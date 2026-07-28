@@ -1398,6 +1398,10 @@ enum Mode {
     All,
     Guides,
     Config,
+    /// `--config-for-completion`, git's `SHOW_CONFIG_VARS`.
+    ConfigVars,
+    /// `--config-sections-for-completion`, git's `SHOW_CONFIG_SECTIONS`.
+    ConfigSections,
     UserInterfaces,
     DeveloperInterfaces,
 }
@@ -1410,6 +1414,8 @@ impl Mode {
             Mode::All => "-a",
             Mode::Guides => "-g",
             Mode::Config => "-c",
+            Mode::ConfigVars => "--config-for-completion",
+            Mode::ConfigSections => "--config-sections-for-completion",
             Mode::UserInterfaces => "--user-interfaces",
             Mode::DeveloperInterfaces => "--developer-interfaces",
         }
@@ -1421,6 +1427,8 @@ impl Mode {
             Mode::All => "--all",
             Mode::Guides => "--guides",
             Mode::Config => "--config",
+            Mode::ConfigVars => "--config-for-completion",
+            Mode::ConfigSections => "--config-sections-for-completion",
             Mode::UserInterfaces => "--user-interfaces",
             Mode::DeveloperInterfaces => "--developer-interfaces",
         }
@@ -1453,11 +1461,19 @@ pub fn help(args: &[String]) -> Result<ExitCode> {
                     print!("{USAGE}");
                     return Ok(ExitCode::from(129));
                 }
-                "all" | "guides" | "config" | "user-interfaces" | "developer-interfaces" => {
+                "all"
+                | "guides"
+                | "config"
+                | "config-for-completion"
+                | "config-sections-for-completion"
+                | "user-interfaces"
+                | "developer-interfaces" => {
                     let m = match long {
                         "all" => Mode::All,
                         "guides" => Mode::Guides,
                         "config" => Mode::Config,
+                        "config-for-completion" => Mode::ConfigVars,
+                        "config-sections-for-completion" => Mode::ConfigSections,
                         "user-interfaces" => Mode::UserInterfaces,
                         _ => Mode::DeveloperInterfaces,
                     };
@@ -1585,6 +1601,18 @@ pub fn help(args: &[String]) -> Result<ExitCode> {
             println!("\n'git help config' for more information");
             Ok(ExitCode::SUCCESS)
         }
+        Some(Mode::ConfigVars) => {
+            for key in config_keys_uniq(set_config_vars) {
+                println!("{key}");
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Some(Mode::ConfigSections) => {
+            for key in config_keys_uniq(set_config_sections) {
+                println!("{key}");
+            }
+            Ok(ExitCode::SUCCESS)
+        }
         None => {
             let Some(topic) = rest.first() else {
                 print!("{COMMON_HELP}");
@@ -1660,11 +1688,65 @@ fn render_all(externals: bool, aliases: bool) -> String {
     out
 }
 
+/// `set_config_vars()` (builtin/help.c): a variable name is truncated at the
+/// first `*` or `<`, whichever comes first, so `alias.*` becomes `alias.` and
+/// `branch.<name>.remote` becomes `branch.`. A name with neither is emitted
+/// whole. Truncation deliberately keeps the trailing `.` — that is the prefix
+/// `git-completion.bash` completes against.
+fn set_config_vars(var: &str) -> &str {
+    let wildcard = var.find('*');
+    let tag = var.find('<');
+    match (wildcard, tag) {
+        (Some(w), Some(t)) => &var[..w.min(t)],
+        (Some(w), None) => &var[..w],
+        (None, Some(t)) => &var[..t],
+        (None, None) => var,
+    }
+}
+
+/// `set_config_sections()` (builtin/help.c): the section is everything before
+/// the first `.`. A name with no `.` at all falls back to
+/// [`set_config_vars`], as git's does.
+fn set_config_sections(var: &str) -> &str {
+    match var.find('.') {
+        Some(dot) => &var[..dot],
+        None => set_config_vars(var),
+    }
+}
+
+/// `list_config_help()`'s tail: map every name in [`CONFIG_VARS`] through `f`,
+/// then `string_list_sort_u` — sort by bytes and drop duplicates, which is what
+/// collapses the many `alias.*`-style truncations into one entry each.
+///
+/// [`CONFIG_VARS`] is already the post-`slot_expansion` list (`advice.*`,
+/// `color.branch.<slot>` and the rest are stored expanded), so the mapping picks
+/// up where git's own loop does.
+fn config_keys_uniq(f: fn(&str) -> &str) -> BTreeSet<&'static str> {
+    CONFIG_VARS.lines().filter(|l| !l.is_empty()).map(f).collect()
+}
+
 /// `git-*` executables reachable through `PATH` that are neither known git
 /// commands nor shipped in git's exec-path — git lists the latter under their
 /// own categories instead.
+///
+/// `load_command_list()` builds `main_cmds` by listing the `git-*` files in the
+/// exec-path directory and then has `exclude_cmds()` subtract that set from the
+/// `PATH` scan, so a helper git itself provides never appears as "external" even
+/// when a copy of it also sits on `PATH`. This binary's exec-path is its own
+/// directory and holds no `git-*` helpers, so the equivalent set is the dispatch
+/// table: every verb this binary serves *is* a helper the installation provides.
+/// Without it, `git help --all` listed the four helpers Homebrew symlinks into
+/// `PATH` — `receive-pack`, `shell`, `upload-archive`, `upload-pack` — under
+/// "External commands", where stock lists none of them. [`command_names`] alone
+/// does not cover these: they are dispatched but not named in the categorised
+/// listing `--all` prints.
 fn external_commands() -> BTreeSet<String> {
-    let known = command_names();
+    let mut known = command_names();
+    known.extend(
+        crate::dispatch::PORCELAIN_VERBS
+            .iter()
+            .map(|v| (*v).to_string()),
+    );
     let exec_path = git_exec_path();
     let mut found = BTreeSet::new();
 

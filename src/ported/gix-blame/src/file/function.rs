@@ -135,7 +135,14 @@ pub fn file(
         let commit = find_commit(cache.as_ref(), &odb, &commit_id, &mut buf)?;
         let commit_time = commit.commit_time()?;
         let target_tree_id = commit.tree_id()?;
-        let parent_ids: ParentIds = collect_parents(commit, &odb, cache.as_ref(), &mut buf2)?;
+        let mut parent_ids: ParentIds = collect_parents(commit, &odb, cache.as_ref(), &mut buf2)?;
+        // git's `first_scapegoat()` (`blame.c:2370-2377`): under `revs->first_parent_only` it frees
+        // `commit->parents->next` before returning the list, so every later scapegoat lookup on this
+        // commit sees exactly one parent and the side branches of a merge are never walked.
+        if options.first_parent {
+            parent_ids.truncate(1);
+        }
+        let parent_ids = parent_ids;
 
         // git's `assign_blame()` does not pop the commit while any of its origins still has
         // entries: it picks one origin, runs `pass_blame()` for it, takes responsibility for
@@ -953,8 +960,31 @@ fn blob_changes(
     )?;
 
     let outcome = resource_cache.prepare_diff()?;
-    let old_data = outcome.old.data.as_slice().unwrap_or_default();
-    let new_data = outcome.new.data.as_slice().unwrap_or_default();
+    // `git blame` never consults the `diff` attribute. `fill_origin_blob()` (`blame.c:1031-1058`)
+    // reads the blob with `odb_read_object()` and hands those bytes straight to `diff_hunks()`, so
+    // a path marked `-diff` (or matched by the `binary` macro) is still diffed line by line.
+    //
+    // `prepare_diff()` does apply that attribute: it classifies such a resource as
+    // `Data::Binary`, whose `as_slice()` is `None`. Taking `unwrap_or_default()` there diffed two
+    // empty buffers, which produced no hunks at all — so a hunk spanning more lines than the
+    // parent's blob has was passed to that parent unchanged, and the walk then indexed the
+    // parent's line table out of bounds (`blame -s sub/nested.txt` on a `-diff` path panicked
+    // rather than printing a blame). Falling back to the object read reproduces git.
+    let (old_raw, new_raw);
+    let old_data = match outcome.old.data.as_slice() {
+        Some(data) => data,
+        None => {
+            old_raw = odb.find_blob(&previous_oid, &mut Vec::new())?.data.to_vec();
+            old_raw.as_slice()
+        }
+    };
+    let new_data = match outcome.new.data.as_slice() {
+        Some(data) => data,
+        None => {
+            new_raw = odb.find_blob(&oid, &mut Vec::new())?.data.to_vec();
+            new_raw.as_slice()
+        }
+    };
     // The `--ignore-rev` re-attribution fingerprints exactly the bytes that were diffed here, as
     // git does by reusing `blame_origin::file` for both.
     let data = collect_data.then(|| (old_data.to_vec(), new_data.to_vec()));
@@ -1086,7 +1116,7 @@ pub(crate) fn tokens_for_diffing(data: &[u8]) -> impl TokenSource<Token = &[u8]>
 /// `\n`, so `git blame -w` (`XDF_IGNORE_WHITESPACE`) treats a whitespace-only line change as no
 /// change. Keeping every `\n` preserves the line count, so a diff of the stripped data yields
 /// hunk line-indices that still map one-to-one onto the original lines.
-pub(super) fn strip_whitespace_per_line(data: &[u8]) -> Vec<u8> {
+pub fn strip_whitespace_per_line(data: &[u8]) -> Vec<u8> {
     data.iter()
         .copied()
         .filter(|&b| b == b'\n' || !matches!(b, b' ' | b'\t' | b'\r' | 0x0c | 0x0b))

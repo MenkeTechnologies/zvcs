@@ -747,6 +747,7 @@ pub fn whatchanged(args: &[String]) -> Result<ExitCode> {
     // git runs the deprecation check inside `cmd_whatchanged`, i.e. after repository
     // setup, so a missing repository is still reported first.
     let repo = gix::discover(".")?;
+    super::diff_files::init_quote_path(&repo);
 
     // git reads `log.*` display config in `git_log_config`, before `setup_revisions` and
     // before the deprecation gate. An invalid `log.date` is fatal here — ahead of the
@@ -2012,7 +2013,8 @@ fn render_raw(repo: &gix::Repository, c: &Change, abbrev: usize, out: &mut Vec<u
     out.extend_from_slice(format!(":{omode:06o} {nmode:06o} {ooid} {noid} ").as_bytes());
     out.push(status(c));
     out.push(b'\t');
-    out.extend_from_slice(&c.path);
+    // `write_name_quoted()`: the shared `quote_c_style()` port, gated on `core.quotePath`.
+    out.extend_from_slice(&super::diff_files::quoted_name(&c.path));
     out.push(b'\n');
     Ok(())
 }

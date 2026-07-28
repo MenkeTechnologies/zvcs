@@ -42,10 +42,21 @@
 //!      be derived from it, i.e. no `-o`)            → fatal, exit 128
 //!   7. `--verify`: the `.idx`/`.pack` pair is unreadable → fatal, exit 128
 //!   8. the `<pack-file>` cannot be opened           → fatal, exit 128
+//!   9. `parse_pack_header()`: fewer than twelve bytes of input is
+//!      `fatal: early EOF`, a wrong magic is `fatal: pack signature mismatch`,
+//!      and a version other than 2 or 3 is
+//!      `fatal: pack version <n> unsupported` → exit 128
 //!
 //! Only once every one of those has passed is an unported flag rejected, so
 //! `--strict does-not-exist.pack` reports the missing pack exactly as git does
 //! instead of complaining about `--strict`.
+//!
+//! Everything past option parsing is a `die()` in git, so nothing here exits 1:
+//! a failure the checks above did not name still becomes a `fatal:` line and
+//! exit 128. `--stdin` without a `<pack-file>` also leaves the same
+//! `objects/pack/tmp_pack_XXXXXX` behind that git's `open_pack_file(NULL)` does
+//! — created before the header is parsed, renamed into place on success, and
+//! deliberately not cleaned up when the command dies.
 //!
 //! File modes match git: `.pack`/`.idx`/`.rev` are left `0444`, a `.keep` is
 //! `0600` and holds `<msg>\n` (empty for a bare `--keep`). The `.rev` payload
@@ -94,7 +105,7 @@
 
 use anyhow::{bail, Result};
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -324,12 +335,75 @@ pub fn index_pack(args: &[String]) -> Result<ExitCode> {
 
     if opts.stdin {
         reject_unported(&opts)?;
-        return index_from_stdin(&opts, opts.pack.as_deref(), index_name.as_deref());
+        return Ok(die_on_error(index_from_stdin(
+            &opts,
+            opts.pack.as_deref(),
+            index_name.as_deref(),
+        )));
     }
 
     let pack_path = opts.pack.clone().expect("checked above");
     let index_name = index_name.expect("a pack name always yields an index name");
-    index_pack_file(&opts, &pack_path, &index_name)
+    Ok(die_on_error(index_pack_file(&opts, &pack_path, &index_name)))
+}
+
+/// Every way `index-pack` can fail past option parsing is a `die()` in git, so
+/// none of them may surface as the dispatcher's exit 1. Whatever the pack
+/// machinery could not do becomes git's exit 128 with a `fatal:` line; the
+/// wording of the cases git names explicitly is produced ahead of this, by
+/// [`parse_pack_header`] and the callers' own checks.
+fn die_on_error(outcome: Result<ExitCode>) -> ExitCode {
+    match outcome {
+        Ok(code) => code,
+        Err(e) => fatal(format!("{e:#}")),
+    }
+}
+
+/// `index-pack.c::parse_pack_header`, which runs before a byte of pack body is
+/// read: `fill()` dies with `early EOF` when the twelve header bytes are not
+/// there at all, and the signature and version are checked in that order.
+/// `Some` is the exit code to die with.
+fn parse_pack_header(header: &[u8]) -> Option<ExitCode> {
+    if header.len() < 12 {
+        return Some(fatal("early EOF"));
+    }
+    if &header[0..4] != b"PACK" {
+        return Some(fatal("pack signature mismatch"));
+    }
+    let version = u32::from_be_bytes([header[4], header[5], header[6], header[7]]);
+    if version != 2 && version != 3 {
+        return Some(fatal(format!("pack version {version} unsupported")));
+    }
+    None
+}
+
+/// The six-character tail `mkstemp()` puts on `tmp_pack_XXXXXX`. Uniqueness is
+/// all that is asked of it — the name is never parsed, only replaced by a rename
+/// or left behind.
+fn mkstemp_suffix() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    format!("{:03x}{:03x}", std::process::id() & 0xfff, nanos & 0xfff)
+}
+
+/// Read the twelve header bytes off `stream` without consuming more, so they can
+/// be chained back in front of it. A short read is returned as-is and refused by
+/// [`parse_pack_header`], which is what keeps an empty input answering
+/// `early EOF` instead of a gitoxide streaming error.
+fn peek_pack_header(stream: &mut dyn Read) -> io::Result<Vec<u8>> {
+    let mut header = [0u8; 12];
+    let mut filled = 0;
+    while filled < header.len() {
+        match stream.read(&mut header[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(header[..filled].to_vec())
 }
 
 /// Index a `.pack` already on disk, writing the index beside it (or to `-o`).
@@ -365,8 +439,16 @@ fn index_pack_file(opts: &Opts, pack_path: &Path, index_path: &Path) -> Result<E
         bail!("unsupported: `--keep` without `--stdin`");
     }
 
+    // `parse_pack_header()` is the first thing git does with the bytes, and its
+    // three deaths outrank anything the pack decoder below could report.
+    let mut file = io::BufReader::new(file);
+    if let Some(code) = parse_pack_header(&peek_pack_header(&mut file)?) {
+        return Ok(code);
+    }
+    file.seek(io::SeekFrom::Start(0))?;
+
     let mut entries = pack::data::input::BytesToEntriesIter::new_from_header(
-        io::BufReader::new(file),
+        file,
         pack::data::input::Mode::Verify,
         pack::data::input::EntryDataMode::Crc32,
         Kind::Sha1,
@@ -483,16 +565,20 @@ fn index_from_stdin(
         }
     }
 
-    // Where the pack is written before it is renamed onto its destination.
-    let write_dir = match target_pack {
-        Some(p) => match p.parent() {
-            Some(dir) if !dir.as_os_str().is_empty() => dir.to_path_buf(),
-            _ => PathBuf::from("."),
-        },
+    // `open_pack_file(NULL)`: with no `<pack-file>` named, git streams stdin into
+    // `objects/pack/tmp_pack_XXXXXX` and renames that file into place once the
+    // pack is complete. It is created before the header is even parsed and git
+    // registers no cleanup for it, so every failure from here on leaves the
+    // empty temporary behind — which is part of the state a failed
+    // `index-pack --stdin` leaves in the repository, and so is reproduced.
+    let temp_pack = match target_pack {
+        Some(_) => None,
         None => {
             let dir = repo.objects.store_ref().path().join("pack");
             fs::create_dir_all(&dir)?;
-            dir
+            let path = dir.join(format!("tmp_pack_{}", mkstemp_suffix()));
+            fs::File::create(&path)?;
+            Some(path)
         }
     };
 
@@ -519,6 +605,25 @@ fn index_from_stdin(
             locked = stdin.lock();
             &mut locked
         }
+    };
+
+    // `parse_pack_header()` runs before any of the pack body is decoded, so an
+    // input too short to hold a header is `early EOF` rather than whatever the
+    // streaming decoder would have said about the truncation.
+    let header = peek_pack_header(input)?;
+    if let Some(code) = parse_pack_header(&header) {
+        return Ok(code);
+    }
+    let mut chained = io::Cursor::new(header).chain(input);
+    let input: &mut dyn io::BufRead = &mut chained;
+
+    // Where the pack is written before it is renamed onto its destination.
+    let write_dir = match target_pack {
+        Some(p) => match p.parent() {
+            Some(dir) if !dir.as_os_str().is_empty() => dir.to_path_buf(),
+            _ => PathBuf::from("."),
+        },
+        None => repo.objects.store_ref().path().join("pack"),
     };
 
     // With `--fix-thin` the object database resolves REF_DELTA bases missing from
@@ -566,6 +671,12 @@ fn index_from_stdin(
     // own beside the final pack holding the requested message.
     if let Some(kp) = &outcome.keep_path {
         let _ = fs::remove_file(kp);
+    }
+
+    // git's temporary *becomes* the finished pack through a rename; gix wrote its
+    // own file instead, so the placeholder goes now that the run has succeeded.
+    if let Some(tmp) = &temp_pack {
+        let _ = fs::remove_file(tmp);
     }
 
     if want_rev_index(opts) {

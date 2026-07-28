@@ -6,7 +6,10 @@
 //! one raw record. Against the working tree the destination side comes from `lstat` via
 //! git's `ce_match_stat_basic`/`match_stat_data` rules, which is why a merely *touched*
 //! file — same bytes, new inode or ctime — is reported as `M` with the null object id,
-//! exactly as stock git reports it.
+//! exactly as stock git reports it. How much of the stat data counts is
+//! `core.trustCTime`/`core.checkStat`: `minimal` drops ctime, owner and inode from the
+//! comparison, leaving only mtime and size, so a file whose content and mtime survived a
+//! copy reads as unmodified.
 //!
 //! Supported invocations (stdout is byte-identical to stock `git diff-index`):
 //!
@@ -165,7 +168,10 @@ use gix::prelude::ObjectIdExt;
 use regex::bytes::Regex;
 
 use super::diff_color;
-use super::diff_files::{count_changes_sides, render_dirstat, DirStat};
+use super::diff_files::{
+    count_changes_sides, quote_one, quote_two, quoted_name, quoted_name_bytes, render_dirstat,
+    DirStat,
+};
 
 /// The file-type bits of a mode, as in `<sys/stat.h>`.
 const S_IFMT: u32 = 0o170000;
@@ -1192,6 +1198,7 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
     }
 
     let repo = gix::discover(".")?;
+    super::diff_files::init_quote_path(&repo);
     if !wseh_explicit {
         if let Ok(v) = diff_color::ws_error_highlight_default(&repo) {
             opts.ws_error_highlight = v;
@@ -1741,6 +1748,9 @@ fn collect(repo: &gix::Repository, tree_id: &ObjectId, opts: &Opts) -> Result<Ve
         bail!("this operation must be run in a work tree");
     }
     let index_timestamp = index_state.timestamp().unix_seconds();
+    // `core.trustCTime` / `core.checkStat`, which decide how much of the stat data
+    // `match_stat_data` is allowed to look at.
+    let stat_opts = repo.stat_options()?;
 
     let all: BTreeSet<&BString> = tree.keys().chain(idx.keys()).collect();
     let mut deltas = Vec::new();
@@ -1797,7 +1807,7 @@ fn collect(repo: &gix::Repository, tree_id: &ObjectId, opts: &Opts) -> Result<Ve
                     // submodule is dirty needs a full status of its own worktree.
                     if (info.mode & S_IFMT) != 0o160000
                         && (info.intent_to_add
-                            || entry_is_dirty(repo, info, &md, index_timestamp, &full))
+                            || entry_is_dirty(repo, info, &md, index_timestamp, stat_opts, &full))
                     {
                         dst_mode = mode_from_stat(&md);
                         dst_id = null;
@@ -1871,9 +1881,10 @@ fn entry_is_dirty(
     info: &IdxInfo,
     md: &std::fs::Metadata,
     index_timestamp: i64,
+    stat_opts: gix::index::entry::stat::Options,
     full: &Path,
 ) -> bool {
-    if mode_changed(info.mode, md) || stat_data_changed(&info.stat, md) {
+    if mode_changed(info.mode, md) || stat_data_changed(&info.stat, md, stat_opts) {
         return true;
     }
     // git's racy-timestamp rule: an entry whose mtime is at or after the index's own
@@ -1935,22 +1946,34 @@ fn fs_mode(_md: &std::fs::Metadata) -> u32 {
     0
 }
 
-/// git's `match_stat_data` with its defaults (`core.trustctime` and `core.checkStat`
-/// both on, nanoseconds and `st_dev` both off). Every comparison truncates to 32 bits
-/// because that is the width the index stores.
+/// git's `match_stat_data`: mtime and size always count, while ctime is gated on
+/// `core.trustCTime` *and* `core.checkStat`, and owner and inode on `core.checkStat`
+/// alone (`core.checkStat=minimal` drops all three). Nanoseconds and `st_dev` stay off,
+/// as in a stock build. Every comparison truncates to 32 bits because that is the width
+/// the index stores.
 #[cfg(unix)]
-fn stat_data_changed(sd: &gix::index::entry::Stat, md: &std::fs::Metadata) -> bool {
+fn stat_data_changed(
+    sd: &gix::index::entry::Stat,
+    md: &std::fs::Metadata,
+    opts: gix::index::entry::stat::Options,
+) -> bool {
     use std::os::unix::fs::MetadataExt;
-    sd.mtime.secs != md.mtime() as u32
-        || sd.ctime.secs != md.ctime() as u32
-        || sd.uid != md.uid()
-        || sd.gid != md.gid()
-        || sd.ino != md.ino() as u32
-        || sd.size != md.size() as u32
+    if sd.mtime.secs != md.mtime() as u32 || sd.size != md.size() as u32 {
+        return true;
+    }
+    if opts.trust_ctime && opts.check_stat && sd.ctime.secs != md.ctime() as u32 {
+        return true;
+    }
+    opts.check_stat
+        && (sd.uid != md.uid() || sd.gid != md.gid() || sd.ino != md.ino() as u32)
 }
 
 #[cfg(not(unix))]
-fn stat_data_changed(sd: &gix::index::entry::Stat, md: &std::fs::Metadata) -> bool {
+fn stat_data_changed(
+    sd: &gix::index::entry::Stat,
+    md: &std::fs::Metadata,
+    _opts: gix::index::entry::stat::Options,
+) -> bool {
     let mtime = md
         .modified()
         .ok()
@@ -2304,7 +2327,7 @@ fn render(repo: &gix::Repository, deltas: &[Delta], opts: &Opts) -> Result<Vec<u
         if opts.nul {
             out.extend_from_slice(path);
         } else {
-            out.extend_from_slice(quote_path(path).as_bytes());
+            out.extend_from_slice(&quoted_name_bytes(path));
         }
         out.push(term);
     }
@@ -2347,40 +2370,6 @@ fn abbrev_len(
             .unwrap_or(7),
     };
     Some(n.clamp(4, hexsz))
-}
-
-/// C-style path quoting matching git's default `core.quotePath=true`: a path is
-/// wrapped in double quotes and escaped when it contains control bytes, a quote,
-/// a backslash, or any byte >= 0x80; otherwise it is emitted verbatim.
-fn quote_path(path: impl AsRef<[u8]>) -> String {
-    let bytes = path.as_ref();
-    let needs = bytes
-        .iter()
-        .any(|&b| b < 0x20 || b == 0x7f || b == b'"' || b == b'\\' || b >= 0x80);
-    if !needs {
-        // All bytes are printable ASCII here, so this is lossless.
-        return String::from_utf8_lossy(bytes).into_owned();
-    }
-    let mut out = String::from("\"");
-    for &b in bytes {
-        match b {
-            b'"' => out.push_str("\\\""),
-            b'\\' => out.push_str("\\\\"),
-            0x07 => out.push_str("\\a"),
-            0x08 => out.push_str("\\b"),
-            0x09 => out.push_str("\\t"),
-            0x0a => out.push_str("\\n"),
-            0x0b => out.push_str("\\v"),
-            0x0c => out.push_str("\\f"),
-            0x0d => out.push_str("\\r"),
-            b if b < 0x20 || b == 0x7f || b >= 0x80 => {
-                out.push_str(&format!("\\{b:03o}"));
-            }
-            b => out.push(b as char),
-        }
-    }
-    out.push('"');
-    out
 }
 
 // ---------------------------------------------------------------------------
@@ -3078,86 +3067,6 @@ fn prefix_lines(body: &[u8], prefix: &[u8]) -> Vec<u8> {
         out.extend_from_slice(prefix);
         out.extend_from_slice(line);
     }
-    out
-}
-
-// ---------------------------------------------------------------------------
-// path quoting (quote.c), matching git's default `core.quotePath=true`
-// ---------------------------------------------------------------------------
-
-/// The escape character for `b`, or `None` if it can be emitted verbatim. `Some(0)`
-/// means "octal-escape this byte".
-fn cq_escape(b: u8) -> Option<u8> {
-    match b {
-        0x07 => Some(b'a'),
-        0x08 => Some(b'b'),
-        0x09 => Some(b't'),
-        0x0a => Some(b'n'),
-        0x0b => Some(b'v'),
-        0x0c => Some(b'f'),
-        0x0d => Some(b'r'),
-        b'"' => Some(b'"'),
-        b'\\' => Some(b'\\'),
-        0x00..=0x1f | 0x7f..=0xff => Some(0),
-        _ => None,
-    }
-}
-
-fn cq_needs_quote(s: &[u8]) -> bool {
-    s.iter().any(|b| cq_escape(*b).is_some())
-}
-
-/// The escaped body of `s`, without the surrounding double quotes.
-fn cq_body(s: &[u8], out: &mut Vec<u8>) {
-    for &b in s {
-        match cq_escape(b) {
-            None => out.push(b),
-            Some(0) => {
-                out.push(b'\\');
-                out.push(((b >> 6) & 0o3) + b'0');
-                out.push(((b >> 3) & 0o7) + b'0');
-                out.push((b & 0o7) + b'0');
-            }
-            Some(c) => {
-                out.push(b'\\');
-                out.push(c);
-            }
-        }
-    }
-}
-
-/// `write_name_quoted()`: the path, double-quoted and escaped only if needed.
-fn quoted_name(path: &BString) -> Vec<u8> {
-    let s = path.as_slice();
-    if !cq_needs_quote(s) {
-        return s.to_vec();
-    }
-    let mut out = vec![b'"'];
-    cq_body(s, &mut out);
-    out.push(b'"');
-    out
-}
-
-/// `quote_two_c_style()` for a single prefixed name (the `---`/`+++` lines).
-fn quote_one(prefix: &str, path: &BString) -> Vec<u8> {
-    let s = path.as_slice();
-    if !cq_needs_quote(prefix.as_bytes()) && !cq_needs_quote(s) {
-        let mut out = prefix.as_bytes().to_vec();
-        out.extend_from_slice(s);
-        return out;
-    }
-    let mut out = vec![b'"'];
-    cq_body(prefix.as_bytes(), &mut out);
-    cq_body(s, &mut out);
-    out.push(b'"');
-    out
-}
-
-/// The `diff --git <a> <b>` name pair.
-fn quote_two(pa: &str, a: &BString, pb: &str, b: &BString) -> Vec<u8> {
-    let mut out = quote_one(pa, a);
-    out.push(b' ');
-    out.extend_from_slice(&quote_one(pb, b));
     out
 }
 

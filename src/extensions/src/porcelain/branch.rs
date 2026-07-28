@@ -788,7 +788,7 @@ fn resolve_filter_commit(repo: &gix::Repository, spec: &str, peel: bool) -> Resu
 /// by each `<common-dir>/worktrees/<id>`, whose path is the `gitdir` file's
 /// contents with the same suffix removed. A worktree with a detached or
 /// unreadable `HEAD` contributes nothing, so it never marks a branch.
-fn worktree_map(repo: &gix::Repository) -> std::collections::HashMap<BString, String> {
+pub(crate) fn worktree_map(repo: &gix::Repository) -> std::collections::HashMap<BString, String> {
     /// `<dir>/HEAD`'s symbolic target, or `None` when detached/unreadable.
     fn head_ref(dir: &std::path::Path) -> Option<BString> {
         let raw = std::fs::read(dir.join("HEAD")).ok()?;
@@ -839,6 +839,14 @@ fn worktree_map(repo: &gix::Repository) -> std::collections::HashMap<BString, St
 /// remote-tracking ref it is configured to track, or `None` when it tracks
 /// nothing (so the whole `-vv` tracking field is suppressed).
 fn upstream_short(repo: &gix::Repository, full: &BStr) -> Option<(FullName, String)> {
+    let up = upstream_ref(repo, full)?;
+    let short = up.shorten().to_string();
+    Some((up, short))
+}
+
+/// git's `branch_get_upstream`: the remote-tracking ref `full` is configured to
+/// build on, or `None` when it tracks nothing.
+pub(crate) fn upstream_ref(repo: &gix::Repository, full: &BStr) -> Option<FullName> {
     let name = FullName::try_from(full.to_owned()).ok()?;
     // git's `set_merge`: a `branch.<name>.remote` of `.` means the upstream lives
     // in this very repository, so `branch.<name>.merge` *is* the upstream ref and
@@ -847,43 +855,67 @@ fn upstream_short(repo: &gix::Repository, full: &BStr) -> Option<(FullName, Stri
         .config_snapshot()
         .string(&format!("branch.{}.remote", name.shorten()))
         .is_some_and(|v| v.as_bstr() == ".");
-    let up = if local_remote {
+    if local_remote {
         repo.branch_remote_ref_name(name.as_ref(), gix::remote::Direction::Fetch)?
-            .ok()?
+            .ok()
     } else {
         repo.branch_remote_tracking_ref_name(name.as_ref(), gix::remote::Direction::Fetch)?
-            .ok()?
-    };
-    let short = up.shorten().to_string();
-    Some((up, short))
+            .ok()
+    }
 }
 
-/// git's `%(upstream:track)` text, sans brackets — `gone` when the configured
-/// upstream ref no longer exists, `ahead N` / `behind N` / `ahead N, behind M`
-/// when the two tips have diverged, and the empty string when they agree
-/// (`fill_remote_ref_details`, `ref-filter.c`).
-fn upstream_track(repo: &gix::Repository, local: Option<gix::Id<'_>>, upstream: &FullName) -> String {
-    let resolved = repo
+/// git's `branch_get_push`: the remote-tracking ref that would mirror a push of
+/// `full`, or `None` when the branch has no push destination.
+pub(crate) fn push_ref(repo: &gix::Repository, full: &BStr) -> Option<FullName> {
+    let name = FullName::try_from(full.to_owned()).ok()?;
+    repo.branch_remote_tracking_ref_name(name.as_ref(), gix::remote::Direction::Push)?
+        .ok()
+}
+
+/// git's `stat_tracking_info` with `AHEAD_BEHIND_FULL`: the commit counts each
+/// side has that the other does not, or `None` for its `-1` return — the
+/// upstream ref is gone, or either end fails to name a commit.
+pub(crate) fn stat_tracking_info(
+    repo: &gix::Repository,
+    local: Option<gix::Id<'_>>,
+    upstream: &FullName,
+) -> Option<(usize, usize)> {
+    let up = repo
         .try_find_reference(upstream.as_ref())
         .ok()
         .flatten()
-        .and_then(|r| r.into_fully_peeled_id().ok());
-    let (Some(local), Some(up)) = (local, resolved) else {
-        return "gone".into();
-    };
+        .and_then(|r| r.into_fully_peeled_id().ok())?;
+    let local = local?;
+    if local.detach() == up.detach() {
+        return Some((0, 0));
+    }
     let count = |tip: ObjectId, hidden: ObjectId| -> usize {
         match repo.rev_walk(Some(tip)).with_hidden(Some(hidden)).all() {
             Ok(walk) => walk.take_while(Result::is_ok).count(),
             Err(_) => 0,
         }
     };
-    let ours = count(local.detach(), up.detach());
-    let theirs = count(up.detach(), local.detach());
-    match (ours, theirs) {
-        (0, 0) => String::new(),
-        (0, t) => format!("behind {t}"),
-        (o, 0) => format!("ahead {o}"),
-        (o, t) => format!("ahead {o}, behind {t}"),
+    Some((
+        count(local.detach(), up.detach()),
+        count(up.detach(), local.detach()),
+    ))
+}
+
+/// git's `%(upstream:track)` text, sans brackets — `gone` when the configured
+/// upstream ref no longer exists, `ahead N` / `behind N` / `ahead N, behind M`
+/// when the two tips have diverged, and the empty string when they agree
+/// (`fill_remote_ref_details`, `ref-filter.c`).
+pub(crate) fn upstream_track(
+    repo: &gix::Repository,
+    local: Option<gix::Id<'_>>,
+    upstream: &FullName,
+) -> String {
+    match stat_tracking_info(repo, local, upstream) {
+        None => "gone".into(),
+        Some((0, 0)) => String::new(),
+        Some((0, t)) => format!("behind {t}"),
+        Some((o, 0)) => format!("ahead {o}"),
+        Some((o, t)) => format!("ahead {o}, behind {t}"),
     }
 }
 

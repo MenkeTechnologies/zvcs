@@ -26,8 +26,12 @@ use regex::bytes::{Regex, RegexBuilder};
 ///   * `git reflog list` — every ref that has a reflog, in git's directory-tree
 ///     order (per-directory name sort).
 ///   * `git reflog exists <ref>` — exit 0 if `$GIT_DIR/logs/<ref>` is a file, else 1.
-///   * `write`, `delete`, `drop`, `expire` bail: `gix-ref` appends to a reflog only
-///     as a side effect of a ref transaction and exposes no rewrite/truncate API.
+///   * `write`, `delete`, `drop`, `expire` bail — not ported. The primitives are
+///     available (`gix-ref`'s `RefLog::Only` appends a reflog entry without
+///     touching the reference, and rewriting a log file in place is what
+///     [`super::gc`]'s reflog expiry already does); what is missing is the
+///     command surface itself — selector parsing, entry relinking, `--rewrite`,
+///     `--updateref`, `--dry-run` reporting and the whole `expire` option set.
 ///
 /// # Argument grammar for `show`
 ///
@@ -99,7 +103,15 @@ use regex::bytes::{Regex, RegexBuilder};
 /// Filtering: `--grep=<pat>` keeps entries whose commit message matches, with
 /// git's default POSIX-basic dialect (translated to the `regex` engine), plus
 /// `-E`/`-P` (extended), `-F` (fixed), `-i` (ignore case), `--all-match` and
-/// `--invert-grep`. A pattern git's regex compiler would reject is fatal (128).
+/// `--invert-grep`. A pattern git's regex compiler would reject is fatal (128),
+/// though the message names only "invalid regular expression" where git quotes
+/// its regex library's own diagnosis.
+///
+/// `--grep-reflog=<pat>` matches the reflog entry's own message. git compiles it
+/// as a `reflog` *header* grep, which has three consequences this module
+/// reproduces: an entry must satisfy the header patterns *and* the `--grep`
+/// patterns, the header patterns stay OR-ed even under `--all-match`, and
+/// `--invert-grep` inverts only the message side.
 ///
 /// # Diff output
 ///
@@ -169,9 +181,9 @@ pub fn reflog(args: &[String]) -> Result<ExitCode> {
         Some("list") => ("list", &args[1..]),
         Some("exists") => ("exists", &args[1..]),
         Some(s @ ("write" | "delete" | "drop" | "expire")) => bail!(
-            "`reflog {s}` is not ported: gix-ref appends to a reflog only as part of a \
-             ref transaction and exposes no API to write standalone entries, rewrite, \
-             truncate or expire a log"
+            "`reflog {s}` is not ported: the reflog write path (entry selectors, \
+             relinking, --rewrite/--updateref, and the expire option set) has no \
+             implementation yet"
         ),
         // Anything else is a `<ref>` for the implicit `show`.
         _ => ("show", args),
@@ -399,6 +411,11 @@ impl Builtin {
 /// way git's `--walk-reflogs` grep does (with `--all-match` / `--invert-grep`).
 struct GrepFilter {
     patterns: Vec<Regex>,
+    /// `--grep-reflog=<pat>`. git adds these to the same filter as a `reflog `
+    /// *header* grep, so they are matched against the reflog entry's own
+    /// message rather than the commit's, and they combine with `--grep` under
+    /// the same any/all rule.
+    reflog_patterns: Vec<Regex>,
     /// `--all-match`: every pattern must match instead of any.
     all_match: bool,
     /// `--invert-grep`: keep entries that do *not* match.
@@ -406,13 +423,31 @@ struct GrepFilter {
 }
 
 impl GrepFilter {
-    fn keeps(&self, message: &[u8]) -> bool {
-        let hit = if self.all_match {
-            self.patterns.iter().all(|re| re.is_match(message))
+    /// Whether one entry survives the filter.
+    ///
+    /// git compiles the message patterns and the `reflog` header patterns into
+    /// separate expressions and sets `all_match` once a header expression
+    /// exists, so an entry has to satisfy both groups. Within the header group
+    /// the patterns stay OR-ed even under `--all-match`, and `--invert-grep`
+    /// (git's `no_body_match`) rejects on a *body* hit only, leaving header
+    /// matching untouched.
+    fn keeps(&self, message: &[u8], reflog_message: &[u8]) -> bool {
+        let body_ok = if self.patterns.is_empty() {
+            true
         } else {
-            self.patterns.iter().any(|re| re.is_match(message))
+            let hit = if self.all_match {
+                self.patterns.iter().all(|re| re.is_match(message))
+            } else {
+                self.patterns.iter().any(|re| re.is_match(message))
+            };
+            hit != self.invert
         };
-        hit != self.invert
+        let header_ok = self.reflog_patterns.is_empty()
+            || self
+                .reflog_patterns
+                .iter()
+                .any(|re| re.is_match(reflog_message));
+        body_ok && header_ok
     }
 }
 
@@ -690,6 +725,7 @@ fn show(repo: &gix::Repository, rest: &[String]) -> Result<ExitCode> {
     // `--grep` state, resolved into a compiled filter after the whole scan (git
     // sets these fields in any order, then compiles once in `setup_revisions`).
     let mut grep_patterns: Vec<String> = Vec::new();
+    let mut grep_reflog_patterns: Vec<String> = Vec::new();
     let mut grep_kind = GrepKind::Basic;
     let mut grep_ignore_case = false;
     let mut grep_invert = false;
@@ -863,6 +899,9 @@ fn show(repo: &gix::Repository, rest: &[String]) -> Result<ExitCode> {
             s if s.starts_with("--grep=") => {
                 grep_patterns.push(s["--grep=".len()..].to_owned());
             }
+            s if s.starts_with("--grep-reflog=") => {
+                grep_reflog_patterns.push(s["--grep-reflog=".len()..].to_owned());
+            }
             "--invert-grep" => grep_invert = true,
             "--all-match" => grep_all_match = true,
             "--regexp-ignore-case" | "-i" => grep_ignore_case = true,
@@ -933,28 +972,42 @@ fn show(repo: &gix::Repository, rest: &[String]) -> Result<ExitCode> {
 
     // git compiles `--grep` patterns once the whole command line is parsed; a bad
     // pattern is fatal (exit 128), as it is in git's `compile_regexp`.
-    if !grep_patterns.is_empty() {
-        let mut compiled: Vec<Regex> = Vec::with_capacity(grep_patterns.len());
-        for pat in &grep_patterns {
-            let translated = match grep_kind {
-                GrepKind::Fixed => regex::escape(pat),
-                GrepKind::Extended => pat.clone(),
-                GrepKind::Basic => bre_to_ere(pat),
-            };
-            match RegexBuilder::new(&translated)
-                .case_insensitive(grep_ignore_case)
-                .multi_line(true)
-                .build()
-            {
-                Ok(re) => compiled.push(re),
-                Err(_) => {
-                    eprintln!("fatal: command line, '{pat}': invalid regular expression");
-                    return Ok(ExitCode::from(128));
+    if !grep_patterns.is_empty() || !grep_reflog_patterns.is_empty() {
+        // git names the origin of a bad pattern: `command line` for a message
+        // grep, `header` for the `reflog` header grep `--grep-reflog` adds.
+        let compile = |pats: &[String], origin: &str| -> std::result::Result<Vec<Regex>, ExitCode> {
+            let mut compiled: Vec<Regex> = Vec::with_capacity(pats.len());
+            for pat in pats {
+                let translated = match grep_kind {
+                    GrepKind::Fixed => regex::escape(pat),
+                    GrepKind::Extended => pat.clone(),
+                    GrepKind::Basic => bre_to_ere(pat),
+                };
+                match RegexBuilder::new(&translated)
+                    .case_insensitive(grep_ignore_case)
+                    .multi_line(true)
+                    .build()
+                {
+                    Ok(re) => compiled.push(re),
+                    Err(_) => {
+                        eprintln!("fatal: {origin}, '{pat}': invalid regular expression");
+                        return Err(ExitCode::from(128));
+                    }
                 }
             }
-        }
+            Ok(compiled)
+        };
+        let patterns = match compile(&grep_patterns, "command line") {
+            Ok(v) => v,
+            Err(code) => return Ok(code),
+        };
+        let reflog_patterns = match compile(&grep_reflog_patterns, "header") {
+            Ok(v) => v,
+            Err(code) => return Ok(code),
+        };
         opts.grep = Some(GrepFilter {
-            patterns: compiled,
+            patterns,
+            reflog_patterns,
             all_match: grep_all_match,
             invert: grep_invert,
         });
@@ -1052,7 +1105,7 @@ fn render(
                     .ok()
                     .and_then(|c| c.message_raw().ok().map(|m| m.to_vec()))
                     .unwrap_or_default();
-                if !grep.keeps(&message) {
+                if !grep.keeps(&message, &entry.message) {
                     continue;
                 }
             }

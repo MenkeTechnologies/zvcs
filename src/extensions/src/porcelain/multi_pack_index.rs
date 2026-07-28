@@ -86,7 +86,10 @@
 //!   * `write --bitmap` — the vendored `gix-pack` has no multi-pack bitmap
 //!     writer at all (`src/ported/gix-pack/src/multi_index/` has `write.rs` and
 //!     `verify.rs` but no bitmap module), so the emitted `.bitmap`/`.rev` could
-//!     not match git's.
+//!     not match git's. The refusal comes only once there is something to index:
+//!     `write_midx_internal()` fails on an empty pack set before it reaches any
+//!     bitmap work, so `write --bitmap` in a repository with no packs answers
+//!     `error: no pack files to index.` / exit 255 exactly as git does.
 //!   * `write --preferred-pack=<name>` when the named pack is present *and* the
 //!     indexed packs share an object id — the only case the value changes the
 //!     MIDX bytes. `write_from_index_paths` takes only a path list and resolves
@@ -409,15 +412,12 @@ fn write(rest: &[&str], mut object_dir: Option<PathBuf>) -> Result<ExitCode> {
         ));
     }
 
-    // `--bitmap` needs a multi-pack bitmap writer and `--incremental` needs a
-    // MIDX chain writer; gix-pack has neither, so these still bail honestly. A
-    // valid `--base` only ever reaches here alongside `--incremental` (it errors
-    // out above otherwise), so the incremental bail covers it.
-    if bitmap {
-        bail!(
-            "multi-pack-index write --bitmap is not portable here — gix-pack has no multi-pack bitmap writer, so the emitted .bitmap/.rev would not match git's"
-        );
-    }
+    // `--incremental` needs a MIDX chain writer, which gix-pack has not, so it
+    // still bails honestly. A valid `--base` only ever reaches here alongside
+    // `--incremental` (it errors out above otherwise), so this bail covers it.
+    // `--bitmap` is deferred until the pack set is known: `write_midx_internal()`
+    // fails on an empty pack set before it reaches any bitmap work, so a
+    // repository with no packs must answer `no pack files to index.` first.
     if incremental {
         bail!(
             "multi-pack-index write --incremental is not portable here — gix-pack writes a single flat v1 MIDX with zero base files (multi_index/init.rs discards the base-file count), so a chain layer under multi-pack-index.d/ cannot be written"
@@ -438,6 +438,19 @@ fn write(rest: &[&str], mut object_dir: Option<PathBuf>) -> Result<ExitCode> {
                 .and_then(|n| n.to_str())
                 .is_some_and(|n| wanted.contains(n))
         });
+    }
+
+    if index_paths.is_empty() {
+        // `midx-write.c`: `error(_("no pack files to index."))`, and cmd_* hands
+        // the -1 straight back to git, which exits 255.
+        eprintln!("error: no pack files to index.");
+        return Ok(ExitCode::from(255));
+    }
+    // Only now — with packs to index — does the missing bitmap writer matter.
+    if bitmap {
+        bail!(
+            "multi-pack-index write --bitmap is not portable here — gix-pack has no multi-pack bitmap writer, so the emitted .bitmap/.rev would not match git's"
+        );
     }
 
     // `--preferred-pack` only steers duplicate-object resolution and bitmap

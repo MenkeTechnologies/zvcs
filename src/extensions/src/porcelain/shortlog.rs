@@ -1932,16 +1932,24 @@ fn diff_touches_path(
         o.track_rewrites(None);
     });
     let mut matched = false;
-    platform
-        .for_each_to_obtain_tree(&new, |change| {
-            if path_matches(change.location(), pathspecs) {
-                matched = true;
-                Ok::<_, std::convert::Infallible>(std::ops::ControlFlow::Break(()))
-            } else {
-                Ok(std::ops::ControlFlow::Continue(()))
-            }
-        })
-        .map_err(|e| anyhow!("{e}"))?;
+    // `ControlFlow::Break` is how the diff machinery is told to stop early, and it
+    // reports that back as `Error::Cancelled` — a *deliberate* stop, not a failure.
+    // Treating it as one turned every matching pathspec into
+    // "fatal: The delegate cancelled the operation", so the break is swallowed and
+    // only a genuine diff error propagates.
+    let outcome = platform.for_each_to_obtain_tree(&new, |change| {
+        if path_matches(change.location(), pathspecs) {
+            matched = true;
+            Ok::<_, std::convert::Infallible>(std::ops::ControlFlow::Break(()))
+        } else {
+            Ok(std::ops::ControlFlow::Continue(()))
+        }
+    });
+    match outcome {
+        Ok(_) => {}
+        Err(_) if matched => {}
+        Err(e) => return Err(anyhow!("{e}")),
+    }
     Ok(matched)
 }
 

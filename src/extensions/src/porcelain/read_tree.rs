@@ -29,6 +29,14 @@
 //!   `--index-output=<file>`, `--exclude-per-directory=<file>`,
 //!   `--[no-]sparse-checkout`, `--[no-]recurse-submodules`, `--[no-]debug-unpack`.
 //!
+//! Up-to-dateness is decided the way `ie_match_stat()` decides it: from the entry's
+//! cached `stat` data, not from content. A file whose mtime, size, inode or owner
+//! moved is "not uptodate" even when its bytes are unchanged — that is what makes
+//! `read-tree -m` refuse and what makes `--reset -u` rewrite the file. Content is
+//! only consulted for a racily-clean entry, exactly as `ce_modified_check_fs` does.
+//! `core.trustCTime` and `core.checkStat` select the fields compared, and
+//! `core.fileMode` whether the executable bit counts.
+//!
 //! ## Configuration honoured
 //!
 //! * `core.maxTreeDepth` — the tree-recursion fail-safe. A tree deeper than the
@@ -44,20 +52,23 @@
 //! its `--no-` form, `--` ends the option scan, and a usage error prints git's usage
 //! block and exits 129.
 //!
-//! ## Not ported
-//!
-//! The two- and three-tree merges (`-m $H $M`, `-m $O $A $B`) are the bulk of
-//! `read-tree`'s merge machinery — the "carry forward" table in `git-read-tree(1)` —
-//! and are not implemented; supplying more than one tree with `-m`/`--reset`/
-//! `--prefix` bails rather than writing a wrong index. `--trivial` and `--aggressive`
-//! are accepted and ignored because they only tune that three-way merge, which is
-//! unreachable here.
+//! * `read-tree -m <old> <new>` — two-tree merge (`twoway_merge`), the "carry
+//!   forward" table of `git-read-tree(1)`.
+//! * `read-tree -m <base> <ours> <theirs>` — three-tree merge (`threeway_merge`),
+//!   leaving unresolvable paths at stages 1/2/3. `--aggressive` resolves the
+//!   trivial delete/delete and identical-add cases; `--trivial` refuses the whole
+//!   merge (`Merge requires file-level merging`) if any path needed file-level
+//!   merging.
 //!
 //! ## Known deviations
 //!
-//! * Up-to-dateness is decided by content (via gitoxide's index↔worktree status)
-//!   rather than by git's `stat` comparison. The two agree except that git can also
-//!   reject a file whose `stat` moved while its content did not.
+//! * The multi-tree merges decide per path over the union of the index's and the
+//!   trees' paths rather than through `traverse_trees()`'s simultaneous walk. The
+//!   merge functions themselves are ported verbatim; what the walk adds on top is
+//!   directory/file-conflict detection — git substitutes `o->df_conflict_entry`
+//!   for a slot whose path is a directory in that tree — and sparse-directory
+//!   handling. A path that is a file in one tree and a directory in another is
+//!   therefore merged as if the directory side were absent.
 //! * The `-u` untracked-collision check rejects any existing file at a path the read
 //!   adds; git additionally permits it when the file is `.gitignore`d.
 //! * The cache-tree (`TREE`) extension is dropped on write, as everywhere else in
@@ -73,12 +84,13 @@
 
 use anyhow::{anyhow, bail, Result};
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::AtomicBool;
 
 use gix::bstr::{BString, ByteSlice};
 use gix::hash::ObjectId;
+use gix::index::entry::stat::Options;
 use gix::index::entry::{Mode, Stat};
 
 /// Parsed command line for a single `read-tree` invocation.
@@ -91,6 +103,8 @@ struct Opts {
     dry_run: bool,             // -n/--dry-run
     read_empty: bool,          // --empty
     prefix: Option<String>,    // --prefix=<p>
+    aggressive: bool,          // --aggressive
+    trivial: bool,             // --trivial
     index_output: Option<PathBuf>, // --index-output=<file>
     trees: Vec<String>,
 }
@@ -316,9 +330,23 @@ pub fn read_tree(args: &[String]) -> Result<ExitCode> {
             }
             // Feedback-only switches: this port is silent either way.
             "verbose" | "no-verbose" | "quiet" | "no-quiet" => no_value!(),
-            // `--trivial`/`--aggressive` only tune the two- and three-tree merges,
-            // which are not reachable here, so they carry no behaviour of their own.
-            "trivial" | "no-trivial" | "aggressive" | "no-aggressive" => no_value!(),
+            // `--trivial`/`--aggressive` only tune the three-tree merge.
+            "trivial" => {
+                no_value!();
+                o.trivial = true;
+            }
+            "no-trivial" => {
+                no_value!();
+                o.trivial = false;
+            }
+            "aggressive" => {
+                no_value!();
+                o.aggressive = true;
+            }
+            "no-aggressive" => {
+                no_value!();
+                o.aggressive = false;
+            }
             // Sparse checkout is never applied by this port, so both directions no-op.
             "sparse-checkout" | "no-sparse-checkout" => no_value!(),
             // `unpack-trees` tracing has no analogue here.
@@ -388,10 +416,10 @@ pub fn read_tree(args: &[String]) -> Result<ExitCode> {
     if o.merge_like() && tree_ids.is_empty() {
         return fatal("you must specify at least one tree to merge");
     }
-    if o.merge_like() && tree_ids.len() > 1 {
+    // `--prefix` is `bind_merge`, which git only ever runs with one tree.
+    if o.prefix.is_some() && tree_ids.len() > 1 {
         bail!(
-            "unsupported: {} tree-ishes with -m/--reset/--prefix (the two- and three-way \
-             read-tree merges are not ported; only the one-tree form is)",
+            "unsupported: {} tree-ishes with --prefix (git's bind merge takes exactly one)",
             tree_ids.len()
         );
     }
@@ -421,6 +449,12 @@ pub fn read_tree(args: &[String]) -> Result<ExitCode> {
         Ok(policy) => policy,
         Err(message) => return fatal(message),
     };
+
+    // Two or three trees select `twoway_merge`/`threeway_merge` instead of the
+    // one-tree `oneway_merge` the rest of this function implements.
+    if o.merge_like() && tree_ids.len() > 1 {
+        return multi_tree_read(&repo, &o, &old, &tree_ids, depth_limit, &fsync);
+    }
 
     // ---- Build the index this invocation wants to end up with. ----
     let mut new_index = if o.read_empty || tree_ids.is_empty() {
@@ -477,10 +511,19 @@ pub fn read_tree(args: &[String]) -> Result<ExitCode> {
 
     // ---- Merge safety checks, before touching anything. ----
     // Needed for the checks, and for `--reset -u` to know which files to restore.
-    let dirty = if o.checked() || (o.reset && o.update) {
-        worktree_dirty(&repo)?
+    // Both are decided from `stat` data against the OLD index, which is what
+    // `verify_uptodate_1`/`oneway_merge` compare against (`o->src_index`).
+    let (dirty, absent) = if o.checked() || (o.reset && o.update) {
+        let stat_ctx = StatCtx::new(&repo, &old)?;
+        let dirty = worktree_dirty(&repo, &old, &stat_ctx);
+        let absent = if o.reset && o.update {
+            worktree_absent(&repo, &old, &stat_ctx)
+        } else {
+            HashSet::new()
+        };
+        (dirty, absent)
     } else {
-        HashSet::new()
+        (HashSet::new(), HashSet::new())
     };
 
     if o.checked() {
@@ -518,7 +561,16 @@ pub fn read_tree(args: &[String]) -> Result<ExitCode> {
         // `--reset` also restores tracked files that drifted from the index.
         let mut wanted = changed.clone();
         if o.reset {
-            wanted.extend(new_paths.iter().filter(|p| dirty.contains(*p)).cloned());
+            // `oneway_merge`: for an entry the tree leaves alone, `--reset -u`
+            // still writes the file when `lstat()` fails *or* `ie_match_stat()`
+            // reports a change — so a deleted worktree file comes back even
+            // though its index entry never moved.
+            wanted.extend(
+                new_paths
+                    .iter()
+                    .filter(|p| dirty.contains(*p) || absent.contains(*p))
+                    .cloned(),
+            );
         }
         checkout_subset(&repo, &mut new_index, &wanted)?;
         for path in &removed {
@@ -626,6 +678,527 @@ fn bind_prefix(
     Ok(Ok(index))
 }
 
+/// `read-tree -m` (or `--reset`) with two or three trees: the two- and
+/// three-tree merges of `unpack-trees.c`.
+///
+/// Decisions are made per path over the union of the index's and the trees'
+/// paths, rather than by `traverse_trees()`'s simultaneous walk. Every merge
+/// function is a faithful port; what the walk adds beyond them is
+/// directory/file-conflict detection (git substitutes `o->df_conflict_entry` for
+/// a slot whose path is a directory in that tree) and sparse-directory handling.
+/// Neither is reproduced here, so a path that is a file in one tree and a
+/// directory in another is merged as if the directory side were simply absent.
+#[allow(clippy::too_many_arguments)]
+fn multi_tree_read(
+    repo: &gix::Repository,
+    o: &Opts,
+    old: &gix::index::File,
+    tree_ids: &[ObjectId],
+    depth_limit: i64,
+    fsync: &crate::config::FsyncPolicy,
+) -> Result<ExitCode> {
+    // Each tree, flattened to path → entry, with `core.maxTreeDepth` charged as
+    // it is for every other form.
+    let mut trees: Vec<HashMap<BString, Ce>> = Vec::with_capacity(tree_ids.len());
+    for id in tree_ids {
+        let from_tree = repo.index_from_tree(id)?;
+        if !within_tree_depth(&from_tree, depth_limit) {
+            eprintln!("error: {TOO_DEEP}");
+            return Ok(ExitCode::from(128));
+        }
+        let backing = from_tree.path_backing();
+        trees.push(
+            from_tree
+                .entries()
+                .iter()
+                .map(|e| {
+                    (
+                        e.path_in(backing).to_owned(),
+                        Ce { id: e.id, mode: e.mode, conflicted: false },
+                    )
+                })
+                .collect(),
+        );
+    }
+
+    // `read_index_unmerged()` collapses a conflicted path into one `CE_CONFLICTED`
+    // existence marker; `-m` has already refused such an index, so this only
+    // matters under `--reset`.
+    let mut index_slots: HashMap<BString, Ce> = HashMap::new();
+    let mut old_stats: HashMap<BString, Stat> = HashMap::new();
+    {
+        let backing = old.path_backing();
+        for e in old.entries() {
+            let path = e.path_in(backing).to_owned();
+            let conflicted = e.stage_raw() != 0;
+            let slot = Ce { id: e.id, mode: e.mode, conflicted };
+            match index_slots.get(&path) {
+                // Keep the first (lowest) stage, as `read_index_unmerged` does.
+                Some(existing) if existing.conflicted => {}
+                _ => {
+                    index_slots.insert(path.clone(), slot);
+                    old_stats.insert(path, e.stat);
+                }
+            }
+        }
+    }
+
+    let mut paths: BTreeSet<BString> = index_slots.keys().cloned().collect();
+    for tree in &trees {
+        paths.extend(tree.keys().cloned());
+    }
+
+    let stat_ctx = StatCtx::new(repo, old)?;
+    let ctx = MergeCtx {
+        repo,
+        old,
+        stat: &stat_ctx,
+        update: o.update,
+        index_only: o.index_only,
+        reset: o.reset,
+        aggressive: o.aggressive,
+    };
+    // `is_index_unborn()`: an index that was never written has nothing to carry.
+    let initial_checkout = old.entries().is_empty();
+    let head_idx = if trees.len() == 2 { 1 } else { trees.len() - 1 };
+
+    let mut result: Vec<(BString, Ce, u8, bool)> = Vec::new();
+    let mut removed: BTreeSet<BString> = BTreeSet::new();
+    let mut nontrivial = false;
+
+    for path in &paths {
+        let mut stages: Vec<Option<Ce>> = Vec::with_capacity(trees.len() + 1);
+        stages.push(index_slots.get(path).copied());
+        for tree in &trees {
+            stages.push(tree.get(path).copied());
+        }
+
+        let verdict = if trees.len() == 2 {
+            twoway_merge(
+                &ctx,
+                [stages[0], stages[1], stages[2]],
+                path.as_bstr(),
+                initial_checkout,
+            )
+        } else {
+            threeway_merge(&ctx, &stages, head_idx, path.as_bstr()).map(|(v, nt)| {
+                nontrivial |= nt;
+                v
+            })
+        };
+        match verdict {
+            Ok(Verdict::Keep(kept)) => {
+                for (ce, stage) in kept {
+                    result.push((path.clone(), ce, stage, false));
+                }
+            }
+            Ok(Verdict::Merge { ce, update }) => result.push((path.clone(), ce, 0, update)),
+            Ok(Verdict::Delete) => {
+                removed.insert(path.clone());
+            }
+            Ok(Verdict::Nothing) => {}
+            Err(message) => return rejected(message),
+        }
+    }
+
+    // `--trivial`: refuse a merge any path could not resolve without file-level
+    // merging, after the whole traversal (unpack_trees.c).
+    if o.trivial && nontrivial {
+        return rejected("Merge requires file-level merging");
+    }
+
+    // A path that stays in the index but was not in the result set is gone.
+    let kept_paths: HashSet<&BString> = result.iter().map(|(p, ..)| p).collect();
+    for path in index_slots.keys() {
+        if !kept_paths.contains(path) {
+            removed.insert(path.clone());
+        }
+    }
+
+    if o.dry_run {
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    // ---- Assemble the result index. ----
+    let mut new_index =
+        gix::index::File::from_state(gix::index::State::new(repo.object_hash()), repo.index_path());
+    let mut wanted: BTreeSet<BString> = BTreeSet::new();
+    for (path, ce, stage, update) in &result {
+        // "Take the stat information from stage0": an entry carried through
+        // unchanged keeps the stat cache it already had, so a later `git status`
+        // does not see the whole index as freshly touched.
+        let stat = match old_stats.get(path) {
+            Some(stat) if !*update => *stat,
+            _ => Stat::default(),
+        };
+        let flags = gix::index::entry::Flags::from(stage_enum(u32::from(*stage)));
+        new_index.dangerously_push_entry(stat, ce.id, flags, ce.mode, path.as_bstr());
+        if *update && *stage == 0 {
+            wanted.insert(path.clone());
+        }
+    }
+    new_index.sort_entries();
+
+    if o.update {
+        checkout_subset(repo, &mut new_index, &wanted)?;
+        for path in &removed {
+            if let Some(full) = repo.workdir_path(path.as_bstr()) {
+                let _ = std::fs::remove_file(full);
+            }
+        }
+    }
+
+    if let Some(out) = &o.index_output {
+        new_index.set_path(out.clone());
+    }
+    new_index.remove_tree();
+    new_index.write(crate::config::index_write_options(repo))?;
+    fsync.harden_path(crate::config::FsyncComponent::Index, new_index.path());
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Map a raw stage number (0..=3) to gitoxide's `Stage`.
+fn stage_enum(stage: u32) -> gix::index::entry::Stage {
+    use gix::index::entry::Stage;
+    match stage {
+        0 => Stage::Unconflicted,
+        1 => Stage::Base,
+        2 => Stage::Ours,
+        _ => Stage::Theirs,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The two- and three-tree merges (`unpack-trees.c`)
+// ---------------------------------------------------------------------------
+
+/// One `src[]` slot of `unpack_trees`' merge functions: an index or tree entry.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Ce {
+    id: ObjectId,
+    mode: Mode,
+    /// `CE_CONFLICTED`, which `same()` treats as "never equal to anything".
+    conflicted: bool,
+}
+
+/// git's `same()`: two slots agree when both are absent, or both are present,
+/// unconflicted, and carry the same mode and object id.
+fn same(a: Option<Ce>, b: Option<Ce>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => !(a.conflicted || b.conflicted) && a.mode == b.mode && a.id == b.id,
+        _ => false,
+    }
+}
+
+/// What the merge decided for one path.
+enum Verdict {
+    /// `keep_entry()`: carry the slot through at the given stage, untouched.
+    Keep(Vec<(Ce, u8)>),
+    /// `merged_entry()`: the result is this slot at stage 0. `update` is git's
+    /// `CE_UPDATE` — cleared when the old index entry already matched, which is
+    /// what stops a matching worktree file from being rewritten.
+    Merge { ce: Ce, update: bool },
+    /// `deleted_entry()`: the path leaves the index (and the worktree under `-u`).
+    Delete,
+    /// The path contributes nothing (git's `return 0` with no `add_entry`).
+    Nothing,
+}
+
+/// The safety checks and option state the merge functions consult.
+struct MergeCtx<'a> {
+    repo: &'a gix::Repository,
+    old: &'a gix::index::File,
+    stat: &'a StatCtx,
+    update: bool,
+    index_only: bool,
+    reset: bool,
+    aggressive: bool,
+}
+
+impl MergeCtx<'_> {
+    /// git's `verify_uptodate()`: refuse to overwrite a worktree file that has
+    /// drifted from the index entry naming it.
+    fn verify_uptodate(&self, path: &gix::bstr::BStr) -> std::result::Result<(), String> {
+        if self.index_only || self.reset {
+            return Ok(());
+        }
+        let Some(entry) = self.old.entry_by_path(path) else {
+            return Ok(());
+        };
+        match self.stat.probe(self.repo, entry, path) {
+            // `errno == ENOENT` is up to date: there is nothing to lose.
+            Probe::Absent | Probe::Uptodate => Ok(()),
+            Probe::Changed => Err(format!(
+                "Entry '{}' not uptodate. Cannot merge.",
+                path.to_str_lossy()
+            )),
+        }
+    }
+
+    /// git's `verify_absent()`: refuse to write over an untracked worktree file.
+    ///
+    /// `overwritten` picks between git's two messages — a path being created
+    /// clobbers a file, a path being dropped removes one.
+    fn verify_absent(
+        &self,
+        path: &gix::bstr::BStr,
+        overwritten: bool,
+    ) -> std::result::Result<(), String> {
+        if self.index_only || !self.update || self.reset {
+            return Ok(());
+        }
+        let exists = self
+            .repo
+            .workdir_path(path)
+            .is_some_and(|p| p.symlink_metadata().is_ok());
+        if !exists {
+            return Ok(());
+        }
+        let shown = path.to_str_lossy();
+        Err(if overwritten {
+            format!("Untracked working tree file '{shown}' would be overwritten by merge.")
+        } else {
+            format!("Untracked working tree file '{shown}' would be removed by merge.")
+        })
+    }
+
+    /// git's `merged_entry()`, minus the sparse-checkout and submodule arms.
+    fn merged_entry(
+        &self,
+        ce: Ce,
+        old: Option<Ce>,
+        path: &gix::bstr::BStr,
+    ) -> std::result::Result<Verdict, String> {
+        match old {
+            None => {
+                self.verify_absent(path, true)?;
+                Ok(Verdict::Merge { ce, update: true })
+            }
+            // "See if we can re-use the old CE directly? That way we get the
+            // uptodate stat info. This also removes the UPDATE flag on a match;
+            // otherwise we will end up overwriting local changes in the work tree."
+            Some(old) if !old.conflicted => {
+                if same(Some(old), Some(ce)) {
+                    Ok(Verdict::Merge { ce, update: false })
+                } else {
+                    self.verify_uptodate(path)?;
+                    Ok(Verdict::Merge { ce, update: true })
+                }
+            }
+            // "Previously unmerged entry left as an existence marker."
+            Some(_) => Ok(Verdict::Merge { ce, update: true }),
+        }
+    }
+
+    /// git's `deleted_entry()`.
+    fn deleted_entry(
+        &self,
+        old: Option<Ce>,
+        path: &gix::bstr::BStr,
+    ) -> std::result::Result<Verdict, String> {
+        let Some(old) = old else {
+            self.verify_absent(path, false)?;
+            return Ok(Verdict::Nothing);
+        };
+        if !old.conflicted {
+            self.verify_uptodate(path)?;
+        }
+        Ok(Verdict::Delete)
+    }
+}
+
+/// git's `reject_merge()` message.
+fn reject_merge(path: &gix::bstr::BStr) -> String {
+    format!(
+        "Entry '{}' would be overwritten by merge. Cannot merge.",
+        path.to_str_lossy()
+    )
+}
+
+/// git's `twoway_merge()`: the "carry forward" table of `git-read-tree(1)`.
+///
+/// `src` is `[index, oldtree, newtree]`. `initial_checkout` is
+/// `is_index_unborn()`, which lets a two-tree read populate an empty index
+/// instead of refusing the staged-deletion case.
+fn twoway_merge(
+    ctx: &MergeCtx<'_>,
+    src: [Option<Ce>; 3],
+    path: &gix::bstr::BStr,
+    initial_checkout: bool,
+) -> std::result::Result<Verdict, String> {
+    let [current, oldtree, newtree] = src;
+
+    if let Some(cur) = current {
+        if cur.conflicted {
+            if same(oldtree, newtree) || ctx.reset {
+                return match newtree {
+                    None => ctx.deleted_entry(current, path),
+                    Some(new) => ctx.merged_entry(new, current, path),
+                };
+            }
+            return Err(reject_merge(path));
+        }
+        // 4 and 5; 6 and 7; 14 and 15; 18 and 19.
+        if (oldtree.is_none() && newtree.is_none())
+            || (oldtree.is_none() && newtree.is_some() && same(current, newtree))
+            || (oldtree.is_some() && newtree.is_some() && same(oldtree, newtree))
+            || (oldtree.is_some()
+                && newtree.is_some()
+                && !same(oldtree, newtree)
+                && same(current, newtree))
+        {
+            return Ok(Verdict::Keep(vec![(cur, 0)]));
+        }
+        // 10 or 11.
+        if oldtree.is_some() && newtree.is_none() && same(current, oldtree) {
+            return ctx.deleted_entry(current, path);
+        }
+        // 20 or 21.
+        if let (Some(_), Some(new)) = (oldtree, newtree) {
+            if same(current, oldtree) && !same(current, newtree) {
+                return ctx.merged_entry(new, current, path);
+            }
+        }
+        return Err(reject_merge(path));
+    }
+
+    if let Some(new) = newtree {
+        if oldtree.is_some() && !initial_checkout {
+            // "deletion of the path was staged"
+            if same(oldtree, newtree) {
+                return Ok(Verdict::Nothing);
+            }
+            return Err(reject_merge(path));
+        }
+        return ctx.merged_entry(new, current, path);
+    }
+    ctx.deleted_entry(current, path)
+}
+
+/// git's `threeway_merge()`. `stages` is `[index, ancestors…, head, remote]`,
+/// indexed exactly as git indexes it, with `head_idx` naming the head slot.
+///
+/// Returns the verdict plus whether the path took the "no merge" path, which is
+/// git's `o->internal.nontrivial_merge` and what `--trivial` refuses.
+fn threeway_merge(
+    ctx: &MergeCtx<'_>,
+    stages: &[Option<Ce>],
+    head_idx: usize,
+    path: &gix::bstr::BStr,
+) -> std::result::Result<(Verdict, bool), String> {
+    let remote = stages[head_idx + 1];
+    let index = stages[0];
+    let head = stages[head_idx];
+
+    let mut any_anc_missing = false;
+    let mut no_anc_exists = true;
+    for stage in &stages[1..head_idx] {
+        if stage.is_none() {
+            any_anc_missing = true;
+        } else {
+            no_anc_exists = false;
+        }
+    }
+
+    // "First, if there's a #16 situation, note that to prevent #13 and #14."
+    let mut head_match = 0usize;
+    let mut remote_match = 0usize;
+    if !same(remote, head) {
+        for (i, stage) in stages.iter().enumerate().take(head_idx).skip(1) {
+            if same(*stage, head) {
+                head_match = i;
+            }
+            if same(*stage, remote) {
+                remote_match = i;
+            }
+        }
+    }
+
+    // #14, #14ALT, #2ALT — the index is allowed to match the result, not head.
+    if let Some(rem) = remote {
+        if head_match != 0 && remote_match == 0 {
+            if index.is_some() && !same(index, remote) && !same(index, head) {
+                return Err(reject_merge(path));
+            }
+            return Ok((ctx.merged_entry(rem, index, path)?, false));
+        }
+    }
+    // Otherwise an index entry has to match head.
+    if index.is_some() && !same(index, head) {
+        return Err(reject_merge(path));
+    }
+
+    if let Some(h) = head {
+        // #5ALT, #15.
+        if same(head, remote) {
+            return Ok((ctx.merged_entry(h, index, path)?, false));
+        }
+        // #13, #3ALT.
+        if remote_match != 0 && head_match == 0 {
+            return Ok((ctx.merged_entry(h, index, path)?, false));
+        }
+    }
+
+    // #1.
+    if head.is_none() && remote.is_none() && any_anc_missing {
+        return Ok((Verdict::Nothing, false));
+    }
+
+    // "Under the 'aggressive' rule, we resolve mostly trivial cases that we
+    // historically had git-merge-one-file resolve."
+    if ctx.aggressive {
+        let head_deleted = head.is_none();
+        let remote_deleted = remote.is_none();
+        let ce = index
+            .or(head)
+            .or(remote)
+            .or_else(|| stages[1..head_idx].iter().copied().flatten().next());
+
+        // Deleted in both; deleted in one and unchanged in the other.
+        if (head_deleted && remote_deleted)
+            || (head_deleted && remote.is_some() && remote_match != 0)
+            || (remote_deleted && head.is_some() && head_match != 0)
+        {
+            if index.is_some() {
+                return Ok((ctx.deleted_entry(index, path)?, false));
+            }
+            if ce.is_some() && !head_deleted {
+                ctx.verify_absent(path, false)?;
+            }
+            return Ok((Verdict::Nothing, false));
+        }
+        // Added in both, identically.
+        if no_anc_exists && head.is_some() && remote.is_some() && same(head, remote) {
+            return Ok((ctx.merged_entry(head.expect("checked"), index, path)?, false));
+        }
+    }
+
+    // "Handle 'no merge' cases": the path stays conflicted, so make sure the
+    // worktree copy is not about to be lost.
+    if index.is_some() {
+        ctx.verify_uptodate(path)?;
+    }
+
+    // #2, #3, #4, #6, #7, #9, #10, #11.
+    let mut kept: Vec<(Ce, u8)> = Vec::new();
+    if head_match == 0 || remote_match == 0 {
+        for (i, stage) in stages.iter().enumerate().take(head_idx).skip(1) {
+            if let Some(ce) = stage {
+                kept.push((*ce, u8::try_from(i).unwrap_or(1)));
+                break;
+            }
+        }
+    }
+    if let Some(h) = head {
+        kept.push((h, u8::try_from(head_idx).unwrap_or(2)));
+    }
+    if let Some(r) = remote {
+        kept.push((r, u8::try_from(head_idx + 1).unwrap_or(3)));
+    }
+    Ok((Verdict::Keep(kept), true))
+}
+
 /// Path → (id, mode, stat) for the stage-0 entries of `index`.
 fn stage0_map(index: &gix::index::File) -> HashMap<BString, (ObjectId, Mode, Stat)> {
     let backing = index.path_backing();
@@ -637,41 +1210,253 @@ fn stage0_map(index: &gix::index::File) -> HashMap<BString, (ObjectId, Mode, Sta
         .collect()
 }
 
-/// Tracked paths whose worktree content differs from the current index.
+/// What one `lstat()` of the worktree file behind an index entry says about it.
 ///
-/// A path missing from the worktree is deliberately *not* reported: git's
-/// `verify_uptodate` treats `ENOENT` as up to date.
-fn worktree_dirty(repo: &gix::Repository) -> Result<HashSet<BString>> {
-    use gix::status::index_worktree::Item;
-    use gix::status::plumbing::index_as_worktree::{Change, EntryStatus};
+/// The three outcomes are what git's callers actually branch on: `verify_uptodate_1`
+/// treats `ENOENT` as up to date and only a *stat mismatch* as a reason to refuse,
+/// while `oneway_merge`'s `--reset -u` arm restores the file for **either**
+/// (`if (lstat(...) || ie_match_stat(...)) update |= CE_UPDATE`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Probe {
+    /// `lstat()` failed — the file is gone from the worktree.
+    Absent,
+    /// Present, and `ie_match_stat()` reports no change.
+    Uptodate,
+    /// Present, and `ie_match_stat()` reports a change.
+    Changed,
+}
 
-    if repo.workdir().is_none() {
-        return Ok(HashSet::new());
+/// The `stat`-comparison context `ie_match_stat()` needs, resolved once.
+///
+/// git decides up-to-dateness from `stat` data, not from content: an entry whose
+/// mtime/size/inode moved is "not uptodate" even when the bytes are unchanged.
+/// That distinction is load-bearing — `read-tree -m` refuses on it, and
+/// `read-tree --reset -u` / `checkout -f` rewrite the file because of it.
+pub(super) struct StatCtx {
+    workdir: Option<PathBuf>,
+    /// `core.trustCtime` / `core.checkStat`, as `Stat::matches` consumes them.
+    opts: gix::index::entry::stat::Options,
+    /// `istate->timestamp`: the index file's own mtime, for the racy-git check.
+    timestamp: gix::index::entry::stat::Time,
+    /// `trust_executable_bit` (`core.fileMode`).
+    trust_executable_bit: bool,
+}
+
+impl StatCtx {
+    pub(super) fn new(repo: &gix::Repository, index: &gix::index::File) -> Result<Self> {
+        Ok(Self {
+            workdir: repo.workdir().map(Path::to_owned),
+            opts: repo.stat_options()?,
+            timestamp: index.timestamp().into(),
+            trust_executable_bit: repo
+                .config_snapshot()
+                .boolean("core.fileMode")
+                .unwrap_or(true),
+        })
     }
 
-    let patterns: Vec<BString> = Vec::new();
-    let iter = repo
-        .status(gix::progress::Discard)?
-        .untracked_files(gix::status::UntrackedFiles::None)
-        .into_index_worktree_iter(patterns)?;
+    /// `lstat()` + `ie_match_stat()` for one entry, named by its index path.
+    pub(super) fn probe(
+        &self,
+        repo: &gix::Repository,
+        entry: &gix::index::Entry,
+        path: &gix::bstr::BStr,
+    ) -> Probe {
+        let Some(workdir) = &self.workdir else {
+            return Probe::Absent;
+        };
+        let full = workdir.join(gix::path::from_bstr(path).as_ref());
+        let Ok(meta) = gix::index::fs::Metadata::from_path_no_follow(&full) else {
+            return Probe::Absent;
+        };
+        // "Historic default policy was to allow submodule to be out of sync wrt
+        // the superproject index" — `verify_uptodate_1` returns 0 for a gitlink
+        // whatever the stat says, and `oneway_merge` only moves one behind
+        // `should_update_submodules()`, which this port does not do.
+        if entry.mode.contains(Mode::COMMIT) {
+            return Probe::Uptodate;
+        }
+        // `ce_intent_to_add()`: "the index entry by definition never matches
+        // what is in the work tree until it actually gets added".
+        if entry.flags.contains(gix::index::entry::Flags::INTENT_TO_ADD) {
+            return Probe::Changed;
+        }
+        if self.basic_changed(entry, &meta) {
+            return Probe::Changed;
+        }
+        // Racily clean: the entry's mtime is not older than the index's own, so
+        // the stat data cannot prove the file is unchanged. `ie_match_stat` falls
+        // back to `ce_modified_check_fs`, which compares the content.
+        if self.is_racy(entry) && self.content_differs(repo, entry, &full, &meta) {
+            return Probe::Changed;
+        }
+        Probe::Uptodate
+    }
 
-    let mut dirty = HashSet::new();
-    for item in iter {
-        if let Item::Modification {
-            rela_path,
-            status:
-                EntryStatus::Change(
-                    Change::Modification { .. }
-                    | Change::Type { .. }
-                    | Change::SubmoduleModification(_),
-                ),
-            ..
-        } = item?
-        {
-            dirty.insert(rela_path);
+    /// git's `is_racy_stat()`: an entry whose mtime is not older than the index's
+    /// own timestamp cannot be proven clean from `stat` data alone. A zero index
+    /// timestamp (an index never written to disk) disables the check entirely.
+    fn is_racy(&self, entry: &gix::index::Entry) -> bool {
+        use std::cmp::Ordering;
+        if self.timestamp.secs == 0 {
+            return false;
+        }
+        match self.timestamp.secs.cmp(&entry.stat.mtime.secs) {
+            Ordering::Less => true,
+            Ordering::Equal if self.opts.use_nsec && self.opts.check_stat => {
+                self.timestamp.nsecs <= entry.stat.mtime.nsecs
+            }
+            Ordering::Equal => true,
+            Ordering::Greater => false,
         }
     }
-    Ok(dirty)
+
+    /// git's `ce_match_stat_basic()`: the type/mode check, then `match_stat_data`,
+    /// then the racily-smudged zero-size special case.
+    fn basic_changed(&self, entry: &gix::index::Entry, meta: &gix::index::fs::Metadata) -> bool {
+        match entry.mode {
+            Mode::FILE | Mode::FILE_EXECUTABLE => {
+                if !meta.is_file() {
+                    return true;
+                }
+                // "We consider only the owner x bit to be relevant for mode changes."
+                if self.trust_executable_bit
+                    && meta.is_executable() != (entry.mode == Mode::FILE_EXECUTABLE)
+                {
+                    return true;
+                }
+            }
+            Mode::SYMLINK => {
+                if !meta.is_symlink() {
+                    return true;
+                }
+            }
+            _ => return true,
+        }
+        let Ok(now) = gix::index::entry::Stat::from_fs(meta) else {
+            return true;
+        };
+        if self.stat_data_changed(&entry.stat, &now) {
+            return true;
+        }
+        // "Racily smudged entry?": a zero recorded size for a non-empty blob is
+        // how `ce_smudge_racily_clean_entry` marks an entry as needing a real look.
+        entry.stat.size == 0 && !entry.id.is_empty_blob()
+    }
+
+    /// git's `match_stat_data()` (statinfo.c), field for field.
+    ///
+    /// Not `gix_index::entry::Stat::matches`, which gates the `ctime` comparison
+    /// on `trust_ctime` alone; git gates it on `trust_ctime && check_stat`, so
+    /// under `core.checkStat=minimal` gix rejects a file whose ctime moved while
+    /// git accepts it. That is the whole point of `minimal` — the setting exists
+    /// for filesystems and copies that do not preserve ctime or inode — and
+    /// getting it wrong turns every such entry into a spurious
+    /// "not uptodate. Cannot merge."
+    fn stat_data_changed(
+        &self,
+        sd: &gix::index::entry::Stat,
+        now: &gix::index::entry::Stat,
+    ) -> bool {
+        let Options {
+            trust_ctime,
+            check_stat,
+            use_nsec,
+            use_stdev,
+        } = self.opts;
+        if sd.mtime.secs != now.mtime.secs {
+            return true;
+        }
+        if trust_ctime && check_stat && sd.ctime.secs != now.ctime.secs {
+            return true;
+        }
+        if use_nsec {
+            if check_stat && sd.mtime.nsecs != now.mtime.nsecs {
+                return true;
+            }
+            if trust_ctime && check_stat && sd.ctime.nsecs != now.ctime.nsecs {
+                return true;
+            }
+        }
+        if check_stat {
+            if sd.uid != now.uid || sd.gid != now.gid {
+                return true;
+            }
+            if sd.ino != now.ino {
+                return true;
+            }
+            if use_stdev && sd.dev != now.dev {
+                return true;
+            }
+        }
+        sd.size != now.size
+    }
+
+    /// git's `ce_modified_check_fs()`, reached only for a racily-clean entry.
+    ///
+    /// git re-hashes the worktree file and compares object ids; comparing the
+    /// stored blob's bytes is the same decision one step earlier, and matches this
+    /// port's `git add`, which likewise hashes worktree bytes without filtering.
+    fn content_differs(
+        &self,
+        repo: &gix::Repository,
+        entry: &gix::index::Entry,
+        full: &Path,
+        meta: &gix::index::fs::Metadata,
+    ) -> bool {
+        let Ok(blob) = repo.find_object(entry.id) else {
+            return true;
+        };
+        if meta.is_symlink() {
+            return match std::fs::read_link(full) {
+                Ok(target) => gix::path::into_bstr(target).as_ref() != blob.data.as_slice(),
+                Err(_) => true,
+            };
+        }
+        match std::fs::read(full) {
+            Ok(bytes) => bytes != blob.data,
+            Err(_) => true,
+        }
+    }
+}
+
+/// Tracked paths whose worktree file `ie_match_stat()` reports as changed.
+///
+/// A path missing from the worktree is deliberately *not* reported: git's
+/// `verify_uptodate_1` treats `ENOENT` as up to date. `--reset -u` needs the
+/// missing ones too and collects them separately via [`StatCtx::probe`].
+fn worktree_dirty(
+    repo: &gix::Repository,
+    index: &gix::index::File,
+    ctx: &StatCtx,
+) -> HashSet<BString> {
+    let backing = index.path_backing();
+    index
+        .entries()
+        .iter()
+        .filter(|e| e.stage_raw() == 0)
+        .filter(|e| ctx.probe(repo, e, e.path_in(backing)) == Probe::Changed)
+        .map(|e| e.path_in(backing).to_owned())
+        .collect()
+}
+
+/// Tracked paths whose worktree file is gone (`lstat` → `ENOENT`).
+///
+/// `oneway_merge` restores these under `--reset -u`: the entry is unchanged, so
+/// nothing else marks the path for a write, yet the file has to come back.
+fn worktree_absent(
+    repo: &gix::Repository,
+    index: &gix::index::File,
+    ctx: &StatCtx,
+) -> HashSet<BString> {
+    let backing = index.path_backing();
+    index
+        .entries()
+        .iter()
+        .filter(|e| e.stage_raw() == 0)
+        .filter(|e| ctx.probe(repo, e, e.path_in(backing)) == Probe::Absent)
+        .map(|e| e.path_in(backing).to_owned())
+        .collect()
 }
 
 /// Check out exactly the entries of `index` named by `wanted`, then carry the stat

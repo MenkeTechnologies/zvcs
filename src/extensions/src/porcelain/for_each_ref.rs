@@ -17,12 +17,26 @@
 //! `parse-options` paths (a missing option value, a bad `--contains` or
 //! `--points-at` operand, an unknown option).
 //!
-//! Not covered — rejected rather than silently producing divergent output: the
-//! atoms that need substrate this module does not build (`%(upstream)`,
-//! `%(push)`, `%(if)`, `%(describe)`, `%(worktreepath)`, `%(trailers)`,
-//! `%(signature)`, `%(raw)`, `%(deltabase)`, `%(ahead-behind)`, `%(is-base)`,
-//! `%(objectsize:disk)`). Those names are still recognised as *valid* git
-//! atoms, so an unknown field name is reported the way git reports it.
+//! The conditional `%(if[:equals=<v>|:notequals=<v>])` / `%(then)` / `%(else)` /
+//! `%(end)` runs on the same formatting stack git uses, so the quoting rules
+//! follow too: literals are never quoted, an atom is quoted only outside any
+//! container, and a container's whole output is quoted when it closes.
+//! Unbalanced containers are reported while formatting a ref, exactly as git
+//! does, which is why a repository with no refs accepts a format missing its
+//! `%(end)`.
+//!
+//! `%(upstream)` and `%(push)` cover the full option set (`:track`,
+//! `:trackshort`, `:nobracket`, `:remotename`, `:remoteref`, and the
+//! `%(refname)` modifiers). `%(describe)` runs the `describe` subcommand as a
+//! subprocess, as git does, so its options stay on one implementation.
+//!
+//! Not covered — rejected rather than silently producing divergent output:
+//! `%(trailers)` (needs `trailer.c`'s parser, which lives in
+//! [`super::interpret_trailers`]), `%(signature)` (needs gpg's raw output,
+//! fingerprint and primary-key fingerprint, which [`crate::gitsig`] does not
+//! carry), `%(deltabase)` and `%(is-base)`. Those names are still recognised as
+//! *valid* git atoms, so an unknown field name is reported the way git reports
+//! it. `%(rest)` is refused the way git refuses it for this command.
 //!
 //! One known divergence: the `:short` renderings (`%(objectname:short)`,
 //! `%(tree:short)`, `%(parent:short)`) take their length from gitoxide's
@@ -69,10 +83,67 @@ enum Field {
     /// `%(color:<spec>)`, pre-rendered: the escape sequence, or empty when
     /// colour is off for this run.
     Color(Vec<u8>),
+    /// `%(upstream[:<opts>])` — the remote-tracking ref a local branch tracks.
+    Upstream(RemoteRef),
+    /// `%(push[:<opts>])` — where a local branch would push.
+    Push(RemoteRef),
+    /// `%(flag)` — `symref` and/or `packed`, comma-joined.
+    Flag,
+    /// `%(worktreepath)` — the working tree that has this branch checked out.
+    WorktreePath,
+    /// `%(describe[:<opts>])`, carrying the argument vector git hands to the
+    /// `describe` subprocess.
+    Describe(Vec<String>),
+    /// `%(ahead-behind:<committish>)` — the resolved base commit.
+    AheadBehind(ObjectId),
+    /// `%(objectsize:disk)`.
+    ObjectSizeDisk,
+    /// `%(raw)` (`false`) and `%(raw:size)` (`true`).
+    Raw(bool),
+}
+
+/// git's `remote_ref` atom options, shared by `%(upstream)` and `%(push)`.
+#[derive(Clone)]
+#[cfg_attr(test, derive(Debug))]
+struct RemoteRef {
+    option: RrOption,
+    /// `nobracket` — drop the `[...]` around a `:track` rendering.
+    nobracket: bool,
+    /// Set by `remotename` / `remoteref`, which name the remote rather than the
+    /// tracking ref, so `%(push:remotename)` never resolves a push destination.
+    push_remote: bool,
+}
+
+/// Which rendering a `%(upstream)` / `%(push)` atom asks for.
+#[derive(Clone)]
+#[cfg_attr(test, derive(Debug))]
+enum RrOption {
+    /// The default: the tracking refname itself, under `%(refname)`'s modifiers.
+    Ref(NameMod),
+    /// `:track` — `ahead N`/`behind N`/`ahead N, behind M`/`gone`.
+    Track,
+    /// `:trackshort` — `=`, `<`, `>` or `<>`.
+    TrackShort,
+    /// `:remotename` — the configured remote's name.
+    RemoteName,
+    /// `:remoteref` — the ref name on the remote side.
+    RemoteRefName,
+}
+
+/// `%(if)`'s comparison mode (git's `cmp_status`).
+#[derive(Clone)]
+enum Cmp {
+    /// Bare `%(if)`: any non-blank content satisfies the condition.
+    None,
+    /// `%(if:equals=<v>)`.
+    Equal(String),
+    /// `%(if:notequals=<v>)`.
+    Unequal(String),
 }
 
 /// Modifiers accepted by `%(refname)` and `%(symref)`.
 #[derive(Clone)]
+#[cfg_attr(test, derive(Debug))]
 enum NameMod {
     Full,
     Short,
@@ -150,6 +221,10 @@ enum Item {
     Lit(Vec<u8>),
     Atom(Atom),
     AlignStart(AlignSpec),
+    /// `%(if[:equals=<v>|:notequals=<v>])`.
+    IfStart(Cmp),
+    Then,
+    Else,
     End,
 }
 
@@ -198,6 +273,22 @@ struct RefInfo {
     /// Present only when `obj` is a tag object, holding its fully peeled target.
     peeled: Option<ObjInfo>,
     is_head: bool,
+    /// git's `REF_ISPACKED`: the ref has no loose file, so it was read out of
+    /// `packed-refs`. Feeds `%(flag)`.
+    packed: bool,
+}
+
+/// Everything `parse_atom` needs beyond the atom text itself.
+///
+/// `repo` is `None` only in unit tests, which never parse a repository-dependent
+/// atom; an atom that needs one reports the failure git reports when the operand
+/// cannot be resolved rather than quietly accepting it.
+struct AtomCtx<'a> {
+    repo: Option<&'a gix::Repository>,
+    color_on: bool,
+    /// git's `format->quote_style`, which `%(raw)` is rejected under. Sort keys
+    /// parse through a fresh `REF_FORMAT_INIT`, i.e. `QuoteStyle::None`.
+    quote_style: QuoteStyle,
 }
 
 /// Which exit code a format/sort parse failure maps onto.
@@ -205,6 +296,7 @@ struct RefInfo {
 /// git splits these: `verify_ref_format` failures `die()` (128), a malformed
 /// `%(` reaches the `parse-options` usage path (129), and anything this module
 /// simply has not built is reported as an ordinary error.
+#[cfg_attr(test, derive(Debug))]
 enum ErrKind {
     Fatal,
     Usage,
@@ -212,6 +304,7 @@ enum ErrKind {
 }
 
 /// A format or sort-key parse failure, carrying the exit code it implies.
+#[cfg_attr(test, derive(Debug))]
 struct AtomError {
     kind: ErrKind,
     msg: String,
@@ -518,8 +611,13 @@ pub fn for_each_ref(args: &[String]) -> Result<ExitCode> {
 
     // git's order after option parsing: verify the format, then reject the
     // `--start-after` combinations, then parse the sort keys.
-    let items = match parse_format(&format, color_on) {
-        Ok(items) => items,
+    let fmt_ctx = AtomCtx {
+        repo: Some(&repo),
+        color_on,
+        quote_style,
+    };
+    let (items, color_reset_at_eol) = match parse_format(&format, &fmt_ctx) {
+        Ok(v) => v,
         Err(e) => return report_atom_error(e),
     };
 
@@ -544,7 +642,14 @@ pub fn for_each_ref(args: &[String]) -> Result<ExitCode> {
             Some(r) => (r, true),
             None => (spec, false),
         };
-        match parse_atom(spec, color_on) {
+        // git parses a sort key through a fresh `REF_FORMAT_INIT`, so the
+        // format's quoting style does not apply to it.
+        let sort_ctx = AtomCtx {
+            repo: Some(&repo),
+            color_on,
+            quote_style: QuoteStyle::None,
+        };
+        match parse_atom(spec, &sort_ctx) {
             Ok(atom) => sorts.push(SortKey {
                 atom,
                 descending,
@@ -583,7 +688,12 @@ pub fn for_each_ref(args: &[String]) -> Result<ExitCode> {
             .iter()
             .filter_map(|it| match it {
                 Item::Atom(a) => Some(a),
-                Item::Lit(_) | Item::AlignStart(_) | Item::End => None,
+                Item::Lit(_)
+                | Item::AlignStart(_)
+                | Item::IfStart(_)
+                | Item::Then
+                | Item::Else
+                | Item::End => None,
             })
             .chain(sorts.iter().map(|s| &s.atom))
     };
@@ -598,6 +708,7 @@ pub fn for_each_ref(args: &[String]) -> Result<ExitCode> {
                 | Field::TargetName
                 | Field::TargetType
                 | Field::TagName
+                | Field::Raw(_)
         )
     });
     let needs_peel = atoms().any(|a| a.deref);
@@ -701,6 +812,12 @@ pub fn for_each_ref(args: &[String]) -> Result<ExitCode> {
             Vec::new()
         };
 
+        // git's `REF_ISPACKED`. `refs_resolve_ref_unsafe` accumulates flags along
+        // the whole symref chain, so the bit reflects where the object id
+        // finally lives: a loose symref pointing at a packed ref reports
+        // `symref,packed`.
+        let packed = is_packed(&repo, name_str);
+
         refs.push(RefInfo {
             is_head: head_name.as_deref() == Some(refname.as_slice()),
             refname,
@@ -709,71 +826,253 @@ pub fn for_each_ref(args: &[String]) -> Result<ExitCode> {
             symref_short,
             obj,
             peeled,
+            packed,
         });
     }
 
-    let mut refs = sort_refs(&repo, refs, &sorts, ignore_case, &prereleases)?;
+    let ctx = RenderCtx {
+        repo: &repo,
+        worktrees: std::cell::OnceCell::new(),
+    };
+
+    let mut refs = sort_refs(&ctx, refs, &sorts, ignore_case, &prereleases)?;
     if let Some(n) = count {
         refs.truncate(n);
     }
 
     let mut out: Vec<u8> = Vec::new();
     for info in &refs {
-        let mut line: Vec<u8> = Vec::new();
-        // `%(align:…)…%(end)` buffers its content so it can be padded on close;
-        // nested aligns stack, and the innermost buffer is the current target.
-        let mut align_stack: Vec<(AlignSpec, Vec<u8>)> = Vec::new();
-        for item in &items {
-            match item {
-                Item::AlignStart(spec) => align_stack.push((spec.clone(), Vec::new())),
-                Item::End => {
-                    // Balance is guaranteed by parse_format, so a pop always succeeds.
-                    let (spec, buf) = align_stack.pop().expect("balanced by parse");
-                    let padded = pad_align(&buf, &spec);
-                    let target = align_stack
-                        .last_mut()
-                        .map(|(_, b)| b)
-                        .unwrap_or(&mut line);
-                    target.extend_from_slice(&padded);
-                }
-                Item::Lit(bytes) => {
-                    let target = align_stack
-                        .last_mut()
-                        .map(|(_, b)| b)
-                        .unwrap_or(&mut line);
-                    target.extend_from_slice(bytes);
-                }
-                Item::Atom(atom) => {
-                    let value = render(&repo, atom, info)?;
-                    // Colour escapes are emitted verbatim; git does not quote them.
-                    let rendered = if matches!(atom.field, Field::Color(_)) {
-                        value
-                    } else {
-                        match quote_style {
-                            QuoteStyle::None => value,
-                            QuoteStyle::Shell => sq_quote(&value),
-                            QuoteStyle::Perl => perl_quote(&value),
-                            QuoteStyle::Python => python_quote(&value),
-                            QuoteStyle::Tcl => tcl_quote(&value),
-                        }
-                    };
-                    let target = align_stack
-                        .last_mut()
-                        .map(|(_, b)| b)
-                        .unwrap_or(&mut line);
-                    target.extend_from_slice(&rendered);
-                }
-            }
-        }
+        let line = match format_ref(&ctx, &items, info, quote_style, color_reset_at_eol)? {
+            Ok(line) => line,
+            // Every stack error git raises while formatting reaches `die()`.
+            Err(msg) => return Ok(fatal(&msg)),
+        };
         if omit_empty && line.is_empty() {
             continue;
         }
-        line.push(b'\n');
         out.extend_from_slice(&line);
+        out.push(b'\n');
     }
 
     std::io::stdout().write_all(&out)?;
     Ok(ExitCode::SUCCESS)
+}
+
+/// Repository-wide state the renderers share, built at most once per run.
+struct RenderCtx<'a> {
+    repo: &'a gix::Repository,
+    /// git's `ref_to_worktree_map`, lazily initialised exactly as
+    /// `lazy_init_worktree_map` does.
+    worktrees: std::cell::OnceCell<std::collections::HashMap<gix::bstr::BString, String>>,
+}
+
+impl RenderCtx<'_> {
+    fn worktrees(&self) -> &std::collections::HashMap<gix::bstr::BString, String> {
+        self.worktrees
+            .get_or_init(|| super::branch::worktree_map(self.repo))
+    }
+}
+
+/// What closing a formatting-stack frame does — git's `at_end` handler slot.
+enum AtEnd {
+    /// The base frame, which `%(end)` may not close.
+    None,
+    Align(AlignSpec),
+    /// An index into the run's `%(if)` state list; the `%(then)` and `%(else)`
+    /// frames of one conditional share it.
+    If(usize),
+}
+
+/// The mutable half of one `%(if)…%(end)` conditional (git's `struct if_then_else`).
+struct IfState {
+    cmp: Cmp,
+    then_seen: bool,
+    else_seen: bool,
+    satisfied: bool,
+}
+
+/// One formatting-stack frame (git's `struct ref_formatting_stack`).
+struct Frame {
+    output: Vec<u8>,
+    at_end: AtEnd,
+}
+
+/// git's `format_ref_array_item`: run the item stream over one ref.
+///
+/// `Ok(Err(msg))` is a stack error — a `%(then)` with no `%(if)`, an unbalanced
+/// `%(end)` — which git turns into `die()`.
+fn format_ref(
+    ctx: &RenderCtx<'_>,
+    items: &[Item],
+    info: &RefInfo,
+    quote_style: QuoteStyle,
+    color_reset_at_eol: bool,
+) -> Result<std::result::Result<Vec<u8>, String>> {
+    macro_rules! stack_err {
+        ($($arg:tt)*) => {
+            return Ok(Err(format!($($arg)*)))
+        };
+    }
+
+    let mut stack: Vec<Frame> = vec![Frame {
+        output: Vec::new(),
+        at_end: AtEnd::None,
+    }];
+    let mut ifs: Vec<IfState> = Vec::new();
+
+    // git's `append_atom`: an atom is quoted only while the base frame is the
+    // only one on the stack. Inside a container the raw bytes accumulate and the
+    // whole frame is quoted when it closes.
+    let append_value = |stack: &mut Vec<Frame>, value: Vec<u8>| {
+        let quoted = if stack.len() == 1 {
+            quote(&value, quote_style)
+        } else {
+            value
+        };
+        stack
+            .last_mut()
+            .expect("the base frame is never popped")
+            .output
+            .extend_from_slice(&quoted);
+    };
+
+    for item in items {
+        match item {
+            // `append_literal` writes straight into the current frame: literal
+            // text is never quoted.
+            Item::Lit(bytes) => stack
+                .last_mut()
+                .expect("base frame")
+                .output
+                .extend_from_slice(bytes),
+            Item::Atom(atom) => {
+                let value = render(ctx, atom, info)?;
+                append_value(&mut stack, value);
+            }
+            Item::AlignStart(spec) => stack.push(Frame {
+                output: Vec::new(),
+                at_end: AtEnd::Align(spec.clone()),
+            }),
+            Item::IfStart(cmp) => {
+                ifs.push(IfState {
+                    cmp: cmp.clone(),
+                    then_seen: false,
+                    else_seen: false,
+                    satisfied: false,
+                });
+                stack.push(Frame {
+                    output: Vec::new(),
+                    at_end: AtEnd::If(ifs.len() - 1),
+                });
+            }
+            Item::Then => {
+                let cur = stack.last_mut().expect("base frame");
+                let AtEnd::If(idx) = cur.at_end else {
+                    stack_err!("format: %(then) atom used without a %(if) atom");
+                };
+                let st = &mut ifs[idx];
+                if st.then_seen {
+                    stack_err!("format: %(then) atom used more than once");
+                }
+                if st.else_seen {
+                    stack_err!("format: %(then) atom used after %(else)");
+                }
+                st.then_seen = true;
+                // The condition is whatever the `%(if)` frame accumulated.
+                st.satisfied = match &st.cmp {
+                    Cmp::Equal(s) => s.as_bytes() == cur.output.as_slice(),
+                    Cmp::Unequal(s) => s.as_bytes() != cur.output.as_slice(),
+                    // git's `is_empty`, i.e. C `isspace` — which counts the
+                    // vertical tab that Rust's `is_ascii_whitespace` omits.
+                    Cmp::None => !cur
+                        .output
+                        .iter()
+                        .all(|b| b.is_ascii_whitespace() || *b == 0x0b),
+                };
+                cur.output.clear();
+            }
+            Item::Else => {
+                let AtEnd::If(idx) = stack.last().expect("base frame").at_end else {
+                    stack_err!("format: %(else) atom used without a %(if) atom");
+                };
+                if !ifs[idx].then_seen {
+                    stack_err!("format: %(else) atom used without a %(then) atom");
+                }
+                if ifs[idx].else_seen {
+                    stack_err!("format: %(else) atom used more than once");
+                }
+                ifs[idx].else_seen = true;
+                // The `%(else)` branch collects into its own frame, sharing the
+                // conditional's state with the `%(then)` frame beneath it.
+                stack.push(Frame {
+                    output: Vec::new(),
+                    at_end: AtEnd::If(idx),
+                });
+            }
+            Item::End => {
+                match stack.last().expect("base frame").at_end {
+                    AtEnd::None => {
+                        stack_err!("format: %(end) atom used without corresponding atom")
+                    }
+                    AtEnd::Align(_) => {
+                        let cur = stack.last_mut().expect("base frame");
+                        let AtEnd::Align(spec) = &cur.at_end else {
+                            unreachable!("matched above")
+                        };
+                        cur.output = pad_align(&cur.output, spec);
+                    }
+                    AtEnd::If(idx) => {
+                        if !ifs[idx].then_seen {
+                            stack_err!("format: %(if) atom used without a %(then) atom");
+                        }
+                        if ifs[idx].else_seen {
+                            // Two frames are open: `%(then)`'s and `%(else)`'s.
+                            // Exactly one survives.
+                            let else_branch = stack.pop().expect("the %(else) frame");
+                            let then_frame = stack.last_mut().expect("the %(then) frame");
+                            if !ifs[idx].satisfied {
+                                then_frame.output = else_branch.output;
+                            }
+                        } else if !ifs[idx].satisfied {
+                            stack.last_mut().expect("base frame").output.clear();
+                        }
+                    }
+                }
+                // Quote the closed frame when it sat directly on the base frame;
+                // a nested one is quoted later, as part of its parent.
+                let cur = stack.pop().expect("a container frame was open");
+                let content = if stack.len() == 1 {
+                    quote(&cur.output, quote_style)
+                } else {
+                    cur.output
+                };
+                stack
+                    .last_mut()
+                    .expect("base frame")
+                    .output
+                    .extend_from_slice(&content);
+            }
+        }
+    }
+
+    if color_reset_at_eol {
+        append_value(&mut stack, b"\x1b[m".to_vec());
+    }
+    if stack.len() > 1 {
+        stack_err!("format: %(end) atom missing");
+    }
+    Ok(Ok(stack.pop().expect("base frame").output))
+}
+
+/// Apply one of the four `--shell`/`--perl`/`--python`/`--tcl` quoting styles.
+fn quote(value: &[u8], style: QuoteStyle) -> Vec<u8> {
+    match style {
+        QuoteStyle::None => value.to_vec(),
+        QuoteStyle::Shell => sq_quote(value),
+        QuoteStyle::Perl => perl_quote(value),
+        QuoteStyle::Python => python_quote(value),
+        QuoteStyle::Tcl => tcl_quote(value),
+    }
 }
 
 /// git's `OPT_INTEGER` operand: a decimal count with an optional `k`/`m`/`g`
@@ -858,11 +1157,18 @@ fn is_ancestor(repo: &gix::Repository, ancestor: ObjectId, descendant: ObjectId)
 ///
 /// A `%` that starts neither `%%`, `%(` nor a two-digit hex escape is literal,
 /// as it is in git.
-fn parse_format(fmt: &[u8], color_on: bool) -> std::result::Result<Vec<Item>, AtomError> {
+///
+/// Returns the item stream plus git's `need_color_reset_at_eol`: a format whose
+/// last `%(color:…)` names anything but `reset` gets an implicit reset appended
+/// to every line, but only while colour is actually on.
+fn parse_format(
+    fmt: &[u8],
+    ctx: &AtomCtx<'_>,
+) -> std::result::Result<(Vec<Item>, bool), AtomError> {
     let mut items = Vec::new();
     let mut lit: Vec<u8> = Vec::new();
     let mut i = 0;
-    let mut align_depth = 0usize;
+    let mut need_color_reset = false;
 
     while i < fmt.len() {
         if fmt[i] != b'%' {
@@ -889,22 +1195,30 @@ fn parse_format(fmt: &[u8], color_on: bool) -> std::result::Result<Vec<Item>, At
                 if !lit.is_empty() {
                     items.push(Item::Lit(std::mem::take(&mut lit)));
                 }
-                // `%(align:…)` / `%(end)` are containers handled here rather than
-                // as value atoms; everything else is a normal atom.
-                if spec == "end" {
-                    if align_depth == 0 {
-                        return Err(fatal_atom(
-                            "format: %(end) atom used without corresponding atom",
-                        ));
+                // The container atoms drive the formatting stack rather than
+                // producing a value, so they are items in their own right.
+                // Everything else is a normal atom. Balance is *not* checked
+                // here: git only discovers it while formatting a ref, so a
+                // format missing its `%(end)` is silently fine in a repository
+                // with no refs to render.
+                let (name, arg) = match spec.split_once(':') {
+                    Some((n, a)) => (n, Some(a)),
+                    None => (spec, None),
+                };
+                match name {
+                    "end" => items.push(Item::End),
+                    "align" => items.push(Item::AlignStart(parse_align(arg)?)),
+                    "if" => items.push(Item::IfStart(parse_if(arg)?)),
+                    // `then` and `else` carry no parser in git's atom table, so
+                    // a trailing `:arg` on them is silently ignored.
+                    "then" => items.push(Item::Then),
+                    "else" => items.push(Item::Else),
+                    _ => {
+                        items.push(Item::Atom(parse_atom(spec, ctx)?));
+                        if name == "color" && !spec.starts_with('*') {
+                            need_color_reset = arg != Some("reset");
+                        }
                     }
-                    align_depth -= 1;
-                    items.push(Item::End);
-                } else if spec == "align" || spec.starts_with("align:") {
-                    let opts = spec.strip_prefix("align:");
-                    items.push(Item::AlignStart(parse_align(opts)?));
-                    align_depth += 1;
-                } else {
-                    items.push(Item::Atom(parse_atom(spec, color_on)?));
                 }
                 i = end + 1;
             }
@@ -930,10 +1244,21 @@ fn parse_format(fmt: &[u8], color_on: bool) -> std::result::Result<Vec<Item>, At
     if !lit.is_empty() {
         items.push(Item::Lit(lit));
     }
-    if align_depth != 0 {
-        return Err(fatal_atom("format: %(end) atom missing"));
-    }
-    Ok(items)
+    Ok((items, need_color_reset && ctx.color_on))
+}
+
+/// git's `if_atom_parser`: a bare `%(if)`, or one of the two comparisons.
+fn parse_if(arg: Option<&str>) -> std::result::Result<Cmp, AtomError> {
+    Ok(match arg {
+        None => Cmp::None,
+        Some(a) => match a.strip_prefix("equals=") {
+            Some(v) => Cmp::Equal(v.to_string()),
+            None => match a.strip_prefix("notequals=") {
+                Some(v) => Cmp::Unequal(v.to_string()),
+                None => return Err(fatal_atom(format!("unrecognized %(if) argument: {a}"))),
+            },
+        },
+    })
 }
 
 /// Parse `%(align:<opts>)` options: a width and an optional position, given
@@ -1049,7 +1374,7 @@ const KNOWN_ATOMS: &[&str] = &[
 /// `:iso8601`, `:iso8601-strict`, `:rfc2822`, `:unix`, `:raw`, `:default`)
 /// forms, `subject`, `body`, and `contents[:subject|:body|:size]`. A leading `*`
 /// evaluates the atom against the object a tag peels to.
-fn parse_atom(spec: &str, color_on: bool) -> std::result::Result<Atom, AtomError> {
+fn parse_atom(spec: &str, ctx: &AtomCtx<'_>) -> std::result::Result<Atom, AtomError> {
     let (body, deref) = match spec.strip_prefix('*') {
         Some(rest) => (rest, true),
         None => (spec, false),
@@ -1096,13 +1421,69 @@ fn parse_atom(spec: &str, color_on: bool) -> std::result::Result<Atom, AtomError
         }
         "objectsize" => match m {
             None => Field::ObjectSize,
-            Some("disk") => return Err(unported_atom("%(objectsize:disk) is not ported")),
+            Some("disk") => Field::ObjectSizeDisk,
             Some(m) => {
                 return Err(fatal_atom(format!(
                     "unrecognized %(objectsize) argument: {m}"
                 )))
             }
         },
+        // git's `raw_atom_parser`. `%(raw)` is byte-exact object data, which the
+        // three quoting styles that cannot represent NUL reject outright.
+        "raw" => {
+            let size = match m {
+                None => false,
+                Some("size") => true,
+                Some(m) => return Err(fatal_atom(format!("unrecognized %(raw) argument: {m}"))),
+            };
+            if !size
+                && matches!(
+                    ctx.quote_style,
+                    QuoteStyle::Python | QuoteStyle::Shell | QuoteStyle::Tcl
+                )
+            {
+                return Err(fatal_atom(format!(
+                    "--format={spec} cannot be used with --python, --shell, --tcl"
+                )));
+            }
+            Field::Raw(size)
+        }
+        "upstream" | "push" => {
+            let rr = parse_remote_ref(name, m)?;
+            if name == "upstream" {
+                Field::Upstream(rr)
+            } else {
+                Field::Push(rr)
+            }
+        }
+        "flag" => {
+            bare(m)?;
+            Field::Flag
+        }
+        "worktreepath" => {
+            bare(m)?;
+            Field::WorktreePath
+        }
+        "describe" => Field::Describe(parse_describe(m)?),
+        "ahead-behind" => {
+            let Some(arg) = m else {
+                return Err(fatal_atom(
+                    "expected format: %(ahead-behind:<committish>)",
+                ));
+            };
+            let base = ctx
+                .repo
+                .and_then(|r| resolve_commit(r, arg))
+                .ok_or_else(|| fatal_atom(format!("failed to find '{arg}'")))?;
+            Field::AheadBehind(base)
+        }
+        // `verify_ref_format`'s `reject_atom`: `for-each-ref` has no "rest of the
+        // line" to report, so the atom parses and is then refused.
+        "rest" => {
+            bare(m)
+                .map_err(|_| fatal_atom("%(rest) does not take arguments"))?;
+            return Err(fatal_atom(format!("this command reject atom %({spec})")));
+        }
         "HEAD" => {
             bare(m)?;
             Field::Head
@@ -1110,7 +1491,7 @@ fn parse_atom(spec: &str, color_on: bool) -> std::result::Result<Atom, AtomError
         "color" => match m {
             None => return Err(fatal_atom("expected format: %(color:<color>)")),
             Some(spec) => match parse_color(spec) {
-                Some(escape) => Field::Color(if color_on { escape } else { Vec::new() }),
+                Some(escape) => Field::Color(if ctx.color_on { escape } else { Vec::new() }),
                 None => return Err(fatal_atom(format!("invalid color value: {spec}"))),
             },
         },
@@ -1191,6 +1572,140 @@ fn parse_atom(spec: &str, color_on: bool) -> std::result::Result<Atom, AtomError
         return Err(fatal_atom(format!("`*` has no meaning on %({name})")));
     }
     Ok(Atom { deref, field })
+}
+
+/// git's `remote_ref_atom_parser`: a comma-separated option list in which the
+/// last recognised rendering wins, `nobracket` is an independent flag, and any
+/// unrecognised token falls back to being read as a `%(refname)` modifier
+/// applied to the *whole* argument (which is where a typo is reported).
+fn parse_remote_ref(name: &str, arg: Option<&str>) -> std::result::Result<RemoteRef, AtomError> {
+    let Some(arg) = arg else {
+        return Ok(RemoteRef {
+            option: RrOption::Ref(NameMod::Full),
+            nobracket: false,
+            push_remote: false,
+        });
+    };
+    let mut rr = RemoteRef {
+        option: RrOption::Ref(NameMod::Full),
+        nobracket: false,
+        push_remote: false,
+    };
+    for token in arg.split(',') {
+        match token {
+            "track" => rr.option = RrOption::Track,
+            "trackshort" => rr.option = RrOption::TrackShort,
+            "nobracket" => rr.nobracket = true,
+            "remotename" => {
+                rr.option = RrOption::RemoteName;
+                rr.push_remote = true;
+            }
+            "remoteref" => {
+                rr.option = RrOption::RemoteRefName;
+                rr.push_remote = true;
+            }
+            // git re-parses the *entire* argument here, not just this token.
+            _ => rr.option = RrOption::Ref(parse_name_mod(name, Some(arg))?),
+        }
+    }
+    Ok(rr)
+}
+
+/// git's `match_atom_arg_value`: peel one `key[=value]` off the head of a
+/// comma-separated option list. `Some((value, rest))` on an exact key match,
+/// where `value` is `None` for a bare key; `None` when the list does not start
+/// with `key` followed by `=`, `,` or the end.
+fn match_arg_value<'a>(to_parse: &'a str, key: &str) -> Option<(Option<&'a str>, &'a str)> {
+    let atom = to_parse.strip_prefix(key)?;
+    let (value, rest) = match atom.as_bytes().first() {
+        Some(b'=') => {
+            let v = &atom[1..];
+            match v.find(',') {
+                Some(i) => (Some(&v[..i]), &v[i + 1..]),
+                None => (Some(v), ""),
+            }
+        }
+        Some(b',') => (None, &atom[1..]),
+        None => (None, ""),
+        // The key is only a prefix of a longer one ("tagsfoo").
+        Some(_) => return None,
+    };
+    Some((value, rest))
+}
+
+/// git's `git_parse_maybe_bool` restricted to the spellings the atom parsers see.
+fn maybe_bool(v: &str) -> Option<bool> {
+    match v {
+        "1" | "yes" | "true" => Some(true),
+        "0" | "no" | "false" => Some(false),
+        _ => None,
+    }
+}
+
+/// git's `describe_atom_parser`: translate `%(describe:<opts>)` into the
+/// argument vector handed to the `describe` subprocess. Each iteration retries
+/// the whole option list against every known key, so an unrecognised key is
+/// reported with the entire unparsed remainder, exactly as `err_bad_arg` does.
+fn parse_describe(arg: Option<&str>) -> std::result::Result<Vec<String>, AtomError> {
+    let mut args: Vec<String> = Vec::new();
+    let mut rest = arg.unwrap_or("");
+    while !rest.is_empty() {
+        let bad = rest;
+        if let Some((v, next)) = match_arg_value(rest, "tags") {
+            let on = match v {
+                None => true,
+                Some(v) => match maybe_bool(v) {
+                    Some(b) => b,
+                    // An unparseable boolean makes the key not match at all.
+                    None => return Err(fatal_atom(format!("unrecognized %(describe) argument: {bad}"))),
+                },
+            };
+            args.push(if on { "--tags".into() } else { "--no-tags".into() });
+            rest = next;
+            continue;
+        }
+        if let Some((v, next)) = match_arg_value(rest, "abbrev") {
+            let v = v.unwrap_or("");
+            if v.is_empty() {
+                return Err(fatal_atom("argument expected for describe:abbrev"));
+            }
+            match v.parse::<i64>() {
+                Ok(n) if n >= 0 => args.push(format!("--abbrev={v}")),
+                Ok(_) => {
+                    return Err(fatal_atom(format!(
+                        "positive value expected describe:abbrev={v}"
+                    )))
+                }
+                Err(_) => {
+                    return Err(fatal_atom(format!("cannot fully parse describe:abbrev={v}")))
+                }
+            }
+            rest = next;
+            continue;
+        }
+        if let Some((v, next)) = match_arg_value(rest, "match") {
+            let v = v.unwrap_or("");
+            if v.is_empty() {
+                return Err(fatal_atom("value expected describe:match="));
+            }
+            args.push(format!("--match={v}"));
+            rest = next;
+            continue;
+        }
+        if let Some((v, next)) = match_arg_value(rest, "exclude") {
+            let v = v.unwrap_or("");
+            if v.is_empty() {
+                return Err(fatal_atom("value expected describe:exclude="));
+            }
+            args.push(format!("--exclude={v}"));
+            rest = next;
+            continue;
+        }
+        return Err(fatal_atom(format!(
+            "unrecognized %(describe) argument: {bad}"
+        )));
+    }
+    Ok(args)
 }
 
 /// The `:short` / `:lstrip=` / `:rstrip=` family shared by `%(refname)` and
@@ -1447,7 +1962,7 @@ fn short_name(refname: &[u8], all: &HashSet<Vec<u8>>) -> Vec<u8> {
 
 /// Order `refs` by the sort chain, falling back to refname as git does.
 fn sort_refs(
-    repo: &gix::Repository,
+    ctx: &RenderCtx<'_>,
     refs: Vec<RefInfo>,
     sorts: &[SortKey],
     ignore_case: bool,
@@ -1459,7 +1974,7 @@ fn sort_refs(
     for info in refs {
         let mut keys = Vec::with_capacity(sorts.len());
         for s in sorts {
-            keys.push(key_of(repo, s, &info)?);
+            keys.push(key_of(ctx, s, &info)?);
         }
         rows.push((keys, info));
     }
@@ -1491,19 +2006,20 @@ enum Key {
 }
 
 /// Compute the sort value of `key`'s atom for `info`.
-fn key_of(repo: &gix::Repository, key: &SortKey, info: &RefInfo) -> Result<Key> {
+fn key_of(ctx: &RenderCtx<'_>, key: &SortKey, info: &RefInfo) -> Result<Key> {
+    let repo = ctx.repo;
     let atom = &key.atom;
     // A version-sorted key always compares the atom's rendered string, matching
     // git's `versioncmp(va->s, vb->s)` even for otherwise-numeric atoms.
     if key.versioned {
-        return Ok(Key::Str(render(repo, atom, info)?));
+        return Ok(Key::Str(render(ctx, atom, info)?));
     }
     match &atom.field {
         Field::ObjectSize => Ok(Key::Num(object_of(atom, info).map_or(0, |o| o.size as i64))),
         // `numparent` is `FIELD_ULONG`, so git compares it numerically; a
         // non-commit (empty rendering) sorts as the 0 git leaves in `v->value`.
         Field::NumParent => {
-            let s = render(repo, atom, info)?;
+            let s = render(ctx, atom, info)?;
             let n = std::str::from_utf8(&s)
                 .ok()
                 .and_then(|s| s.parse::<i64>().ok())
@@ -1517,7 +2033,7 @@ fn key_of(repo: &gix::Repository, key: &SortKey, info: &RefInfo) -> Result<Key> 
             let seconds = with_signature(repo, obj, *w, |sig| sig.seconds())?.unwrap_or(0);
             Ok(Key::Num(seconds))
         }
-        _ => Ok(Key::Str(render(repo, atom, info)?)),
+        _ => Ok(Key::Str(render(ctx, atom, info)?)),
     }
 }
 
@@ -1769,8 +2285,43 @@ fn object_of<'a>(atom: &Atom, info: &'a RefInfo) -> Option<&'a ObjInfo> {
 }
 
 /// Render one atom for one ref.
-fn render(repo: &gix::Repository, atom: &Atom, info: &RefInfo) -> Result<Vec<u8>> {
+fn render(ctx: &RenderCtx<'_>, atom: &Atom, info: &RefInfo) -> Result<Vec<u8>> {
+    let repo = ctx.repo;
     match &atom.field {
+        // git's "fill in specials first" pass: these atoms are answered from the
+        // ref itself, so a leading `*` has no effect on them.
+        Field::Upstream(rr) => return render_upstream(ctx, &info.refname, rr, false),
+        Field::Push(rr) => return render_upstream(ctx, &info.refname, rr, true),
+        Field::Flag => {
+            let mut parts: Vec<&str> = Vec::new();
+            if !info.symref.is_empty() {
+                parts.push("symref");
+            }
+            if info.packed {
+                parts.push("packed");
+            }
+            return Ok(parts.join(",").into_bytes());
+        }
+        Field::WorktreePath => {
+            // `FILTER_REFS_BRANCHES` only: a tag never names a working tree.
+            if !info.refname.starts_with(b"refs/heads/") {
+                return Ok(Vec::new());
+            }
+            let key = gix::bstr::BString::from(info.refname.clone());
+            return Ok(ctx
+                .worktrees()
+                .get(&key)
+                .map(|p| p.as_bytes().to_vec())
+                .unwrap_or_default());
+        }
+        Field::AheadBehind(base) => {
+            let Some(tip) = commit_tip(repo, info.obj.id)? else {
+                // Not a commit: git leaves the atom empty.
+                return Ok(Vec::new());
+            };
+            let (ahead, behind) = ahead_behind(repo, tip, *base)?;
+            return Ok(format!("{ahead} {behind}").into_bytes());
+        }
         Field::RefName(m) => {
             return Ok(match m {
                 NameMod::Full => info.refname.clone(),
@@ -1847,10 +2398,267 @@ fn render(repo: &gix::Repository, atom: &Atom, info: &RefInfo) -> Result<Vec<u8>
         }),
         Field::Person(w, part) => render_person(repo, obj, *w, part),
         Field::Contents(part) => Ok(render_contents(obj, part)),
-        Field::RefName(_) | Field::SymRef(_) | Field::Head | Field::Color(_) => {
-            unreachable!("handled above")
+        Field::ObjectSizeDisk => Ok(disk_size(repo, obj.id)?.to_string().into_bytes()),
+        Field::Raw(size) => Ok(match (size, obj.data.as_deref()) {
+            (true, _) => obj.size.to_string().into_bytes(),
+            (false, Some(data)) => data.to_vec(),
+            (false, None) => Vec::new(),
+        }),
+        // git shells `describe` out as a subprocess; doing the same keeps every
+        // option (`--tags`, `--abbrev=`, `--match=`, `--exclude=`) on the one
+        // implementation instead of a second, drifting copy.
+        Field::Describe(args) => run_describe(args, obj.id),
+        Field::RefName(_)
+        | Field::SymRef(_)
+        | Field::Head
+        | Field::Color(_)
+        | Field::Upstream(_)
+        | Field::Push(_)
+        | Field::Flag
+        | Field::WorktreePath
+        | Field::AheadBehind(_) => unreachable!("handled above"),
+    }
+}
+
+/// git's `%(upstream)` / `%(push)` branch of `populate_value`, plus the
+/// `fill_remote_ref_details` it delegates to.
+///
+/// Only local branches have either relationship, so everything else renders
+/// empty. `for_push` selects `branch_get_push` over `branch_get_upstream` and is
+/// also what `stat_tracking_info` measures against.
+fn render_upstream(
+    ctx: &RenderCtx<'_>,
+    refname: &[u8],
+    rr: &RemoteRef,
+    for_push: bool,
+) -> Result<Vec<u8>> {
+    use super::branch;
+    let repo = ctx.repo;
+    if !refname.starts_with(b"refs/heads/") {
+        return Ok(Vec::new());
+    }
+    let full = refname.as_bstr();
+    let short = full
+        .strip_prefix(b"refs/heads/".as_slice())
+        .expect("checked above")
+        .as_bstr();
+
+    // `remotename` / `remoteref` never resolve a tracking ref, so they answer
+    // even for a branch that has no push destination at all.
+    let tracking = if rr.push_remote {
+        None
+    } else {
+        let t = if for_push {
+            branch::push_ref(repo, full)
+        } else {
+            branch::upstream_ref(repo, full)
+        };
+        match t {
+            Some(t) => Some(t),
+            None => return Ok(Vec::new()),
+        }
+    };
+
+    let local = repo
+        .try_find_reference(full)
+        .ok()
+        .flatten()
+        .and_then(|r| r.into_fully_peeled_id().ok());
+    // `:track` and `:trackshort` always measure the atom's own direction, which
+    // is not necessarily the one that produced `tracking`.
+    let measured = if for_push {
+        branch::push_ref(repo, full)
+    } else {
+        branch::upstream_ref(repo, full)
+    };
+    let counts = measured
+        .as_ref()
+        .and_then(|t| branch::stat_tracking_info(repo, local, t));
+
+    let value = match &rr.option {
+        RrOption::Ref(m) => {
+            let name = tracking.expect("a non-push_remote option resolved one");
+            let name = name.as_bstr().to_vec();
+            return Ok(match m {
+                NameMod::Full => name,
+                // `shorten_unambiguous_ref` against the live ref set, exactly as
+                // `%(refname:short)` does.
+                NameMod::Short => {
+                    let mut all: HashSet<Vec<u8>> = HashSet::new();
+                    for r in repo.references()?.all()? {
+                        let r = r.map_err(|e| anyhow!("{e}"))?;
+                        all.insert(r.name().as_bstr().to_vec());
+                    }
+                    short_name(&name, &all)
+                }
+                NameMod::LStrip(n) => strip_components(&name, *n, true),
+                NameMod::RStrip(n) => strip_components(&name, *n, false),
+            });
+        }
+        RrOption::Track => {
+            let text = match counts {
+                None => "gone".to_string(),
+                Some((0, 0)) => String::new(),
+                Some((0, t)) => format!("behind {t}"),
+                Some((o, 0)) => format!("ahead {o}"),
+                Some((o, t)) => format!("ahead {o}, behind {t}"),
+            };
+            if rr.nobracket || text.is_empty() {
+                text
+            } else {
+                format!("[{text}]")
+            }
+        }
+        RrOption::TrackShort => match counts {
+            None => String::new(),
+            Some((0, 0)) => "=".into(),
+            Some((0, _)) => "<".into(),
+            Some((_, 0)) => ">".into(),
+            Some(_) => "<>".into(),
+        },
+        // git's `remote_for_branch` / `pushremote_for_branch`: the name is only
+        // reported when it was set explicitly, never the `origin` default.
+        RrOption::RemoteName => {
+            let dir = if for_push {
+                gix::remote::Direction::Push
+            } else {
+                gix::remote::Direction::Fetch
+            };
+            repo.branch_remote_name(short, dir)
+                .map(|n| n.as_bstr().to_string())
+                .unwrap_or_default()
+        }
+        // git's `remote_ref_for_branch`: the ref name on the *remote* side.
+        RrOption::RemoteRefName => {
+            let name = gix::refs::FullName::try_from(full.to_owned()).ok();
+            let resolved = if for_push {
+                // git consults *only* the remote's explicit push refspecs here;
+                // with none configured the atom is empty, even though the same
+                // branch would still push somewhere under `push.default`.
+                name.and_then(|n| push_refspec_dest(repo, &n))
+            } else {
+                // A fetch reports `branch.<name>.merge` verbatim.
+                name.and_then(|n| {
+                    repo.branch_remote_ref_name(n.as_ref(), gix::remote::Direction::Fetch)
+                })
+                .and_then(|r| r.ok())
+            };
+            resolved.map(|n| n.as_bstr().to_string()).unwrap_or_default()
+        }
+    };
+    Ok(value.into_bytes())
+}
+
+/// Whether the ref that ultimately holds `name`'s object id came out of
+/// `packed-refs` rather than a loose file, following symrefs to the leaf.
+fn is_packed(repo: &gix::Repository, name: &str) -> bool {
+    let loose = |n: &str| repo.common_dir().join(n).is_file() || repo.git_dir().join(n).is_file();
+    let mut current = name.to_string();
+    // A cycle is impossible in a well-formed store; the bound keeps a corrupt
+    // one from spinning, matching git's own symref-following limit.
+    for _ in 0..5 {
+        let Ok(r) = repo.find_reference(current.as_str()) else {
+            return false;
+        };
+        match r.target().try_name() {
+            Some(next) => current = next.as_bstr().to_string(),
+            None => return !loose(&current),
         }
     }
+    false
+}
+
+/// git's `remote_ref_for_branch(branch, for_push=1)`: run `branch` through the
+/// push remote's *configured* push refspecs. `None` when the branch has no push
+/// remote, that remote declares no push refspec, or none of them match.
+fn push_refspec_dest(
+    repo: &gix::Repository,
+    branch: &gix::refs::FullName,
+) -> Option<gix::refs::FullName> {
+    let name = repo.branch_remote_name(branch.shorten(), gix::remote::Direction::Push)?;
+    let remote = repo.try_find_remote(name.as_bstr())?.ok()?;
+    let specs = remote.refspecs(gix::remote::Direction::Push);
+    if specs.is_empty() {
+        return None;
+    }
+    let group = gix::refspec::MatchGroup {
+        specs: specs
+            .iter()
+            .map(gix::refspec::RefSpec::to_ref)
+            .filter(|s| s.source().is_some() && s.destination().is_some())
+            .collect(),
+    };
+    let null = repo.object_hash().null();
+    let out = group.match_lhs(std::iter::once(gix::refspec::match_group::Item {
+        full_ref_name: branch.as_bstr(),
+        target: &null,
+        object: None,
+    }));
+    out.mappings
+        .into_iter()
+        .next()
+        .and_then(|m| m.rhs)
+        .and_then(|n| gix::refs::FullName::try_from(n.into_owned()).ok())
+}
+
+/// git's `grab_describe_values`: run `describe <atom args> <oid>` and take its
+/// trailing-whitespace-stripped stdout. A failed run leaves the atom empty.
+fn run_describe(args: &[String], id: ObjectId) -> Result<Vec<u8>> {
+    let exe = std::env::current_exe()?;
+    let out = std::process::Command::new(exe)
+        .arg("describe")
+        .args(args)
+        .arg(id.to_string())
+        .output();
+    let Ok(out) = out else {
+        eprintln!("error: failed to run 'describe'");
+        return Ok(Vec::new());
+    };
+    let mut stdout = out.stdout;
+    while stdout.last().is_some_and(|b| b.is_ascii_whitespace()) {
+        stdout.pop();
+    }
+    Ok(stdout)
+}
+
+/// git's `disk_sizep`: the loose object file's length, or a packed object's
+/// entry size (compressed payload plus its in-pack header).
+fn disk_size(repo: &gix::Repository, id: ObjectId) -> Result<u64> {
+    let hex = id.to_string();
+    let loose = repo
+        .git_dir()
+        .join("objects")
+        .join(&hex[..2])
+        .join(&hex[2..]);
+    if let Ok(meta) = std::fs::metadata(&loose) {
+        return Ok(meta.len());
+    }
+    let mut buf = Vec::new();
+    use gix::odb::pack::Find as _;
+    if let Some(loc) = repo.objects.location_by_oid(id.as_ref(), &mut buf) {
+        return Ok(loc.entry_size as u64);
+    }
+    bail!("cannot determine on-disk size of {hex}")
+}
+
+/// Peel `id` to a commit, or `None` when it does not name one — git's
+/// `lookup_commit_reference_gently`.
+fn commit_tip(repo: &gix::Repository, id: ObjectId) -> Result<Option<ObjectId>> {
+    let chain = peel_chain(repo, id)?;
+    let tip = *chain.last().unwrap_or(&id);
+    Ok((repo.find_header(tip)?.kind() == Kind::Commit).then_some(tip))
+}
+
+/// git's `ahead_behind()`: how many commits `tip` has that `base` does not, and
+/// the reverse.
+fn ahead_behind(repo: &gix::Repository, tip: ObjectId, base: ObjectId) -> Result<(usize, usize)> {
+    let count = |from: ObjectId, hidden: ObjectId| -> usize {
+        match repo.rev_walk(Some(from)).with_hidden(Some(hidden)).all() {
+            Ok(walk) => walk.take_while(Result::is_ok).count(),
+            Err(_) => 0,
+        }
+    };
+    Ok((count(tip, base), count(base, tip)))
 }
 
 /// Render an object id per an `%(objectname)`-style length modifier.
@@ -2190,6 +2998,16 @@ fn tcl_quote(value: &[u8]) -> Vec<u8> {
 mod tests {
     use super::*;
 
+    /// A parse context for the atoms below, none of which reads the repository
+    /// or the quoting style.
+    fn test_ctx() -> AtomCtx<'static> {
+        AtomCtx {
+            repo: None,
+            color_on: false,
+            quote_style: QuoteStyle::None,
+        }
+    }
+
     // Values verified against git 2.39: `%(tree)`/`%(parent)` route through
     // `oid_atom_parser`, which accepts `:short` / `:short=<n>` and floors a
     // sub-minimum length to `minimum_abbrev` (4).
@@ -2229,34 +3047,91 @@ mod tests {
         assert_eq!(e.msg, "unrecognized %(parent) argument: bogus");
     }
 
+    // `remote_ref_atom_parser` keeps only the *last* rendering named, treats
+    // `nobracket` as an independent flag, and re-reads the whole argument as a
+    // refname modifier the moment a token is not one of its keywords — so the
+    // error names the entire argument, not the offending token. Verified against
+    // `git for-each-ref --format='%(upstream:bogus)'` (git 2.55).
+    #[test]
+    fn remote_ref_options_parse_like_git() {
+        let rr = parse_remote_ref("upstream", Some("track,nobracket")).unwrap();
+        assert!(matches!(rr.option, RrOption::Track));
+        assert!(rr.nobracket);
+        assert!(!rr.push_remote);
+
+        // The last rendering wins.
+        let rr = parse_remote_ref("push", Some("track,trackshort")).unwrap();
+        assert!(matches!(rr.option, RrOption::TrackShort));
+
+        // `remotename`/`remoteref` also set the flag that suppresses the
+        // push-destination lookup.
+        let rr = parse_remote_ref("push", Some("remoteref")).unwrap();
+        assert!(matches!(rr.option, RrOption::RemoteRefName));
+        assert!(rr.push_remote);
+
+        // A non-keyword falls back to `%(refname)`'s modifiers over the whole arg.
+        let rr = parse_remote_ref("upstream", Some("lstrip=2")).unwrap();
+        assert!(matches!(rr.option, RrOption::Ref(NameMod::LStrip(2))));
+
+        let e = parse_remote_ref("upstream", Some("bogus")).unwrap_err();
+        assert!(matches!(e.kind, ErrKind::Fatal));
+        assert_eq!(e.msg, "unrecognized %(upstream) argument: bogus");
+    }
+
+    // `describe_atom_parser` walks the comma-separated list one key at a time and
+    // reports an unrecognised key with the whole *unparsed remainder*, which is
+    // what `err_bad_arg(err, "describe", bad_arg)` receives. `tags` is a boolean
+    // key, so `tags=false` becomes `--no-tags`.
+    #[test]
+    fn describe_options_become_subcommand_args() {
+        assert_eq!(parse_describe(None).unwrap(), Vec::<String>::new());
+        assert_eq!(parse_describe(Some("tags")).unwrap(), vec!["--tags"]);
+        assert_eq!(parse_describe(Some("tags=false")).unwrap(), vec!["--no-tags"]);
+        assert_eq!(
+            parse_describe(Some("tags,abbrev=8,match=v*,exclude=rc*")).unwrap(),
+            vec!["--tags", "--abbrev=8", "--match=v*", "--exclude=rc*"]
+        );
+
+        let e = parse_describe(Some("tags,bogus,more")).unwrap_err();
+        assert_eq!(e.msg, "unrecognized %(describe) argument: bogus,more");
+        assert_eq!(
+            parse_describe(Some("abbrev=x")).unwrap_err().msg,
+            "cannot fully parse describe:abbrev=x"
+        );
+        assert_eq!(
+            parse_describe(Some("match=")).unwrap_err().msg,
+            "value expected describe:match="
+        );
+    }
+
     // git's atom table gives `object`/`type`/`tag`/`numparent` no parser, so a
     // trailing `:arg` is silently ignored (e.g. `%(type:foo)` == `%(type)`),
     // while `tree`/`parent` take an oid modifier.
     #[test]
     fn commit_and_tag_atoms_parse() {
         assert!(matches!(
-            parse_atom("tree:short", false),
+            parse_atom("tree:short", &test_ctx()),
             Ok(Atom {
                 deref: false,
                 field: Field::Tree(NameLen::Auto)
             })
         ));
         assert!(matches!(
-            parse_atom("parent", false),
+            parse_atom("parent", &test_ctx()),
             Ok(Atom {
                 field: Field::Parent(NameLen::Full),
                 ..
             })
         ));
         assert!(matches!(
-            parse_atom("numparent", false),
+            parse_atom("numparent", &test_ctx()),
             Ok(Atom {
                 field: Field::NumParent,
                 ..
             })
         ));
         assert!(matches!(
-            parse_atom("object", false),
+            parse_atom("object", &test_ctx()),
             Ok(Atom {
                 field: Field::TargetName,
                 ..
@@ -2264,14 +3139,14 @@ mod tests {
         ));
         // A modifier on a no-parser atom is ignored, not an error.
         assert!(matches!(
-            parse_atom("type:foo", false),
+            parse_atom("type:foo", &test_ctx()),
             Ok(Atom {
                 field: Field::TargetType,
                 ..
             })
         ));
         assert!(matches!(
-            parse_atom("tag", false),
+            parse_atom("tag", &test_ctx()),
             Ok(Atom {
                 field: Field::TagName,
                 ..
@@ -2279,7 +3154,7 @@ mod tests {
         ));
         // The `*` deref form is allowed on these object atoms.
         assert!(matches!(
-            parse_atom("*tree", false),
+            parse_atom("*tree", &test_ctx()),
             Ok(Atom {
                 deref: true,
                 field: Field::Tree(NameLen::Full)

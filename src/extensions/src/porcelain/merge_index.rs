@@ -40,15 +40,23 @@
 //!     matching git's `RUN_SETUP` chdir, and index paths are used verbatim
 //!     (they are root-relative and are never re-based onto the current prefix).
 //!
-//! Not covered: nothing in the documented flag set. The one environmental
-//! approximation is the program lookup — git prepends its exec-path to `PATH`
-//! so that `git merge-index git-merge-one-file ...` resolves, and there is no
-//! exec-path concept in the vendored crates, so this port reads `GIT_EXEC_PATH`
-//! and otherwise asks the installed git for it once. When neither is available
-//! the child is looked up on the inherited `PATH` alone.
+//! Program lookup follows git's `exec_cmd.c: setup_path()`, which prepends the
+//! exec-path to `PATH` so that git's own dashed helpers resolve for the child.
+//! Stock git ships those helpers as separate programs in `libexec/git-core`;
+//! zvcs is one binary, so a bare `git-<verb>` naming a verb this binary
+//! dispatches is run as this binary with `argv[0]` set to that dashed name —
+//! the dashed external form `lib.rs: dashed_subcommand` already understands.
+//! That makes `git merge-index git-merge-one-file -a` reach
+//! [`super::merge_one_file`] with git's argument vector, which is what stock
+//! git's exec-path lookup accomplishes. `GIT_EXEC_PATH` is still prepended to
+//! `PATH` for anything else, so a helper installed alongside this binary is
+//! found the way stock git finds one in its libexec.
+//!
+//! Not covered: nothing in the documented flag set.
 
 use anyhow::Result;
 use std::ffi::OsString;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
@@ -234,7 +242,7 @@ fn merge_entry(ctx: &mut Ctx, rows: &[Row], start: usize, path: &BStr) -> Result
         return Ok((0, Flow::Exit(128)));
     }
 
-    let mut cmd = Command::new(&ctx.pgm);
+    let mut cmd = spawn_program(&ctx.pgm);
     cmd.arg(&hex[1])
         .arg(&hex[2])
         .arg(&hex[3])
@@ -284,6 +292,31 @@ fn errno_text(e: &std::io::Error) -> String {
     match s.find(" (os error ") {
         Some(at) => s[..at].to_string(),
         None => s,
+    }
+}
+
+/// The [`Command`] for `<merge-program>`, resolving git's own dashed helpers to
+/// this binary the way stock git resolves them out of its exec-path.
+///
+/// A bare `git-<verb>` — no directory component — naming a verb this binary
+/// dispatches becomes `current_exe()` run under that `argv[0]`, which
+/// `lib.rs: dashed_subcommand` turns straight back into `<verb>`. Anything else
+/// is spawned by name and looked up on the `PATH` [`path_with_git_exec_path`]
+/// builds, exactly as `setup_path()` arranges for stock git's children.
+fn spawn_program(pgm: &OsString) -> Command {
+    let dashed = Path::new(pgm)
+        .file_name()
+        .filter(|_| Path::new(pgm).parent() == Some(Path::new("")))
+        .and_then(|n| n.to_str())
+        .and_then(|n| n.strip_prefix("git-"))
+        .filter(|verb| crate::dispatch::is_verb(verb));
+    match dashed.and_then(|_| std::env::current_exe().ok()) {
+        Some(exe) => {
+            let mut cmd = Command::new(exe);
+            cmd.arg0(pgm);
+            cmd
+        }
+        None => Command::new(pgm),
     }
 }
 

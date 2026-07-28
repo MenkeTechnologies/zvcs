@@ -14,6 +14,18 @@
 //!   * `git checkout <remote-only-name>`         → DWIM (`--guess`, the default):
 //!                                                create-and-track a local branch
 //!                                                when exactly one remote has it.
+//!   * `git checkout -f|--force [<commit-ish>]`  → git's `discard_changes`: the
+//!                                                worktree and index are reset to
+//!                                                the target tree through
+//!                                                `reset_tree()`, throwing away
+//!                                                modified, staged, conflicted and
+//!                                                deleted tracked files instead of
+//!                                                refusing or carrying them
+//!   * `git checkout [-f]`                       → no ref moves; only the worktree
+//!                                                reconciliation runs
+//!   * `git checkout HEAD` / `git checkout @`    → likewise a no-op for every ref:
+//!                                                there is no `refs/heads/HEAD` to
+//!                                                switch to, so this is NOT a detach
 //!   * `git checkout --no-overlay <tree-ish> -- <path>…` → also delete paths that
 //!                                                match the pathspec but are absent
 //!                                                from `<tree-ish>` (overlay mode,
@@ -31,10 +43,15 @@
 //!
 //! Deviations (honest, conservative — never corrupting):
 //! ```text
-//!   * A branch/commit switch that changes the working tree requires a clean
-//!     tracked worktree. Stock git also permits a switch when the dirty files do
-//!     not collide with the diff between trees; that non-conflicting case is
-//!     refused here (message names it) rather than risking an incorrect merge.
+//!   * An *unforced* branch/commit switch that changes the working tree requires
+//!     a clean tracked worktree. Stock git also permits a switch when the dirty
+//!     files do not collide with the diff between trees; that non-conflicting case
+//!     is refused here (message names it) rather than risking an incorrect merge.
+//!     `-f`/`--force` is not affected — it discards the changes outright, as git
+//!     does.
+//!   * An unforced switch does not print git's `show_local_changes()` name-status
+//!     listing except on the no-ref path (`git checkout`, `git checkout HEAD`),
+//!     where it is the only output there is.
 //!     Switches whose target tree equals the current tree (e.g. `-b` at HEAD, or
 //!     two branches on the same commit) carry local changes and are never
 //!     refused. Untracked files are ignored for the clean check, matching git.
@@ -83,6 +100,8 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
     let mut new_branch: Option<(String, bool)> = None;
     let mut detach = false;
     let mut quiet = false;
+    // `-f`/`--force` → git's `opts->discard_changes`.
+    let mut force = false;
     let mut track = false;
     let mut orphan: Option<String> = None;
     // Which conflict stage `--ours`/`--theirs` writes out (2 = ours, 3 = theirs);
@@ -210,8 +229,11 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
             "--no-detach" => detach = false,
             "-q" | "--quiet" => quiet = true,
             "--no-quiet" => quiet = false,
-            "-f" | "--force" => {} // accepted; a clean switch needs no forcing here
-            "--no-force" => {}     // negation of --force; the forced path is a no-op here
+            // git's `-f` sets `opts->discard_changes`, which routes the switch
+            // through `reset_tree()` instead of the 2-way merge: local changes
+            // are thrown away rather than carried or refused.
+            "-f" | "--force" => force = true,
+            "--no-force" => force = false,
             "-t" | "--track" => track = true,
             "--no-track" => {} // accepted; auto-tracking is off unless -t is given
             "--ours" | "-2" => writeout_stage = Some(2),
@@ -426,11 +448,17 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
                 .map_err(|_| anyhow::anyhow!("you are on a branch yet to be born"))?
                 .detach();
             let commit = head.attach(&repo).object()?.peel_to_commit()?;
-            let code = detached_checkout(&repo, "HEAD", commit, quiet, true)?;
+            let code = detached_checkout(&repo, "HEAD", commit, quiet, true, force)?;
             maybe_recurse_submodules(&repo, recurse_submodules, quiet)?;
             return Ok(code);
         }
-        bail!("nothing to checkout: specify a branch, commit, or path(s)");
+        // `git checkout` with neither a ref nor a pathspec is not an error:
+        // `switch_branches()` names the missing branch "HEAD", takes the current
+        // commit, and `update_refs_for_switch()` then does nothing to any ref.
+        // Only the worktree reconciliation happens.
+        let code = checkout_head_in_place(&repo, quiet, force)?;
+        maybe_recurse_submodules(&repo, recurse_submodules, quiet)?;
+        return Ok(code);
     }
 
     // Single positional: prefer ref interpretation (branch → switch; else rev →
@@ -451,13 +479,22 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
             .flatten()
             .is_some();
         if is_branch && !detach {
-            let code = switch_to_branch(&repo, spec, quiet)?;
+            let code = switch_to_branch(&repo, spec, quiet, force)?;
+            maybe_recurse_submodules(&repo, recurse_submodules, quiet)?;
+            return Ok(code);
+        }
+        // `git checkout HEAD` (and its `@` spelling) is not a detach: with no
+        // `refs/heads/HEAD` to resolve, `new_branch_info->path` stays NULL while
+        // its name is "HEAD", and `update_refs_for_switch()`'s first arm leaves
+        // every ref alone. Only the worktree reconciliation runs.
+        if !detach && matches!(spec, "HEAD" | "@") && !is_branch {
+            let code = checkout_head_in_place(&repo, quiet, force)?;
             maybe_recurse_submodules(&repo, recurse_submodules, quiet)?;
             return Ok(code);
         }
         if let Ok(id) = repo.rev_parse_single(spec) {
             let commit = id.object()?.peel_to_commit()?;
-            let code = detached_checkout(&repo, spec, commit, quiet, detach)?;
+            let code = detached_checkout(&repo, spec, commit, quiet, detach, force)?;
             maybe_recurse_submodules(&repo, recurse_submodules, quiet)?;
             return Ok(code);
         }
@@ -567,12 +604,62 @@ pub(super) fn maybe_recurse_submodules(
     Ok(())
 }
 
+/// git's "nothing to do" ref case: `new_branch_info->name` is "HEAD" and there is
+/// no branch path to move to, so `update_refs_for_switch()` touches no ref and
+/// prints nothing. Reached by `git checkout` with no arguments and by
+/// `git checkout HEAD`.
+///
+/// Only `merge_working_tree()` has an effect: forced, it resets the worktree and
+/// index to `HEAD`'s tree; unforced, the 2-way merge against an identical tree is
+/// a no-op and all that remains is the local-changes listing.
+fn checkout_head_in_place(repo: &gix::Repository, quiet: bool, force: bool) -> Result<ExitCode> {
+    let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
+    if force {
+        let tree = repo
+            .head_tree_id()
+            .map_err(|_| anyhow!("You are on a branch yet to be born"))?
+            .detach();
+        reset_worktree_to_tree(repo, tree)?;
+    } else {
+        show_local_changes(quiet)?;
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
 /// Switch `HEAD` to an existing local branch `spec`, updating the worktree when
 /// the target tree differs from the current one.
-fn switch_to_branch(repo: &gix::Repository, spec: &str, quiet: bool) -> Result<ExitCode> {
-    // Already on it → no-op, matching git's "Already on 'x'".
+///
+/// `force` is git's `opts->discard_changes`: it replaces the clean-worktree
+/// requirement with `reset_tree()`, which is also why an already-current branch
+/// still does work — `merge_working_tree()` runs before
+/// `update_refs_for_switch()` decides there is no ref to move.
+fn switch_to_branch(
+    repo: &gix::Repository,
+    spec: &str,
+    quiet: bool,
+    force: bool,
+) -> Result<ExitCode> {
+    // Already on it → the branch `HEAD` points at does not change, but git still
+    // goes through `refs_update_symref("HEAD", ...)`, so the move is reflogged
+    // ("checkout: moving from main to main") before "Already on 'x'" is printed.
     if let Some(cur) = repo.head_name()? {
         if cur.shorten() == spec {
+            let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
+            let head_id = repo.head_id().ok().map(|id| id.detach());
+            if force {
+                let tree = repo.head_tree_id_or_empty()?.detach();
+                reset_worktree_to_tree(repo, tree)?;
+            }
+            let branch_full: FullName = format!("refs/heads/{spec}")
+                .try_into()
+                .map_err(|e| anyhow!("invalid branch name '{spec}': {e}"))?;
+            set_head_symbolic(
+                repo,
+                branch_full,
+                &format!("checkout: moving from {spec} to {spec}"),
+                head_id,
+                head_id,
+            )?;
             if !quiet {
                 eprintln!("Already on '{spec}'");
             }
@@ -591,7 +678,9 @@ fn switch_to_branch(repo: &gix::Repository, spec: &str, quiet: bool) -> Result<E
 
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
 
-    if target_tree != cur_tree {
+    if force {
+        reset_worktree_to_tree(repo, target_tree)?;
+    } else if target_tree != cur_tree {
         ensure_clean(repo)?;
         update_worktree_to_tree(repo, target_tree)?;
     }
@@ -599,7 +688,13 @@ fn switch_to_branch(repo: &gix::Repository, spec: &str, quiet: bool) -> Result<E
     let branch_full: FullName = format!("refs/heads/{spec}")
         .try_into()
         .map_err(|e| anyhow!("invalid branch name '{spec}': {e}"))?;
-    set_head_symbolic(repo, branch_full, &format!("checkout: moving from {old_label} to {spec}"))?;
+    set_head_symbolic(
+        repo,
+        branch_full,
+        &format!("checkout: moving from {old_label} to {spec}"),
+        old_id,
+        Some(commit.id),
+    )?;
 
     if !quiet {
         // git only reports the abandoned detached position when it actually
@@ -624,6 +719,7 @@ fn detached_checkout(
     commit: gix::Commit<'_>,
     quiet: bool,
     force_detach: bool,
+    force: bool,
 ) -> Result<ExitCode> {
     let target_id = commit.id;
     let target_tree = commit.tree_id()?.detach();
@@ -636,7 +732,9 @@ fn detached_checkout(
 
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
 
-    if target_tree != cur_tree {
+    if force {
+        reset_worktree_to_tree(repo, target_tree)?;
+    } else if target_tree != cur_tree {
         ensure_clean(repo)?;
         update_worktree_to_tree(repo, target_tree)?;
     }
@@ -645,6 +743,7 @@ fn detached_checkout(
         repo,
         target_id,
         &format!("checkout: moving from {old_label} to {spec}"),
+        old_id,
     )?;
 
     if !quiet {
@@ -767,7 +866,13 @@ fn create_and_switch(
         name: branch_full.clone(),
         deref: false,
     })?;
-    set_head_symbolic(repo, branch_full, &format!("checkout: moving from {old_label} to {name}"))?;
+    set_head_symbolic(
+        repo,
+        branch_full,
+        &format!("checkout: moving from {old_label} to {name}"),
+        old_id,
+        Some(start_id),
+    )?;
 
     // `-t`: persist branch.<name>.remote / .merge (lock already held above; the
     // per-thread RepoLock is reentrant, so config.rs-style locking isn't needed).
@@ -1355,6 +1460,132 @@ fn update_worktree_to_tree(repo: &gix::Repository, new_tree: ObjectId) -> Result
     Ok(())
 }
 
+/// `git checkout -f`'s worktree update: git's `reset_tree()`, i.e. a one-tree
+/// `unpack_trees` run with `reset = UNPACK_RESET_OVERWRITE_UNTRACKED` and
+/// `update = 1`, driven by `oneway_merge`.
+///
+/// The difference from [`update_worktree_to_tree`] is the whole point of `-f`:
+/// every safety check `verify_uptodate()` performs is skipped (`o->reset` returns
+/// early from it), so a modified, staged, conflicted or *deleted* worktree file is
+/// rewritten from the tree instead of blocking the switch. `oneway_merge` decides
+/// per entry: an entry the tree leaves alone is still written when
+/// `lstat()` fails or `ie_match_stat()` reports a change, and an entry the tree
+/// changes — including a conflicted one, which `same()` never matches — is always
+/// written and lands at stage 0.
+fn reset_worktree_to_tree(repo: &gix::Repository, new_tree: ObjectId) -> Result<()> {
+    let should_interrupt = AtomicBool::new(false);
+
+    let old = repo.index_or_load_from_head_or_empty()?.into_owned();
+    let stat_ctx = super::read_tree::StatCtx::new(repo, &old)?;
+    // Stage-0 entries only: a conflicted path has no stage-0 entry, so it never
+    // matches `same(old, a)` and always ends up rewritten, which is what
+    // `oneway_merge` does with a `CE_CONFLICTED` entry.
+    let mut old_map: HashMap<BString, (ObjectId, Mode, Stat, super::read_tree::Probe)> =
+        HashMap::with_capacity(old.entries().len());
+    {
+        let backing = old.path_backing();
+        for e in old.entries().iter().filter(|e| e.stage_raw() == 0) {
+            let path = e.path_in(backing);
+            old_map.insert(
+                path.to_owned(),
+                (e.id, e.mode, e.stat, stat_ctx.probe(repo, e, path)),
+            );
+        }
+    }
+
+    let mut new_index = repo.index_from_tree(&new_tree)?;
+
+    // What actually gets written: everything the tree changes, plus every
+    // carried-forward entry whose worktree file is missing or stat-dirty.
+    let mut subset = repo.index_from_tree(&new_tree)?;
+    subset.remove_entries(|_, path, entry| match old_map.get(&path.to_owned()) {
+        Some((oid, mode, _, probe)) => {
+            *oid == entry.id && *mode == entry.mode && *probe == super::read_tree::Probe::Uptodate
+        }
+        None => false,
+    });
+    checkout_subset(repo, &mut subset, &should_interrupt)?;
+
+    // Paths the tree drops: `deleted_entry()` removes them from the worktree too
+    // (`verify_uptodate` is a no-op under `--reset`).
+    let new_paths: HashSet<BString> = {
+        let backing = new_index.path_backing();
+        new_index
+            .entries()
+            .iter()
+            .map(|e| e.path_in(backing).to_owned())
+            .collect()
+    };
+    {
+        let backing = old.path_backing();
+        for e in old.entries() {
+            let path = e.path_in(backing);
+            if !new_paths.contains(&path.to_owned()) {
+                if let Some(full) = repo.workdir_path(path) {
+                    let _ = std::fs::remove_file(full);
+                }
+            }
+        }
+    }
+
+    // "Take the stat information from stage0, take the data from stage1": an entry
+    // that was not rewritten keeps the stat cache it already had.
+    let subset_stats = stats_by_path(&subset);
+    {
+        let backing = new_index.path_backing().to_owned();
+        for e in new_index.entries_mut() {
+            let path = e.path_in(&backing).to_owned();
+            if let Some((_, _, stat)) = subset_stats.get(&path) {
+                e.stat = *stat;
+            } else if let Some((oid, mode, stat, _)) = old_map.get(&path) {
+                if *oid == e.id && *mode == e.mode {
+                    e.stat = *stat;
+                }
+            }
+        }
+    }
+    new_index.remove_tree();
+    new_index.write(Default::default())?;
+    // `remove_branch_state()`: a forced switch abandons any in-progress merge,
+    // cherry-pick or revert, exactly as git's `switch_branches` does after the
+    // worktree is reconciled.
+    remove_branch_state(repo);
+    Ok(())
+}
+
+/// git's `remove_branch_state()` (branch.c): the merge/sequencer state files a
+/// switch invalidates, plus the `CHERRY_PICK_HEAD` / `REVERT_HEAD` that
+/// `sequencer_post_commit_cleanup()` drops on its way through.
+///
+/// `AUTO_MERGE` is on the list because `git merge` writes it for the conflicted
+/// tree and nothing else removes it: a forced checkout out of a conflicted state
+/// that leaves it behind makes the next `git diff` compare against a stale tree.
+/// `MERGE_AUTOSTASH` is saved rather than deleted by git and is left alone here.
+fn remove_branch_state(repo: &gix::Repository) {
+    for name in [
+        "MERGE_HEAD",
+        "MERGE_RR",
+        "MERGE_MSG",
+        "MERGE_MODE",
+        "AUTO_MERGE",
+        "CHERRY_PICK_HEAD",
+        "REVERT_HEAD",
+    ] {
+        let _ = std::fs::remove_file(repo.git_dir().join(name));
+    }
+}
+
+/// git's `show_local_changes()`: the `diff-index --name-status` listing a
+/// non-forced checkout prints to **stdout** when it does not discard changes.
+fn show_local_changes(quiet: bool) -> Result<()> {
+    if quiet {
+        return Ok(());
+    }
+    let args = ["--name-status".to_string(), "HEAD".to_string()];
+    super::diff_index::diff_index(&args)?;
+    Ok(())
+}
+
 /// Check out the entries currently held in `index` into the worktree, overwriting
 /// existing files (filters, mode and symlink handling applied by gitoxide).
 fn checkout_subset(
@@ -1384,7 +1615,17 @@ fn checkout_subset(
 }
 
 /// Set `HEAD` to point symbolically at `branch` (attached), logging the move.
-fn set_head_symbolic(repo: &gix::Repository, branch: FullName, message: &str) -> Result<()> {
+///
+/// `from`/`to` are the object ids `HEAD` resolved to before and after; they exist
+/// only for [`record_head_move`], which repairs the `.git/logs/HEAD` line the
+/// vendored `gix-ref` cannot write correctly for a symbolic-target update.
+fn set_head_symbolic(
+    repo: &gix::Repository,
+    branch: FullName,
+    message: &str,
+    from: Option<ObjectId>,
+    to: Option<ObjectId>,
+) -> Result<()> {
     repo.edit_reference(RefEdit {
         change: Change::Update {
             log: LogChange {
@@ -1400,11 +1641,83 @@ fn set_head_symbolic(repo: &gix::Repository, branch: FullName, message: &str) ->
             .map_err(|e| anyhow!("invalid ref name HEAD: {e}"))?,
         deref: false,
     })?;
+    record_head_move(repo, from, to, message);
     Ok(())
 }
 
+/// Make the last `.git/logs/HEAD` entry the one `refs_update_ref`/
+/// `refs_update_symref` would have written for this move.
+///
+/// Two things the vendored `gix-ref` gets wrong for a `HEAD` update made with
+/// `deref: false`, both visible in `git reflog`:
+///
+///  * a **symbolic** new target drops the reflog entry entirely
+///    (`gix-ref/src/store/file/transaction/commit.rs`), so no line is written;
+///  * `PreviousValue::Any` leaves the *old* field as the null id even when `HEAD`
+///    resolved to a commit, because the previous value is a symref it does not
+///    peel.
+///
+/// Rewriting the trailing line — or appending it when none was written — is
+/// confined to the entry this command just made: the line is only replaced when
+/// its message is the one passed in.
+fn record_head_move(
+    repo: &gix::Repository,
+    from: Option<ObjectId>,
+    to: Option<ObjectId>,
+    message: &str,
+) {
+    // `log_all_ref_updates` is on by default for a repository with a worktree,
+    // and git creates `logs/HEAD` on the first update there.
+    let path = repo.git_dir().join("logs").join("HEAD");
+    if !path.exists()
+        && (repo.workdir().is_none()
+            || repo.config_snapshot().boolean("core.logAllRefUpdates") == Some(false))
+    {
+        return;
+    }
+    let null = ObjectId::null(repo.object_hash());
+    let now = gix::date::Time::now_local_or_utc().format_or_unix(gix::date::time::Format::Raw);
+    let sig = match repo.committer() {
+        Some(Ok(sig)) => sig,
+        _ => gix::actor::SignatureRef {
+            name: b"zvcs".as_bstr(),
+            email: b"zvcs@localhost".as_bstr(),
+            time: &now,
+        },
+    };
+    let line = format!(
+        "{} {} {} <{}> {}\t{}\n",
+        from.unwrap_or(null),
+        to.unwrap_or(null),
+        sig.name,
+        sig.email,
+        sig.time,
+        message
+    );
+
+    let mut body = std::fs::read_to_string(&path).unwrap_or_default();
+    let tail_is_ours = body
+        .lines()
+        .next_back()
+        .is_some_and(|last| last.ends_with(&format!("\t{message}")));
+    if tail_is_ours {
+        let cut = body.trim_end_matches('\n').rfind('\n').map_or(0, |i| i + 1);
+        body.truncate(cut);
+    }
+    body.push_str(&line);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&path, body);
+}
+
 /// Detach `HEAD` at object `id`, logging the move.
-fn set_head_detached(repo: &gix::Repository, id: ObjectId, message: &str) -> Result<()> {
+fn set_head_detached(
+    repo: &gix::Repository,
+    id: ObjectId,
+    message: &str,
+    from: Option<ObjectId>,
+) -> Result<()> {
     repo.edit_reference(RefEdit {
         change: Change::Update {
             log: LogChange {
@@ -1420,6 +1733,7 @@ fn set_head_detached(repo: &gix::Repository, id: ObjectId, message: &str) -> Res
             .map_err(|e| anyhow!("invalid ref name HEAD: {e}"))?,
         deref: false,
     })?;
+    record_head_move(repo, from, Some(id), message);
     Ok(())
 }
 

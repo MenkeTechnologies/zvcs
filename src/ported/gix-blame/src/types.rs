@@ -185,6 +185,14 @@ pub struct Options {
     /// Also blame the parents for lines that were copied out of *another* file
     /// (`git blame -C[<score>]`), i.e. git's `PICKAXE_BLAME_COPY`.
     pub detect_copied: Option<CopyDetection>,
+    /// Follow only the first parent of every commit (`git blame --first-parent`).
+    ///
+    /// This is git's `revs->first_parent_only`, which blame applies in
+    /// [`first_scapegoat()`](https://github.com/git/git/blob/v2.55.0/blame.c#L2367): before a
+    /// commit's parents are used as scapegoats, everything after the first one is dropped, so a
+    /// merge only ever passes blame back along its first-parent line and the side branch is never
+    /// entered.
+    pub first_parent: bool,
 }
 
 /// How hard `git blame -C` looks for the file a chunk was copied from, i.e. which of git's

@@ -39,11 +39,16 @@ use std::process::ExitCode;
 ///   * Every flag `blame` refuses is refused here, with `blame`'s own message.
 ///   * Every divergence documented on [`super::blame::blame`] applies here
 ///     unchanged — notably that the flags `blame` still refuses (`--show-stats`,
-///     `--score-debug`, `-S <revs-file>`, `--reverse`, regex/`:funcname` `-L`
-///     forms, `--date=human` and the `-local` date variants) exit via the anyhow
-///     error path instead of git's usage dump with exit code 129, and that a
-///     missing path operand bails `no path given` rather than printing the usage
-///     block.
+///     `--score-debug`, `-S <revs-file>`, `--reverse`, `--no-indent-heuristic`,
+///     `--date=human` and the `-local` date variants) exit via the anyhow error
+///     path instead of git's usage dump with exit code 129.
+///
+/// The usage line says `git blame`, not `git pickaxe`, because `cmd_blame`
+/// receives the argv unchanged and `parse_options` renders `blame_opt_usage`
+/// through `argv[0]`, which the command table already spelled `blame`. That is
+/// why the delegation passes `blame`'s name rather than its own — verified:
+/// `git pickaxe -h` and `git blame -h` print byte-identical text, while
+/// `git annotate -h` differs in exactly the `usage:` line.
 ///
 /// No leading-subcommand strip is performed, matching
 /// [`super::init_db::init_db`]'s reasoning: `dispatch::run` passes only the

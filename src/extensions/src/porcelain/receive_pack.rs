@@ -468,7 +468,7 @@ fn capabilities(repo: &gix::Repository, config: &Config) -> String {
 ///
 /// The suffix is the kernel name git appends at runtime; the mapping below
 /// covers the platforms zvcs targets, and falls back to Rust's own OS name.
-fn agent() -> String {
+pub(crate) fn agent() -> String {
     if let Some(agent) = std::env::var_os("GIT_USER_AGENT") {
         return agent.to_string_lossy().into_owned();
     }

@@ -59,6 +59,18 @@
 //!   Detection is off unless asked for: `diff.renames` is a porcelain default and
 //!   `diff-pairs` is plumbing, so the status letters read off stdin survive untouched
 //!   (`builtin/diff-pairs.c` sets `skip_resolving_statuses` for exactly that reason).
+//!   That flag is specific to reading pairs from stdin; [`render_raw_stream`] clears it
+//!   for an in-process caller, which queues raw pairs the way `diff_tree_oid()` does and
+//!   needs `diff_resolve_rename_copy()` to assign the letters.
+//!
+//! ### In-process use
+//!
+//! [`render_raw_stream`] is this command with the pair stream supplied directly and the
+//! bytes appended to a caller-owned buffer. `git diff-tree` is `diff-tree -z -r --raw`
+//! piped into this renderer, so [`super::diff_tree`] routes its patch, diffstat, dirstat,
+//! whitespace and rename formats here instead of growing a second implementation. The
+//! `-z` usage error only applies to the stdin path; for an in-process caller the flag
+//! decides nothing but how the raw and name records are terminated.
 //! * `--color[=<when>]` / `--no-color` and `--ws-error-highlight=<kind>`, with the
 //!   `color.diff.*` slots and `core.whitespace` rules the emit layer paints from.
 //!   `--ws-error-highlight`, `--color-moved-ws` and `--word-diff-regex` all accept
@@ -497,6 +509,11 @@ struct Formats {
     /// `DIFF_FORMAT_CHECKDIFF` — `--check`.
     check: bool,
     no_output: bool,
+    /// `opt->line_termination == 0`: the raw/name records are NUL-separated and
+    /// NUL-terminated instead of TAB/LF. `git diff-pairs` refuses to run without `-z`,
+    /// so this is always set on that path; an in-process caller may want the ordinary
+    /// line-terminated form.
+    nul: bool,
 }
 
 impl Formats {
@@ -659,6 +676,11 @@ struct Opts {
     /// `--ext-diff` / `--no-ext-diff` (`o->flags.allow_external`). Off by default:
     /// `diff_setup()` only turns external drivers on for the porcelain commands.
     allow_external: bool,
+    /// The inverse of `builtin/diff-pairs.c`s `skip_resolving_statuses`. That flag is
+    /// specific to reading pairs off stdin, where the status letters are given; every
+    /// other caller of `diffcore_std()` — `diff-tree` routed through here included —
+    /// runs `diff_resolve_rename_copy()` and expects it to assign them.
+    resolve_statuses: bool,
 }
 
 /// git's `enum diff_submodule_format`, restricted to the two this port renders.
@@ -745,6 +767,19 @@ struct Analysis {
 
 /// `git diff-pairs` — see the module documentation for the covered surface.
 pub fn diff_pairs(args: &[String]) -> Result<ExitCode> {
+    render_raw_stream(args, None, None)
+}
+
+/// The body of [`diff_pairs`], with the raw-pair stream supplied instead of read from
+/// stdin and the rendered bytes appended to `sink` instead of written to stdout.
+/// `git diff-tree` is `diff-tree -z -r --raw` piped into this exact renderer, so
+/// [`super::diff_tree`] hands its own walk output here rather than growing a second
+/// patch/stat/rename implementation.
+pub(crate) fn render_raw_stream(
+    args: &[String],
+    pairs: Option<Vec<u8>>,
+    sink: Option<&mut Vec<u8>>,
+) -> Result<ExitCode> {
     // Dispatch passes the subcommand itself at index 0.
     let args = match args.first().map(String::as_str) {
         Some("diff-pairs") => &args[1..],
@@ -788,6 +823,7 @@ pub fn diff_pairs(args: &[String]) -> Result<ExitCode> {
         ignore_submodules_set: false,
         submodule_format: SubmoduleFormat::Short,
         allow_external: false,
+        resolve_statuses: false,
     };
     // Whether a `--ws-error-highlight` flag was seen, so the config default does not
     // overwrite it (git reads the config first and the command line last).
@@ -1403,10 +1439,18 @@ pub fn diff_pairs(args: &[String]) -> Result<ExitCode> {
         opts.rename.detect_rename = 0;
         opts.rename.find_copies_harder = false;
     }
-    if !nul {
+    // `builtin/diff-pairs.c` refuses to parse anything but the NUL-terminated stream.
+    // An in-process caller has already produced that stream, so the flag it would have
+    // had to pass only decides how the raw/name records come back out.
+    if !nul && pairs.is_none() {
         eprintln!("usage: working without -z is not supported");
         return Ok(ExitCode::from(129));
     }
+    opts.formats.nul = nul;
+    // `skip_resolving_statuses` exists because `diff-pairs` is handed status letters on
+    // stdin; an in-process caller queues raw pairs the way `diff_tree_oid()` does and
+    // needs `diff_resolve_rename_copy()` to assign them.
+    opts.resolve_statuses = pairs.is_some();
     if !opts.formats.requested() {
         opts.formats.or_patch();
     }
@@ -1504,8 +1548,14 @@ pub fn diff_pairs(args: &[String]) -> Result<ExitCode> {
         std::mem::swap(&mut opts.src_prefix, &mut opts.dst_prefix);
     }
 
-    let mut input = Vec::new();
-    std::io::stdin().read_to_end(&mut input)?;
+    let input = match pairs {
+        Some(v) => v,
+        None => {
+            let mut v = Vec::new();
+            std::io::stdin().read_to_end(&mut v)?;
+            v
+        }
+    };
 
     let hexsz = repo.object_hash().len_in_hex();
     let base_abbrev = base_abbrev(&repo);
@@ -1513,18 +1563,23 @@ pub fn diff_pairs(args: &[String]) -> Result<ExitCode> {
 
     let stdout = std::io::stdout();
     // `--output=<file>` swaps the diff stream for a freshly truncated file; git's
-    // `xfopen` reports the failure verbatim and exits 128.
-    let mut out: Box<dyn Write> = match &output_file {
-        Some(path) => match std::fs::File::create(path) {
-            Ok(f) => Box::new(std::io::BufWriter::new(f)),
-            Err(e) => {
-                return Ok(fatal(&format!(
-                    "could not open '{path}' for writing: {}",
-                    io_reason(&e)
-                )))
-            }
+    // `xfopen` reports the failure verbatim and exits 128. An in-process caller
+    // (`diff-tree`) passes its own buffer instead, so its commit-id lines and this
+    // renderer's output interleave in the right order.
+    let mut out: Box<dyn Write + '_> = match sink {
+        Some(buf) => Box::new(buf),
+        None => match &output_file {
+            Some(path) => match std::fs::File::create(path) {
+                Ok(f) => Box::new(std::io::BufWriter::new(f)),
+                Err(e) => {
+                    return Ok(fatal(&format!(
+                        "could not open '{path}' for writing: {}",
+                        io_reason(&e)
+                    )))
+                }
+            },
+            None => Box::new(stdout.lock()),
         },
-        None => Box::new(stdout.lock()),
     };
     let mut any_pair = false;
     let mut batch: Vec<Pair> = Vec::new();
@@ -1965,6 +2020,7 @@ fn run_rename_detection(
     repo: &gix::Repository,
     pairs: &mut Vec<Pair>,
     opts: &diffcore_rename::Options,
+    resolve_statuses: bool,
 ) -> std::result::Result<diffcore_rename::Warnings, ExitCode> {
     let mut q = diffcore_rename::Queue::default();
     for p in pairs.iter() {
@@ -1996,7 +2052,7 @@ fn run_rename_detection(
     let warnings = diffcore_rename::run(&mut q, &opts, &mut content);
     // `builtin/diff-pairs.c` sets `skip_resolving_statuses` when no rename detection
     // was asked for, leaving the statuses read off stdin alone.
-    if opts.detect_rename != 0 {
+    if resolve_statuses || opts.detect_rename != 0 {
         diffcore_rename::resolve_rename_copy(&mut q);
     }
 
@@ -2082,7 +2138,7 @@ fn flush(
     // `skip_resolving_statuses` when no detection was asked for — so the status
     // letters read off stdin survive untouched unless `-M`/`-C`/`-B` is present.
     if opts.rename.detect_rename != 0 || opts.rename.break_opt != -1 {
-        match run_rename_detection(repo, &mut pairs, &opts.rename) {
+        match run_rename_detection(repo, &mut pairs, &opts.rename, opts.resolve_statuses) {
             // `needed_rename_limit` is reset by every `too_many_rename_candidates()`
             // call, so the last batch's value is the one `diff_result_code()` reports;
             // `degraded_cc_to_c` is only ever set, never cleared.
@@ -2551,12 +2607,23 @@ fn as_creation(p: &Pair) -> Pair {
 /// several are set, matching `flush_one_pair`'s precedence).
 fn render_name(out: &mut Vec<u8>, p: &Pair, f: &Formats) {
     let two_paths = matches!(p.kind(), b'R' | b'C');
+    // `opt->line_termination`: NUL for both fields under `-z`, otherwise git's
+    // `inter_name_termination` TAB between the status and the path and LF at the end.
+    let sep = if f.nul { b'\0' } else { b'\t' };
+    let term = if f.nul { b'\0' } else { b'\n' };
+    let name = |bytes: &BString| -> Vec<u8> {
+        if f.nul {
+            bytes.to_vec()
+        } else {
+            diff_files::quoted_name(bytes)
+        }
+    };
     if f.name_status {
         out.extend_from_slice(&p.status);
-        out.push(b'\0');
+        out.push(sep);
     } else if f.name_only {
-        out.extend_from_slice(&p.new_path);
-        out.push(b'\0');
+        out.extend_from_slice(&name(&p.new_path));
+        out.push(term);
         return;
     } else {
         out.extend_from_slice(
@@ -2570,13 +2637,13 @@ fn render_name(out: &mut Vec<u8>, p: &Pair, f: &Formats) {
             .as_bytes(),
         );
         out.extend_from_slice(&p.status);
-        out.push(b'\0');
+        out.push(sep);
     }
-    out.extend_from_slice(&p.old_path);
-    out.push(b'\0');
+    out.extend_from_slice(&name(&p.old_path));
+    out.push(if two_paths { sep } else { term });
     if two_paths {
-        out.extend_from_slice(&p.new_path);
-        out.push(b'\0');
+        out.extend_from_slice(&name(&p.new_path));
+        out.push(term);
     }
 }
 

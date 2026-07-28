@@ -1030,6 +1030,46 @@ fn add(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
     // (gix-pathspec/src/search/matching.rs:114), so it is filtered out here.
     let mut seen: HashSet<usize> = HashSet::new();
 
+    // `--renormalize` is driven by the *index*, not by a worktree walk:
+    // `renormalize_tracked_files()` (builtin/add.c) loops over the cache and hands
+    // every matching stage-0 blob to `add_file_to_index()`, which `die_errno`s on
+    // a failed `lstat`. A tracked file deleted from the worktree therefore aborts
+    // the whole command instead of being quietly skipped, and the index is never
+    // written. The walk below can never see such a path, so the check runs here.
+    if o.renormalize {
+        let backing = index.path_backing();
+        for e in index.entries() {
+            if e.stage() != Stage::Unconflicted {
+                continue; // "do not touch unmerged paths"
+            }
+            if !matches!(e.mode, Mode::FILE | Mode::FILE_EXECUTABLE | Mode::SYMLINK) {
+                continue; // "do not touch non blobs"
+            }
+            let path = e.path_in(backing);
+            let matched = ps
+                .pattern_matching_relative_path(path, Some(false))
+                .is_some_and(|m| !m.is_excluded());
+            if !matched {
+                continue;
+            }
+            let Some(full) = repo.workdir_path(path) else {
+                continue;
+            };
+            if std::fs::symlink_metadata(&full).is_err() {
+                eprintln!("fatal: unable to stat '{path}': No such file or directory");
+                return Ok(ExitCode::from(128));
+            }
+            // `add_to_index()` reaches `index_path()`, which hashes *and writes*
+            // the blob before the entry is recorded. The loop therefore leaves the
+            // objects for every path it got through in the store even when a later
+            // path aborts the command, which is observable in `cat-file
+            // --batch-all-objects`.
+            if let Ok(content) = std::fs::read(&full) {
+                let _ = repo.write_blob(&content);
+            }
+        }
+    }
+
     // --- decide what each candidate becomes ---------------------------------
     let mut staged: Vec<Staged> = Vec::new();
     let mut printed: BTreeMap<BString, &'static str> = BTreeMap::new();

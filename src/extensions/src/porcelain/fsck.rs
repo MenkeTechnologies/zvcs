@@ -28,10 +28,14 @@ const ERROR_REFS: u8 = 8;
 ///
 /// 1. the reference-database check (`--references`, on by default) runs first
 ///    and, under `--progress`, emits its progress block;
-/// 2. `<object>` arguments are resolved; each one that does not resolve prints
-///    `error: invalid parameter: expected sha1, got '<arg>'` and sets
-///    `ERROR_OBJECT`. Any argument at all suppresses the default head set and
-///    turns reflogs off, exactly as `snapshot_refs()` does;
+/// 2. `<object>` arguments are resolved by `repo_get_oid()`, which accepts a
+///    full-length hex id without consulting the odb. An argument it cannot turn
+///    into an id at all prints `error: invalid parameter: expected sha1, got
+///    '<arg>'` and sets `ERROR_OBJECT`; one that yields an id no object backs
+///    reaches `snapshot_ref()`, which prints `error: <arg>: invalid sha1 pointer
+///    <oid>`, sets `ERROR_REACHABLE` and leaves `default_refs` alone. Any
+///    argument at all suppresses the default head set and turns reflogs off,
+///    exactly as `snapshot_refs()` does;
 /// 3. unless `--connectivity-only`, every object in the odb is decoded, which is
 ///    where `--root` and `--tags` lines and the object-directory progress come
 ///    from;
@@ -127,14 +131,27 @@ const ERROR_REFS: u8 = 8;
 ///    where git prints both its own `<msg-id>` line and the `invalid sha1
 ///    pointer` line and this port prints only the first. The exit code differs
 ///    with it: git ORs in `ERROR_REACHABLE` where this port does not.
-/// 4. **An object the odb cannot open at all still aborts.** git treats an
-///    unreadable loose object as `error: <oid>: object corrupt or missing:
-///    <path>`, sets `ERROR_OBJECT` and keeps going; this port reports `fatal:`
-///    and exits 128 for that case. The neighbouring case — an object that reads
-///    fine but that `parse_object_buffer()` rejects — *is* ported: the
-///    `error: <oid>: object could not be parsed: <path>` line, the `error:`
-///    diagnostic `parse_commit_buffer()`/`parse_tag_buffer()` prints ahead of
-///    it, `ERROR_OBJECT`, and carrying on with the rest of the odb.
+/// 4. **An unreadable object is reported and stepped over**, as `fsck_loose()`
+///    does — that is the whole point of the command. [`read_loose_object`] is a
+///    port of `object-file.c`'s function of that name, so a loose object that
+///    will not inflate, whose header will not parse, whose type is not a type,
+///    whose body is truncated or has trailing garbage, or whose contents hash to
+///    a different id gets git's own diagnostic (`corrupt loose object '<oid>'`,
+///    `garbage at end of loose object '<oid>'`, `unable to unpack header of
+///    <path>`, …) followed by `error: <oid>: object corrupt or missing: <path>`
+///    or `error: <oid>: hash-path mismatch, found at: <path>`, sets
+///    `ERROR_OBJECT`, and the scan continues. Such an object never gains
+///    `HAS_OBJ`, so it draws no `unreachable`/`dangling` line and something
+///    reachable that names it draws a `missing` one. Two details are not
+///    reproduced: git's `error_errno()` line after an empty object file carries
+///    a stale errno from an unrelated syscall, and a blob larger than
+///    `core.bigFileThreshold` is checked by git in streaming form, which only
+///    changes which message precedes the identical `object corrupt or missing`
+///    line. The neighbouring case — an object that reads fine but that
+///    `parse_object_buffer()` rejects — is ported too: the `error: <oid>: object
+///    could not be parsed: <path>` line, the `error:` diagnostic
+///    `parse_commit_buffer()`/`parse_tag_buffer()` prints ahead of it,
+///    `ERROR_OBJECT`, and carrying on with the rest of the odb.
 /// 5. **Gitlink entries are not walked**, matching `gix-fsck` and git: a
 ///    submodule commit that happens to live in this odb is not marked reachable
 ///    by the tree or index entry that names it.
@@ -290,14 +307,29 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
     let mut heads: Vec<ObjectId> = Vec::new();
     let mut default_refs = 0usize;
     for arg in &opt.objects {
-        match repo.rev_parse_single(arg.as_str()) {
-            Ok(id) => {
+        // `repo_get_oid()` turns a full-length hex id into an object id without
+        // consulting the odb, so an id that names nothing still reaches
+        // `snapshot_ref()`; every shorter or symbolic form has to resolve.
+        let resolved = repo
+            .rev_parse_single(arg.as_str())
+            .map(|id| id.detach())
+            .ok()
+            .or_else(|| ObjectId::from_hex(arg.as_bytes()).ok());
+        match resolved {
+            // `snapshot_ref()`: `parse_object()` returning NULL is the id's
+            // problem, not the argument's — a different message and a different
+            // error bit, and `default_refs` is left alone so the head set stays
+            // empty.
+            Some(id) if !repo.has_object(id) => {
+                eprintln!("error: {arg}: invalid sha1 pointer {id}");
+                errors |= ERROR_REACHABLE;
+            }
+            Some(id) => {
                 default_refs += 1;
-                let id = id.detach();
                 state.note(id);
                 heads.push(id);
             }
-            Err(_) => {
+            None => {
                 eprintln!("error: invalid parameter: expected sha1, got '{arg}'");
                 errors |= ERROR_OBJECT;
             }
@@ -342,19 +374,42 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
     // `unreachable`/`dangling` line, no lost-found file, and a `missing` line if
     // something reachable names them.
     let mut unparseable: HashMap<ObjectId, Kind> = HashMap::new();
+    // Objects `read_loose_object()` could not read back at all. `fsck_loose()`
+    // reports each one and returns 0 — "keep checking other objects" — so a
+    // damaged repository still gets a full report. Like [`unparseable`] these
+    // never receive `HAS_OBJ`, and unlike it their type is unknown, so a
+    // `missing` line for one carries the type expected at the reference site.
+    let mut corrupt: HashSet<ObjectId> = HashSet::new();
     // `fsck_source()` announces the directory once per odb source before walking
     // it; `--connectivity-only` skips `fsck_source()` altogether.
     if opt.verbose && !opt.connectivity_only {
         eprintln!("Checking object directory");
     }
     for &id in &all {
-        let kind = match repo.find_header(id) {
-            Ok(h) => h.kind(),
-            Err(e) => return Ok(fatal_corrupt(id, &e)),
+        // `fsck_loose()` reads the object out of the odb first of all. Every
+        // failure of that read is reported and stepped over.
+        let (kind, data) = match read_for_fsck(&repo, id) {
+            Ok(read) => read,
+            // `--connectivity-only` replaces `fsck_source()` with
+            // `mark_object_for_connectivity()`, which sets `HAS_OBJ` from the
+            // odb's file listing without reading a byte. Nothing is reported and
+            // the object still counts as present; the reachability walk below is
+            // where a corrupt one is finally noticed, and only if it is a
+            // non-blob something reaches.
+            Err(_) if opt.connectivity_only => continue,
+            Err(lines) => {
+                let slot = Slot::Scan(id.as_bytes()[0]);
+                for line in lines {
+                    msg_lines.push((slot, id, line));
+                }
+                errors |= ERROR_OBJECT;
+                corrupt.insert(id);
+                continue;
+            }
         };
         // `fsck_loose()` parses before it does anything else, and skips
         // `fsck_obj()` — the verbose line included — when the parse fails.
-        let decoded = match decode(&repo, id)? {
+        let decoded = match parse_object_buffer(id, kind, &data) {
             Ok(d) => d,
             Err(failed) => {
                 let slot = Slot::Scan(id.as_bytes()[0]);
@@ -408,8 +463,7 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
 
         // `fsck_object()` next; `fsck_obj()` skips the `root`/`tagged` line when
         // it reported an error.
-        let object = repo.find_object(id)?;
-        let checked = check_object(kind, &object.data, opt.strict);
+        let checked = check_object(kind, &data, opt.strict);
         for line in checked.raw {
             msg_lines.push((Slot::Scan(id.as_bytes()[0]), id, line));
         }
@@ -460,6 +514,15 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
             if let Some((target_kind, target, name)) = decoded.tag {
                 scan_lines.push((id, format!("tagged {target_kind} {target} ({name}) in {id}")));
             }
+        }
+    }
+
+    // `fsck_loose()` gives up before `parse_object_buffer()`, so a corrupt
+    // object never enters `obj_hash` on its own account — only a reference to
+    // it, which `fsck_walk()` turns into a `lookup_*()` and so into a slot.
+    for id in &corrupt {
+        if !state.used.contains(id) {
+            state.known.remove(id);
         }
     }
 
@@ -576,17 +639,36 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
     }
 
     // ---- 6. reachability ----------------------------------------------------
-    let mut queue: Vec<ObjectId> = Vec::new();
+    // Each entry carries the type the reference site expected — git's
+    // `lookup_tree()`/`lookup_blob()` in the parent's `fsck_walk()` — which is
+    // what decides whether an unreadable object is even opened here. A head has
+    // no such site.
+    let mut queue: Vec<(ObjectId, Option<Kind>)> = Vec::new();
     for id in heads {
         if state.reachable.insert(id) {
-            queue.push(id);
+            queue.push((id, None));
         }
     }
-    while let Some(id) = queue.pop() {
+    while let Some((id, expected)) = queue.pop() {
         let kind = match repo.find_header(id) {
             Ok(h) => h.kind(),
-            // Missing heads are already recorded; nothing to descend into.
-            Err(_) => continue,
+            // The odb cannot read it. Under a full scan the object is in
+            // `corrupt` and was never queued, so this is `--connectivity-only`,
+            // where nothing has read it yet. `fsck_walk_blob()` reads nothing,
+            // so a blob stays quiet; anything else is `parse_tree()` /
+            // `parse_commit()` failing, which is where git gives up. Its own
+            // diagnostic ahead of this line names the specific odb failure and
+            // is not reproduced.
+            Err(_) => match expected {
+                Some(Kind::Blob) | None => continue,
+                Some(_) => {
+                    let path = loose_object_label(&repo, id)
+                        .map(|p| format!(" (stored in {p})"))
+                        .unwrap_or_default();
+                    eprintln!("fatal: loose object {id}{path} is corrupt");
+                    return Ok(ExitCode::from(128));
+                }
+            },
         };
         if kind == Kind::Blob {
             continue;
@@ -594,14 +676,29 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
         // An object `parse_object_buffer()` rejected has no links to follow:
         // `fsck_walk_commit()`/`fsck_walk_tag()` read fields the failed parse
         // never filled in. The scan above already reported it.
-        let Ok(decoded) = decode(&repo, id)? else { continue };
+        let decoded = match decode(&repo, id) {
+            Ok(Ok(d)) => d,
+            // Rejected by `parse_object_buffer()`; the scan above reported it.
+            Ok(Err(_)) => continue,
+            // Readable a moment ago, unreadable now: treat it as git's
+            // `parse_object()` failure, as above.
+            Err(_) => {
+                let path = loose_object_label(&repo, id)
+                    .map(|p| format!(" (stored in {p})"))
+                    .unwrap_or_default();
+                eprintln!("fatal: loose object {id}{path} is corrupt");
+                return Ok(ExitCode::from(128));
+            }
+        };
         for (child, child_kind) in decoded.children {
-            if !repo.has_object(child) {
+            // A corrupt object never got `HAS_OBJ`, so `check_reachable_object()`
+            // prints `missing` for it with the type the reference site expected.
+            if corrupt.contains(&child) || !repo.has_object(child) {
                 state.missing.insert(child, child_kind);
                 continue;
             }
             if state.reachable.insert(child) {
-                queue.push(child);
+                queue.push((child, Some(child_kind)));
             }
         }
     }
@@ -633,20 +730,28 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
         for &id in &all {
             // `check_unreachable_object()` returns immediately without
             // `HAS_OBJ`, so an object the scan could not parse is silent here.
-            if state.reachable.contains(&id) || unparseable.contains_key(&id) {
+            if state.reachable.contains(&id)
+                || unparseable.contains_key(&id)
+                || corrupt.contains(&id)
+            {
                 continue;
             }
             // `check_unreachable_object()`: a shown-unreachable object returns
             // before the dangling/lost-found block, so `--unreachable` never
             // writes lost-found.
+            // Under `--connectivity-only` nothing has read this object, so it
+            // can still turn out to be unreadable here. git's `printable_type()`
+            // answers `unknown` for one and prints the line anyway; this port
+            // has no `unknown` object kind, so it stays silent instead.
+            let Ok(header) = repo.find_header(id) else { continue };
             if opt.show_unreachable {
-                let kind = repo.find_header(id)?.kind();
+                let kind = header.kind();
                 lines.push((id, format!("unreachable {kind} {id}")));
             } else if !state.used.contains(&id) {
                 // `!USED` — the tip of an unreachable set. `dangling` printing and
                 // lost-found writing are independent: `--no-dangling --lost-found`
                 // still writes the files.
-                let kind = repo.find_header(id)?.kind();
+                let kind = header.kind();
                 if opt.show_dangling {
                     lines.push((id, format!("dangling {kind} {id}")));
                 }
@@ -1449,24 +1554,284 @@ fn is_loose(repo: &gix::Repository, id: ObjectId) -> bool {
         .any(|objdir| objdir.join(&hex[..2]).join(&hex[2..]).is_file())
 }
 
-/// The path `fsck_loose()` names in its diagnostics: the loose object file, as
-/// spelled by the odb source that holds it. `None` when the object is not loose
-/// — git reaches those through `verify_pack()`, which reports differently.
+/// The loose object file backing `id`, in the odb source that holds it. `None`
+/// when the object is not loose — git reaches those through `verify_pack()`,
+/// which reports differently.
+fn loose_object_path(repo: &gix::Repository, id: ObjectId) -> Option<PathBuf> {
+    let hex = id.to_hex().to_string();
+    odb_sources(repo)
+        .into_iter()
+        .map(|objdir| objdir.join(&hex[..2]).join(&hex[2..]))
+        .find(|p| p.is_file())
+}
+
+/// The path `fsck_loose()` names in its diagnostics, as [`loose_object_path`]
+/// spells it.
 ///
 /// git chdirs to the top of the worktree during setup, so its object directory
 /// is `.git/objects` for an ordinary repository; the workdir prefix is stripped
 /// here to reproduce that spelling from an absolute path.
 fn loose_object_label(repo: &gix::Repository, id: ObjectId) -> Option<String> {
-    let hex = id.to_hex().to_string();
-    let full = odb_sources(repo)
-        .into_iter()
-        .map(|objdir| objdir.join(&hex[..2]).join(&hex[2..]))
-        .find(|p| p.is_file())?;
+    let full = loose_object_path(repo, id)?;
+    Some(loose_label_of(repo, &full))
+}
+
+/// See [`loose_object_label`].
+fn loose_label_of(repo: &gix::Repository, full: &Path) -> String {
     let rela = repo
         .workdir()
         .and_then(|work| full.strip_prefix(work).ok())
-        .unwrap_or(full.as_path());
-    Some(rela.display().to_string())
+        .unwrap_or(full);
+    rela.display().to_string()
+}
+
+/// `object-file.h`'s `MAX_HEADER_LEN` — the `<type> <size>\0` buffer
+/// `unpack_loose_header()` inflates into.
+const MAX_HEADER_LEN: usize = 32;
+
+/// `object-file.c`'s `enum unpack_loose_header_result`.
+enum LooseHeader {
+    /// The whole `<type> <size>\0` header landed in the buffer.
+    Ok,
+    /// zlib refused the stream.
+    Bad,
+    /// The header is longer than [`MAX_HEADER_LEN`].
+    TooLong,
+}
+
+/// `git-zlib.c::zerr_to_string` over the error codes `gix-zlib` distinguishes.
+fn zerr_to_string(e: &gix::zlib::DecompressError) -> &'static str {
+    use gix::zlib::DecompressError as E;
+    match e {
+        E::InsufficientMemory => "out of memory",
+        E::NeedDict => "needs dictionary",
+        E::DataError => "data stream error",
+        E::StreamError => "stream consistency error",
+    }
+}
+
+/// `git-zlib.c::git_inflate`'s diagnostic for a status below `Z_OK`.
+fn inflate_error_line(z: &gix::zlib::Decompress, e: &gix::zlib::DecompressError) -> String {
+    format!(
+        "error: inflate: {} ({})",
+        zerr_to_string(e),
+        z.error_message().unwrap_or("no message")
+    )
+}
+
+/// `object-file.c::unpack_loose_header`: one `git_inflate()` of the mapped file
+/// into a [`MAX_HEADER_LEN`] buffer, which either contains the terminating NUL
+/// or does not. Appends `git_inflate()`'s own line to `diag` when zlib errors.
+fn unpack_loose_header(
+    z: &mut gix::zlib::Decompress,
+    map: &[u8],
+    hdr: &mut [u8; MAX_HEADER_LEN],
+    diag: &mut Vec<String>,
+) -> LooseHeader {
+    let status = match z.decompress(map, hdr, gix::zlib::FlushDecompress::None) {
+        Ok(s) => s,
+        Err(e) => {
+            diag.push(inflate_error_line(z, &e));
+            return LooseHeader::Bad;
+        }
+    };
+    // `if (status != Z_OK && status != Z_STREAM_END) return ULHR_BAD;`
+    if matches!(status, gix::zlib::Status::BufError) {
+        return LooseHeader::Bad;
+    }
+    let produced = z.total_out() as usize;
+    if hdr[..produced].contains(&0) {
+        LooseHeader::Ok
+    } else {
+        LooseHeader::TooLong
+    }
+}
+
+/// `object-file.c::parse_loose_header`: `<type> <size>\0` by hand, refusing a
+/// non-canonical decimal size. `None` is the function's `-1`; the type is `None`
+/// when the format is valid but the type name is not (`OBJ_BAD`).
+fn parse_loose_header(hdr: &[u8]) -> Option<(Option<Kind>, usize)> {
+    let space = hdr.iter().position(|&c| c == b' ' || c == 0)?;
+    if hdr[space] != b' ' {
+        return None;
+    }
+    let kind = Kind::from_bytes(&hdr[..space]).ok();
+
+    let rest = &hdr[space + 1..];
+    let mut at = 0usize;
+    let mut size = usize::from(*rest.first()? & 0xff);
+    size = size.checked_sub(usize::from(b'0'))?;
+    if size > 9 {
+        return None;
+    }
+    at += 1;
+    if size != 0 {
+        while let Some(&c) = rest.get(at) {
+            if !c.is_ascii_digit() {
+                break;
+            }
+            at += 1;
+            size = size.checked_mul(10)?.checked_add(usize::from(c - b'0'))?;
+        }
+    }
+    // "The length must be followed by a zero byte".
+    if *rest.get(at)? != 0 {
+        return None;
+    }
+    Some((kind, size))
+}
+
+/// `object-file.c::unpack_loose_rest`: the body bytes already sitting in the
+/// header buffer, plus however much more zlib yields, checked for a clean
+/// `Z_STREAM_END` and for no trailing input.
+fn unpack_loose_rest(
+    z: &mut gix::zlib::Decompress,
+    map: &[u8],
+    hdr: &[u8; MAX_HEADER_LEN],
+    size: usize,
+    id: ObjectId,
+    diag: &mut Vec<String>,
+) -> Option<Vec<u8>> {
+    let header_len = hdr.iter().position(|&c| c == 0)? + 1;
+    let mut buf = vec![0u8; size];
+    let mut bytes = (z.total_out() as usize - header_len).min(size);
+    buf[..bytes].copy_from_slice(&hdr[header_len..header_len + bytes]);
+
+    let mut status = gix::zlib::Status::Ok;
+    while matches!(status, gix::zlib::Status::Ok) {
+        let (before_in, before_out) = (z.total_in() as usize, z.total_out() as usize);
+        match z.decompress(
+            &map[before_in..],
+            &mut buf[bytes..],
+            gix::zlib::FlushDecompress::Finish,
+        ) {
+            Ok(s) => status = s,
+            Err(e) => {
+                diag.push(inflate_error_line(z, &e));
+                break;
+            }
+        }
+        bytes += z.total_out() as usize - before_out;
+        // zlib cannot make progress on an exhausted stream; C's `avail_in`/
+        // `avail_out` bookkeeping ends the loop through `Z_BUF_ERROR` instead.
+        if z.total_in() as usize == before_in && z.total_out() as usize == before_out {
+            break;
+        }
+    }
+
+    if !matches!(status, gix::zlib::Status::StreamEnd) {
+        diag.push(format!("error: corrupt loose object '{id}'"));
+        return None;
+    }
+    if (z.total_in() as usize) < map.len() {
+        diag.push(format!("error: garbage at end of loose object '{id}'"));
+        return None;
+    }
+    Some(buf)
+}
+
+/// `object-file.c::read_loose_object` as `fsck_loose()` uses it, followed by
+/// `fsck_loose()`'s own two messages. `Ok` is the object's type and contents;
+/// `Err` is every `error:` line git would have printed, in order, so the caller
+/// can place them in the object-directory scan's output slot instead of
+/// printing them where they were produced.
+///
+/// The one branch not ported is the streaming one: git checks a blob larger
+/// than `core.bigFileThreshold` with `check_stream_oid()` rather than holding
+/// it in memory, which only changes which of `corrupt loose object` /
+/// `garbage at end of loose object` / `hash mismatch for <path>` it prints
+/// ahead of the identical `object corrupt or missing` line below.
+fn read_loose_object(path: &Path, label: &str, id: ObjectId) -> Result<(Kind, Vec<u8>), Vec<String>> {
+    let mut diag: Vec<String> = Vec::new();
+    // `fsck_loose()` reports `object corrupt or missing` for every failure that
+    // did not produce contents whose hash disagrees with the file's name.
+    let corrupt_or_missing = || format!("error: {id}: object corrupt or missing: {label}");
+
+    let map = match std::fs::read(path) {
+        Ok(m) => m,
+        Err(e) => {
+            diag.push(format!("error: unable to mmap {label}: {}", strerror(&e)));
+            diag.push(corrupt_or_missing());
+            return Err(diag);
+        }
+    };
+    // `map_fd()`: "mmap() is forbidden on empty files", so an empty object file
+    // is reported and mapped to NULL, which `read_loose_object()` then reports
+    // again through `error_errno()`. git's second line carries whatever errno a
+    // previous syscall happened to leave behind — nothing set it here — so only
+    // the message is reproduced, not that stale suffix.
+    if map.is_empty() {
+        diag.push(format!("error: object file {label} is empty"));
+        diag.push(format!("error: unable to mmap {label}"));
+        diag.push(corrupt_or_missing());
+        return Err(diag);
+    }
+
+    let mut z = gix::zlib::Decompress::new();
+    let mut hdr = [0u8; MAX_HEADER_LEN];
+    match unpack_loose_header(&mut z, &map, &mut hdr, &mut diag) {
+        LooseHeader::Ok => {}
+        LooseHeader::Bad | LooseHeader::TooLong => {
+            diag.push(format!("error: unable to unpack header of {label}"));
+            diag.push(corrupt_or_missing());
+            return Err(diag);
+        }
+    }
+
+    let Some((kind, size)) = parse_loose_header(&hdr) else {
+        diag.push(format!("error: unable to parse header of {label}"));
+        diag.push(corrupt_or_missing());
+        return Err(diag);
+    };
+    let Some(kind) = kind else {
+        let name = String::from_utf8_lossy(&hdr[..hdr.iter().position(|&c| c == 0).unwrap_or(0)])
+            .into_owned();
+        diag.push(format!("error: unable to parse type from header '{name}' of {label}"));
+        diag.push(corrupt_or_missing());
+        return Err(diag);
+    };
+
+    let Some(contents) = unpack_loose_rest(&mut z, &map, &hdr, size, id, &mut diag) else {
+        diag.push(format!("error: unable to unpack contents of {label}"));
+        diag.push(corrupt_or_missing());
+        return Err(diag);
+    };
+
+    // `read_loose_object()` leaves the hash comparison to its caller, which is
+    // the one failure that gets `fsck_loose()`'s other message.
+    match gix::objs::compute_hash(id.kind(), kind, &contents) {
+        Ok(real) if real == id => Ok((kind, contents)),
+        Ok(real) => Err(vec![format!("error: {real}: hash-path mismatch, found at: {label}")]),
+        Err(_) => Err(vec![corrupt_or_missing()]),
+    }
+}
+
+/// `strerror(errno)`, which is what git's `error_errno()` appends.
+fn strerror(e: &std::io::Error) -> String {
+    match e.raw_os_error() {
+        Some(code) => unsafe { std::ffi::CStr::from_ptr(libc::strerror(code)) }
+            .to_string_lossy()
+            .into_owned(),
+        None => e.to_string(),
+    }
+}
+
+/// The object as the object-directory scan reads it: `fsck_loose()` for a loose
+/// object, `verify_pack()`'s `fsck_obj_buffer()` for a packed one. `Err` is the
+/// `error:` lines git prints before setting `ERROR_OBJECT` and moving on to the
+/// next object — neither path aborts the walk, which is the whole point of
+/// `git fsck` on a damaged repository.
+fn read_for_fsck(repo: &gix::Repository, id: ObjectId) -> Result<(Kind, Vec<u8>), Vec<String>> {
+    if let Some(path) = loose_object_path(repo, id) {
+        let label = loose_label_of(repo, &path);
+        return read_loose_object(&path, &label, id);
+    }
+    // A packed object git reads through `verify_packfile()`, whose per-object
+    // failures surface as `fsck_obj_buffer()`'s pathless line.
+    match repo.find_object(id) {
+        Ok(o) => Ok((o.kind, o.data.clone())),
+        Err(_) => Err(vec![format!("error: {id}: object corrupt or missing")]),
+    }
 }
 
 /// `fsck.c::fsck_blob` for every blob some tree named `.gitmodules` or
@@ -1819,12 +2184,6 @@ fn slot(id: &ObjectId, size: usize) -> usize {
     let b = id.as_bytes();
     let head = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
     head as usize % size
-}
-
-/// git aborts with `fatal:` and exit 128 when it cannot read an object.
-fn fatal_corrupt(id: ObjectId, err: &dyn std::fmt::Display) -> ExitCode {
-    eprintln!("fatal: object {id} is corrupt: {err}");
-    ExitCode::from(128)
 }
 
 // ===========================================================================

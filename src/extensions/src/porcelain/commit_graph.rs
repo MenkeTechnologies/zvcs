@@ -20,6 +20,11 @@
 //!   set writes no file and exits 0, and a successful non-split write removes
 //!   any existing split chain.
 //!
+//! `core.commitGraph=false` turns the feature off outright: `write_commit_graph()`
+//! opens with that check, so a `write` under it warns `attempting to write a
+//! commit-graph, but 'core.commitGraph' is disabled`, leaves the object
+//! directory untouched, and still exits 0. The key defaults to true.
+//!
 //! `commitGraph.generationVersion` selects the generation-number version, as in
 //! git: value 2 (git's default, and the value used when the key is unset) writes
 //! the corrected-commit-date `GDA2` chunk (plus `GDO2` on overflow); any other
@@ -606,6 +611,21 @@ fn write_graph(args: &[String], inherited_object_dir: Option<String>) -> Result<
         Ok(p) => p,
         Err(code) => return Ok(code),
     };
+
+    // `write_commit_graph()`'s first act is to refuse outright when the feature
+    // is switched off, so `-c core.commitGraph=false commit-graph write` warns,
+    // leaves the object directory untouched, and still succeeds. The default is
+    // on (`prepare_repo_settings()` reads it with a fallback of 1).
+    if !repo
+        .config_snapshot()
+        .boolean("core.commitGraph")
+        .unwrap_or(true)
+    {
+        eprintln!(
+            "warning: attempting to write a commit-graph, but 'core.commitGraph' is disabled"
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
 
     // git's `write_commit_graph()` refuses to write at all — not just to write
     // filters — when the version is outside the range it understands, and warns

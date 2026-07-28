@@ -874,10 +874,11 @@ fn parse_refspec(
     let src_full = if src.is_empty() { None } else { resolve_src_full(repo, src) };
 
     let dst_full = match dst_spec {
-        // Bare `src` (or `src:`): push to the source's own full name — git's
-        // `matched_src->name` default. A tag stays a tag, a branch stays a branch.
-        None => src_full.clone().unwrap_or_else(|| full_ref_name(src)),
-        Some("") => src_full.clone().unwrap_or_else(|| full_ref_name(src)),
+        // Bare `src` (or `src:`): `match_explicit()` resolves the destination as
+        // `refs_resolve_ref_unsafe(matched_src->name)` — the *resolved* name, so
+        // a symbolic source such as `HEAD` pushes the branch it points at. A tag
+        // stays a tag, a branch stays a branch.
+        None | Some("") => resolve_bare_dst(repo, src_full.as_deref().unwrap_or(src))?,
         // A fully-qualified destination is used verbatim.
         Some(d) if d.starts_with("refs/") => d.to_string(),
         // A short explicit destination is prefixed by the source ref's kind, exactly
@@ -909,6 +910,39 @@ fn parse_refspec(
         },
         upstream,
     ))
+}
+
+/// The destination for a refspec written without one, as `match_explicit()`
+/// computes it:
+///
+/// ```c
+/// dst_value = refs_resolve_ref_unsafe(..., matched_src->name,
+///                                     RESOLVE_REF_READING, NULL, &flag);
+/// if (!dst_value ||
+///     ((flag & REF_ISSYMREF) && !starts_with(dst_value, "refs/heads/")))
+///         die(_("%s cannot be resolved to branch"), matched_src->name);
+/// ```
+///
+/// The name is resolved *through* symrefs, so `git push . HEAD` updates the
+/// branch HEAD points at rather than creating a ref literally named
+/// `refs/heads/HEAD` — which shadows HEAD itself and leaves the repository with
+/// an ambiguous `HEAD`. A symref that lands outside `refs/heads/` (a detached
+/// HEAD resolves to no ref at all) is fatal.
+fn resolve_bare_dst(repo: &gix::Repository, name: &str) -> Result<String> {
+    let Ok(mut reference) = repo.find_reference(name) else {
+        // Not a ref at all — a raw object name. git's `resolve_ref_unsafe`
+        // returns NULL for it and dies.
+        bail!("{name} cannot be resolved to branch");
+    };
+    let symbolic = matches!(reference.target(), gix::refs::TargetRef::Symbolic(_));
+    while let Some(Ok(next)) = reference.follow() {
+        reference = next;
+    }
+    let resolved = reference.name().as_bstr().to_str()?.to_string();
+    if symbolic && !resolved.starts_with("refs/heads/") {
+        bail!("{name} cannot be resolved to branch");
+    }
+    Ok(resolved)
 }
 
 /// The update for a bare `git push`: the current branch to a same-named remote

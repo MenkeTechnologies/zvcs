@@ -2212,7 +2212,7 @@ pub(crate) fn topo_sort(nodes: Vec<Node>, by_date: bool) -> Vec<Node> {
 // Pretty formats
 // ---------------------------------------------------------------------------
 
-enum Pretty {
+pub(crate) enum Pretty {
     /// git's default: `commit`/`Merge`/`Author`/`Date` and an indented message.
     Medium,
     /// `medium` without the `Date` line, and only the subject.
@@ -2243,7 +2243,7 @@ enum Pretty {
 ///
 /// An empty value is git's empty user format: it renders nothing per commit and,
 /// as a terminator format, drops even the trailing newline.
-fn get_commit_format(spec: &str) -> Result<Option<(Pretty, bool)>> {
+pub(crate) fn get_commit_format(spec: &str) -> Result<Option<(Pretty, bool)>> {
     if spec.is_empty() {
         return Ok(Some((Pretty::User(String::new()), true)));
     }
@@ -3255,7 +3255,7 @@ fn count_occurrences(hay: &[u8], needle: &[u8]) -> i64 {
 /// git's approxidate for `--since`/`--until`: parse an absolute or relative date
 /// to epoch seconds, resolving relative dates against `GIT_TEST_DATE_NOW`/now.
 /// An unparseable value falls back to now, matching git's lenient behavior.
-fn approxidate(value: &str) -> i64 {
+pub(crate) fn approxidate(value: &str) -> i64 {
     let now_s = crate::date::now_seconds();
     if value.trim() == "now" {
         return now_s;
@@ -3378,6 +3378,134 @@ fn subject(msg: &[u8]) -> Vec<u8> {
         out.extend_from_slice(line);
     }
     out
+}
+
+/// The `pretty_print_commit()` body alone, without the `commit <oid>` line.
+///
+/// `git log` prints that line from `show_log()` (log-tree.c) and the body from
+/// `pretty_print_commit()` (pretty.c); [`render_entry`] fuses the two because
+/// every `log` caller wants both. `git rev-list`'s `show_commit()` prints the
+/// object name itself — with its own `"commit "` prefix, revision mark and
+/// `--parents`/`--children` ids in front — and then calls `pretty_print_commit()`
+/// for the rest, so it needs the halves separated the way upstream has them.
+///
+/// The render knobs are the ones `rev-list` leaves at their defaults: no
+/// decoration, no color, no `--date=`, and `revs->abbrev` at `DEFAULT_ABBREV` so
+/// `%h` shortens while the object name stays full length.
+pub(crate) fn rev_list_pretty_body(
+    repo: &gix::Repository,
+    commit: &gix::Commit<'_>,
+    pretty: &Pretty,
+) -> Result<Vec<u8>> {
+    let abbrev = std::cell::RefCell::new(AbbrevCache::new(repo));
+    let colors = super::color::DecorateColors::disabled();
+    let ctx = RenderCtx {
+        abbrev_commit: false,
+        abbrev: &abbrev,
+        date_mode: DateMode::Default,
+        extra: Vec::new(),
+        want_color: false,
+        colors: &colors,
+        now: now_secs(),
+        decorations: None,
+        decorate: DecorateStyle::Off,
+        source: None,
+        mailmap: None,
+    };
+    let mut out = Vec::new();
+    match pretty {
+        // `pp_title_line()` only: `pretty_print_commit()` skips `pp_remainder()`
+        // for oneline, so the body is the subject with no trailing newline.
+        Pretty::Oneline => out.extend_from_slice(&subject(commit.message_raw()?)),
+        Pretty::User(fmt) => expand_format(&mut out, commit, fmt, &ctx)?,
+        Pretty::Reference => {
+            let author = commit.author()?;
+            let t = author.time()?;
+            out.extend_from_slice(abbrev.borrow_mut().get(commit.id()).as_bytes());
+            out.extend_from_slice(b" (");
+            out.extend_from_slice(&subject(commit.message_raw()?));
+            out.extend_from_slice(b", ");
+            out.extend_from_slice(
+                fmt_time(t.seconds, t.offset, DateMode::Short, ctx.now).as_bytes(),
+            );
+            out.push(b')');
+        }
+        Pretty::Raw => {
+            // `pp_header()` copies every header line of the object through
+            // unchanged under `CMIT_FMT_RAW` — including `gpgsig`, `encoding` and
+            // `mergetag`, which a reconstruction from the parsed fields would
+            // drop — and stops at the blank line without emitting it.
+            let data = commit.data.as_slice();
+            let header_len = data
+                .windows(2)
+                .position(|w| w == b"\n\n")
+                .map_or(data.len(), |at| at + 1);
+            out.extend_from_slice(&data[..header_len]);
+            // `pretty_print_commit()` adds the blank line, then `pp_remainder()`
+            // indents the message four spaces with no tab expansion for `raw`.
+            out.push(b'\n');
+            indent_message(&mut out, commit.message_raw()?, 0);
+        }
+        Pretty::Medium | Pretty::Short | Pretty::Full | Pretty::Fuller => {
+            let author = commit.author()?;
+            // `pp_header()` folds the `parent` lines of a merge into one `Merge:`
+            // line of abbreviated ids.
+            let parents: Vec<_> = commit.parent_ids().collect();
+            if parents.len() > 1 {
+                out.extend_from_slice(b"Merge:");
+                for pid in &parents {
+                    out.push(b' ');
+                    out.extend_from_slice(abbrev.borrow_mut().get(*pid).as_bytes());
+                }
+                out.push(b'\n');
+            }
+            match pretty {
+                Pretty::Fuller => {
+                    let committer = commit.committer()?;
+                    let at = author.time()?;
+                    let ct = committer.time()?;
+                    write_person(&mut out, b"Author:     ", &author, None);
+                    writeln!(
+                        out,
+                        "AuthorDate: {}",
+                        fmt_time(at.seconds, at.offset, ctx.date_mode, ctx.now)
+                    )?;
+                    write_person(&mut out, b"Commit:     ", &committer, None);
+                    writeln!(
+                        out,
+                        "CommitDate: {}",
+                        fmt_time(ct.seconds, ct.offset, ctx.date_mode, ctx.now)
+                    )?;
+                }
+                Pretty::Full => {
+                    let committer = commit.committer()?;
+                    write_person(&mut out, b"Author: ", &author, None);
+                    write_person(&mut out, b"Commit: ", &committer, None);
+                }
+                _ => {
+                    write_person(&mut out, b"Author: ", &author, None);
+                    if matches!(pretty, Pretty::Medium) {
+                        let t = author.time()?;
+                        writeln!(
+                            out,
+                            "Date:   {}",
+                            fmt_time(t.seconds, t.offset, ctx.date_mode, ctx.now)
+                        )?;
+                    }
+                }
+            }
+            out.push(b'\n');
+            if matches!(pretty, Pretty::Short) {
+                out.extend_from_slice(b"    ");
+                out.extend_from_slice(&subject(commit.message_raw()?));
+                out.push(b'\n');
+            } else {
+                indent_message(&mut out, commit.message_raw()?, 8);
+            }
+        }
+    }
+    abbrev.into_inner().flush();
+    Ok(out)
 }
 
 /// The per-commit rendering knobs threaded down from [`log`].
@@ -3960,7 +4088,7 @@ fn pathspec_matches(spec: &str, path: &[u8]) -> Result<bool> {
 /// `wildmatch.c:dowild` port below. Only git's `WM_MATCH` counts as a match, so a
 /// malformed pattern (`WM_ABORT_ALL`) is reported as no-match, exactly as git's
 /// pathspec callers treat `wildmatch(...) != 0`.
-fn wildmatch(pat: &[u8], text: &[u8]) -> bool {
+pub(crate) fn wildmatch(pat: &[u8], text: &[u8]) -> bool {
     matches!(dowild(pat, text), Wm::Match)
 }
 

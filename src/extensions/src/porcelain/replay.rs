@@ -592,12 +592,22 @@ fn dwim_ref(repo: &gix::Repository, name: &str) -> Option<String> {
     let mut matches = 0usize;
     for rule in REV_PARSE_RULES {
         let candidate = rule.replace("{}", name);
-        if repo
+        // `expand_ref()` calls `refs_resolve_ref_unsafe()` on the *expanded*
+        // name, so each rule is an exact lookup — the bare `{}` rule asks for a
+        // ref literally named `main`, which is how `HEAD` and `FETCH_HEAD`
+        // resolve and why a branch does not. gix's lookups are partial-name
+        // lookups that re-run this same expansion internally, so `main` resolved
+        // under the `{}` rule *and* under `refs/heads/{}` — two matches where git
+        // counts one, and `repo_dwim_ref(...) == 1` is what gates
+        // `set_up_branch_mode()`. Every `--advance <branch>` therefore died with
+        // "argument to --advance must be a reference". Requiring the resolved
+        // name to be the candidate itself restores the exact-lookup semantics.
+        let exact = repo
             .try_find_reference(candidate.as_str())
             .ok()
             .flatten()
-            .is_some()
-        {
+            .is_some_and(|r| r.name().as_bstr() == candidate.as_bytes());
+        if exact {
             matches += 1;
             if first.is_none() {
                 first = Some(candidate);

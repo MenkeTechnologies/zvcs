@@ -120,20 +120,20 @@
 //!
 //! ### Exit status of the `die` paths
 //!
-//! Perl exits a `die` with `$! || ($? >> 8) || 255`. For this script the last
-//! subprocess before any of these `die`s is the `git config --null --get-regexp
-//! ^sende?mail[.]` in `config_regexp`, which exits 1 when it matches nothing (or
-//! when there is no repository) and 0 otherwise. So every `die` above exits 1 if
-//! no `sende?mail.*` key is set anywhere and 255 if any is — which is what this
-//! module computes. `usage()` calls `exit(1)` explicitly and is not affected.
+//! Perl exits a `die` with `$! || ($? >> 8) || 255`. `$!` is 0 on every path
+//! measured here, so the status is `$? >> 8` from the most recent `git` child
+//! process, or 255 when that child succeeded. Which child that is depends on how
+//! far the script got, so [`die`] tracks it rather than deriving it from the
+//! configuration; the table on that function records the measurements.
+//! `usage()` calls `exit(1)` explicitly and is not affected.
 //!
-//! That accounting holds for the diagnostics the script reaches early. Later on
-//! it stops holding, because `$!` is whatever errno the last failed libc call in
-//! the Perl runtime happened to leave behind: the same `die` observed exit 2
-//! after the patches had been read and 25 after the validation hook had run. The
-//! errno is an artefact of Perl's own internal probing, not of anything the
-//! script decides, so it is not reproduced; these paths exit 1 or 255 by the
-//! rule above. Their messages are byte-identical, except that a `die` whose
+//! Beyond the points [`die`] tracks the accounting stops holding, because `$!`
+//! is whatever errno the last failed libc call in the Perl runtime happened to
+//! leave behind: the same `die` observed exit 2 after the patches had been read
+//! and 25 after the validation hook had run. The errno is an artefact of Perl's
+//! own internal probing, not of anything the script decides, so it is not
+//! reproduced; those paths report the tracked child status instead. Their
+//! messages are byte-identical, except that a `die` whose
 //! message does not end in a newline gets ` at <path-to-git-send-email> line
 //! <n>.` appended by Perl — a path into the stock installation, which nothing
 //! here can or should print. Those messages are:
@@ -2589,11 +2589,45 @@ fn usage() -> ExitCode {
     ExitCode::from(1)
 }
 
-/// Perl's `die` status here: `$? >> 8` from the last `git config --get-regexp`,
-/// which is 1 when nothing matched and 0 otherwise, falling back to 255.
-fn die(msg: &str, known: &Known) -> ExitCode {
+/// The exit status of the most recent `git` child process the script ran, which
+/// is what Perl's `$?` holds when a `die` is raised. See [`die`].
+type LastChild = std::cell::Cell<u8>;
+
+/// Perl exits a `die` with `$! || ($? >> 8) || 255`. `$!` is 0 on every path
+/// measured here, so the status is `$? >> 8` from the last child git process,
+/// falling back to 255 when that child succeeded.
+///
+/// The children the script runs before the `die`s this port can reach, in order:
+///   1. `git rev-parse --show-prefix` (repository discovery, exit 0).
+///   2. `git config --null --get-regexp '^sende?mail[.]'` in `config_regexp` —
+///      exit 1 when nothing matched, 0 otherwise. `read_config` only shells out
+///      for keys `config_regexp` already found, and only for the `bool` and
+///      `path` tables, so a plain-string key such as `sendemail.to` adds no
+///      child of its own.
+///   3. `git rev-parse --verify --quiet <arg>` per file/directory operand in
+///      `is_format_patch_arg` — exit 1 for a name that is not a revision.
+///   4. `git var GIT_AUTHOR_IDENT` via `Git::ident_person`, but only when
+///      `$sender` is still undefined at line 838, i.e. when neither `--from`
+///      nor `sendemail.from` supplied one. Exit 0.
+///
+/// That ordering is what makes the status of `No subject line in <file>?` depend
+/// on the sender rather than on the config, which is the opposite of what this
+/// module previously assumed. Measured against git 2.55.0 on a repository whose
+/// only operand is a non-revision file:
+///
+/// | invocation                              | last child                  | exit |
+/// |-----------------------------------------|-----------------------------|------|
+/// | `send-email … README.md`                | `git var GIT_AUTHOR_IDENT`  | 255  |
+/// | `-c sendemail.to=… send-email … `       | `git var GIT_AUTHOR_IDENT`  | 255  |
+/// | `-c sendemail.smtpserver=… send-email …`| `git var GIT_AUTHOR_IDENT`  | 255  |
+/// | `-c sendemail.from=x@y send-email …`    | `rev-parse --verify README.md` | 1 |
+///
+/// A `die` raised before the operand loop still reports `config_regexp`'s
+/// status, which is why [`run`] seeds the cell from it.
+fn die(msg: &str, last_child: &LastChild) -> ExitCode {
     eprint!("{msg}");
-    ExitCode::from(if known.0.is_empty() { 1 } else { 255 })
+    let status = last_child.get();
+    ExitCode::from(if status == 0 { 255 } else { status })
 }
 
 /// A `die` or an `exit` raised on the way to sending.
@@ -3315,15 +3349,18 @@ pub(crate) fn hostname() -> String {
 pub fn send_email(args: &[String]) -> Result<ExitCode> {
     let (config_file, in_repo) = load_config();
     let known = known_keys(config_file.as_ref());
-    match run(args, &known, in_repo) {
+    // Seeded with `config_regexp`'s own status; `run` advances it as it reaches
+    // the points where the script spawns another child. See [`die`].
+    let last_child = LastChild::new(u8::from(known.0.is_empty()));
+    match run(args, &known, in_repo, &last_child) {
         Ok(code) => Ok(code),
-        Err(Stop::Die(msg)) => Ok(die(&msg, &known)),
+        Err(Stop::Die(msg)) => Ok(die(&msg, &last_child)),
         Err(Stop::Exit(code)) => Ok(ExitCode::from(code)),
         Err(Stop::Unported(msg)) => bail!(msg),
     }
 }
 
-fn run(args: &[String], known: &Known, in_repo: bool) -> Step<ExitCode> {
+fn run(args: &[String], known: &Known, in_repo: bool, last_child: &LastChild) -> Step<ExitCode> {
     // sendemail.identity is read before anything else, then overridden by
     // --identity and cleared by --no-identity.
     let mut identity = known.last("sendemail.identity").map(str::to_string);
@@ -3616,8 +3653,8 @@ fn run(args: &[String], known: &Known, in_repo: bool) -> Step<ExitCode> {
     };
     m.annotate = m.s.annotate.unwrap_or(false);
 
-    m.files = collect_files(m.repo.as_ref(), &pass3.rest, format_patch)?;
-    resolve_sender(&mut m)?;
+    m.files = collect_files(m.repo.as_ref(), &pass3.rest, format_patch, last_child)?;
+    resolve_sender(&mut m, last_child)?;
     m.time = now_seconds() - (m.files.len() as i64 - 1);
     handle_backup_files(&mut m);
 
@@ -3824,6 +3861,7 @@ fn collect_files(
     repo: Option<&gix::Repository>,
     rest: &[String],
     format_patch: Option<bool>,
+    last_child: &LastChild,
 ) -> Step<Vec<String>> {
     use std::os::unix::fs::FileTypeExt;
 
@@ -3831,7 +3869,11 @@ fn collect_files(
         // `return unless $repo`, then a `rev-parse --verify --quiet` that only
         // succeeds for something that names an object.
         let Some(repo) = repo else { return Ok(false) };
-        if repo.rev_parse_single(f).is_err() {
+        let resolved = repo.rev_parse_single(f).is_ok();
+        // That `rev-parse` is a child process, so it sets `$?`: 0 when the name
+        // resolved, 1 (`--verify` failing quietly) when it did not. See [`die`].
+        last_child.set(u8::from(!resolved));
+        if !resolved {
             return Ok(false);
         }
         match format_patch {
@@ -3895,18 +3937,24 @@ fn collect_files(
 
 /// `$sender` — `sendemail.from`/`--from`, else the repository identity, then
 /// `sanitize_address`.
-fn resolve_sender(m: &mut Mailer) -> Step<()> {
+fn resolve_sender(m: &mut Mailer, last_child: &LastChild) -> Step<()> {
     let raw = match m.s.sender.clone() {
         Some(v) => {
             let v = v.trim_matches(|c: char| c.is_ascii_whitespace()).to_string();
             let expanded = m.expand(&[v])?;
             expanded.first().cloned().unwrap_or_default()
         }
-        None => m
-            .ident_person(true)
-            .filter(|v| !v.is_empty())
-            .or_else(|| m.ident_person(false))
-            .unwrap_or_default(),
+        None => {
+            let ident = m
+                .ident_person(true)
+                .filter(|v| !v.is_empty())
+                .or_else(|| m.ident_person(false));
+            // Only this branch runs `git var GIT_AUTHOR_IDENT`
+            // (`Git::ident_person`). It exits 0 when an identity is available
+            // and 128 when git cannot build one. See [`die`].
+            last_child.set(if ident.is_some() { 0 } else { 128 });
+            ident.unwrap_or_default()
+        }
     };
     m.sender = sanitize_address(&raw);
     Ok(())

@@ -24,8 +24,11 @@
 //! * `--raw` (the default), `--name-only`, `--name-status`, `-s`/`--no-patch`
 //! * `--numstat`, `--shortstat`, `--summary` — the file-granular stat family, forced
 //!   recursive like git; numstat line counts come from the vendored imara-diff (git's
-//!   default Myers algorithm) and binary blobs print `-`; paths are C-quoted (or raw
-//!   under `-z` for numstat) exactly as git's `quote_c_style`
+//!   default Myers algorithm) and binary blobs print `-`
+//! * path quoting: every raw and name record goes through the shared `quote_c_style()`
+//!   port in [`super::diff_files`], so `core.quotePath` is honoured and `"`/`\`/control
+//!   bytes are escaped whatever it says. `-z` sets `DIFF_FORMAT_NO_QUOTE` and emits the
+//!   path raw, as in git
 //! * `--merge-base <a> <b>` — diff the single merge base of the two commits against the
 //!   second commit's tree; zero/multiple bases or a non-commit operand reproduce git's
 //!   fatal messages (exit 128)
@@ -59,12 +62,40 @@
 //! * `-h` — git's usage text on stdout, exit 129; no `<tree-ish>` — the same text on
 //!   stderr, exit 129
 //!
+//! * `--no-abbrev` — `cmd_diff_tree` starts from `opt->abbrev = 0`, so this restores
+//!   the full object names the command already defaults to
+//! * `--stdin` — object names read from stdin, one per line: a commit is diffed like
+//!   the single-`<commit>` form (with any further ids on the line replacing its parent
+//!   list), a tree needs a second tree id and is announced by a `<t1> <t2>` line, and a
+//!   line that is not an object name is copied to stdout unchanged. `--stdin` together
+//!   with `--merge-base` is git's fatal "cannot be used together"
+//! * `-c`/`--cc` — the combined merge diff. A path reaches it only when it differs from
+//!   *every* parent, and the commit-id line is printed whether or not any does
+//!   (`diff_tree_combined`'s `show_log_first`). `-c` renders the combined raw format
+//!   (`::<modes…> <oids…> <statuses>\t<path>`), which is also what `--name-status` and
+//!   `--name-only` narrow down to
+//!
+//! ### Formats rendered by `diff-pairs`
+//!
+//! Every patch, diffstat, dirstat, whitespace and rename/rewrite option is handled by
+//! handing this module's walk output to [`super::diff_pairs`] in `diff-tree -z -r --raw`
+//! form — the pipeline `git diff-pairs` documents, run in-process. [`needs_pairs`] lists
+//! what switches a run over; [`raw_pair_stream`] writes the stream, and `-R`,
+//! `--diff-filter` and the format flags travel with it rather than being applied twice.
+//! That covers `-p`/`-u`/`--patch`, `-U<n>`, `--stat`/`--compact-summary`/`--dirstat`,
+//! `-w`/`-b`/`--ignore-*`, `-W`, `--inter-hunk-context=<n>`, `--line-prefix=<s>`,
+//! `-M`/`-C`/`-B`/`--no-renames`, the pickaxe and `--check`.
+//!
 //! ### Options accepted but deliberately without effect
 //!
-//! [`is_ignorable`] lists options that only steer *patch* and *stat* rendering. Since
-//! this module bails rather than emit those formats, the options provably cannot
-//! change the bytes it does emit; each entry there was checked against stock git in
-//! the raw, `-t`, `--name-status` and commit-id-line forms before being listed.
+//! [`is_ignorable`] lists options that only steer rendering this module still owns; each
+//! entry there was checked against stock git in the raw, `-t`, `--name-status` and
+//! commit-id-line forms before being listed.
+//!
+//! `--combined-all-paths` is accepted and changes nothing, which is what stock git 2.55.0
+//! does for `diff-tree`: `diff-tree --combined-all-paths -c -r <merge>` and
+//! `diff-tree -c -r <merge>` emit the same bytes, so the per-parent names
+//! `show_raw_diff()` would print are never reached from this command.
 //!
 //! ### Honest limitations
 //!
@@ -75,29 +106,23 @@
 //! terse bail at the point output would be produced, so an invocation that would print
 //! the wrong bytes fails loudly instead. When git itself produces no output for the
 //! invocation (an unborn root commit without `--root`, a `<tree-ish>` that is not a
-//! commit, a merge without `-m`), there are no bytes to get wrong and the exit status
-//! is git's.
+//! commit, a merge without `-m` or `-c`), there are no bytes to get wrong and the exit
+//! status is git's.
 //!
 //! Not implemented, and bailed on whenever they would matter:
 //!
-//! * `-p`/`-u`/`--patch` and the `--stat`/`--dirstat` family. Patch output abbreviates
-//!   the `index` line to git's *auto* abbreviation length, which is derived from the
-//!   repository's approximate object count (`core.abbrev` when set); the vendored
-//!   crates expose no equivalent. `--stat`'s graph column depends on terminal-width
-//!   scaling this port does not reproduce. (`--numstat`/`--shortstat`/`--summary` are
-//!   implemented — see above.)
-//! * bare `--abbrev` (no `=<n>`), for the same reason.
-//! * `-c`/`--cc`/`--combined-all-paths` — combined merge diffs have no substrate in
-//!   the vendored `gix-diff`.
-//! * `--stdin`, `-v`, `--pretty`/`--format` — these need commit-message formatting,
-//!   which belongs to the `log`/`show` machinery, not the tree diff.
-//! * whitespace-insensitive comparison (`-w`, `-b`, `--ignore-*`). These are not
-//!   patch-only: git re-compares blob *content* and drops a pair whose only
-//!   difference is whitespace, so the raw output changes too.
-//! * rename/copy detection (`-M`/`-C`/`-B`), pickaxe (`-S`/`-G`), `-O`,
-//!   `--find-copies-harder`, `--line-prefix`, `--relative`,
-//!   `--submodule`/`--ignore-submodules`.
+//! * bare `--abbrev` (no `=<n>`), whose width is git's *auto* abbreviation derived from
+//!   the repository's approximate object count; the vendored crates expose no equivalent.
+//! * `--cc`, the *dense* combined patch. The path set is computed exactly as for `-c`,
+//!   so a merge with no combined change prints the same bytes as git; a non-empty one
+//!   bails, because there is no `xdl_diff3`-style combined hunk emitter here.
+//! * `-v`, `--pretty`/`--format` — these need commit-message formatting, which belongs
+//!   to the `log`/`show` machinery, not the tree diff.
+//! * `--relative`, `--submodule`/`--ignore-submodules`.
 //! * magic (`:(...)`) and glob pathspecs.
+//! * `-z` alongside a routed format: `diff-pairs` terminates its raw records the way the
+//!   flag it was given asks, so the NUL form is carried through, but the stat and patch
+//!   emitters it owns are line-terminated as in git.
 
 use anyhow::{bail, Result};
 use std::cmp::Ordering;
@@ -205,6 +230,7 @@ impl Format {
 }
 
 /// Parsed command-line options for a single `diff-tree` invocation.
+#[derive(Clone)]
 struct Opts {
     recurse: bool,       // -r (also implied by -t)
     show_trees: bool,    // -t: report tree entries themselves while recursing
@@ -219,6 +245,19 @@ struct Opts {
     filter: u32,         // --diff-filter mask, see `filter_bit`
     format: Format,
     paths: Vec<BString>, // literal path filters (empty = whole tree)
+    /// `-c`/`--cc`: `rev->combine_merges`. A merge is rendered as one combined diff
+    /// against every parent at once instead of being skipped.
+    combine: bool,
+    /// `--cc`: `rev->dense_combined_merges`, which also selects the combined *patch*
+    /// format instead of the combined raw format.
+    dense_combined: bool,
+    /// `--combined-all-paths`: name the file in every parent, not only in the result.
+    combined_all_paths: bool,
+    /// When set, the file pairs are handed to `diff-pairs` with these options instead
+    /// of being rendered by this module. See [`needs_pairs`].
+    route: Option<Vec<String>>,
+    /// `--line-prefix=<s>`, which git puts in front of the commit-id line too.
+    line_prefix: Vec<u8>,
 }
 
 /// One file-level change, in the form the raw/name output needs.
@@ -230,6 +269,7 @@ struct Side {
     id: ObjectId,
 }
 
+#[derive(Clone)]
 struct Change {
     old: Option<Side>,
     new: Option<Side>,
@@ -255,6 +295,7 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
     }
 
     let repo = gix::discover(".")?;
+    super::diff_files::init_quote_path(&repo);
     let hash = repo.object_hash();
 
     let mut opts = Opts {
@@ -271,6 +312,11 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
         filter: ALL_STATUSES,
         format: Format::Raw,
         paths: Vec::new(),
+        combine: false,
+        dense_combined: false,
+        combined_all_paths: false,
+        route: None,
+        line_prefix: Vec::new(),
     };
 
     // The first option git accepts but this port cannot honour. Kept until we know
@@ -281,6 +327,15 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
     let mut merge_base = false;
     let mut revs: Vec<String> = Vec::new();
     let mut raw_paths: Vec<String> = Vec::new();
+    // `--stdin`: read `<oid>` lines and diff each one, instead of (or as well as) the
+    // revisions on the command line.
+    let mut read_stdin = false;
+    // Every option that belongs to `diff_opt_parse` rather than to `diff-tree` itself,
+    // in command-line order. These are what a routed run hands to `diff-pairs`.
+    let mut diff_args: Vec<String> = Vec::new();
+    // git's `diff_tree_tweak_rev`: the raw format is only the default while
+    // `setup_revisions` left `diffopt.output_format` at zero.
+    let mut format_explicit = false;
 
     // git scans the whole argument list for a literal `--` up front; when one is
     // present every argument before it must be a revision.
@@ -307,6 +362,8 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
             if let Some(code) = validate_render_value(a, v) {
                 return Ok(code);
             }
+            diff_args.push(a.to_string());
+            diff_args.push(v.to_string());
             i += 2;
             continue;
         }
@@ -316,11 +373,20 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
                 if let Some(code) = validate_render_value(flag, v) {
                     return Ok(code);
                 }
+                diff_args.push(a.to_string());
                 i += 1;
                 continue;
             }
         }
         if a.starts_with('-') && a != "-" {
+            // Everything `diff_opt_parse` owns is remembered verbatim: a routed run
+            // replays exactly these onto `diff-pairs`, in order.
+            if !is_diff_tree_option(a) {
+                diff_args.push(a.to_string());
+            }
+            if sets_output_format(a) {
+                format_explicit = true;
+            }
             match a {
                 "-r" => opts.recurse = true,
                 "-t" => {
@@ -343,6 +409,20 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
                 // valid two-commit case diffs the merge base's tree against the second
                 // commit's tree (see [`merge_base_diff`]).
                 "--merge-base" => merge_base = true,
+                // `--stdin`: `cmd_diff_tree` reads `<oid>` lines after it has handled
+                // whatever the command line asked for, and a bare `--stdin` with no
+                // revision is *not* the usage error a bare `diff-tree` is.
+                "--stdin" => read_stdin = true,
+                // `-c`/`--cc`: `rev->combine_merges` / `rev->dense_combined_merges`.
+                // `--cc` implies `-c` and additionally selects the combined *patch*
+                // format, which is why it also counts as an explicit output format
+                // for `diff_tree_tweak_rev`.
+                "-c" => opts.combine = true,
+                "--cc" => {
+                    opts.combine = true;
+                    opts.dense_combined = true;
+                }
+                "--combined-all-paths" => opts.combined_all_paths = true,
                 "--raw" => opts.format = Format::Raw,
                 "--name-only" => opts.format = Format::NameOnly,
                 "--name-status" => opts.format = Format::NameStatus,
@@ -362,6 +442,14 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
                 "-h" => {
                     print!("{USAGE}");
                     return Ok(ExitCode::from(USAGE_ERROR));
+                }
+                // `cmd_diff_tree` starts from `opt->abbrev = 0` (full object names) and
+                // `--no-abbrev` puts it back there, so it is the standing default here.
+                "--no-abbrev" => opts.abbrev = hash.len_in_hex(),
+                // `--line-prefix=<s>` prefixes every emitted line, the commit-id line
+                // included; the diff body is prefixed by whoever renders it.
+                _ if a.starts_with("--line-prefix=") => {
+                    opts.line_prefix = a["--line-prefix=".len()..].as_bytes().to_vec();
                 }
                 _ if a.starts_with("--abbrev=") => {
                     // git parses the value with strtoul(arg, NULL, 10): leading
@@ -435,6 +523,8 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
                     }
                     unsupported.get_or_insert_with(|| a.to_string());
                 }
+                // Rendered by `diff-pairs` further down; see [`needs_pairs`].
+                _ if needs_pairs(a) => {}
                 _ if is_ignorable(a) => {}
                 _ if is_known_unsupported(a) => {
                     unsupported.get_or_insert_with(|| a.to_string());
@@ -490,6 +580,28 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
         opts.show_trees = false;
     }
 
+    // An option only `diff-pairs` can render switches the whole rendering pass over to
+    // it. The pair list handed over is then the untouched walk output: `-R` and
+    // `--diff-filter` travel with the other diff options and are applied there, so
+    // applying them here as well would double them up.
+    if diff_args.iter().any(|a| needs_pairs(a)) {
+        let mut route = diff_args.clone();
+        // `diff_tree_tweak_rev`: with no output format on the command line, `diff-tree`
+        // defaults to the raw format where `diff-pairs` would default to a patch.
+        if !format_explicit {
+            route.insert(0, if opts.dense_combined { "-p" } else { "--raw" }.to_string());
+        }
+        // `diff_setup_done` turns recursion on for the file-granular formats; `-M`
+        // alone leaves it off, so `diff-tree -M` still reports a changed tree entry.
+        if diff_args.iter().any(|a| format_forces_recursion(a)) {
+            opts.recurse = true;
+            opts.show_trees = false;
+        }
+        opts.route = Some(route);
+        opts.reverse = false;
+        opts.filter = ALL_STATUSES;
+    }
+
     // git checks the `--merge-base` operand count after resolving revisions but before
     // the missing-<tree-ish> usage error, so zero revs here is the fatal merge-base
     // message, not the usage text.
@@ -498,14 +610,24 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::from(FATAL));
     }
 
-    if revs.is_empty() {
+    // `cmd_diff_tree` dies on this combination before it looks at the operand count.
+    if read_stdin && merge_base {
+        eprintln!("fatal: options '--stdin' and '--merge-base' cannot be used together");
+        return Ok(ExitCode::from(FATAL));
+    }
+
+    // With `--stdin` the revision list may legitimately be empty: the objects to diff
+    // arrive on stdin instead.
+    if revs.is_empty() && !read_stdin {
         eprint!("{USAGE}");
         return Ok(ExitCode::from(USAGE_ERROR));
     }
 
     let mut out: Vec<u8> = Vec::new();
     let mut differed = false;
-    let code = if merge_base {
+    let code = if revs.is_empty() {
+        0
+    } else if merge_base {
         // `--merge-base <a> <b>`: diff the merge base of the two commits against the
         // second commit's tree. No commit-id line, like the two-tree form.
         merge_base_diff(&repo, &revs[0], &revs[1], &opts, &mut out, &mut differed)?
@@ -532,6 +654,14 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
         single_commit(&repo, &revs[0], &opts, &mut out, &mut differed)?
     };
 
+    // `cmd_diff_tree`'s `--stdin` loop: one object name per line, each diffed like the
+    // single-`<commit>` form. A line that is not an object name is echoed verbatim, and
+    // a commit line may carry replacement ("grafted") parents after the id.
+    let mut code = code;
+    if read_stdin && code == 0 {
+        code = diff_tree_stdin(&repo, &opts, &mut out, &mut differed)?;
+    }
+
     // A recognised-but-unimplemented option can only produce wrong bytes when there
     // are bytes to produce. `differed` is checked alongside the buffer because an
     // option such as `--numstat` renders from the change list even in the forms that
@@ -550,6 +680,127 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::from(1));
     }
     Ok(ExitCode::from(code))
+}
+
+/// git's `diff_tree_stdin()` loop: read object names from stdin, one per line.
+///
+/// A line whose first field is not an object name is copied to stdout unchanged. A
+/// commit id may be followed by further ids, which replace ("graft") its parent list for
+/// this diff only. A tree id must be followed by exactly one more tree id; git prints
+/// `<tree1> <tree2>` and then the tree-vs-tree diff.
+fn diff_tree_stdin(
+    repo: &gix::Repository,
+    opts: &Opts,
+    out: &mut Vec<u8>,
+    differed: &mut bool,
+) -> Result<u8> {
+    let hexsz = repo.object_hash().len_in_hex();
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut line)? == 0 {
+            return Ok(0);
+        }
+        let body = line.strip_suffix('\n').unwrap_or(&line);
+        let head = body.get(..hexsz).unwrap_or("");
+        let parsed = (head.len() == hexsz && head.bytes().all(|b| b.is_ascii_hexdigit()))
+            .then(|| ObjectId::from_hex(head.as_bytes()).ok())
+            .flatten();
+        let Some(id) = parsed else {
+            // `fputs(line, stdout)`: not an object name, echoed as it arrived.
+            out.extend_from_slice(line.as_bytes());
+            continue;
+        };
+        let Ok(object) = repo.find_object(id) else {
+            return Ok(0);
+        };
+        let rest: Vec<ObjectId> = body[hexsz..]
+            .split_ascii_whitespace()
+            .filter_map(|w| ObjectId::from_hex(w.as_bytes()).ok())
+            .collect();
+        match object.kind {
+            gix::object::Kind::Commit => {
+                let commit = object.try_into_commit()?;
+                let commit_id = commit.id;
+                let new_tree = commit.tree_id()?.detach();
+                let parents: Vec<ObjectId> = if rest.is_empty() {
+                    commit.parent_ids().map(|p| p.detach()).collect()
+                } else {
+                    rest
+                };
+                emit_commit_diff(repo, commit_id, &parents, new_tree, opts, out, differed)?;
+            }
+            gix::object::Kind::Tree => {
+                if rest.len() != 1 {
+                    eprintln!("error: Need exactly two trees, separated by a space");
+                    continue;
+                }
+                let (a, b) = (object.id, rest[0]);
+                out.extend_from_slice(format!("{a} {b}\n").as_bytes());
+                let (Some(ta), Some(tb)) = (peel_tree(repo, a), peel_tree(repo, b)) else {
+                    return Ok(0);
+                };
+                let changes = collect(repo, Some(ta), Some(tb), opts)?;
+                *differed |= !changes.is_empty();
+                render_all(repo, out, &changes, opts)?;
+            }
+            kind => {
+                eprintln!("error: Object {id} is a {kind}, not a commit or tree");
+            }
+        }
+    }
+}
+
+/// The tree of `id`, or `None` when it cannot be peeled to one.
+fn peel_tree(repo: &gix::Repository, id: ObjectId) -> Option<ObjectId> {
+    repo.find_object(id).ok()?.peel_to_tree().ok().map(|t| t.id)
+}
+
+/// The body of [`single_commit`] once the commit, its tree and its parent list are
+/// known — shared with the `--stdin` loop, whose parents may have been grafted.
+fn emit_commit_diff(
+    repo: &gix::Repository,
+    commit_id: ObjectId,
+    parents: &[ObjectId],
+    new_tree: ObjectId,
+    opts: &Opts,
+    out: &mut Vec<u8>,
+    differed: &mut bool,
+) -> Result<u8> {
+    if parents.len() > 1 && opts.combine {
+        return combined_commit(repo, commit_id, parents, new_tree, opts, out, differed);
+    }
+    let befores: Vec<Option<ObjectId>> = if parents.is_empty() {
+        if opts.root {
+            vec![None]
+        } else {
+            return Ok(0);
+        }
+    } else if parents.len() > 1 && !opts.merges {
+        // A merge is silently skipped unless -m asks for per-parent diffs.
+        return Ok(0);
+    } else if opts.merges {
+        let mut trees = Vec::with_capacity(parents.len());
+        for p in parents {
+            trees.push(Some(tree_of(repo, *p)?));
+        }
+        trees
+    } else {
+        vec![Some(tree_of(repo, parents[0])?)]
+    };
+
+    let term = if opts.nul { b'\0' } else { b'\n' };
+    for before in befores {
+        let changes = collect(repo, before, Some(new_tree), opts)?;
+        *differed |= !changes.is_empty();
+        if opts.always || (!opts.no_commit_id && !changes.is_empty()) {
+            out.extend_from_slice(&opts.line_prefix);
+            out.extend_from_slice(commit_id.to_hex().to_string().as_bytes());
+            out.push(term);
+        }
+        render_all(repo, out, &changes, opts)?;
+    }
+    Ok(0)
 }
 
 /// git's `verify_filename()`: `Some(code)` when the argument cannot be a path, after
@@ -808,6 +1059,173 @@ fn validate_render_value(flag: &str, value: &str) -> Option<ExitCode> {
     }
 }
 
+/// Options `diff-tree` owns rather than passing to `diff_opt_parse`; everything else on
+/// the command line is a diff option and is replayed verbatim onto `diff-pairs` when a
+/// run is routed there.
+fn is_diff_tree_option(a: &str) -> bool {
+    const EXACT: &[&str] = &[
+        "-r",
+        "-t",
+        "--root",
+        "-m",
+        "-c",
+        "--cc",
+        "--combined-all-paths",
+        "--no-commit-id",
+        "--always",
+        "--merge-base",
+        "--stdin",
+        "-v",
+        "--pretty",
+        "--format",
+        "-h",
+    ];
+    EXACT.contains(&a) || a.starts_with("--pretty=") || a.starts_with("--format=")
+}
+
+/// Options that set `diffopt.output_format`, which is what `diff_tree_tweak_rev` checks
+/// before defaulting to the raw format.
+fn sets_output_format(a: &str) -> bool {
+    const EXACT: &[&str] = &[
+        "-p",
+        "-u",
+        "--patch",
+        "--patch-with-raw",
+        "--patch-with-stat",
+        "--raw",
+        "--name-only",
+        "--name-status",
+        "--numstat",
+        "--shortstat",
+        "--summary",
+        "--stat",
+        "--compact-summary",
+        "--dirstat",
+        "--dirstat-by-file",
+        "--cumulative",
+        "-X",
+        "--check",
+        "-s",
+        "--no-patch",
+        "--quiet",
+    ];
+    const PREFIX: &[&str] = &["--stat=", "--stat-", "--dirstat=", "--dirstat-by-file=", "-X"];
+    EXACT.contains(&a) || PREFIX.iter().any(|p| a.starts_with(p))
+}
+
+/// git's `diff_setup_done`: the file-granular output formats turn `flags.recursive` on
+/// whatever `-r` said. The raw format and rename detection alone do not, which is why
+/// `diff-tree -M` still reports a changed tree entry.
+fn format_forces_recursion(a: &str) -> bool {
+    const EXACT: &[&str] = &[
+        "-p",
+        "-u",
+        "--patch",
+        "--patch-with-raw",
+        "--patch-with-stat",
+        "--stat",
+        "--compact-summary",
+        "--numstat",
+        "--shortstat",
+        "--summary",
+        "--dirstat",
+        "--dirstat-by-file",
+        "--cumulative",
+        "-X",
+        "--check",
+        "--name-only",
+        "--name-status",
+    ];
+    const PREFIX: &[&str] = &["--stat=", "--stat-", "--dirstat=", "--dirstat-by-file=", "-U", "-X"];
+    EXACT.contains(&a) || PREFIX.iter().any(|p| a.starts_with(p))
+}
+
+/// Options `diff-pairs` renders and this module's raw/name/stat emitters cannot.
+///
+/// Seeing one switches the whole rendering pass over to
+/// [`super::diff_pairs::render_raw_stream`] — which is the `diff-tree -z -r --raw |
+/// diff-pairs` pipeline `git diff-pairs` documents, run in-process — instead of growing
+/// a second patch, diffstat, dirstat, whitespace and rename implementation here.
+fn needs_pairs(a: &str) -> bool {
+    const EXACT: &[&str] = &[
+        // patch and stat output
+        "-p",
+        "-u",
+        "--patch",
+        "--patch-with-raw",
+        "--patch-with-stat",
+        "--binary",
+        "--stat",
+        "--compact-summary",
+        "--dirstat",
+        "--dirstat-by-file",
+        "--cumulative",
+        "-X",
+        "--check",
+        "--unified",
+        // rename, copy and rewrite detection
+        "-B",
+        "-C",
+        "-D",
+        "-M",
+        "--break-rewrites",
+        "--find-renames",
+        "--find-copies",
+        "--find-copies-harder",
+        "--irreversible-delete",
+        "--no-renames",
+        "--rename-empty",
+        "--no-rename-empty",
+        // whitespace-insensitive comparison, which also drops pairs
+        "-b",
+        "-w",
+        "--ignore-cr-at-eol",
+        "--ignore-space-at-eol",
+        "--ignore-space-change",
+        "--ignore-all-space",
+        // hunk shaping
+        "-W",
+        "--function-context",
+        // pickaxe and ordering
+        "--pickaxe-all",
+        "--pickaxe-regex",
+        // path rewriting
+        "--relative",
+        "--no-relative",
+        "--skip-to",
+        "--rotate-to",
+    ];
+    const PREFIX: &[&str] = &[
+        "--stat=",
+        "--stat-",
+        "--dirstat=",
+        "--dirstat-by-file=",
+        "--inter-hunk-context=",
+        "--line-prefix=",
+        "--find-renames=",
+        "--find-copies=",
+        "--break-rewrites=",
+        "--unified=",
+        "--ignore-matching-lines=",
+        "--find-object=",
+        "--skip-to=",
+        "--rotate-to=",
+        "--relative=",
+        // short options carrying an attached value
+        "-U",
+        "-S",
+        "-G",
+        "-O",
+        "-l",
+        "-B",
+        "-C",
+        "-M",
+        "-I",
+        "-X",
+    ];
+    EXACT.contains(&a) || PREFIX.iter().any(|p| a.starts_with(p))
+}
+
 fn is_ignorable(a: &str) -> bool {
     const EXACT: &[&str] = &[
         "--no-prefix",
@@ -1031,35 +1449,110 @@ fn single_commit(
     let new_tree = commit.tree_id()?.detach();
     let parents: Vec<ObjectId> = commit.parent_ids().map(|p| p.detach()).collect();
 
-    // Which "before" trees to diff against: `None` stands for the empty tree.
-    let befores: Vec<Option<ObjectId>> = if parents.is_empty() {
-        if opts.root {
-            vec![None]
-        } else {
-            return Ok(0);
+    emit_commit_diff(repo, commit_id, &parents, new_tree, opts, out, differed)
+}
+
+/// git's `diff_tree_combined_merge()`: a merge rendered against every parent at once.
+///
+/// A path is part of a combined diff only when it differs from *all* parents — that is
+/// what makes an ordinary clean merge print nothing but its commit-id line. The walk is
+/// always recursive (`diff_tree_combined` sets `diffopts.flags.recursive = 1`) and the
+/// commit-id line is emitted before the paths, whether or not any survive, which is
+/// `diff_tree_combined`'s `show_log_first`.
+///
+/// `--cc` (`dense_combined_merges`) selects the combined *patch* format instead. This
+/// port has no `xdl_diff3`-style combined hunk emitter, so a non-empty `--cc` path set
+/// bails rather than print the wrong bytes; an empty one has no body either way.
+fn combined_commit(
+    repo: &gix::Repository,
+    commit_id: ObjectId,
+    parents: &[ObjectId],
+    new_tree: ObjectId,
+    opts: &Opts,
+    out: &mut Vec<u8>,
+    differed: &mut bool,
+) -> Result<u8> {
+    let mut walk_opts = opts.clone();
+    walk_opts.recurse = true;
+    walk_opts.show_trees = false;
+    walk_opts.reverse = false;
+    walk_opts.filter = ALL_STATUSES;
+    walk_opts.route = None;
+
+    // One change list per parent, in walk order.
+    let mut per_parent: Vec<Vec<Change>> = Vec::with_capacity(parents.len());
+    for p in parents {
+        let before = tree_of(repo, *p)?;
+        per_parent.push(collect(repo, Some(before), Some(new_tree), &walk_opts)?);
+    }
+
+    // Intersect on path: keep the first parent's order, drop anything a later parent
+    // agrees with. `p->parent[i]` for the surviving paths is that parent's old side.
+    let mut rows: Vec<(BString, Vec<Change>)> = Vec::new();
+    'outer: for c in &per_parent[0] {
+        let mut sides = vec![c.clone()];
+        for others in &per_parent[1..] {
+            match others.iter().find(|o| o.path == c.path) {
+                Some(o) => sides.push(o.clone()),
+                None => continue 'outer,
+            }
         }
-    } else if parents.len() > 1 && !opts.merges {
-        // A merge is silently skipped unless -m asks for per-parent diffs.
-        return Ok(0);
-    } else if opts.merges {
-        let mut trees = Vec::with_capacity(parents.len());
-        for p in &parents {
-            trees.push(Some(tree_of(repo, *p)?));
-        }
-        trees
-    } else {
-        vec![Some(tree_of(repo, parents[0])?)]
-    };
+        rows.push((c.path.clone(), sides));
+    }
 
     let term = if opts.nul { b'\0' } else { b'\n' };
-    for before in befores {
-        let changes = collect(repo, before, Some(new_tree), opts)?;
-        *differed |= !changes.is_empty();
-        if opts.always || (!opts.no_commit_id && !changes.is_empty()) {
-            out.extend_from_slice(commit_id.to_hex().to_string().as_bytes());
-            out.push(term);
+    let sep = if opts.nul { b'\0' } else { b'\t' };
+    if !opts.no_commit_id {
+        out.extend_from_slice(&opts.line_prefix);
+        out.extend_from_slice(commit_id.to_hex().to_string().as_bytes());
+        out.push(term);
+    }
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    *differed = true;
+    if opts.dense_combined {
+        bail!(
+            "combined patch output (--cc) is not ported; {} path(s) of commit {commit_id} differ \
+             from every parent (re-run with -c for the combined raw format)",
+            rows.len()
+        );
+    }
+
+    for (path, sides) in &rows {
+        out.extend_from_slice(&opts.line_prefix);
+        match opts.format {
+            Format::NameOnly => {}
+            _ => {
+                if opts.format == Format::Raw {
+                    for _ in sides {
+                        out.push(b':');
+                    }
+                    for s in sides {
+                        let m = s.old.map_or(0, |o| o.mode.value());
+                        out.extend_from_slice(format!("{m:06o} ").as_bytes());
+                    }
+                    let rmode = sides[0].new.map_or(0, |n| n.mode.value());
+                    out.extend_from_slice(format!("{rmode:06o}").as_bytes());
+                    for s in sides {
+                        let id = s.old.map_or_else(|| ObjectId::null(commit_id.kind()), |o| o.id);
+                        out.extend_from_slice(format!(" {}", id.to_hex()).as_bytes());
+                    }
+                    let rid = sides[0]
+                        .new
+                        .map_or_else(|| ObjectId::null(commit_id.kind()), |n| n.id);
+                    out.extend_from_slice(format!(" {} ", rid.to_hex()).as_bytes());
+                }
+                // The status column is one letter per parent, for `--raw` and
+                // `--name-status` alike.
+                for s in sides {
+                    out.push(status(s));
+                }
+                out.push(sep);
+            }
         }
-        render_all(repo, out, &changes, opts)?;
+        write_path(out, path, opts.nul);
+        out.push(term);
     }
     Ok(0)
 }
@@ -1334,6 +1827,12 @@ fn render_all(
     changes: &[Change],
     opts: &Opts,
 ) -> Result<()> {
+    // A routed run hands the walk output straight to `diff-pairs`, which owns every
+    // patch, diffstat, dirstat, whitespace and rename format.
+    if let Some(args) = &opts.route {
+        super::diff_pairs::render_raw_stream(args, Some(raw_pair_stream(changes)), Some(out))?;
+        return Ok(());
+    }
     match opts.format {
         Format::NumStat => {
             for c in changes {
@@ -1353,6 +1852,36 @@ fn render_all(
         }
     }
     Ok(())
+}
+
+/// Serialize the walk output in `diff-pairs`' input format — the NUL-terminated raw
+/// diff `diff-tree -z -r --raw` writes: `:<omode> <nmode> <ooid> <noid> <status>\0<path>\0`
+/// with full object ids. An absent side is an all-zero mode and an all-zero id.
+fn raw_pair_stream(changes: &[Change]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for c in changes {
+        let (omode, ooid) = match c.old {
+            Some(s) => (s.mode.value(), s.id),
+            None => (0, ObjectId::null(c.new.map_or(gix::hash::Kind::Sha1, |s| s.id.kind()))),
+        };
+        let (nmode, noid) = match c.new {
+            Some(s) => (s.mode.value(), s.id),
+            None => (0, ObjectId::null(ooid.kind())),
+        };
+        out.extend_from_slice(
+            format!(
+                ":{omode:06o} {nmode:06o} {} {} {}",
+                ooid.to_hex(),
+                noid.to_hex(),
+                status(c) as char
+            )
+            .as_bytes(),
+        );
+        out.push(0);
+        out.extend_from_slice(&c.path);
+        out.push(0);
+    }
+    out
 }
 
 /// The raw blob bytes on one side of a change; an absent side is the empty content.
@@ -1474,49 +2003,15 @@ fn render_summary(out: &mut Vec<u8>, c: &Change) {
     }
 }
 
-/// Write a path the way git's stat formats do: raw when `nul` (git's `-z`, no quoting),
-/// otherwise through [`quote_c_style`].
+/// Write a path the way git's emitters do: raw when `nul` (git's `-z` sets
+/// `DIFF_FORMAT_NO_QUOTE`), otherwise through the shared `quote_c_style()` port in
+/// [`super::diff_files`], which honours `core.quotePath`.
 fn write_path(out: &mut Vec<u8>, path: &BString, nul: bool) {
     if nul {
         out.extend_from_slice(path);
     } else {
-        out.extend_from_slice(&quote_c_style(path));
+        out.extend_from_slice(&super::diff_files::quoted_name(path));
     }
-}
-
-/// git's `quote_c_style` with the default `core.quotePath=true`: if any byte is a
-/// control character, a double quote, a backslash, or has the high bit set, the whole
-/// name is wrapped in double quotes with the standard C escapes (`\a \b \t \n \v \f \r
-/// \" \\`) and every other out-of-range byte written as a three-digit octal `\ooo`.
-/// A name needing none of that is returned unchanged.
-fn quote_c_style(name: &[u8]) -> Vec<u8> {
-    let needs_quote = name
-        .iter()
-        .any(|&b| !(0x20..0x80).contains(&b) || b == b'"' || b == b'\\');
-    if !needs_quote {
-        return name.to_vec();
-    }
-    let mut out = Vec::with_capacity(name.len() + 2);
-    out.push(b'"');
-    for &b in name {
-        match b {
-            0x07 => out.extend_from_slice(b"\\a"),
-            0x08 => out.extend_from_slice(b"\\b"),
-            b'\t' => out.extend_from_slice(b"\\t"),
-            b'\n' => out.extend_from_slice(b"\\n"),
-            0x0b => out.extend_from_slice(b"\\v"),
-            0x0c => out.extend_from_slice(b"\\f"),
-            b'\r' => out.extend_from_slice(b"\\r"),
-            b'"' => out.extend_from_slice(b"\\\""),
-            b'\\' => out.extend_from_slice(b"\\\\"),
-            b if !(0x20..0x80).contains(&b) => {
-                out.extend_from_slice(format!("\\{b:03o}").as_bytes());
-            }
-            b => out.push(b),
-        }
-    }
-    out.push(b'"');
-    out
 }
 
 /// The status letter git prints for a change.
@@ -1546,13 +2041,13 @@ fn render(out: &mut Vec<u8>, c: &Change, opts: &Opts) {
         }
         Format::NoOutput => {}
         Format::NameOnly => {
-            out.extend_from_slice(&c.path);
+            write_path(out, &c.path, opts.nul);
             out.push(term);
         }
         Format::NameStatus => {
             out.push(status(c));
             out.push(sep);
-            out.extend_from_slice(&c.path);
+            write_path(out, &c.path, opts.nul);
             out.push(term);
         }
         Format::Raw => {
@@ -1570,7 +2065,7 @@ fn render(out: &mut Vec<u8>, c: &Change, opts: &Opts) {
             out.extend_from_slice(format!(":{omode:06o} {nmode:06o} {ooid} {noid} ").as_bytes());
             out.push(status(c));
             out.push(sep);
-            out.extend_from_slice(&c.path);
+            write_path(out, &c.path, opts.nul);
             out.push(term);
         }
     }

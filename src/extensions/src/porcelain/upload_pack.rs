@@ -3,8 +3,9 @@
 //! `upload-pack` is invoked by `git fetch-pack` over a transport. It writes a ref
 //! advertisement, reads `want`/`have` negotiation from stdin, and streams a
 //! generated pack back. The serving path (`serve`) is implemented for the
-//! bidirectional v0 protocol: a `multi_ack_detailed` advertisement with the
-//! `symref=HEAD:<target>` hint, the want/have loop, and a side-band-64k pack built
+//! bidirectional v0 protocol: the `write_v0_ref()` capability advertisement with
+//! the `symref=HEAD:<target>` hint, the want/have loop in either acknowledgement
+//! dialect (see [`MultiAck`]), and a side-banded pack built
 //! from the negotiated closure (`push_proto::objects_to_send` +
 //! `pack_objects::pack_bytes_for`). Enough for a local (`file://`) or ssh
 //! clone/fetch served by this binary. The want policy of `receive_needs()` is
@@ -54,16 +55,16 @@
 //!
 //! What is *not* served, and why:
 //!
-//!   1. **The capability advertisement is a function of the git binary, not of
-//!      the repository.** Every advertisement line stock git emits ends with
-//!      `agent=git/2.55.0-Darwin` — the installed git's version string and
-//!      platform. It is not derivable from the repository or from the vendored
-//!      crates, and hardcoding one build's value would produce output that
-//!      matches on exactly one machine. Parts of the list are equally
-//!      environmental: `no-done` is advertised for `--advertise-refs` but not
-//!      for the full v0 exchange. The two `allow-*-sha1-in-want` tokens and
-//!      `filter` *are* ported — see [`WantPolicy`] — because each is a policy
-//!      this server can actually enforce.
+//!   1. **`shallow`, `deepen-since`, `deepen-not` and `deepen-relative` are
+//!      withheld.** Stock git advertises all four from a fixed string; nothing
+//!      here computes a shallow boundary, so `shallow`/`deepen*` request lines
+//!      are still ignored. Advertising them would invite a client to deepen,
+//!      hand it a complete pack, and leave it recording a cutoff it never
+//!      received — a corrupted clone that looks like a success. A client that
+//!      sees no `shallow` reports "Server does not support shallow clients" up
+//!      front instead. A repository that is itself shallow still gets its
+//!      `shallow` lines in the advertisement, which is not gated on the
+//!      capability (upload-pack.c:1438).
 //!   2. **The pack is built in one piece, not streamed.**
 //!      `pack_objects::pack_bytes_for` returns a finished `Vec<u8>` before a
 //!      byte goes out, so there is no silent producer to interleave keepalives
@@ -385,12 +386,30 @@ fn protocol_version_of(value: &str) -> u8 {
 /// by this binary. `advertise_only` (smart-HTTP info/refs) writes the advertisement
 /// and stops. Shallow/deepen and object filters are not negotiated (ignored).
 fn serve(repo: &gix::Repository, advertise_only: bool, stateless_rpc: bool) -> Result<ExitCode> {
+    // Every failure inside `upload-pack` is a `die()` in git: a truncated
+    // request stream, a bad pkt-line length, a filter the policy bans. All of
+    // them print `fatal: <reason>` and exit 128, so the error must not escape to
+    // the dispatcher — which would report it as a zvcs-level failure with exit 1
+    // and tell a client waiting on the far end nothing useful about the code.
+    match serve_inner(repo, advertise_only, stateless_rpc) {
+        Ok(code) => Ok(code),
+        Err(err) => {
+            eprintln!("fatal: {err}");
+            Ok(ExitCode::from(128))
+        }
+    }
+}
+
+/// The body of [`serve`], written the way git writes it: anything that goes
+/// wrong is an error return, and the caller turns that into git's `die`.
+fn serve_inner(repo: &gix::Repository, advertise_only: bool, stateless_rpc: bool) -> Result<ExitCode> {
     let policy = WantPolicy::from_config(repo);
     // `if (advertise_refs || !data.stateless_rpc)` (upload-pack.c:1418): a
     // smart-HTTP POST body starts at the `want` lines, so writing an
     // advertisement there would corrupt the response.
     if advertise_only || !stateless_rpc {
-        let adv = advertisement(repo, policy)?;
+        // `if (advertise_refs) data.no_done = 1;` (upload-pack.c:1420-1421).
+        let adv = advertisement(repo, policy, advertise_only)?;
         let mut out = std::io::stdout().lock();
         out.write_all(&adv)?;
         out.flush()?;
@@ -464,16 +483,56 @@ fn serve(repo: &gix::Repository, advertise_only: bool, stateless_rpc: bool) -> R
         return Ok(ExitCode::from(128));
     }
 
+    // Which acknowledgement dialect the client picked, and whether it wants to be
+    // allowed to skip its final `done` (upload-pack.c:1125-1130).
+    let multi_ack = MultiAck::from_caps(&want_caps);
+    let no_done = cap_present(&want_caps, b"no-done");
+    // git's `sent_ready`, set when it answers `ACK <oid> ready` because
+    // `ok_to_give_up()` found the wants already reachable from the haves. This
+    // server has no such early cut-off — it negotiates to the client's `done` and
+    // then packs — so nothing sets it, and the `no-done` shortcut below is
+    // consequently never taken. That is a shortcut the *server* may take, so a
+    // client that asked for `no-done` and is not offered it simply sends its
+    // `done` as usual; the capability stays truthful either way.
+    let sent_ready = false;
+
     // --- haves until `done`, ACK/NAK per round -----------------------------------
+    // Every `have` this server can answer, in arrival order; its last element is
+    // git's `last_hex`.
     let mut common: Vec<ObjectId> = Vec::new();
+    // `got_oid()`'s two pieces of state (upload-pack.c:551-577). `THEY_HAVE` is
+    // set on each accepted have *and on its parents*, and `have_obj` only grows
+    // for a have that did not already carry the flag. The distinction is what
+    // makes `data->have_obj.nr == 1` stay true across a run of haves that walk
+    // straight down one ancestry — which is the condition the bare `ACK` is
+    // gated on when no multi-ack dialect was negotiated.
+    let mut they_have: std::collections::HashSet<ObjectId> = std::collections::HashSet::new();
+    let mut have_obj_nr = 0usize;
+    // Whether the negotiation already closed with its final acknowledgement, as
+    // the `no-done` shortcut does when it takes the pack path early.
+    let mut acked = false;
     let mut out = std::io::stdout().lock();
     loop {
         match read_pkt(&mut stdin)? {
-            // A flush ends a have batch without `done`: with no multi-ack advertised,
-            // git answers a single NAK and the client sends more haves or `done`.
+            // A flush ends a have batch without `done`. `get_common_commits`
+            // (upload-pack.c:587-606) answers NAK when nothing is common yet or
+            // when a multi-ack dialect is in force, then reads the next batch.
             None => {
-                write_pkt(&mut out, b"NAK\n")?;
-                out.flush()?;
+                if have_obj_nr == 0 || multi_ack != MultiAck::None {
+                    write_pkt(&mut out, b"NAK\n")?;
+                    out.flush()?;
+                }
+                // `if (data->no_done && sent_ready)` (upload-pack.c:598-601):
+                // acknowledge and go straight to the pack without waiting for
+                // the client's `done`.
+                if no_done && sent_ready {
+                    if let Some(id) = common.last() {
+                        write_pkt(&mut out, format!("ACK {}\n", id.to_hex()).as_bytes())?;
+                        out.flush()?;
+                    }
+                    acked = true;
+                    break;
+                }
             }
             Some(line) => {
                 let text = String::from_utf8_lossy(&line);
@@ -484,33 +543,73 @@ fn serve(repo: &gix::Repository, advertise_only: bool, stateless_rpc: bool) -> R
                 if let Some(hex) = text.strip_prefix("have ") {
                     if let Ok(id) = ObjectId::from_hex(hex.as_bytes()) {
                         if repo.find_object(id).is_ok() {
+                            // `got_oid()`: mark the commit and its parents, and
+                            // count it only if it was not already marked.
+                            if they_have.insert(id) {
+                                have_obj_nr += 1;
+                            }
+                            if let Ok(commit) = repo.find_commit(id) {
+                                for parent in commit.parent_ids() {
+                                    they_have.insert(parent.detach());
+                                }
+                            }
                             common.push(id);
-                            // multi_ack_detailed: acknowledge each object we have in common
-                            // as it arrives.
-                            write_pkt(&mut out, format!("ACK {} common\n", id.to_hex()).as_bytes())?;
-                            out.flush()?;
+                            let hex = id.to_hex();
+                            // The `default:` arm of `get_common_commits`
+                            // (upload-pack.c:622-631): `common` under
+                            // multi_ack_detailed, `continue` under multi_ack, and
+                            // a bare ACK while `have_obj.nr` is still 1 when
+                            // neither was negotiated.
+                            let ack = match multi_ack {
+                                MultiAck::Detailed => Some(format!("ACK {hex} common\n")),
+                                MultiAck::Plain => Some(format!("ACK {hex} continue\n")),
+                                MultiAck::None if have_obj_nr == 1 => Some(format!("ACK {hex}\n")),
+                                MultiAck::None => None,
+                            };
+                            if let Some(ack) = ack {
+                                write_pkt(&mut out, ack.as_bytes())?;
+                                out.flush()?;
+                            }
                         }
                     }
                 }
             }
         }
     }
-    // Final acknowledgement: the last common object, or NAK when there is none.
-    match common.last() {
-        Some(id) => write_pkt(&mut out, format!("ACK {}\n", id.to_hex()).as_bytes())?,
-        None => write_pkt(&mut out, b"NAK\n")?,
+    // `if (!strcmp(reader->line, "done"))` (upload-pack.c:635-642): the final ACK
+    // names the last common object and is sent only under a multi-ack dialect —
+    // without one the per-have ACK above was already the answer.
+    if !acked {
+        match common.last() {
+            Some(id) if multi_ack != MultiAck::None => {
+                write_pkt(&mut out, format!("ACK {}\n", id.to_hex()).as_bytes())?
+            }
+            Some(_) => {}
+            None => write_pkt(&mut out, b"NAK\n")?,
+        }
+        out.flush()?;
     }
-    out.flush()?;
 
     // --- build + stream the pack -------------------------------------------------
     let mut objects = crate::porcelain::push_proto::objects_to_send(repo, &wants, &common);
     // `--filter=<spec>` on the `pack-objects` git spawns (upload-pack.c:340-344).
     crate::porcelain::pack_objects::apply_filter(repo, filter_spec.as_deref(), &mut objects);
     let pack = crate::porcelain::pack_objects::pack_bytes_for(repo, &objects)?;
-    if cap_present(&want_caps, b"side-band-64k") || cap_present(&want_caps, b"side-band") {
-        // Multiplex the pack on band 1 (≤ 65515 payload bytes per pkt-line), then a
-        // flush closes the side-band stream.
-        for chunk in pack.chunks(65515) {
+    // `data->use_sideband` (upload-pack.c:1135-1138) is the packet size the
+    // selected band carries, not a flag: `LARGE_PACKET_MAX` for `side-band-64k`
+    // and `DEFAULT_PACKET_MAX` for plain `side-band`. `send_sideband()` chunks at
+    // that size minus the 4-byte length and the 1-byte band, so a client that
+    // asked for the 1000-byte dialect must not be handed 65 KiB packets.
+    let use_sideband = if cap_present(&want_caps, b"side-band-64k") {
+        Some(LARGE_PACKET_MAX - 5)
+    } else if cap_present(&want_caps, b"side-band") {
+        Some(DEFAULT_PACKET_MAX - 5)
+    } else {
+        None
+    };
+    if let Some(band_max) = use_sideband {
+        // Multiplex the pack on band 1, then a flush closes the side-band stream.
+        for chunk in pack.chunks(band_max) {
             let mut framed = Vec::with_capacity(chunk.len() + 1);
             framed.push(1);
             framed.extend_from_slice(chunk);
@@ -528,7 +627,7 @@ fn serve(repo: &gix::Repository, advertise_only: bool, stateless_rpc: bool) -> R
 /// `symref=HEAD:<target>` so the client checks out the right branch), then every
 /// ref in name order, each annotated tag followed by its peeled `^{}` line, then a
 /// flush. Mirrors git's `send_ref`/`upload-pack` advertisement shape.
-fn advertisement(repo: &gix::Repository, policy: WantPolicy) -> Result<Vec<u8>> {
+fn advertisement(repo: &gix::Repository, policy: WantPolicy, no_done: bool) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     // `upload-pack` filters its ref list through `ref_is_hidden()` exactly as
     // `receive-pack` does, off `uploadpack.hideRefs` plus the shared
@@ -540,7 +639,7 @@ fn advertisement(repo: &gix::Repository, policy: WantPolicy) -> Result<Vec<u8>> 
         .ok()
         .flatten()
         .map(|r| r.name().as_bstr().to_string());
-    let caps = capabilities(head_target.as_deref(), policy);
+    let caps = capabilities(head_target.as_deref(), policy, no_done);
     let mut sent_caps = false;
 
     // HEAD first, when it resolves to an object.
@@ -591,18 +690,83 @@ fn advertisement(repo: &gix::Repository, policy: WantPolicy) -> Result<Vec<u8>> 
     Ok(out)
 }
 
+/// `LARGE_PACKET_MAX` (pkt-line.h): the packet size `side-band-64k` carries.
+const LARGE_PACKET_MAX: usize = 65520;
+
+/// `DEFAULT_PACKET_MAX` (pkt-line.h): the packet size plain `side-band` carries.
+const DEFAULT_PACKET_MAX: usize = 1000;
+
+/// Which acknowledgement dialect the client selected in its first `want` line —
+/// git's `data->multi_ack`, whose three states change what `get_common_commits`
+/// writes for every `have` (upload-pack.c:1125-1128).
+#[derive(PartialEq, Clone, Copy)]
+enum MultiAck {
+    /// Neither capability requested: one bare `ACK <oid>` for the first common
+    /// object and nothing after it.
+    None,
+    /// `multi_ack`: `ACK <oid> continue` per common object.
+    Plain,
+    /// `multi_ack_detailed`: `ACK <oid> common` per common object.
+    Detailed,
+}
+
+impl MultiAck {
+    /// `parse_feature_request(features, "multi_ack_detailed")` first, then
+    /// `"multi_ack"` — the detailed dialect wins when both are offered.
+    fn from_caps(caps: &[u8]) -> Self {
+        if cap_present(caps, b"multi_ack_detailed") {
+            Self::Detailed
+        } else if cap_present(caps, b"multi_ack") {
+            Self::Plain
+        } else {
+            Self::None
+        }
+    }
+}
+
+/// The fixed part of `write_v0_ref()`'s capability string (upload-pack.c:1235).
+/// Every token here is one this server honours on the v0 path:
+///
+///   * `multi_ack` / `multi_ack_detailed` — both acknowledgement dialects are
+///     driven by [`MultiAck`] in the have loop.
+///   * `thin-pack` / `ofs-delta` / `no-progress` — permissions, not obligations.
+///     A client that sends them asks this server to be *allowed* to accept a
+///     thin or offset-delta'd pack and to skip progress; a pack that is neither
+///     thin nor delta'd and carries no progress satisfies all three, which is
+///     why git advertises them from a fixed string regardless of what
+///     `pack-objects` will produce.
+///   * `side-band` / `side-band-64k` — [`serve`] frames the pack at whichever
+///     of the two the client selects, with the packet cap that goes with it.
+///   * `include-tag` — [`add_included_tags`] adds the tags pointing into the
+///     pack; a client that omits it gets no extra tags.
+///
+/// `shallow` and the three `deepen-*` tokens are the ones held back: nothing
+/// here computes a shallow boundary, so a client that sent `deepen` would get a
+/// complete pack and record a cutoff it never received. A client that sees no
+/// `shallow` reports "Server does not support shallow clients" instead, which is
+/// the truth.
+const V0_CAPABILITIES: &str =
+    "multi_ack thin-pack side-band side-band-64k ofs-delta no-progress \
+     include-tag multi_ack_detailed";
+
 /// The upload-pack capability list. `symref=HEAD:<target>` tells the client which
 /// branch HEAD follows so a clone checks it out. The two `allow-*-sha1-in-want`
 /// tokens are emitted exactly when the matching bit of [`WantPolicy`] is set, as
 /// `write_v0_ref()` does off `data->allow_uor`.
-fn capabilities(head_target: Option<&str>, policy: WantPolicy) -> String {
-    let mut caps =
-        String::from("multi_ack_detailed side-band-64k thin-pack ofs-delta no-progress include-tag");
+///
+/// `no-done` follows `data->no_done`, which `cmd_main` sets only under
+/// `--advertise-refs` (upload-pack.c:1420-1421) — see [`serve`] for the branch
+/// that honours a client asking for it back.
+fn capabilities(head_target: Option<&str>, policy: WantPolicy, no_done: bool) -> String {
+    let mut caps = String::from(V0_CAPABILITIES);
     if policy.tip {
         caps.push_str(" allow-tip-sha1-in-want");
     }
     if policy.reachable {
         caps.push_str(" allow-reachable-sha1-in-want");
+    }
+    if no_done {
+        caps.push_str(" no-done");
     }
     if let Some(t) = head_target {
         caps.push_str(&format!(" symref=HEAD:{t}"));
@@ -612,7 +776,12 @@ fn capabilities(head_target: Option<&str>, policy: WantPolicy) -> String {
     if policy.filter {
         caps.push_str(" filter");
     }
-    caps.push_str(" object-format=sha1 agent=git/2.55.0-zvcs");
+    // One agent string for both servers: `git_user_agent_sanitized()`, ported in
+    // `receive_pack::agent` — `$GIT_USER_AGENT` when set, else
+    // `git/<version>-<uname -s>`. Deriving it keeps `upload-pack` and
+    // `receive-pack` from disagreeing about what this binary is, and keeps the
+    // platform suffix honest off Darwin, which a literal cannot do.
+    caps.push_str(&format!(" object-format=sha1 agent={}", super::receive_pack::agent()));
     caps
 }
 
@@ -1282,7 +1451,7 @@ fn v2_advertisement(repo: &gix::Repository) -> Result<Vec<u8>> {
     let cfg = V2Config::from_repo(repo);
     let mut out = Vec::new();
     pkt_line(&mut out, b"version 2\n");
-    pkt_line(&mut out, b"agent=git/2.55.0-zvcs\n");
+    pkt_line(&mut out, format!("agent={}\n", super::receive_pack::agent()).as_bytes());
     match cfg.unborn {
         Unborn::Advertise => pkt_line(&mut out, b"ls-refs=unborn\n"),
         _ => pkt_line(&mut out, b"ls-refs\n"),
@@ -1997,12 +2166,68 @@ mod tests {
     /// `object-format=` (upload-pack.c:1249-1261).
     #[test]
     fn filter_capability_is_gated_and_positioned() {
-        let off = capabilities(Some("refs/heads/main"), WantPolicy::default());
+        let off = capabilities(Some("refs/heads/main"), WantPolicy::default(), false);
         assert!(!off.contains(" filter"), "{off}");
 
         let policy = WantPolicy { filter: true, ..WantPolicy::default() };
-        let on = capabilities(Some("refs/heads/main"), policy);
+        let on = capabilities(Some("refs/heads/main"), policy, false);
         assert!(on.contains(" symref=HEAD:refs/heads/main filter object-format=sha1 "), "{on}");
+    }
+
+    /// `no-done` is `data->no_done`, which `cmd_main` sets only on the
+    /// `--advertise-refs` path, and `write_v0_ref()` emits it after the
+    /// `allow-*-sha1-in-want` pair and before the symref info
+    /// (upload-pack.c:1252-1257). Advertising it on the bidirectional path would
+    /// promise a shortcut in an exchange stock git never offers it in.
+    #[test]
+    fn no_done_is_advertised_only_for_advertise_refs() {
+        let policy = WantPolicy::default();
+        assert!(!capabilities(Some("refs/heads/main"), policy, false).contains(" no-done"));
+        let adv = capabilities(Some("refs/heads/main"), policy, true);
+        assert!(adv.contains(" no-done symref=HEAD:refs/heads/main "), "{adv}");
+    }
+
+    /// Every token of the fixed capability string is one this server acts on,
+    /// and the four shallow/deepen tokens stock git also advertises are absent
+    /// because no deepen negotiation is implemented. A client that saw
+    /// `shallow` here would send `deepen` lines, get a complete pack, and record
+    /// a cutoff it was never given.
+    #[test]
+    fn shallow_and_deepen_are_withheld() {
+        let caps = capabilities(None, WantPolicy::default(), true);
+        for absent in ["shallow", "deepen-since", "deepen-not", "deepen-relative"] {
+            assert!(
+                !caps.split(' ').any(|tok| tok == absent),
+                "{absent} is not honoured and must not be advertised: {caps}"
+            );
+        }
+        for present in [
+            "multi_ack",
+            "multi_ack_detailed",
+            "side-band",
+            "side-band-64k",
+            "thin-pack",
+            "ofs-delta",
+            "no-progress",
+            "include-tag",
+        ] {
+            assert!(caps.split(' ').any(|tok| tok == present), "{present} missing: {caps}");
+        }
+    }
+
+    /// The dialect is picked off the client's first `want` line, and
+    /// `multi_ack_detailed` wins over `multi_ack` when a client offers both —
+    /// git tests the detailed spelling first (upload-pack.c:1125-1128). A
+    /// substring match here would read `multi_ack` out of `multi_ack_detailed`
+    /// and answer `continue` where the client expects `common`.
+    #[test]
+    fn multi_ack_dialect_is_selected_by_exact_token() {
+        assert!(MultiAck::from_caps(b"multi_ack_detailed side-band-64k") == MultiAck::Detailed);
+        assert!(MultiAck::from_caps(b"multi_ack side-band-64k") == MultiAck::Plain);
+        assert!(MultiAck::from_caps(b"multi_ack multi_ack_detailed") == MultiAck::Detailed);
+        assert!(MultiAck::from_caps(b"side-band-64k ofs-delta") == MultiAck::None);
+        // A capability that merely starts with the token is not the token.
+        assert!(MultiAck::from_caps(b"multi_ack_detailedx") == MultiAck::None);
     }
 
     /// `determine_protocol_version_server()` takes the *greatest* version the

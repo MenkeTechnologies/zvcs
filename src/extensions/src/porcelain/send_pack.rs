@@ -1,8 +1,17 @@
-//! `git send-pack` — push objects over the git protocol. **Not ported: this
-//! module bails once the arguments are accepted.**
+//! `git send-pack` — push objects over the git protocol.
 //!
-//! What *is* covered is the complete argument surface, and only because those
-//! paths are byte-verifiable without opening a connection:
+//! Port of `cmd_send_pack` (`builtin/send-pack.c`): parse the arguments, resolve
+//! the destination, match the `<ref>` arguments against the local refs, hand the
+//! result to the receive-pack client in [`super::push_proto`], and print the
+//! status block `transport_print_push_status()` prints.
+//!
+//! The wire half is shared with `git push` rather than reimplemented:
+//! [`push_proto::send_pack`] is the port of `send_pack()` itself — capability
+//! negotiation, the `<old> <new> <ref>` command list, the push certificate, the
+//! pack, and the `report-status` / `report-status-v2` parser. This module is the
+//! `builtin/` layer on top of it, which is the same split git has.
+//!
+//! The argument surface is covered in full:
 //! ```text
 //!   * `-h` → git's 1472-byte usage block on stdout, exit 129
 //!   * git's parse-options behaviour for every option in the table, including
@@ -23,59 +32,36 @@
 //! ```
 //! (all checked against git 2.55.0.)
 //!
-//! Everything else — i.e. `send-pack` actually pushing — bails, naming the
-//! substrate that is missing. It is deliberately *not* approximated. A partial
-//! implementation would mutate refs in the *receiving* repository, which is
-//! precisely the post-command state a differential harness inspects, and a push
-//! that lands the wrong pack or the wrong ref update is indistinguishable from
-//! success at the exit-code level.
+//! Not covered:
 //!
-//! The missing substrate, concretely, in the vendored crates under `src/ported`:
-//!
-//!   1. **No receive-pack client at all.** `gix-protocol`'s v2 command
-//!      abstraction knows exactly two commands, `ls-refs` and `fetch`
-//!      (`gix-protocol/src/command/mod.rs`, `Command::as_str`), and the crate
-//!      exports only the `handshake`, `ls_refs` and `fetch` modules
-//!      (`gix-protocol/src/lib.rs`). `gix_transport::Service::ReceivePack`
-//!      exists as a name (`gix-transport/src/lib.rs:43`), but nothing in the
-//!      vendored tree ever requests it: the whole `git-receive-pack` side of the
-//!      protocol — the `<old> <new> <ref>\0<capabilities>` command list, the
-//!      flush, and the pack that follows — is unimplemented.
-//!   2. **No report-status parsing.** The strings `report-status` and
-//!      `report_status` do not occur anywhere under `gix-protocol/src`,
-//!      `gix-transport/src` or `gix/src`. `send-pack`'s entire stdout and its
-//!      exit code are derived from the server's `unpack ok` / `ng <ref> <why>`
-//!      report, so without a parser there is nothing to print and no way to know
-//!      whether the push succeeded.
-//!   3. **No pack generation fit to send.** The pack `send-pack` streams is
-//!      produced by `pack-objects`. `gix-pack` cannot compute a delta: its
-//!      output iterator has one mode, documented as "Copy base objects and
-//!      deltas from packs, while non-packed objects will be treated as base
-//!      objects (i.e. without trying to delta compress them)"
-//!      (`gix-pack/src/data/output/entry/iter_from_counts.rs`). `--thin`, which
-//!      is what `send-pack` uses by default under `push`, is a stronger form of
-//!      the same requirement — entries whose delta bases are deliberately
-//!      absent — and is unreachable for the same reason.
-//!   4. **No push certificates.** `--signed` requires generating and signing a
-//!      push cert with the `push-cert` capability. There is no push-cert writer
-//!      in the vendored crates and no signing path that produces one.
-//!   5. **No `--atomic` / `--push-option` transport support.** Both are
-//!      capabilities negotiated on the receive-pack side, which (1) rules out.
-//!      `gix-protocol`'s crate status lists `push` and, under it, "report-status,
-//!      sideband, delete-refs, push-options and atomic pushes" as unimplemented
-//!      (`src/ported/crate-status.md`).
-//!
-//! Two deliberate gaps in the covered part, so this doc claims no more than the
-//! code does. `--force-with-lease=<ref>:<expect>` resolves `<expect>` through
-//! gitoxide's `rev_parse_single` rather than git's `repo_get_oid`; the two
-//! accept the same everyday spellings but are not proven byte-identical on
-//! exotic ones. And the `fatal: '<dest>' does not appear to be a git
-//! repository` diagnostic git emits for an unreachable destination is not
-//! reproduced — that message comes from the connection attempt, which is the
-//! part that does not exist.
+//!   * **`--stateless-rpc`.** The smart-HTTP framing has no local destination to
+//!     connect to, and its `--stdin` variant reads the refspec list as pkt-lines
+//!     rather than plain lines. The flag is accepted and dropped; a caller that
+//!     needs the HTTP transport goes through `http_backend`/`remote_ext`.
+//!   * **`--thin` and `--progress`.** Both describe how the sender builds and
+//!     narrates its pack, not what the receiver is asked to do. The pack this
+//!     sends is never thin and reports no progress, which is a valid choice for
+//!     either flag's value, so neither changes the bytes on the wire.
+//!   * **Refspec forms beyond `[+]<src>[:<dst>]`.** `match_push_refs()`'s
+//!     pattern expansion (`refs/heads/*:refs/heads/*`) is not implemented here;
+//!     `git push` is the porcelain that has it.
+//!   * **`--force-with-lease=<ref>:<expect>`** resolves `<expect>` through
+//!     gitoxide's `rev_parse_single` rather than git's `repo_get_oid`; the two
+//!     accept the same everyday spellings but are not proven byte-identical on
+//!     exotic ones.
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
+use gix::remote::Direction;
+use gix::ObjectId;
+use std::io::BufRead;
 use std::process::ExitCode;
+
+use super::push_proto::{self, Request};
+
+/// git's `DEFAULT_ABBREV` floor for `find_unique_abbrev` and the
+/// `FALLBACK_DEFAULT_ABBREV` `transport_summary_width()` uses when a push
+/// carries no object ids at all.
+const DEFAULT_ABBREV: usize = 7;
 
 /// Stock git's `send-pack` usage block, byte-for-byte (1472 bytes, git 2.55.0),
 /// including the trailing blank line. Printed on `-h` (stdout), after the
@@ -162,13 +148,39 @@ const OPTS: &[OptDef] = &[
     OptDef { long: "force-if-includes", kind: Kind::Bool },
 ];
 
-/// The flag state git derives while parsing, i.e. everything the post-parse
-/// checks look at. Options no check consults are accepted and dropped, since the
-/// command bails before they could matter.
+/// Everything `cmd_send_pack` carries out of `parse_options` into the push
+/// itself, plus the two counters its post-parse usage checks consult.
 #[derive(Default)]
 struct State {
     send_all: bool,
     send_mirror: bool,
+    force: bool,
+    dry_run: bool,
+    verbose: bool,
+    atomic: bool,
+    /// `--stdin`: read the refspec list from stdin instead of argv.
+    from_stdin: bool,
+    /// `--helper-status`: the `remote-helper` status block on **stdout** in
+    /// place of the human-readable one on stderr.
+    helper_status: bool,
+    /// `--signed` / `push.gpgsign`.
+    signed: push_proto::Signed,
+    /// `-o`/`--push-option` values, in argv order.
+    push_options: Vec<String>,
+    /// `--receive-pack` / `--exec`, git's `receivepack` (default
+    /// `git-receive-pack`, which is what leaving it unset means here).
+    receive_pack: Option<String>,
+    /// `--remote <name>`: the configured remote whose tracking refs the push
+    /// updates, checked to actually carry `<directory>` as one of its URLs.
+    remote_name: Option<String>,
+    /// `--force-with-lease[=<ref>:<expect>]`, kept as written so the wire layer
+    /// can resolve the expected value.
+    lease: Option<Option<String>>,
+    force_if_includes: bool,
+    /// `<directory>`, the first non-option argument.
+    dest: Option<String>,
+    /// The `<ref>` arguments after `<directory>`.
+    refspecs: Vec<String>,
     /// Non-option arguments: the first is `<directory>`, the rest are `<ref>`s.
     positionals: usize,
 }
@@ -180,14 +192,14 @@ enum Parsed {
     Exit(ExitCode),
 }
 
-/// `git send-pack` — argument validation and pre-flight checks only; the push
-/// itself is not ported.
+/// `git send-pack` — port of `cmd_send_pack` (`builtin/send-pack.c`).
 ///
 /// Returns 129 with git's own output for `-h`, for every malformed invocation,
 /// for a missing `<directory>`, and for the `--all`/`--mirror`/`<ref>` conflict;
-/// 128 for the `--signed` value git rejects during parsing. Any invocation that
-/// survives both bails, naming the substrate that is missing; see the module
-/// documentation for the full list.
+/// 128 for the `--signed` value git rejects during parsing. Otherwise it runs
+/// the push and returns `send_pack()`'s status: 0 when every ref ended `OK`,
+/// `UPTODATE` or `NONE`, and `ERROR_SEND_PACK_BAD_REF_STATUS` (1) when any did
+/// not (send-pack.c:795-805).
 pub fn send_pack(args: &[String]) -> Result<ExitCode> {
     // Dispatch includes the verb at index 0. `send-pack` does take positionals
     // (the destination and the refs), so the leading verb must be dropped rather
@@ -197,25 +209,365 @@ pub fn send_pack(args: &[String]) -> Result<ExitCode> {
         _ => args,
     };
 
-    let state = match parse(args) {
+    let mut state = match parse(args) {
         Parsed::Exit(code) => return Ok(code),
         Parsed::Ok(state) => state,
     };
+
+    // `if (from_stdin)`: the refspec list continues on stdin, one per line
+    // (send-pack.c:238-249). The `--stateless-rpc` pkt-line spelling of the same
+    // list is not read here — see the module header.
+    if state.from_stdin {
+        for line in std::io::stdin().lock().lines() {
+            let line = line?;
+            if !line.is_empty() {
+                state.refspecs.push(line);
+                state.positionals += 1;
+            }
+        }
+    }
 
     if let Some(code) = preflight(&state) {
         return Ok(code);
     }
 
-    bail!(
-        "send-pack is not ported: gix-protocol has no receive-pack client (its command \
-         abstraction knows only ls-refs and fetch, so the `<old> <new> <ref>` command list and \
-         the pack that follows are never sent), no report-status parser (which is where \
-         send-pack's entire stdout and exit code come from), no push-certificate writer for \
-         --signed, and no atomic/push-option capability negotiation; gix-pack additionally has \
-         no delta compression and so cannot build the thin pack send-pack streams (ported: -h, \
-         argument validation, the --signed and --force-with-lease value callbacks, and the \
-         post-parse usage checks only)"
-    )
+    push(&state)
+}
+
+/// Everything `cmd_send_pack` does once the arguments are accepted: open the
+/// repository, resolve the destination, match the refspecs against the local
+/// refs, run the push, and print the status block.
+fn push(st: &State) -> Result<ExitCode> {
+    let dest = st.dest.as_deref().unwrap_or_default();
+    let repo = gix::discover(".")?;
+
+    // `if (remote_name) { remote = remote_get(...); if (!remote_has_url(...)) die(...) }`
+    // (send-pack.c:259-265). Only a named remote gets its tracking refs updated
+    // afterwards, which is why the destination has to be one of its URLs.
+    let remote = match &st.remote_name {
+        Some(name) => {
+            let configured = repo.find_remote(name.as_str())?;
+            let has_url = [Direction::Push, Direction::Fetch]
+                .iter()
+                .filter_map(|d| configured.url(*d))
+                .any(|u| u.to_bstring() == dest);
+            if !has_url {
+                bail!("Destination {dest} is not a uri for {name}");
+            }
+            configured
+        }
+        None => repo.remote_at(dest)?,
+    };
+
+    let requests = build_requests(&repo, st)?;
+    let opts = push_proto::SendOptions {
+        atomic: st.atomic,
+        push_options: st.push_options.clone(),
+        // `--mirror` is `MATCH_REFS_MIRROR`, whose other half is deleting every
+        // advertised ref this repository no longer has. Only the wire layer has
+        // the advertisement, so the decision is handed down with it.
+        delete_scope: st.send_mirror.then_some(push_proto::DeleteScope::All),
+        local_refs: requests.iter().map(|r| r.name.clone()).collect(),
+        signed: st.signed,
+        receive_pack: st.receive_pack.clone(),
+    };
+
+    // `git_connect()` for a local destination runs `git-receive-pack '<dest>'`,
+    // which dies with git's `enter_repo` message when the path is not a
+    // repository; the parent then cannot read the advertisement and dies through
+    // `die_initial_contact()` (connect.c). Both lines, and the 128, are
+    // reproduced here because the vendored transport reports a single Rust-level
+    // metadata error instead.
+    if let Some(bad) = local_dest_that_is_not_a_repository(dest) {
+        eprintln!("fatal: '{bad}' does not appear to be a git repository");
+        eprintln!(
+            "fatal: Could not read from remote repository.\n\n\
+             Please make sure you have the correct access rights\n\
+             and the repository exists."
+        );
+        return Ok(ExitCode::from(128));
+    }
+
+    // Everything `send_pack()` can fail on is a `die()` in git — a refused
+    // capability, a broken connection, an unreadable advertisement — so the
+    // status is 128 rather than the dispatcher's 1.
+    let outcome = match push_proto::send_pack(&repo, &remote, &requests, st.dry_run, &opts) {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            eprintln!("fatal: {err}");
+            return Ok(ExitCode::from(128));
+        }
+    };
+
+    if st.helper_status {
+        print_helper_status(&outcome);
+    } else {
+        print_push_status(&repo, &outcome, st.verbose);
+    }
+
+    // `if (!ret && !transport_refs_pushed(remote_refs))` (send-pack.c:341-343):
+    // a ref that ended `NONE` or `UPTODATE` did not move, and if none of them
+    // did the run reports so. Stable plumbing output; not localized.
+    let bad = outcome.unpack.is_err() || outcome.statuses.iter().any(|s| s.result.is_err());
+    let pushed = outcome.statuses.iter().any(|s| !s.up_to_date && s.result.is_ok());
+    if !bad && !pushed {
+        eprintln!("Everything up-to-date");
+    }
+
+    Ok(if bad { ExitCode::from(1) } else { ExitCode::SUCCESS })
+}
+
+/// The destination as `enter_repo()` sees it, when it names a local path that is
+/// not a repository — the case `git-receive-pack` would have refused on the far
+/// end. `None` for anything reachable, and for any destination that is not a
+/// local path, whose failures belong to the transport that owns them.
+fn local_dest_that_is_not_a_repository(dest: &str) -> Option<&str> {
+    let url = gix::url::parse(dest.into()).ok()?;
+    if url.scheme != gix::url::Scheme::File {
+        return None;
+    }
+    // `enter_repo(..., strict = 0)`: a worktree, a `.git` directory, or a bare
+    // repository, with `.git` appended if that is what makes it one.
+    let found = [
+        dest.to_string(),
+        format!("{dest}/.git"),
+        format!("{dest}.git"),
+        format!("{dest}.git/.git"),
+    ]
+    .iter()
+    .any(|c| gix::open(c).is_ok());
+    (!found).then_some(dest)
+}
+
+/// `match_push_refs()` reduced to what `send-pack` can ask of it: `--all` and
+/// `--mirror` take every local ref under `refs/`, and otherwise each `<ref>`
+/// argument is one `[+]<src>[:<dst>]` refspec.
+///
+/// `get_local_heads()` (remote.c) is `for_each_ref`, so both flag forms cover
+/// tags and remote-tracking refs, not just branches — `send-pack --all` is a
+/// wider set than `git push --all`, which is refspec-driven.
+fn build_requests(repo: &gix::Repository, st: &State) -> Result<Vec<Request>> {
+    let mut requests = Vec::new();
+
+    if st.send_all || st.send_mirror {
+        for r in repo.references()?.all()? {
+            let Ok(r) = r else { continue };
+            let name = r.name().as_bstr().to_string();
+            if !name.starts_with("refs/") {
+                continue;
+            }
+            if let Some(id) = r.try_id() {
+                requests.push(Request {
+                    src: Some(name.clone()),
+                    name,
+                    new: id.detach(),
+                    // `MATCH_REFS_MIRROR` forces every update; `--all` still
+                    // honours `--force` alone.
+                    force: st.force || st.send_mirror,
+                    expected: None,
+                    only_if_absent: false,
+                    check_reachable: None,
+                });
+            }
+        }
+        return Ok(requests);
+    }
+
+    let null = ObjectId::null(repo.object_hash());
+    for spec in &st.refspecs {
+        let (forced, body) = match spec.strip_prefix('+') {
+            Some(rest) => (true, rest),
+            None => (false, spec.as_str()),
+        };
+        let (src, dst) = match body.split_once(':') {
+            Some((s, d)) => (s, d),
+            None => (body, body),
+        };
+        let force = forced || st.force;
+
+        // An empty source is a deletion: `:refs/heads/gone`.
+        if src.is_empty() {
+            requests.push(Request {
+                name: full_ref_name(repo, dst),
+                src: None,
+                new: null,
+                force,
+                expected: None,
+                only_if_absent: false,
+                check_reachable: None,
+            });
+            continue;
+        }
+
+        let src_ref = repo
+            .find_reference(src)
+            .with_context(|| format!("src refspec {src} does not match any"))?;
+        let new = src_ref.clone().into_fully_peeled_id()?.detach();
+        requests.push(Request {
+            name: full_ref_name(repo, dst),
+            src: Some(src_ref.name().as_bstr().to_string()),
+            new,
+            force,
+            expected: None,
+            only_if_absent: false,
+            check_reachable: None,
+        });
+    }
+    Ok(requests)
+}
+
+/// The destination side of a refspec as a full ref name. A `<dst>` that is
+/// already qualified is used as written; a short one is resolved against the
+/// *local* refs first (so `main` reaches `refs/heads/main`) and falls back to
+/// `refs/heads/<dst>`, which is what `match_push_refs` settles on for a name
+/// the remote does not carry yet.
+fn full_ref_name(repo: &gix::Repository, dst: &str) -> String {
+    if dst.starts_with("refs/") {
+        return dst.to_string();
+    }
+    match repo.find_reference(dst) {
+        Ok(r) => r.name().as_bstr().to_string(),
+        Err(_) => format!("refs/heads/{dst}"),
+    }
+}
+
+/// `transport_print_push_status()` (transport.c:850-899) in its non-porcelain
+/// form: `To <dest>` once, then the up-to-date refs under `-v`, then the ones
+/// that moved, then the ones that did not.
+fn print_push_status(repo: &gix::Repository, outcome: &push_proto::Outcome, verbose: bool) {
+    // `transport_summary_width()`: `2 * <widest abbreviation> + 3`, measured
+    // over every old and new oid in the push, with `FALLBACK_DEFAULT_ABBREV`
+    // when there are none (transport.c:837-848).
+    let width = summary_width(repo, outcome);
+    let mut printed = 0usize;
+
+    let mut emit = |flag: char, summary: String, from: Option<&str>, to: &str, msg: Option<&str>| {
+        if printed == 0 {
+            eprintln!("To {}", outcome.url);
+        }
+        printed += 1;
+        let refs = match from {
+            Some(f) => format!("{} -> {}", prettify(f), prettify(to)),
+            None => prettify(to).to_string(),
+        };
+        let msg = msg.map(|m| format!(" ({m})")).unwrap_or_default();
+        eprintln!(" {flag} {summary:<width$} {refs}{msg}");
+    };
+
+    // `strbuf_add_unique_abbrev(&quickref, oid, DEFAULT_ABBREV)`: the quickref
+    // uses the same abbreviation length the width was measured from.
+    let abbrev = (width - 3) / 2;
+    let short = |oid: &ObjectId| oid.to_hex_with_len(abbrev).to_string();
+
+    for pass in 0..3 {
+        for s in &outcome.statuses {
+            let up_to_date = s.up_to_date && s.result.is_ok();
+            let ok = !up_to_date && s.result.is_ok();
+            match pass {
+                0 if !(up_to_date && verbose) => continue,
+                1 if !ok => continue,
+                2 if up_to_date || ok => continue,
+                _ => {}
+            }
+            let to = s.report_name.as_deref().unwrap_or(&s.name);
+            let from = s.src.as_deref();
+            match &s.result {
+                Err(reason) => emit('!', "[rejected]".into(), from, to, Some(reason)),
+                Ok(()) if up_to_date => emit('=', "[up to date]".into(), from, to, None),
+                Ok(()) if s.new.is_null() => emit('-', "[deleted]".into(), None, to, None),
+                Ok(()) if s.old.is_null() => {
+                    let kind = if to.starts_with("refs/tags/") {
+                        "[new tag]"
+                    } else if to.starts_with("refs/heads/") {
+                        "[new branch]"
+                    } else {
+                        "[new reference]"
+                    };
+                    emit('*', kind.into(), from, to, None);
+                }
+                Ok(()) => {
+                    // `print_ok_ref_status`: `...` and a `+` flag for a forced
+                    // update, `..` and a blank flag otherwise.
+                    let (flag, sep, msg) = if s.forced {
+                        ('+', "...", Some("forced update"))
+                    } else {
+                        (' ', "..", None)
+                    };
+                    emit(flag, format!("{}{sep}{}", short(&s.old), short(&s.new)), from, to, msg);
+                }
+            }
+        }
+    }
+}
+
+/// `transport_summary_width()`. `measure_abbrev` takes the *unique* abbreviation
+/// of each oid but never below `DEFAULT_ABBREV`; with no refs at all the width
+/// falls back to that same constant.
+fn summary_width(repo: &gix::Repository, outcome: &push_proto::Outcome) -> usize {
+    let floor = default_abbrev(repo);
+    let mut maxw = None;
+    for s in &outcome.statuses {
+        for oid in [&s.old, &s.new] {
+            if oid.is_null() {
+                continue;
+            }
+            maxw = Some(maxw.unwrap_or(0).max(unique_abbrev_len(repo, oid, floor)));
+        }
+    }
+    2 * maxw.unwrap_or(floor) + 3
+}
+
+/// git's `DEFAULT_ABBREV`: `core.abbrev` when set, else the fallback. A repo
+/// that spells it `no` gets the full hash, which is git's `40`/`64` case.
+fn default_abbrev(repo: &gix::Repository) -> usize {
+    let full = repo.object_hash().len_in_hex();
+    let config = repo.config_snapshot();
+    match config.string("core.abbrev") {
+        None => DEFAULT_ABBREV,
+        Some(v) if v.as_slice() == b"no" => full,
+        Some(v) => std::str::from_utf8(v.as_slice())
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .map(|n| n.clamp(4, full))
+            .unwrap_or(DEFAULT_ABBREV),
+    }
+}
+
+/// `repo_find_unique_abbrev_r(..., DEFAULT_ABBREV)`: the shortest prefix that
+/// still names exactly one object, never shorter than `floor`.
+fn unique_abbrev_len(repo: &gix::Repository, oid: &ObjectId, floor: usize) -> usize {
+    let full = repo.object_hash().len_in_hex();
+    (floor..=full)
+        .find(|&len| {
+            gix::hash::Prefix::new(oid.as_ref(), len)
+                .ok()
+                .and_then(|p| repo.objects.lookup_prefix(p, None).ok())
+                .is_some_and(|found| matches!(found, Some(Ok(_))))
+        })
+        .unwrap_or(full)
+}
+
+/// `prettify_refname()`: drop the namespace prefix from a full ref name.
+fn prettify(name: &str) -> &str {
+    for prefix in ["refs/heads/", "refs/tags/", "refs/remotes/"] {
+        if let Some(short) = name.strip_prefix(prefix) {
+            return short;
+        }
+    }
+    name
+}
+
+/// `print_helper_status()` (send-pack.c): one machine-readable line per ref on
+/// **stdout**, terminated by a blank line, for a remote helper to parse.
+fn print_helper_status(outcome: &push_proto::Outcome) {
+    for s in &outcome.statuses {
+        let name = s.report_name.as_deref().unwrap_or(&s.name);
+        match &s.result {
+            Ok(()) => println!("ok {name}"),
+            Err(reason) => println!("error {name} {reason}"),
+        }
+    }
+    println!();
 }
 
 /// Walk `args` exactly the way git's parse-options walks them, emitting git's
@@ -229,6 +581,13 @@ fn parse(args: &[String]) -> Parsed {
         let a = args[i].as_str();
 
         if end_of_opts || !a.starts_with('-') || a == "-" {
+            // `if (argc > 0) { dest = argv[0]; refspec_appendn(&rs, argv + 1, argc - 1); }`
+            // — the first non-option is the destination, the rest are refspecs.
+            if st.dest.is_none() {
+                st.dest = Some(a.to_string());
+            } else {
+                st.refspecs.push(a.to_string());
+            }
             st.positionals += 1;
             i += 1;
             continue;
@@ -247,7 +606,7 @@ fn parse(args: &[String]) -> Parsed {
             }
         }
 
-        match short_opts(&a[1..], &mut i) {
+        match short_opts(&a[1..], &mut i, &mut st) {
             Some(code) => return Parsed::Exit(code),
             None => continue,
         }
@@ -295,7 +654,7 @@ fn long_opt(body: &str, args: &[String], i: &mut usize, st: &mut State) -> Optio
     }
 
     if negated {
-        set_long(def.long, false, st);
+        set_long(def.long, false, None, st);
         *i += 1;
         return None;
     }
@@ -324,7 +683,7 @@ fn long_opt(body: &str, args: &[String], i: &mut usize, st: &mut State) -> Optio
         return Some(code);
     }
 
-    set_long(def.long, true, st);
+    set_long(def.long, true, value, st);
     *i += 1;
     None
 }
@@ -433,13 +792,51 @@ fn resolve_rev(spec: &str) -> bool {
     repo.rev_parse_single(spec).is_ok()
 }
 
-/// Record the effect of long option `long`; `on` is false for the `--no-` form.
+/// Record the effect of long option `long`; `on` is false for the `--no-` form,
+/// and `value` is whatever the option consumed (always `None` for a boolean and
+/// for a negation, which parse-options never lets carry one).
 ///
-/// Only the two flags the post-parse checks consult are tracked.
-fn set_long(long: &str, on: bool, st: &mut State) {
+/// `--progress`, `--thin` and `--stateless-rpc` are accepted and dropped: the
+/// first two only change how the pack is produced (this one is never thin and
+/// reports no progress, and both are the sender's choice, not the receiver's),
+/// and the third is the smart-HTTP framing, which has no local destination.
+fn set_long(long: &str, on: bool, value: Option<&str>, st: &mut State) {
     match long {
         "all" => st.send_all = on,
         "mirror" => st.send_mirror = on,
+        "force" => st.force = on,
+        "dry-run" => st.dry_run = on,
+        "verbose" => st.verbose = on,
+        "quiet" => st.verbose = st.verbose && !on,
+        "atomic" => st.atomic = on,
+        "stdin" => st.from_stdin = on,
+        "helper-status" => st.helper_status = on,
+        "force-if-includes" => st.force_if_includes = on,
+        "receive-pack" | "exec" => st.receive_pack = on.then(|| value.unwrap_or("").to_string()),
+        "remote" => st.remote_name = on.then(|| value.unwrap_or("").to_string()),
+        "push-option" => {
+            if on {
+                st.push_options.push(value.unwrap_or("").to_string());
+            } else {
+                // `OPT_STRING_LIST`'s `--no-` form clears the list.
+                st.push_options.clear();
+            }
+        }
+        // `option_parse_push_signed`: a bare `--signed` is "always", `--no-signed`
+        // is "never", and the value grammar was already validated by
+        // [`check_value`].
+        "signed" => {
+            st.signed = match (on, value) {
+                (false, _) => push_proto::Signed::Never,
+                (true, None) => push_proto::Signed::Always,
+                (true, Some(v)) if v.eq_ignore_ascii_case("if-asked") => push_proto::Signed::IfAsked,
+                (true, Some(v)) => match parse_maybe_bool(v) {
+                    Some(true) => push_proto::Signed::Always,
+                    _ => push_proto::Signed::Never,
+                },
+            };
+        }
+        "force-with-lease" => st.lease = on.then(|| value.map(str::to_string)),
         _ => {}
     }
 }
@@ -496,16 +893,18 @@ fn resolve_long(name: &str) -> Resolved {
 
 /// Handle one clustered short-switch entry (`cluster` excludes the leading `-`).
 /// `send-pack` declares `-v`, `-q`, `-n` and `-f`; `-h` is parse-options' own.
-fn short_opts(cluster: &str, i: &mut usize) -> Option<ExitCode> {
+fn short_opts(cluster: &str, i: &mut usize, st: &mut State) -> Option<ExitCode> {
     for c in cluster.chars() {
         match c {
             'h' => {
                 print!("{USAGE}");
                 return Some(ExitCode::from(129));
             }
-            // None of these feed a post-parse check, so they are accepted and
-            // dropped; `-n` is `--dry-run` and `-f` is `--force`.
-            'v' | 'q' | 'n' | 'f' => {}
+            // `OPT__VERBOSITY` counts up for `-v` and down for `-q`.
+            'v' => st.verbose = true,
+            'q' => st.verbose = false,
+            'n' => st.dry_run = true,
+            'f' => st.force = true,
             other => {
                 eprint!("error: unknown switch `{other}'\n{USAGE}");
                 return Some(ExitCode::from(129));

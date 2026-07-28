@@ -26,10 +26,15 @@ fn parse_score(arg: &str) -> Option<u32> {
     arg.parse::<u32>().ok().filter(|&score| score != 0)
 }
 
-/// Byte-for-byte reproduction of `git blame`'s usage text, printed on stderr with
-/// exit status 129 when no path is given (the only usage error we produce).
-const USAGE: &str = concat!(
-    "usage: git blame [<options>] [<rev-opts>] [<rev>] [--] <file>\n",
+/// Byte-for-byte reproduction of `git blame`'s usage text, everything after the
+/// `usage:` line — which [`print_usage`] writes first, naming the command as it
+/// was invoked.
+///
+/// `cmd_annotate` builds its argv with `argv[0] == "annotate"`, and
+/// `parse_options` renders `blame_opt_usage` through that name, so
+/// `git annotate -h` differs from `git blame -h` in exactly that one line
+/// (verified against git 2.55.0 with `diff <(git blame -h) <(git annotate -h)`).
+const USAGE_BODY: &str = concat!(
     "\n",
     "    <rev-opts> are documented in git-rev-list(1)\n",
     "\n",
@@ -388,9 +393,47 @@ fn approxidate(value: &str) -> i64 {
 ///     `ent->suspect->refcnt` — the same refcount graph, read at output time.
 ///   * `-S <revs-file>` — installs commit grafts that rewrite the ancestry the
 ///     walk follows.
-///   * `--reverse`, regex/function `-L` forms, `--date=human` and the `-local`
-///     date variants.
+///   * `--reverse <range>` — inverts the direction of the whole algorithm. git
+///     builds a `revs->children` decoration during `prepare_revision_walk()` and
+///     `first_scapegoat()` returns *children* instead of parents, so a line is
+///     attributed to the last commit that still had it rather than the first that
+///     introduced it. `gix-blame` walks parents only; there is no children map to
+///     hand it.
+///   * `--no-indent-heuristic` — the blame diffs run through
+///     `gix_diff::blob::compact::change_compact`, git's `xdl_change_compact()`
+///     with `XDF_INDENT_HEURISTIC` applied unconditionally, so the heuristic
+///     cannot be switched off. The positive `--indent-heuristic` *is* accepted:
+///     `diff.c:57` seeds `diff_indent_heuristic = 1`, so it asks for the state
+///     the engine is already in.
+///   * `--date=human` and the `-local` date variants.
+///
+/// `--first-parent` and `--minimal` are implemented: the first truncates every
+/// commit's parent list to one entry inside `gix-blame`, which is what git's
+/// `first_scapegoat()` does under `revs->first_parent_only`, and the second
+/// selects the same `XDF_NEED_MINIMAL` diff `--diff-algorithm=minimal` selects.
+///
+/// `-L` accepts every form `line-range.c` does: `<n>`, `<n>,<m>`, `<n>,+<m>`,
+/// `<n>,-<m>`, the empty endpoints of `-L,<m>` and `-L<n>,`, `/<regex>/`,
+/// `^/<regex>/` and `:<funcname>`, resolved against the final image after the
+/// path is known, with multiple `-L`s threading git's anchor from one to the next.
+/// The regexes are `regex::bytes` built with `multi_line` and without
+/// `dot_matches_new_line`, which is `regcomp(…, REG_NEWLINE)`.
 pub fn blame(args: &[String]) -> Result<ExitCode> {
+    blame_with(args, "blame")
+}
+
+/// The single implementation behind `git blame`, `git annotate` and `git pickaxe`.
+///
+/// All three are `cmd_blame()` in git — `pickaxe` is the same command-table entry
+/// under its pre-2006 name, and `cmd_annotate()` (`builtin/annotate.c`) is six
+/// lines that splice `-c` in front of the user's argv and call `cmd_blame()`.
+/// Keeping one body here is what keeps the three from drifting: every option,
+/// every error-precedence rule and every output format is shared by construction
+/// rather than by three parallel ports agreeing.
+///
+/// `cmd` is `argv[0]` as `parse_options` sees it, which only affects the `usage:`
+/// line.
+pub(super) fn blame_with(args: &[String], cmd: &str) -> Result<ExitCode> {
     let mut repo = gix::discover(".")?;
     // Object-heavy path: give gix the caches it does not enable by default —
     // a decoded-object cache and a git-sized delta-base cache (gix ships a
@@ -453,7 +496,7 @@ pub fn blame(args: &[String]) -> Result<ExitCode> {
         repo.config_snapshot().boolean("blame.markUnblamableLines") == Some(true);
     let mark_ignored_lines = repo.config_snapshot().boolean("blame.markIgnoredLines") == Some(true);
 
-    let mut opts = Options::parse(
+    let mut opts = match Options::parse(
         args,
         ConfigDefaults {
             show_email: show_email_default,
@@ -463,7 +506,12 @@ pub fn blame(args: &[String]) -> Result<ExitCode> {
             mark_unblamable_lines,
             mark_ignored_lines,
         },
-    )?;
+    )? {
+        // `parse_options()` answers `-h` the moment it reaches it, before it looks
+        // at anything that follows, so this returns from inside the parse loop.
+        ParseOutcome::Help => return print_usage(cmd, true),
+        ParseOutcome::Opts(opts) => *opts,
+    };
 
     // git's `--progress` handling, run straight after `parse_options` and before
     // any path or revision is resolved: the machine formats refuse it outright,
@@ -505,7 +553,7 @@ pub fn blame(args: &[String]) -> Result<ExitCode> {
     // with git's usage text (129) or a `bad revision` / `More than one commit`
     // fatal (128); those cases print to stderr and return the code here.
     match resolve_targets(&repo, &mut opts)? {
-        Targets::Usage => return print_usage(),
+        Targets::Usage => return print_usage(cmd, false),
         Targets::Fatal(code) => return Ok(code),
         Targets::Resolved => {}
     }
@@ -540,10 +588,14 @@ pub fn blame(args: &[String]) -> Result<ExitCode> {
     //     index, and only then dies with the quoted, always-`HEAD` form;
     //   * without one, `setup_scoreboard` fails to fill the blob and names the
     //     revision as the user typed it.
+    //
+    // Both checks demand a *blob*: `verify_working_tree_path` requires
+    // `oid_object_info(...) == OBJ_BLOB` and `fill_blob_sha1_and_mode` requires
+    // `odb_read_object_info(...) == OBJ_BLOB`, so naming a directory is "no such
+    // path" rather than an attempt to blame a tree (verified: stock
+    // `git blame src` prints `fatal: no such path 'src' in HEAD`, exit 128).
     let overlay = opts.contents.is_some() || opts.rev.is_none();
-    let path_in_suspect = repo
-        .rev_parse_single(format!("{suspect}:{rel_path}").as_str())
-        .is_ok();
+    let path_in_suspect = blob_at(&repo, &suspect, &rel_path).is_some();
     let mut index_only = false;
     if !path_in_suspect {
         let mut err = std::io::stderr().lock();
@@ -585,6 +637,44 @@ pub fn blame(args: &[String]) -> Result<ExitCode> {
         None
     };
 
+    // git's merge parents: `fake_working_tree_commit` gives the synthetic commit
+    // holding the final image `HEAD` *and* every id in `MERGE_HEAD` as parents
+    // (`blame.c:212-213`), so mid-merge a working-tree line that came from the
+    // other side of the merge is blamed on that side rather than on nobody.
+    // `--first-parent` drops them again in `first_scapegoat()`.
+    //
+    // The list is only consulted on the fake-commit path — `setup_scoreboard`
+    // builds that commit only under `--contents` or with no positive rev
+    // (`blame.c:2795`), which is exactly `overlay`.
+    let merge_parents: Vec<ObjectId> = if overlay && !opts.first_parent {
+        read_merge_heads(&repo)
+    } else {
+        Vec::new()
+    };
+
+    // git resolves `-L` against `sb->final_buf` — the final image — right after
+    // `setup_scoreboard()` (`builtin/blame.c:1197-1223`), so the line numbers a
+    // regex or `:funcname` spec resolves to are the ones the output will print,
+    // and an out-of-range start is fatal (128) rather than an empty answer.
+    let final_image: Vec<u8> = match &worktree_content {
+        Some(content) => content.clone(),
+        None => blob_at(&repo, &suspect, &rel_path)
+            .and_then(|id| repo.find_object(id).ok())
+            .map(|o| o.detach().data)
+            .unwrap_or_default(),
+    };
+    match resolve_line_specs(&opts.line_specs, &final_image, &rel_path) {
+        Ok(ranges) => opts.ranges = ranges,
+        Err(LineSpecError::Usage) => return print_usage(cmd, false),
+        Err(LineSpecError::Fatal(msg)) => {
+            let mut err = std::io::stderr().lock();
+            writeln!(err, "fatal: {msg}")?;
+            err.flush()?;
+            return Ok(ExitCode::from(128));
+        }
+        Err(LineSpecError::Unimplementable(what)) => bail!("blame: {what} is not yet ported"),
+    }
+
     // Blame the full file; `-L` is applied to the result so that the working-tree
     // overlay can be built in working-tree line coordinates, as git does.
     let ranges = if opts.ranges.is_empty() || worktree_content.is_some() {
@@ -602,6 +692,7 @@ pub fn blame(args: &[String]) -> Result<ExitCode> {
         detect_moved: opts.detect_moved,
         ignore_revs: ignore_revs.clone(),
         detect_copied: opts.detect_copied,
+        first_parent: opts.first_parent,
     };
 
     // A blame of (commit, path) is a pure function of immutable objects, so the
@@ -623,8 +714,12 @@ pub fn blame(args: &[String]) -> Result<ExitCode> {
     // `--incremental` is not cached either: it needs the walk-order, uncoalesced entries,
     // which the run encoding does not preserve.
     let algo_key = format!(
-        "{:?}|w={}|M={:?}|C={:?}",
-        opts.diff_algorithm, opts.ignore_whitespace, opts.detect_moved, opts.detect_copied
+        "{:?}|w={}|M={:?}|C={:?}|1p={}",
+        opts.diff_algorithm,
+        opts.ignore_whitespace,
+        opts.detect_moved,
+        opts.detect_copied,
+        opts.first_parent
     );
     let cache_key = (opts.ranges.is_empty()
         && ignore_revs.is_empty()
@@ -656,7 +751,7 @@ pub fn blame(args: &[String]) -> Result<ExitCode> {
         Some((lines, bytes)) => (lines, bytes),
         None => {
             let outcome = repo
-                .blame_file(rel_path.as_bytes().as_bstr(), suspect, blame_options)
+                .blame_file(rel_path.as_bytes().as_bstr(), suspect, blame_options.clone())
                 .map_err(|e| anyhow!("{e}"))?;
             let lines = materialize_lines(&outcome);
             if let (Some((c, p, a)), Some(blob)) = (&cache_key, blamed_blob) {
@@ -676,7 +771,34 @@ pub fn blame(args: &[String]) -> Result<ExitCode> {
     };
 
     if let Some(content) = &worktree_content {
-        lines = overlay_worktree(&repo, lines, &blamed_bytes, content, opts.diff_algorithm)?;
+        // The scapegoats of the synthetic commit, in git's order: the suspect
+        // first, then each `MERGE_HEAD`. `pass_blame()` diffs against them in
+        // turn and only ever hands a parent the lines no earlier parent took, so
+        // a line present in both sides of the merge is credited to `HEAD`'s side,
+        // exactly as here.
+        let mut sources: Vec<(Vec<Line>, Vec<u8>)> = vec![(lines, blamed_bytes.clone())];
+        for parent in &merge_parents {
+            let Some(blob) = blob_at(&repo, parent, &rel_path) else {
+                // `verify_working_tree_path` tolerates a parent without the path;
+                // it simply has nothing to hand back.
+                continue;
+            };
+            let Ok(object) = repo.find_object(blob) else {
+                continue;
+            };
+            let bytes = object.detach().data;
+            let outcome = repo
+                .blame_file(rel_path.as_bytes().as_bstr(), *parent, blame_options.clone())
+                .map_err(|e| anyhow!("{e}"))?;
+            sources.push((materialize_lines(&outcome), bytes));
+        }
+        lines = overlay_worktree(
+            &repo,
+            &sources,
+            content,
+            opts.diff_algorithm,
+            opts.ignore_whitespace,
+        )?;
         if !opts.ranges.is_empty() {
             let keep = |n: u32| opts.ranges.iter().any(|r| r.contains(&n));
             lines.retain(|l| keep(l.final_no));
@@ -702,6 +824,7 @@ pub fn blame(args: &[String]) -> Result<ExitCode> {
                 &blamed_bytes,
                 content,
                 opts.diff_algorithm,
+                opts.ignore_whitespace,
             )?),
             None => None,
         };
@@ -889,44 +1012,38 @@ fn materialize_lines(outcome: &gix::blame::Outcome) -> Vec<Line> {
     lines
 }
 
-/// Rebase a `HEAD` blame onto the working-tree content.
+/// Rebase the blames of the synthetic working-tree commit's parents onto the
+/// working-tree content.
 ///
 /// git blames the working tree by putting a synthetic commit holding the
-/// working-tree blob on top of `HEAD` and running its usual algorithm; the first
-/// diff that commit takes part in is exactly `HEAD:<path>` against the working
-/// tree. Lines that survive that diff unchanged carry `HEAD`'s blame result,
-/// lines that don't stay with the synthetic commit (the null object id).
+/// working-tree blob on top of its parents and running its usual algorithm.
+/// `pass_blame()` walks those parents in order, diffing the final image against
+/// each and handing over only the lines no earlier parent already claimed; what
+/// survives every parent stays with the synthetic commit (the null object id).
+///
+/// `sources` is that parent list in the same order — `(blame of the parent, the
+/// parent's blob)` — which is `[HEAD]` for an ordinary working-tree blame and
+/// `[HEAD, MERGE_HEAD…]` mid-merge.
 fn overlay_worktree(
     repo: &gix::Repository,
-    head_lines: Vec<Line>,
-    head_blob: &[u8],
+    sources: &[(Vec<Line>, Vec<u8>)],
     worktree: &[u8],
     diff_algorithm: Option<gix::diff::blob::Algorithm>,
+    ignore_whitespace: bool,
 ) -> Result<Vec<Line>> {
-    let mapped = worktree_line_map(repo, head_blob, worktree, diff_algorithm)?;
-    let after_len = mapped.len() as u32;
-
-    let null_id = ObjectId::null(repo.object_hash());
     let tokens: Vec<&[u8]> = gix::diff::blob::sources::byte_lines(worktree).collect();
+    let null_id = ObjectId::null(repo.object_hash());
 
-    let mut out = Vec::with_capacity(after_len as usize);
-    for (i, token) in tokens.into_iter().enumerate() {
-        let mut content = token.to_vec();
-        if content.last() == Some(&b'\n') {
-            content.pop();
-        }
-        let final_no = i as u32 + 1;
-        match mapped[i].and_then(|h| head_lines.get(h as usize)) {
-            Some(src) => out.push(Line {
-                commit_id: src.commit_id,
-                final_no,
-                orig_no: src.orig_no,
-                source_name: src.source_name.clone(),
-                content,
-                ignored: src.ignored,
-                unblamable: src.unblamable,
-            }),
-            None => out.push(Line {
+    let mut out: Vec<Line> = tokens
+        .into_iter()
+        .enumerate()
+        .map(|(i, token)| {
+            let mut content = token.to_vec();
+            if content.last() == Some(&b'\n') {
+                content.pop();
+            }
+            let final_no = i as u32 + 1;
+            Line {
                 commit_id: null_id,
                 final_no,
                 orig_no: final_no,
@@ -934,10 +1051,62 @@ fn overlay_worktree(
                 content,
                 ignored: false,
                 unblamable: false,
-            }),
+            }
+        })
+        .collect();
+
+    for (parent_lines, parent_blob) in sources {
+        let mapped =
+            worktree_line_map(repo, parent_blob, worktree, diff_algorithm, ignore_whitespace)?;
+        for (i, line) in out.iter_mut().enumerate() {
+            // Already claimed by an earlier parent, exactly as `blame_chunk()`
+            // skips the entries a previous scapegoat took.
+            if line.commit_id != null_id {
+                continue;
+            }
+            let Some(src) = mapped.get(i).copied().flatten().and_then(|n| parent_lines.get(n as usize))
+            else {
+                continue;
+            };
+            line.commit_id = src.commit_id;
+            line.orig_no = src.orig_no;
+            line.source_name = src.source_name.clone();
+            line.ignored = src.ignored;
+            line.unblamable = src.unblamable;
         }
     }
     Ok(out)
+}
+
+/// The blob `path` names in `commit`, or `None` when the entry is missing or is
+/// not a blob.
+///
+/// git demands a blob in both places it resolves the blamed path —
+/// `verify_working_tree_path()` (`blame.c`) and `fill_blob_sha1_and_mode()` —
+/// so a directory operand is "no such path" rather than an attempt to blame a
+/// tree.
+fn blob_at(repo: &gix::Repository, commit: &ObjectId, path: &str) -> Option<ObjectId> {
+    let id = repo
+        .rev_parse_single(format!("{commit}:{path}").as_str())
+        .ok()?;
+    let header = repo.find_header(id).ok()?;
+    header.kind().is_blob().then(|| id.detach())
+}
+
+/// The ids in `MERGE_HEAD`, empty when no merge is in progress.
+///
+/// `append_merge_parents()` (`blame.c:145-168`) reads the file line by line and
+/// appends each as a parent of the synthetic working-tree commit. It dies on a
+/// line that is not a hex object name; a malformed file is treated as absent
+/// here, because refusing to blame is a worse answer than blaming without the
+/// other side.
+fn read_merge_heads(repo: &gix::Repository) -> Vec<ObjectId> {
+    let Ok(body) = std::fs::read_to_string(repo.common_dir().join("MERGE_HEAD")) else {
+        return Vec::new();
+    };
+    body.lines()
+        .filter_map(|line| ObjectId::from_hex(line.trim().as_bytes()).ok())
+        .collect()
 }
 
 /// The diff the synthetic working-tree commit takes part in, as a per-line map: for
@@ -948,8 +1117,22 @@ fn worktree_line_map(
     head_blob: &[u8],
     worktree: &[u8],
     diff_algorithm: Option<gix::diff::blob::Algorithm>,
+    ignore_whitespace: bool,
 ) -> Result<Vec<Option<u32>>> {
-    let input = gix::diff::blob::InternedInput::new(head_blob, worktree);
+    // `-w` (`XDF_IGNORE_WHITESPACE`) is part of `revs.diffopt.xdl_opts`, which git threads through
+    // *every* diff in the blame — the synthetic working-tree commit's first diff included. Without
+    // it, a worktree that differs from `HEAD` only in indentation has all of those lines blamed on
+    // "Not Committed Yet" under `-w`, where git keeps `HEAD`'s attribution. Normalizing per line
+    // preserves the line count, so the hunk indices still map one-to-one onto the original lines.
+    let (head_norm, worktree_norm);
+    let (head_cmp, worktree_cmp): (&[u8], &[u8]) = if ignore_whitespace {
+        head_norm = gix::blame::strip_whitespace_per_line(head_blob);
+        worktree_norm = gix::blame::strip_whitespace_per_line(worktree);
+        (&head_norm, &worktree_norm)
+    } else {
+        (head_blob, worktree)
+    };
+    let input = gix::diff::blob::InternedInput::new(head_cmp, worktree_cmp);
     // `--diff-algorithm` applies to the fake-commit diff too, matching git which
     // threads its `xdl_opts` through every diff in the blame.
     let algorithm = match diff_algorithm {
@@ -1005,6 +1188,12 @@ fn collect_commit_info(
     null_id: &ObjectId,
     rel_path: &str,
 ) -> Result<HashMap<ObjectId, CommitInfo>> {
+    // `cmd_blame` calls `read_mailmap()` unconditionally (`builtin/blame.c:1255`) and
+    // `get_ac_line()` runs `map_user()` over both the author and the committer
+    // (`builtin/blame.c:177-184`), so every identity blame prints — human column,
+    // porcelain `author`/`author-mail`, `committer`/`committer-mail` — is the mapped one.
+    // There is no `--no-use-mailmap` to turn it off; blame has no such option.
+    let mailmap = repo.open_mailmap();
     let mut info: HashMap<ObjectId, CommitInfo> = HashMap::new();
     for line in lines {
         if info.contains_key(&line.commit_id) {
@@ -1016,6 +1205,16 @@ fn collect_commit_info(
             let commit = repo.find_commit(line.commit_id)?;
             let author = commit.author()?;
             let committer = commit.committer()?;
+            // `map_user()` rewrites only the name and the e-mail; the timestamp it
+            // is handed is left alone, so the date columns keep the commit's own.
+            let author_id = mailmap.resolve_cow(author);
+            let committer_id = mailmap.resolve_cow(committer);
+            let (author_name, author_mail) =
+                (author_id.name.as_ref().to_vec(), author_id.email.as_ref().to_vec());
+            let (committer_name, committer_mail) = (
+                committer_id.name.as_ref().to_vec(),
+                committer_id.email.as_ref().to_vec(),
+            );
             let author_time = author.time().ok();
             let committer_time = committer.time().ok();
             // Reduced to owned values before the struct literal: the iterator
@@ -1027,18 +1226,22 @@ fn collect_commit_info(
             let boundary = !opts.show_root && commit.parent_ids().next().is_none();
             let summary = Vec::from(commit.message()?.summary().into_owned());
             CommitInfo {
-                display_author: display_author(author.name, author.email, opts.show_email),
+                display_author: display_author(
+                    author_name.as_slice().into(),
+                    author_mail.as_slice().into(),
+                    opts.show_email,
+                ),
                 display_date: author_time
                     .map(|t| opts.date_mode.format_time(t.seconds, t.offset))
                     .unwrap_or_else(|| author.time.to_string()),
                 boundary,
                 hex: line.commit_id.to_hex().to_string(),
-                author_name: author.name.to_vec(),
-                author_mail: author.email.to_vec(),
+                author_name,
+                author_mail,
                 author_time: author_time.map(|t| t.seconds).unwrap_or(0),
                 author_tz: format_tz(author_time.map(|t| t.offset).unwrap_or(0)),
-                committer_name: committer.name.to_vec(),
-                committer_mail: committer.email.to_vec(),
+                committer_name,
+                committer_mail,
                 committer_time: committer_time.map(|t| t.seconds).unwrap_or(0),
                 committer_tz: format_tz(committer_time.map(|t| t.offset).unwrap_or(0)),
                 summary,
@@ -1746,11 +1949,26 @@ fn format_tz(offset_seconds: i32) -> String {
     format!("{sign}{:02}{:02}", abs / 3600, (abs % 3600) / 60)
 }
 
-/// Print git blame's usage text on stderr and yield its exit status (129).
-fn print_usage() -> Result<ExitCode> {
-    let mut err = std::io::stderr().lock();
-    err.write_all(USAGE.as_bytes())?;
-    err.flush()?;
+/// Print the usage text for `cmd` and yield `parse_options`' exit status (129).
+///
+/// git splits the two usage paths by stream, which the parity contract sees
+/// because stdout is compared: `usage_with_options()` from the `-h` handler
+/// writes to **stdout** (`parse-options.c` passes `stdout` when the request was
+/// explicit), while `usage(str_usage)` for a structurally invalid command line
+/// writes to **stderr**. Both exit 129. Verified against git 2.55.0:
+/// `git blame -h` wrote 2097 bytes to stdout and 0 to stderr; `git blame` with
+/// no operand wrote 0 to stdout and the same 2097 bytes to stderr.
+fn print_usage(cmd: &str, to_stdout: bool) -> Result<ExitCode> {
+    let text = format!("usage: git {cmd} [<options>] [<rev-opts>] [<rev>] [--] <file>\n{USAGE_BODY}");
+    if to_stdout {
+        let mut out = std::io::stdout().lock();
+        out.write_all(text.as_bytes())?;
+        out.flush()?;
+    } else {
+        let mut err = std::io::stderr().lock();
+        err.write_all(text.as_bytes())?;
+        err.flush()?;
+    }
     Ok(ExitCode::from(129))
 }
 
@@ -2196,7 +2414,15 @@ struct Options {
     pre: Vec<String>,
     /// Positionals after `--`; `None` when no `--` was given.
     post: Option<Vec<String>>,
+    /// The raw `-L` arguments in command-line order. git keeps them as an
+    /// `OPT_STRING_LIST` and only interprets them once the final image is in
+    /// hand, because every form but the plain numeric one needs the file's text.
+    line_specs: Vec<String>,
+    /// `line_specs` resolved against the final image; empty until then.
     ranges: Vec<RangeInclusive<u32>>,
+    /// `--first-parent`: follow only the first parent of every commit, which is
+    /// git's `revs->first_parent_only` applied in `first_scapegoat()`.
+    first_parent: bool,
     long: bool,
     suppress: bool,
     show_email: bool,
@@ -2271,8 +2497,15 @@ struct ConfigDefaults {
     mark_ignored_lines: bool,
 }
 
+/// What one `parse_options()` pass produced: either the parsed command line, or
+/// the `-h` short-circuit git answers from inside the loop.
+enum ParseOutcome {
+    Help,
+    Opts(Box<Options>),
+}
+
 impl Options {
-    fn parse(args: &[String], defaults: ConfigDefaults) -> Result<Options> {
+    fn parse(args: &[String], defaults: ConfigDefaults) -> Result<ParseOutcome> {
         let ConfigDefaults {
             show_email: show_email_default,
             show_root: show_root_default,
@@ -2281,7 +2514,8 @@ impl Options {
             mark_unblamable_lines,
             mark_ignored_lines,
         } = defaults;
-        let mut ranges: Vec<RangeInclusive<u32>> = Vec::new();
+        let mut line_specs: Vec<String> = Vec::new();
+        let mut first_parent = false;
         let mut long = false;
         let mut suppress = false;
         let mut show_email = show_email_default;
@@ -2382,12 +2616,35 @@ impl Options {
                     porcelain = false;
                     line_porcelain = false;
                 }
+                // `parse_options()` answers `-h` where it finds it, without
+                // looking at the rest of the command line.
+                "-h" => return Ok(ParseOutcome::Help),
+                // `--first-parent` is a rev-list option blame forwards to
+                // `setup_revisions()`, which sets `revs->first_parent_only`.
+                "--first-parent" => first_parent = true,
+                "--no-first-parent" => first_parent = false,
+                // `--minimal` is `XDF_NEED_MINIMAL` in `revs.diffopt.xdl_opts`,
+                // which is what `Algorithm::MyersMinimal` is: Myers followed by
+                // the exhaustive pass that removes the remaining non-minimal
+                // placements. It is the same knob `--diff-algorithm=minimal`
+                // sets, so the last of the two on the command line wins.
+                "--minimal" => diff_algorithm = Some(gix::diff::blob::Algorithm::MyersMinimal),
+                // `--indent-heuristic` sets `XDF_INDENT_HEURISTIC`, which
+                // `diff.indentHeuristic` already sets by default
+                // (`diff.c:57 static int diff_indent_heuristic = 1;`), so the
+                // flag asks for the state the engine is already in: the blame
+                // diffs run through `gix_diff::blob::compact::change_compact`,
+                // git's `xdl_change_compact()` with the heuristic applied
+                // unconditionally. `--no-indent-heuristic` would turn it *off*
+                // and has no path through that code, so it stays refused below
+                // rather than being accepted as a no-op.
+                "--indent-heuristic" => {}
                 "-L" => {
                     i += 1;
                     let spec = args
                         .get(i)
                         .ok_or_else(|| anyhow!("option `-L` requires a value"))?;
-                    parse_line_range(spec, &mut ranges)?;
+                    line_specs.push(spec.clone());
                 }
                 "--abbrev" => {
                     i += 1;
@@ -2485,7 +2742,7 @@ impl Options {
                 }
                 "--no-incremental" => incremental = false,
                 "--no-show-stats" | "--no-score-debug" => {}
-                _ if a.starts_with("-L") => parse_line_range(&a[2..], &mut ranges)?,
+                _ if a.starts_with("-L") => line_specs.push(a[2..].to_string()),
                 _ if a.starts_with("--abbrev=") => {
                     let v = &a["--abbrev=".len()..];
                     abbrev = Some(v.parse().map_err(|_| anyhow!("invalid --abbrev value: {v}"))?);
@@ -2512,13 +2769,15 @@ impl Options {
 
         // The revision/path split and its validation happen against the repo in
         // `resolve_targets`, since git's DWIM (`is_a_rev`) needs the object db.
-        Ok(Options {
+        Ok(ParseOutcome::Opts(Box::new(Options {
             rev: None,
             file: String::new(),
             suspect_id: None,
             pre,
             post,
-            ranges,
+            line_specs,
+            ranges: Vec::new(),
+            first_parent,
             long,
             suppress,
             show_email,
@@ -2547,7 +2806,7 @@ impl Options {
             date_arg,
             // Overwritten in `blame` once blame.date / `--date` are resolved.
             date_mode: DateMode::Iso8601,
-        })
+        })))
     }
 }
 
@@ -2571,45 +2830,357 @@ fn parse_diff_algorithm(name: &str) -> Result<gix::diff::blob::Algorithm> {
     }
 }
 
-/// Parse one `-L` spec into a 1-based inclusive range. Only numeric forms are
-/// supported; regex (`/re/`) and function (`:name`) forms are rejected.
-fn parse_line_range(spec: &str, ranges: &mut Vec<RangeInclusive<u32>>) -> Result<()> {
-    if spec.starts_with('/') || spec.starts_with(':') {
-        bail!("unsupported -L form: only numeric ranges are supported");
+/// Why a `-L` spec could not be turned into a range.
+#[derive(Debug)]
+enum LineSpecError {
+    /// `parse_range_arg()` returned non-zero, which `cmd_blame` answers with
+    /// `usage(str_usage)` — the stderr usage block and exit 129.
+    Usage,
+    /// git dies with this message and exit 128.
+    Fatal(String),
+    /// The form is real but unported; refuse rather than answer wrongly.
+    Unimplementable(&'static str),
+}
+
+/// `builtin/blame.c:1202-1223` — resolve every `-L` argument against the final
+/// image, in order, and turn each into a 1-based inclusive range.
+///
+/// The anchor threading is git's: `anchor` starts at 1 and becomes `top + 1`
+/// after each spec, so a second `-L` with a relative or regex start searches
+/// from where the previous one ended. The clamping after `parse_range_arg` is
+/// also git's: a `bottom` past the end of the file is fatal, while a `top` past
+/// the end is silently pulled back to the last line (verified against git
+/// 2.55.0 on a 2-line file: `-L 9,9` → `fatal: file src/lib.rs has only 2
+/// lines` exit 128, `-L 1,9` → both lines, exit 0).
+fn resolve_line_specs(
+    specs: &[String],
+    image: &[u8],
+    path: &str,
+) -> Result<Vec<RangeInclusive<u32>>, LineSpecError> {
+    let lines = split_lines(image);
+    let num_lines = lines.len() as u32;
+    let mut out: Vec<RangeInclusive<u32>> = Vec::with_capacity(specs.len());
+    let mut anchor: u32 = 1;
+    for spec in specs {
+        let (bottom, top) = parse_range_arg(spec, image, &lines, num_lines, anchor)?;
+        // `if ((!lno && (top || bottom)) || lno < bottom)` — an empty file with a
+        // non-empty request, or a start past the last line.
+        if (num_lines == 0 && (top != 0 || bottom != 0)) || num_lines < bottom {
+            return Err(LineSpecError::Fatal(plural_line_count(path, num_lines)));
+        }
+        let bottom = bottom.max(1);
+        let top = if top < 1 || num_lines < top { num_lines } else { top };
+        out.push(bottom..=top);
+        anchor = top + 1;
     }
-    let (start_part, end_part) = match spec.split_once(',') {
+    Ok(out)
+}
+
+/// `line-range.c:parse_range_arg()`. Returns git's `(begin, end)`, both 1-based
+/// and both possibly 0 for "unset", which the caller clamps.
+fn parse_range_arg(
+    spec: &str,
+    image: &[u8],
+    lines: &[&[u8]],
+    num_lines: u32,
+    anchor: u32,
+) -> Result<(u32, u32), LineSpecError> {
+    // `if (anchor < 1) anchor = 1; if (anchor > lines) anchor = lines + 1;`
+    let anchor = anchor.clamp(1, num_lines + 1);
+
+    if spec.starts_with(':') || spec.starts_with("^:") {
+        return parse_range_funcname(spec, image, lines, num_lines, anchor);
+    }
+
+    // `parse_loc(arg, …, -anchor, begin)` then, after a comma,
+    // `parse_loc(arg + 1, …, *begin + 1, end)`.
+    let (start_spec, end_spec) = match spec.split_once(',') {
         Some((s, e)) => (s, Some(e)),
         None => (spec, None),
     };
-
-    let start: u32 = if start_part.is_empty() {
-        1
-    } else {
-        start_part
-            .parse()
-            .map_err(|_| anyhow!("invalid -L range: {spec}"))?
+    let begin = parse_loc(start_spec, image, lines, num_lines, -(anchor as i64))?;
+    let end = match end_spec {
+        None => 0,
+        Some(e) => parse_loc(e, image, lines, num_lines, begin as i64 + 1)?,
     };
-    if start == 0 {
-        bail!("invalid -L range: line numbers are 1-based");
+
+    // `if (*begin && *end && *end < *begin) SWAP(*end, *begin);`
+    if begin != 0 && end != 0 && end < begin {
+        Ok((end, begin))
+    } else {
+        Ok((begin, end))
+    }
+}
+
+/// `line-range.c:parse_loc()` — one endpoint of a `-L` spec.
+///
+/// `begin` carries git's two-role encoding: negative means "this is the start
+/// endpoint, and the relative anchor is `-begin`"; positive means "this is the
+/// end endpoint, anchored one past the resolved start".
+fn parse_loc(
+    spec: &str,
+    image: &[u8],
+    lines: &[&[u8]],
+    num_lines: u32,
+    begin: i64,
+) -> Result<u32, LineSpecError> {
+    // An endpoint git's `strtol` cannot start on and that is not a regex leaves
+    // `*ret` at 0 — `-L,5` and `-L2,` both take this path — and the caller
+    // clamps 0 to the file's bounds.
+    if spec.is_empty() {
+        return Ok(0);
     }
 
-    let end: u32 = match end_part {
-        None => u32::MAX,
-        Some("") => u32::MAX,
-        Some(e) if e.starts_with('+') => {
-            let count: u32 = e[1..]
-                .parse()
-                .map_err(|_| anyhow!("invalid -L range: {spec}"))?;
-            start.saturating_add(count.saturating_sub(1))
+    // `if (1 <= begin && (spec[0] == '+' || spec[0] == '-'))` — the `,+N` / `,-N`
+    // forms, valid only as the end endpoint.
+    if begin >= 1 {
+        if let Some(rest) = spec.strip_prefix(['+', '-']) {
+            if let Some(magnitude) = whole_number(rest) {
+                if magnitude == 0 {
+                    return Err(LineSpecError::Fatal("-L invalid empty range".into()));
+                }
+                let num = if spec.starts_with('-') {
+                    -(magnitude as i64)
+                } else {
+                    magnitude as i64
+                };
+                // `*ret = begin + num - 2` for a `+N`; `begin + num > 0 ? … : 1`
+                // for a `-N`.
+                let value = if num > 0 {
+                    begin + num - 2
+                } else {
+                    (begin + num).max(1)
+                };
+                return Ok(value.max(0) as u32);
+            }
         }
-        Some(e) if e.starts_with('-') => {
-            bail!("unsupported -L form: relative end offsets are not supported")
+    }
+
+    // `num = strtol(spec, &term, 10); if (term != spec)` — a plain line number,
+    // sign included, which is how `-L-1` reaches the `num <= 0` die.
+    if let Some(signed) = spec.strip_prefix('-') {
+        if let Some(num) = whole_number(signed) {
+            return Err(LineSpecError::Fatal(format!(
+                "-L invalid line number: -{num}"
+            )));
         }
-        Some(e) => e.parse().map_err(|_| anyhow!("invalid -L range: {spec}"))?,
+    } else if let Some(num) = whole_number(spec.strip_prefix('+').unwrap_or(spec)) {
+        if num == 0 {
+            return Err(LineSpecError::Fatal("-L invalid line number: 0".into()));
+        }
+        return Ok(num);
+    }
+
+    // `if (begin < 0) { if (spec[0] != '^') begin = -begin; else { begin = 1; spec++; } }`
+    let (mut search_from, spec) = if begin < 0 {
+        match spec.strip_prefix('^') {
+            Some(rest) => (1i64, rest),
+            None => (-begin, spec),
+        }
+    } else {
+        (begin, spec)
     };
 
-    ranges.push(start..=end.max(start));
-    Ok(())
+    // `if (spec[0] != '/') return spec;` — anything else is a parse failure, which
+    // `parse_range_arg` reports by leaving unconsumed input behind.
+    let Some(body) = spec.strip_prefix('/') else {
+        return Err(LineSpecError::Usage);
+    };
+    let Some(pattern) = regex_body(body) else {
+        return Err(LineSpecError::Usage);
+    };
+
+    // `begin--; line = nth_line(data, begin);` — the search starts at the byte
+    // offset of the anchor line and runs to the end of the buffer, so the answer
+    // is the line the *match start* falls in.
+    search_from -= 1;
+    let start_line = search_from.clamp(0, num_lines as i64) as usize;
+    let offset = line_offset(lines, image, start_line);
+    let re = compile_line_regex(pattern).map_err(|_| {
+        LineSpecError::Fatal(format!(
+            "-L parameter '{pattern}' starting at line {}: invalid regex",
+            start_line + 1
+        ))
+    })?;
+    let Some(m) = re.find(&image[offset..]) else {
+        return Err(LineSpecError::Fatal(format!(
+            "-L parameter '{pattern}' starting at line {}: regexec() failed to match",
+            start_line + 1
+        )));
+    };
+    let match_at = offset + m.start();
+    let mut lno = start_line;
+    while lno + 1 <= lines.len() && line_offset(lines, image, lno + 1) <= match_at {
+        lno += 1;
+    }
+    Ok(lno as u32 + 1)
+}
+
+/// `line-range.c:parse_range_funcname()` — `-L:<regex>[:<file>]` and its `^`
+/// variant. The trailing `:<file>` form is not reachable from blame, which takes
+/// exactly one path operand.
+fn parse_range_funcname(
+    spec: &str,
+    image: &[u8],
+    lines: &[&[u8]],
+    num_lines: u32,
+    anchor: u32,
+) -> Result<(u32, u32), LineSpecError> {
+    // `if (*arg == '^') { anchor = 1; arg++; }`
+    let (anchor, spec) = match spec.strip_prefix('^') {
+        Some(rest) => (1u32, rest),
+        None => (anchor, spec),
+    };
+    let body = &spec[1..];
+    // `while (*term && *term != ':') { if (*term == '\\' && *(term+1)) term++; term++; }`
+    let mut end = body.len();
+    let bytes = body.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b':' {
+            end = i;
+            break;
+        }
+        if bytes[i] == b'\\' && i + 1 < bytes.len() {
+            i += 1;
+        }
+        i += 1;
+    }
+    let pattern = &body[..end];
+    // `if (term == arg+1) return NULL;` — an empty pattern is a parse failure.
+    if pattern.is_empty() || end != body.len() {
+        return Err(LineSpecError::Usage);
+    }
+
+    let start_line = anchor.saturating_sub(1).min(num_lines) as usize;
+    let re = compile_line_regex(pattern).map_err(|_| {
+        LineSpecError::Fatal(format!("-L parameter '{pattern}': invalid regex"))
+    })?;
+
+    // `find_funcname_matching_regexp()`: take each match in turn, widen it to the
+    // line it starts on, and accept the first such line that is also a funcname
+    // line.
+    let mut search = line_offset(lines, image, start_line);
+    let begin = loop {
+        let Some(m) = re.find(&image[search..]) else {
+            return Err(LineSpecError::Fatal(format!(
+                "-L parameter '{pattern}' starting at line {}: no match",
+                start_line + 1
+            )));
+        };
+        let match_at = search + m.start();
+        let mut lno = start_line;
+        while lno + 1 <= lines.len() && line_offset(lines, image, lno + 1) <= match_at {
+            lno += 1;
+        }
+        if lno < lines.len() && is_funcname_line(lines[lno]) {
+            break lno as u32;
+        }
+        // `start = eol` — resume after the line the match ended on.
+        let match_end = search + m.end();
+        let mut after = match_end;
+        while after < image.len() && image[after] != b'\n' {
+            after += 1;
+        }
+        if after >= image.len() {
+            return Err(LineSpecError::Fatal(format!(
+                "-L parameter '{pattern}' starting at line {}: no match",
+                start_line + 1
+            )));
+        }
+        search = after + 1;
+    };
+
+    // `if (*begin >= lines) die("-L parameter '%s' matches at EOF", pattern);`
+    if begin >= num_lines {
+        return Err(LineSpecError::Fatal(format!(
+            "-L parameter '{pattern}' matches at EOF"
+        )));
+    }
+    // `*end = *begin+1; while (*end < lines && !match_funcname(…)) (*end)++;`
+    let mut end_line = begin + 1;
+    while end_line < num_lines && !is_funcname_line(lines[end_line as usize]) {
+        end_line += 1;
+    }
+    // `(*begin)++` compensates for the 0-based scan.
+    Ok((begin + 1, end_line))
+}
+
+/// The body of a `/…/` regex, honouring the backslash escaping git's scan does
+/// (`for (term = spec + 1; *term && *term != '/'; term++) if (*term == '\\') term++;`).
+/// `None` when the closing `/` is missing, which git reports as a parse failure.
+fn regex_body(body: &str) -> Option<&str> {
+    let bytes = body.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'/' {
+            // git requires the regex to be the *whole* remaining argument.
+            return (i + 1 == bytes.len()).then(|| &body[..i]);
+        }
+        if bytes[i] == b'\\' {
+            i += 1;
+        }
+        i += 1;
+    }
+    None
+}
+
+/// `regcomp(&regexp, pattern, REG_NEWLINE)`: `.` and negated classes stop at a
+/// newline, and `^`/`$` match at line boundaries. `regex::bytes` spells that
+/// `multi_line(true).dot_matches_new_line(false)`.
+fn compile_line_regex(pattern: &str) -> Result<regex::bytes::Regex, regex::Error> {
+    regex::bytes::RegexBuilder::new(pattern)
+        .multi_line(true)
+        .dot_matches_new_line(false)
+        .build()
+}
+
+/// Byte offset of 0-based line `n` in `image`; the end of the buffer for `n`
+/// past the last line, which is what `blame_nth_line()` returns.
+fn line_offset(lines: &[&[u8]], image: &[u8], n: usize) -> usize {
+    match lines.get(n) {
+        Some(line) => line.as_ptr() as usize - image.as_ptr() as usize,
+        None => image.len(),
+    }
+}
+
+/// A run of digits that is the *whole* string.
+///
+/// git parses with `strtol` and then rejects whatever it could not consume
+/// (`if (*arg) return -1` in `parse_range_arg`), so an endpoint with trailing
+/// text is a usage error rather than a truncated number. Requiring the whole
+/// string here collapses those two steps.
+fn whole_number(s: &str) -> Option<u32> {
+    (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| s.parse().ok())
+        .flatten()
+}
+
+/// xdiff's default function-line test (`xdiff/xemit.c:def_ff()` via
+/// `line-range.c:match_funcname()`): a non-empty line starting with a letter,
+/// `_`, or `$`. Used whenever the path has no userdiff driver with a `funcname`
+/// pattern.
+fn is_funcname_line(line: &[u8]) -> bool {
+    matches!(line.first(), Some(&c) if c.is_ascii_alphabetic() || c == b'_' || c == b'$')
+}
+
+/// git's `Q_("file %s has only %lu line", "file %s has only %lu lines", lines)`.
+fn plural_line_count(path: &str, lines: u32) -> String {
+    if lines == 1 {
+        format!("file {path} has only 1 line")
+    } else {
+        format!("file {path} has only {lines} lines")
+    }
+}
+
+/// Lines of `image`, without terminators. A trailing incomplete line counts, an
+/// empty piece after a final `\n` does not — which is how `sb->num_lines` counts.
+fn split_lines(image: &[u8]) -> Vec<&[u8]> {
+    let mut out: Vec<&[u8]> = image.split(|&b| b == b'\n').collect();
+    if out.last().is_some_and(|l| l.is_empty()) {
+        out.pop();
+    }
+    out
 }
 
 use crate::abbrev::configured_abbrev;
@@ -2644,4 +3215,91 @@ fn repo_relative_path(repo: &gix::Repository, user_path: &str) -> Result<String>
         .to_str()
         .ok_or_else(|| anyhow!("path is not valid UTF-8: {user_path}"))?;
     Ok(s.strip_prefix("./").unwrap_or(s).to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A 10-line file whose lines 1, 6 and 10 pass xdiff's default funcname test
+    /// (a line starting with a letter, `_` or `$`).
+    ///
+    /// Every expectation below was captured from stock git 2.55.0 by committing
+    /// exactly these bytes as `g.txt` and reading the line numbers back out of
+    /// `git blame -s -L <spec> g.txt`, not derived from reading `line-range.c`.
+    const FILE: &[u8] = b"fn one() {\n    1\n}\n\n\nfn two() {\n    2\n}\n\nx\n";
+
+    fn ranges(specs: &[&str]) -> Result<Vec<RangeInclusive<u32>>, LineSpecError> {
+        let specs: Vec<String> = specs.iter().map(|s| s.to_string()).collect();
+        resolve_line_specs(&specs, FILE, "g.txt")
+    }
+
+    fn fatal(specs: &[&str]) -> String {
+        match ranges(specs) {
+            Err(LineSpecError::Fatal(msg)) => msg,
+            Err(LineSpecError::Usage) => panic!("expected a fatal, got a usage error"),
+            Err(LineSpecError::Unimplementable(w)) => panic!("expected a fatal, got {w}"),
+            Ok(r) => panic!("expected a fatal, got {r:?}"),
+        }
+    }
+
+    /// The numeric `-L` forms, including the two relative ends and the clamping
+    /// `builtin/blame.c:1211-1218` applies.
+    #[test]
+    fn numeric_line_specs_match_git() {
+        assert_eq!(ranges(&["3"]).unwrap(), vec![3..=10]);
+        assert_eq!(ranges(&["3,5"]).unwrap(), vec![3..=5]);
+        assert_eq!(ranges(&["3,+2"]).unwrap(), vec![3..=4]);
+        assert_eq!(ranges(&["10,-5"]).unwrap(), vec![6..=10]);
+        assert_eq!(ranges(&["10,-15"]).unwrap(), vec![1..=10]);
+        assert_eq!(ranges(&["3,-1"]).unwrap(), vec![3..=3]);
+        // `-L,<m>` and `-L<n>,` leave the missing endpoint at git's 0, which the
+        // clamp turns into the first and the last line respectively.
+        assert_eq!(ranges(&[",4"]).unwrap(), vec![1..=4]);
+        assert_eq!(ranges(&["4,"]).unwrap(), vec![4..=10]);
+        // An inverted range is swapped, not rejected.
+        assert_eq!(ranges(&["5,2"]).unwrap(), vec![2..=5]);
+        // A `top` past the end is pulled back; a `bottom` past the end is fatal.
+        assert_eq!(ranges(&["1,99"]).unwrap(), vec![1..=10]);
+        assert_eq!(fatal(&["99,99"]), "file g.txt has only 10 lines");
+        assert_eq!(fatal(&["0,0"]), "-L invalid line number: 0");
+        assert_eq!(fatal(&["10,-0"]), "-L invalid empty range");
+    }
+
+    /// `/<regex>/` resolves to the line the match *starts* on, searching forward
+    /// from the anchor, and a second `-L` picks up where the first left off
+    /// (`anchor = top + 1`, `builtin/blame.c:1221`).
+    #[test]
+    fn regex_line_specs_match_git() {
+        assert_eq!(ranges(&["/two/,+1"]).unwrap(), vec![6..=6]);
+        // `^/re/` re-anchors the search at line 1 regardless of the running
+        // anchor, so the second spec finds the *first* `fn`, not the next one.
+        assert_eq!(
+            ranges(&["/two/,+1", "^/fn/,+1"]).unwrap(),
+            vec![6..=6, 1..=1]
+        );
+        // Without `^`, the same second spec searches from line 7 onward and
+        // finds nothing.
+        assert_eq!(
+            fatal(&["/two/,+1", "/fn/,+1"]),
+            "-L parameter 'fn' starting at line 7: regexec() failed to match"
+        );
+    }
+
+    /// `:<funcname>` takes the first funcname line matching the pattern and runs
+    /// to just before the next funcname line (`parse_range_funcname`).
+    #[test]
+    fn funcname_line_specs_match_git() {
+        assert_eq!(ranges(&[":one"]).unwrap(), vec![1..=5]);
+        // Line 10 is `x`, which passes the funcname test, so the second function
+        // ends at line 9 rather than at the end of the file.
+        assert_eq!(ranges(&[":two"]).unwrap(), vec![6..=9]);
+        // The pattern also matches inside line 6 only; `find_funcname_matching_regexp`
+        // widens each match to its line and keeps the first that is a funcname line.
+        assert_eq!(ranges(&[":fn t"]).unwrap(), vec![6..=9]);
+        assert_eq!(
+            fatal(&[":nowhere"]),
+            "-L parameter 'nowhere' starting at line 1: no match"
+        );
+    }
 }

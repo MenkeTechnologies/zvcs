@@ -204,6 +204,37 @@ pub fn history(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::from(EXIT_DIE));
     }
 
+    // `cmd_fixup()`'s remaining pre-merge checks, in git's order: resolve HEAD
+    // and its tree, read the index, and refuse when the index holds nothing the
+    // fixup could apply. These sit ahead of `merge_incore_nonrecursive()`, so
+    // they are reachable without the replay engine — and `nothing to fixup` is
+    // what a fixup on a clean worktree actually reports.
+    if sub == Sub::Fixup {
+        let Some(head_tree) = repo
+            .head_commit()
+            .ok()
+            .and_then(|c| c.tree().ok())
+            .map(|t| t.id)
+        else {
+            eprintln!("error: cannot look up HEAD");
+            return Ok(ExitCode::from(EXIT_DIE));
+        };
+        match staged_tree(&repo) {
+            None => {
+                eprintln!("error: unable to read index");
+                return Ok(ExitCode::from(EXIT_DIE));
+            }
+            // `repo_index_has_changes(repo, head_tree, NULL)`: the staged changes
+            // are the diff from HEAD's tree to the index tree, so an index that
+            // writes back to HEAD's own tree has none.
+            Some(index_tree) if index_tree == head_tree => {
+                eprintln!("error: nothing to fixup: no staged changes");
+                return Ok(ExitCode::from(EXIT_DIE));
+            }
+            Some(_) => {}
+        }
+    }
+
     // Everything past this point is the rewrite, which is not ported. Report the
     // specific substrate that is missing rather than producing divergent state.
     let _ = (opts.dry_run, opts.head_only, opts.reedit_message, opts.empty, &opts.pathspecs);
@@ -222,6 +253,43 @@ pub fn history(args: &[String]) -> Result<ExitCode> {
         }
     };
     bail!("`history {}` is not ported: requires {missing}", sub.name());
+}
+
+/// `repo_read_index()` followed by `write_in_core_index_as_tree()`: the tree the
+/// current index would produce, which is HEAD's tree plus whatever is staged.
+/// `None` is git's `unable to read index`.
+///
+/// The tree is written into the object database, as git's is — comparing it to
+/// HEAD's tree id is exactly `repo_index_has_changes()`'s question, and an
+/// unmerged index has no tree at all, which git also treats as a failure to
+/// write one.
+fn staged_tree(repo: &gix::Repository) -> Option<gix::hash::ObjectId> {
+    let index = repo.index_or_empty().ok()?;
+    let backing = index.path_backing();
+    let mut editor = gix::objs::tree::Editor::new(
+        gix::objs::Tree::empty(),
+        &repo.objects,
+        repo.object_hash(),
+    );
+    for entry in index.entries() {
+        if entry.stage() != gix::index::entry::Stage::Unconflicted {
+            return None;
+        }
+        let mode = entry.mode.to_tree_entry_mode()?;
+        editor
+            .upsert(
+                entry
+                    .path_in(backing)
+                    .split(|&b| b == b'/')
+                    .map(gix::bstr::ByteSlice::as_bstr),
+                mode.kind(),
+                entry.id,
+            )
+            .ok()?;
+    }
+    editor
+        .write(|tree| repo.write_object(tree).map(|id| id.detach()))
+        .ok()
 }
 
 /// Outcome of option parsing: either the options, or an exit status to return

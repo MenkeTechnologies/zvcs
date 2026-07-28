@@ -152,14 +152,20 @@ pub fn update_ref(args: &[String]) -> Result<ExitCode> {
     }
 
     // Value parsing failures are `fatal:` in git and exit 128, not usage errors.
-    let new = match parse_val(&repo, new_spec, false) {
+    let new = match parse_slot(&repo, new_spec, false, Slot::New) {
         Ok(v) => v,
         Err(e) => return fatal(e),
     };
-    let old = match parse_val(&repo, old_spec, false) {
+    let old = match parse_slot(&repo, old_spec, false, Slot::Old) {
         Ok(v) => v,
         Err(e) => return fatal(e),
     };
+    // git reports this one through `update_ref`'s die-on-error wrapper, so it
+    // carries the ref name and the same 128 the other update failures use.
+    if let Err(e) = check_new_object(&repo, name, &new) {
+        eprintln!("fatal: update_ref failed for ref '{name}': {e:#}");
+        return Ok(ExitCode::from(128));
+    }
 
     let edit = match build_edit(name, &new, &old, deref, opts.create_reflog, opts.msg.as_deref()) {
         Ok(e) => e,
@@ -178,11 +184,12 @@ pub fn update_ref(args: &[String]) -> Result<ExitCode> {
         Ok(_) => Ok(ExitCode::SUCCESS),
         Err(e) => {
             // `-d` reports `error:` and exits 1; the update form dies with 128.
+            let msg = lock_error(&e);
             if opts.delete {
-                eprintln!("error: {e}");
+                eprintln!("error: {msg}");
                 Ok(ExitCode::from(1))
             } else {
-                eprintln!("fatal: update_ref failed for ref '{name}': {e}");
+                eprintln!("fatal: update_ref failed for ref '{name}': {msg}");
                 Ok(ExitCode::from(128))
             }
         }
@@ -320,11 +327,31 @@ fn fatal(e: anyhow::Error) -> Result<ExitCode> {
     Ok(ExitCode::from(128))
 }
 
-/// Resolve one optional `<oid>` slot.
+/// The two spellings git uses when a value slot fails to parse.
+#[derive(Clone, Copy, PartialEq)]
+enum Slot {
+    New,
+    Old,
+}
+
+/// Resolve one optional `<oid>` slot, naming the slot in the failure message.
 ///
 /// `empty_is_missing` distinguishes the two stdin encodings: under `-z` an empty
 /// field means "value omitted", everywhere else it means the zero value.
-fn parse_val(repo: &gix::Repository, spec: Option<&str>, empty_is_missing: bool) -> Result<Val> {
+///
+/// git resolves both slots with `repo_get_oid_with_flags(…,
+/// GET_OID_SKIP_AMBIGUITY_CHECK)`, whose `get_oid_basic` accepts a
+/// full-length hex string *without* looking the object up. That is what makes
+/// `<old-oid>` an opaque expected value: a stale guard that names no object is
+/// a lost race (the lock check reports "is at … but expected …", exit 1), not
+/// bad input (exit 128). Only a value that is neither full hex nor a resolvable
+/// revision is a parse failure.
+fn parse_slot(
+    repo: &gix::Repository,
+    spec: Option<&str>,
+    empty_is_missing: bool,
+    slot: Slot,
+) -> Result<Val> {
     let Some(spec) = spec else { return Ok(Val::Missing) };
     if spec.is_empty() {
         return Ok(if empty_is_missing { Val::Missing } else { Val::Zero });
@@ -332,14 +359,56 @@ fn parse_val(repo: &gix::Repository, spec: Option<&str>, empty_is_missing: bool)
     if spec.len() == repo.object_hash().len_in_hex() && spec.bytes().all(|b| b == b'0') {
         return Ok(Val::Zero);
     }
+    // git's `get_oid_hex` fast path: a full-length hex string is taken verbatim.
+    if let Ok(id) = ObjectId::from_hex(spec.as_bytes()) {
+        return Ok(Val::Oid(id));
+    }
     let id = repo
         .rev_parse_single(spec)
-        .map_err(|_| anyhow!("{spec}: not a valid SHA1"))?
+        .map_err(|_| match slot {
+            Slot::New => anyhow!("{spec}: not a valid SHA1"),
+            Slot::Old => anyhow!("{spec}: not a valid old SHA1"),
+        })?
         .detach();
-    if !repo.has_object(id) {
-        bail!("trying to write ref with nonexistent object {id}");
-    }
     Ok(Val::Oid(id))
+}
+
+/// Restate a gitoxide ref-transaction failure in git's `lock_ref_oid_basic`
+/// wording, so a caller branching on the message sees what stock git prints.
+///
+/// gitoxide reports the precondition that failed; git reports it as a failure to
+/// take the lock. The three preconditions `update-ref` can violate map one to
+/// one, and anything else is passed through unchanged.
+fn lock_error(e: &gix::reference::edit::Error) -> String {
+    use gix::refs::file::transaction::prepare::Error as P;
+    let gix::reference::edit::Error::FileTransactionPrepare(p) = e else {
+        return e.to_string();
+    };
+    match p {
+        P::ReferenceOutOfDate {
+            full_name,
+            expected,
+            actual,
+        } => format!("cannot lock ref '{full_name}': is at {actual} but expected {expected}"),
+        P::MustNotExist { full_name, .. } => {
+            format!("cannot lock ref '{full_name}': reference already exists")
+        }
+        P::MustExist { full_name, .. } => format!(
+            "cannot lock ref '{full_name}': unable to resolve reference '{full_name}'"
+        ),
+        _ => e.to_string(),
+    }
+}
+
+/// git's `ref_transaction_prepare` check: the object a ref is about to point at
+/// has to exist. The `<old-oid>` guard is deliberately exempt.
+fn check_new_object(repo: &gix::Repository, name: &str, new: &Val) -> Result<()> {
+    if let Val::Oid(id) = new {
+        if !repo.has_object(*id) {
+            bail!("trying to write ref '{name}' with nonexistent object {id}");
+        }
+    }
+    Ok(())
 }
 
 /// Validate `name` as a fully-qualified ref name.
@@ -632,7 +701,9 @@ fn apply(repo: &gix::Repository, batch: Batch, batch_updates: bool) -> Result<()
         return Ok(());
     }
     if !batch_updates {
-        repo.edit_references(batch.edits)?;
+        if let Err(e) = repo.edit_references(batch.edits) {
+            bail!("{}", lock_error(&e));
+        }
         return Ok(());
     }
     let zero = ObjectId::null(repo.object_hash());
@@ -640,8 +711,9 @@ fn apply(repo: &gix::Repository, batch: Batch, batch_updates: bool) -> Result<()
         let name = edit.name.to_string();
         let (new, old) = edit_oids(&edit, &zero);
         if let Err(e) = repo.edit_reference(edit) {
-            eprintln!("error: {e}");
-            println!("rejected {name} {new} {old} {e}");
+            let msg = lock_error(&e);
+            eprintln!("error: {msg}");
+            println!("rejected {name} {new} {old} {msg}");
         }
     }
     Ok(())
@@ -693,11 +765,12 @@ fn stage_oid_command(
             if args.len() < 2 || args.len() > 3 {
                 bail!("update: wrong number of arguments");
             }
-            let new = parse_val(repo, slot(1), nul)?;
-            let old = parse_val(repo, slot(2), nul)?;
+            let new = parse_slot(repo, slot(1), nul, Slot::New)?;
+            let old = parse_slot(repo, slot(2), nul, Slot::Old)?;
             if matches!(new, Val::Missing) {
                 bail!("update {name}: missing <new-oid>");
             }
+            check_new_object(repo, name, &new)?;
             batch
                 .edits
                 .push(build_edit(name, &new, &old, deref, create_reflog, msg)?);
@@ -706,10 +779,15 @@ fn stage_oid_command(
             if args.len() != 2 {
                 bail!("create: wrong number of arguments");
             }
-            let new = parse_val(repo, slot(1), nul)?;
+            let new = parse_slot(repo, slot(1), nul, Slot::New)?;
             let Val::Oid(id) = new else {
                 bail!("create {name}: zero <new-oid>");
             };
+            check_new_object(repo, name, &new)?;
+            // git's `create` refuses outright when the ref is already there;
+            // gitoxide's `MustNotExist` tolerates an existing ref that already
+            // holds the value being written, so the check is made explicit.
+            batch.absent.push(name.to_string());
             batch.edits.push(RefEdit {
                 change: Change::Update {
                     log: log_change(create_reflog, msg),
@@ -724,7 +802,7 @@ fn stage_oid_command(
             if args.len() > 2 {
                 bail!("delete: wrong number of arguments");
             }
-            let old = parse_val(repo, slot(1), nul)?;
+            let old = parse_slot(repo, slot(1), nul, Slot::Old)?;
             // Unlike the command-line `-d`, the stdin `delete` command rejects an
             // explicit all-zero `<old-oid>` outright rather than deleting.
             if matches!(old, Val::Zero) {
@@ -745,7 +823,7 @@ fn stage_oid_command(
             }
             // `verify` is an update to the value it already has: gitoxide skips
             // the reflog when old == new, so nothing is logged, as in git.
-            match parse_val(repo, slot(1), nul)? {
+            match parse_slot(repo, slot(1), nul, Slot::Old)? {
                 Val::Oid(id) => batch.edits.push(RefEdit {
                     change: Change::Update {
                         log: log_change(create_reflog, msg),
@@ -801,7 +879,7 @@ fn stage_symref_command(
                         .ok_or_else(|| anyhow!("symref-update {name}: missing <old-target>"))?;
                     PreviousValue::MustExistAndMatch(Target::Symbolic(refname(old)?))
                 }
-                Some("oid") => match parse_val(repo, slot(3), nul)? {
+                Some("oid") => match parse_slot(repo, slot(3), nul, Slot::Old)? {
                     Val::Oid(id) => PreviousValue::MustExistAndMatch(Target::Object(id)),
                     Val::Zero | Val::Missing => PreviousValue::MustNotExist,
                 },

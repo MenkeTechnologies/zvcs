@@ -112,6 +112,8 @@ pub mod blame_file {
         /// Also blame parents for lines that were copied out of another file
         /// (`git blame -C[<score>]`).
         pub detect_copied: Option<gix_blame::CopyDetection>,
+        /// Follow only the first parent of every commit (`git blame --first-parent`).
+        pub first_parent: bool,
     }
 
     /// The error returned by [Repository::blame_file()](crate::Repository::blame_file()).

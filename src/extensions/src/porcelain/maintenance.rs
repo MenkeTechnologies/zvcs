@@ -7,10 +7,17 @@
 //!     `maintenance.repo` in the global config (or `--config-file`), sets
 //!     `maintenance.auto = false` in the repository's own config, and sets
 //!     `maintenance.strategy = incremental` there when no value is already
-//!     visible in the merged config. Idempotent, silent, exit 0.
+//!     visible in the merged config. Idempotent, silent, exit 0. Each config
+//!     file is written through a `<path>.lock` sibling, as git's config writer
+//!     does, so a config that cannot be locked reports `error: could not lock
+//!     config file <path>` plus git's `fatal: unable to add 'maintenance.repo'
+//!     value of '<path>'` and exits 128 rather than claiming a write it did not
+//!     perform.
 //!   * `unregister [--config-file <path>] [-f|--force]` — removes that entry
 //!     again, dropping the `[maintenance]` section once it holds nothing else
-//!     (git's `git_config_set` does the same). Silent, exit 0; without
+//!     (git's `git_config_set` does the same). Silent, exit 0; a config that
+//!     cannot be locked is `fatal: unable to unset 'maintenance.repo' value of
+//!     '<path>'`, exit 128, unless `--force` was given. Without
 //!     `--force` an unregistered repository yields git's
 //!     `fatal: repository '<path>' is not registered` on stderr, exit 128.
 //!
@@ -1473,7 +1480,10 @@ fn stop_sub(args: &[String]) -> Result<ExitCode> {
 /// visible in the merged config, `maintenance.strategy = incremental` into the
 /// repository's own config; then appends the repository's realpath to
 /// `maintenance.repo` in the target config unless it is already listed. Prints
-/// nothing and exits 0, as stock git does.
+/// nothing and exits 0, as stock git does — unless a config file cannot be
+/// locked, in which case `config.c` reports it and the caller dies: the
+/// `error: could not lock config file <path>` line, then git's `fatal:` line,
+/// exit 128.
 fn register_sub(args: &[String]) -> Result<ExitCode> {
     let config_file = match parse_config_file_opts(args, REGISTER_USAGE, false)? {
         Parsed::Error(code) => return Ok(code),
@@ -1491,7 +1501,13 @@ fn register_sub(args: &[String]) -> Result<ExitCode> {
     if repo.config_snapshot().string("maintenance.strategy").is_none() {
         local.set_raw_value("maintenance.strategy", "incremental")?;
     }
-    write_config(&local_path, &local)?;
+    // `repo_config_set()` is the non-gently spelling: it dies on the write it
+    // could not perform rather than carrying on.
+    if let Err(ConfigWriteFailed(msg)) = write_config(&local_path, &local) {
+        eprintln!("{msg}");
+        eprintln!("fatal: could not set 'maintenance.auto' to 'false'");
+        return Ok(ExitCode::from(128));
+    }
 
     // Then the registry itself: the global config, or `--config-file`.
     let target = match config_file {
@@ -1507,7 +1523,14 @@ fn register_sub(args: &[String]) -> Result<ExitCode> {
     if !already {
         file.section_mut_or_create_new("maintenance", None::<&BStr>)?
             .push("repo", Some(maintpath.as_bstr()))?;
-        write_config(&target, &file)?;
+        if let Err(ConfigWriteFailed(msg)) = write_config(&target, &file) {
+            eprintln!("{msg}");
+            eprintln!(
+                "fatal: unable to add '{REPO_KEY}' value of '{}'",
+                maintpath.to_str_lossy()
+            );
+            return Ok(ExitCode::from(128));
+        }
     }
 
     Ok(ExitCode::SUCCESS)
@@ -1573,7 +1596,18 @@ fn unregister_sub(args: &[String]) -> Result<ExitCode> {
         file.remove_section_by_id(id);
     }
 
-    write_config(&target, &file)?;
+    // `rc && (!force || rc == CONFIG_NOTHING_SET)`: a lock that could not be
+    // taken is `CONFIG_NO_LOCK`, which `--force` swallows.
+    if let Err(ConfigWriteFailed(msg)) = write_config(&target, &file) {
+        eprintln!("{msg}");
+        if !force {
+            eprintln!(
+                "fatal: unable to unset '{REPO_KEY}' value of '{}'",
+                maintpath.to_str_lossy()
+            );
+            return Ok(ExitCode::from(128));
+        }
+    }
     Ok(ExitCode::SUCCESS)
 }
 
@@ -1682,12 +1716,69 @@ fn load_config(path: &Path) -> Result<gix::config::File> {
     }
 }
 
-/// Serialize `file` back over `path`, creating parent directories as git does
-/// for the XDG location. Everything untouched round-trips byte-for-byte.
-fn write_config(path: &Path, file: &gix::config::File) -> Result<()> {
+/// The `error:` line `config.c` prints when it cannot write a config file. git
+/// reports it and then dies with a second, caller-specific `fatal:` line, so the
+/// two are kept apart here.
+struct ConfigWriteFailed(String);
+
+/// Serialize `file` back over `path` the way `git_config_set_multivar_in_file_gently()`
+/// does: the new content is written to a `<path>.lock` sibling created with
+/// `O_EXCL` and renamed into place, so a config that cannot be locked is never
+/// touched and the command can report the failure instead of claiming success.
+/// `lock_file()` resolves symlinks before appending `.lock`, so the lock lands
+/// beside the real file. Everything untouched round-trips byte-for-byte.
+fn write_config(path: &Path, file: &gix::config::File) -> std::result::Result<(), ConfigWriteFailed> {
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        std::fs::create_dir_all(parent)?;
+        let _ = std::fs::create_dir_all(parent);
     }
-    std::fs::write(path, file.to_bstring())?;
+    let real = match path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        Some(parent) => std::fs::canonicalize(parent)
+            .unwrap_or_else(|_| parent.to_owned())
+            .join(path.file_name().unwrap_or_default()),
+        None => path.to_owned(),
+    };
+    let mut lock = real.clone().into_os_string();
+    lock.push(".lock");
+    let lock = PathBuf::from(lock);
+
+    let no_lock = |e: &std::io::Error| {
+        ConfigWriteFailed(format!(
+            "error: could not lock config file {}: {}",
+            path.display(),
+            errno_text(e)
+        ))
+    };
+    let mut out = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&lock)
+    {
+        Ok(f) => f,
+        Err(e) => return Err(no_lock(&e)),
+    };
+    let write = std::io::Write::write_all(&mut out, &file.to_bstring())
+        .and_then(|()| out.sync_all())
+        .and_then(|()| {
+            drop(out);
+            std::fs::rename(&lock, &real)
+        });
+    if let Err(e) = write {
+        let _ = std::fs::remove_file(&lock);
+        return Err(ConfigWriteFailed(format!(
+            "error: could not write config file {}: {}",
+            path.display(),
+            errno_text(&e)
+        )));
+    }
     Ok(())
+}
+
+/// `strerror(errno)`, which is what git's `error_errno()` appends.
+fn errno_text(e: &std::io::Error) -> String {
+    match e.raw_os_error() {
+        Some(code) => unsafe { std::ffi::CStr::from_ptr(libc::strerror(code)) }
+            .to_string_lossy()
+            .into_owned(),
+        None => e.to_string(),
+    }
 }

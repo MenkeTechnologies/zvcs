@@ -1,8 +1,8 @@
 //! `git bundle` — move objects and refs by archive.
 //!
-//! Three of the four subcommands are ported in full and are byte-verifiable
-//! against stock git (checked against git 2.55.0); the one that would have to
-//! *write* pack data bails with the concrete substrate that is missing.
+//! All four subcommands are ported (checked against git 2.55.0). The three that
+//! only *read* a bundle are byte-verifiable against stock git; `create` writes a
+//! bundle whose header is byte-identical and whose pack is not — see below.
 //!
 //! [`uri`] holds the bundle-URI client — `git clone --bundle-uri` and the
 //! `fetch.bundleURI` a `git fetch` follows — which is the only place the
@@ -43,16 +43,27 @@
 //! (`index_pack.rs:60`). The objects and refs are identical; the pack hash on
 //! disk need not be.
 //!
-//! Not ported — this bails, naming the gap, rather than producing a pack that
-//! only looks right:
-//!   * `create` — needs a pack writer that can delta-compress and emit *thin*
-//!     packs. `gix-pack`'s writer has exactly one mode, documented as "Copy
-//!     base objects and deltas from packs, while non-packed objects will be
-//!     treated as base objects (i.e. without trying to delta compress them)"
-//!     (`gix-pack/src/data/output/entry/iter_from_counts.rs:362`). Every bundle
-//!     built with a prerequisite is a thin pack, and a self-contained one would
-//!     differ from git's byte-for-byte — and since `create` writes nothing to
-//!     stdout and exits 0, a wrong bundle is indistinguishable from success.
+//! Ported, with one documented divergence:
+//!   * `git bundle create [-q | --quiet | --progress] [--version=<n>] <file>
+//!     <git-rev-list-args>` — the signature, the `-<oid> <oneline>`
+//!     prerequisites, the `<oid> <ref>` tip list, the header-terminating blank
+//!     line, and the pack, in git's order and with git's ref-naming rules
+//!     (`HEAD` stays `HEAD` because it is a symref; a short name is written out
+//!     as the full ref it dwims to). `-` writes to stdout, any other name is
+//!     written through a `.lock` and renamed, as `hold_lock_file_for_update`
+//!     does. `Refusing to create empty bundle.` and `unsupported bundle
+//!     version <n>` are reproduced.
+//!
+//!     **The pack is not thin.** git's `pack-objects --thin` emits deltas whose
+//!     bases are the prerequisite objects the receiver already has;
+//!     `gix-pack`'s writer has exactly one mode, documented as "Copy base
+//!     objects and deltas from packs, while non-packed objects will be treated
+//!     as base objects (i.e. without trying to delta compress them)"
+//!     (`gix-pack/src/data/output/entry/iter_from_counts.rs:362`). What is
+//!     written is therefore a self-contained superset of git's pack: every
+//!     object it references is present, so `git bundle unbundle`, `git clone`
+//!     and `index-pack --fix-thin` all accept it and produce the same objects
+//!     and refs. The bundle's *bytes* are not git's, and neither is its size.
 //!
 //! Two further deliberate gaps, so this doc claims no more than the code does:
 //! a v3 bundle carrying any capability other than `@object-format` is rejected
@@ -553,18 +564,265 @@ fn history_is_complete(repo: &gix::Repository, tips: &[ObjectId]) -> bool {
 
 // -------------------------------------------------- create / unbundle -------
 
-/// `git bundle create` is not ported; only `-h` is served.
+/// `git bundle create [-q | --quiet | --progress] [--version=<n>] <file>
+/// <git-rev-list-args>`
+///
+/// Port of `cmd_bundle_create` (`builtin/bundle.c`) plus the `create_bundle()`
+/// it calls (`bundle.c:478-604`), in git's order: the signature, the
+/// prerequisite lines, the ref lines, the blank line that ends the header, and
+/// the pack.
 fn create(args: &[String]) -> Result<ExitCode> {
     if args.iter().any(|a| a == "-h") {
         print!("{CREATE_USAGE}");
         return Ok(ExitCode::from(129));
     }
-    bail!(
-        "`bundle create` is not ported: writing a bundle needs a pack writer with delta \
-         compression and thin-pack support; gix-pack's only mode is PackCopyAndBaseObjects \
-         (gix-pack/src/data/output/entry/iter_from_counts.rs:362), which can produce neither \
-         the thin pack a prerequisite bundle requires nor a pack matching git's bytes"
-    )
+
+    // `builtin_bundle_create_options`: the three progress switches all feed the
+    // same `progress` int, which only decides what `pack-objects` narrates on
+    // stderr. Nothing here narrates, so all four spellings are accepted and
+    // dropped. `--version` is the one option that changes the bytes.
+    let mut version: Option<u8> = None;
+    let mut rev_args: Vec<&str> = Vec::new();
+    let mut file: Option<&str> = None;
+    let mut end_of_opts = false;
+
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if end_of_opts || !a.starts_with('-') || a == "-" {
+            if file.is_none() {
+                file = Some(a);
+            } else {
+                rev_args.push(a);
+            }
+            i += 1;
+            continue;
+        }
+        match a {
+            "--" => end_of_opts = true,
+            "-q" | "--quiet" | "--progress" | "--all-progress" | "--all-progress-implied" => {}
+            "--version" => {
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!("error: option `version' requires a value");
+                    return Ok(ExitCode::from(129));
+                };
+                version = Some(parse_version(v)?);
+                i += 1;
+            }
+            _ if a.starts_with("--version=") => {
+                version = Some(parse_version(&a["--version=".len()..])?)
+            }
+            // Everything else is a rev-list argument: `--all`, `^<rev>`,
+            // `--not`, and the rest of the revision grammar.
+            _ if file.is_some() => rev_args.push(a),
+            _ => return Ok(bad_option(a.trim_start_matches('-'), CREATE_USAGE, !a.starts_with("--"))),
+        }
+        i += 1;
+    }
+
+    let Some(file) = file else {
+        return Ok(need_file(CREATE_USAGE));
+    };
+
+    let repo = gix::discover(".")?;
+    let pending = resolve_revisions(&repo, &rev_args)?;
+
+    // `if (version == -1) version = min_version;` — 2 for sha1, and only 2 or 3
+    // exist (bundle.c:525-531).
+    let version = version.unwrap_or(2);
+    if !(2..=3).contains(&version) {
+        eprintln!("fatal: unsupported bundle version {version}");
+        return Ok(ExitCode::from(128));
+    }
+
+    let mut out: Vec<u8> = Vec::new();
+    if version == 2 {
+        out.extend_from_slice(b"# v2 git bundle\n");
+    } else {
+        out.extend_from_slice(b"# v3 git bundle\n");
+        out.extend_from_slice(format!("@object-format={}\n", repo.object_hash()).as_bytes());
+    }
+
+    // `revs.boundary = 1` then `traverse_commit_list(..., write_bundle_prerequisites, ...)`
+    // (bundle.c:564-575): each BOUNDARY commit is written as `-<oid> <oneline>`.
+    let tips: Vec<ObjectId> = pending.iter().filter(|p| !p.uninteresting).map(|p| p.id).collect();
+    let excluded: Vec<ObjectId> =
+        pending.iter().filter(|p| p.uninteresting).map(|p| p.id).collect();
+    let prereqs = boundary_commits(&repo, &tips, &excluded);
+    for id in &prereqs {
+        let subject = commit_oneline(&repo, *id);
+        out.extend_from_slice(format!("-{id} {subject}\n").as_bytes());
+    }
+
+    // `write_bundle_refs()` (bundle.c:383-444): the interesting pending entries
+    // that dwim to a ref, deduplicated by the name that gets written.
+    let mut seen: Vec<String> = Vec::new();
+    for entry in pending.iter().filter(|p| !p.uninteresting) {
+        let Some(display) = &entry.display_ref else { continue };
+        if seen.iter().any(|s| s == display) {
+            continue;
+        }
+        seen.push(display.clone());
+        out.extend_from_slice(format!("{} {display}\n", entry.id).as_bytes());
+    }
+    if seen.is_empty() {
+        eprintln!("fatal: Refusing to create empty bundle.");
+        return Ok(ExitCode::from(128));
+    }
+    // `write_or_die(bundle_fd, "\n", 1)` — the blank line that ends the header.
+    out.push(b'\n');
+
+    // `write_pack_data()`: the objects reachable from the tips and not from the
+    // prerequisites. git's pack is thin (its deltas may name bases the receiver
+    // already has); this one is not, so it carries every object it references.
+    // A non-thin pack is a strictly self-contained superset — `unbundle` and
+    // `index-pack --fix-thin` accept it unchanged — so the bundle is correct,
+    // but its bytes are not git's. See the module header.
+    let mut haves = prereqs.clone();
+    haves.extend_from_slice(&excluded);
+    let objects = crate::porcelain::push_proto::objects_to_send(&repo, &tips, &haves);
+    out.extend_from_slice(&crate::porcelain::pack_objects::pack_bytes_for(&repo, &objects)?);
+
+    if file == "-" {
+        io::stdout().write_all(&out)?;
+        io::stdout().flush()?;
+    } else {
+        // `hold_lock_file_for_update` + `commit_lock_file`: the bundle appears
+        // whole or not at all, so a reader never sees a half-written header.
+        let tmp = format!("{file}.lock");
+        std::fs::write(&tmp, &out)?;
+        std::fs::rename(&tmp, file)?;
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `--version=<n>`: git's `OPT_INTEGER`, so a non-numeric value is a usage
+/// error before the version range is ever looked at.
+fn parse_version(v: &str) -> Result<u8> {
+    v.parse::<u8>()
+        .map_err(|_| anyhow::anyhow!("option `version' expects a numerical value"))
+}
+
+/// One entry of git's `revs.pending`: the object a revision argument named, the
+/// ref name `write_bundle_refs` would print for it, and whether it arrived
+/// negated.
+struct Pending {
+    id: ObjectId,
+    /// `display_ref` in `write_bundle_refs`: the dwim-resolved full ref name,
+    /// or the name as typed when that name is a symref (which is what keeps
+    /// `HEAD` printing as `HEAD` rather than as its target). `None` for an
+    /// argument that does not name a ref at all, which git skips.
+    display_ref: Option<String>,
+    uninteresting: bool,
+}
+
+/// `setup_revisions()` reduced to the grammar `bundle create` is documented
+/// with: `--all`, `<rev>`, `^<rev>`, and `<a>..<b>`.
+fn resolve_revisions(repo: &gix::Repository, args: &[&str]) -> Result<Vec<Pending>> {
+    let mut pending = Vec::new();
+    for arg in args {
+        match *arg {
+            // `handle_refs(for_each_ref)` then `handle_refs(head_ref)`
+            // (revision.c) — which is why `HEAD` lands after the ref list.
+            "--all" => {
+                for r in repo.references()?.all()? {
+                    let Ok(r) = r else { continue };
+                    let name = r.name().as_bstr().to_string();
+                    if let Some(id) = r.try_id() {
+                        pending.push(Pending {
+                            id: id.detach(),
+                            display_ref: Some(name),
+                            uninteresting: false,
+                        });
+                    }
+                }
+                if let Ok(head) = repo.head_id() {
+                    pending.push(Pending {
+                        id: head.detach(),
+                        display_ref: Some("HEAD".into()),
+                        uninteresting: false,
+                    });
+                }
+            }
+            a => {
+                if let Some(rest) = a.strip_prefix('^') {
+                    pending.push(one_pending(repo, rest, true)?);
+                } else if let Some((left, right)) = a.split_once("..") {
+                    pending.push(one_pending(repo, left, true)?);
+                    pending.push(one_pending(repo, right, false)?);
+                } else {
+                    pending.push(one_pending(repo, a, false)?);
+                }
+            }
+        }
+    }
+    Ok(pending)
+}
+
+/// Resolve one revision argument, recording the name `write_bundle_refs` would
+/// print for it.
+fn one_pending(repo: &gix::Repository, spec: &str, uninteresting: bool) -> Result<Pending> {
+    let id = repo
+        .rev_parse_single(spec)
+        .map_err(|_| anyhow::anyhow!("bad revision '{spec}'"))?
+        .detach();
+    // `repo_dwim_ref()` decides whether this is a ref at all; a symref keeps the
+    // name as typed (bundle.c:398-403).
+    let display_ref = match repo.find_reference(spec) {
+        Ok(r) => {
+            let is_symref = matches!(r.target(), gix::refs::TargetRef::Symbolic(_));
+            Some(if is_symref { spec.to_string() } else { r.name().as_bstr().to_string() })
+        }
+        Err(_) => None,
+    };
+    Ok(Pending { id, display_ref, uninteresting })
+}
+
+/// The `BOUNDARY` commits of the walk from `tips` with `excluded` marked
+/// uninteresting: the excluded commits that are directly reachable from a
+/// commit the pack will carry. These are exactly the prerequisites a receiver
+/// must already have.
+fn boundary_commits(
+    repo: &gix::Repository,
+    tips: &[ObjectId],
+    excluded: &[ObjectId],
+) -> Vec<ObjectId> {
+    if excluded.is_empty() {
+        return Vec::new();
+    }
+    // Everything the exclusions cover; a parent inside this set stops the walk.
+    let hidden: std::collections::HashSet<ObjectId> = repo
+        .rev_walk(excluded.to_vec())
+        .all()
+        .into_iter()
+        .flatten()
+        .filter_map(|info| info.ok().map(|i| i.id))
+        .collect();
+
+    let mut boundary = Vec::new();
+    let walk = repo
+        .rev_walk(tips.to_vec())
+        .with_hidden(excluded.to_vec())
+        .all();
+    for info in walk.into_iter().flatten() {
+        let Ok(info) = info else { continue };
+        let Ok(commit) = repo.find_commit(info.id) else { continue };
+        for parent in commit.parent_ids() {
+            let parent = parent.detach();
+            if hidden.contains(&parent) && !boundary.contains(&parent) {
+                boundary.push(parent);
+            }
+        }
+    }
+    boundary
+}
+
+/// `CMIT_FMT_ONELINE`: the commit's subject, i.e. its message up to the first
+/// blank line, with surrounding whitespace trimmed.
+fn commit_oneline(repo: &gix::Repository, id: ObjectId) -> String {
+    let Ok(commit) = repo.find_commit(id) else { return String::new() };
+    let Ok(message) = commit.message() else { return String::new() };
+    message.summary().to_string()
 }
 
 /// `git bundle unbundle [--progress] <file> [<refname>...]`

@@ -486,6 +486,15 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
         }
     }
 
+    // git's `transport_check_allowed()`, reached from `git_connect()`
+    // (`connect.c:1480`) right after the banner and before a single byte moves.
+    // A transport the policy forbids is fatal here, which is what stops a
+    // submodule URL from choosing the transport (CVE-2022-39253).
+    if let Err(e) = check_transport_allowed(&url) {
+        eprintln!("fatal: {e}");
+        return Ok(ExitCode::from(128));
+    }
+
     // Build the clone platform. This already lays the repository down on disk, so
     // the template and alternates below land in the very git dir the fetch will
     // populate — the window git uses for the same work between `init_db()` and
@@ -579,8 +588,15 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     } else {
         None
     };
-    let forced_all_tags = matches!(plan, Some(Refspecs::Bare) | Some(Refspecs::Wildcard))
-        && tags != Some(Tags::None);
+    // `clone.c:1414`: `if (option_tags || option_branch) refspec_append(&remote->fetch,
+    // TAG_REFSPEC)` — the tag refspec is appended *after* the branch refspec, so
+    // `--single-branch` restricts the branches fetched and nothing else. A
+    // single-branch clone keeps every tag, exactly as a full one does; only
+    // `--no-tags` (which clears `option_tags`) drops them.
+    let forced_all_tags = matches!(
+        plan,
+        Some(Refspecs::Bare) | Some(Refspecs::Wildcard) | Some(Refspecs::Single { .. })
+    ) && tags != Some(Tags::None);
     let fetch_tags: Option<Tags> = if tags == Some(Tags::None) || mirror {
         Some(Tags::None)
     } else if forced_all_tags {
@@ -906,7 +922,7 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     // identical `info/sparse-checkout` pattern pair and `config.worktree` keys and
     // prunes the worktree, so it is re-executed here rather than duplicated.
     if sparse {
-        let code = run_self(&dir, &["sparse-checkout", "set", "--cone"])?;
+        let code = run_self(&dir, &["sparse-checkout", "set", "--cone"], true)?;
         if code != 0 {
             return Ok(ExitCode::from(code));
         }
@@ -942,7 +958,7 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
             sub.push("--no-fetch".into());
         }
         let sub: Vec<&str> = sub.iter().map(String::as_str).collect();
-        let code = run_self(&dir, &sub)?;
+        let code = run_self(&dir, &sub, false)?;
         if code != 0 {
             return Ok(ExitCode::from(code));
         }
@@ -1435,18 +1451,95 @@ fn write_alternates(git_dir: &Path, alternates: &[PathBuf]) -> Result<()> {
 /// Re-execute this binary's own porcelain inside the freshly cloned `dir`, the
 /// way git's clone shells out to `git submodule update` and `git sparse-checkout`.
 /// Returns the child's exit code.
-fn run_self(dir: &str, args: &[&str]) -> Result<u8> {
+///
+/// `from_user` is git's `GIT_PROTOCOL_FROM_USER`: `git-submodule.sh:29` exports
+/// it as `0` for everything it runs, because a submodule URL comes out of
+/// `.gitmodules` rather than off the user's command line, and
+/// [`transport_allowed`] refuses a `user`-scoped transport for it. Passing it
+/// down here is what makes a recursive clone honor `protocol.file.allow`.
+fn run_self(dir: &str, args: &[&str], from_user: bool) -> Result<u8> {
     let exe = std::env::current_exe()?;
-    let status = std::process::Command::new(&exe)
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .status()?;
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.arg("-C").arg(dir).args(args);
+    if !from_user {
+        cmd.env("GIT_PROTOCOL_FROM_USER", "0");
+    }
+    let status = cmd.status()?;
     Ok(if status.success() {
         0
     } else {
         status.code().unwrap_or(1) as u8
     })
+}
+
+/// git's `is_transport_allowed()` (`transport.c:1124`) for `type`, the policy
+/// added for CVE-2022-39253.
+///
+/// `GIT_ALLOW_PROTOCOL`, when set, is an exhaustive colon-separated allow-list
+/// and nothing else is consulted. Otherwise `protocol.<type>.allow` decides,
+/// falling back to `protocol.allow`, then to the built-in defaults: `http`,
+/// `https`, `git` and `ssh` are `always`; `ext` is `never`; everything else —
+/// `file` included — is `user`, meaning it is permitted only when the URL came
+/// from the user rather than from a file the repository carries.
+fn transport_allowed(kind: &str) -> Result<bool> {
+    if let Ok(list) = std::env::var("GIT_ALLOW_PROTOCOL") {
+        return Ok(list.split(':').any(|entry| entry == kind));
+    }
+    let config = crate::config::global_config();
+    // git's `parse_protocol_config`: anything but these three is fatal.
+    let parse = |key: &str, value: &str| match value.to_ascii_lowercase().as_str() {
+        "always" => Ok(Allow::Always),
+        "never" => Ok(Allow::Never),
+        "user" => Ok(Allow::User),
+        other => Err(anyhow::anyhow!("unknown value for config '{key}': {other}")),
+    };
+    let read = |key: &str| {
+        config
+            .string(key)
+            .and_then(|v| v.to_str().ok().map(str::to_string))
+    };
+    let key = format!("protocol.{kind}.allow");
+    let policy = match read(&key) {
+        Some(v) => parse(&key, &v)?,
+        None => match read("protocol.allow") {
+            Some(v) => parse("protocol.allow", &v)?,
+            None => match kind {
+                "http" | "https" | "git" | "ssh" => Allow::Always,
+                "ext" => Allow::Never,
+                _ => Allow::User,
+            },
+        },
+    };
+    Ok(match policy {
+        Allow::Always => true,
+        Allow::Never => false,
+        // `git_env_bool("GIT_PROTOCOL_FROM_USER", 1)`.
+        Allow::User => !matches!(std::env::var("GIT_PROTOCOL_FROM_USER").as_deref(), Ok("0")),
+    })
+}
+
+/// git's `protocol_allow_config` (`transport.c:1066`).
+enum Allow {
+    Never,
+    User,
+    Always,
+}
+
+/// git's `transport_check_allowed()` (`transport.c:1156`) for the transport
+/// `url` selects. The error text is git's `transport '%s' not allowed`.
+fn check_transport_allowed(url: &gix::Url) -> Result<()> {
+    let kind = match url.scheme {
+        gix::url::Scheme::File => "file",
+        gix::url::Scheme::Git => "git",
+        gix::url::Scheme::Ssh => "ssh",
+        gix::url::Scheme::Http => "http",
+        gix::url::Scheme::Https => "https",
+        gix::url::Scheme::Ext(ref name) => name.as_str(),
+    };
+    if !transport_allowed(kind)? {
+        bail!("transport '{kind}' not allowed");
+    }
+    Ok(())
 }
 
 /// Derive the default clone directory from a repository URL, mirroring git's

@@ -20,4 +20,4 @@ mod types;
 pub use types::{BlameEntry, BlamePathEntry, BlameRanges, CopyDetection, Options, Outcome, PathId, Statistics, Suspect};
 
 mod file;
-pub use file::function::file;
+pub use file::function::{file, strip_whitespace_per_line};

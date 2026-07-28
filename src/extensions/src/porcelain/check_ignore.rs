@@ -340,6 +340,15 @@ fn read_stdin_paths(nul: bool) -> Result<Option<Vec<BString>>> {
     std::io::stdin().lock().read_to_end(&mut buf)?;
     let sep = if nul { b'\0' } else { b'\n' };
 
+    // git's read loop is `while (strbuf_getline(&buf, stdin) != EOF)`, which
+    // yields no iterations at all on empty input. `[u8]::split` instead yields a
+    // single empty chunk for an empty slice, which produced a phantom record
+    // (`::\t\n` under `-n -v --stdin`, four NULs under `-z`) where stock git
+    // writes nothing.
+    if buf.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+
     let mut chunks: Vec<&[u8]> = buf.split(|&b| b == sep).collect();
     // A trailing separator yields one empty tail chunk that is not a record.
     if buf.last() == Some(&sep) {

@@ -35,10 +35,17 @@
 //! does; a CLI `--ff`/`--no-ff`/`--ff-only` overrides both, and when neither is
 //! set the decision falls through to `merge.ff` inside [`merge`](super::merge).
 //!
+//! `run_merge()`/`run_rebase()` also forward the accumulated `-q`/`-v`
+//! verbosity (git's `argv_push_verbosity()`), so `pull --quiet` silences the
+//! integration step's `Updating …`/`Fast-forward`/diffstat block and not just
+//! the fetch. `--squash`/`--no-squash` and `--allow-unrelated-histories` are
+//! `run_merge()` passthroughs the merge port implements, so they are forwarded
+//! on the merge path and — as git does — rejected on the rebase path.
+//!
 //! What is refused rather than faked, because the underlying substrate is
 //! absent: the merge-only integration options the merge port does not implement
-//! (`-s`/`-X`/`--squash`/`--commit`/`--no-commit`/`--edit`/`--cleanup`/`--log`/
-//! `--signoff`/`--allow-unrelated-histories` on the *merge* path — `-s`/`-X`/
+//! (`-s`/`-X`/`--commit`/`--no-commit`/`--edit`/`--cleanup`/`--log`/
+//! `--signoff` on the *merge* path — `-s`/`-X`/
 //! `--signoff` are honored on the *rebase* path), `--rebase=interactive`
 //! (interactive todo editing needs a TTY editor loop), `--autostash` over a
 //! dirty tree on the merge path (needs a 3-way stash apply the stash port lacks),
@@ -58,6 +65,81 @@ use std::process::ExitCode;
 
 use gix::remote::Direction;
 
+/// `usage_with_options()` rendering of `builtin/pull.c`'s option table, verbatim
+/// (git's `-h` writes it to stdout and exits 129).
+const USAGE: &str = concat!(
+    "usage: git pull [<options>] [<repository> [<refspec>...]]\n",
+    "\n",
+    "    -v, --[no-]verbose    be more verbose\n",
+    "    -q, --[no-]quiet      be more quiet\n",
+    "    --[no-]progress       force progress reporting\n",
+    "    --[no-]recurse-submodules[=<on-demand>]\n",
+    "                          control for recursive fetching of submodules\n",
+    "\n",
+    "Options related to merging\n",
+    "    -r, --[no-]rebase[=(false|true|merges|interactive)]\n",
+    "                          incorporate changes by rebasing rather than merging\n",
+    "    -n                    do not show a diffstat at the end of the merge\n",
+    "    --[no-]stat           show a diffstat at the end of the merge\n",
+    "    --[no-]compact-summary\n",
+    "                          show a compact-summary at the end of the merge\n",
+    "    --[no-]log[=<n>]      add (at most <n>) entries from shortlog to merge commit message\n",
+    "    --[no-]signoff[=...]  add a Signed-off-by trailer\n",
+    "    --[no-]squash         create a single commit instead of doing a merge\n",
+    "    --[no-]commit         perform a commit if the merge succeeds (default)\n",
+    "    --[no-]edit           edit message before committing\n",
+    "    --[no-]cleanup <mode> how to strip spaces and #comments from message\n",
+    "    --[no-]ff             allow fast-forward\n",
+    "    --ff-only             abort if fast-forward is not possible\n",
+    "    --[no-]verify         control use of pre-merge-commit and commit-msg hooks\n",
+    "    --[no-]verify-signatures\n",
+    "                          verify that the named commit has a valid GPG signature\n",
+    "    --[no-]autostash      automatically stash/stash pop before and after\n",
+    "    -s, --[no-]strategy <strategy>\n",
+    "                          merge strategy to use\n",
+    "    -X, --[no-]strategy-option <option=value>\n",
+    "                          option for selected merge strategy\n",
+    "    -S, --[no-]gpg-sign[=<key-id>]\n",
+    "                          GPG sign commit\n",
+    "    --[no-]allow-unrelated-histories\n",
+    "                          allow merging unrelated histories\n",
+    "\n",
+    "Options related to fetching\n",
+    "    --[no-]all            fetch from all remotes\n",
+    "    -a, --[no-]append     append to .git/FETCH_HEAD instead of overwriting\n",
+    "    --[no-]upload-pack <path>\n",
+    "                          path to upload pack on remote end\n",
+    "    -f, --[no-]force      force overwrite of local branch\n",
+    "    -t, --[no-]tags       fetch all tags and associated objects\n",
+    "    -p, --[no-]prune      prune remote-tracking branches no longer on remote\n",
+    "    -j, --[no-]jobs[=<n>] number of submodules pulled in parallel\n",
+    "    --[no-]dry-run        dry run\n",
+    "    -k, --[no-]keep       keep downloaded pack\n",
+    "    --[no-]depth <depth>  deepen history of shallow clone\n",
+    "    --[no-]shallow-since <time>\n",
+    "                          deepen history of shallow repository based on time\n",
+    "    --[no-]shallow-exclude <ref>\n",
+    "                          deepen history of shallow clone, excluding ref\n",
+    "    --[no-]deepen <n>     deepen history of shallow clone\n",
+    "    --unshallow           convert to a complete repository\n",
+    "    --[no-]update-shallow accept refs that update .git/shallow\n",
+    "    --refmap <refmap>     specify fetch refmap\n",
+    "    -o, --[no-]server-option <server-specific>\n",
+    "                          option to transmit\n",
+    "    -4, --[no-]ipv4       use IPv4 addresses only\n",
+    "    -6, --[no-]ipv6       use IPv6 addresses only\n",
+    "    --[no-]negotiation-restrict <revision>\n",
+    "                          report that we have only objects reachable from this object\n",
+    "    --[no-]negotiation-tip <revision>\n",
+    "                          alias of --negotiation-restrict\n",
+    "    --[no-]negotiation-include <revision>\n",
+    "                          ensure this ref is always sent as a negotiation have\n",
+    "    --[no-]show-forced-updates\n",
+    "                          check for forced-updates on all updated branches\n",
+    "    --[no-]set-upstream   set upstream for git pull/fetch\n",
+    "\n",
+);
+
 /// Which integration step `pull` runs after the fetch, mirroring git's
 /// `enum rebase_type` as selected by `config_get_rebase()`.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -66,6 +148,41 @@ enum RebaseMode {
     Plain,
     Merges,
     Interactive,
+}
+
+/// `set_reflog_message()` (builtin/pull.c:149), called from `cmd_pull` before
+/// `parse_options` runs, so the message is the argv exactly as typed:
+///
+/// ```c
+/// if (!getenv("GIT_REFLOG_ACTION"))
+///     set_reflog_message(argc, argv);
+/// ```
+///
+/// `setenv(..., 0)` does not overwrite, which is what makes `pull` win over the
+/// integration step: `cmd_merge` runs its own
+/// `setenv("GIT_REFLOG_ACTION", "merge <heads>", 0)` (builtin/merge.c:1586) and
+/// finds the variable already set, then writes
+/// `"<GIT_REFLOG_ACTION>: <msg>"` into the reflog (builtin/merge.c:492). A pull
+/// therefore leaves `pull . refs/heads/feature: Fast-forward` where a bare merge
+/// would leave `merge FETCH_HEAD: Fast-forward`.
+///
+/// This sets the variable; the integration step still has to read it. The ported
+/// [`merge`](super::merge) builds its reflog message as a hardcoded
+/// `merge <spec>: <msg>` and does not consult `GIT_REFLOG_ACTION`, so every
+/// `git pull` that reaches it still writes the merge-shaped message — the one
+/// remaining half of this port, and the reason the pull reflog does not match
+/// stock yet. `am.rs` and `tag.rs` already read the variable, so the convention
+/// it belongs to is live.
+fn set_reflog_message(args: &[String]) {
+    if std::env::var_os("GIT_REFLOG_ACTION").is_some() {
+        return;
+    }
+    let mut msg = String::from("pull");
+    for a in args {
+        msg.push(' ');
+        msg.push_str(a);
+    }
+    std::env::set_var("GIT_REFLOG_ACTION", msg);
 }
 
 /// Parse a `--rebase=<value>` / `pull.rebase` / `branch.<name>.rebase` value the
@@ -97,6 +214,8 @@ fn config_rebase(repo: &gix::Repository, branch: Option<&str>) -> Result<RebaseM
 }
 
 pub fn pull(args: &[String]) -> Result<ExitCode> {
+    set_reflog_message(args);
+
     // ---- parse -----------------------------------------------------------
     let mut positionals: Vec<&str> = Vec::new();
 
@@ -118,6 +237,10 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
     let mut strategy_opts: Vec<String> = Vec::new(); // -X / --strategy-option
     let mut signoff = false;
     let mut autostash: Option<bool> = None;
+    // `--squash`/`--no-squash` and `--allow-unrelated-histories`, both
+    // `run_merge()` passthroughs the merge port implements.
+    let mut squash: Option<bool> = None;
+    let mut allow_unrelated = false;
     // `--verify` (git's default) / `--no-verify`: forwarded to `merge`, which
     // runs the `pre-merge-commit` and `commit-msg` hooks. git's pull passes it
     // only to the merge, never to the rebase.
@@ -262,11 +385,16 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
             "--verify" => no_verify = false,
             "--no-verify" => no_verify = true,
 
+            // `--squash`/`--allow-unrelated-histories` are `run_merge()`
+            // passthroughs, and the merge port implements both, so they are
+            // forwarded rather than refused. Neither has a rebase equivalent;
+            // git rejects them there and so does the merge-only check below.
+            "--squash" => squash = Some(true),
+            "--no-squash" => squash = Some(false),
+            "--allow-unrelated-histories" => allow_unrelated = true,
+
             // Merge-only integration options the merge port does not implement,
             // with no rebase equivalent: refused rather than faked.
-            "--squash" | "--no-squash" => {
-                bail!("--squash is not supported (the merge port has no squash-merge path)")
-            }
             "--commit" | "--no-commit" => {
                 bail!("--commit/--no-commit is not supported (the merge port always commits)")
             }
@@ -283,9 +411,6 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
             "--log" | "--no-log" => {
                 bail!("--log is not supported (the merge port does not append a shortlog)")
             }
-            "--allow-unrelated-histories" => bail!(
-                "--allow-unrelated-histories is not supported (the merge port requires a common ancestor)"
-            ),
 
             // Absent substrate.
             "--set-upstream" => {
@@ -294,6 +419,13 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
             "-S" | "--gpg-sign" => bail!("--gpg-sign is not supported (GPG is not vendored)"),
             "--verify-signatures" | "--no-verify-signatures" => {
                 bail!("--verify-signatures is not supported (GPG is not vendored)")
+            }
+
+            // `parse_options`' built-in `-h`: the option table on stdout,
+            // exit 129. It fires wherever it appears, ahead of everything else.
+            "-h" => {
+                print!("{USAGE}");
+                return Ok(ExitCode::from(129));
             }
 
             "--" => {
@@ -556,6 +688,23 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
         if let Some(d) = diffstat {
             rebase_args.push(d.to_string());
         }
+        // `argv_push_verbosity(&args)` in `run_rebase()`: the accumulated `-q`/
+        // `-v` count reaches the integration step, which is what makes
+        // `pull --quiet` quiet rather than only quieting the fetch.
+        if f_quiet {
+            rebase_args.push("--quiet".into());
+        }
+        if f_verbose {
+            rebase_args.push("--verbose".into());
+        }
+        // git's `cmd_pull()` rejects both of these ahead of the rebase, since a
+        // rebase has nowhere to put them.
+        if squash.is_some() {
+            bail!("--squash is incompatible with --rebase");
+        }
+        if allow_unrelated {
+            bail!("--allow-unrelated-histories is incompatible with --rebase");
+        }
         rebase_args.push(target_ref);
         return super::rebase(&rebase_args);
     }
@@ -613,6 +762,23 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
     // `run_merge()` pushes `opt_diffstat` verbatim.
     if let Some(d) = diffstat {
         merge_args.push(d.to_string());
+    }
+    // `argv_push_verbosity(&args)` in `run_merge()`. Without this the merge
+    // printed its `Updating …`/`Fast-forward`/diffstat block even under
+    // `pull --quiet`, where only the fetch had been silenced.
+    if f_quiet {
+        merge_args.push("--quiet".into());
+    }
+    if f_verbose {
+        merge_args.push("--verbose".into());
+    }
+    match squash {
+        Some(true) => merge_args.push("--squash".into()),
+        Some(false) => merge_args.push("--no-squash".into()),
+        None => {}
+    }
+    if allow_unrelated {
+        merge_args.push("--allow-unrelated-histories".into());
     }
     merge_args.push(target_ref);
     super::merge(&merge_args)

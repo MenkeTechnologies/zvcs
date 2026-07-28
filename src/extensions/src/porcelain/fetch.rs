@@ -1409,6 +1409,41 @@ fn fetch_one(
         remote = remote.with_fetch_tags(tags);
     }
 
+    // `get_ref_map()` (`builtin/fetch.c`): with nothing on the command line and
+    // nothing configured for this remote — `git fetch <url>`, or a remote whose
+    // `fetch` key is unset — git does not fail. It falls back to
+    //
+    // ```c
+    // } else if (!prefetch) {
+    //         ref_map = get_remote_ref(remote_refs, "HEAD");
+    //         if (!ref_map)
+    //                 die(_("couldn't find remote ref HEAD"));
+    //         ref_map->fetch_head_status = FETCH_HEAD_MERGE;
+    // ```
+    //
+    // — one entry for the remote's `HEAD` with no peer ref, so nothing but
+    // `FETCH_HEAD` moves and the summary reads `* branch  HEAD -> FETCH_HEAD`.
+    // That is exactly a bare `HEAD` refspec, so it is injected as one; `HEAD`
+    // carries no destination, which also keeps automatic tag following off the
+    // way git's untouched `*autotags` does. `--prefetch` is excluded by the
+    // `!prefetch` guard and fetches nothing at all.
+    //
+    // The one configured case git still routes through the branch's upstream is
+    // `has_merge && !strcmp(branch->remote_name, remote->name)`: an upstream
+    // pointing at *this* remote supplies the refspec instead.
+    let branch_upstream_is_this_remote = upstream
+        .is_some_and(|(remote, _)| Some(remote.as_str()) == remote_name.as_deref());
+    let head_fallback = ["HEAD"];
+    let refspecs: &[&str] = if refspecs.is_empty()
+        && !has_configured_refspecs
+        && !branch_upstream_is_this_remote
+        && !opts.prefetch
+    {
+        &head_fallback
+    } else {
+        refspecs
+    };
+
     // Refspec selection. Explicit command-line refspecs replace the configured
     // set and additionally make every FETCH_HEAD row a merge candidate, as git's
     // `get_ref_map` does when `refspec_count > 0`.

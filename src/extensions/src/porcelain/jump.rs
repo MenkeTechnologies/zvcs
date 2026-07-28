@@ -1,5 +1,5 @@
 //! `git jump` — emit "quickfix" lines for interesting spots and hand them to an
-//! editor. **Only the `merge` mode is ported; `diff`, `ws` and `grep` bail.**
+//! editor. **The `merge` and `grep` modes are ported; `diff` and `ws` bail.**
 //!
 //! Stock `git jump` is a `/bin/sh` script installed in `$(git --exec-path)`
 //! (originally `contrib/git-jump/git-jump`; 2.55.0 ships it at
@@ -24,6 +24,11 @@
 //!     `grep: <file>: No such file or directory` is reproduced on stderr for a
 //!     delete/modify conflict, and its exit status is discarded as the pipeline
 //!     does.
+//!   * `mode_grep`: `git grep -n --column <args>` — or the word-split (not
+//!     `eval`'d) command in `jump.grepCmd` — piped through
+//!     `perl -pe 's/[ \t]+/ /g; s/^ *//;'`. The default command re-runs this
+//!     binary, which is the git installation the script would have found. The
+//!     grep's exit status is discarded, as the pipeline discards it.
 //!   * `mode_auto`: the `--is-inside-work-tree` gate, then unmerged paths →
 //!     `mode_merge`, then `git diff --quiet` → `mode_diff`, else usage/exit 1.
 //!   * Running any mode outside a repository: the underlying git command's
@@ -43,14 +48,10 @@
 //!   2. **`mode_ws`** — `git diff --check`. `gix-diff` has no whitespace-error
 //!      checker at all (`grep -rl whitespace src/ported/gix-diff/src/` matches
 //!      nothing), so git's `ws_check_emit` output has no backing.
-//!   3. **`mode_grep`** — forwards arbitrary arguments to `git grep -n --column`
-//!      or, when `jump.grepCmd` is set, to an arbitrary external command word-split
-//!      by the shell. `grep.rs` ships no regex engine (literal patterns only) and
-//!      running a configured foreign command is subprocess work, not a port.
-//!   4. **The editor hand-off** — `git var GIT_EDITOR`, the `mktemp` file, and the
+//!   3. **The editor hand-off** — `git var GIT_EDITOR`, the `mktemp` file, and the
 //!      emacs/vi `eval` split. Spawning the user's editor is not gitoxide
 //!      substrate; a non-empty result therefore bails instead of pretending.
-//!   5. **Options for `merge`.** Stock forwards them to `ls-files`, which answers
+//!   4. **Options for `merge`.** Stock forwards them to `ls-files`, which answers
 //!      an unknown one with its own multi-screen usage and the script still exits
 //!      0. That text is not reproduced here; only `--` and pathspecs are accepted.
 //!
@@ -154,12 +155,7 @@ pub fn jump(args: &[String]) -> Result<ExitCode> {
              gix-diff contains no whitespace-error checker — nothing under src/ported backs \
              git's ws_check_emit output"
         ),
-        "grep" => bail!(
-            "unsupported mode \"grep\" (ported: merge, auto). It forwards arbitrary arguments \
-             to `git grep -n --column`, or to the arbitrary external command in jump.grepCmd; \
-             grep.rs has no regex engine (literal patterns only) and running a configured \
-             foreign command is subprocess work"
-        ),
+        "grep" => mode_grep(mode_args)?,
         _ => unreachable!("mode was validated above"),
     };
 
@@ -224,6 +220,91 @@ fn mode_merge(args: &[String]) -> Result<Vec<u8>> {
     };
     let paths = unmerged_paths(&repo, args)?;
     grep_markers(&paths)
+}
+
+/// `mode_grep`:
+///
+/// ```sh
+/// cmd=$(git config jump.grepCmd)
+/// test -n "$cmd" || cmd="git grep -n --column"
+/// $cmd "$@" | perl -pe 's/[ \t]+/ /g; s/^ *//;'
+/// ```
+///
+/// `$cmd` is unquoted, so the shell word-splits it into a command and its
+/// leading arguments — it is not `eval`'d, so no quoting or redirection inside
+/// it is honoured, and neither is a glob (the words here never contain one).
+/// The pipeline's exit status is perl's, so a grep that matched nothing simply
+/// produces no elements.
+///
+/// The default command runs *this* binary rather than whatever `git` a `PATH`
+/// lookup would find: the script's `git` is the installation it ships with, and
+/// this port is that installation.
+fn mode_grep(args: &[String]) -> Result<Vec<u8>> {
+    let configured = gix::discover(".")
+        .ok()
+        .and_then(|repo| {
+            repo.config_snapshot()
+                .string("jump.grepCmd")
+                .map(|v| v.to_string())
+        })
+        .filter(|v| !v.is_empty());
+
+    let mut argv: Vec<std::ffi::OsString> = match &configured {
+        Some(cmd) => cmd.split_whitespace().map(Into::into).collect(),
+        None => {
+            let exe = std::env::current_exe()?;
+            vec![exe.into(), "grep".into(), "-n".into(), "--column".into()]
+        }
+    };
+    // A `jump.grepCmd` of only whitespace word-splits to nothing, which the shell
+    // would then treat as running `"$@"` itself; that is not a command this port
+    // can guess at.
+    let Some((program, leading)) = argv.split_first_mut() else {
+        bail!("jump.grepCmd is set but contains no command word");
+    };
+    let program = program.clone();
+    let leading: Vec<std::ffi::OsString> = leading.to_vec();
+
+    let out = std::process::Command::new(&program)
+        .args(&leading)
+        .args(args)
+        .stderr(std::process::Stdio::inherit())
+        .output()?;
+
+    Ok(squeeze_blanks(&out.stdout))
+}
+
+/// The `perl -pe 's/[ \t]+/ /g; s/^ *//;'` filter `mode_grep` pipes through:
+/// per line, every run of spaces and tabs collapses to one space and any leading
+/// spaces are then dropped. `-p` prints each line whether or not it changed, and
+/// a final line without a newline stays that way.
+fn squeeze_blanks(input: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(input.len());
+    for line in input.split_inclusive(|&b| b == b'\n') {
+        let (body, eol): (&[u8], &[u8]) = match line.strip_suffix(b"\n") {
+            Some(b) => (b, b"\n"),
+            None => (line, b""),
+        };
+        let mut squeezed: Vec<u8> = Vec::with_capacity(body.len());
+        let mut in_blank = false;
+        for &b in body {
+            if b == b' ' || b == b'\t' {
+                if !in_blank {
+                    squeezed.push(b' ');
+                    in_blank = true;
+                }
+            } else {
+                squeezed.push(b);
+                in_blank = false;
+            }
+        }
+        // `s/^ *//` runs after the collapse, so it can only ever strip the one
+        // space the collapse left behind.
+        let start = usize::from(squeezed.first() == Some(&b' '));
+        out.extend_from_slice(&squeezed[start..]);
+        out.extend_from_slice(eol);
+    }
+    out
 }
 
 /// The `ls-files -u` half of `mode_merge`: cwd-relative paths of every entry at

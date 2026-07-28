@@ -18,9 +18,12 @@
 //! `EntryStatus::NeedsUpdate` items inside `Iter::maybe_keep_index_change` so
 //! callers only see real content changes. This module therefore drives the
 //! lower-level `Repository::index_worktree_status()` with a [`StatOnly`] blob
-//! comparator that never claims two blobs are equal. gix's own fast path still
-//! returns "unchanged" before the comparator is consulted whenever the stat data
-//! matches and the entry is not racily clean, so the result is git's rule.
+//! comparator that reports a difference without reading content. gix's own fast
+//! path still returns "unchanged" before the comparator is consulted whenever the
+//! stat data matches and the entry is not racily clean, so the result is git's
+//! rule. The one case where git *does* read content is a racy entry — one whose
+//! mtime is at or after the index timestamp, where the stat comparison cannot be
+//! trusted — and [`StatOnly`] reproduces `ce_modified_check_fs()` there.
 //!
 //! ### Content-driven output rides on top of that list
 //!
@@ -101,6 +104,7 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::Path;
 use std::process::ExitCode;
+use std::sync::atomic;
 use std::sync::atomic::AtomicBool;
 
 use gix::bstr::{BString, ByteSlice};
@@ -733,6 +737,7 @@ pub fn diff_files(args: &[String]) -> Result<ExitCode> {
     };
 
     let repo = gix::discover(".")?;
+    init_quote_path(&repo);
     match parse(&repo, args) {
         Ok(Parsed::Run { opts, paths }) => run(&repo, opts, paths),
         Ok(Parsed::Unsupported(flag)) => {
@@ -827,7 +832,11 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed, Fatal> {
     for a in args {
         let s = a.as_str();
         if let Some(flag) = pending_value.take() {
-            if flag == "--ws-error-highlight" {
+            if flag == "-I" {
+                // `OPT_CALLBACK_F('I', "ignore-matching-lines", …)`: a required value,
+                // so parse-options takes the next argument when none is glued on.
+                record_ignore_lines(&flag, s, &mut opts)?;
+            } else if flag == "--ws-error-highlight" {
                 opts.ws_error_highlight = parse_ws_error_highlight_opt(s)?;
             } else {
                 let Opts { move_word, color_when, .. } = &mut opts;
@@ -835,6 +844,10 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed, Fatal> {
                     res.map_err(Fatal::OptionError)?;
                 }
             }
+            continue;
+        }
+        if s == "-I" || s == "--ignore-matching-lines" {
+            pending_value = Some("-I".to_string());
             continue;
         }
         if s == "--ws-error-highlight" || diff_color::needs_separate_value(s) {
@@ -2154,31 +2167,30 @@ fn prefix_lines(body: &[u8], prefix: &[u8]) -> Vec<u8> {
 // change collection
 // ---------------------------------------------------------------------------
 
-/// A blob comparator that never reports equality.
+/// The blob comparator this module drives gix with: `FastEq`, which reports a change
+/// only when the content really differs.
 ///
-/// gix only consults this once the cheap stat comparison has already failed (or
-/// flagged the entry as racily clean), which is precisely when git declares the
-/// file modified without looking at content. Returning `Some` here is what turns
-/// gix's content-accurate status into git's stat-accurate `diff-files`.
-#[derive(Clone)]
-struct StatOnly;
-
-impl gix::status::plumbing::index_as_worktree::traits::CompareBlobs for StatOnly {
-    type Output = ();
-
-    fn compare_blobs<'a, 'b>(
-        &mut self,
-        _entry: &gix::index::Entry,
-        _worktree_blob_size: u64,
-        _data: impl gix::status::plumbing::index_as_worktree::traits::ReadData<'a>,
-        _buf: &mut Vec<u8>,
-    ) -> Result<Option<Self::Output>, gix::status::plumbing::index_as_worktree::Error> {
-        Ok(Some(()))
-    }
-}
+/// gix consults a comparator in the two cases where the cheap stat check did not settle
+/// the entry, and `ie_match_stat()` treats them differently:
+///
+/// * the stat data genuinely differs (a bare `touch`) — `ce_match_stat_basic()` already
+///   returned non-zero, git never opens the file, and `diff-files`, which does not
+///   refresh the index, reports the path as modified.
+/// * the stat data matches but the entry is *racy* (its mtime is at or after the index
+///   timestamp), so the stat comparison cannot be trusted. git falls through to
+///   `ce_modified_check_fs()`, which hashes the worktree file and reports the path only
+///   when the hash differs.
+///
+/// gix calls the comparator identically in both, so the split is made afterwards: a
+/// content-equal entry comes back as `EntryStatus::NeedsUpdate(new_stat)`, and
+/// [`Collector::visit_entry`] re-runs the stat comparison on that payload to tell the
+/// racily-clean entry (drop it) from the merely touched one (report `M`).
+type StatOnly = gix::status::plumbing::index_as_worktree::traits::FastEq;
 
 /// Accumulates one or two [`Delta`]s per visited index entry.
 struct Collector<'a> {
+    /// `core.trustCTime`/`core.checkStat`, for re-testing a `NeedsUpdate` payload.
+    stat_opts: gix::index::entry::stat::Options,
     workdir: &'a Path,
     executable_bit: bool,
     null: ObjectId,
@@ -2299,9 +2311,33 @@ impl<'index> gix::status::plumbing::index_as_worktree_with_renames::VisitEntry<'
                     unmerged: false,
                 }
             }
-            // Unreachable with [`StatOnly`]: gix only emits this when content
-            // comparison proved the entry clean, which that comparator never does.
-            EntryStatus::NeedsUpdate(_) => return,
+            // gix emits this when the content comparison proved the entry clean even
+            // though the cheap check did not settle it, which covers two of git's
+            // cases at once. `ie_match_stat()` separates them by *why* it had to look:
+            //
+            // * the stat data matched and the entry was merely racy — git's
+            //   `ce_modified_check_fs()` ran, found the content equal, and reported
+            //   nothing. Dropping the entry is right.
+            // * the stat data really differs (a bare `touch`) — `ce_match_stat_basic()`
+            //   already returned non-zero, git never opened the file, and `diff-files`,
+            //   which does not refresh the index, reports `M` with a null worktree id.
+            //
+            // The new stat is in hand here, so the same comparison decides it.
+            EntryStatus::NeedsUpdate(new_stat) => {
+                if new_stat.matches(&entry.stat, self.stat_opts) {
+                    return;
+                }
+                Delta {
+                    src_mode,
+                    dst_mode: src_mode,
+                    src_id: entry.id,
+                    dst_id: self.null,
+                    status: b'M',
+                    path: path.clone(),
+                    disk: path,
+                    unmerged: false,
+                }
+            }
             EntryStatus::IntentToAdd => Delta {
                 src_mode: 0,
                 dst_mode: src_mode,
@@ -2397,6 +2433,7 @@ fn collect(
     )?;
 
     let mut collector = Collector {
+        stat_opts: repo.stat_options()?,
         workdir: workdir.as_path(),
         executable_bit: caps.executable_bit,
         null: ObjectId::null(repo.object_hash()),
@@ -2412,7 +2449,7 @@ fn collect(
         &index,
         patterns,
         &mut collector,
-        StatOnly,
+        gix::status::plumbing::index_as_worktree::traits::FastEq,
         submodule,
         &mut progress,
         &should_interrupt,
@@ -4584,8 +4621,30 @@ fn combined_raw_hex(repo: &gix::Repository, id: &ObjectId, opts: &Opts) -> Strin
 // path quoting (quote.c)
 // ---------------------------------------------------------------------------
 
+/// git's `quote_path_fully` global, seeded from `core.quotePath` (default true) by
+/// [`init_quote_path`]. git keeps this in one place and every `quote_c_style()` caller
+/// reads it, so the four raw/name emitters that share this module's quoting share the
+/// setting too.
+static QUOTE_PATH_FULLY: AtomicBool = AtomicBool::new(true);
+
+/// Seed [`QUOTE_PATH_FULLY`] from `core.quotePath`, git's `git_default_core_config()`.
+/// Call once, right after the repository is open and before anything is rendered.
+pub(crate) fn init_quote_path(repo: &gix::Repository) {
+    let on = repo
+        .config_snapshot()
+        .boolean("core.quotePath")
+        .unwrap_or(true);
+    QUOTE_PATH_FULLY.store(on, atomic::Ordering::Relaxed);
+}
+
 /// The escape character for `b`, or `None` if it can be emitted verbatim.
 /// `Some(0)` means "octal-escape this byte".
+///
+/// This is git's `cq_lookup[]` table combined with `cq_must_quote()`: entries the table
+/// marks `-1` are never quoted, the named escapes and `"`/`\` are always quoted (their
+/// table entries are `>= ' '`, so `quote_path_fully` cannot switch them off), controls
+/// and DEL are always octal-escaped, and the high half (table entry `0`) is octal-escaped
+/// only while `quote_path_fully` is on.
 fn cq_escape(b: u8) -> Option<u8> {
     match b {
         0x07 => Some(b'a'),
@@ -4597,8 +4656,12 @@ fn cq_escape(b: u8) -> Option<u8> {
         0x0d => Some(b'r'),
         b'"' => Some(b'"'),
         b'\\' => Some(b'\\'),
-        // Controls, DEL and (with the default `core.quotePath`) every high byte.
-        0x00..=0x1f | 0x7f..=0xff => Some(0),
+        // Table entry 1: quoted whatever `core.quotePath` says.
+        0x00..=0x1f | 0x7f => Some(0),
+        // Table entry 0: quoted only while `quote_path_fully` is on.
+        0x80..=0xff => QUOTE_PATH_FULLY
+            .load(atomic::Ordering::Relaxed)
+            .then_some(0),
         _ => None,
     }
 }
@@ -4627,8 +4690,12 @@ fn cq_body(s: &[u8], out: &mut Vec<u8>) {
 }
 
 /// `write_name_quoted()`: the path, double-quoted and escaped only if needed.
-fn quoted_name(path: &BString) -> Vec<u8> {
-    let s = path.as_slice();
+pub(crate) fn quoted_name(path: &BString) -> Vec<u8> {
+    quoted_name_bytes(path.as_slice())
+}
+
+/// [`quoted_name`] over a plain byte slice, for the callers that never hold a `BString`.
+pub(crate) fn quoted_name_bytes(s: &[u8]) -> Vec<u8> {
     if !needs_quote(s) {
         return s.to_vec();
     }
@@ -4639,7 +4706,7 @@ fn quoted_name(path: &BString) -> Vec<u8> {
 }
 
 /// `quote_two_c_style()` for a single prefixed name (the `---`/`+++` lines).
-fn quote_one(prefix: &str, path: &BString) -> Vec<u8> {
+pub(crate) fn quote_one(prefix: &str, path: &BString) -> Vec<u8> {
     let s = path.as_slice();
     if !needs_quote(prefix.as_bytes()) && !needs_quote(s) {
         let mut out = prefix.as_bytes().to_vec();
@@ -4654,7 +4721,7 @@ fn quote_one(prefix: &str, path: &BString) -> Vec<u8> {
 }
 
 /// The `diff --git <a> <b>` name pair.
-fn quote_two(pa: &str, a: &BString, pb: &str, b: &BString) -> Vec<u8> {
+pub(crate) fn quote_two(pa: &str, a: &BString, pb: &str, b: &BString) -> Vec<u8> {
     let mut out = quote_one(pa, a);
     out.push(b' ');
     out.extend_from_slice(&quote_one(pb, b));

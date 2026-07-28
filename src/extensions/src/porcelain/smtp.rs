@@ -164,6 +164,17 @@ impl Ssl {
     /// `ssl_verify_params()` — the `IO::Socket::SSL` options, as the rustls
     /// client configuration they translate into.
     pub(crate) fn client_config(&self) -> Result<Arc<ClientConfig>, String> {
+        // git validates the client cert/key pair in `ssl_verify_params()` before
+        // it hands anything to the TLS layer, so a key without its certificate is
+        // reported as such even on a host whose trust store cannot be read. Doing
+        // it after the root-store build would mask this fatal behind whatever
+        // `load_native_certs()` happened to fail with.
+        if self.client_cert.is_none() {
+            if let Some(key) = &self.client_key {
+                return Err(format!("Only client key \"{key}\" specified\n"));
+            }
+        }
+
         let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
         let builder = ClientConfig::builder_with_provider(provider.clone())
             .with_safe_default_protocol_versions()

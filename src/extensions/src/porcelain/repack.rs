@@ -84,6 +84,13 @@
 //!     traversal, which the index objects are then unioned back into — the model
 //!     git's own output confirms (on the `branched` fixture, `blob:none` yields
 //!     11 of 13 objects: 13 less 4 blobs, plus the 2 blobs the index holds).
+//!     That second pack holds only what an *existing pack* held:
+//!     `write_filtered_pack()` runs `pack-objects --stdin-packs` over the
+//!     non-kept and cruft packs, so a filtered-out object that was only ever
+//!     loose is not in it and simply stays loose — `prune-packed` removes a
+//!     loose object only when a pack holds it. A run whose spec rejects nothing
+//!     that was packed therefore leaves an *empty* second pack beside the loose
+//!     objects, which is what stock git leaves.
 //! ```
 //!
 //! # Deliberate gaps, so this doc claims no more than the code does
@@ -414,6 +421,18 @@ fn execute(st: &State) -> Result<ExitCode> {
     let (mut to_pack, mut filtered_out): (Vec<ObjectId>, Vec<ObjectId>) = candidates
         .into_iter()
         .partition(|id| indexed.contains(id) || keeps_object(st, id, &repo));
+    // `write_filtered_pack()` (`repack-filtered.c`) drives that second pack with
+    // `pack-objects --stdin-packs`, fed the existing non-kept and cruft packs
+    // with the just-written pack excluded by `^`. `--stdin-packs` enumerates
+    // objects *out of packs*, so a filtered-out object that was only ever loose
+    // is not in it: `prune-packed` leaves a loose object no pack holds alone, so
+    // it simply stays loose. Keeping it here instead would move it into a pack
+    // git never writes.
+    let packed: HashSet<ObjectId> = existing
+        .iter()
+        .filter(|f| droppable(st, f.path()))
+        .flat_map(|f| f.iter().map(|e| e.oid))
+        .collect();
     // The pack's entry order is ours to choose; sorting makes a run reproducible.
     to_pack.sort();
     filtered_out.sort();
@@ -429,6 +448,7 @@ fn execute(st: &State) -> Result<ExitCode> {
         }
         return Ok(ExitCode::SUCCESS);
     }
+    filtered_out.retain(|id| packed.contains(id));
 
     // Which packs `-d` may drop: everything that existed before this run, minus
     // any protected by a `.keep` or named by `--keep-pack`. Captured before the

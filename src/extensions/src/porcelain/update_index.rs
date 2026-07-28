@@ -222,6 +222,14 @@ pub fn update_index(args: &[String]) -> Result<ExitCode> {
         Outcome::Exit(code) => Ok(ExitCode::from(code)),
         Outcome::Done => {
             if ctx.dirty || ctx.force_write {
+                // `do_write_index()` refuses to serialise an entry whose object id
+                // is null, so the write fails and `cmd_update_index` dies. Without
+                // this, `--cacheinfo <mode>,<null oid>,<path>` writes an index
+                // stock git then refuses to read.
+                if reject_null_oids(&ctx.index) {
+                    eprintln!("fatal: Unable to write new index file");
+                    return Ok(ExitCode::from(128));
+                }
                 if ctx.tree_stale {
                     ctx.index.remove_tree();
                 }
@@ -237,6 +245,33 @@ pub fn update_index(args: &[String]) -> Result<ExitCode> {
             })
         }
     }
+}
+
+/// git's null-object-id guard in `do_write_index()` (read-cache.c): an entry
+/// whose id is all zeroes cannot be serialised, so the write is abandoned and
+/// the caller dies.
+///
+/// Reports every offending path — git's loop calls `error()` once per entry —
+/// and returns whether the write must be abandoned. `GIT_ALLOW_NULL_SHA1`
+/// downgrades the refusal to a warning, exactly as git's `git_env_bool` gate
+/// does, which is how git's own test suite builds such an index on purpose.
+fn reject_null_oids(index: &gix::index::File) -> bool {
+    let null = ObjectId::null(index.object_hash());
+    let allow = std::env::var("GIT_ALLOW_NULL_SHA1")
+        .ok()
+        .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"));
+    let backing = index.path_backing();
+    let mut rejected = false;
+    for e in index.entries().iter().filter(|e| e.id == null) {
+        let path = e.path_in(backing);
+        if allow {
+            eprintln!("warning: cache entry has null sha1: {path}");
+        } else {
+            eprintln!("error: cache entry has null sha1: {path}");
+            rejected = true;
+        }
+    }
+    rejected
 }
 
 enum Outcome {

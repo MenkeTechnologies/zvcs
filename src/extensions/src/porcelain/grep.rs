@@ -31,10 +31,20 @@
 //!
 //! Context lines are covered: `-A`/`-B`/`-C` (and `--after-context`/
 //! `--before-context`/`--context`/`-<num>`) render the surrounding lines with
-//! git's `-` context prefix and `--` hunk separators. `--recurse-submodules` is
-//! accepted as a no-op — a repo without populated submodules greps identically,
-//! and the index walk already skips the gitlink entries git would recurse into —
-//! except that `--untracked` alongside it is the fatal git makes of it.
+//! git's `-` context prefix and `--` hunk separators.
+//!
+//! `--recurse-submodules` descends, as `grep_submodule()` does. Every gitlink
+//! reached by the index walk or by a `<tree>` walk is opened (when
+//! `is_submodule_active()` says so), and its files are searched and printed under
+//! their superproject-relative names, in the same path order and behind the same
+//! `<rev>:` prefix as the superproject's own. A submodule blob is read from that
+//! submodule's object database; a checked-out submodule file is read straight
+//! out of the superproject work directory, where it already lives. The
+//! superproject's pathspec applies to the full names, including git's
+//! `DO_MATCH_LEADING_PATHSPEC` rule for choosing which submodules to enter (see
+//! [`leads_into`]) — which is why `-- sub/mod.txt` finds a hit against the index
+//! but not against a tree, exactly as in stock. `--untracked` alongside it is the
+//! fatal git makes of it.
 //!
 //! Full regex is supported via the `regex` crate (byte-oriented): `-F` literals,
 //! `-E`/ERE and `-P`/Perl pass through, and `-G`/BRE is translated by swapping
@@ -75,7 +85,8 @@
 //! looks at them). When nothing matched there is nothing for them to shape, so the
 //! empty output and exit code 1 are git's answer exactly.
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
+use std::collections::BTreeMap;
 use std::io::{IsTerminal, Write};
 use std::process::ExitCode;
 
@@ -134,6 +145,13 @@ struct Opts {
 enum Source {
     Work(BString),
     Blob(gix::hash::ObjectId),
+    /// A blob living in a submodule's object database rather than the
+    /// superproject's, named by that submodule's slot in the `subrepos` table
+    /// [`collect_submodule`] fills. `--cached` and a `<tree>` search under
+    /// `--recurse-submodules` both land here; the worktree walk does not,
+    /// because a populated submodule's files sit under the superproject's work
+    /// directory and [`Source::Work`] already resolves them.
+    SubBlob(usize, gix::hash::ObjectId),
 }
 
 /// git's reset sequence, emitted after every colored field.
@@ -814,9 +832,9 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
 
     // git zeroes `--recurse-submodules` under `--no-index` (there is no index to
     // find gitlinks in), then rejects the surviving flag alongside `--untracked`.
-    // This port does not descend into populated submodules, but a repo without
-    // them greps identically either way, so the flag is otherwise accepted as a
-    // no-op — the index walk already skips the gitlink entries git would recurse.
+    // When it survives, every gitlink the index or tree walk reaches is handed to
+    // `grep_submodule()`, which opens the submodule and greps it with the same
+    // options and pathspec — see [`collect_submodule`].
     let recurse_submodules = deferred.set_changing.is_some() && !opts.no_index;
     if recurse_submodules && opts.untracked {
         eprintln!("fatal: --untracked not supported with --recurse-submodules");
@@ -1004,6 +1022,14 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
     // funcname-driver resolution), and where its bytes come from.
     let mut cands: Vec<(Vec<u8>, BString, Source)> = Vec::new();
 
+    // The submodules `--recurse-submodules` descends into, opened once and shared
+    // by both walks. A candidate that came out of one of them records its slot
+    // here so its bytes are read from that repository's object database rather
+    // than the superproject's.
+    let mut subrepos: Vec<gix::Repository> = Vec::new();
+    // Superproject-relative path of a submodule file → its slot in `subrepos`.
+    let mut sub_of: BTreeMap<BString, usize> = BTreeMap::new();
+
     if revs.is_empty() {
         let mut files: Vec<(BString, Option<gix::hash::ObjectId>)> = Vec::new();
         if opts.no_index {
@@ -1018,10 +1044,43 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
                 &index,
                 gix::worktree::stack::state::attributes::Source::IdMapping,
             )?;
+            // `grep_cache()` hands every gitlink it walks past to
+            // `grep_submodule()`. The filtered iterator below cannot serve this:
+            // it tests `sub` as a file, so a pathspec of `sub/mod.txt` drops the
+            // gitlink before we ever see it, while git matches it as a directory
+            // and descends. So the gitlinks are taken from the raw index and
+            // gated on `is_included(.., Some(true))` instead. This runs ahead of
+            // the main walk only because that walk keeps `ps` borrowed for its
+            // whole iteration; the merge below restores git's path order.
+            if recurse_submodules {
+                let subs = open_submodules(&repo);
+                for entry in index.entries() {
+                    if entry.mode != gix::index::entry::Mode::COMMIT {
+                        continue;
+                    }
+                    let path = entry.path(&index);
+                    if !ps.is_included(path, Some(true)) && !leads_into(&specs, path) {
+                        continue;
+                    }
+                    let Some(sub) = subs.get(path.as_bstr()) else {
+                        continue;
+                    };
+                    collect_submodule_cache(
+                        sub,
+                        path,
+                        &mut ps,
+                        &mut subrepos,
+                        &mut files,
+                        &mut sub_of,
+                    )?;
+                }
+            }
+
             if let Some(iter) = ps.index_entries_with_paths(&index) {
                 for (path, entry) in iter {
-                    // git's `grep_cache()` only visits regular files: symlinks and
-                    // gitlinks are skipped, and higher conflict stages are collapsed.
+                    // git's `grep_cache()` only visits regular files: symlinks are
+                    // skipped, gitlinks were handed to `grep_submodule()` above,
+                    // and higher conflict stages are collapsed.
                     if entry.mode != gix::index::entry::Mode::FILE
                         && entry.mode != gix::index::entry::Mode::FILE_EXECUTABLE
                     {
@@ -1033,6 +1092,7 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
                     files.push((path.to_owned(), Some(entry.id)));
                 }
             }
+
             if opts.untracked {
                 collect_untracked(&repo, &index, &specs, &opts, &mut files)?;
             }
@@ -1040,7 +1100,10 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
 
         // The index walk is already ordered, but both directory walks emit in
         // traversal order; git prints paths sorted by their bytes either way.
-        if opts.no_index || opts.untracked {
+        // Submodule files are appended after the superproject's, so they need the
+        // same sort to land where `grep_cache()` emits them (index order is byte
+        // order, so this leaves a submodule-free run untouched).
+        if opts.no_index || opts.untracked || !sub_of.is_empty() {
             files.sort_by(|a, b| a.0.cmp(&b.0));
             files.dedup_by(|a, b| a.0 == b.0);
         }
@@ -1049,11 +1112,14 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
         for (path, id) in files {
             let name = display_name(path.as_bstr(), prefix, &opts);
             // `--cached` reads the index blob; otherwise the worktree file. A
-            // cached entry with no id cannot be read, so git skips it.
+            // cached entry with no id cannot be read, so git skips it. A populated
+            // submodule's files sit under the superproject work directory, so only
+            // the cached read needs to be redirected to the submodule's own odb.
             let src = if opts.cached {
-                match id {
-                    Some(id) => Source::Blob(id),
-                    None => continue,
+                match (id, sub_of.get(&path)) {
+                    (Some(id), Some(&slot)) => Source::SubBlob(slot, id),
+                    (Some(id), None) => Source::Blob(id),
+                    (None, _) => continue,
                 }
             } else {
                 Source::Work(path.clone())
@@ -1069,7 +1135,17 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
             eprintln!("fatal: both --cached and trees are given");
             return Ok(ExitCode::from(128));
         }
-        collect_trees(&repo, &revs, &specs, prefix, &opts, &index, &mut cands)?;
+        collect_trees(
+            &repo,
+            &revs,
+            &specs,
+            prefix,
+            &opts,
+            &index,
+            recurse_submodules,
+            &mut subrepos,
+            &mut cands,
+        )?;
     }
 
     // Whether a file clears the `--all-match` gate. Without the boolean grammar,
@@ -1101,7 +1177,7 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
         // Pre-scan on raw content (no textconv side effects) so the refusal fires
         // before any output is written, keeping stdout all-or-nothing.
         for (_, rela, src) in &cands {
-            let Some(content) = load_content(&repo, None, false, rela.as_bstr(), src)? else {
+            let Some(content) = load_content(&repo, &subrepos, None, false, rela.as_bstr(), src)? else {
                 continue;
             };
             if !passes_gate(&content) {
@@ -1129,7 +1205,7 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
         let mut hunk_mark = false;
         for (name, rela, src) in &cands {
             let Some(content) =
-                load_content(&repo, diff_attrs.as_mut(), textconv_active, rela.as_bstr(), src)?
+                load_content(&repo, &subrepos, diff_attrs.as_mut(), textconv_active, rela.as_bstr(), src)?
             else {
                 continue;
             };
@@ -1191,7 +1267,7 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
         let mut printed_any = false;
         for (name, rela, src) in &cands {
             let Some(content) =
-                load_content(&repo, diff_attrs.as_mut(), textconv_active, rela.as_bstr(), src)?
+                load_content(&repo, &subrepos, diff_attrs.as_mut(), textconv_active, rela.as_bstr(), src)?
             else {
                 continue;
             };
@@ -1236,7 +1312,7 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
     let mut emitted_any = false;
     for (name, rela, src) in &cands {
         let Some(content) =
-            load_content(&repo, diff_attrs.as_mut(), textconv_active, rela.as_bstr(), src)?
+            load_content(&repo, &subrepos, diff_attrs.as_mut(), textconv_active, rela.as_bstr(), src)?
         else {
             continue;
         };
@@ -1443,8 +1519,15 @@ fn collect_trees(
     prefix: Option<&[u8]>,
     opts: &Opts,
     index: &gix::index::File,
+    recurse_submodules: bool,
+    subrepos: &mut Vec<gix::Repository>,
     cands: &mut Vec<(Vec<u8>, BString, Source)>,
 ) -> Result<()> {
+    let subs = if recurse_submodules {
+        open_submodules(repo)
+    } else {
+        BTreeMap::new()
+    };
     for rev in revs {
         let tree = repo.rev_parse_single(rev.as_str())?.object()?.peel_to_tree()?;
         let mut entries = tree.traverse().breadthfirst.files()?;
@@ -1459,9 +1542,37 @@ fn collect_trees(
             gix::worktree::stack::state::attributes::Source::IdMapping,
         )?;
         let rev_prefix = format!("{rev}:").into_bytes();
+        // Files contributed by a submodule, appended after the superproject's
+        // and merged back into path order below — the same shape the index walk
+        // uses, and for the same reason.
+        let mut sub_cands: Vec<(Vec<u8>, BString, Source)> = Vec::new();
         for entry in entries {
-            // git's `grep_tree()` greps regular blobs only: trees, symlinks and
-            // gitlinks are skipped, matching the worktree/index walk.
+            if entry.mode.is_commit() {
+                // `grep_tree()` hands a gitlink to `grep_submodule()`, which
+                // greps the submodule commit the superproject recorded. Note the
+                // pathspec is tested as a file here, not a directory as in the
+                // index walk: that is why `HEAD -- sub/mod.txt` finds nothing
+                // while the worktree form of the same pathspec does.
+                if !recurse_submodules || !ps.is_included(entry.filepath.as_bstr(), Some(false)) {
+                    continue;
+                }
+                if let Some(sub) = subs.get(&entry.filepath) {
+                    collect_submodule_tree(
+                        sub,
+                        entry.filepath.as_bstr(),
+                        entry.oid,
+                        &mut ps,
+                        prefix,
+                        opts,
+                        &rev_prefix,
+                        subrepos,
+                        &mut sub_cands,
+                    )?;
+                }
+                continue;
+            }
+            // git's `grep_tree()` greps regular blobs only: trees and symlinks
+            // are skipped, matching the worktree/index walk.
             if !entry.mode.is_blob() {
                 continue;
             }
@@ -1472,8 +1583,166 @@ fn collect_trees(
             name.extend_from_slice(&display_name(entry.filepath.as_bstr(), prefix, opts));
             cands.push((name, entry.filepath.clone(), Source::Blob(entry.oid)));
         }
+        if !sub_cands.is_empty() {
+            cands.append(&mut sub_cands);
+            cands.sort_by(|a, b| a.1.cmp(&b.1));
+        }
     }
     Ok(())
+}
+
+/// git's `is_submodule_active()` filter over `repo`'s submodules, each opened,
+/// keyed by its superproject-relative path. An inactive, missing or unreadable
+/// submodule is left out, which is what `grep_submodule()` does when
+/// `repo_submodule_init()` fails: it returns without searching and without
+/// complaining.
+fn open_submodules(repo: &gix::Repository) -> BTreeMap<BString, gix::Repository> {
+    let mut out = BTreeMap::new();
+    let Ok(Some(subs)) = repo.submodules() else {
+        return out;
+    };
+    for sm in subs {
+        if !sm.is_active().unwrap_or(false) {
+            continue;
+        }
+        let Ok(path) = sm.path() else { continue };
+        if let Ok(Some(sub)) = sm.open() {
+            out.insert(path, sub);
+        }
+    }
+    out
+}
+
+/// `grep_submodule()` reaching `grep_cache()`: append the submodule's index
+/// entries to the superproject's file list under their superproject-relative
+/// names, recording which repository their blobs live in.
+///
+/// The superproject's pathspec is applied to those full names, which is what git
+/// does — `grep_cache()` matches against the name it has accumulated, so
+/// `-- sub/nomatch` descends into `sub` and then matches nothing.
+fn collect_submodule_cache(
+    sub: &gix::Repository,
+    sub_path: &BStr,
+    ps: &mut gix::Pathspec<'_>,
+    subrepos: &mut Vec<gix::Repository>,
+    files: &mut Vec<(BString, Option<gix::hash::ObjectId>)>,
+    sub_of: &mut BTreeMap<BString, usize>,
+) -> Result<()> {
+    let Ok(sub_index) = sub.open_index() else {
+        return Ok(());
+    };
+    let slot = subrepos.len();
+    let mut used = false;
+    for entry in sub_index.entries() {
+        if entry.mode != gix::index::entry::Mode::FILE
+            && entry.mode != gix::index::entry::Mode::FILE_EXECUTABLE
+        {
+            continue;
+        }
+        let full = join_sub_path(sub_path, entry.path(&sub_index));
+        if !ps.is_included(full.as_bstr(), Some(false)) {
+            continue;
+        }
+        sub_of.insert(full.clone(), slot);
+        files.push((full, Some(entry.id)));
+        used = true;
+    }
+    if used {
+        subrepos.push(sub.clone());
+    }
+    Ok(())
+}
+
+/// `grep_submodule()` reaching `grep_tree()`: append the blobs of the submodule
+/// commit `oid` the superproject's tree records, named and prefixed exactly as
+/// the superproject's own blobs are.
+#[allow(clippy::too_many_arguments)] // one bundle per caller would only move them.
+fn collect_submodule_tree(
+    sub: &gix::Repository,
+    sub_path: &BStr,
+    oid: gix::hash::ObjectId,
+    ps: &mut gix::Pathspec<'_>,
+    prefix: Option<&[u8]>,
+    opts: &Opts,
+    rev_prefix: &[u8],
+    subrepos: &mut Vec<gix::Repository>,
+    cands: &mut Vec<(Vec<u8>, BString, Source)>,
+) -> Result<()> {
+    // The recorded commit may simply not be present in the submodule's odb (a
+    // shallow or stale checkout); git's `repo_submodule_init()` path likewise
+    // gives up silently rather than failing the whole search.
+    let Ok(tree) = sub.find_object(oid).map_err(anyhow::Error::from).and_then(|o| o.peel_to_tree().map_err(anyhow::Error::from))
+    else {
+        return Ok(());
+    };
+    let Ok(mut entries) = tree.traverse().breadthfirst.files() else {
+        return Ok(());
+    };
+    entries.sort_by(|a, b| a.filepath.cmp(&b.filepath));
+    let slot = subrepos.len();
+    let mut used = false;
+    for entry in entries {
+        if !entry.mode.is_blob() {
+            continue;
+        }
+        let full = join_sub_path(sub_path, entry.filepath.as_bstr());
+        if !ps.is_included(full.as_bstr(), Some(false)) {
+            continue;
+        }
+        let mut name = rev_prefix.to_vec();
+        name.extend_from_slice(&display_name(full.as_bstr(), prefix, opts));
+        cands.push((name, full, Source::SubBlob(slot, entry.oid)));
+        used = true;
+    }
+    if used {
+        subrepos.push(sub.clone());
+    }
+    Ok(())
+}
+
+/// `DO_MATCH_LEADING_PATHSPEC`, which `submodule_path_match()` (dir.c) adds to
+/// the gitlink test in `grep_cache()` and gix's `is_included` does not implement:
+/// a pathspec that reaches *inside* a submodule still selects the submodule to
+/// descend into, so `-- sub/mod.txt` greps `sub` even though the gitlink entry
+/// itself is not what the pattern names.
+///
+/// Only the literal head of each pattern is compared — everything from the first
+/// glob metacharacter on is what `is_included` already decided about — and an
+/// exclusion (`:!`/`:^`) never selects anything, matching
+/// `do_match_pathspec()`'s two passes.
+fn leads_into(specs: &[BString], sub_path: &BStr) -> bool {
+    let mut prefix = sub_path.to_vec();
+    prefix.push(b'/');
+    specs.iter().any(|spec| {
+        let s = spec.as_slice();
+        let s = match s.strip_prefix(b":") {
+            // `:(magic,...)long form` and the `:!`/`:^` short forms.
+            Some(rest) if rest.starts_with(b"(") => match rest.iter().position(|&b| b == b')') {
+                Some(end) => {
+                    if rest[..end].windows(7).any(|w| w == b"exclude") {
+                        return false;
+                    }
+                    &rest[end + 1..]
+                }
+                None => return false,
+            },
+            Some(rest) if rest.starts_with(b"!") || rest.starts_with(b"^") => return false,
+            _ => s,
+        };
+        let literal = s
+            .iter()
+            .position(|&b| matches!(b, b'*' | b'?' | b'['))
+            .map_or(s, |i| &s[..i]);
+        literal.starts_with(&prefix)
+    })
+}
+
+/// `<submodule path>/<path inside it>`, the name git prints for a submodule hit.
+fn join_sub_path(sub_path: &BStr, inner: &BStr) -> BString {
+    let mut full = BString::from(sub_path.to_vec());
+    full.push(b'/');
+    full.extend_from_slice(inner);
+    full
 }
 
 /// git's mutual-exclusion diagnosis for the three source selectors, including
@@ -2119,6 +2388,7 @@ static TEXTCONV_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 /// converter for the path) the raw content is returned unchanged.
 fn load_content(
     repo: &gix::Repository,
+    subrepos: &[gix::Repository],
     diff_attrs: Option<&mut DiffAttrs>,
     textconv_active: bool,
     rela: &BStr,
@@ -2136,6 +2406,12 @@ fn load_content(
             }
         }
         Source::Blob(id) => repo.find_object(*id)?.data.clone(),
+        Source::SubBlob(slot, id) => subrepos
+            .get(*slot)
+            .context("submodule repository slot out of range")?
+            .find_object(*id)?
+            .data
+            .clone(),
     };
     if textconv_active {
         if let Some(da) = diff_attrs {

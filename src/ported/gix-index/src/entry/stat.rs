@@ -56,11 +56,15 @@ impl Stat {
             return false;
         }
 
-        if trust_ctime {
+        // `match_stat_data()` gates *both* ctime comparisons on `check_stat`, not only
+        // the nanosecond one: `core.checkStat=minimal` drops ctime from the comparison
+        // entirely, which is what makes a file whose content and mtime survived a copy
+        // read as unmodified.
+        if trust_ctime && check_stat {
             if self.ctime.secs != other.ctime.secs {
                 return false;
             }
-            if check_stat && use_nsec && self.ctime.nsecs != other.ctime.nsecs {
+            if use_nsec && self.ctime.nsecs != other.ctime.nsecs {
                 return false;
             }
         }

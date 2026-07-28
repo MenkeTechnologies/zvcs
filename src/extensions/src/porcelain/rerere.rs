@@ -108,7 +108,10 @@ impl RrDirs {
 ///     conflicted path, record a postimage for every path the user has since
 ///     resolved, and replay any conflict whose resolution is already known.
 ///   * `git rerere forget <pathspec>` → drop the recorded resolution for a path
-///     and re-record its preimage from the index stages.
+///     and re-record its preimage from the index stages. A path with nothing
+///     recorded prints `error: no remembered resolution for '<path>'` and still
+///     exits 0: `rerere_forget()` discards each path's result and returns only
+///     `write_rr()`'s (rerere.c:1152, :1155).
 ///
 /// Options: `--rerere-autoupdate` / `--no-rerere-autoupdate` override
 /// `rerere.autoupdate` for this run, `-h` prints the usage block to stdout with
@@ -374,18 +377,21 @@ fn cmd_forget(repo: &gix::Repository, paths: &[&str]) -> Result<ExitCode> {
 
     // `rerere_forget()` walks its own `find_conflict()` list and keeps only the
     // paths the pathspec matches; `git rerere forget` takes literal paths here.
-    let mut status = ExitCode::SUCCESS;
+    //
+    // `rerere_forget_one_path()`'s return value is discarded (rerere.c:1152): a
+    // path with no remembered resolution prints `error: no remembered resolution
+    // for '<path>'` and the command still exits 0. Only `write_rr()` decides the
+    // status (rerere.c:1155), so a per-path failure must not reach the caller —
+    // the diagnostic has already been printed by `forget_one_path`.
     for path in find_conflict(&index) {
         if !paths.is_empty() && !paths.iter().any(|p| p.as_bytes() == path.as_slice()) {
             continue;
         }
-        if forget_one_path(repo, &index, &path, &mut rr, &mut dirs).is_err() {
-            status = ExitCode::FAILURE;
-        }
+        let _ = forget_one_path(repo, &index, &path, &mut rr, &mut dirs);
     }
 
     write_rr(repo, &rr)?;
-    Ok(status)
+    Ok(ExitCode::SUCCESS)
 }
 
 /// `rerere_forget_one_path()`: recreate the conflict from the index stages,

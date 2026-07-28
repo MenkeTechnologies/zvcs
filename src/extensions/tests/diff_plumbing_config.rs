@@ -80,6 +80,32 @@ fn run(repo: &Path, home: &Path, args: &[&str]) -> Output {
         .unwrap()
 }
 
+/// The stock `git` to compare against, resolved EXPLICITLY (`ZVCS_STOCK_GIT`, else
+/// a known system path) rather than through `PATH`: on a machine where zvcs shadows
+/// git — the machine this is developed on — `PATH` resolution silently makes the
+/// oracle the thing under test, and the comparison proves nothing. `None` when no
+/// stock git exists, in which case callers skip the oracle half.
+fn stock_git() -> Option<String> {
+    if let Ok(p) = std::env::var("ZVCS_STOCK_GIT") {
+        return std::path::Path::new(&p).exists().then_some(p);
+    }
+    ["/usr/bin/git", "/opt/homebrew/bin/git", "/usr/local/bin/git"]
+        .into_iter()
+        .find(|p| std::path::Path::new(p).exists())
+        .map(str::to_owned)
+}
+
+/// Run the same argv under stock git, in the same repo and environment as [`run`].
+fn stock(bin: &str, repo: &Path, home: &Path, args: &[&str]) -> Output {
+    Command::new(bin)
+        .args(args)
+        .current_dir(repo)
+        .env("HOME", home)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap()
+}
+
 fn stdout_of(o: &Output) -> Vec<u8> {
     assert!(
         o.status.success(),
@@ -182,23 +208,40 @@ fn diff_tree_numstat_stable_across_algorithm_config() {
     let _ = std::fs::remove_dir_all(repo.parent().unwrap());
 }
 
-/// `diff-tree -p` is refused (no patch rendering), and setting the patch-only keys
-/// does not change that — no config path can smuggle out a partial/wrong patch.
+/// `diff-tree -p` renders the unified patch byte-for-byte as stock git does, with
+/// and without the patch-only config keys set.
+///
+/// This test previously asserted the opposite — that `diff-tree -p` *refused* —
+/// which pinned the gap rather than the behaviour. `diff-tree` now routes through
+/// the same renderer `diff-pairs` uses, so the assertion is parity with stock.
 #[test]
-fn diff_tree_patch_refused_with_and_without_config() {
+fn diff_tree_patch_matches_stock_with_and_without_config() {
     let (repo, home) = fixture("treep");
     for setup in [false, true] {
         if setup {
             set_all_keys(&repo);
         }
-        let o = run(&repo, &home, &["diff-tree", "-p", "HEAD~", "HEAD"]);
+        let args = ["diff-tree", "-p", "HEAD~", "HEAD"];
+        let ours = run(&repo, &home, &args);
         assert!(
-            !o.status.success() && o.stdout.is_empty(),
-            "diff-tree -p must refuse with no stdout (config set={setup}); \
-             rc={:?} stdout={:?}",
-            o.status.code(),
-            String::from_utf8_lossy(&o.stdout),
+            ours.status.success() && !ours.stdout.is_empty(),
+            "diff-tree -p must render a patch (config set={setup}); rc={:?} stderr={}",
+            ours.status.code(),
+            String::from_utf8_lossy(&ours.stderr),
         );
+        if let Some(bin) = stock_git() {
+            let theirs = stock(&bin, &repo, &home, &args);
+            assert_eq!(
+                ours.status.code(),
+                theirs.status.code(),
+                "diff-tree -p exit code must match stock (config set={setup})"
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&ours.stdout),
+                String::from_utf8_lossy(&theirs.stdout),
+                "diff-tree -p must be byte-identical to stock (config set={setup})"
+            );
+        }
     }
     let _ = std::fs::remove_dir_all(repo.parent().unwrap());
 }

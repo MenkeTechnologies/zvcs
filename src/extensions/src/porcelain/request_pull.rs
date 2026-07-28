@@ -60,7 +60,6 @@ use gix::diff::blob::unified_diff::{ConsumeHunk, ContextSize, DiffLineKind, Hunk
 use gix::diff::blob::{diff_with_slider_heuristics, Algorithm, InternedInput, UnifiedDiff};
 use gix::hash::ObjectId;
 use gix::object::tree::diff::ChangeDetached;
-use gix::prelude::ObjectIdExt;
 use gix::protocol::handshake::Ref;
 use gix::revision::walk::Sorting;
 use gix::traverse::commit::simple::CommitTimeOrder;
@@ -617,23 +616,42 @@ fn diff_stat_summary(
     // header), so such a change is refused rather than mis-rendered.
     let options = gix::diff::Options::default().with_rewrites(Some(gix::diff::Rewrites::default()));
     let mut changes = repo.diff_tree_to_tree(Some(&old_tree), Some(&new_tree), options)?;
+    // `gix_diff::tree_with_rewrites` recurses into subdirectories but *also*
+    // reports the containing tree entries themselves as changes. git's
+    // `diff_tree_oid()` runs with `DIFF_OPT_RECURSIVE` and no
+    // `DIFF_OPT_TREE_IN_RECURSIVE`, so `show_stats()`/`diff_summary()` only ever
+    // see blob-, symlink- and gitlink-level filepairs. Dropping the tree entries
+    // here reproduces that: without it a range touching `src/lib.rs` also lists
+    // `src` as a 34-byte binary file (and `-p` emits a bogus
+    // `Binary files a/src and b/src differ`). `diff.rs`'s `collect_tree_change`
+    // applies the same `is_tree()` filter for the same reason.
+    changes.retain(|c| !change_entry_mode(c).is_tree());
     changes.sort_by(|a, b| change_path(a).cmp(change_path(b)));
 
     if changes.is_empty() {
         return Ok(());
     }
 
-    let mut body: Vec<u8> = Vec::new();
     let mut stats: Vec<StatEntry> = Vec::new();
     for change in &changes {
-        stats.push(emit_change(repo, &mut body, change, abbrev, patch)?);
+        stats.push(stat_of(repo, change, abbrev)?);
     }
 
     emit_stats(out, &stats)?;
     emit_summary(out, &changes)?;
     if patch {
+        // The script's `$patch` is a plain `-p` on the same `git diff` this
+        // function is reproducing, so the body is `git diff <base>..<head>` —
+        // rendered by [`super::diff::commit_patch`] rather than by a second
+        // patch writer here. That renderer is the one `git diff` and `git log
+        // -p` already use, so it carries their `quote_c_style` path quoting (a
+        // `"`-containing or non-ASCII name is quoted and octal-escaped), the
+        // terminating tab after a name holding a space, and `@@ -0,0` rather
+        // than `@@ -1,0` for a file created from nothing. This module's own
+        // writer had none of the three.
         out.push(b'\n');
-        out.extend_from_slice(&body);
+        let head = repo.find_object(headrev)?.peel_to_commit()?;
+        out.extend_from_slice(&super::diff::commit_patch(repo, &head, Some(merge_base), 3)?);
     }
     Ok(())
 }
@@ -884,127 +902,62 @@ const REWRITE_UNSUPPORTED: &str =
     "a rename/copy was detected, but git's estimate_similarity() (diffcore-delta.c) \
      is not in the vendored crates, so the `(NN%)` similarity `-M` prints cannot be reproduced";
 
-/// Render one file-level change into `body` (only when `patch` is set) and
-/// return its diffstat row.
-fn emit_change(
-    repo: &gix::Repository,
-    body: &mut Vec<u8>,
-    change: &ChangeDetached,
-    abbrev: usize,
-    patch: bool,
-) -> Result<StatEntry> {
+/// The diffstat row for one file-level change: git's added/deleted line counts,
+/// or the pre-/post-image byte sizes when either side is binary.
+///
+/// Only the counts are computed here. The `-p` body is rendered by
+/// [`super::diff::commit_patch`] over the same tree pair, so the two never
+/// disagree about a path's spelling or a hunk's header.
+fn stat_of(repo: &gix::Repository, change: &ChangeDetached, abbrev: usize) -> Result<StatEntry> {
+    let _ = abbrev;
     let mut added = 0u64;
     let mut deleted = 0u64;
     let mut binary: Option<(u64, u64)> = None;
 
     match change {
         ChangeDetached::Addition {
-            location,
-            entry_mode,
-            id,
-            ..
+            entry_mode, id, ..
         } => {
-            let path: &[u8] = location;
             let is_sub = entry_mode.is_commit();
             let content = content_of(repo, *id, is_sub)?;
-            let short = short_oid(repo, *id, abbrev, is_sub)?;
-            if patch {
-                emit_git_header(body, path, path);
-                writeln!(body, "new file mode {:o}", entry_mode.value())?;
-                writeln!(body, "index {}..{short}", "0".repeat(short.len()))?;
-            }
             if is_binary(is_sub, &content) {
                 binary = Some((0, content.len() as u64));
-                if patch {
-                    body.extend_from_slice(b"Binary files /dev/null and b/");
-                    body.extend_from_slice(path);
-                    body.extend_from_slice(b" differ\n");
-                }
             } else {
-                let counts = emit_body(body, None, Some(path), &[], &content, patch)?;
+                let counts = text_counts(&[], &content)?;
                 added = counts.0;
                 deleted = counts.1;
             }
         }
         ChangeDetached::Deletion {
-            location,
-            entry_mode,
-            id,
-            ..
+            entry_mode, id, ..
         } => {
-            let path: &[u8] = location;
             let is_sub = entry_mode.is_commit();
             let content = content_of(repo, *id, is_sub)?;
-            let short = short_oid(repo, *id, abbrev, is_sub)?;
-            if patch {
-                emit_git_header(body, path, path);
-                writeln!(body, "deleted file mode {:o}", entry_mode.value())?;
-                writeln!(body, "index {short}..{}", "0".repeat(short.len()))?;
-            }
             if is_binary(is_sub, &content) {
                 binary = Some((content.len() as u64, 0));
-                if patch {
-                    body.extend_from_slice(b"Binary files a/");
-                    body.extend_from_slice(path);
-                    body.extend_from_slice(b" and /dev/null differ\n");
-                }
             } else {
-                let counts = emit_body(body, Some(path), None, &content, &[], patch)?;
+                let counts = text_counts(&content, &[])?;
                 added = counts.0;
                 deleted = counts.1;
             }
         }
         ChangeDetached::Modification {
-            location,
             previous_entry_mode,
             previous_id,
             entry_mode,
             id,
+            ..
         } => {
-            let path: &[u8] = location;
-            let old_mode = format!("{:o}", previous_entry_mode.value());
-            let new_mode = format!("{:o}", entry_mode.value());
-            let mode_changed = old_mode != new_mode;
-            if patch {
-                emit_git_header(body, path, path);
-                if mode_changed {
-                    writeln!(body, "old mode {old_mode}")?;
-                    writeln!(body, "new mode {new_mode}")?;
-                }
-            }
-            // A pure mode change (identical content) prints no index/hunks.
+            // A pure mode change (identical content) contributes no counts.
             if previous_id != id {
                 let old_is_sub = previous_entry_mode.is_commit();
                 let new_is_sub = entry_mode.is_commit();
                 let old_content = content_of(repo, *previous_id, old_is_sub)?;
                 let new_content = content_of(repo, *id, new_is_sub)?;
-                if patch {
-                    let old_short = short_oid(repo, *previous_id, abbrev, old_is_sub)?;
-                    let new_short = short_oid(repo, *id, abbrev, new_is_sub)?;
-                    if mode_changed {
-                        writeln!(body, "index {old_short}..{new_short}")?;
-                    } else {
-                        writeln!(body, "index {old_short}..{new_short} {new_mode}")?;
-                    }
-                }
                 if is_binary(old_is_sub, &old_content) || is_binary(new_is_sub, &new_content) {
                     binary = Some((old_content.len() as u64, new_content.len() as u64));
-                    if patch {
-                        body.extend_from_slice(b"Binary files a/");
-                        body.extend_from_slice(path);
-                        body.extend_from_slice(b" and b/");
-                        body.extend_from_slice(path);
-                        body.extend_from_slice(b" differ\n");
-                    }
                 } else {
-                    let counts = emit_body(
-                        body,
-                        Some(path),
-                        Some(path),
-                        &old_content,
-                        &new_content,
-                        patch,
-                    )?;
+                    let counts = text_counts(&old_content, &new_content)?;
                     added = counts.0;
                     deleted = counts.1;
                 }
@@ -1027,59 +980,13 @@ fn is_binary(is_submodule: bool, content: &[u8]) -> bool {
     !is_submodule && content.iter().take(8000).any(|&b| b == 0)
 }
 
-/// `diff --git a/<old> b/<new>` line, preserving raw path bytes.
-fn emit_git_header(out: &mut Vec<u8>, old: &[u8], new: &[u8]) {
-    out.extend_from_slice(b"diff --git a/");
-    out.extend_from_slice(old);
-    out.extend_from_slice(b" b/");
-    out.extend_from_slice(new);
-    out.push(b'\n');
-}
-
-/// Emit the `---`/`+++` headers and hunks, returning `(added, deleted)` line
-/// counts. With `patch` unset only the counts are computed (the diffstat needs
-/// them even when no patch text is printed).
-fn emit_body(
-    out: &mut Vec<u8>,
-    old: Option<&[u8]>,
-    new: Option<&[u8]>,
-    old_content: &[u8],
-    new_content: &[u8],
-    patch: bool,
-) -> Result<(u64, u64)> {
-    let mut hunks: Vec<u8> = Vec::new();
-    let counts = emit_text_hunks(&mut hunks, old_content, new_content)?;
-    if !patch || hunks.is_empty() {
-        return Ok(counts);
-    }
-
-    out.extend_from_slice(b"--- ");
-    match old {
-        Some(p) => {
-            out.extend_from_slice(b"a/");
-            out.extend_from_slice(p);
-        }
-        None => out.extend_from_slice(b"/dev/null"),
-    }
-    out.push(b'\n');
-
-    out.extend_from_slice(b"+++ ");
-    match new {
-        Some(p) => {
-            out.extend_from_slice(b"b/");
-            out.extend_from_slice(p);
-        }
-        None => out.extend_from_slice(b"/dev/null"),
-    }
-    out.push(b'\n');
-
-    out.extend_from_slice(&hunks);
-    Ok(counts)
-}
-
-/// Compute the unified diff of two blobs with git's default settings, returning
-/// the added/deleted line counts the diffstat needs.
-fn emit_text_hunks(out: &mut Vec<u8>, old: &[u8], new: &[u8]) -> Result<(u64, u64)> {
+/// The added/deleted line counts of two blobs under git's default diff settings,
+/// which is all the diffstat needs. The hunk text itself is produced and
+/// discarded: `UnifiedDiff` reports the counts through its consumer, and the
+/// consumer only sees a line once it has been emitted.
+fn text_counts(old: &[u8], new: &[u8]) -> Result<(u64, u64)> {
+    let mut sink: Vec<u8> = Vec::new();
+    let out = &mut sink;
     let input = InternedInput::new(old, new);
     let diff = diff_with_slider_heuristics(Algorithm::Myers, &input);
     let before_lines: Vec<&[u8]> = input.before.iter().map(|&t| input.interner[t]).collect();
@@ -1197,19 +1104,6 @@ fn content_of(repo: &gix::Repository, id: ObjectId, is_submodule: bool) -> Resul
     }
 }
 
-/// Abbreviated object id for the `index` line.
-fn short_oid(
-    repo: &gix::Repository,
-    id: ObjectId,
-    abbrev: usize,
-    is_submodule: bool,
-) -> Result<String> {
-    if is_submodule {
-        Ok(id.to_hex_with_len(abbrev).to_string())
-    } else {
-        Ok(id.attach(repo).shorten()?.to_string())
-    }
-}
 
 /// The path of a change, for stable diff ordering.
 fn change_path(change: &ChangeDetached) -> &[u8] {
@@ -1218,6 +1112,18 @@ fn change_path(change: &ChangeDetached) -> &[u8] {
         | ChangeDetached::Deletion { location, .. }
         | ChangeDetached::Modification { location, .. }
         | ChangeDetached::Rewrite { location, .. } => location,
+    }
+}
+
+/// The post-image entry mode of a change, used to drop the tree-level entries
+/// `gix_diff` reports alongside the recursed blobs (git's non-`TREE_IN_RECURSIVE`
+/// behavior). A `Rewrite` carries the mode of its destination entry.
+fn change_entry_mode(change: &ChangeDetached) -> gix::object::tree::EntryMode {
+    match change {
+        ChangeDetached::Addition { entry_mode, .. }
+        | ChangeDetached::Deletion { entry_mode, .. }
+        | ChangeDetached::Modification { entry_mode, .. }
+        | ChangeDetached::Rewrite { entry_mode, .. } => *entry_mode,
     }
 }
 

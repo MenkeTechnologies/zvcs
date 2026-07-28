@@ -13,7 +13,7 @@
 use crate::env;
 use crate::fixture::{Shape, Templates};
 use anyhow::{Context, Result};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -27,17 +27,60 @@ pub struct Case {
     pub args: Vec<String>,
     /// Repository shape the case runs against.
     pub shape: Shape,
+    /// Bytes fed to the child on stdin, byte-identically to both sides.
+    ///
+    /// `None` means stdin is closed (`/dev/null`), which is what every case did
+    /// before this field existed. A whole class of git is *only* reachable
+    /// through stdin — `mktree`, `mktag`, `stripspace`, `patch-id`, `mailinfo`,
+    /// `column`, `unpack-objects`, and the `--stdin` mode of a dozen more take
+    /// their entire payload there. With stdin nailed shut those commands could
+    /// only ever be measured on the empty-input path, so a score of 100% for
+    /// them meant "agrees on nothing", not "agrees".
+    ///
+    /// Deliberately `&'static [u8]`: the payload is a literal compiled into the
+    /// corpus, never a file read at run time. A case that reads the filesystem
+    /// for its input is not reproducible, and an unreproducible case cannot be
+    /// the premise of a differential comparison.
+    pub stdin: Option<&'static [u8]>,
 }
 
 impl Case {
     pub fn new(cmd: &'static str, args: &[&str], shape: Shape) -> Self {
-        Self { cmd, args: args.iter().map(|s| s.to_string()).collect(), shape }
+        Self { cmd, args: args.iter().map(|s| s.to_string()).collect(), shape, stdin: None }
+    }
+
+    /// Same as [`Case::new`], with `stdin` delivered to both sides.
+    pub fn with_stdin(
+        cmd: &'static str,
+        args: &[&str],
+        shape: Shape,
+        stdin: &'static [u8],
+    ) -> Self {
+        Self { stdin: Some(stdin), ..Self::new(cmd, args, shape) }
     }
 
     /// Stable identity for reporting and for reproducing a single failure.
+    ///
+    /// The stdin payload is part of the identity: two cases can share a shape
+    /// and an argv and still be different invocations, and a report that
+    /// collapsed them would name the wrong one.
     pub fn id(&self) -> String {
-        format!("{}::{}::{}", self.shape.name(), self.cmd, self.args.join(" "))
+        let base = format!("{}::{}::{}", self.shape.name(), self.cmd, self.args.join(" "));
+        match self.stdin {
+            None => base,
+            Some(bytes) => format!("{base}::stdin[{}B/{:016x}]", bytes.len(), fnv1a64(bytes)),
+        }
     }
+}
+
+/// FNV-1a, used only to give a stdin payload a short stable name in case ids.
+/// Not security-relevant; chosen because it is four lines and has no dependency.
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        h = (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
 }
 
 /// Why a case did not match. Ordered roughly by how damning it is.
@@ -121,17 +164,39 @@ pub struct Outcome {
 /// being reported as the defect it is.
 const CASE_TIMEOUT: Duration = Duration::from_secs(20);
 
-fn run_side(bin: &Path, repo: &Path, home: &Path, args: &[String]) -> Result<Side> {
+fn run_side(
+    bin: &Path,
+    repo: &Path,
+    home: &Path,
+    args: &[String],
+    stdin: Option<&'static [u8]>,
+) -> Result<Side> {
     let mut cmd = Command::new(bin);
     env::harden(&mut cmd, home);
     cmd.current_dir(repo)
         .args(args)
-        .stdin(Stdio::null())
+        // Closed stdin stays the default. A command that reads input it was not
+        // given must still hit EOF rather than block, or the `Hang` verdict
+        // stops meaning anything.
+        .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = cmd
         .spawn()
         .with_context(|| format!("spawn {} {:?}", bin.display(), args))?;
+
+    // Written from a helper thread, not inline: a command that both consumes a
+    // payload and prints while consuming it (`stripspace`, `column`, `apply
+    // --stat`) would otherwise deadlock — the child blocking on a full stdout
+    // pipe while this thread blocks writing stdin. The handle is moved into the
+    // thread so dropping it there closes the pipe and delivers EOF.
+    let writer = stdin.map(|bytes| {
+        let mut h = child.stdin.take().expect("stdin piped when a payload is set");
+        std::thread::spawn(move || {
+            let _ = h.write_all(bytes);
+            let _ = h.flush();
+        })
+    });
 
     let start = Instant::now();
     let status = loop {
@@ -145,6 +210,12 @@ fn run_side(bin: &Path, repo: &Path, home: &Path, args: &[String]) -> Result<Sid
         }
         std::thread::sleep(Duration::from_millis(5));
     };
+
+    // Safe to join only now: the child has exited (or been killed), so a writer
+    // still holding unwritten bytes gets EPIPE and returns instead of blocking.
+    if let Some(w) = writer {
+        let _ = w.join();
+    }
 
     // Pipes are drained after exit; every fixture case produces bounded output,
     // so this cannot deadlock on a full pipe buffer in practice.
@@ -176,6 +247,22 @@ fn probe_state(repo: &Path, home: &Path) -> String {
         &["ls-files", "--stage"],
         &["stash", "list"],
         &["cat-file", "--batch-check", "--batch-all-objects"],
+        // Repository-local config. A command that reports success while failing
+        // to persist the setting it promised — `clone --set-upstream` writing no
+        // `branch.<name>.remote`, `remote add` writing no fetch refspec — is
+        // otherwise only caught if it also happens to print something.
+        //
+        // Safe to compare byte-for-byte because `env::harden` pins every
+        // machine-derived input git consults and both sides run on the same
+        // filesystem, so the values git auto-detects at `init` time
+        // (`core.filemode`, `core.ignorecase`, `core.precomposeunicode`) are
+        // equal by construction. `--local` is explicit so a stray global or
+        // system file could not contribute even if the /dev/null pins were lost.
+        //
+        // Order is compared as well as content: `--list` prints in file order,
+        // and writing the right keys into the wrong section or sequence is a
+        // real difference in `.git/config` bytes.
+        &["config", "--list", "--local"],
     ];
 
     let mut digest = String::new();
@@ -191,7 +278,143 @@ fn probe_state(repo: &Path, home: &Path) -> String {
         digest.push_str(&format!("# {}\n{}", probe.join(" "), rendered));
     }
     digest.push_str(&probe_storage(repo));
+    digest.push_str(&probe_reflogs(repo));
+    digest.push_str(&probe_rr_cache(repo));
     digest
+}
+
+/// Every regular file under `dir`, as `(path relative to dir, absolute path)`,
+/// sorted by the relative path so the listing does not depend on readdir order.
+///
+/// Symlinks are reported by name only — following them could walk outside the
+/// repo, and no git metadata directory uses them for content.
+fn walk_files(dir: &Path) -> Vec<(String, PathBuf)> {
+    fn rec(dir: &Path, prefix: &str, out: &mut Vec<(String, PathBuf)>) {
+        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        for entry in rd.filter_map(Result::ok) {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let rel = if prefix.is_empty() { name } else { format!("{prefix}/{name}") };
+            let path = entry.path();
+            match std::fs::symlink_metadata(&path) {
+                Ok(m) if m.is_dir() => rec(&path, &rel, out),
+                Ok(_) => out.push((rel, path)),
+                Err(_) => {}
+            }
+        }
+    }
+    let mut out = Vec::new();
+    rec(dir, "", &mut out);
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+/// Reduce one entry of the object store to a name two correct implementations
+/// must agree on, eliding only values neither side can reproduce.
+///
+/// Two elisions, each for a value that is *not* a function of repository
+/// content:
+///
+///  * **Checksums.** Pack, multi-pack-index-bitmap and split-commit-graph
+///    filenames embed a hash of their own bytes, and the vendored gitoxide
+///    cannot reproduce git's pack bytes (see `probe_storage`). Handled by
+///    [`elide_hashes`].
+///  * **Temp-file randomness.** Git names in-progress files from `mkstemp`
+///    (`tmp_pack_XXXXXX`) or from its own pid (`.tmp-<pid>-pack-<hash>.pack`,
+///    the `.tmp-%d-pack` format in `pack-objects`). Neither is reproducible
+///    even by stock git against itself: two runs of `index-pack --stdin` on
+///    empty input leave `tmp_pack_juzecI` and `tmp_pack_OWu7xG`. Left raw,
+///    those cases stopped being *measured* at all — they turned into
+///    `Nondeterministic` exclusions, which is a worse outcome than the blind
+///    spot this listing closes. The elision keeps the fact that a temp file was
+///    left behind, and how many; only the random field is masked.
+fn stable_entry_name(rel: &str) -> String {
+    let component = |c: &str| -> String {
+        // `.tmp-<pid>-pack-<hash>.pack`: mask the pid between the first two
+        // dashes, leaving the rest (including the `<hash>`) to `elide_hashes`.
+        if let Some(rest) = c.strip_prefix(".tmp-") {
+            if let Some((pid, tail)) = rest.split_once('-') {
+                if !pid.is_empty() && pid.chars().all(|ch| ch.is_ascii_digit()) {
+                    return format!(".tmp-<pid>-{}", elide_hashes(tail));
+                }
+            }
+        }
+        // `tmp_<kind>_<mkstemp suffix>`: mask the final field.
+        if c.starts_with("tmp_") {
+            if let Some(cut) = c.rfind('_') {
+                return format!("{}<tmp>", &c[..=cut]);
+            }
+        }
+        elide_hashes(c)
+    };
+    rel.split('/').map(component).collect::<Vec<_>>().join("/")
+}
+
+/// Replace every run of 32 or more hex digits with `<hash>`.
+fn elide_hashes(name: &str) -> String {
+    let bytes: Vec<char> = name.chars().collect();
+    let mut out = String::with_capacity(name.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let mut j = i;
+        while j < bytes.len() && bytes[j].is_ascii_hexdigit() {
+            j += 1;
+        }
+        if j - i >= 32 {
+            out.push_str("<hash>");
+        } else {
+            out.extend(&bytes[i..j.max(i + 1)]);
+        }
+        i = j.max(i + 1);
+    }
+    out
+}
+
+/// Reflogs: `.git/logs/**`, compared line for line.
+///
+/// Nothing above reads them, so a command that lands the right ref value while
+/// writing no reflog entry — or the wrong message, or an entry on the wrong log
+/// — scored `Match`. `update-ref refs/heads/main HEAD~1` was the live example:
+/// identical stdout, identical refs, identical objects, and one missing line in
+/// `.git/logs/HEAD`.
+///
+/// Compared verbatim, including the committer identity and timestamp, because
+/// `env::harden` pins `GIT_COMMITTER_{NAME,EMAIL,DATE}` and git stamps reflog
+/// entries from exactly those. Verified by building the Branched shape twice
+/// with stock and diffing `.git/logs` — identical. Since the timestamp is a
+/// constant rather than a clock read, normalising it would only hide an
+/// implementation that ignores the pinned date and stamps wall-clock time.
+fn probe_reflogs(repo: &Path) -> String {
+    let logs = repo.join(".git").join("logs");
+    let mut out = String::from("# reflogs\n");
+    for (rel, path) in walk_files(&logs) {
+        let body = std::fs::read(&path)
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+            .unwrap_or_else(|_| "<unreadable>\n".to_string());
+        out.push_str(&format!("## {rel}\n{body}"));
+    }
+    out
+}
+
+/// Recorded conflict resolutions: `.git/rr-cache/**`, compared byte for byte.
+///
+/// The preimage/postimage bytes *are* rerere — a run that creates the cache
+/// directory but records the wrong hunks, or records nothing at all, is the
+/// failure the feature exists to prevent. Only the exit code and stdout were
+/// checked before, and both are silent on the record path.
+///
+/// Directory names are the hash of the conflict hunks, so they are stable for a
+/// given fixture and are kept as-is rather than elided; verified by recording
+/// the same conflict twice with stock and diffing the trees.
+fn probe_rr_cache(repo: &Path) -> String {
+    let rr = repo.join(".git").join("rr-cache");
+    let mut out = String::from("# rr-cache\n");
+    for (rel, path) in walk_files(&rr) {
+        let body = std::fs::read(&path)
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+            .unwrap_or_else(|_| "<unreadable>\n".to_string());
+        out.push_str(&format!("## {rel}\n{body}"));
+    }
+    out
 }
 
 /// Object *storage layout*, which the command probes above cannot see.
@@ -214,19 +437,16 @@ fn probe_state(repo: &Path, home: &Path) -> String {
 /// This is a known, bounded relaxation: a pack that is well-formed but differs
 /// from git's grouping still passes. It is recorded here rather than left for a
 /// reader to infer from a number.
+///
+/// What it does *not* relax is which files exist. An earlier version counted a
+/// fixed list of extensions, so anything outside that list was invisible:
+/// `objects/pack/multi-pack-index` has no extension at all and `.bitmap` was
+/// simply not on the list, which is why `repack --write-midx -d -a` writing a
+/// midx under stock and nothing under zvcs still scored `Match`. The listing
+/// below is enumerated from the directory instead of from a whitelist, so a
+/// file type nobody thought of is compared the day git starts writing it.
 fn probe_storage(repo: &Path) -> String {
     let objects = repo.join(".git").join("objects");
-    let pack_dir = objects.join("pack");
-
-    let count_ext = |ext: &str| -> usize {
-        std::fs::read_dir(&pack_dir)
-            .map(|rd| {
-                rd.filter_map(Result::ok)
-                    .filter(|e| e.path().extension().is_some_and(|x| x == ext))
-                    .count()
-            })
-            .unwrap_or(0)
-    };
 
     // Loose objects live in the 256 fan-out directories; everything else under
     // `objects/` (pack/, info/) is not a loose object.
@@ -247,16 +467,21 @@ fn probe_storage(repo: &Path) -> String {
         })
         .unwrap_or(0);
 
-    format!(
-        "# storage-layout\nloose {}\npack {}\nidx {}\nrev {}\nmtimes {}\ncommit-graph {}\ninfo-packs {}\n",
-        loose,
-        count_ext("pack"),
-        count_ext("idx"),
-        count_ext("rev"),
-        count_ext("mtimes"),
-        objects.join("info").join("commit-graph").exists(),
-        objects.join("info").join("packs").exists(),
-    )
+    // Every entry under `objects/pack` and `objects/info`, with checksum runs
+    // elided and the result sorted. Duplicates are kept, so splitting one pack
+    // into two still shows up as two `pack-<hash>.pack` lines.
+    let mut entries: Vec<String> = Vec::new();
+    for sub in ["pack", "info"] {
+        for (rel, _) in walk_files(&objects.join(sub)) {
+            entries.push(format!("{sub}/{}", stable_entry_name(&rel)));
+        }
+    }
+    // Sort *after* eliding: two names that differ only inside the checksum
+    // collapse to the same string, and their pre-elision order is arbitrary.
+    entries.sort();
+    let listing: String = entries.iter().map(|e| format!("{e}\n")).collect();
+
+    format!("# storage-layout\nloose {loose}\n{listing}")
 }
 
 /// Strip the two things that legitimately differ between two copies of the same
@@ -278,13 +503,40 @@ fn normalize(raw: &[u8], repo: &Path, home: &Path) -> String {
     s
 }
 
+/// Every phrase the port uses to say "I have not implemented this".
+///
+/// Enumerated rather than pattern-guessed, and kept in one place so the list can
+/// be re-derived from the port's source with a single grep. `unsupported`,
+/// `not ported`, and `not supported` are matched as bare fragments because the
+/// port inflects them a dozen ways ("unsupported flag", "unsupported option",
+/// "unsupported mode", "unsupported revision range", "--patch is not ported",
+/// "recognised but not ported", "magic pathspecs are not supported"); matching
+/// each inflection separately is how three of these were missed to begin with.
+const GAP_MARKERS: &[&str] = &[
+    "not ported",
+    "not yet ported",
+    "is ported so far",
+    "unsupported",
+    "not supported",
+    "not implemented",
+];
+
 /// True when zvcs is reporting a gap rather than disagreeing about behavior.
-/// Matched against the exact wording `dispatch.rs` and the porcelain modules
-/// emit; kept narrow so a genuine error is never miscounted as a known gap.
+///
+/// **This widens the failure bucket, it never narrows it.** `Unsupported` is
+/// counted as a failure; recognising more of them moves cases *out* of
+/// `exit-diff` and, where zvcs happened to fail with git's exit code and no
+/// stdout, *out of `Match`* — a case that was passing only by coincidence.
+/// Nothing here can turn a failure into a pass.
+///
+/// Matching English prose is the wrong mechanism and is only used because the
+/// port has no other channel for this. See the note on [`GAP_MARKERS`] and the
+/// harness report: a distinctive exit status (git leaves 129 free for usage
+/// errors; something like 125 is unclaimed) or a machine-readable line such as
+/// `zvcs: unported: <command> <flag>` would make this exact, and would not
+/// silently drift the next time an error message is reworded.
 fn is_unsupported(stderr: &str) -> bool {
-    stderr.contains("not yet ported")
-        || stderr.contains("unsupported flag")
-        || stderr.contains("is ported so far")
+    GAP_MARKERS.iter().any(|m| stderr.contains(m))
 }
 
 fn looks_like_panic(stderr: &str) -> bool {
@@ -306,8 +558,8 @@ pub fn run_case(
     templates.instantiate(case.shape, &zvcs_repo)?;
 
     let home = &templates.home;
-    let stock = run_side(Path::new("git"), &stock_repo, home, &case.args)?;
-    let zvcs = run_side(zvcs_bin, &zvcs_repo, home, &case.args)?;
+    let stock = run_side(Path::new("git"), &stock_repo, home, &case.args, case.stdin)?;
+    let zvcs = run_side(zvcs_bin, &zvcs_repo, home, &case.args, case.stdin)?;
 
     let stock_state = probe_state(&stock_repo, home);
     let zvcs_state = probe_state(&zvcs_repo, home);
@@ -393,7 +645,7 @@ fn stock_disagrees_with_itself(
     let _ = std::fs::remove_dir_all(&repo);
     templates.instantiate(case.shape, &repo)?;
     let home = &templates.home;
-    let again = run_side(Path::new("git"), &repo, home, &case.args)?;
+    let again = run_side(Path::new("git"), &repo, home, &case.args, case.stdin)?;
     if normalize(&again.stdout, &repo, home) != *first_stdout {
         return Ok(true);
     }

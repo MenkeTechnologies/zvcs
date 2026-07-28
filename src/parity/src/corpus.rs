@@ -6,11 +6,27 @@
 //!
 //! Cases here are curated, not exhaustive — `fuzz` covers combinatorial breadth.
 
+//! The commands below are grouped into submodules by subsystem so the corpus can
+//! grow per-area without one file becoming a merge point. Each submodule exposes
+//! `pub fn cases(out: &mut Vec<Case>)` and is called from [`cases`].
+
 use crate::fixture::Shape;
 use crate::runner::Case;
 
+mod diff_family;
+mod history_rewrite;
+mod info_attrs;
+mod mail_patch;
+mod maintenance;
+mod merge_family;
+mod misc_commands;
+mod plumbing_objects;
+mod plumbing_refs;
+mod transport_local;
+mod worktree_index;
+
 /// Shapes every read-only command should agree on regardless of history layout.
-const READ_SHAPES: &[Shape] = &[
+pub(crate) const READ_SHAPES: &[Shape] = &[
     Shape::Linear,
     Shape::Branched,
     Shape::Merged,
@@ -19,7 +35,7 @@ const READ_SHAPES: &[Shape] = &[
 ];
 
 /// Expand one read-only invocation across the standard shapes.
-fn read_only(cmd: &'static str, args: &[&str], out: &mut Vec<Case>) {
+pub(crate) fn read_only(cmd: &'static str, args: &[&str], out: &mut Vec<Case>) {
     for &shape in READ_SHAPES {
         out.push(Case::new(cmd, args, shape));
     }
@@ -159,6 +175,19 @@ pub fn cases() -> Vec<Case> {
     read_only("log", &["log", "does-not-exist"], &mut c);
     read_only("branch", &["branch", "-d", "no-such-branch"], &mut c);
     read_only("show", &["show", "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"], &mut c);
+
+    // ---- per-subsystem corpora, one module each ----
+    diff_family::cases(&mut c);
+    history_rewrite::cases(&mut c);
+    info_attrs::cases(&mut c);
+    mail_patch::cases(&mut c);
+    maintenance::cases(&mut c);
+    merge_family::cases(&mut c);
+    misc_commands::cases(&mut c);
+    plumbing_objects::cases(&mut c);
+    plumbing_refs::cases(&mut c);
+    transport_local::cases(&mut c);
+    worktree_index::cases(&mut c);
 
     c
 }

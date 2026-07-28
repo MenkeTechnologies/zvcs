@@ -1199,7 +1199,7 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
             first = false;
             if let Err(e) = stdout.write_all(&piece) {
                 if e.kind() == std::io::ErrorKind::BrokenPipe {
-                    return Ok(ExitCode::SUCCESS);
+                    crate::sigpipe::exit_broken_pipe();
                 }
                 return Err(e.into());
             }
@@ -1331,7 +1331,7 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
         // which is a normal stop rather than an error. No per-commit flush is needed.
         if let Err(e) = stdout.write_all(&piece) {
             if e.kind() == std::io::ErrorKind::BrokenPipe {
-                return Ok(ExitCode::SUCCESS);
+                crate::sigpipe::exit_broken_pipe();
             }
             return Err(e.into());
         }
@@ -1355,7 +1355,9 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
         let out = render_graph(&nodes, &blocks, graph_colors(&repo), want_color)?;
         match stdout.write_all(&out) {
             Ok(()) => Ok(ExitCode::SUCCESS),
-            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(ExitCode::SUCCESS),
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+                crate::sigpipe::exit_broken_pipe()
+            }
             Err(e) => Err(e.into()),
         }
     } else {
@@ -1363,7 +1365,9 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
         // format) may still be buffered.
         match stdout.flush() {
             Ok(()) => Ok(ExitCode::SUCCESS),
-            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(ExitCode::SUCCESS),
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+                crate::sigpipe::exit_broken_pipe()
+            }
             Err(e) => Err(e.into()),
         }
     }

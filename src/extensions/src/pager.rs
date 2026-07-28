@@ -155,6 +155,15 @@ fn spawn(program: &str) {
     });
 }
 
+/// Is a pager child of ours installed over stdout?
+///
+/// Distinguishes the pager quitting early — a normal end to the session — from
+/// an unrelated downstream reader closing the pipe, which git dies on. See
+/// [`crate::sigpipe::exit_broken_pipe`].
+pub fn is_active() -> bool {
+    PAGER.lock().is_ok_and(|p| p.is_some())
+}
+
 /// Tear the pager down: flush our streams, close the redirected fds so the pager
 /// reads EOF, then wait for it to exit. No-op when no pager was installed.
 pub fn finish() {

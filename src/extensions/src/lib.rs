@@ -27,6 +27,7 @@ pub mod porcelain;
 pub mod progress;
 pub mod rcache;
 pub mod revfilter;
+pub mod sigpipe;
 pub mod superset;
 pub mod threads;
 pub mod trace2;
@@ -260,6 +261,10 @@ fn run_command() -> ExitCode {
     pager::maybe_setup(&sub, pager_forced);
     let code = match dispatch::run(&sub, &rest) {
         Ok(code) => code,
+        // A closed stdout is not a command failure. git dies from SIGPIPE here
+        // and prints nothing; reporting it as an error meant `zvcs <cmd> | head`
+        // printed a spurious diagnostic and exited 1.
+        Err(e) if sigpipe::is_broken_pipe(e.as_ref()) => sigpipe::exit_broken_pipe(),
         Err(e) => {
             let msg = format!("{sub}: {e:#}");
             trace2::error(&msg);

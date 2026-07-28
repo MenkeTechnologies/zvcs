@@ -584,8 +584,11 @@ pub fn format_patch(args: &[String]) -> Result<ExitCode> {
 
     match stdout.write_all(&buffered).and_then(|()| stdout.flush()) {
         Ok(()) => Ok(ExitCode::SUCCESS),
-        // A downstream `| head` closing the pipe is not an error.
-        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(ExitCode::SUCCESS),
+        // A downstream `| head` closing the pipe is not an error; git leaves by
+        // way of SIGPIPE rather than returning a status of its own.
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+            crate::sigpipe::exit_broken_pipe()
+        }
         Err(e) => Err(e.into()),
     }
 }

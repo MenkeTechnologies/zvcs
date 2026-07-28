@@ -1831,7 +1831,7 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
 /// `--pathspec-from-file=<file>` — the pathspec list read from a file, or from
 /// stdin for `-`. Entries are separated by `NUL` with `--pathspec-file-nul` and
 /// by newlines otherwise; git also drops a trailing `\r` from the line form.
-fn read_pathspec_file(src: &str, nul: bool) -> Result<Vec<String>> {
+pub(super) fn read_pathspec_file(src: &str, nul: bool) -> Result<Vec<String>> {
     let raw = if src == "-" {
         let mut buf = Vec::new();
         std::io::Read::read_to_end(&mut std::io::stdin(), &mut buf)?;

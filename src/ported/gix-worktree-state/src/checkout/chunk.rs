@@ -317,8 +317,19 @@ where
         Err(checkout::Error::Io(err)) if is_collision(&err, entry_path, collisions, files) => {
             Ok(entry::Outcome::Written { bytes: 0 })
         }
-        Err(err) => handle_error(err, entry_path, files, errors, options.keep_going)
-            .map(|()| entry::Outcome::Written { bytes: 0 }),
+        Err(err) => {
+            // `handle_error` only records the path when `keep_going` collects the
+            // error; on the propagating path it would be lost, so bind it here.
+            let err = match err {
+                checkout::Error::Io(source) => checkout::Error::IoPath {
+                    source,
+                    path: entry_path.into(),
+                },
+                other => other,
+            };
+            handle_error(err, entry_path, files, errors, options.keep_going)
+                .map(|()| entry::Outcome::Written { bytes: 0 })
+        }
     }
 }
 

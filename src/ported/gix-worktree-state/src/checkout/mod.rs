@@ -84,6 +84,19 @@ pub enum Error {
     Time(#[from] std::time::SystemTimeError),
     #[error("IO error while writing blob or reading file metadata or changing filetype")]
     Io(#[from] std::io::Error),
+    /// The same failure, but carrying the entry it happened on.
+    ///
+    /// Without `keep_going` the per-entry error is returned rather than
+    /// collected into an [`ErrorRecord`], which used to drop the path — leaving
+    /// a bare "Operation not permitted" with nothing to act on. git always names
+    /// the file it could not write or unlink, so the path is attached here at
+    /// the point where it is still known.
+    #[error("IO error while writing blob or reading file metadata or changing filetype for '{path}'")]
+    IoPath {
+        #[source]
+        source: std::io::Error,
+        path: BString,
+    },
     #[error("object for checkout at {} could not be retrieved from object database", .path.display())]
     Find {
         #[source]

@@ -490,6 +490,7 @@ struct NewTrailer {
 }
 
 /// `struct process_trailer_options`, restricted to what the builtin exposes.
+#[derive(Default)]
 struct Opts {
     in_place: bool,
     trim_empty: bool,
@@ -1607,4 +1608,208 @@ fn usage_error(msg: &str) -> ExitCode {
 fn plain_error(msg: &str) -> ExitCode {
     eprintln!("error: {msg}");
     ExitCode::from(USAGE_CODE)
+}
+
+// ---------------------------------------------------------------------------
+// `%(trailers[:<options>])` — the pretty-format placeholder
+// ---------------------------------------------------------------------------
+
+/// The options `%(trailers:...)` accepts (`parse_trailers_option()`, pretty.c).
+#[derive(Default, Clone)]
+pub(crate) struct PrettyOpts {
+    /// `key=<K>`, repeatable: show only these trailers, matched case-insensitively
+    /// and with an optional trailing separator on the given key. Setting it also
+    /// implies `only`.
+    pub(crate) keys: Vec<Vec<u8>>,
+    /// `only[=<bool>]`: drop the block's non-trailer lines.
+    pub(crate) only: bool,
+    /// `unfold[=<bool>]`: join a folded continuation line back onto its trailer.
+    pub(crate) unfold: bool,
+    /// `valueonly[=<bool>]` / `keyonly[=<bool>]`: print one half of each trailer.
+    pub(crate) valueonly: bool,
+    pub(crate) keyonly: bool,
+    /// `separator=<sep>`: what goes *between* trailers. When unset each trailer is
+    /// instead terminated by a newline, which is why a custom separator produces
+    /// no trailing one.
+    pub(crate) separator: Option<Vec<u8>>,
+    /// `key_value_separator=<sep>`: what goes between a key and its value in place
+    /// of `": "`.
+    pub(crate) key_value_separator: Option<Vec<u8>>,
+}
+
+impl PrettyOpts {
+    /// Parse the text between `%(trailers:` and `)`, which is a comma-separated
+    /// list of `<name>` or `<name>=<value>` items. An unknown item makes the whole
+    /// placeholder print literally, which the caller signals by getting `None`.
+    pub(crate) fn parse(spec: &[u8]) -> Option<Self> {
+        let mut opts = PrettyOpts::default();
+        if spec.is_empty() {
+            return Some(opts);
+        }
+        for item in split_unescaped_commas(spec) {
+            let (name, value) = match item.iter().position(|&b| b == b'=') {
+                Some(i) => (&item[..i], Some(item[i + 1..].to_vec())),
+                None => (&item[..], None),
+            };
+            // `parse_ret_bool()`: a bare option is true, `=true`/`=false` are the
+            // only spellings of the two states.
+            let flag = |value: &Option<Vec<u8>>| -> Option<bool> {
+                match value.as_deref() {
+                    None | Some(b"true") => Some(true),
+                    Some(b"false") => Some(false),
+                    _ => None,
+                }
+            };
+            match name {
+                b"key" => {
+                    let mut key = value?;
+                    // A key given with its separator already attached matches the
+                    // same trailer; git strips it before comparing.
+                    if key.last().is_some_and(|&c| c == b':') {
+                        key.pop();
+                    }
+                    opts.keys.push(key);
+                    opts.only = true;
+                }
+                b"only" => opts.only = flag(&value)?,
+                b"unfold" => opts.unfold = flag(&value)?,
+                b"valueonly" => opts.valueonly = flag(&value)?,
+                b"keyonly" => opts.keyonly = flag(&value)?,
+                b"separator" => opts.separator = Some(unescape_percent(&value?)),
+                b"key_value_separator" => opts.key_value_separator = Some(unescape_percent(&value?)),
+                _ => return None,
+            }
+        }
+        Some(opts)
+    }
+}
+
+/// Split on commas that are not `%x2C`-escaped — the same walk
+/// `format_trailers_cmd()` does before handing each item to the option parser.
+fn split_unescaped_commas(spec: &[u8]) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut cur = Vec::new();
+    let mut i = 0;
+    while i < spec.len() {
+        if spec[i] == b',' {
+            out.push(std::mem::take(&mut cur));
+            i += 1;
+            continue;
+        }
+        cur.push(spec[i]);
+        i += 1;
+    }
+    out.push(cur);
+    out
+}
+
+/// The `%` escapes a separator value may use, which is the subset of the pretty
+/// format's own that produces bytes: `%n`, `%xNN` and `%%`.
+fn unescape_percent(value: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(value.len());
+    let mut i = 0;
+    while i < value.len() {
+        if value[i] != b'%' || i + 1 >= value.len() {
+            out.push(value[i]);
+            i += 1;
+            continue;
+        }
+        match value[i + 1] {
+            b'n' => {
+                out.push(b'\n');
+                i += 2;
+            }
+            b'%' => {
+                out.push(b'%');
+                i += 2;
+            }
+            b'x' if i + 3 < value.len() => {
+                let hex = std::str::from_utf8(&value[i + 2..i + 4]).ok();
+                match hex.and_then(|h| u8::from_str_radix(h, 16).ok()) {
+                    Some(byte) => {
+                        out.push(byte);
+                        i += 4;
+                    }
+                    None => {
+                        out.push(value[i]);
+                        i += 1;
+                    }
+                }
+            }
+            _ => {
+                out.push(value[i]);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// `format_trailers_from_commit()`: the commit message's trailer block, rendered
+/// the way the `%(trailers)` placeholder asks for.
+pub(crate) fn format_pretty(message: &[u8], pretty: &PrettyOpts) -> Vec<u8> {
+    // A configuration this repository cannot read is no reason to print nothing:
+    // `trailer_config_init()`'s built-in defaults are what git falls back to.
+    let cfg = match load_config() {
+        Ok(cfg) => cfg,
+        Err(_) => return Vec::new(),
+    };
+    let block = block_get(message, true, &cfg);
+    let items = parse_block(
+        &block,
+        &Opts {
+            only_trailers: pretty.only,
+            unfold: pretty.unfold,
+            ..Opts::default()
+        },
+        &cfg,
+    );
+
+    let mut out = Vec::new();
+    for item in &items {
+        let Some(token) = &item.token else {
+            // A non-trailer line survives only when `only` is off, and it prints
+            // as it stood.
+            if !pretty.only {
+                out.extend_from_slice(&item.value);
+                match &pretty.separator {
+                    Some(sep) if !out.is_empty() => out.extend_from_slice(sep),
+                    Some(_) => {}
+                    None => out.push(b'\n'),
+                }
+            }
+            continue;
+        };
+        if !pretty.keys.is_empty()
+            && !pretty
+                .keys
+                .iter()
+                .any(|k| k.eq_ignore_ascii_case(token))
+        {
+            continue;
+        }
+        // The separator joins, so it goes in front of every item but the first.
+        if let Some(sep) = &pretty.separator {
+            if !out.is_empty() {
+                out.extend_from_slice(sep);
+            }
+        }
+        if !pretty.valueonly {
+            out.extend_from_slice(token);
+        }
+        if !pretty.keyonly && !pretty.valueonly {
+            match &pretty.key_value_separator {
+                Some(sep) => out.extend_from_slice(sep),
+                None => out.extend_from_slice(b": "),
+            }
+        }
+        if !pretty.keyonly {
+            out.extend_from_slice(&item.value);
+        }
+        // With no separator given each trailer is terminated instead of joined.
+        if pretty.separator.is_none() {
+            out.push(b'\n');
+        }
+    }
+    out
 }

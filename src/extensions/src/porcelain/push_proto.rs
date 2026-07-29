@@ -82,6 +82,10 @@ pub struct Request {
     /// must also be reachable from the *local* ref's reflog, proving this
     /// checkout has seen it.
     pub check_reachable: Option<String>,
+    /// `-d`/`--delete <name>` rather than the `:<name>` refspec spelling. git's
+    /// matcher fails the whole push when such a name is not advertised, while the
+    /// refspec form is sent blind.
+    pub explicit_delete: bool,
 }
 
 /// Which advertised refs a push may DELETE beyond the caller's explicit
@@ -155,6 +159,10 @@ pub struct RefStatus {
     pub forced: bool,
     /// True when the local pre-flight found nothing to do (already up to date).
     pub up_to_date: bool,
+    /// Rejected during matching rather than by the server: git reports these as a
+    /// bare `error: <reason>` before any transport output, so they never appear in
+    /// the `To <url>` block.
+    pub pre_transport: bool,
 }
 
 /// The outcome of a push: the resolved destination URL and every ref's verdict.
@@ -439,10 +447,28 @@ pub fn send_pack(
             result: Err(reason.to_owned()),
             forced: false,
             up_to_date: false,
+            pre_transport: false,
         };
 
         if deletion && !allow_deleting_refs {
             statuses.push(reject("remote does not support deleting refs"));
+            continue;
+        }
+        // `--delete <name>` for a ref the remote does not advertise fails during
+        // matching (`match_push_refs`), before anything is sent: git reports
+        // `unable to delete '<name>': remote ref does not exist` and the push
+        // fails. The `:<name>` spelling instead goes on the wire as a null→null
+        // command, which this port's receiving side does not accept — so that
+        // form still reports the ref as up to date (documented in `push`).
+        if deletion && req.explicit_delete && remote_current == null {
+            statuses.push(RefStatus {
+                result: Err(format!(
+                    "unable to delete '{}': remote ref does not exist",
+                    req.name.strip_prefix("refs/heads/").unwrap_or(&req.name)
+                )),
+                pre_transport: true,
+                ..reject("")
+            });
             continue;
         }
         if remote_current == req.new {
@@ -456,6 +482,7 @@ pub fn send_pack(
                 result: Ok(()),
                 forced: false,
                 up_to_date: true,
+                pre_transport: false,
             });
             continue;
         }
@@ -541,6 +568,7 @@ pub fn send_pack(
                 result: Ok(()),
                 forced: w.forced,
                 up_to_date: false,
+                pre_transport: false,
             });
         }
         return Ok(Outcome {
@@ -581,6 +609,7 @@ pub fn send_pack(
                     result: Err("remote does not support deleting refs".to_owned()),
                     forced: false,
                     up_to_date: false,
+                    pre_transport: false,
                 });
                 continue;
             }
@@ -800,6 +829,7 @@ pub fn send_pack(
                 result,
                 forced: w.forced,
                 up_to_date: false,
+                pre_transport: false,
             });
             continue;
         }
@@ -813,6 +843,7 @@ pub fn send_pack(
                 result: result.clone(),
                 forced: w.forced || report.forced_update,
                 up_to_date: false,
+                pre_transport: false,
             });
         }
     }
@@ -1363,7 +1394,18 @@ fn reachable_objects(repo: &gix::Repository, tips: &[ObjectId]) -> HashSet<Objec
     }
     // Include the tips themselves so a tag object (not a commit) is packed too.
     roots.extend(tips.iter().copied());
+    expand_roots(repo, &roots)
+}
 
+/// Every object an explicit root list names — the roots themselves, their trees
+/// and their blobs — with no ancestry walk of its own. [`reachable_objects`] uses
+/// it after walking, and the shallow server path uses it directly, because there
+/// the commit set is a boundary computation's output rather than everything
+/// reachable from the tips.
+pub(crate) fn expand_roots(repo: &gix::Repository, roots: &[ObjectId]) -> HashSet<ObjectId> {
+    if roots.is_empty() {
+        return HashSet::new();
+    }
     let mut input = roots
         .iter()
         .copied()
@@ -1378,7 +1420,7 @@ fn reachable_objects(repo: &gix::Repository, tips: &[ObjectId]) -> HashSet<Objec
         Ok((counts, _)) => counts.into_iter().map(|c| c.id).collect(),
         // A corrupt object aborts the counter; fall back to the walked roots so a
         // pack is still produced rather than failing the push.
-        Err(_) => roots.into_iter().collect(),
+        Err(_) => roots.iter().copied().collect(),
     }
 }
 

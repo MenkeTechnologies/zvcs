@@ -343,6 +343,10 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
     let mut show_parents = false;
     let mut show_children = false;
     let mut boundary = false;
+    // `--simplify-by-decoration`, plus somewhere to keep the decoration map when
+    // the format itself did not ask for one.
+    let mut simplify_by_decoration = false;
+    let decorations_for_simplify: Option<Decorations>;
     let mut min_parents: Option<usize> = None;
     let mut max_parents: Option<usize> = None;
     let mut date_mode = cfg_date_mode;
@@ -551,6 +555,8 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
             first_parent = true;
         } else if a == "--parents" {
             show_parents = true;
+        } else if a == "--simplify-by-decoration" {
+            simplify_by_decoration = true;
         } else if a == "--boundary" {
             boundary = true;
         } else if a == "--no-boundary" {
@@ -1101,8 +1107,11 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
         nodes.retain(|n| {
             reachable.contains(&n.id) && simplified.get(&n.id).is_some_and(|(_, shown)| *shown)
         });
-        // `rewrite_parents()` again: only the formats that print ancestry need the
-        // simplified-away commits skipped over.
+        // `rewrite_parents()`: the ancestry the output shows is the simplified
+        // one, and a parent reachable from another parent drops out of it. Only
+        // the ancestry-printing formats take it: the per-commit diff stays
+        // against the real first parent, which is what `log --name-status --
+        // <path>` reports.
         if graph || show_parents {
             for node in &mut nodes {
                 let mut rewritten: Vec<ObjectId> = Vec::with_capacity(node.parents.len());
@@ -1113,6 +1122,7 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
                         }
                     }
                 }
+                prune_redundant_parents(&repo, &mut rewritten);
                 node.parents = rewritten;
             }
         }
@@ -1260,6 +1270,68 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
     if show_parents && show_children {
         eprintln!("fatal: options '--parents' and '--children' cannot be used together");
         return Ok(ExitCode::from(128));
+    }
+
+    // `--simplify-by-decoration`: the same simplification the pathspec path runs,
+    // with a different question asked of each commit. `simplify_commit()` keeps a
+    // commit that carries a decoration, and — since simplification may not drop
+    // the shape of the history — a root or a merge; everything else is walked
+    // past. The parent lists are rewritten so `--graph`/`--parents` draw the
+    // simplified history rather than the real one.
+    if simplify_by_decoration {
+        let decos = match &decorations {
+            Some(d) => d,
+            None => {
+                let filter = DecorationFilter::build(
+                    &repo,
+                    &decorate_refs,
+                    &decorate_refs_exclude,
+                    default_decoration_filter,
+                );
+                decorations_for_simplify = Some(build_decorations(&repo, &filter)?);
+                decorations_for_simplify.as_ref().expect("just built")
+            }
+        };
+        let mut simplified: HashMap<ObjectId, (Vec<ObjectId>, bool)> =
+            HashMap::with_capacity(nodes.len());
+        for node in &nodes {
+            let shown =
+                decos.decorates(&node.id) || node.parents.is_empty() || node.parents.len() > 1;
+            let parents = if shown {
+                node.parents.clone()
+            } else {
+                node.parents[..node.parents.len().min(1)].to_vec()
+            };
+            simplified.insert(node.id, (parents, shown));
+        }
+        let mut reachable: HashSet<ObjectId> = HashSet::with_capacity(nodes.len());
+        let mut stack: Vec<ObjectId> = tips.clone();
+        while let Some(id) = stack.pop() {
+            if !reachable.insert(id) {
+                continue;
+            }
+            if let Some((parents, _)) = simplified.get(&id) {
+                stack.extend(parents.iter().copied());
+            }
+        }
+        nodes.retain(|n| {
+            reachable.contains(&n.id) && simplified.get(&n.id).is_some_and(|(_, shown)| *shown)
+        });
+        // `rewrite_parents()` runs whenever a simplification did: the ancestry the
+        // output shows — the `Merge:` header, `--parents`, the graph — is the
+        // simplified one, not the commit's real parent list.
+        for node in &mut nodes {
+            let mut rewritten: Vec<ObjectId> = Vec::with_capacity(node.parents.len());
+            for p in &node.parents {
+                if let Some(id) = simplify_rewrite_one(*p, &simplified) {
+                    if !rewritten.contains(&id) {
+                        rewritten.push(id);
+                    }
+                }
+            }
+            prune_redundant_parents(&repo, &mut rewritten);
+            node.parents = rewritten;
+        }
     }
 
     // `--boundary`: the excluded commits the shown history hangs off — every
@@ -1604,6 +1676,26 @@ fn line_log_rewrite_one(
     }
 }
 
+/// `remove_duplicate_parents()`: after rewriting, a parent reachable from another
+/// parent adds nothing to the simplified ancestry, and git drops it — which is
+/// what turns a merge whose two sides collapse onto one line back into an
+/// ordinary commit (no `Merge:` header, no fork in the graph).
+fn prune_redundant_parents(repo: &gix::Repository, parents: &mut Vec<ObjectId>) {
+    if parents.len() < 2 {
+        return;
+    }
+    let original = parents.clone();
+    parents.retain(|p| {
+        !original.iter().any(|other| {
+            other != p
+                && repo
+                    .merge_base(*p, *other)
+                    .map(|base| base.detach() == *p)
+                    .unwrap_or(false)
+        })
+    });
+}
+
 /// `rewrite_one()` for pathspec simplification: walk past every simplified-away
 /// ancestor until a shown commit (or one the walk never reached) is found, so
 /// `--graph`/`--parents` draw the simplified history rather than the real one.
@@ -1875,7 +1967,7 @@ fn entry_block(
     // (`show_log` prints `print_parents` before `children`). A child list is what
     // the walk saw, so it names only commits this run reached.
     let mut extra = Vec::new();
-    let mut push_ids = |ids: &[ObjectId], out: &mut Vec<u8>| {
+    let push_ids = |ids: &[ObjectId], out: &mut Vec<u8>| {
         for id in ids {
             out.push(b' ');
             let attached = id.attach(repo);
@@ -1907,6 +1999,7 @@ fn entry_block(
         notes: p.notes,
         repo,
         mark: if node.boundary && !p.graph { "- " } else { "" },
+        parents: &node.parents,
     };
     let mut block: Vec<u8> = Vec::new();
     render_entry(&mut block, &commit, p.pretty, &ctx)?;
@@ -2588,6 +2681,10 @@ fn check_format(fmt: &str) -> Result<()> {
             // anything else prints literally rather than failing, so there is
             // nothing here to reject.
             Some('x') => {}
+            // `%(trailers[:<options>])`, whose option list is validated when it is
+            // expanded — an unknown option prints literally there rather than
+            // failing here, exactly as git does.
+            Some('(') => {}
             Some(x) => bail!("unsupported format placeholder %{x}"),
             None => bail!("unsupported trailing % in format"),
         }
@@ -2626,6 +2723,7 @@ pub(crate) fn format_commit(
         notes: &[],
         repo,
         mark: "",
+        parents: &[],
     };
     let mut out = Vec::new();
     expand_format(&mut out, commit, &unabbreviated(fmt), &ctx)?;
@@ -2666,6 +2764,18 @@ fn unabbreviated(fmt: &str) -> String {
 /// Expand the placeholders accepted by [`check_format`] for `commit`, using the
 /// render knobs in `ctx` (`--date=`, color enablement, decorations, and the clock
 /// for relative dates).
+/// A `%(trailers...)` placeholder starting at `chars[i] == '('`: its option text
+/// and the index just past the closing paren. `None` for anything else that opens
+/// with `%(`, which is `%C(...)`'s territory or a malformed placeholder.
+fn trailers_placeholder(chars: &[char], i: usize) -> Option<(String, usize)> {
+    let close = chars[i..].iter().position(|&c| c == ')')? + i;
+    let inner: String = chars[i + 1..close].iter().collect();
+    let spec = inner
+        .strip_prefix("trailers:")
+        .or_else(|| (inner == "trailers").then_some(""))?;
+    Some((spec.to_string(), close + 1))
+}
+
 fn expand_format(
     out: &mut Vec<u8>,
     commit: &gix::Commit<'_>,
@@ -2690,6 +2800,29 @@ fn expand_format(
             continue;
         }
         let Some(&p) = chars.get(i) else { break };
+        // `%(trailers[:<options>])` — the one parenthesised placeholder that is not
+        // a colour request. `format_trailers_from_commit()` renders the message's
+        // trailer block; an unparsable option list makes git print the placeholder
+        // literally rather than fail, which is what a `None` here reproduces.
+        if p == '(' {
+            if let Some((spec, next)) = trailers_placeholder(&chars, i) {
+                match super::interpret_trailers::PrettyOpts::parse(spec.as_bytes()) {
+                    Some(opts) => {
+                        out.extend_from_slice(&super::interpret_trailers::format_pretty(
+                            commit.message_raw()?,
+                            &opts,
+                        ));
+                        i = next;
+                        continue;
+                    }
+                    None => {
+                        out.extend_from_slice(b"%(");
+                        i += 1;
+                        continue;
+                    }
+                }
+            }
+        }
         i += 1;
         match p {
             // Under `%C(auto)`, git paints the commit hash with `color.diff.commit`.
@@ -2973,6 +3106,14 @@ pub(crate) struct Decorations {
     /// The full refname HEAD symbolically points at (`refs/heads/main`), for the
     /// `HEAD -> <branch>` fold. `None` when HEAD is detached or unborn.
     head_branch: Option<String>,
+}
+
+impl Decorations {
+    /// `get_name_decoration()`: whether any ref points at this commit, which is
+    /// the whole of `--simplify-by-decoration`s interest in them.
+    pub(crate) fn decorates(&self, id: &ObjectId) -> bool {
+        self.map.contains_key(id)
+    }
 }
 
 /// git's `prettify_refname`: strip the three namespaces whose short form is
@@ -3711,6 +3852,7 @@ pub(crate) fn rev_list_pretty_body(
         notes: &[],
         repo,
         mark: "",
+        parents: &[],
     };
     let mut out = Vec::new();
     match pretty {
@@ -3853,6 +3995,9 @@ struct RenderCtx<'a> {
     repo: &'a gix::Repository,
     /// `get_revision_mark()`: `- ` for a `--boundary` commit, empty otherwise.
     mark: &'static str,
+    /// The commit's effective parents — its own, or the rewritten list a history
+    /// simplification left behind. What `Merge:` and `--parents` print.
+    parents: &'a [ObjectId],
 }
 
 /// The `Notes[ (<ref>)]:` blocks for `commit`, or empty.
@@ -3957,12 +4102,14 @@ fn render_entry(
             out.push(b'\n');
 
             // A merge commit lists its abbreviated parents right after `commit`.
-            let parents: Vec<_> = commit.parent_ids().collect();
-            if parents.len() > 1 {
+            // The list is the *effective* one: history simplification rewrites
+            // parents before anything is printed, so a merge whose sides
+            // collapsed onto one line is no longer shown as a merge.
+            if ctx.parents.len() > 1 {
                 out.extend_from_slice(b"Merge:");
-                for pid in &parents {
+                for pid in ctx.parents {
                     out.push(b' ');
-                    out.extend_from_slice(ctx.abbrev.borrow_mut().get(*pid).as_bytes());
+                    out.extend_from_slice(ctx.abbrev.borrow_mut().get(pid.attach(ctx.repo)).as_bytes());
                 }
                 out.push(b'\n');
             }

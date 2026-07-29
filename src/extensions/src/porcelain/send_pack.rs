@@ -321,7 +321,7 @@ fn push(st: &State) -> Result<ExitCode> {
 /// not a repository — the case `git-receive-pack` would have refused on the far
 /// end. `None` for anything reachable, and for any destination that is not a
 /// local path, whose failures belong to the transport that owns them.
-fn local_dest_that_is_not_a_repository(dest: &str) -> Option<&str> {
+pub(crate) fn local_dest_that_is_not_a_repository(dest: &str) -> Option<&str> {
     let url = gix::url::parse(dest.into()).ok()?;
     if url.scheme != gix::url::Scheme::File {
         return None;
@@ -367,6 +367,7 @@ fn build_requests(repo: &gix::Repository, st: &State) -> Result<Vec<Request>> {
                     expected: None,
                     only_if_absent: false,
                     check_reachable: None,
+                explicit_delete: false,
                 });
             }
         }
@@ -395,6 +396,7 @@ fn build_requests(repo: &gix::Repository, st: &State) -> Result<Vec<Request>> {
                 expected: None,
                 only_if_absent: false,
                 check_reachable: None,
+                explicit_delete: false,
             });
             continue;
         }
@@ -411,6 +413,7 @@ fn build_requests(repo: &gix::Repository, st: &State) -> Result<Vec<Request>> {
             expected: None,
             only_if_absent: false,
             check_reachable: None,
+                explicit_delete: false,
         });
     }
     Ok(requests)

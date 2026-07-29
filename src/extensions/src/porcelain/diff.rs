@@ -9,10 +9,15 @@
 //! * `git diff <revA> <revB>`         — tree vs. tree (also `<revA>..<revB>`)
 //!
 //! Output formats follow `diff.c`'s model: `--raw`, `--numstat`, `--stat`,
-//! `--shortstat`, `--name-only`, `--name-status` and the unified patch can be
-//! combined, are emitted in git's fixed order (raw, numstat, stat, shortstat,
-//! blank line, patch), and `--name-only`/`--name-status`/`-s` suppress every
-//! other format exactly like `diff_setup_done()` does.
+//! `--shortstat`, `--dirstat`, `--name-only`, `--name-status` and the unified
+//! patch can be combined, are emitted in git's fixed order (raw, numstat, stat,
+//! shortstat, dirstat, summary, blank line, patch), and
+//! `--name-only`/`--name-status`/`-s` suppress every other format exactly like
+//! `diff_setup_done()` does.
+//!
+//! `--no-index <a> <b>` compares two paths on disk with no repository involved and
+//! is answered by [`super::diff_no_index`], which the entry point dispatches to
+//! before discovery is attempted.
 //!
 //! Beyond the format selectors, these options are honored: `-R` (reverse, for
 //! tree/tree and `--cached` pairs), `-z`, `--full-index`, `--abbrev[=<n>]`,
@@ -24,7 +29,12 @@
 //! `--patch-with-raw`, `--patch-with-stat`, `--exit-code`, `--quiet`,
 //! `--minimal`/`--diff-algorithm=<myers|minimal|histogram>`,
 //! `--indent-heuristic`/`--no-indent-heuristic` (with the `diff.indentHeuristic`
-//! default), `-O<file>` (with the `diff.orderFile` default), and
+//! default), `-O<file>` (with the `diff.orderFile` default),
+//! `-W`/`--function-context` (which grows each hunk to its enclosing function
+//! through the `xdl_emit_diff` port in [`super::diff_pairs`]),
+//! `--dirstat[=<params>]`/`--dirstat-by-file[=<params>]`/`--cumulative` (whose
+//! damage is `diffcore_count_changes()`'s, and whose walk is shared with
+//! `diff-files`), and
 //! merge-base ranges `<a>...<b>` (diffed as `merge-base(a,b)` against `b`).
 //! Submodule/gitlink (`160000`) changes render as the short-format
 //! `Subproject commit <oid>` diff for tree/tree and `--cached` pairs.
@@ -58,8 +68,6 @@
 //! * `--line-prefix=<s>` is reproduced by a whole-buffer pass and so only tracks the
 //!   newline-terminated formats; combining it with `-z` (NUL-separated records) is
 //!   not byte-faithful.
-//! * Hunk *section headings* (the text after the second `@@`, i.e. the enclosing function)
-//!   are not emitted — gitoxide's unified-diff writer does not compute them.
 //! * Magic pathspecs (`:(...)`) and glob pathspecs bail; literal path / directory-prefix
 //!   filtering is supported.
 //! * `--color-moved[=<mode>]`, `--color-moved-ws=`, `--word-diff[=]`,
@@ -101,6 +109,7 @@ const F_NAME_STATUS: u32 = 1 << 5;
 const F_PATCH: u32 = 1 << 6;
 const F_NO_OUTPUT: u32 = 1 << 7;
 const F_SUMMARY: u32 = 1 << 8;
+const F_DIRSTAT: u32 = 1 << 9;
 
 /// The exact `git diff` usage stream, printed on a usage error (exit 129).
 const USAGE: &str = "usage: git diff [<options>] [<commit>] [--] [<path>...]\n   or: git diff [<options>] --cached [--merge-base] [<commit>] [--] [<path>...]\n   or: git diff [<options>] [--merge-base] <commit> [<commit>...] <commit> [--] [<path>...]\n   or: git diff [<options>] <commit>...<commit> [--] [<path>...]\n   or: git diff [<options>] <blob> <blob>\n   or: git diff [<options>] --no-index [--] <path> <path> [<pathspec>...]\n\ncommon diff options:\n  -z            output diff-raw with lines terminated with NUL.\n  -p            output patch format.\n  -u            synonym for -p.\n  --patch-with-raw\n                output both a patch and the diff-raw format.\n  --stat        show diffstat instead of patch.\n  --numstat     show numeric diffstat instead of patch.\n  --patch-with-stat\n                output a patch and prepend its diffstat.\n  --name-only   show only names of changed files.\n  --name-status show names and status of changed files.\n  --full-index  show full object name on index lines.\n  --abbrev=<n>  abbreviate object names in diff-tree header and diff-raw.\n  -R            swap input file pairs.\n  -B            detect complete rewrites.\n  -M            detect renames.\n  -C            detect copies.\n  --find-copies-harder\n                try unchanged files as candidate for copy detection.\n  -l<n>         limit rename attempts up to <n> paths.\n  -O<file>      reorder diffs according to the <file>.\n  -S<string>    find filepair whose only one side contains the string.\n  --pickaxe-all\n                show all files diff when -S is used and hit is found.\n  -a  --text    treat all files as text.\n\n";
@@ -131,7 +140,7 @@ struct Render {
 
 /// How lines are compared, mirroring xdiff's `XDF_*` whitespace flags.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Whitespace {
+pub(crate) enum Whitespace {
     Keep,
     /// `-w` / `--ignore-all-space`: every whitespace byte is ignored.
     IgnoreAll,
@@ -193,6 +202,12 @@ impl Delta {
         self.src_path.as_ref().unwrap_or(&self.path)
     }
 
+    /// `DIFF_FILE_VALID(p->two)`: whether the pair has a post-image at all, which is
+    /// what `show_dirstat()` tests before charging a deletion's whole size as damage.
+    fn new_valid(&self) -> bool {
+        !matches!(self.new, NewSide::Absent)
+    }
+
     /// `true` for a rename or copy, i.e. a pair whose two sides have different paths.
     fn renamed(&self) -> bool {
         matches!(self.status, b'R' | b'C')
@@ -231,6 +246,11 @@ struct Analysis {
     /// `check_blank_at_eof()`: where the run of blank lines the change lengthened
     /// begins in the pre- and post-image. `(0, 0)` switches the check off.
     blank_at_eof: (usize, usize),
+    /// `show_dirstat()`'s per-file damage in its default (content) mode: how many
+    /// bytes of this file the change touched, from `diffcore_count_changes()`.
+    /// Computed only when `--dirstat` asked for it, since it costs a second pass
+    /// over both images — and for a binary pair, a read of both blobs.
+    damage: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -238,6 +258,11 @@ struct Analysis {
 // ---------------------------------------------------------------------------
 
 pub fn diff(args: &[String]) -> Result<ExitCode> {
+    // `builtin_diff()` splits before anything else: `--no-index` compares two paths
+    // on disk and needs no repository, so it cannot wait for discovery below.
+    if args.iter().take_while(|a| *a != "--").any(|a| a == "--no-index") {
+        return super::diff_no_index::run(args);
+    }
     let mut cached = false;
     let mut ctx: u32 = 3;
     let mut ws = Whitespace::Keep;
@@ -254,12 +279,18 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     // `--relative[=<path>]`: the prefix stripped from every reported path (with a
     // trailing slash), or `None` when paths are shown from the repository root.
     let mut relative: Option<String> = None;
+    // `--check`: `DIFF_FORMAT_CHECKDIFF`.
+    let mut check = false;
     let mut src_prefix: Vec<u8> = b"a/".to_vec();
     let mut dst_prefix: Vec<u8> = b"b/".to_vec();
     // `--line-prefix=<s>`: prepended to every emitted line (`diff_line_prefix()`).
     let mut line_prefix: Vec<u8> = Vec::new();
     // `--compact-summary`: annotate `--stat` names with create/delete/mode info.
     let mut compact_summary = false;
+    let mut func_context = false;
+    // `--dirstat`'s parameter block (`struct dirstat_opts`), shared with the
+    // `diff-files`/`diff-index` port that renders it.
+    let mut dirstat = super::diff_files::DirStat::default();
     let mut diff_filter: Option<Vec<u8>> = None;
     let mut algorithm: Option<gix::diff::blob::Algorithm> = None;
     // `XDF_INDENT_HEURISTIC`, on unless `diff.indentHeuristic` or
@@ -448,6 +479,10 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
             "--" => after_dashdash = true,
             "--cached" | "--staged" => cached = true,
             "--raw" => fmt |= F_RAW,
+            // `--check`: report whitespace errors instead of a diff (`diff.c`s
+            // `DIFF_FORMAT_CHECKDIFF`), which is why it replaces every other format.
+            "--check" => check = true,
+            "--no-check" => check = false,
             "--numstat" => fmt |= F_NUMSTAT,
             "--shortstat" => fmt |= F_SHORTSTAT,
             "--stat" => fmt |= F_DIFFSTAT,
@@ -456,6 +491,31 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
             "-p" | "-u" | "--patch" => fmt |= F_PATCH,
             "-s" | "--no-patch" => fmt |= F_NO_OUTPUT,
             "--summary" => fmt |= F_SUMMARY,
+            // `--dirstat[=<params>]` / `--dirstat-by-file[=<params>]` / `--cumulative`
+            // (`diff_opt_dirstat()`), all of which turn the format on.
+            "--dirstat" => fmt |= F_DIRSTAT,
+            "--dirstat-by-file" => {
+                fmt |= F_DIRSTAT;
+                dirstat.by_file = true;
+            }
+            "--cumulative" => {
+                fmt |= F_DIRSTAT;
+                dirstat.cumulative = true;
+            }
+            s if s.starts_with("--dirstat=") || s.starts_with("--dirstat-by-file=") => {
+                let by_file = s.starts_with("--dirstat-by-file=");
+                let params = s.split_once('=').map(|(_, v)| v).unwrap_or_default();
+                let errors = super::diff_files::parse_dirstat_params(params, &mut dirstat);
+                if !errors.is_empty() {
+                    // `parse_dirstat_opt()`'s `die()`, carrying the accumulated text.
+                    eprint!("fatal: Failed to parse --dirstat/-X option parameter:\n{errors}\n");
+                    return Ok(ExitCode::from(128));
+                }
+                if by_file {
+                    dirstat.by_file = true;
+                }
+                fmt |= F_DIRSTAT;
+            }
             // `--compact-summary` (`diff_opt_compact_summary()`): sets the
             // stat-with-summary flag AND turns on `--stat`. `--no-compact-summary`
             // only clears the flag; it never touches the output format.
@@ -514,6 +574,10 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
             | "--no-textconv" | "--ita-invisible-in-index" | "--ita-visible-in-index" => {}
             // `XDF_INDENT_HEURISTIC` (`OPT_BIT` on `xdl_opts`): where a hunk that can
             // slide freely finally lands.
+            // `-W`/`--function-context` (`XDL_EMIT_FUNCCONTEXT`): grow every hunk
+            // out to the enclosing function on both ends.
+            "-W" | "--function-context" => func_context = true,
+            "--no-function-context" => func_context = false,
             "--indent-heuristic" => indent_heuristic = true,
             "--no-indent-heuristic" => indent_heuristic = false,
             // `-O<file>` (`OPT_FILENAME('O', ...)`): the value may be glued on or be
@@ -944,13 +1008,19 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     // ---- analyze every delta once -----------------------------------------
     // `--quiet`/`-s` produce no output, so the patch bodies are never needed.
     let workdir = repo.workdir().map(|p| p.to_owned());
-    let want_patch = fmt & F_PATCH != 0 && !quiet;
+    let want_patch = (fmt & F_PATCH != 0 || check) && !quiet;
     // Analysis reads both sides of every changed file, so it runs only for the
     // formats that consume it: the counts (`--numstat`/`--stat`/`--shortstat`)
     // and the patch body. `--name-only`, `--name-status`, `--raw` and `--summary`
     // render from the change list alone, and paying for blob reads there is pure
     // waste — the same reason `--quiet` skips it.
-    let want_analysis = fmt & (F_NUMSTAT | F_DIFFSTAT | F_SHORTSTAT | F_PATCH) != 0;
+    // `--check` walks the same hunks the patch body is built from, so it needs
+    // the analysis even though it prints no patch.
+    // `--dirstat` needs the analysis too: its `lines` mode reads the same counts
+    // the stat formats do, and its default mode needs each pair's content damage.
+    let want_dirstat = fmt & F_DIRSTAT != 0;
+    let want_analysis =
+        check || want_dirstat || fmt & (F_NUMSTAT | F_DIFFSTAT | F_SHORTSTAT | F_PATCH) != 0;
     let mut analyses: Vec<Analysis> = Vec::new();
     if !quiet && want_analysis {
         analyses = analyze_all(
@@ -965,6 +1035,8 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
             want_patch,
             algorithm,
             worktree_mode,
+            want_dirstat && !dirstat.by_line && !dirstat.by_file,
+            func_context,
         )?;
     }
 
@@ -1010,6 +1082,22 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
         }
     }
 
+    // `--check` replaces every other format: `diff_flush()` routes the queue
+    // through `diff_flush_checkdiff()`, which prints one line per added line
+    // that breaks a whitespace rule and nothing else. Its exit status is 2, the
+    // one `git diff --check` gives a caller that greps for problems.
+    if check {
+        let mut found = false;
+        for (delta, analysis) in deltas.iter().zip(analyses.iter()) {
+            found |= report_whitespace(delta, analysis, ws_rule);
+        }
+        return Ok(if found {
+            ExitCode::from(2)
+        } else {
+            ExitCode::SUCCESS
+        });
+    }
+
     // ---- render, in `diff_flush()` order ----------------------------------
     // `diff_flush()` bails out before printing anything at all when the change
     // queue is empty, so even `--shortstat` stays silent on a clean tree.
@@ -1046,6 +1134,36 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
             if fmt & F_SHORTSTAT != 0 {
                 render_shortstat(&mut out, &deltas, &analyses);
             }
+            separator = true;
+        }
+
+        // `diff_flush()`: dirstat sits between the stat formats and the summary.
+        // Its `lines` mode reuses the diffstat counts (a binary pair is charged one
+        // unit per 64 bytes), `--dirstat-by-file` charges one unit per changed file,
+        // and the default mode uses the content damage computed with the pair.
+        if fmt & F_DIRSTAT != 0 {
+            let files: Vec<(BString, u64)> = deltas
+                .iter()
+                .zip(analyses.iter())
+                .map(|(d, an)| {
+                    let damage = if dirstat.by_file {
+                        1
+                    } else if dirstat.by_line {
+                        // For a binary pair `added`/`deleted` are the two sizes,
+                        // which `show_dirstat_by_line()` charges in 64-byte units.
+                        let lines = u64::from(an.added) + u64::from(an.deleted);
+                        if an.binary { lines.div_ceil(64) } else { lines }
+                    } else if an.damage == 0 {
+                        // `show_dirstat()` charges a pair that changed at all a
+                        // single unit, so a mode-only change still shows up.
+                        1
+                    } else {
+                        an.damage
+                    };
+                    (d.path.clone(), damage)
+                })
+                .collect();
+            super::diff_files::render_dirstat(&mut out, files, &dirstat);
             separator = true;
         }
 
@@ -2101,6 +2219,8 @@ fn commit_patch_with(
             true,
             None,
             None,
+            false,
+            false,
         )?;
         render_patch(&mut out, repo, delta, &an, ctx, r)?;
     }
@@ -2146,6 +2266,8 @@ pub(crate) fn line_range_patch(
             true,
             None,
             Some(ranges),
+            false,
+            false,
         )?;
         render_patch(&mut out, repo, &delta, &an, ctx, &r)?;
     }
@@ -2214,6 +2336,10 @@ fn analyze_all(
     want_patch: bool,
     algorithm: Option<gix::diff::blob::Algorithm>,
     worktree_mode: bool,
+    // Whether `--dirstat` will need each pair's content damage.
+    want_dirstat: bool,
+    // `-W`: emit hunks grown to enclosing-function boundaries.
+    func_context: bool,
 ) -> Result<Vec<Analysis>> {
     // Two files per worker. A handle clone plus a fresh blob platform is real
     // setup, but analyzing one file means reading and diffing both its sides —
@@ -2236,6 +2362,8 @@ fn analyze_all(
                     want_patch,
                     algorithm,
                     None,
+                    want_dirstat,
+                    func_context,
                 )
             })
             .collect();
@@ -2277,6 +2405,8 @@ fn analyze_all(
                         want_patch,
                         algorithm,
                         None,
+                        want_dirstat,
+                        func_context,
                     )?;
                     mine.push((i, an));
                 }
@@ -2319,6 +2449,11 @@ fn analyze(
     // `builtin_diff`'s `line_ranges`: under `-L`, the tracked 0-based ranges the
     // emitted hunks are clipped to.
     line_ranges: Option<&[super::line_log::Range]>,
+    // Whether `--dirstat` needs each pair's content damage, which is a second pass
+    // over both images that nothing else asks for.
+    want_dirstat: bool,
+    // `-W`: hunks grown to enclosing-function boundaries.
+    func_context: bool,
 ) -> Result<Analysis> {
     let null = hash_kind.null();
     if delta.unmerged {
@@ -2329,6 +2464,7 @@ fn analyze(
             binary: false,
             hunks: None,
             blank_at_eof: (0, 0),
+            damage: 0,
         });
     }
 
@@ -2392,11 +2528,37 @@ fn analyze(
     match prep.operation {
         Operation::SourceOrDestinationIsBinary => Ok(Analysis {
             new_id,
-            added: 0,
-            deleted: 0,
+            // `diffstat_consume()` never sees a binary pair; `show_stats()` reads
+            // the two *sizes* out of the filespecs instead and prints them as
+            // `Bin <old> -> <new> bytes`, so that is what these two carry here.
+            // Every consumer that counts lines skips a pair with `binary` set.
+            added: blob_size_new(objects, delta, workdir, path)?,
+            deleted: blob_size_old(objects, delta)?,
             binary: true,
             hunks: None,
             blank_at_eof: (0, 0),
+            // `show_dirstat()` weighs a binary pair like any other, on the raw
+            // bytes with `hash_chars()` in its 64-byte-chunk mode. The blob
+            // pipeline withholds the data for a binary pair, so it is read back
+            // here — and only when `--dirstat` is going to use it.
+            damage: if want_dirstat {
+                let old_bytes = delta
+                    .old
+                    .map(|(id, _)| read_blob(objects, id))
+                    .transpose()?
+                    .unwrap_or_default();
+                let new_bytes = match &delta.new {
+                    NewSide::Blob(id, _) => read_blob(objects, *id)?,
+                    NewSide::Worktree(_) => workdir
+                        .map(|base| std::fs::read(base.join(gix::path::from_bstr(path))))
+                        .transpose()?
+                        .unwrap_or_default(),
+                    NewSide::Absent => Vec::new(),
+                };
+                byte_damage(&old_bytes, &new_bytes, delta.old.is_some(), delta.new_valid(), true)
+            } else {
+                0
+            },
         }),
         Operation::ExternalCommand { .. } => {
             bail!("external diff drivers are not supported for {path:?}")
@@ -2425,6 +2587,11 @@ fn analyze(
                     binary: false,
                     hunks,
                     blank_at_eof,
+                    damage: if want_dirstat {
+                        byte_damage(old_data, new_data, delta.old.is_some(), delta.new_valid(), false)
+                    } else {
+                        0
+                    },
                 });
             }
             let before: Vec<&[u8]> = byte_lines(old_data);
@@ -2452,6 +2619,38 @@ fn analyze(
                                 .consume()?,
                         )
                     }
+                    // `-W` changes the hunk *geometry*, not just the text inside
+                    // it: both ends grow to the enclosing function and neighbours
+                    // that end up overlapping merge. gitoxide's unified writer has
+                    // one fixed context on both sides and cannot express that, so
+                    // this takes the `xdl_emit_diff` port instead — the same
+                    // emitter `git diff-pairs` runs, driven off the same change
+                    // script.
+                    None if func_context => {
+                        let changes: Vec<super::diff_pairs::Change> = diff
+                            .hunks()
+                            .map(|h| super::diff_pairs::Change {
+                                i1: h.before.start as usize,
+                                chg1: h.before.len(),
+                                i2: h.after.start as usize,
+                                chg2: h.after.len(),
+                                // `--ignore-blank-lines`/`-I` are not honoured on
+                                // this path, so no change is ever ignorable.
+                                ignore: false,
+                            })
+                            .collect();
+                        let (_, _, buf) = super::diff_pairs::emit_unified(
+                            &before,
+                            &after,
+                            &changes,
+                            &super::diff_pairs::EmitGeometry {
+                                ctx: ctx as usize,
+                                inter_hunk_ctx: 0,
+                                func_context: true,
+                            },
+                        );
+                        Some(buf)
+                    }
                     None => {
                         let sink = PatchSink {
                             buf: Vec::new(),
@@ -2478,9 +2677,157 @@ fn analyze(
                 binary: false,
                 hunks,
                 blank_at_eof,
+                damage: if want_dirstat {
+                    byte_damage(old_data, new_data, delta.old.is_some(), delta.new_valid(), false)
+                } else {
+                    0
+                },
             })
         }
     }
+}
+
+/// `diff_populate_filespec(..., CHECK_SIZE_ONLY)` for the pre-image: the blob's
+/// size without reading it, which is all `show_stats()` wants for a binary pair.
+fn blob_size_old(objects: &gix::OdbHandle, delta: &Delta) -> Result<u32> {
+    use gix::objs::FindHeader;
+    let Some((id, _)) = delta.old else { return Ok(0) };
+    Ok(objects.try_header(&id).ok().flatten().map(|h| h.size).unwrap_or(0) as u32)
+}
+
+/// The post-image half of the same, reading a worktree side's size off disk.
+fn blob_size_new(
+    objects: &gix::OdbHandle,
+    delta: &Delta,
+    workdir: Option<&std::path::Path>,
+    path: &gix::bstr::BStr,
+) -> Result<u32> {
+    use gix::objs::FindHeader;
+    match &delta.new {
+        NewSide::Absent => Ok(0),
+        NewSide::Blob(id, _) => Ok(objects.try_header(id).ok().flatten().map(|h| h.size).unwrap_or(0) as u32),
+        NewSide::Worktree(_) => {
+            let Some(base) = workdir else { return Ok(0) };
+            let full = base.join(gix::path::from_bstr(path));
+            Ok(std::fs::metadata(&full).map(|m| m.len()).unwrap_or(0) as u32)
+        }
+    }
+}
+
+/// Read a blob's bytes straight from the object database, for the one case the
+/// blob pipeline declines to hand them over: a pair it classified as binary.
+fn read_blob(objects: &gix::OdbHandle, id: ObjectId) -> Result<Vec<u8>> {
+    use gix::prelude::FindExt;
+    let mut buf = Vec::new();
+    objects.find_blob(&id, &mut buf)?;
+    Ok(buf.clone())
+}
+
+/// `show_dirstat()`'s content-mode damage for one pair (diff.c:3033-3068): the
+/// bytes of the pre-image that did not survive, plus the bytes the post-image
+/// gained. A pair with only one side is charged that side's whole size, which is
+/// how a pure addition or deletion is weighed against a modification.
+///
+/// `diffcore_count_changes()` is the same chunk-hashing counter rename detection
+/// scores with, so `--dirstat` and `-M` agree about how much a file moved.
+fn byte_damage(old_data: &[u8], new_data: &[u8], old_valid: bool, new_valid: bool, binary: bool) -> u64 {
+    match (old_valid, new_valid) {
+        (true, true) => {
+            let (copied, added) =
+                super::diff_files::count_changes_sides(old_data, !binary, new_data, !binary);
+            (old_data.len() as u64).saturating_sub(copied) + added
+        }
+        (true, false) => old_data.len() as u64,
+        (false, true) => new_data.len() as u64,
+        (false, false) => 0,
+    }
+}
+
+/// `diff_filespec_is_binary()`: a NUL byte in the first 8000 bytes, which is the
+/// only test `--no-index` has to go on for a path with no attributes behind it.
+pub(crate) fn looks_binary(buf: &[u8]) -> bool {
+    buf.get(..8000).unwrap_or(buf).contains(&0)
+}
+
+/// The hunk body of one `--no-index` pair, produced by the same `xdl_emit_diff`
+/// port the tracked patch path uses so the two cannot drift apart.
+pub(crate) fn no_index_body(
+    old_data: &[u8],
+    new_data: &[u8],
+    geom: &super::diff_pairs::EmitGeometry,
+    ws: Whitespace,
+    binary: bool,
+) -> (u32, u32, Vec<u8>) {
+    if binary {
+        return (0, 0, Vec::new());
+    }
+    let before: Vec<&[u8]> = byte_lines(old_data);
+    let after: Vec<&[u8]> = byte_lines(new_data);
+    let mut input: InternedInput<Vec<u8>> = InternedInput::default();
+    input.update_before(before.iter().map(|l| normalize(l, ws)));
+    input.update_after(after.iter().map(|l| normalize(l, ws)));
+    let diff = super::diff_pairs::compute_compacted(
+        gix::diff::blob::Algorithm::Histogram,
+        &input,
+        &before,
+        &after,
+        true,
+    );
+    let changes: Vec<super::diff_pairs::Change> = diff
+        .hunks()
+        .map(|h| super::diff_pairs::Change {
+            i1: h.before.start as usize,
+            chg1: h.before.len(),
+            i2: h.after.start as usize,
+            chg2: h.after.len(),
+            ignore: false,
+        })
+        .collect();
+    super::diff_pairs::emit_unified(&before, &after, &changes, geom)
+}
+
+/// `--stat` for `--no-index` rows, which have two names rather than one. Each row
+/// becomes the synthetic rename pair `show_stats()` would have been handed, so the
+/// column widths and the `{a => b}/c` name compaction are the tracked ones.
+pub(crate) fn render_rows_stat(
+    out: &mut Vec<u8>,
+    rows: &[(BString, BString, u32, u32, bool)],
+    colors: &diff_color::DiffColors,
+) {
+    let (deltas, analyses) = synthetic_rows(rows);
+    render_stat(out, &deltas, &analyses, false, 0, 0, colors);
+}
+
+/// `--numstat` for the same rows.
+pub(crate) fn render_rows_numstat(out: &mut Vec<u8>, rows: &[(BString, BString, u32, u32, bool)], z: bool) {
+    let (deltas, analyses) = synthetic_rows(rows);
+    render_numstat(out, &deltas, &analyses, z);
+}
+
+/// The `(Delta, Analysis)` pair a `--no-index` row stands for: a rename when the
+/// two names differ, an ordinary modification when they do not.
+fn synthetic_rows(rows: &[(BString, BString, u32, u32, bool)]) -> (Vec<Delta>, Vec<Analysis>) {
+    let null = gix::hash::Kind::Sha1.null();
+    let mut deltas = Vec::with_capacity(rows.len());
+    let mut analyses = Vec::with_capacity(rows.len());
+    for (a, b, added, deleted, binary) in rows {
+        let mut d = Delta::plain(b.clone(), Some((null, EntryKind::Blob)), NewSide::Blob(null, EntryKind::Blob));
+        if a != b {
+            d.src_path = Some(a.clone());
+            d.status = b'R';
+        }
+        deltas.push(d);
+        analyses.push(Analysis {
+            new_id: null,
+            added: *added,
+            deleted: *deleted,
+            binary: *binary,
+            hunks: None,
+            blank_at_eof: (0, 0),
+            damage: 0,
+        });
+    }
+    (deltas, analyses)
 }
 
 /// `count_lines()`: lines in a buffer, counting an unterminated final line.
@@ -2602,6 +2949,15 @@ fn analyze_gitlink(
         hunks,
         // A synthetic `Subproject commit <oid>` blob never ends in a blank line.
         blank_at_eof: (0, 0),
+        // The same synthetic images `builtin_diff()` hands the rest of the diff
+        // machinery, so a submodule bump is damage like any other content change.
+        damage: byte_damage(
+            &before.concat(),
+            &after.concat(),
+            old_commit.is_some(),
+            new_commit.is_some(),
+            false,
+        ),
     })
 }
 
@@ -2913,7 +3269,7 @@ fn stat_totals(deltas: &[Delta], analyses: &[Analysis]) -> (u32, u32, u32) {
 }
 
 /// `print_stat_summary_inserts_deletes()`.
-fn stat_summary(out: &mut Vec<u8>, files: u32, insertions: u32, deletions: u32) {
+pub(crate) fn stat_summary(out: &mut Vec<u8>, files: u32, insertions: u32, deletions: u32) {
     if files == 0 {
         push_str(out, " 0 files changed\n");
         return;
@@ -4200,4 +4556,82 @@ impl ConsumeHunk for PatchSink<'_> {
     fn finish(self) -> Vec<u8> {
         self.buf
     }
+}
+
+/// `checkdiff_consume()` (diff.c): report every added line of `delta` that
+/// breaks a whitespace rule, and say whether any did.
+///
+/// The hunk text the analysis already produced is what git walks: each `@@`
+/// header resets the new-file line counter, and every `+` line is checked and,
+/// when it fails, printed under a `<path>:<line>: <problems>.` header. A blank
+/// line inside the run the change lengthened at end-of-file additionally trips
+/// `blank-at-eof`, which is why the analysis carries that boundary.
+fn report_whitespace(delta: &Delta, analysis: &Analysis, ws_rule: u32) -> bool {
+    let Some(hunks) = &analysis.hunks else {
+        return false;
+    };
+    let mut found = false;
+    let mut lineno = 0usize;
+    for line in hunks.split_inclusive(|&b| b == b'\n') {
+        if line.starts_with(b"@@") {
+            // `@@ -a,b +c,d @@` — the new-side start, minus one so the first
+            // line of the hunk lands on `c`.
+            lineno = new_hunk_start(line).saturating_sub(1);
+            continue;
+        }
+        match line.first() {
+            Some(b' ') => lineno += 1,
+            Some(b'+') => {
+                lineno += 1;
+                let body = &line[1..];
+                let bad = super::diff_color::ws_check(body, ws_rule);
+                if bad == 0 {
+                    continue;
+                }
+                found = true;
+                let mut stdout = std::io::stdout().lock();
+                let _ = writeln!(
+                    stdout,
+                    "{}:{lineno}: {}.",
+                    delta.path,
+                    super::diff_color::whitespace_error_string(bad)
+                );
+                let _ = stdout.write_all(line);
+                if !line.ends_with(b"\n") {
+                    let _ = stdout.write_all(b"\n");
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // `diff_flush_checkdiff` reports `blank-at-eof` once per file rather than per
+    // line, naming where the lengthened run of blank lines starts and echoing
+    // nothing — it is a property of the file, not of any one added line.
+    let (blank_at_eof, _) = analysis.blank_at_eof;
+    if ws_rule & super::diff_color::WS_BLANK_AT_EOF != 0 && blank_at_eof != 0 {
+        found = true;
+        println!(
+            "{}:{blank_at_eof}: {}.",
+            delta.path,
+            super::diff_color::whitespace_error_string(super::diff_color::WS_BLANK_AT_EOF)
+        );
+    }
+    found
+}
+
+/// The `+<start>` field of an `@@ -a,b +c,d @@` header.
+fn new_hunk_start(header: &[u8]) -> usize {
+    let Some(plus) = header.iter().position(|&b| b == b'+') else {
+        return 1;
+    };
+    let digits: Vec<u8> = header[plus + 1..]
+        .iter()
+        .copied()
+        .take_while(u8::is_ascii_digit)
+        .collect();
+    std::str::from_utf8(&digits)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1)
 }

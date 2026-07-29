@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use prodash::Root as _;
 use std::io::IsTerminal;
 use std::num::NonZeroU32;
@@ -426,7 +426,16 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     // Resolve the shallow-boundary selectors into a single `Shallow` value. The
     // exclude form supersedes a lone `--shallow-since`, which supersedes
     // `--depth`, matching git's treatment of them as one deepen group.
-    let shallow = if !shallow_exclude.is_empty() {
+    // Remembered before the selectors are folded together, so the local-clone
+    // warning below can name the flag the caller actually typed.
+    let shallow_depth_given = depth.is_some();
+    let shallow_since_given = shallow_since.is_some();
+    let shallow_exclude_given = !shallow_exclude.is_empty();
+    let local_path_source = !url_str.contains("://") && Path::new(url_str).is_dir();
+    let shallow = if local_path_source {
+        // Ignored for a local path clone — see the warning at the banner.
+        Shallow::NoChange
+    } else if !shallow_exclude.is_empty() {
         Shallow::Exclude {
             remote_refs: shallow_exclude,
             since_cutoff: shallow_since,
@@ -483,6 +492,25 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
             eprintln!("Cloning into bare repository '{dir}'...");
         } else {
             eprintln!("Cloning into '{dir}'...");
+        }
+    }
+
+    // `cmd_clone`'s local-clone block: when the source is a *path* on this
+    // machine, git copies the object store instead of running the transport, so
+    // every shallow selector is ignored — with a warning naming the `file://`
+    // spelling that does go through the transport. Erroring instead (the server
+    // "lacks" the `shallow` capability because there is no server) turns a
+    // working `git clone --depth 1 ../repo` into a failure.
+    let local_path_clone = !url_str.contains("://") && Path::new(url_str).is_dir();
+    if local_path_clone && !quiet {
+        for (given, flag) in [
+            (shallow_depth_given, "--depth"),
+            (shallow_since_given, "--shallow-since"),
+            (shallow_exclude_given, "--shallow-exclude"),
+        ] {
+            if given {
+                eprintln!("warning: {flag} is ignored in local clones; use file:// instead.");
+            }
         }
     }
 
@@ -569,6 +597,17 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
         prepare = prepare.with_in_memory_config_overrides(overrides);
     }
 
+    // git-clone(1) on `--depth`: "Implies `--single-branch` unless
+    // `--no-single-branch` is given" — `option_single_branch` defaults to whether
+    // any deepen selector was used, which is the `--depth` / `--shallow-since` /
+    // `--shallow-exclude` group as a whole (clone.c:1370). A local-path clone
+    // ignores the selectors entirely, so it must not inherit the implication.
+    let single_branch = single_branch.or_else(|| {
+        (!local_path_source
+            && (shallow_depth_given || shallow_since_given || shallow_exclude_given))
+            .then_some(true)
+    });
+
     // Decide which refspec set this clone needs and, with it, which tag mode.
     // Supplying `configure_remote` at all suppresses gitoxide's own clone default
     // of `Tags::All`, so every plan that is not a single-branch clone has to ask
@@ -593,14 +632,25 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     // `--single-branch` restricts the branches fetched and nothing else. A
     // single-branch clone keeps every tag, exactly as a full one does; only
     // `--no-tags` (which clears `option_tags`) drops them.
-    let forced_all_tags = matches!(
-        plan,
-        Some(Refspecs::Bare) | Some(Refspecs::Wildcard) | Some(Refspecs::Single { .. })
-    ) && tags != Some(Tags::None);
+    let forced_all_tags =
+        matches!(plan, Some(Refspecs::Bare) | Some(Refspecs::Wildcard)) && tags != Some(Tags::None);
+    // A single-branch clone gets its tags the way git's does: `include-tag` on the
+    // request, and a `refs/tags/<name>` written afterwards for every advertised tag
+    // whose object the pack turned out to carry (`write_followtags()`,
+    // clone.c:686-700). Wanting the tags outright instead — which `Tags::All` does —
+    // is the difference between the two only until a depth is in play, where it
+    // decides the shape of the clone: an explicit `want` for a tag outside the
+    // window makes the server open a second shallow boundary at it and send its
+    // commit, so `--depth 1` lands two `.git/shallow` entries and twice the objects
+    // git fetches. `--depth` implies `--single-branch`, so that is the common case.
+    let included_tags =
+        matches!(plan, Some(Refspecs::Single { .. })) && tags != Some(Tags::None);
     let fetch_tags: Option<Tags> = if tags == Some(Tags::None) || mirror {
         Some(Tags::None)
     } else if forced_all_tags {
         Some(Tags::All)
+    } else if included_tags {
+        Some(Tags::Included)
     } else {
         None
     };
@@ -841,6 +891,14 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
         Some(real) => super::init::relocate_git_dir(&git_dir, dst, real)?,
         None => git_dir,
     };
+
+    // `init_db()` creates `refs/heads` and `refs/tags` for every repository it
+    // makes, clone included (`create_default_files()`, setup.c:2073). gitoxide
+    // leaves out whichever of the two the clone had no loose ref to write, and a
+    // bare clone whose refs all landed in `packed-refs` ends up with no `refs`
+    // directory at all — which stock git then refuses to open, because
+    // `is_git_directory()` requires it (setup.c:397).
+    ensure_ref_directories(&git_dir)?;
 
     // Reconcile `.git/config` with what stock git leaves behind: strip the entries
     // gitoxide persisted that git does not, add the ones git writes itself, and
@@ -1165,6 +1223,18 @@ struct ConfigFixups<'a> {
 /// in-memory snapshot when it records `branch.<name>.*`, which would drop
 /// anything written to the file behind its back. The fetch and checkout still
 /// observe them, because they are also handed to gitoxide as in-memory overrides.
+/// The two ref directories every git repository has, whether or not anything was
+/// ever written into them. Missing them is not cosmetic: `is_git_directory()`
+/// tests for `refs`, so a bare clone without it is not a repository as far as
+/// stock git is concerned.
+fn ensure_ref_directories(git_dir: &Path) -> Result<()> {
+    for sub in ["refs/heads", "refs/tags"] {
+        std::fs::create_dir_all(git_dir.join(sub))
+            .with_context(|| format!("could not create {}", git_dir.join(sub).display()))?;
+    }
+    Ok(())
+}
+
 fn finalize_config(git_dir: &Path, fixups: &ConfigFixups<'_>) -> Result<()> {
     if !fixups.set_mirror
         && !fixups.drop_fetch

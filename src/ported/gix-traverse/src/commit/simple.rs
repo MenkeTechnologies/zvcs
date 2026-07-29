@@ -180,6 +180,7 @@ fn compute_hidden_frontier(
     hidden_tips: &[ObjectId],
     objects: &impl gix_object::Find,
     cache: Option<&gix_commitgraph::Graph>,
+    predicate: &mut impl FnMut(&gix_hash::oid) -> bool,
 ) -> Result<gix_revwalk::graph::IdMap<()>, Error> {
     let mut graph = gix_revwalk::Graph::<gix_revwalk::graph::Commit<PaintFlags>>::new(objects, cache);
     let mut queue = gix_revwalk::PriorityQueue::<GenThenTime, ObjectId>::new();
@@ -213,6 +214,15 @@ fn compute_hidden_frontier(
         }
 
         for parent_id in commit.parents.clone() {
+            // The same predicate the visible walk consults, which is where the
+            // caller expresses a graft: a shallow boundary commit's parents are
+            // deliberately absent from the object database, and reading one is
+            // the error this painting pass used to fail with. git never asks for
+            // them either — its rev-list sees the boundary through
+            // `--shallow-file` and treats the commit as parentless.
+            if !predicate(&parent_id) {
+                continue;
+            }
             graph.get_or_insert_full_commit(parent_id, |parent| {
                 if (parent.data & flags) != flags {
                     parent.data |= flags;
@@ -298,6 +308,7 @@ mod init {
     impl<Find, Predicate> Simple<Find, Predicate>
     where
         Find: gix_object::Find,
+        Predicate: FnMut(&gix_hash::oid) -> bool,
     {
         /// Set the `sorting` method.
         pub fn sorting(mut self, sorting: Sorting) -> Result<Self, Error> {
@@ -377,8 +388,13 @@ mod init {
             if visible_tips.is_empty() {
                 return Ok(());
             }
-            self.state.hidden =
-                compute_hidden_frontier(&visible_tips, &hidden_tips, &self.objects, self.cache.as_ref())?;
+            self.state.hidden = compute_hidden_frontier(
+                &visible_tips,
+                &hidden_tips,
+                &self.objects,
+                self.cache.as_ref(),
+                &mut self.predicate,
+            )?;
             self.state.next.retain(|id| !self.state.hidden.contains_key(id));
             self.state.queue = std::mem::replace(&mut self.state.queue, gix_revwalk::PriorityQueue::new())
                 .into_iter_unordered()

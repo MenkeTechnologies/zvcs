@@ -2420,3 +2420,91 @@ mod tests {
         assert_eq!(find_lno(b"@@ -0,0 +1,2 @@\n"), (0, 1));
     }
 }
+
+/// `ws_check()` (ws.c): which rules an added line breaks, as `WS_*` bits.
+///
+/// The trailing newline (and, under `cr-at-eol`, a carriage return before it)
+/// is set aside first so a line's "end" is its last real character; the rest
+/// mirrors `ws_check_emit_1`'s two passes — trailing blanks from the right, the
+/// indent from the left. `WS_BLANK_AT_EOF` is not decided here: it needs the
+/// whole hunk, which is what [`check_blank_at_eof`] answers for the caller.
+pub(crate) fn ws_check(line: &[u8], ws_rule: u32) -> u32 {
+    let mut result = 0u32;
+    let mut len = line.len();
+    if len > 0 && line[len - 1] == b'\n' {
+        len -= 1;
+    }
+    if (ws_rule & WS_CR_AT_EOL) != 0 && len > 0 && line[len - 1] == b'\r' {
+        len -= 1;
+    }
+
+    // Trailing whitespace, scanned right to left.
+    let mut trailing_whitespace: Option<usize> = None;
+    if (ws_rule & WS_BLANK_AT_EOL) != 0 {
+        for i in (0..len).rev() {
+            if is_c_space(line[i]) {
+                trailing_whitespace = Some(i);
+                result |= WS_BLANK_AT_EOL;
+            } else {
+                break;
+            }
+        }
+    }
+    let trailing_whitespace = trailing_whitespace.unwrap_or(len);
+
+    // The indent, scanned left to right.
+    let mut written = 0usize;
+    let mut i = 0usize;
+    while i < trailing_whitespace {
+        if line[i] == b' ' {
+            i += 1;
+            continue;
+        }
+        if line[i] != b'\t' {
+            break;
+        }
+        if (ws_rule & WS_SPACE_BEFORE_TAB) != 0 && written < i {
+            result |= WS_SPACE_BEFORE_TAB;
+        } else if (ws_rule & WS_TAB_IN_INDENT) != 0 {
+            result |= WS_TAB_IN_INDENT;
+        }
+        written = i + 1;
+        i += 1;
+    }
+    if (ws_rule & WS_INDENT_WITH_NON_TAB) != 0 && i - written >= ws_tab_width(ws_rule) {
+        result |= WS_INDENT_WITH_NON_TAB;
+    }
+    result
+}
+
+/// `whitespace_error_string()`: the comma-joined description `--check` and
+/// `apply` print for one line's set of broken rules.
+pub(crate) fn whitespace_error_string(ws: u32) -> String {
+    let mut err = String::new();
+    let mut add = |s: &str| {
+        if !err.is_empty() {
+            err.push_str(", ");
+        }
+        err.push_str(s);
+    };
+    if ws & WS_TRAILING_SPACE == WS_TRAILING_SPACE {
+        add("trailing whitespace");
+    } else {
+        if ws & WS_BLANK_AT_EOL != 0 {
+            add("trailing whitespace");
+        }
+        if ws & WS_BLANK_AT_EOF != 0 {
+            add("new blank line at EOF");
+        }
+    }
+    if ws & WS_SPACE_BEFORE_TAB != 0 {
+        add("space before tab in indent");
+    }
+    if ws & WS_INDENT_WITH_NON_TAB != 0 {
+        add("indent with spaces");
+    }
+    if ws & WS_TAB_IN_INDENT != 0 {
+        add("tab in indent");
+    }
+    err
+}

@@ -2497,7 +2497,7 @@ fn write_squash_msg(repo: &gix::Repository, targets: &[ObjectId], head: ObjectId
 /// Build a tree object from `index` (all stage-0 entries) and return its id, the
 /// standard gix editor pass over the index in path order — the tree `--continue`
 /// commits.
-fn index_tree(repo: &gix::Repository, index: &gix::index::File) -> Result<ObjectId> {
+pub(crate) fn index_tree(repo: &gix::Repository, index: &gix::index::File) -> Result<ObjectId> {
     let backing = index.path_backing();
     let mut editor =
         gix::objs::tree::Editor::new(gix::objs::Tree::empty(), &repo.objects, repo.object_hash());

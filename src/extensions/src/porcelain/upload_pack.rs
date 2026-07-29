@@ -50,22 +50,21 @@
 //! advertisement, with the `ls-refs`, `fetch` and `object-info` commands (see
 //! [`serve_v2`]). Protocol v1 is v0 preceded by a `version 1` pkt-line, as
 //! `builtin/upload-pack.c` has it. Which v2 capabilities are advertised is
-//! documented on [`V2Config`]; `shallow` and `packfile-uris` are deliberately
-//! withheld because the honouring code for them is not written.
+//! documented on [`V2Config`]; `packfile-uris` is deliberately withheld because
+//! the honouring code for it is not written.
+//!
+//! Shallow clients are served on both protocols. `shallow`, `deepen-since`,
+//! `deepen-not` and `deepen-relative` are advertised, the client's `shallow` and
+//! `deepen*` lines are parsed, and [`crate::shallow_serve`] computes the boundary
+//! they describe: the `shallow`/`unshallow` lines go back before the have loop on
+//! v0 and in the `shallow-info` section on v2, and the pack is cut to the window
+//! so nothing behind the boundary is sent. A repository that is itself shallow
+//! contributes its own grafts to that boundary and, with no deepen request in
+//! play, still reports them in the advertisement (upload-pack.c:1438).
 //!
 //! What is *not* served, and why:
 //!
-//!   1. **`shallow`, `deepen-since`, `deepen-not` and `deepen-relative` are
-//!      withheld.** Stock git advertises all four from a fixed string; nothing
-//!      here computes a shallow boundary, so `shallow`/`deepen*` request lines
-//!      are still ignored. Advertising them would invite a client to deepen,
-//!      hand it a complete pack, and leave it recording a cutoff it never
-//!      received — a corrupted clone that looks like a success. A client that
-//!      sees no `shallow` reports "Server does not support shallow clients" up
-//!      front instead. A repository that is itself shallow still gets its
-//!      `shallow` lines in the advertisement, which is not gated on the
-//!      capability (upload-pack.c:1438).
-//!   2. **The pack is built in one piece, not streamed.**
+//!   1. **The pack is built in one piece, not streamed.**
 //!      `pack_objects::pack_bytes_for` returns a finished `Vec<u8>` before a
 //!      byte goes out, so there is no silent producer to interleave keepalives
 //!      with (`uploadpack.keepAlive`, upload-pack.c:382-498) and no progress on
@@ -75,8 +74,7 @@
 //!      repository's own `.git/config` from running commands on the serving
 //!      machine (upload-pack.c:1387, `git_protected_config`). Both keys are
 //!      therefore unread rather than half-honoured. The pack is also never
-//!      thin. `include-tag` is acted on under v2 (see [`add_included_tags`]) but
-//!      is still only advertised, not applied, on the v0 path.
+//!      thin.
 //!
 //! These paths are deliberately not approximated. An `upload-pack` that exited 0
 //! having written a plausible-looking but wrong advertisement would corrupt the
@@ -428,6 +426,9 @@ fn serve_inner(repo: &gix::Repository, advertise_only: bool, stateless_rpc: bool
     // `filter` there may send a `filter` line (upload-pack.c:1143-1145).
     let mut filter_requested = false;
     let mut filter_spec: Option<String> = None;
+    // `data->shallows` and `data->depth`/`deepen_*` — collected here, answered
+    // after the flush that ends the want section.
+    let mut shallow_req = crate::shallow_serve::Request::default();
     while let Some(line) = read_pkt(&mut stdin)? {
         let text = String::from_utf8_lossy(&line);
         let text = text.trim_end();
@@ -466,7 +467,17 @@ fn serve_inner(repo: &gix::Repository, advertise_only: bool, stateless_rpc: bool
             filter_spec = Some(spec.to_string());
             continue;
         }
-        // `shallow`/`deepen*` lines are ignored (not negotiated).
+        // `shallow <oid>` and the four `deepen*` tokens (upload-pack.c:1046-1104).
+        match shallow_req.absorb(text) {
+            Ok(true) => continue,
+            Ok(false) => {}
+            Err(message) => {
+                let mut out = std::io::stdout().lock();
+                write_pkt(&mut out, format!("ERR {message}").as_bytes())?;
+                out.flush()?;
+                bail!("{message}");
+            }
+        }
     }
     if wants.is_empty() {
         return Ok(ExitCode::SUCCESS); // client hung up after the advertisement (ls-remote)
@@ -481,6 +492,26 @@ fn serve_inner(repo: &gix::Repository, advertise_only: bool, stateless_rpc: bool
         out.flush()?;
         eprintln!("error: git upload-pack: not our ref {refused}");
         return Ok(ExitCode::from(128));
+    }
+
+    // `if (data->depth > 0 || data->deepen_rev_list)` (upload-pack.c:1106-1119):
+    // a deepening request is answered with the new boundary and a flush, right
+    // here, before the have loop starts. A request carrying only `shallow` lines
+    // and no `deepen*` says nothing more than where the client's history stops —
+    // git registers those as grafts and writes nothing back, and so does this: the
+    // walk below stops at them through `client_side_commits`.
+    let deepening = shallow_req.deepen.requested();
+    let boundary = deepening.then(|| crate::shallow_serve::compute(repo, &wants, &shallow_req));
+    if let Some(boundary) = &boundary {
+        let mut out = std::io::stdout().lock();
+        for id in &boundary.shallow {
+            write_pkt(&mut out, format!("shallow {}\n", id.to_hex()).as_bytes())?;
+        }
+        for id in &boundary.unshallow {
+            write_pkt(&mut out, format!("unshallow {}\n", id.to_hex()).as_bytes())?;
+        }
+        out.write_all(b"0000")?;
+        out.flush()?;
     }
 
     // Which acknowledgement dialect the client picked, and whether it wants to be
@@ -591,9 +622,42 @@ fn serve_inner(repo: &gix::Repository, advertise_only: bool, stateless_rpc: bool
     }
 
     // --- build + stream the pack -------------------------------------------------
-    let mut objects = crate::porcelain::push_proto::objects_to_send(repo, &wants, &common);
+    // Under a deepening request the pack is the window, not the full ancestry:
+    // sending anything behind the boundary would contradict the `shallow` lines
+    // just written.
+    let mut objects = match &boundary {
+        Some(boundary) => crate::shallow_serve::objects_within(
+            repo,
+            &wants,
+            &boundary.commits,
+            &common,
+            &shallow_req.client_shallow,
+        ),
+        // `register_shallow()` for each `shallow` line (upload-pack.c:1117-1119):
+        // the client's cutoff becomes a graft for this walk too, so a plain fetch
+        // into a shallow clone packs the new tips without reaching behind it.
+        None if !shallow_req.client_shallow.is_empty() => {
+            let window =
+                crate::shallow_serve::client_side_commits(repo, &wants, &shallow_req.client_shallow);
+            crate::shallow_serve::objects_within(
+                repo,
+                &wants,
+                &window,
+                &common,
+                &shallow_req.client_shallow,
+            )
+        }
+        None => crate::porcelain::push_proto::objects_to_send(repo, &wants, &common),
+    };
     // `--filter=<spec>` on the `pack-objects` git spawns (upload-pack.c:340-344).
     crate::porcelain::pack_objects::apply_filter(repo, filter_spec.as_deref(), &mut objects);
+    // `include-tag` off the client's capability list, the v0 spelling of the v2
+    // argument. A shallow clone depends on it: its tags are never `want`ed, so a
+    // tag whose target landed inside the window arrives only if the pack carries
+    // it (`write_followtags()`, clone.c:686-700).
+    if cap_present(&want_caps, b"include-tag") {
+        add_included_tags(repo, &mut objects);
+    }
     let pack = crate::porcelain::pack_objects::pack_bytes_for(repo, &objects)?;
     // `data->use_sideband` (upload-pack.c:1135-1138) is the packet size the
     // selected band carries, not a flag: `LARGE_PACKET_MAX` for `side-band-64k`
@@ -740,14 +804,14 @@ impl MultiAck {
 ///   * `include-tag` — [`add_included_tags`] adds the tags pointing into the
 ///     pack; a client that omits it gets no extra tags.
 ///
-/// `shallow` and the three `deepen-*` tokens are the ones held back: nothing
-/// here computes a shallow boundary, so a client that sent `deepen` would get a
-/// complete pack and record a cutoff it never received. A client that sees no
-/// `shallow` reports "Server does not support shallow clients" instead, which is
-/// the truth.
+///   * `shallow` and the three `deepen-*` tokens — the client's `shallow` lines
+///     and its `deepen`, `deepen-since`, `deepen-not` and `deepen-relative`
+///     requests are answered by [`crate::shallow_serve`], which computes the
+///     boundary, writes the `shallow`/`unshallow` lines the client records, and
+///     limits the pack to the window.
 const V0_CAPABILITIES: &str =
-    "multi_ack thin-pack side-band side-band-64k ofs-delta no-progress \
-     include-tag multi_ack_detailed";
+    "multi_ack thin-pack side-band side-band-64k ofs-delta shallow deepen-since \
+     deepen-not deepen-relative no-progress include-tag multi_ack_detailed";
 
 /// The upload-pack capability list. `symref=HEAD:<target>` tells the client which
 /// branch HEAD follows so a clone checks it out. The two `allow-*-sha1-in-want`
@@ -1361,17 +1425,9 @@ enum Unborn {
 
 /// The v2 capability set this server advertises, and the config behind it.
 ///
-/// Every entry is a capability whose honouring code is in this module. Two of
-/// git's are deliberately withheld:
+/// Every entry is a capability whose honouring code is in this module. One of
+/// git's is deliberately withheld:
 ///
-///   * **`shallow`** (which git advertises unconditionally as the first value of
-///     `fetch=`). Nothing here negotiates `deepen`/`deepen-since`/`deepen-not`,
-///     so advertising it would invite `deepen` lines that [`fetch_command`] can
-///     only reject. A client that sees no `shallow` reports "Server does not
-///     support shallow clients" up front instead. A repository that is *itself*
-///     shallow still gets a `shallow-info` section, which is not gated on the
-///     capability (upload-pack.c:1747-1761) and mirrors the `shallow` lines the
-///     v0 [`advertisement`] already writes.
 ///   * **`packfile-uris`** (`uploadpack.blobPackfileURI`), which needs
 ///     `pack-objects` to emit URI lines ahead of the pack; the pack here is one
 ///     finished `Vec<u8>`.
@@ -1428,10 +1484,11 @@ impl V2Config {
     }
 
     /// The values of the `fetch=` capability, in git's order
-    /// (`upload_pack_advertise()`, upload-pack.c:1843-1857) minus the two
-    /// withheld ones.
+    /// (`upload_pack_advertise()`, upload-pack.c:1843-1857) minus the withheld
+    /// `packfile-uris`. `shallow` leads, as it does in git, and is unconditional:
+    /// the boundary computation behind it needs no config.
     fn fetch_values(&self) -> String {
-        let mut v = String::from("wait-for-done");
+        let mut v = String::from("shallow wait-for-done");
         if self.policy.filter {
             v.push_str(" filter");
         }
@@ -1799,6 +1856,9 @@ struct FetchArgs {
     wait_for_done: bool,
     include_tag: bool,
     filter: Option<String>,
+    /// `data->shallows` plus the `deepen*` request, answered by the
+    /// `shallow-info` section in [`send_pack_section`].
+    shallow: crate::shallow_serve::Request,
 }
 
 /// `upload_pack_v2()` (upload-pack.c:1770-1833): read the arguments, then run
@@ -1918,6 +1978,17 @@ fn process_fetch_args(
             _ => {}
         }
 
+        // `shallow <oid>` and the `deepen*` tokens, gated on the `shallow` fetch
+        // capability this server advertises.
+        match args.shallow.absorb(&arg) {
+            Ok(true) => continue,
+            Ok(false) => {}
+            Err(message) => {
+                writer.error(&message)?;
+                die!("{message}");
+            }
+        }
+
         if cfg.policy.filter {
             if let Some(spec) = arg.strip_prefix("filter ") {
                 if args.filter.is_some() {
@@ -2002,28 +2073,69 @@ fn send_pack_section(
         writer.delim()?;
     }
 
-    // `send_shallow_info()` (upload-pack.c:1747-1761), reduced to the one case
-    // this server can answer: serving an already-shallow repository, whose
-    // boundary the client has to be told about. This is the same list the v0
-    // `advertisement` writes; without the `shallow` capability there is no
-    // client-requested deepening to compute on top of it.
-    let shallow: Vec<ObjectId> = repo
+    // `send_shallow_info()` (upload-pack.c:1747-1761): the section is written when
+    // a deepening was asked for, when the client declared a boundary of its own,
+    // or when this repository is itself shallow — and it is skipped entirely
+    // otherwise, so an ordinary fetch sees no shallow-info at all.
+    let deepening = args.shallow.deepen.requested();
+    let boundary = deepening.then(|| crate::shallow_serve::compute(repo, &args.wants, &args.shallow));
+    let own: Vec<ObjectId> = repo
         .shallow_commits()
         .ok()
         .flatten()
         .map(|c| c.iter().copied().collect())
         .unwrap_or_default();
-    if !shallow.is_empty() {
-        writer.write("shallow-info\n")?;
-        for id in &shallow {
-            writer.write(&format!("shallow {}\n", id.to_hex()))?;
+    match &boundary {
+        Some(boundary) => {
+            writer.write("shallow-info\n")?;
+            for id in &boundary.shallow {
+                writer.write(&format!("shallow {}\n", id.to_hex()))?;
+            }
+            for id in &boundary.unshallow {
+                writer.write(&format!("unshallow {}\n", id.to_hex()))?;
+            }
+            writer.delim()?;
         }
-        writer.delim()?;
+        // Serving an already-shallow repository: the client is told where this
+        // server's own history stops, which is the boundary it inherits.
+        None if !own.is_empty() => {
+            writer.write("shallow-info\n")?;
+            for id in &own {
+                writer.write(&format!("shallow {}\n", id.to_hex()))?;
+            }
+            writer.delim()?;
+        }
+        None => {}
     }
 
     writer.write("packfile\n")?;
 
-    let mut objects = crate::porcelain::push_proto::objects_to_send(repo, &args.wants, &args.haves);
+    let mut objects = match &boundary {
+        Some(boundary) => crate::shallow_serve::objects_within(
+            repo,
+            &args.wants,
+            &boundary.commits,
+            &args.haves,
+            &args.shallow.client_shallow,
+        ),
+        // `register_shallow()` for the client's own cutoff: its grafts bound this
+        // walk too, so a plain fetch into a shallow clone stays inside it.
+        None if !args.shallow.client_shallow.is_empty() => {
+            let window = crate::shallow_serve::client_side_commits(
+                repo,
+                &args.wants,
+                &args.shallow.client_shallow,
+            );
+            crate::shallow_serve::objects_within(
+                repo,
+                &args.wants,
+                &window,
+                &args.haves,
+                &args.shallow.client_shallow,
+            )
+        }
+        None => crate::porcelain::push_proto::objects_to_send(repo, &args.wants, &args.haves),
+    };
     crate::porcelain::pack_objects::apply_filter(repo, args.filter.as_deref(), &mut objects);
     if args.include_tag {
         add_included_tags(repo, &mut objects);
@@ -2187,20 +2299,14 @@ mod tests {
         assert!(adv.contains(" no-done symref=HEAD:refs/heads/main "), "{adv}");
     }
 
-    /// Every token of the fixed capability string is one this server acts on,
-    /// and the four shallow/deepen tokens stock git also advertises are absent
-    /// because no deepen negotiation is implemented. A client that saw
-    /// `shallow` here would send `deepen` lines, get a complete pack, and record
-    /// a cutoff it was never given.
+    /// Every token of the fixed capability string is one this server acts on.
+    /// The four shallow/deepen tokens are advertised because the boundary is
+    /// computed: a client that sees `shallow` sends `deepen` lines and must get
+    /// `shallow`/`unshallow` back plus a pack cut at the boundary, which is what
+    /// [`crate::shallow_serve`] produces.
     #[test]
-    fn shallow_and_deepen_are_withheld() {
+    fn advertised_capabilities_are_the_honoured_ones() {
         let caps = capabilities(None, WantPolicy::default(), true);
-        for absent in ["shallow", "deepen-since", "deepen-not", "deepen-relative"] {
-            assert!(
-                !caps.split(' ').any(|tok| tok == absent),
-                "{absent} is not honoured and must not be advertised: {caps}"
-            );
-        }
         for present in [
             "multi_ack",
             "multi_ack_detailed",
@@ -2210,6 +2316,10 @@ mod tests {
             "ofs-delta",
             "no-progress",
             "include-tag",
+            "shallow",
+            "deepen-since",
+            "deepen-not",
+            "deepen-relative",
         ] {
             assert!(caps.split(' ').any(|tok| tok == present), "{present} missing: {caps}");
         }
@@ -2254,9 +2364,9 @@ mod tests {
 
     /// The values of the v2 `fetch=` capability are the contract for what the
     /// client may then send. Every token here has honouring code in
-    /// [`process_fetch_args`]; `shallow` and `packfile-uris` are absent because
-    /// theirs is not written, and a regression that adds either back would make
-    /// clients send `deepen`/`packfile-uris` lines this server can only reject.
+    /// [`process_fetch_args`]; `packfile-uris` is absent because its is not
+    /// written, and a regression that added it back would make clients send
+    /// `packfile-uris` lines this server can only reject.
     #[test]
     fn v2_fetch_capability_lists_only_honoured_tokens() {
         let base = V2Config {
@@ -2269,7 +2379,7 @@ mod tests {
             promisor_info: None,
             object_format: "sha1".into(),
         };
-        assert_eq!(base.fetch_values(), "wait-for-done");
+        assert_eq!(base.fetch_values(), "shallow wait-for-done");
 
         let all = V2Config {
             policy: WantPolicy { filter: true, ..WantPolicy::default() },
@@ -2279,8 +2389,7 @@ mod tests {
         };
         // git's own order: filter, then ref-in-want, then sideband-all
         // (`upload_pack_advertise()`, upload-pack.c:1843-1857).
-        assert_eq!(all.fetch_values(), "wait-for-done filter ref-in-want sideband-all");
-        assert!(!all.fetch_values().contains("shallow"), "{}", all.fetch_values());
+        assert_eq!(all.fetch_values(), "shallow wait-for-done filter ref-in-want sideband-all");
         assert!(!all.fetch_values().contains("packfile-uris"), "{}", all.fetch_values());
     }
 }

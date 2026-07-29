@@ -261,6 +261,40 @@ where
             rejected_shallow.reverse();
         }
 
+        // A shallow repository's remote advertises refs whose objects lie outside the
+        // boundary and were deliberately never sent - an old tag, most often. git's
+        // `remove_nonexistent_theirs_shallow()` drops those refs from the ref map instead of
+        // updating them, which is also what keeps them out of the connectivity check below;
+        // feeding one to that check reports a short pack for a fetch that brought everything
+        // it was supposed to. They are dropped silently: git never announces a ref it was
+        // never going to write.
+        //
+        // The condition is what the *fetch* did, not what the repository looks like afterwards:
+        // `remove_nonexistent_theirs_shallow()` runs off `si->shallow`, the shallow info this
+        // exchange carried (fetch-pack.c:1611). `--unshallow` is the case that separates the two —
+        // it deletes the shallow file, so a repository test would be false by the time it is asked,
+        // and every tag whose object the remote left out would go to the connectivity check.
+        if matches!(self.dry_run, fetch::DryRun::No)
+            && (repo.shallow_commits().ok().flatten().is_some()
+                || !matches!(self.shallow, gix_protocol::fetch::Shallow::NoChange))
+        {
+            let outside: Vec<usize> = self
+                .ref_map
+                .mappings
+                .iter()
+                .enumerate()
+                .filter(|(_, m)| {
+                    m.remote
+                        .as_id()
+                        .is_some_and(|id| repo.find_header(id).is_err())
+                })
+                .map(|(index, _)| index)
+                .collect();
+            for index in outside.into_iter().rev() {
+                self.ref_map.mappings.remove(index);
+            }
+        }
+
         // git's `fetch-pack.c` calls `write_promisor_file()` whenever a filter was in play, marking the
         // pack as one that deliberately lacks objects. Everything that later walks for missing objects
         // (`fsck`, `gc`, `rev-list --missing`) keys off the presence of that file - and so does the
@@ -281,10 +315,20 @@ where
                 .ref_map
                 .mappings
                 .iter()
+                // `iterate_ref_map()` skips "anything missing a peer_ref, which we are not
+                // actually going to write a ref for". Without that filter the check demands
+                // objects for refs this fetch never asked for - every tag outside a shallow
+                // clone's window, for one - and fails a fetch git completes.
+                .filter(|m| m.local.is_some())
                 .filter_map(|m| m.remote.as_id().map(ToOwned::to_owned))
                 .collect();
             let options = connected::Options {
                 from_promisor: self.filter.is_some(),
+                // `opt.is_deepening_fetch = args->deepen` (fetch-pack.c:1050): a fetch that moves a
+                // shallow boundary must not hide what is already local. Its own refs point into the
+                // history the pack just extended, and excluding them makes the walk start below the
+                // new boundary and demand the parents the graft exists to cut off.
+                is_deepening_fetch: !matches!(self.shallow, gix_protocol::fetch::Shallow::NoChange),
                 ..Default::default()
             };
             if !connected::check_connected(repo, &tips, options)? {

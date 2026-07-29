@@ -4229,19 +4229,30 @@ fn text_analysis(
 
     // Hunks render the *original* line bytes: the tokens the differ compared may be
     // whitespace-normalized, so the emitter indexes `before`/`after` directly.
-    let (add, del, hunks) = emit_unified(&before, &after, &changes, opts);
+    let (add, del, hunks) = emit_unified(
+        &before,
+        &after,
+        &changes,
+        &EmitGeometry {
+            ctx: opts.ctx as usize,
+            inter_hunk_ctx: opts.inter_hunk_ctx,
+            func_context: opts.func_context,
+        },
+    );
     Ok((add, del, hunks))
 }
 
 /// One `xdchange_t`: `chg1` pre-image records at `i1` replaced by `chg2` post-image
 /// records at `i2`, plus xdiff's `ignore` bit.
 #[derive(Clone, Copy)]
-struct Change {
-    i1: usize,
-    chg1: usize,
-    i2: usize,
-    chg2: usize,
-    ignore: bool,
+pub(crate) struct Change {
+    pub(crate) i1: usize,
+    pub(crate) chg1: usize,
+    pub(crate) i2: usize,
+    pub(crate) chg2: usize,
+    /// `xdchange_t::ignore`: a change `-I`/`--ignore-blank-lines` marked as not
+    /// worth a hunk of its own, which still prints when a real change pulls it in.
+    pub(crate) ignore: bool,
 }
 
 /// `xdl_blankline`: with no whitespace option in force a record is blank only when it is
@@ -4326,6 +4337,18 @@ fn get_hunk(changes: &[Change], cursor: usize, ctxlen: usize, interhunk: usize) 
     Some((scr, lxch))
 }
 
+/// The three knobs `xdl_emit_diff` reads out of `xdemitconf_t` to decide hunk
+/// geometry, split out so callers that keep their options elsewhere — `git diff`'s
+/// own patch path, for one — can drive the same emitter.
+pub(crate) struct EmitGeometry {
+    /// `--unified=<n>`.
+    pub(crate) ctx: usize,
+    /// `--inter-hunk-context=<n>`.
+    pub(crate) inter_hunk_ctx: usize,
+    /// `-W` / `--function-context`, i.e. `XDL_EMIT_FUNCCONTEXT`.
+    pub(crate) func_context: bool,
+}
+
 /// `xdl_emit_diff`: turn the change script into unified-diff text and count the emitted
 /// `+`/`-` records, which is what `diffstat_consume` counts too.
 ///
@@ -4333,14 +4356,14 @@ fn get_hunk(changes: &[Change], cursor: usize, ctxlen: usize, interhunk: usize) 
 /// merging (via [`get_hunk`]), `XDL_EMIT_FUNCNAMES` hunk-header function names and, under
 /// `-W`, `XDL_EMIT_FUNCCONTEXT`'s expansion of both hunk ends to enclosing-function
 /// boundaries.
-fn emit_unified(
+pub(crate) fn emit_unified(
     before: &[&[u8]],
     after: &[&[u8]],
     changes: &[Change],
-    opts: &Opts,
+    geom: &EmitGeometry,
 ) -> (u32, u32, Vec<u8>) {
     let (nrec1, nrec2) = (before.len(), after.len());
-    let ctxlen = opts.ctx as usize;
+    let ctxlen = geom.ctx;
     let mut buf: Vec<u8> = Vec::new();
     let (mut add, mut del) = (0u32, 0u32);
     let mut funclineprev: isize = -1;
@@ -4361,7 +4384,7 @@ fn emit_unified(
         // `xchp` is the queue position *before* `xdl_get_hunk` skips ignorable changes;
         // the `-W` pre-context walk may have to reach back to it.
         let mut xchp = cursor;
-        let Some((mut first, mut last)) = get_hunk(changes, cursor, ctxlen, opts.inter_hunk_ctx)
+        let Some((mut first, mut last)) = get_hunk(changes, cursor, ctxlen, geom.inter_hunk_ctx)
         else {
             break;
         };
@@ -4371,7 +4394,7 @@ fn emit_unified(
         let (s1, s2) = loop {
             let mut s1 = changes[first].i1.saturating_sub(ctxlen);
             let mut s2 = changes[first].i2.saturating_sub(ctxlen);
-            if !opts.func_context {
+            if !geom.func_context {
                 break (s1, s2);
             }
             // `XDL_EMIT_FUNCCONTEXT`: grow the pre-context back to the enclosing function.
@@ -4419,7 +4442,7 @@ fn emit_unified(
             let lctx = ctxlen.min(nrec1 - end1).min(nrec2 - end2);
             let (mut e1, mut e2) = (end1 + lctx, end2 + lctx);
 
-            if opts.func_context {
+            if geom.func_context {
                 let mut fe1 = get_func_line(before, end1 as isize, nrec1 as isize);
                 while fe1 > 0 && is_empty_rec(before[(fe1 - 1) as usize]) {
                     fe1 -= 1;

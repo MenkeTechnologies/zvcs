@@ -303,7 +303,27 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
 
     let remote = match repo.find_remote(remote_name.as_str()) {
         Ok(r) => r,
-        Err(_) => repo.remote_at(remote_name.as_str())?,
+        Err(_) => {
+            // Not a configured remote, so the name is a URL or a path. When it
+            // is neither — no such directory — `git_connect()` runs
+            // `git-receive-pack '<dest>'`, which dies with `enter_repo`'s
+            // message, and the parent follows with `die_initial_contact`. The
+            // vendored transport reports one Rust-level metadata error instead,
+            // so both lines and the 128 are reproduced here, as `send-pack`
+            // already does for the same case.
+            if let Some(bad) =
+                super::send_pack::local_dest_that_is_not_a_repository(remote_name.as_str())
+            {
+                eprintln!("fatal: '{bad}' does not appear to be a git repository");
+                eprintln!(
+                    "fatal: Could not read from remote repository.\n\n\
+                     Please make sure you have the correct access rights\n\
+                     and the repository exists."
+                );
+                return Ok(ExitCode::from(128));
+            }
+            repo.remote_at(remote_name.as_str())?
+        }
     };
 
     // Build the concrete updates, plus the (local-branch, remote-ref) pairs that
@@ -688,7 +708,7 @@ fn build_requests(
                     new: id.detach(),
                     force: true,
                     expected: None,
-                    only_if_absent: false, check_reachable: None,
+                    only_if_absent: false, check_reachable: None, explicit_delete: false,
                 });
             }
         }
@@ -704,7 +724,7 @@ fn build_requests(
             let name = r.name().as_bstr().to_str().map_err(|e| anyhow!("{e}"))?.to_string();
             if let Some(id) = r.try_id() {
                 let short = short_ref(&name).to_string();
-                requests.push(Request { src: Some(name.clone()), name: name.clone(), new: id.detach(), force: f.force, expected: None, only_if_absent: false, check_reachable: None });
+                requests.push(Request { src: Some(name.clone()), name: name.clone(), new: id.detach(), force: f.force, expected: None, only_if_absent: false, check_reachable: None, explicit_delete: false });
                 upstreams.push((short, name));
             }
         }
@@ -728,7 +748,7 @@ fn build_requests(
             // fetch reporting "would clobber existing tag" because the two sides
             // now name different objects.
             if let Some(id) = r.try_id() {
-                tag_requests.push(Request { src: Some(name.clone()), name, new: id.detach(), force: f.force, expected: None, only_if_absent: false, check_reachable: None });
+                tag_requests.push(Request { src: Some(name.clone()), name, new: id.detach(), force: f.force, expected: None, only_if_absent: false, check_reachable: None, explicit_delete: false });
             }
         }
         // Only `--tags` on its own is complete here; with refspecs alongside, the
@@ -747,7 +767,11 @@ fn build_requests(
                 new: null(repo),
                 force: f.force,
                 expected: None,
-                only_if_absent: false, check_reachable: None,
+                only_if_absent: false,
+                check_reachable: None,
+                // The `--delete` spelling, which git fails when the remote does
+                // not advertise the ref.
+                explicit_delete: true,
             });
         }
         return Ok((requests, upstreams));
@@ -837,7 +861,7 @@ fn append_followed_tags(repo: &gix::Repository, requests: &mut Vec<Request>) -> 
         if tips.iter().any(|tip| reachable(repo, peeled, *tip)) {
             // Never forced: a followed tag is an addition, and git refuses to
             // clobber a differing remote tag here just as it does for `--tags`.
-            requests.push(Request { src: Some(name.clone()), name, new: tag_object, force: false, expected: None, only_if_absent: true, check_reachable: None });
+            requests.push(Request { src: Some(name.clone()), name, new: tag_object, force: false, expected: None, only_if_absent: true, check_reachable: None, explicit_delete: false });
         }
     }
     Ok(())
@@ -906,7 +930,7 @@ fn parse_refspec(
             new,
             force,
             expected: None,
-            only_if_absent: false, check_reachable: None,
+            only_if_absent: false, check_reachable: None, explicit_delete: false,
         },
         upstream,
     ))
@@ -966,7 +990,7 @@ fn current_branch_request(repo: &gix::Repository, force: bool) -> Result<(Reques
             new,
             force,
             expected: None,
-            only_if_absent: false, check_reachable: None,
+            only_if_absent: false, check_reachable: None, explicit_delete: false,
         },
         (branch, name),
     ))
@@ -1110,6 +1134,16 @@ fn report(outcome: &push_proto::Outcome, verbose: bool) -> Result<ExitCode> {
         eprintln!("error: unpack failed: {reason}");
     }
 
+    // Refs rejected while matching against the advertisement — `--delete` of a
+    // ref the remote does not have — are git's `error()` calls from
+    // `match_push_refs`, printed before the transport says anything and never
+    // listed in the `To <url>` block.
+    for s in &outcome.statuses {
+        if let (true, Err(reason)) = (s.pre_transport, &s.result) {
+            eprintln!("error: {reason}");
+            any_failed = true;
+        }
+    }
     let did_update = outcome
         .statuses
         .iter()
@@ -1124,11 +1158,16 @@ fn report(outcome: &push_proto::Outcome, verbose: bool) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
-    eprintln!("To {}", outcome.url);
+    // Nothing but matcher rejections: git never opened a transport report, so the
+    // `To <url>` block is not printed at all.
+    let wire_rows = outcome.statuses.iter().any(|s| !s.pre_transport);
+    if wire_rows {
+        eprintln!("To {}", outcome.url);
+    }
     // Every rejected ref with its reason, which `advise_rejections` folds into
     // the single advice block git prints under the status list.
     let mut rejected: Vec<(&str, &str)> = Vec::new();
-    for s in &outcome.statuses {
+    for s in outcome.statuses.iter().filter(|s| !s.pre_transport) {
         let short = |oid: &ObjectId| oid.to_hex_with_len(7).to_string();
         // `print_ref_status` (transport.c:620): the left side is the LOCAL ref
         // (`ref->peer_ref`) and the right side is `report->ref_name` when the
@@ -1544,7 +1583,7 @@ fn expand_pattern_refspec(
             new: id,
             force,
             expected: None,
-            only_if_absent: false, check_reachable: None,
+            only_if_absent: false, check_reachable: None, explicit_delete: false,
         });
     }
     Ok(out)
@@ -1659,7 +1698,7 @@ mod tests {
             new: tip,
             force: false,
             expected: None,
-            only_if_absent: false, check_reachable: None,
+            only_if_absent: false, check_reachable: None, explicit_delete: false,
         }];
         append_followed_tags(&repo, &mut requests).expect("append");
         requests.into_iter().skip(1).map(|r| r.name).collect()
@@ -1688,7 +1727,7 @@ mod tests {
             // Even under `--force`, a followed tag must not inherit the force bit.
             force: true,
             expected: None,
-            only_if_absent: false, check_reachable: None,
+            only_if_absent: false, check_reachable: None, explicit_delete: false,
         }];
         append_followed_tags(&repo, &mut requests).expect("append");
 
@@ -1714,7 +1753,7 @@ mod tests {
             new: gix::hash::ObjectId::null(repo.object_hash()),
             force: false,
             expected: None,
-            only_if_absent: false, check_reachable: None,
+            only_if_absent: false, check_reachable: None, explicit_delete: false,
         }];
         append_followed_tags(&repo, &mut requests).expect("append");
         assert_eq!(requests.len(), 1, "no tips to be reachable from, so no tags");

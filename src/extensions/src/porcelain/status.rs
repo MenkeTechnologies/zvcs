@@ -1878,6 +1878,26 @@ fn tracking_info(repo: &gix::Repository) -> Result<Option<Tracking>> {
 /// `hints` is git's `!(s->hints)` argument to `format_tracking_info`
 /// (`show_divergence_advice`): with `advice.statusHints=false` the state line
 /// stays but the "(use …)" line under it is dropped.
+/// `wt_status_print_tracking()`: the `Your branch is …` lines that follow the
+/// `On branch <name>` header, plus the blank line git emits under them — and
+/// nothing at all when the branch has no upstream, which is why the state block
+/// sits flush against the header there.
+///
+/// Shared with the commands that stop mid-sequence and reprint the header
+/// themselves (`cherry-pick`, `revert`); they were rendering the branch line
+/// alone, which drops the upstream relation from output git shows.
+pub(crate) fn tracking_block(repo: &gix::Repository) -> String {
+    let quick = repo.config_snapshot().boolean("status.aheadBehind") == Some(false);
+    let hints = crate::advice::Advice::StatusHints.enabled_in(repo);
+    let tracking = tracking_info(repo).ok().flatten();
+    let block = tracking_lines(tracking.as_ref(), quick, hints);
+    if block.is_empty() {
+        block
+    } else {
+        format!("{block}\n")
+    }
+}
+
 fn tracking_lines(tracking: Option<&Tracking>, quick: bool, hints: bool) -> String {
     let Some(t) = tracking else {
         return String::new();

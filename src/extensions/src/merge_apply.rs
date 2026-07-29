@@ -10,6 +10,12 @@
 //! lines git prints during the merge are emitted here, since they are identical
 //! across every caller.
 //!
+//! [`three_way_merge_guarded`] adds the last step of
+//! `merge_switch_to_result()`: the `unpack_trees()` pass that refuses the
+//! checkout — rather than overwrite it — when local work sits on a path the
+//! merge touches. Callers that gate on a dirty worktree themselves keep using
+//! the unguarded entry points.
+//!
 //! [`merge_trees`]: gix::Repository::merge_trees
 //!
 //! [`StrategyOptions`] is the `-X`/`--strategy-option` half: a port of
@@ -24,6 +30,19 @@ use gix::bstr::{BStr, BString, ByteSlice};
 use gix::diff::blob::Algorithm;
 use gix::hash::ObjectId;
 use gix::index::entry::{Mode, Stat};
+
+/// What [`three_way_merge_guarded`] did: the merge was applied, or the checkout
+/// that would have applied it was refused because it would have clobbered local
+/// work. The refusal happens after the `Auto-merging`/`CONFLICT` lines and
+/// before anything on disk moves — the order git's `merge_switch_to_result()`
+/// establishes, since its `checkout()` runs last.
+// One of these is produced per merge, on the stack, and both variants are
+// consumed immediately — boxing the applied side would only add an allocation.
+#[allow(clippy::large_enum_variant)]
+pub enum Merged {
+    Applied(Applied),
+    Refused(crate::merge_guard::Clobber),
+}
 
 /// The result of applying a three-way merge to the worktree and index.
 pub struct Applied {
@@ -113,6 +132,74 @@ pub fn three_way_merge_with_options(
     show_msgs: bool,
     xopts: &StrategyOptions,
 ) -> Result<Applied> {
+    let merged = merge_and_apply(
+        repo,
+        base_tree,
+        ours_tree,
+        theirs_tree,
+        old_index,
+        labels,
+        should_interrupt,
+        show_msgs,
+        xopts,
+        None,
+    )?;
+    let Merged::Applied(applied) = merged else {
+        unreachable!("no worktree tree was handed over, so no checkout guard ran")
+    };
+    Ok(applied)
+}
+
+/// [`three_way_merge_with_options`] with git's checkout guard armed.
+///
+/// `worktree_tree` is the tree the worktree currently holds (`HEAD` for a
+/// merge). Before the merged tree is written out, the move from that tree to the
+/// merged one is put through [`crate::merge_guard::verify_two_way`] — the
+/// `unpack_trees()` pass `merge_switch_to_result()` ends with — so local work
+/// the merge would overwrite stops it instead of being lost. Paths outside the
+/// merge's footprint are never consulted, so unrelated local edits survive.
+#[allow(clippy::too_many_arguments)]
+pub fn three_way_merge_guarded(
+    repo: &gix::Repository,
+    base_tree: ObjectId,
+    ours_tree: ObjectId,
+    theirs_tree: ObjectId,
+    old_index: &gix::index::File,
+    labels: gix::merge::blob::builtin_driver::text::Labels<'_>,
+    should_interrupt: &AtomicBool,
+    show_msgs: bool,
+    xopts: &StrategyOptions,
+    worktree_tree: ObjectId,
+) -> Result<Merged> {
+    merge_and_apply(
+        repo,
+        base_tree,
+        ours_tree,
+        theirs_tree,
+        old_index,
+        labels,
+        should_interrupt,
+        show_msgs,
+        xopts,
+        Some(worktree_tree),
+    )
+}
+
+/// The shared body: merge the trees, report, then (unless the guard refuses)
+/// move the worktree and index onto the result.
+#[allow(clippy::too_many_arguments)]
+fn merge_and_apply(
+    repo: &gix::Repository,
+    base_tree: ObjectId,
+    ours_tree: ObjectId,
+    theirs_tree: ObjectId,
+    old_index: &gix::index::File,
+    labels: gix::merge::blob::builtin_driver::text::Labels<'_>,
+    should_interrupt: &AtomicBool,
+    show_msgs: bool,
+    xopts: &StrategyOptions,
+    guard: Option<ObjectId>,
+) -> Result<Merged> {
     // `merge_ort_nonrecursive_internal()` (merge-ort.c) shifts *their* tree and
     // the merge base to match the shape of *our* tree, before any merge info is
     // collected — the merged tree therefore comes out in our shape.
@@ -181,6 +268,16 @@ pub fn three_way_merge_with_options(
         conflicts.push(path);
     }
 
+    // `merge_switch_to_result()` ends in `checkout()`, an `unpack_trees()` from
+    // the worktree's current tree to the merged one — which refuses rather than
+    // overwrite local work on any path the merge touches.
+    if let Some(worktree_tree) = guard {
+        let clobber = crate::merge_guard::verify_two_way(repo, worktree_tree, tree_id, old_index)?;
+        if !clobber.is_empty() {
+            return Ok(Merged::Refused(clobber));
+        }
+    }
+
     let mut index = update_worktree_to_tree(repo, old_index, tree_id, should_interrupt)?;
     if !conflicts.is_empty() {
         merge.index_changed_after_applying_conflicts(
@@ -190,11 +287,11 @@ pub fn three_way_merge_with_options(
         );
     }
 
-    Ok(Applied {
+    Ok(Merged::Applied(Applied {
         tree_id,
         conflicts,
         index,
-    })
+    }))
 }
 
 /// Check out `new_tree_id` over the worktree, touching only entries that differ

@@ -45,6 +45,13 @@ pub mod graph;
 ///
 /// Note that the performance of this queue is very relevant to overall algorithm performance of many graph-walking algorithms,
 /// and as it stands our implementation is about 6% slower in practice, probably also depending on the size of the stored data.
+///
+/// Items whose keys compare equal come out in insertion order. A plain binary
+/// heap leaves that case unspecified, but git`s frontier is a list kept sorted
+/// by `commit_list_insert_by_date()`, which splices a commit in behind every
+/// entry that is not older — so equal commit dates are FIFO there, and any walk
+/// that ties (an import, a scripted series, two commits in the same second)
+/// depends on it to order `log`/`rev-list` the way git does.
 #[derive(Default)]
-pub struct PriorityQueue<K: Ord, T>(std::collections::BinaryHeap<queue::Item<K, T>>);
+pub struct PriorityQueue<K: Ord, T>(std::collections::BinaryHeap<queue::Item<K, T>>, u64);
 mod queue;

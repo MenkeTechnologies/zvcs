@@ -13,6 +13,12 @@ use super::filespec::{content_of, count_changed_lines, is_binary};
 use super::line_log;
 
 /// The terminal width git assumes for `--stat` when stdout is not a terminal.
+/// git's `MINIMUM_ABBREV`: no `--abbrev` may cut an id shorter than this.
+const MINIMUM_ABBREV: usize = 4;
+
+/// git's `DEFAULT_ABBREV`, the length a valueless `--abbrev` selects.
+const DEFAULT_ABBREV: usize = 7;
+
 const STAT_TERM_WIDTH: usize = 80;
 
 /// `--stat` width geometry, in git's `stat_width`/`stat_name_width`/`stat_graph_width`
@@ -196,8 +202,12 @@ pub(crate) fn parse_decoration_style(value: &str) -> Option<DecorateStyle> {
 ///     `--stat-graph-width`, and `--stat-count` flags and the
 ///     `diff.statNameWidth`/`diff.statGraphWidth` config are honored (flag over config
 ///     over the 80-column / uncapped default).
-///   * Pathspec limiting compares each commit to its first parent only, so merge
-///     simplification (TREESAME across multiple parents) is not modelled.
+///   * Pathspec limiting is git's default history simplification: a commit
+///     TREESAME to any parent over the pathspec is simplified away and the
+///     history behind that parent alone is followed, so a merge that took one
+///     side's change drops out along with the side it did not take. The diff
+///     formats (`-p`, `--stat`, `--name-*`) are limited to the same paths.
+///     `--full-history`/`--simplify-merges` are not implemented.
 ///   * Revision ranges are supported: `A..B` (`^A B`), `A...B` (symmetric
 ///     difference, excluding the merge-base), and a leading `^A` exclusion.
 ///   * `--grep`/`--author` filters and every flag not listed above are rejected.
@@ -284,6 +294,14 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
     let mut skip: usize = 0;
     let mut pretty = Pretty::Medium;
     let mut terminator = false;
+    // `--abbrev[=<n>]`, applied as a `core.abbrev` override so every abbreviation
+    // in the run — `%h`, oneline ids, diff index lines — reads the same length.
+    let mut abbrev_len: Option<usize> = None;
+    // `rev->pretty_given`: the built-in formats show notes only when the caller
+    // did not pick a format, so the flag has to be tracked, not inferred from
+    // `pretty` (which starts at the same `medium` a `--pretty=medium` selects).
+    let mut pretty_given = false;
+    let mut notes_opt = super::notes::DisplayOpt::default();
     let mut abbrev_commit = cfg_abbrev_commit;
     let mut name_only = false;
     let mut name_status = false;
@@ -323,6 +341,8 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
     let mut no_merges = false;
     let mut first_parent = false;
     let mut show_parents = false;
+    let mut show_children = false;
+    let mut boundary = false;
     let mut min_parents: Option<usize> = None;
     let mut max_parents: Option<usize> = None;
     let mut date_mode = cfg_date_mode;
@@ -427,11 +447,28 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
             pretty = Pretty::Oneline;
             terminator = true;
             abbrev_commit = true;
+            pretty_given = true;
+        // `--notes[=<ref>]` and its `--show-notes` spelling, plus `--no-notes`:
+        // git`s `notes_callback`. A later flag overrides an earlier one, and an
+        // explicit ref suppresses both the default tree and `notes.displayRef`.
+        } else if a == "--notes" || a == "--show-notes" {
+            notes_opt.enable_default();
+            notes_opt.given = true;
+        } else if let Some(v) = a
+            .strip_prefix("--notes=")
+            .or_else(|| a.strip_prefix("--show-notes="))
+        {
+            notes_opt.enable_ref(v);
+            notes_opt.given = true;
+        } else if a == "--no-notes" || a == "--no-show-notes" {
+            notes_opt.disable();
+            notes_opt.given = true;
         } else if let Some(v) = a.strip_prefix("--pretty=") {
             match get_commit_format(v)? {
                 Some((p, t)) => {
                     pretty = p;
                     terminator = t;
+                    pretty_given = true;
                 }
                 None => {
                     eprintln!("fatal: invalid --pretty format: {v}");
@@ -439,13 +476,14 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
                 }
             }
         } else if let Some(v) = a.strip_prefix("--format=") {
-            // `--format=<s>` is git's alias for `--pretty=<s>` (same parser, not a
+            // `--format=<s>` is git`s alias for `--pretty=<s>` (same parser, not a
             // blind `tformat:` wrapper — `--format=abc` is rejected just like
             // `--pretty=abc`).
             match get_commit_format(v)? {
                 Some((p, t)) => {
                     pretty = p;
                     terminator = t;
+                    pretty_given = true;
                 }
                 None => {
                     eprintln!("fatal: invalid --pretty format: {v}");
@@ -453,9 +491,10 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
                 }
             }
         } else if a == "--pretty" {
-            // Bare `--pretty` is git's `--pretty=medium`.
+            // Bare `--pretty` is git`s `--pretty=medium`.
             pretty = Pretty::Medium;
             terminator = false;
+            pretty_given = true;
         } else if a == "--format" {
             // Bare `--format` (no `=value`) is a git usage error, exit 128.
             eprintln!("fatal: unrecognized argument: --format");
@@ -512,10 +551,36 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
             first_parent = true;
         } else if a == "--parents" {
             show_parents = true;
+        } else if a == "--boundary" {
+            boundary = true;
+        } else if a == "--no-boundary" {
+            boundary = false;
+        } else if a == "--children" {
+            show_children = true;
+        } else if a == "--no-children" {
+            show_children = false;
         } else if a == "--abbrev-commit" {
             abbrev_commit = true;
         } else if a == "--no-abbrev-commit" {
             abbrev_commit = false;
+        // `--abbrev[=<n>]` / `--no-abbrev`: the length every abbreviated id in the
+        // run is cut to. git clamps below `MINIMUM_ABBREV` (4) and at the hash
+        // width, and `--no-abbrev` is the full width. It reaches `%h`, the
+        // oneline id and the diff `index` lines — but not the `commit <id>`
+        // header, which only `--abbrev-commit` shortens.
+        } else if a == "--abbrev" {
+            abbrev_len = Some(DEFAULT_ABBREV);
+        } else if a == "--no-abbrev" {
+            abbrev_len = Some(repo.object_hash().len_in_hex());
+        } else if let Some(v) = a.strip_prefix("--abbrev=") {
+            let full = repo.object_hash().len_in_hex();
+            match v.parse::<usize>() {
+                Ok(n) => abbrev_len = Some(n.clamp(MINIMUM_ABBREV, full)),
+                Err(_) => {
+                    eprintln!("fatal: option `abbrev' expects a numerical value");
+                    return Ok(ExitCode::from(128));
+                }
+            }
         } else if a == "-p" || a == "--patch" || a == "-u" {
             // `-u` is git's documented synonym for `-p`.
             patch = true;
@@ -980,16 +1045,77 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
         nodes = kept;
     }
 
-    // Path-limited traversal: keep only commits that touched a matching pathspec,
-    // measured against the first parent (the empty tree for a root commit).
+    // Path-limited traversal, a port of `try_to_simplify_commit()` followed by
+    // `rewrite_parents()` (revision.c).
+    //
+    // The test is TREESAME *per parent*, not against the first one: a commit that
+    // matches any parent over the pathspec is "simplified away" — it is not
+    // shown, and the history it stands for is the one behind that parent alone.
+    // For a merge that is what removes both the merge itself and the entire side
+    // whose changes it did not take; comparing only against the first parent
+    // leaves the merge in the log and lists the other side's commits as well.
     if !pathspecs.is_empty() {
-        let mut kept = Vec::with_capacity(nodes.len());
-        for node in nodes.into_iter() {
-            if commit_touches(&repo, &node, &pathspecs)? {
-                kept.push(node);
+        // id → (parents the simplified history follows, whether it is shown).
+        let mut simplified: HashMap<ObjectId, (Vec<ObjectId>, bool)> =
+            HashMap::with_capacity(nodes.len());
+        for node in &nodes {
+            let commit = repo.find_object(node.id)?.try_into_commit()?;
+            // `--first-parent` limits the comparison the same way it limits the
+            // walk: git never looks at the parents it is not following.
+            let parents: &[ObjectId] = if first_parent {
+                &node.parents[..node.parents.len().min(1)]
+            } else {
+                &node.parents
+            };
+            if parents.is_empty() {
+                // A root commit is compared against the empty tree, so it shows
+                // exactly when it introduced a matching path.
+                let shown = changes_match(&repo, &commit, None, &pathspecs)?;
+                simplified.insert(node.id, (Vec::new(), shown));
+                continue;
+            }
+            let mut treesame: Option<ObjectId> = None;
+            for p in parents {
+                if !changes_match(&repo, &commit, Some(*p), &pathspecs)? {
+                    treesame = Some(*p);
+                    break;
+                }
+            }
+            match treesame {
+                Some(p) => simplified.insert(node.id, (vec![p], false)),
+                None => simplified.insert(node.id, (parents.to_vec(), true)),
+            };
+        }
+        // Whatever the simplified parent lists no longer reach was never walked
+        // by git in the first place, so it cannot appear in the output.
+        let mut reachable: HashSet<ObjectId> = HashSet::with_capacity(nodes.len());
+        let mut stack: Vec<ObjectId> = tips.clone();
+        while let Some(id) = stack.pop() {
+            if !reachable.insert(id) {
+                continue;
+            }
+            if let Some((parents, _)) = simplified.get(&id) {
+                stack.extend(parents.iter().copied());
             }
         }
-        nodes = kept;
+        nodes.retain(|n| {
+            reachable.contains(&n.id) && simplified.get(&n.id).is_some_and(|(_, shown)| *shown)
+        });
+        // `rewrite_parents()` again: only the formats that print ancestry need the
+        // simplified-away commits skipped over.
+        if graph || show_parents {
+            for node in &mut nodes {
+                let mut rewritten: Vec<ObjectId> = Vec::with_capacity(node.parents.len());
+                for p in &node.parents {
+                    if let Some(id) = simplify_rewrite_one(*p, &simplified) {
+                        if !rewritten.contains(&id) {
+                            rewritten.push(id);
+                        }
+                    }
+                }
+                node.parents = rewritten;
+            }
+        }
     }
 
     // `--merges`/`--no-merges` are git's aliases for `--min-parents=2` /
@@ -1059,7 +1185,7 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
                 _ => {
                     let jobs: Vec<(ObjectId, Option<ObjectId>)> =
                         kept.iter().map(|n| (n.id, n.parents.first().copied())).collect();
-                    let patches = super::diff::commit_patches(&repo, &jobs, 0)?;
+                    let patches = super::diff::commit_patches(&repo, &jobs, 0, &pathspecs)?;
                     kept.into_iter()
                         .zip(patches)
                         .filter(|(_, patch)| {
@@ -1129,8 +1255,71 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
     // `--use-mailmap` / `log.mailmap`: loaded once (worktree `.mailmap`, then
     // `mailmap.blob`, then `mailmap.file`) and shared by every rendered record.
     let mailmap = use_mailmap.then(|| Mailmap::load(&repo));
+    // `revision.c`: the two ancestry decorations share one slot in the header and
+    // git refuses to print both rather than pick an order.
+    if show_parents && show_children {
+        eprintln!("fatal: options '--parents' and '--children' cannot be used together");
+        return Ok(ExitCode::from(128));
+    }
+
+    // `--boundary`: the excluded commits the shown history hangs off — every
+    // parent that the exclusion hid — appended after the walk with a `-` mark.
+    // git emits them from `revs->boundary_commits` once the main walk is done, so
+    // they come last regardless of their dates and skip the filters above.
+    if boundary && !hidden.is_empty() {
+        let shown: HashSet<ObjectId> = nodes.iter().map(|n| n.id).collect();
+        let mut seen: HashSet<ObjectId> = HashSet::new();
+        let mut edge: Vec<Node> = Vec::new();
+        let reader = NodeReader::new(&repo);
+        for node in &nodes {
+            for parent in &node.parents {
+                if shown.contains(parent) || !hidden.contains(parent) || !seen.insert(*parent) {
+                    continue;
+                }
+                let mut n = reader.read(&repo, *parent)?;
+                n.boundary = true;
+                edge.push(n);
+            }
+        }
+        edge.sort_by_key(|n| std::cmp::Reverse(n.time));
+        nodes.extend(edge);
+    }
+
+    // `--children`: git records a child on every parent as it walks, so the list
+    // names only commits this run reached.
+    let children: Option<HashMap<ObjectId, Vec<ObjectId>>> = show_children.then(|| {
+        let mut map: HashMap<ObjectId, Vec<ObjectId>> = HashMap::new();
+        for node in &nodes {
+            for parent in &node.parents {
+                // `push_children()` splices each child onto the *front* of the
+                // list, so the ids come out in reverse walk order.
+                map.entry(*parent).or_default().insert(0, node.id);
+            }
+        }
+        map
+    });
+
+    // `--abbrev=<n>` is `revs->abbrev`, which every abbreviation in the run reads.
+    // Pushing it into the repository's config as `core.abbrev` puts it in front of
+    // the same lookup gitoxide already makes, so `%h`, the oneline id and the diff
+    // `index` lines all shorten together rather than each growing a knob.
+    if let Some(n) = abbrev_len {
+        let mut config = repo.config_snapshot_mut();
+        config.append_config(Some(format!("core.abbrev={n}")), gix::config::Source::Cli)?;
+        config.commit()?;
+    }
+
     // Relative dates (`%cr`/`%ar`, `--date=relative`) are measured against now.
     let now = now_secs();
+
+    // `cmd_log_init_finish()`: with no `--notes`/`--no-notes` of its own, a run
+    // shows notes when the caller picked no format at all — or picked a user
+    // format, where they surface only through `%N`. `--pretty=oneline` and the
+    // other built-ins therefore stay silent unless asked.
+    if !notes_opt.given && (!pretty_given || matches!(pretty, Pretty::User(_))) {
+        notes_opt.enable_default();
+    }
+    let notes_trees = super::notes::load_display(&repo, &notes_opt)?;
 
     // git emits one terminated record per commit for any non-empty format, even
     // when a given commit expands to nothing (e.g. `%d` on an undecorated commit).
@@ -1167,6 +1356,8 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
     let mut entries = EntryWindow::new(EntryParams {
         abbrev_commit,
         show_parents,
+        graph,
+        children: children.as_ref(),
         date_mode,
         want_color,
         colors: &deco_colors,
@@ -1178,6 +1369,7 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
         terminator,
         empty_user_format,
         pretty: &pretty,
+        notes: &notes_trees,
     });
     for (ni, node) in nodes.iter().enumerate() {
         if walk_only {
@@ -1253,8 +1445,26 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
                 // The record was rendered by a worker, which kept nothing; the
                 // count formats need the commit itself for its tree.
                 let commit = repo.find_object(node.id)?.try_into_commit()?;
-                let files =
+                let mut files =
                     collect_changes(&repo, &commit, node.parents.first().copied(), count_formats)?;
+                // `-- <pathspec>` limits what the name/stat formats report, not
+                // just which commits reach them.
+                if !pathspecs.is_empty() {
+                    let mut kept = Vec::with_capacity(files.len());
+                    for f in files {
+                        let mut hit = false;
+                        for spec in &pathspecs {
+                            if pathspec_matches(spec, &f.path)? {
+                                hit = true;
+                                break;
+                            }
+                        }
+                        if hit {
+                            kept.push(f);
+                        }
+                    }
+                    files = kept;
+                }
                 if name_status {
                     for f in &files {
                         diff.push(f.status);
@@ -1285,7 +1495,7 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
                 // The full patch, rendered by the same pipeline as `git diff` so
                 // the two agree byte-for-byte. git separates a preceding count
                 // format from the patch with a blank line.
-                let p = patches.get(&repo, &nodes, ni, 3)?;
+                let p = patches.get(&repo, &nodes, ni, 3, &pathspecs)?;
                 if !p.is_empty() {
                     if !diff.is_empty() {
                         diff.push(b'\n');
@@ -1388,6 +1598,25 @@ fn line_log_rewrite_one(
             return Some(p);
         };
         if parents.len() > 1 || hidden.contains(&p) || *kept {
+            return Some(p);
+        }
+        p = *parents.first()?;
+    }
+}
+
+/// `rewrite_one()` for pathspec simplification: walk past every simplified-away
+/// ancestor until a shown commit (or one the walk never reached) is found, so
+/// `--graph`/`--parents` draw the simplified history rather than the real one.
+fn simplify_rewrite_one(
+    parent: ObjectId,
+    simplified: &HashMap<ObjectId, (Vec<ObjectId>, bool)>,
+) -> Option<ObjectId> {
+    let mut p = parent;
+    loop {
+        let Some((parents, shown)) = simplified.get(&p) else {
+            return Some(p);
+        };
+        if *shown {
             return Some(p);
         }
         p = *parents.first()?;
@@ -1501,6 +1730,12 @@ enum Order {
 struct EntryParams<'a> {
     abbrev_commit: bool,
     show_parents: bool,
+    /// `--graph`: suppresses the `--boundary` mark, which the `o` node draws instead
+    /// (`show_log` skips `put_revision_mark` whenever a graph is active).
+    graph: bool,
+    /// `--children`: each commit`s children among the walked set, or `None` when
+    /// the flag is off.
+    children: Option<&'a HashMap<ObjectId, Vec<ObjectId>>>,
     date_mode: DateMode,
     want_color: bool,
     /// The resolved `color.decorate.*` / `color.diff.commit` slots.
@@ -1515,6 +1750,8 @@ struct EntryParams<'a> {
     terminator: bool,
     empty_user_format: bool,
     pretty: &'a Pretty,
+    /// The notes trees to render after the message; empty when notes are off.
+    notes: &'a [super::notes::Tree],
 }
 
 /// A look-ahead buffer of rendered commit records.
@@ -1634,22 +1871,27 @@ fn entry_block(
     abbrev: &std::cell::RefCell<AbbrevCache>,
 ) -> Result<Vec<u8>> {
     let commit = repo.find_object(node.id)?.try_into_commit()?;
-    // `--parents` decorates the header with the commit's own parent ids.
-    let extra = if p.show_parents {
-        let mut e = Vec::new();
-        for parent in &node.parents {
-            e.push(b' ');
-            let pid = parent.attach(repo);
+    // `--parents` then `--children` decorate the header with ids, in that order
+    // (`show_log` prints `print_parents` before `children`). A child list is what
+    // the walk saw, so it names only commits this run reached.
+    let mut extra = Vec::new();
+    let mut push_ids = |ids: &[ObjectId], out: &mut Vec<u8>| {
+        for id in ids {
+            out.push(b' ');
+            let attached = id.attach(repo);
             if p.abbrev_commit {
-                e.extend_from_slice(abbrev.borrow_mut().get(pid).as_bytes());
+                out.extend_from_slice(abbrev.borrow_mut().get(attached).as_bytes());
             } else {
-                e.extend_from_slice(pid.to_string().as_bytes());
+                out.extend_from_slice(attached.to_string().as_bytes());
             }
         }
-        e
-    } else {
-        Vec::new()
     };
+    if p.show_parents {
+        push_ids(&node.parents, &mut extra);
+    }
+    if let Some(children) = p.children {
+        push_ids(children.get(&node.id).map_or(&[][..], Vec::as_slice), &mut extra);
+    }
     let ctx = RenderCtx {
         abbrev_commit: p.abbrev_commit,
         abbrev,
@@ -1662,6 +1904,9 @@ fn entry_block(
         decorate: p.decorate,
         source: if p.source_mode { Some(node.source.as_bytes()) } else { None },
         mailmap: p.mailmap,
+        notes: p.notes,
+        repo,
+        mark: if node.boundary && !p.graph { "- " } else { "" },
     };
     let mut block: Vec<u8> = Vec::new();
     render_entry(&mut block, &commit, p.pretty, &ctx)?;
@@ -1716,6 +1961,7 @@ impl PatchWindow {
         nodes: &[Node],
         i: usize,
         ctx: u32,
+        paths: &[String],
     ) -> Result<&'a [u8]> {
         if !self.active {
             return Ok(&[]);
@@ -1733,7 +1979,7 @@ impl PatchWindow {
                     at.push(k);
                 }
             }
-            let computed = super::diff::commit_patches(repo, &jobs, ctx)?;
+            let computed = super::diff::commit_patches(repo, &jobs, ctx, paths)?;
             self.slots = vec![Vec::new(); span.len()];
             for (slot, patch) in at.into_iter().zip(computed) {
                 self.slots[slot] = patch;
@@ -1751,14 +1997,27 @@ pub(crate) struct Node {
     /// `--source`: the ref/argument this commit was first reached from. Empty when
     /// `--source` is off (the field is never rendered in that case).
     pub(crate) source: String,
+    /// Order this node entered the frontier, which is what breaks a date tie.
+    /// Set by the walk at push time; never rendered.
+    pub(crate) seq: u64,
+    /// `--boundary`: an excluded commit that a shown commit descends from, which
+    /// git prints with a `-` mark after the rest of the walk.
+    pub(crate) boundary: bool,
 }
 
 /// Heap order for the walk's frontier: newest commit-date first, ties broken by
-/// object id so the ordering is total (a `BinaryHeap` needs `Ord`, and equal
-/// dates are common in imported or scripted history).
+/// insertion order — the commit that entered the frontier first pops first.
+///
+/// git's frontier is a list kept sorted by `commit_list_insert_by_date()`, which
+/// walks past every entry whose date is *not older* than the new one before
+/// splicing it in. Equal dates therefore come out first-in-first-out, and equal
+/// dates are the norm rather than the exception: an import, a scripted series,
+/// or any two commits inside the same second all tie. Breaking those ties by
+/// object id instead reorders `git log` against git — and against this port's
+/// own `rev-list`, which goes through gitoxide's date-ordered walk.
 impl Ord for Node {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.time.cmp(&other.time).then_with(|| other.id.cmp(&self.id))
+        self.time.cmp(&other.time).then_with(|| other.seq.cmp(&self.seq))
     }
 }
 impl PartialOrd for Node {
@@ -1768,7 +2027,7 @@ impl PartialOrd for Node {
 }
 impl PartialEq for Node {
     fn eq(&self, other: &Self) -> bool {
-        self.time == other.time && self.id == other.id
+        self.time == other.time && self.seq == other.seq
     }
 }
 impl Eq for Node {}
@@ -1988,6 +2247,8 @@ fn read_node(repo: &gix::Repository, id: ObjectId) -> Result<Node> {
         id,
         parents: commit.parent_ids().map(|p| p.detach()).collect(),
         time: commit.time()?.seconds,
+        seq: 0,
+        boundary: false,
         source: String::new(),
     })
 }
@@ -2024,6 +2285,8 @@ impl NodeReader {
                     parents,
                     time: commit.committer_timestamp() as i64,
                     source: String::new(),
+                    seq: 0,
+                    boundary: false,
                 });
             }
         }
@@ -2095,6 +2358,10 @@ fn walk(
     // and both the push and the pop are logarithmic. The previous sorted-insert
     // plus `remove(0)` made a full walk quadratic in the number of commits.
     let mut pending: std::collections::BinaryHeap<Node> = std::collections::BinaryHeap::new();
+    // Insertion order, which is what decides a date tie — see `Node`'s `Ord`.
+    // Tips enter in argument order and parents in parent order, exactly as
+    // `add_parents_to_list()` feeds git's frontier.
+    let mut seq: u64 = 0;
     for (idx, tip) in tips.iter().enumerate() {
         if seen.insert(*tip) {
             let mut node = reader.read(repo, *tip)?;
@@ -2103,6 +2370,8 @@ fn walk(
             if let Some(src) = tip_sources.get(idx) {
                 node.source = src.clone();
             }
+            node.seq = seq;
+            seq += 1;
             pending.push(node);
         }
     }
@@ -2129,6 +2398,8 @@ fn walk(
                 // git's `add_parents_to_list`: a parent inherits the source of the
                 // commit that first reaches it (an empty-string clone when off).
                 pnode.source = node.source.clone();
+                pnode.seq = seq;
+                seq += 1;
                 pending.push(pnode);
             }
         }
@@ -2295,7 +2566,7 @@ fn check_format(fmt: &str) -> Result<()> {
         match it.next() {
             Some(
                 'H' | 'h' | 'T' | 't' | 'P' | 'p' | 's' | 'b' | 'B' | 'f' | 'n' | '%' | 'C' | 'd'
-                | 'D',
+                | 'D' | 'N',
             ) => {}
             Some('a') => match it.next() {
                 Some('n' | 'e' | 'd' | 'i' | 'I' | 't' | 'r') => {}
@@ -2350,6 +2621,11 @@ pub(crate) fn format_commit(
         decorate: DecorateStyle::Off,
         source: None,
         mailmap: None,
+        // `rebase -i` renders its instruction lines with no notes; `%N` in an
+        // instruction format expands to nothing, as it does under git.
+        notes: &[],
+        repo,
+        mark: "",
     };
     let mut out = Vec::new();
     expand_format(&mut out, commit, &unabbreviated(fmt), &ctx)?;
@@ -2432,6 +2708,18 @@ fn expand_format(
             's' => out.extend_from_slice(&subject(commit.message_raw()?)),
             'b' => out.extend_from_slice(&body(commit.message_raw()?)),
             'B' => out.extend_from_slice(commit.message_raw()?),
+            // `%N`: the raw note text — no header, no indent — which is the only
+            // way a user format shows notes at all.
+            'N' => {
+                if !ctx.notes.is_empty() {
+                    out.extend_from_slice(&super::notes::format_display(
+                        ctx.repo,
+                        ctx.notes,
+                        commit.id().detach(),
+                        true,
+                    )?);
+                }
+            }
             'f' => out.extend_from_slice(&sanitized_subject(&subject(commit.message_raw()?))),
             'n' => out.push(b'\n'),
             '%' => out.push(b'%'),
@@ -2600,6 +2888,9 @@ fn write_commit_name(out: &mut Vec<u8>, prefix: &[u8], id: &str, ctx: &RenderCtx
         out.extend_from_slice(color.as_bytes());
     }
     out.extend_from_slice(prefix);
+    // `get_revision_mark()`: `--boundary` puts a `-` in front of the object name,
+    // after the `commit ` the header formats print.
+    out.extend_from_slice(ctx.mark.as_bytes());
     out.extend_from_slice(id.as_bytes());
     if !color.is_empty() {
         out.extend_from_slice(b"\x1b[m");
@@ -3415,6 +3706,11 @@ pub(crate) fn rev_list_pretty_body(
         decorate: DecorateStyle::Off,
         source: None,
         mailmap: None,
+        // `cmd_rev_list` never calls `init_display_notes`, so `rev-list --pretty`
+        // prints no notes even where `log` would.
+        notes: &[],
+        repo,
+        mark: "",
     };
     let mut out = Vec::new();
     match pretty {
@@ -3550,6 +3846,26 @@ struct RenderCtx<'a> {
     /// only, so `oneline`, `raw` and user formats are unaffected — `%aN`/`%aE`
     /// consult the mailmap on their own, independent of this flag.
     mailmap: Option<&'a Mailmap>,
+    /// The notes trees whose `Notes[ (<ref>)]:` blocks follow the message. Empty
+    /// when notes are off; a user format reaches them only through `%N`.
+    notes: &'a [super::notes::Tree],
+    /// Rendering a note means reading its blob.
+    repo: &'a gix::Repository,
+    /// `get_revision_mark()`: `- ` for a `--boundary` commit, empty otherwise.
+    mark: &'static str,
+}
+
+/// The `Notes[ (<ref>)]:` blocks for `commit`, or empty.
+///
+/// git appends these to the message buffer, so the leading newline
+/// `format_display_notes()` emits lands differently per format: after a
+/// `medium` message (which already ends in a newline) it renders as the blank
+/// line above the block, and after a `oneline` subject it just ends that line.
+fn notes_block(commit: &gix::Commit<'_>, ctx: &RenderCtx<'_>) -> Result<Vec<u8>> {
+    if ctx.notes.is_empty() {
+        return Ok(Vec::new());
+    }
+    super::notes::format_display(ctx.repo, ctx.notes, commit.id().detach(), false)
 }
 
 /// Render one commit's header in the selected format. Built-in formats end with
@@ -3585,6 +3901,7 @@ fn render_entry(
             }
             out.push(b' ');
             out.extend_from_slice(&subject(commit.message_raw()?));
+            out.extend_from_slice(&notes_block(commit, ctx)?);
         }
         Pretty::Reference => {
             // `%h (%s, %ad)` with `--date=short` unless `--date=` overrode it.
@@ -3619,6 +3936,7 @@ fn render_entry(
             out.push(b'\n');
             // `raw` prints the message as stored: its table entry has no tab width.
             indent_message(out, commit.message_raw()?, 0);
+            out.extend_from_slice(&notes_block(commit, ctx)?);
         }
         Pretty::Medium | Pretty::Short | Pretty::Full | Pretty::Fuller => {
             let author = commit.author()?;
@@ -3695,6 +4013,7 @@ fn render_entry(
             } else {
                 indent_message(out, commit.message_raw()?, 8);
             }
+            out.extend_from_slice(&notes_block(commit, ctx)?);
         }
     }
     Ok(())
@@ -4040,12 +4359,15 @@ fn decode_changes(text: &str) -> Option<Vec<FileChange>> {
     Some(out)
 }
 
-/// Whether `node`'s commit touched any path matching `pathspecs`, diffed against
-/// its first parent (the empty tree for a root commit). This is the predicate
-/// git's path-limited traversal shows a commit on.
-fn commit_touches(repo: &gix::Repository, node: &Node, pathspecs: &[String]) -> Result<bool> {
-    let commit = repo.find_object(node.id)?.try_into_commit()?;
-    let files = collect_changes(repo, &commit, node.parents.first().copied(), false)?;
+/// Whether the diff between `commit` and `parent` (the empty tree when `None`)
+/// touches any of the pathspecs — git's TREESAME test, negated.
+fn changes_match(
+    repo: &gix::Repository,
+    commit: &gix::Commit<'_>,
+    parent: Option<ObjectId>,
+    pathspecs: &[String],
+) -> Result<bool> {
+    let files = collect_changes(repo, commit, parent, false)?;
     for f in &files {
         for spec in pathspecs {
             if pathspec_matches(spec, &f.path)? {
@@ -4062,7 +4384,7 @@ fn commit_touches(repo: &gix::Repository, node: &Node, pathspecs: &[String]) -> 
 /// span the whole path and `[…]` bracket expressions (ranges, `!`/`^` negation,
 /// POSIX `[:class:]`) are honored. Magic pathspecs (`:(glob)`, `:!exclude`, …)
 /// are surfaced terse rather than matched wrong.
-fn pathspec_matches(spec: &str, path: &[u8]) -> Result<bool> {
+pub(crate) fn pathspec_matches(spec: &str, path: &[u8]) -> Result<bool> {
     if spec.starts_with(':') {
         bail!("magic pathspecs are not ported");
     }
@@ -4745,7 +5067,11 @@ fn render_graph(nodes: &[Node], blocks: &[Vec<u8>], colors: Vec<String>, want_co
     let mut out: Vec<u8> = Vec::new();
 
     for (i, node) in nodes.iter().enumerate() {
-        graph.update(node.id, &node.parents);
+        // A boundary commit is where the drawn history stops: git never adds its
+        // parents to the graph, so its column closes and the rows under it are
+        // blank rather than a continuing `|`.
+        let drawn_parents: &[ObjectId] = if node.boundary { &[] } else { &node.parents };
+        graph.update(node.id, drawn_parents, node.boundary);
 
         let block = &blocks[i];
         let ends_nl = block.ends_with(b"\n");
@@ -4830,6 +5156,8 @@ struct Graph {
     mapping: Vec<i32>,
     old_mapping: Vec<i32>,
     commit: ObjectId,
+    /// `--boundary`: the current commit is an excluded ancestor, drawn `o`.
+    boundary: bool,
     /// The current commit's parents, in order — the post-merge row draws one edge
     /// per parent and takes each edge's color from that parent's column.
     parents: Vec<ObjectId>,
@@ -4850,6 +5178,7 @@ impl Graph {
         // always increments first — which lands the first branch line on index 0.
         let default_column_color = colors.len().saturating_sub(2);
         Graph {
+            boundary: false,
             columns: Vec::new(),
             new_columns: Vec::new(),
             mapping: Vec::new(),
@@ -4908,8 +5237,9 @@ impl Graph {
         }
     }
 
-    fn update(&mut self, id: ObjectId, parents: &[ObjectId]) {
+    fn update(&mut self, id: ObjectId, parents: &[ObjectId], boundary: bool) {
         self.commit = id;
+        self.boundary = boundary;
         self.parents = parents.to_vec();
         self.num_parents = parents.len();
         self.update_columns(parents);
@@ -5019,7 +5349,9 @@ impl Graph {
 
             if col_commit == self.commit {
                 seen_this = true;
-                line.addch(b'*');
+                // `graph_output_commit_char()`: a boundary commit is drawn as a
+                // hollow `o` rather than the usual `*`.
+                line.addch(if self.boundary { b'o' } else { b'*' });
             } else if seen_this && self.num_parents > 1 {
                 self.write_column(&mut line, &self.columns[i], b'\\');
             } else if self.prev_state == GraphState::Collapsing

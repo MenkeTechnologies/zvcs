@@ -1023,6 +1023,9 @@ fn stop_empty(
         Some(name) => println!("On branch {}", name.shorten()),
         None => println!("HEAD detached at {}", head_id.attach(repo).shorten_or_id()),
     }
+    // `wt_status_print` follows the header with the upstream relation and a
+    // blank line; a branch with no upstream contributes neither.
+    print!("{}", super::status::tracking_block(repo));
     println!(
         "You are currently cherry-picking commit {}.",
         pick_id.attach(repo).shorten_or_id()

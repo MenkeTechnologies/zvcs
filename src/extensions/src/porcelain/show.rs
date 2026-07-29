@@ -92,6 +92,9 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
     let mut pathspecs: Vec<Vec<u8>> = Vec::new();
     let mut formats = Formats::default();
     let mut pretty = Pretty::Medium;
+    // `rev->pretty_given`, which is what decides whether notes show by default.
+    let mut pretty_given = false;
+    let mut notes_opt = super::notes::DisplayOpt::default();
     let mut after_dashdash = false;
     // Display config shared with `git log`, overridable on the command line. The
     // config defaults are resolved after the repo is discovered; these hold the
@@ -182,7 +185,22 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
             "--name-only" => formats.name_only = true,
             "--raw" => formats.raw = true,
             "--stat" => formats.stat = true,
-            "--oneline" => pretty = Pretty::Oneline,
+            "--oneline" => {
+                pretty = Pretty::Oneline;
+                pretty_given = true;
+                // git`s `--oneline` is `--pretty=oneline --abbrev-commit`.
+                cli_abbrev = Some(true);
+            }
+            // `--notes[=<ref>]`/`--show-notes[=<ref>]`/`--no-notes`, as `git log`
+            // takes them: a later flag overrides an earlier one.
+            "--notes" | "--show-notes" => {
+                notes_opt.enable_default();
+                notes_opt.given = true;
+            }
+            "--no-notes" | "--no-show-notes" => {
+                notes_opt.disable();
+                notes_opt.given = true;
+            }
             // `log.abbrevCommit`/`log.date`/`log.showRoot` overrides, mirroring
             // `git log`. There is no `--no-root`; `--root` only forces it on.
             "--abbrev-commit" => cli_abbrev = Some(true),
@@ -226,9 +244,18 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
                     // before resolving any revision, and rejects an invalid one
                     // wherever it appears with exit 128.
                     match parse_pretty(spec) {
-                        Some(p) => pretty = p,
+                        Some(p) => {
+                            pretty = p;
+                            pretty_given = true;
+                        }
                         None => return Ok(fatal(&format!("invalid --pretty format: {spec}\n"))),
                     }
+                } else if let Some(v) = s
+                    .strip_prefix("--notes=")
+                    .or_else(|| s.strip_prefix("--show-notes="))
+                {
+                    notes_opt.enable_ref(v);
+                    notes_opt.given = true;
                 } else if let Some(v) = s.strip_prefix("--decorate=") {
                     // git's `decorate_callback` dies on a value its
                     // `parse_decoration_style` rejects, unlike `log.decorate`.
@@ -493,7 +520,12 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
     let mut shown: Vec<ObjectId> = Vec::new();
     // git's `rev_info.shown_one`, which drives the inter-record separator.
     let mut shown_one = false;
+    if !notes_opt.given && (!pretty_given || matches!(pretty, Pretty::User(_))) {
+        notes_opt.enable_default();
+    }
+    let notes_trees = super::notes::load_display(&repo, &notes_opt)?;
     let disp = DisplayOpts {
+        notes: &notes_trees,
         abbrev_commit,
         date_mode,
         show_root,
@@ -543,6 +575,10 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
                     parents: commit.parent_ids().map(|p| p.detach()).collect(),
                     time: commit.time()?.seconds,
                     source: String::new(),
+                    // These are collected in walk order and topologically sorted
+                    // below, never through the date-ordered heap.
+                    seq: 0,
+                    boundary: false,
                 });
             }
             nodes = super::log::topo_sort(nodes, false);
@@ -686,7 +722,7 @@ fn check_format(fmt: &str) -> Result<()> {
             continue;
         }
         match it.next() {
-            Some('H' | 'h' | 'T' | 't' | 'P' | 'p' | 's' | 'n' | '%') => {}
+            Some('H' | 'h' | 'T' | 't' | 'P' | 'p' | 's' | 'n' | '%' | 'N') => {}
             Some('a') => match it.next() {
                 Some('n' | 'e') => {}
                 Some(x) => bail!("unsupported format placeholder %a{x}"),
@@ -700,7 +736,12 @@ fn check_format(fmt: &str) -> Result<()> {
 }
 
 /// Expand the placeholders accepted by [`check_format`] for `commit`.
-fn expand_format(out: &mut Vec<u8>, commit: &gix::Commit<'_>, fmt: &str) -> Result<()> {
+fn expand_format(
+    out: &mut Vec<u8>,
+    commit: &gix::Commit<'_>,
+    fmt: &str,
+    notes: &[super::notes::Tree],
+) -> Result<()> {
     let mut it = fmt.chars();
     while let Some(c) = it.next() {
         if c != '%' {
@@ -710,6 +751,13 @@ fn expand_format(out: &mut Vec<u8>, commit: &gix::Commit<'_>, fmt: &str) -> Resu
         }
         match it.next() {
             Some('H') => out.extend_from_slice(commit.id().to_string().as_bytes()),
+            // `%N`: the raw note text, the only way a user format shows notes.
+            Some('N') => out.extend_from_slice(&super::notes::format_display(
+                commit.repo,
+                notes,
+                commit.id().detach(),
+                true,
+            )?),
             Some('h') => out.extend_from_slice(commit.id().shorten_or_id().to_string().as_bytes()),
             Some('T') => out.extend_from_slice(commit.tree_id()?.to_string().as_bytes()),
             Some('t') => {
@@ -857,6 +905,24 @@ struct DisplayOpts<'a> {
     /// `--use-mailmap` / `log.mailmap`: rewrites the `Author:` line through
     /// `.mailmap`. `None` shows the identity as the commit recorded it.
     mailmap: Option<&'a Mailmap>,
+    /// The notes trees whose `Notes[ (<ref>)]:` block follows the message.
+    notes: &'a [super::notes::Tree],
+}
+
+/// The `Notes[ (<ref>)]:` blocks for `id`, or empty when notes are off.
+///
+/// git appends these to the message buffer, so the leading newline lands as the
+/// blank line above the block after a `medium` message and as nothing extra
+/// after a `oneline` subject — see [`super::notes::format_display`].
+fn notes_block(
+    repo: &gix::Repository,
+    disp: &DisplayOpts<'_>,
+    id: ObjectId,
+) -> Result<Vec<u8>> {
+    if disp.notes.is_empty() {
+        return Ok(Vec::new());
+    }
+    super::notes::format_display(repo, disp.notes, id, false)
 }
 
 /// `--stat` width geometry, in git's `stat_width`/`stat_name_width`/`stat_graph_width`
@@ -931,7 +997,6 @@ impl Pickaxe {
 
 /// Render the object `id` (named `spec` on the command line), peeling annotated
 /// tags to their target after printing the tag header.
-#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 fn show_one(
     repo: &gix::Repository,
@@ -1124,15 +1189,22 @@ fn show_commit(
 
     match pretty {
         Pretty::Oneline => {
-            out.extend_from_slice(commit.id().shorten_or_id().to_string().as_bytes());
+            // `--pretty=oneline` prints the full object name; only `--oneline`,
+            // which is `--pretty=oneline --abbrev-commit`, shortens it.
+            if disp.abbrev_commit {
+                out.extend_from_slice(commit.id().shorten_or_id().to_string().as_bytes());
+            } else {
+                out.extend_from_slice(commit.id().to_string().as_bytes());
+            }
             write_source(out, source);
             write_decorations(out, commit.id().as_ref(), disp);
             out.push(b' ');
             out.extend_from_slice(&subject(commit.message_raw()?));
+            out.extend_from_slice(&notes_block(repo, disp, commit.id().detach())?);
             out.push(b'\n');
         }
         Pretty::User(fmt) => {
-            expand_format(out, commit, fmt)?;
+            expand_format(out, commit, fmt, disp.notes)?;
             // A `tformat` (the default for `--format=`) terminates each non-empty
             // entry with a newline; the empty format terminates nothing.
             if !fmt.is_empty() {
@@ -1176,6 +1248,7 @@ fn show_commit(
                 out.extend_from_slice(line);
                 out.push(b'\n');
             }
+            out.extend_from_slice(&notes_block(repo, disp, commit.id().detach())?);
         }
     }
 

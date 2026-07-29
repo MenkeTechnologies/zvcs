@@ -4,6 +4,7 @@ use std::io::{Read, Write};
 use std::process::ExitCode;
 
 use gix::hash::ObjectId;
+use gix::prelude::ObjectIdExt;
 use gix::revision::walk::Sorting;
 use gix::traverse::commit::simple::CommitTimeOrder;
 
@@ -242,6 +243,9 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     let mut disk_usage_human = false;
     let mut include_header = true;
     let mut verbose_header = false;
+    // `--abbrev-commit`: shorten the object name rev-list prints, which is what
+    // `--oneline` turns on together with the oneline format.
+    let mut abbrev_commit = false;
     let mut pretty: Option<Pretty> = None;
     let mut order = Order::Date;
     let mut filter: Option<Filter> = None;
@@ -359,6 +363,16 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
                 verbose_header = true;
                 pretty = Some(Pretty::Medium);
             }
+            // `--oneline` is git`s `--pretty=oneline --abbrev-commit`, and
+            // `--abbrev-commit`/`--no-abbrev-commit` shorten the object name on
+            // their own (`rev_list.c` shares `cmd_log_init`s parser here).
+            "--oneline" => {
+                verbose_header = true;
+                pretty = Some(Pretty::Oneline);
+                abbrev_commit = true;
+            }
+            "--abbrev-commit" => abbrev_commit = true,
+            "--no-abbrev-commit" => abbrev_commit = false,
             "-n" => {
                 i += 1;
                 let Some(n) = args.get(i) else {
@@ -858,7 +872,11 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
                     left_right,
                     cherry_mark,
                 ));
-                out.extend_from_slice(id.to_string().as_bytes());
+                if abbrev_commit {
+                    out.extend_from_slice(id.attach(&repo).shorten_or_id().to_string().as_bytes());
+                } else {
+                    out.extend_from_slice(id.to_string().as_bytes());
+                }
             }
             if show_parents {
                 for parent in parents_of.get(id).into_iter().flatten() {

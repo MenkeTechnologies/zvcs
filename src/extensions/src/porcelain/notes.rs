@@ -1,6 +1,6 @@
 use anyhow::{anyhow, bail, Result};
 use std::collections::BTreeMap;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::process::ExitCode;
 
 use gix::bstr::{BStr, BString, ByteSlice};
@@ -220,7 +220,7 @@ pub(crate) fn resolve_notes_ref(repo: &gix::Repository, override_ref: Option<&st
 
 /// `notes.c:expand_notes_ref()` — a bare name becomes `refs/notes/<name>`, a
 /// `notes/`-prefixed name gains `refs/`, a full name is left alone.
-fn expand_notes_ref(name: &str) -> String {
+pub(crate) fn expand_notes_ref(name: &str) -> String {
     if name.starts_with("refs/notes/") {
         name.to_string()
     } else if name.starts_with("notes/") {
@@ -331,6 +331,194 @@ fn load_subtree(
 
 fn is_hex(s: &str) -> bool {
     !s.is_empty() && s.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+}
+
+// ---------------------------------------------------------------------------
+// display: the `Notes:` block `log`, `show` and `format-patch` render
+// ---------------------------------------------------------------------------
+
+/// git's `GIT_NOTES_DEFAULT_REF` — the one ref whose block has no `(<name>)`.
+pub(crate) const DEFAULT_REF: &str = "refs/notes/commits";
+
+/// Which notes trees to display: a port of `struct display_notes_opt`.
+#[derive(Clone)]
+pub(crate) struct DisplayOpt {
+    /// `use_default_notes`: `-1` until asked for, `1` once `--notes` with no ref
+    /// (or a config default) turned the default tree on.
+    use_default: i32,
+    /// The `--notes=<ref>` values, already through [`expand_notes_ref`].
+    extra_refs: Vec<String>,
+    /// git's `rev.show_notes`.
+    pub(crate) show: bool,
+    /// git's `rev.show_notes_given`: whether any `--notes`/`--no-notes` was seen,
+    /// which is what decides if the format's default still applies.
+    pub(crate) given: bool,
+}
+
+impl Default for DisplayOpt {
+    fn default() -> Self {
+        DisplayOpt {
+            use_default: -1,
+            extra_refs: Vec::new(),
+            show: false,
+            given: false,
+        }
+    }
+}
+
+impl DisplayOpt {
+    /// `enable_default_display_notes()`: `--notes`/`--show-notes` with no ref.
+    pub(crate) fn enable_default(&mut self) {
+        self.use_default = 1;
+        self.show = true;
+    }
+
+    /// `enable_ref_display_notes()`: `--notes=<ref>`. An explicit ref suppresses
+    /// both the default tree and the configured display refs.
+    pub(crate) fn enable_ref(&mut self, name: &str) {
+        self.extra_refs.push(expand_notes_ref(name));
+        self.show = true;
+    }
+
+    /// `disable_display_notes()`: `--no-notes` forgets every ref asked for.
+    pub(crate) fn disable(&mut self) {
+        self.use_default = -1;
+        self.extra_refs.clear();
+        self.show = false;
+    }
+}
+
+/// One loaded notes tree, with the ref it came from (which names the block).
+pub(crate) struct Tree {
+    ref_name: String,
+    notes: Notes,
+}
+
+/// Port of `load_display_notes()` (notes.c).
+///
+/// The default tree is consulted when `--notes` was given without a ref (or when
+/// nothing narrowed the selection), and only then are `GIT_NOTES_DISPLAY_REF`
+/// and `notes.displayRef` added — an explicit `--notes=<ref>` suppresses both.
+pub(crate) fn load_display(repo: &gix::Repository, opt: &DisplayOpt) -> Result<Vec<Tree>> {
+    if !opt.show {
+        return Ok(Vec::new());
+    }
+    let mut refs: Vec<String> = Vec::new();
+    if opt.use_default > 0 || (opt.use_default == -1 && opt.extra_refs.is_empty()) {
+        refs.push(resolve_notes_ref(repo, None));
+        match std::env::var("GIT_NOTES_DISPLAY_REF") {
+            Ok(v) => {
+                for name in v.split(':').filter(|s| !s.is_empty()) {
+                    add_by_glob(repo, &mut refs, name)?;
+                }
+            }
+            Err(_) => {
+                for v in repo
+                    .config_snapshot()
+                    .plumbing()
+                    .values::<gix::bstr::BString>("notes.displayRef")
+                    .unwrap_or_default()
+                {
+                    add_by_glob(repo, &mut refs, v.to_str()?)?;
+                }
+            }
+        }
+    }
+    for r in &opt.extra_refs {
+        add_by_glob(repo, &mut refs, r)?;
+    }
+
+    let mut trees = Vec::new();
+    for r in refs {
+        let (notes, _) = load(repo, &r)?;
+        trees.push(Tree {
+            ref_name: r,
+            notes,
+        });
+    }
+    Ok(trees)
+}
+
+/// Port of `string_list_add_refs_by_glob()`: a pattern is expanded against the
+/// ref store in name order, a plain name that resolves to nothing is warned
+/// about but still listed, and duplicates are dropped either way.
+fn add_by_glob(repo: &gix::Repository, refs: &mut Vec<String>, name: &str) -> Result<()> {
+    let push = |refs: &mut Vec<String>, candidate: String| {
+        if !refs.contains(&candidate) {
+            refs.push(candidate);
+        }
+    };
+    if name.contains(['*', '?', '[']) {
+        let mut matched: Vec<String> = Vec::new();
+        for r in repo.references()?.all()?.filter_map(std::result::Result::ok) {
+            let full = r.name().as_bstr().to_str_lossy().into_owned();
+            if super::log::wildmatch(name.as_bytes(), full.as_bytes()) {
+                matched.push(full);
+            }
+        }
+        matched.sort();
+        for m in matched {
+            push(refs, m);
+        }
+        return Ok(());
+    }
+    if repo.try_find_reference(name)?.is_none() {
+        eprintln!("warning: notes ref {name} is invalid");
+    }
+    push(refs, name.to_owned());
+    Ok(())
+}
+
+/// Port of `format_display_notes()`/`format_note()` (notes.c).
+///
+/// Each tree that carries a note for `object` contributes a bare newline, a
+/// `Notes[ (<ref>)]:` header, and the note's lines indented four spaces. The
+/// leading newline is what renders as the blank line above the block when the
+/// message before it already ended in one — and as no blank at all after a
+/// `--pretty=oneline` subject, which is exactly git's own spacing.
+///
+/// `raw` is `%N`'s expansion: the note text alone, no header and no indent.
+pub(crate) fn format_display(
+    repo: &gix::Repository,
+    trees: &[Tree],
+    object: ObjectId,
+    raw: bool,
+) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    for t in trees {
+        let Some(note_id) = t.notes.map.get(&object) else {
+            continue;
+        };
+        let Ok(blob) = repo.find_object(*note_id) else {
+            continue;
+        };
+        if blob.kind != gix::object::Kind::Blob {
+            continue;
+        }
+        let mut msg = blob.data.as_slice();
+        // "we will end the annotation by a newline anyway"
+        if msg.last() == Some(&b'\n') {
+            msg = &msg[..msg.len() - 1];
+        }
+        if !raw {
+            let label = t.ref_name.as_str();
+            if label == DEFAULT_REF {
+                out.extend_from_slice(b"\nNotes:\n");
+            } else {
+                let short = label.strip_prefix("refs/").unwrap_or(label).to_owned();
+                let short = short.strip_prefix("notes/").unwrap_or(&short);
+                write!(out, "\nNotes ({short}):\n")?;
+            }
+        }
+        for line in msg.split(|&b| b == b'\n') {
+            if !raw {
+                out.extend_from_slice(b"    ");
+            }
+            out.extend_from_slice(line);
+            out.push(b'\n');
+        }
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------

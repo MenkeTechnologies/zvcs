@@ -251,6 +251,9 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     let mut full_index = false;
     let mut want_exit_code = false;
     let mut quiet = false;
+    // `--relative[=<path>]`: the prefix stripped from every reported path (with a
+    // trailing slash), or `None` when paths are shown from the repository root.
+    let mut relative: Option<String> = None;
     let mut src_prefix: Vec<u8> = b"a/".to_vec();
     let mut dst_prefix: Vec<u8> = b"b/".to_vec();
     // `--line-prefix=<s>`: prepended to every emitted line (`diff_line_prefix()`).
@@ -564,6 +567,19 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                     }
                 }
             }
+            // `--relative[=<path>]`/`--no-relative`: `diff_opt_relative()`. With no
+            // value the prefix is the current directory inside the repository;
+            // with one it is that path. Either way git stores it with a trailing
+            // slash so a plain prefix match cannot cross a name boundary.
+            "--relative" => relative = Some(cwd_prefix(&repo)),
+            "--no-relative" => relative = None,
+            s if s.starts_with("--relative=") => {
+                let mut p = s["--relative=".len()..].to_string();
+                if !p.is_empty() && !p.ends_with('/') {
+                    p.push('/');
+                }
+                relative = Some(p);
+            }
             s if s.starts_with("--src-prefix=") => {
                 src_prefix = s.as_bytes()["--src-prefix=".len()..].to_vec();
             }
@@ -859,6 +875,14 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
         deltas.retain(|d| paths.iter().any(|p| path_matches(&d.path, p)));
     }
 
+    // `--relative[=<path>]` narrows the change list to what lives under the
+    // prefix. The names are shortened later, once every side has been read:
+    // stripping here would leave the worktree reads looking for `one.txt` at the
+    // repository root.
+    if let Some(prefix) = &relative {
+        deltas.retain(|d| d.path.starts_with(prefix.as_bytes()));
+    }
+
     // `-R`: swap the two sides of every pair. The worktree "new" side has no object
     // id to move onto the old side, so a reversed worktree diff genuinely cannot be
     // expressed through this pipeline.
@@ -971,6 +995,20 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
             return Ok(ExitCode::from(128));
         }
     };
+
+    // `--relative`: git reports each path through `relative_path()` at output
+    // time, so the shortening happens here — after every blob has been read by
+    // its real path, and in one place rather than at each of the format writers.
+    if let Some(prefix) = &relative {
+        for d in &mut deltas {
+            d.path = d.path[prefix.len()..].into();
+            if let Some(src) = &d.src_path {
+                if src.starts_with(prefix.as_bytes()) {
+                    d.src_path = Some(src[prefix.len()..].into());
+                }
+            }
+        }
+    }
 
     // ---- render, in `diff_flush()` order ----------------------------------
     // `diff_flush()` bails out before printing anything at all when the change
@@ -1903,7 +1941,7 @@ pub(crate) fn commit_patch(
 ) -> Result<Vec<u8>> {
     let mut cache = repo.diff_resource_cache_for_tree_diff()?;
     let r = patch_render(repo);
-    commit_patch_with(repo, &mut cache, &r, commit.id, parent, ctx)
+    commit_patch_with(repo, &mut cache, &r, commit.id, parent, ctx, &[])
 }
 
 /// The render settings `log -p`/`show` use for a patch body. Resolved once per
@@ -1939,6 +1977,7 @@ pub(crate) fn commit_patches(
     repo: &gix::Repository,
     jobs: &[(ObjectId, Option<ObjectId>)],
     ctx: u32,
+    paths: &[String],
 ) -> Result<Vec<Vec<u8>>> {
     // Four commits per worker: below that the handle clones cost more than the
     // split saves, and a short `log -p -n 3` should not spawn anything.
@@ -1948,7 +1987,7 @@ pub(crate) fn commit_patches(
         let r = patch_render(repo);
         return jobs
             .iter()
-            .map(|(id, parent)| commit_patch_with(repo, &mut cache, &r, *id, *parent, ctx))
+            .map(|(id, parent)| commit_patch_with(repo, &mut cache, &r, *id, *parent, ctx, paths))
             .collect();
     }
 
@@ -1968,7 +2007,7 @@ pub(crate) fn commit_patches(
                 loop {
                     let i = cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let Some((id, parent)) = jobs.get(i) else { break };
-                    mine.push((i, commit_patch_with(&repo, &mut cache, &r, *id, *parent, ctx)?));
+                    mine.push((i, commit_patch_with(&repo, &mut cache, &r, *id, *parent, ctx, paths)?));
                 }
                 Ok(mine)
             }));
@@ -2006,6 +2045,7 @@ fn commit_patch_with(
     commit_id: ObjectId,
     parent: Option<ObjectId>,
     ctx: u32,
+    paths: &[String],
 ) -> Result<Vec<u8>> {
     let commit = repo.find_object(commit_id)?.try_into_commit()?;
     let new_tree = commit.tree()?;
@@ -2025,6 +2065,24 @@ fn commit_patch_with(
     }
     // `diff_flush()` order: paths ascending. Tree diffs never produce unmerged
     // deltas, so the secondary key is inert here but kept for parity with `diff()`.
+    // `-- <pathspec>`: git limits the patch to the paths it was asked about, the
+    // same list that decided which commits are shown.
+    if !paths.is_empty() {
+        let mut kept = Vec::with_capacity(deltas.len());
+        for delta in deltas {
+            let mut hit = false;
+            for spec in paths {
+                if super::log::pathspec_matches(spec, &delta.path)? {
+                    hit = true;
+                    break;
+                }
+            }
+            if hit {
+                kept.push(delta);
+            }
+        }
+        deltas = kept;
+    }
     deltas.sort_by(|a, b| a.path.cmp(&b.path).then(b.unmerged.cmp(&a.unmerged)));
 
     let hash_kind = repo.object_hash();
@@ -2099,6 +2157,23 @@ fn toggle_exec(k: EntryKind) -> EntryKind {
         EntryKind::Blob => EntryKind::BlobExecutable,
         EntryKind::BlobExecutable => EntryKind::Blob,
         other => other,
+    }
+}
+
+/// The current directory as a repository-relative prefix with a trailing slash —
+/// git's `prefix`, which is what a valueless `--relative` narrows to. Empty at
+/// the top level, and empty when the cwd cannot be placed inside the worktree.
+fn cwd_prefix(repo: &gix::Repository) -> String {
+    let (Some(workdir), Ok(cwd)) = (repo.workdir(), std::env::current_dir()) else {
+        return String::new();
+    };
+    let (Ok(workdir), Ok(cwd)) = (workdir.canonicalize(), cwd.canonicalize()) else {
+        return String::new();
+    };
+    match cwd.strip_prefix(&workdir) {
+        Ok(rel) if rel.as_os_str().is_empty() => String::new(),
+        Ok(rel) => format!("{}/", rel.to_string_lossy()),
+        Err(_) => String::new(),
     }
 }
 

@@ -18,6 +18,7 @@ mod history_rewrite;
 mod info_attrs;
 mod mail_patch;
 mod maintenance;
+mod merge_dirty;
 mod merge_family;
 mod misc_commands;
 mod plumbing_objects;
@@ -186,6 +187,7 @@ pub fn cases() -> Vec<Case> {
     info_attrs::cases(&mut c);
     mail_patch::cases(&mut c);
     maintenance::cases(&mut c);
+    merge_dirty::cases(&mut c);
     merge_family::cases(&mut c);
     misc_commands::cases(&mut c);
     plumbing_objects::cases(&mut c);

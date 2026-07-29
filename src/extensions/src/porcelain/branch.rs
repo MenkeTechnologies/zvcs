@@ -1180,7 +1180,7 @@ fn list_branches(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
             lines.push(if e.detached {
                 e.display.clone()
             } else {
-                render_format(fmt, e)?
+                render_format(repo, fmt, e)?
             });
         }
         if column_on {
@@ -1375,7 +1375,7 @@ fn abbrev_hex(repo: &gix::Repository, id: gix::Id<'_>, abbrev: Option<usize>) ->
 /// Expand a `--format` template for one entry. Supports `%%` and the atom set
 /// documented on [`branch`]; an unrecognized atom is reported as a gap rather
 /// than silently expanding to nothing.
-fn render_format(fmt: &str, e: &Entry<'_>) -> Result<String> {
+fn render_format(repo: &gix::Repository, fmt: &str, e: &Entry<'_>) -> Result<String> {
     let chars: Vec<char> = fmt.chars().collect();
     let mut out = String::new();
     let mut i = 0;
@@ -1393,7 +1393,7 @@ fn render_format(fmt: &str, e: &Entry<'_>) -> Result<String> {
                 + i
                 + 2;
             let atom: String = chars[i + 2..close].iter().collect();
-            out.push_str(&atom_value(&atom, e)?);
+            out.push_str(&atom_value(repo, &atom, e)?);
             i = close + 1;
             continue;
         }
@@ -1404,7 +1404,7 @@ fn render_format(fmt: &str, e: &Entry<'_>) -> Result<String> {
 }
 
 /// Resolve a single `%(...)` atom.
-fn atom_value(atom: &str, e: &Entry<'_>) -> Result<String> {
+fn atom_value(repo: &gix::Repository, atom: &str, e: &Entry<'_>) -> Result<String> {
     Ok(match atom {
         "refname" => e.full.to_string(),
         "refname:short" => e.short.clone(),
@@ -1414,6 +1414,15 @@ fn atom_value(atom: &str, e: &Entry<'_>) -> Result<String> {
             .map(|id| id.shorten_or_id().to_string())
             .unwrap_or_default(),
         "HEAD" => if e.current { "*" } else { " " }.to_string(),
+        // `%(upstream)` and its `:short` form, from the same `branch_get_upstream`
+        // lookup `-vv` prints — empty for a branch that tracks nothing, and for
+        // every remote-tracking ref (which has no upstream of its own).
+        "upstream" => upstream_ref(repo, e.full.as_ref())
+            .map(|up| up.as_bstr().to_string())
+            .unwrap_or_default(),
+        "upstream:short" => upstream_short(repo, e.full.as_ref())
+            .map(|(_, short)| short)
+            .unwrap_or_default(),
         other => anyhow::bail!("unsupported --format atom \"%({other})\""),
     })
 }

@@ -444,6 +444,17 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
         return result;
     }
 
+    // `handle_builtin()` (git.c): `git <cmd> --help` is rewritten to
+    // `git help <cmd>`, which opens the manual page. Only the *first* argument
+    // counts — `git log --oneline --help` stays with `log`, where parse-options
+    // treats it as `-h`. Every command reached this way used to answer with its
+    // own "unknown option" instead of documentation.
+    if args.first().is_some_and(|a| a == "--help") && !sub.starts_with('z') {
+        let mut help_args: Vec<String> = vec![sub.to_string()];
+        help_args.extend(args[1..].iter().cloned());
+        return porcelain::help(&help_args);
+    }
+
     // Every z-verb answers `-h`/`--help` with a one-line usage, uniformly and
     // before dispatch. `z_usage` returns `None` for anything that is not a known
     // z-verb, so this never intercepts a porcelain command's own `-h`.

@@ -738,10 +738,9 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
         move_head(&repo, target_commit, reflog_spec)?;
         remove_branch_state(repo.git_dir());
         super::checkout::maybe_recurse_submodules(&repo, recurse_submodules, true)?;
-        if !quiet {
-            let summary = commit.message()?.summary().into_owned();
-            println!("HEAD is now at {} {}", commit.short_id()?, summary);
-        }
+        // No `HEAD is now at` here: `cmd_reset()` gates `print_new_head_line()`
+        // on `reset_type == HARD`, so `--merge` and `--keep` move the branch in
+        // silence even though they touch the worktree.
         return Ok(ExitCode::SUCCESS);
     }
 

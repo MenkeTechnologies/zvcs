@@ -1930,29 +1930,36 @@ fn pattern_matches(pattern: &str, refname: &[u8], ignore_case: bool) -> bool {
 /// the most specific down, and accept the first candidate that no *other* rule
 /// could expand into an existing ref.
 fn short_name(refname: &[u8], all: &HashSet<Vec<u8>>) -> Vec<u8> {
-    // Mirrors `ref_rev_parse_rules`. The first rule (the bare name) is only ever
-    // used to test a candidate for ambiguity, never to produce one, and the
-    // `refs/remotes/<name>/HEAD` rule is unreachable because git's `%s` scan is
-    // greedy to end-of-string.
-    const PREFIXES: [&[u8]; 4] = [b"refs/", b"refs/tags/", b"refs/heads/", b"refs/remotes/"];
+    // `ref_rev_parse_rules`, in order. Rule 0 (the bare name) is only ever used
+    // to test a candidate for ambiguity, never to produce one; rule 5 is what
+    // shortens `refs/remotes/origin/HEAD` to `origin`.
+    const RULES: [(&[u8], &[u8]); 6] = [
+        (b"", b""),
+        (b"refs/", b""),
+        (b"refs/tags/", b""),
+        (b"refs/heads/", b""),
+        (b"refs/remotes/", b""),
+        (b"refs/remotes/", b"/HEAD"),
+    ];
 
-    for (i, prefix) in PREFIXES.iter().enumerate().rev() {
-        let Some(candidate) = refname.strip_prefix(*prefix) else {
+    // `refs_shorten_unambiguous_ref()` walks the rules from the most specific
+    // down, and a candidate is ambiguous only against the rules *before* the one
+    // that produced it — the later ones are more specific and cannot collide.
+    for i in (1..RULES.len()).rev() {
+        let (prefix, suffix) = RULES[i];
+        let Some(candidate) = refname
+            .strip_prefix(prefix)
+            .and_then(|rest| rest.strip_suffix(suffix))
+        else {
             continue;
         };
         if candidate.is_empty() {
             continue;
         }
-        // Rule 0 expands to the bare candidate; the rest re-prefix it.
-        let ambiguous = std::iter::once(candidate.to_vec())
-            .chain(
-                PREFIXES
-                    .iter()
-                    .enumerate()
-                    .filter(|(j, _)| *j != i)
-                    .map(|(_, p)| [*p, candidate].concat()),
-            )
-            .any(|name| all.contains(&name));
+        let ambiguous = RULES[..i].iter().any(|(p, s)| {
+            let name = [*p, candidate, *s].concat();
+            all.contains(&name)
+        });
         if !ambiguous {
             return candidate.to_vec();
         }

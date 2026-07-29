@@ -751,6 +751,29 @@ fn emit_range(
 /// `--symbolic-full-name`.
 fn dwim_full_name(repo: &gix::Repository, name: &BStr) -> Option<BString> {
     let name = name.to_str().ok()?;
+    // `@{-N}`: `interpret_nth_prior_checkout()` rewrites the spec to the branch
+    // that many checkouts ago, and everything after it applies to that name.
+    if let Some((nth, used)) = super::check_ref_format::parse_nth_prior(name.as_bytes()) {
+        let mut branch = super::check_ref_format::nth_branch_switch(repo, nth)?;
+        branch.extend_from_slice(&name.as_bytes()[used..]);
+        return dwim_full_name(repo, BStr::new(&branch));
+    }
+    // `@{u}`/`@{upstream}`/`@{push}`: git's `interpret_branch_name()` resolves
+    // these through the branch's configured remote and records the ref it landed
+    // on, which is what `--symbolic-full-name` reports. Without this the whole
+    // spec looks like "not a ref" and prints nothing at all.
+    if let Some((base, direction)) = split_tracking_suffix(name) {
+        let branch = if base.is_empty() {
+            repo.head_name().ok()??
+        } else {
+            let full = repo.find_reference(base).ok()?.name().to_owned();
+            full
+        };
+        return repo
+            .branch_remote_tracking_ref_name(branch.as_ref(), direction)
+            .and_then(std::result::Result::ok)
+            .map(|r| r.as_bstr().to_owned());
+    }
     if name == "HEAD" || name == "@" {
         return Some(match repo.head_name().ok()? {
             Some(referent) => referent.as_bstr().to_owned(),
@@ -768,6 +791,28 @@ fn dwim_full_name(repo: &gix::Repository, name: &BStr) -> Option<BString> {
         current = repo.find_reference(next.as_bstr()).ok()?;
     }
     None
+}
+
+/// Split `<branch>@{upstream}` / `@{push}` into the branch part (empty for the
+/// current one) and the direction the suffix asks about.
+///
+/// git accepts `@{u}` and `@{upstream}` case-insensitively, and `@{push}` the
+/// same way; anything else after `@{` is a reflog or date spec, which names no
+/// ref of its own.
+fn split_tracking_suffix(name: &str) -> Option<(&str, gix::remote::Direction)> {
+    let at = name.rfind("@{")?;
+    if !name.ends_with('}') {
+        return None;
+    }
+    let suffix = &name[at + 2..name.len() - 1];
+    let direction = if suffix.eq_ignore_ascii_case("u") || suffix.eq_ignore_ascii_case("upstream") {
+        gix::remote::Direction::Fetch
+    } else if suffix.eq_ignore_ascii_case("push") {
+        gix::remote::Direction::Push
+    } else {
+        return None;
+    };
+    Some((&name[..at], direction))
 }
 
 /// Walk a ref namespace the way `--all`/`--branches`/`--tags` do.

@@ -75,6 +75,23 @@ pub enum Shape {
     Patches,
     /// Cone-mode sparse checkout with one directory excluded from the worktree.
     Sparse,
+    /// Branches that `main` can merge — some by fast-forward, some three-way —
+    /// over a worktree carrying unstaged edits and an untracked file.
+    ///
+    /// `Dirty` has dirt but nothing to merge and `Branched` has a branch but a
+    /// clean tree, so which paths a merge may write over was unmeasured: a
+    /// blanket "is anything dirty" refusal scored the same as git's per-path
+    /// one. The dirt is placed deliberately — one edit on a path the branches
+    /// rewrite, one on a path none of them touch, and an untracked file exactly
+    /// where two of them want to write.
+    MergeableDirty,
+    /// [`Shape::MergeableDirty`]'s history with a *staged* change instead, on a
+    /// path no branch touches.
+    ///
+    /// The index-vs-`HEAD` gate is the half a fast-forward skips: git refuses a
+    /// three-way merge over this and fast-forwards over it happily, and nothing
+    /// else in the corpus separates the two.
+    MergeableStaged,
 }
 
 impl Shape {
@@ -93,6 +110,8 @@ impl Shape {
         Shape::Packed,
         Shape::Patches,
         Shape::Sparse,
+        Shape::MergeableDirty,
+        Shape::MergeableStaged,
     ];
 
     pub fn name(self) -> &'static str {
@@ -111,6 +130,8 @@ impl Shape {
             Shape::Packed => "packed",
             Shape::Patches => "patches",
             Shape::Sparse => "sparse",
+            Shape::MergeableDirty => "mergeable-dirty",
+            Shape::MergeableStaged => "mergeable-staged",
         }
     }
 }
@@ -592,7 +613,85 @@ pub fn build(shape: Shape, dir: &Path, home: &Path) -> Result<()> {
             // `rm` on the *tracked* excluded path is a fixed bug this pins.
             write(dir, "outside/stray.txt", "untracked, inside the excluded cone\n")?;
         }
+
+        Shape::MergeableDirty => {
+            mergeable_history(dir, home)?;
+            // `hot.txt` is rewritten by `ff-hot`/`div-hot`, so a merge of those
+            // has to refuse; `keep.txt` is rewritten by nothing, so a merge of
+            // anything has to carry it through; `squat.txt` sits untracked
+            // exactly where `ff-squat`/`div-squat` want to write.
+            write(dir, "hot.txt", "hot, edited in the worktree\n")?;
+            write(dir, "keep.txt", "keep, edited in the worktree\n")?;
+            write(dir, "squat.txt", "untracked squatter\n")?;
+        }
+
+        Shape::MergeableStaged => {
+            mergeable_history(dir, home)?;
+            // Staged, and on a path no branch below touches — so no checkout
+            // could overwrite it. A fast-forward carries it through; a strategy
+            // refuses the whole merge over it anyway.
+            write(dir, "keep.txt", "keep, staged\n")?;
+            git(dir, home, &["add", "keep.txt"])?;
+        }
     }
+    Ok(())
+}
+
+/// The history the two mergeable shapes share.
+///
+/// A branch cannot be both fast-forwardable from `main` and diverged from it,
+/// and the two take different paths through git's gates — `unpack_trees()`
+/// alone versus the strategy's index check first — so both kinds are built and
+/// each case picks by branch name:
+///
+/// * `div-*` fork before `main`'s last commit, so merging one is a three-way.
+/// * `ff-*` fork after it, so merging one is a fast-forward.
+///
+/// Each branch touches exactly one path, named for what the shape's dirt does
+/// to it: `cold` is left alone by the worktree, `hot` is edited there, `squat`
+/// is added by the branch and squatted on by an untracked file, `other` exists
+/// so two heads can be merged at once as an octopus.
+fn mergeable_history(dir: &Path, home: &Path) -> Result<()> {
+    for (path, body) in [
+        ("keep.txt", "keep\n"),
+        ("hot.txt", "hot\n"),
+        ("cold.txt", "cold\n"),
+        ("trunk.txt", "trunk\n"),
+    ] {
+        write(dir, path, body)?;
+    }
+    git(dir, home, &["add", "."])?;
+    git(dir, home, &["commit", "-qm", "mergeable base"])?;
+
+    for (branch, path, body) in [
+        ("div-cold", "cold.txt", "cold, from div\n"),
+        ("div-hot", "hot.txt", "hot, from div\n"),
+        ("div-squat", "squat.txt", "squat, from div\n"),
+        ("div-other", "other.txt", "other, from div\n"),
+    ] {
+        git(dir, home, &["checkout", "-q", "-b", branch, "main"])?;
+        write(dir, path, body)?;
+        git(dir, home, &["add", path])?;
+        git(dir, home, &["commit", "-qm", branch])?;
+    }
+
+    // `main` moves last among the shared commits, which is what leaves it
+    // diverged from every `div-*` above and an ancestor of every `ff-*` below.
+    git(dir, home, &["checkout", "-q", "main"])?;
+    write(dir, "trunk.txt", "trunk, moved\n")?;
+    git(dir, home, &["commit", "-qam", "main moves"])?;
+
+    for (branch, path, body) in [
+        ("ff-cold", "cold.txt", "cold, from ff\n"),
+        ("ff-hot", "hot.txt", "hot, from ff\n"),
+        ("ff-squat", "squat.txt", "squat, from ff\n"),
+    ] {
+        git(dir, home, &["checkout", "-q", "-b", branch, "main"])?;
+        write(dir, path, body)?;
+        git(dir, home, &["add", path])?;
+        git(dir, home, &["commit", "-qm", branch])?;
+    }
+    git(dir, home, &["checkout", "-q", "main"])?;
     Ok(())
 }
 

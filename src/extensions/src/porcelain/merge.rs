@@ -5,8 +5,9 @@
 //!
 //! * A fast-forward merge: the ref being merged is a descendant of the current
 //!   `HEAD` (their merge-base is `HEAD` itself). The branch `HEAD` points to is
-//!   advanced (or `HEAD` itself on a detached head), and the clean worktree +
-//!   index are moved to the new tree.
+//!   advanced (or `HEAD` itself on a detached head), and the worktree + index
+//!   are moved to the new tree — writing only the paths the two trees disagree
+//!   on, so local work outside that footprint is carried through untouched.
 //! * `--no-ff` over that same fast-forwardable history. The merged tree is then
 //!   exactly the tree of the ref being merged — when the merge-base *is* our
 //!   own commit, the three-way merge of every path resolves to theirs — so the
@@ -22,6 +23,18 @@
 //!
 //! Also served, as faithful ports of git's behaviour:
 //!
+//! * The dirty-worktree policy, which is two separate gates rather than one
+//!   (see [`crate::merge_guard`]). A strategy — `ort`, `ours`, `octopus` — first
+//!   refuses when the index differs from `HEAD` anywhere (merge-ort's
+//!   `merge_start()`, exit 2 behind `Merge with strategy <name> failed.`); a
+//!   fast-forward skips that gate entirely and accepts staged work. Then the
+//!   checkout itself refuses per path (`twoway_merge()` with `verify_uptodate()`
+//!   / `verify_absent()`): only paths the two trees disagree on are examined, so
+//!   an unrelated local edit is never a reason to stop, while one the merge
+//!   would overwrite — or an untracked file in the way — produces git's
+//!   `error: Your local changes …` / `The following untracked working tree
+//!   files …` block, `Aborting`, and exit 1 from a fast-forward or 2 from a
+//!   strategy.
 //! * `--squash`/`--no-squash`: fold the merge into the worktree/index without a
 //!   commit or ref move, writing `SQUASH_MSG` (a port of `squash_message()`,
 //!   including the `git log`-medium body).
@@ -134,9 +147,15 @@
 //! `prepare-commit-msg` hook is not run before the editor; `default_edit_option`
 //! tests that stdin and stdout are both terminals rather than that they are the
 //! same file; `--signoff` adds its trailer before the `--edit` comment block
-//! rather than through `ignored_log_message_bytes()`; and
+//! rather than through `ignored_log_message_bytes()`;
 //! `Automatic merge went well; stopped before committing as requested` is
-//! printed on stdout where git uses stderr.
+//! printed on stdout where git uses stderr; a `--squash` fast-forward prints its
+//! `Squash commit -- not updating HEAD` after the diffstat rather than before
+//! it; the octopus prints neither git's per-head `Trying simple merge with
+//! <head>` nor a closing diffstat; and a directory standing where a merge wants
+//! to write is left to the checkout instead of going through
+//! `verify_clean_subdirectory()`, so untracked files inside it are not counted
+//! (a gitlink whose submodule is already checked out passes under git too).
 
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
@@ -692,7 +711,7 @@ fn abort() -> Result<ExitCode> {
 
     let old_index = repo.index_or_load_from_head()?.into_owned();
     let should_interrupt = AtomicBool::new(false);
-    update_worktree(&repo, &old_index, head_tree, &should_interrupt)?;
+    update_worktree(&repo, &old_index, None, head_tree, &should_interrupt)?;
 
     // git's `reset_refs()` records the pre-reset HEAD in ORIG_HEAD.
     set_orig_head(&repo, head_id)?;
@@ -864,16 +883,10 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
         .id()
         .ok_or_else(|| anyhow::anyhow!("HEAD does not point to a commit"))?
         .detach();
-    // Owned branch name when attached; `None` when detached.
+    // Owned branch name when attached; `None` when detached. The ref to move is
+    // always `HEAD` itself — see [`advance`] — so the branch name is needed only
+    // for the merge message.
     let branch: Option<FullName> = head.referent_name().map(std::borrow::ToOwned::to_owned);
-    // The ref to move: the attached branch, or HEAD itself when detached. Both
-    // are direct (non-symbolic) refs here, so `deref` is false either way.
-    let name: FullName = match &branch {
-        Some(b) => b.clone(),
-        None => "HEAD"
-            .try_into()
-            .map_err(|e| anyhow::anyhow!("invalid ref name HEAD: {e}"))?,
-    };
 
     // Resolve every ref to merge and peel it to a commit (tags included).
     let mut targets: Vec<ObjectId> = Vec::with_capacity(refs.len());
@@ -909,12 +922,12 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
     // `-s ours`: every head becomes a parent while our tree is kept verbatim.
     // Handles any number of heads and never fast-forwards.
     if opts.strategy == Strategy::Ours {
-        return merge_ours(&repo, name, branch.as_ref(), local_id, &targets, refs, opts);
+        return merge_ours(&repo, branch.as_ref(), local_id, &targets, refs, opts);
     }
 
     // More than one head, default strategy → octopus.
     if refs.len() > 1 {
-        return do_octopus(&repo, refs, &targets, local_id, branch.as_ref(), name, opts);
+        return do_octopus(&repo, refs, &targets, local_id, branch.as_ref(), opts);
     }
 
     let spec = refs[0].as_str();
@@ -931,7 +944,7 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
         // Target already reachable from HEAD (or identical). git checks this
         // before it consults --no-ff, so --no-ff does not force a commit here.
         if !opts.quiet {
-            println!("Already up to date.");
+            println!("{}", up_to_date_line(opts));
         }
         return Ok(ExitCode::SUCCESS);
     }
@@ -972,14 +985,29 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
     // back at the end (or stay recoverable in MERGE_AUTOSTASH if it stops).
     let stash = begin_autostash(&repo, opts)?;
 
-    // Never clobber uncommitted work.
-    if repo.is_dirty()? {
-        anyhow::bail!("worktree has uncommitted changes; refusing to merge");
-    }
-
     let old_index = repo.index_or_load_from_head()?.into_owned();
     let head_tree = repo.find_object(local_id)?.peel_to_tree()?.id;
     let target_tree = repo.find_object(target_id)?.peel_to_tree()?.id;
+
+    // `update_ref("updating ORIG_HEAD", …)` runs before the strategy dispatch, so
+    // a merge that is refused below still leaves ORIG_HEAD at the pre-merge HEAD
+    // (checked against git 2.50.1).
+    set_orig_head(&repo, local_id)?;
+
+    // merge-ort's `merge_start()`: the index must match HEAD before any strategy
+    // runs, whatever the change is and wherever it sits. A fast-forward never
+    // reaches this — git happily fast-forwards over a staged change — so it is
+    // gated on the same `runs_ort` that decides whether `-X` is parsed.
+    if runs_ort {
+        let staged = crate::merge_guard::index_changes_from_head(&repo, head_tree, &old_index)?;
+        if !staged.is_empty() {
+            crate::merge_guard::report_index_changes(&staged);
+            eprintln!("Merge with strategy ort failed.");
+            end_autostash(&repo, stash, false)?;
+            return Ok(ExitCode::from(2));
+        }
+    }
+
     let should_interrupt = AtomicBool::new(false);
     let message = compose_message(&repo, refs, &targets, branch.as_ref(), local_id, opts)?;
 
@@ -1022,7 +1050,7 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
             current: Some(BStr::new(b"HEAD")),
             other: Some(BStr::new(spec.as_bytes())),
         };
-        let applied = crate::merge_apply::three_way_merge_with_options(
+        let merged = crate::merge_apply::three_way_merge_guarded(
             &repo,
             base_tree,
             head_tree,
@@ -1032,14 +1060,25 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
             &should_interrupt,
             merge_verbosity(&repo) != 0,
             &xopts,
+            head_tree,
         )?;
+        let applied = match merged {
+            crate::merge_apply::Merged::Applied(applied) => applied,
+            // `merge_switch_to_result()`'s checkout refused: the merge is
+            // computed and reported, but nothing on disk moved.
+            crate::merge_apply::Merged::Refused(clobber) => {
+                clobber.report("merge");
+                eprintln!("Merge with strategy ort failed.");
+                end_autostash(&repo, stash, false)?;
+                return Ok(ExitCode::from(2));
+            }
+        };
         let mut index = applied.index;
         index.write(Default::default())?;
 
         if applied.conflicts.is_empty() {
             return finalize_clean(
                 &repo,
-                name,
                 local_id,
                 &[target_id],
                 message,
@@ -1053,7 +1092,6 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
         }
 
         // Conflicts: record the in-progress merge and stop with git's message.
-        set_orig_head(&repo, local_id)?;
         let git_dir = repo.git_dir();
         std::fs::write(git_dir.join("MERGE_HEAD"), format!("{target_id}\n"))?;
         std::fs::write(git_dir.join("MERGE_MODE"), merge_mode(opts.ff))?;
@@ -1081,10 +1119,15 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
     // so a three-way merge of every path resolves to theirs — the merged tree is
     // exactly the target's tree. Sync the worktree, then finish as a merge commit.
     if opts.ff == Ff::Never {
-        update_worktree(&repo, &old_index, target_tree, &should_interrupt)?;
+        // The strategy still ran (git dispatches `--no-ff` through `ort`), so a
+        // refusal here is a strategy failure.
+        if let Some(code) = guard_checkout(&repo, head_tree, target_tree, &old_index, true)? {
+            end_autostash(&repo, stash, false)?;
+            return Ok(code);
+        }
+        update_worktree(&repo, &old_index, Some(head_tree), target_tree, &should_interrupt)?;
         return finalize_clean(
             &repo,
-            name,
             local_id,
             &[target_id],
             message,
@@ -1101,13 +1144,19 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
     // not move the ref: git updates the worktree, prints the fast-forward summary,
     // then the squash notice and writes SQUASH_MSG.
     if opts.squash {
-        update_worktree(&repo, &old_index, target_tree, &should_interrupt)?;
         if !opts.quiet {
             println!(
                 "Updating {}..{}",
                 local_id.attach(&repo).shorten()?,
                 target_id.attach(&repo).shorten()?
             );
+        }
+        if let Some(code) = guard_checkout(&repo, head_tree, target_tree, &old_index, false)? {
+            end_autostash(&repo, stash, false)?;
+            return Ok(code);
+        }
+        update_worktree(&repo, &old_index, Some(head_tree), target_tree, &should_interrupt)?;
+        if !opts.quiet {
             println!("Fast-forward");
             print!("{}", diffstat(&repo, head_tree, target_tree, opts.stat)?);
         }
@@ -1128,15 +1177,25 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
     // 2.55.0, whose refusal to clobber an untracked file leaves `refs/heads/main`
     // unmoved). Advancing first would strand a branch two commits ahead of its own
     // checkout, with every later `status` reporting the difference as staged work.
-    set_orig_head(&repo, local_id)?;
-    update_worktree(&repo, &old_index, target_tree, &should_interrupt)?;
-    advance(&repo, name, local_id, target_id, format!("merge {spec}: Fast-forward"))?;
+    //
+    // `Updating <a>..<b>` is printed *before* the checkout is attempted, as
+    // `cmd_merge` does, so a refused fast-forward shows it followed by the
+    // refusal — and exits 1, the fast-forward's own failure code, with no
+    // strategy-failure line (no strategy ran).
     if !opts.quiet {
         println!(
             "Updating {}..{}",
             local_id.attach(&repo).shorten()?,
             target_id.attach(&repo).shorten()?
         );
+    }
+    if let Some(code) = guard_checkout(&repo, head_tree, target_tree, &old_index, false)? {
+        end_autostash(&repo, stash, false)?;
+        return Ok(code);
+    }
+    update_worktree(&repo, &old_index, Some(head_tree), target_tree, &should_interrupt)?;
+    advance(&repo, local_id, target_id, format!("merge {spec}: Fast-forward"))?;
+    if !opts.quiet {
         println!("Fast-forward");
         print!("{}", diffstat(&repo, head_tree, target_tree, opts.stat)?);
     }
@@ -1144,15 +1203,62 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// The `unpack_trees()` gate for the paths that check a tree out directly — the
+/// fast-forward, `--squash` and the `--no-ff` shortcut — rather than through
+/// [`crate::merge_apply`]. Reports git's refusal and yields the exit code when
+/// the move from `head_tree` to `new_tree` would cost local work.
+///
+/// `strategy` distinguishes the two failure shapes `cmd_merge` produces: a
+/// strategy that failed adds `Merge with strategy ort failed.` and exits 2,
+/// while a failed `checkout_fast_forward()` just exits 1.
+fn guard_checkout(
+    repo: &gix::Repository,
+    head_tree: ObjectId,
+    new_tree: ObjectId,
+    index: &gix::index::File,
+    strategy: bool,
+) -> Result<Option<ExitCode>> {
+    let clobber = crate::merge_guard::verify_two_way(repo, head_tree, new_tree, index)?;
+    if clobber.is_empty() {
+        return Ok(None);
+    }
+    clobber.report("merge");
+    if strategy {
+        eprintln!("Merge with strategy ort failed.");
+        return Ok(Some(ExitCode::from(2)));
+    }
+    Ok(Some(ExitCode::from(1)))
+}
+
+/// [`guard_checkout`] for the octopus strategy, which folds each head in with
+/// `git read-tree -u -m` rather than a porcelain checkout: the refusal carries
+/// the plumbing wording, one line per path, and the exit code is git's strategy
+/// failure.
+fn guard_octopus(
+    repo: &gix::Repository,
+    old_tree: ObjectId,
+    new_tree: ObjectId,
+    index: &gix::index::File,
+) -> Result<Option<ExitCode>> {
+    let clobber = crate::merge_guard::verify_two_way(repo, old_tree, new_tree, index)?;
+    if clobber.is_empty() {
+        return Ok(None);
+    }
+    clobber.report_plumbing();
+    eprintln!("Merge with strategy octopus failed.");
+    Ok(Some(ExitCode::from(2)))
+}
+
 /// The clean-merge finish shared by the diverged, `--no-ff`, and `-s ours` paths:
-/// records `ORIG_HEAD`, then squashes, stops before committing, or writes the
-/// merge commit, honouring `--signoff`, `--cleanup`, `--no-verify` and `--quiet`.
-/// `merged_tree` is the already-computed result tree (its worktree/index are
-/// assumed synced by the caller); `head_tree` feeds the diffstat.
+/// squashes, stops before committing, or writes the merge commit, honouring
+/// `--signoff`, `--cleanup`, `--no-verify` and `--quiet`. `ORIG_HEAD` was
+/// recorded by the caller before its gates ran, as `cmd_merge` records it before
+/// the strategy dispatch. `merged_tree` is the already-computed result tree (its
+/// worktree/index are assumed synced by the caller); `head_tree` feeds the
+/// diffstat.
 #[allow(clippy::too_many_arguments)]
 fn finalize_clean(
     repo: &gix::Repository,
-    name: FullName,
     local_id: ObjectId,
     targets: &[ObjectId],
     message: String,
@@ -1163,7 +1269,6 @@ fn finalize_clean(
     spec_label: &str,
     stash: Option<ObjectId>,
 ) -> Result<ExitCode> {
-    set_orig_head(repo, local_id)?;
     let do_commit = opts.commit.unwrap_or(!opts.squash);
 
     // `--squash`: no commit, no ref move, no MERGE_HEAD — just SQUASH_MSG.
@@ -1273,7 +1378,6 @@ fn finalize_clean(
     let new_id = repo.write_object(&commit)?.detach();
     advance(
         repo,
-        name,
         local_id,
         new_id,
         format!("merge {spec_label}: Merge made by the '{strategy_name}' strategy."),
@@ -1305,7 +1409,6 @@ fn write_merge_heads(repo: &gix::Repository, targets: &[ObjectId], ff: Ff) -> Re
 /// fast-forwards; already up to date only when every head is reachable from HEAD.
 fn merge_ours(
     repo: &gix::Repository,
-    name: FullName,
     branch: Option<&FullName>,
     local_id: ObjectId,
     targets: &[ObjectId],
@@ -1322,28 +1425,36 @@ fn merge_ours(
     }
     if all_reachable {
         if !opts.quiet {
-            println!("Already up to date.");
+            println!("{}", up_to_date_line(opts));
         }
         return Ok(ExitCode::SUCCESS);
     }
 
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
     let stash = begin_autostash(repo, opts)?;
-    if repo.is_dirty()? {
-        anyhow::bail!("worktree has uncommitted changes; refusing to merge");
-    }
 
     let head_tree = repo.find_object(local_id)?.peel_to_tree()?.id;
     let old_index = repo.index_or_load_from_head()?.into_owned();
+    set_orig_head(repo, local_id)?;
+
+    // `builtin/merge-ours.c`: "The index must match HEAD, or this merge cannot
+    // proceed" — it exits 2 without a word of its own, and `cmd_merge` supplies
+    // the strategy-failure line. Unstaged worktree changes are none of its
+    // business: our tree is kept verbatim, so nothing is checked out over them.
+    if !crate::merge_guard::index_changes_from_head(repo, head_tree, &old_index)?.is_empty() {
+        eprintln!("Merge with strategy ours failed.");
+        end_autostash(repo, stash, false)?;
+        return Ok(ExitCode::from(2));
+    }
+
     let should_interrupt = AtomicBool::new(false);
     // Our tree is unchanged; sync the index (a no-op checkout).
-    update_worktree(repo, &old_index, head_tree, &should_interrupt)?;
+    update_worktree(repo, &old_index, None, head_tree, &should_interrupt)?;
 
     let message = compose_message(repo, refs, targets, branch, local_id, opts)?;
     let spec_label = refs.join(" ");
     finalize_clean(
         repo,
-        name,
         local_id,
         targets,
         message,
@@ -1366,7 +1477,6 @@ fn do_octopus(
     targets: &[ObjectId],
     local_id: ObjectId,
     _branch: Option<&FullName>,
-    name: FullName,
     opts: &Opts,
 ) -> Result<ExitCode> {
     // Every head, resolved by the caller; pair each with its spec for messages.
@@ -1378,12 +1488,41 @@ fn do_octopus(
 
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
     let stash = begin_autostash(repo, opts)?;
-    if repo.is_dirty()? {
-        anyhow::bail!("worktree has uncommitted changes; refusing to merge");
-    }
 
     let mut cur_index = repo.index_or_load_from_head()?.into_owned();
     let mut mrt = repo.find_object(local_id)?.peel_to_tree()?.id; // merge result tree
+    set_orig_head(repo, local_id)?;
+
+    // `git-merge-octopus`'s opening `if ! git diff-index --quiet --cached HEAD --`:
+    // a staged change stops the octopus before the first head is looked at. The
+    // paths are printed by the strategy itself (on stdout, four-space indented),
+    // and `cmd_merge` adds the failure line.
+    //
+    // `collect_parents()` drops every head already reachable from HEAD before a
+    // strategy is dispatched, so an octopus with nothing left to merge is
+    // answered by the up-to-date path below and never reaches the gate.
+    let mut anything_to_merge = false;
+    for (_, head_id) in &heads {
+        let bases = repo.merge_bases_many(local_id, &[*head_id])?;
+        if !bases.iter().any(|b| b.detach() == *head_id) {
+            anything_to_merge = true;
+            break;
+        }
+    }
+    let staged = if anything_to_merge {
+        crate::merge_guard::index_changes_from_head(repo, mrt, &cur_index)?
+    } else {
+        Vec::new()
+    };
+    if !staged.is_empty() {
+        println!("Error: Your local changes to the following files would be overwritten by merge");
+        for path in &staged {
+            println!("    {}", quote_path(path));
+        }
+        eprintln!("Merge with strategy octopus failed.");
+        end_autostash(repo, stash, false)?;
+        return Ok(ExitCode::from(2));
+    }
     // `MRC` (git's merge-result-commit list): the parents of the eventual commit.
     // It starts as HEAD but, while still a single commit, is *replaced* by a head
     // that fast-forwards it (so `merge a b` where main is an ancestor of `a` yields
@@ -1406,7 +1545,14 @@ fn do_octopus(
         // Fast-forward: while MRC is still a single commit and it is the merge base,
         // git advances the base line to this head rather than recording a parent.
         if mrc.len() == 1 && common == mrc[0] {
-            update_worktree(repo, &cur_index, head_tree, &should_interrupt)?;
+            // Each head is folded in by `git read-tree -u -m`, whose refusals
+            // carry the plumbing wording — `setup_unpack_trees_porcelain()`
+            // never runs for a strategy script.
+            if let Some(code) = guard_octopus(repo, mrt, head_tree, &cur_index)? {
+                end_autostash(repo, stash, false)?;
+                return Ok(code);
+            }
+            update_worktree(repo, &cur_index, Some(mrt), head_tree, &should_interrupt)?;
             cur_index = repo.index_from_tree(&head_tree)?;
             mrt = head_tree;
             mrc = vec![*head_id];
@@ -1432,7 +1578,7 @@ fn do_octopus(
             current: Some(BStr::new(b"HEAD")),
             other: Some(BStr::new(spec.as_bytes())),
         };
-        let applied = crate::merge_apply::three_way_merge_verbose(
+        let merged = crate::merge_apply::three_way_merge_guarded(
             repo,
             base_tree,
             mrt,
@@ -1441,7 +1587,18 @@ fn do_octopus(
             labels,
             &should_interrupt,
             merge_verbosity(repo) != 0,
+            &crate::merge_apply::StrategyOptions::default(),
+            mrt,
         )?;
+        let applied = match merged {
+            crate::merge_apply::Merged::Applied(applied) => applied,
+            crate::merge_apply::Merged::Refused(clobber) => {
+                clobber.report_plumbing();
+                eprintln!("Merge with strategy octopus failed.");
+                end_autostash(repo, stash, false)?;
+                return Ok(ExitCode::from(2));
+            }
+        };
         cur_index = applied.index;
         cur_index.write(Default::default())?;
 
@@ -1455,7 +1612,6 @@ fn do_octopus(
             }
             std::fs::write(git_dir.join("MERGE_HEAD"), merge_head)?;
             std::fs::write(git_dir.join("MERGE_MODE"), b"")?;
-            set_orig_head(repo, local_id)?;
             // `suggest_conflicts()` again: record or replay before the notice.
             super::rerere::repo_rerere(repo, opts.rerere_autoupdate)?;
             if !opts.quiet {
@@ -1471,7 +1627,7 @@ fn do_octopus(
     // Nothing merged: every head was already reachable.
     if mrc.len() == 1 && mrc[0] == local_id {
         if !opts.quiet {
-            println!("Already up to date.");
+            println!("{}", up_to_date_line(opts));
         }
         end_autostash(repo, stash, true)?;
         return Ok(ExitCode::SUCCESS);
@@ -1479,10 +1635,8 @@ fn do_octopus(
     // Everything collapsed onto one line via fast-forward — a plain fast-forward,
     // not an octopus commit.
     if mrc.len() == 1 {
-        set_orig_head(repo, local_id)?;
         advance(
             repo,
-            name,
             local_id,
             mrc[0],
             format!("merge {}: Fast-forward", refs.join(" ")),
@@ -1502,7 +1656,6 @@ fn do_octopus(
     let extra_parents: Vec<ObjectId> = mrc.iter().copied().filter(|p| *p != local_id).collect();
     finalize_clean(
         repo,
-        name,
         local_id,
         &extra_parents,
         message,
@@ -2455,13 +2608,13 @@ fn strerror(e: &std::io::Error) -> String {
 }
 
 /// Move `name` from `old` to `new`, writing `reflog` as the reflog message.
-fn advance(
-    repo: &gix::Repository,
-    name: FullName,
-    old: ObjectId,
-    new: ObjectId,
-    reflog: String,
-) -> Result<()> {
+fn advance(repo: &gix::Repository, old: ObjectId, new: ObjectId, reflog: String) -> Result<()> {
+    // git's `finish()` calls `update_ref(msg, "HEAD", …)`, and updating a symref
+    // writes the entry to `.git/logs/HEAD` *and*, through the deref, to the
+    // branch's own log. Editing the branch directly writes only the branch log
+    // and leaves a hole in `HEAD`'s history where the merge was — `git reflog`
+    // then shows the checkout before it as the most recent thing that happened.
+    // The same edit is what `commit` uses (`commit.rs:1556`).
     repo.edit_reference(RefEdit {
         change: Change::Update {
             log: LogChange {
@@ -2472,10 +2625,22 @@ fn advance(
             expected: PreviousValue::MustExistAndMatch(Target::Object(old)),
             new: Target::Object(new),
         },
-        name,
-        deref: false,
+        name: "HEAD"
+            .try_into()
+            .map_err(|e| anyhow::anyhow!("invalid ref name HEAD: {e}"))?,
+        deref: true,
     })?;
     Ok(())
+}
+
+/// `finish_up_to_date()`: the notice a merge with nothing to do prints, which
+/// names the squash that will not happen when `--squash` asked for one.
+fn up_to_date_line(opts: &Opts) -> &'static str {
+    if opts.squash {
+        "Already up to date. (nothing to squash)"
+    } else {
+        "Already up to date."
+    }
 }
 
 /// Point `ORIG_HEAD` at `id`, as git does before it moves `HEAD`.
@@ -2669,18 +2834,28 @@ fn early_part_of_branch(repo: &gix::Repository, spec: &str) -> Option<(String, b
 /// Move the worktree and its index from the state captured in `old` to
 /// `new_tree`, writing only the paths that changed.
 ///
-/// Ported from the `zsync` reconcile path: the change set is derived by
-/// comparing the old index against the new tree-index (file-level granularity),
-/// added/modified files are checked out via `gix-worktree-state`, removed files
+/// Added/modified files are checked out via `gix-worktree-state`, removed files
 /// are deleted, and the new index is written reusing prior stats for unchanged
 /// entries so a later status stays cheap.
 ///
-/// A path carrying any conflicted stage in `old` is always treated as changed:
-/// its worktree file holds conflict markers rather than any indexed blob, so it
-/// must be rewritten even when one of its stages happens to match the new tree.
+/// `old_tree` names the tree the worktree currently holds, and decides which of
+/// git's two shapes this takes:
+///
+/// * `Some(tree)` — `unpack_trees()` with `twoway_merge`: the footprint is the
+///   paths `tree` and `new_tree` disagree on, and every entry outside it is
+///   `keep_entry()`d, so staged work the merge does not touch survives. This is
+///   what the fast-forward paths need, since git fast-forwards over a staged
+///   change rather than refusing it.
+/// * `None` — the index is the only reference point (`--abort` restoring a
+///   conflicted state, `-s ours` keeping its own tree): the change set comes
+///   from comparing `old` against `new_tree`, and `new_tree` becomes the index
+///   wholesale. A path carrying a conflicted stage in `old` is always treated as
+///   changed there, since its worktree file holds conflict markers rather than
+///   any indexed blob.
 fn update_worktree(
     repo: &gix::Repository,
     old: &gix::index::File,
+    old_tree: Option<ObjectId>,
     new_tree: ObjectId,
     should_interrupt: &AtomicBool,
 ) -> Result<()> {
@@ -2704,12 +2879,49 @@ fn update_worktree(
         }
     }
 
-    // Full target index (all new-tree entries) — what is finally written; a
-    // reduced copy of only the changed entries is what is checked out.
+    // `twoway_merge()`'s footprint when the tree being left is known: the paths
+    // the two trees disagree on. Everything else is `keep_entry()`d below, so a
+    // staged change outside the footprint survives untouched.
+    let touched: Option<HashSet<BString>> = match old_tree {
+        Some(old_tree) => {
+            let before = repo.index_from_tree(&old_tree)?;
+            let mut set: HashMap<BString, (ObjectId, Mode)> = HashMap::new();
+            {
+                let backing = before.path_backing();
+                for e in before.entries() {
+                    set.insert(e.path_in(backing).to_owned(), (e.id, e.mode));
+                }
+            }
+            let after = repo.index_from_tree(&new_tree)?;
+            let mut touched: HashSet<BString> = HashSet::new();
+            {
+                let backing = after.path_backing();
+                for e in after.entries() {
+                    let path = e.path_in(backing).to_owned();
+                    match set.remove(&path) {
+                        Some((id, mode)) if id == e.id && mode == e.mode => {}
+                        _ => {
+                            touched.insert(path);
+                        }
+                    }
+                }
+            }
+            // What is left in `set` is only in the old tree: the move drops it.
+            touched.extend(set.into_keys());
+            Some(touched)
+        }
+        None => None,
+    };
+
+    // Full target index (all new-tree entries) — the basis of what is finally
+    // written; a reduced copy of only the changed entries is what is checked out.
     let mut new_index = repo.index_from_tree(&new_tree)?;
     let mut subset = repo.index_from_tree(&new_tree)?;
     subset.remove_entries(|_, path, entry| {
         let path = path.to_owned();
+        if let Some(touched) = &touched {
+            return !touched.contains(&path);
+        }
         if conflicted.contains(&path) {
             return false;
         }
@@ -2739,7 +2951,9 @@ fn update_worktree(
         opts,
     )?;
 
-    // Remove files present before but not in the new tree.
+    // Remove the files the move drops. With the footprint known that is only a
+    // path the new tree lost; without it, anything the index held and the new
+    // tree does not.
     let new_paths: HashSet<BString> = {
         let backing = new_index.path_backing();
         new_index
@@ -2752,10 +2966,15 @@ fn update_worktree(
         let backing = old.path_backing();
         for e in old.entries() {
             let path = e.path_in(backing);
-            if !new_paths.contains(&path.to_owned()) {
-                if let Some(full) = repo.workdir_path(path) {
-                    let _ = std::fs::remove_file(full);
-                }
+            let owned = path.to_owned();
+            if new_paths.contains(&owned) {
+                continue;
+            }
+            if touched.as_ref().is_some_and(|t| !t.contains(&owned)) {
+                continue;
+            }
+            if let Some(full) = repo.workdir_path(path) {
+                let _ = std::fs::remove_file(full);
             }
         }
     }
@@ -2782,6 +3001,51 @@ fn update_worktree(
                 }
             }
         }
+    }
+
+    // `keep_entry()`: outside the footprint the index entry survives as it was —
+    // a staged modification keeps its blob, a staged deletion stays deleted, and
+    // a staged addition the trees never knew about is carried over. Skipped when
+    // the footprint is unknown, where the new tree simply is the new index.
+    if let Some(touched) = &touched {
+        // Untouched paths the index no longer carries stay gone, and a path
+        // carrying conflict stages is dropped here so the push-back below can
+        // restore every stage rather than flatten it onto the tree's entry.
+        new_index.remove_entries(|_, path, _| {
+            !touched.contains(path)
+                && (!old_map.contains_key(path) || conflicted.contains(&path.to_owned()))
+        });
+        {
+            let backing = new_index.path_backing().to_owned();
+            for e in new_index.entries_mut() {
+                let path = e.path_in(&backing).to_owned();
+                if touched.contains(&path) {
+                    continue;
+                }
+                if let Some((oid, mode, stat)) = old_map.get(&path) {
+                    e.id = *oid;
+                    e.mode = *mode;
+                    e.stat = *stat;
+                }
+            }
+        }
+        let kept: HashSet<BString> = {
+            let backing = new_index.path_backing();
+            new_index
+                .entries()
+                .iter()
+                .map(|e| e.path_in(backing).to_owned())
+                .collect()
+        };
+        let backing = old.path_backing();
+        for e in old.entries() {
+            let path = e.path_in(backing);
+            if kept.contains(&path.to_owned()) || touched.contains(&path.to_owned()) {
+                continue;
+            }
+            new_index.dangerously_push_entry(e.stat, e.id, e.flags, e.mode, path);
+        }
+        new_index.sort_entries();
     }
 
     // Drop any stale cache-tree extension before persisting.

@@ -4,6 +4,9 @@ use crate::PriorityQueue;
 
 pub(crate) struct Item<K, T> {
     key: K,
+    /// Insertion order, which breaks a key tie in favour of the item that
+    /// arrived first.
+    seq: u64,
     value: T,
 }
 
@@ -35,7 +38,9 @@ impl<K: Ord, T> PartialOrd<Self> for Item<K, T> {
 
 impl<K: Ord, T> Ord for Item<K, T> {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.key.cmp(&other.key)
+        // A max-heap pops the greatest item, so the *smaller* sequence number
+        // has to compare greater for the earlier insert to come out first.
+        self.key.cmp(&other.key).then_with(|| other.seq.cmp(&self.seq))
     }
 }
 
@@ -47,6 +52,7 @@ where
     fn clone(&self) -> Self {
         Item {
             key: self.key.clone(),
+            seq: self.seq,
             value: self.value.clone(),
         }
     }
@@ -58,18 +64,21 @@ where
     T: Clone,
 {
     fn clone(&self) -> Self {
-        Self(self.0.clone())
+        Self(self.0.clone(), self.1)
     }
 }
 
 impl<K: Ord, T> PriorityQueue<K, T> {
     /// Create a new instance.
     pub fn new() -> Self {
-        PriorityQueue(Default::default())
+        PriorityQueue(Default::default(), 0)
     }
-    /// Insert `value` so that it is ordered according to `key`.
+    /// Insert `value` so that it is ordered according to `key`, and behind every
+    /// item already queued under an equal key.
     pub fn insert(&mut self, key: K, value: T) {
-        self.0.push(Item { key, value });
+        let seq = self.1;
+        self.1 += 1;
+        self.0.push(Item { key, seq, value });
     }
 
     /// Pop the highest-priority item value off the queue.
@@ -115,7 +124,7 @@ impl<K: Ord, T> PriorityQueue<K, T> {
 
 impl<K: Ord, T> FromIterator<(K, T)> for PriorityQueue<K, T> {
     fn from_iter<I: IntoIterator<Item = (K, T)>>(iter: I) -> Self {
-        let mut q = PriorityQueue(BinaryHeap::new());
+        let mut q = PriorityQueue(BinaryHeap::new(), 0);
         for (k, v) in iter {
             q.insert(k, v);
         }

@@ -208,7 +208,7 @@ fn branchname(repo: &gix::Repository, name: &str) -> Vec<u8> {
 /// Recognises a leading `@{-N}` with `N > 0` and returns `(N, bytes consumed)`.
 /// The closing brace is the first `}` in the input and the number must run
 /// exactly up to it, as git's `strtol`/`num_end` comparison requires.
-fn parse_nth_prior(name: &[u8]) -> Option<(usize, usize)> {
+pub(crate) fn parse_nth_prior(name: &[u8]) -> Option<(usize, usize)> {
     if name.len() < 4 || !name.starts_with(b"@{-") {
         return None;
     }
@@ -222,7 +222,7 @@ fn parse_nth_prior(name: &[u8]) -> Option<(usize, usize)> {
 
 /// The reflog half: `refs.c::grab_nth_branch_switch` over HEAD's log, newest
 /// entry first, returning the source branch of the `nth` checkout found.
-fn nth_branch_switch(repo: &gix::Repository, nth: usize) -> Option<Vec<u8>> {
+pub(crate) fn nth_branch_switch(repo: &gix::Repository, nth: usize) -> Option<Vec<u8>> {
     let head = repo.head().ok()?;
     let mut platform = head.log_iter();
     let log = platform.rev().ok()??;

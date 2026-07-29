@@ -912,6 +912,9 @@ fn revert_one(
             Some(name) => println!("On branch {}", name.shorten()),
             None => println!("HEAD detached at {}", head_id.to_hex_with_len(7)),
         }
+        // The upstream relation and its blank line, as `wt_status_print` emits
+        // them under the header; empty for a branch that tracks nothing.
+        print!("{}", super::status::tracking_block(repo));
         // A sequencer pick that reverts to nothing stops mid-sequence rather
         // than ending, so `git commit`'s status carries the in-progress advice
         // git's `wt_status_get_state` prints from the live sequencer todo. The

@@ -263,18 +263,6 @@ fn ident_eq(a: &Ident, b: &Ident) -> bool {
     a.mail == b.mail && a.name == b.name
 }
 
-/// Which notes trees `--notes`/`--no-notes`/`format.notes` selected, mirroring
-/// git's `struct display_notes_opt`.
-struct NotesOpt {
-    /// `use_default_notes`: -1 until asked for, 1 once `--notes` (no ref) or a
-    /// true `format.notes` turned the default tree on.
-    use_default: i8,
-    /// The `--notes=<ref>` refs, already run through `expand_notes_ref()`.
-    extra_refs: Vec<String>,
-    /// git's `rev.show_notes`.
-    show: bool,
-}
-
 /// The threading state git keeps on `rev_info`: the id of the message being
 /// written and the chain the `References:` header lists.
 struct ThreadState {
@@ -376,7 +364,7 @@ struct Opts {
     /// The branch the series was named by, for `branch.<name>.description`.
     branch_name: Option<String>,
     /// `--notes[=<ref>]`/`--no-notes`/`format.notes`.
-    notes: NotesOpt,
+    notes: super::notes::DisplayOpt,
     /// `--base=<commit>|auto`/`--no-base`/`format.useAutoBase`.
     auto_base: AutoBase,
     /// The explicit `--base=<commit>` argument, if one was given.
@@ -497,7 +485,7 @@ pub fn format_patch(args: &[String]) -> Result<ExitCode> {
     let mut bases_pending = bases.is_some();
 
     // The notes trees `--notes`/`format.notes` selected, loaded once.
-    let notes_trees = load_display_notes(&repo, &opts)?;
+    let notes_trees = super::notes::load_display(&repo, &opts.notes)?;
 
     let mut stdout = std::io::stdout().lock();
     let mut buffered: Vec<u8> = Vec::new();
@@ -813,32 +801,24 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
         branch_name: None,
         notes: match cfg_str("format.notes") {
             Some(v) => match maybe_bool(&v) {
-                Some(true) => NotesOpt {
-                    use_default: 1,
-                    extra_refs: Vec::new(),
-                    show: true,
-                },
-                Some(false) => NotesOpt {
-                    use_default: -1,
-                    extra_refs: Vec::new(),
-                    show: false,
-                },
-                None => NotesOpt {
-                    use_default: -1,
-                    extra_refs: vec![expand_notes_ref(&v)],
-                    show: true,
-                },
+                Some(true) => {
+                    let mut o = super::notes::DisplayOpt::default();
+                    o.enable_default();
+                    o
+                }
+                Some(false) => super::notes::DisplayOpt::default(),
+                None => {
+                    let mut o = super::notes::DisplayOpt::default();
+                    o.enable_ref(&v);
+                    o
+                }
             },
-            None if snap.boolean("format.notes") == Some(true) => NotesOpt {
-                use_default: 1,
-                extra_refs: Vec::new(),
-                show: true,
-            },
-            None => NotesOpt {
-                use_default: -1,
-                extra_refs: Vec::new(),
-                show: false,
-            },
+            None if snap.boolean("format.notes") == Some(true) => {
+                let mut o = super::notes::DisplayOpt::default();
+                o.enable_default();
+                o
+            }
+            None => super::notes::DisplayOpt::default(),
         },
         auto_base: match cfg_str("format.useAutoBase") {
             Some(v) if v.eq_ignore_ascii_case("whenAble") => AutoBase::WhenAble,
@@ -1076,19 +1056,9 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
                 commit_list_format_given = true;
             }
             // `--notes` takes an optional ref; `--no-notes` clears everything.
-            "--notes" => {
-                o.notes.use_default = 1;
-                o.notes.show = true;
-            }
-            s if s.starts_with("--notes=") => {
-                o.notes.extra_refs.push(expand_notes_ref(&s["--notes=".len()..]));
-                o.notes.show = true;
-            }
-            "--no-notes" => {
-                o.notes.use_default = -1;
-                o.notes.extra_refs.clear();
-                o.notes.show = false;
-            }
+            "--notes" => o.notes.enable_default(),
+            s if s.starts_with("--notes=") => o.notes.enable_ref(&s["--notes=".len()..]),
+            "--no-notes" => o.notes.disable(),
             // `--base` is git's `base_callback`: `auto` switches on the
             // upstream-derived base, any other value names the base itself.
             "--base" => {
@@ -1473,17 +1443,6 @@ fn parse_cover_from_description(arg: &str) -> Option<CoverFrom> {
         "subject" => Some(CoverFrom::Subject),
         "auto" => Some(CoverFrom::Auto),
         _ => None,
-    }
-}
-
-/// Port of `expand_notes_ref()` (notes.c).
-fn expand_notes_ref(name: &str) -> String {
-    if name.starts_with("refs/notes/") {
-        name.to_owned()
-    } else if name.starts_with("notes/") {
-        format!("refs/{name}")
-    } else {
-        format!("refs/notes/{name}")
     }
 }
 
@@ -2329,7 +2288,7 @@ fn render_message(
     total: usize,
     opts: &Opts,
     th: &ThreadState,
-    notes_trees: &[NotesTree],
+    notes_trees: &[super::notes::Tree],
     out: &mut Vec<u8>,
 ) -> Result<()> {
     write_from_line(out, commit.id, opts)?;
@@ -2457,7 +2416,7 @@ fn render_message(
     // Notes open their own commentary block, which is what makes the `---` line
     // before the diffstat collapse to a bare blank line.
     let mut shown_dashes = false;
-    let notes = format_display_notes(repo, notes_trees, commit.id)?;
+    let notes = super::notes::format_display(repo, notes_trees, commit.id, false)?;
     if !notes.is_empty() {
         sb.push_str("---\n");
         shown_dashes = true;
@@ -3037,120 +2996,6 @@ fn gen_message_id(repo: &gix::Repository, base: &str) -> Result<String> {
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
     Ok(format!("{base}.{epoch}.git.{}", committer_ident(repo)?.mail))
-}
-
-/// One loaded notes tree, with the ref it came from (which names the block).
-struct NotesTree {
-    ref_name: String,
-    notes: super::notes::Notes,
-}
-
-/// Port of `load_display_notes()` (notes.c) for the refs `--notes`/`--no-notes`/
-/// `format.notes` selected.
-///
-/// The default tree is consulted when `--notes` was given without a ref (or
-/// nothing narrowed the selection), and only then are `GIT_NOTES_DISPLAY_REF`
-/// and `notes.displayRef` added — an explicit `--notes=<ref>` suppresses both.
-fn load_display_notes(repo: &gix::Repository, opts: &Opts) -> Result<Vec<NotesTree>> {
-    if !opts.notes.show {
-        return Ok(Vec::new());
-    }
-    let mut refs: Vec<String> = Vec::new();
-    // Port of `string_list_add_refs_by_glob()`: a name that resolves to nothing
-    // is warned about but still listed, and duplicates are dropped.
-    let add_by_glob = |refs: &mut Vec<String>, name: &str| -> Result<()> {
-        if name.contains(['*', '?', '[']) {
-            bail!("glob notes ref {name:?} is not supported");
-        }
-        if repo.rev_parse_single(BStr::new(name)).is_err() {
-            eprintln!("warning: notes ref {name} is invalid");
-        }
-        if !refs.iter().any(|r| r == name) {
-            refs.push(name.to_owned());
-        }
-        Ok(())
-    };
-    if opts.notes.use_default > 0
-        || (opts.notes.use_default == -1 && opts.notes.extra_refs.is_empty())
-    {
-        refs.push(super::notes::resolve_notes_ref(repo, None));
-        match std::env::var("GIT_NOTES_DISPLAY_REF") {
-            Ok(v) => {
-                for name in v.split(':').filter(|s| !s.is_empty()) {
-                    add_by_glob(&mut refs, name)?;
-                }
-            }
-            Err(_) => {
-                for v in repo
-                    .config_snapshot()
-                    .plumbing()
-                    .values::<gix::bstr::BString>("notes.displayRef")
-                    .unwrap_or_default()
-                {
-                    add_by_glob(&mut refs, v.to_str()?)?;
-                }
-            }
-        }
-    }
-    for r in &opts.notes.extra_refs {
-        add_by_glob(&mut refs, r)?;
-    }
-
-    let mut trees = Vec::new();
-    for r in refs {
-        let (notes, _) = super::notes::load(repo, &r)?;
-        trees.push(NotesTree {
-            ref_name: r,
-            notes,
-        });
-    }
-    Ok(trees)
-}
-
-/// git's `GIT_NOTES_DEFAULT_REF`.
-const NOTES_DEFAULT_REF: &str = "refs/notes/commits";
-
-/// Port of `format_display_notes()`/`format_note()` (notes.c) for the non-raw
-/// (mail) case: a `Notes[ (<ref>)]:` header and the note indented four spaces.
-fn format_display_notes(
-    repo: &gix::Repository,
-    trees: &[NotesTree],
-    object: ObjectId,
-) -> Result<Vec<u8>> {
-    let mut out = Vec::new();
-    for t in trees {
-        let Some(note_id) = t.notes.map.get(&object) else {
-            continue;
-        };
-        let Ok(blob) = repo.find_object(*note_id) else {
-            continue;
-        };
-        if blob.kind != gix::object::Kind::Blob {
-            continue;
-        }
-        let mut msg = blob.data.as_slice();
-        // "we will end the annotation by a newline anyway"
-        if msg.last() == Some(&b'\n') {
-            msg = &msg[..msg.len() - 1];
-        }
-        let label = t.ref_name.as_str();
-        if label == NOTES_DEFAULT_REF {
-            out.extend_from_slice(b"\nNotes:\n");
-        } else {
-            let short = label
-                .strip_prefix("refs/")
-                .unwrap_or(label)
-                .to_owned();
-            let short = short.strip_prefix("notes/").unwrap_or(&short);
-            write!(out, "\nNotes ({short}):\n")?;
-        }
-        for line in msg.split(|&b| b == b'\n') {
-            out.extend_from_slice(b"    ");
-            out.extend_from_slice(line);
-            out.push(b'\n');
-        }
-    }
-    Ok(out)
 }
 
 /// The `base-commit:`/`prerequisite-patch-id:` trailer block, as

@@ -232,7 +232,13 @@ pub fn ls_remote(args: &[String]) -> Result<ExitCode> {
     ) {
         Ok((map, _handshake)) => map,
         Err(e) => {
-            eprintln!("fatal: {e}");
+            // An ssh transport that never connected is git's own `die()`: the
+            // child's stderr, then the fixed block.
+            let err = anyhow::Error::from(e);
+            if let Some(code) = crate::transport_err::ssh_fatal(&url.to_string(), &err) {
+                return Ok(code);
+            }
+            eprintln!("fatal: {err}");
             return Ok(ExitCode::from(128));
         }
     };

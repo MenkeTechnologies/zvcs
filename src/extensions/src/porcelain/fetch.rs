@@ -1635,7 +1635,15 @@ fn fetch_one(
             eprintln!("fatal: {e}");
             return Ok(Verdict::Fatal);
         }
-        Err(e) => return Err(e.into()),
+        Err(e) => {
+            // An ssh transport that never connected is git's own `die()`: the
+            // child's stderr, then the fixed block, exit 128.
+            let err = anyhow::Error::from(e);
+            if crate::transport_err::ssh_fatal(&url, &err).is_some() {
+                return Ok(Verdict::Fatal);
+            }
+            return Err(err);
+        }
     };
 
     // `get_fetch_map()` in `remote.c` is called with `missing_ok == 0` for every refspec that came

@@ -328,14 +328,25 @@ pub fn send_pack(
         transport.configure(&*config).ok();
     }
 
-    let handshake = gix::protocol::handshake(
+    let handshake = match gix::protocol::handshake(
         &mut *transport,
         Service::ReceivePack,
         &mut authenticate,
         Vec::new(),
         &mut gix::progress::Discard,
-    )
-    .context("receive-pack handshake failed")?;
+    ) {
+        Ok(h) => h,
+        Err(e) => {
+            let err = anyhow::Error::from(e).context("receive-pack handshake failed");
+            // An ssh transport that never connected exits the way git's does.
+            // `ssh_fatal` has already written git's block; this layer returns a
+            // `Result` rather than an exit code, so the status is set directly.
+            if crate::transport_err::ssh_fatal(url.as_str(), &err).is_some() {
+                std::process::exit(128);
+            }
+            return Err(err);
+        }
+    };
 
     // Map every advertised ref to its tip so we can fill in each update's old
     // value (git's `remote_refs`, matched against `refs->name`).

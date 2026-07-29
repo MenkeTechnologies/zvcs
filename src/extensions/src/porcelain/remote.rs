@@ -1162,6 +1162,14 @@ fn show(repo: &gix::Repository, args: &[String], verbose: bool) -> Result<ExitCo
             match query_ref_map(repo, name) {
                 Ok(map) => Some(map),
                 Err(e) => {
+                    // An ssh transport that never connected is git's own `die()`.
+                    let url = fetch_urls_or_name(repo, name)
+                        .first()
+                        .cloned()
+                        .unwrap_or_else(|| name.to_string());
+                    if let Some(code) = crate::transport_err::ssh_fatal(&url, &e) {
+                        return Ok(code);
+                    }
                     eprintln!("fatal: {e}");
                     return Ok(ExitCode::from(128));
                 }

@@ -882,6 +882,13 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     if let Some(handle) = render {
         handle.shutdown_and_wait();
     }
+    // A transport that never connected is git's own `die()`, not a wrapped error:
+    // the ssh child's stderr, then the fixed block, exit 128.
+    if let Err(e) = &result {
+        if let Some(code) = crate::transport_err::ssh_fatal(url_str, e) {
+            return Ok(code);
+        }
+    }
     result?;
 
     // `--separate-git-dir`: move the git dir to the requested path and leave a

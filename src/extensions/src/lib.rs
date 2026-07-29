@@ -32,6 +32,7 @@ pub mod shallow_serve;
 pub mod sigpipe;
 pub mod superset;
 pub mod threads;
+pub mod transport_err;
 pub mod trace2;
 pub mod worktree;
 

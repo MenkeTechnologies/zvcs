@@ -132,6 +132,8 @@ pub(crate) fn parse_decoration_style(value: &str) -> Option<DecorateStyle> {
 ///   * `--min-parents=N` / `--max-parents=N` and
 ///     their `--no-` forms                       → parent-count limiting
 ///   * `--first-parent`                          → follow only the first parent
+///   * `--follow`                                 → track one path across renames
+///   * `-m` / `-c` / `--cc` / `--diff-merges=<m>` → what a merge's diff shows
 ///   * `--reverse`                               → emit the selected commits oldest-first
 ///   * `--date-order` / `--topo-order`           → git's two topological sort orders
 ///   * `--oneline`, `--pretty=`/`--format=` with
@@ -188,6 +190,25 @@ pub(crate) fn parse_decoration_style(value: &str) -> Option<DecorateStyle> {
 ///     implies `--topo-order` and, with no other diff format given, `-p`; it is
 ///     rejected against a pathspec and against the count formats exactly as git
 ///     rejects them.
+///
+/// ### Rename detection in the per-commit diff — a measured gap
+///
+/// `git log`'s own diffs run `diffcore_rename` (porcelain defaults `diff.renames`
+/// on), so a commit that renamed a file shows `R<score> <old> <new>` in
+/// `--name-status`, `<old> => <new>` in `--stat`, and a `rename from`/`rename to`
+/// patch header. The per-commit diff here does not run that pass, so such a commit
+/// renders as a delete plus an add instead. Measured against stock git 2.50.1 on a
+/// `git mv`-created commit; it is the same for `log -p`, `--name-status` and
+/// `--stat`, with or without `--follow`. `git diff` is unaffected — it has the
+/// pass, and `--follow`'s *commit list* is unaffected too, because that is decided
+/// by the rename search below rather than by the diff.
+///
+/// `--follow` itself is ported: `try_to_follow_renames()`'s rewrite of the
+/// pathspec, one commit at a time along the first parent, so the log walks back
+/// through every name the file has had. Its exact-rename pass is git's; the
+/// inexact one uses the same `diffcore_count_changes()` estimator, which agrees on
+/// the score but may pick a different winner when several deletions in one commit
+/// score alike.
 ///
 /// Output separation follows git's `format:` (separator) versus `tformat:`
 /// (terminator) distinction, which is why `--format=%s` and `--pretty=format:%s`
@@ -372,6 +393,11 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
     // changed line matches). Both diff each commit against its first parent.
     let mut pickaxe_s: Option<String> = None;
     let mut pickaxe_g: Option<String> = None;
+    // `--diff-merges=<mode>`: what a *merge* commit's patch shows. git's default is
+    // `off`, which is why `git log -p` prints no diff for a merge at all.
+    let mut diff_merges = DiffMerges::Off;
+    // `--follow`: keep following the one pathspec across renames.
+    let mut follow = false;
     // `-L<range>:<file>`, repeatable: line-level traversal (see `line_log`).
     let mut line_ranges: Vec<String> = Vec::new();
     // `-s`/`--no-patch` resets the diff output format to git's NO_OUTPUT. That is a
@@ -732,6 +758,28 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
         } else if a == "-G" {
             i += 1;
             pickaxe_g = Some(args.get(i).cloned().unwrap_or_default());
+        } else if a == "--follow" {
+            follow = true;
+        } else if a == "--no-follow" {
+            follow = false;
+        } else if a == "-m" {
+            // `diff_merges_set_dense_combined_if_unset()` and friends
+            // (diff-merges.c): each spelling selects a mode, and the last one wins.
+            diff_merges = DiffMerges::Separate;
+        } else if a == "-c" {
+            diff_merges = DiffMerges::Combined;
+        } else if a == "--cc" {
+            diff_merges = DiffMerges::DenseCombined;
+        } else if a == "--no-diff-merges" {
+            diff_merges = DiffMerges::Off;
+        } else if let Some(v) = a.strip_prefix("--diff-merges=") {
+            match DiffMerges::parse(v) {
+                Some(m) => diff_merges = m,
+                None => {
+                    eprintln!("fatal: invalid value for '--diff-merges': '{v}'");
+                    return Ok(ExitCode::from(128));
+                }
+            }
         } else if let Some(v) = a.strip_prefix("-G") {
             pickaxe_g = Some(v.to_string());
         } else if let Some(body) = a.strip_prefix('-') {
@@ -1060,7 +1108,39 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
     // For a merge that is what removes both the merge itself and the entire side
     // whose changes it did not take; comparing only against the first parent
     // leaves the merge in the log and lists the other side's commits as well.
-    if !pathspecs.is_empty() {
+    if follow {
+        // `cmd_log_init_finish()`: `--follow` rewrites the pathspec as the walk
+        // goes back, so it can only track one path.
+        if pathspecs.len() != 1 {
+            eprintln!("fatal: --follow requires exactly one pathspec");
+            return Ok(ExitCode::from(128));
+        }
+        // `try_to_follow_renames()` (tree-diff.c): walk newest first along the
+        // first parent, and when the followed path turns out to have arrived by a
+        // rename, switch to the name it came from. A commit is shown exactly when
+        // the followed path changed in it.
+        let mut current: gix::bstr::BString = pathspecs[0].clone().into();
+        let mut shown: Vec<Node> = Vec::new();
+        for node in std::mem::take(&mut nodes) {
+            let commit = repo.find_object(node.id)?.try_into_commit()?;
+            let parent = node.parents.first().copied();
+            let spec = vec![current.to_string()];
+            let changed = changes_match(&repo, &commit, parent, &spec)?;
+            if changed {
+                let mut node = node;
+                node.follow_path = Some(current.clone());
+                shown.push(node);
+            }
+            // The switch happens after the commit is judged: the rename *is* the
+            // change that makes the commit interesting.
+            if let Some(parent) = parent {
+                if let Some(src) = follow_source(&repo, &commit, parent, &current)? {
+                    current = src;
+                }
+            }
+        }
+        nodes = shown;
+    } else if !pathspecs.is_empty() {
         // id → (parents the simplified history follows, whether it is shown).
         let mut simplified: HashMap<ObjectId, (Vec<ObjectId>, bool)> =
             HashMap::with_capacity(nodes.len());
@@ -1229,6 +1309,13 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
     // `--name-only`/`--name-status` are git's reported format; they suppress both
     // the count formats and the `-p` patch. The patch is emitted after the count
     // formats otherwise.
+    // `diff_merges_setup_revs()`: `-c`/`--cc` set `merges_imply_patch`, and the
+    // patch becomes the format only when nothing else claimed it
+    // (`if (!revs->diffopt.output_format)`), so `-c --stat` stays a stat. `-m` sets
+    // no such flag, which is why `git log -m` on its own still prints no diff.
+    let patch = patch
+        || (matches!(diff_merges, DiffMerges::Combined | DiffMerges::DenseCombined)
+            && !(stat || numstat || shortstat || name_only || name_status));
     let emit_patch = patch && !name_only && !name_status;
     let want_names = name_only || name_status || stat || numstat || shortstat;
     // Whether `%C`/`%d` emit ANSI: git's auto rule is "stdout is a terminal, or we
@@ -1420,7 +1507,7 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
     // above it do. The window computes a batch of them across the thread pool
     // while the loop below stays a plain in-order stream — git computes them one
     // at a time on one core.
-    let mut patches = PatchWindow::new(emit_patch, show_root);
+    let mut patches = PatchWindow::new(emit_patch, show_root, diff_merges);
     // Each record's text comes out of its own commit object, and reading 6000 of
     // them is the whole cost of a format like `--oneline` or `%s`. The window
     // renders a batch of records at a time across the thread pool; the loop below
@@ -1495,7 +1582,12 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
                 diff = super::diff::line_range_patch(&repo, pairs, 3)?;
             }
             if !diff.is_empty() {
-                if !matches!(pretty, Pretty::Oneline) && !block.is_empty() {
+                // A merge's combined diff is separated from the header even under
+                // `oneline`, which is the one format that otherwise runs the patch
+                // straight on: `show_combined_diff()` writes the blank line itself.
+                let combined_here = node.parents.len() > 1
+                    && matches!(diff_merges, DiffMerges::Combined | DiffMerges::DenseCombined);
+                if (!matches!(pretty, Pretty::Oneline) || combined_here) && !block.is_empty() {
                     block.push(b'\n');
                 }
                 block.extend_from_slice(&diff);
@@ -1504,8 +1596,11 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
         // A root commit's diff (against the empty tree) is only shown when
         // `show_root` is set — git's `log.showRoot` (default true), forced on by
         // `--root`. Non-root commits are unaffected.
+        // A merge reaches the count/name formats too once a `--diff-merges` mode is
+        // in force; git diffs it against its first parent for those
+        // (`log -c --stat` on a merge prints the first-parent stat).
         else if (want_names || emit_patch)
-            && node.parents.len() < 2
+            && (node.parents.len() < 2 || diff_merges != DiffMerges::Off)
             && (show_root || !node.parents.is_empty())
         {
             let mut diff: Vec<u8> = Vec::new();
@@ -1521,11 +1616,16 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
                     collect_changes(&repo, &commit, node.parents.first().copied(), count_formats)?;
                 // `-- <pathspec>` limits what the name/stat formats report, not
                 // just which commits reach them.
-                if !pathspecs.is_empty() {
+                // `--follow` limits each commit by the name the file had there.
+                let limit: Vec<String> = match &node.follow_path {
+                    Some(path) => vec![path.to_string()],
+                    None => pathspecs.clone(),
+                };
+                if !limit.is_empty() {
                     let mut kept = Vec::with_capacity(files.len());
                     for f in files {
                         let mut hit = false;
-                        for spec in &pathspecs {
+                        for spec in &limit {
                             if pathspec_matches(spec, &f.path)? {
                                 hit = true;
                                 break;
@@ -1537,7 +1637,27 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
                     }
                     files = kept;
                 }
-                if name_status {
+                // A merge under a combined mode reports the *combined* pair list
+                // here, with one status letter per parent — `show_raw_diff()` on a
+                // `combine_diff_path`. The stat formats below stay on the
+                // first-parent diff, which is where git leaves them.
+                let combined_names = (node.parents.len() > 1
+                    && matches!(diff_merges, DiffMerges::Combined | DiffMerges::DenseCombined)
+                    && (name_only || name_status))
+                    .then(|| {
+                        super::diff::merge_combined_names(&repo, node.id, &node.parents, &pathspecs)
+                    })
+                    .transpose()?;
+                if let Some(rows) = combined_names {
+                    for (path, letters) in &rows {
+                        if name_status {
+                            diff.extend_from_slice(letters.as_bytes());
+                            diff.push(b'\t');
+                        }
+                        diff.extend_from_slice(path);
+                        diff.push(b'\n');
+                    }
+                } else if name_status {
                     for f in &files {
                         diff.push(f.status);
                         diff.push(b'\t');
@@ -1567,7 +1687,25 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
                 // The full patch, rendered by the same pipeline as `git diff` so
                 // the two agree byte-for-byte. git separates a preceding count
                 // format from the patch with a blank line.
-                let p = patches.get(&repo, &nodes, ni, 3, &pathspecs)?;
+                // Under `--follow` the limit is the name the file had *at this
+                // commit*, not the one on the command line — and it differs from
+                // commit to commit, so the batching window (one pathspec per fill)
+                // cannot serve it.
+                let follow_patch: Vec<u8> = match &node.follow_path {
+                    Some(path) => super::diff::commit_patches(
+                        &repo,
+                        &[(node.id, node.parents.first().copied())],
+                        3,
+                        &[path.to_string()],
+                    )?
+                    .pop()
+                    .unwrap_or_default(),
+                    None => Vec::new(),
+                };
+                let p: &[u8] = match &node.follow_path {
+                    Some(_) => &follow_patch,
+                    None => patches.get(&repo, &nodes, ni, 3, &pathspecs)?,
+                };
                 if !p.is_empty() {
                     if !diff.is_empty() {
                         diff.push(b'\n');
@@ -1581,7 +1719,12 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
                 // rendered something to separate from. A `--stat` block shown
                 // together with `-p` is fenced off with a `---` line; every other
                 // diff format uses a plain blank line.
-                if !matches!(pretty, Pretty::Oneline) && !block.is_empty() {
+                // A merge's combined diff is separated from the header even under
+                // `oneline`, which is the one format that otherwise runs the patch
+                // straight on: `show_combined_diff()` writes the blank line itself.
+                let combined_here = node.parents.len() > 1
+                    && matches!(diff_merges, DiffMerges::Combined | DiffMerges::DenseCombined);
+                if (!matches!(pretty, Pretty::Oneline) || combined_here) && !block.is_empty() {
                     if stat && emit_patch {
                         block.extend_from_slice(b"---\n");
                     } else {
@@ -2027,6 +2170,8 @@ fn entry_block(
 struct PatchWindow {
     active: bool,
     show_root: bool,
+    /// `--diff-merges=<mode>`: what a merge commit's patch shows.
+    merges: DiffMerges,
     /// Index of `slots[0]` within the caller's node list.
     start: usize,
     slots: Vec<Vec<u8>>,
@@ -2037,17 +2182,26 @@ impl PatchWindow {
     /// wide box, small enough that the buffered patches stay a few megabytes.
     const SPAN: usize = 64;
 
-    fn new(active: bool, show_root: bool) -> Self {
-        PatchWindow { active, show_root, start: 0, slots: Vec::new() }
+
+    fn new(active: bool, show_root: bool, merges: DiffMerges) -> Self {
+        PatchWindow { active, show_root, merges, start: 0, slots: Vec::new() }
     }
 
-    /// `true` when git renders a diff for this commit at all: merges are shown
-    /// only with `-m`/`-c`/`--cc`, and a root commit's diff obeys `log.showRoot`.
+    /// `true` when git renders a diff for this commit at all: a merge only under a
+    /// `--diff-merges` mode other than `off` (which `-m`/`-c`/`--cc` select), and a
+    /// root commit's diff obeys `log.showRoot`.
     fn diffable(&self, node: &Node) -> bool {
-        node.parents.len() < 2 && (self.show_root || !node.parents.is_empty())
+        if node.parents.len() > 1 {
+            return self.merges != DiffMerges::Off;
+        }
+        self.show_root || !node.parents.is_empty()
     }
 
     /// The patch body for `nodes[i]`, refilling the window when `i` runs past it.
+    ///
+    /// A merge is rendered here rather than through the batch: its shape depends on
+    /// the `--diff-merges` mode, and the combined form needs every parent's tree at
+    /// once.
     fn get<'a>(
         &'a mut self,
         repo: &gix::Repository,
@@ -2066,20 +2220,90 @@ impl PatchWindow {
             // `k`'s result belongs in, so the batch carries no wasted diffs.
             let mut jobs: Vec<(ObjectId, Option<ObjectId>)> = Vec::with_capacity(span.len());
             let mut at: Vec<usize> = Vec::with_capacity(span.len());
+            // A merge under `combined`/`dense-combined` needs every parent tree at
+            // once, so it is rendered on its own rather than as a two-way job.
+            let mut merged: Vec<(usize, Vec<u8>)> = Vec::new();
             for (k, n) in span.iter().enumerate() {
-                if self.diffable(n) {
-                    jobs.push((n.id, n.parents.first().copied()));
-                    at.push(k);
+                if !self.diffable(n) {
+                    continue;
                 }
+                if n.parents.len() > 1 {
+                    match self.merges {
+                        DiffMerges::Combined | DiffMerges::DenseCombined => {
+                            merged.push((
+                                k,
+                                super::diff::merge_combined_patch(
+                                    repo,
+                                    n.id,
+                                    &n.parents,
+                                    paths,
+                                    ctx,
+                                    self.merges == DiffMerges::DenseCombined,
+                                )?,
+                            ));
+                            continue;
+                        }
+                        // `separate` repeats the *record* once per parent, each
+                        // headed `<oid> (from <parent-oid>) <subject>` — the insert
+                        // lives inside `show_log()`'s header, which is rendered
+                        // before any patch is known here. Emitting the patches
+                        // without it would print one header for N diffs, so this
+                        // stops instead.
+                        DiffMerges::Separate => {
+                            anyhow::bail!(
+                                "`-m` with a patch format is not ported: git repeats the commit \
+                                 header once per parent with its `(from <oid>)` insert, which this \
+                                 renderer produces before the per-parent diffs exist"
+                            );
+                        }
+                        // `first-parent` is an ordinary two-way job.
+                        DiffMerges::FirstParent | DiffMerges::Off => {}
+                    }
+                }
+                jobs.push((n.id, n.parents.first().copied()));
+                at.push(k);
             }
             let computed = super::diff::commit_patches(repo, &jobs, ctx, paths)?;
             self.slots = vec![Vec::new(); span.len()];
             for (slot, patch) in at.into_iter().zip(computed) {
                 self.slots[slot] = patch;
             }
+            for (slot, patch) in merged {
+                self.slots[slot] = patch;
+            }
             self.start = i;
         }
         Ok(&self.slots[i - self.start])
+    }
+}
+
+/// `--diff-merges=<mode>` (diff-merges.c): what a merge commit's patch shows.
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum DiffMerges {
+    /// The default: a merge gets no patch.
+    Off,
+    /// `-m` / `--diff-merges=separate`: one ordinary patch per parent, each
+    /// preceded by its own copy of the commit header.
+    Separate,
+    /// `-c` / `--diff-merges=combined`: one `diff --combined` section per path
+    /// that differs from every parent.
+    Combined,
+    /// `--cc` / `--diff-merges=dense-combined`: the same, headed `diff --cc`.
+    DenseCombined,
+    /// `--diff-merges=first-parent`: an ordinary patch against the first parent.
+    FirstParent,
+}
+
+impl DiffMerges {
+    fn parse(v: &str) -> Option<Self> {
+        Some(match v {
+            "off" | "none" => DiffMerges::Off,
+            "m" | "separate" => DiffMerges::Separate,
+            "c" | "combined" => DiffMerges::Combined,
+            "cc" | "dense-combined" => DiffMerges::DenseCombined,
+            "1" | "first-parent" => DiffMerges::FirstParent,
+            _ => return None,
+        })
     }
 }
 
@@ -2096,6 +2320,9 @@ pub(crate) struct Node {
     /// `--boundary`: an excluded commit that a shown commit descends from, which
     /// git prints with a `-` mark after the rest of the walk.
     pub(crate) boundary: bool,
+    /// `--follow`: the name the tracked file had *at this commit*, which is what
+    /// its diff and name formats are limited to. `None` when not following.
+    pub(crate) follow_path: Option<gix::bstr::BString>,
 }
 
 /// Heap order for the walk's frontier: newest commit-date first, ties broken by
@@ -2342,6 +2569,7 @@ fn read_node(repo: &gix::Repository, id: ObjectId) -> Result<Node> {
         time: commit.time()?.seconds,
         seq: 0,
         boundary: false,
+        follow_path: None,
         source: String::new(),
     })
 }
@@ -2380,6 +2608,7 @@ impl NodeReader {
                     source: String::new(),
                     seq: 0,
                     boundary: false,
+        follow_path: None,
                 });
             }
         }
@@ -4508,6 +4737,77 @@ fn decode_changes(text: &str) -> Option<Vec<FileChange>> {
 
 /// Whether the diff between `commit` and `parent` (the empty tree when `None`)
 /// touches any of the pathspecs — git's TREESAME test, negated.
+/// The name the followed path arrived from, when this commit renamed it —
+/// `try_to_follow_renames()` reduced to what `--follow` needs: the path must be new
+/// in this commit, and the source is the deletion whose content is most similar.
+///
+/// git runs its full `diffcore_rename` here (exact matches first, then the 50%
+/// similarity pass). The exact pass is reproduced faithfully; the inexact one uses
+/// the same `diffcore_count_changes()` estimator, so it agrees on the score but
+/// picks its own winner when several deletions score alike.
+fn follow_source(
+    repo: &gix::Repository,
+    commit: &gix::Commit<'_>,
+    parent: ObjectId,
+    path: &gix::bstr::BString,
+) -> Result<Option<gix::bstr::BString>> {
+    let files = collect_changes(repo, commit, Some(parent), false)?;
+    // The followed path has to be an addition here; anything else is not a rename.
+    if !files.iter().any(|f| f.path.as_slice() == path.as_slice() && f.status == b'A') {
+        return Ok(None);
+    }
+    let new_tree = commit.tree()?;
+    let old_tree = repo.find_commit(parent)?.tree()?;
+    let blob = |tree: &gix::Tree<'_>, p: &gix::bstr::BString| -> Result<Option<(ObjectId, Vec<u8>)>> {
+        let Some(entry) = tree.lookup_entry_by_path(gix::path::from_bstr(p.as_bstr()))? else {
+            return Ok(None);
+        };
+        let id = entry.object_id();
+        Ok(Some((id, repo.find_object(id)?.detach().data)))
+    };
+    let Some((new_id, new_bytes)) = blob(&new_tree, path)? else {
+        return Ok(None);
+    };
+
+    let mut best: Option<(f64, gix::bstr::BString)> = None;
+    for f in &files {
+        if f.status != b'D' {
+            continue;
+        }
+        let old_name = gix::bstr::BString::from(f.path.clone());
+        let Some((old_id, old_bytes)) = blob(&old_tree, &old_name)? else {
+            continue;
+        };
+        // `find_exact_renames()`: an identical blob is a rename outright.
+        if old_id == new_id {
+            return Ok(Some(old_name));
+        }
+        let score = similarity_score(&old_bytes, &new_bytes);
+        // `DEFAULT_RENAME_SCORE`: half the content has to survive.
+        if score >= super::diffcore_rename::MAX_SCORE / 2.0
+            && best.as_ref().is_none_or(|(b, _)| score > *b)
+        {
+            best = Some((score, old_name));
+        }
+    }
+    Ok(best.map(|(_, p)| p))
+}
+
+/// `estimate_similarity()` (diffcore-rename.c): how much of `old` survives in
+/// `new`, in `MAX_SCORE` units, off the same chunk-hash counter rename detection
+/// uses everywhere else.
+fn similarity_score(old: &[u8], new: &[u8]) -> f64 {
+    if old.is_empty() && new.is_empty() {
+        return super::diffcore_rename::MAX_SCORE;
+    }
+    let max = old.len().max(new.len()) as f64;
+    if max == 0.0 {
+        return 0.0;
+    }
+    let (copied, _added) = super::diff_files::count_changes_sides(old, true, new, true);
+    (copied as f64 * super::diffcore_rename::MAX_SCORE) / max
+}
+
 fn changes_match(
     repo: &gix::Repository,
     commit: &gix::Commit<'_>,

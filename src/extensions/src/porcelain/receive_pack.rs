@@ -1263,6 +1263,19 @@ fn check_command(
     head: Option<&str>,
     band: &mut Band,
 ) -> Result<RefEdit, String> {
+    // `update()`'s first test (receive-pack.c:1094-1098): the name must live under
+    // `refs/` and what follows has to be a valid refname *in its own right*, so a
+    // one-level name like `refs/stash` is refused. git's own matching pass leaves
+    // such a ref out of a `--mirror`, which is why this fires only for a refspec
+    // that names one explicitly.
+    let funny = match cmd.name.strip_prefix("refs/") {
+        Some(tail) => !super::check_ref_format::check_refname_format(tail.as_bytes(), 0),
+        None => true,
+    };
+    if funny {
+        band.error(&format!("refusing to update funny ref '{}' remotely", cmd.name));
+        return Err("funny refname".into());
+    }
     if let Some(reason) = config.refuse(repo, cmd, zero, head, band) {
         return Err(reason);
     }
@@ -1271,6 +1284,12 @@ fn check_command(
     if run_update_hook(repo, cmd, band) {
         band.error(&format!("hook declined to update {}", cmd.name));
         return Err("hook declined".into());
+    }
+    // `update()`: a delete of a ref this repository does not have is allowed and
+    // reported `ok`, but it is worth saying so — the pusher asked to remove
+    // something that was never here.
+    if cmd.new == zero && repo.try_find_reference(cmd.name.as_str()).ok().flatten().is_none() {
+        band.warning("deleting a non-existent ref");
     }
     ref_edit(&cmd.name, cmd.old, cmd.new, zero)
 }
@@ -1763,6 +1782,13 @@ fn ref_edit(
         PreviousValue::MustExistAndMatch(Target::Object(old))
     };
     let change = if new == zero {
+        // A delete whose old value is the null oid is `git push :refs/...` naming
+        // something the remote never had: `delete_ref()` takes it as "whatever is
+        // there, if anything", warns on band 2, and reports `ok`. Asking for
+        // `MustNotExist` alongside a deletion is a contradiction the ref
+        // transaction refuses outright.
+        let expected =
+            if old == zero { PreviousValue::Any } else { expected };
         Change::Delete { expected, log: RefLog::AndReference }
     } else {
         Change::Update {

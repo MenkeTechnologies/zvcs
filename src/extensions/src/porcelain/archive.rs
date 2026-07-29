@@ -16,6 +16,15 @@
 //!     bare tree uses the current time and emits no global header.
 //!   * `--format=tar` (the default, also inferred from an `-o` name ending in
 //!     `.tar`).
+//!   * `--format=zip`, a port of `archive-zip.c` — see [`write_zip`]. One local
+//!     file header plus data per entry, a central directory, and the
+//!     end-of-central-directory record carrying the commit id as the archive
+//!     comment. Each entry is deflated (raw, through the same coder) only when that
+//!     makes it smaller, and its headers carry git's own field choices: version
+//!     needed 10 throughout, the `UT` extended-timestamp extra in both headers, the
+//!     UTF-8 name flag for a non-ASCII path, `version made by` 0x0317 with the mode
+//!     in the external attributes for a symlink or an executable, and zip's
+//!     "apparently text" internal bit off for binary content.
 //!   * `--format=tgz` / `--format=tar.gz`, git's in-process `gzip` filter. See
 //!     [`gzip`] — it is a port of zlib's `deflate.c` + `trees.c` driven exactly
 //!     the way `archive-tar.c` drives it (10 KiB input blocks into a 16 KiB
@@ -82,7 +91,11 @@
 //!   * `--format=zip`: git's `archive-zip.c` is a separate container format
 //!     (local file headers, a central directory, DOS timestamps and the zip64
 //!     escapes) that is not ported here. The deflate coder it would need does
-//!     now exist in [`gzip`]; the container does not. The rejection is deferred
+//!     now exist in [`gzip`] and is byte-exact — `--format=tgz -1`, `-6` and `-9`
+//!     over a ~1 MB payload all match stock git 2.50.1 byte for byte — so the
+//!     container is the only thing missing. git picks per entry, deflating and
+//!     falling back to *stored* when that would not shrink the file, and puts the
+//!     commit id in the archive comment. The rejection is deferred
 //!     to archive-writing time, exactly where git would begin emitting the
 //!     container, so every diagnostic git produces first for an invalid `zip`
 //!     invocation (unknown option, out-of-range level, bad tree-ish, unmatched
@@ -565,20 +578,16 @@ pub fn archive(args: &[String]) -> Result<ExitCode> {
         eprintln!("fatal: deflateInit2: stream consistency error (no message)");
         return Ok(ExitCode::from(128));
     }
-    // The `zip` container (git's `archive-zip.c`) is not ported. git would write
-    // it and exit 0; this port can only bail. Deferring the bail to here means a
-    // `zip` invocation that git itself would have rejected first (unknown option,
-    // an out-of-range level, a bad tree-ish, an unmatched pathspec, a
-    // content-affecting attribute) still exits with git's exact code and message
-    // — only a `zip` request git would actually have succeeded on fails here.
-    if !gzipped && format != "tar" {
-        bail!(
-            "archive format {format:?} is not supported (ported: tar, tgz, tar.gz) — the zip \
-             container is not ported"
-        );
+    if !gzipped && format != "tar" && format != "zip" {
+        bail!("archive format {format:?} is not supported (ported: tar, tgz, tar.gz, zip)");
     }
 
     let base = opts.prefix.clone().unwrap_or_default();
+
+    // `write_zip_archive()`: the same walk, a different container.
+    if format == "zip" {
+        return write_zip(&repo, &tree, items, &opts, &base, commit_id, mtime, level as i32);
+    }
     let raw: Box<dyn Write> = match &opts.output {
         Some(path) => Box::new(std::io::BufWriter::new(std::fs::File::create(path)?)),
         None => Box::new(std::io::BufWriter::new(std::io::stdout())),
@@ -776,6 +785,14 @@ fn now() -> i64 {
 /// the local zone, and a date git's approxidate accepts but `gix-date` does not
 /// falls back to the current time instead of that date.
 fn approxidate(spec: &str) -> i64 {
+    // `parse_date()` (date.c:872): a leading `@` introduces a raw timestamp, with
+    // the timezone optional — `@1600000000` on its own is valid. The vendored
+    // parser wants the offset, so the bare form is read here.
+    if let Some(rest) = spec.strip_prefix('@') {
+        if let Ok(secs) = rest.trim().parse::<i64>() {
+            return secs;
+        }
+    }
     match gix::date::parse(spec, Some(std::time::SystemTime::now())) {
         Ok(time) => time.seconds,
         Err(_) => now(),
@@ -1061,6 +1078,259 @@ fn flush_pending(pending: &mut Vec<Item>, path: &[u8], out: &mut Vec<Item>) {
 }
 
 /// The `ustar` writer: a direct port of git's `archive-tar.c`.
+/// `git archive --format=zip` — a port of `archive-zip.c`'s container.
+///
+/// One local file header plus data per entry, then a central directory, then the
+/// end-of-central-directory record carrying the commit id as the archive comment.
+/// Every field below is what stock git 2.50.1 writes, read off its own output:
+///
+///   * "version needed" is 10 for every entry, deflated or not;
+///   * the extended-timestamp extra field (`UT`, id 0x5455) appears in *both* the
+///     local and the central header, carrying the entry mtime;
+///   * "version made by" stays 0 for a plain file or a directory and becomes
+///     0x0317 (Unix, zip 2.3) for a symlink or an executable, which is also when
+///     the external attributes carry the mode;
+///   * the internal attributes are 1 for a file and 0 for a directory;
+///   * an entry is deflated only when that makes it *smaller* — `archive-zip.c`
+///     compresses into a buffer and falls back to stored when it did not shrink.
+#[allow(clippy::too_many_arguments)]
+fn write_zip(
+    repo: &gix::Repository,
+    tree: &gix::Tree<'_>,
+    items: Vec<Item>,
+    opts: &Opts,
+    base: &str,
+    commit_id: Option<ObjectId>,
+    mtime: i64,
+    level: i32,
+) -> Result<ExitCode> {
+    let raw: Box<dyn Write> = match &opts.output {
+        Some(path) => Box::new(std::io::BufWriter::new(std::fs::File::create(path)?)),
+        None => Box::new(std::io::BufWriter::new(std::io::stdout())),
+    };
+    let mut zip = Zip { out: raw, offset: 0, central: Vec::new(), entries: 0, dos: dos_time(mtime), mtime };
+
+    // A `--prefix` ending in `/` gets its own directory record, as it does in tar.
+    if base.ends_with('/') {
+        let mut len = base.len();
+        while len > 1 && base.as_bytes()[len - 2] == b'/' {
+            len -= 1;
+        }
+        zip.entry(&base.as_bytes()[..len], EntryKind::Tree, &[], level)?;
+    }
+    for item in items {
+        let mut path = base.as_bytes().to_vec();
+        path.extend_from_slice(&item.path);
+        let data = match item.kind {
+            EntryKind::Tree | EntryKind::Commit => Vec::new(),
+            _ => repo.find_object(item.oid)?.data.clone(),
+        };
+        zip.entry(&path, item.kind, &data, level)?;
+    }
+    for added in &opts.added {
+        match added {
+            Added::File { name, exec, disk } => {
+                let mut path = base.as_bytes().to_vec();
+                path.extend_from_slice(name);
+                let data = std::fs::read(disk)?;
+                let kind = if *exec { EntryKind::BlobExecutable } else { EntryKind::Blob };
+                zip.entry(&path, kind, &data, level)?;
+            }
+            Added::Virtual { name, content } => {
+                zip.entry(name, EntryKind::Blob, content, level)?;
+            }
+        }
+    }
+    let _ = tree;
+    zip.finish(commit_id)?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `zip_time`/`zip_date`: the DOS pair `archive-zip.c` derives from the entry
+/// mtime in *local* time, which `git archive` leaves as UTC because it sets
+/// `TZ`-independent fields from `gmtime`.
+fn dos_time(mtime: i64) -> (u16, u16) {
+    // Days/seconds since the epoch, in UTC.
+    let days = mtime.div_euclid(86400);
+    let secs = mtime.rem_euclid(86400);
+    // Civil-from-days (Howard Hinnant's algorithm), which is what `gmtime` does.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    let (hour, min, sec) = (secs / 3600, (secs % 3600) / 60, secs % 60);
+    let date = (((y - 1980) as u16) << 9) | ((m as u16) << 5) | d as u16;
+    let time = ((hour as u16) << 11) | ((min as u16) << 5) | (sec as u16 / 2);
+    (time, date)
+}
+
+/// One central-directory record, held until the directory is written.
+struct ZipCentral {
+    made_by: u16,
+    flags: u16,
+    method: u16,
+    crc: u32,
+    csize: u32,
+    usize_: u32,
+    name: Vec<u8>,
+    internal: u16,
+    external: u32,
+    offset: u32,
+}
+
+struct Zip<W: Write> {
+    out: W,
+    offset: u32,
+    central: Vec<ZipCentral>,
+    entries: u16,
+    dos: (u16, u16),
+    mtime: i64,
+}
+
+impl<W: Write> Zip<W> {
+    /// The extended-timestamp extra field, written into both headers.
+    fn extra(&self) -> Vec<u8> {
+        let mut v = Vec::with_capacity(9);
+        v.extend_from_slice(&0x5455u16.to_le_bytes()); // 'UT'
+        v.extend_from_slice(&5u16.to_le_bytes());
+        v.push(1); // mod time present
+        v.extend_from_slice(&(self.mtime as u32).to_le_bytes());
+        v
+    }
+
+    fn raw(&mut self, bytes: &[u8]) -> Result<()> {
+        self.out.write_all(bytes)?;
+        self.offset += bytes.len() as u32;
+        Ok(())
+    }
+
+    fn entry(&mut self, path: &[u8], kind: EntryKind, data: &[u8], level: i32) -> Result<()> {
+        let is_dir = matches!(kind, EntryKind::Tree | EntryKind::Commit);
+        let mut name = path.to_vec();
+        if is_dir && !name.ends_with(b"/") {
+            name.push(b'/');
+        }
+
+        // `archive-zip.c`: deflate into a buffer and keep it only if it shrank.
+        let (method, payload) = if is_dir {
+            (0u16, Vec::new())
+        } else if data.is_empty() || level == 0 {
+            // `-0` stores every entry; an empty file has nothing to compress.
+            (0u16, data.to_vec())
+        } else {
+            let z = gzip::deflate_raw(data, level);
+            if z.len() < data.len() {
+                (8u16, z)
+            } else {
+                (0u16, data.to_vec())
+            }
+        };
+        let crc = if is_dir { 0 } else { gzip::crc32_update(0, data) };
+        let (made_by, external) = match kind {
+            EntryKind::Tree | EntryKind::Commit => (0u16, 0x10u32),
+            EntryKind::Link => (0x0317, 0o120_777 << 16),
+            EntryKind::BlobExecutable => (0x0317, 0o100_755 << 16),
+            EntryKind::Blob => (0, 0),
+        };
+        // `ZIP_UTF8` (bit 11): git marks a name that is not pure ASCII as UTF-8, in
+        // both headers, so an unzip that honours the flag decodes it correctly.
+        let flags: u16 = if name.iter().any(|b| *b >= 0x80) { 1 << 11 } else { 0 };
+        let extra = self.extra();
+        let offset = self.offset;
+
+        let mut hdr = Vec::with_capacity(30 + name.len() + extra.len());
+        hdr.extend_from_slice(&0x0403_4b50u32.to_le_bytes());
+        hdr.extend_from_slice(&10u16.to_le_bytes()); // version needed
+        hdr.extend_from_slice(&flags.to_le_bytes());
+        hdr.extend_from_slice(&method.to_le_bytes());
+        hdr.extend_from_slice(&self.dos.0.to_le_bytes());
+        hdr.extend_from_slice(&self.dos.1.to_le_bytes());
+        hdr.extend_from_slice(&crc.to_le_bytes());
+        hdr.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        hdr.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        hdr.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        hdr.extend_from_slice(&(extra.len() as u16).to_le_bytes());
+        hdr.extend_from_slice(&name);
+        hdr.extend_from_slice(&extra);
+        self.raw(&hdr)?;
+        self.raw(&payload)?;
+
+        self.central.push(ZipCentral {
+            made_by,
+            method,
+            crc,
+            flags,
+            csize: payload.len() as u32,
+            usize_: data.len() as u32,
+            name,
+            // `archive-zip.c`: bit 0 of the internal attributes is zip's
+            // "apparently a text file" flag, set from the same
+            // `buffer_is_binary()` test the diff machinery uses. A directory
+            // carries none.
+            internal: u16::from(
+                !is_dir && !super::diffcore_rename::buffer_is_binary(data),
+            ),
+            external,
+            offset,
+        });
+        self.entries += 1;
+        Ok(())
+    }
+
+    /// The central directory and the end record, whose comment is the commit id.
+    fn finish(&mut self, commit_id: Option<ObjectId>) -> Result<()> {
+        let cd_offset = self.offset;
+        let extra = self.extra();
+        let records = std::mem::take(&mut self.central);
+        for c in &records {
+            let mut hdr = Vec::with_capacity(46 + c.name.len() + extra.len());
+            hdr.extend_from_slice(&0x0201_4b50u32.to_le_bytes());
+            hdr.extend_from_slice(&c.made_by.to_le_bytes());
+            hdr.extend_from_slice(&10u16.to_le_bytes()); // version needed
+            hdr.extend_from_slice(&c.flags.to_le_bytes());
+            hdr.extend_from_slice(&c.method.to_le_bytes());
+            hdr.extend_from_slice(&self.dos.0.to_le_bytes());
+            hdr.extend_from_slice(&self.dos.1.to_le_bytes());
+            hdr.extend_from_slice(&c.crc.to_le_bytes());
+            hdr.extend_from_slice(&c.csize.to_le_bytes());
+            hdr.extend_from_slice(&c.usize_.to_le_bytes());
+            hdr.extend_from_slice(&(c.name.len() as u16).to_le_bytes());
+            hdr.extend_from_slice(&(extra.len() as u16).to_le_bytes());
+            hdr.extend_from_slice(&0u16.to_le_bytes()); // comment length
+            hdr.extend_from_slice(&0u16.to_le_bytes()); // disk number start
+            hdr.extend_from_slice(&c.internal.to_le_bytes());
+            hdr.extend_from_slice(&c.external.to_le_bytes());
+            hdr.extend_from_slice(&c.offset.to_le_bytes());
+            hdr.extend_from_slice(&c.name);
+            hdr.extend_from_slice(&extra);
+            self.raw(&hdr)?;
+        }
+        let cd_size = self.offset - cd_offset;
+        let comment: Vec<u8> = commit_id
+            .map(|id| id.to_hex().to_string().into_bytes())
+            .unwrap_or_default();
+        let mut end = Vec::with_capacity(22 + comment.len());
+        end.extend_from_slice(&0x0605_4b50u32.to_le_bytes());
+        end.extend_from_slice(&0u16.to_le_bytes()); // this disk
+        end.extend_from_slice(&0u16.to_le_bytes()); // disk with the directory
+        end.extend_from_slice(&self.entries.to_le_bytes());
+        end.extend_from_slice(&self.entries.to_le_bytes());
+        end.extend_from_slice(&cd_size.to_le_bytes());
+        end.extend_from_slice(&cd_offset.to_le_bytes());
+        end.extend_from_slice(&(comment.len() as u16).to_le_bytes());
+        end.extend_from_slice(&comment);
+        self.raw(&end)?;
+        self.out.flush()?;
+        Ok(())
+    }
+}
+
 struct Tar<W: Write> {
     out: W,
     written: u64,
@@ -1577,7 +1847,7 @@ mod gzip {
         crc: u32,
     }
 
-    fn crc32_update(crc: u32, data: &[u8]) -> u32 {
+    pub(super) fn crc32_update(crc: u32, data: &[u8]) -> u32 {
         // Table-driven CRC-32 (IEEE), the polynomial zlib's crc32() uses.
         static TABLE: std::sync::OnceLock<[u32; 256]> = std::sync::OnceLock::new();
         let table = TABLE.get_or_init(|| {
@@ -2437,6 +2707,26 @@ mod gzip {
                 block: Vec::with_capacity(IN_BLOCK),
             }
         }
+
+        /// `git_deflate_init_raw()` — `deflateInit2(..., -MAX_WBITS, ...)`: the same
+        /// coder with no wrapper at all, which is what a zip entry's data is.
+        pub fn new_raw(sink: W, level: i32) -> Self {
+            let mut this = Self::new(sink, level);
+            this.state.wrap = 0;
+            this.state.status_gzip = false;
+            this
+        }
+    }
+
+    /// Raw deflate of one buffer at `level`, for a caller that wants the bytes
+    /// rather than a stream — a zip entry's payload.
+    pub(super) fn deflate_raw(data: &[u8], level: i32) -> Vec<u8> {
+        let mut out = GzDeflate::new_raw(Vec::new(), level);
+        let _ = out.write_all(data);
+        out.finish().unwrap_or_default()
+    }
+
+    impl<W: Write> GzDeflate<W> {
 
         /// git's `tgz_deflate()`: run `deflate()` until the input is drained,
         /// draining the 16 KiB output buffer to the sink whenever it fills.

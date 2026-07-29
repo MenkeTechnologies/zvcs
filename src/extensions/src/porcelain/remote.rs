@@ -1278,13 +1278,13 @@ fn show_one(
         }
     }
 
-    show_push(repo, name);
+    show_push(repo, name, map);
     Ok(())
 }
 
 /// The `'git push'` section of a `show` block: mirror note, explicit refspecs,
 /// or the default matching behaviour.
-fn show_push(repo: &gix::Repository, name: &str) {
+fn show_push(repo: &gix::Repository, name: &str, map: Option<&gix::remote::fetch::RefMap>) {
     let cfg = repo.config_snapshot();
     let mirror = cfg
         .plumbing()
@@ -1298,46 +1298,215 @@ fn show_push(repo: &gix::Repository, name: &str) {
     }
 
     let specs = effective_specs(repo, name, "push");
-    if specs.is_empty() {
-        println!("  Local ref configured for 'git push' (status not queried):");
-        println!("    (matching) pushes to (matching)");
+
+    // With the advertisement in hand, `get_push_ref_states()` runs the same
+    // `match_push_refs()` a push would and reports what each update *would* do.
+    // Without it (`-n`), git falls back to naming the refspecs alone.
+    let rows: Vec<PushRow> = match map {
+        Some(map) => push_states(repo, &specs, map),
+        None => {
+            if specs.is_empty() {
+                println!("  Local ref configured for 'git push' (status not queried):");
+                println!("    (matching) pushes to (matching)");
+                return;
+            }
+            specs
+                .iter()
+                .map(|spec| {
+                    let forced = spec.starts_with('+');
+                    let body = spec.strip_prefix('+').unwrap_or(spec);
+                    let (src, dst) = match body.split_once(':') {
+                        Some((s, d)) => (s.to_string(), d.to_string()),
+                        None => (body.to_string(), body.to_string()),
+                    };
+                    let shown = if src.is_empty() { "(delete)".to_string() } else { src.clone() };
+                    PushRow { sort: src, width_key: shown.clone(), src: shown, forced, dst, status: None }
+                })
+                .collect()
+        }
+    };
+    if rows.is_empty() {
         return;
     }
 
-    // (source ref, displayed source, verb, destination), ordered by the source
-    // ref — a deletion refspec has an empty source and therefore sorts first.
-    let mut rows: Vec<(String, String, &str, String)> = specs
+    let queried = map.is_some();
+    let suffix = if queried { "" } else { " (status not queried)" };
+    if rows.len() == 1 {
+        println!("  Local ref configured for 'git push'{suffix}:");
+    } else {
+        println!("  Local refs configured for 'git push'{suffix}:");
+    }
+    let src_width = rows.iter().map(|r| r.width_key.chars().count()).max().unwrap_or(0);
+    let dst_width = rows.iter().map(|r| r.dst.chars().count()).max().unwrap_or(0);
+    for r in &rows {
+        let verb = if r.forced { "forces to" } else { "pushes to" };
+        match &r.status {
+            // `show_push_info_item()`: both columns padded, then the status.
+            Some(status) => println!(
+                "    {src:<src_width$} {verb} {dst:<dst_width$} ({status})",
+                src = r.src,
+                dst = r.dst
+            ),
+            None => println!("    {src:<src_width$} {verb} {dst}", src = r.src, dst = r.dst),
+        }
+    }
+}
+
+/// One line of the `'git push'` block.
+struct PushRow {
+    /// The key git sorts on: the source ref, so a deletion sorts first.
+    sort: String,
+    /// The source as displayed: the ref name, or `(none)` for a deletion in the
+    /// queried form and `(delete)` in the `-n` one.
+    src: String,
+    /// What the source column is *measured* by. git stores a deletion under the
+    /// key `(delete)` and prints `(none)` in its place, so the column keeps the
+    /// wider of the two even when only the shorter one is shown.
+    width_key: String,
+    forced: bool,
+    dst: String,
+    /// `None` under `-n`, where no status was queried.
+    status: Option<&'static str>,
+}
+
+/// `get_push_ref_states()`: pair each local ref the push refspecs select with the
+/// remote ref it would update, and say what the update would be.
+///
+/// With no configured refspec the default is `match_push_refs(..., MATCH_REFS_NONE)`,
+/// which pairs local branches with *already existing* same-named remote refs and
+/// leaves a local-only branch out — the same set a bare `git push` would send.
+fn push_states(
+    repo: &gix::Repository,
+    specs: &[String],
+    map: &gix::remote::fetch::RefMap,
+) -> Vec<PushRow> {
+    // What the remote advertises, by full ref name.
+    let remote: std::collections::BTreeMap<String, gix::hash::ObjectId> = map
+        .remote_refs
         .iter()
-        .map(|spec| {
+        .filter_map(|r| {
+            let (name, target, peeled) = r.unpack();
+            Some((name.to_str_lossy().into_owned(), peeled.or(target)?.to_owned()))
+        })
+        .collect();
+    // Local branches, by full ref name.
+    let mut local: Vec<(String, gix::hash::ObjectId)> = Vec::new();
+    if let Ok(refs) = repo.references() {
+        if let Ok(iter) = refs.prefixed("refs/heads/") {
+            for r in iter.filter_map(Result::ok) {
+                let name = r.name().as_bstr().to_str_lossy().into_owned();
+                if let Some(id) = r.try_id() {
+                    local.push((name, id.detach()));
+                }
+            }
+        }
+    }
+
+    let mut rows: Vec<PushRow> = Vec::new();
+    if specs.is_empty() {
+        // The matching default.
+        for (name, new) in &local {
+            let Some(old) = remote.get(name) else { continue };
+            let shown = abbrev_branch(name.as_bytes().as_bstr());
+            rows.push(PushRow {
+                sort: name.clone(),
+                width_key: shown.clone(),
+                src: shown.clone(),
+                forced: false,
+                dst: shown,
+                status: Some(push_status(repo, Some(*old), Some(*new))),
+            });
+        }
+    } else {
+        for spec in specs {
             let forced = spec.starts_with('+');
             let body = spec.strip_prefix('+').unwrap_or(spec);
             let (src, dst) = match body.split_once(':') {
                 Some((s, d)) => (s.to_string(), d.to_string()),
                 None => (body.to_string(), body.to_string()),
             };
-            let shown = if src.is_empty() {
-                "(delete)".to_string()
-            } else {
-                src.clone()
-            };
-            let verb = if forced { "forces to" } else { "pushes to" };
-            (src, shown, verb, dst)
-        })
-        .collect();
-    rows.sort_by(|a, b| a.0.cmp(&b.0));
-
-    if rows.len() == 1 {
-        println!("  Local ref configured for 'git push' (status not queried):");
-    } else {
-        println!("  Local refs configured for 'git push' (status not queried):");
+            if src.is_empty() {
+                // A deletion refspec: the destination goes away.
+                let full_dst = full_head_name(&dst);
+                rows.push(PushRow {
+                    sort: String::new(),
+                    width_key: "(delete)".into(),
+                    src: "(none)".into(),
+                    forced,
+                    dst: abbrev_branch(full_dst.as_bytes().as_bstr()),
+                    status: Some("delete"),
+                });
+                continue;
+            }
+            // A pattern refspec expands to one row per matching local ref.
+            if let (Some(src_stem), Some(dst_stem)) = (src.strip_suffix('*'), dst.strip_suffix('*')) {
+                for (name, new) in &local {
+                    let Some(tail) = name.strip_prefix(src_stem) else { continue };
+                    let full_dst = format!("{dst_stem}{tail}");
+                    let old = remote.get(&full_dst).copied();
+                    let shown = abbrev_branch(name.as_bytes().as_bstr());
+                    rows.push(PushRow {
+                        sort: name.clone(),
+                        width_key: shown.clone(),
+                        src: shown,
+                        forced,
+                        dst: abbrev_branch(full_dst.as_bytes().as_bstr()),
+                        status: Some(push_status(repo, old, Some(*new))),
+                    });
+                }
+                continue;
+            }
+            let full_src = full_head_name(&src);
+            let full_dst = full_head_name(&dst);
+            let new = local.iter().find(|(n, _)| *n == full_src).map(|(_, id)| *id);
+            let old = remote.get(&full_dst).copied();
+            let shown = abbrev_branch(full_src.as_bytes().as_bstr());
+            rows.push(PushRow {
+                sort: full_src.clone(),
+                width_key: shown.clone(),
+                src: shown,
+                forced,
+                dst: abbrev_branch(full_dst.as_bytes().as_bstr()),
+                status: Some(push_status(repo, old, new)),
+            });
+        }
     }
-    let width = rows
-        .iter()
-        .map(|(_, shown, _, _)| shown.chars().count())
-        .max()
-        .unwrap_or(0);
-    for (_, shown, verb, dst) in &rows {
-        println!("    {shown:<width$} {verb} {dst}");
+    rows.sort_by(|a, b| a.sort.cmp(&b.sort));
+    rows
+}
+
+/// A short ref name as a full one, when it is not already qualified.
+fn full_head_name(name: &str) -> String {
+    if name.starts_with("refs/") {
+        name.to_owned()
+    } else {
+        format!("refs/heads/{name}")
+    }
+}
+
+/// `get_push_ref_states()`'s five verdicts, in its order of testing.
+fn push_status(
+    repo: &gix::Repository,
+    old: Option<gix::hash::ObjectId>,
+    new: Option<gix::hash::ObjectId>,
+) -> &'static str {
+    let Some(old) = old else { return "create" };
+    let Some(new) = new else { return "delete" };
+    if old == new {
+        return "up to date";
+    }
+    // `ref_newer()`: the update fast-forwards when the remote tip is an ancestor
+    // of the local one. An old tip this repository does not have cannot be
+    // compared, and git calls that out of date.
+    let fast_forward = repo.find_object(old).is_ok()
+        && repo
+            .merge_base(new, old)
+            .map(|base| base.detach() == old)
+            .unwrap_or(false);
+    if fast_forward {
+        "fast-forwardable"
+    } else {
+        "local out of date"
     }
 }
 
@@ -1387,7 +1556,15 @@ fn remote_branch_states(
 
     // Each mapping is a remote ref the fetch refspecs selected; it is `tracked`
     // when its local counterpart already exists, else `new`.
+    //
+    // `get_ref_states()` walks `get_fetch_map(remote_refs, remote->fetch, …)`,
+    // which is the remote's *configured* refspecs and nothing else. gitoxide adds
+    // an implicit tag refspec on top (the `tagOpt` default), and its mappings must
+    // be left out or every advertised tag would be listed as a remote branch.
     for m in &map.mappings {
+        if m.spec_index.implicit_index().is_some() {
+            continue;
+        }
         let Some(remote_name) = m.remote.as_name() else {
             continue;
         };
@@ -1594,9 +1771,16 @@ fn query_ref_map(repo: &gix::Repository, name: &str) -> Result<gix::remote::fetc
             ..Default::default()
         },
     )?;
+    // `transport_get_remote_refs()` asks for the *whole* advertisement: `show`
+    // needs `HEAD` to report the remote's HEAD branch, and the refspec-derived
+    // `ref-prefix` filter would hide it (the fetch refspec only names
+    // `refs/heads/`). git sends no prefixes at all here.
     let (map, _handshake) = connection.ref_map(
         gix::progress::Discard,
-        gix::remote::ref_map::Options::default(),
+        gix::remote::ref_map::Options {
+            prefix_from_spec_as_filter_on_remote: false,
+            ..Default::default()
+        },
     )?;
     Ok(map)
 }

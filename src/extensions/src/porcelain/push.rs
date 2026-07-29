@@ -694,18 +694,30 @@ fn build_requests(
             bail!("--mirror can't be combined with refspecs");
         }
         for r in repo.references()?.all()? {
-            let r = r.map_err(|e| anyhow!("{e}"))?;
+            let mut r = r.map_err(|e| anyhow!("{e}"))?;
             let name = r.name().as_bstr().to_str().map_err(|e| anyhow!("{e}"))?.to_string();
             // Only real refs under refs/ travel: HEAD and other root refs are not
             // part of the mirror set.
-            if !name.starts_with("refs/") {
+            let Some(tail) = name.strip_prefix("refs/") else { continue };
+            // `update()` on the receiving end refuses a name whose part after
+            // `refs/` is not a valid refname (`check_refname_format(name + 5, 0)`,
+            // receive-pack.c:1096) — a one-level name such as `refs/stash` is a
+            // "funny refname" there. git's matching pass leaves such a ref out
+            // rather than pushing it to be rejected, so `--mirror` does not carry
+            // `refs/stash`.
+            if !super::check_ref_format::check_refname_format(tail.as_bytes(), 0) {
                 continue;
             }
-            if let Some(id) = r.try_id() {
+            // A symbolic ref (`refs/remotes/<remote>/HEAD`, which a clone writes)
+            // is mirrored as the object it resolves to; `try_id()` alone would skip
+            // it, since a symref holds no id of its own.
+            if let Some(id) = r.try_id().map(|id| id.detach()).or_else(|| {
+                r.peel_to_id().ok().map(|id| id.detach())
+            }) {
                 requests.push(Request {
                     src: Some(name.clone()),
                     name,
-                    new: id.detach(),
+                    new: id,
                     force: true,
                     expected: None,
                     only_if_absent: false, check_reachable: None, explicit_delete: false,
@@ -769,9 +781,12 @@ fn build_requests(
                 expected: None,
                 only_if_absent: false,
                 check_reachable: None,
-                // The `--delete` spelling, which git fails when the remote does
-                // not advertise the ref.
-                explicit_delete: true,
+                // `match_explicit()`: a destination that matches no advertised ref
+                // is turned into a new linked ref when it is `refs/`-qualified —
+                // the delete then goes out and the server answers it — and is an
+                // error only when it is not, because there is nothing to qualify
+                // it with (remote.c:1152-1163).
+                explicit_delete: !spec.starts_with("refs/"),
             });
         }
         return Ok((requests, upstreams));
@@ -930,7 +945,15 @@ fn parse_refspec(
             new,
             force,
             expected: None,
-            only_if_absent: false, check_reachable: None, explicit_delete: false,
+            only_if_absent: false,
+            check_reachable: None,
+            // `:<dst>` is `--delete <dst>` written the other way round
+            // (git-push(1): "--delete … is the same as prefixing the refname with
+            // a colon"), and both take the same `match_explicit()` branch: an
+            // unadvertised destination is an error when it is unqualified and a
+            // blind delete when it is `refs/`-qualified.
+            explicit_delete: src.is_empty()
+                && !dst_spec.is_some_and(|d| d.starts_with("refs/")),
         },
         upstream,
     ))
@@ -1188,6 +1211,12 @@ fn report(outcome: &push_proto::Outcome, verbose: bool) -> Result<ExitCode> {
                     eprintln!(" = [up to date]      {src_dst}");
                 }
             }
+            // `print_ok_ref_status()` tests `ref->deletion` first, which is what
+            // keeps a delete of a ref the remote never had — old and new both
+            // null — from being announced as a new branch.
+            Ok(()) if s.new.is_null() => {
+                eprintln!(" - [deleted]         {}", short_ref(dst));
+            }
             Ok(()) if s.old.is_null() => {
                 // git names the created ref by its namespace: a branch, a tag, or
                 // — for anything else, notes and remote-tracking refs included,
@@ -1205,9 +1234,6 @@ fn report(outcome: &push_proto::Outcome, verbose: bool) -> Result<ExitCode> {
                 // enough for the difference between padding and a fixed run of
                 // spaces to show.
                 eprintln!(" * {kind:<17} {src_dst}");
-            }
-            Ok(()) if s.new.is_null() => {
-                eprintln!(" - [deleted]         {}", short_ref(dst));
             }
             Ok(()) => {
                 // `print_ok_ref_status`: a forced update is `+` with `...` between
@@ -1230,7 +1256,15 @@ fn report(outcome: &push_proto::Outcome, verbose: bool) -> Result<ExitCode> {
                 // git colors the padded summary field alone (`color.transport` /
                 // `color.transport.rejected`), leaving the space before the
                 // refspec outside the span.
-                let summary = super::color::PushColors::paint(&colors.rejected, "! [rejected]       ");
+                // `print_one_push_status()`: a refusal that came back from the
+                // server is `[remote rejected]`; one this side decided is
+                // `[rejected]`. Both are padded to `TRANSPORT_SUMMARY_WIDTH`.
+                let label = if s.remote_rejected {
+                    "! [remote rejected]"
+                } else {
+                    "! [rejected]       "
+                };
+                let summary = super::color::PushColors::paint(&colors.rejected, label);
                 eprintln!(" {summary} {src_dst} ({reason})");
             }
         }
@@ -1359,6 +1393,7 @@ fn report_porcelain(outcome: &push_proto::Outcome) -> Result<ExitCode> {
         let refpair = format!("{}:{}", s.src.as_deref().unwrap_or(&s.name), dst);
         match &s.result {
             Ok(()) if s.up_to_date => println!("=\t{refpair}\t[up to date]"),
+            Ok(()) if s.new.is_null() => println!("-\t:{dst}\t[deleted]"),
             Ok(()) if s.old.is_null() => {
                 let kind = if dst.starts_with("refs/tags/") {
                     "[new tag]"
@@ -1367,7 +1402,6 @@ fn report_porcelain(outcome: &push_proto::Outcome) -> Result<ExitCode> {
                 };
                 println!("*\t{refpair}\t{kind}");
             }
-            Ok(()) if s.new.is_null() => println!("-\t:{dst}\t[deleted]"),
             Ok(()) => {
                 let flag = if s.forced { "+" } else { " " };
                 let sep = if s.forced { "..." } else { ".." };
@@ -1375,7 +1409,8 @@ fn report_porcelain(outcome: &push_proto::Outcome) -> Result<ExitCode> {
             }
             Err(reason) => {
                 any_failed = true;
-                println!("!\t{refpair}\t[rejected] ({reason})");
+                let label = if s.remote_rejected { "[remote rejected]" } else { "[rejected]" };
+                println!("!\t{refpair}\t{label} ({reason})");
             }
         }
     }

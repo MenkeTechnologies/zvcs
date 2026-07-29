@@ -842,7 +842,12 @@ fn setup_with_upstream(repo: &gix::Repository) -> std::result::Result<Vec<String
 }
 
 fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
-    let repo = gix::discover(".")?;
+    let mut repo = gix::discover(".")?;
+    // Moving `HEAD` writes a reflog, and a fast-forward has already touched the
+    // worktree by then — a failure there would leave the merge half-applied. git
+    // synthesizes an identity for reflog purposes rather than failing.
+    crate::ensure_reflog_identity(&mut repo);
+    let repo = repo;
 
     if repo.git_dir().join("MERGE_HEAD").exists() {
         eprintln!("fatal: You have not concluded your merge (MERGE_HEAD exists).");

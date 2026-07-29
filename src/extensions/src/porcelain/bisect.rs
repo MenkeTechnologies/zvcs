@@ -37,10 +37,14 @@
 //! The terminal report reproduces `git diff-tree --pretty --stat --summary`,
 //! including git's diffstat column scaling and truncation.
 //!
+//! A range containing merges is bisected the way git does it: `find_bisection()`
+//! weights every candidate by how many candidates it reaches, then returns the
+//! first commit that is *halfway* (`|2 * weight - nr| <= 1`). Two details of that
+//! search decide which of several equally good candidates is picked, and both are
+//! reproduced — the list is walked oldest first, and a commit seeded with weight 1
+//! because it has no interesting parent is never offered to the halfway shortcut.
+//!
 //! Honest limitations — each bails with a precise message rather than guessing:
-//!   * Merge commits inside the bisect range. git's weight propagation for
-//!     multi-parent commits is not reproduced here, so a non-linear range would
-//!     pick a different midpoint; that is refused instead.
 //!   * `skip` and `run`: git chooses a skip replacement through its weighted
 //!     `find_bisection`/`skip_away` PRNG, whose exact commit sequence is not
 //!     reproduced; `run` depends on that for exit code 125.
@@ -984,16 +988,16 @@ fn take_step(
         }
     }
 
-    let chain = candidate_chain(ctx, bad, &goods)?;
-    let n = chain.len();
-    let reaches = choose_weight(n);
-    // `chain` is newest-first; a weight of `w` is the w-th commit from the old end.
-    let best = chain[n - reaches];
+    let candidates = candidate_list(ctx, bad, &goods)?;
+    let n = candidates.len();
+    let (best, reaches) = find_bisection(ctx, &candidates)?;
 
     if best == bad {
         return report_first_bad(ctx, bad, terms);
     }
 
+    // `bisect_rev_setup()` prints how many candidates remain *after* the one about
+    // to be tested: everything it reaches, minus itself.
     let left = n - reaches - 1;
     let steps = estimate_bisect_steps(n);
     println!(
@@ -1014,8 +1018,8 @@ fn take_step(
 }
 
 /// git's `check_merge_bases`: when a good end is not an ancestor of the bad one,
-/// the true merge base(s) must be resolved before the range is linear enough to
-/// bisect. For each merge base of `bad` against the goods:
+/// the true merge base(s) must be resolved before the range can be bisected. For
+/// each merge base of `bad` against the goods:
 ///   * if it equals `bad`, the sides are inconsistent — `handle_bad_merge_base`;
 ///   * if it is already a good, it needs no test;
 ///   * otherwise it is checked out with `Bisecting: a merge base must be tested`.
@@ -1112,72 +1116,176 @@ fn is_expected_rev(ctx: &Ctx, id: ObjectId) -> Result<bool> {
 }
 
 /// The commits still under suspicion — reachable from `bad`, not from any good —
-/// ordered newest first, `chain[0] == bad`.
-///
-/// Only linear ranges are accepted: git's weight propagation across merges is not
-/// reproduced here, and guessing it would pick a different midpoint.
-fn candidate_chain(ctx: &Ctx, bad: ObjectId, goods: &[ObjectId]) -> Result<Vec<ObjectId>> {
-    let mut set = std::collections::HashSet::new();
+/// in the order git's revision walk yields them (newest first, `list[0] == bad`).
+fn candidate_list(ctx: &Ctx, bad: ObjectId, goods: &[ObjectId]) -> Result<Vec<ObjectId>> {
+    let mut list = Vec::new();
     for info in ctx
         .repo
         .rev_walk(Some(bad))
         .with_hidden(goods.to_vec())
         .all()?
     {
-        set.insert(info?.id);
+        list.push(info?.id);
     }
-    if set.is_empty() {
+    if list.is_empty() {
         bail!("no testable commit found between the marked revisions");
     }
-
-    let mut chain = vec![bad];
-    let mut cur = bad;
-    loop {
-        let commit = ctx.repo.find_object(cur)?.try_into_commit()?;
-        let parents: Vec<ObjectId> = commit.parent_ids().map(|p| p.detach()).collect();
-        if parents.len() > 1 {
-            bail!(
-                "merge commit {} is inside the bisect range; only linear ranges are supported",
-                cur.to_hex()
-            );
-        }
-        match parents.first() {
-            Some(p) if set.contains(p) => {
-                chain.push(*p);
-                cur = *p;
-            }
-            _ => break,
-        }
-    }
-    if chain.len() != set.len() {
-        bail!(
-            "the bisect range is not linear ({} candidates reachable, {} on the first-parent \
-             chain); only linear ranges are supported",
-            set.len(),
-            chain.len()
-        );
-    }
-    Ok(chain)
+    Ok(list)
 }
 
-/// The weight (number of candidates reachable from it, itself included) of the
-/// commit git's `find_bisection()` picks out of `n` linear candidates.
+/// `find_bisection()` (bisect.c:240-317): pick the commit that splits the
+/// candidate set most evenly, and say how many candidates it reaches.
 ///
-/// git assigns weight 1 to the oldest candidate up front, then walks the rest in
-/// ancestor order and returns the first one that is "halfway" —
-/// `|2 * weight - n| <= 1` — before ever running the best-distance scan. With no
-/// halfway commit (`n <= 2`) the scan runs and picks the oldest candidate.
-fn choose_weight(n: usize) -> usize {
-    if n <= 2 {
-        return 1;
+/// The weight of a candidate is how many candidates it can reach, itself
+/// included. git computes those by propagating along the ancestry — a commit with
+/// one interesting parent inherits its parent's weight plus one, a merge is
+/// counted outright — and then walks the list looking for a commit that is
+/// *halfway*: `|2 * weight - nr| <= 1`. The first such commit wins immediately;
+/// with none (a set too small to have one), the commit whose
+/// `min(weight, nr - weight)` is largest does.
+///
+/// The weights here are computed by reachability over the candidate subgraph,
+/// oldest first, which is the same number git's propagation arrives at and is
+/// exact for a merge as well as for a chain.
+fn find_bisection(ctx: &Ctx, list: &[ObjectId]) -> Result<(ObjectId, usize)> {
+    let nr = list.len();
+    let index: std::collections::HashMap<ObjectId, usize> =
+        list.iter().enumerate().map(|(i, id)| (*id, i)).collect();
+
+    // Parents that are themselves candidates, by list position.
+    let mut parents: Vec<Vec<usize>> = Vec::with_capacity(nr);
+    for id in list {
+        let commit = ctx.repo.find_object(*id)?.try_into_commit()?;
+        parents.push(
+            commit
+                .parent_ids()
+                .filter_map(|p| index.get(&p.detach()).copied())
+                .collect(),
+        );
     }
-    for w in 2..=n {
-        let d = 2 * w as i64 - n as i64;
-        if (-1..=1).contains(&d) {
-            return w;
+
+    // `reach[i]` is the set of candidates commit `i` can reach, as a bitset.
+    //
+    // The list is in commit-date order, which is *not* a topological order — with
+    // equal dates a parent can be listed before its child — so the sets are filled
+    // by an explicit post-order walk rather than by iterating the list. This is
+    // what git's repeated propagation loop achieves by re-scanning until every
+    // weight is known.
+    let words = nr.div_ceil(64);
+    let mut reach = vec![0u64; nr * words];
+    let mut done = vec![false; nr];
+    for root in 0..nr {
+        if done[root] {
+            continue;
+        }
+        let mut stack = vec![(root, false)];
+        while let Some((i, expanded)) = stack.pop() {
+            if done[i] {
+                continue;
+            }
+            if !expanded {
+                stack.push((i, true));
+                for &p in &parents[i] {
+                    if !done[p] {
+                        stack.push((p, false));
+                    }
+                }
+                continue;
+            }
+            // Every parent is finished by now: union their sets into this one.
+            let (before, rest) = reach.split_at_mut(i * words);
+            let (mine, after) = rest.split_at_mut(words);
+            mine[i / 64] |= 1u64 << (i % 64);
+            for &p in &parents[i] {
+                let src = if p > i {
+                    &after[(p - i - 1) * words..(p - i) * words]
+                } else {
+                    &before[p * words..(p + 1) * words]
+                };
+                for (dst, s) in mine.iter_mut().zip(src) {
+                    *dst |= *s;
+                }
+            }
+            done[i] = true;
         }
     }
-    1
+    let weights: Vec<usize> = (0..nr)
+        .map(|i| reach[i * words..(i + 1) * words].iter().map(|w| w.count_ones() as usize).sum())
+        .collect();
+
+    // `do_find_bisection()` (bisect.c:130-217), simulated in its own order because
+    // the order decides which of several equally good candidates is returned.
+    //
+    // git walks the list *reversed* (`find_bisection()` turns it round while
+    // counting), seeds every commit that has no interesting parent with weight 1,
+    // and then loops over the rest until each one's weight is known — a commit
+    // with one interesting parent inherits `parent + 1`, a merge is counted
+    // outright. The halfway shortcut is tested only where a weight is *derived*,
+    // never on the seeded ones, which is why a three-commit range returns the
+    // middle commit rather than the oldest.
+    const PENDING_ONE: i64 = -1;
+    const PENDING_MERGE: i64 = -2;
+    let mut w: Vec<i64> = vec![0; nr];
+    let mut counted = 0usize;
+    let order: Vec<usize> = (0..nr).rev().collect();
+    for &i in &order {
+        w[i] = match parents[i].len() {
+            0 => {
+                counted += 1;
+                1
+            }
+            1 => PENDING_ONE,
+            _ => PENDING_MERGE,
+        };
+    }
+    let halfway = |weight: i64| (-1..=1).contains(&(2 * weight - nr as i64));
+    while counted < nr {
+        let mut progress = false;
+        for &i in &order {
+            match w[i] {
+                PENDING_MERGE => {
+                    // `count_distance()`: walk from the merge and count what it
+                    // reaches, which is exactly the reachability computed above.
+                    w[i] = weights[i] as i64;
+                    counted += 1;
+                    progress = true;
+                    if halfway(w[i]) {
+                        return Ok((list[i], weights[i]));
+                    }
+                }
+                PENDING_ONE => {
+                    let p = parents[i][0];
+                    if w[p] < 0 {
+                        continue;
+                    }
+                    w[i] = w[p] + 1;
+                    counted += 1;
+                    progress = true;
+                    if halfway(w[i]) {
+                        return Ok((list[i], w[i] as usize));
+                    }
+                }
+                _ => {}
+            }
+        }
+        if !progress {
+            break;
+        }
+    }
+
+    // Nothing was halfway: the commit whose `min(weight, nr - weight)` is largest,
+    // scanned in the same reversed order.
+    let mut best = (list[order[0]], weights[order[0]]);
+    let mut best_distance = -1i64;
+    for &i in &order {
+        let weight = weights[i] as i64;
+        let distance = weight.min(nr as i64 - weight);
+        if distance > best_distance {
+            best_distance = distance;
+            best = (list[i], weights[i]);
+        }
+    }
+    Ok(best)
 }
 
 /// git's `estimate_bisect_steps`.

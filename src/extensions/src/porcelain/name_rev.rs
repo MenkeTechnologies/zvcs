@@ -35,8 +35,19 @@
 //!
 //! One further tie-break is git's and not reproducible in principle: `name_tips`
 //! orders the tip table with `QSORT`, which is unstable, so tips with the same
-//! `from_tag` and the same tagger date are visited in an order libc chooses. The
-//! stable sort used here is one of the orders git may pick.
+//! `from_tag` and the same tagger date are visited in an order libc chooses, and
+//! whichever is visited first claims the commit (`is_better_name` ends with "keep
+//! the current one if we cannot decide"). The stable sort used here is one of the
+//! orders git may pick.
+//!
+//! Measured, so that a future reader does not mistake this for a bug worth
+//! chasing: in a repository whose only tie group is `main`, `remotes/origin/main`
+//! and `remotes/origin/HEAD` all at one commit, stock git 2.50.1 answers `main` —
+//! and answers `remotes/origin/main` for the *same* tie group once five unrelated
+//! refs pointing at a different commit exist, because the larger array permutes
+//! differently under the same `QSORT`. The tie group did not change; only the
+//! array around it did. Matching that would mean porting one libc's qsort, and
+//! the answer would then disagree with stock git built against another.
 
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};

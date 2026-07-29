@@ -633,7 +633,9 @@ fn checkout_head_in_place(repo: &gix::Repository, quiet: bool, force: bool) -> R
 /// requirement with `reset_tree()`, which is also why an already-current branch
 /// still does work — `merge_working_tree()` runs before
 /// `update_refs_for_switch()` decides there is no ref to move.
-fn switch_to_branch(
+/// Shared with `rebase <upstream> <branch>`, which checks the branch out before
+/// replaying onto it — quietly, since git's rebase prints no switch message.
+pub(crate) fn switch_to_branch(
     repo: &gix::Repository,
     spec: &str,
     quiet: bool,

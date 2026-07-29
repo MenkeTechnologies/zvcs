@@ -132,26 +132,18 @@
 //! * Tree-object pairs (`040000` on either side) are rejected with `tree objects not
 //!   supported`, exit 128 — this matches stock git's `builtin/diff-pairs.c`, which dies
 //!   with the same message rather than recursing.
-//! * `--binary`: the `GIT binary patch` payload is a base85-armoured *deflate* stream,
-//!   and parity means byte-identical output. The only deflate in this tree is `zlib-rs`
-//!   (through `gix-zlib`), which is not stream-compatible with the zlib git links
-//!   against. Measured by writing the same 191544-byte blob with `hash-object
-//!   --no-filters -w` under both binaries at three `core.compression` settings — the
-//!   same `git_deflate_init(&stream, cfg->zlib_compression_level)` call `--binary`
-//!   makes, whose default is `Z_BEST_SPEED`:
-//!
-//!   | level | stock | this tree | `zlib.compress` | stock == zlib |
-//!   |---|---|---|---|---|
-//!   | 1 (the `--binary` default) | 65258 | 86833 | 65258 | yes |
-//!   | 6 | 48777 | 51638 | 48777 | yes |
-//!   | 9 | 49034 | 49037 | 49034 | yes |
-//!
-//!   Stock's object is byte-identical to zlib's output at every level and this tree's
-//!   is identical at none of them, diverging at byte 3 (level 1), 4 (level 6) and 1472
-//!   (level 9). Byte-exact `--binary` therefore needs either a faithful port of
-//!   zlib's `deflate.c`/`trees.c` or a link against C zlib; emitting a *valid* binary
-//!   patch is easy and emitting git's is not, so this bails rather than printing a
-//!   payload that differs from stock on every input.
+//! * `--binary`: the `GIT binary patch` payload is a base85-armoured *deflate*
+//!   stream, and parity means byte-identical output. This bails today, but the
+//!   blocker named here for a long time — "no deflate in this tree matches the zlib
+//!   git links against" — is **no longer true**, and the measurement that
+//!   established it was of the wrong coder. `gix-zlib` (zlib-rs) does not match:
+//!   writing one 1184922-byte blob with `hash-object --no-filters -w` gives 128323
+//!   bytes here against stock's 93551, which is C zlib's level-1 output exactly.
+//!   But `archive.rs`'s `gzip` module is a port of zlib's own `deflate.c` +
+//!   `trees.c`, and it *does* match: `git archive --format=tgz -1/-6/-9` over a
+//!   ~1 MB payload is byte-identical to stock git 2.50.1 at every level. Wiring
+//!   that coder up with a zlib wrapper (rather than gzip's) is what `--binary`
+//!   needs; the base85 armour and the `literal <size>` framing are the rest.
 //! * `--anchored=<text>`: git's own documentation states it "uses the "patience diff"
 //!   algorithm internally", and the vendored `gix-imara-diff` ships only `myers.rs` and
 //!   `histogram.rs`. Same floor as `--patience` below.

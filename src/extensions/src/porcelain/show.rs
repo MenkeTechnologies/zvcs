@@ -571,6 +571,7 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
                 let info = info?;
                 let commit = repo.find_object(info.id)?.try_into_commit()?;
                 nodes.push(super::log::Node {
+                    follow_path: None,
                     id: info.id,
                     parents: commit.parent_ids().map(|p| p.detach()).collect(),
                     time: commit.time()?.seconds,

@@ -121,11 +121,6 @@
 //!
 //! * Color in any form: `--color`, `--color=always`, and `--dual-color` (which
 //!   upstream uses to *force* color on). The dual-color markup is not ported.
-//! * A repository carrying a `refs/notes/commits` ref, unless `--no-notes` was
-//!   given — upstream asks `git log` to show notes by default, so a note would
-//!   silently change the compared text. `--notes` and `--no-notes` themselves
-//!   are honoured; only the *rendering* of an existing note is unported, so a
-//!   repository without notes emits normally under either flag.
 //! * `--diff-merges=<format>` / `--remerge-diff` (merges are ignored here, which
 //!   is the default upstream behaviour), a magic or wildcard pathspec, and every
 //!   other `git diff` option upstream forwards to the inner patches.
@@ -605,16 +600,23 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
         Err(reason) => bail!("{reason}"),
     };
 
-    if opts.notes && repo.try_find_reference("refs/notes/commits")?.is_some() {
-        bail!(
-            "this repository has a refs/notes/commits ref; `git range-diff` shows notes \
-             by default and note rendering is not ported"
-        );
-    }
 
     let mailmap = repo.open_mailmap();
-    let mut a = read_patches(&repo, ends1, &mailmap, matcher.as_ref(), &opts.abbrev)?;
-    let mut b = read_patches(&repo, ends2, &mailmap, matcher.as_ref(), &opts.abbrev)?;
+    // `--notes`/`--no-notes` are passed straight to the `git log` upstream runs;
+    // with notes on, the display refs are the same ones `git log` would use.
+    let notes = if opts.notes {
+        // `git log --notes` with no ref: the default tree plus whatever
+        // `notes.displayRef`/`GIT_NOTES_DISPLAY_REF` add, which `enable_default()`
+        // sets up.
+        let mut opt = super::notes::DisplayOpt::default();
+        opt.enable_default();
+        opt.given = true;
+        super::notes::load_display(&repo, &opt)?
+    } else {
+        Vec::new()
+    };
+    let mut a = read_patches(&repo, ends1, &mailmap, matcher.as_ref(), &opts.abbrev, &notes)?;
+    let mut b = read_patches(&repo, ends2, &mailmap, matcher.as_ref(), &opts.abbrev, &notes)?;
 
     find_exact_matches(&mut a, &mut b);
     get_correspondences(&mut a, &mut b, opts.creation_factor);
@@ -1150,6 +1152,7 @@ fn read_patches(
     mailmap: &gix::mailmap::Snapshot,
     matcher: Option<&PathMatcher>,
     abbrev: &Abbrev,
+    notes: &[super::notes::Tree],
 ) -> Result<Vec<Patch>> {
     let ids = ordered_commits(repo, tips, hidden)?;
     let mut out = Vec::with_capacity(ids.len());
@@ -1159,7 +1162,7 @@ fn read_patches(
     // index as patches are kept, not from the pre-filter walk position.
     let mut index = 0usize;
     for id in ids {
-        if let Some(patch) = build_patch(repo, id, index, mailmap, matcher, abbrev)? {
+        if let Some(patch) = build_patch(repo, id, index, mailmap, matcher, abbrev, notes)? {
             out.push(patch);
             index += 1;
         }
@@ -1237,6 +1240,7 @@ fn ordered_commits(
 /// Build the canonical patch text of one commit, or `None` when a pathspec is
 /// in force and the commit touches no matching path — the case `git log -- …`
 /// omits from the range entirely.
+#[allow(clippy::too_many_arguments)]
 fn build_patch(
     repo: &gix::Repository,
     id: ObjectId,
@@ -1244,6 +1248,7 @@ fn build_patch(
     mailmap: &gix::mailmap::Snapshot,
     matcher: Option<&PathMatcher>,
     abbrev: &Abbrev,
+    notes: &[super::notes::Tree],
 ) -> Result<Option<Patch>> {
     let commit = repo.find_object(id)?.try_into_commit()?;
 
@@ -1273,6 +1278,23 @@ fn build_patch(
             text.extend_from_slice(&line);
         }
         text.push(b'\n');
+    }
+
+    // ` ## Notes ##` — upstream generates each patch with `git log --notes`, so a
+    // note becomes part of the compared text, indented like the message and
+    // separated from it by a blank line.
+    if !notes.is_empty() {
+        let note = super::notes::format_display(repo, notes, id, true)?;
+        if !note.is_empty() {
+            text.extend_from_slice(b"\n\n ## Notes ##\n");
+            for line in message_lines(gix::bstr::BStr::new(&note)) {
+                if !line.is_empty() {
+                    text.extend_from_slice(b"    ");
+                    text.extend_from_slice(&line);
+                }
+                text.push(b'\n');
+            }
+        }
     }
 
     // One ` ## <path> ##` section per changed file, in path order — the order

@@ -93,9 +93,10 @@
 //!   already in `<upstream>` *before* the sheet is written, announcing it with
 //!   `warning: skipped previously applied commit <abbrev>`. Deciding that needs
 //!   a patch id per commit and nothing vendored computes one, so such a commit
-//!   stays in the sheet and is instead dropped where its pick turns out to
-//!   change nothing — same wording, but at the pick rather than up front, and
-//!   with no `use --reapply-cherry-picks` advice.
+//!   stays in the sheet and is dropped in the pick loop instead — by git's own
+//!   `drop_redundant_commits`, with its `dropping <oid> <subject> -- patch
+//!   contents already upstream` line. The visible difference is the step count:
+//!   the sheet still holds the commit, so the progress line counts it.
 //! * `-v`/`--verbose` past the up-to-date exit. `-v` prints the upstream diffstat
 //!   *and* a second, post-replay diffstat the sequencer emits in verbose mode;
 //!   only the first is ported, so `-v` is rejected with a message naming the
@@ -1085,11 +1086,11 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
     if head.is_unborn() {
         bail!("cannot rebase an unborn branch");
     }
-    let head_oid = head
+    let mut head_oid = head
         .id()
         .ok_or_else(|| anyhow!("HEAD does not point to a commit"))?
         .detach();
-    let branch: Option<FullName> = head.referent_name().map(std::borrow::ToOwned::to_owned);
+    let mut branch: Option<FullName> = head.referent_name().map(std::borrow::ToOwned::to_owned);
     drop(head);
 
     // --- <upstream> --------------------------------------------------------
@@ -1151,14 +1152,16 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
     };
 
     // --- <branch> ----------------------------------------------------------
-    // git checks out `<branch>` before rebasing. That checkout is out of scope
-    // here, so only the already-current branch is accepted — but the argument is
-    // still validated the way git validates it, in git's order.
+    // `cmd_rebase()`: a `<branch>` that is not the current one is checked out
+    // first (`options.switch_to`), silently — the rebase's own messages are the
+    // only ones printed. Everything below then works off the new `HEAD`.
     let branch_arg = if root {
         positional.first()
     } else {
         positional.get(1)
     };
+    // `options.switch_to`: the branch to check out once the tree is known clean.
+    let mut switch_to: Option<String> = None;
     let branch_name = match branch_arg {
         Some(requested) => {
             let is_branch = repo
@@ -1171,9 +1174,19 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
             }
             let current = branch.as_ref().map(|b| b.shorten().to_string());
             if current.as_deref() != Some(requested.as_str()) {
-                bail!(
-                    "rebasing a branch other than the checked-out one requires a checkout; run `git switch {requested}` first"
-                );
+                if !is_branch {
+                    // git only switches to a *branch*; a bare commit-ish is
+                    // resolved as the thing to rebase, with `HEAD` left alone.
+                    die!("no such branch/commit '{requested}'");
+                }
+                // Everything below rebases `<branch>`, so its tip stands in for
+                // `HEAD` right away. The worktree switch itself waits until after
+                // `require_clean_work_tree()`, which git runs first — a dirty tree
+                // must produce git's refusal, not the checkout's.
+                head_oid = peel_to_commit(&repo, requested)
+                    .ok_or_else(|| anyhow!("no such branch/commit '{requested}'"))?;
+                branch = Some(FullName::try_from(format!("refs/heads/{requested}"))?);
+                switch_to = Some(requested.clone());
             }
             requested.clone()
         }
@@ -1266,6 +1279,13 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::from(1));
     }
 
+    // `cmd_rebase()`: with the tree known clean, check out the `<branch>` that is
+    // about to be rebased. git does this silently — the rebase's own messages are
+    // the only ones printed.
+    if let Some(requested) = &switch_to {
+        super::checkout::switch_to_branch(&repo, requested, true, false)?;
+    }
+
     // --- can_fast_forward() ------------------------------------------------
     // git calls `can_fast_forward()` with `options.upstream`, which `--root`
     // leaves NULL, so the preemptive fast-forward is never taken under `--root`:
@@ -1349,6 +1369,24 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
     for info in repo.rev_walk([head_oid]).with_hidden(hidden).all()? {
         replay_range.push(info?.id);
     }
+    // `sequencer_make_script()` walks with `revs.max_parents = 1` unless
+    // `--rebase-merges` asked for the merge structure to be recreated: a merge
+    // commit has no single patch to replay, and `pick` refuses one outright. git
+    // therefore leaves merges out of the instruction sheet, which is what makes
+    // `git rebase --onto <base> <upstream>` work on a branch that contains one.
+    let todo_range: Vec<ObjectId> = if rebase_merges == 1 {
+        replay_range.clone()
+    } else {
+        replay_range
+            .iter()
+            .copied()
+            .filter(|id| {
+                repo.find_commit(*id)
+                    .map(|c| c.parent_ids().count() <= 1)
+                    .unwrap_or(true)
+            })
+            .collect()
+    };
 
     let apply_backend = ty == Backend::Apply;
 
@@ -1497,7 +1535,7 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
             repo: &repo,
             // `revs.reverse = 1`: the instruction sheet is oldest first, while
             // the walk above yields newest first.
-            range: replay_range.iter().rev().copied().collect(),
+            range: todo_range.iter().rev().copied().collect(),
             state: RebaseState {
                 head_name,
                 onto: onto_oid,
@@ -2972,18 +3010,28 @@ impl<'r> Sequencer<'r> {
         // for rebase) keeps, so `--keep-empty` round-trips an empty commit — or
         // a commit whose patch turned out to be already present.
         //
-        // The second case is where this port diverges: git never sees it,
-        // because `sequencer_make_script()`'s `cherry_mark` drops a
-        // patch-equivalent commit before the sheet is written (with
-        // `warning: skipped previously applied commit <abbrev>` up front).
-        // Nothing vendored computes a patch id, so the commit reaches the pick
-        // loop instead and is dropped here, with git's own wording but at the
-        // point of the pick rather than before the run.
+        // The second case is git's `drop_redundant_commits`, which fires in the
+        // pick loop for exactly this reason — the pick produced nothing because
+        // the patch was already there — and names the commit in full.
+        //
+        // (git's *other* drop, `sequencer_make_script()`'s `cherry_mark`, removes
+        // such a commit from the sheet before the run and says
+        // `warning: skipped previously applied commit <abbrev>` instead. That one
+        // needs a patch id per commit, which nothing vendored computes; the
+        // observable difference is only that the sheet here still counts the
+        // commit, so the progress line reads one step longer.)
         if !item.cmd.is_fixup() && applied.tree_id == head_tree {
             let originally_empty = todo::is_original_commit_empty(repo, &commit)?;
             if !originally_empty {
                 self.term_clear_line();
-                eprintln!("warning: skipped previously applied commit {short}");
+                let subject = commit
+                    .message()
+                    .map(|m| m.summary().to_string())
+                    .unwrap_or_default();
+                eprintln!(
+                    "dropping {} {subject} -- patch contents already upstream",
+                    oid.to_hex()
+                );
                 return Ok(Step::Next);
             }
         }

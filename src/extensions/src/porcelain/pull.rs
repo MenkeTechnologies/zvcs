@@ -445,7 +445,14 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
         }
     }
 
-    let repo = gix::discover(".")?;
+    let mut repo = gix::discover(".")?;
+    // A pull moves `HEAD` and the remote-tracking refs, and both write reflogs.
+    // Without a configured identity the write fails, and by then the fast-forward
+    // has already updated the worktree — a half-applied pull. git synthesizes an
+    // identity for reflog purposes rather than failing, which is what `fetch` and
+    // `receive-pack` already do here.
+    crate::ensure_reflog_identity(&mut repo);
+    let repo = repo;
     let head_name = repo.head_name()?;
     let branch_short = head_name.as_ref().map(|h| h.shorten().to_string());
 

@@ -82,9 +82,11 @@ pub struct Request {
     /// must also be reachable from the *local* ref's reflog, proving this
     /// checkout has seen it.
     pub check_reachable: Option<String>,
-    /// `-d`/`--delete <name>` rather than the `:<name>` refspec spelling. git's
-    /// matcher fails the whole push when such a name is not advertised, while the
-    /// refspec form is sent blind.
+    /// A deletion the user asked for by name — `-d`/`--delete <name>` or the
+    /// equivalent `:<name>` refspec. `match_explicit()` fails the whole push when
+    /// such a name is not advertised, before a single command line is written:
+    /// stock git sends only the flush packet and reports
+    /// `error: unable to delete '<name>': remote ref does not exist`.
     pub explicit_delete: bool,
 }
 
@@ -163,6 +165,10 @@ pub struct RefStatus {
     /// bare `error: <reason>` before any transport output, so they never appear in
     /// the `To <url>` block.
     pub pre_transport: bool,
+    /// `REF_STATUS_REMOTE_REJECT`: the refusal came back from the server as an
+    /// `ng <ref> <reason>` line rather than being decided here, which is the
+    /// difference between git's `[remote rejected]` and `[rejected]` summaries.
+    pub remote_rejected: bool,
 }
 
 /// The outcome of a push: the resolved destination URL and every ref's verdict.
@@ -448,18 +454,19 @@ pub fn send_pack(
             forced: false,
             up_to_date: false,
             pre_transport: false,
+            remote_rejected: false,
         };
 
         if deletion && !allow_deleting_refs {
             statuses.push(reject("remote does not support deleting refs"));
             continue;
         }
-        // `--delete <name>` for a ref the remote does not advertise fails during
-        // matching (`match_push_refs`), before anything is sent: git reports
-        // `unable to delete '<name>': remote ref does not exist` and the push
-        // fails. The `:<name>` spelling instead goes on the wire as a null→null
-        // command, which this port's receiving side does not accept — so that
-        // form still reports the ref as up to date (documented in `push`).
+        // A deletion whose destination the remote does not advertise and which the
+        // user wrote unqualified fails during matching (`match_explicit()`), before
+        // anything is sent: git reports `unable to delete '<name>': remote ref does
+        // not exist` and the push fails. A `refs/`-qualified destination instead
+        // becomes a new linked ref and its null→null command goes out on the wire,
+        // which the branch below lets through.
         if deletion && req.explicit_delete && remote_current == null {
             statuses.push(RefStatus {
                 result: Err(format!(
@@ -471,7 +478,12 @@ pub fn send_pack(
             });
             continue;
         }
-        if remote_current == req.new {
+        // A deletion is always sent, even when the remote has nothing at that name:
+        // `match_explicit()` made a linked ref for it, so `send_pack()` writes the
+        // null→null command and the server answers it (with a
+        // `warning: deleting a non-existent ref` on band 2). Only a non-deletion
+        // that already matches is dropped as up to date.
+        if remote_current == req.new && !deletion {
             // Nothing to do — git reports this ref up to date and sends no command.
             statuses.push(RefStatus {
                 name: req.name.clone(),
@@ -483,6 +495,7 @@ pub fn send_pack(
                 forced: false,
                 up_to_date: true,
                 pre_transport: false,
+                remote_rejected: false,
             });
             continue;
         }
@@ -567,9 +580,10 @@ pub fn send_pack(
                 new: w.new,
                 result: Ok(()),
                 forced: w.forced,
-                up_to_date: false,
-                pre_transport: false,
-            });
+            up_to_date: false,
+            pre_transport: false,
+            remote_rejected: false,
+        });
         }
         return Ok(Outcome {
             url,
@@ -608,9 +622,10 @@ pub fn send_pack(
                     new: null,
                     result: Err("remote does not support deleting refs".to_owned()),
                     forced: false,
-                    up_to_date: false,
-                    pre_transport: false,
-                });
+            up_to_date: false,
+            pre_transport: false,
+            remote_rejected: false,
+        });
                 continue;
             }
             // Only the wire entry: the per-ref status is produced from the
@@ -830,6 +845,7 @@ pub fn send_pack(
                 forced: w.forced,
                 up_to_date: false,
                 pre_transport: false,
+                remote_rejected: true,
             });
             continue;
         }
@@ -844,6 +860,7 @@ pub fn send_pack(
                 forced: w.forced || report.forced_update,
                 up_to_date: false,
                 pre_transport: false,
+                remote_rejected: true,
             });
         }
     }

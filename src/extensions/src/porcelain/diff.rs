@@ -3966,6 +3966,81 @@ fn combined_multi(
     Ok(ExitCode::SUCCESS)
 }
 
+/// The paths a merge's *combined* pair list holds, with one status letter per
+/// parent — what `--name-only`/`--name-status` report for a merge under `-c`
+/// (`show_raw_diff()` on a `combine_diff_path`). A path is listed only when the
+/// result differs from every parent, the same filter the combined patch uses; the
+/// stat formats do not go through here, because git leaves those on the
+/// first-parent diff.
+pub(crate) fn merge_combined_names(
+    repo: &gix::Repository,
+    commit: ObjectId,
+    parents: &[ObjectId],
+    paths: &[String],
+) -> Result<Vec<(BString, String)>> {
+    let result_tree = repo.find_commit(commit)?.tree()?;
+    let mut parent_trees: Vec<gix::Tree<'_>> = Vec::with_capacity(parents.len());
+    for p in parents {
+        parent_trees.push(repo.find_commit(*p)?.tree()?);
+    }
+
+    let mut cand: BTreeSet<BString> = BTreeSet::new();
+    for pt in &parent_trees {
+        for change in repo.diff_tree_to_tree(
+            Some(pt),
+            Some(&result_tree),
+            Some(gix::diff::Options::default()),
+        )? {
+            cand.insert(change.location().to_owned());
+        }
+    }
+    if !paths.is_empty() {
+        cand.retain(|p| paths.iter().any(|x| path_matches(p, x)));
+    }
+
+    let mut out = Vec::new();
+    for path in &cand {
+        let (_, res_present, res_bytes) = tree_blob(repo, &result_tree, path)?;
+        let mut letters = String::with_capacity(parent_trees.len());
+        let mut same_as_a_parent = false;
+        for pt in &parent_trees {
+            let (_, p_present, p_bytes) = tree_blob(repo, pt, path)?;
+            if p_bytes == res_bytes && p_present == res_present {
+                same_as_a_parent = true;
+            }
+            letters.push(match (p_present, res_present) {
+                (false, true) => 'A',
+                (true, false) => 'D',
+                _ => 'M',
+            });
+        }
+        // Dense filtering: a path that matches any parent is one-sided and elided.
+        if same_as_a_parent {
+            continue;
+        }
+        out.push((path.clone(), letters));
+    }
+    Ok(out)
+}
+
+/// One merge commit's combined patch, as `git log -c`/`--cc` shows it: the commit's
+/// own tree against every parent's, with the header flavour `dense` selects.
+pub(crate) fn merge_combined_patch(
+    repo: &gix::Repository,
+    commit: ObjectId,
+    parents: &[ObjectId],
+    paths: &[String],
+    ctx: u32,
+    dense: bool,
+) -> Result<Vec<u8>> {
+    let result_tree = repo.find_commit(commit)?.tree()?;
+    let mut parent_trees: Vec<gix::Tree<'_>> = Vec::with_capacity(parents.len());
+    for p in parents {
+        parent_trees.push(repo.find_commit(*p)?.tree()?);
+    }
+    combined_trees_patch_headed(repo, &result_tree, &parent_trees, paths, ctx, dense)
+}
+
 /// The dense combined diff (`diff --cc`) of `result_tree` against every parent
 /// tree, returned as bytes. Shared by `git diff -c`/`--cc` and `git show` on a
 /// merge commit. A path appears only where the result differs from *all*
@@ -3976,6 +4051,20 @@ pub(crate) fn combined_trees_patch(
     parent_trees: &[gix::Tree<'_>],
     paths: &[String],
     ctx: u32,
+) -> Result<Vec<u8>> {
+    combined_trees_patch_headed(repo, result_tree, parent_trees, paths, ctx, true)
+}
+
+/// The same, with the header flavour chosen: `diff --cc` for the dense form and
+/// `diff --combined` for a bare `-c` (`show_combined_header()` prints whichever
+/// `opt->flags.dense_combined_merges` selected).
+pub(crate) fn combined_trees_patch_headed(
+    repo: &gix::Repository,
+    result_tree: &gix::Tree<'_>,
+    parent_trees: &[gix::Tree<'_>],
+    paths: &[String],
+    ctx: u32,
+    dense: bool,
 ) -> Result<Vec<u8>> {
     // Candidate paths: everything that differs between the result and any parent.
     let mut cand: BTreeSet<BString> = BTreeSet::new();
@@ -4021,7 +4110,7 @@ pub(crate) fn combined_trees_patch(
             continue;
         }
 
-        push_str(&mut out, "diff --cc ");
+        push_str(&mut out, if dense { "diff --cc " } else { "diff --combined " });
         out.extend_from_slice(&quoted_name(path));
         out.push(b'\n');
         push_str(&mut out, "index ");

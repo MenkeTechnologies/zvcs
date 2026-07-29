@@ -17,6 +17,7 @@ use gix::refs::FullName;
 ///   * `git worktree list --expire <date>`      → narrow the `prunable` window
 ///   * `git worktree lock [--reason <s>] <wt>`  → create `worktrees/<id>/locked`
 ///   * `git worktree unlock <wt>`               → remove it
+///   * `git worktree add <path> [<commit-ish>]` → a linked worktree, checked out
 ///
 /// `git worktree` itself takes no options, so any dash-prefixed token ahead of
 /// the subcommand is a usage error (exit 129) — `--foo` reports an unknown
@@ -41,12 +42,22 @@ use gix::refs::FullName;
 /// `repair_worktree_at_path()`, rewriting a worktree's `.git` gitfile and its
 /// administrative `gitdir` when either drifts.
 ///
-/// NOT ported, and reported as such rather than approximated: `add`, `move` and
-/// `remove`. `add` needs a full checkout, `move` and `remove` need git's
-/// `check_clean_worktree()` (a `git status --porcelain` of the linked tree) plus
-/// `validate_worktree()`/`update_worktree_location()`; the vendored crates expose
-/// `gix_worktree_state::checkout` but not that bookkeeping, so a faithful port is
-/// not possible here.
+/// `add` reproduces `add_worktree()`: the administrative directory under
+/// `worktrees/<id>` (`HEAD`, `commondir`, `gitdir`, `ORIG_HEAD`, `index`,
+/// `logs/HEAD`, `refs/`), the `<path>/.git` gitfile pointing back at it, and the
+/// checkout itself. `-b`/`-B`, `--detach`, `-f`, `--[no-]checkout`, `-q` and
+/// `--lock [--reason]` are honoured, as is the DWIM branch named after the path's
+/// last component when no `<commit-ish>` is given. The messages keep git's
+/// streams: `Preparing worktree (…)` on stderr before the branch-in-use check,
+/// `HEAD is now at …` on stdout from the checkout — so `--no-checkout` prints
+/// only the first. `--track`, `--guess-remote`, `--orphan` and `--relative-paths`
+/// are refused rather than approximated.
+///
+/// NOT ported, and reported as such rather than approximated: `move` and
+/// `remove`. Both need git's `check_clean_worktree()` (a `git status --porcelain`
+/// of the linked tree) plus `validate_worktree()`/`update_worktree_location()`;
+/// the vendored crates expose `gix_worktree_state::checkout` but not that
+/// bookkeeping, so a faithful port is not possible here.
 ///
 /// A single documented deviation: `repair <nonexistent-path>` dies (exit 128) as
 /// git does, but git's `strbuf_realpath()` names the deepest resolvable path
@@ -101,7 +112,7 @@ pub fn worktree(args: &[String]) -> Result<ExitCode> {
         "unlock" => unlock(&args[1..]),
         "prune" => prune(&args[1..]),
         "repair" => repair(&args[1..]),
-        "add" => bail!("`worktree add` is not ported (needs a full working-tree checkout, which the vendored crates do not drive here)"),
+        "add" => add(&args[1..]),
         "move" => bail!("`worktree move` is not ported (needs git's check_clean_worktree/validate_worktree bookkeeping, absent from the vendored crates)"),
         "remove" => {
             bail!("`worktree remove` is not ported (needs git's check_clean_worktree/validate_worktree bookkeeping, absent from the vendored crates)")
@@ -1583,4 +1594,385 @@ mod tests {
         assert_eq!(strip_dotgit(Path::new("/a/b/.git")), b"/a/b".to_vec());
         assert_eq!(strip_dotgit(Path::new("/a/b")), b"/a/b".to_vec());
     }
+}
+
+// ---------------------------------------------------------------------------
+// `git worktree add`
+// ---------------------------------------------------------------------------
+
+/// What `add_worktree()` was asked to attach.
+enum Start {
+    /// Check out an existing branch, attaching the new worktree's `HEAD` to it.
+    Branch(FullName, ObjectId),
+    /// `-b`/`-B`, or the DWIM branch named after the directory.
+    NewBranch { name: FullName, oid: ObjectId, force: bool },
+    /// `--detach`, or a commit-ish that is not a branch.
+    Detached(ObjectId),
+}
+
+impl Start {
+    fn oid(&self) -> ObjectId {
+        match self {
+            Start::Branch(_, oid) | Start::Detached(oid) => *oid,
+            Start::NewBranch { oid, .. } => *oid,
+        }
+    }
+
+    /// The parenthesised text of the `Preparing worktree (…)` line.
+    fn preparing(&self, repo: &gix::Repository) -> String {
+        match self {
+            Start::Branch(name, _) => {
+                format!("checking out '{}'", name.as_bstr().to_str_lossy().trim_start_matches("refs/heads/"))
+            }
+            Start::NewBranch { name, .. } => format!(
+                "new branch '{}'",
+                name.as_bstr().to_str_lossy().trim_start_matches("refs/heads/")
+            ),
+            Start::Detached(oid) => format!("detached HEAD {}", abbrev(repo, *oid)),
+        }
+    }
+}
+
+/// `find_unique_abbrev()` for the two messages that carry one.
+fn abbrev(repo: &gix::Repository, oid: ObjectId) -> String {
+    oid.attach(repo)
+        .shorten()
+        .map(|p| p.to_string())
+        .unwrap_or_else(|_| oid.to_hex_with_len(7).to_string())
+}
+
+/// `git worktree add [-f] [--detach] [--[no-]checkout] [(-b|-B) <branch>] <path> [<commit-ish>]`
+///
+/// Ported from `builtin/worktree.c`'s `add()` / `add_worktree()`. The steps are
+/// git's, in git's order, because the messages interleave with them: the
+/// `Preparing worktree (…)` line is printed *before* the branch-in-use check, so a
+/// refused add still announces what it was about to do.
+fn add(args: &[String]) -> Result<ExitCode> {
+    let mut new_branch: Option<String> = None;
+    let mut force_branch = false;
+    let mut detach = false;
+    let mut force = false;
+    let mut checkout = true;
+    let mut quiet = false;
+    let mut lock_it = false;
+    let mut lock_reason: Option<String> = None;
+    let mut positional: Vec<&str> = Vec::new();
+
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        match a {
+            "-h" | "--help" => {
+                print!("{MAIN_USAGE}");
+                return Ok(ExitCode::from(129));
+            }
+            "-b" | "-B" => {
+                let Some(v) = args.get(i + 1) else {
+                    return usage(Some(&format!("error: switch `{}' requires a value", &a[1..])), MAIN_USAGE);
+                };
+                new_branch = Some(v.clone());
+                force_branch = a == "-B";
+                i += 1;
+            }
+            "--detach" => detach = true,
+            "-f" | "--force" => force = true,
+            "--checkout" => checkout = true,
+            "--no-checkout" => checkout = false,
+            "-q" | "--quiet" => quiet = true,
+            "--lock" => lock_it = true,
+            "--reason" => {
+                let Some(v) = args.get(i + 1) else {
+                    return usage(Some("error: option `reason' requires a value"), MAIN_USAGE);
+                };
+                lock_reason = Some(v.clone());
+                i += 1;
+            }
+            // Refused rather than approximated: each needs behaviour this port
+            // does not have — remote-tracking DWIM for the first two, and an
+            // unborn HEAD with an empty index for the third.
+            "--track" | "--no-track" | "--guess-remote" | "--no-guess-remote" | "--orphan"
+            | "--relative-paths" | "--no-relative-paths" => {
+                bail!("`worktree add {a}` is not ported")
+            }
+            s if s.starts_with('-') && s.len() > 1 => {
+                return usage(Some(&format!("error: unknown option `{}'", s.trim_start_matches('-'))), MAIN_USAGE)
+            }
+            s => positional.push(s),
+        }
+        i += 1;
+    }
+
+    let Some(path_arg) = positional.first().copied() else {
+        return usage(Some("error: need a path"), MAIN_USAGE);
+    };
+    let commit_ish = positional.get(1).copied();
+
+    let repo = gix::discover(".")?;
+    let common = gix::path::realpath(repo.common_dir())?;
+    let path = PathBuf::from(path_arg);
+
+    // `add()`: with no `<commit-ish>` and no `-b`, git invents a branch named
+    // after the final path component.
+    let dwim_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(str::to_owned)
+        .unwrap_or_default();
+
+    let start = resolve_start(&repo, new_branch.as_deref(), force_branch, detach, commit_ish, &dwim_name)?;
+
+    if !quiet {
+        eprintln!("Preparing worktree ({})", start.preparing(&repo));
+    }
+
+    // `die_if_checked_out()`: a branch may be checked out in one worktree only.
+    if let Start::Branch(name, _) = &start {
+        if !force {
+            if let Some(other) = checked_out_in(&repo, name)? {
+                eprintln!(
+                    "fatal: '{}' is already used by worktree at '{}'",
+                    name.as_bstr().to_str_lossy().trim_start_matches("refs/heads/"),
+                    path_to_string(&other)
+                );
+                return Ok(ExitCode::from(128));
+            }
+        }
+    }
+
+    // `validate_new_branchname()` runs before a single directory is made, so a
+    // `-b` naming an existing branch leaves nothing behind. git reports it through
+    // a failed child process, which is why the status is 255 rather than `die()`'s
+    // 128.
+    if let Start::NewBranch { name, force, .. } = &start {
+        if !force && repo.try_find_reference(name.as_bstr())?.is_some() {
+            eprintln!(
+                "fatal: a branch named '{}' already exists",
+                name.as_bstr().to_str_lossy().trim_start_matches("refs/heads/")
+            );
+            return Ok(ExitCode::from(255));
+        }
+    }
+
+    // `add_worktree()`: the destination must be absent, or an empty directory.
+    let occupied = match std::fs::read_dir(&path) {
+        Ok(mut entries) => entries.next().is_some(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        // A plain file at the path is just as occupied as a full directory.
+        Err(_) => path.exists(),
+    };
+    if occupied && !force {
+        eprintln!("fatal: '{path_arg}' already exists");
+        return Ok(ExitCode::from(128));
+    }
+
+    // The administrative directory, named after the path's last component with
+    // git's `<name>N` de-duplication when that name is taken.
+    let id = unique_admin_id(&common, &dwim_name);
+    let admin = common.join("worktrees").join(&id);
+    std::fs::create_dir_all(admin.join("logs"))?;
+    std::fs::create_dir_all(admin.join("refs"))?;
+    std::fs::create_dir_all(&path)?;
+    let worktree_abs = gix::path::realpath(&path)?;
+
+    // `<path>/.git` points at the administrative directory, and `gitdir` points
+    // back at that file — the two halves `repair` checks against each other.
+    std::fs::write(path.join(".git"), format!("gitdir: {}\n", path_to_string(&admin)))?;
+    std::fs::write(admin.join("gitdir"), format!("{}\n", path_to_string(&worktree_abs.join(".git"))))?;
+    std::fs::write(admin.join("commondir"), "../..\n")?;
+
+    // `-b`/`-B` creates the branch before `HEAD` can name it.
+    if let Start::NewBranch { name, oid, force } = &start {
+        create_branch(&repo, name, *oid, *force)?;
+    }
+    let head_line = match &start {
+        Start::Branch(name, _) => format!("ref: {}\n", name.as_bstr().to_str_lossy()),
+        Start::NewBranch { name, .. } => format!("ref: {}\n", name.as_bstr().to_str_lossy()),
+        Start::Detached(oid) => format!("{}\n", oid.to_hex()),
+    };
+    std::fs::write(admin.join("HEAD"), head_line)?;
+    std::fs::write(admin.join("ORIG_HEAD"), format!("{}\n", start.oid().to_hex()))?;
+    write_worktree_reflog(&repo, &admin, start.oid())?;
+
+    if lock_it {
+        std::fs::write(admin.join("locked"), lock_reason.map(|r| format!("{r}\n")).unwrap_or_default())?;
+    }
+
+    if checkout {
+        checkout_into(&repo, &admin, &path, start.oid())?;
+    }
+
+    // The `HEAD is now at …` line comes from the checkout itself, so
+    // `--no-checkout` has nothing to report.
+    if !quiet && checkout {
+        let subject = repo
+            .find_commit(start.oid())
+            .ok()
+            .and_then(|c| c.message().ok().map(|m| m.summary().to_string()))
+            .unwrap_or_default();
+        // `reset --hard`'s line, which the child writes to stdout — unlike the
+        // `Preparing worktree` line above it.
+        println!("HEAD is now at {} {subject}", abbrev(&repo, start.oid()));
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Which of `<commit-ish>`, `-b`/`-B` and the DWIM branch this add starts from.
+fn resolve_start(
+    repo: &gix::Repository,
+    new_branch: Option<&str>,
+    force_branch: bool,
+    detach: bool,
+    commit_ish: Option<&str>,
+    dwim_name: &str,
+) -> Result<Start> {
+    let peel = |spec: &str| -> Result<ObjectId> {
+        let id = repo
+            .rev_parse_single(spec)
+            .map_err(|_| anyhow::anyhow!("invalid reference: {spec}"))?;
+        Ok(id.object()?.peel_to_commit()?.id)
+    };
+
+    if let Some(name) = new_branch {
+        let oid = peel(commit_ish.unwrap_or("HEAD"))?;
+        return Ok(Start::NewBranch {
+            name: FullName::try_from(format!("refs/heads/{name}"))?,
+            oid,
+            force: force_branch,
+        });
+    }
+    match commit_ish {
+        Some(spec) => {
+            let oid = peel(spec)?;
+            // A `<commit-ish>` that names a branch attaches `HEAD` to it, unless
+            // `--detach` asked otherwise.
+            let branch = (!detach)
+                .then(|| repo.find_reference(spec).ok())
+                .flatten()
+                .map(|r| r.name().to_owned())
+                .filter(|n| n.as_bstr().starts_with(b"refs/heads/"));
+            Ok(match branch {
+                Some(name) => Start::Branch(name, oid),
+                None => Start::Detached(oid),
+            })
+        }
+        // No commit-ish: `-b $(basename <path>)` off HEAD, or a detached HEAD.
+        None => {
+            let oid = peel("HEAD")?;
+            if detach {
+                Ok(Start::Detached(oid))
+            } else {
+                Ok(Start::NewBranch {
+                    name: FullName::try_from(format!("refs/heads/{dwim_name}"))?,
+                    oid,
+                    force: false,
+                })
+            }
+        }
+    }
+}
+
+/// The worktree whose `HEAD` already points at `branch`, if any — git's
+/// `find_shared_symref()`, which is what `die_if_checked_out()` reports.
+fn checked_out_in(repo: &gix::Repository, branch: &FullName) -> Result<Option<PathBuf>> {
+    for wt in collect(repo, u64::MAX)? {
+        if let HeadInfo::Branch { name, .. } = &wt.head {
+            if name.as_bstr() == branch.as_bstr() {
+                return Ok(Some(wt.path));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// `refs/heads/<name>` at `oid`, refusing to clobber unless `-B` was given.
+fn create_branch(repo: &gix::Repository, name: &FullName, oid: ObjectId, force: bool) -> Result<()> {
+    use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
+    let expected = if force { PreviousValue::Any } else { PreviousValue::MustNotExist };
+    let edit = RefEdit {
+        change: Change::Update {
+            log: LogChange {
+                mode: RefLog::AndReference,
+                force_create_reflog: false,
+                message: format!("branch: Created from {}", oid.to_hex()).into(),
+            },
+            expected,
+            new: gix::refs::Target::Object(oid),
+        },
+        name: name.clone(),
+        deref: false,
+    };
+    repo.edit_references([edit]).map_err(|e| {
+        anyhow::anyhow!(
+            "a branch named '{}' already exists: {e}",
+            name.as_bstr().to_str_lossy().trim_start_matches("refs/heads/")
+        )
+    })?;
+    Ok(())
+}
+
+/// The two `logs/HEAD` lines `add_worktree()` leaves behind: the creation of the
+/// new `HEAD`, then the checkout that follows it.
+fn write_worktree_reflog(repo: &gix::Repository, admin: &Path, oid: ObjectId) -> Result<()> {
+    let now = gix::date::Time::now_local_or_utc().format_or_unix(gix::date::time::Format::Raw);
+    let sig = match repo.committer() {
+        Some(Ok(sig)) => sig,
+        _ => gix::actor::SignatureRef {
+            name: b"zvcs".as_bstr(),
+            email: b"zvcs@localhost".as_bstr(),
+            time: &now,
+        },
+    };
+    let sig = format!("{} <{}> {}", sig.name, sig.email, sig.time);
+    let zero = ObjectId::null(repo.object_hash());
+    let text = format!(
+        "{} {} {}\t\n{} {} {}\treset: moving to HEAD\n",
+        zero.to_hex(),
+        oid.to_hex(),
+        sig,
+        oid.to_hex(),
+        oid.to_hex(),
+        sig
+    );
+    std::fs::write(admin.join("logs").join("HEAD"), text)?;
+    Ok(())
+}
+
+/// `<name>`, or `<name>1`, `<name>2`, … when that administrative directory is
+/// taken — `add()`'s `worktree_id` loop.
+fn unique_admin_id(common: &Path, base: &str) -> String {
+    let base = if base.is_empty() { "worktree" } else { base };
+    let dir = common.join("worktrees");
+    if !dir.join(base).exists() {
+        return base.to_owned();
+    }
+    for n in 1u32.. {
+        let candidate = format!("{base}{n}");
+        if !dir.join(&candidate).exists() {
+            return candidate;
+        }
+    }
+    unreachable!("the loop returns")
+}
+
+/// Populate the new worktree: build its index from the commit's tree, write it as
+/// the administrative `index`, and lay the files down.
+fn checkout_into(repo: &gix::Repository, admin: &Path, path: &Path, oid: ObjectId) -> Result<()> {
+    let tree = repo.find_commit(oid)?.tree_id()?.detach();
+    let mut index = repo.index_from_tree(&tree)?;
+    let opts = repo.checkout_options(gix::worktree::stack::state::attributes::Source::IdMapping)?;
+    let odb = repo.objects.clone().into_arc()?;
+    crate::worktree::checkout_subset(
+        &mut index,
+        path,
+        odb,
+        &gix::progress::Discard,
+        &gix::progress::Discard,
+        &std::sync::atomic::AtomicBool::default(),
+        opts,
+    )?;
+    index.write_to(
+        std::fs::File::create(admin.join("index"))?,
+        gix::index::write::Options::default(),
+    )?;
+    Ok(())
 }

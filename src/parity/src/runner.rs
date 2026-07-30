@@ -42,11 +42,33 @@ pub struct Case {
     /// for its input is not reproducible, and an unreproducible case cannot be
     /// the premise of a differential comparison.
     pub stdin: Option<&'static [u8]>,
+    /// Compare stderr byte for byte as well.
+    ///
+    /// Off by default, and deliberately so: the harness's standing policy is that
+    /// error *prose* is not a compatibility surface (see the module header). But
+    /// for the commands whose whole contract is a refusal — a merge that will not
+    /// overwrite, a pull that will not run, a stash that has nothing to pop — the
+    /// message *is* the behaviour, and every one of those shipped wrong at least
+    /// once while stdout, exit code and state all agreed. Cases that opt in here
+    /// are measured on it; the rest of the corpus is unaffected, so no existing
+    /// score moves.
+    pub compare_stderr: bool,
 }
 
 impl Case {
     pub fn new(cmd: &'static str, args: &[&str], shape: Shape) -> Self {
-        Self { cmd, args: args.iter().map(|s| s.to_string()).collect(), shape, stdin: None }
+        Self {
+            cmd,
+            args: args.iter().map(|s| s.to_string()).collect(),
+            shape,
+            stdin: None,
+            compare_stderr: false,
+        }
+    }
+
+    /// Same as [`Case::new`], with stderr compared byte for byte too.
+    pub fn strict(cmd: &'static str, args: &[&str], shape: Shape) -> Self {
+        Self { compare_stderr: true, ..Self::new(cmd, args, shape) }
     }
 
     /// Same as [`Case::new`], with `stdin` delivered to both sides.
@@ -65,7 +87,9 @@ impl Case {
     /// and an argv and still be different invocations, and a report that
     /// collapsed them would name the wrong one.
     pub fn id(&self) -> String {
-        let base = format!("{}::{}::{}", self.shape.name(), self.cmd, self.args.join(" "));
+        let strict = if self.compare_stderr { "!" } else { "" };
+        let base =
+            format!("{}{}::{}::{}", strict, self.shape.name(), self.cmd, self.args.join(" "));
         match self.stdin {
             None => base,
             Some(bytes) => format!("{base}::stdin[{}B/{:016x}]", bytes.len(), fnv1a64(bytes)),
@@ -100,6 +124,9 @@ pub enum Verdict {
     ExitDiff,
     /// Same output, but the repository was left in a different state.
     StateDiff,
+    /// stdout, exit code and state all agree, but the message on stderr does not.
+    /// Only reachable for a case that opted into stderr comparison.
+    StderrDiff,
     /// zvcs crashed (signal, or a panic surfacing as a Rust backtrace).
     Crash,
     /// zvcs did not exit within the case timeout while stock git did. Tracked
@@ -129,6 +156,7 @@ impl Verdict {
             Verdict::StdoutDiff => "STDOUT-DIFF",
             Verdict::ExitDiff => "EXIT-DIFF",
             Verdict::StateDiff => "STATE-DIFF",
+            Verdict::StderrDiff => "STDERR-DIFF",
             Verdict::Crash => "CRASH",
             Verdict::Hang => "HANG",
             Verdict::Nondeterministic => "NONDETERMINISTIC",
@@ -585,6 +613,8 @@ pub fn run_case(
         Verdict::StdoutDiff
     } else if stock_state_n != zvcs_state_n {
         Verdict::StateDiff
+    } else if case.compare_stderr && stock_stderr != zvcs_stderr {
+        Verdict::StderrDiff
     } else {
         Verdict::Match
     };

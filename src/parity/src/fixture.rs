@@ -92,6 +92,27 @@ pub enum Shape {
     /// three-way merge over this and fast-forwards over it happily, and nothing
     /// else in the corpus separates the two.
     MergeableStaged,
+    /// Stash entries that already exist, over a worktree that has more to stash.
+    ///
+    /// Three entries with different insides — an unstaged-only one, one carrying
+    /// an untracked file, and one carrying both staged and unstaged work — plus a
+    /// current worktree holding a staged change, an unstaged change, an untracked
+    /// file and an ignored one. Without pre-existing entries, `stash list/show/
+    /// pop/apply/drop/branch` could only ever be measured on their empty-stack
+    /// error path, and the flags that decide *what* gets stashed
+    /// (`-u`/`-a`/`-k`/`-S`/`--`) had nothing to sort.
+    Stashed,
+    /// A tracking branch behind a real remote, over a dirty worktree.
+    ///
+    /// The remote is a bare repository *inside* the fixture (`.remote.git`, hidden
+    /// from status through `info/exclude`) reached by a relative URL, so it
+    /// survives the per-case copy and every case gets its own. `main` is three
+    /// commits behind `origin/main` and fast-forwardable; `div` has moved on both
+    /// sides. The worktree keeps an unstaged edit to a file the remote never
+    /// touches (so a fast-forward must still succeed) and one to a file `div`
+    /// rewrites (so that merge must refuse per path) — the two halves of the
+    /// dirty-pull question that shipped broken twice.
+    BehindRemote,
 }
 
 impl Shape {
@@ -112,6 +133,8 @@ impl Shape {
         Shape::Sparse,
         Shape::MergeableDirty,
         Shape::MergeableStaged,
+        Shape::Stashed,
+        Shape::BehindRemote,
     ];
 
     pub fn name(self) -> &'static str {
@@ -132,6 +155,8 @@ impl Shape {
             Shape::Sparse => "sparse",
             Shape::MergeableDirty => "mergeable-dirty",
             Shape::MergeableStaged => "mergeable-staged",
+            Shape::Stashed => "stashed",
+            Shape::BehindRemote => "behind-remote",
         }
     }
 }
@@ -612,6 +637,90 @@ pub fn build(shape: Shape, dir: &Path, home: &Path) -> Result<()> {
             // `add` each have to decide what a sparse-excluded path means, and
             // `rm` on the *tracked* excluded path is a fixed bug this pins.
             write(dir, "outside/stray.txt", "untracked, inside the excluded cone\n")?;
+        }
+
+        Shape::Stashed => {
+            // Three commits give the entries something to sit on top of.
+            write(dir, "counter.txt", "1\n")?;
+            write(dir, "notes.txt", "notes\n")?;
+            git(dir, home, &["add", "."])?;
+            git(dir, home, &["commit", "-q", "-m", "add counter and notes"])?;
+
+            // Entry @{2}: unstaged only.
+            write(dir, "counter.txt", "1\nstashed-unstaged\n")?;
+            git(dir, home, &["stash", "push", "-m", "unstaged only"])?;
+            // Entry @{1}: carries an untracked file, which only `-u` picks up.
+            write(dir, "extra.txt", "untracked, stashed with -u\n")?;
+            git(dir, home, &["stash", "push", "-u", "-m", "with untracked"])?;
+            // Entry @{0}: staged *and* unstaged work, so `--index` has something
+            // to restore and `--keep-index` something to keep.
+            write(dir, "notes.txt", "notes\nstaged\n")?;
+            git(dir, home, &["add", "notes.txt"])?;
+            write(dir, "notes.txt", "notes\nstaged\nunstaged\n")?;
+            git(dir, home, &["stash", "push", "-m", "staged and unstaged"])?;
+
+            // And a current worktree with one of each, so a fresh `stash push`
+            // has all four kinds of content to decide about.
+            write(dir, ".gitignore", "ignored.txt\n")?;
+            git(dir, home, &["add", ".gitignore"])?;
+            git(dir, home, &["commit", "-q", "-m", "ignore ignored.txt"])?;
+            write(dir, "counter.txt", "1\nworktree-unstaged\n")?;
+            write(dir, "notes.txt", "notes\nworktree-staged\n")?;
+            git(dir, home, &["add", "notes.txt"])?;
+            write(dir, "notes.txt", "notes\nworktree-staged\nthen-unstaged\n")?;
+            write(dir, "fresh.txt", "untracked in the worktree\n")?;
+            write(dir, "ignored.txt", "ignored in the worktree\n")?;
+        }
+
+        Shape::BehindRemote => {
+            write(dir, "shared.txt", "shared, the remote rewrites this\n")?;
+            write(dir, "mine.txt", "mine, the remote never touches this\n")?;
+            write(dir, "clash.txt", "clash, div rewrites this\n")?;
+            git(dir, home, &["add", "."])?;
+            git(dir, home, &["commit", "-q", "-m", "add shared, mine and clash"])?;
+
+            // The remote lives inside the fixture so the per-case copy carries it,
+            // and is reached by a relative URL so the copy's own one is used.
+            git(dir, home, &["init", "-q", "--bare", ".remote.git"])?;
+            git(dir, home, &["remote", "add", "origin", "./.remote.git"])?;
+            git(dir, home, &["push", "-q", "origin", "main"])?;
+            git(dir, home, &["branch", "--set-upstream-to=origin/main", "main"])?;
+
+            // Advance the remote's `main` by three commits, none of them touching
+            // `mine.txt`, so a fast-forward over a dirty `mine.txt` must succeed.
+            git(dir, home, &["checkout", "-q", "-b", "upstream-work"])?;
+            for n in ["2", "3", "4"] {
+                write(dir, "shared.txt", &format!("shared, the remote rewrites this\nupstream {n}\n"))?;
+                git(dir, home, &["commit", "-qam", &format!("upstream {n}")])?;
+            }
+            git(dir, home, &["push", "-q", "origin", "upstream-work:main"])?;
+
+            // `div` diverges: the remote rewrites `clash.txt`, the local side adds
+            // its own commit, so a pull has to merge and then refuse on the path
+            // the worktree is holding dirty.
+            git(dir, home, &["checkout", "-q", "-b", "div", "main"])?;
+            write(dir, "clash.txt", "clash, div rewrites this\nremote side\n")?;
+            git(dir, home, &["commit", "-qam", "div on the remote"])?;
+            git(dir, home, &["push", "-q", "origin", "div"])?;
+            git(dir, home, &["reset", "-q", "--hard", "HEAD~1"])?;
+            write(dir, "notes-div.txt", "local side of div\n")?;
+            git(dir, home, &["add", "notes-div.txt"])?;
+            git(dir, home, &["commit", "-q", "-m", "div locally"])?;
+            git(dir, home, &["branch", "--set-upstream-to=origin/div", "div"])?;
+
+            // Back on `main`, three commits behind, with the remote's own refs
+            // fetched so `pull` has a tracking ref to compare against.
+            git(dir, home, &["checkout", "-q", "main"])?;
+            git(dir, home, &["branch", "-D", "upstream-work"])?;
+            git(dir, home, &["fetch", "-q", "origin"])?;
+
+            // The bare remote is not part of the tree under test.
+            write(dir, ".git/info/exclude", ".remote.git/\n")?;
+
+            // Dirty in two ways that matter: a file the remote never touches, and
+            // one that `div` rewrites.
+            write(dir, "mine.txt", "mine, the remote never touches this\nlocal edit\n")?;
+            write(dir, "clash.txt", "clash, div rewrites this\nlocal edit\n")?;
         }
 
         Shape::MergeableDirty => {

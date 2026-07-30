@@ -1199,7 +1199,7 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
         return Ok(code);
     }
     update_worktree(&repo, &old_index, Some(head_tree), target_tree, &should_interrupt)?;
-    advance(&repo, local_id, target_id, format!("merge {spec}: Fast-forward"))?;
+    advance(&repo, local_id, target_id, format!("{}: Fast-forward", reflog_action(spec)))?;
     if !opts.quiet {
         println!("Fast-forward");
         print!("{}", diffstat(&repo, head_tree, target_tree, opts.stat)?);
@@ -1385,7 +1385,10 @@ fn finalize_clean(
         repo,
         local_id,
         new_id,
-        format!("merge {spec_label}: Merge made by the '{strategy_name}' strategy."),
+        format!(
+            "{}: Merge made by the '{strategy_name}' strategy.",
+            reflog_action(&spec_label)
+        ),
     )?;
     // git's `finish()` → `remove_merge_branch_state()`: the merge is over.
     remove_merge_state(git_dir, false);
@@ -1644,7 +1647,7 @@ fn do_octopus(
             repo,
             local_id,
             mrc[0],
-            format!("merge {}: Fast-forward", refs.join(" ")),
+            format!("{}: Fast-forward", reflog_action(&refs.join(" "))),
         )?;
         if !opts.quiet {
             println!("Fast-forward");
@@ -2515,6 +2518,18 @@ pub(crate) fn index_tree(repo: &gix::Repository, index: &gix::index::File) -> Re
         editor.upsert(path.split(|&b| b == b'/').map(|c| c.as_bstr()), mode.kind(), entry.id)?;
     }
     Ok(editor.write(|tree| repo.write_object(tree).map(|id| id.detach()))?)
+}
+
+/// `cmd_merge`'s `setenv("GIT_REFLOG_ACTION", "merge <heads>", 0)` (builtin/merge.c:1586)
+/// followed by `"<GIT_REFLOG_ACTION>: <msg>"` (builtin/merge.c:492).
+///
+/// The `setenv` does not overwrite, so a caller that already set the variable wins:
+/// that is how `git pull` leaves `pull: Fast-forward` in the reflog where a bare
+/// merge leaves `merge origin/main: Fast-forward`, and how `git rebase`'s
+/// integration steps keep their own action. Reading it here is the half of that
+/// mechanism the merge side owes; `pull` has always set it.
+fn reflog_action(spec: &str) -> String {
+    std::env::var("GIT_REFLOG_ACTION").unwrap_or_else(|_| format!("merge {spec}"))
 }
 
 /// `git merge --continue`: finish a merge whose conflicts have been resolved and

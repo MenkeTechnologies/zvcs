@@ -328,7 +328,7 @@ fn sample(rng: &mut Rng, g: &Grammar) -> Case {
 
     // Generated cases get closed stdin: an input payload is part of a case's
     // meaning, and the grammars describe argv only. stdin coverage is curated.
-    Case { cmd: g.cmd, args, shape: *rng.pick(g.shapes), stdin: None }
+    Case { cmd: g.cmd, args, shape: *rng.pick(g.shapes), stdin: None, compare_stderr: false }
 }
 
 /// Shrink a failing case to a minimal still-failing one by greedily dropping

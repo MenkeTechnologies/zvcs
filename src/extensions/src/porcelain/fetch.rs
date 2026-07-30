@@ -999,6 +999,18 @@ impl Default for FetchOpts {
 }
 
 /// One line of the git-style per-ref summary.
+/// Move the row for the checked-out branch's own update to the front, which is
+/// where git's ref map puts it. A detached HEAD has no such row and nothing moves.
+fn hoist_current_branch(repo: &gix::Repository, lines: &mut [Line]) {
+    let Some(head) = repo.head_name().ok().flatten() else {
+        return;
+    };
+    let short = head.shorten().to_string();
+    if let Some(pos) = lines.iter().position(|l| l.from == short) {
+        lines[..=pos].rotate_right(1);
+    }
+}
+
 struct Line {
     flag: char,
     summary: String,
@@ -2019,6 +2031,15 @@ fn fetch_one(
     fetch_head.write(if atomic_abort { &[] } else { &fetch_head_rows })?;
 
     // --- print the summary ------------------------------------------------
+    // `store_updated_refs()` walks the ref map, which git builds with the *current
+    // branch's* upstream first (`get_ref_map()` resolves it ahead of the rest), so
+    // that row heads the summary and the others follow in ref-map order. gitoxide's
+    // mappings come back in advertisement order alone, which puts the current
+    // branch wherever its name happens to sort — measured against stock: on `main`
+    // with branches `aaa`/`mmm`/`zzz`, git prints `main` first and this printed
+    // `aaa`.
+    hoist_current_branch(repo, &mut update_lines);
+
     // Pruned refs are reported first, mirroring git's prune-before-fetch order.
     let mut lines = prune_lines;
     lines.extend(update_lines);

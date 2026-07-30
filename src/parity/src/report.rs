@@ -71,6 +71,9 @@ pub struct Tally {
     pub stdout_diff: usize,
     pub exit_diff: usize,
     pub state_diff: usize,
+    /// Cases that agreed on stdout, exit code and state but not on the message —
+    /// only reachable for the cases that opted into stderr comparison.
+    pub stderr_diff: usize,
     pub crash: usize,
     pub nondeterministic: usize,
     pub hang: usize,
@@ -95,6 +98,7 @@ impl Tally {
             + self.stdout_diff
             + self.exit_diff
             + self.state_diff
+            + self.stderr_diff
             + self.crash
             + self.hang
     }
@@ -106,6 +110,7 @@ impl Tally {
             Verdict::StdoutDiff => self.stdout_diff += 1,
             Verdict::ExitDiff => self.exit_diff += 1,
             Verdict::StateDiff => self.state_diff += 1,
+            Verdict::StderrDiff => self.stderr_diff += 1,
             Verdict::Crash => self.crash += 1,
             Verdict::Hang => self.hang += 1,
             Verdict::Nondeterministic => self.nondeterministic += 1,
@@ -227,6 +232,14 @@ impl Report {
                 }
                 if f.stock_state != f.zvcs_state {
                     println!("  !! post-state diverged");
+                    // The probe is one `key: value` line per fact, so the lines
+                    // that differ *are* the diagnosis. Printing the whole state of
+                    // both sides buries it; printing only the differing keys is
+                    // what a reader needs to know which fact moved.
+                    for (a, b) in state_diff_lines(&f.stock_state, &f.zvcs_state).iter().take(6) {
+                        println!("     stock| {a}");
+                        println!("     zvcs | {b}");
+                    }
                 }
                 // Both stderrs are shown, not compared: reading them side by
                 // side is how you tell a real disagreement from terser prose.
@@ -239,6 +252,25 @@ impl Report {
             }
         }
     }
+}
+
+/// The `key: value` lines on which two state probes disagree, paired up by
+/// position — including a line one side has and the other does not.
+fn state_diff_lines(stock: &str, zvcs: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut a = stock.lines();
+    let mut b = zvcs.lines();
+    loop {
+        match (a.next(), b.next()) {
+            (None, None) => break,
+            (x, y) if x == y => continue,
+            (x, y) => out.push((
+                x.unwrap_or("<absent>").to_string(),
+                y.unwrap_or("<absent>").to_string(),
+            )),
+        }
+    }
+    out
 }
 
 /// Minimal HTML escape for the few dynamic strings the report interpolates

@@ -20,6 +20,7 @@
 mod corpus;
 mod env;
 mod fixture;
+mod nested;
 mod fuzz;
 mod grammars_generated;
 mod report;

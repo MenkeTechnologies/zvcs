@@ -47,6 +47,13 @@ pub(crate) fn read_only(cmd: &'static str, args: &[&str], out: &mut Vec<Case>) {
 pub fn cases() -> Vec<Case> {
     let mut c = Vec::new();
 
+    // The nested-option matrices, which cover the commands whose flags *are* the
+    // semantics — stash, pull, merge, fetch — by expanding their interacting flags
+    // rather than by listing invocations someone thought of. See
+    // [`crate::nested`]; those cases also compare stderr, because a refusal's
+    // message is the whole behaviour being tested.
+    crate::nested::cases(&mut c);
+
     // ---- rev-parse: the most-called plumbing in any script ----
     read_only("rev-parse", &["rev-parse", "HEAD"], &mut c);
     read_only("rev-parse", &["rev-parse", "--abbrev-ref", "HEAD"], &mut c);

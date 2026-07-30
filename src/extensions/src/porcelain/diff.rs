@@ -36,8 +36,27 @@
 //! damage is `diffcore_count_changes()`'s, and whose walk is shared with
 //! `diff-files`), and
 //! merge-base ranges `<a>...<b>` (diffed as `merge-base(a,b)` against `b`).
-//! Submodule/gitlink (`160000`) changes render as the short-format
-//! `Subproject commit <oid>` diff for tree/tree and `--cached` pairs.
+//!
+//! ### Submodules
+//!
+//! Gitlink (`160000`) changes render in all three of git's formats, selected by
+//! `--submodule[=<format>]` (a bare `--submodule` is `log`, as `diff_opt_submodule()`
+//! has it) and defaulted from `diff.submodule`:
+//!
+//! * `short` — the synthetic `Subproject commit <oid>` blob each side stands for.
+//! * `log` — `Submodule <path> <a><..|...><b>[ (rewind)]:` and the
+//!   `--left-right --first-parent` commit list, shared with [`super::diff_pairs`].
+//! * `diff` — the same header, then the submodule's own `git diff` piped through
+//!   with the gitlink path glued onto both prefixes, exactly as
+//!   `show_submodule_inline_diff()` spawns it.
+//!
+//! Every pair source is covered: tree/tree, `--cached`, `<rev>` vs. the worktree
+//! and the plain index-vs-worktree diff. A worktree gitlink's post-image is the
+//! commit the submodule has checked out, and the `DIRTY_SUBMODULE_MODIFIED` bit it
+//! carries prints git's `-dirty` marker (and `Submodule <path> contains modified
+//! content` under `log`/`diff`). Untracked files inside a submodule are not damage:
+//! `diff_setup_done()` sets `ignore_untracked_in_submodules` for every diff, so the
+//! status walk is asked for the same thing.
 //!
 //! ### Rename, copy and rewrite detection
 //!
@@ -60,9 +79,13 @@
 //!
 //! * `-R` on a worktree diff bails: the worktree "new" side has no object id to move
 //!   onto the old side within this pipeline.
-//! * A submodule change against the worktree (`git diff <rev>`) still bails — it needs
-//!   the submodule's own repository to resolve the working HEAD.
 //! * A type change (regular file ↔ symlink) in the worktree bails.
+//! * `--ignore-submodules[=<when>]` is accepted and inert: gitlink changes are
+//!   reported whatever it says, apart from the untracked files every diff ignores.
+//! * `-c diff.submodule=<bad value>` warns once. Stock git repeats the warning when
+//!   the value arrives through `-c` (measured: two lines from
+//!   `git -c diff.submodule=bogus diff`, one from the same key in a config file);
+//!   zvcs prints one either way, and matches stock byte for byte for the file case.
 //! * The `patience` diff algorithm has no imara-diff equivalent and bails (the
 //!   `--patience` alias and `diff.algorithm=patience` both surface the same error).
 //! * `--line-prefix=<s>` is reproduced by a whole-buffer pass and so only tracks the
@@ -138,6 +161,32 @@ struct Render {
     hash_kind: gix::hash::Kind,
 }
 
+/// git's `enum diff_submodule_format` (diff.h), selected by `--submodule[=<format>]`
+/// and `diff.submodule`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SubmoduleFormat {
+    /// `DIFF_SUBMODULE_SHORT`: the default — a gitlink pair diffs as the synthetic
+    /// one-line `Subproject commit <oid>` blob each side stands for.
+    Short,
+    /// `DIFF_SUBMODULE_LOG`: `show_submodule_diff_summary()`'s header plus the
+    /// `--left-right --first-parent` commit list.
+    Log,
+    /// `DIFF_SUBMODULE_INLINE_DIFF`: the same header, then the submodule's own
+    /// `git diff` piped through with the gitlink path glued onto both prefixes.
+    InlineDiff,
+}
+
+/// `parse_submodule_params()` (diff.c:194): the three format names, or `None` for
+/// the value git refuses.
+fn parse_submodule_params(value: &str) -> Option<SubmoduleFormat> {
+    match value {
+        "log" => Some(SubmoduleFormat::Log),
+        "short" => Some(SubmoduleFormat::Short),
+        "diff" => Some(SubmoduleFormat::InlineDiff),
+        _ => None,
+    }
+}
+
 /// How lines are compared, mirroring xdiff's `XDF_*` whitespace flags.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Whitespace {
@@ -187,6 +236,14 @@ struct Delta {
     /// none (git prints all-zero), but `hash_filespec()` gives one to every rename
     /// candidate, and `diff_flush_raw()` then prints that real id.
     new_id: Option<ObjectId>,
+    /// git's `p->two->dirty_submodule`: the `DIRTY_SUBMODULE_*` bits describing what
+    /// the submodule worktree holds beyond its recorded commit. Always zero for a
+    /// pair whose post-image is an object.
+    dirty_submodule: u8,
+    /// The commit a *worktree* gitlink post-image stands for: the one the submodule
+    /// currently has checked out, which `run_diff_files()` writes into `p->two->oid`
+    /// while leaving the filespec invalid. `None` for every other pair.
+    new_commit: Option<ObjectId>,
 }
 
 impl Delta {
@@ -230,7 +287,25 @@ impl Delta {
             score: 0,
             status: 0,
             new_id: None,
+            dirty_submodule: 0,
+            new_commit: None,
         }
+    }
+
+    /// `builtin_diff()`'s submodule branch (diff.c:3870): both sides are either
+    /// absent or a gitlink, and the pair is not the phoney one a `--stat`-only run
+    /// queues. Such a pair renders from the submodule's own repository under
+    /// `--submodule=log` / `--submodule=diff` instead of as a blob diff.
+    fn is_submodule_pair(&self) -> bool {
+        let old_ok = match self.old {
+            None => true,
+            Some((_, k)) => k == EntryKind::Commit,
+        };
+        let new_ok = match self.new {
+            NewSide::Absent => true,
+            NewSide::Blob(_, k) | NewSide::Worktree(k) => k == EntryKind::Commit,
+        };
+        old_ok && new_ok && (self.old.is_some() || self.new_valid())
     }
 }
 
@@ -335,6 +410,8 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     // `diff.renameLimit` (`git_diff_basic_config()`), applied in `diff_setup_done()`
     // only when `-l<n>` did not already set an explicit limit.
     let mut rename_limit_default = diffcore_rename::DEFAULT_RENAME_LIMIT;
+    // `--submodule[=<format>]` / `diff.submodule`, seeded from config below.
+    let mut submodule_format = SubmoduleFormat::Short;
 
     // Revisions and pathspecs are classified in a single left-to-right pass, so an
     // invalid option value, an ambiguous positional, and any "too many operands"
@@ -414,6 +491,17 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
         // `diff.renameLimit` (`git_diff_basic_config()`).
         if let Some(n) = snap.integer("diff.renameLimit") {
             rename_limit_default = n;
+        }
+        // `diff.submodule` (`git_diff_ui_config()`, diff.c:453): a value git cannot
+        // parse is a warning, not a fatal, and leaves the format alone.
+        if let Some(v) = snap.string("diff.submodule") {
+            let raw = v.to_str_lossy().into_owned();
+            match parse_submodule_params(&raw) {
+                Some(f) => submodule_format = f,
+                None => eprintln!(
+                    "warning: Unknown value for 'diff.submodule' config variable: '{raw}'"
+                ),
+            }
         }
     }
     // `diff.wsErrorHighlight` (`git_diff_basic_config()`): a value git rejects is
@@ -614,6 +702,21 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
             }
             "--ws-error-highlight" => pending_value = Some(a.to_string()),
             s if s == "--ignore-submodules" || s.starts_with("--ignore-submodules=") => {}
+            // `--submodule[=<format>]` (`diff_opt_submodule()`, diff.c:5916): the
+            // bare form is `log`, not `short`.
+            "--submodule" => submodule_format = SubmoduleFormat::Log,
+            s if s.starts_with("--submodule=") => {
+                let raw = &s["--submodule=".len()..];
+                match parse_submodule_params(raw) {
+                    Some(f) => submodule_format = f,
+                    None => {
+                        eprintln!(
+                            "error: failed to parse --submodule option parameter: '{raw}'"
+                        );
+                        return Ok(ExitCode::from(129));
+                    }
+                }
+            }
             s if s.starts_with("--diff-filter=") => {
                 diff_filter = Some(s.as_bytes()["--diff-filter=".len()..].to_vec());
             }
@@ -1196,8 +1299,40 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
             };
             let mut plain: Vec<u8> = Vec::new();
             let mut files: Vec<diff_color::FilePaint> = Vec::new();
+            // `--submodule=log`/`=diff` write their lines through
+            // `diff_emit_submodule_*()`, which paints each one itself instead of
+            // handing it to `fn_out_consume()`. Draining the assembled patch at
+            // every such pair keeps both the order and those colours intact;
+            // `--color-moved` is the only thing a split buffer would cost, and this
+            // command rejects it outright.
+            let sub_abbrev = crate::abbrev::configured_abbrev(&repo, repo.object_hash().len_in_hex());
             for (delta, an) in deltas.iter().zip(&analyses) {
                 if !delta.unmerged && unmerged.contains(&delta.path) {
+                    continue;
+                }
+                if submodule_format != SubmoduleFormat::Short
+                    && !delta.unmerged
+                    && delta.is_submodule_pair()
+                {
+                    out.extend_from_slice(&diff_color::colorize_patch_ex(
+                        &plain,
+                        &colors,
+                        &paint_opts,
+                        &files,
+                        diff_color::FilePaint::new(ws_rule),
+                        &extra,
+                    ));
+                    plain.clear();
+                    files.clear();
+                    render_submodule(
+                        &mut out,
+                        &repo,
+                        delta,
+                        submodule_format,
+                        sub_abbrev,
+                        &colors,
+                        &r,
+                    );
                     continue;
                 }
                 let before = plain.len();
@@ -1409,8 +1544,12 @@ fn run_diffcore_rename(
     let mut held: Vec<Delta> = Vec::new();
     let mut q = diffcore_rename::Queue::default();
     // spec index -> the "new" side it came from, so a surviving pair can be turned
-    // back into a delta that still knows whether to read the worktree.
+    // back into a delta that still knows whether to read the worktree. A gitlink
+    // pair also has to keep the submodule state it arrived with, which no filespec
+    // has room for.
     let mut new_sides: BTreeMap<usize, NewSide> = BTreeMap::new();
+    let mut submodule_state: BTreeMap<usize, (u8, Option<ObjectId>, Option<ObjectId>)> =
+        BTreeMap::new();
 
     for d in deltas.drain(..) {
         if d.unmerged {
@@ -1442,6 +1581,9 @@ fn run_diffcore_rename(
             )),
         };
         new_sides.insert(two, clone_new_side(&d.new));
+        if d.dirty_submodule != 0 || d.new_commit.is_some() {
+            submodule_state.insert(two, (d.dirty_submodule, d.new_commit, d.new_id));
+        }
         q.add_pair(one, two);
     }
 
@@ -1476,6 +1618,7 @@ fn run_diffcore_rename(
         } else {
             NewSide::Absent
         };
+        let sub_state = two.valid().then(|| submodule_state.get(&p.two).copied()).flatten();
         deltas.push(Delta {
             path,
             old,
@@ -1485,8 +1628,14 @@ fn run_diffcore_rename(
             src_path,
             score: p.score,
             status: p.status,
-            // `hash_filespec()` may have given a worktree post-image a real id.
-            new_id: (two.valid() && two.oid_valid).then_some(two.oid),
+            // `hash_filespec()` may have given a worktree post-image a real id; a
+            // gitlink never goes through it, so its own id survives the queue.
+            new_id: match sub_state {
+                Some((_, _, id)) => id,
+                None => (two.valid() && two.oid_valid).then_some(two.oid),
+            },
+            dirty_submodule: sub_state.map(|(d, _, _)| d).unwrap_or(0),
+            new_commit: sub_state.and_then(|(_, c, _)| c),
         });
     }
     deltas.extend(held);
@@ -1576,6 +1725,8 @@ fn collect_tree_index(
             score: 0,
             status: 0,
             new_id: None,
+            dirty_submodule: 0,
+            new_commit: None,
         });
     }
     Ok(())
@@ -1592,14 +1743,15 @@ fn collect_tree_worktree(
     let tree_id = repo.rev_parse_single(spec)?.object()?.peel_to_tree()?.id;
     let patterns: Vec<BString> = paths.iter().map(|p| BString::from(p.as_str())).collect();
 
-    // Path -> new side, in index order (the order `diff-index` reports in).
-    let mut new_sides: BTreeMap<BString, NewSide> = BTreeMap::new();
-    let mut gitlink: Option<BString> = None;
+    // Path -> new side and its `dirty_submodule` bits, in index order (the order
+    // `diff-index` reports in).
+    let mut new_sides: BTreeMap<BString, (NewSide, u8, Option<ObjectId>)> = BTreeMap::new();
 
     let iter = repo
         .status(gix::progress::Discard)?
         .head_tree(tree_id)
         .tree_index_track_renames(gix::status::tree_index::TrackRenames::Disabled)
+        .index_worktree_submodules(submodule_status())
         .index_worktree_options_mut(|o| {
             o.dirwalk_options = None; // exclude untracked files, matching `git diff`
             o.rewrites = None; // no rename detection
@@ -1614,45 +1766,67 @@ fn collect_tree_worktree(
                 let (loc, _, entry_mode, oid) = change.fields();
                 let (location, id) = (loc.to_owned(), oid.to_owned());
                 match if deleted { None } else { index_mode_kind(entry_mode) } {
-                    Some(EntryKind::Commit) => gitlink = Some(location),
+                    // A gitlink the index already moved: the worktree pass below
+                    // overrides this with the submodule's checked-out `HEAD` when
+                    // the two disagree.
                     Some(k) => {
-                        new_sides.insert(location, NewSide::Blob(id, k));
+                        new_sides.insert(location, (NewSide::Blob(id, k), 0, None));
                     }
                     None => {
-                        new_sides.insert(location, NewSide::Absent);
+                        new_sides.insert(location, (NewSide::Absent, 0, None));
                     }
                 }
             }
             gix::status::Item::IndexWorktree(item) => {
-                if let Some((path, new)) = worktree_new_side(item)? {
-                    new_sides.insert(path, new);
+                if let Some((path, new, dirty, head)) = worktree_new_side(item)? {
+                    new_sides.insert(path, (new, dirty, head));
                 }
             }
         }
     }
-    if let Some(p) = gitlink {
-        bail!("submodule/gitlink change at {p:?} is not supported");
-    }
 
     let tree = repo.find_object(tree_id)?.peel_to_tree()?;
-    for (path, new) in new_sides {
+    for (path, (new, dirty, head)) in new_sides {
         let old = tree_entry(&tree, &path)?;
-        if matches!(old, Some((_, EntryKind::Commit))) {
-            bail!("submodule/gitlink change at {path:?} is not supported");
-        }
         // A path that neither existed in the tree nor exists now is not a change.
         if old.is_none() && matches!(new, NewSide::Absent) {
             continue;
         }
-        // Unchanged content that only travelled through the index is not a change.
+        // Unchanged content that only travelled through the index is not a change —
+        // unless it is a submodule whose worktree is dirty, which `diff_unmodified_pair()`
+        // (diff.c:6528) keeps precisely because of that bit.
         if let (Some((oid, ok)), NewSide::Blob(nid, nk)) = (&old, &new) {
-            if oid == nid && ok == nk {
+            if oid == nid && ok == nk && dirty == 0 {
                 continue;
             }
         }
-        deltas.push(Delta::plain(path, old, new));
+        // The same test for a gitlink whose post-image is the submodule's worktree:
+        // the tree already names the commit it has checked out.
+        if let (Some((oid, EntryKind::Commit)), Some(h)) = (&old, head) {
+            if *oid == h && dirty == 0 {
+                continue;
+            }
+        }
+        let mut delta = Delta::plain(path, old, new);
+        delta.dirty_submodule = dirty;
+        delta.new_commit = head;
+        // As in `collect_index_worktree()`: only a gitlink that did not move keeps
+        // a printable post-image id.
+        delta.new_id = head.filter(|h| old.map(|(id, _)| id) == Some(*h));
+        deltas.push(delta);
     }
     Ok(())
+}
+
+/// git's `ignore_untracked_in_submodules` default (`diff_setup_done()`, diff.c:5169):
+/// a diff never counts untracked files inside a submodule as damage, so the status
+/// walk is told the same thing rather than paying for a dirwalk whose result would
+/// be dropped.
+fn submodule_status() -> gix::status::Submodule {
+    gix::status::Submodule::Given {
+        ignore: gix::submodule::config::Ignore::Untracked,
+        check_dirty: false,
+    }
 }
 
 /// The index vs. the worktree (plain `git diff`).
@@ -1667,6 +1841,7 @@ fn collect_index_worktree(
     let patterns: Vec<BString> = paths.iter().map(|p| BString::from(p.as_str())).collect();
     let iter = repo
         .status(gix::progress::Discard)?
+        .index_worktree_submodules(submodule_status())
         .index_worktree_options_mut(|o| {
             o.dirwalk_options = None; // exclude untracked files, matching `git diff`
             o.rewrites = None; // no rename detection
@@ -1690,14 +1865,21 @@ fn collect_index_worktree(
                 continue;
             }
         }
-        if let Some((path, new)) = worktree_new_side(item)? {
+        if let Some((path, new, dirty, head)) = worktree_new_side(item)? {
             // A worktree entry with no index counterpart cannot happen here (the
             // dirwalk is off), so the old side is always the index entry.
             let entry = index
                 .entry_by_path(path.as_bstr())
                 .ok_or_else(|| anyhow::anyhow!("no index entry for {path:?}"))?;
             let old_kind = index_mode_kind(entry.mode).unwrap_or(EntryKind::Blob);
-            deltas.push(Delta::plain(path, Some((entry.id, old_kind)), new));
+            let mut delta = Delta::plain(path, Some((entry.id, old_kind)), new);
+            delta.dirty_submodule = dirty;
+            delta.new_commit = head;
+            // `run_diff_files()` leaves a moved gitlink's post-image invalid, so
+            // `--raw` prints all-zero for it; a submodule that is only dirty keeps
+            // the id, since the gitlink itself did not move.
+            delta.new_id = head.filter(|h| *h == entry.id);
+            deltas.push(delta);
         }
     }
 
@@ -1719,6 +1901,8 @@ fn collect_index_worktree(
             score: 0,
             status: 0,
             new_id: None,
+            dirty_submodule: 0,
+            new_commit: None,
         });
         if let (Some(s), Some(k)) = (stages, wt_kind) {
             deltas.push(Delta::plain(path, Some((s.ours.0, s.ours.1)), NewSide::Worktree(k)));
@@ -1727,11 +1911,12 @@ fn collect_index_worktree(
     Ok(())
 }
 
-/// The "new" side an index-vs-worktree status item implies, or `None` when the
-/// item carries no textual change.
+/// The "new" side an index-vs-worktree status item implies, together with the
+/// `DIRTY_SUBMODULE_*` bits and the checked-out submodule commit it carries, or
+/// `None` when the item is not a change.
 fn worktree_new_side(
     item: gix::status::index_worktree::Item,
-) -> Result<Option<(BString, NewSide)>> {
+) -> Result<Option<(BString, NewSide, u8, Option<ObjectId>)>> {
     use gix::status::index_worktree::Item;
     use gix::status::plumbing::index_as_worktree::{Change, EntryStatus};
 
@@ -1748,8 +1933,28 @@ fn worktree_new_side(
     };
     let old_kind = index_mode_kind(entry.mode).unwrap_or(EntryKind::Blob);
     if matches!(old_kind, EntryKind::Commit) {
-        // Submodule content change; `git diff` renders this specially. Skip.
-        return Ok(None);
+        // A gitlink's post-image is the commit its worktree currently has checked
+        // out — `run_diff_files()` fills the filespec with that id and leaves it
+        // marked invalid, which is why `--raw` still prints all-zero for it once it
+        // has moved. Local damage inside the submodule rides along as
+        // `two->dirty_submodule`.
+        return Ok(match status {
+            EntryStatus::Change(Change::SubmoduleModification(sm)) => {
+                let head = sm.checked_out_head_id.unwrap_or(entry.id);
+                let dirty = if sm.changes.as_ref().is_some_and(|c| !c.is_empty()) {
+                    super::diff_pairs::DIRTY_SUBMODULE_MODIFIED
+                } else {
+                    0
+                };
+                Some((rela_path, NewSide::Worktree(EntryKind::Commit), dirty, Some(head)))
+            }
+            // The whole submodule directory is gone from the worktree.
+            EntryStatus::Change(Change::Removed) => Some((rela_path, NewSide::Absent, 0, None)),
+            EntryStatus::Change(Change::Type { .. }) => {
+                bail!("type change at {rela_path:?} is not supported")
+            }
+            _ => None,
+        });
     }
     Ok(match status {
         EntryStatus::Change(Change::Modification {
@@ -1761,15 +1966,15 @@ fn worktree_new_side(
             } else {
                 old_kind
             };
-            Some((rela_path, NewSide::Worktree(new_kind)))
+            Some((rela_path, NewSide::Worktree(new_kind), 0, None))
         }
-        EntryStatus::Change(Change::Removed) => Some((rela_path, NewSide::Absent)),
+        EntryStatus::Change(Change::Removed) => Some((rela_path, NewSide::Absent, 0, None)),
         EntryStatus::Change(Change::Type { .. }) => {
             bail!("type change at {rela_path:?} is not supported")
         }
         // A conflicted path still has worktree content; only `git diff` with no
         // revision treats it specially, and that caller intercepts it first.
-        EntryStatus::Conflict { .. } => Some((rela_path, NewSide::Worktree(old_kind))),
+        EntryStatus::Conflict { .. } => Some((rela_path, NewSide::Worktree(old_kind), 0, None)),
         // Submodule content modification, intent-to-add, and stat-only refreshes
         // produce no textual diff.
         EntryStatus::Change(Change::SubmoduleModification(_))
@@ -2477,10 +2682,20 @@ fn analyze(
     };
     let new_commit = match &delta.new {
         NewSide::Blob(id, EntryKind::Commit) => Some(*id),
+        // A worktree gitlink names the commit the submodule has checked out.
+        NewSide::Worktree(EntryKind::Commit) => delta.new_commit,
         _ => None,
     };
     if old_commit.is_some() || new_commit.is_some() {
-        return analyze_gitlink(old_commit, new_commit, null, ctx, want_patch, algo_override);
+        return analyze_gitlink(
+            old_commit,
+            new_commit,
+            delta.dirty_submodule,
+            null,
+            ctx,
+            want_patch,
+            algo_override,
+        );
     }
 
     let path = delta.path.as_bstr();
@@ -2902,22 +3117,32 @@ fn emit_rewrite_lines(out: &mut Vec<u8>, prefix: u8, data: &[u8]) {
 /// Diff a submodule (gitlink) pair as git's `show_submodule_summary`-free short
 /// format does: one `Subproject commit <full-oid>` line per present side. The new
 /// object id on the `index` line is the new commit id (or null when removed).
+///
+/// `dirty` is `two->dirty_submodule`: `diff_populate_gitlink()` (diff.c:4475) glues
+/// `-dirty` onto the post-image line whenever any of its bits is set, so a submodule
+/// with local damage differs from its own recorded commit.
 fn analyze_gitlink(
     old_commit: Option<ObjectId>,
     new_commit: Option<ObjectId>,
+    dirty: u8,
     null: ObjectId,
     ctx: u32,
     want_patch: bool,
     algo_override: Option<gix::diff::blob::Algorithm>,
 ) -> Result<Analysis> {
-    let line = |id: ObjectId| -> Vec<u8> {
+    let line = |id: ObjectId, dirty: bool| -> Vec<u8> {
         let mut v = b"Subproject commit ".to_vec();
         v.extend_from_slice(id.to_hex().to_string().as_bytes());
+        if dirty {
+            v.extend_from_slice(b"-dirty");
+        }
         v.push(b'\n');
         v
     };
-    let before: Vec<Vec<u8>> = old_commit.map(|id| vec![line(id)]).unwrap_or_default();
-    let after: Vec<Vec<u8>> = new_commit.map(|id| vec![line(id)]).unwrap_or_default();
+    let before: Vec<Vec<u8>> = old_commit.map(|id| vec![line(id, false)]).unwrap_or_default();
+    let after: Vec<Vec<u8>> = new_commit
+        .map(|id| vec![line(id, dirty != 0)])
+        .unwrap_or_default();
     let before_r: Vec<&[u8]> = before.iter().map(|l| l.as_slice()).collect();
     let after_r: Vec<&[u8]> = after.iter().map(|l| l.as_slice()).collect();
 
@@ -2926,9 +3151,18 @@ fn analyze_gitlink(
     input.update_after(after_r.iter().map(|l| l.to_vec()));
     let algorithm = algo_override.unwrap_or(gix::diff::blob::Algorithm::Myers);
     let diff = diff_with_slider_heuristics(algorithm, &input);
-    let added = diff.count_additions();
-    let deleted = diff.count_removals();
-    let hunks = if want_patch && (added != 0 || deleted != 0) {
+    // The `-dirty` marker moves the patch but not the stat formats: measured against
+    // git 2.55.0 on a submodule whose worktree is damaged at the commit the index
+    // already records, `git diff` prints the `-Subproject commit <oid>` /
+    // `+Subproject commit <oid>-dirty` hunk while `git diff --numstat` prints
+    // `0\t0\tsub` and `--shortstat` prints `1 file changed, 0 insertions(+),
+    // 0 deletions(-)`. So the counts come from the two commit ids alone.
+    let (added, deleted) = if dirty != 0 && old_commit == new_commit {
+        (0, 0)
+    } else {
+        (diff.count_additions(), diff.count_removals())
+    };
+    let hunks = if want_patch && (diff.count_additions() != 0 || diff.count_removals() != 0) {
         let sink = PatchSink {
             buf: Vec::new(),
             before: &before_r,
@@ -3526,6 +3760,134 @@ fn render_stat(
 
     let (files, adds, dels) = stat_totals(deltas, analyses);
     stat_summary(out, files, adds, dels);
+}
+
+/// `builtin_diff()`'s two submodule branches (diff.c:3870): under `--submodule=log`
+/// the pair renders as `show_submodule_diff_summary()`, and under `--submodule=diff`
+/// as the shared header followed by the submodule's own diff.
+///
+/// The bytes are written already painted — git emits them through
+/// `diff_emit_submodule_*()`, which never passes them to `fn_out_consume()`.
+fn render_submodule(
+    out: &mut Vec<u8>,
+    repo: &gix::Repository,
+    delta: &Delta,
+    format: SubmoduleFormat,
+    abbrev: usize,
+    colors: &diff_color::DiffColors,
+    r: &Render,
+) {
+    let null = r.hash_kind.null();
+    // `p->one->oid` / `p->two->oid`: the null id stands for the side that is absent.
+    let one = delta.old.map(|(id, _)| id).unwrap_or(null);
+    let two = match delta.new {
+        NewSide::Blob(id, _) => id,
+        NewSide::Worktree(_) => delta.new_commit.unwrap_or(null),
+        NewSide::Absent => null,
+    };
+    let path = delta.old_path();
+    if format == SubmoduleFormat::Log {
+        super::diff_pairs::show_submodule_diff_summary(
+            out,
+            repo,
+            path,
+            &one,
+            &two,
+            delta.dirty_submodule,
+            abbrev,
+            colors,
+        );
+        return;
+    }
+    let hdr = super::diff_pairs::show_submodule_header(
+        out,
+        repo,
+        path,
+        &one,
+        &two,
+        delta.dirty_submodule,
+        abbrev,
+    );
+    // "We need a valid left and right commit to display a difference."
+    if !(hdr.left.is_some() || one.is_null()) || !(hdr.right.is_some() || two.is_null()) {
+        return;
+    }
+    match submodule_inline_diff(repo, path, &hdr, &one, &two, delta.dirty_submodule, colors, r) {
+        Some(text) => out.extend_from_slice(&text),
+        // `diff_emit_submodule_error()`: the child could not be started, or it
+        // failed once it had.
+        None => out.extend_from_slice(b"(diff failed)\n"),
+    }
+}
+
+/// `show_submodule_inline_diff()`'s child process (submodule.c:654): a whole second
+/// `diff --submodule=diff` run *inside* the submodule, with the gitlink path glued
+/// onto both prefixes so every file it names is reachable from the superproject.
+/// git spawns `git`; this spawns the running binary, which answers the same options.
+#[allow(clippy::too_many_arguments)]
+fn submodule_inline_diff(
+    repo: &gix::Repository,
+    path: &BString,
+    hdr: &super::diff_pairs::SubmoduleHeader,
+    one: &ObjectId,
+    two: &ObjectId,
+    dirty: u8,
+    colors: &diff_color::DiffColors,
+    r: &Render,
+) -> Option<Vec<u8>> {
+    let empty_tree = gix::ObjectId::empty_tree(r.hash_kind);
+    let old_oid = if hdr.left.is_some() { *one } else { empty_tree };
+    let new_oid = if hdr.right.is_some() { *two } else { empty_tree };
+
+    let workdir = repo.workdir()?;
+    let dir = workdir.join(gix::path::from_bstr(path.as_bstr()).as_ref());
+    let exe = std::env::current_exe().ok()?;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("diff").arg("--submodule=diff");
+    cmd.arg(format!(
+        "--color={}",
+        if colors.enabled() { "always" } else { "never" }
+    ));
+    // `-R` swaps which prefix each side is given; every other option keeps them.
+    let (src, dst) = (&r.src_prefix, &r.dst_prefix);
+    let prefix = |lead: &str, base: &[u8]| -> std::ffi::OsString {
+        let mut v = lead.as_bytes().to_vec();
+        v.extend_from_slice(base);
+        v.extend_from_slice(path);
+        v.push(b'/');
+        gix::path::from_byte_slice(&v).as_os_str().to_owned()
+    };
+    cmd.arg(prefix("--src-prefix=", src));
+    cmd.arg(prefix("--dst-prefix=", dst));
+    cmd.arg(old_oid.to_hex().to_string());
+    // "If the submodule has modified content, we will diff against the work tree" —
+    // so the second revision is left off and the child compares against its own
+    // worktree instead.
+    if dirty & super::diff_pairs::DIRTY_SUBMODULE_MODIFIED == 0 {
+        cmd.arg(new_oid.to_hex().to_string());
+    }
+    if !dir.is_dir() {
+        // `prepare_submodule_repo_env()`'s fallback to an absorbed git dir.
+        let sub = hdr.sub.as_ref()?;
+        cmd.current_dir(sub.git_dir());
+        cmd.env("GIT_DIR", ".").env("GIT_WORK_TREE", ".");
+    } else {
+        cmd.current_dir(&dir);
+        // `prepare_submodule_repo_env()`: the superproject's repository variables
+        // must not leak into the child.
+        cmd.env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .env_remove("GIT_OBJECT_DIRECTORY")
+            .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+            .env_remove("GIT_PREFIX")
+            .env_remove("GIT_COMMON_DIR");
+    }
+    let out = cmd.output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(out.stdout)
 }
 
 /// Render one delta as a `git diff` file section into `out`.

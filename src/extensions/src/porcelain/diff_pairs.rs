@@ -3287,6 +3287,14 @@ fn submodule_walk(
     out
 }
 
+/// `DIRTY_SUBMODULE_UNTRACKED` (submodule.h): the submodule worktree holds
+/// untracked files. `git diff` clears this bit by default
+/// (`ignore_untracked_in_submodules` in `diff_setup_done()`, diff.c:5169).
+pub(crate) const DIRTY_SUBMODULE_UNTRACKED: u8 = 1;
+/// `DIRTY_SUBMODULE_MODIFIED`: tracked content inside the submodule worktree
+/// differs from its `HEAD`.
+pub(crate) const DIRTY_SUBMODULE_MODIFIED: u8 = 2;
+
 /// `show_submodule_diff_summary()` (submodule.c:614), preceded by the
 /// `show_submodule_header()` it shares with the inline-diff format.
 ///
@@ -3294,15 +3302,81 @@ fn submodule_walk(
 /// paints the header with nothing and the two commit markers with `DIFF_FILE_OLD`
 /// (the left side) and `DIFF_FILE_NEW` (the right). The caller supplies
 /// `--line-prefix`.
-fn show_submodule_diff_summary(
+///
+/// `dirty` is git's `two->dirty_submodule` bitmask, which only a worktree pair
+/// ever carries: its two bits print their own line ahead of the header, and an
+/// otherwise-unchanged gitlink then stops there.
+pub(crate) fn show_submodule_diff_summary(
     out: &mut Vec<u8>,
     repo: &gix::Repository,
-    p: &Pair,
+    path: &BString,
+    one: &ObjectId,
+    two: &ObjectId,
+    dirty: u8,
     base_abbrev: usize,
     colors: &diff_color::DiffColors,
 ) {
-    let path = &p.old_path;
-    let (one, two) = (&p.old_id, &p.new_id);
+    let hdr = show_submodule_header(out, repo, path, one, two, dirty, base_abbrev);
+
+    // "If we don't have both a left and a right pointer, there is no reason to try
+    // and display a summary."
+    let (Some(sub), Some(l), Some(r)) = (&hdr.sub, hdr.left, hdr.right) else {
+        return;
+    };
+    for c in submodule_walk(sub, l, r, &hdr.bases) {
+        let mut line = b"  ".to_vec();
+        line.push(if c.left { b'<' } else { b'>' });
+        line.push(b' ');
+        line.extend_from_slice(&super::cherry::subject_of(sub, c.id).unwrap_or_default());
+        let slot = if c.left {
+            diff_color::DiffSlot::Old
+        } else {
+            diff_color::DiffSlot::New
+        };
+        diff_color::paint(out, colors, slot, &line);
+        out.push(b'\n');
+    }
+}
+
+/// What `show_submodule_header()` resolves for the caller that follows it: git
+/// passes these back through the `sub` / `left` / `right` / `merge_bases`
+/// out-parameters.
+pub(crate) struct SubmoduleHeader {
+    /// The submodule's own repository, when it could be opened at all.
+    pub(crate) sub: Option<gix::Repository>,
+    /// The pre-image commit, peeled inside `sub`.
+    pub(crate) left: Option<ObjectId>,
+    /// The post-image commit, peeled inside `sub`.
+    pub(crate) right: Option<ObjectId>,
+    /// Their merge bases, which decide `..` versus `...` and the `(rewind)` suffix.
+    pub(crate) bases: Vec<ObjectId>,
+}
+
+/// `show_submodule_header()` (submodule.c:538): the `Submodule <path> <a>..<b>`
+/// line both `--submodule=log` and `--submodule=diff` open with, plus the commits
+/// each of them then needs.
+pub(crate) fn show_submodule_header(
+    out: &mut Vec<u8>,
+    repo: &gix::Repository,
+    path: &BString,
+    one: &ObjectId,
+    two: &ObjectId,
+    dirty: u8,
+    base_abbrev: usize,
+) -> SubmoduleHeader {
+    // `show_submodule_header()`'s first two statements (submodule.c:550): both
+    // land before the `oideq(one, two)` early return, so a submodule that only
+    // has local damage prints these and nothing else.
+    if dirty & DIRTY_SUBMODULE_UNTRACKED != 0 {
+        out.extend_from_slice(b"Submodule ");
+        out.extend_from_slice(path);
+        out.extend_from_slice(b" contains untracked content\n");
+    }
+    if dirty & DIRTY_SUBMODULE_MODIFIED != 0 {
+        out.extend_from_slice(b"Submodule ");
+        out.extend_from_slice(path);
+        out.extend_from_slice(b" contains modified content\n");
+    }
     let sub = open_submodule(repo, path);
 
     let mut message: Option<&str> = if one.is_null() {
@@ -3318,9 +3392,9 @@ fn show_submodule_diff_summary(
     let mut fast_forward = false;
     let mut fast_backward = false;
 
-    if let Some(sub) = &sub {
-        left = lookup_commit_reference(sub, one);
-        right = lookup_commit_reference(sub, two);
+    if let Some(subr) = &sub {
+        left = lookup_commit_reference(subr, one);
+        right = lookup_commit_reference(subr, two);
         // "Warn about missing commits in the submodule project, but only if they
         // aren't null."
         if (!one.is_null() && left.is_none()) || (!two.is_null() && right.is_none()) {
@@ -3335,12 +3409,15 @@ fn show_submodule_diff_summary(
             // than `...`.
             (None, None) => fast_forward = true,
             (Some(l), Some(r)) if l == r => bases.push(l),
-            (Some(l), Some(r)) => match repo_merge_bases(sub, l, r) {
+            (Some(l), Some(r)) => match repo_merge_bases(subr, l, r) {
                 Ok(b) => bases = b,
                 Err(()) => {
                     message = Some("(corrupt repository)");
                     emit_submodule_header(out, repo, path, one, two, base_abbrev, message, false, false);
-                    return;
+                    // The header is the whole report for an object store that
+                    // cannot answer a merge-base query: with no bases to mark
+                    // uninteresting, a walk would print both histories in full.
+                    return SubmoduleHeader { sub, left: None, right: None, bases };
                 }
             },
             _ => {}
@@ -3352,9 +3429,10 @@ fn show_submodule_diff_summary(
                 fast_backward = true;
             }
         }
-        // An unchanged gitlink prints nothing at all — not even the header.
+        // An unchanged gitlink prints no header at all — the `-dirty` lines above
+        // are the whole report.
         if one == two {
-            return;
+            return SubmoduleHeader { sub, left, right, bases };
         }
     } else if message.is_none() {
         message = Some("(commits not present)");
@@ -3371,25 +3449,7 @@ fn show_submodule_diff_summary(
         fast_forward,
         fast_backward,
     );
-
-    // "If we don't have both a left and a right pointer, there is no reason to try
-    // and display a summary."
-    let (Some(sub), Some(l), Some(r)) = (&sub, left, right) else {
-        return;
-    };
-    for c in submodule_walk(sub, l, r, &bases) {
-        let mut line = b"  ".to_vec();
-        line.push(if c.left { b'<' } else { b'>' });
-        line.push(b' ');
-        line.extend_from_slice(&super::cherry::subject_of(sub, c.id).unwrap_or_default());
-        let slot = if c.left {
-            diff_color::DiffSlot::Old
-        } else {
-            diff_color::DiffSlot::New
-        };
-        diff_color::paint(out, colors, slot, &line);
-        out.push(b'\n');
-    }
+    SubmoduleHeader { sub, left, right, bases }
 }
 
 /// `repo_get_merge_bases()`, reduced to the shape this caller needs: every merge
@@ -5180,7 +5240,18 @@ fn render_patch(
             && (step.new_mode == 0 || is_gitlink_mode(step.new_mode))
         {
             let mut lines = Vec::new();
-            show_submodule_diff_summary(&mut lines, repo, step, base_abbrev, sink.colors);
+            show_submodule_diff_summary(
+                &mut lines,
+                repo,
+                &step.old_path,
+                &step.old_id,
+                &step.new_id,
+                // A `diff-pairs` batch is read from stdin, so no side of it was
+                // ever a worktree: `two->dirty_submodule` is always zero here.
+                0,
+                base_abbrev,
+                sink.colors,
+            );
             sink.prefixed(&lines);
             *found_changes = true;
             continue;

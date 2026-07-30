@@ -2209,6 +2209,17 @@ fn render_long(
     if !unmerged.is_empty() {
         out.push_str(&h("Unmerged paths:\n"));
         if hints {
+            // `wt_longstatus_print_unmerged_header()` leads with the same unstage
+            // hint the staged section carries, under the same conditions — so a
+            // conflict left by something other than a merge in progress (a
+            // `stash apply`, say) says how to unstage it.
+            if !merging {
+                if unborn {
+                    out.push_str(&h("  (use \"git rm --cached <file>...\" to unstage)\n"));
+                } else {
+                    out.push_str(&h("  (use \"git restore --staged <file>...\" to unstage)\n"));
+                }
+            }
             out.push_str(&h(unmerged_hint(unmerged)));
         }
         for (mask, path) in unmerged {

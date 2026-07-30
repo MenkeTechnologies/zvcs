@@ -58,6 +58,47 @@ pub fn ssh_fatal(url: &str, err: &anyhow::Error) -> Option<ExitCode> {
     Some(ExitCode::from(128))
 }
 
+/// git's report for an `ERR <message>` packet line, or `None` when `err` is not
+/// one.
+///
+/// `upload-pack` answers a request it cannot serve with a single `ERR` line —
+/// `ERR upload-pack: not our ref <oid>` for a want it cannot reach — and git's
+/// `pkt-line.c` turns that into
+///
+/// ```text
+/// fatal: remote error: upload-pack: not our ref <oid>
+/// ```
+///
+/// with exit 128 (`die()` under `PACKET_READ_DIE_ON_ERR_PACKET`). The message is
+/// the server's, so it is printed verbatim after the fixed prefix.
+pub fn remote_error_fatal(err: &anyhow::Error) -> Option<ExitCode> {
+    let message = remote_error_message(err.as_ref())?;
+    eprintln!("fatal: remote error: {message}");
+    Some(ExitCode::from(128))
+}
+
+/// The server's message from an `ERR` line anywhere in `err`'s source chain.
+///
+/// Both spellings the vendored protocol produces are checked: the packetline
+/// reader's own error (transports whose reader keeps `fail_on_err_lines`, i.e.
+/// `git://` and `file://`) and the fetch-response parser's wrapper around it
+/// (HTTP, whose reader starts fresh for every request).
+fn remote_error_message(err: &(dyn std::error::Error + 'static)) -> Option<String> {
+    let mut source = Some(err);
+    while let Some(err) = source {
+        if let Some(err) = err.downcast_ref::<gix::protocol::transport::packetline::read::Error>() {
+            return Some(err.message.to_string());
+        }
+        if let Some(gix::protocol::fetch::response::Error::UploadPack(err)) =
+            err.downcast_ref::<gix::protocol::fetch::response::Error>()
+        {
+            return Some(err.message.to_string());
+        }
+        source = err.source();
+    }
+    None
+}
+
 /// Whether `url` names an ssh remote — the `ssh://` scheme or the scp-like
 /// `[user@]host:path` shorthand, both of which `gix_url` resolves to `Ssh`.
 fn is_ssh(url: &str) -> bool {

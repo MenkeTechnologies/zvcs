@@ -1922,7 +1922,7 @@ fn hook_is_runnable(repo: &gix::Repository, name: &str) -> bool {
 /// An unmerged entry makes both `diff-files` and `diff-index --cached` report a
 /// change, so a conflicted index is both unstaged *and* uncommitted regardless
 /// of what the worktree looks like.
-fn dirty_state(repo: &gix::Repository) -> Result<(bool, bool, Vec<String>)> {
+pub(super) fn dirty_state(repo: &gix::Repository) -> Result<(bool, bool, Vec<String>)> {
     let mut conflicts: Vec<String> = Vec::new();
     {
         let index = repo.index_or_load_from_head()?.into_owned();

@@ -28,7 +28,27 @@
 //! Supported invocation forms:
 //!   * `git pull`                  — use the current branch's configured upstream.
 //!   * `git pull <remote>`         — fetch `<remote>`, merge the configured upstream branch.
-//!   * `git pull <remote> <branch>`— fetch `<remote>`, merge `refs/remotes/<remote>/<branch>`.
+//!   * `git pull <remote> <ref>`   — fetch `<remote>`, merge `refs/remotes/<remote>/<ref>`
+//!     when the fetch produced that tracking ref, and `FETCH_HEAD` otherwise.
+//!     `cmd_pull()` takes its merge heads from `FETCH_HEAD` throughout
+//!     (`get_merge_heads()`), so a `<ref>` that lands nowhere under
+//!     `refs/remotes/` — a tag, a `refs/pull/…` head, anything outside the
+//!     remote's refspec — integrates just the same.
+//!
+//! Every `--no-` spelling of a forwarded fetch option (`--no-tags`,
+//! `--no-prune`, `--no-force`, `--no-all`, `--no-keep`, …) is accepted and
+//! handed to the fetch: git declares them `OPT_PASSTHRU`/`OPT_BOOL` and
+//! `recreate_opt()` passes on whichever spelling it saw.
+//!
+//! Two gates sit outside the integration step, both from `cmd_pull()`:
+//!   * When rebasing without `--autostash`, `require_clean_work_tree()` runs
+//!     *before* the fetch, so a dirty tree ends the pull with
+//!     `error: cannot pull with rebase: You have unstaged changes.` and exit
+//!     128 — no network traffic, no tracking refs moved.
+//!   * An unborn `HEAD` is `pull_into_void()`: the fetched head is checked out
+//!     over the empty tree and becomes the branch's first commit, with an
+//!     `initial pull` reflog entry. This is the
+//!     `git init && git remote add && git pull` path.
 //!
 //! Fast-forward policy (merge path only): `pull.ff` (`true`/`false`/`only`) is
 //! the default, overriding `merge.ff` for `pull` as git's `config_get_ff()`
@@ -249,8 +269,11 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
     // Knobs forwarded to `fetch`.
     let mut f_all = false;
     let mut f_force = false;
-    let mut f_tags = false;
-    let mut f_prune = false;
+    // `None` where git would push nothing at all to the fetch; `Some(false)` is
+    // the `--no-` spelling, which git recreates and forwards just like the
+    // positive one.
+    let mut f_tags: Option<bool> = None;
+    let mut f_prune: Option<bool> = None;
     let mut f_unshallow = false;
     let mut f_update_shallow = false;
     let mut f_depth: Option<String> = None;
@@ -263,7 +286,7 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
     let mut f_progress: Option<bool> = None;
     let mut f_dry_run = false;
     let mut f_append = false;
-    let mut f_keep = false;
+    let mut f_keep: Option<bool> = None;
     let mut f_show_forced: Option<bool> = None;
     let mut f_recurse: Option<String> = None;
     let mut f_jobs: Option<String> = None;
@@ -329,26 +352,43 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
             "--compact-summary" => diffstat = Some("--compact-summary"),
             "--no-compact-summary" => diffstat = Some("--no-compact-summary"),
             "-s" | "--strategy" => strategy = Some(take_value!("strategy")),
+            "--no-strategy" => strategy = None,
             "-X" | "--strategy-option" => strategy_opts.push(take_value!("strategy-option")),
+            "--no-strategy-option" => strategy_opts.clear(),
             "--signoff" => signoff = true,
             "--no-signoff" => signoff = false,
             "--autostash" => autostash = Some(true),
             "--no-autostash" => autostash = Some(false),
 
-            // Fetch knobs forwarded to super::fetch.
+            // Fetch knobs forwarded to super::fetch. git declares each of these
+            // `OPT_PASSTHRU`/`OPT_BOOL`, so every one has a `--no-` spelling that
+            // `recreate_opt()` hands to the fetch verbatim — `git pull --no-tags`
+            // has to reach `git fetch --no-tags` rather than be rejected here.
             "--all" => f_all = true,
+            "--no-all" => f_all = false,
             "-f" | "--force" => f_force = true,
-            "-t" | "--tags" => f_tags = true,
-            "-p" | "--prune" => f_prune = true,
+            "--no-force" => f_force = false,
+            "-t" | "--tags" => f_tags = Some(true),
+            "--no-tags" => f_tags = Some(false),
+            "-p" | "--prune" => f_prune = Some(true),
+            "--no-prune" => f_prune = Some(false),
             "--unshallow" => f_unshallow = true,
             "--update-shallow" => f_update_shallow = true,
             "--no-update-shallow" => f_update_shallow = false,
             "--depth" => f_depth = Some(take_value!("depth")),
+            "--no-depth" => f_depth = None,
             "--deepen" => f_deepen = Some(take_value!("deepen")),
+            "--no-deepen" => f_deepen = None,
             "--shallow-since" => f_shallow_since = Some(take_value!("shallow-since")),
+            "--no-shallow-since" => f_shallow_since = None,
             "--shallow-exclude" => f_shallow_exclude.push(take_value!("shallow-exclude")),
+            "--no-shallow-exclude" => f_shallow_exclude.clear(),
+            // `OPT__VERBOSITY` counts up and down; the `--no-` spellings zero
+            // their own side rather than being unknown options.
             "-q" | "--quiet" => f_quiet = true,
+            "--no-quiet" => f_quiet = false,
             "-v" | "--verbose" => f_verbose = true,
+            "--no-verbose" => f_verbose = false,
             "--progress" => f_progress = Some(true),
             "--no-progress" => f_progress = Some(false),
             // git's pull runs the fetch with `--dry-run` and then returns
@@ -358,7 +398,11 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
             "--no-dry-run" => f_dry_run = false,
             "-a" | "--append" => f_append = true,
             "--no-append" => f_append = false,
-            "-k" | "--keep" => f_keep = true,
+            "-k" | "--keep" => f_keep = Some(true),
+            // Forwarded rather than swallowed: the fetch port is where the
+            // "no unpack-objects path" refusal lives, and git's pull passes the
+            // flag straight through too.
+            "--no-keep" => f_keep = Some(false),
             "--show-forced-updates" => f_show_forced = Some(true),
             "--no-show-forced-updates" => f_show_forced = Some(false),
             "--recurse-submodules" => {
@@ -371,14 +415,23 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
             "-j" | "--jobs" => f_jobs = inline.clone(),
             "--no-jobs" => f_jobs = None,
             "--upload-pack" => f_upload_pack = Some(take_value!("upload-pack")),
+            "--no-upload-pack" => f_upload_pack = None,
             "-o" | "--server-option" => f_server_options.push(take_value!("server-option")),
+            "--no-server-option" => f_server_options.clear(),
             "--refmap" => f_refmap.push(take_value!("refmap")),
             "--negotiation-restrict" | "--negotiation-tip" => {
                 f_negotiation_restrict.push(take_value!("negotiation-restrict"));
             }
+            "--no-negotiation-restrict" | "--no-negotiation-tip" => f_negotiation_restrict.clear(),
             "--negotiation-include" => f_negotiation_include.push(take_value!("negotiation-include")),
+            "--no-negotiation-include" => f_negotiation_include.clear(),
             "-4" | "--ipv4" => f_address_family = Some("--ipv4"),
             "-6" | "--ipv6" => f_address_family = Some("--ipv6"),
+            // git's pull knows `--[no-]ipv4`/`--[no-]ipv6` and recreates whichever
+            // spelling it saw for the fetch, where the negation is an unknown
+            // option — so the negation is forwarded rather than swallowed here.
+            "--no-ipv4" => f_address_family = Some("--no-ipv4"),
+            "--no-ipv6" => f_address_family = Some("--no-ipv6"),
 
             // `--verify` (default) / `--no-verify` reach the merge, which runs
             // the `pre-merge-commit` and `commit-msg` hooks.
@@ -392,6 +445,7 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
             "--squash" => squash = Some(true),
             "--no-squash" => squash = Some(false),
             "--allow-unrelated-histories" => allow_unrelated = true,
+            "--no-allow-unrelated-histories" => allow_unrelated = false,
 
             // Merge-only integration options the merge port does not implement,
             // with no rebase equivalent: refused rather than faked.
@@ -412,7 +466,10 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
                 bail!("--log is not supported (the merge port does not append a shortlog)")
             }
 
-            // Absent substrate.
+            // Absent substrate. `--no-set-upstream`/`--no-gpg-sign` ask for the
+            // default (do neither), so they are accepted where the positive form
+            // is refused, exactly as git treats them as ordinary negations.
+            "--no-set-upstream" | "--no-gpg-sign" => {}
             "--set-upstream" => {
                 bail!("--set-upstream is not supported (not exposed by the high-level fetch)")
             }
@@ -464,6 +521,18 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
     };
     let rebasing = rebase_mode != RebaseMode::Disabled;
 
+    // `cmd_pull()` checks the worktree BEFORE `run_fetch()` when it is going to
+    // rebase (`builtin/pull.c`: `require_clean_work_tree()` sits above the fetch,
+    // and above the merge-head resolution that follows it), so a dirty tree ends
+    // the pull without a single byte of network traffic and without the tracking
+    // refs moving. `--autostash` skips the check, since the rebase stashes the
+    // changes itself.
+    if rebasing && !autostash_wanted(&repo, autostash)? {
+        if let Some(code) = require_clean_work_tree(&repo, "pull with rebase")? {
+            return Ok(code);
+        }
+    }
+
     // Resolve which remote-tracking ref the fetched upstream lands at.
     // `<repository>` may just as well be a URL, and then there is no `remote.<name>` section and
     // nothing under `refs/remotes/` for the fetch to have updated. git never depends on one:
@@ -482,15 +551,20 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
     } else {
         // No explicit branch: derive the tracking ref from the current branch's
         // upstream configuration (branch.<name>.remote / .merge).
-        let head = head_name.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "You are not currently on a branch. Please specify which branch to pull."
-            )
-        })?;
+        let head = match head_name.as_ref() {
+            Some(head) => head,
+            None => return Ok(no_merge_candidates(&repo, None, rebasing)),
+        };
         match repo.branch_remote_tracking_ref_name(head.as_ref(), Direction::Fetch) {
             Some(Ok(name)) => name.as_bstr().to_string(),
             Some(Err(err)) => return Err(err.into()),
-            None => bail!("There is no tracking information for the current branch."),
+            None => {
+                return Ok(no_merge_candidates(
+                    &repo,
+                    Some(head.shorten().to_string()).as_deref(),
+                    rebasing,
+                ))
+            }
         }
     };
 
@@ -504,11 +578,15 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
     if f_force {
         fetch_args.push("--force".into());
     }
-    if f_tags {
-        fetch_args.push("--tags".into());
+    match f_tags {
+        Some(true) => fetch_args.push("--tags".into()),
+        Some(false) => fetch_args.push("--no-tags".into()),
+        None => {}
     }
-    if f_prune {
-        fetch_args.push("--prune".into());
+    match f_prune {
+        Some(true) => fetch_args.push("--prune".into()),
+        Some(false) => fetch_args.push("--no-prune".into()),
+        None => {}
     }
     if f_update_shallow {
         fetch_args.push("--update-shallow".into());
@@ -549,8 +627,10 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
     if f_append {
         fetch_args.push("--append".into());
     }
-    if f_keep {
-        fetch_args.push("--keep".into());
+    match f_keep {
+        Some(true) => fetch_args.push("--keep".into()),
+        Some(false) => fetch_args.push("--no-keep".into()),
+        None => {}
     }
     match f_show_forced {
         Some(true) => fetch_args.push("--show-forced-updates".into()),
@@ -607,17 +687,33 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::FAILURE);
     }
 
-    // The upstream ref must now exist locally; if the fetch produced no such
-    // tracking ref the requested branch does not exist on the remote.
-    // `FETCH_HEAD` is a file of candidate lines rather than a reference, so it is looked up the way
-    // `parse_fetch()` reaches it - by resolving the name.
-    if repo.try_find_reference(target_ref.as_str())?.is_none()
-        && repo.rev_parse_single(target_ref.as_str()).is_err()
+    // The tracking ref is a nicety, not the source of truth: `cmd_pull()` takes
+    // its merge heads from `FETCH_HEAD` (`get_merge_heads()`), which the fetch
+    // has just written for exactly what was asked for. A `<remote> <ref>` pair
+    // that does not land under `refs/remotes/` — a tag, a `refs/pull/…` head, a
+    // ref outside the remote's refspec — therefore integrates from `FETCH_HEAD`
+    // rather than failing, which is what `git pull origin v1.0` does.
+    let target_ref = if repo.try_find_reference(target_ref.as_str())?.is_some()
+        || repo.rev_parse_single(target_ref.as_str()).is_ok()
     {
+        target_ref
+    } else if repo.rev_parse_single("FETCH_HEAD").is_ok() {
+        "FETCH_HEAD".to_string()
+    } else {
+        // Nothing was fetched that could be merged: git's `die_no_merge_candidates()`.
         bail!("couldn't find remote ref {target_ref}");
-    }
+    };
 
     // ---- phase 2: integrate ----------------------------------------------
+
+    // `cmd_pull()`: an unborn `HEAD` has no history to merge into, so git treats
+    // the fetched head as the initial state — `pull_into_void()` fast-forwards the
+    // empty tree to it and points `HEAD` there with an `initial pull` reflog entry.
+    // This is the `git init && git remote add && git pull origin main` flow.
+    if repo.head()?.is_unborn() {
+        let merge_head = repo.rev_parse_single(target_ref.as_str())?.detach();
+        return pull_into_void(&repo, merge_head);
+    }
 
     // Nothing was fetched that we do not already have: git reports this as the
     // PULL being up to date and never starts the integration step, so the line
@@ -673,20 +769,10 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
         if signoff {
             rebase_args.push("--signoff".into());
         }
-        // Autostash: CLI flag wins, else pull.autoStash — which overrides
-        // rebase.autoStash for pull the way git's config_autostash resolution
-        // does — else rebase.autoStash, else off. A clean tree makes it a no-op;
-        // a dirty tree is handled by the rebase port's own policy.
-        let want_autostash = match autostash {
-            Some(v) => v,
-            None => {
-                let snap = repo.config_snapshot();
-                snap.boolean("pull.autoStash")
-                    .or_else(|| snap.boolean("rebase.autoStash"))
-                    == Some(true)
-            }
-        };
-        if want_autostash {
+        // A clean tree makes autostash a no-op; a dirty tree was already gated by
+        // the pre-fetch `require_clean_work_tree()` above unless autostash is on,
+        // in which case the rebase port stashes it itself.
+        if autostash_wanted(&repo, autostash)? {
             rebase_args.push("--autostash".into());
         }
         // `run_rebase()` pushes `opt_diffstat` verbatim. `git rebase` knows only
@@ -789,4 +875,154 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
     }
     merge_args.push(target_ref);
     super::merge(&merge_args)
+}
+
+/// `config_autostash()`: the CLI flag wins, else `pull.autoStash` — which
+/// overrides `rebase.autoStash` for a pull — else `rebase.autoStash`, else off.
+fn autostash_wanted(repo: &gix::Repository, cli: Option<bool>) -> Result<bool> {
+    Ok(match cli {
+        Some(v) => v,
+        None => {
+            let snap = repo.config_snapshot();
+            snap.boolean("pull.autoStash")
+                .or_else(|| snap.boolean("rebase.autoStash"))
+                == Some(true)
+        }
+    })
+}
+
+/// `require_clean_work_tree()` (wt-status.c), as `cmd_pull()` calls it before the
+/// fetch when it is going to rebase:
+///
+/// ```text
+/// error: cannot pull with rebase: You have unstaged changes.
+/// error: Please commit or stash them.
+/// ```
+///
+/// `Some(exit)` when the tree is dirty — git's `gently == 0`, so it exits 128 —
+/// and `None` when the pull may proceed. The unmerged paths `refresh_index()`
+/// announces are printed first, on stdout, as they are for the rebase.
+fn require_clean_work_tree(repo: &gix::Repository, action: &str) -> Result<Option<ExitCode>> {
+    let (unstaged, staged, conflicts) = super::rebase::dirty_state(repo)?;
+    for path in &conflicts {
+        println!("{path}: needs merge");
+    }
+    if !unstaged && !staged {
+        return Ok(None);
+    }
+    if unstaged {
+        eprintln!("error: cannot {action}: You have unstaged changes.");
+        if staged {
+            eprintln!("error: additionally, your index contains uncommitted changes.");
+        }
+    } else {
+        eprintln!("error: cannot {action}: Your index contains uncommitted changes.");
+    }
+    eprintln!("error: Please commit or stash them.");
+    Ok(Some(ExitCode::from(128)))
+}
+
+/// `die_no_merge_candidates()` (builtin/pull.c): the block git prints when the
+/// current branch has no upstream to pull from, exit 1.
+///
+/// `branch` is the current branch's short name, or `None` on a detached `HEAD`,
+/// which git reports as not being on a branch at all. The remote is named only
+/// when the repository has exactly one — `get_only_remote()` — and is the
+/// placeholder `<remote>` otherwise.
+fn no_merge_candidates(repo: &gix::Repository, branch: Option<&str>, rebasing: bool) -> ExitCode {
+    let integration = if rebasing {
+        "Please specify which branch you want to rebase against."
+    } else {
+        "Please specify which branch you want to merge with."
+    };
+    match branch {
+        None => {
+            eprintln!("You are not currently on a branch.");
+            eprintln!("{integration}");
+            eprintln!("See git-pull(1) for details.");
+            eprintln!();
+            eprintln!("    git pull <remote> <branch>");
+            eprintln!();
+        }
+        Some(branch) => {
+            let remotes = repo.remote_names();
+            let remote = match remotes.len() {
+                1 => remotes.iter().next().map(ToString::to_string),
+                _ => None,
+            };
+            let remote = remote.unwrap_or_else(|| "<remote>".to_string());
+            eprintln!("There is no tracking information for the current branch.");
+            eprintln!("{integration}");
+            eprintln!("See git-pull(1) for details.");
+            eprintln!();
+            eprintln!("    git pull <remote> <branch>");
+            eprintln!();
+            eprintln!("If you wish to set tracking information for this branch you can do so with:");
+            eprintln!();
+            eprintln!("    git branch --set-upstream-to={remote}/<branch> {branch}");
+            eprintln!();
+        }
+    }
+    ExitCode::FAILURE
+}
+
+/// `pull_into_void()` (builtin/pull.c): integrate `merge_head` into an unborn
+/// branch.
+///
+/// git treats the index as based on the empty tree and fast-forwards to the
+/// fetched head, so work already added on the unborn branch is not lost and an
+/// untracked file in the way still refuses, then points `HEAD` at it with an
+/// `initial pull` reflog entry.
+fn pull_into_void(repo: &gix::Repository, merge_head: gix::ObjectId) -> Result<ExitCode> {
+    use gix::bstr::BStr;
+    use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
+
+    let empty_tree = gix::ObjectId::empty_tree(repo.object_hash());
+    let target_tree = repo.find_object(merge_head)?.peel_to_tree()?.id;
+    let index = repo.index_or_load_from_head_or_empty()?.into_owned();
+    let should_interrupt = std::sync::atomic::AtomicBool::new(false);
+    let labels = gix::merge::blob::builtin_driver::text::Labels {
+        ancestor: Some(BStr::new(b"empty tree")),
+        current: Some(BStr::new(b"HEAD")),
+        other: Some(BStr::new(b"FETCH_HEAD")),
+    };
+    let merged = crate::merge_apply::three_way_merge_guarded(
+        repo,
+        empty_tree,
+        empty_tree,
+        target_tree,
+        &index,
+        labels,
+        &should_interrupt,
+        false,
+        &crate::merge_apply::StrategyOptions::default(),
+        empty_tree,
+    )?;
+    let applied = match merged {
+        crate::merge_apply::Merged::Applied(applied) => applied,
+        // `checkout_fast_forward()` refused: nothing on disk moved and `HEAD`
+        // stays unborn.
+        crate::merge_apply::Merged::Refused(clobber) => {
+            clobber.report("merge");
+            return Ok(ExitCode::FAILURE);
+        }
+    };
+    let mut new_index = applied.index;
+    new_index.write(Default::default())?;
+
+    repo.edit_reference(RefEdit {
+        change: Change::Update {
+            log: LogChange {
+                mode: RefLog::AndReference,
+                force_create_reflog: false,
+                message: "initial pull".into(),
+            },
+            // The branch does not exist yet, which is what makes this the unborn case.
+            expected: PreviousValue::MustNotExist,
+            new: gix::refs::Target::Object(merge_head),
+        },
+        name: "HEAD".try_into().map_err(|e| anyhow::anyhow!("invalid ref name HEAD: {e}"))?,
+        deref: true,
+    })?;
+    Ok(ExitCode::SUCCESS)
 }

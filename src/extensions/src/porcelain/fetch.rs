@@ -1654,6 +1654,11 @@ fn fetch_one(
             if crate::transport_err::ssh_fatal(&url, &err).is_some() {
                 return Ok(Verdict::Fatal);
             }
+            // A server that refused the request with an `ERR` line said why; git
+            // prints that message and dies.
+            if crate::transport_err::remote_error_fatal(&err).is_some() {
+                return Ok(Verdict::Fatal);
+            }
             return Err(err);
         }
     };
@@ -1691,7 +1696,15 @@ fn fetch_one(
             eprintln!("error: {url} did not send all necessary objects");
             return Ok(Verdict::Rejected);
         }
-        Err(e) => return Err(e.into()),
+        Err(e) => {
+            // `ERR <message>` mid-response: the server's own refusal (an
+            // unreachable want, a hidden ref), which git reports verbatim.
+            let err = anyhow::Error::from(e);
+            if crate::transport_err::remote_error_fatal(&err).is_some() {
+                return Ok(Verdict::Fatal);
+            }
+            return Err(err);
+        }
     };
 
     // Refs the remote could only offer by making us adopt one of its shallow roots. git leaves

@@ -85,6 +85,13 @@ impl Response {
                         }
                     };
 
+                    // An `ERR <message>` line is the server refusing the request, not
+                    // the start of the pack — without this it would be mistaken for
+                    // one (`parse_v1_ack_or_shallow_or_assume_pack` assumes a pack
+                    // for anything it does not recognize).
+                    if let Some(err) = response::upload_pack_error(&peeked_line) {
+                        return Err(err);
+                    }
                     if Response::parse_v1_ack_or_shallow_or_assume_pack(&mut acks, &mut shallows, &peeked_line) {
                         break 'lines true;
                     }
@@ -119,6 +126,13 @@ impl Response {
                             io::ErrorKind::UnexpectedEof,
                             "Could not read message headline",
                         )));
+                    }
+
+                    // The server can answer the `fetch` command with an `ERR` line
+                    // instead of a section, which is its own message and not an
+                    // unknown section header.
+                    if let Some(err) = response::upload_pack_error(&line) {
+                        return Err(err);
                     }
 
                     match line.trim_end() {

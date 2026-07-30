@@ -71,6 +71,28 @@ pub struct WantedRef {
     pub path: BString,
 }
 
+/// The `ERR ` prefix an upload-pack error line carries (`ERR_PREFIX` in `gix-packetline`).
+const ERR_PREFIX: &str = "ERR ";
+
+/// The server's own error, if `line` is an `ERR <message>` packet line.
+///
+/// `upload-pack` answers a request it cannot serve with a single `ERR` line in
+/// the middle of the response — `ERR upload-pack: not our ref <oid>` for a want
+/// it cannot reach, for instance. `gix-packetline` recognizes those only when
+/// [`fail_on_err_lines()`][gix_transport::packetline::StreamingPeekableIter::fail_on_err_lines]
+/// is set, which holds for the reader the handshake left behind (`git://`,
+/// `file://`) but not for HTTP, where every request builds a fresh reader with
+/// the flag at its default. Checking here covers both, so an `ERR` line is the
+/// server's message rather than an unparsable section header, matching git's
+/// `PACKET_READ_DIE_ON_ERR_PACKET` (`pkt-line.c`), which dies with
+/// `remote error: <message>` wherever the line appears.
+fn upload_pack_error(line: &str) -> Option<Error> {
+    let message = line.strip_prefix(ERR_PREFIX)?;
+    Some(Error::UploadPack(gix_transport::packetline::read::Error {
+        message: message.trim_end_matches('\n').into(),
+    }))
+}
+
 /// Parse a `ShallowUpdate` from a `line` as received to the server.
 pub fn shallow_update_from_line(line: &str) -> Result<ShallowUpdate, Error> {
     match line.trim_end().split_once(' ') {

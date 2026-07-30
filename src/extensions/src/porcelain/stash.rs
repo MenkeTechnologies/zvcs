@@ -32,13 +32,20 @@
 //!   `-a`, ignored) files into a parentless third parent and deleting them from
 //!   the worktree, along with the directories they leave empty (git's
 //!   `clean --force -d`). Refused together with `-S`, as git refuses it.
-//! * `list`  — one `stash@{N}: <message>` line per reflog entry, newest first.
+//! * `list`  — one `stash@{N}: <message>` line per reflog entry, newest first,
+//!   over `log -g --first-parent` as `list_stash()` runs it, so the diff options
+//!   the reflog port renders (`--name-only`, `--name-status`, `--numstat`,
+//!   `--shortstat`, `--summary`, `--raw`) describe each entry's own change.
+//!   `-p`/`--stat` are refused there rather than silently dropped.
 //! * `pop` / `apply` — a three-way merge of the stash onto the current tree
 //!   (base: the stash's own base, ours: the current index, theirs: `W`), so a
 //!   moved `HEAD` or unrelated local work is fine; a conflict leaves the markers
 //!   and the unmerged index in place, keeps the entry and exits 1. Untracked
 //!   files captured in the third parent come back untracked and never overwrite
 //!   a file already sitting there; `pop` then drops the entry.
+//!   `--index` first replays the stash's staged state onto the current index
+//!   (`apply_cached()`); when that cannot be done the command stops there with
+//!   `conflicts in index. Try without --index.` and nothing on disk has moved.
 //!   The index afterwards is `unstage_changes_unless_new()`: everything the
 //!   merge staged is unstaged again *except* paths that did not exist in the
 //!   pre-apply index, which stay staged — so a stash that had `git add`ed a new
@@ -52,6 +59,12 @@
 //!   like `git reflog delete --rewrite --updateref`. The ref itself moves (or is
 //!   deleted) through the ref store, so a `refs/stash` that lives in
 //!   `packed-refs` is removed rather than left resolving to a dropped stash.
+//! * `<stash>` resolution is `get_stash_info()`: `stash@{n}` (or a bare `n`) is a
+//!   reflog entry, and anything else is any stash-like commit — two parents at
+//!   least — which `apply`, `show` and `branch` take as readily as git does.
+//!   `drop` and `pop` rewrite the reflog, so `assert_stash_ref()` keeps them to
+//!   an entry of it. An entry past the end is `rev-parse`'s
+//!   `fatal: log for 'stash' only has <n> entries`.
 //! * `create` — build the `I`/`W` commit graph and print the `W` id without
 //!   storing it or touching the worktree (`do_create_stash`).
 //! * `store` — point `refs/stash` at an existing stash-like commit, appending
@@ -307,7 +320,15 @@ pub fn stash(args: &[String]) -> Result<ExitCode> {
             if let Some(code) = usage_requested(&args[1..], DROP_USAGE) {
                 return Ok(code);
             }
-            let n = parse_stash_index(positional(&args[1..]))?;
+            let named = positional(&args[1..]);
+            let spec = match resolve_stash(&repo, named)? {
+                Ok(spec) => spec,
+                Err(code) => return Ok(code),
+            };
+            if let Some(code) = require_stash_ref(&spec, named) {
+                return Ok(code);
+            }
+            let n = spec.entry.expect("checked to be a stash reference");
             let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
             let dropped = drop_reflog_entry(&repo, n)?;
             // `drop_stash()` prints the ref as `reflog delete` names it, which is
@@ -869,6 +890,29 @@ fn revert_staged_in_worktree(
     Ok(Ok(merge.tree.write()?.detach()))
 }
 
+/// Whether `theirs` merges into `ours` over `base` without conflicts, reporting
+/// the blocked paths when it does not. Nothing is written either way.
+fn merge_trees_cleanly(
+    repo: &gix::Repository,
+    base: ObjectId,
+    ours: ObjectId,
+    theirs: ObjectId,
+) -> Result<std::result::Result<(), Vec<BString>>> {
+    let labels = gix::merge::blob::builtin_driver::text::Labels::default();
+    let merge = repo.merge_trees(base, ours, theirs, labels, repo.tree_merge_options()?)?;
+    let unresolved = gix::merge::tree::TreatAsUnresolved::git();
+    let blocked: Vec<BString> = merge
+        .conflicts
+        .iter()
+        .filter(|c| c.is_unresolved(unresolved))
+        .map(|c| c.changes_in_resolution().0.location().to_owned())
+        .collect();
+    match blocked.is_empty() {
+        true => Ok(Ok(())),
+        false => Ok(Err(blocked)),
+    }
+}
+
 /// `repo_refresh_and_write_index()` refusing an unmerged index, which is how a
 /// `stash push` in the middle of a conflicted merge ends: every unmerged path on
 /// stdout, then `error: could not write index` and exit 1.
@@ -978,25 +1022,13 @@ fn show_stash(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
     // Resolve the stash: a `stash@{n}` / bare `N` / (default) `stash@{0}` goes
     // through the reflog; anything else is resolved as an arbitrary stash-like
     // commit, matching git's `get_stash_info`.
-    let commit_id = if let Ok(n) = parse_stash_index(stash_spec.as_deref()) {
-        let entries = read_stash_reflog(repo)?;
-        if entries.is_empty() {
-            bail!("No stash entries found.");
-        }
-        entries
-            .get(n)
-            .map(|(id, _)| *id)
-            .ok_or_else(|| anyhow!("{} is not a valid reference", stash_spec.as_deref().unwrap_or("stash@{0}")))?
-    } else {
-        let s = stash_spec.as_deref().expect("non-index spec is Some");
-        repo.rev_parse_single(s).map_err(|_| anyhow!("{s} is not a valid reference"))?.detach()
+    let commit_id = match resolve_stash(repo, stash_spec.as_deref())? {
+        Ok(spec) => spec.id,
+        Err(code) => return Ok(code),
     };
 
     let commit = repo.find_commit(commit_id)?;
     let parents: Vec<ObjectId> = commit.parent_ids().map(|id| id.detach()).collect();
-    if parents.len() < 2 {
-        bail!("'{commit_id}' is not a stash-like commit");
-    }
     let b_commit = parents[0];
 
     // No diff options given → apply config defaults (git: revision_args.nr == 1).
@@ -1070,13 +1102,13 @@ fn branch_stash(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
         Some(b) => (*b).to_string(),
         None => bail!("No branch name specified"),
     };
-    let n = parse_stash_index(positionals.get(1).copied())?;
-
-    let entries = read_stash_reflog(repo)?;
-    if entries.is_empty() {
-        bail!("No stash entries found.");
-    }
-    let commit_id = entries.get(n).map(|(id, _)| *id).ok_or_else(|| anyhow!("stash@{{{n}}} is not a valid reference"))?;
+    // `branch_stash()` takes any stash-like commit; only an entry of the reflog
+    // is dropped afterwards (`is_stash_ref`).
+    let stash = match resolve_stash(repo, positionals.get(1).copied())? {
+        Ok(spec) => spec,
+        Err(code) => return Ok(code),
+    };
+    let commit_id = stash.id;
     let commit = repo.find_commit(commit_id)?;
     let parents: Vec<ObjectId> = commit.parent_ids().map(|id| id.detach()).collect();
     if parents.len() < 2 {
@@ -1092,7 +1124,10 @@ fn branch_stash(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
     // restored here, whatever `stash.index` says, so the staged state a stash
     // captured comes back staged on the new branch.
     let repo = gix::discover(".")?;
-    let restored = restore_stash_commit(&repo, commit_id, true, &ConflictLabels::default())?;
+    let restored = match restore_stash_commit(&repo, commit_id, true, &ConflictLabels::default())? {
+        Ok(restored) => restored,
+        Err(code) => return Ok(code),
+    };
 
     // `do_apply_stash` ends by running `git status` (non-quiet).
     super::status::status(&[])?;
@@ -1102,9 +1137,12 @@ fn branch_stash(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::from(1));
     }
 
-    // The stash came from `refs/stash`, so `is_stash_ref` holds: drop it.
-    let dropped = drop_reflog_entry(&repo, n)?;
-    println!("Dropped refs/stash@{{{n}}} ({dropped})");
+    // Only a `refs/stash` entry is dropped — `is_stash_ref` is false for a
+    // stash-like commit named directly, and git leaves that one alone.
+    if let Some(n) = stash.entry {
+        let dropped = drop_reflog_entry(&repo, n)?;
+        println!("Dropped refs/stash@{{{n}}} ({dropped})");
+    }
     Ok(ExitCode::SUCCESS)
 }
 
@@ -1126,6 +1164,11 @@ fn list(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
     if !has_format {
         rf.push("--format=%gd: %gs".into());
     }
+    // `list_stash()` runs `log -g --first-parent`, and the `--first-parent` is
+    // what gives a diff option anything to render: every stash entry is a merge
+    // commit, which is otherwise skipped. Without it `stash list --name-only`
+    // silently prints subjects alone.
+    rf.push("--first-parent".into());
     rf.extend(args.iter().cloned());
     rf.push("refs/stash".into());
     super::reflog(&rf)
@@ -1136,14 +1179,31 @@ fn list(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
 /// Port of `do_apply_stash`'s tail: the restore, then `git status` (skipped under
 /// `-q`), and for `pop` the `Dropped …` line — which `-q` silences too.
 fn apply_or_pop(repo: &gix::Repository, opts: &ApplyOptions, pop: bool) -> Result<ExitCode> {
-    let entries = read_stash_reflog(repo)?;
-    if entries.is_empty() {
-        bail!("No stash entries found.");
+    let stash = match resolve_stash(repo, opts.spec.as_deref())? {
+        Ok(spec) => spec,
+        Err(code) => return Ok(code),
+    };
+    // `pop` rewrites the reflog afterwards, so — unlike `apply` — it takes only
+    // an entry of it.
+    if pop {
+        if let Some(code) = require_stash_ref(&stash, opts.spec.as_deref()) {
+            return Ok(code);
+        }
     }
-    let n = opts.index_in_stash;
-    let commit_id = entries.get(n).map(|(id, _)| *id).ok_or_else(|| anyhow!("stash@{{{n}}} is not a valid reference"))?;
+    let commit_id = stash.id;
 
-    let restored = restore_stash_commit(repo, commit_id, opts.restore_index, &opts.labels)?;
+    let restored = match restore_stash_commit(repo, commit_id, opts.restore_index, &opts.labels)? {
+        Ok(restored) => restored,
+        // `--index` could not replay the stash's staged state onto ours: git
+        // reports it and stops before the worktree is touched — and a `pop` says
+        // the entry survived, as it does for every other failure.
+        Err(code) => {
+            if pop {
+                println!("The stash entry is kept in case you need it again.");
+            }
+            return Ok(code);
+        }
+    };
 
     if !opts.quiet {
         super::status::status(&[])?;
@@ -1157,6 +1217,7 @@ fn apply_or_pop(repo: &gix::Repository, opts: &ApplyOptions, pop: bool) -> Resul
         return Ok(ExitCode::from(1));
     }
     if pop {
+        let n = stash.entry.expect("checked to be a stash reference");
         let dropped = drop_reflog_entry(repo, n)?;
         if !opts.quiet {
             println!("Dropped refs/stash@{{{n}}} ({dropped})");
@@ -1165,11 +1226,13 @@ fn apply_or_pop(repo: &gix::Repository, opts: &ApplyOptions, pop: bool) -> Resul
     Ok(ExitCode::SUCCESS)
 }
 
-/// Restore the worktree to the stash's `W` tree, for the clean-apply case only:
-/// the current tree must be clean and still at the stash's base (`b_tree`). A
-/// dirty/moved target needs a real 3-way merge, which is not backed. Shared by
-/// `apply`/`pop` and `branch` (where the prior checkout guarantees the clean
-/// base).
+/// Restore the stash onto the current tree with a three-way merge, shared by
+/// `apply`/`pop` and `branch`.
+///
+/// `Err(code)` is `do_apply_stash`'s early refusal: `--index` asks for the
+/// stash's staged state to be replayed onto the current index (`apply_cached()`),
+/// and when that patch does not apply git says so and stops — before the merge,
+/// so nothing on disk moves.
 ///
 /// `restore_index` is `do_apply_stash`'s `index` argument: with it the index is
 /// rebuilt from the stash's `I` (staged) tree, so what was staged when the stash
@@ -1185,7 +1248,7 @@ fn restore_stash_commit(
     commit_id: ObjectId,
     restore_index: bool,
     labels: &ConflictLabels,
-) -> Result<bool> {
+) -> Result<std::result::Result<bool, ExitCode>> {
     let commit = repo.find_commit(commit_id)?;
     let parents: Vec<ObjectId> = commit.parent_ids().map(|id| id.detach()).collect();
     if parents.len() < 2 {
@@ -1216,6 +1279,25 @@ fn restore_stash_commit(
     }
     let c_tree = super::merge::index_tree(repo, &old_index)?;
 
+    // `--index` replays the stash's staged state onto the current index first
+    // (`apply_cached()` of the `w_commit^!` diff), and a patch that does not
+    // apply ends the whole command right there — before the worktree merge, so a
+    // refusal leaves everything as it was. The equivalent test is whether the
+    // stash's index tree merges into ours over the stash's base without
+    // conflicts. As for `-S`, git-apply's `patch failed: <path>:<line>` names a
+    // hunk this tree merge has no equivalent for, so only the per-path verdict
+    // is reported.
+    let has_index = restore_index && i_tree != base_tree && i_tree != c_tree;
+    if has_index {
+        if let Err(blocked) = merge_trees_cleanly(repo, base_tree, c_tree, i_tree)? {
+            for path in blocked {
+                eprintln!("error: {path}: patch does not apply");
+            }
+            eprintln!("error: conflicts in index. Try without --index.");
+            return Ok(Err(ExitCode::FAILURE));
+        }
+    }
+
     let should_interrupt = AtomicBool::new(false);
     let labels = gix::merge::blob::builtin_driver::text::Labels {
         ancestor: labels.base.as_deref().map(|l| BStr::new(l.as_bytes())),
@@ -1239,14 +1321,14 @@ fn restore_stash_commit(
         crate::merge_apply::Merged::Applied(applied) => applied,
         crate::merge_apply::Merged::Refused(clobber) => {
             clobber.report("merge");
-            return Ok(false);
+            return Ok(Ok(false));
         }
     };
     if !applied.conflicts.is_empty() {
         // git leaves the conflicted worktree in place and fails the apply; the
         // caller keeps the stash and reports it.
         applied.index.write(Default::default())?;
-        return Ok(false);
+        return Ok(Ok(false));
     }
 
     // `do_apply_stash`'s tail: the index goes back to what it was (so everything
@@ -1268,7 +1350,7 @@ fn restore_stash_commit(
     // stash staged nothing) or already equal to ours, it sets `has_index = 0`
     // and leaves the index alone — which is what keeps the caller's own staged
     // work staged.
-    let index_tree = if restore_index && i_tree != base_tree && i_tree != c_tree {
+    let index_tree = if has_index {
         i_tree
     } else {
         unstage_changes_unless_new(repo, c_tree, applied.tree_id)?
@@ -1311,7 +1393,7 @@ fn restore_stash_commit(
     if !untracked_ok {
         eprintln!("error: could not restore untracked files from stash");
     }
-    Ok(untracked_ok)
+    Ok(Ok(untracked_ok))
 }
 
 /// Create an *autostash* from the current dirty worktree+index: build the
@@ -1779,6 +1861,75 @@ fn positional(args: &[String]) -> Option<&str> {
 
 /// Parse a `stash@{N}` / `refs/stash@{N}` / bare `N` reference to its index.
 /// Missing spec defaults to `stash@{0}`.
+/// What a `<stash>` argument resolved to — `get_stash_info()` (builtin/stash.c).
+pub(crate) struct StashSpec {
+    /// The stash-like commit the argument named.
+    id: ObjectId,
+    /// `Some(n)` when it named a `refs/stash` reflog entry, which is what
+    /// `assert_stash_ref()` requires of `drop` and `pop`; `None` for an
+    /// arbitrary stash-like commit, which `apply`, `show` and `branch` accept.
+    entry: Option<usize>,
+}
+
+/// Resolve a `<stash>` argument the way `get_stash_info()` does: a `stash@{n}`
+/// (or bare `n`) is a reflog entry, anything else is any commit that looks like
+/// a stash — two parents at least.
+///
+/// The refusals are git's, with git's exit codes: an out-of-range entry is
+/// `rev-parse`'s `fatal: log for 'stash' only has <n> entries` (128), an
+/// unresolvable name is `error: <spec> is not a valid reference` (1), and a
+/// commit that is not stash-shaped is `fatal: '<id>' is not a stash-like commit`
+/// (128).
+fn resolve_stash(
+    repo: &gix::Repository,
+    spec: Option<&str>,
+) -> Result<std::result::Result<StashSpec, ExitCode>> {
+    let entries = read_stash_reflog(repo)?;
+    let by_index = match spec {
+        None => Some(0),
+        Some(s) => parse_stash_index(Some(s)).ok(),
+    };
+    if let Some(n) = by_index {
+        if entries.is_empty() {
+            bail!("No stash entries found.");
+        }
+        let Some((id, _)) = entries.get(n) else {
+            eprintln!("fatal: log for 'stash' only has {} entries", entries.len());
+            return Ok(Err(ExitCode::from(128)));
+        };
+        return Ok(Ok(StashSpec { id: *id, entry: Some(n) }));
+    }
+
+    let spec = spec.expect("a non-index spec was given");
+    let Ok(id) = repo.rev_parse_single(spec) else {
+        eprintln!("error: {spec} is not a valid reference");
+        return Ok(Err(ExitCode::FAILURE));
+    };
+    let id = id.detach();
+    let stash_like = repo
+        .find_commit(id)
+        .map(|c| c.parent_ids().count() >= 2)
+        .unwrap_or(false);
+    if !stash_like {
+        eprintln!("fatal: '{id}' is not a stash-like commit");
+        return Ok(Err(ExitCode::from(128)));
+    }
+    Ok(Ok(StashSpec { id, entry: None }))
+}
+
+/// `assert_stash_ref()`: `drop` and `pop` rewrite the reflog, so they need an
+/// entry in it and refuse a bare commit.
+fn require_stash_ref(spec: &StashSpec, named: Option<&str>) -> Option<ExitCode> {
+    if spec.entry.is_some() {
+        return None;
+    }
+    eprintln!(
+        "error: '{}' is not a stash reference",
+        named.unwrap_or("stash").trim()
+    );
+    Some(ExitCode::FAILURE)
+}
+
 fn parse_stash_index(spec: Option<&str>) -> Result<usize> {
     let s = match spec {
         None => return Ok(0),
@@ -2008,8 +2159,10 @@ fn parse_store_options(args: &[String]) -> Result<(Option<String>, bool, String)
 
 /// The resolved `git stash apply` / `git stash pop` command line.
 struct ApplyOptions {
-    /// Which reflog entry to restore; `stash@{0}` when no `<stash>` was given.
-    index_in_stash: usize,
+    /// The `<stash>` as typed, or `None` for the default `stash@{0}`. It is
+    /// resolved late because `apply` accepts any stash-like commit while `pop`
+    /// requires a reflog entry.
+    spec: Option<String>,
     /// `--index`: rebuild the index from the stash's staged (`I`) tree.
     restore_index: bool,
     /// `-q`/`--quiet`: skip the trailing `git status` and `pop`'s `Dropped …`.
@@ -2087,7 +2240,7 @@ fn parse_apply_options(repo: &gix::Repository, args: &[String]) -> Result<ApplyO
         }
     }
     Ok(ApplyOptions {
-        index_in_stash: parse_stash_index(spec)?,
+        spec: spec.map(ToString::to_string),
         restore_index,
         quiet,
         labels,

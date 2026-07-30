@@ -1662,7 +1662,7 @@ fn set_head_symbolic(
 /// Rewriting the trailing line — or appending it when none was written — is
 /// confined to the entry this command just made: the line is only replaced when
 /// its message is the one passed in.
-fn record_head_move(
+pub(super) fn record_head_move(
     repo: &gix::Repository,
     from: Option<ObjectId>,
     to: Option<ObjectId>,

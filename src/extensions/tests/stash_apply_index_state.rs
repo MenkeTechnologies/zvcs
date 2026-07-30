@@ -131,3 +131,30 @@ fn apply_with_index_restores_the_staged_state() {
         "a.txt was never staged in the stash, so it stays unstaged: {status:?}"
     );
 }
+
+/// `--index` replays the stash's staged state onto the current index first, and
+/// when that cannot be done git stops there: the error, the kept entry, and a
+/// worktree that has not been touched.
+#[test]
+fn apply_with_index_refuses_before_touching_the_worktree() {
+    let f = Fixture::new("index-conflict");
+    // Stage a different content for the same path the stash staged.
+    std::fs::write(f.work.join("new.txt"), "local\n").unwrap();
+    f.git(&["add", "new.txt"]);
+    let before = f.status();
+
+    let (ok, out, err) = f.run(&["stash", "pop", "--index"]);
+    assert!(!ok, "the index apply should fail: {out}{err}");
+    assert!(
+        err.contains("error: conflicts in index. Try without --index."),
+        "stderr: {err}"
+    );
+    assert!(
+        out.contains("The stash entry is kept in case you need it again."),
+        "stdout: {out}"
+    );
+    assert_eq!(f.status(), before, "nothing may move when the index apply is refused");
+    assert_eq!(std::fs::read_to_string(f.work.join("new.txt")).unwrap(), "local\n");
+    let (_, list, _) = f.run(&["stash", "list"]);
+    assert_eq!(list.lines().count(), 1, "the entry must survive: {list}");
+}

@@ -28,19 +28,35 @@
 //! Supported invocation forms:
 //!   * `git pull`                  — use the current branch's configured upstream.
 //!   * `git pull <remote>`         — fetch `<remote>`, merge the configured upstream branch.
-//!   * `git pull <remote> <ref>`   — fetch `<remote>`, merge `refs/remotes/<remote>/<ref>`
-//!     when the fetch produced that tracking ref, and `FETCH_HEAD` otherwise.
-//!     `cmd_pull()` takes its merge heads from `FETCH_HEAD` throughout
-//!     (`get_merge_heads()`), so a `<ref>` that lands nowhere under
-//!     `refs/remotes/` — a tag, a `refs/pull/…` head, anything outside the
-//!     remote's refspec — integrates just the same.
+//!   * `git pull <remote> <ref>…`  — fetch `<remote>`, integrate what the fetch
+//!     marked for-merge in `FETCH_HEAD` (`get_merge_heads()`). A `<ref>` that
+//!     lands nowhere under `refs/remotes/` — a tag, a `refs/pull/…` head,
+//!     anything outside the remote's refspec — integrates just the same, and
+//!     several of them become an octopus.
 //!
 //! Every `--no-` spelling of a forwarded fetch option (`--no-tags`,
 //! `--no-prune`, `--no-force`, `--no-all`, `--no-keep`, …) is accepted and
 //! handed to the fetch: git declares them `OPT_PASSTHRU`/`OPT_BOOL` and
 //! `recreate_opt()` passes on whichever spelling it saw.
 //!
-//! Two gates sit outside the integration step, both from `cmd_pull()`:
+//! The integration step is handed a literal `FETCH_HEAD`, as `run_merge()` does,
+//! so the merge re-reads the file and sees every for-merge head: one is an
+//! ordinary merge, several are an octopus, and each is named the way the fetch
+//! described it (`Merge branch 'main' of <url>`).
+//!
+//! Gates that sit outside the integration step, all from `cmd_pull()`:
+//!   * An unmerged index or a `MERGE_HEAD` left over from an unfinished merge
+//!     stops the pull before the fetch (`die_resolve_conflict()` /
+//!     `die_conclude_merge()`), exit 128.
+//!   * Diverged branches with neither an `--ff…` flag nor `pull.ff`, and no
+//!     rebase policy from the command line or config, are refused with the
+//!     `advice.diverging` block and `fatal: Need to specify how to reconcile
+//!     divergent branches.` — git does not pick an integration strategy on its
+//!     own, and neither does this.
+//!   * Several merge heads cannot be rebased onto or fast-forwarded to
+//!     (`Cannot rebase onto multiple branches.` / `Cannot fast-forward to
+//!     multiple branches.`), and cannot start a branch (`Cannot merge multiple
+//!     branches into empty head.`).
 //!   * When rebasing without `--autostash`, `require_clean_work_tree()` runs
 //!     *before* the fetch, so a dirty tree ends the pull with
 //!     `error: cannot pull with rebase: You have unstaged changes.` and exit
@@ -67,10 +83,12 @@
 //! (`-s`/`-X`/`--commit`/`--no-commit`/`--edit`/`--cleanup`/`--log`/
 //! `--signoff` on the *merge* path — `-s`/`-X`/
 //! `--signoff` are honored on the *rebase* path), `--rebase=interactive`
-//! (interactive todo editing needs a TTY editor loop), `--autostash` over a
-//! dirty tree on the merge path (needs a 3-way stash apply the stash port lacks),
-//! `--set-upstream`, and
+//! (interactive todo editing needs a TTY editor loop), `--set-upstream`, and
 //! `--gpg-sign`/`-S`/`--verify-signatures` (GPG is not vendored).
+//!
+//! `--autostash` is forwarded to whichever integration step runs — `run_merge()`
+//! and `run_rebase()` both push it — so a dirty tree is stashed and restored on
+//! either path.
 //!
 //! The diffstat selectors `-n`, `--stat`/`--no-stat`, `--summary`/`--no-summary`
 //! and `--compact-summary`/`--no-compact-summary` are git's `OPT_PASSTHRU`
@@ -222,14 +240,19 @@ fn parse_rebase_value(v: &str) -> Result<RebaseMode> {
 
 /// Resolve the configured rebase policy: `branch.<name>.rebase` overrides
 /// `pull.rebase`, and an unset key means a merge.
-fn config_rebase(repo: &gix::Repository, branch: Option<&str>) -> Result<RebaseMode> {
+///
+/// The second half of the answer is git's `rebase_unspecified` out-parameter:
+/// neither key was set at all, which is what lets `cmd_pull()` tell "merge,
+/// because that is configured" apart from "no policy was ever chosen" — only
+/// the latter refuses to integrate a diverged branch.
+fn config_rebase(repo: &gix::Repository, branch: Option<&str>) -> Result<(RebaseMode, bool)> {
     let snap = repo.config_snapshot();
     let raw = branch
         .and_then(|b| snap.string(&format!("branch.{b}.rebase")))
         .or_else(|| snap.string("pull.rebase"));
     match raw.map(|v| v.to_string()) {
-        None => Ok(RebaseMode::Disabled),
-        Some(v) => parse_rebase_value(&v),
+        None => Ok((RebaseMode::Disabled, true)),
+        Some(v) => Ok((parse_rebase_value(&v)?, false)),
     }
 }
 
@@ -515,11 +538,18 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
 
     // Resolve the integration policy git's `config_get_rebase()` computes: a CLI
     // flag wins, else branch.<name>.rebase / pull.rebase.
-    let rebase_mode = match rebase_cli {
-        Some(m) => m,
+    let (rebase_mode, rebase_unspecified) = match rebase_cli {
+        Some(m) => (m, false),
         None => config_rebase(&repo, branch_short.as_deref())?,
     };
     let rebasing = rebase_mode != RebaseMode::Disabled;
+
+    // `repo_read_index_unmerged()` / `file_exists(MERGE_HEAD)` in `cmd_pull()`:
+    // both sit above `run_fetch()`, so an unfinished merge stops the pull before
+    // a single byte moves.
+    if let Some(code) = refuse_unfinished_merge(&repo)? {
+        return Ok(code);
+    }
 
     // `cmd_pull()` checks the worktree BEFORE `run_fetch()` when it is going to
     // rebase (`builtin/pull.c`: `require_clean_work_tree()` sits above the fetch,
@@ -687,22 +717,16 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::FAILURE);
     }
 
-    // The tracking ref is a nicety, not the source of truth: `cmd_pull()` takes
-    // its merge heads from `FETCH_HEAD` (`get_merge_heads()`), which the fetch
-    // has just written for exactly what was asked for. A `<remote> <ref>` pair
-    // that does not land under `refs/remotes/` — a tag, a `refs/pull/…` head, a
-    // ref outside the remote's refspec — therefore integrates from `FETCH_HEAD`
-    // rather than failing, which is what `git pull origin v1.0` does.
-    let target_ref = if repo.try_find_reference(target_ref.as_str())?.is_some()
-        || repo.rev_parse_single(target_ref.as_str()).is_ok()
-    {
-        target_ref
-    } else if repo.rev_parse_single("FETCH_HEAD").is_ok() {
-        "FETCH_HEAD".to_string()
-    } else {
-        // Nothing was fetched that could be merged: git's `die_no_merge_candidates()`.
+    // `get_merge_heads()`: everything the fetch marked for-merge in `FETCH_HEAD`,
+    // which is what `cmd_pull()` integrates — not a remote-tracking ref. A
+    // `<remote> <ref>` pair that lands nowhere under `refs/remotes/` (a tag, a
+    // `refs/pull/…` head) is merged just the same, and several refspecs give
+    // several heads.
+    let merge_heads = super::merge::fetch_head_for_merge(&repo)?;
+    if merge_heads.is_empty() {
+        // `die_no_merge_candidates()`: nothing came back that could be merged.
         bail!("couldn't find remote ref {target_ref}");
-    };
+    }
 
     // ---- phase 2: integrate ----------------------------------------------
 
@@ -711,39 +735,60 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
     // empty tree to it and points `HEAD` there with an `initial pull` reflog entry.
     // This is the `git init && git remote add && git pull origin main` flow.
     if repo.head()?.is_unborn() {
-        let merge_head = repo.rev_parse_single(target_ref.as_str())?.detach();
-        return pull_into_void(&repo, merge_head);
+        if merge_heads.len() > 1 {
+            eprintln!("fatal: Cannot merge multiple branches into empty head.");
+            return Ok(ExitCode::from(128));
+        }
+        return pull_into_void(&repo, merge_heads[0].0);
     }
 
-    // Nothing was fetched that we do not already have: git reports this as the
-    // PULL being up to date and never starts the integration step, so the line
-    // is `Already up to date.` — not the rebase's own `Current branch <b> is up
-    // to date.`, which git prints only when the branch has commits the upstream
-    // lacks (the rebase runs and finds nothing to replay). Both cases are
-    // exercised against stock git in tests/pull_up_to_date.rs.
-    if let (Ok(head), Ok(upstream)) = (
-        repo.head_id().map(|id| id.detach()),
-        repo.rev_parse_single(target_ref.as_str()).map(|id| id.detach()),
-    ) {
-        if head == upstream {
-            println!("Already up to date.");
-            return Ok(ExitCode::SUCCESS);
+    let head_id = repo.head_id()?.detach();
+
+    // `already_up_to_date()`: every fetched head is already reachable from `HEAD`.
+    // git does not report this itself — the integration step does, and *which*
+    // line it prints is the difference between the two: the merge says
+    // `Already up to date.` while the rebase, which still runs, says
+    // `Current branch <b> is up to date.`. Both are exercised against stock git
+    // in tests/pull_up_to_date.rs, so nothing is short-circuited here.
+    let already_up_to_date = merge_heads.iter().all(|(id, _)| {
+        repo.merge_base(*id, head_id).map(|base| base.detach() == *id).unwrap_or(false)
+    });
+
+    // `builtin/pull.c`'s `can_ff`: `get_can_ff()` asks whether the *first* fetched
+    // head is a descendant of `HEAD`. When it is, a rebase would replay nothing, so
+    // git forces `opt_ff = "--ff-only"` and runs the *merge* (`ran_ff`), never
+    // starting the rebase.
+    let can_ff = repo
+        .merge_base(merge_heads[0].0, head_id)
+        .map(|base| base.detach() == head_id)
+        .unwrap_or(false);
+
+    // `cmd_pull()`'s divergence gate. With neither an `--ff…` flag nor `pull.ff`,
+    // and with the rebase policy left unspecified by both the command line and
+    // config, git refuses to pick an integration strategy for a diverged branch —
+    // it does not quietly merge.
+    // `divergent = !can_ff && !already_up_to_date`: a branch that is merely
+    // *ahead* of the fetched head has not diverged, and needs no policy.
+    let divergent = !can_ff && !already_up_to_date;
+    let ff_configured = ff_cli.is_some() || repo.config_snapshot().string("pull.ff").is_some();
+    if !ff_configured && rebase_unspecified && divergent {
+        show_advice_pull_non_ff(&repo);
+        eprintln!("fatal: Need to specify how to reconcile divergent branches.");
+        return Ok(ExitCode::from(128));
+    }
+
+    // Several merge heads have no meaning for a rebase, and cannot all be
+    // fast-forwarded to.
+    if merge_heads.len() > 1 {
+        if rebasing {
+            eprintln!("fatal: Cannot rebase onto multiple branches.");
+            return Ok(ExitCode::from(128));
+        }
+        if ff_cli == Some("--ff-only") {
+            eprintln!("fatal: Cannot fast-forward to multiple branches.");
+            return Ok(ExitCode::from(128));
         }
     }
-
-    // `builtin/pull.c`'s `can_ff`: `get_can_ff()` asks whether the fetched head is a
-    // descendant of `HEAD`. When it is, a rebase would replay nothing, so git forces
-    // `opt_ff = "--ff-only"` and runs the *merge* (`ran_ff`), never starting the rebase.
-    let can_ff = match (
-        repo.head_id().map(|id| id.detach()),
-        repo.rev_parse_single(target_ref.as_str()).map(|id| id.detach()),
-    ) {
-        (Ok(head), Ok(upstream)) => repo
-            .merge_base(upstream, head)
-            .map(|base| base.detach() == head)
-            .unwrap_or(false),
-        _ => false,
-    };
 
     if rebasing && !can_ff {
         if rebase_mode == RebaseMode::Interactive {
@@ -798,7 +843,11 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
         if allow_unrelated {
             bail!("--allow-unrelated-histories is incompatible with --rebase");
         }
-        rebase_args.push(target_ref);
+        // `get_rebase_newbase_and_upstream()`: without a fork point both the new
+        // base and the upstream are the fetched head itself, and git passes the
+        // object id — which is what its `rebase (start): checkout <oid>` reflog
+        // entry records.
+        rebase_args.push(merge_heads[0].0.to_string());
         return super::rebase(&rebase_args);
     }
 
@@ -808,14 +857,6 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
         bail!(
             "-s/--strategy, -X/--strategy-option and --signoff are not supported on the merge path \
              (the merge port implements only the 'ort' strategy with no strategy options or sign-off)"
-        );
-    }
-    // `--autostash` over a dirty tree needs a 3-way stash apply the stash port
-    // cannot do; a clean tree makes it a no-op, so only the dirty case refuses.
-    if autostash == Some(true) && repo.is_dirty()? {
-        bail!(
-            "--autostash over a dirty tree is not supported on the merge path \
-             (re-applying the stash over the merged worktree needs a 3-way stash apply)"
         );
     }
 
@@ -873,8 +914,78 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
     if allow_unrelated {
         merge_args.push("--allow-unrelated-histories".into());
     }
-    merge_args.push(target_ref);
+    // `run_merge()` forwards the autostash choice and lets `git merge` do the
+    // stashing, which is why a dirty tree is fine on the merge path.
+    match autostash {
+        Some(true) => merge_args.push("--autostash".into()),
+        Some(false) => merge_args.push("--no-autostash".into()),
+        None if autostash_wanted(&repo, None)? => merge_args.push("--autostash".into()),
+        None => {}
+    }
+    // `run_merge()` ends with a literal `FETCH_HEAD` (builtin/pull.c): the merge
+    // re-reads the file, so it sees every for-merge head — an octopus when the
+    // pull asked for several — and names them the way the fetch described them.
+    merge_args.push("FETCH_HEAD".into());
     super::merge(&merge_args)
+}
+
+/// `die_resolve_conflict("pull")` / `die_conclude_merge()` (advice.c), which
+/// `cmd_pull()` reaches before the fetch.
+///
+/// An unmerged index is the first test and wins over the second, so a conflicted
+/// merge in progress is reported as unresolved conflicts rather than as an
+/// unfinished merge. Both exit 128.
+fn refuse_unfinished_merge(repo: &gix::Repository) -> Result<Option<ExitCode>> {
+    let snap = repo.config_snapshot();
+    let unmerged = repo.open_index().map(|index| {
+        index.entries().iter().any(|e| e.stage_raw() != 0)
+    });
+    if unmerged.unwrap_or(false) {
+        eprintln!("error: Pulling is not possible because you have unmerged files.");
+        if snap.boolean("advice.resolveConflict") != Some(false) {
+            eprintln!("hint: Fix them up in the work tree, and then use 'git add/rm <file>'");
+            eprintln!("hint: as appropriate to mark resolution and make a commit.");
+        }
+        eprintln!("fatal: Exiting because of an unresolved conflict.");
+        return Ok(Some(ExitCode::from(128)));
+    }
+    if repo.git_dir().join("MERGE_HEAD").exists() {
+        eprintln!("error: You have not concluded your merge (MERGE_HEAD exists).");
+        if snap.boolean("advice.resolveConflict") != Some(false) {
+            eprintln!("hint: Please, commit your changes before merging.");
+        }
+        eprintln!("fatal: Exiting because of unfinished merge.");
+        return Ok(Some(ExitCode::from(128)));
+    }
+    Ok(None)
+}
+
+/// `show_advice_pull_non_ff()` (builtin/pull.c): what to do about a diverged
+/// branch, printed before the refusal unless `advice.diverging` is off.
+fn show_advice_pull_non_ff(repo: &gix::Repository) {
+    if repo.config_snapshot().boolean("advice.diverging") == Some(false) {
+        return;
+    }
+    for line in [
+        "You have divergent branches and need to specify how to reconcile them.",
+        "You can do so by running one of the following commands sometime before",
+        "your next pull:",
+        "",
+        "  git config pull.rebase false  # merge",
+        "  git config pull.rebase true   # rebase",
+        "  git config pull.ff only       # fast-forward only",
+        "",
+        "You can replace \"git config\" with \"git config --global\" to set a default",
+        "preference for all repositories. You can also pass --rebase, --no-rebase,",
+        "or --ff-only on the command line to override the configured default per",
+        "invocation.",
+    ] {
+        if line.is_empty() {
+            eprintln!("hint:");
+        } else {
+            eprintln!("hint: {line}");
+        }
+    }
 }
 
 /// `config_autostash()`: the CLI flag wins, else `pull.autoStash` — which

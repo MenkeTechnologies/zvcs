@@ -352,6 +352,9 @@ struct Opts {
     /// message); `None` when no `--grep` was given.
     grep: Option<GrepFilter>,
     parents: bool,
+    /// `--first-parent`: diff a merge entry against its first parent instead of
+    /// skipping it, which is what makes `stash list` show a stash's diff.
+    first_parent: bool,
     /// `Some(true)` for `--merges`, `Some(false)` for `--no-merges`.
     merges: Option<bool>,
     diff: DiffFormats,
@@ -529,6 +532,7 @@ impl Default for Opts {
             out: OutFmt::Oneline,
             grep: None,
             parents: false,
+            first_parent: false,
             merges: None,
             diff: DiffFormats::default(),
             quote_high: true,
@@ -913,7 +917,8 @@ fn show(repo: &gix::Repository, rest: &[String]) -> Result<ExitCode> {
 
             // ---- recognized, no effect on reflog output ---------------------
             // Each of these was verified byte-identical to plain `git reflog`.
-            "--walk-reflogs" | "-g" | "--single-worktree" | "--first-parent" | "--boundary"
+            "--first-parent" => opts.first_parent = true,
+            "--walk-reflogs" | "-g" | "--single-worktree" | "--boundary"
             | "--source" | "--color=never" | "--color=auto" | "--no-color" => {}
 
             // ---- recognized, deliberately unimplemented ---------------------
@@ -1113,7 +1118,7 @@ fn render(
             // reflog message says the entry was. Computed before the skip/count
             // budget because pathspec filtering must run first.
             let changes = match diff_cache.as_mut() {
-                Some(cache) => collect_changes(repo, entry.oid, cache),
+                Some(cache) => collect_changes(repo, entry.oid, cache, opts.first_parent),
                 None => Vec::new(),
             };
             // Pathspecs keep only entries whose diff touches one of them.
@@ -2233,12 +2238,16 @@ fn collect_changes(
     repo: &gix::Repository,
     oid: ObjectId,
     cache: &mut gix::diff::blob::Platform,
+    first_parent: bool,
 ) -> Vec<FileChange> {
     let Ok(commit) = repo.find_commit(oid) else {
         return Vec::new();
     };
     let parents: Vec<ObjectId> = commit.parent_ids().map(|p| p.detach()).collect();
-    if parents.len() > 1 {
+    // A merge has no single diff to show — unless `--first-parent` picks one,
+    // which is how `git stash list --name-only` gets a diff at all: every stash
+    // entry is a merge commit, and `list_stash()` passes `--first-parent`.
+    if parents.len() > 1 && !first_parent {
         return Vec::new();
     }
     let Ok(new_tree) = commit.tree() else {

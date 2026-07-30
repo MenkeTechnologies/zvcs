@@ -107,10 +107,13 @@ fn squash_merges_without_moving_head_and_writes_squash_msg() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "merge --squash failed: {}", String::from_utf8_lossy(&out.stderr));
 
-    // git prints both the stopped-before-committing notice and the squash line.
+    // git prints both notices, on different streams: measured against 2.55.0,
+    // `Automatic merge went well; …` goes to **stderr** (it is `finish()`'s
+    // diagnostic) while `Squash commit -- not updating HEAD` goes to stdout.
+    let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stdout.contains("Automatic merge went well; stopped before committing as requested"),
-        "missing stop notice:\n{stdout}"
+        stderr.contains("Automatic merge went well; stopped before committing as requested"),
+        "missing stop notice:\n{stderr}"
     );
     assert!(stdout.contains("Squash commit -- not updating HEAD"), "missing squash notice:\n{stdout}");
 

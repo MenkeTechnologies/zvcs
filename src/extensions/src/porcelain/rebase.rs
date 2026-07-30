@@ -1583,7 +1583,7 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
     set_head(
         &repo,
         Target::Object(onto_oid),
-        &format!("rebase (start): checkout {onto_spec}"),
+        &format!("{} (start): checkout {onto_spec}", reflog_action()),
     )?;
 
     // ... moves the worktree and index onto the new tree, ...
@@ -1653,7 +1653,7 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
             set_head(
                 &repo,
                 Target::Object(new),
-                &gix::reference::log::message("rebase (pick)", step.message.as_bstr(), 1)
+                &gix::reference::log::message(&format!("{} (pick)", reflog_action()), step.message.as_bstr(), 1)
                     .to_string(),
             )?;
             tip = new;
@@ -1680,7 +1680,7 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
                     log: LogChange {
                         mode: RefLog::AndReference,
                         force_create_reflog: false,
-                        message: format!("rebase (finish): {name} onto {onto_oid}").into(),
+                        message: format!("{} (finish): {name} onto {onto_oid}", reflog_action()).into(),
                     },
                     expected: PreviousValue::MustExistAndMatch(Target::Object(head_oid)),
                     new: Target::Object(tip),
@@ -1688,11 +1688,12 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
                 name: b.clone(),
                 deref: false,
             })?;
-            set_head(
-                &repo,
-                Target::Symbolic(b.clone()),
-                &format!("rebase (finish): returning to {name}"),
-            )?;
+            let message = format!("{} (finish): returning to {name}", reflog_action());
+            set_head(&repo, Target::Symbolic(b.clone()), &message)?;
+            // The vendored `gix-ref` writes no reflog line for a symbolic-target
+            // update, so `HEAD`'s own log would lose the entry git ends every
+            // rebase with — the same compensation `checkout` makes.
+            super::checkout::record_head_move(&repo, Some(tip), Some(tip), &message);
             name
         }
         None => "detached HEAD".to_string(),
@@ -2134,7 +2135,7 @@ fn rebase_abort(repo: &gix::Repository) -> Result<ExitCode> {
                 log: LogChange {
                     mode: RefLog::AndReference,
                     force_create_reflog: false,
-                    message: "rebase (abort): updating HEAD".into(),
+                    message: format!("{} (abort): updating HEAD", reflog_action()).into(),
                 },
                 expected: PreviousValue::Any,
                 new: Target::Object(st.orig_head),
@@ -2142,9 +2143,9 @@ fn rebase_abort(repo: &gix::Repository) -> Result<ExitCode> {
             name: name.clone(),
             deref: false,
         })?;
-        set_head(repo, Target::Symbolic(name), "rebase (abort): returning")?;
+        set_head(repo, Target::Symbolic(name), &format!("{} (abort): returning", reflog_action()))?;
     } else {
-        set_head(repo, Target::Object(st.orig_head), "rebase (abort)")?;
+        set_head(repo, Target::Object(st.orig_head), &format!("{} (abort)", reflog_action()))?;
     }
     // Re-apply any autostash the interrupted rebase saved, onto the restored
     // orig-head tree, before dropping the state dir that holds its reference.
@@ -2348,7 +2349,7 @@ fn sequencer_rebase(start: SequencerStart<'_>) -> Result<ExitCode> {
     set_head(
         repo,
         Target::Object(base),
-        &format!("rebase (start): checkout {onto_label}"),
+        &format!("{} (start): checkout {onto_label}", reflog_action()),
     )?;
     let should_interrupt = AtomicBool::new(false);
     update_clean_worktree(repo, start.old_index, base, &should_interrupt)?;
@@ -2463,7 +2464,7 @@ fn checkout_onto(repo: &gix::Repository, start: &SequencerStart<'_>) -> Result<(
     set_head(
         repo,
         Target::Object(start.state.onto),
-        &format!("rebase (start): checkout {}", start.onto_spec),
+        &format!("{} (start): checkout {}", reflog_action(), start.onto_spec),
     )?;
     let should_interrupt = AtomicBool::new(false);
     update_clean_worktree(repo, start.old_index, start.state.onto, &should_interrupt)
@@ -3063,7 +3064,7 @@ impl<'r> Sequencer<'r> {
             repo,
             Target::Object(new),
             &gix::reference::log::message(
-                &format!("rebase ({})", item.cmd.name()),
+                &format!("{} ({})", reflog_action(), item.cmd.name()),
                 message.as_bstr(),
                 1,
             )
@@ -3151,7 +3152,7 @@ impl<'r> Sequencer<'r> {
                     extra_headers: Default::default(),
                 })?
                 .detach();
-            set_head(repo, Target::Object(new), "rebase (fixup)")?;
+            set_head(repo, Target::Object(new), &format!("{} (fixup)", reflog_action()))?;
             return Ok(Step::Next);
         }
 
@@ -3175,7 +3176,7 @@ impl<'r> Sequencer<'r> {
                     extra_headers: Default::default(),
                 })?
                 .detach();
-            set_head(repo, Target::Object(new), "rebase (fixup)")?;
+            set_head(repo, Target::Object(new), &format!("{} (fixup)", reflog_action()))?;
         } else {
             let squash_msg = repo.git_dir().join("SQUASH_MSG");
             std::fs::copy(dir.join("message-squash"), &squash_msg)?;
@@ -3458,7 +3459,8 @@ impl<'r> Sequencer<'r> {
                         mode: RefLog::AndReference,
                         force_create_reflog: false,
                         message: format!(
-                            "rebase (finish): {} onto {}",
+                            "{} (finish): {} onto {}",
+                            reflog_action(),
                             name.as_bstr(),
                             self.st.onto
                         )
@@ -3470,11 +3472,12 @@ impl<'r> Sequencer<'r> {
                 name: name.clone(),
                 deref: false,
             })?;
-            set_head(
-                repo,
-                Target::Symbolic(name),
-                &format!("rebase (finish): returning to {label}"),
-            )?;
+            let message = format!("{} (finish): returning to {label}", reflog_action());
+            set_head(repo, Target::Symbolic(name), &message)?;
+            // The vendored `gix-ref` writes no reflog line for a symbolic-target
+            // update, so `HEAD`'s own log would lose the entry git ends every
+            // rebase with — the same compensation `checkout` makes.
+            super::checkout::record_head_move(repo, Some(tip), Some(tip), &message);
             label
         } else {
             "detached HEAD".to_string()
@@ -3585,6 +3588,17 @@ fn tree_from_index(repo: &gix::Repository, index: &gix::index::File) -> Result<O
         editor.upsert(path.split(|&b| b == b'/').map(|c| c.as_bstr()), mode.kind(), entry.id)?;
     }
     Ok(editor.write(|tree| repo.write_object(tree).map(|id| id.detach()))?)
+}
+
+/// `sequencer_reflog_action()` (sequencer.c): the word every rebase reflog entry
+/// is prefixed with — `GIT_REFLOG_ACTION` when the caller set one, `rebase`
+/// otherwise.
+///
+/// `pull` sets the variable to its own command line, which is why a
+/// `git pull --rebase` leaves `pull --rebase (pick): …` in the reflog where a
+/// bare rebase leaves `rebase (pick): …`.
+fn reflog_action() -> String {
+    std::env::var("GIT_REFLOG_ACTION").unwrap_or_else(|_| "rebase".to_string())
 }
 
 fn set_head(repo: &gix::Repository, target: Target, message: &str) -> Result<()> {

@@ -44,6 +44,14 @@
 //! * `--continue`: finalize a resolved, staged in-progress merge.
 //! * `-s ours` (and `-s ort`/`octopus`): `ours` records every head as a parent
 //!   but keeps our tree verbatim.
+//! * `git merge FETCH_HEAD` — the form `pull` runs — is `handle_fetch_head()`:
+//!   the heads are the for-merge lines of `.git/FETCH_HEAD`, so one line is an
+//!   ordinary merge and several are an octopus, and the description each line
+//!   carries is what the message is built from. `fmt_merge_msg_title()`'s
+//!   grouping applies, so two branches from one remote read
+//!   `Merge branches 'a' and 'b' of <url>` rather than naming the URL twice. The
+//!   reflog still records what the *command line* said, which for this form is
+//!   the object id of each head.
 //! * `--allow-unrelated-histories`: merge with an empty base tree; without it,
 //!   `fatal: refusing to merge unrelated histories` (exit 128).
 //! * `--signoff`, `-F`/`--file`, `--cleanup=<mode>`, `-q`/`--quiet`,
@@ -893,9 +901,37 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
     // for the merge message.
     let branch: Option<FullName> = head.referent_name().map(std::borrow::ToOwned::to_owned);
 
+    // `git merge FETCH_HEAD` — the form `pull` runs — is `handle_fetch_head()`
+    // (builtin/merge.c): the heads are the *for-merge* lines of `.git/FETCH_HEAD`,
+    // however many there are, and the description each line carries is what the
+    // message is built from. That is why a pull records
+    // `Merge branch 'main' of <url>` and not the name of a tracking ref.
+    let fetch_head = match refs.len() == 1 && refs[0] == "FETCH_HEAD" {
+        true => fetch_head_for_merge(&repo)?,
+        false => Vec::new(),
+    };
+    // What the message names each head as: the FETCH_HEAD descriptions when they
+    // are what we merged, and the specs as typed otherwise. The specs themselves
+    // stay in `refs` for the reflog and the conflict labels, which git writes
+    // from the command line rather than from FETCH_HEAD.
+    let msg_specs: Vec<String> = match fetch_head.is_empty() {
+        true => refs.to_vec(),
+        false => fetch_head.iter().map(|(_, described)| described.clone()).collect(),
+    };
+    // `GIT_REFLOG_ACTION` is `merge <name>` per head (merge.c:1583-1585), and the
+    // name `get_merge_parent()` records for a FETCH_HEAD line is the object id —
+    // which is why `git merge FETCH_HEAD` reflogs `merge <oid>`.
+    let reflog_spec: String = match fetch_head.is_empty() {
+        true => refs.join(" "),
+        false => fetch_head.iter().map(|(id, _)| id.to_string()).collect::<Vec<_>>().join(" "),
+    };
+
     // Resolve every ref to merge and peel it to a commit (tags included).
     let mut targets: Vec<ObjectId> = Vec::with_capacity(refs.len());
-    for spec in refs {
+    for (id, _) in &fetch_head {
+        targets.push(*id);
+    }
+    for spec in refs.iter().filter(|_| fetch_head.is_empty()) {
         let id = repo.rev_parse_single(spec.as_str())?.object()?.peel_to_commit()?.id;
         targets.push(id);
     }
@@ -927,12 +963,14 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
     // `-s ours`: every head becomes a parent while our tree is kept verbatim.
     // Handles any number of heads and never fast-forwards.
     if opts.strategy == Strategy::Ours {
-        return merge_ours(&repo, branch.as_ref(), local_id, &targets, refs, opts);
+        return merge_ours(&repo, branch.as_ref(), local_id, &targets, &msg_specs, opts);
     }
 
-    // More than one head, default strategy → octopus.
-    if refs.len() > 1 {
-        return do_octopus(&repo, refs, &targets, local_id, branch.as_ref(), opts);
+    // More than one head, default strategy → octopus. The count is the resolved
+    // heads', not the arguments': a single `FETCH_HEAD` naming several for-merge
+    // lines is exactly how `git pull <remote> <a> <b>` reaches the octopus.
+    if targets.len() > 1 {
+        return do_octopus(&repo, &msg_specs, &targets, local_id, branch.as_ref(), opts);
     }
 
     let spec = refs[0].as_str();
@@ -1014,7 +1052,7 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
     }
 
     let should_interrupt = AtomicBool::new(false);
-    let message = compose_message(&repo, refs, &targets, branch.as_ref(), local_id, opts)?;
+    let message = compose_message(&repo, &msg_specs, &targets, branch.as_ref(), local_id, opts)?;
 
     // Diverged histories: a genuine three-way merge (`ort` strategy) of HEAD and
     // the target against their merge base (an empty tree for unrelated histories).
@@ -1091,7 +1129,7 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
                 head_tree,
                 opts,
                 "ort",
-                spec,
+                &reflog_spec,
                 stash,
             );
         }
@@ -1140,7 +1178,7 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
             head_tree,
             opts,
             "ort",
-            spec,
+            &reflog_spec,
             stash,
         );
     }
@@ -1199,7 +1237,7 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
         return Ok(code);
     }
     update_worktree(&repo, &old_index, Some(head_tree), target_tree, &should_interrupt)?;
-    advance(&repo, local_id, target_id, format!("{}: Fast-forward", reflog_action(spec)))?;
+    advance(&repo, local_id, target_id, format!("{}: Fast-forward", reflog_action(&reflog_spec)))?;
     if !opts.quiet {
         println!("Fast-forward");
         print!("{}", diffstat(&repo, head_tree, target_tree, opts.stat)?);
@@ -1279,7 +1317,9 @@ fn finalize_clean(
     // `--squash`: no commit, no ref move, no MERGE_HEAD — just SQUASH_MSG.
     if opts.squash {
         if !opts.quiet {
-            println!("Automatic merge went well; stopped before committing as requested");
+            // `finish()` routes this through `printf_ln` on **stderr** — it is
+            // part of the merge's diagnostics, not its output.
+            eprintln!("Automatic merge went well; stopped before committing as requested");
         }
         write_squash_msg(repo, targets, local_id)?;
         if !opts.quiet {
@@ -1484,7 +1524,7 @@ fn do_octopus(
     refs: &[String],
     targets: &[ObjectId],
     local_id: ObjectId,
-    _branch: Option<&FullName>,
+    branch: Option<&FullName>,
     opts: &Opts,
 ) -> Result<ExitCode> {
     // Every head, resolved by the caller; pair each with its spec for messages.
@@ -1658,7 +1698,7 @@ fn do_octopus(
 
     // The default octopus message (or the explicit `-m`/`-F` text), plus the
     // `--log` shortlog of every merged head.
-    let message = compose_message(repo, refs, targets, None, local_id, opts)?;
+    let message = compose_message(repo, refs, targets, branch, local_id, opts)?;
     // The finish (squash / stop-before-commit / commit) is shared with the two-head
     // paths; every merged head becomes a parent (`mrc` minus HEAD).
     let extra_parents: Vec<ObjectId> = mrc.iter().copied().filter(|p| *p != local_id).collect();
@@ -1797,6 +1837,152 @@ fn bool_or_int(value: &BStr) -> Option<i64> {
 // The merge message: title, `--log` shortlog, `--edit` comment block
 // ---------------------------------------------------------------------------
 
+/// The for-merge heads of `.git/FETCH_HEAD` as `(commit, description)`, in file
+/// order — `handle_fetch_head()` (builtin/merge.c).
+///
+/// A row is `<oid>\t<"" | not-for-merge>\t<description>`; only the rows with an
+/// empty middle column are merged, and the description is what the fetch stored
+/// (`branch 'main' of <url>`, `tag 'v1' of <url>`, or the bare URL for a `HEAD`
+/// fetch). An absent file simply means there is nothing to merge.
+pub(super) fn fetch_head_for_merge(repo: &gix::Repository) -> Result<Vec<(ObjectId, String)>> {
+    let path = repo.git_dir().join("FETCH_HEAD");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err.into()),
+    };
+    let mut heads = Vec::new();
+    for line in text.lines() {
+        let mut fields = line.splitn(3, '\t');
+        let (Some(oid), Some(kind), description) = (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        if !kind.is_empty() {
+            continue; // not-for-merge
+        }
+        let Ok(id) = ObjectId::from_hex(oid.as_bytes()) else {
+            continue;
+        };
+        heads.push((id, description.unwrap_or_default().to_string()));
+    }
+    Ok(heads)
+}
+
+/// `fmt_merge_msg_title()` (fmt-merge-msg.c) over FETCH_HEAD descriptions, or
+/// `None` when these are ordinary ref names and the caller's own title applies.
+///
+/// `handle_line()` splits each description at ` of ` into what was merged and
+/// where it came from, then groups by source and by kind, so two branches from
+/// one remote read `Merge branches 'a' and 'b' of <url>` rather than repeating
+/// the URL. Sources are joined with `; `, kinds within a source with `, `, and
+/// the names of one kind with `, ` plus a final ` and `.
+fn fetch_head_title(specs: &[String]) -> Option<String> {
+    // Sources in first-seen order, each with its four name lists in git's order.
+    let mut sources: Vec<(String, [Vec<String>; 4])> = Vec::new();
+    let mut described_any = false;
+    for spec in specs {
+        let (what, src) = match spec.split_once(" of ") {
+            Some((what, src)) => (what, src.to_string()),
+            // No source: the whole line is one, as it is for a `HEAD` fetch.
+            None => (spec.as_str(), spec.clone()),
+        };
+        let slot = match sources.iter().position(|(s, _)| *s == src) {
+            Some(at) => at,
+            None => {
+                sources.push((src, Default::default()));
+                sources.len() - 1
+            }
+        };
+        // `branch 'x'` / `remote-tracking branch 'x'` / `tag 'x'` keep their
+        // quoted name; anything else is a generic head named verbatim, and a
+        // line that *is* its own source (`pulling_head`) names nothing.
+        let (list, name) = if let Some(name) = what.strip_prefix("remote-tracking branch ") {
+            described_any = true;
+            (1, name)
+        } else if let Some(name) = what.strip_prefix("branch ") {
+            described_any = true;
+            (0, name)
+        } else if let Some(name) = what.strip_prefix("tag ") {
+            described_any = true;
+            (2, name)
+        } else if what == sources[slot].0 {
+            continue;
+        } else {
+            (3, what)
+        };
+        sources[slot].1[list].push(name.to_string());
+    }
+    if !described_any {
+        return None;
+    }
+
+    let kinds = [
+        ("branch ", "branches "),
+        ("remote-tracking branch ", "remote-tracking branches "),
+        ("tag ", "tags "),
+        ("commit ", "commits "),
+    ];
+    let mut out = String::from("Merge ");
+    for (i, (src, lists)) in sources.iter().enumerate() {
+        if i > 0 {
+            out.push_str("; ");
+        }
+        let mut first_kind = true;
+        for (list, (singular, plural)) in lists.iter().zip(kinds) {
+            if list.is_empty() {
+                continue;
+            }
+            if !first_kind {
+                out.push_str(", ");
+            }
+            first_kind = false;
+            out.push_str(&join_named(singular, plural, list));
+        }
+        if src != "." {
+            out.push_str(&format!(" of {src}"));
+        }
+    }
+    Some(out)
+}
+
+/// `print_joined()`: `<singular><a>`, or `<plural><a>, <b> and <c>`.
+fn join_named(singular: &str, plural: &str, names: &[String]) -> String {
+    match names {
+        [one] => format!("{singular}{one}"),
+        _ => {
+            let (last, rest) = names.split_last().expect("non-empty");
+            format!("{plural}{} and {last}", rest.join(", "))
+        }
+    }
+}
+
+/// A FETCH_HEAD description read back as a [`SpecOrigin`], or `None` when the
+/// string is an ordinary ref name.
+///
+/// `handle_line()` (fmt-merge-msg.c) strips the `branch `/`remote-tracking
+/// branch ` prefix for the shortlog origin, keeps `tag ` (so its quotes survive),
+/// and takes anything else — a bare URL, for a `HEAD` fetch — verbatim.
+fn described_line(spec: &str) -> Option<SpecOrigin> {
+    for prefix in ["branch '", "remote-tracking branch '"] {
+        if let Some(rest) = spec.strip_prefix(prefix) {
+            return Some(SpecOrigin {
+                described: spec.to_string(),
+                origin: rest.rsplit_once('\'').map_or(rest, |(name, _)| name).to_string(),
+                is_local_branch: prefix == "branch '",
+            });
+        }
+    }
+    if spec.starts_with("tag '") {
+        return Some(SpecOrigin {
+            described: spec.to_string(),
+            origin: spec.to_string(),
+            is_local_branch: false,
+        });
+    }
+    None
+}
+
 /// How one merged ref is named, in the two spellings git needs: the `merge_name()`
 /// description that goes into the title, and the `handle_line()` *origin* that
 /// heads the `--log` shortlog block.
@@ -1822,16 +2008,33 @@ fn compose_message(
 ) -> Result<String> {
     // git's `opts.add_title = !have_message`: an explicit message replaces the
     // generated title but never the shortlog.
-    let mut msg = match (&opts.message, refs.len()) {
-        (Some(m), _) => {
+    // Heads that came from FETCH_HEAD carry their own descriptions, which git
+    // groups by source and kind rather than naming one by one.
+    let fetch_head_title = match &opts.message {
+        Some(_) => None,
+        None => fetch_head_title(refs),
+    };
+    let mut msg = match (&opts.message, fetch_head_title, refs.len()) {
+        (Some(m), _, _) => {
             let mut m = m.clone();
             if !m.ends_with('\n') {
                 m.push('\n');
             }
             m
         }
-        (None, 1) => merge_message(repo, &refs[0], branch, opts.into_name.as_deref())?,
-        (None, _) => {
+        (None, Some(title), _) => {
+            let current = match (opts.into_name.as_deref(), branch) {
+                (Some(n), _) => n.to_string(),
+                (None, Some(b)) => b.shorten().to_str_lossy().into_owned(),
+                (None, None) => "HEAD".to_string(),
+            };
+            match dest_suppressed(repo, &current) {
+                true => format!("{title}\n"),
+                false => format!("{title} into {current}\n"),
+            }
+        }
+        (None, _, 1) => merge_message(repo, &refs[0], branch, opts.into_name.as_deref())?,
+        (None, _, _) => {
             let specs: Vec<&str> = refs.iter().map(String::as_str).collect();
             octopus_message(&specs)
         }
@@ -2770,6 +2973,12 @@ fn suppress_dest_patterns(repo: &gix::Repository) -> Vec<BString> {
 /// prefix is dropped and the surrounding quotes with it, `tag ` is kept (so the
 /// quotes survive), and anything else — a raw commit — is used verbatim.
 fn describe_spec(repo: &gix::Repository, spec: &str) -> SpecOrigin {
+    // A FETCH_HEAD line arrives already described — `handle_line()` reads exactly
+    // these forms out of the file — so it is passed through rather than looked up
+    // as a ref name, which is what it is not.
+    if let Some(origin) = described_line(spec) {
+        return origin;
+    }
     if let Ok(Some(r)) = repo.try_find_reference(spec) {
         let full = r.name().as_bstr().to_str_lossy().into_owned();
         if full.starts_with("refs/heads/") {

@@ -115,10 +115,13 @@ use regex::bytes::{Regex, RegexBuilder};
 ///
 /// # Diff output
 ///
-/// `--raw`, `--numstat`, `--summary`, `--shortstat`, `--name-only` and
-/// `--name-status` render the diff of each entry's commit against its first parent
-/// (the empty tree for a root commit). Merge commits produce no diff, matching
-/// `git log`'s default of not diffing a merge at all. Paths go through git's
+/// `--raw`, `--numstat`, `--summary`, `--shortstat`, `--name-only`,
+/// `--name-status`, `--stat` and `-p`/`--patch` render the diff of each entry's
+/// commit against its first parent (the empty tree for a root commit) — the last
+/// two through the same renderers `diff --stat` and `log -p` use, so a patch here
+/// is the patch there. Merge commits produce no diff, matching `git log`'s
+/// default of not diffing a merge at all, unless `--first-parent` picks a side —
+/// which is how `stash list -p` shows a stash entry's own change. Paths go through git's
 /// `quote_c_style()`, honouring `core.quotePath`, and renames through its
 /// `pprint_rename()` brace compaction. `--raw` object ids are abbreviated with the
 /// diff `--abbrev`, a missing side printed as an abbreviated null id.
@@ -291,6 +294,12 @@ struct DiffFormats {
     /// git's `DIFF_FORMAT_NO_OUTPUT`, set by `-s`/`--no-patch`. It renders nothing
     /// itself but still counts towards the "cannot be used together" check.
     no_output: bool,
+    /// git's `DIFF_FORMAT_PATCH`, set by `-p`/`-u`/`--patch`: the body is rendered
+    /// by the same machinery `log -p` uses.
+    patch: bool,
+    /// git's `DIFF_FORMAT_DIFFSTAT`, set by a bare `--stat`, rendered by the same
+    /// histogram `diff --stat` prints.
+    stat: bool,
 }
 
 impl DiffFormats {
@@ -301,6 +310,8 @@ impl DiffFormats {
             || self.shortstat
             || self.summary
             || self.raw
+            || self.patch
+            || self.stat
     }
 
     /// `-s` / `--no-patch` assigns "no output", dropping every bit set before it.
@@ -309,6 +320,12 @@ impl DiffFormats {
             no_output: true,
             ..DiffFormats::default()
         };
+    }
+
+    /// Whether a patch body is to be rendered after the name/stat formats, which
+    /// is git's ordering when both are asked for.
+    fn wants_patch(self) -> bool {
+        self.patch && !self.no_output
     }
 
     /// The bits git's `HAS_MULTI_BITS()` check counts.
@@ -324,6 +341,10 @@ impl DiffFormats {
             self.shortstat = false;
             self.summary = false;
             self.raw = false;
+            // A name format replaces `DIFF_FORMAT_PATCH`/`DIFFSTAT` rather than
+            // joining them.
+            self.patch = false;
+            self.stat = false;
         }
     }
 }
@@ -922,8 +943,11 @@ fn show(repo: &gix::Repository, rest: &[String]) -> Result<ExitCode> {
             | "--source" | "--color=never" | "--color=auto" | "--no-color" => {}
 
             // ---- recognized, deliberately unimplemented ---------------------
-            "-p" | "--patch" | "-u" | "--stat" | "--dirstat"
-            | "--patch-with-stat" | "--color" | "--color=always" => {
+            // `log -p`'s renderer is shared, so the patch body is real output
+            // rather than a refusal — `git stash list -p` is `log -g -p`.
+            "-p" | "--patch" | "-u" => opts.diff.patch = true,
+            "--stat" => opts.diff.stat = true,
+            "--dirstat" | "--patch-with-stat" | "--color" | "--color=always" => {
                 note_first(&mut unimplemented, a.to_owned());
             }
             s if s.starts_with("--stat=") || s.starts_with("--dirstat=") => {
@@ -1175,9 +1199,15 @@ fn render(
                         out.push(b'\n');
                         // A user format is separated from the diff by a blank line,
                         // emitted whenever the diff queue is non-empty — even when
-                        // the selected format renders none of those changes.
+                        // the selected format renders none of those changes. With a
+                        // stat *and* a patch, git's `log --stat -p` layout puts
+                        // `---` there instead.
                         if !changes.is_empty() {
-                            out.push(b'\n');
+                            if opts.diff.stat && opts.diff.wants_patch() {
+                                out.extend_from_slice(b"---\n");
+                            } else {
+                                out.push(b'\n');
+                            }
                         }
                     }
                 }
@@ -1224,9 +1254,15 @@ fn render(
                         decorations.as_ref(),
                     );
                     out.extend_from_slice(&block);
-                    // A diff, when one is selected, is separated by a blank line.
+                    // A diff, when one is selected, is separated by a blank line —
+                    // except when a stat *and* a patch are both printed, where
+                    // git's `log --stat -p` layout separates them with `---`.
                     if !changes.is_empty() {
-                        out.push(b'\n');
+                        if opts.diff.stat && opts.diff.wants_patch() {
+                            out.extend_from_slice(b"---\n");
+                        } else {
+                            out.push(b'\n');
+                        }
                     }
                 }
             }
@@ -1239,6 +1275,29 @@ fn render(
                 &opts.abbrev,
                 fallback_len,
             );
+            if opts.diff.wants_patch() {
+                // The stat block and the patch are separated by a blank line.
+                if opts.diff.stat && !changes.is_empty() {
+                    out.push(b'\n');
+                }
+                if let Ok(commit) = repo.find_commit(entry.oid) {
+                    // Measured against 2.55.0: `git log -g -p --first-parent`
+                    // diffs a merge entry against its first parent — that is what
+                    // `stash list -p` is — while `git reflog show -p
+                    // --first-parent` prints the entry lines alone. The custom
+                    // format is what tells the two apart here, since `stash list`
+                    // always passes one.
+                    let merge = commit.parent_ids().count() > 1;
+                    if merge && !matches!(opts.out, OutFmt::Custom(_)) {
+                        printed += 1;
+                        continue;
+                    }
+                    let parent = commit.parent_ids().next().map(|id| id.detach());
+                    if let Ok(patch) = super::diff::commit_patch(repo, &commit, parent, 3) {
+                        out.extend_from_slice(&patch);
+                    }
+                }
+            }
             printed += 1;
         }
     }
@@ -2501,6 +2560,25 @@ fn append_diff(
             out.extend_from_slice(&quote_path(&change.path, quote_high));
             out.push(b'\n');
         }
+    }
+
+    if fmts.stat {
+        // The same histogram `diff --stat` prints, fed the rows this module
+        // already computed — widths, `{a => b}` compaction and the summary line
+        // all come from there rather than from a second implementation.
+        let rows: Vec<(gix::bstr::BString, gix::bstr::BString, u32, u32, bool)> = changes
+            .iter()
+            .map(|change| {
+                let dest = gix::bstr::BString::from(change.path.clone());
+                let src = change
+                    .source
+                    .clone()
+                    .map_or_else(|| dest.clone(), gix::bstr::BString::from);
+                let (ins, del) = change.counts.unwrap_or((0, 0));
+                (src, dest, ins, del, change.counts.is_none())
+            })
+            .collect();
+        super::diff::render_rows_stat(out, &rows, &super::diff_color::DiffColors::disabled());
     }
 
     if fmts.numstat {

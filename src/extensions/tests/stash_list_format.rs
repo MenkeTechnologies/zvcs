@@ -123,3 +123,40 @@ fn stash_list_empty_without_a_stash() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// `stash list -p` and `--stat` render each entry's own change — the diff of the
+/// stash commit against its first parent, which only the `--first-parent` walk
+/// `list_stash()` uses can reach. Both go through the renderers `log -p` and
+/// `diff --stat` use, so the bodies are the ones those commands produce.
+#[test]
+fn stash_list_patch_and_stat_match_git() {
+    let root = std::env::temp_dir().join(format!("zvcs-stashdiff-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let root = root.canonicalize().unwrap();
+    let home = root.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let repo = root.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    git(&repo, &["config", "user.email", "a@b"]);
+    git(&repo, &["config", "user.name", "A"]);
+    std::fs::write(repo.join("f"), "one\n").unwrap();
+    git(&repo, &["add", "f"]);
+    git(&repo, &["-c", "commit.gpgsign=false", "commit", "-q", "-m", "c0", "--date", DATE]);
+    std::fs::write(repo.join("f"), "one\ntwo\n").unwrap();
+    git(&repo, &["stash"]);
+    std::fs::write(repo.join("f"), "one\nthree\n").unwrap();
+    git(&repo, &["stash"]);
+
+    assert_matches(&repo, &home, &["stash", "list", "-p"]);
+    assert_matches(&repo, &home, &["stash", "list", "--stat"]);
+    // Both: git's `log --stat -p` layout, `---` then the stat then the patch.
+    assert_matches(&repo, &home, &["stash", "list", "-p", "--stat"]);
+    // A name format outranks both, as `diff_setup_done()` resolves it.
+    assert_matches(&repo, &home, &["stash", "list", "-p", "--name-only"]);
+    // And the same options straight through `reflog show`.
+    assert_matches(&repo, &home, &["reflog", "show", "-p", "--first-parent", "refs/stash"]);
+
+    let _ = std::fs::remove_dir_all(&root);
+}

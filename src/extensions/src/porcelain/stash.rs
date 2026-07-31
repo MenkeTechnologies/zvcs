@@ -40,7 +40,9 @@
 //!   over `log -g --first-parent` as `list_stash()` runs it, so the diff options
 //!   the reflog port renders (`--name-only`, `--name-status`, `--numstat`,
 //!   `--shortstat`, `--summary`, `--raw`) describe each entry's own change.
-//!   `-p`/`--stat` are refused there rather than silently dropped.
+//!   `-p` and `--stat` render each entry's patch and histogram through the same
+//!   machinery `log -p`/`diff --stat` use; `--dirstat`/`--patch-with-stat` are
+//!   refused there rather than silently dropped.
 //! * `pop` / `apply` — a three-way merge of the stash onto the current tree
 //!   (base: the stash's own base, ours: the current index, theirs: `W`), so a
 //!   moved `HEAD` or unrelated local work is fine; a conflict leaves the markers

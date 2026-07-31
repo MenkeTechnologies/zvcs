@@ -14,16 +14,32 @@
 //! harness, because its output still reads like evidence.
 //!
 //! So the binary is resolved explicitly here, and *verified*: `ZVCS_STOCK_GIT`
-//! when set, else the usual install locations, and each candidate is probed
-//! before it is trusted. Nothing falls back to a silent `PATH` lookup — when no
-//! stock git can be found, the caller is told rather than handed zvcs.
+//! when set, else the newest of the usual install locations, with each candidate
+//! probed before it is trusted. Nothing falls back to a silent `PATH` lookup —
+//! when no stock git can be found, the caller is told rather than handed zvcs.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 
-/// Where a real git usually lives, in the order a candidate is tried.
+/// Where a real git usually lives. Order does not matter: the newest of them
+/// wins (see [`git_path`]).
 const CANDIDATES: [&str; 3] = ["/usr/bin/git", "/opt/homebrew/bin/git", "/usr/local/bin/git"];
+
+/// `git version X.Y.Z` as a comparable tuple, or `None` when it will not answer.
+///
+/// A machine usually has more than one git — an OS-vendored one under `/usr/bin`
+/// and a current one from a package manager — and the port targets the *newest*
+/// one it can find. Measuring against the older one silently reports parity with
+/// a git nobody is running: `/usr/bin/git` here is 2.50.1 while the port tracks
+/// 2.55.0, and the two disagree about real behaviour.
+fn version_of(bin: &Path) -> Option<(u32, u32, u32)> {
+    let out = Command::new(bin).arg("--version").env_clear().output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let rest = text.trim().strip_prefix("git version ")?;
+    let mut parts = rest.split(['.', ' ', '-']).filter_map(|p| p.parse::<u32>().ok());
+    Some((parts.next()?, parts.next().unwrap_or(0), parts.next().unwrap_or(0)))
+}
 
 /// Whether `bin` is zvcs wearing git's name.
 ///
@@ -56,7 +72,10 @@ pub fn git_path() -> Option<&'static Path> {
             CANDIDATES
                 .iter()
                 .map(PathBuf::from)
-                .find(|p| p.exists() && !is_zvcs(p))
+                .filter(|p| p.exists() && !is_zvcs(p))
+                .filter_map(|p| version_of(&p).map(|v| (v, p)))
+                .max_by_key(|(v, _)| *v)
+                .map(|(_, p)| p)
         })
         .as_deref()
 }

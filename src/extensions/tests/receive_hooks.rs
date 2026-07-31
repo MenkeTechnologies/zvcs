@@ -351,6 +351,11 @@ fn proc_receive_ng_rejects_the_ref() {
 
 /// A `receive.procReceiveRefs` prefix only matches at a `/` boundary, so a
 /// sibling ref with the same textual prefix goes through the ref store as usual.
+///
+/// The sibling has to be two levels deep: `update()` refuses anything under
+/// `refs/` that `check_refname_format()` rejects without `ALLOW_ONELEVEL`, so a
+/// bare `refs/formal` is a `funny refname` for git too and would prove nothing
+/// about prefix matching.
 #[test]
 fn proc_receive_prefix_matches_only_at_a_slash_boundary() {
     let f = Fixture::new("procbound");
@@ -358,13 +363,13 @@ fn proc_receive_prefix_matches_only_at_a_slash_boundary() {
     // Any invocation of the hook is a failure, so make it one.
     f.hook("proc-receive", "#!/bin/sh\nexit 1\n");
 
-    let out = f.git(&["push", "origin", "main:refs/formal"]);
+    let out = f.git(&["push", "origin", "main:refs/format/main"]);
     assert!(
         out.status.success(),
-        "refs/formal is not under refs/for/: {}",
+        "refs/format/ is not under refs/for/: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(f.has_ref("refs/formal"), "ref did not land: {}", f.remote_refs());
+    assert!(f.has_ref("refs/format/main"), "ref did not land: {}", f.remote_refs());
 }
 
 /// `--atomic` is all or nothing: an `update` hook that vetoes the second ref

@@ -156,9 +156,7 @@
 //! tests that stdin and stdout are both terminals rather than that they are the
 //! same file; `--signoff` adds its trailer before the `--edit` comment block
 //! rather than through `ignored_log_message_bytes()`;
-//! a `--squash` fast-forward prints its
-//! `Squash commit -- not updating HEAD` after the diffstat rather than before
-//! it; and a directory standing where a merge wants
+//! and a directory standing where a merge wants
 //! to write is left to the checkout instead of going through
 //! `verify_clean_subdirectory()`, so untracked files inside it are not counted
 //! (a gitlink whose submodule is already checked out passes under git too).
@@ -1208,11 +1206,14 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
         update_worktree(&repo, &old_index, Some(head_tree), target_tree, &should_interrupt)?;
         if !opts.quiet {
             println!("Fast-forward");
-            print!("{}", diffstat(&repo, head_tree, target_tree, opts.stat)?);
         }
+        // `finish()` calls `squash_message()`, which announces itself before it
+        // writes `SQUASH_MSG`, and prints the diffstat afterwards. The notice has
+        // no verbosity check in git: `-q` silences the block around it, not it.
+        println!("Squash commit -- not updating HEAD");
         write_squash_msg(&repo, &[target_id], local_id)?;
         if !opts.quiet {
-            println!("Squash commit -- not updating HEAD");
+            print!("{}", diffstat(&repo, head_tree, target_tree, opts.stat)?);
         }
         end_autostash(&repo, stash, false)?;
         return Ok(ExitCode::SUCCESS);
@@ -1327,15 +1328,13 @@ fn finalize_clean(
 
     // `--squash`: no commit, no ref move, no MERGE_HEAD — just SQUASH_MSG.
     if opts.squash {
-        if !opts.quiet {
-            // `finish()` routes this through `printf_ln` on **stderr** — it is
-            // part of the merge's diagnostics, not its output.
-            eprintln!("Automatic merge went well; stopped before committing as requested");
-        }
+        // `cmd_merge()` reports this with `fprintf(stderr, …)` after `finish()`,
+        // and — like the squash notice — with no verbosity check of its own.
+        eprintln!("Automatic merge went well; stopped before committing as requested");
+        // No verbosity check on this one in git — `squash_message()` prints it
+        // before it writes the file, whatever `-q` says.
+        println!("Squash commit -- not updating HEAD");
         write_squash_msg(repo, targets, local_id)?;
-        if !opts.quiet {
-            println!("Squash commit -- not updating HEAD");
-        }
         end_autostash(repo, stash, false)?;
         return Ok(ExitCode::SUCCESS);
     }
@@ -1345,9 +1344,7 @@ fn finalize_clean(
         let git_dir = repo.git_dir();
         write_merge_heads(repo, targets, opts.ff)?;
         std::fs::write(git_dir.join("MERGE_MSG"), &message)?;
-        if !opts.quiet {
-            println!("Automatic merge went well; stopped before committing as requested");
-        }
+        eprintln!("Automatic merge went well; stopped before committing as requested");
         end_autostash(repo, stash, false)?;
         return Ok(ExitCode::SUCCESS);
     }

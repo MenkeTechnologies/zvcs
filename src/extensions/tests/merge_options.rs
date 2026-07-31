@@ -140,12 +140,19 @@ fn no_commit_records_merge_state_without_committing() {
     let head_before = git_out(&repo, &["rev-parse", "HEAD"]);
 
     let out = zvcs_merge(&repo, &home, &["--no-commit", "feat"]);
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(out.status.success(), "merge --no-commit failed: {}", String::from_utf8_lossy(&out.stderr));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "merge --no-commit failed: {stderr}");
 
+    // `cmd_merge()` ends with `fprintf(stderr, …)` for this one, and with no
+    // verbosity check — `-q` does not silence it either.
     assert!(
-        stdout.contains("Automatic merge went well; stopped before committing as requested"),
-        "missing stop notice:\n{stdout}"
+        stderr.contains("Automatic merge went well; stopped before committing as requested"),
+        "missing stop notice:\n{stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).matches("Automatic merge went well").count(),
+        0,
+        "the notice belongs on stderr"
     );
 
     // HEAD stays put; the merge is left in progress for `git commit` to finish.

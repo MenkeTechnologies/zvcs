@@ -322,21 +322,17 @@ pub fn stash(args: &[String]) -> Result<ExitCode> {
             if let Some(code) = usage_requested(&args[1..], DROP_USAGE) {
                 return Ok(code);
             }
-            let named = positional(&args[1..]);
-            let spec = match resolve_stash(&repo, named)? {
+            let quiet = args[1..].iter().any(|a| a == "-q" || a == "--quiet");
+            let named = positionals(&args[1..]);
+            let spec = match resolve_stash(&repo, &named)? {
                 Ok(spec) => spec,
                 Err(code) => return Ok(code),
             };
-            if let Some(code) = require_stash_ref(&spec, named) {
+            if let Some(code) = require_stash_ref(&spec) {
                 return Ok(code);
             }
-            let n = spec.entry.expect("checked to be a stash reference");
             let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
-            let dropped = drop_reflog_entry(&repo, n)?;
-            // `drop_stash()` prints the ref as `reflog delete` names it, which is
-            // the full `refs/stash@{n}` and not the short spelling.
-            println!("Dropped refs/stash@{{{n}}} ({dropped})");
-            Ok(ExitCode::SUCCESS)
+            do_drop_stash(&repo, &spec, quiet)
         }
         Some("clear") => {
             let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
@@ -380,9 +376,13 @@ pub fn stash(args: &[String]) -> Result<ExitCode> {
 
 /// `git stash push` — snapshot tracked changes, then reset the worktree+index to HEAD.
 fn push(repo: &gix::Repository, opts: &PushOpts) -> Result<ExitCode> {
-    // An unborn HEAD has no base to stash against.
+    // An unborn HEAD has no base to stash against. `do_create_stash()` says so on
+    // stderr — unprefixed, and not at all under `-q` — and returns -1.
     if repo.head_id().is_err() {
-        bail!("You do not have the initial commit yet");
+        if !opts.quiet {
+            eprintln!("You do not have the initial commit yet");
+        }
+        return Ok(ExitCode::FAILURE);
     }
 
     // `do_push_stash()` starts with `repo_refresh_and_write_index()`, which fails
@@ -422,7 +422,9 @@ fn push(repo: &gix::Repository, opts: &PushOpts) -> Result<ExitCode> {
     // `-S` with an empty index diff. git distinguishes the two.
     if affected.is_empty() && untracked_paths.is_empty() {
         if opts.staged_only {
-            bail!("No staged changes");
+            // `stash_staged()`: stderr, unprefixed.
+            eprintln!("No staged changes");
+            return Ok(ExitCode::FAILURE);
         }
         if !opts.quiet {
             println!("No local changes to save");
@@ -1042,7 +1044,8 @@ fn refuse_unmerged_index(repo: &gix::Repository) -> Result<Option<ExitCode>> {
 /// by a space (no option parsing), and a clean tree prints nothing (exit 0).
 fn create_stash(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
     if repo.head_id().is_err() {
-        bail!("You do not have the initial commit yet");
+        eprintln!("You do not have the initial commit yet");
+        return Ok(ExitCode::FAILURE);
     }
     // `check_changes_tracked_files`: no tracked changes → nothing to create.
     if !repo.is_dirty()? {
@@ -1092,7 +1095,7 @@ fn store_stash(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
 /// same machinery git's `diff_tree_oid` drives, so output is byte-identical.
 fn show_stash(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
     let mut diff_flags: Vec<String> = Vec::new();
-    let mut stash_spec: Option<String> = None;
+    let mut stash_specs: Vec<String> = Vec::new();
     // `show_include_untracked` / `show_only_untracked`: what the `^3` tree the
     // stash carries contributes to the diff. `stash.showIncludeUntracked` seeds
     // it before the options are read — unlike `stash.showStat`/`showPatch`, it
@@ -1109,19 +1112,14 @@ fn show_stash(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
             "-u" | "--include-untracked" => untracked_mode = ShowUntracked::Include,
             "--only-untracked" => untracked_mode = ShowUntracked::Only,
             s if s.starts_with('-') && s != "-" => diff_flags.push(a.clone()),
-            _ => {
-                if stash_spec.is_some() {
-                    bail!("Too many revisions specified");
-                }
-                stash_spec = Some(a.clone());
-            }
+            _ => stash_specs.push(a.clone()),
         }
     }
 
     // Resolve the stash: a `stash@{n}` / bare `N` / (default) `stash@{0}` goes
     // through the reflog; anything else is resolved as an arbitrary stash-like
     // commit, matching git's `get_stash_info`.
-    let commit_id = match resolve_stash(repo, stash_spec.as_deref())? {
+    let commit_id = match resolve_stash(repo, &stash_specs)? {
         Ok(spec) => spec.id,
         Err(code) => return Ok(code),
     };
@@ -1158,6 +1156,10 @@ fn show_stash(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
         None => None,
     };
     let (left, right) = match (untracked_mode, u_tree) {
+        // `case UNTRACKED_ONLY:` diffs the `^3` tree and nothing else, so a stash
+        // that captured no untracked files has nothing to show — not even the
+        // tracked changes it does carry.
+        (ShowUntracked::Only, None) => return Ok(ExitCode::SUCCESS),
         (ShowUntracked::No, _) | (_, None) => (b_commit.to_string(), commit_id.to_string()),
         (ShowUntracked::Only, Some(u)) => (repo.empty_tree().id().to_string(), u.to_string()),
         (ShowUntracked::Include, Some(u)) => {
@@ -1199,11 +1201,15 @@ fn branch_stash(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
     }
     let branch = match positionals.first() {
         Some(b) => (*b).to_string(),
-        None => bail!("No branch name specified"),
+        None => {
+            eprintln!("No branch name specified");
+            return Ok(ExitCode::FAILURE);
+        }
     };
     // `branch_stash()` takes any stash-like commit; only an entry of the reflog
     // is dropped afterwards (`is_stash_ref`).
-    let stash = match resolve_stash(repo, positionals.get(1).copied())? {
+    let specs: Vec<String> = positionals[1..].iter().map(|s| (*s).to_string()).collect();
+    let stash = match resolve_stash(repo, &specs)? {
         Ok(spec) => spec,
         Err(code) => return Ok(code),
     };
@@ -1238,9 +1244,8 @@ fn branch_stash(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
 
     // Only a `refs/stash` entry is dropped — `is_stash_ref` is false for a
     // stash-like commit named directly, and git leaves that one alone.
-    if let Some(n) = stash.entry {
-        let dropped = drop_reflog_entry(&repo, n)?;
-        println!("Dropped refs/stash@{{{n}}} ({dropped})");
+    if stash.is_stash_ref {
+        return do_drop_stash(&repo, &stash, false);
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -1278,14 +1283,14 @@ fn list(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
 /// Port of `do_apply_stash`'s tail: the restore, then `git status` (skipped under
 /// `-q`), and for `pop` the `Dropped …` line — which `-q` silences too.
 fn apply_or_pop(repo: &gix::Repository, opts: &ApplyOptions, pop: bool) -> Result<ExitCode> {
-    let stash = match resolve_stash(repo, opts.spec.as_deref())? {
+    let stash = match resolve_stash(repo, &opts.specs)? {
         Ok(spec) => spec,
         Err(code) => return Ok(code),
     };
     // `pop` rewrites the reflog afterwards, so — unlike `apply` — it takes only
     // an entry of it.
     if pop {
-        if let Some(code) = require_stash_ref(&stash, opts.spec.as_deref()) {
+        if let Some(code) = require_stash_ref(&stash) {
             return Ok(code);
         }
     }
@@ -1316,11 +1321,7 @@ fn apply_or_pop(repo: &gix::Repository, opts: &ApplyOptions, pop: bool) -> Resul
         return Ok(ExitCode::from(1));
     }
     if pop {
-        let n = stash.entry.expect("checked to be a stash reference");
-        let dropped = drop_reflog_entry(repo, n)?;
-        if !opts.quiet {
-            println!("Dropped refs/stash@{{{n}}} ({dropped})");
-        }
+        return do_drop_stash(repo, &stash, opts.quiet);
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -1419,45 +1420,56 @@ fn restore_stash_commit(
         &crate::merge_apply::StrategyOptions::default(),
         c_tree,
     )?;
+    // A merge that did not come out clean — an unresolved conflict, or a checkout
+    // the local changes refused — leaves the index restore undone. git says so
+    // when `--index` asked for one, then jumps straight to the untracked files:
+    // `if (ret) { … if (index) "Index was not unstashed."; goto restore_untracked; }`.
     let mut applied = match merged {
-        crate::merge_apply::Merged::Applied(applied) => applied,
+        crate::merge_apply::Merged::Applied(applied) => Some(applied),
         crate::merge_apply::Merged::Refused(clobber) => {
             clobber.report("merge");
-            return Ok(Ok(false));
+            None
         }
     };
-    if !applied.conflicts.is_empty() {
+    let merged_cleanly = applied.as_ref().is_some_and(|a| a.conflicts.is_empty());
+    if !merged_cleanly {
         // git leaves the conflicted worktree in place and fails the apply; the
         // caller keeps the stash and reports it.
-        applied.index.write(Default::default())?;
-        return Ok(Ok(false));
+        if let Some(applied) = applied.as_mut() {
+            applied.index.write(Default::default())?;
+        }
+        if restore_index {
+            eprintln!("Index was not unstashed.");
+        }
     }
 
     // `do_apply_stash`'s tail: the index goes back to what it was (so everything
     // the merge brought in shows up unstaged), or — under `--index` — to the
     // stash's own staged tree. Worktree stats come from the merge's own index so
     // a following `status` does not re-hash every file.
-    let fresh: HashMap<BString, Stat> = {
-        let backing = applied.index.path_backing();
-        applied
-            .index
-            .entries()
-            .iter()
-            .map(|e| (e.path_in(backing).to_owned(), e.stat))
-            .collect()
-    };
+    if let Some(applied) = applied.filter(|_| merged_cleanly) {
+        let fresh: HashMap<BString, Stat> = {
+            let backing = applied.index.path_backing();
+            applied
+                .index
+                .entries()
+                .iter()
+                .map(|e| (e.path_in(backing).to_owned(), e.stat))
+                .collect()
+        };
     //
     // `--index` restores the stash's staged state, but `do_apply_stash` first
     // checks whether the stash *had* one: with `i_tree` equal to the base (the
     // stash staged nothing) or already equal to ours, it sets `has_index = 0`
     // and leaves the index alone — which is what keeps the caller's own staged
     // work staged.
-    let index_tree = if has_index {
-        i_tree
-    } else {
-        unstage_changes_unless_new(repo, c_tree, applied.tree_id)?
-    };
-    write_target_index(repo, index_tree, &old_index, &fresh)?;
+        let index_tree = if has_index {
+            i_tree
+        } else {
+            unstage_changes_unless_new(repo, c_tree, applied.tree_id)?
+        };
+        write_target_index(repo, index_tree, &old_index, &fresh)?;
+    }
 
     // Untracked files come back last and stay untracked — their stats are
     // deliberately dropped rather than fed to the index.
@@ -1495,7 +1507,7 @@ fn restore_stash_commit(
     if !untracked_ok {
         eprintln!("error: could not restore untracked files from stash");
     }
-    Ok(Ok(untracked_ok))
+    Ok(Ok(merged_cleanly && untracked_ok))
 }
 
 /// Create an *autostash* from the current dirty worktree+index: build the
@@ -1846,24 +1858,6 @@ fn write_target_index(
 // Reflog helpers
 // ---------------------------------------------------------------------------
 
-/// Read `refs/stash` reflog entries newest-first as `(commit id, message)`.
-fn read_stash_reflog(repo: &gix::Repository) -> Result<Vec<(ObjectId, BString)>> {
-    let reference = match repo.try_find_reference("refs/stash")? {
-        Some(r) => r,
-        None => return Ok(Vec::new()),
-    };
-    let mut platform = reference.log_iter();
-    let mut oldest_first: Vec<(ObjectId, BString)> = Vec::new();
-    if let Some(iter) = platform.all()? {
-        for line in iter {
-            let line = line?;
-            oldest_first.push((line.new_oid(), line.message.to_owned()));
-        }
-    }
-    oldest_first.reverse();
-    Ok(oldest_first)
-}
-
 /// Remove `stash@{n}` from the reflog, rewriting the chain and repointing the
 /// ref, exactly like `git reflog delete --rewrite --updateref stash@{n}`.
 /// Returns the dropped commit id.
@@ -1956,93 +1950,173 @@ fn set_prev(line: &mut Vec<u8>, prev: &[u8]) -> Result<()> {
 // Argument parsing
 // ---------------------------------------------------------------------------
 
-/// First non-flag argument, if any.
-fn positional(args: &[String]) -> Option<&str> {
-    args.iter().find(|a| !a.starts_with('-')).map(String::as_str)
+/// Every non-flag argument — `parse_options()`'s leftovers, which is what
+/// `get_stash_info()` counts when it refuses more than one revision.
+fn positionals(args: &[String]) -> Vec<String> {
+    args.iter().filter(|a| !a.starts_with('-')).cloned().collect()
 }
 
-/// Parse a `stash@{N}` / `refs/stash@{N}` / bare `N` reference to its index.
-/// Missing spec defaults to `stash@{0}`.
 /// What a `<stash>` argument resolved to — `get_stash_info()` (builtin/stash.c).
 pub(crate) struct StashSpec {
-    /// The stash-like commit the argument named.
+    /// `parse_stash_revision()`'s expansion of the argument: `refs/stash@{0}`
+    /// when none was given, `refs/stash@{<n>}` for a bare number, and the
+    /// argument verbatim otherwise. Every message about the stash names *this*,
+    /// never the object id — `fatal: 'HEAD' is not a stash-like commit`.
+    revision: String,
+    /// The stash-like commit it named.
     id: ObjectId,
-    /// `Some(n)` when it named a `refs/stash` reflog entry, which is what
-    /// `assert_stash_ref()` requires of `drop` and `pop`; `None` for an
-    /// arbitrary stash-like commit, which `apply`, `show` and `branch` accept.
-    entry: Option<usize>,
+    /// Whether the text before the revision's first `@` names `refs/stash`, which
+    /// is what `assert_stash_ref()` demands of `drop` and `pop`. It is a property
+    /// of the *spelling*, not of the commit: `stash@{0}`, `refs/stash@{0}`,
+    /// `refs/stash` and even `stash@{0}~0` all pass, while the same commit named
+    /// by its id does not.
+    is_stash_ref: bool,
 }
 
-/// Resolve a `<stash>` argument the way `get_stash_info()` does: a `stash@{n}`
-/// (or bare `n`) is a reflog entry, anything else is any commit that looks like
-/// a stash — two parents at least.
+/// `parse_stash_revision()`: an absent argument is the newest entry, a run of
+/// digits is that entry, and anything else is passed through untouched.
+fn parse_stash_revision(repo: &gix::Repository, commit: Option<&str>) -> Result<Option<String>> {
+    Ok(match commit {
+        None => {
+            if repo.try_find_reference("refs/stash")?.is_none() {
+                eprintln!("No stash entries found.");
+                return Ok(None);
+            }
+            Some("refs/stash@{0}".to_string())
+        }
+        // `strspn(commit, "0123456789") == strlen(commit)`.
+        Some(s) if s.bytes().all(|b| b.is_ascii_digit()) => Some(format!("refs/stash@{{{s}}}")),
+        Some(s) => Some(s.to_string()),
+    })
+}
+
+/// The `@{<n>}` a revision carries, as `reflog_delete()` reads it: the digits
+/// after `@{` up to the closing brace, with anything past the brace ignored —
+/// which is why `stash@{0}~0` drops entry 0. The outer `None` means there is no
+/// `@{` at all; the inner one means its payload is not a number, i.e. an
+/// `@{<date>}` expiry spec.
+fn reflog_recno(revision: &str) -> Option<Option<usize>> {
+    let spec = revision.find("@{").map(|at| &revision[at + 2..])?;
+    let digits = spec.len() - spec.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+    if !spec[digits..].starts_with('}') {
+        return Some(None);
+    }
+    // An empty run is `strtoul`'s 0, as in git.
+    Some(Some(spec[..digits].parse().unwrap_or(0)))
+}
+
+/// How many entries a ref's reflog holds, or `None` when the ref is unknown.
+fn reflog_len(repo: &gix::Repository, name: &str) -> Result<Option<usize>> {
+    let Some(reference) = repo.try_find_reference(name)? else {
+        return Ok(None);
+    };
+    let mut platform = reference.log_iter();
+    Ok(Some(match platform.all()? {
+        Some(iter) => iter.count(),
+        None => 0,
+    }))
+}
+
+/// Resolve a `<stash>` argument the way `get_stash_info()` does: expand it with
+/// `parse_stash_revision()`, resolve *that* string, and require the result to
+/// look like a stash — two parents at least.
 ///
-/// The refusals are git's, with git's exit codes: an out-of-range entry is
-/// `rev-parse`'s `fatal: log for 'stash' only has <n> entries` (128), an
-/// unresolvable name is `error: <spec> is not a valid reference` (1), and a
-/// commit that is not stash-shaped is `fatal: '<id>' is not a stash-like commit`
-/// (128).
+/// The refusals are git's, with git's exit codes: more than one revision is
+/// `Too many revisions specified:` and the list (1), an out-of-range reflog
+/// entry is `get_oid_basic()`'s `fatal: log for '<ref>' only has <n> entries`
+/// (128), an unresolvable name is `error: <revision> is not a valid reference`
+/// (1), and a commit that is not stash-shaped is
+/// `fatal: '<revision>' is not a stash-like commit` (128).
 fn resolve_stash(
     repo: &gix::Repository,
-    spec: Option<&str>,
+    specs: &[String],
 ) -> Result<std::result::Result<StashSpec, ExitCode>> {
-    let entries = read_stash_reflog(repo)?;
-    let by_index = match spec {
-        None => Some(0),
-        Some(s) => parse_stash_index(Some(s)).ok(),
-    };
-    if let Some(n) = by_index {
-        if entries.is_empty() {
-            bail!("No stash entries found.");
-        }
-        let Some((id, _)) = entries.get(n) else {
-            eprintln!("fatal: log for 'stash' only has {} entries", entries.len());
-            return Ok(Err(ExitCode::from(128)));
-        };
-        return Ok(Ok(StashSpec { id: *id, entry: Some(n) }));
+    if specs.len() > 1 {
+        let listed: String = specs.iter().map(|s| format!(" '{s}'")).collect();
+        eprintln!("Too many revisions specified:{listed}");
+        return Ok(Err(ExitCode::FAILURE));
     }
-
-    let spec = spec.expect("a non-index spec was given");
-    let Ok(id) = repo.rev_parse_single(spec) else {
-        eprintln!("error: {spec} is not a valid reference");
+    let Some(revision) = parse_stash_revision(repo, specs.first().map(String::as_str))? else {
         return Ok(Err(ExitCode::FAILURE));
     };
-    let id = id.detach();
+
+    let id = match repo.rev_parse_single(revision.as_str()) {
+        Ok(id) => id.detach(),
+        Err(_) => {
+            // An `@{<n>}` past the end of the log never reaches `get_stash_info`:
+            // `get_oid_basic()` dies on it while parsing the name.
+            if let Some(Some(n)) = reflog_recno(&revision) {
+                let named = revision.split('@').next().unwrap_or(&revision);
+                if let Some(count) = reflog_len(repo, named)? {
+                    if n >= count {
+                        eprintln!("fatal: log for '{named}' only has {count} entries");
+                        return Ok(Err(ExitCode::from(128)));
+                    }
+                }
+            }
+            eprintln!("error: {revision} is not a valid reference");
+            return Ok(Err(ExitCode::FAILURE));
+        }
+    };
+
+    // `assert_stash_like()`: `<rev>^1` and `<rev>^2` both have to exist.
     let stash_like = repo
         .find_commit(id)
         .map(|c| c.parent_ids().count() >= 2)
         .unwrap_or(false);
     if !stash_like {
-        eprintln!("fatal: '{id}' is not a stash-like commit");
+        eprintln!("fatal: '{revision}' is not a stash-like commit");
         return Ok(Err(ExitCode::from(128)));
     }
-    Ok(Ok(StashSpec { id, entry: None }))
+
+    // `repo_dwim_ref()` over everything up to the first `@`.
+    let named = revision.split('@').next().unwrap_or(&revision);
+    let is_stash_ref = repo
+        .try_find_reference(named)
+        .ok()
+        .flatten()
+        .is_some_and(|r| r.name().as_bstr() == "refs/stash");
+    Ok(Ok(StashSpec { revision, id, is_stash_ref }))
 }
 
-/// `assert_stash_ref()`: `drop` and `pop` rewrite the reflog, so they need an
-/// entry in it and refuse a bare commit.
-fn require_stash_ref(spec: &StashSpec, named: Option<&str>) -> Option<ExitCode> {
-    if spec.entry.is_some() {
+/// `assert_stash_ref()`: `drop` and `pop` rewrite the reflog, so they refuse a
+/// revision that does not name `refs/stash`.
+fn require_stash_ref(spec: &StashSpec) -> Option<ExitCode> {
+    if spec.is_stash_ref {
         return None;
     }
-    eprintln!(
-        "error: '{}' is not a stash reference",
-        named.unwrap_or("stash").trim()
-    );
+    eprintln!("error: '{}' is not a stash reference", spec.revision);
     Some(ExitCode::FAILURE)
 }
 
-fn parse_stash_index(spec: Option<&str>) -> Result<usize> {
-    let s = match spec {
-        None => return Ok(0),
-        Some(s) => s.trim(),
+/// `do_drop_stash()`: delete the reflog entry the revision names, then report it
+/// under that same spelling.
+///
+/// The deletion is `reflog_delete(rev, REWRITE|UPDATE_REF)`, which needs an
+/// `@{…}` in the revision — a bare `refs/stash` is not a reflog spec and is
+/// refused as one — and reads a number out of it. An `@{<date>}` payload sends
+/// git into `approxidate()`-driven expiry, which this port does not have; it
+/// says so rather than guess an entry.
+fn do_drop_stash(repo: &gix::Repository, spec: &StashSpec, quiet: bool) -> Result<ExitCode> {
+    let rev = &spec.revision;
+    let recno = match reflog_recno(rev) {
+        Some(Some(n)) => n,
+        Some(None) => {
+            eprintln!("error: {rev}: an `@{{<date>}}` reflog spec is not ported");
+            eprintln!("error: {rev}: Could not drop stash entry");
+            return Ok(ExitCode::FAILURE);
+        }
+        None => {
+            eprintln!("error: not a reflog: {rev}");
+            eprintln!("error: {rev}: Could not drop stash entry");
+            return Ok(ExitCode::FAILURE);
+        }
     };
-    let inner = s.strip_prefix("stash@{").or_else(|| s.strip_prefix("refs/stash@{"));
-    if let Some(rest) = inner {
-        let num = rest.strip_suffix('}').ok_or_else(|| anyhow!("{s} is not a valid reference"))?;
-        return num.parse::<usize>().map_err(|_| anyhow!("{s} is not a valid reference"));
+    let dropped = drop_reflog_entry(repo, recno)?;
+    if !quiet {
+        println!("Dropped {rev} ({dropped})");
     }
-    s.parse::<usize>().map_err(|_| anyhow!("{s} is not a valid stash reference"))
+    Ok(ExitCode::SUCCESS)
 }
 
 /// Which files beyond the tracked changes a push takes.
@@ -2161,9 +2235,11 @@ fn parse_push_options(args: &[String]) -> Result<std::result::Result<PushOpts, E
         bail!("--pathspec-file-nul requires --pathspec-from-file");
     }
 
-    // git refuses the combination outright rather than picking a winner.
+    // git refuses the combination outright rather than picking a winner, on
+    // stderr and unprefixed (`do_push_stash()`).
     if o.staged_only && o.untracked != Untracked::No {
-        bail!("Can't use --staged and --include-untracked or --all at the same time");
+        eprintln!("Can't use --staged and --include-untracked or --all at the same time");
+        return Ok(Err(ExitCode::FAILURE));
     }
     Ok(Ok(o))
 }
@@ -2220,7 +2296,8 @@ fn parse_save_options(args: &[String]) -> Result<std::result::Result<PushOpts, E
         }
     }
     if o.staged_only && o.untracked != Untracked::No {
-        bail!("Can't use --staged and --include-untracked or --all at the same time");
+        eprintln!("Can't use --staged and --include-untracked or --all at the same time");
+        return Ok(Err(ExitCode::FAILURE));
     }
     o.message = (!words.is_empty()).then(|| words.join(" "));
     Ok(Ok(o))
@@ -2261,10 +2338,11 @@ fn parse_store_options(args: &[String]) -> Result<(Option<String>, bool, String)
 
 /// The resolved `git stash apply` / `git stash pop` command line.
 struct ApplyOptions {
-    /// The `<stash>` as typed, or `None` for the default `stash@{0}`. It is
+    /// The leftover positionals — the `<stash>` as typed, if any. They are
     /// resolved late because `apply` accepts any stash-like commit while `pop`
-    /// requires a reflog entry.
-    spec: Option<String>,
+    /// requires a reflog entry, and because `get_stash_info()` is what refuses
+    /// more than one of them.
+    specs: Vec<String>,
     /// `--index`: rebuild the index from the stash's staged (`I`) tree.
     restore_index: bool,
     /// `-q`/`--quiet`: skip the trailing `git status` and `pop`'s `Dropped …`.
@@ -2301,7 +2379,7 @@ impl Default for ConflictLabels {
 fn parse_apply_options(repo: &gix::Repository, args: &[String]) -> Result<ApplyOptions> {
     let mut restore_index = repo.config_snapshot().boolean("stash.index").unwrap_or(false);
     let mut quiet = false;
-    let mut spec: Option<&str> = None;
+    let mut specs: Vec<String> = Vec::new();
     let mut labels = ConflictLabels::default();
     for a in args {
         // The label options take their value attached, as git's usage spells them.
@@ -2333,16 +2411,11 @@ fn parse_apply_options(repo: &gix::Repository, args: &[String]) -> Result<ApplyO
             other if other.starts_with('-') && other != "-" => {
                 bail!("unsupported stash option '{other}'")
             }
-            other => {
-                if spec.is_some() {
-                    bail!("Too many revisions specified");
-                }
-                spec = Some(other);
-            }
+            other => specs.push(other.to_string()),
         }
     }
     Ok(ApplyOptions {
-        spec: spec.map(ToString::to_string),
+        specs,
         restore_index,
         quiet,
         labels,

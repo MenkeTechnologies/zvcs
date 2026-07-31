@@ -158,3 +158,75 @@ fn apply_with_index_refuses_before_touching_the_worktree() {
     let (_, list, _) = f.run(&["stash", "list"]);
     assert_eq!(list.lines().count(), 1, "the entry must survive: {list}");
 }
+
+/// A stash that cannot be applied because the worktree holds work on one of its
+/// paths: `merge_switch_to_result()`'s `checkout()` fails, so it returns before
+/// `merge_display_update_messages()` — nothing about the merge is printed, only
+/// the refusal. Announcing `Auto-merging a.txt` before `Aborting` would claim a
+/// merge that never reached the disk.
+#[test]
+fn a_refused_apply_prints_the_refusal_and_nothing_about_the_merge() {
+    let f = Fixture::new("refused-quiet");
+    std::fs::write(f.work.join("a.txt"), "local work\n").unwrap();
+
+    let (ok, out, err) = f.run(&["stash", "apply", "-q"]);
+    assert!(!ok, "the apply should have been refused: {out}{err}");
+    assert_eq!(out, "", "nothing may be reported about the merge: {out}");
+    assert_eq!(
+        err,
+        "error: Your local changes to the following files would be overwritten by merge:\n\
+         \ta.txt\n\
+         Please commit your changes or stash them before you merge.\n\
+         Aborting\n",
+        "stderr: {err}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(f.work.join("a.txt")).unwrap(),
+        "local work\n",
+        "the local work must be untouched"
+    );
+}
+
+/// `--index` asked for the stash's staged state; a merge that fails never gets
+/// there, and git says so on stderr before moving on to the untracked files.
+#[test]
+fn a_failed_apply_with_index_says_the_index_was_not_unstashed() {
+    let f = Fixture::new("index-not-unstashed");
+    std::fs::write(f.work.join("a.txt"), "local work\n").unwrap();
+
+    let (ok, out, err) = f.run(&["stash", "apply", "--index", "-q"]);
+    assert!(!ok, "the apply should have been refused: {out}{err}");
+    assert!(
+        err.ends_with("Aborting\nIndex was not unstashed.\n"),
+        "stderr: {err}"
+    );
+}
+
+/// A conflicted apply still hands the untracked files back: `do_apply_stash()`
+/// jumps to `restore_untracked`, it does not return. Leaving them in the stash
+/// would hide files the user has no reason to suspect are still there.
+#[test]
+fn a_conflicted_apply_still_restores_untracked_files() {
+    let f = Fixture::new("conflict-untracked");
+    // A stash carrying both a tracked edit and an untracked file...
+    f.git(&["stash", "drop", "-q"]);
+    std::fs::write(f.work.join("a.txt"), "stashed\n").unwrap();
+    std::fs::write(f.work.join("u.txt"), "untracked\n").unwrap();
+    f.git(&["stash", "push", "-q", "-u", "-m", "u"]);
+    // ...and a HEAD that has moved onto the same line since.
+    std::fs::write(f.work.join("a.txt"), "upstream\n").unwrap();
+    f.git(&["add", "a.txt"]);
+    f.git(&["commit", "-q", "-m", "moved"]);
+
+    let (ok, out, err) = f.run(&["stash", "apply", "-q"]);
+    assert!(!ok, "the apply should have conflicted: {out}{err}");
+    assert_eq!(
+        std::fs::read_to_string(f.work.join("u.txt")).unwrap(),
+        "untracked\n",
+        "the untracked file must come back even though the merge conflicted"
+    );
+    assert!(
+        std::fs::read_to_string(f.work.join("a.txt")).unwrap().contains("<<<<<<<"),
+        "the conflict must be left in the worktree"
+    );
+}

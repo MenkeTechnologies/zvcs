@@ -151,3 +151,80 @@ fn list_describes_each_entry_with_diff_options() {
     assert_eq!(code, 0, "stash list --numstat failed: {out}{err}");
     assert!(out.contains("1\t0\tb.txt") && out.contains("1\t0\ta.txt"), "stdout: {out}");
 }
+
+/// Every message about a stash names the revision *as spelled*, because
+/// `get_stash_info()` keeps `parse_stash_revision()`'s expansion in
+/// `info->revision` and prints that. `drop` reports the entry it dropped under
+/// the same spelling, and `-q` silences the line entirely.
+#[test]
+fn messages_name_the_revision_as_spelled() {
+    let f = Fixture::new("spelling");
+    let (code, out, err) = f.run(&["stash", "drop", "stash@{0}"]);
+    assert_eq!(code, 0, "drop failed: {out}{err}");
+    assert!(
+        out.starts_with("Dropped stash@{0} ("),
+        "the spelling must survive into the report: {out}"
+    );
+
+    // A bare number expands to the full ref, and that expansion is what shows.
+    let (code, out, err) = f.run(&["stash", "drop", "0"]);
+    assert_eq!(code, 0, "drop failed: {out}{err}");
+    assert!(out.starts_with("Dropped refs/stash@{0} ("), "stdout: {out}");
+}
+
+/// `is_stash_ref` is decided by `repo_dwim_ref()` on everything before the first
+/// `@`, so a suffix does not make a stash reference stop being one — and
+/// `reflog_delete()` still reads the `@{<n>}` out of it, ignoring what follows
+/// the closing brace.
+#[test]
+fn a_suffixed_stash_reference_still_names_its_entry() {
+    let f = Fixture::new("suffixed");
+    let newest = f.run(&["rev-parse", "stash@{0}"]).1.trim().to_string();
+
+    let (code, out, err) = f.run(&["stash", "drop", "stash@{0}~0"]);
+    assert_eq!(code, 0, "`drop stash@{{0}}~0` should have worked: {out}{err}");
+    assert_eq!(out, format!("Dropped stash@{{0}}~0 ({newest})\n"), "stdout: {out}");
+    assert_eq!(f.run(&["stash", "list"]).1.lines().count(), 1, "entry 0 must be gone");
+}
+
+/// `refs/stash` with no `@{…}` passes `assert_stash_ref()` — it dwims to the
+/// stash ref — and then fails inside `reflog_delete()`, which needs a reflog
+/// *spec*. Both of its error lines are git's.
+#[test]
+fn a_bare_stash_ref_is_not_a_reflog_spec() {
+    let f = Fixture::new("bare-ref");
+    let (code, out, err) = f.run(&["stash", "drop", "refs/stash"]);
+    assert_eq!(code, 1, "`drop refs/stash` should have failed: {out}{err}");
+    assert_eq!(
+        err,
+        "error: not a reflog: refs/stash\nerror: refs/stash: Could not drop stash entry\n",
+        "stderr: {err}"
+    );
+    assert_eq!(f.run(&["stash", "list"]).1.lines().count(), 2, "nothing may be dropped");
+}
+
+/// The out-of-range message names the ref the way the revision spells it, since
+/// it comes from `get_oid_basic()` parsing that very string.
+#[test]
+fn the_log_length_message_uses_the_spelled_ref() {
+    let f = Fixture::new("log-len-spelling");
+    let (code, _, err) = f.run(&["stash", "pop", "refs/stash@{9}"]);
+    assert_eq!(code, 128, "stderr: {err}");
+    assert_eq!(err, "fatal: log for 'refs/stash' only has 2 entries\n", "stderr: {err}");
+}
+
+/// `get_stash_info()` refuses a second revision by listing every one it was
+/// given, quoted, on stderr and unprefixed.
+#[test]
+fn a_second_revision_is_refused_with_the_list() {
+    let f = Fixture::new("too-many");
+    for sub in ["apply", "show", "drop"] {
+        let (code, out, err) = f.run(&["stash", sub, "stash@{0}", "stash@{1}"]);
+        assert_eq!(code, 1, "`stash {sub}` with two revisions: {out}{err}");
+        assert_eq!(
+            err,
+            "Too many revisions specified: 'stash@{0}' 'stash@{1}'\n",
+            "stderr: {err}"
+        );
+    }
+}

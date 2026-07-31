@@ -33,9 +33,10 @@ use gix::index::entry::{Mode, Stat};
 
 /// What [`three_way_merge_guarded`] did: the merge was applied, or the checkout
 /// that would have applied it was refused because it would have clobbered local
-/// work. The refusal happens after the `Auto-merging`/`CONFLICT` lines and
-/// before anything on disk moves — the order git's `merge_switch_to_result()`
-/// establishes, since its `checkout()` runs last.
+/// work. A refusal prints nothing and moves nothing — `merge_switch_to_result()`
+/// runs its `checkout()` before `merge_display_update_messages()` and `return`s
+/// on failure, so the `Auto-merging`/`CONFLICT` lines the merge produced are
+/// dropped along with the merge itself.
 // One of these is produced per merge, on the stack, and both variants are
 // consumed immediately — boxing the applied side would only add an allocation.
 #[allow(clippy::large_enum_variant)]
@@ -244,13 +245,17 @@ fn merge_and_apply(
 
     // git's merge-ort emits an `Auto-merging <path>` line for every attempted blob
     // merge, then `CONFLICT (<kind>): Merge conflict in <path>` for the unresolved
-    // ones. Trivially-identical changes resolve silently.
+    // ones. Trivially-identical changes resolve silently. The lines are collected
+    // rather than printed here because merge-ort collects them too — `path_msg()`
+    // appends to `opt->priv->output` and only `merge_display_update_messages()`
+    // flushes it, which `merge_switch_to_result()` reaches *after* its checkout.
     let unresolved = gix::merge::tree::TreatAsUnresolved::git();
     let mut conflicts: Vec<BString> = Vec::new();
+    let mut messages: Vec<String> = Vec::new();
     for conflict in &merge.conflicts {
         let path = conflict.changes_in_resolution().0.location().to_owned();
         if show_msgs && conflict.content_merge().is_some() {
-            println!("Auto-merging {path}");
+            messages.push(format!("Auto-merging {path}"));
         }
         if !conflict.is_unresolved(unresolved) {
             continue;
@@ -263,19 +268,26 @@ fn merge_and_apply(
             "content"
         };
         if show_msgs {
-            println!("CONFLICT ({kind}): Merge conflict in {path}");
+            messages.push(format!("CONFLICT ({kind}): Merge conflict in {path}"));
         }
         conflicts.push(path);
     }
 
     // `merge_switch_to_result()` ends in `checkout()`, an `unpack_trees()` from
     // the worktree's current tree to the merged one — which refuses rather than
-    // overwrite local work on any path the merge touches.
+    // overwrite local work on any path the merge touches. A refused checkout
+    // `return`s straight away, so the collected messages are never displayed: the
+    // merge did not happen, and saying `Auto-merging f` before `Aborting` would
+    // claim it did.
     if let Some(worktree_tree) = guard {
         let clobber = crate::merge_guard::verify_two_way(repo, worktree_tree, tree_id, old_index)?;
         if !clobber.is_empty() {
             return Ok(Merged::Refused(clobber));
         }
+    }
+
+    for line in messages {
+        println!("{line}");
     }
 
     let mut index = update_worktree_to_tree(repo, old_index, tree_id, should_interrupt)?;

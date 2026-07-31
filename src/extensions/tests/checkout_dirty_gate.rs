@@ -144,3 +144,27 @@ fn an_untracked_file_in_the_way_refuses() {
     );
     assert_eq!(f.branch(), "main");
 }
+
+/// A path both trees share keeps its index entry: `twoway_merge()` calls
+/// `keep_entry()` for it, so a staged change to a file the target branch does
+/// not touch survives the switch. Rebuilding the index from the target tree
+/// would silently discard that work.
+#[test]
+fn a_staged_change_to_a_shared_path_survives_the_switch() {
+    let f = Fixture::new("staged-kept");
+    std::fs::write(f.work.join("a.txt"), "a\nstaged\n").unwrap();
+    f.git(&["add", "a.txt"]);
+
+    let (code, out, err) = f.run(&["checkout", "other"]);
+    assert_eq!(code, 0, "the switch should have happened: {out}{err}");
+    assert_eq!(f.branch(), "other");
+    assert_eq!(
+        std::fs::read_to_string(f.work.join("a.txt")).unwrap(),
+        "a\nstaged\n",
+        "the staged content must still be on disk"
+    );
+    let (_, staged, _) = f.run(&["show", ":a.txt"]);
+    assert_eq!(staged, "a\nstaged\n", "the index entry must still hold it");
+    // And `show_local_changes()` accounts for it, as git does.
+    assert_eq!(out, "M\ta.txt\n", "stdout: {out}");
+}

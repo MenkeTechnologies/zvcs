@@ -41,20 +41,15 @@
 //! and the `advice.detachedHead` block) goes to **stderr**, as in stock git —
 //! `git checkout` writes nothing to stdout on success.
 //!
+//! A switch is gated the way `unpack_trees()` gates it: per path the two trees
+//! disagree on, `verify_uptodate()` for one being rewritten and
+//! `verify_absent()` for one being added, so local work on any other path is
+//! carried across and listed afterwards by `show_local_changes()`
+//! (`<letter>\t<path>` on stdout). A path both trees share keeps its index entry
+//! untouched, staged content included.
+//!
 //! Deviations (honest, conservative — never corrupting):
 //! ```text
-//!   * An *unforced* branch/commit switch that changes the working tree requires
-//!     a clean tracked worktree. Stock git also permits a switch when the dirty
-//!     files do not collide with the diff between trees; that non-conflicting case
-//!     is refused here (message names it) rather than risking an incorrect merge.
-//!     `-f`/`--force` is not affected — it discards the changes outright, as git
-//!     does.
-//!   * An unforced switch does not print git's `show_local_changes()` name-status
-//!     listing except on the no-ref path (`git checkout`, `git checkout HEAD`),
-//!     where it is the only output there is.
-//!     Switches whose target tree equals the current tree (e.g. `-b` at HEAD, or
-//!     two branches on the same commit) carry local changes and are never
-//!     refused. Untracked files are ignored for the clean check, matching git.
 //!   * Pathspecs match literal files and directory prefixes (and `.`); general
 //!     glob magic is left to the shell.
 //!   * `--ours`/`--theirs` write a conflicted path's stage-2/stage-3 blob into
@@ -686,7 +681,7 @@ pub(crate) fn switch_to_branch(
         if let Some(code) = ensure_clean(repo, cur_tree, target_tree)? {
             return Ok(code);
         }
-        update_worktree_to_tree(repo, target_tree)?;
+        update_worktree_to_tree(repo, cur_tree, target_tree)?;
     }
 
     let branch_full: FullName = format!("refs/heads/{spec}")
@@ -711,8 +706,10 @@ pub(crate) fn switch_to_branch(
         }
         eprintln!("Switched to branch '{spec}'");
     }
+    show_local_changes(quiet)?;
     Ok(ExitCode::SUCCESS)
 }
+
 
 /// Detach `HEAD` at `commit`, updating the worktree when the target tree differs.
 /// `force_detach` is true for an explicit `--detach`, which suppresses the
@@ -742,7 +739,7 @@ fn detached_checkout(
         if let Some(code) = ensure_clean(repo, cur_tree, target_tree)? {
             return Ok(code);
         }
-        update_worktree_to_tree(repo, target_tree)?;
+        update_worktree_to_tree(repo, cur_tree, target_tree)?;
     }
 
     set_head_detached(
@@ -849,7 +846,7 @@ fn create_and_switch(
         if let Some(code) = ensure_clean(repo, cur_tree, target_tree)? {
             return Ok(code);
         }
-        update_worktree_to_tree(repo, target_tree)?;
+        update_worktree_to_tree(repo, cur_tree, target_tree)?;
     }
 
     let branch_full: FullName = full
@@ -960,7 +957,7 @@ fn orphan_checkout(
         if let Some(code) = ensure_clean(repo, cur_tree, target_tree)? {
             return Ok(code);
         }
-        update_worktree_to_tree(repo, target_tree)?;
+        update_worktree_to_tree(repo, cur_tree, target_tree)?;
     }
 
     // Write HEAD as a plain symref to the (not-yet-existing) branch. No ref is
@@ -1409,78 +1406,94 @@ fn ensure_clean(repo: &gix::Repository, cur_tree: ObjectId, target_tree: ObjectI
 /// Move a clean worktree and its index from the current state to `new_tree`,
 /// writing only the files that changed (added/modified checked out, removed
 /// deleted). Mirrors the file-level reconciliation used by `zsync`.
-fn update_worktree_to_tree(repo: &gix::Repository, new_tree: ObjectId) -> Result<()> {
+fn update_worktree_to_tree(
+    repo: &gix::Repository,
+    old_tree: ObjectId,
+    new_tree: ObjectId,
+) -> Result<()> {
     let should_interrupt = AtomicBool::new(false);
 
-    // Current tracked state (worktree == this when clean), with real stats.
-    // `_or_empty` because the first checkout of a repository has neither: a
-    // freshly `init`ed repo that has only fetched objects has no index file and
-    // an unborn `HEAD`, and the plain `index_or_load_from_head` peels that
-    // unborn `HEAD` and fails. git checks out into exactly that state — it is
-    // how `git init && git fetch <url> <sha> && git checkout <sha>` works, the
-    // sequence tree-sitter grammar fetchers use.
+    // `twoway_merge()` decides per path, and only for the paths the two trees
+    // disagree on: everything else is `keep_entry()`d, index entry and worktree
+    // file untouched. That is what carries a staged change to a file both
+    // branches share across the switch — rebuilding the index from the target
+    // tree instead would silently throw that work away.
+    let old_flat = flatten_tree(repo, old_tree)?;
+    let new_flat = flatten_tree(repo, new_tree)?;
+    let touched: HashSet<BString> = old_flat
+        .keys()
+        .chain(new_flat.keys())
+        .filter(|p| old_flat.get(*p) != new_flat.get(*p))
+        .cloned()
+        .collect();
+
+    // The index this checkout starts from. `_or_empty` because the first
+    // checkout of a repository has neither index nor `HEAD`: a freshly `init`ed
+    // repo that has only fetched objects is exactly the state
+    // `git init && git fetch <url> <sha> && git checkout <sha>` checks out from,
+    // the sequence tree-sitter grammar fetchers use.
     let old = repo.index_or_load_from_head_or_empty()?.into_owned();
-    let mut old_map: HashMap<BString, (ObjectId, Mode, Stat)> =
-        HashMap::with_capacity(old.entries().len());
-    {
+    let old_stats: HashMap<BString, (ObjectId, Mode, Stat)> = {
         let backing = old.path_backing();
-        for e in old.entries() {
-            old_map.insert(e.path_in(backing).to_owned(), (e.id, e.mode, e.stat));
-        }
-    }
-
-    // Full target index (the whole new tree) — what is finally written.
-    let mut new_index = repo.index_from_tree(&new_tree)?;
-
-    // Just the changed subset (added, or content/mode differs) — what is written
-    // to disk.
-    let mut subset = repo.index_from_tree(&new_tree)?;
-    subset.remove_entries(|_, path, entry| match old_map.get(&path.to_owned()) {
-        Some((oid, mode, _)) => *oid == entry.id && *mode == entry.mode,
-        None => false,
-    });
-
-    checkout_subset(repo, &mut subset, &should_interrupt)?;
-
-    // Delete files present in the old tree but not the new one.
-    let new_paths: HashSet<BString> = {
-        let backing = new_index.path_backing();
-        new_index
-            .entries()
+        old.entries()
             .iter()
-            .map(|e| e.path_in(backing).to_owned())
+            .map(|e| (e.path_in(backing).to_owned(), (e.id, e.mode, e.stat)))
             .collect()
     };
-    {
-        let backing = old.path_backing();
-        for e in old.entries() {
-            let path = e.path_in(backing);
-            if !new_paths.contains(&path.to_owned()) {
-                if let Some(full) = repo.workdir_path(path) {
-                    let _ = std::fs::remove_file(full);
-                }
-            }
+
+    // `merged_entry()`: the touched paths the new tree has are written out.
+    let mut subset = repo.index_from_tree(&new_tree)?;
+    subset.remove_entries(|_, path, _| !touched.contains(&path.to_owned()));
+    checkout_subset(repo, &mut subset, &should_interrupt)?;
+
+    // `deleted_entry()`: the touched paths it does not have are removed.
+    for path in touched.iter().filter(|p| !new_flat.contains_key(*p)) {
+        if let Some(full) = repo.workdir_path(path.as_bstr()) {
+            let _ = std::fs::remove_file(full);
         }
     }
 
-    // Fresh stats for changed entries; reuse previous stats for unchanged ones.
+    // The index moves with the worktree, one path at a time: the touched entries
+    // are replaced by the new tree's, the rest stay exactly as they were.
+    let mut index = old;
+    index.remove_entries(|_, path, _| touched.contains(&path.to_owned()));
     let subset_stats = stats_by_path(&subset);
     {
-        let backing = new_index.path_backing().to_owned();
-        for e in new_index.entries_mut() {
+        let backing = subset.path_backing().to_owned();
+        for e in subset.entries() {
             let path = e.path_in(&backing).to_owned();
-            if let Some((_, _, stat)) = subset_stats.get(&path) {
-                e.stat = *stat;
-            } else if let Some((oid, mode, stat)) = old_map.get(&path) {
-                if *oid == e.id && *mode == e.mode {
-                    e.stat = *stat;
-                }
-            }
+            let stat = subset_stats
+                .get(&path)
+                .map(|(_, _, stat)| *stat)
+                .or_else(|| {
+                    old_stats
+                        .get(&path)
+                        .filter(|(oid, mode, _)| *oid == e.id && *mode == e.mode)
+                        .map(|(_, _, stat)| *stat)
+                })
+                .unwrap_or(e.stat);
+            index.dangerously_push_entry(stat, e.id, e.flags, e.mode, path.as_ref());
         }
     }
-    new_index.remove_tree();
-    new_index.write(Default::default())?;
+    index.sort_entries();
+    index.remove_tree();
+    index.write(Default::default())?;
     Ok(())
+}
+
+/// A tree as `path -> (id, mode)`, through its index representation so nested
+/// trees come out as slash-separated paths.
+fn flatten_tree(
+    repo: &gix::Repository,
+    tree: ObjectId,
+) -> Result<HashMap<BString, (ObjectId, Mode)>> {
+    let index = repo.index_from_tree(&tree)?;
+    let backing = index.path_backing();
+    Ok(index
+        .entries()
+        .iter()
+        .map(|e| (e.path_in(backing).to_owned(), (e.id, e.mode)))
+        .collect())
 }
 
 /// `git checkout -f`'s worktree update: git's `reset_tree()`, i.e. a one-tree

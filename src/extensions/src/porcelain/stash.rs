@@ -27,7 +27,11 @@
 //!   `git apply -R` of that patch — so an unstaged edit elsewhere in the same
 //!   file survives, and an edit that overlaps the staged one makes the whole
 //!   reset fail (`Cannot remove worktree changes`, exit 1) with the stash entry
-//!   kept, since `apply` is all-or-nothing.
+//!   kept, since `apply` is all-or-nothing. Reverting a staged *deletion* means
+//!   writing the file back, so a path still sitting in the worktree — what
+//!   `git rm --cached` leaves — is reported as
+//!   `<path>: already exists in working directory` and stops the reset the same
+//!   way.
 //! * `-u/--include-untracked` and `-a/--all`, capturing untracked (and for
 //!   `-a`, ignored) files into a parentless third parent and deleting them from
 //!   the worktree, along with the directories they leave empty (git's
@@ -865,6 +869,31 @@ fn revert_staged_in_worktree(
     head_tree: ObjectId,
     worktree_tree: ObjectId,
 ) -> Result<std::result::Result<ObjectId, Vec<BString>>> {
+    // Reverting a staged *deletion* means writing the file back, and `git apply`
+    // refuses to create a path that is already there — a `git rm --cached` leaves
+    // exactly that: the entry gone from the index, the file still on disk. git
+    // reports it per path and abandons the whole reset.
+    let head = tree_map(repo, head_tree)?;
+    let staged = tree_map(repo, index_tree)?;
+    let mut in_the_way: Vec<BString> = head
+        .keys()
+        .filter(|path| !staged.contains_key(*path))
+        .filter(|path| {
+            repo.workdir_path(path.as_bstr())
+                .is_some_and(|full| full.symlink_metadata().is_ok())
+        })
+        .cloned()
+        .collect();
+    if !in_the_way.is_empty() {
+        in_the_way.sort();
+        for path in &in_the_way {
+            eprintln!("error: {path}: already exists in working directory");
+        }
+        // Reported with its own wording, so the caller's per-path
+        // `patch does not apply` lines would be a second, wrong explanation.
+        return Ok(Err(Vec::new()));
+    }
+
     // Nothing unstaged: the reverse patch is the plain reset to HEAD.
     if worktree_tree == index_tree {
         return Ok(Ok(head_tree));

@@ -156,11 +156,9 @@
 //! tests that stdin and stdout are both terminals rather than that they are the
 //! same file; `--signoff` adds its trailer before the `--edit` comment block
 //! rather than through `ignored_log_message_bytes()`;
-//! `Automatic merge went well; stopped before committing as requested` is
-//! printed on stdout where git uses stderr; a `--squash` fast-forward prints its
+//! a `--squash` fast-forward prints its
 //! `Squash commit -- not updating HEAD` after the diffstat rather than before
-//! it; the octopus prints neither git's per-head `Trying simple merge with
-//! <head>` nor a closing diffstat; and a directory standing where a merge wants
+//! it; and a directory standing where a merge wants
 //! to write is left to the checkout instead of going through
 //! `verify_clean_subdirectory()`, so untracked files inside it are not counted
 //! (a gitlink whose submodule is already checked out passes under git too).
@@ -925,6 +923,13 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
         true => refs.join(" "),
         false => fetch_head.iter().map(|(id, _)| id.to_string()).collect::<Vec<_>>().join(" "),
     };
+    // What a *strategy* was handed, which is what `git-merge-octopus` echoes in
+    // its per-head lines: the object id for a FETCH_HEAD merge, since that is
+    // what `cmd_merge()` passes on, and the spec as typed otherwise.
+    let head_labels: Vec<String> = match fetch_head.is_empty() {
+        true => refs.to_vec(),
+        false => fetch_head.iter().map(|(id, _)| id.to_string()).collect(),
+    };
 
     // Resolve every ref to merge and peel it to a commit (tags included).
     let mut targets: Vec<ObjectId> = Vec::with_capacity(refs.len());
@@ -970,7 +975,7 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
     // heads', not the arguments': a single `FETCH_HEAD` naming several for-merge
     // lines is exactly how `git pull <remote> <a> <b>` reaches the octopus.
     if targets.len() > 1 {
-        return do_octopus(&repo, &msg_specs, &targets, local_id, branch.as_ref(), opts);
+        return do_octopus(&repo, &msg_specs, &head_labels, &targets, local_id, branch.as_ref(), opts);
     }
 
     let spec = refs[0].as_str();
@@ -1124,6 +1129,7 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
                 &repo,
                 local_id,
                 &[target_id],
+                None,
                 message,
                 applied.tree_id,
                 head_tree,
@@ -1173,6 +1179,7 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
             &repo,
             local_id,
             &[target_id],
+            None,
             message,
             target_tree,
             head_tree,
@@ -1304,6 +1311,10 @@ fn finalize_clean(
     repo: &gix::Repository,
     local_id: ObjectId,
     targets: &[ObjectId],
+    // `mrc` (the merge-result-commit list) when it is not simply `HEAD` plus the
+    // merged heads: an octopus whose first head fast-forwarded past `HEAD`
+    // *replaces* it there, so `HEAD` is subsumed and does not become a parent.
+    parents_override: Option<&[ObjectId]>,
     message: String,
     merged_tree: ObjectId,
     head_tree: ObjectId,
@@ -1401,9 +1412,15 @@ fn finalize_clean(
     let committer = repo
         .committer()
         .ok_or_else(|| anyhow::anyhow!("committer identity is not configured"))??;
-    let mut parents: Vec<ObjectId> = Vec::with_capacity(targets.len() + 1);
-    parents.push(local_id);
-    parents.extend_from_slice(targets);
+    let parents: Vec<ObjectId> = match parents_override {
+        Some(mrc) => mrc.to_vec(),
+        None => {
+            let mut parents = Vec::with_capacity(targets.len() + 1);
+            parents.push(local_id);
+            parents.extend_from_slice(targets);
+            parents
+        }
+    };
     let mut commit = gix::objs::Commit {
         message: msg.into(),
         tree: merged_tree,
@@ -1505,6 +1522,7 @@ fn merge_ours(
         repo,
         local_id,
         targets,
+        None,
         message,
         head_tree,
         head_tree,
@@ -1522,13 +1540,16 @@ fn merge_ours(
 fn do_octopus(
     repo: &gix::Repository,
     refs: &[String],
+    // What the strategy was handed for each head, which is what its progress
+    // lines name — the object ids for a FETCH_HEAD merge.
+    head_labels: &[String],
     targets: &[ObjectId],
     local_id: ObjectId,
     branch: Option<&FullName>,
     opts: &Opts,
 ) -> Result<ExitCode> {
     // Every head, resolved by the caller; pair each with its spec for messages.
-    let heads: Vec<(String, ObjectId)> = refs
+    let heads: Vec<(String, ObjectId)> = head_labels
         .iter()
         .cloned()
         .zip(targets.iter().copied())
@@ -1593,6 +1614,10 @@ fn do_octopus(
         // Fast-forward: while MRC is still a single commit and it is the merge base,
         // git advances the base line to this head rather than recording a parent.
         if mrc.len() == 1 && common == mrc[0] {
+            // `git-merge-octopus` announces each step it takes.
+            if !opts.quiet {
+                println!("Fast-forwarding to: {spec}");
+            }
             // Each head is folded in by `git read-tree -u -m`, whose refusals
             // carry the plumbing wording — `setup_unpack_trees_porcelain()`
             // never runs for a strategy script.
@@ -1607,6 +1632,9 @@ fn do_octopus(
             continue;
         }
 
+        if !opts.quiet {
+            println!("Trying simple merge with {spec}");
+        }
         let base_tree = repo.find_object(common)?.peel_to_tree()?.id;
         // `merge_ort_internal()`'s ancestor name again — see the recursive path
         // above. Stock's octopus never reaches a rendering that shows it: it
@@ -1706,9 +1734,16 @@ fn do_octopus(
         repo,
         local_id,
         &extra_parents,
+        // `git-merge-octopus` commits exactly its MRC: when the first head
+        // fast-forwarded the base line past `HEAD`, `HEAD` was replaced there and
+        // is not a parent — `merge a b` from an ancestor yields `[a, b]`, not
+        // `[HEAD, a, b]`.
+        Some(&mrc),
         message,
         mrt,
-        mrt, // no diffstat basis distinct from the octopus tree; git prints none
+        // `cmd_merge()` ends with the same diffstat every other strategy prints,
+        // taken from where `HEAD` was to the merged tree.
+        repo.find_object(local_id)?.peel_to_tree()?.id,
         opts,
         "octopus",
         &refs.join(" "),

@@ -194,3 +194,28 @@ fn include_untracked_removes_the_directories_it_empties() {
     assert_eq!(f.read("nested/deep/new.txt"), "u\n");
     assert_eq!(f.read("keep/also-new.txt"), "u\n");
 }
+
+/// Reverting a staged *deletion* means writing the file back, and `git apply`
+/// refuses to create a path that is already there — which is exactly what
+/// `git rm --cached` leaves behind. git reports it per path and abandons the
+/// reset, keeping the stash it just wrote.
+#[test]
+fn staged_only_push_refuses_to_restore_over_a_file_in_the_way() {
+    let f = Fixture::new("staged-delete");
+    f.git(&["rm", "-q", "--cached", "b.txt"]);
+    f.write("a.txt", "l1\nl2\nl3\nunstaged\n");
+
+    let (ok, out, err) = f.run(&["stash", "push", "-S", "-m", "s"]);
+    assert!(!ok, "the reset should have been refused: {out}{err}");
+    assert!(
+        err.contains("error: b.txt: already exists in working directory")
+            && err.contains("Cannot remove worktree changes"),
+        "stderr: {err}"
+    );
+    // Nothing was reset: the staged deletion is still staged and the file is
+    // still on disk, untracked.
+    let status = f.status();
+    assert!(status.contains(&("D ".to_string(), "b.txt".to_string())), "status: {status:?}");
+    assert!(status.contains(&("??".to_string(), "b.txt".to_string())), "status: {status:?}");
+    assert!(f.work.join("b.txt").exists());
+}

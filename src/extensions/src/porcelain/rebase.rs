@@ -102,10 +102,15 @@
 //!   only the first is ported, so `-v` is rejected with a message naming the
 //!   reason rather than emitting half of git's output. Plain `--stat` (and
 //!   `rebase.stat=true`, which sets the same bit and nothing else) is ported.
-//! * `--rebase-merges` / `--update-refs`, and the `label`/`reset`/`merge`/
-//!   `update-ref` instructions they generate. Both still select the merge
-//!   backend and still raise git's apply-backend incompatibility errors; what is
-//!   missing is `make_script_with_merges()` and the four executors.
+//! * `--update-refs`, and the `label`/`reset`/`merge`/`update-ref` instructions
+//!   it generates: it still selects the merge backend and still raises git's
+//!   apply-backend incompatibility errors, but `make_script_with_merges()` and
+//!   the four executors are missing.
+//! * `--rebase-merges` over a range that *contains* a merge, for the same
+//!   reason — it is refused by name rather than flattening the history it was
+//!   asked to keep. Over a linear range the instruction sheet is picks either
+//!   way, so it replays exactly as git does; only git's step count differs,
+//!   since its sheet also carries the `label onto`/`reset onto` pair.
 //!
 //! ### `--root`
 //!
@@ -1375,6 +1380,24 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
     // therefore leaves merges out of the instruction sheet, which is what makes
     // `git rebase --onto <base> <upstream>` work on a branch that contains one.
     let todo_range: Vec<ObjectId> = if rebase_merges == 1 {
+        // `make_script_with_merges()` writes `label`/`reset`/`merge` instructions
+        // to rebuild the branch topology, and the four executors that run them are
+        // not ported. Over a linear range the sheet is picks either way, so that
+        // works; a merge in the range needs the real thing, and replaying it as a
+        // pick would flatten history the user asked to keep.
+        if let Some(merge) = replay_range.iter().find(|id| {
+            repo.find_commit(**id)
+                .map(|c| c.parent_ids().count() > 1)
+                .unwrap_or(false)
+        }) {
+            let short = gix::prelude::ObjectIdExt::attach(*merge, &repo).shorten_or_id();
+            bail!(
+                "--rebase-merges over a merge commit ({short}) is not supported \
+                 (recreating the topology needs the label/reset/merge instructions \
+                 `make_script_with_merges()` writes, which are not ported); rebase \
+                 without it to flatten, or replay the branches individually"
+            );
+        }
         replay_range.clone()
     } else {
         replay_range

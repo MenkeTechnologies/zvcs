@@ -6,6 +6,9 @@
 //! is what tells `git reflog` where the rebase put you; the vendored `gix-ref`
 //! drops reflog lines for symbolic-target updates, so that entry has to be
 //! written explicitly.
+//!
+//! Also here, because it shares the fixture: `--rebase-merges` refuses a range
+//! that contains a merge rather than flattening it.
 #![cfg(unix)]
 
 use std::path::PathBuf;
@@ -129,4 +132,36 @@ fn git_reflog_action_replaces_the_prefix() {
         ],
         "reflog: {log:?}"
     );
+}
+
+/// `--rebase-merges` over a range that contains a merge is refused by name.
+/// Recreating the topology needs the `label`/`reset`/`merge` instructions
+/// `make_script_with_merges()` writes; replaying the merge as a pick would
+/// flatten exactly the history the flag exists to keep.
+#[test]
+fn rebase_merges_over_a_merge_is_refused_not_flattened() {
+    let f = Fixture::new("rebase-merges");
+    // topic: t1, then a real merge of `side`, then t2.
+    f.git(&["checkout", "-q", "-b", "side"]);
+    std::fs::write(f.work.join("s.txt"), "s\n").unwrap();
+    f.git(&["add", "s.txt"]);
+    f.git(&["commit", "-q", "-m", "swork"]);
+    f.git(&["checkout", "-q", "topic"]);
+    f.git(&["merge", "--no-edit", "--no-ff", "-q", "side"]);
+    let before = f.run(&["rev-parse", "HEAD"]).1;
+
+    let (ok, out, err) = f.run(&["rebase", "--rebase-merges", "main"]);
+    assert!(!ok, "the rebase should have been refused: {out}{err}");
+    assert!(
+        err.contains("--rebase-merges over a merge commit")
+            && err.contains("make_script_with_merges"),
+        "stderr: {err}"
+    );
+    assert_eq!(f.run(&["rev-parse", "HEAD"]).1, before, "the branch must not have moved");
+    assert!(!f.work.join(".git/rebase-merge").exists(), "no rebase state may be left behind");
+
+    // A linear range still replays, with the merge backend selected.
+    f.git(&["checkout", "-q", "-B", "linear", "topic~1"]);
+    let (ok, out, err) = f.run(&["rebase", "--rebase-merges", "main"]);
+    assert!(ok, "a linear --rebase-merges should work: {out}{err}");
 }

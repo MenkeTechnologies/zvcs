@@ -311,16 +311,43 @@ where
         // already out of `mappings`, matching `iterate_ref_map()` skipping `REF_STATUS_REJECT_SHALLOW`.
         // A dry run never wrote the pack, so there is nothing to be connected to.
         if matches!(self.dry_run, fetch::DryRun::No) {
-            let tips: Vec<_> = self
-                .ref_map
-                .mappings
+            // Which refs this fetch is actually going to write, decided before the check so the
+            // check can be limited to them. git reaches the same set the other way round: by the
+            // time `store_updated_refs()` runs, `filter_refs()` has already dropped the updates it
+            // will not perform, so a *rejected* one — a tag that would be overwritten, a
+            // non-fast-forward — never reaches `check_connected()`. Deciding them here is a plain
+            // dry run: it reads refs and writes nothing.
+            let planned = refs::update(
+                repo,
+                self.reflog_message
+                    .clone()
+                    .unwrap_or_else(|| RefLogMessage::Prefixed { action: "fetch".into() }),
+                &self.ref_map.mappings,
+                con.remote.fetch_refspecs(),
+                &self.ref_map.extra_refspecs,
+                con.remote.fetch_tags,
+                fetch::DryRun::Yes,
+                self.write_packed_refs,
+                self.atomic,
+            )?;
+            let tips: Vec<_> = planned
+                .updates
                 .iter()
+                .zip(self.ref_map.mappings.iter())
                 // `iterate_ref_map()` skips "anything missing a peer_ref, which we are not
                 // actually going to write a ref for". Without that filter the check demands
                 // objects for refs this fetch never asked for - every tag outside a shallow
                 // clone's window, for one - and fails a fetch git completes.
-                .filter(|m| m.local.is_some())
-                .filter_map(|m| m.remote.as_id().map(ToOwned::to_owned))
+                //
+                // The same reasoning covers the updates that move no ref: a rejected one is
+                // not written, and one that needs no change already points at an object that
+                // is here. Neither can be a reason to demand something from the pack.
+                .filter(|(update, m)| {
+                    m.local.is_some()
+                        && !update.mode.is_rejected()
+                        && !matches!(update.mode, refs::update::Mode::NoChangeNeeded)
+                })
+                .filter_map(|(_, m)| m.remote.as_id().map(ToOwned::to_owned))
                 .collect();
             let options = connected::Options {
                 from_promisor: self.filter.is_some(),

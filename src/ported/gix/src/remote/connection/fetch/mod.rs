@@ -25,6 +25,7 @@ pub use shallow::Mode as ShallowUpdate;
 use crate::remote::fetch::WritePackedRefs;
 
 /// The way reflog messages should be composed whenever a ref is written with recent objects from a remote.
+#[derive(Clone)]
 pub enum RefLogMessage {
     /// Prefix the log with `action` and generate the typical suffix as `git` would.
     Prefixed {

@@ -79,10 +79,17 @@ impl Clobber {
             }
             eprintln!("{advice}");
         };
+        // `setup_unpack_trees_porcelain()` names the command twice: once as it is
+        // for the headline, and once as the *action* the advice tells you to
+        // finish first — where `checkout` reads `switch branches`.
+        let action = match cmd {
+            "checkout" => "switch branches",
+            other => other,
+        };
         let overwritten =
             format!("Your local changes to the following files would be overwritten by {cmd}:");
-        let commit_advice = format!("Please commit your changes or stash them before you {cmd}.");
-        let move_advice = format!("Please move or remove them before you {cmd}.");
+        let commit_advice = format!("Please commit your changes or stash them before you {action}.");
+        let move_advice = format!("Please move or remove them before you {action}.");
         block(&self.would_overwrite, &overwritten, &commit_advice);
         block(&self.not_uptodate, &overwritten, &commit_advice);
         block(
@@ -343,6 +350,15 @@ fn scan(repo: &gix::Repository, want_untracked: bool) -> Result<Worktree> {
                 EntryStatus::Change(Change::Removed) => {}
                 // Racily clean: the content still matches.
                 EntryStatus::NeedsUpdate(_) => {}
+                // A submodule is never in the way: `verify_uptodate_1()` hands a
+                // gitlink to `check_submodule_move_head()` — a no-op unless the
+                // command recurses into submodules — and returns 0 without ever
+                // consulting `ie_match_stat`'s verdict. Dirty content inside the
+                // submodule, or a submodule `HEAD` that has moved away from the
+                // recorded gitlink, therefore does not stop a checkout or a
+                // merge that changes that gitlink: the superproject's index is
+                // updated and the submodule worktree is left exactly as it is.
+                EntryStatus::Change(Change::SubmoduleModification(_)) => {}
                 EntryStatus::Change(_) | EntryStatus::Conflict { .. } | EntryStatus::IntentToAdd => {
                     state.modified.insert(rela_path);
                 }

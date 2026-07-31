@@ -683,7 +683,9 @@ pub(crate) fn switch_to_branch(
     if force {
         reset_worktree_to_tree(repo, target_tree)?;
     } else if target_tree != cur_tree {
-        ensure_clean(repo)?;
+        if let Some(code) = ensure_clean(repo, cur_tree, target_tree)? {
+            return Ok(code);
+        }
         update_worktree_to_tree(repo, target_tree)?;
     }
 
@@ -737,7 +739,9 @@ fn detached_checkout(
     if force {
         reset_worktree_to_tree(repo, target_tree)?;
     } else if target_tree != cur_tree {
-        ensure_clean(repo)?;
+        if let Some(code) = ensure_clean(repo, cur_tree, target_tree)? {
+            return Ok(code);
+        }
         update_worktree_to_tree(repo, target_tree)?;
     }
 
@@ -842,7 +846,9 @@ fn create_and_switch(
     }
 
     if target_tree != cur_tree {
-        ensure_clean(repo)?;
+        if let Some(code) = ensure_clean(repo, cur_tree, target_tree)? {
+            return Ok(code);
+        }
         update_worktree_to_tree(repo, target_tree)?;
     }
 
@@ -951,7 +957,9 @@ fn orphan_checkout(
     let target_tree = commit.tree_id()?.detach();
     let cur_tree = repo.head_tree_id_or_empty()?.detach();
     if target_tree != cur_tree {
-        ensure_clean(repo)?;
+        if let Some(code) = ensure_clean(repo, cur_tree, target_tree)? {
+            return Ok(code);
+        }
         update_worktree_to_tree(repo, target_tree)?;
     }
 
@@ -1376,13 +1384,26 @@ fn restore_from_tree(
 
 // --- Worktree / ref helpers ------------------------------------------------
 
-/// Refuse any tracked-file modification before a switch that rewrites the
-/// worktree (untracked files are ignored, matching git).
-fn ensure_clean(repo: &gix::Repository) -> Result<()> {
-    if repo.is_dirty()? {
-        bail!("your local changes would be overwritten by checkout; commit or stash them first");
+/// `unpack_trees()` with `twoway_merge` over `HEAD -> <target>`: refuse the
+/// switch only for the paths it would actually write over.
+///
+/// git does not ask whether the worktree is clean — it asks, per path the two
+/// trees disagree on, whether the file there still matches the index
+/// (`verify_uptodate()`) or, for a path being added, whether something untracked
+/// is in the way (`verify_absent()`). Everything else is carried across
+/// untouched, which is why `git checkout <branch>` works with unrelated local
+/// edits in the tree and reports them as `M <path>` afterwards.
+///
+/// Returns the exit code when the switch is refused; the paths and the advice
+/// are printed by [`crate::merge_guard::Clobber::report`].
+fn ensure_clean(repo: &gix::Repository, cur_tree: ObjectId, target_tree: ObjectId) -> Result<Option<ExitCode>> {
+    let index = repo.index_or_load_from_head_or_empty()?;
+    let clobber = crate::merge_guard::verify_two_way(repo, cur_tree, target_tree, &index)?;
+    if clobber.is_empty() {
+        return Ok(None);
     }
-    Ok(())
+    clobber.report("checkout");
+    Ok(Some(ExitCode::from(1)))
 }
 
 /// Move a clean worktree and its index from the current state to `new_tree`,

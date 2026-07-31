@@ -150,6 +150,17 @@ pub(crate) fn update(
                                 } else if let Some(gix_ref::Category::Tag) = existing.name().category() {
                                     if spec.allow_non_fast_forward() {
                                         (Mode::Forced, "updating tag")
+                                    } else if is_implicit_tag {
+                                        // Automatic tag following never proposes a tag that is
+                                        // already here: `find_non_local_tags()` asks the local ref
+                                        // store first and only offers what is missing. So a tag the
+                                        // remote moved is not a *rejected* update for a plain fetch
+                                        // — it is not an update at all, which is why git says
+                                        // nothing about it and still exits 0. Only an explicit
+                                        // `--tags`/`refs/tags/*` refspec reaches the rejection
+                                        // below.
+                                        updates.push(Mode::NoChangeNeeded.into());
+                                        continue;
                                     } else {
                                         updates.push(Mode::RejectedTagUpdate.into());
                                         continue;

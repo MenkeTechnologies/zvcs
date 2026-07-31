@@ -99,10 +99,6 @@
 //!   of `merge`/`rebase`/`pull`; that path always behaves as `--no-index` here,
 //!   because restoring the staged state across a *moved* `HEAD` needs a second
 //!   three-way merge of the index tree that is not ported.
-//! * A `-S` reset that cannot be applied reports `error: <path>: patch does not
-//!   apply` per blocked path; git-apply also names the hunk it could not place
-//!   (`error: patch failed: <path>:<line>`), and that line number is a property
-//!   of its hunk matching, which the reverse merge here has no equivalent for.
 //! * Content blobs are produced through the repo filter pipeline, so CRLF /
 //!   clean filters are honored just like git.
 
@@ -476,13 +472,13 @@ fn push(repo: &gix::Repository, opts: &PushOpts) -> Result<ExitCode> {
             // `apply -R` failed: an unstaged edit sits on top of the staged one
             // it would have to undo. git leaves the worktree and index untouched
             // and fails, with the stash entry it just wrote still in place.
-            //
-            // git-apply also names the hunk it could not place
-            // (`error: patch failed: <path>:<line>`); that line number is a
-            // property of its hunk matching, which this reverse-merge has no
-            // equivalent for, so only the per-path verdict is reported.
             Err(blocked) => {
                 for path in blocked {
+                    // git-apply names the hunk it could not place before the
+                    // per-path verdict.
+                    if let Some(line) = first_hunk_line(repo, head_tree_id, i_tree_id, &path) {
+                        eprintln!("error: patch failed: {path}:{line}");
+                    }
                     eprintln!("error: {path}: patch does not apply");
                 }
                 if !opts.quiet {
@@ -921,6 +917,78 @@ fn revert_staged_in_worktree(
     Ok(Ok(merge.tree.write()?.detach()))
 }
 
+/// The line `git apply` names when the staged patch for `path` cannot be placed:
+/// the old-side start of its first hunk, counting the one line of context
+/// `stash_staged()`'s `diff-tree -U1` carries.
+///
+/// Both blobs come from trees, so this is the same patch geometry the reverse
+/// apply would have worked from — no worktree state is involved.
+fn first_hunk_line(
+    repo: &gix::Repository,
+    head_tree: ObjectId,
+    index_tree: ObjectId,
+    path: &BString,
+) -> Option<u32> {
+    use gix::diff::blob::unified_diff::{ConsumeHunk, ContextSize, DiffLineKind, HunkHeader};
+    use gix::diff::blob::{diff_with_slider_heuristics, Algorithm, InternedInput, UnifiedDiff};
+
+    let blob = |tree: ObjectId| -> Option<Vec<u8>> {
+        let id = tree_map(repo, tree).ok()?.get(path).map(|(id, _)| *id)?;
+        Some(repo.find_object(id).ok()?.detach().data)
+    };
+    let (old, new) = (blob(head_tree)?, blob(index_tree)?);
+    let worktree = repo
+        .workdir_path(path.as_bstr())
+        .and_then(|full| std::fs::read(full).ok())?;
+
+    /// Every hunk of the staged patch as `(old-side start, new-side range)`.
+    #[derive(Default)]
+    struct Hunks(Vec<(u32, std::ops::Range<usize>)>);
+    impl ConsumeHunk for Hunks {
+        type Out = Vec<(u32, std::ops::Range<usize>)>;
+        fn consume_hunk(
+            &mut self,
+            header: HunkHeader,
+            _lines: &[(DiffLineKind, &[u8])],
+        ) -> std::io::Result<()> {
+            let start = header.after_hunk_start.saturating_sub(1) as usize;
+            self.0
+                .push((header.before_hunk_start, start..start + header.after_hunk_len as usize));
+            Ok(())
+        }
+        fn finish(self) -> Self::Out {
+            self.0
+        }
+    }
+
+    let input = InternedInput::new(old.as_slice(), new.as_slice());
+    let diff = diff_with_slider_heuristics(Algorithm::Myers, &input);
+    // `stash_staged()` generates the patch with `-U1`, and a hunk header's start
+    // counts that context line.
+    let hunks = UnifiedDiff::new(&diff, &input, Hunks::default(), ContextSize::symmetrical(1))
+        .consume()
+        .ok()?;
+
+    // `git apply` names the hunk it could not place, not the first one. A hunk
+    // reverse-applies only if its *new* side — what the staged change produced —
+    // is still in the worktree to be taken back out; `apply` searches for it with
+    // some drift, so its presence anywhere is the test.
+    let index_lines: Vec<&[u8]> = new.split_inclusive(|b| *b == b'\n').collect();
+    let worktree_lines: Vec<&[u8]> = worktree.split_inclusive(|b| *b == b'\n').collect();
+    let applies = |range: &std::ops::Range<usize>| -> bool {
+        let want = match index_lines.get(range.clone()) {
+            Some(lines) if !lines.is_empty() => lines,
+            _ => return true,
+        };
+        worktree_lines.windows(want.len()).any(|w| w == want)
+    };
+    hunks
+        .iter()
+        .find(|(_, range)| !applies(range))
+        .or_else(|| hunks.first())
+        .map(|(before_start, _)| *before_start)
+}
+
 /// Whether `theirs` merges into `ours` over `base` without conflicts, reporting
 /// the blocked paths when it does not. Nothing is written either way.
 fn merge_trees_cleanly(
@@ -1315,13 +1383,16 @@ fn restore_stash_commit(
     // apply ends the whole command right there — before the worktree merge, so a
     // refusal leaves everything as it was. The equivalent test is whether the
     // stash's index tree merges into ours over the stash's base without
-    // conflicts. As for `-S`, git-apply's `patch failed: <path>:<line>` names a
-    // hunk this tree merge has no equivalent for, so only the per-path verdict
-    // is reported.
+    // conflicts. The patch git-apply could not place is named the same way as
+    // for `-S`: the diff here is the stash's own (`w_commit^!`), so its hunks
+    // are the ones that failed.
     let has_index = restore_index && i_tree != base_tree && i_tree != c_tree;
     if has_index {
         if let Err(blocked) = merge_trees_cleanly(repo, base_tree, c_tree, i_tree)? {
             for path in blocked {
+                if let Some(line) = first_hunk_line(repo, base_tree, i_tree, &path) {
+                    eprintln!("error: patch failed: {path}:{line}");
+                }
                 eprintln!("error: {path}: patch does not apply");
             }
             eprintln!("error: conflicts in index. Try without --index.");

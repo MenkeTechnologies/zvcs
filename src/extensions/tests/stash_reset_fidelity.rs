@@ -246,3 +246,28 @@ fn a_crlf_conversion_warns_like_git() {
     let (_, _, err) = f.run(&["-c", "core.safecrlf=false", "stash", "push", "-m", "c2"]);
     assert!(err.is_empty(), "safecrlf=false must be silent: {err}");
 }
+
+/// The refusal names the hunk `git apply` could not place — the one that
+/// actually fails, not simply the first — with the line number its `-U1` patch
+/// geometry produces.
+#[test]
+fn a_failing_reverse_patch_names_the_hunk() {
+    let f = Fixture::new("hunk-line");
+    f.write("a.txt", "a1\na2\na3\na4\na5\na6\na7\na8\na9\na10\na11\na12\n");
+    f.git(&["add", "a.txt"]);
+    f.git(&["commit", "-q", "-m", "wide"]);
+    // Two staged hunks; only the second is disturbed in the worktree.
+    f.write("a.txt", "a1\nS2\na3\na4\na5\na6\na7\na8\na9\na10\nS11\na12\n");
+    f.git(&["add", "a.txt"]);
+    f.write("a.txt", "a1\nS2\na3\na4\na5\na6\na7\na8\na9\na10\nE11\na12\n");
+
+    let (ok, out, err) = f.run(&["stash", "push", "-S", "-m", "s"]);
+    assert!(!ok, "the reset should have been refused: {out}{err}");
+    assert_eq!(
+        err,
+        "error: patch failed: a.txt:10\n\
+         error: a.txt: patch does not apply\n\
+         Cannot remove worktree changes\n",
+        "stderr: {err}"
+    );
+}

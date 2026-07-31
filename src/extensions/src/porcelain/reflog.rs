@@ -297,8 +297,8 @@ struct DiffFormats {
     /// git's `DIFF_FORMAT_PATCH`, set by `-p`/`-u`/`--patch`: the body is rendered
     /// by the same machinery `log -p` uses.
     patch: bool,
-    /// git's `DIFF_FORMAT_DIFFSTAT`, set by a bare `--stat`, rendered by the same
-    /// histogram `diff --stat` prints.
+    /// git's `DIFF_FORMAT_DIFFSTAT`, set by `--stat`/`--patch-with-stat`,
+    /// rendered by the same histogram `diff --stat` prints.
     stat: bool,
 }
 
@@ -947,9 +947,19 @@ fn show(repo: &gix::Repository, rest: &[String]) -> Result<ExitCode> {
             // rather than a refusal — `git stash list -p` is `log -g -p`.
             "-p" | "--patch" | "-u" => opts.diff.patch = true,
             "--stat" => opts.diff.stat = true,
-            "--dirstat" | "--patch-with-stat" | "--color" | "--color=always" => {
+            // `--patch-with-stat` is `--stat -p`, which is how git renders it.
+            "--patch-with-stat" => {
+                opts.diff.stat = true;
+                opts.diff.patch = true;
+            }
+            "--dirstat" | "--color" | "--color=always" => {
                 note_first(&mut unimplemented, a.to_owned());
             }
+            // `--stat=<width>[,<name-width>[,<count>]]` needs `show_stats()`'s
+            // width derivation — total line width against the terminal's, with
+            // the graph taking what the name column leaves — which no renderer
+            // here implements (`diff --stat=<width>` drops the parameters too).
+            // Refused rather than rendered at the default width.
             s if s.starts_with("--stat=") || s.starts_with("--dirstat=") => {
                 note_first(&mut unimplemented, s.to_owned());
             }

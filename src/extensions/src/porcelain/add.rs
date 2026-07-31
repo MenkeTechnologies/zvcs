@@ -31,11 +31,16 @@
 //! modern `git add` semantics. Unmerged (conflicted) entries under a matched path
 //! are collapsed to the freshly-staged stage-0 entry.
 //!
+//! Content goes through the same filter pipeline git runs on the way into the
+//! object database — `clean` drivers, `working-tree-encoding`, `ident` and the
+//! EOL normalization `text`/`core.autocrlf` ask for — so the staged blob is the
+//! one git would write, `core.safecrlf=true` refuses an unsafe conversion with
+//! `fatal: CRLF would be replaced by LF in <path>` (exit 128, nothing staged),
+//! and the round-trip warning reaches stderr. A symlink's target is stored
+//! verbatim, as git stores it.
+//!
 //! Deviations (bailed or noted, never faked):
 //! ```text
-//!   * `.gitattributes` content filters (autocrlf, `clean`/`smudge`) are NOT
-//!     applied — the blob is the verbatim worktree bytes. `--renormalize` therefore
-//!     re-stages current bytes without re-running EOL filters.
 //!   * an embedded git repository is staged as a gitlink but is not registered in
 //!     `.gitmodules` — the same as stock git, which only warns.
 //!   * `-i`/`--interactive` runs the numbered main menu ([`super::add_interactive`])
@@ -368,6 +373,12 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
         was_tracked: bool,
     }
     let mut staged: Vec<Staged> = Vec::new();
+    // The content filters git runs on the way into the object database:
+    // `.gitattributes` `clean` drivers, `working-tree-encoding`, `ident`, and the
+    // EOL normalization `text`/`core.autocrlf` ask for. `git add` hashes the
+    // *converted* bytes, so staging the verbatim worktree copy writes a different
+    // blob than git does in any repository that normalizes line endings.
+    let (mut filters, filter_index) = repo.filter_pipeline(None)?;
     // Paths that could not be read, paired with the OS error text git reports
     // (only surfaced for a real add). git prints `open("<p>"): <strerror>`.
     let mut read_errors: Vec<(BString, String)> = Vec::new();
@@ -470,6 +481,26 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
                 Mode::FILE_EXECUTABLE
             } else {
                 Mode::FILE
+            };
+            // A symlink's target is stored verbatim; a regular file goes through
+            // the pipeline, which is also where git's CRLF round-trip warning
+            // (and `core.safecrlf`'s refusal) comes from.
+            let bytes = {
+                use std::io::Read;
+                let rela = gix::path::from_bstr(path.as_bstr()).into_owned();
+                let mut converted = Vec::with_capacity(bytes.len());
+                match filters.convert_to_git(bytes.as_slice(), &rela, &filter_index) {
+                    Ok(mut outcome) => {
+                        outcome.read_to_end(&mut converted)?;
+                        converted
+                    }
+                    Err(err) => {
+                        // `core.safecrlf=true` makes an unsafe conversion fatal:
+                        // git names the path, stages nothing and exits 128.
+                        eprintln!("fatal: {err}");
+                        return Ok(ExitCode::from(128));
+                    }
+                }
             };
             (bytes, mode)
         };

@@ -36,6 +36,11 @@ fn profiling_and_dashboard_reflect_state() {
     std::fs::create_dir_all(&work).unwrap();
     let home = root.join("home");
     let sock = root.join("sock");
+    // The dashboard assertions below are about a *cold* cache, so no daemon may
+    // warm it mid-test: `zdaemon stop`'s marker file is what autostart consults,
+    // and writing it up front keeps a loaded machine from spawning one.
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(home.join("zdaemon.disabled"), "").unwrap();
 
     // Two repos: alpha with two tracked files (one dirty), beta with one.
     let alpha = work.join("alpha");

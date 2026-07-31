@@ -189,8 +189,14 @@ mod tests {
     use super::head_authored_by_zvcs;
 
     /// Write a `logs/HEAD` whose last entry carries `msg`, then classify it.
+    ///
+    /// The directory is unique per call: the tests in this binary run in
+    /// parallel, and keying it by anything the messages share (their length, say)
+    /// lets one case delete the directory another is reading.
     fn classify(msg: &str) -> bool {
-        let dir = std::env::temp_dir().join(format!("zvcs-oplog-{}-{}", std::process::id(), msg.len()));
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let seq = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("zvcs-oplog-{}-{seq}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("logs")).unwrap();
         let z = "0000000000000000000000000000000000000000";

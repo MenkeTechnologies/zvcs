@@ -9,9 +9,27 @@ use std::process::{Command, Output};
 
 const BIN: &str = env!("CARGO_BIN_EXE_git");
 
+/// A `git` whose identity comes from the fixture's config and nowhere else.
+///
+/// `GIT_AUTHOR_*`/`GIT_COMMITTER_*` outrank `user.name`/`user.email`, and CI
+/// exports them so a bare runner can commit at all. Every assertion here is
+/// about an identity the config named (`t <t@e.x>` in the trailer, in the
+/// in-body `From:`), so the vars have to go or the runner's identity silently
+/// takes their place.
+fn cmd(dir: &Path, args: &[&str]) -> Command {
+    let mut c = Command::new(BIN);
+    c.args(args)
+        .current_dir(dir)
+        .env_remove("GIT_AUTHOR_NAME")
+        .env_remove("GIT_AUTHOR_EMAIL")
+        .env_remove("GIT_COMMITTER_NAME")
+        .env_remove("GIT_COMMITTER_EMAIL");
+    c
+}
+
 fn git(dir: &Path, args: &[&str]) {
     assert!(
-        Command::new(BIN).args(args).current_dir(dir).status().unwrap().success(),
+        cmd(dir, args).status().unwrap().success(),
         "git {args:?} failed"
     );
 }
@@ -37,9 +55,7 @@ fn fixture(tag: &str) -> (PathBuf, PathBuf) {
 fn fmt(repo: &Path, home: &Path, extra: &[&str]) -> Output {
     let mut args = vec!["format-patch", "--stdout", "-1"];
     args.extend_from_slice(extra);
-    Command::new(BIN)
-        .args(&args)
-        .current_dir(repo)
+    cmd(repo, &args)
         .env("HOME", home)
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("ZVCS_HOME", home)

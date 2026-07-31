@@ -30,7 +30,7 @@ pub enum RoundTripCheck<'a> {
 #[derive(Debug, thiserror::Error)]
 #[expect(missing_docs)]
 pub enum Error {
-    #[error("{msg} in '{}'", path.display())]
+    #[error("{msg} in {}", path.display())]
     RoundTrip { msg: &'static str, path: PathBuf },
     #[error("Could not obtain index object to check line endings for")]
     FetchObjectFromIndex(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
@@ -117,10 +117,12 @@ pub(crate) mod function {
                             path: rela_path.to_owned(),
                         });
                     }
-                    #[allow(unused_variables, reason = "Used when tracing is enabled at compile time.")]
                     RoundTripCheck::Warn { rela_path } => {
-                        gix_trace::warn!(
-                            "in the working copy of '{}', CRLF will be replaced by LF next time git touches it",
+                        // git prints this on stderr from `check_global_conv_flags_eol()`,
+                        // and a caller checking output for it is checking stderr — a
+                        // trace event nothing is subscribed to would be invisible.
+                        eprintln!(
+                            "warning: in the working copy of '{}', CRLF will be replaced by LF the next time Git touches it",
                             rela_path.display()
                         );
                     }
@@ -134,10 +136,9 @@ pub(crate) mod function {
                             path: rela_path.to_owned(),
                         });
                     }
-                    #[allow(unused_variables, reason = "Used when tracing is enabled at compile time.")]
                     RoundTripCheck::Warn { rela_path } => {
-                        gix_trace::warn!(
-                            "in the working copy of '{}', LF will be replaced by CRLF next time git touches it",
+                        eprintln!(
+                            "warning: in the working copy of '{}', LF will be replaced by CRLF the next time Git touches it",
                             rela_path.display()
                         );
                     }

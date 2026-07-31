@@ -219,3 +219,30 @@ fn staged_only_push_refuses_to_restore_over_a_file_in_the_way() {
     assert!(status.contains(&("??".to_string(), "b.txt".to_string())), "status: {status:?}");
     assert!(f.work.join("b.txt").exists());
 }
+
+/// Converting CRLF on the way into the object database is reported the way git
+/// reports it — on stderr, from the filter pipeline's round-trip check.
+#[test]
+fn a_crlf_conversion_warns_like_git() {
+    let f = Fixture::new("crlf");
+    f.write(".gitattributes", "* text=auto\n");
+    // The committed blob has LF, as a normalized repository's does; the worktree
+    // copy grows CRLF, which is what the conversion — and the warning — is about.
+    f.write("w.txt", "l1\nl2\n");
+    f.git(&["add", "-A"]);
+    f.git(&["commit", "-q", "-m", "attrs"]);
+    f.write("w.txt", "l1\r\nl2\r\nl3\r\n");
+
+    let (ok, out, err) = f.run(&["stash", "push", "-m", "c"]);
+    assert!(ok, "stash failed: {out}{err}");
+    assert_eq!(
+        err,
+        "warning: in the working copy of 'w.txt', CRLF will be replaced by LF the next time Git touches it\n",
+        "stderr: {err}"
+    );
+    // `core.safecrlf=false` silences it, `true` makes it fatal — git's three modes.
+    f.git(&["checkout", "--", "w.txt"]);
+    f.write("w.txt", "l1\r\nl2\r\nl4\r\n");
+    let (_, _, err) = f.run(&["-c", "core.safecrlf=false", "stash", "push", "-m", "c2"]);
+    assert!(err.is_empty(), "safecrlf=false must be silent: {err}");
+}

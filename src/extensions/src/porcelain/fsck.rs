@@ -121,16 +121,12 @@ const ERROR_REFS: u8 = 8;
 ///    vendored `gix-ref` has no reftable backend.
 /// 3. **No re-hashing.** git recomputes each object's hash to catch a silent
 ///    `hash mismatch`; this port trusts the odb's own integrity checking.
-/// 3b. **A reference the ref store cannot resolve is fatal to the connectivity
-///    walk.** `snapshot_ref()` reports `error: <ref>: invalid sha1 pointer
-///    <oid>`, sets `ERROR_REACHABLE` and carries on with the remaining refs, so
-///    `git fsck` still reports the rest of the repository. Here the head
-///    collection propagates the ref store's error instead and the command
-///    exits. This is visible for exactly the defects the reference-database
-///    check below reports — an unparsable ref file, or an invalid refname —
-///    where git prints both its own `<msg-id>` line and the `invalid sha1
-///    pointer` line and this port prints only the first. The exit code differs
-///    with it: git ORs in `ERROR_REACHABLE` where this port does not.
+/// 3b. **A reference the ref store cannot resolve is reported, not fatal.**
+///    `snapshot_ref()` prints `error: <ref>: invalid sha1 pointer <null-oid>`,
+///    sets `ERROR_REACHABLE` and carries on with the remaining refs, so
+///    `git fsck` still reports the rest of the repository — which is what a
+///    `refs/remotes/<remote>/HEAD` left pointing at a renamed default branch
+///    produces.
 /// 4. **An unreadable object is reported and stepped over**, as `fsck_loose()`
 ///    does — that is the whole point of the command. [`read_loose_object`] is a
 ///    port of `object-file.c`'s function of that name, so a loose object that
@@ -610,7 +606,7 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
 
     // ---- 4. the head set ----------------------------------------------------
     if !explicit_heads {
-        default_refs += collect_default_heads(&repo, &mut state, &mut heads)?;
+        default_refs += collect_default_heads(&repo, &mut state, &mut heads, &mut errors)?;
     }
     if opt.include_reflogs {
         let logs_root = repo.common_dir().join("logs");
@@ -1285,6 +1281,7 @@ fn collect_default_heads(
     repo: &gix::Repository,
     state: &mut State,
     heads: &mut Vec<ObjectId>,
+    errors: &mut u8,
 ) -> Result<usize> {
     let mut count = 0usize;
 
@@ -1296,11 +1293,20 @@ fn collect_default_heads(
         // Bind the direct target first so the borrow of `reference` ends before
         // the peeling fallback consumes it.
         let direct: Option<ObjectId> = reference.target().try_id().map(|id| id.to_owned());
+        let name = reference.name().as_bstr().to_string();
         let id = match direct {
             Some(id) => id,
             None => match reference.into_fully_peeled_id() {
                 Ok(id) => id.detach(),
-                Err(_) => continue,
+                // `snapshot_ref()` is handed the null id for a ref the store
+                // cannot resolve — a symbolic ref whose target is gone — and
+                // reports it against the *ref*, sets `ERROR_REACHABLE`, and
+                // carries on with the rest of the repository.
+                Err(_) => {
+                    eprintln!("error: {name}: invalid sha1 pointer {}", ObjectId::null(repo.object_hash()));
+                    *errors |= ERROR_REACHABLE;
+                    continue;
+                }
             },
         };
         state.note(id);

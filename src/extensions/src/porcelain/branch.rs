@@ -590,6 +590,9 @@ fn collect_entries<'repo>(
         let wt_map = worktree_map(repo);
         for r in repo.references()?.local_branches()? {
             let r = r.map_err(|e| anyhow!("{e}"))?;
+            if !resolves(&r) {
+                continue;
+            }
             let full = r.name().as_bstr().to_owned();
             let short = r.name().shorten().to_string();
             let (id, symref) = target_of(&r);
@@ -611,6 +614,9 @@ fn collect_entries<'repo>(
     if o.mode != ListMode::Local {
         for r in repo.references()?.remote_branches()? {
             let r = r.map_err(|e| anyhow!("{e}"))?;
+            if !resolves(&r) {
+                continue;
+            }
             let full = r.name().as_bstr().to_owned();
             let short = r.name().shorten().to_string();
             // Under `-a` git disambiguates remote refs with a `remotes/` prefix;
@@ -920,6 +926,19 @@ pub(crate) fn upstream_track(
 }
 
 /// Split a reference's target into a commit id or a symbolic-ref short name.
+/// Whether `for_each_ref()` would hand this ref to the listing at all.
+///
+/// git drops refs that do not resolve (`ref_resolves_to_object()`), and a
+/// symbolic ref whose target is gone is exactly that: `refs/remotes/<remote>/HEAD`
+/// still naming a default branch the remote has since renamed. git omits it from
+/// `branch -a`/`-r` rather than printing a line that points nowhere.
+fn resolves(r: &gix::Reference<'_>) -> bool {
+    match r.target() {
+        gix::refs::TargetRef::Object(_) => true,
+        gix::refs::TargetRef::Symbolic(_) => r.clone().peel_to_id().is_ok(),
+    }
+}
+
 fn target_of<'repo>(r: &gix::Reference<'repo>) -> (Option<gix::Id<'repo>>, Option<String>) {
     match r.target() {
         gix::refs::TargetRef::Object(_) => (Some(r.id()), None),

@@ -777,7 +777,13 @@ pub fn for_each_ref(args: &[String]) -> Result<ExitCode> {
             .try_name()
             .map(|n| n.as_bstr().to_vec())
             .unwrap_or_default();
-        let id = reference.follow_to_object()?.detach();
+        // `do_for_each_ref()` drops a ref that does not resolve, so a symbolic
+        // ref whose target is gone — `refs/remotes/<remote>/HEAD` still naming a
+        // renamed default branch — is simply not among the refs iterated. It is
+        // not an error, and listing every other ref is not optional.
+        let Ok(id) = reference.follow_to_object().map(|id| id.detach()) else {
+            continue;
+        };
 
         // The chain of tag targets, so `--points-at`, the reachability filters
         // and `*`-atoms agree with git. Skipped entirely when nothing needs it,

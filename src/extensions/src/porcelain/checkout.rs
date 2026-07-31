@@ -90,6 +90,14 @@ use gix::refs::{FullName, Target};
 pub fn checkout(args: &[String]) -> Result<ExitCode> {
     let repo = gix::discover(".")?;
 
+    // `cmd_checkout()` special-cases the exact command line `git checkout -b
+    // <branch>` — argv checked literally, so `-B` and any extra option fall out
+    // of it — and gives it `git switch -c`'s behaviour by setting
+    // `only_merge_on_switching_branches`. With no start-point that makes
+    // `switch_branches()` skip `merge_working_tree()` altogether, which is why
+    // this one spelling prints no local-changes listing.
+    let only_merge_on_switching_branches = args.len() == 2 && args[0] == "-b";
+
     // --- Argument classification -------------------------------------------
     // `new_branch` is Some((name, reset_if_exists)) for -b / -B.
     let mut new_branch: Option<(String, bool)> = None;
@@ -394,7 +402,15 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
             }
             return Ok(ExitCode::SUCCESS);
         }
-        return create_and_switch(&repo, &name, reset, start, quiet, track);
+        return create_and_switch(
+            &repo,
+            &name,
+            reset,
+            start,
+            quiet,
+            track,
+            !only_merge_on_switching_branches,
+        );
     }
 
     // `-t <remote>/<branch>` with no `-b`: DWIM the local branch name from the
@@ -411,7 +427,7 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
                     eprintln!("fatal: missing branch name; try -b");
                     return Ok(ExitCode::from(128));
                 };
-                return create_and_switch(&repo, &name, false, pre[0], quiet, true);
+                return create_and_switch(&repo, &name, false, pre[0], quiet, true, true);
             }
             None => {
                 eprintln!("fatal: missing branch name; try -b");
@@ -505,7 +521,7 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
                 match unique_remote_branch(&repo, spec)? {
                     Dwim::One(remote_short) => {
                         let code =
-                            create_and_switch(&repo, spec, false, &remote_short, quiet, true)?;
+                            create_and_switch(&repo, spec, false, &remote_short, quiet, true, true)?;
                         maybe_recurse_submodules(&repo, recurse_submodules, quiet)?;
                         return Ok(code);
                     }
@@ -616,7 +632,7 @@ fn checkout_head_in_place(repo: &gix::Repository, quiet: bool, force: bool) -> R
             .detach();
         reset_worktree_to_tree(repo, tree)?;
     } else {
-        show_local_changes(quiet)?;
+        show_local_changes("HEAD", quiet)?;
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -646,6 +662,11 @@ pub(crate) fn switch_to_branch(
             if force {
                 let tree = repo.head_tree_id_or_empty()?.detach();
                 reset_worktree_to_tree(repo, tree)?;
+            } else {
+                // `switch_branch_doing_nothing_is_ok`: the switch is a no-op, but
+                // `merge_working_tree()` still runs, so the local changes are
+                // still listed — before `Already on '<branch>'`.
+                show_local_changes(spec, quiet)?;
             }
             let branch_full: FullName = format!("refs/heads/{spec}")
                 .try_into()
@@ -683,6 +704,10 @@ pub(crate) fn switch_to_branch(
         }
         update_worktree_to_tree(repo, cur_tree, target_tree)?;
     }
+    // The tail of `merge_working_tree()`: `!opts->discard_changes && !opts->quiet`.
+    if !force {
+        show_local_changes(&commit.id.to_string(), quiet)?;
+    }
 
     let branch_full: FullName = format!("refs/heads/{spec}")
         .try_into()
@@ -706,7 +731,6 @@ pub(crate) fn switch_to_branch(
         }
         eprintln!("Switched to branch '{spec}'");
     }
-    show_local_changes(quiet)?;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -735,11 +759,14 @@ fn detached_checkout(
 
     if force {
         reset_worktree_to_tree(repo, target_tree)?;
-    } else if target_tree != cur_tree {
-        if let Some(code) = ensure_clean(repo, cur_tree, target_tree)? {
-            return Ok(code);
+    } else {
+        if target_tree != cur_tree {
+            if let Some(code) = ensure_clean(repo, cur_tree, target_tree)? {
+                return Ok(code);
+            }
+            update_worktree_to_tree(repo, cur_tree, target_tree)?;
         }
-        update_worktree_to_tree(repo, cur_tree, target_tree)?;
+        show_local_changes(&target_id.to_string(), quiet)?;
     }
 
     set_head_detached(
@@ -798,6 +825,7 @@ fn create_and_switch(
     start: &str,
     quiet: bool,
     track: bool,
+    merge_worktree: bool,
 ) -> Result<ExitCode> {
     let full = format!("refs/heads/{name}");
     if gix::validate::reference::branch_name(BStr::new(full.as_bytes())).is_err() {
@@ -847,6 +875,13 @@ fn create_and_switch(
             return Ok(code);
         }
         update_worktree_to_tree(repo, cur_tree, target_tree)?;
+    }
+    // `merge_working_tree()` ends here, and its last act is the listing of the
+    // local changes carried onto the new branch — before `update_refs_for_switch()`
+    // announces the switch. `only_merge_on_switching_branches` skips the whole
+    // function, listing included.
+    if merge_worktree {
+        show_local_changes(&start_id.to_string(), quiet)?;
     }
 
     let branch_full: FullName = full
@@ -1393,7 +1428,11 @@ fn restore_from_tree(
 ///
 /// Returns the exit code when the switch is refused; the paths and the advice
 /// are printed by [`crate::merge_guard::Clobber::report`].
-fn ensure_clean(repo: &gix::Repository, cur_tree: ObjectId, target_tree: ObjectId) -> Result<Option<ExitCode>> {
+pub(super) fn ensure_clean(
+    repo: &gix::Repository,
+    cur_tree: ObjectId,
+    target_tree: ObjectId,
+) -> Result<Option<ExitCode>> {
     let index = repo.index_or_load_from_head_or_empty()?;
     let clobber = crate::merge_guard::verify_two_way(repo, cur_tree, target_tree, &index)?;
     if clobber.is_empty() {
@@ -1406,7 +1445,7 @@ fn ensure_clean(repo: &gix::Repository, cur_tree: ObjectId, target_tree: ObjectI
 /// Move a clean worktree and its index from the current state to `new_tree`,
 /// writing only the files that changed (added/modified checked out, removed
 /// deleted). Mirrors the file-level reconciliation used by `zsync`.
-fn update_worktree_to_tree(
+pub(super) fn update_worktree_to_tree(
     repo: &gix::Repository,
     old_tree: ObjectId,
     new_tree: ObjectId,
@@ -1508,7 +1547,7 @@ fn flatten_tree(
 /// `lstat()` fails or `ie_match_stat()` reports a change, and an entry the tree
 /// changes — including a conflicted one, which `same()` never matches — is always
 /// written and lands at stage 0.
-fn reset_worktree_to_tree(repo: &gix::Repository, new_tree: ObjectId) -> Result<()> {
+pub(super) fn reset_worktree_to_tree(repo: &gix::Repository, new_tree: ObjectId) -> Result<()> {
     let should_interrupt = AtomicBool::new(false);
 
     let old = repo.index_or_load_from_head_or_empty()?.into_owned();
@@ -1613,11 +1652,17 @@ fn remove_branch_state(repo: &gix::Repository) {
 
 /// git's `show_local_changes()`: the `diff-index --name-status` listing a
 /// non-forced checkout prints to **stdout** when it does not discard changes.
-fn show_local_changes(quiet: bool) -> Result<()> {
+///
+/// `rev` is what git passes as the diff's left side — `new_branch_info->commit`,
+/// the commit being switched *to*, not `HEAD`. It runs from `merge_working_tree()`,
+/// before `update_refs_for_switch()` moves `HEAD`, so diffing against `HEAD`
+/// would name every path the two branches disagree about on top of the local
+/// changes it is meant to list.
+pub(super) fn show_local_changes(rev: &str, quiet: bool) -> Result<()> {
     if quiet {
         return Ok(());
     }
-    let args = ["--name-status".to_string(), "HEAD".to_string()];
+    let args = ["--name-status".to_string(), rev.to_string()];
     super::diff_index::diff_index(&args)?;
     Ok(())
 }

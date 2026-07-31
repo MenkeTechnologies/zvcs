@@ -32,34 +32,33 @@
 //! `fatal: <reason>` on stderr and exit 128; option-parsing failures print
 //! `error: <reason>` (with the usage block for unknown options) and exit 129.
 //!
-//! Deferred (honest terse bail): `-m`/`--merge` (a real 3-way worktree merge that
-//! carries local modifications onto the new branch — needs the unpack-trees
-//! merge machinery gitoxide does not expose as a worktree operation) and
-//! `--conflict` (only meaningful with `--merge`).
+//! The worktree move is `checkout`'s, because git's is: both commands run the
+//! same two-way `unpack_trees()` from the tree `HEAD` holds to the target's, so
+//! a local modification to a file the two branches agree on is carried across
+//! (and listed as `<status>\t<path>` on stdout), one to a file they disagree on
+//! refuses the switch in `checkout`'s wording, and `--force`/`--discard-changes`
+//! resets instead. See [`move_worktree`].
+//!
+//! Deferred (honest terse bail): `-m`/`--merge` (a real 3-way worktree merge of
+//! local modifications *with* the target's version of the same path — a
+//! different operation from the two-way carry-across above) and `--conflict`
+//! (only meaningful with `--merge`).
 //!
 //! Known divergences from git that are *not* fixable from this file:
 //! ```text
 //!   * No `.git/logs/HEAD` reflog line is written for the symbolic `HEAD` move —
 //!     see [`attach_head`].
-//!   * A switch that must rewrite tracked files requires a clean worktree unless
-//!     `--force` is given; git instead carries non-conflicting local
-//!     modifications across (reporting them as `<status>\t<path>` on stdout).
-//!     Refusing the dirty case is narrower than git but never silently loses
-//!     work; `--force` provides the discard-and-switch escape hatch.
 //!   * The "you are leaving N commit behind" orphaned-commit warning printed when
 //!     abandoning a detached HEAD with unreachable commits is not reproduced
 //!     (consistent with `checkout.rs`).
 //! ```
 
 use anyhow::{anyhow, bail, Result};
-use std::collections::{HashMap, HashSet};
 use std::io::Write as _;
 use std::process::ExitCode;
-use std::sync::atomic::AtomicBool;
 
 use gix::bstr::{BStr, BString, ByteSlice};
 use gix::hash::ObjectId;
-use gix::index::entry::{Mode, Stat};
 use gix::prelude::ObjectIdExt;
 use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
 use gix::refs::{FullName, Target};
@@ -258,7 +257,7 @@ fn parse<'a>(args: &'a [String]) -> Result<Parse<'a>> {
                 let ch = shorts[off..].chars().next().expect("in-bounds");
                 let next_off = off + ch.len_utf8();
                 match ch {
-                    'q' => {}
+                    'q' => p.quiet = true,
                     'd' => p.detach = true,
                     'f' => p.force = true,
                     't' => p.track = Some(true),
@@ -399,12 +398,17 @@ fn switch_existing(
     let full = format!("refs/heads/{branch}");
 
     // Already on the requested branch → git reports it and exits 0 untouched.
+    // `merge_working_tree()` still runs (the branch *is* named, so `do_merge`
+    // stays set), and its listing of local changes comes before the message.
     if repo.head_name()?.as_ref().map(|n| n.as_bstr())
         == FullName::try_from(full.as_str())
             .ok()
             .as_ref()
             .map(|n| n.as_bstr())
     {
+        if !force {
+            super::checkout::show_local_changes(branch, quiet)?;
+        }
         if !quiet {
             eprintln!("Already on '{branch}'");
         }
@@ -451,8 +455,13 @@ fn switch_existing(
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
 
     if needs_worktree {
-        let old = prepare_worktree_change(repo, force)?;
-        update_worktree(repo, &old, target, force)?;
+        let target_tree = repo.find_object(target)?.peel_to_commit()?.tree_id()?.detach();
+        let cur_tree = head_tree(repo)?.unwrap_or_else(|| repo.empty_tree().id().detach());
+        if let Some(code) =
+            move_worktree(repo, cur_tree, target_tree, force, quiet, &target.to_string())?
+        {
+            return Ok(code);
+        }
     }
 
     attach_head(repo, &full_name, &from_desc, branch)?;
@@ -527,9 +536,23 @@ fn switch_create(
         return Ok(ExitCode::SUCCESS);
     };
 
+    // `only_merge_on_switching_branches` is set for `switch`, so the worktree is
+    // only merged when a start-point actually moves `HEAD` — `switch -c <new>`
+    // alone leaves the worktree (and its listing) alone entirely.
     let needs_worktree = current_commit != Some(start_commit);
-    let old = if needs_worktree {
-        Some(prepare_worktree_change(repo, force)?)
+    let trees = if needs_worktree {
+        let target_tree = repo.find_object(start_commit)?.peel_to_commit()?.tree_id()?.detach();
+        let cur_tree = head_tree(repo)?.unwrap_or_else(|| repo.empty_tree().id().detach());
+        // Refuse before the branch is created, so a blocked switch leaves no ref
+        // behind — git's `merge_working_tree()` runs before `update_refs_for_switch()`.
+        if let Some(code) = if force {
+            None
+        } else {
+            super::checkout::ensure_clean(repo, cur_tree, target_tree)?
+        } {
+            return Ok(code);
+        }
+        Some((cur_tree, target_tree))
     } else {
         None
     };
@@ -557,8 +580,12 @@ fn switch_create(
         install_tracking(repo, branch, up)?;
     }
 
-    if let Some(old) = old {
-        update_worktree(repo, &old, start_commit, force)?;
+    if let Some((cur_tree, target_tree)) = trees {
+        if let Some(code) =
+            move_worktree(repo, cur_tree, target_tree, force, quiet, &start_commit.to_string())?
+        {
+            return Ok(code);
+        }
     }
 
     attach_head(repo, &full_name, &from_desc, branch)?;
@@ -625,8 +652,12 @@ fn switch_detach(
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
 
     if cur_tree != Some(target_tree) {
-        let old = prepare_worktree_change(repo, force)?;
-        update_worktree(repo, &old, target_id, force)?;
+        let from_tree = cur_tree.unwrap_or_else(|| repo.empty_tree().id().detach());
+        if let Some(code) =
+            move_worktree(repo, from_tree, target_tree, force, quiet, &target_id.to_string())?
+        {
+            return Ok(code);
+        }
     }
 
     let to_desc = target_id.attach(repo).shorten_or_id().to_string();
@@ -689,8 +720,16 @@ fn switch_orphan(
 
     let old = repo.index_or_load_from_head()?.into_owned();
     if !old.entries().is_empty() {
-        if !force && repo.is_dirty()? {
-            bail!("your local changes would be overwritten; commit or stash them, or use --force (dirty-worktree orphan is unsupported)");
+        // `orphan_from_empty_tree`: the target tree is the empty one, so the same
+        // two-way pass every switch runs decides this — and refuses in the same
+        // words. No listing follows: `new_branch_info->commit` is NULL, which is
+        // what `show_local_changes()` is guarded on.
+        if !force {
+            let cur_tree = head_tree(repo)?.unwrap_or_else(|| repo.empty_tree().id().detach());
+            let empty = repo.empty_tree().id().detach();
+            if let Some(code) = super::checkout::ensure_clean(repo, cur_tree, empty)? {
+                return Ok(code);
+            }
         }
         clear_tracked_worktree(repo, &old)?;
     }
@@ -974,13 +1013,34 @@ fn head_tree(repo: &gix::Repository) -> Result<Option<ObjectId>> {
     }
 }
 
-/// Ensure the tracked worktree may be rewritten and capture its current index.
-/// Refuses a dirty worktree unless `force` is set (git's discard path).
-fn prepare_worktree_change(repo: &gix::Repository, force: bool) -> Result<gix::index::File> {
-    if !force && repo.is_dirty()? {
-        bail!("your local changes would be overwritten; commit or stash them, or use --force (dirty-worktree switch is unsupported)");
+/// `merge_working_tree()` for a switch: move the worktree and index from the
+/// tree `HEAD` holds now onto `target_tree`, then list what was carried across.
+///
+/// This is `checkout`'s path verbatim, because git's is: both commands run the
+/// same two-way `unpack_trees()`, so a local change to a file the two branches
+/// agree on comes along, one to a file they disagree on refuses the switch (in
+/// `checkout`'s wording — `git switch` does not have its own), and `--force` /
+/// `--discard-changes` resets instead.
+///
+/// Returns the exit code of a refusal, or `None` when the worktree moved.
+fn move_worktree(
+    repo: &gix::Repository,
+    cur_tree: ObjectId,
+    target_tree: ObjectId,
+    force: bool,
+    quiet: bool,
+    listing_rev: &str,
+) -> Result<Option<ExitCode>> {
+    if force {
+        super::checkout::reset_worktree_to_tree(repo, target_tree)?;
+        return Ok(None);
     }
-    Ok(repo.index_or_load_from_head()?.into_owned())
+    if let Some(code) = super::checkout::ensure_clean(repo, cur_tree, target_tree)? {
+        return Ok(Some(code));
+    }
+    super::checkout::update_worktree_to_tree(repo, cur_tree, target_tree)?;
+    super::checkout::show_local_changes(listing_rev, quiet)?;
+    Ok(None)
 }
 
 /// Point `HEAD` symbolically at `branch_ref`, requesting a `checkout: moving
@@ -1082,109 +1142,3 @@ fn clear_tracked_worktree(repo: &gix::Repository, old: &gix::index::File) -> Res
     Ok(())
 }
 
-/// Move the worktree and index from `old` to the tree of commit `new_commit`.
-///
-/// Clean mode (`force == false`) writes only the files that differ from `old`.
-/// Force mode (`force == true`) checks out the entire target tree, overwriting
-/// any local modifications — git's `--force`/`--discard-changes` behavior.
-fn update_worktree(
-    repo: &gix::Repository,
-    old: &gix::index::File,
-    new_commit: ObjectId,
-    force: bool,
-) -> Result<()> {
-    let should_interrupt = AtomicBool::new(false);
-
-    let workdir = repo
-        .workdir()
-        .ok_or_else(|| anyhow!("bare repository has no worktree to update"))?
-        .to_owned();
-
-    let new_tree_id = repo.find_object(new_commit)?.peel_to_tree()?.id;
-
-    let mut old_map: HashMap<BString, (ObjectId, Mode, Stat)> =
-        HashMap::with_capacity(old.entries().len());
-    {
-        let backing = old.path_backing();
-        for e in old.entries() {
-            old_map.insert(e.path_in(backing).to_owned(), (e.id, e.mode, e.stat));
-        }
-    }
-
-    let mut new_index = repo.index_from_tree(&new_tree_id)?;
-
-    // The subset written to disk: in force mode the whole tree (discarding local
-    // edits), otherwise only entries that differ from `old`.
-    let mut subset = repo.index_from_tree(&new_tree_id)?;
-    if !force {
-        subset.remove_entries(|_, path, entry| match old_map.get(&path.to_owned()) {
-            Some((oid, mode, _)) => *oid == entry.id && *mode == entry.mode,
-            None => false,
-        });
-    }
-
-    let mut opts =
-        repo.checkout_options(gix::worktree::stack::state::attributes::Source::IdMapping)?;
-    opts.destination_is_initially_empty = false;
-    opts.overwrite_existing = true;
-    let odb = repo.objects.clone().into_arc()?;
-    let discard_files = gix::progress::Discard;
-    let discard_bytes = gix::progress::Discard;
-    crate::worktree::checkout_subset(
-        &mut subset,
-        workdir.as_path(),
-        odb,
-        &discard_files,
-        &discard_bytes,
-        &should_interrupt,
-        opts,
-    )?;
-
-    // Remove files present in the old tree but not the new one.
-    let new_paths: HashSet<BString> = {
-        let backing = new_index.path_backing();
-        new_index
-            .entries()
-            .iter()
-            .map(|e| e.path_in(backing).to_owned())
-            .collect()
-    };
-    {
-        let backing = old.path_backing();
-        for e in old.entries() {
-            let path = e.path_in(backing);
-            if !new_paths.contains(&path.to_owned()) {
-                if let Some(full) = repo.workdir_path(path) {
-                    let _ = std::fs::remove_file(full);
-                }
-            }
-        }
-    }
-
-    let mut subset_stats: HashMap<BString, Stat> = HashMap::with_capacity(subset.entries().len());
-    {
-        let backing = subset.path_backing();
-        for e in subset.entries() {
-            subset_stats.insert(e.path_in(backing).to_owned(), e.stat);
-        }
-    }
-
-    {
-        let backing = new_index.path_backing().to_owned();
-        for e in new_index.entries_mut() {
-            let path = e.path_in(&backing).to_owned();
-            if let Some(stat) = subset_stats.get(&path) {
-                e.stat = *stat;
-            } else if let Some((oid, mode, stat)) = old_map.get(&path) {
-                if *oid == e.id && *mode == e.mode {
-                    e.stat = *stat;
-                }
-            }
-        }
-    }
-
-    new_index.remove_tree();
-    new_index.write(Default::default())?;
-
-    Ok(())
-}

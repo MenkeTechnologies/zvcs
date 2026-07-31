@@ -168,3 +168,55 @@ fn a_staged_change_to_a_shared_path_survives_the_switch() {
     // And `show_local_changes()` accounts for it, as git does.
     assert_eq!(out, "M\ta.txt\n", "stdout: {out}");
 }
+
+/// `show_local_changes()` diffs against the commit being switched *to* and runs
+/// from `merge_working_tree()`, before `HEAD` moves. Diffing against `HEAD`
+/// instead would list every path the two branches disagree about on top of the
+/// local changes it is meant to report.
+#[test]
+fn the_listing_is_against_the_target_not_head() {
+    let f = Fixture::new("listing-base");
+    std::fs::write(f.work.join("a.txt"), "a\nlocal\n").unwrap();
+
+    let (code, out, err) = f.run(&["checkout", "other"]);
+    assert_eq!(code, 0, "the switch should have happened: {out}{err}");
+    assert_eq!(out, "M\ta.txt\n", "b.txt differs between the branches, not locally: {out}");
+}
+
+/// `cmd_checkout()` checks argv literally: the exact line `git checkout -b
+/// <branch>` is given `git switch -c`'s `only_merge_on_switching_branches`, so
+/// `merge_working_tree()` — and its listing — is skipped entirely. `-B`, or the
+/// same `-b` with a start-point, is not that line and still reports.
+#[test]
+fn plain_dash_b_skips_the_listing_that_dash_capital_b_prints() {
+    let f = Fixture::new("only-merge");
+    std::fs::write(f.work.join("a.txt"), "a\nlocal\n").unwrap();
+
+    let (code, out, err) = f.run(&["checkout", "-b", "fresh"]);
+    assert_eq!(code, 0, "branch creation failed: {out}{err}");
+    assert_eq!(out, "", "`checkout -b <name>` lists nothing: {out}");
+
+    let (code, out, err) = f.run(&["checkout", "-B", "forced"]);
+    assert_eq!(code, 0, "branch creation failed: {out}{err}");
+    assert_eq!(out, "M\ta.txt\n", "`-B` is not the special-cased line: {out}");
+
+    let (code, out, err) = f.run(&["checkout", "-b", "withstart", "HEAD"]);
+    assert_eq!(code, 0, "branch creation failed: {out}{err}");
+    assert_eq!(out, "M\ta.txt\n", "a start-point is not the special-cased line: {out}");
+}
+
+/// A detach and a no-op switch both run `merge_working_tree()`, so both list.
+#[test]
+fn detaching_and_re_selecting_the_current_branch_still_list() {
+    let f = Fixture::new("noop-listing");
+    std::fs::write(f.work.join("a.txt"), "a\nlocal\n").unwrap();
+
+    let (code, out, err) = f.run(&["checkout", "main"]);
+    assert_eq!(code, 0, "the no-op switch failed: {out}{err}");
+    assert_eq!(out, "M\ta.txt\n", "stdout: {out}");
+    assert_eq!(err, "Already on 'main'\n", "stderr: {err}");
+
+    let (code, out, err) = f.run(&["checkout", "--detach"]);
+    assert_eq!(code, 0, "the detach failed: {out}{err}");
+    assert_eq!(out, "M\ta.txt\n", "stdout: {out}");
+}

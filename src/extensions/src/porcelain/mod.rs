@@ -4,6 +4,21 @@
 //! tools on PATH (RustRover, gh, cargo) see identical behavior against the
 //! same on-disk `.git`.
 
+/// `parse-options`' own "this option needed a value" refusal: the option named
+/// the way it was typed (`option \`depth'` for a long one, `switch \`j'` for a
+/// short one), one line on stderr, exit 129.
+///
+/// It is here rather than in one porcelain because every command that takes an
+/// option value shares it — the message comes from `get_arg()` in
+/// parse-options.c, not from any subcommand.
+pub(crate) fn missing_option_value(key: &str) -> std::process::ExitCode {
+    match key.strip_prefix("--") {
+        Some(long) => eprintln!("error: option `{long}' requires a value"),
+        None => eprintln!("error: switch `{}' requires a value", &key[1..]),
+    }
+    std::process::ExitCode::from(129)
+}
+
 mod add;
 pub(crate) mod add_interactive;
 pub(crate) mod add_patch;

@@ -78,13 +78,22 @@
 //! `run_merge()` passthroughs the merge port implements, so they are forwarded
 //! on the merge path and — as git does — rejected on the rebase path.
 //!
+//! `--[no-]commit`, `--[no-]edit`, `--[no-]log[=<n>]` and `--cleanup=<mode>` are
+//! `run_merge()` passthroughs too, forwarded as given; the merge port implements
+//! all four. git pushes none of them onto the rebase command line and does not
+//! reject them there either, so neither does this.
+//!
 //! What is refused rather than faked, because the underlying substrate is
-//! absent: the merge-only integration options the merge port does not implement
-//! (`-s`/`-X`/`--commit`/`--no-commit`/`--edit`/`--cleanup`/`--log`/
-//! `--signoff` on the *merge* path — `-s`/`-X`/
-//! `--signoff` are honored on the *rebase* path), `--rebase=interactive`
-//! (interactive todo editing needs a TTY editor loop), `--set-upstream`, and
-//! `--gpg-sign`/`-S`/`--verify-signatures` (GPG is not vendored).
+//! absent: `-s`/`-X`/`--signoff` on the *merge* path (they are honored on the
+//! *rebase* path), `--rebase=interactive` (interactive todo editing needs a TTY
+//! editor loop), `--set-upstream`, and `--gpg-sign`/`-S`/`--verify-signatures`
+//! (GPG is not vendored).
+//!
+//! Option *errors* are `parse-options`': an unknown option prints
+//! `error: unknown option \`<name>'` and the whole usage block on stderr and
+//! exits 129, and a value-taking option with nothing after it prints
+//! `error: option \`<name>' requires a value` alone, also 129. Only `-h` writes
+//! the usage to stdout.
 //!
 //! `--autostash` is forwarded to whichever integration step runs — `run_merge()`
 //! and `run_rebase()` both push it — so a dirty tree is stashed and restored on
@@ -283,6 +292,9 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
     // `--squash`/`--no-squash` and `--allow-unrelated-histories`, both
     // `run_merge()` passthroughs the merge port implements.
     let mut squash: Option<bool> = None;
+    // `run_merge()`'s verbatim passthroughs — `--[no-]commit`, `--[no-]edit`,
+    // `--[no-]log[=<n>]`, `--cleanup=<mode>` — which the merge port implements.
+    let mut merge_passthru: Vec<String> = Vec::new();
     let mut allow_unrelated = false;
     // `--verify` (git's default) / `--no-verify`: forwarded to `merge`, which
     // runs the `pre-merge-commit` and `commit-msg` hooks. git's pull passes it
@@ -312,7 +324,9 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
     let mut f_keep: Option<bool> = None;
     let mut f_show_forced: Option<bool> = None;
     let mut f_recurse: Option<String> = None;
-    let mut f_jobs: Option<String> = None;
+    // `Some(None)` is a bare `--jobs`, forwarded as such; `Some(Some(n))` carried
+    // its value attached.
+    let mut f_jobs: Option<Option<String>> = None;
     let mut f_upload_pack: Option<String> = None;
     let mut f_server_options: Vec<String> = Vec::new();
     let mut f_refmap: Vec<String> = Vec::new();
@@ -335,17 +349,19 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
         };
 
         // Value for a value-taking option: inline `=v` or the next argv entry.
+        // A missing one is `parse-options`' own error — one line, no usage block,
+        // exit 129.
         macro_rules! take_value {
             ($name:literal) => {
                 match inline.clone() {
                     Some(v) => v,
-                    None => {
-                        let v = args.get(i).cloned().ok_or_else(|| {
-                            anyhow::anyhow!(concat!("option `", $name, "' requires a value"))
-                        })?;
-                        i += 1;
-                        v
-                    }
+                    None => match args.get(i).cloned() {
+                        Some(v) => {
+                            i += 1;
+                            v
+                        }
+                        None => return Ok(super::missing_option_value(key)),
+                    },
                 }
             };
         }
@@ -432,10 +448,14 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
                 f_recurse = Some(inline.clone().unwrap_or_else(|| "yes".into()))
             }
             "--no-recurse-submodules" => f_recurse = Some("no".into()),
-            // git's pull declares `-j`/`--jobs` with an *optional* value, so a
-            // detached `5` in `git pull -j 5` is a positional, not the count.
-            // Only an attached value sets it.
-            "-j" | "--jobs" => f_jobs = inline.clone(),
+            // `OPT_PASSTHRU('j', "jobs", …, PARSE_OPT_OPTARG)`: an attached value
+            // is recreated as `--jobs=<n>`, and a bare `--jobs` is forwarded bare —
+            // where `git fetch`'s own `--jobs` (which does require a value) picks
+            // up whatever positional followed it. That is why `git pull --jobs 2`
+            // fetches from `origin` rather than from a remote called `2`.
+            "-j" | "--jobs" => {
+                f_jobs = Some(inline.clone());
+            }
             "--no-jobs" => f_jobs = None,
             "--upload-pack" => f_upload_pack = Some(take_value!("upload-pack")),
             "--no-upload-pack" => f_upload_pack = None,
@@ -465,28 +485,23 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
             // passthroughs, and the merge port implements both, so they are
             // forwarded rather than refused. Neither has a rebase equivalent;
             // git rejects them there and so does the merge-only check below.
+            _ if a.starts_with("--log=") || a.starts_with("--cleanup=") => {
+                merge_passthru.push(a.to_string());
+            }
             "--squash" => squash = Some(true),
             "--no-squash" => squash = Some(false),
             "--allow-unrelated-histories" => allow_unrelated = true,
             "--no-allow-unrelated-histories" => allow_unrelated = false,
 
-            // Merge-only integration options the merge port does not implement,
-            // with no rebase equivalent: refused rather than faked.
-            "--commit" | "--no-commit" => {
-                bail!("--commit/--no-commit is not supported (the merge port always commits)")
-            }
-            "--edit" | "-e" | "--no-edit" => {
-                bail!("--edit is not supported (editing the merge message needs a TTY editor loop)")
+            // `run_merge()` passthroughs, forwarded as given. None of them has a
+            // rebase equivalent, and git does not reject them there either — it
+            // simply does not push them onto the rebase command line.
+            "--commit" | "--no-commit" | "-e" | "--edit" | "--no-edit" | "--log" | "--no-log" => {
+                merge_passthru.push(a.to_string());
             }
             "--cleanup" => {
-                // `i` bump inside take_value! is dead here because we bail immediately;
-                // the value is still consumed so a missing one errors identically to git.
-                #[allow(unused_assignments)]
-                let _ = take_value!("cleanup");
-                bail!("--cleanup is not supported (the merge port does not run message cleanup)")
-            }
-            "--log" | "--no-log" => {
-                bail!("--log is not supported (the merge port does not append a shortlog)")
+                let mode = take_value!("cleanup");
+                merge_passthru.push(format!("--cleanup={mode}"));
             }
 
             // Absent substrate. `--no-set-upstream`/`--no-gpg-sign` ask for the
@@ -520,7 +535,18 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
             other if other.starts_with("-s") && other.len() > 2 => {
                 strategy = Some(other[2..].to_string())
             }
-            other if other.starts_with('-') && other != "-" => bail!("unsupported flag {other}"),
+            // `parse-options`' own rejection: the offending name without its
+            // dashes, then the whole option table, exit 129.
+            other if other.starts_with("--") => {
+                eprintln!("error: unknown option `{}'", key.trim_start_matches('-'));
+                eprint!("{USAGE}");
+                return Ok(ExitCode::from(129));
+            }
+            other if other.starts_with('-') && other != "-" => {
+                eprintln!("error: unknown switch `{}'", &other[1..2]);
+                eprint!("{USAGE}");
+                return Ok(ExitCode::from(129));
+            }
             other => positionals.push(other),
         }
     }
@@ -671,7 +697,10 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
         fetch_args.push(format!("--recurse-submodules={r}"));
     }
     if let Some(j) = &f_jobs {
-        fetch_args.push(format!("--jobs={j}"));
+        match j {
+            Some(n) => fetch_args.push(format!("--jobs={n}")),
+            None => fetch_args.push("--jobs".into()),
+        }
     }
     if let Some(p) = &f_upload_pack {
         fetch_args.push(format!("--upload-pack={p}"));
@@ -911,6 +940,7 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
         Some(false) => merge_args.push("--no-squash".into()),
         None => {}
     }
+    merge_args.extend(merge_passthru.iter().cloned());
     if allow_unrelated {
         merge_args.push("--allow-unrelated-histories".into());
     }

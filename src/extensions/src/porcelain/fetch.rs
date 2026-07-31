@@ -87,6 +87,13 @@ use gix::remote::fetch::{RefLogMessage, Shallow, Status, Tags};
 /// alone and warned about, exactly as git's `update_shallow()` decides; `--update-shallow`
 /// takes the roots the fetched refs actually need and adds them to the boundary instead.
 ///
+/// Known divergence, stated rather than hidden: under `--dry-run` git reports an
+/// auto-followed tag *twice* — nothing is written, so its `backfill_tags()`
+/// round proposes the same tag the first round already listed. Reproducing that
+/// would mean running a second transport round for the sole purpose of printing a
+/// duplicate line, so this prints the tag once. A real (non-dry-run) fetch is
+/// byte-identical.
+///
 /// `-4`/`--ipv4` and `-6`/`--ipv6` are git's `transport_family`: they restrict address
 /// resolution for `git://` and `http(s)://` and become `ssh`'s `-4`/`-6`, and are forwarded
 /// into a submodule fetch the way `add_options_to_argv()` forwards them. A `file://` remote
@@ -146,14 +153,14 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
             ($name:literal) => {
                 match inline_val.clone() {
                     Some(v) => v,
-                    None => {
-                        let v = args
-                            .get(i)
-                            .cloned()
-                            .ok_or_else(|| anyhow::anyhow!(concat!($name, " requires a value")))?;
-                        i += 1;
-                        v
-                    }
+                    None => match args.get(i).cloned() {
+                        Some(v) => {
+                            i += 1;
+                            v
+                        }
+                        // `get_arg()`: named as typed, one line, exit 129.
+                        None => return Ok(super::missing_option_value(key)),
+                    },
                 }
             };
         }
@@ -269,27 +276,38 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
             "--no-recurse-submodules" => recurse_submodules = Some(Recurse::No),
             "-j" | "--jobs" => {
                 let v = take_value!("--jobs");
-                let n: usize = v
-                    .parse()
-                    .map_err(|_| anyhow::anyhow!("--jobs expects a positive integer, got {v:?}"))?;
+                // `OPT_INTEGER`'s own rejection, which names the unit suffixes it
+                // would have accepted.
+                let Ok(n) = v.parse::<usize>() else {
+                    eprintln!(
+                        "error: option `jobs' expects an integer value with an optional k/m/g suffix"
+                    );
+                    return Ok(ExitCode::from(129));
+                };
                 // `0` is git's "pick a reasonable number", resolved below.
                 jobs = Some(n);
             }
 
             "--depth" => {
                 let v = take_value!("--depth");
-                let n: u32 = v
-                    .parse()
-                    .map_err(|_| anyhow::anyhow!("--depth expects a positive integer, got {v:?}"))?;
-                let n = NonZeroU32::new(n)
-                    .ok_or_else(|| anyhow::anyhow!("--depth expects a positive integer"))?;
+                // `--depth` is an `OPT_STRING` in git; the number is checked by
+                // `cmd_fetch()` itself, which is why a bad one is a `fatal:` and
+                // not parse-options' 129.
+                let Some(n) = v.parse::<u32>().ok().and_then(NonZeroU32::new) else {
+                    eprintln!("fatal: depth {v} is not a positive number");
+                    return Ok(ExitCode::from(128));
+                };
                 opts.shallow = Some(Shallow::DepthAtRemote(n));
             }
             "--deepen" => {
                 let v = take_value!("--deepen");
-                let n: u32 = v
-                    .parse()
-                    .map_err(|_| anyhow::anyhow!("--deepen expects an integer, got {v:?}"))?;
+                // `OPT_INTEGER`, so a bad value is parse-options' rejection.
+                let Ok(n) = v.parse::<u32>() else {
+                    eprintln!(
+                        "error: option `deepen' expects an integer value with an optional k/m/g suffix"
+                    );
+                    return Ok(ExitCode::from(129));
+                };
                 opts.shallow = Some(Shallow::Deepen(n));
             }
             // Shallow boundary at a cutoff date (git's `deepen_since`). Parsed with

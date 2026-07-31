@@ -25,6 +25,7 @@ mod fuzz;
 mod grammars_generated;
 mod report;
 mod runner;
+mod stock;
 
 use anyhow::{Context, Result};
 use runner::{run_case, Case};

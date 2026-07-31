@@ -294,8 +294,13 @@ fn probe_state(repo: &Path, home: &Path) -> String {
     ];
 
     let mut digest = String::new();
+    // Resolved once: with no stock git the probes cannot run at all, and every
+    // probe folds into the digest as a marker rather than aborting the case.
+    let Ok(stock) = crate::stock::git() else {
+        return "<no-stock-git>\n".to_string();
+    };
     for probe in PROBES {
-        let mut cmd = Command::new("git");
+        let mut cmd = Command::new(stock);
         env::harden(&mut cmd, home);
         cmd.current_dir(repo).args(*probe);
         let rendered = match cmd.output() {
@@ -586,7 +591,7 @@ pub fn run_case(
     templates.instantiate(case.shape, &zvcs_repo)?;
 
     let home = &templates.home;
-    let stock = run_side(Path::new("git"), &stock_repo, home, &case.args, case.stdin)?;
+    let stock = run_side(crate::stock::git()?, &stock_repo, home, &case.args, case.stdin)?;
     let zvcs = run_side(zvcs_bin, &zvcs_repo, home, &case.args, case.stdin)?;
 
     let stock_state = probe_state(&stock_repo, home);
@@ -675,7 +680,7 @@ fn stock_disagrees_with_itself(
     let _ = std::fs::remove_dir_all(&repo);
     templates.instantiate(case.shape, &repo)?;
     let home = &templates.home;
-    let again = run_side(Path::new("git"), &repo, home, &case.args, case.stdin)?;
+    let again = run_side(crate::stock::git()?, &repo, home, &case.args, case.stdin)?;
     if normalize(&again.stdout, &repo, home) != *first_stdout {
         return Ok(true);
     }

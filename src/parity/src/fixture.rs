@@ -19,7 +19,6 @@
 use crate::env;
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 /// A repository shape. Every corpus case names the shape it needs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -166,7 +165,7 @@ impl Shape {
 /// Fixture construction has no tolerance for partial success: a half-built
 /// premise would silently weaken every case that uses it.
 fn git(dir: &Path, home: &Path, args: &[&str]) -> Result<String> {
-    let mut cmd = Command::new("git");
+    let mut cmd = crate::stock::command()?;
     env::harden(&mut cmd, home);
     cmd.current_dir(dir).args(args);
     let out = cmd
@@ -303,7 +302,7 @@ pub fn build(shape: Shape, dir: &Path, home: &Path) -> Result<()> {
             git(dir, home, &["add", "conflict.txt"])?;
             git(dir, home, &["commit", "-qm", "ours"])?;
             // Expected to exit non-zero — that *is* the state being built.
-            let mut cmd = Command::new("git");
+            let mut cmd = crate::stock::command()?;
             env::harden(&mut cmd, home);
             cmd.current_dir(dir).args(["merge", "theirs"]);
             let out = cmd.output()?;

@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 /// Derived at runtime rather than hardcoded: a literal list would go stale the
 /// moment git is upgraded, and would let the denominator be edited.
 pub fn stock_subcommands() -> Result<Vec<String>> {
-    let out = Command::new("git")
+    let out = crate::stock::command()?
         .arg("--list-cmds=main")
         .output()
         .context("running `git --list-cmds=main`")?;
@@ -283,10 +283,9 @@ fn esc(s: &str) -> String {
 /// Best-effort short git version (`2.55.0`) of the reference binary the corpus
 /// was compared against.
 fn git_version() -> String {
-    Command::new("git")
-        .arg("--version")
-        .output()
+    crate::stock::command()
         .ok()
+        .and_then(|mut c| c.arg("--version").output().ok())
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .map(|s| s.trim().trim_start_matches("git version ").to_string())
         .filter(|s| !s.is_empty())
@@ -704,7 +703,10 @@ fn parse_options(text: &str) -> Vec<(String, Option<String>, bool)> {
 
 /// The options stock git advertises for `cmd`, from `git <cmd> -h`.
 fn git_options(cmd: &str) -> Vec<(String, Option<String>, bool)> {
-    let out = match Command::new("git").arg(cmd).arg("-h").output() {
+    let Ok(mut stock) = crate::stock::command() else {
+        return Vec::new();
+    };
+    let out = match stock.arg(cmd).arg("-h").output() {
         Ok(o) => o,
         Err(_) => return Vec::new(),
     };
@@ -819,7 +821,10 @@ pub fn option_matrix(
 /// `git help --config` (camelCase `section.key` / `section.<name>.key`).
 /// Derived at runtime so it tracks the installed git, never a hand list.
 pub fn git_config_keys() -> Vec<String> {
-    let out = match Command::new("git").args(["help", "--config"]).output() {
+    let Ok(mut stock) = crate::stock::command() else {
+        return Vec::new();
+    };
+    let out = match stock.args(["help", "--config"]).output() {
         Ok(o) => o,
         Err(_) => return Vec::new(),
     };

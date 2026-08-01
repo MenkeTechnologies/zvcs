@@ -369,7 +369,13 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
 
     // git reads the repository (and the in-progress state dirs, which seed the
     // backend) before `parse_options` runs.
-    let repo = gix::discover(".")?;
+    // Every ref this moves carries a reflog line, and git writes those with an
+    // identity it synthesizes from the OS when `user.*` is unset — only a
+    // `commit` with nothing determinable is refused. Without this a bare runner,
+    // a container or a `sudo` shell cannot switch branches at all, and a
+    // recursive submodule walk aborts on the first one it reaches.
+    let mut repo = gix::discover(".")?;
+    crate::ensure_reflog_identity(&mut repo);
     let state_dir = repo.common_dir();
     let apply_in_progress = state_dir.join("rebase-apply").is_dir();
     let merge_in_progress = state_dir.join("rebase-merge").is_dir();

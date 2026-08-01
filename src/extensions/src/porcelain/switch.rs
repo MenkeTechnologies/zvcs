@@ -325,7 +325,13 @@ pub fn switch(args: &[String]) -> Result<ExitCode> {
         return fatal("'--detach' cannot be used with '-b/-B/--orphan'");
     }
 
-    let repo = gix::discover(".")?;
+    // Every ref this moves carries a reflog line, and git writes those with an
+    // identity it synthesizes from the OS when `user.*` is unset — only a
+    // `commit` with nothing determinable is refused. Without this a bare runner,
+    // a container or a `sudo` shell cannot switch branches at all, and a
+    // recursive submodule walk aborts on the first one it reaches.
+    let mut repo = gix::discover(".")?;
+    crate::ensure_reflog_identity(&mut repo);
 
     // DWIM default: `--[no-]guess` on the CLI wins, else `checkout.guess`
     // (git's default is on).

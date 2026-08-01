@@ -492,7 +492,13 @@ pub fn branch(args: &[String]) -> Result<ExitCode> {
         o.colopts = super::column::DISABLED;
     }
 
-    let repo = gix::discover(".")?;
+    // Every ref this moves carries a reflog line, and git writes those with an
+    // identity it synthesizes from the OS when `user.*` is unset — only a
+    // `commit` with nothing determinable is refused. Without this a bare runner,
+    // a container or a `sudo` shell cannot switch branches at all, and a
+    // recursive submodule walk aborts on the first one it reaches.
+    let mut repo = gix::discover(".")?;
+    crate::ensure_reflog_identity(&mut repo);
 
     // `git_branch_config()` runs `color_parse()` on every `color.branch.<slot>`
     // it recognizes while configuration is being read, so an unparseable spec is

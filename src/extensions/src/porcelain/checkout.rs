@@ -88,7 +88,13 @@ use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
 use gix::refs::{FullName, Target};
 
 pub fn checkout(args: &[String]) -> Result<ExitCode> {
-    let repo = gix::discover(".")?;
+    // Every ref this moves carries a reflog line, and git writes those with an
+    // identity it synthesizes from the OS when `user.*` is unset — only a
+    // `commit` with nothing determinable is refused. Without this a bare runner,
+    // a container or a `sudo` shell cannot switch branches at all, and a
+    // recursive submodule walk aborts on the first one it reaches.
+    let mut repo = gix::discover(".")?;
+    crate::ensure_reflog_identity(&mut repo);
 
     // `cmd_checkout()` special-cases the exact command line `git checkout -b
     // <branch>` — argv checked literally, so `-B` and any extra option fall out

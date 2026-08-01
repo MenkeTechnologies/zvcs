@@ -102,7 +102,13 @@ pub fn update_ref(args: &[String]) -> Result<ExitCode> {
         return fatal(anyhow!("Refusing to perform update with empty message."));
     }
 
-    let repo = gix::discover(".")?;
+    // Every ref this moves carries a reflog line, and git writes those with an
+    // identity it synthesizes from the OS when `user.*` is unset — only a
+    // `commit` with nothing determinable is refused. Without this a bare runner,
+    // a container or a `sudo` shell cannot switch branches at all, and a
+    // recursive submodule walk aborts on the first one it reaches.
+    let mut repo = gix::discover(".")?;
+    crate::ensure_reflog_identity(&mut repo);
     let deref = !opts.no_deref;
 
     if opts.read_stdin {

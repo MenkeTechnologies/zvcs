@@ -74,6 +74,14 @@ impl Fixture {
         c
     }
 
+    /// The same, with `EMAIL` cleared: the machine this runs on may export one,
+    /// and git reads it ahead of the auto-detected address.
+    fn cmd_no_email(&self, dir: &Path, args: &[&str]) -> Command {
+        let mut c = self.cmd(dir, args);
+        c.env_remove("EMAIL");
+        c
+    }
+
     fn git(&self, dir: &Path, args: &[&str]) {
         let out = self.cmd(dir, args).output().unwrap();
         assert!(out.status.success(), "setup `git {args:?}` failed: {out:?}");
@@ -188,5 +196,89 @@ fn a_submodule_walk_populates_every_submodule() {
             "lib/{name} was left unpopulated — the walk stopped early:\n{err}"
         );
         assert_eq!(std::fs::read_to_string(&file).unwrap(), format!("{name}\n"));
+    }
+}
+
+/// `EMAIL` is git's fallback for the address (`git_default_email()`), ahead of
+/// the one built from the account and host — so a machine that exports it can
+/// commit with no `user.email` at all, and the identity that lands is that
+/// address with the account's full name from the passwd gecos field.
+#[test]
+fn the_email_environment_variable_is_used_when_config_has_none() {
+    let f = Fixture::new("emailenv");
+    f.identity(false);
+    // A tracked file, so `-a` has something to stage.
+    std::fs::write(f.repo.join("a.txt"), "a\nmore\n").unwrap();
+
+    let out = f
+        .cmd(&f.repo, &["commit", "-q", "-a", "-m", "x"])
+        .env("EMAIL", "someone@example.org")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "commit failed: {}", String::from_utf8_lossy(&out.stderr));
+
+    let (_, who, _) = f.run(&["log", "-1", "--format=%ae|%ce"]);
+    assert_eq!(who.trim(), "someone@example.org|someone@example.org", "identity: {who}");
+}
+
+/// With no address anywhere, git refuses the commands that write an object —
+/// the auto-detected `<user>@<host>` on a machine with no domain is not an
+/// address it will sign work with — while the ones that only move a ref carry
+/// on using it for their reflog.
+#[test]
+fn an_undetectable_address_refuses_object_writes_but_not_ref_moves() {
+    let f = Fixture::new("noaddr");
+    f.identity(false);
+    std::fs::write(f.repo.join("b.txt"), "b\n").unwrap();
+    let add = f.cmd_no_email(&f.repo, &["add", "b.txt"]).output().unwrap();
+    assert!(add.status.success(), "add failed: {}", String::from_utf8_lossy(&add.stderr));
+
+    let out = f.cmd_no_email(&f.repo, &["commit", "-m", "x"]).output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    // A host with a domain *can* auto-detect, and there the commit is allowed —
+    // assert the contract, not the machine.
+    if out.status.success() {
+        return;
+    }
+    assert_eq!(out.status.code(), Some(128), "wrong exit: {err}");
+    assert!(err.starts_with("Author identity unknown\n"), "stderr: {err}");
+    assert!(
+        err.contains("fatal: unable to auto-detect email address (got '"),
+        "the refusal must name the address it rejected: {err}"
+    );
+
+    // The ref move is unaffected: its reflog takes the same address.
+    let out = f.cmd_no_email(&f.repo, &["branch", "reflogged"]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "a ref move must not need a signable address: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// `user.useConfigOnly` turns the fallbacks off — including `EMAIL` — and names
+/// the half that is missing, with the address reported ahead of the name.
+#[test]
+fn use_config_only_refuses_and_names_the_missing_half() {
+    let f = Fixture::new("useconfigonly");
+
+    for (config, missing) in [
+        ("[user]\n\tuseConfigOnly = true\n", "email"),
+        ("[user]\n\tname = t\n\tuseConfigOnly = true\n", "email"),
+        ("[user]\n\temail = t@e.co\n\tuseConfigOnly = true\n", "name"),
+    ] {
+        std::fs::write(f.root.join("gitconfig"), config).unwrap();
+        // `EMAIL` is exported on this machine and must not satisfy the check.
+        let out = f
+            .cmd(&f.repo, &["commit", "--allow-empty", "-m", "x"])
+            .env("EMAIL", "someone@example.org")
+            .output()
+            .unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(128), "config {config:?}: {err}");
+        assert!(
+            err.contains(&format!("fatal: no {missing} was given and auto-detection is disabled")),
+            "config {config:?} must report the missing {missing}: {err}"
+        );
     }
 }

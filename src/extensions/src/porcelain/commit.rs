@@ -883,7 +883,13 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     }
 
     // --- repository + serialized read-modify-write -----------------------
-    let repo = gix::discover(".")?;
+    // The object this writes carries an identity, and git fills the halves
+    // the user did not give rather than refusing — except under
+    // `user.useConfigOnly`, which is the one case it says so.
+    let mut repo = gix::discover(".")?;
+    if let Some(code) = crate::ensure_object_identity(&mut repo, "Author") {
+        return Ok(code);
+    }
     // Serialize tree build + commit + HEAD update through the repo coordinator so
     // concurrent zvcs writers queue instead of racing. Held across the whole op —
     // except that `-p`/`--interactive` must run the selector *outside* the lane,

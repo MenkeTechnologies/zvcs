@@ -422,17 +422,175 @@ pub fn ensure_reflog_identity(repo: &mut gix::Repository) {
     if repo.committer().is_some() {
         return;
     }
-    let user = std::env::var("USER")
+    let name = auto_name();
+    // `git_default_email()`: the `EMAIL` environment variable outranks the
+    // address built from the account and host, and is what most machines that
+    // have no `user.email` actually go by.
+    let email = std::env::var("EMAIL")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| auto_email(&name.login).0);
+    let mut cfg = repo.config_snapshot_mut();
+    let _ = cfg.set_value(&gix::config::tree::User::NAME, name.display.as_str());
+    let _ = cfg.set_value(&gix::config::tree::User::EMAIL, email.as_str());
+    // Rebuilds the cached personas so the injected identity takes effect.
+    let _ = cfg.commit();
+}
+
+/// The account's login and display names, as `ident.c` reads them: the passwd
+/// gecos field up to its first comma is the name git shows, and the login name
+/// is what the auto address is built from.
+struct AutoName {
+    login: String,
+    display: String,
+}
+
+fn auto_name() -> AutoName {
+    let login = std::env::var("USER")
         .or_else(|_| std::env::var("LOGNAME"))
         .ok()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "unknown".to_string());
-    let email = format!("{user}@{}", hostname().unwrap_or_else(|| "localhost".to_string()));
-    let mut cfg = repo.config_snapshot_mut();
-    let _ = cfg.set_value(&gix::config::tree::User::NAME, user.as_str());
-    let _ = cfg.set_value(&gix::config::tree::User::EMAIL, email.as_str());
-    // Rebuilds the cached personas so the injected identity takes effect.
-    let _ = cfg.commit();
+    let display = gecos().unwrap_or_else(|| login.clone());
+    AutoName { login, display }
+}
+
+/// The passwd gecos field for this uid, truncated at the first comma — the
+/// "Full Name" part git uses (`copy_gecos()`).
+fn gecos() -> Option<String> {
+    // SAFETY: `getpwuid` returns a pointer into a static buffer owned by libc,
+    // read before any other call can overwrite it.
+    let pw = unsafe { libc::getpwuid(libc::getuid()) };
+    if pw.is_null() {
+        return None;
+    }
+    let raw = unsafe { (*pw).pw_gecos };
+    if raw.is_null() {
+        return None;
+    }
+    let text = unsafe { std::ffi::CStr::from_ptr(raw) }.to_str().ok()?;
+    let name = text.split(',').next().unwrap_or("").trim();
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+/// `<login>@<domain>` the way `add_domainname()` builds it, and whether git
+/// considers the result bogus.
+///
+/// A hostname that already carries a domain is used as-is; otherwise the
+/// canonical name from the resolver is tried; when neither yields a domain git
+/// appends `.(none)` and marks the address as *not* auto-detected — which is
+/// what makes a `commit` on a domain-less machine refuse while its reflogs are
+/// written with that same address.
+fn auto_email(login: &str) -> (String, bool) {
+    let host = hostname().unwrap_or_else(|| "(none)".to_string());
+    if host.contains('.') {
+        return (format!("{login}@{host}"), false);
+    }
+    match canonical_hostname(&host) {
+        Some(fqdn) if fqdn.contains('.') => (format!("{login}@{fqdn}"), false),
+        _ => (format!("{login}@{host}.(none)"), true),
+    }
+}
+
+/// The resolver's canonical name for `host` (`getaddrinfo` with `AI_CANONNAME`),
+/// which is how git finds a domain for a short hostname.
+fn canonical_hostname(host: &str) -> Option<String> {
+    let c_host = std::ffi::CString::new(host).ok()?;
+    let hints = libc::addrinfo {
+        ai_flags: libc::AI_CANONNAME,
+        ai_family: libc::AF_UNSPEC,
+        ai_socktype: 0,
+        ai_protocol: 0,
+        ai_addrlen: 0,
+        ai_canonname: std::ptr::null_mut(),
+        ai_addr: std::ptr::null_mut(),
+        ai_next: std::ptr::null_mut(),
+    };
+    let mut res: *mut libc::addrinfo = std::ptr::null_mut();
+    // SAFETY: `c_host` outlives the call, `hints` is fully initialized, and the
+    // list `res` points at is freed before returning.
+    let rc = unsafe { libc::getaddrinfo(c_host.as_ptr(), std::ptr::null(), &hints, &mut res) };
+    if rc != 0 || res.is_null() {
+        return None;
+    }
+    let canon = unsafe { (*res).ai_canonname };
+    let out = if canon.is_null() {
+        None
+    } else {
+        unsafe { std::ffi::CStr::from_ptr(canon) }.to_str().ok().map(str::to_string)
+    };
+    unsafe { libc::freeaddrinfo(res) };
+    out
+}
+
+/// git's identity rules for a command that writes a **commit or tag object**.
+///
+/// `fmt_ident()` fills each half the user did not give — the name from the
+/// system account, the email from `<user>@<host>` — and only refuses when
+/// `user.useConfigOnly` turns that auto-detection off. The refusal is a block of
+/// advice and `fatal: no <field> was given and auto-detection is disabled`,
+/// exit 128, with the missing *email* reported ahead of a missing name.
+///
+/// `role` is the word git heads the block with: `Author` for the commit-shaped
+/// commands (`commit`, `notes`, `commit-tree`) and `Committer` for `tag`.
+/// Commands that write an object *without* the strict check — `git stash` makes
+/// a commit under `user.useConfigOnly` just fine — want
+/// [`ensure_reflog_identity`] instead.
+///
+/// Returns the exit code to hand back when git would refuse; `None` means the
+/// identity is settled and the caller proceeds.
+pub fn ensure_object_identity(repo: &mut gix::Repository, role: &str) -> Option<std::process::ExitCode> {
+    let env_set = |key: &str| std::env::var_os(key).is_some_and(|v| !v.is_empty());
+    let cfg = repo.config_snapshot();
+    let cfg_set = |key: &str| cfg.string(key).is_some_and(|v| !v.is_empty());
+    let upper = role.to_uppercase();
+    // git reads `GIT_<ROLE>_NAME`/`_EMAIL` ahead of the config, and `EMAIL` as a
+    // last resort for the address alone.
+    let name = env_set(&format!("GIT_{upper}_NAME")) || cfg_set("user.name");
+    // `EMAIL` is a fallback, not a setting: `user.useConfigOnly` refuses over a
+    // missing `user.email` even on a machine that exports one.
+    let email_configured = env_set(&format!("GIT_{upper}_EMAIL")) || cfg_set("user.email");
+    let email = email_configured || env_set("EMAIL");
+    let use_config_only = cfg.boolean("user.useConfigOnly").unwrap_or(false);
+    drop(cfg);
+
+    if name && email_configured {
+        return None;
+    }
+    if use_config_only {
+        let missing = if !email_configured { "email" } else { "name" };
+        identity_advice(role);
+        eprintln!("fatal: no {missing} was given and auto-detection is disabled");
+        return Some(std::process::ExitCode::from(128));
+    }
+    if name && email {
+        return None;
+    }
+    // The address git would auto-detect, and whether it counts as detected at
+    // all: on a machine whose hostname carries no domain it does not, and that
+    // is what a strict command refuses over.
+    let auto = auto_name();
+    let (auto_addr, bogus) = auto_email(&auto.login);
+    if !email && bogus {
+        identity_advice(role);
+        eprintln!("fatal: unable to auto-detect email address (got '{auto_addr}')");
+        return Some(std::process::ExitCode::from(128));
+    }
+    ensure_reflog_identity(repo);
+    None
+}
+
+/// The block `fmt_ident()` prints before it gives up, verbatim.
+fn identity_advice(role: &str) {
+    eprintln!(
+        "{role} identity unknown\n\n\
+         *** Please tell me who you are.\n\n\
+         Run\n\n\
+         \x20 git config --global user.email \"you@example.com\"\n\
+         \x20 git config --global user.name \"Your Name\"\n\n\
+         to set your account's default identity.\n\
+         Omit --global to set the identity only in this repository.\n"
+    );
 }
 
 /// The machine's hostname (`gethostname`), for the synthesized reflog identity.

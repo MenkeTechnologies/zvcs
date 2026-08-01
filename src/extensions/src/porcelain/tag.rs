@@ -407,7 +407,13 @@ pub fn tag(args: &[String]) -> Result<ExitCode> {
         colopts = super::column::DISABLED;
     }
 
-    let repo = gix::discover(".")?;
+    // The object this writes carries an identity, and git fills the halves
+    // the user did not give rather than refusing — except under
+    // `user.useConfigOnly`, which is the one case it says so.
+    let mut repo = gix::discover(".")?;
+    if let Some(code) = crate::ensure_object_identity(&mut repo, "Committer") {
+        return Ok(code);
+    }
 
     if delete {
         return delete_tags(&repo, &positionals);

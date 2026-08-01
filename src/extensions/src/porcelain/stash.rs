@@ -264,7 +264,10 @@ pub fn stash(args: &[String]) -> Result<ExitCode> {
         }
     }
 
-    let repo = gix::discover(".")?;
+    // `git stash` writes commits, but not under the strict identity check —
+    // it saves fine with `user.useConfigOnly` set and nothing configured.
+    let mut repo = gix::discover(".")?;
+    crate::ensure_reflog_identity(&mut repo);
 
     match args.first().map(String::as_str) {
         None => {

@@ -1805,10 +1805,41 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     });
     let stats = platform.stats(&new_tree)?;
 
+    // A gitlink has no blob to diff, so the tree-diff stats above score it zero —
+    // but git renders a submodule as the one-line `Subproject commit <oid>`, making
+    // a pointer move one insertion plus one deletion, a new submodule one insertion
+    // and a removed one, one deletion.
+    let mut ins = stats.lines_added;
+    let mut del = stats.lines_removed;
+    let is_gitlink = |m: &EntryMode| m.kind() == gix::object::tree::EntryKind::Commit;
+    for (path, mode, id) in &new_entries {
+        match old_entries.get(path) {
+            None => {
+                if is_gitlink(mode) {
+                    ins += 1;
+                }
+            }
+            Some((old_mode, old_id)) => {
+                if old_id == id && old_mode == mode {
+                    continue;
+                }
+                if is_gitlink(mode) {
+                    ins += 1;
+                }
+                if is_gitlink(old_mode) {
+                    del += 1;
+                }
+            }
+        }
+    }
+    for (path, (mode, _)) in &old_entries {
+        if !new_paths.contains(path) && is_gitlink(mode) {
+            del += 1;
+        }
+    }
+
     // git prints the diff block only when something actually changed.
     if files_changed > 0 {
-        let ins = stats.lines_added;
-        let del = stats.lines_removed;
         let mut line = format!(" {files_changed} file{} changed", plural(files_changed));
         // git shows the insertion clause unless there are only deletions, and the
         // deletion clause unless there are only insertions.
@@ -2497,6 +2528,11 @@ impl StagedSet {
 /// A pathspec matches a path when the path equals it or lives under `<spec>/`;
 /// literal files and directory prefixes are supported, as are the worktree globs
 /// the dirwalk resolves. Blob hashing and mode detection mirror `git add`.
+///
+/// A matched path whose worktree entry is a *directory* is a submodule gitlink and
+/// is staged as mode 160000 from that submodule's checked-out HEAD, which is what
+/// git's `add_to_index()` does for `S_ISDIR` via `index_path()`'s
+/// `resolve_gitlink_ref()`.
 fn stage_pathspecs(
     repo: &gix::Repository,
     pathspecs: &[String],
@@ -2573,6 +2609,48 @@ fn stage_pathspecs(
         None => anyhow::bail!("directory walk did not complete"),
     };
 
+    // --- submodule gitlinks: record the submodule's checked-out HEAD (mode 160000)
+    // The walk above yields only blobs and symlinks — a submodule worktree comes out
+    // as `Kind::Repository` and is dropped there — so a gitlink would never reach the
+    // partial commit's tree, and `git commit -- <submodule>` silently committed
+    // nothing. git's `add_remove_files()` lstats every path `list_paths()` matched and
+    // hands a directory to `add_to_index()`, which stores the submodule's HEAD
+    // (`index_path()` → `resolve_gitlink_ref()`), *not* the value already staged in the
+    // index. Driving this off `known` — the index overlaid with HEAD for `--only`, the
+    // index alone for `-i` — is exactly the set `list_paths()` yields.
+    //
+    // A directory git cannot resolve a HEAD for (an uninitialized submodule, a plain
+    // directory) is not an error: `ce_compare_gitlink()` reports an unresolvable
+    // gitlink as unchanged, so the entry is left alone — neither restaged here nor
+    // treated as a deletion below, since the directory does exist.
+    for path in known {
+        if staged_set.contains(path) || !pathspec.is_included(path.as_bstr(), Some(false)) {
+            continue;
+        }
+        let Some(abs) = repo.workdir_path(path.as_bstr()) else {
+            continue;
+        };
+        let Ok(md) = gix::index::fs::Metadata::from_path_no_follow(&abs) else {
+            continue; // vanished — the deletion pass below owns this path
+        };
+        if !md.is_dir() {
+            continue;
+        }
+        let Some(id) = gix::open(&abs)
+            .ok()
+            .and_then(|sub| sub.head_id().ok().map(|h| h.detach()))
+        else {
+            continue;
+        };
+        staged_set.insert(path.clone());
+        staged.push(StagedFile {
+            path: path.clone(),
+            id,
+            mode: Mode::COMMIT,
+            stat: Stat::from_fs(&md).unwrap_or_default(),
+        });
+    }
+
     // Deletions: tracked paths matched by the pathspec whose worktree file is gone.
     let mut deletions: Vec<BString> = Vec::new();
     for path in tracked.keys() {
@@ -2615,9 +2693,11 @@ fn stage_pathspecs(
 /// `git commit -a`, which is `git add -u` over the whole worktree.
 ///
 /// Only stage-0 entries participate: conflicted stages are left for the caller's
-/// unmerged-files check to reject, and submodule gitlinks are never re-read from
-/// the worktree here. Untracked files are deliberately not added, which is the
-/// whole distinction between `-a` and `git add -A`.
+/// unmerged-files check to reject. Submodule gitlinks move to the submodule's
+/// checked-out HEAD, which is what git's `-a` does (`add_files_to_cache()` diffs
+/// with `ignore_submodule_ignore_config`, so a moved pointer shows up as modified
+/// and `add_file_to_index()` re-resolves it). Untracked files are deliberately not
+/// added, which is the whole distinction between `-a` and `git add -A`.
 ///
 /// Content filters (`autocrlf`, `clean`/`smudge`) are not applied, matching the
 /// same deviation `git add` carries in this port.
@@ -2635,10 +2715,10 @@ fn stage_tracked_changes(repo: &gix::Repository) -> Result<()> {
     Ok(())
 }
 
-/// The `-a`/`--all` scan itself: every stage-0, non-gitlink index entry whose
-/// worktree content or mode moved, plus the tracked paths that vanished.
-/// Split out from [`stage_tracked_changes`] so `--dry-run -a` can build the
-/// prepared index without writing it.
+/// The `-a`/`--all` scan itself: every stage-0 index entry whose worktree content,
+/// mode or (for a gitlink) submodule HEAD moved, plus the tracked paths that
+/// vanished. Split out from [`stage_tracked_changes`] so `--dry-run -a` can build
+/// the prepared index without writing it.
 fn collect_tracked_changes(
     repo: &gix::Repository,
     index: &gix::index::File,
@@ -2652,21 +2732,39 @@ fn collect_tracked_changes(
     {
         let backing = index.path_backing();
         for e in index.entries() {
-            if e.stage() != Stage::Unconflicted || e.mode == Mode::COMMIT {
+            if e.stage() != Stage::Unconflicted {
                 continue;
             }
             let path = e.path_in(backing).to_owned();
             let Some(abs) = repo.workdir_path(&path) else {
                 continue;
             };
-            // A vanished (or unreadable) tracked path stages as a deletion.
+            // A vanished (or unreadable) tracked path stages as a deletion — a
+            // submodule whose whole worktree is gone included.
             let Ok(md) = gix::index::fs::Metadata::from_path_no_follow(&abs) else {
                 deletions.push(path);
                 continue;
             };
-            // A tracked file replaced by a directory is not stageable content;
-            // leave the index entry untouched rather than guessing.
+            // A directory is a submodule: stage its checked-out HEAD as the gitlink.
+            // One that has no resolvable HEAD (uninitialized submodule, or a tracked
+            // file replaced by a plain directory) is left untouched, matching
+            // `ce_compare_gitlink()`'s "unresolvable reads as unchanged".
             if md.is_dir() {
+                let Some(id) = gix::open(&abs)
+                    .ok()
+                    .and_then(|sub| sub.head_id().ok().map(|h| h.detach()))
+                else {
+                    continue;
+                };
+                if id == e.id && e.mode == Mode::COMMIT {
+                    continue;
+                }
+                staged.push(StagedFile {
+                    path,
+                    id,
+                    mode: Mode::COMMIT,
+                    stat: Stat::from_fs(&md).unwrap_or_default(),
+                });
                 continue;
             }
 

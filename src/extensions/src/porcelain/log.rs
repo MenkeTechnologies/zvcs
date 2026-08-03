@@ -124,7 +124,7 @@ pub(crate) fn parse_decoration_style(value: &str) -> Option<DecorateStyle> {
 ///   * `git log [<rev>...]`                      → history from `HEAD`, a revision, or the
 ///     union of several revisions
 ///   * `-- <pathspec>...`                        → path-limited traversal: show only commits
-///     that touched a matching plain pathspec (magic pathspecs surfaced terse)
+///     that touched a matching pathspec, magic (`:(exclude)`, `:(glob)`, …) included
 ///   * `-n N` / `--max-count=N` / `-N` / `-nN`   → limit the number of commits shown
 ///   * `--skip=N`                                → drop the first N selected commits
 ///   * `--all`                                   → start from every ref plus `HEAD`
@@ -1120,12 +1120,14 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
         // rename, switch to the name it came from. A commit is shown exactly when
         // the followed path changed in it.
         let mut current: gix::bstr::BString = pathspecs[0].clone().into();
+        // The followed path is the whole pathspec set here, so the matcher is
+        // rebuilt only when a rename moves it — not once per commit.
+        let mut matcher = PathspecMatcher::new(&repo, std::slice::from_ref(&pathspecs[0]))?;
         let mut shown: Vec<Node> = Vec::new();
         for node in std::mem::take(&mut nodes) {
             let commit = repo.find_object(node.id)?.try_into_commit()?;
             let parent = node.parents.first().copied();
-            let spec = vec![current.to_string()];
-            let changed = changes_match(&repo, &commit, parent, &spec)?;
+            let changed = changes_match(&repo, &commit, parent, &mut matcher)?;
             if changed {
                 let mut node = node;
                 node.follow_path = Some(current.clone());
@@ -1136,11 +1138,13 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
             if let Some(parent) = parent {
                 if let Some(src) = follow_source(&repo, &commit, parent, &current)? {
                     current = src;
+                    matcher = PathspecMatcher::new(&repo, &[current.to_string()])?;
                 }
             }
         }
         nodes = shown;
     } else if !pathspecs.is_empty() {
+        let mut matcher = PathspecMatcher::new(&repo, &pathspecs)?;
         // id → (parents the simplified history follows, whether it is shown).
         let mut simplified: HashMap<ObjectId, (Vec<ObjectId>, bool)> =
             HashMap::with_capacity(nodes.len());
@@ -1156,13 +1160,13 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
             if parents.is_empty() {
                 // A root commit is compared against the empty tree, so it shows
                 // exactly when it introduced a matching path.
-                let shown = changes_match(&repo, &commit, None, &pathspecs)?;
+                let shown = changes_match(&repo, &commit, None, &mut matcher)?;
                 simplified.insert(node.id, (Vec::new(), shown));
                 continue;
             }
             let mut treesame: Option<ObjectId> = None;
             for p in parents {
-                if !changes_match(&repo, &commit, Some(*p), &pathspecs)? {
+                if !changes_match(&repo, &commit, Some(*p), &mut matcher)? {
                     treesame = Some(*p);
                     break;
                 }
@@ -1530,6 +1534,13 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
         pretty: &pretty,
         notes: &notes_trees,
     });
+    // The pathspec set the name/stat formats are limited to, parsed once rather
+    // than per commit. `--follow` replaces it per commit (see below).
+    let mut path_limit = if pathspecs.is_empty() {
+        None
+    } else {
+        Some(PathspecMatcher::new(&repo, &pathspecs)?)
+    };
     for (ni, node) in nodes.iter().enumerate() {
         if walk_only {
             let Pretty::User(fmt) = &pretty else { unreachable!() };
@@ -1617,25 +1628,12 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
                 // `-- <pathspec>` limits what the name/stat formats report, not
                 // just which commits reach them.
                 // `--follow` limits each commit by the name the file had there.
-                let limit: Vec<String> = match &node.follow_path {
-                    Some(path) => vec![path.to_string()],
-                    None => pathspecs.clone(),
+                let mut followed = match &node.follow_path {
+                    Some(path) => Some(PathspecMatcher::new(&repo, &[path.to_string()])?),
+                    None => None,
                 };
-                if !limit.is_empty() {
-                    let mut kept = Vec::with_capacity(files.len());
-                    for f in files {
-                        let mut hit = false;
-                        for spec in &limit {
-                            if pathspec_matches(spec, &f.path)? {
-                                hit = true;
-                                break;
-                            }
-                        }
-                        if hit {
-                            kept.push(f);
-                        }
-                    }
-                    files = kept;
+                if let Some(m) = followed.as_mut().or(path_limit.as_mut()) {
+                    files.retain(|f| m.matches(&f.path));
                 }
                 // A merge under a combined mode reports the *combined* pair list
                 // here, with one status letter per parent — `show_raw_diff()` on a
@@ -4812,49 +4810,54 @@ fn changes_match(
     repo: &gix::Repository,
     commit: &gix::Commit<'_>,
     parent: Option<ObjectId>,
-    pathspecs: &[String],
+    specs: &mut PathspecMatcher,
 ) -> Result<bool> {
     let files = collect_changes(repo, commit, parent, false)?;
-    for f in &files {
-        for spec in pathspecs {
-            if pathspec_matches(spec, &f.path)? {
-                return Ok(true);
-            }
-        }
-    }
-    Ok(false)
+    Ok(files.iter().any(|f| specs.matches(&f.path)))
 }
 
-/// Does a plain git pathspec match a repo-relative path? Matches git's default
-/// (non-magic) rules: an exact path, a leading directory (`src` matches
-/// `src/lib.rs`), or a wildcard matched by git's `wildmatch.c` (flags=0) — `*`/`?`
-/// span the whole path and `[…]` bracket expressions (ranges, `!`/`^` negation,
-/// POSIX `[:class:]`) are honored. Magic pathspecs (`:(glob)`, `:!exclude`, …)
-/// are surfaced terse rather than matched wrong.
-pub(crate) fn pathspec_matches(spec: &str, path: &[u8]) -> Result<bool> {
-    if spec.starts_with(':') {
-        bail!("magic pathspecs are not ported");
+/// A parsed `-- <pathspec>...` set, matched by git's real pathspec engine.
+///
+/// Built once per spec list and then asked about one path at a time. A set is not
+/// the same thing as a list of independent patterns, which is why this is a type
+/// and not a `matches(spec, path)` function: `:(exclude)`/`:!` *subtracts* from
+/// what the positive specs select, and a set of nothing but exclusions selects
+/// everything they do not name — neither is expressible as "does any one spec
+/// match". The rest of the magic grammar (`:(glob)`, `:(icase)`, `:(literal)`,
+/// `:(top)`, `:(attr:…)`) comes along with it.
+///
+/// This is `repo.pathspec()`, the same engine `add`, `grep`, `rm`, `ls-files`,
+/// `stage` and `status` match with, so a pathspec means one thing across the whole
+/// binary. Specs are resolved against the repository prefix, so they are relative
+/// to the current directory exactly as git's are.
+pub(crate) struct PathspecMatcher {
+    inner: gix::PathspecDetached,
+}
+
+impl PathspecMatcher {
+    /// Parse `specs` for `repo`. Callers skip matching altogether for an empty
+    /// list — git treats "no pathspec" as "no limiting", not as a set that matches
+    /// nothing — so this is only ever handed a non-empty one.
+    pub(crate) fn new<S: AsRef<[u8]>>(repo: &gix::Repository, specs: &[S]) -> Result<Self> {
+        // `IdMapping` reads `.gitattributes` from the index, and is only consulted
+        // at all when a spec carries `:(attr:…)`.
+        let index = repo.index_or_empty()?;
+        let inner = repo
+            .pathspec(
+                true,
+                specs.iter().map(|s| gix::bstr::BStr::new(s.as_ref())),
+                false,
+                &index,
+                gix::worktree::stack::state::attributes::Source::IdMapping,
+            )?
+            .detach()?;
+        Ok(Self { inner })
     }
-    let spec = spec.strip_prefix("./").unwrap_or(spec);
-    let spec = spec.trim_end_matches('/');
-    if spec.is_empty() || spec == "." {
-        return Ok(true);
+
+    /// Is this repo-relative file path in the set?
+    pub(crate) fn matches(&mut self, path: &[u8]) -> bool {
+        self.inner.is_included(path.as_bstr(), Some(false))
     }
-    let sb = spec.as_bytes();
-    if path == sb {
-        return Ok(true);
-    }
-    // Leading-directory match: the path lives under the pathspec directory.
-    if path.len() > sb.len() && path.starts_with(sb) && path[sb.len()] == b'/' {
-        return Ok(true);
-    }
-    // A `*`, `?`, or `[` makes this a wildcard pathspec (git's `is_glob_special`
-    // set), matched by `wildmatch` below. `[` covers bracket expressions and POSIX
-    // classes.
-    if spec.bytes().any(|b| b == b'*' || b == b'?' || b == b'[') {
-        return Ok(wildmatch(sb, path));
-    }
-    Ok(false)
 }
 
 /// Glob match for a plain (non-magic) pathspec, delegating to the faithful
@@ -6148,8 +6151,26 @@ mod tests {
     // real repository with git 2.55.0: a bracket pathspec is a wildcard pathspec,
     // so it never gets the literal leading-directory shortcut, and its `[…]`
     // expression follows git's `wildmatch.c:dowild` (flags=0) rules.
+
+    /// A throwaway repository for the matcher to take its defaults from. Nothing
+    /// here reads the worktree or the index — the specs are matched against the
+    /// paths given, not against anything on disk — but a pathspec is always parsed
+    /// in the context of a repository, so there has to be one.
+    fn scratch_repo() -> gix::Repository {
+        static ROOT: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+        let root = ROOT.get_or_init(|| {
+            let dir = std::env::temp_dir().join(format!("zvcs-pathspec-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("scratch dir");
+            gix::init(&dir).expect("init scratch repo");
+            dir
+        });
+        gix::open(root).expect("open scratch repo")
+    }
+
     fn m(spec: &str, path: &[u8]) -> bool {
-        pathspec_matches(spec, path).unwrap()
+        let repo = scratch_repo();
+        PathspecMatcher::new(&repo, &[spec]).expect("parse pathspec").matches(path)
     }
 
     #[test]
@@ -6200,9 +6221,36 @@ mod tests {
     }
 
     #[test]
-    fn magic_pathspec_still_surfaced_as_floor() {
-        // Magic pathspecs remain unported (an honest error, never a wrong match).
-        assert!(pathspec_matches(":(glob)foo", b"foo").is_err());
-        assert!(pathspec_matches(":!foo", b"foo").is_err());
+    fn magic_pathspecs_are_matched_not_refused() {
+        // These used to `bail!("magic pathspecs are not ported")`, which took the
+        // whole command down. Each one is a real match now.
+        assert!(m(":(glob)foo", b"foo"));
+        assert!(m(":(literal)f[oi]le", b"f[oi]le"), ":(literal) turns off the wildcards");
+        assert!(!m(":(literal)f[oi]le", b"file"));
+        assert!(m(":(icase)README", b"readme"));
+        assert!(m(":(top)src", b"src/lib.rs"));
+        // `:(glob)` gives `*` pathname semantics, so it stops at a `/` where a
+        // plain wildcard pathspec would run straight through one.
+        assert!(!m(":(glob)builtin*log.c", b"builtin/log.c"));
+        assert!(m(":(glob)builtin/**/log.c", b"builtin/sub/log.c"));
+    }
+
+    /// An exclusion subtracts from the set rather than matching on its own, so it
+    /// cannot be modelled by asking each spec in turn — the whole set answers.
+    #[test]
+    fn exclusions_subtract_from_the_set() {
+        let repo = scratch_repo();
+        let mut set = |specs: &[&str], path: &[u8]| {
+            PathspecMatcher::new(&repo, specs).expect("parse pathspecs").matches(path)
+        };
+        // A lone exclusion selects everything it does not name.
+        assert!(set(&[":!docs"], b"src/lib.rs"));
+        assert!(!set(&[":!docs"], b"docs/guide.md"));
+        assert!(!set(&[":(exclude)docs"], b"docs/guide.md"));
+        // With a positive spec present, the exclusion carves out of it.
+        assert!(set(&["src", ":!src/gen"], b"src/lib.rs"));
+        assert!(!set(&["src", ":!src/gen"], b"src/gen/table.rs"));
+        // A path outside every positive spec is still not selected.
+        assert!(!set(&["src", ":!src/gen"], b"docs/guide.md"));
     }
 }

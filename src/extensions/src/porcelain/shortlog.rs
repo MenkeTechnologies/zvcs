@@ -52,7 +52,7 @@
 //!     malformed `-w` argument.
 //!
 //! Not covered — each `bail!`s rather than emitting output that would diverge:
-//! magic pathspecs (`:(glob)`, `:(icase)`, `:!exclude`), `--reflog`, `--simplify-merges`,
+//! `--reflog`, `--simplify-merges`,
 //! `--author-date-order`, `--bisect`, `--alternate-refs`, `--exclude-hidden`,
 //! and `--boundary` combined with
 //! `--skip`/`--max-count` (git appends boundary commits to the tail of the
@@ -765,10 +765,13 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
         if filters.boundary && (filters.skip != 0 || filters.max_count.is_some()) {
             bail!("`--boundary` combined with `--skip`/`--max-count` is not ported");
         }
-        // Only plain paths are ported; a magic pathspec would need real matching.
-        if pathspecs.iter().any(|p| p.first() == Some(&b':')) {
-            bail!("magic pathspecs are not ported");
-        }
+        // The pathspec set, parsed once for the whole walk by the shared engine —
+        // magic (`:(exclude)`, `:(glob)`, `:(icase)`, …) included.
+        let mut specs = if pathspecs.is_empty() {
+            None
+        } else {
+            Some(super::log::PathspecMatcher::new(repo, &pathspecs)?)
+        };
 
         let items = walk(repo, &tips, &hidden, &filters)?;
         let items = if filters.ancestry_path {
@@ -792,16 +795,10 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
             // Path limit: a commit is shown only if its diff against a parent
             // touched a matching path (git's TREESAME test). Runs before
             // `--skip`/`--max-count`, which count only commits actually shown.
-            if !pathspecs.is_empty()
-                && !commit_touches_path(
-                    repo,
-                    item.id,
-                    &item.parents,
-                    filters.first_parent,
-                    &pathspecs,
-                )?
-            {
-                continue;
+            if let Some(specs) = specs.as_mut() {
+                if !commit_touches_path(repo, item.id, &item.parents, filters.first_parent, specs)? {
+                    continue;
+                }
             }
             kept.push(item.id);
         }
@@ -1891,18 +1888,18 @@ fn commit_touches_path(
     commit: ObjectId,
     parents: &[ObjectId],
     first_parent: bool,
-    pathspecs: &[Vec<u8>],
+    specs: &mut super::log::PathspecMatcher,
 ) -> Result<bool> {
     let Some(tree) = commit_tree(repo, commit) else {
         return Ok(false);
     };
     if parents.is_empty() {
-        return diff_touches_path(repo, None, tree, pathspecs);
+        return diff_touches_path(repo, None, tree, specs);
     }
     let considered = if first_parent { &parents[..1] } else { parents };
     for parent in considered {
         let parent_tree = commit_tree(repo, *parent);
-        if !diff_touches_path(repo, parent_tree, tree, pathspecs)? {
+        if !diff_touches_path(repo, parent_tree, tree, specs)? {
             // TREESAME to this parent → not shown under default simplification.
             return Ok(false);
         }
@@ -1911,13 +1908,13 @@ fn commit_touches_path(
 }
 
 /// Whether the diff turning `old_tree` (empty when `None`) into `new_tree` touches
-/// any of `pathspecs`. Rename tracking is off so a rename shows as a deletion and
+/// the pathspec set. Rename tracking is off so a rename shows as a deletion and
 /// an addition, letting either endpoint's path match.
 fn diff_touches_path(
     repo: &gix::Repository,
     old_tree: Option<ObjectId>,
     new_tree: ObjectId,
-    pathspecs: &[Vec<u8>],
+    specs: &mut super::log::PathspecMatcher,
 ) -> Result<bool> {
     let Some(new) = tree_object(repo, new_tree) else {
         return Ok(false);
@@ -1938,7 +1935,7 @@ fn diff_touches_path(
     // "fatal: The delegate cancelled the operation", so the break is swallowed and
     // only a genuine diff error propagates.
     let outcome = platform.for_each_to_obtain_tree(&new, |change| {
-        if path_matches(change.location(), pathspecs) {
+        if specs.matches(change.location()) {
             matched = true;
             Ok::<_, std::convert::Infallible>(std::ops::ControlFlow::Break(()))
         } else {
@@ -1951,18 +1948,6 @@ fn diff_touches_path(
         Err(e) => return Err(anyhow!("{e}")),
     }
     Ok(matched)
-}
-
-/// git's plain (non-magic) pathspec match: a pathspec matches a path when it is
-/// equal to it or is a leading directory prefix ending at a component boundary,
-/// so `dir` matches `dir/file` but `fil` does not match `file`.
-fn path_matches(path: &[u8], pathspecs: &[Vec<u8>]) -> bool {
-    pathspecs.iter().any(|spec| {
-        let spec = spec.strip_suffix(b"/").unwrap_or(spec);
-        spec.is_empty()
-            || path == spec
-            || (path.len() > spec.len() && path.starts_with(spec) && path[spec.len()] == b'/')
-    })
 }
 
 /// The tree id of a commit object, or `None` if it is missing or not a commit.

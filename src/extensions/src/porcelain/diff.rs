@@ -977,12 +977,6 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
         return Ok(usage_error());
     }
 
-    for p in &paths {
-        if p.starts_with(':') || p.bytes().any(|b| matches!(b, b'*' | b'?' | b'[')) {
-            bail!("magic/glob pathspecs are not supported, got {p:?}");
-        }
-    }
-
     // Three or more revisions request a dense combined ("--cc") diff of the first
     // revision against the rest, exactly like `builtin_diff_combined()`.
     if !cached && revs.len() >= 3 {
@@ -1039,7 +1033,8 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     // For tree/index sources, apply literal pathspec filtering here (the worktree
     // iterators already filtered via `patterns`).
     if !worktree_mode && !paths.is_empty() {
-        deltas.retain(|d| paths.iter().any(|p| path_matches(&d.path, p)));
+        let mut specs = super::log::PathspecMatcher::new(&repo, &paths)?;
+        deltas.retain(|d| specs.matches(&d.path));
     }
 
     // `--relative[=<path>]` narrows the change list to what lives under the
@@ -1408,13 +1403,21 @@ fn add_unmodified_pairs(
         .filter(|d| d.old.is_some())
         .map(|d| d.path.clone())
         .collect();
+    // The same pathspec filtering the change list went through. Worktree sources
+    // were already limited by the dirwalk, which matches pathspecs itself.
+    let mut specs = if worktree_mode || paths.is_empty() {
+        None
+    } else {
+        Some(super::log::PathspecMatcher::new(repo, paths)?)
+    };
     let mut add = |path: BString, id: ObjectId, kind: EntryKind| {
         if seen.contains(&path) {
             return;
         }
-        // Honor the same literal pathspec filtering the change list went through.
-        if !worktree_mode && !paths.is_empty() && !paths.iter().any(|p| path_matches(&path, p)) {
-            return;
+        if let Some(specs) = specs.as_mut() {
+            if !specs.matches(&path) {
+                return;
+            }
         }
         deltas.push(Delta::plain(path, Some((id, kind)), NewSide::Blob(id, kind)));
     };
@@ -2264,7 +2267,7 @@ pub(crate) fn commit_patch(
 ) -> Result<Vec<u8>> {
     let mut cache = repo.diff_resource_cache_for_tree_diff()?;
     let r = patch_render(repo);
-    commit_patch_with(repo, &mut cache, &r, commit.id, parent, ctx, &[])
+    commit_patch_with(repo, &mut cache, &r, commit.id, parent, ctx, None)
 }
 
 /// The render settings `log -p`/`show` use for a patch body. Resolved once per
@@ -2305,12 +2308,23 @@ pub(crate) fn commit_patches(
     // Four commits per worker: below that the handle clones cost more than the
     // split saves, and a short `log -p -n 3` should not spawn anything.
     let workers = crate::threads::count(jobs.len(), 4);
+    // The pathspec set is parsed once per worker, never per commit.
+    let matcher = |repo: &gix::Repository| -> Result<Option<super::log::PathspecMatcher>> {
+        if paths.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(super::log::PathspecMatcher::new(repo, paths)?))
+    };
+
     if workers <= 1 {
         let mut cache = repo.diff_resource_cache_for_tree_diff()?;
         let r = patch_render(repo);
+        let mut specs = matcher(repo)?;
         return jobs
             .iter()
-            .map(|(id, parent)| commit_patch_with(repo, &mut cache, &r, *id, *parent, ctx, paths))
+            .map(|(id, parent)| {
+                commit_patch_with(repo, &mut cache, &r, *id, *parent, ctx, specs.as_mut())
+            })
             .collect();
     }
 
@@ -2322,15 +2336,20 @@ pub(crate) fn commit_patches(
         for _ in 0..workers {
             let proto = repo.clone();
             let cursor = &cursor;
+            let matcher = &matcher;
             handles.push(scope.spawn(move || -> Result<Vec<(usize, Vec<u8>)>> {
                 let repo = proto;
                 let mut cache = repo.diff_resource_cache_for_tree_diff()?;
                 let r = patch_render(&repo);
+                let mut specs = matcher(&repo)?;
                 let mut mine = Vec::new();
                 loop {
                     let i = cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let Some((id, parent)) = jobs.get(i) else { break };
-                    mine.push((i, commit_patch_with(&repo, &mut cache, &r, *id, *parent, ctx, paths)?));
+                    mine.push((
+                        i,
+                        commit_patch_with(&repo, &mut cache, &r, *id, *parent, ctx, specs.as_mut())?,
+                    ));
                 }
                 Ok(mine)
             }));
@@ -2368,7 +2387,7 @@ fn commit_patch_with(
     commit_id: ObjectId,
     parent: Option<ObjectId>,
     ctx: u32,
-    paths: &[String],
+    specs: Option<&mut super::log::PathspecMatcher>,
 ) -> Result<Vec<u8>> {
     let commit = repo.find_object(commit_id)?.try_into_commit()?;
     let new_tree = commit.tree()?;
@@ -2390,21 +2409,8 @@ fn commit_patch_with(
     // deltas, so the secondary key is inert here but kept for parity with `diff()`.
     // `-- <pathspec>`: git limits the patch to the paths it was asked about, the
     // same list that decided which commits are shown.
-    if !paths.is_empty() {
-        let mut kept = Vec::with_capacity(deltas.len());
-        for delta in deltas {
-            let mut hit = false;
-            for spec in paths {
-                if super::log::pathspec_matches(spec, &delta.path)? {
-                    hit = true;
-                    break;
-                }
-            }
-            if hit {
-                kept.push(delta);
-            }
-        }
-        deltas = kept;
+    if let Some(specs) = specs {
+        deltas.retain(|delta| specs.matches(&delta.path));
     }
     deltas.sort_by(|a, b| a.path.cmp(&b.path).then(b.unmerged.cmp(&a.unmerged)));
 
@@ -2502,13 +2508,6 @@ fn cwd_prefix(repo: &gix::Repository) -> String {
         Ok(rel) => format!("{}/", rel.to_string_lossy()),
         Err(_) => String::new(),
     }
-}
-
-/// `true` if `path` equals `pat` or lives under the directory `pat`.
-fn path_matches(path: &BString, pat: &str) -> bool {
-    let pat = pat.trim_end_matches('/').as_bytes();
-    let path = path.as_slice();
-    path == pat || (path.len() > pat.len() && path.starts_with(pat) && path[pat.len()] == b'/')
 }
 
 // ---------------------------------------------------------------------------
@@ -4357,7 +4356,8 @@ pub(crate) fn merge_combined_names(
         }
     }
     if !paths.is_empty() {
-        cand.retain(|p| paths.iter().any(|x| path_matches(p, x)));
+        let mut specs = super::log::PathspecMatcher::new(repo, paths)?;
+        cand.retain(|p| specs.matches(p));
     }
 
     let mut out = Vec::new();
@@ -4443,7 +4443,8 @@ pub(crate) fn combined_trees_patch_headed(
         }
     }
     if !paths.is_empty() {
-        cand.retain(|p| paths.iter().any(|x| path_matches(p, x)));
+        let mut specs = super::log::PathspecMatcher::new(repo, paths)?;
+        cand.retain(|p| specs.matches(p));
     }
 
     let null = repo.object_hash().null();

@@ -593,12 +593,8 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
     }
 
     // A pathspec limits both which commits appear and which file sections each
-    // rendered patch carries. Plain paths are matched here; a magic pathspec
-    // this port does not implement stops rather than filter differently.
-    let matcher = match build_matcher(&pathspec) {
-        Ok(m) => m,
-        Err(reason) => bail!("{reason}"),
-    };
+    // rendered patch carries.
+    let matcher = build_matcher(&repo, &pathspec)?;
 
 
     let mailmap = repo.open_mailmap();
@@ -1032,47 +1028,16 @@ fn stray_operand(repo: &gix::Repository, range: &str, token: &str) -> ExitCode {
     }
 }
 
-/// A plain-path pathspec limiter. `git`'s pathspec grammar is far larger, but
-/// the corpus only ever produces plain paths and directory prefixes here; any
-/// magic (`:(glob)`, `:!exclude`, …) or wildcard is refused up front by
-/// [`build_matcher`] rather than matched with subtly different semantics.
-struct PathMatcher {
-    paths: Vec<Vec<u8>>,
-}
+/// The pathspec limiter, shared with every other verb.
+type PathMatcher = super::log::PathspecMatcher;
 
-impl PathMatcher {
-    /// A change path matches when it equals a pathspec exactly or lies under it
-    /// as a directory prefix, which is git's plain-path containment rule.
-    fn matches(&self, path: &[u8]) -> bool {
-        self.paths.iter().any(|p| {
-            path == p.as_slice()
-                || (path.len() > p.len() && path[p.len()] == b'/' && path.starts_with(p))
-        })
+/// Build the pathspec limiter, or `None` when there is nothing to limit — an
+/// empty spec, or no spec at all, means every commit and every file section.
+fn build_matcher(repo: &gix::Repository, pathspec: &[String]) -> Result<Option<PathMatcher>> {
+    if pathspec.is_empty() || pathspec.iter().any(String::is_empty) {
+        return Ok(None);
     }
-}
-
-/// Build the pathspec limiter, or `None` when there is nothing to limit. A
-/// pathspec this port does not implement is refused with a terse reason so the
-/// run stops rather than filter with different semantics.
-fn build_matcher(pathspec: &[String]) -> Result<Option<PathMatcher>, String> {
-    let mut paths: Vec<Vec<u8>> = Vec::new();
-    for spec in pathspec {
-        if spec.is_empty() {
-            // An empty pathspec matches everything, i.e. no limiting.
-            return Ok(None);
-        }
-        if spec.starts_with(':') {
-            return Err(format!("magic pathspec is not supported: {spec:?}"));
-        }
-        if spec.bytes().any(|b| matches!(b, b'*' | b'?' | b'[' | b'\\')) {
-            return Err(format!("wildcard pathspec is not supported: {spec:?}"));
-        }
-        // A trailing slash on a directory pathspec is not part of the stored
-        // path prefix; git treats `src/` and `src` alike.
-        let trimmed = spec.strip_suffix('/').unwrap_or(spec.as_str());
-        paths.push(trimmed.as_bytes().to_vec());
-    }
-    Ok((!paths.is_empty()).then_some(PathMatcher { paths }))
+    Ok(Some(PathMatcher::new(repo, pathspec)?))
 }
 
 fn resolve_commit(repo: &gix::Repository, spec: &str) -> Result<ObjectId> {

@@ -584,24 +584,11 @@ fn parse_limit_date(value: &str) -> i64 {
 
 /// git pathspec match: an entry survives when at least one of its changed paths (a
 /// destination, or a rename/copy source) equals a pathspec or lies under it.
-fn pathspec_matches(changes: &[FileChange], specs: &[Vec<u8>]) -> bool {
+fn pathspec_matches(changes: &[FileChange], specs: &mut super::log::PathspecMatcher) -> bool {
     changes.iter().any(|change| {
-        specs.iter().any(|spec| {
-            spec_covers(spec, &change.path)
-                || change.source.as_deref().is_some_and(|s| spec_covers(spec, s))
-        })
+        specs.matches(&change.path)
+            || change.source.as_deref().is_some_and(|s| specs.matches(s))
     })
-}
-
-/// One pathspec against one path: an empty spec matches everything, otherwise the
-/// path must equal the spec or sit in the subtree the spec names.
-fn spec_covers(spec: &[u8], path: &[u8]) -> bool {
-    let spec = spec.strip_suffix(b"/").unwrap_or(spec);
-    if spec.is_empty() {
-        return true;
-    }
-    path == spec
-        || (path.len() > spec.len() && path.starts_with(spec) && path[spec.len()] == b'/')
 }
 
 /// The refs that decorate each commit, resolved once for a `--decorate` run.
@@ -1108,6 +1095,12 @@ fn render(
     let mut diff_cache = (opts.diff.any() || !opts.pathspecs.is_empty())
         .then(|| repo.diff_resource_cache_for_tree_diff().ok())
         .flatten();
+    // The `--` pathspec set, parsed once for the whole listing.
+    let mut path_specs = if opts.pathspecs.is_empty() {
+        None
+    } else {
+        Some(super::log::PathspecMatcher::new(repo, &opts.pathspecs)?)
+    };
     // The ref-set that decorates each entry's commit, resolved once. `--decorate`
     // fixes the mode; a `%d`/`%D` in a user format needs decorations too and, with
     // no `--decorate`, git defaults it to the short form.
@@ -1155,9 +1148,11 @@ fn render(
                 Some(cache) => collect_changes(repo, entry.oid, cache, opts.first_parent),
                 None => Vec::new(),
             };
-            // Pathspecs keep only entries whose diff touches one of them.
-            if !opts.pathspecs.is_empty() && !pathspec_matches(&changes, &opts.pathspecs) {
-                continue;
+            // Pathspecs keep only entries whose diff touches the set.
+            if let Some(specs) = path_specs.as_mut() {
+                if !pathspec_matches(&changes, specs) {
+                    continue;
+                }
             }
             if skipped < opts.skip {
                 skipped += 1;
@@ -1211,8 +1206,11 @@ fn render(
                         // emitted whenever the diff queue is non-empty — even when
                         // the selected format renders none of those changes. With a
                         // stat *and* a patch, git's `log --stat -p` layout puts
-                        // `---` there instead.
-                        if !changes.is_empty() {
+                        // `---` there instead. The separator belongs to the diff, so
+                        // it needs a diff format to have been asked for: a pathspec
+                        // alone builds the change list to filter with and prints no
+                        // diff, and so no blank line either.
+                        if opts.diff.any() && !changes.is_empty() {
                             if opts.diff.stat && opts.diff.wants_patch() {
                                 out.extend_from_slice(b"---\n");
                             } else {

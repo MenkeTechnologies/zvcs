@@ -153,8 +153,8 @@ struct ObjectWalk<'a> {
     filter: Option<Filter>,
     missing: Missing,
     /// The `--` pathspecs, which restrict the listed trees and blobs the same
-    /// way they restrict the commits. Empty means every object is listed.
-    pathspecs: &'a [Vec<u8>],
+    /// way they restrict the commits. `None` means every object is listed.
+    pathspecs: Option<&'a super::log::PathspecMatcher>,
 }
 
 /// `git rev-list` — list commit ids reachable from the given revisions.
@@ -652,13 +652,12 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     // `--children` map that follow.
     let mut treesame: HashSet<ObjectId> = HashSet::new();
     if !pathspecs.is_empty() {
-        if pathspecs.iter().any(|p| p.first() == Some(&b':')) {
-            return Ok(fatal("magic pathspecs are not supported"));
-        }
+        let mut specs = super::log::PathspecMatcher::new(&repo, &pathspecs)?;
         let mut simplified: Vec<(ObjectId, Vec<ObjectId>)> = Vec::new();
         for id in &commits {
             let parents = parents_of.get(id).map(Vec::as_slice).unwrap_or(&[]);
-            let same = treesame_parent(&repo, *id, parents, first_parent, &pathspecs, &parents_of)?;
+            let same =
+                treesame_parent(&repo, *id, parents, first_parent, &mut specs, &parents_of)?;
             match same {
                 None => {}
                 Some(parent) => {
@@ -808,10 +807,15 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
 
     // Objects reachable from an excluded (`^rev`) commit are pre-marked as seen
     // so they never appear, which is how git keeps `a..b --objects` to b's data.
+    let object_specs = if pathspecs.is_empty() {
+        None
+    } else {
+        Some(super::log::PathspecMatcher::new(&repo, &pathspecs)?)
+    };
     let walk = ObjectWalk {
         filter,
         missing,
-        pathspecs: &pathspecs,
+        pathspecs: object_specs.as_ref(),
     };
     let mut absent: Vec<ObjectId> = Vec::new();
     let mut seen: HashSet<ObjectId> = HashSet::new();
@@ -1830,14 +1834,14 @@ fn treesame_parent(
     commit: ObjectId,
     parents: &[ObjectId],
     first_parent: bool,
-    pathspecs: &[Vec<u8>],
+    specs: &mut super::log::PathspecMatcher,
     walked: &HashMap<ObjectId, Vec<ObjectId>>,
 ) -> Result<Option<Option<ObjectId>>> {
     let Some(tree) = commit_tree(repo, commit) else {
         return Ok(Some(None));
     };
     if parents.is_empty() {
-        return Ok(match diff_touches_path(repo, None, tree, pathspecs)? {
+        return Ok(match diff_touches_path(repo, None, tree, specs)? {
             true => None,
             false => Some(None),
         });
@@ -1846,7 +1850,7 @@ fn treesame_parent(
     let mut same: Option<Option<ObjectId>> = None;
     for parent in considered {
         let parent_tree = commit_tree(repo, *parent);
-        if diff_touches_path(repo, parent_tree, tree, pathspecs)? {
+        if diff_touches_path(repo, parent_tree, tree, specs)? {
             continue;
         }
         // A parent outside the walk is UNINTERESTING, and `relevant_commit`
@@ -1866,7 +1870,7 @@ fn diff_touches_path(
     repo: &gix::Repository,
     old_tree: Option<ObjectId>,
     new_tree: ObjectId,
-    pathspecs: &[Vec<u8>],
+    specs: &mut super::log::PathspecMatcher,
 ) -> Result<bool> {
     let Some(new) = tree_object(repo, new_tree) else {
         return Ok(false);
@@ -1875,43 +1879,19 @@ fn diff_touches_path(
         .and_then(|id| tree_object(repo, id))
         .unwrap_or_else(|| repo.empty_tree());
 
-    let mut platform = old.changes().map_err(|e| anyhow!("{e}"))?;
-    platform.options(|o| {
-        o.track_path();
-        o.track_rewrites(None);
-    });
-    let mut matched = false;
-    // `ControlFlow::Break` is how the diff machinery is told to stop early, and it
-    // reports that back as `Error::Cancelled` — a *deliberate* stop, not a failure.
-    // Treating it as one turned every matching pathspec into
-    // "fatal: The delegate cancelled the operation", so the break is swallowed and
-    // only a genuine diff error propagates.
-    let outcome = platform.for_each_to_obtain_tree(&new, |change| {
-        if path_matches(change.location(), pathspecs) {
-            matched = true;
-            Ok::<_, std::convert::Infallible>(std::ops::ControlFlow::Break(()))
-        } else {
-            Ok(std::ops::ControlFlow::Continue(()))
-        }
-    });
-    match outcome {
-        Ok(_) => {}
-        Err(_) if matched => {}
-        Err(e) => return Err(anyhow!("{e}")),
-    }
-    Ok(matched)
-}
+    // The diff has to be RECURSIVE for the pathspec to see real file paths: a
+    // tree-level walk reports `src` where the change is `src/gen/table.rs`, and
+    // `:(exclude)src/gen` then fails to exclude anything, because `src` itself is
+    // not what the spec names. `diff_tree_to_tree` is the same file-granular diff
+    // `log` decides TREESAME with, so the two can never disagree.
+    let changes = repo
+        .diff_tree_to_tree(Some(&old), Some(&new), gix::diff::Options::default())
+        .map_err(|e| anyhow!("{e}"))?;
 
-/// git's plain (non-magic) pathspec match: a pathspec matches a path when it is
-/// equal to it or is a leading directory prefix ending at a component boundary,
-/// so `dir` matches `dir/file` but `fil` does not match `file`.
-fn path_matches(path: &[u8], pathspecs: &[Vec<u8>]) -> bool {
-    pathspecs.iter().any(|spec| {
-        let spec = spec.strip_suffix(b"/").unwrap_or(spec);
-        spec.is_empty()
-            || path == spec
-            || (path.len() > spec.len() && path.starts_with(spec) && path[spec.len()] == b'/')
-    })
+    Ok(changes
+        .iter()
+        .filter(|c| !super::log::change_is_tree(c))
+        .any(|c| specs.matches(super::log::change_path(c))))
 }
 
 /// The entries of a tree object, or `None` if it is missing or not a tree.
@@ -2026,20 +2006,20 @@ fn note_missing(id: ObjectId, absent: &mut Vec<ObjectId>, missing: Missing) -> O
     }
 }
 
-/// git's `tree_entry_interesting` for plain pathspecs: an entry is listed when a
-/// pathspec names it or an ancestor of it, and a tree is also listed when a
-/// pathspec lives underneath it, because the walk has to descend to reach it.
-fn entry_interesting(path: &[u8], is_tree: bool, pathspecs: &[Vec<u8>]) -> bool {
-    if pathspecs.is_empty() {
-        return true;
+/// git's `tree_entry_interesting`: an entry is listed when a pathspec names it or
+/// an ancestor of it, and a tree is also listed when a pathspec could match
+/// something underneath it, because the walk has to descend to reach that.
+fn entry_interesting(
+    path: &[u8],
+    is_tree: bool,
+    specs: Option<&super::log::PathspecMatcher>,
+) -> bool {
+    let Some(specs) = specs else { return true };
+    if is_tree {
+        specs.may_contain_match(path)
+    } else {
+        specs.matches(path)
     }
-    pathspecs.iter().any(|spec| {
-        let spec = spec.strip_suffix(b"/").unwrap_or(spec);
-        if spec.is_empty() || path_matches(path, std::slice::from_ref(&spec.to_vec())) {
-            return true;
-        }
-        is_tree && spec.len() > path.len() && spec.starts_with(path) && spec[path.len()] == b'/'
-    })
 }
 
 /// Whether `--filter=` omits this blob. Reading its header is also the missing

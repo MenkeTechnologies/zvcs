@@ -1033,7 +1033,7 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     // For tree/index sources, apply literal pathspec filtering here (the worktree
     // iterators already filtered via `patterns`).
     if !worktree_mode && !paths.is_empty() {
-        let mut specs = super::log::PathspecMatcher::new(&repo, &paths)?;
+        let specs = super::log::PathspecMatcher::new(&repo, &paths)?;
         deltas.retain(|d| specs.matches(&d.path));
     }
 
@@ -4356,7 +4356,7 @@ pub(crate) fn merge_combined_names(
         }
     }
     if !paths.is_empty() {
-        let mut specs = super::log::PathspecMatcher::new(repo, paths)?;
+        let specs = super::log::PathspecMatcher::new(repo, paths)?;
         cand.retain(|p| specs.matches(p));
     }
 
@@ -4443,7 +4443,7 @@ pub(crate) fn combined_trees_patch_headed(
         }
     }
     if !paths.is_empty() {
-        let mut specs = super::log::PathspecMatcher::new(repo, paths)?;
+        let specs = super::log::PathspecMatcher::new(repo, paths)?;
         cand.retain(|p| specs.matches(p));
     }
 

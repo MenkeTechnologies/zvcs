@@ -124,6 +124,68 @@ fn diff_and_shortlog_honor_magic_pathspecs() {
     assert_eq!(count("*.md"), "1");
 }
 
+/// The rest of the pathspec-taking family, which ran its own matchers: `rev-list`
+/// and `fast-export` refused magic outright, `show` and `reflog` silently dropped
+/// their output, `diff-tree` refused magic *and* wildcards, and `restore` reported
+/// `did not match any file(s) known to git`.
+#[test]
+fn the_rest_of_the_family_honors_magic_pathspecs() {
+    let (repo, home) = fixture("family");
+    let one = |args: &[&str]| -> Vec<String> { out(&repo, &home, args) };
+
+    // rev-list counts commits, so a wrong pathspec shows up as a wrong number.
+    assert_eq!(one(&["rev-list", "--count", "HEAD", "--", ":!web"]), ["3"]);
+    assert_eq!(one(&["rev-list", "--count", "HEAD", "--", "*.rs"]), ["2"]);
+    assert_eq!(one(&["rev-list", "--count", "HEAD", "--", ":(glob)src/**"]), ["2"]);
+
+    // show prints the commit and then its file list; the list used to vanish.
+    assert_eq!(
+        one(&["show", "--name-only", "--format=%s", "HEAD~2", "--", ":!web"]),
+        ["c2", "", "src/gen/table.rs"]
+    );
+    assert_eq!(
+        one(&["show", "--name-only", "--format=%s", "HEAD~2", "--", "*.rs"]),
+        ["c2", "", "src/gen/table.rs"]
+    );
+
+    assert_eq!(one(&["reflog", "show", "--format=%s", "HEAD", "--", ":!web"]), ["c4", "c2", "c1"]);
+    assert_eq!(one(&["reflog", "show", "--format=%s", "HEAD", "--", "*.rs"]), ["c2", "c1"]);
+
+    assert_eq!(
+        one(&["diff-tree", "-r", "--name-only", "HEAD~3", "HEAD", "--", ":!web"]),
+        ["README", "src/gen/table.rs"]
+    );
+    assert_eq!(
+        one(&["diff-tree", "-r", "--name-only", "HEAD~3", "HEAD", "--", "*.rs"]),
+        ["src/gen/table.rs"]
+    );
+
+    // These two only have to stop refusing; both print nothing for this history.
+    assert!(one(&["restore", "--source=HEAD", "--staged", "--", ":!web"]).is_empty());
+    assert!(!one(&["fast-export", "--no-data", "HEAD", "--", ":!web"]).is_empty());
+}
+
+/// A recursive tree diff reports the containing directories alongside the files
+/// in them, and a directory is not what a pathspec names. Handing `src` to
+/// `:(exclude)src/gen` says "not excluded", which kept every commit whose only
+/// real change lived under `src/gen` — a nested exclusion that quietly did
+/// nothing while a top-level one worked.
+#[test]
+fn a_nested_exclusion_is_decided_on_files_not_directories() {
+    let (repo, home) = fixture("nested");
+    let count = |spec: &str| -> String {
+        out(&repo, &home, &["rev-list", "--count", "HEAD", "--", spec]).remove(0)
+    };
+    // c2 is the only commit under src/gen, so excluding it must drop exactly one.
+    assert_eq!(count(":!src/gen"), "3");
+    assert_eq!(count(":(exclude)src/gen"), "3");
+    // The top-level case that used to work by accident still does.
+    assert_eq!(count(":!web"), "3");
+    // shortlog decides the same way and must agree.
+    let tally = out(&repo, &home, &["shortlog", "-s", "HEAD", "--", ":!src/gen"]);
+    assert_eq!(tally.first().map(|l| l.split_whitespace().next().unwrap_or("")), Some("3"));
+}
+
 #[test]
 fn pathspecs_are_relative_to_the_current_directory() {
     let (repo, home) = fixture("prefix");
@@ -144,4 +206,15 @@ fn pathspecs_are_relative_to_the_current_directory() {
     assert_eq!(out(&src, &home, &["log", "--format=%s", "--", ":(top)web"]), ["c3"]);
     // An exclusion is resolved against the same prefix.
     assert_eq!(out(&src, &home, &["log", "--format=%s", "--", ":!gen"]), ["c4", "c3", "c1"]);
+    assert_eq!(out(&src, &home, &["rev-list", "--count", "HEAD", "--", ":!gen"]), ["3"]);
+
+    // `restore` resolves its specs to repo-root-relative paths before matching, so
+    // the engine must not apply the prefix a second time — that matched nothing at
+    // all and reported every spec as unknown.
+    let r = run(&src, &home, &["restore", "--source=HEAD", "--staged", "--", "gen"]);
+    assert!(
+        r.status.success(),
+        "restore from a subdirectory must accept a relative spec: {}",
+        String::from_utf8_lossy(&r.stderr)
+    );
 }

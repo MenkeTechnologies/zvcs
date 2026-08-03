@@ -4830,8 +4830,14 @@ fn changes_match(
 /// `stage` and `status` match with, so a pathspec means one thing across the whole
 /// binary. Specs are resolved against the repository prefix, so they are relative
 /// to the current directory exactly as git's are.
+///
+/// Matching takes `&self`: gix wants `&mut` for the attribute stack a `:(attr:…)`
+/// spec consults, but a pathspec set is logically a predicate, and half the callers
+/// ask from inside a `retain`/`remove_entries` closure that cannot hold a mutable
+/// borrow. The cell keeps that detail here instead of spreading it over every one
+/// of them.
 pub(crate) struct PathspecMatcher {
-    inner: gix::PathspecDetached,
+    inner: std::cell::RefCell<gix::PathspecDetached>,
 }
 
 impl PathspecMatcher {
@@ -4851,12 +4857,46 @@ impl PathspecMatcher {
                 gix::worktree::stack::state::attributes::Source::IdMapping,
             )?
             .detach()?;
-        Ok(Self { inner })
+        Ok(Self { inner: std::cell::RefCell::new(inner) })
     }
 
     /// Is this repo-relative file path in the set?
-    pub(crate) fn matches(&mut self, path: &[u8]) -> bool {
-        self.inner.is_included(path.as_bstr(), Some(false))
+    pub(crate) fn matches(&self, path: &[u8]) -> bool {
+        self.inner.borrow_mut().is_included(path.as_bstr(), Some(false))
+    }
+
+    /// Is this repo-relative *directory* itself selected, or could something under
+    /// it be? This is git's `tree_entry_interesting()` for a tree entry: a walk has
+    /// to descend into `src` to reach `src/gen/table.rs`, and `ls-tree` without
+    /// `-r` reports the tree itself for a spec that lives below it. A wildcard has
+    /// no literal prefix to test, so `can_match_relative_path` answers on the
+    /// shortest shared prefix and errs towards descending.
+    pub(crate) fn may_contain_match(&self, dir: &[u8]) -> bool {
+        let mut inner = self.inner.borrow_mut();
+        inner.is_included(dir.as_bstr(), Some(true))
+            || inner.search.can_match_relative_path(dir.as_bstr(), Some(true))
+    }
+
+    /// Should this directory be *reported* as an entry in its own right?
+    ///
+    /// Narrower than [`Self::may_contain_match`], which answers "is it worth
+    /// descending". git reports a tree for a spec that names it, and for one that
+    /// points at a literal path inside it — `diff-tree -- d1/sub` without `-r`
+    /// still lists `d1`. A wildcard names no such path, so `-- '*.rs'` lists no
+    /// trees at all even though the walk has to descend through them.
+    pub(crate) fn selects_dir(&self, dir: &[u8]) -> bool {
+        if self.inner.borrow_mut().is_included(dir.as_bstr(), Some(true)) {
+            return true;
+        }
+        let inner = self.inner.borrow();
+        let named_below = inner.search.patterns().any(|p| {
+            let path = p.path();
+            !p.is_excluded()
+                && path.len() > dir.len()
+                && path.starts_with(dir)
+                && path[dir.len()] == b'/'
+        });
+        named_below
     }
 }
 
@@ -5208,7 +5248,24 @@ fn type_class(kind: EntryKind) -> u8 {
 }
 
 /// The path of a change, for stable diff ordering.
-fn change_path(change: &ChangeDetached) -> &[u8] {
+/// Is this change a *directory* entry rather than a file?
+///
+/// A recursive tree diff reports each containing directory alongside the files
+/// inside it. Every pathspec test in git is file-granular, so a directory must
+/// never be offered to one: under `:(exclude)src/gen` the parent `src` is not
+/// excluded, and a commit whose only real change is `src/gen/table.rs` would be
+/// kept on the strength of the `src` entry alone. [`prepare_change`] drops these
+/// for the same reason.
+pub(crate) fn change_is_tree(change: &ChangeDetached) -> bool {
+    match change {
+        ChangeDetached::Addition { entry_mode, .. }
+        | ChangeDetached::Deletion { entry_mode, .. }
+        | ChangeDetached::Modification { entry_mode, .. }
+        | ChangeDetached::Rewrite { entry_mode, .. } => entry_mode.is_tree(),
+    }
+}
+
+pub(crate) fn change_path(change: &ChangeDetached) -> &[u8] {
     match change {
         ChangeDetached::Addition { location, .. }
         | ChangeDetached::Deletion { location, .. }

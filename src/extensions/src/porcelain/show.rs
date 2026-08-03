@@ -1160,7 +1160,8 @@ fn show_commit(
     } else if diff_shown {
         let mut f = collect_changes(repo, commit, parents.first().map(|p| p.detach()))?;
         if !pathspecs.is_empty() {
-            f.retain(|c| matches_pathspec(&c.path, pathspecs));
+            let specs = super::log::PathspecMatcher::new(repo, pathspecs)?;
+            f.retain(|c| specs.matches(&c.path));
         }
         if pickaxe_path {
             // Keep only files whose own change text matches, testing each file's
@@ -1402,17 +1403,6 @@ fn show_commit(
 /// git limits a commit's diff to paths matching the pathspecs after `--`. Without
 /// pathspec magic (`:(glob)`, `:!`, …), a pathspec matches a path when they are
 /// equal or the path lies under the pathspec directory. `.` matches everything.
-fn matches_pathspec(path: &[u8], pathspecs: &[Vec<u8>]) -> bool {
-    pathspecs.iter().any(|spec| {
-        let spec: &[u8] = spec.strip_suffix(b"/").unwrap_or(spec.as_slice());
-        if spec.is_empty() || spec == b"." {
-            return true;
-        }
-        path == spec
-            || (path.len() > spec.len() && path.starts_with(spec) && path[spec.len()] == b'/')
-    })
-}
-
 // ---------------------------------------------------------------------------
 // Change collection
 // ---------------------------------------------------------------------------

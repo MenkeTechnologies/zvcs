@@ -544,41 +544,10 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
     // fast-forward gate and NO commit (that is `git zbump`). An unchanged gitlink
     // stages nothing, matching git. `--refresh` returns before the write below, so
     // it still only refreshes stat and never records a pointer move.
-    {
-        let backing = index.path_backing();
-        for e in index.entries() {
-            if e.stage() != Stage::Unconflicted || e.mode != Mode::COMMIT {
-                continue; // only stage-0 gitlinks
-            }
-            let path = e.path_in(backing);
-            if !pathspec.is_included(path, Some(false)) || staged_set.contains(&path.to_owned()) {
-                continue;
-            }
-            // Resolve the submodule worktree's current HEAD commit. gix::open reads
-            // its `.git` gitfile, so this works whether or not the gitlink is also
-            // declared in .gitmodules (git add does not require it to be).
-            let Some(abs) = repo.workdir_path(path) else { continue };
-            let Some(new_id) = gix::open(&abs)
-                .ok()
-                .and_then(|sr| sr.head_id().ok().map(|h| h.detach()))
-            else {
-                continue; // uninitialized or unborn HEAD → nothing to stage
-            };
-            if new_id == e.id {
-                continue; // gitlink already at HEAD → git stages nothing
-            }
-            let stat = gix::index::fs::Metadata::from_path_no_follow(&abs)
-                .ok()
-                .and_then(|md| Stat::from_fs(&md).ok())
-                .unwrap_or_default();
-            staged.push(Staged {
-                path: path.to_owned(),
-                id: new_id,
-                mode: Mode::COMMIT,
-                stat,
-                was_tracked: true,
-            });
-        }
+    for (path, id, stat) in moved_gitlinks(&repo, &index, &staged_set, |p| {
+        pathspec.is_included(p, Some(false))
+    }) {
+        staged.push(Staged { path, id, mode: Mode::COMMIT, stat, was_tracked: true });
     }
     let staged_set: HashSet<BString> = staged.iter().map(|s| s.path.clone()).collect();
 
@@ -836,6 +805,60 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
             ignore_errors,
             dry_run,
         ))
+}
+
+/// Every stage-0 gitlink the pathspec selects whose submodule worktree sits at a
+/// commit other than the one recorded, as `(path, submodule HEAD, stat)`.
+///
+/// `git add <submodule>` records the submodule worktree's current HEAD as the
+/// parent gitlink (mode 160000). A worktree walk cannot serve this — a submodule
+/// directory comes out of it as `Kind::Repository`, which carries no stageable
+/// content — so this is driven off the index instead, which also keeps it
+/// independent of how any given walk treats a repository directory.
+///
+/// An unchanged gitlink yields nothing, exactly as git stages nothing for one, and
+/// a submodule whose worktree has no resolvable HEAD (uninitialized, or unborn) is
+/// left alone rather than guessed at. `skip` is the set of paths the caller has
+/// already staged.
+///
+/// Shared with the `stage` verb, which stock git implements as the very same
+/// `cmd_add` and which must therefore record the same pointer moves.
+pub(crate) fn moved_gitlinks(
+    repo: &gix::Repository,
+    index: &gix::index::File,
+    skip: &HashSet<BString>,
+    mut selected: impl FnMut(&gix::bstr::BStr) -> bool,
+) -> Vec<(BString, gix::ObjectId, Stat)> {
+    let backing = index.path_backing();
+    let mut out = Vec::new();
+    for e in index.entries() {
+        if e.stage() != Stage::Unconflicted || e.mode != Mode::COMMIT {
+            continue; // only stage-0 gitlinks
+        }
+        let path = e.path_in(backing);
+        if !selected(path) || skip.contains(&path.to_owned()) {
+            continue;
+        }
+        // Resolve the submodule worktree's current HEAD commit. gix::open reads
+        // its `.git` gitfile, so this works whether or not the gitlink is also
+        // declared in .gitmodules (git add does not require it to be).
+        let Some(abs) = repo.workdir_path(path) else { continue };
+        let Some(new_id) = gix::open(&abs)
+            .ok()
+            .and_then(|sr| sr.head_id().ok().map(|h| h.detach()))
+        else {
+            continue; // uninitialized or unborn HEAD → nothing to stage
+        };
+        if new_id == e.id {
+            continue; // gitlink already at HEAD → git stages nothing
+        }
+        let stat = gix::index::fs::Metadata::from_path_no_follow(&abs)
+            .ok()
+            .and_then(|md| Stat::from_fs(&md).ok())
+            .unwrap_or_default();
+        out.push((path.to_owned(), new_id, stat));
+    }
+    out
 }
 
 /// Record a `stage` event in the live feed (`git zevents`/`ztail`) after a

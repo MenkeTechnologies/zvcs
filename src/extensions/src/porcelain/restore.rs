@@ -44,14 +44,8 @@ use gix::refs::Target;
 /// True if `path` matches any of the (repo-root-relative, slash-separated)
 /// pathspecs. A spec matches its own exact path, or any path under it as a
 /// directory prefix. `match_all` (a `.` or empty spec) matches everything.
-fn path_matches(path: &BStr, match_all: bool, specs: &[Vec<u8>]) -> bool {
-    if match_all {
-        return true;
-    }
-    let p: &[u8] = path.as_ref();
-    specs.iter().any(|s| {
-        p == s.as_slice() || (p.len() > s.len() && &p[..s.len()] == s.as_slice() && p[s.len()] == b'/')
-    })
+fn path_matches(path: &BStr, match_all: bool, specs: &super::log::PathspecMatcher) -> bool {
+    match_all || specs.matches(path.as_ref())
 }
 
 /// Which unmerged stage a conflict-resolution flag selects.
@@ -527,7 +521,12 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
             }
         }
     }
-    let specs_bytes: Vec<Vec<u8>> = specs.iter().map(|(_, b)| b.clone()).collect();
+    // The pathspec set, parsed once by the shared engine — from the RAW specs, not
+    // the ones `resolve_spec` already made repo-root-relative: the engine applies
+    // the repository prefix itself, and feeding it resolved specs would apply it
+    // twice, so a spec given from a subdirectory would match nothing.
+    let raw_specs: Vec<String> = specs.iter().map(|(raw, _)| raw.clone()).collect();
+    let spec_set = super::log::PathspecMatcher::new(&repo, &raw_specs)?;
 
     // Serialize the whole read-modify-write through the repo coordinator so a
     // concurrent zvcs writer can't race `index.lock`. Held for the function.
@@ -584,7 +583,7 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
     // Matched unmerged paths (sorted for git-identical diagnostic ordering).
     let mut unmerged_matched: Vec<BString> = Vec::new();
     for (p, arr) in &stage_blobs {
-        if is_unmerged(arr) && path_matches(BStr::new(p), match_all, &specs_bytes) {
+        if is_unmerged(arr) && path_matches(BStr::new(p), match_all, &spec_set) {
             unmerged_matched.push(p.clone());
         }
     }
@@ -594,7 +593,8 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
     // union of source and index paths), mirroring git's pathspec error (exit 1).
     if !match_all {
         for (raw, spec) in &specs {
-            let single = [spec.clone()];
+            // Each spec is checked on its own: git names the one that matched nothing.
+            let single = super::log::PathspecMatcher::new(&repo, std::slice::from_ref(raw))?;
             let hit = source_map
                 .keys()
                 .chain(cur_paths.iter())
@@ -672,7 +672,7 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
     candidates.extend(source_map.keys());
     candidates.extend(cur_paths.iter());
     for path in candidates {
-        if !path_matches(BStr::new(path), match_all, &specs_bytes) {
+        if !path_matches(BStr::new(path), match_all, &spec_set) {
             continue;
         }
         match (source_map.get(path), cur_paths.contains(path)) {
@@ -731,7 +731,7 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
         // Subset of the source restricted to matched stage-0 entries, plus any
         // conflict-resolved entries; checked out over the existing worktree.
         let mut subset = source_index.clone();
-        subset.remove_entries(|_, p, e| e.stage_raw() != 0 || !path_matches(p, match_all, &specs_bytes));
+        subset.remove_entries(|_, p, e| e.stage_raw() != 0 || !path_matches(p, match_all, &spec_set));
         for (path, id, mode) in &resolved_entries {
             subset.dangerously_push_entry(Stat::default(), *id, Flags::empty(), *mode, BStr::new(path));
         }
@@ -792,7 +792,7 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
             if let Some(subs) = repo.submodules()? {
                 for sm in subs {
                     let sm_path = sm.path()?;
-                    if !path_matches(BStr::new(&sm_path), match_all, &specs_bytes) {
+                    if !path_matches(BStr::new(&sm_path), match_all, &spec_set) {
                         continue;
                     }
                     // Target commit = the gitlink recorded in the restore source.

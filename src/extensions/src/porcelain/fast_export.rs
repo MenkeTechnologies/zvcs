@@ -478,10 +478,9 @@ pub fn fast_export(args: &[String]) -> Result<ExitCode> {
         if *negated {
             return Ok(fatal_ambiguous(tok));
         }
-        if is_magic_or_glob(tok) {
-            bail!("magic pathspecs are not supported");
-        }
-        if is_worktree_path(&repo, tok) {
+        // A magic or wildcard pathspec names no worktree path of its own; it is a
+        // pathspec regardless, and the shared engine resolves it below.
+        if is_magic_or_glob(tok) || is_worktree_path(&repo, tok) {
             pathspecs.push(tok.clone());
         } else {
             return Ok(fatal_ambiguous(tok));
@@ -720,8 +719,8 @@ pub fn fast_export(args: &[String]) -> Result<ExitCode> {
     // parents, and every ref that pointed at a pruned commit, are then rewritten
     // to the nearest shown ancestor by following first parents through the pruned
     // (TREESAME) run — exactly `rewrite_one`.
-    let specs: Vec<Vec<u8>> = pathspecs.iter().map(|s| s.as_bytes().to_vec()).collect();
-    let filtering = !specs.is_empty();
+    let specs = super::log::PathspecMatcher::new(&repo, &pathspecs)?;
+    let filtering = !pathspecs.is_empty();
     let mut simpl: HashMap<ObjectId, Simpl> = HashMap::new();
     let mut emit_parents: HashMap<ObjectId, Vec<ObjectId>> = HashMap::new();
     if filtering {
@@ -816,7 +815,7 @@ pub fn fast_export(args: &[String]) -> Result<ExitCode> {
 
     for info in &order_list {
         let override_parents = emit_parents.get(&info.id).map(Vec::as_slice);
-        if let Some(f) = emit_commit(&repo, info, &opts, &sources, &mut st, &specs, override_parents)?
+        if let Some(f) = emit_commit(&repo, info, &opts, &sources, &mut st, filtering.then_some(&specs), override_parents)?
         {
             return Ok(die_midstream(&st.out, &f));
         }
@@ -1192,14 +1191,6 @@ fn is_worktree_path(repo: &gix::Repository, tok: &str) -> bool {
 /// git's plain (non-magic) pathspec match: a pathspec matches a path when equal
 /// to it or a leading directory prefix ending at a component boundary, so `dir`
 /// matches `dir/file` but `fil` does not match `file`.
-fn path_matches(path: &[u8], specs: &[Vec<u8>]) -> bool {
-    specs.iter().any(|spec| {
-        let spec = spec.strip_suffix(b"/").unwrap_or(spec);
-        spec.is_empty()
-            || path == spec
-            || (path.len() > spec.len() && path.starts_with(spec) && path[spec.len()] == b'/')
-    })
-}
 
 /// The id of a commit's tree, for the pathspec-restricted TREESAME comparisons.
 fn commit_tree_id(repo: &gix::Repository, id: ObjectId) -> Result<ObjectId> {
@@ -1213,10 +1204,10 @@ fn diff_matches(
     repo: &gix::Repository,
     old: Option<ObjectId>,
     new: ObjectId,
-    specs: &[Vec<u8>],
+    specs: &super::log::PathspecMatcher,
 ) -> Result<bool> {
     let changes = collect(repo, old, Some(new))?;
-    Ok(changes.iter().any(|c| path_matches(c.path.as_bstr(), specs)))
+    Ok(changes.iter().any(|c| specs.matches(c.path.as_bstr())))
 }
 
 /// git's `rewrite_one`: replace a parent (or a ref target) with the nearest
@@ -1556,7 +1547,7 @@ fn emit_commit(
     opts: &Opts,
     sources: &HashMap<ObjectId, BString>,
     st: &mut State,
-    specs: &[Vec<u8>],
+    specs: Option<&super::log::PathspecMatcher>,
     override_parents: Option<&[ObjectId]>,
 ) -> Result<Option<Fatal>> {
     let id = info.id;
@@ -1629,8 +1620,8 @@ fn emit_commit(
     let mut changes = collect(repo, base, Some(tree))?;
     // Under a pathspec, `show_filemodify` only emits — and only exports blobs for
     // — changes matching it, exactly as git's diff is pathspec-limited.
-    if !specs.is_empty() {
-        changes.retain(|c| path_matches(c.path.as_bstr(), specs));
+    if let Some(specs) = specs {
+        changes.retain(|c| specs.matches(c.path.as_bstr()));
     }
 
     // git exports every referenced blob before the commit that first names it,

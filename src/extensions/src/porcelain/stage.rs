@@ -1148,6 +1148,29 @@ fn add(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
         staged.push(Staged { path, id, mode, stat, intent: false });
     }
 
+    // --- submodule gitlinks: stage a moved submodule's new HEAD (mode 160000) ---
+    // The walk above kept only files and symlinks, so a submodule worktree
+    // (`Kind::Repository`) never reached it. Stock git's `stage` *is* `cmd_add`,
+    // so it records the same pointer moves `git add <submodule>` does — off the
+    // shared index-driven pass, not a second copy of the rule.
+    {
+        let already: HashSet<BString> = staged.iter().map(|s| s.path.clone()).collect();
+        for (path, id, stat) in super::add::moved_gitlinks(&repo, &index, &already, |p| {
+            match ps.pattern_matching_relative_path(p, Some(false)) {
+                Some(m) if !m.is_excluded() => {
+                    if m.sequence_number < patterns.len() {
+                        seen.insert(m.sequence_number);
+                    }
+                    true
+                }
+                _ => false,
+            }
+        }) {
+            printed.insert(path.clone(), "add");
+            staged.push(Staged { path, id, mode: Mode::COMMIT, stat, intent: false });
+        }
+    }
+
     // --- deletions: tracked stage-0 paths, matched, whose file is gone ------
     let staged_set: HashSet<BString> = staged.iter().map(|s| s.path.clone()).collect();
     let mut deletions: Vec<BString> = Vec::new();
@@ -1239,6 +1262,12 @@ fn add(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
     // The id recorded in the index is the one the write returned, so the two can
     // never disagree even if the file changed since the scan hashed it.
     for s in &mut staged {
+        // A gitlink has no blob and no worktree bytes: its id is the submodule's
+        // HEAD commit, which lives in the submodule's own object database. Reading
+        // the path would just be a read of a directory.
+        if s.mode == Mode::COMMIT {
+            continue;
+        }
         s.id = if s.intent {
             repo.write_blob(b"")?.detach()
         } else {

@@ -244,7 +244,10 @@ struct Opts {
     abbrev: usize,       // object-id width in the raw output
     filter: u32,         // --diff-filter mask, see `filter_bit`
     format: Format,
-    paths: Vec<BString>, // literal path filters (empty = whole tree)
+    paths: Vec<BString>, // the raw path filters (empty = whole tree)
+    // The parsed pathspec set matching `paths`; `None` when there is no filter.
+    // Behind an `Rc` so `Opts` stays `Clone`; the matcher itself is never mutated.
+    specs: Option<std::rc::Rc<super::log::PathspecMatcher>>,
     /// `-c`/`--cc`: `rev->combine_merges`. A merge is rendered as one combined diff
     /// against every parent at once instead of being skipped.
     combine: bool,
@@ -312,6 +315,7 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
         filter: ALL_STATUSES,
         format: Format::Raw,
         paths: Vec::new(),
+        specs: None,
         combine: false,
         dense_combined: false,
         combined_all_paths: false,
@@ -567,10 +571,13 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
     }
 
     for p in &raw_paths {
-        if p.starts_with(':') || p.bytes().any(|b| matches!(b, b'*' | b'?' | b'[')) {
-            bail!("magic/glob pathspecs are not supported, got {p:?}");
-        }
-        opts.paths.push(BString::from(p.trim_end_matches('/').as_bytes()));
+        opts.paths.push(BString::from(p.as_bytes()));
+    }
+    // The pathspec set, parsed once by the shared engine — magic and wildcards
+    // included, the same as every other verb.
+    if !opts.paths.is_empty() {
+        opts.specs =
+            Some(std::rc::Rc::new(super::log::PathspecMatcher::new(&repo, &raw_paths)?));
     }
 
     // The stat family is always file-granular in git: recursion is forced on and tree
@@ -1795,30 +1802,26 @@ fn join(prefix: &BStr, name: &BStr) -> BString {
     p
 }
 
-/// `true` if `path` starts with `pat` followed by a `/`.
-fn under(path: &[u8], pat: &[u8]) -> bool {
-    path.len() > pat.len() && path.starts_with(pat) && path[pat.len()] == b'/'
-}
-
 /// Whether an entry is reported under the active path filters.
 ///
 /// A filter selects the entry when it names it exactly, when the entry lives inside
 /// the filtered directory, or — for a tree — when the filter points somewhere below
 /// the tree (`-- d1/sub` still reports the top-level `d1` without `-r`).
 fn selects(path: &BString, is_tree: bool, opts: &Opts) -> bool {
-    opts.paths.is_empty()
-        || opts.paths.iter().any(|p| {
-            path == p || under(path, p) || (is_tree && under(p, path))
-        })
+    let Some(specs) = opts.specs.as_ref() else { return true };
+    if is_tree {
+        // A tree is reported when the set selects it outright and when a spec names
+        // something literally below it — the old `(is_tree && under(p, path))` leg.
+        specs.selects_dir(path)
+    } else {
+        specs.matches(path)
+    }
 }
 
 /// Whether the sub-tree at `path` can contain a filtered entry and so must be entered.
 fn descend(path: &BString, opts: &Opts) -> bool {
-    opts.paths.is_empty()
-        || opts
-            .paths
-            .iter()
-            .any(|p| path == p || under(path, p) || under(p, path))
+    let Some(specs) = opts.specs.as_ref() else { return true };
+    specs.may_contain_match(path)
 }
 
 fn render_all(

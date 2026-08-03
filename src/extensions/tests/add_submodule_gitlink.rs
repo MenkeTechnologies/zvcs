@@ -112,3 +112,64 @@ fn add_stages_moved_submodule_gitlink() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// `git stage` is stock git's own alias for `cmd_add` (git-stage(1): "This is a
+/// synonym for git-add(1)"), so it has to record the same pointer moves.
+///
+/// Regression: `stage` ran its own worktree walk that kept only files and symlinks,
+/// with no gitlink pass of its own, so `git stage <submodule>` exited 0 having
+/// staged nothing at all — a silent no-op next to a working `git add`.
+#[test]
+fn stage_stages_moved_submodule_gitlink_like_add() {
+    let root = std::env::temp_dir().join(format!("zvcs-stagegitlink-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let root = root.canonicalize().unwrap();
+    let home = root.join("home");
+
+    let sub_src = root.join("sub_src");
+    std::fs::create_dir_all(&sub_src).unwrap();
+    git(&sub_src, &["init", "-q", "-b", "main"]);
+    git(&sub_src, &["commit", "--allow-empty", "-q", "-m", "s0"]);
+    let c0 = out_str(git(&sub_src, &["rev-parse", "HEAD"])).trim().to_string();
+    git(&sub_src, &["commit", "--allow-empty", "-q", "-m", "s1"]);
+    let c1 = out_str(git(&sub_src, &["rev-parse", "HEAD"])).trim().to_string();
+
+    let parent = root.join("parent");
+    std::fs::create_dir_all(&parent).unwrap();
+    git(&parent, &["init", "-q", "-b", "main"]);
+    git(&parent, &["submodule", "add", "-q", sub_src.to_str().unwrap(), "vendor/sub"]);
+    git(&parent, &["commit", "-q", "-m", "add sub"]);
+    git(&parent.join("vendor/sub"), &["checkout", "-q", &c0]);
+    assert_eq!(staged_gitlink(&parent, "vendor/sub"), c1, "index still at c1 before stage");
+
+    let stage = Command::new(BIN)
+        .args(["stage", "vendor/sub"])
+        .current_dir(&parent)
+        .env("ZVCS_HOME", &home)
+        .output()
+        .unwrap();
+    assert!(stage.status.success(), "zvcs stage failed: {}", String::from_utf8_lossy(&stage.stderr));
+    assert_eq!(
+        staged_gitlink(&parent, "vendor/sub"),
+        c0,
+        "git stage must stage the submodule's current HEAD ({c0}), exactly as git add does"
+    );
+
+    // `-u` restages tracked paths, which includes a moved gitlink.
+    git(&parent, &["reset", "-q"]);
+    git(&parent, &["stage", "-u"]);
+    assert_eq!(staged_gitlink(&parent, "vendor/sub"), c0, "stage -u must pick the gitlink up too");
+
+    // An unchanged gitlink stages nothing and still exits 0.
+    let again = Command::new(BIN)
+        .args(["stage", "vendor/sub"])
+        .current_dir(&parent)
+        .env("ZVCS_HOME", &home)
+        .output()
+        .unwrap();
+    assert!(again.status.success(), "second stage failed: {}", String::from_utf8_lossy(&again.stderr));
+    assert_eq!(staged_gitlink(&parent, "vendor/sub"), c0, "gitlink unchanged after no-op re-stage");
+
+    let _ = std::fs::remove_dir_all(&root);
+}

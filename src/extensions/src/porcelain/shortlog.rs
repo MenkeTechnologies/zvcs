@@ -1923,31 +1923,18 @@ fn diff_touches_path(
         .and_then(|id| tree_object(repo, id))
         .unwrap_or_else(|| repo.empty_tree());
 
-    let mut platform = old.changes().map_err(|e| anyhow!("{e}"))?;
-    platform.options(|o| {
-        o.track_path();
-        o.track_rewrites(None);
-    });
-    let mut matched = false;
-    // `ControlFlow::Break` is how the diff machinery is told to stop early, and it
-    // reports that back as `Error::Cancelled` — a *deliberate* stop, not a failure.
-    // Treating it as one turned every matching pathspec into
-    // "fatal: The delegate cancelled the operation", so the break is swallowed and
-    // only a genuine diff error propagates.
-    let outcome = platform.for_each_to_obtain_tree(&new, |change| {
-        if specs.matches(change.location()) {
-            matched = true;
-            Ok::<_, std::convert::Infallible>(std::ops::ControlFlow::Break(()))
-        } else {
-            Ok(std::ops::ControlFlow::Continue(()))
-        }
-    });
-    match outcome {
-        Ok(_) => {}
-        Err(_) if matched => {}
-        Err(e) => return Err(anyhow!("{e}")),
-    }
-    Ok(matched)
+    // The diff has to be RECURSIVE for the pathspec to see real file paths: a
+    // tree-level walk reports `src` where the change is `src/gen/table.rs`, and
+    // `:(exclude)src/gen` then excludes nothing, because `src` is not what the spec
+    // names. `diff_tree_to_tree` is the same file-granular diff `log` decides
+    // TREESAME with, so the two can never disagree.
+    let changes = repo
+        .diff_tree_to_tree(Some(&old), Some(&new), gix::diff::Options::default())
+        .map_err(|e| anyhow!("{e}"))?;
+    Ok(changes
+        .iter()
+        .filter(|c| !super::log::change_is_tree(c))
+        .any(|c| specs.matches(super::log::change_path(c))))
 }
 
 /// The tree id of a commit object, or `None` if it is missing or not a commit.

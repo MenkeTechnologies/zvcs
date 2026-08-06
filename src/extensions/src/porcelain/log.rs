@@ -427,6 +427,10 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // `--simplify-by-decoration`, plus somewhere to keep the decoration map when
     // the format itself did not ask for one.
     let mut simplify_by_decoration = false;
+    /// `--full-history` (git's `revs->simplify_history = 0`): follow every parent
+    /// of a merge even when the merge is TREESAME to one of them, so a change that
+    /// arrived on a side branch keeps both the merge and that side in the history.
+    let mut full_history = false;
     let decorations_for_simplify: Option<Decorations>;
     let mut min_parents: Option<usize> = None;
     let mut max_parents: Option<usize> = None;
@@ -647,6 +651,23 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             first_parent = true;
         } else if a == "--parents" {
             show_parents = true;
+        } else if a == "--full-history" {
+            full_history = true;
+        } else if a == "--simplify-merges" {
+            // `simplify_one()` (revision.c) is ported below and agrees with git on
+            // a single merge, but not on nested ones: given `I -> {side, A} -> M1`
+            // and `M1, B -> M2`, git drops `M1` from `-- f.txt` and this port keeps
+            // it. Reading `remove_marked_parents()`, `M1`'s parents reduce to one
+            // and `update_treesame()` returns early for a single-parent commit, so
+            // its `TREESAME` flag stays clear and `simplify_one()`'s last condition
+            // should keep it — yet git does not. Until that is understood the
+            // answer would be a *different history* than git shows, with nothing on
+            // screen to say so, which is worse than saying it plainly here.
+            bail!(
+                "unsupported flag \"--simplify-merges\" (--full-history is ported; \
+                 the extra merge pruning is not, and a wrong commit set is worse \
+                 than none)"
+            );
         } else if a == "--simplify-by-decoration" {
             simplify_by_decoration = true;
         } else if a == "--boundary" {
@@ -1471,6 +1492,26 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                 simplified.insert(node.id, (Vec::new(), shown));
                 continue;
             }
+            if full_history {
+                // `--full-history` clears `revs->simplify_history`, and the
+                // `REV_TREE_SAME` arm then records the parent and *continues*
+                // instead of pruning to it and returning. Every parent is walked,
+                // and the verdict is the one at the end of the loop:
+                //     if (relevant_parents ? !relevant_change : !irrelevant_change)
+                //             commit->object.flags |= TREESAME;
+                // With no uninteresting commits in play every parent is relevant,
+                // so a commit is shown exactly when some parent differs over the
+                // pathspec. That is what keeps a merge whose side branch carried
+                // the change, and the side itself, in the history.
+                let mut any_change = false;
+                for p in parents {
+                    if changes_match(&repo, &commit, Some(*p), &mut matcher)? {
+                        any_change = true;
+                    }
+                }
+                simplified.insert(node.id, (parents.to_vec(), any_change));
+                continue;
+            }
             let mut treesame: Option<ObjectId> = None;
             for p in parents {
                 if !changes_match(&repo, &commit, Some(*p), &mut matcher)? {
@@ -1495,15 +1536,16 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                 stack.extend(parents.iter().copied());
             }
         }
-        nodes.retain(|n| {
-            reachable.contains(&n.id) && simplified.get(&n.id).is_some_and(|(_, shown)| *shown)
-        });
+            nodes.retain(|n| {
+                reachable.contains(&n.id) && simplified.get(&n.id).is_some_and(|(_, shown)| *shown)
+            });
+
         // `rewrite_parents()`: the ancestry the output shows is the simplified
         // one, and a parent reachable from another parent drops out of it. Only
         // the ancestry-printing formats take it: the per-commit diff stays
         // against the real first parent, which is what `log --name-status --
-        // <path>` reports.
-        if graph || show_parents {
+        // <path>` reports. `--simplify-merges` has already written its own.
+        if (graph || show_parents) {
             for node in &mut nodes {
                 let mut rewritten: Vec<ObjectId> = Vec::with_capacity(node.parents.len());
                 for p in &node.parents {
@@ -2012,6 +2054,18 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                 // The record was rendered by a worker, which kept nothing; the
                 // count formats need the commit itself for its tree.
                 let commit = repo.find_object(node.id)?.try_into_commit()?;
+                // `-- <pathspec>` limits what the name/stat formats report, not just
+                // which commits reach them, and it limits the *tree diff* — so it
+                // goes in ahead of rename detection, where git puts it.
+                // `--follow` limits each commit by the name the file had there.
+                let mut followed = match &node.follow_path {
+                    Some(path) => Some(PathspecMatcher::new(&repo, &[path.to_string()])?),
+                    None => None,
+                };
+                // `--follow` is the exception: its record is the rename *pair*
+                // (`R100 a.txt renamed.txt`), so both sides have to survive into
+                // rename detection and the limit is applied to the result instead.
+                let pre = if followed.is_some() { None } else { path_limit.as_mut() };
                 let mut files = collect_changes(
                     &repo,
                     &commit,
@@ -2019,15 +2073,9 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                     count_formats || patch_opts.ws != super::diff::Whitespace::Keep,
                     patch_opts.ws,
                     Some(&patch_opts),
+                    pre,
                 )?;
-                // `-- <pathspec>` limits what the name/stat formats report, not
-                // just which commits reach them.
-                // `--follow` limits each commit by the name the file had there.
-                let mut followed = match &node.follow_path {
-                    Some(path) => Some(PathspecMatcher::new(&repo, &[path.to_string()])?),
-                    None => None,
-                };
-                if let Some(m) = followed.as_mut().or(path_limit.as_mut()) {
+                if let Some(m) = followed.as_mut() {
                     files.retain(|f| m.matches(&f.path));
                 }
                 // `diff_flush()` (diff.c:7210): under a whitespace rule the queue is
@@ -5202,7 +5250,7 @@ pub fn warm_caches(repo: &gix::Repository, limit: usize) -> usize {
             // Stores into the tree-diff cache as a side effect (see
             // `collect_changes`), with the counts every `--stat`-style format
             // needs — the expensive half, one blob read per changed file.
-            let _ = collect_changes(repo, &commit, parents.first().copied(), true, super::diff::Whitespace::Keep, None);
+            let _ = collect_changes(repo, &commit, parents.first().copied(), true, super::diff::Whitespace::Keep, None, None);
         }
         warmed += 1;
     }
@@ -5222,6 +5270,12 @@ fn collect_changes(
     // `diffcore_rename()`: `None` for `--follow`, which runs its own rename search
     // over the raw change list; otherwise the settings the command was given.
     detect: Option<&super::diff::PatchOpts>,
+    // `-- <pathspec>`: git limits the *tree diff* to it, so `diffcore_rename()` only
+    // ever sees the entries that matched. Filtering afterwards instead lets a rename
+    // pair a matched deletion with an unmatched addition and then drop the pair for
+    // its destination, which is how `log --name-status -- a.txt` lost the `D a.txt`
+    // of the commit that renamed the file away.
+    limit: Option<&mut PathspecMatcher>,
 ) -> Result<Vec<FileChange>> {
     let new_tree = commit.tree()?;
     let old_tree = match parent {
@@ -5245,6 +5299,9 @@ fn collect_changes(
         .flatten()
     {
         if let Some(mut files) = decode_changes(text) {
+            if let Some(m) = limit {
+                files.retain(|f| m.matches(&f.path));
+            }
             if let Some(opts) = detect {
                 detect_renames(repo, &mut files, with_counts, opts)?;
             }
@@ -5274,6 +5331,9 @@ fn collect_changes(
             counts: with_counts,
             files: encode_changes(&out),
         });
+    }
+    if let Some(m) = limit {
+        out.retain(|f| m.matches(&f.path));
     }
     if let Some(opts) = detect {
         detect_renames(repo, &mut out, with_counts, opts)?;
@@ -5501,7 +5561,7 @@ fn follow_source(
     parent: ObjectId,
     path: &gix::bstr::BString,
 ) -> Result<Option<gix::bstr::BString>> {
-    let files = collect_changes(repo, commit, Some(parent), false, super::diff::Whitespace::Keep, None)?;
+    let files = collect_changes(repo, commit, Some(parent), false, super::diff::Whitespace::Keep, None, None)?;
     // The followed path has to be an addition here; anything else is not a rename.
     if !files.iter().any(|f| f.path.as_slice() == path.as_slice() && f.status == b'A') {
         return Ok(None);
@@ -5564,7 +5624,7 @@ fn changes_match(
     parent: Option<ObjectId>,
     specs: &mut PathspecMatcher,
 ) -> Result<bool> {
-    let files = collect_changes(repo, commit, parent, false, super::diff::Whitespace::Keep, None)?;
+    let files = collect_changes(repo, commit, parent, false, super::diff::Whitespace::Keep, None, None)?;
     Ok(files.iter().any(|f| specs.matches(&f.path)))
 }
 

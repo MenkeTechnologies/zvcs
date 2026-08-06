@@ -18,6 +18,13 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # The tag being released. On a `v*` tag push that is the ref; on a manual
+  # `workflow_dispatch` the ref is whatever branch the run was started from
+  # (`main`), so the `tag` input is what carries it. Using `github.ref_name`
+  # unconditionally published a release literally named `main` and regenerated
+  # the tap formula with `version "main"` and no URL, which broke
+  # `brew upgrade zvcs` for everyone.
+  TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
   build:
@@ -47,6 +54,10 @@ jobs:
             allow_failure: true
     steps:
       - uses: actions/checkout@v6
+        with:
+          # A dispatch runs from a branch; the artifact must still come from the
+          # tag the run was asked to release.
+          ref: ${{ inputs.tag || github.ref }}
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -71,13 +82,13 @@ jobs:
           # the binary inside it is `git` (the git-shadowing superset).
           cd target/${{ matrix.target }}/release
           strip git 2>/dev/null || true
-          tar czf ../../../zvcs-${{ github.ref_name }}-${{ matrix.target }}.tar.gz git
+          tar czf ../../../zvcs-${TAG}-${{ matrix.target }}.tar.gz git
           cd ../../..
 
       - uses: actions/upload-artifact@v6
         with:
           name: zvcs-${{ matrix.target }}
-          path: zvcs-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
+          path: zvcs-${{ inputs.tag || github.ref_name }}-${{ matrix.target }}.tar.gz
 
   publish:
     name: Publish GitHub Release
@@ -95,8 +106,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create ${{ github.ref_name }} \
-            --title "${{ github.ref_name }}" \
+          gh release create "$TAG" \
+            --title "$TAG" \
             --generate-notes \
             artifacts/*.tar.gz
 
@@ -131,7 +142,7 @@ jobs:
       - name: Update formula
         shell: bash
         env:
-          VERSION: ${{ github.ref_name }}
+          VERSION: ${{ inputs.tag || github.ref_name }}
           SHA_ARM_MACOS: ${{ steps.sha.outputs.aarch64_apple_darwin }}
           SHA_X86_LINUX: ${{ steps.sha.outputs.x86_64_unknown_linux_gnu }}
           SHA_ARM_LINUX: ${{ steps.sha.outputs.aarch64_unknown_linux_gnu }}
@@ -201,5 +212,5 @@ jobs:
             echo "no changes — formula already up to date"
             exit 0
           fi
-          git commit -m "zvcs: bump to ${{ github.ref_name }}"
+          git commit -m "zvcs: bump to ${{ inputs.tag || github.ref_name }}"
           git push

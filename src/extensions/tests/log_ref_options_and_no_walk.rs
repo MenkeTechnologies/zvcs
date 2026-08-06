@@ -69,7 +69,14 @@ impl Fixture {
             .env("HOME", &self.root)
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_SYSTEM", "/dev/null")
-            .env("GIT_CONFIG_NOSYSTEM", "1");
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            // Every commit gets the same timestamp on purpose: these tests are
+            // about the order tips are *pended* in, which only decides the output
+            // once the commit dates tie. Left to the clock the fixture ties on a
+            // fast machine and does not on a slow one, so the assertions would
+            // describe the hardware rather than the walk.
+            .env("GIT_AUTHOR_DATE", "1700000000 +0000")
+            .env("GIT_COMMITTER_DATE", "1700000000 +0000");
         c
     }
 

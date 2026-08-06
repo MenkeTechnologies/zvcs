@@ -90,12 +90,30 @@ struct Lane {
 }
 
 /// The zvcs state directory, `~/.zvcs` (override with `ZVCS_HOME`). Created on
-/// demand; falls back to the current directory if `$HOME` is unset.
+/// demand.
+///
+/// With neither variable set — a cleared environment, a service manager that
+/// exports no `HOME`, a scratch container — the state still has to go somewhere,
+/// and that somewhere is never the current directory. A relative `.zvcs` means
+/// every invocation deposits a state directory wherever it happened to be
+/// standing, including invocations that only ask a question: `git zverbs` run
+/// with `env_clear()` is enough. Cargo runs each test binary from its crate root,
+/// so that is how `src/extensions/.zvcs` and `src/parity/.zvcs` appeared in the
+/// source tree.
+///
+/// The fallback is per-user because the temp directory is shared on Linux, and a
+/// world-writable state path another account can pre-create is worth avoiding.
+/// It also lands under the temp directory, which [`is_sandboxed`] already reads
+/// as a throwaway home — so a daemon that starts against it is idle-reaped rather
+/// than left running forever.
 pub fn zvcs_home() -> PathBuf {
     let dir = std::env::var_os("ZVCS_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".zvcs")))
-        .unwrap_or_else(|| PathBuf::from(".zvcs"));
+        .unwrap_or_else(|| {
+            let uid = unsafe { libc::getuid() };
+            std::env::temp_dir().join(format!("zvcs-{uid}"))
+        });
     let _ = std::fs::create_dir_all(&dir);
     dir
 }

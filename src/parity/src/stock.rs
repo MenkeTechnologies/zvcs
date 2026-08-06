@@ -48,13 +48,26 @@ fn version_of(bin: &Path) -> Option<(u32, u32, u32)> {
 /// `'zverbs' is not a git command`. Clearing the environment is what makes the
 /// probe sound — zvcs's own installation puts a `git-zverbs` shim on `PATH`, so
 /// with it a *stock* git answers the verb too.
+///
+/// The question can only be answered by *running* the candidate, so the run is
+/// made harmless first. An emptied environment leaves a zvcs with no `HOME` to
+/// put its state under, and a build old enough to fall back to a relative path
+/// writes a `.zvcs/` into whatever directory the probe was standing in — which is
+/// the crate root under `cargo test`. Naming a throwaway `ZVCS_HOME` and running
+/// from the temp directory bounds that: a stock git ignores both, and any zvcs,
+/// however old, keeps its state where it is told.
 fn is_zvcs(bin: &Path) -> bool {
-    Command::new(bin)
+    let scratch = std::env::temp_dir().join(format!("zvcs-probe-{}", std::process::id()));
+    let answered = Command::new(bin)
         .arg("zverbs")
         .env_clear()
+        .env("ZVCS_HOME", &scratch)
+        .current_dir(std::env::temp_dir())
         .output()
         .map(|o| o.status.success() && !o.stdout.is_empty())
-        .unwrap_or(false)
+        .unwrap_or(false);
+    let _ = std::fs::remove_dir_all(&scratch);
+    answered
 }
 
 /// The version this port reproduces, read from its single source of truth:

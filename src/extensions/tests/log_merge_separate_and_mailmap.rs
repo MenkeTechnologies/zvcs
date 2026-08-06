@@ -47,7 +47,16 @@ impl Fixture {
             .env("HOME", &self.root)
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_SYSTEM", "/dev/null")
-            .env("GIT_CONFIG_NOSYSTEM", "1");
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            // This suite attributes commits to particular authors through config
+            // so that `.mailmap` has something to rewrite. `GIT_AUTHOR_*` and
+            // `GIT_COMMITTER_*` outrank config — including `-c user.name=…` — so
+            // an environment that sets them (every CI runner here does) would
+            // silently replace the identities the assertions are about.
+            .env_remove("GIT_AUTHOR_NAME")
+            .env_remove("GIT_AUTHOR_EMAIL")
+            .env_remove("GIT_COMMITTER_NAME")
+            .env_remove("GIT_COMMITTER_EMAIL");
         c
     }
 

@@ -99,7 +99,7 @@ pub fn last_modified(args: &[String]) -> Result<ExitCode> {
     let repo = gix::discover(".")?;
 
     if repo.commit_graph_if_enabled()?.is_some() {
-        bail!("unsupported: repository has a commit-graph; walk order would not match git");
+        anyhow::bail!("unsupported: repository has a commit-graph; walk order would not match git");
     }
 
     // Split positionals into `<revision>` and pathspecs the way `setup_revisions`
@@ -109,7 +109,7 @@ pub fn last_modified(args: &[String]) -> Result<ExitCode> {
     let mut specs: Vec<&str> = Vec::new();
     for (n, p) in positionals.iter().enumerate() {
         if p.contains("..") || p.starts_with('^') {
-            bail!("unsupported <revision-range> {p:?} (only a single revision is ported)");
+            anyhow::bail!("unsupported <revision-range> {p:?} (only a single revision is ported)");
         }
         let is_rev = n == 0
             && !only_paths_before(args, p)
@@ -126,10 +126,10 @@ pub fn last_modified(args: &[String]) -> Result<ExitCode> {
     let prefix = cwd_prefix(&repo)?;
     for s in specs {
         if s.starts_with(':') {
-            bail!("unsupported pathspec magic {s:?}");
+            anyhow::bail!("unsupported pathspec magic {s:?}");
         }
         if s.contains('*') || s.contains('?') || s.contains('[') {
-            bail!("unsupported wildcard pathspec {s:?}");
+            anyhow::bail!("unsupported wildcard pathspec {s:?}");
         }
         let mut full = prefix.clone();
         full.extend_from_slice(s.as_bytes());

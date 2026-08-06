@@ -1174,13 +1174,13 @@ fn render_format(
                         push_byte(out, &mut frames, byte);
                         i += 3;
                     }
-                    None => bail!("unsupported '%' escape in --format"),
+                    None => anyhow::bail!("unsupported '%' escape in --format"),
                 }
             }
         }
     }
     if !frames.is_empty() {
-        bail!("format string has an unclosed '%(if)'");
+        crate::git_fatal!("format string has an unclosed '%(if)'");
     }
     Ok(())
 }

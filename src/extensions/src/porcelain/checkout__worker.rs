@@ -245,7 +245,7 @@ fn worker_loop() -> Result<ExitCode> {
     loop {
         match read_packet(&mut input) {
             Ok(Pkt::Zero) => break,
-            Ok(Pkt::Item(len)) => bail!(
+            Ok(Pkt::Item(len)) => anyhow::bail!(
                 "unsupported: parallel-checkout item packet ({len}B) — its wire format is a raw \
                  C `pc_item_fixed_portion` dump and the reply embeds a raw `struct stat`, and \
                  writing the entry needs convert.c's pre-resolved `conv_attrs` filters (ported: \

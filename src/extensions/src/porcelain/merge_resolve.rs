@@ -164,7 +164,7 @@ pub fn merge_resolve(args: &[String]) -> Result<ExitCode> {
     // equivalent. The recursive strategy's virtual merge base is a *different*
     // algorithm, so it is not substituted here.
     if parsed.bases.len() > 1 {
-        bail!(
+        anyhow::bail!(
             "unsupported: {} merge bases need read-tree's multi-base --aggressive merge \
              (a stage-collapsing unpack_trees state machine gitoxide has no equivalent for); \
              the recursive strategy's virtual merge base is a different algorithm and is not \
@@ -212,7 +212,7 @@ pub fn merge_resolve(args: &[String]) -> Result<ExitCode> {
     // rather than write different markers.
     if let Some(style) = repo.config_snapshot().string("merge.conflictStyle") {
         if style != "merge" {
-            bail!(
+            anyhow::bail!(
                 "unsupported: merge.conflictStyle={style} (only the default `merge` style is ported)"
             );
         }
@@ -237,7 +237,7 @@ pub fn merge_resolve(args: &[String]) -> Result<ExitCode> {
     // The `diff-index --cached HEAD` guard above proved the index equals HEAD;
     // guard the worktree too, as merge-recursive does, before writing.
     if repo.is_dirty()? {
-        bail!("your local changes would be overwritten by merge; commit or stash them first");
+        crate::git_fatal!("your local changes would be overwritten by merge; commit or stash them first");
     }
 
     let old_index = repo.index_or_load_from_head()?.into_owned();
@@ -337,7 +337,7 @@ fn render_resolve_messages(repo: &Repository, conflicts: &[Conflict]) -> Result<
             Ok(Resolution::OursModifiedTheirsModifiedThenBlobContentMerge { merged_blob }) => {
                 merged_blob
             }
-            _ => bail!(
+            _ => anyhow::bail!(
                 "unsupported: conflict at {path} is not a content merge; read-tree --aggressive + \
                  git-merge-one-file resolve rename/delete, modify/delete, directory/file and \
                  submodule cases this port does not render"
@@ -487,7 +487,7 @@ fn dirty_paths(repo: &Repository) -> Result<Vec<BString>> {
 
     let head_tree = match repo.head_commit().ok().and_then(|c| c.tree_id().ok()) {
         Some(id) => id.detach(),
-        None => bail!(
+        None => anyhow::bail!(
             "unsupported: merge-resolve against an unborn HEAD (git lets diff-index's \
              `fatal: ambiguous argument 'HEAD'` through, which is not reproduced)"
         ),

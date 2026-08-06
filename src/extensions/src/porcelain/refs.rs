@@ -136,7 +136,7 @@ pub fn refs(args: &[String]) -> Result<ExitCode> {
         "list" => list(&args[1..]),
         // `optimize` keeps its own leading token: the pack-refs port skips it.
         "optimize" => optimize(args),
-        "migrate" => bail!(
+        "migrate" => anyhow::bail!(
             "unsupported subcommand \"migrate\": the vendored gix-ref has no reftable backend \
              (only the loose+packed files store), so there is no format to migrate to"
         ),

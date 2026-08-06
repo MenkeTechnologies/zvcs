@@ -143,14 +143,14 @@ pub fn jump(args: &[String]) -> Result<ExitCode> {
             Some(lines) => lines,
             None => return Ok(usage_err()),
         },
-        "diff" => bail!(
+        "diff" => anyhow::bail!(
             "unsupported mode \"diff\" (ported: merge, auto, --stdout, the option loop and \
              usage/exit codes). It runs `git diff --no-prefix --relative` over arbitrary \
              user-supplied diff arguments and derives one quickfix line per hunk from the \
              patch text; diff.rs exports only `pub fn diff`, keeps its hunk walk private, \
              and implements neither --no-prefix nor --relative"
         ),
-        "ws" => bail!(
+        "ws" => anyhow::bail!(
             "unsupported mode \"ws\" (ported: merge, auto). It is `git diff --check`, and \
              gix-diff contains no whitespace-error checker — nothing under src/ported backs \
              git's ws_check_emit output"
@@ -200,7 +200,7 @@ fn mode_auto(args: &[String]) -> Result<Option<Vec<u8>>> {
     // `! git diff --quiet "$@"` — index vs worktree only, staged changes and
     // untracked files do not count.
     if has_unstaged_changes(&repo, args)? {
-        bail!(
+        anyhow::bail!(
             "unsupported: `git jump` with unstaged changes selects mode \"diff\", which is not \
              ported — it runs `git diff --no-prefix --relative` and derives a quickfix line per \
              hunk; diff.rs exports only `pub fn diff` and implements neither flag"
@@ -260,7 +260,7 @@ fn mode_grep(args: &[String]) -> Result<Vec<u8>> {
     // would then treat as running `"$@"` itself; that is not a command this port
     // can guess at.
     let Some((program, leading)) = argv.split_first_mut() else {
-        bail!("jump.grepCmd is set but contains no command word");
+        crate::git_fatal!("jump.grepCmd is set but contains no command word");
     };
     let program = program.clone();
     let leading: Vec<std::ffi::OsString> = leading.to_vec();
@@ -318,7 +318,7 @@ fn unmerged_paths(repo: &gix::Repository, args: &[String]) -> Result<BTreeSet<BS
             continue;
         }
         if !no_more_flags && a.starts_with('-') {
-            bail!(
+            anyhow::bail!(
                 "unsupported argument {a:?}: git jump forwards it to `git ls-files -u`, whose \
                  option parser and usage text are not reproduced here (ported: -- and pathspecs)"
             );
@@ -369,7 +369,7 @@ fn unmerged_paths(repo: &gix::Repository, args: &[String]) -> Result<BTreeSet<BS
                 .iter()
                 .any(|&b| !(0x20..0x7f).contains(&b) || b == b'"' || b == b'\\')
             {
-                bail!(
+                anyhow::bail!(
                     "unsupported path {:?}: git ls-files renders it in quoted form and stock \
                      git-jump then greps a filename that does not exist",
                     display.as_bstr()
@@ -394,7 +394,7 @@ fn grep_markers(paths: &BTreeSet<BString>) -> Result<Vec<u8>> {
                 eprintln!("grep: {name}: No such file or directory");
                 continue;
             }
-            Err(e) => bail!("grep: {name}: {e}"),
+            Err(e) => crate::git_fatal!("grep: {name}: {e}"),
         };
 
         // Trailing newline terminates the last line rather than starting a new one.
@@ -409,7 +409,7 @@ fn grep_markers(paths: &BTreeSet<BString>) -> Result<Vec<u8>> {
             continue;
         }
         if content.contains(&0) {
-            bail!(
+            anyhow::bail!(
                 "unsupported binary conflicted file {name:?}: system grep answers \
                  \"Binary file {name} matches\" instead of line hits, which is not reproduced"
             );

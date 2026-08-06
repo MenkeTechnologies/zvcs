@@ -626,15 +626,15 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
 fn one_name<'a>(positional: &[&'a str]) -> Result<&'a str> {
     match positional {
         [name] => Ok(*name),
-        [] => bail!("no config key given"),
-        _ => bail!("too many arguments, expected a single `<name>`"),
+        [] => crate::git_fatal!("no config key given"),
+        _ => crate::git_fatal!("too many arguments, expected a single `<name>`"),
     }
 }
 
 fn name_and_value<'a>(positional: &[&'a str]) -> Result<(&'a str, &'a str)> {
     match positional {
         [name, value] => Ok((*name, *value)),
-        _ => bail!("expected `<name> <value>`"),
+        _ => crate::git_fatal!("expected `<name> <value>`"),
     }
 }
 
@@ -1399,7 +1399,7 @@ fn resolve_write_target(scope: &Scope, repo: Option<&gix::Repository>) -> Result
                 (Some(u), Some(x)) if !u.exists() && x.exists() => (x, Source::Git),
                 (Some(u), _) => (u, Source::User),
                 (None, Some(x)) => (x, Source::Git),
-                (None, None) => bail!("could not determine the global config path (HOME unset)"),
+                (None, None) => crate::git_fatal!("could not determine the global config path (HOME unset)"),
             };
             Ok(WriteTarget {
                 lock_key: path.clone(),
@@ -1468,7 +1468,7 @@ fn write_scoped(target: &WriteTarget, name: &str, value: &str, op: WriteOp) -> R
                 return Ok(ExitCode::from(5));
             }
             if matches!(op, WriteOp::Unset) && count > 1 {
-                bail!("key contains multiple values: {name}");
+                crate::git_fatal!("key contains multiple values: {name}");
             }
             if matches!(op, WriteOp::UnsetAll) {
                 while section.remove(key.value_name).is_some() {}

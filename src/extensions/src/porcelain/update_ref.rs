@@ -411,7 +411,7 @@ fn lock_error(e: &gix::reference::edit::Error) -> String {
 fn check_new_object(repo: &gix::Repository, name: &str, new: &Val) -> Result<()> {
     if let Val::Oid(id) = new {
         if !repo.has_object(*id) {
-            bail!("trying to write ref '{name}' with nonexistent object {id}");
+            crate::git_fatal!("trying to write ref '{name}' with nonexistent object {id}");
         }
     }
     Ok(())
@@ -542,7 +542,7 @@ fn validate_prepare(repo: &gix::Repository, batch: &Batch) -> Result<()> {
     for name in &batch.absent {
         refname(name)?;
         if repo.try_find_reference(name.as_str())?.is_some() {
-            bail!("cannot lock ref '{name}': reference already exists");
+            crate::git_fatal!("cannot lock ref '{name}': reference already exists");
         }
     }
     if batch.edits.is_empty() {
@@ -700,7 +700,7 @@ fn apply(repo: &gix::Repository, batch: Batch, batch_updates: bool) -> Result<()
     for name in &batch.absent {
         refname(name)?; // reject malformed names the same way an edit would
         if repo.try_find_reference(name.as_str())?.is_some() {
-            bail!("cannot lock ref '{name}': reference already exists");
+            crate::git_fatal!("cannot lock ref '{name}': reference already exists");
         }
     }
     if batch.is_empty() {
@@ -708,7 +708,7 @@ fn apply(repo: &gix::Repository, batch: Batch, batch_updates: bool) -> Result<()
     }
     if !batch_updates {
         if let Err(e) = repo.edit_references(batch.edits) {
-            bail!("{}", lock_error(&e));
+            crate::git_fatal!("{}", lock_error(&e));
         }
         return Ok(());
     }
@@ -769,12 +769,12 @@ fn stage_oid_command(
     match cmd {
         "update" => {
             if args.len() < 2 || args.len() > 3 {
-                bail!("update: wrong number of arguments");
+                crate::git_fatal!("update: wrong number of arguments");
             }
             let new = parse_slot(repo, slot(1), nul, Slot::New)?;
             let old = parse_slot(repo, slot(2), nul, Slot::Old)?;
             if matches!(new, Val::Missing) {
-                bail!("update {name}: missing <new-oid>");
+                crate::git_fatal!("update {name}: missing <new-oid>");
             }
             check_new_object(repo, name, &new)?;
             batch
@@ -783,11 +783,11 @@ fn stage_oid_command(
         }
         "create" => {
             if args.len() != 2 {
-                bail!("create: wrong number of arguments");
+                crate::git_fatal!("create: wrong number of arguments");
             }
             let new = parse_slot(repo, slot(1), nul, Slot::New)?;
             let Val::Oid(id) = new else {
-                bail!("create {name}: zero <new-oid>");
+                crate::git_fatal!("create {name}: zero <new-oid>");
             };
             check_new_object(repo, name, &new)?;
             // git's `create` refuses outright when the ref is already there;
@@ -806,13 +806,13 @@ fn stage_oid_command(
         }
         "delete" => {
             if args.len() > 2 {
-                bail!("delete: wrong number of arguments");
+                crate::git_fatal!("delete: wrong number of arguments");
             }
             let old = parse_slot(repo, slot(1), nul, Slot::Old)?;
             // Unlike the command-line `-d`, the stdin `delete` command rejects an
             // explicit all-zero `<old-oid>` outright rather than deleting.
             if matches!(old, Val::Zero) {
-                bail!("delete {name}: zero <old-oid>");
+                crate::git_fatal!("delete {name}: zero <old-oid>");
             }
             batch.edits.push(RefEdit {
                 change: Change::Delete {
@@ -825,7 +825,7 @@ fn stage_oid_command(
         }
         "verify" => {
             if args.len() > 2 {
-                bail!("verify: wrong number of arguments");
+                crate::git_fatal!("verify: wrong number of arguments");
             }
             // `verify` is an update to the value it already has: gitoxide skips
             // the reflog when old == new, so nothing is logged, as in git.
@@ -889,7 +889,7 @@ fn stage_symref_command(
                     Val::Oid(id) => PreviousValue::MustExistAndMatch(Target::Object(id)),
                     Val::Zero | Val::Missing => PreviousValue::MustNotExist,
                 },
-                Some(kind) => bail!("symref-update {name}: invalid old value kind '{kind}'"),
+                Some(kind) => crate::git_fatal!("symref-update {name}: invalid old value kind '{kind}'"),
             };
             batch.edits.push(RefEdit {
                 change: Change::Update {
@@ -964,7 +964,7 @@ fn split_nul_records(input: &str) -> Result<Vec<Vec<String>>> {
             "symref-create" => 1,
             "symref-delete" | "symref-verify" => 1,
             "option" | "start" | "prepare" | "commit" | "abort" => 0,
-            _ => bail!("unknown command: {head}"),
+            _ => crate::git_fatal!("unknown command: {head}"),
         };
         let mut record = vec![cmd];
         if let Some(f) = first {
@@ -1022,7 +1022,7 @@ fn tokenize(line: &str) -> Result<Vec<String>> {
         }
         if i < b.len() {
             if b[i] != b' ' {
-                bail!("unexpected character after quoted field in: {line}");
+                crate::git_fatal!("unexpected character after quoted field in: {line}");
             }
             i += 1;
         } else {
@@ -1041,14 +1041,14 @@ fn unquote_c(b: &[u8]) -> Result<(String, usize)> {
     let mut i = 1;
     loop {
         let Some(&c) = b.get(i) else {
-            bail!("unterminated quoted string");
+            crate::git_fatal!("unterminated quoted string");
         };
         i += 1;
         match c {
             b'"' => break,
             b'\\' => {
                 let Some(&e) = b.get(i) else {
-                    bail!("unterminated escape in quoted string");
+                    crate::git_fatal!("unterminated escape in quoted string");
                 };
                 i += 1;
                 match e {
@@ -1072,11 +1072,11 @@ fn unquote_c(b: &[u8]) -> Result<(String, usize)> {
                             }
                         }
                         if v > 0xff {
-                            bail!("octal escape out of range in quoted string");
+                            crate::git_fatal!("octal escape out of range in quoted string");
                         }
                         out.push(v as u8);
                     }
-                    _ => bail!("invalid escape '\\{}' in quoted string", e as char),
+                    _ => crate::git_fatal!("invalid escape '\\{}' in quoted string", e as char),
                 }
             }
             _ => out.push(c),

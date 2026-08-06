@@ -151,10 +151,10 @@ fn create_temp_file(dir: &Path, data: &[u8]) -> Result<String> {
             }
             // A collision just means another name is needed; anything else is fatal.
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => anyhow::bail!("unable to create temp-file in {}: {e}", dir.display()),
+            Err(e) => crate::git_fatal!("unable to create temp-file in {}: {e}", dir.display()),
         }
     }
-    anyhow::bail!("unable to create temp-file in {}: no unused name found", dir.display())
+    crate::git_fatal!("unable to create temp-file in {}: no unused name found", dir.display())
 }
 
 /// One `.merge_file_XXXXXX` candidate, advancing `state`.

@@ -255,7 +255,7 @@ pub fn fetch_pack(args: &[String]) -> Result<ExitCode> {
                 }
                 None => {
                     if looks_like_object_hash(name) {
-                        bail!(
+                        anyhow::bail!(
                             "ref {name:?} looks like an object id — wanting a raw id \
                              (uploadpack.allow*SHA1InWant) has no substrate in the vendored \
                              refspec layer, which maps names only ({PORTED})"
@@ -280,7 +280,7 @@ pub fn fetch_pack(args: &[String]) -> Result<ExitCode> {
         // A failed fetch surfaces as git's `fatal:` with 128 unless it is one of
         // our own refusals, which must stay loud and unmistakable.
         if let Some(refusal) = e.downcast_ref::<Refusal>() {
-            bail!("{}", refusal.0);
+            crate::git_fatal!("{}", refusal.0);
         }
         eprintln!("fatal: {e}");
         return Ok(ExitCode::from(128));

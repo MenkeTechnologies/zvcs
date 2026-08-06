@@ -701,7 +701,7 @@ impl StrategyOptions {
     /// `gix-merge` has no way to express rather than silently ignoring them.
     fn apply(&self, options: gix::merge::tree::Options) -> Result<gix::merge::tree::Options> {
         if let Some(flag) = &self.ignore_whitespace {
-            bail!("unsupported strategy option \"{flag}\" (gix-merge's text driver has no whitespace-insensitive tokenizer)");
+            anyhow::bail!("unsupported strategy option \"{flag}\" (gix-merge's text driver has no whitespace-insensitive tokenizer)");
         }
         if let Some(path) = &self.subtree {
             let shown = if path.is_empty() {
@@ -709,10 +709,10 @@ impl StrategyOptions {
             } else {
                 format!("subtree={path}")
             };
-            bail!("unsupported strategy option \"{shown}\" (gix-merge has no subtree shift)");
+            anyhow::bail!("unsupported strategy option \"{shown}\" (gix-merge has no subtree shift)");
         }
         if self.renormalize == Some(true) {
-            bail!("unsupported strategy option \"renormalize\" (gix-merge's blob pipeline is not driven in renormalizing mode here)");
+            anyhow::bail!("unsupported strategy option \"renormalize\" (gix-merge's blob pipeline is not driven in renormalizing mode here)");
         }
 
         let algorithm = match self.diff_algorithm.as_deref() {
@@ -720,7 +720,7 @@ impl StrategyOptions {
             Some("myers" | "default") => Some(gix::diff::blob::Algorithm::Myers),
             Some("minimal") => Some(gix::diff::blob::Algorithm::MyersMinimal),
             Some("histogram") => Some(gix::diff::blob::Algorithm::Histogram),
-            Some(other) => bail!(
+            Some(other) => anyhow::bail!(
                 "unsupported strategy option \"{other}\" diff algorithm (gix-imara-diff implements myers, minimal and histogram only)"
             ),
         };

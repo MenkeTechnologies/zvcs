@@ -381,7 +381,7 @@ pub fn stash(args: &[String]) -> Result<ExitCode> {
             let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
             push(&repo, &opts)
         }
-        Some(other) => bail!("{other} is not a stash command"),
+        Some(other) => crate::git_fatal!("{other} is not a stash command"),
     }
 }
 
@@ -732,7 +732,7 @@ fn build_stash_commit(
                                 wt_mods.push((rela_path, false));
                             }
                             EntryStatus::Conflict { .. } => {
-                                bail!("cannot stash: unmerged (conflicted) entries present")
+                                crate::git_fatal!("cannot stash: unmerged (conflicted) entries present")
                             }
                             _ => {}
                         }
@@ -1268,7 +1268,7 @@ fn branch_stash(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
     let mut positionals: Vec<&str> = Vec::new();
     for a in args {
         if a.starts_with('-') && a.as_str() != "-" {
-            bail!("unsupported stash branch option '{a}'");
+            anyhow::bail!("unsupported stash branch option '{a}'");
         }
         positionals.push(a);
     }
@@ -1290,7 +1290,7 @@ fn branch_stash(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
     let commit = repo.find_commit(commit_id)?;
     let parents: Vec<ObjectId> = commit.parent_ids().map(|id| id.detach()).collect();
     if parents.len() < 2 {
-        bail!("'{commit_id}' is not a stash-like commit");
+        crate::git_fatal!("'{commit_id}' is not a stash-like commit");
     }
     let b_commit = parents[0];
 
@@ -1425,7 +1425,7 @@ fn restore_stash_commit(
     let commit = repo.find_commit(commit_id)?;
     let parents: Vec<ObjectId> = commit.parent_ids().map(|id| id.detach()).collect();
     if parents.len() < 2 {
-        bail!("'{commit_id}' is not a stash-like commit");
+        crate::git_fatal!("'{commit_id}' is not a stash-like commit");
     }
     // A third parent is the untracked capture written by `push -u`/`-a`; its
     // tree is restored to the worktree after the tracked paths, below.
@@ -1434,7 +1434,7 @@ fn restore_stash_commit(
         None => None,
     };
     if parents.len() > 3 {
-        bail!("'{commit_id}' is not a stash-like commit");
+        crate::git_fatal!("'{commit_id}' is not a stash-like commit");
     }
     let base_tree = repo.find_commit(parents[0])?.tree_id()?.detach();
     let i_tree = repo.find_commit(parents[1])?.tree_id()?.detach();
@@ -1448,7 +1448,7 @@ fn restore_stash_commit(
     // merge does.
     let old_index = repo.open_index()?;
     if old_index.entries().iter().any(|e| e.stage_raw() != 0) {
-        bail!("cannot apply a stash in the middle of a merge");
+        crate::git_fatal!("cannot apply a stash in the middle of a merge");
     }
     let c_tree = super::merge::index_tree(repo, &old_index)?;
 
@@ -1621,7 +1621,7 @@ pub fn apply_autostash(repo: &gix::Repository, commit_id: ObjectId, quiet: bool)
     let commit = repo.find_commit(commit_id)?;
     let parents: Vec<ObjectId> = commit.parent_ids().map(|id| id.detach()).collect();
     if parents.len() < 2 {
-        bail!("'{commit_id}' is not a stash-like commit");
+        crate::git_fatal!("'{commit_id}' is not a stash-like commit");
     }
     let base = repo.find_commit(parents[0])?.tree_id()?.detach();
     let theirs = commit.tree_id()?.detach();
@@ -1975,7 +1975,7 @@ fn drop_reflog_entry(repo: &gix::Repository, n: usize) -> Result<ObjectId> {
     let mut lines: Vec<Vec<u8>> = data.split(|b| *b == b'\n').filter(|l| !l.is_empty()).map(<[u8]>::to_vec).collect();
     let len = lines.len();
     if n >= len {
-        bail!("stash@{{{n}}} is not a valid reference");
+        crate::git_fatal!("stash@{{{n}}} is not a valid reference");
     }
     let target = len - 1 - n; // stash@{0} is the last (newest) line
 
@@ -2333,11 +2333,11 @@ fn parse_push_options(args: &[String]) -> Result<std::result::Result<PushOpts, E
 
     if let Some(f) = from_file {
         if !o.pathspecs.is_empty() {
-            bail!("--pathspec-from-file is incompatible with pathspec arguments");
+            crate::git_fatal!("--pathspec-from-file is incompatible with pathspec arguments");
         }
         o.pathspecs = super::commit::read_pathspec_file(&f, nul)?;
     } else if nul {
-        bail!("--pathspec-file-nul requires --pathspec-from-file");
+        crate::git_fatal!("--pathspec-file-nul requires --pathspec-from-file");
     }
 
     // git refuses the combination outright rather than picking a winner, on
@@ -2436,7 +2436,7 @@ fn parse_store_options(args: &[String]) -> Result<(Option<String>, bool, String)
         i += 1;
     }
     if positionals.len() != 1 {
-        bail!("\"git stash store\" requires one <commit> argument");
+        crate::git_fatal!("\"git stash store\" requires one <commit> argument");
     }
     Ok((message, quiet, positionals.into_iter().next().expect("exactly one")))
 }
@@ -2515,7 +2515,7 @@ fn parse_apply_options(repo: &gix::Repository, args: &[String]) -> Result<ApplyO
             // exists; the selector itself is ready (`super::add_patch`).
             "-p" | "--patch" => bail!("--patch is not ported"),
             other if other.starts_with('-') && other != "-" => {
-                bail!("unsupported stash option '{other}'")
+                anyhow::bail!("unsupported stash option '{other}'")
             }
             other => specs.push(other.to_string()),
         }

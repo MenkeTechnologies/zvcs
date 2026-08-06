@@ -235,7 +235,7 @@ pub fn merge_recursive(args: &[String]) -> Result<ExitCode> {
     // `<head>`'s tree and the worktree must be clean.
     ensure_index_matches(&repo, &old_index, head_tree)?;
     if repo.is_dirty()? {
-        bail!("your local changes would be overwritten by merge; commit or stash them first");
+        crate::git_fatal!("your local changes would be overwritten by merge; commit or stash them first");
     }
 
     let how = TreatAsUnresolved::git();

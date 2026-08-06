@@ -412,7 +412,7 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
                 "the reftable ref storage format is not supported: no vendored \
                  reftable backend"
             ),
-            other => bail!("unknown ref storage format '{other}'"),
+            other => crate::git_fatal!("unknown ref storage format '{other}'"),
         }
     }
 
@@ -422,10 +422,10 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     // happens to be configured.
     if also_filter_submodules == Some(true) {
         if filter.is_none() {
-            bail!("the option '--also-filter-submodules' requires '--filter'");
+            crate::git_fatal!("the option '--also-filter-submodules' requires '--filter'");
         }
         if !recurse_submodules {
-            bail!("the option '--also-filter-submodules' requires '--recurse-submodules'");
+            crate::git_fatal!("the option '--also-filter-submodules' requires '--recurse-submodules'");
         }
     }
 
@@ -433,7 +433,7 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     // with a shallow request.
     if bundle_uri.is_some() && (depth.is_some() || shallow_since.is_some() || !shallow_exclude.is_empty())
     {
-        bail!(
+        crate::git_fatal!(
             "options '--bundle-uri' and '--depth/--shallow-since/--shallow-exclude' cannot be used together"
         );
     }
@@ -441,13 +441,13 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     // git refuses to combine these (`builtin/clone.c`, verified against stock git:
     // `fatal: options '--bare' and '--separate-git-dir' cannot be used together`).
     if bare && separate_git_dir.is_some() {
-        bail!("options '--bare' and '--separate-git-dir' cannot be used together");
+        crate::git_fatal!("options '--bare' and '--separate-git-dir' cannot be used together");
     }
     // A sparse checkout needs a worktree; stock git fails the clone here with
     // `fatal: this operation must be run in a work tree` /
     // `error: failed to initialize sparse-checkout`.
     if sparse && bare {
-        bail!("failed to initialize sparse-checkout: this operation must be run in a work tree");
+        crate::git_fatal!("failed to initialize sparse-checkout: this operation must be run in a work tree");
     }
 
     if positionals.len() > 2 {
@@ -606,7 +606,7 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
                 Err(e) if *if_able => {
                     eprintln!("info: Could not add alternate for '{path}': {e}");
                 }
-                Err(e) => bail!("{e}"),
+                Err(e) => crate::git_fatal!("{e}"),
             }
         }
         if !alternates.is_empty() {
@@ -1549,7 +1549,7 @@ fn split_config_key(key: &str) -> Result<(String, Option<String>, String)> {
     let section = &key[..first];
     let name = &key[last + 1..];
     if section.is_empty() || name.is_empty() {
-        bail!("key does not contain variable name: {key}");
+        crate::git_fatal!("key does not contain variable name: {key}");
     }
     let subsection = (first != last).then(|| key[first + 1..last].to_string());
     Ok((section.to_string(), subsection, name.to_string()))
@@ -1676,7 +1676,7 @@ fn check_transport_allowed(url: &gix::Url) -> Result<()> {
         gix::url::Scheme::Ext(ref name) => name.as_str(),
     };
     if !transport_allowed(kind)? {
-        bail!("transport '{kind}' not allowed");
+        crate::git_fatal!("transport '{kind}' not allowed");
     }
     Ok(())
 }

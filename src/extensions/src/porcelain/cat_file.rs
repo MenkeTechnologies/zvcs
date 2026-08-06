@@ -864,7 +864,7 @@ pub(crate) fn temp_blob_dir() -> Result<std::path::PathBuf> {
             Err(e) => return Err(e.into()),
         }
     }
-    anyhow::bail!("could not create a temporary directory in {}", base.display())
+    crate::git_fatal!("could not create a temporary directory in {}", base.display())
 }
 
 /// `git cat-file --textconv (<rev>:<path> | --path=<path> <rev>)`: emit the object

@@ -935,7 +935,7 @@ fn index_bytes(
 ) -> Result<Vec<u8>> {
     const LARGE_OFFSET_THRESHOLD: u64 = 0x7fff_ffff;
     if let Some(offset) = offsets.iter().find(|o| **o > LARGE_OFFSET_THRESHOLD) {
-        anyhow::bail!("pack offset {offset} needs a 64-bit index offset table, which is not written");
+        crate::git_fatal!("pack offset {offset} needs a 64-bit index offset table, which is not written");
     }
     let mut bytes = Vec::with_capacity(8 + 256 * 4 + ids.len() * 32);
     bytes.extend_from_slice(&[0xff, b't', b'O', b'c']);

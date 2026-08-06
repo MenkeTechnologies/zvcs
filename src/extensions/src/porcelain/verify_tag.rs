@@ -349,7 +349,7 @@ fn render_format(
                 } else if name == "end" {
                     end_atom(&mut stack)?;
                 } else if let Some(bad) = name.strip_prefix("if:") {
-                    bail!("unrecognized %(if) argument: {bad}");
+                    crate::git_fatal!("unrecognized %(if) argument: {bad}");
                 } else {
                     let value = atom_value(name, tag, id, data, &sub, &tagger)?;
                     stack.last_mut().expect("base frame").output.extend(value);
@@ -359,7 +359,7 @@ fn render_format(
     }
 
     if stack.len() != 1 {
-        bail!("format: %(end) atom missing");
+        crate::git_fatal!("format: %(end) atom missing");
     }
     Ok(stack.pop().expect("base frame").output)
 }
@@ -407,7 +407,7 @@ fn atom_value(
         "contents:body" => data[sub.body_start..sub.body_start + sub.nonsiglen].to_vec(),
         // C_SIG: the signature block, verbatim.
         "contents:signature" => data[sub.sig.0..sub.sig.0 + sub.sig.1].to_vec(),
-        _ => bail!("unsupported format atom \"%({name})\" (ported: tag, objectname, objecttype, objectsize, taggername, taggeremail, taggerdate, creatordate, contents:subject, contents:body, contents:signature, if, then, else, end)"),
+        _ => anyhow::bail!("unsupported format atom \"%({name})\" (ported: tag, objectname, objecttype, objectsize, taggername, taggeremail, taggerdate, creatordate, contents:subject, contents:body, contents:signature, if, then, else, end)"),
     })
 }
 
@@ -474,15 +474,15 @@ fn then_atom(stack: &mut [Frame]) -> Result<()> {
     let (cmp_status, needle) = match &mut cur.cond {
         Some(c) => {
             if c.then_atom_seen {
-                bail!("format: %(then) atom used more than once");
+                crate::git_fatal!("format: %(then) atom used more than once");
             }
             if c.else_atom_seen {
-                bail!("format: %(then) atom used after %(else)");
+                crate::git_fatal!("format: %(then) atom used after %(else)");
             }
             c.then_atom_seen = true;
             (c.cmp_status, c.str.clone())
         }
-        None => bail!("format: %(then) atom used without a %(if) atom"),
+        None => crate::git_fatal!("format: %(then) atom used without a %(if) atom"),
     };
 
     let satisfied = match cmp_status {
@@ -503,11 +503,11 @@ fn else_atom(stack: &mut Vec<Frame>) -> Result<()> {
     let cur = stack.last_mut().expect("base frame");
     match &cur.cond {
         Some(c) if !c.then_atom_seen => {
-            bail!("format: %(else) atom used without a %(then) atom")
+            crate::git_fatal!("format: %(else) atom used without a %(then) atom")
         }
-        Some(c) if c.else_atom_seen => bail!("format: %(else) atom used more than once"),
+        Some(c) if c.else_atom_seen => crate::git_fatal!("format: %(else) atom used more than once"),
         Some(_) => {}
-        None => bail!("format: %(else) atom used without a %(if) atom"),
+        None => crate::git_fatal!("format: %(else) atom used without a %(if) atom"),
     }
     let mut cond = cur.cond.take().expect("condition present");
     cond.else_atom_seen = true;
@@ -523,10 +523,10 @@ fn else_atom(stack: &mut Vec<Frame>) -> Result<()> {
 fn end_atom(stack: &mut Vec<Frame>) -> Result<()> {
     let cond = match stack.last_mut().and_then(|f| f.cond.take()) {
         Some(c) => c,
-        None => bail!("format: %(end) atom used without corresponding atom"),
+        None => crate::git_fatal!("format: %(end) atom used without corresponding atom"),
     };
     if !cond.then_atom_seen {
-        bail!("format: %(if) atom used without a %(then) atom");
+        crate::git_fatal!("format: %(if) atom used without a %(then) atom");
     }
 
     if cond.else_atom_seen {
@@ -736,7 +736,7 @@ fn run_gpg(repo: &gix::Repository, payload: &[u8], signature: &[u8]) -> Result<G
         Ok(c) => c,
         Err(e) => {
             let _ = std::fs::remove_file(&sig_path);
-            bail!("could not run {program:?}: {e}");
+            crate::git_fatal!("could not run {program:?}: {e}");
         }
     };
 

@@ -1150,7 +1150,7 @@ fn parse_command(text: &str) -> Result<Command> {
     let mut it = text.splitn(3, ' ');
     let (o, n, name) = match (it.next(), it.next(), it.next()) {
         (Some(o), Some(n), Some(name)) if !name.is_empty() => (o, n, name),
-        _ => bail!("protocol error: expected old/new/ref, got {text:?}"),
+        _ => crate::git_fatal!("protocol error: expected old/new/ref, got {text:?}"),
     };
     Ok(Command {
         old: gix::ObjectId::from_hex(o.as_bytes())
@@ -1895,7 +1895,7 @@ fn read_push_cert(input: &mut impl Read, cert: &mut Vec<u8>) -> Result<bool> {
 /// certificate's blank line and the start of its signature.
 fn commands_from_cert(cert: &[u8]) -> Result<Vec<Command>> {
     let Some(boc) = memchr::memmem::find(cert, b"\n\n").map(|i| i + 2) else {
-        bail!(
+        crate::git_fatal!(
             "malformed push certificate {}",
             String::from_utf8_lossy(&cert[..cert.len().min(100)])
         );

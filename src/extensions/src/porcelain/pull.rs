@@ -240,10 +240,10 @@ fn parse_rebase_value(v: &str) -> Result<RebaseMode> {
         "false" | "no" | "off" | "0" => Ok(RebaseMode::Disabled),
         "merges" => Ok(RebaseMode::Merges),
         "interactive" => Ok(RebaseMode::Interactive),
-        "preserve" => bail!(
+        "preserve" => crate::git_fatal!(
             "preserve is no longer supported (--rebase=preserve / pull.rebase=preserve); use 'merges' instead"
         ),
-        other => bail!("Invalid value for rebase: '{other}'"),
+        other => crate::git_fatal!("Invalid value for rebase: '{other}'"),
     }
 }
 
@@ -754,7 +754,7 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
     let merge_heads = super::merge::fetch_head_for_merge(&repo)?;
     if merge_heads.is_empty() {
         // `die_no_merge_candidates()`: nothing came back that could be merged.
-        bail!("couldn't find remote ref {target_ref}");
+        crate::git_fatal!("couldn't find remote ref {target_ref}");
     }
 
     // ---- phase 2: integrate ----------------------------------------------
@@ -867,10 +867,10 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
         // git's `cmd_pull()` rejects both of these ahead of the rebase, since a
         // rebase has nowhere to put them.
         if squash.is_some() {
-            bail!("--squash is incompatible with --rebase");
+            crate::git_fatal!("--squash is incompatible with --rebase");
         }
         if allow_unrelated {
-            bail!("--allow-unrelated-histories is incompatible with --rebase");
+            crate::git_fatal!("--allow-unrelated-histories is incompatible with --rebase");
         }
         // `get_rebase_newbase_and_upstream()`: without a fork point both the new
         // base and the upstream are the fetched head itself, and git passes the

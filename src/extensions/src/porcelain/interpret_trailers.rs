@@ -563,7 +563,7 @@ pub fn interpret_trailers(args: &[String]) -> Result<ExitCode> {
             .iter()
             .any(|i| i.command.is_some() || i.cmd.is_some())
     {
-        bail!("unsupported config trailer.<key-alias>.cmd/.command (needs shell execution)");
+        anyhow::bail!("unsupported config trailer.<key-alias>.cmd/.command (needs shell execution)");
     }
 
     if run.files.is_empty() {

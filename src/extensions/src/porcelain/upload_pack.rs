@@ -284,7 +284,7 @@ pub fn upload_pack(args: &[String]) -> Result<ExitCode> {
     // over a sibling bare repository of the same name.
     let expanded = match expand_tilde(directory) {
         Ok(p) => p,
-        Err(msg) => bail!("{msg}"),
+        Err(msg) => crate::git_fatal!("{msg}"),
     };
     let candidates: Vec<PathBuf> = if strict {
         vec![expanded]
@@ -450,11 +450,11 @@ fn serve_inner(repo: &gix::Repository, advertise_only: bool, stateless_rpc: bool
         // `filter <spec>` (upload-pack.c:1109-1116).
         if let Some(spec) = text.strip_prefix("filter ") {
             if !filter_requested {
-                bail!("git upload-pack: filtering capability not negotiated");
+                crate::git_fatal!("git upload-pack: filtering capability not negotiated");
             }
             // `list_objects_filter_die_if_populated()`.
             if filter_spec.is_some() {
-                bail!("multiple filter-specs cannot be combined");
+                crate::git_fatal!("multiple filter-specs cannot be combined");
             }
             if let Some(err) = filter_ban_reason(repo, spec) {
                 // `send_err_and_die()`: the reason reaches the client as an
@@ -462,7 +462,7 @@ fn serve_inner(repo: &gix::Repository, advertise_only: bool, stateless_rpc: bool
                 let mut out = std::io::stdout().lock();
                 write_pkt(&mut out, format!("ERR {err}").as_bytes())?;
                 out.flush()?;
-                bail!("{err}");
+                crate::git_fatal!("{err}");
             }
             filter_spec = Some(spec.to_string());
             continue;
@@ -475,7 +475,7 @@ fn serve_inner(repo: &gix::Repository, advertise_only: bool, stateless_rpc: bool
                 let mut out = std::io::stdout().lock();
                 write_pkt(&mut out, format!("ERR {message}").as_bytes())?;
                 out.flush()?;
-                bail!("{message}");
+                crate::git_fatal!("{message}");
             }
         }
     }

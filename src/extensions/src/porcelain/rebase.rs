@@ -1095,7 +1095,7 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
     // --- HEAD --------------------------------------------------------------
     let head = repo.head()?;
     if head.is_unborn() {
-        bail!("cannot rebase an unborn branch");
+        crate::git_fatal!("cannot rebase an unborn branch");
     }
     let mut head_oid = head
         .id()
@@ -1127,7 +1127,7 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
                     }
                     name.shorten().to_string()
                 }
-                Some(Err(e)) => bail!("{e}"),
+                Some(Err(e)) => crate::git_fatal!("{e}"),
                 None => {
                     // `error_on_missing_default_upstream()`: stdout, exit 1.
                     match branch.as_ref() {
@@ -2358,7 +2358,7 @@ fn sequencer_rebase(start: SequencerStart<'_>) -> Result<ExitCode> {
 
     let (mut list, ok) = todo::List::parse(repo, &script, false);
     if !ok {
-        bail!("generated an unusable todo list");
+        crate::git_fatal!("generated an unusable todo list");
     }
 
     // `complete_action()`.
@@ -2870,7 +2870,7 @@ impl<'r> Sequencer<'r> {
                 }
                 todo::Cmd::UpdateRef => {
                     self.term_clear_line();
-                    bail!(
+                    anyhow::bail!(
                         "unsupported todo command \"update-ref\" (refs pointing into the rebased \
                          range are not tracked; the rebase is still resumable with \
                          `git rebase --abort`)"
@@ -2883,7 +2883,7 @@ impl<'r> Sequencer<'r> {
                 }
                 todo::Cmd::Revert => {
                     self.term_clear_line();
-                    bail!("unsupported todo command \"revert\" (only `git revert` produces it)")
+                    anyhow::bail!("unsupported todo command \"revert\" (only `git revert` produces it)")
                 }
             };
             match step {
@@ -3020,7 +3020,7 @@ impl<'r> Sequencer<'r> {
         // rather than that stand-in's child.
         let create_root = item.cmd.is_pick_or_similar() && Some(head) == self.st.squash_onto;
         if create_root && item.cmd.is_fixup() {
-            bail!("cannot fixup root commit");
+            crate::git_fatal!("cannot fixup root commit");
         }
 
         let parent = commit.parent_ids().next().map(|p| p.detach());

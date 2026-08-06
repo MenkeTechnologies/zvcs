@@ -369,7 +369,7 @@ pub fn am(args: &[String]) -> Result<ExitCode> {
         Resume::Abort => am_abort(&repo, &state_dir),
         // git has no `--retry` verb; this port accepts the token in `parse` but
         // there is no faithful behavior to drive, so it stays an honest refusal.
-        Resume::Retry => bail!(
+        Resume::Retry => crate::git_fatal!(
             "`git am --retry` is not a git verb; there is no upstream behavior to port"
         ),
     }
@@ -2138,7 +2138,7 @@ fn show_patch(state_dir: &Path, sub: Sub) -> Result<ExitCode> {
     if state_dir.join("original-commit").is_file() {
         // git delegates to `git show <orig-commit> --` for a rebase-driven
         // session; that session cannot be produced here in the first place.
-        bail!(
+        crate::git_fatal!(
             "--show-current-patch for a rebase-driven am session is not yet ported: it \
              replays `git show <original-commit>`, and gix-rebase is an empty placeholder"
         );

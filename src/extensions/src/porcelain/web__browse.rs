@@ -155,7 +155,7 @@ pub fn web__browse(args: &[String]) -> Result<ExitCode> {
                 continue;
             }
             if opt.split_whitespace().count() > 1 {
-                bail!("config variable {opt:?} word-splits into several `git config` arguments (unsupported)");
+                anyhow::bail!("config variable {opt:?} word-splits into several `git config` arguments (unsupported)");
             }
             if let Some(v) = git_config(&cfg, opt) {
                 browser = v;

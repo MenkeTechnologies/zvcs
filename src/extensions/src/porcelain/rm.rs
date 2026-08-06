@@ -575,7 +575,7 @@ pub fn rm(args: &[String]) -> Result<ExitCode> {
             match res {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => bail!("failed to remove {}: {e}", t.path.to_str_lossy()),
+                Err(e) => crate::git_fatal!("failed to remove {}: {e}", t.path.to_str_lossy()),
             }
             // Prune now-empty parent directories up to (never including) workdir.
             let mut cur = abs.parent().map(|p| p.to_owned());
@@ -672,7 +672,7 @@ fn worktree_blob(
     let meta = match std::fs::symlink_metadata(&abs) {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => bail!("failed to stat {}: {e}", path.to_str_lossy()),
+        Err(e) => crate::git_fatal!("failed to stat {}: {e}", path.to_str_lossy()),
     };
 
     let content: Vec<u8> = if mode == Mode::SYMLINK || meta.is_symlink() {
@@ -726,7 +726,7 @@ fn gitmodules_has_unstaged_changes(
     let content = match std::fs::read(&abs) {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(e) => bail!("failed to read .gitmodules: {e}"),
+        Err(e) => crate::git_fatal!("failed to read .gitmodules: {e}"),
     };
     let id = gix::objs::compute_hash(repo.object_hash(), gix::objs::Kind::Blob, &content)?;
     Ok(id != entry.id)
@@ -745,7 +745,7 @@ fn update_gitmodules(
     let mut content = match std::fs::read(&gm_path) {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => bail!("failed to read .gitmodules: {e}"),
+        Err(e) => crate::git_fatal!("failed to read .gitmodules: {e}"),
     };
 
     let mut changed = false;

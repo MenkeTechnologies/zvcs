@@ -3025,7 +3025,7 @@ fn read_block(data: &[u8], mut pos: usize, counts: &TzCounts, time_size: usize) 
 /// `git reflog list` — every ref under `$GIT_DIR/logs` that owns a log file.
 fn list(repo: &gix::Repository, rest: &[String]) -> Result<ExitCode> {
     if let Some(a) = rest.first() {
-        bail!("unsupported argument {a:?} for `reflog list`");
+        anyhow::bail!("unsupported argument {a:?} for `reflog list`");
     }
     if repo.git_dir() != repo.common_dir() {
         bail!("`reflog list` from a linked worktree is not supported");
@@ -3263,7 +3263,7 @@ fn read_raw_log(path: &Path) -> Result<Option<Vec<RawLine>>> {
         }
         match parse_raw_line(line) {
             Some(parsed) => out.push(parsed),
-            None => bail!("bad reflog line in {}", path.display()),
+            None => crate::git_fatal!("bad reflog line in {}", path.display()),
         }
     }
     Ok(Some(out))
@@ -3311,7 +3311,7 @@ fn delete_entries(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
             "--updateref" => updateref = true,
             "-n" | "--dry-run" => dry_run = true,
             "--verbose" | "-q" | "--quiet" => {}
-            s if s.starts_with('-') => bail!("unsupported argument {s:?} for `reflog delete`"),
+            s if s.starts_with('-') => anyhow::bail!("unsupported argument {s:?} for `reflog delete`"),
             s => selectors.push(s),
         }
     }
@@ -3420,17 +3420,17 @@ fn expire_entries(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
                 let v = &s["--expire-unreachable=".len()..];
                 match cutoff(v) {
                     Some(t) => expire_unreachable = Some(t),
-                    None => bail!("'{v}' is not a valid timestamp"),
+                    None => crate::git_fatal!("'{v}' is not a valid timestamp"),
                 }
             }
             _ if s.starts_with("--expire=") => {
                 let v = &s["--expire=".len()..];
                 match cutoff(v) {
                     Some(t) => expire = Some(t),
-                    None => bail!("'{v}' is not a valid timestamp"),
+                    None => crate::git_fatal!("'{v}' is not a valid timestamp"),
                 }
             }
-            _ if s.starts_with('-') => bail!("unsupported argument {s:?} for `reflog expire`"),
+            _ if s.starts_with('-') => anyhow::bail!("unsupported argument {s:?} for `reflog expire`"),
             _ => refs.push(s.to_owned()),
         }
     }

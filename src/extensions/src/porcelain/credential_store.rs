@@ -425,7 +425,7 @@ fn read_credential_file(path: &Path) -> Result<Vec<Vec<u8>>> {
         {
             Ok(Vec::new())
         }
-        Err(e) => anyhow::bail!("unable to open {}: {e}", path.display()),
+        Err(e) => crate::git_fatal!("unable to open {}: {e}", path.display()),
     }
 }
 
@@ -514,11 +514,11 @@ fn rewrite_credential_file(
     drop(file);
     if let Err(e) = write {
         let _ = std::fs::remove_file(&lock);
-        anyhow::bail!("unable to write credential store: {e}");
+        crate::git_fatal!("unable to write credential store: {e}");
     }
     if let Err(e) = std::fs::rename(&lock, path) {
         let _ = std::fs::remove_file(&lock);
-        anyhow::bail!("unable to write credential store: {e}");
+        crate::git_fatal!("unable to write credential store: {e}");
     }
     Ok(())
 }
@@ -548,7 +548,7 @@ fn acquire_lock(lock: &Path) -> Result<std::fs::File> {
                 std::thread::sleep(std::time::Duration::from_millis(10));
                 waited += 10;
             }
-            Err(e) => anyhow::bail!("unable to get credential storage lock in {TIMEOUT_MS} ms: {e}"),
+            Err(e) => crate::git_fatal!("unable to get credential storage lock in {TIMEOUT_MS} ms: {e}"),
         }
     }
 }

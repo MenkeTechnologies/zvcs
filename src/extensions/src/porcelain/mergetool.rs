@@ -159,7 +159,7 @@ pub fn mergetool(args: &[String]) -> Result<ExitCode> {
     // `require_work_tree`. git's wording embeds the script's own absolute path,
     // which cannot be reproduced, so this states the condition instead.
     if repo.workdir().is_none() {
-        bail!("this operation must be run in a work tree");
+        crate::git_fatal!("this operation must be run in a work tree");
     }
 
     // `get_merge_tool` (main line `merge_tool=$(get_merge_tool)`), which runs
@@ -360,7 +360,7 @@ fn merge_file(
             }
             // A real answer drives the resolve loop's checkout-index/add/rm/
             // update-index mutation — interactive and not ported (see [`SUBSTRATE`]).
-            bail!(SUBSTRATE);
+            anyhow::bail!("{SUBSTRATE}");
         }
         AfterMessage::Normal => {
             if show_prompt {
@@ -378,7 +378,7 @@ fn merge_file(
             }
             // `run_merge_tool`: only a user-defined `.cmd` tool is portable here.
             let Some(cmd) = tool_cmd else {
-                bail!(SUBSTRATE);
+                anyhow::bail!("{SUBSTRATE}");
             };
             run_user_tool(
                 repo,
@@ -419,7 +419,7 @@ fn run_user_tool(
 ) -> Result<MergeOutcome> {
     let merged = match path.to_str() {
         Ok(s) => s.to_owned(),
-        Err(_) => bail!("cannot stage a merge tool for a non-UTF-8 path {path:?}"),
+        Err(_) => crate::git_fatal!("cannot stage a merge tool for a non-UTF-8 path {path:?}"),
     };
 
     if hide_resolved {
@@ -1410,10 +1410,10 @@ fn read_merge_rr(repo: &gix::Repository) -> Result<Vec<BString>> {
             continue;
         }
         if rec.len() < hexsz + 2 {
-            bail!("corrupt MERGE_RR");
+            crate::git_fatal!("corrupt MERGE_RR");
         }
         let Some(tab_at) = rec.iter().position(|&b| b == b'\t') else {
-            bail!("corrupt MERGE_RR");
+            crate::git_fatal!("corrupt MERGE_RR");
         };
         let path = BString::from(&rec[tab_at + 1..]);
         if !out.contains(&path) {

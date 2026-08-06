@@ -114,7 +114,7 @@ pub fn init(args: &[String]) -> Result<ExitCode> {
         let arg = &args[i];
         if positional_only || !arg.starts_with('-') || arg == "-" {
             if directory.is_some() {
-                anyhow::bail!("too many arguments, expected at most one directory");
+                crate::git_fatal!("too many arguments, expected at most one directory");
             }
             directory = Some(arg.clone());
             i += 1;
@@ -245,7 +245,7 @@ pub fn init(args: &[String]) -> Result<ExitCode> {
 
     // git refuses to combine these (builtin/init-db.c: "cannot be used together").
     if separate_git_dir.is_some() && bare {
-        anyhow::bail!(
+        crate::git_fatal!(
             "options '--separate-git-dir' and '--bare' cannot be used together"
         );
     }
@@ -670,7 +670,7 @@ fn parse_shared_value(value: &str) -> Result<i32> {
         Some(2) => Ok(0o664),
         Some(mode) => {
             if (mode & 0o600) != 0o600 {
-                anyhow::bail!(
+                crate::git_fatal!(
                     "problem with core.sharedRepository filemode value (0{mode:03o}).\n\
                      The owner of files must always have read and write permissions."
                 );
@@ -713,7 +713,7 @@ fn write_shared_config(git_dir: &Path, shared: i32) -> Result<()> {
     } else if shared == 0o664 {
         "2".to_string()
     } else {
-        anyhow::bail!("invalid value for shared repository");
+        crate::git_fatal!("invalid value for shared repository");
     };
 
     let path = git_dir.join("config");

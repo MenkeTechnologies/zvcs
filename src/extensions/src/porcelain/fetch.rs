@@ -287,7 +287,7 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
                          superproject's old/new submodule gitlinks to decide what to fetch)"
                     ),
                     Some(other) => {
-                        anyhow::bail!("--recurse-submodules expects yes/on-demand/no, got {other:?}")
+                        crate::git_fatal!("--recurse-submodules expects yes/on-demand/no, got {other:?}")
                     }
                 });
             }
@@ -702,7 +702,7 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
     let result = (|| -> Result<()> {
         if all {
             if !positionals.is_empty() {
-                anyhow::bail!("fetch --all does not take a repository argument");
+                crate::git_fatal!("fetch --all does not take a repository argument");
             }
             // git announces each remote on stdout while fanning out, but only on
             // the genuinely multi-remote path: `cmd_fetch` short-circuits

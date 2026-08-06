@@ -581,7 +581,7 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
         match positionals.as_slice() {
             [] => {}
             [c] => commit_spec = Some(*c),
-            _ => bail!("too many revisions given before `--`"),
+            _ => crate::git_fatal!("too many revisions given before `--`"),
         }
     } else if let Some((first, rest)) = positionals.split_first() {
         if repo.rev_parse_single(*first).is_ok() {
@@ -693,7 +693,7 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
     let target_tree = commit.tree_id()?.detach();
 
     if mode == ResetMode::Hard && repo.workdir().is_none() {
-        bail!("hard reset not allowed in a bare repository");
+        crate::git_fatal!("hard reset not allowed in a bare repository");
     }
 
     // Serialize the whole read-modify-write; held for the rest of the function.

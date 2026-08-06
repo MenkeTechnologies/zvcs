@@ -560,7 +560,7 @@ fn get_info_refs(hdr: &mut Headers, repo: &gix::Repository, cfg: &HttpConfig) ->
             Ok(s) => s,
             Err(code) => return Ok(code),
         };
-        bail!(
+        crate::git_fatal!(
             "smart HTTP advertisement for {svc:?} needs a server-side {svc} \
              (git runs `{svc} --http-backend-info-refs`); the vendored gitoxide \
              has no server implementation — gix-protocol is client-only"
@@ -743,7 +743,7 @@ fn service_rpc(hdr: &mut Headers, cfg: &HttpConfig, service_name: &str) -> Resul
         return Ok(ExitCode::SUCCESS);
     }
 
-    bail!(
+    crate::git_fatal!(
         "smart HTTP RPC for {svc:?} needs a server-side {svc} \
          (git runs `{svc} --stateless-rpc .` and pipes the request body into it); \
          the vendored gitoxide has no server implementation — gix-protocol is client-only"

@@ -566,7 +566,7 @@ fn print_columns(list: &[Vec<u8>], colopts: u32, opts: &Options, out: &mut Vec<u
     match colopts & COL_LAYOUT_MASK {
         COL_PLAIN => display_plain(list, indent, nl, out),
         COL_ROW | COL_COLUMN => display_table(list, colopts, indent, nl, width, opts.padding, out)?,
-        mode => bail!("invalid layout mode {mode}"),
+        mode => crate::git_fatal!("invalid layout mode {mode}"),
     }
     Ok(())
 }
@@ -668,7 +668,7 @@ fn display_table(
     if initial_width == 0 {
         // Upstream divides by this unconditionally; a zero divisor can only
         // arise from all-empty input with `--padding=0`, where git crashes.
-        bail!("cannot lay out empty cells with --padding=0");
+        crate::git_fatal!("cannot lay out empty cells with --padding=0");
     }
     let mut cols = (total_width - indent.len() as i64) / initial_width;
     if cols == 0 {

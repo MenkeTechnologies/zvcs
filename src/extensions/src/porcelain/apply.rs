@@ -1578,7 +1578,7 @@ fn parse_one(
             p.is_rename = true;
             p.new_name = Some(strip_path(&unquote(rest)?, strip.saturating_sub(1))?);
         } else if l.starts_with("copy from ") || l.starts_with("copy to ") {
-            bail!("copy patches are not implemented (ported: {PORTED})");
+            anyhow::bail!("copy patches are not implemented (ported: {PORTED})");
         } else if let Some(rest) = l.strip_prefix("similarity index ") {
             // Drives the `(N%)` in the summary's rename line.
             p.score = rest.trim().trim_end_matches('%').parse().unwrap_or(0);
@@ -1646,7 +1646,7 @@ fn parse_one(
 /// side is `None` for a creation or deletion.
 fn normalise(mut p: Patch) -> Result<Patch> {
     if p.old_name.is_none() && p.new_name.is_none() {
-        bail!("corrupt patch: no file name in the header");
+        crate::git_fatal!("corrupt patch: no file name in the header");
     }
     if p.old_name.is_none() {
         p.is_new = true;
@@ -1863,7 +1863,7 @@ fn strip_path(name: &[u8], n: usize) -> Result<String> {
     for _ in 0..n {
         match s.iter().position(|&b| b == b'/') {
             Some(i) => s = &s[i + 1..],
-            None => bail!(
+            None => crate::git_fatal!(
                 "removing {n} leading path components from {:?} would leave nothing",
                 String::from_utf8_lossy(name)
             ),
@@ -1878,7 +1878,7 @@ fn strip_path(name: &[u8], n: usize) -> Result<String> {
 /// is what lets git through this gate, is not honoured, so this is unconditional.
 fn check_path(out: String) -> Result<String> {
     if out.is_empty() || out.starts_with('/') || out.split('/').any(|c| c == "..") {
-        bail!("refusing to apply to path {out:?} outside the working tree");
+        crate::git_fatal!("refusing to apply to path {out:?} outside the working tree");
     }
     Ok(out)
 }
@@ -1915,7 +1915,7 @@ fn unquote(s: &str) -> Result<Vec<u8>> {
         }
         i += 1;
         let Some(&c) = inner.get(i) else {
-            bail!("corrupt quoted path {s:?}");
+            crate::git_fatal!("corrupt quoted path {s:?}");
         };
         i += 1;
         match c {
@@ -1940,7 +1940,7 @@ fn unquote(s: &str) -> Result<Vec<u8>> {
                 }
                 out.push(v as u8);
             }
-            _ => bail!("corrupt quoted path {s:?}"),
+            _ => crate::git_fatal!("corrupt quoted path {s:?}"),
         }
     }
     Ok(out)

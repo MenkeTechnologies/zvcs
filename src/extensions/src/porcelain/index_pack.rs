@@ -328,7 +328,7 @@ pub fn index_pack(args: &[String]) -> Result<ExitCode> {
             // git reads the pack from stdin and compares against the existing
             // index; the two `Cannot open existing pack ...` spellings it uses
             // there are not reproduced, so refuse rather than guess.
-            bail!("unsupported: `--verify --stdin` (only verifying a pack already on disk is ported)");
+            anyhow::bail!("unsupported: `--verify --stdin` (only verifying a pack already on disk is ported)");
         }
         return verify_existing(&opts, &index_name);
     }
@@ -436,7 +436,7 @@ fn index_pack_file(opts: &Opts, pack_path: &Path, index_path: &Path) -> Result<E
 
     reject_unported(opts)?;
     if opts.keep.is_some() {
-        bail!("unsupported: `--keep` without `--stdin`");
+        anyhow::bail!("unsupported: `--keep` without `--stdin`");
     }
 
     // `parse_pack_header()` is the first thing git does with the bytes, and its
@@ -512,7 +512,7 @@ fn verify_existing(opts: &Opts, index_path: &Path) -> Result<ExitCode> {
 
     reject_unported(opts)?;
     if opts.keep.is_some() {
-        bail!("unsupported: `--verify --keep` (the .keep file is not written here)");
+        anyhow::bail!("unsupported: `--verify --keep` (the .keep file is not written here)");
     }
 
     let options = pack::index::verify::integrity::Options {
@@ -534,7 +534,7 @@ fn verify_existing(opts: &Opts, index_path: &Path) -> Result<ExitCode> {
         Ok(_) => Ok(ExitCode::SUCCESS),
         // git's per-corruption diagnostics are not reproduced; report the real
         // failure rather than inventing text that only looks like git's.
-        Err(e) => bail!("--verify failed for '{name}': {e}"),
+        Err(e) => crate::git_fatal!("--verify failed for '{name}': {e}"),
     }
 }
 
@@ -722,7 +722,7 @@ fn reject_unported(opts: &Opts) -> Result<()> {
     }
     if let Some(fmt) = &opts.object_format {
         if fmt != "sha1" {
-            bail!("unsupported object format {fmt:?} (ported: sha1)");
+            anyhow::bail!("unsupported object format {fmt:?} (ported: sha1)");
         }
     }
     if let Some((version, off32_limit)) = opts.index_version {

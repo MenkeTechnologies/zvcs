@@ -628,7 +628,7 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
     // patch that ignored the option.
     if let Some(reason) = &opts.deferred {
         if !(a.is_empty() || b.is_empty()) {
-            bail!("{reason}");
+            crate::git_fatal!("{reason}");
         }
     }
 

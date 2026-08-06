@@ -550,7 +550,7 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
             .iter()
             .any(|(id, _)| !by_subdir.insert(id.as_bytes()[0]));
         if collides || has_packs(&repo) {
-            bail!(
+            anyhow::bail!(
                 "refusing to guess the output order: git emits these {} lines during its \
                  object-directory scan, and two of them share the raw readdir() sequence of one \
                  .git/objects/?? subdirectory",
@@ -573,7 +573,7 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
         // Either way, two distinct ids in the same slot are unorderable.
         let collides = by_slot.values().any(|ids| ids.len() > 1);
         if collides || has_packs(&repo) {
-            bail!(
+            anyhow::bail!(
                 "refusing to guess the output order: git emits these {} object-content messages \
                  during its object-directory scan, and two of them share the raw readdir() \
                  sequence of one .git/objects/?? subdirectory",
@@ -761,7 +761,7 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
     let order = SlotOrder::new(&state.known);
     let reported: Vec<ObjectId> = lines.iter().map(|(id, _)| *id).collect();
     if order.is_ambiguous_for(&reported) {
-        bail!(
+        anyhow::bail!(
             "refusing to guess the output order: git emits these {} lines in obj_hash slot order, \
              and two of them share a collision cluster whose order depends on git's internal \
              object-creation sequence, which this port does not model",

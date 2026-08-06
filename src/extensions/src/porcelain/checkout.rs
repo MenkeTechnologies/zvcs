@@ -327,7 +327,7 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
             match pre.len() {
                 0 => (None, post.as_slice()),
                 1 => (Some(pre[0]), post.as_slice()),
-                _ => bail!("only one <tree-ish> may precede `--`"),
+                _ => crate::git_fatal!("only one <tree-ish> may precede `--`"),
             }
         } else if !pre.is_empty() && repo.rev_parse_single(pre[0]).is_ok() {
             (Some(pre[0]), &pre[1..])
@@ -358,17 +358,17 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
     // `<tree-ish>` source; anything else is git's incompatibility error.
     if let Some(file) = pathspec_from_file {
         if has_dashdash || !post.is_empty() {
-            bail!("--pathspec-from-file is incompatible with pathspec arguments");
+            crate::git_fatal!("--pathspec-from-file is incompatible with pathspec arguments");
         }
         if new_branch.is_some() || orphan.is_some() || writeout_stage.is_some() {
-            bail!("--pathspec-from-file cannot be combined with branch creation or --ours/--theirs");
+            crate::git_fatal!("--pathspec-from-file cannot be combined with branch creation or --ours/--theirs");
         }
         let specs = read_pathspec_file(&file, pathspec_file_nul)?;
         let refs: Vec<&str> = specs.iter().map(String::as_str).collect();
         return match pre.len() {
             0 => restore_from_index(&repo, &refs, false, quiet),
             1 => restore_from_tree(&repo, pre[0], &refs, overlay, quiet),
-            _ => bail!("only one <tree-ish> may precede pathspecs"),
+            _ => crate::git_fatal!("only one <tree-ish> may precede pathspecs"),
         };
     }
 
@@ -399,7 +399,7 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
             return Ok(ExitCode::from(128));
         }
         if pre.len() > 1 {
-            bail!("too many start-points given for branch creation");
+            crate::git_fatal!("too many start-points given for branch creation");
         }
         let start = pre.first().copied().unwrap_or("HEAD");
         // On an UNBORN HEAD (a fresh `git init`, or a clone of an empty repo)
@@ -464,12 +464,12 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
 
     if has_dashdash {
         if post.is_empty() {
-            bail!("you must specify path(s) to restore");
+            crate::git_fatal!("you must specify path(s) to restore");
         }
         return match pre.len() {
             0 => restore_from_index(&repo, &post, false, quiet),
             1 => restore_from_tree(&repo, pre[0], &post, overlay, quiet),
-            _ => bail!("only one <tree-ish> may precede `--`"),
+            _ => crate::git_fatal!("only one <tree-ish> may precede `--`"),
         };
     }
 
@@ -862,7 +862,7 @@ fn create_and_switch(
 ) -> Result<ExitCode> {
     let full = format!("refs/heads/{name}");
     if gix::validate::reference::branch_name(BStr::new(full.as_bytes())).is_err() {
-        bail!("'{name}' is not a valid branch name");
+        crate::git_fatal!("'{name}' is not a valid branch name");
     }
 
     // `-t`: resolve the upstream before any mutation, so a bad start-point fails
@@ -902,7 +902,7 @@ fn create_and_switch(
 
     let existed = repo.try_find_reference(full.as_str())?.is_some();
     if existed && !reset {
-        bail!("a branch named '{name}' already exists");
+        crate::git_fatal!("a branch named '{name}' already exists");
     }
 
     if target_tree != cur_tree {
@@ -1305,7 +1305,7 @@ fn unquote_c_style(quoted: &[u8]) -> Result<String> {
             b'"' => return Ok(String::from_utf8_lossy(&out).into_owned()),
             b'\\' => {
                 let Some(e) = it.next() else {
-                    bail!("unterminated quoted pathspec");
+                    crate::git_fatal!("unterminated quoted pathspec");
                 };
                 match e {
                     b'a' => out.push(0x07),
@@ -1329,13 +1329,13 @@ fn unquote_c_style(quoted: &[u8]) -> Result<String> {
                         }
                         out.push(val as u8);
                     }
-                    _ => bail!("invalid escape in quoted pathspec"),
+                    _ => crate::git_fatal!("invalid escape in quoted pathspec"),
                 }
             }
             _ => out.push(c),
         }
     }
-    bail!("missing closing quote in pathspec")
+    crate::git_fatal!("missing closing quote in pathspec")
 }
 
 /// Restore `paths` in the worktree from the current index (index left unchanged;

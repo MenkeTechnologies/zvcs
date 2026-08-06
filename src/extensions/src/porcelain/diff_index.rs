@@ -1435,7 +1435,7 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
         // content-driven in git, so an all-clean pair list renders as nothing; only a run
         // that would produce real bytes is refused.
         if !deltas.is_empty() {
-            bail!("unsupported output format {flag:?} (ported: {PORTED})");
+            anyhow::bail!("unsupported output format {flag:?} (ported: {PORTED})");
         }
     } else if opts.format != Format::Silent {
         // Per-pair blob analysis for the content formats. The stat family and the patch
@@ -1745,7 +1745,7 @@ fn collect(repo: &gix::Repository, tree_id: &ObjectId, opts: &Opts) -> Result<Ve
 
     let workdir: Option<PathBuf> = repo.workdir().map(Path::to_path_buf);
     if !opts.cached && workdir.is_none() {
-        bail!("this operation must be run in a work tree");
+        crate::git_fatal!("this operation must be run in a work tree");
     }
     let index_timestamp = index_state.timestamp().unix_seconds();
     // `core.trustCTime` / `core.checkStat`, which decide how much of the stat data

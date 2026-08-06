@@ -672,7 +672,7 @@ pub(super) fn blame_with(args: &[String], cmd: &str) -> Result<ExitCode> {
             err.flush()?;
             return Ok(ExitCode::from(128));
         }
-        Err(LineSpecError::Unimplementable(what)) => bail!("blame: {what} is not yet ported"),
+        Err(LineSpecError::Unimplementable(what)) => crate::git_fatal!("blame: {what} is not yet ported"),
     }
 
     // Blame the full file; `-L` is applied to the result so that the working-tree
@@ -2390,7 +2390,7 @@ enum DateOutcome {
 fn resolve_date_mode(input: &str) -> Result<DateOutcome> {
     match classify_date(input) {
         DateClass::Supported(m) => Ok(DateOutcome::Mode(m)),
-        DateClass::Unsupported(f) => bail!("unsupported --date mode: {f}"),
+        DateClass::Unsupported(f) => anyhow::bail!("unsupported --date mode: {f}"),
         DateClass::UnknownFormat(f) => {
             let mut err = std::io::stderr().lock();
             writeln!(err, "fatal: unknown date format {f}")?;
@@ -2848,7 +2848,7 @@ fn parse_diff_algorithm(name: &str) -> Result<gix::diff::blob::Algorithm> {
     } else if name.eq_ignore_ascii_case("patience") {
         bail!("diff algorithm 'patience' is not implemented")
     } else {
-        bail!(
+        crate::git_fatal!(
             "option diff-algorithm accepts \"myers\", \"minimal\", \"patience\" and \"histogram\""
         )
     }

@@ -336,7 +336,7 @@ fn report_atom_error(e: AtomError) -> Result<ExitCode> {
     match e.kind {
         ErrKind::Fatal => Ok(fatal(&e.msg)),
         ErrKind::Usage => Ok(usage_error(&e.msg)),
-        ErrKind::Unported => bail!("{}", e.msg),
+        ErrKind::Unported => crate::git_fatal!("{}", e.msg),
     }
 }
 
@@ -2651,7 +2651,7 @@ fn disk_size(repo: &gix::Repository, id: ObjectId) -> Result<u64> {
     if let Some(loc) = repo.objects.location_by_oid(id.as_ref(), &mut buf) {
         return Ok(loc.entry_size as u64);
     }
-    bail!("cannot determine on-disk size of {hex}")
+    crate::git_fatal!("cannot determine on-disk size of {hex}")
 }
 
 /// Peel `id` to a commit, or `None` when it does not name one — git's

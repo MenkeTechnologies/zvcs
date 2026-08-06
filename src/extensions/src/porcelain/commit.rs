@@ -3,6 +3,85 @@ use std::collections::{HashMap, HashSet};
 use std::io::IsTerminal;
 use std::process::ExitCode;
 
+/// `usage_with_options()` rendering of `builtin/commit.c`'s option table,
+/// verbatim. `parse_options` writes it after an `error:` line for an unknown
+/// option or a malformed value, and to stdout for `-h`; both exit 129.
+/// `parse_options` rejecting an option: `error: <message>` and the usage table on
+/// stderr, exit 129. Distinct from a `die()` — different stream shape, different
+/// code — so it goes out here and unwinds carrying only the code.
+fn usage_error(msg: String) -> anyhow::Error {
+    eprintln!("error: {msg}");
+    eprint!("{USAGE}");
+    anyhow::Error::new(crate::fatal::Silent(129))
+}
+
+const USAGE: &str = concat!(
+    "usage: git commit [-a | --interactive | --patch] [-s] [-v] [-u[<mode>]] [--amend]\n",
+    "                  [--dry-run] [(-c | -C | --squash) <commit> | --fixup [(amend|reword):]<commit>]\n",
+    "                  [-F <file> | -m <msg>] [--reset-author] [--allow-empty]\n",
+    "                  [--allow-empty-message] [--no-verify] [-e] [--author=<author>]\n",
+    "                  [--date=<date>] [--cleanup=<mode>] [--[no-]status]\n",
+    "                  [-i | -o] [--pathspec-from-file=<file> [--pathspec-file-nul]]\n",
+    "                  [(--trailer <token>[(=|:)<value>])...] [-S[<keyid>]]\n",
+    "                  [--] [<pathspec>...]\n",
+    "\n",
+    "    -q, --[no-]quiet      suppress summary after successful commit\n",
+    "    -v, --[no-]verbose    show diff in commit message template\n",
+    "\n",
+    "Commit message options\n",
+    "    -F, --[no-]file <file>\n",
+    "                          read message from file\n",
+    "    --[no-]author <author>\n",
+    "                          override author for commit\n",
+    "    --[no-]date <date>    override date for commit\n",
+    "    -m, --[no-]message <message>\n",
+    "                          commit message\n",
+    "    -c, --[no-]reedit-message <commit>\n",
+    "                          reuse and edit message from specified commit\n",
+    "    -C, --[no-]reuse-message <commit>\n",
+    "                          reuse message from specified commit\n",
+    "    --[no-]fixup [(amend|reword):]commit\n",
+    "                          use autosquash formatted message to fixup or amend/reword specified commit\n",
+    "    --[no-]squash <commit>\n",
+    "                          use autosquash formatted message to squash specified commit\n",
+    "    --[no-]reset-author   the commit is authored by me now (used with -C/-c/--amend)\n",
+    "    --trailer <trailer>   add custom trailer(s)\n",
+    "    -s, --[no-]signoff    add a Signed-off-by trailer\n",
+    "    -t, --[no-]template <file>\n",
+    "                          use specified template file\n",
+    "    -e, --[no-]edit       force edit of commit\n",
+    "    --[no-]cleanup <mode> how to strip spaces and #comments from message\n",
+    "    --[no-]status         include status in commit message template\n",
+    "    -S, --[no-]gpg-sign[=<key-id>]\n",
+    "                          GPG sign commit\n",
+    "\n",
+    "Commit contents options\n",
+    "    -a, --[no-]all        commit all changed files\n",
+    "    -i, --[no-]include    add specified files to index for commit\n",
+    "    --[no-]interactive    interactively add files\n",
+    "    -p, --[no-]patch      interactively add changes\n",
+    "    -o, --[no-]only       commit only specified files\n",
+    "    -n, --no-verify       bypass pre-commit and commit-msg hooks\n",
+    "    --verify              opposite of --no-verify\n",
+    "    --[no-]dry-run        show what would be committed\n",
+    "    --[no-]short          show status concisely\n",
+    "    --[no-]branch         show branch information\n",
+    "    --[no-]ahead-behind   compute full ahead/behind values\n",
+    "    --[no-]porcelain      machine-readable output\n",
+    "    --[no-]long           show status in long format (default)\n",
+    "    -z, --[no-]null       terminate entries with NUL\n",
+    "    --[no-]amend          amend previous commit\n",
+    "    --no-post-rewrite     bypass post-rewrite hook\n",
+    "    --post-rewrite        opposite of --no-post-rewrite\n",
+    "    -u, --[no-]untracked-files[=<mode>]\n",
+    "                          show untracked files, optional modes: all, normal, no. (Default: all)\n",
+    "    --[no-]pathspec-from-file <file>\n",
+    "                          read pathspec from file\n",
+    "    --[no-]pathspec-file-nul\n",
+    "                          with --pathspec-from-file, pathspec elements are separated with NUL character\n",
+    "\n",
+);
+
 use gix::bstr::{BString, ByteSlice};
 use gix::index::entry::{Flags, Mode, Stage, Stat};
 use gix::objs::tree::EntryMode;
@@ -621,7 +700,13 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
             "--no-short" | "--no-long" | "--no-porcelain" => status_format = StatusFormat::None,
             // Unlike `git status`, commit's `--porcelain` is a plain switch.
             s if s.starts_with("--porcelain=") => {
-                anyhow::bail!("option `porcelain' takes no value")
+                {
+                    // A malformed *value* is an `error:` and 129, but without the
+                    // usage table — `parse_options` only appends that when it
+                    // cannot make sense of the option itself.
+                    eprintln!("error: option `porcelain' takes no value");
+                    return Err(anyhow::Error::new(crate::fatal::Silent(129)));
+                }
             }
             "-z" | "--null" => null_term = true,
             "--no-null" => null_term = false,
@@ -710,7 +795,9 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
                 gpg_sign = GpgSign::On(Some(s["--gpg-sign=".len()..].to_string()))
             }
             "--no-gpg-sign" => gpg_sign = GpgSign::Off,
-            s if s.starts_with("--") => anyhow::bail!("unsupported option `{s}`"),
+            s if s.starts_with("--") => {
+                return Err(usage_error(format!("unknown option `{}'", s.trim_start_matches('-'))))
+            }
             // `-S<keyid>` and `-u<mode>` take an *attached* value only, so they are
             // resolved before the generic short-cluster split below.
             s if s.starts_with("-S") && s.len() > 2 => {
@@ -787,7 +874,7 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
                             }
                             break;
                         }
-                        _ => anyhow::bail!("unsupported option `-{c}`"),
+                        _ => return Err(usage_error(format!("unknown switch `{c}'"))),
                     }
                 }
             }
@@ -808,24 +895,24 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
         interactive = true;
     }
     if only_flag && include_flag {
-        anyhow::bail!("options '-i/--include' and '-o/--only' cannot be used together");
+        crate::git_fatal!("options '-i/--include' and '-o/--only' cannot be used together");
     }
     if all && only_flag {
-        anyhow::bail!("options '-o/--only' and '-a/--all' cannot be used together");
+        crate::git_fatal!("options '-o/--only' and '-a/--all' cannot be used together");
     }
     if all && include_flag {
-        anyhow::bail!("options '-i/--include' and '-a/--all' cannot be used together");
+        crate::git_fatal!("options '-i/--include' and '-a/--all' cannot be used together");
     }
     if include_flag && interactive {
-        anyhow::bail!(
+        crate::git_fatal!(
             "options '-i/--include' and '--interactive/-p/--patch' cannot be used together"
         );
     }
     if only_flag && interactive {
-        anyhow::bail!("options '-o/--only' and '--interactive/-p/--patch' cannot be used together");
+        crate::git_fatal!("options '-o/--only' and '--interactive/-p/--patch' cannot be used together");
     }
     if all && interactive {
-        anyhow::bail!("options '-a/--all' and '--interactive/-p/--patch' cannot be used together");
+        crate::git_fatal!("options '-a/--all' and '--interactive/-p/--patch' cannot be used together");
     }
 
     // git's `prepare_index()` opens with the two `cannot be negative` fatals.
@@ -835,24 +922,52 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     // `--pathspec-from-file` supplies the pathspec list instead of the command
     // line, so it is resolved before every pathspec-dependent check below.
     if pathspec_from_file.is_some() && !pathspecs.is_empty() {
-        anyhow::bail!("'--pathspec-from-file' and pathspec arguments cannot be used together");
+        crate::git_fatal!("'--pathspec-from-file' and pathspec arguments cannot be used together");
     }
     if pathspec_file_nul && pathspec_from_file.is_none() {
-        anyhow::bail!("the option '--pathspec-file-nul' requires '--pathspec-from-file'");
+        crate::git_fatal!("the option '--pathspec-file-nul' requires '--pathspec-from-file'");
     }
     if let Some(src) = &pathspec_from_file {
         if interactive {
-            anyhow::bail!(
+            crate::git_fatal!(
                 "options '--pathspec-from-file' and '--interactive/--patch' cannot be used together"
             );
         }
         if all {
-            anyhow::bail!("options '--pathspec-from-file' and '-a' cannot be used together");
+            crate::git_fatal!("options '--pathspec-from-file' and '-a' cannot be used together");
         }
         pathspecs = read_pathspec_file(src, pathspec_file_nul)?;
     }
-    if (only_flag || include_flag) && pathspecs.is_empty() {
-        anyhow::bail!("No paths with --include/--only does not make sense.");
+    // `builtin/commit.c:parse_and_validate_options`:
+    //     if (argc == 0 && (also || (only && !amend && !allow_empty)))
+    //             die(_("No paths with --include/--only does not make sense."));
+    // `--only` with no paths is how a caller says "commit exactly what is staged
+    // and nothing the worktree has since changed", which is meaningful the moment
+    // there is something to commit without a pathspec — an amend, or an explicitly
+    // allowed empty commit. `--include` has no such reading and always needs paths.
+    //
+    // Rejecting the amend form broke `commit --amend -F <file> --only`, which is
+    // how the JetBrains client rewords a commit message.
+    if pathspecs.is_empty() && (include_flag || (only_flag && !amend && !allow_empty)) {
+        crate::git_fatal!("No paths with --include/--only does not make sense.");
+    }
+    // `parse_and_validate_options()` rejects a malformed `-u<mode>` and
+    // `--cleanup=<mode>` before the index is read, so the answer does not depend
+    // on whether there was anything to commit. Validating them where they are
+    // *used* put both behind the "nothing to commit" exit, which meant a typo in
+    // either was reported as a clean tree.
+    if let Some(u) = &untracked_arg {
+        if !matches!(u.as_str(), "no" | "normal" | "all") {
+            crate::git_fatal!("Invalid untracked files mode '{u}'");
+        }
+    }
+    if let Some(c) = &cleanup_arg {
+        if !matches!(
+            c.as_str(),
+            "default" | "verbatim" | "whitespace" | "strip" | "scissors"
+        ) {
+            crate::git_fatal!("Invalid cleanup mode {c}");
+        }
     }
     // Outside patch mode the two diff-shaping options have nothing to feed, and
     // git refuses the whole command rather than ignore them.
@@ -861,7 +976,7 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     }
     // `git commit -a <paths>` is rejected outright, exactly as git does.
     if all && !pathspecs.is_empty() {
-        anyhow::bail!("paths '{} ...' with -a does not make sense", pathspecs[0]);
+        crate::git_fatal!("paths '{} ...' with -a does not make sense", pathspecs[0]);
     }
     // Pathspec-limited ("only") mode: build the commit tree from HEAD's tree with
     // only the listed paths taken from the worktree. `-i`/`--include` instead adds
@@ -910,12 +1025,12 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     // `parse_and_validate_options()`: an in-progress operation forbids `--amend`,
     // because the commit being replaced is not the one the operation is building.
     if amend && whence != Whence::Commit {
-        anyhow::bail!("You are in the middle of a {} -- cannot amend.", whence.noun());
+        crate::git_fatal!("You are in the middle of a {} -- cannot amend.", whence.noun());
     }
     // `prepare_index()`: a pathspec-limited commit builds a tree that ignores the
     // rest of the index, which would silently drop the operation's other paths.
     if only_mode && whence != Whence::Commit {
-        anyhow::bail!("cannot do a partial commit during a {}.", whence.noun());
+        crate::git_fatal!("cannot do a partial commit during a {}.", whence.noun());
     }
 
     // --- `-p`/`--interactive`: hand staging to the hunk selector ----------
@@ -939,7 +1054,7 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
             super::add_interactive::run_status(&repo, patch_opts.to_interactive(false), &pathspecs)?
         };
         if status != 0 {
-            anyhow::bail!("interactive add failed");
+            crate::git_fatal!("interactive add failed");
         }
         interactive_stage = Some(guard);
         // The selector is done and its `apply` children have exited, so the lane
@@ -952,7 +1067,7 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     // after option validation.
     if dry_run {
         if amend && repo.head()?.try_peel_to_id()?.is_none() {
-            anyhow::bail!("You have nothing to amend.");
+            crate::git_fatal!("You have nothing to amend.");
         }
         if amend {
             anyhow::bail!(
@@ -997,7 +1112,7 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     let mut message = messages.join("\n\n");
     if from_flags {
         if message.trim().is_empty() && !allow_empty_message {
-            anyhow::bail!("empty commit message (use --allow-empty-message to override)");
+            crate::git_fatal!("empty commit message (use --allow-empty-message to override)");
         }
         // Match git's on-disk message, which is newline-terminated.
         if !message.ends_with('\n') {
@@ -1037,7 +1152,7 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     // rebase can reword. `squash_fixup_seed`, when set, seeds the editor path.
     let mut squash_fixup_seed: Option<String> = None;
     if squash_arg.is_some() && fixup_arg.is_some() {
-        anyhow::bail!("options '--squash' and '--fixup' cannot be used together");
+        crate::git_fatal!("options '--squash' and '--fixup' cannot be used together");
     }
     if let Some(spec) = &squash_arg {
         if reuse_arg.is_some() {
@@ -1059,7 +1174,7 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     if let Some(raw) = &fixup_arg {
         // `-c`/`-C`/`-F` are rejected with `--fixup` in every form.
         if reuse_arg.is_some() || !file_args.is_empty() {
-            anyhow::bail!("options '-c/-C/-F' and '--fixup' cannot be used together");
+            crate::git_fatal!("options '-c/-C/-F' and '--fixup' cannot be used together");
         }
         // Parse `[(amend|reword):]<commit>`: only a leading run of alpha
         // characters immediately followed by `:` is treated as a suboption.
@@ -1074,7 +1189,7 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
                     "reword" => anyhow::bail!(
                         "--fixup=reword: requires a paths-limited (--only) commit, which is not ported"
                     ),
-                    _ => anyhow::bail!("unknown option: --fixup={sub}:{commit}"),
+                    _ => crate::git_fatal!("unknown option: --fixup={sub}:{commit}"),
                 }
             } else {
                 (raw.as_str(), "fixup")
@@ -1098,7 +1213,7 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
             // and carries the original message (its body only when the original
             // is itself an `amend!` commit, mirroring `prepare_amend_commit()`).
             if from_flags {
-                anyhow::bail!("options '-m' and '--fixup=amend:<commit>' cannot be used together");
+                crate::git_fatal!("options '-m' and '--fixup=amend:<commit>' cannot be used together");
             }
             allow_empty = true;
             let orig = c.message_raw()?.to_str_lossy().into_owned();
@@ -1236,7 +1351,12 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
         }
         None => head_tip.into_iter().collect(),
     };
-    let is_root = parents.is_empty();
+    // git's `initial_commit`, which is `!current_head` — whether `HEAD` existed
+    // *before* this command, not whether the commit being written has parents.
+    // The two differ for `--amend` of a root commit: the result has no parent, but
+    // `HEAD` was there, so git prints neither `(root-commit)` in the summary nor
+    // "Initial commit" in the status block.
+    let is_root = head_tip.is_none();
     // git's `log_tree_commit()` prints no diff for a commit with several parents,
     // so `print_commit_summary()` degenerates to the headline for a merge.
     let is_merge_commit = parents.len() > 1;
@@ -1259,7 +1379,7 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
         if amend {
             // git refuses an amend whose result would be empty (tree unchanged
             // from the parent) unless --allow-empty, with its own message.
-            anyhow::bail!(
+            crate::git_fatal!(
                 "You asked to amend the most recent commit, but doing so would make\n\
                  it empty. You can repeat your command with --allow-empty, or you can\n\
                  remove the commit entirely with \"git reset HEAD^\"."
@@ -1425,9 +1545,9 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     }
     if message.trim().is_empty() && !allow_empty_message {
         if from_flags {
-            anyhow::bail!("empty commit message (use --allow-empty-message to override)");
+            crate::git_fatal!("empty commit message (use --allow-empty-message to override)");
         }
-        anyhow::bail!("Aborting commit due to empty commit message.");
+        crate::git_fatal!("Aborting commit due to empty commit message.");
     }
     if !message.is_empty() && !message.ends_with('\n') {
         message.push('\n');
@@ -1929,7 +2049,7 @@ fn dry_run_commit(repo: &gix::Repository, o: &DryRun) -> Result<ExitCode> {
     // a fatal error rather than a status-engine usage message mid-dry-run.
     if let Some(u) = &o.untracked {
         if !matches!(u.as_str(), "no" | "normal" | "all") {
-            anyhow::bail!("Invalid untracked files mode '{u}'");
+            crate::git_fatal!("Invalid untracked files mode '{u}'");
         }
     }
 
@@ -2320,7 +2440,7 @@ fn resolve_cleanup(
                 Cleanup::Whitespace
             }
         }
-        Some(other) => anyhow::bail!("Invalid cleanup mode {other}"),
+        Some(other) => crate::git_fatal!("Invalid cleanup mode {other}"),
     })
 }
 
@@ -2540,7 +2660,7 @@ fn stage_pathspecs(
     known: &HashSet<BString>,
 ) -> Result<StagedSet> {
     if repo.workdir().is_none() {
-        anyhow::bail!("this operation must be run in a work tree");
+        crate::git_fatal!("this operation must be run in a work tree");
     }
 
     // Walk the worktree for files matching the pathspecs (mirrors `git add`).
@@ -2682,7 +2802,10 @@ fn stage_pathspecs(
             .iter()
             .any(|x| x.as_slice() == pb || x.as_slice().starts_with(&prefix));
         if !matched {
-            anyhow::bail!("pathspec '{p}' did not match any file(s) known to git");
+            // `report_path_error()` writes `error:` and the caller exits 1 — this
+            // is not a `die()`, so it is neither `fatal:` nor 128.
+            eprintln!("error: pathspec '{p}' did not match any file(s) known to git");
+            return Err(anyhow::Error::new(crate::fatal::Silent(1)));
         }
     }
 
@@ -2724,7 +2847,7 @@ fn collect_tracked_changes(
     index: &gix::index::File,
 ) -> Result<StagedSet> {
     if repo.workdir().is_none() {
-        anyhow::bail!("this operation must be run in a work tree");
+        crate::git_fatal!("this operation must be run in a work tree");
     }
     let mut staged: Vec<StagedFile> = Vec::new();
     let mut deletions: Vec<BString> = Vec::new();
@@ -2881,7 +3004,7 @@ fn resolve_editor(snap: &gix::config::Snapshot<'_>) -> Result<String> {
     }
     let dumb = std::env::var("TERM").map(|t| t == "dumb").unwrap_or(true);
     if dumb || !std::io::stdin().is_terminal() {
-        anyhow::bail!("Terminal is dumb, but EDITOR unset. Please supply the message using -m.");
+        crate::git_fatal!("Terminal is dumb, but EDITOR unset. Please supply the message using -m.");
     }
     Ok("vi".to_string())
 }
@@ -2920,7 +3043,7 @@ fn launch_editor(snap: &gix::config::Snapshot<'_>, path: &std::path::Path) -> Re
         let _ = std::io::stderr().flush();
     }
     if !status.success() {
-        anyhow::bail!("there was a problem with the editor '{editor}'");
+        crate::git_fatal!("there was a problem with the editor '{editor}'");
     }
     Ok(())
 }

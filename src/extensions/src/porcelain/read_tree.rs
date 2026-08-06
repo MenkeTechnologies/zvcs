@@ -418,7 +418,7 @@ pub fn read_tree(args: &[String]) -> Result<ExitCode> {
     }
     // `--prefix` is `bind_merge`, which git only ever runs with one tree.
     if o.prefix.is_some() && tree_ids.len() > 1 {
-        bail!(
+        anyhow::bail!(
             "unsupported: {} tree-ishes with --prefix (git's bind merge takes exactly one)",
             tree_ids.len()
         );

@@ -301,7 +301,7 @@ fn resolve_format(arg: &str) -> Result<Option<Format>> {
         "raw" => Format::Builtin(Builtin::Raw),
         // git implements `reference` as this exact user format with a short date.
         "reference" => Format::User(parse_user_format("%h (%s, %as)")?),
-        "email" | "mboxrd" => bail!(
+        "email" | "mboxrd" => anyhow::bail!(
             "unsupported --format \"{arg}\" (ported: oneline, short, medium, full, fuller, raw, reference, format:, tformat:, and user formats)"
         ),
         _ if arg.is_empty() || arg.contains('%') => Format::User(parse_user_format(arg)?),
@@ -452,7 +452,7 @@ fn parse_user_format(fmt: &str) -> Result<Vec<Item>> {
                 let ch = c as char;
                 let who = if c == b'a' { Who::Author } else { Who::Committer };
                 let Some(&sub) = b.get(i + 2) else {
-                    bail!("unsupported placeholder \"%{ch}\"");
+                    anyhow::bail!("unsupported placeholder \"%{ch}\"");
                 };
                 let ph = match sub {
                     b'n' => Ph::Person(who, Part::Name),
@@ -468,7 +468,7 @@ fn parse_user_format(fmt: &str) -> Result<Vec<Item>> {
                     b't' => Ph::Person(who, Part::DateUnix),
                     _ => {
                         let bad = sub as char;
-                        bail!(
+                        anyhow::bail!(
                             "unsupported placeholder \"%{ch}{bad}\" (ported: %{ch}n, %{ch}e, %{ch}l, %{ch}N, %{ch}E, %{ch}d, %{ch}D, %{ch}i, %{ch}I, %{ch}s, %{ch}t)"
                         );
                     }
@@ -561,7 +561,7 @@ fn parse_always_color(spec: &[u8]) -> Result<Vec<u8>> {
     let mut color_count = 0usize;
     for t in tokens {
         if t == b"reset".as_slice() {
-            bail!("unsupported combined `reset` in %C(always,...)");
+            anyhow::bail!("unsupported combined `reset` in %C(always,...)");
         }
         if let Some(a) = attr_code(t) {
             attrs.push(a);
@@ -626,7 +626,7 @@ fn color_code(t: &[u8], is_bg: bool) -> Result<Option<String>> {
                 return Ok(Some((90 + base + idx as u16).to_string()));
             }
         }
-        bail!("unsupported color token in %C(always,...)");
+        anyhow::bail!("unsupported color token in %C(always,...)");
     }
     if t.first() == Some(&b'#') && t.len() == 7 {
         let hex = &t[1..];
@@ -637,7 +637,7 @@ fn color_code(t: &[u8], is_bg: bool) -> Result<Option<String>> {
             let lead = if is_bg { "48" } else { "38" };
             return Ok(Some(format!("{lead};2;{r};{g};{bl}")));
         }
-        bail!("unsupported color token in %C(always,...)");
+        anyhow::bail!("unsupported color token in %C(always,...)");
     }
     if !t.is_empty() && t.iter().all(u8::is_ascii_digit) {
         let n: u16 = std::str::from_utf8(t)
@@ -655,7 +655,7 @@ fn color_code(t: &[u8], is_bg: bool) -> Result<Option<String>> {
         };
         return Ok(Some(s));
     }
-    bail!("unsupported color token in %C(always,...)");
+    anyhow::bail!("unsupported color token in %C(always,...)");
 }
 
 /// Parse a `%(…)` atom starting at `b[i] == '%'` (`b[i+1] == '('`), appending any
@@ -689,7 +689,7 @@ fn parse_atom(b: &[u8], i: usize, items: &mut Vec<Item>, lit: &mut Vec<u8>) -> R
         } else if opts == b":all".as_slice() {
             SelectRef::AllRefs
         } else {
-            bail!(
+            anyhow::bail!(
                 "unsupported %(describe) options (ported: %(describe), %(describe:tags), %(describe:all))"
             );
         };

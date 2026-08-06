@@ -594,7 +594,7 @@ fn write_pack(
         },
     )?;
     if packed.entries.is_empty() {
-        bail!("pack writer produced no files for {} objects", ids.len());
+        crate::git_fatal!("pack writer produced no files for {} objects", ids.len());
     }
 
     let kind = repo.object_hash();

@@ -903,7 +903,7 @@ fn revert_one(
             // and this port persists no sequencer todo for the status driver to read
             // — so it is left a floor rather than emitting status without that block.
             if sequencer {
-                bail!("revert is a no-op with a dirty worktree mid-sequence: `git status`'s `Revert currently in progress` block needs the `.git/sequencer` todo this port omits");
+                crate::git_fatal!("revert is a no-op with a dirty worktree mid-sequence: `git status`'s `Revert currently in progress` block needs the `.git/sequencer` todo this port omits");
             }
             super::status::status(&[])?;
             return Ok(Step::Failed(ExitCode::from(1)));

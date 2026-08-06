@@ -3369,19 +3369,19 @@ fn check_format(fmt: &str) -> Result<()> {
                 // `%aN`/`%aE` are the mailmap-resolved name and address, which
                 // `format_person_part()` maps whether or not `--use-mailmap` is on.
                 Some('n' | 'e' | 'N' | 'E' | 'd' | 'i' | 'I' | 't' | 'r') => {}
-                Some(x) => bail!("unsupported format placeholder %a{x}"),
-                None => bail!("unsupported trailing % in format"),
+                Some(x) => anyhow::bail!("unsupported format placeholder %a{x}"),
+                None => anyhow::bail!("unsupported trailing % in format"),
             },
             Some('c') => match it.next() {
                 Some('n' | 'e' | 'N' | 'E' | 'd' | 'i' | 'I' | 't' | 'r') => {}
-                Some(x) => bail!("unsupported format placeholder %c{x}"),
-                None => bail!("unsupported trailing % in format"),
+                Some(x) => anyhow::bail!("unsupported format placeholder %c{x}"),
+                None => anyhow::bail!("unsupported trailing % in format"),
             },
             // Signature placeholders: %G? (status char) and %GK (signing key).
             Some('G') => match it.next() {
                 Some('?' | 'K') => {}
-                Some(x) => bail!("unsupported format placeholder %G{x}"),
-                None => bail!("unsupported trailing % in format"),
+                Some(x) => anyhow::bail!("unsupported format placeholder %G{x}"),
+                None => anyhow::bail!("unsupported trailing % in format"),
             },
             // `%xNN` is always accepted: two hex digits emit that byte, and
             // anything else prints literally rather than failing, so there is
@@ -3391,8 +3391,8 @@ fn check_format(fmt: &str) -> Result<()> {
             // expanded — an unknown option prints literally there rather than
             // failing here, exactly as git does.
             Some('(') => {}
-            Some(x) => bail!("unsupported format placeholder %{x}"),
-            None => bail!("unsupported trailing % in format"),
+            Some(x) => anyhow::bail!("unsupported format placeholder %{x}"),
+            None => anyhow::bail!("unsupported trailing % in format"),
         }
     }
     Ok(())
@@ -6516,7 +6516,7 @@ fn render_graph(nodes: &[Node], blocks: &[Vec<u8>], colors: Vec<String>, want_co
             out.push(b'\n');
             guard -= 1;
             if guard == 0 {
-                bail!("--graph failed to settle the commit graph");
+                crate::git_fatal!("--graph failed to settle the commit graph");
             }
         }
     }

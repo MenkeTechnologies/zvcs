@@ -366,7 +366,7 @@ impl Shell {
         self.stdin.flush()?;
         let mut line = String::new();
         if self.status.read_line(&mut line)? == 0 {
-            bail!("the filter shell exited while running: {code}");
+            crate::git_fatal!("the filter shell exited while running: {code}");
         }
         Ok(line.trim().parse::<i32>().unwrap_or(1))
     }
@@ -376,7 +376,7 @@ impl Shell {
         let code = format!("{name}={}", sq(value));
         match self.run(&code)? {
             0 => Ok(()),
-            _ => bail!("could not set {name} in the filter shell"),
+            _ => crate::git_fatal!("could not set {name} in the filter shell"),
         }
     }
 }
@@ -1776,7 +1776,7 @@ fn select(repo: &gix::Repository, args: &[String]) -> Result<Selection> {
         }
         if let Some((base, tip)) = arg.split_once("..") {
             if base.contains('.') || tip.starts_with('.') {
-                bail!("unsupported rev-list argument: {arg}");
+                anyhow::bail!("unsupported rev-list argument: {arg}");
             }
             let base = if base.is_empty() { "HEAD" } else { base };
             let tip = if tip.is_empty() { "HEAD" } else { tip };
@@ -1789,7 +1789,7 @@ fn select(repo: &gix::Repository, args: &[String]) -> Result<Selection> {
             continue;
         }
         if arg.starts_with('-') {
-            bail!("unsupported rev-list argument: {arg}");
+            anyhow::bail!("unsupported rev-list argument: {arg}");
         }
         match repo.rev_parse_single(arg.as_str()) {
             Ok(_) => {
@@ -1816,7 +1816,7 @@ fn select(repo: &gix::Repository, args: &[String]) -> Result<Selection> {
     }
     for spec in &sel.pathspecs {
         if spec.starts_with(':') || spec.contains(['*', '?', '[']) {
-            bail!("unsupported pathspec: {spec}");
+            anyhow::bail!("unsupported pathspec: {spec}");
         }
     }
 

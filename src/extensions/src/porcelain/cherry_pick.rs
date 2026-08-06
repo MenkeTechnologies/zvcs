@@ -525,7 +525,7 @@ pub fn cherry_pick(args: &[String]) -> Result<ExitCode> {
 
     let head = repo.head()?;
     if head.is_unborn() {
-        anyhow::bail!("cannot cherry-pick onto an unborn branch");
+        crate::git_fatal!("cannot cherry-pick onto an unborn branch");
     }
     let mut head_id = head
         .id()
@@ -682,7 +682,7 @@ pub fn cherry_pick(args: &[String]) -> Result<ExitCode> {
             message = cleanup_message(&message, mode);
         }
         if message.trim().is_empty() && !opts.allow_empty_message {
-            anyhow::bail!("the commit message of {spec} is empty (use --allow-empty-message)");
+            crate::git_fatal!("the commit message of {spec} is empty (use --allow-empty-message)");
         }
         if message.last() != Some(&b'\n') {
             message.push(b'\n');

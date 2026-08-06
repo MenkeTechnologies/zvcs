@@ -349,7 +349,7 @@ pub fn backfill(args: &[String]) -> Result<ExitCode> {
     }
 
     if has_promisor_remote(&repo) {
-        bail!(
+        crate::git_fatal!(
             "backfill cannot download from a promisor remote: the vendored gitoxide has no \
              partial-clone support — no crate mentions promisor remotes or extensions.partialClone, \
              gix-protocol's fetch arguments expose no filter line, and there is no way to request \

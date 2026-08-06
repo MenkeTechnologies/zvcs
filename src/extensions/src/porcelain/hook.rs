@@ -181,7 +181,7 @@ fn list(args: &[String]) -> Result<ExitCode> {
             }
             s => {
                 if event.is_some() {
-                    bail!("unexpected extra argument {s:?}");
+                    crate::git_fatal!("unexpected extra argument {s:?}");
                 }
                 event = Some(s.to_string());
             }
@@ -298,7 +298,7 @@ fn run(args: &[String]) -> Result<ExitCode> {
             }
             s => {
                 if event.is_some() {
-                    bail!("unexpected extra argument {s:?} (hook arguments go after `--`)");
+                    crate::git_fatal!("unexpected extra argument {s:?} (hook arguments go after `--`)");
                 }
                 event = Some(s.to_string());
             }
@@ -533,7 +533,7 @@ fn parse_bool(value: &[u8], key: &str) -> Result<bool> {
     match v.to_ascii_lowercase().as_str() {
         "true" | "yes" | "on" | "1" => Ok(true),
         "false" | "no" | "off" | "0" | "" => Ok(false),
-        _ => bail!("bad boolean config value '{v}' for '{key}'"),
+        _ => crate::git_fatal!("bad boolean config value '{v}' for '{key}'"),
     }
 }
 
@@ -543,7 +543,7 @@ fn parse_jobs(value: &str) -> Result<i64> {
         .parse()
         .map_err(|_| anyhow::anyhow!("invalid job count `{value}`"))?;
     if n == 0 || n < -1 {
-        bail!("invalid job count `{value}`");
+        crate::git_fatal!("invalid job count `{value}`");
     }
     Ok(n)
 }

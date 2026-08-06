@@ -457,26 +457,26 @@ impl Config {
 
         if let Some(n) = snap.integer("diff.context") {
             if n < 0 {
-                anyhow::bail!("diff.context cannot be negative");
+                crate::git_fatal!("diff.context cannot be negative");
             }
             cfg.context = n as i32;
         }
         if let Some(n) = snap.integer("diff.interHunkContext") {
             if n < 0 {
-                anyhow::bail!("diff.interHunkContext cannot be negative");
+                crate::git_fatal!("diff.interHunkContext cannot be negative");
             }
             cfg.interhunk = n as i32;
         }
 
         if opts.context != -1 {
             if opts.context < 0 {
-                anyhow::bail!("--unified cannot be negative");
+                crate::git_fatal!("--unified cannot be negative");
             }
             cfg.context = opts.context;
         }
         if opts.interhunk != -1 {
             if opts.interhunk < 0 {
-                anyhow::bail!("--inter-hunk-context cannot be negative");
+                crate::git_fatal!("--inter-hunk-context cannot be negative");
             }
             cfg.interhunk = opts.interhunk;
         }
@@ -844,7 +844,7 @@ impl State<'_> {
 
         let (ok, plain) = run_git(&args, None, true, None)?;
         if !ok {
-            anyhow::bail!("could not parse diff");
+            crate::git_fatal!("could not parse diff");
         }
         self.plain = plain;
         if self.plain.is_empty() {
@@ -861,7 +861,7 @@ impl State<'_> {
             cargs[color_arg_index] = "--color".into();
             let (ok, colored) = run_git(&cargs, None, true, None)?;
             if !ok {
-                anyhow::bail!("could not parse colored diff");
+                crate::git_fatal!("could not parse colored diff");
             }
             self.colored = colored;
 
@@ -871,7 +871,7 @@ impl State<'_> {
             if let Some(filter) = self.cfg.diff_filter.clone() {
                 match run_shell(&filter, &self.colored) {
                     Some(out) => self.colored = out,
-                    None => anyhow::bail!("failed to run '{filter}'"),
+                    None => crate::git_fatal!("failed to run '{filter}'"),
                 }
             }
             complete_line(&mut self.colored);
@@ -914,7 +914,7 @@ impl State<'_> {
                 }
                 marker = 0;
             } else if p == 0 {
-                anyhow::bail!(
+                crate::git_fatal!(
                     "diff starts with unexpected line:\n{}",
                     String::from_utf8_lossy(&self.plain[p..eol])
                 );
@@ -1649,7 +1649,7 @@ fn launch_editor(repo: &gix::Repository, path: &std::path::Path) -> Result<()> {
         .or_else(|| std::env::var("EDITOR").ok().filter(|v| !v.is_empty()))
         .or_else(|| if dumb { None } else { Some("vi".to_string()) });
     let Some(editor) = editor else {
-        anyhow::bail!("terminal is dumb, but EDITOR unset");
+        crate::git_fatal!("terminal is dumb, but EDITOR unset");
     };
     if editor == ":" {
         return Ok(());
@@ -1661,7 +1661,7 @@ fn launch_editor(repo: &gix::Repository, path: &std::path::Path) -> Result<()> {
         .arg(path)
         .status()?;
     if !status.success() {
-        anyhow::bail!("There was a problem with the editor '{editor}'.");
+        crate::git_fatal!("There was a problem with the editor '{editor}'.");
     }
     Ok(())
 }

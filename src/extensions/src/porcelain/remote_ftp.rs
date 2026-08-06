@@ -70,7 +70,7 @@ pub fn remote_ftp(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::from(1));
     }
     let Some(url) = args.get(2) else {
-        bail!("remote-ftp <remote> without <url> is unsupported (the URL must be given explicitly)");
+        anyhow::bail!("remote-ftp <remote> without <url> is unsupported (the URL must be given explicitly)");
     };
 
     // `str_end_url_with_slash` then `credential_from_url`, which only fails at
@@ -135,7 +135,7 @@ fn command_loop() -> Result<ExitCode> {
             || line == "check-connectivity"
         {
             let verb = line.split(' ').next().unwrap_or(&line).to_string();
-            bail!(
+            anyhow::bail!(
                 "remote-ftp {verb:?} is unsupported: no FTP transport and no dumb-protocol \
                  walker in the vendored gitoxide crates (ported: capabilities, option)"
             );

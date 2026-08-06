@@ -295,7 +295,7 @@ pub fn difftool(args: &[String]) -> Result<ExitCode> {
     // the tool modified; skipping the copy-back would lose the user's edits, so
     // it bails rather than run a data-losing partial (see module docs).
     if opts.dir_diff {
-        bail!(
+        crate::git_fatal!(
             "--dir-diff (`-d`) needs run_dir_diff's two temp trees plus the copy-back of \
              tool-modified files into the work tree; a partial implementation would silently \
              drop those edits, so it is not launched \
@@ -454,7 +454,7 @@ fn resolve_command(snapshot: &gix::config::Snapshot<'_>, opts: &Opts) -> Result<
                 snapshot.string(*k).map(|v| v.to_str_lossy().into_owned()).filter(|v| !v.is_empty())
             }) {
                 Some(t) => t,
-                None => bail!(
+                None => crate::git_fatal!(
                     "no diff tool configured: without --tool/--extcmd or diff.tool/merge.tool, git \
                      runs guess_merge_tool over the mergetools/ catalogue under $(git --exec-path), \
                      which is not present in the vendored crates \
@@ -479,7 +479,7 @@ fn resolve_command(snapshot: &gix::config::Snapshot<'_>, opts: &Opts) -> Result<
             tool_path: super::mergetool::merge_tool_path(snapshot, &tool, true),
             label: tool,
         }),
-        None => bail!(
+        None => crate::git_fatal!(
             "built-in diff tool {tool:?} has no difftool.{tool}.cmd/mergetool.{tool}.cmd config; \
              its diff_cmd lives in a mergetools/ shell script under $(git --exec-path), which is not \
              present in the vendored crates \
@@ -510,7 +510,7 @@ fn parse_raw(buf: &[u8]) -> Result<Vec<RawRecord>> {
             break;
         }
         let Some(path) = fields.next() else {
-            bail!("malformed raw diff: header with no path field");
+            crate::git_fatal!("malformed raw diff: header with no path field");
         };
         // `:m1 m2 oid1 oid2 STATUS`.
         let header = std::str::from_utf8(header)
@@ -518,7 +518,7 @@ fn parse_raw(buf: &[u8]) -> Result<Vec<RawRecord>> {
         let body = header.strip_prefix(':').unwrap_or(header);
         let parts: Vec<&str> = body.split(' ').collect();
         let [m1, m2, oid1, oid2, _status] = parts.as_slice() else {
-            bail!("malformed raw diff header: {header:?}");
+            crate::git_fatal!("malformed raw diff header: {header:?}");
         };
         out.push(RawRecord {
             mode_a: (*m1).to_owned(),
@@ -706,14 +706,14 @@ fn no_index(opts: &Opts) -> Result<ExitCode> {
                 return Ok(ExitCode::SUCCESS);
             }
         }
-        bail!(
+        crate::git_fatal!(
             "--no-index: {a:?} and {b:?} differ; launching a built-in tool needs the mergetools/ \
              catalogue and a directory pair needs --no-index's recursive walk, neither present in \
              the vendored crates (ported: an identical pair, an inaccessible path, and a differing \
              regular-file pair under -x/--extcmd)"
         );
     }
-    bail!(
+    crate::git_fatal!(
         "--no-index with {} path argument(s) prints `git diff --no-index`'s parse-options usage \
          block on stderr (exit 129); that block is `git diff`'s option surface, produced by its \
          parser rather than difftool's",

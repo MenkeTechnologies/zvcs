@@ -535,7 +535,7 @@ impl State<'_> {
         }
         let (ok, out) = run_git(&args, None, true, None)?;
         if !ok {
-            anyhow::bail!("could not read index");
+            crate::git_fatal!("could not read index");
         }
         let mut result = Vec::new();
         for record in out.split(|&b| b == 0) {
@@ -590,7 +590,7 @@ impl State<'_> {
         }
         let (ok, out) = run_git(&args, None, true, None)?;
         if !ok {
-            anyhow::bail!("could not read index");
+            crate::git_fatal!("could not read index");
         }
         let names: Vec<String> = out
             .split(|&b| b == 0)

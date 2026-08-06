@@ -927,7 +927,7 @@ fn reject_worktree_attributes(repo: &gix::Repository) -> Result<()> {
                     let text = std::fs::read(&path)?;
                     if let Some(attr) = first_content_attribute(&text) {
                         let shown = path.strip_prefix(root).unwrap_or(path.as_path()).display();
-                        bail!(
+                        crate::git_fatal!(
                             "{shown} assigns {attr:?}, which changes archived content; \
                              --worktree-attributes cannot be honoured"
                         );

@@ -232,7 +232,7 @@ fn plan_source(
     // git reports a same-path move (and a move into a subpath of itself) with
     // this exact phrasing regardless of the item being a file.
     if src_rel == dst_rel || dst_rel.starts_with(&format!("{src_rel}/")) {
-        bail!("can not move directory into itself, source={src_rel}, destination={dst_rel}");
+        crate::git_fatal!("can not move directory into itself, source={src_rel}, destination={dst_rel}");
     }
 
     // The source must exist on disk first (git lstat's it before consulting the
@@ -258,23 +258,23 @@ fn plan_source(
             }
         }
         if remaps.is_empty() {
-            bail!("not under version control, source={src_rel}, destination={dst_rel}");
+            crate::git_fatal!("not under version control, source={src_rel}, destination={dst_rel}");
         }
         // A directory destination that already exists on disk can't be merged
         // here; git refuses it too (only file destinations honor -f).
         if dst_abs.exists() {
-            bail!("destination already exists, source={src_rel}, destination={dst_rel}");
+            crate::git_fatal!("destination already exists, source={src_rel}, destination={dst_rel}");
         }
         remaps
     } else {
         // Regular file / symlink: it must be tracked at stage 0.
         if !is_tracked(index, &src_rel) {
-            bail!("not under version control, source={src_rel}, destination={dst_rel}");
+            crate::git_fatal!("not under version control, source={src_rel}, destination={dst_rel}");
         }
         // Refuse to clobber an existing destination (tracked or on disk) unless
         // forced. `-f` relies on POSIX rename() replacing the destination file.
         if !force && (dst_abs.exists() || is_tracked(index, &dst_rel)) {
-            bail!("destination exists, source={src_rel}, destination={dst_rel}");
+            crate::git_fatal!("destination exists, source={src_rel}, destination={dst_rel}");
         }
         vec![(src_rel.clone(), dst_rel.clone())]
     };
@@ -283,7 +283,7 @@ fn plan_source(
     // so the abort stays atomic instead of surfacing mid-rename.
     if let Some(parent) = dst_abs.parent() {
         if !parent.as_os_str().is_empty() && !parent.exists() {
-            bail!("renaming '{src_rel}' failed: No such file or directory");
+            crate::git_fatal!("renaming '{src_rel}' failed: No such file or directory");
         }
     }
 
@@ -362,7 +362,7 @@ fn normalize_rel(workdir: &Path, prefix: &Path, arg: &str) -> Result<String> {
         let real = canonicalize_lenient(arg_path);
         match real.strip_prefix(&canon_wd) {
             Ok(rel) if !rel.as_os_str().is_empty() => rel.to_path_buf(),
-            _ => bail!("'{arg}' is outside repository at '{}'", canon_wd.display()),
+            _ => crate::git_fatal!("'{arg}' is outside repository at '{}'", canon_wd.display()),
         }
     } else {
         prefix.join(arg)
@@ -373,19 +373,19 @@ fn normalize_rel(workdir: &Path, prefix: &Path, arg: &str) -> Result<String> {
             Component::CurDir => {}
             Component::ParentDir => {
                 if parts.pop().is_none() {
-                    bail!("'{arg}' is outside repository at '{}'", workdir.display());
+                    crate::git_fatal!("'{arg}' is outside repository at '{}'", workdir.display());
                 }
             }
             Component::Normal(p) => parts.push(p.to_string_lossy().into_owned()),
             Component::RootDir | Component::Prefix(_) => {
                 // Absolute inputs are stripped to worktree-relative above, so a
                 // residual root component here means the path escaped.
-                bail!("'{arg}' is outside repository at '{}'", workdir.display())
+                crate::git_fatal!("'{arg}' is outside repository at '{}'", workdir.display())
             }
         }
     }
     if parts.is_empty() {
-        bail!("invalid path: {arg}");
+        crate::git_fatal!("invalid path: {arg}");
     }
     Ok(parts.join("/"))
 }

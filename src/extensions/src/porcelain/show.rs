@@ -355,7 +355,7 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
                 {
                     match v.parse::<u32>() {
                         Ok(n) => patch_opts.ctx = n,
-                        Err(_) => bail!("invalid argument to -U: {v}"),
+                        Err(_) => crate::git_fatal!("invalid argument to -U: {v}"),
                     }
                 } else if s == "--no-renames" {
                     patch_opts.renames = Some(0);
@@ -373,7 +373,7 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
                 {
                     let (score, rest) = super::diffcore_rename::parse_rename_score(v);
                     if !rest.is_empty() {
-                        bail!("invalid argument to -C: {v}");
+                        crate::git_fatal!("invalid argument to -C: {v}");
                     }
                     patch_opts.rename_score = score;
                     if patch_opts.renames == Some(super::diffcore_rename::DETECT_COPY) {
@@ -394,7 +394,7 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
                 {
                     match super::diffcore_rename::parse_break_opt(v) {
                         Ok(n) => patch_opts.break_opt = n,
-                        Err(()) => bail!("invalid argument to -B: {v}"),
+                        Err(()) => crate::git_fatal!("invalid argument to -B: {v}"),
                     }
                 } else if s == "--renames" || s == "-M" || s == "--find-renames" {
                     patch_opts.renames = Some(super::diffcore_rename::DETECT_RENAME);
@@ -405,7 +405,7 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
                     patch_opts.renames = Some(super::diffcore_rename::DETECT_RENAME);
                     let (score, rest) = super::diffcore_rename::parse_rename_score(v);
                     if !rest.is_empty() {
-                        bail!("invalid argument to -M: {v}");
+                        crate::git_fatal!("invalid argument to -M: {v}");
                     }
                     patch_opts.rename_score = score;
                 // `--abbrev[=<n>]` / `--no-abbrev`: the width of every abbreviated id
@@ -883,11 +883,11 @@ fn check_format(fmt: &str) -> Result<()> {
             Some('H' | 'h' | 'T' | 't' | 'P' | 'p' | 's' | 'n' | '%' | 'N') => {}
             Some('a') => match it.next() {
                 Some('n' | 'e') => {}
-                Some(x) => bail!("unsupported format placeholder %a{x}"),
-                None => bail!("unsupported trailing % in format"),
+                Some(x) => anyhow::bail!("unsupported format placeholder %a{x}"),
+                None => anyhow::bail!("unsupported trailing % in format"),
             },
-            Some(x) => bail!("unsupported format placeholder %{x}"),
-            None => bail!("unsupported trailing % in format"),
+            Some(x) => anyhow::bail!("unsupported format placeholder %{x}"),
+            None => anyhow::bail!("unsupported trailing % in format"),
         }
     }
     Ok(())

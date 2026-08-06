@@ -225,7 +225,7 @@ fn ident(cfg: &ConfigFile, role: &str) -> Result<String> {
     let name = without_crud(&name);
     let email = without_crud(&email);
     if name.is_empty() {
-        anyhow::bail!("empty ident name (for <{email}>) not allowed");
+        crate::git_fatal!("empty ident name (for <{email}>) not allowed");
     }
 
     let date_var = format!("GIT_{role}_DATE");

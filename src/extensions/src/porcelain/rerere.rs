@@ -410,7 +410,7 @@ fn forget_one_path(
     let (found, hash) = handle_cache(repo, index, path, marker_size, true, None)?;
     if found < 1 {
         eprintln!("error: could not parse conflict hunks in '{path}'");
-        bail!("could not parse conflict hunks in '{path}'");
+        crate::git_fatal!("could not parse conflict hunks in '{path}'");
     }
     let hex = hash.expect("hash requested").to_string();
     let id_dir = rr_cache.join(&hex);
@@ -434,7 +434,7 @@ fn forget_one_path(
     }
     if status_nr <= variant {
         eprintln!("error: no remembered resolution for '{path}'");
-        bail!("no remembered resolution for '{path}'");
+        crate::git_fatal!("no remembered resolution for '{path}'");
     }
 
     let post = variant_path(&id_dir, variant as i32, "postimage");
@@ -444,7 +444,7 @@ fn forget_one_path(
         } else {
             eprintln!("error: cannot unlink '{}': {e}", post.display());
         }
-        bail!("no remembered resolution for '{path}'");
+        crate::git_fatal!("no remembered resolution for '{path}'");
     }
     dirs.get(&rr_cache, &hex)[variant] &= !RR_HAS_POSTIMAGE;
 
@@ -593,7 +593,7 @@ fn rerere_one_path(
     // with a preimage on record *is* the resolution.
     if variant >= 0 && handle_file(repo, &path, marker_size, false, None)?.0 == 0 {
         let Some(src) = repo.workdir_path(&path) else {
-            bail!("this operation must be run in a work tree");
+            crate::git_fatal!("this operation must be run in a work tree");
         };
         std::fs::copy(&src, variant_path(&id_dir, variant, "postimage"))
             .with_context(|| format!("could not write postimage for '{path}'"))?;
@@ -704,7 +704,7 @@ fn replay(
     }
 
     let Some(dst) = repo.workdir_path(path) else {
-        bail!("this operation must be run in a work tree");
+        crate::git_fatal!("this operation must be run in a work tree");
     };
     std::fs::write(&dst, &merged).with_context(|| format!("could not write '{path}'"))?;
     Ok(true)
@@ -744,7 +744,7 @@ fn update_paths(repo: &gix::Repository, update: &[BString]) -> Result<()> {
 
     for path in update {
         let Some(abs) = repo.workdir_path(path) else {
-            bail!("this operation must be run in a work tree");
+            crate::git_fatal!("this operation must be run in a work tree");
         };
         let md = gix::index::fs::Metadata::from_path_no_follow(&abs)?;
         let bytes = std::fs::read(&abs).with_context(|| format!("could not open '{path}'"))?;
@@ -1028,7 +1028,7 @@ fn handle_file(
     output: Option<&Path>,
 ) -> Result<(i32, Option<gix::ObjectId>)> {
     let Some(abs) = repo.workdir_path(path) else {
-        bail!("this operation must be run in a work tree");
+        crate::git_fatal!("this operation must be run in a work tree");
     };
     let data = match std::fs::read(&abs) {
         Ok(d) => d,
@@ -1190,7 +1190,7 @@ fn read_rr(repo: &gix::Repository) -> Result<Vec<RrEntry>> {
 
         // "There has to be the hash, tab, path and then NUL".
         if rec.len() < hexsz + 2 {
-            bail!("corrupt MERGE_RR");
+            crate::git_fatal!("corrupt MERGE_RR");
         }
         let hex = std::str::from_utf8(&rec[..hexsz])
             .ok()
@@ -1211,7 +1211,7 @@ fn read_rr(repo: &gix::Repository) -> Result<Vec<RrEntry>> {
             (0, hexsz)
         };
         if rec.get(tab_at) != Some(&b'\t') {
-            bail!("corrupt MERGE_RR");
+            crate::git_fatal!("corrupt MERGE_RR");
         }
         let path = BString::from(&rec[tab_at + 1..]);
 

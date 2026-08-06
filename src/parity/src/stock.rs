@@ -148,7 +148,11 @@ pub fn git() -> anyhow::Result<&'static Path> {
             CANDIDATES.join(", ")
         );
     };
-    if let Some(target) = target_version() {
+    // The floor is for the *search*. A caller who names a binary has taken
+    // responsibility for it, and the refusal below tells them to do exactly that —
+    // applying the floor to their choice as well would make that advice a dead end.
+    let explicit = std::env::var_os("ZVCS_STOCK_GIT").is_some();
+    if let Some(target) = target_version().filter(|_| !explicit) {
         if *version < target {
             let (a, b, c) = *version;
             let (x, y, z) = target;

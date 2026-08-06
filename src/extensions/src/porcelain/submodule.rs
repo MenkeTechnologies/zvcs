@@ -530,7 +530,7 @@ fn init_repo(repo: &gix::Repository, patterns: &[BString], quiet: bool) -> Resul
                     _ if upd.starts_with('!') => bail!(
                         "submodule '{sub_name}' configures `update = {upd}`; git's !command downgrade path is not ported"
                     ),
-                    _ => bail!("submodule '{sub_name}' has an unknown update strategy {upd:?}"),
+                    _ => crate::git_fatal!("submodule '{sub_name}' has an unknown update strategy {upd:?}"),
                 }
             }
         }
@@ -1467,7 +1467,7 @@ fn update_repo(
             // `resolve_relative_url` — which is not ported, so a `./`/`../` url bails.
             let url = repo.config_snapshot().string(key(sub_name.as_bstr(), "url"));
             let Some(url) = url else {
-                bail!(
+                crate::git_fatal!(
                     "submodule '{display}' has no registered `submodule.{sub_name}.url`; run `submodule init` (or `update --init`) first"
                 );
             };
@@ -1517,7 +1517,7 @@ fn update_repo(
         let just_cloned = clone_url.is_some();
 
         let Ok(sub_repo) = gix::open(sm_dir) else {
-            bail!("submodule path '{display}' could not be opened after cloning");
+            crate::git_fatal!("submodule path '{display}' could not be opened after cloning");
         };
 
         // git's `determine_submodule_update_strategy`: the command-line override,
@@ -1603,7 +1603,7 @@ fn parse_jobs(flag: &str, value: &str) -> Result<usize> {
         .parse()
         .map_err(|_| anyhow::anyhow!("{flag} expects a numerical value"))?;
     if n <= 0 {
-        bail!("you must provide a non-zero number of processes");
+        crate::git_fatal!("you must provide a non-zero number of processes");
     }
     Ok(n as usize)
 }
@@ -1624,7 +1624,7 @@ fn parse_fetch_jobs_config(value: &str) -> Result<usize> {
         .parse()
         .map_err(|_| anyhow::anyhow!("bad numeric config value {value:?} for 'submodule.fetchjobs'"))?;
     if n < 0 {
-        bail!("negative values not allowed for submodule.fetchJobs");
+        crate::git_fatal!("negative values not allowed for submodule.fetchJobs");
     }
     Ok(if n == 0 {
         std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
@@ -3053,7 +3053,7 @@ fn add(args: &[String], quiet: bool) -> Result<ExitCode> {
         }
     };
     if path.is_empty() {
-        bail!("'{url}' does not name a submodule path");
+        crate::git_fatal!("'{url}' does not name a submodule path");
     }
     let name = name.unwrap_or_else(|| path.clone());
 
@@ -3067,10 +3067,10 @@ fn add(args: &[String], quiet: bool) -> Result<ExitCode> {
     let abs = workdir.join(&path);
     let occupied = std::fs::read_dir(&abs).map(|mut d| d.next().is_some()).unwrap_or(false);
     if occupied && !force {
-        bail!("'{path}' already exists and is not an empty directory");
+        crate::git_fatal!("'{path}' already exists and is not an empty directory");
     }
     if !force && repo.index_or_empty()?.entry_by_path(BStr::new(path.as_bytes())).is_some() {
-        bail!("'{path}' already exists in the index");
+        crate::git_fatal!("'{path}' already exists in the index");
     }
 
     // ---- clone, through this binary's own porcelain -------------------------

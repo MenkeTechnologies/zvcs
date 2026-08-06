@@ -460,7 +460,7 @@ impl Mailinfo {
             let value = String::from_utf8_lossy(&v).into_owned();
             match parse_quoted_cr_action(&value) {
                 Some(action) => mi.quoted_cr = action,
-                None => bail!("bad action '{value}' for 'mailinfo.quotedcr'"),
+                None => crate::git_fatal!("bad action '{value}' for 'mailinfo.quotedcr'"),
             }
         }
         Ok(mi)
@@ -685,7 +685,7 @@ impl Mailinfo {
             }
             // git hands every other pair to iconv; without it, guessing bytes
             // would be worse than stopping.
-            None => bail!(
+            None => crate::git_fatal!(
                 "cannot convert from {source} to {target}: charset re-coding beyond \
                  UTF-8/US-ASCII/ISO-8859-1 needs iconv, which is not vendored (use -n)"
             ),

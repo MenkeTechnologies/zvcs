@@ -1099,7 +1099,7 @@ fn color_enabled(repo: &gix::Repository, cli: Option<bool>) -> Result<bool> {
                 "auto" => auto_color(),
                 "true" | "yes" | "on" | "1" => true,
                 "false" | "no" | "off" | "0" | "" => false,
-                other => bail!("invalid value {other:?} for {key}"),
+                other => crate::git_fatal!("invalid value {other:?} for {key}"),
             });
         }
         // A valueless key (`[color]\n\tui`) is boolean true.

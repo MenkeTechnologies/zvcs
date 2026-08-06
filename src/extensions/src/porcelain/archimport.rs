@@ -142,7 +142,7 @@ pub fn archimport(args: &[String]) -> Result<ExitCode> {
         return Ok(usage());
     }
 
-    bail!(
+    anyhow::bail!(
         "unsupported command \"archimport\": importing from GNU Arch requires a tla/baz archive \
          reader (patch logs, changesets, the archive,category--branch--version namespace), which \
          no vendored crate under src/ported provides; stock git-archimport shells out to $ARCH_CLIENT"

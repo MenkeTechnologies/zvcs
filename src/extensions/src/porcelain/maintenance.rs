@@ -1387,7 +1387,7 @@ fn check_value(
             };
             *scheduled = Some(frequency);
         }
-        _ => bail!("internal: unexpected option name {name:?}"),
+        _ => crate::git_fatal!("internal: unexpected option name {name:?}"),
     }
     Ok(None)
 }
@@ -1670,7 +1670,7 @@ fn maintpath(repo: &gix::Repository) -> Result<BString> {
     let base = repo.workdir().unwrap_or_else(|| repo.path());
     let real = std::fs::canonicalize(base)?;
     let Some(text) = real.to_str() else {
-        bail!("repository path is not valid UTF-8: {real:?}");
+        crate::git_fatal!("repository path is not valid UTF-8: {real:?}");
     };
     Ok(BString::from(text))
 }

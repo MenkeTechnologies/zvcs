@@ -641,7 +641,7 @@ fn disk_size(repo: &gix::Repository, oid: ObjectId) -> Result<u64> {
     if let Some(loc) = repo.objects.location_by_oid(oid.as_ref(), &mut buf) {
         return Ok(loc.entry_size as u64);
     }
-    anyhow::bail!("repo: cannot determine on-disk size of {hex}")
+    crate::git_fatal!("repo: cannot determine on-disk size of {hex}")
 }
 
 /// One table row: a plain label (section header / spacer) or a value cell.

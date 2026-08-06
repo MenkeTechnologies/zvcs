@@ -156,31 +156,31 @@ pub fn submodule__helper(args: &[String]) -> Result<ExitCode> {
             forwarded.extend(tail.iter().cloned());
             super::submodule::submodule(&forwarded)
         }
-        "clone" => bail!(
+        "clone" => anyhow::bail!(
             "unsupported subcommand \"clone\": cloning a submodule needs transport plus worktree checkout (ported: gitdir, get-default-remote, status, init, foreach, summary, set-branch)"
         ),
-        "add" => bail!(
+        "add" => anyhow::bail!(
             "unsupported subcommand \"add\": needs a clone of the new submodule (ported: gitdir, get-default-remote, status, init, foreach, summary, set-branch)"
         ),
-        "update" => bail!(
+        "update" => anyhow::bail!(
             "unsupported subcommand \"update\": needs clone/fetch/checkout of submodules (ported: gitdir, get-default-remote, status, init, foreach, summary, set-branch)"
         ),
-        "sync" => bail!(
+        "sync" => anyhow::bail!(
             "unsupported subcommand \"sync\": rewrites remote urls inside submodules (ported: gitdir, get-default-remote, status, init, foreach, summary, set-branch)"
         ),
-        "deinit" => bail!(
+        "deinit" => anyhow::bail!(
             "unsupported subcommand \"deinit\": removes submodule worktrees (ported: gitdir, get-default-remote, status, init, foreach, summary, set-branch)"
         ),
-        "push-check" => bail!(
+        "push-check" => anyhow::bail!(
             "unsupported subcommand \"push-check\": needs the remote/refspec machinery (ported: gitdir, get-default-remote, status, init, foreach, summary, set-branch)"
         ),
-        "absorbgitdirs" => bail!(
+        "absorbgitdirs" => anyhow::bail!(
             "unsupported subcommand \"absorbgitdirs\": relocates submodule git dirs (ported: gitdir, get-default-remote, status, init, foreach, summary, set-branch)"
         ),
-        "set-url" => bail!(
+        "set-url" => anyhow::bail!(
             "unsupported subcommand \"set-url\": edits .gitmodules (ported: gitdir, get-default-remote, status, init, foreach, summary, set-branch)"
         ),
-        "create-branch" => bail!(
+        "create-branch" => anyhow::bail!(
             "unsupported subcommand \"create-branch\": creates a branch inside a submodule (ported: gitdir, get-default-remote, status, init, foreach, summary, set-branch)"
         ),
         "migrate-gitdir-configs" => bail!(
@@ -308,7 +308,7 @@ fn get_default_remote(args: &[String]) -> Result<ExitCode> {
         Some(name) => {
             let full = name.as_bstr().to_str_lossy().into_owned();
             let Some(short) = full.strip_prefix("refs/heads/") else {
-                bail!("HEAD of '{path}' points to {full}, which is not a branch");
+                crate::git_fatal!("HEAD of '{path}' points to {full}, which is not a branch");
             };
             Some(BString::from(short))
         }

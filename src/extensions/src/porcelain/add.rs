@@ -65,7 +65,7 @@ use gix::index::entry::{Flags, Mode, Stage, Stat};
 pub fn add(args: &[String]) -> Result<ExitCode> {
     let repo = gix::discover(".")?;
     if repo.workdir().is_none() {
-        bail!("this operation must be run in a work tree");
+        crate::git_fatal!("this operation must be run in a work tree");
     }
 
     // --- argument parse -----------------------------------------------------

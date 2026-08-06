@@ -199,7 +199,7 @@ fn report(path: &str, err: HeaderError) -> Result<ExitCode> {
         HeaderError::NotBundle => {
             eprintln!("error: '{path}' does not look like a v2 or v3 bundle file");
         }
-        HeaderError::Malformed(why) => bail!("malformed bundle header in {path:?}: {why}"),
+        HeaderError::Malformed(why) => crate::git_fatal!("malformed bundle header in {path:?}: {why}"),
     }
     Ok(ExitCode::from(1))
 }

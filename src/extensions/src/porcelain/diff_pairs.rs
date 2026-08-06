@@ -1064,13 +1064,13 @@ pub(crate) fn render_raw_stream(
             // substituting Myers, exactly like the sibling `git diff` port.
             "--minimal" => opts.algo = Some(gix::diff::blob::Algorithm::MyersMinimal),
             "--histogram" => opts.algo = Some(gix::diff::blob::Algorithm::Histogram),
-            "--patience" => bail!("diff algorithm {:?} is not available", "patience"),
+            "--patience" => crate::git_fatal!("diff algorithm {:?} is not available", "patience"),
             "--diff-algorithm" => {
                 let v = want_value!(s.len());
                 match classify_algo(&v) {
                     AlgoChoice::Use(a) => opts.algo = Some(a),
                     AlgoChoice::Patience => {
-                        bail!("diff algorithm {:?} is not available", "patience")
+                        crate::git_fatal!("diff algorithm {:?} is not available", "patience")
                     }
                     AlgoChoice::Unknown => {
                         eprintln!(
@@ -1085,7 +1085,7 @@ pub(crate) fn render_raw_stream(
                 match classify_algo(&s["--diff-algorithm=".len()..]) {
                     AlgoChoice::Use(a) => opts.algo = Some(a),
                     AlgoChoice::Patience => {
-                        bail!("diff algorithm {:?} is not available", "patience")
+                        crate::git_fatal!("diff algorithm {:?} is not available", "patience")
                     }
                     AlgoChoice::Unknown => {
                         eprintln!(

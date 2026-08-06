@@ -123,7 +123,7 @@ pub fn mktag(args: &[String]) -> Result<ExitCode> {
         // Only reachable when config demoted one of the structural checks that
         // git nevertheless treats as fatal to the parse; git would go on to use
         // an uninitialised object id, which is not something to imitate.
-        bail!("tag on stdin has no usable 'object'/'type' header after fsck demotion");
+        crate::git_fatal!("tag on stdin has no usable 'object'/'type' header after fsck demotion");
     };
 
     // `verify_object_in_tag`: the tagged object must exist and have that type.

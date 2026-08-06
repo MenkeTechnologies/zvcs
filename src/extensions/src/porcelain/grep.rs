@@ -583,7 +583,7 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
                 "recurse-submodules" => {
                     deferred.set_changing.get_or_insert_with(|| a.to_string());
                 }
-                _ => bail!("{}", unsupported(a)),
+                _ => anyhow::bail!("{}", unsupported(a)),
             }
             i += 1;
             continue;
@@ -718,7 +718,7 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
                     c = group.len();
                     continue;
                 }
-                other => bail!("{}", unsupported(&format!("-{other}"))),
+                other => anyhow::bail!("{}", unsupported(&format!("-{other}"))),
             }
             c += 1;
         }
@@ -1191,7 +1191,7 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
                 if let Some(da) = diff_attrs.as_mut() {
                     if da.has_funcname_driver(rela.as_bstr())? {
                         let flag = if opts.funcbody { "--function-context" } else { "--show-function" };
-                        bail!("{}", unsupported(flag));
+                        anyhow::bail!("{}", unsupported(flag));
                     }
                 }
             }
@@ -2374,7 +2374,7 @@ fn run_textconv(cmd: &str, content: &[u8]) -> Result<Vec<u8>> {
     match output {
         Ok(o) if o.status.success() => Ok(o.stdout),
         Ok(_) | Err(_) => {
-            bail!("unable to read files to diff: textconv command '{cmd}' failed")
+            crate::git_fatal!("unable to read files to diff: textconv command '{cmd}' failed")
         }
     }
 }
@@ -3286,7 +3286,7 @@ fn literal_of(pattern: &str, dialect: Dialect) -> Result<Vec<u8>> {
         ],
     };
     if let Some(c) = pattern.chars().find(|c| meta.contains(c)) {
-        bail!(
+        crate::git_fatal!(
             "pattern {pattern:?} contains the regex metacharacter {c:?}; \
              the vendored gitoxide crates ship no regex engine, so only literal \
              patterns are supported (use -F to match it literally)"

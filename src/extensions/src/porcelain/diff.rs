@@ -667,7 +667,7 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
             "--histogram" => algorithm = Some(gix::diff::blob::Algorithm::Histogram),
             // `--patience` aliases `--diff-algorithm=patience`; imara-diff has no
             // patience variant, so it bails identically to that flag.
-            "--patience" => bail!("diff algorithm {:?} is not available", "patience"),
+            "--patience" => crate::git_fatal!("diff algorithm {:?} is not available", "patience"),
             // Accepted here rather than implemented.
             //
             // Rename detection is *not* in this list any more — `-M`, `-C`,
@@ -784,7 +784,7 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                     "myers" | "default" => algorithm = Some(gix::diff::blob::Algorithm::Myers),
                     "minimal" => algorithm = Some(gix::diff::blob::Algorithm::MyersMinimal),
                     "histogram" => algorithm = Some(gix::diff::blob::Algorithm::Histogram),
-                    other => bail!("diff algorithm {other:?} is not available"),
+                    other => crate::git_fatal!("diff algorithm {other:?} is not available"),
                 }
             }
             // `--stat-name-width=<n>` / `--stat-graph-width=<n>` override the
@@ -968,7 +968,7 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
         match config_algorithm {
             Some(ConfigAlgorithm::Use(a)) => algorithm = Some(a),
             Some(ConfigAlgorithm::Patience) => {
-                bail!("diff algorithm {:?} is not available", "patience")
+                crate::git_fatal!("diff algorithm {:?} is not available", "patience")
             }
             None => {}
         }
@@ -2179,7 +2179,7 @@ fn parse_config_algorithm(name: &gix::bstr::BStr) -> Result<ConfigAlgorithm> {
         b"minimal" => ConfigAlgorithm::Use(MyersMinimal),
         b"histogram" => ConfigAlgorithm::Use(Histogram),
         b"patience" => ConfigAlgorithm::Patience,
-        _ => bail!("diff algorithm {:?} is not available", name.to_str_lossy()),
+        _ => crate::git_fatal!("diff algorithm {:?} is not available", name.to_str_lossy()),
     })
 }
 

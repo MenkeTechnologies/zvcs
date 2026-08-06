@@ -3356,7 +3356,7 @@ pub fn send_email(args: &[String]) -> Result<ExitCode> {
         Ok(code) => Ok(code),
         Err(Stop::Die(msg)) => Ok(die(&msg, &last_child)),
         Err(Stop::Exit(code)) => Ok(ExitCode::from(code)),
-        Err(Stop::Unported(msg)) => bail!(msg),
+        Err(Stop::Unported(msg)) => anyhow::bail!("{msg}"),
     }
 }
 

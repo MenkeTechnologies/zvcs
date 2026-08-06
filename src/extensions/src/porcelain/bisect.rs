@@ -654,7 +654,7 @@ fn start(args: &[String]) -> Result<ExitCode> {
 fn head_label(repo: &gix::Repository) -> Result<String> {
     let head = repo.head()?;
     if head.is_unborn() {
-        bail!("cannot bisect: HEAD does not point at a commit yet");
+        crate::git_fatal!("cannot bisect: HEAD does not point at a commit yet");
     }
     if head.is_detached() {
         let id = head
@@ -1128,7 +1128,7 @@ fn candidate_list(ctx: &Ctx, bad: ObjectId, goods: &[ObjectId]) -> Result<Vec<Ob
         list.push(info?.id);
     }
     if list.is_empty() {
-        bail!("no testable commit found between the marked revisions");
+        crate::git_fatal!("no testable commit found between the marked revisions");
     }
     Ok(list)
 }

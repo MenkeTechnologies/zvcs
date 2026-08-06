@@ -175,7 +175,7 @@ pub fn remote_http(args: &[String]) -> Result<ExitCode> {
         } else if cmd == "list" || strip_prefix(&line, b"list ").is_some() {
             // `cmd_list()`: `for_push = !!strstr(buf->buf + 4, "for-push")`.
             if cmd[4..].contains_str("for-push") {
-                bail!(
+                crate::git_fatal!(
                     "'list for-push' needs a git-receive-pack service advertisement; the vendored \
                      gitoxide only performs an upload-pack handshake and has no send-pack driver"
                 );
@@ -184,19 +184,19 @@ pub fn remote_http(args: &[String]) -> Result<ExitCode> {
                 return Ok(code);
             }
         } else if strip_prefix(&line, b"fetch ").is_some() {
-            bail!(
+            crate::git_fatal!(
                 "'fetch' must download the named object ids without writing refs; gix's fetch is \
                  refspec-driven and updates refs, and exposes no object-id entry point"
             );
         } else if strip_prefix(&line, b"push ").is_some() {
-            bail!(
+            crate::git_fatal!(
                 "'push' needs a git-receive-pack driver (ref-update commands, pack generation, \
                  report-status parsing); gix-protocol implements only the fetch half"
             );
         } else if cmd == "stateless-connect"
             || strip_prefix(&line, b"stateless-connect ").is_some()
         {
-            bail!(
+            crate::git_fatal!(
                 "'stateless-connect' must proxy raw pkt-lines between stdio and a series of HTTP \
                  POSTs; gix-transport's HTTP client is a typed request/response pair, not a duplex \
                  byte channel"

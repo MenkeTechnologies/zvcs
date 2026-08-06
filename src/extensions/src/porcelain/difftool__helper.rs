@@ -83,7 +83,7 @@ pub fn difftool__helper(args: &[String]) -> Result<ExitCode> {
     if extcmd.is_none() {
         let named = env_nonempty("GIT_DIFF_TOOL");
         if named.is_none() {
-            bail!(
+            anyhow::bail!(
                 "unsupported invocation: without GIT_DIFFTOOL_EXTCMD the helper must run \
                  git-mergetool--lib's get_merge_tool, which reads diff.tool/merge.tool and then \
                  guesses from the tools installed under $(git --exec-path)/mergetools/ — no such \
@@ -92,7 +92,7 @@ pub fn difftool__helper(args: &[String]) -> Result<ExitCode> {
             );
         }
         if dirdiff || args.len() > GROUP - 1 {
-            bail!(
+            anyhow::bail!(
                 "unsupported invocation: launching tool {:?} requires git-mergetool--lib's \
                  initialize_merge_tool/run_merge_tool, i.e. that tool's diff_cmd from \
                  $(git --exec-path)/mergetools/, which the vendored crates do not provide \

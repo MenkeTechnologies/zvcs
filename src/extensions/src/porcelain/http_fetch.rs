@@ -380,7 +380,7 @@ impl Walker {
         let text = String::from_utf8_lossy(&body);
         let text = text.trim_end();
         if let Some(rest) = text.strip_prefix("ref: ") {
-            bail!(
+            crate::git_fatal!(
                 "target {target:?} resolved to the symbolic ref {:?}; git records the symref and \
                  then walks a null object id, which this port refuses to imitate ({PORTED})",
                 rest.trim()
@@ -596,7 +596,7 @@ impl Walker {
         for name in ["objects/info/http-alternates", "objects/info/alternates"] {
             let Some(body) = self.get(name) else { continue };
             if body.iter().any(|b| !b.is_ascii_whitespace()) {
-                bail!(
+                crate::git_fatal!(
                     "remote lists {name} — git retries every miss against each alternate base \
                      recursively, a fetch order this port has not verified against git ({PORTED})"
                 );
@@ -692,7 +692,7 @@ impl Walker {
 
         let hash = outcome.index.data_hash;
         let (Some(data_path), Some(index_path)) = (&outcome.data_path, &outcome.index_path) else {
-            bail!("downloaded pack held no objects (empty pack)");
+            crate::git_fatal!("downloaded pack held no objects (empty pack)");
         };
 
         if self.want_rev_index() {

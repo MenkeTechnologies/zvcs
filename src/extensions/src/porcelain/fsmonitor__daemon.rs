@@ -163,7 +163,7 @@ pub fn fsmonitor__daemon(args: &[String]) -> Result<ExitCode> {
             }
         }
         "stop" => stop(&socket),
-        "start" | "run" => bail!(
+        "start" | "run" => crate::git_fatal!(
             "`{}` needs the daemon substrate (a filesystem-notification backend and a simple-IPC server), which the vendored gitoxide crates do not provide (ported: status, stop)",
             positional[0]
         ),

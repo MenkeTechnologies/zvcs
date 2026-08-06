@@ -63,7 +63,7 @@ pub fn cvsexportcommit(args: &[String]) -> Result<ExitCode> {
             if VALUE_FLAGS.contains(&c) {
                 let rest: String = chars.by_ref().collect();
                 if rest.is_empty() && iter.next().is_none() {
-                    bail!("option requires an argument -- {c}");
+                    crate::git_fatal!("option requires an argument -- {c}");
                 }
                 break;
             } else if BOOL_FLAGS.contains(&c) {

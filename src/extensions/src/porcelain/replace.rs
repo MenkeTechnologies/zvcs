@@ -709,14 +709,14 @@ fn replace_parents(buf: &mut Vec<u8>, hexsz: usize, new_parents: &[u8]) -> Resul
     // "tree " + <hex> + "\n"
     let start = hexsz + 6;
     if buf.len() < start || !buf.starts_with(b"tree ") {
-        bail!("malformed commit object: no tree header");
+        crate::git_fatal!("malformed commit object: no tree header");
     }
     let mut end = start;
     // "parent " + <hex> + "\n"
     while buf[end..].starts_with(b"parent ") {
         end += hexsz + 8;
         if end > buf.len() {
-            bail!("malformed commit object: truncated parent header");
+            crate::git_fatal!("malformed commit object: truncated parent header");
         }
     }
     buf.splice(start..end, new_parents.iter().copied());

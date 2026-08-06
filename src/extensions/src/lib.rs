@@ -15,6 +15,7 @@ pub mod date;
 pub mod db;
 pub mod dispatch;
 pub mod external;
+pub mod fatal;
 pub mod gitsig;
 pub mod hooks;
 pub mod index_commit;
@@ -268,6 +269,20 @@ fn run_command() -> ExitCode {
         // and prints nothing; reporting it as an error meant `zvcs <cmd> | head`
         // printed a spurious diagnostic and exited 1.
         Err(e) if sigpipe::is_broken_pipe(e.as_ref()) => sigpipe::exit_broken_pipe(),
+        // A message git itself would `die()` with is rendered the way git renders
+        // it — `fatal: <message>`, exit 128 — and without the anyhow context
+        // chain, which git has no equivalent of. Anything else is this port
+        // speaking for itself and keeps the `zvcs: <verb>:` prefix that says so.
+        // The diagnostic is already on stderr; only the exit code is left.
+        Err(e) if e.downcast_ref::<fatal::Silent>().is_some() => {
+            ExitCode::from(e.downcast_ref::<fatal::Silent>().expect("checked").0)
+        }
+        Err(e) if e.downcast_ref::<fatal::Fatal>().is_some() => {
+            let msg = e.downcast_ref::<fatal::Fatal>().expect("checked").0.clone();
+            trace2::error(&msg);
+            eprintln!("fatal: {msg}");
+            ExitCode::from(fatal::EXIT_FATAL)
+        }
         Err(e) => {
             let msg = format!("{sub}: {e:#}");
             trace2::error(&msg);

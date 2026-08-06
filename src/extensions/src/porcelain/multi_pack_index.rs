@@ -419,7 +419,7 @@ fn write(rest: &[&str], mut object_dir: Option<PathBuf>) -> Result<ExitCode> {
     // fails on an empty pack set before it reaches any bitmap work, so a
     // repository with no packs must answer `no pack files to index.` first.
     if incremental {
-        bail!(
+        crate::git_fatal!(
             "multi-pack-index write --incremental is not portable here — gix-pack writes a single flat v1 MIDX with zero base files (multi_index/init.rs discards the base-file count), so a chain layer under multi-pack-index.d/ cannot be written"
         );
     }
@@ -448,7 +448,7 @@ fn write(rest: &[&str], mut object_dir: Option<PathBuf>) -> Result<ExitCode> {
     }
     // Only now — with packs to index — does the missing bitmap writer matter.
     if bitmap {
-        bail!(
+        crate::git_fatal!(
             "multi-pack-index write --bitmap is not portable here — gix-pack has no multi-pack bitmap writer, so the emitted .bitmap/.rev would not match git's"
         );
     }
@@ -464,7 +464,7 @@ fn write(rest: &[&str], mut object_dir: Option<PathBuf>) -> Result<ExitCode> {
     if let Some(name) = &preferred {
         if preferred_pack_present(name, &index_paths) {
             if has_cross_pack_duplicates(&index_paths, repo.object_hash())? {
-                bail!(
+                anyhow::bail!(
                     "multi-pack-index write --preferred-pack={name} cannot be reproduced here — the indexed packs share at least one object id and gix_pack::multi_index::write_from_index_paths does not expose the preferred-pack tie-break git uses to resolve the duplicate"
                 );
             }
@@ -722,7 +722,7 @@ fn expire(rest: &[&str], mut object_dir: Option<PathBuf>) -> Result<ExitCode> {
         let (pack, _offset) = file.pack_id_and_pack_offset_at_index(entry);
         match counts.get_mut(pack as usize) {
             Some(count) => *count += 1,
-            None => bail!(
+            None => crate::git_fatal!(
                 "multi-pack-index entry {entry} names pack {pack}, but only {} packs are recorded",
                 counts.len()
             ),
@@ -850,7 +850,7 @@ fn compact(rest: &[&str], mut object_dir: Option<PathBuf>) -> Result<ExitCode> {
         return Ok(ExitCode::from(128));
     }
 
-    bail!("compacting MIDX chain layers {from}..{to} is unported — gix-pack reads and writes v1 MIDX with zero base files only (multi_index/init.rs discards the base-file count), so a chain layer cannot be read back, let alone merged")
+    anyhow::bail!("compacting MIDX chain layers {from}..{to} is unported — gix-pack reads and writes v1 MIDX with zero base files only (multi_index/init.rs discards the base-file count), so a chain layer cannot be read back, let alone merged")
 }
 
 /// `repack`: batch small packs into new ones and rewrite the MIDX.
@@ -958,7 +958,7 @@ fn repack(rest: &[&str], mut object_dir: Option<PathBuf>) -> Result<ExitCode> {
     // MIDX. That step needs a pack-repacking driver gix-pack does not provide —
     // its only output mode is `Mode::PackCopyAndBaseObjects` with no delta
     // compression — so collapsing packs is not yet ported.
-    bail!(
+    crate::git_fatal!(
         "multi-pack-index repack of a MIDX naming {} packs is not yet ported — batched repacking needs a pack writer that gix-pack does not provide",
         file.num_indices()
     )
@@ -1107,7 +1107,7 @@ fn object_store(object_dir: Option<PathBuf>) -> Result<(gix::Repository, PathBuf
 fn reject_chain(pack_dir: &Path) -> Result<()> {
     let chain = pack_dir.join("multi-pack-index.d");
     if chain.exists() {
-        bail!("an incremental multi-pack-index chain is present at {chain:?}; rewriting it is unported");
+        anyhow::bail!("an incremental multi-pack-index chain is present at {chain:?}; rewriting it is unported");
     }
     Ok(())
 }

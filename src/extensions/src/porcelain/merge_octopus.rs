@@ -397,7 +397,7 @@ fn dirty_paths(repo: &Repository) -> Result<Vec<BString>> {
 
     let head_tree = match repo.head_commit().ok().and_then(|c| c.tree_id().ok()) {
         Some(id) => id.detach(),
-        None => bail!(
+        None => anyhow::bail!(
             "unsupported: merge-octopus against an unborn HEAD (git lets diff-index's \
              `fatal: ambiguous argument 'HEAD'` through, which is not reproduced)"
         ),

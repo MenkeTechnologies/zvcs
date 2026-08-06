@@ -536,7 +536,7 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
                 // Not one of git's diff-tree options as far as this port knows; git
                 // would answer with its usage text and 129, but guessing that here
                 // would hide a genuinely missing option, so fail loudly instead.
-                _ => bail!("unrecognized option {a:?}"),
+                _ => crate::git_fatal!("unrecognized option {a:?}"),
             }
             i += 1;
             continue;

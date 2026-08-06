@@ -171,7 +171,7 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
                     None | Some("true") | Some("yes") => push_proto::Signed::Always,
                     Some("false") | Some("no") => push_proto::Signed::Never,
                     Some("if-asked") => push_proto::Signed::IfAsked,
-                    Some(v) => bail!("bad signed argument: {v}"),
+                    Some(v) => crate::git_fatal!("bad signed argument: {v}"),
                 };
                 signed_explicit = true;
             }
@@ -182,7 +182,7 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
 
     // Conflicts git rejects before contacting the remote.
     if f.tags && f.all {
-        bail!("--all can't be combined with --tags");
+        crate::git_fatal!("--all can't be combined with --tags");
     }
 
     let repo = gix::discover(".")?;
@@ -242,7 +242,7 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
                     Some(false) => push_proto::Signed::Never,
                     Some(true) => push_proto::Signed::Always,
                     None if v.eq_ignore_ascii_case("if-asked") => push_proto::Signed::IfAsked,
-                    None => bail!("invalid value for 'push.gpgSign'"),
+                    None => crate::git_fatal!("invalid value for 'push.gpgSign'"),
                 };
             }
         }
@@ -298,7 +298,7 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
     // git validates the push-option list once, after the command line and
     // `push.pushOption` have been reconciled, so a configured value is checked too.
     if f.push_options.iter().any(|o| o.contains('\n')) {
-        bail!("push options must not have new line characters");
+        crate::git_fatal!("push options must not have new line characters");
     }
 
     let remote = match repo.find_remote(remote_name.as_str()) {
@@ -358,7 +358,7 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
     }
 
     if requests.is_empty() {
-        bail!("no refspec to push");
+        crate::git_fatal!("no refspec to push");
     }
 
     // `pre-push` runs before contacting the remote, receiving `<remote> <url>` as
@@ -410,7 +410,7 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
                     eprintln!();
                     eprintln!("to push them to a remote.");
                     eprintln!();
-                    bail!("Aborting.");
+                    crate::git_fatal!("Aborting.");
                 }
                 // git's `push_unpushed_submodules` recursively runs `git push` inside
                 // each submodule (submodule.c). That transport recursion is not wired
@@ -551,13 +551,13 @@ enum Recurse {
 /// modes map through directly.
 fn parse_recurse(arg: &str) -> Result<Recurse> {
     match maybe_bool(arg) {
-        Some(true) => bail!("bad recurse-submodules argument: {arg}"),
+        Some(true) => crate::git_fatal!("bad recurse-submodules argument: {arg}"),
         Some(false) => Ok(Recurse::Off),
         None => match arg {
             "on-demand" => Ok(Recurse::OnDemand),
             "check" => Ok(Recurse::Check),
             "only" => Ok(Recurse::Only),
-            _ => bail!("bad recurse-submodules argument: {arg}"),
+            _ => crate::git_fatal!("bad recurse-submodules argument: {arg}"),
         },
     }
 }
@@ -691,7 +691,7 @@ fn build_requests(
     // is the only place the advertisement exists.
     if f.mirror {
         if !specs.is_empty() {
-            bail!("--mirror can't be combined with refspecs");
+            crate::git_fatal!("--mirror can't be combined with refspecs");
         }
         for r in repo.references()?.all()? {
             let mut r = r.map_err(|e| anyhow!("{e}"))?;
@@ -729,7 +729,7 @@ fn build_requests(
 
     if f.all {
         if !specs.is_empty() {
-            bail!("--all can't be combined with refspecs");
+            crate::git_fatal!("--all can't be combined with refspecs");
         }
         for r in repo.references()?.local_branches()? {
             let r = r.map_err(|e| anyhow!("{e}"))?;
@@ -979,7 +979,7 @@ fn resolve_bare_dst(repo: &gix::Repository, name: &str) -> Result<String> {
     let Ok(mut reference) = repo.find_reference(name) else {
         // Not a ref at all — a raw object name. git's `resolve_ref_unsafe`
         // returns NULL for it and dies.
-        bail!("{name} cannot be resolved to branch");
+        crate::git_fatal!("{name} cannot be resolved to branch");
     };
     let symbolic = matches!(reference.target(), gix::refs::TargetRef::Symbolic(_));
     while let Some(Ok(next)) = reference.follow() {
@@ -987,7 +987,7 @@ fn resolve_bare_dst(repo: &gix::Repository, name: &str) -> Result<String> {
     }
     let resolved = reference.name().as_bstr().to_str()?.to_string();
     if symbolic && !resolved.starts_with("refs/heads/") {
-        bail!("{name} cannot be resolved to branch");
+        crate::git_fatal!("{name} cannot be resolved to branch");
     }
     Ok(resolved)
 }
@@ -1588,7 +1588,7 @@ fn expand_pattern_refspec(
         None => (spec, spec),
     };
     if src.matches('*').count() != 1 || dst.matches('*').count() != 1 {
-        bail!("invalid refspec '{spec}': a pattern needs exactly one '*' on each side");
+        crate::git_fatal!("invalid refspec '{spec}': a pattern needs exactly one '*' on each side");
     }
     let (src_prefix, src_suffix) = src.split_once('*').expect("checked above");
     let (dst_prefix, dst_suffix) = dst.split_once('*').expect("checked above");

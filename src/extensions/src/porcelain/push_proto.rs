@@ -396,13 +396,13 @@ pub fn send_pack(
     // dropping the options) would silently do something other than what was asked.
     if opts.atomic {
         if !caps.contains("atomic") {
-            bail!("the receiving end does not support --atomic push");
+            crate::git_fatal!("the receiving end does not support --atomic push");
         }
         cap_buf.push_str(" atomic");
     }
     if !opts.push_options.is_empty() {
         if !caps.contains("push-options") {
-            bail!("the receiving end does not support push options");
+            crate::git_fatal!("the receiving end does not support push options");
         }
         cap_buf.push_str(" push-options");
     }
@@ -419,7 +419,7 @@ pub fn send_pack(
         Signed::IfAsked => nonce.is_some(),
         Signed::Always => {
             if nonce.is_none() {
-                bail!("the receiving end does not support --signed push");
+                crate::git_fatal!("the receiving end does not support --signed push");
             }
             true
         }
@@ -775,7 +775,7 @@ pub fn send_pack(
                     None => Err(format!("unable to parse remote unpack status: {text}")),
                 };
             }
-            None => bail!("unexpected flush packet while reading remote unpack status"),
+            None => crate::git_fatal!("unexpected flush packet while reading remote unpack status"),
         }
         // `hint`, the ref the `option` lines that follow belong to.
         let mut hint: Option<String> = None;
@@ -926,7 +926,7 @@ fn read_pkt_lines(reader: &mut Box<dyn ExtendedBufRead<'_> + Unpin + '_>) -> Res
             }
             // Flush / delimiter / response-end all terminate the report.
             Some(Ok(Ok(_))) => break,
-            Some(Ok(Err(e))) => bail!("malformed packet line from remote: {e}"),
+            Some(Ok(Err(e))) => crate::git_fatal!("malformed packet line from remote: {e}"),
             Some(Err(e)) => bail!("error reading from remote: {e}"),
         }
     }
@@ -985,7 +985,7 @@ fn demultiplex_sideband(
                 // `protocol error: missing sideband designator` / `bad band #n`.
                 _ => {
                     sideband.finish();
-                    bail!("protocol error: bad side-band packet from remote");
+                    crate::git_fatal!("protocol error: bad side-band packet from remote");
                 }
             },
             // The flush that ends the multiplexed stream — `SIDEBAND_FLUSH`.
@@ -995,7 +995,7 @@ fn demultiplex_sideband(
             }
             Some(Ok(Err(e))) => {
                 sideband.finish();
-                bail!("malformed packet line from remote: {e}");
+                crate::git_fatal!("malformed packet line from remote: {e}");
             }
             Some(Err(e)) => {
                 sideband.finish();

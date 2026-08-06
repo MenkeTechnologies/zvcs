@@ -221,7 +221,7 @@ pub fn merge_subtree(args: &[String]) -> Result<ExitCode> {
                     repo.find_commit(computed[0].detach())?.tree_id()?.detach(),
                     None,
                 ),
-                _ => bail!(
+                _ => crate::git_fatal!(
                     "merge-subtree cannot be performed: the history has {} merge bases \
                      (criss-cross), whose virtual merge base git builds by recursively \
                      merging them with the subtree shift applied at each level; \
@@ -235,7 +235,7 @@ pub fn merge_subtree(args: &[String]) -> Result<ExitCode> {
             commit_tree(&repo, bases[0])?,
             Some("constructed merge base".to_string()),
         ),
-        n => bail!(
+        n => crate::git_fatal!(
             "merge-subtree cannot be performed: {n} explicit merge bases require a virtual \
              merge base built by recursively merging them with the subtree shift applied at \
              each level; Repository::virtual_merge_base cannot thread the shift through its \
@@ -286,7 +286,7 @@ pub fn merge_subtree(args: &[String]) -> Result<ExitCode> {
     // `<head>`'s tree and the worktree must be clean.
     ensure_index_matches(&repo, &old_index, head_tree)?;
     if repo.is_dirty()? {
-        bail!("your local changes would be overwritten by merge; commit or stash them first");
+        crate::git_fatal!("your local changes would be overwritten by merge; commit or stash them first");
     }
 
     let how = TreatAsUnresolved::git();
@@ -374,7 +374,7 @@ fn shift_tree(
         }
         return match tree_entry(repo, hash2, &del_prefix)? {
             Some((oid, _)) => Ok(oid),
-            None => bail!(
+            None => crate::git_fatal!(
                 "cannot find path {} in tree {hash2}",
                 del_prefix.as_bstr()
             ),

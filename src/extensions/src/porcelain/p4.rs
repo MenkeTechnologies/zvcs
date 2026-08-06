@@ -228,7 +228,7 @@ pub fn p4(args: &[String]) -> Result<ExitCode> {
     };
 
     if matches!(cmd.name, "submit" | "commit") {
-        bail!(
+        anyhow::bail!(
             "unsupported subcommand {cmd_name:?}: P4Submit's constructor probes the external `p4` \
              client for its `move` command before parsing any argument, and no Perforce client \
              exists in the vendored gitoxide crates (ported: branches, and the option/help \
@@ -286,7 +286,7 @@ pub fn p4(args: &[String]) -> Result<ExitCode> {
             let repo = repo.expect("unshelve sets needsGit");
             run_unshelve_preflight(&repo, &cmd, &opts, &parsed)
         }
-        _ => bail!(
+        _ => anyhow::bail!(
             "unsupported subcommand {cmd_name:?}: it reads depot content through the external `p4` \
              client, for which there is no substrate in the vendored gitoxide crates \
              (ported: branches, and the option/help handling of sync, rebase, clone, unshelve)"
@@ -371,7 +371,7 @@ fn usage_block() -> Result<String> {
 fn prog_path() -> Result<String> {
     match std::env::var("GIT_EXEC_PATH") {
         Ok(dir) if !dir.is_empty() => Ok(format!("{dir}/git-p4")),
-        _ => bail!(
+        _ => crate::git_fatal!(
             "cannot render the git-p4 usage banner: it echoes the script's own path \
              ($GIT_EXEC_PATH/git-p4) and GIT_EXEC_PATH is unset"
         ),
@@ -720,7 +720,7 @@ fn run_branches(repo: &gix::Repository) -> Result<ExitCode> {
         let full = format!("refs/remotes/{line}");
         let settings = extract_settings(&log_message(repo, &full)?);
         let (Some(paths), Some(change)) = (settings.depot_paths(), settings.get("change")) else {
-            bail!(
+            crate::git_fatal!(
                 "branch {line:?} has no complete [git-p4: ...] trailer on its tip commit; stock \
                  git raises KeyError and prints a traceback here"
             );
@@ -767,7 +767,7 @@ fn create_or_update_branches_from_origin(repo: &gix::Repository) -> Result<()> {
                 let settings = extract_settings(&log_message(repo, &remote_head)?);
                 if let Some(change) = settings.get("change") {
                     let Some(paths) = settings.depot_paths() else {
-                        bail!(
+                        crate::git_fatal!(
                             "{remote_head} records a change but no depot paths; stock git raises \
                              KeyError and prints a traceback here"
                         );
@@ -845,7 +845,7 @@ fn symbolic_remotes(repo: &gix::Repository) -> Result<Vec<String>> {
 fn log_message(repo: &gix::Repository, rev: &str) -> Result<String> {
     let object = repo.rev_parse_single(rev)?.object()?;
     if object.kind != gix::objs::Kind::Commit {
-        bail!("{rev} does not name a commit");
+        crate::git_fatal!("{rev} does not name a commit");
     }
     let data = &object.data;
     let body = match data.windows(2).position(|w| w == b"\n\n") {
@@ -945,7 +945,7 @@ fn run_unshelve_preflight(
         return Ok(ExitCode::from(1));
     }
 
-    bail!(
+    anyhow::bail!(
         "unsupported: unshelving changelist {:?} reads the shelved files through the external `p4` \
          client, for which there is no substrate in the vendored gitoxide crates (ported: the \
          changelist-count and --origin pre-flight)",

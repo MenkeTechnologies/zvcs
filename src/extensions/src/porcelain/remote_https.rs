@@ -126,7 +126,7 @@ pub fn remote_https(args: &[String]) -> Result<ExitCode> {
         } else if line == "list" || line.starts_with("list ") {
             // git's own test is a substring search over the argument tail.
             if line["list".len()..].contains("for-push") {
-                bail!(
+                crate::git_fatal!(
                     "'list for-push' needs a git-receive-pack advertisement, \
                      which the vendored gitoxide crates do not implement ({PORTED})"
                 );
@@ -135,14 +135,14 @@ pub fn remote_https(args: &[String]) -> Result<ExitCode> {
             stdout.write_all(out.as_bytes())?;
             stdout.flush()?;
         } else if line == "fetch" || line.starts_with("fetch ") {
-            bail!(
+            crate::git_fatal!(
                 "'fetch' needs the helper's batched fetch contract wired to pack \
                  negotiation, which gitoxide only exposes through gix::remote ({PORTED})"
             );
         } else if line == "push" || line.starts_with("push ") {
-            bail!("'push' needs a send-pack client, absent from the vendored gitoxide crates ({PORTED})");
+            crate::git_fatal!("'push' needs a send-pack client, absent from the vendored gitoxide crates ({PORTED})");
         } else if line == "stateless-connect" || line.starts_with("stateless-connect ") {
-            bail!(
+            anyhow::bail!(
                 "'stateless-connect' needs a raw pkt-line passthrough over the HTTP \
                  transport, which gix-transport does not expose ({PORTED})"
             );

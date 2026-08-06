@@ -252,7 +252,7 @@ fn push(st: &State) -> Result<ExitCode> {
                 .filter_map(|d| configured.url(*d))
                 .any(|u| u.to_bstring() == dest);
             if !has_url {
-                bail!("Destination {dest} is not a uri for {name}");
+                crate::git_fatal!("Destination {dest} is not a uri for {name}");
             }
             configured
         }

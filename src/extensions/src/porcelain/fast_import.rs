@@ -316,7 +316,7 @@ fn date_format(name: &str) -> Result<DateFormat> {
         "raw-permissive" => Ok(DateFormat::RawPermissive),
         "rfc2822" => Ok(DateFormat::Rfc2822),
         "now" => Ok(DateFormat::Now),
-        _ => bail!("unknown --date-format argument {name}"),
+        _ => crate::git_fatal!("unknown --date-format argument {name}"),
     }
 }
 
@@ -419,7 +419,7 @@ impl Input {
             let mut out = Vec::new();
             loop {
                 let Some(line) = self.line()? else {
-                    bail!(
+                    crate::git_fatal!(
                         "EOF in data (terminator '{}' not found)",
                         String::from_utf8_lossy(&delim)
                     );
@@ -481,7 +481,7 @@ impl Importer {
         let mut input = Input::new();
         let saw_done = self.stream(&mut input)?;
         if self.opts.require_done && !saw_done {
-            bail!("stream ends early");
+            crate::git_fatal!("stream ends early");
         }
 
         self.checkpoint()?;
@@ -672,7 +672,7 @@ impl Importer {
             } else if cmd == b"done" {
                 return Ok(true);
             } else {
-                bail!("unsupported command: {}", String::from_utf8_lossy(cmd));
+                anyhow::bail!("unsupported command: {}", String::from_utf8_lossy(cmd));
             }
         }
         Ok(false)
@@ -692,7 +692,7 @@ impl Importer {
             line = input.command()?;
         }
         let Some(spec) = field(&line, b"data ") else {
-            bail!("expected 'data n' command");
+            crate::git_fatal!("expected 'data n' command");
         };
         let payload = input.data(&spec)?;
         let id = self.repo.write_blob(&payload)?.detach();
@@ -723,7 +723,7 @@ impl Importer {
             line = input.command()?;
         }
         let Some(v) = field(&line, b"committer ") else {
-            bail!("expected committer command");
+            crate::git_fatal!("expected committer command");
         };
         let committer = self.ident(&v)?;
         line = input.command()?;
@@ -737,11 +737,11 @@ impl Importer {
             let header = match algo {
                 "sha1" => "gpgsig",
                 "sha256" => "gpgsig-sha256",
-                _ => bail!("unknown git hash algorithm in gpgsig: '{algo}'"),
+                _ => crate::git_fatal!("unknown git hash algorithm in gpgsig: '{algo}'"),
             };
             line = input.command()?;
             let Some(spec) = field(&line, b"data ") else {
-                bail!("expected 'data n' command");
+                crate::git_fatal!("expected 'data n' command");
             };
             signatures.push((header, input.data(&spec)?));
             line = input.command()?;
@@ -758,7 +758,7 @@ impl Importer {
                     signatures.clear();
                 }
                 SignedMode::Abort => {
-                    bail!("encountered signed commit; use --signed-commits=<mode> to handle it")
+                    crate::git_fatal!("encountered signed commit; use --signed-commits=<mode> to handle it")
                 }
                 SignedMode::NeedsVerification => bail!(
                     "unsupported flag \"--signed-commits=<mode>-if-invalid\" (the `-if-invalid` \
@@ -773,7 +773,7 @@ impl Importer {
             line = input.command()?;
         }
         let Some(spec) = field(&line, b"data ") else {
-            bail!("expected 'data n' command");
+            crate::git_fatal!("expected 'data n' command");
         };
         let message = input.data(&spec)?;
 
@@ -879,7 +879,7 @@ impl Importer {
             line = input.command()?;
         }
         let Some(spec) = field(&line, b"from ") else {
-            bail!("expected from command");
+            crate::git_fatal!("expected from command");
         };
         let object = self.commitish(&spec)?;
         line = input.command()?;
@@ -893,7 +893,7 @@ impl Importer {
             line = input.command()?;
         }
         let Some(spec) = field(&line, b"data ") else {
-            bail!("expected 'data n' command");
+            crate::git_fatal!("expected 'data n' command");
         };
         let mut message = input.data(&spec)?;
 
@@ -911,7 +911,7 @@ impl Importer {
                     message.truncate(at);
                 }
                 SignedMode::Abort => {
-                    bail!("encountered signed tag; use --signed-tags=<mode> to handle it")
+                    crate::git_fatal!("encountered signed tag; use --signed-tags=<mode> to handle it")
                 }
                 SignedMode::NeedsVerification => bail!(
                     "unsupported flag \"--signed-tags=<mode>-if-invalid\" (the `-if-invalid` \
@@ -967,12 +967,12 @@ impl Importer {
     fn parse_alias(&mut self, input: &mut Input) -> Result<()> {
         let line = input.command()?;
         let Some(v) = field(&line, b"mark :") else {
-            bail!("expected mark command");
+            crate::git_fatal!("expected mark command");
         };
         let mark = parse_mark(&v)?;
         let line = input.command()?;
         let Some(spec) = field(&line, b"to ") else {
-            bail!("expected to command");
+            crate::git_fatal!("expected to command");
         };
         let id = self.commitish(&spec)?;
         self.marks.insert(mark, id);
@@ -988,7 +988,7 @@ impl Importer {
         };
         let unsafe_feature = matches!(name, "export-marks" | "import-marks" | "import-marks-if-exists");
         if unsafe_feature && !self.opts.allow_unsafe {
-            bail!("feature '{spec}' forbidden in input without --allow-unsafe-features");
+            crate::git_fatal!("feature '{spec}' forbidden in input without --allow-unsafe-features");
         }
         match name {
             "date-format" => {
@@ -1009,7 +1009,7 @@ impl Importer {
             "done" => self.opts.require_done = true,
             // Capability probes for commands this port implements.
             "get-mark" | "cat-blob" | "ls" | "notes" => {}
-            _ => bail!("this version of fast-import does not support feature {spec}."),
+            _ => anyhow::bail!("this version of fast-import does not support feature {spec}."),
         }
         Ok(())
     }
@@ -1021,7 +1021,7 @@ impl Importer {
             return Ok(());
         };
         if self.seen_data_command {
-            bail!("option command must be the first command in the stream");
+            crate::git_fatal!("option command must be the first command in the stream");
         }
         match opt {
             "quiet" | "stats" => Ok(()),
@@ -1032,7 +1032,7 @@ impl Importer {
             {
                 Ok(())
             }
-            _ => bail!("this version of fast-import does not support option: {opt}"),
+            _ => anyhow::bail!("this version of fast-import does not support option: {opt}"),
         }
     }
 
@@ -1049,11 +1049,11 @@ impl Importer {
             let path = unquote(after_inline)?;
             let line = input.command()?;
             let Some(spec) = field(&line, b"data ") else {
-                bail!("expected 'data n' command");
+                crate::git_fatal!("expected 'data n' command");
             };
             let payload = input.data(&spec)?;
             if mode == 0o160000 {
-                bail!("Git links cannot be specified 'inline'");
+                crate::git_fatal!("Git links cannot be specified 'inline'");
             }
             (self.repo.write_blob(&payload)?.detach(), path)
         } else {
@@ -1084,8 +1084,8 @@ impl Importer {
         };
         match self.repo.try_find_header(oid)? {
             None if mode == 0o160000 => {}
-            None => bail!("{oid} not found"),
-            Some(header) if header.kind() != want => bail!(
+            None => crate::git_fatal!("{oid} not found"),
+            Some(header) if header.kind() != want => crate::git_fatal!(
                 "Not a {want} (actually a {}): {}",
                 header.kind(),
                 String::from_utf8_lossy(&path)
@@ -1123,7 +1123,7 @@ impl Importer {
         if dst.is_empty() {
             match node {
                 Node::Dir(d) => self.branches[idx].tree = d,
-                Node::Leaf { .. } => bail!("Path {} is not a tree", String::from_utf8_lossy(&src)),
+                Node::Leaf { .. } => crate::git_fatal!("Path {} is not a tree", String::from_utf8_lossy(&src)),
             }
         } else {
             dir_set(&mut self.branches[idx].tree, &dst, node);
@@ -1137,7 +1137,7 @@ impl Importer {
             let target = after_inline.to_vec();
             let line = input.command()?;
             let Some(spec) = field(&line, b"data ") else {
-                bail!("expected 'data n' command");
+                crate::git_fatal!("expected 'data n' command");
             };
             let payload = input.data(&spec)?;
             (self.repo.write_blob(&payload)?.detach(), target)
@@ -1183,7 +1183,7 @@ impl Importer {
         let oid = self.dataref(spec)?;
         let object = self.repo.find_object(oid)?;
         if object.kind != Kind::Blob {
-            bail!("Object {oid} is a {}, not a blob", object.kind);
+            crate::git_fatal!("Object {oid} is a {}, not a blob", object.kind);
         }
         let mut out = format!("{oid} blob {}\n", object.data.len()).into_bytes();
         out.extend_from_slice(&object.data);
@@ -1288,7 +1288,7 @@ impl Importer {
         // A branch already in the table contributes its in-memory tree directly.
         if let Some(&other) = self.by_name.get(&text) {
             if other == idx {
-                bail!("Can't create a branch from itself: {}", self.branches[idx].name);
+                crate::git_fatal!("Can't create a branch from itself: {}", self.branches[idx].name);
             }
             let (head, tree, notes) = {
                 let src = &self.branches[other];
@@ -1325,7 +1325,7 @@ impl Importer {
     fn commitish(&self, spec: &[u8]) -> Result<ObjectId> {
         let id = self.commitish_allow_null(spec)?;
         if id.is_null() {
-            bail!("invalid null object id in commit-ish");
+            crate::git_fatal!("invalid null object id in commit-ish");
         }
         Ok(id)
     }
@@ -1397,7 +1397,7 @@ impl Importer {
             ),
         };
         if !valid_raw_date(date, strict) {
-            bail!(
+            crate::git_fatal!(
                 "invalid raw date \"{}\" in ident: {}",
                 String::from_utf8_lossy(date),
                 String::from_utf8_lossy(raw)
@@ -1586,7 +1586,7 @@ fn read_mark_file(
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
         Err(e) if if_exists && e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => bail!("cannot read '{display}': {}", strerror(&e)),
+        Err(e) => crate::git_fatal!("cannot read '{display}': {}", strerror(&e)),
     };
     let mut out = Vec::new();
     for line in text.lines() {
@@ -1860,7 +1860,7 @@ fn unquote(path: &[u8]) -> Result<Vec<u8>> {
     }
     let (out, consumed) = unquote_prefix(path)?;
     if consumed != path.len() {
-        bail!("Garbage after path: {}", String::from_utf8_lossy(path));
+        crate::git_fatal!("Garbage after path: {}", String::from_utf8_lossy(path));
     }
     Ok(out)
 }
@@ -1902,7 +1902,7 @@ fn unquote_prefix(input: &[u8]) -> Result<(Vec<u8>, usize)> {
                         }
                         out.push(value as u8);
                     }
-                    _ => bail!("Invalid quoting: {}", String::from_utf8_lossy(input)),
+                    _ => crate::git_fatal!("Invalid quoting: {}", String::from_utf8_lossy(input)),
                 }
             }
             b => {
@@ -1911,7 +1911,7 @@ fn unquote_prefix(input: &[u8]) -> Result<(Vec<u8>, usize)> {
             }
         }
     }
-    bail!("Invalid quoting: {}", String::from_utf8_lossy(input))
+    crate::git_fatal!("Invalid quoting: {}", String::from_utf8_lossy(input))
 }
 
 /// `:<idnum>` where the number is a positive decimal integer.

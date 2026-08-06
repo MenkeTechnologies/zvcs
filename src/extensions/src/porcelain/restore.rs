@@ -535,12 +535,15 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
     // --- Resolve the restore source ----------------------------------------
     // `source_tree_id == None` means "the current index" (default worktree src).
     let source_tree_id: Option<ObjectId> = match &source {
-        Some(rev) => Some(
-            repo.rev_parse_single(rev.as_str())?
-                .object()?
-                .peel_to_tree()?
-                .id,
-        ),
+        // A `--source` that names nothing is git's own fatal. Propagating the
+        // revision parser's error instead put a Rust type name and a path inside
+        // `src/ported/` in front of the user, and exited 1 where git exits 128.
+        Some(rev) => {
+            let Ok(object) = repo.rev_parse_single(rev.as_str()) else {
+                crate::git_fatal!("could not resolve {rev}");
+            };
+            Some(object.object()?.peel_to_tree()?.id)
+        }
         None if staged => Some(repo.head_tree_id_or_empty()?.detach()),
         None => None,
     };

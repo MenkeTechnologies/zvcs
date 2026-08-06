@@ -157,7 +157,7 @@ fn do_generic_cmd(me: &str, arg: Option<&[u8]>) -> Result<ExitCode> {
         "receive-pack" => super::receive_pack(&argv),
         "upload-pack" => super::upload_pack(&argv),
         "upload-archive" => super::upload_archive(&argv),
-        other => bail!("unsupported server command {other:?}"),
+        other => anyhow::bail!("unsupported server command {other:?}"),
     }
 }
 

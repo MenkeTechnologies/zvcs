@@ -892,7 +892,7 @@ fn emit_summary(out: &mut Vec<u8>, changes: &[ChangeDetached]) -> Result<()> {
                     )?;
                 }
             }
-            ChangeDetached::Rewrite { .. } => bail!("{REWRITE_UNSUPPORTED}"),
+            ChangeDetached::Rewrite { .. } => anyhow::bail!("{REWRITE_UNSUPPORTED}"),
         }
     }
     Ok(())
@@ -963,7 +963,7 @@ fn stat_of(repo: &gix::Repository, change: &ChangeDetached, abbrev: usize) -> Re
                 }
             }
         }
-        ChangeDetached::Rewrite { .. } => bail!("{REWRITE_UNSUPPORTED}"),
+        ChangeDetached::Rewrite { .. } => anyhow::bail!("{REWRITE_UNSUPPORTED}"),
     }
 
     Ok(StatEntry {

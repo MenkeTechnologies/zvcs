@@ -340,12 +340,12 @@ fn command_loop() -> Result<ExitCode> {
         // no argument) is an unknown command, while `list` matches both bare and
         // with arguments.
         if let Some(arg) = strip_prefix(line, b"fetch ") {
-            bail!(
+            crate::git_fatal!(
                 "remote-curl: 'fetch {}' needs an FTPS client; the vendored gitoxide has no FTP transport ({PORTED})",
                 arg.as_bstr()
             );
         } else if let Some(arg) = strip_prefix(line, b"push ") {
-            bail!(
+            crate::git_fatal!(
                 "remote-curl: 'push {}' needs an FTPS client; the vendored gitoxide has no FTP transport ({PORTED})",
                 arg.as_bstr()
             );
@@ -366,11 +366,11 @@ fn command_loop() -> Result<ExitCode> {
             stdout.write_all(CAPABILITIES.as_bytes())?;
             stdout.flush()?;
         } else if line == b"list".as_slice() || strip_prefix(line, b"list ").is_some() {
-            bail!("remote-curl: 'list' needs an FTPS client to read the remote's refs; the vendored gitoxide has no FTP transport ({PORTED})");
+            crate::git_fatal!("remote-curl: 'list' needs an FTPS client to read the remote's refs; the vendored gitoxide has no FTP transport ({PORTED})");
         } else if strip_prefix(line, b"stateless-connect ").is_some() {
-            bail!("remote-curl: 'stateless-connect' needs an FTPS client; the vendored gitoxide has no FTP transport ({PORTED})");
+            crate::git_fatal!("remote-curl: 'stateless-connect' needs an FTPS client; the vendored gitoxide has no FTP transport ({PORTED})");
         } else if strip_prefix(line, b"get ").is_some() {
-            bail!("remote-curl: 'get' needs an FTPS client to download the file; the vendored gitoxide has no FTP transport ({PORTED})");
+            crate::git_fatal!("remote-curl: 'get' needs an FTPS client to download the file; the vendored gitoxide has no FTP transport ({PORTED})");
         } else {
             eprintln!(
                 "error: remote-curl: unknown command '{}' from git",

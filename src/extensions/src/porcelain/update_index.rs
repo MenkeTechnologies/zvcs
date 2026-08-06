@@ -998,13 +998,13 @@ fn update_one(ctx: &mut Ctx, path: &BString) -> Result<Step> {
         None
     } else {
         match ctx.workdir.as_ref() {
-            None => bail!("this operation must be run in a work tree"),
+            None => crate::git_fatal!("this operation must be run in a work tree"),
             Some(_) => match ctx.repo.workdir_path(path.as_bstr()) {
                 Some(abs) => match gix::index::fs::Metadata::from_path_no_follow(&abs) {
                     Ok(m) => Some(Ok(m)),
                     Err(e) => Some(Err(e)),
                 },
-                None => bail!("this operation must be run in a work tree"),
+                None => crate::git_fatal!("this operation must be run in a work tree"),
             },
         }
     };
@@ -1103,7 +1103,7 @@ fn process_directory(
 ) -> Result<Step> {
     let abs = match ctx.repo.workdir_path(path.as_bstr()) {
         Some(a) => a,
-        None => bail!("this operation must be run in a work tree"),
+        None => crate::git_fatal!("this operation must be run in a work tree"),
     };
     let existing = ctx
         .index
@@ -1184,7 +1184,7 @@ fn add_one_path(
 
     let abs = match ctx.repo.workdir_path(path.as_bstr()) {
         Some(a) => a,
-        None => bail!("this operation must be run in a work tree"),
+        None => crate::git_fatal!("this operation must be run in a work tree"),
     };
     let content = read_worktree_content(&abs, meta)?;
 
@@ -1399,7 +1399,7 @@ fn remove_path_entries(ctx: &mut Ctx, path: &BStr) {
 /// whose content still matches, and report the rest as `<path>: needs update`.
 fn refresh(ctx: &mut Ctx, really: bool) -> Result<Step> {
     if ctx.workdir.is_none() {
-        bail!("this operation must be run in a work tree");
+        crate::git_fatal!("this operation must be run in a work tree");
     }
 
     let mut i = 0;
@@ -1450,7 +1450,7 @@ fn refresh(ctx: &mut Ctx, really: bool) -> Result<Step> {
 
         let abs = match ctx.repo.workdir_path(path.as_bstr()) {
             Some(a) => a,
-            None => bail!("this operation must be run in a work tree"),
+            None => crate::git_fatal!("this operation must be run in a work tree"),
         };
         let meta = match gix::index::fs::Metadata::from_path_no_follow(&abs) {
             Ok(m) => m,
@@ -1521,7 +1521,7 @@ fn refresh(ctx: &mut Ctx, really: bool) -> Result<Step> {
 /// path that matches nothing rather than as an option.
 fn do_reupdate(ctx: &mut Ctx, specs: &[String]) -> Result<Step> {
     if ctx.workdir.is_none() {
-        bail!("this operation must be run in a work tree");
+        crate::git_fatal!("this operation must be run in a work tree");
     }
     // `PATHSPEC_PREFER_CWD`: a bare spec is relative to the current directory.
     let specs: Vec<String> = specs.iter().map(|s| format!("{}{s}", ctx.prefix)).collect();
@@ -1815,7 +1815,7 @@ fn report(ctx: &Ctx, args: std::fmt::Arguments<'_>) {
 /// worktree. A trailing slash is preserved so `verify_path` can reject it.
 fn resolve_path(ctx: &Ctx, raw: &BStr) -> Result<std::result::Result<BString, Die>> {
     let Some(workdir) = ctx.workdir.as_ref() else {
-        bail!("this operation must be run in a work tree");
+        crate::git_fatal!("this operation must be run in a work tree");
     };
 
     let raw_os = bytes_to_os(raw);

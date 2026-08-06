@@ -896,7 +896,7 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
     // a real merge into it would be a checkout, which is out of scope.
     let head = repo.head()?;
     if head.is_unborn() {
-        anyhow::bail!("cannot merge into an unborn branch");
+        crate::git_fatal!("cannot merge into an unborn branch");
     }
     let local_id = head
         .id()
@@ -945,8 +945,19 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
         targets.push(*id);
     }
     for spec in refs.iter().filter(|_| fetch_head.is_empty()) {
-        let id = repo.rev_parse_single(spec.as_str())?.object()?.peel_to_commit()?.id;
-        targets.push(id);
+        // `cmd_merge`'s own refusal, which is neither a `fatal:` nor exit 128:
+        // `merge: <arg> - not something we can merge`, on stderr, exit 1. It also
+        // covers a name that resolves to something that is not a commit.
+        let resolved = repo
+            .rev_parse_single(spec.as_str())
+            .ok()
+            .and_then(|o| o.object().ok())
+            .and_then(|o| o.peel_to_commit().ok());
+        let Some(commit) = resolved else {
+            eprintln!("merge: {spec} - not something we can merge");
+            return Err(anyhow::Error::new(crate::fatal::Silent(1)));
+        };
+        targets.push(commit.id);
     }
 
     // `--verify-signatures` / `merge.verifySignatures`. git runs this over the
@@ -2857,7 +2868,7 @@ fn continue_merge(opts: &Opts) -> Result<ExitCode> {
 
     let head = repo.head()?;
     if head.is_unborn() {
-        anyhow::bail!("cannot conclude a merge on an unborn branch");
+        crate::git_fatal!("cannot conclude a merge on an unborn branch");
     }
     let local_id = head
         .id()

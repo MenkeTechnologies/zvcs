@@ -52,7 +52,14 @@ impl Fixture {
             .env("HOME", &self.root)
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_SYSTEM", "/dev/null")
-            .env("GIT_CONFIG_NOSYSTEM", "1");
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            // `rebase -i` opens the todo list in an editor, and a runner has no
+            // `EDITOR` and no terminal — git falls back to `vi`, which waits for
+            // input that never comes. Accepting the file as written is what the
+            // test wants anyway, and an inherited `EDITOR` must not decide whether
+            // this suite terminates.
+            .env("GIT_EDITOR", "true")
+            .env("GIT_SEQUENCE_EDITOR", "true");
         c
     }
 

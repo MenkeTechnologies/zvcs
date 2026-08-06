@@ -580,7 +580,7 @@ fn list_files(full: &Path, rel: &str, verb: &str, out: &mut Vec<u8>) {
 // --- sparsity model --------------------------------------------------------
 
 /// What the worktree is currently restricted to.
-enum Sparsity {
+pub(crate) enum Sparsity {
     /// No restriction at all — what `disable` applies.
     Full,
     Cone(Cone),
@@ -589,7 +589,7 @@ enum Sparsity {
 }
 
 impl Sparsity {
-    fn includes(&self, path: &str) -> bool {
+    pub(crate) fn includes(&self, path: &str) -> bool {
         match self {
             Sparsity::Full => true,
             Sparsity::Cone(c) => c.matches(path),
@@ -598,7 +598,7 @@ impl Sparsity {
     }
 }
 
-fn load_sparsity(repo: &gix::Repository) -> Result<Sparsity> {
+pub(crate) fn load_sparsity(repo: &gix::Repository) -> Result<Sparsity> {
     let lines = read_pattern_file(repo)?;
     Ok(if is_cone(repo)? {
         Sparsity::Cone(Cone::new(cone_dirs(&lines)))

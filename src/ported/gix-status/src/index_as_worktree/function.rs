@@ -63,7 +63,7 @@ pub fn index_as_worktree<'index, T, U, Find, E>(
     Context {
         pathspec,
         stack,
-        filter,
+        mut filter,
         should_interrupt,
     }: Context<'_>,
     options: Options,
@@ -74,6 +74,14 @@ where
     E: std::error::Error + Send + Sync + 'static,
     Find: gix_object::Find + Send + Clone,
 {
+    // Worktree files are converted here only to compare their hash against the index, never to write
+    // an object. Git does the same via `ce_compare_data() -> index_fd(.., flags = 0)`, and
+    // `get_conv_flags()` turns that into `conv_flags = 0`, so `check_global_conv_flags_eol()` - the
+    // source of the `core.safecrlf` round-trip warning - is skipped. Without this, `git status` (and
+    // the index refresh that `git diff` performs) would emit warnings that git does not, and
+    // `git diff HEAD` would print each warning twice: once here, once from the diff pipeline.
+    filter.options_mut().crlf_roundtrip_check = gix_filter::pipeline::CrlfRoundTripCheck::Skip;
+
     // the order is absolutely critical here we use the old timestamp to detect racy index entries
     // (modified at or after the last index update) during the index update we then set those
     // entries size to 0 (see below) to ensure they keep showing up as racy and reset the timestamp.
@@ -627,7 +635,10 @@ where
                 .filter
                 .convert_to_git(
                     file,
-                    self.path,
+                    // The pipeline wants the repo-relative path - it ends up in `%f` of process
+                    // filters and in round-trip messages, both of which git states relative to the
+                    // worktree root.
+                    gix_path::from_bstr(self.rela_path).as_ref(),
                     &mut |_path, attrs| {
                         platform.matching_attributes(attrs);
                     },

@@ -15,7 +15,29 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 const BIN: &str = env!("CARGO_BIN_EXE_git");
-const STOCK: &str = "/opt/homebrew/bin/git";
+
+/// Where a real git usually lives. Never `PATH`: it finds this binary on any
+/// machine where the shadow is installed, and a worktree interop test that drove
+/// this binary on both sides would pass while proving nothing.
+const STOCK_CANDIDATES: [&str; 3] = ["/opt/homebrew/bin/git", "/usr/local/bin/git", "/usr/bin/git"];
+
+/// The first candidate that exists and is not this binary wearing git's name.
+///
+/// The probe is a superset verb run with an emptied environment: zvcs serves
+/// `zverbs` itself, while a stock git looks for a `git-zverbs` on `PATH` and fails.
+/// Clearing the environment is what makes it sound — zvcs's own installation puts
+/// a `git-zverbs` shim on `PATH`, which a stock git would then answer too.
+fn stock_git() -> Option<&'static str> {
+    STOCK_CANDIDATES.into_iter().find(|bin| {
+        Path::new(bin).exists()
+            && !Command::new(bin)
+                .arg("zverbs")
+                .env_clear()
+                .output()
+                .map(|o| o.status.success() && !o.stdout.is_empty())
+                .unwrap_or(false)
+    })
+}
 
 fn run_with(bin: &str, dir: &Path, home: &Path, args: &[&str]) -> Output {
     Command::new(bin)
@@ -159,20 +181,21 @@ fn add_dwims_a_branch_name_and_honours_no_checkout() {
 /// repository observe the branch move.
 #[test]
 fn stock_git_can_work_in_a_worktree_this_binary_created() {
-    if !Path::new(STOCK).exists() {
-        eprintln!("skipping: {STOCK} not installed");
+    let Some(stock) = stock_git() else {
+        eprintln!("skipping: no stock git installed to check interoperability against");
         return;
-    }
+    };
+    let stock: &str = stock;
     let (root, repo, home) = fixture("interop");
     let o = run(&repo, &home, &["worktree", "add", "../wt", "other"]);
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     let wt = root.join("wt");
 
-    let head = run_with(STOCK, &wt, &home, &["rev-parse", "--abbrev-ref", "HEAD"]);
+    let head = run_with(stock, &wt, &home, &["rev-parse", "--abbrev-ref", "HEAD"]);
     assert!(head.status.success(), "{}", String::from_utf8_lossy(&head.stderr));
     assert_eq!(String::from_utf8_lossy(&head.stdout).trim_end(), "other");
 
-    let gitdir = run_with(STOCK, &wt, &home, &["rev-parse", "--git-dir"]);
+    let gitdir = run_with(stock, &wt, &home, &["rev-parse", "--git-dir"]);
     assert_eq!(
         String::from_utf8_lossy(&gitdir.stdout).trim_end(),
         repo.join(".git/worktrees/wt").to_str().unwrap()
@@ -180,17 +203,17 @@ fn stock_git_can_work_in_a_worktree_this_binary_created() {
 
     std::fs::write(wt.join("z"), "z\n").unwrap();
     for args in [&["add", "z"][..], &["commit", "-q", "-m", "in the worktree"][..]] {
-        let o = run_with(STOCK, &wt, &home, args);
+        let o = run_with(stock, &wt, &home, args);
         assert!(o.status.success(), "stock {args:?}: {}", String::from_utf8_lossy(&o.stderr));
     }
     // The main repository sees `other` at the new commit.
-    let moved = run_with(STOCK, &repo, &home, &["log", "--oneline", "-1", "other"]);
+    let moved = run_with(stock, &repo, &home, &["log", "--oneline", "-1", "other"]);
     assert!(
         String::from_utf8_lossy(&moved.stdout).contains("in the worktree"),
         "{}",
         String::from_utf8_lossy(&moved.stdout)
     );
-    let fsck = run_with(STOCK, &repo, &home, &["fsck", "--no-progress"]);
+    let fsck = run_with(stock, &repo, &home, &["fsck", "--no-progress"]);
     assert!(fsck.status.success(), "{}", String::from_utf8_lossy(&fsck.stderr));
 
     let _ = std::fs::remove_dir_all(&root);

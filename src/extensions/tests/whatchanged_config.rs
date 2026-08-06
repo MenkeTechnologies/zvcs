@@ -299,27 +299,21 @@ fn log_date_invalid_is_fatal_before_deprecation_and_override() {
 }
 
 #[test]
-fn log_date_valid_nondefault_bails_but_empty_walk_exits_zero() {
-    // whatchanged renders only DATE_NORMAL, so a valid non-default log.date (e.g. short)
-    // selects a format it cannot produce. Rather than emit a wrong Date: line it bails when
-    // a commit would be shown — identical treatment to a command-line --date.
+fn log_date_valid_nondefault_renders_and_empty_walk_exits_zero() {
+    // The rendering is `git log`'s, so a valid non-default `log.date` reaches the
+    // `Date:` line the same way it does there — `short` prints the bare date.
     let (repo, home) = fixture("date-short");
     config(&repo, "log.date", "short");
     let z = zvcs(&repo, &home, &[]);
-    assert_ne!(z.status.code(), Some(0), "must not silently emit a wrong Date line");
+    assert_eq!(z.status.code(), Some(0));
+    let out = String::from_utf8_lossy(&z.stdout);
     assert!(
-        String::from_utf8_lossy(&z.stderr).contains("log.date"),
-        "bail names the unported config: {}",
-        String::from_utf8_lossy(&z.stderr)
+        out.contains("Date:   2006-01-02") && !out.contains("2006-01-02 "),
+        "log.date=short renders the bare date: {out}"
     );
-    // Real git happily renders the short date here — this is the one documented
-    // divergence, and it can only be checked where the oracle runs at all.
-    if oracle_usable(&repo, &home) {
-        assert!(String::from_utf8_lossy(&real(&repo, &home, &[]).stdout).contains("Date:   2006-01-02"));
-    }
+    assert_stdout_matches(&repo, &home, &[]);
 
-    // But when a filter empties the walk, the unported option is never applied, so both
-    // git and zvcs exit 0 with empty output — the deferred bail must not fire early.
+    // When a filter empties the walk, both git and zvcs exit 0 with empty output.
     assert_stdout_matches(&repo, &home, &["--grep=NOPExyz"]);
     let empty = zvcs(&repo, &home, &["--grep=NOPExyz"]);
     assert_eq!(empty.status.code(), Some(0));

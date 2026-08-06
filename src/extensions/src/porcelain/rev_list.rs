@@ -237,12 +237,15 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     let mut left_right = false;
     let mut cherry_mark = false;
     let mut ancestry_path = false;
+    let mut simplify_by_decoration = false;
     let mut bisect = false;
     let mut quiet = false;
     let mut disk_usage = false;
     let mut disk_usage_human = false;
     let mut include_header = true;
     let mut verbose_header = false;
+    // `--timestamp`: prefix each object name with the commit date.
+    let mut show_timestamp = false;
     // `--abbrev-commit`: shorten the object name rev-list prints, which is what
     // `--oneline` turns on together with the oneline format.
     let mut abbrev_commit = false;
@@ -330,6 +333,10 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
             "--left-right" => left_right = true,
             "--cherry-mark" => cherry_mark = true,
             "--ancestry-path" => ancestry_path = true,
+            // `--simplify-by-decoration`: `simplify_commit()` keeps a decorated commit,
+            // and — since simplification may not change the shape of the history — a
+            // root or a merge; everything else is walked past.
+            "--simplify-by-decoration" => simplify_by_decoration = true,
             "--bisect" => {
                 if let Err(e) = seed_bisect_refs(&repo, negate, &mut seeds, &mut pending_tags) {
                     return Ok(fatal(&e));
@@ -347,7 +354,18 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
             "--commit-header" => include_header = true,
             "--no-commit-header" => include_header = false,
             "--header" => verbose_header = true,
+            "--timestamp" => show_timestamp = true,
             "--not" => negate = !negate,
+            // `--encoding=<enc>`, which the pretty formats take just as `log` does.
+            s if s.starts_with("--encoding=") => {
+                let v = &s["--encoding=".len()..];
+                if !super::blame::encoding_is_passthrough(v) {
+                    eprintln!(
+                        "fatal: unsupported option {s} (only utf-8 and none are ported)"
+                    );
+                    return Ok(ExitCode::from(128));
+                }
+            }
             "--no-walk" => no_walk = true,
             "--do-walk" => no_walk = false,
             "--stdin" => read_stdin = true,
@@ -716,6 +734,39 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
         }
     }
 
+    // `--simplify-by-decoration`: the same simplification the pathspec path runs,
+    // asking a different question of each commit. A commit that carries a decoration
+    // is kept, and so are a root and a merge, because simplification may not change
+    // the shape of the history; everything else is walked past, and what is then
+    // unreachable from the tips drops out with it.
+    if simplify_by_decoration {
+        let filter = super::log::DecorationFilter::build(&repo, &[], &[], true);
+        let decos = super::log::build_decorations(&repo, &filter)?;
+        let kept: HashSet<ObjectId> = commits
+            .iter()
+            .copied()
+            .filter(|id| {
+                let parents = parents_of.get(id).map_or(0, Vec::len);
+                decos.decorates(id) || parents == 0 || parents > 1
+            })
+            .collect();
+        let mut reachable: HashSet<ObjectId> = HashSet::with_capacity(commits.len());
+        let mut stack: Vec<ObjectId> = tips.clone();
+        while let Some(id) = stack.pop() {
+            if !reachable.insert(id) {
+                continue;
+            }
+            let parents = parents_of.get(&id).map_or(&[][..], Vec::as_slice);
+            if kept.contains(&id) {
+                stack.extend(parents.iter().copied());
+            } else {
+                // A simplified-away commit is walked past along its first parent only.
+                stack.extend(parents.first().copied());
+            }
+        }
+        commits.retain(|id| kept.contains(id) && reachable.contains(id));
+    }
+
     // `simplify_commit` drops the TREESAME commits, then `commit_ignore` applies
     // the parent-count bounds and `commit_match` the header predicates.
     commits.retain(|id| !treesame.contains(id));
@@ -727,6 +778,8 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     // `--grep`/`--author`/`--committer`: git's `commit_match`, applied as each
     // commit is about to be shown rather than during the walk.
     let cfilter = CommitFilter {
+        // `rev-list` loads no mailmap, so its header greps see the recorded identities.
+        ident_map: None,
         author_res: compile_patterns(&author_pats, dialect, ignore_case)?,
         committer_res: compile_patterns(&committer_pats, dialect, ignore_case)?,
         grep_res: compile_patterns(&grep_pats, dialect, ignore_case)?,
@@ -869,6 +922,19 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
         // so the interleaved `--in-commit-order` listing below is not skipped.
         if !quiet && !count_only {
             out.extend_from_slice(header_prefix);
+            // `--timestamp`: `show_commit()` prints the commit date in front of the
+            // object name, which is how a caller sorts a list without re-reading each
+            // object.
+            if show_timestamp {
+                let secs = repo
+                    .find_object(*id)
+                    .ok()
+                    .and_then(|o| o.try_into_commit().ok())
+                    .and_then(|c| c.committer().ok().map(|s| s.seconds()))
+                    .unwrap_or(0);
+                out.extend_from_slice(secs.to_string().as_bytes());
+                out.push(b' ');
+            }
             if include_header {
                 out.extend_from_slice(revision_mark(
                     *is_boundary,

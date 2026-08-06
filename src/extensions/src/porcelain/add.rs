@@ -77,6 +77,9 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
     let mut intent_to_add = false;
     let mut refresh = false;
     let mut renormalize = false;
+    // `--sparse` (git's `include_sparse`): stage paths outside the sparse-checkout
+    // definition instead of reporting them.
+    let mut include_sparse = false;
     // `add.ignoreErrors` (alias `add.ignore-errors`) is the default for
     // `--ignore-errors`; the explicit `--ignore-errors`/`--no-ignore-errors`
     // flags parsed below override it, matching git's config-then-CLI precedence.
@@ -151,7 +154,11 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
             // are not applied here, so it restages the verbatim worktree bytes.
             "--renormalize" => renormalize = true,
             "--no-renormalize" => renormalize = false,
-            "--sparse" | "--no-sparse" => { /* no sparse-checkout cone here: accept and ignore */ }
+            // `--sparse` lets the add reach paths the sparse-checkout definition
+            // leaves out of the worktree; without it those paths are reported and
+            // skipped (`advise_on_updating_sparse_paths()`).
+            "--sparse" => include_sparse = true,
+            "--no-sparse" => include_sparse = false,
             // `--warn-embedded-repo`/`--no-warn-embedded-repo` (hidden in git,
             // an `OPT_HIDDEN_BOOL` over `warn_on_embedded_repo`, default on) mutes
             // the `adding embedded git repository:` warning and its advice; the
@@ -196,6 +203,14 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
             "-i" | "--interactive" => add_interactive = true,
             "--no-interactive" => add_interactive = false,
             "-e" | "--edit" => bail!("edit mode (-e/--edit) needs an interactive editor; not ported"),
+            // `-h` is handled by `parse_options()` before any other switch in the
+            // same bundle, so `git add -hv` still prints the table.
+            other if other.starts_with('-')
+                && !other.starts_with("--")
+                && other[1..].contains('h') =>
+            {
+                return print_usage();
+            }
             // Bundled short flags like `-nv`; every char must be a known toggle.
             other if other.starts_with('-') && !other.starts_with("--") && other.len() > 1 => {
                 for c in other[1..].chars() {
@@ -340,6 +355,12 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
         .ok()
         .flatten()
         .is_none_or(|p| p.as_os_str().is_empty());
+    // `prefix_path()` runs every command-line path through `normalize_path_copy()`
+    // first, so `./.` is `.`, `src/.` is `src`, and `a/../b` is `b` before anything
+    // asks whether the path exists or is ignored.
+    for spec in pathspecs.iter_mut() {
+        *spec = normalize_pathspec(spec);
+    }
     if at_root {
         for spec in pathspecs.iter_mut() {
             if spec == "." || spec == "./" {
@@ -379,6 +400,33 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
     // *converted* bytes, so staging the verbatim worktree copy writes a different
     // blob than git does in any repository that normalizes line endings.
     let (mut filters, filter_index) = repo.filter_pipeline(None)?;
+    // `get_conv_flags()` (convert.c): the `core.safecrlf` round-trip check rides on
+    // `HASH_WRITE_OBJECT`, so it runs only when this add really writes a blob. A dry
+    // run, `-N` and `--refresh` write nothing, and `--renormalize` passes
+    // `HASH_RENORMALIZE`, which returns `CONV_EOL_RENORMALIZE` alone — none of them
+    // warns or fails, however `core.safecrlf` is set.
+    if !write_content || renormalize {
+        filters.options_mut().crlf_roundtrip_check =
+            gix::filter::plumbing::pipeline::CrlfRoundTripCheck::Skip;
+    }
+    // `path_in_sparse_checkout()`: without `--sparse`, a path the sparse-checkout
+    // definition leaves out of the worktree is skipped and reported instead of
+    // staged. Loaded only when there is a definition to consult.
+    let sparsity = if !include_sparse
+        && repo
+            .config_snapshot()
+            .boolean("core.sparseCheckout")
+            .unwrap_or(false)
+    {
+        Some(super::sparse_checkout::load_sparsity(&repo)?)
+    } else {
+        None
+    };
+    let outside_sparse = |path: &BString| -> bool {
+        sparsity.as_ref().is_some_and(|s| !s.includes(&path.to_str_lossy()))
+    };
+    // `matched_sparse_paths`: what the message at the end names, sorted and unique.
+    let mut sparse_skipped: std::collections::BTreeSet<BString> = Default::default();
     // Paths that could not be read, paired with the OS error text git reports
     // (only surfaced for a real add). git prints `open("<p>"): <strerror>`.
     let mut read_errors: Vec<(BString, String)> = Vec::new();
@@ -389,8 +437,24 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
     // per repository, the advice at most once per invocation.
     let mut embedded_advised = false;
 
+    // git stages in two passes: `update_files_in_cache()` walks the *index* (so the
+    // tracked matches come first, in path order), then `add_files()` walks the sorted
+    // `dir->entries` for the new ones. Everything the staging emits — the `-v`/`-n`
+    // report, the `core.safecrlf` warnings, the read errors — comes out in that order,
+    // so the walk results are put in it before any file is touched.
+    let mut walked: Vec<gix::dir::Entry> = Vec::new();
     for item in iter.by_ref() {
-        let entry = item?.entry;
+        walked.push(item?.entry);
+    }
+    walked.sort_by(|a, b| {
+        let (a_new, b_new) = (
+            !existing.contains(&a.rela_path),
+            !existing.contains(&b.rela_path),
+        );
+        a_new.cmp(&b_new).then_with(|| a.rela_path.cmp(&b.rela_path))
+    });
+
+    for entry in walked {
         let path = entry.rela_path;
         let already_tracked = existing.contains(&path);
         // Ignore semantics: an ignored path is only staged if forced or already
@@ -442,6 +506,14 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
         }
         // `-u/--update`, `--refresh`, `--renormalize` restage tracked paths only.
         if tracked_only && !already_tracked {
+            continue;
+        }
+        // `add_files()`: a path this add would otherwise stage but that lies outside
+        // the sparse-checkout definition is collected for the report instead. The
+        // check sits after the eligibility filters, so a path `-u` was never going to
+        // stage is not reported either.
+        if outside_sparse(&path) {
+            sparse_skipped.insert(path);
             continue;
         }
         // `-N/--intent-to-add` never rewrites the content of already-tracked
@@ -560,9 +632,18 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
             if e.stage() != Stage::Unconflicted || e.mode == Mode::COMMIT {
                 continue; // leave conflicted stages and submodule gitlinks alone
             }
+            // `PS_IGNORE_SKIP_WORKTREE`: an entry the sparse-checkout definition keeps
+            // out of the worktree is absent by design, never a deletion.
+            if e.flags.contains(gix::index::entry::Flags::SKIP_WORKTREE) {
+                continue;
+            }
             let path = e.path_in(backing);
             let owned = path.to_owned();
             if staged_set.contains(&owned) {
+                continue;
+            }
+            if outside_sparse(&owned) {
+                sparse_skipped.insert(owned);
                 continue;
             }
             if !pathspec.is_included(path, Some(false)) {
@@ -596,8 +677,12 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
         // An embedded repository whose HEAD is unborn matched the pathspec — it
         // just could not be indexed — so it is not a "did not match" case.
         let matched_headless = path_is_or_under(headless_repos.iter(), p);
+        // Neither is a path held back by the sparse-checkout definition: it matched,
+        // and the sparse report at the end is what git says about it.
+        let matched_sparse = path_is_or_under(sparse_skipped.iter(), p);
 
-        if matched_staged || matched_tracked || matched_deleted || matched_headless {
+        if matched_staged || matched_tracked || matched_deleted || matched_headless || matched_sparse
+        {
             continue;
         }
         if tracked_only {
@@ -693,8 +778,13 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
                 }
             }
         }
-        for s in staged.iter().filter(|s| !s.was_tracked) {
-            lines.push(format!("add '{}'", s.path));
+        // `read_directory()` sorts `dir->entries` before `add_files()` walks them, so
+        // the new paths are reported in path order rather than in the order the
+        // directory walk happened to reach them.
+        let mut fresh: Vec<&BString> = staged.iter().filter(|s| !s.was_tracked).map(|s| &s.path).collect();
+        fresh.sort();
+        for path in fresh {
+            lines.push(format!("add '{path}'"));
         }
         lines
     };
@@ -704,6 +794,7 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
             !read_errors.is_empty() || !headless_repos.is_empty(),
             ignore_errors,
             dry_run,
+            &sparse_skipped,
         ));
     }
 
@@ -716,6 +807,7 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
             !read_errors.is_empty() || !headless_repos.is_empty(),
             ignore_errors,
             dry_run,
+            &sparse_skipped,
         ));
     }
 
@@ -770,6 +862,7 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
             !read_errors.is_empty() || !headless_repos.is_empty(),
             ignore_errors,
             dry_run,
+            &sparse_skipped,
         ));
     }
 
@@ -801,10 +894,11 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
     }
 
     Ok(finish_code(
-            !read_errors.is_empty() || !headless_repos.is_empty(),
-            ignore_errors,
-            dry_run,
-        ))
+        !read_errors.is_empty() || !headless_repos.is_empty(),
+        ignore_errors,
+        dry_run,
+        &sparse_skipped,
+    ))
 }
 
 /// Every stage-0 gitlink the pathspec selects whose submodule worktree sits at a
@@ -880,9 +974,74 @@ pub(crate) fn record_stage_event(repo: &gix::Repository, count: usize) {
     }
 }
 
+/// `normalize_path_copy_len()` (path.c), the pass `prefix_path()` puts every
+/// command-line path through: a `.` component disappears, a `..` component pops the
+/// one before it, and repeated slashes collapse into one. So `./.` reaches the
+/// pathspec machinery as `.`, `src/.` as `src`, and `a/../b` as `b`.
+///
+/// A pathspec that carries magic (`:(icase)x`, `:/`, …) is left alone: git parses the
+/// magic first and normalizes only the path that follows, and the magic forms this
+/// command sees are already repo-relative.
+fn normalize_pathspec(spec: &str) -> String {
+    if spec.starts_with(':') || spec.is_empty() {
+        return spec.to_string();
+    }
+    let absolute = spec.starts_with('/');
+    let mut out: Vec<&str> = Vec::new();
+    for component in spec.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                // A leading `..` has nothing to pop and stays, as git keeps it for the
+                // "outside repository" diagnostics further on.
+                if matches!(out.last(), Some(&last) if last != "..") {
+                    out.pop();
+                } else {
+                    out.push("..");
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    let joined = out.join("/");
+    match (absolute, joined.is_empty()) {
+        (true, _) => format!("/{joined}"),
+        // Everything cancelled out: the argument named the directory it was run in.
+        (false, true) => ".".to_string(),
+        (false, false) => joined,
+    }
+}
+
 /// The overall exit code: git returns 1 from a real add when `--ignore-errors`
-/// let it skip at least one unreadable file, else success.
-fn finish_code(had_errors: bool, ignore_errors: bool, dry_run: bool) -> ExitCode {
+/// let it skip at least one unreadable file, and 1 whenever a matched path lay
+/// outside the sparse-checkout definition; else success.
+///
+/// `advise_on_updating_sparse_paths()` names every skipped path — sorted, one per
+/// line, under a three-line explanation — and follows with the advice block that
+/// `advice.updateSparsePath` turns off.
+fn finish_code(
+    had_errors: bool,
+    ignore_errors: bool,
+    dry_run: bool,
+    sparse_skipped: &std::collections::BTreeSet<BString>,
+) -> ExitCode {
+    if !sparse_skipped.is_empty() {
+        eprintln!("The following paths and/or pathspecs matched paths that exist");
+        eprintln!("outside of your sparse-checkout definition, so will not be");
+        eprintln!("updated in the index:");
+        for path in sparse_skipped {
+            eprintln!("{path}");
+        }
+        if crate::advice::enabled("updateSparsePath") {
+            eprintln!("hint: If you intend to update such entries, try one of the following:");
+            eprintln!("hint: * Use the --sparse option.");
+            eprintln!("hint: * Disable or modify the sparsity rules.");
+            eprintln!(
+                "hint: Disable this message with \"git config set advice.updateSparsePath false\""
+            );
+        }
+        return ExitCode::from(1);
+    }
     if ignore_errors && !dry_run && had_errors {
         ExitCode::from(1)
     } else {
@@ -951,10 +1110,50 @@ fn parse_chmod(v: &str) -> Option<bool> {
     }
 }
 
-/// A usage error (git exit 129): unknown option/switch.
+/// `usage_with_options()` rendering of `builtin/add.c`'s option table, verbatim —
+/// including the blank line after the synopsis, the group break before `-i`, the
+/// continuation lines for names too long for the description column, and the
+/// trailing blank line.
+const USAGE: &str = concat!(
+    "usage: git add [<options>] [--] <pathspec>...\n",
+    "\n",
+    "    -n, --[no-]dry-run    dry run\n",
+    "    -v, --[no-]verbose    be verbose\n",
+    "\n",
+    "    -i, --[no-]interactive\n",
+    "                          interactive picking\n",
+    "    -p, --[no-]patch      select hunks interactively\n",
+    "    -e, --[no-]edit       edit current diff and apply\n",
+    "    -f, --[no-]force      allow adding otherwise ignored files\n",
+    "    -u, --[no-]update     update tracked files\n",
+    "    --[no-]renormalize    renormalize EOL of tracked files (implies -u)\n",
+    "    -N, --[no-]intent-to-add\n",
+    "                          record only the fact that the path will be added later\n",
+    "    -A, --[no-]all        add changes from all tracked and untracked files\n",
+    "    --[no-]ignore-removal ignore paths removed in the working tree (same as --no-all)\n",
+    "    --[no-]refresh        don't add, only refresh the index\n",
+    "    --[no-]ignore-errors  just skip files which cannot be added because of errors\n",
+    "    --[no-]ignore-missing check if - even missing - files are ignored in dry run\n",
+    "    --[no-]sparse         allow updating entries outside of the sparse-checkout cone\n",
+    "    --[no-]chmod (+|-)x   override the executable bit of the listed files\n",
+    "    --[no-]pathspec-from-file <file>\n",
+    "                          read pathspec from file\n",
+    "    --[no-]pathspec-file-nul\n",
+    "                          with --pathspec-from-file, pathspec elements are separated with NUL character\n",
+    "\n",
+);
+
+/// `-h`: `parse_options()` prints the whole table on *stdout* and still exits 129.
+fn print_usage() -> Result<ExitCode> {
+    print!("{USAGE}");
+    Ok(ExitCode::from(129))
+}
+
+/// A usage error (git exit 129): unknown option/switch. git names the offending
+/// option, then prints the same table `-h` does — on stderr this time.
 fn usage_error(msg: String) -> Result<ExitCode> {
     eprintln!("error: {msg}");
-    eprintln!("usage: git add [<options>] [--] <pathspec>...");
+    eprint!("{USAGE}");
     Ok(ExitCode::from(129))
 }
 

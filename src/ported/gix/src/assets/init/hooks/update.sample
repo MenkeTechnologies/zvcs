@@ -1,0 +1,24 @@
+#!/bin/sh
+# A sample hook that decides whether one ref may be updated
+###########################################################
+# This hook runs once per ref a push proposes, after `pre-receive` accepted the push as a
+# whole. It is called with `<ref-name> <old-oid> <new-oid>`, and a non-zero exit rejects
+# that one ref while the rest of the push proceeds. It's useful on the server side only.
+#
+# To enable this hook remove the `.sample` suffix from this file entirely.
+
+ref="$1"
+old="$2"
+new="$3"
+
+# Refuse a non-fast-forward update of a branch: the new tip has to contain the old one.
+case "$ref" in
+refs/heads/*)
+    if [ "$old" != "0000000000000000000000000000000000000000" ] &&
+       ! git merge-base --is-ancestor "$old" "$new"; then
+        echo "Refusing to force-update $ref." >&2
+        exit 1
+    fi
+    ;;
+esac
+exit 0

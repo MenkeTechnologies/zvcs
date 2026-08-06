@@ -1,0 +1,18 @@
+#!/bin/sh
+# A sample hook that updates the worktree of a pushed-to repository
+###################################################################
+# This hook runs on the remote when a push updates the branch that repository has checked
+# out, and `receive.denyCurrentBranch` is set to `updateInstead`. It is called with the
+# commit the branch is moving to, and is responsible for updating the index and the
+# worktree; a non-zero exit rejects the push. It's useful on the server side only.
+#
+# To enable this hook remove the `.sample` suffix from this file entirely.
+
+commit="$1"
+
+# Refuse to touch a dirty worktree, then move index and files to the pushed commit.
+if ! git diff-index --quiet HEAD -- || ! git diff-index --cached --quiet HEAD --; then
+    echo "The worktree or index has local changes; not updating." >&2
+    exit 1
+fi
+exec git read-tree -u -m "$commit"

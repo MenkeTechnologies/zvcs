@@ -70,16 +70,38 @@
 //! empty-blob placeholder, git's `ita_only` path), `-3`/`--3way` and
 //! `--ours`/`--theirs`/`--union` (3-way
 //! merge against the object store), `--build-fake-ancestor` (writes a temporary
-//! index), `-C<n>` (fuzzy context reduction), the whitespace-fixing
-//! `--whitespace` actions (`fix`/`strip`/`error`/`error-all`, byte-altering),
+//! index),
 //! `--ignore-whitespace`/`--ignore-space-change` (whitespace-insensitive match
 //! with pre/post-image fixup), `--inaccurate-eof` (subtle trailing-newline
-//! semantics), copy patches, binary patches, non-UTF-8 paths, and running from a
+//! semantics), copy patches, non-UTF-8 paths, and running from a
 //! subdirectory of the worktree (git reinterprets patch paths against the repo
 //! prefix there).
 //!
-//! Whitespace-error warnings (git's default `--whitespace=warn`) are not
-//! emitted; they go to stderr only and never alter the applied content.
+//! Binary patches are applied: the `GIT binary patch` payload is base85-decoded and
+//! inflated, then either used whole (`literal`) or applied as a git delta to the
+//! pre-image (`delta`, `patch_delta()`'s copy/insert opcodes). Both ends are verified
+//! against the ids the `index` line names, so a payload meets the pre-image it was made
+//! against or the patch is refused — which also means a patch without a full index line
+//! is refused, as git refuses it.
+//!
+//! `-C<n>` reduces context the way `apply_one_fragment()` does: a hunk that does not
+//! land as written sheds one context line from whichever end has more of them and is
+//! retried, down to the `<n>` floor.
+//!
+//! `--whitespace=fix` is honoured for git's default rule set (`blank-at-eol`,
+//! `blank-at-eof`, `space-before-tab`): the trailing run goes and the spaces in front of
+//! a tab in the indent go. A repository whose `core.whitespace` asks for
+//! `indent-with-non-tab` or `tab-in-indent` keeps the refusal — those reshape the indent
+//! in ways this has not been verified against, and a guess would rewrite the user's
+//! bytes.
+//!
+//! Whitespace errors are checked before anything is written, as `check_whitespace()`
+//! does: every added line goes through `ws_check()` under `core.whitespace`, the first
+//! five offenders are reported as `<patch>:<line>: <error>.` followed by the line, and
+//! the rest are summarised (`squelched <n> whitespace errors`). `warn` (the default)
+//! then applies anyway, `nowarn` counts silently, and `error`/`error-all` refuse the
+//! whole patch with `error: <n> lines add whitespace errors.` and exit 128. A
+//! `whitespace` *attribute* would refine the rule per path; only the config is read.
 //!
 //! A fragment that `parse_fragment()` rejects — a header the `@@ -a,b +c,d @@`
 //! grammar does not accept, a body that runs out before the header's counts are
@@ -205,12 +227,14 @@ fn unmark(v: &mut Vec<Unhonoured>, key: &'static str) {
 /// How a `--whitespace`/`apply.whitespace` action classifies against the set
 /// git's `parse_whitespace_option` accepts.
 enum WsAction {
-    /// `warn`/`nowarn`: neither alters the applied bytes; this port emits no
-    /// whitespace warnings either, so both are a no-op.
-    Noop,
-    /// `fix`/`strip`/`error`/`error-all`: byte-altering or erroring at apply
-    /// time; not implemented, so deferred to the unsupported-flag path.
-    Defer,
+    /// `nowarn`: the check runs but says nothing.
+    Silent,
+    /// `warn`: report each offending added line, then apply anyway.
+    Warn,
+    /// `error`/`error-all`: report, then refuse the whole patch (exit 128).
+    Error,
+    /// `fix`/`strip`: rewrite the offending lines before applying them.
+    Fix,
     /// Anything else: git rejects it as an unrecognized whitespace option.
     Invalid,
 }
@@ -219,8 +243,10 @@ enum WsAction {
 /// does (used for both the `--whitespace` flag and the `apply.whitespace` config).
 fn classify_whitespace(v: &str) -> WsAction {
     match v {
-        "warn" | "nowarn" => WsAction::Noop,
-        "fix" | "strip" | "error" | "error-all" => WsAction::Defer,
+        "warn" => WsAction::Warn,
+        "nowarn" => WsAction::Silent,
+        "error" | "error-all" => WsAction::Error,
+        "fix" | "strip" => WsAction::Fix,
         _ => WsAction::Invalid,
     }
 }
@@ -228,7 +254,13 @@ fn classify_whitespace(v: &str) -> WsAction {
 /// Parsed command-line options for a single `apply` invocation. Only the flags
 /// this port honours get a field; the rest live in the `Unhonoured` list.
 struct Opts {
+    /// `--whitespace=<action>` / `apply.whitespace`, for the actions this port runs
+    /// itself. `fix`/`strip` never reach here — they are deferred as unsupported.
+    ws: WsAction,
     strip: usize,               // -p<n>: leading path components to drop (default 1)
+    /// `-C<n>`: the fewest context lines a hunk may be reduced to when it does not
+    /// apply as written. `None` is git's default of keeping every context line.
+    p_context: Option<usize>,
     reverse: bool,              // -R/--reverse: swap pre- and post-image
     check: bool,                // --check: validate only, never write
     numstat: bool,              // --numstat: machine-readable added/deleted counts
@@ -254,6 +286,9 @@ struct Opts {
 impl Default for Opts {
     fn default() -> Self {
         Opts {
+            // git's default is `warn`.
+            ws: WsAction::Warn,
+            p_context: None,
             strip: 1,
             reverse: false,
             check: false,
@@ -382,8 +417,13 @@ fn parse_opts(
                         // default read from config: `Noop` clears it, `Defer`
                         // replaces it with this spelling.
                         match classify_whitespace(&v) {
-                            WsAction::Noop => unmark(unhonoured, "whitespace"),
-                            WsAction::Defer => mark(unhonoured, "whitespace", &a, R_WS),
+                            action @ (WsAction::Silent
+                            | WsAction::Warn
+                            | WsAction::Error
+                            | WsAction::Fix) => {
+                                unmark(unhonoured, "whitespace");
+                                o.ws = action;
+                            }
                             WsAction::Invalid => {
                                 eprintln!("error: unrecognized whitespace option '{v}'");
                                 return Err(ExitCode::from(129));
@@ -501,7 +541,10 @@ fn parse_opts(
                         );
                         return Err(ExitCode::from(129));
                     } else {
-                        mark(unhonoured, "context", &format!("-C{v}"), R_CONTEXT);
+                        o.p_context = v.parse::<usize>().ok();
+                        if o.p_context.is_none() {
+                            mark(unhonoured, "context", &format!("-C{v}"), R_CONTEXT);
+                        }
                     }
                 }
                 'z' => o.nul = true,
@@ -557,9 +600,8 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
         if let Some(v) = repo.config_snapshot().string("apply.whitespace") {
             let v = v.to_str_lossy();
             match classify_whitespace(&v) {
-                WsAction::Noop => {}
-                WsAction::Defer => {
-                    mark(&mut unhonoured, "whitespace", &format!("apply.whitespace={v}"), R_WS)
+                action @ (WsAction::Silent | WsAction::Warn | WsAction::Error | WsAction::Fix) => {
+                    o.ws = action
                 }
                 WsAction::Invalid => {
                     eprintln!("error: unrecognized whitespace option '{v}'");
@@ -663,6 +705,67 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
         patches.retain(|p| use_patch(p, &o.limits, o.has_include));
     }
 
+    // `check_whitespace()`: every added line is checked before anything is written,
+    // so `--whitespace=error` refuses the patch with the worktree untouched. The rule
+    // comes from `core.whitespace`; a `whitespace` attribute would refine it per path,
+    // which this pass does not read.
+    if !patches.is_empty() && !matches!(o.ws, WsAction::Invalid) {
+        let rule = gix::discover(".")
+            .map(|repo| super::diff_color::whitespace_rule_cfg(&repo))
+            .unwrap_or(super::diff_color::WS_DEFAULT_RULE);
+        // `--whitespace=fix` reports the offending lines exactly as `warn` does, then
+        // rewrites them. Only the default rule set is reproduced byte-for-byte, so any
+        // other one keeps the honest refusal.
+        if matches!(o.ws, WsAction::Fix) && !ws_fix_supported(rule) {
+            bail!(
+                "unsupported flag \"--whitespace=fix\": {R_WS} for a non-default \
+                 core.whitespace (ported: {PORTED})"
+            );
+        }
+        let errors = report_whitespace(&patches, &spans, rule, &o.ws, o.quiet);
+        if matches!(o.ws, WsAction::Fix) {
+            for p in &mut patches {
+                for h in &mut p.hunks {
+                    for (_, post_idx) in &h.added_at {
+                        if let Some(line) = h.post.get_mut(*post_idx) {
+                            if super::diff_files::ws_check(line, rule) != 0 {
+                                *line = ws_fix_default(line);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if errors > 0 && matches!(o.ws, WsAction::Error) {
+            err(
+                o.quiet,
+                &format!(
+                    "error: {errors} {} whitespace errors.",
+                    if errors == 1 { "line adds" } else { "lines add" }
+                ),
+            );
+            return Ok(ExitCode::from(128));
+        }
+        if errors > 0 && matches!(o.ws, WsAction::Fix) && o.apply {
+            err(
+                o.quiet,
+                &format!(
+                    "warning: {errors} {} after fixing whitespace errors.",
+                    if errors == 1 { "line applied" } else { "lines applied" }
+                ),
+            );
+        }
+        if errors > 0 && matches!(o.ws, WsAction::Warn) {
+            err(
+                o.quiet,
+                &format!(
+                    "warning: {errors} {} whitespace errors.",
+                    if errors == 1 { "line adds" } else { "lines add" }
+                ),
+            );
+        }
+    }
+
     // git prints its report modes in this fixed order: the scaled --stat graph,
     // then the machine-readable --numstat records, then the --summary lines.
     if o.stat {
@@ -732,9 +835,6 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
     let mut failed = false;
 
     for p in &patches {
-        if p.binary {
-            bail!("binary patch application is not implemented (ported: {PORTED})");
-        }
         // The name git reports progress and success against.
         let name = p.new_name.clone().or_else(|| p.old_name.clone()).unwrap_or_default();
         // The name git reports errors against: the pre-image path when there is
@@ -773,12 +873,16 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
             }
         }
 
+        // The pre-image bytes, kept whole: a text patch works on its lines, a binary
+        // one on the bytes themselves.
+        let mut pre_bytes: Vec<u8> = Vec::new();
         let mut image: Vec<Vec<u8>> = if p.is_new {
             Vec::new()
         } else {
             let old = p.old_name.as_deref().unwrap_or_default();
             match read_preimage(&staged, idx_view, o.cached, old) {
                 PreRead::Found(bytes) => {
+                    pre_bytes = bytes.clone();
                     split_lines(&bytes).into_iter().map(|l| l.to_vec()).collect()
                 }
                 PreRead::MissingWorktree => {
@@ -799,7 +903,18 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
             }
         };
 
-        if let Err(idx) = apply_hunks(&mut image, p, o.unidiff_zero, o.no_add) {
+        // `apply_binary()`: the payload rebuilds the whole file, and both ends are
+        // checked against the ids the `index` line named.
+        if p.binary {
+            match rebuild_binary(p, &pre_bytes) {
+                Ok(bytes) => image = vec![bytes],
+                Err(msg) => {
+                    err(o.quiet, &format!("error: {msg}"));
+                    failed = true;
+                    continue;
+                }
+            }
+        } else if let Err(idx) = apply_hunks(&mut image, p, o.unidiff_zero, o.no_add, o.p_context) {
             let h = &p.hunks[idx];
             if o.verbose {
                 let pre: Vec<u8> = h.pre.concat();
@@ -1077,6 +1192,16 @@ struct Patch {
     is_delete: bool,
     is_rename: bool,
     binary: bool,
+    /// The `GIT binary patch` payloads, forward first and the reverse second when the
+    /// patch carries one (`--binary` writes both). `None` for a `Binary files … differ`
+    /// stub, which carries no data at all.
+    binary_forward: Option<BinaryPayload>,
+    binary_reverse: Option<BinaryPayload>,
+    /// The two ids of the `index <old>..<new>` line, when it carried them in full.
+    /// A binary patch is only applied when they are there: git needs them to check
+    /// that the pre-image is the one the payload was made against.
+    index_old: Option<String>,
+    index_new: Option<String>,
     score: u32, // `similarity index N%`, for the summary's rename line
     hunks: Vec<Hunk>,
     added: usize,
@@ -1105,14 +1230,19 @@ impl Patch {
 /// newline (absent on a line marked `\ No newline at end of file`), matching how
 /// git's `struct image` stores them so the EOF-newline distinction falls out of
 /// plain byte comparison.
+#[derive(Clone)]
 struct Hunk {
     old_pos: usize,
     new_pos: usize,
     pre: Vec<Vec<u8>>,
     post: Vec<Vec<u8>>,
+    /// `(index into the concatenated input, index into `post`)` for every added line,
+    /// which is what the whitespace check reports against (`<patch>:<line>: …`).
+    added_at: Vec<(usize, usize)>,
     context: Vec<Vec<u8>>, // the context lines only, spliced in for --no-add
     raw: Vec<u8>,          // the fragment's verbatim text (header + body) for *.rej
     trailing: usize,       // trailing context lines; 0 means the hunk must match at EOF
+    leading: usize,        // leading context lines, for `-C<n>` context reduction
 }
 
 // ---------------------------------------------------------------------------
@@ -1128,16 +1258,62 @@ fn apply_hunks(
     p: &Patch,
     unidiff_zero: bool,
     no_add: bool,
+    // `-C<n>`: the fewest context lines a hunk may be reduced to before it is called
+    // a failure. `None` keeps every context line, which is git's default.
+    p_context: Option<usize>,
 ) -> Result<(), usize> {
     for (idx, h) in p.hunks.iter().enumerate() {
         if let Some(at) = place_hunk(image.as_slice(), h, unidiff_zero) {
             let repl = if no_add { &h.context } else { &h.post };
             image.splice(at..at + h.pre.len(), repl.iter().cloned());
-        } else {
-            return Err(idx);
+            continue;
         }
+        // `apply_one_fragment()`'s reduction loop: drop a context line from whichever
+        // end has more of them and try again, down to the `-C<n>` floor.
+        if let Some(floor) = p_context {
+            if let Some((at, trimmed)) = place_reduced(image.as_slice(), h, unidiff_zero, floor) {
+                let repl = if no_add { &trimmed.context } else { &trimmed.post };
+                image.splice(at..at + trimmed.pre.len(), repl.iter().cloned());
+                continue;
+            }
+        }
+        return Err(idx);
     }
     Ok(())
+}
+
+/// Trim context off `h` one line at a time — the longer end first, as git does — and
+/// return the placement of the first trimmed form that lands, together with that form.
+fn place_reduced(
+    image: &[Vec<u8>],
+    h: &Hunk,
+    unidiff_zero: bool,
+    floor: usize,
+) -> Option<(usize, Hunk)> {
+    let mut cur = h.clone();
+    while cur.leading > floor || cur.trailing > floor {
+        let from_front = cur.leading > cur.trailing;
+        if from_front {
+            cur.leading -= 1;
+            cur.pre.remove(0);
+            cur.post.remove(0);
+            if !cur.context.is_empty() {
+                cur.context.remove(0);
+            }
+            // The pre-image now starts one line later.
+            cur.old_pos += 1;
+            cur.new_pos += 1;
+        } else {
+            cur.trailing -= 1;
+            cur.pre.pop();
+            cur.post.pop();
+            cur.context.pop();
+        }
+        if let Some(at) = place_hunk(image, &cur, unidiff_zero) {
+            return Some((at, cur));
+        }
+    }
+    None
 }
 
 /// Where hunk `h`'s pre-image lands in `image`, or `None` if it does not apply.
@@ -1266,6 +1442,18 @@ impl InputSpans {
     /// git, parsing one file at a time, simply runs out of bytes and reports the
     /// line one past that file's last, so the input is chosen by where the
     /// fragment *started* rather than by where the scan stopped.
+    /// The `<input>:<line>` a (0-based) index in the concatenated buffer belongs to.
+    fn location(&self, idx: usize) -> (String, usize) {
+        let (name, start) = self
+            .spans
+            .iter()
+            .rev()
+            .find(|(_, start)| *start <= idx)
+            .map(|(name, start)| (name.clone(), *start))
+            .unwrap_or_else(|| ("<stdin>".to_string(), 0));
+        (name, idx - start + 1)
+    }
+
     fn corrupt_at(&self, anchor: usize, idx: usize) -> anyhow::Error {
         let (name, start) = self
             .spans
@@ -1349,6 +1537,10 @@ fn parse_one(
         is_delete: false,
         is_rename: false,
         binary: false,
+        binary_forward: None,
+        binary_reverse: None,
+        index_old: None,
+        index_new: None,
         score: 0,
         hunks: Vec::new(),
         added: 0,
@@ -1400,6 +1592,13 @@ fn parse_one(
                     p.new_mode = Some(octal(mode)?);
                 }
             }
+            // The ids themselves matter to a binary patch, which is only applied
+            // when the line named them in full.
+            let ids = rest.split(' ').next().unwrap_or("");
+            if let Some((old, new)) = ids.split_once("..") {
+                p.index_old = Some(old.to_string());
+                p.index_new = Some(new.to_string());
+            }
         } else if let Some(rest) = l.strip_prefix("--- ") {
             p.old_name = header_path(rest, strip)?;
         } else if let Some(rest) = l.strip_prefix("+++ ") {
@@ -1407,7 +1606,17 @@ fn parse_one(
         } else if l.starts_with("GIT binary patch") || l.starts_with("Binary files ") {
             p.binary = true;
             i += 1;
-            // Consume the encoded payload up to the next patch header.
+            // `parse_binary()`: the forward payload, then the reverse one when the
+            // patch was written with `--binary`. Anything else ends the section.
+            if let Some((forward, next)) = parse_binary_block(lines, i) {
+                p.binary_forward = Some(forward);
+                i = next;
+                if let Some((reverse, next)) = parse_binary_block(lines, i) {
+                    p.binary_reverse = Some(reverse);
+                    i = next;
+                }
+            }
+            // Consume whatever is left of the section.
             while i < lines.len() {
                 let n = txt(lines[i]);
                 if n.starts_with("diff --git ") || n.starts_with("--- ") {
@@ -1476,9 +1685,11 @@ fn parse_hunk(
         new_pos,
         pre: Vec::new(),
         post: Vec::new(),
+        added_at: Vec::new(),
         context: Vec::new(),
         raw: Vec::new(),
         trailing: 0,
+        leading: 0,
     };
     let (mut added, mut deleted) = (0usize, 0usize);
     let mut last = Side::None;
@@ -1513,6 +1724,9 @@ fn parse_hunk(
         };
         match marker {
             b' ' => {
+                if added == 0 && deleted == 0 {
+                    h.leading += 1;
+                }
                 h.pre.push(body.to_vec());
                 h.post.push(body.to_vec());
                 h.context.push(body.to_vec());
@@ -1529,6 +1743,7 @@ fn parse_hunk(
                 old_rem = old_rem.saturating_sub(1);
             }
             _ => {
+                h.added_at.push((i, h.post.len()));
                 h.post.push(body.to_vec());
                 h.trailing = 0;
                 added += 1;
@@ -2257,4 +2472,339 @@ fn io_msg(e: &std::io::Error) -> String {
         Some(i) => s[..i].to_string(),
         None => s,
     }
+}
+
+// ---------------------------------------------------------------------------
+// whitespace checking — apply.c's ws_check path
+// ---------------------------------------------------------------------------
+
+/// Report the whitespace errors every added line carries, as `apply.c`'s
+/// `check_whitespace()` does: one `<patch>:<line>: <error>.` line followed by the
+/// offending text, the first five only, then the count.
+///
+/// Returns the number of offending lines. `nowarn` counts without reporting, which is
+/// what git's `ws_error_action == nowarn_ws_error` does.
+fn report_whitespace(
+    patches: &[Patch],
+    spans: &InputSpans,
+    rule: u32,
+    action: &WsAction,
+    quiet: bool,
+) -> usize {
+    // `squelch_whitespace_errors`: git prints the first five and summarises the rest.
+    const SQUELCH: usize = 5;
+    let mut errors = 0usize;
+    let mut printed = 0usize;
+    let silent = matches!(action, WsAction::Silent);
+    for p in patches {
+        for h in &p.hunks {
+            for (input_idx, post_idx) in &h.added_at {
+                let Some(line) = h.post.get(*post_idx) else {
+                    continue;
+                };
+                if super::diff_files::ws_check(line, rule) == 0 {
+                    continue;
+                }
+                errors += 1;
+                if silent || printed >= SQUELCH {
+                    continue;
+                }
+                printed += 1;
+                let (file, no) = spans.location(*input_idx);
+                let what = super::diff_files::whitespace_error_string(
+                    super::diff_files::ws_check(line, rule),
+                );
+                err(quiet, &format!("{file}:{no}: {what}."));
+                let body = line.strip_suffix(b"\n").unwrap_or(line);
+                err(quiet, &String::from_utf8_lossy(body));
+            }
+        }
+    }
+    if !silent && errors > printed {
+        err(
+            quiet,
+            &format!(
+                "warning: squelched {} whitespace {}",
+                errors - printed,
+                plural_errors(errors - printed)
+            ),
+        );
+    }
+    errors
+}
+
+/// `Q_("whitespace error", "whitespace errors", n)`.
+fn plural_errors(n: usize) -> &'static str {
+    if n == 1 {
+        "error"
+    } else {
+        "errors"
+    }
+}
+
+// ---------------------------------------------------------------------------
+// binary patches — apply.c's `GIT binary patch` payload
+// ---------------------------------------------------------------------------
+
+/// One `GIT binary patch` fragment: how to turn the pre-image into the post-image.
+#[derive(Clone)]
+enum BinaryPayload {
+    /// `literal <size>`: the inflated bytes are the whole post-image.
+    Literal(Vec<u8>),
+    /// `delta <size>`: the inflated bytes are a git delta against the pre-image.
+    Delta(Vec<u8>),
+}
+
+impl BinaryPayload {
+    /// The post-image this payload produces from `base`.
+    fn rebuild(&self, base: &[u8]) -> Option<Vec<u8>> {
+        match self {
+            BinaryPayload::Literal(data) => Some(data.clone()),
+            BinaryPayload::Delta(delta) => apply_git_delta(base, delta),
+        }
+    }
+}
+
+/// git's base85 alphabet (base85.c). The decoder maps each character back to its
+/// value; anything outside the alphabet makes the line invalid.
+const BASE85: &[u8; 85] =
+    b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz!#$%&()*+-;<=>?@^_`{|}~";
+
+/// `decode_85()`: five alphabet characters carry four bytes, the last group padded.
+fn decode_base85(input: &[u8], want: usize) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(want);
+    let mut left = want;
+    let mut chunk = input.chunks(5);
+    while left > 0 {
+        let group = chunk.next()?;
+        if group.len() != 5 {
+            return None;
+        }
+        let mut acc: u32 = 0;
+        for &ch in group {
+            let de = BASE85.iter().position(|c| *c == ch)? as u32;
+            acc = acc.checked_mul(85)?.checked_add(de)?;
+        }
+        // git emits the four bytes most-significant first by rotating the
+        // accumulator a byte at a time.
+        let take = left.min(4);
+        for _ in 0..take {
+            acc = acc.rotate_left(8);
+            out.push(acc as u8);
+        }
+        left -= take;
+    }
+    Some(out)
+}
+
+/// `patch_delta()` (patch-delta.c): a size header for each side, then copy-from-base
+/// and insert-literal instructions. `None` when the delta does not describe `base`.
+fn apply_git_delta(base: &[u8], delta: &[u8]) -> Option<Vec<u8>> {
+    let mut pos = 0usize;
+    let mut varint = |pos: &mut usize| -> Option<usize> {
+        let mut value = 0usize;
+        let mut shift = 0u32;
+        loop {
+            let byte = *delta.get(*pos)?;
+            *pos += 1;
+            value |= ((byte & 0x7f) as usize) << shift;
+            if byte & 0x80 == 0 {
+                return Some(value);
+            }
+            shift += 7;
+        }
+    };
+    if varint(&mut pos)? != base.len() {
+        return None;
+    }
+    let target_size = varint(&mut pos)?;
+    let mut out: Vec<u8> = Vec::with_capacity(target_size);
+    while pos < delta.len() {
+        let op = delta[pos];
+        pos += 1;
+        if op & 0x80 != 0 {
+            // Copy: the low bits say which offset/size bytes are present.
+            let mut offset = 0usize;
+            let mut size = 0usize;
+            for (bit, shift) in [(0x01, 0), (0x02, 8), (0x04, 16), (0x08, 24)] {
+                if op & bit != 0 {
+                    offset |= (*delta.get(pos)? as usize) << shift;
+                    pos += 1;
+                }
+            }
+            for (bit, shift) in [(0x10, 0), (0x20, 8), (0x40, 16)] {
+                if op & bit != 0 {
+                    size |= (*delta.get(pos)? as usize) << shift;
+                    pos += 1;
+                }
+            }
+            if size == 0 {
+                size = 0x10000;
+            }
+            out.extend_from_slice(base.get(offset..offset.checked_add(size)?)?);
+        } else if op != 0 {
+            let len = op as usize;
+            out.extend_from_slice(delta.get(pos..pos + len)?);
+            pos += len;
+        } else {
+            // A zero opcode is reserved and git refuses it.
+            return None;
+        }
+    }
+    (out.len() == target_size).then_some(out)
+}
+
+/// Read one `literal <n>`/`delta <n>` block: the header line, then base85 lines until
+/// a blank one. Returns the payload and the index just past the block.
+fn parse_binary_block(lines: &[&[u8]], mut i: usize) -> Option<(BinaryPayload, usize)> {
+    let head = String::from_utf8_lossy(lines.get(i)?).trim_end().to_string();
+    let (kind, size) = match head.split_once(' ') {
+        Some(("literal", n)) => ("literal", n.parse::<usize>().ok()?),
+        Some(("delta", n)) => ("delta", n.parse::<usize>().ok()?),
+        _ => return None,
+    };
+    i += 1;
+    let mut encoded: Vec<u8> = Vec::new();
+    while let Some(line) = lines.get(i) {
+        let body = line.strip_suffix(b"\n").unwrap_or(line);
+        if body.is_empty() {
+            i += 1;
+            break;
+        }
+        // The first byte is the length this line encodes, in git's `A`..`Z`/`a`..`z`
+        // counting; a line outside that range ends the block.
+        let len = match body[0] {
+            c @ b'A'..=b'Z' => (c - b'A') as usize + 1,
+            c @ b'a'..=b'z' => (c - b'a') as usize + 27,
+            _ => break,
+        };
+        encoded.extend_from_slice(&decode_base85(&body[1..], len)?);
+        i += 1;
+    }
+    // The payload is deflated, exactly as `emit_binary_diff_body()` wrote it.
+    let mut inflate = gix::zlib::Inflate::default();
+    let mut out = vec![0u8; size];
+    let (_status, _consumed, written) = inflate.once(&encoded, out.as_mut_slice()).ok()?;
+    if written != size {
+        return None;
+    }
+    Some((
+        match kind {
+            "literal" => BinaryPayload::Literal(out),
+            _ => BinaryPayload::Delta(out),
+        },
+        i,
+    ))
+}
+
+/// `apply_binary()`: rebuild a binary file's post-image from its payload, refusing
+/// unless the `index` line named both ids in full and the pre-image is the one the
+/// payload was made against.
+fn rebuild_binary(p: &Patch, pre: &[u8]) -> std::result::Result<Vec<u8>, String> {
+    let name = p
+        .new_name
+        .clone()
+        .or_else(|| p.old_name.clone())
+        .unwrap_or_default();
+    let hexsz = gix::hash::Kind::Sha1.len_in_hex();
+    let (Some(old_id), Some(new_id)) = (&p.index_old, &p.index_new) else {
+        return Err(format!(
+            "cannot apply binary patch to '{name}' without full index line"
+        ));
+    };
+    if old_id.len() != hexsz || new_id.len() != hexsz {
+        return Err(format!(
+            "cannot apply binary patch to '{name}' without full index line"
+        ));
+    }
+    let Some(payload) = &p.binary_forward else {
+        return Err(format!("cannot apply binary patch to '{name}' without full index line"));
+    };
+
+    // `read_blob_object()`'s check: the pre-image has to hash to the id the patch was
+    // made against, or the payload describes something else entirely.
+    let have = blob_hex(pre);
+    if have != *old_id {
+        return Err(if pre.is_empty() {
+            format!("the patch applies to an empty '{name}' but it is not empty")
+        } else {
+            format!(
+                "the patch applies to '{name}' ({old_id}), which does not match the current contents."
+            )
+        });
+    }
+    let Some(result) = payload.rebuild(pre) else {
+        return Err(format!("binary patch does not apply to '{name}'"));
+    };
+    let got = blob_hex(&result);
+    if got != *new_id {
+        return Err(format!(
+            "binary patch to '{name}' creates incorrect result (expecting {new_id}, got {got})"
+        ));
+    }
+    Ok(result)
+}
+
+/// The blob id of `data`, which is what both ends of a binary patch are checked against.
+fn blob_hex(data: &[u8]) -> String {
+    gix::objs::compute_hash(gix::hash::Kind::Sha1, gix::objs::Kind::Blob, data)
+        .map(|id| id.to_hex().to_string())
+        .unwrap_or_default()
+}
+
+/// `ws_fix_copy()` for git's default whitespace rule: strip the trailing whitespace a
+/// line ends with, and drop the spaces that sit in front of a tab in its indent.
+///
+/// Only the default rule set is fixed here. `indent-with-non-tab` and `tab-in-indent`
+/// reshape the indent in ways this has not been verified against, so a repository that
+/// configures them keeps the deferred `--whitespace=fix` refusal rather than getting a
+/// guess (see [`ws_fix_supported`]).
+fn ws_fix_default(line: &[u8]) -> Vec<u8> {
+    let (body, terminator): (&[u8], &[u8]) = match line.strip_suffix(b"\n") {
+        Some(rest) => (rest, b"\n"),
+        None => (line, b""),
+    };
+    // `blank-at-eol`: everything after the last non-blank goes.
+    let end = body
+        .iter()
+        .rposition(|b| !matches!(b, b' ' | b'\t'))
+        .map_or(0, |i| i + 1);
+    let body = &body[..end];
+
+    // `space-before-tab`: inside the indent, a run of spaces followed by a tab is the
+    // violation, and the fix is to drop the spaces.
+    let indent_end = body
+        .iter()
+        .position(|b| !matches!(b, b' ' | b'\t'))
+        .unwrap_or(body.len());
+    let mut out: Vec<u8> = Vec::with_capacity(line.len());
+    let mut i = 0usize;
+    while i < indent_end {
+        if body[i] == b'\t' {
+            out.push(b'\t');
+            i += 1;
+            continue;
+        }
+        let run_end = body[i..indent_end]
+            .iter()
+            .position(|b| *b != b' ')
+            .map_or(indent_end, |n| i + n);
+        // Kept unless a tab follows the run, which is what makes it a violation.
+        if body.get(run_end) != Some(&b'\t') {
+            out.extend_from_slice(&body[i..run_end]);
+        }
+        i = run_end;
+    }
+    out.extend_from_slice(&body[indent_end..]);
+    out.extend_from_slice(terminator);
+    out
+}
+
+/// Whether [`ws_fix_default`] describes what `rule` asks for: git's default set, with
+/// any tab width (the width only matters to the rules this does not fix).
+fn ws_fix_supported(rule: u32) -> bool {
+    use super::diff_color::{WS_BLANK_AT_EOF, WS_BLANK_AT_EOL, WS_SPACE_BEFORE_TAB};
+    const FIXABLE: u32 = WS_BLANK_AT_EOL | WS_BLANK_AT_EOF | WS_SPACE_BEFORE_TAB;
+    // Ignore the low six bits, which carry the tab width rather than a rule.
+    (rule & !0x3f) == FIXABLE
 }

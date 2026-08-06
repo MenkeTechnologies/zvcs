@@ -79,7 +79,7 @@ pub(super) fn recursive(
         if can_recurse(
             current_bstr.as_bstr(),
             info,
-            opts.for_deletion,
+            opts,
             false, /* is root */
             delegate,
         ) {
@@ -299,6 +299,22 @@ impl Mark {
         delegate: &mut dyn walk::Delegate,
     ) -> Option<Action> {
         if !self.may_collapse {
+            return None;
+        }
+        // `treat_directory()` (dir.c:1932): when `directory_exists_in_index()` reports
+        // `index_directory` the directory is recursed into and never reported as a single
+        // untracked directory. Its entries do not have to exist on disk — a tracked file
+        // deleted from the worktree, one marked `skip-worktree`, or a path outside a
+        // sparse checkout all keep the directory expanded, so its untracked siblings are
+        // named one by one. Without this, `git status` says `?? d/` where git says
+        // `?? d/untracked.txt`, and `git clean -f` (which never removes directories)
+        // finds nothing to remove at all.
+        //
+        // Only entries *below* the directory count, which is what `index_kind` of
+        // `Directory` means here: `directory_exists_in_index()` requires the byte after
+        // the prefix to be `/`, so an index entry with this exact name (a file where the
+        // worktree now has a directory) leaves the collapse alone.
+        if dir_info.index_kind == Some(entry::Kind::Directory) {
             return None;
         }
         let (mut expendable, mut precious, mut untracked, mut entries, mut matching_entries) = (0, 0, 0, 0, 0);

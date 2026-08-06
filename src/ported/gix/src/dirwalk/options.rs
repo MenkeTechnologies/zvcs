@@ -11,6 +11,7 @@ impl Options {
             recurse_repositories: false,
             emit_pruned: false,
             emit_ignored: None,
+            recurse_ignored_directories: false,
             for_deletion: None,
             emit_tracked: false,
             emit_untracked: Default::default(),
@@ -31,6 +32,7 @@ impl From<Options> for gix_dir::walk::Options<'static> {
             recurse_repositories: v.recurse_repositories,
             emit_pruned: v.emit_pruned,
             emit_ignored: v.emit_ignored,
+            recurse_ignored_directories: v.recurse_ignored_directories,
             for_deletion: v.for_deletion,
             emit_tracked: v.emit_tracked,
             emit_untracked: v.emit_untracked,
@@ -84,6 +86,18 @@ impl Options {
     /// If `None`, ignored entries will not be emitted at all.
     pub fn emit_ignored(mut self, value: Option<EmissionMode>) -> Self {
         self.emit_ignored = value;
+        self
+    }
+    /// If `true`, default `false`, look inside a directory that is itself ignored so
+    /// every ignored file in it is seen — git's cleared `DIR_SHOW_OTHER_DIRECTORIES`,
+    /// which is what `git status -uall --ignored` runs with.
+    pub fn recurse_ignored_directories(mut self, toggle: bool) -> Self {
+        self.recurse_ignored_directories = toggle;
+        self
+    }
+    /// Like [`recurse_ignored_directories()`](Self::recurse_ignored_directories), but only requires a mutably borrowed instance.
+    pub fn set_recurse_ignored_directories(&mut self, toggle: bool) -> &mut Self {
+        self.recurse_ignored_directories = toggle;
         self
     }
     /// Like [`emit_ignored()`](Self::emit_ignored), but only requires a mutably borrowed instance.

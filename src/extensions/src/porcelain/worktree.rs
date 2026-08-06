@@ -18,6 +18,8 @@ use gix::refs::FullName;
 ///   * `git worktree lock [--reason <s>] <wt>`  → create `worktrees/<id>/locked`
 ///   * `git worktree unlock <wt>`               → remove it
 ///   * `git worktree add <path> [<commit-ish>]` → a linked worktree, checked out
+///   * `git worktree remove [-f] <wt>`          → the checkout, then its admin directory
+///   * `git worktree move <wt> <new-path>`      → rename it, relinking both halves
 ///
 /// `git worktree` itself takes no options, so any dash-prefixed token ahead of
 /// the subcommand is a usage error (exit 129) — `--foo` reports an unknown
@@ -34,6 +36,14 @@ use gix::refs::FullName;
 /// — the only reason reachable from `list`, since git skips a worktree whose
 /// `gitdir` file is missing or empty. `list` defaults that threshold to TIME_MAX,
 /// so a missing checkout is prunable unless `--expire` narrows the window.
+///
+/// `remove` and `move` reproduce `remove_worktree()`/`move_worktree()`: the argument
+/// is resolved through the same lookup `lock` uses, the main worktree is refused, and a
+/// locked one needs `-f -f` (`move`: `-f`). `remove` additionally runs
+/// `check_clean_worktree()`'s question — does `status` have anything to say, tracked or
+/// untracked? — and refuses without `--force`; it then deletes the checkout before the
+/// administrative directory, so an interrupted removal leaves a prunable entry rather
+/// than a live worktree with no bookkeeping.
 ///
 /// `prune` and `repair` are ported: both are pure worktree-administrative
 /// bookkeeping over `<common-dir>/worktrees/*`, needing no checkout. `prune`
@@ -113,9 +123,9 @@ pub fn worktree(args: &[String]) -> Result<ExitCode> {
         "prune" => prune(&args[1..]),
         "repair" => repair(&args[1..]),
         "add" => add(&args[1..]),
-        "move" => bail!("`worktree move` is not ported (needs git's check_clean_worktree/validate_worktree bookkeeping, absent from the vendored crates)"),
+        "move" => move_worktree(&args[1..]),
         "remove" => {
-            bail!("`worktree remove` is not ported (needs git's check_clean_worktree/validate_worktree bookkeeping, absent from the vendored crates)")
+            remove(&args[1..])
         }
         other => usage(
             Some(&format!("error: unknown subcommand: `{other}'")),
@@ -1604,8 +1614,10 @@ mod tests {
 enum Start {
     /// Check out an existing branch, attaching the new worktree's `HEAD` to it.
     Branch(FullName, ObjectId),
-    /// `-b`/`-B`, or the DWIM branch named after the directory.
-    NewBranch { name: FullName, oid: ObjectId, force: bool },
+    /// `-b`/`-B`, or the DWIM branch named after the directory. `from` is the start
+    /// point as the caller spelled it (`HEAD` when none was given), which is what the
+    /// branch's `branch: Created from <x>` reflog line names.
+    NewBranch { name: FullName, oid: ObjectId, force: bool, from: String },
     /// `--detach`, or a commit-ish that is not a branch.
     Detached(ObjectId),
 }
@@ -1781,8 +1793,8 @@ fn add(args: &[String]) -> Result<ExitCode> {
     std::fs::write(admin.join("commondir"), "../..\n")?;
 
     // `-b`/`-B` creates the branch before `HEAD` can name it.
-    if let Start::NewBranch { name, oid, force } = &start {
-        create_branch(&repo, name, *oid, *force)?;
+    if let Start::NewBranch { name, oid, force, from } = &start {
+        create_branch(&repo, name, *oid, *force, from)?;
     }
     let head_line = match &start {
         Start::Branch(name, _) => format!("ref: {}\n", name.as_bstr().to_str_lossy()),
@@ -1838,6 +1850,7 @@ fn resolve_start(
             name: FullName::try_from(format!("refs/heads/{name}"))?,
             oid,
             force: force_branch,
+            from: commit_ish.unwrap_or("HEAD").to_string(),
         });
     }
     match commit_ish {
@@ -1865,6 +1878,7 @@ fn resolve_start(
                     name: FullName::try_from(format!("refs/heads/{dwim_name}"))?,
                     oid,
                     force: false,
+                    from: "HEAD".to_string(),
                 })
             }
         }
@@ -1885,7 +1899,13 @@ fn checked_out_in(repo: &gix::Repository, branch: &FullName) -> Result<Option<Pa
 }
 
 /// `refs/heads/<name>` at `oid`, refusing to clobber unless `-B` was given.
-fn create_branch(repo: &gix::Repository, name: &FullName, oid: ObjectId, force: bool) -> Result<()> {
+fn create_branch(
+    repo: &gix::Repository,
+    name: &FullName,
+    oid: ObjectId,
+    force: bool,
+    from: &str,
+) -> Result<()> {
     use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
     let expected = if force { PreviousValue::Any } else { PreviousValue::MustNotExist };
     let edit = RefEdit {
@@ -1893,7 +1913,7 @@ fn create_branch(repo: &gix::Repository, name: &FullName, oid: ObjectId, force: 
             log: LogChange {
                 mode: RefLog::AndReference,
                 force_create_reflog: false,
-                message: format!("branch: Created from {}", oid.to_hex()).into(),
+                message: format!("branch: Created from {from}").into(),
             },
             expected,
             new: gix::refs::Target::Object(oid),
@@ -1975,4 +1995,197 @@ fn checkout_into(repo: &gix::Repository, admin: &Path, path: &Path, oid: ObjectI
         gix::index::write::Options::default(),
     )?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// remove / move
+// ---------------------------------------------------------------------------
+
+/// `git worktree remove [-f] <worktree>` — port of `remove_worktree()`.
+///
+/// The checkout goes first and its administrative directory second, so an
+/// interrupted removal leaves a prunable entry rather than a live worktree with no
+/// bookkeeping. A locked worktree needs `-f -f`, and a dirty one `-f`: git counts
+/// the `--force`s and treats the second as "override the lock too".
+fn remove(args: &[String]) -> Result<ExitCode> {
+    let mut force = 0usize;
+    let mut target: Option<&str> = None;
+    for a in args {
+        match a.as_str() {
+            "-h" | "--help" => {
+                print!("{MAIN_USAGE}");
+                return Ok(ExitCode::from(129));
+            }
+            "-f" | "--force" => force += 1,
+            "--no-force" => force = 0,
+            s if s.starts_with('-') && s != "-" => return usage(None, MAIN_USAGE),
+            s if target.is_none() => target = Some(s),
+            _ => return usage(None, MAIN_USAGE),
+        }
+    }
+    let Some(arg) = target else {
+        return usage(None, MAIN_USAGE);
+    };
+
+    let repo = gix::discover(".")?;
+    let worktrees = collect(&repo, u64::MAX)?;
+    let Some(wt) = find_worktree(&worktrees, arg) else {
+        return die(&format!("'{arg}' is not a working tree"));
+    };
+    let Some(id) = wt.id.clone() else {
+        return die(&format!("'{arg}' is a main working tree"));
+    };
+    if force < 2 {
+        if let Some(reason) = &wt.locked {
+            return die(&if reason.is_empty() {
+                "cannot remove a locked working tree;\nuse 'remove -f -f' to override or unlock first"
+                    .to_string()
+            } else {
+                format!(
+                    "cannot remove a locked working tree, lock reason: {reason}\nuse 'remove -f -f' to override or unlock first"
+                )
+            });
+        }
+    }
+
+    // `check_clean_worktree()`: git runs `status --porcelain` inside the worktree and
+    // refuses on any output at all, tracked or not. A checkout that is already gone
+    // (`WT_VALIDATE_WORKTREE_MISSING_OK`) skips straight to the bookkeeping.
+    if wt.path.exists() {
+        if force == 0 {
+            if let Some(dirty) = worktree_is_dirty(&wt.path)? {
+                if dirty {
+                    return die(&format!(
+                        "'{arg}' contains modified or untracked files, use --force to delete it"
+                    ));
+                }
+            }
+        }
+        if let Err(e) = std::fs::remove_dir_all(&wt.path) {
+            return die(&format!(
+                "failed to delete '{}': {}",
+                path_to_string(&wt.path),
+                errno_str(&e)
+            ));
+        }
+    }
+    let admin = repo.common_dir().join("worktrees").join(&id);
+    if let Err(e) = std::fs::remove_dir_all(&admin) {
+        return die(&format!(
+            "failed to delete '{}': {}",
+            path_to_string(&admin),
+            errno_str(&e)
+        ));
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `git worktree move <worktree> <new-path>` — port of `move_worktree()`.
+///
+/// The directory is renamed first, then the two files that point at each other are
+/// rewritten: `worktrees/<id>/gitdir` (which names the checkout's `.git` file) and
+/// the checkout's own `.git` file (which names the administrative directory).
+fn move_worktree(args: &[String]) -> Result<ExitCode> {
+    let mut force = false;
+    let mut positionals: Vec<&str> = Vec::new();
+    for a in args {
+        match a.as_str() {
+            "-h" | "--help" => {
+                print!("{MAIN_USAGE}");
+                return Ok(ExitCode::from(129));
+            }
+            "-f" | "--force" => force = true,
+            "--no-force" => force = false,
+            s if s.starts_with('-') && s != "-" => return usage(None, MAIN_USAGE),
+            s => positionals.push(s),
+        }
+    }
+    if positionals.len() != 2 {
+        return usage(None, MAIN_USAGE);
+    }
+    let (arg, dest_arg) = (positionals[0], positionals[1]);
+
+    let repo = gix::discover(".")?;
+    let worktrees = collect(&repo, u64::MAX)?;
+    let Some(wt) = find_worktree(&worktrees, arg) else {
+        return die(&format!("'{arg}' is not a working tree"));
+    };
+    let Some(id) = wt.id.clone() else {
+        return die(&format!("'{arg}' is a main working tree"));
+    };
+    if !force {
+        if let Some(reason) = &wt.locked {
+            return die(&if reason.is_empty() {
+                "cannot move a locked working tree;\nuse 'move -f -f' to override or unlock first"
+                    .to_string()
+            } else {
+                format!(
+                    "cannot move a locked working tree, lock reason: {reason}\nuse 'move -f -f' to override or unlock first"
+                )
+            });
+        }
+    }
+
+    // `git worktree move a b` where `b` is a directory moves the checkout *into* it,
+    // keeping its own name — the same rule `mv` follows.
+    let mut dest = PathBuf::from(dest_arg);
+    if dest.is_dir() {
+        if let Some(name) = wt.path.file_name() {
+            dest = dest.join(name);
+        }
+    }
+    if dest.exists() {
+        return die(&format!("target '{dest_arg}' already exists"));
+    }
+    if let Err(e) = std::fs::rename(&wt.path, &dest) {
+        return die(&format!(
+            "failed to move '{}' to '{}': {}",
+            path_to_string(&wt.path),
+            path_to_string(&dest),
+            errno_str(&e)
+        ));
+    }
+
+    // `update_worktree_location()`: both halves of the link are rewritten, absolute,
+    // exactly as `worktree add` wrote them.
+    let admin = repo.common_dir().join("worktrees").join(&id);
+    let dest_abs = gix::path::realpath(&dest).unwrap_or(dest.clone());
+    let mut gitdir_line = path_bytes(&dest_abs.join(".git"));
+    gitdir_line.push(b'\n');
+    std::fs::write(admin.join("gitdir"), gitdir_line)?;
+    let admin_abs = gix::path::realpath(&admin).unwrap_or_else(|_| admin.clone());
+    let mut dot_git = b"gitdir: ".to_vec();
+    dot_git.extend_from_slice(&path_bytes(&admin_abs));
+    dot_git.push(b'\n');
+    std::fs::write(dest_abs.join(".git"), dot_git)?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `check_clean_worktree()`'s question, asked of the worktree at `path`: does
+/// `status --porcelain` have anything to say? `None` when the checkout cannot be
+/// opened at all, which git treats as nothing to protect.
+fn worktree_is_dirty(path: &Path) -> Result<Option<bool>> {
+    let Ok(repo) = gix::open(path) else {
+        return Ok(None);
+    };
+    if repo.is_dirty()? {
+        return Ok(Some(true));
+    }
+    // `is_dirty()` only knows about tracked paths; git refuses over an untracked file
+    // just as readily, so the same dirwalk `clean` uses answers the rest.
+    let index = repo.index_or_empty()?;
+    let options = repo
+        .dirwalk_options()?
+        .emit_untracked(gix::dir::walk::EmissionMode::CollapseDirectory)
+        .emit_ignored(None)
+        .emit_empty_directories(false);
+    let patterns: Vec<gix::bstr::BString> = Vec::new();
+    let iter = repo.dirwalk_iter(index, patterns, Default::default(), options)?;
+    for item in iter {
+        let item = item?;
+        if matches!(item.entry.status, gix::dir::entry::Status::Untracked) {
+            return Ok(Some(true));
+        }
+    }
+    Ok(Some(false))
 }

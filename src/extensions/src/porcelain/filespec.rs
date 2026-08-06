@@ -40,6 +40,34 @@ pub(crate) fn count_changed_lines(old: &[u8], new: &[u8]) -> Result<(usize, usiz
     Ok(UnifiedDiff::new(&diff, &input, counter, ContextSize::symmetrical(3)).consume()?)
 }
 
+/// [`count_changed_lines`] with a whitespace rule applied to the *comparison* only,
+/// the way `-w`/`-b`/`--ignore-space-at-eol` work: every line is normalized before
+/// the two sides are matched up, so a line whose only change is whitespace pairs
+/// with its counterpart and drops out of the tally.
+///
+/// The history commands need this because git computes their `--stat` counts from
+/// the same pairs the patch would print — a commit whose whole diff is whitespace
+/// leaves the queue empty under `-w`, and the stat, name and raw formats then have
+/// nothing to report.
+pub(crate) fn count_changed_lines_ws(
+    old: &[u8],
+    new: &[u8],
+    ws: super::diff::Whitespace,
+) -> Result<(usize, usize)> {
+    if ws == super::diff::Whitespace::Keep {
+        return count_changed_lines(old, new);
+    }
+    let norm = |data: &[u8]| -> Vec<u8> {
+        let mut out = Vec::with_capacity(data.len());
+        for line in super::diff::byte_lines(data) {
+            out.extend_from_slice(&super::diff::normalize_line(line, ws));
+            out.push(b'\n');
+        }
+        out
+    };
+    count_changed_lines(&norm(old), &norm(new))
+}
+
 /// Counts changed lines, ignoring context.
 struct LineCounter {
     added: usize,

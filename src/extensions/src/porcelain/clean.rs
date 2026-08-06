@@ -214,7 +214,12 @@ fn parse(args: &[String]) -> std::result::Result<Parsed, u8> {
 ///   * `-e`/`--exclude=<pattern>` — extra ignore patterns, layered above every
 ///                          `.gitignore` exactly like git's `EXC_CMDL` group, so
 ///                          with `-X` they become removal targets and otherwise
-///                          they shield paths from removal.
+///                          they shield paths from removal. `-x` drops the
+///                          repository's own ignore rules but keeps these, which
+///                          then also keep the directory holding a shielded file
+///                          expanded — removing the directory would take that
+///                          file with it. A `!`-negated pattern gives the
+///                          protection back up.
 ///   * `--no-quiet`, `--no-dry-run`, `--no-force`, `--no-interactive`, and
 ///     unique-prefix abbreviations such as `--dry` or `--no-dr`.
 ///   * `--` and `<pathspec>...` — as with git, any pathspec implies `-d`, and
@@ -363,6 +368,15 @@ pub fn clean(args: &[String]) -> Result<ExitCode> {
     //   * `for_deletion` is only set with `-d`; it is what stops a directory
     //     from collapsing when it also holds files we would not delete, so that
     //     `git clean -nd` reports `dir/file` instead of `dir/`.
+    //   * with `-x` and `-e` the only ignore patterns left are the command-line ones,
+    //     and everything they match is a file to *keep*. The walk is told so by making
+    //     those patterns *precious*, which is what stops a directory holding one of
+    //     them from collapsing over it — git reports `dir/deletable` there, never
+    //     `dir/`, because removing the directory would take the excluded file with it.
+    //
+    // `-X` keeps git's standard excludes (they are what it deletes); only `-x` drops
+    // them and leaves the `-e` patterns as the sole protection.
+    let cmdl_excludes_only = ignored_too && !ignored_only && !excludes.is_empty();
     let mut options = repo
         .dirwalk_options()?
         .empty_patterns_match_prefix(true)
@@ -380,8 +394,7 @@ pub fn clean(args: &[String]) -> Result<ExitCode> {
         remove_directories
             .then_some(gix::dir::walk::ForDeletionMode::IgnoredDirectoriesCanHideNestedRepositories),
     );
-
-    let entries = walk(&repo, index, &pathspecs, &excludes, options)?;
+    let entries = walk(&repo, index, &pathspecs, &excludes, cmdl_excludes_only, options)?;
 
     // (sort key = repo-relative path with a trailing '/' for directories, repo-relative path, is_dir)
     let mut targets: Vec<(BString, BString, bool)> = Vec::new();
@@ -389,6 +402,9 @@ pub fn clean(args: &[String]) -> Result<ExitCode> {
         match entry.status {
             gix::dir::entry::Status::Pruned | gix::dir::entry::Status::Tracked => continue,
             gix::dir::entry::Status::Untracked if ignored_only => continue,
+            // With `-x` and `-e` the stack holds nothing but the command-line patterns,
+            // so an ignored entry is one the caller asked to keep, not one to delete.
+            gix::dir::entry::Status::Ignored(_) if cmdl_excludes_only => continue,
             gix::dir::entry::Status::Ignored(_) if !(ignored_too || ignored_only) => continue,
             _ => {}
         }
@@ -478,6 +494,11 @@ fn walk(
     index: gix::worktree::IndexPersistedOrInMemory,
     pathspecs: &[String],
     excludes: &[String],
+    // `-x`: `cmd_clean()` skips `setup_standard_excludes()`, so no `.gitignore`, no
+    // `info/exclude` and no `core.excludesFile` is read — but the `EXC_CMDL` group the
+    // `-e` patterns live in is added either way, and it is the only thing left that can
+    // hold a file back from deletion.
+    cmdl_excludes_only: bool,
     options: gix::dirwalk::Options,
 ) -> Result<Vec<gix::dir::Entry>> {
     let patterns: Vec<BString> = pathspecs
@@ -495,20 +516,67 @@ fn walk(
     }
 
     let state: &gix::index::State = &index;
-    let parse = gix::ignore::search::Ignore {
+    let mut parse = gix::ignore::search::Ignore {
         support_precious: repo
             .config_snapshot()
             .boolean("gitoxide.parsePrecious")
             .unwrap_or(false),
     };
-    let overrides = gix::ignore::Search::from_overrides(excludes.iter().cloned(), parse);
-    let mut exclude_stack = repo
-        .excludes(
-            state,
-            Some(overrides),
-            gix::worktree::stack::state::ignore::Source::WorktreeThenIdMappingIfNotSkipped,
-        )?
-        .detach();
+    // Under `-x` a `-e` match is the one thing that keeps a file, so the patterns enter
+    // the walk as *precious* (gitoxide's `$` marker): a directory holding a precious
+    // entry never collapses while walking for deletion, and one that holds nothing else
+    // is reported as ignored rather than as a deletion target.
+    let overrides = if cmdl_excludes_only {
+        parse.support_precious = true;
+        // A negated pattern takes protection *away* again, so it stays a plain negation:
+        // `$` and `!` cannot be combined, and a `!`-line is only ever consulted to undo
+        // an earlier match.
+        gix::ignore::Search::from_overrides(
+            excludes.iter().map(|p| {
+                if p.starts_with('!') {
+                    p.clone()
+                } else {
+                    format!("${p}")
+                }
+            }),
+            parse,
+        )
+    } else {
+        gix::ignore::Search::from_overrides(excludes.iter().cloned(), parse)
+    };
+    let source = gix::worktree::stack::state::ignore::Source::WorktreeThenIdMappingIfNotSkipped;
+    let mut exclude_stack = if cmdl_excludes_only {
+        // Command-line patterns only: empty globals stand in for the `info/exclude` and
+        // `core.excludesFile` git does not read under `-x`, and an empty per-directory
+        // name stops the stack from looking for `.gitignore` (the same lever
+        // `--no-exclude-per-directory` pulls in `ls-files`).
+        //
+        // The case sensitivity is the repository's own, as `Repository::excludes()`
+        // resolves it — `core.ignoreCase` as probed for this filesystem.
+        let case = if repo.filesystem_options()?.ignore_case {
+            gix::glob::pattern::Case::Fold
+        } else {
+            gix::glob::pattern::Case::Sensitive
+        };
+        let ignore = gix::worktree::stack::state::Ignore::new(
+            overrides,
+            Default::default(),
+            Some("".into()),
+            source,
+            parse,
+        );
+        let state_stack = gix::worktree::stack::State::IgnoreStack(ignore);
+        let id_mappings = state_stack.id_mappings_from_index(state, state.path_backing(), case);
+        gix::worktree::Stack::new(
+            repo.workdir().unwrap_or_else(|| repo.git_dir()),
+            state_stack,
+            case,
+            Vec::with_capacity(512),
+            id_mappings,
+        )
+    } else {
+        repo.excludes(state, Some(overrides), source)?.detach()
+    };
     let gix::PathspecDetached {
         mut search,
         mut stack,

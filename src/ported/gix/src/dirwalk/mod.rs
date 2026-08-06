@@ -82,6 +82,7 @@ pub struct Options {
     recurse_repositories: bool,
     emit_pruned: bool,
     emit_ignored: Option<EmissionMode>,
+    recurse_ignored_directories: bool,
     for_deletion: Option<ForDeletionMode>,
     emit_tracked: bool,
     emit_untracked: EmissionMode,

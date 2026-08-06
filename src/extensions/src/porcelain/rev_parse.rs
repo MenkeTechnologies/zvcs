@@ -128,8 +128,6 @@ const UNIMPLEMENTED_EXACT: &[&str] = &[
     "--flags",
     "--no-flags",
     "--local-env-vars",
-    "--show-object-format",
-    "--show-ref-format",
     "--output-object-format",
     "--resolve-git-dir",
     "--git-path",
@@ -233,6 +231,10 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
                     if o.echo_flags {
                         emit(&mut out, arg.as_bytes())?;
                     }
+                }
+                Opt::Fatal => {
+                    out.flush()?;
+                    return Ok(ExitCode::from(128));
                 }
             }
             continue;
@@ -502,6 +504,9 @@ enum Opt {
     Refs(RefSet),
     /// Not an option stock git knows; git echoes these.
     Unknown,
+    /// git `die()`d on the option's value: the message is already on stderr and the
+    /// scan stops with git's fatal exit code.
+    Fatal,
 }
 
 #[derive(Clone, Copy)]
@@ -510,6 +515,13 @@ enum Query {
     ShowToplevel,
     IsInsideWorkTree,
     IsBareRepository,
+    /// `--show-object-format[=(storage|input|output)]`: the hash algorithm's name.
+    /// All three modes read the same algorithm here — this port stores, reads and
+    /// writes one hash, so there is no compatibility algorithm to differ from.
+    ObjectFormat,
+    /// `--show-ref-format`: how refs are stored, which is always the loose-plus-
+    /// packed `files` backend; `reftable` is not implemented.
+    RefFormat,
 }
 
 fn option(o: &mut Opts, arg: &str) -> Result<Opt> {
@@ -540,10 +552,21 @@ fn option(o: &mut Opts, arg: &str) -> Result<Opt> {
         "--show-toplevel" => return Ok(Opt::Query(Query::ShowToplevel)),
         "--is-inside-work-tree" => return Ok(Opt::Query(Query::IsInsideWorkTree)),
         "--is-bare-repository" => return Ok(Opt::Query(Query::IsBareRepository)),
+        "--show-object-format" => return Ok(Opt::Query(Query::ObjectFormat)),
+        "--show-ref-format" => return Ok(Opt::Query(Query::RefFormat)),
         "--all" => return Ok(Opt::Refs(RefSet::All)),
         "--branches" => return Ok(Opt::Refs(RefSet::Branches)),
         "--tags" => return Ok(Opt::Refs(RefSet::Tags)),
         _ => {
+            // `--show-object-format=<mode>`: git names three, and rejects anything
+            // else before it looks at the repository.
+            if let Some(mode) = arg.strip_prefix("--show-object-format=") {
+                if !matches!(mode, "storage" | "input" | "output") {
+                    eprintln!("fatal: unknown mode for --show-object-format: {mode}");
+                    return Ok(Opt::Fatal);
+                }
+                return Ok(Opt::Query(Query::ObjectFormat));
+            }
             if let Some(n) = arg.strip_prefix("--short=") {
                 let n: usize = n
                     .parse()
@@ -598,6 +621,8 @@ fn query(out: &mut impl Write, repo: &gix::Repository, q: Query) -> Result<Optio
             emit(out, yes_no(repo.workdir().is_some() && !inside_git_dir))?;
         }
         Query::IsBareRepository => emit(out, yes_no(repo.is_bare()))?,
+        Query::ObjectFormat => emit(out, repo.object_hash().to_string().as_bytes())?,
+        Query::RefFormat => emit(out, b"files")?,
     }
     Ok(None)
 }

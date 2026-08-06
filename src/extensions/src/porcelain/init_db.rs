@@ -36,12 +36,11 @@ use std::process::ExitCode;
 ///     `info/exclude`, and a configured `sha256` / `reftable` format is rejected
 ///     rather than silently laid down in the other format.
 ///
-/// Two further inherited divergences, both on stderr and both belonging to
-/// `init` rather than to this synonym:
-///   * Stock git prints the `advice.defaultBranchName` hint block when
-///     `init.defaultBranch` is unset; this port prints no hint.
-///   * A rejected flag exits with the anyhow error path rather than git's
-///     usage dump and exit code 129.
+/// One inherited divergence, on stderr and belonging to `init` rather than to this
+/// synonym: stock git prints the `advice.defaultBranchName` hint block when
+/// `init.defaultBranch` is unset; this port prints no hint. The refusals themselves are
+/// git's — `-h` and an unknown option print the usage block and exit 129, an unknown
+/// hash or ref format is `fatal:` and exit 128.
 ///
 /// Unlike [`super::fsck_objects::fsck_objects`], no leading-subcommand strip is
 /// performed: `dispatch::run` takes the subcommand as a separate

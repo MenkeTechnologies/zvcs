@@ -1,0 +1,22 @@
+#!/bin/sh
+# A sample hook that decides whether a push may update any ref
+##############################################################
+# This hook runs once on the remote when a push arrives, before any ref is updated. Every
+# proposed update is fed to it on stdin as `<old-oid> <new-oid> <ref-name>` lines, and a
+# non-zero exit rejects the whole push. It's useful on the server side only.
+#
+# To enable this hook remove the `.sample` suffix from this file entirely.
+
+# Reject a push that would delete a branch, whatever else it carries.
+zero=$(git hash-object --stdin -t tree </dev/null)
+while read -r _old new ref; do
+    case "$ref" in
+    refs/heads/*)
+        if [ "$new" = "$zero" ] || [ "$new" = "0000000000000000000000000000000000000000" ]; then
+            echo "Refusing to delete $ref over the wire." >&2
+            exit 1
+        fi
+        ;;
+    esac
+done
+exit 0

@@ -48,7 +48,11 @@ const TPL_HOOKS_PRE_MERGE_COMMIT: &[u8] = include_bytes!("assets/init/hooks/pre-
 const TPL_HOOKS_PRE_PUSH: &[u8] = include_bytes!("assets/init/hooks/pre-push.sample");
 const TPL_HOOKS_PRE_REBASE: &[u8] = include_bytes!("assets/init/hooks/pre-rebase.sample");
 const TPL_HOOKS_PREPARE_COMMIT_MSG: &[u8] = include_bytes!("assets/init/hooks/prepare-commit-msg.sample");
-const TPL_HOOKS_DOCS_URL: &[u8] = include_bytes!("assets/init/hooks/docs.url");
+const TPL_HOOKS_PRE_RECEIVE: &[u8] = include_bytes!("assets/init/hooks/pre-receive.sample");
+const TPL_HOOKS_PUSH_TO_CHECKOUT: &[u8] = include_bytes!("assets/init/hooks/push-to-checkout.sample");
+const TPL_HOOKS_SENDEMAIL_VALIDATE: &[u8] =
+    include_bytes!("assets/init/hooks/sendemail-validate.sample");
+const TPL_HOOKS_UPDATE: &[u8] = include_bytes!("assets/init/hooks/update.sample");
 const TPL_DESCRIPTION: &[u8] = include_bytes!("assets/init/description");
 const TPL_HEAD: &[u8] = include_bytes!("assets/init/HEAD");
 
@@ -215,7 +219,6 @@ pub fn into(
     {
         let mut cursor = NewDir(&mut dot_git).at("hooks")?;
         for (tpl, filename) in &[
-            (TPL_HOOKS_DOCS_URL, "docs.url"),
             (TPL_HOOKS_PREPARE_COMMIT_MSG, "prepare-commit-msg.sample"),
             (TPL_HOOKS_PRE_REBASE, "pre-rebase.sample"),
             (TPL_HOOKS_PRE_PUSH, "pre-push.sample"),
@@ -226,6 +229,12 @@ pub fn into(
             (TPL_HOOKS_FSMONITOR_WATCHMAN, "fsmonitor-watchman.sample"),
             (TPL_HOOKS_COMMIT_MSG, "commit-msg.sample"),
             (TPL_HOOKS_APPLYPATCH_MSG, "applypatch-msg.sample"),
+            // git ships these four as well, and a repository is compared by what its
+            // `hooks/` directory holds — so the set has to match name for name.
+            (TPL_HOOKS_PRE_RECEIVE, "pre-receive.sample"),
+            (TPL_HOOKS_UPDATE, "update.sample"),
+            (TPL_HOOKS_PUSH_TO_CHECKOUT, "push-to-checkout.sample"),
+            (TPL_HOOKS_SENDEMAIL_VALIDATE, "sendemail-validate.sample"),
         ] {
             write_file(tpl, PathCursor(cursor.as_mut()).at(filename))?;
         }

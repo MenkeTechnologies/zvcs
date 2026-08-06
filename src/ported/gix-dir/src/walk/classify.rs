@@ -53,7 +53,8 @@ pub fn root(
             out.pathspec_match,
             options.for_deletion,
             worktree_root_is_repository,
-        ) {
+        ) && !super::function::recurses_into_ignored_directory(out, options)
+        {
             break;
         }
         last_length = Some(buf.len());

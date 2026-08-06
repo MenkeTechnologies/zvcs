@@ -241,10 +241,12 @@ pub(crate) fn update(
                     }
                     None => {
                         let name: gix_ref::FullName = name.try_into()?;
+                        // `update_local_ref()`: a new tag is "storing tag" and everything
+                        // else — a local branch, a remote-tracking branch, any other ref
+                        // a refspec names — is "storing head".
                         let reflog_msg = match name.category() {
                             Some(gix_ref::Category::Tag) => "storing tag",
-                            Some(gix_ref::Category::LocalBranch) => "storing head",
-                            _ => "storing ref",
+                            _ => "storing head",
                         };
                         (
                             Mode::New,

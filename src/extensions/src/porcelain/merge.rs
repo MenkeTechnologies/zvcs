@@ -78,6 +78,14 @@
 //!   since an edited message defaults to `COMMIT_MSG_CLEANUP_ALL`. A failing
 //!   editor or an empty message aborts with git's `Not committing merge; use
 //!   'git commit' to complete the merge.` and leaves the merge in progress.
+//! * `save_state()`: before a strategy runs, a dirty worktree is snapshotted into a
+//!   `git stash create` commit — dangling, and what `git fsck --dangling` reports after
+//!   a merge over local changes. It exists so `restore_state()` can rewind a strategy
+//!   that failed part-way; the strategies here compute the whole result before touching
+//!   the worktree, so nothing has to be rewound and the snapshot is only ever a record.
+//!   A strategy refused because the *index* does not match HEAD also logs the no-op
+//!   `<reflog action>: updating HEAD` git logs there (a refusal over unstaged changes
+//!   does not).
 //! * `--autostash`/`--no-autostash` and `merge.autoStash`: a dirty worktree is
 //!   snapshotted into a stash-like commit parked under the `MERGE_AUTOSTASH` ref
 //!   (`Created autostash: <id>`), the merge runs against the clean tree, and the
@@ -717,8 +725,10 @@ fn abort() -> Result<ExitCode> {
     let should_interrupt = AtomicBool::new(false);
     update_worktree(&repo, &old_index, None, head_tree, &should_interrupt)?;
 
-    // git's `reset_refs()` records the pre-reset HEAD in ORIG_HEAD.
+    // git's `reset_refs()` records the pre-reset HEAD in ORIG_HEAD, and the reset it
+    // performs (`--merge` to HEAD) logs on `HEAD` even though the branch does not move.
     set_orig_head(&repo, head_id)?;
+    super::checkout::record_head_move(&repo, Some(head_id), Some(head_id), "reset: moving to HEAD");
     remove_merge_state(repo.git_dir(), true);
 
     Ok(ExitCode::SUCCESS)
@@ -1026,10 +1036,12 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
     // daemon is running), matching the zsync/zbump write path.
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
 
-    // `--autostash`: snapshot and reset the dirty worktree before anything is
-    // touched, so the merge runs against a clean tree and the local changes come
-    // back at the end (or stay recoverable in MERGE_AUTOSTASH if it stops).
-    let stash = begin_autostash(&repo, opts)?;
+    // `--autostash`: snapshot and reset the dirty worktree so the merge runs against a
+    // clean tree and the local changes come back at the end (or stay recoverable in
+    // MERGE_AUTOSTASH if it stops). `cmd_merge` creates it per branch, not up front:
+    // the fast-forward path prints `Updating <a>..<b>` first, the strategy paths create
+    // it just before the strategy runs, and the up-to-date path never gets there at all.
+    let mut stash: Option<ObjectId> = None;
 
     let old_index = repo.index_or_load_from_head()?.into_owned();
     let head_tree = repo.find_object(local_id)?.peel_to_tree()?.id;
@@ -1040,16 +1052,26 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
     // (checked against git 2.50.1).
     set_orig_head(&repo, local_id)?;
 
+    // `save_state()`: git snapshots a dirty worktree into a `stash create` commit
+    // before running a strategy, so `restore_state()` can rewind to it if the strategy
+    // fails part-way. The snapshot is left dangling in the object database either way,
+    // which is what `git fsck --dangling` reports after a merge over dirty files.
+    // No `restore_state()` follows here: the strategy below computes the whole result
+    // before touching the worktree and reports `Merge with strategy ort failed.`
+    // without having moved anything, so there is nothing to rewind.
     // merge-ort's `merge_start()`: the index must match HEAD before any strategy
     // runs, whatever the change is and wherever it sits. A fast-forward never
     // reaches this — git happily fast-forwards over a staged change — so it is
     // gated on the same `runs_ort` that decides whether `-X` is parsed.
     if runs_ort {
+        stash = begin_autostash(&repo, opts)?;
+        let _snapshot = super::stash::create_snapshot(&repo)?;
         let staged = crate::merge_guard::index_changes_from_head(&repo, head_tree, &old_index)?;
         if !staged.is_empty() {
             crate::merge_guard::report_index_changes(&staged);
             eprintln!("Merge with strategy ort failed.");
             end_autostash(&repo, stash, false)?;
+            log_strategy_failure(&repo, local_id, &reflog_spec);
             return Ok(ExitCode::from(2));
         }
     }
@@ -1199,6 +1221,7 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
                 target_id.attach(&repo).shorten()?
             );
         }
+        stash = begin_autostash(&repo, opts)?;
         if let Some(code) = guard_checkout(&repo, head_tree, target_tree, &old_index, false)? {
             end_autostash(&repo, stash, false)?;
             return Ok(code);
@@ -1240,6 +1263,7 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
             target_id.attach(&repo).shorten()?
         );
     }
+    stash = begin_autostash(&repo, opts)?;
     if let Some(code) = guard_checkout(&repo, head_tree, target_tree, &old_index, false)? {
         end_autostash(&repo, stash, false)?;
         return Ok(code);
@@ -1495,6 +1519,11 @@ fn merge_ours(
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
     let stash = begin_autostash(repo, opts)?;
 
+    // `save_state()` runs for every strategy `cmd_merge` dispatches, `ours` included:
+    // the dirty worktree is snapshotted into a dangling `stash create` commit before
+    // the strategy is given a chance to fail.
+    let _snapshot = super::stash::create_snapshot(repo)?;
+
     let head_tree = repo.find_object(local_id)?.peel_to_tree()?.id;
     let old_index = repo.index_or_load_from_head()?.into_owned();
     set_orig_head(repo, local_id)?;
@@ -1506,6 +1535,7 @@ fn merge_ours(
     if !crate::merge_guard::index_changes_from_head(repo, head_tree, &old_index)?.is_empty() {
         eprintln!("Merge with strategy ours failed.");
         end_autostash(repo, stash, false)?;
+        log_strategy_failure(repo, local_id, &refs.join(" "));
         return Ok(ExitCode::from(2));
     }
 
@@ -1555,6 +1585,10 @@ fn do_octopus(
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
     let stash = begin_autostash(repo, opts)?;
 
+    // `save_state()`: the octopus is a strategy like any other, so a dirty worktree is
+    // snapshotted into a dangling `stash create` commit before it runs.
+    let _snapshot = super::stash::create_snapshot(repo)?;
+
     let mut cur_index = repo.index_or_load_from_head()?.into_owned();
     let mut mrt = repo.find_object(local_id)?.peel_to_tree()?.id; // merge result tree
     set_orig_head(repo, local_id)?;
@@ -1587,6 +1621,7 @@ fn do_octopus(
         }
         eprintln!("Merge with strategy octopus failed.");
         end_autostash(repo, stash, false)?;
+        log_strategy_failure(repo, local_id, &refs.join(" "));
         return Ok(ExitCode::from(2));
     }
     // `MRC` (git's merge-result-commit list): the parents of the eventual commit.
@@ -2466,10 +2501,26 @@ fn end_autostash(repo: &gix::Repository, stash: Option<ObjectId>, applied: bool)
         })?;
         eprintln!("Applied autostash.");
     } else {
-        // git keeps the stash reachable so the user can retry the apply.
-        eprintln!("Applying autostash resulted in conflicts.");
-        eprintln!("Your changes are safe in the stash.");
-        eprintln!("You can run \"git stash pop\" or \"git stash drop\" at any time.");
+        // `apply_save_autostash_oid()`: a re-apply that conflicted stores the snapshot as
+        // a real stash entry, which is what makes the advice below true, and drops
+        // MERGE_AUTOSTASH now that `refs/stash` holds it.
+        crate::porcelain::stash::store_commit(repo, id, "autostash")?;
+        repo.edit_reference(RefEdit {
+            change: Change::Delete {
+                expected: PreviousValue::Any,
+                log: RefLog::AndReference,
+            },
+            name: MERGE_AUTOSTASH
+                .try_into()
+                .map_err(|e| anyhow::anyhow!("invalid ref name {MERGE_AUTOSTASH}: {e}"))?,
+            deref: false,
+        })?;
+        // `apply_autostash()`'s wording for a re-apply that could not be completed.
+        eprintln!("Your local changes are stashed, however applying them");
+        eprintln!("resulted in conflicts.  You can either resolve the conflicts");
+        eprintln!("and then discard the stash with \"git stash drop\", or, if you");
+        eprintln!("do not want to resolve them now, run \"git reset --hard\" and");
+        eprintln!("apply the local changes later by running \"git stash pop\".");
     }
     Ok(())
 }
@@ -2763,6 +2814,16 @@ pub(crate) fn index_tree(repo: &gix::Repository, index: &gix::index::File) -> Re
 /// merge leaves `merge origin/main: Fast-forward`, and how `git rebase`'s
 /// integration steps keep their own action. Reading it here is the half of that
 /// mechanism the merge side owes; `pull` has always set it.
+/// The no-op HEAD update git records (`<reflog action>: updating HEAD`) when a strategy
+/// refuses because the *index* does not match HEAD. Measured against stock 2.55.0 for
+/// `ort`, `ours` and `octopus`: the staged-change refusal logs it, while the refusal
+/// over unstaged worktree changes ("Your local changes … would be overwritten") does
+/// not, so this is tied to the index guards alone.
+fn log_strategy_failure(repo: &gix::Repository, head: ObjectId, spec: &str) {
+    let msg = format!("{}: updating HEAD", reflog_action(spec));
+    super::checkout::record_head_move(repo, Some(head), Some(head), &msg);
+}
+
 fn reflog_action(spec: &str) -> String {
     std::env::var("GIT_REFLOG_ACTION").unwrap_or_else(|_| format!("merge {spec}"))
 }

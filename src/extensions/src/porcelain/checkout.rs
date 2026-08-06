@@ -53,8 +53,20 @@
 //!   * Pathspecs match literal files and directory prefixes (and `.`); general
 //!     glob magic is left to the shell.
 //!   * `--ours`/`--theirs` write a conflicted path's stage-2/stage-3 blob into
-//!     the worktree (index left conflicted), `-t`/`--track` create-and-track,
-//!     `--orphan` starts an unborn branch — all matching stock git.
+//!     the worktree (index left conflicted), `--orphan` starts an unborn branch —
+//!     all matching stock git.
+//!   * Tracking follows `setup_tracking()`: `-t`/`--track` and `--no-track` decide
+//!     outright, and otherwise `branch.autoSetupMerge` does — its default (`true`)
+//!     configures the upstream whenever the start point is a remote-tracking branch,
+//!     which is what `checkout -b feature origin/feature` relies on. `always` adds
+//!     local start points, `simple` narrows it to a same-named remote branch, and
+//!     `inherit`'s upstream-copying is not reproduced (it behaves as the default).
+//!   * A switch ends with `report_tracking()`'s ahead/behind summary, the same block
+//!     `status` prints; a branch created by `-b` reports only the upstream it just
+//!     configured, as git does.
+//!   * A bare `--` introduces no pathspec, so `checkout -B main origin/main --` is a
+//!     branch reset rather than a path restore; a path after the separator is still
+//!     `Cannot update paths and switch to branch` (exit 128).
 //!   * `-m`/`--merge` is accepted: with a clean worktree it is byte-identical to
 //!     a plain switch, and the dirty case is governed by the same conservative
 //!     clean-check as every other switch here.
@@ -111,7 +123,9 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
     let mut quiet = false;
     // `-f`/`--force` → git's `opts->discard_changes`.
     let mut force = false;
-    let mut track = false;
+    // `-t`/`--track` vs `--no-track`; `None` leaves the decision to
+    // `branch.autoSetupMerge`, which is how `checkout -b x origin/x` gets its upstream.
+    let mut track: Option<bool> = None;
     let mut orphan: Option<String> = None;
     // Which conflict stage `--ours`/`--theirs` writes out (2 = ours, 3 = theirs);
     // the last of the two flags wins, exactly like git's `opts.writeout_stage`.
@@ -188,7 +202,7 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
         // silently behaving like `direct`. An unknown value is git's 129.
         if let Some(val) = a.strip_prefix("--track=") {
             match val {
-                "direct" => track = true,
+                "direct" => track = Some(true),
                 "inherit" => bail!(
                     "--track=inherit is not supported (upstream-inheritance tracking not implemented)"
                 ),
@@ -243,8 +257,8 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
             // are thrown away rather than carried or refused.
             "-f" | "--force" => force = true,
             "--no-force" => force = false,
-            "-t" | "--track" => track = true,
-            "--no-track" => {} // accepted; auto-tracking is off unless -t is given
+            "-t" | "--track" => track = Some(true),
+            "--no-track" => track = Some(false),
             "--ours" | "-2" => writeout_stage = Some(2),
             "--theirs" | "-3" => writeout_stage = Some(3),
             // `-m` only changes behavior when local changes must be carried across
@@ -375,8 +389,14 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
     }
 
     if let Some((name, reset)) = new_branch {
-        if has_dashdash || !post.is_empty() {
-            bail!("cannot combine branch creation (-b/-B) with path restore");
+        // A bare `--` introduces no pathspec at all — `git checkout -B main origin/main --`
+        // is a plain branch creation, which is how the JetBrains client spells it. Only a
+        // path *after* the separator (or before it, without one) is a path restore.
+        if !post.is_empty() {
+            eprintln!(
+                "fatal: Cannot update paths and switch to branch '{name}' at the same time."
+            );
+            return Ok(ExitCode::from(128));
         }
         if pre.len() > 1 {
             bail!("too many start-points given for branch creation");
@@ -421,7 +441,7 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
 
     // `-t <remote>/<branch>` with no `-b`: DWIM the local branch name from the
     // remote-tracking start-point, then create-and-track.
-    if track {
+    if track == Some(true) {
         if pre.len() != 1 {
             eprintln!("fatal: missing branch name; try -b");
             return Ok(ExitCode::from(128));
@@ -433,7 +453,7 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
                     eprintln!("fatal: missing branch name; try -b");
                     return Ok(ExitCode::from(128));
                 };
-                return create_and_switch(&repo, &name, false, pre[0], quiet, true, true);
+                return create_and_switch(&repo, &name, false, pre[0], quiet, Some(true), true);
             }
             None => {
                 eprintln!("fatal: missing branch name; try -b");
@@ -496,7 +516,7 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
             .flatten()
             .is_some();
         if is_branch && !detach {
-            let code = switch_to_branch(&repo, spec, quiet, force)?;
+            let code = switch_to_branch(&repo, spec, quiet, force, None)?;
             maybe_recurse_submodules(&repo, recurse_submodules, quiet)?;
             return Ok(code);
         }
@@ -527,7 +547,7 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
                 match unique_remote_branch(&repo, spec)? {
                     Dwim::One(remote_short) => {
                         let code =
-                            create_and_switch(&repo, spec, false, &remote_short, quiet, true, true)?;
+                            create_and_switch(&repo, spec, false, &remote_short, quiet, Some(true), true)?;
                         maybe_recurse_submodules(&repo, recurse_submodules, quiet)?;
                         return Ok(code);
                     }
@@ -657,6 +677,10 @@ pub(crate) fn switch_to_branch(
     spec: &str,
     quiet: bool,
     force: bool,
+    // The reflog line to write instead of `checkout: moving from <a> to <b>`. git's
+    // rebase passes `<reflog action>: checkout <branch>` here, which is what its
+    // `options.switch_to` checkout records.
+    reflog_message: Option<&str>,
 ) -> Result<ExitCode> {
     // Already on it → the branch `HEAD` points at does not change, but git still
     // goes through `refs_update_symref("HEAD", ...)`, so the move is reflogged
@@ -680,7 +704,7 @@ pub(crate) fn switch_to_branch(
             set_head_symbolic(
                 repo,
                 branch_full,
-                &format!("checkout: moving from {spec} to {spec}"),
+                reflog_message.unwrap_or(&format!("checkout: moving from {spec} to {spec}")),
                 head_id,
                 head_id,
             )?;
@@ -721,7 +745,7 @@ pub(crate) fn switch_to_branch(
     set_head_symbolic(
         repo,
         branch_full,
-        &format!("checkout: moving from {old_label} to {spec}"),
+        reflog_message.unwrap_or(&format!("checkout: moving from {old_label} to {spec}")),
         old_id,
         Some(commit.id),
     )?;
@@ -736,6 +760,9 @@ pub(crate) fn switch_to_branch(
             }
         }
         eprintln!("Switched to branch '{spec}'");
+        // `report_tracking()`: the ahead/behind summary for a branch with an upstream,
+        // the same block `status` prints under its header.
+        print_tracking_status(repo);
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -830,7 +857,7 @@ fn create_and_switch(
     reset: bool,
     start: &str,
     quiet: bool,
-    track: bool,
+    track: Option<bool>,
     merge_worktree: bool,
 ) -> Result<ExitCode> {
     let full = format!("refs/heads/{name}");
@@ -839,9 +866,11 @@ fn create_and_switch(
     }
 
     // `-t`: resolve the upstream before any mutation, so a bad start-point fails
-    // exactly like git — branch untouched, HEAD unmoved.
-    let track_info = if track {
-        match resolve_tracking(repo, start)? {
+    // exactly like git — branch untouched, HEAD unmoved. Without an explicit flag
+    // `setup_tracking()` consults `branch.autoSetupMerge`, whose default (`true`) sets
+    // the upstream whenever the start point is a remote-tracking branch.
+    let track_info = match track {
+        Some(true) => match resolve_tracking(repo, start)? {
             Some(info) => Some(info),
             None => {
                 eprintln!(
@@ -849,9 +878,9 @@ fn create_and_switch(
                 );
                 return Ok(ExitCode::from(128));
             }
-        }
-    } else {
-        None
+        },
+        Some(false) => None,
+        None => auto_tracking(repo, name, start)?,
     };
 
     let commit = repo.rev_parse_single(start)?.object()?.peel_to_commit()?;
@@ -948,6 +977,11 @@ fn create_and_switch(
         if let Some(info) = &track_info {
             println!("branch '{name}' set up to track '{}'.", info.display);
         }
+        // `report_tracking()` follows for a branch that already existed; a brand-new
+        // one has nothing to report beyond the upstream just configured.
+        if existed {
+            print_tracking_status(repo);
+        }
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -1027,7 +1061,13 @@ fn restore_conflict_stage(
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
 
     let index = repo.open_index()?;
-    let matched = match_paths(&index, paths)?;
+    let matched = match match_paths(&index, paths) {
+        Ok(m) => m,
+        Err(spec) => {
+            eprintln!("error: pathspec '{spec}' did not match any file(s) known to git");
+            return Ok(ExitCode::from(1));
+        }
+    };
     let mset: HashSet<BString> = matched.iter().cloned().collect();
 
     // Which stages each matched path carries (index 0..=3).
@@ -1115,10 +1155,15 @@ struct TrackInfo {
 /// neither a local branch nor a remote-tracking branch of a configured remote —
 /// the caller turns that into git's "is not a branch" / "missing branch name".
 fn resolve_tracking(repo: &gix::Repository, start: &str) -> Result<Option<TrackInfo>> {
-    if repo
-        .try_find_reference(format!("refs/heads/{start}").as_str())?
-        .is_some()
-    {
+    // A start point is often a revision expression rather than a branch name
+    // (`git checkout -b topic HEAD~2`, or a raw object name — which is how the
+    // JetBrains client spells "branch from this commit"). `refs/heads/HEAD~2` is
+    // not a well-formed refname, so the lookup fails to *parse* rather than
+    // failing to find; either way it names no branch, and nothing is tracked.
+    let branch_ref = |suffix: &str| -> Option<gix::Reference<'_>> {
+        repo.try_find_reference(suffix).ok().flatten()
+    };
+    if branch_ref(format!("refs/heads/{start}").as_str()).is_some() {
         return Ok(Some(TrackInfo {
             remote: ".".into(),
             merge: format!("refs/heads/{start}"),
@@ -1126,10 +1171,7 @@ fn resolve_tracking(repo: &gix::Repository, start: &str) -> Result<Option<TrackI
             dwim_name: None,
         }));
     }
-    if repo
-        .try_find_reference(format!("refs/remotes/{start}").as_str())?
-        .is_some()
-    {
+    if branch_ref(format!("refs/remotes/{start}").as_str()).is_some() {
         // Remote names carry no '/', so the first component is the remote.
         if let Some((remote, rest)) = start.split_once('/') {
             if !rest.is_empty()
@@ -1152,7 +1194,16 @@ fn resolve_tracking(repo: &gix::Repository, start: &str) -> Result<Option<TrackI
 
 /// Persist `branch.<name>.remote` / `branch.<name>.merge` into the repo-local
 /// config. The caller already holds the reentrant `RepoLock`.
-fn write_tracking_config(repo: &gix::Repository, name: &str, info: &TrackInfo) -> Result<()> {
+fn write_tracking_config(repo: &gix::Repository, name: &str, info: &TrackInfo) -> Result<bool> {
+    // Whether this changes anything: `install_branch_config()` announces the upstream it
+    // *set*, so re-stating the same one (a `-B` onto a branch that already tracks it)
+    // says nothing and leaves the ordinary tracking status to speak instead.
+    let unchanged = {
+        let snap = repo.config_snapshot();
+        snap.string(&format!("branch.{name}.remote")).map(|v| v.to_string()) == Some(info.remote.clone())
+            && snap.string(&format!("branch.{name}.merge")).map(|v| v.to_string())
+                == Some(info.merge.clone())
+    };
     let path = repo.common_dir().join("config");
     let mut file =
         gix::config::File::from_path_no_includes(path.clone(), gix::config::Source::Local)?;
@@ -1162,7 +1213,7 @@ fn write_tracking_config(repo: &gix::Repository, name: &str, info: &TrackInfo) -
     let tmp = path.with_extension("zvcs-tmp");
     std::fs::write(&tmp, &bytes)?;
     std::fs::rename(&tmp, &path)?;
-    Ok(())
+    Ok(!unchanged)
 }
 
 // --- DWIM (`--guess`) ------------------------------------------------------
@@ -1299,7 +1350,13 @@ fn restore_from_index(
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
 
     let mut index = repo.open_index()?;
-    let matched = match_paths(&index, paths)?;
+    let matched = match match_paths(&index, paths) {
+        Ok(m) => m,
+        Err(spec) => {
+            eprintln!("error: pathspec '{spec}' did not match any file(s) known to git");
+            return Ok(ExitCode::from(1));
+        }
+    };
 
     let mut subset = repo.open_index()?;
     keep_only(&mut subset, &matched);
@@ -1346,11 +1403,39 @@ fn restore_from_tree(
 
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
 
-    let src = repo.index_from_tree(&tree_id)?;
+    let mut src = repo.index_from_tree(&tree_id)?;
+    // `PS_IGNORE_SKIP_WORKTREE`: a path the sparse-checkout definition keeps out of
+    // the worktree is not something a pathspec can match, so naming one is git's
+    // "did not match any file(s) known to git" rather than a checkout of a file the
+    // definition says should not be there.
+    let sparse: HashSet<BString> = {
+        let index = repo.open_index()?;
+        let backing = index.path_backing();
+        index
+            .entries()
+            .iter()
+            .filter(|e| e.flags.contains(gix::index::entry::Flags::SKIP_WORKTREE))
+            .map(|e| e.path_in(backing).to_owned())
+            .collect()
+    };
+    if !sparse.is_empty() {
+        src.remove_entries(|_, path, _| sparse.contains(&path.to_owned()));
+    }
 
     // Paths to write from the tree, and (no-overlay only) paths to delete.
     let (matched, to_remove) = if overlay {
-        (match_paths(&src, paths)?, Vec::new())
+        (
+            match match_paths(&src, paths) {
+                Ok(m) => m,
+                Err(spec) => {
+                    eprintln!(
+                        "error: pathspec '{spec}' did not match any file(s) known to git"
+                    );
+                    return Ok(ExitCode::from(1));
+                }
+            },
+            Vec::new(),
+        )
     } else {
         let (tree_matched, tree_hit) = matches_in(&src, paths);
         let cur = repo.open_index()?;
@@ -1753,6 +1838,28 @@ pub(super) fn record_head_move(
     to: Option<ObjectId>,
     message: &str,
 ) {
+    write_head_log(repo, from, to, message, true);
+}
+
+/// [`record_head_move`] without the replace-the-identical-tail rule, for the callers
+/// that legitimately log the same message twice — a branch rename mirrors both the
+/// removal and the creation of the branch `HEAD` points at.
+pub(super) fn append_head_log(
+    repo: &gix::Repository,
+    from: Option<ObjectId>,
+    to: Option<ObjectId>,
+    message: &str,
+) {
+    write_head_log(repo, from, to, message, false);
+}
+
+fn write_head_log(
+    repo: &gix::Repository,
+    from: Option<ObjectId>,
+    to: Option<ObjectId>,
+    message: &str,
+    dedup: bool,
+) {
     // `log_all_ref_updates` is on by default for a repository with a worktree,
     // and git creates `logs/HEAD` on the first update there.
     let path = repo.git_dir().join("logs").join("HEAD");
@@ -1783,10 +1890,11 @@ pub(super) fn record_head_move(
     );
 
     let mut body = std::fs::read_to_string(&path).unwrap_or_default();
-    let tail_is_ours = body
-        .lines()
-        .next_back()
-        .is_some_and(|last| last.ends_with(&format!("\t{message}")));
+    let tail_is_ours = dedup
+        && body
+            .lines()
+            .next_back()
+            .is_some_and(|last| last.ends_with(&format!("\t{message}")));
     if tail_is_ours {
         let cut = body.trim_end_matches('\n').rfind('\n').map_or(0, |i| i + 1);
         body.truncate(cut);
@@ -1848,15 +1956,18 @@ fn describe(repo: &gix::Repository, id: ObjectId) -> Result<(String, String)> {
 
 /// Collect the index entries (by path) matching every pathspec in `specs`.
 /// Each spec must match at least one entry, else git's "did not match" error.
-fn match_paths(index: &gix::index::File, specs: &[&str]) -> Result<Vec<BString>> {
+/// The matched paths, or `Err(spec)` naming the first pathspec that matched nothing —
+/// git reports that on stderr as `error: …` and exits 1, so it is not an error value
+/// the dispatcher would re-prefix.
+fn match_paths<'a>(
+    index: &gix::index::File,
+    specs: &[&'a str],
+) -> std::result::Result<Vec<BString>, &'a str> {
     let (matched, hit) = matches_in(index, specs);
-    if let Some(si) = hit.iter().position(|h| !h) {
-        bail!(
-            "pathspec '{}' did not match any file(s) known to git",
-            specs[si]
-        );
+    match hit.iter().position(|h| !h) {
+        Some(si) => Err(specs[si]),
+        None => Ok(matched),
     }
-    Ok(matched)
 }
 
 /// The entries of `index` matching any pathspec, plus a per-spec "did it match
@@ -1911,4 +2022,47 @@ fn stats_by_path(index: &gix::index::File) -> HashMap<BString, (ObjectId, Mode, 
         .iter()
         .map(|e| (e.path_in(backing).to_owned(), (e.id, e.mode, e.stat)))
         .collect()
+}
+
+/// `setup_tracking()` with no explicit `--track`/`--no-track`: `branch.autoSetupMerge`
+/// decides, and its default (`true`) means "track a remote-tracking start point".
+///
+/// * `false` — never.
+/// * `true` (default) — when the start point is a remote-tracking branch.
+/// * `always` — that, plus a local branch start point.
+/// * `simple` — only a remote-tracking branch whose name matches the new branch's.
+/// * `inherit` — copy the start branch's own upstream.
+fn auto_tracking(repo: &gix::Repository, name: &str, start: &str) -> Result<Option<TrackInfo>> {
+    let mode = repo
+        .config_snapshot()
+        .string("branch.autoSetupMerge")
+        .map(|v| v.to_str_lossy().to_ascii_lowercase())
+        .unwrap_or_else(|| "true".into());
+    if matches!(mode.as_str(), "false" | "no" | "off" | "0") {
+        return Ok(None);
+    }
+    let Some(info) = resolve_tracking(repo, start)? else {
+        return Ok(None);
+    };
+    // `remote == "."` is a local start point, which only `always` tracks.
+    let is_remote = info.remote != ".";
+    let keep = match mode.as_str() {
+        "always" => true,
+        "simple" => is_remote && info.dwim_name.as_deref() == Some(name),
+        // `inherit` is about copying the *start branch's* upstream rather than pointing
+        // at the start branch itself; that is not reproduced, so it behaves as the
+        // default rather than guessing at a different upstream.
+        _ => is_remote,
+    };
+    Ok(keep.then_some(info))
+}
+
+/// `report_tracking()`: the ahead/behind summary for the branch `HEAD` now points at,
+/// printed after the switch line. Nothing at all when the branch has no upstream.
+///
+/// The text comes from the same renderer `status` uses, which appends the blank line
+/// that separates it from the file lists there; a switch has nothing to separate from.
+pub(crate) fn print_tracking_status(repo: &gix::Repository) {
+    let block = super::status::tracking_block(repo);
+    print!("{}", block.strip_suffix('\n').unwrap_or(&block));
 }

@@ -473,6 +473,9 @@ fn switch_existing(
     attach_head(repo, &full_name, &from_desc, branch)?;
     if !quiet {
         eprintln!("Switched to branch '{branch}'");
+        // `report_tracking()`, which `cmd_switch` reaches through the same
+        // `update_refs_for_switch()` `checkout` does.
+        super::checkout::print_tracking_status(repo);
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -569,7 +572,9 @@ fn switch_create(
             log: LogChange {
                 mode: RefLog::AndReference,
                 force_create_reflog: false,
-                message: format!("branch: Created from {from_desc}").into(),
+                // `create_branch()` logs the start-point as the caller spelled it, and
+                // `HEAD` when none was given — not the branch `HEAD` happens to be on.
+                message: format!("branch: Created from {}", start.unwrap_or("HEAD")).into(),
             },
             expected: if existed {
                 PreviousValue::Any
@@ -666,11 +671,15 @@ fn switch_detach(
         }
     }
 
-    let to_desc = target_id.attach(repo).shorten_or_id().to_string();
+    // git logs the name the caller typed, not the id it resolved to — `switch
+    // --detach HEAD~1` records `to HEAD~1`, and a bare `--detach` (which detaches
+    // where `HEAD` already is) records `to HEAD`.
+    let to_desc = positionals.first().copied().unwrap_or("HEAD").to_string();
     set_head_detached(
         repo,
         target_id,
         &format!("checkout: moving from {from_desc} to {to_desc}"),
+        old_id,
     )?;
 
     if !quiet {
@@ -1049,24 +1058,32 @@ fn move_worktree(
     Ok(None)
 }
 
-/// Point `HEAD` symbolically at `branch_ref`, requesting a `checkout: moving
-/// from <from> to <to>` reflog entry.
+/// Point `HEAD` symbolically at `branch_ref`, logging the `checkout: moving from
+/// <from> to <to>` entry git writes.
 ///
-/// Known gap: the vendored `gix-ref` drops the reflog entry for a symbolic-target
-/// update (see `gix-ref/src/store/file/transaction/commit.rs`), so no
-/// `.git/logs/HEAD` line is written here even though git writes one.
+/// The vendored `gix-ref` drops the reflog entry for a symbolic-target update
+/// (see `gix-ref/src/store/file/transaction/commit.rs`), so the line is written
+/// afterwards by [`super::checkout::record_head_move`] — the same repair
+/// `git checkout` makes.
 fn attach_head(
     repo: &gix::Repository,
     branch_ref: &FullName,
     from_desc: &str,
     to_short: &str,
 ) -> Result<()> {
+    let from = repo.head().ok().and_then(|mut h| {
+        h.try_peel_to_id()
+            .ok()
+            .flatten()
+            .map(|id| id.detach())
+    });
+    let message = format!("checkout: moving from {from_desc} to {to_short}");
     repo.edit_reference(RefEdit {
         change: Change::Update {
             log: LogChange {
                 mode: RefLog::AndReference,
                 force_create_reflog: false,
-                message: format!("checkout: moving from {from_desc} to {to_short}").into(),
+                message: message.clone().into(),
             },
             expected: PreviousValue::Any,
             new: Target::Symbolic(branch_ref.clone()),
@@ -1076,11 +1093,26 @@ fn attach_head(
             .map_err(|e| anyhow!("invalid ref name HEAD: {e}"))?,
         deref: false,
     })?;
+    let to = repo
+        .find_reference(branch_ref.as_ref())
+        .ok()
+        .and_then(|mut r| r.peel_to_id_in_place().ok().map(|id| id.detach()));
+    super::checkout::record_head_move(repo, from, to, &message);
     Ok(())
 }
 
 /// Point `HEAD` directly at object `id` (detached).
-fn set_head_detached(repo: &gix::Repository, id: ObjectId, message: &str) -> Result<()> {
+/// Detach `HEAD` at `id`, logging the move.
+///
+/// `from` is what `HEAD` resolved to beforehand: the vendored `gix-ref` leaves the
+/// old field of a `deref: false` update null when the previous value was a symref,
+/// so the line is repaired afterwards by [`super::checkout::record_head_move`].
+fn set_head_detached(
+    repo: &gix::Repository,
+    id: ObjectId,
+    message: &str,
+    from: Option<ObjectId>,
+) -> Result<()> {
     repo.edit_reference(RefEdit {
         change: Change::Update {
             log: LogChange {
@@ -1096,6 +1128,7 @@ fn set_head_detached(repo: &gix::Repository, id: ObjectId, message: &str) -> Res
             .map_err(|e| anyhow!("invalid ref name HEAD: {e}"))?,
         deref: false,
     })?;
+    super::checkout::record_head_move(repo, from, Some(id), message);
     Ok(())
 }
 

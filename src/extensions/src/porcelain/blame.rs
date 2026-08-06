@@ -2743,6 +2743,30 @@ impl Options {
                 "--no-incremental" => incremental = false,
                 "--no-show-stats" | "--no-score-debug" => {}
                 _ if a.starts_with("-L") => line_specs.push(a[2..].to_string()),
+                // `--encoding=<enc>` (`OPT_STRING(0, "encoding", ...)`): the encoding the
+                // author names and summaries are written in. Everything here is already
+                // UTF-8, so `utf-8` and `none` are what the output is either way; any
+                // other encoding would need a transcoding step that is not ported, and
+                // silently emitting UTF-8 under a Latin-1 request would be wrong.
+                "--encoding" => {
+                    let v = args.get(i + 1).cloned().unwrap_or_default();
+                    i += 1;
+                    if !encoding_is_passthrough(&v) {
+                        bail!(
+                            "unsupported option: --encoding={v} (only utf-8 and none are \
+                             ported; transcoding author names is not)"
+                        );
+                    }
+                }
+                _ if a.starts_with("--encoding=") => {
+                    let v = &a["--encoding=".len()..];
+                    if !encoding_is_passthrough(v) {
+                        bail!(
+                            "unsupported option: {a} (only utf-8 and none are ported; \
+                             transcoding author names is not)"
+                        );
+                    }
+                }
                 _ if a.starts_with("--abbrev=") => {
                     let v = &a["--abbrev=".len()..];
                     abbrev = Some(v.parse().map_err(|_| anyhow!("invalid --abbrev value: {v}"))?);
@@ -3302,4 +3326,16 @@ mod tests {
             "-L parameter 'nowhere' starting at line 1: no match"
         );
     }
+}
+
+/// Whether `--encoding=<enc>` asks for the bytes this port already produces: UTF-8 in
+/// any of its spellings, or `none` (git's "do not convert"). git also falls back to
+/// passing the bytes through when the platform's iconv does not know the name, but that
+/// is a silent fallback rather than a promise, so only these are accepted here.
+///
+/// Shared with the history commands, which take the same option for commit messages —
+/// every IDE passes `--encoding=UTF-8` to `log` and `blame` alike.
+pub(crate) fn encoding_is_passthrough(enc: &str) -> bool {
+    let lower = enc.trim().to_ascii_lowercase();
+    matches!(lower.as_str(), "utf-8" | "utf8" | "none" | "")
 }

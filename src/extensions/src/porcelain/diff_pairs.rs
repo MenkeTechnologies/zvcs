@@ -5071,7 +5071,7 @@ fn render_summary(out: &mut Vec<u8>, p: &Pair) {
             let score = p.score();
             if score != 0 {
                 out.extend_from_slice(b" rewrite ");
-                out.extend_from_slice(&p.new_path);
+                out.extend_from_slice(&diff_files::quoted_name(&p.new_path));
                 out.extend_from_slice(format!(" ({score}%)\n").as_bytes());
             }
             summary_mode_change(out, p, score == 0);
@@ -5086,7 +5086,7 @@ fn summary_mode_name(out: &mut Vec<u8>, verb: &str, mode: u32, path: &BString) {
     } else {
         out.extend_from_slice(format!(" {verb} ").as_bytes());
     }
-    out.extend_from_slice(path);
+    out.extend_from_slice(&diff_files::quoted_name(path));
     out.push(b'\n');
 }
 
@@ -5109,7 +5109,7 @@ fn summary_mode_change(out: &mut Vec<u8>, p: &Pair, show_name: bool) {
         );
         if show_name {
             out.push(b' ');
-            out.extend_from_slice(&p.new_path);
+            out.extend_from_slice(&diff_files::quoted_name(&p.new_path));
         }
         out.push(b'\n');
     }
@@ -5117,7 +5117,15 @@ fn summary_mode_change(out: &mut Vec<u8>, p: &Pair, show_name: bool) {
 
 /// `pprint_rename()`: compress the common leading directory and trailing suffix of a
 /// rename/copy into `pfx{old-mid => new-mid}sfx`.
-fn pprint_rename(a: &[u8], b: &[u8]) -> Vec<u8> {
+pub(crate) fn pprint_rename(a: &[u8], b: &[u8]) -> Vec<u8> {
+    // A path that needs C-quoting skips the factoring entirely — git cannot splice
+    // braces into a quoted string, so it prints `"old" => "new"` whole.
+    if diff_files::needs_c_quote(a) || diff_files::needs_c_quote(b) {
+        let mut out = diff_files::quoted_name_bytes(a);
+        out.extend_from_slice(b" => ");
+        out.extend_from_slice(&diff_files::quoted_name_bytes(b));
+        return out;
+    }
     let (la, lb) = (a.len(), b.len());
     let at = |s: &[u8], i: usize| -> u8 {
         if i < s.len() {

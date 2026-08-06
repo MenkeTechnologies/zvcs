@@ -1173,6 +1173,9 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
     };
     // `options.switch_to`: the branch to check out once the tree is known clean.
     let mut switch_to: Option<String> = None;
+    // The subset of `switch_to` that actually moves `HEAD`: a `<branch>` that is not
+    // the current one has to be checked out before the replay can work off it.
+    let mut eager_switch: Option<String> = None;
     let branch_name = match branch_arg {
         Some(requested) => {
             let is_branch = repo
@@ -1184,6 +1187,12 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
                 die!("no such branch/commit '{requested}'");
             }
             let current = branch.as_ref().map(|b| b.shorten().to_string());
+            // `options.switch_to = argv[0]` (builtin/rebase.c:1698) is set for any
+            // `<branch>` argument, the current one included: when the rebase turns out
+            // to be a no-op, `checkout_up_to_date()` still records the checkout.
+            if is_branch && current.as_deref() == Some(requested.as_str()) {
+                switch_to = Some(requested.clone());
+            }
             if current.as_deref() != Some(requested.as_str()) {
                 if !is_branch {
                     // git only switches to a *branch*; a bare commit-ish is
@@ -1198,6 +1207,7 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
                     .ok_or_else(|| anyhow!("no such branch/commit '{requested}'"))?;
                 branch = Some(FullName::try_from(format!("refs/heads/{requested}"))?);
                 switch_to = Some(requested.clone());
+                eager_switch = Some(requested.clone());
             }
             requested.clone()
         }
@@ -1293,8 +1303,14 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
     // `cmd_rebase()`: with the tree known clean, check out the `<branch>` that is
     // about to be rebased. git does this silently — the rebase's own messages are
     // the only ones printed.
-    if let Some(requested) = &switch_to {
-        super::checkout::switch_to_branch(&repo, requested, true, false)?;
+    if let Some(requested) = &eager_switch {
+        super::checkout::switch_to_branch(
+            &repo,
+            requested,
+            true,
+            false,
+            Some(&format!("{}: checkout {requested}", reflog_action())),
+        )?;
     }
 
     // --- can_fast_forward() ------------------------------------------------
@@ -1309,6 +1325,35 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
     };
     if allow_preemptive_ff && can_ff {
         if flags & FORCE == 0 {
+            // `checkout_up_to_date()` (builtin/rebase.c:855): the lazy switch to the
+            // branch that needs no rebasing. Its `reset_head()` carries `ropts.branch`,
+            // so the line lands in the branch's reflog as well as `HEAD`'s — even when
+            // the branch is the one already checked out and nothing moves. A switch to
+            // a *different* branch already happened above and is not repeated.
+            if let Some(requested) = switch_to.as_ref().filter(|_| eager_switch.is_none()) {
+                let message = format!("{}: checkout {requested}", reflog_action());
+                if let Some(name) = &branch {
+                    repo.edit_reference(RefEdit {
+                        change: Change::Update {
+                            log: LogChange {
+                                mode: RefLog::AndReference,
+                                force_create_reflog: false,
+                                message: message.clone().into(),
+                            },
+                            expected: PreviousValue::Any,
+                            new: Target::Object(head_oid),
+                        },
+                        name: name.clone(),
+                        deref: false,
+                    })?;
+                }
+                super::checkout::record_head_move(
+                    &repo,
+                    Some(head_oid),
+                    Some(head_oid),
+                    &message,
+                );
+            }
             if flags & NO_QUIET != 0 {
                 if branch_name == "HEAD" {
                     println!("HEAD is up to date.");
@@ -2369,11 +2414,11 @@ fn sequencer_rebase(start: SequencerStart<'_>) -> Result<ExitCode> {
 
     // `checkout_onto()`: ORIG_HEAD, then detach `HEAD` at the base and move the
     // worktree onto its tree.
-    let onto_label = if base == start.state.onto {
-        start.onto_spec.to_string()
-    } else {
-        base.to_string()
-    };
+    //
+    // The reflog names `<onto>` as the caller spelled it (sequencer.c:4875 passes
+    // `onto_name`, not the id), even when `skip_unnecessary_picks()` has advanced the
+    // base past it — the entry describes the rebase, not the commit it landed on.
+    let onto_label = start.onto_spec.to_string();
     write_orig_head(repo, start.state.orig_head)?;
     set_head(
         repo,
@@ -3631,6 +3676,21 @@ fn reflog_action() -> String {
 }
 
 fn set_head(repo: &gix::Repository, target: Target, message: &str) -> Result<()> {
+    // What `HEAD` resolved to before the move, and after it: the vendored `gix-ref`
+    // writes a null old field for a `deref: false` update whose previous value was a
+    // symref, and drops the entry entirely when the new target is symbolic. Both are
+    // repaired by `record_head_move()`, the same way `git checkout` repairs them.
+    let from = repo
+        .head()
+        .ok()
+        .and_then(|mut h| h.try_peel_to_id().ok().flatten().map(|id| id.detach()));
+    let to = match &target {
+        Target::Object(id) => Some(*id),
+        Target::Symbolic(name) => repo
+            .find_reference(name.as_ref())
+            .ok()
+            .and_then(|mut r| r.peel_to_id_in_place().ok().map(|id| id.detach())),
+    };
     repo.edit_reference(RefEdit {
         change: Change::Update {
             log: LogChange {
@@ -3644,6 +3704,7 @@ fn set_head(repo: &gix::Repository, target: Target, message: &str) -> Result<()>
         name: full_name("HEAD")?,
         deref: false,
     })?;
+    super::checkout::record_head_move(repo, from, to, message);
     Ok(())
 }
 

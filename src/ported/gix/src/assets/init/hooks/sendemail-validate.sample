@@ -1,0 +1,17 @@
+#!/bin/sh
+# A sample hook that checks each patch `git send-email` is about to send
+########################################################################
+# This hook is called once per patch file, with the file as its only argument, before
+# `git send-email` hands anything to the transport. A non-zero exit stops the send.
+#
+# To enable this hook remove the `.sample` suffix from this file entirely.
+
+patch="$1"
+
+# Refuse a patch whose subject line is still the placeholder `format-patch` writes for an
+# empty commit message.
+if grep -q '^Subject: \[PATCH\] \*\*\* SUBJECT HERE \*\*\*' "$patch"; then
+    echo "$patch still carries the placeholder subject." >&2
+    exit 1
+fi
+exit 0

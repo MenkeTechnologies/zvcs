@@ -31,6 +31,7 @@ pub fn options_emit_all() -> walk::Options<'static> {
         classify_untracked_bare_repositories: false,
         emit_pruned: true,
         emit_ignored: Some(walk::EmissionMode::Matching),
+        recurse_ignored_directories: false,
         emit_tracked: true,
         emit_untracked: walk::EmissionMode::Matching,
         emit_empty_directories: true,

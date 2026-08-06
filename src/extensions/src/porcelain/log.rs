@@ -9,7 +9,7 @@ use gix::hash::ObjectId;
 use gix::object::tree::diff::ChangeDetached;
 use gix::objs::tree::EntryKind;
 
-use super::filespec::{content_of, count_changed_lines, is_binary};
+use super::filespec::{content_of, count_changed_lines_ws, is_binary};
 use super::line_log;
 
 /// The terminal width git assumes for `--stat` when stdout is not a terminal.
@@ -150,10 +150,15 @@ pub(crate) fn parse_decoration_style(value: &str) -> Option<DecorateStyle> {
 ///   * `--color[=<when>]` / `--no-color`         → enable/disable the `%C` and
 ///     `%C(auto)`-gated decoration colors (`always`/`never`/`auto`; auto colors when
 ///     stdout is a terminal or a pager is in use)
-///   * `--name-only`, `--name-status`, `--stat`,
-///     `--numstat`, `--shortstat`                → per-commit diff against the first parent
-///     (`--name-only`/`--name-status` are mutually exclusive and suppress the count
-///     formats); `-s`/`--no-patch` accepted as no-ops
+///   * `--name-only`, `--name-status`, `--raw`, `--stat`,
+///     `--numstat`, `--shortstat`, `--summary`     → per-commit diff against the first parent.
+///     `diff_setup_done()`'s precedence applies: `--name-only`/`--name-status` are mutually
+///     exclusive and clear every other format, `--raw` clears nothing (so `--raw --stat -p`
+///     prints all three, in git's order), and `--stat --shortstat` prints both summary
+///     lines. `-s`/`--no-patch` clears them all
+///   * `-z`                                      → `line_termination = 0`: the raw/name
+///     records and the per-commit record use NUL separators and the paths go out
+///     unquoted
 ///   * `-q`/`--quiet` / `--no-quiet`               → git's position-independent
 ///     NO_OUTPUT: with no diff requested it changes nothing (`git log` shows no diff
 ///     by default), and any explicit `-p`/`--stat` still wins, so its only visible
@@ -191,17 +196,17 @@ pub(crate) fn parse_decoration_style(value: &str) -> Option<DecorateStyle> {
 ///     rejected against a pathspec and against the count formats exactly as git
 ///     rejects them.
 ///
-/// ### Rename detection in the per-commit diff — a measured gap
+/// ### Rename detection in the per-commit diff
 ///
-/// `git log`'s own diffs run `diffcore_rename` (porcelain defaults `diff.renames`
-/// on), so a commit that renamed a file shows `R<score> <old> <new>` in
-/// `--name-status`, `<old> => <new>` in `--stat`, and a `rename from`/`rename to`
-/// patch header. The per-commit diff here does not run that pass, so such a commit
-/// renders as a delete plus an add instead. Measured against stock git 2.50.1 on a
-/// `git mv`-created commit; it is the same for `log -p`, `--name-status` and
-/// `--stat`, with or without `--follow`. `git diff` is unaffected — it has the
-/// pass, and `--follow`'s *commit list* is unaffected too, because that is decided
-/// by the rename search below rather than by the diff.
+/// The per-commit diff runs `diffcore_rename` — the same port `git diff` uses, so the
+/// pairing and the similarity indices agree — because `init_diff_ui_defaults()` turns
+/// it on for every porcelain. A commit that renamed a file shows `R<score> <old>
+/// <new>` in `--name-status`, `<old> => <new>` (compacted to `dir/{a => b}` where the
+/// paths share a prefix) in `--stat`/`--numstat`, and a `similarity index` plus
+/// `rename from`/`rename to` patch header. `diff.renames=false` turns it off.
+///
+/// `--follow`'s own rename search runs on the *raw* change list, before that pass, so
+/// the commit list it produces is unaffected by it.
 ///
 /// `--follow` itself is ported: `try_to_follow_renames()`'s rewrite of the
 /// pathspec, one commit at a time along the first parent, so the log walks back
@@ -217,7 +222,9 @@ pub(crate) fn parse_decoration_style(value: &str) -> Option<DecorateStyle> {
 /// Deviations, surfaced rather than faked:
 ///   * `--graph` renders commits with at most two parents. An octopus merge is
 ///     rejected instead of being drawn wrong.
-///   * Rename detection is off, so a rename shows as a delete plus an add.
+///   * `--abbrev[=<n>]`/`--no-abbrev` set the width of every abbreviated id, applied as a
+///     `core.abbrev` override. `--no-abbrev` is git's zero: the raw columns and `%h` print
+///     the whole id while the patch `index` line stays at the configured default.
 ///   * `--stat` assumes an 80-column terminal (`COLUMNS` is not consulted) and measures
 ///     paths in `char`s; the `--stat-width`/`--stat=<w>`, `--stat-name-width`,
 ///     `--stat-graph-width`, and `--stat-count` flags and the
@@ -231,8 +238,32 @@ pub(crate) fn parse_decoration_style(value: &str) -> Option<DecorateStyle> {
 ///     `--full-history`/`--simplify-merges` are not implemented.
 ///   * Revision ranges are supported: `A..B` (`^A B`), `A...B` (symmetric
 ///     difference, excluding the merge-base), and a leading `^A` exclusion.
-///   * `--grep`/`--author` filters and every flag not listed above are rejected.
+///   * `-M`/`-C`/`-B` and their long spellings drive `diffcore_rename`'s rename, copy and
+///     break-rewrite passes, and reach every format (`--raw`, `--name-status`, `--stat`,
+///     `--summary`, the patch).
+///   * `%aN`/`%aE`/`%cN`/`%cE` resolve through `.mailmap` whether or not `--use-mailmap`
+///     is in effect, and `--author`/`--committer` grep the mailmapped headers while it is.
+///   * Every flag not listed above is rejected.
+/// Which builtin is being run. `cmd_whatchanged()` is `cmd_log()` with two settings
+/// changed: the raw format is the default when nothing else is asked for, and
+/// `always_show_header` stays off, so a commit whose diff queue came out empty
+/// prints nothing at all — and does not spend a `--max-count` slot.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Flavor {
+    Log,
+    WhatChanged,
+}
+
+/// `git whatchanged`: `cmd_log()` under [`Flavor::WhatChanged`].
+pub(crate) fn whatchanged(args: &[String]) -> Result<ExitCode> {
+    log_flavored(args, Flavor::WhatChanged)
+}
+
 pub fn log(args: &[String]) -> Result<ExitCode> {
+    log_flavored(args, Flavor::Log)
+}
+
+fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // Repeated object reads (one per rendered commit) re-inflate from the pack
     // without a cache; gix ships one and simply does not enable it by default.
     // A few MB turns `log` on a deep history from thousands of decompressions
@@ -315,6 +346,10 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
     let mut skip: usize = 0;
     let mut pretty = Pretty::Medium;
     let mut terminator = false;
+    // `-z`: `line_termination = 0` — the raw/name records use NUL field and record
+    // separators and stop C-quoting, and the per-commit record terminator/separator
+    // becomes NUL too.
+    let mut z = false;
     // `--abbrev[=<n>]`, applied as a `core.abbrev` override so every abbreviation
     // in the run — `%h`, oneline ids, diff index lines — reads the same length.
     let mut abbrev_len: Option<usize> = None;
@@ -326,9 +361,13 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
     let mut abbrev_commit = cfg_abbrev_commit;
     let mut name_only = false;
     let mut name_status = false;
+    // `--raw`: the `:<old mode> <new mode> <old sha> <new sha> <status>\t<path>` listing.
+    let mut raw = false;
     let mut stat = false;
     let mut numstat = false;
     let mut shortstat = false;
+    // `--summary`: the creation/deletion/rename/mode-change lines.
+    let mut summary = false;
     let mut patch = false;
     // `-q`/`--quiet`: git pre-sets DIFF_FORMAT_NO_OUTPUT before the other diff-format
     // flags parse, so it is position-independent. On `git log` (which shows no diff by
@@ -357,6 +396,22 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
     // built-in header formats through `.mailmap`. Seeded from `log.mailmap`.
     let mut use_mailmap = cfg_mailmap;
     let mut all = false;
+    // `--branches`/`--tags`/`--remotes`, each optionally `=<glob>`: like `--all`
+    // restricted to one namespace, and unlike it they do not add `HEAD`. Kept in
+    // command-line order because that is the order the tips are appended in.
+    /// Each entry is `(revisions read so far, namespace prefix, glob)`. The count is
+    /// where the option stood on the command line, which is where its tips belong.
+    let mut ref_globs: Vec<(usize, &'static str, Option<String>)> = Vec::new();
+    /// Where `--all` stood, for the same reason.
+    let mut all_at: Option<usize> = None;
+    // `--not`: reverses the sense of every revision that follows, and toggles
+    // again at the next `--not` (`handle_revision_pseudo_opt()`). It applies to
+    // the arguments after it, so the flip is recorded per revision as it is read.
+    let mut negate_revs = false;
+    // `--no-walk[=(sorted|unsorted)]` / `--do-walk`: show the named commits
+    // themselves and traverse no further. `sorted` (the default) orders them by
+    // commit date, newest first; `unsorted` keeps the order they were named in.
+    let mut no_walk: Option<NoWalk> = None;
     let mut reverse = false;
     let mut only_merges = false;
     let mut no_merges = false;
@@ -375,6 +430,9 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
     let mut color = ColorWhen::Auto;
     let mut order = Order::Default;
     let mut revs: Vec<String> = Vec::new();
+    /// Parallel to `revs`: whether a `--not` was in force when it was read, which
+    /// reverses the sense the `^` prefix would otherwise give it.
+    let mut rev_negated: Vec<bool> = Vec::new();
     let mut pathspecs: Vec<String> = Vec::new();
     // History filtering (`--grep`/`--author`/`--committer` + dialect flags),
     // matched through the shared `revfilter` so log and shortlog agree.
@@ -393,6 +451,9 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
     // changed line matches). Both diff each commit against its first parent.
     let mut pickaxe_s: Option<String> = None;
     let mut pickaxe_g: Option<String> = None;
+    // The diff options the per-commit patch is rendered with; `-U3` and no whitespace
+    // folding until a flag says otherwise.
+    let mut patch_opts = super::diff::PatchOpts::default();
     // `--diff-merges=<mode>`: what a *merge* commit's patch shows. git's default is
     // `off`, which is why `git log -p` prints no diff for a merge at all.
     let mut diff_merges = DiffMerges::Off;
@@ -603,16 +664,15 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
         } else if a == "--abbrev" {
             abbrev_len = Some(DEFAULT_ABBREV);
         } else if a == "--no-abbrev" {
+            // `--no-abbrev` zeroes `revs->abbrev`, which every id-printing format
+            // reads as "the whole thing" — except the `index` line, which falls back
+            // to the configured default (pinned below, before `core.abbrev` moves).
             abbrev_len = Some(repo.object_hash().len_in_hex());
+            patch_opts.index_abbrev =
+                Some(crate::abbrev::configured_abbrev(&repo, repo.object_hash().len_in_hex()));
         } else if let Some(v) = a.strip_prefix("--abbrev=") {
-            let full = repo.object_hash().len_in_hex();
-            match v.parse::<usize>() {
-                Ok(n) => abbrev_len = Some(n.clamp(MINIMUM_ABBREV, full)),
-                Err(_) => {
-                    eprintln!("fatal: option `abbrev' expects a numerical value");
-                    return Ok(ExitCode::from(128));
-                }
-            }
+            abbrev_len =
+                Some(crate::abbrev::parse_abbrev_arg(v, repo.object_hash().len_in_hex()));
         } else if a == "-p" || a == "--patch" || a == "-u" {
             // `-u` is git's documented synonym for `-p`.
             patch = true;
@@ -644,6 +704,8 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
             stat = false;
             numstat = false;
             shortstat = false;
+            summary = false;
+            raw = false;
             name_only = false;
             name_status = false;
             patch = false;
@@ -651,6 +713,10 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
             name_only = true;
         } else if a == "--name-status" {
             name_status = true;
+        } else if a == "--summary" {
+            summary = true;
+        } else if a == "--raw" {
+            raw = true;
         } else if a == "--stat" {
             stat = true;
         } else if let Some(v) = a.strip_prefix("--stat=") {
@@ -683,6 +749,44 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
             graph = true;
         } else if a == "--all" {
             all = true;
+            all_at.get_or_insert(revs.len());
+        // The namespace-restricted forms of `--all`. `=<glob>` matches against the
+        // *shortened* name (`--branches=fea*` sees `feature`), and a glob with no
+        // wildcard still matches a whole path component, as `refs.c` does.
+        } else if a == "--branches" {
+            ref_globs.push((revs.len(), "refs/heads/", None));
+        } else if let Some(v) = a.strip_prefix("--branches=") {
+            ref_globs.push((revs.len(), "refs/heads/", Some(v.to_string())));
+        } else if a == "--tags" {
+            ref_globs.push((revs.len(), "refs/tags/", None));
+        } else if let Some(v) = a.strip_prefix("--tags=") {
+            ref_globs.push((revs.len(), "refs/tags/", Some(v.to_string())));
+        } else if a == "--remotes" {
+            ref_globs.push((revs.len(), "refs/remotes/", None));
+        } else if let Some(v) = a.strip_prefix("--remotes=") {
+            ref_globs.push((revs.len(), "refs/remotes/", Some(v.to_string())));
+        // Options `git log` does not have, and whose owners are elsewhere:
+        // `--timestamp` belongs to `rev-list`, `--no-stat` to `merge`/`pull`. git's
+        // `setup_revisions()` leaves them unconsumed and `cmd_log_walk()` dies on the
+        // first one, so this is git's own refusal rather than an unported feature.
+        } else if a == "--timestamp" || a == "--no-stat" {
+            eprintln!("fatal: unrecognized argument: {a}");
+            return Ok(ExitCode::from(128));
+        } else if a == "--not" {
+            negate_revs = !negate_revs;
+        } else if a == "--no-walk" {
+            no_walk = Some(NoWalk::Sorted);
+        } else if let Some(v) = a.strip_prefix("--no-walk=") {
+            match v {
+                "sorted" => no_walk = Some(NoWalk::Sorted),
+                "unsorted" => no_walk = Some(NoWalk::Unsorted),
+                _ => {
+                    eprintln!("fatal: invalid argument to --no-walk");
+                    return Ok(ExitCode::from(128));
+                }
+            }
+        } else if a == "--do-walk" {
+            no_walk = None;
         } else if a == "--reverse" {
             reverse = true;
         } else if a == "--merges" {
@@ -782,6 +886,126 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
             }
         } else if let Some(v) = a.strip_prefix("-G") {
             pickaxe_g = Some(v.to_string());
+        // The patch-shaping options `setup_revisions()` takes from `diff_opt_parse()`.
+        } else if a == "--no-renames" {
+            patch_opts.renames = Some(0);
+        } else if a == "--renames" || a == "-M" || a == "--find-renames" {
+            patch_opts.renames = Some(super::diffcore_rename::DETECT_RENAME);
+        } else if let Some(v) = a
+            .strip_prefix("-M")
+            .filter(|v| !v.is_empty())
+            .or_else(|| a.strip_prefix("--find-renames="))
+        {
+            let (score, rest) = super::diffcore_rename::parse_rename_score(v);
+            if !rest.is_empty() {
+                eprintln!("fatal: invalid argument to -M: {v}");
+                return Ok(ExitCode::from(128));
+            }
+            patch_opts.renames = Some(super::diffcore_rename::DETECT_RENAME);
+            patch_opts.rename_score = score;
+        // `diff_opt_find_copies()`: a second `-C` is `--find-copies-harder`.
+        } else if a == "-C" || a == "--find-copies" {
+            patch_opts.rename_score = 0;
+            if patch_opts.renames == Some(super::diffcore_rename::DETECT_COPY) {
+                patch_opts.find_copies_harder = true;
+            } else {
+                patch_opts.renames = Some(super::diffcore_rename::DETECT_COPY);
+            }
+        } else if let Some(v) = a
+            .strip_prefix("-C")
+            .filter(|v| !v.is_empty())
+            .or_else(|| a.strip_prefix("--find-copies="))
+        {
+            let (score, rest) = super::diffcore_rename::parse_rename_score(v);
+            if !rest.is_empty() {
+                eprintln!("fatal: invalid argument to -C: {v}");
+                return Ok(ExitCode::from(128));
+            }
+            patch_opts.rename_score = score;
+            if patch_opts.renames == Some(super::diffcore_rename::DETECT_COPY) {
+                patch_opts.find_copies_harder = true;
+            } else {
+                patch_opts.renames = Some(super::diffcore_rename::DETECT_COPY);
+            }
+        } else if a == "--find-copies-harder" {
+            patch_opts.find_copies_harder = true;
+        } else if a == "--no-find-copies-harder" {
+            patch_opts.find_copies_harder = false;
+        // `diff_opt_break_rewrites()`: `-B[<n>][/<m>]`, packed as `n | (m << 16)`.
+        } else if a == "-B" || a == "--break-rewrites" {
+            patch_opts.break_opt = 0;
+        } else if let Some(v) = a
+            .strip_prefix("-B")
+            .filter(|v| !v.is_empty())
+            .or_else(|| a.strip_prefix("--break-rewrites="))
+        {
+            match super::diffcore_rename::parse_break_opt(v) {
+                Ok(n) => patch_opts.break_opt = n,
+                Err(()) => {
+                    eprintln!("fatal: invalid argument to -B: {v}");
+                    return Ok(ExitCode::from(128));
+                }
+            }
+        } else if a == "--encoding" {
+            // `--encoding=<enc>`: the encoding commit messages are re-coded into. This
+            // port writes them as stored, which is what `utf-8` and `none` ask for.
+            i += 1;
+            let v = args.get(i).cloned().unwrap_or_default();
+            if !super::blame::encoding_is_passthrough(&v) {
+                bail!(
+                    "unsupported flag \"--encoding={v}\" (only utf-8 and none are ported; \
+                     re-coding commit messages is not)"
+                );
+            }
+        } else if let Some(v) = a.strip_prefix("--encoding=") {
+            if !super::blame::encoding_is_passthrough(v) {
+                bail!(
+                    "unsupported flag \"{a}\" (only utf-8 and none are ported; re-coding \
+                     commit messages is not)"
+                );
+            }
+        } else if a == "-z" {
+            z = true;
+        } else if a == "-w" || a == "--ignore-all-space" {
+            patch_opts.ws = super::diff::Whitespace::IgnoreAll;
+        } else if a == "-b" || a == "--ignore-space-change" {
+            patch_opts.ws = super::diff::Whitespace::IgnoreChange;
+        } else if a == "--ignore-space-at-eol" {
+            patch_opts.ws = super::diff::Whitespace::IgnoreAtEol;
+        } else if a == "--full-index" {
+            patch_opts.full_index = true;
+        } else if a == "-a" || a == "--text" {
+            patch_opts.text = true;
+        } else if a == "-W" || a == "--function-context" {
+            patch_opts.func_context = true;
+        } else if a == "--no-function-context" {
+            patch_opts.func_context = false;
+        } else if a == "--no-prefix" {
+            patch_opts.src_prefix.clear();
+            patch_opts.dst_prefix.clear();
+        } else if a == "--default-prefix" {
+            patch_opts.src_prefix = b"a/".to_vec();
+            patch_opts.dst_prefix = b"b/".to_vec();
+        } else if let Some(v) = a.strip_prefix("--src-prefix=") {
+            patch_opts.src_prefix = v.as_bytes().to_vec();
+        } else if let Some(v) = a.strip_prefix("--dst-prefix=") {
+            patch_opts.dst_prefix = v.as_bytes().to_vec();
+        } else if let Some(v) = a.strip_prefix("-U").filter(|v| !v.is_empty()) {
+            match v.parse::<u32>() {
+                Ok(n) => patch_opts.ctx = n,
+                Err(_) => {
+                    eprintln!("fatal: invalid argument to -U: {v}");
+                    return Ok(ExitCode::from(128));
+                }
+            }
+        } else if let Some(v) = a.strip_prefix("--unified=") {
+            match v.parse::<u32>() {
+                Ok(n) => patch_opts.ctx = n,
+                Err(_) => {
+                    eprintln!("fatal: invalid argument to --unified: {v}");
+                    return Ok(ExitCode::from(128));
+                }
+            }
         } else if let Some(body) = a.strip_prefix('-') {
             if let Some(num) = body.strip_prefix('n') {
                 // `-nN` shorthand (e.g. `-n5`).
@@ -808,6 +1032,7 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
             // A non-flag token before `--` is a revision; git accepts several and
             // walks the union of their histories.
             revs.push(a.clone());
+            rev_negated.push(negate_revs);
         }
         i += 1;
     }
@@ -865,23 +1090,33 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
     // support git's range forms: `A..B` (= `^A B`), `A...B` (symmetric difference —
     // exclude the merge-base), and a leading `^A`. An empty endpoint means `HEAD`
     // (`A..`, `..B`). Anything without `..`/`^` is a single positive tip, as before.
-    let mut pos_specs: Vec<String> = Vec::new();
+    // Each positive spec carries the index of the revision argument it came from, so
+    // the ref-naming pseudo-options can be slotted back in at the position they were
+    // written at: `setup_revisions()` appends to one `pending` list as it reads the
+    // command line, and a tie in commit date is broken by that order.
+    let mut pos_specs: Vec<(usize, String)> = Vec::new();
     let mut neg_ids: Vec<ObjectId> = Vec::new();
-    for spec in &revs {
-        if let Some(rest) = spec.strip_prefix('^') {
-            match resolve_rev(&repo, rest) {
-                Ok(id) => neg_ids.push(id),
-                Err(_) => {
-                    let hex_len = repo.object_hash().len_in_hex();
-                    eprint!("{}", bad_revision_message(rest, hex_len));
-                    return Ok(ExitCode::from(128));
-                }
+    // Resolve one endpoint onto the excluded side, reporting git's fatal if it is
+    // not a revision. Ranges and `^`-prefixed arguments both land here.
+    let mut resolve_neg = |spec: &str, neg_ids: &mut Vec<ObjectId>| -> Option<ExitCode> {
+        match resolve_rev(&repo, spec) {
+            Ok(id) => {
+                neg_ids.push(id);
+                None
             }
-        } else if let Some((a, b)) = spec.split_once("...") {
+            Err(_) => {
+                let hex_len = repo.object_hash().len_in_hex();
+                eprint!("{}", bad_revision_message(spec, hex_len));
+                Some(ExitCode::from(128))
+            }
+        }
+    };
+    for (at, (spec, negated)) in revs.iter().zip(rev_negated.iter().copied()).enumerate() {
+        if let Some((a, b)) = spec.split_once("...") {
             let a = if a.is_empty() { "HEAD" } else { a };
             let b = if b.is_empty() { "HEAD" } else { b };
-            pos_specs.push(a.to_string());
-            pos_specs.push(b.to_string());
+            pos_specs.push((at, a.to_string()));
+            pos_specs.push((at, b.to_string()));
             // `A...B` hides what both endpoints can reach: their merge-base.
             if let (Ok(ia), Ok(ib)) = (resolve_rev(&repo, a), resolve_rev(&repo, b)) {
                 if let Ok(base) = repo.merge_base(ia, ib) {
@@ -891,17 +1126,24 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
         } else if let Some((a, b)) = spec.split_once("..") {
             let a = if a.is_empty() { "HEAD" } else { a };
             let b = if b.is_empty() { "HEAD" } else { b };
-            match resolve_rev(&repo, a) {
-                Ok(id) => neg_ids.push(id),
-                Err(_) => {
-                    let hex_len = repo.object_hash().len_in_hex();
-                    eprint!("{}", bad_revision_message(a, hex_len));
-                    return Ok(ExitCode::from(128));
-                }
+            // `A..B` is `^A B`; under `--not` each endpoint takes the other side.
+            let (kept, excluded) = if negated { (a, b) } else { (b, a) };
+            if let Some(code) = resolve_neg(excluded, &mut neg_ids) {
+                return Ok(code);
             }
-            pos_specs.push(b.to_string());
+            pos_specs.push((at, kept.to_string()));
         } else {
-            pos_specs.push(spec.clone());
+            // A plain revision is a tip and `^rev` excludes one; `--not` reverses
+            // both readings, which is all `handle_revision_arg()` does with its
+            // `UNINTERESTING` flip.
+            let bare = spec.strip_prefix('^').unwrap_or(spec);
+            if spec.starts_with('^') != negated {
+                if let Some(code) = resolve_neg(bare, &mut neg_ids) {
+                    return Ok(code);
+                }
+            } else {
+                pos_specs.push((at, bare.to_string()));
+            }
         }
     }
     // git resolves each positional token as a revision; the first that is *not* a
@@ -909,49 +1151,41 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
     // every one after it become pathspecs, exactly as if a `--` had preceded them
     // (so `git log .` == `git log -- .`). A token that is neither a revision nor a
     // path is the "ambiguous argument" fatal.
-    let mut in_paths = false;
-    for spec in &pos_specs {
-        if in_paths {
-            pathspecs.push(spec.clone());
-            continue;
-        }
-        match repo.rev_parse_single(spec.as_str()) {
-            Ok(id) => {
-                tips.push(peel_to_commit(&repo, id.detach()));
-                tip_names.push(spec.clone());
-                if source_mode {
-                    tip_sources.push(spec.clone());
-                }
-            }
-            Err(_) if spec_is_path(&repo, spec) => {
-                in_paths = true;
-                pathspecs.push(spec.clone());
-            }
-            Err(_) => {
-                let hex_len = repo.object_hash().len_in_hex();
-                eprint!("{}", bad_revision_message(spec, hex_len));
-                return Ok(ExitCode::from(128));
-            }
-        }
-    }
-    // Whether the args named any *positive* revision tip. When they didn't — no revs,
-    // only `^exclude`s, or every token turned out to be a pathspec (`git log .`) —
-    // git defaults the positive side to `HEAD`, just as for a bare `git log`.
-    let positive_from_args = !tips.is_empty();
-    if all {
-        // Materialise the names first: the iterator holds the packed-refs buffer,
-        // which would block the per-ref object lookups below.
+    // Every ref, sorted by full name: git walks `refs/` in that order, which decides
+    // the tie-break between tips that share a commit date. Materialised once, and only
+    // when a ref-naming option asked for it — the iterator holds the packed-refs
+    // buffer, which would block the per-ref object lookups.
+    let ref_names: Vec<String> = if all || !ref_globs.is_empty() {
         let mut names: Vec<Vec<u8>> = Vec::new();
         for r in repo.references()?.all()? {
             let r = r.map_err(|e| anyhow!("{e}"))?;
             names.push(r.name().as_bstr().to_vec());
         }
-        // git walks `refs/` in sorted full-name order, which decides the tie-break
-        // between tips that share a commit date.
         names.sort();
-        for name in names {
-            let Ok(full) = name.to_str() else { continue };
-            let Ok(reference) = repo.find_reference(full) else {
+        names.iter().filter_map(|n| n.to_str().ok().map(str::to_owned)).collect()
+    } else {
+        Vec::new()
+    };
+    // Append the tips of the ref-naming pseudo-options that stood at argument index
+    // `at`: `--all`, or the namespaces `--branches`/`--tags`/`--remotes` selected.
+    let mut push_ref_tips = |at: usize,
+                             tips: &mut Vec<ObjectId>,
+                             tip_names: &mut Vec<String>,
+                             tip_sources: &mut Vec<String>| {
+        let selects_all = all_at == Some(at);
+        let globs: Vec<_> = ref_globs.iter().filter(|(a, _, _)| *a == at).collect();
+        if !selects_all && globs.is_empty() {
+            return;
+        }
+        for full in &ref_names {
+            if !selects_all
+                && !globs
+                    .iter()
+                    .any(|(_, prefix, glob)| ref_in_namespace(full, prefix, glob.as_deref()))
+            {
+                continue;
+            }
+            let Ok(reference) = repo.find_reference(full.as_str()) else {
                 continue;
             };
             let Ok(id) = reference.into_fully_peeled_id() else {
@@ -962,14 +1196,56 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
             if let Ok(obj) = repo.find_object(oid) {
                 if obj.kind == gix::objs::Kind::Commit {
                     tips.push(oid);
-                    tip_names.push(full.to_string());
+                    tip_names.push(full.clone());
                     if source_mode {
-                        tip_sources.push(full.to_string());
+                        tip_sources.push(full.clone());
                     }
                 }
             }
         }
+    };
+
+    // git resolves each positional token as a revision; the first that is *not* a
+    // revision but names an existing path switches to pathspec mode — that token and
+    // every one after it become pathspecs, exactly as if a `--` had preceded them
+    // (so `git log .` == `git log -- .`). A token that is neither a revision nor a
+    // path is the "ambiguous argument" fatal.
+    let mut in_paths = false;
+    let mut specs = pos_specs.iter().peekable();
+    for at in 0..=revs.len() {
+        push_ref_tips(at, &mut tips, &mut tip_names, &mut tip_sources);
+        while let Some((_, spec)) = specs.next_if(|(i, _)| *i == at) {
+            if in_paths {
+                pathspecs.push(spec.clone());
+                continue;
+            }
+            match repo.rev_parse_single(spec.as_str()) {
+                Ok(id) => {
+                    tips.push(peel_to_commit(&repo, id.detach()));
+                    tip_names.push(spec.clone());
+                    if source_mode {
+                        tip_sources.push(spec.clone());
+                    }
+                }
+                Err(_) if spec_is_path(&repo, spec) => {
+                    in_paths = true;
+                    pathspecs.push(spec.clone());
+                }
+                Err(_) => {
+                    let hex_len = repo.object_hash().len_in_hex();
+                    eprint!("{}", bad_revision_message(spec, hex_len));
+                    return Ok(ExitCode::from(128));
+                }
+            }
+        }
     }
+    // git's `rev_input_given`: `setup_revisions()` falls back to `HEAD` only when the
+    // command line named no revision at all. An argument that named one and excluded
+    // it (`^rev`, `--not rev`) still counts, so `git log ^feature` walks nothing
+    // rather than quietly walking `HEAD`. So does a namespace option that selected
+    // nothing: `--remotes` in a repository with no remotes is still an input.
+    // A token that turned out to be a pathspec is not — `git log .` walks `HEAD`.
+    let positive_from_args = !tips.is_empty() || !neg_ids.is_empty() || !ref_globs.is_empty();
     if !positive_from_args || all {
         let head = repo.head()?;
         if head.is_unborn() && !all {
@@ -1019,9 +1295,11 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
         && !reverse
         && !graph
         && order == Order::Default;
-    let budget = (unfiltered && max_count.is_some())
+    // A suppressed `whatchanged` record does not consume its `--max-count`, so the
+    // walk cannot stop at `skip + max_count` commits there.
+    let budget = (unfiltered && max_count.is_some() && flavor == Flavor::Log)
         .then(|| skip.saturating_add(max_count.unwrap_or(0)));
-    let mut nodes = walk(&repo, &tips, &tip_sources, first_parent, &hidden, budget)?;
+    let mut nodes = walk(&repo, &tips, &tip_sources, first_parent, &hidden, budget, no_walk)?;
     // `-L` sets `revs->topo_order = 1` without touching `sort_order`, so it walks
     // topologically unless `--date-order` asked for the date-ordered variant.
     let effective_order = match (order, graph || line_level) {
@@ -1227,9 +1505,28 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
         nodes.retain(|n| n.parents.len() <= max);
     }
 
+    // `--use-mailmap` / `log.mailmap`: loaded once (worktree `.mailmap`, then
+    // `mailmap.blob`, then `mailmap.file`) and shared by every rendered record.
+    // `%aN`/`%aE`/`%cN`/`%cE` resolve through the mailmap whether or not the header
+    // formats do, so a format that names one loads it even under `--no-use-mailmap`.
+    let format_maps_identities = match &pretty {
+        Pretty::User(f) => format_names_mapped_identity(f),
+        _ => false,
+    };
+    let mailmap = (use_mailmap || format_maps_identities)
+        .then(|| std::sync::Arc::new(Mailmap::load(&repo)));
+
     // `--grep`/`--author`/`--committer` header/message filtering, applied during
     // selection — before `--skip`/`--max-count`, exactly as git does.
     let commit_filter = crate::revfilter::CommitFilter {
+        // `commit_match()` greps the mailmapped headers when a mailmap is in effect,
+        // which is what makes `--author=<canonical>` find an aliased commit. The
+        // format-only load above does not enable it: git ties this to `revs->mailmap`.
+        ident_map: use_mailmap.then(|| mailmap.clone()).flatten().map(|m| {
+            let m = m.clone();
+            std::sync::Arc::new(move |name: &[u8], email: &[u8]| m.mapped(name, email))
+                as crate::revfilter::IdentMapper
+        }),
         author_res: crate::revfilter::compile_patterns(&author_pats, grep_dialect, grep_ignore_case)?,
         committer_res: crate::revfilter::compile_patterns(
             &committer_pats,
@@ -1279,7 +1576,7 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
                 _ => {
                     let jobs: Vec<(ObjectId, Option<ObjectId>)> =
                         kept.iter().map(|n| (n.id, n.parents.first().copied())).collect();
-                    let patches = super::diff::commit_patches(&repo, &jobs, 0, &pathspecs)?;
+                    let patches = super::diff::commit_patches(&repo, &jobs, &super::diff::PatchOpts { ctx: 0, ..patch_opts.clone() }, &pathspecs)?;
                     kept.into_iter()
                         .zip(patches)
                         .filter(|(_, patch)| {
@@ -1299,9 +1596,19 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
         let drop = skip.min(nodes.len());
         nodes.drain(0..drop);
     }
-    if let Some(limit) = max_count {
-        nodes.truncate(limit);
-    }
+    // `cmd_log_walk()` restores a `--max-count` slot spent on a commit that printed
+    // nothing (`if (!log_tree_commit(...)) rev->max_count++`), which only `whatchanged`
+    // can hit — `git log` always shows the header. The cap therefore moves to the
+    // render loop there, counting records actually printed.
+    let print_limit = match flavor {
+        Flavor::WhatChanged => max_count,
+        Flavor::Log => {
+            if let Some(limit) = max_count {
+                nodes.truncate(limit);
+            }
+            None
+        }
+    };
     if reverse {
         nodes.reverse();
     }
@@ -1319,9 +1626,18 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
     // no such flag, which is why `git log -m` on its own still prints no diff.
     let patch = patch
         || (matches!(diff_merges, DiffMerges::Combined | DiffMerges::DenseCombined)
-            && !(stat || numstat || shortstat || name_only || name_status));
+            && !(stat || numstat || shortstat || summary || name_only || name_status || raw));
     let emit_patch = patch && !name_only && !name_status;
-    let want_names = name_only || name_status || stat || numstat || shortstat;
+    // `diff_setup_done()`: `--name-only`/`--name-status` clear every other output
+    // format, `--raw` among them; `--raw` itself clears nothing, so it stacks with
+    // the count formats and the patch.
+    // `cmd_whatchanged()`: `if (!rev.diffopt.output_format) output_format = DIFF_FORMAT_RAW`.
+    let raw = raw
+        || (flavor == Flavor::WhatChanged
+            && !(patch || stat || numstat || shortstat || summary || name_only || name_status));
+    let raw = raw && !name_only && !name_status;
+    let summary = summary && !name_only && !name_status;
+    let want_names = name_only || name_status || raw || summary || stat || numstat || shortstat;
     // Whether `%C`/`%d` emit ANSI: git's auto rule is "stdout is a terminal, or we
     // are paging to one" — `pager::maybe_setup` records the latter via the env flag.
     let want_color = match color {
@@ -1353,9 +1669,6 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
     } else {
         super::color::DecorateColors::disabled()
     };
-    // `--use-mailmap` / `log.mailmap`: loaded once (worktree `.mailmap`, then
-    // `mailmap.blob`, then `mailmap.file`) and shared by every rendered record.
-    let mailmap = use_mailmap.then(|| Mailmap::load(&repo));
     // `revision.c`: the two ancestry decorations share one slot in the header and
     // git refuses to print both rather than pick an order.
     if show_parents && show_children {
@@ -1511,7 +1824,7 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
     // above it do. The window computes a batch of them across the thread pool
     // while the loop below stays a plain in-order stream — git computes them one
     // at a time on one core.
-    let mut patches = PatchWindow::new(emit_patch, show_root, diff_merges);
+    let mut patches = PatchWindow::new(emit_patch, show_root, diff_merges, patch_opts.clone());
     // Each record's text comes out of its own commit object, and reading 6000 of
     // them is the whole cost of a format like `--oneline` or `%s`. The window
     // renders a batch of records at a time across the thread pool; the loop below
@@ -1528,8 +1841,10 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
         decorations: decorations.as_ref(),
         decorate,
         source_mode,
-        mailmap: mailmap.as_ref(),
+        mailmap: use_mailmap.then(|| mailmap.as_deref()).flatten(),
+        identity_mailmap: mailmap.as_deref(),
         terminator,
+        rec_term: if z { 0u8 } else { b'\n' },
         empty_user_format,
         pretty: &pretty,
         notes: &notes_trees,
@@ -1541,13 +1856,47 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
     } else {
         Some(PathspecMatcher::new(&repo, &pathspecs)?)
     };
-    for (ni, node) in nodes.iter().enumerate() {
+    // `-z` replaces the record terminator (and the separator between records) with NUL,
+    // which is what `line_termination` feeds in git.
+    let rec_term = if z { 0u8 } else { b'\n' };
+
+    // `whatchanged` counts what it actually printed against `--max-count`.
+    let mut printed = 0usize;
+
+    // `log_tree_commit()` under `-m`: a merge is rendered once per parent, each record
+    // carrying its own ` (from <oid>)` header insert and diffing against that parent.
+    // Every other commit is one record against its first parent.
+    let separate_merges = diff_merges == DiffMerges::Separate && (want_names || emit_patch);
+    if separate_merges && graph && nodes.iter().any(|n| n.parents.len() > 1) {
+        bail!("`-m` with `--graph` is not ported: git lays out one graph row per
+               per-parent record");
+    }
+    let records: Vec<(usize, Option<ObjectId>, Option<ObjectId>)> = nodes
+        .iter()
+        .enumerate()
+        .flat_map(|(ni, n)| {
+            if separate_merges && n.parents.len() > 1 {
+                n.parents.iter().map(|p| (ni, Some(*p), Some(*p))).collect::<Vec<_>>()
+            } else {
+                vec![(ni, n.parents.first().copied(), None)]
+            }
+        })
+        .collect();
+
+    for (ni, diff_parent, from) in records.iter().copied() {
+        let node = &nodes[ni];
+        if print_limit.is_some_and(|n| printed >= n) {
+            break;
+        }
+        // Whether this record produced a diff queue; `whatchanged` prints nothing for
+        // a commit that did not.
+        let mut record_has_diff = false;
         if walk_only {
             let Pretty::User(fmt) = &pretty else { unreachable!() };
             let mut block: Vec<u8> = Vec::new();
             expand_walk_only(&mut block, fmt, node, abbrev_commit, &abbrev_cache, &repo);
             if terminator && !empty_user_format {
-                block.push(b'\n');
+                block.push(rec_term);
             }
             if graph {
                 blocks.push(block);
@@ -1555,7 +1904,7 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
             }
             let mut piece: Vec<u8> = Vec::new();
             if !terminator && !first {
-                piece.push(b'\n');
+                piece.push(rec_term);
             }
             piece.extend_from_slice(&block);
             first = false;
@@ -1567,7 +1916,14 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
             }
             continue;
         }
-        let mut block = entries.get(&repo, &nodes, ni, &abbrev_cache)?;
+        let mut block = match from {
+            None => entries.get(&repo, &nodes, ni, &abbrev_cache)?,
+            // A per-parent `-m` record is rendered on its own: the batched window has
+            // one slot per commit and no room for the ` (from <oid>)` insert.
+            Some(parent) => {
+                entry_block_from(&repo, node, &entries.params, &abbrev_cache, Some(parent))?
+            }
+        };
 
         // `log_tree_diff` short-circuits under `-L`: it flushes the pairs
         // `line_log_queue_pairs()` produced and returns, so neither the merge rule
@@ -1615,6 +1971,10 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
             && (show_root || !node.parents.is_empty())
         {
             let mut diff: Vec<u8> = Vec::new();
+            // `log_tree_diff_flush()` separates the message from the diff whenever the
+            // pair queue is non-empty, even for a format that has nothing to say about
+            // those pairs (`--summary` over a plain content change).
+            let mut queue_nonempty = false;
             if want_names {
                 // `--name-only`/`--name-status` are the reported format when
                 // present; git suppresses the count formats in that case, so the
@@ -1623,8 +1983,14 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
                 // The record was rendered by a worker, which kept nothing; the
                 // count formats need the commit itself for its tree.
                 let commit = repo.find_object(node.id)?.try_into_commit()?;
-                let mut files =
-                    collect_changes(&repo, &commit, node.parents.first().copied(), count_formats)?;
+                let mut files = collect_changes(
+                    &repo,
+                    &commit,
+                    diff_parent,
+                    count_formats || patch_opts.ws != super::diff::Whitespace::Keep,
+                    patch_opts.ws,
+                    Some(&patch_opts),
+                )?;
                 // `-- <pathspec>` limits what the name/stat formats report, not
                 // just which commits reach them.
                 // `--follow` limits each commit by the name the file had there.
@@ -1634,6 +2000,17 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
                 };
                 if let Some(m) = followed.as_mut().or(path_limit.as_mut()) {
                     files.retain(|f| m.matches(&f.path));
+                }
+                // `diff_flush()` (diff.c:7210): under a whitespace rule the queue is
+                // re-rendered quietly first and every pair whose patch came out empty
+                // is dropped, so the raw, name and stat formats never mention a file
+                // whose only change was whitespace — nor does the separator appear.
+                // The queue is tested for emptiness *before* the quiet flush, so a
+                // commit whose only change is whitespace still separates its message
+                // from the (empty) diff.
+                queue_nonempty = !files.is_empty();
+                if patch_opts.ws != super::diff::Whitespace::Keep {
+                    files.retain(reports_change);
                 }
                 // A merge under a combined mode reports the *combined* pair list
                 // here, with one status letter per parent — `show_raw_diff()` on a
@@ -1655,29 +2032,53 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
                         diff.extend_from_slice(path);
                         diff.push(b'\n');
                     }
-                } else if name_status {
-                    for f in &files {
-                        diff.push(f.status);
-                        diff.push(b'\t');
-                        diff.extend_from_slice(&f.path);
-                        diff.push(b'\n');
-                    }
-                } else if name_only {
-                    for f in &files {
-                        diff.extend_from_slice(&f.path);
-                        diff.push(b'\n');
-                    }
                 } else {
-                    // git stacks the count formats in a fixed order: numstat, then
-                    // the full stat block, then a bare shortstat summary if stat did
-                    // not already print one.
-                    if numstat {
-                        emit_numstat(&mut diff, &files);
+                    // `diff_flush()`'s fixed order: the raw/name loop first, then the
+                    // count formats. `--raw` does not displace them, so `--raw --stat`
+                    // prints both.
+                    if raw {
+                        emit_raw(&repo, &mut diff, &files, z)?;
                     }
-                    if stat {
-                        emit_stat(&mut diff, &files, &stat_widths)?;
-                    } else if shortstat {
-                        emit_shortstat(&mut diff, &files)?;
+                    let (fsep, fend) = if z { (0u8, 0u8) } else { (b'\t', b'\n') };
+                    if name_status {
+                        for f in &files {
+                            diff.push(f.status);
+                            // `diff_flush_name_status()`: a rename carries its similarity
+                            // index and names both paths. Every name goes out through
+                            // `write_name_quoted()`.
+                            if let Some(source) = &f.source {
+                                diff.extend_from_slice(format!("{:03}", f.score).as_bytes());
+                                diff.push(fsep);
+                                diff.extend_from_slice(&name_field(source, z));
+                            }
+                            diff.push(fsep);
+                            diff.extend_from_slice(&name_field(&f.path, z));
+                            diff.push(fend);
+                        }
+                    } else if name_only {
+                        for f in &files {
+                            diff.extend_from_slice(&name_field(&f.path, z));
+                            diff.push(fend);
+                        }
+                    } else {
+                        // git stacks the count formats in a fixed order: numstat, then
+                        // the full stat block, then a bare shortstat summary if stat did
+                        // not already print one.
+                        if numstat {
+                            emit_numstat(&mut diff, &files, z);
+                        }
+                        // `diff_flush()` tests the two bits separately, so
+                        // `--stat --shortstat` prints the stat block and then a
+                        // second summary line.
+                        if stat {
+                            emit_stat(&mut diff, &files, &stat_widths)?;
+                        }
+                        if shortstat {
+                            emit_shortstat(&mut diff, &files)?;
+                        }
+                        if summary {
+                            emit_summary(&mut diff, &files);
+                        }
                     }
                 }
             }
@@ -1693,16 +2094,30 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
                     Some(path) => super::diff::commit_patches(
                         &repo,
                         &[(node.id, node.parents.first().copied())],
-                        3,
+                        &patch_opts,
                         &[path.to_string()],
                     )?
                     .pop()
                     .unwrap_or_default(),
                     None => Vec::new(),
                 };
-                let p: &[u8] = match &node.follow_path {
-                    Some(_) => &follow_patch,
-                    None => patches.get(&repo, &nodes, ni, 3, &pathspecs)?,
+                // A per-parent `-m` record diffs against *that* parent, which the
+                // batched window (one first-parent patch per commit) cannot serve.
+                let separate_patch: Vec<u8> = match from {
+                    Some(parent) => super::diff::commit_patches(
+                        &repo,
+                        &[(node.id, Some(parent))],
+                        &patch_opts,
+                        &pathspecs,
+                    )?
+                    .pop()
+                    .unwrap_or_default(),
+                    None => Vec::new(),
+                };
+                let p: &[u8] = match (&node.follow_path, from) {
+                    (Some(_), _) => &follow_patch,
+                    (None, Some(_)) => &separate_patch,
+                    (None, None) => patches.get(&repo, &nodes, ni, 3, &pathspecs)?,
                 };
                 if !p.is_empty() {
                     if !diff.is_empty() {
@@ -1711,7 +2126,7 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
                     diff.extend_from_slice(p);
                 }
             }
-            if !diff.is_empty() {
+            if !diff.is_empty() || queue_nonempty {
                 // git puts a separator between the log message and the diff for
                 // every format but `oneline` — and only when the message block
                 // rendered something to separate from. A `--stat` block shown
@@ -1731,6 +2146,16 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
                 }
                 block.extend_from_slice(&diff);
             }
+            record_has_diff = !diff.is_empty() || queue_nonempty;
+        }
+        // `cmd_whatchanged()` leaves `always_show_header` off, so `log_tree_commit()`
+        // prints nothing at all for a commit whose diff queue came out empty — and
+        // `cmd_log_walk()` hands the `--max-count` slot back.
+        if flavor == Flavor::WhatChanged {
+            if !record_has_diff {
+                continue;
+            }
+            printed += 1;
         }
         if graph {
             // Buffer for the column layout, which spans all commits at once.
@@ -1745,7 +2170,7 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
         // above, so no separator is inserted.
         let mut piece: Vec<u8> = Vec::new();
         if !terminator && !first {
-            piece.push(b'\n');
+            piece.push(rec_term);
         }
         piece.extend_from_slice(&block);
         first = false;
@@ -1771,7 +2196,7 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
             let last = blocks.len().saturating_sub(1);
             for (idx, block) in blocks.iter_mut().enumerate() {
                 if idx != last {
-                    block.push(b'\n');
+                    block.push(rec_term);
                 }
             }
         }
@@ -1957,6 +2382,19 @@ enum Order {
     Topo,
 }
 
+/// `--no-walk[=(sorted|unsorted)]` (`revision.c`'s `no_walk` field).
+///
+/// The named commits are shown and nothing is traversed, which is how a caller
+/// asks for "just these objects" — `git log --no-walk <a> <b>` is two records,
+/// not two histories.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NoWalk {
+    /// The default: the named commits in commit-date order, newest first.
+    Sorted,
+    /// `--no-walk=unsorted`: the order they were named in.
+    Unsorted,
+}
+
 /// What the walk needs to know about a commit, read once up front.
 /// Everything a commit's record needs beyond the commit itself: the flags and
 /// lookup tables that are fixed for the whole command.
@@ -1980,7 +2418,12 @@ struct EntryParams<'a> {
     /// `--use-mailmap` / `log.mailmap`: the loaded mailmap, or `None` when the
     /// identities are shown as recorded.
     mailmap: Option<&'a Mailmap>,
+    /// The mailmap `%aN`/`%aE`/`%cN`/`%cE` read, which is loaded even when the
+    /// header formats are not routed through one.
+    identity_mailmap: Option<&'a Mailmap>,
     terminator: bool,
+    /// `-z`: the byte a `tformat:` record is terminated with.
+    rec_term: u8,
     empty_user_format: bool,
     pretty: &'a Pretty,
     /// The notes trees to render after the message; empty when notes are off.
@@ -2103,6 +2546,18 @@ fn entry_block(
     p: &EntryParams<'_>,
     abbrev: &std::cell::RefCell<AbbrevCache>,
 ) -> Result<Vec<u8>> {
+    entry_block_from(repo, node, p, abbrev, None)
+}
+
+/// [`entry_block`] with `show_log()`'s ` (from <oid>)` insert, which the per-parent
+/// records `-m` prints carry after the commit id and before any decorations.
+fn entry_block_from(
+    repo: &gix::Repository,
+    node: &Node,
+    p: &EntryParams<'_>,
+    abbrev: &std::cell::RefCell<AbbrevCache>,
+    from: Option<ObjectId>,
+) -> Result<Vec<u8>> {
     let commit = repo.find_object(node.id)?.try_into_commit()?;
     // `--parents` then `--children` decorate the header with ids, in that order
     // (`show_log` prints `print_parents` before `children`). A child list is what
@@ -2125,6 +2580,16 @@ fn entry_block(
     if let Some(children) = p.children {
         push_ids(children.get(&node.id).map_or(&[][..], Vec::as_slice), &mut extra);
     }
+    if let Some(parent) = from {
+        extra.extend_from_slice(b" (from ");
+        let attached = parent.attach(repo);
+        if p.abbrev_commit {
+            extra.extend_from_slice(abbrev.borrow_mut().get(attached).as_bytes());
+        } else {
+            extra.extend_from_slice(attached.to_string().as_bytes());
+        }
+        extra.push(b')');
+    }
     let ctx = RenderCtx {
         abbrev_commit: p.abbrev_commit,
         abbrev,
@@ -2137,6 +2602,7 @@ fn entry_block(
         decorate: p.decorate,
         source: if p.source_mode { Some(node.source.as_bytes()) } else { None },
         mailmap: p.mailmap,
+        identity_mailmap: p.identity_mailmap,
         notes: p.notes,
         repo,
         mark: if node.boundary && !p.graph { "- " } else { "" },
@@ -2148,7 +2614,7 @@ fn entry_block(
     // record whose expansion happened to be empty (so `%d` prints one line per
     // commit); only the genuinely empty user format emits no terminator.
     if p.terminator && !p.empty_user_format {
-        block.push(b'\n');
+        block.push(p.rec_term);
     }
     Ok(block)
 }
@@ -2170,6 +2636,8 @@ struct PatchWindow {
     show_root: bool,
     /// `--diff-merges=<mode>`: what a merge commit's patch shows.
     merges: DiffMerges,
+    /// The diff options the patch bodies are rendered with (`-U<n>`, `-w`, …).
+    patch_opts: super::diff::PatchOpts,
     /// Index of `slots[0]` within the caller's node list.
     start: usize,
     slots: Vec<Vec<u8>>,
@@ -2181,8 +2649,13 @@ impl PatchWindow {
     const SPAN: usize = 64;
 
 
-    fn new(active: bool, show_root: bool, merges: DiffMerges) -> Self {
-        PatchWindow { active, show_root, merges, start: 0, slots: Vec::new() }
+    fn new(
+        active: bool,
+        show_root: bool,
+        merges: DiffMerges,
+        patch_opts: super::diff::PatchOpts,
+    ) -> Self {
+        PatchWindow { active, show_root, merges, patch_opts, start: 0, slots: Vec::new() }
     }
 
     /// `true` when git renders a diff for this commit at all: a merge only under a
@@ -2241,19 +2714,10 @@ impl PatchWindow {
                             ));
                             continue;
                         }
-                        // `separate` repeats the *record* once per parent, each
-                        // headed `<oid> (from <parent-oid>) <subject>` — the insert
-                        // lives inside `show_log()`'s header, which is rendered
-                        // before any patch is known here. Emitting the patches
-                        // without it would print one header for N diffs, so this
-                        // stops instead.
-                        DiffMerges::Separate => {
-                            anyhow::bail!(
-                                "`-m` with a patch format is not ported: git repeats the commit \
-                                 header once per parent with its `(from <oid>)` insert, which this \
-                                 renderer produces before the per-parent diffs exist"
-                            );
-                        }
+                        // `separate` repeats the *record* once per parent, so the
+                        // render loop asks for each of those patches itself and this
+                        // window has nothing to contribute.
+                        DiffMerges::Separate => continue,
                         // `first-parent` is an ordinary two-way job.
                         DiffMerges::FirstParent | DiffMerges::Off => {}
                     }
@@ -2261,7 +2725,7 @@ impl PatchWindow {
                 jobs.push((n.id, n.parents.first().copied()));
                 at.push(k);
             }
-            let computed = super::diff::commit_patches(repo, &jobs, ctx, paths)?;
+            let computed = super::diff::commit_patches(repo, &jobs, &self.patch_opts, paths)?;
             self.slots = vec![Vec::new(); span.len()];
             for (slot, patch) in at.into_iter().zip(computed) {
                 self.slots[slot] = patch;
@@ -2644,7 +3108,7 @@ pub(crate) fn source_map(
     } else {
         ancestor_closure(repo, exclude)?
     };
-    let nodes = walk(repo, tips, tip_sources, first_parent, &hidden, None)?;
+    let nodes = walk(repo, tips, tip_sources, first_parent, &hidden, None, None)?;
     Ok(nodes.into_iter().map(|n| (n.id, n.source)).collect())
 }
 
@@ -2658,6 +3122,7 @@ fn walk(
     first_parent: bool,
     hidden: &HashSet<ObjectId>,
     budget: Option<usize>,
+    no_walk: Option<NoWalk>,
 ) -> Result<Vec<Node>> {
     // Shallow commits (from `.git/shallow`, as a `--depth` clone leaves) are grafted
     // to have no parents: the walk must stop at them, not try to read their absent
@@ -2694,6 +3159,18 @@ fn walk(
             seq += 1;
             pending.push(node);
         }
+    }
+
+    // `--no-walk`: git sets `revs->no_walk` and `get_revision()` returns the pending
+    // objects themselves without ever calling `add_parents_to_list()`. `sorted` (the
+    // default) hands them back newest-first, which is the heap's own order;
+    // `unsorted` keeps the order they were named in.
+    if let Some(mode) = no_walk {
+        let mut out: Vec<Node> = std::iter::from_fn(|| pending.pop()).collect();
+        if mode == NoWalk::Unsorted {
+            out.sort_by_key(|n| n.seq);
+        }
+        return Ok(out);
     }
 
     let mut out: Vec<Node> = Vec::new();
@@ -2889,12 +3366,14 @@ fn check_format(fmt: &str) -> Result<()> {
                 | 'D' | 'N',
             ) => {}
             Some('a') => match it.next() {
-                Some('n' | 'e' | 'd' | 'i' | 'I' | 't' | 'r') => {}
+                // `%aN`/`%aE` are the mailmap-resolved name and address, which
+                // `format_person_part()` maps whether or not `--use-mailmap` is on.
+                Some('n' | 'e' | 'N' | 'E' | 'd' | 'i' | 'I' | 't' | 'r') => {}
                 Some(x) => bail!("unsupported format placeholder %a{x}"),
                 None => bail!("unsupported trailing % in format"),
             },
             Some('c') => match it.next() {
-                Some('n' | 'e' | 'd' | 'i' | 'I' | 't' | 'r') => {}
+                Some('n' | 'e' | 'N' | 'E' | 'd' | 'i' | 'I' | 't' | 'r') => {}
                 Some(x) => bail!("unsupported format placeholder %c{x}"),
                 None => bail!("unsupported trailing % in format"),
             },
@@ -2945,6 +3424,7 @@ pub(crate) fn format_commit(
         decorate: DecorateStyle::Off,
         source: None,
         mailmap: None,
+        identity_mailmap: None,
         // `rebase -i` renders its instruction lines with no notes; `%N` in an
         // instruction format expands to nothing, as it does under git.
         notes: &[],
@@ -3104,6 +3584,8 @@ fn expand_format(
                 match chars.get(i).copied() {
                     Some('n') => out.extend_from_slice(author.name),
                     Some('e') => out.extend_from_slice(author.email),
+                    Some('N') => out.extend_from_slice(mapped_name(&author, ctx.identity_mailmap)),
+                    Some('E') => out.extend_from_slice(mapped_email(&author, ctx.identity_mailmap)),
                     Some('d') => expand_date(out, &author, date_mode, ctx.now)?,
                     Some('i') => expand_date(out, &author, DateMode::Iso, ctx.now)?,
                     Some('I') => expand_date(out, &author, DateMode::IsoStrict, ctx.now)?,
@@ -3118,6 +3600,8 @@ fn expand_format(
                 match chars.get(i).copied() {
                     Some('n') => out.extend_from_slice(committer.name),
                     Some('e') => out.extend_from_slice(committer.email),
+                    Some('N') => out.extend_from_slice(mapped_name(&committer, ctx.identity_mailmap)),
+                    Some('E') => out.extend_from_slice(mapped_email(&committer, ctx.identity_mailmap)),
                     Some('d') => expand_date(out, &committer, date_mode, ctx.now)?,
                     Some('i') => expand_date(out, &committer, DateMode::Iso, ctx.now)?,
                     Some('I') => expand_date(out, &committer, DateMode::IsoStrict, ctx.now)?,
@@ -4074,6 +4558,7 @@ pub(crate) fn rev_list_pretty_body(
         decorate: DecorateStyle::Off,
         source: None,
         mailmap: None,
+        identity_mailmap: None,
         // `cmd_rev_list` never calls `init_display_notes`, so `rev-list --pretty`
         // prints no notes even where `log` would.
         notes: &[],
@@ -4215,6 +4700,10 @@ struct RenderCtx<'a> {
     /// only, so `oneline`, `raw` and user formats are unaffected — `%aN`/`%aE`
     /// consult the mailmap on their own, independent of this flag.
     mailmap: Option<&'a Mailmap>,
+    /// The mailmap `%aN`/`%aE`/`%cN`/`%cE` resolve through. Loaded whenever a format
+    /// asks for them, even under `--no-use-mailmap`, which is what
+    /// `format_person_part()` does.
+    identity_mailmap: Option<&'a Mailmap>,
     /// The notes trees whose `Notes[ (<ref>)]:` blocks follow the message. Empty
     /// when notes are off; a user format reaches them only through `%N`.
     notes: &'a [super::notes::Tree],
@@ -4407,6 +4896,36 @@ fn write_source(out: &mut Vec<u8>, ctx: &RenderCtx<'_>) {
 /// mailmap when `--use-mailmap` / `log.mailmap` supplied one — git's
 /// `pp_user_info`, which is the single place the built-in formats resolve an
 /// identity.
+/// Whether a user format names `%aN`, `%aE`, `%cN` or `%cE` — the placeholders that
+/// resolve through `.mailmap` on their own, so their presence is what decides
+/// whether one has to be loaded.
+fn format_names_mapped_identity(fmt: &str) -> bool {
+    let bytes = fmt.as_bytes();
+    bytes.windows(3).any(|w| {
+        w[0] == b'%' && matches!(w[1], b'a' | b'c') && matches!(w[2], b'N' | b'E')
+    })
+}
+
+/// `format_person_part()`'s `N`: the mailmap's name for an identity, or the one the
+/// commit recorded when nothing maps it.
+fn mapped_name<'a>(sig: &'a gix::actor::SignatureRef<'a>, mailmap: Option<&'a Mailmap>) -> &'a [u8] {
+    mailmap
+        .and_then(|m| m.lookup(sig.name, sig.email))
+        .and_then(|info| info.name.as_deref())
+        .unwrap_or(sig.name)
+}
+
+/// `format_person_part()`'s `E`: the same for the address.
+fn mapped_email<'a>(
+    sig: &'a gix::actor::SignatureRef<'a>,
+    mailmap: Option<&'a Mailmap>,
+) -> &'a [u8] {
+    mailmap
+        .and_then(|m| m.lookup(sig.name, sig.email))
+        .and_then(|info| info.email.as_deref())
+        .unwrap_or(sig.email)
+}
+
 pub(crate) fn write_person(
     out: &mut Vec<u8>,
     label: &[u8],
@@ -4497,6 +5016,18 @@ impl Mailmap {
 
     /// git's `map_user`: find the email, then prefer a name-qualified sub-entry
     /// when one matches, else fall back to the unqualified mapping.
+    /// The identity as the mailmap reports it: each half replaced where a mapping
+    /// covers it, kept as recorded otherwise.
+    pub(crate) fn mapped(&self, name: &[u8], email: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        match self.lookup(name, email) {
+            None => (name.to_vec(), email.to_vec()),
+            Some(info) => (
+                info.name.clone().unwrap_or_else(|| name.to_vec()),
+                info.email.clone().unwrap_or_else(|| email.to_vec()),
+            ),
+        }
+    }
+
     fn lookup(&self, name: &[u8], email: &[u8]) -> Option<&MailmapInfo> {
         let slot = self.by_email.get(&lower_ascii(email))?;
         let info = if slot.by_name.is_empty() {
@@ -4596,6 +5127,15 @@ struct FileChange {
     is_binary: bool,
     old_size: usize,
     new_size: usize,
+    /// The path the content came from, for a rename; `None` for everything else.
+    source: Option<Vec<u8>>,
+    /// `similarity_index()` in percent, meaningless without `source`.
+    score: u32,
+    /// `(mode, object id)` of each side, kept for the rename pass; `None` where the
+    /// path does not exist. Not part of the cached record — by the time a change list
+    /// is cached the renames are already resolved.
+    old_side: Option<(u32, ObjectId)>,
+    new_side: Option<(u32, ObjectId)>,
 }
 
 /// Diff `commit`'s tree against `parent`'s (or the empty tree for a root commit),
@@ -4633,7 +5173,7 @@ pub fn warm_caches(repo: &gix::Repository, limit: usize) -> usize {
             // Stores into the tree-diff cache as a side effect (see
             // `collect_changes`), with the counts every `--stat`-style format
             // needs — the expensive half, one blob read per changed file.
-            let _ = collect_changes(repo, &commit, parents.first().copied(), true);
+            let _ = collect_changes(repo, &commit, parents.first().copied(), true, super::diff::Whitespace::Keep, None);
         }
         warmed += 1;
     }
@@ -4646,6 +5186,13 @@ fn collect_changes(
     commit: &gix::Commit<'_>,
     parent: Option<ObjectId>,
     with_counts: bool,
+    // `-w`/`-b`/`--ignore-space-at-eol`: the tallies are computed the way the patch
+    // would compute them, and the cache is bypassed so a whitespace-insensitive run
+    // never stores its counts under the plain key.
+    ws: super::diff::Whitespace,
+    // `diffcore_rename()`: `None` for `--follow`, which runs its own rename search
+    // over the raw change list; otherwise the settings the command was given.
+    detect: Option<&super::diff::PatchOpts>,
 ) -> Result<Vec<FileChange>> {
     let new_tree = commit.tree()?;
     let old_tree = match parent {
@@ -4660,8 +5207,18 @@ fn collect_changes(
     // the work instead of racing it.
     let old_key = old_tree.as_ref().map(|t| t.id.to_string()).unwrap_or_default();
     let new_key = new_tree.id.to_string();
-    if let Some(text) = crate::rcache::treediff_load(&old_key, &new_key, with_counts) {
-        if let Some(files) = decode_changes(text) {
+    // The cached list is the raw one the tree walk produced; rename detection runs on
+    // the way out, so `--follow` (which does its own rename search on the raw list) and
+    // the reporting formats can share one cache entry.
+    let cacheable = ws == super::diff::Whitespace::Keep;
+    if let Some(text) = cacheable
+        .then(|| crate::rcache::treediff_load(&old_key, &new_key, with_counts))
+        .flatten()
+    {
+        if let Some(mut files) = decode_changes(text) {
+            if let Some(opts) = detect {
+                detect_renames(repo, &mut files, with_counts, opts)?;
+            }
             return Ok(files);
         }
     }
@@ -4675,19 +5232,157 @@ fn collect_changes(
 
     let mut out = Vec::with_capacity(changes.len());
     for change in &changes {
-        if let Some(f) = prepare_change(repo, change, with_counts)? {
+        if let Some(f) = prepare_change(repo, change, with_counts, ws)? {
             out.push(f);
         }
     }
     // Off-thread: the answer is already in `out`, so the row is bookkeeping and
     // the caller must not wait for a transaction to reach the disk.
-    crate::rcache::cache_write(crate::rcache::CacheWrite::TreeDiff {
-        old_tree: old_key,
-        new_tree: new_key,
-        counts: with_counts,
-        files: encode_changes(&out),
-    });
+    if cacheable {
+        crate::rcache::cache_write(crate::rcache::CacheWrite::TreeDiff {
+            old_tree: old_key,
+            new_tree: new_key,
+            counts: with_counts,
+            files: encode_changes(&out),
+        });
+    }
+    if let Some(opts) = detect {
+        detect_renames(repo, &mut out, with_counts, opts)?;
+    }
     Ok(out)
+}
+
+/// `diffcore_rename()`: pair each deletion with an addition carrying the same (or
+/// similar enough) content, so a moved file is one `R` entry instead of a `D` and an
+/// `A`. `git log` is a porcelain, so detection is on unless `diff.renames` says
+/// otherwise, at git's default 50% similarity.
+///
+/// This is the same port `git diff` runs, so the pairing and the similarity indices
+/// agree across the commands.
+fn detect_renames(
+    repo: &gix::Repository,
+    files: &mut Vec<FileChange>,
+    with_counts: bool,
+    opts: &super::diff::PatchOpts,
+) -> Result<()> {
+    let cfg = repo.config_snapshot();
+    let detect = opts.renames.unwrap_or_else(|| super::diffcore_rename::config_rename(
+        cfg.string("diff.renames").as_deref().map(|v| v.as_bstr()),
+    ));
+    // `-B` runs on its own: `diffcore_std()` breaks rewrites whether or not a rename
+    // pass follows, so the early exit only applies when neither is asked for.
+    let wants_break = opts.break_opt != -1;
+    if (detect == 0 && !wants_break)
+        || (!wants_break && !files.iter().any(|f| f.status == b'A' || f.status == b'D'))
+    {
+        return Ok(());
+    }
+    let ws = opts.ws;
+    let opts = super::diffcore_rename::Options {
+        detect_rename: detect,
+        rename_score: opts.rename_score,
+        find_copies_harder: opts.find_copies_harder,
+        break_opt: opts.break_opt,
+        rename_limit: cfg
+            .integer("diff.renameLimit")
+            .unwrap_or(super::diffcore_rename::DEFAULT_RENAME_LIMIT),
+        hash_kind: repo.object_hash(),
+        ..Default::default()
+    };
+
+    // The queue needs object ids, which the change list does not keep; they are read
+    // back from the two trees by path, which is what the ids were taken from.
+    let mut q = super::diffcore_rename::Queue::default();
+    for f in files.iter() {
+        let (old_mode, old_id) = f.old_side.unwrap_or((0, ObjectId::null(repo.object_hash())));
+        let (new_mode, new_id) = f.new_side.unwrap_or((0, ObjectId::null(repo.object_hash())));
+        let one = q.add_spec(super::diffcore_rename::FileSpec::new(
+            f.path.clone().into(),
+            old_mode,
+            old_id,
+            old_mode != 0,
+        ));
+        let two = q.add_spec(super::diffcore_rename::FileSpec::new(
+            f.path.clone().into(),
+            new_mode,
+            new_id,
+            new_mode != 0,
+        ));
+        let idx = q.add_pair(one, two);
+        q.pairs[idx].status = f.status;
+    }
+
+    let mut content = LogContent { repo };
+    super::diffcore_rename::run(&mut q, &opts, &mut content);
+    super::diffcore_rename::resolve_rename_copy(&mut q);
+
+    let mut rebuilt: Vec<FileChange> = Vec::with_capacity(q.pairs.len());
+    for pair in &q.pairs {
+        let source = &q.specs[pair.one];
+        let dest = &q.specs[pair.two];
+        let status = if pair.status == 0 { b'M' } else { pair.status };
+        if !matches!(status, b'R' | b'C') {
+            // Not a rename: the entry this pair was built from already has its
+            // contents and counts, and both of its sides carry that one path.
+            // A `-B` rewrite that stayed a modification carries a score, which
+            // `--summary` prints as its ` rewrite ... (n%)` line.
+            if let Some(at) = files.iter().position(|f| f.path == dest.path.as_slice()) {
+                let mut kept = files.swap_remove(at);
+                kept.score = super::diffcore_rename::similarity_index(pair.score);
+                rebuilt.push(kept);
+            }
+            continue;
+        }
+        let mut f = FileChange {
+            path: dest.path.to_vec(),
+            status,
+            added: 0,
+            deleted: 0,
+            is_binary: false,
+            old_size: 0,
+            new_size: 0,
+            source: Some(source.path.to_vec()),
+            score: super::diffcore_rename::similarity_index(pair.score),
+            old_side: Some((source.mode, source.oid)),
+            new_side: Some((dest.mode, dest.oid)),
+        };
+        if with_counts {
+            let old_is_sub = source.mode & 0o170000 == 0o160000;
+            let new_is_sub = dest.mode & 0o170000 == 0o160000;
+            let old_content = content_of(repo, source.oid, old_is_sub)?;
+            let new_content = content_of(repo, dest.oid, new_is_sub)?;
+            f.old_size = old_content.len();
+            f.new_size = new_content.len();
+            f.is_binary = is_binary(&old_content) || is_binary(&new_content);
+            if !f.is_binary && source.oid != dest.oid {
+                let (added, deleted) =
+                    count_changed_lines_ws(&old_content, &new_content, ws)?;
+                f.added = added;
+                f.deleted = deleted;
+            }
+        }
+        rebuilt.push(f);
+    }
+    rebuilt.sort_by(|a, b| a.path.cmp(&b.path));
+    *files = rebuilt;
+    Ok(())
+}
+
+/// Reads a filespec's blob for [`super::diffcore_rename`] — every side names an object
+/// in the database, so this is an odb lookup.
+struct LogContent<'a> {
+    repo: &'a gix::Repository,
+}
+
+impl super::diffcore_rename::Content for LogContent<'_> {
+    fn size(&mut self, spec: &super::diffcore_rename::FileSpec) -> Option<u64> {
+        let header = self.repo.find_header(spec.oid).ok()?;
+        (header.kind() == gix::object::Kind::Blob).then(|| header.size())
+    }
+
+    fn data(&mut self, spec: &super::diffcore_rename::FileSpec) -> Option<Vec<u8>> {
+        self.repo.find_object(spec.oid).ok().map(|o| o.detach().data)
+    }
 }
 
 /// Encode a change list for the ledger: one record per file,
@@ -4698,13 +5393,17 @@ fn encode_changes(files: &[FileChange]) -> String {
         .iter()
         .map(|f| {
             format!(
-                "{},{},{},{},{},{},{}",
+                "{},{},{},{},{},{},{},{},{},{},{}",
                 f.status as char,
                 f.added,
                 f.deleted,
                 u8::from(f.is_binary),
                 f.old_size,
                 f.new_size,
+                f.old_side.map(|(mode, _)| mode).unwrap_or(0),
+                f.old_side.map(|(_, id)| id.to_hex().to_string()).unwrap_or_default(),
+                f.new_side.map(|(mode, _)| mode).unwrap_or(0),
+                f.new_side.map(|(_, id)| id.to_hex().to_string()).unwrap_or_default(),
                 String::from_utf8_lossy(&f.path)
             )
         })
@@ -4720,15 +5419,39 @@ fn decode_changes(text: &str) -> Option<Vec<FileChange>> {
     }
     let mut out = Vec::new();
     for rec in text.split('\0') {
-        let mut f = rec.splitn(7, ',');
+        let mut f = rec.splitn(11, ',');
         let status = f.next()?.bytes().next()?;
         let added: usize = f.next()?.parse().ok()?;
         let deleted: usize = f.next()?.parse().ok()?;
         let is_binary = f.next()? == "1";
         let old_size: usize = f.next()?.parse().ok()?;
         let new_size: usize = f.next()?.parse().ok()?;
+        // The two sides feed the rename pass, which runs after the cache is consulted.
+        // A record written before they were stored has too few fields and is rejected
+        // here, which sends the caller back to a real diff.
+        let side = |mode: &str, id: &str| -> Option<Option<(u32, ObjectId)>> {
+            let mode: u32 = mode.parse().ok()?;
+            if mode == 0 {
+                return Some(None);
+            }
+            Some(Some((mode, ObjectId::from_hex(id.as_bytes()).ok()?)))
+        };
+        let old_side = side(f.next()?, f.next()?)?;
+        let new_side = side(f.next()?, f.next()?)?;
         let path = f.next()?.as_bytes().to_vec();
-        out.push(FileChange { path, status, added, deleted, is_binary, old_size, new_size });
+        out.push(FileChange {
+            path,
+            status,
+            added,
+            deleted,
+            is_binary,
+            old_size,
+            new_size,
+            source: None,
+            score: 0,
+            old_side,
+            new_side,
+        });
     }
     Some(out)
 }
@@ -4749,7 +5472,7 @@ fn follow_source(
     parent: ObjectId,
     path: &gix::bstr::BString,
 ) -> Result<Option<gix::bstr::BString>> {
-    let files = collect_changes(repo, commit, Some(parent), false)?;
+    let files = collect_changes(repo, commit, Some(parent), false, super::diff::Whitespace::Keep, None)?;
     // The followed path has to be an addition here; anything else is not a rename.
     if !files.iter().any(|f| f.path.as_slice() == path.as_slice() && f.status == b'A') {
         return Ok(None);
@@ -4812,7 +5535,7 @@ fn changes_match(
     parent: Option<ObjectId>,
     specs: &mut PathspecMatcher,
 ) -> Result<bool> {
-    let files = collect_changes(repo, commit, parent, false)?;
+    let files = collect_changes(repo, commit, parent, false, super::diff::Whitespace::Keep, None)?;
     Ok(files.iter().any(|f| specs.matches(&f.path)))
 }
 
@@ -4925,6 +5648,43 @@ enum Wm {
     /// `WM_ABORT_ALL`: text ended with the pattern still expecting a literal, or a
     /// malformed bracket expression. A no-match at the top level.
     AbortAll,
+}
+
+/// Whether `refname` is one of the refs `--branches`/`--tags`/`--remotes` names.
+///
+/// git's `refs.c:for_each_glob_ref_in()`: the namespace prefix is prepended to the
+/// pattern, a pattern holding no glob metacharacter gains an implicit `/*`, and
+/// each ref under the prefix is tested with `wildmatch(…, WM_PATHNAME)` — so `*`
+/// stops at a `/`. Without a glob at all (`--branches`), every ref under the
+/// prefix qualifies.
+///
+/// `WM_PATHNAME` is had by matching component-wise: within one `/`-free component
+/// the flagged and unflagged matchers agree, so the shared [`wildmatch`] (git's
+/// `flags == 0` specialisation) is exact there. A `**`, which is the one pattern
+/// meant to span components, falls back to matching the whole name at once.
+fn ref_in_namespace(refname: &str, prefix: &str, glob: Option<&str>) -> bool {
+    let Some(rest) = refname.strip_prefix(prefix) else {
+        return false;
+    };
+    let Some(glob) = glob else {
+        return true;
+    };
+    // `strbuf_complete(&real_pattern, '/'); strbuf_addch(&real_pattern, '*');`
+    let pattern = if glob.contains(['?', '*', '[']) {
+        glob.to_string()
+    } else {
+        format!("{}/*", glob.trim_end_matches('/'))
+    };
+    if pattern.contains("**") {
+        return wildmatch(pattern.as_bytes(), rest.as_bytes());
+    }
+    let pat_parts: Vec<&str> = pattern.split('/').collect();
+    let name_parts: Vec<&str> = rest.split('/').collect();
+    pat_parts.len() == name_parts.len()
+        && pat_parts
+            .iter()
+            .zip(&name_parts)
+            .all(|(p, n)| wildmatch(p.as_bytes(), n.as_bytes()))
 }
 
 /// git's `is_glob_special`: the bytes `wildmatch` treats as metacharacters.
@@ -5142,6 +5902,7 @@ fn prepare_change(
     repo: &gix::Repository,
     change: &ChangeDetached,
     with_counts: bool,
+    ws: super::diff::Whitespace,
 ) -> Result<Option<FileChange>> {
     let (path, status, old, new) = match change {
         ChangeDetached::Addition {
@@ -5157,7 +5918,7 @@ fn prepare_change(
                 location.to_vec(),
                 b'A',
                 None,
-                Some((*id, entry_mode.is_commit())),
+                Some((*id, u32::from(entry_mode.value()))),
             )
         }
         ChangeDetached::Deletion {
@@ -5172,7 +5933,7 @@ fn prepare_change(
             (
                 location.to_vec(),
                 b'D',
-                Some((*id, entry_mode.is_commit())),
+                Some((*id, u32::from(entry_mode.value()))),
                 None,
             )
         }
@@ -5196,8 +5957,8 @@ fn prepare_change(
             (
                 location.to_vec(),
                 status,
-                Some((*previous_id, previous_entry_mode.is_commit())),
-                Some((*id, entry_mode.is_commit())),
+                Some((*previous_id, u32::from(previous_entry_mode.value()))),
+                Some((*id, u32::from(entry_mode.value()))),
             )
         }
         // Never produced: rewrite tracking is disabled via Options::default().
@@ -5212,15 +5973,20 @@ fn prepare_change(
         is_binary: false,
         old_size: 0,
         new_size: 0,
+        source: None,
+        score: 0,
+        old_side: old.map(|(id, mode)| (mode, id)),
+        new_side: new.map(|(id, mode)| (mode, id)),
     };
 
     if with_counts {
+        let is_sub = |mode: u32| mode & 0o170000 == 0o160000;
         let old_content = match old {
-            Some((id, is_sub)) => content_of(repo, id, is_sub)?,
+            Some((id, mode)) => content_of(repo, id, is_sub(mode))?,
             None => Vec::new(),
         };
         let new_content = match new {
-            Some((id, is_sub)) => content_of(repo, id, is_sub)?,
+            Some((id, mode)) => content_of(repo, id, is_sub(mode))?,
             None => Vec::new(),
         };
         f.old_size = old_content.len();
@@ -5228,7 +5994,7 @@ fn prepare_change(
         f.is_binary = is_binary(&old_content) || is_binary(&new_content);
         let mode_only = matches!((old, new), (Some((a, _)), Some((b, _))) if a == b);
         if !f.is_binary && !mode_only {
-            let (added, deleted) = count_changed_lines(&old_content, &new_content)?;
+            let (added, deleted) = count_changed_lines_ws(&old_content, &new_content, ws)?;
             f.added = added;
             f.deleted = deleted;
         }
@@ -5306,7 +6072,7 @@ fn emit_stat(out: &mut Vec<u8>, files: &[FileChange], sw: &StatWidths) -> Result
     while i < count && i < files.len() as i64 {
         let f = &files[i as usize];
         i += 1;
-        max_len = max_len.max(display_width(&f.path) as i64);
+        max_len = max_len.max(display_width(&stat_name(f)) as i64);
         if f.is_binary {
             // `"Bin XXX -> YYY bytes"`: 14 fixed chars plus each size's decimal width.
             let w = 14 + decimal_width(f.new_size) as i64 + decimal_width(f.old_size) as i64;
@@ -5382,7 +6148,8 @@ fn emit_stat(out: &mut Vec<u8>, files: &[FileChange], sw: &StatWidths) -> Result
     }
 
     for f in files.iter().take(count.max(0) as usize) {
-        let (prefix, name) = elide_name(&f.path, name_width);
+        let display = stat_name(f);
+        let (prefix, name) = elide_name(&display, name_width);
         let padding = name_width.saturating_sub(prefix.len() + display_width(name));
         out.push(b' ');
         out.extend_from_slice(prefix.as_bytes());
@@ -5462,17 +6229,161 @@ fn write_stat_summary(
     Ok(())
 }
 
+/// `diff_flush_raw()`: `:<old mode> <new mode> <old sha> <new sha> <status>\t<path>`,
+/// with a rename's similarity index after the status letter and its source path first.
+/// An absent side is mode `000000` and an all-zero id padded to the same width.
+fn emit_raw(repo: &gix::Repository, out: &mut Vec<u8>, files: &[FileChange], z: bool) -> Result<()> {
+    // `-z`: the field and record separators are NUL and paths go out unquoted.
+    let sep = if z { 0u8 } else { b'\t' };
+    let end = if z { 0u8 } else { b'\n' };
+    // `diff_aligned_abbrev()` abbreviates to `revs->abbrev`, which `--abbrev[=<n>]`
+    // and `--no-abbrev` already wrote into this repository's `core.abbrev`.
+    let abbrev =
+        crate::abbrev::configured_abbrev(repo, repo.object_hash().len_in_hex()).max(MINIMUM_ABBREV);
+    for f in files {
+        let side = |s: Option<(u32, ObjectId)>| -> Result<(u32, String)> {
+            let Some((mode, id)) = s else {
+                return Ok((0, "0".repeat(abbrev)));
+            };
+            // A gitlink names a commit this odb does not have, so it cannot be
+            // disambiguated against — git truncates it as-is.
+            if mode & 0o170000 == 0o160000 {
+                return Ok((mode, id.to_hex_with_len(abbrev).to_string()));
+            }
+            Ok((mode, id.attach(repo).shorten()?.to_string()))
+        };
+        let (old_mode, old_hex) = side(f.old_side)?;
+        let (new_mode, new_hex) = side(f.new_side)?;
+        write!(out, ":{old_mode:06o} {new_mode:06o} {old_hex} {new_hex} ")?;
+        out.push(f.status);
+        if let Some(source) = &f.source {
+            write!(out, "{:03}", f.score)?;
+            out.push(sep);
+            out.extend_from_slice(&name_field(source, z));
+        }
+        out.push(sep);
+        out.extend_from_slice(&name_field(&f.path, z));
+        out.push(end);
+    }
+    Ok(())
+}
+
+/// Whether a pair still has something to report once a whitespace rule has been
+/// applied — `diff_flush_patch_quietly()`'s test, stated over the change list: a
+/// creation, deletion, mode change, rename or binary difference always prints a
+/// header, and everything else survives only if lines actually differ.
+fn reports_change(f: &FileChange) -> bool {
+    let old_mode = f.old_side.map(|(m, _)| m);
+    let new_mode = f.new_side.map(|(m, _)| m);
+    old_mode.is_none()
+        || new_mode.is_none()
+        || old_mode != new_mode
+        || f.source.is_some()
+        || (f.is_binary && f.old_side.map(|(_, id)| id) != f.new_side.map(|(_, id)| id))
+        || f.added != 0
+        || f.deleted != 0
+}
+
+/// `diff_summary()`: one line per created, deleted, renamed or mode-changed file.
+fn emit_summary(out: &mut Vec<u8>, files: &[FileChange]) {
+    for f in files {
+        let old_mode = f.old_side.map(|(m, _)| m);
+        let new_mode = f.new_side.map(|(m, _)| m);
+        match (old_mode, new_mode, &f.source) {
+            // `show_rename_copy()`: the paired name, then a mode-change line whose
+            // own name is suppressed because the line above already carried one.
+            (_, _, Some(source)) => {
+                out.extend_from_slice(b" ");
+                out.extend_from_slice(if f.status == b'C' { b"copy " } else { b"rename " });
+                out.extend_from_slice(&super::diff_pairs::pprint_rename(source, &f.path));
+                out.extend_from_slice(format!(" ({}%)\n", f.score).as_bytes());
+                summary_mode_change(out, old_mode, new_mode, None);
+            }
+            (None, Some(mode), None) => summary_mode_name(out, "create", mode, &f.path),
+            (Some(mode), None, None) => summary_mode_name(out, "delete", mode, &f.path),
+            // `diff_summary()`'s default arm: a `-B` rewrite that stayed a
+            // modification announces itself and suppresses the mode-change name.
+            _ if f.score != 0 => {
+                out.extend_from_slice(b" rewrite ");
+                out.extend_from_slice(&super::diff_files::quoted_name_bytes(&f.path));
+                out.extend_from_slice(format!(" ({}%)\n", f.score).as_bytes());
+                summary_mode_change(out, old_mode, new_mode, None);
+            }
+            _ => summary_mode_change(out, old_mode, new_mode, Some(&f.path)),
+        }
+    }
+}
+
+/// `show_file_mode_name()`: ` create mode <mode> <path>` / ` delete mode …`.
+fn summary_mode_name(out: &mut Vec<u8>, verb: &str, mode: u32, path: &[u8]) {
+    out.extend_from_slice(format!(" {verb} mode {mode:06o} ").as_bytes());
+    out.extend_from_slice(&super::diff_files::quoted_name_bytes(path));
+    out.push(b'\n');
+}
+
+/// `show_mode_change()`: the ` mode change <old> => <new>` line, named only when no
+/// other summary line for the same pair printed the path.
+fn summary_mode_change(out: &mut Vec<u8>, old: Option<u32>, new: Option<u32>, name: Option<&[u8]>) {
+    let (Some(old), Some(new)) = (old, new) else {
+        return;
+    };
+    if old == new {
+        return;
+    }
+    out.extend_from_slice(format!(" mode change {old:06o} => {new:06o}").as_bytes());
+    if let Some(path) = name {
+        out.push(b' ');
+        out.extend_from_slice(&super::diff_files::quoted_name_bytes(path));
+    }
+    out.push(b'\n');
+}
+
+/// A path as a raw/name record field: the bytes themselves under `-z`, C-quoted
+/// otherwise — `write_name_quoted()`.
+fn name_field(path: &[u8], z: bool) -> Vec<u8> {
+    if z {
+        path.to_vec()
+    } else {
+        super::diff_files::quoted_name_bytes(path)
+    }
+}
+
 /// git's `--numstat`: `<added>\t<deleted>\t<path>` per file, with `-\t-` for a
-/// binary file whose line counts are undefined.
-fn emit_numstat(out: &mut Vec<u8>, files: &[FileChange]) {
+/// binary file whose line counts are undefined. Under `-z` the record is
+/// `<added>\t<deleted>\t\0<path>\0`, with a rename naming both sides.
+fn emit_numstat(out: &mut Vec<u8>, files: &[FileChange], z: bool) {
     for f in files {
         if f.is_binary {
             out.extend_from_slice(b"-\t-\t");
         } else {
             out.extend_from_slice(format!("{}\t{}\t", f.added, f.deleted).as_bytes());
         }
-        out.extend_from_slice(&f.path);
+        if z {
+            // `show_numstat()`'s `-z` arm: the raw path, NUL-terminated. A rename
+            // prefixes an empty field and names its source first.
+            if let Some(source) = &f.source {
+                out.push(0);
+                out.extend_from_slice(source);
+                out.push(0);
+            }
+            out.extend_from_slice(&f.path);
+            out.push(0);
+            continue;
+        }
+        out.extend_from_slice(&stat_name(f));
         out.push(b'\n');
+    }
+}
+
+/// The name the stat formats print for a file: a rename goes through
+/// `pprint_rename()`, which factors out a shared prefix and suffix
+/// (`pkg/{a.txt => b.txt}`) and otherwise prints `old => new`.
+fn stat_name(f: &FileChange) -> Vec<u8> {
+    match &f.source {
+        // `pprint_rename()` quotes the pair itself; a plain name goes through
+        // `quote_c_style()` in `fill_print_name()`.
+        Some(source) => super::diff_pairs::pprint_rename(source, &f.path),
+        None => super::diff_files::quoted_name_bytes(&f.path),
     }
 }
 

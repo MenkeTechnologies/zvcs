@@ -7,7 +7,7 @@ use bstr::{BStr, BString, ByteSlice};
 
 use crate::{
     EntryRef, entry,
-    walk::{Action, Context, Delegate, Error, ForDeletionMode, Options, Outcome, classify, readdir},
+    walk::{Action, Context, Delegate, Error, Options, Outcome, classify, readdir},
 };
 
 /// A function to perform a git-style, unsorted, directory walk.
@@ -82,7 +82,7 @@ pub fn walk(
         } else {
             root_info
         },
-        options.for_deletion,
+        options,
         worktree_root_is_repository,
         delegate,
     );
@@ -159,7 +159,7 @@ fn assure_no_symlink_in_root<'root>(
 pub(super) fn can_recurse(
     rela_path: &BStr,
     info: classify::Outcome,
-    for_deletion: Option<ForDeletionMode>,
+    opts: Options<'_>,
     worktree_root_is_repository: bool,
     delegate: &mut dyn Delegate,
 ) -> bool {
@@ -167,11 +167,22 @@ pub(super) fn can_recurse(
     if !is_dir {
         return false;
     }
+    if recurses_into_ignored_directory(info, opts) {
+        return true;
+    }
     delegate.can_recurse(
         EntryRef::from_outcome(Cow::Borrowed(rela_path), info),
-        for_deletion,
+        opts.for_deletion,
         worktree_root_is_repository,
     )
+}
+
+/// Whether this directory is one the caller asked to look inside even though it is
+/// ignored — git's cleared `DIR_SHOW_OTHER_DIRECTORIES`.
+pub(super) fn recurses_into_ignored_directory(info: classify::Outcome, opts: Options<'_>) -> bool {
+    opts.recurse_ignored_directories
+        && matches!(info.status, entry::Status::Ignored(_))
+        && info.disk_kind.is_some_and(|k| k.is_dir())
 }
 
 /// Possibly emit an entry to `for_each` in case the provided information makes that possible.

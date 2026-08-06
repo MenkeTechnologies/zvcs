@@ -83,15 +83,22 @@
 //! Not covered — these `bail!` rather than emit output that would diverge:
 //!   * binary files, unless `-a`/`--text` is given. format-patch implies
 //!     `--binary`, i.e. a base85 `GIT binary patch` payload; that encoder is not
-//!     ported.
+//!     ported, and neither is the `Binary files … differ` + `Bin <n> -> <m> bytes`
+//!     pair `--no-binary` would print, so that flag parses but changes nothing.
 //!   * pathspec-limited output. A pathspec is parsed and honoured to the extent
 //!     that it never becomes a bogus revision error, but limiting the walk and
 //!     the patch to it is not ported, so a pathspec that reaches a non-empty
 //!     commit list is fatal.
-//!   * interdiff and range-diff, `--ignore-if-in-upstream`,
-//!     `--compact-summary`, `--encode-email-headers` as a *deferred* spelling,
-//!     whitespace-insensitive diffing, patience diff (imara-diff has Myers,
-//!     MyersMinimal and Histogram only), and rename/copy detection.
+//!   * interdiff and range-diff, `--function-context`, `--compact-summary`,
+//!     `--encode-email-headers` as a *deferred* spelling, whitespace-insensitive
+//!     diffing, patience diff (imara-diff has Myers, MyersMinimal and Histogram only),
+//!     and copy detection (`-C`; renames are detected, as git's default asks).
+//!     `--ignore-if-in-upstream` and `--creation-factor` reproduce the refusals git
+//!     raises for them (`need exactly one range`, `requires '--range-diff'`) but the
+//!     comparisons themselves are not ported.
+//!   * `--src-prefix=<p>`, `--dst-prefix=<p>`, `--no-prefix`, `--default-prefix` and
+//!     `--output=<file>` *are* ported; unknown options report git's own
+//!     `fatal: unrecognized argument: <arg>` (128).
 //!   * a glob in `notes.displayRef`/`GIT_NOTES_DISPLAY_REF`/`--notes=<glob>`:
 //!     expanding a pattern over the ref store is not ported, so a pattern is
 //!     refused rather than read as a literal ref name.
@@ -114,11 +121,10 @@
 //! id then feeds — the `In-Reply-To:` target, the `References:` chain and how
 //! shallow and deep threading differ — is byte-identical to git's.
 //!
-//! Known deviations, stated rather than hidden: rename/copy detection is
-//! disabled (as elsewhere in this crate), so a commit that renames a file
-//! renders as a delete plus an add instead of git's `rename from`/`rename to`
-//! and `old => new` stat line. Column widths are computed in Unicode scalar
-//! values, so East-Asian wide characters in a path measure 1 rather than 2. The
+//! Known deviations, stated rather than hidden: copy detection (`-C`) is off, as
+//! git's own default has it — renames are detected and render with git's
+//! `rename from`/`rename to` header and `old => new` stat line. Column widths are
+//! computed in Unicode scalar values, so East-Asian wide characters measure 1. The
 //! cover letter's shortlog does not wrap long subjects at 76 columns.
 //! `append_signoff()`'s trailer-block scan does not consult `trailer.<token>.key`
 //! config, so only git's own generated prefixes can carry a mixed block over the
@@ -337,6 +343,10 @@ struct Opts {
     /// `--no-prefix`/`format.noprefix`: drop the `a/`+`b/` path prefixes from
     /// `diff --git`, `---` and `+++`. `--default-prefix` puts them back.
     noprefix: bool,
+    /// `--src-prefix=<p>`/`--dst-prefix=<p>`: what those prefixes are when they are
+    /// not suppressed. git's defaults are `a/` and `b/`.
+    src_prefix: String,
+    dst_prefix: String,
 
     // Messaging.
     /// `-s`/`--signoff`, defaulted by `format.signOff`: append the committer's
@@ -387,6 +397,9 @@ struct Opts {
     context: u32,
     algorithm: Algorithm,
     text: bool,
+    /// `--no-binary`: a binary file section stops at `Binary files … differ` instead of
+    /// carrying the base85 `GIT binary patch` payload format-patch normally implies.
+    no_binary: bool,
     /// `-I<regex>`: change groups whose every line matches one of these are
     /// marked ignorable before hunks are assembled.
     ignore_regex: Vec<Regex>,
@@ -398,6 +411,9 @@ struct Opts {
     /// `--range-diff=<range>`: git validates the range after the walk (128 on a
     /// bad revision); the range-diff render itself is not ported.
     range_diff: Option<String>,
+    /// `--output=<file>`: the whole series goes to this one file, which is created (and
+    /// truncated) while the option parses — before the `--stdout` conflict below.
+    output: Option<String>,
 
     /// Arg index of each entry in `revs`, so a revision error can be ordered
     /// against a diff-option value error the way git's `setup_revisions()` does.
@@ -418,6 +434,25 @@ pub fn format_patch(args: &[String]) -> Result<ExitCode> {
         Parsed::Ready(opts) => *opts,
         Parsed::Exit(code) => return Ok(code),
     };
+
+    // `cmd_format_patch`: `--output` cannot share a command line with `--stdout`. The
+    // file itself was already created while the option parsed, as git's `OPT_FILENAME`
+    // does, so it is left behind either way.
+    if opts.output.is_some() && opts.to_stdout {
+        return Ok(fatal("options '--stdout' and '--output' cannot be used together"));
+    }
+
+    // `--ignore-if-in-upstream` compares the series against the other side of a range,
+    // so git requires exactly two pending endpoints (`A..B`); `--creation-factor` only
+    // scales a `--range-diff` and is refused without one. Both die before any output,
+    // and in this order.
+    if opts.deferred.iter().any(|f| f == "--ignore-if-in-upstream") && pending_endpoints(&opts) != 2
+    {
+        return Ok(fatal("need exactly one range"));
+    }
+    if opts.deferred.iter().any(|f| is_flag(f, "--creation-factor")) && opts.range_diff.is_none() {
+        return Ok(fatal("the option '--creation-factor' requires '--range-diff'"));
+    }
 
     // git: "Make sure 0000-$sub.patch gives non-negative length for $sub".
     let floor = "0000-".len() + opts.suffix.len();
@@ -584,6 +619,13 @@ pub fn format_patch(args: &[String]) -> Result<ExitCode> {
 /// Append one rendered message to the mbox stream, or write it to its file and
 /// note the name for stdout.
 fn emit_message(buffered: &mut Vec<u8>, msg: &[u8], name: String, opts: &Opts) -> Result<()> {
+    // `--output=<file>`: every message of the series is appended to the one file the
+    // option opened, and nothing is announced on stdout.
+    if let Some(path) = &opts.output {
+        let mut f = std::fs::OpenOptions::new().append(true).open(path)?;
+        f.write_all(msg)?;
+        return Ok(());
+    }
     if opts.to_stdout {
         buffered.extend_from_slice(msg);
         return Ok(());
@@ -622,6 +664,10 @@ enum Parsed {
 /// prefixes emitted, and format-patch implies `--binary` (binary content is
 /// rejected either way).
 const NO_OP: &[&str] = &[
+    // `rev.always_show_header`, which `format-patch` sets for every commit anyway:
+    // measured against stock 2.55.0 over single commits, ranges, and commits whose
+    // diff is empty, the output is identical with and without it.
+    "--always",
     "--indent-heuristic",
     "--no-renames",
     "--rename-empty",
@@ -633,7 +679,6 @@ const NO_OP: &[&str] = &[
     "--no-progress",
     "--no-relative",
     "--ita-invisible-in-index",
-    "--binary",
 ];
 
 /// Flags git accepts that this module has not ported. Matched as `--flag` or
@@ -642,13 +687,11 @@ const DEFERRED: &[&str] = &[
     "--encode-email-headers",
     "--interdiff",
     "--creation-factor",
-    "--always",
     "--ignore-if-in-upstream",
     "--compact-summary",
     "--patience",
     "--no-indent-heuristic",
     "--full-index",
-    "--no-binary",
     "--abbrev",
     "--break-rewrites",
     "--find-renames",
@@ -772,6 +815,8 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
         encode_email_headers: snap.boolean("format.encodeEmailHeaders").unwrap_or(true),
         mboxrd: snap.boolean("format.mboxrd") == Some(true),
         noprefix: snap.boolean("format.noprefix") == Some(true),
+        src_prefix: "a/".to_owned(),
+        dst_prefix: "b/".to_owned(),
         signoff: snap.boolean("format.signOff") == Some(true),
         from: cfg_from,
         force_in_body_from: snap.boolean("format.forceInBodyFrom") == Some(true),
@@ -843,9 +888,11 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
         context: 3,
         algorithm: Algorithm::Myers,
         text: false,
+        no_binary: false,
         ignore_regex: Vec::new(),
         deferred: Vec::new(),
         range_diff: None,
+        output: None,
         rev_pos: Vec::new(),
         opt_error: None,
     };
@@ -914,7 +961,13 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
             "--encode-email-headers" => o.encode_email_headers = true,
             "--no-encode-email-headers" => o.encode_email_headers = false,
             "--no-prefix" => o.noprefix = true,
-            "--default-prefix" => o.noprefix = false,
+            "--no-binary" => o.no_binary = true,
+            "--binary" => o.no_binary = false,
+            "--default-prefix" => {
+                o.noprefix = false;
+                o.src_prefix = "a/".to_owned();
+                o.dst_prefix = "b/".to_owned();
+            }
             "-p" | "--no-stat" => o.use_patch_format = true,
             // Each of these ORs its own `DIFF_FORMAT_*` bit in, which is what
             // makes them *replace* format-patch's `DIFFSTAT|SUMMARY` default
@@ -1205,15 +1258,26 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
             s if s.starts_with("--range-diff=") => {
                 o.range_diff = Some(s["--range-diff=".len()..].to_owned());
             }
+            // `OPT_FILENAME` opens the file as it parses, so it exists (empty) even when
+            // a later check kills the command.
+            "--output" => {
+                i += 1;
+                let v = value_at(args, i, a)?;
+                std::fs::File::create(&v)?;
+                o.output = Some(v);
+            }
+            s if s.starts_with("--output=") => {
+                let v = s["--output=".len()..].to_owned();
+                std::fs::File::create(&v)?;
+                o.output = Some(v);
+            }
             s if s.starts_with("--src-prefix=") => {
-                if &s["--src-prefix=".len()..] != "a/" {
-                    o.deferred.push(a.to_owned());
-                }
+                o.src_prefix = s["--src-prefix=".len()..].to_owned();
+                o.noprefix = false;
             }
             s if s.starts_with("--dst-prefix=") => {
-                if &s["--dst-prefix=".len()..] != "b/" {
-                    o.deferred.push(a.to_owned());
-                }
+                o.dst_prefix = s["--dst-prefix=".len()..].to_owned();
+                o.noprefix = false;
             }
             // git's `--color=<when>` runs `git_config_colorbool(NULL, arg)`,
             // which accepts only never/always/auto (case-insensitively) and
@@ -1352,7 +1416,11 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
             {
                 o.deferred.push(s.to_owned());
             }
-            s if s.starts_with('-') => bail!("unsupported flag {s:?}"),
+            // `setup_revisions()` reports anything left over the same way, whether it
+            // is a typo or an option git knows but this module does not reach.
+            s if s.starts_with('-') => {
+                return Ok(Parsed::Exit(fatal(&format!("unrecognized argument: {s}"))));
+            }
             s => {
                 o.revs.push(s.to_owned());
                 o.rev_pos.push(i);
@@ -1996,6 +2064,18 @@ fn at_worktree_top(repo: &gix::Repository) -> bool {
 
 /// git exits 128 on a fatal error; `anyhow::bail!` would collapse that to 1, so
 /// the message goes to stderr here and the code is returned explicitly.
+/// The number of objects `setup_revisions()` would leave pending: a range names two
+/// endpoints, a bare revision one, and an empty command line defaults to `HEAD`.
+fn pending_endpoints(opts: &Opts) -> usize {
+    if opts.revs.is_empty() {
+        return 1;
+    }
+    opts.revs
+        .iter()
+        .map(|r| if r.contains("..") { 2 } else { 1 })
+        .sum()
+}
+
 fn fatal(msg: &str) -> ExitCode {
     eprintln!("fatal: {msg}");
     ExitCode::from(128)
@@ -3374,7 +3454,156 @@ fn tree_changes(
         repo.diff_tree_to_tree(old_tree, new_tree, gix::diff::Options::default())?;
     changes.retain(|c| !is_tree_entry(c));
     changes.sort_by(|a, b| change_path(a).cmp(change_path(b)));
+    detect_renames(repo, &mut changes)?;
     Ok(changes)
+}
+
+/// `diffcore_rename()`: replace each deletion/addition pair whose content matches (or
+/// is similar enough) with the single rewrite entry git reports.
+///
+/// `format-patch` is a porcelain, so detection is on unless `diff.renames` turns it
+/// off, at git's default 50%. The pass is the same port `git diff` uses, so the
+/// pairing and the similarity index agree between them.
+fn detect_renames(repo: &gix::Repository, changes: &mut Vec<ChangeDetached>) -> Result<()> {
+    use gix::bstr::ByteSlice;
+
+    let cfg = repo.config_snapshot();
+    let detect = super::diffcore_rename::config_rename(
+        cfg.string("diff.renames").as_deref().map(|v| v.as_bstr()),
+    );
+    let has_pair = changes
+        .iter()
+        .any(|c| matches!(c, ChangeDetached::Addition { .. }))
+        && changes
+            .iter()
+            .any(|c| matches!(c, ChangeDetached::Deletion { .. }));
+    if detect == 0 || !has_pair {
+        return Ok(());
+    }
+    let opts = super::diffcore_rename::Options {
+        detect_rename: detect,
+        rename_limit: cfg
+            .integer("diff.renameLimit")
+            .unwrap_or(super::diffcore_rename::DEFAULT_RENAME_LIMIT),
+        hash_kind: repo.object_hash(),
+        ..Default::default()
+    };
+
+    let null = gix::hash::ObjectId::null(repo.object_hash());
+    let mut q = super::diffcore_rename::Queue::default();
+    for change in changes.iter() {
+        let (path, old, new, status) = match change {
+            ChangeDetached::Addition {
+                location,
+                entry_mode,
+                id,
+                ..
+            } => (location, None, Some((*id, entry_mode.value())), b'A'),
+            ChangeDetached::Deletion {
+                location,
+                entry_mode,
+                id,
+                ..
+            } => (location, Some((*id, entry_mode.value())), None, b'D'),
+            ChangeDetached::Modification {
+                location,
+                previous_entry_mode,
+                previous_id,
+                entry_mode,
+                id,
+            } => (
+                location,
+                Some((*previous_id, previous_entry_mode.value())),
+                Some((*id, entry_mode.value())),
+                b'M',
+            ),
+            // gix never produces these here: the tree diff runs without rewrites.
+            ChangeDetached::Rewrite { .. } => return Ok(()),
+        };
+        let one = q.add_spec(super::diffcore_rename::FileSpec::new(
+            path.clone(),
+            old.map_or(0, |(_, mode)| u32::from(mode)),
+            old.map_or(null, |(id, _)| id),
+            old.is_some(),
+        ));
+        let two = q.add_spec(super::diffcore_rename::FileSpec::new(
+            path.clone(),
+            new.map_or(0, |(_, mode)| u32::from(mode)),
+            new.map_or(null, |(id, _)| id),
+            new.is_some(),
+        ));
+        let idx = q.add_pair(one, two);
+        q.pairs[idx].status = status;
+    }
+
+    let mut content = OdbContent { repo };
+    super::diffcore_rename::run(&mut q, &opts, &mut content);
+    super::diffcore_rename::resolve_rename_copy(&mut q);
+
+    let mut rebuilt: Vec<ChangeDetached> = Vec::with_capacity(q.pairs.len());
+    for pair in &q.pairs {
+        let source = &q.specs[pair.one];
+        let dest = &q.specs[pair.two];
+        let status = if pair.status == 0 { b'M' } else { pair.status };
+        if !matches!(status, b'R' | b'C') {
+            // Not a rename: the change this pair was built from is kept as it is, and
+            // both of its sides carry that one path.
+            if let Some(at) = changes
+                .iter()
+                .position(|c| change_path(c) == dest.path.as_bstr())
+            {
+                rebuilt.push(changes.remove(at));
+            }
+            continue;
+        }
+        let score = super::diffcore_rename::similarity_index(pair.score);
+        rebuilt.push(ChangeDetached::Rewrite {
+            source_location: source.path.clone(),
+            source_entry_mode: mode_from_octal(source.mode),
+            source_relation: None,
+            source_id: source.oid,
+            // The only consumer of this is the `similarity index` line, which is what
+            // the score is carried in.
+            diff: Some(gix::diff::blob::DiffLineStats {
+                removals: 0,
+                insertions: 0,
+                before: 0,
+                after: 0,
+                similarity: score as f32 / 100.0,
+            }),
+            entry_mode: mode_from_octal(dest.mode),
+            id: dest.oid,
+            location: dest.path.clone(),
+            relation: None,
+            copy: status == b'C',
+        });
+    }
+    rebuilt.sort_by(|a, b| change_path(a).cmp(change_path(b)));
+    *changes = rebuilt;
+    Ok(())
+}
+
+/// The `EntryMode` for a raw octal mode, as the queue carries it.
+fn mode_from_octal(mode: u32) -> gix::objs::tree::EntryMode {
+    gix::objs::tree::EntryMode::try_from(format!("{mode:o}").as_bytes())
+        .unwrap_or(gix::objs::tree::EntryKind::Blob.into())
+}
+
+/// Reads a filespec's blob for [`super::diffcore_rename`]; both sides name an object
+/// in the database here.
+struct OdbContent<'a> {
+    repo: &'a gix::Repository,
+}
+
+impl super::diffcore_rename::Content for OdbContent<'_> {
+    fn size(&mut self, spec: &super::diffcore_rename::FileSpec) -> Option<u64> {
+        let header = self.repo.find_header(spec.oid).ok()?;
+        (header.kind() == gix::object::Kind::Blob).then(|| header.size())
+    }
+
+    fn data(&mut self, spec: &super::diffcore_rename::FileSpec) -> Option<Vec<u8>> {
+        self.repo.find_object(spec.oid).ok().map(|o| o.detach().data)
+    }
 }
 
 fn is_tree_entry(change: &ChangeDetached) -> bool {
@@ -3942,7 +4171,24 @@ fn emit_dirstat(
             ChangeDetached::Addition {
                 entry_mode, id, ..
             } => content_of(repo, *id, entry_mode.is_commit())?.len() as u64,
-            ChangeDetached::Rewrite { .. } => bail!("rename/copy detection is not supported"),
+            // A rename is charged the damage between its two sides, the same way a
+            // modification is; an unchanged move costs nothing.
+            ChangeDetached::Rewrite {
+                source_entry_mode,
+                source_id,
+                entry_mode,
+                id,
+                ..
+            } => {
+                let old = content_of(repo, *source_id, source_entry_mode.is_commit())?;
+                let new = content_of(repo, *id, entry_mode.is_commit())?;
+                if source_id == id {
+                    0
+                } else {
+                    let (added, copied) = count_changes(&old, &new);
+                    ((old.len() as u64 - copied) + added).max(1)
+                }
+            }
         };
         files.push(DirstatFile {
             name: change_path(change).to_vec(),
@@ -4259,10 +4505,30 @@ fn emit_summary(out: &mut Vec<u8>, changes: &[ChangeDetached]) -> Result<()> {
                     )?;
                 }
             }
-            ChangeDetached::Rewrite { .. } => bail!("rename/copy detection is not supported"),
+            // `diff_summary()`'s rename/copy line, with the similarity in percent.
+            ChangeDetached::Rewrite {
+                source_location,
+                location,
+                diff,
+                copy,
+                ..
+            } => writeln!(
+                out,
+                " {} {} ({}%)",
+                if *copy { "copy" } else { "rename" },
+                // `show_rename_copy()` prints the compacted `pkg/{a.txt => b.txt}`
+                // form, the same one the diffstat row uses.
+                quote_path(&super::diff_pairs::pprint_rename(source_location, location)),
+                similarity_percent(diff.as_ref())
+            )?,
         }
     }
     Ok(())
+}
+
+/// The `similarity index` percentage carried on a rewrite.
+fn similarity_percent(diff: Option<&gix::diff::blob::DiffLineStats>) -> u32 {
+    diff.map_or(100, |d| (d.similarity * 100.0).round() as u32)
 }
 
 // ---------------------------------------------------------------------------
@@ -4353,20 +4619,81 @@ fn emit_change(
                 )?;
             }
         }
-        // Never produced: rewrite tracking is off via Options::default().
-        ChangeDetached::Rewrite { .. } => bail!("rename/copy detection is not supported"),
+        ChangeDetached::Rewrite {
+            source_location,
+            source_entry_mode,
+            source_id,
+            entry_mode,
+            id,
+            location,
+            diff,
+            copy,
+            ..
+        } => {
+            let (from, to): (&[u8], &[u8]) = (source_location, location);
+            emit_rename_header(out, from, to, opts);
+            writeln!(out, "similarity index {}%", similarity_percent(diff.as_ref()))?;
+            let verb = if *copy { "copy" } else { "rename" };
+            writeln!(out, "{verb} from {}", quote_path(from))?;
+            writeln!(out, "{verb} to {}", quote_path(to))?;
+            let old_mode = format!("{:o}", source_entry_mode.value());
+            let new_mode = format!("{:o}", entry_mode.value());
+            if old_mode != new_mode {
+                writeln!(out, "old mode {old_mode}")?;
+                writeln!(out, "new mode {new_mode}")?;
+            }
+            // A rename that moved the content unchanged has nothing below the header.
+            if source_id != id {
+                let old_is_sub = source_entry_mode.is_commit();
+                let new_is_sub = entry_mode.is_commit();
+                let old_content = content_of(repo, *source_id, old_is_sub)?;
+                let new_content = content_of(repo, *id, new_is_sub)?;
+                reject_binary(old_is_sub, &old_content, from, opts)?;
+                reject_binary(new_is_sub, &new_content, to, opts)?;
+                let old_short = short_oid(repo, *source_id, abbrev, old_is_sub)?;
+                let new_short = short_oid(repo, *id, abbrev, new_is_sub)?;
+                if old_mode != new_mode {
+                    writeln!(out, "index {old_short}..{new_short}")?;
+                } else {
+                    writeln!(out, "index {old_short}..{new_short} {new_mode}")?;
+                }
+                counts = emit_body(out, Some(from), Some(to), &old_content, &new_content, opts)?;
+            }
+        }
     }
+    // The stat row for a rename names both sides through `pprint_rename()`.
+    let display = match change {
+        ChangeDetached::Rewrite {
+            source_location,
+            location,
+            ..
+        } => super::diff_pairs::pprint_rename(source_location, location),
+        _ => change_path(change).to_vec(),
+    };
     Ok(StatEntry {
-        name: quote_path(change_path(change)),
-        raw_name: change_path(change).to_vec(),
+        name: quote_path(&display),
+        raw_name: display,
         added: counts.0,
         deleted: counts.1,
     })
 }
 
+/// `diff --git a/<old> b/<new>` for a rename, where the two paths differ.
+fn emit_rename_header(out: &mut Vec<u8>, from: &[u8], to: &[u8], opts: &Opts) {
+    let (a, b) = prefixes(opts);
+    out.extend_from_slice(b"diff --git ");
+    out.extend_from_slice(&quote_two(a, from));
+    out.push(b' ');
+    out.extend_from_slice(&quote_two(b, to));
+    out.push(b'\n');
+}
+
 /// format-patch implies `--binary`, whose base85 `GIT binary patch` payload is
 /// not ported; refuse rather than emit a textual approximation. `-a`/`--text`
-/// asks for exactly that textual rendering, so it is honoured.
+/// asks for exactly that textual rendering, so it is honoured. `--no-binary` parses
+/// but does not change this: its `Binary files … differ` line comes with a
+/// `Bin <n> -> <m> bytes` stat row that this stat renderer does not produce either,
+/// so a binary file is still refused rather than half-rendered.
 fn reject_binary(is_submodule: bool, content: &[u8], path: &[u8], opts: &Opts) -> Result<()> {
     if !opts.text && !is_submodule && content.iter().take(8000).any(|&b| b == 0) {
         bail!(
@@ -4391,12 +4718,11 @@ fn emit_git_header(out: &mut Vec<u8>, path: &[u8], opts: &Opts) {
 
 /// The `a/`+`b/` source/destination prefixes, emptied by `--no-prefix` /
 /// `format.noprefix`.
-fn prefixes(opts: &Opts) -> (&'static str, &'static str) {
+fn prefixes(opts: &Opts) -> (&str, &str) {
     if opts.noprefix {
-        ("", "")
-    } else {
-        ("a/", "b/")
+        return ("", "");
     }
+    (opts.src_prefix.as_str(), opts.dst_prefix.as_str())
 }
 
 /// Emit the `---`/`+++` headers and hunks, returning `(added, deleted)` line

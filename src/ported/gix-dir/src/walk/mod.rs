@@ -161,6 +161,13 @@ pub struct Options<'a> {
     /// If `Some(mode)`, entries that are ignored will be emitted according to the given `mode`.
     /// If `None`, ignored entries will not be emitted at all.
     pub emit_ignored: Option<EmissionMode>,
+    /// If `true`, descend into a directory that is itself ignored so every ignored file
+    /// inside it is seen, instead of stopping at the directory.
+    ///
+    /// This is git's missing `DIR_SHOW_OTHER_DIRECTORIES`: `git status -uall --ignored`
+    /// clears that flag, which is why it prints `build/output.o` where the default
+    /// `-unormal` prints `build/`.
+    pub recurse_ignored_directories: bool,
     /// When the walk is for deletion, this must be `Some(_)` to assure we don't collapse directories that have precious files in
     /// them, and otherwise assure that no entries are observable that shouldn't be deleted.
     /// If `None`, precious files are treated like expendable files, which is usually what you want when displaying them

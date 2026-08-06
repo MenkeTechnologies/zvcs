@@ -13,13 +13,16 @@ use gix::objs::{Kind, TreeRefIter};
 use gix::prelude::ObjectIdExt;
 use gix::revision::plumbing::Spec as RevSpec;
 
-use super::filespec::{content_of, count_changed_lines, is_binary};
+use super::filespec::{content_of, count_changed_lines_ws, is_binary};
 use super::line_log;
 use super::log::{DecorateStyle, Decorations, Mailmap};
 
-/// git's floor for an abbreviated object id, used for the all-zero side of an
-/// `index`/raw line where there is no real object to disambiguate against.
-const MINIMUM_ABBREV: usize = 7;
+/// git's `MINIMUM_ABBREV`: the shortest id `--abbrev=<n>` may ask for, and the width
+/// the all-zero side of an `index`/raw line is padded to when nothing longer is set.
+const MINIMUM_ABBREV: usize = 4;
+
+/// git's `DEFAULT_ABBREV`, the length a valueless `--abbrev` selects.
+const DEFAULT_ABBREV: usize = 7;
 
 /// The terminal width git assumes for `--stat` when stdout is not a terminal.
 const STAT_TERM_WIDTH: usize = 80;
@@ -60,11 +63,14 @@ const STAT_TERM_WIDTH: usize = 80;
 /// never parsed and the tracked ranges therefore print as a brand-new file (a merge
 /// prints its header alone). See [`super::line_log`].
 ///
-/// Diff output formats: `-p`/`--patch`, `--stat`, `--raw`, `--name-only`,
-/// `-s`/`--no-patch`, and `-q`/`--quiet`. Their interaction is git's, reproduced in
-/// [`Formats`]; `-q`/`--quiet` suppresses the default patch but yields to any
-/// explicit format flag regardless of position (git applies its NO_OUTPUT bit
-/// before the other diff flags parse).
+/// Diff output formats: `-p`/`--patch`, `--stat`, `--shortstat`, `--numstat`, `--raw`,
+/// `--summary`, `--name-only`, `--name-status`, `-s`/`--no-patch`, and `-q`/`--quiet`.
+/// Their interaction is git's, reproduced in [`Formats`]; `-q`/`--quiet` suppresses the
+/// default patch but yields to any explicit format flag regardless of position (git
+/// applies its NO_OUTPUT bit before the other diff flags parse). `--abbrev[=<n>]` and
+/// `--no-abbrev` set the width of the ids the raw columns and the patch `index` line
+/// carry, applied as a `core.abbrev` override — `--no-abbrev` is git's zero, so the raw
+/// columns widen to the whole hash while the `index` line keeps the configured default.
 ///
 /// The patch uses git's default settings: Myers diff with the indent (slider)
 /// heuristic, three lines of context, `@@`-hunk function-context, binary-file
@@ -72,11 +78,9 @@ const STAT_TERM_WIDTH: usize = 80;
 /// colorized (equivalent to `git --no-color show` / a non-tty pipe).
 ///
 /// Deviations, surfaced rather than faked:
-///   * Rename/copy detection is disabled, so a renamed file shows as a delete plus
-///     an add instead of git's default `rename from`/`rename to`. Everything emitted
-///     is still a correct patch.
-///   * Non-ASCII/special paths are emitted verbatim rather than `core.quotePath`-quoted,
-///     and `--stat` measures a path in `char`s rather than display columns.
+///   * Non-ASCII/special paths are C-quoted the way `write_name_quoted()` quotes them,
+///     but `core.quotePath` itself is not consulted, and `--stat` measures a path in
+///     `char`s rather than display columns.
 ///   * `--stat` assumes an 80-column terminal (`COLUMNS` is not consulted), but the
 ///     `--stat-width`/`--stat=<w>`, `--stat-name-width`, `--stat-graph-width`, and
 ///     `--stat-count` flags and the `diff.statNameWidth`/`diff.statGraphWidth` config
@@ -91,6 +95,8 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
     let mut specs: Vec<&str> = Vec::new();
     let mut pathspecs: Vec<Vec<u8>> = Vec::new();
     let mut formats = Formats::default();
+    // `-z` (`diffopt.line_termination = 0`): NUL-terminated records with raw paths.
+    let mut z = false;
     let mut pretty = Pretty::Medium;
     // `rev->pretty_given`, which is what decides whether notes show by default.
     let mut pretty_given = false;
@@ -100,6 +106,12 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
     // config defaults are resolved after the repo is discovered; these hold the
     // CLI overrides in the meantime (`None` = fall back to config).
     let mut cli_abbrev: Option<bool> = None;
+    // `--abbrev[=<n>]` (`revs->abbrev`), clamped and applied after the repo is open;
+    // `--no-abbrev` is git's zero, which prints whole ids everywhere but the `index`
+    // line.
+    let mut abbrev_len: Option<usize> = None;
+    let mut abbrev_raw: Option<String> = None;
+    let mut no_abbrev = false;
     let mut cli_date: Option<DateMode> = None;
     let mut force_root = false;
     let mut first_parent = false;
@@ -119,6 +131,8 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
     // `--stat` width geometry; seeded from config after repo discovery, then any
     // explicit `--stat*` flag below wins (git precedence).
     let mut stat_widths = StatWidths::default();
+    // The patch-shaping options, handed to the shared renderer.
+    let mut patch_opts = super::diff::PatchOpts::default();
     // `--decorate[=<style>]` / `--no-decorate`, shared with `git log`. `None` means
     // no flag was given, so `log.decorate` (and then git's `auto` default) decides.
     let mut cli_decorate: Option<DecorateStyle> = None;
@@ -183,6 +197,11 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
             "-q" | "--quiet" => quiet = true,
             "--no-quiet" => quiet = false,
             "--name-only" => formats.name_only = true,
+            "--name-status" => formats.name_status = true,
+            "-z" => z = true,
+            "--numstat" => formats.numstat = true,
+            "--shortstat" => formats.shortstat = true,
+            "--summary" => formats.summary = true,
             "--raw" => formats.raw = true,
             "--stat" => formats.stat = true,
             "--oneline" => {
@@ -203,6 +222,17 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
             }
             // `log.abbrevCommit`/`log.date`/`log.showRoot` overrides, mirroring
             // `git log`. There is no `--no-root`; `--root` only forces it on.
+            // `--encoding=<enc>`: the encoding commit messages are re-coded into; this
+            // port writes them as stored, which is `utf-8`/`none`.
+            s if s.starts_with("--encoding=") => {
+                let v = &s["--encoding=".len()..];
+                if !super::blame::encoding_is_passthrough(v) {
+                    bail!(
+                        "unsupported option {s} (only utf-8 and none are ported; re-coding \
+                         commit messages is not)"
+                    );
+                }
+            }
             "--abbrev-commit" => cli_abbrev = Some(true),
             "--no-abbrev-commit" => cli_abbrev = Some(false),
             "--root" => force_root = true,
@@ -291,6 +321,111 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
                 } else if let Some(v) = s.strip_prefix("--stat-count=") {
                     formats.stat = true;
                     stat_widths.count = parse_stat_i64(v);
+                // Rename detection: on by default for a porcelain, and these are the
+                // knobs `diff_opt_parse()` gives to turn it off or retune it.
+                // The patch-shaping options `diff_opt_parse()` takes.
+                } else if s == "-w" || s == "--ignore-all-space" {
+                    patch_opts.ws = super::diff::Whitespace::IgnoreAll;
+                } else if s == "-b" || s == "--ignore-space-change" {
+                    patch_opts.ws = super::diff::Whitespace::IgnoreChange;
+                } else if s == "--ignore-space-at-eol" {
+                    patch_opts.ws = super::diff::Whitespace::IgnoreAtEol;
+                } else if s == "--full-index" {
+                    patch_opts.full_index = true;
+                } else if s == "-a" || s == "--text" {
+                    patch_opts.text = true;
+                } else if s == "-W" || s == "--function-context" {
+                    patch_opts.func_context = true;
+                } else if s == "--no-function-context" {
+                    patch_opts.func_context = false;
+                } else if s == "--no-prefix" {
+                    patch_opts.src_prefix.clear();
+                    patch_opts.dst_prefix.clear();
+                } else if s == "--default-prefix" {
+                    patch_opts.src_prefix = b"a/".to_vec();
+                    patch_opts.dst_prefix = b"b/".to_vec();
+                } else if let Some(v) = s.strip_prefix("--src-prefix=") {
+                    patch_opts.src_prefix = v.as_bytes().to_vec();
+                } else if let Some(v) = s.strip_prefix("--dst-prefix=") {
+                    patch_opts.dst_prefix = v.as_bytes().to_vec();
+                } else if let Some(v) = s
+                    .strip_prefix("-U")
+                    .filter(|v| !v.is_empty())
+                    .or_else(|| s.strip_prefix("--unified="))
+                {
+                    match v.parse::<u32>() {
+                        Ok(n) => patch_opts.ctx = n,
+                        Err(_) => bail!("invalid argument to -U: {v}"),
+                    }
+                } else if s == "--no-renames" {
+                    patch_opts.renames = Some(0);
+                // `diff_opt_find_copies()`: a second `-C` is `--find-copies-harder`.
+                } else if s == "-C" || s == "--find-copies" {
+                    patch_opts.rename_score = 0;
+                    if patch_opts.renames == Some(super::diffcore_rename::DETECT_COPY) {
+                        patch_opts.find_copies_harder = true;
+                    } else {
+                        patch_opts.renames = Some(super::diffcore_rename::DETECT_COPY);
+                    }
+                } else if let Some(v) = s
+                    .strip_prefix("--find-copies=")
+                    .or_else(|| s.strip_prefix("-C").filter(|r| !r.is_empty()))
+                {
+                    let (score, rest) = super::diffcore_rename::parse_rename_score(v);
+                    if !rest.is_empty() {
+                        bail!("invalid argument to -C: {v}");
+                    }
+                    patch_opts.rename_score = score;
+                    if patch_opts.renames == Some(super::diffcore_rename::DETECT_COPY) {
+                        patch_opts.find_copies_harder = true;
+                    } else {
+                        patch_opts.renames = Some(super::diffcore_rename::DETECT_COPY);
+                    }
+                } else if s == "--find-copies-harder" {
+                    patch_opts.find_copies_harder = true;
+                } else if s == "--no-find-copies-harder" {
+                    patch_opts.find_copies_harder = false;
+                // `diff_opt_break_rewrites()`: `-B[<n>][/<m>]`, packed as `n | (m << 16)`.
+                } else if s == "-B" || s == "--break-rewrites" {
+                    patch_opts.break_opt = 0;
+                } else if let Some(v) = s
+                    .strip_prefix("--break-rewrites=")
+                    .or_else(|| s.strip_prefix("-B").filter(|r| !r.is_empty()))
+                {
+                    match super::diffcore_rename::parse_break_opt(v) {
+                        Ok(n) => patch_opts.break_opt = n,
+                        Err(()) => bail!("invalid argument to -B: {v}"),
+                    }
+                } else if s == "--renames" || s == "-M" || s == "--find-renames" {
+                    patch_opts.renames = Some(super::diffcore_rename::DETECT_RENAME);
+                } else if let Some(v) = s
+                    .strip_prefix("-M")
+                    .or_else(|| s.strip_prefix("--find-renames="))
+                {
+                    patch_opts.renames = Some(super::diffcore_rename::DETECT_RENAME);
+                    let (score, rest) = super::diffcore_rename::parse_rename_score(v);
+                    if !rest.is_empty() {
+                        bail!("invalid argument to -M: {v}");
+                    }
+                    patch_opts.rename_score = score;
+                // `--abbrev[=<n>]` / `--no-abbrev`: the width of every abbreviated id
+                // in the run — `%h`, the oneline id, the `--raw` columns and the patch
+                // `index` line. Applied as a `core.abbrev` override once the repo is
+                // open, so one setting reaches all of them.
+                } else if s == "--abbrev" {
+                    abbrev_len = Some(DEFAULT_ABBREV);
+                    abbrev_raw = None;
+                    no_abbrev = false;
+                } else if s == "--no-abbrev" {
+                    no_abbrev = true;
+                    abbrev_len = None;
+                    abbrev_raw = None;
+                } else if let Some(v) = s.strip_prefix("--abbrev=") {
+                    // The clamp needs the hash width, so the raw request is kept
+                    // here and read once the repo is open.
+                    abbrev_raw = Some(v.to_string());
+                    abbrev_len = None;
+                    no_abbrev = false;
                 } else if s.starts_with('-') {
                     bail!("unsupported option {s}");
                 } else {
@@ -340,8 +475,28 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
         specs.push("HEAD");
     }
 
-    let repo = gix::discover(".")?;
+    let mut repo = gix::discover(".")?;
     let hex_len = repo.object_hash().len_in_hex();
+
+    // `revs->abbrev` reaches every abbreviation in the run, so it goes in front of
+    // the same `core.abbrev` lookup gitoxide already makes. `--no-abbrev` is the one
+    // exception: it prints whole ids but leaves the `index` line on the configured
+    // default, which is pinned here before the override lands.
+    if let Some(v) = &abbrev_raw {
+        abbrev_len = Some(crate::abbrev::parse_abbrev_arg(v, hex_len));
+    }
+    if no_abbrev {
+        patch_opts.index_abbrev = Some(crate::abbrev::configured_abbrev(&repo, hex_len));
+        abbrev_len = Some(hex_len);
+    }
+    if let Some(n) = abbrev_len {
+        let mut config = repo.config_snapshot_mut();
+        config.append_config(
+            Some(format!("core.abbrev={}", n.clamp(MINIMUM_ABBREV, hex_len))),
+            gix::config::Source::Cli,
+        )?;
+        config.commit()?;
+    }
 
     // Config supplies the defaults for the display knobs `git show` shares with
     // `git log`; the CLI flags parsed above win where present. git reads these in
@@ -531,9 +686,11 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
         show_root,
         first_parent,
         stat: stat_widths,
+        patch: patch_opts.clone(),
         decorate,
         decorations: decorations.as_ref(),
         mailmap: mailmap.as_ref(),
+        z,
     };
     if line_level {
         // `check_single_commit`: the ranges are resolved against exactly one pending
@@ -824,8 +981,12 @@ fn subject(msg: &[u8]) -> Vec<u8> {
 struct Formats {
     no_output: bool,
     name_only: bool,
+    name_status: bool,
     raw: bool,
     stat: bool,
+    numstat: bool,
+    shortstat: bool,
+    summary: bool,
     patch: bool,
 }
 
@@ -837,10 +998,18 @@ struct FormatConflict;
 enum Selection {
     /// `-s` alone: no diff output and no separator after the message.
     Disabled,
-    /// `--name-only` wins over every other diff format, whatever the order.
-    Names,
-    /// Any combination of raw, stat, and patch, rendered in that order.
-    Blocks { raw: bool, stat: bool, patch: bool },
+    /// `--name-only`/`--name-status` win over every other diff format, whatever the
+    /// order; `status` picks which of the two.
+    Names { status: bool },
+    /// Any combination of the block formats, rendered in git's fixed order.
+    Blocks {
+        raw: bool,
+        numstat: bool,
+        stat: bool,
+        shortstat: bool,
+        summary: bool,
+        patch: bool,
+    },
 }
 
 impl Formats {
@@ -852,7 +1021,20 @@ impl Formats {
     }
 
     fn any_set(self) -> bool {
-        self.no_output || self.name_only || self.raw || self.stat || self.patch
+        self.no_output
+            || self.name_only
+            || self.name_status
+            || self.raw
+            || self.stat
+            || self.numstat
+            || self.shortstat
+            || self.summary
+            || self.patch
+    }
+
+    /// The block formats, i.e. everything `--name-only`/`--name-status` overrides.
+    fn any_block(self) -> bool {
+        self.raw || self.stat || self.numstat || self.shortstat || self.summary || self.patch
     }
 
     /// Apply git's precedence: `-s` suppresses output only when it is the sole
@@ -862,18 +1044,22 @@ impl Formats {
         if !self.any_set() {
             self.patch = true;
         }
-        if self.no_output && self.name_only && !self.raw && !self.stat && !self.patch {
+        let names = self.name_only || self.name_status;
+        if self.no_output && names && !self.any_block() {
             return Err(FormatConflict);
         }
-        if self.no_output && !self.name_only && !self.raw && !self.stat && !self.patch {
+        if self.no_output && !names && !self.any_block() {
             return Ok(Selection::Disabled);
         }
-        if self.name_only {
-            return Ok(Selection::Names);
+        if names {
+            return Ok(Selection::Names { status: self.name_status });
         }
         Ok(Selection::Blocks {
             raw: self.raw,
+            numstat: self.numstat,
             stat: self.stat,
+            shortstat: self.shortstat,
+            summary: self.summary,
             patch: self.patch,
         })
     }
@@ -896,6 +1082,8 @@ struct DisplayOpts<'a> {
     /// `--first-parent`: render a merge as a plain diff against its first parent
     /// rather than the dense combined (`--cc`) diff.
     first_parent: bool,
+    /// The diff options the patch body is rendered with (`-U<n>`, `-w`, prefixes).
+    patch: super::diff::PatchOpts,
     /// `--stat` width geometry (see [`StatWidths`]).
     stat: StatWidths,
     /// `--decorate` / `log.decorate`: the decoration style for the `commit <id>`
@@ -908,6 +1096,21 @@ struct DisplayOpts<'a> {
     mailmap: Option<&'a Mailmap>,
     /// The notes trees whose `Notes[ (<ref>)]:` block follows the message.
     notes: &'a [super::notes::Tree],
+    /// `-z`: NUL instead of newline as the record terminator, and paths written
+    /// raw rather than through `write_name_quoted()`. It reaches the header's own
+    /// terminator too — `git show --name-status -z --format=%H` ends the id with a
+    /// NUL — and, for a merge's combined record, the separator that follows it.
+    z: bool,
+}
+
+/// A path as a record field: quoted the way `write_name_quoted()` does it, or raw
+/// under `-z`, where the NUL delimiter makes quoting unnecessary.
+fn name_bytes(path: &[u8], z: bool) -> Vec<u8> {
+    if z {
+        path.to_vec()
+    } else {
+        super::diff_files::quoted_name_bytes(path)
+    }
 }
 
 /// The `Notes[ (<ref>)]:` blocks for `id`, or empty when notes are off.
@@ -1153,12 +1356,18 @@ fn show_commit(
     // The pickaxe applies to the first-parent / non-merge path; a merge's combined
     // `--cc` diff is never paired with pickaxe by git-fuzzy and is left unfiltered.
     let pickaxe_path = pickaxe.active() && !(is_merge && !disp.first_parent);
+    let mut queue_nonempty = false;
     let files: Vec<FileChange> = if line_log_pairs.is_some() {
         // `-L` renders `line_log_queue_pairs()`' pairs, not the commit's own change
         // set, so none of the collection below runs.
         Vec::new()
     } else if diff_shown {
-        let mut f = collect_changes(repo, commit, parents.first().map(|p| p.detach()))?;
+        let mut f = collect_changes(
+            repo,
+            commit,
+            parents.first().map(|p| p.detach()),
+            &disp.patch,
+        )?;
         if !pathspecs.is_empty() {
             let specs = super::log::PathspecMatcher::new(repo, pathspecs)?;
             f.retain(|c| specs.matches(&c.path));
@@ -1171,6 +1380,14 @@ fn show_commit(
                 emit_patch(repo, &mut buf, c).is_ok()
                     && super::log::pickaxe_hit(&buf, pickaxe.s.as_deref(), pickaxe.g.as_ref())
             });
+        }
+        // `log_tree_diff_flush()` tests the queue for emptiness here, before
+        // `diff_flush()` re-renders it quietly under a whitespace rule and drops the
+        // pairs whose patch came out empty. A whitespace-only commit therefore still
+        // separates its message from the diff it no longer prints.
+        queue_nonempty = !f.is_empty();
+        if disp.patch.ws != super::diff::Whitespace::Keep {
+            f.retain(reports_change);
         }
         f
     } else {
@@ -1208,9 +1425,10 @@ fn show_commit(
         Pretty::User(fmt) => {
             expand_format(out, commit, fmt, disp.notes)?;
             // A `tformat` (the default for `--format=`) terminates each non-empty
-            // entry with a newline; the empty format terminates nothing.
+            // entry with the record terminator — a newline, or NUL under `-z`, which
+            // is `show_log()` writing `opt->diffopt.line_termination`.
             if !fmt.is_empty() {
-                out.push(b'\n');
+                out.push(if disp.z { b'\0' } else { b'\n' });
             }
         }
         Pretty::Medium => {
@@ -1269,8 +1487,12 @@ fn show_commit(
         }
         match selection {
             Selection::Disabled => {}
-            Selection::Names => {
+            Selection::Names { status } => {
                 for (pair, _) in pairs {
+                    if status {
+                        out.push(line_log_change(repo, pair).status);
+                        out.push(b'\t');
+                    }
                     out.extend_from_slice(&pair.path);
                     out.push(b'\n');
                 }
@@ -1280,7 +1502,7 @@ fn show_commit(
                 if raw {
                     let files: Vec<FileChange> =
                         pairs.iter().map(|(p, _)| line_log_change(repo, p)).collect();
-                    emit_raw(repo, out, &files)?;
+                    emit_raw(repo, out, &files, disp.z)?;
                     wrote_block = true;
                 }
                 if patch {
@@ -1307,8 +1529,35 @@ fn show_commit(
         // empty user format prints neither the blank line nor a header.
         // `--first-parent` opts out: the merge falls through to the plain
         // single-parent path below, diffing against `parents[0]` like any commit.
+        //
+        // A combined record's separator is the record terminator, so `-z` makes it a
+        // NUL — unlike the single-parent path below, where the blank line stays a
+        // newline even under `-z`.
         if !header_empty {
-            out.push(b'\n');
+            out.push(if disp.z { b'\0' } else { b'\n' });
+        }
+        // A merge's name list is the *combined* one: one status letter per parent,
+        // and only the paths that differ from every parent (`diff_tree_combined()`'s
+        // dense filter). `--name-only` prints the paths alone.
+        if let Selection::Names { status } = selection {
+            let ps: Vec<String> = pathspecs
+                .iter()
+                .map(|p| String::from_utf8_lossy(p).into_owned())
+                .collect();
+            let parent_ids: Vec<ObjectId> = parents.iter().map(|p| p.detach()).collect();
+            let sep = if disp.z { b'\0' } else { b'\t' };
+            let end = if disp.z { b'\0' } else { b'\n' };
+            for (path, letters) in
+                super::diff::merge_combined_names(repo, commit.id().detach(), &parent_ids, &ps)?
+            {
+                if status {
+                    out.extend_from_slice(letters.as_bytes());
+                    out.push(sep);
+                }
+                out.extend_from_slice(&name_bytes(&path, disp.z));
+                out.push(end);
+            }
+            return Ok(());
         }
         if let Selection::Blocks { stat, patch, .. } = selection {
             let mut wrote = false;
@@ -1346,7 +1595,7 @@ fn show_commit(
 
     // A pathspec that matched nothing leaves the message with no diff and, like git,
     // no trailing separator.
-    if files.is_empty() {
+    if !queue_nonempty {
         return Ok(());
     }
 
@@ -1370,29 +1619,83 @@ fn show_commit(
 
     match selection {
         Selection::Disabled => {}
-        Selection::Names => {
+        Selection::Names { status } => {
+            // Under `-z` every field ends in a NUL and the paths are written raw:
+            // `diff_flush_name()` skips `write_name_quoted()` when there is nothing a
+            // newline-delimited reader could confuse.
+            let sep = if disp.z { b'\0' } else { b'\t' };
+            let end = if disp.z { b'\0' } else { b'\n' };
             for f in &files {
-                out.extend_from_slice(&f.path);
-                out.push(b'\n');
+                if status {
+                    out.push(f.status);
+                    // A rename names its similarity index and both paths.
+                    if let Some(source) = &f.source {
+                        out.extend_from_slice(format!("{:03}", f.score).as_bytes());
+                        out.push(sep);
+                        out.extend_from_slice(&name_bytes(source, disp.z));
+                    }
+                    out.push(sep);
+                }
+                out.extend_from_slice(&name_bytes(&f.path, disp.z));
+                out.push(end);
             }
         }
-        Selection::Blocks { raw, stat, patch } => {
+        Selection::Blocks {
+            raw,
+            numstat,
+            stat,
+            shortstat,
+            summary,
+            patch,
+        } => {
             let mut wrote_block = false;
+            // `diff_flush()`'s fixed order: raw, numstat, stat, shortstat, summary,
+            // then the patch.
             if raw {
-                emit_raw(repo, out, &files)?;
+                emit_raw(repo, out, &files, disp.z)?;
                 wrote_block = true;
             }
+            if numstat {
+                emit_numstat(out, &files);
+                wrote_block = true;
+            }
+            // `diff_flush()` tests the two bits separately, so `--stat --shortstat`
+            // prints the stat block and then a second summary line.
             if stat {
                 emit_stat(out, &files, &disp.stat)?;
+                wrote_block = true;
+            }
+            if shortstat {
+                emit_shortstat(out, &files)?;
+                wrote_block = true;
+            }
+            if summary {
+                emit_summary(out, &files)?;
                 wrote_block = true;
             }
             if patch {
                 if wrote_block {
                     out.push(b'\n');
                 }
-                for f in &files {
-                    emit_patch(repo, out, f)?;
-                }
+                // The patch body comes from the shared `git diff` pipeline (the same
+                // one `git log -p` renders through), so every diff option it takes —
+                // `-w`, `-U<n>`, `--full-index`, the prefixes — applies here too, and
+                // the two commands stay byte-identical. The pickaxe path above still
+                // renders per file, since it filters on each file's own patch.
+                let specs: Vec<String> = pathspecs
+                    .iter()
+                    .map(|p| String::from_utf8_lossy(p).into_owned())
+                    .collect();
+                out.extend_from_slice(
+                    &super::diff::commit_patches(
+                        repo,
+                        &[(commit.id, parents.first().map(|p| p.detach()))],
+                        &disp.patch,
+                        &specs,
+                    )?
+                    .pop()
+                    .unwrap_or_default(),
+                );
             }
         }
     }
@@ -1429,6 +1732,8 @@ fn line_log_change(repo: &gix::Repository, pair: &line_log::Pair) -> FileChange 
     FileChange {
         path: path.to_vec(),
         status,
+        source: None,
+        score: 0,
         old_mode: mode(pair.old),
         new_mode: mode(pair.new),
         old_id: pair.old.map_or(null, |(id, _)| id),
@@ -1446,8 +1751,12 @@ fn line_log_change(repo: &gix::Repository, pair: &line_log::Pair) -> FileChange 
 
 struct FileChange {
     path: Vec<u8>,
-    /// `A`, `D`, `M`, or `T`, as used by `--raw`.
+    /// `A`, `D`, `M`, `T` or `R`, as used by `--raw`.
     status: u8,
+    /// The path the content came from, for a rename. `None` for everything else.
+    source: Option<Vec<u8>>,
+    /// `similarity_index()` of the rename, in percent. Meaningless without `source`.
+    score: u32,
     /// Octal entry modes; `None` on the side where the path does not exist.
     old_mode: Option<u32>,
     new_mode: Option<u32>,
@@ -1470,7 +1779,11 @@ fn collect_changes(
     repo: &gix::Repository,
     commit: &gix::Commit<'_>,
     parent: Option<ObjectId>,
+    // The diffcore knobs (`-M`/`-C`/`-B`) and the whitespace rule the tallies are
+    // computed under, so a whitespace-only change reports nothing.
+    opts: &super::diff::PatchOpts,
 ) -> Result<Vec<FileChange>> {
+    let ws = opts.ws;
     let new_tree = commit.tree()?;
     let old_tree = match parent {
         Some(pid) => Some(repo.find_object(pid)?.try_into_commit()?.tree()?),
@@ -1486,16 +1799,149 @@ fn collect_changes(
 
     let mut out = Vec::with_capacity(changes.len());
     for change in &changes {
-        if let Some(f) = prepare_change(repo, change)? {
+        if let Some(f) = prepare_change(repo, change, ws)? {
             out.push(f);
         }
     }
+    detect_renames(repo, &mut out, opts)?;
     Ok(out)
+}
+
+/// `diffcore_rename()`: pair each deletion with an addition that carries the same (or
+/// similar enough) content, so a moved file is one `R` entry rather than a `D` plus an
+/// `A`.
+///
+/// `git show` is a porcelain, so `init_diff_ui_defaults()` has rename detection on
+/// with git's default 50% similarity; `diff.renames` and `diff.renameLimit` move it.
+/// The pass is the same port `git diff` uses, so the pairing and the similarity
+/// indices agree between the two commands.
+fn detect_renames(
+    repo: &gix::Repository,
+    files: &mut Vec<FileChange>,
+    popts: &super::diff::PatchOpts,
+) -> Result<()> {
+    let cfg = repo.config_snapshot();
+    let detect = popts.renames.unwrap_or_else(|| {
+        super::diffcore_rename::config_rename(
+            cfg.string("diff.renames").as_deref().map(|v| v.as_bstr()),
+        )
+    });
+    // `-B` runs on its own: `diffcore_std()` breaks rewrites whether or not rename
+    // detection follows, and a break with no rename pass still reports the split.
+    let wants_break = popts.break_opt != -1;
+    if (detect == 0 && !wants_break)
+        || (!wants_break && !files.iter().any(|f| f.status == b'A' || f.status == b'D'))
+    {
+        return Ok(());
+    }
+    let opts = super::diffcore_rename::Options {
+        detect_rename: detect,
+        rename_score: popts.rename_score,
+        find_copies_harder: popts.find_copies_harder,
+        break_opt: popts.break_opt,
+        rename_limit: cfg
+            .integer("diff.renameLimit")
+            .unwrap_or(super::diffcore_rename::DEFAULT_RENAME_LIMIT),
+        hash_kind: repo.object_hash(),
+        ..Default::default()
+    };
+    let ws = popts.ws;
+
+    let mut q = super::diffcore_rename::Queue::default();
+    for f in files.iter() {
+        let one = q.add_spec(super::diffcore_rename::FileSpec::new(
+            f.path.clone().into(),
+            f.old_mode.unwrap_or(0),
+            f.old_id,
+            f.old_mode.is_some(),
+        ));
+        let two = q.add_spec(super::diffcore_rename::FileSpec::new(
+            f.path.clone().into(),
+            f.new_mode.unwrap_or(0),
+            f.new_id,
+            f.new_mode.is_some(),
+        ));
+        let idx = q.add_pair(one, two);
+        q.pairs[idx].status = f.status;
+    }
+
+    let mut content = ShowContent { repo };
+    super::diffcore_rename::run(&mut q, &opts, &mut content);
+    super::diffcore_rename::resolve_rename_copy(&mut q);
+
+    // Rebuild the list from the resolved queue: a rename replaces the deletion and the
+    // addition it was made of, and everything else comes back unchanged.
+    let mut rebuilt = Vec::with_capacity(q.pairs.len());
+    for pair in &q.pairs {
+        let source = &q.specs[pair.one];
+        let dest = &q.specs[pair.two];
+        let status = if pair.status == 0 { b'M' } else { pair.status };
+        if !matches!(status, b'R' | b'C') {
+            // Not a rename: the entry this pair was built from already has its
+            // contents and counts, and both of its sides carry that one path. A `-B`
+            // rewrite that stayed a modification carries a score, which `--summary`
+            // prints as its ` rewrite ... (n%)` line.
+            if let Some(at) = files.iter().position(|f| f.path == dest.path.as_slice()) {
+                let mut kept = files.swap_remove(at);
+                kept.score = super::diffcore_rename::similarity_index(pair.score);
+                rebuilt.push(kept);
+            }
+            continue;
+        }
+        let old_is_sub = source.mode & 0o170000 == 0o160000;
+        let new_is_sub = dest.mode & 0o170000 == 0o160000;
+        let mut f = FileChange {
+            path: dest.path.to_vec(),
+            status,
+            source: Some(source.path.to_vec()),
+            score: super::diffcore_rename::similarity_index(pair.score),
+            old_mode: Some(source.mode),
+            new_mode: Some(dest.mode),
+            old_id: source.oid,
+            new_id: dest.oid,
+            old_content: content_of(repo, source.oid, old_is_sub)?,
+            new_content: content_of(repo, dest.oid, new_is_sub)?,
+            old_is_sub,
+            new_is_sub,
+            is_binary: false,
+            // A pure rename has nothing to show below the header, exactly as a
+            // mode-only change has not.
+            mode_only: source.oid == dest.oid,
+            added: 0,
+            deleted: 0,
+        };
+        fill_counts(&mut f, ws)?;
+        rebuilt.push(f);
+    }
+    rebuilt.sort_by(|a, b| a.path.cmp(&b.path));
+    *files = rebuilt;
+    Ok(())
+}
+
+/// Reads a filespec's blob for [`diffcore_rename`]; every side names an object in the
+/// database here, so this is `diff_populate_filespec()` reduced to an odb lookup.
+struct ShowContent<'a> {
+    repo: &'a gix::Repository,
+}
+
+impl super::diffcore_rename::Content for ShowContent<'_> {
+    fn size(&mut self, spec: &super::diffcore_rename::FileSpec) -> Option<u64> {
+        let header = self.repo.find_header(spec.oid).ok()?;
+        (header.kind() == gix::object::Kind::Blob).then(|| header.size())
+    }
+
+    fn data(&mut self, spec: &super::diffcore_rename::FileSpec) -> Option<Vec<u8>> {
+        self.repo.find_object(spec.oid).ok().map(|o| o.detach().data)
+    }
 }
 
 /// Turn one gix change into a [`FileChange`], or `None` for the directory entries
 /// git does not report (gix emits those *and* recurses into them).
-fn prepare_change(repo: &gix::Repository, change: &ChangeDetached) -> Result<Option<FileChange>> {
+fn prepare_change(
+    repo: &gix::Repository,
+    change: &ChangeDetached,
+    ws: super::diff::Whitespace,
+) -> Result<Option<FileChange>> {
     let null = ObjectId::null(repo.object_hash());
     let mut f = match change {
         ChangeDetached::Addition {
@@ -1511,6 +1957,8 @@ fn prepare_change(repo: &gix::Repository, change: &ChangeDetached) -> Result<Opt
             FileChange {
                 path: location.to_vec(),
                 status: b'A',
+                source: None,
+                score: 0,
                 old_mode: None,
                 new_mode: Some(entry_mode.value().into()),
                 old_id: null,
@@ -1538,6 +1986,8 @@ fn prepare_change(repo: &gix::Repository, change: &ChangeDetached) -> Result<Opt
             FileChange {
                 path: location.to_vec(),
                 status: b'D',
+                source: None,
+                score: 0,
                 old_mode: Some(entry_mode.value().into()),
                 new_mode: None,
                 old_id: *id,
@@ -1574,6 +2024,8 @@ fn prepare_change(repo: &gix::Repository, change: &ChangeDetached) -> Result<Opt
             FileChange {
                 path: location.to_vec(),
                 status,
+                source: None,
+                score: 0,
                 old_mode: Some(previous_entry_mode.value().into()),
                 new_mode: Some(entry_mode.value().into()),
                 old_id: *previous_id,
@@ -1592,14 +2044,35 @@ fn prepare_change(repo: &gix::Repository, change: &ChangeDetached) -> Result<Opt
         ChangeDetached::Rewrite { .. } => bail!("rename/copy detection is not supported"),
     };
 
+    fill_counts(&mut f, ws)?;
+    Ok(Some(f))
+}
+
+/// Whether a pair still has something to report once a whitespace rule has been
+/// applied — `diff_flush_patch_quietly()`'s test, stated over the change list: a
+/// creation, deletion, mode change, rename or binary difference always prints a
+/// header, and everything else survives only if lines actually differ.
+fn reports_change(f: &FileChange) -> bool {
+    f.old_mode.is_none()
+        || f.new_mode.is_none()
+        || f.old_mode != f.new_mode
+        || f.source.is_some()
+        || (f.is_binary && f.old_id != f.new_id)
+        || f.added != 0
+        || f.deleted != 0
+}
+
+/// The per-file tallies every format needs: whether the pair is binary, and the
+/// insert/delete counts when it is not.
+fn fill_counts(f: &mut FileChange, ws: super::diff::Whitespace) -> Result<()> {
     f.is_binary = (!f.old_is_sub && is_binary(&f.old_content))
         || (!f.new_is_sub && is_binary(&f.new_content));
     if !f.is_binary && !f.mode_only {
-        let (added, deleted) = count_changed_lines(&f.old_content, &f.new_content)?;
+        let (added, deleted) = count_changed_lines_ws(&f.old_content, &f.new_content, ws)?;
         f.added = added;
         f.deleted = deleted;
     }
-    Ok(Some(f))
+    Ok(())
 }
 
 /// git's status letters distinguish a change of file *type* (`T`) from a change of
@@ -1618,7 +2091,11 @@ fn type_class(kind: EntryKind) -> u8 {
 // ---------------------------------------------------------------------------
 
 /// `:<old mode> <new mode> <old sha> <new sha> <status>\t<path>`.
-fn emit_raw(repo: &gix::Repository, out: &mut Vec<u8>, files: &[FileChange]) -> Result<()> {
+fn emit_raw(repo: &gix::Repository, out: &mut Vec<u8>, files: &[FileChange], z: bool) -> Result<()> {
+    // `-z` swaps the field separator and the record terminator for NULs and drops
+    // the path quoting, exactly as in the name-status form.
+    let sep = if z { b'\0' } else { b'\t' };
+    let end = if z { b'\0' } else { b'\n' };
     for f in files {
         write!(out, ":{:06o} {:06o} ", f.old_mode.unwrap_or(0), f.new_mode.unwrap_or(0))?;
         let old = short_oid(repo, &f.old_id, f.old_mode.is_none() || f.old_is_sub)?;
@@ -1628,9 +2105,15 @@ fn emit_raw(repo: &gix::Repository, out: &mut Vec<u8>, files: &[FileChange]) -> 
         out.extend_from_slice(new.as_bytes());
         out.push(b' ');
         out.push(f.status);
-        out.push(b'\t');
-        out.extend_from_slice(&f.path);
-        out.push(b'\n');
+        // `diff_flush_raw()`: a rename carries its similarity index and both paths.
+        if let Some(source) = &f.source {
+            write!(out, "{:03}", f.score)?;
+            out.push(sep);
+            out.extend_from_slice(&name_bytes(source, z));
+        }
+        out.push(sep);
+        out.extend_from_slice(&name_bytes(&f.path, z));
+        out.push(end);
     }
     Ok(())
 }
@@ -1667,7 +2150,7 @@ fn emit_stat(out: &mut Vec<u8>, files: &[FileChange], sw: &StatWidths) -> Result
     while i < count && i < files.len() as i64 {
         let f = &files[i as usize];
         i += 1;
-        max_len = max_len.max(display_width(&f.path) as i64);
+        max_len = max_len.max(display_width(&stat_name(f)) as i64);
         if f.is_binary {
             // `"Bin XXX -> YYY bytes"`: 14 fixed chars plus each size's decimal width.
             let w = 14 + decimal_width(f.new_content.len()) as i64
@@ -1744,7 +2227,8 @@ fn emit_stat(out: &mut Vec<u8>, files: &[FileChange], sw: &StatWidths) -> Result
     }
 
     for f in files.iter().take(count.max(0) as usize) {
-        let (prefix, name) = elide_name(&f.path, name_width);
+        let display = stat_name(f);
+        let (prefix, name) = elide_name(&display, name_width);
         let padding = name_width.saturating_sub(prefix.len() + display_width(name));
         out.push(b' ');
         out.extend_from_slice(prefix.as_bytes());
@@ -1848,6 +2332,117 @@ fn decimal_width(mut n: usize) -> usize {
     w
 }
 
+/// `--numstat` (`show_numstat()`): added, deleted, name — with `-` counts for a
+/// binary pair, and the rename form for a moved file.
+fn emit_numstat(out: &mut Vec<u8>, files: &[FileChange]) {
+    for f in files {
+        if f.is_binary {
+            out.extend_from_slice(b"-\t-\t");
+        } else {
+            out.extend_from_slice(format!("{}\t{}\t", f.added, f.deleted).as_bytes());
+        }
+        out.extend_from_slice(&stat_name(f));
+        out.push(b'\n');
+    }
+}
+
+/// `--shortstat` (`show_shortstats()`): the `--stat` summary line on its own.
+/// Binary pairs contribute no insertions or deletions, exactly as in the full block.
+fn emit_shortstat(out: &mut Vec<u8>, files: &[FileChange]) -> Result<()> {
+    if files.is_empty() {
+        return Ok(());
+    }
+    let (added, deleted) = files
+        .iter()
+        .filter(|f| !f.is_binary)
+        .fold((0usize, 0usize), |(a, d), f| (a + f.added, d + f.deleted));
+    write!(out, " {} file{} changed", files.len(), plural(files.len()))?;
+    if added != 0 || deleted == 0 {
+        write!(out, ", {added} insertion{}(+)", plural(added))?;
+    }
+    if deleted != 0 || added == 0 {
+        write!(out, ", {deleted} deletion{}(-)", plural(deleted))?;
+    }
+    out.push(b'\n');
+    Ok(())
+}
+
+/// `diff_summary()` (diff.c): the `create`/`delete`/`mode change`/`rename` lines that
+/// follow the diffstat.
+fn emit_summary(out: &mut Vec<u8>, files: &[FileChange]) -> Result<()> {
+    for f in files {
+        match (f.old_mode, f.new_mode, &f.source) {
+            // `show_rename_copy()`: the paired name, then the mode-change line with
+            // its name suppressed — the rename line above already carried one.
+            (_, _, Some(source)) => {
+                writeln!(
+                    out,
+                    " {} {} ({}%)",
+                    if f.status == b'C' { "copy" } else { "rename" },
+                    String::from_utf8_lossy(&super::diff_pairs::pprint_rename(source, &f.path)),
+                    f.score
+                )?;
+                summary_mode_change(out, f, false)?;
+            }
+            (None, Some(new), None) => summary_mode_name(out, "create", new, &f.path)?,
+            (Some(old), None, None) => summary_mode_name(out, "delete", old, &f.path)?,
+            // `diff_summary()`'s default arm: a `-B` rewrite that stayed a
+            // modification announces itself and suppresses the mode-change name.
+            _ if f.score != 0 => {
+                out.extend_from_slice(b" rewrite ");
+                out.extend_from_slice(&super::diff_files::quoted_name_bytes(&f.path));
+                write!(out, " ({}%)\n", f.score)?;
+                summary_mode_change(out, f, false)?;
+            }
+            _ => summary_mode_change(out, f, true)?,
+        }
+    }
+    Ok(())
+}
+
+/// `show_file_mode_name()`: ` create mode <mode> <path>` / ` delete mode …`.
+fn summary_mode_name(out: &mut Vec<u8>, verb: &str, mode: u32, path: &[u8]) -> Result<()> {
+    write!(out, " {verb} mode {mode:06o} ")?;
+    out.extend_from_slice(&super::diff_files::quoted_name_bytes(path));
+    out.push(b'\n');
+    Ok(())
+}
+
+/// `show_mode_change()`: the ` mode change <old> => <new>` line, named only when no
+/// other summary line for this pair printed the path.
+fn summary_mode_change(out: &mut Vec<u8>, f: &FileChange, show_name: bool) -> Result<()> {
+    let (Some(old), Some(new)) = (f.old_mode, f.new_mode) else {
+        return Ok(());
+    };
+    if old == new {
+        return Ok(());
+    }
+    write!(out, " mode change {old:06o} => {new:06o}")?;
+    if show_name {
+        out.push(b' ');
+        out.extend_from_slice(&super::diff_files::quoted_name_bytes(&f.path));
+    }
+    out.push(b'\n');
+    Ok(())
+}
+
+/// `"s"` unless the count is one, for the summary lines' plurals.
+fn plural(n: usize) -> &'static str {
+    if n == 1 { "" } else { "s" }
+}
+
+/// The name the stat formats print for a file: a rename shows both sides through
+/// `pprint_rename()`, which factors out a shared prefix and suffix
+/// (`dir/{old => new}.txt`) and otherwise prints `old => new`.
+fn stat_name(f: &FileChange) -> Vec<u8> {
+    match &f.source {
+        // `pprint_rename()` quotes the pair itself; a plain name goes through
+        // `quote_c_style()` in `fill_print_name()`.
+        Some(source) => super::diff_pairs::pprint_rename(source, &f.path),
+        None => super::diff_files::quoted_name_bytes(&f.path),
+    }
+}
+
 /// Approximate display width. Paths are treated as UTF-8 and counted in `char`s,
 /// which matches git for everything but wide and combining characters.
 fn display_width(path: &[u8]) -> usize {
@@ -1860,7 +2455,10 @@ fn display_width(path: &[u8]) -> usize {
 
 /// Render one file-level change as a `diff --git` block.
 fn emit_patch(repo: &gix::Repository, out: &mut Vec<u8>, f: &FileChange) -> Result<()> {
-    emit_git_header(out, &f.path);
+    // A rename names both sides in the header, and `fill_metainfo()` follows it with
+    // the similarity index and the two `rename` lines.
+    let old_path = f.source.as_deref().unwrap_or(&f.path);
+    emit_git_header(out, old_path, &f.path);
 
     match (f.old_mode, f.new_mode) {
         (None, Some(new)) => writeln!(out, "new file mode {new:o}")?,
@@ -1871,8 +2469,18 @@ fn emit_patch(repo: &gix::Repository, out: &mut Vec<u8>, f: &FileChange) -> Resu
         }
         _ => {}
     }
+    if let Some(source) = &f.source {
+        writeln!(out, "similarity index {}%", f.score)?;
+        out.extend_from_slice(b"rename from ");
+        out.extend_from_slice(source);
+        out.push(b'\n');
+        out.extend_from_slice(b"rename to ");
+        out.extend_from_slice(&f.path);
+        out.push(b'\n');
+    }
 
-    // A pure mode change (identical content) prints no index line and no hunks.
+    // A pure mode change (identical content) prints no index line and no hunks — and
+    // so does a rename that moved the content unchanged.
     if f.mode_only {
         return Ok(());
     }
@@ -1885,7 +2493,7 @@ fn emit_patch(repo: &gix::Repository, out: &mut Vec<u8>, f: &FileChange) -> Resu
         _ => writeln!(out, "index {old_short}..{new_short}")?,
     }
 
-    let old_path = f.old_mode.map(|_| f.path.as_slice());
+    let old_path = f.old_mode.map(|_| old_path);
     let new_path = f.new_mode.map(|_| f.path.as_slice());
     if f.is_binary {
         emit_binary_line(out, old_path, new_path);
@@ -1894,12 +2502,13 @@ fn emit_patch(repo: &gix::Repository, out: &mut Vec<u8>, f: &FileChange) -> Resu
     emit_body(out, old_path, new_path, &f.old_content, &f.new_content)
 }
 
-/// `diff --git a/<path> b/<path>` line, preserving raw path bytes.
-fn emit_git_header(out: &mut Vec<u8>, path: &[u8]) {
+/// `diff --git a/<old> b/<new>` line, preserving raw path bytes. The two differ only
+/// for a rename.
+fn emit_git_header(out: &mut Vec<u8>, old_path: &[u8], new_path: &[u8]) {
     out.extend_from_slice(b"diff --git a/");
-    out.extend_from_slice(path);
+    out.extend_from_slice(old_path);
     out.extend_from_slice(b" b/");
-    out.extend_from_slice(path);
+    out.extend_from_slice(new_path);
     out.push(b'\n');
 }
 

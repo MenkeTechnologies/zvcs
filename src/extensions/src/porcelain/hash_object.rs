@@ -11,19 +11,21 @@
 //! and every parse failure exits 129 with git's usage block. Everything else that
 //! fails is fatal and exits 128.
 //!
-//! Not covered: content filtering. Git may run the checkin conversion (the
-//! `text`/`eol`/`filter`/`ident` attributes, `core.autocrlf`) over the input
-//! before hashing, which changes the resulting id. Rather than silently hashing
-//! unconverted bytes, this module detects the situations in which a filter could
-//! apply and fails with a precise message; `--no-filters` (and `--stdin` without
-//! `--path`) takes the check out of the picture entirely.
+//! Content filtering follows `index_mem()`: a blob with a known path (the file's own
+//! name, or `--path`) is run through the checkin conversion — the `text`/`eol`/
+//! `filter`/`ident` attributes and `core.autocrlf` — so the id is the one `git add`
+//! would record. `--no-filters` and `--stdin` without `--path` hash the bytes as
+//! they are, and a non-blob type is never converted.
+//!
+//! `core.safecrlf` rides on `HASH_WRITE_OBJECT` (`get_conv_flags()`): only `-w` warns
+//! about a conversion that would not survive a round trip, or refuses it outright
+//! when the setting is `true`.
 
 use anyhow::Result;
 use std::io::{Read, Write as _};
 use std::path::Path;
 use std::process::ExitCode;
 
-use gix::bstr::ByteSlice;
 use gix::hash::ObjectId;
 use gix::objs::{Kind, ObjectRef, Write as _};
 
@@ -105,8 +107,8 @@ impl Fatal {
 /// Never returns `Err`: usage failures exit 129 and fatal failures exit 128, both
 /// reported here so the caller's generic exit-1 path is not taken.
 ///
-/// Content filters are not applied — see the module docs; invocations where one
-/// could apply are rejected rather than answered with a wrong id.
+/// Blobs with a path are hashed through the checkin conversion, so the id matches
+/// what staging the same bytes would record — see the module docs.
 pub fn hash_object(args: &[String]) -> Result<ExitCode> {
     // Dispatch passes the subcommand itself at index 0.
     let args = match args.first() {
@@ -315,6 +317,9 @@ fn run(opts: &Opts) -> std::result::Result<(), Fatal> {
     let hash_kind = repo
         .as_ref()
         .map_or(gix::hash::Kind::Sha1, gix::Repository::object_hash);
+    // The checkin conversion is set up on first use and reused across every input,
+    // so `--stdin-paths` with a thousand paths still reads the attributes once.
+    let mut filters: Option<FilterPipeline<'_>> = None;
 
     // 1. The `--stdin` object. Its virtual path is `--path` if given at all.
     if opts.stdin > 0 {
@@ -327,12 +332,12 @@ fn run(opts: &Opts) -> std::result::Result<(), Fatal> {
         if std::io::stdin().lock().read_to_end(&mut data).is_err() {
             return Err(Fatal::new(format!("Unable to hash {}", vpath.unwrap_or("(null)"))));
         }
-        emit(&data, repo.as_ref(), hash_kind, opts, vpath)?;
+        emit(&data, repo.as_ref(), &mut filters, hash_kind, opts, vpath)?;
     }
 
     // 2. Each `<file>` positional, in command-line order.
     for file in &opts.files {
-        hash_file(file, repo.as_ref(), hash_kind, opts)?;
+        hash_file(file, repo.as_ref(), &mut filters, hash_kind, opts)?;
     }
 
     // 3. Paths read from stdin, one per line. git does not skip blank lines; it
@@ -343,7 +348,7 @@ fn run(opts: &Opts) -> std::result::Result<(), Fatal> {
             return Err(Fatal::new("Unable to hash (null)"));
         }
         for line in buf.lines() {
-            hash_file(line, repo.as_ref(), hash_kind, opts)?;
+            hash_file(line, repo.as_ref(), &mut filters, hash_kind, opts)?;
         }
     }
 
@@ -362,9 +367,10 @@ fn errno_text(e: &std::io::Error) -> String {
 /// Open `file`, then hash it, following git's order of operations exactly: the
 /// open failure is reported before the object type is even looked at, and a file
 /// that opens but cannot be read (a directory, say) is an `Unable to hash`.
-fn hash_file(
+fn hash_file<'repo>(
     file: &str,
-    repo: Option<&gix::Repository>,
+    repo: Option<&'repo gix::Repository>,
+    filters: &mut Option<FilterPipeline<'repo>>,
     hash_kind: gix::hash::Kind,
     opts: &Opts,
 ) -> std::result::Result<(), Fatal> {
@@ -398,22 +404,27 @@ fn hash_file(
         )));
     }
 
-    emit(&data, repo, hash_kind, opts, vpath)
+    emit(&data, repo, filters, hash_kind, opts, vpath)
 }
 
 /// Validate (unless `--literally`), hash, optionally write, and print the id.
-fn emit(
+fn emit<'repo>(
     data: &[u8],
-    repo: Option<&gix::Repository>,
+    repo: Option<&'repo gix::Repository>,
+    filters: &mut Option<FilterPipeline<'repo>>,
     hash_kind: gix::hash::Kind,
     opts: &Opts,
     vpath: Option<&str>,
 ) -> std::result::Result<(), Fatal> {
     let kind = parse_kind(&opts.type_name)?;
 
-    if let Some(p) = vpath {
-        ensure_no_filters(repo, Path::new(p))?;
-    }
+    // `index_mem()` converts only blobs, and only when it has a path to look up
+    // attributes with.
+    let converted = match (kind, vpath) {
+        (Kind::Blob, Some(p)) => convert_for_checkin(filters, repo, p, data, opts.write)?,
+        _ => None,
+    };
+    let data = converted.as_deref().unwrap_or(data);
 
     if !opts.literally && kind != Kind::Blob {
         if let Err(e) = ObjectRef::from_bytes(data, kind, hash_kind) {
@@ -447,71 +458,59 @@ fn parse_kind(s: &str) -> std::result::Result<Kind, Fatal> {
         .map_err(|_| Fatal::new(format!("invalid object type \"{s}\"")))
 }
 
-/// Refuse to hash when the checkin conversion could change the bytes.
+/// The checkin conversion, as `index_mem()` runs it: for a blob with a known path,
+/// the `text`/`eol`/`filter`/`ident` attributes and `core.autocrlf` decide the bytes
+/// that get hashed, so the id matches the one `git add` would record.
 ///
-/// Filtering is decided by `core.autocrlf` and by the `text`/`eol`/`filter`/
-/// `ident` attributes, which are read from `.gitattributes` along `rela_path`,
-/// from `$GIT_DIR/info/attributes`, and from `core.attributesFile`. None of that
-/// conversion is implemented here, so the presence of any of those inputs is a
-/// hard error instead of a silently-unconverted (and therefore wrong) id.
-fn ensure_no_filters(
-    repo: Option<&gix::Repository>,
-    rela_path: &Path,
-) -> std::result::Result<(), Fatal> {
-    let Some(repo) = repo else { return Ok(()) };
+/// `get_conv_flags()` ties the `core.safecrlf` round-trip check to
+/// `HASH_WRITE_OBJECT`, so only `-w` can warn about — or refuse — a lossy
+/// conversion; a plain `git hash-object --path x x` converts silently.
+///
+/// Returns the bytes to hash. A path the attribute stack cannot place (a `--path`
+/// pointing outside the worktree, say) has no attributes to apply and is hashed
+/// verbatim, which is what git's own lookup ends up doing.
+fn convert_for_checkin<'repo>(
+    filters: &mut Option<FilterPipeline<'repo>>,
+    repo: Option<&'repo gix::Repository>,
+    rela_path: &str,
+    data: &[u8],
+    write: bool,
+) -> std::result::Result<Option<Vec<u8>>, Fatal> {
+    let Some(repo) = repo else { return Ok(None) };
+    if filters.is_none() {
+        let (mut pipeline, index) = repo
+            .filter_pipeline(None)
+            .map_err(|err| Fatal::new(format!("unable to setup filters: {err}")))?;
+        if !write {
+            pipeline.options_mut().crlf_roundtrip_check =
+                gix::filter::plumbing::pipeline::CrlfRoundTripCheck::Skip;
+        }
+        *filters = Some(FilterPipeline { pipeline, index });
+    }
+    let state = filters.as_mut().expect("just set");
+    let mut converted = Vec::with_capacity(data.len());
+    match state
+        .pipeline
+        .convert_to_git(data, Path::new(rela_path), &state.index)
+    {
+        Ok(mut outcome) => {
+            outcome
+                .read_to_end(&mut converted)
+                .map_err(|err| Fatal::new(format!("unable to convert '{rela_path}': {err}")))?;
+            Ok(Some(converted))
+        }
+        // A path the attribute stack cannot walk to — `--path=../outside`, or a name
+        // that leaves the worktree — has no attributes to apply. git looks them up and
+        // finds none; here the lookup fails outright, and the answer is the same: hash
+        // the bytes as they are.
+        Err(gix::filter::pipeline::convert_to_git::Error::WorktreeCacheAtPath(_)) => Ok(None),
+        // `core.safecrlf=true` turns a lossy conversion into a refusal, naming the path.
+        Err(err) => Err(Fatal::new(err.to_string())),
+    }
+}
 
-    let snapshot = repo.config_snapshot();
-    if let Some(v) = snapshot.string("core.autocrlf") {
-        let v = v.to_str_lossy().into_owned();
-        if v != "false" {
-            return Err(Fatal::new(format!(
-                "core.autocrlf={v} would filter the input; pass --no-filters"
-            )));
-        }
-    }
-    if let Ok(Some(p)) = snapshot.trusted_path("core.attributesFile") {
-        if p.exists() {
-            return Err(Fatal::new(format!(
-                "attributes in {} may filter the input; pass --no-filters",
-                p.display()
-            )));
-        }
-    }
-
-    let info = repo.git_dir().join("info").join("attributes");
-    if info.exists() {
-        return Err(Fatal::new(format!(
-            "attributes in {} may filter the input; pass --no-filters",
-            info.display()
-        )));
-    }
-
-    // `.gitattributes` from the file's own directory up to the worktree root.
-    // Paths outside the worktree (`--path=../outside`, or the empty path) have no
-    // attributes to find, so the walk stays inside the root.
-    let Some(workdir) = repo.workdir() else {
-        return Ok(());
-    };
-    let root = workdir.canonicalize().unwrap_or_else(|_| workdir.to_owned());
-    let start = rela_path
-        .canonicalize()
-        .unwrap_or_else(|_| root.join(rela_path));
-    let mut dir = start.parent();
-    while let Some(d) = dir {
-        if !d.starts_with(&root) {
-            break;
-        }
-        let candidate = d.join(".gitattributes");
-        if candidate.exists() {
-            return Err(Fatal::new(format!(
-                "attributes in {} may filter the input; pass --no-filters",
-                candidate.display()
-            )));
-        }
-        if d == root {
-            break;
-        }
-        dir = d.parent();
-    }
-    Ok(())
+/// The filter pipeline plus the index it consults, built at most once per run.
+struct FilterPipeline<'repo> {
+    pipeline: gix::filter::Pipeline<'repo>,
+    index: gix::worktree::IndexPersistedOrInMemory,
 }

@@ -592,12 +592,26 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
     // Validate every explicit pathspec matches something git knows about (the
     // union of source and index paths), mirroring git's pathspec error (exit 1).
     if !match_all {
+        // `PS_IGNORE_SKIP_WORKTREE`: a path the sparse-checkout definition keeps out
+        // of the worktree cannot be matched by a pathspec, so naming one is git's
+        // "did not match" rather than a restore of a file that should not be there.
+        let sparse: std::collections::HashSet<BString> = {
+            let index = repo.index_or_empty()?;
+            let backing = index.path_backing();
+            index
+                .entries()
+                .iter()
+                .filter(|e| e.flags.contains(gix::index::entry::Flags::SKIP_WORKTREE))
+                .map(|e| e.path_in(backing).to_owned())
+                .collect()
+        };
         for (raw, spec) in &specs {
             // Each spec is checked on its own: git names the one that matched nothing.
             let single = super::log::PathspecMatcher::new(&repo, std::slice::from_ref(raw))?;
             let hit = source_map
                 .keys()
                 .chain(cur_paths.iter())
+                .filter(|p| !sparse.contains(&BString::from(p.to_vec())))
                 .any(|p| path_matches(BStr::new(p), false, &single));
             if !hit {
                 eprintln!("error: pathspec '{raw}' did not match any file(s) known to git");

@@ -75,6 +75,23 @@ use crate::lock::RepoLock;
 ///     unrecognized value reproduces git's exact error text (`unknown hash
 ///     algorithm '<v>'` / `unknown ref storage format '<v>'`).
 /// ```
+/// `git init`'s usage block, byte-for-byte from stock git 2.55.0. `-h` prints it on
+/// stdout; a usage error prints the complaint and then this on stderr. Both exit 129.
+const USAGE: &str = "usage: git init [-q | --quiet] [--bare] [--template=<template-directory>]\n                [--separate-git-dir <git-dir>] [--object-format=<format>]\n                [--ref-format=<format>]\n                [-b <branch-name> | --initial-branch=<branch-name>]\n                [--shared[=<permissions>]] [<directory>]\n\n    --[no-]template <template-directory>\n                          directory from which templates will be used\n    --[no-]bare           create a bare repository\n    --shared[=<permissions>]\n                          specify that the git repository is to be shared amongst several users\n    -q, --[no-]quiet      be quiet\n    --[no-]separate-git-dir <gitdir>\n                          separate git dir from working tree\n    -b, --[no-]initial-branch <name>\n                          override the name of the initial branch\n    --[no-]object-format <hash>\n                          specify the hash algorithm to use\n    --[no-]ref-format <format>\n                          specify the reference format to use\n\n";
+
+/// `die()`: `fatal: <msg>` and exit 128.
+fn fatal(msg: &str) -> ExitCode {
+    eprintln!("fatal: {msg}");
+    ExitCode::from(128)
+}
+
+/// A `parse-options` complaint followed by the usage block, exit 129.
+fn usage_error(msg: &str) -> ExitCode {
+    eprintln!("{msg}");
+    eprint!("{USAGE}");
+    ExitCode::from(129)
+}
+
 pub fn init(args: &[String]) -> Result<ExitCode> {
     let mut bare = false;
     let mut quiet = false;
@@ -112,6 +129,11 @@ pub fn init(args: &[String]) -> Result<ExitCode> {
             // uses a custom callback with no negation, so `--no-shared` is NOT
             // accepted (git reports it as an unknown option) and is left unhandled.
             "--no-bare" => bare = false,
+            // `parse-options` answers `-h` before anything else, on stdout.
+            "-h" | "--help" => {
+                print!("{USAGE}");
+                return Ok(ExitCode::from(129));
+            }
             "-q" | "--quiet" => quiet = true,
             "--no-quiet" => quiet = false,
             "-b" | "--initial-branch" => {
@@ -181,7 +203,11 @@ pub fn init(args: &[String]) -> Result<ExitCode> {
             _ if arg.starts_with("-b") => {
                 initial_branch = Some(arg[2..].to_string());
             }
-            _ => anyhow::bail!("unknown option `{arg}'"),
+            _ => {
+                // `parse-options` reports a long option without its dashes.
+                let name = arg.trim_start_matches('-');
+                return Ok(usage_error(&format!("error: unknown option `{name}'")));
+            }
         }
         i += 1;
     }
@@ -204,12 +230,12 @@ pub fn init(args: &[String]) -> Result<ExitCode> {
     let ref_format = ref_format.or_else(|| std::env::var("GIT_DEFAULT_REF_FORMAT").ok());
     if let Some(fmt) = object_format.as_deref() {
         if check_object_format(fmt)? == FormatCheck::Unrecognized {
-            anyhow::bail!("unknown hash algorithm '{fmt}'");
+            return Ok(fatal(&format!("unknown hash algorithm '{fmt}'")));
         }
     }
     if let Some(fmt) = ref_format.as_deref() {
         if check_ref_format(fmt)? == FormatCheck::Unrecognized {
-            anyhow::bail!("unknown ref storage format '{fmt}'");
+            return Ok(fatal(&format!("unknown ref storage format '{fmt}'")));
         }
     }
 
@@ -230,9 +256,12 @@ pub fn init(args: &[String]) -> Result<ExitCode> {
     // `Reinitialized existing ...` line instead of failing. For a worktree repo
     // the git dir is `<target>/.git`; for a bare repo it is `<target>` itself,
     // recognized by its `HEAD` file at the root.
+    // With `--bare` the git directory IS the target, so a worktree repository sitting
+    // there is beside the point: git initialises a new bare repository on top of it
+    // (`git init --bare` inside a checkout is `Initialized empty`, not `Reinitialized`).
     let existing_git_dir: Option<PathBuf> = {
         let dot_git = target.join(".git");
-        if dot_git.exists() {
+        if !bare && dot_git.exists() {
             Some(dot_git)
         } else if target.join("HEAD").is_file() && target.join("objects").is_dir() {
             Some(target.clone())
@@ -482,7 +511,13 @@ fn init_bare_into_nonempty(target: &Path) -> Result<gix::Repository> {
         std::fs::rename(entry.path(), target.join(entry.file_name()))?;
     }
     std::fs::remove_dir(&scratch)?;
-    gix::open(target).map_err(|e| anyhow::anyhow!("{e}"))
+    // `gix::open` would discover the *worktree* repository a `.git` directory beside
+    // the new layout still names; the bare repository just laid down is `target` itself.
+    gix::open_opts(
+        target,
+        gix::open::Options::isolated().open_path_as_is(true),
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 /// Move the freshly-created git dir (`src`, i.e. `<target>/.git`) to the

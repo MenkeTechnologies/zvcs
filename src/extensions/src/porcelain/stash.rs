@@ -101,6 +101,14 @@
 //!   three-way merge of the index tree that is not ported.
 //! * Content blobs are produced through the repo filter pipeline, so CRLF /
 //!   clean filters are honored just like git.
+//! * What the object database is left holding matches git, which is not the same as
+//!   what the emulation needs: `-S` computes its reset by merging a tree that stands
+//!   for the worktree, and `apply --index` answers "would this patch apply?" the same
+//!   way. git writes neither (it shells out to `git apply -R` / `--check`), so both go
+//!   through a memory-backed object handle and nothing reaches disk. The `reset --hard`
+//!   reflog line follows git too: only the pathspec-less, non-`-S` push runs that reset,
+//!   and `-u` always writes its untracked parent — with the empty tree when the pathspec
+//!   left nothing to collect.
 
 use anyhow::{anyhow, bail, Result};
 use std::collections::{HashMap, HashSet};
@@ -379,6 +387,13 @@ pub fn stash(args: &[String]) -> Result<ExitCode> {
 
 /// `git stash push` — snapshot tracked changes, then reset the worktree+index to HEAD.
 fn push(repo: &gix::Repository, opts: &PushOpts) -> Result<ExitCode> {
+    // `-S` computes its reset by merging trees that describe the *worktree*, which
+    // git never writes: it reverses the staged patch over the files themselves
+    // (`git apply -R`). Those intermediate objects go here instead of into the
+    // repository, so a `-S` push — successful or not — leaves the same object
+    // database behind that git leaves.
+    let scratch = repo.clone().with_object_memory();
+
     // An unborn HEAD has no base to stash against. `do_create_stash()` says so on
     // stderr — unprefixed, and not at all under `-q` — and returns -1.
     if repo.head_id().is_err() {
@@ -419,7 +434,7 @@ fn push(repo: &gix::Repository, opts: &PushOpts) -> Result<ExitCode> {
         affected,
         untracked_paths,
         worktree_tree,
-    } = build_stash_commit(repo, opts.message.as_deref(), opts)?;
+    } = build_stash_commit(repo, &scratch, opts.message.as_deref(), opts)?;
 
     // Nothing survived the filter: a pathspec that matched only clean paths, or
     // `-S` with an empty index diff. git distinguishes the two.
@@ -468,7 +483,7 @@ fn push(repo: &gix::Repository, opts: &PushOpts) -> Result<ExitCode> {
     // stash does not hold.
     let worktree_target = match (opts.staged_only, opts.keep_index) {
         (true, _) => match revert_staged_in_worktree(
-            repo,
+            &scratch,
             i_tree_id,
             head_tree_id,
             worktree_tree.unwrap_or(i_tree_id),
@@ -505,9 +520,11 @@ fn push(repo: &gix::Repository, opts: &PushOpts) -> Result<ExitCode> {
     } else {
         revert_paths_in_tree(repo, i_tree_id, head_tree_id, &affected)?
     };
-    let target_map = tree_map(repo, worktree_target)?;
+    // `-S`'s target tree lives in the scratch odb, so both readers go through it; for
+    // every other mode it is a real tree and the proxy just reads through.
+    let target_map = tree_map(&scratch, worktree_target)?;
     let should_interrupt = AtomicBool::new(false);
-    let fresh = sync_worktree(repo, worktree_target, &affected, &target_map, &should_interrupt)?;
+    let fresh = sync_worktree(&scratch, worktree_target, &affected, &target_map, &should_interrupt)?;
     let old_index = repo.open_index()?;
     write_target_index(repo, index_target, &old_index, &fresh)?;
 
@@ -521,6 +538,18 @@ fn push(repo: &gix::Repository, opts: &PushOpts) -> Result<ExitCode> {
             let _ = std::fs::remove_file(&abs);
         }
         remove_emptied_dirs(repo, &untracked_paths);
+    }
+
+    // `do_push_stash()` clears the worktree with `reset --hard`, which logs
+    // `reset: moving to HEAD` on `HEAD` — the branch does not move, so only that one
+    // log gains an entry. Only the pathspec-less path runs that reset: with a
+    // pathspec git restores the named paths through `checkout-index`/`clean` instead,
+    // and `-S` reverses the staged patch with `apply -R`; neither logs anything.
+    if opts.pathspecs.is_empty() && !opts.staged_only {
+        if let Ok(head_id) = repo.head_id() {
+            let id = head_id.detach();
+            super::checkout::record_head_move(repo, Some(id), Some(id), "reset: moving to HEAD");
+        }
     }
 
     Ok(ExitCode::SUCCESS)
@@ -652,6 +681,11 @@ struct StashBuild {
 /// `W` id). The caller has already verified HEAD is born and the tree is dirty.
 fn build_stash_commit(
     repo: &gix::Repository,
+    // `-S` needs a picture of what the worktree currently holds, which git never
+    // hashes (it reverses the staged patch over the files themselves). Building it here
+    // as a tree is how the reset is computed, so the objects it needs go to this
+    // memory-backed handle and leave no trace in the repository's object database.
+    scratch: &gix::Repository,
     message: Option<&str>,
     opts: &PushOpts,
 ) -> Result<StashBuild> {
@@ -748,7 +782,7 @@ fn build_stash_commit(
     // disappear, though — the reset in `push` has to preserve it — so the tree
     // the worktree actually holds is built first and handed back.
     let worktree_tree = if opts.staged_only {
-        let tree = tree_with_worktree_mods(repo, i_tree_id, &wt_mods)?;
+        let tree = tree_with_worktree_mods(scratch, i_tree_id, &wt_mods)?;
         wt_mods.clear();
         Some(tree)
     } else {
@@ -787,27 +821,25 @@ fn build_stash_commit(
     let mut parents = vec![head_id, index_commit];
     if opts.untracked != Untracked::No {
         untracked_paths = collect_untracked(repo, opts)?;
-        if !untracked_paths.is_empty() {
-            let (mut pipeline, wt_index) = repo.filter_pipeline(None)?;
-            let empty = repo.empty_tree().id().detach();
-            let mut u_editor = repo.edit_tree(empty)?;
-            for path in &untracked_paths {
-                if let Some((id, kind, _md)) =
-                    pipeline.worktree_file_to_object(path.as_bstr(), &wt_index)?
-                {
-                    u_editor.upsert(path.as_bstr(), kind, id)?;
-                }
+        let (mut pipeline, wt_index) = repo.filter_pipeline(None)?;
+        let empty = repo.empty_tree().id().detach();
+        let mut u_editor = repo.edit_tree(empty)?;
+        for path in &untracked_paths {
+            if let Some((id, kind, _md)) =
+                pipeline.worktree_file_to_object(path.as_bstr(), &wt_index)?
+            {
+                u_editor.upsert(path.as_bstr(), kind, id)?;
             }
-            let u_tree_id = u_editor.write()?.detach();
-            let u_msg = format!("untracked files on {branch}: {head_short} {subject}");
-            // Parentless, like git's `u_commit`: the untracked tree stands alone.
-            let no_parents: Vec<ObjectId> = Vec::new();
-            let u_commit =
-                repo.new_commit(format!("{u_msg}\n"), u_tree_id, no_parents)?.id().detach();
-            parents.push(u_commit);
-        } else {
-            untracked_paths.clear();
         }
+        let u_tree_id = u_editor.write()?.detach();
+        let u_msg = format!("untracked files on {branch}: {head_short} {subject}");
+        // Parentless, like git's `u_commit`: the untracked tree stands alone. git
+        // writes this parent whenever `-u`/`-a` was asked for — even when nothing was
+        // collected, in which case its tree is the empty one.
+        let no_parents: Vec<ObjectId> = Vec::new();
+        let u_commit =
+            repo.new_commit(format!("{u_msg}\n"), u_tree_id, no_parents)?.id().detach();
+        parents.push(u_commit);
     }
 
     let w_commit = repo.new_commit(stash_msg.as_str(), w_tree_id, parents)?.id().detach();
@@ -995,13 +1027,19 @@ fn first_hunk_line(
 }
 
 /// Whether `theirs` merges into `ours` over `base` without conflicts, reporting
-/// the blocked paths when it does not. Nothing is written either way.
+/// the blocked paths when it does not.
+///
+/// This is a question, not a step: git asks it with `git apply --cached --check`, which
+/// writes nothing. The tree merge that answers it here resolves content merges, and
+/// resolving one means writing the merged blob — so it runs against a memory-backed
+/// handle and the object database is left exactly as it was.
 fn merge_trees_cleanly(
     repo: &gix::Repository,
     base: ObjectId,
     ours: ObjectId,
     theirs: ObjectId,
 ) -> Result<std::result::Result<(), Vec<BString>>> {
+    let repo = &repo.clone().with_object_memory();
     let labels = gix::merge::blob::builtin_driver::text::Labels::default();
     let merge = repo.merge_trees(base, ours, theirs, labels, repo.tree_merge_options()?)?;
     let unresolved = gix::merge::tree::TreatAsUnresolved::git();
@@ -1041,6 +1079,18 @@ fn refuse_unmerged_index(repo: &gix::Repository) -> Result<Option<ExitCode>> {
     Ok(Some(ExitCode::FAILURE))
 }
 
+/// `save_state()` (builtin/merge.c): the `git stash create` snapshot a merge takes of a
+/// dirty worktree before running a strategy, so `restore_state()` can put the tree back
+/// if the strategy fails. `None` when there is nothing to snapshot, which is git's
+/// empty output from `stash create`.
+pub(crate) fn create_snapshot(repo: &gix::Repository) -> Result<Option<ObjectId>> {
+    if repo.head_id().is_err() || !repo.is_dirty()? {
+        return Ok(None);
+    }
+    let built = build_stash_commit(repo, repo, None, &PushOpts::with_message(None))?;
+    Ok(Some(built.w_commit))
+}
+
 /// `git stash create [<message>…]` — build the stash commit graph and print the
 /// `W` commit id without storing it or touching the worktree. Port of
 /// `create_stash` (builtin/stash.c): the message is every remaining arg joined
@@ -1055,13 +1105,33 @@ fn create_stash(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
     let message = if args.is_empty() { None } else { Some(args.join(" ")) };
-    let built = build_stash_commit(repo, message.as_deref(), &PushOpts::with_message(None))?;
+    let built = build_stash_commit(repo, repo, message.as_deref(), &PushOpts::with_message(None))?;
     println!("{}", built.w_commit);
     Ok(ExitCode::SUCCESS)
 }
 
 /// `git stash store [-m <msg>] [-q] <commit>` — point `refs/stash` at an existing
 /// stash-like commit, appending the reflog entry. Port of `do_store_stash`.
+/// `git stash store -m <msg> -q <commit>`, which `apply_save_autostash_oid()` runs when
+/// an autostash could not be re-applied: the snapshot becomes a real `stash` so the
+/// "Your changes are safe in the stash" line is true.
+pub(crate) fn store_commit(repo: &gix::Repository, oid: ObjectId, message: &str) -> Result<()> {
+    repo.edit_reference(RefEdit {
+        change: Change::Update {
+            log: LogChange {
+                mode: RefLog::AndReference,
+                force_create_reflog: true,
+                message: message.into(),
+            },
+            expected: PreviousValue::Any,
+            new: Target::Object(oid),
+        },
+        name: "refs/stash".try_into().map_err(|e| anyhow!("invalid ref name refs/stash: {e}"))?,
+        deref: false,
+    })?;
+    Ok(())
+}
+
 fn store_stash(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
     let (message, quiet, commit) = parse_store_options(args)?;
     let oid = match repo.rev_parse_single(commit.as_str()) {
@@ -1404,6 +1474,13 @@ fn restore_stash_commit(
         }
     }
 
+    // `merge_trees()` (merge-recursive.c): a merge whose base already equals the
+    // other side has nothing to bring in and says so on stdout, `-q` included — which
+    // is what an entry holding only untracked files looks like from here.
+    if w_tree == base_tree {
+        println!("Already up to date.");
+    }
+
     let should_interrupt = AtomicBool::new(false);
     let labels = gix::merge::blob::builtin_driver::text::Labels {
         ancestor: labels.base.as_deref().map(|l| BStr::new(l.as_bytes())),
@@ -1521,7 +1598,7 @@ fn restore_stash_commit(
 /// [`apply_autostash`]. The caller has already checked the tree is dirty.
 pub fn create_autostash(repo: &gix::Repository) -> Result<ObjectId> {
     let StashBuild { w_commit, head_tree_id, affected, .. } =
-        build_stash_commit(repo, Some("autostash"), &PushOpts::with_message(None))?;
+        build_stash_commit(repo, repo, Some("autostash"), &PushOpts::with_message(None))?;
 
     // Reset the tracked worktree + index back to HEAD (untracked files untouched),
     // exactly as `push` does after storing the stash.
@@ -1551,14 +1628,26 @@ pub fn apply_autostash(repo: &gix::Repository, commit_id: ObjectId, quiet: bool)
     let ours = repo.head_tree_id()?.detach();
     let old_index = repo.index_or_load_from_head()?.into_owned();
 
+    // `do_apply_stash()`'s labels, which is what a stash conflict is marked with
+    // wherever it is applied from: `Updated upstream` / `Stash base` / `Stashed changes`.
     let labels = gix::merge::blob::builtin_driver::text::Labels {
-        ancestor: Some(BStr::new(b"stash base")),
-        current: Some(BStr::new(b"HEAD")),
+        ancestor: Some(BStr::new(b"Stash base")),
+        current: Some(BStr::new(b"Updated upstream")),
         other: Some(BStr::new(b"Stashed changes")),
     };
     let should_interrupt = AtomicBool::new(false);
-    let applied = crate::merge_apply::three_way_merge(
-        repo, base, ours, theirs, &old_index, labels, &should_interrupt,
+    // `apply_autostash()` re-applies with `git stash apply --index --quiet`, so the
+    // merge's own `Auto-merging`/`CONFLICT` block is suppressed; the caller reports
+    // the outcome in git's own words.
+    let applied = crate::merge_apply::three_way_merge_verbose(
+        repo,
+        base,
+        ours,
+        theirs,
+        &old_index,
+        labels,
+        &should_interrupt,
+        !quiet,
     )?;
 
     if applied.conflicts.is_empty() {
@@ -1830,11 +1919,12 @@ fn write_target_index(
 ) -> Result<()> {
     let mut new_index = repo.index_from_tree(&tree_id)?;
 
-    let mut old_map: HashMap<BString, (ObjectId, Mode, Stat)> = HashMap::with_capacity(old_index.entries().len());
+    let mut old_map: HashMap<BString, (ObjectId, Mode, Stat, gix::index::entry::Flags)> =
+        HashMap::with_capacity(old_index.entries().len());
     {
         let backing = old_index.path_backing();
         for e in old_index.entries() {
-            old_map.insert(e.path_in(backing).to_owned(), (e.id, e.mode, e.stat));
+            old_map.insert(e.path_in(backing).to_owned(), (e.id, e.mode, e.stat, e.flags));
         }
     }
 
@@ -1844,10 +1934,22 @@ fn write_target_index(
             let path = e.path_in(&backing).to_owned();
             if let Some(stat) = fresh.get(&path) {
                 e.stat = *stat;
-            } else if let Some((id, mode, stat)) = old_map.get(&path) {
+            } else if let Some((id, mode, stat, _)) = old_map.get(&path) {
                 if *id == e.id && *mode == e.mode {
                     e.stat = *stat;
                 }
+            }
+            // A tree carries no `SKIP_WORKTREE`, so rebuilding the index from one would
+            // drop the sparse-checkout state and report every out-of-cone path as
+            // deleted. git keeps the bit (`update_sparsity()` leaves those entries
+            // alone), so it is carried across here.
+            if old_map
+                .get(&path)
+                .is_some_and(|(_, _, _, flags)| flags.contains(gix::index::entry::Flags::SKIP_WORKTREE))
+            {
+                // The bit only reaches the file through the v3 extended-flag word, which
+                // `EXTENDED` is what asks for.
+                e.flags |= gix::index::entry::Flags::SKIP_WORKTREE | gix::index::entry::Flags::EXTENDED;
             }
         }
     }
@@ -2365,10 +2467,11 @@ struct ConflictLabels {
 
 impl Default for ConflictLabels {
     fn default() -> Self {
+        // `do_apply_stash()`: `Updated upstream` / `Stash base` / `Stashed changes`.
         ConflictLabels {
             ours: "Updated upstream".to_string(),
             theirs: "Stashed changes".to_string(),
-            base: None,
+            base: Some("Stash base".to_string()),
         }
     }
 }

@@ -203,6 +203,16 @@ cargo run -p zvcs-parity -- --fuzz 12    # plus generated flag combinations
 It builds fixture repositories with stock git, runs each invocation against both
 binaries, and compares stdout, exit code, and the resulting repository state.
 
+The stock git it measures against is resolved explicitly, never through `PATH` —
+`PATH` finds this binary on any machine where the shadow is installed, and
+comparing zvcs with zvcs measures nothing. Each of `/usr/bin/git`,
+`/opt/homebrew/bin/git` and `/usr/local/bin/git` is probed, any that answers the
+superset verb `zverbs` is rejected as this binary wearing git's name, and the
+newest of the rest wins. One older than the version this port targets is refused
+outright rather than measured against: the two disagree about real behaviour, so
+its numbers would read like the others while describing a git nobody runs. Name a
+specific binary with `ZVCS_STOCK_GIT` to override the search.
+
 ## [0x04] THE SUPERSET VERBS
 
 Over a hundred superset (`z*`) verbs share the one binary, grouped into a few

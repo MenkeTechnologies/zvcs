@@ -94,16 +94,20 @@
 //!     committed wrong.
 //!   * **`-i`/`--interactive`.** The per-patch tty prompt loop cannot run
 //!     unattended.
-//!   * **`--ignore-date` / `--committer-date-is-author-date` / `-S`.** These
-//!     reshape the commit's date, committer, or signature; `git commit-tree`
-//!     cannot be driven to reproduce them here.
+//!   * **`-S`.** Signing the commit needs a path `git commit-tree` does not expose
+//!     here. `--ignore-date` and `--committer-date-is-author-date` are honoured:
+//!     the first drops the mail's author date, the second dates the committer by it.
 //!   * **`--rebasing` / rebase-driven sessions.** `parse_mail_rebase`, the
 //!     `rewritten` note replay, and `--show-current-patch` on an
 //!     `original-commit` all need the rebase machinery, which is an empty
 //!     placeholder (`gix-rebase`/`gix-sequencer`).
-//!   * **Multi-message mbox splitting.** `split_mbox` treats each source file as
-//!     a single message (the fixtures carry no `From ` envelope); a real
-//!     multi-patch mbox would need envelope splitting `git mailsplit` does.
+//!
+//! `split_mbox` is `git mailsplit`: an input is cut at its `From ` postmarks
+//! (`is_from_line()`'s date-shaped test, not the object name), each message keeping the
+//! postmark it starts with, and content before the first postmark forming a message of
+//! its own — which is how a bare patch file reaches `am`. `--signoff` appends the
+//! trailer through the same `append_signoff()` port `commit` uses, before the message
+//! is stored, so a later `--continue` carries it.
 
 use anyhow::{bail, Result};
 use gix::bstr::{BString, ByteSlice};
@@ -913,32 +917,51 @@ enum Split {
     Failed(Vec<String>),
 }
 
-/// Number of mbox messages in `body`, counted by the `From ` envelope separator
-/// git's mailsplit splits on (a line `From <40-hex-sha> <date>`, as produced by
-/// `format-patch`). Used to REFUSE a multi-patch mbox rather than silently
-/// squashing it into one commit — this port does not yet re-exec `git mailsplit`
-/// for real envelope splitting, so a series must be applied one patch at a time.
-fn mbox_message_count(body: &[u8]) -> usize {
-    let is_from_line = |line: &[u8]| -> bool {
-        let Some(rest) = line.strip_prefix(b"From ") else {
-            return false;
-        };
-        // `From ` followed by a 40- or 64-hex object id and a space.
-        let hex_len = rest.iter().take_while(|b| b.is_ascii_hexdigit()).count();
-        (hex_len == 40 || hex_len == 64) && rest.get(hex_len) == Some(&b' ')
+/// `is_from_line()` (builtin/mailsplit.c): an mbox postmark. git does not look at the
+/// object name at all — it looks for a date, requiring `HH:MM` digits around the last
+/// colon on the line and a year past 90.
+fn is_from_line(line: &[u8]) -> bool {
+    if line.len() < 20 || !line.starts_with(b"From ") {
+        return false;
+    }
+    // git scans back from `line + len - 2`, i.e. skipping the last byte.
+    let end = line.len() - 1;
+    let Some(colon) = line[5..end].iter().rposition(|b| *b == b':').map(|i| i + 5) else {
+        return false;
     };
-    body.split(|&b| b == b'\n').filter(|l| is_from_line(l)).count()
+    let digit = |i: usize| line.get(i).is_some_and(u8::is_ascii_digit);
+    if colon < 4 || !digit(colon - 4) || !digit(colon - 2) || !digit(colon - 1) {
+        return false;
+    }
+    if !digit(colon + 1) || !digit(colon + 2) {
+        return false;
+    }
+    // The year follows the time; anything at or below 90 is not a date git accepts.
+    let tail = &line[colon + 3..];
+    let year: i64 = std::str::from_utf8(tail)
+        .ok()
+        .and_then(|s| s.trim_start().split_whitespace().last().and_then(|w| w.parse().ok()))
+        .unwrap_or(0);
+    year > 90
 }
 
-/// The honest refusal for a multi-message mbox, so `git am <series>` fails
-/// cleanly (git's `Failed to split patches`, exit 128) instead of corrupting
-/// history by committing the whole series as one squashed patch.
-fn multi_message_unsupported() -> Split {
-    Split::Failed(vec![
-        "multi-patch mbox splitting is not ported (needs git mailsplit envelope \
-         splitting); apply the patches one at a time"
-            .to_string(),
-    ])
+/// `split_one()`: cut an mbox into its messages at the postmark lines, each message
+/// keeping the postmark it starts with. Content before the first postmark is a message
+/// of its own, which is how a bare patch file (git's `mailsplit -b`) reaches `am`.
+fn split_mbox_body(body: &[u8]) -> Vec<Vec<u8>> {
+    let mut msgs: Vec<Vec<u8>> = Vec::new();
+    let mut current: Vec<u8> = Vec::new();
+    for line in body.split_inclusive(|b| *b == b'\n') {
+        let bare = line.strip_suffix(b"\n").unwrap_or(line);
+        if is_from_line(bare) && !current.is_empty() {
+            msgs.push(std::mem::take(&mut current));
+        }
+        current.extend_from_slice(line);
+    }
+    if !current.is_empty() {
+        msgs.push(current);
+    }
+    msgs
 }
 
 fn split_mail(format: Format, paths: &[String]) -> Result<Split> {
@@ -959,24 +982,12 @@ fn split_mail(format: Format, paths: &[String]) -> Result<Split> {
 fn split_mbox(paths: &[String]) -> Result<Split> {
     let mut msgs: Vec<Vec<u8>> = Vec::new();
     if paths.is_empty() {
-        let body = read_stdin()?;
-        if mbox_message_count(&body) > 1 {
-            return Ok(multi_message_unsupported());
-        }
-        if !body.is_empty() {
-            msgs.push(body);
-        }
+        msgs.extend(split_mbox_body(&read_stdin()?));
         return Ok(Split::Messages(msgs));
     }
     for p in paths {
         if p == "-" {
-            let body = read_stdin()?;
-            if mbox_message_count(&body) > 1 {
-                return Ok(multi_message_unsupported());
-            }
-            if !body.is_empty() {
-                msgs.push(body);
-            }
+            msgs.extend(split_mbox_body(&read_stdin()?));
             continue;
         }
         let path = Path::new(p);
@@ -998,14 +1009,7 @@ fn split_mbox(paths: &[String]) -> Result<Split> {
             continue;
         }
         match std::fs::read(path) {
-            Ok(body) => {
-                if mbox_message_count(&body) > 1 {
-                    return Ok(multi_message_unsupported());
-                }
-                if !body.is_empty() {
-                    msgs.push(body);
-                }
-            }
+            Ok(body) => msgs.extend(split_mbox_body(&body)),
             Err(e) => {
                 return Ok(Split::Failed(vec![format!(
                     "cannot stat {p}: {}",
@@ -1378,13 +1382,19 @@ fn run_am_loop(
                     continue;
                 }
                 ParseOutcome::Died(code) => return Ok(code),
-                ParseOutcome::Parsed(ci) => {
+                ParseOutcome::Parsed(mut ci) => {
+                    // `am --signoff`: the trailer goes on before the message is stored, so
+                    // `final-commit` (and a later `--continue`) already carries it.
                     if ld.signoff {
-                        bail!(
-                            "`git am --signoff` is not ported: appending a Signed-off-by trailer \
-                             faithfully needs git's `append_signoff` trailer placement/dedup, which \
-                             is not vendored; refusing rather than committing a wrong message"
-                        );
+                        let sig = repo
+                            .committer()
+                            .transpose()?
+                            .ok_or_else(|| anyhow::anyhow!("unable to auto-detect email address"))?;
+                        let ident = format!("{} <{}>", sig.name, sig.email);
+                        let mut msg = String::from_utf8_lossy(&ci.msg).into_owned();
+                        super::commit::append_signoff(&mut msg, &ident, 0, true);
+                        ci.msg = msg.into_bytes();
+                        std::fs::write(state_dir.join("final-commit"), &ci.msg)?;
                     }
                     write_author_script(state_dir, &ci)?;
                     // `final-commit` was written by `parse_mail`.
@@ -1449,15 +1459,21 @@ fn run_am_loop(
             }
         }
 
-        if cli.ignore_date || cli.committer_date_is_author_date || cli.gpg_sign {
+        if cli.gpg_sign {
             bail!(
-                "`git am` with --ignore-date/--committer-date-is-author-date/-S is not ported: \
-                 these reshape the commit's date/committer/signature and cannot be reproduced \
-                 through `git commit-tree`; refusing rather than committing a wrong object"
+                "`git am -S` is not ported: signing the commit it writes needs the signing\
+                 path `commit-tree` does not expose here"
             );
         }
 
-        if let Some(code) = do_commit(&ctx, repo, &info, ld.quiet)? {
+        if let Some(code) = do_commit(
+            &ctx,
+            repo,
+            &info,
+            ld.quiet,
+            cli.ignore_date,
+            cli.committer_date_is_author_date,
+        )? {
             return Ok(code);
         }
 
@@ -1630,6 +1646,10 @@ fn do_commit(
     repo: &gix::Repository,
     info: &CommitInfo,
     quiet: bool,
+    // `--ignore-date` drops the mail's author date (the commit is dated now), and
+    // `--committer-date-is-author-date` dates the committer by the author's.
+    ignore_date: bool,
+    committer_date_is_author_date: bool,
 ) -> Result<Option<ExitCode>> {
     // `fmt_ident(..., IDENT_STRICT)` refuses an empty author name; our
     // `commit-tree` would instead accept an empty gix signature, so reproduce
@@ -1662,8 +1682,11 @@ fn do_commit(
     }
     ct.env("GIT_AUTHOR_NAME", &info.author_name)
         .env("GIT_AUTHOR_EMAIL", &info.author_email);
-    if !info.author_date.is_empty() {
+    if !info.author_date.is_empty() && !ignore_date {
         ct.env("GIT_AUTHOR_DATE", &info.author_date);
+        if committer_date_is_author_date {
+            ct.env("GIT_COMMITTER_DATE", &info.author_date);
+        }
     }
     ct.stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1777,14 +1800,21 @@ fn am_resolve(
              per-patch tty prompt loop"
         );
     }
-    if cli.ignore_date || cli.committer_date_is_author_date || cli.gpg_sign {
+    if cli.gpg_sign {
         bail!(
-            "`git am --continue` with --ignore-date/--committer-date-is-author-date/-S is not \
-             ported: these reshape the commit and cannot be reproduced through `git commit-tree`"
+            "`git am --continue -S` is not ported: signing the commit needs the signing path \
+             `commit-tree` does not expose here"
         );
     }
 
-    if let Some(code) = do_commit(&ctx, repo, &info, quiet)? {
+    if let Some(code) = do_commit(
+        &ctx,
+        repo,
+        &info,
+        quiet,
+        cli.ignore_date,
+        cli.committer_date_is_author_date,
+    )? {
         return Ok(code);
     }
 

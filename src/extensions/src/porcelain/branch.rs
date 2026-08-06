@@ -1968,6 +1968,11 @@ fn rename_branch(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
         name: new_name.clone(),
         deref: false,
     })?;
+    // The ref is new to the ref store, so gitoxide logs it as a creation; git renamed a
+    // *ref that already pointed there*, and its entry reads `<tip> <tip>`.
+    if old_full != new_full {
+        rewrite_last_reflog_old_id(&repo.git_dir().join("logs").join(&new_full), target);
+    }
 
     if old_full != new_full {
         repo.edit_reference(RefEdit {
@@ -1983,6 +1988,12 @@ fn rename_branch(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
     }
 
     if head_follows {
+        // HEAD is symbolic to the branch being renamed, so both halves of the rename are
+        // mirrored into its log: the old name going away, then the new one arriving.
+        // `refs_rename_ref()` performs the delete and the create, and each is logged
+        // through the symref.
+        super::checkout::append_head_log(repo, Some(target), None, &message);
+        super::checkout::append_head_log(repo, None, Some(target), &message);
         repo.edit_reference(RefEdit {
             change: Change::Update {
                 log: LogChange {
@@ -2659,4 +2670,33 @@ fn versioncmp(s1: &[u8], s2: &[u8]) -> Ordering {
         }
         other => (other as i32).cmp(&0),
     }
+}
+
+/// Point the last reflog entry's *old* id at `old`, which is what a rename records: the
+/// ref did not come into being, it changed name while pointing where it already pointed.
+fn rewrite_last_reflog_old_id(path: &std::path::Path, old: gix::ObjectId) {
+    let Ok(body) = std::fs::read(path) else {
+        return;
+    };
+    // Every line starts with the old id in hex, so only that field is replaced.
+    let Some(start) = body
+        .iter()
+        .rposition(|b| *b == b'\n')
+        .map(|nl| {
+            // The last line is what follows the second-to-last newline.
+            body[..nl]
+                .iter()
+                .rposition(|b| *b == b'\n')
+                .map_or(0, |prev| prev + 1)
+        })
+    else {
+        return;
+    };
+    let hex = old.to_hex().to_string();
+    if body.len() < start + hex.len() {
+        return;
+    }
+    let mut out = body.clone();
+    out[start..start + hex.len()].copy_from_slice(hex.as_bytes());
+    let _ = std::fs::write(path, out);
 }

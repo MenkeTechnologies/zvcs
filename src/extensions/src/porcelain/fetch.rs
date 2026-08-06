@@ -101,7 +101,15 @@ use gix::remote::fetch::{RefLogMessage, Shallow, Status, Tags};
 // The final `take_value!` expansion bumps the `i` cursor that no later arm reads;
 // the write is needed by every other expansion, so it can't be removed.
 #[allow(unused_assignments)]
+/// `git fetch`'s usage block, byte-for-byte from stock git 2.55.0, printed on stdout
+/// for `-h` with exit 129 — `parse-options` answers it before anything else.
+const USAGE: &str = "usage: git fetch [<options>] [<repository> [<refspec>...]]\n   or: git fetch [<options>] <group>\n   or: git fetch --multiple [<options>] [(<repository>|<group>)...]\n   or: git fetch --all [<options>]\n\n    -v, --[no-]verbose    be more verbose\n    -q, --[no-]quiet      be more quiet\n    --[no-]all            fetch from all remotes\n    --[no-]set-upstream   set upstream for git pull/fetch\n    -a, --[no-]append     append to .git/FETCH_HEAD instead of overwriting\n    --[no-]atomic         use atomic transaction to update references\n    --[no-]upload-pack <path>\n                          path to upload pack on remote end\n    -f, --[no-]force      force overwrite of local reference\n    -m, --[no-]multiple   fetch from multiple remotes\n    -t, --[no-]tags       fetch all tags and associated objects\n    -n                    do not fetch all tags (--no-tags)\n    -j, --[no-]jobs <n>   number of submodules fetched in parallel\n    --[no-]prefetch       modify the refspec to place all refs within refs/prefetch/\n    -p, --[no-]prune      prune remote-tracking branches no longer on remote\n    -P, --[no-]prune-tags prune local tags no longer on remote and clobber changed tags\n    --[no-]recurse-submodules[=<on-demand>]\n                          control recursive fetching of submodules\n    --[no-]dry-run        dry run\n    --[no-]porcelain      machine-readable output\n    --[no-]write-fetch-head\n                          write fetched references to the FETCH_HEAD file\n    -k, --[no-]keep       keep downloaded pack\n    -u, --[no-]update-head-ok\n                          allow updating of HEAD ref\n    --[no-]progress       force progress reporting\n    --[no-]depth <depth>  deepen history of shallow clone\n    --[no-]shallow-since <time>\n                          deepen history of shallow repository based on time\n    --[no-]shallow-exclude <ref>\n                          deepen history of shallow clone, excluding ref\n    --[no-]deepen <n>     deepen history of shallow clone\n    --unshallow           convert to a complete repository\n    --refetch             re-fetch without negotiating common commits\n    --[no-]update-shallow accept refs that update .git/shallow\n    --refmap <refmap>     specify fetch refmap\n    -o, --[no-]server-option <server-specific>\n                          option to transmit\n    -4, --ipv4            use IPv4 addresses only\n    -6, --ipv6            use IPv6 addresses only\n    --[no-]negotiation-restrict <revision>\n                          report that we have only objects reachable from this object\n    --[no-]negotiation-tip <revision>\n                          alias of --negotiation-restrict\n    --[no-]negotiation-include <revision>\n                          ensure this ref is always sent as a negotiation have\n    --[no-]negotiate-only do not fetch a packfile; instead, print ancestors of negotiation tips\n    --[no-]filter <args>  object filtering\n    --[no-]auto-maintenance\n                          run 'maintenance --auto' after fetching\n    --[no-]auto-gc        run 'maintenance --auto' after fetching\n    --[no-]show-forced-updates\n                          check for forced-updates on all updated branches\n    --[no-]write-commit-graph\n                          write the commit-graph after fetching\n    --[no-]stdin          accept refspecs from stdin\n\n";
+
 pub fn fetch(args: &[String]) -> Result<ExitCode> {
+    if args.iter().any(|a| a == "-h") {
+        print!("{USAGE}");
+        return Ok(ExitCode::from(129));
+    }
     let mut repo = gix::discover(".")?;
 
     // Remote-tracking ref updates write reflogs; without a configured identity, seed
@@ -110,6 +118,16 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
 
     // --- argument parsing -------------------------------------------------
     let mut opts = FetchOpts::default();
+    // `cmd_fetch()` builds the reflog action from the command line itself — `fetch`
+    // followed by every argument — unless `GIT_REFLOG_ACTION` already named one.
+    opts.reflog_action = std::env::var("GIT_REFLOG_ACTION").unwrap_or_else(|_| {
+        let mut msg = String::from("fetch");
+        for a in args {
+            msg.push(' ');
+            msg.push_str(a);
+        }
+        msg
+    });
     // Tri-state so `fetch.all` can supply the default: `Some(true/false)` is an
     // explicit `--all`/`--no-all`, `None` defers to config (git precedence:
     // CLI > config > built-in default).
@@ -719,8 +737,27 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
                 }
             }
         } else if multiple {
-            // `--multiple` always takes the fan-out path, so even one remote is
-            // announced.
+            // `--multiple` reads every positional as a remote *name* or group
+            // (`add_remote_or_group()`), so a URL or path is refused before anything is
+            // fetched — `git fetch --multiple .` never contacts `.` at all.
+            for name in &positionals {
+                let known = repo
+                    .remote_names()
+                    .iter()
+                    .any(|n| n.as_bstr() == BStr::new(*name))
+                    || repo
+                        .config_snapshot()
+                        .string(&format!("remotes.{name}"))
+                        .is_some();
+                if !known {
+                    eprintln!("fatal: no such remote or remote group: {name}");
+                    fatal = true;
+                    break;
+                }
+            }
+            if fatal {
+                return Ok(());
+            }
             for name in &positionals {
                 if !opts.quiet {
                     println!("Fetching {name}");
@@ -909,6 +946,9 @@ enum Recurse {
 /// Parsed command-line options shared across every remote a single invocation
 /// touches (`--all`/`--multiple` fan out but carry the same flags).
 struct FetchOpts {
+    /// `GIT_REFLOG_ACTION`, or the whole command line as git composes it: `fetch` plus
+    /// every argument, which is the prefix each stored ref's reflog line carries.
+    reflog_action: String,
     dry_run: bool,
     verbose: bool,
     quiet: bool,
@@ -979,6 +1019,7 @@ struct FetchOpts {
 impl Default for FetchOpts {
     fn default() -> Self {
         FetchOpts {
+            reflog_action: "fetch".to_string(),
             dry_run: false,
             verbose: false,
             quiet: false,
@@ -1393,6 +1434,22 @@ fn fetch_one(
     fetch_head: &mut FetchHead,
     progress: &mut prodash::tree::Item,
 ) -> Result<Verdict> {
+    // A local path that is not a repository never reaches the transport in git:
+    // `enter_repo()` fails on the other side and `die_initial_contact()` follows.
+    if let Some(spec) = name_or_url {
+        let spec = spec.to_string();
+        if repo.try_find_remote(spec.as_str()).is_none() {
+            if let Some(bad) = super::send_pack::local_dest_that_is_not_a_repository(&spec) {
+                eprintln!("fatal: '{bad}' does not appear to be a git repository");
+                eprintln!(
+                    "fatal: Could not read from remote repository.\n\n\
+                     Please make sure you have the correct access rights\n\
+                     and the repository exists."
+                );
+                return Ok(Verdict::Fatal);
+            }
+        }
+    }
     let mut remote = repo.find_fetch_remote(name_or_url)?;
     let remote_name = remote.name().map(|n| n.as_bstr().to_string());
 
@@ -1701,7 +1758,7 @@ fn fetch_one(
         .with_refetch(opts.refetch)
         .with_atomic(opts.atomic)
         .with_reflog_message(RefLogMessage::Prefixed {
-            action: "fetch".into(),
+            action: opts.reflog_action.clone().into(),
         })
         .receive(&mut *progress, &should_interrupt);
     let outcome = match outcome {
@@ -1736,6 +1793,12 @@ fn fetch_one(
             .or_else(|| mapping.remote.as_name().map(ToString::to_string))
             .unwrap_or_default();
         eprintln!("warning: rejected {name} because shallow roots are not allowed to be updated");
+    }
+
+    // `fetch_pack()` chooses `unpack-objects` over `index-pack` for a small pack, so a
+    // fetch of a handful of objects leaves them loose rather than packed.
+    if let Status::Change { write_pack_bundle, .. } = &outcome.status {
+        explode_small_pack(repo, write_pack_bundle)?;
     }
 
     // Both status variants carry the ref-update outcome; the ref_map ties each
@@ -2489,4 +2552,63 @@ mod tests {
             format!("{}\tnot-for-merge\t/tmp/o", id.to_hex())
         );
     }
+}
+
+/// `fetch_pack()`'s `unpack-objects` path: a pack carrying fewer objects than
+/// `fetch.unpackLimit` (falling back to `transfer.unpackLimit`, then git's 100) is
+/// exploded into loose objects and dropped, because indexing a tiny pack costs more
+/// than the objects are worth.
+///
+/// gitoxide always indexes, so the pack is written first and taken apart here; the
+/// object database ends up holding what git's would.
+fn explode_small_pack(
+    repo: &gix::Repository,
+    bundle: &gix::odb::pack::bundle::write::Outcome,
+) -> Result<()> {
+    let limit = {
+        let snap = repo.config_snapshot();
+        snap.integer("fetch.unpackLimit")
+            .or_else(|| snap.integer("transfer.unpackLimit"))
+            .unwrap_or(100)
+    };
+    // `0` disables the shortcut, and a negative value is git's "always unpack".
+    if limit == 0 {
+        return Ok(());
+    }
+    let count = bundle.index.num_objects;
+    if limit > 0 && u64::from(count) >= limit as u64 {
+        return Ok(());
+    }
+    let (Some(index_path), Some(data_path)) = (&bundle.index_path, &bundle.data_path) else {
+        return Ok(());
+    };
+
+    use gix::objs::Write as _;
+    let pack = gix::odb::pack::Bundle::at(index_path, repo.object_hash())?;
+    let mut buf = Vec::with_capacity(64 * 1024);
+    let mut inflate = gix::zlib::Inflate::default();
+    let mut cache = gix::odb::pack::cache::Never;
+    for idx in 0..pack.index.num_objects() {
+        let id = pack.index.oid_at_index(idx).to_owned();
+        let (object, _) = pack.get_object_by_index(idx, &mut buf, &mut inflate, &mut cache)?;
+        repo.objects
+            .write_buf_with_known_id(object.kind, object.data, id)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+    drop(pack);
+
+    // The `.keep` file guards the pack until its refs point at it; with the objects
+    // loose there is nothing left to guard.
+    for path in [
+        Some(data_path.clone()),
+        Some(index_path.clone()),
+        bundle.keep_path.clone(),
+        Some(data_path.with_extension("rev")),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let _ = std::fs::remove_file(path);
+    }
+    Ok(())
 }

@@ -57,9 +57,32 @@ fn is_zvcs(bin: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// The stock git binary, or `None` when the machine has none that is not zvcs.
-pub fn git_path() -> Option<&'static Path> {
-    static RESOLVED: OnceLock<Option<PathBuf>> = OnceLock::new();
+/// The version this port reproduces, read from its single source of truth:
+/// `GIT_VERSION` in `porcelain/version.rs`, which is what `git version` prints.
+///
+/// It is read rather than repeated here so the two can never drift. `None` means
+/// the constant could not be found, and the floor below is then not enforced —
+/// a harness that cannot locate the target must not invent one.
+fn target_version() -> Option<(u32, u32, u32)> {
+    let src = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()?
+        .join("extensions/src/porcelain/version.rs");
+    let text = std::fs::read_to_string(src).ok()?;
+    let line = text.lines().find(|l| l.trim_start().starts_with("const GIT_VERSION"))?;
+    let literal = line.split('"').nth(1)?;
+    let mut parts = literal.split('.').filter_map(|p| p.parse::<u32>().ok());
+    Some((parts.next()?, parts.next().unwrap_or(0), parts.next().unwrap_or(0)))
+}
+
+/// The newest usable stock git and its version, or `None` when there is none.
+///
+/// "Usable" means: it exists, it is not zvcs wearing git's name, and it answers
+/// `--version`. A binary that will not run — a clobbered install, a signature the
+/// kernel rejects — fails the last test and drops out, which is why the version
+/// travels with the path: without it the caller cannot tell a resolved oracle
+/// from a silently downgraded one.
+fn resolved() -> Option<&'static (PathBuf, (u32, u32, u32))> {
+    static RESOLVED: OnceLock<Option<(PathBuf, (u32, u32, u32))>> = OnceLock::new();
     RESOLVED
         .get_or_init(|| {
             if let Some(explicit) = std::env::var_os("ZVCS_STOCK_GIT") {
@@ -67,7 +90,11 @@ pub fn git_path() -> Option<&'static Path> {
                 // An explicit choice is honoured even if the probe dislikes it:
                 // the caller named a binary, and second-guessing that would make
                 // the escape hatch useless. It still has to exist.
-                return path.exists().then_some(path);
+                if !path.exists() {
+                    return None;
+                }
+                let v = version_of(&path).unwrap_or((0, 0, 0));
+                return Some((path, v));
             }
             CANDIDATES
                 .iter()
@@ -75,22 +102,59 @@ pub fn git_path() -> Option<&'static Path> {
                 .filter(|p| p.exists() && !is_zvcs(p))
                 .filter_map(|p| version_of(&p).map(|v| (v, p)))
                 .max_by_key(|(v, _)| *v)
-                .map(|(_, p)| p)
+                .map(|(v, p)| (p, v))
         })
-        .as_deref()
+        .as_ref()
+}
+
+/// The stock git binary, or `None` when the machine has none that is not zvcs.
+pub fn git_path() -> Option<&'static Path> {
+    resolved().map(|(p, _)| p.as_path())
+}
+
+/// The version of the binary [`git_path`] resolved to.
+pub fn git_version() -> Option<(u32, u32, u32)> {
+    resolved().map(|(_, v)| *v)
 }
 
 /// The stock git binary, or an error naming what to do about its absence.
+///
+/// A git older than the one the port targets is refused rather than measured
+/// against. The two disagree about real behaviour, so parity with the older one
+/// is parity with a git nobody is running — and the failure mode this guards is
+/// silent: when the newest candidate stops answering (overwritten, unsigned,
+/// removed), the next-newest is picked up and the run keeps producing numbers
+/// that read exactly like the ones before it.
 pub fn git() -> anyhow::Result<&'static Path> {
-    git_path().ok_or_else(|| {
-        anyhow::anyhow!(
+    let Some((path, version)) = resolved() else {
+        anyhow::bail!(
             "no stock git found to measure against (tried {}); \
              set ZVCS_STOCK_GIT to one. `git` on PATH is not used: it is zvcs on \
              any machine where the shadow is installed, and comparing zvcs with \
              itself measures nothing",
             CANDIDATES.join(", ")
-        )
-    })
+        );
+    };
+    if let Some(target) = target_version() {
+        if *version < target {
+            let (a, b, c) = *version;
+            let (x, y, z) = target;
+            anyhow::bail!(
+                "the newest stock git found is {} at {} — older than the {}.{}.{} this port \
+                 targets, which measures parity against a git nobody is running. Install \
+                 {}.{}.{} or newer, or name one with ZVCS_STOCK_GIT",
+                format!("{a}.{b}.{c}"),
+                path.display(),
+                x,
+                y,
+                z,
+                x,
+                y,
+                z
+            );
+        }
+    }
+    Ok(path.as_path())
 }
 
 /// A [`Command`] for the stock git, or an error when there is none.

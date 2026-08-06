@@ -284,6 +284,16 @@ impl Pipeline<'_> {
     pub fn driver_context_mut(&mut self) -> &mut gix_filter::pipeline::Context {
         self.inner.driver_context_mut()
     }
+
+    /// Adjust the options this pipeline was built with, for callers that convert under
+    /// different rules than the repository configuration alone implies.
+    ///
+    /// git's `get_conv_flags()` is the reason this exists: the same `core.safecrlf`
+    /// setting produces a round-trip check when an object is about to be written, and
+    /// none at all when the conversion only feeds a comparison or a dry run.
+    pub fn options_mut(&mut self) -> &mut gix_filter::pipeline::Options {
+        self.inner.options_mut()
+    }
 }
 
 /// Obtain a list of all configured driver, but ignore those in sections that we don't trust enough.

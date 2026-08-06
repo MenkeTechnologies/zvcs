@@ -26,12 +26,17 @@ use regex::bytes::{Regex, RegexBuilder};
 ///   * `git reflog list` — every ref that has a reflog, in git's directory-tree
 ///     order (per-directory name sort).
 ///   * `git reflog exists <ref>` — exit 0 if `$GIT_DIR/logs/<ref>` is a file, else 1.
-///   * `write`, `delete`, `drop`, `expire` bail — not ported. The primitives are
-///     available (`gix-ref`'s `RefLog::Only` appends a reflog entry without
-///     touching the reference, and rewriting a log file in place is what
-///     [`super::gc`]'s reflog expiry already does); what is missing is the
-///     command surface itself — selector parsing, entry relinking, `--rewrite`,
-///     `--updateref`, `--dry-run` reporting and the whole `expire` option set.
+///   * `git reflog delete [--rewrite] [--updateref] [--dry-run] <ref>…` — drop
+///     the named entries. The rest of the file is left byte-identical: the neighbours
+///     keep the ids they recorded unless `--rewrite` closes the chain up, and the ref
+///     only moves under `--updateref`. A selector past the end of a log is ignored.
+///   * `git reflog expire [--expire=<t>] [--expire-unreachable=<t>] [--rewrite]
+///     [--updateref] [--dry-run] [--all | <ref>…]` — `should_expire_reflog_ent()`'s
+///     two tests: an entry goes when it is older than the total cutoff, and also when
+///     it is unreachable from the ref and older than the unreachable cutoff. Without
+///     the options git's 90-day / 30-day defaults apply. An emptied log is left as an
+///     empty file, as git leaves it.
+///   * `write` and `drop` bail — not ported.
 ///
 /// # Argument grammar for `show`
 ///
@@ -183,7 +188,9 @@ pub fn reflog(args: &[String]) -> Result<ExitCode> {
         Some("show") => ("show", &args[1..]),
         Some("list") => ("list", &args[1..]),
         Some("exists") => ("exists", &args[1..]),
-        Some(s @ ("write" | "delete" | "drop" | "expire")) => bail!(
+        Some("delete") => ("delete", &args[1..]),
+        Some("expire") => ("expire", &args[1..]),
+        Some(s @ ("write" | "drop")) => bail!(
             "`reflog {s}` is not ported: the reflog write path (entry selectors, \
              relinking, --rewrite/--updateref, and the expire option set) has no \
              implementation yet"
@@ -197,6 +204,8 @@ pub fn reflog(args: &[String]) -> Result<ExitCode> {
         "show" => show(&repo, rest),
         "list" => list(&repo, rest),
         "exists" => exists(&repo, rest),
+        "delete" => delete_entries(&repo, rest),
+        "expire" => expire_entries(&repo, rest),
         _ => unreachable!("subcommand set is closed above"),
     }
 }
@@ -3175,4 +3184,333 @@ fn collect_logs(dir: &Path, prefix: &str, out: &mut Vec<String>) -> Result<()> {
 
 fn all_digits(s: &str) -> bool {
     !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
+}
+
+// ---------------------------------------------------------------------------
+// delete / expire — the reflog write path
+// ---------------------------------------------------------------------------
+
+/// One line of a reflog file, kept whole so a rewrite is byte-exact.
+///
+/// git rewrites these files as text: `<old> <new> <who> <ts> <tz>\t<message>`. The two
+/// ids and the timestamp are the only fields the write path reasons about, so the rest
+/// of the line is carried through untouched.
+struct RawLine {
+    old: ObjectId,
+    new: ObjectId,
+    time: i64,
+    bytes: Vec<u8>,
+}
+
+/// Parse one reflog line. `None` for a line git would not have written.
+fn parse_raw_line(line: &[u8]) -> Option<RawLine> {
+    let hexsz = line.iter().position(|b| *b == b' ')?;
+    let old = ObjectId::from_hex(&line[..hexsz]).ok()?;
+    let rest = &line[hexsz + 1..];
+    let new_end = rest.iter().position(|b| *b == b' ')?;
+    let new = ObjectId::from_hex(&rest[..new_end]).ok()?;
+    // The committer block ends at the timestamp, which is the second-to-last
+    // whitespace-separated field before the tab (`<name> <email> <secs> <tz>`).
+    let head = match rest.iter().position(|b| *b == b'\t') {
+        Some(tab) => &rest[..tab],
+        None => rest,
+    };
+    let mut fields = head.rsplit(|b| *b == b' ');
+    let _tz = fields.next()?;
+    let secs = fields.next()?;
+    let time: i64 = std::str::from_utf8(secs).ok()?.parse().ok()?;
+    Some(RawLine {
+        old,
+        new,
+        time,
+        bytes: line.to_vec(),
+    })
+}
+
+/// The file a ref's reflog lives in. `HEAD` (and the other per-worktree
+/// pseudo-refs) belong to this worktree; everything else is shared.
+fn log_file(repo: &gix::Repository, full_name: &str) -> PathBuf {
+    let root = if full_name.starts_with("refs/") {
+        repo.common_dir()
+    } else {
+        repo.git_dir()
+    };
+    root.join("logs").join(full_name)
+}
+
+/// The full ref name behind a selector's ref part, as `dwim_log()` resolves it.
+fn resolve_log_ref(repo: &gix::Repository, name: &str) -> String {
+    if name == "HEAD" {
+        return name.to_owned();
+    }
+    match repo.try_find_reference(name).ok().flatten() {
+        Some(r) => r.name().as_bstr().to_str_lossy().into_owned(),
+        None => name.to_owned(),
+    }
+}
+
+/// Read a reflog file as raw lines, oldest first. `None` when there is no log.
+fn read_raw_log(path: &Path) -> Result<Option<Vec<RawLine>>> {
+    let data = match std::fs::read(path) {
+        Ok(d) => d,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let mut out = Vec::new();
+    for line in data.split(|b| *b == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        match parse_raw_line(line) {
+            Some(parsed) => out.push(parsed),
+            None => bail!("bad reflog line in {}", path.display()),
+        }
+    }
+    Ok(Some(out))
+}
+
+/// Write a reflog file back from its surviving lines. An empty survivor set leaves an
+/// empty file rather than removing it, which is what `git reflog expire` leaves behind.
+fn write_raw_log(path: &Path, lines: &[RawLine], rewrite: bool) -> Result<()> {
+    let mut out: Vec<u8> = Vec::new();
+    let mut previous: Option<ObjectId> = None;
+    for line in lines {
+        // `--rewrite`: a survivor whose predecessor was dropped starts from what is now
+        // the previous entry's new id, so the chain reads continuously again.
+        if rewrite && previous.is_some_and(|p| p != line.old) {
+            let want = previous.expect("checked");
+            let mut fixed = want.to_hex().to_string().into_bytes();
+            fixed.extend_from_slice(&line.bytes[want.to_hex().to_string().len()..]);
+            out.extend_from_slice(&fixed);
+        } else {
+            out.extend_from_slice(&line.bytes);
+        }
+        out.push(b'\n');
+        previous = Some(line.new);
+    }
+    std::fs::write(path, out)?;
+    Ok(())
+}
+
+/// `git reflog delete [--rewrite] [--updateref] [--dry-run] <ref>@{<n>}…` — port of
+/// `cmd_reflog_delete`.
+///
+/// Each selector names one entry, counted from the newest. The entry is dropped and the
+/// rest of the file is left as it was: the neighbours keep the ids they recorded unless
+/// `--rewrite` asks for the chain to be closed up, and the ref itself only moves under
+/// `--updateref`. A selector past the end of the log is silently ignored, as git's
+/// `mark_reflog_expiry` is.
+fn delete_entries(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
+    let mut rewrite = false;
+    let mut updateref = false;
+    let mut dry_run = false;
+    let mut selectors: Vec<&str> = Vec::new();
+    for a in args {
+        match a.as_str() {
+            "--rewrite" => rewrite = true,
+            "--updateref" => updateref = true,
+            "-n" | "--dry-run" => dry_run = true,
+            "--verbose" | "-q" | "--quiet" => {}
+            s if s.starts_with('-') => bail!("unsupported argument {s:?} for `reflog delete`"),
+            s => selectors.push(s),
+        }
+    }
+    if selectors.is_empty() {
+        eprintln!("usage: git reflog delete [--rewrite] [--updateref] [--dry-run] [--verbose] <ref>@{{<specifier>}}…");
+        return Ok(ExitCode::from(129));
+    }
+
+    for spec in selectors {
+        let Some((name, rest)) = spec.split_once("@{") else {
+            eprintln!("error: not a reflog: {spec}");
+            return Ok(ExitCode::from(255));
+        };
+        let Some(index) = rest.strip_suffix('}').and_then(|n| n.parse::<usize>().ok()) else {
+            eprintln!("error: not a reflog: {spec}");
+            return Ok(ExitCode::from(255));
+        };
+        let full = resolve_log_ref(repo, name);
+        let path = log_file(repo, &full);
+        let Some(mut lines) = read_raw_log(&path)? else {
+            eprintln!("error: reflog for '{name}' does not exist");
+            return Ok(ExitCode::from(255));
+        };
+        // `@{0}` is the newest entry, which is the last line of the file.
+        let Some(at) = lines.len().checked_sub(index + 1) else {
+            continue;
+        };
+        lines.remove(at);
+        if dry_run {
+            continue;
+        }
+        write_raw_log(&path, &lines, rewrite)?;
+        if updateref {
+            if let Some(newest) = lines.last() {
+                update_ref_to(repo, &full, newest.new)?;
+            }
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Point `full_name` at `oid` without adding a reflog entry of its own, which is what
+/// `--updateref` does after the log was rewritten.
+fn update_ref_to(repo: &gix::Repository, full_name: &str, oid: ObjectId) -> Result<()> {
+    use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
+    repo.edit_reference(RefEdit {
+        change: Change::Update {
+            log: LogChange {
+                mode: RefLog::Only,
+                force_create_reflog: false,
+                message: "".into(),
+            },
+            expected: PreviousValue::Any,
+            new: gix::refs::Target::Object(oid),
+        },
+        name: full_name
+            .try_into()
+            .map_err(|e| anyhow!("invalid ref name {full_name}: {e}"))?,
+        deref: false,
+    })?;
+    Ok(())
+}
+
+/// `git reflog expire [--expire=<time>] [--expire-unreachable=<time>] [--all] …` — port
+/// of `cmd_reflog_expire`.
+///
+/// An entry is dropped when it is older than the cutoff that applies to it: `--expire`
+/// for one whose new id is still reachable from the ref, `--expire-unreachable` for one
+/// whose is not. `now` expires everything, `never` nothing; without either option git's
+/// `gc.reflogExpire` (90 days) and `gc.reflogExpireUnreachable` (30 days) defaults apply.
+fn expire_entries(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
+    const DAY: i64 = 24 * 60 * 60;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+
+    let mut all = false;
+    let mut dry_run = false;
+    let mut rewrite = false;
+    let mut updateref = false;
+    let mut expire: Option<i64> = None;
+    let mut expire_unreachable: Option<i64> = None;
+    let mut refs: Vec<String> = Vec::new();
+    // `now` is "everything is older", `never` is "nothing is"; anything else is an
+    // approxidate the same parser `--expire` takes elsewhere reads.
+    let cutoff = |value: &str| -> Option<i64> {
+        match value {
+            "now" | "all" => Some(i64::MAX),
+            "never" | "false" => Some(i64::MIN),
+            _ => gix::date::parse(value, Some(std::time::SystemTime::now()))
+                .ok()
+                .map(|t| t.seconds),
+        }
+    };
+    for a in args {
+        let s = a.as_str();
+        match s {
+            "--all" => all = true,
+            "--single-worktree" => {}
+            "-n" | "--dry-run" => dry_run = true,
+            "--rewrite" => rewrite = true,
+            "--updateref" => updateref = true,
+            "--stale-fix" | "--verbose" | "-q" | "--quiet" => {}
+            _ if s.starts_with("--expire-unreachable=") => {
+                let v = &s["--expire-unreachable=".len()..];
+                match cutoff(v) {
+                    Some(t) => expire_unreachable = Some(t),
+                    None => bail!("'{v}' is not a valid timestamp"),
+                }
+            }
+            _ if s.starts_with("--expire=") => {
+                let v = &s["--expire=".len()..];
+                match cutoff(v) {
+                    Some(t) => expire = Some(t),
+                    None => bail!("'{v}' is not a valid timestamp"),
+                }
+            }
+            _ if s.starts_with('-') => bail!("unsupported argument {s:?} for `reflog expire`"),
+            _ => refs.push(s.to_owned()),
+        }
+    }
+
+    let expire = expire.unwrap_or(now - 90 * DAY);
+    let expire_unreachable = expire_unreachable.unwrap_or(now - 30 * DAY);
+
+    let targets: Vec<String> = if all {
+        let mut names = Vec::new();
+        for root in reflog_roots(repo) {
+            collect_logs(&root, "", &mut names)?;
+        }
+        names.sort();
+        names.dedup();
+        names
+    } else if refs.is_empty() {
+        eprintln!("usage: git reflog expire [--expire=<time>] [--expire-unreachable=<time>] [--rewrite] [--updateref] [--stale-fix] [--dry-run] [--verbose] [--all [--single-worktree] | <refs>…]");
+        return Ok(ExitCode::from(129));
+    } else {
+        refs.iter().map(|r| resolve_log_ref(repo, r)).collect()
+    };
+
+    for full in targets {
+        let path = log_file(repo, &full);
+        let Some(lines) = read_raw_log(&path)? else {
+            continue;
+        };
+        // `should_expire_reflog_ent()`: an entry goes when it is older than the total
+        // cutoff, and separately when it is unreachable and older than that cutoff. The
+        // reachable set is only needed for the second test.
+        let reachable = (expire_unreachable != i64::MIN)
+            .then(|| reachable_from_ref(repo, &full))
+            .transpose()?;
+        let mut kept: Vec<RawLine> = Vec::new();
+        for line in lines {
+            if line.time < expire {
+                continue;
+            }
+            let unreachable = reachable
+                .as_ref()
+                .is_some_and(|set| !line.new.is_null() && !set.contains(&line.new));
+            if unreachable && line.time < expire_unreachable {
+                continue;
+            }
+            kept.push(line);
+        }
+        if dry_run {
+            continue;
+        }
+        write_raw_log(&path, &kept, rewrite)?;
+        if updateref {
+            if let Some(newest) = kept.last() {
+                update_ref_to(repo, &full, newest.new)?;
+            }
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Every commit reachable from a ref's current tip, which is what decides whether an
+/// entry counts as unreachable for `--expire-unreachable`.
+fn reachable_from_ref(
+    repo: &gix::Repository,
+    full_name: &str,
+) -> Result<std::collections::HashSet<ObjectId>> {
+    let mut set = std::collections::HashSet::new();
+    let Some(tip) = repo
+        .try_find_reference(full_name)
+        .ok()
+        .flatten()
+        .and_then(|mut r| r.peel_to_id_in_place().ok())
+        .map(|id| id.detach())
+    else {
+        return Ok(set);
+    };
+    let Ok(walk) = repo.rev_walk([tip]).all() else {
+        return Ok(set);
+    };
+    for info in walk.flatten() {
+        set.insert(info.id);
+    }
+    Ok(set)
 }

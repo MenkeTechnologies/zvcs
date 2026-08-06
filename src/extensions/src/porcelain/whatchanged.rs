@@ -54,121 +54,35 @@
 //! `error:`-prefixed ones that come from `parse-options` rather than `die()` exit 129,
 //! the rest exit 128.
 //!
-//! ### Covered (byte-identical stdout/stderr and exit code against stock git 2.55.0)
+//! ### What this module does
 //!
-//! * Every exit-128/129 argument-parsing path listed above.
-//! * No `--i-still-use-this`: the 702-byte deprecation notice on stderr, empty stdout,
-//!   exit 128. This is the whole behaviour of the stock command on modern git, so it
-//!   is the path most callers actually hit.
-//! * `--i-still-use-this`: the `medium` commit header (`commit`/`Author:`/`Date:` plus
-//!   the four-space-indented message) followed by a blank line and the recursive
-//!   `--raw` change list, newest commit first by commit date, commits separated by a
-//!   blank line.
-//! * Merge commits are skipped entirely (`--no-merges`), and — unlike `git log --raw`,
-//!   which sets `always_show_header` — a commit whose diff is empty prints nothing and
-//!   does not consume a `--max-count` slot. Both match `cmd_whatchanged`.
-//! * A root commit is diffed against the empty tree, so it lists its whole tree as
-//!   additions.
-//! * `-n <n>` / `-n<n>` / `-<n>` / `--max-count[=]<n>`, `--no-renames`, `--raw` and
-//!   `--no-merges` (both already implied by `whatchanged`), and a single `<rev>`
-//!   (default `HEAD`).
-//! * Object ids are abbreviated the way git's `diff_aligned_abbrev` does: `core.abbrev`
-//!   when set, otherwise an auto width floored at 7, extended per id until unambiguous;
-//!   an absent side renders as that many `0`s.
-//! * **`log.*` display config, read by [`read_log_config`] the way git's `git_log_config`
-//!   does, with the command line overriding — matching `git log`'s own handling.**
-//!   * `log.abbrevCommit` (default false) abbreviates the `commit <id>` header to the same
-//!     `find_unique_abbrev` width the raw diff uses; `--abbrev-commit` / `--no-abbrev-commit`
-//!     override it.
-//!   * `log.showRoot` (default true) shows the root commit's empty-tree diff. Set false it
-//!     is suppressed, so — being TREESAME-empty — the root commit drops out of the output
-//!     entirely and consumes no `--max-count` slot; `--root` forces it back on (git has no
-//!     `--no-root`).
-//!   * `log.date` is validated at read time exactly like git: an unknown value is
-//!     `fatal: unknown date format <v>` (exit 128), raised ahead of the deprecation gate and
-//!     of any `--date` override. `default` is a no-op; every other valid mode selects a date
-//!     format `whatchanged` does not render, so it is deferred to the unported bail below
-//!     (identical treatment to a command-line `--date`).
-//! * **Path-limited traversal.** Everything after `--` — and any pre-`--` argument that
-//!   resolved as a filename rather than a revision — is a pathspec. A commit is shown
-//!   iff its `--raw` change list, filtered down to the paths the pathspec matches, is
-//!   non-empty; the shown lines are the surviving ones. Matching is delegated to gix's
-//!   `Pathspec`, git's own algorithm: literal paths and directory prefixes, shell globs
-//!   (`*.rs`), and `:(glob)` / `:!exclude` / exclude-only magic. Slot accounting matches
-//!   git — a path-filtered-empty commit consumes no `--max-count`.
-//! * **Ref-set selectors.** `--all`, `--tags`, `--branches` and `--remotes` replace the
-//!   default `HEAD` tip with the union of the matching commit refs (any explicit `<rev>`
-//!   is unioned in too), so history from every selected ref is walked. An empty selection
-//!   (`--tags` in a tagless repo) walks nothing and exits 0, as git does.
-//! * **`--grep` commit-message filter** for the literal-pattern case. git greps the
-//!   message with POSIX *basic* regex by default; a pattern that is a pure literal under
-//!   the active flavour (`-F` forces literal, `-E`/`-P` widen the metacharacter set) is
-//!   matched with an exact substring test — byte-identical to git's result. Multiple
-//!   `--grep` OR (`--all-match` ANDs), `--invert-grep` negates, and `-i` folds ASCII case.
-//!   A pattern carrying regex metacharacters is deferred (see below) rather than matched
-//!   with the wrong flavour.
-//! * **Unported options are applied lazily, matching git's exit code on empty output.**
-//!   git only applies display/filter options to the commits it actually shows, so an
-//!   invocation whose filters leave nothing to show exits 0 with empty output whatever
-//!   those options are. This module mirrors that: a recognised-but-unported option no
-//!   longer bails up front — it bails only when a commit survives every filter and would
-//!   be rendered. `whatchanged --i-still-use-this --unified=1 --grep=X` over a repo where
-//!   no message matches `X` now exits 0 (empty), exactly like git, instead of erroring.
-//! * **Malformed option values are rejected at parse time, matching git's exit code.**
-//!   An invalid `--pretty=`/`--format=` value is `fatal: invalid --pretty format` (128);
-//!   `--min-parents=`/`--max-parents=` reject a non-integer (128); `--unified=`,
-//!   `--stat-width=`/`--stat-count=`/`--stat-name-width=`, `--color=`, and `--word-diff=`
-//!   reject a bad value as a `parse-options` `error:` (129). The value itself is still
-//!   unimplemented, but a bad one now exits exactly as git does instead of reaching the
-//!   generic recognised-but-unported path.
+//! `cmd_whatchanged` is `cmd_log` with two settings changed — the raw format becomes
+//! the default when no other diff format is asked for, and `always_show_header` stays
+//! off — so once the deprecation gate is cleared the walk and the rendering are handed
+//! to [`super::log::whatchanged`], which runs `log`'s renderer under that flavour. What
+//! stays here is everything that happens *before* the gate:
 //!
-//! ### Honest limitations (bailed on with a precise message, never silently ignored)
+//! * The whole `setup_revisions` classification above, with its exit-128/129 paths.
+//! * `git_log_config`'s validation of `log.date`, which is fatal ahead of the
+//!   deprecation notice and of any argument-parse error.
+//! * The 702-byte deprecation notice (stderr, empty stdout, exit 128) when
+//!   `--i-still-use-this` is absent — the whole behaviour of the stock command on
+//!   modern git, and the path most callers hit.
+//! * Dropping `--i-still-use-this` itself, which `cmd_log_init`'s `parse_options` pass
+//!   removes before `setup_revisions` ever sees the array.
 //!
-//! * **Every other recognised option.** They are recognised for the purpose of argument
-//!   classification — that is what git does, and it is what decides the exit-128 output
-//!   above — but under `--i-still-use-this` a recognised option this module does not
-//!   implement bails *when a commit would be shown* rather than being ignored (see the
-//!   lazy-application note above; when the filters empty the walk, they exit 0 like git).
-//!   `-p`/`--patch`, `--stat` and friends, a *valid* `--pretty`/`--format`, `--graph`,
-//!   date/author filters, a non-literal `--grep`, `-M`/`-C`, and `--decorate` all land here.
-//! * **Tip-set-broadening selectors this module does not resolve** — `--reflog`,
-//!   `--walk-reflogs`/`-g`, `--stdin`, `--bisect`, `--not`, and patterned ref globs
-//!   (`--glob=`, `--exclude=`, `--branches=`/`--tags=`/`--remotes=` with a value) — bail
-//!   *before* the walk, since ignoring one could make real history look empty.
-//! * **`:(attr:…)` attribute pathspecs** (which need the worktree attribute stack) and
-//!   **multiple or non-single revisions** (`a..b`, `^a`, `a...b`) bail under
-//!   `--i-still-use-this`.
-//! * **Rename detection.** git's `diff.renames` defaults to on, so a commit that both
-//!   adds and deletes files gets `R<score>` lines in a queue order produced by
-//!   `diffcore_rename`. The vendored `gix-diff` rewrite tracker computes similarity
-//!   from a line-based blob diff (`rewrites/tracker.rs`, `(old_len - removed_bytes) /
-//!   max(old_len, new_len)`) rather than git's 64-byte spanhash `src_copied`, does not
-//!   expose an integer score on `ChangeRef::Rewrite` at all, and emits changes in
-//!   tree-walk order rather than git's rename-queue order. Neither the `R<score>`
-//!   digits nor the line ordering could be reproduced, so when rename detection is
-//!   active *and* a commit's diff contains both an addition and a deletion, this bails
-//!   instead of printing plausible-looking wrong lines. `--no-renames` (or
-//!   `diff.renames=false`) makes every commit reproducible.
+//! ### Limitations
+//!
 //! * The option tables below are the ones that were verified against stock git. An
 //!   option git recognises but that is absent from them is reported as
 //!   `unrecognized argument`, which is wrong for that option; nothing silently passes.
-//! * The auto abbreviation width is derived from gix's *packed* object count; git also
-//!   estimates loose objects, so the two can differ by a hex digit in a repository with
-//!   many loose objects and no pack.
-//! * `i18n.commitEncoding` / the commit `encoding` header is not applied; the message
-//!   bytes are passed through as stored.
+//! * Whatever `git log` does not implement is not implemented here either, and is
+//!   reported by that module.
 
-use anyhow::{anyhow, bail, Result};
-use std::cmp::Ordering;
-use std::io::Write;
+use anyhow::Result;
 use std::process::ExitCode;
 
-use gix::bstr::{BStr, BString, ByteSlice};
-use gix::hash::ObjectId;
-use gix::objs::tree::EntryMode;
-use gix::prelude::ObjectIdExt;
-use gix::revision::walk::Sorting;
-use gix::traverse::commit::simple::CommitTimeOrder;
+use gix::bstr::ByteSlice;
 
 /// Stock git's deprecation notice, byte-for-byte (702 bytes). Written to stderr, with
 /// nothing on stdout, when `--i-still-use-this` is absent; exit code 128.
@@ -192,16 +106,6 @@ const DEPRECATION: &str = concat!(
     "\n",
     "fatal: refusing to run without --i-still-use-this\n",
 );
-
-/// The `S_IFMT` mask git uses to tell a *type* change (`T`) from a plain modification
-/// (`M`); `100644` and `100755` share a type, `120000` and `160000` do not.
-const IFMT: u16 = 0o170000;
-
-/// git's `MINIMUM_ABBREV`, the floor `core.abbrev` is clamped to.
-const MINIMUM_ABBREV: usize = 4;
-
-/// git's `FALLBACK_DEFAULT_ABBREV`, the floor of the auto-computed width.
-const FALLBACK_ABBREV: usize = 7;
 
 /// A message git writes to stderr before exiting non-zero. `text` is complete, already
 /// newline-terminated, and includes its own `fatal: ` / `error: ` prefix.
@@ -258,6 +162,7 @@ const VALUE_SWITCHES: &[char] = &['S', 'G', 'l', 'O'];
 /// these reaches the deprecation notice rather than `unrecognized argument`.
 const FLAG_OPTS: &[&str] = &[
     "--raw",
+    "-z",
     "-p",
     "-u",
     "-s",
@@ -550,27 +455,6 @@ impl OptState {
     }
 }
 
-/// One side of a change: absent (`None`) means the path was added or deleted.
-#[derive(Clone, Copy)]
-struct Side {
-    mode: EntryMode,
-    id: ObjectId,
-}
-
-/// A single blob-level change, in the shape the `--raw` line needs.
-struct Change {
-    old: Option<Side>,
-    new: Option<Side>,
-    path: BString,
-}
-
-/// A tree entry, materialised so the borrow on the tree's buffer ends before we recurse.
-struct Entry {
-    mode: EntryMode,
-    name: BString,
-    id: ObjectId,
-}
-
 /// Options that make `--walk-reflogs` fatal, because they force git to build a limited
 /// (topologically ordered) revision list. Determined by running each grammar option
 /// alongside `-g` against stock git; `--reverse` has its own message and is not here.
@@ -607,61 +491,6 @@ struct GrepFilter {
     invert: bool,
     fixed: bool,
     extended: bool,
-}
-
-impl GrepFilter {
-    fn active(&self) -> bool {
-        !self.patterns.is_empty()
-    }
-
-    /// Whether every collected pattern is a pure literal under the active flavour, so a
-    /// substring test reproduces git's match. `-F` makes any pattern literal; otherwise a
-    /// regex metacharacter (basic, or the wider extended set) disqualifies it.
-    fn is_faithful(&self) -> bool {
-        if self.fixed {
-            return true;
-        }
-        let specials: &[u8] = if self.extended {
-            b".*[]^$\\+?(){}|"
-        } else {
-            b".*[]^$\\"
-        };
-        self.patterns
-            .iter()
-            .all(|p| !p.bytes().any(|b| specials.contains(&b)))
-    }
-
-    /// Whether a commit with this message is kept. Only called once [`is_faithful`] has
-    /// confirmed the substring test is exact.
-    fn keeps(&self, message: &[u8]) -> bool {
-        let hay: Vec<u8> = if self.ignore_case {
-            message.to_ascii_lowercase()
-        } else {
-            message.to_vec()
-        };
-        let test = |pat: &str| {
-            let needle = if self.ignore_case {
-                pat.to_ascii_lowercase()
-            } else {
-                pat.to_string()
-            };
-            contains_subslice(&hay, needle.as_bytes())
-        };
-        let matched = if self.all_match {
-            self.patterns.iter().all(|p| test(p))
-        } else {
-            self.patterns.iter().any(|p| test(p))
-        };
-        matched != self.invert
-    }
-}
-
-/// Whether `haystack` contains `needle` as a contiguous run (`needle` empty ⇒ true).
-fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
-    if needle.is_empty() {
-        return true;
-    }
-    haystack.windows(needle.len()).any(|w| w == needle)
 }
 
 /// The result of reproducing `setup_revisions` over the argument list.
@@ -704,10 +533,6 @@ struct LogConfig {
     abbrev_commit: bool,
     /// `log.showRoot` (default true): show the root commit's empty-tree diff.
     show_root: bool,
-    /// `log.date` is set to a valid mode other than `default`. `whatchanged` only renders
-    /// git's `DATE_NORMAL`, so any other mode is deferred to the unported bail (like a
-    /// command-line `--date`). An *invalid* `log.date` is fatal at read time instead.
-    date_unsupported: bool,
 }
 
 /// Read the `log.*` display config, reproducing `git_log_config`'s validation of
@@ -718,21 +543,14 @@ fn read_log_config(repo: &gix::Repository) -> Result<LogConfig, Fatal> {
     let abbrev_commit = snap.boolean("log.abbrevCommit").unwrap_or(false);
     // git's `log.showRoot` defaults to true; only an explicit false suppresses the root.
     let show_root = snap.boolean("log.showRoot").unwrap_or(true);
-    let date_unsupported = match snap.string("log.date") {
-        None => false,
-        Some(v) => {
-            let v = v.to_str_lossy();
-            // Same validation git applies via `parse_date_format`; invalid ⇒ fatal 128.
-            validate_date_format(&v)?;
-            // `default` renders exactly `DATE_NORMAL`, which is all `whatchanged` produces,
-            // so it is a no-op; every other (valid) mode changes the `Date:` line.
-            v.as_ref() != "default"
-        }
-    };
+    // `git_log_config` validates `log.date` here, before the deprecation gate and before
+    // argument parsing; the rendering itself is log's, which reads the mode again.
+    if let Some(v) = snap.string("log.date") {
+        validate_date_format(&v.to_str_lossy())?;
+    }
     Ok(LogConfig {
         abbrev_commit,
         show_root,
-        date_unsupported,
     })
 }
 
@@ -743,6 +561,8 @@ pub fn whatchanged(args: &[String]) -> Result<ExitCode> {
         Some("whatchanged") => &args[1..],
         _ => args,
     };
+
+    let original_args = args;
 
     // git runs the deprecation check inside `cmd_whatchanged`, i.e. after repository
     // setup, so a missing repository is still reported first.
@@ -774,22 +594,11 @@ pub fn whatchanged(args: &[String]) -> Result<ExitCode> {
     };
     let (opted_in, args) = (phase1.opted_in, phase1.rest);
 
-    let mut parsed = match parse_args(&repo, &args, phase1.quiet, &cfg) {
-        Ok(p) => p,
-        Err(f) => {
-            eprint!("{}", f.text);
-            return Ok(ExitCode::from(f.code));
-        }
-    };
-    if parsed.unimplemented.is_none() {
-        parsed.unimplemented = phase1.unimplemented;
-    }
-    // A valid but non-default `log.date` selects a date format `whatchanged` does not
-    // render (it only produces `DATE_NORMAL`), exactly like a command-line `--date`: defer
-    // it to the render-time unported bail rather than silently emitting a wrong `Date:`
-    // line. A filter that empties the walk still exits 0, matching git.
-    if parsed.unimplemented.is_none() && cfg.date_unsupported {
-        parsed.unimplemented = Some("log.date".to_string());
+    // `setup_revisions` classifies the whole array before the deprecation check, so
+    // its exit-128/129 paths come first and are reproduced here.
+    if let Err(f) = parse_args(&repo, &args, phase1.quiet, &cfg) {
+        eprint!("{}", f.text);
+        return Ok(ExitCode::from(f.code));
     }
 
     if !opted_in {
@@ -797,7 +606,28 @@ pub fn whatchanged(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::from(128));
     }
 
-    run(&repo, parsed)
+    // `cmd_whatchanged` *is* `cmd_log` with the raw format as the default and
+    // `always_show_header` left off, so the walk and the rendering are log's. Only
+    // `--i-still-use-this` is dropped, exactly as `cmd_log_init`'s `parse_options`
+    // pass removes it before `setup_revisions` sees the array.
+    let forwarded: Vec<String> = args_without_opt_in(original_args);
+    super::log::whatchanged(&forwarded)
+}
+
+/// The argument array `cmd_log_init` leaves for `setup_revisions`, minus the opt-in
+/// flag it consumed. Anything after `--` is a pathspec and is left alone.
+fn args_without_opt_in(args: &[String]) -> Vec<String> {
+    let mut out = Vec::with_capacity(args.len());
+    let mut after_dashdash = false;
+    for a in args {
+        if after_dashdash || a != "--i-still-use-this" {
+            out.push(a.clone());
+        }
+        if a == "--" {
+            after_dashdash = true;
+        }
+    }
+    out
 }
 
 /// What `cmd_log_init`'s `parse_options` pass takes out of the argument list.
@@ -1661,568 +1491,3 @@ fn validate_word_diff(v: &str) -> Result<(), Fatal> {
     Err(Fatal::usage(format!("bad --word-diff argument: {v}")))
 }
 
-/// Walk and render, once `--i-still-use-this` has cleared the deprecation gate.
-fn run(repo: &gix::Repository, mut parsed: Parsed) -> Result<ExitCode> {
-    // A tip-set-broadening selector this module does not resolve: bail up front, because
-    // silently ignoring it could make an invocation with real history look empty.
-    if let Some(flag) = &parsed.set_broadening {
-        bail!("{flag} selects history that is not ported");
-    }
-
-    // A `--grep` whose patterns are not all literal under the active flavour cannot be
-    // matched faithfully (git defaults to POSIX basic regex); treat it like any other
-    // unported option — deferred to render time — rather than matching with wrong rules.
-    if parsed.grep.active() && !parsed.grep.is_faithful() && parsed.unimplemented.is_none() {
-        parsed.unimplemented = Some("--grep".to_string());
-    }
-    let apply_grep = parsed.grep.active() && parsed.grep.is_faithful();
-
-    // The unported-option bail is deferred: git applies these options only to commits it
-    // actually shows, so an invocation whose filters leave nothing to show exits 0 with no
-    // output regardless of them. The bail therefore fires per-commit, below, the moment a
-    // commit survives filtering and would be rendered — not here.
-    let has_selector =
-        parsed.select_all || parsed.select_tags || parsed.select_branches || parsed.select_remotes;
-    if !has_selector && parsed.revs.len() > 1 {
-        bail!("multiple revisions are not ported");
-    }
-
-    // Path-limited traversal: everything after `--` (and any pre-`--` argument that
-    // resolved as a filename) is a pathspec. A commit is shown iff, after filtering its
-    // raw change list down to the paths matching the pathspec, at least one change
-    // remains — exactly git's default history simplification over this `--no-merges`
-    // walk. gix's `Pathspec` reproduces git's matcher (literal prefixes, shell globs,
-    // `:(glob)`/`:!exclude` magic and exclude-only sets); attribute pathspecs
-    // (`:(attr:…)`) are the one form it would need the worktree for, and those bail.
-    let mut matcher = if parsed.pathspecs.is_empty() {
-        None
-    } else {
-        Some(gix::Pathspec::new(
-            repo,
-            false,
-            parsed.pathspecs.iter().map(String::as_str),
-            false,
-            || {
-                Err::<gix::worktree::Stack, Box<dyn std::error::Error + Send + Sync>>(
-                    "attribute pathspecs are not ported".into(),
-                )
-            },
-        )?)
-    };
-
-    // Resolve the walk tips. Ref-set selectors (`--all`/`--tags`/`--branches`/`--remotes`)
-    // replace the default `HEAD` with the union of the matching commit refs; an empty
-    // selector set (e.g. `--tags` in a tagless repo) is not an error — git walks nothing
-    // and exits 0. Otherwise a single `<rev>` is used, defaulting to `HEAD`, which may be
-    // unborn (git reports that as a fatal error rather than as empty output).
-    let tips: Vec<ObjectId> = if has_selector {
-        selector_tips(repo, &parsed)?
-    } else {
-        match parsed.revs.first() {
-            // `parse_args` already resolved this spec, so the error arm is unreachable; it
-            // is spelled out rather than `?`-ed to keep the gix error out of `anyhow`.
-            Some(spec) => match repo.rev_parse(spec.as_str()) {
-                Ok(rev) => match rev.single() {
-                    Some(id) => vec![id.detach()],
-                    None => bail!("revision ranges are not ported"),
-                },
-                Err(e) => bail!("{spec}: {e}"),
-            },
-            None => match repo.head()?.try_peel_to_id()? {
-                Some(id) => vec![id.detach()],
-                None => bail!("your current branch does not have any commits yet"),
-            },
-        }
-    };
-
-    let renames = !parsed.no_renames && renames_enabled(repo);
-    let abbrev = base_abbrev(repo)?;
-
-    // Newest-first by commit date, the default `git log` ordering.
-    let walk = repo
-        .rev_walk(tips.iter().copied())
-        .sorting(Sorting::ByCommitTime(CommitTimeOrder::NewestFirst))
-        .all()?;
-
-    let limit = parsed.max_count.unwrap_or(usize::MAX);
-    let mut out: Vec<u8> = Vec::new();
-    let mut shown = 0usize;
-
-    for info in walk {
-        if shown >= limit {
-            break;
-        }
-        let commit = info?.object()?;
-
-        // `--no-merges`: a merge is dropped from the output, but the walk still
-        // traverses through it, and it never consumes a `--max-count` slot.
-        let parents: Vec<ObjectId> = commit.parent_ids().map(|p| p.detach()).collect();
-        if parents.len() > 1 {
-            continue;
-        }
-
-        // `log.showRoot=false` suppresses the root commit's empty-tree diff. With nothing
-        // to diff it is TREESAME-empty, so — like the empty-diff case below — the commit is
-        // dropped entirely and consumes no `--max-count` slot. `--root` turns it back on.
-        if !parsed.show_root && parents.is_empty() {
-            continue;
-        }
-
-        // `--grep`: git filters on the commit message during traversal, before the diff,
-        // and an excluded commit is dropped whether or not it changed anything.
-        if apply_grep {
-            let message = commit.message_raw()?;
-            let bytes: &[u8] = message;
-            if !parsed.grep.keeps(bytes) {
-                continue;
-            }
-        }
-
-        let new_tree = commit.tree_id()?.detach();
-        let old_tree = match parents.first() {
-            Some(p) => Some(repo.find_object(*p)?.peel_to_tree()?.id),
-            None => None, // root commit: diff against the empty tree
-        };
-
-        let mut changes: Vec<Change> = Vec::new();
-        walk_trees(repo, old_tree, Some(new_tree), BStr::new(""), &mut changes)?;
-
-        // Path limiting: keep only the changes whose path matches the pathspec. A
-        // commit with no surviving change is `TREESAME` and is dropped without
-        // consuming a `--max-count` slot, just like an empty diff below.
-        if let Some(m) = matcher.as_mut() {
-            changes.retain(|c| m.is_included(c.path.as_bstr(), Some(false)));
-        }
-
-        // `cmd_whatchanged` leaves `always_show_header` off, so a commit that produced
-        // no diff prints nothing at all and git restores the `--max-count` it spent.
-        if changes.is_empty() {
-            continue;
-        }
-
-        // Deferred unported-option bail: this commit survives every filter and would be
-        // rendered, but an option this module cannot honour (a patch/stat display mode, a
-        // non-literal `--grep`, …) is active, so its raw rendering would not match git.
-        // Reaching here means git *does* have output, so an honest bail is the right
-        // answer; an invocation whose filters emptied the walk never gets here and exits 0.
-        if let Some(flag) = &parsed.unimplemented {
-            bail!(
-                "{flag} is recognised but not ported (ported: --i-still-use-this, --raw, \
-                 --no-merges, --no-renames, --grep, --all/--branches/--tags/--remotes, \
-                 -n/--max-count/-nN/-N, --abbrev-commit/--no-abbrev-commit, --root, \
-                 and log.abbrevCommit/log.showRoot/log.date config)"
-            );
-        }
-
-        // git would run `diffcore_rename` over this pair set; see the module docs for
-        // why that cannot be reproduced byte-identically from the vendored crates.
-        if renames
-            && changes.iter().any(|c| c.old.is_none())
-            && changes.iter().any(|c| c.new.is_none())
-        {
-            bail!(
-                "commit {} both adds and deletes paths, so git's rename detection would \
-                 emit R<score> lines; the vendored gix-diff exposes no diffcore-rename \
-                 score or queue order (re-run with --no-renames, or set diff.renames=false)",
-                commit.id()
-            );
-        }
-
-        if shown > 0 {
-            out.push(b'\n');
-        }
-        render_commit(repo, &commit, &changes, parsed.abbrev_commit, abbrev, &mut out)?;
-        shown += 1;
-    }
-
-    let mut stdout = std::io::stdout().lock();
-    stdout.write_all(&out)?;
-    stdout.flush()?;
-    Ok(ExitCode::SUCCESS)
-}
-
-/// Collect the walk tips for the ref-set selectors (`--all`/`--tags`/`--branches`/
-/// `--remotes`), matching git's rev-list: each selected ref is peeled to its object and
-/// only commit tips are kept (a tag pointing at a tree/blob contributes no history). Any
-/// explicit `<rev>` on the command line is unioned in, as git does. `--all` is the union
-/// of local branches, tags and remote-tracking branches; exotic ref namespaces
-/// (`refs/stash`, notes, …) are not included, matching the common `for-each-ref` set.
-fn selector_tips(repo: &gix::Repository, parsed: &Parsed) -> Result<Vec<ObjectId>> {
-    let mut ids: Vec<ObjectId> = Vec::new();
-    let refs = repo.references()?;
-    if parsed.select_branches || parsed.select_all {
-        add_ref_tips(repo, refs.local_branches()?, &mut ids)?;
-    }
-    if parsed.select_tags || parsed.select_all {
-        add_ref_tips(repo, refs.tags()?, &mut ids)?;
-    }
-    if parsed.select_remotes || parsed.select_all {
-        add_ref_tips(repo, refs.remote_branches()?, &mut ids)?;
-    }
-    // git's `--all` is "all refs in refs/, along with HEAD" — so a detached HEAD (or any
-    // commit reachable only from HEAD) is included even though no ref names it.
-    if parsed.select_all {
-        if let Ok(mut head) = repo.head() {
-            if let Ok(Some(id)) = head.try_peel_to_id() {
-                ids.push(id.detach());
-            }
-        }
-    }
-    for spec in &parsed.revs {
-        if let Ok(rev) = repo.rev_parse(spec.as_str()) {
-            if let Some(id) = rev.single() {
-                ids.push(id.detach());
-            }
-        }
-    }
-    ids.sort();
-    ids.dedup();
-    Ok(ids)
-}
-
-/// Peel each reference in `iter` to its target object and push the commit ids onto `ids`.
-fn add_ref_tips<'a>(
-    repo: &gix::Repository,
-    iter: impl Iterator<
-        Item = std::result::Result<gix::Reference<'a>, Box<dyn std::error::Error + Send + Sync + 'static>>,
-    >,
-    ids: &mut Vec<ObjectId>,
-) -> Result<()> {
-    for r in iter {
-        let mut r = r.map_err(|e| anyhow!("reference iteration failed: {e}"))?;
-        let id = r
-            .peel_to_id()
-            .map_err(|e| anyhow!("cannot resolve reference: {e}"))?
-            .detach();
-        if matches!(repo.find_object(id).map(|o| o.kind), Ok(gix::objs::Kind::Commit)) {
-            ids.push(id);
-        }
-    }
-    Ok(())
-}
-
-/// Whether git would run rename detection: `diff.renames` defaults to on, and only an
-/// explicit false value turns it off (`copies`/`copy` turn it *up*, not off).
-fn renames_enabled(repo: &gix::Repository) -> bool {
-    match repo.config_snapshot().string("diff.renames") {
-        None => true,
-        Some(v) => !matches!(
-            v.to_str_lossy().to_ascii_lowercase().as_str(),
-            "false" | "no" | "off" | "0"
-        ),
-    }
-}
-
-/// The base abbreviation width for `--raw` object ids.
-///
-/// `core.abbrev` when set (clamped to `MINIMUM_ABBREV..=hexsz`, with `no`/`off`/`false`
-/// meaning the full id), otherwise git's auto width: half the bit-length of the object
-/// count, rounded up, floored at `FALLBACK_ABBREV`. Individual ids may be rendered
-/// longer than this when they need it to stay unambiguous; the all-zero id of an absent
-/// side is always rendered at exactly this width, as `diff_aligned_abbrev` does.
-fn base_abbrev(repo: &gix::Repository) -> Result<usize> {
-    let hexsz = repo.object_hash().len_in_hex();
-    if let Some(v) = repo.config_snapshot().string("core.abbrev") {
-        match v.to_str_lossy().as_ref() {
-            "auto" => {}
-            "no" | "off" | "false" => return Ok(hexsz),
-            other => {
-                let n: usize = other
-                    .parse()
-                    .map_err(|_| anyhow!("Invalid value for 'core.abbrev' = '{other}'"))?;
-                return Ok(n.clamp(MINIMUM_ABBREV, hexsz));
-            }
-        }
-    }
-    let count = repo.objects.packed_object_count()?;
-    let bits = u64::BITS - count.leading_zeros();
-    Ok((bits.div_ceil(2) as usize).max(FALLBACK_ABBREV))
-}
-
-/// Render one commit: the `medium` header, its message, a blank line, then the raw
-/// change lines. No `Merge:` line is ever needed because merges are filtered out.
-fn render_commit(
-    repo: &gix::Repository,
-    commit: &gix::Commit<'_>,
-    changes: &[Change],
-    abbrev_commit: bool,
-    abbrev: usize,
-    out: &mut Vec<u8>,
-) -> Result<()> {
-    let author = commit.author()?;
-    let time = author.time()?;
-
-    // `log.abbrevCommit`/`--abbrev-commit`: git shortens the header id with
-    // `find_unique_abbrev` at the same default width the raw diff uses.
-    if abbrev_commit {
-        out.extend_from_slice(
-            format!("commit {}\n", short(repo, commit.id().detach(), abbrev)?).as_bytes(),
-        );
-    } else {
-        out.extend_from_slice(format!("commit {}\n", commit.id()).as_bytes());
-    }
-    out.extend_from_slice(b"Author: ");
-    out.extend_from_slice(author.name);
-    out.extend_from_slice(b" <");
-    out.extend_from_slice(author.email);
-    out.extend_from_slice(b">\n");
-    out.extend_from_slice(
-        format!("Date:   {}\n\n", format_git_date(time.seconds, time.offset)).as_bytes(),
-    );
-
-    // git's `pp_remainder`: leading blank lines are dropped, every remaining line gets a
-    // four-space indent, and an all-whitespace line keeps only that indent.
-    let raw = commit.message_raw()?;
-    let bytes: &[u8] = raw;
-    let mut lines: Vec<&[u8]> = bytes.split(|b| *b == b'\n').collect();
-    if lines.last().is_some_and(|l| l.is_empty()) {
-        lines.pop(); // the newline terminating the last line, not an extra blank one
-    }
-    let mut started = false;
-    for line in lines {
-        let blank = line.iter().all(u8::is_ascii_whitespace);
-        if blank && !started {
-            continue;
-        }
-        started = true;
-        out.extend_from_slice(b"    ");
-        if !blank {
-            out.extend_from_slice(line);
-        }
-        out.push(b'\n');
-    }
-    out.push(b'\n');
-
-    for c in changes {
-        render_raw(repo, c, abbrev, out)?;
-    }
-    Ok(())
-}
-
-/// `:<omode> <nmode> <ooid> <noid> <status>\t<path>` — git's raw diff line.
-fn render_raw(repo: &gix::Repository, c: &Change, abbrev: usize, out: &mut Vec<u8>) -> Result<()> {
-    let zeros = "0".repeat(abbrev);
-    let (omode, ooid) = match c.old {
-        Some(s) => (s.mode.value(), short(repo, s.id, abbrev)?),
-        None => (0, zeros.clone()),
-    };
-    let (nmode, noid) = match c.new {
-        Some(s) => (s.mode.value(), short(repo, s.id, abbrev)?),
-        None => (0, zeros),
-    };
-    out.extend_from_slice(format!(":{omode:06o} {nmode:06o} {ooid} {noid} ").as_bytes());
-    out.push(status(c));
-    out.push(b'\t');
-    // `write_name_quoted()`: the shared `quote_c_style()` port, gated on `core.quotePath`.
-    out.extend_from_slice(&super::diff_files::quoted_name(&c.path));
-    out.push(b'\n');
-    Ok(())
-}
-
-/// git's `diff_abbrev_oid`: the id shortened to the configured width, extended until it
-/// is unambiguous. `gix::Id::shorten` derives the same width from `core.abbrev` (or the
-/// same auto formula) and performs the same disambiguation.
-fn short(repo: &gix::Repository, id: ObjectId, abbrev: usize) -> Result<String> {
-    if abbrev >= repo.object_hash().len_in_hex() {
-        return Ok(id.to_hex().to_string());
-    }
-    Ok(id.attach(repo).shorten()?.to_string())
-}
-
-/// The status letter git prints for a change.
-fn status(c: &Change) -> u8 {
-    match (c.old, c.new) {
-        (None, _) => b'A',
-        (_, None) => b'D',
-        (Some(o), Some(n)) => {
-            if o.mode.value() & IFMT != n.mode.value() & IFMT {
-                b'T'
-            } else {
-                b'M'
-            }
-        }
-    }
-}
-
-/// Read the entries of `id` in stored (git-sorted) order; `None` is the empty tree.
-fn read_entries(repo: &gix::Repository, id: Option<ObjectId>) -> Result<Vec<Entry>> {
-    let Some(id) = id else { return Ok(Vec::new()) };
-    let tree = repo.find_tree(id)?;
-    Ok(tree
-        .decode()?
-        .entries
-        .iter()
-        .map(|e| Entry {
-            mode: e.mode,
-            name: BString::from(e.filename.to_vec()),
-            id: e.oid.to_owned(),
-        })
-        .collect())
-}
-
-/// git's `tree-entry-comparison`: names compare byte-wise with an implicit `/` appended
-/// to tree entries, so a blob and a tree of the same name never compare `Equal`.
-fn entry_cmp(a: &Entry, b: &Entry) -> Ordering {
-    let common = a.name.len().min(b.name.len());
-    match a.name[..common].cmp(&b.name[..common]) {
-        Ordering::Equal => {
-            let ac = a
-                .name
-                .get(common)
-                .copied()
-                .or(a.mode.is_tree().then_some(b'/'));
-            let bc = b
-                .name
-                .get(common)
-                .copied()
-                .or(b.mode.is_tree().then_some(b'/'));
-            ac.cmp(&bc)
-        }
-        other => other,
-    }
-}
-
-/// Depth-first merge-walk of two trees rooted at `prefix`, collecting blob-level
-/// changes. `--raw` in the log family is always recursive and never reports the tree
-/// entries themselves, so this always descends and only ever pushes non-tree entries.
-fn walk_trees(
-    repo: &gix::Repository,
-    old: Option<ObjectId>,
-    new: Option<ObjectId>,
-    prefix: &BStr,
-    out: &mut Vec<Change>,
-) -> Result<()> {
-    let lhs = read_entries(repo, old)?;
-    let rhs = read_entries(repo, new)?;
-    let (mut i, mut j) = (0usize, 0usize);
-
-    while i < lhs.len() || j < rhs.len() {
-        let order = match (lhs.get(i), rhs.get(j)) {
-            (Some(a), Some(b)) => entry_cmp(a, b),
-            (Some(_), None) => Ordering::Less,
-            (None, Some(_)) => Ordering::Greater,
-            (None, None) => unreachable!("loop condition guarantees one side has an entry"),
-        };
-        match order {
-            Ordering::Equal => {
-                let (a, b) = (&lhs[i], &rhs[j]);
-                i += 1;
-                j += 1;
-                if a.mode == b.mode && a.id == b.id {
-                    continue;
-                }
-                let path = join(prefix, a.name.as_bstr());
-                // `Equal` implies both sides are trees or neither is.
-                if a.mode.is_tree() {
-                    walk_trees(repo, Some(a.id), Some(b.id), path.as_bstr(), out)?;
-                } else {
-                    out.push(Change {
-                        old: Some(side(a)),
-                        new: Some(side(b)),
-                        path,
-                    });
-                }
-            }
-            Ordering::Less => {
-                let a = &lhs[i];
-                i += 1;
-                let path = join(prefix, a.name.as_bstr());
-                if a.mode.is_tree() {
-                    walk_trees(repo, Some(a.id), None, path.as_bstr(), out)?;
-                } else {
-                    out.push(Change {
-                        old: Some(side(a)),
-                        new: None,
-                        path,
-                    });
-                }
-            }
-            Ordering::Greater => {
-                let b = &rhs[j];
-                j += 1;
-                let path = join(prefix, b.name.as_bstr());
-                if b.mode.is_tree() {
-                    walk_trees(repo, None, Some(b.id), path.as_bstr(), out)?;
-                } else {
-                    out.push(Change {
-                        old: None,
-                        new: Some(side(b)),
-                        path,
-                    });
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-fn side(e: &Entry) -> Side {
-    Side {
-        mode: e.mode,
-        id: e.id,
-    }
-}
-
-fn join(prefix: &BStr, name: &BStr) -> BString {
-    let mut p = BString::from(prefix.to_vec());
-    if !p.is_empty() {
-        p.push(b'/');
-    }
-    p.extend_from_slice(name);
-    p
-}
-
-/// Format a commit time exactly like git's default `DATE_NORMAL`:
-/// `Www Mmm <day> HH:MM:SS YYYY +ZZZZ`, in the commit's own offset. Done by hand because
-/// gix exposes no custom format string. git's `date.c` renders the day with `%d`, which
-/// is *unpadded* — a single-digit day is one character (`Jan 2`), never space-padded.
-fn format_git_date(seconds: i64, offset: i32) -> String {
-    const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-    const MONTHS: [&str; 12] = [
-        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-    ];
-
-    // Shift into the commit's local wall-clock time, then split into whole days since
-    // the Unix epoch and seconds within the day. `div_euclid`/`rem_euclid` keep the
-    // split correct for pre-1970 (negative) timestamps.
-    let local = seconds + offset as i64;
-    let days = local.div_euclid(86_400);
-    let secs = local.rem_euclid(86_400);
-    let (hour, min, sec) = (secs / 3600, (secs % 3600) / 60, secs % 60);
-
-    // 1970-01-01 (day 0) was a Thursday, index 4 with Sunday = 0.
-    let weekday = ((days.rem_euclid(7)) + 4).rem_euclid(7) as usize;
-    let (year, month, day) = civil_from_days(days);
-
-    let (sign, off) = if offset < 0 { ('-', -offset) } else { ('+', offset) };
-    let (off_h, off_m) = (off / 3600, (off % 3600) / 60);
-
-    format!(
-        "{} {} {} {:02}:{:02}:{:02} {} {}{:02}{:02}",
-        WEEKDAYS[weekday],
-        MONTHS[(month - 1) as usize],
-        day,
-        hour,
-        min,
-        sec,
-        year,
-        sign,
-        off_h,
-        off_m,
-    )
-}
-
-/// Convert a day count since the Unix epoch into a civil `(year, month, day)`, month and
-/// day 1-based. Howard Hinnant's `civil_from_days`, exact over the representable range.
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
-    let z = z + 719_468;
-    let era = (if z >= 0 { z } else { z - 146_096 }) / 146_097;
-    let doe = z - era * 146_097; // [0, 146096]
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
-    let year = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
-    let mp = (5 * doy + 2) / 153; // [0, 11]
-    let day = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
-    let month = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
-    (if month <= 2 { year + 1 } else { year }, month as u32, day)
-}

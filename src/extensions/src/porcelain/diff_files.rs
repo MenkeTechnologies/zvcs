@@ -4666,7 +4666,9 @@ fn cq_escape(b: u8) -> Option<u8> {
     }
 }
 
-fn needs_quote(s: &[u8]) -> bool {
+/// `quote_c_style(s, NULL, NULL, 0)` used as a predicate: whether quoting would
+/// change the string at all.
+pub(crate) fn needs_c_quote(s: &[u8]) -> bool {
     s.iter().any(|b| cq_escape(*b).is_some())
 }
 
@@ -4696,7 +4698,7 @@ pub(crate) fn quoted_name(path: &BString) -> Vec<u8> {
 
 /// [`quoted_name`] over a plain byte slice, for the callers that never hold a `BString`.
 pub(crate) fn quoted_name_bytes(s: &[u8]) -> Vec<u8> {
-    if !needs_quote(s) {
+    if !needs_c_quote(s) {
         return s.to_vec();
     }
     let mut out = vec![b'"'];
@@ -4708,7 +4710,7 @@ pub(crate) fn quoted_name_bytes(s: &[u8]) -> Vec<u8> {
 /// `quote_two_c_style()` for a single prefixed name (the `---`/`+++` lines).
 pub(crate) fn quote_one(prefix: &str, path: &BString) -> Vec<u8> {
     let s = path.as_slice();
-    if !needs_quote(prefix.as_bytes()) && !needs_quote(s) {
+    if !needs_c_quote(prefix.as_bytes()) && !needs_c_quote(s) {
         let mut out = prefix.as_bytes().to_vec();
         out.extend_from_slice(s);
         return out;

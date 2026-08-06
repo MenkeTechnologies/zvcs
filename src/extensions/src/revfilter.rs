@@ -120,9 +120,17 @@ pub fn ident_line(sig: gix::actor::SignatureRef<'_>) -> BString {
     out
 }
 
+/// Rewrites an identity the way a mailmap would, given its recorded name and
+/// address. `commit_match()` applies this to the `author`/`committer` headers before
+/// grepping them, so `--author=<canonical>` finds a commit recorded under an alias.
+pub type IdentMapper = std::sync::Arc<dyn Fn(&[u8], &[u8]) -> (Vec<u8>, Vec<u8>) + Send + Sync>;
+
 /// Compiled `log`/`shortlog` header/message predicates.
 #[derive(Default)]
 pub struct CommitFilter {
+    /// The mailmap rewrite applied to the two identity headers before matching;
+    /// `None` leaves them as the commit recorded them.
+    pub ident_map: Option<IdentMapper>,
     pub author_res: Vec<regex::bytes::Regex>,
     pub committer_res: Vec<regex::bytes::Regex>,
     pub grep_res: Vec<regex::bytes::Regex>,
@@ -137,18 +145,32 @@ impl CommitFilter {
         self.author_res.is_empty() && self.committer_res.is_empty() && self.grep_res.is_empty()
     }
 
+    /// One identity header as it is matched against: rewritten through the mailmap
+    /// when there is one, otherwise exactly as recorded.
+    fn mapped_ident_line(&self, sig: gix::actor::SignatureRef<'_>) -> BString {
+        let Some(map) = &self.ident_map else {
+            return ident_line(sig);
+        };
+        let (name, email) = map(sig.name, sig.email);
+        ident_line(gix::actor::SignatureRef {
+            name: name.as_slice().into(),
+            email: email.as_slice().into(),
+            time: sig.time,
+        })
+    }
+
     /// git's header-and-message match: `--author` AND `--committer` AND the
     /// `--grep` result (OR of patterns, or AND under `--all-match`, then flipped
     /// by `--invert-grep`). An empty predicate set matches everything.
     pub fn matches(&self, commit: &gix::Commit<'_>) -> Result<bool> {
         if !self.author_res.is_empty() {
-            let line = ident_line(commit.author()?);
+            let line = self.mapped_ident_line(commit.author()?);
             if !self.author_res.iter().any(|re| re.is_match(line.as_bytes())) {
                 return Ok(false);
             }
         }
         if !self.committer_res.is_empty() {
-            let line = ident_line(commit.committer()?);
+            let line = self.mapped_ident_line(commit.committer()?);
             if !self
                 .committer_res
                 .iter()

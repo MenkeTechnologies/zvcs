@@ -34,7 +34,16 @@
 //! through the `xdl_emit_diff` port in [`super::diff_pairs`]),
 //! `--dirstat[=<params>]`/`--dirstat-by-file[=<params>]`/`--cumulative` (whose
 //! damage is `diffcore_count_changes()`'s, and whose walk is shared with
-//! `diff-files`), and
+//! `diff-files`),
+//! `-w`/`--ignore-all-space`, `-b`/`--ignore-space-change` and
+//! `--ignore-space-at-eol` (a pair they leave with no changed line disappears
+//! completely: `builtin_diff()` never flushes its deferred header, so there is no
+//! `diff --git` block, `builtin_diffstat()` drops the entry so `--stat`,
+//! `--numstat` and `--shortstat` stay silent, `diff_flush()` renders each pair
+//! quietly before the raw/name formats print it so `--raw`, `--name-only` and
+//! `--name-status` skip it too, and `--exit-code`/`--quiet` report no change
+//! because `diff_from_contents` makes the status follow what was actually
+//! emitted), and
 //! merge-base ranges `<a>...<b>` (diffed as `merge-base(a,b)` against `b`).
 //!
 //! ### Submodules
@@ -147,8 +156,10 @@ fn usage_error() -> ExitCode {
 /// format (raw / name / patch). Mirrors the fields of `struct diff_options` that
 /// affect byte-level formatting.
 struct Render {
-    /// Object-name abbreviation length for `--raw` and the patch `index` line.
+    /// Object-name abbreviation length for the patch `index` line.
     abbrev: usize,
+    /// The same for `--raw`, which `--no-abbrev` widens on its own.
+    raw_abbrev: usize,
     /// `--full-index`: emit the full object name on the patch `index` line.
     full_index: bool,
     /// `-z`: terminate `--raw`/`--name-only`/`--name-status` records with NUL and
@@ -198,6 +209,8 @@ pub(crate) enum Whitespace {
     IgnoreChange,
     /// `--ignore-space-at-eol`: only trailing whitespace is ignored.
     IgnoreAtEol,
+    /// `--ignore-cr-at-eol`: a single CR before the line terminator is ignored.
+    IgnoreCrAtEol,
 }
 
 /// The "new" side of a change.
@@ -379,6 +392,8 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     // `7` is only a placeholder until then. `--abbrev[=<n>]` overrides explicitly.
     let mut abbrev: usize = 7;
     let mut abbrev_explicit = false;
+    // `--no-abbrev`: the width `--raw` prints, when it differs from the `index` line.
+    let mut raw_abbrev: Option<usize> = None;
     // `diff.algorithm` default, applied after argument parsing so a `--minimal` /
     // `--histogram` / `--diff-algorithm=` flag always wins (git precedence).
     let mut config_algorithm: Option<ConfigAlgorithm> = None;
@@ -626,7 +641,17 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                 want_exit_code = true;
             }
             "--full-index" => full_index = true,
-            "--abbrev" => abbrev = 7,
+            "--abbrev" => {
+                abbrev = 7;
+                abbrev_explicit = true;
+                raw_abbrev = None;
+            }
+            // `--no-abbrev` is `revs->abbrev = 0`: the raw format prints whole ids,
+            // while the `index` line falls back to the configured default.
+            "--no-abbrev" => {
+                raw_abbrev = Some(repo.object_hash().len_in_hex());
+                abbrev_explicit = false;
+            }
             "--no-prefix" => {
                 src_prefix.clear();
                 dst_prefix.clear();
@@ -657,7 +682,8 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
             // `xdl_mark_ignorable_lines`); wiring this command through it is the fix.
             // The remaining entries are believed to match zvcs's default behavior, but
             // that has not been measured flag by flag — treat them as unverified.
-            "--ignore-blank-lines" | "--ignore-cr-at-eol" | "--text" | "-a"
+            "--ignore-cr-at-eol" => ws = Whitespace::IgnoreCrAtEol,
+            "--ignore-blank-lines" | "--text" | "-a"
             | "--no-ext-diff" | "--ext-diff" | "--textconv"
             | "--no-textconv" | "--ita-invisible-in-index" | "--ita-visible-in-index" => {}
             // `XDF_INDENT_HEURISTIC` (`OPT_BIT` on `xdl_opts`): where a hunk that can
@@ -721,18 +747,15 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                 diff_filter = Some(s.as_bytes()["--diff-filter=".len()..].to_vec());
             }
             s if s.starts_with("--abbrev=") => {
-                let raw = &s["--abbrev=".len()..];
-                match raw.parse::<usize>() {
-                    // git clamps `--abbrev` to the range [4, hexsz].
-                    Ok(n) => {
-                        abbrev = n.clamp(4, repo.object_hash().len_in_hex());
-                        abbrev_explicit = true;
-                    }
-                    Err(_) => {
-                        eprintln!("error: option `abbrev' expects a numerical value");
-                        return Ok(ExitCode::from(129));
-                    }
-                }
+                // `diff_opt_parse()` reads the value with `strtoul()` and clamps it
+                // to [MINIMUM_ABBREV, hexsz]; a non-numeric value is zero, never an
+                // error.
+                abbrev = crate::abbrev::parse_abbrev_arg(
+                    &s["--abbrev=".len()..],
+                    repo.object_hash().len_in_hex(),
+                );
+                abbrev_explicit = true;
+                raw_abbrev = None;
             }
             // `--relative[=<path>]`/`--no-relative`: `diff_opt_relative()`. With no
             // value the prefix is the current directory inside the repository;
@@ -1106,7 +1129,19 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     // ---- analyze every delta once -----------------------------------------
     // `--quiet`/`-s` produce no output, so the patch bodies are never needed.
     let workdir = repo.workdir().map(|p| p.to_owned());
-    let want_patch = (fmt & F_PATCH != 0 || check) && !quiet;
+    // `diff_setup_done()` (diff.c:4899): the whitespace-ignoring options make "is
+    // there a change?" a question only the rendered content can answer.
+    let from_contents = ws != Whitespace::Keep;
+    // `diff_flush()` (diff.c:6828): `--quiet`/`-s` produce no output, but with
+    // `diff_from_contents` and `--exit-code` git still runs the patch machinery with
+    // its output redirected to `/dev/null` purely to learn the exit status.
+    let exit_needs_patch = quiet && want_exit_code && from_contents;
+    // `diff_flush()` (diff.c:7210): under `diff_from_contents` the raw/name formats
+    // run every pair through `diff_flush_patch_quietly()` first and skip the ones
+    // that report no change, so they too need the patch machinery.
+    let names_need_patch = from_contents && !quiet && fmt & (F_RAW | F_NAME | F_NAME_STATUS) != 0;
+    let want_patch =
+        (fmt & F_PATCH != 0 || check || exit_needs_patch || names_need_patch) && (!quiet || exit_needs_patch);
     // Analysis reads both sides of every changed file, so it runs only for the
     // formats that consume it: the counts (`--numstat`/`--stat`/`--shortstat`)
     // and the patch body. `--name-only`, `--name-status`, `--raw` and `--summary`
@@ -1117,10 +1152,13 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     // `--dirstat` needs the analysis too: its `lines` mode reads the same counts
     // the stat formats do, and its default mode needs each pair's content damage.
     let want_dirstat = fmt & F_DIRSTAT != 0;
-    let want_analysis =
-        check || want_dirstat || fmt & (F_NUMSTAT | F_DIFFSTAT | F_SHORTSTAT | F_PATCH) != 0;
+    let want_analysis = check
+        || want_dirstat
+        || exit_needs_patch
+        || names_need_patch
+        || fmt & (F_NUMSTAT | F_DIFFSTAT | F_SHORTSTAT | F_PATCH) != 0;
     let mut analyses: Vec<Analysis> = Vec::new();
-    if !quiet && want_analysis {
+    if (!quiet || exit_needs_patch) && want_analysis {
         analyses = analyze_all(
             &repo,
             &mut cache,
@@ -1146,6 +1184,7 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     }
 
     let r = Render {
+        raw_abbrev: raw_abbrev.unwrap_or(abbrev),
         abbrev,
         full_index,
         z,
@@ -1201,28 +1240,50 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     // queue is empty, so even `--shortstat` stays silent on a clean tree.
     let mut out: Vec<u8> = Vec::new();
     let mut separator = false;
+    // `o->found_changes`: what the whitespace-ignoring options make the exit status
+    // depend on. Only a format that actually emitted something sets it — see the
+    // `diff_from_contents` rewrite of `has_changes` at the end of `diff_flush()`
+    // (diff.c:6861).
+    let mut found_changes = false;
     if !quiet && !deltas.is_empty() {
         if fmt & (F_RAW | F_NAME | F_NAME_STATUS) != 0 {
-            for delta in &deltas {
+            let mut scratch: Vec<u8> = Vec::new();
+            for (i, delta) in deltas.iter().enumerate() {
+                // `diff_flush()` (diff.c:7210): with `diff_from_contents` the pair is
+                // rendered quietly first and dropped when it reports nothing, so a
+                // whitespace-only change is absent from these formats as well.
+                if names_need_patch {
+                    let an = &analyses[i];
+                    if !pair_reports_change(&mut scratch, &repo, delta, an, ctx, &r, submodule_format)? {
+                        continue;
+                    }
+                }
                 if fmt & (F_RAW | F_NAME_STATUS) != 0 {
                     render_raw(&mut out, delta, fmt, &r);
                 } else {
                     out.extend_from_slice(&name_field(&delta.path, r.z));
                     out.push(if r.z { 0 } else { b'\n' });
                 }
+                // `flush_one_pair()` (diff.c:6323) sets `found_changes` for every
+                // pair it prints, whatever the whitespace options did.
+                found_changes = true;
             }
             separator = true;
         }
 
         if fmt & (F_NUMSTAT | F_DIFFSTAT | F_SHORTSTAT) != 0 {
+            let stat_pairs = diffstat_pairs(&deltas, &analyses);
+            // `compute_diffstat()` (diff.c:7168) *assigns* `found_changes` from the
+            // number of surviving entries, so a stat format that dropped every pair
+            // clears a `found_changes` an earlier raw/name format had set.
+            found_changes = !stat_pairs.is_empty();
             if fmt & F_NUMSTAT != 0 {
-                render_numstat(&mut out, &deltas, &analyses, z);
+                render_numstat(&mut out, &stat_pairs, z);
             }
             if fmt & F_DIFFSTAT != 0 {
                 render_stat(
                     &mut out,
-                    &deltas,
-                    &analyses,
+                    &stat_pairs,
                     compact_summary,
                     stat_name_width,
                     stat_graph_width,
@@ -1230,7 +1291,7 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                 );
             }
             if fmt & F_SHORTSTAT != 0 {
-                render_shortstat(&mut out, &deltas, &analyses);
+                render_shortstat(&mut out, &stat_pairs);
             }
             separator = true;
         }
@@ -1328,12 +1389,18 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                         &colors,
                         &r,
                     );
+                    // `builtin_diff()`'s submodule branches set `o->found_changes`
+                    // unconditionally (diff.c:3570, diff.c:3579).
+                    found_changes = true;
                     continue;
                 }
                 let before = plain.len();
                 render_patch(&mut plain, &repo, delta, an, ctx, &r)?;
                 if plain.len() != before {
                     files.push(diff_color::FilePaint { ws_rule, blank_at_eof: an.blank_at_eof });
+                    // Every `builtin_diff()` arm that emits a header or a hunk sets
+                    // `o->found_changes`, so having written anything is the answer.
+                    found_changes = true;
                 }
             }
             out.extend_from_slice(&diff_color::colorize_patch_ex(
@@ -1344,6 +1411,19 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                 diff_color::FilePaint::new(ws_rule),
                 &extra,
             ));
+        }
+    }
+
+    // `diff_flush()` (diff.c:6828): the no-output formats still render every pair
+    // into `/dev/null` under `diff_from_contents`, stopping at the first pair that
+    // reports a change, because that is the only way to know the exit status.
+    if exit_needs_patch {
+        let mut sink: Vec<u8> = Vec::new();
+        for (delta, an) in deltas.iter().zip(&analyses) {
+            if pair_reports_change(&mut sink, &repo, delta, an, ctx, &r, submodule_format)? {
+                found_changes = true;
+                break;
+            }
         }
     }
 
@@ -1362,8 +1442,17 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     // so the `-l` / `diff.renameLimit` warnings land after the diff itself.
     rename_warnings.emit("diff.renameLimit");
     // `--exit-code`/`--quiet`: exit 1 when any difference was reported.
-    if want_exit_code && !deltas.is_empty() {
-        return Ok(ExitCode::from(1));
+    //
+    // `diff_change()` sets `has_changes` as each pair is queued, so normally a
+    // non-empty queue is the whole answer. A whitespace-ignoring option turns on
+    // `diff_from_contents` (diff.c:4899) and that queue-time shortcut is skipped:
+    // `diff_flush()` re-derives `has_changes` from `found_changes` instead
+    // (diff.c:6861), which only the formats that emitted something ever set.
+    if want_exit_code {
+        let changed = if from_contents { found_changes } else { !deltas.is_empty() };
+        if changed {
+            return Ok(ExitCode::from(1));
+        }
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -2266,24 +2355,82 @@ pub(crate) fn commit_patch(
     ctx: u32,
 ) -> Result<Vec<u8>> {
     let mut cache = repo.diff_resource_cache_for_tree_diff()?;
-    let r = patch_render(repo);
-    commit_patch_with(repo, &mut cache, &r, commit.id, parent, ctx, None)
+    let r = patch_render(repo, &PatchOpts { ctx, ..Default::default() });
+    commit_patch_with(repo, &mut cache, &r, commit.id, parent, &PatchOpts { ctx, ..Default::default() }, None)
 }
 
 /// The render settings `log -p`/`show` use for a patch body. Resolved once per
 /// worker rather than per commit: `core.abbrev` cannot change mid-command, and
 /// reading it is a config lookup.
-fn patch_render(repo: &gix::Repository) -> Render {
+fn patch_render(repo: &gix::Repository, opts: &PatchOpts) -> Render {
     let hash_kind = repo.object_hash();
     Render {
         // `git log -p`/`git show` honor core.abbrev on the index line, same as
         // `git diff` — resolved once here rather than hardcoded.
-        abbrev: crate::abbrev::configured_abbrev(repo, hash_kind.len_in_hex()),
-        full_index: false,
+        abbrev: opts
+            .index_abbrev
+            .unwrap_or_else(|| crate::abbrev::configured_abbrev(repo, hash_kind.len_in_hex())),
+        // This renderer only produces patches, so the raw width never applies.
+        raw_abbrev: crate::abbrev::configured_abbrev(repo, hash_kind.len_in_hex()),
+        full_index: opts.full_index,
         z: false,
-        src_prefix: b"a/".to_vec(),
-        dst_prefix: b"b/".to_vec(),
+        src_prefix: opts.src_prefix.clone(),
+        dst_prefix: opts.dst_prefix.clone(),
         hash_kind,
+    }
+}
+
+/// The diff options a history command can hand to the per-commit patch renderer.
+///
+/// These are the `diff_options` fields `setup_revisions()` fills from the same flags
+/// `git diff` takes; everything not listed keeps `diff_setup()`'s default.
+#[derive(Clone)]
+pub(crate) struct PatchOpts {
+    /// `-U<n>`/`--unified=<n>`: context lines.
+    pub ctx: u32,
+    /// `-w`/`-b`/`--ignore-space-at-eol`.
+    pub ws: Whitespace,
+    /// `--full-index`: the whole object name on the `index` line.
+    pub full_index: bool,
+    /// `-a`/`--text`: diff a binary file as text.
+    pub text: bool,
+    /// `-W`/`--function-context`.
+    pub func_context: bool,
+    /// `--no-prefix`/`--src-prefix=`/`--dst-prefix=`.
+    pub src_prefix: Vec<u8>,
+    pub dst_prefix: Vec<u8>,
+    /// `--no-renames`/`--renames`/`-M[<n>]`. `None` leaves `diff.renames` — and the
+    /// porcelain default of on — in charge.
+    pub renames: Option<u8>,
+    /// `-M<n>`'s similarity threshold in `MAX_SCORE` units; `0` is git's own 50%.
+    pub rename_score: u32,
+    /// `-C`/`--find-copies`: pair a new file with an unchanged one it was copied
+    /// from. A second `-C` (`--find-copies-harder`) widens the candidate set.
+    pub find_copies_harder: bool,
+    /// `-B[<n>][/<m>]`: `diffcore_break()`'s packed score, `-1` when off.
+    pub break_opt: i64,
+    /// The `index` line's abbreviation, when it must differ from `core.abbrev`:
+    /// `--no-abbrev` zeroes `revs->abbrev`, which the raw format reads as "print the
+    /// whole id" while the `index` line falls back to the configured default.
+    pub index_abbrev: Option<usize>,
+}
+
+impl Default for PatchOpts {
+    fn default() -> Self {
+        PatchOpts {
+            ctx: 3,
+            ws: Whitespace::Keep,
+            full_index: false,
+            text: false,
+            func_context: false,
+            src_prefix: b"a/".to_vec(),
+            dst_prefix: b"b/".to_vec(),
+            renames: None,
+            rename_score: 0,
+            find_copies_harder: false,
+            break_opt: -1,
+            index_abbrev: None,
+        }
     }
 }
 
@@ -2302,7 +2449,7 @@ fn patch_render(repo: &gix::Repository) -> Render {
 pub(crate) fn commit_patches(
     repo: &gix::Repository,
     jobs: &[(ObjectId, Option<ObjectId>)],
-    ctx: u32,
+    opts: &PatchOpts,
     paths: &[String],
 ) -> Result<Vec<Vec<u8>>> {
     // Four commits per worker: below that the handle clones cost more than the
@@ -2318,12 +2465,12 @@ pub(crate) fn commit_patches(
 
     if workers <= 1 {
         let mut cache = repo.diff_resource_cache_for_tree_diff()?;
-        let r = patch_render(repo);
+        let r = patch_render(repo, opts);
         let mut specs = matcher(repo)?;
         return jobs
             .iter()
             .map(|(id, parent)| {
-                commit_patch_with(repo, &mut cache, &r, *id, *parent, ctx, specs.as_mut())
+                commit_patch_with(repo, &mut cache, &r, *id, *parent, opts, specs.as_mut())
             })
             .collect();
     }
@@ -2340,7 +2487,7 @@ pub(crate) fn commit_patches(
             handles.push(scope.spawn(move || -> Result<Vec<(usize, Vec<u8>)>> {
                 let repo = proto;
                 let mut cache = repo.diff_resource_cache_for_tree_diff()?;
-                let r = patch_render(&repo);
+                let r = patch_render(&repo, opts);
                 let mut specs = matcher(&repo)?;
                 let mut mine = Vec::new();
                 loop {
@@ -2348,7 +2495,7 @@ pub(crate) fn commit_patches(
                     let Some((id, parent)) = jobs.get(i) else { break };
                     mine.push((
                         i,
-                        commit_patch_with(&repo, &mut cache, &r, *id, *parent, ctx, specs.as_mut())?,
+                        commit_patch_with(&repo, &mut cache, &r, *id, *parent, opts, specs.as_mut())?,
                     ));
                 }
                 Ok(mine)
@@ -2386,7 +2533,7 @@ fn commit_patch_with(
     r: &Render,
     commit_id: ObjectId,
     parent: Option<ObjectId>,
-    ctx: u32,
+    opts: &PatchOpts,
     specs: Option<&mut super::log::PathspecMatcher>,
 ) -> Result<Vec<u8>> {
     let commit = repo.find_object(commit_id)?.try_into_commit()?;
@@ -2414,6 +2561,34 @@ fn commit_patch_with(
     }
     deltas.sort_by(|a, b| a.path.cmp(&b.path).then(b.unmerged.cmp(&a.unmerged)));
 
+    // `diffcore_std()`: `git log`/`git show` are porcelains, so rename detection is on
+    // unless `diff.renames` turns it off — a `git mv` commit is one `R` section, not a
+    // deletion plus an addition.
+    let ro = diffcore_rename::Options {
+        detect_rename: opts.renames.unwrap_or_else(|| {
+            diffcore_rename::config_rename(
+                repo.config_snapshot()
+                    .string("diff.renames")
+                    .as_deref()
+                    .map(|v| v.as_bstr()),
+            )
+        }),
+        rename_score: opts.rename_score,
+        find_copies_harder: opts.find_copies_harder,
+        break_opt: opts.break_opt,
+        rename_limit: repo
+            .config_snapshot()
+            .integer("diff.renameLimit")
+            .unwrap_or(diffcore_rename::DEFAULT_RENAME_LIMIT),
+        hash_kind: repo.object_hash(),
+        ..Default::default()
+    };
+    // `-B` runs through the same pass even with no rename detection behind it.
+    if ro.detect_rename != 0 || ro.break_opt != -1 {
+        run_diffcore_rename(repo, cache, &mut deltas, &ro, false)?;
+        deltas.sort_by(|a, b| a.path.cmp(&b.path).then(b.unmerged.cmp(&a.unmerged)));
+    }
+
     let hash_kind = repo.object_hash();
     let mut out: Vec<u8> = Vec::new();
     for delta in &deltas {
@@ -2422,8 +2597,8 @@ fn commit_patch_with(
             cache,
             &repo.objects,
             delta,
-            ctx,
-            Whitespace::Keep,
+            opts.ctx,
+            opts.ws,
             true,
             hash_kind,
             None,
@@ -2431,9 +2606,9 @@ fn commit_patch_with(
             None,
             None,
             false,
-            false,
+            opts.func_context,
         )?;
-        render_patch(&mut out, repo, delta, &an, ctx, r)?;
+        render_patch(&mut out, repo, delta, &an, opts.ctx, r)?;
     }
     Ok(out)
 }
@@ -2446,7 +2621,7 @@ pub(crate) fn line_range_patch(
     pairs: &[(super::line_log::Pair, Vec<super::line_log::Range>)],
     ctx: u32,
 ) -> Result<Vec<u8>> {
-    let r = patch_render(repo);
+    let r = patch_render(repo, &PatchOpts { ctx, ..Default::default() });
     let mut cache = repo.diff_resource_cache_for_tree_diff()?;
     let hash_kind = repo.object_hash();
     let mut out: Vec<u8> = Vec::new();
@@ -2811,8 +2986,8 @@ fn analyze(
             let before: Vec<&[u8]> = byte_lines(old_data);
             let after: Vec<&[u8]> = byte_lines(new_data);
             let mut input: InternedInput<Vec<u8>> = InternedInput::default();
-            input.update_before(before.iter().map(|l| normalize(l, ws)));
-            input.update_after(after.iter().map(|l| normalize(l, ws)));
+            input.update_before(before.iter().map(|l| normalize_line(l, ws)));
+            input.update_after(after.iter().map(|l| normalize_line(l, ws)));
 
             // `xdl_change_compact()` measures `xdf->recs[i]->ptr`, the *original*
             // record, not the whitespace-normalized token the comparison used.
@@ -2978,8 +3153,8 @@ pub(crate) fn no_index_body(
     let before: Vec<&[u8]> = byte_lines(old_data);
     let after: Vec<&[u8]> = byte_lines(new_data);
     let mut input: InternedInput<Vec<u8>> = InternedInput::default();
-    input.update_before(before.iter().map(|l| normalize(l, ws)));
-    input.update_after(after.iter().map(|l| normalize(l, ws)));
+    input.update_before(before.iter().map(|l| normalize_line(l, ws)));
+    input.update_after(after.iter().map(|l| normalize_line(l, ws)));
     let diff = super::diff_pairs::compute_compacted(
         gix::diff::blob::Algorithm::Histogram,
         &input,
@@ -3009,13 +3184,13 @@ pub(crate) fn render_rows_stat(
     colors: &diff_color::DiffColors,
 ) {
     let (deltas, analyses) = synthetic_rows(rows);
-    render_stat(out, &deltas, &analyses, false, 0, 0, colors);
+    render_stat(out, &diffstat_pairs(&deltas, &analyses), false, 0, 0, colors);
 }
 
 /// `--numstat` for the same rows.
 pub(crate) fn render_rows_numstat(out: &mut Vec<u8>, rows: &[(BString, BString, u32, u32, bool)], z: bool) {
     let (deltas, analyses) = synthetic_rows(rows);
-    render_numstat(out, &deltas, &analyses, z);
+    render_numstat(out, &diffstat_pairs(&deltas, &analyses), z);
 }
 
 /// The `(Delta, Analysis)` pair a `--no-index` row stands for: a rename when the
@@ -3210,7 +3385,7 @@ pub(crate) fn byte_lines(data: &[u8]) -> Vec<&[u8]> {
 
 /// The form of a line used for *comparison* only; the original bytes are always
 /// what gets printed.
-fn normalize(line: &[u8], ws: Whitespace) -> Vec<u8> {
+pub(crate) fn normalize_line(line: &[u8], ws: Whitespace) -> Vec<u8> {
     let is_space = |b: u8| matches!(b, b' ' | b'\t' | b'\x0b' | b'\x0c' | b'\r' | b'\n');
     match ws {
         Whitespace::Keep => line.to_vec(),
@@ -3218,6 +3393,21 @@ fn normalize(line: &[u8], ws: Whitespace) -> Vec<u8> {
         Whitespace::IgnoreAtEol => {
             let end = line.iter().rposition(|b| !is_space(*b)).map_or(0, |i| i + 1);
             line[..end].to_vec()
+        }
+        // `XDF_IGNORE_CR_AT_EOL`: exactly one CR, and only where it sits against the
+        // line terminator.
+        Whitespace::IgnoreCrAtEol => {
+            let mut out = line.to_vec();
+            match out.last() {
+                Some(b'\n') if out.len() >= 2 && out[out.len() - 2] == b'\r' => {
+                    out.remove(out.len() - 2);
+                }
+                Some(b'\r') => {
+                    out.pop();
+                }
+                _ => {}
+            }
+            out
         }
         Whitespace::IgnoreChange => {
             let end = line.iter().rposition(|b| !is_space(*b)).map_or(0, |i| i + 1);
@@ -3258,17 +3448,17 @@ fn mode_str(k: EntryKind) -> &'static str {
 fn render_raw(out: &mut Vec<u8>, delta: &Delta, fmt: u32, r: &Render) {
     let status = status_char(delta);
     if fmt & F_NAME_STATUS == 0 {
-        let null = r.hash_kind.null().to_hex_with_len(r.abbrev).to_string();
+        let null = r.hash_kind.null().to_hex_with_len(r.raw_abbrev).to_string();
         let old_hash = delta
             .old
-            .map(|(id, _)| id.to_hex_with_len(r.abbrev).to_string())
+            .map(|(id, _)| id.to_hex_with_len(r.raw_abbrev).to_string())
             .unwrap_or_else(|| null.clone());
         // Worktree content has no object id yet, which git reports as all-zero —
         // unless rename detection already hashed it (`hash_filespec()`).
         let new_hash = match (&delta.new, delta.unmerged) {
-            (NewSide::Blob(id, _), false) => id.to_hex_with_len(r.abbrev).to_string(),
+            (NewSide::Blob(id, _), false) => id.to_hex_with_len(r.raw_abbrev).to_string(),
             (NewSide::Worktree(_), false) => match delta.new_id {
-                Some(id) => id.to_hex_with_len(r.abbrev).to_string(),
+                Some(id) => id.to_hex_with_len(r.raw_abbrev).to_string(),
                 None => null,
             },
             _ => null,
@@ -3451,12 +3641,46 @@ fn status_char(d: &Delta) -> u8 {
     }
 }
 
+/// The pairs the diffstat formats actually see.
+///
+/// `builtin_diffstat()` (diff.c:3882) throws an entry away again right after running
+/// xdiff when the pair is a plain modification, both sides are present with the same
+/// mode, and the comparison produced no changed line — "omit diffstats of modified
+/// files where nothing changed", which is what a whitespace-ignoring option leaves
+/// behind. With the entry gone, `--stat`, `--numstat` and `--shortstat` print nothing
+/// at all rather than a `| 0` row plus a `1 file changed` summary.
+///
+/// The drop sits inside `builtin_diffstat()`'s `may_differ` arm, so it never applies
+/// when the two ids are equal: a dirty submodule (same commit on both sides) keeps
+/// its `0\t0\t<path>` row, and so does a pure mode change.
+fn diffstat_pairs<'a>(deltas: &'a [Delta], analyses: &'a [Analysis]) -> Vec<(&'a Delta, &'a Analysis)> {
+    deltas
+        .iter()
+        .zip(analyses)
+        .filter(|(d, an)| {
+            if d.unmerged || an.binary || d.complete_rewrite() {
+                return true;
+            }
+            let (Some((old_id, old_kind)), Some(new_kind)) = (d.old, d.new_kind()) else {
+                return true;
+            };
+            let may_differ = old_id != an.new_id;
+            let dropped = may_differ
+                && status_char(d) == b'M'
+                && an.added == 0
+                && an.deleted == 0
+                && old_kind == new_kind;
+            !dropped
+        })
+        .collect()
+}
+
 /// `--numstat` (`show_numstat()`).
 ///
 /// A rename/copy prints the `pprint_rename`d name in the newline-terminated form and
 /// the two raw names, each NUL-terminated and preceded by an extra NUL, under `-z`.
-fn render_numstat(out: &mut Vec<u8>, deltas: &[Delta], analyses: &[Analysis], z: bool) {
-    for (d, an) in deltas.iter().zip(analyses) {
+fn render_numstat(out: &mut Vec<u8>, pairs: &[(&Delta, &Analysis)], z: bool) {
+    for (d, an) in pairs.iter().copied() {
         if an.binary {
             push_str(out, "-\t-\t");
         } else {
@@ -3482,15 +3706,21 @@ fn render_numstat(out: &mut Vec<u8>, deltas: &[Delta], analyses: &[Analysis], z:
 }
 
 /// `--shortstat` (`show_shortstats()`).
-fn render_shortstat(out: &mut Vec<u8>, deltas: &[Delta], analyses: &[Analysis]) {
-    let (files, adds, dels) = stat_totals(deltas, analyses);
+fn render_shortstat(out: &mut Vec<u8>, pairs: &[(&Delta, &Analysis)]) {
+    // `show_shortstats()` (diff.c:2934) returns before the summary line when the
+    // diffstat holds no entries, so a run whose every pair was dropped prints
+    // nothing rather than ` 0 files changed`.
+    if pairs.is_empty() {
+        return;
+    }
+    let (files, adds, dels) = stat_totals(pairs);
     stat_summary(out, files, adds, dels);
 }
 
-fn stat_totals(deltas: &[Delta], analyses: &[Analysis]) -> (u32, u32, u32) {
-    let mut files = deltas.len() as u32;
+fn stat_totals(pairs: &[(&Delta, &Analysis)]) -> (u32, u32, u32) {
+    let mut files = pairs.len() as u32;
     let (mut adds, mut dels) = (0u32, 0u32);
-    for (d, an) in deltas.iter().zip(analyses) {
+    for (d, an) in pairs.iter().copied() {
         if d.unmerged {
             files -= 1;
         } else if !an.binary {
@@ -3616,20 +3846,23 @@ fn stat_display_name(d: &Delta, compact: bool) -> Vec<u8> {
 /// from `--stat-name-width`/`--stat-graph-width` or `diff.statNameWidth`/`diff.statGraphWidth`.
 fn render_stat(
     out: &mut Vec<u8>,
-    deltas: &[Delta],
-    analyses: &[Analysis],
+    pairs: &[(&Delta, &Analysis)],
     compact: bool,
     stat_name_width: i64,
     stat_graph_width: i64,
     colors: &diff_color::DiffColors,
 ) {
-    let names: Vec<Vec<u8>> = deltas.iter().map(|d| stat_display_name(d, compact)).collect();
+    // `show_stats()` (diff.c:2664) returns immediately on an empty diffstat.
+    if pairs.is_empty() {
+        return;
+    }
+    let names: Vec<Vec<u8>> = pairs.iter().map(|(d, _)| stat_display_name(d, compact)).collect();
 
     let mut max_change: i64 = 0;
     let mut max_len: i64 = 0;
     let mut bin_width: i64 = 0;
     let mut number_width: i64 = 0;
-    for (i, (d, an)) in deltas.iter().zip(analyses).enumerate() {
+    for (i, (d, an)) in pairs.iter().copied().enumerate() {
         let change = (an.added + an.deleted) as i64;
         max_len = max_len.max(names[i].len() as i64);
         if d.unmerged {
@@ -3681,7 +3914,7 @@ fn render_stat(
         }
     }
 
-    for (i, (d, an)) in deltas.iter().zip(analyses).enumerate() {
+    for (i, (d, an)) in pairs.iter().copied().enumerate() {
         let (added, deleted) = (an.added as i64, an.deleted as i64);
         // "scale" the filename: overlong names are truncated to "...<tail>".
         let full = &names[i];
@@ -3757,7 +3990,7 @@ fn render_stat(
         out.push(b'\n');
     }
 
-    let (files, adds, dels) = stat_totals(deltas, analyses);
+    let (files, adds, dels) = stat_totals(pairs);
     stat_summary(out, files, adds, dels);
 }
 
@@ -3889,6 +4122,30 @@ fn submodule_inline_diff(
     Some(out.stdout)
 }
 
+/// `diff_flush_patch_quietly()` (diff.c:6566): render the pair with the output
+/// thrown away and report only whether it had anything to say. `scratch` is the
+/// caller's reusable buffer — nothing in it is ever printed.
+///
+/// A submodule pair reports a change without rendering: `builtin_diff()`'s two
+/// submodule branches set `o->found_changes` before writing a single byte.
+#[allow(clippy::too_many_arguments)]
+fn pair_reports_change(
+    scratch: &mut Vec<u8>,
+    repo: &gix::Repository,
+    delta: &Delta,
+    an: &Analysis,
+    ctx: u32,
+    r: &Render,
+    submodule_format: SubmoduleFormat,
+) -> Result<bool> {
+    if !delta.unmerged && submodule_format != SubmoduleFormat::Short && delta.is_submodule_pair() {
+        return Ok(true);
+    }
+    scratch.clear();
+    render_patch(scratch, repo, delta, an, ctx, r)?;
+    Ok(!scratch.is_empty())
+}
+
 /// Render one delta as a `git diff` file section into `out`.
 fn render_patch(
     out: &mut Vec<u8>,
@@ -3916,6 +4173,28 @@ fn render_patch(
     };
     let content_differs = old_hash != new_hash;
     let new_kind = delta.new_kind();
+
+    // `builtin_diff()` builds the header into a strbuf and hands it to
+    // `fn_out_consume()` (diff.c:2364), which emits it only when the first hunk line
+    // goes out. `must_show_header` is what forces it out early: `fill_metainfo()`
+    // (diff.c:4491) sets it for a copy, a rename and a `-B` rewrite, and
+    // `builtin_diff()` itself for a creation (diff.c:3613), a deletion (diff.c:3620)
+    // and a mode change (diff.c:3627). A plain modification whose comparison found
+    // nothing — the usual result of `-w`/`-b` on a whitespace-only edit — therefore
+    // prints no `diff --git` line at all.
+    let mode_changed = matches!((delta.old, new_kind), (Some((_, ok)), Some(nk)) if ok != nk);
+    let must_show = delta.old.is_none()
+        || matches!(delta.new, NewSide::Absent)
+        || delta.renamed()
+        || delta.complete_rewrite()
+        || mode_changed
+        || an.hunks.is_some()
+        // The binary arm prints `Binary files ... differ` and its header with it,
+        // but only once the two sides are known to differ (diff.c:3672).
+        || (an.binary && content_differs);
+    if !must_show {
+        return Ok(());
+    }
 
     push_str(out, "diff --git ");
     out.extend_from_slice(&quote_two(&r.src_prefix, delta.old_path(), &r.dst_prefix, &delta.path));

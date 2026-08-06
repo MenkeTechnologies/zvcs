@@ -165,33 +165,33 @@ pub fn file(
                 }
             }
 
+            // A parentless commit has nothing to pass anything to, so it keeps whatever is
+            // still suspected of it — git's `assign_blame()` runs `pass_blame()` (which walks
+            // no scapegoats here) and then hands every entry left on the origin to
+            // `found_guilty_entry()`. This must not wait for the queue to run dry: a root
+            // reached while other commits are still pending would otherwise keep its suspect,
+            // and the `'origin` loop, which re-selects that same suspect, would never end. Any
+            // repository whose history merges reaches its root that way.
             if parent_ids.is_empty() {
-                if queue.is_empty() {
-                    // I’m not entirely sure if this is correct yet. `suspect`, at this point, is the
-                    // `id` of the last `item` that was yielded by `queue`, so it makes sense to assign
-                    // the remaining lines to it, even though we don’t explicitly check whether that is
-                    // true here. We could perhaps use diff-tree-to-tree to compare `suspect` against
-                    // an empty tree to validate this assumption.
-                    if unblamed_to_out_is_done(&mut hunks_to_blame, &mut out, suspect, &paths) {
-                        if let Some(ref mut blame_path) = blame_path {
-                            let entry = previous_entry
-                                .take()
-                                .filter(|(id, _)| *id == suspect)
-                                .map(|(_, entry)| entry);
+                let done = unblamed_to_out_is_done(&mut hunks_to_blame, &mut out, suspect, &paths);
+                if let Some(ref mut blame_path) = blame_path {
+                    let entry = previous_entry
+                        .take()
+                        .filter(|(id, _)| *id == suspect)
+                        .map(|(_, entry)| entry);
 
-                            let blame_path_entry = BlamePathEntry {
-                                source_file_path: current_file_path.clone(),
-                                previous_source_file_path: None,
-                                commit_id,
-                                blob_id: entry.unwrap_or(gix_hash::Kind::shortest().null()),
-                                previous_blob_id: gix_hash::Kind::shortest().null(),
-                                parent_index: 0,
-                            };
-                            blame_path.push(blame_path_entry);
-                        }
-
-                        break 'outer;
-                    }
+                    let blame_path_entry = BlamePathEntry {
+                        source_file_path: current_file_path.clone(),
+                        previous_source_file_path: None,
+                        commit_id,
+                        blob_id: entry.unwrap_or(gix_hash::Kind::shortest().null()),
+                        previous_blob_id: gix_hash::Kind::shortest().null(),
+                        parent_index: 0,
+                    };
+                    blame_path.push(blame_path_entry);
+                }
+                if done {
+                    break 'outer;
                 }
                 // There is more, keep looking.
                 continue 'origin;

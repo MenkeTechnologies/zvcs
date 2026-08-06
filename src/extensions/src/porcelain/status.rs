@@ -368,6 +368,11 @@ pub fn status(args: &[String]) -> Result<ExitCode> {
         },
         None => None,
     };
+    // `wt_status`'s `show_ignored_mode`. `traditional` lists the ignored *files* (and
+    // with `-uall` git clears `DIR_SHOW_OTHER_DIRECTORIES`, so it descends into an
+    // ignored directory to name them), while `matching` reports whatever the ignore
+    // pattern matched — the directory itself when a directory pattern matched it.
+    let ignored_matching = matches!(ignored_arg.as_deref(), Some("matching"));
     let show_ignored = match &ignored_arg {
         // git accepts exactly these three ignored modes (no boolean coercion);
         // `no` is valid but suppresses the listing, anything else is fatal.
@@ -557,6 +562,16 @@ pub fn status(args: &[String]) -> Result<ExitCode> {
     // enables the in-progress banner and suppresses the unstage hint.
     let merging = repo.git_dir().join("MERGE_HEAD").exists();
 
+    // `wt_status_get_state()`: everything else the long format announces as being in
+    // progress — an `am` session, a rebase, a cherry-pick, a revert, a bisect.
+    let progress = ProgressState::detect(&repo, merging);
+
+    // `wt_status_get_state()`'s sparse-checkout share (wt-status.c:1795): off unless
+    // `core.sparseCheckout` is set and the index has entries, `None` for a sparse
+    // index (which has no per-file view to count), otherwise the percentage of index
+    // entries that are actually in the worktree, in git's integer arithmetic.
+    let sparse_checkout = sparse_checkout_state(&repo);
+
     let untracked = untracked_flag.unwrap_or_else(|| configured_untracked(&repo));
 
     // The porcelain-v2 machine format is a separate renderer with its own,
@@ -567,6 +582,7 @@ pub fn status(args: &[String]) -> Result<ExitCode> {
             &repo,
             untracked,
             show_ignored,
+            ignored_matching,
             renames,
             branch_header,
             &pathspecs,
@@ -596,12 +612,19 @@ pub fn status(args: &[String]) -> Result<ExitCode> {
         });
     if show_ignored {
         // git lists ignored entries at the same granularity as untracked ones.
-        let mode = if untracked == Untracked::All {
+        // `--ignored=matching` reports whatever the ignore pattern matched, so it never
+        // collapses; the traditional mode follows the untracked granularity, and under
+        // `-uall` it additionally descends into an ignored directory to name the files
+        // in it.
+        let mode = if untracked == Untracked::All || ignored_matching {
             gix::dir::walk::EmissionMode::Matching
         } else {
             gix::dir::walk::EmissionMode::CollapseDirectory
         };
-        platform = platform.dirwalk_options(|opts| opts.emit_ignored(Some(mode)));
+        let descend = untracked == Untracked::All && !ignored_matching;
+        platform = platform.dirwalk_options(|opts| {
+            opts.emit_ignored(Some(mode)).recurse_ignored_directories(descend)
+        });
     }
     if let Some(rewrites) = renames {
         platform = platform.tree_index_track_renames(match rewrites {
@@ -816,7 +839,17 @@ pub fn status(args: &[String]) -> Result<ExitCode> {
                 untracked_slow,
                 hints,
                 unborn,
-                merging,
+                &progress,
+                &rebase_information(&progress, &repo, repo.git_dir(), hints, &|text: &str| {
+                    text.split_inclusive('\n')
+                        .map(|line| match line.strip_suffix('\n') {
+                            Some(body) => format!("{}\n", colors.paint(Slot::Header, body)),
+                            None => colors.paint(Slot::Header, line),
+                        })
+                        .collect()
+                }),
+                repo.git_dir(),
+                sparse_checkout,
                 untracked,
                 show_ignored,
                 &staged,
@@ -1136,6 +1169,7 @@ fn porcelain_v2_output(
     repo: &gix::Repository,
     untracked: Untracked,
     show_ignored: bool,
+    ignored_matching: bool,
     renames: Option<Option<gix::diff::Rewrites>>,
     branch_header: bool,
     pathspecs: &[BString],
@@ -1223,12 +1257,19 @@ fn porcelain_v2_output(
             Untracked::All => gix::status::UntrackedFiles::Files,
         });
     if show_ignored {
-        let mode = if untracked == Untracked::All {
+        // `--ignored=matching` reports whatever the ignore pattern matched, so it never
+        // collapses; the traditional mode follows the untracked granularity, and under
+        // `-uall` it additionally descends into an ignored directory to name the files
+        // in it.
+        let mode = if untracked == Untracked::All || ignored_matching {
             gix::dir::walk::EmissionMode::Matching
         } else {
             gix::dir::walk::EmissionMode::CollapseDirectory
         };
-        platform = platform.dirwalk_options(|opts| opts.emit_ignored(Some(mode)));
+        let descend = untracked == Untracked::All && !ignored_matching;
+        platform = platform.dirwalk_options(|opts| {
+            opts.emit_ignored(Some(mode)).recurse_ignored_directories(descend)
+        });
     }
     if let Some(rewrites) = renames {
         platform = platform.tree_index_track_renames(match rewrites {
@@ -2074,6 +2115,333 @@ fn submodule_summary(workdir: Option<&std::path::Path>, uncommitted: bool, limit
     format!("{header}\n\n{body}")
 }
 
+/// `wt_status_state` (wt-status.h): the operations the long format announces, and
+/// the few strings their banners need.
+///
+/// Detection is `wt_status_get_state()` and its `wt_status_check_rebase()` /
+/// `wt_status_check_bisect()` helpers: purely files under `$GIT_DIR`, in the same
+/// order, so an `am` that stopped and a rebase that stopped are told apart by
+/// `rebase-apply/applying` exactly as git tells them apart.
+#[derive(Default)]
+struct ProgressState {
+    merge: bool,
+    am: bool,
+    /// `rebase-apply/patch` exists and is empty.
+    am_empty_patch: bool,
+    rebase: bool,
+    rebase_interactive: bool,
+    /// `rebase-*/head-name`, as `get_branch()` shortens it.
+    branch: Option<String>,
+    /// `rebase-*/onto`, likewise.
+    onto: Option<String>,
+    /// `Some(None)` when the sequencer says "pick" without a `CHERRY_PICK_HEAD`.
+    cherry_pick: Option<Option<String>>,
+    /// Whether the `CHERRY_PICK_HEAD` ref itself is there, which is the only thing
+    /// `sequencer_determine_whence()` looks at.
+    cherry_pick_head: bool,
+    revert: Option<Option<String>>,
+    bisect: bool,
+    /// `BISECT_START`, the branch the bisect started from.
+    bisecting_from: Option<String>,
+}
+
+impl ProgressState {
+    fn detect(repo: &gix::Repository, merging: bool) -> Self {
+        let git_dir = repo.git_dir();
+        let mut state = ProgressState { merge: merging, ..Default::default() };
+
+        // `wt_status_check_rebase()`: `rebase-apply` is either an `am` session or a
+        // patch-based rebase, `rebase-merge` is the sequencer-driven one.
+        if git_dir.join("rebase-apply").is_dir() {
+            if git_dir.join("rebase-apply/applying").exists() {
+                state.am = true;
+                state.am_empty_patch = std::fs::metadata(git_dir.join("rebase-apply/patch"))
+                    .is_ok_and(|md| md.len() == 0);
+            } else {
+                state.rebase = true;
+                state.branch = read_state_branch(repo, "rebase-apply/head-name");
+                state.onto = read_state_branch(repo, "rebase-apply/onto");
+            }
+        } else if git_dir.join("rebase-merge").is_dir() {
+            if git_dir.join("rebase-merge/interactive").exists() {
+                state.rebase_interactive = true;
+            } else {
+                state.rebase = true;
+            }
+            state.branch = read_state_branch(repo, "rebase-merge/head-name");
+            state.onto = read_state_branch(repo, "rebase-merge/onto");
+        }
+
+        state.cherry_pick = sequencer_head(repo, "CHERRY_PICK_HEAD");
+        state.cherry_pick_head = git_dir.join("CHERRY_PICK_HEAD").exists();
+        state.revert = sequencer_head(repo, "REVERT_HEAD");
+
+        // `wt_status_check_bisect()`.
+        if git_dir.join("BISECT_LOG").exists() {
+            state.bisect = true;
+            state.bisecting_from = read_state_branch(repo, "BISECT_START");
+        }
+        state
+    }
+
+    /// Whether any of these has a banner to print.
+    fn any(&self) -> bool {
+        self.merge
+            || self.am
+            || self.rebase
+            || self.rebase_interactive
+            || self.cherry_pick.is_some()
+            || self.revert.is_some()
+            || self.bisect
+    }
+
+    /// `determine_whence()` (builtin/commit.c:198): `s->whence != FROM_COMMIT` leaves
+    /// the "use `git restore --staged` to unstage" hint out of the staged and unmerged
+    /// headers. Only two things move it off `FROM_COMMIT` — `MERGE_HEAD`, and the
+    /// `CHERRY_PICK_HEAD` that `sequencer_determine_whence()` tests. A revert or a
+    /// stopped rebase keeps the hint.
+    fn suppresses_unstage_hint(&self) -> bool {
+        self.merge || self.cherry_pick_head
+    }
+}
+
+/// `get_branch()` (wt-status.c:1645): the contents of a state file as a name —
+/// `refs/heads/x` becomes `x`, another `refs/` name stays whole, a raw object id is
+/// abbreviated, and the rebase placeholder `detached HEAD` means "no name".
+fn read_state_branch(repo: &gix::Repository, rela: &str) -> Option<String> {
+    let text = std::fs::read_to_string(repo.git_dir().join(rela)).ok()?;
+    let text = text.trim_end_matches('\n');
+    if text.is_empty() {
+        return None;
+    }
+    if let Some(name) = text.strip_prefix("refs/heads/") {
+        return Some(name.to_string());
+    }
+    if text.starts_with("refs/") {
+        return Some(text.to_string());
+    }
+    if let Ok(id) = gix::ObjectId::from_hex(text.as_bytes()) {
+        return Some(
+            repo.find_object(id)
+                .ok()
+                .map(|obj| obj.id().shorten_or_id().to_string())
+                .unwrap_or_else(|| id.to_hex_with_len(7).to_string()),
+        );
+    }
+    if text == "detached HEAD" {
+        return None;
+    }
+    Some(text.to_string())
+}
+
+/// `CHERRY_PICK_HEAD`/`REVERT_HEAD` as an abbreviated id, falling back to
+/// `sequencer_get_last_command()`: a stopped sequencer whose head ref is already gone
+/// still reports the operation, then with no commit to name.
+fn sequencer_head(repo: &gix::Repository, name: &str) -> Option<Option<String>> {
+    if let Ok(text) = std::fs::read_to_string(repo.git_dir().join(name)) {
+        if let Ok(id) = gix::ObjectId::from_hex(text.trim().as_bytes()) {
+            return Some(Some(
+                repo.find_object(id)
+                    .ok()
+                    .map(|obj| obj.id().shorten_or_id().to_string())
+                    .unwrap_or_else(|| id.to_hex_with_len(7).to_string()),
+            ));
+        }
+    }
+    let todo = repo.git_dir().join("sequencer/todo");
+    let text = std::fs::read_to_string(todo).ok()?;
+    let verb = text
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with('#'))
+        .and_then(|line| line.split_whitespace().next())?;
+    let is_revert = matches!(verb, "revert");
+    let is_pick = matches!(verb, "pick" | "p");
+    match name {
+        "CHERRY_PICK_HEAD" if is_pick => Some(None),
+        "REVERT_HEAD" if is_revert => Some(None),
+        _ => None,
+    }
+}
+
+/// `show_rebase_information()` (wt-status.c:1430): what an interactive rebase has
+/// done and has left to do, two lines of each.
+///
+/// A non-interactive rebase keeps no todo list and contributes nothing here.
+fn rebase_information(
+    progress: &ProgressState,
+    repo: &gix::Repository,
+    git_dir: &std::path::Path,
+    hints: bool,
+    h: &dyn Fn(&str) -> String,
+) -> String {
+    if !progress.rebase_interactive {
+        return String::new();
+    }
+    const SHOWN: usize = 2;
+    let mut out = String::new();
+    let done = read_rebase_todolist(repo, git_dir, "rebase-merge/done");
+    let todo = read_rebase_todolist(repo, git_dir, "rebase-merge/git-rebase-todo");
+    if todo.is_none() {
+        out.push_str(&h("git-rebase-todo is missing.\n"));
+    }
+    let done = done.unwrap_or_default();
+    if done.is_empty() {
+        out.push_str(&h("No commands done.\n"));
+    } else {
+        out.push_str(&h(&format!(
+            "Last command{} done ({} command{} done):\n",
+            if done.len() == 1 { "" } else { "s" },
+            done.len(),
+            if done.len() == 1 { "" } else { "s" }
+        )));
+        for line in done.iter().skip(done.len().saturating_sub(SHOWN)) {
+            out.push_str(&h(&format!("   {line}\n")));
+        }
+        if done.len() > SHOWN && hints {
+            out.push_str(&h(&format!(
+                "  (see more in file {})\n",
+                git_dir.join("rebase-merge/done").display()
+            )));
+        }
+    }
+    let todo = todo.unwrap_or_default();
+    if todo.is_empty() {
+        out.push_str(&h("No commands remaining.\n"));
+    } else {
+        out.push_str(&h(&format!(
+            "Next command{} to do ({} remaining command{}):\n",
+            if todo.len() == 1 { "" } else { "s" },
+            todo.len(),
+            if todo.len() == 1 { "" } else { "s" }
+        )));
+        for line in todo.iter().take(SHOWN) {
+            out.push_str(&h(&format!("   {line}\n")));
+        }
+        if hints {
+            out.push_str(&h("  (use \"git rebase --edit-todo\" to view and edit)\n"));
+        }
+    }
+    out
+}
+
+/// `read_rebase_todolist()` (wt-status.c:1399): the todo file without its comments
+/// and blank lines, each line run through `abbrev_oid_in_line()`. `None` when the
+/// file is missing.
+fn read_rebase_todolist(
+    repo: &gix::Repository,
+    git_dir: &std::path::Path,
+    rela: &str,
+) -> Option<Vec<String>> {
+    let text = std::fs::read_to_string(git_dir.join(rela)).ok()?;
+    Some(
+        text.lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .map(|line| abbrev_oid_in_line(repo, line))
+            .collect(),
+    )
+}
+
+/// `abbrev_oid_in_line()` (wt-status.c:1376): turn
+/// `pick d6a2f0303e897ec2… some message` into `pick d6a2f03 some message`, leaving
+/// the commands that carry no object id alone.
+fn abbrev_oid_in_line(repo: &gix::Repository, line: &str) -> String {
+    if ["exec ", "x ", "label ", "l "]
+        .iter()
+        .any(|verb| line.starts_with(verb))
+    {
+        return line.to_string();
+    }
+    let mut parts = line.splitn(3, ' ');
+    let (Some(verb), Some(oid)) = (parts.next(), parts.next()) else {
+        return line.to_string();
+    };
+    let rest = parts.next();
+    let Some(short) = gix::ObjectId::from_hex(oid.as_bytes())
+        .ok()
+        .and_then(|id| repo.find_object(id).ok())
+        .map(|obj| obj.id().shorten_or_id().to_string())
+    else {
+        return line.to_string();
+    };
+    match rest {
+        Some(rest) => format!("{verb} {short} {rest}"),
+        None => format!("{verb} {short}"),
+    }
+}
+
+/// `split_commit_in_progress()` (wt-status.c:1333): a rebase that stopped to edit a
+/// commit and has already had part of it committed, which is what tells "splitting"
+/// apart from "editing".
+///
+/// The check only runs on a dirty worktree (git's `s->workdir_dirty`, the same
+/// "Changes not staged for commit" set) and a detached `HEAD`; a clean stop at an
+/// `edit` is "editing", not "splitting".
+fn split_commit_in_progress(
+    git_dir: &std::path::Path,
+    head_state: &HeadState,
+    workdir_dirty: bool,
+) -> bool {
+    if !workdir_dirty || !matches!(head_state, HeadState::Detached(_)) {
+        return false;
+    }
+    let line = |rela: &str| -> Option<String> {
+        std::fs::read_to_string(git_dir.join(rela))
+            .ok()
+            .map(|s| s.trim().to_string())
+    };
+    // Both refs have to resolve; git bails when either read fails.
+    let (Some(head), Some(orig_head)) = (line("HEAD"), line("ORIG_HEAD")) else {
+        return false;
+    };
+    let (Some(amend), Some(rebase_orig_head)) = (
+        line("rebase-merge/amend"),
+        line("rebase-merge/orig-head"),
+    ) else {
+        return false;
+    };
+    if amend == rebase_orig_head {
+        // The rebase recorded the commit it stopped at; `HEAD` having moved past it
+        // means part of that commit is already committed.
+        head != amend
+    } else {
+        // Otherwise the split shows in `ORIG_HEAD` no longer being where the rebase
+        // started.
+        orig_head != rebase_orig_head
+    }
+}
+
+/// `wt_status_get_state()`'s sparse-checkout share (wt-status.c:1795).
+///
+/// `None` when `core.sparseCheckout` is off or the index is empty — git skips the
+/// computation rather than divide by zero. `Some(None)` for a sparse index, which
+/// git reports without a number. Otherwise `Some(Some(percent))` with git's
+/// `100 - (100 * skipped) / total` in integer arithmetic.
+fn sparse_checkout_state(repo: &gix::Repository) -> Option<Option<u32>> {
+    if !repo
+        .config_snapshot()
+        .boolean("core.sparseCheckout")
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    let index = repo.index_or_empty().ok()?;
+    let total = index.entries().len();
+    if total == 0 {
+        return None;
+    }
+    if index.is_sparse() {
+        return Some(None);
+    }
+    let skipped = index
+        .entries()
+        .iter()
+        .filter(|e| e.flags.contains(gix::index::entry::Flags::SKIP_WORKTREE))
+        .count();
+    Some(Some((100 - (100 * skipped) / total) as u32))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_long(
     head_state: &HeadState,
@@ -2084,7 +2452,15 @@ fn render_long(
     untracked_slow: Option<f64>,
     hints: bool,
     unborn: bool,
-    merging: bool,
+    // `s->state`: which operation is in progress, and what its banner needs.
+    progress: &ProgressState,
+    // `show_rebase_information()`'s block, rendered by the caller because it reads the
+    // todo files and abbreviates their object ids.
+    rebase_info: &str,
+    // `$GIT_DIR`, for the rebase state files the banners read.
+    git_dir: &std::path::Path,
+    // `s->state.sparse_checkout_percentage`, as [`sparse_checkout_state`] computed it.
+    sparse_checkout: Option<Option<u32>>,
     untracked_mode: Untracked,
     show_ignored: bool,
     staged: &[(StageKind, BString, Option<BString>)],
@@ -2146,8 +2522,21 @@ fn render_long(
         }
         HeadState::Detached(short) => {
             out.push_str(&colors.paint(Slot::Header, ""));
-            out.push_str(&colors.paint(Slot::Nobranch, "HEAD detached at "));
-            out.push_str(&colors.paint(Slot::Branch, short));
+            // A rebase names what it is rebasing onto instead of the detached id:
+            // `wt_longstatus_print` prefers `state.onto` whenever a rebase is in
+            // progress (wt-status.c:1902).
+            let (prefix, name) = if progress.rebase || progress.rebase_interactive {
+                let prefix = if progress.rebase_interactive {
+                    "interactive rebase in progress; onto "
+                } else {
+                    "rebase in progress; onto "
+                };
+                (prefix, progress.onto.as_deref().unwrap_or(short.as_str()))
+            } else {
+                ("HEAD detached at ", short.as_str())
+            };
+            out.push_str(&colors.paint(Slot::Nobranch, prefix));
+            out.push_str(&colors.paint(Slot::Branch, name));
             out.push('\n');
         }
     }
@@ -2160,7 +2549,16 @@ fn render_long(
         out.push('\n');
     }
 
-    if merging {
+    // `wt_longstatus_print_state()` (wt-status.c:1863): one banner from the
+    // merge/am/rebase/cherry-pick/revert chain, then the bisect one if a bisect is
+    // also running, then the sparse-checkout line.
+    if progress.merge {
+        if progress.rebase_interactive {
+            // A conflicted `rebase -i` shows what the todo list is doing before the
+            // merge banner, with a plain newline between them.
+            out.push_str(rebase_info);
+            out.push('\n');
+        }
         if unmerged.is_empty() {
             out.push_str(&h("All conflicts fixed but you are still merging.\n"));
             if hints {
@@ -2172,6 +2570,144 @@ fn render_long(
                 out.push_str(&h("  (fix conflicts and run \"git commit\")\n"));
                 out.push_str(&h("  (use \"git merge --abort\" to abort the merge)\n"));
             }
+        }
+        out.push_str(&trailer());
+    } else if progress.am {
+        out.push_str(&h("You are in the middle of an am session.\n"));
+        if progress.am_empty_patch {
+            out.push_str(&h("The current patch is empty.\n"));
+        }
+        if hints {
+            if !progress.am_empty_patch {
+                out.push_str(&h("  (fix conflicts and then run \"git am --continue\")\n"));
+            }
+            out.push_str(&h("  (use \"git am --skip\" to skip this patch)\n"));
+            if progress.am_empty_patch {
+                out.push_str(&h(
+                    "  (use \"git am --allow-empty\" to record this patch as an empty commit)\n",
+                ));
+            }
+            out.push_str(&h("  (use \"git am --abort\" to restore the original branch)\n"));
+        }
+        out.push_str(&trailer());
+    } else if progress.rebase || progress.rebase_interactive {
+        out.push_str(rebase_info);
+        // `print_rebase_state()`: named branch when the rebase recorded one.
+        let state_line = || match &progress.branch {
+            Some(branch) => format!(
+                "You are currently rebasing branch '{branch}' on '{}'.\n",
+                progress.onto.as_deref().unwrap_or_default()
+            ),
+            None => "You are currently rebasing.\n".to_string(),
+        };
+        if !unmerged.is_empty() {
+            out.push_str(&h(&state_line()));
+            if hints {
+                out.push_str(&h("  (fix conflicts and then run \"git rebase --continue\")\n"));
+                out.push_str(&h("  (use \"git rebase --skip\" to skip this patch)\n"));
+                out.push_str(&h(
+                    "  (use \"git rebase --abort\" to check out the original branch)\n",
+                ));
+            }
+        } else if progress.rebase || git_dir.join("MERGE_MSG").exists() {
+            out.push_str(&h(&state_line()));
+            if hints {
+                out.push_str(&h("  (all conflicts fixed: run \"git rebase --continue\")\n"));
+            }
+        } else if split_commit_in_progress(git_dir, head_state, !unstaged.is_empty()) {
+            out.push_str(&h(&match &progress.branch {
+                Some(branch) => format!(
+                    "You are currently splitting a commit while rebasing branch '{branch}' on '{}'.\n",
+                    progress.onto.as_deref().unwrap_or_default()
+                ),
+                None => "You are currently splitting a commit during a rebase.\n".to_string(),
+            }));
+            if hints {
+                out.push_str(&h(
+                    "  (Once your working directory is clean, run \"git rebase --continue\")\n",
+                ));
+            }
+        } else {
+            out.push_str(&h(&match &progress.branch {
+                Some(branch) => format!(
+                    "You are currently editing a commit while rebasing branch '{branch}' on '{}'.\n",
+                    progress.onto.as_deref().unwrap_or_default()
+                ),
+                None => "You are currently editing a commit during a rebase.\n".to_string(),
+            }));
+            if hints {
+                out.push_str(&h("  (use \"git commit --amend\" to amend the current commit)\n"));
+                out.push_str(&h(
+                    "  (use \"git rebase --continue\" once you are satisfied with your changes)\n",
+                ));
+            }
+        }
+        out.push_str(&trailer());
+    } else if let Some(commit) = &progress.cherry_pick {
+        out.push_str(&h(&match commit {
+            Some(id) => format!("You are currently cherry-picking commit {id}.\n"),
+            None => "Cherry-pick currently in progress.\n".to_string(),
+        }));
+        if hints {
+            if !unmerged.is_empty() {
+                out.push_str(&h("  (fix conflicts and run \"git cherry-pick --continue\")\n"));
+            } else if commit.is_none() {
+                out.push_str(&h("  (run \"git cherry-pick --continue\" to continue)\n"));
+            } else {
+                out.push_str(&h(
+                    "  (all conflicts fixed: run \"git cherry-pick --continue\")\n",
+                ));
+            }
+            out.push_str(&h("  (use \"git cherry-pick --skip\" to skip this patch)\n"));
+            out.push_str(&h(
+                "  (use \"git cherry-pick --abort\" to cancel the cherry-pick operation)\n",
+            ));
+        }
+        out.push_str(&trailer());
+    } else if let Some(commit) = &progress.revert {
+        out.push_str(&h(&match commit {
+            Some(id) => format!("You are currently reverting commit {id}.\n"),
+            None => "Revert currently in progress.\n".to_string(),
+        }));
+        if hints {
+            if !unmerged.is_empty() {
+                out.push_str(&h("  (fix conflicts and run \"git revert --continue\")\n"));
+            } else if commit.is_none() {
+                out.push_str(&h("  (run \"git revert --continue\" to continue)\n"));
+            } else {
+                out.push_str(&h("  (all conflicts fixed: run \"git revert --continue\")\n"));
+            }
+            out.push_str(&h("  (use \"git revert --skip\" to skip this patch)\n"));
+            out.push_str(&h(
+                "  (use \"git revert --abort\" to cancel the revert operation)\n",
+            ));
+        }
+        out.push_str(&trailer());
+    }
+
+    // A bisect can run alongside any of the above, so it is its own `if`.
+    if progress.bisect {
+        out.push_str(&h(&match &progress.bisecting_from {
+            Some(branch) => format!("You are currently bisecting, started from branch '{branch}'.\n"),
+            None => "You are currently bisecting.\n".to_string(),
+        }));
+        if hints {
+            out.push_str(&h(
+                "  (use \"git bisect reset\" to get back to the original branch)\n",
+            ));
+        }
+        out.push_str(&trailer());
+    }
+
+    // `show_sparse_checkout_in_use()` (wt-status.c:1626): the last of the state
+    // blocks `wt_longstatus_print_state()` writes, so it lands after any in-progress
+    // banner and before the initial-commit notice.
+    if let Some(percentage) = sparse_checkout {
+        match percentage {
+            Some(percentage) => out.push_str(&h(&format!(
+                "You are in a sparse checkout with {percentage}% of tracked files present.\n"
+            ))),
+            None => out.push_str(&h("You are in a sparse checkout.\n")),
         }
         out.push_str(&trailer());
     }
@@ -2188,7 +2724,7 @@ fn render_long(
         out.push_str(&h("Changes to be committed:\n"));
         // Mid-merge git offers no unstage hint, as `git restore --staged` is not
         // the right advice while `MERGE_HEAD` is around.
-        if hints && !merging {
+        if hints && !progress.suppresses_unstage_hint() {
             if unborn {
                 out.push_str(&h("  (use \"git rm --cached <file>...\" to unstage)\n"));
             } else {
@@ -2213,7 +2749,7 @@ fn render_long(
             // hint the staged section carries, under the same conditions — so a
             // conflict left by something other than a merge in progress (a
             // `stash apply`, say) says how to unstage it.
-            if !merging {
+            if !progress.suppresses_unstage_hint() {
                 if unborn {
                     out.push_str(&h("  (use \"git rm --cached <file>...\" to unstage)\n"));
                 } else {

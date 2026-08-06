@@ -1020,8 +1020,18 @@ mod tests {
     /// `Submodule` is excluded by construction, not by convenience: it records
     /// the absolute path of its upstream in `.gitmodules` and `.git/config`, so
     /// two copies at different paths are *supposed* to differ.
+    ///
+    /// The builder needs a stock git to run at all, and [`crate::stock::git`]
+    /// refuses one older than the version the port targets — a machine without a
+    /// current git cannot answer this question, so the test says so rather than
+    /// reporting a determinism failure it did not measure. Every path that
+    /// *reports a number* still refuses outright.
     #[test]
     fn shapes_build_reproducibly() {
+        if let Err(why) = crate::stock::git() {
+            eprintln!("skipping: no git to build fixtures with — {why}");
+            return;
+        }
         let root = std::env::temp_dir().join(format!("zvcs-fixture-determinism-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let home = root.join("home");

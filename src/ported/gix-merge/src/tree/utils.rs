@@ -106,11 +106,12 @@ where
     E: Into<Box<dyn std::error::Error + Send + Sync + 'static>>,
 {
     if our_id == their_id {
-        // This can happen if the merge modes are different.
-        debug_assert_ne!(
-            our_mode, their_mode,
-            "BUG: we must think anything has to be merged if the modes and the ids are the same"
-        );
+        // Both sides arrived at the same content, so there is nothing to merge and the
+        // content itself is the result. The modes may still differ — but they need not:
+        // the caller dispatches on the *kind* of change each side made, not on what it
+        // produced, so a rename on one side and a modification on the other reach here
+        // whenever the two happen to land on the same blob. That is what a cherry-pick
+        // of a commit whose change the branch already carries looks like.
         return Ok((their_id, crate::blob::Resolution::Complete));
     }
     if matches!(our_mode.kind(), EntryKind::Link) && matches!(their_mode.kind(), EntryKind::Link) {

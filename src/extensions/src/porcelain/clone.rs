@@ -19,6 +19,14 @@ use gix::remote::fetch::{Shallow, Tags};
 /// `HEAD`/remote-tracking refs are written, and — for a non-bare clone — the
 /// main worktree is checked out.
 ///
+/// A *local* source then gets git's `clone_local()` treatment: the source object store
+/// is adopted wholesale, hardlinked file by file (copied under `--no-hardlinks`, and
+/// skipped entirely under `--no-local` or with a `--filter`), replacing what the fetch
+/// packed. The clone therefore ends up with the object layout git leaves — loose
+/// objects stay loose, packs stay packs — rather than a re-packed equivalent. gitoxide
+/// has no local-clone shortcut, so the pack is still built and then discarded; the
+/// end state matches git, the work to get there does not.
+///
 /// Supported forms:
 ///   * `git clone <url>`             → clone into a directory named after the URL
 ///   * `git clone <url> <directory>` → clone into an explicit directory
@@ -111,13 +119,41 @@ use gix::remote::fetch::{Shallow, Tags};
 ///     `with_write_packed_refs_only`), where stock git leaves some of them loose.
 ///     The ref set is identical; only the loose/packed split differs.
 /// ```
+/// `git clone`'s usage block, byte-for-byte from stock git 2.55.0. Printed on
+/// stdout for `-h` and on stderr for a usage error, both exiting 129.
+const USAGE: &str = "usage: git clone [<options>] [--] <repo> [<dir>]\n\n    -v, --[no-]verbose    be more verbose\n    -q, --[no-]quiet      be more quiet\n    --[no-]progress       force progress reporting\n    --[no-]reject-shallow don't clone shallow repository\n    -n, --no-checkout     don't create a checkout\n    --checkout            opposite of --no-checkout\n    --[no-]bare           create a bare repository\n    --[no-]mirror         create a mirror repository (implies --bare)\n    -l, --[no-]local      to clone from a local repository\n    --no-hardlinks        don't use local hardlinks, always copy\n    --hardlinks           opposite of --no-hardlinks\n    -s, --[no-]shared     setup as shared repository\n    --[no-]recurse-submodules[=<pathspec>]\n                          initialize submodules in the clone\n    --[no-]recursive[=<pathspec>]\n                          alias of --recurse-submodules\n    -j, --[no-]jobs <n>   number of submodules cloned in parallel\n    --[no-]template <template-directory>\n                          directory from which templates will be used\n    --[no-]reference <repo>\n                          reference repository\n    --[no-]reference-if-able <repo>\n                          reference repository\n    --[no-]dissociate     use --reference only while cloning\n    -o, --[no-]origin <name>\n                          use <name> instead of 'origin' to track upstream\n    -b, --[no-]branch <branch>\n                          checkout <branch> instead of the remote's HEAD\n    --[no-]revision <rev> clone single revision <rev> and check out\n    -u, --[no-]upload-pack <path>\n                          path to git-upload-pack on the remote\n    --[no-]depth <depth>  create a shallow clone of that depth\n    --[no-]shallow-since <time>\n                          create a shallow clone since a specific time\n    --[no-]shallow-exclude <ref>\n                          deepen history of shallow clone, excluding ref\n    --[no-]single-branch  clone only one branch, HEAD or --branch\n    --[no-]tags           clone tags, and make later fetches not to follow them\n    --[no-]shallow-submodules\n                          any cloned submodules will be shallow\n    --[no-]separate-git-dir <gitdir>\n                          separate git dir from working tree\n    --[no-]ref-format <format>\n                          specify the reference format to use\n    -c, --[no-]config <key=value>\n                          set config inside the new repository\n    --[no-]server-option <server-specific>\n                          option to transmit\n    -4, --ipv4            use IPv4 addresses only\n    -6, --ipv6            use IPv6 addresses only\n    --[no-]filter <args>  object filtering\n    --[no-]also-filter-submodules\n                          apply partial clone filters to submodules\n    --[no-]remote-submodules\n                          any cloned submodules will use their remote-tracking branch\n    --[no-]sparse         initialize sparse-checkout file to include only files at root\n    --[no-]bundle-uri <uri>\n                          a URI for downloading bundles before fetching from origin remote\n\n";
+
+/// `die()`: the `fatal: ` prefix and exit 128, which is what every clone refusal but the
+/// usage errors exits with.
+fn fatal(msg: &str) -> ExitCode {
+    eprintln!("fatal: {msg}");
+    ExitCode::from(128)
+}
+
+/// A `parse-options` usage error: the message, a blank line, then the usage block on
+/// stderr, exit 129.
+fn usage_error(msg: &str) -> ExitCode {
+    eprintln!("fatal: {msg}\n");
+    eprint!("{USAGE}");
+    ExitCode::from(129)
+}
+
 pub fn clone(args: &[String]) -> Result<ExitCode> {
+    // `-h` is answered by `parse-options` before anything else, on stdout.
+    if args.iter().any(|a| a == "-h") {
+        print!("{USAGE}");
+        return Ok(ExitCode::from(129));
+    }
     let mut bare = false;
     let mut mirror = false;
     let mut quiet = false;
     // `Some(true)` = `--progress` forced, `Some(false)` = `--no-progress`,
     // `None` = default (progress iff stderr is a terminal), matching git.
     let mut force_progress: Option<bool> = None;
+    // `--no-local` / `--no-hardlinks`, which decide whether a local source's object
+    // store is adopted directly and whether that adoption may hardlink.
+    let mut no_local = false;
+    let mut hardlinks = true;
     let mut recurse_submodules = false;
     // The `<pathspec>` arguments of `--recurse-submodules[=<pathspec>]`, recorded
     // as `submodule.active` in the new repository the way git does.
@@ -228,11 +264,13 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
             "-v" | "--verbose" | "--no-verbose" => {}
             "--progress" => force_progress = Some(true),
             "--no-progress" => force_progress = Some(false),
-            // Local-clone optimizations: git uses these to control hardlinking /
-            // copying of objects when the source is a local path. gitoxide always
-            // copies objects over its transport, so the resulting repository is
-            // identical regardless of these flags — accept them as no-ops.
-            "-l" | "--local" | "--no-local" | "--no-hardlinks" | "--hardlinks" => {}
+            // `clone_local()`: a local source has its object store copied (hardlinked
+            // where the filesystem allows) instead of being packed and unpacked.
+            // `--no-local` forces the transport, `--no-hardlinks` copies the bytes.
+            "-l" | "--local" => no_local = false,
+            "--no-local" => no_local = true,
+            "--no-hardlinks" => hardlinks = false,
+            "--hardlinks" => hardlinks = true,
             // `-n`/`--no-checkout`: fetch refs and set `HEAD`, but do not populate
             // a worktree (leaves an empty index, exactly like git).
             "-n" | "--no-checkout" => no_checkout = true,
@@ -412,12 +450,20 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
         bail!("failed to initialize sparse-checkout: this operation must be run in a work tree");
     }
 
+    if positionals.len() > 2 {
+        return Ok(usage_error("Too many arguments."));
+    }
     let url_str = match positionals.first() {
         Some(u) => *u,
-        None => bail!("you must specify a repository to clone"),
+        None => return Ok(usage_error("You must specify a repository to clone.")),
     };
-    if positionals.len() > 2 {
-        bail!("too many arguments");
+    // `cmd_clone` resolves a local path before anything is created or announced, so a
+    // source that is not there is reported on its own.
+    if !url_str.contains("://")
+        && !url_str.contains('@')
+        && !Path::new(url_str).exists()
+    {
+        return Ok(fatal(&format!("repository '{url_str}' does not exist")));
     }
 
     // Parse the URL up front so a malformed one is reported before touching disk.
@@ -452,10 +498,9 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     // URL the way git's `guess_dir_name` does (humanish last component).
     let dir = match positionals.get(1) {
         Some(d) => (*d).to_string(),
-        None => match derive_dir_name(url_str, bare) {
-            Some(name) => name,
-            None => bail!("could not derive a directory name from {url_str:?}"),
-        },
+        // `guess_dir_name()` falls back to the argument itself, which is how
+        // `git clone .` ends up refusing `.` as a non-empty destination.
+        None => derive_dir_name(url_str, bare).unwrap_or_else(|| url_str.to_string()),
     };
     let dst = Path::new(&dir);
 
@@ -468,7 +513,9 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
             .map(|mut e| e.next().is_some())
             .unwrap_or(true)
     {
-        bail!("destination path {dir:?} already exists and is not an empty directory");
+        return Ok(fatal(&format!(
+            "destination path '{dir}' already exists and is not an empty directory."
+        )));
     }
     std::fs::create_dir_all(dst)?;
 
@@ -898,6 +945,21 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
         Some(real) => super::init::relocate_git_dir(&git_dir, dst, real)?,
         None => git_dir,
     };
+
+    // `clone_local()`: with a local source, git never runs the transport at all — it
+    // adopts the source object store, hardlinking each file where it can. Here the
+    // local fetch has already produced a pack; the pack is dropped and the source's
+    // objects are adopted in its place, so the clone ends up with the object layout git
+    // leaves behind (loose objects stay loose, packs stay packs).
+    if local_path_source && !no_local && filter.is_none() {
+        adopt_local_objects(Path::new(url_str), &git_dir, hardlinks)?;
+    }
+
+    // `write_remote_refs()` commits the remote-tracking refs through
+    // `initial_ref_transaction_commit()`, which writes no reflog at all — a fresh clone
+    // has logs for `HEAD`, the checked-out branch and `refs/remotes/<remote>/HEAD`, and
+    // nothing else. gitoxide logs every ref it writes, so the extra files are removed.
+    remove_initial_remote_reflogs(&git_dir, origin.as_deref().unwrap_or("origin"));
 
     // `init_db()` creates `refs/heads` and `refs/tags` for every repository it
     // makes, clone included (`create_default_files()`, setup.c:2073). gitoxide
@@ -1636,4 +1698,77 @@ fn derive_dir_name(url: &str, bare: bool) -> Option<String> {
     } else {
         name.to_string()
     })
+}
+
+/// `clone_local()` + `copy_or_link_directory()` (builtin/clone.c): adopt the source's
+/// object store wholesale.
+///
+/// Every file below `<source>/objects` is hardlinked into the destination — falling
+/// back to a copy when the filesystem refuses, and copying outright under
+/// `--no-hardlinks`. Whatever the local fetch left in `objects/pack` is dropped first,
+/// so the destination holds exactly what the source holds rather than a re-packed
+/// equivalent. `objects/info/alternates` is not inherited: the borrowed stores it names
+/// are the source's business, and git resolves them into the copy instead.
+fn adopt_local_objects(source: &Path, git_dir: &Path, hardlinks: bool) -> Result<()> {
+    let src_objects = match source.join(".git").is_dir() {
+        true => source.join(".git").join("objects"),
+        false => source.join("objects"),
+    };
+    if !src_objects.is_dir() {
+        return Ok(());
+    }
+    let dst_objects = git_dir.join("objects");
+
+    // The fetch's own pack is what the adoption replaces.
+    if let Ok(entries) = std::fs::read_dir(dst_objects.join("pack")) {
+        for entry in entries.flatten() {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+
+    let mut stack = vec![(src_objects.clone(), dst_objects.clone())];
+    while let Some((from, to)) = stack.pop() {
+        std::fs::create_dir_all(&to)?;
+        for entry in std::fs::read_dir(&from)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let src_path = entry.path();
+            let dst_path = to.join(&name);
+            if entry.file_type()?.is_dir() {
+                stack.push((src_path, dst_path));
+                continue;
+            }
+            if from == src_objects.join("info") && name == "alternates" {
+                continue;
+            }
+            if dst_path.exists() {
+                continue;
+            }
+            let linked = hardlinks && std::fs::hard_link(&src_path, &dst_path).is_ok();
+            if !linked {
+                std::fs::copy(&src_path, &dst_path)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Drop the per-branch reflogs under `logs/refs/remotes/<remote>/`, which
+/// `initial_ref_transaction_commit()` never creates. `HEAD` is kept: git writes that one
+/// through the ordinary ref machinery when it records where the remote points.
+fn remove_initial_remote_reflogs(git_dir: &Path, remote: &str) {
+    let dir = git_dir.join("logs").join("refs").join("remotes").join(remote);
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry.file_name() == "HEAD" {
+            continue;
+        }
+        let path = entry.path();
+        let _ = match entry.file_type().map(|t| t.is_dir()) {
+            Ok(true) => std::fs::remove_dir_all(&path),
+            _ => std::fs::remove_file(&path),
+        };
+    }
 }

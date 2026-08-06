@@ -93,6 +93,11 @@ const STAT_TERM_WIDTH: usize = 80;
 /// interpreted). Every flag not listed above is rejected explicitly.
 pub fn show(args: &[String]) -> Result<ExitCode> {
     let mut specs: Vec<&str> = Vec::new();
+    // `--stdin`: further revisions, one per line, read after the command line is
+    // scanned. The JetBrains client uses it to ask about a batch of commits.
+    let mut read_stdin = false;
+    // Owns the lines so `specs` can borrow them alongside the argument slices.
+    let stdin_text: String;
     let mut pathspecs: Vec<Vec<u8>> = Vec::new();
     let mut formats = Formats::default();
     // `-z` (`diffopt.line_termination = 0`): NUL-terminated records with raw paths.
@@ -199,6 +204,7 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
             "--name-only" => formats.name_only = true,
             "--name-status" => formats.name_status = true,
             "-z" => z = true,
+            "--stdin" => read_stdin = true,
             "--numstat" => formats.numstat = true,
             "--shortstat" => formats.shortstat = true,
             "--summary" => formats.summary = true,
@@ -471,6 +477,16 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
         // Reject unknown placeholders before any output is produced.
         check_format(fmt)?;
     }
+    stdin_text = if read_stdin {
+        use std::io::Read as _;
+        let mut s = String::new();
+        std::io::stdin().read_to_string(&mut s)?;
+        s
+    } else {
+        String::new()
+    };
+    specs.extend(stdin_text.lines().filter(|l| !l.is_empty()));
+
     if specs.is_empty() {
         specs.push("HEAD");
     }

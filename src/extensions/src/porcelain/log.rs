@@ -404,6 +404,11 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     let mut ref_globs: Vec<(usize, &'static str, Option<String>)> = Vec::new();
     /// Where `--all` stood, for the same reason.
     let mut all_at: Option<usize> = None;
+    /// `--stdin`: read further revisions (then, after a bare `--`, pathspecs) from
+    /// standard input. It is how a caller asks about a set of commits too large or
+    /// too dynamic for a command line — the JetBrains client loads every commit's
+    /// details with `log --no-walk --stdin`, feeding the hashes it wants.
+    let mut read_stdin = false;
     // `--not`: reverses the sense of every revision that follows, and toggles
     // again at the next `--not` (`handle_revision_pseudo_opt()`). It applies to
     // the arguments after it, so the flip is recorded per revision as it is read.
@@ -772,6 +777,8 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         } else if a == "--timestamp" || a == "--no-stat" {
             eprintln!("fatal: unrecognized argument: {a}");
             return Ok(ExitCode::from(128));
+        } else if a == "--stdin" {
+            read_stdin = true;
         } else if a == "--not" {
             negate_revs = !negate_revs;
         } else if a == "--no-walk" {
@@ -1094,6 +1101,28 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // the ref-naming pseudo-options can be slotted back in at the position they were
     // written at: `setup_revisions()` appends to one `pending` list as it reads the
     // command line, and a tie in commit date is broken by that order.
+    // `read_revisions_from_stdin()`: every line is another revision argument, until
+    // a bare `--` turns the rest into pathspecs. They are appended after the ones
+    // the command line named, which is where git puts them.
+    if read_stdin {
+        use std::io::Read as _;
+        let mut text = String::new();
+        std::io::stdin().read_to_string(&mut text)?;
+        let mut in_paths = false;
+        for line in text.lines() {
+            if line.is_empty() {
+                continue;
+            }
+            if in_paths {
+                pathspecs.push(line.to_string());
+            } else if line == "--" {
+                in_paths = true;
+            } else {
+                revs.push(line.to_string());
+                rev_negated.push(negate_revs);
+            }
+        }
+    }
     let mut pos_specs: Vec<(usize, String)> = Vec::new();
     let mut neg_ids: Vec<ObjectId> = Vec::new();
     // Resolve one endpoint onto the excluded side, reporting git's fatal if it is

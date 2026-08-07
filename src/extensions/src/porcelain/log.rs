@@ -431,6 +431,11 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     /// of a merge even when the merge is TREESAME to one of them, so a change that
     /// arrived on a side branch keeps both the merge and that side in the history.
     let mut full_history = false;
+    /// `--simplify-merges`: build the `--full-history` graph, then replace each
+    /// commit with its simplification (see [`simplify_merges`]). revision.c:2424
+    /// sets, in order: simplify_merges, topo_order, rewrite_parents,
+    /// simplify_history = 0, limited.
+    let mut simplify_merges_opt = false;
     let decorations_for_simplify: Option<Decorations>;
     let mut min_parents: Option<usize> = None;
     let mut max_parents: Option<usize> = None;
@@ -654,20 +659,9 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         } else if a == "--full-history" {
             full_history = true;
         } else if a == "--simplify-merges" {
-            // `simplify_one()` (revision.c) is ported below and agrees with git on
-            // a single merge, but not on nested ones: given `I -> {side, A} -> M1`
-            // and `M1, B -> M2`, git drops `M1` from `-- f.txt` and this port keeps
-            // it. Reading `remove_marked_parents()`, `M1`'s parents reduce to one
-            // and `update_treesame()` returns early for a single-parent commit, so
-            // its `TREESAME` flag stays clear and `simplify_one()`'s last condition
-            // should keep it — yet git does not. Until that is understood the
-            // answer would be a *different history* than git shows, with nothing on
-            // screen to say so, which is worse than saying it plainly here.
-            bail!(
-                "unsupported flag \"--simplify-merges\" (--full-history is ported; \
-                 the extra merge pruning is not, and a wrong commit set is worse \
-                 than none)"
-            );
+            simplify_merges_opt = true;
+            full_history = true;
+            order = Order::Topo;
         } else if a == "--simplify-by-decoration" {
             simplify_by_decoration = true;
         } else if a == "--boundary" {
@@ -1476,6 +1470,8 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         // id → (parents the simplified history follows, whether it is shown).
         let mut simplified: HashMap<ObjectId, (Vec<ObjectId>, bool)> =
             HashMap::with_capacity(nodes.len());
+        // Only `--simplify-merges` needs the per-parent detail.
+        let mut merge_simp: HashMap<ObjectId, MergeSimp> = HashMap::new();
         for node in &nodes {
             let commit = repo.find_object(node.id)?.try_into_commit()?;
             // `--first-parent` limits the comparison the same way it limits the
@@ -1489,6 +1485,12 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                 // A root commit is compared against the empty tree, so it shows
                 // exactly when it introduced a matching path.
                 let shown = changes_match(&repo, &commit, None, &mut matcher)?;
+                if simplify_merges_opt {
+                    merge_simp.insert(
+                        node.id,
+                        MergeSimp { parents: Vec::new(), treesame_with: Vec::new(), treesame: !shown },
+                    );
+                }
                 simplified.insert(node.id, (Vec::new(), shown));
                 continue;
             }
@@ -1504,10 +1506,17 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                 // pathspec. That is what keeps a merge whose side branch carried
                 // the change, and the side itself, in the history.
                 let mut any_change = false;
+                let mut treesame_with: Vec<bool> = Vec::with_capacity(parents.len());
                 for p in parents {
-                    if changes_match(&repo, &commit, Some(*p), &mut matcher)? {
-                        any_change = true;
-                    }
+                    let changed = changes_match(&repo, &commit, Some(*p), &mut matcher)?;
+                    treesame_with.push(!changed);
+                    any_change |= changed;
+                }
+                if simplify_merges_opt {
+                    merge_simp.insert(
+                        node.id,
+                        MergeSimp { parents: parents.to_vec(), treesame_with, treesame: !any_change },
+                    );
                 }
                 simplified.insert(node.id, (parents.to_vec(), any_change));
                 continue;
@@ -1536,16 +1545,36 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                 stack.extend(parents.iter().copied());
             }
         }
+        if simplify_merges_opt {
+            // `simplify_merges()` prunes `revs->commits` to the commits that
+            // simplify to themselves; the display filter is unchanged, so a
+            // TREESAME commit is still skipped. Both apply.
+            let order: Vec<ObjectId> =
+                nodes.iter().map(|n| n.id).filter(|id| reachable.contains(id)).collect();
+            let kept = simplify_merges(&repo, &order, &merge_simp, first_parent)?;
+            nodes.retain(|n| {
+                kept.contains_key(&n.id) && simplified.get(&n.id).is_some_and(|(_, shown)| *shown)
+            });
+            // The rewritten ancestry is what `%p`/`%P` report as well, not only
+            // `--parents`/`--graph`: git rewrites `commit->parents` in place, so
+            // every consumer sees the simplified list.
+            for node in &mut nodes {
+                if let Some(parents) = kept.get(&node.id) {
+                    node.parents = parents.clone();
+                }
+            }
+        } else {
             nodes.retain(|n| {
                 reachable.contains(&n.id) && simplified.get(&n.id).is_some_and(|(_, shown)| *shown)
             });
+        }
 
         // `rewrite_parents()`: the ancestry the output shows is the simplified
         // one, and a parent reachable from another parent drops out of it. Only
         // the ancestry-printing formats take it: the per-commit diff stays
         // against the real first parent, which is what `log --name-status --
         // <path>` reports. `--simplify-merges` has already written its own.
-        if (graph || show_parents) {
+        if (graph || show_parents) && !simplify_merges_opt {
             for node in &mut nodes {
                 let mut rewritten: Vec<ObjectId> = Vec::with_capacity(node.parents.len());
                 for p in &node.parents {
@@ -1555,7 +1584,14 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                         }
                     }
                 }
-                prune_redundant_parents(&repo, &mut rewritten);
+                // Dropping a parent that is reachable from another is
+                // `mark_redundant_parents()`, which belongs to
+                // `--simplify-merges`. Plain `rewrite_parents()` keeps both, so
+                // `--full-history --parents` shows the merge with the ancestry it
+                // actually had.
+                if !full_history {
+                    prune_redundant_parents(&repo, &mut rewritten);
+                }
                 node.parents = rewritten;
             }
         }
@@ -3078,6 +3114,173 @@ fn peel_to_commit(repo: &gix::Repository, id: ObjectId) -> ObjectId {
 }
 
 /// Every commit reachable from `roots` (inclusive) — the "uninteresting" set for a
+/// What `--simplify-merges` needs about one commit, from the `--full-history` pass.
+struct MergeSimp {
+    /// Parents as walked, unpruned.
+    parents: Vec<ObjectId>,
+    /// Parallel to `parents`: whether the commit is TREESAME to that one over the
+    /// pathspec — git's `revs->treesame` decoration.
+    treesame_with: Vec<bool>,
+    /// git's `TREESAME` object flag: no parent showed a change.
+    treesame: bool,
+}
+
+/// Port of `simplify_merges()` / `simplify_one()` (revision.c).
+///
+/// Each commit is replaced by its simplification: parents are rewritten to *their*
+/// simplifications, then duplicates and parents that are ancestors of other parents
+/// are dropped (as are root parents TREESAME to the empty tree), never dropping
+/// every parent the commit is TREESAME to. A commit that still has a parent, is
+/// TREESAME, and has exactly one relevant parent becomes that parent's
+/// simplification. What survives is the set of commits that simplify to themselves.
+///
+/// Dropping parents can only make a commit *more* TREESAME, so the flag is
+/// recomputed over the survivors — `relevant_parents ? !relevant_change :
+/// !irrelevant_change`, which with everything relevant is "every surviving parent
+/// is treesame". That recompute is what collapses a merge whose only remaining
+/// parent it matches: in `I -> {side, A} -> M1`, `M1`'s `side` rewrites to `I`,
+/// `I` is redundant beside `A`, and `M1` is TREESAME to the `A` that is left, so
+/// `M1` becomes `A` — which is exactly what `git log --parents` shows, rewriting
+/// the child merge's parent list from `M1` to `A`.
+fn simplify_merges(
+    repo: &gix::Repository,
+    order: &[ObjectId],
+    info: &HashMap<ObjectId, MergeSimp>,
+    first_parent: bool,
+) -> Result<HashMap<ObjectId, Vec<ObjectId>>> {
+    // Relevance is `!(flags & UNINTERESTING)`; excluded commits never enter this
+    // walk, so the walked set is exactly the relevant one.
+    let walked: HashSet<ObjectId> = order.iter().copied().collect();
+    let mut simplified: HashMap<ObjectId, ObjectId> = HashMap::with_capacity(order.len());
+    let mut rewritten: HashMap<ObjectId, Vec<ObjectId>> = HashMap::with_capacity(order.len());
+
+    // git feeds the list reversed and re-queues whatever is not ready yet.
+    let mut queue: Vec<ObjectId> = order.iter().rev().copied().collect();
+    let mut guard = 0usize;
+    while !queue.is_empty() {
+        guard += 1;
+        anyhow::ensure!(guard <= order.len() + 2, "simplify-merges did not converge");
+        let mut next: Vec<ObjectId> = Vec::new();
+        for id in std::mem::take(&mut queue) {
+            if simplified.contains_key(&id) {
+                continue;
+            }
+            let Some(me) = info.get(&id) else {
+                simplified.insert(id, id);
+                continue;
+            };
+            // A root simplifies to itself and its parents are not rewritten.
+            if me.parents.is_empty() {
+                simplified.insert(id, id);
+                continue;
+            }
+            let considered: &[ObjectId] = if first_parent { &me.parents[..1] } else { &me.parents };
+            let pending: Vec<ObjectId> = considered
+                .iter()
+                .copied()
+                .filter(|p| walked.contains(p) && !simplified.contains_key(p))
+                .collect();
+            if !pending.is_empty() {
+                next.extend(pending);
+                next.push(id);
+                continue;
+            }
+
+            // Rewrite each parent to its simplification, carrying its treesame bit.
+            let mut parents: Vec<(ObjectId, bool)> = considered
+                .iter()
+                .enumerate()
+                .map(|(i, p)| {
+                    (
+                        simplified.get(p).copied().unwrap_or(*p),
+                        me.treesame_with.get(i).copied().unwrap_or(false),
+                    )
+                })
+                .collect();
+            // `remove_duplicate_parents`.
+            let mut seen: HashSet<ObjectId> = HashSet::new();
+            parents.retain(|(p, _)| seen.insert(*p));
+
+            let mut treesame = me.treesame;
+            if parents.len() > 1 {
+                let ids: Vec<ObjectId> = parents.iter().map(|(p, _)| *p).collect();
+                // `mark_redundant_parents`: `reduce_heads()` over the parent list —
+                // a parent reachable from another adds nothing.
+                let mut marked: Vec<bool> = vec![false; parents.len()];
+                for (i, p) in ids.iter().enumerate() {
+                    let others: Vec<ObjectId> =
+                        ids.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, q)| *q).collect();
+                    if ancestor_closure(repo, &others)?.contains(p) {
+                        marked[i] = true;
+                    }
+                }
+                // `mark_treesame_root_parents`: a root parent that is TREESAME to
+                // the empty tree contributed nothing either.
+                for (i, (p, _)) in parents.iter().enumerate() {
+                    if info.get(p).is_some_and(|s| s.parents.is_empty() && s.treesame) {
+                        marked[i] = true;
+                    }
+                }
+                // `leave_one_treesame_to_parent`: never drop every parent we are
+                // TREESAME to — that is the path the default scan would follow.
+                if marked.iter().any(|m| *m) {
+                    let has_unmarked_treesame =
+                        parents.iter().zip(&marked).any(|((_, ts), m)| *ts && !*m);
+                    if !has_unmarked_treesame {
+                        if let Some(i) =
+                            parents.iter().zip(&marked).position(|((_, ts), m)| *ts && *m)
+                        {
+                            marked[i] = false;
+                        }
+                    }
+                }
+                if marked.iter().any(|m| *m) {
+                    let mut it = marked.iter();
+                    parents.retain(|_| !it.next().copied().unwrap_or(false));
+                    // `remove_marked_parents`: "Removing parents can only increase
+                    // TREESAMEness", so the flag is recomputed over the survivors.
+                    treesame = parents.iter().all(|(_, ts)| *ts);
+                }
+            }
+
+            // `one_relevant_parent`: for a single parent it is that parent, else the
+            // sole relevant one, else none.
+            let relevant = if first_parent || parents.len() == 1 {
+                parents.first().map(|(p, _)| *p)
+            } else {
+                let mut found = None;
+                let mut several = false;
+                for (p, _) in &parents {
+                    if walked.contains(p) {
+                        if found.is_some() {
+                            several = true;
+                        }
+                        found = Some(*p);
+                    }
+                }
+                if several { None } else { found }
+            };
+
+            let becomes = match relevant {
+                Some(parent) if treesame => simplified.get(&parent).copied().unwrap_or(parent),
+                _ => id,
+            };
+            rewritten.insert(id, parents.into_iter().map(|(p, _)| p).collect());
+            simplified.insert(id, becomes);
+        }
+        queue = next;
+    }
+
+    // "clean up the result, removing the simplified ones".
+    let mut out: HashMap<ObjectId, Vec<ObjectId>> = HashMap::new();
+    for id in order {
+        if simplified.get(id) == Some(id) {
+            out.insert(*id, rewritten.get(id).cloned().unwrap_or_default());
+        }
+    }
+    Ok(out)
+}
+
 /// `..` exclusion, gathered by a plain ancestor DFS.
 fn ancestor_closure(repo: &gix::Repository, roots: &[ObjectId]) -> Result<HashSet<ObjectId>> {
     let mut set: HashSet<ObjectId> = HashSet::new();
@@ -3620,8 +3823,8 @@ fn expand_format(
 't' => {
                 out.extend_from_slice(ctx.abbrev.borrow_mut().get(commit.tree_id()?).as_bytes());
             }
-            'P' => write_parents(out, commit, false, ctx.abbrev),
-            'p' => write_parents(out, commit, true, ctx.abbrev),
+            'P' => write_parents(out, false, ctx.abbrev, ctx.parents, ctx.repo),
+            'p' => write_parents(out, true, ctx.abbrev, ctx.parents, ctx.repo),
             's' => out.extend_from_slice(&subject(commit.message_raw()?)),
             'b' => out.extend_from_slice(&body(commit.message_raw()?)),
             'B' => out.extend_from_slice(commit.message_raw()?),
@@ -4566,18 +4769,25 @@ fn sanitized_subject(subj: &[u8]) -> Vec<u8> {
 }
 
 /// Space-separated parent ids, abbreviated for `%p` and full for `%P`.
+/// `%p`/`%P`: the commit's *effective* parents.
+///
+/// git rewrites `commit->parents` in place under history simplification, so these
+/// placeholders print the simplified ancestry — a merge that `--simplify-merges`
+/// replaced is named by what it became, not by itself. Reading the commit object
+/// here instead would print the real ancestry and disagree with `--parents`.
 fn write_parents(
     out: &mut Vec<u8>,
-    commit: &gix::Commit<'_>,
     abbrev: bool,
     cache: &std::cell::RefCell<AbbrevCache>,
+    parents: &[ObjectId],
+    repo: &gix::Repository,
 ) {
-    for (i, p) in commit.parent_ids().enumerate() {
+    for (i, p) in parents.iter().copied().enumerate() {
         if i > 0 {
             out.push(b' ');
         }
         let text = if abbrev {
-            cache.borrow_mut().get(p)
+            cache.borrow_mut().get(p.attach(repo))
         } else {
             p.to_string()
         };

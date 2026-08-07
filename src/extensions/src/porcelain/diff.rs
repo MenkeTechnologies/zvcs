@@ -2356,7 +2356,7 @@ pub(crate) fn commit_patch(
 ) -> Result<Vec<u8>> {
     let mut cache = repo.diff_resource_cache_for_tree_diff()?;
     let r = patch_render(repo, &PatchOpts { ctx, ..Default::default() });
-    commit_patch_with(repo, &mut cache, &r, commit.id, parent, &PatchOpts { ctx, ..Default::default() }, None)
+    commit_patch_with(repo, &mut cache, &r, commit.id, parent, &PatchOpts { ctx, ..Default::default() }, None, false)
 }
 
 /// The render settings `log -p`/`show` use for a patch body. Resolved once per
@@ -2451,6 +2451,7 @@ pub(crate) fn commit_patches(
     jobs: &[(ObjectId, Option<ObjectId>)],
     opts: &PatchOpts,
     paths: &[String],
+    follow: bool,
 ) -> Result<Vec<Vec<u8>>> {
     // Four commits per worker: below that the handle clones cost more than the
     // split saves, and a short `log -p -n 3` should not spawn anything.
@@ -2470,7 +2471,7 @@ pub(crate) fn commit_patches(
         return jobs
             .iter()
             .map(|(id, parent)| {
-                commit_patch_with(repo, &mut cache, &r, *id, *parent, opts, specs.as_mut())
+                commit_patch_with(repo, &mut cache, &r, *id, *parent, opts, specs.as_mut(), follow)
             })
             .collect();
     }
@@ -2495,7 +2496,7 @@ pub(crate) fn commit_patches(
                     let Some((id, parent)) = jobs.get(i) else { break };
                     mine.push((
                         i,
-                        commit_patch_with(&repo, &mut cache, &r, *id, *parent, opts, specs.as_mut())?,
+                        commit_patch_with(&repo, &mut cache, &r, *id, *parent, opts, specs.as_mut(), follow)?,
                     ));
                 }
                 Ok(mine)
@@ -2535,6 +2536,12 @@ fn commit_patch_with(
     parent: Option<ObjectId>,
     opts: &PatchOpts,
     specs: Option<&mut super::log::PathspecMatcher>,
+    // `--follow`: the limit names the file *at this commit*, and the rename that
+    // brought it there is the very thing to show — so the tree diff is taken whole,
+    // rename detection runs on it, and only then is the pair whose destination
+    // matches kept. Limiting the tree diff first would hide the deletion side and
+    // leave the rename rendered as an addition.
+    follow: bool,
 ) -> Result<Vec<u8>> {
     let commit = repo.find_object(commit_id)?.try_into_commit()?;
     let new_tree = commit.tree()?;
@@ -2556,8 +2563,11 @@ fn commit_patch_with(
     // deltas, so the secondary key is inert here but kept for parity with `diff()`.
     // `-- <pathspec>`: git limits the patch to the paths it was asked about, the
     // same list that decided which commits are shown.
-    if let Some(specs) = specs {
-        deltas.retain(|delta| specs.matches(&delta.path));
+    let mut follow_specs = None;
+    match specs {
+        Some(s) if follow => follow_specs = Some(s),
+        Some(s) => deltas.retain(|delta| s.matches(&delta.path)),
+        None => {}
     }
     deltas.sort_by(|a, b| a.path.cmp(&b.path).then(b.unmerged.cmp(&a.unmerged)));
 
@@ -2587,6 +2597,11 @@ fn commit_patch_with(
     if ro.detect_rename != 0 || ro.break_opt != -1 {
         run_diffcore_rename(repo, cache, &mut deltas, &ro, false)?;
         deltas.sort_by(|a, b| a.path.cmp(&b.path).then(b.unmerged.cmp(&a.unmerged)));
+    }
+    // The `--follow` limit, applied once the rename it is following exists as a
+    // pair: the destination is the name the file has at this commit.
+    if let Some(specs) = follow_specs {
+        deltas.retain(|delta| specs.matches(&delta.path));
     }
 
     let hash_kind = repo.object_hash();

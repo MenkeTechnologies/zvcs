@@ -1449,7 +1449,17 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         for node in std::mem::take(&mut nodes) {
             let commit = repo.find_object(node.id)?.try_into_commit()?;
             let parent = node.parents.first().copied();
-            let changed = changes_match(&repo, &commit, parent, &mut matcher)?;
+            // `--follow` turns pruning off entirely — "Can't prune commits with
+            // rename following: the paths change" (revision.c) — and sets
+            // `revs->diff`, so what a commit is judged by is whether it *renders a
+            // diff*. A merge renders none by default, which is why `--follow` drops
+            // a merge that the same pathspec keeps without it. `--first-parent` (or
+            // an explicit `-m`/`-c`/`--cc`) gives the merge a diff, and then it is
+            // shown like any other commit.
+            let merge_without_diff =
+                node.parents.len() > 1 && !first_parent && diff_merges == DiffMerges::Off;
+            let changed =
+                !merge_without_diff && changes_match(&repo, &commit, parent, &mut matcher)?;
             if changed {
                 let mut node = node;
                 node.follow_path = Some(current.clone());
@@ -1683,7 +1693,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                 _ => {
                     let jobs: Vec<(ObjectId, Option<ObjectId>)> =
                         kept.iter().map(|n| (n.id, n.parents.first().copied())).collect();
-                    let patches = super::diff::commit_patches(&repo, &jobs, &super::diff::PatchOpts { ctx: 0, ..patch_opts.clone() }, &pathspecs)?;
+                    let patches = super::diff::commit_patches(&repo, &jobs, &super::diff::PatchOpts { ctx: 0, ..patch_opts.clone() }, &pathspecs, false)?;
                     kept.into_iter()
                         .zip(patches)
                         .filter(|(_, patch)| {
@@ -1931,7 +1941,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // above it do. The window computes a batch of them across the thread pool
     // while the loop below stays a plain in-order stream — git computes them one
     // at a time on one core.
-    let mut patches = PatchWindow::new(emit_patch, show_root, diff_merges, patch_opts.clone());
+    let mut patches = PatchWindow::new(emit_patch, show_root, diff_merges, first_parent, patch_opts.clone());
     // Each record's text comes out of its own commit object, and reading 6000 of
     // them is the whole cost of a format like `--oneline` or `%s`. The window
     // renders a batch of records at a time across the thread pool; the loop below
@@ -2073,8 +2083,11 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         // A merge reaches the count/name formats too once a `--diff-merges` mode is
         // in force; git diffs it against its first parent for those
         // (`log -c --stat` on a merge prints the first-parent stat).
+        // `--first-parent` is the other way a merge gets a diff: git's
+        // `diff_merges_setup_revs()` reads it as "diff against the first parent",
+        // so `log --first-parent -p` renders a merge like any single-parent commit.
         else if (want_names || emit_patch)
-            && (node.parents.len() < 2 || diff_merges != DiffMerges::Off)
+            && (node.parents.len() < 2 || diff_merges != DiffMerges::Off || first_parent)
             && (show_root || !node.parents.is_empty())
         {
             let mut diff: Vec<u8> = Vec::new();
@@ -2209,6 +2222,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                         &[(node.id, node.parents.first().copied())],
                         &patch_opts,
                         &[path.to_string()],
+                        true,
                     )?
                     .pop()
                     .unwrap_or_default(),
@@ -2222,6 +2236,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                         &[(node.id, Some(parent))],
                         &patch_opts,
                         &pathspecs,
+                        false,
                     )?
                     .pop()
                     .unwrap_or_default(),
@@ -2749,6 +2764,9 @@ struct PatchWindow {
     show_root: bool,
     /// `--diff-merges=<mode>`: what a merge commit's patch shows.
     merges: DiffMerges,
+    /// `--first-parent`: git reads it as "diff a merge against its first parent",
+    /// so a merge has an ordinary patch even with no `--diff-merges` mode.
+    first_parent: bool,
     /// The diff options the patch bodies are rendered with (`-U<n>`, `-w`, …).
     patch_opts: super::diff::PatchOpts,
     /// Index of `slots[0]` within the caller's node list.
@@ -2766,9 +2784,10 @@ impl PatchWindow {
         active: bool,
         show_root: bool,
         merges: DiffMerges,
+        first_parent: bool,
         patch_opts: super::diff::PatchOpts,
     ) -> Self {
-        PatchWindow { active, show_root, merges, patch_opts, start: 0, slots: Vec::new() }
+        PatchWindow { active, show_root, merges, first_parent, patch_opts, start: 0, slots: Vec::new() }
     }
 
     /// `true` when git renders a diff for this commit at all: a merge only under a
@@ -2776,7 +2795,7 @@ impl PatchWindow {
     /// root commit's diff obeys `log.showRoot`.
     fn diffable(&self, node: &Node) -> bool {
         if node.parents.len() > 1 {
-            return self.merges != DiffMerges::Off;
+            return self.merges != DiffMerges::Off || self.first_parent;
         }
         self.show_root || !node.parents.is_empty()
     }
@@ -2811,7 +2830,7 @@ impl PatchWindow {
                 if !self.diffable(n) {
                     continue;
                 }
-                if n.parents.len() > 1 {
+                if n.parents.len() > 1 && !self.first_parent {
                     match self.merges {
                         DiffMerges::Combined | DiffMerges::DenseCombined => {
                             merged.push((
@@ -2838,7 +2857,7 @@ impl PatchWindow {
                 jobs.push((n.id, n.parents.first().copied()));
                 at.push(k);
             }
-            let computed = super::diff::commit_patches(repo, &jobs, &self.patch_opts, paths)?;
+            let computed = super::diff::commit_patches(repo, &jobs, &self.patch_opts, paths, false)?;
             self.slots = vec![Vec::new(); span.len()];
             for (slot, patch) in at.into_iter().zip(computed) {
                 self.slots[slot] = patch;

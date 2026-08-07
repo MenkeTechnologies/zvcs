@@ -1708,6 +1708,7 @@ fn show_commit(
                         &[(commit.id, parents.first().map(|p| p.detach()))],
                         &disp.patch,
                         &specs,
+                        false,
                     )?
                     .pop()
                     .unwrap_or_default(),

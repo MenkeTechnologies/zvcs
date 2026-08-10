@@ -15,9 +15,13 @@
 //! here: `checkout_entry` unlinks the old entry and `create_file` recreates it
 //! with the final mode, so the file it writes is always its own.
 //!
-//! The other user cannot be conjured up without root, so the test pins the
-//! mechanism instead - the file is replaced (new inode) rather than written
-//! through - which is what makes the owner irrelevant.
+//! The other user cannot be conjured up without root, so the tests pin the
+//! mechanism instead - which is what makes the owner irrelevant - through a
+//! hardlink to the file being checked out over. A replaced file leaves its old
+//! content behind on the link; a file written through carries the new content
+//! to both names. The inode number cannot stand in for this: ext4 hands the
+//! freed inode straight back to the next create, so the number survives the
+//! replacement it is supposed to detect.
 #![cfg(unix)]
 
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -70,6 +74,14 @@ impl Fixture {
         self.work.join(rela)
     }
 
+    /// A second name for `rela`, outside the repository so it is not itself a
+    /// checkout target, holding the worktree file as it stands now.
+    fn hardlink(&self, rela: &str) -> PathBuf {
+        let link = self.root.join(format!("{}.link", rela.replace('/', "_")));
+        std::fs::hard_link(self.path(rela), &link).unwrap();
+        link
+    }
+
     fn git(&self, args: &[&str]) {
         let out = Command::new(BIN)
             .args(args)
@@ -84,8 +96,12 @@ impl Fixture {
     }
 }
 
-fn inode(path: &Path) -> u64 {
-    std::fs::metadata(path).unwrap().ino()
+fn read(path: &Path) -> String {
+    std::fs::read_to_string(path).unwrap()
+}
+
+fn links(path: &Path) -> u64 {
+    std::fs::metadata(path).unwrap().nlink()
 }
 
 fn mode(path: &Path) -> u32 {
@@ -96,18 +112,19 @@ fn mode(path: &Path) -> u32 {
 fn an_executable_entry_replaces_the_file_it_checks_out_over() {
     let f = Fixture::new("ckexe");
     let exe = f.path("exe.sh");
-    let before = inode(&exe);
+    let link = f.hardlink("exe.sh");
 
     f.git(&["reset", "--hard", "HEAD~1"]);
 
-    assert_eq!(std::fs::read_to_string(&exe).unwrap(), "v1\n");
-    assert_ne!(
-        inode(&exe),
-        before,
-        "the executable must be unlinked and recreated, or its mode can only be reached \
-         through an fchmod that fails on a file owned by someone else"
+    assert_eq!(read(&exe), "v1\n", "the entry must be checked out");
+    assert_eq!(
+        read(&link),
+        "v2\n",
+        "the old file must be left behind, not written through: its mode can only be \
+         reached by an fchmod, which fails on a file owned by someone else"
     );
-    assert_eq!(mode(&exe) & 0o111, 0o111, "the checked out file must stay executable");
+    assert_eq!(links(&exe), 1, "the checked out file must be a fresh one");
+    assert_eq!(mode(&exe) & 0o111, 0o111, "and it must still be executable");
 }
 
 /// Only the executable path pays for the extra unlink - everything else keeps
@@ -117,10 +134,11 @@ fn an_executable_entry_replaces_the_file_it_checks_out_over() {
 fn a_plain_entry_is_still_written_in_place() {
     let f = Fixture::new("ckplain");
     let plain = f.path("plain.txt");
-    let before = inode(&plain);
+    let link = f.hardlink("plain.txt");
 
     f.git(&["reset", "--hard", "HEAD~1"]);
 
-    assert_eq!(std::fs::read_to_string(&plain).unwrap(), "v1\n");
-    assert_eq!(inode(&plain), before, "a non-executable entry needs no replacement");
+    assert_eq!(read(&plain), "v1\n", "the entry must be checked out");
+    assert_eq!(read(&link), "v1\n", "a non-executable entry needs no replacement");
+    assert_eq!(links(&plain), 2, "so the file it was written into is the same one");
 }

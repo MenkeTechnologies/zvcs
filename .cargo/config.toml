@@ -1,0 +1,19 @@
+# Cargo-run processes get a throwaway `ZVCS_HOME`, so nothing built or tested here
+# can write to the developer's real ledger at `~/.zvcs/db.sqlite`.
+#
+# zvcs self-registers the current repository in the ledger from ~19 code paths
+# (`add`, `status`, `claim`, `watch`, `queue`, `hooks`, …), and `zdaemon::zvcs_home`
+# falls back to `$HOME/.zvcs` when `ZVCS_HOME` is unset. The test suite runs the
+# real binary inside `tempfile` repositories, so every test file that forgets to set
+# `ZVCS_HOME` on its `Command` indexes a temp repo into the developer's own machine-
+# wide index — where it stays as a dead row once the tempdir is removed. A single
+# `cargo test` run could add thousands. Setting it here covers the whole workspace at
+# one point instead of relying on each of the 200+ test files to remember.
+#
+# `force` is left at its default (false), so an explicitly exported `ZVCS_HOME` (and
+# any per-invocation `Command::env("ZVCS_HOME", …)` a test sets) still wins. `relative`
+# resolves against this file's parent directory, so the path is absolute and identical
+# no matter which member crate cargo is invoked from. It lands under `target/`, which
+# is already ignored and is cleared by `cargo clean`.
+[env]
+ZVCS_HOME = { value = "target/zvcs-test-home", relative = true }

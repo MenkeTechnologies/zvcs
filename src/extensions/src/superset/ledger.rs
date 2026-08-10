@@ -94,11 +94,7 @@ pub fn zreindex(args: &[String]) -> Result<ExitCode> {
     } else {
         roots_args.iter().map(std::path::PathBuf::from).collect()
     };
-    let n = crate::crawler::crawl_into_db(&roots)?;
-    let pruned = {
-        let conn = crate::db::open_rw()?;
-        crate::db::prune_missing(&conn)?
-    };
+    let (n, pruned) = crate::crawler::crawl_into_db(&roots)?;
     println!("indexed {n} repo(s), pruned {pruned}");
     Ok(ExitCode::SUCCESS)
 }

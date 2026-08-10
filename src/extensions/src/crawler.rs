@@ -139,15 +139,21 @@ fn resolve_git_dir(dir: &Path, dotgit: &Path) -> Option<PathBuf> {
     abs.canonicalize().ok().or(Some(abs))
 }
 
-/// Crawl `roots` and upsert every discovered repo into the index.
-/// Returns the number of repos recorded.
-pub fn crawl_into_db(roots: &[PathBuf]) -> Result<usize> {
+/// Crawl `roots`, upsert every discovered repo into the index, then drop the rows
+/// whose git-dir has since vanished. Returns `(indexed, pruned)`.
+///
+/// The prune is part of the crawl, not a separate opt-in step: a repo that is
+/// deleted (or a throwaway one under `$TMPDIR`) is only ever removed by a stat
+/// sweep, so without it every crawl is monotonically additive and the index drifts
+/// into counting repos that no longer exist.
+pub fn crawl_into_db(roots: &[PathBuf]) -> Result<(usize, usize)> {
     let repos = crawl(roots);
     let conn = crate::db::open_rw()?;
     for (git_dir, workdir) in &repos {
         crate::db::upsert_repo(&conn, git_dir, Some(workdir))?;
     }
-    Ok(repos.len())
+    let pruned = crate::db::prune_missing(&conn)?;
+    Ok((repos.len(), pruned))
 }
 
 /// Spawn the daemon's autocrawl on start: an initial crawl of the configured roots
@@ -201,7 +207,7 @@ fn roots_from_config(cfg: &crate::config::ZvcsConfig) -> Vec<PathBuf> {
 /// `verb` (`indexed`/`reindexed`).
 fn spawn_crawl(roots: Vec<PathBuf>, verb: &'static str) {
     std::thread::spawn(move || match crawl_into_db(&roots) {
-        Ok(n) => log_line(&format!("[zvcs crawl] {verb} {n} repo(s)")),
+        Ok((n, pruned)) => log_line(&format!("[zvcs crawl] {verb} {n} repo(s), pruned {pruned}")),
         Err(e) => log_line(&format!("[zvcs crawl] error: {e:#}")),
     });
 }
@@ -255,7 +261,9 @@ fn recrawl_if_changed(git_dir: &Path, last_roots: &mut Option<Vec<PathBuf>>) {
     }
     *last_roots = Some(roots.clone());
     match crawl_into_db(&roots) {
-        Ok(n) => log_line(&format!("[zvcs crawl] reindexed {n} repo(s) after config change")),
+        Ok((n, pruned)) => {
+            log_line(&format!("[zvcs crawl] reindexed {n} repo(s), pruned {pruned} after config change"))
+        }
         Err(e) => log_line(&format!("[zvcs crawl] error: {e:#}")),
     }
 }

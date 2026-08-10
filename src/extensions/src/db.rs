@@ -361,8 +361,9 @@ pub fn root_mtime_advanced(conn: &Connection, git_dir: &Path, root: &Path) -> bo
     let Some(cur) = root_mtime(root) else {
         return true; // can't stat the root → don't skip, scan to be safe
     };
+    let key = repo_key(git_dir);
     let stored: Option<i64> = conn
-        .query_row("SELECT mtime FROM repos WHERE git_dir = ?1", [git_dir.to_string_lossy()], |r| r.get(0))
+        .query_row("SELECT mtime FROM repos WHERE git_dir = ?1", [key.to_string_lossy()], |r| r.get(0))
         .optional()
         .ok()
         .flatten();
@@ -371,7 +372,7 @@ pub fn root_mtime_advanced(conn: &Connection, git_dir: &Path, root: &Path) -> bo
     }
     let _ = conn.execute(
         "UPDATE repos SET mtime = ?2 WHERE git_dir = ?1",
-        rusqlite::params![git_dir.to_string_lossy(), cur],
+        rusqlite::params![key.to_string_lossy(), cur],
     );
     true
 }
@@ -402,38 +403,106 @@ pub fn open_ro() -> Result<Connection> {
     Ok(conn)
 }
 
+/// How many indexed repos justify a stat thread in [`prune_missing`]. Each check
+/// is one `stat(2)`, so a small index is cheaper to walk on the calling thread
+/// than to split; a machine-wide index is tens of thousands of stats and fans out.
+const PRUNE_STATS_PER_THREAD: usize = 256;
+
 /// Remove repos whose git-dir no longer exists on disk (deleted since indexing).
 /// Returns the number pruned. Job history is preserved but *detached* (repo_id
 /// nulled), so it can't rejoin a newly-indexed repo that reuses the rowid.
+///
+/// The existence checks fan across [`crate::threads`] workers and the deletes run
+/// in one transaction: this runs on the daemon's housekeeping timer over the whole
+/// machine-wide index, where the stats dominate and per-row commits would hold the
+/// single writer for the length of the prune.
 pub fn prune_missing(conn: &Connection) -> Result<usize> {
     let mut stmt = conn.prepare("SELECT id, git_dir FROM repos")?;
     let rows: Vec<(i64, String)> = stmt
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     drop(stmt);
-    let mut removed = 0;
-    for (id, git_dir) in rows {
-        if !std::path::Path::new(&git_dir).exists() {
-            // Clear everything keyed by this repo_id first: SQLite reuses rowids and
-            // FKs are off, so an orphaned row could otherwise silently reattach to a
-            // newly-indexed repo that reuses this id. Jobs are DETACHED (repo_id →
-            // NULL) rather than deleted — history survives, but `pending_failures`
-            // (INNER JOIN) and `list_jobs` (LEFT JOIN, NULL git_dir) can't
-            // mis-attribute a pruned repo's failure to the id's next occupant.
-            conn.execute("UPDATE jobs SET repo_id=NULL WHERE repo_id=?1", [id])?;
-            conn.execute("DELETE FROM claims WHERE repo_id=?1", [id])?;
-            conn.execute("DELETE FROM repo_status WHERE repo_id=?1", [id])?;
-            conn.execute("DELETE FROM repos WHERE id=?1", [id])?;
-            removed += 1;
-        }
+
+    let missing = missing_repo_ids(&rows);
+    if missing.is_empty() {
+        return Ok(0);
     }
-    Ok(removed)
+    let tx = conn.unchecked_transaction()?;
+    for id in &missing {
+        // Clear everything keyed by this repo_id first. Every table that references
+        // `repos(id)` must be handled or the DELETE below fails outright: rusqlite's
+        // bundled SQLite is built with `SQLITE_DEFAULT_FOREIGN_KEYS`, so the
+        // constraints are enforced. And even without them SQLite reuses rowids, so an
+        // orphan could silently reattach to a newly-indexed repo that takes this id.
+        //
+        // History is DETACHED (repo_id → NULL) rather than deleted — jobs and the
+        // event feed survive, but `pending_failures` (INNER JOIN) and `list_jobs` /
+        // `events_recent` (LEFT JOIN, NULL git_dir) can't mis-attribute a pruned
+        // repo's history to the id's next occupant. Per-repo *state* (claim, cached
+        // status) is meaningless without the repo and is deleted.
+        tx.execute("UPDATE jobs SET repo_id=NULL WHERE repo_id=?1", [id])?;
+        tx.execute("UPDATE events SET repo_id=NULL WHERE repo_id=?1", [id])?;
+        tx.execute("DELETE FROM claims WHERE repo_id=?1", [id])?;
+        tx.execute("DELETE FROM repo_status WHERE repo_id=?1", [id])?;
+        tx.execute("DELETE FROM repos WHERE id=?1", [id])?;
+    }
+    tx.commit()?;
+    Ok(missing.len())
+}
+
+/// The ids in `rows` (`(id, git_dir)`) whose git-dir is gone, statted in parallel.
+/// Pure filesystem work with no db handle involved, so it splits freely; the db
+/// stays single-writer in the caller.
+fn missing_repo_ids(rows: &[(i64, String)]) -> Vec<i64> {
+    fn gone(rows: &[(i64, String)]) -> Vec<i64> {
+        rows.iter()
+            .filter(|(_, git_dir)| {
+                let p = Path::new(git_dir);
+                // A relative row (written before `repo_key` normalized every key)
+                // resolves against whichever process runs the sweep, so it is alive
+                // in one cwd and dead in the next — never a real repo identity.
+                // Drop it; the repo's own absolute row is indexed separately.
+                !p.is_absolute() || !p.exists()
+            })
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    let workers = crate::threads::count(rows.len(), PRUNE_STATS_PER_THREAD);
+    if workers <= 1 {
+        return gone(rows);
+    }
+    let chunk = rows.len().div_ceil(workers);
+    std::thread::scope(|s| {
+        let handles: Vec<_> = rows.chunks(chunk).map(|c| s.spawn(move || gone(c))).collect();
+        handles.into_iter().flat_map(|h| h.join().unwrap_or_default()).collect()
+    })
+}
+
+/// The index key for a repo path: absolute and symlink-resolved when it exists,
+/// else absolutized against the cwd. Every `WHERE git_dir = ?` site keys through
+/// this, so one repo can never occupy two rows under two spellings of its path
+/// (`./.git` vs `/abs/repo/.git`, `/tmp` vs macOS's `/private/tmp`) — a relative
+/// row is also unprunable, since [`prune_missing`]'s existence check would resolve
+/// it against the daemon's cwd rather than the caller's.
+fn repo_key(p: &Path) -> PathBuf {
+    if let Ok(c) = p.canonicalize() {
+        return c;
+    }
+    if p.is_absolute() {
+        return p.to_path_buf();
+    }
+    match std::env::current_dir() {
+        Ok(cwd) => cwd.join(p),
+        Err(_) => p.to_path_buf(),
+    }
 }
 
 /// Insert or refresh a repo row, returning its id.
 pub fn upsert_repo(conn: &Connection, git_dir: &Path, workdir: Option<&Path>) -> Result<i64> {
-    let gd = git_dir.to_string_lossy();
-    let wd = workdir.map(|p| p.to_string_lossy().into_owned());
+    let key = repo_key(git_dir);
+    let gd = key.to_string_lossy();
+    let wd = workdir.map(|p| repo_key(p).to_string_lossy().into_owned());
     let ts = now();
     conn.execute(
         "INSERT INTO repos (git_dir, workdir, discovered_at, last_seen)
@@ -454,7 +523,7 @@ pub fn upsert_repo(conn: &Connection, git_dir: &Path, workdir: Option<&Path>) ->
 pub fn remove_repo(conn: &Connection, git_dir: &Path) -> Result<usize> {
     Ok(conn.execute(
         "DELETE FROM repos WHERE git_dir = ?1",
-        [git_dir.to_string_lossy()],
+        [repo_key(git_dir).to_string_lossy()],
     )?)
 }
 
@@ -465,7 +534,7 @@ pub fn set_repo_hook(conn: &Connection, git_dir: &Path, workdir: Option<&Path>, 
     upsert_repo(conn, git_dir, workdir)?;
     conn.execute(
         "UPDATE repos SET hook = ?2 WHERE git_dir = ?1",
-        rusqlite::params![git_dir.to_string_lossy(), hook],
+        rusqlite::params![repo_key(git_dir).to_string_lossy(), hook],
     )?;
     Ok(())
 }
@@ -1092,7 +1161,7 @@ pub fn mark_notified(conn: &Connection, ids: &[i64]) -> Result<()> {
 pub fn set_pin(conn: &Connection, git_dir: &Path, pinned: bool) -> Result<()> {
     conn.execute(
         "UPDATE repos SET pinned=?2 WHERE git_dir=?1",
-        rusqlite::params![git_dir.to_string_lossy(), pinned as i64],
+        rusqlite::params![repo_key(git_dir).to_string_lossy(), pinned as i64],
     )?;
     Ok(())
 }
@@ -1101,7 +1170,7 @@ pub fn set_pin(conn: &Connection, git_dir: &Path, pinned: bool) -> Result<()> {
 pub fn is_pinned(conn: &Connection, git_dir: &Path) -> bool {
     conn.query_row(
         "SELECT COALESCE(pinned,0) FROM repos WHERE git_dir=?1",
-        [git_dir.to_string_lossy()],
+        [repo_key(git_dir).to_string_lossy()],
         |r| r.get::<_, i64>(0),
     )
     .map(|v| v != 0)
@@ -1379,7 +1448,7 @@ mod snapshot_atomic_tests {
     use super::{
         add_subscription, claim, events_recent, events_since, insert_job, is_pinned, job_finished,
         list_claims, list_pins, list_subscriptions, load_snapshot, mark_read, post_message,
-        prune_stale_jobs, prune_stale_messages, record_event, remove_subscription,
+        prune_missing, prune_stale_jobs, prune_stale_messages, record_event, remove_subscription,
         root_mtime_advanced, save_snapshot,
         set_pin, transfer_claim, unread_messages, upsert_repo, upsert_status, EV_COMMIT_SQL, SCHEMA,
     };
@@ -1423,6 +1492,116 @@ mod snapshot_atomic_tests {
         let after = load_snapshot(&conn, "snap").unwrap();
         assert_eq!(after.len(), 3, "failed save must not destroy the prior snapshot (got {})", after.len());
         assert!(after.iter().any(|(g, _, _)| g == "g1"), "original entries must survive");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The whole point of the sweep: an index that only ever grows reports a repo
+    /// count made of paths that no longer exist (a `cargo test` run alone can leave
+    /// thousands of dead `$TMPDIR` rows). Uses enough rows to cross
+    /// `PRUNE_STATS_PER_THREAD`, so the threaded stat fan-out is what is measured,
+    /// not just the sequential fallback.
+    #[test]
+    fn prune_missing_drops_only_the_repos_that_are_gone() {
+        // Distinct from `zvcs-prune-*` (the job-ledger prune test): tests in a crate
+        // share a pid, so a shared temp-dir name means one test's `remove_dir_all`
+        // pulls the other's db file out from under an open connection.
+        let dir = std::env::temp_dir().join(format!("zvcs-repoprune-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let conn = Connection::open(dir.join("t.sqlite")).unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+
+        // 600 indexed repos: the even ones will be deleted from disk, the odd ones stay.
+        const N: usize = 600;
+        let mut doomed_id = 0i64;
+        for i in 0..N {
+            let root = dir.join(format!("r{i}"));
+            let gd = root.join(".git");
+            std::fs::create_dir_all(&gd).unwrap();
+            let id = upsert_repo(&conn, &gd, Some(&root)).unwrap();
+            if i == 0 {
+                doomed_id = id;
+            }
+        }
+        // A job, an event, a claim and a status row hanging off the repo that is about
+        // to vanish — one row in every table that references `repos(id)`, so a table
+        // added later and forgotten here fails the DELETE on its foreign key.
+        let job = insert_job(&conn, Some(doomed_id), "zcommit", "{}", None).unwrap();
+        record_event(&conn, "reconcile", Some(doomed_id), None, None, None).unwrap();
+        claim(&conn, doomed_id, "sess", Some("w")).unwrap();
+        upsert_status(&conn, doomed_id, false, false, "ok", "main", "deadbeef").unwrap();
+
+        // A legacy relative row (pre-`repo_key`): unresolvable, so it must go too even
+        // though `./.git` happens to exist relative to whoever runs the sweep.
+        conn.execute(
+            "INSERT INTO repos (git_dir, workdir, discovered_at, last_seen) VALUES ('./.git','.',0,0)",
+            [],
+        )
+        .unwrap();
+
+        for i in (0..N).step_by(2) {
+            std::fs::remove_dir_all(dir.join(format!("r{i}"))).unwrap();
+        }
+
+        assert_eq!(prune_missing(&conn).unwrap(), N / 2 + 1, "every deleted repo must be pruned");
+        let left: i64 = conn.query_row("SELECT count(*) FROM repos", [], |r| r.get(0)).unwrap();
+        assert_eq!(left as usize, N / 2, "repos still on disk must survive the sweep");
+        // A second sweep with nothing deleted since is a no-op — the count is stable,
+        // not monotonically shrinking.
+        assert_eq!(prune_missing(&conn).unwrap(), 0, "a clean index must prune nothing");
+
+        // History survives but is detached; per-repo state keyed on the dead id is gone,
+        // so a future repo that reuses the rowid can't inherit it.
+        let repo_id: Option<i64> =
+            conn.query_row("SELECT repo_id FROM jobs WHERE id=?1", [job], |r| r.get(0)).unwrap();
+        assert!(repo_id.is_none(), "pruned repo's job must be detached, not deleted");
+        let orphan_events: i64 = conn
+            .query_row("SELECT count(*) FROM events WHERE repo_id=?1", [doomed_id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(orphan_events, 0, "pruned repo's events must be detached");
+        let events: i64 = conn.query_row("SELECT count(*) FROM events", [], |r| r.get(0)).unwrap();
+        assert!(events > 0, "detached events must survive the prune, not be deleted");
+        let claims: i64 = conn
+            .query_row("SELECT count(*) FROM claims WHERE repo_id=?1", [doomed_id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(claims, 0, "the dead repo's claim must be cleared");
+        let status: i64 = conn
+            .query_row("SELECT count(*) FROM repo_status WHERE repo_id=?1", [doomed_id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(status, 0, "the dead repo's cached status must be cleared");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two spellings of one repo's path must be one row. Without the key
+    /// normalization the same repo is indexed twice (and a relative row can never
+    /// be pruned, since the existence check would resolve it against whichever
+    /// process happens to run the sweep).
+    #[test]
+    fn upsert_repo_keys_one_repo_to_one_row() {
+        let dir = std::env::temp_dir().join(format!("zvcs-repokey-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let conn = Connection::open(dir.join("t.sqlite")).unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+
+        let root = dir.join("repo");
+        let gd = root.join(".git");
+        std::fs::create_dir_all(&gd).unwrap();
+        let link = dir.join("link");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&root, &link).unwrap();
+
+        let direct = upsert_repo(&conn, &gd, Some(&root)).unwrap();
+        let via_link = upsert_repo(&conn, &link.join(".git"), Some(&link)).unwrap();
+        assert_eq!(direct, via_link, "a symlinked path must resolve to the same repo row");
+        let rows: i64 = conn.query_row("SELECT count(*) FROM repos", [], |r| r.get(0)).unwrap();
+        assert_eq!(rows, 1, "one repo must never occupy two rows");
+
+        let stored: String =
+            conn.query_row("SELECT git_dir FROM repos", [], |r| r.get(0)).unwrap();
+        assert!(Path::new(&stored).is_absolute(), "the stored key must be absolute, got {stored}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

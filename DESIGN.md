@@ -345,7 +345,15 @@ jobs(
   **crawler** (whole-device `.git` discovery via `ignore`, permission-denied
   paths logged and skipped) plus the meta repo's own submodule walk. This is the
   "index all git repos on the storage device" capability. `git zreindex [path]`
-  forces a rescan.
+  forces a rescan. Rows are keyed on the **absolute, symlink-resolved** git dir, so
+  one repo can never occupy two rows under two spellings of its path. Discovery is
+  additive, so it is paired with a **prune**: every crawl, plus a daemon sweep at
+  startup and on the hourly housekeeping timer, stats each indexed git dir and drops
+  the ones that are gone (deleted repos, throwaway `$TMPDIR` checkouts). Job and
+  event history is detached (`repo_id` → NULL) rather than deleted, so it survives
+  without re-attaching to whichever repo later reuses the rowid. Without the sweep
+  the index only grows, and the repo count degrades into a count of paths that no
+  longer exist.
 - **`jobs`** is the ledger of every async job (§7) and the record behind
   notify-on-next-command (§5.4).
 

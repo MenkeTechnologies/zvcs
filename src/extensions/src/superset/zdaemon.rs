@@ -535,15 +535,37 @@ fn start() -> Result<ExitCode> {
 
     // Ledger housekeeping: terminal jobs older than the retention window are pruned
     // on a slow timer so the jobs table stays bounded across millions of commands.
-    thread::spawn(|| loop {
-        thread::sleep(Duration::from_secs(JOB_PRUNE_INTERVAL_SECS));
+    // The repo index is swept on the same timer — repos are deleted, moved and
+    // (for throwaway `$TMPDIR` checkouts) discarded without anything telling the
+    // daemon, so absent this sweep the index only ever grows and `zdashboard`
+    // reports a repo count made mostly of paths that no longer exist. The sweep is
+    // parallel inside `prune_missing` (see its stat fan-out), so a machine-wide
+    // index costs one short burst per hour rather than a serial stat walk.
+    thread::spawn(|| {
+        // Sweep the index once at startup rather than only after the first interval:
+        // a machine that has been rebooted (or has just had its `$TMPDIR` cleared)
+        // has stale rows the moment the daemon comes up, and the dashboard is read
+        // long before the first hourly tick.
         if let Ok(conn) = crate::db::open_rw() {
-            match crate::db::prune_stale_jobs(&conn, JOB_RETENTION_SECS) {
-                Ok(n) if n > 0 => log_line(&format!("[zvcs job] pruned {n} stale job(s)")),
+            match crate::db::prune_missing(&conn) {
+                Ok(n) if n > 0 => log_line(&format!("[zvcs crawl] pruned {n} deleted repo(s)")),
                 _ => {}
             }
-            let _ = crate::db::prune_stale_events(&conn, JOB_RETENTION_SECS);
-            let _ = crate::db::prune_stale_messages(&conn, JOB_RETENTION_SECS);
+        }
+        loop {
+            thread::sleep(Duration::from_secs(JOB_PRUNE_INTERVAL_SECS));
+            if let Ok(conn) = crate::db::open_rw() {
+                match crate::db::prune_stale_jobs(&conn, JOB_RETENTION_SECS) {
+                    Ok(n) if n > 0 => log_line(&format!("[zvcs job] pruned {n} stale job(s)")),
+                    _ => {}
+                }
+                let _ = crate::db::prune_stale_events(&conn, JOB_RETENTION_SECS);
+                let _ = crate::db::prune_stale_messages(&conn, JOB_RETENTION_SECS);
+                match crate::db::prune_missing(&conn) {
+                    Ok(n) if n > 0 => log_line(&format!("[zvcs crawl] pruned {n} deleted repo(s)")),
+                    _ => {}
+                }
+            }
         }
     });
 

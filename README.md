@@ -249,7 +249,10 @@ volumes, and the macOS data-volume firmlink reflection. At a terminal it runs
 **async** by default — the crawl detaches to the background (results → `zvcs.log`,
 follow with `git zdaemon log -f`) and the prompt returns immediately; piped or
 scripted it runs **inline** so `indexed N, pruned M` stays on stdout. `--sync`
-and `--async` override the default.
+and `--async` override the default. Pruning is not something you have to remember
+to run: every crawl ends with it, and the daemon sweeps the whole index at startup
+and hourly, so repos deleted (or thrown away with a temp directory) leave the index
+on their own rather than inflating the count `zrepos` and `zdashboard` report.
 
 **Async queue.** `git zcommit <paths> -m <msg> [--push]` and `git zpush` submit
 fire-and-forget jobs to the daemon (with a network-free / live `ls-refs` push

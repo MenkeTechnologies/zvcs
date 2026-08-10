@@ -274,14 +274,24 @@ pub(crate) fn open_file(
     let mut options = open_options(path, destination_is_initially_empty, overwrite_existing);
     let needs_executable_bit = fs_supports_executable_bit && entry_mode == gix_index::entry::Mode::FILE_EXECUTABLE;
     #[cfg(unix)]
-    let set_executable_after_creation = if needs_executable_bit && destination_is_initially_empty {
-        use std::os::unix::fs::OpenOptionsExt;
-        // Note that these only work if the file was newly created, but won't if it's already
-        // existing, possibly without the executable bit set. Thus we do this only if the file is new.
-        options.mode(0o777);
+    let set_executable_after_creation = if !needs_executable_bit {
         false
     } else {
-        needs_executable_bit
+        use std::os::unix::fs::OpenOptionsExt;
+        // A mode passed to `open` only applies to a file it creates, so an already existing one
+        // would have to be `fchmod`ed afterwards - and that fails with EPERM for anyone but its
+        // owner, even where the directory permits replacing the file. A Homebrew prefix shared
+        // between two accounts hits exactly that on every `reset --hard`.
+        // git does not chmod here either: `checkout_entry` unlinks the old entry and `create_file`
+        // recreates it with the final mode, so the file it writes always belongs to it. Unlink for
+        // the same reason, and keep the chmod only for when that is impossible (a read-only
+        // directory), where it still succeeds on a file we do own.
+        let replaced_existing = !destination_is_initially_empty
+            && std::fs::symlink_metadata(path)
+                .and_then(|meta| try_unlink_path_recursively(path, &meta))
+                .is_ok();
+        options.mode(0o777);
+        !destination_is_initially_empty && !replaced_existing
     };
     //  not supported on windows
     #[cfg(windows)]

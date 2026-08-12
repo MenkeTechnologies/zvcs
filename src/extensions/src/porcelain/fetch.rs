@@ -2375,11 +2375,16 @@ fn update_checked_out_ref(
             None
         });
     }
-    // A fast-forward is an update whose old value is an ancestor of the new one.
-    let fast_forward = repo
-        .merge_base(old_id, new_id)
-        .map(|base| base.detach() == old_id)
-        .unwrap_or(false);
+    // A fast-forward is an update whose old value is an ancestor of the new one —
+    // except that `--no-show-forced-updates` skips the check outright and treats
+    // every update as one (`fast_forward = 1`, fetch.c:1046-1056). That is not
+    // only a reporting shortcut: it decides which of git's three branches runs,
+    // so it governs the rejection and the reflog message as well as the summary.
+    let fast_forward = !opts.show_forced_updates
+        || repo
+            .merge_base(old_id, new_id)
+            .map(|base| base.detach() == old_id)
+            .unwrap_or(false);
     if !fast_forward && !allow_non_fast_forward {
         return Ok(Some((
             '!',
@@ -2388,17 +2393,29 @@ fn update_checked_out_ref(
         )));
     }
     if !opts.dry_run {
+        // `s_update_ref()` (fetch.c:641-655) composes every fetch reflog entry as
+        // `<reflog action>: <what>`, where the action is `GIT_REFLOG_ACTION` or
+        // the command line git rebuilt for itself, and `<what>` is the verdict
+        // this branch reached — `fast-forward` or `forced-update`.
+        let action = if fast_forward {
+            "fast-forward"
+        } else {
+            "forced-update"
+        };
         repo.edit_reference(RefEdit {
             change: Change::Update {
                 log: LogChange {
                     mode: RefLog::AndReference,
                     force_create_reflog: false,
-                    message: format!("fetch: {}..{}", old_id.to_hex(), new_id.to_hex()).into(),
+                    message: format!("{}: {action}", opts.reflog_action).into(),
                 },
                 expected: PreviousValue::MustExistAndMatch(Target::Object(old_id)),
                 new: Target::Object(new_id),
             },
             name: name.clone(),
+            // Deliberately not a deref: the destination is a branch, and the
+            // matching `logs/HEAD` entry is the ref store's `split_head_update()`
+            // to write, not this caller's.
             deref: false,
         })?;
     }
@@ -2410,7 +2427,7 @@ fn update_checked_out_ref(
             new_id.to_hex_with_len(abbrev)
         )
     };
-    Ok(Some(if fast_forward || !opts.show_forced_updates {
+    Ok(Some(if fast_forward {
         (' ', range(".."), "")
     } else {
         ('+', range("..."), "  (forced update)")

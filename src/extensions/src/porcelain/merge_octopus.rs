@@ -180,6 +180,10 @@ pub fn merge_octopus(args: &[String]) -> Result<ExitCode> {
     let mut octopus_failure = false;
     let mut cur_index = repo.index_or_load_from_head()?.into_owned();
     let should_interrupt = AtomicBool::new(false);
+    // `pretty_name` is a plain shell variable that outlives one iteration of the
+    // loop below, and a head whose spelling is not a shell name leaves it at the
+    // previous iteration's value — see [`pretty_name`]. It starts out unset.
+    let mut pretty = String::new();
 
     for sha1 in &parsed.remotes {
         // `case "$OCTOPUS_FAILURE" in 1)` — a prior head left an unresolved
@@ -190,7 +194,7 @@ pub fn merge_octopus(args: &[String]) -> Result<ExitCode> {
             return Ok(ExitCode::from(2));
         }
 
-        let pretty = pretty_name(sha1);
+        pretty = pretty_name(sha1, &pretty);
 
         // `common=$(git merge-base --all $SHA1 $MRC) || die ...`
         let sha1_commit = commit_reference(&repo, sha1);
@@ -322,11 +326,27 @@ pub fn merge_octopus(args: &[String]) -> Result<ExitCode> {
 
 /// `eval pretty_name=\${GITHEAD_$SHA1:-$SHA1}`, then the uppercased retry.
 /// `${x:-y}` treats an empty value as unset, hence the `filter`.
-fn pretty_name(sha1: &str) -> String {
+///
+/// `previous` is the value `pretty_name` still holds from the previous loop
+/// iteration. It matters because `$SHA1` is interpolated into a *parameter
+/// name*: when the head is spelled as something that is not a shell name — a
+/// tag such as `v0.1.0`, say, which `git merge` passes through verbatim — the
+/// expansion is a "bad substitution", the whole `eval` fails without assigning,
+/// and the loop goes on to print the *stale* `pretty_name`. Both `eval`s share
+/// that fate, since uppercasing cannot rescue an invalid name.
+fn pretty_name(sha1: &str, previous: &str) -> String {
+    // `GITHEAD_$SHA1` is a valid parameter name only while `$SHA1` keeps the
+    // expansion inside the shell's portable-name character set; the `GITHEAD_`
+    // prefix already satisfies the leading-non-digit rule.
+    if !sha1.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+        return previous.to_string();
+    }
     let lookup = |key: String| std::env::var(key).ok().filter(|v| !v.is_empty());
     if let Some(name) = lookup(format!("GITHEAD_{sha1}")) {
         return name;
     }
+    // `test "$SHA1" = "$pretty_name"` holds: the `:-` fallback just assigned
+    // `$SHA1`. The retry's own `:-` default is that same value.
     let upper: String = sha1
         .chars()
         .map(|c| if c.is_ascii_lowercase() { c.to_ascii_uppercase() } else { c })
@@ -504,6 +524,22 @@ mod tests {
     #[test]
     fn pretty_name_falls_back_to_the_id() {
         let id = "0123456789abcdef0123456789abcdef01234567";
-        assert_eq!(pretty_name(id), id);
+        assert_eq!(pretty_name(id, "stale"), id);
+    }
+
+    /// A head spelled as anything outside the shell's parameter-name character
+    /// set makes `${GITHEAD_$SHA1:-$SHA1}` a "bad substitution": the `eval`
+    /// aborts before assigning, so the script goes on to print whatever the
+    /// previous iteration left in `pretty_name` rather than the head itself.
+    /// `git merge octopus main feature v0.1.0` is exactly this — the tag's dots
+    /// make stock git announce "Trying simple merge with feature".
+    #[test]
+    fn pretty_name_keeps_the_previous_value_for_a_non_shell_name() {
+        assert_eq!(pretty_name("v0.1.0", "feature"), "feature");
+        assert_eq!(pretty_name("refs/tags/v1", "feature"), "feature");
+        // Unset at the top of the loop, so the very first head yields nothing.
+        assert_eq!(pretty_name("v0.1.0", ""), "");
+        // An underscore is a name character, so this one substitutes normally.
+        assert_eq!(pretty_name("my_head", "feature"), "my_head");
     }
 }

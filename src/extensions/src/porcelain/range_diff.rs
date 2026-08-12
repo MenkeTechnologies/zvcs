@@ -159,6 +159,8 @@ use gix::hash::ObjectId;
 use gix::object::tree::diff::ChangeDetached;
 use gix::prelude::ObjectIdExt;
 
+use super::diff_color;
+
 /// `RANGE_DIFF_CREATION_FACTOR_DEFAULT`.
 const CREATION_FACTOR_DEFAULT: i64 = 60;
 /// `COST_MAX` from `linear-assignment.h`, the cost cap that prevents overflow.
@@ -261,10 +263,166 @@ const LONG_TAKES_VALUE: &[&str] = &[
     "--ws-error-highlight",
 ];
 
+/// Every long option `git range-diff` accepts: its own eight plus everything
+/// `add_diff_options()` contributes. `parse_options()` resolves an argument against
+/// this table before any revision is looked at, so a name that is missing from it
+/// is `error: unknown option` and 129 no matter what the rest of the command line
+/// says — which is why an unrecognised option cannot be deferred like an
+/// unimplemented one. Transcribed from `git range-diff -h` (git 2.55.0), including
+/// the negations `parse_options()` generates but the usage table leaves implicit.
+const KNOWN_LONG: &[&str] = &[
+    "--abbrev",
+    "--anchored",
+    "--binary",
+    "--break-rewrites",
+    "--check",
+    "--color",
+    "--color-moved",
+    "--color-moved-ws",
+    "--color-words",
+    "--compact-summary",
+    "--creation-factor",
+    "--cumulative",
+    "--default-prefix",
+    "--diff-algorithm",
+    "--diff-filter",
+    "--diff-merges",
+    "--dirstat",
+    "--dirstat-by-file",
+    "--dst-prefix",
+    "--dual-color",
+    "--exit-code",
+    "--ext-diff",
+    "--find-copies",
+    "--find-copies-harder",
+    "--find-object",
+    "--find-renames",
+    "--follow",
+    "--full-index",
+    "--function-context",
+    "--histogram",
+    "--ignore-all-space",
+    "--ignore-blank-lines",
+    "--ignore-cr-at-eol",
+    "--ignore-matching-lines",
+    "--ignore-space-at-eol",
+    "--ignore-space-change",
+    "--ignore-submodules",
+    "--indent-heuristic",
+    "--inter-hunk-context",
+    "--irreversible-delete",
+    "--ita-invisible-in-index",
+    "--ita-visible-in-index",
+    "--left-only",
+    "--line-prefix",
+    "--max-depth",
+    "--max-memory",
+    "--minimal",
+    "--name-only",
+    "--name-status",
+    "--no-abbrev",
+    "--no-color",
+    "--no-color-moved",
+    "--no-color-moved-ws",
+    "--no-compact-summary",
+    "--no-creation-factor",
+    "--no-diff-merges",
+    "--no-dual-color",
+    "--no-exit-code",
+    "--no-ext-diff",
+    "--no-find-copies",
+    "--no-find-copies-harder",
+    "--no-follow",
+    "--no-full-index",
+    "--no-function-context",
+    "--no-ignore-matching-lines",
+    "--no-indent-heuristic",
+    "--no-left-only",
+    "--no-max-memory",
+    "--no-notes",
+    "--no-patch",
+    "--no-prefix",
+    "--no-quiet",
+    "--no-relative",
+    "--no-remerge-diff",
+    "--no-rename-empty",
+    "--no-renames",
+    "--no-right-only",
+    "--no-text",
+    "--no-textconv",
+    "--notes",
+    "--numstat",
+    "--output",
+    "--output-indicator-context",
+    "--output-indicator-new",
+    "--output-indicator-old",
+    "--patch",
+    "--patch-with-raw",
+    "--patch-with-stat",
+    "--patience",
+    "--pickaxe-all",
+    "--pickaxe-regex",
+    "--quiet",
+    "--raw",
+    "--relative",
+    "--remerge-diff",
+    "--rename-empty",
+    "--right-only",
+    "--rotate-to",
+    "--shortstat",
+    "--skip-to",
+    "--src-prefix",
+    "--stat",
+    "--stat-count",
+    "--stat-graph-width",
+    "--stat-name-width",
+    "--stat-width",
+    "--submodule",
+    "--summary",
+    "--text",
+    "--textconv",
+    "--unified",
+    "--word-diff",
+    "--word-diff-regex",
+    "--ws-error-highlight",
+];
+
+/// Every short option the same table accepts, `-h` aside (answered before this).
+const KNOWN_SHORT: &[u8] = b"aBbCDGIlMOpRSsUuWwXz";
+
 /// Short options whose value is a separate argv element. The remaining short
 /// options either take no value (`-p`, `-R`, `-w`, …) or attach it (`-U1`,
 /// `-M50`, …), so neither consumes the next element.
 const SHORT_TAKES_VALUE: &[&str] = &["-G", "-I", "-O", "-S", "-l"];
+
+/// Whether `parse_options()` would resolve `name` against the range-diff option table.
+///
+/// `name` has already had any `=<value>` split off. A short option carries its value
+/// attached, so only its first letter is looked up.
+fn is_known_option(name: &str) -> bool {
+    match name.strip_prefix("--") {
+        Some(_) => KNOWN_LONG.contains(&name),
+        // `-` alone never reaches here; the parse loop treats it as an operand.
+        None => name
+            .as_bytes()
+            .get(1)
+            .is_some_and(|c| KNOWN_SHORT.contains(c)),
+    }
+}
+
+/// git's unknown-option convention: the complaint, then the usage block, exit 129.
+///
+/// `arg` is the whole argument as typed. A long option is quoted in full, `=<value>`
+/// and all (`--bogus=1` reports ``unknown option `bogus=1'``); a short one is reported
+/// by its letter alone, since the rest of the argument is that option's value.
+fn unknown_option(arg: &str) -> ExitCode {
+    match arg.strip_prefix("--") {
+        Some(rest) => eprintln!("error: unknown option `{rest}'"),
+        None => eprintln!("error: unknown switch `{}'", &arg[1..2]),
+    }
+    eprint!("{USAGE}");
+    ExitCode::from(129)
+}
 
 /// How the abbreviated commit id in every pair header is computed.
 enum Abbrev {
@@ -294,6 +452,10 @@ struct Opts {
     /// The first option this port recognises as real but does not implement,
     /// held until the run is about to produce output. See the module docs.
     deferred: Option<String>,
+    /// `diff_get_color_opt()`'s palette for the pair header, empty strings when
+    /// `diffopt.use_color` is off — which is the default, since output is not a
+    /// terminal. `--dual-color` and `--color=always` turn it on.
+    colors: diff_color::DiffColors,
 }
 
 impl Opts {
@@ -315,7 +477,14 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
         no_patch: false,
         abbrev: Abbrev::Default,
         deferred: None,
+        colors: diff_color::DiffColors::disabled(),
     };
+    // `simple_color` is upstream's tri-state: -1 until `--dual-color` sets it to 0 or
+    // `--no-dual-color` sets it to 1 (builtin/range-diff.c:49). Only the 0 case forces
+    // color, and it does so after `diff_setup_done()` — which is why `--dual-color
+    // --no-color` still comes out colored.
+    let mut simple_color: i8 = -1;
+    let mut color_when: Option<diff_color::ColorWhen> = None;
     // `args` excludes the `range-diff` verb: `dispatch::run` takes the
     // subcommand separately, so option parsing starts at index 0. Positionals
     // are collected in order into `pos`, and the `--` end-of-options marker is
@@ -360,10 +529,27 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
             "--no-left-only" => opts.left_only = false,
             "--right-only" => opts.right_only = true,
             "--no-right-only" => opts.right_only = false,
-            // Without color the dual and simple renderings are the same bytes,
-            // and `auto` resolves to off because output is not a terminal.
-            "--no-dual-color" | "--no-color" => {}
-            "--color" if matches!(inline, Some("never") | Some("auto")) => {}
+            // `OPT_BOOL(0, "no-dual-color", &simple_color, …)`: the spelled option sets
+            // it, and the negation `parse_options()` derives clears it.
+            "--no-dual-color" => simple_color = 1,
+            "--dual-color" => simple_color = 0,
+            "--no-color" => color_when = Some(diff_color::ColorWhen::Never),
+            "--color" => {
+                // A bare `--color` is `always`; a value is parsed as `git_config_colorbool`
+                // reads it, and an unrecognised one is a usage error at 129.
+                let when = match inline {
+                    None => diff_color::ColorWhen::Always,
+                    Some(v) => match diff_color::parse_color_when(v) {
+                        Some(w) => w,
+                        None => {
+                            return Ok(option_error(&format!(
+                                "option `color' expects \"always\", \"auto\", or \"never\""
+                            )))
+                        }
+                    },
+                };
+                color_when = Some(when);
+            }
             // Patch output is what this port emits; `-p`/`-u` ask for it.
             "-p" | "-u" | "--patch" => {}
             "--no-notes" => opts.notes = false,
@@ -515,6 +701,10 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
                     }
                 }
             }
+            // A name `parse_options()` has never heard of loses immediately — it never
+            // reaches the revision arguments, so unlike an unimplemented option there is
+            // nothing to defer it behind.
+            _ if !is_known_option(name) => return Ok(unknown_option(a)),
             _ => {
                 opts.defer(unsupported_flag(a));
                 if inline.is_none()
@@ -542,6 +732,20 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
     }
 
     let repo = gix::discover(".")?;
+
+    // builtin/range-diff.c:89 — "force color when --dual-color was used", applied after
+    // `diff_setup_done()` so it overrides `--no-color` and the `color.diff`/`color.ui`
+    // config alike. Without it the palette is the ordinary `git_diff_ui_config()` one,
+    // which resolves to off whenever stdout is not a terminal.
+    let want_color = simple_color == 0 || diff_color::resolve_color(&repo, color_when);
+    opts.colors = diff_color::DiffColors::resolve(&repo, want_color);
+    // The pair headers are colored below, but the diff-of-diffs body carries the
+    // dual-color markup (`contextDimmed`/`oldBold`/… under
+    // `o->flags.dual_color_diffed_diffs`) that this port does not render. Refuse a run
+    // that would print one rather than emit a plainly-colored approximation of it.
+    if want_color && !opts.no_patch {
+        opts.defer("colored diff-of-diffs body is not ported".to_string());
+    }
 
     // Upstream's order: the argument shape is checked first (a bad shape is 129
     // even when `--left-only --right-only` were also given), and the two-range
@@ -640,6 +844,71 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
     out.write_all(&rendered)?;
     out.flush()?;
     Ok(ExitCode::SUCCESS)
+}
+
+/// `RANGE_DIFF_CREATION_FACTOR_DEFAULT`'s sibling
+/// `CREATION_FACTOR_FOR_THE_SAME_SERIES` (`builtin/log.c`), the factor
+/// `format-patch` passes when `--creation-factor` was not given: a rerolled
+/// series is expected to be the *same* series, so creations are made expensive
+/// enough that almost any pairing is preferred.
+pub(super) const CREATION_FACTOR_FOR_THE_SAME_SERIES: i64 = 999;
+
+/// Port of `show_range_diff()` (`range-diff.c`) as `format-patch` calls it:
+/// render the diff of the two commit ranges into `out`, with the four-space
+/// indent and dual-colour settings `log-tree.c`'s `show_diff_of_diff()` asks for
+/// (colour is always off here, which makes dual and simple colouring identical).
+///
+/// `notes` mirrors `get_notes_args()`: `format-patch` forwards `--no-notes`
+/// unless the series itself is rendering notes.
+///
+/// Both ranges must already be known to resolve; an endpoint that does not is
+/// reported the way the inner `git log` reports it and returns the exit code
+/// upstream leaves behind.
+pub(super) fn show_range_diff(
+    repo: &gix::Repository,
+    range1: &str,
+    range2: &str,
+    creation_factor: i64,
+    notes_on: bool,
+    out: &mut Vec<u8>,
+) -> Result<std::result::Result<(), ExitCode>> {
+    let opts = Opts {
+        creation_factor,
+        left_only: false,
+        right_only: false,
+        notes: notes_on,
+        no_patch: false,
+        abbrev: Abbrev::Default,
+        deferred: None,
+        // `format-patch --range-diff` embeds the range-diff in a patch, which is never
+        // colored.
+        colors: diff_color::DiffColors::disabled(),
+    };
+    let ends1 = match endpoints(repo, range1) {
+        Ok(e) => e,
+        Err(_) => return Ok(Err(could_not_parse_log(range1))),
+    };
+    let ends2 = match endpoints(repo, range2) {
+        Ok(e) => e,
+        Err(_) => return Ok(Err(could_not_parse_log(range2))),
+    };
+
+    let mailmap = repo.open_mailmap();
+    let notes = if opts.notes {
+        let mut opt = super::notes::DisplayOpt::default();
+        opt.enable_default();
+        opt.given = true;
+        super::notes::load_display(repo, &opt)?
+    } else {
+        Vec::new()
+    };
+    let mut a = read_patches(repo, ends1, &mailmap, None, &opts.abbrev, &notes)?;
+    let mut b = read_patches(repo, ends2, &mailmap, None, &opts.abbrev, &notes)?;
+
+    find_exact_matches(&mut a, &mut b);
+    get_correspondences(&mut a, &mut b, opts.creation_factor);
+    output(out, &mut a, &b, &opts)?;
+    Ok(Ok(()))
 }
 
 /// Upstream's `usage_msg_opt()`: the reason, a blank line, the synopsis, 129.
@@ -2018,7 +2287,7 @@ fn output(out: &mut Vec<u8>, a: &mut [Patch], b: &[Patch], opts: &Opts) -> Resul
         // Show an unmatched LHS commit whose predecessors were shown.
         if i < a.len() && a[i].matching < 0 {
             if !opts.right_only {
-                pair_header(out, patch_no_width, &mut dashes, Some(&a[i]), None)?;
+                pair_header(out, patch_no_width, &mut dashes, Some(&a[i]), None, &opts.colors)?;
             }
             i += 1;
             continue;
@@ -2027,7 +2296,7 @@ fn output(out: &mut Vec<u8>, a: &mut [Patch], b: &[Patch], opts: &Opts) -> Resul
         // Show unmatched RHS commits.
         while j < b.len() && b[j].matching < 0 {
             if !opts.left_only {
-                pair_header(out, patch_no_width, &mut dashes, None, Some(&b[j]))?;
+                pair_header(out, patch_no_width, &mut dashes, None, Some(&b[j]), &opts.colors)?;
             }
             j += 1;
         }
@@ -2036,7 +2305,7 @@ fn output(out: &mut Vec<u8>, a: &mut [Patch], b: &[Patch], opts: &Opts) -> Resul
         // drops the diff-of-diffs body (`DIFF_FORMAT_NO_OUTPUT`).
         if j < b.len() {
             let ai = b[j].matching as usize;
-            pair_header(out, patch_no_width, &mut dashes, Some(&a[ai]), Some(&b[j]))?;
+            pair_header(out, patch_no_width, &mut dashes, Some(&a[ai]), Some(&b[j]), &opts.colors)?;
             if !opts.no_patch {
                 patch_diff(out, &a[ai].text, &b[j].text)?;
             }
@@ -2047,15 +2316,21 @@ fn output(out: &mut Vec<u8>, a: &mut [Patch], b: &[Patch], opts: &Opts) -> Resul
     Ok(())
 }
 
-/// `output_pair_header()` with color disabled: every color string is empty, so
-/// the line reduces to the two index/abbreviation columns, the status character
-/// and the one-line subject.
+/// `output_pair_header()` (range-diff.c:399): the two index/abbreviation columns, the
+/// status character and the one-line subject.
+///
+/// The whole line is wrapped in one color — red for a dropped commit, green for a new
+/// one, commit-yellow for a matched pair. A `!` pair is the exception: it opens in red
+/// (the left side), and resets to re-open in yellow, green and yellow again so the
+/// status character, the right-hand column and the subject each carry their own. With
+/// color off every one of those strings is empty and the line reduces to plain text.
 fn pair_header(
     out: &mut Vec<u8>,
     width: usize,
     dashes: &mut Option<String>,
     a: Option<&Patch>,
     b: Option<&Patch>,
+    colors: &diff_color::DiffColors,
 ) -> Result<()> {
     let anchor = a.or(b).expect("at least one side is present");
     if dashes.is_none() {
@@ -2069,8 +2344,18 @@ fn pair_header(
         (Some(x), Some(y)) if x.text != y.text => b'!',
         _ => b'=',
     };
+    let reset = colors.reset();
+    let color_old = colors.get(diff_color::DiffSlot::Old);
+    let color_new = colors.get(diff_color::DiffSlot::New);
+    let color = match status {
+        b'<' => color_old,
+        b'>' => color_new,
+        _ => colors.get(diff_color::DiffSlot::Commit),
+    };
+    let split = status == b'!';
 
     let mut line: Vec<u8> = Vec::new();
+    line.extend_from_slice(if split { color_old } else { color }.as_bytes());
     match a {
         Some(p) => line.extend_from_slice(
             format!("{:>width$}:  {} ", p.index + 1, p.abbrev, width = width).as_bytes(),
@@ -2079,7 +2364,15 @@ fn pair_header(
             line.extend_from_slice(format!("{:>width$}:  {dashes} ", "-", width = width).as_bytes())
         }
     }
+    if split {
+        line.extend_from_slice(reset.as_bytes());
+        line.extend_from_slice(color.as_bytes());
+    }
     line.push(status);
+    if split {
+        line.extend_from_slice(reset.as_bytes());
+        line.extend_from_slice(color_new.as_bytes());
+    }
     match b {
         Some(p) => line.extend_from_slice(
             format!(" {:>width$}:  {}", p.index + 1, p.abbrev, width = width).as_bytes(),
@@ -2088,8 +2381,13 @@ fn pair_header(
             line.extend_from_slice(format!(" {:>width$}:  {dashes}", "-", width = width).as_bytes())
         }
     }
+    if split {
+        line.extend_from_slice(reset.as_bytes());
+        line.extend_from_slice(color.as_bytes());
+    }
     line.push(b' ');
     line.extend_from_slice(&anchor.subject);
+    line.extend_from_slice(reset.as_bytes());
     line.push(b'\n');
     out.extend_from_slice(&line);
     Ok(())

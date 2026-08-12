@@ -63,21 +63,29 @@ const MAX_COMMAND_BYTES: usize = 4094;
 /// `git remote-ext` — the `ext::` remote helper.
 ///
 /// See the module docs for the covered surface and the three divergences.
-/// `args[0]` is the subcommand, so `args.len()` is C's `argc`, which this command
-/// checks exactly (git rejects anything but 3).
+///
+/// The dispatcher hands this function the arguments that FOLLOW the verb, while
+/// C's `main` also sees the command name in `argv[0]`. `argv` below rebuilds that
+/// shape so every `argc`/`argv` index reads exactly as it does in
+/// `builtin/remote-ext.c`, which rejects any `argc` but 3.
 pub fn remote_ext(args: &[String]) -> Result<ExitCode> {
+    let argv: Vec<&str> = std::iter::once("git-remote-ext")
+        .chain(args.iter().map(String::as_str))
+        .collect();
+
     // `show_usage_if_asked()`: only when the help flag is the sole argument.
     // git 2.55.0 puts this on stdout but still leaves 129 in `$?`.
-    if args.len() == 2 && (args[1] == "-h" || args[1] == "--help-all") {
+    if argv.len() == 2 && (argv[1] == "-h" || argv[1] == "--help-all") {
         print!("{USAGE_MSG}");
+        std::io::stdout().flush()?;
         return Ok(ExitCode::from(129));
     }
-    if args.len() != 3 {
+    if argv.len() != 3 {
         eprint!("{USAGE_MSG}");
         return Ok(ExitCode::from(129));
     }
 
-    command_loop(&args[2])
+    command_loop(argv[2])
 }
 
 /// Port of `command_loop()`: serve helper commands until `connect` or EOF.

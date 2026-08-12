@@ -46,25 +46,37 @@
 //!     `usage_with_options` block (usage line plus a blank line) on stderr,
 //!     exit 129.
 //!
-//!   * **`status`**, **`init`**, **`foreach`**, **`summary`** and
-//!     **`set-branch`** delegate to [`super::submodule`], which implements
-//!     them. Each of these helper subcommands is registered in
-//!     builtin/submodule--helper.c's `OPT_SUBCOMMAND` table against the very
-//!     same C function (`module_status`, `module_init`, `module_foreach`,
-//!     `module_summary`, `module_set_branch`) that `git submodule <name>`
+//!   * **`status`**, **`init`**, **`foreach`**, **`summary`**, **`sync`**,
+//!     **`update`**, **`deinit`**, **`absorbgitdirs`**, **`set-branch`** and
+//!     **`set-url`** delegate to [`super::submodule::subcommand`], which
+//!     implements them. Each is registered in builtin/submodule--helper.c's
+//!     `OPT_SUBCOMMAND` table against the very same C function (`module_status`,
+//!     `module_init`, `module_foreach`, `module_summary`, `module_sync`,
+//!     `module_update`, `module_deinit`, `absorb_git_dirs`,
+//!     `module_set_branch`, `module_set_url`) that `git submodule <name>`
 //!     dispatches to, so forwarding `[<name>, <tail>...]` into the porcelain
-//!     module reproduces the helper byte-for-byte. `status`/`init` were
-//!     confirmed to emit identical bytes here (including the `../sm` display
-//!     path from a subdirectory).
+//!     module reproduces the helper. `status`/`init` were confirmed to emit
+//!     identical bytes here (including the `../sm` display path from a
+//!     subdirectory).
+//!
+//!     The forward deliberately targets `subcommand` rather than
+//!     `submodule`: the porcelain entry point also reproduces
+//!     `git-submodule.sh:29`'s `GIT_PROTOCOL_FROM_USER=0` export, and the helper
+//!     has no such export — which is why `git submodule--helper update --remote`
+//!     fetches over a `file` url where `git submodule update --remote` dies
+//!     `transport 'file' not allowed`.
+//!
+//!   * **`add`** parses `module_add`'s own option table here — the porcelain
+//!     wrapper forwards its arguments unvalidated except for a missing
+//!     `<repository>`, so the two disagree on the error: a wrong operand count
+//!     is `usage_with_options` (the add usage block, exit 129) for the helper
+//!     and the `git-submodule.sh` usage block (exit 1) for `git submodule add`.
+//!     Past those checks the work is the porcelain's.
 //!
 //! Not ported — each bails naming the missing substrate rather than guessing:
 //!
-//!   * `clone`, `add`, `update` — need a working clone/fetch/checkout of the
-//!     submodule, i.e. transport plus worktree materialisation per submodule.
-//!   * `sync`, `set-url` — rewrite `.gitmodules` and the remote urls inside
-//!     each submodule; [`super::submodule`] floors these too.
-//!   * `deinit`, `absorbgitdirs` — move or delete submodule git dirs and
-//!     worktrees.
+//!   * `clone` — needs transport plus worktree materialisation for a submodule
+//!     that `update` has not already planned.
 //!   * `push-check` — validates the push refspec against the submodule's
 //!     remote; needs the refspec/remote machinery.
 //!   * `create-branch` — `git branch` inside a submodule with `--track`
@@ -147,44 +159,39 @@ pub fn submodule__helper(args: &[String]) -> Result<ExitCode> {
         "get-default-remote" => get_default_remote(tail),
         // Upstream these are literally the same C functions `git submodule`
         // dispatches to (`module_status`, `module_init`, `module_foreach`,
-        // `module_summary`, `module_set_branch` — see the `OPT_SUBCOMMAND`
-        // table in builtin/submodule--helper.c), so the porcelain module owns
-        // the implementation and the helper forwards to it verbatim.
-        "status" | "init" | "foreach" | "summary" | "set-branch" => {
+        // `module_summary`, `module_sync`, `module_update`, `module_deinit`,
+        // `absorb_git_dirs`, `module_set_branch`, `module_set_url` — see the
+        // `OPT_SUBCOMMAND` table in builtin/submodule--helper.c), so the
+        // porcelain module owns the implementation and the helper forwards to
+        // its shared subcommand table. It is deliberately *not* routed through
+        // `submodule()`: that entry point also reproduces `git-submodule.sh`'s
+        // `GIT_PROTOCOL_FROM_USER=0` export, which the helper does not have —
+        // `git submodule--helper update --remote` fetches over `file` where
+        // `git submodule update --remote` refuses.
+        "status" | "init" | "foreach" | "summary" | "set-branch" | "sync" | "update"
+        | "deinit" | "absorbgitdirs" | "set-url" => {
             let mut forwarded = Vec::with_capacity(tail.len() + 1);
             forwarded.push(name.to_string());
             forwarded.extend(tail.iter().cloned());
-            super::submodule::submodule(&forwarded)
+            super::submodule::subcommand(&forwarded)
         }
+        // `module_add` is likewise the same C function `git submodule add`
+        // reaches, but the two disagree before it: the porcelain wrapper does no
+        // option parsing of its own and forwards everything, so a wrong operand
+        // count here is `module_add`'s own `usage_with_options` (exit 129) while
+        // the wrapper's is the `git-submodule.sh` usage block (exit 1).
+        "add" => add(tail),
         "clone" => anyhow::bail!(
-            "unsupported subcommand \"clone\": cloning a submodule needs transport plus worktree checkout (ported: gitdir, get-default-remote, status, init, foreach, summary, set-branch)"
-        ),
-        "add" => anyhow::bail!(
-            "unsupported subcommand \"add\": needs a clone of the new submodule (ported: gitdir, get-default-remote, status, init, foreach, summary, set-branch)"
-        ),
-        "update" => anyhow::bail!(
-            "unsupported subcommand \"update\": needs clone/fetch/checkout of submodules (ported: gitdir, get-default-remote, status, init, foreach, summary, set-branch)"
-        ),
-        "sync" => anyhow::bail!(
-            "unsupported subcommand \"sync\": rewrites remote urls inside submodules (ported: gitdir, get-default-remote, status, init, foreach, summary, set-branch)"
-        ),
-        "deinit" => anyhow::bail!(
-            "unsupported subcommand \"deinit\": removes submodule worktrees (ported: gitdir, get-default-remote, status, init, foreach, summary, set-branch)"
+            "unsupported subcommand \"clone\": cloning a submodule needs transport plus worktree checkout (ported: gitdir, get-default-remote, status, init, foreach, summary, sync, update, deinit, absorbgitdirs, set-branch, set-url, add)"
         ),
         "push-check" => anyhow::bail!(
-            "unsupported subcommand \"push-check\": needs the remote/refspec machinery (ported: gitdir, get-default-remote, status, init, foreach, summary, set-branch)"
-        ),
-        "absorbgitdirs" => anyhow::bail!(
-            "unsupported subcommand \"absorbgitdirs\": relocates submodule git dirs (ported: gitdir, get-default-remote, status, init, foreach, summary, set-branch)"
-        ),
-        "set-url" => anyhow::bail!(
-            "unsupported subcommand \"set-url\": edits .gitmodules (ported: gitdir, get-default-remote, status, init, foreach, summary, set-branch)"
+            "unsupported subcommand \"push-check\": needs the remote/refspec machinery (ported: gitdir, get-default-remote, status, init, foreach, summary, sync, update, deinit, absorbgitdirs, set-branch, set-url, add)"
         ),
         "create-branch" => anyhow::bail!(
-            "unsupported subcommand \"create-branch\": creates a branch inside a submodule (ported: gitdir, get-default-remote, status, init, foreach, summary, set-branch)"
+            "unsupported subcommand \"create-branch\": creates a branch inside a submodule (ported: gitdir, get-default-remote, status, init, foreach, summary, sync, update, deinit, absorbgitdirs, set-branch, set-url, add)"
         ),
         "migrate-gitdir-configs" => bail!(
-            "unsupported subcommand \"migrate-gitdir-configs\": the extensions.submodulePathConfig migration is not ported (ported: gitdir, get-default-remote, status, init, foreach, summary, set-branch)"
+            "unsupported subcommand \"migrate-gitdir-configs\": the extensions.submodulePathConfig migration is not ported (ported: gitdir, get-default-remote, status, init, foreach, summary, sync, update, deinit, absorbgitdirs, set-branch, set-url, add)"
         ),
         other => {
             eprintln!("error: unknown subcommand: `{other}'");
@@ -192,6 +199,151 @@ pub fn submodule__helper(args: &[String]) -> Result<ExitCode> {
             Ok(ExitCode::from(129))
         }
     }
+}
+
+// ------------------------------------------------------------------- add ----
+
+/// The `usage:` block `module_add`'s `usage_with_options` prints, captured
+/// byte-for-byte from git 2.55.0 (`git submodule--helper add`): the usage line, a
+/// blank line, the nine options with their help text in column 27, and a
+/// trailing blank line. Exit is 129.
+const ADD_USAGE: &str = "\
+usage: git submodule add [<options>] [--] <repository> [<path>]
+
+    -b, --[no-]branch <branch>
+                          branch of repository to add as submodule
+    -f, --[no-]force      allow adding an otherwise ignored submodule path
+    -q, --[no-]quiet      print only error messages
+    --[no-]progress       force cloning progress
+    --[no-]reference <repository>
+                          reference repository
+    --[no-]ref-format <format>
+                          specify the reference format to use
+    --[no-]dissociate     borrow the objects from reference repositories
+    --[no-]name <name>    sets the submodule's name to the given string instead of defaulting to its path
+    --[no-]depth <n>      depth for shallow clones
+
+";
+
+/// `git submodule--helper add [<options>] [--] <repository> [<path>]` — git's
+/// `module_add` (submodule--helper.c:3642).
+///
+/// Only the two checks `module_add` performs before it starts working are here —
+/// the writable-`.gitmodules` gate and the operand count — because they are the
+/// two that differ from the porcelain wrapper, which forwards its arguments
+/// unvalidated except for a missing `<repository>`. Everything past them is the
+/// same C function `git submodule add` reaches, so it is delegated to the shared
+/// subcommand table.
+fn add(args: &[String]) -> Result<ExitCode> {
+    /// `module_add`'s long options that take a value.
+    const VALUED: &[&str] = &["branch", "reference", "ref-format", "name", "depth"];
+    /// …and the ones that do not.
+    const FLAGS: &[&str] = &["force", "quiet", "progress", "dissociate"];
+
+    let mut operands = 0usize;
+    let mut end_of_options = false;
+    let mut i = 0;
+    while let Some(a) = args.get(i) {
+        i += 1;
+        if end_of_options || !a.starts_with('-') || a == "-" {
+            operands += 1;
+            continue;
+        }
+        if a == "--" {
+            end_of_options = true;
+            continue;
+        }
+        if let Some(long) = a.strip_prefix("--") {
+            // `--no-<name>` unsets; for a valued option it simply clears it.
+            let (name, inline) = match long.split_once('=') {
+                Some((n, v)) => (n, Some(v)),
+                None => (long, None),
+            };
+            let name = name.strip_prefix("no-").unwrap_or(name);
+            if FLAGS.contains(&name) {
+                continue;
+            }
+            if VALUED.contains(&name) {
+                if inline.is_none() && !long.starts_with("no-") {
+                    if args.get(i).is_none() {
+                        eprintln!("error: option `{name}' requires a value");
+                        eprint!("{ADD_USAGE}");
+                        return Ok(ExitCode::from(129));
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+            eprintln!("error: unknown option `{long}'");
+            eprint!("{ADD_USAGE}");
+            return Ok(ExitCode::from(129));
+        }
+        // A short cluster: `-qf`, `-bmain`, `-b main`.
+        let mut chars = a[1..].char_indices();
+        while let Some((at, c)) = chars.next() {
+            match c {
+                'f' | 'q' => {}
+                'b' => {
+                    // The rest of the cluster is the value; an empty rest takes
+                    // the next argument.
+                    let rest = &a[1 + at + c.len_utf8()..];
+                    if rest.is_empty() {
+                        if args.get(i).is_none() {
+                            eprintln!("error: switch `b' requires a value");
+                            eprint!("{ADD_USAGE}");
+                            return Ok(ExitCode::from(129));
+                        }
+                        i += 1;
+                    }
+                    break;
+                }
+                other => {
+                    eprintln!("error: unknown switch `{other}'");
+                    eprint!("{ADD_USAGE}");
+                    return Ok(ExitCode::from(129));
+                }
+            }
+        }
+    }
+
+    // `is_writing_gitmodules_ok()` runs *before* the operand count: `.gitmodules`
+    // must be in the working tree, or absent from the index and HEAD alike.
+    if !writing_gitmodules_ok()? {
+        crate::git_fatal!("please make sure that the .gitmodules file is in the working tree");
+    }
+
+    if operands == 0 || operands > 2 {
+        eprint!("{ADD_USAGE}");
+        return Ok(ExitCode::from(129));
+    }
+
+    let mut forwarded = Vec::with_capacity(args.len() + 1);
+    forwarded.push("add".to_string());
+    forwarded.extend(args.iter().cloned());
+    super::submodule::subcommand(&forwarded)
+}
+
+/// git's `is_writing_gitmodules_ok` (submodule.c): the worktree copy exists, or
+/// there is no `.gitmodules` in the index nor in `HEAD` to be shadowed by one.
+fn writing_gitmodules_ok() -> Result<bool> {
+    let repo = gix::discover(".")?;
+    if let Some(workdir) = repo.workdir() {
+        if workdir.join(".gitmodules").exists() {
+            return Ok(true);
+        }
+    }
+    let path = BString::from(".gitmodules");
+    let in_index = repo
+        .index_or_empty()?
+        .entry_by_path(path.as_bstr())
+        .is_some();
+    let in_head = repo
+        .head_commit()
+        .ok()
+        .and_then(|c| c.tree().ok())
+        .and_then(|t| t.lookup_entry_by_path(".gitmodules").ok().flatten())
+        .is_some();
+    Ok(!in_index && !in_head)
 }
 
 // ---------------------------------------------------------------- gitdir ----
@@ -352,4 +504,61 @@ fn prefixed_path(repo: &gix::Repository, path: &str) -> Result<String> {
         }
     }
     Ok(parts.join("/"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pins the helper's two usage blocks to the bytes git 2.55.0 writes.
+    ///
+    /// `ADD_USAGE` is `module_add`'s `usage_with_options` output, captured from
+    /// `git submodule--helper add` on git 2.55.0. Its shape is the part that
+    /// silently rots: `parse_options` puts help text in column 27 and spills an
+    /// option whose `-x, --[no-]name <arg>` header already reaches that column
+    /// onto its own line — which is why `branch`, `reference`, `ref-format` are
+    /// two-line entries and `force`, `quiet`, `progress`, `dissociate`, `name`,
+    /// `depth` are one.
+    #[test]
+    fn usage_blocks_match_git() {
+        assert_eq!(USAGE, "usage: git submodule--helper <command>\n\n");
+
+        let lines: Vec<&str> = ADD_USAGE.split('\n').collect();
+        assert_eq!(
+            lines[0],
+            "usage: git submodule add [<options>] [--] <repository> [<path>]"
+        );
+        assert_eq!(lines[1], "");
+        assert_eq!(lines[2], "    -b, --[no-]branch <branch>");
+        assert_eq!(
+            lines[3],
+            "                          branch of repository to add as submodule"
+        );
+        assert_eq!(
+            lines[4],
+            "    -f, --[no-]force      allow adding an otherwise ignored submodule path"
+        );
+        assert_eq!(
+            lines[5],
+            "    -q, --[no-]quiet      print only error messages"
+        );
+        assert_eq!(
+            *lines.last().expect("non-empty"),
+            "",
+            "parse_options ends the block with a blank line"
+        );
+        assert!(ADD_USAGE.ends_with("depth for shallow clones\n\n"));
+        // Every wrapped help line is indented to the same column as the inline
+        // ones, so a mis-measured pad would show up as a mismatch here.
+        for line in ADD_USAGE
+            .lines()
+            .filter(|l| l.starts_with("                "))
+        {
+            assert_eq!(
+                line.len() - line.trim_start().len(),
+                26,
+                "help column drifted: {line:?}"
+            );
+        }
+    }
 }

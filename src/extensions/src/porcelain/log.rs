@@ -465,6 +465,14 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // changed line matches). Both diff each commit against its first parent.
     let mut pickaxe_s: Option<String> = None;
     let mut pickaxe_g: Option<String> = None;
+    // `--pickaxe-regex` promotes `-S`'s literal to a regex whose *match count* is
+    // compared; `--pickaxe-all` keeps the whole changeset when any pair matches;
+    // `--find-object=<id>` selects pairs that touch a named object instead of
+    // searching content. All three are read before the needle they modify is
+    // finalised, because git accepts them on either side of `-S`.
+    let mut pickaxe_regex = false;
+    let mut pickaxe_all = false;
+    let mut find_object: Vec<String> = Vec::new();
     // The diff options the per-commit patch is rendered with; `-U3` and no whitespace
     // folding until a flag says otherwise.
     let mut patch_opts = super::diff::PatchOpts::default();
@@ -884,6 +892,15 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         } else if a == "-G" {
             i += 1;
             pickaxe_g = Some(args.get(i).cloned().unwrap_or_default());
+        } else if a == "--pickaxe-all" {
+            pickaxe_all = true;
+        } else if a == "--pickaxe-regex" {
+            pickaxe_regex = true;
+        } else if a == "--find-object" {
+            i += 1;
+            find_object.push(args.get(i).cloned().unwrap_or_default());
+        } else if let Some(v) = a.strip_prefix("--find-object=") {
+            find_object.push(v.to_string());
         } else if a == "--follow" {
             follow = true;
         } else if a == "--no-follow" {
@@ -1659,7 +1676,71 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         Some(p) => Some(crate::revfilter::build_regex(p, grep_dialect, grep_ignore_case)?),
         None => None,
     };
-    let has_pickaxe = pickaxe_s.is_some() || pickaxe_g_re.is_some();
+    // `diff_setup_done()` (diff.c:5262-5273) rejects two pickaxe combinations outright,
+    // both `die()`s and so both exit 128. They are checked here, after the revisions have
+    // been resolved, because `setup_revisions()` reaches `diff_setup_done()` only once it
+    // has finished walking argv — a bad revision is reported first.
+    if usize::from(pickaxe_s.is_some())
+        + usize::from(pickaxe_g.is_some())
+        + usize::from(!find_object.is_empty())
+        > 1
+    {
+        eprintln!("fatal: options '-G', '-S', and '--find-object' cannot be used together");
+        return Ok(ExitCode::from(128));
+    }
+    if pickaxe_all && !find_object.is_empty() {
+        eprintln!(
+            "fatal: options '--pickaxe-all' and '--find-object' cannot be used together, \
+             use '--pickaxe-all' with '-G' and '-S'"
+        );
+        return Ok(ExitCode::from(128));
+    }
+    // `diffcore_pickaxe()`'s needle, for the two kinds that are decided from the blobs
+    // alone: `-S` (`has_changes`, a literal unless `--pickaxe-regex` promotes it) and
+    // `--find-object` (`o->objfind`, a plain id-set test). `-G` needs the patch text and
+    // keeps its own path below.
+    let pickaxe = match (&find_object, &pickaxe_s) {
+        (ids, _) if !ids.is_empty() => {
+            let mut oids = Vec::with_capacity(ids.len());
+            for spec in ids {
+                // `--find-object` resolves through the usual revision machinery, so an
+                // abbreviated id or any other object-ish spelling works.
+                match repo.rev_parse_single(spec.as_bytes()) {
+                    Ok(id) => oids.push(id.detach()),
+                    // `diff_opt_find_object()` (diff.c:5532) returns `error()` from the
+                    // option callback, which parse-options turns into 129 rather than the
+                    // 128 a `die()` would give.
+                    Err(_) => {
+                        eprintln!("error: unable to resolve '{spec}'");
+                        return Ok(ExitCode::from(129));
+                    }
+                }
+            }
+            Some(super::diff_pairs::Pickaxe {
+                kind: super::diff_pairs::PickaxeKind::ObjFind(oids),
+                all: pickaxe_all,
+            })
+        }
+        (_, Some(needle)) => {
+            let kind = match pickaxe_regex {
+                true => match super::diff_pairs::compile_regex(needle.as_bytes()) {
+                    Ok(re) => super::diff_pairs::PickaxeKind::Occurrences(
+                        super::diff_pairs::Needle::Regex(re),
+                    ),
+                    Err(msg) => {
+                        eprintln!("fatal: invalid regex: {msg}");
+                        return Ok(ExitCode::from(128));
+                    }
+                },
+                false => super::diff_pairs::PickaxeKind::Occurrences(
+                    super::diff_pairs::Needle::Literal(needle.as_bytes().to_vec()),
+                ),
+            };
+            Some(super::diff_pairs::Pickaxe { kind, all: pickaxe_all })
+        }
+        _ => None,
+    };
+    let has_pickaxe = pickaxe.is_some() || pickaxe_g_re.is_some();
 
     if !commit_filter.is_empty() || since.is_some() || until.is_some() || has_pickaxe {
         let mut kept = Vec::with_capacity(nodes.len());
@@ -1685,11 +1766,12 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             // what its parents contain. Dropping them here also keeps the scan
             // from reading blobs for the largest commits in the history.
             kept.retain(|n| n.parents.len() < 2);
-            kept = match (&pickaxe_s, &pickaxe_g_re) {
-                // `-S` alone never needs patch text. git's `has_changes` counts
-                // the needle in each side's whole blob and keeps the file when the
-                // two counts differ, so the scan reads blobs and never diffs them.
-                (Some(needle), None) => pickaxe_by_count(&repo, kept, needle.as_bytes())?,
+            kept = match (&pickaxe, &pickaxe_g_re) {
+                // `-S` and `--find-object` never need patch text. git's `has_changes`
+                // counts the needle in each side's whole blob and keeps the file when
+                // the two counts differ, and `objfind` only compares ids, so the scan
+                // reads blobs (or nothing at all) and never diffs them.
+                (Some(px), None) => pickaxe_by_count(&repo, kept, &px.kind)?,
                 _ => {
                     let jobs: Vec<(ObjectId, Option<ObjectId>)> =
                         kept.iter().map(|n| (n.id, n.parents.first().copied())).collect();
@@ -2126,6 +2208,14 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                 )?;
                 if let Some(m) = followed.as_mut() {
                     files.retain(|f| m.matches(&f.path));
+                }
+                // `diffcore_pickaxe()` munges the queue itself, so every format below
+                // sees only the pairs that matched — `git log -Sfoo --raw` names the
+                // file that changed its occurrence count, not the whole commit. This
+                // runs inside `diffcore_std()`, i.e. before the whitespace re-render
+                // and before the queue is tested for emptiness.
+                if let Some(px) = &pickaxe {
+                    pickaxe_filter_files(&repo, px, &mut files)?;
                 }
                 // `diff_flush()` (diff.c:7210): under a whitespace rule the queue is
                 // re-rendered quietly first and every pair whose patch came out empty
@@ -4484,19 +4574,30 @@ fn now_secs() -> i64 {
     crate::date::now_seconds()
 }
 
-/// `-S<string>` over a set of commits, keeping those whose first-parent diff
-/// changes the number of occurrences of `needle`.
+/// `-S<string>` / `--find-object=<id>` over a set of commits, keeping those whose
+/// first-parent diff contains a pair `diffcore_pickaxe()` would have kept.
 ///
-/// This is git's `has_changes` (diffcore-pickaxe.c): for each changed path,
-/// count the needle in the whole old blob and the whole new blob, and keep the
-/// commit as soon as one pair's counts differ. No patch is built and no line
-/// diff is run — the needle's position is irrelevant, only how many times it
-/// appears, and a blob whose id is unchanged cannot change its own count.
+/// This is git's `has_changes` (diffcore-pickaxe.c): for each changed path, count the
+/// needle in the whole old blob and the whole new blob, and keep the commit as soon as
+/// one pair's counts differ. No patch is built and no line diff is run — the needle's
+/// position is irrelevant, only how many times it appears, and a blob whose id is
+/// unchanged cannot change its own count. `--find-object` is cheaper still: it compares
+/// the recorded ids and never reads a blob at all.
 ///
 /// The commits are independent, so the scan runs across the thread pool. Each
 /// worker owns a repository handle, which is not `Sync`.
-fn pickaxe_by_count(repo: &gix::Repository, nodes: Vec<Node>, needle: &[u8]) -> Result<Vec<Node>> {
-    if needle.is_empty() || nodes.is_empty() {
+fn pickaxe_by_count(
+    repo: &gix::Repository,
+    nodes: Vec<Node>,
+    kind: &super::diff_pairs::PickaxeKind,
+) -> Result<Vec<Node>> {
+    let empty_needle = match kind {
+        super::diff_pairs::PickaxeKind::Occurrences(super::diff_pairs::Needle::Literal(n)) => {
+            n.is_empty()
+        }
+        _ => false,
+    };
+    if empty_needle || nodes.is_empty() {
         return Ok(nodes);
     }
     // Two commits per worker: a single commit's scan can read many blobs, so
@@ -4505,7 +4606,7 @@ fn pickaxe_by_count(repo: &gix::Repository, nodes: Vec<Node>, needle: &[u8]) -> 
     if workers <= 1 {
         let mut kept = Vec::new();
         for node in nodes {
-            if commit_changes_count(repo, &node, needle)? {
+            if commit_changes_count(repo, &node, kind)? {
                 kept.push(node);
             }
         }
@@ -4527,7 +4628,7 @@ fn pickaxe_by_count(repo: &gix::Repository, nodes: Vec<Node>, needle: &[u8]) -> 
                 loop {
                     let i = cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let Some(node) = nodes.get(i) else { break };
-                    if commit_changes_count(&repo, node, needle)? {
+                    if commit_changes_count(&repo, node, kind)? {
                         mine.push(i);
                     }
                 }
@@ -4558,9 +4659,12 @@ fn pickaxe_by_count(repo: &gix::Repository, nodes: Vec<Node>, needle: &[u8]) -> 
     Ok(nodes.into_iter().zip(keep).filter(|(_, k)| *k).map(|(n, _)| n).collect())
 }
 
-/// `true` when this commit's first-parent diff changes how many times `needle`
-/// occurs in any one file.
-fn commit_changes_count(repo: &gix::Repository, node: &Node, needle: &[u8]) -> Result<bool> {
+/// `true` when this commit's first-parent diff holds a pair `diffcore_pickaxe()` keeps.
+fn commit_changes_count(
+    repo: &gix::Repository,
+    node: &Node,
+    kind: &super::diff_pairs::PickaxeKind,
+) -> Result<bool> {
     let new_tree = repo.find_object(node.id)?.try_into_commit()?.tree()?;
     let old_tree = match node.parents.first() {
         Some(pid) => Some(repo.find_object(*pid)?.try_into_commit()?.tree()?),
@@ -4568,7 +4672,7 @@ fn commit_changes_count(repo: &gix::Repository, node: &Node, needle: &[u8]) -> R
     };
     // Counting a blob means reading it, so the count is memoized per blob id
     // within the commit: a file that appears on both sides of several changes
-    // (or a tree that reuses a blob) is read once.
+    // (or a tree that reuses a blob) is read once. `--find-object` reads nothing.
     let mut counted: std::collections::HashMap<ObjectId, i64> = std::collections::HashMap::new();
     let mut count_of = |repo: &gix::Repository, id: Option<ObjectId>| -> Result<i64> {
         let Some(id) = id else { return Ok(0) };
@@ -4578,9 +4682,14 @@ fn commit_changes_count(repo: &gix::Repository, node: &Node, needle: &[u8]) -> R
         // A gitlink or a missing object counts as absent, exactly as git's
         // pickaxe treats a side it cannot read as an empty buffer.
         let n = match repo.find_object(id) {
-            Ok(obj) if obj.kind == gix::object::Kind::Blob => {
-                count_occurrences(&obj.data, needle)
-            }
+            Ok(obj) if obj.kind == gix::object::Kind::Blob => match kind {
+                super::diff_pairs::PickaxeKind::Occurrences(needle) => {
+                    needle.count(&obj.data) as i64
+                }
+                // Neither reads content; `objfind` short-circuits before this runs and
+                // `-G` never reaches this scan.
+                _ => 0,
+            },
             _ => 0,
         };
         counted.insert(id, n);
@@ -4599,10 +4708,10 @@ fn commit_changes_count(repo: &gix::Repository, node: &Node, needle: &[u8]) -> R
     // over-approximation, and only a commit it flags needs the second, exact
     // pass. Most commits are not flagged, and the history's renames are paid for
     // only where they might matter.
-    if !any_count_changed(repo, old_tree.as_ref(), &new_tree, &mut count_of, false)? {
+    if !any_count_changed(repo, old_tree.as_ref(), &new_tree, kind, &mut count_of, false)? {
         return Ok(false);
     }
-    any_count_changed(repo, old_tree.as_ref(), &new_tree, &mut count_of, true)
+    any_count_changed(repo, old_tree.as_ref(), &new_tree, kind, &mut count_of, true)
 }
 
 /// Whether any changed pair between the two trees holds the needle a different
@@ -4612,6 +4721,7 @@ fn any_count_changed(
     repo: &gix::Repository,
     old_tree: Option<&gix::Tree<'_>>,
     new_tree: &gix::Tree<'_>,
+    kind: &super::diff_pairs::PickaxeKind,
     count_of: &mut impl FnMut(&gix::Repository, Option<ObjectId>) -> Result<i64>,
     rename_tracking: bool,
 ) -> Result<bool> {
@@ -4622,6 +4732,15 @@ fn any_count_changed(
     let changes = repo.diff_tree_to_tree(old_tree, Some(new_tree), Some(options))?;
     for change in changes {
         let (old_id, new_id) = change_blob_ids(&change);
+        // `o->objfind`: a pair is kept when either side *is* one of the named objects,
+        // which is decided before the unmodified-pair short circuit below.
+        if let super::diff_pairs::PickaxeKind::ObjFind(ids) = kind {
+            if old_id.is_some_and(|i| ids.contains(&i)) || new_id.is_some_and(|i| ids.contains(&i))
+            {
+                return Ok(true);
+            }
+            continue;
+        }
         // An unchanged blob id on both sides cannot change its own count.
         if old_id == new_id {
             continue;
@@ -4631,6 +4750,67 @@ fn any_count_changed(
         }
     }
     Ok(false)
+}
+
+/// `pickaxe()` (diffcore-pickaxe.c) over one commit's change list.
+///
+/// Without `--pickaxe-all` only the matching pairs survive. With it the whole list
+/// survives as soon as one pair matches ("do not munge the queue") and is cleared
+/// outright when none does.
+///
+/// `-G` is absent because it is decided from patch text rather than the blobs, and
+/// reaches the commit through [`pickaxe_hit`] instead.
+fn pickaxe_filter_files(
+    repo: &gix::Repository,
+    px: &super::diff_pairs::Pickaxe,
+    files: &mut Vec<FileChange>,
+) -> Result<()> {
+    let mut hit = Vec::with_capacity(files.len());
+    for f in files.iter() {
+        hit.push(pickaxe_file_hit(repo, &px.kind, f)?);
+    }
+    if px.all {
+        if !hit.iter().any(|h| *h) {
+            files.clear();
+        }
+        return Ok(());
+    }
+    let mut it = hit.into_iter();
+    files.retain(|_| it.next().unwrap_or(false));
+    Ok(())
+}
+
+/// `pickaxe_match()` for one change: `objfind` compares the recorded ids, `-S` compares
+/// the needle's occurrence count in each side's whole blob.
+fn pickaxe_file_hit(
+    repo: &gix::Repository,
+    kind: &super::diff_pairs::PickaxeKind,
+    f: &FileChange,
+) -> Result<bool> {
+    let old = f.old_side.map(|(_, id)| id);
+    let new = f.new_side.map(|(_, id)| id);
+    match kind {
+        super::diff_pairs::PickaxeKind::ObjFind(ids) => {
+            Ok(old.is_some_and(|i| ids.contains(&i)) || new.is_some_and(|i| ids.contains(&i)))
+        }
+        super::diff_pairs::PickaxeKind::Occurrences(needle) => {
+            // `diff_unmodified_pair()`: identical ids hold identical content.
+            if old == new {
+                return Ok(false);
+            }
+            let count = |id: Option<ObjectId>| -> Result<usize> {
+                let Some(id) = id else { return Ok(0) };
+                Ok(match repo.find_object(id) {
+                    Ok(obj) if obj.kind == gix::object::Kind::Blob => needle.count(&obj.data),
+                    // A gitlink or an unreadable object is an empty buffer to the pickaxe.
+                    _ => 0,
+                })
+            };
+            Ok(count(old)? != count(new)?)
+        }
+        // Reached only if a `-G` needle were ever routed here; it is not.
+        super::diff_pairs::PickaxeKind::Grep(_) => Ok(true),
+    }
 }
 
 /// The old and new blob ids of a tree change, or `None` for a side that does not

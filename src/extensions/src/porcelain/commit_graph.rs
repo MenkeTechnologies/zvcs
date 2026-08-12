@@ -55,15 +55,23 @@
 //! last-extra-edge marker both `0x80000000`; `GDA2` holding the corrected
 //! commit date *offset* per commit.
 //!
+//! `--split` writes the *first* layer of a chain: the graph goes to
+//! `info/commit-graphs/graph-<checksum>.graph` and `commit-graph-chain` names
+//! it. A one-layer chain has no base graph, so its bytes are exactly the
+//! single-file graph's — verified byte-for-byte against git 2.55.0 — and only
+//! the naming differs. `--split=no-merge` and `--split=replace` reach the same
+//! layer, there being nothing to merge or replace.
+//!
 //! Deliberately not implemented — this bails rather than writing a file that
 //! only looks right:
-//!   * `--split`. Needs the incremental chain protocol (chain file, base-graph
-//!     `BASE` chunk, merge/expiry strategies), none of which the vendored crate
-//!     models.
+//!   * `--split` over a commit-graph that already exists. Folding one into the
+//!     new tip needs `split_graph_merge_strategy()`'s layer accounting, the
+//!     `BASE` chunk, parent positions renumbered across the whole chain, and
+//!     `expire_commit_graphs()` — none of which the vendored crate models.
 //!
-//! `--max-commits`, `--size-multiple` and `--expire-time` only steer split
-//! writes; git accepts and ignores them for a non-split write, and so does
-//! this, after validating their values so the exit codes still agree.
+//! `--max-commits`, `--size-multiple` and `--expire-time` only steer the merge
+//! strategy above; git accepts and ignores them for a non-split write, and so
+//! does this, after validating their values so the exit codes still agree.
 //!
 //! Progress goes to stderr in git and is not emitted here. Verification
 //! *failure* text is gix's diagnostic, not git's wording; only the success path
@@ -545,14 +553,6 @@ fn write_graph(args: &[String], inherited_object_dir: Option<String>) -> Result<
         ));
     }
 
-    if split {
-        bail!(
-            "unsupported flag \"--split\": the incremental chain protocol (chain file, BASE \
-             chunk, merge and expiry strategies) is not modelled by the read-only vendored \
-             gix-commitgraph (ported: non-split writes)"
-        );
-    }
-
     let repo = gix::discover(".")?;
 
     // `commitGraph.generationVersion` selects the generation-number version.
@@ -611,6 +611,31 @@ fn write_graph(args: &[String], inherited_object_dir: Option<String>) -> Result<
         Ok(p) => p,
         Err(code) => return Ok(code),
     };
+
+    // What `--split` is *not*: the strategies that fold an existing graph into
+    // the new tip. `split_graph_merge_strategy()` decides how many layers of the
+    // old chain survive, `write_commit_graph_file()` writes their checksums into
+    // a `BASE` chunk and renumbers every parent position across the whole chain,
+    // and `expire_commit_graphs()` removes what is left over. None of that is
+    // modelled, so a repository that already has a graph to build on is refused
+    // rather than answered with a chain that only looks right. Writing the
+    // *first* layer of a chain needs none of it: with no base graph the layer's
+    // bytes are exactly the single-file graph's — verified byte-for-byte against
+    // git 2.55.0 — and only the naming and the chain file differ.
+    if split
+        && (objects.join("info").join("commit-graph").exists()
+            || objects
+                .join("info")
+                .join("commit-graphs")
+                .join("commit-graph-chain")
+                .exists())
+    {
+        bail!(
+            "unsupported flag \"--split\" over an existing commit-graph: the chain merge, \
+             BASE chunk and expiry strategies are not modelled by the read-only vendored \
+             gix-commitgraph (ported: writing the first layer of a chain)"
+        );
+    }
 
     // `write_commit_graph()`'s first act is to refuse outright when the feature
     // is switched off, so `-c core.commitGraph=false commit-graph write` warns,
@@ -757,7 +782,11 @@ fn write_graph(args: &[String], inherited_object_dir: Option<String>) -> Result<
         Ok(b) => b,
         Err(code) => return Ok(code),
     };
-    install(&objects, &bytes)?;
+    if split {
+        install_split(&objects, &bytes, repo.object_hash())?;
+    } else {
+        install(&objects, &bytes)?;
+    }
     Ok(ExitCode::SUCCESS)
 }
 
@@ -1313,6 +1342,41 @@ fn install(objects: &Path, bytes: &[u8]) -> Result<()> {
                 let _ = std::fs::remove_file(entry.path());
             }
         }
+    }
+    Ok(())
+}
+
+/// Install `bytes` as the one layer of a new commit-graph chain.
+///
+/// A layer lives at `<objects>/info/commit-graphs/graph-<checksum>.graph`, named
+/// after its own trailing hash, and `commit-graph-chain` lists the chain base
+/// first, tip last — one hash per line. Both are left read-only, as git leaves
+/// them. Only the first layer is written here; see the refusal in [`write`] for
+/// what a chain that already exists would need.
+fn install_split(objects: &Path, bytes: &[u8], hash: gix::hash::Kind) -> Result<()> {
+    let dir = objects.join("info").join("commit-graphs");
+    std::fs::create_dir_all(&dir)?;
+
+    let Ok(checksum) = gix::hash::ObjectId::try_from(&bytes[bytes.len() - hash.len_in_bytes()..])
+    else {
+        bail!("commit-graph trailer is not a valid object id");
+    };
+    let pid = std::process::id();
+    for (name, body) in [
+        (format!("graph-{checksum}.graph"), bytes.to_vec()),
+        ("commit-graph-chain".to_string(), format!("{checksum}\n").into_bytes()),
+    ] {
+        let tmp = dir.join(format!("{name}.tmp-{pid}"));
+        std::fs::write(&tmp, &body)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o444));
+        }
+        let target = dir.join(&name);
+        // The old file is read-only, which some filesystems refuse to rename over.
+        let _ = std::fs::remove_file(&target);
+        std::fs::rename(&tmp, &target)?;
     }
     Ok(())
 }

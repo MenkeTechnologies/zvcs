@@ -39,6 +39,17 @@ pub(in crate::store_impl::file) struct Edit {
     /// For symbolic refs, this is the previous OID to put into the reflog instead of our own previous value. It's the
     /// peeled value of the leaf referent.
     leaf_referent_previous_oid: Option<ObjectId>,
+    /// git's `REF_LOG_ONLY`, which is narrower than [`RefLog::Only`][crate::transaction::RefLog::Only].
+    ///
+    /// `RefLog::Only` on a deletion is overloaded. A caller can pass it to mean "delete the reflog and
+    /// leave the reference alone" — gix's own feature, with no counterpart in git. The splitter also
+    /// *assigns* it to the symbolic half of a dereferenced edit, moving the caller's original mode onto
+    /// the referent; that half is git's `REF_LOG_ONLY`, and it must gain a reflog entry rather than lose
+    /// its log. The two are told apart by the referent's mode: `RefLog::AndReference` there means the
+    /// caller asked to delete a reference, so this half is the log-only mirror of that deletion.
+    ///
+    /// Only ever set on a deletion; updates carry git's flag faithfully in `RefLog::Only` already.
+    log_only_split: bool,
 }
 
 impl Edit {

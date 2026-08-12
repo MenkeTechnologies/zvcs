@@ -15,7 +15,8 @@
 //!   `remote.<name>.url` (first value) when the name is a configured remote,
 //!   the name itself otherwise, with `url.<base>.insteadOf` applied in either
 //!   case. `argv[3]` and beyond are ignored, exactly as the C ignores them.
-//! * `end_url_with_slash()` — the URL always gets a trailing `/`.
+//! * `end_url_with_slash()` — a non-empty URL always gets a trailing `/`
+//!   (`strbuf_complete()` leaves an empty one empty).
 //! * `http_init()`'s URL validation, i.e. `credential_from_url()`: the
 //!   `warning: url has no scheme: <url>` and
 //!   `warning: url contains a newline in its <component> component: <url>`
@@ -50,14 +51,11 @@
 //! through a `Repository`, so global/system `insteadOf` rules are not consulted
 //! there (inside a repository they are).
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 use std::io::{BufRead, Write};
 use std::process::ExitCode;
 
-use gix::bstr::{BString, ByteSlice};
-
-/// `remote-curl.c`'s usage `error()`, byte-for-byte.
-const USAGE: &str = "error: remote-curl: usage: git remote-curl <remote> [<url>]";
+use gix::bstr::ByteSlice;
 
 /// The reply to `capabilities`, including the terminating empty line.
 const CAPABILITIES: &str = "\
@@ -123,195 +121,16 @@ const PORTED: &str = "ported: capabilities, option, and the argument/URL prologu
 
 /// `git remote-ftps <remote> [<url>]` — see the module docs for what is covered.
 pub fn remote_ftps(args: &[String]) -> Result<ExitCode> {
-    // `args` mirrors C's `argv`: args[0] is the command name, args[1] the
-    // remote, args[2] the optional URL. `remote-curl.c` only rejects `argc < 2`;
-    // surplus arguments are silently ignored, so they are ignored here too.
-    if args.len() < 2 {
-        eprintln!("{USAGE}");
-        return Ok(ExitCode::from(1));
-    }
-
-    let mut url: Vec<u8> = match args.get(2) {
-        Some(explicit) => explicit.clone().into_bytes(),
-        None => remote_url(&args[1]),
-    };
-    // end_url_with_slash(): a trailing slash is added if there isn't one.
-    if url.last() != Some(&b'/') {
-        url.push(b'/');
-    }
-
-    // http_init() -> credential_from_url(), which dies on a URL it cannot parse
-    // after warning about the offending component.
-    if !credential_url_is_parseable(&url) {
-        eprintln!("fatal: credential url cannot be parsed: {}", url.as_bstr());
-        return Ok(ExitCode::from(128));
+    // The argument check, the `remote_get` fallback, `end_url_with_slash()` and
+    // `credential_from_url()` are `remote-curl.c::cmd_main`'s, identical for
+    // every name this one binary is installed under; see
+    // [`super::remote_http::prologue`].
+    match super::remote_http::prologue(args) {
+        super::remote_http::Prologue::Exit(code) => return Ok(code),
+        super::remote_http::Prologue::Url(_) => {}
     }
 
     command_loop()
-}
-
-/// `remote_get(argv[1])` reduced to what this command uses: the first
-/// `remote.<name>.url` when the argument names a configured remote, the
-/// argument itself otherwise, with `url.<base>.insteadOf` applied to the result.
-///
-/// Values are carried as raw bytes rather than through `gix_url::Url` so the
-/// string handed to the credential parser is the configured one verbatim —
-/// parsing and re-serialising could normalise it and change the diagnostics.
-fn remote_url(name: &str) -> Vec<u8> {
-    let Ok(repo) = gix::discover(".") else {
-        return name.as_bytes().to_vec();
-    };
-    let config = repo.config_snapshot();
-    let file = config.plumbing();
-
-    let configured = file
-        .strings_by("remote", name, "url")
-        .and_then(|urls| urls.into_iter().next());
-    let url: BString = configured.unwrap_or_else(|| name.into());
-
-    // alias_url(): among all url.<base>.insteadOf values that prefix the URL,
-    // the longest one wins and is replaced by its <base>.
-    let mut best: Option<(BString, usize)> = None;
-    if let Some(sections) = file.sections_by_name("url") {
-        for section in sections {
-            let Some(base) = section.header().subsection_name() else {
-                continue;
-            };
-            for prefix in section.values("insteadOf") {
-                if url.starts_with(prefix.as_slice())
-                    && best.as_ref().is_none_or(|(_, len)| prefix.len() > *len)
-                {
-                    best = Some((base.to_owned(), prefix.len()));
-                }
-            }
-        }
-    }
-
-    match best {
-        Some((base, len)) => {
-            let mut out: Vec<u8> = base.into();
-            out.extend_from_slice(&url[len..]);
-            out
-        }
-        None => url.into(),
-    }
-}
-
-/// `credential.c::credential_from_url_1(c, url, allow_partial = 0, quiet = 0)`,
-/// reduced to its observable effect here: the warnings it prints and whether it
-/// failed. Returns false once a warning has been emitted.
-fn credential_url_is_parseable(url: &[u8]) -> bool {
-    // Match one of:
-    //   (1) proto://<host>/...
-    //   (2) proto://<user>@<host>/...
-    //   (3) proto://<user>:<pass>@<host>/...
-    let Some(proto_end) = url.find("://") else {
-        warn_no_scheme(url);
-        return false;
-    };
-    if proto_end == 0 {
-        warn_no_scheme(url);
-        return false;
-    }
-
-    let cp = &url[proto_end + 3..];
-    let at = cp.find_byte(b'@');
-    let colon = cp.find_byte(b':');
-    // strchrnul(cp, '/'): the end of the string when there is no slash.
-    let slash = cp.find_byte(b'/').unwrap_or(cp.len());
-
-    let (username, password, host) = match at {
-        // Case (1): no credentials in the authority.
-        Some(at) if slash <= at => (None, None, &cp[..slash]),
-        None => (None, None, &cp[..slash]),
-        Some(at) => match colon {
-            // Case (3): user and password — the C's `!(!colon || at <= colon)`.
-            Some(colon) if colon < at => (
-                Some(url_decode(&cp[..colon])),
-                Some(url_decode(&cp[colon + 1..at])),
-                &cp[at + 1..slash],
-            ),
-            // Case (2): user only.
-            _ => (Some(url_decode(&cp[..at])), None, &cp[at + 1..slash]),
-        },
-    };
-
-    // The protocol is taken verbatim; every other component is percent-decoded.
-    let protocol = &url[..proto_end];
-    let host = url_decode(host);
-
-    // "Trim leading and trailing slashes from path" — an all-slash tail leaves
-    // no path component at all.
-    let mut path = &cp[slash..];
-    while path.first() == Some(&b'/') {
-        path = &path[1..];
-    }
-    let path = if path.is_empty() {
-        None
-    } else {
-        let mut decoded = url_decode(path);
-        while decoded.len() > 1 && decoded.last() == Some(&b'/') {
-            decoded.pop();
-        }
-        Some(decoded)
-    };
-
-    // check_url_component() in the C's order.
-    let components: [(&str, Option<&[u8]>); 5] = [
-        ("username", username.as_deref()),
-        ("password", password.as_deref()),
-        ("protocol", Some(protocol)),
-        ("host", Some(host.as_slice())),
-        ("path", path.as_deref()),
-    ];
-    for (name, value) in components {
-        // C strings: everything past a NUL is invisible to strchr().
-        let Some(value) = value else { continue };
-        let value = &value[..value.find_byte(0).unwrap_or(value.len())];
-        if value.contains(&b'\n') {
-            eprintln!(
-                "warning: url contains a newline in its {name} component: {}",
-                url.as_bstr()
-            );
-            return false;
-        }
-    }
-    true
-}
-
-/// The `warning()` shared by both no-scheme rejections.
-fn warn_no_scheme(url: &[u8]) {
-    eprintln!("warning: url has no scheme: {}", url.as_bstr());
-}
-
-/// `url.c::url_decode_mem` — `%XX` is folded to a byte, and an escape that is
-/// not two hex digits is passed through unchanged (which is why a URL such as
-/// `ftps://ho%zzst/r` is accepted by git rather than rejected).
-fn url_decode(input: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(input.len());
-    let mut i = 0;
-    while i < input.len() {
-        if input[i] == b'%' && i + 2 < input.len() {
-            if let (Some(hi), Some(lo)) = (hex(input[i + 1]), hex(input[i + 2])) {
-                out.push(hi << 4 | lo);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(input[i]);
-        i += 1;
-    }
-    out
-}
-
-/// One hex digit, or `None` for anything else — the C's `hexval()`.
-fn hex(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
 }
 
 /// `remote-curl.c::cmd_main`'s command loop.
@@ -456,7 +275,10 @@ fn getline_lf(stdin: &mut impl BufRead) -> std::io::Result<Option<Vec<u8>>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_strtol, option_value, set_option, url_decode};
+    // `url_decode` moved to `remote_http` when the four helpers were folded onto
+    // one prologue; stock ships one binary for all of them (remote-curl.c).
+    use super::super::remote_http::url_decode;
+    use super::{is_strtol, option_value, set_option};
 
     #[test]
     fn option_names_are_matched_as_prefixes_in_source_order() {

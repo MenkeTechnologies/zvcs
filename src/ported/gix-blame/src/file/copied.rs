@@ -9,6 +9,7 @@
 use gix_hash::ObjectId;
 use gix_object::{FindExt, bstr::BString};
 
+use super::function::OriginFiles;
 use super::moved::{self, Split};
 use crate::{
     Error, Statistics,
@@ -125,6 +126,7 @@ fn find_copy_in_parent(
     starts: &[usize],
     paths: &mut PathTable,
     odb: &(impl gix_object::Find + gix_object::FindHeader),
+    origin_files: &mut OriginFiles,
     diff_state: &mut gix_diff::tree::State,
     diff_algorithm: gix_diff::blob::Algorithm,
     ignore_whitespace: bool,
@@ -145,7 +147,6 @@ fn find_copy_in_parent(
     };
 
     let porigin_path = parent.porigin_path.map(|id| paths.path(id).to_owned());
-    let mut blob_buf = Vec::new();
     let mut leftover = Vec::new();
     // Each round hands out at most one chunk per entry, leaving up to two smaller entries behind;
     // those go around again until a round finds nothing, exactly as git's `do { } while (unblamed)`.
@@ -159,7 +160,11 @@ fn find_copy_in_parent(
                 continue;
             }
             let parent_origin = Suspect::at(parent.commit_id, paths.intern(path.as_ref()));
-            let parent_blob = odb.find_blob(blob_id, &mut blob_buf)?.data.to_vec();
+            // `norigin = get_origin(parent, p->one->path)` followed by `fill_origin_blob()`
+            // (`blame.c:2300-2304`). The origin is shared, so a candidate that is still around
+            // from an earlier round — because it holds entries, or because it is the best split so
+            // far — hands the blob over instead of it being read again.
+            let parent_blob = origin_files.fill(parent_origin, blob_id.as_ref(), odb, stats)?;
 
             for (slot, hunk) in best.iter_mut().zip(unblamed.iter()) {
                 let Some((split, score)) = moved::find_copy_in_blob(
@@ -179,6 +184,19 @@ fn find_copy_in_parent(
                     Some((_, best_score, _)) if score < *best_score => {}
                     _ => *slot = Some((split, score, parent_origin)),
                 }
+            }
+
+            // `blame_origin_decref(norigin)` (`blame.c:2315`). The only references a candidate
+            // origin can be under here are the splits that named it as their best so far
+            // (`split_overlap()` increfs it) and the entries an earlier round handed it; without
+            // either it is freed on the spot and the next round reads its blob again.
+            let still_referenced = best
+                .iter()
+                .any(|slot| matches!(slot, Some((_, _, origin)) if *origin == parent_origin))
+                || unblamed.iter().any(|hunk| hunk.has_suspect(&parent_origin))
+                || blamed.iter().any(|hunk| hunk.has_suspect(&parent_origin));
+            if !still_referenced {
+                origin_files.drop_blob(&parent_origin);
             }
         }
 
@@ -209,6 +227,7 @@ pub(super) fn find_copies_in_parents(
     starts: &[usize],
     paths: &mut PathTable,
     odb: &(impl gix_object::Find + gix_object::FindHeader),
+    origin_files: &mut OriginFiles,
     diff_state: &mut gix_diff::tree::State,
     diff_algorithm: gix_diff::blob::Algorithm,
     ignore_whitespace: bool,
@@ -246,6 +265,7 @@ pub(super) fn find_copies_in_parents(
             starts,
             paths,
             odb,
+            origin_files,
             diff_state,
             diff_algorithm,
             ignore_whitespace,

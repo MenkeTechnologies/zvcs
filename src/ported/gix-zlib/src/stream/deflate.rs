@@ -1,7 +1,9 @@
 //! Compression state and a [`std::io::Write`] adapter for producing zlib streams.
 
+use crate::deflate::{
+    Wrap, Z_BUF_ERROR, Z_FINISH, Z_FULL_FLUSH, Z_NO_FLUSH, Z_OK, Z_PARTIAL_FLUSH, Z_STREAM_END, Z_SYNC_FLUSH,
+};
 use crate::{Compression, Status};
-use zlib_rs::DeflateError;
 
 const BUF_SIZE: usize = 4096 * 8;
 
@@ -30,7 +32,11 @@ where
 }
 
 /// Hold all state needed for compressing data.
-pub struct Compress(zlib_rs::Deflate);
+///
+/// Backed by [`crate::deflate`], the zlib transcription, because these bytes end
+/// up in loose objects, packs and bundles that are compared against the ones
+/// `git` writes.
+pub struct Compress(crate::deflate::Deflate);
 
 impl Compress {
     /// The number of bytes that were read from the input.
@@ -45,10 +51,7 @@ impl Compress {
 
     /// Create a new instance compressing with `level` - this allocates so should be done with care.
     pub fn new(level: Compression) -> Self {
-        let config = zlib_rs::DeflateConfig::new(level.level());
-        let header = true;
-        let inner = zlib_rs::Deflate::new(config.level, header, config.window_bits as u8);
-        Self(inner)
+        Self(crate::deflate::Deflate::new(level.level(), Wrap::Zlib))
     }
 
     /// Prepare the instance for a new stream.
@@ -57,19 +60,24 @@ impl Compress {
     }
 
     /// Compress `input` and write compressed bytes to `output`, with `flush` controlling additional characteristics.
+    ///
+    /// `input` is the input that has not been consumed yet, and the bytes written to
+    /// `output` start at its beginning, exactly as with one `deflate()` call.
     pub fn compress(&mut self, input: &[u8], output: &mut [u8], flush: FlushCompress) -> Result<Status, CompressError> {
         let flush = match flush {
-            FlushCompress::None => zlib_rs::DeflateFlush::NoFlush,
-            FlushCompress::Partial => zlib_rs::DeflateFlush::PartialFlush,
-            FlushCompress::Sync => zlib_rs::DeflateFlush::SyncFlush,
-            FlushCompress::Full => zlib_rs::DeflateFlush::FullFlush,
-            FlushCompress::Finish => zlib_rs::DeflateFlush::Finish,
+            FlushCompress::None => Z_NO_FLUSH,
+            FlushCompress::Partial => Z_PARTIAL_FLUSH,
+            FlushCompress::Sync => Z_SYNC_FLUSH,
+            FlushCompress::Full => Z_FULL_FLUSH,
+            FlushCompress::Finish => Z_FINISH,
         };
-        let status = self.0.compress(input, output, flush)?;
-        match status {
-            zlib_rs::Status::Ok => Ok(Status::Ok),
-            zlib_rs::Status::BufError => Ok(Status::BufError),
-            zlib_rs::Status::StreamEnd => Ok(Status::StreamEnd),
+        self.0.set_input(input.len());
+        self.0.set_output(output.len());
+        match self.0.step(input, output, flush) {
+            Z_OK => Ok(Status::Ok),
+            Z_STREAM_END => Ok(Status::StreamEnd),
+            Z_BUF_ERROR => Ok(Status::BufError),
+            _ => Err(CompressError::StreamError),
         }
     }
 }
@@ -84,16 +92,6 @@ pub enum CompressError {
     DataError,
     #[error("Not enough memory")]
     InsufficientMemory,
-}
-
-impl From<zlib_rs::DeflateError> for CompressError {
-    fn from(value: zlib_rs::DeflateError) -> Self {
-        match value {
-            DeflateError::StreamError => CompressError::StreamError,
-            DeflateError::DataError => CompressError::DataError,
-            DeflateError::MemError => CompressError::InsufficientMemory,
-        }
-    }
 }
 
 /// Values which indicate the form of flushing to be used when compressing

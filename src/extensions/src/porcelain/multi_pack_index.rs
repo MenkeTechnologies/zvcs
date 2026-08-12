@@ -542,7 +542,7 @@ fn has_cross_pack_duplicates(index_paths: &[PathBuf], object_hash: gix::hash::Ki
 ///
 /// git writes through `multi-pack-index.lock` and renames on success, so a
 /// failed write never replaces a good index; this does the same.
-fn write_midx(pack_dir: &Path, object_hash: gix::hash::Kind) -> Result<bool> {
+pub(crate) fn write_midx(pack_dir: &Path, object_hash: gix::hash::Kind) -> Result<bool> {
     write_midx_from(pack_dir, object_hash, pack_indices(pack_dir))
 }
 

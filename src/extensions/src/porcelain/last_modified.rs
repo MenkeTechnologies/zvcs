@@ -15,6 +15,10 @@
 //!   * literal `[--] <pathspec>...`, prefixed with the repo-relative cwd like
 //!     git does, with git's exact depth rule (`tree-diff.c:check_recursion_depth`)
 //!   * C-style path quoting (`core.quotePath`) for the newline-terminated form
+//!   * the argv diagnostics: `-h` (usage on stdout, exit 129), an unrecognised
+//!     option (`error: unknown last-modified argument:` + usage on stderr, 129),
+//!     `setup_revisions`' three `verify_filename`/`verify_non_filename` fatals,
+//!     and `last-modified can only operate on one commit at a time`
 //!
 //! Not covered — these `bail!` rather than emit output that would diverge:
 //!   * `<revision-range>` forms (`A..B`, `^X`, `--not`, `--all`, `-n`): they
@@ -25,13 +29,47 @@
 //!     which the vendored `gix-commitgraph` does not expose, so the emission
 //!     order could not be guaranteed to match
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Write;
 use std::process::ExitCode;
 
 use gix::bstr::{BString, ByteSlice};
 use gix::hash::ObjectId;
+
+/// `last_modified_usage[]` rendered by `usage_with_options()`; the option block
+/// is what `parse_options` derives from `last_modified_options[]`.
+const USAGE: &str = "\
+usage: git last-modified [--recursive] [--show-trees] [--max-depth=<depth>] [-z]
+                         [<revision-range>] [[--] <pathspec>...]
+
+    -r, --[no-]recursive  recurse into subtrees
+    -t, --[no-]show-trees show tree entries when recursing into subtrees
+    --max-depth <n>       maximum tree depth to recurse
+    -z                    lines are separated with NUL character
+
+";
+
+/// `verify_filename(..., diagnose_misspelt_rev = 1)`: the argument was neither a
+/// revision nor an existing path, so git cannot tell which was meant.
+fn die_ambiguous(arg: &str) -> ExitCode {
+    eprintln!(
+        "fatal: ambiguous argument '{arg}': unknown revision or path not in the working tree.\n\
+         Use '--' to separate paths from revisions, like this:\n\
+         'git <command> [<revision>...] -- [<file>...]'"
+    );
+    ExitCode::from(128)
+}
+
+/// `verify_filename(..., diagnose_misspelt_rev = 0)`: an earlier argument was
+/// already taken as a path, so this one can only be a path — and it is missing.
+fn die_no_such_path(arg: &str) -> ExitCode {
+    eprintln!(
+        "fatal: {arg}: no such path in the working tree.\n\
+         Use 'git <command> -- <path>...' to specify paths that do not exist locally."
+    );
+    ExitCode::from(128)
+}
 
 /// Parsed command line, mirroring `struct last_modified` plus the diff options
 /// `last_modified_init()` sets on `rev.diffopt`.
@@ -55,18 +93,31 @@ pub fn last_modified(args: &[String]) -> Result<ExitCode> {
     let mut max_depth: i32 = 0;
     let mut show_trees = false;
     let mut nul = false;
-    let mut positionals: Vec<&str> = Vec::new();
+    // `(argument, appeared after `--`)`. `PARSE_OPT_KEEP_DASHDASH` makes
+    // `parse_options` stop at `--`, so nothing past it is read as an option.
+    let mut positionals: Vec<(&str, bool)> = Vec::new();
     let mut only_paths = false;
+    // `PARSE_OPT_KEEP_UNKNOWN_OPT`: unrecognised options survive option parsing
+    // and are reported by `last_modified_init()` *after* `setup_revisions()` has
+    // had its chance to die on a bad revision.
+    let mut unknown: Option<&str> = None;
 
     let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
         if only_paths {
-            positionals.push(a);
+            positionals.push((a, true));
             i += 1;
             continue;
         }
         match a {
+            "-h" => {
+                // `parse_options` writes the usage to stdout for an explicit
+                // `-h` and exits 129 with nothing on stderr.
+                print!("{USAGE}");
+                std::io::stdout().flush()?;
+                return Ok(ExitCode::from(129));
+            }
             "--" => only_paths = true,
             "-r" | "--recursive" => max_depth = -1,
             "--no-recursive" => max_depth = 0,
@@ -88,38 +139,71 @@ pub fn last_modified(args: &[String]) -> Result<ExitCode> {
                     .parse()
                     .map_err(|_| anyhow::anyhow!("invalid --max-depth value: {v}"))?;
             }
-            _ if a.len() > 1 && a.starts_with('-') => bail!(
-                "unsupported flag {a:?} (ported: -r/--recursive, -t/--show-trees, --max-depth, -z)"
-            ),
-            _ => positionals.push(a),
+            _ if a.len() > 1 && a.starts_with('-') => {
+                if unknown.is_none() {
+                    unknown = Some(a);
+                }
+            }
+            _ => positionals.push((a, false)),
         }
         i += 1;
     }
 
     let repo = gix::discover(".")?;
 
-    if repo.commit_graph_if_enabled()?.is_some() {
-        anyhow::bail!("unsupported: repository has a commit-graph; walk order would not match git");
-    }
-
     // Split positionals into `<revision>` and pathspecs the way `setup_revisions`
-    // does: a leading argument that names an object (and is not a worktree path)
-    // is the revision, everything after it is a pathspec.
+    // does: a leading argument that names an object is the revision, everything
+    // after it is a pathspec, and anything that is neither is fatal.
     let mut rev: Option<&str> = None;
     let mut specs: Vec<&str> = Vec::new();
-    for (n, p) in positionals.iter().enumerate() {
+    let mut seen_path = false;
+    for &(p, after_dashdash) in &positionals {
+        if after_dashdash {
+            specs.push(p);
+            continue;
+        }
         if p.contains("..") || p.starts_with('^') {
             anyhow::bail!("unsupported <revision-range> {p:?} (only a single revision is ported)");
         }
-        let is_rev = n == 0
-            && !only_paths_before(args, p)
-            && repo.rev_parse_single(*p).is_ok()
-            && !std::path::Path::new(p).exists();
-        if is_rev {
-            rev = Some(p);
-        } else {
-            specs.push(p);
+        let exists = std::path::Path::new(p).exists();
+        if repo.rev_parse_single(p).is_ok() {
+            if exists {
+                // `verify_non_filename()`.
+                eprintln!(
+                    "fatal: ambiguous argument '{p}': both revision and filename\n\
+                     Use '--' to separate paths from revisions, like this:\n\
+                     'git <command> [<revision>...] -- [<file>...]'"
+                );
+                return Ok(ExitCode::from(128));
+            }
+            if !seen_path && rev.is_none() {
+                rev = Some(p);
+                continue;
+            }
+            if !seen_path {
+                // `populate_paths_from_revs()` rejects a second interesting tip.
+                eprintln!("error: last-modified can only operate on one commit at a time");
+                return Ok(ExitCode::from(255));
+            }
         }
+        if !exists {
+            return Ok(if seen_path {
+                die_no_such_path(p)
+            } else {
+                die_ambiguous(p)
+            });
+        }
+        seen_path = true;
+        specs.push(p);
+    }
+
+    if let Some(a) = unknown {
+        eprint!("error: unknown last-modified argument: {a}\n{USAGE}");
+        return Ok(ExitCode::from(129));
+    }
+
+    if repo.commit_graph_if_enabled()?.is_some() {
+        anyhow::bail!("unsupported: repository has a commit-graph; walk order would not match git");
     }
 
     let mut pathspecs: Vec<BString> = Vec::new();
@@ -154,12 +238,7 @@ pub fn last_modified(args: &[String]) -> Result<ExitCode> {
     let spec = rev.unwrap_or("HEAD");
     let id = match repo.rev_parse_single(spec) {
         Ok(id) => id,
-        Err(_) => {
-            eprintln!(
-                "fatal: ambiguous argument '{spec}': unknown revision or path not in the working tree."
-            );
-            return Ok(ExitCode::from(128));
-        }
+        Err(_) => return Ok(die_ambiguous(spec)),
     };
     let commit = match id.object()?.peel_to_commit() {
         Ok(c) => c,
@@ -264,19 +343,6 @@ pub fn last_modified(args: &[String]) -> Result<ExitCode> {
 
     std::io::stdout().write_all(&out)?;
     Ok(ExitCode::SUCCESS)
-}
-
-/// Whether `p` appears only after a `--` separator (so it can never be a revision).
-fn only_paths_before(args: &[String], p: &str) -> bool {
-    let mut seen_sep = false;
-    for a in args {
-        if a == "--" {
-            seen_sep = true;
-        } else if a == p {
-            return seen_sep;
-        }
-    }
-    false
 }
 
 /// The repo-relative path of the current directory, with a trailing `/`, which

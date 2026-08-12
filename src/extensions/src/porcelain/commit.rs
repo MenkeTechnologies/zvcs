@@ -2964,7 +2964,7 @@ fn parse_author_ident(s: &str) -> Result<(String, String)> {
 /// The comment prefix for message templates: `core.commentString` (a multi-byte
 /// prefix, git 2.45+) if set, else `core.commentChar` (a single character),
 /// defaulting to `#`. `auto` is treated as the default here.
-fn comment_prefix(snap: &gix::config::Snapshot<'_>) -> String {
+pub(super) fn comment_prefix(snap: &gix::config::Snapshot<'_>) -> String {
     if let Some(v) = snap.string("core.commentString") {
         let v = v.to_string();
         if !v.is_empty() && v != "auto" {
@@ -3012,7 +3012,7 @@ fn resolve_editor(snap: &gix::config::Snapshot<'_>) -> Result<String> {
 /// Open `path` in the configured editor and wait, git-style: the editor string
 /// runs through the shell so `core.editor = "code -w"` and other argument-bearing
 /// commands work, and stdio is inherited so the interactive editor owns the tty.
-fn launch_editor(snap: &gix::config::Snapshot<'_>, path: &std::path::Path) -> Result<()> {
+pub(super) fn launch_editor(snap: &gix::config::Snapshot<'_>, path: &std::path::Path) -> Result<()> {
     let editor = resolve_editor(snap)?;
     // `launch_specified_editor` (editor.c): when stderr is a terminal and
     // `advice.waitingForEditor` is on, git says why it is blocked before handing
@@ -3052,7 +3052,7 @@ fn launch_editor(snap: &gix::config::Snapshot<'_>, path: &std::path::Path) -> Re
 /// [`resolve_cleanup`] from `--cleanup`/`commit.cleanup` and whether an editor
 /// is used.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Cleanup {
+pub(super) enum Cleanup {
     /// `strip` (`COMMIT_MSG_CLEANUP_ALL`) — whitespace cleanup plus comment lines.
     Strip,
     /// `whitespace` (`COMMIT_MSG_CLEANUP_SPACE`).
@@ -3068,7 +3068,7 @@ enum Cleanup {
 /// text untouched while the others trim trailing whitespace, collapse runs of
 /// blank lines and drop leading/trailing blank lines. `strip` additionally
 /// removes lines beginning with the comment prefix.
-fn cleanup_message(raw: &str, comment: &str, mode: Cleanup, verbose: bool) -> String {
+pub(super) fn cleanup_message(raw: &str, comment: &str, mode: Cleanup, verbose: bool) -> String {
     // `strbuf_setlen(msg, wt_status_locate_end(...))` — the cut line and
     // everything below it never reach the commit.
     let raw = if verbose || mode == Cleanup::Scissors {

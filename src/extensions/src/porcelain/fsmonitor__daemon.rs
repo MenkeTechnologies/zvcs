@@ -62,6 +62,14 @@ pub fn fsmonitor__daemon(args: &[String]) -> Result<ExitCode> {
         _ => args,
     };
 
+    // `run_builtin()` skips `setup_git_directory()` when the whole command line is
+    // a lone `-h`, so help answers even outside a repository. parse-options prints
+    // the block to *stdout* and exits 129.
+    if rest.len() == 1 && rest[0] == "-h" {
+        println!("{USAGE}");
+        return Ok(ExitCode::from(129));
+    }
+
     // git runs setup before parse_options (RUN_SETUP), so repository discovery
     // failures win over option errors.
     let repo = gix::discover(".")?;
@@ -112,9 +120,15 @@ pub fn fsmonitor__daemon(args: &[String]) -> Result<ExitCode> {
                 return Ok(ExitCode::from(129));
             }
             s => {
-                // Short forms; git reports the first unknown switch character.
+                // Short forms; git consumes the cluster left to right, and `h` is
+                // parse-options' built-in help (stdout), so only the first
+                // character decides between help and the unknown-switch report.
                 let c = s.chars().nth(1).unwrap_or('-');
-                eprint!("error: unknown switch `{c}'\n{USAGE}\n");
+                if c == 'h' {
+                    println!("{USAGE}");
+                } else {
+                    eprint!("error: unknown switch `{c}'\n{USAGE}\n");
+                }
                 return Ok(ExitCode::from(129));
             }
         }

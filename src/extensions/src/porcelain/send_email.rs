@@ -83,7 +83,9 @@
 //!   character, and verbatim otherwise.
 //! * The whole per-patch pipeline: the argument loop that turns files and
 //!   directories into `@files` (with `is_format_patch_arg` disambiguating a name
-//!   that is also a revision), `handle_backup_files`, the 8-bit scan that fills
+//!   that is also a revision, and everything left over handed to
+//!   `git format-patch -o <tmpdir>` so a revision range mails the patches it
+//!   generates), `handle_backup_files`, the 8-bit scan that fills
 //!   `%broken_encoding`, the `*** SUBJECT HERE ***` refusal, `pre_process_file`
 //!   (header unfolding, `header-cmd`, the `%suppress_cc` decisions for the
 //!   `From:`/`To:`/`Cc:` headers and the body's `-by:`/`Cc:` trailers,
@@ -147,9 +149,6 @@
 //! * The SASL mechanisms beyond `PLAIN` and `LOGIN` that `Authen::SASL` would
 //!   supply, and `Authen::SASL`'s ranking between mechanisms — see
 //!   [`super::smtp`].
-//! * Revision arguments, which the script turns into patches by running
-//!   `git format-patch -o <tmpdir>`. Naming patch files or a directory works;
-//!   anything that falls through to `@rev_list_opts` bails.
 //! * `--git-completion-helper`, which shells out to
 //!   `git format-patch --git-completion-helper` and prints the union of both
 //!   option lists. It bails.
@@ -3412,6 +3411,9 @@ fn run(args: &[String], known: &Known, in_repo: bool, last_child: &LastChild) ->
     let mut initial_subject: Option<String> = None;
     let mut initial_in_reply_to: Option<String> = None;
     let mut reply_to: Option<String> = None;
+    // `"v=s" => \$reroll_count`, which is only ever handed back to
+    // `format-patch` as `-v <count>`.
+    let mut reroll_count: Option<String> = None;
 
     for hit in &pass3.hits {
         let val = || hit.value.clone();
@@ -3474,6 +3476,7 @@ fn run(args: &[String], known: &Known, in_repo: bool, last_child: &LastChild) ->
             "xmailer" => s.use_xmailer = on,
             "batch-size" => s.batch_size = val(),
             "relogin-delay" => s.relogin_delay = val(),
+            "v" => reroll_count = val(),
             "outlook-id-fix" => s.smtp.outlook_id_fix = Some(on),
             _ => {}
         }
@@ -3653,7 +3656,17 @@ fn run(args: &[String], known: &Known, in_repo: bool, last_child: &LastChild) ->
     };
     m.annotate = m.s.annotate.unwrap_or(false);
 
-    m.files = collect_files(m.repo.as_ref(), &pass3.rest, format_patch, last_child)?;
+    // `tempdir(CLEANUP => 1)` is removed by Perl's `END`, so the generated
+    // patches have to outlive every path out of this function — including the
+    // `die`s — which is what holding the guard here does.
+    let (files, _format_patch_tmpdir) = collect_files(
+        m.repo.as_ref(),
+        &pass3.rest,
+        format_patch,
+        reroll_count.as_deref(),
+        last_child,
+    )?;
+    m.files = files;
     resolve_sender(&mut m, last_child)?;
     m.time = now_seconds() - (m.files.len() as i64 - 1);
     handle_backup_files(&mut m);
@@ -3861,8 +3874,9 @@ fn collect_files(
     repo: Option<&gix::Repository>,
     rest: &[String],
     format_patch: Option<bool>,
+    reroll_count: Option<&str>,
     last_child: &LastChild,
-) -> Step<Vec<String>> {
+) -> Step<(Vec<String>, Option<TempDir>)> {
     use std::os::unix::fs::FileTypeExt;
 
     let is_format_patch_arg = |f: &str| -> Step<bool> {
@@ -3921,18 +3935,98 @@ fn collect_files(
         }
     }
 
-    if !rev_list_opts.is_empty() {
-        if repo.is_none() {
-            return Err(died("Cannot run git format-patch from outside a repository\n"));
-        }
-        return Err(Stop::Unported(format!(
-            "unsupported: \"{}\" is a revision specification, which send-email turns into patches \
-             by running `git format-patch -o <tmpdir>` and then mailing the result — pass the \
-             patch files themselves instead",
-            rev_list_opts.join(" ")
+    if rev_list_opts.is_empty() {
+        return Ok((files, None));
+    }
+    if repo.is_none() {
+        return Err(died("Cannot run git format-patch from outside a repository\n"));
+    }
+    let tmpdir = TempDir::new("git-send-email")
+        .map_err(|e| died(format!("Failed to create temp dir: {e}\n")))?;
+    let generated = run_format_patch(tmpdir.path(), &rev_list_opts, reroll_count, last_child)?;
+    files.extend(generated);
+    Ok((files, Some(tmpdir)))
+}
+
+/// A directory removed when the value is dropped, standing in for
+/// `File::Temp::tempdir(CLEANUP => 1)`.
+struct TempDir(std::path::PathBuf);
+
+impl TempDir {
+    /// `tempdir()` names the directory with ten random characters. Nothing
+    /// observable depends on the name — it only ever reaches the user inside a
+    /// `format-patch` failure message, where stock's is random too — so this
+    /// only has to be unique against the other processes on the machine.
+    fn new(tag: &str) -> std::io::Result<Self> {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        let dir =
+            std::env::temp_dir().join(format!("{tag}-{}-{unique:08x}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        Ok(Self(dir))
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// ```text
+/// push @files, $repo->command('format-patch', '-o', File::Temp::tempdir(CLEANUP => 1),
+///                             defined $reroll_count ? ('-v', $reroll_count) : (),
+///                             @rev_list_opts);
+/// ```
+///
+/// `Git::command` in list context captures the child's stdout and returns it
+/// chomped line by line, which is how the generated patch names reach `@files`.
+/// stderr is not captured, so `format-patch`'s own diagnostics reach the
+/// terminal first. A non-zero exit throws `Git::Error::Command`, whose text is
+/// `"<cmdline>: command returned error: <status>"` (`Git.pm`'s
+/// `Git::Error::Command::new`); nothing catches it here, so the throw exits
+/// `$? >> 8` — the child's own status — through [`die`].
+fn run_format_patch(
+    tmpdir: &std::path::Path,
+    rev_list_opts: &[String],
+    reroll_count: Option<&str>,
+    last_child: &LastChild,
+) -> Step<Vec<String>> {
+    let mut argv: Vec<String> =
+        vec!["format-patch".into(), "-o".into(), tmpdir.to_string_lossy().into_owned()];
+    if let Some(count) = reroll_count {
+        argv.push("-v".into());
+        argv.push(count.to_string());
+    }
+    argv.extend_from_slice(rev_list_opts);
+
+    let out = std::process::Command::new(self_exe())
+        .args(&argv)
+        .stderr(std::process::Stdio::inherit())
+        .output()
+        .map_err(|e| died(format!("format-patch: {e}\n")))?;
+
+    let status = u8::try_from(out.status.code().unwrap_or(255)).unwrap_or(255);
+    last_child.set(status);
+    if status != 0 {
+        // `$cmdline` is the argument list joined by spaces, without a leading
+        // `git`, which is what `Git::command`'s `_cmd_close` was handed.
+        return Err(died(format!(
+            "{}: command returned error: {status}\n",
+            argv.join(" ")
         )));
     }
-    Ok(files)
+
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(std::string::ToString::to_string)
+        .collect())
 }
 
 /// `$sender` — `sendemail.from`/`--from`, else the repository identity, then

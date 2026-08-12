@@ -14,11 +14,14 @@
 //! wording. The usage block and its exit code (129) match stock git, as does the
 //! exit code on a pack that cannot be opened or does not verify (1).
 //!
-//! Sizes follow git exactly: the third column is the fully resolved object size
-//! (for a delta, the result size read from the delta header, not the delta
-//! stream), and the fourth is the entry's on-disk span — the distance to the next
-//! entry in pack-offset order, or to the start of the pack trailer for the last
-//! entry, matching `packed_object_info()`'s `disk_sizep`.
+//! Sizes follow git exactly. `verify-pack` is a thin wrapper that runs
+//! `index-pack --verify-stat`, so the table is `show_pack_info()`'s, and its
+//! third column is `obj->size` — the size field decoded from the entry's own
+//! pack header. For a base entry that is the object size; for a delta entry it
+//! is the length of the delta instruction stream, *not* the size of the object
+//! the delta reconstructs. The fourth column is the entry's on-disk span, the
+//! distance to the next entry in pack-offset order or to the start of the pack
+//! trailer for the last entry.
 //!
 //! `--object-format` is resolved per pack rather than up front, because that is
 //! where git resolves it: a name it cannot use does not abort the command, it
@@ -318,7 +321,8 @@ struct Row {
     oid: ObjectId,
     offset: u64,
     kind: &'static str,
-    /// Fully resolved object size (`oi.sizep`).
+    /// Size decoded from this entry's own pack header (`obj->size`): the object
+    /// size for a base entry, the delta stream length for a delta entry.
     size: u64,
     /// Bytes this entry occupies in the pack (`oi.disk_sizep`).
     disk: u64,
@@ -368,13 +372,17 @@ fn show_pack_info(
             pack::data::entry::Header::RefDelta { base_id } => Some(base_id),
             _ => None,
         };
+        // `obj->size` in `show_pack_info()` is the size decoded from *this*
+        // entry's own header, which for a delta is the length of the delta
+        // instruction stream — not the size of the object it reconstructs.
+        let entry_size = entry.decompressed_size;
         let info = data.decode_header(entry, &mut inflate, &resolve)?;
         let next = entries.get(i + 1).map_or(pack_end, |(o, _)| *o);
         rows.push(Row {
             oid,
             offset,
             kind: type_name(info.kind),
-            size: info.object_size,
+            size: entry_size,
             disk: next.saturating_sub(offset),
             depth: info.num_deltas,
             base,

@@ -1112,3 +1112,105 @@ mod blame_ranges {
         assert!(matches!(ranges, BlameRanges::WholeFile));
     }
 }
+
+/// git's `blame_origin::refcnt` as `git blame --score-debug` prints it, over the shapes the graph
+/// takes. Every expectation here is the `%02d` column stock git 2.55.0 printed for the history
+/// described in the test's name.
+mod suspect_refcounts {
+    use std::collections::BTreeMap;
+
+    use gix_hash::ObjectId;
+
+    use crate::OriginKey;
+    use crate::file::function::suspect_refcounts;
+
+    /// A distinguishable commit id: `nn` repeated across the whole hash.
+    fn commit(nn: u8) -> ObjectId {
+        ObjectId::from_hex(format!("{nn:02x}").repeat(20).as_bytes()).expect("40 hex digits")
+    }
+
+    fn origin(nn: u8) -> OriginKey {
+        (commit(nn), None)
+    }
+
+    /// `(origin, how many coalesced blame entries name it)`.
+    fn entries(counts: &[(u8, u32)]) -> BTreeMap<OriginKey, u32> {
+        counts.iter().map(|(nn, count)| (origin(*nn), *count)).collect()
+    }
+
+    fn previous(edges: &[(u8, u8)]) -> BTreeMap<OriginKey, OriginKey> {
+        edges.iter().map(|(from, to)| (origin(*from), origin(*to))).collect()
+    }
+
+    /// Three commits each appending a line: every origin is referenced by its own entry, and by
+    /// the `previous` of the origin that passed blame to it.
+    #[test]
+    fn a_chain_counts_its_own_entry_plus_the_previous_pointing_at_it() {
+        let counts = suspect_refcounts(&entries(&[(1, 1), (2, 1), (3, 1)]), &previous(&[(3, 2), (2, 1)]));
+
+        assert_eq!(counts[&origin(1)], 2);
+        assert_eq!(counts[&origin(2)], 2);
+        assert_eq!(counts[&origin(3)], 1);
+    }
+
+    /// A commit that changed one line in the middle leaves the first commit with two entries that
+    /// `blame_coalesce()` cannot merge, and each of them holds its own reference.
+    #[test]
+    fn every_uncoalescable_entry_of_an_origin_holds_a_reference() {
+        let counts = suspect_refcounts(&entries(&[(1, 2), (2, 1)]), &previous(&[(2, 1)]));
+
+        assert_eq!(counts[&origin(1)], 3);
+        assert_eq!(counts[&origin(2)], 1);
+    }
+
+    /// A merge that kept nothing for itself is freed by `blame_origin_decref()`, which follows the
+    /// chain down — so the `previous` it held does *not* count towards the origin it named, while
+    /// the two live branch origins' pointers at their common ancestor do.
+    #[test]
+    fn a_dead_origins_previous_does_not_count() {
+        // merge(4) -> main(2), main(2) -> base(1), side(3) -> base(1); the merge kept no lines.
+        let counts = suspect_refcounts(
+            &entries(&[(1, 1), (2, 1), (3, 1)]),
+            &previous(&[(4, 2), (2, 1), (3, 1)]),
+        );
+
+        assert_eq!(counts[&origin(1)], 3);
+        assert_eq!(counts[&origin(2)], 1, "the dead merge origin's `previous` was released");
+        assert_eq!(counts[&origin(3)], 1);
+        assert!(!counts.contains_key(&origin(4)), "an origin with no references is freed");
+    }
+
+    /// An origin with no entries stays alive as long as a live origin points at it, and while it
+    /// is alive its own `previous` counts too — the closure `blame_origin_decref()` stops at.
+    #[test]
+    fn liveness_travels_along_the_previous_chain() {
+        // Only 1 and 4 keep lines; 2 and 3 survive purely as `previous` links between them.
+        let counts = suspect_refcounts(&entries(&[(1, 1), (4, 1)]), &previous(&[(1, 2), (2, 3), (3, 4)]));
+
+        assert_eq!(counts[&origin(1)], 1);
+        assert_eq!(counts[&origin(2)], 1);
+        assert_eq!(counts[&origin(3)], 1);
+        assert_eq!(counts[&origin(4)], 2);
+    }
+
+    /// The fake working-tree commit enters the graph as an origin under the null id, with the
+    /// entries the overlay's own lines make and, when it had to diff against the suspect, a
+    /// `previous` pointing there. A clean worktree gives it neither.
+    #[test]
+    fn the_fake_working_tree_commit_is_an_origin_like_any_other() {
+        let null = (ObjectId::null(gix_hash::Kind::Sha1), None);
+
+        let mut dirty_previous = BTreeMap::new();
+        dirty_previous.insert(null.clone(), origin(1));
+        let dirty = suspect_refcounts(
+            &[(null.clone(), 2), (origin(1), 1)].into_iter().collect(),
+            &dirty_previous,
+        );
+        assert_eq!(dirty[&null], 2, "one reference per run of lines no scapegoat took");
+        assert_eq!(dirty[&origin(1)], 2, "its own entry, plus the fake origin's `previous`");
+
+        let clean = suspect_refcounts(&entries(&[(1, 1)]), &BTreeMap::new());
+        assert!(!clean.contains_key(&null), "it gave everything away and was freed");
+        assert_eq!(clean[&origin(1)], 1, "`pass_whole_blame()` never set `previous`");
+    }
+}

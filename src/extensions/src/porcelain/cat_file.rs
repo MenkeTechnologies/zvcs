@@ -928,6 +928,7 @@ enum Token {
     ObjectName,
     ObjectType,
     ObjectSize,
+    ObjectSizeDisk,
     Rest,
 }
 
@@ -936,6 +937,9 @@ enum Token {
 struct Format {
     tokens: Vec<Token>,
     has_rest: bool,
+    /// Whether `%(objectsize:disk)` appears, so the on-disk lookup — which costs
+    /// a pack-entry decode per object — is only paid for when it is asked for.
+    has_disk_size: bool,
 }
 
 const DEFAULT_FORMAT: &str = "%(objectname) %(objecttype) %(objectsize)";
@@ -948,6 +952,7 @@ fn compile_format(fmt: &str) -> std::result::Result<Format, String> {
     let mut tokens: Vec<Token> = Vec::new();
     let mut lit: Vec<u8> = Vec::new();
     let mut has_rest = false;
+    let mut has_disk_size = false;
     let mut i = 0;
     while i < bytes.len() {
         let b = bytes[i];
@@ -985,11 +990,15 @@ fn compile_format(fmt: &str) -> std::result::Result<Format, String> {
                 has_rest = true;
                 Token::Rest
             }
-            b"objectsize:disk" | b"deltabase" => {
-                // Valid in git, but the values require pack-entry introspection
-                // gix's header lookup does not surface. Reject rather than fake.
-                let a = String::from_utf8_lossy(atom);
-                return Err(format!("git cat-file: format atom %({a}) is not yet ported"));
+            b"objectsize:disk" => {
+                has_disk_size = true;
+                Token::ObjectSizeDisk
+            }
+            b"deltabase" => {
+                // Valid in git, but naming the delta base needs the pack entry's
+                // OFS_DELTA/REF_DELTA header resolved back to an object id, which
+                // this port does not do. Reject rather than fake.
+                return Err("git cat-file: format atom %(deltabase) is not yet ported".into());
             }
             _ => {
                 // git dies `bad cat-file format: %(<atom>)`.
@@ -1006,20 +1015,154 @@ fn compile_format(fmt: &str) -> std::result::Result<Format, String> {
     if !lit.is_empty() {
         tokens.push(Token::Literal(lit));
     }
-    Ok(Format { tokens, has_rest })
+    Ok(Format { tokens, has_rest, has_disk_size })
 }
 
 /// Render one info line into `out` (no trailing delimiter).
-fn render_info(fmt: &Format, oid: &gix::hash::ObjectId, kind: Kind, size: u64, rest: &[u8], out: &mut Vec<u8>) {
+///
+/// `disk` is only consulted when the format carries `%(objectsize:disk)`; the
+/// caller passes 0 otherwise rather than paying for the lookup.
+fn render_info(
+    fmt: &Format,
+    oid: &gix::hash::ObjectId,
+    kind: Kind,
+    size: u64,
+    disk: u64,
+    rest: &[u8],
+    out: &mut Vec<u8>,
+) {
     for tok in &fmt.tokens {
         match tok {
             Token::Literal(l) => out.extend_from_slice(l),
             Token::ObjectName => out.extend_from_slice(oid.to_hex().to_string().as_bytes()),
             Token::ObjectType => out.extend_from_slice(kind.to_string().as_bytes()),
             Token::ObjectSize => out.extend_from_slice(size.to_string().as_bytes()),
+            Token::ObjectSizeDisk => out.extend_from_slice(disk.to_string().as_bytes()),
             Token::Rest => out.extend_from_slice(rest),
         }
     }
+}
+
+/// `--unordered`'s enumeration: every object in the order the object database
+/// itself yields them, de-duplicated by first sighting.
+///
+/// This is `batch_each_object(opt, batch_unordered_object,
+/// ODB_FOR_EACH_OBJECT_PACK_ORDER, &cb)` with the `oidset seen` that
+/// `batch_unordered_object()` consults, so a loose copy of a packed object is
+/// reported once, from whichever source came first. `odb_for_each_object()`
+/// walks **loose objects first, then packs**, and `PACK_ORDER` asks for each
+/// pack in ascending pack-offset order rather than index (oid) order.
+///
+/// Verified against stock git 2.55.0 on a repository with both loose and packed
+/// objects: its output is the loose set followed by the packed set in exactly
+/// `verify-pack -v`'s offset order.
+///
+/// Within one loose fanout directory git uses raw `readdir` order (it sorts
+/// nothing; only the `00`..`ff` directory names are visited in order), which is
+/// a property of the filesystem rather than of git. `std::fs::read_dir` is the
+/// same `readdir`, so the two agree on the same directory, but neither order is
+/// reproducible across differently-created copies of a repository.
+fn all_objects_in_odb_order(repo: &gix::Repository) -> Result<Vec<gix::hash::ObjectId>> {
+    use gix::odb::store::iter::Ordering;
+    let hex_len = repo.object_hash().len_in_hex();
+    let mut seen: std::collections::HashSet<gix::hash::ObjectId> = std::collections::HashSet::new();
+    let mut ids: Vec<gix::hash::ObjectId> = Vec::new();
+
+    // `for_each_loose_object`: fanout `00`..`ff`, in that order, per odb.
+    let mut name = String::new();
+    for dir in loose_object_dirs(repo) {
+        for fanout in 0u16..=0xff {
+            let sub = dir.join(format!("{fanout:02x}"));
+            let Ok(entries) = std::fs::read_dir(&sub) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let Some(rest) = entry.file_name().to_str().map(str::to_owned) else {
+                    continue;
+                };
+                if rest.len() != hex_len - 2 {
+                    continue;
+                }
+                name.clear();
+                name.push_str(&format!("{fanout:02x}"));
+                name.push_str(&rest);
+                let Ok(oid) = gix::hash::ObjectId::from_hex(name.as_bytes()) else {
+                    continue;
+                };
+                if seen.insert(oid) {
+                    ids.push(oid);
+                }
+            }
+        }
+    }
+
+    // `for_each_packed_object(..., FOR_EACH_OBJECT_PACK_ORDER)`. gitoxide's
+    // iterator yields packs before loose, so the loose tail it appends is
+    // already `seen` and drops out here.
+    for id in repo
+        .objects
+        .iter()?
+        .with_ordering(Ordering::PackAscendingOffsetThenLooseLexicographical)
+    {
+        let oid = id?;
+        if seen.insert(oid) {
+            ids.push(oid);
+        }
+    }
+    Ok(ids)
+}
+
+/// git's `oi.disk_sizep`: how many bytes the object occupies on disk.
+///
+/// `packed_object_info()` reports `revidx[1].offset - obj_offset`, the entry's
+/// span in the pack, which for a delta is the delta's compressed size rather
+/// than the reconstructed object's; `location_by_oid` returns exactly that span
+/// as `entry_size`. `loose_object_info()` reports the loose file's own length.
+///
+/// The order matters. `do_oid_object_info_extended()` calls `find_pack_entry()`
+/// first and only falls back to `loose_object_info()` when no pack has the
+/// object, so an object that exists **both** loose and packed is reported at its
+/// packed size. Verified against stock git 2.55.0: a blob left loose by
+/// `repack` without `-d` has a 72-byte loose file and a 63-byte pack entry, and
+/// `cat-file --batch-check='%(objectsize:disk)'` prints 63.
+pub(crate) fn disk_size(repo: &gix::Repository, id: gix::hash::ObjectId) -> Result<u64> {
+    let mut buf = Vec::new();
+    use gix::odb::pack::Find as _;
+    // `location_by_oid` asserts the handle keeps packs mapped for the lifetime of
+    // the returned location, so the handle has to opt out of pack unloading.
+    let mut odb = repo.objects.clone();
+    odb.prevent_pack_unload();
+    if let Some(loc) = odb.location_by_oid(id.as_ref(), &mut buf) {
+        return Ok(loc.entry_size as u64);
+    }
+    let hex = id.to_string();
+    for dir in loose_object_dirs(repo) {
+        if let Ok(meta) = std::fs::metadata(dir.join(&hex[..2]).join(&hex[2..])) {
+            return Ok(meta.len());
+        }
+    }
+    crate::git_fatal!("cannot determine on-disk size of {hex}")
+}
+
+/// Every `objects/` directory backing this repository — the primary one first,
+/// then each alternate, in the order the odb consults them.
+fn loose_object_dirs(repo: &gix::Repository) -> Vec<std::path::PathBuf> {
+    use gix::odb::store::structure::Record;
+    repo.objects
+        .store_ref()
+        .structure()
+        .map(|records| {
+            records
+                .into_iter()
+                .filter_map(|r| match r {
+                    Record::LooseObjectDatabase {
+                        objects_directory, ..
+                    } => Some(objects_directory),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_else(|_| vec![repo.common_dir().join("objects")])
 }
 
 /// One filter-spec predicate. Only the small, unambiguous subset git shares
@@ -1147,12 +1290,18 @@ fn run_batch(
     let mut out = stdout.lock();
 
     if all_objects {
-        // Ignore stdin; enumerate the whole odb. Default output is oid-sorted
-        // and de-duplicated; `--unordered` streams in enumeration order.
-        let mut ids: Vec<gix::hash::ObjectId> = Vec::new();
-        for id in repo.objects.iter()? {
-            ids.push(id?);
-        }
+        // Ignore stdin; enumerate the whole odb. `batch_objects()` collects into
+        // an `oid_array` and walks it with `oid_array_for_each_unique()` — sorted
+        // and de-duplicated — unless `--unordered`, which walks the odb directly.
+        let mut ids: Vec<gix::hash::ObjectId> = if unordered {
+            all_objects_in_odb_order(&repo)?
+        } else {
+            let mut v: Vec<gix::hash::ObjectId> = Vec::new();
+            for id in repo.objects.iter()? {
+                v.push(id?);
+            }
+            v
+        };
         if !unordered {
             ids.sort();
             ids.dedup();
@@ -1743,7 +1892,12 @@ fn emit_object(
     transform: Option<&mut Transform<'_>>,
 ) -> Result<EmitOutcome> {
     let mut info = Vec::new();
-    render_info(fmt, &oid, kind, size, rest, &mut info);
+    let disk = if fmt.has_disk_size {
+        disk_size(repo, oid)?
+    } else {
+        0
+    };
+    render_info(fmt, &oid, kind, size, disk, rest, &mut info);
     out.write_all(&info)?;
     out.write_all(&[delim])?;
 

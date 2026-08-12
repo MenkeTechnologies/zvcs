@@ -26,11 +26,18 @@
 //!     arguments`, `-e needs exactly one argument`, `--convert-graft-file takes
 //!     no argument`, `only one pattern can be given with -l`, and the
 //!     `options '<a>' and '<b>' cannot be used together` conflict).
+//!   * `--edit`/`-e` — `export_object()` writes the object to
+//!     `$GIT_DIR/REPLACE_EDITOBJ` through `git --no-replace-objects cat-file`
+//!     (`-p`, or the bare type under `--raw`), the editor is opened on it, and
+//!     `import_object()` hashes the result back in as the same type — through
+//!     `git mktree` for a pretty-printed tree. An unchanged object is git's
+//!     `new object is the same as the old one` error (255). As in git, the
+//!     scratch file is left behind, so a second `--edit` in the same repository
+//!     fails on the `O_EXCL` create.
 //!
 //! Not covered, and refused rather than approximated:
-//!   * `--edit`/`-e` — spawns `$GIT_EDITOR` on a pretty-printed object and
-//!     re-parses the result; interactive, no substrate for it here. The argument
-//!     count is still validated exactly as git does before the refusal.
+//!   * `index_fd()`'s `INDEX_FORMAT_CHECK`, the object-format validation git
+//!     runs over the edited bytes before writing them.
 //!   * `--graft` on a commit carrying a `mergetag` header — git's
 //!     `check_mergetags` re-hashes and parses each mergetag to decide whether it
 //!     is discarded, which needs tag parsing this port does not do; refused
@@ -258,9 +265,7 @@ pub fn replace(args: &[String]) -> Result<ExitCode> {
             if positionals.len() != 1 {
                 return usage_msg_opt("-e needs exactly one argument");
             }
-            bail!(
-                "unsupported flag \"--edit\" (ported: -l, -d, -g/--graft, --convert-graft-file, -f, --format; --edit needs an interactive editor round-trip)"
-            )
+            edit_and_replace(&positionals[0], force, raw)
         }
         Mode::ConvertGraftFile => {
             if !positionals.is_empty() {
@@ -298,6 +303,166 @@ fn error_line(msg: &str) {
 fn err(msg: &str) -> Result<ExitCode> {
     error_line(msg);
     Ok(ExitCode::from(255))
+}
+
+/// `edit_and_replace()`: round-trip an object through the editor and replace it
+/// with whatever came back.
+///
+/// The object is exported to `$GIT_DIR/REPLACE_EDITOBJ` by `git cat-file`
+/// (`-p`, or the bare type under `--raw`) run with replacement resolution off,
+/// the editor is opened on it, and the result is hashed back in as the *same*
+/// type — through `git mktree` for a pretty-printed tree, since that listing is
+/// not a tree object's on-disk form. An unchanged object is git's
+/// `new object is the same as the old one` error (255), not a no-op success.
+fn edit_and_replace(object_ref: &str, force: bool, raw: bool) -> Result<ExitCode> {
+    let repo = gix::discover(".")?;
+
+    let Some(old) = resolve(&repo, object_ref) else {
+        return err(&format!("not a valid object name: '{object_ref}'"));
+    };
+    let Some(kind) = object_kind(&repo, old) else {
+        return err(&format!("unable to get object type for {old}"));
+    };
+
+    // `check_ref_valid()`: the ref must be writable *before* the editor runs.
+    let name = format!("{REPLACE_BASE}{old}");
+    if read_replace_ref(&repo, &name)?.is_some() && !force {
+        return err(&format!("replace ref '{name}' already exists"));
+    }
+
+    // git never removes `REPLACE_EDITOBJ`, and creates it `O_EXCL`, so a second
+    // `--edit` in the same repository dies on the leftover. Verified against
+    // stock 2.55.0.
+    let tmpfile = repo.git_dir().join("REPLACE_EDITOBJ");
+    export_object(&tmpfile, old, kind, raw)?;
+
+    let new = if launch_editor(&repo, &tmpfile) {
+        import_object(&repo, &tmpfile, kind, raw)
+    } else {
+        error_line("editing object file failed");
+        None
+    };
+
+    let Some(new) = new else {
+        return Ok(ExitCode::from(255));
+    };
+    if new == old {
+        return err(&format!("new object is the same as the old one: '{old}'"));
+    }
+
+    let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
+    // git passes the literal `"replacement"` as the name it would quote back in
+    // the type-mismatch diagnostic, which `--edit` can never trigger anyway.
+    let ok = replace_object_oid(&repo, object_ref, old, "replacement", new, force)?;
+    Ok(if ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(255)
+    })
+}
+
+/// Render an `io::Error` the way `die_errno()`'s `strerror` would, i.e. without
+/// Rust's trailing ` (os error N)`.
+fn os_msg(e: &std::io::Error) -> String {
+    let s = e.to_string();
+    match s.rfind(" (os error ") {
+        Some(at) => s[..at].to_string(),
+        None => s,
+    }
+}
+
+/// `export_object()`: `git --no-replace-objects cat-file (-p|<type>) <oid>` into
+/// a freshly created `filename`, run as our own binary (git's `cmd.git_cmd = 1`).
+/// `--no-replace-objects` is exactly `GIT_NO_REPLACE_OBJECTS=1` in the child.
+fn export_object(filename: &std::path::Path, oid: ObjectId, kind: Kind, raw: bool) -> Result<()> {
+    // `xopen(filename, O_CREAT | O_EXCL | O_WRONLY, 0666)`.
+    let file = std::fs::File::options()
+        .write(true)
+        .create_new(true)
+        .open(filename)
+        .map_err(|e| anyhow!("unable to create '{}': {}", filename.display(), os_msg(&e)))?;
+    let selector = if raw { kind.to_string() } else { "-p".to_string() };
+    let status = std::process::Command::new(std::env::current_exe()?)
+        .args(["cat-file", &selector, &oid.to_string()])
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(file)
+        .status();
+    match status {
+        Ok(s) if s.success() => Ok(()),
+        _ => {
+            error_line(&format!(
+                "cannot run 'git cat-file' to export object '{oid}'"
+            ));
+            Err(anyhow!("cat-file failed"))
+        }
+    }
+}
+
+/// `import_object()`: hash the edited file back in as `kind`. A pretty-printed
+/// tree goes through `git mktree`; everything else is written verbatim.
+/// `None` is git's -1 return, with the `error:` line already printed.
+fn import_object(
+    repo: &gix::Repository,
+    filename: &std::path::Path,
+    kind: Kind,
+    raw: bool,
+) -> Option<ObjectId> {
+    if !raw && kind == Kind::Tree {
+        let listing = std::fs::File::open(filename).ok()?;
+        let out = std::process::Command::new(std::env::current_exe().ok()?)
+            .arg("mktree")
+            .stdin(listing)
+            .output()
+            .ok()
+            .or_else(|| {
+                error_line("unable to spawn mktree");
+                None
+            })?;
+        if !out.status.success() {
+            error_line("mktree reported failure");
+            return None;
+        }
+        let hex = out.stdout.split(|&b| b == b'\n').next().unwrap_or_default();
+        return match ObjectId::from_hex(hex) {
+            Ok(id) => Some(id),
+            Err(_) => {
+                error_line("mktree did not return an object name");
+                None
+            }
+        };
+    }
+
+    let data = std::fs::read(filename)
+        .map_err(|e| error_line(&format!("unable to fstat {}: {e}", filename.display())))
+        .ok()?;
+    match repo.objects.write_buf(kind, &data) {
+        Ok(id) => Some(id),
+        Err(_) => {
+            error_line("unable to write object to database");
+            None
+        }
+    }
+}
+
+/// `launch_editor(tmpfile, NULL, NULL)`: open the file and wait, without reading
+/// it back — `import_object()` re-reads it from disk. `false` is git's -1.
+fn launch_editor(repo: &gix::Repository, path: &std::path::Path) -> bool {
+    let Some(editor) = super::bugreport::git_editor(Some(repo)) else {
+        error_line("Terminal is dumb, but EDITOR unset");
+        return false;
+    };
+    // `:` is git's documented no-op editor; it is never actually run.
+    if editor == ":" {
+        return true;
+    }
+    match super::bugreport::editor_command(&editor, path).status() {
+        Ok(s) if s.success() => true,
+        Ok(_) | Err(_) => {
+            error_line(&format!("there was a problem with the editor '{editor}'"));
+            false
+        }
+    }
 }
 
 /// What one `create_graft` call did, mirroring the three ways git's version can

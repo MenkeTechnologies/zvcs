@@ -13,26 +13,39 @@
 //! `imap-send.c` carries two implementations: git's own client (above) and a
 //! delegation to libcurl, picked by `--curl`/`--no-curl` with a build-time
 //! default. Which one a stock binary can reach is a property of how it was
-//! compiled, not of the command line. The binary on this machine is built
-//! `USE_CURL_FOR_IMAP_SEND` **and** `NO_OPENSSL`, so `imap-send.c:1820-1824`
-//! forces the curl backend and `--no-curl` only warns:
+//! compiled, not of the command line, and the two `#if` arms of
+//! `imap-send.c:1815-1824` reject whichever flag names a backend that was left
+//! out:
 //!
-//! ```text
-//! $ git imap-send --no-curl -c imap.folder=Drafts < mbox
-//! warning: --no-curl not supported in this build
-//! Sending 1 message to Drafts folder...
-//! ```
+//! | build                            | `--curl`               | `--no-curl`               |
+//! |----------------------------------|------------------------|---------------------------|
+//! | no libcurl                       | warns, uses the client | uses the client           |
+//! | libcurl, `NO_OPENSSL`            | uses curl              | warns, uses curl          |
+//! | libcurl and a TLS stack          | uses curl              | uses the client           |
 //!
-//! This port has a TLS stack and no libcurl, so it behaves as the other build
-//! does: `--curl` warns `--curl not supported in this build`
-//! (`imap-send.c:1817`) and continues with git's own client, and `--no-curl`
-//! selects it silently. The user-visible output of the two backends agrees on
-//! the paths that matter — `Sending N message(s) to F folder...`, the percent
-//! line, and `--list`'s untagged `* LIST` lines are all shared code
-//! (`imap-send.c:1584-1600` / `:1721-1749`) — but the wire dialogue does not,
-//! and neither does the login: libcurl picks a SASL mechanism off `CAPABILITY`
-//! by itself, while git's client uses `LOGIN` unless `imap.authMethod` names
-//! one, and warns when that goes out in the clear (`imap-send.c:1322-1324`).
+//! This port is the third row: it has both a TLS stack and a client that fills
+//! the role libcurl fills in stock, so neither flag names something missing and
+//! neither one warns. `use_curl` therefore defaults on, as `USE_CURL_DEFAULT`
+//! does wherever curl is available.
+//!
+//! What that selects here is the *output contract*, not a second wire
+//! implementation — one client runs either way. The curl backend never opens
+//! the connection itself, so it prints none of the client's connection chatter
+//! (`Resolving <host>... `, `Connecting to [<ip>]:<port>... `, the `OK`s), all
+//! of which `imap_info` writes to **stdout**; and its `--list` announces
+//! `Fetching the list of available folders...` *before* connecting rather than
+//! after (`curl_list_imap_folders` vs `list_imap_folders`). `--no-curl` and
+//! `imap.tunnel` take the client's contract instead, chatter included, which is
+//! also what stock does — a tunnel bypasses curl in both dispatch sites
+//! (`imap-send.c:1836-1841` / `:1874-1879`).
+//!
+//! Everything downstream of the connection is shared code and identical either
+//! way: `Sending N message(s) to F folder...`, the percent line, and `--list`'s
+//! untagged `* LIST` lines (`imap-send.c:1584-1600` / `:1721-1749`). The wire
+//! dialogue is not, and neither is the login: libcurl picks a SASL mechanism
+//! off `CAPABILITY` by itself, while git's client uses `LOGIN` unless
+//! `imap.authMethod` names one, and warns when that goes out in the clear
+//! (`imap-send.c:1322-1324`).
 //!
 //! ### Configuration, all of it live
 //!
@@ -141,19 +154,31 @@ const LONGS: &[(&str, bool)] = &[
 ];
 
 /// State accumulated by the option scan.
-#[derive(Default)]
 struct Opts {
     /// `-f`/`--folder`: `None` unless the flag carried a value. `--no-folder`
     /// leaves this `None`, which is why it cannot clear `imap.folder`.
     folder: Option<String>,
     list: bool,
-    /// `--curl`, which this build cannot honour; see the module docs.
+    /// `static int use_curl = USE_CURL_DEFAULT`, which is 1 wherever curl is
+    /// available; see the module docs for what it selects here.
     curl: bool,
     /// `OPT__VERBOSITY`: `-v` counts up, `-q` counts down, and either `--no-`
     /// form resets to zero (`parse_opt_verbosity_cb`).
     verbosity: i32,
     /// Any non-option argument. The builtin accepts none.
     positional: bool,
+}
+
+impl Default for Opts {
+    fn default() -> Self {
+        Self {
+            folder: None,
+            list: false,
+            curl: true,
+            verbosity: 0,
+            positional: false,
+        }
+    }
 }
 
 /// How the scan ended.
@@ -1201,8 +1226,24 @@ fn imap_warn(verbosity: i32, msg: &str) {
 
 /// `imap_open_store()` (`imap-send.c:1145`) — connect, greet, authenticate, and
 /// make sure `folder` exists.
-fn imap_open_store(cfg: &mut ServerConf, folder: &str, verbosity: i32, list: bool) -> Option<Store> {
+///
+/// `progress` is off on the curl-shaped path, where stock never reaches this
+/// function at all and so prints none of its `imap_info` chatter. Diagnostics
+/// are unaffected: they go to stderr and are printed either way.
+fn imap_open_store(
+    cfg: &mut ServerConf,
+    folder: &str,
+    verbosity: i32,
+    list: bool,
+    progress: bool,
+) -> Option<Store> {
     let host = cfg.host.clone().unwrap_or_default();
+    // The session-establishment chatter, which only the in-tree client emits.
+    let info = |msg: &str| {
+        if progress {
+            imap_info(verbosity, msg);
+        }
+    };
     let mut store = Store {
         stream: None,
         buf: Vec::new(),
@@ -1223,7 +1264,7 @@ fn imap_open_store(cfg: &mut ServerConf, folder: &str, verbosity: i32, list: boo
     };
 
     if let Some(tunnel) = cfg.tunnel.clone() {
-        imap_info(verbosity, &format!("Starting tunnel '{tunnel}'... "));
+        info(&format!("Starting tunnel '{tunnel}'... "));
         let mut child = Command::new("sh")
             .arg("-c")
             .arg(&tunnel)
@@ -1237,9 +1278,9 @@ fn imap_open_store(cfg: &mut ServerConf, folder: &str, verbosity: i32, list: boo
         let stdin = child.stdin.take()?;
         let stdout = child.stdout.take()?;
         store.stream = Some(Stream::Tunnel { child, stdin, stdout });
-        imap_info(verbosity, "OK\n");
+        info("OK\n");
     } else {
-        imap_info(verbosity, &format!("Resolving {host}... "));
+        info(&format!("Resolving {host}... "));
         let targets = match format!("{host}:{}", cfg.port).to_socket_addrs() {
             Ok(t) => t.collect::<Vec<_>>(),
             Err(e) => {
@@ -1247,11 +1288,11 @@ fn imap_open_store(cfg: &mut ServerConf, folder: &str, verbosity: i32, list: boo
                 return None;
             }
         };
-        imap_info(verbosity, "OK\n");
+        info("OK\n");
 
         let mut sock = None;
         for target in targets {
-            imap_info(verbosity, &format!("Connecting to [{}]:{}... ", target.ip(), cfg.port));
+            info(&format!("Connecting to [{}]:{}... ", target.ip(), cfg.port));
             match TcpStream::connect_timeout(&target, TIMEOUT) {
                 Ok(s) => {
                     sock = Some(s);
@@ -1278,7 +1319,7 @@ fn imap_open_store(cfg: &mut ServerConf, folder: &str, verbosity: i32, list: boo
         } else {
             Stream::Plain(sock)
         });
-        imap_info(verbosity, "OK\n");
+        info("OK\n");
     }
 
     // The greeting.
@@ -1327,7 +1368,7 @@ fn imap_open_store(cfg: &mut ServerConf, folder: &str, verbosity: i32, list: boo
             }
         }
 
-        imap_info(verbosity, "Logging in...\n");
+        info("Logging in...\n");
         // `server_fill_credential`: only when something is missing.
         if cfg.user.is_none() || cfg.pass.is_none() {
             let mut c = Credential {
@@ -1591,10 +1632,18 @@ fn imap_store_msg(store: &mut Store, msg: &[u8]) -> i32 {
     ret
 }
 
-/// `append_msgs_to_imap()` (`imap-send.c:1568`).
-fn append_msgs_to_imap(cfg: &mut ServerConf, all: &[u8], total: usize, verbosity: i32) -> u8 {
+/// `append_msgs_to_imap()` (`imap-send.c:1568`), and the send half of
+/// `curl_append_msgs_to_imap()` (`:1721`) when `progress` is off — the two
+/// agree from `Sending N message(s)...` onwards.
+fn append_msgs_to_imap(
+    cfg: &mut ServerConf,
+    all: &[u8],
+    total: usize,
+    verbosity: i32,
+    progress: bool,
+) -> u8 {
     let folder = cfg.folder.clone().unwrap_or_default();
-    let Some(mut store) = imap_open_store(cfg, &folder, verbosity, false) else {
+    let Some(mut store) = imap_open_store(cfg, &folder, verbosity, false, progress) else {
         eprintln!("failed to open store");
         return 1;
     };
@@ -1623,7 +1672,7 @@ fn append_msgs_to_imap(cfg: &mut ServerConf, all: &[u8], total: usize, verbosity
 /// `list_imap_folders()` (`imap-send.c:1607`) — `LIST "" "*"`, whose untagged
 /// replies `buffer_gets` has already printed.
 fn list_imap_folders(cfg: &mut ServerConf, verbosity: i32) -> u8 {
-    let Some(mut store) = imap_open_store(cfg, "INBOX", verbosity, true) else {
+    let Some(mut store) = imap_open_store(cfg, "INBOX", verbosity, true, true) else {
         eprintln!("failed to connect to IMAP server");
         return 1;
     };
@@ -1634,6 +1683,20 @@ fn list_imap_folders(cfg: &mut ServerConf, verbosity: i32) -> u8 {
     } else {
         0
     };
+    store.close();
+    rc
+}
+
+/// `curl_list_imap_folders()` (`imap-send.c:1687`) — the same `LIST`, but the
+/// announcement comes first because curl does not connect until
+/// `curl_easy_perform`, and a failure returns `res != CURLE_OK` without a
+/// message of its own.
+fn curl_list_imap_folders(cfg: &mut ServerConf, verbosity: i32) -> u8 {
+    eprintln!("Fetching the list of available folders...");
+    let Some(mut store) = imap_open_store(cfg, "INBOX", verbosity, true, false) else {
+        return 1;
+    };
+    let rc = u8::from(store.exec("LIST \"\" \"*\"", None, None) != RESP_OK);
     store.close();
     rc
 }
@@ -1676,11 +1739,9 @@ pub fn imap_send(args: &[String]) -> Result<ExitCode> {
         return Ok(usage_err());
     }
 
-    // This build has git's own IMAP client and no libcurl, which is the
-    // `#ifndef USE_CURL_FOR_IMAP_SEND` arm (`imap-send.c:1815-1819`).
-    if opts.curl {
-        eprintln!("warning: --curl not supported in this build");
-    }
+    // Neither arm of `imap-send.c:1815-1824` applies: both backends' roles are
+    // filled here, so neither flag names something missing and neither warns.
+    // See the module docs.
 
     if server.port == 0 {
         server.port = if server.use_ssl { 993 } else { 143 };
@@ -1697,8 +1758,17 @@ pub fn imap_send(args: &[String]) -> Result<ExitCode> {
         server.host = Some("tunnel".into());
     }
 
+    // A tunnel bypasses curl at both dispatch sites, so it always takes the
+    // client's contract (`imap-send.c:1836-1841` / `:1874-1879`).
+    let use_curl = opts.curl && server.tunnel.is_none();
+
     if opts.list {
-        return Ok(ExitCode::from(list_imap_folders(&mut server, opts.verbosity)));
+        let rc = if use_curl {
+            curl_list_imap_folders(&mut server, opts.verbosity)
+        } else {
+            list_imap_folders(&mut server, opts.verbosity)
+        };
+        return Ok(ExitCode::from(rc));
     }
 
     if server.folder.is_none() {
@@ -1721,12 +1791,38 @@ pub fn imap_send(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::from(1));
     }
 
-    Ok(ExitCode::from(append_msgs_to_imap(&mut server, &mbox, total, opts.verbosity)))
+    Ok(ExitCode::from(append_msgs_to_imap(&mut server, &mbox, total, opts.verbosity, !use_curl)))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn parse(args: &[&str]) -> Opts {
+        let owned: Vec<String> = args.iter().map(|a| (*a).to_string()).collect();
+        match scan(&owned) {
+            Scan::Ok(opts) => opts,
+            Scan::Help => panic!("scan treated {args:?} as -h"),
+            Scan::Error(msg, _) => panic!("scan rejected {args:?}: {msg}"),
+        }
+    }
+
+    /// `use_curl` starts at `USE_CURL_DEFAULT`, which is 1 wherever curl is
+    /// available (`imap-send.c:1780-1786`), and both spellings are accepted.
+    ///
+    /// The default is what keeps `imap_open_store`'s `imap_info` chatter —
+    /// `Resolving <host>... ` and the `OK`s, all of it on **stdout** — off the
+    /// path stock reaches through curl. Flipping it back to `false` would put
+    /// that chatter on stdout for every plain `imap-send`, where stock prints
+    /// nothing at all, so this pins the default rather than just the parsing.
+    #[test]
+    fn curl_is_the_default_backend_and_both_spellings_parse() {
+        assert!(parse(&[]).curl, "USE_CURL_DEFAULT is 1 here");
+        assert!(parse(&["--curl"]).curl);
+        assert!(!parse(&["--no-curl"]).curl, "--no-curl selects the in-tree client");
+        // The default survives options that do not name it.
+        assert!(parse(&["--list", "-v"]).curl);
+    }
 
     /// The digest the stock binary sent when it authenticated to a local server
     /// with challenge `<1896.697170952@example.com>` and password `s3cret`.

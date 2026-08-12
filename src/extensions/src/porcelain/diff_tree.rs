@@ -53,7 +53,10 @@
 //!   `--expand-tabs=<n>` (not a base-10 non-negative integer) and an invalid
 //!   `--ignore-submodules=<v>` (outside none/untracked/dirty/all) are both fatal
 //!   (`fatal: '<n>': not a non-negative integer` / `fatal: bad --ignore-submodules
-//!   argument: <v>`, exit 128); valid values are recorded as unsupported.
+//!   argument: <v>`, exit 128). A valid `--expand-tabs` is recorded as unsupported;
+//!   of the `--ignore-submodules` values only `all` is, the other three being
+//!   no-ops for a tree-to-tree diff (see the option arm for the check against
+//!   stock).
 //! * `--merge-base` requires exactly two commits; git enforces this after resolving
 //!   revisions but before the missing-`<tree-ish>` check, so any other count — zero
 //!   included — is `fatal: --merge-base only works with two commits` (exit 128). The
@@ -261,6 +264,10 @@ struct Opts {
     route: Option<Vec<String>>,
     /// `--line-prefix=<s>`, which git puts in front of the commit-id line too.
     line_prefix: Vec<u8>,
+    /// `-v` / `--pretty[=<fmt>]` / `--format[=<fmt>]`: `revs->verbose_header`, which
+    /// makes `show_log()` print a formatted commit header where the bare object name
+    /// would otherwise go. Behind an `Rc` so `Opts` stays `Clone`, like `specs`.
+    pretty: Option<std::rc::Rc<super::log::Pretty>>,
 }
 
 /// One file-level change, in the form the raw/name output needs.
@@ -321,6 +328,7 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
         combined_all_paths: false,
         route: None,
         line_prefix: Vec::new(),
+        pretty: None,
     };
 
     // The first option git accepts but this port cannot honour. Kept until we know
@@ -402,6 +410,12 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
                 "-m" => opts.merges = true,
                 "--no-commit-id" => opts.no_commit_id = true,
                 "--always" => opts.always = true,
+                // `-v` is `revs->verbose_header` on its own, and a bare
+                // `--pretty`/`--format` is that plus `CMIT_FMT_MEDIUM` — git's default
+                // when the option carries no value.
+                "-v" | "--pretty" | "--format" => {
+                    opts.pretty = Some(std::rc::Rc::new(super::log::Pretty::Medium));
+                }
                 // `-R` (git's `DIFF_OPT_REVERSE_DIFF`): swap the two sides of every
                 // file pair. git applies this in diffcore before `--diff-filter`
                 // classification, so a reversed addition is filtered as a deletion;
@@ -500,7 +514,15 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
                         eprintln!("fatal: invalid --pretty format: {v}");
                         return Ok(ExitCode::from(FATAL));
                     }
-                    unsupported.get_or_insert_with(|| a.to_string());
+                    // A name this port can render becomes the verbose header; one it
+                    // only *validates* stays recorded as unsupported, so the run still
+                    // refuses rather than printing the wrong bytes.
+                    match super::log::get_commit_format(v) {
+                        Ok(Some((fmt, _))) => opts.pretty = Some(std::rc::Rc::new(fmt)),
+                        _ => {
+                            unsupported.get_or_insert_with(|| a.to_string());
+                        }
+                    }
                 }
                 // git parses `--expand-tabs=<n>` at option time as a base-10 integer
                 // (leading whitespace and an optional sign allowed, the whole value
@@ -516,16 +538,25 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
                 }
                 // git validates `--ignore-submodules=<value>` at option time against a
                 // fixed, case-sensitive set and dies fatally on anything else (the
-                // empty string included), before revision resolution. A valid value is
-                // still unsupported: it changes which gitlink pairs are reported, so it
-                // is recorded like any other unimplemented option.
+                // empty string included), before revision resolution.
+                //
+                // Only `all` changes a tree-to-tree diff. `dirty` and `untracked` name
+                // states a worktree has and two trees do not, and `none` is the
+                // default, so all three leave the output alone; `all` drops gitlink
+                // pairs entirely and stays recorded as unimplemented. Verified against
+                // git 2.55.0 over a pair of commits whose only submodule change is a
+                // gitlink oid: `diff-tree -r A B` is byte-identical with `none`,
+                // `untracked` and `dirty` (raw and `-p`), and loses the `:160000` row
+                // only with `all`.
                 _ if a.starts_with("--ignore-submodules=") => {
                     let v = &a["--ignore-submodules=".len()..];
                     if !matches!(v, "none" | "untracked" | "dirty" | "all") {
                         eprintln!("fatal: bad --ignore-submodules argument: {v}");
                         return Ok(ExitCode::from(FATAL));
                     }
-                    unsupported.get_or_insert_with(|| a.to_string());
+                    if v == "all" {
+                        unsupported.get_or_insert_with(|| a.to_string());
+                    }
                 }
                 // Rendered by `diff-pairs` further down; see [`needs_pairs`].
                 _ if needs_pairs(a) => {}
@@ -796,18 +827,86 @@ fn emit_commit_diff(
         vec![Some(tree_of(repo, parents[0])?)]
     };
 
-    let term = if opts.nul { b'\0' } else { b'\n' };
     for before in befores {
         let changes = collect(repo, before, Some(new_tree), opts)?;
         *differed |= !changes.is_empty();
         if opts.always || (!opts.no_commit_id && !changes.is_empty()) {
-            out.extend_from_slice(&opts.line_prefix);
-            out.extend_from_slice(commit_id.to_hex().to_string().as_bytes());
-            out.push(term);
+            emit_commit_header(repo, out, commit_id, opts)?;
         }
         render_all(repo, out, &changes, opts)?;
     }
     Ok(0)
+}
+
+/// `show_log()` (log-tree.c:741) followed by the blank line `log_tree_diff_flush()`
+/// (log-tree.c:939) puts between the header and the diff.
+///
+/// Without `revs->verbose_header` that is just the object name, which is what plumbing
+/// callers parse. With it — `-v`, `--pretty`, `--format` — the name gains git's `commit `
+/// prefix and the formatted message follows, except under `oneline`, where the subject
+/// shares the name's line and no blank line separates it from the diff.
+fn emit_commit_header(
+    repo: &gix::Repository,
+    out: &mut Vec<u8>,
+    commit_id: ObjectId,
+    opts: &Opts,
+) -> Result<()> {
+    let term = if opts.nul { b'\0' } else { b'\n' };
+    out.extend_from_slice(&opts.line_prefix);
+    let Some(pretty) = opts.pretty.as_deref() else {
+        out.extend_from_slice(commit_id.to_hex().to_string().as_bytes());
+        out.push(term);
+        return Ok(());
+    };
+    let oneline = matches!(pretty, super::log::Pretty::Oneline);
+    if !oneline {
+        out.extend_from_slice(b"commit ");
+    }
+    out.extend_from_slice(commit_id.to_hex().to_string().as_bytes());
+    // git separates the object name from a oneline body with a space and from every
+    // other body with the line terminator.
+    out.push(if oneline { b' ' } else { term });
+    let commit = repo.find_object(commit_id)?.try_into_commit()?;
+    let body = super::log::rev_list_pretty_body(repo, &commit, pretty)?;
+    if !body.is_empty() {
+        out.extend_from_slice(&body);
+        // `pp_remainder()` already terminates every multi-line format's last message
+        // line; `oneline` is the one that stops after the subject, so only it still
+        // owes a terminator.
+        if body.last() != Some(&term) {
+            out.push(term);
+        }
+    }
+    // log-tree.c:941 — "an extra newline between the end of log and the diff/diffstat
+    // output for readability", suppressed for `oneline` and for `-s`, which selects
+    // `DIFF_FORMAT_NO_OUTPUT` and so leaves nothing for the blank line to separate.
+    if opts.format != Format::NoOutput && !oneline {
+        out.extend_from_slice(&opts.line_prefix);
+        // With both a diffstat and a patch requested the separator is a `---` line
+        // rather than an empty one.
+        if stat_and_patch(opts) {
+            out.extend_from_slice(b"---");
+        }
+        out.push(b'\n');
+    }
+    Ok(())
+}
+
+/// `(DIFF_FORMAT_DIFFSTAT | DIFF_FORMAT_PATCH)` both requested, which is the case
+/// `log_tree_diff_flush()` marks with a `---` line. Both formats at once are always a
+/// routed run — this module's own `Format` holds one at a time — so the answer comes
+/// from the arguments being forwarded to `diff-pairs`.
+fn stat_and_patch(opts: &Opts) -> bool {
+    let Some(args) = &opts.route else {
+        return false;
+    };
+    let stat = args
+        .iter()
+        .any(|a| a == "--stat" || a.starts_with("--stat=") || a == "--patch-with-stat");
+    let patch = args.iter().any(|a| {
+        matches!(a.as_str(), "-p" | "-u" | "--patch" | "--patch-with-raw" | "--patch-with-stat")
+    });
+    stat && patch
 }
 
 /// git's `verify_filename()`: `Some(code)` when the argument cannot be a path, after
@@ -1333,11 +1432,8 @@ fn is_known_unsupported(a: &str) -> bool {
         "--ignore-blank-lines",
         // commit formatting, combined diffs and revision walking
         "--stdin",
-        "-v",
-        "--pretty",
-        "--format",
-        // `--oneline` is `--pretty=oneline --abbrev-commit`; it renders a
-        // commit-message line this port cannot produce.
+        // `--oneline` is `--pretty=oneline --abbrev-commit`; the abbreviated commit
+        // name is what this port does not produce here.
         "--oneline",
         "--no-oneline",
         "-c",
@@ -1510,9 +1606,7 @@ fn combined_commit(
     let term = if opts.nul { b'\0' } else { b'\n' };
     let sep = if opts.nul { b'\0' } else { b'\t' };
     if !opts.no_commit_id {
-        out.extend_from_slice(&opts.line_prefix);
-        out.extend_from_slice(commit_id.to_hex().to_string().as_bytes());
-        out.push(term);
+        emit_commit_header(repo, out, commit_id, opts)?;
     }
     if rows.is_empty() {
         return Ok(0);

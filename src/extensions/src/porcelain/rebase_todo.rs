@@ -19,7 +19,10 @@
 //! * `todo_list_to_strbuf()` — [`List::to_bytes`], with `TODO_LIST_SHORTEN_IDS`
 //!   and `TODO_LIST_ABBREVIATE_CMDS`.
 //! * `sequencer_make_script()` — [`make_script`], including
-//!   `rebase.instructionFormat` and the ` # empty` marker.
+//!   `rebase.instructionFormat` and the ` # empty` marker, and
+//!   `make_script_with_merges()` — [`make_script_with_merges`], the
+//!   `--rebase-merges` sheet, with `label_oid()`'s label minting and
+//!   `rebase.maxLabelLength`.
 //! * `todo_list_rearrange_squash()` — [`rearrange_squash`], the `--autosquash`
 //!   engine: `fixup!`/`amend!`/`squash!` subjects matched by title, by commit
 //!   name, and by subject prefix, then reordered under the commit they name.
@@ -590,6 +593,305 @@ pub(crate) fn make_script(
             out.extend_from_slice(b" empty");
         }
         out.push(b'\n');
+    }
+    Ok(out)
+}
+
+/// `label_oid()`'s bookkeeping: the label each commit was given, and every label
+/// handed out so far (compared case-insensitively, as `strihash` does).
+struct LabelState {
+    commit2label: std::collections::HashMap<ObjectId, String>,
+    labels: std::collections::HashSet<String>,
+    /// `rebase.maxLabelLength`, git's `GIT_MAX_LABEL_LENGTH`.
+    max_label_length: usize,
+}
+
+impl LabelState {
+    fn taken(&self, label: &str) -> bool {
+        self.labels.contains(&label.to_lowercase())
+    }
+}
+
+/// `label_oid()`: the label `oid` is known by, minting one if it has none.
+///
+/// With no `label` hint the label is a unique abbreviation of the object name,
+/// extended until it collides with nothing. With one, the hint is sanitized to
+/// alphanumerics and dashes (it becomes a ref name under `refs/rewritten/`) and
+/// suffixed `-2`, `-3`, … if it is taken, is a full object name, or is `#`.
+///
+/// Not ported: git's UTF-8-aware truncation, which keeps non-ASCII characters
+/// whole. Here every non-alphanumeric byte — multi-byte UTF-8 included — becomes
+/// a dash, so a label built from a non-ASCII subject differs from git's.
+fn label_oid(
+    repo: &gix::Repository,
+    oid: ObjectId,
+    label: Option<&str>,
+    state: &mut LabelState,
+) -> String {
+    if let Some(known) = state.commit2label.get(&oid) {
+        return known.clone();
+    }
+    let hexsz = repo.object_hash().len_in_hex();
+
+    let label = match label {
+        None => {
+            let short = short_name(repo, oid);
+            if state.taken(&short) {
+                // Extend the abbreviation one hex digit at a time until unique.
+                let full = oid.to_string();
+                let mut chosen = full.clone();
+                for i in short.len() + 1..hexsz {
+                    if !state.taken(&full[..i]) {
+                        chosen = full[..i].to_string();
+                        break;
+                    }
+                }
+                chosen
+            } else {
+                short
+            }
+        }
+        Some(hint) => {
+            let mut buf = String::new();
+            for c in hint.chars() {
+                if buf.len() + 1 >= state.max_label_length {
+                    break;
+                }
+                if c.is_ascii_alphanumeric() {
+                    buf.push(c);
+                } else if !buf.is_empty() && !buf.ends_with('-') {
+                    // Avoid a leading dash and double dashes.
+                    buf.push('-');
+                }
+            }
+            if buf.is_empty() {
+                buf = format!("rev-{}", short_name(repo, oid));
+            }
+            let is_full_oid =
+                buf.len() == hexsz && buf.bytes().all(|b| b.is_ascii_hexdigit());
+            if is_full_oid || buf == "#" || state.taken(&buf) {
+                let stem = buf.clone();
+                for i in 2.. {
+                    let candidate = format!("{stem}-{i}");
+                    if !state.taken(&candidate) {
+                        buf = candidate;
+                        break;
+                    }
+                }
+            }
+            buf
+        }
+    };
+
+    state.labels.insert(label.to_lowercase());
+    state.commit2label.insert(oid, label.clone());
+    label
+}
+
+/// `make_script_with_merges()`: the `--rebase-merges` instruction sheet, which
+/// rebuilds the branch topology out of `label`/`reset`/`merge` instructions
+/// instead of flattening it into picks.
+///
+/// `commits` is the replay range oldest first (`revs.reverse = 1`) and `onto` is
+/// the range's `BOTTOM` command-line rev — the first merge base of the symmetric
+/// range `get_revision_ranges()` builds — which git pre-labels `onto` before the
+/// walk. Unrelated histories have no merge base and so get no `onto` label.
+///
+/// Not ported, matching [`make_script`]: `revs.cherry_mark`, so no commit is
+/// dropped for being already upstream. `--rebase-merges=rebase-cousins` is
+/// rejected by the caller, so the `rebase_cousins` arms are not reproduced.
+pub(crate) fn make_script_with_merges(
+    repo: &gix::Repository,
+    commits: &[ObjectId],
+    onto: Option<ObjectId>,
+    keep_empty: bool,
+    abbreviate: bool,
+) -> Result<Vec<u8>> {
+    use std::collections::{HashMap, HashSet};
+
+    let format = instruction_format(repo);
+    let comment = comment_prefix(repo);
+    let (cmd_pick, cmd_label, cmd_reset, cmd_merge) = if abbreviate {
+        ("p", "l", "t", "m")
+    } else {
+        ("pick", "label", "reset", "merge")
+    };
+
+    let mut state = LabelState {
+        commit2label: HashMap::new(),
+        labels: HashSet::new(),
+        max_label_length: repo
+            .config_snapshot()
+            .integer("rebase.maxLabelLength")
+            .and_then(|v| usize::try_from(v).ok())
+            .unwrap_or(GIT_MAX_LABEL_LENGTH),
+    };
+    // `revs->cmdline.rev[0].flags & BOTTOM`: the range's exclusive bottom is the
+    // rebase target, and is always reachable as `onto`.
+    if let Some(onto) = onto {
+        state.commit2label.insert(onto, "onto".to_string());
+        state.labels.insert("onto".to_string());
+    }
+
+    let branches = branch_tips(repo)?;
+    let interesting: HashSet<ObjectId> = commits.iter().copied().collect();
+    let mut commit2todo: HashMap<ObjectId, String> = HashMap::new();
+    let mut tips: Vec<ObjectId> = Vec::new();
+
+    // First phase: render every commit's instruction and label the tips of the
+    // branches each merge brought in.
+    for &oid in commits {
+        let commit = repo.find_commit(oid)?;
+        let empty = is_original_commit_empty(repo, &commit)?;
+        if empty && !keep_empty {
+            continue;
+        }
+        let oneline = String::from_utf8_lossy(&super::log::format_commit(repo, &commit, &format)?)
+            .into_owned();
+
+        let parents: Vec<ObjectId> = commit.parent_ids().map(|p| p.detach()).collect();
+        if parents.len() < 2 {
+            let mut line = format!("{cmd_pick} {oid} {oneline}");
+            if empty {
+                line.push_str(&format!(" {comment} empty"));
+            }
+            commit2todo.insert(oid, line);
+            continue;
+        }
+
+        // A label built from the merge's own subject, used for any merged tip
+        // that no branch points at.
+        let label_from_message = match oneline
+            .strip_prefix(&format!("{comment} Merge "))
+            .and_then(|rest| rest.split_once('\''))
+            .and_then(|(_, rest)| rest.split_once('\''))
+        {
+            Some((quoted, _)) => quoted.to_string(),
+            None => match oneline
+                .strip_prefix(&format!("{comment} Merge pull request "))
+                .and_then(|rest| rest.split_once(" from "))
+            {
+                Some((_, from)) => from.to_string(),
+                None => oneline.clone(),
+            },
+        };
+
+        let mut line = format!("{cmd_merge} -C {oid}");
+        for &parent in &parents[1..] {
+            let hint = branches
+                .get(&parent)
+                .map(String::as_str)
+                .unwrap_or(label_from_message.as_str());
+            line.push(' ');
+            if !interesting.contains(&parent) {
+                // Not being rebased, so it cannot be labelled: name it by a
+                // unique abbreviation instead.
+                line.push_str(&label_oid(repo, parent, None, &mut state));
+                continue;
+            }
+            tips.push(parent);
+            line.push_str(&label_oid(repo, parent, Some(hint), &mut state));
+        }
+        line.push(' ');
+        line.push_str(&oneline);
+        commit2todo.insert(oid, line);
+    }
+
+    // Second phase: label the branch points (a commit more than one replayed
+    // commit has as a parent), and add HEAD as the implicit last tip.
+    let mut child_seen: HashSet<ObjectId> = HashSet::new();
+    for (i, &oid) in commits.iter().enumerate() {
+        for parent in repo.find_commit(oid)?.parent_ids() {
+            let parent = parent.detach();
+            if !interesting.contains(&parent) {
+                continue;
+            }
+            if !child_seen.insert(parent) {
+                label_oid(repo, parent, Some("branch-point"), &mut state);
+            }
+        }
+        if i + 1 == commits.len() {
+            tips.push(oid);
+        }
+    }
+
+    // Third phase: walk back from every tip along first parents, gathering the
+    // commits not yet emitted, so the sheet moves forward rather than jumping
+    // between branches.
+    let mut out = format!("{cmd_label} onto\n").into_bytes();
+    let mut shown: HashSet<ObjectId> = HashSet::new();
+    for &tip in &tips {
+        if shown.contains(&tip) {
+            continue;
+        }
+        match state.commit2label.get(&tip) {
+            Some(name) => out.extend_from_slice(format!("\n{comment} Branch {name}\n").as_bytes()),
+            None => out.push(b'\n'),
+        }
+
+        let mut list: Vec<ObjectId> = Vec::new();
+        let mut walk = Some(tip);
+        while let Some(oid) = walk {
+            if !interesting.contains(&oid) || shown.contains(&oid) {
+                break;
+            }
+            list.insert(0, oid);
+            walk = repo.find_commit(oid)?.parent_ids().next().map(|p| p.detach());
+        }
+
+        match walk {
+            // Ran off the end of history: the branch starts at a new root.
+            None => out.extend_from_slice(format!("{cmd_reset} [new root]\n").as_bytes()),
+            Some(base) => {
+                let to = match state.commit2label.get(&base) {
+                    Some(name) => name.clone(),
+                    None => label_oid(repo, base, None, &mut state),
+                };
+                if to == "onto" {
+                    out.extend_from_slice(format!("{cmd_reset} onto\n").as_bytes());
+                } else {
+                    let commit = repo.find_commit(base)?;
+                    let oneline = super::log::format_commit(repo, &commit, &format)?;
+                    out.extend_from_slice(format!("{cmd_reset} {to} ").as_bytes());
+                    out.extend_from_slice(&oneline);
+                    out.push(b'\n');
+                }
+            }
+        }
+
+        for oid in list {
+            if let Some(line) = commit2todo.get(&oid) {
+                out.extend_from_slice(line.as_bytes());
+                out.push(b'\n');
+            }
+            if let Some(name) = state.commit2label.get(&oid) {
+                out.extend_from_slice(format!("{cmd_label} {name}\n").as_bytes());
+            }
+            shown.insert(oid);
+        }
+    }
+    Ok(out)
+}
+
+/// `GIT_MAX_LABEL_LENGTH`.
+const GIT_MAX_LABEL_LENGTH: usize = 100;
+
+/// `load_branch_decorations()` restricted to what `make_script_with_merges()`
+/// asks of it: the short name of the first `refs/heads/` ref at each commit.
+fn branch_tips(repo: &gix::Repository) -> Result<std::collections::HashMap<ObjectId, String>> {
+    let mut out = std::collections::HashMap::new();
+    for reference in repo.references()?.prefixed("refs/heads/")? {
+        let Ok(mut reference) = reference else { continue };
+        let name = reference
+            .name()
+            .as_bstr()
+            .to_str_lossy()
+            .strip_prefix("refs/heads/")
+            .unwrap_or_default()
+            .to_string();
+        if let Ok(id) = reference.peel_to_id() {
+            out.entry(id.detach()).or_insert(name);
+        }
     }
     Ok(out)
 }

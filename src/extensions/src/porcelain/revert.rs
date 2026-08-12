@@ -757,6 +757,27 @@ fn revert_one(
         if !conflict.is_unresolved(unresolved) {
             continue;
         }
+        // merge-ort reports a path one side modified and the other deleted with
+        // its own message naming both operands, not the generic content notice.
+        // Reverting a root commit hits this for every file the commit added:
+        // "theirs" is the empty tree, so each one is deleted there and modified
+        // in HEAD. The modified side is the one whose tree still carries `path`.
+        if matches!(
+            conflict.resolution,
+            Err(gix::merge::tree::ResolutionFailure::OursModifiedTheirsDeleted)
+        ) {
+            let (modify, delete) = if ours.contains_key(&path) {
+                ("HEAD", other_label.as_str())
+            } else {
+                (other_label.as_str(), "HEAD")
+            };
+            println!(
+                "CONFLICT (modify/delete): {path} deleted in {delete} and modified in {modify}.  \
+                 Version {modify} of {path} left in tree."
+            );
+            conflicted.push(path);
+            continue;
+        }
         // merge-ort's `filemask == 6`: no ancestor stage means both sides added
         // the path, reported as `add/add` rather than `content`.
         let kind = if conflict.entries()[0].is_none() {

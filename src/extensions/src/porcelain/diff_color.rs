@@ -297,6 +297,9 @@ pub(crate) enum DiffSlot {
     Old,
     /// `new` — added lines. Green.
     New,
+    /// `commit` — a commit name. Yellow. Only `range-diff`'s pair header reaches
+    /// this from the diff family; the patch body never emits it.
+    Commit,
     /// `whitespace` — the whitespace-error markup. Red background.
     Whitespace,
     /// `func` — the section heading after the second `@@`. No color by default.
@@ -320,7 +323,7 @@ pub(crate) enum DiffSlot {
 }
 
 /// The number of slots in [`DiffSlot`].
-const NSLOTS: usize = 15;
+const NSLOTS: usize = 16;
 
 /// One row of the slot table: the `color.diff.` and `diff.color.` spellings git
 /// accepts for the slot, and its built-in default spec.
@@ -342,6 +345,7 @@ const SLOT_DEFS: [SlotDef; NSLOTS] = [
     SlotDef { names: &["color.diff.frag", "diff.color.frag"], default_spec: "cyan" },
     SlotDef { names: &["color.diff.old", "diff.color.old"], default_spec: "red" },
     SlotDef { names: &["color.diff.new", "diff.color.new"], default_spec: "green" },
+    SlotDef { names: &["color.diff.commit", "diff.color.commit"], default_spec: "yellow" },
     SlotDef {
         names: &["color.diff.whitespace", "diff.color.whitespace"],
         // `GIT_COLOR_BG_RED`: no foreground change, red background.

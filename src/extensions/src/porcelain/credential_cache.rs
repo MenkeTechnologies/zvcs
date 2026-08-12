@@ -68,7 +68,9 @@ pub fn credential_cache(args: &[String]) -> Result<ExitCode> {
     let mut action: Option<&str> = None;
     let mut no_more_opts = false;
 
-    let mut i = 1;
+    // `dispatch::run` hands us the arguments *after* the verb, so unlike stock's
+    // `cmd_main` there is no program name to skip: parsing starts at index 0.
+    let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
         i += 1;

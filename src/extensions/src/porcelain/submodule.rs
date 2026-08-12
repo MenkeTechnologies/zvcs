@@ -132,6 +132,31 @@ const SUBCOMMANDS: &[&str] = &[
 ///     dies 128; a wrong operand count prints the set-branch usage and exits 129;
 ///     `--default` exits 0 when it removed a branch key and 1 when there was none.
 ///
+///   * `git submodule [--quiet] set-url [--] <path> <newurl>`
+///     Writes `submodule.<name>.url` into the worktree `.gitmodules`, then runs
+///     the same `sync_submodule` pass `sync` runs for that one submodule, so the
+///     new url reaches `.git/config` and the submodule's own remote and the
+///     `Synchronizing submodule url for '<displaypath>'` line is printed. A
+///     wrong operand count prints the set-url usage and exits 129.
+///
+///   * `git submodule [--quiet] deinit [-f|--force] (--all | [--] <path>...)`
+///     Empties each listed submodule's worktree directory and removes the whole
+///     `submodule.<name>` section from `.git/config`, leaving `.gitmodules` and
+///     the gitlink alone. Without `-f` a `git rm -qn` dry run first refuses a
+///     worktree carrying local modifications; a `.git` *directory* inside the
+///     worktree is absorbed into the superproject before the removal, and the
+///     submodule's own `core.worktree` is unset after it. Prints
+///     `Cleared directory '<displaypath>'` and `Submodule '<name>' (<url>)
+///     unregistered for path '<displaypath>'`. Neither `--all` nor a path dies
+///     128; both together print the deinit usage and exit 129.
+///
+///   * `git submodule absorbgitdirs [--] [<path>...]`
+///     Moves any submodule whose repository still lives in its own worktree into
+///     the superproject's `modules/<name>`, leaving a `gitdir:` file and a
+///     matching `core.worktree` behind, then recurses. A submodule that is
+///     already absorbed, or not populated at all, is left untouched — which is
+///     why the common case prints nothing and exits 0.
+///
 /// `--quiet` is accepted in front of every subcommand, but `--cached` is only
 /// declared by `status` and `summary`, so a leading `--cached` in front of any
 /// other subcommand is a usage error exiting 1 — `--quiet` does not suppress the
@@ -148,11 +173,23 @@ const SUBCOMMANDS: &[&str] = &[
 /// while the submodule does hold tags, this bails rather than skipping ahead to
 /// stage 4 and printing a name git would not have printed.
 ///
-/// Not ported, each rejected with a precise reason rather than approximated:
-/// `add`, `deinit`, `set-url` and `absorbgitdirs`. `init` (and `sync`)
-/// additionally bail on `.gitmodules` urls that are
-/// relative (`./`, `../`), which require git's `resolve_relative_url` against
-/// the superproject's default remote.
+/// `-h` as the very first argument is `git-sh-setup`'s, not the script's: the
+/// usage block goes to **stdout** and the exit status is 0, unlike every parse
+/// error, which prints the same block on stderr and exits 1.
+///
+/// All eleven subcommands are ported. What still bails, in every one of them, is
+/// a `.gitmodules` url that is relative (`./`, `../`) — git's
+/// `resolve_relative_url` resolves it against the superproject's default remote,
+/// and that is not ported — plus, in `update`, the clone/fetch-shaping flags
+/// (`--depth`, `--reference`, `--dissociate`, `--recommend-shallow`,
+/// `--single-branch`, `--filter`, `--require-init`) and a `!command` update
+/// strategy.
+///
+/// Every url this porcelain dials comes out of `.gitmodules` rather than off the
+/// command line, so — exactly as `git-submodule.sh:29` does — `GIT_PROTOCOL_FROM_USER`
+/// is cleared on entry and the `protocol.<type>.allow` policy then refuses a
+/// `file` url unless it was explicitly permitted. `git submodule--helper` does
+/// *not* do this, which is why it reaches [`subcommand`] directly.
 pub fn submodule(args: &[String]) -> Result<ExitCode> {
     // Dispatch hands us the subcommand at index 0; tolerate both conventions so
     // the wiring may pass either `["submodule", ...]` or just the tail.
@@ -161,6 +198,41 @@ pub fn submodule(args: &[String]) -> Result<ExitCode> {
         _ => args,
     };
 
+    // `-h` is handled by `git-sh-setup` before `git-submodule.sh` parses
+    // anything of its own: `case "$1" in -h) echo "$LONG_USAGE"; exit`, i.e. the
+    // usage block on **stdout** and a bare `exit`, which is status 0. Only an
+    // exact first argument counts — `git submodule --quiet -h` and
+    // `git submodule status -h` never reach it — and trailing arguments are
+    // ignored, since the `case` never looks at `$#`.
+    if args.first().map(String::as_str) == Some("-h") {
+        print!("{USAGE}");
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    // `git-submodule.sh:29`: "Tell the rest of git that any URLs we get don't
+    // come directly from the user, so it can apply policy as appropriate." Every
+    // url this porcelain dials comes out of `.gitmodules`, so `protocol.<x>.allow
+    // = user` (the default for `file`, CVE-2022-39253) must refuse it. The
+    // assignment is unconditional in the script, so an inherited
+    // `GIT_PROTOCOL_FROM_USER=1` is overwritten — and it is set here rather than
+    // in `submodule--helper`, which is why `git submodule--helper update
+    // --remote` still fetches over `file` where `git submodule update --remote`
+    // does not.
+    std::env::set_var("GIT_PROTOCOL_FROM_USER", "0");
+
+    subcommand(args)
+}
+
+/// The subcommand table `git submodule` and `git submodule--helper` share.
+///
+/// Every name below is registered in builtin/submodule--helper.c's
+/// `OPT_SUBCOMMAND` table against the very same C function the porcelain's
+/// `cmd_<name>` shell wrapper dispatches to, so the helper reaches the
+/// implementation here rather than re-entering [`submodule`] — which matters
+/// because [`submodule`] also reproduces `git-submodule.sh`'s
+/// `GIT_PROTOCOL_FROM_USER=0` export, and the helper deliberately does not have
+/// it.
+pub(super) fn subcommand(args: &[String]) -> Result<ExitCode> {
     // `git submodule [--quiet] [--cached] [<subcommand>]` — the two global flags
     // may precede the subcommand, and mean the same as passing them after it.
     let mut quiet = false;
@@ -201,11 +273,11 @@ pub fn submodule(args: &[String]) -> Result<ExitCode> {
         "foreach" => foreach(tail, quiet),
         "add" => add(tail, quiet),
         "update" => update(tail, quiet),
-        "deinit" => bail!("`submodule deinit` removes submodule worktrees; not ported"),
+        "deinit" => deinit(tail, quiet),
         "sync" => sync(tail, quiet),
         "set-branch" => set_branch(tail, quiet),
-        "set-url" => bail!("`submodule set-url` edits .gitmodules; not ported"),
-        "absorbgitdirs" => bail!("`submodule absorbgitdirs` relocates git dirs; not ported"),
+        "set-url" => set_url(tail, quiet),
+        "absorbgitdirs" => absorbgitdirs(tail),
         _ => usage_exit(),
     }
 }
@@ -932,6 +1004,14 @@ fn foreach_repo(
     let Some(workdir) = repo.workdir().map(ToOwned::to_owned) else {
         return Ok(0);
     };
+    // git's `toplevel` is `xgetcwd()`, read after `git-submodule.sh` ran
+    // `cd_to_toplevel` (and after git's own setup chdir'd to the top level), so
+    // it is the *resolved absolute* worktree path — never the `.` that
+    // `Repository::workdir` hands back for a repository opened in place.
+    // Recursion re-enters this function on the submodule's own repository, whose
+    // worktree is the submodule directory, which is what git's `cp.dir = path`
+    // child sees as its cwd.
+    let toplevel = workdir.canonicalize().unwrap_or_else(|_| absolute(&workdir));
 
     for entry in &entries {
         let Some(sub) = find_submodule(&submodules, &entry.path) else {
@@ -954,7 +1034,7 @@ fn foreach_repo(
         // An empty command list is not an error: git enters every submodule and
         // runs nothing.
         if !cmd.is_empty() {
-            let status = run_in_submodule(cmd, &sm_dir, &workdir, sub.name(), entry, &display)?;
+            let status = run_in_submodule(cmd, &sm_dir, &toplevel, sub.name(), entry, &display)?;
             if !status.success() {
                 eprintln!("fatal: run_command returned non-zero status for {display}\n.");
                 return Ok(128);
@@ -972,9 +1052,14 @@ fn foreach_repo(
     Ok(0)
 }
 
-/// git runs the command through `sh`, so a single argument is a whole script and
-/// several are a command with `"$@"` appended, and exports the five variables
-/// `git-submodule`'s documentation promises.
+/// git's `runcommand_in_submodule_cb`, minus the `Entering` line and the
+/// recursion the caller owns.
+///
+/// The one-argument and many-argument forms are deliberately *not* equivalent,
+/// and git says so in a `NEEDSWORK` comment: only a single argument gets the
+/// five exported variables and the `path=<sq-quoted>; ` prologue, "for
+/// maintaining a faithful translation from shell script". Several arguments are
+/// handed to `run_command` as a plain argv with `use_shell = 1`.
 fn run_in_submodule(
     cmd: &[String],
     sm_dir: &std::path::Path,
@@ -983,25 +1068,73 @@ fn run_in_submodule(
     entry: &Entry,
     display: &str,
 ) -> Result<std::process::ExitStatus> {
-    let mut proc = std::process::Command::new("sh");
-    proc.arg("-c");
-    if cmd.len() == 1 {
-        proc.arg(&cmd[0]);
+    let mut proc = if cmd.len() == 1 {
+        // `strvec_pushf(&cp.args, "path=%s; %s", sq_quote(path), argv[0])`. The
+        // assignment always carries a `;` and a space, so `prepare_shell_cmd`'s
+        // metacharacter test always fires and the script always runs under `sh`.
+        let mut proc = std::process::Command::new("sh");
+        proc.arg("-c")
+            .arg(format!("path={}; {}", sq_quote(entry.path.as_bstr()), cmd[0]))
+            .env("name", name.to_str_lossy().as_ref())
+            .env("sm_path", entry.path.to_str_lossy().as_ref())
+            .env("displaypath", display)
+            .env("sha1", entry.oid.to_hex().to_string())
+            .env("toplevel", toplevel);
+        proc
     } else {
-        proc.arg(format!("{} \"$@\"", cmd[0]));
-        proc.args(cmd);
-    }
+        shell_command(cmd)
+    };
+    // git's `prepare_submodule_repo_env` for the child.
     proc.current_dir(sm_dir)
-        .env("name", name.to_str_lossy().as_ref())
-        .env("sm_path", entry.path.to_str_lossy().as_ref())
-        .env("displaypath", display)
-        .env("sha1", entry.oid.to_hex().to_string())
-        .env("toplevel", toplevel)
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_INDEX_FILE")
         .env_remove("GIT_PREFIX");
     Ok(proc.status()?)
+}
+
+/// git's `prepare_shell_cmd` (run-command.c) for a `use_shell = 1` child: a
+/// first word free of shell metacharacters is executed directly, otherwise the
+/// argv becomes `sh -c '<argv0> "$@"' <argv...>` (or just `sh -c '<argv0>'` when
+/// there is nothing to substitute).
+fn shell_command(argv: &[String]) -> std::process::Command {
+    const METACHARS: &[char] = &[
+        '|', '&', ';', '<', '>', '(', ')', '$', '`', '\\', '"', '\'', ' ', '\t', '\n', '*', '?',
+        '[', '#', '~', '=', '%',
+    ];
+    if !argv[0].contains(METACHARS) {
+        let mut proc = std::process::Command::new(&argv[0]);
+        proc.args(&argv[1..]);
+        return proc;
+    }
+    let mut proc = std::process::Command::new("sh");
+    proc.arg("-c");
+    if argv.len() == 1 {
+        proc.arg(&argv[0]);
+    } else {
+        proc.arg(format!("{} \"$@\"", argv[0]));
+        // git pushes the whole argv after the script, so `$0` is the command
+        // word itself and `"$@"` starts at the first real argument.
+        proc.args(argv);
+    }
+    proc
+}
+
+/// git's `sq_quote_buf` (quote.c): always single-quote, escaping `'` and `!` by
+/// closing the quote, backslash-escaping the character, and reopening.
+fn sq_quote(src: &BStr) -> String {
+    let mut out = BString::from("'");
+    for &b in src.iter() {
+        if b == b'\'' || b == b'!' {
+            out.extend_from_slice(b"'\\");
+            out.push(b);
+            out.push(b'\'');
+        } else {
+            out.push(b);
+        }
+    }
+    out.push(b'\'');
+    out.to_str_lossy().into_owned()
 }
 
 // ------------------------------------------------------------------ sync ----
@@ -1058,15 +1191,7 @@ fn sync_repo(
     };
 
     let submodules = submodules(repo)?;
-    let workdir = repo.workdir().map(ToOwned::to_owned);
-
-    // `.gitmodules` is read raw so urls are copied verbatim, exactly as git's
-    // `sync_submodule` copies `sub->url` without round-tripping a parsed URL.
-    let modules_path = match repo.workdir() {
-        Some(wd) => wd.join(".gitmodules"),
-        None => std::path::PathBuf::from(".gitmodules"),
-    };
-    let modules = ConfigFile::from_path_no_includes(modules_path, Source::Local).ok();
+    let modules = read_gitmodules(repo);
 
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
     let config_path = repo.common_dir().join("config");
@@ -1077,76 +1202,26 @@ fn sync_repo(
         let Some(sub) = find_submodule(&submodules, &entry.path) else {
             continue;
         };
-        // `sync_submodule` returns immediately for an inactive submodule.
-        if !is_submodule_active(repo, &index, sub, &entry.path)? {
-            continue;
-        }
-        let sub_name = sub.name().to_owned();
-        let sub_name = sub_name.as_bstr();
         let display = match super_prefix {
             Some(sp) => format!("{sp}{}", entry.path),
             None => display_path(entry.path.as_bstr(), prefix),
         };
-
-        // The url git copies to both the superproject and the submodule remote.
-        // A relative url needs `resolve_relative_url` against the superproject's
-        // default remote, which is not ported — bail rather than register a
-        // literal `./`/`../` url git would have rewritten.
-        let url = modules
-            .as_ref()
-            .and_then(|m| m.string_by("submodule", Some(sub_name), "url"));
-        if let Some(u) = url.as_ref() {
-            if u.starts_with(b"./") || u.starts_with(b"../") {
-                bail!(
-                    "submodule '{sub_name}' has the relative url {:?}; resolving it against the default remote is not ported",
-                    u.to_str_lossy()
-                );
-            }
-        }
-        // git uses an empty string when the submodule has no url at all.
-        let url_bytes: BString = url.unwrap_or_default();
-
-        if !quiet {
-            println!("Synchronizing submodule url for '{display}'");
-            std::io::stdout().flush()?;
-        }
-
-        // Superproject `submodule.<name>.url` — git's `git_config_set_gently`.
-        config.set_raw_value_by("submodule", Some(sub_name), "url", url_bytes.as_bstr())?;
-        dirty = true;
-
-        // `is_submodule_populated_gently`: no repository on disk means git stops
-        // here (the remote-url rewrite and any recursion are skipped).
-        let sub_repo = match workdir.as_ref() {
-            Some(wd) => gix::open(wd.join(&*gix::path::from_bstr(entry.path.as_bstr()))).ok(),
-            None => None,
-        };
-        let Some(sub_repo) = sub_repo else { continue };
-
-        // Rewrite `remote.<default-remote>.url` in the submodule's own config.
-        let remote = default_remote(&sub_repo)?;
-        let remote = BString::from(remote);
-        let sub_config_path = sub_repo.common_dir().join("config");
-        {
-            let _sub_lock = crate::lock::RepoLock::acquire(sub_repo.git_dir());
-            let mut sub_config =
-                ConfigFile::from_path_no_includes(sub_config_path.clone(), Source::Local)?;
-            sub_config.set_raw_value_by(
-                "remote",
-                Some(remote.as_bstr()),
-                "url",
-                url_bytes.as_bstr(),
-            )?;
-            persist(&sub_config_path, &sub_config)?;
-        }
-
-        if recursive {
-            let nested = format!("{display}/");
-            let code = sync_repo(&sub_repo, &[], quiet, true, Some(&nested), None)?;
-            if code != 0 {
-                if dirty {
-                    persist(&config_path, &config)?;
-                }
+        let outcome = sync_one(
+            repo,
+            &index,
+            sub,
+            &entry.path,
+            &display,
+            quiet,
+            recursive,
+            modules.as_ref(),
+            &mut config,
+        )?;
+        match outcome {
+            SyncOne::Skipped => continue,
+            SyncOne::Synced => dirty = true,
+            SyncOne::Failed(code) => {
+                persist(&config_path, &config)?;
                 return Ok(code);
             }
         }
@@ -1156,6 +1231,114 @@ fn sync_repo(
         persist(&config_path, &config)?;
     }
     Ok(0)
+}
+
+/// What [`sync_one`] did, so its caller knows whether the superproject config
+/// still needs writing out.
+enum SyncOne {
+    /// Inactive: git's `sync_submodule` returns before touching anything.
+    Skipped,
+    /// `submodule.<name>.url` was set in the caller's config file.
+    Synced,
+    /// A recursive descent failed with this exit code; the config was written.
+    Failed(u8),
+}
+
+/// git's `sync_submodule` (submodule--helper.c:1429) for one gitlink: copy the
+/// `.gitmodules` url into the superproject's `submodule.<name>.url`, and — when
+/// the submodule is populated — into `remote.<default-remote>.url` inside the
+/// submodule's own config, descending afterwards under `--recursive`.
+///
+/// The superproject config is written by the caller: git rewrites `.git/config`
+/// once per submodule, and batching the writes is the only difference.
+#[allow(clippy::too_many_arguments)]
+fn sync_one(
+    repo: &gix::Repository,
+    index: &gix::index::State,
+    sub: &gix::Submodule<'_>,
+    path: &BString,
+    display: &str,
+    quiet: bool,
+    recursive: bool,
+    modules: Option<&ConfigFile>,
+    config: &mut ConfigFile,
+) -> Result<SyncOne> {
+    // `sync_submodule` returns immediately for an inactive submodule.
+    if !is_submodule_active(repo, index, sub, path)? {
+        return Ok(SyncOne::Skipped);
+    }
+    let sub_name = sub.name().to_owned();
+    let sub_name = sub_name.as_bstr();
+
+    // The url git copies to both the superproject and the submodule remote.
+    // A relative url needs `resolve_relative_url` against the superproject's
+    // default remote, which is not ported — bail rather than register a
+    // literal `./`/`../` url git would have rewritten.
+    let url = modules.and_then(|m| m.string_by("submodule", Some(sub_name), "url"));
+    if let Some(u) = url.as_ref() {
+        if u.starts_with(b"./") || u.starts_with(b"../") {
+            bail!(
+                "submodule '{sub_name}' has the relative url {:?}; resolving it against the default remote is not ported",
+                u.to_str_lossy()
+            );
+        }
+    }
+    // git uses an empty string when the submodule has no url at all.
+    let url_bytes: BString = url.unwrap_or_default();
+
+    if !quiet {
+        println!("Synchronizing submodule url for '{display}'");
+        std::io::stdout().flush()?;
+    }
+
+    // Superproject `submodule.<name>.url` — git's `git_config_set_gently`.
+    config.set_raw_value_by("submodule", Some(sub_name), "url", url_bytes.as_bstr())?;
+
+    // `is_submodule_populated_gently`: no repository on disk means git stops
+    // here (the remote-url rewrite and any recursion are skipped).
+    let sub_repo = repo
+        .workdir()
+        .and_then(|wd| gix::open(wd.join(&*gix::path::from_bstr(path.as_bstr()))).ok());
+    let Some(sub_repo) = sub_repo else {
+        return Ok(SyncOne::Synced);
+    };
+
+    // Rewrite `remote.<default-remote>.url` in the submodule's own config.
+    let remote = BString::from(default_remote(&sub_repo)?);
+    let sub_config_path = sub_repo.common_dir().join("config");
+    {
+        let _sub_lock = crate::lock::RepoLock::acquire(sub_repo.git_dir());
+        let mut sub_config =
+            ConfigFile::from_path_no_includes(sub_config_path.clone(), Source::Local)?;
+        sub_config.set_raw_value_by("remote", Some(remote.as_bstr()), "url", url_bytes.as_bstr())?;
+        persist(&sub_config_path, &sub_config)?;
+    }
+
+    if recursive {
+        let nested = format!("{display}/");
+        let code = sync_repo(&sub_repo, &[], quiet, true, Some(&nested), None)?;
+        if code != 0 {
+            return Ok(SyncOne::Failed(code));
+        }
+    }
+    Ok(SyncOne::Synced)
+}
+
+/// The worktree `.gitmodules` parsed raw, so urls are read verbatim — exactly as
+/// git's `sub->url` is the literal string from the file, never a round-tripped
+/// URL. `None` when the file is absent or unparsable, which git treats as "no
+/// mappings".
+fn read_gitmodules(repo: &gix::Repository) -> Option<ConfigFile> {
+    ConfigFile::from_path_no_includes(gitmodules_path(repo), Source::Local).ok()
+}
+
+/// Where the worktree `.gitmodules` lives, falling back to the current directory
+/// for a bare repository (which git's `is_writing_gitmodules_ok` would refuse).
+fn gitmodules_path(repo: &gix::Repository) -> std::path::PathBuf {
+    match repo.workdir() {
+        Some(wd) => wd.join(".gitmodules"),
+        None => std::path::PathBuf::from(".gitmodules"),
+    }
 }
 
 /// git's `repo_get_default_remote`: the remote of the submodule's current branch
@@ -1175,6 +1358,531 @@ fn default_remote(repo: &gix::Repository) -> Result<String> {
         Some(v) => v.to_str_lossy().into_owned(),
         None => "origin".to_string(),
     })
+}
+
+// --------------------------------------------------------------- set-url ----
+
+/// The `usage:` block `module_set_url`'s `usage_with_options` prints (exit 129),
+/// captured byte-for-byte from git 2.55.0 (`git submodule--helper set-url`).
+const SET_URL_USAGE: &str = "\
+usage: git submodule set-url [--quiet] <path> <newurl>
+
+    -q, --[no-]quiet      suppress output for setting url of a submodule
+
+";
+
+/// `git submodule set-url [--quiet] [--] <path> <newurl>` — git's
+/// `module_set_url` (submodule--helper.c:3228).
+///
+/// Writes `submodule.<name>.url` into the worktree `.gitmodules`, keyed by the
+/// submodule *name* the `<path>` maps to, then re-reads the file and runs the
+/// same `sync_submodule` that `git submodule sync` runs for that one submodule —
+/// which is what copies the new url into `.git/config` and into the submodule's
+/// own `remote.<default-remote>.url`, and what prints the
+/// `Synchronizing submodule url for '<displaypath>'` line.
+///
+/// `<path>` is matched against `.gitmodules` verbatim, not joined with the cwd
+/// prefix: git's `submodule_from_path(the_repository, null_oid, argv[0])` looks
+/// the raw operand up against the root-relative `path` field, so from a
+/// subdirectory `set-url sub <url>` is the one that resolves and `set-url ../sub
+/// <url>` is the one that dies (confirmed against git 2.55.0).
+fn set_url(args: &[String], mut quiet: bool) -> Result<ExitCode> {
+    let mut operands: Vec<String> = Vec::new();
+    let mut no_more_opts = false;
+
+    // `cmd_set_url` filters the option list before the helper sees it: only
+    // `-q`/`--quiet` and `--` pass, and any other `-*` is the porcelain's own
+    // `usage` (exit 1). The first operand does not stop the scan — the shell
+    // loop `break`s on it and forwards the remainder after `--`.
+    for a in args {
+        if no_more_opts {
+            operands.push(a.clone());
+            continue;
+        }
+        match a.as_str() {
+            "--" => no_more_opts = true,
+            "-q" | "--quiet" => quiet = true,
+            s if s.starts_with('-') && s.len() > 1 => return usage_exit(),
+            _ => {
+                operands.push(a.clone());
+                no_more_opts = true;
+            }
+        }
+    }
+
+    if operands.len() != 2 {
+        eprint!("{SET_URL_USAGE}");
+        return Ok(ExitCode::from(129));
+    }
+    let (path, newurl) = (BString::from(operands[0].as_str()), operands[1].clone());
+
+    let repo = gix::discover(".")?;
+    let prefix = repo_prefix(&repo)?;
+    let submodules = submodules(&repo)?;
+    let Some(sub) = find_submodule(&submodules, &path) else {
+        eprintln!("fatal: no submodule mapping found in .gitmodules for path '{path}'");
+        return Ok(ExitCode::from(128));
+    };
+    let sub_name = sub.name().to_owned();
+
+    // `config_set_in_gitmodules_file_gently`; a failure here returns 1 and the
+    // sync below never runs.
+    let modules_path = gitmodules_path(&repo);
+    {
+        let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
+        let mut modules = ConfigFile::from_path_no_includes(modules_path.clone(), Source::Local)?;
+        modules.set_raw_value_by(
+            "submodule",
+            Some(sub_name.as_bstr()),
+            "url",
+            newurl.as_str(),
+        )?;
+        persist(&modules_path, &modules)?;
+    }
+
+    // `repo_read_gitmodules(the_repository, 0)` then `sync_submodule(sub->path,
+    // prefix, NULL, ...)`: the sync must see the url just written.
+    let index = repo.open_index()?;
+    let display = display_path(path.as_bstr(), prefix.as_ref());
+    let modules = read_gitmodules(&repo);
+    let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
+    let config_path = repo.common_dir().join("config");
+    let mut config = ConfigFile::from_path_no_includes(config_path.clone(), Source::Local)?;
+    let outcome = sync_one(
+        &repo,
+        &index,
+        sub,
+        &path,
+        &display,
+        quiet,
+        false,
+        modules.as_ref(),
+        &mut config,
+    )?;
+    Ok(match outcome {
+        SyncOne::Skipped => ExitCode::SUCCESS,
+        SyncOne::Synced => {
+            persist(&config_path, &config)?;
+            ExitCode::SUCCESS
+        }
+        SyncOne::Failed(code) => {
+            persist(&config_path, &config)?;
+            ExitCode::from(code)
+        }
+    })
+}
+
+// ---------------------------------------------------------------- deinit ----
+
+/// The `usage:` block `module_deinit`'s `usage_with_options` prints (exit 129),
+/// captured byte-for-byte from git 2.55.0
+/// (`git submodule--helper deinit --all <path>`).
+const DEINIT_USAGE: &str = "\
+usage: git submodule deinit [--quiet] [-f | --force] [--all | [--] [<path>...]]
+
+    -q, --[no-]quiet      suppress submodule status output
+    -f, --[no-]force      remove submodule working trees even if they contain local changes
+    --[no-]all            unregister all submodules
+
+";
+
+/// `git submodule deinit [-q] [-f] (--all | [--] <path>...)` — git's
+/// `module_deinit` (submodule--helper.c:1677).
+fn deinit(args: &[String], mut quiet: bool) -> Result<ExitCode> {
+    let mut force = false;
+    let mut all = false;
+    let mut patterns: Vec<BString> = Vec::new();
+    let mut no_more_opts = false;
+
+    // `cmd_deinit`'s option loop: `-f`/`--force`, `-q`/`--quiet`, `--all`, `--`;
+    // the first operand breaks out and any other `-*` is the porcelain's usage.
+    for a in args {
+        if no_more_opts {
+            patterns.push(BString::from(a.as_str()));
+            continue;
+        }
+        match a.as_str() {
+            "--" => no_more_opts = true,
+            "-q" | "--quiet" => quiet = true,
+            "-f" | "--force" => force = true,
+            "--all" => all = true,
+            s if s.starts_with('-') && s.len() > 1 => return usage_exit(),
+            _ => {
+                patterns.push(BString::from(a.as_str()));
+                no_more_opts = true;
+            }
+        }
+    }
+
+    if all && !patterns.is_empty() {
+        eprintln!("error: pathspec and --all are incompatible");
+        eprint!("{DEINIT_USAGE}");
+        return Ok(ExitCode::from(129));
+    }
+    if patterns.is_empty() && !all {
+        eprintln!("fatal: Use '--all' if you really want to deinitialize all submodules");
+        return Ok(ExitCode::from(128));
+    }
+    if let Some(code) = reject_empty_pathspec(&patterns) {
+        return Ok(code);
+    }
+
+    let repo = gix::discover(".")?;
+    let prefix = repo_prefix(&repo)?;
+    let index = repo.open_index()?;
+    let entries = match module_list(&repo, &index, &patterns)? {
+        Ok(entries) => entries,
+        Err(code) => return Ok(ExitCode::from(code)),
+    };
+    let submodules = submodules(&repo)?;
+    let modules = read_gitmodules(&repo);
+    let Some(workdir) = repo.workdir().map(ToOwned::to_owned) else {
+        return Ok(ExitCode::SUCCESS);
+    };
+
+    for entry in &entries {
+        // `if (!sub || !sub->name) goto cleanup` — a gitlink with no
+        // `.gitmodules` mapping is silently left alone.
+        let Some(sub) = find_submodule(&submodules, &entry.path) else {
+            continue;
+        };
+        deinit_one(
+            &repo,
+            &workdir,
+            sub,
+            &entry.path,
+            &display_path(entry.path.as_bstr(), prefix.as_ref()),
+            modules.as_ref(),
+            quiet,
+            force,
+        )?;
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// git's `deinit_submodule` (submodule--helper.c:1578) for one gitlink: empty the
+/// worktree directory and drop the whole `submodule.<name>` section from
+/// `.git/config`, leaving `.gitmodules` and the gitlink itself untouched.
+#[allow(clippy::too_many_arguments)]
+fn deinit_one(
+    repo: &gix::Repository,
+    workdir: &std::path::Path,
+    sub: &gix::Submodule<'_>,
+    path: &BString,
+    display: &str,
+    modules: Option<&ConfigFile>,
+    quiet: bool,
+    force: bool,
+) -> Result<()> {
+    let sub_name = sub.name().to_owned();
+    let sm_dir = workdir.join(&*gix::path::from_bstr(path.as_bstr()));
+
+    if sm_dir.is_dir() {
+        // A real `.git` *directory* inside the worktree would be deleted along
+        // with it, so git relocates it into the superproject first.
+        if sm_dir.join(".git").is_dir() {
+            if !quiet {
+                eprintln!(
+                    "warning: Submodule work tree '{display}' contains a .git directory. This will be replaced with a .git file by using absorbgitdirs."
+                );
+            }
+            absorb_one(repo, path, None)?;
+        }
+
+        // `git rm -qn <path>`: a dry run whose only job is to refuse when the
+        // worktree carries changes that removing it would throw away.
+        if !force {
+            let dry = crate::dispatch::run(
+                "rm",
+                &["-qn".to_string(), path.to_str_lossy().into_owned()],
+            )?;
+            if dry != ExitCode::SUCCESS {
+                crate::git_fatal!(
+                    "Submodule work tree '{display}' contains local modifications; use '-f' to discard them"
+                );
+            }
+        }
+
+        let removed = std::fs::remove_dir_all(&sm_dir).is_ok();
+        if !quiet {
+            if removed {
+                println!("Cleared directory '{display}'");
+            } else {
+                println!("Could not remove submodule work tree '{display}'");
+            }
+            std::io::stdout().flush()?;
+        }
+        unset_core_worktree(repo, sub_name.as_bstr(), display);
+    }
+
+    // git recreates the (now empty) directory so the gitlink keeps a mount
+    // point. The diagnostic it prints when that fails carries no newline.
+    if std::fs::create_dir(&sm_dir).is_err() {
+        print!("could not create empty submodule directory {display}");
+        std::io::stdout().flush()?;
+    }
+
+    // `git config --get-regexp "submodule.<name>\."` decides whether there is
+    // anything registered; only then is the section removed and the line
+    // printed. git drops the *whole* section so a later `init` starts clean.
+    let config_path = repo.common_dir().join("config");
+    let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
+    let mut config = ConfigFile::from_path_no_includes(config_path.clone(), Source::Local)?;
+    let mut removed_any = false;
+    while config
+        .remove_section("submodule", Some(sub_name.as_bstr()))
+        .is_some()
+    {
+        removed_any = true;
+    }
+    if removed_any {
+        persist(&config_path, &config)?;
+        if !quiet {
+            let url = modules
+                .and_then(|m| m.string_by("submodule", Some(sub_name.as_bstr()), "url"))
+                .unwrap_or_default();
+            println!(
+                "Submodule '{}' ({}) unregistered for path '{display}'",
+                sub_name,
+                url.to_str_lossy()
+            );
+            std::io::stdout().flush()?;
+        }
+    }
+    Ok(())
+}
+
+/// git's `submodule_unset_core_worktree` (submodule.c:2059): drop
+/// `core.worktree` from the submodule's own config, warning rather than dying
+/// when that cannot be done.
+///
+/// "Cannot be done" includes *there was nothing to unset*: git goes through
+/// `repo_config_set_in_file_gently(..., NULL)`, which answers `CONFIG_NOTHING_SET`
+/// for an absent key, so a second `deinit` of the same submodule warns even
+/// though the first one already left the config in the wanted state.
+fn unset_core_worktree(repo: &gix::Repository, name: &BStr, display: &str) {
+    let unset = || -> Result<bool> {
+        let path = submodule_name_to_gitdir(repo, name)?.join("config");
+        let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
+        let mut config = ConfigFile::from_path_no_includes(path.clone(), Source::Local)?;
+        let removed = config
+            .section_mut("core", None)
+            .ok()
+            .and_then(|mut section| section.remove("worktree"))
+            .is_some();
+        if removed {
+            persist(&path, &config)?;
+        }
+        Ok(removed)
+    };
+    if !matches!(unset(), Ok(true)) {
+        eprintln!("warning: Could not unset core.worktree setting in submodule '{display}'");
+    }
+}
+
+// --------------------------------------------------------- absorbgitdirs ----
+
+/// The `usage:` block `absorb_git_dirs`' `usage_with_options` prints (exit 129).
+/// Its only option, `--super-prefix`, is `PARSE_OPT_HIDDEN`, so the block is the
+/// usage line and a blank line and nothing else.
+const ABSORB_USAGE: &str = "usage: git submodule absorbgitdirs [<options>] [<path>...]\n\n";
+
+/// `git submodule absorbgitdirs [--] [<path>...]` — git's `absorb_git_dirs`
+/// (submodule--helper.c:3194). `cmd_absorbgitdirs` forwards its arguments
+/// unfiltered, so the porcelain and the helper parse identically here.
+fn absorbgitdirs(args: &[String]) -> Result<ExitCode> {
+    let mut patterns: Vec<BString> = Vec::new();
+    let mut super_prefix: Option<String> = None;
+    let mut no_more_opts = false;
+
+    let mut i = 0;
+    while let Some(a) = args.get(i) {
+        i += 1;
+        if no_more_opts {
+            patterns.push(BString::from(a.as_str()));
+            continue;
+        }
+        match a.as_str() {
+            "--" => no_more_opts = true,
+            "--super-prefix" => match args.get(i) {
+                Some(v) => {
+                    super_prefix = Some(v.clone());
+                    i += 1;
+                }
+                None => {
+                    eprintln!("error: option `super-prefix' requires a value");
+                    eprint!("{ABSORB_USAGE}");
+                    return Ok(ExitCode::from(129));
+                }
+            },
+            s if s.starts_with("--super-prefix=") => {
+                super_prefix = Some(s["--super-prefix=".len()..].to_string());
+            }
+            s if s.starts_with("--") => {
+                eprintln!("error: unknown option `{}'", &s[2..]);
+                eprint!("{ABSORB_USAGE}");
+                return Ok(ExitCode::from(129));
+            }
+            s if s.starts_with('-') && s.len() > 1 => {
+                eprintln!(
+                    "error: unknown switch `{}'",
+                    s[1..].chars().next().expect("len > 1")
+                );
+                eprint!("{ABSORB_USAGE}");
+                return Ok(ExitCode::from(129));
+            }
+            _ => patterns.push(BString::from(a.as_str())),
+        }
+    }
+
+    if let Some(code) = reject_empty_pathspec(&patterns) {
+        return Ok(code);
+    }
+
+    let repo = gix::discover(".")?;
+    let code = absorb_repo(&repo, &patterns, super_prefix.as_deref())?;
+    Ok(ExitCode::from(code))
+}
+
+/// One superproject's worth of `absorbgitdirs`: `absorb_git_dir_into_superproject`
+/// for every listed gitlink.
+fn absorb_repo(
+    repo: &gix::Repository,
+    patterns: &[BString],
+    super_prefix: Option<&str>,
+) -> Result<u8> {
+    let index = repo.open_index()?;
+    let entries = match module_list(repo, &index, patterns)? {
+        Ok(entries) => entries,
+        Err(code) => return Ok(code),
+    };
+    for entry in &entries {
+        absorb_one(repo, &entry.path, super_prefix)?;
+    }
+    Ok(0)
+}
+
+/// git's `absorb_git_dir_into_superproject` (submodule.c:2556): make the
+/// submodule's repository live under the superproject's `modules/<name>`, with
+/// `<path>/.git` a `gitdir:` file pointing at it, then recurse.
+fn absorb_one(
+    repo: &gix::Repository,
+    path: &BString,
+    super_prefix: Option<&str>,
+) -> Result<()> {
+    let Some(workdir) = repo.workdir() else {
+        return Ok(());
+    };
+    let sm_dir = workdir.join(&*gix::path::from_bstr(path.as_bstr()));
+    let dot_git = sm_dir.join(".git");
+
+    // `resolve_gitdir_gently(<path>/.git, &err_code)`.
+    if !dot_git.exists() {
+        // `READ_GITFILE_ERR_MISSING`: unpopulated as expected, and git returns
+        // *before* recursing.
+        return Ok(());
+    }
+    match gix::open(&sm_dir) {
+        Ok(sub_repo) => {
+            // Already absorbed? git compares the resolved git dir against the
+            // superproject's resolved common dir by prefix.
+            let real_sub = real_path(sub_repo.git_dir());
+            let real_common = real_path(repo.common_dir());
+            if !real_sub.starts_with(&real_common) {
+                relocate_git_dir(repo, path, &sm_dir, super_prefix)?;
+            }
+        }
+        Err(_) => {
+            // `READ_GITFILE_ERR_NOT_A_REPO`: populated, but the gitfile points
+            // nowhere — the superproject was itself just absorbed and the link
+            // has not been rewritten yet. Repoint it at where it must live.
+            let submodules = submodules(repo)?;
+            let Some(sub) = find_submodule(&submodules, path) else {
+                crate::git_fatal!("could not lookup name for submodule '{path}'");
+            };
+            let sub_gitdir = submodule_name_to_gitdir(repo, sub.name())?;
+            connect_work_tree_and_git_dir(&sm_dir, &sub_gitdir)?;
+        }
+    }
+
+    // `absorb_git_dir_into_superproject_recurse`: the same pass inside the
+    // submodule, with the display prefix extended by this path.
+    let Ok(sub_repo) = gix::open(&sm_dir) else {
+        crate::git_fatal!("could not recurse into submodule '{path}'");
+    };
+    let nested = format!("{}{path}/", super_prefix.unwrap_or(""));
+    absorb_repo(&sub_repo, &[], Some(&nested))?;
+    Ok(())
+}
+
+/// git's `relocate_single_git_dir_into_superproject` (submodule.c:2487): move a
+/// `<path>/.git` *directory* into `<superproject-git-dir>/modules/<name>` and
+/// leave the pair of links behind.
+fn relocate_git_dir(
+    repo: &gix::Repository,
+    path: &BString,
+    sm_dir: &std::path::Path,
+    super_prefix: Option<&str>,
+) -> Result<()> {
+    let old_git_dir = sm_dir.join(".git");
+    // An actual gitfile does not need migration; only a real directory does.
+    if old_git_dir.is_file() {
+        return Ok(());
+    }
+    // `submodule_uses_worktrees`: `relocate_gitdir` would break the linked
+    // worktrees' `gitdir` files, so git refuses outright.
+    if std::fs::read_dir(old_git_dir.join("worktrees"))
+        .map(|mut d| d.next().is_some())
+        .unwrap_or(false)
+    {
+        crate::git_fatal!(
+            "relocate_gitdir for submodule '{path}' with more than one worktree not supported"
+        );
+    }
+
+    let real_old = real_path(&old_git_dir);
+    let submodules = submodules(repo)?;
+    let Some(sub) = find_submodule(&submodules, path) else {
+        crate::git_fatal!("could not lookup name for submodule '{path}'");
+    };
+    let new_git_dir = submodule_name_to_gitdir(repo, sub.name())?;
+    if let Some(parent) = new_git_dir.parent() {
+        if std::fs::create_dir_all(parent).is_err() {
+            crate::git_fatal!("could not create directory '{}'", new_git_dir.display());
+        }
+    }
+    let real_new = real_path(&new_git_dir);
+
+    eprintln!(
+        "Migrating git directory of '{}{path}' from\n'{}' to\n'{}'",
+        super_prefix.unwrap_or(""),
+        real_old.display(),
+        real_new.display()
+    );
+
+    // `relocate_gitdir`: rename, then re-link the worktree and the git dir.
+    if let Err(err) = std::fs::rename(&real_old, &real_new) {
+        crate::git_fatal!(
+            "could not migrate git directory from '{}' to '{}': {err}",
+            real_old.display(),
+            real_new.display()
+        );
+    }
+    connect_work_tree_and_git_dir(sm_dir, &real_new)
+}
+
+/// git's `real_pathdup(path, 1)`: the path with every symlink resolved. A
+/// component that does not exist yet cannot be resolved, so the deepest existing
+/// ancestor is resolved and the remainder appended — which is what git's
+/// `strbuf_realpath` does for the not-yet-created `modules/<name>`.
+fn real_path(path: &std::path::Path) -> std::path::PathBuf {
+    if let Ok(resolved) = path.canonicalize() {
+        return resolved;
+    }
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => real_path(parent).join(name),
+        _ => absolute(path),
+    }
 }
 
 // ---------------------------------------------------------------- update ----
@@ -1850,6 +2558,17 @@ fn fetch_in_submodule(
     quiet: bool,
     direct: Option<(&str, &ObjectId)>,
 ) -> Result<u8> {
+    // git's `git fetch` child runs `transport_check_allowed()` before it dials,
+    // and dies `fatal: transport '<type>' not allowed` when the policy refuses —
+    // which is what stops a `file` submodule url unless `protocol.file.allow` is
+    // relaxed. The ported `fetch` does not implement the allow-list, so the same
+    // check is applied here instead: one layer above the child, with the same
+    // message, the same exit code, and before any transfer can start.
+    if let Some(kind) = refused_transport(sm_dir, direct.map(|(remote, _)| remote))? {
+        eprintln!("fatal: transport '{kind}' not allowed");
+        return Ok(crate::fatal::EXIT_FATAL);
+    }
+
     let exe = std::env::current_exe()?;
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("fetch");
@@ -1862,6 +2581,90 @@ fn fetch_in_submodule(
     submodule_child_env(&mut cmd, sm_dir);
     let status = cmd.status()?;
     Ok(child_code(status))
+}
+
+/// The transport name `git fetch` inside `sm_dir` would refuse, or `None` when
+/// the fetch may proceed (including when there is no url to judge — `git fetch`
+/// then fails on its own terms, with its own message).
+///
+/// `remote` names the remote the fetch will use; `None` means the default one,
+/// git's `repo_get_default_remote`.
+fn refused_transport(sm_dir: &std::path::Path, remote: Option<&str>) -> Result<Option<String>> {
+    let Ok(repo) = gix::open(sm_dir) else {
+        return Ok(None);
+    };
+    let name = match remote {
+        Some(r) => r.to_string(),
+        None => default_remote(&repo)?,
+    };
+    let snapshot = repo.config_snapshot();
+    let url = snapshot.string(KeyRef {
+        section_name: "remote",
+        subsection_name: Some(BStr::new(name.as_bytes())),
+        value_name: "url",
+    });
+    let Some(url) = url else { return Ok(None) };
+    let Ok(url) = gix::url::parse(url.as_ref()) else {
+        return Ok(None);
+    };
+    let kind = match url.scheme {
+        gix::url::Scheme::File => "file".to_string(),
+        gix::url::Scheme::Git => "git".to_string(),
+        gix::url::Scheme::Ssh => "ssh".to_string(),
+        gix::url::Scheme::Http => "http".to_string(),
+        gix::url::Scheme::Https => "https".to_string(),
+        gix::url::Scheme::Ext(ref name) => name.clone(),
+    };
+    Ok((!transport_allowed(&snapshot, &kind)?).then_some(kind))
+}
+
+/// git's `is_transport_allowed` (transport.c:1124), the CVE-2022-39253 policy,
+/// read against the repository the fetch will run in.
+///
+/// `GIT_ALLOW_PROTOCOL`, when set, is an exhaustive colon-separated allow-list
+/// and nothing else is consulted. Otherwise `protocol.<type>.allow` decides,
+/// falling back to `protocol.allow`, then to the built-in defaults: `http`,
+/// `https`, `git` and `ssh` are `always`, `ext` is `never`, and everything else
+/// — `file` included — is `user`, i.e. allowed only when the url came off the
+/// command line rather than out of a file the repository carries.
+fn transport_allowed(snapshot: &gix::config::Snapshot<'_>, kind: &str) -> Result<bool> {
+    if let Ok(list) = std::env::var("GIT_ALLOW_PROTOCOL") {
+        return Ok(list.split(':').any(|entry| entry == kind));
+    }
+    // git's `parse_protocol_config`: anything but these three is fatal.
+    let parse = |key: &str, value: &BStr| match value.to_str_lossy().to_ascii_lowercase().as_str() {
+        "always" => Ok(TransportPolicy::Always),
+        "never" => Ok(TransportPolicy::Never),
+        "user" => Ok(TransportPolicy::User),
+        other => Err(anyhow::anyhow!("unknown value for config '{key}': {other}")),
+    };
+    let key = format!("protocol.{kind}.allow");
+    let policy = match snapshot.string(key.as_str()) {
+        Some(v) => parse(&key, v.as_ref())?,
+        None => match snapshot.string("protocol.allow") {
+            Some(v) => parse("protocol.allow", v.as_ref())?,
+            None => match kind {
+                "http" | "https" | "git" | "ssh" => TransportPolicy::Always,
+                "ext" => TransportPolicy::Never,
+                _ => TransportPolicy::User,
+            },
+        },
+    };
+    Ok(match policy {
+        TransportPolicy::Always => true,
+        TransportPolicy::Never => false,
+        // `git_env_bool("GIT_PROTOCOL_FROM_USER", 1)`; `submodule` clears it.
+        TransportPolicy::User => {
+            !matches!(std::env::var("GIT_PROTOCOL_FROM_USER").as_deref(), Ok("0"))
+        }
+    })
+}
+
+/// git's `protocol_allow_config` (transport.c:1066).
+enum TransportPolicy {
+    Never,
+    User,
+    Always,
 }
 
 /// git's `run_update_command`: re-exec the ported subcommand for the chosen
@@ -2568,30 +3371,21 @@ fn set_branch_apply(branch: Option<String>, path: String) -> Result<ExitCode> {
     let path = BString::from(path.as_str());
     let repo = gix::discover(".")?;
     let submodules = submodules(&repo)?;
-    let prefix = repo_prefix(&repo)?;
 
-    // git looks the path up relative to the repository root, so a run from a
-    // subdirectory carries the cwd prefix into the `.gitmodules` `path` match.
-    let full = match prefix.as_ref() {
-        Some(p) => {
-            let mut b = p.clone();
-            b.extend_from_slice(&path);
-            b
-        }
-        None => path,
-    };
-
-    let Some(sub) = find_submodule(&submodules, &full) else {
-        eprintln!("fatal: no submodule mapping found in .gitmodules for path '{full}'");
+    // `module_set_branch` hands `argv[0]` to `submodule_from_path` verbatim, and
+    // `.gitmodules` records root-relative paths — so the operand is matched as
+    // typed, never joined with the cwd prefix. Confirmed against git 2.55.0: run
+    // from a subdirectory, `set-branch -b x sub` is the form that resolves and
+    // `set-branch -b x ../sub` is the one that dies. (`set-url` behaves the same
+    // way; only the *display* path in `sync`'s output is prefix-relative.)
+    let Some(sub) = find_submodule(&submodules, &path) else {
+        eprintln!("fatal: no submodule mapping found in .gitmodules for path '{path}'");
         return Ok(ExitCode::from(128));
     };
     let sub_name = sub.name().to_owned();
     let sub_name = sub_name.as_bstr();
 
-    let modules_path = match repo.workdir() {
-        Some(wd) => wd.join(".gitmodules"),
-        None => std::path::PathBuf::from(".gitmodules"),
-    };
+    let modules_path = gitmodules_path(&repo);
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
     let mut modules = ConfigFile::from_path_no_includes(modules_path.clone(), Source::Local)?;
 
@@ -3221,5 +4015,85 @@ mod tests {
             "usage: git submodule set-branch [-q|--quiet] (-d|--default) <path>\n   or: git submodule set-branch [-q|--quiet] (-b|--branch) <branch> <path>\n\n"
         ));
         assert!(SET_BRANCH_USAGE.ends_with("set the default tracking branch\n\n"));
+    }
+
+    /// Every `usage_with_options` block reached from this module, pinned to the
+    /// bytes git 2.55.0 writes. The shape is load-bearing: `parse_options` ends
+    /// each block with a blank line, and a block with a hidden-only option table
+    /// (`absorbgitdirs`) is the usage line plus that blank line and nothing else.
+    #[test]
+    fn subcommand_usage_blocks_match_git() {
+        assert_eq!(
+            SET_URL_USAGE,
+            "usage: git submodule set-url [--quiet] <path> <newurl>\n\n    \
+             -q, --[no-]quiet      suppress output for setting url of a submodule\n\n"
+        );
+        assert_eq!(
+            DEINIT_USAGE,
+            "usage: git submodule deinit [--quiet] [-f | --force] [--all | [--] [<path>...]]\n\n    \
+             -q, --[no-]quiet      suppress submodule status output\n    \
+             -f, --[no-]force      remove submodule working trees even if they contain local changes\n    \
+             --[no-]all            unregister all submodules\n\n"
+        );
+        assert_eq!(
+            ABSORB_USAGE,
+            "usage: git submodule absorbgitdirs [<options>] [<path>...]\n\n"
+        );
+        // The porcelain block is not a `parse_options` one: it comes from
+        // `git-sh-setup`'s `$LONG_USAGE`, so it has no option table and no
+        // trailing blank line, and `-h` prints it to stdout with status 0.
+        assert!(USAGE.starts_with("usage: git submodule [--quiet] [--cached]\n"));
+        assert!(USAGE.ends_with("absorbgitdirs [--] [<path>...]\n"));
+        assert!(!USAGE.ends_with("\n\n"));
+    }
+
+    /// git's `sq_quote_buf` always wraps in single quotes, and escapes `'` and
+    /// `!` by closing the quote, backslash-escaping the byte, and reopening —
+    /// `!` included because a re-quoted string may be re-read by an interactive
+    /// shell with history expansion on.
+    #[test]
+    fn sq_quote_matches_git() {
+        let q = |s: &str| sq_quote(BStr::new(s.as_bytes()));
+        assert_eq!(q("sub"), "'sub'");
+        assert_eq!(q(""), "''");
+        assert_eq!(q("with space"), "'with space'");
+        assert_eq!(q("it's"), "'it'\\''s'");
+        assert_eq!(q("bang!"), "'bang'\\!''");
+        assert_eq!(q("a'b!c"), "'a'\\''b'\\!'c'");
+    }
+
+    /// git's `prepare_shell_cmd` only reaches for `sh` when the command word
+    /// contains a shell metacharacter; otherwise the child is exec'd directly.
+    /// The `foreach` single-argument form always gets `sh`, because the
+    /// `path=…; ` prologue git prepends carries `;` and a space.
+    #[test]
+    fn shell_command_matches_prepare_shell_cmd() {
+        let program = |argv: &[&str]| {
+            let owned: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
+            shell_command(&owned)
+                .get_program()
+                .to_string_lossy()
+                .into_owned()
+        };
+        // No metacharacter in argv[0]: direct exec, even with several arguments.
+        assert_eq!(program(&["true"]), "true");
+        assert_eq!(program(&["git", "status", "--porcelain"]), "git");
+        // Each of these argv[0]s carries a metacharacter from git's list.
+        for word in ["echo hi", "a|b", "a$b", "a*b", "a=b", "a~b", "a#b", "a[b"] {
+            assert_eq!(program(&[word]), "sh", "{word} should go through sh");
+        }
+    }
+
+    /// `real_pathdup` has to answer for a path whose last component does not
+    /// exist yet — `modules/<name>` before the relocation creates it — so the
+    /// deepest existing ancestor is resolved and the rest appended.
+    #[test]
+    fn real_path_resolves_a_missing_leaf() {
+        let dir = std::env::temp_dir()
+            .canonicalize()
+            .expect("temp dir is resolvable");
+        let missing = dir.join("zvcs-no-such-dir-9f3a2c").join("modules").join("x");
+        assert_eq!(real_path(&missing), missing);
+        assert_eq!(real_path(&dir), dir);
     }
 }

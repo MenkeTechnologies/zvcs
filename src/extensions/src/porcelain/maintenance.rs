@@ -452,6 +452,7 @@ fn option_name(arg: &str) -> Option<String> {
 /// `git maintenance run` — validate arguments, then run the selected tasks.
 fn run_sub(args: &[String]) -> Result<ExitCode> {
     let mut auto = false;
+    let mut quiet = false;
     let mut scheduled: Option<Schedule> = None;
     let mut selected: Vec<String> = Vec::new();
     let mut end_of_opts = false;
@@ -469,10 +470,14 @@ fn run_sub(args: &[String]) -> Result<ExitCode> {
             "--" => end_of_opts = true,
             "--auto" => auto = true,
             "--no-auto" => auto = false,
-            // `--quiet` suppresses progress written to stderr off a tty, which
-            // is suppressed here anyway; `--detach` only changes *when* the same
-            // work happens, and this port runs synchronously.
-            "--quiet" | "--no-quiet" | "--detach" | "--no-detach" => {}
+            // `--quiet` reaches the tasks that spawn a child: git forwards it as
+            // `--quiet`/`--no-quiet` to `pack-objects` and `prune-packed`, and as
+            // `--no-progress`/`--progress` to `multi-pack-index`.
+            "--quiet" => quiet = true,
+            "--no-quiet" => quiet = false,
+            // `--detach` only changes *when* the same work happens, and this
+            // port runs synchronously.
+            "--detach" | "--no-detach" => {}
             // git's `--schedule` callback rejects the negated form outright, at
             // the position it appears — before any later option is parsed.
             "--no-schedule" => {
@@ -544,7 +549,7 @@ fn run_sub(args: &[String]) -> Result<ExitCode> {
         None
     };
 
-    run_tasks(&repo, &selected, scheduled, strategy, auto)
+    run_tasks(&repo, &selected, scheduled, strategy, auto, quiet)
 }
 
 /// Run the selected maintenance tasks in git's order and report the way git's
@@ -589,24 +594,30 @@ fn run_sub(args: &[String]) -> Result<ExitCode> {
 ///     `worktree prune --expire <gc.worktreePruneExpire>` port `git gc` runs,
 ///     with git's `locked` and expiry semantics.
 ///
-/// # The one task that does nothing, and why
+///   * **`commit-graph`** → [`super::commit_graph::commit_graph`] with
+///     `write --split --reachable`, git's own argument list
+///     (`run_write_commit_graph()`, gc.c).
 ///
-///   * **`commit-graph`**. git runs `commit-graph write --split --reachable`,
-///     which writes `objects/info/commit-graphs/commit-graph-chain` and a
-///     `graph-<hash>.graph` beside it. `gix-commitgraph` ships `access`, `file`,
-///     `init` and `verify` — it reads the format and cannot write it. Writing
-///     one by hand is not a small thing done safely: a graph file that is
-///     well-formed enough to be *loaded* but wrong in a chunk would make every
-///     later git command silently traverse from bad data, which is worse than
-///     having no graph at all. So none is written, and none is claimed. It is
-///     skipped rather than approximated, and a `maintenance run` that exits 0
-///     has not written a commit-graph.
+///   * **`loose-objects`** → [`prune_packed_task`] then [`pack_loose`], which is
+///     `prune_packed(opts) || pack_loose(opts)` verbatim.
+///
+///   * **`incremental-repack`** → [`incremental_repack`], the
+///     `multi-pack-index write` / `expire` / `repack --batch-size=<n>` sequence.
+///
+/// # The one task that is still unported, and why
+///
+///   * **`prefetch`**. git runs a fetch that rewrites every refspec into
+///     `refs/prefetch/<remote>/*` so the objects arrive without any
+///     remote-tracking ref moving. Nothing in the tree rewrites a refspec that
+///     way, and a prefetch that moved the tracking refs would be a different
+///     operation wearing the same name, so it bails rather than approximating.
 fn run_tasks(
     repo: &gix::Repository,
     selected: &[String],
     scheduled: Option<Schedule>,
     strategy: Option<Strategy>,
     auto: bool,
+    quiet: bool,
 ) -> Result<ExitCode> {
     let order = plan(repo, selected, scheduled, strategy);
 
@@ -650,17 +661,24 @@ fn run_tasks(
                     || delegate(super::rerere::rerere(&strings(&["gc"])))
             }
             "worktree-prune" => super::gc::prune_worktrees(repo).is_ok(),
-            // See the "one task that does nothing" section above.
-            "commit-graph" => true,
-            // Selectable, but blocked on substrate no module in the tree has:
-            // `prefetch` needs a fetch that rewrites refspecs into
-            // `refs/prefetch/`, and `loose-objects`/`incremental-repack` need a
-            // multi-pack-index writer to repack against.
-            "prefetch" | "loose-objects" | "incremental-repack" => {
+            // `run_write_commit_graph()`: git spawns `git commit-graph write
+            // --split --reachable` and reports the task as failed when it fails.
+            "commit-graph" => {
+                spawn_git(repo, &["commit-graph", "write", "--split", "--reachable"])
+            }
+            // `maintenance_task_loose_objects()` is exactly
+            // `prune_packed(opts) || pack_loose(opts)`: the `||` short-circuits,
+            // so a failing `prune-packed` skips the packing and fails the task.
+            "loose-objects" => prune_packed_task(repo, quiet) && pack_loose(repo, quiet),
+            "incremental-repack" => incremental_repack(repo, quiet),
+            // Selectable, but blocked on substrate no module in the tree has: a
+            // fetch that rewrites each refspec into `refs/prefetch/<remote>/*`.
+            "prefetch" => {
                 bail!(
-                    "maintenance task '{task}' is not ported: prefetch needs a refspec-rewriting \
-                     fetch, and loose-objects/incremental-repack need a multi-pack-index writer \
-                     (ported tasks: pack-refs, reflog-expire, geometric-repack, gc, rerere-gc)"
+                    "maintenance task 'prefetch' is not ported: it needs a fetch that rewrites \
+                     every refspec into refs/prefetch/<remote>/*, which no module in this tree \
+                     does (ported tasks: pack-refs, reflog-expire, commit-graph, loose-objects, \
+                     incremental-repack, geometric-repack, gc, rerere-gc, worktree-prune)"
                 );
             }
             _ => true,
@@ -742,6 +760,199 @@ fn plan(
 /// can produce. A genuine failure inside them surfaces as `Err`.
 fn delegate(outcome: Result<ExitCode>) -> bool {
     outcome.is_ok()
+}
+
+/// Run one of git's maintenance children — `git <args>` in this repository — and
+/// report whether it succeeded, which is `!run_command(&child)` in gc.c.
+///
+/// A child rather than an in-process call because that is the only way to see
+/// the verb's *exit code*: a porcelain that fails politely returns
+/// `Ok(ExitCode::from(1))`, which [`delegate`] cannot tell from success, and git
+/// keys every one of these tasks on exactly that code. `git multi-pack-index
+/// write` in a repository with no packs is the case that matters — it reports
+/// `error: no pack files to index.` and exits non-zero, and the task has to fail
+/// with it.
+///
+/// `stdout` is inherited: none of these children print anything on their success
+/// path, and git lets what they do print through.
+fn spawn_git(repo: &gix::Repository, args: &[&str]) -> bool {
+    let Ok(exe) = std::env::current_exe() else {
+        return false;
+    };
+    std::process::Command::new(exe)
+        .args(args)
+        .current_dir(repo.workdir().unwrap_or_else(|| repo.git_dir()))
+        .stdin(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+/// `prune_packed()` (gc.c:1287): `git prune-packed [--quiet]`.
+fn prune_packed_task(repo: &gix::Repository, quiet: bool) -> bool {
+    let mut args = vec!["prune-packed"];
+    if quiet {
+        args.push("--quiet");
+    }
+    spawn_git(repo, &args)
+}
+
+/// `pack_loose()` (gc.c:1354): fold every loose object into one pack named
+/// `<object-dir>/pack/loose`.
+///
+/// git spawns `git pack-objects [--quiet|--no-quiet] <objdir>/pack/loose` and
+/// feeds it the loose object ids on stdin, discarding the pack hash the child
+/// prints. A child is used here for the same reason git uses one: `pack-objects`
+/// reads its object list from the process's stdin, which this process is not
+/// free to replace.
+///
+/// `maintenance.loose-objects.batchSize` bounds how many ids are written
+/// (default 50000; `0` removes the limit, and a positive value is decremented so
+/// the comparison is an equality on the limit, exactly as git does). A repository
+/// with no loose object at all starts no child and succeeds.
+fn pack_loose(repo: &gix::Repository, quiet: bool) -> bool {
+    let objdir = repo.objects.store_ref().path().to_path_buf();
+    let batch_size = match repo
+        .config_snapshot()
+        .integer("maintenance.loose-objects.batchSize")
+        .unwrap_or(50_000)
+    {
+        0 => usize::MAX,
+        n if n > 0 => (n - 1) as usize,
+        // A negative value is not special-cased by git either: the counter is
+        // already past it, so the very first object ends the loop.
+        _ => 0,
+    };
+
+    let loose = loose_object_ids(repo, batch_size.saturating_add(1));
+    if loose.is_empty() {
+        return true;
+    }
+
+    let Ok(exe) = std::env::current_exe() else {
+        return false;
+    };
+    let mut child = std::process::Command::new(exe);
+    child
+        .arg("pack-objects")
+        .arg(if quiet { "--quiet" } else { "--no-quiet" })
+        .arg(objdir.join("pack").join("loose"))
+        .current_dir(repo.workdir().unwrap_or_else(|| repo.git_dir()))
+        .stdin(std::process::Stdio::piped())
+        // "git-pack-objects(1) ends up writing the pack hash to stdout, which we
+        // do not care for."
+        .stdout(std::process::Stdio::null());
+    let Ok(mut child) = child.spawn() else {
+        eprintln!("error: failed to start 'git pack-objects' process");
+        return false;
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        use std::io::Write;
+        let mut payload = String::with_capacity(loose.len() * 41);
+        for id in &loose {
+            payload.push_str(id);
+            payload.push('\n');
+        }
+        // A short write is the child having died; `finish_command` below reports it.
+        let _ = stdin.write_all(payload.as_bytes());
+    }
+    match child.wait() {
+        Ok(status) if status.success() => true,
+        _ => {
+            eprintln!("error: failed to finish 'git pack-objects' process");
+            false
+        }
+    }
+}
+
+/// The hex ids of at most `limit` loose objects in the repository's own object
+/// directory, in `for_each_loose_file_in_source` order (fan-out directory, then
+/// the entries within it).
+fn loose_object_ids(repo: &gix::Repository, limit: usize) -> Vec<String> {
+    let objdir = repo.objects.store_ref().path().to_path_buf();
+    let name_len = repo.object_hash().len_in_hex() - 2;
+    let mut out = Vec::new();
+    for fanout in 0..256u16 {
+        let prefix = format!("{fanout:02x}");
+        let Ok(entries) = std::fs::read_dir(objdir.join(&prefix)) else {
+            continue;
+        };
+        let mut names: Vec<String> = entries
+            .flatten()
+            .filter_map(|e| e.file_name().to_str().map(str::to_owned))
+            .filter(|name| {
+                name.len() == name_len
+                    && name.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+            })
+            .collect();
+        // `readdir` order is filesystem-dependent; sorting makes the id list — and
+        // so the pack git names after it — the same on two runs of the same repo.
+        names.sort();
+        for name in names {
+            out.push(format!("{prefix}{name}"));
+            if out.len() >= limit {
+                return out;
+            }
+        }
+    }
+    out
+}
+
+/// `maintenance_task_incremental_repack()` (gc.c:1552): write the
+/// multi-pack-index, expire the packs it has superseded, then repack the small
+/// ones together.
+///
+/// `core.multiPackIndex = false` skips the task with git's warning and counts as
+/// success. Each of the three steps is `git multi-pack-index <verb>` with
+/// `--progress`/`--no-progress`, and the third adds `--batch-size` from
+/// [`auto_pack_size`]; a failing step reports git's message and stops.
+fn incremental_repack(repo: &gix::Repository, quiet: bool) -> bool {
+    if repo.config_snapshot().boolean("core.multiPackIndex") == Some(false) {
+        eprintln!("warning: skipping incremental-repack task because core.multiPackIndex is disabled");
+        return true;
+    }
+    let progress = if quiet { "--no-progress" } else { "--progress" };
+
+    if !spawn_git(repo, &["multi-pack-index", "write", progress]) {
+        eprintln!("error: failed to write multi-pack-index");
+        return false;
+    }
+    if !spawn_git(repo, &["multi-pack-index", "expire", progress]) {
+        eprintln!("error: 'git multi-pack-index expire' failed");
+        return false;
+    }
+    let batch = format!("--batch-size={}", auto_pack_size(repo));
+    if !spawn_git(repo, &["multi-pack-index", "repack", progress, &batch]) {
+        eprintln!("error: 'git multi-pack-index repack' failed");
+        return false;
+    }
+    true
+}
+
+/// `get_auto_pack_size()` (gc.c): one byte more than the second largest pack,
+/// capped at two gigabytes.
+///
+/// git's comment: "we optimize for one large pack-file (i.e. from a clone) and
+/// expect the rest to be small and they can be repacked quickly … This ensures
+/// that we will repack at least two packs if there are three or more packs."
+fn auto_pack_size(repo: &gix::Repository) -> u64 {
+    const TWO_GIGABYTES: u64 = i32::MAX as u64;
+    let mut largest: u64 = 0;
+    let mut second: u64 = 0;
+    let pack_dir = repo.objects.store_ref().path().join("pack");
+    for entry in std::fs::read_dir(&pack_dir).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if path.extension().is_none_or(|ext| ext != "pack") {
+            continue;
+        }
+        let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+        if size > largest {
+            second = largest;
+            largest = size;
+        } else if size > second {
+            second = size;
+        }
+    }
+    (second + 1).min(TWO_GIGABYTES)
 }
 
 /// Borrow a fixed argument list as the `&[String]` every porcelain entry takes.

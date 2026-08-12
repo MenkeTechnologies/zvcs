@@ -1,6 +1,6 @@
 //! `git pack-objects` — create a packed archive of objects.
 //!
-//! # Pack bytes differ from git's, but the compression does not
+//! # Pack layout matches git's; the deflate bytes do not
 //!
 //! The pack written here is delta-compressed by
 //! [`gix_pack::data::output::delta`], which is git's own delta machinery ported
@@ -10,14 +10,36 @@
 //! are worth deltifying. `--delta-base-offset` selects `OBJ_OFS_DELTA` over
 //! `OBJ_REF_DELTA` exactly as it does in git.
 //!
-//! What still differs is the *byte stream*. The objects are enumerated in this
-//! module's own order rather than git's `compute_write_order()`, deltas are
-//! never reused from an existing pack (every pair is searched afresh), and there
-//! are no preferred bases or delta islands to steer the search. So the pack has
-//! the same objects and comparable size, but a different layout, a different
-//! trailing checksum, and therefore a different `<base-name>-<hash>.{pack,idx,rev}`
-//! filename. `git verify-pack`, `git index-pack --verify` and `git
-//! unpack-objects` all accept it.
+//! Objects are enumerated in `traverse_commit_list()`'s order (see
+//! [`traverse_commit_list`]) and written in `compute_write_order()`'s (see
+//! [`compute_write_order`]), so the entry sequence, the type and size of every
+//! entry, and which entry deltifies against which at what depth all agree with
+//! stock git — checked entry-for-entry with `verify-pack -v` on the `linear`,
+//! `branched` and `merged` harness fixtures, including the tag-tip regrouping
+//! `--include-tag` exercises.
+//!
+//! **What is left is the deflate stream.** The vendored `gix-zlib` compresses
+//! through `zlib-rs`, which is a port of *zlib-ng*, and zlib-ng's level-1..8
+//! match finders are not zlib's: for identical input at level 6 the two emit
+//! different-length blocks, and git links zlib. Measured on `branched` at
+//! level 6 — commit `07e86d1…` 235 bytes: zlib 152, zlib-rs 149; tree
+//! `cae1e31…` 106 bytes: zlib 112, zlib-rs 113; blob `74b7440…` 52 bytes: zlib
+//! 44, zlib-rs 46; tree `e0e1a77…` 67 bytes: zlib 76, zlib-rs 78, where zlib-rs
+//! emits a *stored* block and zlib a compressed one. Level 9 agrees, both using
+//! `deflate_slow`, but git's default pack compression is 6. So the pack has the
+//! same objects in the same order with the same deltas, and a different total
+//! size, a different trailing checksum, and therefore a different
+//! `<base-name>-<hash>.{pack,idx,rev}` filename. Closing that gap needs a
+//! zlib-compatible deflate, which the tree does not have; nothing in this module
+//! can reach it. `git verify-pack`, `git index-pack --verify` and `git
+//! unpack-objects` all accept what is written.
+//!
+//! Two smaller layout inputs are still absent, neither reachable from the
+//! default configuration: deltas are never reused from an existing pack (every
+//! pair is searched afresh, so `write_reused_pack()` has no counterpart), and
+//! delta islands do not split the write order into layers — with islands off
+//! `oe_layer()` is 0 throughout and there is exactly one layer, which is what
+//! [`compute_write_order`] reproduces.
 //!
 //! The knobs with nothing to steer are the ones tied to substrate that is still
 //! missing: `--no-reuse-delta` and `--no-reuse-object` (no pack entry is ever
@@ -33,7 +55,10 @@
 //! * the object *set*: which objects end up in the pack, for `--all`,
 //!   `--reflog`, `--indexed-objects`, `--revs`, `--stdin-packs`, `--unpacked`,
 //!   `--cruft`, a bare object list on stdin, and every combination of those
-//!   (see [`collect_counts`])
+//!   (see [`collect_counts`]). A bare object list packs exactly the ids it
+//!   names — `add_object_entry()` adds one object and no traversal follows — and
+//!   an id naming nothing is carried to the write and dies there, as git's does
+//! * the object *order*, both the enumeration order and the write order
 //! * the *artifacts*: `<base>-<hash>.pack`, `.idx` (v1 and v2), `.rev`, and
 //!   `.mtimes` for `--cruft` — the files whose presence and count callers and
 //!   state probes observe
@@ -469,7 +494,16 @@ fn execute(st: &State) -> Result<ExitCode> {
     let mut stdin = Vec::new();
     std::io::stdin().read_to_end(&mut stdin).ok();
 
-    let counts = collect_counts(&repo, st, &stdin);
+    let counts = match collect_counts(&repo, st, &stdin) {
+        Ok(counts) => counts,
+        Err(message) => {
+            // `vreportf()` appends its newline unconditionally, so a message
+            // that already ends in one — this one echoes the offending line
+            // verbatim — leaves a blank line behind. git's output has it.
+            eprint!("fatal: {message}\n");
+            return Ok(ExitCode::from(128));
+        }
+    };
     // git reports the object list it just built as `Enumerating objects`, a
     // count with no total because the traversal is what decides the total.
     {
@@ -864,22 +898,27 @@ fn write_pack(
     use pack::data::output::delta;
 
     // Entries are encoded before the header is written, because the header
-    // carries the entry *count* and an object that turns out to be unreadable
-    // must not be counted. git likewise drops such an object and packs the rest.
+    // carries the entry *count*, which is known only once every object in the
+    // set has been shown to be readable.
     const HEADER_LEN: u64 = 12;
 
-    // Phase 1: types and sizes, from the object headers alone. An object whose
-    // header cannot be read is dropped here and never reaches the pack.
+    // Phase 1: types and sizes, from the object headers alone.
     //
     // This is the pass git reports as `Counting objects`: one step per object in
-    // the set the traversal handed over, whether or not it survives to the pack.
+    // the set the traversal handed over. An object whose header cannot be read is
+    // fatal — git's `check_object()` tolerates it (recording `OBJ_BAD` so that a
+    // missing *preferred base* can be ignored), but the entry stays in the pack
+    // list and `write_no_reuse_object()` dies `unable to read <oid>` when the
+    // write reaches it. Raising it here rather than at the write is a step
+    // earlier than git; stdout is empty and the exit code 128 either way, since
+    // git's pack bytes are still sitting in the hashfile buffer when it dies.
     let mut counting = Meter::counted("Counting objects", counts.len(), progress);
     let mut objects: Vec<delta::Object> = Vec::with_capacity(counts.len());
     for count in counts {
         use gix::odb::HeaderExt;
         counting.tick();
         let Ok(header) = repo.objects.header(count.id) else {
-            continue;
+            crate::git_fatal!("unable to read {}", count.id);
         };
         objects.push(delta::Object {
             id: count.id,
@@ -934,12 +973,13 @@ fn write_pack(
     // object's base first, so the meter counts positions reached rather than
     // entries appended — the same total, and monotone, which is what the display
     // needs.
+    let write_order = compute_write_order(&objects, &deltas, &tag_tips(repo));
     let mut writing = Meter::counted("Writing objects", objects.len(), progress);
     let mut body: Vec<u8> = Vec::new();
     let mut entries: Vec<PackedEntry> = Vec::with_capacity(objects.len());
     let mut offsets: Vec<Option<u64>> = vec![None; objects.len()];
     let mut written_deltas = 0usize;
-    for at in 0..objects.len() {
+    for at in write_order {
         writing.tick();
         write_entry(
             repo,
@@ -975,6 +1015,162 @@ fn write_pack(
         id,
         entries,
     })
+}
+
+/// The objects `mark_tagged()` marks: for every reference under `refs/tags`, the
+/// id it holds and the id it peels to.
+///
+/// That is the whole input to [`compute_write_order`]'s regrouping, and it is
+/// why a repository with no tags writes its pack in enumeration order.
+fn tag_tips(repo: &gix::Repository) -> HashSet<ObjectId> {
+    let mut out = HashSet::new();
+    let Ok(platform) = repo.references() else { return out };
+    let Ok(tags) = platform.prefixed("refs/tags/") else { return out };
+    for reference in tags.flatten() {
+        let mut reference = reference;
+        if let Some(id) = reference.target().try_id() {
+            out.insert(id.to_owned());
+        }
+        if let Ok(id) = reference.peel_to_id() {
+            out.insert(id.detach());
+        }
+    }
+    out
+}
+
+/// `compute_write_order()`: the positions of `objects`, in the order the pack
+/// writes them.
+///
+/// With nothing tagged this is the identity. `compute_layer_order()`'s first
+/// loop copies entries across until it meets a tagged one, and where that never
+/// happens it copies all of them — which is why an ordinary pack comes out in
+/// the order it was enumerated in. A tag tip stops that loop at `last_untagged`,
+/// and everything from there is regrouped: the tag tips first, then the
+/// remaining commits and tags, then the trees, then everything else walked
+/// family by family so a delta base and its deltas stay together.
+///
+/// Delta islands are not modelled here. git splits the order into one layer per
+/// island and runs `compute_layer_order()` per layer; with no islands `oe_layer()`
+/// is always 0 and there is exactly one layer, which is the case reproduced.
+fn compute_write_order(
+    objects: &[pack::data::output::delta::Object],
+    deltas: &[Option<pack::data::output::delta::Delta>],
+    tagged: &HashSet<ObjectId>,
+) -> Vec<usize> {
+    let n = objects.len();
+
+    // `delta_child`/`delta_sibling`, built by walking backwards and pushing each
+    // delta to the front of its base's child list — which leaves every child list
+    // in ascending, i.e. original recency, order.
+    let mut children: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for i in (0..n).rev() {
+        if let Some(d) = &deltas[i] {
+            if d.base < n {
+                children[d.base].insert(0, i);
+            }
+        }
+    }
+    // Where each entry sits in its parent's child list, so a "sibling" is the
+    // next one along.
+    let mut slot: Vec<usize> = vec![0; n];
+    for list in &children {
+        for (at, &child) in list.iter().enumerate() {
+            slot[child] = at;
+        }
+    }
+    let parent = |i: usize| deltas[i].as_ref().map(|d| d.base).filter(|b| *b < n);
+    let sibling = |i: usize| {
+        let p = parent(i)?;
+        children[p].get(slot[i] + 1).copied()
+    };
+
+    let mut wo: Vec<usize> = Vec::with_capacity(n);
+    let mut filled = vec![false; n];
+    let add = |wo: &mut Vec<usize>, filled: &mut Vec<bool>, i: usize| {
+        if !filled[i] {
+            filled[i] = true;
+            wo.push(i);
+        }
+    };
+
+    // `add_descendants_to_write_order()`, ported as its own loop: at each node
+    // reached "from above" the node and all its later siblings are added, then
+    // the walk descends into the first child and repeats; a node with no child
+    // steps right, or climbs until it can, without adding again.
+    let add_descendants = |wo: &mut Vec<usize>, filled: &mut Vec<bool>, root: usize| {
+        let mut add_to_order = true;
+        let mut e = Some(root);
+        while let Some(cur) = e {
+            if add_to_order {
+                add(wo, filled, cur);
+                let mut s = sibling(cur);
+                while let Some(next) = s {
+                    add(wo, filled, next);
+                    s = sibling(next);
+                }
+            }
+            if let Some(child) = children[cur].first().copied() {
+                add_to_order = true;
+                e = Some(child);
+                continue;
+            }
+            add_to_order = false;
+            if let Some(next) = sibling(cur) {
+                e = Some(next);
+                continue;
+            }
+            let mut up = parent(cur);
+            while let Some(p) = up {
+                if sibling(p).is_some() {
+                    break;
+                }
+                up = parent(p);
+            }
+            match up {
+                Some(p) => e = sibling(p),
+                None => return,
+            }
+        }
+    };
+
+    // 1. Everything up to the first tagged entry, in enumeration order.
+    let mut last_untagged = n;
+    for i in 0..n {
+        if tagged.contains(&objects[i].id) {
+            last_untagged = i;
+            break;
+        }
+        add(&mut wo, &mut filled, i);
+    }
+    // 2. The tag tips.
+    for i in last_untagged..n {
+        if tagged.contains(&objects[i].id) {
+            add(&mut wo, &mut filled, i);
+        }
+    }
+    // 3. The remaining commits and tags.
+    for i in last_untagged..n {
+        if matches!(objects[i].kind, gix::object::Kind::Commit | gix::object::Kind::Tag) {
+            add(&mut wo, &mut filled, i);
+        }
+    }
+    // 4. The trees.
+    for i in last_untagged..n {
+        if objects[i].kind == gix::object::Kind::Tree {
+            add(&mut wo, &mut filled, i);
+        }
+    }
+    // 5. The rest, family by family from each family's root.
+    for i in last_untagged..n {
+        if !filled[i] {
+            let mut root = i;
+            while let Some(p) = parent(root) {
+                root = p;
+            }
+            add_descendants(&mut wo, &mut filled, root);
+        }
+    }
+    wo
 }
 
 /// The pack header is 12 bytes, so every entry offset is that much past its
@@ -2506,13 +2702,18 @@ fn mtimes_file(
 /// `--unpacked` and `--incremental` then drop anything already in a pack, and
 /// `--filter` drops whatever its spec excludes.
 ///
-/// Objects that cannot be found are skipped rather than fatal: a reflog naming a
-/// pruned commit is ordinary, and git drops those too.
+/// Objects reached by a walk that cannot be found are skipped rather than fatal:
+/// a reflog naming a pruned commit is ordinary, and git drops those too. An id
+/// read straight off stdin is different — git carries it into the pack list and
+/// dies on it at write time — so those are kept; see [`read_object_list_from_stdin`].
+///
+/// `Err` carries a `fatal:` body: the one diagnostic git raises while building
+/// the set rather than while parsing argv.
 fn collect_counts(
     repo: &gix::Repository,
     st: &State,
     stdin: &[u8],
-) -> Vec<pack::data::output::Count> {
+) -> Result<Vec<pack::data::output::Count>, String> {
     let mut ids: Vec<ObjectId> = if st.stdin_packs {
         // Here `--unpacked` *adds* the loose objects rather than restricting the
         // set: it is the one rev-list-implying option `--stdin-packs` accepts,
@@ -2531,7 +2732,7 @@ fn collect_counts(
         ids.retain(|id| !covered.contains(id));
         ids
     } else {
-        let mut ids = rev_list_objects(repo, st, stdin);
+        let mut ids = rev_list_objects(repo, st, stdin)?;
         // Restricting to what no pack holds only makes sense for a set derived
         // from a reachability walk; the two branches above name their packs
         // outright.
@@ -2545,22 +2746,66 @@ fn collect_counts(
     dedup(&mut ids);
     apply_filter(repo, st.filter.as_deref(), &mut ids);
 
-    ids.into_iter()
+    Ok(ids
+        .into_iter()
         .map(|id| pack::data::output::Count {
             id,
             entry_pack_location: pack::data::output::count::PackLocation::NotLookedUp,
         })
-        .collect()
+        .collect())
+}
+
+/// `read_object_list_from_stdin()`: the object list git reads when its internal
+/// rev list is off.
+///
+/// Each `fgets` line is a raw object id — `parse_oid_hex`, never a rev — with an
+/// optional path after it that only steers the delta search. A `-` prefix names
+/// a *preferred base*, an object the search may delta against without packing
+/// it; nothing here has preferred bases, so such a line is validated and then
+/// ignored. Anything that is not a hex id is fatal, and the returned message
+/// carries git's own two-line wording, the offending line included verbatim.
+///
+/// Ids are *not* checked against the object database: git does not check them
+/// here either, and one that names nothing is carried all the way to the write,
+/// where it becomes `unable to read <oid>`.
+fn read_object_list_from_stdin(stdin: &[u8]) -> Result<Vec<ObjectId>, String> {
+    let mut out = Vec::new();
+    // `split_inclusive` hands back exactly what `fgets` would: every line keeps
+    // its newline, a final unterminated line is still a line, and the empty
+    // remainder after a trailing newline is EOF rather than a blank line.
+    for line in stdin.split_inclusive(|b| *b == b'\n') {
+        let (body, what) = match line.split_first() {
+            Some((b'-', rest)) => (rest, "edge object ID"),
+            _ => (line, "object ID"),
+        };
+        let hex = body.get(..40).filter(|h| h.iter().all(u8::is_ascii_hexdigit));
+        let Some(id) = hex.and_then(|h| ObjectId::from_hex(h).ok()) else {
+            let line = String::from_utf8_lossy(line);
+            return Err(format!("expected {what}, got garbage:\n {line}"));
+        };
+        // A preferred base is never packed, only deltified against.
+        if what == "object ID" {
+            out.push(id);
+        }
+    }
+    Ok(out)
 }
 
 /// The rev-list half of [`collect_counts`]: tips, their ancestry, and the trees
 /// and blobs hanging off every commit reached.
-fn rev_list_objects(repo: &gix::Repository, st: &State, stdin: &[u8]) -> Vec<ObjectId> {
-    // Refs are collected unpeeled so an annotated tag's own object lands in the
-    // pack; `peel_to_commit` supplies the commit the walk starts from.
-    let mut unpeeled: Vec<ObjectId> = Vec::new();
-    let mut tips: Vec<ObjectId> = Vec::new();
-    let mut as_is: Vec<ObjectId> = Vec::new();
+fn rev_list_objects(
+    repo: &gix::Repository,
+    st: &State,
+    stdin: &[u8],
+) -> Result<Vec<ObjectId>, String> {
+    // `revs->pending`, in the order git fills it. `cmd_pack_objects()` builds the
+    // rev-list argv as `--all`, `--reflog`, `--indexed-objects`, then the stdin
+    // specs, and `setup_revisions()` adds each option's objects as it reaches it,
+    // so this order is the order the traversal will see them in. Tips stay
+    // unpeeled: an annotated tag's own object belongs in the pack, and
+    // `handle_commit()` is what peels it.
+    let mut pending: Vec<ObjectId> = Vec::new();
+    let mut from_stdin: Vec<ObjectId> = Vec::new();
 
     if st.all {
         if let Ok(platform) = repo.references() {
@@ -2568,7 +2813,7 @@ fn rev_list_objects(repo: &gix::Repository, st: &State, stdin: &[u8]) -> Vec<Obj
                 for reference in all {
                     let Ok(mut reference) = reference else { continue };
                     if let Ok(id) = reference.follow_to_object() {
-                        unpeeled.push(id.detach());
+                        pending.push(id.detach());
                     }
                 }
             }
@@ -2577,13 +2822,13 @@ fn rev_list_objects(repo: &gix::Repository, st: &State, stdin: &[u8]) -> Vec<Obj
         // only reachable here.
         if let Ok(head) = repo.head() {
             if let Some(id) = head.id() {
-                unpeeled.push(id.detach());
+                pending.push(id.detach());
             }
         }
     }
 
     if st.reflog {
-        unpeeled.extend(reflog_objects(repo));
+        pending.extend(reflog_objects(repo));
     }
 
     if st.indexed_objects {
@@ -2592,11 +2837,11 @@ fn rev_list_objects(repo: &gix::Repository, st: &State, stdin: &[u8]) -> Vec<Obj
                 // git's `add_index_objects_to_pending()` skips gitlinks, whose
                 // ids name commits in another repository.
                 if entry.mode != gix::index::entry::Mode::COMMIT {
-                    as_is.push(entry.id);
+                    pending.push(entry.id);
                 }
             }
             if let Some(tree) = index.tree() {
-                push_cache_tree(tree, &mut as_is);
+                push_cache_tree(tree, &mut pending);
             }
         }
     }
@@ -2614,74 +2859,174 @@ fn rev_list_objects(repo: &gix::Repository, st: &State, stdin: &[u8]) -> Vec<Obj
                 continue;
             }
             if let Ok(id) = repo.rev_parse_single(spec) {
-                unpeeled.push(id.detach());
+                pending.push(id.detach());
             }
         }
     } else if !st.internal_rev_list {
-        for line in stdin.split(|b| *b == b'\n') {
-            let Ok(text) = std::str::from_utf8(line) else { continue };
-            // `rev-list --objects` prints `<oid> [<path>]`; git reads the first
-            // field and ignores the rest.
-            let Some(field) = text.split_whitespace().next() else { continue };
-            if let Ok(id) = repo.rev_parse_single(field) {
-                as_is.push(id.detach());
+        from_stdin = read_object_list_from_stdin(stdin)?;
+    }
+
+    // An id read off stdin becomes a pack entry *as it stands*: with no internal
+    // rev list there is no traversal, so `add_object_entry()` adds that one
+    // object and nothing under it — naming a commit packs the commit, not its
+    // tree. git checks nothing at that point either, so an id that resolves to
+    // no object stays in the list and becomes `unable to read <oid>` when the
+    // write reaches it. Both are why these bypass the traversal, which expands
+    // trees and can only report objects it could read.
+    let mut out = from_stdin;
+    out.extend(traverse_commit_list(repo, pending));
+    Ok(out)
+}
+
+/// `list-objects.c::traverse_commit_list()`: the order git shows objects in, and
+/// so the order `add_object_entry()` fills `to_pack.objects` in.
+///
+/// Two phases, and the split between them is what makes the order what it is.
+///
+/// 1. **Commits.** `prepare_revision_walk()` peels every pending object: a tag
+///    is re-added to `pending` under its own id and then followed, a commit is
+///    appended to `revs->commits`, and a tree or blob stays in `pending`. That
+///    list is then stably sorted by committer date, newest first — stably, so
+///    equal dates keep pending order. `do_traverse()` pops it front to back,
+///    showing each commit, appending its tree to `pending`, and inserting each
+///    unseen parent with `commit_list_insert_by_date()`, which walks past every
+///    entry whose date is `>=` its own and so lands *after* equal dates.
+/// 2. **Everything else.** `traverse_trees_and_blobs()` walks `pending` in
+///    order: a tag is shown, a blob is shown, and a tree is shown and then
+///    descended into, entry by entry in tree order, recursing into subtrees as
+///    they are met. Nothing is shown twice, so a tree whose contents an earlier
+///    tree already covered contributes only itself.
+///
+/// A pending id naming nothing is dropped rather than fatal: `--reflog` routinely
+/// names commits that have since been pruned, and git's `parse_object()` gives it
+/// a NULL it skips.
+pub(crate) fn traverse_commit_list(repo: &gix::Repository, pending: Vec<ObjectId>) -> Vec<ObjectId> {
+    use gix::object::Kind;
+
+    let mut seen: HashSet<ObjectId> = HashSet::new();
+    let mut out: Vec<ObjectId> = Vec::new();
+    // `revs->commits`: (id, committer date), kept in git's date order.
+    let mut queue: Vec<(ObjectId, i64)> = Vec::new();
+    // What `prepare_revision_walk()` leaves in `pending`, plus the trees the
+    // commit loop appends to it.
+    let mut objects: Vec<ObjectId> = Vec::new();
+
+    // Phase 1a: `handle_commit()` per pending object.
+    for id in pending {
+        let mut id = id;
+        // Bounded like git's own peel, so a cyclic tag chain cannot spin.
+        for _ in 0..16 {
+            let Ok(object) = repo.find_object(id) else { break };
+            match object.kind {
+                Kind::Tag => {
+                    // `add_pending_object(revs, object, tag->tag)`: the tag
+                    // object itself joins `pending` before its target is followed.
+                    if seen.insert(id) {
+                        objects.push(id);
+                    }
+                    let tag = object.into_tag();
+                    let Ok(target) = tag.decode().map(|t| t.target()) else { break };
+                    id = target;
+                }
+                Kind::Commit => {
+                    if seen.insert(id) {
+                        let date = commit_date(repo, id);
+                        queue.push((id, date));
+                    }
+                    break;
+                }
+                Kind::Tree | Kind::Blob => {
+                    if seen.insert(id) {
+                        objects.push(id);
+                    }
+                    break;
+                }
             }
         }
     }
 
-    for id in &unpeeled {
-        if let Some(commit) = peel_to_commit(repo, *id) {
-            tips.push(commit);
+    // `commit_list_sort_by_date()` — a stable merge sort, newest first.
+    queue.sort_by(|a, b| b.1.cmp(&a.1));
+
+    // Phase 1b: `do_traverse()`'s commit loop.
+    let mut at = 0usize;
+    while at < queue.len() {
+        let (id, _) = queue[at];
+        at += 1;
+        let Ok(object) = repo.find_object(id) else { continue };
+        let Ok(commit) = object.into_commit().decode().map(|c| (c.tree(), c.parents().collect::<Vec<_>>()))
+        else {
+            continue;
+        };
+        let (tree, parents) = commit;
+        // `add_pending_tree()` runs *before* `show_commit()`, but the tree joins
+        // `pending` while the commit joins the output, so the two never interleave.
+        if seen.insert(tree) {
+            objects.push(tree);
+        }
+        out.push(id);
+        for parent in parents {
+            if !seen.insert(parent) {
+                continue;
+            }
+            let date = commit_date(repo, parent);
+            // `commit_list_insert_by_date()`: before the first entry with a
+            // strictly smaller date, i.e. after every entry of equal date. Only
+            // the unpopped tail is a list in git, so the search starts there.
+            let pos = queue[at..]
+                .iter()
+                .position(|(_, d)| *d < date)
+                .map_or(queue.len(), |i| at + i);
+            queue.insert(pos, (parent, date));
         }
     }
 
-    // Commits first, then the tag objects that pointed at them: that is the
-    // grouping git's own output starts with, and it keeps a tag adjacent to the
-    // history it names.
-    let mut roots: Vec<ObjectId> = Vec::new();
-    if let Ok(walk) = repo.rev_walk(tips.iter().copied()).all() {
-        roots.extend(walk.filter_map(|info| info.ok().map(|info| info.id)));
-    } else {
-        roots.extend(tips.iter().copied());
+    // Phase 2: `traverse_trees_and_blobs()`. `objects` grows only in phase 1, so
+    // the index walk is over a fixed list; subtrees are expanded in place.
+    for id in objects {
+        expand_tree(repo, id, &mut seen, &mut out);
     }
-    roots.extend(unpeeled.iter().copied());
-    roots.extend(as_is);
-
-    expand(repo, roots)
+    out
 }
 
-/// Expand `roots` into the full object set, using `gix-pack`'s counter: a commit
-/// contributes its tree and everything under it, a tag its target, a tree its
-/// contents, and anything else itself.
-///
-/// Ancestry is *not* expanded here — [`rev_list_objects`] has already walked it
-/// — which is exactly what `ObjectExpansion::TreeContents` does.
-fn expand(repo: &gix::Repository, roots: Vec<ObjectId>) -> Vec<ObjectId> {
-    // The counter treats a missing object as fatal for the whole run. Reflogs
-    // routinely name objects that have since been pruned, so they are dropped
-    // up front rather than allowed to abort the count.
-    let roots: Vec<ObjectId> = roots
-        .into_iter()
-        .filter(|id| repo.find_object(*id).is_ok())
-        .collect();
-    let mut input = roots
-        .iter()
-        .copied()
-        .map(Ok::<_, Box<dyn std::error::Error + Send + Sync + 'static>>);
-    let counted = pack::data::output::count::objects_unthreaded(
-        &*repo.objects,
-        &mut input,
-        &gix::progress::Discard,
-        &std::sync::atomic::AtomicBool::new(false),
-        pack::data::output::count::objects::ObjectExpansion::TreeContents,
-    );
-    match counted {
-        Ok((counts, _outcome)) => counts.into_iter().map(|c| c.id).collect(),
-        // An undecodable object still aborts the counter. git reports the
-        // corruption and packs what it can, so fall back to the unexpanded
-        // roots: a smaller pack, never a fatal.
-        Err(_) => roots,
+/// `process_tree()`/`process_blob()`: show `id`, and when it is a tree descend
+/// into it in entry order, recursing into each subtree as it is met. A gitlink
+/// names a commit in another repository and is not followed, exactly as
+/// `process_tree_contents()` skips it.
+fn expand_tree(repo: &gix::Repository, id: ObjectId, seen: &mut HashSet<ObjectId>, out: &mut Vec<ObjectId>) {
+    let Ok(object) = repo.find_object(id) else { return };
+    let kind = object.kind;
+    out.push(id);
+    if kind != gix::object::Kind::Tree {
+        return;
     }
+    let Ok(tree) = gix::objs::TreeRef::from_bytes(&object.data, repo.object_hash()) else {
+        return;
+    };
+    // The borrow of `object` has to end before the recursion re-enters the odb.
+    let entries: Vec<(ObjectId, bool)> = tree
+        .entries
+        .iter()
+        .filter(|e| e.mode.kind() != gix::objs::tree::EntryKind::Commit)
+        .map(|e| (e.oid.to_owned(), e.mode.is_tree()))
+        .collect();
+    drop(object);
+    for (child, _) in entries {
+        if seen.insert(child) {
+            expand_tree(repo, child, seen, out);
+        }
+    }
+}
+
+/// The committer date the date-ordered commit list is built on. A commit that
+/// will not decode sorts as if it were epoch-old, which is where git's own
+/// `parse_commit()` failure leaves it.
+fn commit_date(repo: &gix::Repository, id: ObjectId) -> i64 {
+    repo.find_object(id)
+        .ok()
+        .and_then(|o| o.try_into_commit().ok())
+        .and_then(|c| c.committer().ok().map(|c| c.seconds()))
+        .unwrap_or(0)
 }
 
 /// Every object id named by any reflog in this repository, old and new.
@@ -2737,25 +3082,6 @@ fn push_cache_tree(tree: &gix::index::extension::Tree, out: &mut Vec<ObjectId>) 
     for child in &tree.children {
         push_cache_tree(child, out);
     }
-}
-
-/// Follow tag objects until a commit is reached. `None` for a ref that peels to
-/// a tree or blob, which contributes no ancestry.
-fn peel_to_commit(repo: &gix::Repository, id: ObjectId) -> Option<ObjectId> {
-    let mut id = id;
-    // Bounded so a cyclic tag chain cannot spin; git's own peel is bounded too.
-    for _ in 0..16 {
-        let object = repo.find_object(id).ok()?;
-        match object.kind {
-            gix::object::Kind::Commit => return Some(id),
-            gix::object::Kind::Tag => {
-                let tag = object.into_tag();
-                id = tag.decode().ok()?.target();
-            }
-            _ => return None,
-        }
-    }
-    None
 }
 
 /// The object ids held by the packs named on stdin, one name per line.

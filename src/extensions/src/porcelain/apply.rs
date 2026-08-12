@@ -23,10 +23,12 @@
 //!     git), `-q`/`--quiet`, `--whitespace=warn|nowarn`, `--recount`,
 //!     `--directory=<root>`, `--`, and the `--no-` form of each of git's
 //!     negatable options
+//!   * `-3`/`--3way` and its `--ours`/`--theirs`/`--union` variants — see below
 //!   * usage errors: unknown option/switch (git's own usage block on stderr,
 //!     exit 129), a missing or non-integer option value, an unrecognised
-//!     `--whitespace` action, and `--ours`/`--theirs`/`--union` without `--3way`
-//!     (`fatal:`, exit 128)
+//!     `--whitespace` action, `--ours`/`--theirs`/`--union` without `--3way`,
+//!     `--reject` with `--3way`, and `--3way` outside a repository
+//!     (`fatal:`/`error:`, exit 128)
 //!   * patch kinds: modification, creation, deletion, rename, mode change, and
 //!     symlink blobs; git-style (`diff --git`) and traditional `---`/`+++` diffs
 //!
@@ -65,11 +67,23 @@
 //! and the executable-bit of a plain modification whose diff carries no `index`
 //! mode line and whose pre-image is not in the index.
 //!
+//! `-3`/`--3way` is `try_threeway()`: the patch is replayed onto the blob its
+//! `index <old>..` line names, that post-image is merged into the current
+//! contents with the named blob as the common ancestor, and only a pre-image the
+//! object store cannot supply — or a patch that will not apply even to it — falls
+//! back to placing hunks (`Falling back to direct application...`). It implies
+//! `check_index` exactly as `check_apply_state()` does, so the result is staged;
+//! a merge that does not resolve writes `ll_merge`'s conflict markers, stages the
+//! base/ours/theirs trio, prints `U <path>`, and exits 1.
+//! `--ours`/`--theirs`/`--union` are `state->merge_variant`. Not ported inside
+//! this path: git's `direct_to_threeway`, the add/add case where a creation
+//! collides with an existing file — a creation therefore takes the direct route
+//! and reports what git reports without `--3way`.
+//!
 //! Not implemented — these `bail!` rather than produce plausible-looking wrong
 //! results: `-N`/`--intent-to-add` (index mutation with the intent-to-add flag and
-//! empty-blob placeholder, git's `ita_only` path), `-3`/`--3way` and
-//! `--ours`/`--theirs`/`--union` (3-way
-//! merge against the object store), `--build-fake-ancestor` (writes a temporary
+//! empty-blob placeholder, git's `ita_only` path),
+//! `--build-fake-ancestor` (writes a temporary
 //! index),
 //! `--ignore-whitespace`/`--ignore-space-change` (whitespace-insensitive match
 //! with pre/post-image fixup), `--inaccurate-eof` (subtle trailing-newline
@@ -132,6 +146,10 @@ use anyhow::{bail, Result};
 use gix::bstr::{BString, ByteSlice};
 use gix::hash::ObjectId;
 use gix::index::entry::{Flags, Mode as IndexMode, Stat};
+use gix::merge::blob::builtin_driver::text::{
+    Conflict as MergeConflict, Labels as MergeLabels, Level as MergeLevel, Merge as MergeText,
+    Rendering as MergeRendering,
+};
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -140,7 +158,7 @@ use std::process::ExitCode;
 /// The flag set this port honours, quoted verbatim in the unsupported-flag error.
 const PORTED: &str = "-p<n>, -R/--reverse, --check, --numstat, --stat, --summary, \
                       -z, --apply, --allow-empty, --unidiff-zero, --no-add, \
-                      --index, --cached, \
+                      --index, --cached, -3/--3way, --ours, --theirs, --union, \
                       --exclude, --include, -v/--verbose, --reject, --binary, \
                       -q/--quiet, --whitespace=warn|nowarn, --recount, \
                       --directory=<root>";
@@ -194,7 +212,6 @@ const USAGE: &str = r"usage: git apply [<options>] [<patch>...]
 
 // Reasons quoted back in the deferred unsupported-flag error.
 const R_INDEX: &str = "index mutation is not implemented";
-const R_3WAY: &str = "3-way merge is not implemented";
 const R_CONTEXT: &str = "context reduction is not implemented";
 const R_WS: &str = "whitespace fixing is not implemented";
 const R_IGNORE_WS: &str = "whitespace-insensitive matching is not implemented";
@@ -281,6 +298,18 @@ struct Opts {
     has_include: bool,          // whether any rule is an --include
     apply_override: Option<bool>, // --apply / --no-apply
     apply: bool,                // whether the patch is actually applied
+    three_way: bool,            // -3/--3way: merge the patch in rather than place its hunks
+    /// `--ours`/`--theirs`/`--union`: `state->merge_variant`, which resolves a
+    /// 3-way conflict to one side instead of writing conflict markers.
+    merge_variant: Option<MergeVariant>,
+}
+
+/// git's `XDL_MERGE_FAVOR_*`, the three ways `--3way` can silence a conflict.
+#[derive(Clone, Copy)]
+enum MergeVariant {
+    Ours,
+    Theirs,
+    Union,
 }
 
 impl Default for Opts {
@@ -310,6 +339,8 @@ impl Default for Opts {
             has_include: false,
             apply_override: None,
             apply: true,
+            three_way: false,
+            merge_variant: None,
         }
     }
 }
@@ -353,7 +384,6 @@ fn parse_opts(
     sources: &mut Vec<String>,
     unhonoured: &mut Vec<Unhonoured>,
 ) -> Result<(), ExitCode> {
-    let mut three_way = false;
     let mut conflict_given = false;
     let mut no_more_opts = false;
     let mut i = 0;
@@ -446,15 +476,17 @@ fn parse_opts(
                 }
 
                 // ---- parsed, validated, reported before they could matter ----
-                "ours" | "theirs" | "union" if !neg => conflict_given = true,
-                "3way" => {
-                    three_way = !neg;
-                    if neg {
-                        unmark(unhonoured, "3way");
-                    } else {
-                        mark(unhonoured, "3way", &a, R_3WAY);
-                    }
+                // `state->merge_variant`, handed to `ll_merge()` so a conflict
+                // resolves to one side instead of being marked up.
+                "ours" | "theirs" | "union" if !neg => {
+                    conflict_given = true;
+                    o.merge_variant = Some(match name {
+                        "ours" => MergeVariant::Ours,
+                        "theirs" => MergeVariant::Theirs,
+                        _ => MergeVariant::Union,
+                    });
                 }
+                "3way" => o.three_way = !neg,
                 // --index (worktree + index) and --cached (index only) are honoured.
                 "index" => o.index = !neg,
                 "cached" => o.cached = !neg,
@@ -552,10 +584,7 @@ fn parse_opts(
                 'q' => o.quiet = true,
                 'v' => o.verbose = true,
                 'N' => mark(unhonoured, "intent-to-add", "-N", R_INDEX),
-                '3' => {
-                    three_way = true;
-                    mark(unhonoured, "3way", "-3", R_3WAY);
-                }
+                '3' => o.three_way = true,
                 _ => {
                     eprintln!("error: unknown switch `{c}'");
                     eprint!("{USAGE}");
@@ -566,7 +595,7 @@ fn parse_opts(
     }
 
     // git's one post-parse usage check, run before it opens any patch file.
-    if conflict_given && !three_way {
+    if conflict_given && !o.three_way {
         eprintln!("fatal: --ours, --theirs, and --union require --3way");
         return Err(ExitCode::from(128));
     }
@@ -615,10 +644,19 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
         return Ok(code);
     }
 
-    // `--index`/`--cached` both require a repository, and git rejects them outside
-    // one (`check_apply_state`) before it even opens the patch input. `--index`'s
-    // message wins when both are given, matching git's check order.
-    let check_index = o.index || o.cached;
+    // `check_apply_state()`, in its own order: the `--reject`/`--3way` clash
+    // first, then `--3way`'s repository requirement — which also turns
+    // `check_index` on, since the merge base comes out of the object store — and
+    // only then the same requirement for `--index`/`--cached`.
+    if o.reject && o.three_way {
+        eprintln!("error: options '--reject' and '--3way' cannot be used together");
+        return Ok(ExitCode::from(128));
+    }
+    if o.three_way && gix::discover(".").is_err() {
+        eprintln!("error: '--3way' outside a repository");
+        return Ok(ExitCode::from(128));
+    }
+    let check_index = o.index || o.cached || o.three_way;
     if check_index && gix::discover(".").is_err() {
         let flag = if o.index { "--index" } else { "--cached" };
         eprintln!("error: '{flag}' outside a repository");
@@ -833,6 +871,9 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
     let mut staged: HashMap<String, Option<Vec<u8>>> = HashMap::new();
     let mut ops: Vec<Op> = Vec::new();
     let mut failed = false;
+    // `patch->conflicted_threeway`: paths whose 3-way merge left markers behind,
+    // with the stage 1/2/3 blobs `add_conflicted_stages_file()` records.
+    let mut conflicted: Vec<(String, u32, [Option<ObjectId>; 3])> = Vec::new();
 
     for p in &patches {
         // The name git reports progress and success against.
@@ -903,9 +944,39 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
             }
         };
 
+        // `apply_data()`: under `--3way` the merge is what applies the patch, and
+        // only a pre-image the object store cannot supply — or a patch that will
+        // not even apply to that pre-image — falls back to placing hunks.
+        let mut merged: Option<ThreeWay> = None;
+        if o.three_way && !p.binary {
+            let repo = idx_repo.as_ref().expect("--3way implies check_index");
+            match try_threeway(repo, p, &pre_bytes, &o)? {
+                ThreeWayOutcome::Merged(tw) => {
+                    err(
+                        o.quiet,
+                        &if tw.stages.is_some() {
+                            format!("Applied patch to '{}' with conflicts.", tw.path)
+                        } else {
+                            format!("Applied patch to '{}' cleanly.", tw.path)
+                        },
+                    );
+                    image = vec![tw.content.clone()];
+                    merged = Some(tw);
+                }
+                ThreeWayOutcome::Fallback(reason) => {
+                    if let Some(msg) = reason {
+                        err(o.quiet, &format!("error: {msg}"));
+                    }
+                    err(o.quiet, "Falling back to direct application...");
+                }
+            }
+        }
+
         // `apply_binary()`: the payload rebuilds the whole file, and both ends are
         // checked against the ids the `index` line named.
-        if p.binary {
+        if merged.is_some() {
+            // The merge already produced the whole post-image.
+        } else if p.binary {
             match rebuild_binary(p, &pre_bytes) {
                 Ok(bytes) => image = vec![bytes],
                 Err(msg) => {
@@ -973,6 +1044,9 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
             }
         }
         staged.insert(new.clone(), Some(data.clone()));
+        if let Some(stages) = merged.and_then(|tw| tw.stages) {
+            conflicted.push((new.clone(), mode, stages));
+        }
         ops.push(Op {
             name,
             remove: p.old_name.clone(),
@@ -1048,8 +1122,34 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
             .chain(idx_add.iter().map(|(p, _, _, _)| p.clone()))
             .collect();
         index.remove_entries(|_, path, _| drop_set.contains(&path.to_owned()));
+        // `add_conflicted_stages_file()` replaces a conflicted path's stage-0
+        // entry with the base/ours/theirs trio, so the path reads as unmerged.
+        let conflicted_paths: HashSet<BString> = conflicted
+            .iter()
+            .map(|(p, _, _)| BString::from(p.clone().into_bytes()))
+            .collect();
         for (path, id, mode, stat) in &idx_add {
+            if conflicted_paths.contains(path) {
+                continue;
+            }
             index.dangerously_push_entry(*stat, *id, Flags::empty(), *mode, path.as_ref());
+        }
+        for (path, mode, stages) in &conflicted {
+            let path = BString::from(path.clone().into_bytes());
+            for (n, id) in stages.iter().enumerate() {
+                let Some(id) = id else { continue };
+                index.dangerously_push_entry(
+                    Stat::default(),
+                    *id,
+                    Flags::from_stage(match n {
+                        0 => gix::index::entry::Stage::Base,
+                        1 => gix::index::entry::Stage::Ours,
+                        _ => gix::index::entry::Stage::Theirs,
+                    }),
+                    to_index_mode(*mode),
+                    path.as_ref(),
+                );
+            }
         }
         index.sort_entries();
         // Drop the cached tree so a later commit cannot capture a stale subtree.
@@ -1057,7 +1157,169 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
         index.write(gix::index::write::Options::default())?;
     }
 
+    // `write_out_results()`: the conflicted paths are named once every write is
+    // done, in sorted order, and make the whole run fail.
+    if !conflicted.is_empty() {
+        let mut names: Vec<&str> = conflicted.iter().map(|(p, _, _)| p.as_str()).collect();
+        names.sort_unstable();
+        for name in names {
+            err(o.quiet, &format!("U {name}"));
+        }
+        return Ok(ExitCode::from(1));
+    }
+
     Ok(ExitCode::SUCCESS)
+}
+
+/// The outcome of `try_threeway()`: either the merge produced the post-image, or
+/// the caller must fall back to placing the patch's hunks directly.
+enum ThreeWayOutcome {
+    Merged(ThreeWay),
+    /// `try_threeway()` returned `< 0`. The payload is the `error()` git printed
+    /// on the way out, when it printed one.
+    Fallback(Option<String>),
+}
+
+/// A completed 3-way merge.
+struct ThreeWay {
+    /// `patch->new_name`, the path git names in its report.
+    path: String,
+    /// The merged post-image.
+    content: Vec<u8>,
+    /// `patch->threeway_stage`, set only when the merge did not resolve: the
+    /// pre-image (absent for a creation), ours, and theirs.
+    stages: Option<[Option<ObjectId>; 3]>,
+}
+
+/// Port of `try_threeway()` (apply.c): rebuild the post-image the patch was
+/// written to produce, then merge it into the current contents using the blob the
+/// patch names as the common ancestor.
+///
+/// `ours` is the pre-image the caller already read — git's `load_preimage()`
+/// result, which is the index blob under `check_index` and the worktree file
+/// otherwise.
+fn try_threeway(
+    repo: &gix::Repository,
+    p: &Patch,
+    ours: &[u8],
+    o: &Opts,
+) -> Result<ThreeWayOutcome> {
+    // "No point falling back to 3-way merge in these cases". A creation is on
+    // the list too: git only merges one through `direct_to_threeway`, the
+    // add/add path this port does not build.
+    let gitlink = |m: Option<u32>| m.is_some_and(|m| m & 0o170000 == 0o160000);
+    if p.is_delete
+        || p.is_new
+        || gitlink(p.old_mode)
+        || gitlink(p.new_mode)
+        || (p.is_rename && p.added == 0 && p.deleted == 0)
+    {
+        return Ok(ThreeWayOutcome::Fallback(None));
+    }
+
+    let path = p
+        .new_name
+        .clone()
+        .or_else(|| p.old_name.clone())
+        .unwrap_or_default();
+    let missing_blob =
+        || Ok(ThreeWayOutcome::Fallback(Some(
+            "repository lacks the necessary blob to perform 3-way merge.".to_string(),
+        )));
+
+    // "Preimage the patch was prepared for": the `index <old>..` id, read as a blob.
+    let Some(pre_hex) = p.preimage_id(o.reverse) else {
+        return missing_blob();
+    };
+    let Ok(pre_id) = repo.rev_parse_single(pre_hex.as_bytes().as_bstr()) else {
+        return missing_blob();
+    };
+    let Some(pre_bytes) = repo
+        .find_object(pre_id)
+        .ok()
+        .and_then(|obj| obj.try_into_blob().ok())
+        .map(|blob| blob.data.clone())
+    else {
+        return missing_blob();
+    };
+    let pre_id = pre_id.detach();
+
+    // "Apply the patch to get the post image" — against that pre-image, not
+    // against what is on disk.
+    let mut post: Vec<Vec<u8>> = split_lines(&pre_bytes)
+        .into_iter()
+        .map(<[u8]>::to_vec)
+        .collect();
+    if apply_hunks(&mut post, p, o.unidiff_zero, o.no_add, o.p_context).is_err() {
+        return Ok(ThreeWayOutcome::Fallback(None));
+    }
+    let post_bytes: Vec<u8> = post.concat();
+    let post_id = repo.write_blob(&post_bytes)?.detach();
+    let our_id = repo.write_blob(ours)?.detach();
+
+    // `three_way_merge()`'s trivial resolutions, which never reach the merge
+    // driver: one side did not move, so the other side is the answer.
+    if pre_id == our_id {
+        return Ok(ThreeWayOutcome::Merged(ThreeWay {
+            path,
+            content: post_bytes,
+            stages: None,
+        }));
+    }
+    if pre_id == post_id || our_id == post_id {
+        return Ok(ThreeWayOutcome::Merged(ThreeWay {
+            path,
+            content: ours.to_vec(),
+            stages: None,
+        }));
+    }
+
+    // `ll_merge()` with `LL_MERGE_OPTIONS_INIT`: `XDL_MERGE_ZEALOUS`, the
+    // configured conflict style, and git's fixed base/ours/theirs labels.
+    let style = match super::merge_file::conflict_style_config(Some(repo)) {
+        Ok(s) => s,
+        Err(code) => return Ok(ThreeWayOutcome::Fallback(Some(format!(
+            "merge.conflictStyle is unusable (exit {code:?})"
+        )))),
+    };
+    let conflict = match o.merge_variant {
+        Some(MergeVariant::Ours) => MergeConflict::ResolveWithOurs,
+        Some(MergeVariant::Theirs) => MergeConflict::ResolveWithTheirs,
+        Some(MergeVariant::Union) => MergeConflict::ResolveWithUnion,
+        None => MergeConflict::Keep {
+            style,
+            marker_size: std::num::NonZeroU8::new(7).expect("7 is not zero"),
+        },
+    };
+    let mut content = Vec::new();
+    let mut input = gix::diff::blob::InternedInput::default();
+    let merge = MergeText::new(
+        &mut input,
+        ours,
+        &pre_bytes,
+        &post_bytes,
+        gix::diff::blob::Algorithm::Myers,
+    );
+    let (_resolution, conflicts) = merge.run_with(
+        &mut content,
+        MergeLabels {
+            current: Some(b"ours".as_bstr()),
+            ancestor: Some(b"base".as_bstr()),
+            other: Some(b"theirs".as_bstr()),
+        },
+        MergeRendering {
+            conflict,
+            style: Some(style),
+            level: MergeLevel::Zealous,
+            marker_size: Some(7),
+        },
+    );
+
+    Ok(ThreeWayOutcome::Merged(ThreeWay {
+        path,
+        content,
+        stages: (conflicts > 0).then_some([Some(pre_id), Some(our_id), Some(post_id)]),
+    }))
 }
 
 /// Whether a creation/rename target is already taken, and where. git's
@@ -1209,6 +1471,21 @@ struct Patch {
 }
 
 impl Patch {
+    /// `patch->old_oid_prefix`: the id of the blob the patch was written against,
+    /// which the 3-way merge uses as its common ancestor.
+    ///
+    /// `reverse_patches()` swaps the pair along with everything else it reverses.
+    /// [`Patch::reverse`] leaves `index_old`/`index_new` in file order because the
+    /// binary payload they are checked against is not swapped either, so under
+    /// `-R` the pre-image id is the one written second.
+    fn preimage_id(&self, reversed: bool) -> Option<&String> {
+        if reversed {
+            self.index_new.as_ref()
+        } else {
+            self.index_old.as_ref()
+        }
+    }
+
     /// `-R`: swap the two images, so the patch undoes itself.
     fn reverse(&mut self) {
         std::mem::swap(&mut self.old_name, &mut self.new_name);
@@ -2565,38 +2842,6 @@ impl BinaryPayload {
     }
 }
 
-/// git's base85 alphabet (base85.c). The decoder maps each character back to its
-/// value; anything outside the alphabet makes the line invalid.
-const BASE85: &[u8; 85] =
-    b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz!#$%&()*+-;<=>?@^_`{|}~";
-
-/// `decode_85()`: five alphabet characters carry four bytes, the last group padded.
-fn decode_base85(input: &[u8], want: usize) -> Option<Vec<u8>> {
-    let mut out = Vec::with_capacity(want);
-    let mut left = want;
-    let mut chunk = input.chunks(5);
-    while left > 0 {
-        let group = chunk.next()?;
-        if group.len() != 5 {
-            return None;
-        }
-        let mut acc: u32 = 0;
-        for &ch in group {
-            let de = BASE85.iter().position(|c| *c == ch)? as u32;
-            acc = acc.checked_mul(85)?.checked_add(de)?;
-        }
-        // git emits the four bytes most-significant first by rotating the
-        // accumulator a byte at a time.
-        let take = left.min(4);
-        for _ in 0..take {
-            acc = acc.rotate_left(8);
-            out.push(acc as u8);
-        }
-        left -= take;
-    }
-    Some(out)
-}
-
 /// `patch_delta()` (patch-delta.c): a size header for each side, then copy-from-base
 /// and insert-literal instructions. `None` when the delta does not describe `base`.
 fn apply_git_delta(base: &[u8], delta: &[u8]) -> Option<Vec<u8>> {
@@ -2678,7 +2923,7 @@ fn parse_binary_block(lines: &[&[u8]], mut i: usize) -> Option<(BinaryPayload, u
             c @ b'a'..=b'z' => (c - b'a') as usize + 27,
             _ => break,
         };
-        encoded.extend_from_slice(&decode_base85(&body[1..], len)?);
+        encoded.extend_from_slice(&super::binary_patch::decode_base85(&body[1..], len)?);
         i += 1;
     }
     // The payload is deflated, exactly as `emit_binary_diff_body()` wrote it.

@@ -2,7 +2,7 @@ lints.workspace = true
 
 [package]
 name = "gix-zlib"
-description = "Zlib-rs streaming compression and decompression utilities used by gitoxide"
+description = "Zlib-exact compression and zlib-rs decompression utilities used by gitoxide"
 repository = "https://github.com/GitoxideLabs/gitoxide"
 version = "0.1.0"
 authors = ["Sebastian Thiel <sebastian.thiel@icloud.com>"]

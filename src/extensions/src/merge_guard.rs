@@ -264,6 +264,156 @@ pub fn verify_two_way(
     Ok(clobber)
 }
 
+/// `unpack_trees()` with `fn = threeway_merge` and `o->aggressive` — that is,
+/// `git read-tree -u -m --aggressive <base> <ours> <theirs>`, the one gate the
+/// octopus strategy runs per head before it ever calls `git write-tree`.
+///
+/// This has to be a *separate* check from [`verify_two_way`] rather than a
+/// post-hoc look at the merged tree, because the ordering is observable: git's
+/// `read-tree` refuses without having written anything, so a refused octopus
+/// leaves no merged tree (and no merged blobs) behind in the object database.
+///
+/// `threeway_merge()`'s case table is transcribed below, with `stages[0]` the
+/// index, `stages[1]` the base, `stages[2]` (`head`) ours and `stages[3]`
+/// (`remote`) theirs. The D/F-conflict entries have no counterpart in this
+/// flattened path map, so `df_conflict_head`/`df_conflict_remote` are always 0
+/// and the branches they guard collapse to their taken side.
+pub fn verify_three_way(
+    repo: &gix::Repository,
+    base_tree: ObjectId,
+    ours_tree: ObjectId,
+    theirs_tree: ObjectId,
+    index: &gix::index::State,
+) -> Result<Clobber> {
+    let base = flatten(repo, base_tree)?;
+    let ours = flatten(repo, ours_tree)?;
+    let theirs = flatten(repo, theirs_tree)?;
+    let (cur, conflicted) = index_map(index);
+    let mut clobber = Clobber::default();
+
+    // Deferred so the worktree is scanned once, and only when it can matter.
+    let mut uptodate: Vec<&BString> = Vec::new();
+    let mut absent_overwritten: Vec<&BString> = Vec::new();
+    let mut absent_removed: Vec<&BString> = Vec::new();
+
+    let paths: BTreeSet<&BString> = base
+        .keys()
+        .chain(ours.keys())
+        .chain(theirs.keys())
+        .chain(cur.keys())
+        .collect();
+
+    for path in paths {
+        let anc = base.get(path);
+        let head = ours.get(path);
+        let remote = theirs.get(path);
+        let idx = cur.get(path);
+        // An unmerged index entry never reaches `read-tree -m`: git refuses the
+        // whole command with "you need to resolve your current index first".
+        if conflicted.contains(path) {
+            clobber.would_overwrite.push(path.clone());
+            continue;
+        }
+
+        // `merged_entry(ce, old)` reduced to the two checks it can fail: an
+        // addition must find nothing untracked in the way, and a replacement
+        // must find the worktree still matching the index entry it replaces.
+        let mut merged_entry = |ce: Option<&(ObjectId, Mode)>, old: Option<&(ObjectId, Mode)>| {
+            match old {
+                None => absent_overwritten.push(path),
+                Some(old) if Some(old) == ce => {}
+                Some(_) => uptodate.push(path),
+            }
+        };
+
+        // `if (!same(remote, head))` guards both matches, so they stay 0 when
+        // the two sides agree.
+        let (head_match, remote_match) = if remote == head {
+            (false, false)
+        } else {
+            (anc == head, anc == remote)
+        };
+
+        // #14, #14ALT, #2ALT: ours reverted to the base, so theirs wins and the
+        // index is allowed to already hold the result.
+        if remote.is_some() && head_match && !remote_match {
+            if idx.is_some() && idx != remote && idx != head {
+                clobber.would_overwrite.push(path.clone());
+            } else {
+                merged_entry(remote, idx);
+            }
+            continue;
+        }
+        // Outside that one exception the index must match ours.
+        if idx.is_some() && idx != head {
+            clobber.would_overwrite.push(path.clone());
+            continue;
+        }
+        if head.is_some() {
+            // #5ALT, #15 (both sides identical) and #13, #3ALT (theirs reverted
+            // to the base): ours wins, which the index already holds.
+            if head == remote || (remote_match && !head_match) {
+                merged_entry(head, idx);
+                continue;
+            }
+        }
+        // #1: absent from both sides and from at least one base.
+        if head.is_none() && remote.is_none() && anc.is_none() {
+            continue;
+        }
+
+        // `if (o->aggressive)`: deleted on both sides, or deleted on one and
+        // untouched on the other.
+        let (head_deleted, remote_deleted) = (head.is_none(), remote.is_none());
+        if (head_deleted && remote_deleted)
+            || (head_deleted && remote.is_some() && remote_match)
+            || (remote_deleted && head.is_some() && head_match)
+        {
+            // `deleted_entry(index, index)` — `old` is the index entry itself,
+            // so the branch that runs is `verify_uptodate`.
+            match idx {
+                Some(_) => uptodate.push(path),
+                // `ce` falls back to head/remote/base, and only a live `head`
+                // reaches the untracked check.
+                None if !head_deleted => absent_removed.push(path),
+                None => {}
+            }
+            continue;
+        }
+        // "Added in both, identically" is already covered by `head == remote`
+        // above, so the aggressive block has nothing left to resolve.
+
+        // The "no merge" cases keep all three stages, and git demands an
+        // up-to-date index first so the conflict markers do not land on top of
+        // unsaved work.
+        if idx.is_some() {
+            uptodate.push(path);
+        }
+    }
+
+    if uptodate.is_empty() && absent_overwritten.is_empty() && absent_removed.is_empty() {
+        return Ok(clobber);
+    }
+    let want_untracked = !absent_overwritten.is_empty() || !absent_removed.is_empty();
+    let worktree = scan(repo, want_untracked)?;
+    for path in uptodate {
+        if worktree.modified.contains(path) {
+            clobber.not_uptodate.push(path.clone());
+        }
+    }
+    for path in absent_overwritten {
+        if worktree.untracked.contains(path) && is_plain_file(repo, path) {
+            clobber.untracked_overwritten.push(path.clone());
+        }
+    }
+    for path in absent_removed {
+        if worktree.untracked.contains(path) && is_plain_file(repo, path) {
+            clobber.untracked_removed.push(path.clone());
+        }
+    }
+    Ok(clobber)
+}
+
 /// Whether the path in the way is a plain file rather than a directory.
 ///
 /// `check_ok_to_remove()` rejects a file outright, but hands a directory to

@@ -356,10 +356,9 @@ fn approxidate(value: &str) -> i64 {
 /// (clears the porcelain bit only), `--no-line-porcelain` (clears both porcelain
 /// bits, so it also cancels a preceding `-p`), and `--no-abbrev` (equivalent to
 /// `--abbrev=0`, i.e. the full hash). `--no-ignore-rev` / `--no-ignore-revs-file`
-/// clear their `OPT_STRING_LIST`s, config-supplied entries included. The `--no-`
-/// forms of the unimplemented options (`--no-show-stats`, `--no-score-debug`)
-/// each select git's default, which this port already produces, so they are
-/// accepted as no-ops.
+/// clear their `OPT_STRING_LIST`s, config-supplied entries included.
+/// `--no-show-stats` clears its `OPT_BOOL` and `--no-score-debug` clears the
+/// `OUTPUT_SHOW_SCORE` bit its `OPT_BIT` sets.
 ///
 /// `--ignore-rev <rev>`, `--ignore-revs-file <file>` and `blame.ignoreRevsFile`
 /// are implemented against a port of git's fingerprint matcher: once the ordinary
@@ -371,34 +370,17 @@ fn approxidate(value: &str) -> i64 {
 /// spending one column of the object-name field, and both emit their own
 /// `ignored` / `unblamable` line in the porcelain formats.
 ///
-/// Flags that are not implemented are rejected with a terse message rather than
-/// emitting wrong output, each for a concrete reason:
-///   * `--show-stats` — the three counters are `blame_scoreboard`'s own
-///     instrumentation and count *reads*, not attributions. `num commits` and
-///     `num get patch` are structural (one per `pass_blame()` that got past
-///     `pass_whole_blame()`, one per `pass_blame_to_parent()` that found entries
-///     left), but `num read blob` is one per `fill_origin_blob()` that found
-///     `blame_origin::file` empty — so it counts the *misses* of a per-origin blob
-///     cache whose lifetime is the `blame_origin` refcount graph:
-///     `pass_whole_blame()` hands the buffer to the parent origin rather than
-///     re-reading it, `fake_working_tree_commit()` seeds the starting origin's
-///     buffer from the worktree so a working-tree blame reads one blob fewer than
-///     the same blame at `HEAD` (verified: 2 versus 3 on the same file), and
-///     `find_copy_in_parent()` builds and drops a fresh origin per candidate path
-///     per round. Reproducing the number therefore means reproducing that graph,
-///     not the walk this port performs, whose per-parent structure differs.
-///   * `--score-debug` — the score column is reproducible (`blame_entry_score()`
-///     is one plus the entry's alphanumeric bytes, ported in
-///     `gix_blame::file::moved`), but the `%02d` column beside it is
-///     `ent->suspect->refcnt` — the same refcount graph, read at output time.
+/// A long option no git parser knows — neither `options[]` nor the revision and
+/// diff tables `parse_revision_opt()` forwards to, enumerated in
+/// [`GIT_BLAME_LONG_OPTIONS`] — is answered with git's own
+/// `error: unknown option` and usage on stderr, exit 129, including git's quirk
+/// of losing the option's name to `overwrite_argv()` once an earlier option has
+/// consumed an argv slot (see [`unknown_option_name`]).
+///
+/// Flags git *does* know but this port has not implemented are rejected with a
+/// terse message rather than emitting wrong output, each for a concrete reason:
 ///   * `-S <revs-file>` — installs commit grafts that rewrite the ancestry the
 ///     walk follows.
-///   * `--reverse <range>` — inverts the direction of the whole algorithm. git
-///     builds a `revs->children` decoration during `prepare_revision_walk()` and
-///     `first_scapegoat()` returns *children* instead of parents, so a line is
-///     attributed to the last commit that still had it rather than the first that
-///     introduced it. `gix-blame` walks parents only; there is no children map to
-///     hand it.
 ///   * `--no-indent-heuristic` — the blame diffs run through
 ///     `gix_diff::blob::compact::change_compact`, git's `xdl_change_compact()`
 ///     with `XDF_INDENT_HEURISTIC` applied unconditionally, so the heuristic
@@ -411,6 +393,33 @@ fn approxidate(value: &str) -> i64 {
 /// commit's parent list to one entry inside `gix-blame`, which is what git's
 /// `first_scapegoat()` does under `revs->first_parent_only`, and the second
 /// selects the same `XDF_NEED_MINIMAL` diff `--diff-algorithm=minimal` selects.
+///
+/// `--reverse <range>`, `--show-stats` and `--score-debug` are implemented too,
+/// and all three needed the same thing: `gix-blame` had to grow the parts of
+/// git's `blame_origin` it did not model.
+///   * `--reverse` inverts the direction of the whole algorithm. git builds a
+///     `revs->children` decoration during `prepare_revision_walk()`,
+///     `first_scapegoat()` returns *children* instead of parents and the commit
+///     queue is ordered oldest-first, so a line is attributed to the last commit
+///     that still had it. [`reverse_children`] builds that decoration over the
+///     range the arguments name and hands it to `gix-blame` as
+///     `Options::children`.
+///   * `--show-stats` prints `blame_scoreboard`'s three counters, and `num read
+///     blob` is the awkward one: it counts `fill_origin_blob()` calls that found
+///     `blame_origin::file` empty, i.e. the *misses* of a per-origin blob cache
+///     whose lifetime is the refcount graph. `gix-blame` now keeps that cache
+///     (`OriginFiles`), so `pass_whole_blame()` hands the buffer over instead of
+///     the parent re-reading it and `find_copy_in_parent()` drops a candidate's
+///     blob again unless something kept the origin alive. The one origin outside
+///     the walk is `fake_working_tree_commit()`, which is this file's overlay;
+///     it is described to `gix-blame` as `Options::fake_commit`, and it is why a
+///     working-tree blame reads one blob fewer than the same blame at `HEAD`
+///     (verified against stock git: 2 versus 3 on the same file).
+///   * `--score-debug` adds `blame_entry_score()` — one plus the entry's
+///     alphanumeric bytes — and beside it `ent->suspect->refcnt`, read from that
+///     same graph at output time. `Outcome::suspect_refcounts` reports it: an
+///     origin is referenced once per coalesced entry naming it and once per live
+///     origin whose `blame_origin::previous` points at it.
 ///
 /// `-L` accepts every form `line-range.c` does: `<n>`, `<n>,<m>`, `<n>,+<m>`,
 /// `<n>,-<m>`, the empty endpoints of `-L,<m>` and `-L<n>,`, `/<regex>/`,
@@ -510,6 +519,14 @@ pub(super) fn blame_with(args: &[String], cmd: &str) -> Result<ExitCode> {
         // `parse_options()` answers `-h` the moment it reaches it, before it looks
         // at anything that follows, so this returns from inside the parse loop.
         ParseOutcome::Help => return print_usage(cmd, true),
+        // `parse_revision_opt()` prints the diagnostic and then
+        // `usage_with_options()`, both on stderr, and exits 129.
+        ParseOutcome::Unknown(name) => {
+            let mut err = std::io::stderr().lock();
+            writeln!(err, "error: unknown option `{name}'")?;
+            err.flush()?;
+            return print_usage(cmd, false);
+        }
         ParseOutcome::Opts(opts) => *opts,
     };
 
@@ -558,6 +575,14 @@ pub(super) fn blame_with(args: &[String], cmd: &str) -> Result<ExitCode> {
         Targets::Resolved => {}
     }
 
+    // `setup_scoreboard()`'s first check (`blame.c:2778`), before anything else it does.
+    if opts.reverse && opts.contents.is_some() {
+        let mut err = std::io::stderr().lock();
+        writeln!(err, "fatal: --contents and --reverse do not blend well.")?;
+        err.flush()?;
+        return Ok(ExitCode::from(128));
+    }
+
     // Resolve the suspect commit (default HEAD). The overlay (working tree or
     // `--contents`) is layered on top of the suspect, so `head_id` — the commit a
     // not-yet-committed line points back to via the porcelain `previous` field —
@@ -594,7 +619,10 @@ pub(super) fn blame_with(args: &[String], cmd: &str) -> Result<ExitCode> {
     // `odb_read_object_info(...) == OBJ_BLOB`, so naming a directory is "no such
     // path" rather than an attempt to blame a tree (verified: stock
     // `git blame src` prints `fatal: no such path 'src' in HEAD`, exit 128).
-    let overlay = opts.contents.is_some() || opts.rev.is_none();
+    // A `--reverse` blame always names its initial commit, so `setup_scoreboard()` never has to
+    // invent a commit for the final image: `sb->final` is set and `sb->contents_from` is refused
+    // above.
+    let overlay = opts.contents.is_some() || (opts.rev.is_none() && !opts.reverse);
     let path_in_suspect = blob_at(&repo, &suspect, &rel_path).is_some();
     let mut index_only = false;
     if !path_in_suspect {
@@ -683,6 +711,47 @@ pub(super) fn blame_with(args: &[String], cmd: &str) -> Result<ExitCode> {
         gix::blame::BlameRanges::from_one_based_inclusive_ranges(opts.ranges.clone())
             .map_err(|e| anyhow!("{e}"))?
     };
+    // `revs->children` for a `--reverse` walk, built over the range the arguments named.
+    let children = match (opts.reverse, opts.reverse_from) {
+        (true, Some(from)) if opts.first_parent => {
+            let latest = opts.reverse_tips[0];
+            match reverse_first_parent_children(&repo, from, latest)? {
+                Some(children) => Some(children),
+                None => {
+                    let mut err = std::io::stderr().lock();
+                    writeln!(
+                        err,
+                        "fatal: --reverse --first-parent together require range along first-parent chain"
+                    )?;
+                    err.flush()?;
+                    return Ok(ExitCode::from(128));
+                }
+            }
+        }
+        (true, Some(from)) => Some(reverse_children(&repo, from, &opts.reverse_tips)?),
+        _ => None,
+    };
+
+    // git's `fake_working_tree_commit()`, which only exists on the overlay path. Both halves of
+    // what `gix-blame` needs to account for it follow from the same comparison the overlay itself
+    // is built from: whether the final image is `suspect`'s blob, and how many runs of lines no
+    // scapegoat can claim. Under an in-progress merge the remaining scapegoats are `MERGE_HEAD`s,
+    // whose blames are separate walks below and so keep their own origin caches; the counters
+    // then add up rather than sharing one, as they would in git's single scoreboard.
+    let fake_commit = match &worktree_content {
+        Some(content) => {
+            let scapegoat_blobs: Vec<Vec<u8>> = std::iter::once(suspect)
+                .filter_map(|id| blob_at(&repo, &id, &rel_path))
+                .filter_map(|blob| repo.find_object(blob).ok())
+                .map(|o| o.detach().data)
+                .collect();
+            Some(gix::blame::FakeCommit {
+                passes_whole_blame: scapegoat_blobs.first().is_some_and(|blob| blob == content),
+            })
+        }
+        None => None,
+    };
+
     let blame_options = gix::repository::blame_file::Options {
         diff_algorithm: opts.diff_algorithm,
         ranges,
@@ -693,6 +762,8 @@ pub(super) fn blame_with(args: &[String], cmd: &str) -> Result<ExitCode> {
         ignore_revs: ignore_revs.clone(),
         detect_copied: opts.detect_copied,
         first_parent: opts.first_parent,
+        children,
+        fake_commit,
     };
 
     // A blame of (commit, path) is a pure function of immutable objects, so the
@@ -713,6 +784,11 @@ pub(super) fn blame_with(args: &[String], cmd: &str) -> Result<ExitCode> {
     //
     // `--incremental` is not cached either: it needs the walk-order, uncoalesced entries,
     // which the run encoding does not preserve.
+    //
+    // Neither are `--show-stats` and `--score-debug`: both report on the walk itself — the work it
+    // did, and the `blame_origin` refcounts it ended up with — and a cache hit is precisely the
+    // case where no walk happened. `--reverse` is a different traversal over a range the key does
+    // not name, so it is kept out too.
     let algo_key = format!(
         "{:?}|w={}|M={:?}|C={:?}|1p={}",
         opts.diff_algorithm,
@@ -724,7 +800,10 @@ pub(super) fn blame_with(args: &[String], cmd: &str) -> Result<ExitCode> {
     let cache_key = (opts.ranges.is_empty()
         && ignore_revs.is_empty()
         && !index_only
-        && !opts.incremental)
+        && !opts.incremental
+        && !opts.show_stats
+        && !opts.score_debug
+        && !opts.reverse)
         .then(|| (suspect.to_string(), rel_path.clone(), algo_key));
     // The blamed blob identifies the file content the attribution belongs to.
     let blamed_blob = repo
@@ -742,18 +821,35 @@ pub(super) fn blame_with(args: &[String], cmd: &str) -> Result<ExitCode> {
     // The entries in the order the walk finalized them, which only `--incremental`
     // needs — and which is empty on a cache hit, where the walk never ran.
     let mut uncoalesced: Vec<gix::blame::BlameEntry> = Vec::new();
+    // The `blame_scoreboard` counters `--show-stats` reports, accumulated over every walk this
+    // blame runs — one, except mid-merge where each `MERGE_HEAD` scapegoat of the synthetic
+    // working-tree commit is its own.
+    let mut stats = gix::blame::Statistics::default();
+    // `blame_origin::previous`, which the porcelain format reports and which walking forwards is a
+    // *child*, so it cannot be rediscovered from a commit's parents the way [`find_previous`]
+    // does it.
+    let mut previous_origins: PreviousOrigins = std::collections::BTreeMap::new();
     // `(lines, blob content)` — the overlay path needs the blamed blob's bytes,
     // which come from the outcome on a miss and from the object on a hit.
     let (mut lines, blamed_bytes) = match cached {
         // Nothing to blame against: the file exists only in the index, so the empty
-        // `HEAD` image below leaves every line with the synthetic commit.
-        _ if index_only => (Vec::new(), Vec::new()),
+        // `HEAD` image below leaves every line with the synthetic commit. No walk runs, but
+        // git's does not either — `setup_scoreboard()` reads the final image, and the fake
+        // commit's `pass_blame()` reaches `sb->num_commits++` with every `sg_origin[]` left
+        // NULL, since none of its scapegoats has the path to hand back.
+        _ if index_only => {
+            stats.num_read_blob = 1;
+            stats.num_commits = 1;
+            (Vec::new(), Vec::new())
+        }
         Some((lines, bytes)) => (lines, bytes),
         None => {
             let outcome = repo
                 .blame_file(rel_path.as_bytes().as_bstr(), suspect, blame_options.clone())
                 .map_err(|e| anyhow!("{e}"))?;
             let lines = materialize_lines(&outcome);
+            stats = outcome.statistics;
+            collect_previous_origins(&mut previous_origins, &outcome);
             if let (Some((c, p, a)), Some(blob)) = (&cache_key, blamed_blob) {
                 // Queued, not written here: the blame is already computed and
                 // about to be printed.
@@ -790,6 +886,8 @@ pub(super) fn blame_with(args: &[String], cmd: &str) -> Result<ExitCode> {
             let outcome = repo
                 .blame_file(rel_path.as_bytes().as_bstr(), *parent, blame_options.clone())
                 .map_err(|e| anyhow!("{e}"))?;
+            add_statistics(&mut stats, &outcome.statistics);
+            collect_previous_origins(&mut previous_origins, &outcome);
             sources.push((materialize_lines(&outcome), bytes));
         }
         lines = overlay_worktree(
@@ -809,6 +907,11 @@ pub(super) fn blame_with(args: &[String], cmd: &str) -> Result<ExitCode> {
     finish_progress(show_progress, progress_started, lines.len())?;
 
     if lines.is_empty() {
+        // `output()` has nothing to print, but `cmd_blame` still reaches the counters
+        // (`builtin/blame.c:1293`) unless `--incremental` sent it to cleanup first.
+        if opts.show_stats && !opts.incremental {
+            print_stats(&stats)?;
+        }
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -845,14 +948,104 @@ pub(super) fn blame_with(args: &[String], cmd: &str) -> Result<ExitCode> {
 
     let info = collect_commit_info(&repo, &lines, &opts, &null_id, &rel_path)?;
 
-    if opts.porcelain {
+    // `ent->suspect->refcnt` as the output loop reads it: one reference per blame entry in
+    // `sb->ent`, which is this line list grouped the way `blame_coalesce()` groups it, plus the
+    // `blame_origin::previous` of every origin that survived. The counting happens here rather
+    // than inside the walk because the entries the walk produced are not the entries git prints:
+    // a working-tree overlay replaces some of them and `-L` drops others, and each of those is a
+    // reference gained or lost.
+    let refcounts = if opts.score_debug {
+        let mut entry_counts: std::collections::BTreeMap<(ObjectId, Option<Vec<u8>>), u32> =
+            std::collections::BTreeMap::new();
+        for group in group_lines(&lines) {
+            let entry = &lines[group.start];
+            *entry_counts
+                .entry((entry.commit_id, entry.source_name.clone()))
+                .or_default() += 1;
+        }
+        // The fake working-tree commit's own edge: it only reaches `origin->previous` when it had
+        // to diff against the suspect rather than hand the whole blame down.
+        let mut previous = previous_origins.clone();
+        if !index_only && blame_options.fake_commit.is_some_and(|fake| !fake.passes_whole_blame) {
+            previous.insert((null_id, None), (suspect, None));
+        }
+        suspect_refcounts(&entry_counts, &previous)
+    } else {
+        std::collections::BTreeMap::new()
+    };
+
+    let code = if opts.porcelain {
         // The synthetic commit only records a `previous` origin when it actually
         // handed lines to one, which never happens when the path is index-only.
         let head_id = if index_only { None } else { head_id };
-        emit_porcelain(&repo, &lines, &info, &rel_path, head_id, &null_id, &opts)
+        emit_porcelain(&repo, &lines, &info, &rel_path, head_id, &null_id, &opts, &previous_origins)?
     } else {
-        emit_human(&repo, &lines, &info, &rel_path, &opts, &colors)
+        emit_human(&repo, &lines, &info, &rel_path, &opts, &colors, &refcounts)?
+    };
+
+    if opts.show_stats {
+        print_stats(&stats)?;
     }
+
+    Ok(code)
+}
+
+/// `--show-stats`, which is `cmd_blame`'s last act before cleanup
+/// (`builtin/blame.c:1293-1297`): the counters follow the blame on stdout, in every format
+/// `--incremental` did not skip past.
+fn print_stats(stats: &gix::blame::Statistics) -> Result<()> {
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    writeln!(out, "num read blob: {}", stats.num_read_blob)?;
+    writeln!(out, "num get patch: {}", stats.num_get_patch)?;
+    writeln!(out, "num commits: {}", stats.num_commits)?;
+    out.flush()?;
+    Ok(())
+}
+
+/// Add one walk's counters onto the running total — see the `stats` binding in [`blame_with`].
+fn add_statistics(total: &mut gix::blame::Statistics, one: &gix::blame::Statistics) {
+    total.commits_traversed += one.commits_traversed;
+    total.trees_decoded += one.trees_decoded;
+    total.trees_diffed += one.trees_diffed;
+    total.trees_diffed_with_rewrites += one.trees_diffed_with_rewrites;
+    total.blobs_diffed += one.blobs_diffed;
+    total.num_read_blob += one.num_read_blob;
+    total.num_get_patch += one.num_get_patch;
+    total.num_commits += one.num_commits;
+}
+
+/// The origin each origin points at through `blame_origin::previous`, keyed the way the output
+/// lines name one.
+type PreviousOrigins =
+    std::collections::BTreeMap<(ObjectId, Option<Vec<u8>>), (ObjectId, Option<Vec<u8>>)>;
+
+/// Re-key one walk's `blame_origin::previous` map onto the `(commit, source file name)` pair the
+/// output lines carry.
+fn collect_previous_origins(into: &mut PreviousOrigins, outcome: &gix::blame::Outcome) {
+    for (origin, parent) in &outcome.suspect_previous {
+        let owned = |(commit_id, name): &gix::blame::OriginKey| {
+            (*commit_id, name.as_ref().map(|name| name.to_vec()))
+        };
+        into.entry(owned(origin)).or_insert_with(|| owned(parent));
+    }
+}
+
+/// [`gix::blame::suspect_refcounts`] over the keys this file uses, which own their path bytes.
+fn suspect_refcounts(
+    entries: &std::collections::BTreeMap<(ObjectId, Option<Vec<u8>>), u32>,
+    previous: &PreviousOrigins,
+) -> std::collections::BTreeMap<(ObjectId, Option<Vec<u8>>), u32> {
+    use gix::bstr::BString;
+    let to_gix = |(commit_id, name): &(ObjectId, Option<Vec<u8>>)| -> gix::blame::OriginKey {
+        (*commit_id, name.as_ref().map(|name| BString::from(name.clone())))
+    };
+    let entries = entries.iter().map(|(key, count)| (to_gix(key), *count)).collect();
+    let previous = previous.iter().map(|(key, parent)| (to_gix(key), to_gix(parent))).collect();
+    gix::blame::suspect_refcounts(&entries, &previous)
+        .into_iter()
+        .map(|((commit_id, name), count)| ((commit_id, name.map(|name| name.to_vec())), count))
+        .collect()
 }
 
 /// git's delayed "Blaming lines" progress meter (`start_delayed_progress` /
@@ -1223,7 +1416,13 @@ fn collect_commit_info(
             // `--root` (git's `show_root`) stops root commits counting as
             // boundaries, dropping both the `^` marker and the porcelain
             // `boundary` field for them.
-            let boundary = !opts.show_root && commit.parent_ids().next().is_none();
+            //
+            // A `--reverse` range marks its initial commit `UNINTERESTING` through the `^A` the
+            // arguments named, which is a different flag from the root rule and so is not
+            // affected by `--root`: a line the range's oldest commit kept, because the next commit
+            // changed it, prints with the boundary marker.
+            let boundary = (!opts.show_root && commit.parent_ids().next().is_none())
+                || opts.reverse_from.is_some_and(|from| from == line.commit_id);
             let summary = Vec::from(commit.message()?.summary().into_owned());
             CommitInfo {
                 display_author: display_author(
@@ -1409,6 +1608,7 @@ fn emit_human(
     rel_path: &str,
     opts: &Options,
     colors: &BlameColors,
+    refcounts: &std::collections::BTreeMap<(ObjectId, Option<Vec<u8>>), u32>,
 ) -> Result<ExitCode> {
     let name_width = object_name_width(repo, opts);
 
@@ -1420,11 +1620,23 @@ fn emit_human(
     // and only `cnt > 0` takes the repeated-metadata color. The entries are the
     // coalesced groups the porcelain format also emits.
     let mut cnt_in_entry: Vec<usize> = vec![0; lines.len()];
+    // `blame_entry_score()` (`blame.c:1991`): one plus the alphanumeric bytes of the entry's lines
+    // in the final image, cached on the entry so every line of it prints the same number.
+    // `find_alignment()` computes it for every entry whether or not `--score-debug` asked
+    // (`builtin/blame.c:680`), and takes `max_score_digits` from the largest.
+    let mut score_of_line: Vec<u32> = vec![0; lines.len()];
     for group in group_lines(lines) {
+        let entry = &lines[group.start..group.start + group.len];
+        let score = 1 + entry
+            .iter()
+            .map(|line| line.content.iter().filter(|b| b.is_ascii_alphanumeric()).count() as u32)
+            .sum::<u32>();
         for k in 0..group.len {
             cnt_in_entry[group.start + k] = k;
+            score_of_line[group.start + k] = score;
         }
     }
+    let w_score = decimal_width(score_of_line.iter().copied().max().unwrap_or(1));
 
     let show_file = opts.show_name || lines.iter().any(|l| l.source_name.is_some());
     let current_path = rel_path.as_bytes();
@@ -1466,6 +1678,20 @@ fn emit_human(
 
         // Object name (boundary `^` marker, `-b` blanking).
         emit_object_name(&mut buf, ci, line, name_width, opts);
+
+        // `--score-debug`: `printf(" %*d %02d", max_score_digits, ent->score,
+        // ent->suspect->refcnt)` (`builtin/blame.c:533-535`).
+        if opts.score_debug {
+            let s = score_of_line[idx].to_string();
+            buf.push(b' ');
+            pad(&mut buf, w_score.saturating_sub(s.len()));
+            buf.extend_from_slice(s.as_bytes());
+            let refcnt = refcounts
+                .get(&(line.commit_id, line.source_name.clone()))
+                .copied()
+                .unwrap_or_default();
+            buf.extend_from_slice(format!(" {refcnt:02}").as_bytes());
+        }
 
         // Source filename column (left-justified).
         if show_file {
@@ -1528,6 +1754,7 @@ fn emit_porcelain(
     head_id: Option<ObjectId>,
     null_id: &ObjectId,
     opts: &Options,
+    previous_origins: &PreviousOrigins,
 ) -> Result<ExitCode> {
     let current_path = rel_path.as_bytes();
     let stdout = std::io::stdout();
@@ -1548,6 +1775,17 @@ fn emit_porcelain(
         if !previous_cache.contains_key(&key) {
             let previous = if &first.commit_id == null_id {
                 head_id.map(|h| (h.to_hex().to_string(), current_path.to_vec()))
+            } else if opts.reverse {
+                // Walking forwards, `origin->previous` is the first *child* the origin handed
+                // entries to, which no amount of looking at the commit's parents will find.
+                previous_origins
+                    .get(&(first.commit_id, first.source_name.clone()))
+                    .map(|(commit_id, name)| {
+                        (
+                            commit_id.to_hex().to_string(),
+                            name.clone().unwrap_or_else(|| current_path.to_vec()),
+                        )
+                    })
             } else {
                 find_previous(repo, first.commit_id, path)?
             };
@@ -2149,6 +2387,10 @@ fn resolve_targets(repo: &gix::Repository, opts: &mut Options) -> Result<Targets
         }
     };
 
+    if opts.reverse {
+        return resolve_reverse_targets(repo, opts, &revs, file);
+    }
+
     // Resolve the revisions in order, matching git: the first that fails to
     // resolve is a `bad revision`; a second one that succeeds is `More than one
     // commit to dig from`.
@@ -2177,6 +2419,165 @@ fn resolve_targets(repo: &gix::Repository, opts: &mut Options) -> Result<Targets
     opts.suspect_id = suspect.map(|(_, id)| id);
     opts.file = file;
     Ok(Targets::Resolved)
+}
+
+/// The revision arguments of a `--reverse` blame, which name a *range* rather than a single
+/// commit: `setup_revisions()` marks the left-hand side of `A..B` (and any `^A`) as
+/// `UNINTERESTING`, and `setup_scoreboard()` then picks the sole negative one with
+/// `find_single_initial()` (`blame.c:2726`) as the commit whose file is the final image.
+fn resolve_reverse_targets(
+    repo: &gix::Repository,
+    opts: &mut Options,
+    revs: &[String],
+    file: String,
+) -> Result<Targets> {
+    let mut negative: Vec<(String, ObjectId)> = Vec::new();
+    let mut positive: Vec<(String, ObjectId)> = Vec::new();
+
+    // `setup_revisions()`'s range grammar, in the forms blame is given one: `A..B` names `^A` and
+    // `B`, an empty endpoint means `HEAD`, and a bare `^A` is the negative on its own. `A...B`
+    // (symmetric difference) is not a range the reverse walk can be expressed over, since it has
+    // no single initial commit.
+    for r in revs {
+        if r.contains("...") {
+            let mut err = std::io::stderr().lock();
+            writeln!(err, "fatal: unsupported revision range for --reverse: {r}")?;
+            err.flush()?;
+            return Ok(Targets::Fatal(ExitCode::from(128)));
+        }
+        let (name, side) = match r.split_once("..") {
+            Some((lhs, rhs)) => {
+                let lhs = if lhs.is_empty() { "HEAD" } else { lhs };
+                let rhs = if rhs.is_empty() { "HEAD" } else { rhs };
+                match resolve_commit(repo, rhs) {
+                    Some(id) => positive.push((rhs.to_string(), id)),
+                    None => return bad_revision(r),
+                }
+                (lhs.to_string(), &mut negative)
+            }
+            None => match r.strip_prefix('^') {
+                Some(rest) => (rest.to_string(), &mut negative),
+                None => (r.clone(), &mut positive),
+            },
+        };
+        match resolve_commit(repo, &name) {
+            Some(id) => side.push((name, id)),
+            None => return bad_revision(r),
+        }
+    }
+
+    if negative.len() > 1 {
+        let mut err = std::io::stderr().lock();
+        writeln!(
+            err,
+            "fatal: More than one commit to dig up from, {} and {}?",
+            negative[0].0, negative[1].0
+        )?;
+        err.flush()?;
+        return Ok(Targets::Fatal(ExitCode::from(128)));
+    }
+
+    // `dwim_reverse_initial()` (`blame.c:2688`): with a single revision and no negative one,
+    // `git blame --reverse ONE -- PATH` means `ONE..HEAD`.
+    if negative.is_empty() && positive.len() == 1 {
+        negative.push(positive.remove(0));
+        match repo.head_id() {
+            Ok(head) => positive.push(("HEAD".to_string(), head.detach())),
+            Err(_) => return no_commit_to_dig_up_from(),
+        }
+    }
+
+    let Some((from_name, from_id)) = negative.pop() else {
+        return no_commit_to_dig_up_from();
+    };
+
+    // `setup_scoreboard()`: `--reverse --first-parent` needs a single latest commit to build the
+    // first-parent chain decoration from (`blame.c:2828-2832`).
+    if opts.first_parent && positive.len() != 1 {
+        let mut err = std::io::stderr().lock();
+        writeln!(
+            err,
+            "fatal: --reverse and --first-parent together require specified latest commit"
+        )?;
+        err.flush()?;
+        return Ok(Targets::Fatal(ExitCode::from(128)));
+    }
+
+    opts.rev = Some(from_name);
+    opts.suspect_id = Some(from_id);
+    opts.reverse_from = Some(from_id);
+    opts.reverse_tips = positive.into_iter().map(|(_, id)| id).collect();
+    opts.file = file;
+    Ok(Targets::Resolved)
+}
+
+fn bad_revision(name: &str) -> Result<Targets> {
+    let mut err = std::io::stderr().lock();
+    writeln!(err, "fatal: bad revision '{name}'")?;
+    err.flush()?;
+    Ok(Targets::Fatal(ExitCode::from(128)))
+}
+
+fn no_commit_to_dig_up_from() -> Result<Targets> {
+    let mut err = std::io::stderr().lock();
+    writeln!(err, "fatal: No commit to dig up from?")?;
+    err.flush()?;
+    Ok(Targets::Fatal(ExitCode::from(128)))
+}
+
+/// git's `revs->children` decoration for a `--reverse` range, which is what `first_scapegoat()`
+/// returns instead of a commit's parents.
+///
+/// `set_children()` (`revision.c`) walks `revs->commits` — the commits the range selected, newest
+/// first — and inserts each at the *front* of its parents' child lists while
+/// `prepare_revision_walk()` runs, so a commit's children come out oldest first. That order is the
+/// order `pass_blame()` offers the scapegoats in, which decides which of them gets a chunk that
+/// both could claim and which one becomes `blame_origin::previous`.
+fn reverse_children(
+    repo: &gix::Repository,
+    from: ObjectId,
+    tips: &[ObjectId],
+) -> Result<gix::blame::Children> {
+    let mut children: gix::blame::Children = gix::blame::Children::default();
+    let walk = repo
+        .rev_walk(tips.iter().copied())
+        .with_hidden(Some(from))
+        .sorting(gix::revision::walk::Sorting::ByCommitTime(
+            gix::traverse::commit::simple::CommitTimeOrder::NewestFirst,
+        ))
+        .all()?;
+    for info in walk {
+        let info = info?;
+        let child = info.id;
+        for parent in info.parent_ids() {
+            children.entry(parent.detach()).or_default().insert(0, child);
+        }
+    }
+    Ok(children)
+}
+
+/// `setup_scoreboard()`'s `--reverse --first-parent` decoration (`blame.c:2842-2859`): instead of
+/// every child in the range, each commit on the first-parent chain from the latest commit down to
+/// `from` is recorded as the sole child of the commit before it.
+fn reverse_first_parent_children(
+    repo: &gix::Repository,
+    from: ObjectId,
+    latest: ObjectId,
+) -> Result<Option<gix::blame::Children>> {
+    let mut children: gix::blame::Children = gix::blame::Children::default();
+    let mut c = latest;
+    loop {
+        if c == from {
+            return Ok(Some(children));
+        }
+        let commit = repo.find_commit(c)?;
+        let Some(parent) = commit.parent_ids().next() else {
+            // git leaves the loop on a parentless commit and then finds it is not the initial one.
+            return Ok(None);
+        };
+        children.insert(parent.detach(), vec![c]);
+        c = parent.detach();
+    }
 }
 
 /// The date-formatting modes zvcs blame reproduces byte-for-byte from git's
@@ -2423,6 +2824,21 @@ struct Options {
     /// `--first-parent`: follow only the first parent of every commit, which is
     /// git's `revs->first_parent_only` applied in `first_scapegoat()`.
     first_parent: bool,
+    /// `--reverse`: git's `sb->reverse`. The walk runs forwards through the given range, so a
+    /// line is attributed to the last commit that still had it rather than the first that
+    /// introduced it.
+    reverse: bool,
+    /// The negative endpoint of a `--reverse` range, i.e. git's `find_single_initial()`: the
+    /// commit whose version of the file is the final image and where the forward walk starts.
+    reverse_from: Option<ObjectId>,
+    /// The positive endpoints of a `--reverse` range — where the forward walk stops. git's
+    /// `revs->pending` minus the negative one.
+    reverse_tips: Vec<ObjectId>,
+    /// `--show-stats`: print `blame_scoreboard`'s three work counters after the blame.
+    show_stats: bool,
+    /// `--score-debug` (git's `OUTPUT_SHOW_SCORE`): add `blame_entry_score()` and the entry's
+    /// `blame_origin::refcnt` to every human-format line.
+    score_debug: bool,
     long: bool,
     suppress: bool,
     show_email: bool,
@@ -2501,7 +2917,97 @@ struct ConfigDefaults {
 /// the `-h` short-circuit git answers from inside the loop.
 enum ParseOutcome {
     Help,
+    /// An option neither `options[]` nor `handle_revision_opt()` recognises.
+    /// The payload is the name git puts in its `unknown option` diagnostic —
+    /// see [`unknown_option_name`] for why that is sometimes `(null)`.
+    Unknown(String),
     Opts(Box<Options>),
+}
+
+/// The operand of git's `error: unknown option \`%s'` for the argument at
+/// `args[idx]`, given that `positionals` positional arguments preceded it.
+///
+/// `cmd_blame` drives `parse_options_step` itself and hands the leftover to
+/// `parse_revision_opt()`, which prints `ctx->argv[0]`. Before printing,
+/// `handle_revision_opt()` has already called `overwrite_argv()`, which moves the
+/// argument down into `ctx->out[ctx->cpidx]` — the same array as `ctx->argv` —
+/// and NULs out the slot it came from. The two indices only differ once a
+/// recognised option has consumed an argv slot without pushing anything to
+/// `out`, and `overwrite_argv` short-circuits when they coincide, so the name
+/// survives for an unknown option that is the first option on the line and is
+/// lost for every later one. Verified against git 2.55.0:
+/// `git blame --no-bogus a.txt` names the option, `git blame -w --no-bogus a.txt`
+/// prints `(null)`.
+fn unknown_option_name(args: &[String], idx: usize, positionals: usize) -> String {
+    if idx > positionals {
+        "(null)".to_string()
+    } else {
+        args[idx].clone()
+    }
+}
+
+/// Every long option name `git blame` accepts, whether or not this port
+/// implements it: `builtin/blame.c`'s own `options[]`, plus everything
+/// `parse_revision_opt()` forwards to — the names `revision.c`'s
+/// `handle_revision_opt()` matches and the `parseopts[]` table
+/// `diff.c:prep_parse_options()` builds — all read off git v2.55.0.
+///
+/// The set exists to keep the two failure modes apart: an option outside it is a
+/// name git itself rejects, so the port must reproduce git's
+/// `error: unknown option` and its exit 129, while an option inside it that this
+/// port has no implementation for must be refused on its own terms rather than
+/// misreported as a typo.
+static GIT_BLAME_LONG_OPTIONS: &[&str] = &[
+    "abbrev", "abbrev-commit", "after", "all", "all-match", "alternate-refs", "always",
+    "ancestry-path", "anchored", "author", "author-date-order", "basic-regexp", "before",
+    "binary", "bisect", "boundary", "branches", "break-rewrites", "check", "cherry",
+    "cherry-mark", "cherry-pick", "children", "color", "color-by-age", "color-lines",
+    "color-moved", "color-moved-ws", "color-words", "committer", "compact-summary", "contents",
+    "count", "cumulative", "date", "date-order", "default", "default-prefix", "dense",
+    "diff-algorithm", "diff-filter", "dirstat", "dirstat-by-file", "do-walk", "dst-prefix",
+    "encode-email-headers", "encoding", "exclude", "exclude-first-parent-only",
+    "exclude-hidden", "exclude-promisor-objects", "exit-code", "expand-tabs", "ext-diff",
+    "extended-regexp", "find-copies", "find-copies-harder", "find-object", "find-renames",
+    "first-parent", "fixed-strings", "follow", "format", "full-diff", "full-history",
+    "full-index", "function-context", "glob", "graph", "graph-lane-limit", "grep",
+    "grep-reflog", "histogram", "ignore-all-space", "ignore-blank-lines", "ignore-cr-at-eol",
+    "ignore-matching-lines", "ignore-missing", "ignore-rev", "ignore-revs-file",
+    "ignore-space-at-eol", "ignore-space-change", "ignore-submodules", "in-commit-order",
+    "incremental", "indent-heuristic", "indexed-objects", "inter-hunk-context", "invert-grep",
+    "irreversible-delete", "ita-invisible-in-index", "ita-visible-in-index", "left-only",
+    "left-right", "line-porcelain", "line-prefix", "log-size", "max-age", "max-count",
+    "max-count-oldest", "max-depth", "max-parents", "maximal-only", "merge", "merges",
+    "min-age", "min-parents", "minimal", "name-only", "name-status", "no-abbrev",
+    "no-abbrev-commit", "no-commit-id", "no-encode-email-headers", "no-expand-tabs",
+    "no-graph", "no-kept-objects", "no-max-parents", "no-merges", "no-min-parents", "no-notes",
+    "no-patch", "no-prefix", "no-renames", "no-show-signature", "no-standard-notes", "no-walk",
+    "not", "notes", "numstat", "objects", "objects-edge", "objects-edge-aggressive", "oneline",
+    "output", "output-indicator-context", "output-indicator-new", "output-indicator-old",
+    "parents", "patch", "patch-with-raw", "patch-with-stat", "patience", "perl-regexp",
+    "pickaxe-all", "pickaxe-regex", "porcelain", "pretty", "progress", "quiet", "raw",
+    "reflog", "regexp-ignore-case", "relative", "relative-date", "remotes", "remove-empty",
+    "rename-empty", "reverse", "right-only", "root", "rotate-to", "score-debug", "shortstat",
+    "show-email", "show-linear-break", "show-name", "show-notes", "show-notes-by-default",
+    "show-number", "show-pulls", "show-signature", "show-stats", "simplify-by-decoration",
+    "simplify-merges", "since", "since-as-filter", "skip", "skip-to", "sparse", "src-prefix",
+    "standard-notes", "stat", "stat-count", "stat-graph-width", "stat-name-width",
+    "stat-width", "submodule", "summary", "tags", "text", "textconv", "topo-order", "unified",
+    "unpacked", "until", "verify-objects", "walk-reflogs", "word-diff", "word-diff-regex",
+    "ws-error-highlight",
+];
+
+/// Whether one of git's own parsers would recognise the long option `a`, in any
+/// of the spellings `parse_long_opt()` accepts: `--name`, `--name=<value>` and
+/// the `--no-name` negation.
+fn git_knows_long_option(a: &str) -> bool {
+    let Some(name) = a.strip_prefix("--") else {
+        return false;
+    };
+    let name = name.split('=').next().unwrap_or(name);
+    GIT_BLAME_LONG_OPTIONS.contains(&name)
+        || name
+            .strip_prefix("no-")
+            .is_some_and(|n| GIT_BLAME_LONG_OPTIONS.contains(&n))
 }
 
 impl Options {
@@ -2516,6 +3022,9 @@ impl Options {
         } = defaults;
         let mut line_specs: Vec<String> = Vec::new();
         let mut first_parent = false;
+        let mut reverse = false;
+        let mut show_stats = false;
+        let mut score_debug = false;
         let mut long = false;
         let mut suppress = false;
         let mut show_email = show_email_default;
@@ -2623,6 +3132,14 @@ impl Options {
                 // `setup_revisions()`, which sets `revs->first_parent_only`.
                 "--first-parent" => first_parent = true,
                 "--no-first-parent" => first_parent = false,
+                // `cmd_blame` rewrites `--reverse` to `--children` before handing the argument to
+                // `handle_revision_opt()` and sets its own `reverse` flag
+                // (`builtin/blame.c:1027-1029`), which is what turns the whole algorithm around.
+                "--reverse" => reverse = true,
+                // git's `OPT_BOOL(0, "show-stats", …)` and `OPT_BIT(0, "score-debug", …,
+                // OUTPUT_SHOW_SCORE)`, each with the negation its declaration implies.
+                "--show-stats" => show_stats = true,
+                "--score-debug" => score_debug = true,
                 // `--minimal` is `XDF_NEED_MINIMAL` in `revs.diffopt.xdl_opts`,
                 // which is what `Algorithm::MyersMinimal` is: Myers followed by
                 // the exhaustive pass that removes the remaining non-minimal
@@ -2741,7 +3258,8 @@ impl Options {
                     copy_score = parse_score(&a["-C".len()..]);
                 }
                 "--no-incremental" => incremental = false,
-                "--no-show-stats" | "--no-score-debug" => {}
+                "--no-show-stats" => show_stats = false,
+                "--no-score-debug" => score_debug = false,
                 _ if a.starts_with("-L") => line_specs.push(a[2..].to_string()),
                 // `--encoding=<enc>` (`OPT_STRING(0, "encoding", ...)`): the encoding the
                 // author names and summaries are written in. Everything here is already
@@ -2770,6 +3288,12 @@ impl Options {
                 _ if a.starts_with("--abbrev=") => {
                     let v = &a["--abbrev=".len()..];
                     abbrev = Some(v.parse().map_err(|_| anyhow!("invalid --abbrev value: {v}"))?);
+                }
+                // A long option no git parser knows: git answers with its own
+                // diagnostic and the usage, so reproduce that rather than
+                // claiming the option merely is not ported.
+                _ if a.starts_with("--") && !git_knows_long_option(a) => {
+                    return Ok(ParseOutcome::Unknown(unknown_option_name(args, i, pre.len())));
                 }
                 _ if a.starts_with('-') && a.len() > 1 => {
                     bail!("unsupported option: {a}")
@@ -2802,6 +3326,11 @@ impl Options {
             line_specs,
             ranges: Vec::new(),
             first_parent,
+            reverse,
+            reverse_from: None,
+            reverse_tips: Vec::new(),
+            show_stats,
+            score_debug,
             long,
             suppress,
             show_email,
@@ -3324,6 +3853,58 @@ mod tests {
         assert_eq!(
             fatal(&[":nowhere"]),
             "-L parameter 'nowhere' starting at line 1: no match"
+        );
+    }
+
+    /// The three tables that decide whether an option is a typo or a porting
+    /// gap: blame's own, revision.c's, and diff.c's. A miss here would make the
+    /// port claim git rejects an option git actually accepts.
+    #[test]
+    fn known_long_options_span_all_three_tables() {
+        // `builtin/blame.c:options[]`.
+        assert!(git_knows_long_option("--show-stats"));
+        assert!(git_knows_long_option("--ignore-revs-file=x"));
+        // `revision.c:handle_revision_opt()`.
+        assert!(git_knows_long_option("--first-parent"));
+        assert!(git_knows_long_option("--children"));
+        // `diff.c:prep_parse_options()`.
+        assert!(git_knows_long_option("--ignore-space-change"));
+        assert!(git_knows_long_option("--find-copies-harder"));
+        // `parse_long_opt()` accepts the negation of a negatable option, and the
+        // explicit `--no-` names revision.c matches in their own right.
+        assert!(git_knows_long_option("--no-show-stats"));
+        assert!(git_knows_long_option("--no-walk"));
+        // Not an option of any of the three, which is what the tested case
+        // `git blame -s --no-use-mailmap` turns on: blame has no `use-mailmap`.
+        assert!(!git_knows_long_option("--use-mailmap"));
+        assert!(!git_knows_long_option("--no-use-mailmap"));
+        assert!(!git_knows_long_option("--bogus"));
+        // Short options never take this path.
+        assert!(!git_knows_long_option("-w"));
+    }
+
+    /// `overwrite_argv()` clears `ctx->argv[0]` exactly when an earlier
+    /// recognised option has consumed an argv slot, so the name git prints is
+    /// the option itself only for the first option on the line.
+    ///
+    /// Captured from stock git 2.55.0: `git blame --no-bogus a.txt` prints
+    /// ``unknown option `--no-bogus'``, `git blame a.txt --no-bogus` prints the
+    /// same, and `git blame -w --no-bogus a.txt` prints ``unknown option
+    /// `(null)'``.
+    #[test]
+    fn unknown_option_name_matches_gits_argv_shuffle() {
+        let argv = |v: &[&str]| -> Vec<String> { v.iter().map(|s| (*s).to_owned()).collect() };
+
+        // First thing on the line: nothing has desynchronised `out` from `argv`.
+        assert_eq!(unknown_option_name(&argv(&["--no-bogus", "a.txt"]), 0, 0), "--no-bogus");
+        // A positional before it advances both indices together.
+        assert_eq!(unknown_option_name(&argv(&["a.txt", "--no-bogus"]), 1, 1), "--no-bogus");
+        // A recognised option advances only `argv`, and the name is lost.
+        assert_eq!(unknown_option_name(&argv(&["-w", "--no-bogus", "a.txt"]), 1, 0), "(null)");
+        // An option with a detached value consumes two slots; still lost.
+        assert_eq!(
+            unknown_option_name(&argv(&["-L", "1,1", "--no-bogus", "a.txt"]), 2, 0),
+            "(null)"
         );
     }
 }

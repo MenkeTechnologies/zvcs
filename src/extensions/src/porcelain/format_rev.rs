@@ -23,11 +23,13 @@
 //! `%(else)`/`%(end)` and any other unrecognised `%(…)` — which git echoes
 //! verbatim, as we do.
 //!
+//! `--notes=<ref>` is accepted and, like git, has no effect unless the format
+//! expands `%N`: git only calls `load_display_notes()` when
+//! `userformat_find_requirements()` reports the format wants notes.
+//!
 //! Not covered — each rejected with a precise message rather than producing
-//! divergent output: `--notes=<ref>` and the notes-on-by-default `%N`
-//! (the vendored `gix-note` crate is an empty stub, and `format-rev`'s
-//! `--no-notes`-is-a-no-op behaviour would need more verification to reproduce
-//! faithfully), the `email`/`mboxrd` builtin formats (RFC2047 subject encoding
+//! divergent output: `%N` itself (the vendored `gix-note` crate is an empty
+//! stub, so notes cannot be read), the `email`/`mboxrd` builtin formats (RFC2047 subject encoding
 //! and MIME body handling are not built), the `%(trailers…)` atoms (a faithful
 //! port of git's `find_trailer_block_start` + folding + the full option matrix
 //! could not be validated to byte-parity here without an integration build),
@@ -122,7 +124,7 @@ enum Ph {
     Body,
     /// `%B`
     RawBody,
-    /// `%N` — always empty here: notes are off unless `--notes` is given, which is refused.
+    /// `%N` — refused up front: reading notes needs substrate that is not vendored.
     Notes,
     /// `%e`
     Encoding,
@@ -173,6 +175,10 @@ pub fn format_rev(args: &[String]) -> Result<ExitCode> {
     let mut mode_arg: Option<String> = None;
     let mut null_input = false;
     let mut null_output = false;
+    // `OPT_STRING_LIST(0, "notes", …)`: refs accumulate, `--no-notes` clears the
+    // list. git only *loads* them when the pretty format asks for notes, so the
+    // option on its own is inert — see the `Ph::Notes` check below.
+    let mut notes: Vec<String> = Vec::new();
 
     let mut i = 0;
     while i < args.len() {
@@ -187,11 +193,15 @@ pub fn format_rev(args: &[String]) -> Result<ExitCode> {
         match a {
             "--format" => format_arg = Some(value(&mut i, "format")?),
             "--stdin-mode" => mode_arg = Some(value(&mut i, "stdin-mode")?),
-            "--notes" => {
-                let _ = value(&mut i, "notes")?;
-                bail!("unsupported flag \"--notes\" (ported: --format, --stdin-mode, -z, --null-input, --null-output, --no-notes)");
+            "--notes" => notes.push(value(&mut i, "notes")?),
+            "--no-notes" => notes.clear(), // the default: notes are not displayed
+            "-h" => {
+                // `parse_options` prints the usage on stdout for an explicit
+                // `-h` and exits 129, leaving stderr empty.
+                print!("{USAGE}");
+                std::io::stdout().flush()?;
+                return Ok(ExitCode::from(129));
             }
-            "--no-notes" => {} // the default: notes are not displayed
             "-z" | "--null" => {
                 null_input = true;
                 null_output = true;
@@ -205,8 +215,8 @@ pub fn format_rev(args: &[String]) -> Result<ExitCode> {
                     format_arg = Some(v.to_string());
                 } else if let Some(v) = a.strip_prefix("--stdin-mode=") {
                     mode_arg = Some(v.to_string());
-                } else if a.starts_with("--notes=") {
-                    bail!("unsupported flag \"--notes\" (ported: --format, --stdin-mode, -z, --null-input, --null-output, --no-notes)");
+                } else if let Some(v) = a.strip_prefix("--notes=") {
+                    notes.push(v.to_string());
                 } else if a.starts_with('-') {
                     let name = a.trim_start_matches('-');
                     eprint!("error: unknown option `{name}'\n{USAGE}");
@@ -245,6 +255,25 @@ pub fn format_rev(args: &[String]) -> Result<ExitCode> {
             return Ok(ExitCode::from(128));
         }
     };
+
+    // `userformat_find_requirements()` + `load_display_notes()`: notes are read
+    // only when the format actually expands `%N`. Any `--notes=<ref>` given for a
+    // format that never asks for them is inert, so it needs no support here.
+    if let Format::User(items) = &format {
+        if items
+            .iter()
+            .any(|it| matches!(it, Item::Placeholder(Ph::Notes)))
+        {
+            bail!(
+                "unsupported: `%N` requires reading notes{} (the vendored gix-note crate is a stub)",
+                if notes.is_empty() {
+                    " from refs/notes/commits".to_string()
+                } else {
+                    format!(" from {}", notes.join(", "))
+                }
+            );
+        }
+    }
 
     let repo = gix::discover(".")?;
     let hex_len = repo.object_hash().len_in_hex();

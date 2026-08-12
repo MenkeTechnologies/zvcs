@@ -79,12 +79,20 @@
 //! `CONFLICT`/`could not apply` and leaves the conflicted worktree and index in
 //! place.
 //!
-//! `label`, `reset`, `merge` and `update-ref` parse and round-trip through
-//! `--edit-todo`, but executing one is refused with a message naming the reason
-//! (a refused instruction leaves the rebase resumable, so `--abort` still
-//! works). They need the merge-topology rebuild `make_script_with_merges()`
-//! drives, which is also what `rebase.maxLabelLength` sizes — the one
-//! `rebase.*` key still without a reader.
+//! `label`, `reset` and `merge` execute too, which is what makes
+//! `--rebase-merges` rebuild a branch topology rather than flatten it:
+//! [`super::rebase_todo::make_script_with_merges`] writes the sheet,
+//! [`Sequencer::do_label`] parks `refs/rewritten/<label>` at the current `HEAD`,
+//! [`Sequencer::do_reset`] moves back to one, and [`Sequencer::do_merge`]
+//! recreates the merge — fast-forwarding to the original commit when `HEAD` and
+//! every merge head are still its parents, and running a real `ort` merge
+//! otherwise. The `refs/rewritten/*` scratch refs are deleted when the rebase
+//! finishes. Refused within `merge`, with a message naming the reason: octopus
+//! merges (git shells out to `git merge -s octopus`), an explicit `-s`, the
+//! `merge -c` editor variant, `merge` without an original `-C` commit, more than
+//! one merge base, and `reset [new root]`. `update-ref` is still refused
+//! outright. A refused instruction leaves the rebase resumable, so `--abort`
+//! still works.
 //!
 //! ### What is NOT ported, and why
 //!
@@ -102,15 +110,13 @@
 //!   only the first is ported, so `-v` is rejected with a message naming the
 //!   reason rather than emitting half of git's output. Plain `--stat` (and
 //!   `rebase.stat=true`, which sets the same bit and nothing else) is ported.
-//! * `--update-refs`, and the `label`/`reset`/`merge`/`update-ref` instructions
-//!   it generates: it still selects the merge backend and still raises git's
-//!   apply-backend incompatibility errors, but `make_script_with_merges()` and
-//!   the four executors are missing.
-//! * `--rebase-merges` over a range that *contains* a merge, for the same
-//!   reason — it is refused by name rather than flattening the history it was
-//!   asked to keep. Over a linear range the instruction sheet is picks either
-//!   way, so it replays exactly as git does; only git's step count differs,
-//!   since its sheet also carries the `label onto`/`reset onto` pair.
+//! * `--update-refs`, and the `update-ref` instruction it generates: it still
+//!   selects the merge backend and still raises git's apply-backend
+//!   incompatibility errors, but nothing tracks the refs pointing into the
+//!   rebased range, so executing the instruction is refused.
+//! * `--rebase-merges=rebase-cousins`, which changes which base
+//!   `make_script_with_merges()` resets a branch to; only the default mode is
+//!   ported.
 //!
 //! ### `--root`
 //!
@@ -139,10 +145,13 @@
 //! `rebase.abbreviateCommands` (one-letter spellings) and
 //! `rebase.missingCommitsCheck` (what happens when the user deletes a line).
 //!
-//! `rebase.maxLabelLength` has no reader: it sizes the labels
-//! `make_script_with_merges()` mints, and `--rebase-merges` is not ported.
+//! `rebase.maxLabelLength` sizes the labels `make_script_with_merges()` mints.
 //!
-//! `--signoff`/`--trailer` are *not* refused up front, and *not* refused at all
+//! `--signoff` appends the `Signed-off-by` trailer `append_signoff()` builds
+//! from the committer identity to every replayed commit, on both the exact-replay
+//! and sequencer paths, and is recorded in `$state_dir/signoff` so `--continue`
+//! keeps signing. `--trailer` is still refused. Neither is refused up front, and
+//! neither is refused at all
 //! when the todo is empty: like git they only set `REBASE_FORCE`, so an
 //! up-to-date range takes the noop / fast-forward finish (git rewrites nothing
 //! there — `git rebase --signoff HEAD` leaves the tip untouched), and a missing
@@ -1346,13 +1355,29 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
                         name: name.clone(),
                         deref: false,
                     })?;
+                    // `update_refs()` (reset.c) does two ref updates when it has a
+                    // branch: `refs_update_ref(<branch>)` — which `split_head_update()`
+                    // mirrors into `logs/HEAD`, since HEAD points at that branch, and
+                    // which the `edit_reference` above already produced — and then
+                    // `refs_update_symref("HEAD", <branch>)`, appended here. Both carry
+                    // the same message, so an unmoved branch still gains two identical
+                    // `logs/HEAD` lines. Verified against stock 2.55.0.
+                    super::checkout::append_head_log(
+                        &repo,
+                        Some(head_oid),
+                        Some(head_oid),
+                        &message,
+                    );
+                } else {
+                    // Detached: `update_refs()` takes the single
+                    // `refs_update_ref("HEAD", …)` branch instead.
+                    super::checkout::record_head_move(
+                        &repo,
+                        Some(head_oid),
+                        Some(head_oid),
+                        &message,
+                    );
                 }
-                super::checkout::record_head_move(
-                    &repo,
-                    Some(head_oid),
-                    Some(head_oid),
-                    &message,
-                );
             }
             if flags & NO_QUIET != 0 {
                 if branch_name == "HEAD" {
@@ -1431,24 +1456,8 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
     // therefore leaves merges out of the instruction sheet, which is what makes
     // `git rebase --onto <base> <upstream>` work on a branch that contains one.
     let todo_range: Vec<ObjectId> = if rebase_merges == 1 {
-        // `make_script_with_merges()` writes `label`/`reset`/`merge` instructions
-        // to rebuild the branch topology, and the four executors that run them are
-        // not ported. Over a linear range the sheet is picks either way, so that
-        // works; a merge in the range needs the real thing, and replaying it as a
-        // pick would flatten history the user asked to keep.
-        if let Some(merge) = replay_range.iter().find(|id| {
-            repo.find_commit(**id)
-                .map(|c| c.parent_ids().count() > 1)
-                .unwrap_or(false)
-        }) {
-            let short = gix::prelude::ObjectIdExt::attach(*merge, &repo).shorten_or_id();
-            bail!(
-                "--rebase-merges over a merge commit ({short}) is not supported \
-                 (recreating the topology needs the label/reset/merge instructions \
-                 `make_script_with_merges()` writes, which are not ported); rebase \
-                 without it to flatten, or replay the branches individually"
-            );
-        }
+        // `make_script_with_merges()` keeps the merges and writes
+        // `label`/`reset`/`merge` instructions to rebuild the topology.
         replay_range.clone()
     } else {
         replay_range
@@ -1523,9 +1532,6 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
         // range is refused here.
         if gpg_sign_on {
             return Err(refuse_gpg_sign());
-        }
-        if signoff {
-            bail!("unsupported flag \"--signoff\" (rewriting commit messages requires commit replay)");
         }
         if !trailers.is_empty() {
             bail!("unsupported flag \"--trailer\" (rewriting commit messages requires commit replay)");
@@ -1619,6 +1625,7 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
                 quiet: flags & NO_QUIET == 0,
                 verbose: flags & VERBOSE != 0,
                 reschedule_failed_exec: reschedule,
+                signoff,
                 rerere_autoupdate,
             },
             onto_spec: &onto_spec,
@@ -1628,6 +1635,7 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
             keep_empty,
             interactive: flags & INTERACTIVE_EXPLICIT != 0,
             autostash: autostash_oid,
+            rebase_merges: rebase_merges == 1,
             old_index: &old_index,
         });
     }
@@ -1713,9 +1721,12 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
                 committer.time = author.time;
             }
 
+            // `do_pick_commit()`: `if (opts->signoff) append_signoff(&msgbuf, 0, 0)`.
+            let message = sign_off(&committer, signoff, &step.message)?;
+
             let new = repo
                 .write_object(&gix::objs::Commit {
-                    message: step.message.clone(),
+                    message,
                     tree: step.tree,
                     author,
                     committer,
@@ -2081,6 +2092,11 @@ struct RebaseState {
     /// that exits non-zero is put back at the head of the todo list instead of
     /// being consumed, so `--continue` retries it.
     reschedule_failed_exec: bool,
+    /// `--signoff`: every replayed commit gains a `Signed-off-by` trailer built
+    /// from the committer identity. git records it as the one-liner
+    /// `$state_dir/signoff`, whose mere presence also re-implies `REBASE_FORCE`
+    /// on `--continue`.
+    signoff: bool,
     /// `opts.allow_rerere_auto` — what [`Sequencer::stop_for_conflict`] passes to
     /// `repo_rerere()`. `Some(true)` stages a replayed resolution, `Some(false)`
     /// leaves it unstaged, `None` defers to `rerere.autoupdate`. git records it
@@ -2117,6 +2133,13 @@ fn write_basic_state(repo: &gix::Repository, st: &RebaseState) -> Result<()> {
     marker(&dir, "verbose", st.verbose)?;
     marker(&dir, "reschedule-failed-exec", st.reschedule_failed_exec)?;
     marker(&dir, "no-reschedule-failed-exec", !st.reschedule_failed_exec)?;
+    // `write_file(state_dir_path("signoff", opts), "--signoff")` — content-bearing,
+    // unlike the empty markers above, though only its presence is ever read back.
+    if st.signoff {
+        std::fs::write(dir.join("signoff"), b"--signoff")?;
+    } else {
+        let _ = std::fs::remove_file(dir.join("signoff"));
+    }
     match st.rerere_autoupdate {
         Some(true) => std::fs::write(
             dir.join("allow_rerere_autoupdate"),
@@ -2163,6 +2186,7 @@ fn read_basic_state(repo: &gix::Repository) -> Result<RebaseState> {
         quiet: dir.join("quiet").exists(),
         verbose: dir.join("verbose").exists(),
         reschedule_failed_exec: dir.join("reschedule-failed-exec").exists(),
+        signoff: dir.join("signoff").exists(),
         // `read_oneliner(…, READ_ONELINER_SKIP_IF_EMPTY)` followed by an exact
         // match on the flag as spelled: anything else leaves the option unset.
         rerere_autoupdate: match read("allow_rerere_autoupdate").as_deref() {
@@ -2332,6 +2356,9 @@ struct SequencerStart<'a> {
     /// `REBASE_INTERACTIVE_EXPLICIT`. Without it `run_specific_rebase()` forces
     /// `GIT_SEQUENCE_EDITOR=:`, i.e. the sheet is used exactly as generated.
     interactive: bool,
+    /// `--rebase-merges`: the sheet rebuilds the branch topology instead of
+    /// flattening it, so `make_script_with_merges()` generates it.
+    rebase_merges: bool,
     autostash: Option<ObjectId>,
     old_index: &'a gix::index::File,
 }
@@ -2347,7 +2374,28 @@ fn sequencer_rebase(start: SequencerStart<'_>) -> Result<ExitCode> {
         == Some(true);
 
     // `sequencer_make_script()`.
-    let script = todo::make_script(repo, &start.range, start.keep_empty, abbreviate)?;
+    let script = if start.rebase_merges {
+        // `get_revision_ranges()` builds `<upstream|onto>...<orig_head>`, and
+        // `handle_dotdot_1()` records the *merge bases* of that symmetric range as
+        // `revs->cmdline.rev[0]` — before either endpoint — with `BOTTOM` set. That
+        // first merge base is therefore the commit `make_script_with_merges()`
+        // pre-labels `onto`, not `<onto>` itself. Only the first is used, so a
+        // criss-cross history with several bases seeds just one, as git does.
+        let base_rev = start.upstream.unwrap_or(start.state.onto);
+        let label_onto = repo
+            .merge_base(base_rev, start.state.orig_head)
+            .ok()
+            .map(|id| id.detach());
+        todo::make_script_with_merges(
+            repo,
+            &start.range,
+            label_onto,
+            start.keep_empty,
+            abbreviate,
+        )?
+    } else {
+        todo::make_script(repo, &start.range, start.keep_empty, abbreviate)?
+    };
 
     // `init_basic_state()`: the state directory exists before the editor runs,
     // so an interrupted edit is still an in-progress rebase.
@@ -2859,15 +2907,9 @@ impl<'r> Sequencer<'r> {
                 }
                 todo::Cmd::Exec => self.do_exec(&item)?,
                 todo::Cmd::Noop | todo::Cmd::Drop | todo::Cmd::Comment => Step::Next,
-                todo::Cmd::Label | todo::Cmd::Reset | todo::Cmd::Merge => {
-                    self.term_clear_line();
-                    bail!(
-                        "unsupported todo command {:?} (`label`/`reset`/`merge` rebuild a merge \
-                         topology, which is not ported; the rebase is still resumable with \
-                         `git rebase --abort`)",
-                        item.cmd.name()
-                    )
-                }
+                todo::Cmd::Label => self.do_label(&item)?,
+                todo::Cmd::Reset => self.do_reset(&item)?,
+                todo::Cmd::Merge => self.do_merge(&item)?,
                 todo::Cmd::UpdateRef => {
                     self.term_clear_line();
                     anyhow::bail!(
@@ -3123,9 +3165,13 @@ impl<'r> Sequencer<'r> {
         } else {
             std::iter::once(head).collect()
         };
+        // `do_pick_commit()`: `if (opts->signoff) append_signoff(&msgbuf, 0, 0)`.
+        // The reflog entry below still names the original subject, which the
+        // trailer never touches.
+        let signed = sign_off(&self.committer, self.st.signoff, &message)?;
         let new = repo
             .write_object(&gix::objs::Commit {
-                message: message.clone(),
+                message: signed,
                 tree: applied.tree_id,
                 author,
                 committer: self.committer.clone(),
@@ -3150,6 +3196,253 @@ impl<'r> Sequencer<'r> {
             todo::Cmd::Edit => self.stop_for_edit(new, &short, item),
             _ => Ok(Step::Next),
         }
+    }
+
+    /// `sequencer_remove_state()`: drop every `refs/rewritten/<label>` the run
+    /// created, listed in `$state_dir/refs-to-delete`. Best effort, as git's is —
+    /// a ref that will not delete only earns a warning.
+    fn delete_rewritten_refs(&self) {
+        let Ok(body) = std::fs::read_to_string(self.dir().join("refs-to-delete")) else {
+            return;
+        };
+        for name in body.lines().filter(|l| !l.is_empty()) {
+            let Ok(full) = gix::refs::FullName::try_from(name) else {
+                eprintln!("warning: could not delete '{name}'");
+                continue;
+            };
+            let deleted = self.repo.edit_reference(RefEdit {
+                change: Change::Delete {
+                    expected: PreviousValue::Any,
+                    log: RefLog::AndReference,
+                },
+                name: full,
+                deref: false,
+            });
+            if deleted.is_err() {
+                eprintln!("warning: could not delete '{name}'");
+            }
+        }
+    }
+
+    /// `do_label()`: point `refs/rewritten/<name>` at the current `HEAD` so a
+    /// later `reset`/`merge` can name this position, and remember the ref so the
+    /// end of the rebase can delete it again.
+    fn do_label(&mut self, item: &todo::Item) -> Result<Step> {
+        let name = item.arg.to_str_lossy().into_owned();
+        if name == "#" {
+            self.term_clear_line();
+            crate::git_fatal!("illegal label name: '{name}'");
+        }
+        let full = format!("refs/rewritten/{name}");
+        let head = self.repo.head_id()?.detach();
+        self.repo.edit_reference(RefEdit {
+            change: Change::Update {
+                log: LogChange {
+                    mode: RefLog::AndReference,
+                    force_create_reflog: false,
+                    message: format!("{} (label) '{name}'", reflog_action()).into(),
+                },
+                expected: PreviousValue::Any,
+                new: Target::Object(head),
+            },
+            name: full
+                .as_str()
+                .try_into()
+                .map_err(|e| anyhow!("illegal label name: '{name}': {e}"))?,
+            deref: false,
+        })?;
+        // `safe_append(rebase_path_refs_to_delete(), …)`.
+        let path = self.dir().join("refs-to-delete");
+        let mut body = std::fs::read_to_string(&path).unwrap_or_default();
+        body.push_str(&full);
+        body.push('\n');
+        std::fs::write(path, body)?;
+        Ok(Step::Next)
+    }
+
+    /// `do_reset()`: move `HEAD`, the index and the worktree to a label (or to a
+    /// raw revision, which is what `make_script_with_merges()` writes for a base
+    /// outside the replayed range).
+    fn do_reset(&mut self, item: &todo::Item) -> Result<Step> {
+        // git takes the label as the first whitespace-delimited word of the
+        // argument, so the `# <oneline>` the sheet carries is ignored.
+        let arg = item.arg.to_str_lossy().into_owned();
+        let name = arg.split_whitespace().next().unwrap_or_default().to_string();
+        if name == "[new" || arg.starts_with("[new root]") {
+            self.term_clear_line();
+            bail!(
+                "`reset [new root]` is not ported (it needs the `--root` stand-in commit \
+                 `do_reset()` mints); the rebase is still resumable with `git rebase --abort`"
+            );
+        }
+        let oid = self.lookup_label(&name)?;
+        let head = self.repo.head_id()?.detach();
+        update_clean_worktree(self.repo, &self.index, oid, &self.should_interrupt)?;
+        self.refresh_index()?;
+        // `refs_update_ref()` on a value the ref already holds writes neither the
+        // ref nor a reflog line, so a `reset` that does not move HEAD is silent.
+        if oid != head {
+            set_head(
+                self.repo,
+                Target::Object(oid),
+                &format!("{} (reset): '{name}'", reflog_action()),
+            )?;
+        }
+        Ok(Step::Next)
+    }
+
+    /// `lookup_label()`: `refs/rewritten/<label>` if it exists, else `<label>`
+    /// read as an ordinary revision.
+    fn lookup_label(&self, label: &str) -> Result<ObjectId> {
+        let full = format!("refs/rewritten/{label}");
+        if let Ok(Some(mut r)) = self.repo.try_find_reference(full.as_str()) {
+            if let Ok(id) = r.peel_to_id() {
+                return Ok(id.detach());
+            }
+        }
+        self.repo
+            .rev_parse_single(label)
+            .map(|id| id.detach())
+            .map_err(|_| anyhow!("could not resolve '{full}'"))
+    }
+
+    /// `do_merge()`: recreate a merge commit whose sides the sheet named by label.
+    ///
+    /// Covered: the fast-forward shortcut (`HEAD` and every merge head are still
+    /// the original merge's parents, so its commit id survives the rebase) and a
+    /// genuine two-parent `ort` merge, including a conflict stop.
+    ///
+    /// Not ported, and refused rather than approximated: octopus merges (git
+    /// shells out to `git merge -s octopus`), an explicit `-s <strategy>`, the
+    /// `merge -c` editor variant, `merge` with no `-C`/`-c` original, and
+    /// merging onto the `--root` stand-in commit.
+    fn do_merge(&mut self, item: &todo::Item) -> Result<Step> {
+        let repo = self.repo;
+        let Some(original) = item.commit else {
+            self.term_clear_line();
+            bail!(
+                "`merge` without `-C <commit>` is not ported (git synthesizes a \
+                 `Merge branch '…'` message for it); the rebase is still resumable with \
+                 `git rebase --abort`"
+            );
+        };
+        if item.flags & todo::EDIT_MERGE_MSG != 0 {
+            self.term_clear_line();
+            bail!("`merge -c` (reword the merge message) is not ported");
+        }
+
+        // The argument is the merge heads, optionally followed by `# <oneline>`.
+        let arg = item.arg.to_str_lossy().into_owned();
+        let heads: Vec<&str> = arg
+            .split_whitespace()
+            .take_while(|w| *w != "#")
+            .collect();
+        if heads.is_empty() {
+            self.term_clear_line();
+            crate::git_fatal!("nothing to merge: '{arg}'");
+        }
+        if heads.len() > 1 {
+            self.term_clear_line();
+            bail!(
+                "octopus `merge` is not ported (git runs `git merge -s octopus` for more than \
+                 one merge head); the rebase is still resumable with `git rebase --abort`"
+            );
+        }
+        let merge_head = self.lookup_label(heads[0])?;
+        let head = repo.head_id()?.detach();
+
+        // `can_fast_forward`: HEAD is still the original merge's first parent and
+        // the merge heads are still its remaining parents, so the original merge
+        // commit already *is* the answer.
+        let original_parents: Vec<ObjectId> = repo
+            .find_commit(original)?
+            .parent_ids()
+            .map(|p| p.detach())
+            .collect();
+        let can_fast_forward = self.st.allow_ff
+            && original_parents.first() == Some(&head)
+            && original_parents.len() == 2
+            && original_parents[1] == merge_head;
+        if can_fast_forward {
+            update_clean_worktree(repo, &self.index, original, &self.should_interrupt)?;
+            self.refresh_index()?;
+            set_head(repo, Target::Object(original), "rebase: fast-forward")?;
+            return Ok(Step::Next);
+        }
+
+        // `merge_ort_recursive()` over the one merge base. Several bases would
+        // need the virtual common ancestor git builds by merging them, which is
+        // not reachable from here.
+        let bases = repo.merge_bases_many(head, &[merge_head])?;
+        if bases.len() > 1 {
+            self.term_clear_line();
+            bail!(
+                "`merge` across {} merge bases is not ported (git folds them into one virtual \
+                 ancestor); the rebase is still resumable with `git rebase --abort`",
+                bases.len()
+            );
+        }
+        let base_tree = match bases.first() {
+            Some(id) => repo.find_object(id.detach())?.peel_to_tree()?.id,
+            None => ObjectId::empty_tree(repo.object_hash()),
+        };
+        let head_tree = repo.find_commit(head)?.tree_id()?.detach();
+        let other_tree = repo.find_commit(merge_head)?.tree_id()?.detach();
+        let other_label = format!("refs/rewritten/{}", heads[0]);
+        let applied = crate::merge_apply::three_way_merge(
+            repo,
+            base_tree,
+            head_tree,
+            other_tree,
+            &self.index,
+            gix::merge::blob::builtin_driver::text::Labels {
+                ancestor: None,
+                current: Some(BStr::new(b"HEAD")),
+                other: Some(BStr::new(other_label.as_bytes())),
+            },
+            &self.should_interrupt,
+        )?;
+        self.index = applied.index;
+        self.index.write(Default::default())?;
+
+        let commit = repo.find_commit(original)?;
+        let message: BString = commit.message_raw()?.to_owned();
+        if !applied.conflicts.is_empty() {
+            // `MERGE_HEAD`/`MERGE_MODE` are what let `git commit` conclude the
+            // stopped merge.
+            std::fs::write(repo.git_dir().join("MERGE_HEAD"), format!("{merge_head}\n"))?;
+            std::fs::write(repo.git_dir().join("MERGE_MODE"), "no-ff\n")?;
+            std::fs::write(repo.git_dir().join("MERGE_MSG"), &message)?;
+            let short = todo::short_name(repo, original);
+            let subject = first_line(message.as_bstr());
+            return self.stop_for_conflict(item, original, &short, &subject, &message);
+        }
+
+        write_author_script(repo, &commit)?;
+        let author = commit.author()?.to_owned()?;
+        let signed = sign_off(&self.committer, self.st.signoff, &message)?;
+        let new = repo
+            .write_object(&gix::objs::Commit {
+                message: signed,
+                tree: applied.tree_id,
+                author,
+                committer: self.committer.clone(),
+                encoding: None,
+                parents: [head, merge_head].into_iter().collect(),
+                extra_headers: Default::default(),
+            })?
+            .detach();
+        set_head(
+            repo,
+            Target::Object(new),
+            &gix::reference::log::message(
+                &format!("{} (merge)", reflog_action()),
+                message.as_bstr(),
+                1,
+            )
+            .to_string(),
+        )?;
+        Ok(Step::Next)
     }
 
     /// `reword`: amend the commit just made, with the editor open on its
@@ -3556,6 +3849,7 @@ impl<'r> Sequencer<'r> {
         } else {
             "detached HEAD".to_string()
         };
+        self.delete_rewritten_refs();
         let _ = std::fs::remove_dir_all(rebase_merge_dir(repo));
         if let Some(oid) = self.autostash {
             crate::porcelain::stash::apply_autostash(repo, oid, self.st.quiet)?;
@@ -3673,6 +3967,30 @@ fn tree_from_index(repo: &gix::Repository, index: &gix::index::File) -> Result<O
 /// bare rebase leaves `rebase (pick): …`.
 fn reflog_action() -> String {
     std::env::var("GIT_REFLOG_ACTION").unwrap_or_else(|_| "rebase".to_string())
+}
+
+/// `--signoff`: `append_signoff(&msgbuf, 0, 0)` over a replayed commit's message,
+/// with the trailer built from the *committer* identity (`WANT_COMMITTER_IDENT`,
+/// no date). Returns the message unchanged when `--signoff` was not given.
+///
+/// `append_signoff()` merges into an existing trailer block, so a commit already
+/// carrying this exact sign-off as its last trailer is left alone. Its port lives
+/// in `commit.rs` and works on `String`, which is why a non-UTF-8 message is
+/// reported rather than round-tripped lossily.
+fn sign_off(
+    committer: &gix::actor::Signature,
+    signoff: bool,
+    message: &BString,
+) -> Result<BString> {
+    if !signoff {
+        return Ok(message.clone());
+    }
+    let Ok(mut text) = String::from_utf8(message.to_vec()) else {
+        bail!("--signoff on a non-UTF-8 commit message is not ported");
+    };
+    let ident = format!("{} <{}>", committer.name, committer.email);
+    super::commit::append_signoff(&mut text, &ident, 0, false);
+    Ok(BString::from(text))
 }
 
 fn set_head(repo: &gix::Repository, target: Target, message: &str) -> Result<()> {

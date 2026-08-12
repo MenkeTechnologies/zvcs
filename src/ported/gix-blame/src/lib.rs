@@ -17,7 +17,10 @@
 mod error;
 pub use error::Error;
 mod types;
-pub use types::{BlameEntry, BlamePathEntry, BlameRanges, CopyDetection, Options, Outcome, PathId, Statistics, Suspect};
+pub use types::{
+    BlameEntry, BlamePathEntry, BlameRanges, Children, CopyDetection, FakeCommit, Options, OriginKey, Outcome, PathId,
+    Statistics, Suspect,
+};
 
 mod file;
-pub use file::function::{file, strip_whitespace_per_line};
+pub use file::function::{file, strip_whitespace_per_line, suspect_refcounts};

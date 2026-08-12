@@ -69,6 +69,19 @@ impl AllObjects {
     /// Set the ordering of the objects returned, trading off memory and latency for object query performance.
     pub fn with_ordering(mut self, order: Ordering) -> Self {
         self.order = order;
+        // `new()` already sorted the *first* pack's entries using the default
+        // ordering, and `maybe_sort_entries()` only runs again when the iterator
+        // advances to the next index — so without re-sorting here the first pack
+        // would ignore the ordering that was just asked for, and a single-pack
+        // repository would ignore it entirely.
+        if let State::Pack {
+            index,
+            ordered_entries,
+            ..
+        } = &mut self.state
+        {
+            *ordered_entries = maybe_sort_entries(index, order);
+        }
         self
     }
 }

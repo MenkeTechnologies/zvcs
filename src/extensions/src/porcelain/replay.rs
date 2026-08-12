@@ -29,6 +29,8 @@
 //!   (`REPLAY_EMPTY_COMMIT_DROP`; git exposes no flag to change it).
 //! * Exit codes: 0 clean, 1 conflicted (with no output and no ref updates, as
 //!   git documents), 128 for `die`/`error` paths, 129 for the usage error.
+//! * `pick_regular_commit` is `pub(super)` because `git history` replays its
+//!   descendants through the same libified function git does.
 //!
 //! ## Not covered
 //!
@@ -90,9 +92,118 @@ const REV_PARSE_RULES: [&str; 6] = [
 
 /// `enum replay_mode`.
 #[derive(Clone, Copy, PartialEq)]
-enum Mode {
+pub(super) enum Mode {
     Pick,
     Revert,
+}
+
+/// `enum replay_empty_commit_action` (replay.h).
+#[derive(Clone, Copy, PartialEq)]
+pub(super) enum EmptyAction {
+    Drop,
+    Keep,
+    Abort,
+}
+
+/// What [`pick_regular_commit`] produced for one commit.
+pub(super) enum Picked {
+    /// The replayed commit — or, when an empty commit was dropped, the base it
+    /// was replayed onto, which is what git returns in that case.
+    Commit(ObjectId),
+    /// The three-way merge left unresolved conflicts (`!result->clean`).
+    Conflict,
+    /// `--empty=abort` and the commit became empty; git sets
+    /// `result->clean = error("commit %s became empty after replay")`, which the
+    /// caller turns into a -1 return.
+    BecameEmpty(ObjectId),
+}
+
+/// git's `pick_regular_commit` (replay.c): three-way merge `pickme` onto the
+/// already-replayed version of its parent, then commit the result.
+///
+/// `fallback` is `mapped_commit`'s default when `pickme`'s parent has not been
+/// replayed — `onto` in pick mode, the previous result in revert mode.
+pub(super) fn pick_regular_commit(
+    repo: &gix::Repository,
+    pickme: ObjectId,
+    replayed: &HashMap<ObjectId, ObjectId>,
+    fallback: ObjectId,
+    merge_options: &gix::merge::tree::Options,
+    mode: Mode,
+    empty: EmptyAction,
+) -> Result<Picked> {
+    let commit = repo.find_commit(pickme)?;
+    let base = commit.parent_ids().next().map(|id| id.detach());
+    let base_tree = match base {
+        Some(b) => repo.find_commit(b)?.tree_id()?.detach(),
+        None => repo.object_hash().empty_tree(),
+    };
+
+    let replayed_base = base
+        .and_then(|b| replayed.get(&b).copied())
+        .unwrap_or(fallback);
+    let replayed_base_tree = repo.find_commit(replayed_base)?.tree_id()?.detach();
+    let pickme_tree = commit.tree_id()?.detach();
+
+    // Labels only surface inside conflict markers, which a conflicted replay
+    // never writes; they are set for parity with `pick_regular_commit`.
+    let ours_label = replayed_base.attach(repo).shorten_or_id().to_string();
+    let pickme_label = pickme.attach(repo).shorten_or_id().to_string();
+    let parent_label = format!("parent of {pickme_label}");
+    let (ancestor_tree, our_tree, their_tree, labels) = match mode {
+        Mode::Pick => (
+            base_tree,
+            replayed_base_tree,
+            pickme_tree,
+            Labels {
+                ancestor: Some(if base.is_some() {
+                    BStr::new(parent_label.as_str())
+                } else {
+                    BStr::new("empty tree")
+                }),
+                current: Some(BStr::new(ours_label.as_str())),
+                other: Some(BStr::new(pickme_label.as_str())),
+            },
+        ),
+        Mode::Revert => (
+            pickme_tree,
+            replayed_base_tree,
+            base_tree,
+            Labels {
+                ancestor: Some(BStr::new(pickme_label.as_str())),
+                current: Some(BStr::new(ours_label.as_str())),
+                other: Some(BStr::new(parent_label.as_str())),
+            },
+        ),
+    };
+
+    let mut outcome =
+        repo.merge_trees(ancestor_tree, our_tree, their_tree, labels, merge_options.clone())?;
+    // `merge_incore_nonrecursive()` produces `result->tree` whether or not the
+    // merge came out clean — `pick_regular_commit` only inspects `result->clean`
+    // afterwards — so the tree objects land in the odb either way. Writing after
+    // the conflict check instead left a conflicted replay with the marked blob in
+    // the store but none of the trees pointing at it.
+    let tree_id = outcome.tree.write()?.detach();
+    if outcome.has_unresolved_conflicts(TreatAsUnresolved::git()) {
+        return Ok(Picked::Conflict);
+    }
+
+    if tree_id == replayed_base_tree && pickme_tree != base_tree {
+        match empty {
+            EmptyAction::Drop => return Ok(Picked::Commit(replayed_base)),
+            EmptyAction::Keep => {}
+            EmptyAction::Abort => return Ok(Picked::BecameEmpty(pickme)),
+        }
+    }
+
+    Ok(Picked::Commit(create_commit(
+        repo,
+        &commit,
+        tree_id,
+        replayed_base,
+        mode,
+    )?))
 }
 
 /// `enum ref_action_mode`.
@@ -362,78 +473,39 @@ pub fn replay(args: &[String]) -> Result<ExitCode> {
     };
 
     let merge_options = repo.tree_merge_options()?;
-    let empty_tree = repo.object_hash().empty_tree();
     let mut replayed: HashMap<ObjectId, ObjectId> = HashMap::new();
     let mut last_commit = onto;
     let mut updates: Vec<Update> = Vec::new();
     let mut conflicted = false;
 
     for pickme in order {
-        let commit = repo.find_commit(pickme)?;
-        let parents: Vec<ObjectId> = commit.parent_ids().map(|id| id.detach()).collect();
-        if parents.len() > 1 {
+        if repo.find_commit(pickme)?.parent_ids().count() > 1 {
             return fatal("replaying merge commits is not supported yet!");
         }
-        let base = parents.first().copied();
-        let base_tree = match base {
-            Some(b) => repo.find_commit(b)?.tree_id()?.detach(),
-            None => empty_tree,
-        };
 
         // In revert mode each commit stacks on the previous result; in pick mode
         // it stacks on its already-replayed parent, or `onto` if it has none.
         let fallback = if mode == Mode::Revert { last_commit } else { onto };
-        let replayed_base = base
-            .and_then(|b| replayed.get(&b).copied())
-            .unwrap_or(fallback);
-        let replayed_base_tree = repo.find_commit(replayed_base)?.tree_id()?.detach();
-        let pickme_tree = commit.tree_id()?.detach();
-
-        // Labels only surface inside conflict markers, which a conflicted replay
-        // never writes; they are set for parity with `pick_regular_commit`.
-        let ours_label = replayed_base.attach(&repo).shorten_or_id().to_string();
-        let pickme_label = pickme.attach(&repo).shorten_or_id().to_string();
-        let parent_label = format!("parent of {pickme_label}");
-        let (ancestor_tree, our_tree, their_tree, labels) = match mode {
-            Mode::Pick => (
-                base_tree,
-                replayed_base_tree,
-                pickme_tree,
-                Labels {
-                    ancestor: Some(if base.is_some() {
-                        BStr::new(parent_label.as_str())
-                    } else {
-                        BStr::new("empty tree")
-                    }),
-                    current: Some(BStr::new(ours_label.as_str())),
-                    other: Some(BStr::new(pickme_label.as_str())),
-                },
-            ),
-            Mode::Revert => (
-                pickme_tree,
-                replayed_base_tree,
-                base_tree,
-                Labels {
-                    ancestor: Some(BStr::new(pickme_label.as_str())),
-                    current: Some(BStr::new(ours_label.as_str())),
-                    other: Some(BStr::new(parent_label.as_str())),
-                },
-            ),
-        };
-
-        let mut outcome =
-            repo.merge_trees(ancestor_tree, our_tree, their_tree, labels, merge_options.clone())?;
-        if outcome.has_unresolved_conflicts(TreatAsUnresolved::git()) {
-            conflicted = true;
-            break;
-        }
-        let tree_id = outcome.tree.write()?.detach();
-
-        // A commit that becomes empty is dropped (the CLI-reachable default).
-        let new_commit = if tree_id == replayed_base_tree && pickme_tree != base_tree {
-            replayed_base
-        } else {
-            create_commit(&repo, &commit, tree_id, replayed_base, mode)?
+        // The CLI exposes no `--empty`, so the default `drop` is the only value
+        // reachable here.
+        let new_commit = match pick_regular_commit(
+            &repo,
+            pickme,
+            &replayed,
+            fallback,
+            &merge_options,
+            mode,
+            EmptyAction::Drop,
+        )? {
+            Picked::Commit(id) => id,
+            Picked::Conflict => {
+                conflicted = true;
+                break;
+            }
+            // Unreachable with `EmptyAction::Drop`.
+            Picked::BecameEmpty(id) => {
+                bail!("commit {id} became empty after replay");
+            }
         };
 
         replayed.insert(pickme, new_commit);
@@ -625,7 +697,7 @@ fn dwim_ref(repo: &gix::Repository, name: &str) -> Option<String> {
 /// `add_name_decoration` produces: references are visited in ascending name
 /// order and *prepended*, so each commit's list runs in descending name order,
 /// with `HEAD` — visited last — at the front.
-fn load_branch_decorations(
+pub(super) fn load_branch_decorations(
     repo: &gix::Repository,
     detached_head: bool,
 ) -> Result<HashMap<ObjectId, Vec<String>>> {
@@ -663,7 +735,7 @@ fn load_branch_decorations(
 /// extra headers (minus the signatures) and — for a pick — its author and
 /// message; a revert instead gets the current user as author and git's
 /// generated revert message.
-fn create_commit(
+pub(super) fn create_commit(
     repo: &gix::Repository,
     based_on: &gix::Commit<'_>,
     tree: ObjectId,

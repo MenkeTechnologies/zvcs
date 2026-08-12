@@ -1804,10 +1804,19 @@ fn select(repo: &gix::Repository, args: &[String]) -> Result<Selection> {
                 sel.saw_nonrev = true;
             }
             Err(_) => {
-                return die(&format!(
-                    "fatal: ambiguous argument '{arg}': unknown revision or path not in the \
-                     working tree."
-                ));
+                // `nonrevs=$(git rev-parse --no-revs "$@") || exit`: the message
+                // and the 128 both come from `rev-parse`'s `die_verify_filename`,
+                // and the bare `exit` propagates its status rather than the
+                // script's own 1.
+                return die_with_status(
+                    128,
+                    &format!(
+                        "fatal: ambiguous argument '{arg}': unknown revision or path not in the \
+                         working tree.\n\
+                         Use '--' to separate paths from revisions, like this:\n\
+                         'git <command> [<revision>...] -- [<file>...]'"
+                    ),
+                );
             }
         }
     }

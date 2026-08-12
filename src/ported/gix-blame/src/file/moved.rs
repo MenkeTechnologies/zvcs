@@ -8,12 +8,17 @@
 use std::ops::Range;
 
 use gix_hash::ObjectId;
-use gix_object::FindExt;
 
 use gix_diff::blob::compact;
 
-use super::{function::strip_whitespace_per_line, function::tokens_for_diffing};
-use crate::{Error, Statistics, types::{Suspect, UnblamedHunk}};
+use super::{
+    function::OriginFiles,
+    function::{strip_whitespace_per_line, tokens_for_diffing},
+};
+use crate::{
+    Error, Statistics,
+    types::{Suspect, UnblamedHunk},
+};
 
 /// One parent's contribution to `sg_origin[]` in git's `pass_blame()`: the origin — the parent
 /// commit and the path the blamed file lives at in it — plus the blob it has there.
@@ -219,6 +224,7 @@ pub(super) fn find_moves_in_parents(
     blamed_blob: &[u8],
     starts: &[usize],
     odb: &impl gix_object::Find,
+    origin_files: &mut OriginFiles,
     diff_algorithm: gix_diff::blob::Algorithm,
     ignore_whitespace: bool,
     stats: &mut Statistics,
@@ -236,12 +242,13 @@ pub(super) fn find_moves_in_parents(
     let mut toosmall = Vec::new();
     unblamed = filter_small(blamed_blob, starts, &mut toosmall, unblamed, move_score);
 
-    let mut buf = Vec::new();
     for (parent_origin, parent_blob_id) in parents {
         if unblamed.is_empty() {
             break;
         }
-        let parent_blob = odb.find_blob(parent_blob_id, &mut buf)?.data.to_vec();
+        // `fill_origin_blob()` again (`blame.c:2173`), on the same origin the ordinary diff
+        // already used, so this normally costs nothing beyond the lookup.
+        let parent_blob = origin_files.fill(*parent_origin, parent_blob_id.as_ref(), odb, stats)?;
 
         // Whatever a round hands to the parent leaves behind up to two smaller entries, and those
         // are offered to the same parent again until a round finds nothing.

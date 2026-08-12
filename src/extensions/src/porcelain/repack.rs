@@ -66,8 +66,10 @@
 //!     existing pack already holds are excluded, and a run with nothing left to
 //!     pack prints `Nothing new to pack.` on *stdout* and writes no pack — git's
 //!     wording, stream and exit code, including the way `-q`/`--quiet`
-//!     suppresses just that notice. With `-a` the whole set is repacked
-//!     regardless.
+//!     suppresses just that notice. That notice does not end the run: `-d` still
+//!     prunes and `--write-midx` still writes, exactly as `if (!names.nr)` in
+//!     `cmd_repack()` only reports and falls through. With `-a` the whole set is
+//!     repacked regardless.
 //!   * **`.idx` and `.rev`** are written straight from the pack writer's own
 //!     record of where each object landed, the `.rev` unless
 //!     `pack.writeReverseIndex` is false. The pack is named after its trailing
@@ -107,6 +109,12 @@
 //!     value is fatal even for `-h`).
 //!   * **`--geometric`** repacks everything rather than selecting the subset of
 //!     packs that restores a geometric size progression.
+//!   * **`--write-midx`** writes `objects/pack/multi-pack-index` over the packs
+//!     the run leaves behind, through the same writer `git multi-pack-index
+//!     write` uses. `--write-midx=incremental` asks for a MIDX *chain* instead
+//!     and is refused; and a MIDX written together with `-b` carries no
+//!     `.bitmap`, git's `write_bitmaps` path for a MIDX being a different
+//!     format from the pack bitmap this port writes.
 //!   * **`--filter=tree:<depth>`** is accepted but not applied to the traversal;
 //!     unlike the blob filters its interaction with `--indexed-objects` did not
 //!     reduce to a rule the observed output confirms, and guessing one would put
@@ -274,6 +282,9 @@ struct State {
     /// repository".
     write_bitmap: Option<bool>,
     write_midx: bool,
+    /// `--write-midx=incremental`, which asks for a MIDX *chain* rather than a
+    /// single `multi-pack-index`. Tracked separately so it can be refused.
+    write_midx_incremental: bool,
     geometric: bool,
     filter: bool,
     filter_to: bool,
@@ -437,16 +448,13 @@ fn execute(st: &State) -> Result<ExitCode> {
     to_pack.sort();
     filtered_out.sort();
 
-    if to_pack.is_empty() && filtered_out.is_empty() {
-        // git's own wording, on stdout, exit 0. `-a` repacks unconditionally and
-        // so never reaches this, and `-q` suppresses the notice.
-        if !st.all_into_one && !st.quiet {
-            println!("Nothing new to pack.");
-        }
-        if run_server_info {
-            let _ = super::update_server_info::update_server_info(&["update-server-info".to_string()])?;
-        }
-        return Ok(ExitCode::SUCCESS);
+    // `if (!names.nr)`: git says so and carries on. Everything after the pack
+    // write still runs — in particular `-d`'s `prune_packed_objects()`, which is
+    // what drops the loose copies of objects an *existing* pack already holds,
+    // and `--write-midx`. Returning here instead left those loose objects behind.
+    let nothing_new = to_pack.is_empty() && filtered_out.is_empty();
+    if nothing_new && !st.all_into_one && !st.quiet {
+        println!("Nothing new to pack.");
     }
     filtered_out.retain(|id| packed.contains(id));
 
@@ -525,6 +533,20 @@ fn execute(st: &State) -> Result<ExitCode> {
         super::multi_pack_index::drop_stale_midx(&pack_dir);
         // git finishes `-d` by running `git prune-packed`, which is a real port.
         let _ = super::prune_packed::prune_packed(&["prune-packed".to_string(), "-q".to_string()])?;
+    }
+
+    // `repack_write_midx()`. git writes the index before it deletes the packs
+    // `-d` supersedes, working from the set it has already marked for removal;
+    // writing it here instead, from the packs actually left in the directory,
+    // reaches the same set without having to model the marks.
+    if st.write_midx_incremental {
+        bail!(
+            "unsupported flag \"--write-midx=incremental\" \
+             (the MIDX chain protocol is not modelled by the vendored gix-pack multi-index writer)"
+        );
+    }
+    if st.write_midx {
+        super::multi_pack_index::write_midx(&pack_dir, repo.object_hash())?;
     }
 
     if run_server_info {
@@ -1122,7 +1144,10 @@ fn set_long(idx: usize, negated: bool, value: Option<&str>, st: &mut State) {
         "keep-unreachable" => st.keep_unreachable = on,
         "write-bitmap-index" => st.write_bitmap = Some(on),
         "unpack-unreachable" => st.loosen_unreachable = on,
-        "write-midx" => st.write_midx = on,
+        "write-midx" => {
+            st.write_midx = on;
+            st.write_midx_incremental = on && value == Some("incremental");
+        }
         "geometric" => st.geometric = on,
         "filter" => {
             st.filter = on;

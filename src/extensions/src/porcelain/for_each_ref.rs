@@ -30,13 +30,22 @@
 //! `%(refname)` modifiers). `%(describe)` runs the `describe` subcommand as a
 //! subprocess, as git does, so its options stay on one implementation.
 //!
+//! `%(trailers)` / `%(contents:trailers)` reuse `trailer.c`'s parser out of
+//! [`super::interpret_trailers`] and reproduce `format_trailers_from_commit`'s
+//! verbatim-block fast path; the option list (`:only`, `:unfold`, `:key=`, …)
+//! re-renders the parsed items instead and is refused.
+//!
+//! `%(signature)`'s `:signer`, `:key`, `:grade` and `:trustlevel` come from
+//! [`crate::gitsig`], which runs the same `gpg --verify` git runs. On an
+//! unsigned object every option renders what a zeroed `signature_check` would.
+//! The bare `%(signature)` of a *signed* object needs `sigc->output` — gpg's own
+//! report — and `:fingerprint` / `:primarykeyfingerprint` need the `VALIDSIG`
+//! fingerprints; `gitsig` keeps neither, so those three are refused.
+//!
 //! Not covered — rejected rather than silently producing divergent output:
-//! `%(trailers)` (needs `trailer.c`'s parser, which lives in
-//! [`super::interpret_trailers`]), `%(signature)` (needs gpg's raw output,
-//! fingerprint and primary-key fingerprint, which [`crate::gitsig`] does not
-//! carry), `%(deltabase)` and `%(is-base)`. Those names are still recognised as
-//! *valid* git atoms, so an unknown field name is reported the way git reports
-//! it. `%(rest)` is refused the way git refuses it for this command.
+//! `%(deltabase)` and `%(is-base)`. Those names are still recognised as *valid*
+//! git atoms, so an unknown field name is reported the way git reports it.
+//! `%(rest)` is refused the way git refuses it for this command.
 //!
 //! One known divergence: the `:short` renderings (`%(objectname:short)`,
 //! `%(tree:short)`, `%(parent:short)`) take their length from gitoxide's
@@ -100,6 +109,28 @@ enum Field {
     ObjectSizeDisk,
     /// `%(raw)` (`false`) and `%(raw:size)` (`true`).
     Raw(bool),
+    /// `%(signature[:<option>])` — a commit's signature verification result.
+    Signature(SigOption),
+}
+
+/// git's `signature` atom options, in `parse_signature_option`'s order.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SigOption {
+    /// `%(signature)` — `sigc->output`, gpg's own human-readable report.
+    Bare,
+    /// `%(signature:signer)` — `sigc->signer`.
+    Signer,
+    /// `%(signature:grade)` — `sigc->result`, with a good-but-untrusted `G`
+    /// folded to `U`.
+    Grade,
+    /// `%(signature:key)` — `sigc->key`.
+    Key,
+    /// `%(signature:fingerprint)` — `sigc->fingerprint`.
+    Fingerprint,
+    /// `%(signature:primarykeyfingerprint)` — `sigc->primary_key_fingerprint`.
+    PrimaryKeyFingerprint,
+    /// `%(signature:trustlevel)` — `gpg_trust_level_to_str(sigc->trust_level)`.
+    TrustLevel,
 }
 
 /// git's `remote_ref` atom options, shared by `%(upstream)` and `%(push)`.
@@ -205,6 +236,8 @@ enum ContentPart {
     Subject,
     Body,
     Size,
+    /// `%(trailers)` / `%(contents:trailers)`, git's `C_TRAILERS`.
+    Trailers,
 }
 
 /// One `%(...)` atom: an optional leading `*` (evaluate against the peeled
@@ -328,6 +361,22 @@ fn unported_atom(msg: impl Into<String>) -> AtomError {
     AtomError {
         kind: ErrKind::Unported,
         msg: msg.into(),
+    }
+}
+
+/// `trailers_atom_parser`'s argument handling, reduced to the form this module
+/// renders: the argument-less one, where `format_trailers_from_commit` takes its
+/// fast path and copies the message's trailer block out verbatim. Every option
+/// (`only`, `unfold`, `key=`, `separator=`, `keyonly`, `valueonly`,
+/// `key_value_separator=`) instead re-renders the parsed items, which is
+/// `format_trailers()`'s job and is not wired up here.
+fn trailers_bare(name: &str, arg: Option<&str>) -> std::result::Result<(), AtomError> {
+    match arg {
+        None => Ok(()),
+        Some(a) => Err(unported_atom(format!(
+            "the %({name}) option list {a:?} is not ported: only the argument-less form, \
+             which copies the message's trailer block verbatim, is"
+        ))),
     }
 }
 
@@ -709,6 +758,7 @@ pub fn for_each_ref(args: &[String]) -> Result<ExitCode> {
                 | Field::TargetType
                 | Field::TagName
                 | Field::Raw(_)
+                | Field::Signature(_)
         )
     });
     let needs_peel = atoms().any(|a| a.deref);
@@ -1545,14 +1595,42 @@ fn parse_atom(spec: &str, ctx: &AtomCtx<'_>) -> std::result::Result<Atom, AtomEr
             bare(m)?;
             Field::Contents(ContentPart::Body)
         }
+        // `trailers_atom_parser`: bare, or an option list this port does not
+        // render. The bare form is the one `format_trailers_from_commit` answers
+        // on its verbatim-block fast path.
+        "trailers" => {
+            trailers_bare(name, m)?;
+            Field::Contents(ContentPart::Trailers)
+        }
         "contents" => Field::Contents(match m {
             None => ContentPart::All,
             Some("subject") => ContentPart::Subject,
             Some("body") => ContentPart::Body,
             Some("size") => ContentPart::Size,
+            // `contents_atom_parser` forwards this to `trailers_atom_parser`,
+            // splitting `trailers:<args>` at the first colon.
+            Some(m) if m == "trailers" || m.starts_with("trailers:") => {
+                trailers_bare(name, m.strip_prefix("trailers:"))?;
+                ContentPart::Trailers
+            }
             Some(m) => {
                 return Err(fatal_atom(format!(
                     "unrecognized %(contents) argument: {m}"
+                )))
+            }
+        }),
+        // `signature_atom_parser`.
+        "signature" => Field::Signature(match m {
+            None => SigOption::Bare,
+            Some("signer") => SigOption::Signer,
+            Some("grade") => SigOption::Grade,
+            Some("key") => SigOption::Key,
+            Some("fingerprint") => SigOption::Fingerprint,
+            Some("primarykeyfingerprint") => SigOption::PrimaryKeyFingerprint,
+            Some("trustlevel") => SigOption::TrustLevel,
+            Some(m) => {
+                return Err(fatal_atom(format!(
+                    "unrecognized %(signature) argument: {m}"
                 )))
             }
         }),
@@ -2410,8 +2488,13 @@ fn render(ctx: &RenderCtx<'_>, atom: &Atom, info: &RefInfo) -> Result<Vec<u8>> {
             None => Vec::new(),
         }),
         Field::Person(w, part) => render_person(repo, obj, *w, part),
-        Field::Contents(part) => Ok(render_contents(obj, part)),
-        Field::ObjectSizeDisk => Ok(disk_size(repo, obj.id)?.to_string().into_bytes()),
+        Field::Contents(part) => render_contents(obj, part),
+        Field::Signature(option) => render_signature(obj, *option),
+        // One implementation of `oi.disk_sizep` for the whole port: it has to try
+        // packs before loose files, which the `cat-file` copy already does.
+        Field::ObjectSizeDisk => {
+            Ok(super::cat_file::disk_size(repo, obj.id)?.to_string().into_bytes())
+        }
         Field::Raw(size) => Ok(match (size, obj.data.as_deref()) {
             (true, _) => obj.size.to_string().into_bytes(),
             (false, Some(data)) => data.to_vec(),
@@ -2634,26 +2717,6 @@ fn run_describe(args: &[String], id: ObjectId) -> Result<Vec<u8>> {
     Ok(stdout)
 }
 
-/// git's `disk_sizep`: the loose object file's length, or a packed object's
-/// entry size (compressed payload plus its in-pack header).
-fn disk_size(repo: &gix::Repository, id: ObjectId) -> Result<u64> {
-    let hex = id.to_string();
-    let loose = repo
-        .git_dir()
-        .join("objects")
-        .join(&hex[..2])
-        .join(&hex[2..]);
-    if let Ok(meta) = std::fs::metadata(&loose) {
-        return Ok(meta.len());
-    }
-    let mut buf = Vec::new();
-    use gix::odb::pack::Find as _;
-    if let Some(loc) = repo.objects.location_by_oid(id.as_ref(), &mut buf) {
-        return Ok(loc.entry_size as u64);
-    }
-    crate::git_fatal!("cannot determine on-disk size of {hex}")
-}
-
 /// Peel `id` to a commit, or `None` when it does not name one — git's
 /// `lookup_commit_reference_gently`.
 fn commit_tip(repo: &gix::Repository, id: ObjectId) -> Result<Option<ObjectId>> {
@@ -2829,13 +2892,14 @@ fn format_date(time: gix::date::Time, fmt: DateFmt) -> String {
     }
 }
 
-/// Render `%(contents...)`, `%(subject)` and `%(body)` from an object's message.
-fn render_contents(obj: &ObjInfo, part: &ContentPart) -> Vec<u8> {
+/// Render `%(contents...)`, `%(subject)`, `%(body)` and `%(trailers)` from an
+/// object's message.
+fn render_contents(obj: &ObjInfo, part: &ContentPart) -> Result<Vec<u8>> {
     let Some(data) = obj.data.as_deref() else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     if !matches!(obj.kind, Kind::Commit | Kind::Tag) {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     // git takes everything after the header block; a header continuation line
     // always starts with a space, so the first blank line ends the headers.
@@ -2845,8 +2909,13 @@ fn render_contents(obj: &ObjInfo, part: &ContentPart) -> Vec<u8> {
     };
 
     match part {
-        ContentPart::All => contents.to_vec(),
-        ContentPart::Size => contents.len().to_string().into_bytes(),
+        ContentPart::All => Ok(contents.to_vec()),
+        ContentPart::Size => Ok(contents.len().to_string().into_bytes()),
+        // `grab_sub_body_contents`' `C_TRAILERS` arm: the message with any
+        // signature block cut off, handed to `format_trailers_from_commit`.
+        ContentPart::Trailers => {
+            super::interpret_trailers::trailer_block_of(&contents[..signature_start(contents)])
+        }
         ContentPart::Subject | ContentPart::Body => {
             // Signatures belong to neither the subject nor the body.
             let body = &contents[..signature_start(contents)];
@@ -2855,11 +2924,68 @@ fn render_contents(obj: &ObjInfo, part: &ContentPart) -> Vec<u8> {
                 Some(i) => (&body[..i], trim_leading_newlines(&body[i..])),
                 None => (body, &body[body.len()..]),
             };
-            match part {
+            Ok(match part {
                 ContentPart::Subject => fold_subject(subject),
                 _ => rest.to_vec(),
-            }
+            })
         }
+    }
+}
+
+/// git's `grab_signature`: verify a commit's signature once, then render the
+/// field the atom asked for.
+///
+/// `check_commit_signature` leaves every field empty for an object that carries
+/// no `gpgsig` header — including a tag or a tree, which `grab_signature` is
+/// never even reached for — so those render empty here too.
+///
+/// [`crate::gitsig`] runs the same `gpg --verify` git runs, but discards gpg's
+/// human-readable report and never asks for the key's fingerprints, so the three
+/// atoms that quote those (`%(signature)` itself, `:fingerprint` and
+/// `:primarykeyfingerprint`) can only be answered for an unsigned object.
+fn render_signature(obj: &ObjInfo, option: SigOption) -> Result<Vec<u8>> {
+    let data = obj.data.as_deref().unwrap_or_default();
+    let signed = obj.kind == Kind::Commit && crate::gitsig::split_signed(data).is_some();
+    if !signed {
+        // `sigc` stays zeroed apart from `result = 'N'` and `trust_level =
+        // TRUST_UNDEFINED`, so every string field renders empty and the two
+        // derived atoms report the initial verdict.
+        return Ok(match option {
+            SigOption::Grade => b"N".to_vec(),
+            SigOption::TrustLevel => trust_level_str(crate::gitsig::Trust::Undefined).into(),
+            _ => Vec::new(),
+        });
+    }
+
+    let check = crate::gitsig::evaluate_full(data);
+    Ok(match option {
+        SigOption::Signer => check.signer.into_bytes(),
+        SigOption::Key => check.key.into_bytes(),
+        SigOption::Grade => vec![check.pretty_status().code() as u8],
+        SigOption::TrustLevel => trust_level_str(check.trust).into(),
+        SigOption::Bare => crate::git_fatal!(
+            "%(signature) on a signed object needs `sigc->output` — gpg's own report, which \
+             check_signature() keeps verbatim; crate::gitsig discards gpg's stderr and cannot \
+             reproduce it (ported: :signer, :key, :grade, :trustlevel, and every option on an \
+             unsigned object)"
+        ),
+        SigOption::Fingerprint | SigOption::PrimaryKeyFingerprint => crate::git_fatal!(
+            "%(signature:fingerprint) / %(signature:primarykeyfingerprint) need the \
+             VALIDSIG status line's fingerprint fields, which crate::gitsig does not parse \
+             (ported: :signer, :key, :grade, :trustlevel, and every option on an unsigned object)"
+        ),
+    })
+}
+
+/// git's `gpg_trust_level_to_str()`: the lowercase `TRUST_*` suffix.
+fn trust_level_str(trust: crate::gitsig::Trust) -> &'static [u8] {
+    use crate::gitsig::Trust;
+    match trust {
+        Trust::Undefined => b"undefined",
+        Trust::Never => b"never",
+        Trust::Marginal => b"marginal",
+        Trust::Fully => b"fully",
+        Trust::Ultimate => b"ultimate",
     }
 }
 

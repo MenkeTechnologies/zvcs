@@ -54,16 +54,41 @@
 //!     does. `Refusing to create empty bundle.` and `unsupported bundle
 //!     version <n>` are reproduced.
 //!
-//!     **The pack is not thin.** git's `pack-objects --thin` emits deltas whose
-//!     bases are the prerequisite objects the receiver already has;
-//!     `gix-pack`'s writer has exactly one mode, documented as "Copy base
-//!     objects and deltas from packs, while non-packed objects will be treated
-//!     as base objects (i.e. without trying to delta compress them)"
-//!     (`gix-pack/src/data/output/entry/iter_from_counts.rs:362`). What is
-//!     written is therefore a self-contained superset of git's pack: every
-//!     object it references is present, so `git bundle unbundle`, `git clone`
-//!     and `index-pack --fix-thin` all accept it and produce the same objects
-//!     and refs. The bundle's *bytes* are not git's, and neither is its size.
+//!     **The pack bytes are not git's.** The header — magic line, prerequisite
+//!     and tip lines, terminating blank line — is byte-identical; the pack that
+//!     follows is not, for three independent reasons, each measured against
+//!     stock git 2.55.0 on the `branched` fixture:
+//!
+//!       1. *Object order.* git's `compute_write_order()` groups the pack by
+//!          type (tagged tips, then remaining commits and tags, then trees, then
+//!          the rest) and keeps delta families contiguous. This port writes in
+//!          the order `objects_to_send()` produces, which is
+//!          `HashSet<ObjectId>` iteration order — so the order is not git's *and
+//!          is not stable between two runs of this binary*. Fixing it means
+//!          returning an ordered collection from
+//!          `push_proto::objects_to_send()` and porting `compute_write_order()`,
+//!          neither of which lives in this module.
+//!       2. *Deflate output.* zvcs compresses through `zlib-rs`, which targets
+//!          zlib-ng-compatible output rather than bit-identity with the zlib
+//!          stock git links. On the `branched` fixture 6 of 13 objects compress
+//!          to a different length at the same level (a 235-byte commit becomes
+//!          149 bytes here and 152 in stock). No level setting closes this; only
+//!          swapping the compressor would.
+//!       3. *Thinness.* git passes `--thin`, so its deltas may name bases the
+//!          receiver already has; `gix-pack`'s writer has exactly one mode,
+//!          documented as "Copy base objects and deltas from packs, while
+//!          non-packed objects will be treated as base objects"
+//!          (`gix-pack/src/data/output/entry/iter_from_counts.rs:362`). With
+//!          `--all` there are no prerequisites, so this one is inert there.
+//!
+//!     What is written is a self-contained superset of git's pack: every object
+//!     it references is present, so `git bundle unbundle`, `git clone` and
+//!     `index-pack --fix-thin` all accept it and produce the same objects and
+//!     refs. Delta *base selection* is not currently a cause — on `branched`
+//!     gitoxide picks the same base and emits a byte-identical delta payload —
+//!     and the deltas are `OBJ_OFS_DELTA`, because `write_pack_data()` spawns
+//!     `pack-objects --stdout --thin --delta-base-offset` unconditionally
+//!     (`bundle.c:333-336`).
 //!
 //! Two further deliberate gaps, so this doc claims no more than the code does:
 //! a v3 bundle carrying any capability other than `@object-format` is rejected
@@ -681,7 +706,14 @@ fn create(args: &[String]) -> Result<ExitCode> {
     let mut haves = prereqs.clone();
     haves.extend_from_slice(&excluded);
     let objects = crate::porcelain::push_proto::objects_to_send(&repo, &tips, &haves);
-    out.extend_from_slice(&crate::porcelain::pack_objects::pack_bytes_for(&repo, &objects)?);
+    // `write_pack_data()` spawns `pack-objects --stdout --thin --delta-base-offset`
+    // (bundle.c:333-336) — the flag is unconditional there, so a bundle's deltas
+    // are always `OBJ_OFS_DELTA`. Passing `false` here wrote `OBJ_REF_DELTA`
+    // instead, which is 18 bytes larger per delta and is not what any git bundle
+    // contains.
+    out.extend_from_slice(&crate::porcelain::pack_objects::pack_bytes_with(
+        &repo, &objects, true,
+    )?);
 
     if file == "-" {
         io::stdout().write_all(&out)?;

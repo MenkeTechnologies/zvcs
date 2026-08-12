@@ -11,9 +11,12 @@
 //! The parts of `remote-curl.c` that are transport-independent, verified
 //! byte-for-byte against stock git (stdout, stderr and exit code):
 //!
-//! * `git remote-ftp` with no arguments —
-//!   `error: remote-curl: usage: git remote-curl <remote> [<url>]`, exit 1.
-//! * the startup URL check: a URL with no `://` produces
+//! * the whole argument prologue, shared with the other three names this one
+//!   binary answers to — see [`super::remote_http::prologue`]. No arguments is
+//!   `error: remote-curl: usage: git remote-curl <remote> [<url>]`, exit 1;
+//!   `<url>` is `argv[2]` when given and otherwise the URL `remote_get(argv[1])`
+//!   resolves (`remote.<name>.url` with `url.<base>.insteadOf` applied); and the
+//!   startup URL check rejects one with no `://` as
 //!   `warning: url has no scheme: <url>/` followed by
 //!   `fatal: credential url cannot be parsed: <url>/`, exit 128 (the trailing
 //!   slash is `remote-curl`'s `str_end_url_with_slash`; an empty URL gets none).
@@ -45,17 +48,13 @@
 //! walker from scratch, not porting onto existing substrate, so they report the
 //! missing piece instead of returning plausible-looking output.
 //!
-//! The `<remote> <url>` form with the URL omitted also bails: git falls back to
-//! the configured remote's URL through `remote_get`, whose fallback semantics for
-//! unconfigured names are not reproduced here.
+//! One limit on the URL fallback: outside a repository, `remote_get` degrades to
+//! the given name verbatim, because gitoxide reaches configuration through a
+//! `Repository` and so cannot consult global or system `insteadOf` rules there.
 
 use anyhow::{bail, Result};
 use std::io::{Read, Write};
 use std::process::ExitCode;
-
-/// `remote-curl.c`'s usage string, byte-for-byte (it names `remote-curl`, not
-/// `remote-ftp`, because the FTP helper is the same binary).
-const USAGE: &str = "error: remote-curl: usage: git remote-curl <remote> [<url>]\n";
 
 /// The capability list `remote-curl` advertises, in its order, terminated by the
 /// blank line that ends a helper response.
@@ -63,27 +62,12 @@ const CAPABILITIES: &str = "stateless-connect\nfetch\nget\noption\npush\ncheck-c
 
 /// `git remote-ftp` — see the module docs for the covered behaviour.
 pub fn remote_ftp(args: &[String]) -> Result<ExitCode> {
-    // argv[0] is the command, argv[1] the remote name, argv[2] the URL. Only
-    // "no remote at all" is a usage error; extra arguments are ignored.
-    if args.len() < 2 {
-        eprint!("{USAGE}");
-        return Ok(ExitCode::from(1));
-    }
-    let Some(url) = args.get(2) else {
-        anyhow::bail!("remote-ftp <remote> without <url> is unsupported (the URL must be given explicitly)");
-    };
-
-    // `str_end_url_with_slash` then `credential_from_url`, which only fails at
-    // this point when the URL carries no scheme at all.
-    let with_slash = if url.is_empty() || url.ends_with('/') {
-        url.clone()
-    } else {
-        format!("{url}/")
-    };
-    if !with_slash.contains("://") {
-        eprintln!("warning: url has no scheme: {with_slash}");
-        eprintln!("fatal: credential url cannot be parsed: {with_slash}");
-        return Ok(ExitCode::from(128));
+    // The argument check, the URL and `credential_from_url` all come from
+    // `remote-curl.c::cmd_main`, which is the same code for every helper name
+    // this binary answers to; see [`super::remote_http::prologue`].
+    match super::remote_http::prologue(args) {
+        super::remote_http::Prologue::Exit(code) => return Ok(code),
+        super::remote_http::Prologue::Url(_) => {}
     }
 
     command_loop()

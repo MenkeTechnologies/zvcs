@@ -874,6 +874,22 @@ fn process(input: &[u8], opts: &Opts, new_trailers: &[NewTrailer], cfg: &Trailer
     out
 }
 
+/// `format_trailers_from_commit()` under the option set ref-filter's
+/// `%(trailers)` / `%(contents:trailers)` builds with no arguments: every field
+/// of `process_trailer_options` left at its default except `no_divider`, which
+/// `trailers_atom_parser` always sets.
+///
+/// With `only_trailers`, `unfold`, `filter`, `separator`, `key_only`,
+/// `value_only` and `key_value_separator` all unset, that function takes its
+/// fast path — `strbuf_add(out, msg + trailer_block_start(b), trailer_block_end(b)
+/// - trailer_block_start(b))` — so the answer is the block's bytes verbatim,
+/// without re-rendering the parsed items.
+pub(crate) fn trailer_block_of(msg: &[u8]) -> Result<Vec<u8>> {
+    let cfg = load_config()?;
+    let block = block_get(msg, true, &cfg);
+    Ok(msg[block.start..block.end].to_vec())
+}
+
 /// `trailer_block_get()`: locate the block and fold its continuation lines.
 fn block_get(input: &[u8], no_divider: bool, cfg: &TrailerConfig) -> Block {
     let cend = c_len(input);

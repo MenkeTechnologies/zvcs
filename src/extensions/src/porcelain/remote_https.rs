@@ -7,8 +7,11 @@
 //! `remote-curl`, matching the binary stock git actually execs.
 //!
 //! Covered, byte-for-byte against stock git:
-//!   * argument validation — the `error: remote-curl: usage: ...` line on
-//!     stderr with exit 1.
+//!   * argument validation and the URL prologue — shared with the other three
+//!     spellings of this one binary, see [`super::remote_http::prologue`]: the
+//!     `error: remote-curl: usage: ...` line on stderr with exit 1, the fallback
+//!     to the named remote's configured URL, `end_url_with_slash()`, and the
+//!     `credential_from_url()` refusal (exit 128).
 //!   * the command loop itself, including its two termination paths: a blank
 //!     command line exits 0, EOF without one exits 1.
 //!   * `capabilities` — the fixed advertisement block.
@@ -81,21 +84,14 @@ enum Reply {
 /// blank command line (exit 0) or EOF (exit 1), exactly as stock `remote-curl`
 /// does.
 pub fn remote_https(args: &[String]) -> Result<ExitCode> {
-    // Dispatch passes the subcommand at index 0; tolerate its absence so the
-    // function can also be driven directly with bare helper arguments.
-    let args = match args.first().map(String::as_str) {
-        Some("remote-https" | "remote-http") => &args[1..],
-        _ => args,
+    // The whole prologue — argument check, URL selection, `end_url_with_slash`
+    // and `credential_from_url` — is `remote-curl.c`'s and is shared with the
+    // other three names the same binary answers to.
+    let spec = match super::remote_http::prologue(args) {
+        super::remote_http::Prologue::Exit(code) => return Ok(code),
+        super::remote_http::Prologue::Url(url) => url.to_string(),
     };
-
-    // Stock accepts `<remote>` or `<remote> <url>` and nothing else.
-    if args.is_empty() || args.len() > 2 {
-        eprintln!("error: remote-curl: usage: git remote-curl <remote> [<url>]");
-        return Ok(ExitCode::from(1));
-    }
-    // With both present the URL is authoritative (git has already applied
-    // `url.<base>.insteadOf`); with one, it names a configured remote.
-    let spec = args[args.len() - 1].as_str();
+    let spec = spec.as_str();
 
     let mut opts = Options::default();
     let stdin = std::io::stdin();

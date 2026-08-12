@@ -48,10 +48,18 @@ use gix::refs::Target;
 /// `merge` without `-s` takes its strategy from `notes.<name>.mergeStrategy`
 /// then `notes.mergeStrategy`.
 ///
-/// The only paths kept as a terse bail are the genuinely interactive editor
-/// flows — a bare `edit`/`add`/`append` with no message option, and `-e` /
-/// `-c`/`--reedit-message` — which require a live terminal that has no
-/// equivalent here. The manual merge strategy's conflict blob is written with
+/// The editor round-trip is ported: `prepare_note_data()` writes
+/// `$GIT_DIR/NOTES_EDITMSG` with the message so far (or, for `edit`, the note
+/// being re-edited), git's commented template and a commented
+/// `git show --stat --no-notes <object>`, opens `git_editor()` on it and
+/// stripspaces what comes back — so a bare `edit`/`add`/`append`, `-e` and
+/// `-c`/`--reedit-message` all work, and a dumb terminal with no editor
+/// configured still reports git's `Terminal is dumb, but EDITOR unset` followed
+/// by `please supply the note contents using either -m or -F option` (128).
+/// A bare `add` on an object that already has a note re-enters `edit`, as
+/// git's `argv[0] = "edit"` redirect does.
+///
+/// The manual merge strategy's conflict blob is written with
 /// whole-content conflict markers (git's `ll_merge` output for single-block
 /// notes); its stdout, exit code and staged-merge state match stock git.
 pub fn notes(args: &[String]) -> Result<ExitCode> {
@@ -717,7 +725,19 @@ fn check_writable(notes_ref: &str, sub: &str) -> Result<Option<ExitCode>> {
 
 /// Resolve one `<object>` argument. Notes annotate any object, so the spec is
 /// not peeled — `git notes add v1.0` annotates the tag object itself.
+///
+/// `get_oid_basic()` returns a full-length hex object name as-is, *without*
+/// checking that the object exists, so `git notes show <missing-40-hex>` reaches
+/// the note lookup and reports "no note found" instead of failing to parse its
+/// argument. Only git's ambiguity *warning* for a same-named ref is skipped.
 fn resolve(repo: &gix::Repository, spec: &str) -> Result<ObjectId, String> {
+    let hexsz = repo.object_hash().len_in_hex();
+    if spec.len() == hexsz && spec.bytes().all(|b| b.is_ascii_hexdigit()) {
+        // `hexval()` accepts either case; `from_hex` wants lowercase.
+        if let Ok(id) = ObjectId::from_hex(spec.to_ascii_lowercase().as_bytes()) {
+            return Ok(id);
+        }
+    }
     repo.rev_parse_single(spec)
         .map(|id| id.detach())
         .map_err(|_| format!("failed to resolve '{spec}' as a valid ref."))
@@ -738,6 +758,9 @@ struct MsgOpts {
     separator: Option<String>,
     allow_empty: bool,
     force: bool,
+    /// `-e`/`--edit` (and `-c`, which implies it): open the editor even when a
+    /// message option was given.
+    use_editor: bool,
     object: Option<String>,
 }
 
@@ -749,6 +772,7 @@ impl Default for MsgOpts {
             separator: Some("\n".to_string()),
             allow_empty: false,
             force: false,
+            use_editor: false,
             object: None,
         }
     }
@@ -810,10 +834,35 @@ fn parse_msg_opts(
                 },
                 None => return Ok(Err(msg_sub_usage(sub, &requires_value(a))?)),
             },
-            "-e" | "--edit" => bail!("`-e`/`--edit` is not supported (it requires an editor)"),
-            "-c" | "--reedit-message" => {
-                bail!("`-c`/`--reedit-message` is not supported (it requires an editor)")
+            "-e" | "--edit" => o.use_editor = true,
+            "--no-edit" => o.use_editor = false,
+            // `parse_reedit_arg()` is `parse_reuse_arg()` plus `use_editor = 1`.
+            "-c" | "--reedit-message" => match detached(args, &mut i) {
+                Some(v) => match read_note_blob(repo, &v) {
+                    Ok(b) => {
+                        o.use_editor = true;
+                        o.msgs.push(Msg { bytes: b, strip: false });
+                    }
+                    Err(m) => return Ok(Err(fatal128(&m))),
+                },
+                None => return Ok(Err(msg_sub_usage(sub, &requires_value(a))?)),
+            },
+            _ if a.starts_with("--reedit-message=") => {
+                match read_note_blob(repo, &a["--reedit-message=".len()..]) {
+                    Ok(b) => {
+                        o.use_editor = true;
+                        o.msgs.push(Msg { bytes: b, strip: false });
+                    }
+                    Err(m) => return Ok(Err(fatal128(&m))),
+                }
             }
+            _ if a.starts_with("-c") => match read_note_blob(repo, &a[2..]) {
+                Ok(b) => {
+                    o.use_editor = true;
+                    o.msgs.push(Msg { bytes: b, strip: false });
+                }
+                Err(m) => return Ok(Err(fatal128(&m))),
+            },
             _ if a.starts_with("--separator=") => {
                 o.separator = Some(a["--separator=".len()..].to_string())
             }
@@ -920,6 +969,117 @@ fn concat_messages(o: &MsgOpts) -> Vec<u8> {
         }
     }
     buf
+}
+
+/// `builtin/notes.c:note_template` — the one-line hint above the commented object.
+const NOTE_TEMPLATE: &str = "Write/edit the notes for the following object:";
+
+/// `builtin/notes.c:prepare_note_data()` — the editor round-trip.
+///
+/// A no-op unless `-e`/`--edit` was given or no `-m`/`-F`/`-c`/`-C` was; in that
+/// case `$GIT_DIR/NOTES_EDITMSG` is written with the message so far (or, when
+/// `old_note` is set, that note's blob), git's commented template, and a
+/// commented `git show --stat --no-notes <object>`, the editor is opened on it,
+/// and what comes back replaces the message. `stripspace` is git's tri-state:
+/// only an explicit `--no-stripspace` keeps the comment lines.
+///
+/// `Err` is git's `die(_("please supply the note contents using either -m or -F
+/// option"))` — every `launch_editor()` failure lands there, after the editor
+/// layer has printed its own `error:` line.
+fn prepare_note_data(
+    repo: &gix::Repository,
+    object: &ObjectId,
+    body: Vec<u8>,
+    have_msgs: bool,
+    use_editor: bool,
+    old_note: Option<ObjectId>,
+    stripspace: Option<bool>,
+) -> Result<std::result::Result<Vec<u8>, ExitCode>> {
+    if !use_editor && have_msgs {
+        return Ok(Ok(body));
+    }
+
+    let comment = super::rebase_todo::comment_prefix(repo);
+    let edit_path = repo.git_dir().join("NOTES_EDITMSG");
+
+    let mut file: Vec<u8> = Vec::new();
+    if have_msgs {
+        file.extend_from_slice(&body);
+    } else if let Some(old) = old_note {
+        // `copy_obj_to_fd()` — the previous note verbatim, or nothing when the
+        // object cannot be read (git ignores that failure here).
+        if let Ok(blob) = repo.find_object(old) {
+            file.extend_from_slice(&blob.data);
+        }
+    }
+    file.push(b'\n');
+    let banner = format!("\n{NOTE_TEMPLATE}\n\n");
+    file.extend_from_slice(&super::stripspace::comment_lines(
+        banner.as_bytes(),
+        comment.as_bytes(),
+    ));
+    file.extend_from_slice(&super::stripspace::comment_lines(
+        &show_stat(object)?,
+        comment.as_bytes(),
+    ));
+
+    std::fs::write(&edit_path, &file)?;
+    let edited = launch_editor(repo, &edit_path);
+    // `free_note_data()` unlinks the scratch file whatever happened.
+    let _ = std::fs::remove_file(&edit_path);
+
+    let Some(mut buf) = edited else {
+        eprintln!("fatal: please supply the note contents using either -m or -F option");
+        return Ok(Err(ExitCode::from(128)));
+    };
+    if stripspace != Some(false) {
+        buf = super::stripspace::strip_space(&buf, Some(comment.as_bytes()));
+    }
+    Ok(Ok(buf))
+}
+
+/// `write_commented_object()`'s child: `git show --stat --no-notes <object>`,
+/// run as our own binary (git's `show.git_cmd = 1`) with its stderr inherited.
+fn show_stat(object: &ObjectId) -> Result<Vec<u8>> {
+    let exe = std::env::current_exe()?;
+    let out = std::process::Command::new(exe)
+        .args(["show", "--stat", "--no-notes", &object.to_string()])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|_| anyhow!("unable to start 'show' for object '{object}'"))?;
+    if !out.status.success() {
+        bail!("failed to finish 'show' for object '{object}'");
+    }
+    Ok(out.stdout)
+}
+
+/// `launch_editor()`: open `path` in git's editor and hand back what it left
+/// there. `None` is git's `-1` return, after the `error:` line it prints itself.
+///
+/// `:` is git's documented no-op editor — it is never run and the file is never
+/// read back, so the message stays empty.
+fn launch_editor(repo: &gix::Repository, path: &std::path::Path) -> Option<Vec<u8>> {
+    let Some(editor) = super::bugreport::git_editor(Some(repo)) else {
+        eprintln!("error: Terminal is dumb, but EDITOR unset");
+        return None;
+    };
+    if editor == ":" {
+        return Some(Vec::new());
+    }
+    match super::bugreport::editor_command(&editor, path).status() {
+        Ok(s) if s.success() => {}
+        Ok(_) | Err(_) => {
+            eprintln!("error: there was a problem with the editor '{editor}'");
+            return None;
+        }
+    }
+    match std::fs::read(path) {
+        Ok(buf) => Some(buf),
+        Err(e) => {
+            eprintln!("error: could not read file '{}': {}", path.display(), os_msg(&e));
+            None
+        }
+    }
 }
 
 /// `builtin/notes.c:append_separator()` — the separator always ends a line, so
@@ -1175,7 +1335,8 @@ fn add(repo: &gix::Repository, notes_ref: &str, args: &[String]) -> Result<ExitC
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
     let (mut notes, parent) = load(repo, notes_ref)?;
 
-    if notes.map.contains_key(&object) {
+    let note = notes.map.get(&object).copied();
+    if note.is_some() {
         if o.force {
             eprintln!("Overwriting existing notes for object {object}");
         } else if !o.msgs.is_empty() {
@@ -1184,18 +1345,27 @@ fn add(repo: &gix::Repository, notes_ref: &str, args: &[String]) -> Result<ExitC
                  Use '-f' to overwrite existing notes"
             );
             return Ok(ExitCode::from(1));
+        } else {
+            // With neither `-f` nor a message git rewrites `argv[0]` to `edit`
+            // and re-enters `append_edit()`, which pre-fills the editor with the
+            // existing note and logs the change as `git notes edit`.
+            drop(_lock);
+            return edit(repo, notes_ref, args);
         }
-        // A bare `add` on an existing note with neither `-f` nor a message
-        // falls through to git's editor path (the dumb-terminal error below).
-    }
-    if o.msgs.is_empty() {
-        // git opens $EDITOR here; with no terminal it dies 128.
-        eprintln!("error: Terminal is dumb, but EDITOR unset");
-        eprintln!("fatal: please supply the note contents using either -m or -F option");
-        return Ok(ExitCode::from(128));
     }
 
-    let body = concat_messages(&o);
+    let body = match prepare_note_data(
+        repo,
+        &object,
+        concat_messages(&o),
+        !o.msgs.is_empty(),
+        o.use_editor,
+        note,
+        o.stripspace,
+    )? {
+        Ok(b) => b,
+        Err(code) => return Ok(code),
+    };
     if !body.is_empty() || o.allow_empty {
         let blob = repo.write_blob(&body)?.detach();
         notes.map.insert(object, blob);
@@ -1227,13 +1397,6 @@ fn append(repo: &gix::Repository, notes_ref: &str, args: &[String]) -> Result<Ex
         Ok(o) => o,
         Err(code) => return Ok(code),
     };
-    if o.msgs.is_empty() {
-        // git falls back to $EDITOR; with no terminal it dies 128.
-        eprintln!("error: Terminal is dumb, but EDITOR unset");
-        eprintln!("fatal: please supply the note contents using either -m or -F option");
-        return Ok(ExitCode::from(128));
-    }
-
     let spec = o.object.clone().unwrap_or_else(|| "HEAD".to_string());
     let object = match resolve(repo, &spec) {
         Ok(id) => id,
@@ -1249,7 +1412,20 @@ fn append(repo: &gix::Repository, notes_ref: &str, args: &[String]) -> Result<Ex
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
     let (mut notes, parent) = load(repo, notes_ref)?;
 
-    let mut body = concat_messages(&o);
+    // `append_edit()` passes no `old_note`: appending never pre-fills the editor
+    // with the previous note, it prepends it afterwards.
+    let mut body = match prepare_note_data(
+        repo,
+        &object,
+        concat_messages(&o),
+        !o.msgs.is_empty(),
+        o.use_editor,
+        None,
+        o.stripspace,
+    )? {
+        Ok(b) => b,
+        Err(code) => return Ok(code),
+    };
     if let Some(prev) = notes.map.get(&object) {
         // Previous contents first, then a separator when both sides are
         // non-empty; the joined result is not re-stripped.
@@ -1291,21 +1467,16 @@ fn append(repo: &gix::Repository, notes_ref: &str, args: &[String]) -> Result<Ex
 /// With any of `-m`/`-F`/`-c`/`-C` present git prints a deprecation notice and
 /// then behaves exactly like `add -f` (force implied, but without the
 /// "Overwriting existing notes" line). Its reflog messages say `git notes edit`.
-/// A bare `edit` with no message option is the editor path, which cannot run
-/// without an interactive terminal.
+/// A bare `edit` opens the editor on the existing note, if any.
 fn edit(repo: &gix::Repository, notes_ref: &str, args: &[String]) -> Result<ExitCode> {
     let o = match parse_msg_opts(repo, args, "edit")? {
         Ok(o) => o,
         Err(code) => return Ok(code),
     };
-    if o.msgs.is_empty() {
-        // git opens $EDITOR here; with no terminal it dies 128.
-        eprintln!("error: Terminal is dumb, but EDITOR unset");
-        eprintln!("fatal: please supply the note contents using either -m or -F option");
-        return Ok(ExitCode::from(128));
+    if !o.msgs.is_empty() {
+        eprintln!("The -m/-F/-c/-C options have been deprecated for the 'edit' subcommand.");
+        eprintln!("Please use 'git notes add -f -m/-F/-c/-C' instead.");
     }
-    eprintln!("The -m/-F/-c/-C options have been deprecated for the 'edit' subcommand.");
-    eprintln!("Please use 'git notes add -f -m/-F/-c/-C' instead.");
 
     let spec = o.object.clone().unwrap_or_else(|| "HEAD".to_string());
     let object = match resolve(repo, &spec) {
@@ -1322,7 +1493,19 @@ fn edit(repo: &gix::Repository, notes_ref: &str, args: &[String]) -> Result<Exit
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
     let (mut notes, parent) = load(repo, notes_ref)?;
 
-    let body = concat_messages(&o);
+    // `edit && note ? note : NULL` — re-editing pre-fills with the current note.
+    let body = match prepare_note_data(
+        repo,
+        &object,
+        concat_messages(&o),
+        !o.msgs.is_empty(),
+        o.use_editor,
+        notes.map.get(&object).copied(),
+        o.stripspace,
+    )? {
+        Ok(b) => b,
+        Err(code) => return Ok(code),
+    };
     if !body.is_empty() || o.allow_empty {
         let blob = repo.write_blob(&body)?.detach();
         notes.map.insert(object, blob);

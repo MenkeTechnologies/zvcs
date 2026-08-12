@@ -697,14 +697,16 @@ fn symbolic_head_missing_referent_then_update_referent() -> crate::Result {
 }
 
 #[test]
-/// Writing a peeled ref to which head points to doesn't update HEAD on the fly even though that might be what's would
-/// be needed to keep the reflog consistent
-fn write_reference_to_which_head_points_to_does_not_update_heads_reflog_even_though_it_should() -> crate::Result {
+/// Writing a peeled ref that HEAD points to also appends to HEAD's reflog, so the two logs stay
+/// consistent. `split_head_update()` (refs/files-backend.c) adds an extra `REF_LOG_ONLY` update for
+/// HEAD whenever the edit names the reference HEAD resolves to, carrying the same ids and message.
+fn write_reference_to_which_head_points_to_also_updates_heads_reflog() -> crate::Result {
     let (_keep, store) = store_writable("make_repo_for_reflog.sh")?;
     let head = store.find_loose("HEAD")?;
     let referent = head.target.to_ref().try_name().expect("symbolic ref").to_owned();
     let previous_head_reflog = reflog_lines(&store, "HEAD")?;
 
+    let old_id = hex_to_id("02a7a22d90d7c02fb494ed25551850b868e634f0");
     let new_id = hex_to_id("01dd4e2a978a9f5bd773dae6da7aa4a5ac1cdbbc");
     let edits = store
         .transaction()
@@ -727,38 +729,67 @@ fn write_reference_to_which_head_points_to_does_not_update_heads_reflog_even_tho
         )?
         .commit(committer().to_ref(&mut TimeBuf::default()))?;
 
-    assert_eq!(edits.len(), 1, "HEAD wasn't update");
+    // Two edits: the one the caller asked for, plus git's log-only mirror onto HEAD.
+    assert_eq!(edits.len(), 2, "HEAD was updated alongside its referent");
     assert_eq!(
         edits,
-        vec![RefEdit {
-            change: Change::Update {
-                log: LogChange {
-                    mode: RefLog::AndReference,
-                    force_create_reflog: false,
-                    message: "".into(),
+        vec![
+            RefEdit {
+                change: Change::Update {
+                    log: LogChange {
+                        mode: RefLog::AndReference,
+                        force_create_reflog: false,
+                        message: "".into(),
+                    },
+                    expected: PreviousValue::MustExistAndMatch(Target::Object(old_id)),
+                    new: Target::Object(new_id),
                 },
-                expected: PreviousValue::MustExistAndMatch(Target::Object(hex_to_id(
-                    "02a7a22d90d7c02fb494ed25551850b868e634f0"
-                ))),
-                new: Target::Object(new_id),
+                name: referent.as_bstr().try_into()?,
+                deref: false,
             },
-            name: referent.as_bstr().try_into()?,
-            deref: false,
-        }]
-    );
-    assert_eq!(
-        reflog_lines(&store, "HEAD")?,
-        previous_head_reflog,
-        "nothing changed in the heads reflog"
+            // `REF_LOG_ONLY | REF_NO_DEREF`: HEAD's log moves, HEAD itself keeps pointing at the
+            // branch, which is why the recorded previous value is still the symbolic one.
+            RefEdit {
+                change: Change::Update {
+                    log: LogChange {
+                        mode: RefLog::Only,
+                        force_create_reflog: false,
+                        message: "".into(),
+                    },
+                    expected: PreviousValue::MustExistAndMatch(Target::Symbolic(
+                        referent.as_bstr().try_into()?
+                    )),
+                    new: Target::Object(new_id),
+                },
+                name: "HEAD".try_into()?,
+                deref: false,
+            },
+        ]
     );
 
-    let expected_line = log_line(hex_to_id("02a7a22d90d7c02fb494ed25551850b868e634f0"), new_id, "");
+    let expected_line = log_line(old_id, new_id, "");
+    // `lock_ref_for_update()` copies `old_oid` from the parent lock onto the split update, so the
+    // HEAD entry reads exactly like the branch entry it mirrors.
+    let head_reflog = reflog_lines(&store, "HEAD")?;
+    assert_eq!(
+        head_reflog.len(),
+        previous_head_reflog.len() + 1,
+        "exactly one entry was appended to HEAD's reflog"
+    );
+    assert_eq!(head_reflog[..previous_head_reflog.len()], previous_head_reflog[..]);
+    assert_eq!(head_reflog.last().expect("the new line"), &expected_line);
+
     assert_eq!(
         reflog_lines(&store, &referent.to_string())?
             .last()
             .expect("at least one line"),
         &expected_line,
         "referent line matches the expected one"
+    );
+    // HEAD is untouched as a reference: only its log grew.
+    assert_eq!(
+        store.find_loose("HEAD")?.target.to_ref().try_name().expect("still symbolic"),
+        referent.as_ref()
     );
     Ok(())
 }
@@ -793,7 +824,36 @@ fn packed_refs_are_looked_up_when_checking_existing_values() -> crate::Result {
         )?
         .commit(committer().to_ref(&mut TimeBuf::default()))?;
 
-    assert_eq!(edits.len(), 1, "only one edit was performed in the loose refs store");
+    // `split_head_update()` (refs/files-backend.c) mirrors the edit onto HEAD because HEAD resolves
+    // to `refs/heads/main`. It checks the refname alone, so a packed referent is mirrored just like
+    // a loose one — verified against stock git 2.55.0, which appends to `.git/logs/HEAD` when
+    // `update-ref refs/heads/main` moves a packed checked-out branch.
+    assert_eq!(
+        edits.len(),
+        2,
+        "the edit in the loose refs store, plus git's log-only mirror onto HEAD"
+    );
+    assert_eq!(edits[1].name.as_bstr(), "HEAD");
+    assert!(
+        matches!(
+            edits[1].change,
+            Change::Update {
+                log: LogChange { mode: RefLog::Only, .. },
+                ..
+            }
+        ),
+        "the mirror only writes a reflog entry, it does not move HEAD"
+    );
+    assert_eq!(
+        reflog_lines(&store, "HEAD")?.last().expect("a HEAD entry"),
+        &log_line(old_id, new_id, "for pack"),
+        "the HEAD entry carries the same ids and message as the branch edit"
+    );
+    assert_eq!(
+        store.find_loose("HEAD")?.target.to_ref().try_name().expect("still symbolic").as_bstr(),
+        "refs/heads/main",
+        "HEAD itself is untouched"
+    );
 
     let packed = store.open_packed_buffer().unwrap().expect("packed refs is available");
     assert_eq!(

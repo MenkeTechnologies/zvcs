@@ -401,7 +401,7 @@ fn parse_int_arg(text: &str) -> std::result::Result<Option<i64>, ()> {
 /// Config is read only when inside a repository — the same scope the previous
 /// default honored — so a global-only `merge.conflictStyle` outside a repo
 /// keeps resolving to `merge` rather than being consulted (or validated) here.
-fn conflict_style_config(
+pub(super) fn conflict_style_config(
     repo: Option<&gix::Repository>,
 ) -> std::result::Result<ConflictStyle, ExitCode> {
     let Some(repo) = repo else {

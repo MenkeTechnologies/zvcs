@@ -953,6 +953,17 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     // leaves behind (loose objects stay loose, packs stay packs).
     if local_path_source && !no_local && filter.is_none() {
         adopt_local_objects(Path::new(url_str), &git_dir, hardlinks)?;
+    } else if gix::open(&git_dir)
+        .ok()
+        .and_then(|repo| repo.config_snapshot().boolean("pack.writeReverseIndex"))
+        .unwrap_or(true)
+    {
+        // A clone that really fetched received its pack through gitoxide, which
+        // writes no reverse index; git's `index-pack` writes one for every pack
+        // it produces unless `pack.writeReverseIndex` says otherwise. The adopted
+        // local objects above are exempt: they are the source's own pack files,
+        // carried across with whatever sidecars the source already had.
+        super::index_pack::write_missing_rev_indexes(&git_dir.join("objects").join("pack"));
     }
 
     // `write_remote_refs()` commits the remote-tracking refs through
@@ -960,6 +971,14 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     // has logs for `HEAD`, the checked-out branch and `refs/remotes/<remote>/HEAD`, and
     // nothing else. gitoxide logs every ref it writes, so the extra files are removed.
     remove_initial_remote_reflogs(&git_dir, origin.as_deref().unwrap_or("origin"));
+
+    // The tags of a `--single-branch` clone are written by `write_followtags()`,
+    // which runs *after* `write_remote_refs()` and outside its transaction, so
+    // they land as loose files while the mapped refs are packed. See
+    // [`unpack_followed_tags`] for why gitoxide cannot make that split itself.
+    if included_tags {
+        unpack_followed_tags(&git_dir)?;
+    }
 
     // `init_db()` creates `refs/heads` and `refs/tags` for every repository it
     // makes, clone included (`create_default_files()`, setup.c:2073). gitoxide
@@ -1292,6 +1311,86 @@ struct ConfigFixups<'a> {
 /// in-memory snapshot when it records `branch.<name>.*`, which would drop
 /// anything written to the file behind its back. The fetch and checkout still
 /// observe them, because they are also handed to gitoxide as in-memory overrides.
+/// Move `refs/tags/*` out of `packed-refs` and into loose ref files.
+///
+/// `update_remote_refs()` writes a single-branch clone's refs in two passes
+/// (clone.c:553-558):
+///
+/// ```c
+/// write_remote_refs(mapped_refs);
+/// if (option_single_branch && option_tags)
+///         write_followtags(refs, msg);
+/// ```
+///
+/// The first opens a `REF_TRANSACTION_FLAG_INITIAL` transaction, whose whole
+/// point is to write `packed-refs` in one shot. The second is a plain
+/// `refs_update_ref()` per tag, which writes an ordinary loose ref. The split is
+/// not cosmetic bookkeeping — it is why a `git clone --single-branch` leaves
+/// `refs/tags/v1` on disk while `refs/heads/main` is packed.
+///
+/// gitoxide has no equivalent split: `--single-branch` restricts which *branch*
+/// is mapped, and every ref the fetch produced — tags included — goes through
+/// the one transaction that writes `packed-refs`. Rather than reach into the
+/// fetch to split it, the two-pass result is reconstructed here, which lands the
+/// same bytes in the same files.
+///
+/// A tag that already has a loose file keeps it; only the `packed-refs` entry
+/// (and its `^peeled` line) is dropped, since the loose ref is the one git
+/// resolves anyway.
+fn unpack_followed_tags(git_dir: &Path) -> Result<()> {
+    let packed_path = git_dir.join("packed-refs");
+    let Ok(body) = std::fs::read_to_string(&packed_path) else {
+        return Ok(());
+    };
+
+    let mut kept = String::with_capacity(body.len());
+    let mut unpacked: Vec<(String, String)> = Vec::new();
+    // A `^<oid>` line belongs to the ref line above it, so it travels with it:
+    // dropped when that ref moves out, kept when it stays.
+    let mut dropping_peel = false;
+    for line in body.lines() {
+        if let Some(peeled) = line.strip_prefix('^') {
+            if dropping_peel {
+                // The peeled value is an accelerator for the packed store only;
+                // a loose ref file holds the tag object's id and nothing else.
+                let _ = peeled;
+                continue;
+            }
+            kept.push_str(line);
+            kept.push('\n');
+            continue;
+        }
+        dropping_peel = false;
+        match line.split_once(' ') {
+            Some((oid, name)) if name.starts_with("refs/tags/") => {
+                unpacked.push((name.to_string(), oid.to_string()));
+                dropping_peel = true;
+            }
+            _ => {
+                kept.push_str(line);
+                kept.push('\n');
+            }
+        }
+    }
+
+    if unpacked.is_empty() {
+        return Ok(());
+    }
+
+    for (name, oid) in &unpacked {
+        let path = git_dir.join(name);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("could not create {}", parent.display()))?;
+        }
+        std::fs::write(&path, format!("{oid}\n"))
+            .with_context(|| format!("could not write {}", path.display()))?;
+    }
+    std::fs::write(&packed_path, kept)
+        .with_context(|| format!("could not write {}", packed_path.display()))?;
+    Ok(())
+}
+
 /// The two ref directories every git repository has, whether or not anything was
 /// ever written into them. Missing them is not cosmetic: `is_git_directory()`
 /// tests for `refs`, so a bare clone without it is not a repository as far as

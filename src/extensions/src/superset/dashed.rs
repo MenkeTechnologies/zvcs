@@ -83,17 +83,22 @@ pub fn zdashed(args: &[String]) -> Result<ExitCode> {
     let stats = install_links(&dir, &target)?;
 
     // Also materialize the superset man pages so `man git-<verb>` resolves once
-    // `~/.zvcs/man` is on MANPATH; `git help <zverb>` works regardless.
+    // `~/.zvcs/man` is on MANPATH; `git help <zverb>` works regardless. The HTML
+    // set goes down beside them, where `git --html-path` reports and
+    // `git help -w <cmd>` looks.
     let man = crate::superset::manpage::install_all().unwrap_or(0);
     let man_dir = crate::superset::manpage::man_dir().join("man1");
+    let html = crate::superset::htmldoc::install_all().unwrap_or(0);
+    let html_dir = crate::superset::htmldoc::html_dir();
 
     println!(
-        "installed {} git-<verb> link(s) in {} ({} already current, {} skipped); {man} man page(s) in {}",
+        "installed {} git-<verb> link(s) in {} ({} already current, {} skipped); {man} man page(s) in {}; {html} HTML page(s) in {}",
         stats.created,
         dir.display(),
         stats.current,
         stats.skipped,
-        man_dir.display()
+        man_dir.display(),
+        html_dir.display()
     );
     Ok(ExitCode::SUCCESS)
 }

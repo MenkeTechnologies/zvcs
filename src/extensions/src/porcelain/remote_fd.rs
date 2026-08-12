@@ -80,21 +80,26 @@ const BUFFERSIZE: usize = 65536;
 
 /// `git remote-fd` — see the module docs for the covered behaviour.
 pub fn remote_fd(args: &[String]) -> Result<ExitCode> {
-    // `args` mirrors C's `argv`: argv[0] is the command, argv[1] the remote name
-    // (unused — the fd pair carries everything), argv[2] the address.
+    // The dispatcher hands over the arguments that FOLLOW the verb; C's `main`
+    // also sees the command name. `argv` restores C's shape: argv[0] is the
+    // command, argv[1] the remote name (unused — the fd pair carries
+    // everything), argv[2] the address.
+    let argv: Vec<&str> = std::iter::once("git-remote-fd")
+        .chain(args.iter().map(String::as_str))
+        .collect();
 
     // `show_usage_if_asked()`: a lone `-h` prints the usage on stdout, exit 129.
-    if args.len() == 2 && args[1] == "-h" {
+    if argv.len() == 2 && argv[1] == "-h" {
         print!("{USAGE}");
         std::io::stdout().flush()?;
         return Ok(ExitCode::from(129));
     }
-    if args.len() != 3 {
+    if argv.len() != 3 {
         eprint!("{USAGE}");
         return Ok(ExitCode::from(129));
     }
 
-    let url = args[2].as_bytes();
+    let url = argv[2].as_bytes();
 
     // input_fd = (int)strtoul(argv[2], &end, 10);
     let (value, end) = strtoul(url);

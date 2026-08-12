@@ -1335,6 +1335,31 @@ fn guard_octopus(
     Ok(Some(ExitCode::from(2)))
 }
 
+/// [`guard_octopus`] for the three-tree fold, which is what a non-fast-forward
+/// head actually goes through: `git read-tree -u -m --aggressive $common $MRT
+/// $SHA1`.
+///
+/// It runs *before* the merge rather than over its result because the script
+/// only reaches `git write-tree` once `read-tree` has agreed — a head refused
+/// here must therefore leave no merged tree behind in the object database, which
+/// a check on the merged tree cannot arrange.
+fn guard_octopus_three_way(
+    repo: &gix::Repository,
+    base_tree: ObjectId,
+    ours_tree: ObjectId,
+    theirs_tree: ObjectId,
+    index: &gix::index::File,
+) -> Result<Option<ExitCode>> {
+    let clobber =
+        crate::merge_guard::verify_three_way(repo, base_tree, ours_tree, theirs_tree, index)?;
+    if clobber.is_empty() {
+        return Ok(None);
+    }
+    clobber.report_plumbing();
+    eprintln!("Merge with strategy octopus failed.");
+    Ok(Some(ExitCode::from(2)))
+}
+
 /// The clean-merge finish shared by the diverged, `--no-ff`, and `-s ours` paths:
 /// squashes, stops before committing, or writes the merge commit, honouring
 /// `--signoff`, `--cleanup`, `--no-verify` and `--quiet`. `ORIG_HEAD` was
@@ -1679,6 +1704,14 @@ fn do_octopus(
             println!("Trying simple merge with {spec}");
         }
         let base_tree = repo.find_object(common)?.peel_to_tree()?.id;
+        // `git read-tree -u -m --aggressive $common $MRT $SHA1 || exit 2`, which
+        // the script runs before the `git write-tree` that follows it. Refusing
+        // here rather than over the merged tree is what keeps a failed octopus
+        // from leaving that tree in the object database.
+        if let Some(code) = guard_octopus_three_way(repo, base_tree, mrt, head_tree, &cur_index)? {
+            end_autostash(repo, stash, false)?;
+            return Ok(code);
+        }
         // `merge_ort_internal()`'s ancestor name again — see the recursive path
         // above. Stock's octopus never reaches a rendering that shows it: it
         // resolves unmerged paths through `git merge-index -o git-merge-one-file`,

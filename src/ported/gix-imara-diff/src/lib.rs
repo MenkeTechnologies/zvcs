@@ -161,6 +161,7 @@ pub mod compact;
 mod histogram;
 mod intern;
 mod myers;
+mod patience;
 mod postprocess;
 mod slider_heuristic;
 pub mod sources;
@@ -202,6 +203,15 @@ pub enum Algorithm {
     /// be used instead.
     #[default]
     Histogram,
+    /// The `patience` diff algorithm itself, ported from git's `xdiff/xpatience.c`.
+    ///
+    /// It anchors on the lines that are unique in *both* files, takes the longest such
+    /// run whose order agrees on the two sides, and recurses into the gaps between those
+    /// anchors; a gap with no unique pairs left is handed to `Myers`. That makes it
+    /// slower than `Histogram`, which approximates the same idea with a histogram, but
+    /// it is the algorithm `git diff --patience` names and so the only one that
+    /// reproduces its output.
+    Patience,
     /// An implementation of the linear space variant of
     /// [Myers  `O((N+M)D)` algorithm](http://www.xmailserver.org/diff2.pdf).
     /// The algorithm is enhanced with preprocessing that removes
@@ -285,6 +295,7 @@ impl Diff {
         let added = &mut self.added[range];
         match algorithm {
             Algorithm::Histogram => histogram::diff(before, after, removed, added, num_tokens),
+            Algorithm::Patience => patience::diff(before, after, removed, added),
             Algorithm::Myers => myers::diff(before, after, removed, added, false, untrimmed_before, untrimmed_after),
             Algorithm::MyersMinimal => {
                 myers::diff(before, after, removed, added, true, untrimmed_before, untrimmed_after)

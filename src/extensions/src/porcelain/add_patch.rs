@@ -99,8 +99,13 @@ struct PatchMode {
     /// of the two accepts the patch.
     apply_for_checkout: bool,
     /// Prompts for `PROMPT_MODE_CHANGE`, `PROMPT_DELETION`, `PROMPT_ADDITION`,
-    /// `PROMPT_HUNK`. Each carries two `%s`: the `(was: y)` marker and the
-    /// context-dependent extra keys.
+    /// `PROMPT_HUNK`.
+    ///
+    /// Rendered with `(decision, keys)` — the `(was: y)` marker and the
+    /// context-dependent extra keys — always in that order, because git's
+    /// `printf` passes both whatever the string does with them. A mode whose
+    /// string has only one `%s` therefore shows the marker and silently drops
+    /// the key list; [`PATCH_MODE_SPLIT`] is git's one such mode.
     prompt_mode: [&'static str; 4],
     /// The trailing line of the manual-edit instructions.
     edit_hunk_hint: &'static str,
@@ -310,6 +315,38 @@ static PATCH_MODE_WORKTREE_NOTHEAD: PatchMode = PatchMode {
                       q - quit; do not apply this hunk or any of the remaining ones\n\
                       a - apply this hunk and all later hunks in the file\n\
                       d - do not apply this hunk or any of the later hunks in the file\n",
+};
+
+/// The mode `run_add_p_index` builds on its stack, for `git history split`.
+///
+/// Two things separate it from [`PATCH_MODE_ADD`], which it otherwise copies.
+/// Its diff is `diff-tree -r <parent tree> <commit>` rather than `diff-files`
+/// (the tree oid is a run-time value, supplied through [`State::diff_extra`]).
+/// And its prompts carry a single `%s` where every other mode carries two, so
+/// the `(was: …)` marker is all that is substituted and the key list never
+/// reaches the screen — `[y,n,q,a,d,?]` even though `p`/`P` are live. That is
+/// git's own output, not a simplification: its `printf` passes both arguments
+/// unconditionally and C drops the one the format has no slot for.
+static PATCH_MODE_SPLIT: PatchMode = PatchMode {
+    diff_cmd: &["diff-tree", "-r"],
+    apply_args: &["--cached"],
+    apply_check_args: &["--cached"],
+    is_reverse: false,
+    index_only: true,
+    apply_for_checkout: false,
+    prompt_mode: [
+        "Stage mode change [y,n,q,a,d%s,?]? ",
+        "Stage deletion [y,n,q,a,d%s,?]? ",
+        "Stage addition [y,n,q,a,d%s,?]? ",
+        "Stage this hunk [y,n,q,a,d%s,?]? ",
+    ],
+    edit_hunk_hint: "If the patch applies cleanly, the edited hunk \
+                     will immediately be marked for staging.",
+    help_patch_text: "y - stage this hunk\n\
+                      n - do not stage this hunk\n\
+                      q - quit; do not stage this hunk or any of the remaining ones\n\
+                      a - stage this hunk and all later hunks in the file\n\
+                      d - do not stage this hunk or any of the later hunks in the file\n",
 };
 
 /// The remainder of the `?` help — lines shown only when the corresponding key
@@ -573,6 +610,17 @@ struct State<'a> {
     /// Set once the single-key reader has fallen back to line input, so the
     /// warning is printed at most once (git's `warning_displayed`).
     single_key_warned: bool,
+    /// Arguments spliced in directly after `mode.diff_cmd`.
+    ///
+    /// `run_add_p_index` finishes its `diff_cmd` at run time with the parent
+    /// tree's oid; a `&'static` table cannot hold that, so it arrives here and
+    /// `parse_diff` appends it in the same position.
+    diff_extra: Vec<String>,
+    /// git's `s->index_file`: the index every child of this selector operates
+    /// on, exported to each of them as `GIT_INDEX_FILE` by
+    /// `setup_child_process`. `None` leaves the children on the repository's own
+    /// index, which is what `run_add_p` does.
+    index_file: Option<std::path::PathBuf>,
 }
 
 // ---------------------------------------------------------------------------
@@ -657,11 +705,30 @@ pub(super) fn run_git(
     capture: bool,
     dir: Option<&std::path::Path>,
 ) -> std::io::Result<(bool, Vec<u8>)> {
+    run_git_in_index(args, input, capture, dir, None)
+}
+
+/// [`run_git`] with git's `setup_child_process` environment: `GIT_INDEX_FILE`
+/// pointing at the index this selector is staging into.
+///
+/// git sets it on *every* child it spawns, the diff children included, so a
+/// selector running against a scratch index never reads or writes the
+/// repository's own. `None` leaves the environment alone.
+fn run_git_in_index(
+    args: &[String],
+    input: Option<&[u8]>,
+    capture: bool,
+    dir: Option<&std::path::Path>,
+    index_file: Option<&std::path::Path>,
+) -> std::io::Result<(bool, Vec<u8>)> {
     let exe = std::env::current_exe()?;
     let mut cmd = Command::new(exe);
     cmd.args(args);
     if let Some(d) = dir {
         cmd.current_dir(d);
+    }
+    if let Some(index) = index_file {
+        cmd.env("GIT_INDEX_FILE", index);
     }
     cmd.stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() });
     cmd.stdout(if capture { Stdio::piped() } else { Stdio::inherit() });
@@ -816,6 +883,8 @@ impl State<'_> {
     /// [`FileDiff`]s and [`Hunk`]s.
     fn parse_diff(&mut self, pathspecs: &[String]) -> Result<()> {
         let mut args: Vec<String> = self.mode.diff_cmd.iter().map(|s| s.to_string()).collect();
+        // The run-time tail of `diff_cmd` — `run_add_p_index`'s parent tree oid.
+        args.extend(self.diff_extra.iter().cloned());
         if self.cfg.context != -1 {
             args.push(format!("--unified={}", self.cfg.context));
         }
@@ -842,7 +911,7 @@ impl State<'_> {
         args.push("--".into());
         args.extend(pathspecs.iter().cloned());
 
-        let (ok, plain) = run_git(&args, None, true, None)?;
+        let (ok, plain) = run_git_in_index(&args, None, true, None, self.index_file.as_deref())?;
         if !ok {
             crate::git_fatal!("could not parse diff");
         }
@@ -859,7 +928,8 @@ impl State<'_> {
         if self.cfg.use_color_diff {
             let mut cargs = args.clone();
             cargs[color_arg_index] = "--color".into();
-            let (ok, colored) = run_git(&cargs, None, true, None)?;
+            let (ok, colored) =
+                run_git_in_index(&cargs, None, true, None, self.index_file.as_deref())?;
             if !ok {
                 crate::git_fatal!("could not parse colored diff");
             }
@@ -1525,7 +1595,10 @@ impl State<'_> {
         let patch = self.reassemble_patch(file_idx, true);
         let mut args = vec!["apply".to_string(), "--check".to_string()];
         args.extend(self.mode.apply_check_args.iter().map(|s| s.to_string()));
-        matches!(run_git(&args, Some(&patch), false, self.workdir()), Ok((true, _)))
+        matches!(
+            run_git_in_index(&args, Some(&patch), false, self.workdir(), self.index_file.as_deref()),
+            Ok((true, _))
+        )
     }
 
     /// git's `edit_hunk_loop`: edit, validate, re-offer. `Ok(true)` means the
@@ -1683,21 +1756,26 @@ impl State<'_> {
             v
         };
         let dir = self.repo.workdir().map(|p| p.to_owned());
+        let index = self.index_file.clone();
         let check = |extra: &[&str]| {
-            matches!(run_git(&argv(extra), Some(diff), false, dir.as_deref()), Ok((true, _)))
+            matches!(
+                run_git_in_index(&argv(extra), Some(diff), false, dir.as_deref(), index.as_deref()),
+                Ok((true, _))
+            )
         };
         let applies_index = check(&["--cached", "--check"]);
         let applies_worktree = check(&["--check"]);
 
         if applies_worktree && applies_index {
-            let _ = run_git(&argv(&["--cached"]), Some(diff), false, dir.as_deref());
-            let _ = run_git(&argv(&[]), Some(diff), false, dir.as_deref());
+            let _ =
+                run_git_in_index(&argv(&["--cached"]), Some(diff), false, dir.as_deref(), index.as_deref());
+            let _ = run_git_in_index(&argv(&[]), Some(diff), false, dir.as_deref(), index.as_deref());
             return;
         }
         if !applies_index {
             self.err("The selected hunks do not apply to the index!");
             if self.prompt_yesno("Apply them to the worktree anyway? ") {
-                let _ = run_git(&argv(&[]), Some(diff), false, dir.as_deref());
+                let _ = run_git_in_index(&argv(&[]), Some(diff), false, dir.as_deref(), index.as_deref());
                 return;
             }
             self.err("Nothing was applied.\n");
@@ -1722,7 +1800,11 @@ impl State<'_> {
             let mut args = vec!["apply".to_string()];
             args.extend(self.mode.apply_args.iter().map(|s| s.to_string()));
             let dir = self.repo.workdir().map(|p| p.to_owned());
-            if !matches!(run_git(&args, Some(&patch), false, dir.as_deref()), Ok((true, _))) {
+            let index = self.index_file.as_deref();
+            if !matches!(
+                run_git_in_index(&args, Some(&patch), false, dir.as_deref(), index),
+                Ok((true, _))
+            ) {
                 eprintln!("error: 'git apply' failed");
             }
         }
@@ -2452,7 +2534,7 @@ pub(crate) fn run_status(
             return Ok(128);
         }
     };
-    let mut state = State {
+    let state = State {
         repo,
         cfg,
         mode: select_mode(mode, revision),
@@ -2463,8 +2545,71 @@ pub(crate) fn run_status(
         colored: Vec::new(),
         files: Vec::new(),
         single_key_warned: false,
+        diff_extra: Vec::new(),
+        index_file: None,
+    };
+    run_common(state, opts, pathspecs)
+}
+
+/// git's `run_add_p_index`: the same selector over a caller-supplied index file,
+/// diffing `revision`'s parent tree against `revision` itself.
+///
+/// `git history split` is the only caller. The index at `index_file` is what the
+/// `apply --cached` children stage into (via `GIT_INDEX_FILE`), so the selection
+/// lands there and the repository's own index is never touched; reading the tree
+/// back out of it is the caller's job.
+pub(crate) fn run_index(
+    repo: &gix::Repository,
+    index_file: &std::path::Path,
+    revision: &str,
+    opts: Options,
+    pathspecs: &[String],
+) -> Result<u8> {
+    let cfg = match Config::init(repo, &opts) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("fatal: {e}");
+            return Ok(128);
+        }
+    };
+    let mut state = State {
+        repo,
+        cfg,
+        mode: &PATCH_MODE_SPLIT,
+        revision: Some(revision.to_string()),
+        buf: Vec::new(),
+        answer: Vec::new(),
+        plain: Vec::new(),
+        colored: Vec::new(),
+        files: Vec::new(),
+        single_key_warned: false,
+        diff_extra: Vec::new(),
+        index_file: Some(index_file.to_path_buf()),
     };
 
+    // `lookup_commit_reference_by_name(revision)`, then the parent's tree — or
+    // the empty tree for a root commit — as the left side of the diff.
+    let commit = repo
+        .rev_parse_single(revision)
+        .ok()
+        .and_then(|id| id.object().ok())
+        .and_then(|obj| obj.peel_to_commit().ok());
+    let Some(commit) = commit else {
+        state.err("Revision does not refer to a commit");
+        return Ok(1);
+    };
+    let parent_tree = match commit.parent_ids().next() {
+        Some(p) => repo.find_commit(p.detach())?.tree_id()?.detach(),
+        None => repo.object_hash().empty_tree(),
+    };
+    state.diff_extra = vec![parent_tree.to_string()];
+
+    run_common(state, opts, pathspecs)
+}
+
+/// git's `run_add_p_common`: parse the diff, walk the files, then report the
+/// two whole-run diagnostics.
+fn run_common(mut state: State<'_>, opts: Options, pathspecs: &[String]) -> Result<u8> {
     if let Err(e) = state.parse_diff(pathspecs) {
         // An empty message means the diagnostic was already written where git's
         // own `error()` writes it (see `mismatched_output`).

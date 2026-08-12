@@ -162,6 +162,9 @@ struct Render {
     raw_abbrev: usize,
     /// `--full-index`: emit the full object name on the patch `index` line.
     full_index: bool,
+    /// `--binary`: emit a `GIT binary patch` payload for a binary pair, and widen
+    /// that pair's `index` line to full object names.
+    binary: bool,
     /// `-z`: terminate `--raw`/`--name-only`/`--name-status` records with NUL and
     /// suppress path C-quoting.
     z: bool,
@@ -339,6 +342,11 @@ struct Analysis {
     /// Computed only when `--dirstat` asked for it, since it costs a second pass
     /// over both images — and for a binary pair, a read of both blobs.
     damage: u64,
+    /// The pre- and post-images of a binary pair, kept only when `--binary` will
+    /// turn them into a `GIT binary patch`. The blob pipeline withholds the data
+    /// for a binary pair, so this is a deliberate second read and is skipped
+    /// whenever the payload is not going to be emitted.
+    images: Option<(Vec<u8>, Vec<u8>)>,
 }
 
 // ---------------------------------------------------------------------------
@@ -362,6 +370,7 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     let mut reverse = false;
     let mut z = false;
     let mut full_index = false;
+    let mut binary = false;
     let mut want_exit_code = false;
     let mut quiet = false;
     // `--relative[=<path>]`: the prefix stripped from every reported path (with a
@@ -532,6 +541,9 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     let mut revs: Vec<String> = Vec::new();
     let mut paths: Vec<String> = Vec::new();
     let mut in_rev_region = true;
+    // The first argument git would not resolve to an option, held until the whole command
+    // line has been read. See [`invalid_option`].
+    let mut invalid_arg: Option<String> = None;
     // `--ws-error-highlight <kind>`, `--color-moved-ws <modes>` and
     // `--word-diff-regex <re>` all spell their value as the next argument when it is
     // not glued on with `=`; parse-options consumes it before anything else, `--`
@@ -641,6 +653,7 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                 want_exit_code = true;
             }
             "--full-index" => full_index = true,
+            "--binary" => binary = true,
             "--abbrev" => {
                 abbrev = 7;
                 abbrev_explicit = true;
@@ -660,14 +673,12 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                 src_prefix = b"a/".to_vec();
                 dst_prefix = b"b/".to_vec();
             }
-            // Diff-algorithm selection. imara-diff has no `patience` variant, so
-            // only the byte-reproducible algorithms are honored.
+            // Diff-algorithm selection; the last flag on the command line wins.
             "--minimal" => algorithm = Some(gix::diff::blob::Algorithm::MyersMinimal),
             "--myers" => algorithm = Some(gix::diff::blob::Algorithm::Myers),
             "--histogram" => algorithm = Some(gix::diff::blob::Algorithm::Histogram),
-            // `--patience` aliases `--diff-algorithm=patience`; imara-diff has no
-            // patience variant, so it bails identically to that flag.
-            "--patience" => crate::git_fatal!("diff algorithm {:?} is not available", "patience"),
+            // `--patience` aliases `--diff-algorithm=patience`.
+            "--patience" => algorithm = Some(gix::diff::blob::Algorithm::Patience),
             // Accepted here rather than implemented.
             //
             // Rename detection is *not* in this list any more — `-M`, `-C`,
@@ -784,6 +795,7 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                     "myers" | "default" => algorithm = Some(gix::diff::blob::Algorithm::Myers),
                     "minimal" => algorithm = Some(gix::diff::blob::Algorithm::MyersMinimal),
                     "histogram" => algorithm = Some(gix::diff::blob::Algorithm::Histogram),
+                    "patience" => algorithm = Some(gix::diff::blob::Algorithm::Patience),
                     other => crate::git_fatal!("diff algorithm {other:?} is not available"),
                 }
             }
@@ -904,6 +916,14 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                     }
                 }
             }
+            // A name git itself does not resolve is its usage error, not a gap here. The
+            // report is deferred to after the loop because which of `cmd_diff`'s four
+            // dispatch targets receives the leftover — and so whether the `error:` line
+            // precedes the usage block — depends on whether a revision turns up, which
+            // may still be later in argv (`git diff --no-such-flag HEAD`).
+            s if s.starts_with('-') && !is_known_option(s) => {
+                invalid_arg.get_or_insert_with(|| s.to_owned());
+            }
             s if s.starts_with('-') => bail!("unsupported option {s:?}"),
             s => {
                 // A positional is a revision while we are still in the revision
@@ -957,20 +977,21 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
         eprintln!("error: {}", diff_color::missing_value(&flag));
         return Ok(ExitCode::from(129));
     }
+    // `cmd_diff`'s dispatch (builtin/diff.c:611): with no tree-ish pending the leftover
+    // reaches `builtin_diff_files()`, which names it; with one it reaches
+    // `builtin_diff_index()`, which prints the usage block alone. `--cached` counts as a
+    // pending tree-ish because `cmd_diff` supplies HEAD for it.
+    if let Some(arg) = &invalid_arg {
+        return Ok(invalid_option(arg, !revs.is_empty() || cached));
+    }
     paths.extend(trailing_paths);
 
     // Apply the `diff.algorithm` default only when no `--minimal`/`--histogram`/
-    // `--diff-algorithm=` flag set the algorithm on the command line (git's
-    // precedence). A `patience` default is git-valid but has no imara-diff
-    // equivalent, so it bails exactly like `--diff-algorithm=patience` — but only
-    // here, where it would actually be used, so an overriding flag is honored.
+    // `--patience`/`--diff-algorithm=` flag set the algorithm on the command line
+    // (git's precedence).
     if algorithm.is_none() {
-        match config_algorithm {
-            Some(ConfigAlgorithm::Use(a)) => algorithm = Some(a),
-            Some(ConfigAlgorithm::Patience) => {
-                crate::git_fatal!("diff algorithm {:?} is not available", "patience")
-            }
-            None => {}
+        if let Some(ConfigAlgorithm::Use(a)) = config_algorithm {
+            algorithm = Some(a);
         }
     }
 
@@ -1172,6 +1193,9 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
             algorithm,
             worktree_mode,
             want_dirstat && !dirstat.by_line && !dirstat.by_file,
+            // Only a rendered patch carries the payload, so a `--stat`-only run with
+            // `--binary` reads nothing extra.
+            binary && want_patch,
             func_context,
         )?;
     }
@@ -1187,6 +1211,7 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
         raw_abbrev: raw_abbrev.unwrap_or(abbrev),
         abbrev,
         full_index,
+        binary,
         z,
         src_prefix,
         dst_prefix,
@@ -2160,11 +2185,188 @@ fn looks_like_range(tok: &str) -> bool {
     !tok.starts_with('.') && !tok.contains('/')
 }
 
-/// A validated `diff.algorithm` config value: a renderable algorithm, or the
-/// git-valid-but-unrenderable `patience`.
+/// Every option name stock `git diff` resolves — the union of what `setup_revisions()`
+/// and `diff_opt_parse()` consume plus the handful `cmd_diff` dispatches on. A name
+/// missing from this table is one git itself rejects, which is the only case that may
+/// take the `invalid option` path; anything present here that this port has not
+/// implemented keeps saying so, rather than blaming git for the gap.
+///
+/// Established by running every candidate name through stock git 2.55.0 and keeping
+/// those it does not answer with `error: invalid option:`.
+const KNOWN_LONG: &[&str] = &[
+    "--abbrev",
+    "--abbrev-commit",
+    "--all",
+    "--anchored",
+    "--base",
+    "--binary",
+    "--bisect",
+    "--branches",
+    "--break-rewrites",
+    "--cached",
+    "--cc",
+    "--check",
+    "--children",
+    "--color",
+    "--color-moved",
+    "--color-moved-ws",
+    "--color-words",
+    "--compact-summary",
+    "--count",
+    "--cumulative",
+    "--date-order",
+    "--default-prefix",
+    "--diff-algorithm",
+    "--diff-filter",
+    "--diff-merges",
+    "--dirstat",
+    "--dirstat-by-file",
+    "--dst-prefix",
+    "--exclude-hidden",
+    "--exit-code",
+    "--ext-diff",
+    "--find-copies",
+    "--find-copies-harder",
+    "--find-object",
+    "--find-renames",
+    "--follow",
+    "--full-index",
+    "--function-context",
+    "--histogram",
+    "--ignore-all-space",
+    "--ignore-blank-lines",
+    "--ignore-cr-at-eol",
+    "--ignore-matching-lines",
+    "--ignore-space-at-eol",
+    "--ignore-space-change",
+    "--ignore-submodules",
+    "--indent-heuristic",
+    "--inter-hunk-context",
+    "--irreversible-delete",
+    "--ita-invisible-in-index",
+    "--ita-visible-in-index",
+    "--left-only",
+    "--left-right",
+    "--line-prefix",
+    "--max-age",
+    "--max-count",
+    "--max-depth",
+    "--min-age",
+    "--minimal",
+    "--name-only",
+    "--name-status",
+    "--no-abbrev",
+    "--no-color",
+    "--no-color-moved",
+    "--no-color-moved-ws",
+    "--no-compact-summary",
+    "--no-diff-merges",
+    "--no-exit-code",
+    "--no-ext-diff",
+    "--no-find-copies-harder",
+    "--no-follow",
+    "--no-full-index",
+    "--no-function-context",
+    "--no-ignore-matching-lines",
+    "--no-indent-heuristic",
+    "--no-index",
+    "--no-max-parents",
+    "--no-merges",
+    "--no-min-parents",
+    "--no-notes",
+    "--no-patch",
+    "--no-prefix",
+    "--no-quiet",
+    "--no-relative",
+    "--no-rename-empty",
+    "--no-renames",
+    "--no-text",
+    "--no-textconv",
+    "--notes",
+    "--numstat",
+    "--ours",
+    "--output",
+    "--output-indicator-context",
+    "--output-indicator-new",
+    "--output-indicator-old",
+    "--parents",
+    "--patch",
+    "--patch-with-raw",
+    "--patch-with-stat",
+    "--patience",
+    "--pickaxe-all",
+    "--pickaxe-regex",
+    "--quiet",
+    "--raw",
+    "--relative",
+    "--remerge-diff",
+    "--remotes",
+    "--remove-empty",
+    "--rename-empty",
+    "--reverse",
+    "--right-only",
+    "--rotate-to",
+    "--shortstat",
+    "--skip-to",
+    "--sparse",
+    "--src-prefix",
+    "--staged",
+    "--stat",
+    "--stat-count",
+    "--stat-graph-width",
+    "--stat-name-width",
+    "--stat-width",
+    "--stdin",
+    "--summary",
+    "--tags",
+    "--text",
+    "--textconv",
+    "--theirs",
+    "--topo-order",
+    "--unified",
+    "--unpacked",
+    "--word-diff",
+    "--word-diff-regex",
+    "--ws-error-highlight",
+];
+
+/// The short options the same probe found stock `git diff` accepts.
+const KNOWN_SHORT: &[u8] = b"abcghilmnpqrstuvwzBCDEFGIMOPRSUWX0123";
+
+/// Whether stock `git diff` resolves `arg` to an option at all.
+///
+/// A long option is looked up without its `=<value>`; a short option carries its value
+/// attached (`-S<string>`, `-U3`), so only the letter is looked up.
+fn is_known_option(arg: &str) -> bool {
+    match arg.starts_with("--") {
+        true => KNOWN_LONG.contains(&arg.split_once('=').map_or(arg, |(n, _)| n)),
+        false => arg.as_bytes().get(1).is_some_and(|c| KNOWN_SHORT.contains(c)),
+    }
+}
+
+/// `builtin_diff_files()` (builtin/diff.c:267) reporting an argument no part of
+/// `setup_revisions()` claimed:
+///
+/// ```text
+/// error(_("invalid option: %s"), argv[1]);
+/// usage(builtin_diff_usage);
+/// ```
+///
+/// The other three dispatch targets — `builtin_diff_index()` (diff.c:150),
+/// `builtin_diff_tree()` (diff.c:187) and `builtin_diff_combined()` (diff.c:220) — reach
+/// the same leftover through a bare `usage(builtin_diff_usage)` with no `error()` ahead
+/// of it, so the message appears only when no revision was given. Both exit 129, since
+/// `usage()` is what ends the process either way.
+fn invalid_option(arg: &str, have_revision: bool) -> ExitCode {
+    if !have_revision {
+        eprintln!("error: invalid option: {arg}");
+    }
+    usage_error()
+}
+
+/// A validated `diff.algorithm` config value.
 enum ConfigAlgorithm {
     Use(gix::diff::blob::Algorithm),
-    Patience,
 }
 
 /// Parse a `diff.algorithm` config value the way git's config loader does:
@@ -2172,13 +2374,13 @@ enum ConfigAlgorithm {
 /// `patience`. Any other name is a hard config error (git exits 128) — rendered
 /// here as the same "not available" bail the `--diff-algorithm=` flag uses.
 fn parse_config_algorithm(name: &gix::bstr::BStr) -> Result<ConfigAlgorithm> {
-    use gix::diff::blob::Algorithm::{Histogram, Myers, MyersMinimal};
+    use gix::diff::blob::Algorithm::{Histogram, Myers, MyersMinimal, Patience};
     let lower = name.to_ascii_lowercase();
     Ok(match lower.as_slice() {
         b"myers" | b"default" => ConfigAlgorithm::Use(Myers),
         b"minimal" => ConfigAlgorithm::Use(MyersMinimal),
         b"histogram" => ConfigAlgorithm::Use(Histogram),
-        b"patience" => ConfigAlgorithm::Patience,
+        b"patience" => ConfigAlgorithm::Use(Patience),
         _ => crate::git_fatal!("diff algorithm {:?} is not available", name.to_str_lossy()),
     })
 }
@@ -2373,6 +2575,9 @@ fn patch_render(repo: &gix::Repository, opts: &PatchOpts) -> Render {
         // This renderer only produces patches, so the raw width never applies.
         raw_abbrev: crate::abbrev::configured_abbrev(repo, hash_kind.len_in_hex()),
         full_index: opts.full_index,
+        // The history commands do not parse `--binary` yet, so a binary pair there
+        // still renders as `Binary files … differ`, exactly as before.
+        binary: false,
         z: false,
         src_prefix: opts.src_prefix.clone(),
         dst_prefix: opts.dst_prefix.clone(),
@@ -2621,6 +2826,7 @@ fn commit_patch_with(
             None,
             None,
             false,
+            r.binary,
             opts.func_context,
         )?;
         render_patch(&mut out, repo, delta, &an, opts.ctx, r)?;
@@ -2668,6 +2874,7 @@ pub(crate) fn line_range_patch(
             None,
             Some(ranges),
             false,
+            r.binary,
             false,
         )?;
         render_patch(&mut out, repo, &delta, &an, ctx, &r)?;
@@ -2732,6 +2939,8 @@ fn analyze_all(
     worktree_mode: bool,
     // Whether `--dirstat` will need each pair's content damage.
     want_dirstat: bool,
+    // Whether `--binary` will need each binary pair's two images.
+    want_binary: bool,
     // `-W`: emit hunks grown to enclosing-function boundaries.
     func_context: bool,
 ) -> Result<Vec<Analysis>> {
@@ -2757,6 +2966,7 @@ fn analyze_all(
                     algorithm,
                     None,
                     want_dirstat,
+                    want_binary,
                     func_context,
                 )
             })
@@ -2800,6 +3010,7 @@ fn analyze_all(
                         algorithm,
                         None,
                         want_dirstat,
+                        want_binary,
                         func_context,
                     )?;
                     mine.push((i, an));
@@ -2846,6 +3057,9 @@ fn analyze(
     // Whether `--dirstat` needs each pair's content damage, which is a second pass
     // over both images that nothing else asks for.
     want_dirstat: bool,
+    // Whether `--binary` needs a binary pair's two images, which the blob pipeline
+    // withholds and nothing else asks for.
+    want_binary: bool,
     // `-W`: hunks grown to enclosing-function boundaries.
     func_context: bool,
 ) -> Result<Analysis> {
@@ -2859,6 +3073,7 @@ fn analyze(
             hunks: None,
             blank_at_eof: (0, 0),
             damage: 0,
+            images: None,
         });
     }
 
@@ -2930,22 +3145,11 @@ fn analyze(
     };
 
     match prep.operation {
-        Operation::SourceOrDestinationIsBinary => Ok(Analysis {
-            new_id,
-            // `diffstat_consume()` never sees a binary pair; `show_stats()` reads
-            // the two *sizes* out of the filespecs instead and prints them as
-            // `Bin <old> -> <new> bytes`, so that is what these two carry here.
-            // Every consumer that counts lines skips a pair with `binary` set.
-            added: blob_size_new(objects, delta, workdir, path)?,
-            deleted: blob_size_old(objects, delta)?,
-            binary: true,
-            hunks: None,
-            blank_at_eof: (0, 0),
-            // `show_dirstat()` weighs a binary pair like any other, on the raw
-            // bytes with `hash_chars()` in its 64-byte-chunk mode. The blob
-            // pipeline withholds the data for a binary pair, so it is read back
-            // here — and only when `--dirstat` is going to use it.
-            damage: if want_dirstat {
+        Operation::SourceOrDestinationIsBinary => {
+            // The blob pipeline withholds the data for a binary pair, so both images
+            // are read back here — and only if `--dirstat` or `--binary` is going to
+            // use them, since for a binary pair that is the whole file on both sides.
+            let images = if want_dirstat || want_binary {
                 let old_bytes = delta
                     .old
                     .map(|(id, _)| read_blob(objects, id))
@@ -2959,11 +3163,32 @@ fn analyze(
                         .unwrap_or_default(),
                     NewSide::Absent => Vec::new(),
                 };
-                byte_damage(&old_bytes, &new_bytes, delta.old.is_some(), delta.new_valid(), true)
+                Some((old_bytes, new_bytes))
             } else {
-                0
-            },
-        }),
+                None
+            };
+            Ok(Analysis {
+                new_id,
+                // `diffstat_consume()` never sees a binary pair; `show_stats()` reads
+                // the two *sizes* out of the filespecs instead and prints them as
+                // `Bin <old> -> <new> bytes`, so that is what these two carry here.
+                // Every consumer that counts lines skips a pair with `binary` set.
+                added: blob_size_new(objects, delta, workdir, path)?,
+                deleted: blob_size_old(objects, delta)?,
+                binary: true,
+                hunks: None,
+                blank_at_eof: (0, 0),
+                // `show_dirstat()` weighs a binary pair like any other, on the raw
+                // bytes with `hash_chars()` in its 64-byte-chunk mode.
+                damage: match (want_dirstat, &images) {
+                    (true, Some((old_bytes, new_bytes))) => {
+                        byte_damage(old_bytes, new_bytes, delta.old.is_some(), delta.new_valid(), true)
+                    }
+                    _ => 0,
+                },
+                images: want_binary.then_some(images).flatten(),
+            })
+        }
         Operation::ExternalCommand { .. } => {
             bail!("external diff drivers are not supported for {path:?}")
         }
@@ -2996,6 +3221,7 @@ fn analyze(
                     } else {
                         0
                     },
+                    images: None,
                 });
             }
             let before: Vec<&[u8]> = byte_lines(old_data);
@@ -3086,6 +3312,7 @@ fn analyze(
                 } else {
                     0
                 },
+                images: None,
             })
         }
     }
@@ -3229,6 +3456,7 @@ fn synthetic_rows(rows: &[(BString, BString, u32, u32, bool)]) -> (Vec<Delta>, V
             hunks: None,
             blank_at_eof: (0, 0),
             damage: 0,
+            images: None,
         });
     }
     (deltas, analyses)
@@ -3372,6 +3600,7 @@ fn analyze_gitlink(
         hunks,
         // A synthetic `Subproject commit <oid>` blob never ends in a blank line.
         blank_at_eof: (0, 0),
+        images: None,
         // The same synthetic images `builtin_diff()` hands the rest of the diff
         // machinery, so a submodule bump is damage like any other content change.
         damage: byte_damage(
@@ -4174,8 +4403,14 @@ fn render_patch(
         return render_combined(out, repo, delta, ctx);
     }
 
-    // The `index` line honors `--abbrev` / `--full-index`.
-    let hlen = if r.full_index { r.hash_kind.len_in_hex() } else { r.abbrev };
+    // The `index` line honors `--abbrev` / `--full-index`. `fill_metainfo()` also
+    // widens it to the full name under `--binary`, but only for a pair that really
+    // is binary — text pairs in the same run keep the normal abbreviation.
+    let hlen = if r.full_index || (r.binary && an.binary) {
+        r.hash_kind.len_in_hex()
+    } else {
+        r.abbrev
+    };
     let null_hash = r.hash_kind.null().to_hex_with_len(hlen).to_string();
     let old_hash = delta
         .old
@@ -4290,11 +4525,22 @@ fn render_patch(
     };
 
     if an.binary {
-        push_str(out, "Binary files ");
-        out.extend_from_slice(&old_label);
-        push_str(out, " and ");
-        out.extend_from_slice(&new_label);
-        push_str(out, " differ\n");
+        match (r.binary, &an.images) {
+            // `emit_binary_diff()`: no `---`/`+++` pair, just the payload.
+            (true, Some((one, two))) => super::binary_patch::emit(
+                out,
+                one,
+                two,
+                super::binary_patch::loose_compression_level(repo),
+            ),
+            _ => {
+                push_str(out, "Binary files ");
+                out.extend_from_slice(&old_label);
+                push_str(out, " and ");
+                out.extend_from_slice(&new_label);
+                push_str(out, " differ\n");
+            }
+        }
     } else if let Some(hunks) = &an.hunks {
         emit_file_line(out, b"--- ", &old_label);
         emit_file_line(out, b"+++ ", &new_label);

@@ -161,8 +161,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use gix::bstr::{BString, ByteSlice};
-use gix::diff::blob::unified_diff::{ConsumeHunk, ContextSize, DiffLineKind, HunkHeader};
-use gix::diff::blob::{Algorithm, Diff, InternedInput, UnifiedDiff};
+use gix::diff::blob::{Algorithm, Diff, InternedInput};
 use gix::hash::ObjectId;
 use gix::prelude::ObjectIdExt;
 use regex::bytes::Regex;
@@ -185,6 +184,8 @@ enum Format {
     NameOnly,
     /// `<status>\t<path>`
     NameStatus,
+    /// `--check`: `<path>:<line>: <problem>.` and the offending added line.
+    Check,
     /// Nothing at all (`-s`, `--no-patch`, `--quiet`).
     Silent,
 }
@@ -298,6 +299,17 @@ struct Opts {
     patch: bool,
     /// `-U<n>`/`--unified=<n>`: unified-diff context, git's default of 3.
     ctx: u32,
+    /// `--inter-hunk-context=<n>`: `xecfg.interhunkctxlen`, the extra gap two change
+    /// groups may leave between them and still land in one hunk.
+    inter_hunk_ctx: usize,
+    /// `--check`: `DIFF_FORMAT_CHECKDIFF`, the whitespace-error and conflict-marker
+    /// report. Like the name formats it clears every other output format, and a hit
+    /// sets bit 1 of `diff_result_code()`.
+    check: bool,
+    /// `--binary`: `o->flags.binary`. It changes nothing for a text pair; for a binary
+    /// one it replaces `Binary files … differ` with a `GIT binary patch` block and
+    /// widens the `index` line to full object ids (`fill_metainfo()`, diff.c:4920).
+    binary: bool,
     /// `XDF_INDENT_HEURISTIC`: where a hunk that can slide freely finally lands.
     /// `git_diff_heuristic_config()` runs from `git_diff_basic_config()`, so
     /// `diff.indentHeuristic` reaches plumbing too, and `--[no-]indent-heuristic`
@@ -471,6 +483,9 @@ fn render_only_option(a: &str) -> bool {
         "--no-rename-empty",
         "--no-renames",
         "--no-textconv",
+        // Like `--histogram` and `--minimal` above: this module's content formats always
+        // run Myers (`analyze_index_delta`), so an algorithm flag is a no-op for the raw
+        // listing and a refusal for anything that renders the line diff.
         "--patience",
         "--rename-empty",
         "--submodule",
@@ -486,7 +501,6 @@ fn render_only_option(a: &str) -> bool {
         "--break-rewrites=",
         "--diff-merges=",
         "--dst-prefix=",
-        "--inter-hunk-context=",
         "--output-indicator-context=",
         "--output-indicator-new=",
         "--output-indicator-old=",
@@ -499,15 +513,6 @@ fn render_only_option(a: &str) -> bool {
     // tail; neither changes this listing.
     let b = a.as_bytes();
     b.len() > 2 && b[0] == b'-' && (b[1] == b'B' || b[1] == b'l')
-}
-
-/// The two content-derived renderings this module still declines: `--check`
-/// (whitespace-error report) and `--binary` (the base85 `GIT binary patch` payload).
-/// Both are content-driven in git, so an all-clean pair list renders as nothing and
-/// only a run with surviving pairs is refused rather than approximated. The patch and
-/// stat families, by contrast, are ported below and rendered for real.
-fn unsupported_format(a: &str) -> bool {
-    matches!(a, "--check" | "--binary")
 }
 
 /// `--stat=<width>[,<name-width>[,<count>]]` (`diff_opt_stat()`), parsed leniently:
@@ -645,6 +650,9 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
         detect_rename: false,
         patch: false,
         ctx: 3,
+        inter_hunk_ctx: 0,
+        check: false,
+        binary: false,
         indent_heuristic: true,
         numstat: false,
         diffstat: false,
@@ -804,6 +812,9 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
             "-z" => opts.nul = true,
             "--abbrev" => opts.abbrev = Some(None),
             "--no-abbrev" => opts.abbrev = None,
+            "--check" => opts.check = true,
+            "--binary" => opts.binary = true,
+            "--no-binary" => opts.binary = false,
             "--exit-code" => opts.exit_code = true,
             "--quiet" => {
                 opts.exit_code = true;
@@ -857,6 +868,24 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
             s if s.starts_with("--unified=") => {
                 opts.patch = true;
                 opts.ctx = parse_context(&s["--unified=".len()..]);
+            }
+            // `--inter-hunk-context=<n>` is `OPT_UNSIGNED` (diff.c:6144) over
+            // `xecfg.interhunkctxlen`. A value that is not a magnitude is parse-options'
+            // 129, deferred with its argv index so a bad revision earlier in argv still
+            // wins with git's 128.
+            s if s.starts_with("--inter-hunk-context=") => {
+                match super::diff_files::parse_magnitude(&s["--inter-hunk-context=".len()..]) {
+                    Some(n) => opts.inter_hunk_ctx = n as usize,
+                    None => {
+                        deferred.get_or_insert((
+                            cur,
+                            129,
+                            b"error: option `inter-hunk-context' expects a non-negative \
+                              integer value with an optional k/m/g suffix\n"
+                                .to_vec(),
+                        ));
+                    }
+                }
             }
             // `--diff-algorithm <value>`: the separated form. git's `OPT_CALLBACK_F`
             // consumes the next argument unconditionally (even one that looks like a
@@ -1102,9 +1131,7 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
                 opts.detect_rename = true;
             }
             s => {
-                if unsupported_format(s) {
-                    bad_format.get_or_insert_with(|| s.to_owned());
-                } else if render_only_option(s) {
+                if render_only_option(s) {
                     // Ignored for the raw/name listings (their bytes are identical with
                     // and without it); recorded so a content format refuses rather than
                     // rendering the wrong bytes.
@@ -1123,9 +1150,18 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
     if quiet {
         opts.format = Format::Silent;
     }
-    // `diff_setup_done()`: `--name-only`, `--name-status` and `-s` clear every other
-    // output format, so `--dirstat`/`--stat`/`-p` next to one of them are dropped.
-    if matches!(opts.format, Format::NameOnly | Format::NameStatus | Format::Silent) {
+    // `diff_setup_done()`: `DIFF_FORMAT_CHECKDIFF` displaces the raw listing the same
+    // way the name formats do, and `-s` outranks it in turn.
+    if opts.check && opts.format != Format::Silent {
+        opts.format = Format::Check;
+        opts.emit_pairs = false;
+    }
+    // `diff_setup_done()`: `--name-only`, `--name-status`, `--check` and `-s` clear every
+    // other output format, so `--dirstat`/`--stat`/`-p` next to one of them are dropped.
+    if matches!(
+        opts.format,
+        Format::NameOnly | Format::NameStatus | Format::Check | Format::Silent
+    ) {
         opts.dirstat = None;
         opts.patch = false;
         opts.numstat = false;
@@ -1327,6 +1363,8 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
         .iter()
         .any(|p| p.first() == Some(&b':') || p.iter().any(|&b| matches!(b, b'*' | b'?' | b'[')));
 
+    // `o->flags.check_failed`, set by the `--check` walk below.
+    let mut check_failed = false;
     let mut deltas = collect(&repo, &tree_id, &opts)?;
     if !paths.is_empty() {
         if needs_gix {
@@ -1372,7 +1410,9 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
         || opts.numstat
         || opts.diffstat
         || opts.shortstat
-        || opts.summary)
+        || opts.summary
+        // `builtin_checkdiff()` reads both sides too.
+        || opts.format == Format::Check)
         && opts.format != Format::Silent;
     let content_driven = opts.ws.any()
         || opts.ignore_lines.is_some()
@@ -1456,7 +1496,10 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
                 return Ok(ExitCode::from(128));
             }
         };
-        let need_analyses = opts.patch || opts.numstat || opts.diffstat || opts.shortstat;
+        // `--check` walks the same hunk stream the patch does, so it needs the analysis
+        // (and with it the rendered hunks) exactly as `-p` does.
+        let want_hunks = opts.patch || opts.format == Format::Check;
+        let need_analyses = want_hunks || opts.numstat || opts.diffstat || opts.shortstat;
         let analyses: Vec<IdxAnalysis> = if need_analyses {
             // `diff_filespec_load_driver()`: the `diff=<driver>` attribute plus that
             // driver's `diff.<name>.binary`, resolved once for the whole batch because
@@ -1497,6 +1540,23 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
         }
 
         if !deltas.is_empty() {
+            // `builtin_checkdiff()`, in `diff_flush()`'s raw/name/checkdiff block —
+            // the same walk `diff-files --check` does, over this command's pair list.
+            if opts.format == Format::Check {
+                let pairs: Vec<super::diff_files::CheckPair<'_>> = deltas
+                    .iter()
+                    .zip(&analyses)
+                    .map(|(d, an)| super::diff_files::CheckPair {
+                        checkable: !d.unmerged && d.new_valid() && !an.binary,
+                        path: &d.path,
+                        old_data: &an.old_data,
+                        new_data: &an.new_data,
+                        hunks: an.hunks.as_deref(),
+                    })
+                    .collect();
+                check_failed =
+                    super::diff_files::render_check(&mut rest, &pairs, ws_rule, &colors);
+            }
             if opts.numstat || opts.diffstat || opts.shortstat {
                 let stats = compute_diffstat(&deltas, &analyses, &opts);
                 if opts.numstat {
@@ -1536,17 +1596,26 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
             };
             let mut plain: Vec<u8> = Vec::new();
             let mut files: Vec<diff_color::FilePaint> = Vec::new();
-            // `fill_metainfo()`'s abbreviation length: the full hash under `--full-index`,
-            // otherwise `DEFAULT_ABBREV`, which `core.abbrev` sets.
+            // `fill_metainfo()`'s abbreviation length (diff.c:4915):
+            //     int abbrev = o->abbrev ? o->abbrev : DEFAULT_ABBREV;
+            //     if (o->flags.full_index) abbrev = hexsz;
+            // so `--full-index` wins outright, an explicit `--abbrev=<n>` (already
+            // clamped to `[MINIMUM_ABBREV, hexsz]` by the parser) is used verbatim, and
+            // every other spelling — no flag, a bare `--abbrev`, `--no-abbrev` — leaves
+            // `o->abbrev` at 0 and falls back to `DEFAULT_ABBREV`, which `core.abbrev`
+            // sets. `--no-abbrev` widens only the raw listing, never this line.
             let hexsz = repo.object_hash().len_in_hex();
-            let patch_abbrev = if opts.full_index {
-                hexsz
-            } else {
-                crate::abbrev::configured_abbrev(&repo, hexsz)
+            // `--binary`'s payload is deflated at git's `zlib_compression_level`; read it
+            // once rather than per file.
+            let zlib_level = super::binary_patch::loose_compression_level(&repo);
+            let patch_abbrev = match (opts.full_index, opts.abbrev) {
+                (true, _) => hexsz,
+                (false, Some(Some(n))) => n.clamp(crate::abbrev::MINIMUM_ABBREV, hexsz),
+                (false, _) => crate::abbrev::configured_abbrev(&repo, hexsz),
             };
             for (d, an) in deltas.iter().zip(&analyses) {
                 let before = plain.len();
-                render_patch(&mut plain, d, an, &opts, patch_abbrev);
+                render_patch(&mut plain, d, an, &opts, patch_abbrev, zlib_level);
                 if plain.len() != before {
                     files.push(diff_color::FilePaint {
                         ws_rule,
@@ -1573,11 +1642,16 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
         std::io::stdout().lock().write_all(&out)?;
     }
 
-    Ok(if opts.exit_code && !deltas.is_empty() {
-        ExitCode::from(1)
-    } else {
-        ExitCode::SUCCESS
-    })
+    // `diff_result_code()`: bit 0 is `--exit-code` with something to report, bit 1 is
+    // `--check` having found a whitespace error or a conflict marker.
+    let mut code = 0u8;
+    if opts.exit_code && !deltas.is_empty() {
+        code |= 1;
+    }
+    if check_failed {
+        code |= 2;
+    }
+    Ok(ExitCode::from(code))
 }
 
 /// `parse_dirstat_opt()`: fold one parameter list into the accumulated `--dirstat`
@@ -1983,6 +2057,14 @@ fn stat_data_changed(
     sd.mtime.secs != mtime || sd.size != md.len() as u32
 }
 
+/// git's `diff_from_contents` (`diff_setup_done()`, diff.c:5282): the whitespace family
+/// and `-I` make emptiness a question only the content can answer, so `diff_flush()`
+/// generates each patch quietly before the raw/name block runs — which incidentally
+/// fills in the object id of any side that had none.
+fn diff_from_contents(opts: &Opts) -> bool {
+    opts.ws.any() || opts.ignore_lines.is_some()
+}
+
 /// Drop every pair whose two sides carry the same content once the requested folding is
 /// applied, and give the surviving worktree side the object id git had to compute in
 /// order to decide that.
@@ -2003,7 +2085,17 @@ fn apply_content_filter(repo: &gix::Repository, deltas: &mut Vec<Delta>, opts: &
             continue;
         }
         let mut d = d;
-        if d.dst_id == null && d.dst_mode != 0 {
+        // Only the `diff_from_contents` path writes the computed id back where the raw
+        // listing can see it. `diff_flush()` (diff.c:7210) runs a quiet patch pass —
+        // and with it `diff_fill_oid_info()` — ahead of the raw/name block *only* when
+        // that flag is set, which `diff_setup_done()` (diff.c:5282) ties to the
+        // whitespace family and `-I`:
+        //     if ((options->xdl_opts & XDF_WHITESPACE_FLAGS) || options->ignore_regex_nr)
+        //             options->flags.diff_from_contents = 1;
+        // Everywhere else the worktree side still reads `oid_valid == 0` when the raw
+        // block prints, so it shows the null id and only the patch's `index` line —
+        // which fills lazily, see [`analyze_index_delta`] — carries the real hash.
+        if diff_from_contents(opts) && d.dst_id == null && d.dst_mode != 0 {
             if let Some(id) = hash_worktree(repo, workdir.as_deref(), &d.path)? {
                 d.dst_id = id;
             }
@@ -2303,6 +2395,7 @@ fn render(repo: &gix::Repository, deltas: &[Delta], opts: &Opts) -> Result<Vec<u
         out.extend_from_slice(&opts.line_prefix);
         match opts.format {
             Format::Silent => unreachable!("silent output is short-circuited by the caller"),
+            Format::Check => unreachable!("--check clears `emit_pairs`, so this never runs"),
             Format::NameOnly => {}
             Format::NameStatus => {
                 out.push(d.status());
@@ -2393,6 +2486,12 @@ struct IdxAnalysis {
     hunks: Option<Vec<u8>>,
     old_data: Vec<u8>,
     new_data: Vec<u8>,
+    /// The ids the patch `index` line shows, i.e. the pair after `diff_fill_oid_info()`
+    /// (diff.c:4990) has run over it. They differ from `Delta::src_id`/`dst_id` for a
+    /// worktree side, whose `oid_valid` is 0: the raw listing prints that side's null id
+    /// while the patch prints the hash git computes on the spot from the file.
+    src_id: ObjectId,
+    dst_id: ObjectId,
 }
 
 /// The bytes of one side of a pair, or `None` when that side does not exist. Unlike
@@ -2444,8 +2543,16 @@ fn analyze_index_delta(
             hunks: None,
             old_data: Vec::new(),
             new_data: Vec::new(),
+            src_id: d.src_id,
+            dst_id: d.dst_id,
         });
     }
+
+    // `diff_fill_oid_info()`: a side that exists but carries no valid id is the worktree
+    // side, and git hashes the file right here so the `index` line can name it. Both
+    // sides are tested because `-R` has already swapped them by now.
+    let src_id = fill_oid_info(repo, workdir, d.src_mode, d.src_id, &d.path)?;
+    let dst_id = fill_oid_info(repo, workdir, d.dst_mode, d.dst_id, &d.path)?;
 
     let old_data = content_of(repo, workdir, d.src_mode, d.src_id, &d.path)?.unwrap_or_default();
     let new_data = content_of(repo, workdir, d.dst_mode, d.dst_id, &d.path)?.unwrap_or_default();
@@ -2469,6 +2576,8 @@ fn analyze_index_delta(
             hunks: None,
             old_data,
             new_data,
+            src_id,
+            dst_id,
         });
     }
 
@@ -2489,35 +2598,44 @@ fn analyze_index_delta(
         opts.indent_heuristic,
     );
     // `xdl_mark_ignorable_regex()`: a change group whose every removed and added line
-    // matches the `-I` pattern contributes nothing to the counts.
-    let (added, deleted) = match &opts.ignore_lines {
-        None => (diff.count_additions(), diff.count_removals()),
-        Some(pat) => {
-            let mut add = 0u32;
-            let mut del = 0u32;
-            for hunk in diff.hunks() {
-                let ignorable = hunk.before.clone().all(|i| pat.is_match(before[i as usize]))
-                    && hunk.after.clone().all(|i| pat.is_match(after[i as usize]));
-                if ignorable {
-                    continue;
-                }
-                del += hunk.before.clone().count() as u32;
-                add += hunk.after.clone().count() as u32;
+    // matches the `-I` pattern is marked ignorable, which keeps it out of the counts and
+    // stops `xdl_get_hunk()` from opening a hunk for it.
+    let changes: Vec<super::diff_pairs::Change> = diff
+        .hunks()
+        .map(|h| {
+            let ignore = opts.ignore_lines.as_ref().is_some_and(|pat| {
+                h.before.clone().all(|i| pat.is_match(before[i as usize]))
+                    && h.after.clone().all(|i| pat.is_match(after[i as usize]))
+            });
+            super::diff_pairs::Change {
+                i1: h.before.start as usize,
+                chg1: h.before.len(),
+                i2: h.after.start as usize,
+                chg2: h.after.len(),
+                ignore,
             }
-            (add, del)
-        }
-    };
+        })
+        .collect();
+    let (added, deleted) = changes
+        .iter()
+        .filter(|c| !c.ignore)
+        .fold((0u32, 0u32), |(a, d), c| (a + c.chg2 as u32, d + c.chg1 as u32));
 
-    let hunks = if opts.patch && (added != 0 || deleted != 0) {
-        let sink = PatchSink {
-            buf: Vec::new(),
-            before: &before,
-            after: &after,
-            // No hunk has been emitted yet, so nothing bounds the first search.
-            func_prev: -1,
-            func_text: Vec::new(),
-        };
-        Some(UnifiedDiff::new(&diff, &input, sink, ContextSize::symmetrical(opts.ctx)).consume()?)
+    // `--check` walks the hunk stream too, so it is rendered for that format as well.
+    let hunks = if (opts.patch || opts.format == Format::Check) && (added != 0 || deleted != 0) {
+        // The shared `xdl_emit_diff` port, so `--inter-hunk-context=<n>` merges hunks
+        // here exactly as it does for `git diff` and `diff-pairs`.
+        let (_, _, buf) = super::diff_pairs::emit_unified(
+            &before,
+            &after,
+            &changes,
+            &super::diff_pairs::EmitGeometry {
+                ctx: opts.ctx as usize,
+                inter_hunk_ctx: opts.inter_hunk_ctx,
+                func_context: false,
+            },
+        );
+        Some(buf)
     } else {
         None
     };
@@ -2531,7 +2649,29 @@ fn analyze_index_delta(
         hunks,
         old_data,
         new_data,
+        src_id,
+        dst_id,
     })
+}
+
+/// `diff_fill_oid_info()` (diff.c:4990) for one side of a pair.
+///
+/// A side that git records with `oid_valid == 0` — the worktree half of a
+/// `diff-index`/`diff-files` pair — reaches the patch machinery with a null id, and git
+/// hashes the file on the spot so the `index` line can name it. A side with no mode does
+/// not exist and keeps the null id, which is what `/dev/null` halves print.
+fn fill_oid_info(
+    repo: &gix::Repository,
+    workdir: Option<&Path>,
+    mode: u32,
+    id: ObjectId,
+    path: &BString,
+) -> Result<ObjectId> {
+    let null = ObjectId::null(repo.object_hash());
+    if id != null || mode == 0 || (mode & S_IFMT) == 0o160000 {
+        return Ok(id);
+    }
+    Ok(hash_worktree(repo, workdir, path)?.unwrap_or(null))
 }
 
 /// The path as rendered, after `--relative` stripping — the same amount [`render`]
@@ -2940,7 +3080,14 @@ fn mode_str(mode: u32) -> String {
 /// `hlen` is the `index` line hex width `fill_metainfo()` uses:
 /// `o->flags.full_index ? the_hash_algo->hexsz : DEFAULT_ABBREV`, and `DEFAULT_ABBREV`
 /// is what `core.abbrev` sets -- not a hardcoded 7.
-fn render_patch(out: &mut Vec<u8>, d: &Delta, an: &IdxAnalysis, opts: &Opts, hlen: usize) {
+fn render_patch(
+    out: &mut Vec<u8>,
+    d: &Delta,
+    an: &IdxAnalysis,
+    opts: &Opts,
+    hlen: usize,
+    zlib_level: i32,
+) {
     if d.unmerged {
         out.extend_from_slice(b"* Unmerged path ");
         out.extend_from_slice(display_path(&d.path, opts).as_ref());
@@ -2956,13 +3103,25 @@ fn render_patch(out: &mut Vec<u8>, d: &Delta, an: &IdxAnalysis, opts: &Opts, hle
         (&opts.src_prefix, &opts.dst_prefix)
     };
 
+    // `fill_metainfo()` widens the `index` line to full object names under `--binary`,
+    // but only for a pair that really is binary; text pairs in the same run keep the
+    // abbreviation the caller computed.
+    let hlen = if opts.binary && an.binary {
+        an.src_id.kind().len_in_hex()
+    } else {
+        hlen
+    };
+
+    // `an.src_id`/`an.dst_id`, not the delta's: the patch runs after
+    // `diff_fill_oid_info()`, so a worktree side names the hash git computed from the
+    // file rather than the null id the raw listing printed for it.
     let old_hash = if d.old_valid() {
-        d.src_id.to_hex_with_len(hlen).to_string()
+        an.src_id.to_hex_with_len(hlen).to_string()
     } else {
         "0".repeat(hlen)
     };
     let new_hash = if d.new_valid() {
-        d.dst_id.to_hex_with_len(hlen).to_string()
+        an.dst_id.to_hex_with_len(hlen).to_string()
     } else {
         "0".repeat(hlen)
     };
@@ -3036,11 +3195,17 @@ fn render_patch(out: &mut Vec<u8>, d: &Delta, an: &IdxAnalysis, opts: &Opts, hle
     };
 
     if an.binary {
-        out.extend_from_slice(b"Binary files ");
-        out.extend_from_slice(&old_label);
-        out.extend_from_slice(b" and ");
-        out.extend_from_slice(&new_label);
-        out.extend_from_slice(b" differ\n");
+        if opts.binary {
+            // `emit_binary_diff()`: the payload replaces the whole `Binary files …`
+            // line, and there is no `---`/`+++` pair in front of it.
+            super::binary_patch::emit(out, &an.old_data, &an.new_data, zlib_level);
+        } else {
+            out.extend_from_slice(b"Binary files ");
+            out.extend_from_slice(&old_label);
+            out.extend_from_slice(b" and ");
+            out.extend_from_slice(&new_label);
+            out.extend_from_slice(b" differ\n");
+        }
     } else if let Some(hunks) = &an.hunks {
         emit_file_line(out, b"--- ", &old_label);
         emit_file_line(out, b"+++ ", &new_label);
@@ -3068,107 +3233,4 @@ fn prefix_lines(body: &[u8], prefix: &[u8]) -> Vec<u8> {
         out.extend_from_slice(line);
     }
     out
-}
-
-// ---------------------------------------------------------------------------
-// unified-diff hunk sink
-// ---------------------------------------------------------------------------
-
-/// Format one side of a hunk header (`@@ -<here> +<here> @@`), omitting the length when
-/// it is 1 and using the pre-hunk line number when it is 0, like `git diff`.
-fn fmt_range(start: u32, len: u32) -> String {
-    match len {
-        1 => format!("{start}"),
-        0 => format!("{},0", start.saturating_sub(1)),
-        _ => format!("{start},{len}"),
-    }
-}
-
-/// A [`ConsumeHunk`] sink that renders unified-diff hunks into a byte buffer. The tokens
-/// the differ compares may be whitespace-normalized, so line *content* is taken from the
-/// original line tables, tracked by the cursors the hunk header establishes.
-struct PatchSink<'a> {
-    buf: Vec<u8>,
-    before: &'a [&'a [u8]],
-    after: &'a [&'a [u8]],
-    /// git's `funclineprev`: the line the previous hunk's search started from, and the
-    /// limit for the next one, so a heading is never scanned for twice.
-    func_prev: i64,
-    /// git's `func_line`, which lives across the whole file rather than one hunk. A
-    /// search that finds nothing leaves it alone, so a hunk deep inside a long function
-    /// keeps the heading found for the hunk above it.
-    func_text: Vec<u8>,
-}
-
-impl ConsumeHunk for PatchSink<'_> {
-    type Out = Vec<u8>;
-
-    fn consume_hunk(&mut self, header: HunkHeader, lines: &[(DiffLineKind, &[u8])]) -> std::io::Result<()> {
-        let mut hdr: Vec<u8> = Vec::with_capacity(super::diff::HUNK_HDR_MAX);
-        hdr.extend_from_slice(b"@@ -");
-        hdr.extend_from_slice(fmt_range(header.before_hunk_start, header.before_hunk_len).as_bytes());
-        hdr.extend_from_slice(b" +");
-        hdr.extend_from_slice(fmt_range(header.after_hunk_start, header.after_hunk_len).as_bytes());
-        hdr.extend_from_slice(b" @@");
-
-        // `XDL_EMIT_FUNCNAMES`: the nearest qualifying line at or above the hunk's first
-        // pre-image line, searched no further back than the previous hunk's own starting
-        // point. `before_hunk_start` is 1-based and git's `s1` is the 0-based index of
-        // that same line.
-        let s1 = header.before_hunk_start as i64 - 1;
-        if let Some(func) = super::diff::func_line(self.before, s1 - 1, self.func_prev) {
-            self.func_text = func.to_vec();
-        }
-        self.func_prev = s1 - 1;
-        if !self.func_text.is_empty() {
-            // git clips the heading to what remains of its 128-byte header buffer,
-            // reserving one byte for the newline.
-            let room = super::diff::HUNK_HDR_MAX.saturating_sub(hdr.len() + 2);
-            hdr.push(b' ');
-            hdr.extend_from_slice(&self.func_text[..self.func_text.len().min(room)]);
-        }
-        hdr.push(b'\n');
-        self.buf.extend_from_slice(&hdr);
-
-        let mut bi = header.before_hunk_start.saturating_sub(1) as usize;
-        let mut ai = header.after_hunk_start.saturating_sub(1) as usize;
-        for (kind, fallback) in lines {
-            let (marker, content): (u8, &[u8]) = match kind {
-                // `xdl_emit_diff()` emits every context record from `xe->xdf2`, the
-                // *post-image*: all three context loops call
-                // `xdl_emit_record(&xe->xdf2, s2, " ", ecb)`. The two sides only
-                // differ here when the comparison called unequal bytes equal, which
-                // is exactly what `-w`/`-b`/`--ignore-space-at-eol` do.
-                DiffLineKind::Context => {
-                    let c = self.after.get(ai).copied().unwrap_or(*fallback);
-                    bi += 1;
-                    ai += 1;
-                    (b' ', c)
-                }
-                DiffLineKind::Remove => {
-                    let c = self.before.get(bi).copied().unwrap_or(*fallback);
-                    bi += 1;
-                    (b'-', c)
-                }
-                DiffLineKind::Add => {
-                    let c = self.after.get(ai).copied().unwrap_or(*fallback);
-                    ai += 1;
-                    (b'+', c)
-                }
-            };
-            self.buf.push(marker);
-            self.buf.extend_from_slice(content);
-            // A token without a terminator is the last line of a file that lacks a
-            // trailing newline.
-            if content.last() != Some(&b'\n') {
-                self.buf.push(b'\n');
-                self.buf.extend_from_slice(b"\\ No newline at end of file\n");
-            }
-        }
-        Ok(())
-    }
-
-    fn finish(self) -> Vec<u8> {
-        self.buf
-    }
 }

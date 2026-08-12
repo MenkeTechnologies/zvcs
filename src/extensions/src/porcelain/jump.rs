@@ -1,5 +1,6 @@
 //! `git jump` — emit "quickfix" lines for interesting spots and hand them to an
-//! editor. **The `merge` and `grep` modes are ported; `diff` and `ws` bail.**
+//! editor. **All four modes (`diff`, `merge`, `grep`, `ws`) plus `auto` are
+//! ported; only the editor hand-off bails.**
 //!
 //! Stock `git jump` is a `/bin/sh` script installed in `$(git --exec-path)`
 //! (originally `contrib/git-jump/git-jump`; 2.55.0 ships it at
@@ -29,6 +30,13 @@
 //!     `perl -pe 's/[ \t]+/ /g; s/^ *//;'`. The default command re-runs this
 //!     binary, which is the git installation the script would have found. The
 //!     grep's exit status is discarded, as the pipeline discards it.
+//!   * `mode_diff`: `git diff --no-prefix --relative <args>` piped through the
+//!     perl filter that emits `<file>:<new-line>:1: <text>` for the first
+//!     changed line of every hunk. Like `mode_grep`, the `git` the script means
+//!     is the installation it ships with — this binary — so the patch comes from
+//!     re-running `diff.rs`, which already implements both flags.
+//!   * `mode_ws`: `git diff --check <args>`, whose output is already in quickfix
+//!     form and is forwarded unfiltered.
 //!   * `mode_auto`: the `--is-inside-work-tree` gate, then unmerged paths →
 //!     `mode_merge`, then `git diff --quiet` → `mode_diff`, else usage/exit 1.
 //!   * Running any mode outside a repository: the underlying git command's
@@ -38,22 +46,16 @@
 //!
 //! NOT ported — each bails, naming the missing substrate:
 //!
-//!   1. **`mode_diff`** — `git diff --no-prefix --relative "$@"` piped through a
-//!      perl filter that emits `<file>:<new-line>:1: <text>` for the first
-//!      changed line of each hunk. `diff.rs` cannot be reused (only `pub fn
-//!      diff` is exported, its hunk walk is module-private, and it implements
-//!      neither `--no-prefix` nor `--relative`), and the mode forwards arbitrary
-//!      user diff arguments, so this needs a second patch generator rather than
-//!      a call.
-//!   2. **`mode_ws`** — `git diff --check`. `gix-diff` has no whitespace-error
-//!      checker at all (`grep -rl whitespace src/ported/gix-diff/src/` matches
-//!      nothing), so git's `ws_check_emit` output has no backing.
-//!   3. **The editor hand-off** — `git var GIT_EDITOR`, the `mktemp` file, and the
+//!   1. **The editor hand-off** — `git var GIT_EDITOR`, the `mktemp` file, and the
 //!      emacs/vi `eval` split. Spawning the user's editor is not gitoxide
 //!      substrate; a non-empty result therefore bails instead of pretending.
-//!   4. **Options for `merge`.** Stock forwards them to `ls-files`, which answers
+//!   2. **Options for `merge`.** Stock forwards them to `ls-files`, which answers
 //!      an unknown one with its own multi-screen usage and the script still exits
 //!      0. That text is not reproduced here; only `--` and pathspecs are accepted.
+//!
+//! `diff` and `ws` inherit whatever `diff.rs` gets right or wrong about
+//! `--no-prefix`/`--relative`/`--check`; that is the same coupling stock has,
+//! since the script shells out to the `git` it ships with.
 //!
 //! Known divergences, deliberately left rather than guessed at: `sort -u` uses
 //! the caller's collation while this port sorts by bytes (identical for ASCII
@@ -143,18 +145,8 @@ pub fn jump(args: &[String]) -> Result<ExitCode> {
             Some(lines) => lines,
             None => return Ok(usage_err()),
         },
-        "diff" => anyhow::bail!(
-            "unsupported mode \"diff\" (ported: merge, auto, --stdout, the option loop and \
-             usage/exit codes). It runs `git diff --no-prefix --relative` over arbitrary \
-             user-supplied diff arguments and derives one quickfix line per hunk from the \
-             patch text; diff.rs exports only `pub fn diff`, keeps its hunk walk private, \
-             and implements neither --no-prefix nor --relative"
-        ),
-        "ws" => anyhow::bail!(
-            "unsupported mode \"ws\" (ported: merge, auto). It is `git diff --check`, and \
-             gix-diff contains no whitespace-error checker — nothing under src/ported backs \
-             git's ws_check_emit output"
-        ),
+        "diff" => mode_diff(mode_args)?,
+        "ws" => mode_ws(mode_args)?,
         "grep" => mode_grep(mode_args)?,
         _ => unreachable!("mode was validated above"),
     };
@@ -200,13 +192,127 @@ fn mode_auto(args: &[String]) -> Result<Option<Vec<u8>>> {
     // `! git diff --quiet "$@"` — index vs worktree only, staged changes and
     // untracked files do not count.
     if has_unstaged_changes(&repo, args)? {
-        anyhow::bail!(
-            "unsupported: `git jump` with unstaged changes selects mode \"diff\", which is not \
-             ported — it runs `git diff --no-prefix --relative` and derives a quickfix line per \
-             hunk; diff.rs exports only `pub fn diff` and implements neither flag"
-        );
+        return Ok(Some(mode_diff(args)?));
     }
     Ok(None)
+}
+
+/// `mode_diff`:
+///
+/// ```sh
+/// git diff --no-prefix --relative "$@" | perl -ne '…'
+/// ```
+///
+/// The script is a driver: it runs the `git` it ships with, which is this
+/// binary, exactly as `mode_grep` already does. The pipeline's exit status is
+/// perl's, so a diff that failed still yields whatever it printed.
+fn mode_diff(args: &[String]) -> Result<Vec<u8>> {
+    let out = run_self(&["diff", "--no-prefix", "--relative"], args)?;
+    Ok(first_line_of_each_hunk(&out))
+}
+
+/// `mode_ws`: `git diff --check "$@"`, unfiltered — its output is already in
+/// `<file>:<line>: <error>` quickfix form.
+fn mode_ws(args: &[String]) -> Result<Vec<u8>> {
+    run_self(&["diff", "--check"], args)
+}
+
+/// Run this binary with `leading` followed by the mode's own arguments,
+/// returning its stdout. stderr is inherited and the exit status discarded,
+/// which is what a shell pipeline whose last stage is `perl` (or the bare
+/// command, for `mode_ws`) does with it.
+fn run_self(leading: &[&str], args: &[String]) -> Result<Vec<u8>> {
+    let exe = std::env::current_exe()?;
+    let out = std::process::Command::new(exe)
+        .args(leading)
+        .args(args)
+        .stderr(std::process::Stdio::inherit())
+        .output()?;
+    Ok(out.stdout)
+}
+
+/// `mode_diff`'s perl filter, line for line:
+///
+/// ```perl
+/// if (m{^\+\+\+ (.*?)\t?$}) { $file = $1 eq "/dev/null" ? undef : $1; next }
+/// defined($file) or next;
+/// if (m/^@@ .*?\+(\d+)/) { $line = $1; next }
+/// defined($line) or next;
+/// if (/^ /) { $line++; next }
+/// if (/^[-+]\s*(.*)/) { print "$file:$line:1: $1\n"; $line = undef; }
+/// ```
+///
+/// One element per hunk: the first changed line in it, reported at the hunk's
+/// new-side start line. `$line = undef` after a hit is what stops a hunk from
+/// contributing a second element; only the next `@@` re-arms it.
+fn first_line_of_each_hunk(patch: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut file: Option<&[u8]> = None;
+    let mut line: Option<u64> = None;
+
+    for raw in patch.split_inclusive(|&b| b == b'\n') {
+        // Perl's `$` matches before a final newline, so the trailing one is not
+        // part of what the patterns see.
+        let l = raw.strip_suffix(b"\n").unwrap_or(raw);
+
+        if let Some(rest) = l.strip_prefix(b"+++ ") {
+            // `(.*?)\t?$`: the non-greedy capture gives up at most one trailing
+            // tab, which is how git terminates a name it had to quote or that
+            // contains a space.
+            let name = rest.strip_suffix(b"\t").unwrap_or(rest);
+            file = if name == b"/dev/null" { None } else { Some(name) };
+            continue;
+        }
+        if file.is_none() {
+            continue;
+        }
+        if l.starts_with(b"@@ ") {
+            // `.*?\+(\d+)` — the first `+<digits>` after the marker, which is the
+            // new-side start of the hunk.
+            line = hunk_new_start(&l[3..]);
+            continue;
+        }
+        let Some(n) = line else { continue };
+        if l.first() == Some(&b' ') {
+            line = Some(n + 1);
+            continue;
+        }
+        if matches!(l.first(), Some(b'-' | b'+')) {
+            // `^[-+]\s*(.*)`: `\s*` is greedy and `\s` includes the newline, so a
+            // change line holding nothing but blanks captures the empty string.
+            let body = &l[1..];
+            let text = match body.iter().position(|b| !is_perl_space(*b)) {
+                Some(i) => &body[i..],
+                None => &body[body.len()..],
+            };
+            out.extend_from_slice(file.expect("checked above"));
+            out.extend_from_slice(format!(":{n}:1: ").as_bytes());
+            out.extend_from_slice(text);
+            out.push(b'\n');
+            line = None;
+        }
+    }
+    out
+}
+
+/// Perl's `\s` for a non-Unicode pattern: space, tab, newline, form feed,
+/// carriage return and (since 5.18) vertical tab.
+fn is_perl_space(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r')
+}
+
+/// The `\+(\d+)` of `@@ -<a>,<b> +<c>,<d> @@`: the first run of digits that
+/// follows a `+`.
+fn hunk_new_start(rest: &[u8]) -> Option<u64> {
+    let plus = rest.iter().position(|&b| b == b'+')?;
+    let digits: &[u8] = rest[plus + 1..]
+        .split(|b| !b.is_ascii_digit())
+        .next()
+        .unwrap_or(&[]);
+    if digits.is_empty() {
+        return None;
+    }
+    std::str::from_utf8(digits).ok()?.parse().ok()
 }
 
 /// `mode_merge`: `git ls-files -u "$@"` → first-tab strip → `sort -u` →
@@ -459,4 +565,96 @@ fn is_inside_work_tree(repo: &gix::Repository) -> bool {
         return false;
     };
     !cwd.starts_with(git_dir)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The expectations here are the output of `git jump`'s own perl filter,
+    /// run verbatim over the same input:
+    ///
+    /// ```sh
+    /// perl -ne '
+    ///   if (m{^\+\+\+ (.*?)\t?$}) { $file = $1 eq "/dev/null" ? undef : $1; next }
+    ///   defined($file) or next;
+    ///   if (m/^@@ .*?\+(\d+)/) { $line = $1; next }
+    ///   defined($line) or next;
+    ///   if (/^ /) { $line++; next }
+    ///   if (/^[-+]\s*(.*)/) { print "$file:$line:1: $1\n"; $line = undef; }
+    ///   '
+    /// ```
+    #[test]
+    fn one_element_per_hunk_matches_the_perl_filter() {
+        // Two hunks in one file (the second reports its *deletion*, at the line
+        // the preceding context advanced to), a deletion whose `+++ /dev/null`
+        // disarms the file, and an addition whose text is empty after `\s*`.
+        let patch = b"\
+diff --git README.md README.md
+index 9741694..1b0a2f1 100644
+--- README.md
++++ README.md
+@@ -1,3 +1,4 @@
+ # fixture
+ line two
++added here
+ line three
+@@ -10,4 +12,5 @@ context text
+ keep
+-drop me
++  replaced
+ tail
+diff --git gone.txt gone.txt
+deleted file mode 100644
+index bac0ee7..0000000
+--- gone.txt
++++ /dev/null
+@@ -1 +0,0 @@
+-was here
+diff --git src/new.rs src/new.rs
+new file mode 100644
+index 0000000..46e89a2
+--- /dev/null
++++ src/new.rs
+@@ -0,0 +1,2 @@
++
++fn x() {}
+";
+        assert_eq!(
+            first_line_of_each_hunk(patch),
+            b"README.md:3:1: added here\nREADME.md:13:1: drop me\nsrc/new.rs:1:1: \n".to_vec()
+        );
+    }
+
+    /// git terminates a `+++` path that needs it with a tab, which the filter's
+    /// non-greedy `(.*?)\t?$` drops; the `\s*` after the `+` then eats the
+    /// indentation of the added line.
+    #[test]
+    fn trailing_tab_and_indentation_match_the_perl_filter() {
+        let patch = b"\
+diff --git my file.txt my file.txt
+index 111..222 100644
+--- my file.txt\t
++++ my file.txt\t
+@@ -5,2 +7,3 @@ fn ctx()
+ unchanged
++\ttabbed add
+ context
+";
+        assert_eq!(
+            first_line_of_each_hunk(patch),
+            b"my file.txt:8:1: tabbed add\n".to_vec()
+        );
+    }
+
+    /// `@@ .*?\+(\d+)`: the first `+<digits>` after the marker. A hunk header
+    /// whose old range is absent still parses, and a malformed one yields
+    /// nothing rather than a wrong line number.
+    #[test]
+    fn hunk_new_start_reads_the_new_side_offset() {
+        assert_eq!(hunk_new_start(b"-1,3 +1,4 @@"), Some(1));
+        assert_eq!(hunk_new_start(b"-0,0 +12 @@ trailer"), Some(12));
+        assert_eq!(hunk_new_start(b"-1 +7,2 @@"), Some(7));
+        assert_eq!(hunk_new_start(b"nonsense"), None);
+    }
 }

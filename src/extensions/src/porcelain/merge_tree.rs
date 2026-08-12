@@ -40,13 +40,14 @@
 //!     they track git's argument labels regardless of `gix-merge`'s canonical
 //!     side ordering
 //!
+//! The deprecated `--trivial-merge` mode is ported too: the three-tree
+//! lock-step walk (`threeway_callback()` / `resolve()` / `unresolved()`), the
+//! `merged`/`added in …`/`changed in both`/`removed in …` stage listing, and the
+//! bare unified diff (context 3, no file headers) from our version of each path
+//! to the `merge_blobs()` result. Its two operand diagnostics — `unknown rev`
+//! and `unable to read tree` — still fire before the walk.
+//!
 //! Not covered, and refused rather than approximated:
-//!   * actually *running* the deprecated `--trivial-merge` mode (its
-//!     option-compatibility rules are enforced and its operands are peeled to
-//!     trees so git's `unknown rev` / `unable to read tree` diagnostics are
-//!     reproduced; only the legacy three-tree walk with its embedded unified
-//!     diff is not ported, as reproducing git's xdiff hunk framing byte-for-byte
-//!     through `gix-imara-diff` cannot be guaranteed)
 //!   * the strategy options `subtree[=<path>]`, `renormalize`, `patience`,
 //!     `diff-algorithm=patience`, `ignore-space-change`, `ignore-all-space`,
 //!     `ignore-space-at-eol` and `ignore-cr-at-eol` — `gix-merge`'s text driver
@@ -66,9 +67,13 @@ use std::io::{BufRead, Write};
 use std::process::ExitCode;
 
 use gix::bstr::{BStr, BString, ByteSlice};
+use gix::diff::blob::unified_diff::{ConsumeHunk, ContextSize, DiffLineKind, HunkHeader};
+use gix::diff::blob::{diff_with_slider_heuristics, InternedInput, UnifiedDiff};
 use gix::diff::tree_with_rewrites::Change;
 use gix::hash::ObjectId;
-use gix::merge::blob::builtin_driver::text::Labels;
+use gix::merge::blob::builtin_driver::text::{
+    Conflict as MergeConflict, ConflictStyle, Labels, Level, Merge as TextMerge, Rendering,
+};
 use gix::merge::tree::apply_index_entries::RemovalMode;
 use gix::merge::tree::{Conflict, FileFavor, Resolution, ResolutionFailure, TreatAsUnresolved};
 
@@ -409,11 +414,11 @@ pub fn merge_tree(args: &[String]) -> Result<ExitCode> {
         // git's trivial merge peels each of the three operands to a tree before
         // it walks them: an operand that names no object is a fatal `unknown rev`,
         // and one that names a non-tree is `unable to read tree`. Both fire
-        // (exit 128) before the walk, so they are reproduced here even though the
-        // legacy three-tree walk with its embedded unified diff is not ported.
+        // (exit 128) before the walk.
+        let mut trees = Vec::with_capacity(3);
         for spec in &revs {
             match resolve_tree(&repo, spec) {
-                TreeResolution::Ok => {}
+                TreeResolution::Tree(id) => trees.push(id),
                 TreeResolution::UnknownRev => {
                     eprintln!("fatal: unknown rev {spec}");
                     return Ok(ExitCode::from(128));
@@ -424,7 +429,7 @@ pub fn merge_tree(args: &[String]) -> Result<ExitCode> {
                 }
             }
         }
-        bail!("unsupported mode \"--trivial-merge\" (git's deprecated three-tree walk is not ported; use --write-tree)");
+        return trivial_merge(&repo, [trees[0], trees[1], trees[2]]);
     }
 
     let (spec1, spec2) = (revs[0].as_str(), revs[1].as_str());
@@ -823,8 +828,8 @@ fn peel_commit(repo: &gix::Repository, spec: &str) -> Option<ObjectId> {
 /// Outcome of resolving a trivial-merge operand, mirroring the two distinct
 /// failure modes of git's `get_tree_descriptor()`.
 enum TreeResolution {
-    /// The spec peels to a tree.
-    Ok,
+    /// The spec peels to this tree.
+    Tree(ObjectId),
     /// The spec names no object at all — git's `unknown rev`.
     UnknownRev,
     /// The spec resolves but does not peel to a tree — git's `unable to read
@@ -845,8 +850,508 @@ fn resolve_tree(repo: &gix::Repository, spec: &str) -> TreeResolution {
     };
     let oid = object.id;
     match object.peel_to_tree() {
-        Ok(_) => TreeResolution::Ok,
+        Ok(tree) => TreeResolution::Tree(tree.id),
         Err(_) => TreeResolution::NotATree(oid),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `--trivial-merge`: the original 2005 three-tree walk
+// ---------------------------------------------------------------------------
+
+/// One `struct merge_list` node: one stage of one path. A path's stages are held
+/// in one `Vec` in `link` order, which is the order `show_result_list()` prints.
+struct MergeEntry {
+    /// 0 result, 1 base, 2 our, 3 their — indexes `desc[]`.
+    stage: u8,
+    mode: u32,
+    id: ObjectId,
+    path: BString,
+}
+
+/// One tree entry at the current level, or (with `mode == 0` and a null id) the
+/// absence of one — git's `struct name_entry` for a tree that lacks the name.
+#[derive(Clone)]
+struct NameEntry {
+    name: BString,
+    mode: u32,
+    id: ObjectId,
+}
+
+impl NameEntry {
+    fn is_dir(&self) -> bool {
+        self.mode & 0o170000 == 0o040000
+    }
+    fn is_null(&self) -> bool {
+        self.id.is_null()
+    }
+}
+
+/// `trivial_merge()`: walk `t[0]` (base), `t[1]` (ours) and `t[2]` (theirs) in
+/// lock-step and print what the three-way comparison of every name found.
+///
+/// Not covered: `xpp.flags`-driven whitespace options (the deprecated mode takes
+/// none) and git's binary merge driver's `LL_MERGE_BINARY_CONFLICT` return, which
+/// this mode never reports — a binary conflict still yields our side's content,
+/// as `ll_binary_merge()` does.
+fn trivial_merge(repo: &gix::Repository, trees: [ObjectId; 3]) -> Result<ExitCode> {
+    let mut result: Vec<Vec<MergeEntry>> = Vec::new();
+    let descs = [
+        read_tree(repo, Some(trees[0]))?,
+        read_tree(repo, Some(trees[1]))?,
+        read_tree(repo, Some(trees[2]))?,
+    ];
+    trivial_merge_trees(repo, descs, b"".as_bstr(), &mut result)?;
+
+    // `show_result()`.
+    let mut out = std::io::stdout().lock();
+    for item in &result {
+        show_result_list(&mut out, item)?;
+        show_diff(repo, &mut out, item)?;
+    }
+    out.flush()?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `fill_tree_descriptor()`: a tree's entries in tree order, or nothing at all
+/// for the absent side of a directory that only some operands have.
+fn read_tree(repo: &gix::Repository, id: Option<ObjectId>) -> Result<Vec<NameEntry>> {
+    let Some(id) = id else { return Ok(Vec::new()) };
+    let tree = repo.find_tree(id)?;
+    let mut out = Vec::new();
+    for entry in tree.iter() {
+        let entry = entry?;
+        out.push(NameEntry {
+            name: entry.filename().to_owned(),
+            mode: entry.mode().value() as u32,
+            id: entry.oid().to_owned(),
+        });
+    }
+    Ok(out)
+}
+
+/// `traverse_trees()` restricted to what `trivial_merge_trees()` needs: advance
+/// the three cursors together, grouping the entries `df_name_compare()` calls
+/// equal — which is why a file and a directory of the same name arrive together
+/// and reach `unresolved_directory()`.
+fn trivial_merge_trees(
+    repo: &gix::Repository,
+    trees: [Vec<NameEntry>; 3],
+    base: &BStr,
+    out: &mut Vec<Vec<MergeEntry>>,
+) -> Result<()> {
+    let mut idx = [0usize; 3];
+    loop {
+        let mut min: Option<NameEntry> = None;
+        for (i, tree) in trees.iter().enumerate() {
+            if let Some(e) = tree.get(idx[i]) {
+                if min
+                    .as_ref()
+                    .map_or(true, |m| df_name_compare(e, m) == std::cmp::Ordering::Less)
+                {
+                    min = Some(e.clone());
+                }
+            }
+        }
+        let Some(min) = min else { return Ok(()) };
+
+        let null = ObjectId::null(repo.object_hash());
+        let mut n: [NameEntry; 3] = std::array::from_fn(|_| NameEntry {
+            name: min.name.clone(),
+            mode: 0,
+            id: null,
+        });
+        for (i, tree) in trees.iter().enumerate() {
+            if let Some(e) = tree.get(idx[i]) {
+                if df_name_compare(e, &min) == std::cmp::Ordering::Equal {
+                    n[i] = e.clone();
+                    idx[i] += 1;
+                }
+            }
+        }
+        threeway_callback(repo, base, &n, out)?;
+    }
+}
+
+/// `df_name_compare()`: like `base_name_compare()`, except that a directory and
+/// a file of the same name compare *equal*, so the walk hands both to the same
+/// callback.
+fn df_name_compare(a: &NameEntry, b: &NameEntry) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let (n1, n2) = (a.name.as_slice(), b.name.as_slice());
+    let len = n1.len().min(n2.len());
+    match n1[..len].cmp(&n2[..len]) {
+        Ordering::Equal => {}
+        other => return other,
+    }
+    if n1.len() == n2.len() {
+        return Ordering::Equal;
+    }
+    // C reads the NUL terminator for the shorter name, and substitutes `/` for
+    // it when that side is a directory.
+    let at = |n: &[u8], e: &NameEntry| -> u8 {
+        match n.get(len) {
+            Some(&c) => c,
+            None if e.is_dir() => b'/',
+            None => 0,
+        }
+    };
+    let (c1, c2) = (at(n1, a), at(n2, b));
+    if (c1 == b'/' && c2 == 0) || (c2 == b'/' && c1 == 0) {
+        return Ordering::Equal;
+    }
+    c1.cmp(&c2)
+}
+
+/// `same_entry()`: "An empty entry never compares same, not even to another
+/// empty entry".
+fn same_entry(a: &NameEntry, b: &NameEntry) -> bool {
+    !a.is_null() && !b.is_null() && a.id == b.id && a.mode == b.mode
+}
+
+fn both_empty(a: &NameEntry, b: &NameEntry) -> bool {
+    a.is_null() && b.is_null()
+}
+
+/// `threeway_callback()`: the read-tree three-way resolution rules.
+fn threeway_callback(
+    repo: &gix::Repository,
+    base: &BStr,
+    n: &[NameEntry; 3],
+    out: &mut Vec<Vec<MergeEntry>>,
+) -> Result<()> {
+    // Modified, added or removed identically.
+    if same_entry(&n[1], &n[2]) || both_empty(&n[1], &n[2]) {
+        return Ok(()); // `resolve(info, NULL, …)` shows nothing.
+    }
+
+    if same_entry(&n[0], &n[1]) && !n[2].is_null() && !n[2].is_dir() {
+        // We did not touch, they modified — take theirs.
+        resolve(base, &n[1], &n[2], out);
+        return Ok(());
+    }
+    // Otherwise (a directory on one side, a file on the other) fall through to
+    // `unresolved()`, which recurses.
+
+    // We added, modified or removed, they did not touch — take ours.
+    if same_entry(&n[0], &n[2]) || both_empty(&n[0], &n[2]) {
+        return Ok(()); // again `resolve(info, NULL, …)`.
+    }
+
+    unresolved(repo, base, n, out)
+}
+
+/// `resolve()` with a non-NULL `ours`: the merged result plus the version it
+/// replaced, so `show_diff()` can show what taking theirs changed.
+fn resolve(base: &BStr, ours: &NameEntry, result: &NameEntry, out: &mut Vec<Vec<MergeEntry>>) {
+    let path = traverse_path(base, result.name.as_bstr());
+    out.push(vec![
+        MergeEntry { stage: 0, mode: result.mode, id: result.id, path: path.clone() },
+        MergeEntry { stage: 2, mode: ours.mode, id: ours.id, path },
+    ]);
+}
+
+/// `unresolved()`: recurse into any directory at this name first, then record
+/// the non-directory stages that are left.
+fn unresolved(
+    repo: &gix::Repository,
+    base: &BStr,
+    n: &[NameEntry; 3],
+    out: &mut Vec<Vec<MergeEntry>>,
+) -> Result<()> {
+    // A missing entry counts as a directory, so a name that is a directory
+    // wherever it exists is fully handled by the recursion below.
+    let mask = 0b111u8;
+    let mut dirmask = 0u8;
+    for (i, e) in n.iter().enumerate() {
+        if e.mode == 0 || e.is_dir() {
+            dirmask |= 1 << i;
+        }
+    }
+
+    unresolved_directory(repo, base, n, out)?;
+
+    if dirmask == mask {
+        return Ok(());
+    }
+
+    // `link_entry()` builds the chain back to front, so `their` ends up last.
+    let mut chain: Vec<MergeEntry> = Vec::new();
+    let mut path: Option<BString> = None;
+    for (stage, i) in [(3u8, 2usize), (2, 1), (1, 0)] {
+        let e = &n[i];
+        if e.mode == 0 || e.is_dir() {
+            continue;
+        }
+        // Every stage of one path shares the first path string that was built.
+        let p = path.get_or_insert_with(|| traverse_path(base, e.name.as_bstr())).clone();
+        chain.insert(0, MergeEntry { stage, mode: e.mode, id: e.id, path: p });
+    }
+    if !chain.is_empty() {
+        out.push(chain);
+    }
+    Ok(())
+}
+
+/// `unresolved_directory()`: descend into the sub-trees of whichever operands
+/// have a directory here, treating the others as absent.
+fn unresolved_directory(
+    repo: &gix::Repository,
+    base: &BStr,
+    n: &[NameEntry; 3],
+    out: &mut Vec<Vec<MergeEntry>>,
+) -> Result<()> {
+    let Some(first_dir) = n.iter().find(|e| e.mode != 0 && e.is_dir()) else {
+        return Ok(()); /* there is no tree here */
+    };
+    let newbase = traverse_path(base, first_dir.name.as_bstr());
+    let sub = [
+        read_tree(repo, dir_id(&n[0]))?,
+        read_tree(repo, dir_id(&n[1]))?,
+        read_tree(repo, dir_id(&n[2]))?,
+    ];
+    trivial_merge_trees(repo, sub, newbase.as_bstr(), out)
+}
+
+/// `ENTRY_OID()`: the entry's id only when it really is a directory.
+fn dir_id(e: &NameEntry) -> Option<ObjectId> {
+    (e.mode != 0 && e.is_dir()).then_some(e.id)
+}
+
+/// `strbuf_make_traverse_path()`: the base and the entry name joined by `/`.
+fn traverse_path(base: &BStr, name: &BStr) -> BString {
+    if base.is_empty() {
+        return name.to_owned();
+    }
+    let mut out = base.to_owned();
+    out.push(b'/');
+    out.extend_from_slice(name);
+    out
+}
+
+/// `explanation()`: the headline above one path's stages.
+fn explanation(item: &[MergeEntry]) -> &'static str {
+    match item[0].stage {
+        0 => "merged",
+        3 => "added in remote",
+        2 => {
+            if item.len() > 1 {
+                "added in both"
+            } else {
+                "added in local"
+            }
+        }
+        // Existed in base.
+        _ => match item.get(1) {
+            None => "removed in both",
+            Some(second) => {
+                if item.len() > 2 {
+                    "changed in both"
+                } else if second.stage == 3 {
+                    "removed in local"
+                } else {
+                    "removed in remote"
+                }
+            }
+        },
+    }
+}
+
+/// `show_result_list()`: the headline, then one `  <desc> <mode> <oid> <path>`
+/// line per stage.
+fn show_result_list(out: &mut impl Write, item: &[MergeEntry]) -> Result<()> {
+    const DESC: [&str; 4] = ["result", "base", "our", "their"];
+    write!(out, "{}\n", explanation(item))?;
+    for e in item {
+        write!(
+            out,
+            "  {:<6} {:o} {} {}\n",
+            DESC[e.stage as usize], e.mode, e.id, e.path
+        )?;
+    }
+    Ok(())
+}
+
+/// `show_diff()`: a bare unified diff (context 3, no file headers) from our
+/// version of the path to the merged result.
+fn show_diff(repo: &gix::Repository, out: &mut impl Write, item: &[MergeEntry]) -> Result<()> {
+    let src = origin(repo, item).unwrap_or_default();
+    let dst = merge_result(repo, item).unwrap_or_default();
+
+    let before = super::diff::byte_lines(&src);
+    let after = super::diff::byte_lines(&dst);
+    let mut input: InternedInput<Vec<u8>> = InternedInput::default();
+    input.update_before(before.iter().map(|l| l.to_vec()));
+    input.update_after(after.iter().map(|l| l.to_vec()));
+    let diff = diff_with_slider_heuristics(gix::diff::blob::Algorithm::Myers, &input);
+    if diff.count_additions() == 0 && diff.count_removals() == 0 {
+        return Ok(());
+    }
+    let hunks = UnifiedDiff::new(
+        &diff,
+        &input,
+        TrivialSink { buf: Vec::new(), before: &before, after: &after },
+        ContextSize::symmetrical(3),
+    )
+    .consume()?;
+    out.write_all(&hunks)?;
+    Ok(())
+}
+
+/// `origin()`: our version of the path, or nothing when we do not have one.
+fn origin(repo: &gix::Repository, item: &[MergeEntry]) -> Option<Vec<u8>> {
+    let e = item.iter().find(|e| e.stage == 2)?;
+    read_blob(repo, e.id)
+}
+
+/// `result()`: a stage-0 entry is the merged blob itself; anything else is fed
+/// through `merge_blobs()`.
+fn merge_result(repo: &gix::Repository, item: &[MergeEntry]) -> Option<Vec<u8>> {
+    if item[0].stage == 0 {
+        return read_blob(repo, item[0].id);
+    }
+    let stage = |s: u8| item.iter().find(|e| e.stage == s);
+    merge_blobs(
+        repo,
+        stage(1).map(|e| e.id),
+        stage(2).map(|e| e.id),
+        stage(3).map(|e| e.id),
+    )
+}
+
+/// `merge_blobs()` (merge-blobs.c): a side missing on either branch resolves to
+/// whichever side still has content — unless the path existed in the base, in
+/// which case the merge produces nothing at all. Two present sides go through
+/// `ll_merge()` with the `.our`/`.their` labels and no ancestor label.
+fn merge_blobs(
+    repo: &gix::Repository,
+    base: Option<ObjectId>,
+    ours: Option<ObjectId>,
+    theirs: Option<ObjectId>,
+) -> Option<Vec<u8>> {
+    let (Some(our_id), Some(their_id)) = (ours, theirs) else {
+        if base.is_some() {
+            return None;
+        }
+        return read_blob(repo, ours.or(theirs)?);
+    };
+    let our = read_blob(repo, our_id)?;
+    let their = read_blob(repo, their_id)?;
+    let ancestor = base.and_then(|id| read_blob(repo, id)).unwrap_or_default();
+
+    // `ll_merge()` hands a binary buffer to `ll_binary_merge()`, whose default
+    // variant keeps our side verbatim and reports a conflict.
+    if buffer_is_binary(&our) || buffer_is_binary(&their) || buffer_is_binary(&ancestor) {
+        return Some(our);
+    }
+
+    let mut merged = Vec::new();
+    let mut input = InternedInput::default();
+    // `Merge::new` takes the operands in `git merge-file` order —
+    // current, ancestor, other — not `ll_merge`'s ancestor-first order.
+    let merge = TextMerge::new(
+        &mut input,
+        &our,
+        &ancestor,
+        &their,
+        gix::diff::blob::Algorithm::Myers,
+    );
+    merge.run_with(
+        &mut merged,
+        Labels {
+            ancestor: None,
+            current: Some(b".our".as_bstr()),
+            other: Some(b".their".as_bstr()),
+        },
+        Rendering {
+            conflict: MergeConflict::Keep {
+                style: ConflictStyle::Merge,
+                marker_size: std::num::NonZeroU8::new(7).expect("nonzero"),
+            },
+            style: Some(ConflictStyle::Merge),
+            // `ll_xdl_merge()` sets `xmp.level = XDL_MERGE_ZEALOUS`.
+            level: Level::Zealous,
+            marker_size: Some(7),
+        },
+    );
+    Some(merged)
+}
+
+/// `buffer_is_binary()`: a NUL in the first 8000 bytes.
+fn buffer_is_binary(data: &[u8]) -> bool {
+    data[..data.len().min(8000)].contains(&0)
+}
+
+/// `odb_read_object()`: the object's bytes, or nothing when it is not there.
+fn read_blob(repo: &gix::Repository, id: ObjectId) -> Option<Vec<u8>> {
+    repo.find_object(id).ok().map(|o| o.data.clone())
+}
+
+/// The `xdi_diff` sink for [`show_diff`]: hunk headers and body lines only, with
+/// no `---`/`+++` header and no function-context suffix (the deprecated mode
+/// leaves `xecfg.flags` at zero).
+struct TrivialSink<'a> {
+    buf: Vec<u8>,
+    before: &'a [&'a [u8]],
+    after: &'a [&'a [u8]],
+}
+
+impl ConsumeHunk for TrivialSink<'_> {
+    type Out = Vec<u8>;
+
+    fn consume_hunk(
+        &mut self,
+        header: HunkHeader,
+        lines: &[(DiffLineKind, &[u8])],
+    ) -> std::io::Result<()> {
+        let range = |start: u32, len: u32| match len {
+            1 => format!("{start}"),
+            0 => format!("{},0", start.saturating_sub(1)),
+            _ => format!("{start},{len}"),
+        };
+        self.buf.extend_from_slice(
+            format!(
+                "@@ -{} +{} @@\n",
+                range(header.before_hunk_start, header.before_hunk_len),
+                range(header.after_hunk_start, header.after_hunk_len)
+            )
+            .as_bytes(),
+        );
+
+        let mut bi = header.before_hunk_start.saturating_sub(1) as usize;
+        let mut ai = header.after_hunk_start.saturating_sub(1) as usize;
+        for (kind, fallback) in lines {
+            let (marker, content): (u8, &[u8]) = match kind {
+                DiffLineKind::Context => {
+                    let c = self.after.get(ai).copied().unwrap_or(fallback);
+                    bi += 1;
+                    ai += 1;
+                    (b' ', c)
+                }
+                DiffLineKind::Remove => {
+                    let c = self.before.get(bi).copied().unwrap_or(fallback);
+                    bi += 1;
+                    (b'-', c)
+                }
+                DiffLineKind::Add => {
+                    let c = self.after.get(ai).copied().unwrap_or(fallback);
+                    ai += 1;
+                    (b'+', c)
+                }
+            };
+            self.buf.push(marker);
+            self.buf.extend_from_slice(content);
+            if content.last() != Some(&b'\n') {
+                self.buf.push(b'\n');
+                self.buf
+                    .extend_from_slice(b"\\ No newline at end of file\n");
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> Vec<u8> {
+        self.buf
     }
 }
 

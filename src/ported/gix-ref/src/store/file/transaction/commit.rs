@@ -72,7 +72,14 @@ impl Transaction<'_, '_> {
                             }
                         };
                         if let Some((previous, new_oid)) = log_update {
-                            let do_update = previous.as_ref() != Some(new_oid);
+                            // `files_transaction_finish()` writes the reflog when
+                            // `REF_NEEDS_COMMIT || REF_LOG_ONLY`. `lock_ref_for_update()`
+                            // withholds `REF_NEEDS_COMMIT` when the value is unchanged, but a
+                            // log-only update — the `HEAD` half of a dereferenced or
+                            // head-split edit — is logged regardless. That is why `git reset`
+                            // with no argument still appends `reset: moving to HEAD` to
+                            // `.git/logs/HEAD` while leaving the branch log untouched.
+                            let do_update = log.mode == RefLog::Only || previous.as_ref() != Some(new_oid);
                             if do_update {
                                 self.store.reflog_create_or_append(
                                     change.update.name.as_ref(),
@@ -113,12 +120,49 @@ impl Transaction<'_, '_> {
                         }
                     }
                 }
-                Change::Delete { .. } => {}
+                // A deletion never sets `REF_NEEDS_COMMIT` (`lock_ref_for_update()` skips the
+                // write-and-flag branch for `REF_DELETING`), so it logs nothing and its log is
+                // unlinked below — *unless* it is git's `REF_LOG_ONLY`, the shape
+                // `split_symref_update()` leaves behind for `HEAD`. `update-ref -d HEAD`
+                // therefore appends `<old> <null>` to `.git/logs/HEAD` and keeps that log,
+                // while `refs/heads/main` and its log are removed.
+                //
+                // `log_only_split` and not `RefLog::Only`: a caller passing `RefLog::Only`
+                // directly means gix's "delete the reflog, keep the reference", which has no
+                // git counterpart and must still delete the log.
+                //
+                // The entry carries no message: `Change::Delete` has nowhere to put one, so
+                // `update-ref -d -m <msg>` loses the message git would have recorded here.
+                Change::Delete { expected, .. } => {
+                    if change.log_only_split {
+                        let previous = match expected {
+                            PreviousValue::MustExistAndMatch(Target::Object(oid))
+                            | PreviousValue::ExistingMustMatch(Target::Object(oid)) => Some(oid.to_owned()),
+                            _ => None,
+                        }
+                        .or(change.leaf_referent_previous_oid);
+                        self.store.reflog_create_or_append(
+                            change.update.name.as_ref(),
+                            previous,
+                            &self.store.object_hash.null(),
+                            committer,
+                            "".into(),
+                            false,
+                        )?;
+                    }
+                }
             }
         }
 
         for change in &mut updates {
             let (reflog_root, relative_name) = self.store.reflog_base_and_relative_path(change.update.name.as_ref());
+            // `files_transaction_finish()` unlinks the reflog only for updates that are
+            // `REF_DELETING && !REF_LOG_ONLY`; the log-only mirror exists precisely to add an
+            // entry to a log that stays. A caller-requested `RefLog::Only` deletion is not that
+            // flag — it is a request to remove the log — so it falls through and deletes.
+            if change.log_only_split {
+                continue;
+            }
             match &change.update.change {
                 Change::Update { .. } => {}
                 Change::Delete { .. } => {

@@ -25,6 +25,7 @@ pub mod dashed;
 pub mod doctor;
 pub mod gitls;
 pub mod hooks;
+pub mod htmldoc;
 pub mod ledger;
 pub mod lscolors;
 pub mod manpage;

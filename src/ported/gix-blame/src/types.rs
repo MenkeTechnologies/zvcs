@@ -192,8 +192,73 @@ pub struct Options {
     /// commit's parents are used as scapegoats, everything after the first one is dropped, so a
     /// merge only ever passes blame back along its first-parent line and the side branch is never
     /// entered.
+    ///
+    /// Ignored under [`Self::children`]: `first_scapegoat()` only consults `first_parent_only` on
+    /// the forward side, and in reverse the caller expresses it by handing over a children map
+    /// that follows the first-parent chain (`blame.c:2842-2859`).
     pub first_parent: bool,
+    /// Walk the history *forwards* instead of backwards (`git blame --reverse <rev>..<rev>`).
+    ///
+    /// This is git's `sb->reverse` and the `revs->children` decoration it goes with, which is the
+    /// whole of the inversion: with it set,
+    /// [`first_scapegoat()`](https://github.com/git/git/blob/v2.55.0/blame.c#L2367) returns
+    /// `lookup_decoration(&revs->children, commit)` instead of `commit->parents`, and
+    /// `setup_scoreboard()` orders the commit queue by `compare_commits_by_reverse_commit_date`
+    /// so the oldest commit is examined first. Everything else — the diff, the splitting, the
+    /// handing over of entries — is the same code as forwards, which is why a line ends up
+    /// attributed to the *last* commit that still had it.
+    ///
+    /// The map is `revs->children` itself: for every commit in the range, the commits in that same
+    /// range that have it as a parent. git builds it in `set_children()` (`revision.c`) while
+    /// `prepare_revision_walk()` runs, so it covers exactly the commits the range selected and
+    /// stops the walk at the range's tips, where a commit has no children.
+    ///
+    /// The final image is the blob at `suspect`, which for `A..B` is the range's *oldest*
+    /// endpoint `A` — git's `find_single_initial()`.
+    pub children: Option<Children>,
+    /// The synthetic commit `setup_scoreboard()` builds on top of `suspect` when the final image
+    /// does not come out of `suspect`'s tree — git's
+    /// [`fake_working_tree_commit()`](https://github.com/git/git/blob/v2.55.0/blame.c#L188), which
+    /// is how `git blame <path>` blames the working tree and how `--contents` blames an arbitrary
+    /// file.
+    ///
+    /// [`file()`](crate::file()) does not attribute the overlay's own lines — it starts at
+    /// `suspect`, and mapping the overlay onto the attribution it produces is the caller's job.
+    /// What is modelled here is the rest of what that commit is in git: an ordinary origin taking
+    /// part in `pass_blame()`, which is why it shows up in [`Statistics`] and in the refcount graph
+    /// behind [`Outcome::suspect_refcounts`].
+    pub fake_commit: Option<FakeCommit>,
 }
+
+/// git's `revs->children`: the commits of the walked range that have a given commit as a parent,
+/// in the order `first_scapegoat()` hands them to `pass_blame()`.
+pub type Children = std::collections::HashMap<ObjectId, Vec<ObjectId>>;
+
+/// The part of git's `fake_working_tree_commit()` origin that outlives the caller's own overlay
+/// handling — see [`Options::fake_commit`].
+///
+/// The one thing it says is decided by the comparison the caller makes anyway, between the
+/// overlay's bytes and the blob at `suspect`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FakeCommit {
+    /// The overlay is byte-identical to `suspect`'s blob, so the fake commit's `pass_blame()` ends
+    /// in [`pass_whole_blame()`](https://github.com/git/git/blob/v2.55.0/blame.c#L2342): it counts
+    /// no commit and no patch, and hands `suspect`'s origin the buffer it had already read
+    /// ("Steal its file") rather than letting it read the blob again.
+    ///
+    /// When this is `false` the fake commit diffs against `suspect` like any other commit: one
+    /// `num_commits`, one `num_get_patch` and one `num_read_blob` for the blob it reads into
+    /// `suspect`'s origin — which is cached either way, so the walk itself never re-reads it. It
+    /// also gains a `blame_origin::previous` pointing at that origin, which the caller adds to
+    /// [`Outcome::suspect_previous`] before asking [`suspect_refcounts()`](crate::suspect_refcounts())
+    /// for the counts.
+    pub passes_whole_blame: bool,
+}
+
+/// How an origin is named outside the walk: the commit, and the *Source File* name the entries of
+/// that origin carry — `None` for the path being blamed. git's `fake_working_tree_commit()` has a
+/// null object id, so that is the key its origin goes under.
+pub type OriginKey = (ObjectId, Option<BString>);
 
 /// How hard `git blame -C` looks for the file a chunk was copied from, i.e. which of git's
 /// `PICKAXE_BLAME_COPY*` bits are set.
@@ -329,6 +394,20 @@ pub struct Outcome {
     pub statistics: Statistics,
     /// Contains a log of all changes that affected the outcome of this blame.
     pub blame_path: Option<Vec<BlamePathEntry>>,
+    /// git's `blame_origin::refcnt` for the origins [`Self::entries`] keeps alive, as
+    /// [`suspect_refcounts()`](crate::suspect_refcounts()) computes it.
+    ///
+    /// A caller that changes which entries end up in the output — by laying a working-tree overlay
+    /// over them, or by applying `-L` afterwards — has a different entry list from this one and
+    /// should recompute from that list instead, since a reference is exactly one blame entry.
+    pub suspect_refcounts: std::collections::BTreeMap<OriginKey, u32>,
+    /// git's `blame_origin::previous`: for each origin that handed entries to a scapegoat, the
+    /// first scapegoat it handed them to (`blame.c:2480-2483`).
+    ///
+    /// This is the origin `git blame --porcelain` names in its `previous` line
+    /// (`builtin/blame.c:393-399`), which walking backwards is a parent and walking forwards is a
+    /// child.
+    pub suspect_previous: std::collections::BTreeMap<OriginKey, OriginKey>,
 }
 
 /// Additional information about the performed operations.
@@ -349,6 +428,32 @@ pub struct Statistics {
     /// The amount of blobs there were compared to each other to learn what changed between commits.
     /// Note that in order to diff a blob, one needs to load both versions from the database.
     pub blobs_diffed: usize,
+    /// git's `blame_scoreboard::num_read_blob`, the first of the three counters
+    /// `git blame --show-stats` prints.
+    ///
+    /// One for the final image `setup_scoreboard()` reads (`blame.c:2889`), plus one for every
+    /// [`fill_origin_blob()`](https://github.com/git/git/blob/v2.55.0/blame.c#L1031) that found
+    /// `blame_origin::file` empty (`blame.c:1039`). It is therefore a count of *misses* of a
+    /// per-origin blob cache, not of diffs: the same blob is read once per origin that needs it and
+    /// keeps needing it, and an origin that is handed a buffer by `pass_whole_blame()` never reads
+    /// at all.
+    pub num_read_blob: u32,
+    /// git's `blame_scoreboard::num_get_patch`: one per
+    /// [`pass_blame_to_parent()`](https://github.com/git/git/blob/v2.55.0/blame.c#L1944) that
+    /// found entries left to hand over (`blame.c:1965`), including the second, `ignore_diffs` pass
+    /// an `--ignore-rev` commit makes over the same parents.
+    ///
+    /// The `-M` and `-C` searches do not count here: they diff with `find_copy_in_blob()` rather
+    /// than through `pass_blame_to_parent()`.
+    pub num_get_patch: u32,
+    /// git's `blame_scoreboard::num_commits`: one per
+    /// [`pass_blame()`](https://github.com/git/git/blob/v2.55.0/blame.c#L2416) that reached
+    /// `blame.c:2473`, i.e. per origin that had at least one scapegoat and did not already give
+    /// everything away through `pass_whole_blame()`.
+    ///
+    /// It counts origins rather than commits: under `-C` one commit can be the suspect for chunks
+    /// that came from several of its files, and each of those is its own `pass_blame()`.
+    pub num_commits: u32,
 }
 
 impl Outcome {

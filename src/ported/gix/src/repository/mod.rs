@@ -114,6 +114,12 @@ pub mod blame_file {
         pub detect_copied: Option<gix_blame::CopyDetection>,
         /// Follow only the first parent of every commit (`git blame --first-parent`).
         pub first_parent: bool,
+        /// Walk the history forwards instead of backwards (`git blame --reverse <rev>..<rev>`),
+        /// carrying git's `revs->children` decoration.
+        pub children: Option<gix_blame::Children>,
+        /// The synthetic commit holding the final image, when it does not come from `suspect`'s
+        /// tree (git's `fake_working_tree_commit()`).
+        pub fake_commit: Option<gix_blame::FakeCommit>,
     }
 
     /// The error returned by [Repository::blame_file()](crate::Repository::blame_file()).

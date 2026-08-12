@@ -28,6 +28,7 @@ mod apply;
 mod archimport;
 mod archive;
 mod backfill;
+mod binary_patch;
 mod bisect;
 mod blame;
 mod branch;
@@ -98,7 +99,9 @@ mod gc;
 mod get_tar_commit_id;
 mod grep;
 mod hash_object;
-mod help;
+// Public: `git --info-path` and the HTML documentation set read its
+// command-list tables (`help::topics`, `help::info_dir`).
+pub mod help;
 mod history;
 mod hook;
 mod http_backend;

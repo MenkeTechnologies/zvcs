@@ -151,6 +151,24 @@ fn run_command() -> ExitCode {
                 std::env::set_var("GIT_EXEC_PATH", &s["--exec-path=".len()..]);
                 idx += 1;
             }
+            // The three `print_system_path()` queries beside it in
+            // `handle_options`: each prints one directory of the installation and
+            // exits, ignoring whatever follows. git's prefix is its build's; this
+            // port's is `$ZVCS_HOME`, which is where its man pages, HTML pages and
+            // info tree are installed — the same paths `git help -m/-w/-i` resolve
+            // against, so a scripted `git --html-path` and `git help -w` agree.
+            "--html-path" => {
+                println!("{}", superset::htmldoc::html_dir().display());
+                return ExitCode::SUCCESS;
+            }
+            "--man-path" => {
+                println!("{}", superset::manpage::man_dir().display());
+                return ExitCode::SUCCESS;
+            }
+            "--info-path" => {
+                println!("{}", porcelain::help::info_dir().display());
+                return ExitCode::SUCCESS;
+            }
             _ => break,
         }
     }

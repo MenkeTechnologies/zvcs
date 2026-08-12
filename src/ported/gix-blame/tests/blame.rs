@@ -261,6 +261,7 @@ macro_rules! mktest {
                     since: None,
                     rewrites: Some(gix_diff::Rewrites::default()),
                     debug_track_path: false,
+                    ..Default::default()
                 },
             )?
             .entries;
@@ -350,6 +351,7 @@ fn diff_algorithm_parity() {
                 since: None,
                 rewrites: Some(gix_diff::Rewrites::default()),
                 debug_track_path: false,
+                ..Default::default()
             },
         )
         .unwrap()
@@ -419,6 +421,7 @@ fn since() -> gix_testtools::Result {
             ),
             rewrites: Some(gix_diff::Rewrites::default()),
             debug_track_path: false,
+            ..Default::default()
         },
     )?
     .entries;
@@ -459,6 +462,7 @@ mod blame_ranges {
                 since: None,
                 rewrites: Some(gix_diff::Rewrites::default()),
                 debug_track_path: false,
+                ..Default::default()
             },
         )?
         .entries;
@@ -502,6 +506,7 @@ mod blame_ranges {
                 since: None,
                 rewrites: None,
                 debug_track_path: false,
+                ..Default::default()
             },
         )?
         .entries;
@@ -543,6 +548,7 @@ mod blame_ranges {
                 since: None,
                 rewrites: None,
                 debug_track_path: false,
+                ..Default::default()
             },
         )?
         .entries;
@@ -589,6 +595,7 @@ mod rename_tracking {
                 since: None,
                 rewrites: Some(gix_diff::Rewrites::default()),
                 debug_track_path: false,
+                ..Default::default()
             },
         )?
         .entries;
@@ -619,6 +626,7 @@ mod rename_tracking {
                     since: None,
                     rewrites: Some(gix_diff::Rewrites::default()),
                     debug_track_path: false,
+                    ..Default::default()
                 },
             )?
             .entries;

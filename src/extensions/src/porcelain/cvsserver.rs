@@ -7,11 +7,28 @@
 //! implementation and no plumbing equivalent.
 //!
 //! What is ported here (byte-identical to stock, verified against git 2.55.0):
-//!   * The `Getopt::Long` front end at `git-cvsserver.perl:111-137` — the exact
+//!   * The `Getopt::Long` front end at `git-cvsserver.perl:123-135` — the exact
 //!     usage text, unique-prefix and case-insensitive long-option matching,
 //!     `--version`/`-V` output, and the three `warn` + `die $usage` failure
 //!     paths (`Unknown option: X`, `Option X requires an argument`,
 //!     `Option X does not take an argument`), all on stderr with exit 255.
+//!   * The operand handling at `:140-156`: a leading `pserver` or `server`
+//!     selects the method and is dropped, everything else is an allowed root,
+//!     and `--export-all` without one dies
+//!     `--export-all can only be used together with an explicit '<directory>...'
+//!     list`.
+//!   * The `pserver` header check at `:179-183`: the first line must be
+//!     `BEGIN AUTH REQUEST` or `BEGIN VERIFICATION REQUEST`, and anything else —
+//!     including nothing at all, where perl's undef interpolates as the empty
+//!     string — is `E Do not understand <line> - expecting BEGIN AUTH REQUEST`
+//!     with exit 255.
+//!   * The `while (<STDIN>)` request loop's own termination, at `:254` and
+//!     `:277-278`: a client that sends nothing is not an error. The loop body
+//!     never runs, `git-cvsserver` prints nothing and exits **0** — which is
+//!     what `git cvsserver` with stdin closed does, and (because `-h` sets
+//!     `$state->{h}` while the guard at `:132` reads `$state->{help}`, so the
+//!     help branch is dead code in stock git) also what `git cvsserver -h`
+//!     does.
 //!
 //! What is NOT ported — the server itself. Everything past option parsing
 //! (`pserver` authentication against `gitcvs.authdb`, the `Root`/`Directory`/
@@ -31,11 +48,11 @@
 //!     so a plausible-looking reimplementation is worse than none: it would
 //!     silently corrupt working copies rather than fail loudly.
 //!
-//! `-h`/`-H` also bail: in stock git they are a no-op. `@opts` declares
-//! `'h|H'`, which populates `$state->{h}`, but the guard at
-//! `git-cvsserver.perl:134` tests `$state->{help}` — so `-h` prints nothing and
-//! falls straight into the server loop. Reproducing that means reproducing the
-//! server loop.
+//! `-h`/`-H` are *not* help in stock git: `@opts` declares `'h|H'`, which
+//! populates `$state->{h}`, but the guard at `git-cvsserver.perl:132` tests
+//! `$state->{help}` — so `-h` prints nothing and falls straight into the server
+//! loop, where a closed stdin ends it with exit 0. That is reproduced; the usage
+//! text is only ever printed by the option-parsing failure path, as in stock.
 
 use anyhow::{bail, Result};
 use std::io::Write;
@@ -127,9 +144,7 @@ pub fn cvsserver(args: &[String]) -> Result<ExitCode> {
     // options produce two `Unknown option:` lines above a single usage block.
     let mut errors: Vec<String> = Vec::new();
     let mut want_version = false;
-    // Any option that only matters to the server loop; recorded so the bail
-    // below can name the flag that was actually asked for.
-    let mut server_flag: Option<String> = None;
+    let mut export_all = false;
     let mut operands: Vec<&str> = Vec::new();
 
     let mut it = args.iter().peekable();
@@ -167,7 +182,10 @@ pub fn cvsserver(args: &[String]) -> Result<ExitCode> {
                 }
                 match canonical {
                     "version" => want_version = true,
-                    other => server_flag = Some(other.to_string()),
+                    "export-all" => export_all = true,
+                    // `h`/`H` sets `$state->{h}`, which nothing reads, and
+                    // `base-path`/`strict-paths` only steer request handling.
+                    _ => {}
                 }
             }
         }
@@ -183,20 +201,138 @@ pub fn cvsserver(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
-    if let Some(flag) = server_flag {
+    // `:141-148` — a leading `pserver`/`server` names the transport and is
+    // dropped; whatever remains is the allowed-roots list.
+    let method_is_pserver = match operands.first() {
+        Some(&"pserver") => {
+            operands.remove(0);
+            true
+        }
+        Some(&"server") => {
+            operands.remove(0);
+            false
+        }
+        _ => false,
+    };
+
+    // `:154-156`. The message ends in its own newline, so perl's `die` adds no
+    // ` at <script> line <n>.` suffix.
+    if export_all && operands.is_empty() {
+        eprintln!("--export-all can only be used together with an explicit '<directory>...' list");
+        return Ok(ExitCode::from(255));
+    }
+
+    if method_is_pserver {
+        // `:180-183` — the authentication cat starts with one line that must be
+        // the request header. A client that sends nothing leaves `$line` undef,
+        // which `chomp`/`m//` warn about and interpolate as the empty string.
+        let first = read_line()?.unwrap_or_default();
+        let first = first.as_str();
+        if first != "BEGIN AUTH REQUEST" && first != "BEGIN VERIFICATION REQUEST" {
+            // The `die` string ends in its own newline, so perl adds no
+            // ` at <script> line <n>.` suffix. Exit 255.
+            eprintln!("E Do not understand {first} - expecting BEGIN AUTH REQUEST");
+            return Ok(ExitCode::from(255));
+        }
         bail!(
-            "unsupported flag {flag:?} (ported: --version/-V and the option-parsing \
-             failure paths only; every other flag feeds the CVS protocol server, which \
-             has no gitoxide substrate — no CVS wire-protocol implementation and no \
-             gitcvs.*.sqlite revision database)"
+            "the pserver authentication exchange is not ported (ported: option parsing, \
+             --version/-V, the operand split, the `BEGIN … REQUEST` header check and the \
+             request loop's end-of-input path). Past the header it reads the root, user and \
+             scrambled password and answers I LOVE YOU / I HATE YOU against the [gitcvs] \
+             authdb, which needs the CVS root resolution the server half provides plus a \
+             crypt(3) check of the descrambled password"
         );
     }
 
-    bail!(
-        "unsupported: the CVS protocol server is not ported (ported: --version/-V and \
-         the option-parsing failure paths). Stock git-cvsserver is a Perl script that \
-         speaks the CVS request/response protocol on stdin/stdout and keeps CVS revision \
-         numbers in a DBD::SQLite database; the vendored gitoxide implements neither, and \
-         an approximation would silently corrupt existing CVS sandboxes"
-    );
+    request_loop()
 }
+
+/// `git-cvsserver.perl:254-278`'s `while (<STDIN>)`.
+///
+/// The end of that loop is the whole of what can be ported: a client that
+/// closes the connection without sending a request leaves the loop body unrun,
+/// and the script falls through to `chdir '/'; exit 0` having printed nothing.
+/// Every line that *is* read dispatches into the CVS protocol handlers, which
+/// are not ported — see the module docs for the missing substrate — so a real
+/// request reports that rather than answering it.
+fn request_loop() -> Result<ExitCode> {
+    loop {
+        // `while (<STDIN>)`: end of input ends the loop, and nothing else does.
+        let Some(request) = read_line()? else {
+            return Ok(ExitCode::SUCCESS);
+        };
+        let request = request.as_str();
+        // `if (/^([\w-]+)(?:\s+(.*))?$/ and defined($methods->{$1}))`, else
+        // `die("Unknown command $_")` — 255, since `$!` and `$?` are clear.
+        let verb = match request.find(char::is_whitespace) {
+            Some(at) => &request[..at],
+            None => request,
+        };
+        let known = !verb.is_empty()
+            && verb.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+            && METHODS.contains(&verb);
+        if !known {
+            eprintln!("Unknown command {request}");
+            return Ok(ExitCode::from(255));
+        }
+        bail!(
+            "the CVS request {verb:?} is not ported (ported: option parsing, --version/-V, \
+             the operand split and the request loop's end-of-input path). Stock \
+             git-cvsserver answers it from a DBD::SQLite revision database it maintains \
+             per head (gitcvs.<module>.sqlite), whose schema and incremental-update rules \
+             are defined only by that Perl script; the vendored gitoxide has neither a CVS \
+             wire-protocol layer nor that database, and an approximation would hand a CVS \
+             client wrong revision numbers and silently corrupt its sandbox"
+        );
+    }
+}
+
+/// One `<STDIN>` read plus `chomp`: `None` at end of input.
+///
+/// Read as bytes rather than as text because the CVS protocol carries file
+/// names, and a client that sends one in a non-UTF-8 encoding must get the
+/// protocol's own answer rather than a decoding error from this process.
+fn read_line() -> Result<Option<String>> {
+    let mut buf: Vec<u8> = Vec::new();
+    if std::io::BufRead::read_until(&mut std::io::stdin().lock(), b'\n', &mut buf)? == 0 {
+        return Ok(None);
+    }
+    if buf.last() == Some(&b'\n') {
+        buf.pop();
+    }
+    Ok(Some(String::from_utf8_lossy(&buf).into_owned()))
+}
+
+/// The keys of `$methods` at `git-cvsserver.perl:58-88`, which is what decides
+/// whether a request line is dispatched or is an `Unknown command` death.
+const METHODS: &[&str] = &[
+    "Root",
+    "Valid-responses",
+    "valid-requests",
+    "Directory",
+    "Sticky",
+    "Entry",
+    "Modified",
+    "Unchanged",
+    "Questionable",
+    "Argument",
+    "Argumentx",
+    "expand-modules",
+    "add",
+    "remove",
+    "co",
+    "update",
+    "ci",
+    "diff",
+    "log",
+    "rlog",
+    "tag",
+    "status",
+    "admin",
+    "history",
+    "watchers",
+    "editors",
+    "noop",
+    "annotate",
+    "Global_option",
+];

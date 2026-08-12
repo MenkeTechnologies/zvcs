@@ -13,6 +13,14 @@
 //!     line, on **stderr**, exit 129
 //!   * the `-d`/`-D` arity check → `fatal: You must specify only one branch name
 //!     when deleting a remote branch`, exit 128
+//!   * `http_init(NULL, repo->url, 1)`'s `credential_from_url()` — the last
+//!     thing that runs before the first DAV request, and the reason
+//!     `git http-push --no-such-flag` is not a usage error at all: the unknown
+//!     flag falls through to become the URL, which then has no scheme, so git
+//!     warns `url has no scheme: --no-such-flag/` and dies
+//!     `credential url cannot be parsed: --no-such-flag/` with exit 128. Shared
+//!     with the `remote-curl` helpers, which reach the same check from
+//!     `remote-curl.c` (see [`super::remote_http::credential_url_is_parseable`]).
 //! ```
 //! (all checked against git 2.55.0 by running the stock binary.)
 //!
@@ -124,10 +132,18 @@ pub fn http_push(args: &[String]) -> Result<ExitCode> {
         )
     }
 
-    // `if (delete_branch && rc != 1) die(...)` — `rc` is the number of `<head>`
-    // arguments, which is zero on this path, so the check always fires.
+    // `if (delete_branch && rs.nr != 1) die(...)` — `rs.nr` is the number of
+    // `<head>` arguments, which is zero on this path, so the check always fires.
     if state.delete_branch {
         eprintln!("fatal: You must specify only one branch name when deleting a remote branch");
+        return Ok(ExitCode::from(128));
+    }
+
+    // `http_init(NULL, repo->url, 1)`, which parses the URL for credentials
+    // before issuing a single request and dies on one it cannot parse. This is
+    // the last check reachable without a server.
+    if !super::remote_http::credential_url_is_parseable(url.as_bytes()) {
+        eprintln!("fatal: credential url cannot be parsed: {url}");
         return Ok(ExitCode::from(128));
     }
 

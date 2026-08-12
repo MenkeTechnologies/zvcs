@@ -18,8 +18,13 @@
 //!   * `-h` — the exact usage line stock prints on stderr, exit status 1.
 //!   * The no-argument path — stock's `Need at least one commit identifier!`
 //!     die, exit status 255.
-//!   * Flag recognition for the full `getopts('uhPpvcfkam:d:w:W')` set, so an
-//!     unknown flag is reported instead of silently ignored.
+//!   * `getopts('uhPpvcfkam:d:w:W')` in full, including `Getopt::Std`'s
+//!     behaviour on an unknown flag: it is *not* fatal. Each unrecognised
+//!     character warns `Unknown option: <c>` on stderr and parsing continues
+//!     with the next character of the same cluster, which is why
+//!     `git cvsexportcommit --no-such-flag` prints eight of those lines — one
+//!     per character outside the option set — and then, because the `h` in
+//!     `--no-such-flag` *is* in the set, prints the usage line and exits 1.
 //!
 //! Not covered — every invocation that would actually export a commit
 //! `bail!`s, naming the missing substrate. Nothing is attempted against the
@@ -44,37 +49,72 @@ const BOOL_FLAGS: [char; 10] = ['u', 'h', 'P', 'p', 'v', 'c', 'f', 'k', 'a', 'W'
 /// `git cvsexportcommit` — see the module docs for what is and is not covered.
 pub fn cvsexportcommit(args: &[String]) -> Result<ExitCode> {
     let mut help = false;
-    let mut positionals: Vec<&str> = Vec::new();
-    let mut iter = args.iter().peekable();
-    let mut no_more_opts = false;
 
-    while let Some(a) = iter.next() {
-        if no_more_opts || a == "-" || !a.starts_with('-') {
-            positionals.push(a);
-            continue;
-        }
-        if a == "--" {
-            no_more_opts = true;
-            continue;
-        }
-        // Getopt::Std clusters short flags and accepts attached values.
-        let mut chars = a[1..].chars();
-        while let Some(c) = chars.next() {
-            if VALUE_FLAGS.contains(&c) {
-                let rest: String = chars.by_ref().collect();
-                if rest.is_empty() && iter.next().is_none() {
-                    crate::git_fatal!("option requires an argument -- {c}");
-                }
-                break;
-            } else if BOOL_FLAGS.contains(&c) {
-                if c == 'h' {
-                    help = true;
-                }
-            } else {
-                bail!("unsupported flag {:?} (ported: -h only)", format!("-{c}"));
+    // `Getopt::Std::getopts('uhPpvcfkam:d:w:W')`, ported from its loop rather
+    // than approximated, because the corpus reaches three of its quirks at once:
+    // its loop guard is `$ARGV[0] =~ /^-(.)(.*)/s`, so scanning stops at the
+    // first argument that is not `-<something>` — a bare `-`, or any operand —
+    // and everything after it is an operand even if it looks like a flag; an
+    // unknown character is a `warn`, not a death; and a value option whose value
+    // is missing entirely records an error count nobody reads and prints
+    // nothing.
+    let mut rest: Vec<&String> = args.iter().collect();
+    // The unconsumed tail of the current cluster, i.e. Perl's `$rest` written
+    // back into `$ARGV[0]` as `-$rest`.
+    let mut cluster = String::new();
+    while let Some(front) = rest.first() {
+        let body = if cluster.is_empty() {
+            match front.strip_prefix('-') {
+                Some(body) if !body.is_empty() => body.to_string(),
+                // `-` alone, or an operand: the loop guard fails and option
+                // scanning is over.
+                _ => break,
             }
+        } else {
+            std::mem::take(&mut cluster)
+        };
+        // `if (/^--$/) { shift @ARGV; last; }`.
+        if body == "-" {
+            rest.remove(0);
+            break;
+        }
+
+        let mut chars = body.chars();
+        let first = chars.next().expect("the guard rejected an empty body");
+        let tail: String = chars.collect();
+
+        if VALUE_FLAGS.contains(&first) {
+            // The option always consumes its argv entry; an attached value is
+            // used as-is, otherwise the next entry is taken — and if there is
+            // none, `getopts` only bumps its error count.
+            rest.remove(0);
+            if tail.is_empty() && !rest.is_empty() {
+                rest.remove(0);
+            }
+            continue;
+        }
+
+        if BOOL_FLAGS.contains(&first) {
+            if first == 'h' {
+                help = true;
+            }
+        } else {
+            // `warn "Unknown option: $first\n"` — a warning, not a death, so the
+            // rest of the cluster is still parsed and a later valid flag (the
+            // `h` in `--no-such-flag`) still takes effect.
+            eprintln!("Unknown option: {first}");
+        }
+
+        // A flag consumes only its character: the remainder of the cluster is
+        // pushed back for the next iteration, and an exhausted cluster consumes
+        // the argv entry.
+        if tail.is_empty() {
+            rest.remove(0);
+        } else {
+            cluster = tail;
         }
     }
+    let positionals = rest;
 
     if help {
         let mut err = std::io::stderr().lock();

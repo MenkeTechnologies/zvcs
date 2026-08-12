@@ -16,7 +16,9 @@
 //! * `read-tree` (no trees) — emits git's deprecation warning and empties the index.
 //! * `read-tree --empty` — empty the index.
 //! * `read-tree -m <tree-ish>` — one-way merge: like the plain read, except an index
-//!   entry whose id and mode already match the tree keeps its stat cache. Refuses to
+//!   entry whose id and mode already match the tree keeps its stat cache and its
+//!   sticky flags (skip-worktree, assume-valid, intent-to-add), because
+//!   `oneway_merge()` re-adds the existing entry rather than the tree's. Refuses to
 //!   run on an unmerged index, and refuses to clobber a modified tracked file.
 //! * `read-tree --reset <tree-ish>` — as `-m`, but unmerged entries are discarded and
 //!   the safety checks are skipped.
@@ -91,7 +93,7 @@ use std::sync::atomic::AtomicBool;
 use gix::bstr::{BString, ByteSlice};
 use gix::hash::ObjectId;
 use gix::index::entry::stat::Options;
-use gix::index::entry::{Mode, Stat};
+use gix::index::entry::{Flags, Mode, Stat};
 
 /// Parsed command line for a single `read-tree` invocation.
 #[derive(Default)]
@@ -476,13 +478,27 @@ pub fn read_tree(args: &[String]) -> Result<ExitCode> {
 
     // `-m`/`--reset` carry the stat cache of entries the tree leaves untouched, so a
     // later `git status` does not see the whole tree as freshly modified.
+    //
+    // They carry the entry's sticky flags for the same reason: `oneway_merge()` reacts to
+    // `same(old, a)` with `add_entry(o, old, update, CE_STAGEMASK)`, re-adding the *existing*
+    // cache entry rather than the one built from the tree, so every `ce_flags` bit but the
+    // stage survives the read. Dropping them turns a sparse-checkout index inside out —
+    // `read-tree -m -u HEAD` cleared `CE_SKIP_WORKTREE` on the cone-excluded paths and left
+    // `git status` reporting them as deleted. `CE_EXTENDED` rides along because
+    // `Entry::write_to` only serialises the extended flag word (which holds skip-worktree and
+    // intent-to-add) when it is set.
+    const STICKY: gix::index::entry::Flags = gix::index::entry::Flags::ASSUME_VALID
+        .union(gix::index::entry::Flags::EXTENDED)
+        .union(gix::index::entry::Flags::INTENT_TO_ADD)
+        .union(gix::index::entry::Flags::SKIP_WORKTREE);
     let old_map = stage0_map(&old);
     if o.merge || o.reset {
         let backing = new_index.path_backing().to_owned();
         for e in new_index.entries_mut() {
-            if let Some((id, mode, stat)) = old_map.get(&e.path_in(&backing).to_owned()) {
+            if let Some((id, mode, stat, flags)) = old_map.get(&e.path_in(&backing).to_owned()) {
                 if *id == e.id && *mode == e.mode {
                     e.stat = *stat;
+                    e.flags |= *flags & STICKY;
                 }
             }
         }
@@ -497,7 +513,7 @@ pub fn read_tree(args: &[String]) -> Result<ExitCode> {
     let changed: BTreeSet<BString> = new_paths
         .iter()
         .filter(|p| match (old_map.get(*p), new_map.get(*p)) {
-            (Some((oid, omode, _)), Some((nid, nmode, _))) => oid != nid || omode != nmode,
+            (Some((oid, omode, _, _)), Some((nid, nmode, _, _))) => oid != nid || omode != nmode,
             _ => true,
         })
         .cloned()
@@ -1200,13 +1216,13 @@ fn threeway_merge(
 }
 
 /// Path → (id, mode, stat) for the stage-0 entries of `index`.
-fn stage0_map(index: &gix::index::File) -> HashMap<BString, (ObjectId, Mode, Stat)> {
+fn stage0_map(index: &gix::index::File) -> HashMap<BString, (ObjectId, Mode, Stat, Flags)> {
     let backing = index.path_backing();
     index
         .entries()
         .iter()
         .filter(|e| e.stage_raw() == 0)
-        .map(|e| (e.path_in(backing).to_owned(), (e.id, e.mode, e.stat)))
+        .map(|e| (e.path_in(backing).to_owned(), (e.id, e.mode, e.stat, e.flags)))
         .collect()
 }
 

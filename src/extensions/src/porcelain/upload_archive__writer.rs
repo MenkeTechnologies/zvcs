@@ -57,7 +57,7 @@
 //! factoring them out would mean editing that module.
 
 use anyhow::Result;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::process::ExitCode;
 
 /// git's `MAX_ARGS`, counting the program name the writer pushes first.
@@ -95,7 +95,8 @@ pub fn upload_archive__writer(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::from(129));
     }
     if args.len() != 1 {
-        eprintln!("{USAGE}");
+        // One `write`, for the same sideband-framing reason as `fatal`.
+        let _ = std::io::stderr().write_all(format!("{USAGE}\n").as_bytes());
         return Ok(ExitCode::from(129));
     }
 
@@ -171,8 +172,18 @@ pub fn upload_archive__writer(args: &[String]) -> Result<ExitCode> {
 }
 
 /// Report a git `die` verbatim and hand back git's exit code for one.
+///
+/// The message must reach stderr in a **single** `write`. This process's stderr
+/// is a pipe read by the `upload-archive` front end, which frames one sideband
+/// packet per `read()` — so a message split across syscalls is split across
+/// packets, and the client sees framing stock git never produces. Rust's stderr
+/// is unbuffered and `eprintln!` writes each format fragment separately (the
+/// text, then the newline), which is exactly that split: stock's single
+/// `0042`-length band-2 packet became `0041` + a stray `0006` holding the
+/// newline. Formatting first and issuing one `write_all` restores git's framing.
 fn fatal(msg: &str) -> Result<ExitCode> {
-    eprintln!("fatal: {msg}");
+    let line = format!("fatal: {msg}\n");
+    let _ = std::io::stderr().write_all(line.as_bytes());
     Ok(ExitCode::from(128))
 }
 

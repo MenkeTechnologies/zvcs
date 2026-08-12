@@ -19,7 +19,7 @@
 //!   * `get_merge_tool` / `guess_merge_tool`: honouring a configured
 //!     `merge.tool`/`merge.guitool`, and otherwise building git's candidate list
 //!     and emitting the `'merge.tool' is not configured` guidance on stderr — see
-//!     [`select_merge_tool`];
+//!     [`select_tool`];
 //!   * the full "is there anything to do" decision, i.e. the `MERGE_RR` /
 //!     `git rerere remaining` branch and the `diff --diff-filter=U` pathspec
 //!     filter, ending in `print_noop_and_exit`'s `No files need merging` / exit 0;
@@ -171,9 +171,10 @@ pub fn mergetool(args: &[String]) -> Result<ExitCode> {
         Some(t) => Selection { tool: Some(t.clone()), guessed: false, guidance: Vec::new() },
         // `gui_mode`: an unpinned `GIT_MERGETOOL_GUI` falls back to
         // `mergetool.guiDefault`, which is what selects the `merge.guitool` key.
-        None => select_merge_tool(
-            &snapshot,
-            gui.unwrap_or_else(|| gui_default(&snapshot, "mergetool.guiDefault")),
+        None => select_tool(
+            snapshot.plumbing(),
+            gui.unwrap_or_else(|| gui_default(snapshot.plumbing(), "mergetool.guiDefault")),
+            false,
         ),
     };
     let show_prompt_default = prompt_enabled(&snapshot, prompt_flag);
@@ -224,28 +225,25 @@ pub fn mergetool(args: &[String]) -> Result<ExitCode> {
     // *user-defined* tool whose `merge_cmd` is `( eval $cmd )` — portable. A tool
     // with no `.cmd` is a `mergetools/` catalogue backend, absent from the vendored
     // crates, so running it bails (see [`SUBSTRATE`]).
-    let tool_cmd: Option<String> = if tool.is_empty() {
-        None
-    } else {
-        match snapshot
-            .string(&format!("mergetool.{tool}.cmd"))
-            .map(|v| v.to_str_lossy().into_owned())
-            .filter(|v| !v.is_empty())
-        {
-            Some(cmd) => Some(cmd),
-            // No user-defined `.cmd`: fall back to a ported `mergetools/` backend.
-            None => match builtin_merge_cmd(&tool, &snapshot) {
-                Ok(cmd) => cmd,
-                Err(e) => {
-                    eprintln!("{e}");
-                    return Ok(ExitCode::from(1));
-                }
-            },
-        }
+    let user_cmd = user_tool_cmd(snapshot.plumbing(), &tool, false);
+    let tool_cmd: Option<String> = match &user_cmd {
+        Some(cmd) => Some(cmd.clone()),
+        // No user-defined `.cmd`: fall back to a ported `mergetools/` backend.
+        None => match builtin_merge_cmd(&tool, &snapshot) {
+            Ok(cmd) => cmd,
+            Err(e) => {
+                eprintln!("{e}");
+                return Ok(ExitCode::from(1));
+            }
+        },
     };
+    // `initialize_merge_tool "$merge_tool" || return` inside `merge_file`: the
+    // verdict does not depend on the path, but the script re-runs `setup_tool`
+    // for each one, so its message is emitted per path rather than once here.
+    let tool_setup = setup_tool(&tool, user_cmd.is_some(), false);
     // `get_merge_tool_path` (merge mode): `mergetool.<tool>.path`, else the tool
     // name. `run_merge_tool` puts it in `merge_tool_path` for the `.cmd` eval.
-    let tool_path = merge_tool_path(&snapshot, &tool, false);
+    let tool_path = merge_tool_path(snapshot.plumbing(), &tool, false);
     // `trust_exit_code`: user tools default to false, so only an explicit
     // `mergetool.<tool>.trustExitCode=true` lets the tool's exit code decide.
     let trust_exit_code = !tool.is_empty()
@@ -290,6 +288,7 @@ pub fn mergetool(args: &[String]) -> Result<ExitCode> {
             &index,
             f.as_bstr(),
             &tool,
+            tool_setup.as_ref().err().map(String::as_str),
             tool_cmd.as_deref(),
             &tool_path,
             trust_exit_code,
@@ -334,6 +333,7 @@ fn merge_file(
     index: &gix::index::File,
     path: &gix::bstr::BStr,
     tool: &str,
+    tool_setup_error: Option<&str>,
     tool_cmd: Option<&str>,
     tool_path: &str,
     trust_exit_code: bool,
@@ -344,6 +344,14 @@ fn merge_file(
     show_prompt: bool,
     out: &mut impl Write,
 ) -> Result<MergeOutcome> {
+    // `initialize_merge_tool "$merge_tool" || return`, which sits between the
+    // `git ls-files -u` probe and the description block below — an unusable tool
+    // therefore fails the path *before* anything is printed about the conflict.
+    if let Some(e) = tool_setup_error {
+        eprintln!("{e}");
+        return Ok(MergeOutcome::Failed);
+    }
+
     let msg = merge_file_message(repo, index, path)?;
     out.write_all(&msg.text)?;
 
@@ -558,18 +566,18 @@ eval "$6""#;
     Ok(wait_status(status))
 }
 
-/// `get_merge_tool_path` reduced to the case this module can run — a
-/// user-defined tool, whose configured `.cmd` makes the `type` availability
-/// check moot. The path is `mergetool.<tool>.path` when set (in diff mode
-/// `difftool.<tool>.path` is consulted first), else `translate_merge_tool_path`,
-/// which for a user tool is the identity on the tool name.
+/// `get_merge_tool_path`'s path lookup: `mergetool.<tool>.path` when set (in diff
+/// mode `difftool.<tool>.path` is consulted first), else
+/// `translate_merge_tool_path`, which a catalogue script may override (`vimdiff`
+/// probes `vim`, `araxis` probes `compare`) and which is the identity for a
+/// user-defined tool.
 pub(crate) fn merge_tool_path(
-    snapshot: &gix::config::Snapshot<'_>,
+    config: &gix::config::File,
     tool: &str,
     diff_mode: bool,
 ) -> String {
     let key = |section: &str| {
-        snapshot
+        config
             .string(&format!("{section}.{tool}.path"))
             .map(|v| v.to_str_lossy().into_owned())
             .filter(|v| !v.is_empty())
@@ -579,19 +587,25 @@ pub(crate) fn merge_tool_path(
     } else {
         key("mergetool")
     };
-    configured.unwrap_or_else(|| tool.to_owned())
+    configured.unwrap_or_else(|| {
+        TOOLS
+            .iter()
+            .find(|t| t.name == tool)
+            .and_then(|t| if diff_mode { t.diff.as_ref() } else { t.merge.as_ref() })
+            .map_or_else(|| tool.to_owned(), |b| b.path.to_owned())
+    })
 }
 
 /// `get_gui_default` (git-mergetool--lib.sh): `<section>.guiDefault` decides
 /// whether `gui_mode` is on when neither `-g`/`--gui` nor `--no-gui` was given.
 /// The literal value `auto` (case-insensitively) defers to `$DISPLAY` being
 /// non-empty; anything else is read as a boolean defaulting to false.
-pub(crate) fn gui_default(snapshot: &gix::config::Snapshot<'_>, key: &str) -> bool {
-    match snapshot.string(key) {
+pub(crate) fn gui_default(config: &gix::config::File, key: &str) -> bool {
+    match config.string(key) {
         Some(v) if v.to_str_lossy().eq_ignore_ascii_case("auto") => {
             std::env::var_os("DISPLAY").is_some_and(|d| !d.is_empty())
         }
-        _ => snapshot.boolean(key) == Some(true),
+        _ => config.boolean(key).ok().flatten() == Some(true),
     }
 }
 
@@ -806,14 +820,14 @@ const SUBSTRATE: &str = "this path needs git's mergetools/ shell-backend catalog
 /// Outcome of the selected merge tool, mirroring `get_merge_tool`'s three signals:
 /// the tool name (empty when the guess found nothing), whether it was *guessed*
 /// (which forces the prompt), and the stderr bytes `guess_merge_tool` emits.
-struct Selection {
-    tool: Option<String>,
-    guessed: bool,
-    guidance: Vec<u8>,
+pub(crate) struct Selection {
+    pub(crate) tool: Option<String>,
+    pub(crate) guessed: bool,
+    pub(crate) guidance: Vec<u8>,
 }
 
-/// `get_merge_tool`: use a configured `merge.tool` (or `merge.guitool` under `-g`)
-/// when it is set and valid, otherwise `guess_merge_tool`.
+/// `get_merge_tool`: use the configured `<mode>.tool` (or `<mode>.guitool` under
+/// `-g`) when it is set and valid, otherwise `guess_merge_tool`.
 ///
 /// The guess reproduces `list_merge_tool_candidates` + the guidance heredoc, then
 /// returns the first candidate whose *name* is on `$PATH`. Selection uses the raw
@@ -821,23 +835,34 @@ struct Selection {
 /// --lib`'s identity default — no `setup_tool` has overridden it — so `is_available`
 /// probes e.g. `vimdiff`/`emerge` directly, not the `vim`/`emacs` a configured tool
 /// would resolve to.
-fn select_merge_tool(snapshot: &gix::config::Snapshot<'_>, gui: bool) -> Selection {
-    // `get_configured_merge_tool`'s key order for merge mode.
-    let keys: &[&str] = if gui { &["merge.guitool", "merge.tool"] } else { &["merge.tool"] };
+pub(crate) fn select_tool(
+    config: &gix::config::File,
+    gui: bool,
+    diff_mode: bool,
+) -> Selection {
+    // `get_configured_merge_tool`'s key order for this mode.
+    let keys: &[&str] = match (diff_mode, gui) {
+        (true, true) => &["diff.guitool", "merge.guitool", "diff.tool", "merge.tool"],
+        (true, false) => &["diff.tool", "merge.tool"],
+        (false, true) => &["merge.guitool", "merge.tool"],
+        (false, false) => &["merge.tool"],
+    };
     let configured = keys.iter().find_map(|k| {
-        snapshot
+        config
             .string(*k)
             .map(|v| v.to_str_lossy().into_owned())
             .filter(|v| !v.is_empty())
     });
 
+    // `$TOOL_MODE` and the `${TOOL_MODE}tool` command name the messages quote.
+    let mode = if diff_mode { "diff" } else { "merge" };
     let mut guidance = Vec::new();
     if let Some(t) = configured {
-        if valid_tool(&t, snapshot) {
+        if valid_tool(&t, config, diff_mode) {
             return Selection { tool: Some(t), guessed: false, guidance };
         }
         // `git config option $TOOL_MODE.${gui_prefix}tool set to unknown tool: …`.
-        let key = if gui { "merge.guitool" } else { "merge.tool" };
+        let key = format!("{mode}.{}tool", if gui { "gui" } else { "" });
         guidance.extend_from_slice(
             format!("git config option {key} set to unknown tool: {t}\nResetting to default...\n")
                 .as_bytes(),
@@ -845,10 +870,15 @@ fn select_merge_tool(snapshot: &gix::config::Snapshot<'_>, gui: bool) -> Selecti
     }
 
     // `guess_merge_tool`: the candidate list, then the `cat >&2 <<-EOF` guidance.
-    let candidates = merge_tool_candidates();
-    guidance.extend_from_slice(b"\nThis message is displayed because 'merge.tool' is not configured.\n");
-    guidance.extend_from_slice(b"See 'git mergetool --tool-help' or 'git help config' for more details.\n");
-    guidance.extend_from_slice(b"'git mergetool' will now attempt to use one of the following tools:\n");
+    let candidates = tool_candidates(diff_mode);
+    guidance.extend_from_slice(
+        format!(
+            "\nThis message is displayed because '{mode}.tool' is not configured.\n\
+             See 'git {mode}tool --tool-help' or 'git help config' for more details.\n\
+             'git {mode}tool' will now attempt to use one of the following tools:\n"
+        )
+        .as_bytes(),
+    );
     guidance.extend_from_slice(candidates.join(" ").as_bytes());
     guidance.push(b'\n');
 
@@ -857,25 +887,110 @@ fn select_merge_tool(snapshot: &gix::config::Snapshot<'_>, gui: bool) -> Selecti
             return Selection { tool: Some(c.clone()), guessed: true, guidance };
         }
     }
-    // `echo >&2 "No known merge tool is available."; return 1` — get_merge_tool's
-    // `|| exit` then leaves merge_tool empty with guessed_merge_tool=true.
-    guidance.extend_from_slice(b"No known merge tool is available.\n");
+    // `echo >&2 "No known $TOOL_MODE tool is available."; return 1` —
+    // get_merge_tool's `|| exit` then leaves merge_tool empty with is_guessed true.
+    guidance.extend_from_slice(format!("No known {mode} tool is available.\n").as_bytes());
     Selection { tool: None, guessed: true, guidance }
 }
 
-/// `valid_tool`: a catalogue backend, or a name with a configured
-/// `mergetool.<tool>.cmd` (`setup_user_tool`).
-fn valid_tool(tool: &str, snapshot: &gix::config::Snapshot<'_>) -> bool {
-    let cmd_key = format!("mergetool.{tool}.cmd");
-    TOOLS.iter().any(|t| t.name == tool)
-        || snapshot.string(&cmd_key).is_some_and(|v| !v.is_empty())
+/// `valid_tool`: `setup_tool` accepts the name, or a `mergetool.<tool>.cmd` is
+/// configured (which `setup_user_tool` would pick up). The second arm is why a
+/// merge-incapable backend such as `kompare` still passes selection with a
+/// `.cmd` set, only for `initialize_merge_tool` to reject it per path.
+pub(crate) fn valid_tool(tool: &str, config: &gix::config::File, diff_mode: bool) -> bool {
+    let has_cmd = user_tool_cmd(config, tool, diff_mode).is_some();
+    setup_tool(tool, has_cmd, diff_mode).is_ok() || has_cmd
 }
 
-/// `list_merge_tool_candidates` for merge mode: the base `tortoisemerge`, the
-/// graphical block only when `$DISPLAY` is set, and the editor-derived tail keyed
-/// on `${VISUAL:-$EDITOR}`.
-fn merge_tool_candidates() -> Vec<String> {
+/// `get_merge_tool_cmd`: `difftool.<tool>.cmd` then `mergetool.<tool>.cmd` in
+/// diff mode, `mergetool.<tool>.cmd` alone in merge mode. Empty counts as unset
+/// (`test -n "$merge_tool_cmd"` in `setup_user_tool`).
+pub(crate) fn user_tool_cmd(
+    config: &gix::config::File,
+    tool: &str,
+    diff_mode: bool,
+) -> Option<String> {
+    let read = |key: String| {
+        config.string(&key).map(|v| v.to_str_lossy().into_owned()).filter(|v| !v.is_empty())
+    };
+    diff_mode
+        .then(|| read(format!("difftool.{tool}.cmd")))
+        .flatten()
+        .or_else(|| read(format!("mergetool.{tool}.cmd")))
+}
+
+/// Port of `setup_tool` (`git-mergetool--lib`), reduced to its verdict: callers
+/// only need to know whether the tool can drive this mode and, when it cannot,
+/// which line git writes to stderr before returning non-zero.
+///
+/// The three rejections, in the script's order: no catalogue script and no
+/// `setup_user_tool` to fall back on; a script that does not list this name
+/// among its `list_tool_variants`; and a script whose `can_merge` (merge mode)
+/// or `can_diff` (diff mode) is false.
+pub(crate) fn setup_tool(tool: &str, has_user_cmd: bool, diff_mode: bool) -> Result<(), String> {
+    let section = if diff_mode { "difftool" } else { "mergetool" };
+    let Some(file) = catalogue_script(tool) else {
+        // `setup_user_tool; rc=$?; ... return $rc` — the only remaining source of
+        // a `merge_cmd` is the config, and without one the tool does not exist.
+        return if has_user_cmd {
+            Ok(())
+        } else {
+            Err(format!("error: {section}.{tool}.cmd not set for tool '{tool}'"))
+        };
+    };
+    // `setup_user_tool` runs here too with its status ignored — but a `.cmd`
+    // replaces `list_tool_variants` with one that echoes `$tool`, so the variant
+    // check can only ever reject a name that is not configured.
+    if !has_user_cmd && !tool_variants(file, diff_mode).contains(&tool) {
+        return Err(format!("error: unknown tool variant '{tool}'"));
+    }
+    // `if merge_mode && ! can_merge ... elif diff_mode && ! can_diff`.
+    if !diff_mode && CANNOT_MERGE.contains(&file) {
+        return Err(format!("error: '{tool}' can not be used to resolve merges"));
+    }
+    if diff_mode && CANNOT_DIFF.contains(&file) {
+        return Err(format!("error: '{tool}' can only be used to resolve merges"));
+    }
+    Ok(())
+}
+
+/// `test -f "$MERGE_TOOLS_DIR/$tool"`, then the `${tool%[0-9]}` retry: the
+/// catalogue script backing `tool`, if any. The scripts are exactly the [`TOOLS`]
+/// entries that no other entry produces.
+fn catalogue_script(tool: &str) -> Option<&'static str> {
+    let script =
+        |name: &str| TOOLS.iter().find(|t| t.producers.is_empty() && t.name == name).map(|t| t.name);
+    script(tool).or_else(|| script(tool.strip_suffix(|c: char| c.is_ascii_digit())?))
+}
+
+/// `list_tool_variants` for the catalogue script `file` under `$TOOL_MODE`.
+///
+/// Every script lists a fixed set except `mergetools/vimdiff`, which drops the
+/// numbered layouts in diff mode — `git difftool` has no MERGED buffer to lay
+/// out — and those are the entries [`VIM_FAMILY`] produces.
+fn tool_variants(file: &str, diff_mode: bool) -> Vec<&'static str> {
+    TOOLS
+        .iter()
+        .filter(|t| if t.producers.is_empty() { t.name == file } else { t.producers.contains(&file) })
+        .filter(|t| !(diff_mode && t.producers == VIM_FAMILY))
+        .map(|t| t.name)
+        .collect()
+}
+
+/// The catalogue scripts that redefine `can_merge` to return 1. Everything else
+/// keeps `git-mergetool--lib`'s `return 0` default.
+const CANNOT_MERGE: &[&str] = &["kompare"];
+
+/// The catalogue scripts that redefine `can_diff` to return 1. Everything else
+/// keeps `git-mergetool--lib`'s `return 0` default.
+const CANNOT_DIFF: &[&str] = &["tortoisemerge"];
+
+/// `list_merge_tool_candidates`: the mode's base tool (`tortoisemerge` for merge,
+/// `kompare` for diff), the graphical block only when `$DISPLAY` is set, and the
+/// editor-derived tail keyed on `${VISUAL:-$EDITOR}`.
+pub(crate) fn tool_candidates(diff_mode: bool) -> Vec<String> {
     let nonempty = |k: &str| std::env::var_os(k).is_some_and(|v| !v.is_empty());
+    let base = if diff_mode { "kompare" } else { "tortoisemerge" };
 
     let mut tools: Vec<String> = Vec::new();
     if nonempty("DISPLAY") {
@@ -885,14 +1000,14 @@ fn merge_tool_candidates() -> Vec<String> {
             &["opendiff", "kdiff3", "tkdiff", "xxdiff", "meld"]
         };
         tools.extend(graphical.iter().map(|s| s.to_string()));
-        tools.push("tortoisemerge".to_string());
+        tools.push(base.to_string());
         tools.extend(
             ["gvimdiff", "diffuse", "diffmerge", "ecmerge", "p4merge", "araxis", "bc", "codecompare", "smerge"]
                 .iter()
                 .map(|s| s.to_string()),
         );
     } else {
-        tools.push("tortoisemerge".to_string());
+        tools.push(base.to_string());
     }
 
     // `${VISUAL:-$EDITOR}`: VISUAL wins unless unset or empty.
@@ -1289,7 +1404,7 @@ fn list_config_tools(
 /// `is_available`: `type "$merge_tool_path"`, i.e. an executable of that name on
 /// `$PATH`. None of the catalogue's names are shell builtins, so the builtin and
 /// function lookups `type` also does cannot match.
-fn is_available(path: &str) -> bool {
+pub(crate) fn is_available(path: &str) -> bool {
     if path.contains('/') {
         return is_executable(Path::new(path));
     }
@@ -1468,4 +1583,70 @@ fn pathspec_matches(spec: &BString, path: &BString) -> bool {
         return true;
     }
     path.len() > spec.len() && path.starts_with(spec.as_slice()) && path[spec.len()] == b'/'
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `setup_tool`'s first rejection, and the one `git mergetool --tool=<junk>`
+    /// hits: no `mergetools/` script by that name and no `<mode>tool.<tool>.cmd`
+    /// to stand in for one. It fires inside `merge_file`, so the caller must
+    /// still have printed the `Merging:` banner but nothing about the conflict.
+    #[test]
+    fn an_unknown_tool_without_a_cmd_is_rejected_per_mode() {
+        assert_eq!(
+            setup_tool("no-such-tool", false, false),
+            Err("error: mergetool.no-such-tool.cmd not set for tool 'no-such-tool'".into())
+        );
+        assert_eq!(
+            setup_tool("no-such-tool", false, true),
+            Err("error: difftool.no-such-tool.cmd not set for tool 'no-such-tool'".into())
+        );
+        // `setup_user_tool` succeeds once a `.cmd` exists, whatever the name.
+        assert_eq!(setup_tool("no-such-tool", true, false), Ok(()));
+    }
+
+    /// `test -f "$MERGE_TOOLS_DIR/$tool"`, then the `${tool%[0-9]}` retry.
+    #[test]
+    fn a_numbered_variant_resolves_to_its_script() {
+        assert_eq!(catalogue_script("vimdiff"), Some("vimdiff"));
+        assert_eq!(catalogue_script("vimdiff2"), Some("vimdiff"));
+        assert_eq!(catalogue_script("bc4"), Some("bc"));
+        // Only one trailing digit is stripped, and only once.
+        assert_eq!(catalogue_script("bc44"), None);
+        assert_eq!(catalogue_script("no-such-tool"), None);
+    }
+
+    /// `mergetools/vimdiff`'s `list_tool_variants` drops the numbered layouts in
+    /// diff mode, so `git difftool --tool=vimdiff2` is an unknown variant while
+    /// `git mergetool --tool=vimdiff2` is fine.
+    #[test]
+    fn numbered_vim_layouts_exist_only_in_merge_mode() {
+        assert_eq!(setup_tool("vimdiff2", false, false), Ok(()));
+        assert_eq!(
+            setup_tool("vimdiff2", false, true),
+            Err("error: unknown tool variant 'vimdiff2'".into())
+        );
+        // The unnumbered names are listed in both modes.
+        assert_eq!(setup_tool("vimdiff", false, true), Ok(()));
+        assert!(tool_variants("vimdiff", false).contains(&"nvimdiff3"));
+        assert!(!tool_variants("vimdiff", true).contains(&"nvimdiff3"));
+    }
+
+    /// The two scripts that override `can_merge`/`can_diff`. Each is usable in
+    /// exactly one mode, and the refusal wording differs between them.
+    #[test]
+    fn mode_only_backends_are_refused_in_the_other_mode() {
+        assert_eq!(
+            setup_tool("kompare", false, false),
+            Err("error: 'kompare' can not be used to resolve merges".into())
+        );
+        assert_eq!(setup_tool("kompare", false, true), Ok(()));
+        assert_eq!(
+            setup_tool("tortoisemerge", false, true),
+            Err("error: 'tortoisemerge' can only be used to resolve merges".into())
+        );
+        assert_eq!(setup_tool("tortoisemerge", false, false), Ok(()));
+    }
 }

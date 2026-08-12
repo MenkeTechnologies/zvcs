@@ -1,13 +1,14 @@
 //! `git daemon` — the `git://` protocol server.
-//! **The server itself is not ported: every path that would bind a socket or
-//! serve a client bails.**
+//! **The server itself is not ported: every path that would serve a client
+//! bails.**
 //!
 //! `daemon` binds TCP port 9418, accepts connections, reads a `git-upload-pack`
 //! / `git-upload-archive` / `git-receive-pack` request line, and runs that
 //! service against a repository. What is ported here is the surface that is
-//! byte-verifiable *without* speaking the protocol or holding a socket: the
-//! whole command-line parser and every startup check that runs before the
-//! listen loop. All of it was checked against git 2.55.0 on Darwin.
+//! byte-verifiable *without* speaking the protocol: the whole command-line
+//! parser, every startup check that runs before the listen loop, and
+//! `socksetup()` — the bind itself, whose failure is what `git daemon` on an
+//! occupied port reports. All of it was checked against git 2.55.0 on Darwin.
 //!
 //! `daemon` uses a hand-rolled argument loop, not `parse_options`, so its
 //! diagnostics differ from most git commands — there is no `error: unknown
@@ -35,6 +36,14 @@
 //!     `--group supplied without --user`,
 //!     `option --strict-paths requires '<directory>' arguments`,
 //!     `base-path '<p>' does not exist or is not a directory`.
+//!   * `serve()`'s socket setup: the wildcard bind (`::` then `0.0.0.0`) or one
+//!     bind per `--listen=`, each failure logged as
+//!     `[<pid>] Could not bind to <addr>: <strerror>` and tolerated, and
+//!     `fatal: unable to allocate any listen sockets on port <n>` (exit 128)
+//!     only when every address failed — the exit `git daemon` takes when the
+//!     port is already in use. The sockets are closed again immediately: there
+//!     is nothing to serve on them, and holding the port would lock out a real
+//!     daemon.
 //!   * The die-routine swap. When the effective log destination is `syslog`
 //!     (`--syslog`, or the default under `--inetd`/`--detach`), `daemon`
 //!     installs `daemon_die`, which logs to syslog and exits **1** — so those
@@ -57,14 +66,16 @@
 //!      `want`/`have`/`ACK`/`NAK`, nothing turns a negotiated set into a
 //!      side-band-multiplexed pack, and nothing parses the daemon request line
 //!      or its `host=`/`extra` NUL-separated arguments.
-//!   2. **The listen loop.** Binding, `SO_REUSEADDR`, multiple `--listen=`
-//!      addresses, `--max-connections` child reaping, `--timeout`/
+//!   2. **The accept loop.** `poll()` over the listen sockets, forking a child
+//!      per connection, `--max-connections` child reaping, `--timeout`/
 //!      `--init-timeout` alarm handling, `--detach` daemonisation, `--pid-file`
-//!      and `--inetd` stdin/stdout service are process- and socket-level work
-//!      with no substrate in gitoxide, which is a repository-format library.
+//!      and `--inetd` stdin/stdout service are process-level work with no
+//!      substrate in gitoxide, which is a repository-format library — and each
+//!      of them exists only to reach the serving code in (1), which does not.
 //!   3. **`--user=`/`--group=` privilege drop.** `getpwnam(3)`/`getgrnam(3)`
-//!      are not reachable: this crate depends on `gix` and `anyhow` only, with
-//!      no `libc` or `nix`. The lookup cannot be faked from `/etc/passwd` —
+//!      are not called: they are POSIX identity lookups this port has no use
+//!      for while it cannot serve. The lookup cannot be faked from
+//!      `/etc/passwd` either —
 //!      Darwin resolves users through Directory Services, so a file scan would
 //!      report `user not found` for users that exist. `--group` without
 //!      `--user` needs no lookup and is checked faithfully; a present `--user`
@@ -114,8 +125,8 @@ struct Opts {
     strict_paths: bool,
     /// `--port=<n>`, stored as git's `int listen_port` — 0 means "not given".
     listen_port: i32,
-    /// One entry per `--listen=`; only its emptiness is observable here.
-    listen_addrs: usize,
+    /// One entry per `--listen=`, lowercased as git's `xstrdup_tolower()` does.
+    listen_addrs: Vec<String>,
     log_dest: LogDest,
     user: Option<String>,
     group: Option<String>,
@@ -142,7 +153,7 @@ pub fn daemon(args: &[String]) -> Result<ExitCode> {
         detach: false,
         strict_paths: false,
         listen_port: 0,
-        listen_addrs: 0,
+        listen_addrs: Vec::new(),
         log_dest: LogDest::Unset,
         user: None,
         group: None,
@@ -157,8 +168,9 @@ pub fn daemon(args: &[String]) -> Result<ExitCode> {
 
         // Options taking a value are only ever matched in `--name=value` form;
         // the bare spelling falls through to the usage branch below.
-        if arg.starts_with("--listen=") {
-            o.listen_addrs += 1;
+        if let Some(v) = arg.strip_prefix("--listen=") {
+            // `string_list_append(&listen_addr, xstrdup_tolower(v))`.
+            o.listen_addrs.push(v.to_ascii_lowercase());
             continue;
         }
         if let Some(v) = arg.strip_prefix("--port=") {
@@ -299,7 +311,7 @@ pub fn daemon(args: &[String]) -> Result<ExitCode> {
             quiet,
         ));
     }
-    if o.inetd && (o.listen_port != 0 || o.listen_addrs > 0) {
+    if o.inetd && (o.listen_port != 0 || !o.listen_addrs.is_empty()) {
         return Ok(die_maybe_quiet(
             "--listen= and --port= are incompatible with --inetd",
             quiet,
@@ -312,8 +324,8 @@ pub fn daemon(args: &[String]) -> Result<ExitCode> {
         // git calls getpwnam(user) here, then getgrnam(group) if --group was
         // given, and dies "user not found - <u>" / "group not found - <g>".
         bail!(
-            "--user={user:?} is not ported: dropping privileges needs getpwnam(3)/getgrnam(3), \
-             and this crate depends on gix and anyhow only"
+            "--user={user:?} is not ported: dropping privileges is only meaningful for the \
+             serving process this port does not have, so getpwnam(3)/getgrnam(3) are not called"
         );
     }
     if o.strict_paths && o.ok_paths == 0 {
@@ -340,11 +352,182 @@ pub fn daemon(args: &[String]) -> Result<ExitCode> {
              gix-protocol handshake/fetch/ls_refs)"
         );
     }
+    // `if (detach) { if (daemonize()) die(...) }` — before the sockets, so a
+    // daemon that cannot fork never takes the port.
+    if o.detach {
+        bail!(
+            "--detach is not ported: daemonising is a fork/setsid/redirect sequence with no \
+             substrate in gitoxide, which is a repository-format library"
+        );
+    }
+
+    // `serve()`: bind first, and die when nothing could be bound. This is the
+    // last step that is observable without a client, and it is where
+    // `git daemon` on a busy port ends up.
+    let port = if o.listen_port == 0 {
+        DEFAULT_GIT_PORT
+    } else {
+        o.listen_port
+    };
+    if let Some(code) = socksetup(&o.listen_addrs, port, log_dest, quiet) {
+        return Ok(code);
+    }
+
     bail!(
-        "the git:// listen loop is not ported: it needs socket and process substrate gitoxide \
-         does not provide, and a server-side upload-pack/receive-pack that does not exist in the \
-         vendored crates"
+        "the git:// service loop is not ported: the listen sockets bind, but accepting a \
+         connection needs a server-side upload-pack/receive-pack, and the vendored crates \
+         implement only the client half (gix-transport/src/client, gix-protocol \
+         handshake/fetch/ls_refs)"
     );
+}
+
+/// `daemon.c`'s `DEFAULT_GIT_PORT`.
+const DEFAULT_GIT_PORT: i32 = 9418;
+
+/// `socksetup()` followed by `serve()`'s `if (socklist.nr == 0) die(...)`.
+///
+/// Returns `Some(exit)` when not one socket could be bound — git's
+/// `unable to allocate any listen sockets on port <n>` — and `None` when at
+/// least one was, which is the point where git enters `service_loop()`.
+///
+/// Every socket opened here is closed again on return: there is no server-side
+/// protocol implementation to hand it to (see the module docs), so holding the
+/// port would only lock out a real daemon. What is reproduced is the part that
+/// decides the exit status — which addresses are tried, in which order, and that
+/// a failure on every one of them is fatal while a failure on some is not.
+///
+/// One deliberate divergence, not observable in the exit code: `IPV6_V6ONLY` is
+/// not set (Rust's `TcpListener` has no pre-bind hook for it), so on a platform
+/// that defaults it off the `::` bind also covers IPv4 and the following
+/// `0.0.0.0` bind reports the port as taken — one socket where git gets two,
+/// and a listen set that is not empty either way. `SO_REUSEADDR` needs no code:
+/// `TcpListener::bind` sets it on every non-Windows target, as
+/// `set_reuse_addr()` does.
+fn socksetup(
+    listen_addrs: &[String],
+    port: i32,
+    log_dest: LogDest,
+    quiet: bool,
+) -> Option<ExitCode> {
+    let mut bound = 0usize;
+    if listen_addrs.is_empty() {
+        // `if (!listen_addr->nr) setup_named_sock(NULL, …)` — the wildcard.
+        bound += setup_named_sock(None, port, log_dest);
+    } else {
+        for addr in listen_addrs {
+            let socknum = setup_named_sock(Some(addr), port, log_dest);
+            // `if (socknum == 0) logerror("unable to allocate any listen
+            //  sockets for host %s on port %u", …)`.
+            if socknum == 0 {
+                logerror(
+                    &format!(
+                        "unable to allocate any listen sockets for host {addr} on port {}",
+                        port as u32
+                    ),
+                    log_dest,
+                );
+            }
+            bound += socknum;
+        }
+    }
+
+    if bound == 0 {
+        // `%u` of git's `int listen_port`. This `die` is the one that lands
+        // *after* `freopen("/dev/null", "w", stderr)` at `cmd_main`'s line 1455,
+        // so under the `none` destination the message is discarded while the
+        // status stays 128 — unlike the startup checks above, which run before
+        // the redirect.
+        let msg = format!("unable to allocate any listen sockets on port {}", port as u32);
+        if log_dest != LogDest::Stderr {
+            return Some(ExitCode::from(if quiet { 1 } else { 128 }));
+        }
+        return Some(die_maybe_quiet(&msg, quiet));
+    }
+    None
+}
+
+/// `setup_named_sock()`: resolve one listen address and bind every result,
+/// returning how many sockets came up. Neither a resolution failure nor a bind
+/// failure is fatal on its own — only an empty socket list is, and that is the
+/// caller's decision.
+fn setup_named_sock(listen_addr: Option<&str>, port: i32, log_dest: LogDest) -> usize {
+    // `getaddrinfo(listen_addr, pbuf, &hints, &ai0)` with `AI_PASSIVE` and
+    // `AF_UNSPEC`. Rust has no passive resolution, so the wildcard is spelled
+    // out as the two addresses the resolver returns for it, in that order; the
+    // port goes in as text exactly as git's `xsnprintf(pbuf, "%d", …)` does, so
+    // a value outside the port range fails resolution rather than being clamped.
+    let hosts: Vec<&str> = match listen_addr {
+        Some(addr) => vec![addr],
+        None => vec!["::", "0.0.0.0"],
+    };
+    let mut addrs: Vec<std::net::SocketAddr> = Vec::new();
+    let mut failure: Option<String> = None;
+    for host in hosts {
+        // A literal IPv6 address needs brackets before the port can be appended.
+        let target = if host.contains(':') {
+            format!("[{host}]:{port}")
+        } else {
+            format!("{host}:{port}")
+        };
+        match std::net::ToSocketAddrs::to_socket_addrs(&target) {
+            Ok(found) => addrs.extend(found),
+            Err(e) => {
+                failure.get_or_insert_with(|| errno_text(&e));
+            }
+        }
+    }
+
+    if addrs.is_empty() {
+        // `logerror("getaddrinfo() for %s failed: %s", listen_addr,
+        //  gai_strerror(gai))` — C renders a NULL host as `(null)`.
+        logerror(
+            &format!(
+                "getaddrinfo() for {} failed: {}",
+                listen_addr.unwrap_or("(null)"),
+                failure.unwrap_or_else(|| "no addresses returned".to_string())
+            ),
+            log_dest,
+        );
+        return 0;
+    }
+
+    let mut socknum = 0;
+    for addr in addrs {
+        match std::net::TcpListener::bind(addr) {
+            Ok(listener) => {
+                socknum += 1;
+                // Closed immediately; see the note on `socksetup`.
+                drop(listener);
+            }
+            // `logerror("Could not bind to %s: %s", ip2str(…), strerror(errno))`
+            // — one line per address, and not fatal on its own.
+            Err(e) => logerror(
+                &format!("Could not bind to {}: {}", addr.ip(), errno_text(&e)),
+                log_dest,
+            ),
+        }
+    }
+    socknum
+}
+
+/// `logerror()`: the message prefixed with the pid, on stderr — except under the
+/// syslog and none destinations, where git has already pointed stderr at
+/// /dev/null (`freopen("/dev/null", "w", stderr)`), so nothing is visible. The
+/// syslog record itself is not reproduced; see the module docs.
+fn logerror(msg: &str, log_dest: LogDest) {
+    if log_dest == LogDest::Stderr {
+        eprintln!("[{}] {msg}", std::process::id());
+    }
+}
+
+/// `strerror(errno)`, which is what git appends: Rust adds its own
+/// ` (os error <n>)` tail to the same text, so that tail is trimmed off.
+fn errno_text(e: &std::io::Error) -> String {
+    let text = e.to_string();
+    match text.find(" (os error ") {
+        Some(at) => text[..at].to_string(),
+        None => text,
+    }
 }
 
 /// git's `usage()`: the block on stderr, exit 129.

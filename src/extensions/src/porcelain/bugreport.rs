@@ -524,7 +524,7 @@ fn launch_editor(repo: Option<&gix::Repository>, path: &Path) -> bool {
 ///
 /// `core.editor` is only consulted when a repository was found — without one
 /// there is no configuration stack to read it from here.
-fn git_editor(repo: Option<&gix::Repository>) -> Option<String> {
+pub(crate) fn git_editor(repo: Option<&gix::Repository>) -> Option<String> {
     let dumb = match std::env::var("TERM") {
         Ok(t) => t == "dumb",
         Err(_) => true,
@@ -551,7 +551,7 @@ fn git_editor(repo: Option<&gix::Repository>) -> Option<String> {
 /// `prepare_shell_cmd()` for a `use_shell` child: an editor string containing
 /// anything the shell would interpret runs as `sh -c '<editor> "$@"' <editor>
 /// <path>`; a bare program name is executed directly.
-fn editor_command(editor: &str, path: &Path) -> Command {
+pub(crate) fn editor_command(editor: &str, path: &Path) -> Command {
     const META: &[char] = &[
         '|', '&', ';', '<', '>', '(', ')', '$', '`', '\\', '"', '\'', ' ', '\t', '\n', '*', '?',
         '[', '#', '~', '=', '%',

@@ -35,21 +35,29 @@
 //!   * end state: the received objects are exploded into loose objects and the
 //!     intermediate pack is removed, which is what git does below
 //!     `fetch.unpackLimit`. No ref, reflog or `FETCH_HEAD` is touched.
+//!   * `-k`/`--keep` — the received pack stays in `objects/pack` under a
+//!     `.keep`, with the `.rev` git's `index-pack` writes beside it, and the
+//!     `keep <hash>` line goes out before the ref listing. `<hash>` is the
+//!     pack's trailer checksum, which is what both git and `gix-pack` name a
+//!     pack after, so the two agree byte-for-byte as long as the received pack
+//!     bytes do. See [`keep_pack`].
 //!
 //! Not covered — each bails rather than silently diverging:
-//!   * `-k`/`--keep` and, by extension, any fetch large enough that git would
-//!     keep the pack instead of exploding it (`fetch.unpackLimit`, default 100).
-//!     git names a kept pack after the hash of its sorted object names and drops
-//!     a `.rev` file beside it; `gix-pack` names packs after the pack trailer
-//!     checksum and writes no `.rev`, so the kept-pack end state cannot be
-//!     reproduced. The `keep <hash>` line git prints for that case would be
-//!     wrong for the same reason.
-//!   * `--include-tag` — the high-level gitoxide fetch expresses "include tags"
-//!     only as an implicit `refs/tags/*:refs/tags/*` refspec, which *creates local
-//!     tag refs* (`fetch-pack` must not write refs); its negotiation path exposes
-//!     no `include-tag` capability toggle, and wanting every advertised tag instead
-//!     would download tags unrelated to the fetched objects, so the conditional
-//!     server-side auto-include cannot be reproduced.
+//!   * a fetch large enough that git would keep the pack on its own
+//!     (`fetch.unpackLimit`, default 100) without `--keep` having been asked
+//!     for. That is the same kept-pack end state, but reached by a rule this
+//!     port has no way to observe from the outside: git decides it from the pack
+//!     *header* before reading the body, while the vendored bundle writer only
+//!     reports the object count once the pack is already written and indexed.
+//!   * `--include-tag`, **unless the want set already covers every advertised
+//!     tag** (which `--all` guarantees). The capability only ever *adds* tags
+//!     the server would otherwise have held back, so once all of them are
+//!     explicit wants it cannot change the object set and is accepted. In every
+//!     other shape it is refused: gitoxide expresses "include tags" as an
+//!     implicit `refs/tags/*:refs/tags/*` refspec, which *creates local tag refs*
+//!     — and `fetch-pack` must write none — while deciding client-side which
+//!     tags the server would have attached needs the pack's contents before the
+//!     pack exists.
 //!   * `--filter=<spec>` — the high-level negotiation never emits the `filter`
 //!     packet line (the vendored `Arguments::filter` is only reachable from the
 //!     low-level fetch function this port does not drive), so a partial-clone
@@ -57,11 +65,14 @@
 //!   * `--refetch`.
 //!   * `--upload-pack=<exec>` / `--exec=<exec>` — the vendored transport `connect`
 //!     takes no per-invocation override for the remote program.
-//!   * `--diag-url` — git prints its `Diag:` breakdown from `connect.c`'s own URL
-//!     parser (`url_scheme_name`, `hostandport`/`userandhost`, `path`, and the
-//!     possibly-rewritten `url=` echo); `gix-url` decomposes URLs differently
-//!     (scp-like host:path, port defaulting, path normalisation), so a reproduction
-//!     could not stay byte-for-byte.
+//!   * `--diag-url` **on an ssh URL**. The local, `file://` and `git://` forms
+//!     are covered: [`parse_connect_url`] is a direct port of `connect.c`'s own
+//!     URL splitter, written out rather than delegated to `gix-url`, which
+//!     decomposes URLs differently (scp-like `host:path`, port defaulting, path
+//!     normalisation) and would not print git's fields. git reaches the ssh
+//!     breakdown (`userandhost`/`port` instead of `hostandport`) only after
+//!     `transport_check_allowed("ssh")` and the `strange pathname` guard, and
+//!     neither has a home in this tree, so that one form bails.
 //!   * `--check-self-contained-and-connected`, `--stateless-rpc`, `--lock-pack`.
 //!   * a `<ref>` given as a raw object hash (`uploadpack.allowTipSHA1InWant`
 //!     and friends): the vendored refspec layer maps names, not bare ids.
@@ -76,6 +87,7 @@ use anyhow::{bail, Result};
 use std::collections::HashSet;
 use std::io::BufRead;
 use std::num::NonZeroU32;
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::atomic::AtomicBool;
@@ -115,6 +127,9 @@ pub fn fetch_pack(args: &[String]) -> Result<ExitCode> {
     // flag (`git fetch-pack <url> --all` reports "no such remote ref --all").
     let mut all = false;
     let mut from_stdin = false;
+    let mut diag_url = false;
+    let mut include_tag = false;
+    let mut keep = false;
     let mut dest: Option<&str> = None;
     let mut sought: Vec<String> = Vec::new();
     // The shallow-clone family. git keeps `depth` (`strtol` of `--depth=`),
@@ -150,20 +165,19 @@ pub fn fetch_pack(args: &[String]) -> Result<ExitCode> {
             // gitoxide always requests a thin pack; the end state is identical
             // either way (see the module docs).
             "--thin" | "--no-thin" => {}
-            "-k" | "--keep" | "--lock-pack" => bail!(
-                "unsupported flag {a:?} — a kept pack cannot be reproduced: \
-                 git names it after the hash of its sorted object names and adds a `.rev` file, \
-                 gix-pack names it after the pack trailer checksum and writes none ({PORTED})"
-            ),
-            "--include-tag" => bail!(
-                "unsupported flag {a:?} — gitoxide implements it as an implicit \
-                 `refs/tags/*:refs/tags/*` refspec, which would create local tag refs ({PORTED})"
-            ),
+            "-k" | "--keep" => keep = true,
+            // `--lock-pack` additionally makes `index-pack` hold a `.keep` lock
+            // whose path `cmd_fetch_pack()` prints as `lock <path>` and expects
+            // the caller to release; there is no lockfile protocol here to hand
+            // that ownership to.
+            "--lock-pack" => bail!("unsupported flag {a:?} ({PORTED}, -k/--keep)"),
+            "--include-tag" => include_tag = true,
             // `--deepen-relative` is a modifier on `--depth`; git only appends the
             // `deepen-relative` line when a depth is present, so we just record it.
             "--deepen-relative" => deepen_relative = true,
+            "--diag-url" => diag_url = true,
             "--refetch" => bail!("unsupported flag {a:?} ({PORTED})"),
-            "--check-self-contained-and-connected" | "--diag-url" | "--stateless-rpc"
+            "--check-self-contained-and-connected" | "--stateless-rpc"
             | "--no-filter" => bail!("unsupported flag {a:?} ({PORTED})"),
             // `--depth=<n>` — git does `strtol(arg, NULL, 0)`; a non-numeric value
             // there degrades to 0 (no deepen), but we surface it as an error rather
@@ -201,6 +215,13 @@ pub fn fetch_pack(args: &[String]) -> Result<ExitCode> {
         eprint!("{USAGE}");
         return Ok(ExitCode::from(129));
     };
+
+    // `--diag-url` short-circuits everything: `git_connect()` decomposes the URL,
+    // prints the breakdown, returns NULL, and `cmd_fetch_pack()` exits 0 without
+    // reading stdin, opening a repository or contacting anyone (fetch-pack.c:224).
+    if diag_url {
+        return diag_connect_url(dest);
+    }
 
     // `--stdin` refs are processed after the ones on the command line.
     if from_stdin {
@@ -240,6 +261,11 @@ pub fn fetch_pack(args: &[String]) -> Result<ExitCode> {
     };
 
     // --- select the refs to report and to want ----------------------------
+    let advertised_tags: Vec<String> = advertised
+        .iter()
+        .filter(|(name, _)| name.starts_with("refs/tags/"))
+        .map(|(name, _)| name.clone())
+        .collect();
     let mut selected: Vec<(String, ObjectId)> = Vec::new();
     let mut missing = false;
     if all {
@@ -269,6 +295,40 @@ pub fn fetch_pack(args: &[String]) -> Result<ExitCode> {
     }
     selected.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
 
+    // `--include-tag` asks `upload-pack` to add, to the pack it was already going
+    // to send, the tag objects under `refs/tags/` whose target is in that pack.
+    // It can therefore only ever add tags the server is holding — so when every
+    // advertised tag is already an explicit `want`, the capability has nothing
+    // left to contribute and the received object set is the same either way.
+    // That is the case `--all` produces, and it is checked rather than assumed.
+    //
+    // Anywhere else it is refused. The vendored fetch spells "include tags" as
+    // `Tags::Included`, which `Tags::to_refspec()` turns into an implicit
+    // `refs/tags/*:refs/tags/*` (gix-protocol/src/fetch/types.rs:270) — that
+    // writes local tag refs, and `fetch-pack` must write none. Deciding
+    // client-side which tags the server *would* have attached needs the pack's
+    // contents before the pack exists; gitoxide's own note on the capability
+    // says the same ("we would have to implement another pass to fetch attached
+    // tags separately"). Wanting every tag unconditionally instead would
+    // download tags unrelated to the fetched objects, which is a different
+    // operation, so the flag stops here rather than approximating one.
+    if include_tag {
+        let selected_names: HashSet<&str> = selected.iter().map(|(n, _)| n.as_str()).collect();
+        let unwanted_tags = advertised_tags
+            .iter()
+            .filter(|name| !selected_names.contains(name.as_str()))
+            .count();
+        if unwanted_tags > 0 {
+            bail!(
+                "unsupported flag \"--include-tag\" for a fetch that does not already want every \
+                 advertised tag ({unwanted_tags} not wanted here) — gitoxide spells the \
+                 capability as an implicit `refs/tags/*:refs/tags/*` refspec, which would create \
+                 local tag refs that `fetch-pack` must not write ({PORTED}, and --include-tag \
+                 alongside a want set that already covers every tag)"
+            );
+        }
+    }
+
     // Nothing matched: git never opens a fetch and exits 1.
     if selected.is_empty() {
         return Ok(ExitCode::FAILURE);
@@ -276,7 +336,7 @@ pub fn fetch_pack(args: &[String]) -> Result<ExitCode> {
 
     // --- phase 2: negotiate and receive the pack --------------------------
     let shallow = build_shallow(depth, deepen_relative, shallow_since.as_deref(), &shallow_exclude)?;
-    if let Err(e) = receive(&repo, dest, &selected, shallow) {
+    if let Err(e) = receive(&repo, dest, &selected, shallow, keep) {
         // A failed fetch surfaces as git's `fatal:` with 128 unless it is one of
         // our own refusals, which must stay loud and unmistakable.
         if let Some(refusal) = e.downcast_ref::<Refusal>() {
@@ -297,6 +357,247 @@ pub fn fetch_pack(args: &[String]) -> Result<ExitCode> {
     } else {
         ExitCode::SUCCESS
     })
+}
+
+/// git's `enum url_scheme` (url.h:26). `Unknown` is the value
+/// `parse_connect_url()` dies on.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum UrlScheme {
+    Local,
+    File,
+    Ssh,
+    Git,
+    Unknown,
+}
+
+impl UrlScheme {
+    /// `url_scheme_name()` (connect.c:703) — what `Diag: protocol=` prints.
+    fn name(self) -> &'static str {
+        match self {
+            UrlScheme::Local | UrlScheme::File => "file",
+            UrlScheme::Ssh => "ssh",
+            UrlScheme::Git => "git",
+            UrlScheme::Unknown => "unknown protocol",
+        }
+    }
+
+    /// `url_get_scheme()` (url.c:144), including the two deprecated spellings.
+    fn from_name(name: &str) -> Self {
+        match name {
+            "ssh" | "git+ssh" | "ssh+git" => UrlScheme::Ssh,
+            "git" => UrlScheme::Git,
+            "file" => UrlScheme::File,
+            _ => UrlScheme::Unknown,
+        }
+    }
+}
+
+/// `--diag-url`: print `git_connect()`'s decomposition of `url` and exit 0.
+///
+/// Port of the non-SSH arm of `git_connect()` (connect.c:1425-1430):
+///
+/// ```c
+/// scheme = parse_connect_url(url, &hostandport, &path);
+/// if ((flags & CONNECT_DIAG_URL) && (scheme != URL_SCHEME_SSH)) {
+///         printf("Diag: url=%s\n", url ? url : "NULL");
+///         printf("Diag: protocol=%s\n", url_scheme_name(scheme));
+///         printf("Diag: hostandport=%s\n", hostandport ? hostandport : "NULL");
+///         printf("Diag: path=%s\n", path ? path : "NULL");
+///         conn = NULL;
+/// }
+/// ```
+///
+/// `url=` echoes the argument as given, not the decoded copy the parser works
+/// on, so a percent-encoded URL prints twice in two forms — that is git's
+/// output and it is reproduced here.
+///
+/// An SSH URL takes git's other arm, which prints `userandhost`/`port` instead
+/// and reaches it only after `transport_check_allowed("ssh")` and the
+/// `strange pathname` guard. Neither has a home in this tree, so that arm bails
+/// rather than printing a breakdown git might have refused to produce.
+fn diag_connect_url(url: &str) -> Result<ExitCode> {
+    let (scheme, hostandport, path) = match parse_connect_url(url) {
+        Ok(parts) => parts,
+        Err(message) => {
+            eprintln!("fatal: {message}");
+            return Ok(ExitCode::from(128));
+        }
+    };
+    if scheme == UrlScheme::Ssh {
+        bail!(
+            "--diag-url on an ssh URL is not ported: git reaches that breakdown \
+             (userandhost/port) only after `transport_check_allowed(\"ssh\")` and the \
+             `strange pathname` guard, neither of which exists here ({PORTED}, --diag-url \
+             for local, file:// and git:// URLs)"
+        );
+    }
+    print!(
+        "Diag: url={url}\nDiag: protocol={}\nDiag: hostandport={hostandport}\nDiag: path={path}\n",
+        scheme.name()
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Port of `parse_connect_url()` (connect.c:1054), returning
+/// `(scheme, hostandport, path)` or the message git would `die()` with.
+///
+/// The C walks one mutable buffer with pointers and NUL-terminates it in place;
+/// this walks the same buffer with byte indices, which is why the boundaries are
+/// named after the C variables (`host`, `end`, `path`) rather than being
+/// re-derived.
+///
+/// Two branches of the C are unreachable on the platforms this tree builds for
+/// and are therefore not carried over: both `URL_SCHEME_FILE` special cases turn
+/// on `has_dos_drive_prefix()` or on `offset_1st_component(host - 2) > 1`, and
+/// POSIX's `offset_1st_component()` returns at most 1 (`is_dir_sep(s[0])`), so a
+/// `file://` URL takes the same `strchr(end, separator)` path every other
+/// non-local scheme takes.
+fn parse_connect_url(url_orig: &str) -> std::result::Result<(UrlScheme, String, String), String> {
+    let url = if is_url(url_orig) {
+        url_decode(url_orig)
+    } else {
+        url_orig.to_string()
+    };
+    let bytes = url.as_bytes();
+
+    let mut scheme = UrlScheme::Local;
+    let mut separator = b'/';
+    let host = match url.find("://") {
+        Some(at) => {
+            scheme = UrlScheme::from_name(&url[..at]);
+            if scheme == UrlScheme::Unknown {
+                return Err(format!("protocol '{}' is not supported", &url[..at]));
+            }
+            at + 3
+        }
+        None => {
+            if !url_is_local_not_ssh(&url) {
+                scheme = UrlScheme::Ssh;
+                separator = b':';
+            }
+            0
+        }
+    };
+
+    // "Don't do destructive transforms as protocol code does '[]' unwrapping in
+    // get_host_and_port()" — hence `removebrackets = 0`.
+    let end = host_end(bytes, host);
+
+    let path = if scheme == UrlScheme::Local {
+        Some(end)
+    } else {
+        bytes[end..].iter().position(|&b| b == separator).map(|k| end + k)
+    };
+    let Some(path) = path.filter(|&p| p < bytes.len()) else {
+        return Err("no path specified; see 'git help pull' for valid url syntax".to_string());
+    };
+
+    // `end = path` here: the host is terminated where the path begins, whatever
+    // the two adjustments below do to the path's own start.
+    let host_end_index = path;
+    let mut path = path;
+    if separator == b':' {
+        path += 1; // the path starts after the ':'
+    }
+    // "null-terminate hostname and point path to ~ for URL's like this:
+    //  ssh://host.xz/~user/repo"
+    if matches!(scheme, UrlScheme::Git | UrlScheme::Ssh) && bytes.get(path + 1) == Some(&b'~') {
+        path += 1;
+    }
+
+    Ok((
+        scheme,
+        url[host..host_end_index].to_string(),
+        url[path..].to_string(),
+    ))
+}
+
+/// `host_end()` (connect.c:718) with `removebrackets = 0`: the index just past
+/// the bracketed IPv6 literal a host may start with, or the host's own start.
+fn host_end(bytes: &[u8], host: usize) -> usize {
+    let rest = &bytes[host..];
+    // `strstr(host, "@[")`, then `start++` to jump over the '@'.
+    let start = rest
+        .windows(2)
+        .position(|w| w == b"@[")
+        .map_or(0, |at| at + 1);
+    if rest.get(start) != Some(&b'[') {
+        return host;
+    }
+    match rest[start + 1..].iter().position(|&b| b == b']') {
+        // `end` is left ON the ']' — the `end++` that skips it is inside the
+        // `if (removebrackets)` block, which this caller does not take.
+        Some(k) => host + start + 1 + k,
+        None => host,
+    }
+}
+
+/// `url_is_local_not_ssh()` (url.c:136). The `has_dos_drive_prefix()` clause is
+/// Windows-only and always false here.
+fn url_is_local_not_ssh(url: &str) -> bool {
+    let colon = url.find(':');
+    let slash = url.find('/');
+    match (colon, slash) {
+        (None, _) => true,
+        (Some(c), Some(s)) => s < c,
+        (Some(_), None) => false,
+    }
+}
+
+/// `is_url()` (url.c:34): a `[A-Za-z0-9][A-Za-z0-9+.-]*` scheme followed by
+/// `://`. The first character is deliberately allowed to be a digit — git
+/// loosened the RFC3986 rule so as not to break existing remote helpers.
+fn is_url(url: &str) -> bool {
+    let b = url.as_bytes();
+    let scheme_char = |first: bool, c: u8| c.is_ascii_alphanumeric() || (!first && matches!(c, b'+' | b'-' | b'.'));
+    if b.is_empty() || !scheme_char(true, b[0]) {
+        return false;
+    }
+    let mut i = 1;
+    while i < b.len() && b[i] != b':' {
+        if !scheme_char(false, b[i]) {
+            return false;
+        }
+        i += 1;
+    }
+    b.get(i) == Some(&b':') && b.get(i + 1) == Some(&b'/') && b.get(i + 2) == Some(&b'/')
+}
+
+/// `url_decode()` (url.c:85) by way of `url_decode_mem`: everything up to the
+/// first colon is copied verbatim (it is the scheme), and `%XX` escapes are
+/// decoded from the colon on. `+` is NOT turned into a space — that is
+/// `decode_plus`, which this call site leaves off.
+fn url_decode(url: &str) -> String {
+    let b = url.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = match b.iter().position(|&c| c == b':') {
+        // `if (colon && url < colon)`: a leading colon is not a scheme.
+        Some(at) if at > 0 => {
+            out.extend_from_slice(&b[..at]);
+            at
+        }
+        _ => 0,
+    };
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            // `hex2chr` rejects a NUL byte and any non-hex digit, and git only
+            // takes the escape when the decoded value is strictly positive.
+            if let Some(v) = hex2chr(b[i + 1], b[i + 2]).filter(|&v| v > 0) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// `hex2chr()`: two hex digits as one byte, `None` when either is not hex.
+fn hex2chr(hi: u8, lo: u8) -> Option<u8> {
+    let digit = |c: u8| (c as char).to_digit(16).map(|d| d as u8);
+    Some(digit(hi)? << 4 | digit(lo)?)
 }
 
 /// Every ref the remote advertises, as `(full name, id)` pairs.
@@ -406,7 +707,8 @@ fn build_shallow(
     Ok(Shallow::NoChange)
 }
 
-/// Want exactly `selected`, receive the pack, and explode it into loose objects.
+/// Want exactly `selected`, receive the pack, and either keep it (`--keep`) or
+/// explode it into loose objects.
 ///
 /// Each ref is turned into a one-sided fetch refspec (`refs/heads/main` with no
 /// destination), which makes it a `want` without producing any ref edit — the
@@ -416,6 +718,7 @@ fn receive(
     dest: &str,
     selected: &[(String, ObjectId)],
     shallow: Shallow,
+    keep: bool,
 ) -> Result<()> {
     let remote = repo
         .remote_at(dest)?
@@ -442,8 +745,62 @@ fn receive(
         Status::NoPackReceived { .. } => Ok(()),
         Status::Change {
             write_pack_bundle, ..
+        } if keep => keep_pack(write_pack_bundle),
+        Status::Change {
+            write_pack_bundle, ..
         } => explode(repo, write_pack_bundle),
     }
+}
+
+/// `--keep`: leave the received pack in `objects/pack` under a `.keep`, and
+/// print the `keep <hash>` line `index-pack --stdin --keep` prints.
+///
+/// git reaches this by running `index-pack --stdin --keep=<msg>` instead of
+/// `unpack-objects` (`get_pack()`, fetch-pack.c:1007-1018); the child inherits
+/// stdout, so its `keep\t<hash>` lands before the ref listing `fetch-pack` prints
+/// afterwards. `<hash>` is the pack's own trailer checksum — which is also what
+/// the pack is named after, both here and in git — so the two agree whenever the
+/// received bytes do.
+///
+/// The `.keep` message is git's, `fetch-pack <pid> on <hostname>`
+/// (`add_index_pack_keep_option()`, fetch-pack.c:947-950). gitoxide writes a
+/// `.keep` of its own as a collection guard and expects the caller to deal with
+/// it; here it is filled in with git's text rather than removed, which is
+/// exactly the file `--keep` is asking for.
+///
+/// `finalize_object_file()` leaves the pack, its index and its reverse index
+/// read-only, so the three are chmod'd to match.
+fn keep_pack(bundle: gix::odb::pack::bundle::write::Outcome) -> Result<()> {
+    let (Some(index_path), Some(data_path)) = (bundle.index_path.clone(), bundle.data_path.clone())
+    else {
+        // gitoxide found a pack with these bytes already on disk and reused it,
+        // so there is nothing to keep and nothing new to name.
+        return Ok(());
+    };
+    if let Some(keep_path) = bundle.keep_path.clone() {
+        std::fs::write(
+            &keep_path,
+            format!(
+                "fetch-pack {} on {}\n",
+                std::process::id(),
+                super::send_email::hostname()
+            ),
+        )?;
+        // `odb_pack_keep()` creates it `O_CREAT|O_EXCL, 0600`, unlike the three
+        // read-only files below.
+        let _ = std::fs::set_permissions(&keep_path, std::fs::Permissions::from_mode(0o600));
+    }
+    // git's `index-pack` writes the reverse index for the pack it just built;
+    // `gix-pack` does not, so it is filled in beside the index here.
+    if let Some(pack_dir) = data_path.parent() {
+        super::index_pack::write_missing_rev_indexes(pack_dir);
+    }
+    for path in [&data_path, &index_path] {
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o444));
+    }
+
+    println!("keep\t{}", bundle.index.data_hash.to_hex());
+    Ok(())
 }
 
 /// Turn the freshly written pack into loose objects and remove it, which is what
@@ -549,5 +906,76 @@ impl Scratch {
 impl Drop for Scratch {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_connect_url, UrlScheme};
+
+    /// Every expectation below was read off stock git 2.55.0's own
+    /// `git fetch-pack --diag-url <url>`, which prints exactly the three values
+    /// `parse_connect_url()` returns. They are the cases where the C walks its
+    /// buffer with pointer arithmetic this port had to re-express as indices:
+    /// the empty host of a local path, the `//` a `file://` URL leaves behind,
+    /// the `~user` rewind, the `:` separator of an scp-like address, and the
+    /// bracketed IPv6 literal `host_end()` exists for.
+    #[test]
+    fn parse_connect_url_matches_gits_diag_url() {
+        let cases: &[(&str, UrlScheme, &str, &str)] = &[
+            // A bare local path: the host is empty and the whole string is the path.
+            (".", UrlScheme::Local, "", "."),
+            ("/tmp/repo", UrlScheme::Local, "", "/tmp/repo"),
+            // A local path whose *later* component holds a colon stays local,
+            // because `url_is_local_not_ssh()` sees the slash first.
+            ("./sub:dir/repo", UrlScheme::Local, "", "./sub:dir/repo"),
+            // `file://` with an empty authority.
+            ("file:///tmp/repo", UrlScheme::File, "", "/tmp/repo"),
+            // Percent-decoding runs before the split, and only past the scheme.
+            ("file://%2Ftmp/repo", UrlScheme::File, "", "/tmp/repo"),
+            ("git://host.xz/repo.git", UrlScheme::Git, "host.xz", "/repo.git"),
+            // The port stays with the host; `~user` pulls the path start back
+            // onto the tilde.
+            (
+                "git://host.xz:9418/~user/repo.git",
+                UrlScheme::Git,
+                "host.xz:9418",
+                "~user/repo.git",
+            ),
+            // `host_end()`: the path search starts after the ']' so a colon
+            // inside an IPv6 literal is not mistaken for the port separator.
+            ("git://[::1]/repo.git", UrlScheme::Git, "[::1]", "/repo.git"),
+            ("git://[::1]:9418/repo.git", UrlScheme::Git, "[::1]:9418", "/repo.git"),
+            (
+                "git://user@[::1]:9418/repo.git",
+                UrlScheme::Git,
+                "user@[::1]:9418",
+                "/repo.git",
+            ),
+            // scp-like: no scheme, a colon before any slash, so the separator
+            // becomes ':' and the path starts after it.
+            ("host.xz:repo.git", UrlScheme::Ssh, "host.xz", "repo.git"),
+            ("ssh://host.xz/repo.git", UrlScheme::Ssh, "host.xz", "/repo.git"),
+        ];
+        for (url, scheme, host, path) in cases {
+            let (got_scheme, got_host, got_path) =
+                parse_connect_url(url).unwrap_or_else(|e| panic!("{url}: {e}"));
+            assert_eq!(got_scheme.name(), scheme.name(), "scheme for {url}");
+            assert_eq!(got_host, *host, "hostandport for {url}");
+            assert_eq!(got_path, *path, "path for {url}");
+        }
+    }
+
+    /// The two `die()`s `parse_connect_url()` can reach, worded as git words them.
+    #[test]
+    fn parse_connect_url_rejects_what_git_rejects() {
+        assert_eq!(
+            parse_connect_url("git://host.xz").unwrap_err(),
+            "no path specified; see 'git help pull' for valid url syntax"
+        );
+        assert_eq!(
+            parse_connect_url("bogus://host/x").unwrap_err(),
+            "protocol 'bogus' is not supported"
+        );
     }
 }

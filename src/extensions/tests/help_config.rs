@@ -1,18 +1,23 @@
-//! Config-driven `git help` behavior. Two keys reach this command:
+//! Config-driven `git help` behavior. Four keys reach this command:
 //!   * `help.autocorrect` — parsed in the unknown-verb path (see the
 //!     `autocorrect` integration test); not re-tested here.
-//!   * `help.format` — read by `git help <topic>` to pick a viewer. Only the
-//!     plain `man` viewer is implemented, so a non-`man` `help.format` (and,
-//!     symmetrically, a non-`man` `man.viewer`) is a faithful-unsupported gate
-//!     that must fire before `man` is ever spawned.
+//!   * `help.format` — picks the viewer. All three of git's formats are
+//!     implemented, so `html`/`web` must actually route to the HTML viewer
+//!     rather than being rejected, and an unrecognized value must die with
+//!     git's own message.
+//!   * `help.htmlpath` — overrides the directory the HTML viewer resolves the
+//!     page in, and is never written to (it is the user's own tree).
+//!   * `man.viewer` — a non-`man` viewer is a faithful-unsupported gate that
+//!     must fire before `man` is ever spawned.
 //!
-//! `help.htmlPath` / `help.browser` are intentionally NOT read: both only steer
-//! the web format (`git help -w`), which this port rejects outright, so reading
-//! them would fabricate behavior with no code path behind it.
+//! Every case that reaches the HTML viewer pins `web.browser` to a custom tool
+//! whose `browser.<tool>.cmd` echoes its arguments, so no real browser is ever
+//! detected or launched and the resolved page path lands on stdout where the
+//! test can compare it byte-for-byte.
 //!
 //! The one place `help.format` is git-parity rather than a divergence is the
-//! alias path: an alias resolves and prints its expansion BEFORE the viewer gate
-//! is consulted, exactly as stock git does — that case is asserted byte-for-byte
+//! alias path: an alias resolves and prints its expansion BEFORE the viewer is
+//! consulted, exactly as stock git does — that case is asserted byte-for-byte
 //! against the installed git.
 
 use std::path::{Path, PathBuf};
@@ -82,21 +87,91 @@ fn alias_expansion_precedes_format_gate() {
     let _ = std::fs::remove_dir_all(repo.parent().unwrap());
 }
 
-/// A non-`man` `help.format` on a real topic fails through the viewer gate — and
-/// crucially fails BEFORE `man` is spawned, so the value is genuinely honored
-/// rather than ignored. The error names the offending value.
+/// Pin `web.browser` to a custom tool that only echoes the URLs it is handed, so
+/// the viewer runs to completion without a browser existing. Returns the config
+/// arguments; the echoed path shows up on the command's stdout.
+fn echoing_browser(repo: &Path) {
+    git(repo, &["config", "web.browser", "zvcsecho"]);
+    git(repo, &["config", "browser.zvcsecho.cmd", "printf '%s\\n'"]);
+}
+
+/// `help.format=html` selects the web viewer, exactly as `-w` does: the page is
+/// materialized under `git --html-path` and its path handed to `web--browse`.
+/// The echoed path is the whole contract — it proves the lookup resolved to the
+/// directory `--html-path` reports, under the name `cmd_to_page()` produces.
 #[test]
-fn unsupported_help_format_is_rejected() {
+fn help_format_html_selects_the_web_viewer() {
     let (repo, home) = fixture("format");
     git(&repo, &["config", "help.format", "html"]);
+    echoing_browser(&repo);
 
     let out = run(&repo, &home, &["help", "status"]);
-    assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("help.format=html"), "stderr:\n{stderr}");
-    assert!(stderr.contains("only the plain `man` viewer is"), "stderr:\n{stderr}");
-    // The gate fired ahead of any viewer, so nothing reached stdout.
+    assert!(out.status.success(), "stderr:\n{stderr}");
+
+    let dir = String::from_utf8(run(&repo, &home, &["--html-path"]).stdout).unwrap();
+    let page = PathBuf::from(dir.trim()).join("git-status.html");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!("{}\n", page.display()),
+        "the viewer was handed the wrong path"
+    );
+
+    // …and that path is a real page carrying git's own description of `status`.
+    let body = std::fs::read_to_string(&page).unwrap();
+    assert!(body.starts_with("<!doctype html>"), "not an HTML document:\n{body}");
+    assert!(body.contains("Show the working tree status"), "no summary in:\n{body}");
+
+    let _ = std::fs::remove_dir_all(repo.parent().unwrap());
+}
+
+/// An unrecognized `help.format` dies with git's own message and exit code,
+/// rather than being silently treated as `man`.
+#[test]
+fn unrecognized_help_format_dies() {
+    let (repo, home) = fixture("badformat");
+    git(&repo, &["config", "help.format", "hologram"]);
+
+    let out = run(&repo, &home, &["help", "status"]);
+    assert_eq!(out.status.code(), Some(128));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(stderr, "fatal: unrecognized help format 'hologram'\n", "stderr:\n{stderr}");
     assert!(String::from_utf8_lossy(&out.stdout).is_empty());
+
+    let _ = std::fs::remove_dir_all(repo.parent().unwrap());
+}
+
+/// `help.htmlpath` moves the lookup to the configured directory — and that
+/// directory is the user's own tree, so nothing is generated into it: an empty
+/// one produces git's `documentation file not found` rather than a page.
+#[test]
+fn help_htmlpath_redirects_the_lookup_and_is_never_written_to() {
+    let (repo, home) = fixture("htmlpath");
+    let elsewhere = home.join("manual");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    git(&repo, &["config", "help.htmlpath", elsewhere.to_str().unwrap()]);
+    echoing_browser(&repo);
+
+    let out = run(&repo, &home, &["help", "-w", "status"]);
+    assert_eq!(out.status.code(), Some(128));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        stderr,
+        format!("fatal: '{}/git-status.html': documentation file not found.\n", elsewhere.display()),
+        "stderr:\n{stderr}"
+    );
+    assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0, "the configured tree was written to");
+
+    // With the page present, the same lookup succeeds and hands over that path —
+    // the configured directory, not the built-in one.
+    std::fs::write(elsewhere.join("git-status.html"), "<!doctype html>\n").unwrap();
+    let out = run(&repo, &home, &["help", "-w", "status"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stderr:\n{stderr}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!("{}/git-status.html\n", elsewhere.display())
+    );
 
     let _ = std::fs::remove_dir_all(repo.parent().unwrap());
 }

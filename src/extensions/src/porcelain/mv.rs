@@ -9,12 +9,20 @@
 //!   * flags `-f`/`--force`, `-k`, `-n`/`--dry-run`, `-v`/`--verbose`,
 //!     `--sparse`, `-h`, `--`
 //!
-//! A directory source remaps every tracked entry beneath it. Overwriting a
-//! tracked/worktree destination requires `-f`. Exit codes match stock git:
-//! usage errors return 129, fatal errors return 128, `-k`-skipped failures
-//! still return 0. `--sparse` is accepted as a no-op — this server enforces no
-//! sparse-checkout cone, so relaxing that cone (all `--sparse` does) is already
-//! the behavior of a plain move.
+//! A directory source remaps every tracked entry beneath it; a source that is
+//! itself a gitlink is moved as a submodule (`.gitmodules` is rewritten and
+//! restaged, and the submodule's `.git` file and `core.worktree` are repointed).
+//! Overwriting a tracked/worktree destination requires `-f`. Exit codes match
+//! stock git: usage errors return 129, fatal errors return 128, `-k`-skipped
+//! failures still return 0.
+//!
+//! Sparse-checkout: without `--sparse`, a source or destination outside the
+//! sparse-checkout definition is not moved. Every such path is collected and
+//! reported by `advise_on_updating_sparse_paths()`, and the whole command exits
+//! 1 having touched neither the index nor the worktree, exactly as `cmd_mv`
+//! does. Not ported: `SKIP_WORKTREE_DIR`, git's handling of a *directory* that
+//! exists only as sparse index entries (`empty_dir_has_sparse_contents()`);
+//! such a source is still reported as `bad source`.
 
 use anyhow::{anyhow, bail, Result};
 use std::path::{Component, Path, PathBuf};
@@ -61,6 +69,14 @@ struct Plan {
     dst_rel: String,
     /// (old repo-relative path, new repo-relative path) for each index entry.
     remaps: Vec<(String, String)>,
+    /// `submodule_gitfiles[i]`: set when the source is a gitlink, carrying the
+    /// git directory its `.git` *file* points at. `None` for a non-submodule;
+    /// `Some(None)` is git's `SUBMODULE_WITH_GITDIR` — an embedded `.git`
+    /// directory, which needs no repointing.
+    submodule: Option<Option<PathBuf>>,
+    /// A directory source, whose entries are remapped without a sparse check
+    /// (git reaches `act_on_entry` before the sparse gate for those).
+    is_dir: bool,
 }
 
 pub fn mv(args: &[String]) -> Result<ExitCode> {
@@ -69,6 +85,7 @@ pub fn mv(args: &[String]) -> Result<ExitCode> {
     let mut skip = false;
     let mut dry_run = false;
     let mut verbose = false;
+    let mut ignore_sparse = false;
     let mut positional: Vec<&str> = Vec::new();
     let mut opts_done = false;
     for a in args {
@@ -90,9 +107,8 @@ pub fn mv(args: &[String]) -> Result<ExitCode> {
             "-k" => skip = true,
             "-n" | "--dry-run" => dry_run = true,
             "-v" | "--verbose" => verbose = true,
-            // No sparse-checkout cone is enforced here, so `--sparse` (which only
-            // relaxes that cone) is byte-for-byte a plain move. Accept, no-op.
-            "--sparse" => {}
+            "--sparse" => ignore_sparse = true,
+            "--no-sparse" => ignore_sparse = false,
             s if s.starts_with('-') && s.len() > 1 => {
                 eprintln!("error: unknown option `{}'", s.trim_start_matches('-'));
                 return usage_err();
@@ -162,10 +178,40 @@ pub fn mv(args: &[String]) -> Result<ExitCode> {
     //    Without `-k` the first failure aborts before ANY disk/index mutation,
     //    matching git's all-or-nothing behavior. With `-k` a failing source is
     //    silently skipped and the command still succeeds.
+    //
+    //    `path_in_sparse_checkout()` is the very last gate git applies, after
+    //    every other check has passed, so that it can point at `--sparse`.
+    let sparsity = if !ignore_sparse
+        && repo
+            .config_snapshot()
+            .boolean("core.sparseCheckout")
+            .unwrap_or(false)
+    {
+        Some(super::sparse_checkout::load_sparsity(&repo)?)
+    } else {
+        None
+    };
+    let mut only_match_skip_worktree: Vec<String> = Vec::new();
+
     let mut plans: Vec<Plan> = Vec::new();
     for s in sources {
         match plan_source(&index, &workdir, &prefix, s, dir_mode, &dest_rel, force) {
-            Ok(plan) => plans.push(plan),
+            Ok(plan) => {
+                // Both ends are checked, and both are named in the report.
+                if let Some(sp) = sparsity.as_ref().filter(|_| !plan.is_dir) {
+                    let mut skip_sparse = false;
+                    for end in [&plan.src_rel, &plan.dst_rel] {
+                        if !sp.includes(end) {
+                            only_match_skip_worktree.push(end.clone());
+                            skip_sparse = true;
+                        }
+                    }
+                    if skip_sparse {
+                        continue;
+                    }
+                }
+                plans.push(plan)
+            }
             Err(e) => {
                 if skip {
                     continue;
@@ -175,9 +221,19 @@ pub fn mv(args: &[String]) -> Result<ExitCode> {
         }
     }
 
+    // git reports every sparse-excluded path together and then gives up on the
+    // whole command — nothing has been renamed or staged at this point.
+    if !only_match_skip_worktree.is_empty() {
+        crate::advice::on_updating_sparse_paths(&repo, &only_match_skip_worktree);
+        if !skip {
+            return Ok(ExitCode::from(1));
+        }
+    }
+
     // 6. Apply phase — print the same lines git prints, then (unless dry-run)
     //    rename on disk and remap the index entries.
     let mut modified = false;
+    let mut gitmodules_modified = false;
     for plan in &plans {
         if dry_run {
             println!("Checking rename of '{}' to '{}'", plan.src_rel, plan.dst_rel);
@@ -189,12 +245,28 @@ pub fn mv(args: &[String]) -> Result<ExitCode> {
             if let Err(e) = std::fs::rename(&plan.src_abs, &plan.dst_abs) {
                 return fatal(format!("renaming '{}' failed: {e}", plan.src_rel));
             }
+            if let Some(gitfile) = &plan.submodule {
+                // `update_path_in_gitmodules()` then, for a `.git`-file
+                // submodule, `connect_work_tree_and_git_dir()`.
+                if update_path_in_gitmodules(&workdir, &plan.src_rel, &plan.dst_rel)? {
+                    gitmodules_modified = true;
+                }
+                if let Some(git_dir) = gitfile {
+                    connect_work_tree_and_git_dir(&plan.dst_abs, git_dir)?;
+                }
+            }
             apply_remaps(&mut index, &plan.remaps);
             modified = true;
         }
     }
 
-    // 7. Persist once. `dangerously_push_entry` appends out of order, so restore
+    // 7. `stage_updated_gitmodules()`: the rewritten file is restaged, so the
+    //    move shows up as one commit's worth of change.
+    if gitmodules_modified {
+        stage_gitmodules(&repo, &mut index, &workdir)?;
+    }
+
+    // 8. Persist once. `dangerously_push_entry` appends out of order, so restore
     //    the sort invariant before writing, and drop the stale tree-cache so a
     //    later commit doesn't capture a subtree that no longer exists.
     if modified {
@@ -241,7 +313,40 @@ fn plan_source(
     let meta = std::fs::symlink_metadata(&src_abs)
         .map_err(|_| anyhow!("bad source, source={src_rel}, destination={dst_rel}"))?;
 
+    let mut submodule = None;
     let remaps: Vec<(String, String)> = if meta.is_dir() {
+        // `dir_check`: an index entry *at* the directory itself is a gitlink, so
+        // this is a submodule move rather than a subtree remap. git refuses to
+        // touch `.gitmodules` while it has unstaged edits, since it is about to
+        // rewrite and restage it.
+        if let Some(mode) = tracked_mode(index, &src_rel) {
+            if mode != Mode::COMMIT {
+                crate::git_fatal!("Directory {src_rel} is in index and no submodule?");
+            }
+            if gitmodules_has_unstaged_changes(index, workdir)? {
+                crate::git_fatal!(
+                    "Please stage your changes to .gitmodules or stash them to proceed"
+                );
+            }
+            // `read_gitfile()`: `Some(path)` for a `.git` file (a separate git
+            // dir that has to be repointed), `None` for an embedded `.git`
+            // directory (git's `SUBMODULE_WITH_GITDIR`).
+            submodule = Some(read_gitfile(&src_abs.join(".git")));
+            if dst_abs.exists() {
+                crate::git_fatal!(
+                    "destination already exists, source={src_rel}, destination={dst_rel}"
+                );
+            }
+            return Ok(Plan {
+                src_abs,
+                dst_abs,
+                src_rel: src_rel.clone(),
+                dst_rel: dst_rel.clone(),
+                remaps: vec![(src_rel, dst_rel)],
+                submodule,
+                is_dir: true,
+            });
+        }
         // Directory: remap every stage-0 entry beneath `src_rel/`.
         let sub_prefix = format!("{src_rel}/");
         let mut remaps = Vec::new();
@@ -287,22 +392,173 @@ fn plan_source(
         }
     }
 
+    let is_dir = meta.is_dir();
     Ok(Plan {
         src_abs,
         dst_abs,
         src_rel,
         dst_rel,
         remaps,
+        submodule,
+        is_dir,
     })
 }
 
 /// Whether a stage-0 index entry exists at exactly `rel`.
 fn is_tracked(index: &gix::index::File, rel: &str) -> bool {
+    tracked_mode(index, rel).is_some()
+}
+
+/// The mode of the stage-0 index entry at exactly `rel`, if there is one.
+fn tracked_mode(index: &gix::index::File, rel: &str) -> Option<Mode> {
     let backing = index.path_backing();
-    index.entries().iter().any(|e| {
-        e.stage() == Stage::Unconflicted
-            && AsRef::<[u8]>::as_ref(e.path_in(backing)) == rel.as_bytes()
-    })
+    index
+        .entries()
+        .iter()
+        .find(|e| {
+            e.stage() == Stage::Unconflicted
+                && AsRef::<[u8]>::as_ref(e.path_in(backing)) == rel.as_bytes()
+        })
+        .map(|e| e.mode)
+}
+
+/// `read_gitfile()`: the git directory a `gitdir: <path>` file points at, made
+/// absolute against the file's own directory. `None` when `path` is not a
+/// gitfile — an embedded `.git` directory, or nothing at all.
+fn read_gitfile(path: &Path) -> Option<PathBuf> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let target = text.strip_prefix("gitdir: ")?.trim_end_matches(['\n', '\r']);
+    let target = Path::new(target);
+    let joined = if target.is_absolute() {
+        target.to_path_buf()
+    } else {
+        path.parent()?.join(target)
+    };
+    Some(joined.canonicalize().unwrap_or(joined))
+}
+
+/// `is_staging_gitmodules_ok()`: true when the worktree `.gitmodules` differs
+/// from the blob the index records, which is when git refuses to rewrite it.
+fn gitmodules_has_unstaged_changes(index: &gix::index::File, workdir: &Path) -> Result<bool> {
+    let Some(entry) = index.entry_by_path(BStr::new(b".gitmodules")) else {
+        return Ok(false);
+    };
+    let content = match std::fs::read(workdir.join(".gitmodules")) {
+        Ok(c) => c,
+        Err(_) => return Ok(false),
+    };
+    let id = gix::objs::compute_hash(entry.id.kind(), gix::objs::Kind::Blob, &content)?;
+    Ok(id != entry.id)
+}
+
+/// `update_path_in_gitmodules()`: point the `submodule.<name>.path` of whichever
+/// section currently maps to `old` at `new`. The *name* never changes — only the
+/// path does. Returns whether the file was rewritten; git only warns (and stages
+/// nothing) when no section matches.
+fn update_path_in_gitmodules(workdir: &Path, old: &str, new: &str) -> Result<bool> {
+    let file = workdir.join(".gitmodules");
+    if !file.exists() {
+        return Ok(false);
+    }
+    let mut config = gix::config::File::from_path_no_includes(
+        file.clone(),
+        gix::config::Source::Worktree,
+    )?;
+    let name = config
+        .sections_by_name("submodule")
+        .into_iter()
+        .flatten()
+        .find(|s| s.value("path").is_some_and(|v| v.as_slice() == old.as_bytes()))
+        .and_then(|s| s.header().subsection_name().map(ToOwned::to_owned));
+    let Some(name) = name else {
+        eprintln!("warning: Could not find section in .gitmodules where path={old}");
+        return Ok(false);
+    };
+    config.set_raw_value_by("submodule", Some(name.as_ref()), "path", new)?;
+    std::fs::write(&file, config.to_string())?;
+    Ok(true)
+}
+
+/// `connect_work_tree_and_git_dir()`: rewrite `<work_tree>/.git` to point at
+/// `git_dir` and `git_dir`'s `core.worktree` back at `work_tree`, both as paths
+/// relative to each other, which is what makes a moved submodule keep working.
+fn connect_work_tree_and_git_dir(work_tree: &Path, git_dir: &Path) -> Result<()> {
+    let work_tree = work_tree.canonicalize().unwrap_or_else(|_| work_tree.to_path_buf());
+    let git_dir = git_dir.canonicalize().unwrap_or_else(|_| git_dir.to_path_buf());
+
+    std::fs::write(
+        work_tree.join(".git"),
+        format!("gitdir: {}\n", relative_path(&git_dir, &work_tree).display()),
+    )?;
+
+    let config_path = git_dir.join("config");
+    let mut config = gix::config::File::from_path_no_includes(
+        config_path.clone(),
+        gix::config::Source::Local,
+    )?;
+    config.set_raw_value_by(
+        "core",
+        None::<&BStr>,
+        "worktree",
+        relative_path(&work_tree, &git_dir).to_string_lossy().as_ref(),
+    )?;
+    std::fs::write(&config_path, config.to_string())?;
+    Ok(())
+}
+
+/// `relative_path(target, base)`: how to reach `target` starting from directory
+/// `base`, using `..` for each level `base` sits below their common ancestor.
+/// Both must already be absolute and normalized.
+fn relative_path(target: &Path, base: &Path) -> PathBuf {
+    let mut t = target.components().peekable();
+    let mut b = base.components().peekable();
+    while t.peek().is_some() && t.peek() == b.peek() {
+        t.next();
+        b.next();
+    }
+    let mut out = PathBuf::new();
+    for _ in b {
+        out.push("..");
+    }
+    out.extend(t);
+    if out.as_os_str().is_empty() {
+        out.push(".");
+    }
+    out
+}
+
+/// `stage_updated_gitmodules()`: hash the rewritten worktree file back into the
+/// index so the move is one staged change, not a staged rename plus a dirty file.
+fn stage_gitmodules(
+    repo: &gix::Repository,
+    index: &mut gix::index::File,
+    workdir: &Path,
+) -> Result<()> {
+    let path = workdir.join(".gitmodules");
+    let content = std::fs::read(&path)?;
+    let id = repo.write_blob(&content)?.detach();
+    let stat = gix::index::fs::Metadata::from_path_no_follow(&path)
+        .ok()
+        .and_then(|md| Stat::from_fs(&md).ok())
+        .unwrap_or_default();
+    match index.entry_index_by_path(BStr::new(b".gitmodules")) {
+        Ok(at) => {
+            let entry = &mut index.entries_mut()[at];
+            entry.id = id;
+            entry.stat = stat;
+        }
+        Err(_) => {
+            let name = BString::from(".gitmodules");
+            index.dangerously_push_entry(
+                stat,
+                id,
+                Flags::empty(),
+                Mode::FILE,
+                BStr::new(&name),
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Apply the (old → new) path remaps to the in-memory index: capture the moved

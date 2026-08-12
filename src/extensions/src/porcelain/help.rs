@@ -24,6 +24,20 @@
 //!     `gitrevisions`, `gitk` → `gitk`) and propagating `man`'s exit code.
 //!   * `git help <alias>` — prints `'<name>' is aliased to '<value>'`, and, as
 //!     in git, a real command wins over an alias of the same name.
+//!   * `-i`/`--info` — `show_info_page()`: `INFOPATH` is pointed at the install's
+//!     info directory and `info gitman <page>` runs, propagating its status; with
+//!     no `info` on `$PATH` git's `fatal: no info viewer handled the request`
+//!     (exit 128) is what is left.
+//!   * `-w`/`--web` — `show_html_page()`: `get_html_page_path()` resolves
+//!     `<html-path>/<page>.html` (honoring `help.htmlpath`, and taking a `://`
+//!     path on trust as git does), dying `'%s/%s.html': documentation file not
+//!     found.` when it is absent, then `open_html()` hands the path to
+//!     `git web--browse -c help.browser`. The HTML set the lookup lands in is
+//!     [`crate::superset::htmldoc`], generated from the same tables the rest of
+//!     this module prints.
+//!   * `help.format` (`man`/`info`/`web`/`html`, with git's
+//!     `unrecognized help format '%s'` on anything else) and `help.htmlpath`,
+//!     read after the command line so an explicit `-m`/`-w`/`-i` still wins.
 //!   * `-h`, unknown options/switches, the cmdmode conflict errors and the
 //!     "doesn't take any non-option arguments" errors, with git's exact text,
 //!     stream and exit code 129.
@@ -31,8 +45,7 @@
 //! Faithfully unsupported — each `bail!`s rather than emitting divergent
 //! output: `-a --no-verbose` (git scans the git-core exec-path directory for
 //! its individual `git-*` helper binaries and column-formats that on-disk set,
-//! which a single-binary port cannot reproduce byte-for-byte), `-w`/`--web` and
-//! `-i`/`--info` (HTML and info viewers), and a configured `help.format` /
+//! which a single-binary port cannot reproduce byte-for-byte), and a configured
 //! `man.viewer` other than plain `man`.
 
 use anyhow::{bail, Result};
@@ -1618,10 +1631,23 @@ pub fn help(args: &[String]) -> Result<ExitCode> {
                 print!("{COMMON_HELP}");
                 return Ok(ExitCode::SUCCESS);
             };
-            match viewer {
-                Some("--web") => bail!("`git help --web` is not supported: no HTML doc viewer"),
-                Some("--info") => bail!("`git help --info` is not supported: no info viewer"),
-                _ => show_help_for(topic),
+            // git reads `git_help_config` only once it has a topic, then lets
+            // the command line override the configured format, then falls back
+            // to `DEFAULT_HELP_FORMAT` ("man").
+            let config = match help_config() {
+                Ok(c) => c,
+                Err(code) => return Ok(code),
+            };
+            let format = match viewer {
+                Some("--web") => Format::Web,
+                Some("--info") => Format::Info,
+                Some("--man") => Format::Man,
+                _ => config.format.unwrap_or(Format::Man),
+            };
+            match format {
+                Format::Web => show_html_page(topic, config.html_path.as_deref()),
+                Format::Info => show_info_page(topic),
+                Format::Man => show_help_for(topic),
             }
         }
     }
@@ -1774,23 +1800,84 @@ fn external_commands() -> BTreeSet<String> {
     found
 }
 
-/// Every command name listed in [`ALL_COMMANDS`], excluding the documentation
-/// categories named in [`DOC_CATEGORIES`].
-fn command_names() -> BTreeSet<String> {
-    let mut names = BTreeSet::new();
-    let mut in_doc_category = false;
-    for line in ALL_COMMANDS.lines() {
-        if let Some(entry) = line.strip_prefix("   ") {
-            if !in_doc_category {
-                if let Some(name) = entry.split_whitespace().next() {
-                    names.insert(name.to_string());
+/// One row of the tables `git help -a` and `git help -g` print: the topic as the
+/// user types it, the manual page it maps to, its one-line description, and the
+/// heading it is listed under.
+pub struct Topic {
+    /// The topic as `git help <topic>` takes it — `status`, `revisions`, `everyday`.
+    pub name: String,
+    /// The page [`cmd_to_page`] maps it to — `git-status`, `gitrevisions`.
+    pub page: String,
+    /// git's one-line description for it.
+    pub summary: String,
+    /// The category heading it appears under in the listing.
+    pub section: String,
+    /// The command that lists it: `git help -a` for the command tables,
+    /// `git help -g` for the concept guides.
+    pub listing: &'static str,
+    /// Whether it is a git command rather than a documentation topic. Drives
+    /// both the page name and the wording of the generated page.
+    pub is_command: bool,
+}
+
+/// The heading [`GUIDES`] entries are filed under. The block's own first line is
+/// a sentence rather than a category name, so this names the section instead.
+const GUIDES_SECTION: &str = "Git concept guides";
+
+/// Every topic git documents, parsed out of the [`ALL_COMMANDS`] and [`GUIDES`]
+/// blocks this module already prints — the command list is not restated
+/// anywhere, so nothing downstream (the name set below, the HTML documentation
+/// set in [`crate::superset::htmldoc`]) can drift from what `git help -a` says.
+pub fn topics() -> Vec<Topic> {
+    let mut out = Vec::new();
+    for (block, guides) in [(ALL_COMMANDS, false), (GUIDES, true)] {
+        let mut section = if guides { GUIDES_SECTION } else { "" }.to_string();
+        let mut is_command = !guides;
+        for line in block.lines() {
+            let Some(entry) = line.strip_prefix("   ") else {
+                // A category heading — only [`ALL_COMMANDS`] has them. The
+                // guides block opens and closes with prose instead, so its
+                // section stays [`GUIDES_SECTION`] throughout.
+                if !guides && !line.is_empty() && !line.starts_with("See ") {
+                    section = line.to_string();
+                    is_command = !DOC_CATEGORIES.contains(&line);
                 }
-            }
-        } else if !line.is_empty() && !line.starts_with("See ") {
-            in_doc_category = DOC_CATEGORIES.contains(&line);
+                continue;
+            };
+            let mut fields = entry.splitn(2, char::is_whitespace);
+            let (Some(name), rest) = (fields.next(), fields.next()) else {
+                continue;
+            };
+            out.push(Topic {
+                page: cmd_to_page(name, is_command),
+                name: name.to_string(),
+                summary: rest.unwrap_or("").trim().to_string(),
+                section: section.clone(),
+                listing: if guides { "git help -g" } else { "git help -a" },
+                is_command,
+            });
         }
     }
-    names
+    out
+}
+
+/// `cmd_to_page()` (builtin/help.c): a topic already spelled `git*` is its own
+/// page, a command becomes `git-<cmd>`, and anything else `git<topic>` — which
+/// is what turns `revisions` into `gitrevisions` and `add` into `git-add`.
+pub fn cmd_to_page(topic: &str, is_command: bool) -> String {
+    if topic.starts_with("git") {
+        topic.to_string()
+    } else if is_command {
+        format!("git-{topic}")
+    } else {
+        format!("git{topic}")
+    }
+}
+
+/// Every command name in [`topics`] — the documentation topics (the
+/// [`DOC_CATEGORIES`] sections and the guides) are not commands and are left out.
+fn command_names() -> BTreeSet<String> {
+    topics().into_iter().filter(|t| t.is_command).map(|t| t.name).collect()
 }
 
 /// Whether `path` is a regular file carrying an execute bit — git's criterion
@@ -1887,27 +1974,10 @@ fn show_help_for(topic: &str) -> Result<ExitCode> {
         }
     }
 
-    let is_command = command_names().contains(topic) || external_commands().contains(topic);
-
-    // git resolves a real command before consulting aliases, so an alias that
-    // shadows a builtin still shows the builtin's manual.
-    if !is_command {
-        if let Some(value) = alias_list().get(topic) {
-            println!("'{topic}' is aliased to '{value}'");
-            return Ok(ExitCode::SUCCESS);
-        }
-    }
-
-    reject_unsupported_viewer_config()?;
-
-    // git's cmd_to_page().
-    let page = if topic.starts_with("git") {
-        topic.to_string()
-    } else if is_command {
-        format!("git-{topic}")
-    } else {
-        format!("git{topic}")
+    let Some(page) = resolve_page(topic)? else {
+        return Ok(ExitCode::SUCCESS);
     };
+    reject_unsupported_viewer_config()?;
 
     std::io::stdout().flush().ok();
     let status = Command::new("man")
@@ -1917,18 +1987,185 @@ fn show_help_for(topic: &str) -> Result<ExitCode> {
     Ok(ExitCode::from(exit_status_code(status)))
 }
 
-/// This port only drives plain `man`, so a configured HTML/info format or a
-/// custom man viewer is rejected instead of silently ignored.
+/// `cmd_help`'s alias check followed by `check_git_cmd()` + `cmd_to_page()`,
+/// the two steps git takes before it picks a viewer.
+///
+/// `Ok(None)` means the topic was an alias: git prints its expansion and
+/// returns 0 without opening anything.
+fn resolve_page(topic: &str) -> Result<Option<String>> {
+    // git's `is_git_command()` is "a builtin, or a `git-*` in the exec-path or on
+    // `PATH`". The superset verbs are builtins of this binary, so they belong in
+    // that set regardless of whether their dashed links happen to be installed.
+    let is_command = crate::dispatch::SUPERSET_VERBS.contains(&topic)
+        || command_names().contains(topic)
+        || external_commands().contains(topic);
+
+    // git resolves a real command before consulting aliases, so an alias that
+    // shadows a builtin still shows the builtin's manual.
+    if !is_command {
+        if let Some(value) = alias_list().get(topic) {
+            println!("'{topic}' is aliased to '{value}'");
+            return Ok(None);
+        }
+    }
+
+    Ok(Some(cmd_to_page(topic, is_command)))
+}
+
+/// `show_info_page()`: point `INFOPATH` at the install's info directory and hand
+/// the page to `info gitman <page>`.
+///
+/// git `execlp`s, so the info viewer replaces the process and its exit status is
+/// the command's; running it as a child and propagating that status is the same
+/// observable result. `execlp` only *returns* when there is no `info` on `$PATH`,
+/// which is the one case git turns into `die(_("no info viewer handled the
+/// request"))`.
+fn show_info_page(topic: &str) -> Result<ExitCode> {
+    let Some(page) = resolve_page(topic)? else {
+        return Ok(ExitCode::SUCCESS);
+    };
+
+    std::io::stdout().flush().ok();
+    match Command::new("info")
+        .env("INFOPATH", info_dir())
+        .arg("gitman")
+        .arg(&page)
+        .status()
+    {
+        Ok(status) => Ok(ExitCode::from(exit_status_code(status))),
+        Err(_) => Ok(die("no info viewer handled the request")),
+    }
+}
+
+/// `system_path(GIT_INFO_PATH)` — `<prefix>/share/info`, the directory
+/// `git --info-path` reports and `show_info_page()` points `INFOPATH` at. This
+/// port's prefix is `$ZVCS_HOME`, the same one the man pages install under.
+pub fn info_dir() -> PathBuf {
+    crate::superset::zdaemon::zvcs_home().join("share").join("info")
+}
+
+/// The help viewers, git's `enum help_format` minus its `NONE` sentinel (which
+/// this port spells `Option<Format>`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Format {
+    Man,
+    Info,
+    Web,
+}
+
+/// The `help.*` variables `git_help_config()` collects. `man.viewer` is read
+/// separately, at the point the man viewer would run.
+#[derive(Default)]
+struct HelpConfig {
+    format: Option<Format>,
+    html_path: Option<String>,
+}
+
+/// `parse_help_format()`: the four spellings git accepts, and its `die()` on
+/// anything else.
+fn parse_help_format(format: &str) -> Result<Format, ExitCode> {
+    match format {
+        "man" => Ok(Format::Man),
+        "info" => Ok(Format::Info),
+        "web" | "html" => Ok(Format::Web),
+        other => Err(die(&format!("unrecognized help format '{other}'"))),
+    }
+}
+
+/// `git_help_config()`'s `help.format` and `help.htmlpath` arms. git runs this
+/// after `setup_git_directory_gently()`, so the global files still apply outside
+/// a repository — which is why the lookup falls back to them rather than
+/// yielding nothing.
+fn help_config() -> Result<HelpConfig, ExitCode> {
+    let file = match gix::discover(".") {
+        Ok(repo) => repo.config_snapshot().plumbing().clone(),
+        Err(_) => match gix::config::File::from_globals() {
+            Ok(f) => f,
+            Err(_) => return Ok(HelpConfig::default()),
+        },
+    };
+    let string = |key: &str| {
+        file.string(key)
+            .map(|v| String::from_utf8_lossy(&v).into_owned())
+            .filter(|v| !v.is_empty())
+    };
+    Ok(HelpConfig {
+        format: string("help.format").map(|f| parse_help_format(&f)).transpose()?,
+        html_path: string("help.htmlpath"),
+    })
+}
+
+/// `show_html_page()`: resolve the page's path, then open it in a browser.
+///
+/// git's HTML manual is laid down by `make install`, so the stat in
+/// [`get_html_page_path`] finds a file that the installation put there. This
+/// port is a single binary with no install step, so the page is materialized
+/// first, from the same tables the man pages come from — `git zshadow` and
+/// `git zdashed` write the whole set up front, and this covers the case where
+/// neither has been run. A page that cannot be written (a topic outside the
+/// documented set, an unwritable `$ZVCS_HOME`) falls through to git's own stat,
+/// which gives exactly the answer stock gives for a missing file. A configured
+/// `help.htmlpath` is the user's own tree and is never written to.
+fn show_html_page(topic: &str, configured: Option<&str>) -> Result<ExitCode> {
+    let Some(page) = resolve_page(topic)? else {
+        return Ok(ExitCode::SUCCESS);
+    };
+    if configured.is_none() {
+        let _ = crate::superset::htmldoc::ensure_page(&page);
+    }
+    let path = match get_html_page_path(&page, configured) {
+        Ok(path) => path,
+        Err(code) => return Ok(code),
+    };
+    open_html(&path)
+}
+
+/// `get_html_page_path()` verbatim: `help.htmlpath` when set, else
+/// `system_path(GIT_HTML_PATH)`. A path holding `://` is a URL git cannot stat,
+/// so it is taken on trust; anything else must name a regular file or git dies.
+fn get_html_page_path(page: &str, configured: Option<&str>) -> Result<String, ExitCode> {
+    let path = match configured {
+        Some(p) => p.to_string(),
+        None => crate::superset::htmldoc::html_dir().display().to_string(),
+    };
+    if !path.contains("://") {
+        let file = Path::new(&path).join(format!("{page}.html"));
+        if !std::fs::metadata(&file).is_ok_and(|m| m.is_file()) {
+            return Err(die(&format!("'{path}/{page}.html': documentation file not found.")));
+        }
+    }
+    Ok(format!("{path}/{page}.html"))
+}
+
+/// `open_html()`: git `execl_git_cmd`s `git web--browse -c help.browser <path>`,
+/// replacing itself with it. One binary here, so the same porcelain is called
+/// in-process and its status becomes this command's — what the exec would leave
+/// behind.
+fn open_html(path: &str) -> Result<ExitCode> {
+    std::io::stdout().flush().ok();
+    crate::porcelain::web__browse(&[
+        "-c".to_string(),
+        "help.browser".to_string(),
+        path.to_string(),
+    ])
+}
+
+/// git's `die()`: one `fatal:` line on stderr and exit 128, with no usage block.
+fn die(msg: &str) -> ExitCode {
+    eprintln!("fatal: {msg}");
+    ExitCode::from(128)
+}
+
+/// git's `man.viewer` names a program to hand the page to (`konqueror`, `woman`,
+/// a `man.<tool>.cmd`). This port only drives plain `man`, so a different viewer
+/// is rejected instead of silently ignored. `help.format` needs no gate: all
+/// three of git's formats are implemented, and [`parse_help_format`] rejects the
+/// rest with git's own message.
 fn reject_unsupported_viewer_config() -> Result<()> {
     let Ok(repo) = gix::discover(".") else {
         return Ok(());
     };
     let config = repo.config_snapshot();
-    if let Some(format) = config.string("help.format") {
-        if format != "man" {
-            bail!("help.format={format} is not supported: only the plain `man` viewer is");
-        }
-    }
     if let Some(viewer) = config.string("man.viewer") {
         if viewer != "man" {
             bail!("man.viewer={viewer} is not supported: only the plain `man` viewer is");

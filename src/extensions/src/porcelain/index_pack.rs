@@ -48,8 +48,8 @@
 //!      `fatal: pack version <n> unsupported` → exit 128
 //!
 //! Only once every one of those has passed is an unported flag rejected, so
-//! `--strict does-not-exist.pack` reports the missing pack exactly as git does
-//! instead of complaining about `--strict`.
+//! `--check-self-contained-and-connected does-not-exist.pack` reports the
+//! missing pack exactly as git does instead of complaining about the flag.
 //!
 //! Everything past option parsing is a `die()` in git, so nothing here exits 1:
 //! a failure the checks above did not name still becomes a `fatal:` line and
@@ -75,10 +75,19 @@
 //! print. A self-contained stream (the common case) is copied through
 //! byte-for-byte, so its hash matches git exactly.
 //!
+//! `--strict` and `--fsck-objects` are covered: see [`fsck_pack`]. Both run
+//! `fsck_object()` over every object the pack holds, `--strict` adds
+//! `fsck_walk()`/`check_objects()`'s link and type checks, and both finish with
+//! `fsck_finish()`'s `.gitmodules`/`.gitattributes` lint. The checks reuse the
+//! `fsck_object()` port in [`super::fsck`] and run before the index is renamed
+//! into place, so a pack that fails them leaves no artifact behind.
+//!
 //! Not covered, each rejected with a precise message rather than a plausible
-//! wrong answer: `--strict`, `--fsck-objects`,
-//! `--check-self-contained-and-connected` (all three need git's `check_objects()`
-//! connectivity/fsck pass, which exceeds the vendored `gix-fsck` primitive),
+//! wrong answer: the `<msg-id>=<severity>` list form of `--strict=` /
+//! `--fsck-objects=` (its grammar is validated, but the severities it asks for
+//! are not applied — the checks run at git's defaults),
+//! `--check-self-contained-and-connected` (git's connectivity pass over the
+//! whole reachable set, which exceeds the vendored `gix-fsck` primitive),
 //! `--promisor`, `--pack_header`, `--index-version` other than a plain `2`,
 //! `--object-format=sha256`, `--verify` combined with `--stdin`, `--keep`
 //! without `--stdin`, and a `<pack-file>` on disk (or a self-contained pack read
@@ -94,8 +103,8 @@
 //! malformed value dies (exit 128) with git's exact wording — `Missing '=':
 //! '<tok>'`, `Unhandled message id: <id>`, `Unknown fsck message type:
 //! '<sev>'`, or `Cannot demote <id> to <sev>` — before any positional check.
-//! Only a *well-formed* value reaches the later `--strict`/`--fsck-objects`
-//! unported rejection (no fsck pass is run here).
+//! Only a *well-formed* value reaches the later rejection of the severity list
+//! itself.
 //!
 //! Two narrower gaps are documented rather than papered over: `-v` and
 //! `--progress-title` are accepted but no progress is drawn on stderr (stdout
@@ -105,7 +114,7 @@
 
 use anyhow::{bail, Result};
 use std::fs;
-use std::io::{self, Read, Seek, Write};
+use std::io::{self, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -137,6 +146,7 @@ struct Opts {
     threads: Option<usize>,       // --threads=<n>, None = all logical cores
     strict: bool,                 // --strict / --strict=<msg-id>=<severity>...
     fsck_objects: bool,           // --fsck-objects[=...]
+    msg_types: Option<String>,    // the `<msg-id>=<severity>...` list, if one was given
     self_contained: bool,         // --check-self-contained-and-connected
     promisor: bool,               // --promisor[=<msg>]
     index_version: Option<(u64, Option<u64>)>, // --index-version=<v>[,<limit>]
@@ -158,6 +168,7 @@ impl Opts {
             threads: None,
             strict: false,
             fsck_objects: false,
+            msg_types: None,
             self_contained: false,
             promisor: false,
             index_version: None,
@@ -240,12 +251,14 @@ pub fn index_pack(args: &[String]) -> Result<ExitCode> {
                     return Ok(code);
                 }
                 opts.strict = true;
+                opts.msg_types = Some(a["--strict=".len()..].to_string());
             }
             _ if a.starts_with("--fsck-objects=") => {
                 if let Err(code) = validate_fsck_msg_types(&a["--fsck-objects=".len()..]) {
                     return Ok(code);
                 }
                 opts.fsck_objects = true;
+                opts.msg_types = Some(a["--fsck-objects=".len()..].to_string());
             }
             _ if a.starts_with("--threads=") => {
                 // git validates the number here and answers with usage, not a
@@ -445,8 +458,27 @@ fn index_pack_file(opts: &Opts, pack_path: &Path, index_path: &Path) -> Result<E
     if let Some(code) = parse_pack_header(&peek_pack_header(&mut file)?) {
         return Ok(code);
     }
-    file.seek(io::SeekFrom::Start(0))?;
+    drop(file);
 
+    let hash = write_index_for_pack(opts, pack_path, index_path)?;
+
+    if want_rev_index(opts) {
+        write_rev_index(index_path, &hash)?;
+    }
+    set_read_only(index_path)?;
+
+    println!("{hash}");
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Index the pack at `pack_path` into `index_path`, returning the pack checksum.
+///
+/// Shared by the named-pack path and the zero-object `--stdin` path. The index
+/// is built in a sibling temporary and renamed into place, so a failure never
+/// leaves a half-written index behind — the same `git_mkstemp`/`rename` dance
+/// git performs.
+fn write_index_for_pack(opts: &Opts, pack_path: &Path, index_path: &Path) -> Result<ObjectId> {
+    let file = io::BufReader::new(fs::File::open(pack_path)?);
     let mut entries = pack::data::input::BytesToEntriesIter::new_from_header(
         file,
         pack::data::input::Mode::Verify,
@@ -455,8 +487,6 @@ fn index_pack_file(opts: &Opts, pack_path: &Path, index_path: &Path) -> Result<E
     )?;
     let pack_version = entries.version();
 
-    // Write to a sibling temporary first so a failure never leaves a half index
-    // in place, exactly as git's `git_mkstemp`/`rename` dance does.
     let tmp = with_suffix(index_path, ".tmp");
     let mut out = io::BufWriter::new(fs::File::create(&tmp)?);
     let outcome = pack::index::write_data_iter_to_stream(
@@ -476,15 +506,19 @@ fn index_pack_file(opts: &Opts, pack_path: &Path, index_path: &Path) -> Result<E
     )?;
     out.flush()?;
     drop(out);
-    fs::rename(&tmp, index_path)?;
 
-    if want_rev_index(opts) {
-        write_rev_index(index_path, &outcome.data_hash)?;
+    // The fsck passes run against the finished index while it is still the
+    // temporary, so a failure leaves the repository exactly as git leaves it:
+    // the checks git runs before `write_idx_file()` have already failed by then.
+    if opts.strict || opts.fsck_objects {
+        if let Err(e) = fsck_pack(pack_path, &tmp, opts.strict) {
+            let _ = fs::remove_file(&tmp);
+            return Err(e);
+        }
     }
-    set_read_only(index_path)?;
 
-    println!("{}", outcome.data_hash);
-    Ok(ExitCode::SUCCESS)
+    fs::rename(&tmp, index_path)?;
+    Ok(outcome.data_hash)
 }
 
 /// `--verify`: check an existing index against its pack, printing nothing and
@@ -531,11 +565,17 @@ fn verify_existing(opts: &Opts, index_path: &Path) -> Result<ExitCode> {
         &mut gix::progress::Discard,
         &AtomicBool::new(false),
     ) {
-        Ok(_) => Ok(ExitCode::SUCCESS),
+        Ok(_) => {}
         // git's per-corruption diagnostics are not reproduced; report the real
         // failure rather than inventing text that only looks like git's.
         Err(e) => crate::git_fatal!("--verify failed for '{name}': {e}"),
     }
+    // `do_fsck_object` is independent of `--verify`: the object checks still run
+    // over everything the pack holds.
+    if opts.strict || opts.fsck_objects {
+        fsck_pack(&pack_path, index_path, opts.strict)?;
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 /// Stream a pack from stdin, then report it git's way.
@@ -614,6 +654,7 @@ fn index_from_stdin(
     if let Some(code) = parse_pack_header(&header) {
         return Ok(code);
     }
+    let object_count = u32::from_be_bytes([header[8], header[9], header[10], header[11]]);
     let mut chained = io::Cursor::new(header).chain(input);
     let input: &mut dyn io::BufRead = &mut chained;
 
@@ -626,50 +667,74 @@ fn index_from_stdin(
         None => repo.objects.store_ref().path().join("pack"),
     };
 
-    // With `--fix-thin` the object database resolves REF_DELTA bases missing from
-    // the pack, completing a thin pack in place; without it the pack is copied
-    // through byte-for-byte and a thin base is a fatal `NotFound`.
-    let resolver = opts.fix_thin.then(|| repo.objects.clone());
-    let outcome = pack::Bundle::write_to_directory(
-        input,
-        Some(&write_dir),
-        &mut gix::progress::Discard,
-        &AtomicBool::new(false),
-        resolver,
-        pack::bundle::write::Options {
-            thread_limit: opts.threads,
-            object_hash: Kind::Sha1,
-            ..Default::default()
-        },
-    )?;
+    // A header declaring zero objects is ordinary input to git: the object loop
+    // runs zero times, the trailer is checked, and pack, index and rev index are
+    // written like any other pack. gix's `write_to_directory` instead discards
+    // both files when it indexed nothing, so the empty pack is staged and indexed
+    // here through the same index writer the named-pack path uses.
+    let (hash, data_path, index_path, gix_keep) = if object_count == 0 {
+        let (hash, data_path, index_path) =
+            index_empty_from_stdin(opts, input, target_pack, target_index, temp_pack.as_deref(), &write_dir)?;
+        (hash, data_path, index_path, None)
+    } else {
+        // With `--fix-thin` the object database resolves REF_DELTA bases missing
+        // from the pack, completing a thin pack in place; without it the pack is
+        // copied through byte-for-byte and a thin base is a fatal `NotFound`.
+        let resolver = opts.fix_thin.then(|| repo.objects.clone());
+        let outcome = pack::Bundle::write_to_directory(
+            input,
+            Some(&write_dir),
+            &mut gix::progress::Discard,
+            &AtomicBool::new(false),
+            resolver,
+            pack::bundle::write::Options {
+                thread_limit: opts.threads,
+                object_hash: Kind::Sha1,
+                ..Default::default()
+            },
+        )?;
 
-    let hash = outcome.index.data_hash;
-    let (Some(gix_data), Some(gix_index)) = (&outcome.data_path, &outcome.index_path) else {
-        bail!("empty packs are not supported (no objects were read from stdin)");
-    };
+        let hash = outcome.index.data_hash;
+        let (Some(gix_data), Some(gix_index)) = (&outcome.data_path, &outcome.index_path) else {
+            bail!("gitoxide indexed no objects from a pack whose header declared {object_count}");
+        };
 
-    // Move gix's hash-named files onto git's chosen destinations, if any.
-    let (data_path, index_path): (PathBuf, PathBuf) = match (target_pack, target_index) {
-        (Some(tp), Some(ti)) => {
-            fs::rename(gix_index, ti)?;
-            fs::rename(gix_data, tp)?;
-            (tp.to_path_buf(), ti.to_path_buf())
+        // Before the pack is moved anywhere, so a failing check leaves nothing
+        // in `objects/pack` — the state git leaves, since its own checks run
+        // ahead of `write_idx_file()`.
+        if opts.strict || opts.fsck_objects {
+            if let Err(e) = fsck_pack(gix_data, gix_index, opts.strict) {
+                for path in [gix_data, gix_index].into_iter().chain(outcome.keep_path.as_ref()) {
+                    let _ = fs::remove_file(path);
+                }
+                return Err(e);
+            }
         }
-        (None, Some(ti)) => {
-            fs::rename(gix_index, ti)?;
-            (gix_data.clone(), ti.to_path_buf())
-        }
-        (Some(tp), None) => {
-            fs::rename(gix_data, tp)?;
-            (tp.to_path_buf(), gix_index.clone())
-        }
-        (None, None) => (gix_data.clone(), gix_index.clone()),
+
+        // Move gix's hash-named files onto git's chosen destinations, if any.
+        let (data_path, index_path): (PathBuf, PathBuf) = match (target_pack, target_index) {
+            (Some(tp), Some(ti)) => {
+                fs::rename(gix_index, ti)?;
+                fs::rename(gix_data, tp)?;
+                (tp.to_path_buf(), ti.to_path_buf())
+            }
+            (None, Some(ti)) => {
+                fs::rename(gix_index, ti)?;
+                (gix_data.clone(), ti.to_path_buf())
+            }
+            (Some(tp), None) => {
+                fs::rename(gix_data, tp)?;
+                (tp.to_path_buf(), gix_index.clone())
+            }
+            (None, None) => (gix_data.clone(), gix_index.clone()),
+        };
+        (hash, data_path, index_path, outcome.keep_path.clone())
     };
 
     // `write_to_directory` always drops a `.keep` beside the pack it wrote; git
     // only leaves one when asked, so drop gix's and, under `--keep`, write our
     // own beside the final pack holding the requested message.
-    if let Some(kp) = &outcome.keep_path {
+    if let Some(kp) = &gix_keep {
         let _ = fs::remove_file(kp);
     }
 
@@ -698,6 +763,261 @@ fn index_from_stdin(
     Ok(ExitCode::SUCCESS)
 }
 
+/// Stream a pack whose header declares zero objects from `input` and index it.
+///
+/// Returns the pack checksum and the final pack and index paths. git streams
+/// stdin straight into its output file — the named `<pack-file>` when there is
+/// one, otherwise `tmp_pack_XXXXXX`, which is then renamed to the
+/// content-addressed name — so that is what happens here; the index is built
+/// beside the staged pack and renamed alongside it.
+fn index_empty_from_stdin(
+    opts: &Opts,
+    input: &mut dyn io::BufRead,
+    target_pack: Option<&Path>,
+    target_index: Option<&Path>,
+    temp_pack: Option<&Path>,
+    write_dir: &Path,
+) -> Result<(ObjectId, PathBuf, PathBuf)> {
+    let staged = match (target_pack, temp_pack) {
+        (Some(p), _) => p.to_path_buf(),
+        (None, Some(t)) => t.to_path_buf(),
+        (None, None) => write_dir.join(format!("tmp_pack_{}", mkstemp_suffix())),
+    };
+    let mut bytes = Vec::new();
+    input.read_to_end(&mut bytes)?;
+    fs::write(&staged, &bytes)?;
+
+    // The pack's own checksum names it, so the index is written beside the
+    // staged pack first and both are moved once the checksum is known.
+    let staged_index = with_suffix(&staged, ".idx");
+    let hash = write_index_for_pack(opts, &staged, &staged_index)?;
+
+    let data_path = match target_pack {
+        Some(p) => p.to_path_buf(),
+        None => write_dir.join(format!("pack-{hash}.pack")),
+    };
+    if data_path != staged {
+        fs::rename(&staged, &data_path)?;
+    }
+    let index_path = match target_index {
+        Some(p) => p.to_path_buf(),
+        None => data_path.with_extension("idx"),
+    };
+    if index_path != staged_index {
+        fs::rename(&staged_index, &index_path)?;
+    }
+    Ok((hash, data_path, index_path))
+}
+
+/// `--strict` / `--fsck-objects`: the fsck passes git runs over the pack.
+///
+/// `fsck_options_init(&fsck_options, repo, FSCK_OPTIONS_MISSING_GITMODULES)`
+/// gives `index-pack` `strict = 1` and *no* configuration: `git_index_pack_config()`
+/// reads four `pack.*`/`core.*` keys and nothing from `fsck.*`. So every severity
+/// is the static default from `fsck.h` with `fsck_msg_severity()`'s promotion of
+/// an unconfigured warning to an error — see [`strict_severity`]. Three passes
+/// can fail:
+///
+/// * `fsck_object()` from `sha1_object()`, on every object the pack holds →
+///   `fsck error in packed object`.
+/// * `fsck_walk()` plus `check_objects()`, under `--strict` only: every object a
+///   packed object links to must be in the pack or already in the object
+///   database, with the type the link implies → `did not receive expected
+///   object <oid>` or `object <oid>: expected type <a>, found <b>`.
+/// * `fsck_finish()`, which lints the `.gitmodules` and `.gitattributes` blobs
+///   the tree walk queued → `fsck error in pack objects`.
+///
+/// git runs the first two before it writes the index and the third after the
+/// rename. Here all three run against a finished index that has not been moved
+/// into place, so a failure still leaves no artifact behind — the caller removes
+/// the temporary it passed.
+fn fsck_pack(pack_path: &Path, index_path: &Path, strict: bool) -> Result<()> {
+    use super::fsck::{check_blob, check_object, Severity};
+    use gix::object::Kind as ObjKind;
+
+    let bundle = pack::Bundle {
+        index: pack::index::File::at(index_path, Kind::Sha1)?,
+        pack: pack::data::File::at(pack_path, Kind::Sha1)?,
+    };
+
+    // `sha1_object()` sees objects in the order they are unpacked, so the first
+    // diagnostic is the one lowest in the pack.
+    let mut order: Vec<(u64, u32)> = (0..bundle.index.num_objects())
+        .map(|i| (bundle.index.pack_offset_at_index(i), i))
+        .collect();
+    order.sort_unstable();
+
+    let in_pack: std::collections::HashSet<ObjectId> =
+        (0..bundle.index.num_objects()).map(|i| bundle.index.oid_at_index(i).to_owned()).collect();
+
+    let mut inflate = gix::zlib::Inflate::default();
+    let mut cache = pack::cache::Never;
+    let mut buf = Vec::new();
+    let mut queued: Vec<(ObjectId, bool, bool)> = Vec::new();
+    let mut links: Vec<(ObjectId, ObjKind)> = Vec::new();
+    let mut object_error = false;
+
+    for (_, index) in &order {
+        let id = bundle.index.oid_at_index(*index).to_owned();
+        let (object, _) = bundle.get_object_by_index(*index, &mut buf, &mut inflate, &mut cache)?;
+        let (kind, data) = (object.kind, object.data.to_vec());
+
+        let checked = check_object(kind, &data, true);
+        // `init_tree_desc_gently()` and `update_tree_entry_gently()` call
+        // `error()` themselves, with no msg-id and so no severity to consult.
+        for line in &checked.raw {
+            eprintln!("error: {line}");
+            object_error = true;
+        }
+        for finding in &checked.findings {
+            match strict_severity(finding.msg) {
+                Severity::Ignore => {}
+                Severity::Info | Severity::Warn => {
+                    eprintln!("warning: object {id}: {}: {}", finding.msg.id, finding.text);
+                }
+                Severity::Error | Severity::Fatal => {
+                    eprintln!("error: object {id}: {}: {}", finding.msg.id, finding.text);
+                    object_error = true;
+                }
+            }
+        }
+        for blob in &checked.gitmodules {
+            queued.push((*blob, true, false));
+        }
+        for blob in &checked.gitattributes {
+            queued.push((*blob, false, true));
+        }
+        if strict {
+            collect_links(kind, &data, &mut links);
+        }
+    }
+    if object_error {
+        crate::git_fatal!("fsck error in packed object");
+    }
+
+    // `check_objects()`: a linked object already in this pack carries
+    // `FLAG_CHECKED` and is skipped; anything else has to be in the object
+    // database with the type the link gave it.
+    if strict && !links.is_empty() {
+        let repo = gix::discover(".")?;
+        use gix::odb::HeaderExt;
+        for (id, expected) in &links {
+            if in_pack.contains(id) {
+                continue;
+            }
+            let Ok(header) = repo.objects.header(id) else {
+                crate::git_fatal!("did not receive expected object {id}");
+            };
+            if header.kind() != *expected {
+                crate::git_fatal!(
+                    "object {id}: expected type {expected}, found {}",
+                    header.kind()
+                );
+            }
+        }
+    }
+
+    // `fsck_finish()`. The pack has been loaded into the store by now in git, so
+    // a queued blob is looked up across the whole database — here the pack is
+    // still only a pair of files, so it is consulted directly first.
+    if !queued.is_empty() {
+        let repo = gix::discover(".")?;
+        let mut finish_error = false;
+        let mut done: Vec<ObjectId> = Vec::new();
+        for (id, as_modules, as_attrs) in &queued {
+            if done.contains(id) {
+                continue;
+            }
+            done.push(*id);
+            let mut found = bundle
+                .find(id, &mut buf, &mut inflate, &mut cache)
+                .ok()
+                .flatten()
+                .map(|(object, _)| (object.kind, object.data.to_vec()));
+            if found.is_none() {
+                found = repo.find_object(*id).ok().map(|o| (o.kind, o.data.clone()));
+            }
+            let label = if *as_modules { ".gitmodules" } else { ".gitattributes" };
+            let Some((kind, data)) = found else {
+                // `fsck_objects_error_cb_print_missing_gitmodules()` answers a
+                // missing `.gitmodules` by printing its id and *not* failing:
+                // that id is what `unpack-objects`' caller fetches next.
+                if *as_modules {
+                    println!("{id}");
+                } else {
+                    eprintln!("error: object {id}: gitattributesMissing: unable to read {label} blob");
+                    finish_error = true;
+                }
+                continue;
+            };
+            if kind != ObjKind::Blob {
+                let msg = if *as_modules { "gitmodulesBlob" } else { "gitattributesBlob" };
+                eprintln!("error: object {id}: {msg}: non-blob found at {label}");
+                finish_error = true;
+                continue;
+            }
+            for finding in check_blob(&data, *as_modules, *as_attrs) {
+                match strict_severity(finding.msg) {
+                    Severity::Ignore => {}
+                    Severity::Info | Severity::Warn => {
+                        eprintln!("warning: object {id}: {}: {}", finding.msg.id, finding.text);
+                    }
+                    Severity::Error | Severity::Fatal => {
+                        eprintln!("error: object {id}: {}: {}", finding.msg.id, finding.text);
+                        finish_error = true;
+                    }
+                }
+            }
+        }
+        if finish_error {
+            crate::git_fatal!("fsck error in pack objects");
+        }
+    }
+    Ok(())
+}
+
+/// `fsck_msg_severity()` for `index-pack`: its options always carry `strict = 1`
+/// and nothing configures a row, so an unconfigured warning becomes an error and
+/// every other default is left alone.
+fn strict_severity(msg: &super::fsck::Msg) -> super::fsck::Severity {
+    use super::fsck::Severity;
+    match msg.default {
+        Severity::Warn => Severity::Error,
+        other => other,
+    }
+}
+
+/// `fsck_walk_{commit,tree,tag}`: the objects `obj` links to, each with the type
+/// the link gives it. A gitlink is skipped — it names a commit in another
+/// repository, which `fsck_walk_tree()` never follows.
+fn collect_links(kind: gix::object::Kind, data: &[u8], out: &mut Vec<(ObjectId, gix::object::Kind)>) {
+    use gix::object::Kind as ObjKind;
+    match kind {
+        ObjKind::Commit => {
+            let Ok(commit) = gix::objs::CommitRef::from_bytes(data, Kind::Sha1) else { return };
+            out.push((commit.tree(), ObjKind::Tree));
+            out.extend(commit.parents().map(|id| (id, ObjKind::Commit)));
+        }
+        ObjKind::Tree => {
+            let Ok(tree) = gix::objs::TreeRef::from_bytes(data, Kind::Sha1) else { return };
+            for entry in tree.entries {
+                match entry.mode.kind() {
+                    gix::objs::tree::EntryKind::Commit => {}
+                    gix::objs::tree::EntryKind::Tree => {
+                        out.push((entry.oid.to_owned(), ObjKind::Tree));
+                    }
+                    _ => out.push((entry.oid.to_owned(), ObjKind::Blob)),
+                }
+            }
+        }
+        ObjKind::Tag => {
+            let Ok(tag) = gix::objs::TagRef::from_bytes(data, Kind::Sha1) else { return };
+            out.push((tag.target(), tag.target_kind));
+        }
+        ObjKind::Blob => {}
+    }
+}
+
 /// Reject the flags stock git implements that this port does not.
 ///
 /// Called only after every check git performs first has passed, so a terse
@@ -705,11 +1025,11 @@ fn index_from_stdin(
 /// message names the flag and why it is not honoured; none of these are
 /// silently ignored, which would turn a wrong answer into an apparent success.
 fn reject_unported(opts: &Opts) -> Result<()> {
-    if opts.strict {
-        bail!("unsupported flag \"--strict\" (no fsck pass is run here)");
-    }
-    if opts.fsck_objects {
-        bail!("unsupported flag \"--fsck-objects\" (no fsck pass is run here)");
+    if let Some(list) = &opts.msg_types {
+        bail!(
+            "unsupported fsck severity list {list:?} \
+             (the checks run at git's defaults; per-message severities are not honoured)"
+        );
     }
     if opts.self_contained {
         bail!("unsupported flag \"--check-self-contained-and-connected\" (no connectivity pass is run here)");
@@ -743,6 +1063,37 @@ fn want_rev_index(opts: &Opts) -> bool {
         .ok()
         .and_then(|repo| repo.config_snapshot().boolean("pack.writeReverseIndex"))
         .unwrap_or(true)
+}
+
+/// Give every `.idx` under `pack_dir` the `.rev` file git's `index-pack` would
+/// have written beside it.
+///
+/// git indexes a fetched pack with `index-pack`, which writes the reverse index
+/// whenever `pack.writeReverseIndex` allows it (the default). gitoxide's fetch
+/// writes the pack and its index through `gix-pack`, which has no reverse-index
+/// writer at all, so a clone or fetch that received a pack came out one file
+/// short of git's. This fills that gap in after the fetch, for the packs that
+/// are missing it; a pack that already has one is left alone.
+///
+/// Best-effort per pack: a `.rev` that cannot be produced is skipped rather than
+/// failing the clone, since git's own `index-pack` treats the reverse index as
+/// an accelerator and the repository is complete without it.
+pub(super) fn write_missing_rev_indexes(pack_dir: &Path) {
+    let Ok(entries) = fs::read_dir(pack_dir) else {
+        return;
+    };
+    for path in entries.flatten().map(|e| e.path()) {
+        if path.extension().is_none_or(|ext| ext != "idx") || path.with_extension("rev").exists() {
+            continue;
+        }
+        // The trailer of the `.idx` is the checksum of the pack it indexes, which
+        // is the id the `.rev` records. Reading it from the index rather than the
+        // filename keeps this correct for a pack named any other way.
+        let Ok(index) = pack::index::File::at(&path, Kind::Sha1) else {
+            continue;
+        };
+        let _ = write_rev_index(&path, &index.pack_checksum());
+    }
 }
 
 /// Write the reverse index for `index_path` per `gitformat-pack(5)`.

@@ -1387,16 +1387,23 @@ fn is_fast_forward(repo: &gix::Repository, old: ObjectId, new: ObjectId) -> Opti
 /// `pack-objects --revs <wants> --not <haves>`. Computed as the set difference of
 /// the two reachability closures (correct, though not bitmap-optimized). Shared with
 /// `upload-pack`, whose server side needs the same closure for a negotiated fetch.
+///
+/// The want side is enumerated by
+/// [`super::pack_objects::traverse_commit_list`] rather than by a set walk, for
+/// the same reason git's caller runs `pack-objects --revs`: that is the order
+/// `to_pack.objects` ends up in, and it is what `compute_write_order()` then
+/// works from. A `HashSet` here made the resulting pack bytes differ from run to
+/// run — `git bundle create` produced a different file five times out of five
+/// where stock produced the same one every time — because iteration order is
+/// unspecified and the pack writer honours the order it is handed.
 pub(crate) fn objects_to_send(repo: &gix::Repository, wants: &[ObjectId], haves: &[ObjectId]) -> Vec<ObjectId> {
-    let want_closure = reachable_objects(repo, wants);
+    let mut want_closure = super::pack_objects::traverse_commit_list(repo, wants.to_vec());
     if haves.is_empty() {
-        return want_closure.into_iter().collect();
+        return want_closure;
     }
     let have_closure = reachable_objects(repo, haves);
+    want_closure.retain(|id| !have_closure.contains(id));
     want_closure
-        .into_iter()
-        .filter(|id| !have_closure.contains(id))
-        .collect()
 }
 
 /// Every object reachable from `tips` (commits, their trees, and blobs). The

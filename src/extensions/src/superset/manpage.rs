@@ -260,7 +260,7 @@ pub const DOCS: &[Doc] = &[
         summary: "install the ~/.zvcs shadow and print the shell lines for it",
         synopsis: "git zshadow [<dir>] [-n|--print] [--all]",
         desc: &[
-            "Sets up the whole shadow install in one command: a `git` symlink to this binary in <dir> (default ~/.zvcs/bin), a git-<verb> dashed link beside it for every verb the dispatcher serves, every superset man page under ~/.zvcs/man, and the zvcs-forked zsh completion as ~/.zvcs/completions/_git. The completion is compiled into the binary, so nothing is needed from the source tree.",
+            "Sets up the whole shadow install in one command: a `git` symlink to this binary in <dir> (default ~/.zvcs/bin), a git-<verb> dashed link beside it for every verb the dispatcher serves, every superset man page under ~/.zvcs/man, the HTML documentation set under ~/.zvcs/share/doc/git-doc (the directory `git --html-path` reports and `git help -w <cmd>` opens pages from), and the zvcs-forked zsh completion as ~/.zvcs/completions/_git. Everything installed is compiled into the binary, so nothing is needed from the source tree.",
             "stdout carries shell code only \\(em the export PATH line for the bin directory, the export MANPATH line for the man directory, and the fpath line for the completion directory \\(em so `eval \"$(git zshadow)\"` sets the current shell up and the same lines paste into ~/.zshrc. The install summary goes to stderr, where an eval leaves it alone.",
             "A PATH or MANPATH line the environment already satisfies is printed commented out, so re-evaluating never duplicates an entry and the line is still visible to uncomment when pasting into an rc file; --all prints every line uncommented. fpath is a zsh variable rather than an exported one, so it cannot be inspected from here and its line is always live \\(em put it before compinit, and `typeset -U fpath` keeps repeats harmless.",
             "-n (--print) prints the lines without installing anything. Paths under $HOME are written as $HOME/... so the lines are portable across machines.",
@@ -274,7 +274,7 @@ pub const DOCS: &[Doc] = &[
         synopsis: "git zdashed [<dir>]",
         desc: &[
             "Installs a git-<verb> symlink for every builtin and superset verb into <dir> (default ~/.zvcs/bin), so the dashed external forms resolve to this binary once stock git is removed.",
-            "It also writes every extension man page under ~/.zvcs/man, so `man git-<verb>` resolves when that directory is on MANPATH.",
+            "It also writes every extension man page under ~/.zvcs/man, so `man git-<verb>` resolves when that directory is on MANPATH, and the HTML documentation set under ~/.zvcs/share/doc/git-doc, so `git help -w <cmd>` finds a page for every command without generating one first.",
         ],
     },
     Doc {
@@ -945,8 +945,10 @@ fn esc_line(text: &str) -> String {
 }
 
 /// Self-contained CSS for the HTML reference — inlined so the page needs no
-/// assets, works offline, and adapts to light/dark.
-const HTML_STYLE: &str = "<style>\n\
+/// assets, works offline, and adapts to light/dark. Shared with
+/// [`crate::superset::htmldoc`] so the installed doc set and the published
+/// reference render alike.
+pub(crate) const HTML_STYLE: &str = "<style>\n\
 :root{--bg:#0d1117;--fg:#c9d1d9;--dim:#8b949e;--accent:#58a6ff;--code:#1f2430;--line:#21262d}\n\
 @media(prefers-color-scheme:light){:root{--bg:#fff;--fg:#1f2328;--dim:#57606a;--accent:#0969da;--code:#f2f4f8;--line:#d0d7de}}\n\
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.6 -apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;max-width:60rem;margin:0 auto;padding:2rem 1.25rem}\n\
@@ -999,13 +1001,13 @@ pub fn html_reference() -> String {
     s
 }
 
-fn html_esc(t: &str) -> String {
+pub(crate) fn html_esc(t: &str) -> String {
     t.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
 }
 
 /// HTML-escape a description paragraph, turn the roff em-dash `\(em` into `—`, and
 /// `` `code` `` spans into `<code>`.
-fn html_inline(t: &str) -> String {
+pub(crate) fn html_inline(t: &str) -> String {
     let esc = html_esc(t).replace("\\(em", "\u{2014}");
     let mut out = String::new();
     let mut in_code = false;

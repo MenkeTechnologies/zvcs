@@ -6,6 +6,20 @@ use gix_ref::{
 
 use crate::{Reference, bstr::BString, ext::ReferenceExt, reference};
 
+/// Pick the edit for `name` out of `edits`.
+///
+/// A single requested edit can come back as several: the file store adds log-only companions of
+/// its own, since git's `split_head_update()` mirrors an edit of the checked-out branch onto `HEAD`
+/// and `split_symref_update()` splits a dereferenced edit into symbolic and referent halves. Only
+/// the one naming `name` describes the reference the caller asked to write.
+fn edited_name(edits: Vec<RefEdit>, name: &FullName) -> FullName {
+    edits
+        .into_iter()
+        .map(|edit| edit.name)
+        .find(|edited| edited == name)
+        .expect("the requested reference is always among the returned edits")
+}
+
 /// Obtain and alter references comfortably
 impl crate::Repository {
     /// Create a lightweight tag with given `name` (and without `refs/tags/` prefix) pointing to the given `target`, and return it as reference.
@@ -19,20 +33,19 @@ impl crate::Repository {
         constraint: PreviousValue,
     ) -> Result<Reference<'_>, reference::edit::Error> {
         let id = target.into();
-        let mut edits = self.edit_reference(RefEdit {
+        let name: FullName = format!("refs/tags/{}", name.as_ref()).try_into()?;
+        let edits = self.edit_reference(RefEdit {
             change: Change::Update {
                 log: Default::default(),
                 expected: constraint,
                 new: Target::Object(id),
             },
-            name: format!("refs/tags/{}", name.as_ref()).try_into()?,
+            name: name.clone(),
             deref: false,
         })?;
-        assert_eq!(edits.len(), 1, "reference splits should ever happen");
-        let edit = edits.pop().expect("exactly one item");
         Ok(Reference {
             inner: gix_ref::Reference {
-                name: edit.name,
+                name: edited_name(edits, &name),
                 target: id.into(),
                 peeled: None,
             },
@@ -102,7 +115,7 @@ impl crate::Repository {
         constraint: PreviousValue,
         log_message: BString,
     ) -> Result<Reference<'_>, reference::edit::Error> {
-        let mut edits = self.edit_reference(RefEdit {
+        let edits = self.edit_reference(RefEdit {
             change: Change::Update {
                 log: LogChange {
                     mode: RefLog::AndReference,
@@ -112,17 +125,12 @@ impl crate::Repository {
                 expected: constraint,
                 new: Target::Object(id),
             },
-            name,
+            name: name.clone(),
             deref: false,
         })?;
-        assert_eq!(
-            edits.len(),
-            1,
-            "only one reference can be created, splits aren't possible"
-        );
 
         Ok(gix_ref::Reference {
-            name: edits.pop().expect("exactly one edit").name,
+            name: edited_name(edits, &name),
             target: Target::Object(id),
             peeled: None,
         }

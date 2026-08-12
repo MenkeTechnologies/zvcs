@@ -9,6 +9,10 @@ use gix::remote::Direction;
 
 use super::push_proto::{self, Request};
 
+/// `git push`'s usage block, byte-for-byte from stock git 2.55.0. `parse-options`
+/// answers `-h` with it on stdout and exits 129, before any repository setup.
+const USAGE: &str = "usage: git push [<options>] [<repository> [<refspec>...]]\n\n    -v, --[no-]verbose    be more verbose\n    -q, --[no-]quiet      be more quiet\n    --[no-]repo <repository>\n                          repository\n    --[no-]all            push all branches\n    --[no-]branches       alias of --all\n    --[no-]mirror         mirror all refs\n    -d, --[no-]delete     delete refs\n    --[no-]tags           push tags (can't be used with --all or --branches or --mirror)\n    -n, --[no-]dry-run    dry run\n    --[no-]porcelain      machine-readable output\n    -f, --[no-]force      force updates\n    --[no-]force-with-lease[=<refname>:<expect>]\n                          require old value of ref to be at this value\n    --[no-]force-if-includes\n                          require remote updates to be integrated locally\n    --[no-]recurse-submodules (check|on-demand|no)\n                          control recursive pushing of submodules\n    --[no-]thin           use thin pack\n    --[no-]receive-pack <receive-pack>\n                          receive pack program\n    --[no-]exec <receive-pack>\n                          receive pack program\n    -u, --[no-]set-upstream\n                          set upstream for git pull/status\n    --[no-]progress       force progress reporting\n    --[no-]prune          prune locally removed refs\n    --no-verify           bypass pre-push hook\n    --verify              opposite of --no-verify\n    --[no-]follow-tags    push missing but relevant tags\n    --[no-]signed[=(yes|no|if-asked)]\n                          GPG sign the push\n    --[no-]atomic         request atomic transaction on remote side\n    -o, --[no-]push-option <server-specific>\n                          option to transmit\n    -4, --ipv4            use IPv4 addresses only\n    -6, --ipv6            use IPv6 addresses only\n\n";
+
 /// `git push [<options>] [<repository> [<refspec>...]]` — upload commits and
 /// update remote refs.
 ///
@@ -52,6 +56,18 @@ use super::push_proto::{self, Request};
 /// command-line flag always wins, because git reads config in `git_push_config`
 /// *before* `parse_options`.
 pub fn push(args: &[String]) -> Result<ExitCode> {
+    // `parse_options()` answers `-h` before the command body runs, so this
+    // precedes repository discovery and every other flag. `--` ends option
+    // parsing, so an `-h` behind it is a plain argument.
+    if args
+        .iter()
+        .take_while(|a| a.as_str() != "--")
+        .any(|a| a == "-h")
+    {
+        print!("{USAGE}");
+        return Ok(ExitCode::from(129));
+    }
+
     let mut f = Flags::default();
     let mut positionals: Vec<String> = Vec::new();
     let mut end_of_options = false;
@@ -112,7 +128,10 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
             "--no-force-with-lease" => f.lease = Lease::None,
             // Accepted, but inert here or already matched by the engine's behavior.
             "-v" | "--verbose" => f.verbose = true,
-            "-q" | "--quiet" | "--progress" | "--no-progress"
+            // `--quiet` drives `transport->verbose` negative, which is what
+            // `set_upstreams()` tests before printing its notice (transport.c:120).
+            "-q" | "--quiet" => f.quiet = true,
+            "--progress" | "--no-progress"
             | "--thin" | "--no-thin" | "-4" | "--ipv4" | "-6" | "--ipv6"
             | "--verify" | "--no-verify"
             => {}
@@ -487,20 +506,26 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
     };
     let outcome = push_proto::send_pack(&repo, &remote, &requests, f.dry_run, &send_opts)?;
 
-    // A dry run performs no local writes; a real push advances the tracking refs
-    // and (for `-u`) records the upstream, but only for refs the remote accepted.
-    if !f.dry_run {
-        update_tracking_refs(&repo, &remote, &outcome);
-        if f.set_upstream {
-            record_upstreams(&repo, &remote_name, &outcome, &upstreams);
-        }
-    }
-
-    if f.porcelain {
+    // `transport_push` finishes in this order: print the status block, then
+    // `set_upstreams()`, then the tracking refs (transport.c:1545-1558). The
+    // order is observable — with `--porcelain` both the status block and the
+    // `-u` notice go to stdout — so the report runs first here too.
+    //
+    // A dry run performs no local writes, but `set_upstreams()` still runs for
+    // it: `pretend` makes it report what it *would* configure, while the
+    // tracking-ref update is skipped outright.
+    let code = if f.porcelain {
         report_porcelain(&outcome)
     } else {
         report(&outcome, f.verbose)
+    };
+    if f.set_upstream {
+        record_upstreams(&repo, &remote_name, &outcome, &upstreams, f.dry_run, f.quiet);
     }
+    if !f.dry_run {
+        update_tracking_refs(&repo, &remote, &outcome);
+    }
+    code
 }
 
 /// The push flag state.
@@ -513,6 +538,9 @@ struct Flags {
     tags: bool,
     mirror: bool,
     verbose: bool,
+    /// `-q`/`--quiet`. Only consulted where git consults `transport->verbose < 0`:
+    /// the `set up to track` notice `--set-upstream` prints.
+    quiet: bool,
     prune: bool,
     atomic: bool,
     signed: push_proto::Signed,
@@ -928,9 +956,37 @@ fn parse_refspec(
         },
     };
 
-    // Record an upstream only when the source is a local branch.
-    let upstream = match &src_full {
-        Some(sf) if sf.starts_with("refs/heads/") => Some((src.to_string(), dst_full.clone())),
+    // `transport.c::set_upstreams` decides this, and it is stricter than "the
+    // source is a branch":
+    //
+    // ```c
+    // localname = ref->peer_ref->name;
+    // tmp = refs_resolve_ref_unsafe(…, localname, RESOLVE_REF_READING, NULL, &flag);
+    // if (tmp && flag & REF_ISSYMREF && starts_with(tmp, "refs/heads/"))
+    //         localname = tmp;
+    // if (!localname || !starts_with(localname, "refs/heads/")) continue;
+    // if (!remotename || !starts_with(remotename, "refs/heads/")) continue;
+    // install_branch_config(flag, localname + 11, transport->remote->name, remotename);
+    // ```
+    //
+    // Two things follow that the previous shape got wrong. A SYMBOLIC source is
+    // followed — which is the whole point of the comment "mainly for HEAD", and
+    // the reason `push -u . HEAD:refs/heads/tracked` configures `main` rather
+    // than recording nothing. And the recorded branch is `localname + 11`, the
+    // full ref minus `refs/heads/`, not the text the user typed: `push -u origin
+    // refs/heads/main` writes `branch.main.*`, never `branch.refs/heads/main.*`.
+    // The destination must be a branch too, so a tag push records nothing.
+    //
+    // `ref->peer_ref->name` is the MATCHED local ref's full name when the source
+    // named a ref, and the literal text otherwise — `try_explicit_object_name`
+    // allocates the ref under the name as written (remote.c:1127), which is why
+    // `HEAD` arrives here unresolved and needs the symref step at all.
+    let peer_name = src_full.clone().unwrap_or_else(|| src.to_string());
+    let local_full = symref_branch_target(repo, &peer_name).unwrap_or(peer_name);
+    let upstream = match local_full.strip_prefix("refs/heads/") {
+        Some(short) if dst_full.starts_with("refs/heads/") => {
+            Some((short.to_string(), dst_full.clone()))
+        }
         _ => None,
     };
     Ok((
@@ -1056,21 +1112,73 @@ fn resolve_src_full(repo: &gix::Repository, name: &str) -> Option<String> {
     .find_map(|candidate| full(candidate))
 }
 
-/// Record `branch.<name>.remote`/`.merge` for every branch the remote accepted,
-/// as `git push -u` does. Best-effort: a config-write failure does not fail the push.
+/// `refs_resolve_ref_unsafe(name, RESOLVE_REF_READING)` restricted to the one
+/// answer `set_upstreams()` acts on: the full name a SYMBOLIC `name` ultimately
+/// resolves to, when that lands inside `refs/heads/`.
+///
+/// `None` for a direct ref (git keeps `localname` as it was), for an unresolvable
+/// name, and for a symref that leaves `refs/heads/` — a detached `HEAD` has no
+/// referent at all, so `git push -u . HEAD:refs/heads/x` from a detached head
+/// configures nothing, exactly as git does.
+fn symref_branch_target(repo: &gix::Repository, name: &str) -> Option<String> {
+    let mut current = repo.find_reference(name).ok()?;
+    let mut followed = false;
+    // A symref chain is bounded by the ref store's own depth limit; git stops at
+    // `MAXDEPTH` = 5 rather than trusting the file layout, and so does this.
+    for _ in 0..5 {
+        let target = match current.target() {
+            gix::refs::TargetRef::Symbolic(next) => next.as_bstr().to_str().ok()?.to_string(),
+            gix::refs::TargetRef::Object(_) => break,
+        };
+        followed = true;
+        current = repo.find_reference(target.as_str()).ok()?;
+    }
+    if !followed {
+        return None;
+    }
+    let resolved = current.name().as_bstr().to_str().ok()?.to_string();
+    resolved.starts_with("refs/heads/").then_some(resolved)
+}
+
+/// Port of `transport.c::set_upstreams`, from the point at which the source and
+/// destination have already been vetted (see [`parse_refspec`]): for every branch
+/// the remote accepted, write `branch.<name>.remote`/`.merge` and print git's
+/// `install_branch_config` notice.
+///
+/// The status filter is git's — `REF_STATUS_OK` or `REF_STATUS_UPTODATE`, never a
+/// deletion. `pretend` is `--dry-run`, which reports what it would do and writes
+/// nothing; `quiet` is `transport->verbose < 0`, which silences the notice but
+/// not the config write. Config writes stay best-effort: a failure does not fail
+/// the push.
 fn record_upstreams(
     repo: &gix::Repository,
     remote_name: &str,
     outcome: &push_proto::Outcome,
     upstreams: &[Upstream],
+    pretend: bool,
+    quiet: bool,
 ) {
     for (branch, remote_ref) in upstreams {
         let accepted = outcome
             .statuses
             .iter()
             .any(|s| &s.name == remote_ref && s.result.is_ok() && !s.new.is_null());
-        if accepted {
-            let _ = super::config::set_branch_upstream(repo, branch, remote_name, remote_ref);
+        if !accepted {
+            continue;
+        }
+        // `install_branch_config_multiple_remotes` shortens the tracked ref for
+        // display and prefixes it with the remote's name, so a push to `.` reads
+        // `./tracked` and one to `origin` reads `origin/tracked`.
+        let short = remote_ref.strip_prefix("refs/heads/").unwrap_or(remote_ref);
+        if pretend {
+            if !quiet {
+                println!("Would set upstream of '{branch}' to '{short}' of '{remote_name}'");
+            }
+            continue;
+        }
+        let _ = super::config::set_branch_upstream(repo, branch, remote_name, remote_ref);
+        if !quiet {
+            println!("branch '{branch}' set up to track '{remote_name}/{short}'.");
         }
     }
 }

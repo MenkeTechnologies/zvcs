@@ -41,7 +41,10 @@ use anyhow::{bail, Result};
 use std::process::ExitCode;
 
 /// The git version this port reproduces, as printed by `git version`.
-const GIT_VERSION: &str = "2.55.0";
+///
+/// `diagnose.rs` heads its report with the same string; `git version` and
+/// `git diagnose` must never disagree about what this binary claims to be.
+pub(crate) const GIT_VERSION: &str = "2.55.0";
 
 /// `usage_with_options()` rendering of `builtin/version.c`'s option table,
 /// verbatim (including the blank line before the option list and the trailing

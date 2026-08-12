@@ -57,6 +57,16 @@
 //!   * `-I<regex>`/`--ignore-matching-lines=<regex>`, via a vendored POSIX ERE
 //!     engine (`regcomp(REG_EXTENDED | REG_NEWLINE)` semantics) and a port of
 //!     xdiff's `xdl_get_hunk()` hunk selection.
+//!   * `-W`/`--function-context`, xdiff's `XDL_EMIT_FUNCCONTEXT`: each hunk grows
+//!     back to the line the enclosing function starts on and forward to the line
+//!     before the next one, merging into the following hunk when the two meet.
+//!   * `--interdiff=<rev>` and `--range-diff=<rev>` with `--creation-factor=<n>`:
+//!     `show_diff_of_diff()`'s two trailing blocks, either behind the single
+//!     patch (indented two spaces, as `log-tree.c` indents the interdiff) or in
+//!     the cover letter (flush left), including the `Interdiff against v<n>:` /
+//!     `Range-diff against v<n>:` titles a `-v<n>` reroll selects, the ranges
+//!     `infer_range_diff_ranges()` derives, and the rule that either option turns
+//!     a cover letter on for a multi-patch series.
 //!
 //! Flags git accepts that are *not* ported are recorded during parsing and
 //! rejected only once it is clear a patch would actually be emitted. Rejecting
@@ -82,20 +92,22 @@
 //!
 //! Not covered — these `bail!` rather than emit output that would diverge:
 //!   * binary files, unless `-a`/`--text` is given. format-patch implies
-//!     `--binary`, i.e. a base85 `GIT binary patch` payload; that encoder is not
-//!     ported, and neither is the `Binary files … differ` + `Bin <n> -> <m> bytes`
-//!     pair `--no-binary` would print, so that flag parses but changes nothing.
+//!     `--binary`, i.e. a base85 `GIT binary patch` payload. The payload itself is
+//!     available now — [`super::binary_patch`] emits it byte-for-byte, as
+//!     `git diff --binary` does — but this renderer does not carry the two raw
+//!     images down to its patch body yet, and `--no-binary`'s alternative
+//!     (`Binary files … differ` plus a `Bin <n> -> <m> bytes` stat row) is not
+//!     ported either, so that flag parses but changes nothing.
 //!   * pathspec-limited output. A pathspec is parsed and honoured to the extent
 //!     that it never becomes a bogus revision error, but limiting the walk and
 //!     the patch to it is not ported, so a pathspec that reaches a non-empty
 //!     commit list is fatal.
-//!   * interdiff and range-diff, `--function-context`, `--compact-summary`,
-//!     `--encode-email-headers` as a *deferred* spelling, whitespace-insensitive
-//!     diffing, patience diff (imara-diff has Myers, MyersMinimal and Histogram only),
-//!     and copy detection (`-C`; renames are detected, as git's default asks).
-//!     `--ignore-if-in-upstream` and `--creation-factor` reproduce the refusals git
-//!     raises for them (`need exactly one range`, `requires '--range-diff'`) but the
-//!     comparisons themselves are not ported.
+//!   * `--compact-summary`, `--encode-email-headers` as a *deferred* spelling,
+//!     whitespace-insensitive diffing, patience diff (imara-diff has Myers,
+//!     MyersMinimal and Histogram only), and copy detection (`-C`; renames are
+//!     detected, as git's default asks). `--ignore-if-in-upstream` reproduces the
+//!     refusal git raises for it (`need exactly one range`) but the patch-id
+//!     comparison itself is not ported.
 //!   * `--src-prefix=<p>`, `--dst-prefix=<p>`, `--no-prefix`, `--default-prefix` and
 //!     `--output=<file>` *are* ported; unknown options report git's own
 //!     `fatal: unrecognized argument: <arg>` (128).
@@ -226,6 +238,17 @@ enum CoverFrom {
 
 /// git's `COVER_FROM_AUTO_MAX_SUBJECT_LEN`.
 const COVER_FROM_AUTO_MAX_SUBJECT_LEN: usize = 100;
+
+/// git's `enum cover_setting` — the four states `format.coverLetter` can be in.
+/// `Unset` and `Off` differ: with `--interdiff`/`--range-diff` over a multi-patch
+/// series, `Unset` turns the cover letter on and `Off` leaves it off.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CoverSetting {
+    Unset,
+    Off,
+    On,
+    Auto,
+}
 
 /// git's `enum auto_base_setting` — `--base=<c>|auto` / `format.useAutoBase`.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -403,14 +426,32 @@ struct Opts {
     /// `-I<regex>`: change groups whose every line matches one of these are
     /// marked ignorable before hunks are assembled.
     ignore_regex: Vec<Regex>,
+    /// `-W`/`--function-context`: `XDL_EMIT_FUNCCONTEXT`, which grows every hunk
+    /// outward to the enclosing function's first and last line.
+    function_context: bool,
 
     /// Flags git accepts that this module has not ported, in the spelling the
     /// caller used. Reported only when a patch would actually be emitted.
     deferred: Vec<String>,
 
     /// `--range-diff=<range>`: git validates the range after the walk (128 on a
-    /// bad revision); the range-diff render itself is not ported.
+    /// bad revision).
     range_diff: Option<String>,
+    /// `--creation-factor=<n>`, git's `creation_factor`, which starts at -1.
+    /// Any value still below zero means the default was never overridden.
+    creation_factor: Option<i64>,
+    /// `--interdiff=<rev>`, resolved as `parse_opt_object_name()` resolves it.
+    /// Only the last entry is used; `--no-interdiff` empties the list.
+    interdiff: Vec<ObjectId>,
+    /// Whether `--cover-letter`/`--no-cover-letter` was on the command line.
+    /// git leaves the flag undecided until the series length is known, because
+    /// `--interdiff`/`--range-diff` turn a cover letter on for a multi-patch
+    /// series (see the `cover_letter == -1` block in `cmd_format_patch`).
+    cover_letter_given: bool,
+    /// `format.coverLetter`, kept as git's four-state `enum cover_setting`
+    /// rather than a boolean because "unset" and "false" decide differently
+    /// once `--interdiff`/`--range-diff` is in play.
+    cover_setting: CoverSetting,
     /// `--output=<file>`: the whole series goes to this one file, which is created (and
     /// truncated) while the option parses — before the `--stdout` conflict below.
     output: Option<String>,
@@ -442,16 +483,11 @@ pub fn format_patch(args: &[String]) -> Result<ExitCode> {
         return Ok(fatal("options '--stdout' and '--output' cannot be used together"));
     }
 
-    // `--ignore-if-in-upstream` compares the series against the other side of a range,
-    // so git requires exactly two pending endpoints (`A..B`); `--creation-factor` only
-    // scales a `--range-diff` and is refused without one. Both die before any output,
-    // and in this order.
+    // `--ignore-if-in-upstream` compares the series against the other side of a
+    // range, so git requires exactly two pending endpoints (`A..B`).
     if opts.deferred.iter().any(|f| f == "--ignore-if-in-upstream") && pending_endpoints(&opts) != 2
     {
         return Ok(fatal("need exactly one range"));
-    }
-    if opts.deferred.iter().any(|f| is_flag(f, "--creation-factor")) && opts.range_diff.is_none() {
-        return Ok(fatal("the option '--creation-factor' requires '--range-diff'"));
     }
 
     // git: "Make sure 0000-$sub.patch gives non-negative length for $sub".
@@ -480,17 +516,58 @@ pub fn format_patch(args: &[String]) -> Result<ExitCode> {
         Err(code) => return Ok(code),
     }
 
+    let total = commits.len();
+
+    // `cmd_format_patch`'s `cover_letter == -1` block, which only runs once the
+    // series length is known: `format.coverLetter=auto` follows the length, an
+    // interdiff or range-diff over a multi-patch series turns the cover letter
+    // on unless the config switched it off, and otherwise only an explicit
+    // `format.coverLetter=true` does.
+    if !opts.cover_letter_given {
+        let diff_of_diff = !opts.interdiff.is_empty() || opts.range_diff.is_some();
+        opts.cover_letter = if opts.cover_setting == CoverSetting::Auto {
+            total > 1
+        } else if diff_of_diff && total > 1 {
+            opts.cover_setting != CoverSetting::Off
+        } else {
+            opts.cover_setting == CoverSetting::On
+        };
+    }
+
+    // Both diff-of-diff options need somewhere to put their block: the cover
+    // letter, or the one patch of a single-patch series.
+    if !opts.interdiff.is_empty() && !opts.cover_letter && total != 1 {
+        return Ok(fatal("--interdiff requires --cover-letter or single patch"));
+    }
+    if opts.range_diff.is_some() && !opts.cover_letter && total != 1 {
+        return Ok(fatal("--range-diff requires --cover-letter or single patch"));
+    }
+
+    // `creation_factor` starts at -1 and any value still below zero after
+    // parsing means "not given", which is also what makes an explicit negative
+    // value legal without a `--range-diff` to scale.
+    let creation_factor = match opts.creation_factor {
+        Some(n) if n >= 0 => {
+            if opts.range_diff.is_none() {
+                return Ok(fatal("the option '--creation-factor' requires '--range-diff'"));
+            }
+            n
+        }
+        _ => super::range_diff::CREATION_FACTOR_FOR_THE_SAME_SERIES,
+    };
+
     // git validates the `--range-diff` range after the walk
     // (`infer_range_diff_ranges`); an unresolvable side dies 128 there, before
-    // any supported-but-unported diff option would matter. A range git accepts
-    // still can't be rendered here, so it falls through to the unsupported-flag
-    // report below.
-    if let Some(rd) = opts.range_diff.clone() {
-        if let Err(code) = validate_range_diff(&repo, &rd) {
-            return Ok(code);
+    // any supported-but-unported diff option would matter.
+    let range_diff_ranges = match opts.range_diff.clone() {
+        Some(rd) => {
+            if let Err(code) = validate_range_diff(&repo, &rd) {
+                return Ok(code);
+            }
+            Some(infer_range_diff_ranges(&repo, &rd, &commits)?)
         }
-        opts.deferred.push(format!("--range-diff={rd}"));
-    }
+        None => None,
+    };
 
     // Everything below emits bytes, so an unported flag can no longer be
     // deferred: it would change what those bytes are.
@@ -503,7 +580,6 @@ pub fn format_patch(args: &[String]) -> Result<ExitCode> {
 
     // Auto-numbering kicks in for a series; -n/-N override it. A cover letter
     // always numbers, since it is itself patch 0 of the series.
-    let total = commits.len();
     let numbered = opts.numbered.unwrap_or(total > 1 || opts.cover_letter);
     let printed_total = if numbered {
         total + opts.start_number - 1
@@ -538,6 +614,17 @@ pub fn format_patch(args: &[String]) -> Result<ExitCode> {
         // A bad `--commit-list-format` is only caught once the cover letter's
         // headers are already written, so the partial message is emitted first.
         if let Err(code) = render_cover_letter(&repo, &commits, printed_total, &opts, &th, &mut msg)?
+        {
+            emit_message(&mut buffered, &msg, cover_filename(&opts), &opts)?;
+            stdout.write_all(&buffered)?;
+            stdout.flush()?;
+            return Ok(code);
+        }
+        // `make_cover_letter()` puts the diff-of-diff blocks straight after the
+        // diffstat, flush left (indent 0) and with no blank line of their own —
+        // `show_diffstat()` already ended with one.
+        if let Err(code) =
+            emit_diff_of_diff(&repo, &opts, range_diff_ranges.as_ref(), creation_factor, &commits, 0, &mut msg)?
         {
             emit_message(&mut buffered, &msg, cover_filename(&opts), &opts)?;
             stdout.write_all(&buffered)?;
@@ -582,6 +669,19 @@ pub fn format_patch(args: &[String]) -> Result<ExitCode> {
             &notes_trees,
             &mut msg,
         )?;
+        // `log_tree_commit()` calls `show_diff_of_diff()` once the patch body is
+        // out, and only for the single-patch case — a cover letter has already
+        // carried the blocks, and git clears them before the loop in that case.
+        if !opts.cover_letter {
+            if let Err(code) =
+                emit_diff_of_diff(&repo, &opts, range_diff_ranges.as_ref(), creation_factor, &commits, 2, &mut msg)?
+            {
+                emit_message(&mut buffered, &msg, patch_filename(&commit, nr, &opts)?, &opts)?;
+                stdout.write_all(&buffered)?;
+                stdout.flush()?;
+                return Ok(code);
+            }
+        }
         if bases_pending {
             if let Some(b) = &bases {
                 print_bases(&mut msg, b);
@@ -613,6 +713,155 @@ pub fn format_patch(args: &[String]) -> Result<ExitCode> {
             crate::sigpipe::exit_broken_pipe()
         }
         Err(e) => Err(e.into()),
+    }
+}
+
+/// Port of `diff_title()` (`builtin/log.c`): a reroll count of at least 1 names
+/// the version this series is being compared against, `v<n-1>`.
+fn diff_title(reroll: Option<&str>, generic: &str, rerolled: &str) -> String {
+    match reroll.and_then(strtol_i) {
+        Some(v) if v >= 1 => format!("{rerolled}{}:", v - 1),
+        _ => generic.to_string(),
+    }
+}
+
+/// Port of `infer_range_diff_ranges()` (`builtin/log.c`): the two ranges
+/// `--range-diff=<prev>` stands for.
+///
+/// `prev` is either already a range — in which case it is the left side
+/// verbatim — or a single tip, which becomes `<head>..<prev>`. The right side
+/// runs from the series' origin to its tip; without an origin git falls back to
+/// `prev` and says so, or gives up when `prev` was a range.
+fn infer_range_diff_ranges(
+    repo: &gix::Repository,
+    prev: &str,
+    commits: &[ObjectId],
+) -> Result<(String, String)> {
+    let head = commits.last().expect("caller rejects an empty series");
+    let head_hex = head.to_hex().to_string();
+    let prev_is_range = is_range_diff_range(repo, prev);
+    let r1 = if prev_is_range {
+        prev.to_string()
+    } else {
+        format!("{head_hex}..{prev}")
+    };
+    let r2 = match series_origin(repo, commits)? {
+        Some(origin) => format!("{}..{head_hex}", origin.to_hex()),
+        None if prev_is_range => {
+            crate::git_fatal!("failed to infer range-diff origin of current series")
+        }
+        None => {
+            eprintln!("warning: using '{prev}' as range-diff origin of current series");
+            format!("{prev}..{head_hex}")
+        }
+    };
+    Ok((r1, r2))
+}
+
+/// Port of `is_range_diff_range()` (`range-diff.c`): true when the argument
+/// resolves to both a positive and a negative endpoint, i.e. it names a range
+/// rather than a single tip.
+fn is_range_diff_range(repo: &gix::Repository, arg: &str) -> bool {
+    let resolves = |s: &str| {
+        repo.rev_parse_single(BStr::new(if s.is_empty() { "HEAD" } else { s }))
+            .is_ok()
+    };
+    // Only the two range spellings contribute endpoints of both signs: a bare
+    // tip is positive-only and a `^<rev>` is negative-only, so neither counts.
+    let Some((left, right)) = arg.split_once("...").or_else(|| arg.split_once("..")) else {
+        return false;
+    };
+    resolves(left) && resolves(right)
+}
+
+/// The `origin` `cmd_format_patch` picks up from its walk: the single boundary
+/// commit of the series, i.e. the one commit that a listed commit descends from
+/// while not being listed itself. git sets `origin` only while exactly one
+/// boundary commit has been seen (`origin = (boundary_count == 1) ? commit :
+/// NULL`), so a series with several roots or several bases has none.
+fn series_origin(repo: &gix::Repository, commits: &[ObjectId]) -> Result<Option<ObjectId>> {
+    let listed: std::collections::HashSet<ObjectId> = commits.iter().copied().collect();
+    let mut boundary: Vec<ObjectId> = Vec::new();
+    for id in commits {
+        for parent in repo.find_commit(*id)?.parent_ids() {
+            let parent = parent.detach();
+            if !listed.contains(&parent) && !boundary.contains(&parent) {
+                boundary.push(parent);
+            }
+        }
+    }
+    Ok(match boundary.len() {
+        1 => Some(boundary[0]),
+        _ => None,
+    })
+}
+
+/// Port of `show_diff_of_diff()` (`log-tree.c`) and the tail of
+/// `make_cover_letter()`: the `Interdiff:` block, then the `Range-diff:` block.
+///
+/// `indent` is git's `output_prefix` width for the interdiff — two spaces from
+/// `show_diff_of_diff()`, none from the cover letter — and doubles as the flag
+/// for the leading blank line the patch form prints and the cover letter does
+/// not. The range-diff carries its own four-space indent internally and is never
+/// given an output prefix, in either form.
+fn emit_diff_of_diff(
+    repo: &gix::Repository,
+    opts: &Opts,
+    ranges: Option<&(String, String)>,
+    creation_factor: i64,
+    commits: &[ObjectId],
+    indent: usize,
+    out: &mut Vec<u8>,
+) -> Result<std::result::Result<(), ExitCode>> {
+    if let Some(oid1) = opts.interdiff.last() {
+        let head = commits.last().expect("caller rejects an empty series");
+        let new_tree = repo.find_object(*head)?.peel_to_tree()?;
+        let old_tree = repo.find_object(*oid1)?.peel_to_tree()?;
+        if indent > 0 {
+            out.push(b'\n');
+        }
+        writeln!(out, "{}", diff_title(opts.reroll.as_deref(), "Interdiff:", "Interdiff against v"))?;
+        let mut body: Vec<u8> = Vec::new();
+        let abbrev = new_tree.id().shorten()?.hex_len();
+        for change in &tree_changes(repo, Some(&old_tree), Some(&new_tree))? {
+            emit_change(repo, &mut body, change, abbrev, opts)?;
+        }
+        write_indented(out, &body, indent);
+    }
+
+    if let Some((r1, r2)) = ranges {
+        if indent > 0 {
+            out.push(b'\n');
+        }
+        writeln!(out, "{}", diff_title(opts.reroll.as_deref(), "Range-diff:", "Range-diff against v"))?;
+        // `get_notes_args()`: format-patch pushes `--no-notes` unless the series
+        // itself renders notes (`rev->show_notes`).
+        let notes_on = opts.notes.show;
+        match super::range_diff::show_range_diff(
+            repo,
+            r1,
+            r2,
+            creation_factor,
+            notes_on,
+            out,
+        )? {
+            Ok(()) => {}
+            Err(code) => return Ok(Err(code)),
+        }
+    }
+    Ok(Ok(()))
+}
+
+/// git's `output_prefix`: every emitted line of a diff carries it, so a rendered
+/// patch is indented by prefixing each of its lines.
+fn write_indented(out: &mut Vec<u8>, body: &[u8], indent: usize) {
+    if indent == 0 {
+        out.extend_from_slice(body);
+        return;
+    }
+    for line in body.split_inclusive(|&b| b == b'\n') {
+        out.resize(out.len() + indent, b' ');
+        out.extend_from_slice(line);
     }
 }
 
@@ -685,8 +934,6 @@ const NO_OP: &[&str] = &[
 /// `--flag=<value>`; see the module header for what each of them would change.
 const DEFERRED: &[&str] = &[
     "--encode-email-headers",
-    "--interdiff",
-    "--creation-factor",
     "--ignore-if-in-upstream",
     "--compact-summary",
     "--patience",
@@ -706,7 +953,6 @@ const DEFERRED: &[&str] = &[
     "--ignore-all-space",
     "--ignore-blank-lines",
     "--inter-hunk-context",
-    "--function-context",
     "--textconv",
     "--line-prefix",
     "--output-indicator-new",
@@ -721,7 +967,6 @@ const DEFERRED: &[&str] = &[
     "-b",
     "-w",
     "-D",
-    "-W",
 ];
 
 /// Short options that carry an attached value, e.g. `-M50%` or `-S<string>`.
@@ -806,7 +1051,17 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
             .filter(|n| *n > 0)
             .map(|n| n as usize)
             .unwrap_or(NAME_MAX_DEFAULT),
-        cover_letter: snap.boolean("format.coverLetter") == Some(true),
+        // Decided after the walk, where `cmd_format_patch` decides it; the
+        // config only supplies the state feeding that decision.
+        cover_letter: false,
+        cover_setting: match snap.string("format.coverLetter") {
+            None => CoverSetting::Unset,
+            Some(v) if v.to_str_lossy().eq_ignore_ascii_case("auto") => CoverSetting::Auto,
+            Some(v) => match maybe_bool(&v.to_str_lossy()) {
+                Some(true) => CoverSetting::On,
+                _ => CoverSetting::Off,
+            },
+        },
         keep_subject: false,
         in_reply_to: None,
         to: cfg_list("format.to"),
@@ -890,8 +1145,12 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
         text: false,
         no_binary: false,
         ignore_regex: Vec::new(),
+        function_context: false,
         deferred: Vec::new(),
         range_diff: None,
+        creation_factor: None,
+        interdiff: Vec::new(),
+        cover_letter_given: false,
         output: None,
         rev_pos: Vec::new(),
         opt_error: None,
@@ -913,7 +1172,6 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
     // `--commit-list-format` implies a cover letter, but only when the caller
     // did not spell `--cover-letter`/`--no-cover-letter` out.
     let mut commit_list_format_given = false;
-    let mut cover_letter_given = false;
     while i < args.len() {
         let a = args[i].as_str();
         if pathspec_mode {
@@ -996,11 +1254,11 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
             }
             "--cover-letter" => {
                 o.cover_letter = true;
-                cover_letter_given = true;
+                o.cover_letter_given = true;
             }
             "--no-cover-letter" => {
                 o.cover_letter = false;
-                cover_letter_given = true;
+                o.cover_letter_given = true;
             }
             "-k" | "--keep-subject" => o.keep_subject = true,
             "--to" => {
@@ -1248,9 +1506,44 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
                     ),
                 }
             }
+            // `OPT_SET_INT('W', "function-context", …)`, which sets
+            // `XDL_EMIT_FUNCCONTEXT` on the blob diffs.
+            "-W" | "--function-context" => o.function_context = true,
+            "--no-function-context" => o.function_context = false,
+            // `OPT_CALLBACK(0, "interdiff", &idiff_prev, …, parse_opt_object_name)`:
+            // every occurrence appends to an oid array and `--no-interdiff` clears
+            // it; only the last entry is used. The name is resolved here, as the
+            // callback does, so a name that resolves to nothing is a parse-time
+            // error ahead of the walk.
+            "--interdiff" => {
+                i += 1;
+                let v = value_at(args, i, a)?;
+                if let Err(code) = push_interdiff(repo, &mut o, &v) {
+                    return Ok(Parsed::Exit(code));
+                }
+            }
+            s if s.starts_with("--interdiff=") => {
+                let v = s["--interdiff=".len()..].to_owned();
+                if let Err(code) = push_interdiff(repo, &mut o, &v) {
+                    return Ok(Parsed::Exit(code));
+                }
+            }
+            "--no-interdiff" => o.interdiff.clear(),
+            // `OPT_INTEGER(0, "creation-factor", &creation_factor, …)`, whose
+            // value parse-options rejects in place with its two distinct
+            // messages: one for an empty value, one for a malformed one.
+            "--creation-factor" => {
+                i += 1;
+                let v = value_at(args, i, a)?;
+                set_creation_factor(&mut o, i, &v);
+            }
+            s if s.starts_with("--creation-factor=") => {
+                let v = s["--creation-factor=".len()..].to_owned();
+                set_creation_factor(&mut o, i, &v);
+            }
+            "--no-creation-factor" => o.creation_factor = None,
             // `--range-diff=<range>` / `--range-diff <range>`: the range is
-            // validated after the walk (see `validate_range_diff`); the render is
-            // not ported, so a range git accepts is still fatal there.
+            // validated after the walk (see `validate_range_diff`).
             "--range-diff" => {
                 i += 1;
                 o.range_diff = Some(value_at(args, i, a)?);
@@ -1463,8 +1756,9 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
     // `--commit-list-format` on the command line implies `--cover-letter` when
     // the caller did not decide for themselves; `format.commitListFormat` does
     // not, because git only consults it after that check.
-    if commit_list_format_given && !cover_letter_given {
+    if commit_list_format_given && !o.cover_letter_given {
         o.cover_letter = true;
+        o.cover_letter_given = true;
     }
 
     o.branch_name = find_branch_name(repo, &o);
@@ -1654,6 +1948,26 @@ fn parse_permille(p: &str) -> Option<u32> {
     rest.is_empty().then_some(permille)
 }
 
+/// Port of `parse_opt_object_name()` (parse-options-cb.c): resolve `arg` to an
+/// object name and append it. A name that resolves to nothing is parse-options'
+/// own `error()`, which leaves git with exit 129 and no usage block.
+fn push_interdiff(
+    repo: &gix::Repository,
+    o: &mut Opts,
+    arg: &str,
+) -> std::result::Result<(), ExitCode> {
+    match repo.rev_parse_single(arg) {
+        Ok(id) => {
+            o.interdiff.push(id.detach());
+            Ok(())
+        }
+        Err(_) => {
+            eprintln!("error: malformed object name '{arg}'");
+            Err(ExitCode::from(129))
+        }
+    }
+}
+
 /// Port of `diff_opt_ignore_regex()` (diff.c): `regcomp` failure is an
 /// `error()`, which makes `parse_options` exit 129 with only that one line.
 fn push_ignore_regex(o: &mut Opts, pattern: &str) -> std::result::Result<(), ExitCode> {
@@ -1686,6 +2000,41 @@ fn record_opt_error(slot: &mut Option<(usize, u8, String)>, idx: usize, code: u8
 
 /// git's `die(_("'%s': not an integer"))` for the revision-walk counts, recorded
 /// positionally (exit 128).
+/// `OPT_INTEGER`'s value handling for `--creation-factor`: an empty value and a
+/// malformed one get parse-options' two different `error()` messages, both exit
+/// 129 and both recorded so an earlier revision error still preempts them.
+fn set_creation_factor(o: &mut Opts, idx: usize, value: &str) {
+    if value.is_empty() {
+        record_opt_error(
+            &mut o.opt_error,
+            idx,
+            129,
+            "error: option `creation-factor' expects a numerical value".to_owned(),
+        );
+        return;
+    }
+    match parse_int_with_suffix(value) {
+        IntParse::Ok(n) => o.creation_factor = Some(n),
+        IntParse::Bad => record_opt_error(
+            &mut o.opt_error,
+            idx,
+            129,
+            "error: option `creation-factor' expects an integer value with an optional \
+             k/m/g suffix"
+                .to_owned(),
+        ),
+        IntParse::Range => record_opt_error(
+            &mut o.opt_error,
+            idx,
+            129,
+            format!(
+                "error: value {value} for option `creation-factor' not in range \
+                 [-2147483648,2147483647]"
+            ),
+        ),
+    }
+}
+
 fn not_an_integer(slot: &mut Option<(usize, u8, String)>, idx: usize, val: &str) {
     record_opt_error(slot, idx, 128, format!("fatal: '{val}': not an integer"));
 }
@@ -4688,16 +5037,18 @@ fn emit_rename_header(out: &mut Vec<u8>, from: &[u8], to: &[u8], opts: &Opts) {
     out.push(b'\n');
 }
 
-/// format-patch implies `--binary`, whose base85 `GIT binary patch` payload is
-/// not ported; refuse rather than emit a textual approximation. `-a`/`--text`
-/// asks for exactly that textual rendering, so it is honoured. `--no-binary` parses
-/// but does not change this: its `Binary files … differ` line comes with a
-/// `Bin <n> -> <m> bytes` stat row that this stat renderer does not produce either,
-/// so a binary file is still refused rather than half-rendered.
+/// format-patch implies `--binary`, and this renderer cannot produce that payload
+/// yet — not because the encoding is missing ([`super::binary_patch`] emits it
+/// byte-for-byte) but because this patch body never carries the two raw images the
+/// payload is built from. Refuse rather than emit a textual approximation.
+/// `-a`/`--text` asks for exactly that textual rendering, so it is honoured.
+/// `--no-binary` parses but does not change this: its `Binary files … differ` line
+/// comes with a `Bin <n> -> <m> bytes` stat row that this stat renderer does not
+/// produce either, so a binary file is still refused rather than half-rendered.
 fn reject_binary(is_submodule: bool, content: &[u8], path: &[u8], opts: &Opts) -> Result<()> {
     if !opts.text && !is_submodule && content.iter().take(8000).any(|&b| b == 0) {
         bail!(
-            "binary file {:?}: the GIT binary patch encoding is not ported",
+            "binary file {:?}: the GIT binary patch body is not wired up here",
             path.as_bstr()
         );
     }
@@ -4775,7 +5126,10 @@ fn emit_text_hunks(
     let diff = diff_with_slider_heuristics(opts.algorithm, &input);
     let before_lines: Vec<&[u8]> = input.before.iter().map(|&t| input.interner[t]).collect();
 
-    if !opts.ignore_regex.is_empty() {
+    // gix's `UnifiedDiff` emits xdiff's default hunk shape only; both `-I` and
+    // `-W` change which change groups share a hunk and how far its context
+    // reaches, so they go through the hand-rolled `xdl_emit_diff()` port.
+    if !opts.ignore_regex.is_empty() || opts.function_context {
         let after_lines: Vec<&[u8]> = input.after.iter().map(|&t| input.interner[t]).collect();
         return emit_hunks_with_ignorable(out, &diff, &before_lines, &after_lines, opts);
     }
@@ -4851,24 +5205,114 @@ fn emit_hunks_with_ignorable(
         deleted: 0,
     };
 
+    let func_context = opts.function_context;
     let mut idx = 0usize;
     while idx < changes.len() {
+        // `xchp` in xdiff: the first change of the group *before* `xdl_get_hunk`
+        // skipped any leading ignorable ones. Growing the leading context back
+        // over one of those brings it into the hunk after all.
+        let xchp = idx;
         let mut start = idx;
         let Some(last) = get_hunk(&changes, &mut start, ctx) else {
             break;
         };
-        let (first, last) = (start, last);
+        let (mut first, mut last) = (start, last);
+
+        // `pre_context_calculation`, re-entered whenever the widened context
+        // swallowed a change that had been left out.
+        let (mut s1, mut s2);
+        loop {
+            let f = &changes[first];
+            s1 = (i64::from(f.i1) - ctx).max(0);
+            s2 = (i64::from(f.i2) - ctx).max(0);
+            if !func_context {
+                break;
+            }
+            let mut i1 = i64::from(f.i1);
+            // An appended chunk has nothing above it in the pre-image; if the
+            // whole function came with it, no extra context is needed at all.
+            let mut appended_whole_function = false;
+            if i1 >= nrec1 {
+                let mut i2 = i64::from(f.i2);
+                while i2 < nrec2 {
+                    if is_func_line(after_lines[i2 as usize]) {
+                        appended_whole_function = true;
+                        break;
+                    }
+                    i2 += 1;
+                }
+                i1 = nrec1 - 1;
+            }
+            if appended_whole_function {
+                break;
+            }
+            let mut fs1 = get_func_line(before_lines, i1, -1);
+            while fs1 > 0
+                && !is_empty_line(before_lines[(fs1 - 1) as usize])
+                && !is_func_line(before_lines[(fs1 - 1) as usize])
+            {
+                fs1 -= 1;
+            }
+            if fs1 < 0 {
+                fs1 = 0;
+            }
+            if fs1 >= s1 {
+                break;
+            }
+            s2 = (s2 - (s1 - fs1)).max(0);
+            s1 = fs1;
+            // Did the widened context reach back over a skipped change?
+            let mut back = xchp;
+            while back != first
+                && i64::from(changes[back].i1 + changes[back].chg1) <= s1
+                && i64::from(changes[back].i2 + changes[back].chg2) <= s2
+            {
+                back += 1;
+            }
+            if back == first {
+                break;
+            }
+            first = back;
+        }
+
+        // `post_context_calculation`, re-entered whenever the trailing context
+        // ran into the next change.
+        let (mut e1, mut e2);
+        loop {
+            let e = &changes[last];
+            // Trailing context stops at whichever file runs out first.
+            let lctx = ctx
+                .min(nrec1 - i64::from(e.i1 + e.chg1))
+                .min(nrec2 - i64::from(e.i2 + e.chg2));
+            e1 = i64::from(e.i1 + e.chg1) + lctx;
+            e2 = i64::from(e.i2 + e.chg2) + lctx;
+            if !func_context {
+                break;
+            }
+            let mut fe1 = get_func_line(before_lines, i64::from(e.i1 + e.chg1), nrec1);
+            while fe1 > 0 && is_empty_line(before_lines[(fe1 - 1) as usize]) {
+                fe1 -= 1;
+            }
+            if fe1 < 0 {
+                fe1 = nrec1;
+            }
+            if fe1 > e1 {
+                e2 = (e2 + (fe1 - e1)).min(nrec2);
+                e1 = fe1;
+            }
+            // Overlap with the next change? Then take it in and start over.
+            let Some(next) = changes.get(last + 1) else {
+                break;
+            };
+            let l = i64::from(next.i1).min(nrec1 - 1);
+            if l - ctx <= e1 || get_func_line(before_lines, l, e1) < 0 {
+                last += 1;
+                continue;
+            }
+            break;
+        }
+
         let (f, e) = (&changes[first], &changes[last]);
-
-        let s1 = (i64::from(f.i1) - ctx).max(0);
-        let s2 = (i64::from(f.i2) - ctx).max(0);
-        // Trailing context stops at whichever file runs out first.
-        let lctx = ctx
-            .min(nrec1 - i64::from(e.i1 + e.chg1))
-            .min(nrec2 - i64::from(e.i2 + e.chg2));
-        let e1 = i64::from(e.i1 + e.chg1) + lctx;
-        let e2 = i64::from(e.i2 + e.chg2) + lctx;
-
         let mut lines: Vec<(DiffLineKind, &[u8])> = Vec::new();
         // Leading context, taken from the post-image as xdiff does.
         for l in s2..i64::from(f.i2) {
@@ -4907,6 +5351,37 @@ fn emit_hunks_with_ignorable(
     }
 
     Ok(writer.finish())
+}
+
+/// Port of `def_ff()` (xdiff/xemit.c), the funcname heuristic git uses when no
+/// `xfuncname` driver applies: a line whose first byte starts an identifier.
+fn is_func_line(line: &[u8]) -> bool {
+    matches!(line.first(), Some(&c) if c.is_ascii_alphabetic() || c == b'_' || c == b'$')
+}
+
+/// Port of `is_empty_rec()` (xdiff/xemit.c): a record of nothing but whitespace.
+/// Records carry their newline, so a blank line is empty by this test.
+fn is_empty_line(line: &[u8]) -> bool {
+    line.iter()
+        .all(|&c| matches!(c, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r'))
+}
+
+/// Port of `get_func_line()` (xdiff/xemit.c): scan the *pre-image* from `start`
+/// toward `limit` (exclusive) for the first line [`is_func_line`] accepts, or
+/// `-1` when there is none. The direction follows the sign of `limit - start`,
+/// which is how the same routine finds both the function a hunk sits inside and
+/// the one that starts after it.
+fn get_func_line(lines: &[&[u8]], start: i64, limit: i64) -> i64 {
+    let step: i64 = if start > limit { -1 } else { 1 };
+    let n = lines.len() as i64;
+    let mut l = start;
+    while l != limit && l >= 0 && l < n {
+        if is_func_line(lines[l as usize]) {
+            return l;
+        }
+        l += step;
+    }
+    -1
 }
 
 /// Port of `xdl_get_hunk()` (xdiff/xemit.c) with `interhunkctxlen` zero.
@@ -5749,5 +6224,86 @@ mod tests {
             stats(&files, sw),
             " x | 4 +++-\n 1 file changed, 3 insertions(+), 1 deletion(-)\n"
         );
+    }
+
+    /// xdiff records keep their newline, so `is_empty_rec()` must call a bare
+    /// `"\n"` empty; and `def_ff()` accepts only a line whose *first* byte starts
+    /// an identifier, which is what keeps an indented statement from being
+    /// mistaken for a function header.
+    #[test]
+    fn funcname_and_empty_record_tests() {
+        assert!(is_func_line(b"int one(void)\n"));
+        assert!(is_func_line(b"_start:\n"));
+        assert!(is_func_line(b"$var = 1\n"));
+        assert!(!is_func_line(b"\tint a = 1;\n"));
+        assert!(!is_func_line(b"}\n"));
+        assert!(!is_func_line(b"\n"));
+        assert!(!is_func_line(b""));
+
+        assert!(is_empty_line(b"\n"));
+        assert!(is_empty_line(b"   \t\n"));
+        assert!(is_empty_line(b"\x0b\x0c"));
+        assert!(!is_empty_line(b"}\n"));
+    }
+
+    /// `get_func_line()` takes its direction from the sign of `limit - start`,
+    /// which is the whole reason one routine serves both the search for the
+    /// function a hunk sits inside and the search for the next one down.
+    #[test]
+    fn get_func_line_scans_both_ways() {
+        let lines: Vec<&[u8]> = vec![
+            b"one(void)\n", // 0
+            b"{\n",         // 1
+            b"\tstmt;\n",   // 2
+            b"}\n",         // 3
+            b"\n",          // 4
+            b"two(void)\n", // 5
+            b"{\n",         // 6
+            b"\tstmt;\n",   // 7
+            b"}\n",         // 8
+        ];
+        // Backwards from inside `two` finds its header; the limit is exclusive.
+        assert_eq!(get_func_line(&lines, 7, -1), 5);
+        assert_eq!(get_func_line(&lines, 4, -1), 0);
+        assert_eq!(get_func_line(&lines, 4, 1), -1);
+        // Forwards from the end of `one`'s body finds the next header.
+        assert_eq!(get_func_line(&lines, 3, lines.len() as i64), 5);
+        // Nothing below the last header.
+        assert_eq!(get_func_line(&lines, 6, lines.len() as i64), -1);
+    }
+
+    /// `diff_title()`: only a reroll count that parses as an integer >= 1 selects
+    /// the "against v<n-1>" spelling, and the version named is the *previous*
+    /// one. Captured from stock git 2.55.0, where `-v2 --interdiff=…` prints
+    /// `Interdiff against v1:`.
+    #[test]
+    fn diff_title_follows_reroll_count() {
+        let with = |reroll: Option<&str>| diff_title(reroll, "Interdiff:", "Interdiff against v");
+        assert_eq!(with(None), "Interdiff:");
+        assert_eq!(with(Some("2")), "Interdiff against v1:");
+        assert_eq!(with(Some("1")), "Interdiff against v0:");
+        // v0 (an RFC reroll) and a non-numeric count both fall back to the
+        // generic title rather than naming a negative version.
+        assert_eq!(with(Some("0")), "Interdiff:");
+        assert_eq!(with(Some("rfc")), "Interdiff:");
+    }
+
+    /// git's `output_prefix` is written at the head of every emitted line, so the
+    /// indent must reach a body's last line even when it has no trailing newline,
+    /// and must not append one that git would not print.
+    #[test]
+    fn indent_prefixes_every_line() {
+        let mut out = Vec::new();
+        write_indented(&mut out, b"a\n\nb\n", 2);
+        assert_eq!(out, b"  a\n  \n  b\n");
+
+        let mut out = Vec::new();
+        write_indented(&mut out, b"tail", 2);
+        assert_eq!(out, b"  tail");
+
+        // The cover letter renders the same patch flush left.
+        let mut out = Vec::new();
+        write_indented(&mut out, b"a\nb\n", 0);
+        assert_eq!(out, b"a\nb\n");
     }
 }

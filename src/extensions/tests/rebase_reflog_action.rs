@@ -7,8 +7,8 @@
 //! drops reflog lines for symbolic-target updates, so that entry has to be
 //! written explicitly.
 //!
-//! Also here, because it shares the fixture: `--rebase-merges` refuses a range
-//! that contains a merge rather than flattening it.
+//! Also here, because it shares the fixture: `--rebase-merges` recreates a
+//! merge in the replayed range rather than flattening it.
 #![cfg(unix)]
 
 use std::path::PathBuf;
@@ -134,14 +134,17 @@ fn git_reflog_action_replaces_the_prefix() {
     );
 }
 
-/// `--rebase-merges` over a range that contains a merge is refused by name.
-/// Recreating the topology needs the `label`/`reset`/`merge` instructions
-/// `make_script_with_merges()` writes; replaying the merge as a pick would
-/// flatten exactly the history the flag exists to keep.
+/// `--rebase-merges` recreates the merge rather than flattening it: the rebased
+/// tip is still a two-parent commit, its second parent still carries `side`'s
+/// work, and the whole thing now sits on `main`.
+///
+/// This is what `make_script_with_merges()`'s `label`/`reset`/`merge`
+/// instructions buy — a plain rebase of the same range replays only the
+/// non-merge commits and leaves a linear branch.
 #[test]
-fn rebase_merges_over_a_merge_is_refused_not_flattened() {
+fn rebase_merges_recreates_the_merge_instead_of_flattening_it() {
     let f = Fixture::new("rebase-merges");
-    // topic: t1, then a real merge of `side`, then t2.
+    // topic: topicwork, then a real merge of `side`.
     f.git(&["checkout", "-q", "-b", "side"]);
     std::fs::write(f.work.join("s.txt"), "s\n").unwrap();
     f.git(&["add", "s.txt"]);
@@ -151,13 +154,25 @@ fn rebase_merges_over_a_merge_is_refused_not_flattened() {
     let before = f.run(&["rev-parse", "HEAD"]).1;
 
     let (ok, out, err) = f.run(&["rebase", "--rebase-merges", "main"]);
-    assert!(!ok, "the rebase should have been refused: {out}{err}");
-    assert!(
-        err.contains("--rebase-merges over a merge commit")
-            && err.contains("make_script_with_merges"),
-        "stderr: {err}"
+    assert!(ok, "rebase failed: {out}{err}");
+
+    // The tip moved (it was replayed onto `main`) and is still a merge.
+    let after = f.run(&["rev-parse", "HEAD"]).1;
+    assert_ne!(after, before, "the branch should have been replayed onto main");
+    let parents = f.run(&["rev-list", "--parents", "-n1", "HEAD"]).1;
+    assert_eq!(
+        parents.split_whitespace().count(),
+        3,
+        "the rebased tip must still be a two-parent merge: {parents}"
     );
-    assert_eq!(f.run(&["rev-parse", "HEAD"]).1, before, "the branch must not have moved");
+    // `mainwork` is now an ancestor, and both sides of the merge survived.
+    for spec in ["HEAD^{/mainwork}", "HEAD^{/swork}", "HEAD^{/topicwork}"] {
+        let (ok, _, err) = f.run(&["rev-parse", "--verify", spec]);
+        assert!(ok, "{spec} is missing after the rebase: {err}");
+    }
+    // `refs/rewritten/*` is scratch state and must not outlive the rebase.
+    let (_, refs, _) = f.run(&["for-each-ref", "--format=%(refname)", "refs/rewritten/"]);
+    assert!(refs.trim().is_empty(), "rewritten refs left behind: {refs}");
     assert!(!f.work.join(".git/rebase-merge").exists(), "no rebase state may be left behind");
 
     // A linear range still replays, with the merge backend selected.

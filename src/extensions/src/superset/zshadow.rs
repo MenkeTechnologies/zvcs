@@ -3,9 +3,11 @@
 //!
 //! One command for what was three: a `git` symlink to this binary in `<dir>`
 //! (default `$ZVCS_HOME/bin`), the `git-<verb>` dashed links beside it, every
-//! superset man page under `~/.zvcs/man`, and the forked zsh `_git` under
-//! `~/.zvcs/completions`. The completion is compiled into the binary, so the
-//! install needs nothing from the source tree.
+//! superset man page under `~/.zvcs/man`, the HTML documentation set under
+//! `~/.zvcs/share/doc/git-doc` (where `git --html-path` points and `git help -w`
+//! looks), and the forked zsh `_git` under `~/.zvcs/completions`. Everything
+//! installed is compiled into the binary, so the install needs nothing from the
+//! source tree.
 //!
 //! stdout carries only shell code, so `eval "$(git zshadow)"` sets the current
 //! shell up and the same three lines paste into an rc file; the install summary
@@ -19,7 +21,7 @@ use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use crate::superset::{dashed, doctor, manpage, zdaemon};
+use crate::superset::{dashed, doctor, htmldoc, manpage, zdaemon};
 
 /// The zsh completion shipped in the tree (`completions/_git`): the stock `_git`
 /// forked with the `z*` verbs. Embedded so the installed shadow is self-contained.
@@ -62,16 +64,18 @@ fn install(bin: &Path, comp: &Path) -> Result<()> {
     dashed::link_to(&bin.join("git"), &me, &mut shim)?;
     let links = dashed::install_links(bin, &dashed::link_target(bin)?)?;
     let pages = manpage::install_all().unwrap_or(0);
+    let html = htmldoc::install_all().unwrap_or(0);
     let completion = install_completion(comp)?;
 
     eprintln!(
-        "zshadow: {} ({}, {} dashed link(s) new / {} current / {} skipped); {pages} man page(s) in {}; {completion} in {}",
+        "zshadow: {} ({}, {} dashed link(s) new / {} current / {} skipped); {pages} man page(s) in {}; {html} HTML page(s) in {}; {completion} in {}",
         bin.join("git").display(),
         if shim.created > 0 { "shim linked" } else if shim.skipped > 0 { "shim left alone: real file" } else { "shim current" },
         links.created,
         links.current,
         links.skipped,
         manpage::man_dir().join("man1").display(),
+        htmldoc::html_dir().display(),
         comp.display(),
     );
     Ok(())

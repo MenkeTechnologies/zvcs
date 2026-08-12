@@ -132,18 +132,15 @@
 //! * Tree-object pairs (`040000` on either side) are rejected with `tree objects not
 //!   supported`, exit 128 — this matches stock git's `builtin/diff-pairs.c`, which dies
 //!   with the same message rather than recursing.
-//! * `--binary`: the `GIT binary patch` payload is a base85-armoured *deflate*
-//!   stream, and parity means byte-identical output. This bails today, but the
-//!   blocker named here for a long time — "no deflate in this tree matches the zlib
-//!   git links against" — is **no longer true**, and the measurement that
-//!   established it was of the wrong coder. `gix-zlib` (zlib-rs) does not match:
-//!   writing one 1184922-byte blob with `hash-object --no-filters -w` gives 128323
-//!   bytes here against stock's 93551, which is C zlib's level-1 output exactly.
-//!   But `archive.rs`'s `gzip` module is a port of zlib's own `deflate.c` +
-//!   `trees.c`, and it *does* match: `git archive --format=tgz -1/-6/-9` over a
-//!   ~1 MB payload is byte-identical to stock git 2.50.1 at every level. Wiring
-//!   that coder up with a zlib wrapper (rather than gzip's) is what `--binary`
-//!   needs; the base85 armour and the `literal <size>` framing are the rest.
+//! * `--binary`: the `GIT binary patch` payload itself is no longer the obstacle.
+//!   [`super::binary_patch`] emits it byte-for-byte — [`gix::zlib::deflate`] is a
+//!   transcription of zlib's `deflate.c`/`trees.c`, so the base85-armoured deflate
+//!   stream matches stock git, as `git diff --binary` and `git diff-index --binary`
+//!   already demonstrate. What is missing here is the wiring, and this renderer has
+//!   two interactions the other two do not: `--line-prefix` has to reach every
+//!   payload line the way `emit_diff_symbol()` prefixes `DIFF_SYMBOL_BINARY_DIFF_BODY`,
+//!   and a pair rewritten by `--textconv` or forced textual by `-a` must keep
+//!   rendering as text. Until both are covered this bails rather than guessing.
 //! * `--anchored=<text>`: git's own documentation states it "uses the "patience diff"
 //!   algorithm internally", and the vendored `gix-imara-diff` ships only `myers.rs` and
 //!   `histogram.rs`. Same floor as `--patience` below.
@@ -339,6 +336,143 @@ enum Whitespace {
     IgnoreCrAtEol,
 }
 
+/// Every long option `git diff-pairs` accepts — its own `-z` plus everything
+/// `add_diff_options()` contributes. `parse_options()` resolves an argument against
+/// this table before anything else happens, so a name missing from it is
+/// `error: unknown option` and 129, not a gap in this port. Transcribed from
+/// `git diff-pairs -h` (git 2.55.0), including the negations `parse_options()`
+/// generates but the usage table leaves implicit.
+const KNOWN_LONG: &[&str] = &[
+    "--abbrev",
+    "--anchored",
+    "--binary",
+    "--break-rewrites",
+    "--check",
+    "--color",
+    "--color-moved",
+    "--color-moved-ws",
+    "--color-words",
+    "--compact-summary",
+    "--cumulative",
+    "--default-prefix",
+    "--diff-algorithm",
+    "--diff-filter",
+    "--dirstat",
+    "--dirstat-by-file",
+    "--dst-prefix",
+    "--exit-code",
+    "--ext-diff",
+    "--find-copies",
+    "--find-copies-harder",
+    "--find-object",
+    "--find-renames",
+    "--follow",
+    "--full-index",
+    "--function-context",
+    "--histogram",
+    "--ignore-all-space",
+    "--ignore-blank-lines",
+    "--ignore-cr-at-eol",
+    "--ignore-matching-lines",
+    "--ignore-space-at-eol",
+    "--ignore-space-change",
+    "--ignore-submodules",
+    "--indent-heuristic",
+    "--inter-hunk-context",
+    "--irreversible-delete",
+    "--ita-invisible-in-index",
+    "--ita-visible-in-index",
+    "--line-prefix",
+    "--max-depth",
+    "--minimal",
+    "--name-only",
+    "--name-status",
+    "--no-abbrev",
+    "--no-color",
+    "--no-color-moved",
+    "--no-color-moved-ws",
+    "--no-compact-summary",
+    "--no-exit-code",
+    "--no-ext-diff",
+    "--no-find-copies",
+    "--no-find-copies-harder",
+    "--no-follow",
+    "--no-full-index",
+    "--no-function-context",
+    "--no-ignore-matching-lines",
+    "--no-indent-heuristic",
+    "--no-patch",
+    "--no-prefix",
+    "--no-quiet",
+    "--no-relative",
+    "--no-rename-empty",
+    "--no-renames",
+    "--no-text",
+    "--no-textconv",
+    "--numstat",
+    "--output",
+    "--output-indicator-context",
+    "--output-indicator-new",
+    "--output-indicator-old",
+    "--patch",
+    "--patch-with-raw",
+    "--patch-with-stat",
+    "--patience",
+    "--pickaxe-all",
+    "--pickaxe-regex",
+    "--quiet",
+    "--raw",
+    "--relative",
+    "--rename-empty",
+    "--rotate-to",
+    "--shortstat",
+    "--skip-to",
+    "--src-prefix",
+    "--stat",
+    "--stat-count",
+    "--stat-graph-width",
+    "--stat-name-width",
+    "--stat-width",
+    "--submodule",
+    "--summary",
+    "--text",
+    "--textconv",
+    "--unified",
+    "--word-diff",
+    "--word-diff-regex",
+    "--ws-error-highlight",
+];
+
+/// Every short option the same table accepts.
+const KNOWN_SHORT: &[u8] = b"abhlpsuwzBCDGIMORSUWX";
+
+/// Whether `parse_options()` would resolve `arg` against the diff-pairs option table.
+///
+/// A long option is looked up without its `=<value>`; a short option carries its value
+/// attached, so only the letter is looked up.
+fn is_known_option(arg: &str) -> bool {
+    match arg.starts_with("--") {
+        true => {
+            let name = arg.split_once('=').map_or(arg, |(n, _)| n);
+            KNOWN_LONG.contains(&name)
+        }
+        false => arg.as_bytes().get(1).is_some_and(|c| KNOWN_SHORT.contains(c)),
+    }
+}
+
+/// git's unknown-option convention: the complaint, then the usage block, exit 129.
+///
+/// A long option is quoted in full including any `=<value>`; a short one by its letter
+/// alone, the rest of the argument being that option's value.
+fn unknown_option(arg: &str) -> ExitCode {
+    match arg.strip_prefix("--") {
+        Some(rest) => eprintln!("error: unknown option `{rest}'"),
+        None => eprintln!("error: unknown switch `{}'", &arg[1..2]),
+    }
+    eprint!("{USAGE}");
+    ExitCode::from(129)
+}
+
 /// The `--relative[=<p>]` / `--no-relative` selection.
 enum Relative {
     /// git's default: paths stay repository-root relative.
@@ -360,14 +494,14 @@ enum Anchor {
 /// A search pattern: a literal substring (git's kwset path for a plain `-S`) or a
 /// compiled regular expression (git's `-G` and `-S --pickaxe-regex`, which call
 /// `regcomp` with `REG_EXTENDED | REG_NEWLINE`).
-enum Needle {
+pub(crate) enum Needle {
     Literal(Vec<u8>),
     Regex(Regex),
 }
 
 impl Needle {
     /// Whether `hay` contains a match — used by `-G` on each changed line.
-    fn is_match(&self, hay: &[u8]) -> bool {
+    pub(crate) fn is_match(&self, hay: &[u8]) -> bool {
         match self {
             Needle::Literal(n) => count_occurrences(hay, n) > 0,
             Needle::Regex(re) => re.is_match(hay),
@@ -375,7 +509,7 @@ impl Needle {
     }
 
     /// Non-overlapping match count — used by `-S` to compare the two sides.
-    fn count(&self, hay: &[u8]) -> usize {
+    pub(crate) fn count(&self, hay: &[u8]) -> usize {
         match self {
             Needle::Literal(n) => count_occurrences(hay, n),
             Needle::Regex(re) => re.find_iter(hay).count(),
@@ -386,7 +520,7 @@ impl Needle {
 /// Compile a `-G`/`-I`/`-S --pickaxe-regex` pattern the way git's `regcomp` does: on
 /// bytes, without Unicode mode so the byte semantics carry git's C locale, and with
 /// multi-line mode standing in for `REG_NEWLINE`.
-fn compile_regex(pat: &[u8]) -> std::result::Result<Regex, String> {
+pub(crate) fn compile_regex(pat: &[u8]) -> std::result::Result<Regex, String> {
     let s = std::str::from_utf8(pat).map_err(|_| "invalid byte sequence in pattern".to_owned())?;
     regex::bytes::RegexBuilder::new(s)
         .unicode(false)
@@ -426,16 +560,16 @@ fn count_occurrences(hay: &[u8], needle: &[u8]) -> usize {
 
 /// `-S<string>` counts occurrences; `-G<pattern>` looks at the changed lines;
 /// `--find-object=<id>` keeps a pair that touches one of the named object ids.
-enum PickaxeKind {
+pub(crate) enum PickaxeKind {
     Occurrences(Needle),
     Grep(Needle),
     ObjFind(Vec<ObjectId>),
 }
 
-struct Pickaxe {
-    kind: PickaxeKind,
+pub(crate) struct Pickaxe {
+    pub(crate) kind: PickaxeKind,
     /// `--pickaxe-all`: keep every pair when any one of them matches.
-    all: bool,
+    pub(crate) all: bool,
 }
 
 /// `--diff-filter=<letters>`.
@@ -1059,19 +1193,14 @@ pub(crate) fn render_raw_stream(
             // -a / --text: force a textual diff for content git would flag as binary.
             "-a" | "--text" => opts.text = true,
             "--no-text" => opts.text = false,
-            // Diff-algorithm selection. imara-diff has no `patience` variant, so
-            // `--patience`/`--diff-algorithm=patience` bail rather than silently
-            // substituting Myers, exactly like the sibling `git diff` port.
+            // Diff-algorithm selection; the last flag on the command line wins.
             "--minimal" => opts.algo = Some(gix::diff::blob::Algorithm::MyersMinimal),
             "--histogram" => opts.algo = Some(gix::diff::blob::Algorithm::Histogram),
-            "--patience" => crate::git_fatal!("diff algorithm {:?} is not available", "patience"),
+            "--patience" => opts.algo = Some(gix::diff::blob::Algorithm::Patience),
             "--diff-algorithm" => {
                 let v = want_value!(s.len());
                 match classify_algo(&v) {
                     AlgoChoice::Use(a) => opts.algo = Some(a),
-                    AlgoChoice::Patience => {
-                        crate::git_fatal!("diff algorithm {:?} is not available", "patience")
-                    }
                     AlgoChoice::Unknown => {
                         eprintln!(
                             "error: option diff-algorithm accepts \"myers\", \"minimal\", \
@@ -1084,9 +1213,6 @@ pub(crate) fn render_raw_stream(
             _ if s.starts_with("--diff-algorithm=") => {
                 match classify_algo(&s["--diff-algorithm=".len()..]) {
                     AlgoChoice::Use(a) => opts.algo = Some(a),
-                    AlgoChoice::Patience => {
-                        crate::git_fatal!("diff algorithm {:?} is not available", "patience")
-                    }
                     AlgoChoice::Unknown => {
                         eprintln!(
                             "error: option diff-algorithm accepts \"myers\", \"minimal\", \
@@ -1384,6 +1510,9 @@ pub(crate) fn render_raw_stream(
                     }
                 }
             }
+            // A name `parse_options()` has never heard of is rejected there, before any
+            // of this command's own work begins — it is git's error, not a gap here.
+            _ if !is_known_option(&s) => return Ok(unknown_option(&s)),
             _ => bail!(
                 "unsupported flag {s:?} (ported: -z, -p/-u/--patch, -s/--no-patch, --raw, \
                  --name-only, --name-status, --numstat, --stat[=<w>], --shortstat, --summary, \
@@ -1798,8 +1927,6 @@ fn set_indicator(slot: &mut u8, val: &str, name: &str) -> std::result::Result<()
 /// The outcome of resolving a `--diff-algorithm=<name>` value.
 enum AlgoChoice {
     Use(gix::diff::blob::Algorithm),
-    /// git-valid, but imara-diff has no patience variant.
-    Patience,
     Unknown,
 }
 
@@ -1807,12 +1934,12 @@ enum AlgoChoice {
 /// case-insensitive `parse_algorithm` (which accepts `myers`/`default`, `minimal`,
 /// `histogram` and `patience`).
 fn classify_algo(name: &str) -> AlgoChoice {
-    use gix::diff::blob::Algorithm::{Histogram, Myers, MyersMinimal};
+    use gix::diff::blob::Algorithm::{Histogram, Myers, MyersMinimal, Patience};
     match name.to_ascii_lowercase().as_str() {
         "myers" | "default" => AlgoChoice::Use(Myers),
         "minimal" => AlgoChoice::Use(MyersMinimal),
         "histogram" => AlgoChoice::Use(Histogram),
-        "patience" => AlgoChoice::Patience,
+        "patience" => AlgoChoice::Use(Patience),
         _ => AlgoChoice::Unknown,
     }
 }

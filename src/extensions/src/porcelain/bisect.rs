@@ -22,7 +22,9 @@
 //!   * `git bisect next` — force a step, including git's `warning: bisecting only
 //!     with a <bad> commit` path and the "need at least one bad|good" error.
 //!   * `git bisect replay <logfile>` — re-drive a session from a saved log.
-//!   * `git bisect help` — the usage block on stderr, exit 129.
+//!   * `git bisect help` — the usage block on stderr, exit 129; `-h` prints the
+//!     same block on stdout, because `parse_options` answers it before
+//!     `usage_with_options` is ever reached.
 //!
 //! A good revision that is not an ancestor of the bad one now goes through git's
 //! merge-base machinery: the merge base is checked out with `Bisecting: a merge
@@ -44,11 +46,28 @@
 //! reproduced — the list is walked oldest first, and a commit seeded with weight 1
 //! because it has no interesting parent is never offered to the halfway shortcut.
 //!
+//! `--first-parent` is honoured on every later step, not just recorded:
+//! `BISECT_FIRST_PARENT` sets `revs.first_parent_only` for the candidate walk and
+//! stops the weight propagation after the first parent, which is git's
+//! `FIND_BISECTION_FIRST_PARENT_ONLY`. A first bad commit that is a merge is
+//! reported the way `show_diff_tree()` does it — a `Merge:` header of abbreviated
+//! parents, then `--stat`/`--summary` against the first parent alone, which is
+//! what `--cc` falls back to for those formats.
+//!
+//! Custom terms name their own references: `bisect_write` stores the bad side at
+//! `refs/bisect/<term-bad>` and each good side at `refs/bisect/<term-good>-<oid>`,
+//! and `register_ref` reads them back by the same names, so a session started
+//! with `--term-new=broken` is interchangeable with stock git's.
+//!
 //! Honest limitations — each bails with a precise message rather than guessing:
-//!   * `skip` and `run`: git chooses a skip replacement through its weighted
-//!     `find_bisection`/`skip_away` PRNG, whose exact commit sequence is not
-//!     reproduced; `run` depends on that for exit code 125.
-//!   * `visualize`/`view`: shells out to gitk / `git log`.
+//!   * `skip` and `run`: gated on git's `bisect_autostart` / `bisect_next_check`
+//!     first, so an unstarted or half-marked session answers exactly as stock
+//!     does. Past that gate they bail: git chooses a skip replacement through its
+//!     weighted `find_bisection`/`skip_away` PRNG, whose exact commit sequence is
+//!     not reproduced, and `run` depends on that for exit code 125.
+//!   * `visualize`/`view`: `bisect_next_check(terms, NULL)` is reproduced (a
+//!     silent exit 1 when either side is unmarked); a live session bails, because
+//!     the command shells out to gitk / `git log`.
 //!   * Pathspec limiting is parsed and recorded in `BISECT_NAMES`, but it does
 //!     not constrain candidate selection, so a `--`-limited bisection with
 //!     revisions would pick a different midpoint; only the empty-pathspec case
@@ -106,23 +125,19 @@ pub fn bisect(args: &[String]) -> Result<ExitCode> {
         "reset" => reset_cmd(rest),
         "replay" => replay_cmd(rest),
         "next" => next_cmd(),
-        "help" | "-h" => {
-            // git prints the usage block on stderr and exits 129.
+        // `parse_options` answers `-h` on stdout, `usage_with_options` (which is
+        // what the `help` word reaches) on stderr. Both exit 129.
+        "-h" => {
+            print!("{USAGE}");
+            Ok(ExitCode::from(129))
+        }
+        "help" => {
             eprint!("{USAGE}");
             Ok(ExitCode::from(129))
         }
-        "skip" => bail!(
-            "`bisect skip` is not supported: git picks a replacement commit from the remaining \
-             candidates via its weighted `find_bisection`/`skip_away` PRNG, whose byte-identical \
-             sequence this port does not reproduce"
-        ),
-        "run" => bail!(
-            "`bisect run` is not supported: it drives an external command per step and relies on \
-             `bisect skip` for exit code 125, which is not reproduced here"
-        ),
-        "visualize" | "view" => {
-            bail!("`bisect visualize` is not supported (it shells out to gitk/git log)")
-        }
+        "skip" => skip_cmd(rest),
+        "run" => run_cmd(rest),
+        "visualize" | "view" => visualize_cmd(rest),
         // Anything else is a marking word — `bad`/`good`, `new`/`old`, or a
         // custom term a stock-git session recorded — or a genuine typo.
         other => {
@@ -164,21 +179,29 @@ impl Ctx {
         self.git_dir.join("refs").join("bisect")
     }
 
+    /// git's `file_is_not_empty(git_path_bisect_start())`.
     fn in_progress(&self) -> bool {
-        self.file("BISECT_START").exists()
+        std::fs::metadata(self.file("BISECT_START")).is_ok_and(|m| m.len() > 0)
     }
 
     /// The bad-side tip, if one has been marked.
-    fn bad(&self) -> Result<Option<ObjectId>> {
-        read_ref(&self.refs_dir().join("bad"))
+    ///
+    /// git's `register_ref` compares the trimmed ref name against `term_bad`
+    /// itself, so a session opened with `--term-new=broken` keeps its tip in
+    /// `refs/bisect/broken`, not `refs/bisect/bad`.
+    fn bad(&self, terms: &Terms) -> Result<Option<ObjectId>> {
+        read_ref(&self.refs_dir().join(&terms.bad))
     }
 
     /// Every marked good-side commit, sorted for deterministic iteration.
-    fn goods(&self) -> Result<Vec<ObjectId>> {
+    /// The refs are named `<term-good>-<oid>`, per `register_ref`'s
+    /// `good_prefix`.
+    fn goods(&self, terms: &Terms) -> Result<Vec<ObjectId>> {
         let dir = self.refs_dir();
         let Ok(entries) = std::fs::read_dir(&dir) else {
             return Ok(Vec::new());
         };
+        let prefix = format!("{}-", terms.good);
         let mut out = Vec::new();
         for entry in entries {
             let entry = entry?;
@@ -186,7 +209,7 @@ impl Ctx {
             let Some(name) = file_name.to_str() else {
                 continue;
             };
-            if !name.starts_with("good-") {
+            if !name.starts_with(&prefix) {
                 continue;
             }
             if let Some(id) = read_ref(&entry.path())? {
@@ -195,6 +218,12 @@ impl Ctx {
         }
         out.sort();
         Ok(out)
+    }
+
+    /// `git bisect start --first-parent` records this marker, and every later
+    /// step reads it back (`bisect.c:1065`).
+    fn first_parent_only(&self) -> bool {
+        self.file("BISECT_FIRST_PARENT").exists()
     }
 
     fn append_log(&self, line: &str) -> Result<()> {
@@ -235,6 +264,20 @@ fn write_ref(path: &Path, id: ObjectId) -> Result<()> {
 struct Terms {
     bad: String,
     good: String,
+}
+
+/// git's `set_terms(&terms, "bad", "good")`, the seed every entry point uses
+/// before it tries `get_terms()`.
+fn default_terms() -> Terms {
+    Terms {
+        bad: "bad".into(),
+        good: "good".into(),
+    }
+}
+
+/// `set_terms(…, "bad", "good"); get_terms(&terms);` in one step.
+fn current_terms(ctx: &Ctx) -> Result<Terms> {
+    Ok(read_terms(ctx)?.unwrap_or_else(default_terms))
 }
 
 fn read_terms(ctx: &Ctx) -> Result<Option<Terms>> {
@@ -339,6 +382,70 @@ fn unknown_command(word: &str) -> Result<ExitCode> {
     }
     eprint!("fatal: unknown command: '{word}'\n\n{USAGE}");
     Ok(ExitCode::from(129))
+}
+
+// --- subcommands gated on an active session ----------------------------------
+
+/// git's `bisect_autostart`: with nothing started, `fprintf_ln(stderr, "You need
+/// to start by \"git bisect start\"\n")` — the format already ends in a newline
+/// and `fprintf_ln` adds a second — and the command fails. The interactive
+/// "Do you want me to do it for you [Y/n]?" branch is only reached on a tty.
+fn autostart(ctx: &Ctx) -> bool {
+    if ctx.in_progress() {
+        return true;
+    }
+    eprint!("You need to start by \"git bisect start\"\n\n");
+    false
+}
+
+/// git's `bisect_next_check(terms, NULL)`. With no `current_term` to fall back
+/// on, `decide_next` returns -1 *before* reaching any of its `error()` calls, so
+/// a half-marked (or unstarted) session fails silently with exit 1.
+fn next_check_silent(ctx: &Ctx, terms: &Terms) -> Result<bool> {
+    Ok(ctx.bad(terms)?.is_some() && !ctx.goods(terms)?.is_empty())
+}
+
+/// `git bisect skip` routes through `bisect_state`, whose first act is
+/// `bisect_autostart`; only a live session reaches the replacement search.
+fn skip_cmd(_args: &[String]) -> Result<ExitCode> {
+    let ctx = Ctx::open()?;
+    if !autostart(&ctx) {
+        return Ok(ExitCode::from(1));
+    }
+    bail!(
+        "`bisect skip` is not supported: git picks a replacement commit from the remaining \
+         candidates via its weighted `find_bisection`/`skip_away` PRNG, whose byte-identical \
+         sequence this port does not reproduce"
+    )
+}
+
+/// `git bisect visualize|view`: `bisect_next_check(terms, NULL)` first, then the
+/// child process.
+fn visualize_cmd(_args: &[String]) -> Result<ExitCode> {
+    let ctx = Ctx::open()?;
+    let terms = current_terms(&ctx)?;
+    if !next_check_silent(&ctx, &terms)? {
+        return Ok(ExitCode::from(1));
+    }
+    bail!("`bisect visualize` is not supported (it shells out to gitk/git log)")
+}
+
+/// `git bisect run`: `cmd_bisect__run` rejects an empty command line, then
+/// `bisect_run` gates on `bisect_next_check(terms, NULL)`.
+fn run_cmd(args: &[String]) -> Result<ExitCode> {
+    if args.is_empty() {
+        eprintln!("error: 'git bisect run' failed: no command provided.");
+        return Ok(ExitCode::from(1));
+    }
+    let ctx = Ctx::open()?;
+    let terms = current_terms(&ctx)?;
+    if !next_check_silent(&ctx, &terms)? {
+        return Ok(ExitCode::from(1));
+    }
+    bail!(
+        "`bisect run` is not supported: it drives an external command per step and relies on \
+         `bisect skip` for exit code 125, which is not reproduced here"
+    )
 }
 
 // --- subcommand: terms -------------------------------------------------------
@@ -451,8 +558,14 @@ fn checkout_and_report(ctx: &Ctx, target: &str) -> Result<()> {
     let old_id = head.id().map(|id| id.detach());
     drop(head);
 
+    // `bisect reset <commit>` takes any commit-ish, so `target` is routinely not
+    // a valid ref name at all (`HEAD~1`); `try_find_reference` reports that as an
+    // error rather than "absent", which must not abort the reset.
     let branch_ref = format!("refs/heads/{target}");
-    let target_is_branch = ctx.repo.try_find_reference(branch_ref.as_str())?.is_some();
+    let target_is_branch = matches!(
+        ctx.repo.try_find_reference(branch_ref.as_str()),
+        Ok(Some(_))
+    );
 
     if !was_detached && target_is_branch && old_branch.as_deref() == Some(target) {
         eprintln!("Already on '{target}'");
@@ -624,11 +737,11 @@ fn start(args: &[String]) -> Result<ExitCode> {
     // The first revision is the bad one; the rest are good.
     for (idx, id) in resolved.iter().enumerate() {
         let (term, path) = if idx == 0 {
-            (&terms.bad, ctx.refs_dir().join("bad"))
+            (&terms.bad, ctx.refs_dir().join(&terms.bad))
         } else {
             (
                 &terms.good,
-                ctx.refs_dir().join(format!("good-{}", id.to_hex())),
+                ctx.refs_dir().join(format!("{}-{}", terms.good, id.to_hex())),
             )
         };
         write_ref(&path, *id)?;
@@ -733,8 +846,8 @@ fn mark(word: &str, args: &[String]) -> Result<ExitCode> {
     }
 
     // A commit cannot sit on both sides of the search.
-    let bad = ctx.bad()?;
-    let goods = ctx.goods()?;
+    let bad = ctx.bad(&terms)?;
+    let goods = ctx.goods(&terms)?;
     for id in &ids {
         let clashes = match side {
             Side::Bad => goods.contains(id),
@@ -753,10 +866,10 @@ fn mark(word: &str, args: &[String]) -> Result<ExitCode> {
 
     for id in &ids {
         let (term, path) = match side {
-            Side::Bad => (&terms.bad, ctx.refs_dir().join("bad")),
+            Side::Bad => (&terms.bad, ctx.refs_dir().join(&terms.bad)),
             Side::Good => (
                 &terms.good,
-                ctx.refs_dir().join(format!("good-{}", id.to_hex())),
+                ctx.refs_dir().join(format!("{}-{}", terms.good, id.to_hex())),
             ),
         };
         write_ref(&path, *id)?;
@@ -777,9 +890,11 @@ fn mark(word: &str, args: &[String]) -> Result<ExitCode> {
 /// way `mark` does, but without advancing the bisection — used by `replay`, which
 /// applies every logged mark and only then takes a single step.
 fn write_mark(ctx: &Ctx, term: &str, side: Side, id: ObjectId) -> Result<()> {
+    // `bisect_write`: `refs/bisect/<state>` for the bad side, and
+    // `refs/bisect/<state>-<rev>` for the good side — `<state>` being the term.
     let path = match side {
-        Side::Bad => ctx.refs_dir().join("bad"),
-        Side::Good => ctx.refs_dir().join(format!("good-{}", id.to_hex())),
+        Side::Bad => ctx.refs_dir().join(term),
+        Side::Good => ctx.refs_dir().join(format!("{term}-{}", id.to_hex())),
     };
     write_ref(&path, id)?;
     ctx.append_log(&format!(
@@ -803,13 +918,10 @@ fn next_cmd() -> Result<ExitCode> {
         eprint!("You need to start by \"git bisect start\"\n\n");
         return Ok(ExitCode::from(1));
     }
-    let terms = read_terms(&ctx)?.unwrap_or_else(|| Terms {
-        bad: "bad".into(),
-        good: "good".into(),
-    });
+    let terms = current_terms(&ctx)?;
     let no_checkout = ctx.file("BISECT_HEAD").exists();
-    let bad = ctx.bad()?;
-    let goods = ctx.goods()?;
+    let bad = ctx.bad(&terms)?;
+    let goods = ctx.goods(&terms)?;
 
     match (bad, goods.is_empty()) {
         (Some(bad), false) => take_step(&ctx, &terms, bad, goods, no_checkout),
@@ -898,10 +1010,7 @@ fn replay_cmd(args: &[String]) -> Result<ExitCode> {
         }
     }
 
-    let terms = read_terms(&ctx)?.unwrap_or_else(|| Terms {
-        bad: "bad".into(),
-        good: "good".into(),
-    });
+    let terms = current_terms(&ctx)?;
     let no_checkout = ctx.file("BISECT_HEAD").exists();
     auto_next(&ctx, &terms, no_checkout)
 }
@@ -941,8 +1050,8 @@ fn subject(repo: &gix::Repository, id: ObjectId) -> Result<String> {
 /// `BISECT_HEAD` ref instead of being checked out, matching `git bisect start
 /// --no-checkout`.
 fn auto_next(ctx: &Ctx, terms: &Terms, no_checkout: bool) -> Result<ExitCode> {
-    let bad = ctx.bad()?;
-    let goods = ctx.goods()?;
+    let bad = ctx.bad(&terms)?;
+    let goods = ctx.goods(&terms)?;
 
     if bad.is_none() || goods.is_empty() {
         let status = match (bad.is_some(), goods.len()) {
@@ -988,9 +1097,10 @@ fn take_step(
         }
     }
 
-    let candidates = candidate_list(ctx, bad, &goods)?;
+    let first_parent = ctx.first_parent_only();
+    let candidates = candidate_list(ctx, bad, &goods, first_parent)?;
     let n = candidates.len();
-    let (best, reaches) = find_bisection(ctx, &candidates)?;
+    let (best, reaches) = find_bisection(ctx, &candidates, first_parent)?;
 
     if best == bad {
         return report_first_bad(ctx, bad, terms);
@@ -1117,14 +1227,20 @@ fn is_expected_rev(ctx: &Ctx, id: ObjectId) -> Result<bool> {
 
 /// The commits still under suspicion — reachable from `bad`, not from any good —
 /// in the order git's revision walk yields them (newest first, `list[0] == bad`).
-fn candidate_list(ctx: &Ctx, bad: ObjectId, goods: &[ObjectId]) -> Result<Vec<ObjectId>> {
+fn candidate_list(
+    ctx: &Ctx,
+    bad: ObjectId,
+    goods: &[ObjectId],
+    first_parent: bool,
+) -> Result<Vec<ObjectId>> {
     let mut list = Vec::new();
-    for info in ctx
-        .repo
-        .rev_walk(Some(bad))
-        .with_hidden(goods.to_vec())
-        .all()?
-    {
+    let mut walk = ctx.repo.rev_walk(Some(bad)).with_hidden(goods.to_vec());
+    // `bisect_rev_setup` sets `revs.first_parent_only` from BISECT_FIRST_PARENT,
+    // so the candidate set itself is the first-parent chain (bisect.c:1077).
+    if first_parent {
+        walk = walk.first_parent_only();
+    }
+    for info in walk.all()? {
         list.push(info?.id);
     }
     if list.is_empty() {
@@ -1147,21 +1263,26 @@ fn candidate_list(ctx: &Ctx, bad: ObjectId, goods: &[ObjectId]) -> Result<Vec<Ob
 /// The weights here are computed by reachability over the candidate subgraph,
 /// oldest first, which is the same number git's propagation arrives at and is
 /// exact for a merge as well as for a chain.
-fn find_bisection(ctx: &Ctx, list: &[ObjectId]) -> Result<(ObjectId, usize)> {
+fn find_bisection(ctx: &Ctx, list: &[ObjectId], first_parent: bool) -> Result<(ObjectId, usize)> {
     let nr = list.len();
     let index: std::collections::HashMap<ObjectId, usize> =
         list.iter().enumerate().map(|(i, id)| (*id, i)).collect();
 
-    // Parents that are themselves candidates, by list position.
+    // Parents that are themselves candidates, by list position. With
+    // `FIND_BISECTION_FIRST_PARENT_ONLY` git stops after the first parent in
+    // both `count_distance` and the weight propagation (bisect.c:104, 338, 362).
     let mut parents: Vec<Vec<usize>> = Vec::with_capacity(nr);
     for id in list {
         let commit = ctx.repo.find_object(*id)?.try_into_commit()?;
-        parents.push(
-            commit
-                .parent_ids()
-                .filter_map(|p| index.get(&p.detach()).copied())
-                .collect(),
-        );
+        let mut ps = commit.parent_ids();
+        parents.push(if first_parent {
+            ps.next()
+                .and_then(|p| index.get(&p.detach()).copied())
+                .into_iter()
+                .collect()
+        } else {
+            ps.filter_map(|p| index.get(&p.detach()).copied()).collect()
+        });
     }
 
     // `reach[i]` is the set of candidates commit `i` can reach, as a bitset.
@@ -1335,13 +1456,13 @@ struct StatEntry {
 fn diff_tree_report(repo: &gix::Repository, id: ObjectId) -> Result<Vec<u8>> {
     let commit = repo.find_object(id)?.try_into_commit()?;
     let parents: Vec<ObjectId> = commit.parent_ids().map(|p| p.detach()).collect();
-    if parents.len() > 1 {
-        bail!("the first bad commit is a merge; combined diffs (--cc) are not supported");
-    }
     let Some(parent) = parents.first().copied() else {
         return Ok(Vec::new());
     };
 
+    // For a merge, `--cc` still renders `--stat`/`--summary` against the first
+    // parent alone (combine-diff.c:1567 "show stat against the first parent even
+    // when doing combined diff"), so the same single-parent diff serves both.
     let new_tree = commit.tree()?;
     let old_tree = repo.find_object(parent)?.try_into_commit()?.tree()?;
     let mut changes = repo.diff_tree_to_tree(
@@ -1361,6 +1482,17 @@ fn diff_tree_report(repo: &gix::Repository, id: ObjectId) -> Result<Vec<u8>> {
 
     let mut out: Vec<u8> = Vec::new();
     writeln!(out, "commit {}", commit.id())?;
+    // `--pretty` adds a `Merge:` header for a multi-parent commit. bisect's
+    // `show_diff_tree()` leaves `rev.abbrev` at git's default (unlike
+    // `diff-tree`, which pins it to full oids), so the parents are abbreviated.
+    if parents.len() > 1 {
+        use gix::prelude::ObjectIdExt;
+        let shorts: Vec<String> = parents
+            .iter()
+            .map(|p| p.attach(repo).shorten_or_id().to_string())
+            .collect();
+        writeln!(out, "Merge: {}", shorts.join(" "))?;
+    }
     let author = commit.author()?;
     out.extend_from_slice(b"Author: ");
     out.extend_from_slice(author.name);

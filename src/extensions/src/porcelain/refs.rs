@@ -16,11 +16,19 @@
 //!     missing subcommand (`error: need a subcommand` + usage on stderr, 129),
 //!     an unknown subcommand, and each subcommand's own `-h` usage block.
 //!
+//!   * `git refs migrate --ref-format=<format>` up to the point where bytes would
+//!     move: the option scan, `usage: too many arguments`, `usage: missing
+//!     --ref-format=<format>`, `error: unknown ref storage format '<x>'`, and
+//!     `error: repository already uses '<x>' format`. `cmd_refs_migrate()` reaches
+//!     `repo_migrate_ref_storage_format()` only after all four, and every one of
+//!     them is a decision about names and the repository's current format.
+//!
 //! Not covered, and rejected with an error rather than approximated:
-//!   * `git refs migrate` — writing the reftable format. The vendored `gix-ref`
-//!     has no reftable backend at all (its `store/` holds only the loose+packed
-//!     files backend), so there is nothing to migrate to or from. That same gap
-//!     is why `verify` never reports `badReftableTableName`.
+//!   * the migration itself — `git refs migrate --ref-format=reftable` on a repo in
+//!     `files` format. The vendored `gix-ref` has no reftable backend at all (its
+//!     `store/` holds only the loose+packed files backend), so there is nothing to
+//!     migrate to. That same gap is why `verify` never reports
+//!     `badReftableTableName`.
 //!
 //! Known divergence: usage *errors* raised inside `optimize` are reported by the
 //! `pack-refs` module, so their usage block reads `usage: git pack-refs ...`
@@ -106,6 +114,22 @@ usage: git refs exists <ref>\n\
 \n\
 ";
 
+/// `git refs migrate -h`, byte-for-byte.
+const USAGE_MIGRATE: &str = "\
+usage: git refs migrate --ref-format=<format> [--no-reflog] [--dry-run]\n\
+\n\
+\x20   --ref-format <format> specify the reference format to convert to\n\
+\x20   --[no-]dry-run        perform a non-destructive dry-run\n\
+\x20   --no-reflog           drop reflogs entirely during the migration\n\
+\x20   --reflog              opposite of --no-reflog\n\
+\n\
+";
+
+/// The reference storage backends `ref_storage_format_by_name()` knows, in the order
+/// `ref_storage_format_to_name()` reports them back. Matched case-sensitively, as git
+/// does — `--ref-format=FILES` is an unknown format, not `files`.
+const REF_FORMATS: [&str; 2] = ["files", "reftable"];
+
 /// `git refs verify -h`, byte-for-byte.
 const USAGE_VERIFY: &str = "\
 usage: git refs verify [--strict] [--verbose]\n\
@@ -136,10 +160,7 @@ pub fn refs(args: &[String]) -> Result<ExitCode> {
         "list" => list(&args[1..]),
         // `optimize` keeps its own leading token: the pack-refs port skips it.
         "optimize" => optimize(args),
-        "migrate" => anyhow::bail!(
-            "unsupported subcommand \"migrate\": the vendored gix-ref has no reftable backend \
-             (only the loose+packed files store), so there is no format to migrate to"
-        ),
+        "migrate" => migrate(&args[1..]),
         "verify" => verify(&args[1..]),
         // git's option parser reports an unknown leading dashed argument before
         // it ever looks for a subcommand.
@@ -309,6 +330,111 @@ fn verify(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::from(255));
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// `git refs migrate --ref-format=<format> [--no-reflog] [--dry-run]`.
+///
+/// `cmd_refs_migrate()` (builtin/refs.c) makes four decisions before it moves a byte, and
+/// all four are reproduced here:
+///
+///  1. leftover positionals — `usage(_("too many arguments"))`;
+///  2. no `--ref-format` — `usage(_("missing --ref-format=<format>"))`;
+///  3. a name `ref_storage_format_by_name()` does not know — `error(_("unknown ref storage
+///     format '%s'"))`;
+///  4. the repository already in that format — `error(_("repository already uses '%s'
+///     format"))`.
+///
+/// `usage()` exits 129. The `error()` paths return `-1` up through `cmd_refs()`, which the
+/// process truncates to 255 — not 1, which is what an `error()` returning `1` would give.
+///
+/// Only step 5, `repo_migrate_ref_storage_format()`, is out of reach: it writes the target
+/// backend, and the vendored `gix-ref` has no reftable implementation to write.
+fn migrate(args: &[String]) -> Result<ExitCode> {
+    let mut format_str: Option<String> = None;
+    let mut positionals: Vec<&str> = Vec::new();
+    let mut end_of_opts = false;
+    let mut i = 0usize;
+
+    while i < args.len() {
+        let a = args[i].as_str();
+        i += 1;
+        if end_of_opts || a == "-" || !a.starts_with('-') {
+            positionals.push(a);
+            continue;
+        }
+        if a == "--" {
+            end_of_opts = true;
+            continue;
+        }
+        match a {
+            "-h" => {
+                print!("{USAGE_MIGRATE}");
+                return Ok(ExitCode::from(129));
+            }
+            "--dry-run" | "--no-dry-run" | "--no-reflog" | "--reflog" => {}
+            // `PARSE_OPT_NONEG`, so there is no `--no-ref-format`; that name falls
+            // through to the unknown-option arm below exactly as git's does.
+            "--ref-format" => match args.get(i) {
+                Some(v) => {
+                    format_str = Some(v.clone());
+                    i += 1;
+                }
+                // `parse-options` prints this one without the usage block.
+                None => {
+                    eprintln!("error: option `ref-format' requires a value");
+                    return Ok(ExitCode::from(129));
+                }
+            },
+            _ => {
+                if let Some(v) = a.strip_prefix("--ref-format=") {
+                    format_str = Some(v.to_string());
+                } else if let Some(long) = a.strip_prefix("--") {
+                    eprintln!("error: unknown option `{long}'");
+                    eprint!("{USAGE_MIGRATE}");
+                    return Ok(ExitCode::from(129));
+                } else {
+                    eprintln!("error: unknown switch `{}'", &a[1..2]);
+                    eprint!("{USAGE_MIGRATE}");
+                    return Ok(ExitCode::from(129));
+                }
+            }
+        }
+    }
+
+    // `usage()`: the message alone on stderr, no `fatal:` prefix, no usage block.
+    if !positionals.is_empty() {
+        eprintln!("usage: too many arguments");
+        return Ok(ExitCode::from(129));
+    }
+    let Some(format_str) = format_str else {
+        eprintln!("usage: missing --ref-format=<format>");
+        return Ok(ExitCode::from(129));
+    };
+
+    if !REF_FORMATS.contains(&format_str.as_str()) {
+        eprintln!("error: unknown ref storage format '{format_str}'");
+        return Ok(ExitCode::from(255));
+    }
+
+    let repo = gix::discover(".")?;
+    if current_ref_format(&repo) == format_str {
+        eprintln!("error: repository already uses '{format_str}' format");
+        return Ok(ExitCode::from(255));
+    }
+
+    bail!(
+        "refs migrate: cannot convert to '{format_str}': the vendored gix-ref implements only \
+         the loose+packed files backend, so there is no reftable writer to migrate into"
+    )
+}
+
+/// The repository's reference backend, as `repo_settings`'s `ref_storage_format` resolves it:
+/// the `extensions.refStorage` value, or `files` when the extension is absent.
+fn current_ref_format(repo: &gix::Repository) -> String {
+    repo.config_snapshot()
+        .string("extensions.refStorage")
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "files".to_string())
 }
 
 /// `git refs list` — the documented alias for `git for-each-ref`.

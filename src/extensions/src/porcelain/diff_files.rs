@@ -110,8 +110,7 @@ use std::sync::atomic::AtomicBool;
 use gix::bstr::{BString, ByteSlice};
 use gix::diff::blob::pipeline::{Mode, WorktreeRoots};
 use gix::diff::blob::platform::prepare_diff::Operation;
-use gix::diff::blob::unified_diff::{ConsumeHunk, ContextSize, DiffLineKind, HunkHeader};
-use gix::diff::blob::{Algorithm, InternedInput, ResourceKind, UnifiedDiff};
+use gix::diff::blob::{Algorithm, InternedInput, ResourceKind};
 use gix::hash::ObjectId;
 use gix::objs::tree::EntryKind;
 use gix::prelude::ObjectIdExt;
@@ -380,6 +379,7 @@ struct Opts {
     nul: bool,                     // -z: NUL field/record terminators, no path quoting
     abbrev: Option<Option<usize>>, // --abbrev[=N]: None=full, Some(None)=auto, Some(Some(n))=N
     exit_code: bool,               // --exit-code/--quiet: exit 1 when anything differs
+    binary: bool,                  // --binary: emit a GIT binary patch for a binary pair
     line_prefix: Vec<u8>,          // --line-prefix=<s>, emitted before every record
     anchor: Option<Anchor>,
     relative: Relative,
@@ -455,21 +455,14 @@ struct Opts {
     merges_need_diff: bool,
     /// `--full-index`: the combined header prints full object ids.
     full_index: bool,
-    /// A non-zero `--inter-hunk-context=<n>`: recorded rather than applied, because the
-    /// unified writer cannot merge hunks the way `xdl_get_hunk` does. A patch refuses
-    /// rather than printing the wrong hunk split; every other format is unaffected.
-    inter_hunk_ctx: Option<String>,
-    /// `--diff-algorithm=`/`--minimal`/`--histogram`: the xdiff algorithm the CLI
-    /// selected. `None` leaves gix on the repo's `diff.algorithm` config default
-    /// (git precedence: an explicit CLI flag overrides config). `patience` has no
-    /// imara-diff equivalent, so it is recorded in `patience_spelling` and bailed on
-    /// rather than stored here.
+    /// `--inter-hunk-context=<n>`: `xecfg.interhunkctxlen`, the extra gap two change
+    /// groups may leave between them and still land in one hunk. Applied by the shared
+    /// `xdl_emit_diff` port in [`super::diff_pairs::emit_unified`].
+    inter_hunk_ctx: usize,
+    /// `--diff-algorithm=`/`--minimal`/`--histogram`/`--patience`: the xdiff algorithm
+    /// the CLI selected. `None` leaves gix on the repo's `diff.algorithm` config default
+    /// (git precedence: an explicit CLI flag overrides config).
     algorithm: Option<Algorithm>,
-    /// The spelling of a `patience` request (`--patience` or `--diff-algorithm=patience`).
-    /// imara-diff has no patience variant, so any format that consumes the line diff
-    /// bails with this flag rather than silently substituting Myers. Cleared when a
-    /// later renderable algorithm flag wins, so last-one-on-the-line semantics hold.
-    patience_spelling: Option<String>,
     /// `XDF_INDENT_HEURISTIC`: where a hunk that can slide freely finally lands.
     /// `git_diff_heuristic_config()` runs from `git_diff_basic_config()`, so
     /// `diff.indentHeuristic` reaches plumbing too, and
@@ -773,6 +766,7 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed, Fatal> {
         nul: false,
         abbrev: None,
         exit_code: false,
+        binary: false,
         line_prefix: Vec::new(),
         anchor: None,
         relative: Relative::No,
@@ -811,9 +805,8 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed, Fatal> {
         explicit_stage: false,
         merges_need_diff: false,
         full_index: false,
-        inter_hunk_ctx: None,
+        inter_hunk_ctx: 0,
         algorithm: None,
-        patience_spelling: None,
         indent_heuristic: super::diff_pairs::indent_heuristic_default(repo),
     };
     let mut quiet = false;
@@ -1001,28 +994,6 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed, Fatal> {
         }
     }
 
-    // `--inter-hunk-context=<n>` only reshapes the patch body, so the stat family and
-    // the raw listing stay valid with it.
-    if opts.fmt & F_PATCH != 0 {
-        if let Some(flag) = opts.inter_hunk_ctx.take() {
-            return Ok(Parsed::Unsupported(flag));
-        }
-    }
-
-    // `patience` has no imara-diff equivalent, so any format that consumes the xdiff
-    // line diff — the patch, the line-counting stats, `--check`, and `--dirstat=lines`
-    // — would silently fall back to Myers and print a diff git did not ask for. Bail
-    // for exactly those formats. A raw / name-only / summary / by-file-dirstat listing
-    // never diffs line content, so `--patience` is a harmless no-op there, matching
-    // stock git's exit-0 output for e.g. `git diff-files --patience`.
-    let dirstat_line = if opts.dirstat.by_line { F_DIRSTAT } else { 0 };
-    let line_diff_fmt = F_NUMSTAT | F_DIFFSTAT | F_SHORTSTAT | F_PATCH | F_CHECKDIFF | dirstat_line;
-    if opts.fmt & line_diff_fmt != 0 {
-        if let Some(flag) = opts.patience_spelling.take() {
-            return Ok(Parsed::Unsupported(flag));
-        }
-    }
-
     // `-I` suppresses a change group whose every line matches. That is applied to
     // the change *counts* below, but the unified writer renders the whole diff in
     // one pass, so a patch under `-I` could silently keep a hunk git would drop.
@@ -1113,9 +1084,13 @@ fn classify(s: &str, opts: &mut Opts, quiet: &mut bool) -> Result<Flag, Fatal> {
         "--raw" => opts.fmt |= F_RAW,
         "--name-only" => opts.fmt |= F_NAME,
         "--name-status" => opts.fmt |= F_NAME_STATUS,
-        // `--binary` turns patch output on; the `GIT binary patch` payload it also
-        // enables is unreachable for text, which is all these blobs ever are.
-        "-p" | "-u" | "--patch" | "--binary" => opts.fmt |= F_PATCH,
+        "-p" | "-u" | "--patch" => opts.fmt |= F_PATCH,
+        // `--binary` turns patch output on and additionally replaces a binary pair's
+        // `Binary files … differ` line with the base85 payload.
+        "--binary" => {
+            opts.fmt |= F_PATCH;
+            opts.binary = true;
+        }
         "--patch-with-raw" => opts.fmt |= F_PATCH | F_RAW,
         "--patch-with-stat" => opts.fmt |= F_PATCH | F_DIFFSTAT,
         "--stat" => opts.fmt |= F_DIFFSTAT,
@@ -1199,22 +1174,12 @@ fn classify(s: &str, opts: &mut Opts, quiet: &mut bool) -> Result<Flag, Fatal> {
             opts.unmerged_stage = 3;
             opts.explicit_stage = true;
         }
-        // Diff-algorithm aliases. Each sets the CLI algorithm (which overrides the
-        // `diff.algorithm` config default at the diff site) and clears any pending
-        // patience request, so the last algorithm flag on the line wins. `--patience`
-        // has no imara-diff variant, so it is recorded for the content-format bail.
-        "--minimal" => {
-            opts.algorithm = Some(Algorithm::MyersMinimal);
-            opts.patience_spelling = None;
-        }
-        "--histogram" => {
-            opts.algorithm = Some(Algorithm::Histogram);
-            opts.patience_spelling = None;
-        }
-        "--patience" => {
-            opts.algorithm = None;
-            opts.patience_spelling = Some("--patience".to_owned());
-        }
+        // Diff-algorithm aliases. Each sets the CLI algorithm, which overrides the
+        // `diff.algorithm` config default at the diff site, so the last algorithm flag
+        // on the line wins.
+        "--minimal" => opts.algorithm = Some(Algorithm::MyersMinimal),
+        "--histogram" => opts.algorithm = Some(Algorithm::Histogram),
+        "--patience" => opts.algorithm = Some(Algorithm::Patience),
         // `XDF_INDENT_HEURISTIC`: where a hunk that can slide freely finally lands.
         "--indent-heuristic" => opts.indent_heuristic = true,
         "--no-indent-heuristic" => opts.indent_heuristic = false,
@@ -1303,23 +1268,10 @@ fn classify_valued(s: &str, opts: &mut Opts) -> Result<Flag, Fatal> {
     }
     if let Some(v) = s.strip_prefix("--diff-algorithm=") {
         match v {
-            "myers" | "default" => {
-                opts.algorithm = Some(Algorithm::Myers);
-                opts.patience_spelling = None;
-            }
-            "minimal" => {
-                opts.algorithm = Some(Algorithm::MyersMinimal);
-                opts.patience_spelling = None;
-            }
-            "histogram" => {
-                opts.algorithm = Some(Algorithm::Histogram);
-                opts.patience_spelling = None;
-            }
-            // imara-diff has no patience variant: recorded for the content-format bail.
-            "patience" => {
-                opts.algorithm = None;
-                opts.patience_spelling = Some(s.to_owned());
-            }
+            "myers" | "default" => opts.algorithm = Some(Algorithm::Myers),
+            "minimal" => opts.algorithm = Some(Algorithm::MyersMinimal),
+            "histogram" => opts.algorithm = Some(Algorithm::Histogram),
+            "patience" => opts.algorithm = Some(Algorithm::Patience),
             _ => return Err(Fatal::Usage),
         }
         return Ok(Flag::Handled);
@@ -1435,15 +1387,11 @@ fn classify_valued(s: &str, opts: &mut Opts) -> Result<Flag, Fatal> {
         };
     }
     // `--inter-hunk-context=<n>` is an `OPT_MAGNITUDE` (`xecfg.interhunkctxlen`): two
-    // change groups closer than `2 * ctxlen + interhunk` records land in one hunk.
-    // gix's unified writer has no such knob, so a non-zero value would silently split
-    // hunks git merges. git validates the number first and rejects a bad one at 129,
-    // so that check still runs; a zero is git's own default and changes nothing.
+    // change groups closer than `2 * ctxlen + interhunk` records land in one hunk. git
+    // validates the number first and rejects a bad one at 129, so that check runs before
+    // the value is taken; zero is git's own default and changes nothing.
     if let Some(v) = s.strip_prefix("--inter-hunk-context=") {
-        validate_magnitude(v, "inter-hunk-context")?;
-        if v.parse::<u64>().is_ok_and(|n| n > 0) {
-            opts.inter_hunk_ctx = Some(s.to_owned());
-        }
+        opts.inter_hunk_ctx = validate_magnitude(v, "inter-hunk-context")? as usize;
         return Ok(Flag::Handled);
     }
     // `--ws-error-highlight=<kinds>`: a comma list drawn from old/new/context/all/
@@ -1536,32 +1484,40 @@ fn parse_filter(v: &str) -> Result<Filter, Fatal> {
     Ok(Filter { keep, all_or_none })
 }
 
-/// `OPT_MAGNITUDE` validation (`parse_options.c` `parse_opt_unsigned`): an optional
-/// leading `+`, one or more decimal digits, then an optional single k/m/g suffix
-/// (case-insensitive). An empty value and a malformed one carry distinct messages.
-fn validate_magnitude(v: &str, opt: &'static str) -> Result<(), Fatal> {
-    if v.is_empty() {
-        return Err(Fatal::Magnitude(opt));
-    }
+/// `OPT_UNSIGNED`'s value (`parse_options.c` `parse_opt_unsigned`): an optional leading
+/// `+`, one or more decimal digits, then an optional single k/m/g suffix
+/// (case-insensitive) multiplying by 1024, 1024² or 1024³.
+///
+/// `None` for anything that does not match, which every caller turns into git's 129.
+pub(crate) fn parse_magnitude(v: &str) -> Option<u64> {
     let b = v.as_bytes();
-    let mut i = 0;
-    if b[i] == b'+' {
-        i += 1;
-    }
+    let mut i = usize::from(b.first() == Some(&b'+'));
     let digits_start = i;
     while i < b.len() && b[i].is_ascii_digit() {
         i += 1;
     }
     if i == digits_start {
-        return Err(Fatal::BadMagnitude(opt));
+        return None;
     }
-    if i < b.len() && matches!(b[i], b'k' | b'K' | b'm' | b'M' | b'g' | b'G') {
+    let mut n: u64 = v[digits_start..i].parse().ok()?;
+    if i < b.len() {
+        n = n.checked_mul(match b[i] {
+            b'k' | b'K' => 1024,
+            b'm' | b'M' => 1024 * 1024,
+            b'g' | b'G' => 1024 * 1024 * 1024,
+            _ => return None,
+        })?;
         i += 1;
     }
-    if i != b.len() {
-        return Err(Fatal::BadMagnitude(opt));
+    (i == b.len()).then_some(n)
+}
+
+/// `OPT_UNSIGNED` validation. An empty value and a malformed one carry distinct messages.
+fn validate_magnitude(v: &str, opt: &'static str) -> Result<u64, Fatal> {
+    if v.is_empty() {
+        return Err(Fatal::Magnitude(opt));
     }
-    Ok(())
+    parse_magnitude(v).ok_or(Fatal::BadMagnitude(opt))
 }
 
 /// How many times `needle` occurs in `hay`, without overlaps.
@@ -1799,7 +1755,18 @@ fn run(repo: &gix::Repository, opts: Opts, paths: Vec<BString>) -> Result<ExitCo
             separator = true;
         }
         if opts.fmt & F_CHECKDIFF != 0 {
-            check_failed = render_check(&mut rest, &deltas, &analyses, ws_rule, &colors);
+            let pairs: Vec<CheckPair<'_>> = deltas
+                .iter()
+                .zip(&analyses)
+                .map(|(d, an)| CheckPair {
+                    checkable: !d.unmerged && d.new_valid() && !an.binary,
+                    path: &d.path,
+                    old_data: &an.old_data,
+                    new_data: &an.new_data,
+                    hunks: an.hunks.as_deref(),
+                })
+                .collect();
+            check_failed = render_check(&mut rest, &pairs, ws_rule, &colors);
         }
 
         let dirstat_by_line = opts.fmt & F_DIRSTAT != 0 && opts.dirstat.by_line;
@@ -1865,17 +1832,26 @@ fn run(repo: &gix::Repository, opts: Opts, paths: Vec<BString>) -> Result<ExitCo
             count_occurrences_of(&combined_patch, b"\ndiff --cc ") + usize::from(combined_patch.starts_with(b"diff --cc "));
         let mut files: Vec<diff_color::FilePaint> =
             vec![diff_color::FilePaint::new(ws_rule); combined_sections];
-        // `fill_metainfo()`'s abbreviation length: the full hash under `--full-index`,
-        // otherwise `DEFAULT_ABBREV`, which `core.abbrev` sets.
+        // `fill_metainfo()`'s abbreviation length (diff.c:4915):
+        //     int abbrev = o->abbrev ? o->abbrev : DEFAULT_ABBREV;
+        //     if (o->flags.full_index) abbrev = hexsz;
+        // so `--full-index` wins outright, an explicit `--abbrev=<n>` (already clamped
+        // to `[MINIMUM_ABBREV, hexsz]` by the parser) is used verbatim, and every other
+        // spelling — no flag, a bare `--abbrev`, `--no-abbrev` — leaves `o->abbrev` at 0
+        // and falls back to `DEFAULT_ABBREV`, which `core.abbrev` sets. `--no-abbrev`
+        // widens only the raw listing, never this line.
         let hexsz = repo.object_hash().len_in_hex();
-        let patch_abbrev = if opts.full_index {
-            hexsz
-        } else {
-            crate::abbrev::configured_abbrev(repo, hexsz)
+        // `--binary`'s payload is deflated at git's `zlib_compression_level`; read it
+        // once rather than per file.
+        let zlib_level = super::binary_patch::loose_compression_level(repo);
+        let patch_abbrev = match (opts.full_index, opts.abbrev) {
+            (true, _) => hexsz,
+            (false, Some(Some(n))) => n.clamp(crate::abbrev::MINIMUM_ABBREV, hexsz),
+            (false, _) => crate::abbrev::configured_abbrev(repo, hexsz),
         };
         for (d, an) in deltas.iter().zip(&analyses) {
             let before = plain.len();
-            render_patch(&mut plain, d, an, &opts, patch_abbrev);
+            render_patch(&mut plain, d, an, &opts, patch_abbrev, zlib_level);
             if plain.len() != before {
                 files.push(diff_color::FilePaint {
                     ws_rule,
@@ -2579,17 +2555,44 @@ fn analyze(
     let mode_changed = old_mode != 0 && new_mode != 0 && old_mode != new_mode;
 
     match prep.operation {
-        Operation::SourceOrDestinationIsBinary => Ok(Analysis {
-            src_id,
-            dst_id,
-            added: 0,
-            deleted: 0,
-            binary: true,
-            hunks: None,
-            old_data,
-            new_data,
-            changed: old_mode == 0 || new_mode == 0 || mode_changed || src_id != dst_id,
-        }),
+        Operation::SourceOrDestinationIsBinary => {
+            // The blob pipeline hands back only the *size* of content it classified as
+            // binary, so `prep.*.data` is empty here. `--binary` needs the real bytes,
+            // and only `--binary` does, so they are read back just for it.
+            let (old_data, new_data) = if opts.binary {
+                let staged = if blob_mode == 0 {
+                    Vec::new()
+                } else {
+                    let mut buf = Vec::new();
+                    use gix::prelude::FindExt;
+                    objects.find_blob(&blob_id, &mut buf)?;
+                    buf
+                };
+                let worktree = if wt_mode == 0 {
+                    Vec::new()
+                } else {
+                    std::fs::read(workdir.join(gix::path::from_bstr(path))).unwrap_or_default()
+                };
+                if swapped {
+                    (worktree, staged)
+                } else {
+                    (staged, worktree)
+                }
+            } else {
+                (old_data, new_data)
+            };
+            Ok(Analysis {
+                src_id,
+                dst_id,
+                added: 0,
+                deleted: 0,
+                binary: true,
+                hunks: None,
+                old_data,
+                new_data,
+                changed: old_mode == 0 || new_mode == 0 || mode_changed || src_id != dst_id,
+            })
+        }
         Operation::ExternalCommand { .. } => Ok(Analysis {
             src_id,
             dst_id,
@@ -2620,43 +2623,47 @@ fn analyze(
                 &after,
                 opts.indent_heuristic,
             );
-            // `xdl_mark_ignorable_regex()`: a change group whose every removed and
-            // added line matches an `-I` pattern contributes nothing.
-            let (added, deleted) = if opts.ignore_lines.is_empty() {
-                (diff.count_additions(), diff.count_removals())
-            } else {
-                let mut add = 0u32;
-                let mut del = 0u32;
-                for hunk in diff.hunks() {
-                    let ignorable = hunk
-                        .before
-                        .clone()
-                        .all(|i| matches_any(&opts.ignore_lines, before[i as usize]))
-                        && hunk
-                            .after
+            // `xdl_mark_ignorable_regex()`: a change group whose every removed and added
+            // line matches an `-I` pattern is marked ignorable, which keeps it out of
+            // the counts and stops `xdl_get_hunk()` from opening a hunk for it.
+            let changes: Vec<super::diff_pairs::Change> = diff
+                .hunks()
+                .map(|h| {
+                    let ignore = !opts.ignore_lines.is_empty()
+                        && h.before
+                            .clone()
+                            .all(|i| matches_any(&opts.ignore_lines, before[i as usize]))
+                        && h.after
                             .clone()
                             .all(|i| matches_any(&opts.ignore_lines, after[i as usize]));
-                    if ignorable {
-                        continue;
+                    super::diff_pairs::Change {
+                        i1: h.before.start as usize,
+                        chg1: h.before.len(),
+                        i2: h.after.start as usize,
+                        chg2: h.after.len(),
+                        ignore,
                     }
-                    del += hunk.before.clone().count() as u32;
-                    add += hunk.after.clone().count() as u32;
-                }
-                (add, del)
-            };
+                })
+                .collect();
+            let (added, deleted) = changes.iter().filter(|c| !c.ignore).fold(
+                (0u32, 0u32),
+                |(a, d), c| (a + c.chg2 as u32, d + c.chg1 as u32),
+            );
             let hunks = if want_patch && (added != 0 || deleted != 0) {
-                let sink = PatchSink {
-                    buf: Vec::new(),
-                    before: &before,
-                    after: &after,
-                    // No hunk has been emitted yet, so nothing bounds the first search.
-                    func_prev: -1,
-                    func_text: Vec::new(),
-                };
-                Some(
-                    UnifiedDiff::new(&diff, &input, sink, ContextSize::symmetrical(opts.ctx))
-                        .consume()?,
-                )
+                // The `xdl_emit_diff` port `git diff`, `diff-pairs` and `--no-index`
+                // already share, so `--inter-hunk-context=<n>` merges hunks the same way
+                // in every one of them instead of each writer inventing its own geometry.
+                let (_, _, buf) = super::diff_pairs::emit_unified(
+                    &before,
+                    &after,
+                    &changes,
+                    &super::diff_pairs::EmitGeometry {
+                        ctx: opts.ctx as usize,
+                        inter_hunk_ctx: opts.inter_hunk_ctx,
+                        func_context: false,
+                    },
+                );
+                Some(buf)
             } else {
                 None
             };
@@ -3426,10 +3433,21 @@ fn summary_mode_name(out: &mut Vec<u8>, verb: &str, mode: u32, path: &BString) {
 /// The hunk stream it walks is the one the command already computed, so unlike stock
 /// git — which runs a private `xecfg.ctxlen = 1`, `xpp.flags = 0` diff for the check —
 /// `-U<n>` and the whitespace-ignoring options do reach it here.
-fn render_check(
+/// One pair as `--check` needs to see it, so the walk below can serve every command
+/// that has a pair list and a hunk stream rather than being tied to one module's types.
+pub(crate) struct CheckPair<'a> {
+    /// Skipped entirely when false: an unmerged record, a deletion, or a binary pair.
+    pub(crate) checkable: bool,
+    pub(crate) path: &'a BString,
+    pub(crate) old_data: &'a [u8],
+    pub(crate) new_data: &'a [u8],
+    /// The rendered unified hunks; `None` when the pair produced none.
+    pub(crate) hunks: Option<&'a [u8]>,
+}
+
+pub(crate) fn render_check(
     out: &mut Vec<u8>,
-    deltas: &[Delta],
-    analyses: &[Analysis],
+    pairs: &[CheckPair<'_>],
     ws_rule: u32,
     colors: &diff_color::DiffColors,
 ) -> bool {
@@ -3437,15 +3455,15 @@ fn render_check(
     let set = colors.get(diff_color::DiffSlot::New);
     let ws_color = colors.get(diff_color::DiffSlot::Whitespace);
     let reset = colors.reset();
-    for (d, an) in deltas.iter().zip(analyses) {
-        if d.unmerged || !d.new_valid() || an.binary {
+    for pair in pairs {
+        if !pair.checkable {
             continue;
         }
-        let name = quoted_name(&d.path);
-        let new_lines = byte_lines(&an.new_data);
+        let name = quoted_name(pair.path);
+        let new_lines = byte_lines(pair.new_data);
         // Only the added lines are checked: `--check` reports what the change
         // *introduces*, so the preimage is deliberately not examined.
-        let Some(hunks) = &an.hunks else {
+        let Some(hunks) = pair.hunks else {
             continue;
         };
         let mut lineno = 0usize;
@@ -3506,7 +3524,7 @@ fn render_check(
             }
         }
         if ws_rule & diff_color::WS_BLANK_AT_EOF != 0 {
-            if let Some(at) = check_blank_at_eof(&an.old_data, &new_lines) {
+            if let Some(at) = check_blank_at_eof(pair.old_data, &new_lines) {
                 failed = true;
                 out.extend_from_slice(&name);
                 out.extend_from_slice(
@@ -3697,7 +3715,14 @@ fn check_blank_at_eof(old: &[u8], new_lines: &[&[u8]]) -> Option<usize> {
 /// `hlen` is the `index` line's hex width: `fill_metainfo()` abbreviates with
 /// `o->flags.full_index ? the_hash_algo->hexsz : DEFAULT_ABBREV`, and `DEFAULT_ABBREV`
 /// is what `core.abbrev` sets — not a hardcoded 7.
-fn render_patch(out: &mut Vec<u8>, d: &Delta, an: &Analysis, opts: &Opts, hlen: usize) {
+fn render_patch(
+    out: &mut Vec<u8>,
+    d: &Delta,
+    an: &Analysis,
+    opts: &Opts,
+    hlen: usize,
+    zlib_level: i32,
+) {
     if d.unmerged {
         out.extend_from_slice(b"* Unmerged path ");
         out.extend_from_slice(d.path.as_ref());
@@ -3710,6 +3735,14 @@ fn render_patch(out: &mut Vec<u8>, d: &Delta, an: &Analysis, opts: &Opts, hlen: 
         (&opts.dst_prefix, &opts.src_prefix)
     } else {
         (&opts.src_prefix, &opts.dst_prefix)
+    };
+
+    // `fill_metainfo()` widens the `index` line to full object names under `--binary`,
+    // but only for a pair that really is binary; text pairs keep the abbreviation.
+    let hlen = if opts.binary && an.binary {
+        an.src_id.kind().len_in_hex()
+    } else {
+        hlen
     };
 
     let old_hash = if d.old_valid() {
@@ -3794,11 +3827,17 @@ fn render_patch(out: &mut Vec<u8>, d: &Delta, an: &Analysis, opts: &Opts, hlen: 
     };
 
     if an.binary {
-        out.extend_from_slice(b"Binary files ");
-        out.extend_from_slice(&old_label);
-        out.extend_from_slice(b" and ");
-        out.extend_from_slice(&new_label);
-        out.extend_from_slice(b" differ\n");
+        if opts.binary {
+            // `emit_binary_diff()`: the payload replaces the whole `Binary files …`
+            // line, and there is no `---`/`+++` pair in front of it.
+            super::binary_patch::emit(out, &an.old_data, &an.new_data, zlib_level);
+        } else {
+            out.extend_from_slice(b"Binary files ");
+            out.extend_from_slice(&old_label);
+            out.extend_from_slice(b" and ");
+            out.extend_from_slice(&new_label);
+            out.extend_from_slice(b" differ\n");
+        }
     } else if let Some(hunks) = &an.hunks {
         emit_file_line(out, b"--- ", &old_label);
         emit_file_line(out, b"+++ ", &new_label);
@@ -4728,116 +4767,4 @@ pub(crate) fn quote_two(pa: &str, a: &BString, pb: &str, b: &BString) -> Vec<u8>
     out.push(b' ');
     out.extend_from_slice(&quote_one(pb, b));
     out
-}
-
-// ---------------------------------------------------------------------------
-// unified-diff hunk sink
-// ---------------------------------------------------------------------------
-
-/// Format one side of a hunk header (`@@ -<here> +<here> @@`), omitting the length
-/// when it is 1 and using the pre-hunk line number when it is 0, like `git diff`.
-fn fmt_range(start: u32, len: u32) -> String {
-    match len {
-        1 => format!("{start}"),
-        0 => format!("{},0", start.saturating_sub(1)),
-        _ => format!("{start},{len}"),
-    }
-}
-
-/// A [`ConsumeHunk`] sink that renders unified-diff hunks into a byte buffer.
-///
-/// The tokens the differ compares may be whitespace-normalized (`-w` and friends),
-/// so line *content* is taken from the original line tables instead, tracked by the
-/// cursors the hunk header establishes.
-/// Hunks are always rendered with git's canonical `+`/`-`/` ` markers;
-/// `--output-indicator-*` is applied when the patch is written out, so every
-/// consumer of these bytes (`--check`, `-G`) can rely on the canonical form.
-struct PatchSink<'a> {
-    buf: Vec<u8>,
-    before: &'a [&'a [u8]],
-    after: &'a [&'a [u8]],
-    /// git's `funclineprev`: the line the previous hunk's search started from, and the
-    /// limit for the next one, so a heading is never scanned for twice.
-    func_prev: i64,
-    /// git's `func_line`, which lives across the whole file rather than one hunk. A
-    /// search that finds nothing leaves it alone, so a hunk deep inside a long function
-    /// keeps the heading found for the hunk above it.
-    func_text: Vec<u8>,
-}
-
-impl ConsumeHunk for PatchSink<'_> {
-    type Out = Vec<u8>;
-
-    fn consume_hunk(
-        &mut self,
-        header: HunkHeader,
-        lines: &[(DiffLineKind, &[u8])],
-    ) -> std::io::Result<()> {
-        let mut hdr: Vec<u8> = Vec::with_capacity(super::diff::HUNK_HDR_MAX);
-        hdr.extend_from_slice(b"@@ -");
-        hdr.extend_from_slice(fmt_range(header.before_hunk_start, header.before_hunk_len).as_bytes());
-        hdr.extend_from_slice(b" +");
-        hdr.extend_from_slice(fmt_range(header.after_hunk_start, header.after_hunk_len).as_bytes());
-        hdr.extend_from_slice(b" @@");
-
-        // `XDL_EMIT_FUNCNAMES`: the nearest qualifying line at or above the hunk's first
-        // pre-image line, searched no further back than the previous hunk's own starting
-        // point. `before_hunk_start` is 1-based and git's `s1` is the 0-based index of
-        // that same line.
-        let s1 = header.before_hunk_start as i64 - 1;
-        if let Some(func) = super::diff::func_line(self.before, s1 - 1, self.func_prev) {
-            self.func_text = func.to_vec();
-        }
-        self.func_prev = s1 - 1;
-        if !self.func_text.is_empty() {
-            // git clips the heading to what remains of its 128-byte header buffer,
-            // reserving one byte for the newline.
-            let room = super::diff::HUNK_HDR_MAX.saturating_sub(hdr.len() + 2);
-            hdr.push(b' ');
-            hdr.extend_from_slice(&self.func_text[..self.func_text.len().min(room)]);
-        }
-        hdr.push(b'\n');
-        self.buf.extend_from_slice(&hdr);
-
-        let mut bi = header.before_hunk_start.saturating_sub(1) as usize;
-        let mut ai = header.after_hunk_start.saturating_sub(1) as usize;
-        for (kind, fallback) in lines {
-            let (marker, content): (u8, &[u8]) = match kind {
-                // `xdl_emit_diff()` emits every context record from `xe->xdf2`, the
-                // *post-image*: all three context loops call
-                // `xdl_emit_record(&xe->xdf2, s2, " ", ecb)`. The two sides only
-                // differ here when the comparison called unequal bytes equal, which
-                // is exactly what `-w`/`-b`/`--ignore-space-at-eol` do.
-                DiffLineKind::Context => {
-                    let c = self.after.get(ai).copied().unwrap_or(*fallback);
-                    bi += 1;
-                    ai += 1;
-                    (b' ', c)
-                }
-                DiffLineKind::Remove => {
-                    let c = self.before.get(bi).copied().unwrap_or(*fallback);
-                    bi += 1;
-                    (b'-', c)
-                }
-                DiffLineKind::Add => {
-                    let c = self.after.get(ai).copied().unwrap_or(*fallback);
-                    ai += 1;
-                    (b'+', c)
-                }
-            };
-            self.buf.push(marker);
-            self.buf.extend_from_slice(content);
-            // Tokens keep their line terminator; a token without one is the last
-            // line of a file that lacks a trailing newline.
-            if content.last() != Some(&b'\n') {
-                self.buf.push(b'\n');
-                self.buf.extend_from_slice(b"\\ No newline at end of file\n");
-            }
-        }
-        Ok(())
-    }
-
-    fn finish(self) -> Vec<u8> {
-        self.buf
-    }
 }

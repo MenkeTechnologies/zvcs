@@ -1,4 +1,6 @@
+use std::collections::{BTreeMap, HashMap};
 use std::num::NonZeroU32;
+use std::rc::Rc;
 
 use gix_diff::{blob::TokenSource, tree::Visit};
 use gix_hash::ObjectId;
@@ -14,8 +16,65 @@ use gix_diff::blob::compact;
 use super::{Change, UnblamedHunk, copied, moved, process_changes, process_ignored_changes};
 use crate::{
     BlameEntry, Error, Options, Outcome, Statistics,
-    types::{BlamePathEntry, PathTable, Suspect},
+    types::{BlamePathEntry, Children, OriginKey, PathTable, Suspect},
 };
+
+/// git's `blame_origin::file`: the blob an origin holds on to, so the next diff that needs it does
+/// not read it from the object database again.
+///
+/// An entry lives exactly as long as the origin does in git, which is what makes
+/// [`Statistics::num_read_blob`] a count of cache misses rather than of diffs: `pass_blame()`
+/// releases the origin it just processed with `drop_origin_blob()` and releases every scapegoat
+/// that came away with nothing (`blame.c:2572-2579`), while `pass_whole_blame()` moves the buffer
+/// from one origin to the next instead of letting the second read the same bytes
+/// (`blame.c:2347-2351`).
+#[derive(Default)]
+pub(super) struct OriginFiles {
+    files: HashMap<Suspect, Rc<[u8]>>,
+}
+
+impl OriginFiles {
+    /// `fill_origin_blob()` (`blame.c:1031`): the origin's blob, read — and counted — only when the
+    /// origin does not already hold it.
+    pub(super) fn fill(
+        &mut self,
+        origin: Suspect,
+        blob_id: &gix_hash::oid,
+        odb: &impl gix_object::Find,
+        stats: &mut Statistics,
+    ) -> Result<Rc<[u8]>, Error> {
+        if let Some(file) = self.files.get(&origin) {
+            return Ok(file.clone());
+        }
+        stats.num_read_blob += 1;
+        let mut buf = Vec::new();
+        let file: Rc<[u8]> = Rc::from(odb.find_blob(blob_id, &mut buf)?.data);
+        self.files.insert(origin, file.clone());
+        Ok(file)
+    }
+
+    /// Give `origin` a buffer it did not read itself — what the fake working-tree commit of
+    /// [`Options::fake_commit`] leaves on the origin at `suspect`.
+    pub(super) fn seed(&mut self, origin: Suspect, file: Rc<[u8]>) {
+        self.files.entry(origin).or_insert(file);
+    }
+
+    /// `pass_whole_blame()`'s "Steal its file" (`blame.c:2347-2351`): the parent origin takes over
+    /// the buffer, if it has none of its own and this one has one.
+    pub(super) fn steal(&mut self, from: Suspect, to: Suspect) {
+        if self.files.contains_key(&to) {
+            return;
+        }
+        if let Some(file) = self.files.remove(&from) {
+            self.files.insert(to, file);
+        }
+    }
+
+    /// `drop_origin_blob()` (`blame.c:1065`).
+    pub(super) fn drop_blob(&mut self, origin: &Suspect) {
+        self.files.remove(origin);
+    }
+}
 
 /// Produce a list of consecutive [`BlameEntry`] instances to indicate in which commits the ranges of the file
 /// at `suspect:<file_path>` originated in.
@@ -91,11 +150,20 @@ pub fn file(
         commit_id: suspect,
     })?;
     let blamed_file_blob = odb.find_blob(&blamed_file_entry_id, &mut buf)?.data.to_vec();
+    // `setup_scoreboard()` reads the final image into `sb->final_buf` and counts it
+    // (`blame.c:2889`). It does *not* fill the starting origin's `file`, which is why the same
+    // blame started at a commit reads one blob more than one started on the working tree, where a
+    // fake commit hands that origin its buffer — see `options.fake_commit` below.
+    stats.num_read_blob += 1;
     let num_lines_in_blamed = tokens_for_diffing(&blamed_file_blob).tokenize().count() as u32;
 
-    // Binary or otherwise empty?
+    // Binary or otherwise empty? `assign_blame()` then finds an origin with no entries and stops,
+    // but `setup_scoreboard()` has already read the final image, so the counters are not empty.
     if num_lines_in_blamed == 0 {
-        return Ok(Outcome::default());
+        return Ok(Outcome {
+            statistics: stats,
+            ..Default::default()
+        });
     }
 
     // git's `sb->lineno`, which `-M` needs to cut the entry's lines out of the final image.
@@ -111,11 +179,35 @@ pub fn file(
         .map(|range| UnblamedHunk::new(range, Suspect::new(suspect)))
         .collect::<Vec<_>>();
 
+    // git's `blame_origin` graph, the two halves of it this port needs: the blob each origin is
+    // holding, and the first scapegoat each origin managed to hand entries to.
+    let mut origin_files = OriginFiles::default();
+    let mut origin_previous: HashMap<Suspect, Suspect> = HashMap::new();
+
+    // git's `fake_working_tree_commit()`, whose `pass_blame()` runs before the walk below starts.
+    // Either way it leaves `suspect`'s origin holding the final image: through
+    // `pass_whole_blame()`'s steal when the overlay matches the blob, and through the blob its
+    // `pass_blame_to_parent()` read into that origin when it does not.
+    if let Some(fake) = options.fake_commit {
+        origin_files.seed(Suspect::new(suspect), Rc::from(blamed_file_blob.as_slice()));
+        if !fake.passes_whole_blame {
+            stats.num_commits += 1;
+            stats.num_get_patch += 1;
+            stats.num_read_blob += 1;
+        }
+    }
+
     let (mut buf, mut buf2) = (Vec::new(), Vec::new());
     let commit = find_commit(cache.as_ref(), &odb, &suspect, &mut buf)?;
     let mut queue: gix_revwalk::PriorityQueue<gix_date::SecondsSinceUnixEpoch, ObjectId> =
         gix_revwalk::PriorityQueue::new();
-    queue.insert(commit.commit_time()?, suspect);
+    // `setup_scoreboard()` picks the queue's ordering with `sb->commits.compare`:
+    // `compare_commits_by_commit_date` walking backwards, `compare_commits_by_reverse_commit_date`
+    // walking forwards (`blame.c:2784-2790`). This queue always pops the largest key, so the
+    // forward walk is expressed by negating the commit time.
+    let reverse = options.children.is_some();
+    let queue_key = |time: gix_date::SecondsSinceUnixEpoch| if reverse { -time } else { time };
+    queue.insert(queue_key(commit.commit_time()?), suspect);
 
     let mut out = Vec::new();
     let mut diff_state = gix_diff::tree::State::default();
@@ -135,13 +227,21 @@ pub fn file(
         let commit = find_commit(cache.as_ref(), &odb, &commit_id, &mut buf)?;
         let commit_time = commit.commit_time()?;
         let target_tree_id = commit.tree_id()?;
-        let mut parent_ids: ParentIds = collect_parents(commit, &odb, cache.as_ref(), &mut buf2)?;
-        // git's `first_scapegoat()` (`blame.c:2370-2377`): under `revs->first_parent_only` it frees
-        // `commit->parents->next` before returning the list, so every later scapegoat lookup on this
-        // commit sees exactly one parent and the side branches of a merge are never walked.
-        if options.first_parent {
-            parent_ids.truncate(1);
-        }
+        // git's `first_scapegoat()` (`blame.c:2367-2380`). Walking backwards it is the commit's
+        // parents, with `revs->first_parent_only` freeing `commit->parents->next` first so that
+        // every later lookup on this commit sees exactly one parent and the side branches of a
+        // merge are never walked. Walking forwards it is `revs->children` instead, which the
+        // caller built over the range and which already reflects `--first-parent`.
+        let parent_ids: ParentIds = match &options.children {
+            Some(children) => collect_children(children, &commit_id, &odb, cache.as_ref(), &mut buf2)?,
+            None => {
+                let mut ids = collect_parents(commit, &odb, cache.as_ref(), &mut buf2)?;
+                if options.first_parent {
+                    ids.truncate(1);
+                }
+                ids
+            }
+        };
         let parent_ids = parent_ids;
 
         // git's `assign_blame()` does not pop the commit while any of its origins still has
@@ -290,9 +390,14 @@ pub fn file(
                         previous_entry = Some((Suspect::at(*parent_id, suspect.path), parent_entry_id));
                     }
                     if no_change_in_entry {
-                        // git's `pass_whole_blame()` followed by `goto finish`.
-                        pass_blame_from_to(suspect, Suspect::at(*parent_id, suspect.path), &mut hunks_to_blame);
-                        queue.insert(*parent_commit_time, *parent_id);
+                        // git's `pass_whole_blame()` followed by `goto finish`. It happens before
+                        // `sb->num_commits++`, so a commit that gave everything away this way is
+                        // not counted, and "Steal its file" hands the parent origin whatever blob
+                        // this one had rather than letting it read the same bytes again.
+                        let parent_origin = Suspect::at(*parent_id, suspect.path);
+                        origin_files.steal(suspect, parent_origin);
+                        pass_blame_from_to(suspect, parent_origin, &mut hunks_to_blame);
+                        queue.insert(queue_key(*parent_commit_time), *parent_id);
                         passed_whole_blame = true;
                         break;
                     }
@@ -316,9 +421,28 @@ pub fn file(
             // `-M`, `-C` also visits the parents that do not have the blamed file at all.
             let mut copy_parents: Vec<copied::CopyParent> = Vec::new();
 
+            // The second shape `pass_whole_blame()` comes in: `find_origin()` found nothing at the
+            // origin's own path, but `find_rename()` found the file under another name with the
+            // very same blob, so the rename carried no change at all and the whole origin is
+            // handed over (`blame.c:2452-2459`).
+            let mut renamed_whole_blame = false;
+
+            // `sb->num_commits++` (`blame.c:2473`): one per origin that had scapegoats and did not
+            // give everything away first. git resolves every scapegoat before it gets here, so it
+            // already knows about both shapes of `pass_whole_blame()`; here the rename shape only
+            // becomes visible once the tree diff in the loop below has run, which is why that
+            // branch takes the count back off again.
+            stats.num_commits += 1;
+
             let more_than_one_parent = parent_ids.len() > 1;
             for (index, (parent_id, parent_commit_time)) in parent_ids.iter().enumerate() {
-                queue.insert(*parent_commit_time, *parent_id);
+                queue.insert(queue_key(*parent_commit_time), *parent_id);
+                // `pass_blame()` stops offering scapegoats the moment the origin has nothing left
+                // (`blame.c:2485-2486`), and `pass_blame_to_parent()` would return without
+                // counting anyway (`blame.c:1952`).
+                if !hunks_to_blame.iter().any(|hunk| hunk.has_suspect(&suspect)) {
+                    continue;
+                }
                 if options.detect_copied.is_some() {
                     let tree_id = find_commit(cache.as_ref(), &odb, parent_id, &mut buf)?.tree_id()?;
                     copy_parents.push(copied::CopyParent {
@@ -390,18 +514,22 @@ pub fn file(
                         if let Some(parent) = copy_parents.last_mut() {
                             parent.porigin_path = Some(suspect.path);
                         }
+                        // `origin->previous` (`blame.c:2480-2483`) is the first scapegoat this
+                        // origin hands entries to, and it holds a reference for as long as this
+                        // origin lives — which is what keeps that scapegoat in the refcount graph
+                        // after every entry of its own has moved on.
+                        origin_previous.entry(suspect).or_insert(parent_origin);
+                        let parent_file = origin_files.fill(parent_origin, previous_id.as_ref(), &odb, &mut stats)?;
+                        let target_file = origin_files.fill(suspect, id.as_ref(), &odb, &mut stats)?;
+                        stats.num_get_patch += 1;
                         let (changes, data) = blob_changes(
-                            &odb,
-                            resource_cache,
-                            id,
-                            previous_id,
-                            file_path,
-                            file_path,
+                            &parent_file,
+                            &target_file,
                             options.diff_algorithm,
                             options.ignore_whitespace,
                             &mut stats,
                             suspect_is_ignored,
-                        )?;
+                        );
                         hunks_to_blame = process_changes(hunks_to_blame, changes.clone(), suspect, parent_origin);
                         if let Some((old_data, new_data)) = data {
                             ignored_passes.push((parent_origin, changes.clone(), old_data, new_data));
@@ -432,22 +560,28 @@ pub fn file(
                         // different path — which is what makes the *Source File* column appear.
                         let source_path = paths.intern(source_location.as_ref());
                         let parent_origin = Suspect::at(*parent_id, source_path);
+                        if source_id == id {
+                            origin_files.steal(suspect, parent_origin);
+                            pass_blame_from_to(suspect, parent_origin, &mut hunks_to_blame);
+                            renamed_whole_blame = true;
+                            break;
+                        }
                         push_move_parent(&mut move_parents, parent_origin, source_id);
                         if let Some(parent) = copy_parents.last_mut() {
                             parent.porigin_path = Some(source_path);
                         }
+                        origin_previous.entry(suspect).or_insert(parent_origin);
+                        let parent_file = origin_files.fill(parent_origin, source_id.as_ref(), &odb, &mut stats)?;
+                        let target_file = origin_files.fill(suspect, id.as_ref(), &odb, &mut stats)?;
+                        stats.num_get_patch += 1;
                         let (changes, data) = blob_changes(
-                            &odb,
-                            resource_cache,
-                            id,
-                            source_id,
-                            file_path,
-                            source_location.as_ref(),
+                            &parent_file,
+                            &target_file,
                             options.diff_algorithm,
                             options.ignore_whitespace,
                             &mut stats,
                             suspect_is_ignored,
-                        )?;
+                        );
                         hunks_to_blame = process_changes(hunks_to_blame, changes.clone(), suspect, parent_origin);
                         if let Some((old_data, new_data)) = data {
                             ignored_passes.push((parent_origin, changes, old_data, new_data));
@@ -473,11 +607,25 @@ pub fn file(
                 }
             }
 
+            if renamed_whole_blame {
+                // `goto finish` before `sb->num_commits++`. A merge whose *later* scapegoat is the
+                // one holding the file under a new name would also have had git skip the earlier
+                // scapegoats' `pass_blame_to_parent()`, since it resolves all of them before it
+                // diffs against any; those patches are counted here.
+                stats.num_commits -= 1;
+                continue 'origin;
+            }
+
             // "Pass remaining suspects for ignored commits to their parents." (`blame.c`, `pass_blame`)
             for (parent_origin, changes, parent_blob, target_blob) in &ignored_passes {
                 if !hunks_to_blame.iter().any(|hunk| hunk.has_suspect(&suspect)) {
                     break;
                 }
+                // A second `pass_blame_to_parent()`, so a second `sb->num_get_patch++`
+                // (`blame.c:2500`). Both origins still hold the blobs the first pass read, so it
+                // reads nothing; git then drops the parent's "so we can refresh the fingerprints
+                // if we use the parent again" (`blame.c:2502-2506`).
+                stats.num_get_patch += 1;
                 hunks_to_blame = process_ignored_changes(
                     hunks_to_blame,
                     changes,
@@ -486,6 +634,7 @@ pub fn file(
                     parent_blob,
                     target_blob,
                 );
+                origin_files.drop_blob(parent_origin);
             }
 
             // "Optionally find moves in parents' files." (`blame.c`, `pass_blame`)
@@ -498,6 +647,7 @@ pub fn file(
                     &blamed_file_blob,
                     &blamed_line_starts,
                     &odb,
+                    &mut origin_files,
                     options.diff_algorithm,
                     options.ignore_whitespace,
                     &mut stats,
@@ -516,6 +666,7 @@ pub fn file(
                     &blamed_line_starts,
                     &mut paths,
                     &odb,
+                    &mut origin_files,
                     &mut diff_state,
                     options.diff_algorithm,
                     options.ignore_whitespace,
@@ -544,6 +695,17 @@ pub fn file(
                 true
             });
             sort_batch_from(&mut out, batch_start);
+
+            // `pass_blame()`'s `finish:` (`blame.c:2572-2579`): every scapegoat that came away
+            // with nothing releases its blob, and so does the origin that was just processed —
+            // which is why the same blob can be read more than once over a walk, and why
+            // [`Statistics::num_read_blob`] is larger than the number of distinct blobs involved.
+            for (parent_origin, _) in &move_parents {
+                if !hunks_to_blame.iter().any(|hunk| hunk.has_suspect(parent_origin)) {
+                    origin_files.drop_blob(parent_origin);
+                }
+            }
+            origin_files.drop_blob(&suspect);
         }
     }
 
@@ -559,13 +721,73 @@ pub fn file(
     // I don’t know yet whether it would make sense to use a data structure instead that preserves
     // order on insertion.
     out.sort_by_key(|a| a.start_in_blamed_file);
+    let entries = coalesce_blame_entries(out);
+    let key_of = |origin: &Suspect| -> OriginKey { (origin.commit_id, paths.source_file_name(origin.path)) };
+    let suspect_previous: BTreeMap<OriginKey, OriginKey> = origin_previous
+        .iter()
+        .map(|(origin, parent)| (key_of(origin), key_of(parent)))
+        .collect();
+    let suspect_refcounts = suspect_refcounts(&entry_counts(&entries), &suspect_previous);
     Ok(Outcome {
-        entries: coalesce_blame_entries(out),
+        entries,
         uncoalesced_entries,
         blob: blamed_file_blob,
         statistics: stats,
         blame_path,
+        suspect_refcounts,
+        suspect_previous,
     })
+}
+
+/// How many blame entries name each origin, which is how many references those entries hold.
+pub(super) fn entry_counts(entries: &[BlameEntry]) -> BTreeMap<OriginKey, u32> {
+    let mut counts: BTreeMap<OriginKey, u32> = BTreeMap::new();
+    for entry in entries {
+        *counts
+            .entry((entry.commit_id, entry.source_file_name.clone()))
+            .or_default() += 1;
+    }
+    counts
+}
+
+/// git's `blame_origin::refcnt` for every origin still alive once the walk is over — the `%02d`
+/// column of `git blame --score-debug` (`builtin/blame.c:535`).
+///
+/// The references an origin can still be under at that point are the blame entries that name it —
+/// one each, since `blame_coalesce()` drops a reference for every entry it merges away
+/// (`blame.c:1201`), so `entries` must be the *coalesced* list the output is printed from — and
+/// the [`Outcome::suspect_previous`] pointers of other origins. A `previous` pointer only counts
+/// while the origin holding it is itself alive, because `blame_origin_decref()` follows the chain
+/// down as it frees (`blame.c:48-49`); so liveness is a closure over `previous`, seeded by the
+/// origins that have entries. Origins outside that closure have already been freed and are absent
+/// from the result.
+///
+/// A caller that lays a working-tree overlay over the walk's entries counts the fake commit's own
+/// entries under the null id and, unless it passed the whole blame down
+/// ([`FakeCommit::passes_whole_blame`](crate::FakeCommit::passes_whole_blame)), adds its `previous`
+/// edge from that key to the origin at the suspect.
+pub fn suspect_refcounts(
+    entries: &BTreeMap<OriginKey, u32>,
+    previous: &BTreeMap<OriginKey, OriginKey>,
+) -> BTreeMap<OriginKey, u32> {
+    let mut live: std::collections::BTreeSet<OriginKey> = entries.keys().cloned().collect();
+    let mut pending: Vec<OriginKey> = live.iter().cloned().collect();
+    while let Some(key) = pending.pop() {
+        if let Some(parent) = previous.get(&key) {
+            if live.insert(parent.clone()) {
+                pending.push(parent.clone());
+            }
+        }
+    }
+
+    let mut refcounts = entries.clone();
+    for key in &live {
+        if let Some(parent) = previous.get(key) {
+            *refcounts.entry(parent.clone()).or_default() += 1;
+        }
+    }
+    refcounts.retain(|key, _| live.contains(key));
+    refcounts
 }
 
 /// Order the entries `out` gained since it was `batch_start` long by their position in the
@@ -931,60 +1153,26 @@ fn tree_diff_with_rewrites_at_file_path(
 /// the exact `(old, new)` bytes that were diffed, for the `--ignore-rev` fingerprints.
 type BlobChanges = (Vec<Change>, Option<(Vec<u8>, Vec<u8>)>);
 
-#[expect(clippy::too_many_arguments)]
+/// `pass_blame_to_parent()`'s `diff_hunks()` (`blame.c:1967`) over the two blobs the origins are
+/// holding.
+///
+/// The bytes come straight out of [`OriginFiles`] rather than through a
+/// [`gix_diff::blob::Platform`], because `git blame` never consults the `diff` attribute:
+/// `fill_origin_blob()` (`blame.c:1031-1058`) reads the blob with `odb_read_object()` and hands
+/// those bytes to the diff, so a path marked `-diff` (or matched by the `binary` macro) is still
+/// diffed line by line. `prepare_diff()` does apply that attribute — it classifies such a resource
+/// as `Data::Binary`, whose `as_slice()` is `None` — and diffing the two empty buffers that left
+/// produced no hunks at all, so a hunk spanning more lines than the parent's blob has was passed
+/// to that parent unchanged and the walk then indexed the parent's line table out of bounds
+/// (`blame -s sub/nested.txt` on a `-diff` path panicked rather than printing a blame).
 fn blob_changes(
-    odb: impl gix_object::Find + gix_object::FindHeader,
-    resource_cache: &mut gix_diff::blob::Platform,
-    oid: ObjectId,
-    previous_oid: ObjectId,
-    file_path: &BStr,
-    previous_file_path: &BStr,
+    old_data: &[u8],
+    new_data: &[u8],
     diff_algorithm: gix_diff::blob::Algorithm,
     ignore_whitespace: bool,
     stats: &mut Statistics,
     collect_data: bool,
-) -> Result<BlobChanges, Error> {
-    resource_cache.set_resource(
-        previous_oid,
-        gix_object::tree::EntryKind::Blob,
-        previous_file_path,
-        gix_diff::blob::ResourceKind::OldOrSource,
-        &odb,
-    )?;
-    resource_cache.set_resource(
-        oid,
-        gix_object::tree::EntryKind::Blob,
-        file_path,
-        gix_diff::blob::ResourceKind::NewOrDestination,
-        &odb,
-    )?;
-
-    let outcome = resource_cache.prepare_diff()?;
-    // `git blame` never consults the `diff` attribute. `fill_origin_blob()` (`blame.c:1031-1058`)
-    // reads the blob with `odb_read_object()` and hands those bytes straight to `diff_hunks()`, so
-    // a path marked `-diff` (or matched by the `binary` macro) is still diffed line by line.
-    //
-    // `prepare_diff()` does apply that attribute: it classifies such a resource as
-    // `Data::Binary`, whose `as_slice()` is `None`. Taking `unwrap_or_default()` there diffed two
-    // empty buffers, which produced no hunks at all — so a hunk spanning more lines than the
-    // parent's blob has was passed to that parent unchanged, and the walk then indexed the
-    // parent's line table out of bounds (`blame -s sub/nested.txt` on a `-diff` path panicked
-    // rather than printing a blame). Falling back to the object read reproduces git.
-    let (old_raw, new_raw);
-    let old_data = match outcome.old.data.as_slice() {
-        Some(data) => data,
-        None => {
-            old_raw = odb.find_blob(&previous_oid, &mut Vec::new())?.data.to_vec();
-            old_raw.as_slice()
-        }
-    };
-    let new_data = match outcome.new.data.as_slice() {
-        Some(data) => data,
-        None => {
-            new_raw = odb.find_blob(&oid, &mut Vec::new())?.data.to_vec();
-            new_raw.as_slice()
-        }
-    };
+) -> BlobChanges {
     // The `--ignore-rev` re-attribution fingerprints exactly the bytes that were diffed here, as
     // git does by reusing `blame_origin::file` for both.
     let data = collect_data.then(|| (old_data.to_vec(), new_data.to_vec()));
@@ -1049,7 +1237,7 @@ fn blob_changes(
     }
 
     stats.blobs_diffed += 1;
-    Ok((changes, data))
+    (changes, data)
 }
 
 fn find_path_entry_in_commit(
@@ -1104,6 +1292,24 @@ fn collect_parents(
         }
     }
     Ok(parent_ids)
+}
+
+/// `first_scapegoat()` under `sb->reverse` (`blame.c:2379`):
+/// `lookup_decoration(&revs->children, commit)`, paired with each child's commit time so the queue
+/// can be fed the same way the parents feed it walking backwards.
+fn collect_children(
+    children: &Children,
+    commit_id: &ObjectId,
+    odb: &impl gix_object::Find,
+    cache: Option<&gix_commitgraph::Graph>,
+    buf: &mut Vec<u8>,
+) -> Result<ParentIds, Error> {
+    let mut child_ids: ParentIds = Default::default();
+    for child in children.get(commit_id).into_iter().flatten() {
+        let commit_time = find_commit(cache, odb, child, buf)?.commit_time()?;
+        child_ids.push((*child, commit_time));
+    }
+    Ok(child_ids)
 }
 
 /// Return an iterator over tokens for use in diffing. These are usually lines, but it's important

@@ -61,6 +61,35 @@ impl Transaction<'_, '_> {
         }
     }
 
+    /// Follow the symref chain starting at `start` and return the object id it ends on,
+    /// or `None` if the chain is dangling or longer than git's `SYMREF_MAXDEPTH`.
+    ///
+    /// Mirrors the `refs_resolve_ref_unsafe(&refs->base, referent.buf, 0, &lock->old_oid, NULL)`
+    /// call `lock_ref_for_update()` (refs/files-backend.c) makes for a symbolic reference
+    /// updated with `REF_NO_DEREF`: the reflog's "old" side is the value the symref resolved
+    /// to, not a null id.
+    fn resolve_symref_chain(
+        store: &file::Store,
+        start: &FullName,
+        packed: Option<&packed::Buffer>,
+    ) -> Option<gix_hash::ObjectId> {
+        let mut name = start.clone();
+        // git's SYMREF_MAXDEPTH.
+        for _ in 0..5 {
+            match Self::read_existing_ref(store, name.as_ref(), packed).ok()?? {
+                Reference {
+                    target: Target::Object(id),
+                    ..
+                } => return Some(id),
+                Reference {
+                    target: Target::Symbolic(next),
+                    ..
+                } => name = next,
+            }
+        }
+        None
+    }
+
     fn lock_ref_and_apply_change(
         store: &file::Store,
         lock_fail_mode: gix_lock::acquire::Fail,
@@ -79,6 +108,10 @@ impl Transaction<'_, '_> {
         // so acquiring it would fail or open the device instead of
         // returning the configured validation error.
         store.check_windows_device_name(change.update.name.as_ref())?;
+
+        // Set when the reference being updated is itself symbolic: see [`Self::resolve_symref_chain`].
+        // Applied after the borrow of `change.update.change` below ends.
+        let mut symref_previous_oid = None;
 
         let lock = match &mut change.update.change {
             Change::Delete { expected, .. } => {
@@ -144,6 +177,14 @@ impl Transaction<'_, '_> {
                 let mut lock = obtain_lock()?;
 
                 let existing_ref = Self::read_existing_ref(store, change.update.name.as_ref(), packed)?;
+
+                if let Some(Reference {
+                    target: Target::Symbolic(referent),
+                    ..
+                }) = &existing_ref
+                {
+                    symref_previous_oid = Self::resolve_symref_chain(store, referent, packed);
+                }
 
                 match (&expected, &existing_ref) {
                     (PreviousValue::Any, _)
@@ -218,6 +259,11 @@ impl Transaction<'_, '_> {
                 }
             }
         };
+        // Only a fallback: a symref that *is* being dereferenced gets the same value written
+        // here again by its split-off child once that child is locked.
+        if let Some(oid) = symref_previous_oid {
+            change.leaf_referent_previous_oid = Some(oid);
+        }
         change.lock = lock;
         Ok(())
     }
@@ -256,6 +302,7 @@ impl Transaction<'_, '_> {
                 lock: None,
                 parent_index: None,
                 leaf_referent_previous_oid: None,
+                log_only_split: false,
             })
             .collect();
         updates
@@ -272,9 +319,132 @@ impl Transaction<'_, '_> {
                     lock: None,
                     parent_index: Some(idx),
                     leaf_referent_previous_oid: None,
+                    log_only_split: false,
                 },
             )
             .map_err(Error::PreprocessingFailed)?;
+
+        // Identify the halves that are git's `REF_LOG_ONLY` rather than a caller asking for
+        // gix's reflog-only deletion — see [`Edit::log_only_split`]. `split_symref_update()`
+        // hands the referent the caller's original mode and forces `RefLog::Only` on the
+        // symbolic half, so a child that still deletes its reference marks its parent as the
+        // log-only mirror of a real deletion.
+        for idx in 0..updates.len() {
+            let Some(parent) = updates[idx].parent_index else { continue };
+            if matches!(
+                updates[idx].update.change,
+                Change::Delete {
+                    log: RefLog::AndReference,
+                    ..
+                }
+            ) {
+                updates[parent].log_only_split = true;
+            }
+        }
+
+        // `split_head_update()` (refs/files-backend.c): "If update is a direct update of
+        // head_ref (the reference pointed to by HEAD), then add an extra REF_LOG_ONLY update
+        // for HEAD." Without it `update-ref refs/heads/main <rev>` on the checked-out branch
+        // moves the branch but leaves `.git/logs/HEAD` short one entry.
+        //
+        // `head_ref` is HEAD's *immediate* referent (git resolves it with
+        // `RESOLVE_REF_NO_RECURSE`) and only counts when HEAD is symbolic.
+        //
+        // A transaction that migrates refs into `packed-refs` is exempt: `files_pack_refs()`
+        // stamps its updates `REF_SKIP_CREATE_REFLOG`, which `split_head_update()` checks
+        // first. Packing changes no value, so a `HEAD` entry would be pure noise — and these
+        // transactions commit without a committer, so demanding a reflog fails them outright.
+        let packing_refs = matches!(
+            self.packed_refs,
+            PackedRefs::DeletionsAndNonSymbolicUpdates(_)
+                | PackedRefs::DeletionsAndNonSymbolicUpdatesRemoveLooseSourceReference(_)
+        );
+        let head_splits = if packing_refs {
+            Vec::new()
+        } else {
+            let head_name: FullName = "HEAD".try_into().expect("HEAD is a valid ref name");
+            let head_referent = store
+                .find_existing_inner(head_name.as_ref().as_partial_name(), None)
+                .ok()
+                .and_then(|r| match r.target {
+                    Target::Symbolic(referent) => Some(referent),
+                    Target::Object(_) => None,
+                });
+            match head_referent {
+                None => Vec::new(),
+                Some(head_ref) => {
+                    // git errors out on a transaction that already touches HEAD; we simply
+                    // leave such a transaction alone, since the caller has stated what the
+                    // HEAD entry should be and `assure_one_name_has_one_edit` above would
+                    // otherwise have to be re-run.
+                    let head_already_edited = updates.iter().any(|e| e.update.name == head_name);
+                    let mut splits = Vec::new();
+                    if !head_already_edited {
+                        for idx in 0..updates.len() {
+                            if updates[idx].update.name != head_ref {
+                                continue;
+                            }
+                            // `REF_LOG_ONLY` and `REF_UPDATE_VIA_HEAD` both suppress the split;
+                            // the latter is what a `HEAD` deref already produced, so the entry
+                            // would be a duplicate.
+                            if log_mode_of(&updates[idx].update.change) == RefLog::Only
+                                || has_head_ancestor(&updates, idx)
+                            {
+                                continue;
+                            }
+                            // git mirrors deletions too, carrying `update->msg` onto the
+                            // `HEAD` entry. `Change::Delete` has no message field, so the
+                            // mirror could only ever be message-less where git writes a
+                            // messaged line — and the delete-through-`HEAD` path that *is*
+                            // reachable (`update-ref -d HEAD`) gets its entry from
+                            // `split_symref_update` instead, which this does not touch.
+                            // Deleting a branch by name while it is checked out therefore
+                            // leaves `.git/logs/HEAD` alone here; `git branch -m` writes that
+                            // entry itself, with the message.
+                            let Change::Update { log, new, .. } = &updates[idx].update.change else {
+                                continue;
+                            };
+                            let mirrored = Change::Update {
+                                log: LogChange {
+                                    mode: RefLog::Only,
+                                    force_create_reflog: log.force_create_reflog,
+                                    message: log.message.clone(),
+                                },
+                                expected: PreviousValue::Any,
+                                new: new.clone(),
+                            };
+                            splits.push((
+                                idx,
+                                Edit {
+                                    update: RefEdit {
+                                        change: mirrored,
+                                        name: head_name.clone(),
+                                        deref: false,
+                                    },
+                                    lock: None,
+                                    parent_index: None,
+                                    leaf_referent_previous_oid: None,
+                                    log_only_split: false,
+                                },
+                            ));
+                            // At most one edit can name `head_ref` — `pre_process` above
+                            // already rejected duplicates — and at most one HEAD entry may
+                            // exist, so stop after the first match.
+                            break;
+                        }
+                    }
+                    splits
+                }
+            }
+        };
+        // `(index of the branch update, index of the HEAD log-only update)`.
+        let head_split_indices: Vec<(usize, usize)> = head_splits
+            .into_iter()
+            .map(|(branch_idx, edit)| {
+                updates.push(edit);
+                (branch_idx, updates.len() - 1)
+            })
+            .collect();
 
         let mut maybe_updates_for_packed_refs = match self.packed_refs {
             PackedRefs::DeletionsAndNonSymbolicUpdates(_)
@@ -427,6 +597,16 @@ impl Transaction<'_, '_> {
                 }
             }
         }
+
+        // `lock_ref_for_update()`: a `REF_LOG_VIA_SPLIT` update copies `old_oid` from its
+        // parent lock, so the HEAD entry reads exactly like the branch entry it mirrors.
+        for (branch_idx, head_idx) in head_split_indices {
+            if let Some(crate::TargetRef::Object(oid)) = updates[branch_idx].update.change.previous_value() {
+                let oid = oid.to_owned();
+                updates[head_idx].leaf_referent_previous_oid = Some(oid);
+            }
+        }
+
         self.updates = Some(updates);
         Ok(self)
     }
@@ -444,6 +624,32 @@ impl Transaction<'_, '_> {
             .map(|updates| updates.into_iter().map(|u| u.update).collect())
             .unwrap_or_default()
     }
+}
+
+/// The reflog mode an edit carries, whichever kind of change it is.
+fn log_mode_of(change: &Change) -> RefLog {
+    match change {
+        Change::Update {
+            log: LogChange { mode, .. },
+            ..
+        } => *mode,
+        Change::Delete { log, .. } => *log,
+    }
+}
+
+/// Whether `idx` was split off (transitively) from an edit named `HEAD`.
+///
+/// This is git's `REF_UPDATE_VIA_HEAD`, which `split_symref_update()` sets when the symref
+/// being dereferenced is `HEAD` and which propagates to further splits through `new_flags`.
+fn has_head_ancestor(updates: &[Edit], idx: usize) -> bool {
+    let mut cursor = updates[idx].parent_index;
+    while let Some(parent_idx) = cursor {
+        if updates[parent_idx].update.name.as_bstr() == "HEAD" {
+            return true;
+        }
+        cursor = updates[parent_idx].parent_index;
+    }
+    false
 }
 
 fn possibly_adjust_name_for_prefixes(name: &FullNameRef) -> Option<FullName> {

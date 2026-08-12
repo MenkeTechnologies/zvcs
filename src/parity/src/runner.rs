@@ -562,14 +562,32 @@ const GAP_MARKERS: &[&str] = &[
 /// stdout, *out of `Match`* — a case that was passing only by coincidence.
 /// Nothing here can turn a failure into a pass.
 ///
-/// Matching English prose is the wrong mechanism and is only used because the
-/// port has no other channel for this. See the note on [`GAP_MARKERS`] and the
-/// harness report: a distinctive exit status (git leaves 129 free for usage
-/// errors; something like 125 is unclaimed) or a machine-readable line such as
-/// `zvcs: unported: <command> <flag>` would make this exact, and would not
-/// silently drift the next time an error message is reworded.
+/// A marker only counts on a line spoken in *this port's own voice*. `fatal.rs`
+/// makes that a type-level distinction and states the invariant the scan relies
+/// on: a message git itself would `die()` with is rendered exactly as git renders
+/// it, while a gap keeps the `zvcs: <verb>: …` prefix, because "a port that has
+/// not implemented something and says so in git's voice is lying about its own
+/// coverage". Git never writes `zvcs: `, so the prefix is the machine-readable
+/// channel the note below asked for — no new protocol, just the one the port
+/// already guarantees.
+///
+/// Scanning the whole of stderr instead scored four cases as gaps where zvcs was
+/// byte-identical to stock — stdout, stderr *and* exit code — because the marker
+/// sat inside git's own text that zvcs correctly reproduces: `error: unsupported
+/// option 'bogus'` (column), `usage: working without -z is not supported`
+/// (diff-pairs), and `fatal: replaying merge commits is not supported yet!`
+/// (replay, twice). Reproducing git exactly is the thing being measured, so the
+/// old scan penalised the port for succeeding, and any rewording to escape it
+/// would have been a real parity regression.
+///
+/// Narrowing the scan cannot inflate the score. A case that leaves this bucket is
+/// not thereby a pass — it is compared on stdout, exit code and repository state
+/// like every other case, and matches only if all of them agree with stock.
 fn is_unsupported(stderr: &str) -> bool {
-    GAP_MARKERS.iter().any(|m| stderr.contains(m))
+    stderr
+        .lines()
+        .filter(|l| l.trim_start().starts_with("zvcs: "))
+        .any(|l| GAP_MARKERS.iter().any(|m| l.contains(m)))
 }
 
 fn looks_like_panic(stderr: &str) -> bool {
@@ -708,4 +726,36 @@ pub fn locate_zvcs_bin(explicit: Option<&str>) -> Result<PathBuf> {
         }
     }
     anyhow::bail!("no zvcs `git` binary found; run `cargo build` first")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_unsupported;
+
+    /// A gap is only a gap when the port says so in its own voice.
+    ///
+    /// Every string here is a real stderr captured from one of the two binaries;
+    /// the `git_*` cases are stock git 2.55.0's own wording, reproduced
+    /// byte-for-byte by zvcs, and scoring them as gaps marked the port down for
+    /// being correct.
+    #[test]
+    fn only_the_ports_own_voice_counts_as_a_gap() {
+        // zvcs speaking for itself: `zvcs: <verb>: …`, exit 1 (see `fatal.rs`).
+        assert!(is_unsupported("zvcs: history: `history fixup` is not ported: requires a commit-replay engine\n"));
+        assert!(is_unsupported("zvcs: jump: unsupported mode \"diff\"\n"));
+        assert!(is_unsupported("zvcs: diff: unsupported option \"--no-such-flag\"\n"));
+
+        // git's own wording, which zvcs reproduces exactly. Not a gap.
+        assert!(!is_unsupported("error: unsupported option 'bogus'\n"));
+        assert!(!is_unsupported("usage: working without -z is not supported\n"));
+        assert!(!is_unsupported("fatal: replaying merge commits is not supported yet!\n"));
+        assert!(!is_unsupported("fatal: Argument not supported for format 'tar': -9\n"));
+        assert!(!is_unsupported("warning: --no-curl not supported in this build\n"));
+
+        // A gap reported alongside git-voiced output is still a gap.
+        assert!(is_unsupported("error: unsupported option 'bogus'\nzvcs: column: --mode is not ported\n"));
+
+        // The prefix alone is not enough; the line must actually claim a gap.
+        assert!(!is_unsupported("zvcs: commit: nothing to commit\n"));
+    }
 }

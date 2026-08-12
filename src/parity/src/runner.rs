@@ -517,16 +517,43 @@ fn probe_storage(repo: &Path) -> String {
     format!("# storage-layout\nloose {loose}\n{listing}")
 }
 
-/// Strip the two things that legitimately differ between two copies of the same
-/// repo: their filesystem paths, and the binary's own name in usage text.
+/// Strip the three things that legitimately differ between two copies of the same
+/// repo: their filesystem paths, and where each binary is installed.
 ///
 /// This is the only masking applied, and it is intentionally narrow. Every
 /// widening of this function weakens the parity number, so it stays auditable
 /// in one place.
-fn normalize(raw: &[u8], repo: &Path, home: &Path) -> String {
+///
+/// `exec_dir` is the side's *own* exec-path — where git looks for `git-<verb>`
+/// helpers, as that side reports it. A few commands print it: `git p4`'s usage is
+/// built from `sys.argv[0]`, and `git help --all` heads its listing with
+/// `available git commands in '<exec-path>'`. Masking it is not a favour to the
+/// port, it is the same fact the `<REPO>` and `<HOME>` tokens already encode —
+/// established by running the *same stock git 2.55.0* from two prefixes:
+///
+/// ```text
+/// A: usage: …/stockgit/git/2.55.0/libexec/git-core/git-p4 <command> [options]
+/// B: usage: …/stock2/git/2.55.0/libexec/git-core/git-p4   <command> [options]
+/// ```
+///
+/// Identical exit codes, identical text, one differing path — stock fails the
+/// case against itself. A comparison that a binary cannot pass against its own
+/// twin is measuring the filesystem, not the implementation.
+///
+/// It is a substitution of one known, computed path per side, never a pattern
+/// over arbitrary paths: nothing about *what* the command printed is hidden, only
+/// where this particular copy happens to live. Every other byte still has to
+/// agree, which is why `version --build-options` still fails — its values
+/// describe a C toolchain, not a location.
+fn normalize(raw: &[u8], repo: &Path, home: &Path, exec_dir: &Path) -> String {
     let mut s = String::from_utf8_lossy(raw).into_owned();
-    for (path, token) in [(repo, "<REPO>"), (home, "<HOME>")] {
+    // Exec-path first: on the zvcs side it lives under `home`, so masking `home`
+    // ahead of it would rewrite the prefix and leave the two sides unequal.
+    for (path, token) in [(exec_dir, "<EXEC-PATH>"), (repo, "<REPO>"), (home, "<HOME>")] {
         let p = path.to_string_lossy().into_owned();
+        if p.is_empty() {
+            continue;
+        }
         s = s.replace(&p, token);
         // Both the symlinked and resolved forms show up on macOS (/tmp vs /private/tmp).
         if let Ok(canon) = path.canonicalize() {
@@ -534,6 +561,39 @@ fn normalize(raw: &[u8], repo: &Path, home: &Path) -> String {
         }
     }
     s
+}
+
+/// What `bin` reports as its exec-path, under the same hardened environment the
+/// cases run in.
+///
+/// Asked of the binary rather than derived from its location: git computes it
+/// from its own installation layout, and zvcs answers `$GIT_EXEC_PATH` else
+/// `$HOME/.zvcs/bin`. Guessing either would mask the wrong string, and masking a
+/// string neither side prints is worse than masking nothing.
+/// The stock side's exec-path, resolved once for the whole run.
+fn stock_exec_dir(home: &Path) -> &'static Path {
+    static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| match crate::stock::git() {
+        Ok(bin) => exec_path_of(bin, home),
+        Err(_) => PathBuf::new(),
+    })
+}
+
+/// The binary-under-test's exec-path, resolved once for the whole run.
+fn zvcs_exec_dir(bin: &Path, home: &Path) -> &'static Path {
+    static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| exec_path_of(bin, home))
+}
+
+fn exec_path_of(bin: &Path, home: &Path) -> PathBuf {
+    let mut cmd = Command::new(bin);
+    cmd.arg("--exec-path").current_dir(std::env::temp_dir());
+    env::harden(&mut cmd, home);
+    cmd.output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| PathBuf::from(String::from_utf8_lossy(&o.stdout).trim().to_string()))
+        .unwrap_or_default()
 }
 
 /// Every phrase the port uses to say "I have not implemented this".
@@ -615,12 +675,18 @@ pub fn run_case(
     let stock_state = probe_state(&stock_repo, home);
     let zvcs_state = probe_state(&zvcs_repo, home);
 
-    let stock_stdout = normalize(&stock.stdout, &stock_repo, home);
-    let zvcs_stdout = normalize(&zvcs.stdout, &zvcs_repo, home);
-    let stock_stderr = normalize(&stock.stderr, &stock_repo, home);
-    let zvcs_stderr = normalize(&zvcs.stderr, &zvcs_repo, home);
-    let stock_state_n = normalize(stock_state.as_bytes(), &stock_repo, home);
-    let zvcs_state_n = normalize(zvcs_state.as_bytes(), &zvcs_repo, home);
+    // Asked of each binary once per run, not per case: 4000+ cases would
+    // otherwise pay two extra child processes each for an answer that cannot
+    // change while the run is in flight.
+    let stock_exec = stock_exec_dir(home);
+    let zvcs_exec = zvcs_exec_dir(zvcs_bin, home);
+
+    let stock_stdout = normalize(&stock.stdout, &stock_repo, home, stock_exec);
+    let zvcs_stdout = normalize(&zvcs.stdout, &zvcs_repo, home, zvcs_exec);
+    let stock_stderr = normalize(&stock.stderr, &stock_repo, home, stock_exec);
+    let zvcs_stderr = normalize(&zvcs.stderr, &zvcs_repo, home, zvcs_exec);
+    let stock_state_n = normalize(stock_state.as_bytes(), &stock_repo, home, stock_exec);
+    let zvcs_state_n = normalize(zvcs_state.as_bytes(), &zvcs_repo, home, zvcs_exec);
 
     // Ordering matters: a crash outranks a gap, and a gap outranks the ordinary
     // diffs it would otherwise masquerade as.
@@ -699,10 +765,10 @@ fn stock_disagrees_with_itself(
     templates.instantiate(case.shape, &repo)?;
     let home = &templates.home;
     let again = run_side(crate::stock::git()?, &repo, home, &case.args, case.stdin)?;
-    if normalize(&again.stdout, &repo, home) != *first_stdout {
+    if normalize(&again.stdout, &repo, home, stock_exec_dir(home)) != *first_stdout {
         return Ok(true);
     }
-    let again_state = normalize(probe_state(&repo, home).as_bytes(), &repo, home);
+    let again_state = normalize(probe_state(&repo, home).as_bytes(), &repo, home, stock_exec_dir(home));
     Ok(again_state != *first_state)
 }
 

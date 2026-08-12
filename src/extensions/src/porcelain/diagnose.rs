@@ -54,17 +54,14 @@
 //!     the archive is larger. The deflate coder that would close this lives in
 //!     `porcelain::archive`'s private `gzip` module and is not reachable from
 //!     here; no second deflate implementation was written to fake it.
-//!   * **The version block is abridged.** `get_version_info()` prints C build
-//!     configuration baked in at compile time (`sizeof-long`, `shell-path`,
-//!     `rust`, `feature`, `gettext`, `libcurl`, `OpenSSL`, `zlib`, `SHA-1`,
-//!     `SHA-256`, `default-ref-format`, `default-hash`). A Rust binary on
-//!     gitoxide has no such state, so [`version_info`] omits those lines rather
-//!     than copying stock's values into a diagnostic report. The lines it does
-//!     print are the ones that are *not* build configuration and can be answered
-//!     honestly: the version string (shared with `git version` through
-//!     [`super::version::GIT_VERSION`], so the two can never disagree), `cpu:`
-//!     (git's `GIT_HOST_CPU`, i.e. `uname -m`), the no-build-commit line, and
-//!     `sizeof-size_t`.
+//!   * **The version block describes this build, not stock's.** [`version_info`]
+//!     is `cmd_diagnose()`'s `get_version_info(&buf, 1)` and is rendered by
+//!     [`super::version::get_version_info`] — the same function
+//!     `git version --build-options` uses, as in git. It reports every line that
+//!     is true of a Rust binary on gitoxide and omits the ones naming C
+//!     components this build does not link (`gettext`, `libcurl`, `OpenSSL`,
+//!     `zlib`, `SHA-256`); nothing is copied from stock. That function's docs
+//!     carry the line-by-line reasoning.
 //!   * **No repository is not a crash.** Stock dereferences `r->objects` with no
 //!     repository and dies of `SIGSEGV` (exit 139) after leaving a zero-byte
 //!     zip behind; verified against git 2.55.0. This port writes the archive
@@ -85,7 +82,7 @@
 use anyhow::{bail, Result};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
+use std::process::ExitCode;
 
 /// The usage block, byte-identical to stock `git diagnose -h`.
 const USAGE: &str = "\
@@ -374,45 +371,15 @@ impl Setup {
     }
 }
 
-/// `get_version_info(buf, 1)`, restricted to what is true of *this* binary.
+/// `cmd_diagnose()`'s `get_version_info(&buf, 1)`.
 ///
-/// The C build-configuration fields are deliberately absent; see the module
-/// docs. `porcelain::bugreport` prints the same block under its
-/// `git version:` header, so the two reports never disagree.
+/// The one implementation lives in [`super::version`], which is also where
+/// `git version --build-options` renders it — in git the two share
+/// `get_version_info()`, and here they share it too, so a report can never
+/// describe a different build than `git version` does.
+/// `porcelain::bugreport` prints the same block under its `git version:` header.
 pub(crate) fn version_info(out: &mut String) {
-    // The version this port reports, shared with `git version` — reporting the
-    // crate version here made the same binary answer `2.55.0` to `git version`
-    // and `0.14.11` to `git diagnose`.
-    out.push_str(&format!(
-        "git version {}\n",
-        super::version::GIT_VERSION
-    ));
-    out.push_str(&format!("cpu: {}\n", host_cpu()));
-    out.push_str("no commit associated with this build\n");
-    out.push_str(&format!("sizeof-size_t: {}\n", std::mem::size_of::<usize>()));
-}
-
-/// `GIT_HOST_CPU`, which the Makefile defines as
-/// `$(firstword $(subst -, ,$(uname_M)))` — `uname -m` truncated at its first
-/// `-`. This is a fact about the running host, not about how a C binary was
-/// compiled, so it is reportable; `std::env::consts::ARCH` is not the same thing
-/// (it is the Rust target arch, and prints `aarch64` where `uname -m` and stock
-/// git both say `arm64`).
-fn host_cpu() -> String {
-    match Command::new("uname").arg("-m").output() {
-        Ok(o) if o.status.success() => {
-            let text = String::from_utf8_lossy(&o.stdout);
-            let machine = text.trim();
-            let first = machine.split('-').next().unwrap_or(machine);
-            if first.is_empty() {
-                std::env::consts::ARCH.to_string()
-            } else {
-                first.to_string()
-            }
-        }
-        // Without `uname` there is nothing better to say than the target arch.
-        _ => std::env::consts::ARCH.to_string(),
-    }
+    super::version::get_version_info(out, true);
 }
 
 /// `create_diagnostics_archive()` — write the report to stdout and the archive

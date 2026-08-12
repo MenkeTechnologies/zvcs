@@ -24,21 +24,25 @@
 //!     an abbreviation (`--no-b`). `--no-build-options` leaves the flag clear,
 //!     so it prints exactly the plain-`git version` output.
 //!
-//! Faithfully unsupported — `--build-options` `bail!`s rather than emitting
-//! divergent output. Every line it prints is the C build configuration of the
-//! *stock* binary: `cpu:` (`GIT_HOST_CPU`), the build commit, `sizeof-long` /
-//! `sizeof-size_t`, `shell-path` (`SHELL_PATH`), the compiled-in `feature:`
-//! list, `gettext:`, the linked `libcurl:` and `zlib:` versions, and the
-//! `SHA-1:` / `SHA-256:` backend names. Those are properties of how a C program
-//! was compiled and linked; a Rust binary built from gitoxide has no honest way
-//! to report them, and guessing them would be fabrication. `diagnose.rs` records
-//! the same conclusion for the report section that embeds this output.
+//!   * `--build-options` — [`get_version_info`], reduced to the lines that are
+//!     true of *this* binary. Each of git's lines is either reported honestly or
+//!     left out; none is copied from stock. See [`get_version_info`] for the
+//!     line-by-line reasoning. `git diagnose` and `git bugreport` embed the same
+//!     block through the same function, exactly as `cmd_diagnose()` embeds
+//!     `get_version_info(&buf, 1)`, so the three can never disagree.
+//!
+//! The build report will not match stock's byte for byte, and is not meant to:
+//! it describes a Rust binary on gitoxide, not a C binary on zlib/libcurl. The
+//! values that differ do so because they are *true here and false there*
+//! (`rust: enabled`, `SHA-1: sha1-checked`), and the lines that are absent are
+//! absent because this build has no such component to report — the same reason
+//! git's own `#ifdef`s drop `libcurl:` from a build without curl.
 //!
 //! Note that `git <cmd> --help` never reaches a builtin: `git.c` rewrites it to
 //! `git help <cmd>` before dispatch, so `--help` is not handled here.
 
-use anyhow::{bail, Result};
-use std::process::ExitCode;
+use anyhow::Result;
+use std::process::{Command, ExitCode};
 
 /// The git version this port reproduces, as printed by `git version`.
 ///
@@ -103,17 +107,107 @@ pub fn version(args: &[String]) -> Result<ExitCode> {
         }
     }
 
-    if build_options {
-        bail!(
-            "--build-options is not supported: every line it prints (cpu, build commit, \
-             sizeof-long/size_t, shell-path, feature list, gettext, libcurl, zlib, the \
-             SHA-1/SHA-256 backend names) is the C build configuration of the stock binary, \
-             which a Rust build from gitoxide cannot report honestly"
-        );
-    }
-
-    println!("git version {GIT_VERSION}");
+    // `cmd_version`: build the whole report into one buffer, then print it.
+    let mut buf = String::new();
+    get_version_info(&mut buf, build_options);
+    print!("{buf}");
     Ok(ExitCode::SUCCESS)
+}
+
+/// The shell a `!`-prefixed alias is run through (`alias::run_shell_alias`).
+///
+/// git's `SHELL_PATH` is an absolute path chosen at compile time; this binary
+/// spawns `sh` and lets the OS resolve it on `PATH`, so `sh` — not `/bin/sh` —
+/// is what it actually runs.
+const SHELL_PATH: &str = "sh";
+
+/// The SHA-1 implementation this build links: the `sha1-checked` crate, which
+/// `gix-hash` drives with the same collision-detection algorithm git uses.
+///
+/// git's `SHA1_BACKEND` names a C library (`SHA1_DC`, `BLK_SHA1`,
+/// `OPENSSL_SHA1`, …). None of those is linked here, so the crate is named
+/// instead; printing git's token would claim a C dependency that does not exist.
+const SHA1_BACKEND: &str = "sha1-checked";
+
+/// Port of `get_version_info()` (help.c), reduced to what is true of this
+/// binary. `git version --build-options`, `git diagnose` and `git bugreport` all
+/// render their version block through here, as they all call this function in
+/// git.
+///
+/// Reported, because each is a real property of *this* build:
+///   * `cpu:` — `GIT_HOST_CPU`, see [`host_cpu`].
+///   * the no-build-commit line — git's `git_built_from_commit_string[0] == 0`
+///     branch. Nothing embeds a commit in this binary, so that branch is the
+///     honest one.
+///   * `sizeof-long:` / `sizeof-size_t:` — the C `long` and `size_t` widths of
+///     the target this was compiled for, taken from `libc::c_long` and `usize`.
+///   * `shell-path:` — [`SHELL_PATH`].
+///   * `rust:` — git's `WITH_RUST`, "this build contains Rust code". It does.
+///   * `SHA-1:` — [`SHA1_BACKEND`].
+///   * `default-ref-format:` / `default-hash:` — `files` and `sha1`. Both are
+///     the defaults here *and* the only formats this port accepts;
+///     `porcelain::init` rejects `--ref-format=reftable` and
+///     `--object-format=sha256` for want of a backend.
+///
+/// Omitted, because this build has no such component — the same reason git's own
+/// `#ifdef`s drop a line:
+///   * `feature: fsmonitor--daemon` — git prints it when
+///     `fsmonitor_ipc__is_supported()`. Only the *client* half is ported
+///     (`porcelain::fsmonitor__daemon`); there is no IPC server to talk to.
+///   * `gettext:` — no message catalogs are compiled in.
+///   * `libcurl:` / `OpenSSL:` — the transport is reqwest + rustls, a pure-Rust
+///     stack; neither C library is linked.
+///   * `zlib:` / `zlib-ng:` — git prints the `ZLIB_VERSION` of the library it
+///     links. This build links no zlib: `gix-zlib`'s deflate is an in-tree
+///     transcription of zlib's `deflate.c`/`trees.c` and its inflate is
+///     `zlib-rs`. Neither carries a `ZLIB_VERSION`, and quoting one would name a
+///     library that is not there.
+///   * `SHA-256:` — git prints it unconditionally because it always has a
+///     backend. The `sha2` crate is not in this build's dependency graph, so
+///     there is nothing to name.
+pub(crate) fn get_version_info(out: &mut String, show_build_options: bool) {
+    // "The format of this string should be kept stable for compatibility with
+    // external projects that rely on the output of `git version`."
+    out.push_str(&format!("git version {GIT_VERSION}\n"));
+
+    if !show_build_options {
+        return;
+    }
+    out.push_str(&format!("cpu: {}\n", host_cpu()));
+    out.push_str("no commit associated with this build\n");
+    out.push_str(&format!(
+        "sizeof-long: {}\n",
+        std::mem::size_of::<libc::c_long>()
+    ));
+    out.push_str(&format!("sizeof-size_t: {}\n", std::mem::size_of::<usize>()));
+    out.push_str(&format!("shell-path: {SHELL_PATH}\n"));
+    out.push_str("rust: enabled\n");
+    out.push_str(&format!("SHA-1: {SHA1_BACKEND}\n"));
+    out.push_str("default-ref-format: files\n");
+    out.push_str("default-hash: sha1\n");
+}
+
+/// `GIT_HOST_CPU`, which the Makefile defines as
+/// `$(firstword $(subst -, ,$(uname_M)))` — `uname -m` truncated at its first
+/// `-`. This is a fact about the host, not about how a C binary was compiled, so
+/// it is reportable; `std::env::consts::ARCH` is not the same thing (it is the
+/// Rust target arch, and prints `aarch64` where `uname -m` and stock git both
+/// say `arm64`).
+fn host_cpu() -> String {
+    match Command::new("uname").arg("-m").output() {
+        Ok(o) if o.status.success() => {
+            let text = String::from_utf8_lossy(&o.stdout);
+            let machine = text.trim();
+            let first = machine.split('-').next().unwrap_or(machine);
+            if first.is_empty() {
+                std::env::consts::ARCH.to_string()
+            } else {
+                first.to_string()
+            }
+        }
+        // Without `uname` there is nothing better to say than the target arch.
+        _ => std::env::consts::ARCH.to_string(),
+    }
 }
 
 /// Resolve a long-option spelling (already stripped of `--` and any `=value`).

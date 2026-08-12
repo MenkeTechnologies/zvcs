@@ -640,7 +640,7 @@ fn hostname() -> Option<String> {
 /// bin directory where the shadow's `git-*` helper symlinks live (`$HOME/.zvcs/bin`).
 /// Unlike stock git's `libexec/git-core`, the shadow serves every `git-*` helper from
 /// one binary, so that install dir is the honest answer.
-fn exec_path() -> String {
+pub(crate) fn exec_path() -> String {
     if let Ok(p) = std::env::var("GIT_EXEC_PATH") {
         if !p.is_empty() {
             return p;

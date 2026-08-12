@@ -3,7 +3,8 @@
 //! Stock `git help` prints tables that live in git's generated
 //! `command-list.h`, compiled from `command-list.txt`. gitoxide carries no
 //! equivalent table, so this port holds the same data verbatim in the
-//! [`COMMON_HELP`], [`ALL_COMMANDS`], [`GUIDES`], [`USER_INTERFACES`] and
+//! [`GIT_USAGE_STRING`], [`COMMON_CMDS`], [`GIT_MORE_INFO_STRING`],
+//! [`ALL_COMMANDS`], [`GUIDES`], [`USER_INTERFACES`] and
 //! [`DEVELOPER_INTERFACES`] blocks below, transcribed from git 2.55.0. These
 //! are static in git as well — they move only when git itself gains, drops or
 //! renames a command — so they are reproduced rather than computed, and they
@@ -15,6 +16,13 @@
 //!     dynamic `External commands` section (a `git-*` scan of `PATH`) and the
 //!     `Command aliases` section (from `alias.*` config), plus the
 //!     `--[no-]external-commands` / `--[no-]aliases` toggles.
+//!   * `git help -a --no-verbose` — `list_commands()`: the synopsis, the
+//!     `available git commands in '<exec-path>'` heading, the loaded command
+//!     list column-formatted through [`super::column`] exactly as
+//!     `pretty_print_cmdnames()` does, the trailer, and then the common help
+//!     that `cmd_help` falls through to. The *set* of names matches stock
+//!     byte-for-byte; the exec-path in the heading names this installation and
+//!     so necessarily differs from stock's `libexec/git-core`.
 //!   * `git help -g`/`--guides`, `--user-interfaces`, `--developer-interfaces`.
 //!   * `git help -c`/`--config` — every configuration variable name plus git's
 //!     `'git help config' for more information` trailer, from the [`CONFIG_VARS`]
@@ -42,27 +50,30 @@
 //!     "doesn't take any non-option arguments" errors, with git's exact text,
 //!     stream and exit code 129.
 //!
-//! Faithfully unsupported — each `bail!`s rather than emitting divergent
-//! output: `-a --no-verbose` (git scans the git-core exec-path directory for
-//! its individual `git-*` helper binaries and column-formats that on-disk set,
-//! which a single-binary port cannot reproduce byte-for-byte), and a configured
-//! `man.viewer` other than plain `man`.
+//! Faithfully unsupported — `bail!`s rather than emitting divergent output: a
+//! configured `man.viewer` other than plain `man`.
 
+use super::column;
 use anyhow::{bail, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, ExitStatus};
 
-/// `git help` with no arguments.
-const COMMON_HELP: &str = r#"usage: git [-v | --version] [-h | --help] [-C <path>] [-c <name>=<value>]
+/// `git.c`'s `git_usage_string`. Both `git help` with no arguments and
+/// `git help --all --no-verbose` open with it, each via
+/// `printf(_("usage: %s%s"), _(git_usage_string), "\n\n")`, so it is held apart
+/// from the command table that follows rather than baked into one blob.
+const GIT_USAGE_STRING: &str = r#"git [-v | --version] [-h | --help] [-C <path>] [-c <name>=<value>]
            [--exec-path[=<path>]] [--html-path] [--man-path] [--info-path]
            [-p | --paginate | -P | --no-pager] [--no-replace-objects] [--no-lazy-fetch]
            [--no-optional-locks] [--no-advice] [--bare] [--git-dir=<path>]
            [--work-tree=<path>] [--namespace=<name>] [--config-env=<name>=<envvar>]
-           <command> [<args>]
+           <command> [<args>]"#;
 
-These are common Git commands used in various situations:
+/// `list_common_cmds_help()`: the `command-list.txt` groups flagged `common`,
+/// in git's declaration order.
+const COMMON_CMDS: &str = r#"These are common Git commands used in various situations:
 
 start a working area (see also: git help tutorial)
    clone      Clone a repository into a new directory
@@ -97,12 +108,19 @@ collaborate (see also: git help workflows)
    fetch      Download objects and refs from another repository
    pull       Fetch from and integrate with another repository or a local branch
    push       Update remote refs along with associated objects
+"#;
 
-'git help -a' and 'git help -g' list available subcommands and some
+/// `git.c`'s `git_more_info_string`, the trailer every listing closes with.
+const GIT_MORE_INFO_STRING: &str = r#"'git help -a' and 'git help -g' list available subcommands and some
 concept guides. See 'git help <command>' or 'git help <concept>'
 to read about a specific subcommand or concept.
-See 'git help git' for an overview of the system.
-"#;
+See 'git help git' for an overview of the system."#;
+
+/// `cmd_help`'s no-topic tail (`builtin/help.c`): the synopsis, the common
+/// command groups, then the trailer — its three `printf`s, in order.
+fn common_help() -> String {
+    format!("usage: {GIT_USAGE_STRING}\n\n{COMMON_CMDS}\n{GIT_MORE_INFO_STRING}\n")
+}
 
 /// The static half of `git help -a`: every category from `command-list.txt`
 /// with its commands and descriptions. External commands and aliases are
@@ -1578,19 +1596,23 @@ pub fn help(args: &[String]) -> Result<ExitCode> {
     match mode {
         Some(Mode::All) => {
             if !verbose {
-                // git's non-verbose `-a` runs `list_commands()`, which scans the
-                // git-core exec-path directory for its `git-*` helper binaries
-                // (`checkout--worker`, `merge-octopus`, `sh-i18n--envsubst`, …)
-                // and column-formats that on-disk set — not the static
-                // `command-list.txt` table used by the verbose form. This port
-                // is a single binary with no such exec-path directory of
-                // individual helpers, so there is no faithful data source to
-                // reproduce that listing byte-for-byte.
-                bail!(
-                    "`git help --all --no-verbose` is not supported: it column-formats the \
-                     git-* helper binaries found in git's exec-path directory, a set this \
-                     single-binary port has no notion of"
-                );
+                // `cmd_help`'s non-verbose `--all`: the synopsis, then
+                // `list_commands()` over the loaded command list, then the
+                // trailer. That arm `break`s rather than returning, and `--all`
+                // has already rejected any operand, so `cmd_help` falls straight
+                // into its no-topic tail and prints the common help as well —
+                // the output really does carry two synopses and two trailers.
+                let (main_cmds, other_cmds) = load_command_list();
+                let listing = match list_commands(&main_cmds, &other_cmds) {
+                    Ok(text) => text,
+                    Err(err) => {
+                        eprint!("{err}");
+                        return Ok(ExitCode::from(128));
+                    }
+                };
+                print!("usage: {GIT_USAGE_STRING}\n\n{listing}{GIT_MORE_INFO_STRING}\n");
+                print!("{}", common_help());
+                return Ok(ExitCode::SUCCESS);
             }
             print!("{}", render_all(externals, aliases));
             Ok(ExitCode::SUCCESS)
@@ -1628,7 +1650,7 @@ pub fn help(args: &[String]) -> Result<ExitCode> {
         }
         None => {
             let Some(topic) = rest.first() else {
-                print!("{COMMON_HELP}");
+                print!("{}", common_help());
                 return Ok(ExitCode::SUCCESS);
             };
             // git reads `git_help_config` only once it has a topic, then lets
@@ -1751,53 +1773,124 @@ fn config_keys_uniq(f: fn(&str) -> &str) -> BTreeSet<&'static str> {
     CONFIG_VARS.lines().filter(|l| !l.is_empty()).map(f).collect()
 }
 
-/// `git-*` executables reachable through `PATH` that are neither known git
-/// commands nor shipped in git's exec-path — git lists the latter under their
-/// own categories instead.
-///
-/// `load_command_list()` builds `main_cmds` by listing the `git-*` files in the
-/// exec-path directory and then has `exclude_cmds()` subtract that set from the
-/// `PATH` scan, so a helper git itself provides never appears as "external" even
-/// when a copy of it also sits on `PATH`. This binary's exec-path is its own
-/// directory and holds no `git-*` helpers, so the equivalent set is the dispatch
-/// table: every verb this binary serves *is* a helper the installation provides.
-/// Without it, `git help --all` listed the four helpers Homebrew symlinks into
-/// `PATH` — `receive-pack`, `shell`, `upload-archive`, `upload-pack` — under
-/// "External commands", where stock lists none of them. [`command_names`] alone
-/// does not cover these: they are dispatched but not named in the categorised
-/// listing `--all` prints.
-fn external_commands() -> BTreeSet<String> {
-    let mut known = command_names();
-    known.extend(
-        crate::dispatch::PORCELAIN_VERBS
-            .iter()
-            .map(|v| (*v).to_string()),
-    );
-    let exec_path = git_exec_path();
+/// Port of `list_commands_in_dir()` (help.c): the `git-*` executables directly
+/// inside `dir`, with the prefix stripped. An unreadable directory yields
+/// nothing, as `opendir()` failing does.
+fn list_commands_in_dir(dir: &Path) -> BTreeSet<String> {
     let mut found = BTreeSet::new();
-
-    let Some(path) = std::env::var_os("PATH") else {
+    let Ok(entries) = std::fs::read_dir(dir) else {
         return found;
     };
-    for dir in std::env::split_paths(&path) {
-        if exec_path.as_deref() == Some(dir.as_path()) {
-            continue;
-        }
-        let Ok(entries) = std::fs::read_dir(&dir) else {
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str().and_then(|n| n.strip_prefix("git-")) else {
             continue;
         };
-        for entry in entries.flatten() {
-            let file_name = entry.file_name();
-            let Some(name) = file_name.to_str().and_then(|n| n.strip_prefix("git-")) else {
-                continue;
-            };
-            if name.is_empty() || known.contains(name) || !is_executable_file(&entry.path()) {
-                continue;
-            }
-            found.insert(name.to_string());
+        if name.is_empty() || !is_executable_file(&entry.path()) {
+            continue;
         }
+        found.insert(name.to_string());
     }
     found
+}
+
+/// Port of `load_command_list("git-", &main_cmds, &other_cmds)` (help.c): the
+/// two halves every `--all` form is built from, sorted and de-duplicated (git's
+/// `QSORT(cmdname_compare)` + `uniq()`, which `BTreeSet` gives for the ASCII
+/// names involved).
+///
+/// `main_cmds` is `load_builtin_commands()` — git's compiled-in command table —
+/// plus the `git-*` files in the exec-path directory. This binary serves every
+/// git-compat verb from one executable, so its compiled-in table is
+/// [`crate::dispatch::PORCELAIN_VERBS`]; the exec-path scan is still performed,
+/// because an installation may drop a real `git-*` helper next to the shadow.
+///
+/// `other_cmds` is the `$PATH` scan with `exclude_cmds()` applied, so a helper
+/// the installation itself provides is never also listed as external. That is
+/// what keeps the four helpers Homebrew symlinks into `PATH` — `receive-pack`,
+/// `shell`, `upload-archive`, `upload-pack` — out of the external list, exactly
+/// as stock keeps them out via its own `libexec/git-core` copies. The exclusion
+/// is widened by [`command_names`]: those are commands whose manual pages this
+/// installation ships and whose names `git help -a` already prints under a
+/// category, so listing them a second time as "external" would contradict the
+/// table printed directly above.
+fn load_command_list() -> (BTreeSet<String>, BTreeSet<String>) {
+    let exec_dir = PathBuf::from(crate::exec_path());
+
+    let mut main_cmds: BTreeSet<String> = crate::dispatch::PORCELAIN_VERBS
+        .iter()
+        .map(|v| (*v).to_string())
+        .collect();
+    main_cmds.extend(list_commands_in_dir(&exec_dir));
+
+    let mut other_cmds = BTreeSet::new();
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            if dir == exec_dir {
+                continue;
+            }
+            other_cmds.extend(list_commands_in_dir(&dir));
+        }
+    }
+    let documented = command_names();
+    other_cmds.retain(|n| !main_cmds.contains(n) && !documented.contains(n));
+
+    (main_cmds, other_cmds)
+}
+
+/// `git-*` executables reachable through `PATH` that this installation does not
+/// itself provide — `load_command_list()`'s `other_cmds`, which is what both
+/// `list_all_cmds_help()` (via `list_all_other_cmds()`) and `list_commands()`
+/// print as external.
+fn external_commands() -> BTreeSet<String> {
+    load_command_list().1
+}
+
+/// Port of `list_commands()` (help.c): the exec-path listing, then the `$PATH`
+/// listing, each preceded by its heading and a blank line and followed by
+/// another blank line. Returns git's config-error text when `column.*` holds a
+/// value `git_column_config()` rejects, which is fatal there too.
+fn list_commands(
+    main_cmds: &BTreeSet<String>,
+    other_cmds: &BTreeSet<String>,
+) -> Result<String, String> {
+    // `repo_config(the_repository, get_colopts, &colopts)`, whose callback is
+    // `git_column_config(var, value, "help", colopts)` — `column.ui`, then
+    // `column.help`.
+    let mut colopts = column::DISABLED;
+    column::config_colopts(&mut colopts, "help")?;
+
+    let mut out = String::new();
+    if !main_cmds.is_empty() {
+        out.push_str(&format!(
+            "available git commands in '{}'\n\n",
+            crate::exec_path()
+        ));
+        out.push_str(&pretty_print_cmdnames(main_cmds, colopts));
+        out.push('\n');
+    }
+    if !other_cmds.is_empty() {
+        out.push_str("git commands available from elsewhere on your $PATH\n\n");
+        out.push_str(&pretty_print_cmdnames(other_cmds, colopts));
+        out.push('\n');
+    }
+    Ok(out)
+}
+
+/// Port of `pretty_print_cmdnames()` (help.c): the table is always rendered —
+/// its comment reads "always enable column display, we only consult `column.*`
+/// about layout strategy and stuff" — with a two-space indent, two spaces of
+/// padding, and the terminal's width.
+fn pretty_print_cmdnames(cmds: &BTreeSet<String>, colopts: u32) -> String {
+    let list: Vec<Vec<u8>> = cmds.iter().map(|n| n.as_bytes().to_vec()).collect();
+    let opts = column::ColumnOptions {
+        width: 0,
+        padding: 2,
+        indent: Some("  ".to_string()),
+        nl: None,
+    };
+    let bytes = column::layout(&list, column::force_enabled(colopts), &opts);
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 /// One row of the tables `git help -a` and `git help -g` print: the topic as the
@@ -1898,22 +1991,6 @@ fn is_executable_file(path: &Path) -> bool {
     {
         true
     }
-}
-
-/// git's exec-path: `GIT_EXEC_PATH` when set, else whatever the installed git
-/// reports. `None` when neither is available, in which case nothing is excluded
-/// from the `PATH` scan.
-fn git_exec_path() -> Option<PathBuf> {
-    if let Some(p) = std::env::var_os("GIT_EXEC_PATH") {
-        if !p.is_empty() {
-            return Some(PathBuf::from(p));
-        }
-    }
-    // This binary IS git: the helper directory is the one holding this
-    // executable, never whatever a foreign `git --exec-path` would report.
-    std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(PathBuf::from))
 }
 
 /// Every `alias.<name>` in the effective configuration, sorted by name, the

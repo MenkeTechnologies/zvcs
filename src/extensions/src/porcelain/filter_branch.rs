@@ -1250,10 +1250,20 @@ impl Progress {
     }
 
     fn report(&mut self, commit: &str) {
+        print!("{}", self.report_at(commit, now()));
+        let _ = std::io::stdout().flush();
+    }
+
+    /// One `report_progress` call with the clock supplied, returning the bytes
+    /// its `printf` writes.
+    ///
+    /// The script reads `date +%s` only inside the sampling branch; `now` is
+    /// read eagerly here and, as there, consulted only when that branch runs.
+    fn report_at(&mut self, commit: &str, now: i64) -> String {
         self.seen += 1;
         if self.seen > self.next_sample_at {
             self.count = self.seen;
-            let elapsed = now() - self.start;
+            let elapsed = now - self.start;
             let remaining = (self.commits - self.count) * elapsed / self.count;
             if elapsed > 0 {
                 self.next_sample_at = (elapsed + 1) * self.count / elapsed;
@@ -1262,11 +1272,10 @@ impl Progress {
             }
             self.progress = format!(" ({elapsed} seconds passed, remaining {remaining} predicted)");
         }
-        print!(
+        format!(
             "\rRewrite {commit} ({}/{}){}    ",
             self.count, self.commits, self.progress
-        );
-        let _ = std::io::stdout().flush();
+        )
     }
 }
 
@@ -2144,4 +2153,135 @@ fn entry_at(
     Ok(tree
         .lookup_entry_by_path(Path::new(path))?
         .map(|e| (e.mode(), e.id().detach())))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Progress;
+
+    /// A `Progress` with the clock pinned, so `report_at`'s `now` is an elapsed
+    /// count. `new` would read the real clock.
+    fn progress(commits: i64) -> Progress {
+        Progress {
+            commits,
+            count: 0,
+            seen: 0,
+            next_sample_at: 0,
+            progress: "dummy to ensure this is not empty".to_string(),
+            start: 0,
+        }
+    }
+
+    /// The `printf` at script line 363 writes no newline: a carriage return, the
+    /// line, then four spaces that cover the tail of whatever the previous entry
+    /// left on the terminal row. Both are load-bearing bytes on a redirected
+    /// stdout, which is where the differential harness reads them.
+    #[test]
+    fn report_is_a_carriage_return_and_four_trailing_spaces() {
+        let line = progress(2).report_at("edfab1b", 0);
+        assert_eq!(
+            line,
+            "\rRewrite edfab1b (1/2) (0 seconds passed, remaining 0 predicted)    "
+        );
+        assert!(!line.contains('\n'));
+    }
+
+    /// `progress` is seeded with a placeholder (script line 372) that only shows
+    /// if the sampling branch has never run. It cannot: `seen` is 1 and
+    /// `next_sample_at` is 0 on the first call, so the very first line already
+    /// carries a real measurement.
+    #[test]
+    fn the_placeholder_never_reaches_stdout() {
+        assert!(!progress(3).report_at("edfab1b", 0).contains("dummy"));
+    }
+
+    /// Captured from git 2.55.0: a four-commit history under
+    /// `filter-branch -f --tree-filter 'sleep 1' HEAD`, which spends a second per
+    /// commit. The counter stops at 2/4 because sampling at `elapsed` 1 pushes
+    /// `next_sample_at` to 4, and `seen > next_sample_at` is then never true
+    /// again — stock reprints the stale count and the stale prediction verbatim.
+    #[test]
+    fn the_counter_freezes_once_the_sample_interval_outruns_the_history() {
+        let mut p = progress(4);
+        let lines: Vec<String> = [("edfab1b", 0), ("2d98e86", 1), ("d4cf82a", 2), ("f781761", 3)]
+            .iter()
+            .map(|(commit, now)| p.report_at(commit, *now))
+            .collect();
+        assert_eq!(
+            lines,
+            vec![
+                "\rRewrite edfab1b (1/4) (0 seconds passed, remaining 0 predicted)    ",
+                "\rRewrite 2d98e86 (2/4) (1 seconds passed, remaining 1 predicted)    ",
+                "\rRewrite d4cf82a (2/4) (1 seconds passed, remaining 1 predicted)    ",
+                "\rRewrite f781761 (2/4) (1 seconds passed, remaining 1 predicted)    ",
+            ]
+        );
+    }
+
+    /// Also captured from git 2.55.0, on the same history when the first two
+    /// commits land inside the same wall-clock second: the counter reaches 3/4
+    /// before `next_sample_at` jumps to 6, and the fourth commit reprints 3/4.
+    /// The prediction is integer division — `(4 - 3) * 1 / 3` is 0, not 1.
+    #[test]
+    fn a_later_first_sample_freezes_the_counter_one_commit_later() {
+        let mut p = progress(4);
+        let lines: Vec<String> = [("edfab1b", 0), ("2d98e86", 0), ("d4cf82a", 1), ("f781761", 1)]
+            .iter()
+            .map(|(commit, now)| p.report_at(commit, *now))
+            .collect();
+        assert_eq!(
+            lines,
+            vec![
+                "\rRewrite edfab1b (1/4) (0 seconds passed, remaining 0 predicted)    ",
+                "\rRewrite 2d98e86 (2/4) (0 seconds passed, remaining 0 predicted)    ",
+                "\rRewrite d4cf82a (3/4) (1 seconds passed, remaining 0 predicted)    ",
+                "\rRewrite f781761 (3/4) (1 seconds passed, remaining 0 predicted)    ",
+            ]
+        );
+    }
+
+    /// Captured from git 2.55.0 on a six-commit history whose tree filter sleeps
+    /// once: the counter thaws again when `seen` finally passes `next_sample_at`.
+    /// This is the sequence that pins the interval itself — sampling at
+    /// `elapsed` 1 with `count` 2 sets `next_sample_at` to `(1 + 1) * 2 / 1`,
+    /// i.e. 4, so the fifth commit samples and the sixth does not. Any other
+    /// multiplier leaves the counter stuck at 2/6 for the rest of the run.
+    #[test]
+    fn the_counter_thaws_when_the_sample_interval_is_reached_again() {
+        let mut p = progress(6);
+        let counts: Vec<String> = [0, 1, 1, 1, 2, 2]
+            .iter()
+            .map(|now| p.report_at("c", *now))
+            .collect();
+        assert_eq!(
+            counts,
+            vec![
+                "\rRewrite c (1/6) (0 seconds passed, remaining 0 predicted)    ",
+                "\rRewrite c (2/6) (1 seconds passed, remaining 2 predicted)    ",
+                "\rRewrite c (2/6) (1 seconds passed, remaining 2 predicted)    ",
+                "\rRewrite c (2/6) (1 seconds passed, remaining 2 predicted)    ",
+                "\rRewrite c (5/6) (2 seconds passed, remaining 0 predicted)    ",
+                "\rRewrite c (5/6) (2 seconds passed, remaining 0 predicted)    ",
+            ]
+        );
+    }
+
+    /// The whole-run shape on a fixture small enough that no second elapses,
+    /// which is what the differential corpus compares: every commit samples, the
+    /// counter tracks it, and the entries run together with no separator beyond
+    /// the carriage return.
+    #[test]
+    fn an_instant_rewrite_numbers_every_commit() {
+        let mut p = progress(3);
+        let stream: String = ["edfab1b", "5915d79", "07e86d1"]
+            .iter()
+            .map(|commit| p.report_at(commit, 0))
+            .collect();
+        assert_eq!(
+            stream,
+            "\rRewrite edfab1b (1/3) (0 seconds passed, remaining 0 predicted)    \
+             \rRewrite 5915d79 (2/3) (0 seconds passed, remaining 0 predicted)    \
+             \rRewrite 07e86d1 (3/3) (0 seconds passed, remaining 0 predicted)    "
+        );
+    }
 }

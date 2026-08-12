@@ -535,15 +535,31 @@ objects, level 6) goes from 4.04s to 4.93s, while loose-object writes at git's
 default level 1 are unchanged at 0.44s and get 8% smaller, because zlib-ng's
 level-1 coder trades ratio for speed.
 
-One limit is structural rather than unfinished work.
+Two limits are structural rather than unfinished work.
+
 **A handful of commands print a path into their own installation** —
 `git p4`'s usage embeds `sys.argv[0]`, and `git help --all --no-verbose` heads its
-listing with `available git commands in '<exec-path>'` and then column-formats the
-individual `git-*` helper binaries it finds in that directory — so no independent
+listing with `available git commands in '<exec-path>'` — so no independent
 implementation can reproduce those bytes. Matching them would mean reporting some
 other installation's `libexec/git-core` as this binary's own exec-path, which
-would be false, and reproducing an on-disk set of helper executables (`sh-setup`,
-`mergetool--lib`, `merge-octopus`) that a single-binary port does not have.
+would be false. Everything below that heading does match: the command names stock
+lists are exactly the ones this binary dispatches, laid out through the same
+`column` engine at the same width, followed by the same trailer and the same
+fall-through to the common help. Stock's `libexec/git-core` shell libraries
+(`git-sh-setup`, `git-sh-i18n`, `git-mergetool--lib`) are not in that listing on
+either side — they are not executable, so `list_commands_in_dir()` skips them.
+
+**`git version --build-options` describes the build that prints it.** Stock
+reports the C toolchain it was compiled and linked against; this binary reports
+what is true of a Rust binary on gitoxide and omits the rest, rather than copying
+stock's values into a report about itself. `cpu`, the no-build-commit line,
+`sizeof-long`, `sizeof-size_t`, `default-ref-format` and `default-hash` agree with
+stock because they are the same facts; `rust: enabled`, `shell-path: sh` and
+`SHA-1: sha1-checked` disagree because the answers really are different here; and
+`gettext`, `libcurl`, `OpenSSL`, `zlib` and `SHA-256` are absent because no such
+component is linked — the same reason git's own `#ifdef`s drop a line. The same
+block is what `git diagnose` and `git bugreport` embed, through the same function
+git shares between them.
 
 `subtree`, `filter-branch` and `instaweb` are ported directly from their stock
 shell scripts. `subtree add`, `merge`, `pull`, `split`, and `push` all produce

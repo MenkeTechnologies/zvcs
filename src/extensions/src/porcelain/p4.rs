@@ -19,11 +19,15 @@
 //!
 //! ### Covered (byte-identical stdout/stderr and exit code against git 2.55.0)
 //!
-//! * `main()`'s dispatch: no arguments at all prints [`print_usage`] on stdout
-//!   and exits 2; an unrecognized subcommand prints `unknown command <name>`,
-//!   a blank line, then the same usage block, and exits 2. Both banners echo
-//!   the script's `sys.argv[0]`, which git sets to `$GIT_EXEC_PATH/git-p4` —
-//!   see [`prog_path`] for how that is recovered.
+//! * `main()`'s dispatch: no arguments at all prints [`usage_block`] on stdout
+//!   and exits 2; anything `commands` does not name — including `-h` and
+//!   `--no-such-flag`, which reach the table as `sys.argv[1]` before any option
+//!   parsing — prints `unknown command <name>`, a blank line, then the same
+//!   usage block, and exits 2. Both banners echo the script's `sys.argv[0]`,
+//!   the `git-p4` git resolved out of its exec-path; see [`prog_path`]. That
+//!   one substring is installation-specific and is the only part of these four
+//!   invocations that cannot agree with stock's, since the two installations
+//!   keep their helpers in different directories.
 //! * The `optparse` option scan for `sync`, `rebase`, `clone`, `branches` and
 //!   `unshelve`: exact and unique-prefix long-option matching, `--opt=value`
 //!   and `--opt value`, bundled and attached short options (including the `-/`
@@ -215,7 +219,7 @@ pub fn p4(args: &[String]) -> Result<ExitCode> {
 
     // `if len(sys.argv[1:]) == 0: printUsage(...); sys.exit(2)`.
     let Some(cmd_name) = args.first() else {
-        print!("{}", usage_block()?);
+        print!("{}", usage_block());
         return Ok(ExitCode::from(2));
     };
 
@@ -223,7 +227,7 @@ pub fn p4(args: &[String]) -> Result<ExitCode> {
         // `except KeyError:` — the message, a blank line, then the usage block.
         println!("unknown command {cmd_name}");
         println!();
-        print!("{}", usage_block()?);
+        print!("{}", usage_block());
         return Ok(ExitCode::from(2));
     };
 
@@ -352,30 +356,68 @@ fn option_list(cmd: &CommandDef) -> Vec<&'static OptDef> {
 }
 
 /// `printUsage(commands.keys())`, rendered into a string.
-fn usage_block() -> Result<String> {
-    let prog = prog_path()?;
-    Ok(format!(
+fn usage_block() -> String {
+    let prog = prog_path();
+    format!(
         "usage: {prog} <command> [options]\n\nvalid commands: {}\n\nTry {prog} <command> --help for \
          command specific help.\n\n",
         COMMANDS.join(", ")
-    ))
+    )
 }
 
-/// `sys.argv[0]` as git sets it when it execs the script: the absolute path
-/// `<exec-path>/git-p4`.
+/// `sys.argv[0]`: the `git-p4` program git would exec, spelled the way git
+/// spells it.
 ///
-/// git exports `GIT_EXEC_PATH` to every subcommand it runs, so that is where the
-/// value comes from. It is not derivable from gitoxide — the exec path is baked
-/// into the git binary — so an unset variable is an error rather than a guess,
-/// which would put a wrong path in the banner.
-fn prog_path() -> Result<String> {
-    match std::env::var("GIT_EXEC_PATH") {
-        Ok(dir) if !dir.is_empty() => Ok(format!("{dir}/git-p4")),
-        _ => crate::git_fatal!(
-            "cannot render the git-p4 usage banner: it echoes the script's own path \
-             ($GIT_EXEC_PATH/git-p4) and GIT_EXEC_PATH is unset"
-        ),
+/// git never writes this path down as a literal. `execv_dashed_external()`
+/// hands run-command the bare name `git-p4`, `setup_path()` has already
+/// prepended the exec-path to `PATH`, and `prepare_cmd()` resolves a name with
+/// no directory separator through `locate_in_PATH()` — the first `PATH` entry
+/// holding an executable of that name, joined as the entry is written — before
+/// exec'ing it. Measured against git 2.55.0: a `GIT_EXEC_PATH` directory that
+/// holds a `git-p4` wins; with none there the banner names the `PATH` entry
+/// that does hold one; a candidate that is not executable, or is a directory,
+/// is skipped rather than chosen; a relative `PATH` entry yields a relative
+/// path; and the empty entry POSIX reads as the current directory yields the
+/// bare `git-p4`.
+///
+/// The same scan runs here, over the shadow's own exec-path
+/// ([`crate::exec_path`] — `$GIT_EXEC_PATH`, else `$HOME/.zvcs/bin`, where
+/// `git zdashed` installs the `git-p4` entry that would be exec'd). The banner
+/// therefore differs from stock's in exactly one substring: each installation's
+/// own helper directory, the same difference `git --exec-path` reports.
+///
+/// With no `git-p4` anywhere there is nothing to resolve, and no git behaviour
+/// to copy either — stock git never reaches the script, it reports `p4` as not
+/// a git command. The shadow serves `p4` from this binary regardless, so the
+/// banner falls back to the exec-path spelling, which is the path an installed
+/// shadow resolves to.
+fn prog_path() -> String {
+    const HELPER: &str = "git-p4";
+    let exec_path = crate::exec_path();
+    let path = std::env::var("PATH").unwrap_or_default();
+    for dir in std::iter::once(exec_path.as_str()).chain(path.split(':')) {
+        let candidate = if dir.is_empty() {
+            HELPER.to_string()
+        } else {
+            format!("{dir}/{HELPER}")
+        };
+        if is_executable(&candidate) {
+            return candidate;
+        }
     }
+    format!("{exec_path}/{HELPER}")
+}
+
+/// git's `is_executable()`, the test `locate_in_PATH` accepts a candidate with:
+/// `stat` (so a symlink is followed), a regular file, and the *owner* execute
+/// bit — not `access(X_OK)`. Both distinctions are observable: a directory named
+/// `git-p4` is searchable and would pass `access`, and a file with only the
+/// group and other execute bits set has an execute bit but not that one; stock
+/// git skips each of them.
+fn is_executable(path: &str) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o100 != 0)
 }
 
 // ---------------------------------------------------------------------------

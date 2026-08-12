@@ -100,9 +100,10 @@ git rev-parse HEAD
 ```
 
 `git zshadow` then installs the permanent shadow — a `git` symlink and the
-`git-<verb>` dashed links in `~/.zvcs/bin`, every man page in `~/.zvcs/man`, and
-the forked zsh `_git` in `~/.zvcs/completions` — and prints the three shell lines
-that activate them (stdout is shell code only; the summary goes to stderr):
+`git-<verb>` dashed links in `~/.zvcs/bin`, every man page in `~/.zvcs/man`, the
+HTML documentation set in `~/.zvcs/share/doc/git-doc`, and the forked zsh `_git`
+in `~/.zvcs/completions` — and prints the three shell lines that activate them
+(stdout is shell code only; the summary goes to stderr):
 
 ```sh
 git zshadow                 # install, then print the lines
@@ -164,7 +165,7 @@ Two namespaces share one dispatch table (`src/extensions/src/dispatch.rs`):
 | Console | `zrepl` | interactive line console over **every** command — each line runs as `git <line>`, so the `z*` verbs and all git porcelain work alike (startup stats banner + Tab completion of every verb) |
 | Shell | `zcd` `zpwd` `zls` `zenv` `zunset` `zecho` `zmkdir` `ztouch` `zrm` `zcp` `zmv` `zcat` `zln` | shell builtins so `zrepl` drives like a shell — `zcd`/`zenv`/`zunset` mutate the console's cwd/environment and persist across lines; `zls` is a git-aware listing (per-file status like `eza --git`); `zmkdir`/`ztouch`/`zrm`/`zcp`/`zmv`/`zcat`/`zln` are native filesystem commands (`zrm`/`zmv` are on-disk, distinct from `git rm`/`git mv`) |
 | Discovery | `zverbs` | list every extension verb and its one-line usage (sourced from each verb's own `-h`) |
-| Setup | `zshadow [<dir>] [-n\|--print] [--all]` | install the whole `~/.zvcs` shadow — `git` shim + `git-<verb>` dashed links in `~/.zvcs/bin`, man pages in `~/.zvcs/man`, the forked zsh `_git` in `~/.zvcs/completions` — then print the `PATH`, `MANPATH`, and `fpath` lines on stdout (shell code only, so `eval "$(git zshadow)"` works; a line the environment already satisfies is printed commented out) |
+| Setup | `zshadow [<dir>] [-n\|--print] [--all]` | install the whole `~/.zvcs` shadow — `git` shim + `git-<verb>` dashed links in `~/.zvcs/bin`, man pages in `~/.zvcs/man`, the HTML doc set in `~/.zvcs/share/doc/git-doc`, the forked zsh `_git` in `~/.zvcs/completions` — then print the `PATH`, `MANPATH`, and `fpath` lines on stdout (shell code only, so `eval "$(git zshadow)"` works; a line the environment already satisfies is printed commented out) |
 | Health | `zdoctor` | environment health check — git shadow on PATH, daemon, ledger, man pages, MANPATH, dashed forms, installed completion (OK/WARN/FAIL, exits non-zero on FAIL) |
 | git-compat | every stock subcommand | dispatched natively; depth varies — see the parity report |
 
@@ -351,6 +352,25 @@ export MANPATH="$HOME/.zvcs/man:$MANPATH"
 man git-zsync
 ```
 
+`git help -w <cmd>` opens the HTML manual instead, so zvcs ships one: a page per
+git command, documentation topic and superset verb under
+`~/.zvcs/share/doc/git-doc`, which is what `git --html-path` reports (as
+`--man-path` and `--info-path` report the other two). It is generated from the
+same two tables the rest of `git help` reads — the `command-list` blocks
+`git help -a`/`-g` print, and the superset manual in `manpage.rs` — so a verb
+cannot exist without a page. A `z*` verb's page is its complete manual; a stock
+command's page carries git's own one-line description, the category it is filed
+under, whether this build dispatches it, and the cross-reference to the man page
+that holds the prose (git's asciidoc manual is not reproduced, and no page claims
+to be it). Pages are written on demand by `git help -w`, and all at once by
+`git zshadow` / `git zdashed`; nothing is generated at startup.
+
+```sh
+git --html-path                       # ~/.zvcs/share/doc/git-doc
+git help -w status                    # write git-status.html, open it
+git -c help.htmlpath=/elsewhere help -w status   # or point it at your own tree
+```
+
 ## [0x05] THE zdaemon COORDINATOR
 
 `zdaemon` is one machine-wide daemon (state under `~/.zvcs/`, socket
@@ -496,7 +516,34 @@ widely per subcommand; some are byte-faithful across their documented flag set,
 others implement the common flags and bail terse on the rest. A few subcommands
 are honest skeletons that name the missing substrate instead of pretending:
 the foreign-SCM bridges (`p4`, `cvsimport`, `cvsserver`, `cvsexportcommit`,
-`archimport`) have no gitoxide backing to port onto.
+`archimport`) have no gitoxide backing to port onto. Their *argument* surface is
+still git's — the option parsers, usage blocks and exit codes are ported from the
+stock Perl and Python, so an invocation that never reaches a Perforce or CVS
+server answers exactly as stock does; only the parts needing a foreign server
+refuse, by name.
+
+**Compressed output is byte-identical to stock.** `gix-zlib` no longer compresses
+through `zlib-rs`, whose zlib-ng-lineage match finders produce a valid but
+different deflate stream at levels 0 through 8. `gix_zlib::deflate` is a
+transcription of zlib's own `deflate.c` and `trees.c`, so a packfile, a bundle, a
+loose object and a `diff --binary` payload are the same bytes git would have
+written — which also means two clones of one history agree on disk, not merely on
+object ids. Decompression stays on `zlib-rs`, where the output is fixed by the
+format and it is the faster decoder. The cost is confined to compression and is
+paid where zlib is slower than zlib-ng: `pack-objects` over this repository (15098
+objects, level 6) goes from 4.04s to 4.93s, while loose-object writes at git's
+default level 1 are unchanged at 0.44s and get 8% smaller, because zlib-ng's
+level-1 coder trades ratio for speed.
+
+One limit is structural rather than unfinished work.
+**A handful of commands print a path into their own installation** —
+`git p4`'s usage embeds `sys.argv[0]`, and `git help --all --no-verbose` heads its
+listing with `available git commands in '<exec-path>'` and then column-formats the
+individual `git-*` helper binaries it finds in that directory — so no independent
+implementation can reproduce those bytes. Matching them would mean reporting some
+other installation's `libexec/git-core` as this binary's own exec-path, which
+would be false, and reproducing an on-disk set of helper executables (`sh-setup`,
+`mergetool--lib`, `merge-octopus`) that a single-binary port does not have.
 
 `subtree`, `filter-branch` and `instaweb` are ported directly from their stock
 shell scripts. `subtree add`, `merge`, `pull`, `split`, and `push` all produce

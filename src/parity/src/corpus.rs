@@ -154,6 +154,15 @@ pub fn cases() -> Vec<Case> {
     c.push(Case::new("reset", &["reset", "--hard"], Shape::Dirty));
     c.push(Case::new("reset", &["reset", "--soft", "HEAD~1"], Shape::Branched));
     c.push(Case::new("reset", &["reset", "--mixed", "HEAD"], Shape::Dirty));
+    // `reset --merge` over an unmerged index is the documented way out of a
+    // conflicted merge, and it is the path `revert --abort` takes. It needs
+    // `repo_read_index_unmerged()`, which collapses the stage 1/2/3 entries to a
+    // `CE_CONFLICTED` marker that `unpack_trees` skips `verify_uptodate` for;
+    // without it the command refused with `Entry '<p>' not uptodate` and exit 128
+    // where stock succeeds. No other case reaches it — the whole `reset` family
+    // ran against clean or merely dirty shapes.
+    c.push(Case::new("reset", &["reset", "--merge"], Shape::Conflicted));
+    c.push(Case::new("reset", &["reset", "--merge", "HEAD"], Shape::Conflicted));
     c.push(Case::new("commit", &["commit", "-m", "parity commit"], Shape::Dirty));
     c.push(Case::new("commit", &["commit", "-am", "parity commit all"], Shape::Dirty));
     c.push(Case::new("commit", &["commit", "--allow-empty", "-m", "empty"], Shape::Linear));

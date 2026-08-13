@@ -219,6 +219,16 @@ fn submodule_helper(out: &mut Vec<Case>) {
 
     out.push(Case::new("submodule--helper", &["submodule--helper", "status"], Shape::Submodule));
     out.push(Case::new("submodule--helper", &["submodule--helper", "status"], Shape::Linear));
+    // `module_foreach` parses with plain `parse_options`, so a flag *after* the
+    // command is permuted out of it — one operand is left, which takes the shell
+    // form and prints no `Entering` line. `git-submodule.sh` does not permute, so
+    // the two entry points genuinely differ here and the helper cannot simply
+    // forward. Nothing else in the corpus puts a flag after a `foreach` command.
+    out.push(Case::new(
+        "submodule--helper",
+        &["submodule--helper", "foreach", "does-not-exist", "-q"],
+        Shape::Submodule,
+    ));
     out.push(Case::new(
         "submodule--helper",
         &["submodule--helper", "status", "--recursive"],

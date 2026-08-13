@@ -81,6 +81,16 @@ fn cherry_pick(out: &mut Vec<Case>) {
     out.push(Case::new("cherry-pick", &["cherry-pick", "-s", "feature"], Shape::Branched));
     out.push(Case::new("cherry-pick", &["cherry-pick", "--ff", "feature"], Shape::Branched));
     out.push(Case::new("cherry-pick", &["cherry-pick", "--allow-empty", "feature"], Shape::Branched));
+    // A named strategy goes to `merge-<name>` as a child (sequencer.c's
+    // `try_merge_command`), which interpolates `-X` unquoted — so read-tree sees
+    // `--theirs` as an option and rejects it before looking at a tree. The port
+    // used to refuse with its own two-merge-base message and a different exit
+    // code, i.e. the right failure for the wrong reason.
+    out.push(Case::new(
+        "cherry-pick",
+        &["cherry-pick", "--strategy=resolve", "-Xtheirs", "feature"],
+        Shape::Branched,
+    ));
     // A merge commit needs an explicit mainline; without one it must be refused.
     out.push(Case::new("cherry-pick", &["cherry-pick", "-m", "1", "HEAD"], Shape::Merged));
     out.push(Case::new("cherry-pick", &["cherry-pick", "HEAD"], Shape::Merged));

@@ -496,6 +496,10 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
     // The accumulated `diff_setup_done()` output-format bits (see [`FMT_NAME`]).
     let mut fmt_mask: u32 = 0;
 
+    // The first `--diff-merges` style the inner `git log` would reject, held
+    // back until that log runs so the ordering matches upstream.
+    let mut bad_diff_merges: Option<String> = None;
+
     let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
@@ -523,6 +527,36 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
             Some(p) if a.starts_with("--") => (&a[..p], Some(&a[p + 1..])),
             _ => (a, None),
         };
+
+        // The shared `add_diff_options()` value checks (`--submodule`,
+        // `--word-diff`, `--unified`/`-U`, `--diff-algorithm`, the `--stat-*`
+        // widths). They run inside `parse_options()`, so a bad value is reported
+        // here — before any operand is classified or resolved — even though this
+        // port defers the rendering those options ask for.
+        let (shared_name, shared_value) = match a.strip_prefix("-U") {
+            // `-U` carries its value attached; a bare `-U` is the same as a bare
+            // `--unified` and passes no value to the callback.
+            Some("") => ("unified", None),
+            Some(v) => ("unified", Some(v)),
+            None => {
+                let bare = name.trim_start_matches('-');
+                // Options whose value may also be the next argv element see it
+                // either way. The ones that take an *optional* value
+                // (`--submodule`, `--word-diff`) are absent from that list, so
+                // they correctly never look past their own token.
+                let value = match inline {
+                    Some(v) => Some(v),
+                    None if LONG_TAKES_VALUE.contains(&name) => {
+                        args.get(i + 1).map(String::as_str)
+                    }
+                    None => None,
+                };
+                (bare, value)
+            }
+        };
+        if let Err(msg) = crate::diffopt::check(shared_name, shared_value) {
+            return Ok(option_error(&msg));
+        }
 
         match name {
             "--left-only" => opts.left_only = true,
@@ -569,7 +603,7 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
             "--abbrev" => {
                 opts.abbrev = match inline {
                     None => Abbrev::Len(7),
-                    Some(v) => match parse_abbrev_value(v) {
+                    Some(v) => match crate::abbrev::parse_opt_abbrev_value(v) {
                         Some(0) => Abbrev::Len(40),
                         Some(n) => Abbrev::Len(n.clamp(4, 40) as usize),
                         None => {
@@ -589,9 +623,23 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
             // are genuine no-ops here, not deferrals — accept them silently.
             "--full-index" | "--binary" | "--no-binary" | "--no-diff-merges"
             | "--remerge-diff" => {}
+            // `--diff-merges` is an `OPT_PASSTHRU_ARGV`, so its value is not
+            // checked here — it is handed to the inner `git log`, which dies on
+            // a style it does not know. Record the first bad one and report it
+            // where that log would have run (see below); reporting it now would
+            // put it ahead of the range resolution git does first.
             "--diff-merges" => {
-                if inline.is_none() {
-                    i += 1;
+                let value = match inline {
+                    Some(v) => Some(v.to_string()),
+                    None => {
+                        i += 1;
+                        args.get(i).cloned()
+                    }
+                };
+                if let Some(v) = value {
+                    if !crate::diffopt::diff_merges_is_valid(&v) && bad_diff_merges.is_none() {
+                        bad_diff_merges = Some(v);
+                    }
                 }
             }
             // The four mutually-exclusive `diff_setup_done()` output formats.
@@ -784,6 +832,14 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
         Ok(e) => e,
         Err(_) => return Ok(could_not_parse_log(&range1)),
     };
+    // The inner `git log` takes the range first and the forwarded `log_arg`
+    // after it (`range-diff.c` `read_patches()`), so a range it cannot resolve
+    // is reported ahead of a `--diff-merges` style it cannot parse — but a
+    // resolvable range1 lets the style error out, before range2 is ever tried.
+    if let Some(v) = &bad_diff_merges {
+        eprintln!("fatal: invalid value for '--diff-merges': '{v}'");
+        return Ok(log_parse_failed(&range1));
+    }
     let ends2 = match endpoints(&repo, &range2) {
         Ok(e) => e,
         Err(_) => return Ok(could_not_parse_log(&range2)),
@@ -927,6 +983,13 @@ fn could_not_parse_log(range: &str) -> ExitCode {
     );
     eprintln!("Use '--' to separate paths from revisions, like this:");
     eprintln!("'git <command> [<revision>...] -- [<file>...]'");
+    log_parse_failed(range)
+}
+
+/// `builtin/range-diff.c`'s own `error()` for a failed inner log, on its own:
+/// the caller has already printed whatever that log died with. Upstream's -1
+/// return is exit status 255.
+fn log_parse_failed(range: &str) -> ExitCode {
     eprintln!("error: could not parse log for '{range}'");
     ExitCode::from(255)
 }
@@ -1037,50 +1100,6 @@ fn git_parse_unsigned(value: &str, max: u64) -> Result<u64, MagnitudeError> {
     }
 }
 
-/// Port of `parse_opt_abbrev_cb()`'s value handling: `v = (int)strtol(arg, &end,
-/// 10)` requiring `arg` to be a whole number — optional leading ASCII
-/// whitespace, an optional `+`/`-` sign, at least one decimal digit, and no
-/// trailing bytes. `None` is upstream's `expects a numerical value` error. A
-/// value that overflows a C `long` is saturated and then truncated to `int`
-/// exactly as the assignment `int v = strtol(...)` does on a 64-bit host, so the
-/// pathological `--abbrev=<huge>` reproduces git's wrap.
-fn parse_abbrev_value(value: &str) -> Option<i32> {
-    let bytes = value.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() && matches!(bytes[i], b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r') {
-        i += 1;
-    }
-    let negative = match bytes.get(i) {
-        Some(b'+') => {
-            i += 1;
-            false
-        }
-        Some(b'-') => {
-            i += 1;
-            true
-        }
-        _ => false,
-    };
-    let digits_start = i;
-    // `strtol` saturates to `LONG_{MAX,MIN}` on overflow; mirror with an i64
-    // accumulator (a C `long` on the 64-bit hosts this port targets).
-    let mut acc: i64 = 0;
-    while i < bytes.len() && bytes[i].is_ascii_digit() {
-        let d = i64::from(bytes[i] - b'0');
-        acc = acc
-            .checked_mul(10)
-            .and_then(|v| v.checked_add(d))
-            .unwrap_or(i64::MAX);
-        i += 1;
-    }
-    // No digits, or trailing bytes after the number: not a whole number.
-    if i == digits_start || i != bytes.len() {
-        return None;
-    }
-    let signed = if negative { acc.wrapping_neg() } else { acc };
-    // `int v = strtol(...)` narrows the `long` to 32 bits.
-    Some(signed as i32)
-}
 
 /// `find_unique_abbrev()`: the abbreviated id printed in a pair header. With no
 /// `--abbrev`/`--no-abbrev`, gitoxide's `shorten()` applies `core.abbrev` (the 7

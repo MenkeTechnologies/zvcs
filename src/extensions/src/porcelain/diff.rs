@@ -19,6 +19,14 @@
 //! is answered by [`super::diff_no_index`], which the entry point dispatches to
 //! before discovery is attempted.
 //!
+//! Discovery coming up empty is *also* answered there. `cmd_diff()` sets up
+//! gently and, finding no repository, sets `DIFF_NO_INDEX_IMPLICIT` rather than
+//! dying — `git diff` outside a working tree is git's "colourful `diff(1)`", not
+//! an error — so the two operands are compared if there are two, and if there
+//! are not the command says so in a shape no other verb has: a `warning:`
+//! pointing at `--no-index`, the `--no-index` usage block, and exit 129 rather
+//! than the `fatal:` / 128 every command that needs a repository dies with.
+//!
 //! Beyond the format selectors, these options are honored: `-R` (reverse, for
 //! tree/tree and `--cached` pairs), `-z`, `--full-index`, `--abbrev[=<n>]`,
 //! `--no-prefix`/`--default-prefix`/`--src-prefix=`/`--dst-prefix=`/`--line-prefix=`,
@@ -441,7 +449,16 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     // invalid option value, an ambiguous positional, and any "too many operands"
     // error surface in git's own argument order — `setup_revisions()` is one pass,
     // and the earliest failing token is the one whose exit code git reports.
-    let mut repo = gix::discover(".")?;
+    // `setup_git_directory_gently(&nongit)`: with no repository `cmd_diff()`
+    // carries on with `nongit` set, and every one of its remaining branches then
+    // leads to `diff_no_index()` with `implicit_no_index` — the `die()` at the
+    // end of the function is only reachable once that has been ruled out. Any
+    // setup failure counts, not just an empty search: a `$GIT_DIR` that names no
+    // repository leaves `nongit` set too.
+    let mut repo = match gix::discover(".") {
+        Ok(repo) => repo,
+        Err(_) => return super::diff_no_index::run_implicit(args),
+    };
     // Object-heavy path: give gix the caches it does not enable by default —
     // a decoded-object cache and a git-sized delta-base cache (gix ships a
     // 64-entry linked list; git's core.deltaBaseCacheLimit default is 96MB).

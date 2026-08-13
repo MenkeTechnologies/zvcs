@@ -13,6 +13,7 @@ pub mod config;
 pub mod crawler;
 pub mod date;
 pub mod db;
+pub mod diffopt;
 pub mod dispatch;
 pub mod external;
 pub mod fatal;
@@ -303,6 +304,20 @@ fn run_command() -> ExitCode {
             eprintln!("fatal: {msg}");
             ExitCode::from(fatal::EXIT_FATAL)
         }
+        // Repository setup is git's, not this port's. git runs it in the
+        // dispatcher (`run_builtin()`, for every `RUN_SETUP` entry of the
+        // `commands[]` table) and dies there; the port lets each command find
+        // its own repository, so the failure arrives here instead — but it is
+        // the same failure and says the same thing, `fatal: …` at 128. Reading
+        // it off the error rather than checking up front is what keeps the
+        // commands that legitimately run without one working: `grep --no-index`,
+        // `archive --remote`, and `rev-parse --parseopt` never ask.
+        Err(e) if fatal::discovery_fatal(&e).is_some() => {
+            let msg = fatal::discovery_fatal(&e).expect("checked");
+            trace2::error(&msg);
+            eprintln!("fatal: {msg}");
+            ExitCode::from(fatal::EXIT_FATAL)
+        }
         Err(e) => {
             let msg = format!("{sub}: {e:#}");
             trace2::error(&msg);
@@ -481,31 +496,56 @@ struct AutoName {
 }
 
 fn auto_name() -> AutoName {
-    let login = std::env::var("USER")
-        .or_else(|_| std::env::var("LOGNAME"))
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "unknown".to_string());
-    let display = gecos().unwrap_or_else(|| login.clone());
+    let (login, gecos) = passwd_self();
+    // `copy_gecos()` (ident.c:60-78) copies the field up to its first comma,
+    // expanding `&` to the login name with its first letter capitalized, and
+    // `ident_default_name()` trims the result.
+    let display = copy_gecos(&gecos, &login);
+    // `fmt_ident()` (ident.c:509-518): a gecos field that yields nothing falls
+    // back to the login name itself.
+    let display = if display.is_empty() { login.clone() } else { display };
     AutoName { login, display }
 }
 
-/// The passwd gecos field for this uid, truncated at the first comma — the
-/// "Full Name" part git uses (`copy_gecos()`).
-fn gecos() -> Option<String> {
-    // SAFETY: `getpwuid` returns a pointer into a static buffer owned by libc,
-    // read before any other call can overwrite it.
+/// `copy_gecos()`: the gecos field up to its first comma, with each `&` replaced
+/// by the login name capitalized, trimmed as `ident_default_name()` trims it.
+fn copy_gecos(gecos: &str, login: &str) -> String {
+    let mut name = String::new();
+    for ch in gecos.chars().take_while(|&c| c != ',') {
+        if ch == '&' {
+            let mut chars = login.chars();
+            if let Some(first) = chars.next() {
+                name.extend(first.to_uppercase());
+                name.push_str(chars.as_str());
+            }
+        } else {
+            name.push(ch);
+        }
+    }
+    name.trim().to_string()
+}
+
+/// `xgetpwuid_self()` (ident.c:41-58): this uid's `(pw_name, pw_gecos)`, or the
+/// `("unknown", "Unknown")` stand-in git substitutes when there is no passwd
+/// entry. git reads the account from the passwd database only — `USER` and
+/// `LOGNAME` never take part — so an environment without them still yields the
+/// same address stock git builds.
+fn passwd_self() -> (String, String) {
+    // SAFETY: `getpwuid` returns a pointer into a static buffer owned by libc;
+    // both fields are copied out before anything else can overwrite it.
     let pw = unsafe { libc::getpwuid(libc::getuid()) };
     if pw.is_null() {
-        return None;
+        return ("unknown".to_string(), "Unknown".to_string());
     }
-    let raw = unsafe { (*pw).pw_gecos };
-    if raw.is_null() {
-        return None;
-    }
-    let text = unsafe { std::ffi::CStr::from_ptr(raw) }.to_str().ok()?;
-    let name = text.split(',').next().unwrap_or("").trim();
-    (!name.is_empty()).then(|| name.to_string())
+    let field = |raw: *const libc::c_char| -> String {
+        if raw.is_null() {
+            String::new()
+        } else {
+            // SAFETY: a non-null passwd field is a NUL-terminated C string.
+            unsafe { std::ffi::CStr::from_ptr(raw) }.to_string_lossy().into_owned()
+        }
+    };
+    (field(unsafe { (*pw).pw_name }), field(unsafe { (*pw).pw_gecos }))
 }
 
 /// `<login>@<domain>` the way `add_domainname()` builds it, and whether git

@@ -554,7 +554,7 @@ reports the C toolchain it was compiled and linked against; this binary reports
 what is true of a Rust binary on gitoxide and omits the rest, rather than copying
 stock's values into a report about itself. `cpu`, the no-build-commit line,
 `sizeof-long`, `sizeof-size_t`, `default-ref-format` and `default-hash` agree with
-stock because they are the same facts; `rust: enabled`, `shell-path: sh` and
+stock because they are the same facts; `rust: enabled` and
 `SHA-1: sha1-checked` disagree because the answers really are different here; and
 `gettext`, `libcurl`, `OpenSSL`, `zlib` and `SHA-256` are absent because no such
 component is linked — the same reason git's own `#ifdef`s drop a line. The same
@@ -571,9 +571,20 @@ the same daemon configuration as stock for whichever of lighttpd, apache2,
 mongoose, plackup, webrick or python is installed, and serves gitweb through
 it; like stock, it ships no web server of its own.
 
-Mutating subcommands are currently excluded from generated fuzz cases, so their
-parity rests on curated cases only. Treat their scores as less well covered than
-the read-only ones rather than as evidence of correctness.
+Generated cases cover mutating subcommands as well as read-only ones — the
+hardened environment neutralizes every interactive hook (`GIT_EDITOR=true` and
+its siblings), which is what made a command that opens an editor fuzzable at all.
+That coverage earns its keep: a sweep found `git init --bare nested/dir` failing
+outright, `fast-import` leaving a different object store than stock after a
+rejected command line, and `cherry-pick` refusing strategies git accepts — none
+of which any curated case reached.
+
+What no score covers is the situation a case cannot describe. Until recently
+every case ran at the worktree root, so repository discovery went unmeasured and
+three bugs shipped behind that gap, including a process abort in any bare
+repository's subdirectory. A case can now name its own working directory and
+environment; read a green subcommand as "agrees on what was asked", never as
+"agrees".
 
 ## [0x08] BENCHMARKS
 

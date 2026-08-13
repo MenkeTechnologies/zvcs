@@ -430,6 +430,11 @@ struct Opts {
     pickaxe_all: bool,
     /// `--pickaxe-regex`: makes `-S` a regex search rather than a literal count.
     pickaxe_regex: bool,
+    /// The `DIFF_PICKAXE_KIND_*` bits `diff_setup_done()` tests, accumulated
+    /// across the whole command line. Distinct from [`Opts::pickaxe_pending`],
+    /// which keeps only the last `-S`/`-G`: the bits are sticky, which is how
+    /// `-G<re> -S<s>` is rejected even though only one search would have run.
+    pickaxe_kinds: u8,
     stat: StatWidths,
     dirstat: DirStat,
     /// `-0`/`-1`/`-2`/`-3`, `--base`/`--ours`/`--theirs`. git's default is 2.
@@ -598,6 +603,13 @@ enum Fatal {
     /// used together`, exit 128. `diff_setup_done()` dies when `-s` (NO_OUTPUT) is
     /// left set alongside a name/status/check format.
     NameStatusNoPatch,
+    /// `diff_setup_done()`: more than one of `-G`, `-S` and `--find-object`.
+    PickaxeKinds,
+    /// `diff_setup_done()`: `-G` together with `--pickaxe-regex`, which only `-S`
+    /// takes.
+    PickaxeGRegex,
+    /// `diff_setup_done()`: `--pickaxe-all` together with `--find-object`.
+    PickaxeAllObjfind,
     /// `fatal: invalid regex: <msg>`, exit 128. git compiles the `-G`/`-S --pickaxe-regex`
     /// pattern in `diffcore_pickaxe` setup, after argument validation; the message tail
     /// is the `regex` crate's rather than the platform `regerror`'s.
@@ -689,6 +701,26 @@ impl Fatal {
                 let _ = writeln!(
                     err,
                     "fatal: options '--name-only', '--name-status', '--check', and '-s' cannot be used together"
+                );
+            }
+            Fatal::PickaxeKinds => {
+                let _ = writeln!(
+                    err,
+                    "fatal: options '-G', '-S', and '--find-object' cannot be used together"
+                );
+            }
+            Fatal::PickaxeGRegex => {
+                let _ = writeln!(
+                    err,
+                    "fatal: options '-G' and '--pickaxe-regex' cannot be used together, \
+                     use '--pickaxe-regex' with '-S'"
+                );
+            }
+            Fatal::PickaxeAllObjfind => {
+                let _ = writeln!(
+                    err,
+                    "fatal: options '--pickaxe-all' and '--find-object' cannot be used together, \
+                     use '--pickaxe-all' with '-G' and '-S'"
                 );
             }
             Fatal::InvalidRegexPickaxe(msg) => {
@@ -796,6 +828,7 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed, Fatal> {
         output_file: None,
         pickaxe_all: false,
         pickaxe_regex: false,
+        pickaxe_kinds: 0,
         stat: StatWidths::default(),
         dirstat: DirStat::default(),
         unmerged_stage: 2,
@@ -919,16 +952,30 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed, Fatal> {
         opts.fmt |= F_PATCH;
     }
 
-    // `diff_setup_done()`: --name-only / --name-status / --check clear every other
-    // content/patch format. `-s` (NO_OUTPUT) is *not* in this trigger — its own
-    // `OPT_BITOP` already cleared the other formats in argument order.
+    // `diff_setup_done()`'s opening `HAS_MULTI_BITS(output_format & check_mask)`:
+    // any *two* of `--name-only`, `--name-status`, `--check` and `-s` is fatal.
+    // `-s` reaches this with the others still set only when it came first, since
+    // its own `OPT_BITOP` clears them in argument order — which is why
+    // `--name-only -s` is accepted and `-s --name-only` is not.
+    if (opts.fmt & (F_NAME | F_NAME_STATUS | F_CHECKDIFF | F_NO_OUTPUT)).count_ones() > 1 {
+        return Err(Fatal::NameStatusNoPatch);
+    }
+    // Only then does it clear every other content/patch format. `-s` (NO_OUTPUT)
+    // is not in this trigger — its `OPT_BITOP` already did the clearing.
     if opts.fmt & (F_NAME | F_NAME_STATUS | F_CHECKDIFF) != 0 {
         opts.fmt &= !F_POSITIVE;
     }
-    // `diff_setup_done()` dies when `-s` survives alongside a name/status/check
-    // format, i.e. `-s` came after them with nothing re-enabling output.
-    if opts.fmt & F_NO_OUTPUT != 0 && opts.fmt & (F_NAME | F_NAME_STATUS | F_CHECKDIFF) != 0 {
-        return Err(Fatal::NameStatusNoPatch);
+    // The three pickaxe `HAS_MULTI_BITS` fatals `diff_setup_done()` raises next,
+    // in its order. Each is "more than one bit of this mask is set", so they fire
+    // on the *combination* rather than on either option alone.
+    if opts.pickaxe_kinds.count_ones() > 1 {
+        return Err(Fatal::PickaxeKinds);
+    }
+    if opts.pickaxe_kinds & PICKAXE_KIND_G != 0 && opts.pickaxe_regex {
+        return Err(Fatal::PickaxeGRegex);
+    }
+    if opts.pickaxe_kinds & PICKAXE_KIND_OBJFIND != 0 && opts.pickaxe_all {
+        return Err(Fatal::PickaxeAllObjfind);
     }
     // `setup_revisions()` has now finished (its closing `diff_setup_done()` is the
     // check just above), so this is where `cmd_diff_files()` walks the leftover argv
@@ -1069,6 +1116,13 @@ const ACCEPTED_NOOP: &[&str] = &[
     // diff-files' "stay quiet about removed files"; zvcs never warns about them.
     "-q",
 ];
+
+/// `DIFF_PICKAXE_KIND_S`: a `-S<string>` search was requested.
+const PICKAXE_KIND_S: u8 = 1;
+/// `DIFF_PICKAXE_KIND_G`: a `-G<regex>` search was requested.
+const PICKAXE_KIND_G: u8 = 2;
+/// `DIFF_PICKAXE_KIND_OBJFIND`: a `--find-object=<id>` search was requested.
+const PICKAXE_KIND_OBJFIND: u8 = 4;
 
 /// Prefixes of valued options in the same category as [`ACCEPTED_NOOP`].
 const ACCEPTED_NOOP_VALUED: &[&str] = &[
@@ -1212,9 +1266,14 @@ fn classify(s: &str, opts: &mut Opts, quiet: &mut bool) -> Result<Flag, Fatal> {
 
 fn classify_valued(s: &str, opts: &mut Opts) -> Result<Flag, Fatal> {
     if let Some(n) = s.strip_prefix("--abbrev=") {
-        // git clamps rather than rejecting, so a bad value is a usage error.
-        let n: usize = n.parse().map_err(|_| Fatal::Usage)?;
-        opts.abbrev = Some(Some(n));
+        // `revision.c`'s `--abbrev`, not `parse_opt_abbrev_cb`: `setup_revisions()`
+        // claims the option before `diff_opt_parse()` ever sees it and reads the
+        // value with `strtoul(optarg, NULL, 10)`, which cannot fail. So a value
+        // with no digits is 0 and every value is clamped to `[MINIMUM_ABBREV,
+        // hexsz]` — `git diff-files --abbrev=abc` prints 4-character ids, it does
+        // not complain. (Commands that reach `OPT__ABBREV` directly, such as
+        // `cherry`, do reject it; see `crate::abbrev::parse_opt_abbrev_value`.)
+        opts.abbrev = Some(Some(crate::abbrev::parse_abbrev_arg(n, 40)));
         return Ok(Flag::Handled);
     }
     if let Some(v) = s.strip_prefix("--line-prefix=") {
@@ -1258,9 +1317,13 @@ fn classify_valued(s: &str, opts: &mut Opts) -> Result<Flag, Fatal> {
         ("--output-indicator-context=", 2),
     ] {
         if let Some(v) = s.strip_prefix(lead) {
-            let Some(c) = v.as_bytes().first().copied() else {
-                return Err(Fatal::Usage);
-            };
+            // `diff_opt_char()` rejects only a value longer than one byte, and
+            // then with its own `error:` line rather than the usage block. The
+            // empty value is legal: it stores NUL, which prints as nothing.
+            let name = lead.trim_start_matches('-').trim_end_matches('=');
+            crate::diffopt::check(name, Some(v))
+                .map_err(|msg| Fatal::OptionError(format!("error: {msg}")))?;
+            let c = v.as_bytes().first().copied().unwrap_or(0);
             match slot {
                 0 => opts.ind_new = c,
                 1 => opts.ind_old = c,
@@ -1279,8 +1342,20 @@ fn classify_valued(s: &str, opts: &mut Opts) -> Result<Flag, Fatal> {
         }
         return Ok(Flag::Handled);
     }
-    if s.starts_with("--find-copies=") {
+    if let Some(v) = s.strip_prefix("--find-copies=") {
+        crate::diffopt::check_rename_score("find-copies", v)
+            .map_err(|msg| Fatal::OptionError(format!("error: {msg}")))?;
         opts.find_copies = true;
+        return Ok(Flag::Handled);
+    }
+    if let Some(v) = s.strip_prefix("--find-renames=") {
+        crate::diffopt::check_rename_score("find-renames", v)
+            .map_err(|msg| Fatal::OptionError(format!("error: {msg}")))?;
+        return Ok(Flag::Handled);
+    }
+    if let Some(v) = s.strip_prefix("--break-rewrites=") {
+        crate::diffopt::check_break_rewrites(v)
+            .map_err(|msg| Fatal::OptionError(format!("error: {msg}")))?;
         return Ok(Flag::Handled);
     }
     if let Some(v) = s.strip_prefix("--diff-algorithm=") {
@@ -1354,16 +1429,19 @@ fn classify_valued(s: &str, opts: &mut Opts) -> Result<Flag, Fatal> {
     }
     if let Some(v) = s.strip_prefix("-S") {
         // Finalized after the line is read, since `--pickaxe-regex` may still follow.
+        opts.pickaxe_kinds |= PICKAXE_KIND_S;
         opts.pickaxe_pending = Some((b'S', v.as_bytes().to_vec()));
         return Ok(Flag::Handled);
     }
     if let Some(v) = s.strip_prefix("-G") {
         // `-G` is always a regex; it is compiled in the finalize pass so a bad pattern
         // is reported after every earlier argument, as git's `diffcore_pickaxe` does.
+        opts.pickaxe_kinds |= PICKAXE_KIND_G;
         opts.pickaxe_pending = Some((b'G', v.as_bytes().to_vec()));
         return Ok(Flag::Handled);
     }
     if let Some(v) = s.strip_prefix("--find-object=") {
+        opts.pickaxe_kinds |= PICKAXE_KIND_OBJFIND;
         opts.find_object_args.push(v.to_owned());
         return Ok(Flag::Handled);
     }
@@ -1378,19 +1456,24 @@ fn classify_valued(s: &str, opts: &mut Opts) -> Result<Flag, Fatal> {
         opts.output_file = Some(v.to_owned());
         return Ok(Flag::Handled);
     }
-    // `-B<n>`, `-M<n>`, `-C<n>`: the score is irrelevant without renames.
+    // `-B<n>`, `-M<n>`, `-C<n>`: the score itself is irrelevant without renames,
+    // but `parse_rename_score()` must still consume the whole value or the
+    // callback reports it — with the *long* name, since that is `opt->long_name`.
     if let Some(v) = s.strip_prefix("-C") {
-        if v.bytes().all(|b| b.is_ascii_digit() || b == b'%' || b == b'.' || b == b'/') {
-            opts.find_copies = true;
-            return Ok(Flag::Handled);
-        }
+        crate::diffopt::check_rename_score("find-copies", v)
+            .map_err(|msg| Fatal::OptionError(format!("error: {msg}")))?;
+        opts.find_copies = true;
+        return Ok(Flag::Handled);
     }
-    for lead in ["-B", "-M"] {
-        if let Some(v) = s.strip_prefix(lead) {
-            if v.bytes().all(|b| b.is_ascii_digit() || b == b'%' || b == b'.' || b == b'/') {
-                return Ok(Flag::Handled);
-            }
-        }
+    if let Some(v) = s.strip_prefix("-M") {
+        crate::diffopt::check_rename_score("find-renames", v)
+            .map_err(|msg| Fatal::OptionError(format!("error: {msg}")))?;
+        return Ok(Flag::Handled);
+    }
+    if let Some(v) = s.strip_prefix("-B") {
+        crate::diffopt::check_break_rewrites(v)
+            .map_err(|msg| Fatal::OptionError(format!("error: {msg}")))?;
+        return Ok(Flag::Handled);
     }
     // `-n<count>` is `--max-count`; diff-files rejects any revision limiting,
     // but only after the value itself parses.
@@ -1415,6 +1498,15 @@ fn classify_valued(s: &str, opts: &mut Opts) -> Result<Flag, Fatal> {
     // default/none, deciding which sides get whitespace-error markup.
     if let Some(v) = s.strip_prefix("--ws-error-highlight=") {
         opts.ws_error_highlight = parse_ws_error_highlight_opt(v)?;
+        return Ok(Flag::Handled);
+    }
+    // `--submodule=<format>` cannot change this port's output — a gitlink pair is
+    // reported the same way for all three formats here — but `diff_opt_submodule()`
+    // still rejects a name that is not one of them, at parse time and before any
+    // path is looked at. So the value is checked even though it is then ignored.
+    if let Some(v) = s.strip_prefix("--submodule=") {
+        crate::diffopt::check("submodule", Some(v))
+            .map_err(|msg| Fatal::OptionError(format!("error: {msg}")))?;
         return Ok(Flag::Handled);
     }
     if ACCEPTED_NOOP.contains(&s) || ACCEPTED_NOOP_VALUED.iter().any(|p| s.starts_with(p)) {

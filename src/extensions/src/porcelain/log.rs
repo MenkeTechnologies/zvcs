@@ -220,8 +220,9 @@ pub(crate) fn parse_decoration_style(value: &str) -> Option<DecorateStyle> {
 /// lay out differently; `--oneline`/`--pretty=oneline` are terminator formats.
 ///
 /// Deviations, surfaced rather than faked:
-///   * `--graph` renders commits with at most two parents. An octopus merge is
-///     rejected instead of being drawn wrong.
+///   * `--graph` is a port of `graph.c` covering every parent count, octopus merges
+///     included, minus `graph_needs_truncation()` — the lane cap only reachable
+///     through `--graph-lane-limit=<n>`, which this port rejects as unsupported.
 ///   * `--abbrev[=<n>]`/`--no-abbrev` set the width of every abbreviated id, applied as a
 ///     `core.abbrev` override. `--no-abbrev` is git's zero: the raw columns and `%h` print
 ///     the whole id while the patch `index` line stays at the configured default.
@@ -1096,12 +1097,6 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         }
     }
 
-    // git checks this combination before touching the repository.
-    if graph && reverse {
-        eprintln!("fatal: options '--graph' and '--reverse' cannot be used together");
-        return Ok(ExitCode::from(128));
-    }
-
     // git's `diff_setup_done` rejects using more than one of `--name-only`,
     // `--name-status`, `--check`, and `-s` (NO_OUTPUT) together. `--quiet` pre-sets
     // NO_OUTPUT, but the stat/patch output formats clear it again, so `--quiet`
@@ -1324,6 +1319,31 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                 tip_sources.push("HEAD".to_string());
             }
         }
+    }
+
+    // The option combinations `setup_revisions()` refuses once it has finished
+    // reading the command line, in its order. They come after the revisions are
+    // resolved because git resolves them first, in the argument loop: an
+    // unreadable revision and an unborn `HEAD` both report themselves before any
+    // of these, and `--graph --reverse <bogus-rev>` names the revision.
+    //
+    // `revision.c` guards the ancestry decorations with
+    // `revs->rewrite_parents && revs->children.name` rather than with `--parents`
+    // itself: `--simplify-merges` and `--simplify-by-decoration` set
+    // `rewrite_parents` where they are parsed and `revision_opts_finish()` sets it
+    // for `--graph`, so each of those conflicts with `--children` exactly as
+    // `--parents` does. The two decorations share one slot in the header and git
+    // refuses to print both rather than pick an order.
+    let rewrite_parents = show_parents || graph || simplify_merges_opt || simplify_by_decoration;
+    if rewrite_parents && show_children {
+        eprintln!("fatal: options '--parents' and '--children' cannot be used together");
+        return Ok(ExitCode::from(128));
+    }
+    // "Limitations on the graph functionality", which `setup_revisions()` reaches
+    // only after the check above.
+    if graph && reverse {
+        eprintln!("fatal: options '--graph' and '--reverse' cannot be used together");
+        return Ok(ExitCode::from(128));
     }
 
     // Walk in git's default commit-date order, then re-sort if a topological
@@ -1812,10 +1832,6 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         nodes.reverse();
     }
 
-    if graph && nodes.iter().any(|n| n.parents.len() > 2) {
-        bail!("--graph is not ported for octopus merges");
-    }
-
     // `--name-only`/`--name-status` are git's reported format; they suppress both
     // the count formats and the `-p` patch. The patch is emitted after the count
     // formats otherwise.
@@ -1868,13 +1884,6 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     } else {
         super::color::DecorateColors::disabled()
     };
-    // `revision.c`: the two ancestry decorations share one slot in the header and
-    // git refuses to print both rather than pick an order.
-    if show_parents && show_children {
-        eprintln!("fatal: options '--parents' and '--children' cannot be used together");
-        return Ok(ExitCode::from(128));
-    }
-
     // `--simplify-by-decoration`: the same simplification the pathspec path runs,
     // with a different question asked of each commit. `simplify_commit()` keeps a
     // commit that carries a decoration, and — since simplification may not drop
@@ -2409,16 +2418,22 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
 
     if graph {
         // `format:` separates records with a newline; `tformat:` already
-        // terminated each block above.
-        if !terminator {
-            let last = blocks.len().saturating_sub(1);
-            for (idx, block) in blocks.iter_mut().enumerate() {
-                if idx != last {
-                    block.push(rec_term);
-                }
-            }
-        }
-        let out = render_graph(&nodes, &blocks, graph_colors(&repo), want_color)?;
+        // terminated each block above. The separator is not simply appended to the
+        // previous block: `show_log()` prints it once the *next* commit has been
+        // through `graph_update()`, so [`render_graph`] emits it there.
+        let separator = (!terminator).then_some(rec_term);
+        // A terminator format's byte is already at the end of each block; the graph
+        // path re-emits it after the commit's remaining rows, where git puts it.
+        let record_terminator = terminator.then_some(rec_term);
+        let out = render_graph(
+            &nodes,
+            &blocks,
+            graph_colors(&repo),
+            want_color,
+            separator,
+            record_terminator,
+            first_parent,
+        )?;
         match stdout.write_all(&out) {
             Ok(()) => Ok(ExitCode::SUCCESS),
             Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
@@ -6956,11 +6971,27 @@ fn graph_colors(repo: &gix::Repository) -> Vec<String> {
     };
     let spec = spec.to_string();
     let mut colors: Vec<String> = Vec::new();
-    for word in spec.split(',') {
+    // `parse_graph_colors_config()` walks `start` to the end of the string rather
+    // than splitting it: an empty value has nothing between `start` and `end`, so
+    // the loop never runs, and a trailing comma leaves `start == end` and yields
+    // no final chunk. Rust's `split(',')` disagrees with both — it hands back one
+    // empty word for `""` and a trailing empty word for `"red,"`, each of which
+    // parses as a valid (empty) color and so adds a column color git does not have.
+    let bytes = spec.as_bytes();
+    let mut start = 0usize;
+    while start < bytes.len() {
+        let comma = bytes[start..].iter().position(|&b| b == b',').map_or(bytes.len(), |i| start + i);
+        let word = &spec[start..comma];
         match super::color::parse_color_spec(word) {
             Some(code) => colors.push(code),
-            None => eprintln!("warning: ignored invalid color '{word}' in log.graphColors"),
+            None => {
+                // `color_parse_mem()` reports the value itself before
+                // `parse_graph_colors_config()` reports what it did about it.
+                eprintln!("error: invalid color value: {word}");
+                eprintln!("warning: ignored invalid color '{word}' in log.graphColors");
+            }
         }
+        start = comma + 1;
     }
     colors.push(RESET.to_string());
     colors
@@ -6968,7 +6999,20 @@ fn graph_colors(repo: &gix::Repository) -> Vec<String> {
 
 /// Prefix every line of every commit's block with git's ASCII graph, flushing the
 /// merge and collapse rows that fall between commits.
-fn render_graph(nodes: &[Node], blocks: &[Vec<u8>], colors: Vec<String>, want_color: bool) -> Result<Vec<u8>> {
+///
+/// `separator` is the byte a separator format (`format:` and the built-in pretties)
+/// puts between records, and `None` for a terminator format whose blocks already
+/// carry it. `first_parent` mirrors `revs->first_parent_only`, which makes
+/// `next_interesting_parent()` return nothing so only the first parent is drawn.
+fn render_graph(
+    nodes: &[Node],
+    blocks: &[Vec<u8>],
+    colors: Vec<String>,
+    want_color: bool,
+    separator: Option<u8>,
+    terminator: Option<u8>,
+    first_parent: bool,
+) -> Result<Vec<u8>> {
     let mut graph = Graph::new(colors, want_color);
     let mut out: Vec<u8> = Vec::new();
 
@@ -6976,10 +7020,47 @@ fn render_graph(nodes: &[Node], blocks: &[Vec<u8>], colors: Vec<String>, want_co
         // A boundary commit is where the drawn history stops: git never adds its
         // parents to the graph, so its column closes and the rows under it are
         // blank rather than a continuing `|`.
-        let drawn_parents: &[ObjectId] = if node.boundary { &[] } else { &node.parents };
+        // Under `--first-parent` only the first parent is an *interesting* parent
+        // (`next_interesting_parent()` returns nothing), so the merge fans out no
+        // further than one lane.
+        let drawn_parents: &[ObjectId] = if node.boundary {
+            &[]
+        } else if first_parent {
+            &node.parents[..node.parents.len().min(1)]
+        } else {
+            &node.parents
+        };
         graph.update(node.id, drawn_parents, node.boundary);
 
-        let block = &blocks[i];
+        // `show_log()` prints the record separator *after* the next commit has been
+        // through `graph_update()`, and puts that commit's padding row in front of
+        // it whenever the previous record ended in a newline — otherwise the gap
+        // would read as a hole in the graph. The row is git's `graph_padding_line()`,
+        // which also marks the state as padded so the commit row below it does not
+        // mistake the collapse it interrupted for its own.
+        if let (true, Some(sep)) = (i > 0, separator) {
+            if sep == b'\n' && blocks[i - 1].ends_with(b"\n") {
+                out.extend_from_slice(&graph.padding_line_before_record());
+            }
+            out.push(sep);
+        }
+
+        // `graph_show_commit()` drains every row that comes *before* the commit
+        // row onto lines of its own — the `...` skip row, and the expansion rows
+        // an octopus merge needs — so that the commit's text lands on the row
+        // carrying its `*`.
+        while matches!(graph.state, GraphState::Skip | GraphState::PreCommit) {
+            out.extend_from_slice(&graph.next_line());
+            out.push(b'\n');
+        }
+
+        // A terminator format's byte is carried at the end of the block, but git
+        // prints it *after* the commit's remaining graph rows (log-tree.c:915-919),
+        // so it is taken off here and put back below.
+        let block: &[u8] = match terminator {
+            Some(t) if blocks[i].last() == Some(&t) => &blocks[i][..blocks[i].len() - 1],
+            _ => &blocks[i],
+        };
         let ends_nl = block.ends_with(b"\n");
         let mut lines: Vec<&[u8]> = block.split(|&b| b == b'\n').collect();
         if ends_nl {
@@ -6995,16 +7076,43 @@ fn render_graph(nodes: &[Node], blocks: &[Vec<u8>], colors: Vec<String>, want_co
         }
 
         // Rows the commit's own text did not consume: the `|\` of a merge and the
-        // `|/` of a collapse both appear on lines of their own. A collapse needs at
-        // most one row per column, so the bound below can only trip on a bug here —
-        // failing beats hanging the caller.
-        let mut guard = graph.columns.len() + graph.new_columns.len() + 8;
-        while graph.state != GraphState::Padding {
-            out.extend_from_slice(&graph.next_line());
-            out.push(b'\n');
-            guard -= 1;
-            if guard == 0 {
-                crate::git_fatal!("--graph failed to settle the commit graph");
+        // `|/` of a collapse both appear on lines of their own. `graph_show_commit_msg()`
+        // opens a line for them when the record did not end in one, then
+        // `graph_show_remainder()` puts a newline *between* the rows only — the
+        // trailing one comes back at the end, and only for a record that was newline
+        // terminated. A collapse needs at most one row per column, so the bound below
+        // can only trip on a bug here — failing beats hanging the caller.
+        if graph.state != GraphState::Padding {
+            if !ends_nl {
+                out.push(b'\n');
+            }
+            let mut guard = graph.columns.len() + graph.new_columns.len() + graph.num_parents + 8;
+            loop {
+                out.extend_from_slice(&graph.next_line());
+                if graph.state == GraphState::Padding {
+                    break;
+                }
+                out.push(b'\n');
+                guard -= 1;
+                if guard == 0 {
+                    crate::git_fatal!("--graph failed to settle the commit graph");
+                }
+            }
+            if ends_nl {
+                out.push(b'\n');
+            }
+        }
+
+        // `show_log()` closes a terminator format's record last of all, and puts a
+        // padding row in front of the terminator when the record's own text ended
+        // in a newline (log-tree.c:915-919) — the same reason the separator carries
+        // one: an empty line would read as a hole in the graph.
+        if let Some(term) = terminator {
+            if blocks[i].last() == Some(&term) {
+                if ends_nl {
+                    out.extend_from_slice(&graph.next_line());
+                }
+                out.push(term);
             }
         }
     }
@@ -7014,6 +7122,10 @@ fn render_graph(nodes: &[Node], blocks: &[Vec<u8>], colors: Vec<String>, want_co
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum GraphState {
     Padding,
+    /// The previous commit's rows were cut short, so git marks the gap with `...`.
+    Skip,
+    /// An expansion row that opens space around an octopus merge.
+    PreCommit,
     Commit,
     PostMerge,
     Collapsing,
@@ -7052,15 +7164,28 @@ impl GraphLine {
     }
 }
 
-/// git's `graph.c` column state machine, for commits with at most two parents.
+/// git's `graph.c` column state machine, ported for any number of parents —
+/// two-way merges, octopus merges, and the left/right-skewed layouts alike.
+///
+/// The port follows `graph.c` function for function: [`Graph::update`] is
+/// `graph_update()`, [`Graph::update_columns`] is `graph_update_columns()`, and
+/// each `*_line` method is the matching `graph_output_*_line()`. The one piece
+/// left out is `graph_needs_truncation()`, which only fires under
+/// `--graph-lane-limit=<n>`; this port's `log` rejects that option outright, so
+/// `revs->graph_max_lanes` is always 0 and every truncation branch is dead.
 struct Graph {
     /// Columns as of the previous commit.
     columns: Vec<GraphColumn>,
     /// Columns as of the current commit.
     new_columns: Vec<GraphColumn>,
-    /// Screen-slot to new-column index, `-1` for an empty slot.
+    /// Screen-slot to new-column index, `-1` for an empty slot. Sized at
+    /// `2 * column_capacity` like git's array, with `mapping_size` the live
+    /// prefix — the slots past it keep their stale values, which the commit row
+    /// reads back out of `old_mapping`.
     mapping: Vec<i32>,
     old_mapping: Vec<i32>,
+    mapping_size: usize,
+    column_capacity: usize,
     commit: ObjectId,
     /// `--boundary`: the current commit is an excluded ancestor, drawn `o`.
     boundary: bool,
@@ -7069,14 +7194,31 @@ struct Graph {
     parents: Vec<ObjectId>,
     num_parents: usize,
     width: usize,
+    /// The next expansion row to print while in [`GraphState::PreCommit`].
+    expansion_row: usize,
     state: GraphState,
     prev_state: GraphState,
+    /// The column this commit sits in, or `columns.len()` when no column was
+    /// following it yet.
+    commit_index: usize,
+    prev_commit_index: usize,
+    /// Which merge layout to draw: 0 when the first parent is already in a column
+    /// left of the merge (the left-skewed `|/| | |` form), 1 otherwise. `-1` while
+    /// the layout for the current commit has not been chosen yet.
+    merge_layout: i32,
+    /// Columns this commit added, which is what decides whether the edges right of
+    /// a merge are drawn `\` or `|`.
+    edges_added: i32,
+    prev_edges_added: i32,
     /// `log.graphColors`, with the reset appended; the last index means "uncolored".
     colors: Vec<String>,
     /// The color the next column to be opened is assigned, cycling through `colors`.
     default_column_color: usize,
     want_color: bool,
 }
+
+/// `graph_init()`'s starting column capacity; grown by doubling.
+const GRAPH_COLUMN_CAPACITY: usize = 30;
 
 impl Graph {
     fn new(colors: Vec<String>, want_color: bool) -> Self {
@@ -7087,14 +7229,22 @@ impl Graph {
             boundary: false,
             columns: Vec::new(),
             new_columns: Vec::new(),
-            mapping: Vec::new(),
-            old_mapping: Vec::new(),
+            mapping: vec![-1; 2 * GRAPH_COLUMN_CAPACITY],
+            old_mapping: vec![-1; 2 * GRAPH_COLUMN_CAPACITY],
+            mapping_size: 0,
+            column_capacity: GRAPH_COLUMN_CAPACITY,
             commit: ObjectId::null(gix::hash::Kind::Sha1),
             parents: Vec::new(),
             num_parents: 0,
             width: 0,
+            expansion_row: 0,
             state: GraphState::Padding,
             prev_state: GraphState::Padding,
+            commit_index: 0,
+            prev_commit_index: 0,
+            merge_layout: 0,
+            edges_added: 0,
+            prev_edges_added: 0,
             colors,
             default_column_color,
             want_color,
@@ -7117,8 +7267,20 @@ impl Graph {
         }
     }
 
+    /// git's `graph_increment_column_color`: `(default + 1) % column_colors_max`.
+    ///
+    /// A `log.graphColors` whose every entry was rejected (or that is empty)
+    /// leaves the parse holding only the reset, so `column_colors_max` is 0 and
+    /// git's modulo is a division by zero — C's undefined behaviour, which the
+    /// counter's value never escapes anyway: `graph_line_write_column` paints a
+    /// column only when `color < column_colors_max`, and nothing is below zero.
+    /// Leave the counter alone in that case rather than divide; the graph comes
+    /// out uncolored either way, which is what git prints.
     fn increment_column_color(&mut self) {
-        self.default_column_color = (self.default_column_color + 1) % self.uncolored();
+        let max = self.uncolored();
+        if max > 0 {
+            self.default_column_color = (self.default_column_color + 1) % max;
+        }
     }
 
     /// git's `graph_find_commit_color`: a commit that already owns a column keeps its
@@ -7143,31 +7305,146 @@ impl Graph {
         }
     }
 
+    /// `graph_update_state()`: remember the row that was just drawn, since the next
+    /// row's shape depends on it.
+    fn update_state(&mut self, s: GraphState) {
+        self.prev_state = self.state;
+        self.state = s;
+    }
+
+    /// `graph_ensure_capacity()`: the mapping arrays are twice the column capacity,
+    /// which doubles until it covers the columns the next commit can need.
+    fn ensure_capacity(&mut self, num_columns: usize) {
+        if self.column_capacity >= num_columns {
+            return;
+        }
+        while self.column_capacity < num_columns {
+            self.column_capacity *= 2;
+        }
+        self.mapping.resize(2 * self.column_capacity, -1);
+        self.old_mapping.resize(2 * self.column_capacity, -1);
+    }
+
+    fn find_new_column_by_commit(&self, id: ObjectId) -> Option<usize> {
+        self.new_columns.iter().position(|c| c.id == id)
+    }
+
+    /// `graph_num_dashed_parents()`: the parents an octopus merge reaches with a
+    /// horizontal `-` run, which is one less when the merge skews left.
+    fn num_dashed_parents(&self) -> i32 {
+        self.num_parents as i32 + self.merge_layout - 3
+    }
+
+    /// `graph_num_expansion_rows()`: two rows per dashed parent, to open the space
+    /// the octopus merge's edges need.
+    fn num_expansion_rows(&self) -> i32 {
+        self.num_dashed_parents() * 2
+    }
+
+    /// `graph_needs_pre_commit_line()`: an octopus merge with a branch line to its
+    /// right needs its expansion rows drawn before the commit row.
+    fn needs_pre_commit_line(&self) -> bool {
+        self.num_parents >= 3
+            && (self.commit_index as isize) < self.columns.len() as isize - 1
+            && (self.expansion_row as i32) < self.num_expansion_rows()
+    }
+
+    /// `graph_is_mapping_correct()`: every branch line is at its target column, so
+    /// nothing is left to collapse.
+    fn mapping_correct(&self) -> bool {
+        self.mapping[..self.mapping_size]
+            .iter()
+            .enumerate()
+            .all(|(i, &t)| t < 0 || t == (i as i32) / 2)
+    }
+
     fn update(&mut self, id: ObjectId, parents: &[ObjectId], boundary: bool) {
         self.commit = id;
         self.boundary = boundary;
         self.parents = parents.to_vec();
         self.num_parents = parents.len();
-        self.update_columns(parents);
-        // Every commit's rows are fully flushed before the next one starts, so
-        // the skip and pre-commit states git needs for interrupted output and
-        // octopus expansion never arise here.
-        self.state = GraphState::Commit;
+        self.prev_commit_index = self.commit_index;
+        self.update_columns();
+        self.expansion_row = 0;
+        // `graph_update()` assigns the state directly rather than through
+        // `graph_update_state()`: no line was drawn for the state being left, so
+        // `prev_state` must keep describing the last row actually printed.
+        self.state = if self.state != GraphState::Padding {
+            // The previous commit never reached padding, so part of the graph is
+            // missing and git marks the gap.
+            GraphState::Skip
+        } else if self.needs_pre_commit_line() {
+            GraphState::PreCommit
+        } else {
+            GraphState::Commit
+        };
     }
 
-    fn update_columns(&mut self, parents: &[ObjectId]) {
+    /// `graph_insert_into_new_columns()`: record `id` in the new column list
+    /// (reusing its column when it is already there) and point a screen slot at it.
+    /// `idx` is the column the current commit occupies when `id` is one of its
+    /// parents, and `-1` for a column merely passing through.
+    fn insert_into_new_columns(&mut self, id: ObjectId, idx: i32) {
+        let i = match self.find_new_column_by_commit(id) {
+            Some(i) => i,
+            None => {
+                let color = self.commit_color(id);
+                self.new_columns.push(GraphColumn { id, color });
+                self.new_columns.len() - 1
+            }
+        };
+
+        let mapping_idx: isize;
+        if self.num_parents > 1 && idx > -1 && self.merge_layout == -1 {
+            // The first parent of a merge picks the layout: 0 when that parent
+            // already sits in a column left of the merge (the edges fuse and one
+            // less column is added), 1 when it does not.
+            let dist = idx - i as i32;
+            let shift = if dist > 1 { 2 * dist - 3 } else { 1 };
+            self.merge_layout = i32::from(dist <= 0);
+            self.edges_added = self.num_parents as i32 + self.merge_layout - 2;
+            mapping_idx = self.width as isize + (self.merge_layout as isize - 1) * shift as isize;
+            self.width += 2 * self.merge_layout as usize;
+        } else if self.edges_added > 0
+            && self.width >= 2
+            && i as i32 == self.mapping[self.width - 2]
+        {
+            // Columns were added by a merge but this one was found in the last
+            // existing column, so the two edges join immediately.
+            mapping_idx = self.width as isize - 2;
+            self.edges_added = -1;
+        } else {
+            mapping_idx = self.width as isize;
+            self.width += 2;
+        }
+
+        if let Some(slot) = usize::try_from(mapping_idx).ok().and_then(|k| self.mapping.get_mut(k)) {
+            *slot = i as i32;
+        }
+    }
+
+    /// `graph_update_columns()`: roll the column state forward one commit, deciding
+    /// which lanes the next row carries and where each of them is heading.
+    fn update_columns(&mut self) {
         std::mem::swap(&mut self.columns, &mut self.new_columns);
         self.new_columns.clear();
 
         let num_columns = self.columns.len();
         let max_new_columns = num_columns + self.num_parents;
-        self.mapping = vec![-1i32; 2 * max_new_columns.max(1)];
+        self.ensure_capacity(max_new_columns);
+
+        self.mapping_size = 2 * max_new_columns;
+        for slot in self.mapping.iter_mut().take(self.mapping_size) {
+            *slot = -1;
+        }
+
+        self.width = 0;
+        self.prev_edges_added = self.edges_added;
+        self.edges_added = 0;
 
         let mut seen_this = false;
-        let mut mapping_idx = 0usize;
         let mut is_commit_in_columns = true;
-        let mut i = 0usize;
-        while i <= num_columns {
+        for i in 0..=num_columns {
             let col_commit = if i == num_columns {
                 if seen_this {
                     break;
@@ -7179,71 +7456,157 @@ impl Graph {
             };
 
             if col_commit == self.commit {
-                let old_mapping_idx = mapping_idx;
                 seen_this = true;
-                for parent in parents {
+                self.commit_index = i;
+                self.merge_layout = -1;
+                for parent in self.parents.clone() {
                     // A merge fans out, and a commit no column was following starts a
                     // fresh line: both open a lane that gets the next color in the cycle.
                     if self.num_parents > 1 || !is_commit_in_columns {
                         self.increment_column_color();
                     }
-                    self.insert_column(*parent, &mut mapping_idx);
+                    self.insert_into_new_columns(parent, i as i32);
                 }
                 // A commit occupies at least two screen slots even with no parents.
-                if mapping_idx == old_mapping_idx {
-                    mapping_idx += 2;
+                if self.num_parents == 0 {
+                    self.width += 2;
                 }
             } else {
-                self.insert_column(col_commit, &mut mapping_idx);
+                self.insert_into_new_columns(col_commit, -1);
             }
-            i += 1;
         }
 
-        while self.mapping.len() > 1 && *self.mapping.last().unwrap_or(&0) < 0 {
-            self.mapping.pop();
+        while self.mapping_size > 1 && self.mapping[self.mapping_size - 1] < 0 {
+            self.mapping_size -= 1;
         }
-
-        // Every row of this commit is padded to the widest row it can produce.
-        let mut max_cols = num_columns + self.num_parents;
-        if self.num_parents < 1 {
-            max_cols += 1;
-        }
-        if is_commit_in_columns && max_cols > 0 {
-            max_cols -= 1;
-        }
-        self.width = max_cols * 2;
-    }
-
-    fn mapping_correct(&self) -> bool {
-        self.mapping
-            .iter()
-            .enumerate()
-            .all(|(i, &t)| t < 0 || t == (i as i32) / 2)
     }
 
     fn next_line(&mut self) -> Vec<u8> {
+        let mut line = GraphLine::new();
         match self.state {
-            GraphState::Commit => self.commit_line(),
-            GraphState::PostMerge => self.post_merge_line(),
-            GraphState::Collapsing => self.collapsing_line(),
-            GraphState::Padding => {
-                let mut line = GraphLine::new();
-                for col in &self.new_columns {
-                    self.write_column(&mut line, col, b'|');
+            GraphState::Padding => self.padding_line(&mut line),
+            GraphState::Skip => self.skip_line(&mut line),
+            GraphState::PreCommit => self.pre_commit_line(&mut line),
+            GraphState::Commit => self.commit_line(&mut line),
+            GraphState::PostMerge => self.post_merge_line(&mut line),
+            GraphState::Collapsing => self.collapsing_line(&mut line),
+        }
+        line.pad_to(self.width);
+        line.buf
+    }
+
+    /// `graph_padding_line()` (graph.c:1480): the row printed in front of the
+    /// newline separating two records. It runs after the next commit's
+    /// `graph_update()`, so while that commit still waits in
+    /// [`GraphState::Commit`] the row draws the columns as they stood *before* it,
+    /// widening the octopus merge's own column to cover the dashes its commit row
+    /// is about to carry. In any other state git falls through to that state's
+    /// ordinary row, which advances the state machine as usual.
+    fn padding_line_before_record(&mut self) -> Vec<u8> {
+        if self.state != GraphState::Commit {
+            return self.next_line();
+        }
+        let mut line = GraphLine::new();
+        for col in &self.columns {
+            self.write_column(&mut line, col, b'|');
+            if col.id == self.commit && self.num_parents > 2 {
+                for _ in 0..(self.num_parents - 2) * 2 {
                     line.addch(b' ');
                 }
-                line.pad_to(self.width);
-                line.buf
+            } else {
+                line.addch(b' ');
             }
+        }
+        line.pad_to(self.width);
+        // git records the padded row so the commit row below it is not read as the
+        // continuation of a collapse.
+        self.prev_state = GraphState::Padding;
+        line.buf
+    }
+
+    /// `graph_output_padding_line()`: every branch line carries straight down.
+    fn padding_line(&mut self, line: &mut GraphLine) {
+        for col in &self.new_columns {
+            self.write_column(line, col, b'|');
+            line.addch(b' ');
         }
     }
 
-    fn commit_line(&mut self) -> Vec<u8> {
-        let mut line = GraphLine::new();
+    /// `graph_output_skip_line()`: the previous commit never finished its rows, so
+    /// git marks the gap and picks up where the new commit needs to start.
+    fn skip_line(&mut self, line: &mut GraphLine) {
+        for ch in b"..." {
+            line.addch(*ch);
+        }
+        if self.needs_pre_commit_line() {
+            self.update_state(GraphState::PreCommit);
+        } else {
+            self.update_state(GraphState::Commit);
+        }
+    }
+
+    /// `graph_output_pre_commit_line()`: widen the space around an octopus merge,
+    /// one row at a time, so its dashed edges have room. Only reached with three or
+    /// more parents.
+    fn pre_commit_line(&mut self, line: &mut GraphLine) {
+        let mut seen_this = false;
+        for i in 0..self.columns.len() {
+            let col = self.columns[i];
+            if col.id == self.commit {
+                seen_this = true;
+                self.write_column(line, &col, b'|');
+                for _ in 0..self.expansion_row {
+                    line.addch(b' ');
+                }
+            } else if seen_this && self.expansion_row == 0 {
+                // First expansion row: a branch line that the previous commit's
+                // post-merge row drew as `\` keeps going as `\` here.
+                if self.prev_state == GraphState::PostMerge && self.prev_commit_index < i {
+                    self.write_column(line, &col, b'\\');
+                } else {
+                    self.write_column(line, &col, b'|');
+                }
+            } else if seen_this {
+                self.write_column(line, &col, b'\\');
+            } else {
+                self.write_column(line, &col, b'|');
+            }
+            line.addch(b' ');
+        }
+
+        self.expansion_row += 1;
+        if !self.needs_pre_commit_line() {
+            self.update_state(GraphState::Commit);
+        }
+    }
+
+    /// `graph_draw_octopus_merge()`: the horizontal `-`…`.` run that reaches the
+    /// parents beyond the first two. Each dash takes the color of the lane the edge
+    /// under it will collapse to, which the mapping — not `new_columns` order —
+    /// knows.
+    fn draw_octopus_merge(&self, line: &mut GraphLine) {
+        let dashed_parents = self.num_dashed_parents();
+        for i in 0..dashed_parents {
+            let slot = (self.commit_index + i as usize + 2) * 2;
+            let Some(col) = self
+                .mapping
+                .get(slot)
+                .and_then(|&j| usize::try_from(j).ok())
+                .and_then(|j| self.new_columns.get(j))
+                .copied()
+            else {
+                continue;
+            };
+            self.write_column(line, &col, b'-');
+            self.write_column(line, &col, if i == dashed_parents - 1 { b'.' } else { b'-' });
+        }
+    }
+
+    /// `graph_output_commit_line()`: the row carrying the commit's mark.
+    fn commit_line(&mut self, line: &mut GraphLine) {
         let mut seen_this = false;
         let num_columns = self.columns.len();
-        let mut i = 0usize;
-        while i <= num_columns {
+        for i in 0..=num_columns {
             let col_commit = if i == num_columns {
                 if seen_this {
                     break;
@@ -7258,39 +7621,55 @@ impl Graph {
                 // `graph_output_commit_char()`: a boundary commit is drawn as a
                 // hollow `o` rather than the usual `*`.
                 line.addch(if self.boundary { b'o' } else { b'*' });
-            } else if seen_this && self.num_parents > 1 {
-                self.write_column(&mut line, &self.columns[i], b'\\');
+                if self.num_parents > 2 {
+                    self.draw_octopus_merge(line);
+                }
+            } else if seen_this && self.edges_added > 1 {
+                self.write_column(line, &self.columns[i], b'\\');
+            } else if seen_this && self.edges_added == 1 {
+                // A right-skewed two-way merge or a left-skewed three-way one:
+                // there is no expansion row, so this is the commit's first row and
+                // a `\` coming out of the previous post-merge row keeps its shape.
+                if self.prev_state == GraphState::PostMerge
+                    && self.prev_edges_added > 0
+                    && self.prev_commit_index < i
+                {
+                    self.write_column(line, &self.columns[i], b'\\');
+                } else {
+                    self.write_column(line, &self.columns[i], b'|');
+                }
             } else if self.prev_state == GraphState::Collapsing
                 && self.old_mapping.get(2 * i + 1).copied().unwrap_or(-1) == i as i32
                 && self.mapping.get(2 * i).copied().unwrap_or(-1) < i as i32
             {
-                self.write_column(&mut line, &self.columns[i], b'/');
+                self.write_column(line, &self.columns[i], b'/');
             } else {
-                self.write_column(&mut line, &self.columns[i], b'|');
+                self.write_column(line, &self.columns[i], b'|');
             }
             line.addch(b' ');
-            i += 1;
         }
-        line.pad_to(self.width);
-        let line = line.buf;
 
-        self.prev_state = GraphState::Commit;
-        self.state = if self.num_parents > 1 {
-            GraphState::PostMerge
+        if self.num_parents > 1 {
+            self.update_state(GraphState::PostMerge);
         } else if self.mapping_correct() {
-            GraphState::Padding
+            self.update_state(GraphState::Padding);
         } else {
-            GraphState::Collapsing
-        };
-        line
+            self.update_state(GraphState::Collapsing);
+        }
     }
 
-    fn post_merge_line(&mut self) -> Vec<u8> {
-        let mut line = GraphLine::new();
+    /// `graph_output_post_merge_line()`: the `|\`, `|\ \`, `/|\` … row under a merge,
+    /// one character per parent in the color of the lane that parent took.
+    fn post_merge_line(&mut self, line: &mut GraphLine) {
+        /// git's `merge_chars`, indexed by how far along the merge fan the edge is.
+        const MERGE_CHARS: [u8; 3] = [b'/', b'|', b'\\'];
+
+        let first_parent = self.parents.first().copied();
+        let mut parent_col: Option<GraphColumn> = None;
         let mut seen_this = false;
         let num_columns = self.columns.len();
-        let mut i = 0usize;
-        while i <= num_columns {
+
+        for i in 0..=num_columns {
             let col_commit = if i == num_columns {
                 if seen_this {
                     break;
@@ -7302,52 +7681,80 @@ impl Graph {
 
             if col_commit == self.commit {
                 seen_this = true;
-                // One edge per parent, each in the color of the lane that parent
-                // just took — git's `graph_output_post_merge_line`, which looks the
-                // parent up in `new_columns` for exactly this reason.
-                for (n, parent) in self.parents.clone().into_iter().enumerate() {
-                    let ch = if n == 0 { b'|' } else { b'\\' };
-                    match self.new_columns.iter().position(|c| c.id == parent) {
-                        Some(p) => self.write_column(&mut line, &self.new_columns[p], ch),
+                // The merge's own edges: one per parent, drawn from the column each
+                // parent just took. `merge_layout` picks where in `merge_chars` the
+                // run starts, so a left-skewed merge opens with `/`.
+                let mut idx = self.merge_layout.clamp(0, 2) as usize;
+                for (j, parent) in self.parents.clone().into_iter().enumerate() {
+                    let ch = MERGE_CHARS[idx];
+                    match self.find_new_column_by_commit(parent) {
+                        Some(p) => {
+                            let col = self.new_columns[p];
+                            self.write_column(line, &col, ch);
+                        }
                         None => line.addch(ch),
                     }
+                    if idx == 2 {
+                        if self.edges_added > 0 || j < self.num_parents - 1 {
+                            line.addch(b' ');
+                        }
+                    } else {
+                        idx += 1;
+                    }
+                }
+                if self.edges_added == 0 {
+                    line.addch(b' ');
                 }
             } else if seen_this {
-                self.write_column(&mut line, &self.columns[i], b'\\');
+                if self.edges_added > 0 {
+                    self.write_column(line, &self.columns[i], b'\\');
+                } else {
+                    self.write_column(line, &self.columns[i], b'|');
+                }
                 line.addch(b' ');
             } else {
-                self.write_column(&mut line, &self.columns[i], b'|');
-                line.addch(b' ');
+                self.write_column(line, &self.columns[i], b'|');
+                // The gap left of a left-skewed merge is filled with the first
+                // parent's `_` run once that parent's column has been passed.
+                if self.merge_layout != 0 || i as isize != self.commit_index as isize - 1 {
+                    match parent_col {
+                        Some(col) => self.write_column(line, &col, b'_'),
+                        None => line.addch(b' '),
+                    }
+                }
             }
-            i += 1;
-        }
-        line.pad_to(self.width);
-        let line = line.buf;
 
-        self.prev_state = GraphState::PostMerge;
-        self.state = if self.mapping_correct() {
-            GraphState::Padding
+            if Some(col_commit) == first_parent && i < num_columns {
+                parent_col = Some(self.columns[i]);
+            }
+        }
+
+        if self.mapping_correct() {
+            self.update_state(GraphState::Padding);
         } else {
-            GraphState::Collapsing
-        };
-        line
+            self.update_state(GraphState::Collapsing);
+        }
     }
 
-    fn collapsing_line(&mut self) -> Vec<u8> {
+    /// `graph_output_collapsing_line()`: move every branch line one step towards its
+    /// target column, drawing `/` for a diagonal step and `_` for a horizontal run.
+    fn collapsing_line(&mut self, line: &mut GraphLine) {
         std::mem::swap(&mut self.mapping, &mut self.old_mapping);
-        let size = self.old_mapping.len();
-        self.mapping = vec![-1i32; size];
+        for slot in self.mapping.iter_mut().take(self.mapping_size) {
+            *slot = -1;
+        }
 
         let mut horizontal_edge: i32 = -1;
         let mut horizontal_edge_target: i32 = -1;
 
-        for i in 0..size {
+        for i in 0..self.mapping_size {
             let target = self.old_mapping[i];
             if target < 0 {
                 continue;
             }
+            // `update_columns()` always inserts the leftmost column first, so a
+            // branch's target is never to the right of where it is now.
             if (target as usize) * 2 == i {
-                // Already where it belongs.
                 self.mapping[i] = target;
             } else if i >= 1 && self.mapping[i - 1] < 0 {
                 // Nothing to the left: step one slot over.
@@ -7355,8 +7762,9 @@ impl Graph {
                 if horizontal_edge == -1 {
                     horizontal_edge = i as i32;
                     horizontal_edge_target = target;
+                    // `target * 2 + 3` is the screen column the horizontal run starts at.
                     let mut j = (target as usize) * 2 + 3;
-                    while (j as i64) < i as i64 - 2 {
+                    while (j as isize) < i as isize - 2 {
                         self.mapping[j] = target;
                         j += 2;
                     }
@@ -7364,18 +7772,32 @@ impl Graph {
             } else if i >= 1 && self.mapping[i - 1] == target {
                 // Shares a parent with the line to its left; already drawn.
             } else if i >= 2 {
-                // Cross over the unrelated line to the left.
+                // Cross over the unrelated line to the left, and claim the
+                // horizontal edge so no other line moves sideways this row.
                 self.mapping[i - 2] = target;
+                if horizontal_edge == -1 {
+                    horizontal_edge_target = target;
+                    horizontal_edge = i as i32 - 1;
+                    let mut j = (target as usize) * 2 + 3;
+                    while (j as isize) < i as isize - 2 {
+                        self.mapping[j] = target;
+                        j += 2;
+                    }
+                }
             }
         }
 
-        if size > 0 && self.mapping[size - 1] < 0 {
-            self.mapping.pop();
+        // The commit row of the *next* commit reads this row's mapping back out of
+        // `old_mapping`, so it is copied before the drawing loop clears the spans
+        // that must not continue.
+        self.old_mapping[..self.mapping_size].copy_from_slice(&self.mapping[..self.mapping_size]);
+
+        if self.mapping_size > 0 && self.mapping[self.mapping_size - 1] < 0 {
+            self.mapping_size -= 1;
         }
 
-        let mut line = GraphLine::new();
         let mut used_horizontal = false;
-        for i in 0..self.mapping.len() {
+        for i in 0..self.mapping_size {
             let target = self.mapping[i];
             // A collapsing edge is drawn in the color of the lane it is heading for,
             // which is the new column the mapping points at.
@@ -7385,49 +7807,28 @@ impl Graph {
                 continue;
             };
             if (target as usize) * 2 == i {
-                self.write_column(&mut line, &col, b'|');
+                self.write_column(line, &col, b'|');
             } else if target == horizontal_edge_target && i as i32 != horizontal_edge - 1 {
+                // Only the first segment of a horizontal run continues onto the
+                // next row.
                 if i != (target as usize) * 2 + 3 {
                     self.mapping[i] = -1;
                 }
                 used_horizontal = true;
-                self.write_column(&mut line, &col, b'_');
+                self.write_column(line, &col, b'_');
             } else {
                 if used_horizontal && (i as i32) < horizontal_edge {
                     self.mapping[i] = -1;
                 }
-                self.write_column(&mut line, &col, b'/');
+                self.write_column(line, &col, b'/');
             }
         }
-        line.pad_to(self.width);
-        let line = line.buf;
 
-        self.prev_state = GraphState::Collapsing;
+        // Only the row that finishes the collapse advances `prev_state`: git leaves
+        // both fields alone while more collapsing rows are still to come.
         if self.mapping_correct() {
-            self.state = GraphState::Padding;
+            self.update_state(GraphState::Padding);
         }
-        line
-    }
-}
-
-impl Graph {
-    /// Record `id` in the new column list (reusing its column when it is already
-    /// there) and point the next screen slot at it. A column opened here takes the
-    /// color `id` already had elsewhere, or the current one — git's
-    /// `graph_insert_into_new_columns`.
-    fn insert_column(&mut self, id: ObjectId, mapping_idx: &mut usize) {
-        let col = match self.new_columns.iter().position(|c| c.id == id) {
-            Some(i) => i,
-            None => {
-                let color = self.commit_color(id);
-                self.new_columns.push(GraphColumn { id, color });
-                self.new_columns.len() - 1
-            }
-        };
-        if let Some(slot) = self.mapping.get_mut(*mapping_idx) {
-            *slot = col as i32;
-        }
-        *mapping_idx += 2;
     }
 }
 

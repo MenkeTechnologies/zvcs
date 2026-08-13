@@ -21,6 +21,7 @@ use crate::{
 /// ### Deviation
 ///
 /// Git mostly silently ignores IO errors and stops iterating seemingly quietly, while we error loudly.
+/// The one case ported faithfully is a directory that cannot be opened at all — see [`recursive`].
 #[expect(clippy::too_many_arguments)]
 pub(super) fn recursive(
     may_collapse: bool,
@@ -37,15 +38,28 @@ pub(super) fn recursive(
         return Err(Error::Interrupted);
     }
     out.read_dir_calls += 1;
-    let entries = gix_fs::read_dir(current, opts.precompose_unicode).map_err(|err| Error::ReadDir {
-        path: current.to_owned(),
-        source: err,
-    })?;
+    // `open_cached_dir()` (dir.c:2585-2593) warns when `opendir()` fails and hands
+    // `read_directory_recursive()` a -1 it turns into "this directory has no
+    // entries" — a directory the user cannot read does not abort the traversal, and
+    // the paths beside it are still reported. The path is the one git prints:
+    // worktree-relative with a trailing slash, or `.` at the traversal root.
+    let entries = match gix_fs::read_dir(current, opts.precompose_unicode) {
+        Ok(entries) => Some(entries),
+        Err(err) => {
+            let path = if current_bstr.is_empty() {
+                ".".into()
+            } else {
+                format!("{current_bstr}/")
+            };
+            eprintln!("warning: could not open directory '{path}': {}", errno_text(&err));
+            None
+        }
+    };
 
     let mut num_entries = 0;
     let mark = state.mark(may_collapse);
     let mut prevent_collapse = false;
-    for entry in entries {
+    for entry in entries.into_iter().flatten() {
         let entry = entry.map_err(|err| Error::DirEntry {
             parent_directory: current.to_owned(),
             source: err,
@@ -137,6 +151,16 @@ pub(super) fn recursive(
         delegate,
     );
     Ok((res, prevent_collapse))
+}
+
+/// The bare `strerror` text git's `warning_errno()` prints. Rust appends its own
+/// `(os error N)`, which git never shows, so it is trimmed off.
+fn errno_text(err: &std::io::Error) -> String {
+    let text = err.to_string();
+    match text.find(" (os error ") {
+        Some(cut) => text[..cut].to_string(),
+        None => text,
+    }
 }
 
 pub(super) struct State {

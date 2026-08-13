@@ -181,11 +181,16 @@ use super::diff_color;
 use super::diff_files;
 use super::diffcore_rename;
 
-/// Stock git's `diff-pairs` usage block, byte-for-byte including the trailing blank
-/// line. Printed on `-h` (stdout, exit 129).
-const USAGE: &str = r#"usage: git diff-pairs -z [<diff-options>]
+/// Stock git's `diff-pairs` usage line. The option block under it is
+/// [`DIFF_OPTIONS`]; the two together are what `-h` prints (stdout, exit 129).
+const USAGE_LINE: &str = "usage: git diff-pairs -z [<diff-options>]\n\n";
 
-Diff output format options
+/// Everything `add_diff_options()` contributes to a usage block, byte-for-byte
+/// including the trailing blank line — the whole of it, since every command that
+/// calls it gets the identical three sections under its own usage line. Shared
+/// with `git diff --no-index`, whose block is the same bytes (verified against
+/// stock 2.55.0), so the two cannot drift apart.
+pub(crate) const DIFF_OPTIONS: &str = r#"Diff output format options
     -p, --patch           generate patch
     -s, --no-patch        suppress diff output
     -u                    generate patch
@@ -469,7 +474,7 @@ fn unknown_option(arg: &str) -> ExitCode {
         Some(rest) => eprintln!("error: unknown option `{rest}'"),
         None => eprintln!("error: unknown switch `{}'", &arg[1..2]),
     }
-    eprint!("{USAGE}");
+    eprint!("{USAGE_LINE}{DIFF_OPTIONS}");
     ExitCode::from(129)
 }
 
@@ -1025,7 +1030,7 @@ pub(crate) fn render_raw_stream(
         }
         match s {
             "-h" => {
-                print!("{USAGE}");
+                print!("{USAGE_LINE}{DIFF_OPTIONS}");
                 return Ok(ExitCode::from(129));
             }
             "-z" => nul = true,

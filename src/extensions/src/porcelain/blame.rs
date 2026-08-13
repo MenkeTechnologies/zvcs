@@ -3431,29 +3431,9 @@ fn parse_diff_algorithm(name: &str) -> Result<Option<gix::diff::blob::Algorithm>
 /// — while `--abbrev=999999999` survives whole and later prints the full hash.
 fn parse_abbrev_cb(arg: &str) -> Result<usize, &'static str> {
     const ERR: &str = "option `abbrev' expects a numerical value";
-    if arg.is_empty() {
-        return Err(ERR);
-    }
-    // `strtol`: optional leading whitespace, optional sign, then base-10 digits.
-    let rest = arg.trim_start_matches(|c: char| c.is_ascii_whitespace());
-    let (sign, digits) = match rest.strip_prefix('-') {
-        Some(d) => (-1i64, d),
-        None => (1i64, rest.strip_prefix('+').unwrap_or(rest)),
-    };
-    let consumed: String = digits.chars().take_while(|c| c.is_ascii_digit()).collect();
-    if consumed.is_empty() || consumed.len() != digits.len() {
-        return Err(ERR);
-    }
-    // Overflow saturates at `LONG_MIN`/`LONG_MAX` the way `strtol` does, then
-    // narrows the way the `int v` it is assigned to does.
-    let magnitude = consumed.parse::<i64>();
-    let wide = match (sign, magnitude) {
-        (-1, Ok(m)) => -m,
-        (_, Ok(m)) => m,
-        (-1, Err(_)) => i64::MIN,
-        (_, Err(_)) => i64::MAX,
-    };
-    let mut v = wide as i32;
+    // The `strtol`-then-narrow quirks are shared with every other command that
+    // takes `--abbrev`; see [`crate::abbrev::parse_opt_abbrev_value`].
+    let mut v = crate::abbrev::parse_opt_abbrev_value(arg).ok_or(ERR)?;
     if v != 0 && v < MINIMUM_ABBREV as i32 {
         v = MINIMUM_ABBREV as i32;
     }

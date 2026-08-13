@@ -461,7 +461,16 @@ fn ambiguous_argument(arg: &str) -> ExitCode {
 }
 
 pub fn reset(args: &[String]) -> Result<ExitCode> {
-    let repo = gix::discover(".")?;
+    // Every `reset` that moves HEAD writes a reflog line, and the reflog writer
+    // (`log_ref_write_fd()`, refs/files-backend.c:1940-41) fills a missing
+    // committer with `git_committer_info(0)` — flag 0, so `fmt_ident()` runs
+    // *non-strict* and synthesizes the ident from the account and host instead
+    // of dying. Only object-writing commands pass `IDENT_STRICT` and refuse.
+    // `checkout`/`branch`/`fetch`/… already fill this gap; `reset` did not, so
+    // it failed on any machine with no `user.name`/`user.email`.
+    let mut repo = gix::discover(".")?;
+    crate::ensure_reflog_identity(&mut repo);
+    let repo = repo;
 
     // ---- 1. Parse flags, honoring the `--` paths separator. ----
     let mut mode: Option<ResetMode> = None;
@@ -681,6 +690,30 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
 
     let mode = mode.unwrap_or(ResetMode::Mixed);
 
+    // Bare-repository refusals, in `cmd_reset()`'s order (builtin/reset.c:470-478).
+    //
+    // * `setup_work_tree()` runs for every mode but SOFT, and for MIXED only
+    //   when a work tree exists — so in a bare repository `--hard`, `--merge`
+    //   and `--keep` die there with the generic work-tree message.
+    // * MIXED (including the default and the pathspec form, both of which have
+    //   already defaulted to MIXED above) reaches the explicit
+    //   `is_bare_repository()` check and dies naming the mode.
+    // * `--soft` needs neither, and is the one mode that works in a bare repo.
+    //
+    // Both precede the `-N` check below, which is why `git reset -N --hard` in
+    // a bare repository reports the work tree and not the option.
+    if repo.workdir().is_none() {
+        match mode {
+            ResetMode::Soft => {}
+            ResetMode::Mixed => {
+                crate::git_fatal!("{} reset is not allowed in a bare repository", mode.label())
+            }
+            ResetMode::Hard | ResetMode::Merge | ResetMode::Keep => {
+                crate::git_fatal!("this operation must be run in a work tree")
+            }
+        }
+    }
+
     // `-N` rides only on a MIXED reset (the with-paths guard above already fired for
     // the non-MIXED path form, so this catches the whole-tree `--soft/--hard/… -N`).
     if intent_to_add && mode != ResetMode::Mixed {
@@ -696,10 +729,6 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
     let commit = target.object()?.peel_to_commit()?;
     let target_commit = commit.id;
     let target_tree = commit.tree_id()?.detach();
-
-    if mode == ResetMode::Hard && repo.workdir().is_none() {
-        crate::git_fatal!("hard reset not allowed in a bare repository");
-    }
 
     // Serialize the whole read-modify-write; held for the rest of the function.
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());

@@ -107,6 +107,21 @@ fn git_dir_is_reported_the_way_setup_leaves_it() {
     }
 }
 
+/// `--show-cdup` writes *nothing* — zero bytes, exit 0 — wherever there is no work tree, which is
+/// not the same as the empty line every other `rev-parse` query prints. `builtin/rev-parse.c`
+/// reaches its `putchar('\n')` only when `is_inside_work_tree()` holds; the other branch prints
+/// the work tree if there is one and otherwise falls straight through to the next argument.
+/// Measured with `od -c` under stock 2.55.0 in each directory named by its callers.
+fn assert_cdup_is_empty(dir: &Path, home: &Path) {
+    let o = run(dir, home, &["rev-parse", "--show-cdup"]);
+    assert_eq!(o.status.code(), Some(0), "`rev-parse --show-cdup` in {dir:?} still succeeds");
+    assert!(
+        o.stdout.is_empty(),
+        "`rev-parse --show-cdup` in {dir:?} writes no bytes at all, got {:?}",
+        String::from_utf8_lossy(&o.stdout)
+    );
+}
+
 /// `GIT_DIR_BARE` means no work tree, so the predicates flip and the commands that need one die
 /// the way git dies rather than failing somewhere deeper.
 #[test]
@@ -114,9 +129,13 @@ fn the_git_dir_has_no_work_tree() {
     let (_root, repo, home) = fixture("no-worktree");
     let git_dir = repo.join(".git");
 
+    // The work tree above is a work tree, and there `--show-cdup` does print its empty line.
+    assert_eq!(run(&repo, &home, &["rev-parse", "--show-cdup"]).stdout, b"\n");
+
     for dir in [git_dir.clone(), git_dir.join("refs")] {
         assert_eq!(stdout(&dir, &home, &["rev-parse", "--is-inside-work-tree"]), "false");
         assert_eq!(stdout(&dir, &home, &["rev-parse", "--is-inside-git-dir"]), "true");
+        assert_cdup_is_empty(&dir, &home);
 
         for args in [vec!["status", "--porcelain"], vec!["rev-parse", "--show-toplevel"]] {
             let o = run(&dir, &home, &args);
@@ -149,6 +168,7 @@ fn discovery_from_a_bare_repository_subdirectory() {
         let expected = if dir == bare { ".".to_owned() } else { bare.to_string_lossy().into_owned() };
         assert_eq!(String::from_utf8_lossy(&o.stdout).trim_end(), expected);
         assert_eq!(stdout(&dir, &home, &["rev-parse", "--is-bare-repository"]), "true");
+        assert_cdup_is_empty(&dir, &home);
     }
 }
 
@@ -174,6 +194,11 @@ fn linked_worktree_checkout_and_private_git_dir() {
         common.to_string_lossy()
     );
     assert_eq!(stdout(&checkout, &home, &["rev-parse", "--is-inside-work-tree"]), "true");
+    assert_eq!(
+        run(&checkout, &home, &["rev-parse", "--show-cdup"]).stdout,
+        b"\n",
+        "the checkout is the top of a work tree, so the climb is empty but still a line"
+    );
 
     // Standing in the private git dir is `GIT_DIR_BARE` again: git does not follow the `gitdir`
     // back-link to re-attach the checkout.
@@ -184,6 +209,7 @@ fn linked_worktree_checkout_and_private_git_dir() {
     );
     assert_eq!(stdout(&private, &home, &["rev-parse", "--is-inside-work-tree"]), "false");
     assert_eq!(stdout(&private, &home, &["symbolic-ref", "HEAD"]), "refs/heads/wtb");
+    assert_cdup_is_empty(&private, &home);
 }
 
 /// `setup_git_directory_gently_1()` returns `GIT_DIR_EXPLICIT` before it walks anywhere, so
@@ -226,6 +252,23 @@ fn explicit_git_dir_is_used_verbatim() {
 /// A `GIT_CEILING_DIRECTORIES` that names no ancestor of the search directory is not an error in
 /// git: `setup_git_directory_gently_1()` folds it away and searches as if it were unset. One that
 /// *does* contain an ancestor stops the walk there.
+///
+/// The ceiling directory is itself the first directory not searched — the walk stops *at* it, not
+/// after it:
+///
+/// ```text
+///     while (--offset > ceil_offset && !is_dir_sep(dir->buf[offset]))
+///             ; /* continue */
+///     if (offset <= ceil_offset)
+///             return GIT_DIR_HIT_CEILING;
+/// ```
+///
+/// `offset` is the length of the parent about to be examined and `ceil_offset` the length of the
+/// longest ceiling that is a *proper* ancestor of the starting directory, so a repository sitting
+/// exactly at the ceiling is never found. The starting directory is probed before any of this and
+/// is therefore reachable whatever the ceilings say — `longest_ancestor_length()` requires
+/// `path[len] == '/'`, so a ceiling equal to the starting directory matches nothing. Each
+/// expectation below was measured with stock 2.55.0 in the same layout.
 #[test]
 fn ceiling_directories_bound_the_walk() {
     let (root, repo, home) = fixture("ceiling");
@@ -243,14 +286,52 @@ fn ceiling_directories_bound_the_walk() {
             .output()
             .expect("run binary")
     };
+    let found_the_repo = |o: &Output| {
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        assert_eq!(
+            String::from_utf8_lossy(&o.stdout).trim_end(),
+            repo.join(".git").to_string_lossy()
+        );
+    };
+    let hit_the_ceiling = |o: &Output| {
+        assert_eq!(o.status.code(), Some(128), "{}", String::from_utf8_lossy(&o.stderr));
+        assert_eq!(
+            String::from_utf8_lossy(&o.stderr),
+            "fatal: not a git repository (or any of the parent directories): .git\n"
+        );
+    };
 
-    let o = with_ceiling(&deep, &root.join("nowhere"));
-    assert!(o.status.success(), "a non-matching ceiling is ignored, not an error");
-    assert_eq!(
-        String::from_utf8_lossy(&o.stdout).trim_end(),
-        repo.join(".git").to_string_lossy()
-    );
+    found_the_repo(&with_ceiling(&deep, &root.join("nowhere")));
+    hit_the_ceiling(&with_ceiling(&deep, &repo.join("sub")));
 
-    let o = with_ceiling(&deep, &repo.join("sub"));
-    assert_eq!(o.status.code(), Some(128), "a matching ceiling stops the walk below the repo");
+    // The repository's own root as the ceiling: `sub/deep` and `sub` are searched, `repo` is not.
+    hit_the_ceiling(&with_ceiling(&deep, &repo));
+    hit_the_ceiling(&with_ceiling(&repo.join("sub"), &repo));
+
+    // Standing on the ceiling is not below it, so the repository right here is still found —
+    // as it is with a ceiling above the repository, which excludes nothing on the way up.
+    let o = with_ceiling(&repo, &repo);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert_eq!(String::from_utf8_lossy(&o.stdout).trim_end(), ".git");
+    found_the_repo(&with_ceiling(&deep, &root));
+
+    // Several ceilings: git keeps the longest that is a proper ancestor, so the deepest one wins
+    // however the list is ordered, and a list of pure misses restricts nothing.
+    let joined = |dirs: [&Path; 2]| {
+        let sep = if cfg!(windows) { ";" } else { ":" };
+        dirs.map(|d| d.to_string_lossy().into_owned()).join(sep)
+    };
+    let sub = repo.join("sub");
+    hit_the_ceiling(&with_ceiling(&deep, Path::new(&joined([&repo, &sub]))));
+    hit_the_ceiling(&with_ceiling(&deep, Path::new(&joined([&sub, &repo]))));
+    found_the_repo(&with_ceiling(
+        &deep,
+        Path::new(&joined([&root.join("nowhere"), &repo.join("sub/deep/deeper")])),
+    ));
+
+    // A trailing separator is not part of the name: `real_pathdup()` in `canonicalize_ceiling_entry`
+    // normalizes it away before the comparison, so it behaves exactly like the bare path.
+    let mut with_slash = repo.as_os_str().to_owned();
+    with_slash.push(std::path::MAIN_SEPARATOR_STR);
+    hit_the_ceiling(&with_ceiling(&deep, Path::new(&with_slash)));
 }

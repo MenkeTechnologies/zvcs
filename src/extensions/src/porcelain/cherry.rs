@@ -234,11 +234,13 @@ pub fn cherry(args: &[String]) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// Port of `parse_opt_abbrev_cb()` for an attached `--abbrev=<n>`: a bare number,
-/// `0` meaning "print the whole name", anything else clamped to `[4, hexsz]`.
-/// `None` reports the non-numeric case upstream turns into a usage error.
+/// Port of `parse_opt_abbrev_cb()` for an attached `--abbrev=<n>`: the C number
+/// (see [`crate::abbrev::parse_opt_abbrev_value`], which owns the `strtol`
+/// quirks), then `0` meaning "print the whole name" and anything else clamped to
+/// `[4, hexsz]`. `None` reports the non-numeric case upstream turns into a usage
+/// error.
 fn parse_abbrev(value: &str, hexsz: usize) -> Option<Abbrev> {
-    let n: i64 = value.parse().ok()?;
+    let n = i64::from(crate::abbrev::parse_opt_abbrev_value(value)?);
     Some(if n == 0 {
         Abbrev::Full
     } else if n < MINIMUM_ABBREV as i64 {

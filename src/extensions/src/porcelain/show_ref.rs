@@ -233,7 +233,7 @@ fn die_incompatible(a: &str, b: &str) -> Result<ExitCode> {
 /// keeps the full id, a nonzero value below git's 4-digit minimum is raised to
 /// 4, and larger values are clamped to the hash width at render time.
 fn parse_abbrev(s: &str) -> Option<Abbrev> {
-    let v = strtol_i32(s)?;
+    let v = crate::abbrev::parse_opt_abbrev_value(s)?;
     Some(if v == 0 {
         Abbrev::Full
     } else if v < 4 {
@@ -243,39 +243,6 @@ fn parse_abbrev(s: &str) -> Option<Abbrev> {
     })
 }
 
-/// C `strtol(s, &end, 10)` followed by assignment to a 32-bit `int`, as git
-/// stores its abbrev value: skip leading whitespace, take an optional `+`/`-`
-/// and base-10 digits, and require the whole string to be consumed. On integer
-/// overflow the accumulator saturates to `i64::MIN`/`MAX` — whose low 32 bits
-/// (`0` / `-1`) match a C `long`-to-`int` truncation of `LONG_MIN`/`LONG_MAX`.
-fn strtol_i32(s: &str) -> Option<i32> {
-    let b = s.as_bytes();
-    let mut i = 0;
-    // strtol's isspace: space, \t, \n, \v, \f, \r.
-    while i < b.len() && (b[i] == 0x0B || b[i].is_ascii_whitespace()) {
-        i += 1;
-    }
-    let neg = matches!(b.get(i), Some(b'-'));
-    if matches!(b.get(i), Some(b'+' | b'-')) {
-        i += 1;
-    }
-    let start = i;
-    let mut acc: i64 = 0;
-    while i < b.len() && b[i].is_ascii_digit() {
-        let d = i64::from(b[i] - b'0');
-        acc = if neg {
-            acc.saturating_mul(10).saturating_sub(d)
-        } else {
-            acc.saturating_mul(10).saturating_add(d)
-        };
-        i += 1;
-    }
-    // No digits, or trailing junk after the number -> not a numerical value.
-    if i == start || i != b.len() {
-        return None;
-    }
-    Some(acc as i32)
-}
 
 /// Default form: walk every ref under `refs/` (optionally restricted to
 /// `refs/heads/` and/or `refs/tags/`) and print the ones matching `patterns`.

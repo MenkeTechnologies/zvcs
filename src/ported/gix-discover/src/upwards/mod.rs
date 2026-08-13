@@ -95,7 +95,26 @@ pub(crate) mod function {
         let mut current_height = 0;
         let mut cursor_metadata = Some(dir_metadata);
         'outer: loop {
-            if max_height.is_some_and(|x| current_height > x) {
+            // The ceiling directory itself is *not* searched. `setup_git_directory_gently_1()` in
+            // `setup.c` keeps `ceil_offset`, the length of the longest ceiling that is a proper
+            // ancestor of the starting directory, and stops before it ever looks at that
+            // directory:
+            //
+            //     while (--offset > ceil_offset && !is_dir_sep(dir->buf[offset]))
+            //             ; /* continue */
+            //     if (offset <= ceil_offset)
+            //             return GIT_DIR_HIT_CEILING;
+            //
+            // `offset` there is the length of the parent that is about to be examined, so the
+            // parent whose length *equals* the ceiling's — the ceiling itself — ends the search.
+            // `max_height` is that same boundary expressed as the number of components between
+            // the ceiling and the starting directory, hence `>=` rather than `>`.
+            //
+            // `find_ceiling_height()` only ever yields a height of at least one (git's
+            // `longest_ancestor_length()` likewise requires `path[len] == '/'`, so a ceiling
+            // equal to the starting directory does not match), which is what keeps the starting
+            // directory itself searched no matter what the ceilings say.
+            if max_height.is_some_and(|x| current_height >= x) {
                 return Err(Error::NoGitRepositoryWithinCeiling {
                     path: dir.into_owned(),
                     ceiling_height: current_height,

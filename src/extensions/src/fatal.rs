@@ -81,3 +81,103 @@ pub fn die(message: impl Into<String>) -> anyhow::Error {
 pub fn need_work_tree() -> anyhow::Error {
     die("this operation must be run in a work tree")
 }
+
+// ---------------------------------------------------------------------------
+// setup.c: "setup did not find a repository"
+// ---------------------------------------------------------------------------
+
+/// `DEFAULT_GIT_DIR_ENVIRONMENT` in `environment.h`. git fills the discovery
+/// message with this constant, not with a path: when the upward search comes up
+/// empty the message names the thing it was looking *for*, and is the same in
+/// every directory.
+const DEFAULT_GIT_DIR: &str = ".git";
+
+/// `GIT_DIR_HIT_CEILING` in `setup_git_directory_gently()`: the upward search
+/// reached the top — of the filesystem, or of a `GIT_CEILING_DIRECTORIES` entry
+/// — without finding a repository. Both endings print this same line; git does
+/// not say which one stopped it, nor how far it walked.
+pub fn no_repository_walked() -> String {
+    format!("not a git repository (or any of the parent directories): {DEFAULT_GIT_DIR}")
+}
+
+/// `GIT_DIR_HIT_MOUNT_POINT`: the search would have had to leave the filesystem
+/// it started on, which it will not do unless `GIT_DISCOVERY_ACROSS_FILESYSTEM`
+/// says so. `dir` is the directory the crossing was detected at.
+pub fn no_repository_at_mount_point(dir: &std::path::Path) -> String {
+    format!(
+        "not a git repository (or any parent up to mount point {})\n\
+         Stopping at filesystem boundary (GIT_DISCOVERY_ACROSS_FILESYSTEM not set).",
+        dir.display()
+    )
+}
+
+/// `setup_explicit_git_dir()`: `$GIT_DIR` was set, so nothing was searched for
+/// — the named directory simply is not a repository, and git quotes it back.
+pub fn no_repository_explicit(git_dir: &str) -> String {
+    format!("not a git repository: '{git_dir}'")
+}
+
+/// The line `setup_git_directory_gently()` would die with *here*, for the call
+/// sites that know only that they found no repository and never held the error.
+///
+/// Only the two endings reachable without one are distinguished: an explicit
+/// `$GIT_DIR` skips discovery entirely, and everything else walked and failed.
+/// A filesystem boundary is invisible from here — it is a property of the walk
+/// — so a site that has the error should map it with [`discovery_message`].
+pub fn no_repository() -> String {
+    match std::env::var_os("GIT_DIR") {
+        Some(dir) => no_repository_explicit(&dir.to_string_lossy()),
+        None => no_repository_walked(),
+    }
+}
+
+/// The same, as an error to return: `fatal: <message>`, exit 128.
+pub fn no_repository_error() -> anyhow::Error {
+    die(no_repository())
+}
+
+/// How git's setup would have reported a `gix::discover()` failure, or `None`
+/// when the failure is not one setup has a diagnostic for — an unreadable
+/// directory, a dubious-ownership refusal, a config that would not parse. Those
+/// keep the port's own voice rather than borrowing a message git never prints
+/// for them.
+pub fn discovery_message(err: &gix::discover::Error) -> Option<String> {
+    match err {
+        gix::discover::Error::Discover(err) => upwards_message(err),
+        // `discover()` reaches `open()` two ways: `$GIT_DIR` short-circuits the
+        // search (git's `GIT_DIR_EXPLICIT`), and a successful walk still has to
+        // open what it found. Only the first is `setup_explicit_git_dir()`, and
+        // only it names a path in the message — so the variable has to be set
+        // for this to be that branch at all.
+        gix::discover::Error::Open(gix::open::Error::NotARepository { .. }) => {
+            std::env::var_os("GIT_DIR").map(|dir| no_repository_explicit(&dir.to_string_lossy()))
+        }
+        gix::discover::Error::Open(_) => None,
+    }
+}
+
+/// The discovery-walk half of [`discovery_message`].
+fn upwards_message(err: &gix::discover::upwards::Error) -> Option<String> {
+    use gix::discover::upwards::Error as E;
+    match err {
+        // git collapses "ran out of parents" and "hit a ceiling" into one
+        // ending, `GIT_DIR_HIT_CEILING`, and one message.
+        E::NoGitRepository { .. } | E::NoGitRepositoryWithinCeiling { .. } => {
+            Some(no_repository_walked())
+        }
+        E::NoGitRepositoryWithinFs { limit, .. } => Some(no_repository_at_mount_point(limit)),
+        _ => None,
+    }
+}
+
+/// [`discovery_message`] for an error that has already been wrapped: the whole
+/// `anyhow` chain is searched, since a discovery failure usually arrives inside
+/// whatever context the command added on the way out.
+pub fn discovery_fatal(err: &anyhow::Error) -> Option<String> {
+    err.chain().find_map(|cause| {
+        if let Some(err) = cause.downcast_ref::<gix::discover::Error>() {
+            return discovery_message(err);
+        }
+        cause.downcast_ref::<gix::discover::upwards::Error>().and_then(upwards_message)
+    })
+}

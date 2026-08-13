@@ -1066,52 +1066,13 @@ fn prefixed_name(repo: &gix::Repository, short: &BStr) -> Option<BString> {
 ///   * `None` (git's `error: … expects a numerical value`, exit 129) is returned
 ///     only when no digit is consumed or non-digit bytes trail the number
 ///     (e.g. ``, `abc`, `0x10`, `12abc`, `8 `);
-///   * overflow does not error — `strtol` saturates to `LONG_{MAX,MIN}`, so the
-///     magnitude saturates to `i64::{MAX,MIN}` here;
-///   * the resulting `long` is then assigned to an `int`, i.e. truncated to the
-///     low 32 bits (`i64 as i32`), so `99…9` -> -1, `2^32` -> 0, `2^32+4` -> 4 —
-///     matching git bit-for-bit. The caller stores this and lets `hex_len` apply
-///     git's later `MINIMUM_ABBREV`/`hexsz` clamp.
+///   * overflow does not error, and the `long` is narrowed to the low 32 bits
+///     by the assignment to `int` (see [`crate::abbrev::parse_opt_abbrev_value`],
+///     which owns those quirks). The caller stores this and lets `hex_len`
+///     apply git's later `MINIMUM_ABBREV`/`hexsz` clamp.
 /// ```
 fn parse_c_int(s: &str) -> Option<i64> {
-    let b = s.as_bytes();
-    let mut i = 0;
-    // strtol skips the C `isspace` set before the sign.
-    while i < b.len() && matches!(b[i], b' ' | b'\t' | b'\n' | 0x0B | 0x0C | b'\r') {
-        i += 1;
-    }
-    let neg = matches!(b.get(i), Some(b'+' | b'-')) && {
-        let n = b[i] == b'-';
-        i += 1;
-        n
-    };
-    let start = i;
-    let mut acc: i64 = 0;
-    let mut overflow = false;
-    while let Some(&c) = b.get(i) {
-        if !c.is_ascii_digit() {
-            break;
-        }
-        let d = (c - b'0') as i64;
-        match acc.checked_mul(10).and_then(|v| v.checked_add(d)) {
-            Some(v) => acc = v,
-            None => overflow = true,
-        }
-        i += 1;
-    }
-    // No digits, or trailing bytes strtol would not consume: git errors 129.
-    if i == start || i != b.len() {
-        return None;
-    }
-    let long_val: i64 = if overflow {
-        if neg { i64::MIN } else { i64::MAX }
-    } else if neg {
-        -acc
-    } else {
-        acc
-    };
-    // git assigns the `long` to an `int`: keep the low 32 bits.
-    Some(long_val as i32 as i64)
+    crate::abbrev::parse_opt_abbrev_value(s).map(i64::from)
 }
 
 /// git's fatal convention: `fatal: <msg>` on stderr, exit 128.

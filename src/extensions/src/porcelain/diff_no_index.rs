@@ -225,8 +225,37 @@ struct Opts {
     colors: diff_color::DiffColors,
 }
 
+/// git's `diff_no_index_usage[]`, over the block every `add_diff_options()`
+/// caller shares. `usage_with_options()` writes both to stderr and exits 129.
+const USAGE_LINE: &str = "usage: git diff --no-index [<options>] <path> <path> [<pathspec>...]\n\n";
+
+/// Print the usage the way `usage_with_options()` does and hand back its code.
+fn usage() -> Result<ExitCode> {
+    eprint!("{USAGE_LINE}{}", super::diff_pairs::DIFF_OPTIONS);
+    Ok(ExitCode::from(129))
+}
+
+/// The options `cmd_diff()` consumes itself, before `diff_no_index()` ever runs
+/// its own `parse_options()` over `add_diff_options()`. They are ordinary `git
+/// diff` options *and* unknown to the no-index parser, which is why `git diff
+/// --cached` outside a repository is a parse error rather than a complaint about
+/// the missing repository.
+const NOT_IN_NO_INDEX: &[&str] = &["--cached", "--staged", "--merge-base"];
+
 /// `git diff --no-index <a> <b>`.
 pub(crate) fn run(args: &[String]) -> Result<ExitCode> {
+    run_with(args, false)
+}
+
+/// The same, entered because `git diff` found no repository: git's
+/// `DIFF_NO_INDEX_IMPLICIT`. The comparison itself is identical — only the
+/// diagnostic for the wrong number of operands differs, since a user who did not
+/// type `--no-index` has to be told why they are being shown its usage.
+pub(crate) fn run_implicit(args: &[String]) -> Result<ExitCode> {
+    run_with(args, true)
+}
+
+fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
     let mut fmt = Format::default();
     let mut ctx: u32 = 3;
     let mut ws = super::diff::Whitespace::Keep;
@@ -304,13 +333,40 @@ pub(crate) fn run(args: &[String]) -> Result<ExitCode> {
             s if s.starts_with("--abbrev=") => {
                 abbrev = s["--abbrev=".len()..].parse().unwrap_or(7);
             }
+            // `parse_options()` rejects these outright: they belong to
+            // `cmd_diff()`, not to the no-index parser, and never reach it.
+            s if NOT_IN_NO_INDEX.contains(&s) => {
+                eprintln!("error: unknown option `{}'", s.trim_start_matches('-'));
+                return usage();
+            }
             s => anyhow::bail!("unsupported option {s:?}"),
         }
     }
 
-    if operands.len() != 2 {
-        eprintln!("usage: git diff --no-index [<options>] <path> <path>");
-        return Ok(ExitCode::from(129));
+    // `if (argc < 2)`: too few operands is where the implicit form explains
+    // itself, since the user asked for `git diff` and is being shown the usage
+    // of a command they did not name.
+    if operands.len() < 2 {
+        if implicit {
+            eprintln!(
+                "warning: Not a git repository. Use --no-index to compare two paths outside a working tree"
+            );
+        }
+        return usage();
+    }
+    // `else if (argc > 2)`: extra operands are a pathspec, and `fixup_paths()`
+    // accepts one only when both sides are directories. A pair that is not two
+    // directories is git's refusal; a pair that is has no pathspec support here
+    // yet, and says so in this port's own voice rather than borrowing git's.
+    if operands.len() > 2 {
+        let both_dirs = operands[..2].iter().all(|p| Path::new(p).is_dir());
+        if both_dirs {
+            anyhow::bail!("--no-index pathspec limiting is not supported");
+        }
+        eprintln!(
+            "warning: Limiting comparison with pathspecs is only supported if both paths are directories."
+        );
+        return usage();
     }
 
     // Colour needs a repository to read `color.diff.*` out of. `--no-index` may run

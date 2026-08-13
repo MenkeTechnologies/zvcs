@@ -78,29 +78,51 @@ fn upwards_with_relative_directories_and_optional_ceiling() -> gix_testtools::Re
     ] {
         let search_dir = Path::new(search_dir);
         let ceiling_dir = cwd.join(ceiling_dir_component);
-        let (repo_path, _trust) = gix_discover::upwards_opts(
+        // Every spelling of `..` here names the work dir itself, which is the first directory the
+        // ceiling excludes from the search — stock 2.55.0 dies `not a git repository` for the
+        // same pair, e.g. `GIT_CEILING_DIRECTORIES=<work_dir> git rev-parse --git-dir` run in
+        // `<work_dir>/some`.
+        let err = gix_discover::upwards_opts(
             search_dir,
             Options {
                 ceiling_dirs: vec![ceiling_dir],
                 ..Default::default()
             },
         )
-        .expect("ceiling dir should allow us to discover the repo");
+        .expect_err("however it is spelled, the ceiling is the work dir and is not searched");
+        assert!(matches!(
+            err,
+            gix_discover::upwards::Error::NoGitRepositoryWithinCeiling { .. }
+        ));
+
+        // One directory higher the very same search succeeds, so the failure above is the ceiling
+        // taking effect rather than the path spelling defeating the search.
+        let (repo_path, _trust) = gix_discover::upwards_opts(
+            search_dir,
+            Options {
+                ceiling_dirs: vec![cwd.join(ceiling_dir_component).join("..")],
+                ..Default::default()
+            },
+        )
+        .expect("a ceiling above the work dir leaves the work dir itself searchable");
         assert_repo_is_current_workdir(repo_path, Path::new(".."));
 
         let (repo_path, _trust) =
             gix_discover::upwards_opts(search_dir, Default::default()).expect("without ceiling dir we see the same");
         assert_repo_is_current_workdir(repo_path, Path::new(".."));
 
-        let (repo_path, _trust) = gix_discover::upwards_opts(
+        let err = gix_discover::upwards_opts(
             search_dir,
             Options {
                 ceiling_dirs: vec![PathBuf::from("..")],
                 ..Default::default()
             },
         )
-        .expect("purely relative ceiling dirs work as well");
-        assert_repo_is_current_workdir(repo_path, Path::new(".."));
+        .expect_err("purely relative ceiling dirs work as well, and this one is the work dir too");
+        assert!(matches!(
+            err,
+            gix_discover::upwards::Error::NoGitRepositoryWithinCeiling { .. }
+        ));
 
         let err = gix_discover::upwards_opts(
             search_dir,

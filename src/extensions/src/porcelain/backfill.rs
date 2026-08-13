@@ -200,16 +200,25 @@ pub fn backfill(args: &[String]) -> Result<ExitCode> {
     let mut saw_objects = false;
     let mut saw_filter = false;
     let mut saw_ancestry_path = false;
+    // `setup_revisions` hands back the options it did not recognize and lets the
+    // caller complain; `cmd_backfill` does so only once the whole scan is over, so
+    // a revision error later in the argv is reported ahead of this one.
+    let mut unrecognized: Option<&str> = None;
+
+    // git pre-scans for `--` before looking at anything else: the arguments after
+    // it become prune data, taken as pathspecs with no check that they exist, and
+    // the ones before it are revisions *only* — a non-revision there is a `bad
+    // revision`, never a path.
+    let head: &[&str] = match rest.iter().position(|&a| a == "--") {
+        Some(n) => &rest[..n],
+        None => &rest[..],
+    };
+    let seen_dashdash = head.len() != rest.len();
 
     let mut j = 0;
-    while j < rest.len() {
-        let a = rest[j];
+    while j < head.len() {
+        let a = head[j];
         j += 1;
-
-        // Everything after `--` is a pathspec; git does not require it to exist.
-        if a == "--" {
-            break;
-        }
 
         if let Some(spec) = a.strip_prefix('^') {
             // git reports the caret form differently from a bare revision.
@@ -248,7 +257,7 @@ pub fn backfill(args: &[String]) -> Result<ExitCode> {
                 "--max-count" | "--skip" => {
                     let value = match value {
                         Some(value) => value,
-                        None => match rest.get(j) {
+                        None => match head.get(j) {
                             Some(&next) if next != "--" => {
                                 j += 1;
                                 next
@@ -297,8 +306,8 @@ pub fn backfill(args: &[String]) -> Result<ExitCode> {
                      would go unreported"
                 );
             }
-            eprintln!("fatal: unrecognized argument: {a}");
-            return Ok(ExitCode::from(128));
+            unrecognized.get_or_insert(a);
+            continue;
         }
 
         // A positional: a revision, a range, or — if it names an existing path —
@@ -316,10 +325,27 @@ pub fn backfill(args: &[String]) -> Result<ExitCode> {
             has_bottom |= negating || a.contains("..");
             continue;
         }
-        if Path::new(a).exists() {
-            continue;
+
+        // `handle_revision_arg` failed. A `--` earlier in the argv declared every
+        // argument before it a revision, so git dies outright rather than falling
+        // back to a path. Otherwise this argument *and every one after it* must
+        // name a path, and revision parsing stops here — which is why a valid
+        // revision behind a path is still rejected (`README.md HEAD`).
+        if seen_dashdash {
+            eprintln!("fatal: bad revision '{a}'");
+            return Ok(ExitCode::from(128));
         }
-        return Ok(fatal_ambiguous(a));
+        for (n, arg) in head[j - 1..].iter().enumerate() {
+            if let Some(code) = verify_filename(arg, n == 0) {
+                return Ok(code);
+            }
+        }
+        break;
+    }
+
+    if let Some(a) = unrecognized {
+        eprintln!("fatal: unrecognized argument: {a}");
+        return Ok(ExitCode::from(128));
     }
 
     // Two post-parse checks git makes once the whole revision set is known.
@@ -392,6 +418,60 @@ fn fatal_ambiguous(spec: &str) -> ExitCode {
          'git <command> [<revision>...] -- [<file>...]'"
     );
     ExitCode::from(128)
+}
+
+/// git's `verify_filename()` (setup.c): `Some(code)` when the argument cannot be a
+/// path, after printing the message git prints for it.
+///
+/// `first` is git's `diagnose_misspelt_rev`, set only for the argument that failed
+/// revision resolution; the ones trailing it were already known to be paths, so they
+/// get the plainer wording.
+fn verify_filename(arg: &str, first: bool) -> Option<ExitCode> {
+    if arg.starts_with('-') {
+        eprintln!("fatal: option '{arg}' must come before non-option arguments");
+        return Some(ExitCode::from(128));
+    }
+    if looks_like_pathspec(arg) || check_filename(arg) {
+        return None;
+    }
+    if first {
+        return Some(fatal_ambiguous(arg));
+    }
+    eprintln!(
+        "fatal: {arg}: no such path in the working tree.\n\
+         Use 'git <command> -- <path>...' to specify paths that do not exist locally."
+    );
+    Some(ExitCode::from(128))
+}
+
+/// git's `looks_like_pathspec()`: an unescaped glob metacharacter, or long-form
+/// pathspec magic. Short magic (`:/`, `:!`, `:^`) deliberately is *not* here — git
+/// strips it in `check_filename` and then requires the remainder to exist, so
+/// `:/nope` is a missing path rather than an accepted pathspec.
+fn looks_like_pathspec(arg: &str) -> bool {
+    let mut escaped = false;
+    for b in arg.bytes() {
+        if escaped {
+            escaped = false;
+        } else if b == b'\\' {
+            escaped = true;
+        } else if matches!(b, b'*' | b'?' | b'[') {
+            return true;
+        }
+    }
+    arg.starts_with(":(")
+}
+
+/// git's `check_filename()`: true when the argument names something on disk. Short
+/// pathspec magic is stripped first, and a bare `:/`, `:!` or `:^` — root, or an
+/// exclusion of everything — counts as present without a lookup.
+fn check_filename(arg: &str) -> bool {
+    let rest = [":/", ":!", ":^"].iter().find_map(|p| arg.strip_prefix(p));
+    match rest {
+        Some("") => true,
+        Some(rest) => Path::new(rest).symlink_metadata().is_ok(),
+        None => Path::new(arg).symlink_metadata().is_ok(),
+    }
 }
 
 /// A parse-options `error:` line with no usage block after it, exit 129.
@@ -493,4 +573,43 @@ fn has_promisor_remote(repo: &gix::Repository) -> bool {
         let key = format!("remote.{}.promisor", name.to_str_lossy());
         config.boolean(&key).unwrap_or(false)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// git's `looks_like_pathspec()` accepts an argument as a pathspec without
+    /// touching the filesystem only for an unescaped glob metacharacter or the
+    /// long `:(...)` magic. Short magic is *not* in that set: stock git 2.55.0
+    /// answers `git backfill README.md :/nope` with
+    /// `fatal: :/nope: no such path in the working tree.`, which it could not do
+    /// if a leading `:` short-circuited the check.
+    #[test]
+    fn short_pathspec_magic_is_not_self_certifying() {
+        assert!(looks_like_pathspec("no*pe"));
+        assert!(looks_like_pathspec("a?b"));
+        assert!(looks_like_pathspec("a[bc]"));
+        assert!(looks_like_pathspec(":(top)nope"));
+
+        assert!(!looks_like_pathspec(":/nope"));
+        assert!(!looks_like_pathspec(":!nope"));
+        assert!(!looks_like_pathspec(":^nope"));
+        assert!(!looks_like_pathspec("README.md"));
+        // An escaped metacharacter is a literal, so it certifies nothing.
+        assert!(!looks_like_pathspec(r"a\*b"));
+    }
+
+    /// `check_filename()` treats a bare `:/` (repository root) and a bare `:!`
+    /// or `:^` (exclude nothing) as present without a lookup, which is why
+    /// `git backfill README.md :/` exits 0 in a repository that has no file
+    /// named `:/`.
+    #[test]
+    fn bare_short_magic_needs_no_file() {
+        assert!(check_filename(":/"));
+        assert!(check_filename(":!"));
+        assert!(check_filename(":^"));
+        assert!(!check_filename(":/definitely-not-present"));
+        assert!(!check_filename("definitely-not-present"));
+    }
 }

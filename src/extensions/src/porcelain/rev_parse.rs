@@ -652,11 +652,24 @@ fn query(out: &mut impl Write, repo: &gix::Repository, q: Query) -> Result<Optio
             None => emit(out, b"")?,
         },
         Query::ShowCdup => {
-            // Outside the work tree git prints the work tree itself rather than a `../` climb.
+            // Outside the work tree git prints the work tree itself rather than a `../` climb —
+            // and where there is no work tree at all it prints *nothing*, not even the newline
+            // every other query ends with. `builtin/rev-parse.c` reaches its `putchar('\n')`
+            // only through the `is_inside_work_tree()` branch; the other one is
+            //
+            //     if (!is_inside_work_tree(the_repository)) {
+            //             const char *work_tree = repo_get_work_tree(the_repository);
+            //             if (work_tree)
+            //                     printf("%s\n", work_tree);
+            //             continue;
+            //     }
+            //
+            // so a missing work tree writes zero bytes and still exits 0. That is what happens
+            // inside a `.git` directory, inside a linked worktree's administrative directory and
+            // in a bare repository.
             if !is_inside_work_tree(repo) {
-                match toplevel(repo) {
-                    Some(top) => emit(out, top.as_os_str().as_encoded_bytes())?,
-                    None => emit(out, b"")?,
+                if let Some(top) = toplevel(repo) {
+                    emit(out, top.as_os_str().as_encoded_bytes())?;
                 }
             } else {
                 let up: String = prefix(repo).map_or_else(String::new, |pfx| {

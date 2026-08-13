@@ -572,17 +572,12 @@ fn render_plain(repo: &gix::Repository, worktrees: &[Wt], verbose: bool) -> Stri
 /// backwards but is deliberate, since the caller wants everything already in the
 /// past. `None` means the date was malformed.
 fn parse_expiry(text: &str) -> Option<u64> {
-    match text {
-        "never" | "false" => return Some(0),
-        "all" | "now" => return Some(u64::MAX),
-        _ => {}
+    // The shared port's "expire everything" is `i64::MAX`; this caller compares against `u64`
+    // mtimes, so saturate to `u64::MAX` rather than truncating the sentinel.
+    match crate::date::parse_expiry_date(text)? {
+        i64::MAX => Some(u64::MAX),
+        seconds => Some(seconds.max(0) as u64),
     }
-    let now = Some(std::time::SystemTime::now());
-    // approxidate treats `.` as a word separator, so `1.day.ago` is relative.
-    let parsed = gix::date::parse(text, now)
-        .or_else(|_| gix::date::parse(text.replace('.', " ").trim(), now))
-        .ok()?;
-    Some(parsed.seconds.max(0) as u64)
 }
 
 /// git's `find_unique_abbrev()`: the shortest unambiguous prefix at least

@@ -1,10 +1,16 @@
-//! Relative date rendering, ported from git's `show_date_relative` (date.c).
+//! Date arguments and relative date rendering, both ported from git's `date.c`.
 //!
-//! gitoxide's `gix-date` can PARSE relative dates ("2 minutes ago" → a
-//! timestamp) but has no relative/human FORMAT direction, so this is the shared
-//! renderer for `--date=relative` and the `%ar`/`%cr` pretty atoms. Every
-//! command (log, shortlog, for-each-ref, blame) routes here so the output is
-//! identical across the binary.
+//! Two directions, one module:
+//!
+//! * **Reading** a `--since`/`--until`/`--before`/`--after`/`--expire`/`--mtime` value is
+//!   [`approxidate()`] and friends, thin wrappers that supply git's `get_time()` to the port in
+//!   [`gix::date::parse::approxidate_careful`]. Every verb goes through them, so a date argument
+//!   means the same thing everywhere in the binary. Do not reach for
+//!   [`gix::date::parse`][gix::date::parse()] for a command-line date: it reads a bare integer as
+//!   a unix timestamp, and git does not below `100000000` — `--since=0` means *now* to git.
+//! * **Writing** a relative date is [`show_date_relative()`]. `gix-date` parses relative dates
+//!   but has no format direction, so this is the shared renderer for `--date=relative` and the
+//!   `%ar`/`%cr` pretty atoms.
 
 /// The "now" reference git resolves in `get_time()`: `GIT_TEST_DATE_NOW`
 /// (epoch seconds) when set — so relative output is reproducible under test —
@@ -19,6 +25,41 @@ pub fn now_seconds() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/// git's `approxidate()` (date.h:69): resolve a command-line date to epoch seconds.
+///
+/// This is the only date-argument parser in the binary. It never fails — anything git cannot read
+/// resolves to the current time, which is what makes `--since=garbage` a no-op limiter rather
+/// than an error.
+///
+/// Use [`approxidate_careful()`] instead when the caller has to distinguish "git could not read
+/// this" from "git read this as now".
+pub fn approxidate(value: &str) -> i64 {
+    gix::date::parse::approxidate(value, now_seconds())
+}
+
+/// git's `approxidate_careful()` (date.c:1413): [`approxidate()`] plus the `error_ret` flag,
+/// `true` when nothing in `value` looked like a date at all.
+pub fn approxidate_careful(value: &str) -> (i64, bool) {
+    gix::date::parse::approxidate_careful(value, now_seconds())
+}
+
+/// git's `parse_date_basic()` (date.c:879): the strict half, which is what `parse_date()` and
+/// therefore `GIT_AUTHOR_DATE`/`--date=` use before anything falls back to approxidate.
+///
+/// `None` is git's `-1` return.
+pub fn parse_date_basic(value: &str) -> Option<gix::date::Time> {
+    gix::date::parse::parse_date_basic(value, now_seconds())
+}
+
+/// git's `parse_expiry_date()` (date.c:957): [`approxidate_careful()`] with four words taken over
+/// first — `never`/`false` expire nothing, `all`/`now` expire everything.
+///
+/// `None` is git's non-zero return, which every caller reports as
+/// `fatal: invalid timestamp '<value>' given to '--<option>'`.
+pub fn parse_expiry_date(value: &str) -> Option<i64> {
+    gix::date::parse::parse_expiry_date(value, now_seconds())
 }
 
 /// git's `Q_(...)` pluralization: `"1 second ago"` vs `"N seconds ago"`.

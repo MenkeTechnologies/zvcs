@@ -393,7 +393,10 @@ fn parse_pack_header(header: &[u8]) -> Option<ExitCode> {
 /// The six-character tail `mkstemp()` puts on `tmp_pack_XXXXXX`. Uniqueness is
 /// all that is asked of it — the name is never parsed, only replaced by a rename
 /// or left behind.
-fn mkstemp_suffix() -> String {
+///
+/// Shared with `porcelain::fast_import`, whose `start_packfile()` opens a
+/// temporary under the same name in the same directory.
+pub(crate) fn mkstemp_suffix() -> String {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.subsec_nanos())

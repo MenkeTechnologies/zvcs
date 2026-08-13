@@ -328,13 +328,12 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
                 };
                 opts.shallow = Some(Shallow::Deepen(n));
             }
-            // Shallow boundary at a cutoff date (git's `deepen_since`). Parsed with
-            // gitoxide's git-compatible date parser, relative to the current time.
+            // Shallow boundary at a cutoff date (git's `deepen_since`). `fetch-pack.c:439` runs
+            // the value through `approxidate()`, which never fails — an unreadable date is the
+            // current time, not an error.
             "--shallow-since" => {
                 let v = take_value!("--shallow-since");
-                let t = gix::date::parse(&v, Some(std::time::SystemTime::now()))
-                    .map_err(|_| anyhow::anyhow!("--shallow-since expects a valid date, got {v:?}"))?;
-                shallow_since = Some(t);
+                shallow_since = Some(gix::date::Time::new(crate::date::approxidate(&v), 0));
             }
             // Exclude history reachable from a ref (git's repeatable `deepen_not`).
             "--shallow-exclude" => {

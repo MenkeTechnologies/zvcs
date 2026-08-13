@@ -2,6 +2,16 @@
 //!
 //! Note that this is not a general purpose time library.
 //!
+//! Two parsers live here, and they are not interchangeable:
+//!
+//! * [`parse()`] matches a value against a list of known formats. A bare integer is a unix
+//!   timestamp to it, always.
+//! * [`parse::approxidate_careful()`] is the port of git's own `approxidate_careful()`, which is
+//!   what every `--since`/`--until`/`--expire` value on a git command line goes through. It reads
+//!   a bare integer as a unix timestamp only from `100000000` up; below that the number is a
+//!   day-of-month or a year, and `0` is nothing at all. Use it for anything a user typed on a
+//!   command line.
+//!
 //! ## Examples
 //!
 //! ```

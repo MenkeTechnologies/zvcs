@@ -52,6 +52,27 @@ use crate::lock::RepoLock;
 ///   * `--` to terminate option parsing
 /// ```
 ///
+/// A `<directory>` that does not exist is created, leading directories and all
+/// (git `chdir()`s into it and falls back to
+/// `safe_create_leading_directories_const()` + `mkdir()`), for bare and
+/// non-bare alike.
+///
+/// Refusals follow `cmd_init_db`'s order, which mixes two exit codes and two
+/// different usage renderings — callers branch on both, so neither the order
+/// nor the rendering is interchangeable:
+/// ```text
+///   * an unknown option              parse_options -> usage_with_options():
+///                                    `error: unknown option `x'`, the reflowed
+///                                    usage, the option list. Exit 129.
+///   * `--separate-git-dir` + `--bare`  die() -> exit 128.
+///   * a second `<directory>`         usage(init_db_usage[0]): the usage string
+///                                    alone, unreflowed, no option list. Exit 129.
+///   * an unknown `--object-format` / `--ref-format`   die() -> exit 128.
+///   * an initial branch name `check_refname_format()` rejects
+///                                    die() -> exit 128, after the repository
+///                                    skeleton exists but before `HEAD` is written.
+/// ```
+///
 /// Ported from git's `builtin/init-db.c` + `setup.c` (`create_default_files`,
 /// `copy_templates_1`, `separate_git_dir`) and `path.c`
 /// (`calc_shared_perm`/`adjust_shared_perm`). The `--shared` permission math,
@@ -79,6 +100,20 @@ use crate::lock::RepoLock;
 /// stdout; a usage error prints the complaint and then this on stderr. Both exit 129.
 const USAGE: &str = "usage: git init [-q | --quiet] [--bare] [--template=<template-directory>]\n                [--separate-git-dir <git-dir>] [--object-format=<format>]\n                [--ref-format=<format>]\n                [-b <branch-name> | --initial-branch=<branch-name>]\n                [--shared[=<permissions>]] [<directory>]\n\n    --[no-]template <template-directory>\n                          directory from which templates will be used\n    --[no-]bare           create a bare repository\n    --shared[=<permissions>]\n                          specify that the git repository is to be shared amongst several users\n    -q, --[no-]quiet      be quiet\n    --[no-]separate-git-dir <gitdir>\n                          separate git dir from working tree\n    -b, --[no-]initial-branch <name>\n                          override the name of the initial branch\n    --[no-]object-format <hash>\n                          specify the hash algorithm to use\n    --[no-]ref-format <format>\n                          specify the reference format to use\n\n";
 
+/// `init_db_usage[0]` verbatim from git 2.55.0's `builtin/init-db.c`, with the
+/// `"usage: "` prefix `usage_builtin()` prepends (`usage.c`).
+///
+/// This is NOT [`USAGE`]. git has two ways out of `builtin/init-db.c`:
+/// `parse_options` failures go through `usage_with_options()`, which *reflows*
+/// the usage string (continuation lines re-indented under `usage: git init `)
+/// and appends the option list — that is [`USAGE`], what `-h` and an unknown
+/// option print. Too many positional arguments instead calls plain
+/// `usage(init_db_usage[0])`, which prints the C string literal as written: the
+/// continuation lines keep the 9 spaces they have in the source, and no option
+/// list follows. Both exit 129, but the bytes differ, so the two paths need two
+/// constants.
+const PLAIN_USAGE: &str = "usage: git init [-q | --quiet] [--bare] [--template=<template-directory>]\n         [--separate-git-dir <git-dir>] [--object-format=<format>]\n         [--ref-format=<format>]\n         [-b <branch-name> | --initial-branch=<branch-name>]\n         [--shared[=<permissions>]] [<directory>]\n";
+
 /// `die()`: `fatal: <msg>` and exit 128.
 fn fatal(msg: &str) -> ExitCode {
     eprintln!("fatal: {msg}");
@@ -92,11 +127,24 @@ fn usage_error(msg: &str) -> ExitCode {
     ExitCode::from(129)
 }
 
+/// git's bare `usage(init_db_usage[0])`: the unreflowed usage string alone on
+/// stderr, exit 129. Reached only by `0 < argc` after `parse_options` — i.e.
+/// more than one `<directory>` operand.
+fn usage_only() -> ExitCode {
+    eprint!("{PLAIN_USAGE}");
+    ExitCode::from(129)
+}
+
 pub fn init(args: &[String]) -> Result<ExitCode> {
     let mut bare = false;
     let mut quiet = false;
     let mut initial_branch: Option<String> = None;
-    let mut directory: Option<String> = None;
+    // Every non-option operand, in order. git's `parse_options` collects these
+    // by compacting `argv` and reports how many survived; the count is only
+    // judged *after* parsing, so a second directory is not an error until the
+    // whole command line has been read (`git init a b --frobnicate` reports the
+    // unknown option, not the extra operand).
+    let mut positionals: Vec<String> = Vec::new();
     let mut template: Option<String> = None;
     let mut separate_git_dir: Option<String> = None;
     // The requested `--object-format`/`--ref-format` values (validated after the
@@ -113,10 +161,7 @@ pub fn init(args: &[String]) -> Result<ExitCode> {
     while i < args.len() {
         let arg = &args[i];
         if positional_only || !arg.starts_with('-') || arg == "-" {
-            if directory.is_some() {
-                crate::git_fatal!("too many arguments, expected at most one directory");
-            }
-            directory = Some(arg.clone());
+            positionals.push(arg.clone());
             i += 1;
             continue;
         }
@@ -212,6 +257,32 @@ pub fn init(args: &[String]) -> Result<ExitCode> {
         i += 1;
     }
 
+    // Post-parse checks, in git's order — `cmd_init_db` decides these one after
+    // another and each `die()`s/`usage()`s on the spot, so a command line that
+    // trips several is judged by the FIRST one git reaches, not by ours:
+    //   1. `--separate-git-dir` with `--bare`   → die, exit 128
+    //   2. more than one `<directory>` operand  → usage(), exit 129
+    //   3. an unknown `--object-format`         → die, exit 128
+    //   4. an unknown `--ref-format`            → die, exit 128
+    // Verified against stock 2.55.0: `git init --object-format=bogus a b` prints
+    // the usage block and exits 129 (the operand count is judged first), while
+    // `git init --separate-git-dir=x --bare a b` dies with the option-conflict
+    // message and exits 128 (that check precedes the operand count).
+
+    // git refuses to combine these (builtin/init-db.c: "cannot be used together").
+    if separate_git_dir.is_some() && bare {
+        crate::git_fatal!(
+            "options '--separate-git-dir' and '--bare' cannot be used together"
+        );
+    }
+
+    // `} else if (0 < argc) { usage(init_db_usage[0]); }` — anything past the
+    // single optional `<directory>` is a usage error, not a `die()`.
+    if positionals.len() > 1 {
+        return Ok(usage_only());
+    }
+    let directory = positionals.into_iter().next();
+
     // Resolve the repository formats with git's precedence (`builtin/init-db.c`
     // + `setup.c`): the command-line option wins, then the `GIT_DEFAULT_HASH` /
     // `GIT_DEFAULT_REF_FORMAT` environment variable, then the
@@ -243,14 +314,24 @@ pub fn init(args: &[String]) -> Result<ExitCode> {
     // being passed (git's init_shared_repository == 0 is falsy).
     let shared = shared.filter(|&s| s != 0);
 
-    // git refuses to combine these (builtin/init-db.c: "cannot be used together").
-    if separate_git_dir.is_some() && bare {
-        crate::git_fatal!(
-            "options '--separate-git-dir' and '--bare' cannot be used together"
-        );
-    }
-
     let target = PathBuf::from(directory.as_deref().unwrap_or("."));
+
+    // git `chdir()`s into the `<directory>` operand and, when that fails, creates
+    // it — leading directories via `safe_create_leading_directories_const()` then
+    // the leaf via `mkdir()` — before retrying (`builtin/init-db.c`). So
+    // `git init nested/dir` works with no `nested/` present. This port never
+    // chdirs (it passes the path down instead), so the creation has to be done
+    // here: `gix::init` happens to create leading directories itself, but
+    // `gix::init_bare` does not, which is why `git init --bare nested/dir` failed
+    // where the non-bare form succeeded.
+    if let Some(dir) = directory.as_deref() {
+        if !target.is_dir() {
+            if let Err(e) = std::fs::create_dir_all(&target) {
+                // git's `die_errno(_("cannot mkdir %s"), argv[0])`.
+                return Ok(fatal(&format!("cannot mkdir {dir}: {e}")));
+            }
+        }
+    }
 
     // Detect an already-initialized repository at the target so we can emit the
     // `Reinitialized existing ...` line instead of failing. For a worktree repo
@@ -341,10 +422,39 @@ pub fn init(args: &[String]) -> Result<ExitCode> {
     // branch, matching stock git init (which creates no `logs/HEAD`). For a
     // separate git dir this happens before the git dir is moved, so the lock and
     // ref edit still target the freshly-created `<target>/.git`.
-    let branch: FullName = format!("refs/heads/{branch_name}")
-        .try_into()
-        .map_err(|e| anyhow::anyhow!("invalid initial branch name {branch_name:?}: {e}"))?;
+    //
+    // git checks the composed ref here, not at parse time:
+    // `create_reference_database()` (`setup.c`) builds `refs/heads/<name>` and
+    // `die(_("invalid initial branch name: '%s'"), initial_branch)` when
+    // `check_refname_format(ref, 0)` rejects it — so the diagnostic is git's
+    // `die()` (exit 128), and it lands only after the repository skeleton
+    // already exists, exactly like here.
     let src_git_dir = repo.git_dir().to_path_buf();
+    let branch: FullName = match format!("refs/heads/{branch_name}").try_into() {
+        Ok(b) => b,
+        Err(_) => {
+            // git dies *before* `HEAD` is written: `create_default_files()` lays
+            // down `config`, `description`, `hooks/`, `info/` and the refs
+            // directories, and only then does `create_reference_database()`
+            // validate the name and, if it passes, symref `HEAD` at it. gix's
+            // `init`/`init_bare` bundle the skeleton and `HEAD` into one call, so
+            // the file exists here by the time the name can be checked; removing
+            // it leaves the same on-disk wreckage stock git leaves behind (which
+            // the parity probe compares, since a bare init drops these files in
+            // the caller's directory for it to see).
+            // Same reasoning for the object store: stock git creates
+            // `objects/{info,pack}` only after the reference database is set up,
+            // so a failed init leaves none. `remove_dir` refuses a non-empty
+            // directory, so a pre-existing object store is never touched.
+            let _ = std::fs::remove_file(src_git_dir.join("HEAD"));
+            for dir in ["objects/pack", "objects/info", "objects"] {
+                let _ = std::fs::remove_dir(src_git_dir.join(dir));
+            }
+            return Ok(fatal(&format!(
+                "invalid initial branch name: '{branch_name}'"
+            )));
+        }
+    };
     {
         let _lock = RepoLock::acquire(&src_git_dir);
         repo.edit_reference(RefEdit {

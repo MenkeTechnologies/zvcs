@@ -2517,11 +2517,13 @@ fn quotemeta(s: &str) -> String {
     out
 }
 
-/// `execute_cmd($prefix, $cmd, $file)` — run `<cmd> <file>` through the shell
-/// and collect its lines. A blank line ends the output; anything after one is an
+/// `execute_cmd($prefix, $cmd, $file)` — `open my $fh, "-|", "$cmd \Q$file\E"`.
+/// A perl pipe-open with a single string always hands it to the shell whole, so
+/// there is no `prepare_shell_cmd` argv here: the command and the quoted file
+/// name are one script. A blank line ends the output; anything after one is an
 /// error.
 fn execute_cmd(prefix: &str, cmd: &str, file: &str) -> Result<Vec<String>, String> {
-    let out = std::process::Command::new("sh")
+    let out = crate::external::shell()
         .arg("-c")
         .arg(format!("{cmd} {}", quotemeta(file)))
         .stdin(std::process::Stdio::null())
@@ -2886,8 +2888,12 @@ impl Mailer {
         }
         let editor = self.editor.clone().unwrap_or_default();
         let die_msg = "the editor exited uncleanly, aborting everything\n";
+        // `system_or_die(['sh', '-c', $editor.' "$@"', $editor, @_], $die_msg)` —
+        // the perl driver spells the shell invocation out itself rather than
+        // going through `prepare_shell_cmd`, so a bare editor name is shelled
+        // too. Only the interpreter is shared.
         let run = |batch: &[String]| -> Step<()> {
-            let status = std::process::Command::new("sh")
+            let status = crate::external::shell()
                 .arg("-c")
                 .arg(format!("{editor} \"$@\""))
                 .arg(&editor)
@@ -3189,7 +3195,10 @@ impl Mailer {
         } else if self.s.sendmail_cmd.is_some() || absolute_server {
             let mut cmd = match &self.s.sendmail_cmd {
                 Some(sc) => {
-                    let mut c = std::process::Command::new("sh");
+                    // `exec("sh", "-c", "$sendmail_cmd \"\$@\"", "-", @params)` —
+                    // the perl driver's own shape, with `-` on `$0`, not
+                    // `prepare_shell_cmd`'s.
+                    let mut c = crate::external::shell();
                     c.arg("-c").arg(format!("{sc} \"$@\"")).arg("-").args(&params);
                     c
                 }

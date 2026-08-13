@@ -38,6 +38,18 @@
 //!   `Trying simple merge.` / `Simple merge failed …` framing, the per-path
 //!   `Auto-merging` / `Added … differently.` lines, and the exit code.
 //!
+//! ### Option-shaped operands
+//!
+//! The script interpolates `$bases`, `$head` and `$remotes` into the `read-tree`
+//! command line **unquoted**, so anything in them that looks like an option is
+//! one — and read-tree's `parse_options` sees it before it looks at a single
+//! tree. That is the whole story behind `-X<opt>`: `try_merge_command` turns it
+//! into `--<opt>` and puts it ahead of the merge base, so
+//! `git cherry-pick --strategy=resolve -Xtheirs` arrives here with `--theirs` in
+//! `$bases`. Nothing in this file decides what to do about that; read-tree's own
+//! scan does (`super::read_tree::parse_args`), and `|| exit 2` maps its refusal
+//! to status 2 — `error: unknown option \`theirs'` plus read-tree's usage block.
+//!
 //! ### Floors (bail rather than approximate)
 //!
 //! * Two or more merge bases: `read-tree`'s multi-base `--aggressive` merge is a
@@ -157,7 +169,31 @@ pub fn merge_resolve(args: &[String]) -> Result<ExitCode> {
     }
 
     // Past this point the script refreshes the index, reads three or more trees
-    // into it, and updates the worktree.
+    // into it, and updates the worktree:
+    //
+    //     git read-tree -u -m --aggressive $bases $head $remotes || exit 2
+    //
+    // The operand lists are interpolated *unquoted*, so anything in them that
+    // looks like an option is one — and read-tree's `parse_options` sees it
+    // before it looks at a single tree. That is what happens to `-X<opt>`: the
+    // sequencer's `try_merge_command` turns it into `--<opt>` and puts it in
+    // front of the merge base, so `cherry-pick --strategy=resolve -Xtheirs`
+    // arrives here as a `--theirs` merge base and read-tree rejects it as an
+    // unknown option. Run read-tree's own scan so the refusal is that one — the
+    // `error: unknown option` line plus read-tree's usage block, mapped by
+    // `|| exit 2` to status 2 — rather than one of the port's floors below.
+    let mut read_tree_argv: Vec<String> =
+        ["-u", "-m", "--aggressive"].iter().map(|s| s.to_string()).collect();
+    read_tree_argv.extend(parsed.bases.iter().cloned());
+    read_tree_argv.extend(parsed.head.iter().cloned());
+    read_tree_argv.extend(parsed.remotes.iter().cloned());
+    match super::read_tree::parse_args(&read_tree_argv)? {
+        // `--prefix <base>` swallows the base as its value and then collides with
+        // the `-m` the script always passes, so the mode conflict is reachable
+        // from an operand too; run read-tree's pre-repository check as well.
+        Ok(o) if super::read_tree::check_options(&o)?.is_ok() => {}
+        _ => return Ok(ExitCode::from(2)),
+    }
 
     // Multiple merge bases route through read-tree's multi-base --aggressive
     // merge — a stage-collapsing unpack_trees state machine with no gitoxide

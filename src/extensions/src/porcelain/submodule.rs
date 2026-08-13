@@ -963,25 +963,42 @@ fn first_parent_chain(repo: &gix::Repository, tip: &ObjectId) -> Vec<ObjectId> {
 // --------------------------------------------------------------- foreach ----
 
 fn foreach(args: &[String], mut quiet: bool) -> Result<ExitCode> {
+    // `git-submodule.sh`'s `cmd_foreach` loop, verbatim: `-q|--quiet` and
+    // `--recursive` are consumed, `*` breaks out, and everything else matching
+    // `-*` is a usage error — there is deliberately **no** `--` arm, so
+    // `git submodule foreach -- cmd` is rejected even though the helper the
+    // wrapper then invokes is handed an explicit `--`.
     let mut recursive = false;
     let mut i = 0;
     while let Some(a) = args.get(i) {
         match a.as_str() {
             "-q" | "--quiet" => quiet = true,
             "--recursive" => recursive = true,
-            "--" => {
-                i += 1;
-                break;
-            }
             s if s.starts_with('-') && s.len() > 1 => return usage_exit(),
             _ => break,
         }
         i += 1;
     }
 
+    foreach_parsed(&args[i..], quiet, recursive, None)
+}
+
+/// `module_foreach`'s body once `parse_options` has returned.
+///
+/// Split out so `submodule--helper foreach` can reach it with *its* parse: the
+/// helper's `parse_options` runs with flags `0`, which permutes options out from
+/// among the operands, while `git-submodule.sh`'s `cmd_foreach` loop stops at the
+/// first non-option and hands the rest over behind a `--`. The two therefore
+/// disagree on `foreach <command> -q`, and each has to do its own scanning.
+pub(super) fn foreach_parsed(
+    cmd: &[String],
+    quiet: bool,
+    recursive: bool,
+    super_prefix: Option<&str>,
+) -> Result<ExitCode> {
     let repo = gix::discover(".")?;
     let prefix = repo_prefix(&repo)?;
-    let code = foreach_repo(&repo, &args[i..], quiet, recursive, None, prefix.as_ref())?;
+    let code = foreach_repo(&repo, cmd, quiet, recursive, super_prefix, prefix.as_ref())?;
     Ok(ExitCode::from(code))
 }
 
@@ -1034,8 +1051,8 @@ fn foreach_repo(
         // An empty command list is not an error: git enters every submodule and
         // runs nothing.
         if !cmd.is_empty() {
-            let status = run_in_submodule(cmd, &sm_dir, &toplevel, sub.name(), entry, &display)?;
-            if !status.success() {
+            let ok = run_in_submodule(cmd, &sm_dir, &toplevel, sub.name(), entry, &display)?;
+            if !ok {
                 eprintln!("fatal: run_command returned non-zero status for {display}\n.");
                 return Ok(128);
             }
@@ -1060,6 +1077,14 @@ fn foreach_repo(
 /// five exported variables and the `path=<sq-quoted>; ` prologue, "for
 /// maintaining a faithful translation from shell script". Several arguments are
 /// handed to `run_command` as a plain argv with `use_shell = 1`.
+///
+/// Returns whether the child both started *and* exited zero. A child that never
+/// starts — the many-argument form is exec'd directly, so a command that is not
+/// on `PATH` fails right here — is `start_command`'s `error_errno("cannot run
+/// %s", …)` on stderr and a non-zero `run_command`, which the caller then turns
+/// into the same `fatal: run_command returned non-zero status` it uses for a
+/// child that ran and failed. Bubbling the spawn error up instead reported it as
+/// an internal failure with status 1.
 fn run_in_submodule(
     cmd: &[String],
     sm_dir: &std::path::Path,
@@ -1067,15 +1092,16 @@ fn run_in_submodule(
     name: &BStr,
     entry: &Entry,
     display: &str,
-) -> Result<std::process::ExitStatus> {
+) -> Result<bool> {
     let mut proc = if cmd.len() == 1 {
         // `strvec_pushf(&cp.args, "path=%s; %s", sq_quote(path), argv[0])`. The
         // assignment always carries a `;` and a space, so `prepare_shell_cmd`'s
-        // metacharacter test always fires and the script always runs under `sh`.
-        let mut proc = std::process::Command::new("sh");
-        proc.arg("-c")
-            .arg(format!("path={}; {}", sq_quote(entry.path.as_bstr()), cmd[0]))
-            .env("name", name.to_str_lossy().as_ref())
+        // metacharacter test always fires and the script always runs under the
+        // shell; being a one-element argv it takes the no-`"$@"` branch.
+        let script = format!("path={}; {}", sq_quote(entry.path.as_bstr()), cmd[0]);
+        let mut proc =
+            crate::external::prepare_shell_cmd_str(&script, crate::external::NO_ARGS);
+        proc.env("name", name.to_str_lossy().as_ref())
             .env("sm_path", entry.path.to_str_lossy().as_ref())
             .env("displaypath", display)
             .env("sha1", entry.oid.to_hex().to_string())
@@ -1090,34 +1116,46 @@ fn run_in_submodule(
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_INDEX_FILE")
         .env_remove("GIT_PREFIX");
-    Ok(proc.status()?)
+    match proc.status() {
+        Ok(status) => Ok(status.success()),
+        Err(err) => {
+            // `error_errno("cannot run %s", cmd->args.v[0])` names the program
+            // git actually tried to exec: the first word as written when the
+            // argv is run directly, the shell itself when `prepare_shell_cmd`
+            // wrapped it. `Command::get_program` is that same value.
+            eprintln!(
+                "error: cannot run {}: {}",
+                proc.get_program().to_string_lossy(),
+                strerror(&err)
+            );
+            Ok(false)
+        }
+    }
 }
 
-/// git's `prepare_shell_cmd` (run-command.c) for a `use_shell = 1` child: a
-/// first word free of shell metacharacters is executed directly, otherwise the
-/// argv becomes `sh -c '<argv0> "$@"' <argv...>` (or just `sh -c '<argv0>'` when
-/// there is nothing to substitute).
+/// `strerror(errno)` for an OS error, which is what git's `error_errno()`
+/// appends after its `: `.
+///
+/// Rust renders an OS error as `<strerror> (os error <n>)`, the leading part
+/// coming from the platform's own `strerror_r`; dropping the parenthesised tail
+/// leaves exactly the string git prints. An error carrying no errno (there is no
+/// such case on the spawn path) is passed through whole.
+fn strerror(err: &std::io::Error) -> String {
+    let text = err.to_string();
+    match err.raw_os_error() {
+        Some(code) => text
+            .strip_suffix(&format!(" (os error {code})"))
+            .unwrap_or(&text)
+            .to_string(),
+        None => text,
+    }
+}
+
+/// The many-argument `foreach` form: git hands the argv straight to
+/// `run_command` with `use_shell = 1`, so the shared `prepare_shell_cmd` decides
+/// the shape.
 fn shell_command(argv: &[String]) -> std::process::Command {
-    const METACHARS: &[char] = &[
-        '|', '&', ';', '<', '>', '(', ')', '$', '`', '\\', '"', '\'', ' ', '\t', '\n', '*', '?',
-        '[', '#', '~', '=', '%',
-    ];
-    if !argv[0].contains(METACHARS) {
-        let mut proc = std::process::Command::new(&argv[0]);
-        proc.args(&argv[1..]);
-        return proc;
-    }
-    let mut proc = std::process::Command::new("sh");
-    proc.arg("-c");
-    if argv.len() == 1 {
-        proc.arg(&argv[0]);
-    } else {
-        proc.arg(format!("{} \"$@\"", argv[0]));
-        // git pushes the whole argv after the script, so `$0` is the command
-        // word itself and `"$@"` starts at the first real argument.
-        proc.args(argv);
-    }
-    proc
+    crate::external::prepare_shell_cmd_str(&argv[0], &argv[1..])
 }
 
 /// git's `sq_quote_buf` (quote.c): always single-quote, escaping `'` and `!` by
@@ -4017,6 +4055,23 @@ mod tests {
         assert!(SET_BRANCH_USAGE.ends_with("set the default tracking branch\n\n"));
     }
 
+    /// `error_errno()` prints `strerror(errno)` after its `: `, with no errno
+    /// number. Rust renders the same error as `<strerror> (os error <n>)`, so the
+    /// helper has to drop that tail — this is what makes a `foreach` command that
+    /// is not on `PATH` report git's
+    /// `error: cannot run <cmd>: No such file or directory` rather than an
+    /// internal `(os error 2)` failure.
+    #[test]
+    fn strerror_drops_the_rust_errno_suffix() {
+        let enoent = std::io::Error::from_raw_os_error(2);
+        assert!(enoent.to_string().ends_with(" (os error 2)"));
+        assert_eq!(strerror(&enoent), "No such file or directory");
+
+        // An error with no errno behind it is passed through untouched.
+        let synthetic = std::io::Error::other("boom");
+        assert_eq!(strerror(&synthetic), "boom");
+    }
+
     /// Every `usage_with_options` block reached from this module, pinned to the
     /// bytes git 2.55.0 writes. The shape is load-bearing: `parse_options` ends
     /// each block with a blank line, and a block with a hidden-only option table
@@ -4078,9 +4133,15 @@ mod tests {
         // No metacharacter in argv[0]: direct exec, even with several arguments.
         assert_eq!(program(&["true"]), "true");
         assert_eq!(program(&["git", "status", "--porcelain"]), "git");
-        // Each of these argv[0]s carries a metacharacter from git's list.
+        // Each of these argv[0]s carries a metacharacter from git's list, and the
+        // shell they reach is git's compile-time `SHELL_PATH`, never a `sh`
+        // picked up from PATH.
         for word in ["echo hi", "a|b", "a$b", "a*b", "a=b", "a~b", "a#b", "a[b"] {
-            assert_eq!(program(&[word]), "sh", "{word} should go through sh");
+            assert_eq!(
+                program(&[word]),
+                crate::external::SHELL_PATH,
+                "{word} should go through the shell"
+            );
         }
     }
 

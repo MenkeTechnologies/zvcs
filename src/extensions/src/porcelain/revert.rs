@@ -49,9 +49,17 @@
 //!     an index that differs from `HEAD`, merge without `-m`, missing parent,
 //!     and affected files that are locally modified or would clobber untracked
 //!     files — same text, same exit codes (128/129)
-//!   * `--quit` (drops `.git/sequencer`); the single-pick `--abort`/`--skip`,
-//!     which reduce to `git reset --merge HEAD` through the ported `reset`; and
-//!     the "nothing in progress" refusals of `--abort`/`--skip`/`--continue`
+//!   * the whole sequencer, on disk and in the verbs. Two or more operands — or
+//!     any range/`^`-exclusion, which git walks — take
+//!     `sequencer_pick_revisions`' non-`single_pick` path, so
+//!     [`crate::sequencer`] writes `head`, `opts` and `abort-safety` up front
+//!     and rewrites `todo` before every instruction. `--continue` commits the
+//!     stopped revert and replays the rest; `--abort` rewinds to
+//!     `sequencer/head` when `abort-safety` still matches `HEAD` and warns
+//!     `You seem to have moved HEAD.` when it does not; `--skip` resets the
+//!     stopped revert away and resumes; `--quit` drops the state. With no
+//!     sequence live each falls back to its single-pick form, which is where the
+//!     "nothing in progress" refusals come from
 //!   * a no-op single pick against a dirty worktree, which git finishes by
 //!     running `git commit` — nothing to commit, so it prints the working-tree
 //!     status (byte-identical to `git status`) and exits 1; served by delegating
@@ -63,20 +71,16 @@
 //!     revert exactly as git's sequencer does: the merge result — `<<<<<<<` /
 //!     `>>>>>>>` markers included — is checked out, the conflicting paths get
 //!     stage 1/2/3 index entries, an `Auto-merging`/`CONFLICT (...)` line goes to
-//!     stdout, `REVERT_HEAD`, `AUTO_MERGE` and a `MERGE_MSG` carrying the
-//!     `# Conflicts:` hint are written, and the exit status is 1
+//!     stdout, `REVERT_HEAD` and a `MERGE_MSG` carrying the `# Conflicts:` hint
+//!     are written, and the exit status is 1
+//!   * `AUTO_MERGE`: `merge_switch_to_result()` records the merged tree for
+//!     every result merge-ort checks out, so it is written for a *successful*
+//!     revert too and survives the commit — `git rev-parse AUTO_MERGE` resolves
+//!     after `git revert HEAD`. A revert always takes the in-process merge
+//!     (`do_pick_commit` routes `TODO_REVERT` there whatever `--strategy` says),
+//!     so there is no strategy-child exception as there is for `cherry-pick`.
 //!
 //! What this port does NOT do, and refuses rather than approximates:
-//!   * `--continue`: git finishes a stopped pick by re-running `git commit`,
-//!     which recreates the revert commit from `MERGE_MSG`/`REVERT_HEAD`; this
-//!     port's commit path consumes neither, so `--continue` is not ported and
-//!     bails rather than committing a wrong message.
-//!   * resuming a *multi-commit* sequence: `--abort`/`--skip` on a walking pick
-//!     roll back to, or replay from, the `.git/sequencer` todo git persists when
-//!     such a pick stops. This port never writes that todo — a stopped pick
-//!     leaves the object set, index, refs and worktree identical to git's, but no
-//!     resumable sequencer state — so `--abort`/`--skip` are served only for the
-//!     single-pick fast path and bail once a real `.git/sequencer/head` exists.
 //!   * `-S`/`--gpg-sign` — bails, since nothing here can produce a signature.
 //!   * **spawning an editor.** `-e`/`--edit` is accepted and only changes which
 //!     `--cleanup=default` mode applies; the generated message is then taken as
@@ -171,6 +175,18 @@ impl Cleanup {
             _ => return None,
         })
     }
+
+    /// git's `describe_cleanup_mode()`, the spelling `save_opts` records.
+    /// `builtin/revert.c` resolves the mode with `get_cleanup_mode(arg, 1)`, so
+    /// `default` names `strip`.
+    fn name(self) -> &'static str {
+        match self {
+            Cleanup::Verbatim => "verbatim",
+            Cleanup::Whitespace => "whitespace",
+            Cleanup::Strip | Cleanup::Default => "strip",
+            Cleanup::Scissors => "scissors",
+        }
+    }
 }
 
 /// Everything the option parser collects, in git's own shape.
@@ -179,6 +195,10 @@ struct Options {
     no_commit: bool,
     signoff: bool,
     edit: bool,
+    /// `opts->edit` as git's tri-state (`-1` when never given), kept alongside
+    /// [`Options::edit`] because `save_opts` writes the key for either explicit
+    /// spelling and omits it otherwise.
+    edit_given: Option<bool>,
     reference: bool,
     /// 0 means "not given"; git stores it the same way.
     mainline: usize,
@@ -225,8 +245,14 @@ pub fn revert(args: &[String]) -> Result<ExitCode> {
             "--commit" => o.no_commit = false,
             "-s" | "--signoff" => o.signoff = true,
             "--no-signoff" => o.signoff = false,
-            "-e" | "--edit" => o.edit = true,
-            "--no-edit" => o.edit = false,
+            "-e" | "--edit" => {
+                o.edit = true;
+                o.edit_given = Some(true);
+            }
+            "--no-edit" => {
+                o.edit = false;
+                o.edit_given = Some(false);
+            }
             "--reference" => {
                 o.reference = true;
                 reference_explicit = true;
@@ -397,13 +423,98 @@ pub fn revert(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::from(128));
     }
 
+    let todo = build_todo(&repo, &commits)?;
+    if sequencer {
+        // `create_seq_dir()` / `save_head()` / `save_opts()` /
+        // `update_abort_safety_file()`, in `sequencer_pick_revisions()`'s order.
+        let git_dir = repo.git_dir();
+        if crate::sequencer::create(git_dir)?.is_err() {
+            eprintln!("fatal: revert failed");
+            return Ok(ExitCode::from(128));
+        }
+        let head = repo.head_id()?.detach();
+        crate::sequencer::save_head(git_dir, head)?;
+        crate::sequencer::save_opts(git_dir, &saved_opts(&o, cleanup))?;
+        crate::sequencer::update_abort_safety_file(&repo)?;
+    }
     // With `-n` nothing is committed between steps; each further revert stacks
     // because it re-reads the index the previous one left behind.
-    for id in commits {
-        match revert_one(&repo, id, &o, cleanup, sequencer)? {
+    run_todo(&repo, &o, cleanup, &todo, 0, sequencer)
+}
+
+/// `walk_revs_populate_todo`: one `revert <abbrev> <subject>` instruction per
+/// commit, in replay order.
+fn build_todo(
+    repo: &gix::Repository,
+    commits: &[ObjectId],
+) -> Result<Vec<crate::sequencer::TodoItem>> {
+    commits
+        .iter()
+        .map(|id| {
+            let commit = repo.find_commit(*id)?;
+            let subject = gix::objs::commit::MessageRef::from_bytes(commit.message_raw()?)
+                .summary()
+                .to_str_lossy()
+                .into_owned();
+            Ok(crate::sequencer::TodoItem {
+                action: crate::sequencer::Action::Revert,
+                oid: *id,
+                abbrev: id.attach(repo).shorten_or_id().to_string(),
+                subject,
+            })
+        })
+        .collect()
+}
+
+/// `save_opts`'s view of the command line. A revert reaches far fewer of the
+/// keys than a cherry-pick does — `--reference` is `opts->commit_use_reference`,
+/// which `save_opts` does not persist at all, so it is lost across a
+/// `--continue` in stock too.
+fn saved_opts<'a>(o: &Options, cleanup: Option<Cleanup>) -> crate::sequencer::SavedOpts<'a> {
+    crate::sequencer::SavedOpts {
+        no_commit: o.no_commit,
+        edit: o.edit_given,
+        signoff: o.signoff,
+        mainline: o.mainline as u32,
+        allow_rerere_auto: o.rerere,
+        default_msg_cleanup: cleanup.map(Cleanup::name),
+        ..Default::default()
+    }
+}
+
+/// `pick_commits()`: replay `todo[start..]`, keeping the on-disk sequencer state
+/// in step when one is live.
+///
+/// `save_todo()` runs at the top of each instruction and keeps it in the file, so
+/// a stop leaves the todo beginning with the revert that stopped;
+/// `update_abort_safety_file()` runs at the bottom (git's `leave:` label) whether
+/// the revert landed or not.
+fn run_todo(
+    repo: &gix::Repository,
+    o: &Options,
+    cleanup: Option<Cleanup>,
+    todo: &[crate::sequencer::TodoItem],
+    start: usize,
+    sequencer: bool,
+) -> Result<ExitCode> {
+    let git_dir = repo.git_dir().to_owned();
+    for (i, item) in todo.iter().enumerate().skip(start) {
+        if sequencer {
+            crate::sequencer::save_todo(&git_dir, todo, i)?;
+        }
+        let step = revert_one(repo, item.oid, o, cleanup, sequencer);
+        if sequencer {
+            crate::sequencer::update_abort_safety_file(repo)?;
+        }
+        match step? {
             Step::Failed(code) => return Ok(code),
             Step::Done => {}
         }
+    }
+    // "Sequence of picks finished successfully; cleanup by removing the
+    // .git/sequencer directory."
+    if sequencer {
+        crate::sequencer::remove_state(&git_dir);
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -429,74 +540,239 @@ fn set_mode(o: &mut Options, new: Cmd) -> Option<ExitCode> {
 
 /// Run a `--quit`/`--continue`/`--abort`/`--skip` command mode.
 ///
-/// `--quit` drops the sequencer directory. `--abort`/`--skip` are served for the
-/// single-pick fast path — git's `rollback_single_pick`/`skip_single_pick` reduce
-/// to `git reset --merge HEAD`, delegated to the ported `reset` — and refuse a
-/// real multi-commit sequence (`.git/sequencer/head`), whose rollback/replay needs
-/// the todo this port never persists. `--continue` refuses: git finishes a stopped
-/// pick by re-running `git commit` off `MERGE_MSG`/`REVERT_HEAD`, which this port's
-/// commit path does not consume.
+/// These are the same `sequencer.c` entry points `git cherry-pick` reaches, only
+/// with `revert` in the diagnostics: `sequencer_remove_state()` for `--quit`,
+/// `sequencer_continue()`, `sequencer_rollback()` and `sequencer_skip()` for the
+/// rest. Each one falls back to its single-pick form (`continue_single_pick()`,
+/// `rollback_single_pick()`, `skip_single_pick()`) when no `.git/sequencer` is
+/// live, which is also where the "nothing in progress" refusals come from.
 fn run_mode(repo: &gix::Repository, mode: Cmd) -> Result<ExitCode> {
-    let git_dir = repo.git_dir();
-    let sequencer = git_dir.join("sequencer");
-    // `git_path_head_file()`: a live `.git/sequencer/head` marks a walking,
-    // multi-commit sequence — the single-pick fast path never writes one.
-    let seq_head = sequencer.join("head").exists();
-    let revert_head = git_dir.join("REVERT_HEAD").exists();
-    let cherry_pick_head = git_dir.join("CHERRY_PICK_HEAD").exists();
-
+    let git_dir = repo.git_dir().to_owned();
     match mode {
+        // `cmd == 'q'`: `sequencer_remove_state()` then `remove_branch_state()`.
         Cmd::Quit => {
-            let _ = std::fs::remove_dir_all(&sequencer);
+            crate::sequencer::remove_state(&git_dir);
+            let _ = std::fs::remove_file(git_dir.join("REVERT_HEAD"));
+            let _ = std::fs::remove_file(git_dir.join("MERGE_MSG"));
+            let _ = std::fs::remove_file(git_dir.join("AUTO_MERGE"));
             Ok(ExitCode::SUCCESS)
         }
-        Cmd::Abort => {
-            // `sequencer_rollback`: with a live `.git/sequencer/head` it rewinds to
-            // the stored pre-sequence HEAD and clears the sequencer state. This port
-            // never persists that todo, so a real sequence cannot be rolled back.
-            if seq_head {
-                bail!("--abort of a multi-commit revert sequence is not ported (rewinding to the stored pre-sequence HEAD needs the `.git/sequencer` state this port omits)");
-            }
-            // `rollback_single_pick`: refuse unless a single pick is in progress.
-            if !revert_head && !cherry_pick_head {
-                eprintln!("error: no cherry-pick or revert in progress");
-                eprintln!("fatal: revert failed");
-                return Ok(ExitCode::from(128));
-            }
-            // `reset_merge(&head_oid)` == `git reset --merge HEAD`: the two-tree
-            // reset discards the staged single pick and restores its worktree paths
-            // while keeping unrelated local changes, and drops REVERT_HEAD/MERGE_MSG/
-            // AUTO_MERGE. git's reset_merge prints nothing (it is not a hard reset),
-            // so run the ported reset quiet to match its byte-empty output.
-            super::reset::reset(&["--merge".to_string(), "--quiet".to_string()])
+        Cmd::Abort => sequencer_rollback(repo, &git_dir),
+        Cmd::Skip => sequencer_skip(repo, &git_dir),
+        Cmd::Continue => sequencer_continue(repo, &git_dir),
+    }
+}
+
+/// `reset_merge()` (sequencer.c): `git reset --merge [<commit>]`. The two-tree
+/// reset discards the staged pick and restores the paths it touched while
+/// keeping unrelated local changes, and drops `REVERT_HEAD` / `MERGE_MSG` /
+/// `AUTO_MERGE`. It prints nothing (it is not a hard reset), which `--quiet`
+/// keeps true of the ported reset too.
+fn reset_merge(to: ObjectId) -> Result<ExitCode> {
+    super::reset::reset(&[
+        "--merge".to_string(),
+        "--quiet".to_string(),
+        to.to_string(),
+    ])
+}
+
+/// `sequencer_rollback()`: rewind to the pre-sequence `HEAD`, or undo the single
+/// stopped pick when there is no sequence.
+fn sequencer_rollback(repo: &gix::Repository, git_dir: &std::path::Path) -> Result<ExitCode> {
+    let head_file = crate::sequencer::head_path(git_dir);
+    let Ok(text) = std::fs::read_to_string(&head_file) else {
+        // `rollback_single_pick()`.
+        if !git_dir.join("REVERT_HEAD").exists() && !git_dir.join("CHERRY_PICK_HEAD").exists() {
+            eprintln!("error: no cherry-pick or revert in progress");
+            eprintln!("fatal: revert failed");
+            return Ok(ExitCode::from(128));
         }
-        Cmd::Skip => {
-            // `sequencer_skip` for a revert refuses unless REVERT_HEAD is present.
-            if !revert_head {
-                eprintln!("error: no revert in progress");
-                eprintln!("fatal: revert failed");
-                return Ok(ExitCode::from(128));
-            }
-            // `skip_single_pick` is the same `git reset --merge HEAD`; only when a
-            // `.git/sequencer` todo follows does git replay the rest of the sequence.
-            if seq_head {
-                bail!("--skip of a multi-commit revert sequence is not ported (replaying the remaining `.git/sequencer` todo is not implemented)");
-            }
-            super::reset::reset(&["--merge".to_string(), "--quiet".to_string()])
+        return reset_merge(repo.head_id()?.detach());
+    };
+    let Some(oid) = text
+        .lines()
+        .next()
+        .and_then(|line| ObjectId::from_hex(line.trim().as_bytes()).ok())
+    else {
+        eprintln!(
+            "error: stored pre-cherry-pick HEAD file '{}' is corrupt",
+            head_file.display()
+        );
+        eprintln!("fatal: revert failed");
+        return Ok(ExitCode::from(128));
+    };
+    if crate::sequencer::rollback_is_safe(repo) {
+        reset_merge(oid)?;
+    } else {
+        // A hand-made commit moved HEAD past the sequence; git declines the
+        // rewind rather than discarding it, and still succeeds.
+        eprintln!("warning: You seem to have moved HEAD. Not rewinding, check your HEAD!");
+    }
+    crate::sequencer::remove_state(git_dir);
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `sequencer_skip()`: drop the stopped revert, then resume the sequence if one
+/// is live.
+fn sequencer_skip(repo: &gix::Repository, git_dir: &std::path::Path) -> Result<ExitCode> {
+    if !git_dir.join("REVERT_HEAD").exists() {
+        if crate::sequencer::get_last_command(git_dir) != Some(crate::sequencer::Action::Revert) {
+            eprintln!("error: no revert in progress");
+            eprintln!("fatal: revert failed");
+            return Ok(ExitCode::from(128));
         }
-        Cmd::Continue => {
-            // `continue_single_pick` re-runs `git commit --no-edit --cleanup=strip`,
-            // which recreates the revert commit from `MERGE_MSG`/`REVERT_HEAD`. This
-            // port's `commit` consumes neither, so it cannot finalize a stopped pick;
-            // committing anyway would produce a wrong message, so refuse instead.
-            if !seq_head && !revert_head && !cherry_pick_head {
-                eprintln!("error: no cherry-pick or revert in progress");
-                eprintln!("fatal: revert failed");
-                return Ok(ExitCode::from(128));
-            }
-            bail!("--continue is not ported (finalizing a stopped pick needs `git commit`'s MERGE_MSG/REVERT_HEAD recovery, which this port's commit path does not implement)")
+        if !crate::sequencer::rollback_is_safe(repo) {
+            eprintln!("error: there is nothing to skip");
+            crate::advice::Advice::ResolveConflict
+                .advise_plain("have you committed already?\ntry \"git revert --continue\"");
+            eprintln!("fatal: revert failed");
+            return Ok(ExitCode::from(128));
         }
     }
+    // `skip_single_pick()` is `reset_merge(HEAD)`.
+    reset_merge(repo.head_id()?.detach())?;
+    if !crate::sequencer::dir(git_dir).is_dir() {
+        return Ok(ExitCode::SUCCESS);
+    }
+    sequencer_continue(repo, git_dir)
+}
+
+/// `sequencer_continue()`: commit the revert that stopped, then replay whatever
+/// the todo list still holds.
+fn sequencer_continue(repo: &gix::Repository, git_dir: &std::path::Path) -> Result<ExitCode> {
+    if !crate::sequencer::todo_path(git_dir).exists() {
+        return Ok(match continue_single_pick(repo, git_dir)? {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(code) => code,
+        });
+    }
+
+    let todo = crate::sequencer::read_todo(repo, git_dir)?;
+    if git_dir.join("REVERT_HEAD").exists() || git_dir.join("CHERRY_PICK_HEAD").exists() {
+        if let Err(code) = continue_single_pick(repo, git_dir)? {
+            return Ok(code);
+        }
+    }
+
+    // `index_differs_from(r, "HEAD", NULL, 0)` → `error_dirty_index()`.
+    let index = repo.open_index()?;
+    let head_tree = repo.head_commit()?.tree_id()?.detach();
+    if index_tree(repo, &index)? != head_tree {
+        eprintln!("error: your local changes would be overwritten by revert.");
+        crate::advice::Advice::CommitBeforeMerge
+            .advise_plain("commit your changes or stash them to proceed.");
+        eprintln!("fatal: revert failed");
+        return Ok(ExitCode::from(128));
+    }
+
+    // `read_populate_opts()`: the command line the sequence recorded.
+    let loaded = crate::sequencer::read_opts(git_dir);
+    let o = Options {
+        no_commit: loaded.no_commit,
+        signoff: loaded.signoff,
+        edit: loaded.edit == Some(true),
+        edit_given: loaded.edit,
+        reference: false,
+        mainline: loaded.mainline as usize,
+        cleanup: loaded.default_msg_cleanup.clone(),
+        xopts: loaded.xopts.len(),
+        rerere: loaded.allow_rerere_auto,
+        mode: None,
+    };
+    let cleanup = o.cleanup.as_deref().and_then(Cleanup::parse);
+    // git's `todo_list.current++`: the instruction that stopped is finished.
+    run_todo(repo, &o, cleanup, &todo, 1, true)
+}
+
+/// `continue_single_pick()`: finish the revert that stopped.
+///
+/// git spawns `git commit --no-edit --cleanup=strip`, which recovers the message
+/// from `MERGE_MSG` and the "which commit" from `REVERT_HEAD`. The revert commit
+/// takes the *current* user as author (unlike a cherry-pick, which preserves the
+/// original), so nothing but the message has to be recovered.
+///
+/// `Err(code)` is a refusal git already reported.
+fn continue_single_pick(
+    repo: &gix::Repository,
+    git_dir: &std::path::Path,
+) -> Result<std::result::Result<(), ExitCode>> {
+    if !git_dir.join("REVERT_HEAD").exists() && !git_dir.join("CHERRY_PICK_HEAD").exists() {
+        eprintln!("error: no cherry-pick or revert in progress");
+        eprintln!("fatal: revert failed");
+        return Ok(Err(ExitCode::from(128)));
+    }
+
+    let index = repo.open_index()?;
+    if index.entries().iter().any(|e| e.stage_raw() != 0) {
+        return Ok(Err(super::commit::die_resolve_conflict(&index)));
+    }
+    let tree_id = index_tree(repo, &index)?;
+    let head_id = repo.head_id()?.detach();
+
+    // `--cleanup=strip` is what git passes, so the `# Conflicts:` block the stop
+    // appended is dropped along with every other comment line.
+    let raw = std::fs::read_to_string(git_dir.join("MERGE_MSG")).unwrap_or_default();
+    let message = stripspace(&raw, true);
+
+    let author = repo
+        .author()
+        .ok_or_else(|| anyhow::anyhow!("no author identity configured"))??;
+    let author_time = author.time()?;
+    let committer = repo
+        .committer()
+        .ok_or_else(|| anyhow::anyhow!("no committer identity configured"))??;
+    let commit = gix::objs::Commit {
+        message: message.clone().into(),
+        tree: tree_id,
+        author: author.into(),
+        committer: committer.into(),
+        encoding: None,
+        parents: std::iter::once(head_id).collect(),
+        extra_headers: Default::default(),
+    };
+    let new_id = repo.write_object(&commit)?.detach();
+    let subject = message.lines().next().unwrap_or("").to_string();
+    repo.edit_reference(RefEdit {
+        change: Change::Update {
+            log: LogChange {
+                mode: RefLog::AndReference,
+                force_create_reflog: false,
+                message: format!("revert: {subject}").into(),
+            },
+            expected: PreviousValue::MustExistAndMatch(Target::Object(head_id)),
+            new: Target::Object(new_id),
+        },
+        name: "HEAD"
+            .try_into()
+            .map_err(|e| anyhow::anyhow!("invalid ref name HEAD: {e}"))?,
+        deref: true,
+    })?;
+
+    let _ = std::fs::remove_file(git_dir.join("MERGE_MSG"));
+    crate::sequencer::post_commit_cleanup(repo)?;
+
+    let head_tree = repo.find_commit(head_id)?.tree_id()?.detach();
+    print_summary(repo, new_id, &subject, &author_time, head_tree, tree_id, false)?;
+    Ok(Ok(()))
+}
+
+/// A tree object built from the stage-0 entries of `index` — git's
+/// `write_index_as_tree()` for an index the caller has already proved resolved.
+fn index_tree(repo: &gix::Repository, index: &gix::index::File) -> Result<ObjectId> {
+    let mut flat: Flat = BTreeMap::new();
+    let backing = index.path_backing();
+    for entry in index.entries() {
+        if entry.stage_raw() != 0 {
+            continue;
+        }
+        let kind = entry
+            .mode
+            .to_tree_entry_mode()
+            .ok_or_else(|| anyhow::anyhow!("index entry has an unrepresentable mode"))?
+            .kind();
+        flat.insert(entry.path_in(backing).to_owned(), (entry.id, kind));
+    }
+    write_tree(repo, &flat)
 }
 
 /// Turn the operand list into the commits to revert, newest first.
@@ -576,7 +852,13 @@ fn resolve_specs(repo: &gix::Repository, specs: &[String]) -> Result<Selection> 
 
     if include.is_empty() || !walked {
         // No walk: git's single-pick fast path only when exactly one operand.
+        // That test is on `opts->revs->cmdline.nr`, the operand count, so it is
+        // read before the de-duplication below.
         let sequencer = include.len() > 1;
+        // `add_pending_object()` sets `SEEN`, so a commit named twice is walked
+        // once: `git revert A A` writes a one-line todo and reverts `A` once.
+        let mut seen = HashSet::new();
+        include.retain(|id| seen.insert(*id));
         return Ok(Selection::List { commits: include, sequencer });
     }
     let mut out = Vec::new();
@@ -740,6 +1022,16 @@ fn revert_one(
     // The tree — conflict markers and all — is written before anything is checked
     // out, so the object exists even when a checkout below is refused.
     let merged_tree = merge.tree.write()?.detach();
+    // `merge_switch_to_result()` (merge-ort.c) records every result it checks
+    // out as `AUTO_MERGE`, clean or conflicted and whether or not a commit
+    // follows — which is why stock leaves `.git/AUTO_MERGE` behind after a
+    // *successful* `git revert`. A revert always takes the in-process merge
+    // (`do_pick_commit` routes `TODO_REVERT` there regardless of `--strategy`),
+    // so there is no strategy-child exception here.
+    std::fs::write(
+        repo.git_dir().join("AUTO_MERGE"),
+        format!("{merged_tree}\n"),
+    )?;
     let merged = flatten(repo, merged_tree)?;
     let ours = flatten(repo, ours_tree)?;
 
@@ -851,14 +1143,21 @@ fn revert_one(
         committer,
     )?;
     let subject = message.lines().next().unwrap_or("").to_string();
+    // `do_pick_commit` writes the message to `MERGE_MSG` for every built-in
+    // pick, before the merge even runs, and the commit that concludes the pick
+    // unlinks it again. So it is only *observable* when the pick does not
+    // commit: the conflict stop overwrites it with the `# Conflicts:` version
+    // below, `--no-commit` leaves it as-is, and a pick that stops because its
+    // result is empty leaves exactly this.
+    std::fs::write(repo.git_dir().join("MERGE_MSG"), &message)?;
 
     // --- apply to index + worktree ---------------------------------------
     let changed_set: HashSet<BString> = changed.iter().cloned().collect();
 
     // An unresolved merge stops the revert the way git's sequencer does: check out
     // the marker'd tree, give the conflicting paths stage 1/2/3 index entries, and
-    // record `REVERT_HEAD`/`AUTO_MERGE`/`MERGE_MSG` before exiting 1. Resuming from
-    // here (`--continue`) needs the `.git/sequencer` todo this port omits.
+    // record `REVERT_HEAD` and `MERGE_MSG` before exiting 1 (`AUTO_MERGE` was
+    // already written above, by the merge itself).
     if !conflicted.is_empty() {
         let mut new_index = apply(repo, &changed_set, merged_tree, &merged)?;
         merge.index_changed_after_applying_conflicts(
@@ -870,9 +1169,6 @@ fn revert_one(
 
         let git_dir = repo.git_dir();
         std::fs::write(git_dir.join("REVERT_HEAD"), format!("{target_id}\n"))?;
-        // git records the merge result — markers and all — as `AUTO_MERGE` so a
-        // later `--continue` could diff against it.
-        std::fs::write(git_dir.join("AUTO_MERGE"), format!("{merged_tree}\n"))?;
 
         // git's `append_conflicts_hint`: a blank line, `# Conflicts:`, then one
         // commented path per unresolved conflict, appended to the commit message.
@@ -906,7 +1202,6 @@ fn revert_one(
         let git_dir = repo.git_dir();
         std::fs::write(git_dir.join("REVERT_HEAD"), format!("{target_id}\n"))?;
         std::fs::write(git_dir.join("MERGE_MSG"), &message)?;
-        std::fs::write(git_dir.join("AUTO_MERGE"), format!("{merged_tree}\n"))?;
         return Ok(Step::Done);
     }
 
@@ -917,15 +1212,10 @@ fn revert_one(
             // git finishes a no-op pick by running `git commit`, which finds
             // nothing to commit and prints the working-tree status — byte-identical
             // to `git status` — before exiting 1. Reuse the ported status driver
-            // rather than re-rolling the changes/untracked sections. The single-pick
-            // fast path has no `.git/sequencer` todo on disk, so `git status` prints
-            // no in-progress block, which matches. A walked pick would need the
-            // "Revert currently in progress" block injected after the branch line,
-            // and this port persists no sequencer todo for the status driver to read
-            // — so it is left a floor rather than emitting status without that block.
-            if sequencer {
-                crate::git_fatal!("revert is a no-op with a dirty worktree mid-sequence: `git status`'s `Revert currently in progress` block needs the `.git/sequencer` todo this port omits");
-            }
+            // rather than re-rolling the changes/untracked sections; it reads the
+            // live `.git/sequencer/todo` itself, so the "Revert currently in
+            // progress" block appears for a walked pick and not for the
+            // single-pick fast path, exactly as `wt_status_get_state()` decides.
             super::status::status(&[])?;
             return Ok(Step::Failed(ExitCode::from(1)));
         }
@@ -982,12 +1272,15 @@ fn revert_one(
         deref: true,
     })?;
 
-    // A committed revert clears any leftover in-progress markers, as git does.
-    for f in ["REVERT_HEAD", "MERGE_MSG", "AUTO_MERGE"] {
+    // A committed revert clears the in-progress markers, as git does.
+    // `AUTO_MERGE` is *not* one of them: `sequencer_post_commit_cleanup()` only
+    // runs when a pick was stopped, and a revert that lands never was — so stock
+    // leaves the merge result behind for `git rev-parse AUTO_MERGE` to find.
+    for f in ["REVERT_HEAD", "MERGE_MSG"] {
         let _ = std::fs::remove_file(repo.git_dir().join(f));
     }
 
-    print_summary(repo, new_id, &subject, &author_time, ours_tree, merged_tree)?;
+    print_summary(repo, new_id, &subject, &author_time, ours_tree, merged_tree, true)?;
     Ok(Step::Done)
 }
 
@@ -1348,6 +1641,7 @@ fn print_summary(
     author_time: &gix::date::Time,
     old_tree: ObjectId,
     new_tree: ObjectId,
+    show_author_date: bool,
 ) -> Result<()> {
     let label = match repo.head_name()? {
         Some(name) => name.shorten().to_string(),
@@ -1355,10 +1649,16 @@ fn print_summary(
     };
     let short = new_id.attach(repo).shorten_or_id();
     println!("[{label} {short}] {subject}");
-    println!(
-        " Date: {}",
-        author_time.format_or_unix(gix::date::time::format::DEFAULT)
-    );
+    // `SUMMARY_SHOW_AUTHOR_DATE`: the sequencer always sets it, but the child
+    // `git commit` a `--continue` runs only does when `author_date_is_interesting()`
+    // — `author_message || force_date`. A revert reuses no author, so its
+    // `--continue` summary carries no ` Date:` line.
+    if show_author_date {
+        println!(
+            " Date: {}",
+            author_time.format_or_unix(gix::date::time::format::DEFAULT)
+        );
+    }
 
     let old = flatten(repo, old_tree)?;
     let new = flatten(repo, new_tree)?;

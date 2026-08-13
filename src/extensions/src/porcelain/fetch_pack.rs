@@ -668,10 +668,9 @@ fn build_shallow(
     shallow_since: Option<&str>,
     shallow_exclude: &[String],
 ) -> Result<Shallow> {
-    let parse_date = |s: &str| -> Result<gix::date::Time> {
-        gix::date::parse(s, Some(std::time::SystemTime::now()))
-            .map_err(|e| anyhow::anyhow!("invalid --shallow-since date {s:?}: {e}"))
-    };
+    // `fetch-pack.c:439` runs `--shallow-since` through `approxidate()`, which never fails.
+    let parse_date =
+        |s: &str| -> Result<gix::date::Time> { Ok(gix::date::Time::new(crate::date::approxidate(s), 0)) };
 
     if !shallow_exclude.is_empty() {
         let remote_refs = shallow_exclude

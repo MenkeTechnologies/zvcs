@@ -548,26 +548,12 @@ pub(crate) fn git_editor(repo: Option<&gix::Repository>) -> Option<String> {
     Some(editor.unwrap_or_else(|| "vi".to_string()))
 }
 
-/// `prepare_shell_cmd()` for a `use_shell` child: an editor string containing
-/// anything the shell would interpret runs as `sh -c '<editor> "$@"' <editor>
-/// <path>`; a bare program name is executed directly.
+/// `launch_specified_editor()`'s child: `strvec_pushl(&p.args, editor, path)`
+/// with `p.use_shell = 1`, so an editor string containing anything the shell
+/// would interpret runs as `<SHELL_PATH> -c '<editor> "$@"' <editor> <path>` and
+/// a bare program name is executed directly.
 pub(crate) fn editor_command(editor: &str, path: &Path) -> Command {
-    const META: &[char] = &[
-        '|', '&', ';', '<', '>', '(', ')', '$', '`', '\\', '"', '\'', ' ', '\t', '\n', '*', '?',
-        '[', '#', '~', '=', '%',
-    ];
-    if editor.contains(META) {
-        let mut cmd = Command::new("/bin/sh");
-        cmd.arg("-c")
-            .arg(format!("{editor} \"$@\""))
-            .arg(editor)
-            .arg(path);
-        cmd
-    } else {
-        let mut cmd = Command::new(editor);
-        cmd.arg(path);
-        cmd
-    }
+    crate::external::prepare_shell_cmd_str(editor, [path])
 }
 
 /// The `strerror()` text `die_errno()` appends, for the errno values this

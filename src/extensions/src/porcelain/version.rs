@@ -114,12 +114,15 @@ pub fn version(args: &[String]) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// The shell a `!`-prefixed alias is run through (`alias::run_shell_alias`).
+/// The shell this binary runs every shell child through — hooks, `!`-aliases,
+/// clean/smudge and textconv filters, the pager, editors, mergetool/difftool,
+/// `filter-branch`, `submodule foreach`, `rebase --exec`.
 ///
-/// git's `SHELL_PATH` is an absolute path chosen at compile time; this binary
-/// spawns `sh` and lets the OS resolve it on `PATH`, so `sh` — not `/bin/sh` —
-/// is what it actually runs.
-const SHELL_PATH: &str = "sh";
+/// Like git's `SHELL_PATH`, it is one absolute path fixed in the source rather
+/// than a name resolved on `PATH`, and [`crate::external::SHELL_PATH`] is the
+/// single definition every one of those call sites reaches for. Printing it here
+/// is therefore a true statement about what the binary will execute.
+const SHELL_PATH: &str = crate::external::SHELL_PATH;
 
 /// The SHA-1 implementation this build links: the `sha1-checked` crate, which
 /// `gix-hash` drives with the same collision-detection algorithm git uses.

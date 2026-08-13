@@ -71,6 +71,9 @@ impl FromStr for Time {
     }
 }
 
+mod approxidate;
+pub use approxidate::{approxidate, approxidate_careful, parse_date_basic, parse_expiry_date};
+
 pub(crate) mod function;
 mod git;
 mod raw;

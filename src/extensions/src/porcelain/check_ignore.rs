@@ -17,13 +17,19 @@
 //! errors (exit 128), the usage block with its unknown-option/unknown-switch and
 //! `-h` exits (129), and the 0/1 exit convention.
 //!
-//! Not covered — refused, never faked: pathspec magic (`:(glob)…`) and pathspecs
-//! containing wildcards, both of which git resolves through the full pathspec
-//! machinery against the index before it ever consults the exclude stack; and
-//! unique-prefix option abbreviation (`--verb`), whose ambiguity diagnostics
-//! depend on `parse-options`' internal candidate ordering.
+//! Wildcards in a pathspec (`*.log`) are matched the way git matches them here,
+//! which is only against the index: `check_ignore()` never expands a pathspec, it
+//! feeds `pathspec.items[i].match` — the literal text — to `last_matching_pattern()`
+//! and reports `items[i].original` back. The wildcard therefore decides one thing
+//! only, whether the pathspec is "seen" in the index and so exempt from the exclude
+//! lookup (see [`index_has`]).
+//!
+//! Not covered — refused, never faked: pathspec magic (`:(glob)…`), which git
+//! resolves through the full pathspec machinery; and unique-prefix option
+//! abbreviation (`--verb`), whose ambiguity diagnostics depend on `parse-options`'
+//! internal candidate ordering.
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -222,9 +228,6 @@ pub fn check_ignore(args: &[String]) -> Result<ExitCode> {
             return Ok(fatal(&format!(
                 "{orig}: pathspec magic is not supported by check-ignore"
             )));
-        }
-        if orig.iter().any(|&b| matches!(b, b'*' | b'?' | b'[')) {
-            bail!("pathspec with wildcards is not supported: {orig:?}");
         }
 
         let rel = match to_repo_relative(orig.as_bstr(), prefix_b.as_bstr(), root_b.as_bstr()) {
@@ -470,17 +473,32 @@ fn normalize(path: &[u8]) -> Option<BString> {
     Some(BString::from(parts.join(&b'/')))
 }
 
-/// Whether the index holds `rel` itself or anything beneath it — git's
-/// `find_pathspecs_matching_against_index` for a literal pathspec.
+/// Whether any index entry matches the pathspec `rel` — git's
+/// `find_pathspecs_matching_against_index()`, which runs `ce_path_match()` over
+/// every cache entry.
+///
+/// `match_pathspec_item()` accepts an entry three ways: the pathspec equals it, the
+/// pathspec is a leading directory of it, or the pathspec fnmatches it. The last one
+/// is `git_fnmatch()`, and without `:(glob)` magic that is `wildmatch(pattern,
+/// string, 0)` — no `WM_PATHNAME` — so a `*` in the pathspec crosses `/` and `*.log`
+/// would match `logs/a.log` as readily as `a.log`.
+///
+/// Only the *match* result matters here: `check_ignore()` uses it purely to skip the
+/// exclude lookup for tracked paths, and still reports the pathspec's own text.
 fn index_has(index: &gix::index::State, rel: &BStr) -> bool {
     if rel.is_empty() {
         return !index.entries().is_empty();
     }
     let mut dir_prefix = rel.to_vec();
     dir_prefix.push(b'/');
+    // `pathspec_item.nowildcard_len < len` is what gates the fnmatch attempt, i.e.
+    // the pathspec has to actually contain a wildcard for it to be tried.
+    let wild = rel.iter().any(|&b| matches!(b, b'*' | b'?' | b'['));
     index.entries().iter().any(|e| {
         let p = e.path(index);
-        p == rel || p.starts_with(&dir_prefix)
+        p == rel
+            || p.starts_with(&dir_prefix)
+            || (wild && gix::glob::wildmatch(rel, p, gix::glob::wildmatch::Mode::empty()))
     })
 }
 

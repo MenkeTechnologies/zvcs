@@ -39,6 +39,9 @@ pub enum Advice {
     /// A sequencer operation refused to run over a dirty index
     /// (`error_dirty_index`).
     CommitBeforeMerge,
+    /// `create_seq_dir()` found a cherry-pick or revert sequence already live,
+    /// so the new one cannot start.
+    SequencerInUse,
     /// `git rm` refused because the work tree or index would lose changes.
     RmHints,
     /// Umbrella slot for every push rejection; false disables the whole family.
@@ -120,6 +123,7 @@ impl Advice {
             Advice::ResolveConflict => "advice.resolveConflict",
             Advice::MergeConflict => "advice.mergeConflict",
             Advice::CommitBeforeMerge => "advice.commitBeforeMerge",
+            Advice::SequencerInUse => "advice.sequencerInUse",
             Advice::RmHints => "advice.rmHints",
             Advice::PushUpdateRejected => "advice.pushUpdateRejected",
             Advice::PushNonFastForward => "advice.pushNonFastForward",

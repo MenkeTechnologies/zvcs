@@ -46,12 +46,26 @@
 //!     `usage_with_options` block (usage line plus a blank line) on stderr,
 //!     exit 129.
 //!
-//!   * **`status`**, **`init`**, **`foreach`**, **`summary`**, **`sync`**,
+//!   * **`foreach`** parses `module_foreach`'s own option table here and then
+//!     calls the porcelain's body directly. It is the one shared subcommand that
+//!     cannot be forwarded verbatim, because the two entry points scan their
+//!     arguments differently: `module_foreach` calls `parse_options(..., 0)`,
+//!     which **permutes** — an option after the command is still an option —
+//!     while `git-submodule.sh`'s `cmd_foreach` loop stops at the first
+//!     non-option and re-invokes the helper behind an explicit `--`. So
+//!     `submodule--helper foreach does-not-exist -q` is a quiet one-argument
+//!     command (the shell form, no `Entering` line) where
+//!     `submodule foreach does-not-exist -q` is a noisy two-argument one. The
+//!     usage block, the abbreviation matching (`--qu` is `--quiet`, `--no-` is
+//!     ambiguous), `--help-all`'s hidden `--super-prefix`, and which of those
+//!     land on stdout rather than stderr all follow parse-options.
+//!
+//!   * **`status`**, **`init`**, **`summary`**, **`sync`**,
 //!     **`update`**, **`deinit`**, **`absorbgitdirs`**, **`set-branch`** and
 //!     **`set-url`** delegate to [`super::submodule::subcommand`], which
 //!     implements them. Each is registered in builtin/submodule--helper.c's
 //!     `OPT_SUBCOMMAND` table against the very same C function (`module_status`,
-//!     `module_init`, `module_foreach`, `module_summary`, `module_sync`,
+//!     `module_init`, `module_summary`, `module_sync`,
 //!     `module_update`, `module_deinit`, `absorb_git_dirs`,
 //!     `module_set_branch`, `module_set_url`) that `git submodule <name>`
 //!     dispatches to, so forwarding `[<name>, <tail>...]` into the porcelain
@@ -158,7 +172,7 @@ pub fn submodule__helper(args: &[String]) -> Result<ExitCode> {
         "gitdir" => gitdir(tail),
         "get-default-remote" => get_default_remote(tail),
         // Upstream these are literally the same C functions `git submodule`
-        // dispatches to (`module_status`, `module_init`, `module_foreach`,
+        // dispatches to (`module_status`, `module_init`,
         // `module_summary`, `module_sync`, `module_update`, `module_deinit`,
         // `absorb_git_dirs`, `module_set_branch`, `module_set_url` — see the
         // `OPT_SUBCOMMAND` table in builtin/submodule--helper.c), so the
@@ -168,8 +182,12 @@ pub fn submodule__helper(args: &[String]) -> Result<ExitCode> {
         // `GIT_PROTOCOL_FROM_USER=0` export, which the helper does not have —
         // `git submodule--helper update --remote` fetches over `file` where
         // `git submodule update --remote` refuses.
-        "status" | "init" | "foreach" | "summary" | "set-branch" | "sync" | "update"
-        | "deinit" | "absorbgitdirs" | "set-url" => {
+        // `foreach` is the one shared subcommand whose *parse* differs between
+        // the two entry points, so it cannot be forwarded verbatim — see
+        // [`foreach`].
+        "foreach" => foreach(tail),
+        "status" | "init" | "summary" | "set-branch" | "sync" | "update" | "deinit"
+        | "absorbgitdirs" | "set-url" => {
             let mut forwarded = Vec::with_capacity(tail.len() + 1);
             forwarded.push(name.to_string());
             forwarded.extend(tail.iter().cloned());
@@ -199,6 +217,233 @@ pub fn submodule__helper(args: &[String]) -> Result<ExitCode> {
             Ok(ExitCode::from(129))
         }
     }
+}
+
+// --------------------------------------------------------------- foreach ----
+
+/// The `usage_with_options` block `module_foreach` prints, captured from git
+/// 2.55.0: the usage line, a blank line, its two options, and a trailing blank
+/// line. It is *not* the `git-submodule.sh` usage the porcelain wrapper prints.
+const FOREACH_USAGE: &str = "\
+usage: git submodule foreach [--quiet] [--recursive] [--] <command>
+
+    -q, --[no-]quiet      suppress output of entering each submodule command
+    --[no-]recursive      recurse into nested submodules
+
+";
+
+/// `USAGE_FULL` — what `--help-all` prints, which is the block above plus the
+/// `PARSE_OPT_HIDDEN` `--super-prefix`.
+const FOREACH_USAGE_FULL: &str = "\
+usage: git submodule foreach [--quiet] [--recursive] [--] <command>
+
+    --[no-]super-prefix <prefix>
+                          prefixed path to initial superproject
+    -q, --[no-]quiet      suppress output of entering each submodule command
+    --[no-]recursive      recurse into nested submodules
+
+";
+
+/// `git submodule--helper foreach [<options>] [--] <command>` — `module_foreach`
+/// (builtin/submodule--helper.c:432).
+///
+/// The whole reason this is not forwarded to [`super::submodule::subcommand`] is
+/// the option scan. `module_foreach` calls `parse_options(..., 0)`: with no
+/// `PARSE_OPT_STOP_AT_NON_OPTION`, parse-options **permutes** — a non-option is
+/// copied to `ctx->out` and the walk continues, so an option after the command
+/// is still an option. `git submodule foreach` never sees that, because
+/// `git-submodule.sh`'s `cmd_foreach` stops at the first non-option itself and
+/// then re-invokes the helper with an explicit `--`.
+///
+/// The difference is observable in two ways at once, because
+/// `runcommand_in_submodule_cb` branches on `info->argc == 1`:
+///
+/// ```text
+/// git submodule--helper foreach does-not-exist -q
+///   → -q permutes out, one argument is left, so the command runs through the
+///     shell as `path='sm'; does-not-exist` and no `Entering` line prints
+/// git submodule foreach does-not-exist -q
+///   → `-q` stays in the command, two arguments are exec'd directly
+/// ```
+fn foreach(args: &[String]) -> Result<ExitCode> {
+    /// `PARSE_OPT_UNKNOWN` reaching `parse_options`: the `error:` line, then the
+    /// usage block, then exit 129.
+    fn unknown(message: String) -> Result<ExitCode> {
+        eprintln!("error: {message}");
+        eprint!("{FOREACH_USAGE}");
+        Ok(ExitCode::from(129))
+    }
+    /// `PARSE_OPT_ERROR`: the `error:` line and exit 129 with **no** usage block
+    /// — `parse_options` exits on it before reaching `usage_with_options`.
+    fn opt_error(message: String) -> Result<ExitCode> {
+        eprintln!("error: {message}");
+        Ok(ExitCode::from(129))
+    }
+    /// `show_usage:` — `usage_with_options_internal(…, USAGE_TO_STDOUT)`, so the
+    /// block goes to **stdout** even when an `error:` line preceded it on stderr.
+    fn help() -> Result<ExitCode> {
+        print!("{FOREACH_USAGE}");
+        Ok(ExitCode::from(129))
+    }
+    /// The same, for the ambiguous-abbreviation path: `parse_long_opt` prints
+    /// its `error:` and returns `PARSE_OPT_HELP`, which is a `goto show_usage`.
+    fn ambiguous_error(message: String) -> Result<ExitCode> {
+        eprintln!("error: {message}");
+        help()
+    }
+
+    /// `module_foreach_options[]`. `super-prefix` is `PARSE_OPT_HIDDEN`, which is
+    /// why the usage block above lists only the other two; hidden options still
+    /// parse and still take part in abbreviation matching.
+    const LONG: [&str; 3] = ["super-prefix", "quiet", "recursive"];
+    /// Which of them take a value (`OPT__SUPER_PREFIX` is an `OPT_STRING`; the
+    /// other two are `OPT_COUNTUP`/`OPT_BOOL`, i.e. `PARSE_OPT_NOARG`).
+    fn takes_value(name: &str) -> bool {
+        name == "super-prefix"
+    }
+
+    let mut quiet = false;
+    let mut recursive = false;
+    let mut super_prefix: Option<String> = None;
+    let mut command: Vec<String> = Vec::new();
+
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        i += 1;
+
+        // `if (*arg != '-' || !arg[1])`: a non-option — including a lone `-` —
+        // is copied to `ctx->out` and the scan *continues*. This is the
+        // permutation that separates the helper from the porcelain wrapper.
+        if !a.starts_with('-') || a == "-" {
+            command.push(a.to_string());
+            continue;
+        }
+        // `--` and `--end-of-options` end the scan; the rest are operands.
+        if a == "--" || a == "--end-of-options" {
+            command.extend(args[i..].iter().cloned());
+            break;
+        }
+        // A lone `-h` asks for help, but only when it is the *entire* command
+        // line: `internal_help && ctx->total == 1`.
+        if a == "-h" && args.len() == 1 {
+            return help();
+        }
+
+        let Some(body) = a.strip_prefix("--") else {
+            // Short clusters. `-q` is the only switch; `-h` anywhere in one
+            // still shows the usage (`internal_help && *ctx->opt == 'h'`).
+            if !a.is_ascii() {
+                return unknown(format!("unknown non-ascii option in string: `{a}'"));
+            }
+            for c in a[1..].chars() {
+                match c {
+                    'q' => quiet = true,
+                    'h' => return help(),
+                    _ => return unknown(format!("unknown switch `{c}'")),
+                }
+            }
+            continue;
+        };
+
+        // `internal_help` is on (flags `0`), and both of these are matched
+        // literally, ahead of `parse_long_opt`, so neither abbreviates.
+        if body == "help" {
+            return help();
+        }
+        if body == "help-all" {
+            print!("{FOREACH_USAGE_FULL}");
+            return Ok(ExitCode::from(129));
+        }
+
+        // ---- `parse_long_opt`, including its abbreviation matching. ----
+        let (head, inline) = match body.split_once('=') {
+            Some((n, v)) => (n, Some(v)),
+            None => (body, None),
+        };
+        // `skip_prefix(arg_start, "no-", …)` twice: one `no-` is the negation,
+        // two means the option itself would have to be named `no-<something>`,
+        // and none of these are.
+        let (stem, unset, no_no) = match head.strip_prefix("no-") {
+            Some(rest) => match rest.strip_prefix("no-") {
+                Some(rest2) => (rest2, false, true),
+                None => (rest, true, false),
+            },
+            None => (head, false, false),
+        };
+
+        let mut exact: Option<&str> = None;
+        // `register_abbrev`'s two slots: the most recent prefix match, and the
+        // earlier one it displaced (which is what makes the match ambiguous).
+        let mut abbrev: Option<&str> = None;
+        let mut ambiguous: Option<&str> = None;
+        // `register_abbrev`: the newest prefix match displaces the previous one
+        // into the `ambiguous` slot. git calls it from two independent places
+        // per option, so one option can displace *itself* — which is why
+        // `--no-` reports "could be --no-recursive or --no-recursive".
+        let mut register = |name: &'static str| {
+            if let Some(prev) = abbrev {
+                ambiguous = Some(prev);
+            }
+            abbrev = Some(name);
+        };
+        if !no_no {
+            for name in LONG {
+                if stem == name {
+                    exact = Some(name);
+                    break;
+                }
+                // `!strncmp(long_name, arg_start, arg_end - arg_start)`.
+                if name.starts_with(stem) {
+                    register(name);
+                }
+                // "negated and abbreviated very much": `starts_with("no-", arg)`
+                // asks whether `"no-"` starts with the *argument*, so `--n`,
+                // `--no` and `--no-` register every negatable option a second
+                // time — and are therefore always ambiguous.
+                if "no-".starts_with(head) {
+                    register(name);
+                }
+            }
+        }
+        if exact.is_none() {
+            if let (Some(other), Some(one)) = (ambiguous, abbrev) {
+                let no = if unset || "no-".starts_with(head) { "no-" } else { "" };
+                return ambiguous_error(format!(
+                    "ambiguous option: {body} (could be --{no}{other} or --{no}{one})"
+                ));
+            }
+        }
+        let Some(name) = exact.or(abbrev) else {
+            return unknown(format!("unknown option `{body}'"));
+        };
+
+        if !takes_value(name) && inline.is_some() {
+            return opt_error(format!("option `{name}' takes no value"));
+        }
+        match name {
+            "quiet" => quiet = !unset,
+            "recursive" => recursive = !unset,
+            "super-prefix" if unset => super_prefix = None,
+            "super-prefix" => {
+                super_prefix = match inline {
+                    Some(v) => Some(v.to_string()),
+                    None => match args.get(i) {
+                        Some(next) => {
+                            i += 1;
+                            Some(next.clone())
+                        }
+                        None => {
+                            return opt_error("option `super-prefix' requires a value".to_string())
+                        }
+                    },
+                };
+            }
+            _ => unreachable!("every name comes from LONG"),
+        }
+    }
+
+    super::submodule::foreach_parsed(&command, quiet, recursive, super_prefix.as_deref())
 }
 
 // ------------------------------------------------------------------- add ----

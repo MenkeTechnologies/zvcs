@@ -4878,19 +4878,9 @@ fn count_occurrences(hay: &[u8], needle: &[u8]) -> i64 {
     .0
 }
 
-/// git's approxidate for `--since`/`--until`: parse an absolute or relative date
-/// to epoch seconds, resolving relative dates against `GIT_TEST_DATE_NOW`/now.
-/// An unparseable value falls back to now, matching git's lenient behavior.
-pub(crate) fn approxidate(value: &str) -> i64 {
-    let now_s = crate::date::now_seconds();
-    if value.trim() == "now" {
-        return now_s;
-    }
-    let now = std::time::UNIX_EPOCH + std::time::Duration::from_secs(now_s.max(0) as u64);
-    gix::date::parse(value, Some(now))
-        .map(|t| t.seconds)
-        .unwrap_or(now_s)
-}
+/// git's `approxidate()` for `--since`/`--until`, shared with every other verb that takes a date
+/// argument. Re-exported so `rev-list`/`whatchanged`/`show` can keep importing it from here.
+pub(crate) use crate::date::approxidate;
 
 /// git's `show_date_relative`, via the shared port (exact thresholds + the
 /// `(diff*24+365)/730` years/months rounding).

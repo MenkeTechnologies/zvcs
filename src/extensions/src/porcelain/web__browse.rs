@@ -383,7 +383,8 @@ fn launch(browser: &str, browser_path: &str, browser_cmd: Option<&str>, urls: &[
             cmd.arg("\"web-browse\"").args(urls);
             exec(cmd)
         }
-        // A custom `browser.<tool>.cmd`: `( eval "$browser_cmd \"\$@\"" )`.
+        // A custom `browser.<tool>.cmd`: `( eval "$browser_cmd \"\$@\"" )` inside
+        // `git-web--browse.sh`, whose `#!@SHELL_PATH@` line names the same shell.
         // Running `sh -c '<cmd> "$@"' sh <urls>` keeps the command text under
         // full shell parsing while each URL stays one word.
         _ => {
@@ -391,7 +392,7 @@ fn launch(browser: &str, browser_path: &str, browser_cmd: Option<&str>, urls: &[
                 // `if test -n "$browser_cmd"` with no else — the compound is 0.
                 return Ok(ExitCode::SUCCESS);
             };
-            let status = Command::new("sh")
+            let status = crate::external::shell()
                 .arg("-c")
                 .arg(format!("{cmd_text} \"$@\""))
                 .arg("sh")

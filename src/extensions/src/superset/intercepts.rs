@@ -215,7 +215,7 @@ pub fn maybe_intercept(sub: &str, args: &[String]) -> Option<Result<ExitCode>> {
 /// Run advice as a shell command, inheriting stdio, with the INTERCEPT_* env and
 /// the loop guard set. Returns its exit status (127 if the shell can't spawn).
 fn run_advice(code: &str, env: &[(&str, String)]) -> i32 {
-    Command::new("sh")
+    crate::external::shell()
         .arg("-c")
         .arg(code)
         .env("ZVCS_INTERCEPTED", "1")

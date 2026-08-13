@@ -301,7 +301,7 @@ fn have_finished_the_last_pick(repo: &gix::Repository) -> bool {
 /// The `U<TAB><path>` lines are `refresh_index()`'s `REFRESH_IN_PORCELAIN`
 /// report and go to **stdout**, one per conflicted path; the diagnosis and the
 /// `advice.resolveConflict` hint go to stderr, and the exit status is 128.
-fn die_resolve_conflict(index: &gix::index::File) -> ExitCode {
+pub(super) fn die_resolve_conflict(index: &gix::index::File) -> ExitCode {
     let backing = index.path_backing();
     let mut last: Option<&gix::bstr::BStr> = None;
     for entry in index.entries() {
@@ -1225,13 +1225,17 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
             squash_fixup_seed = Some(format!("amend! {subject}\n\n{carried}"));
         }
     }
-    // `--date=<date>` overrides the author date (git accepts fixed and relative
-    // forms; `gix::date::parse` covers the same grammar).
+    // `--date=<date>` overrides the author date. `parse_force_date()` (builtin/commit.c:614)
+    // tries `parse_date()` first and only falls back to `approxidate_careful()`, failing when
+    // that reports an error — so `--date=0` is the current time, not the epoch.
     let date_override: Option<gix::date::Time> = match &date_arg {
-        Some(d) => Some(
-            gix::date::parse(d, Some(std::time::SystemTime::now()))
-                .map_err(|e| anyhow::anyhow!("invalid date format `{d}`: {e}"))?,
-        ),
+        Some(d) => Some(match crate::date::parse_date_basic(d) {
+            Some(time) => time,
+            None => match crate::date::approxidate_careful(d) {
+                (seconds, false) => gix::date::Time::new(seconds, 0),
+                (_, true) => crate::git_fatal!("invalid date format: {d}"),
+            },
+        }),
         None => None,
     };
 
@@ -3014,6 +3018,12 @@ fn resolve_editor(snap: &gix::config::Snapshot<'_>) -> Result<String> {
 /// commands work, and stdio is inherited so the interactive editor owns the tty.
 pub(super) fn launch_editor(snap: &gix::config::Snapshot<'_>, path: &std::path::Path) -> Result<()> {
     let editor = resolve_editor(snap)?;
+    // `if (strcmp(editor, ":"))` (editor.c:66): git's documented no-op editor is
+    // recognised before any child is built, so nothing is spawned and not even
+    // the "Waiting for your editor" hint is printed.
+    if editor == ":" {
+        return Ok(());
+    }
     // `launch_specified_editor` (editor.c): when stderr is a terminal and
     // `advice.waitingForEditor` is on, git says why it is blocked before handing
     // the tty over. A dumb terminal cannot erase the line afterwards, so it gets
@@ -3028,11 +3038,7 @@ pub(super) fn launch_editor(snap: &gix::config::Snapshot<'_>, path: &std::path::
         eprint!("hint: Waiting for your editor to close the file...{tail}");
         let _ = std::io::stderr().flush();
     }
-    let status = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(format!("{editor} \"$@\""))
-        .arg(&editor) // $0
-        .arg(path) // $1
+    let status = crate::external::prepare_shell_cmd_str(&editor, [path])
         .status()
         .map_err(|e| anyhow::anyhow!("cannot run editor '{editor}': {e}"))?;
     // `term_clear_line()`: wipe the "Waiting for your editor" line so the

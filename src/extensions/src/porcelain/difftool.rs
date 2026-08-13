@@ -1258,7 +1258,8 @@ export GIT_PREFIX
 ( eval $4 )"#;
 
     let script = if append { EXTCMD } else { TOOL };
-    let status = Command::new("sh")
+    // `git-mergetool--lib.sh`, sourced by a `#!@SHELL_PATH@` script.
+    let status = crate::external::shell()
         .arg("-c")
         .arg(script)
         .arg("sh")

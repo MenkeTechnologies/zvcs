@@ -761,30 +761,10 @@ fn now() -> i64 {
         .unwrap_or_default()
 }
 
-/// git's `approxidate()`, as `--mtime` uses it: whatever the value parses to,
-/// and the current time for anything that does not parse at all (`--mtime=@0`
-/// and `--mtime=bogus-time` both land here, as stock git does).
-///
-/// The parse itself is `gix::date::parse`, covering ISO-8601 (with or without a
-/// zone, dotted or compact), RFC-2822, git's `<seconds> <±hhmm>` raw form, a
-/// bare epoch count and relative spellings like `2 days ago`. Two known
-/// deviations from git: a zone-less date is read as UTC where git reads it in
-/// the local zone, and a date git's approxidate accepts but `gix-date` does not
-/// falls back to the current time instead of that date.
-fn approxidate(spec: &str) -> i64 {
-    // `parse_date()` (date.c:872): a leading `@` introduces a raw timestamp, with
-    // the timezone optional — `@1600000000` on its own is valid. The vendored
-    // parser wants the offset, so the bare form is read here.
-    if let Some(rest) = spec.strip_prefix('@') {
-        if let Ok(secs) = rest.trim().parse::<i64>() {
-            return secs;
-        }
-    }
-    match gix::date::parse(spec, Some(std::time::SystemTime::now())) {
-        Ok(time) => time.seconds,
-        Err(_) => now(),
-    }
-}
+// git's `approxidate()`, as `--mtime` uses it (`archive.c:520`) — the same shared parser every
+// `--since`/`--until` goes through, so `--mtime=@0` (no zone, so not an object header) and
+// `--mtime=bogus-time` both resolve to the current time exactly as stock git does.
+use crate::date::approxidate;
 
 /// git's `filename_to_archive_format()`: the format whose name the output file's
 /// extension spells, or `None` to fall back to `tar`.

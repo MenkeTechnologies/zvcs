@@ -142,7 +142,7 @@ pub fn list() -> Result<Vec<(String, String)>> {
 /// output goes to the daemon log. Independent of git — the directory need not be
 /// a repository.
 pub fn run_command(dir: &Path, cmd: &str) -> bool {
-    let out = Command::new("sh")
+    let out = crate::external::shell()
         .arg("-c")
         .arg(cmd)
         .current_dir(dir)
@@ -191,7 +191,7 @@ pub fn run(git_dir: &Path, workdir: &Path) {
         .map(|n| n.shorten().to_string())
         .unwrap_or_else(|| "HEAD".to_string());
 
-    let out = Command::new("sh")
+    let out = crate::external::shell()
         .arg("-c")
         .arg(&cmd)
         .current_dir(workdir)

@@ -97,7 +97,7 @@ use gix::index::entry::{Flags, Mode, Stat};
 
 /// Parsed command line for a single `read-tree` invocation.
 #[derive(Default)]
-struct Opts {
+pub(super) struct Opts {
     merge: bool,               // -m
     reset: bool,               // --reset
     update: bool,              // -u
@@ -237,6 +237,33 @@ pub fn read_tree(args: &[String]) -> Result<ExitCode> {
         _ => args,
     };
 
+    let o = match parse_args(argv)? {
+        Ok(o) => o,
+        Err(code) => return Ok(code),
+    };
+    finish(o)
+}
+
+/// `parse_options()` over git's `read-tree` option table.
+///
+/// Split out from [`read_tree`] because `git-merge-resolve.sh` runs
+/// `git read-tree -u -m --aggressive $bases $head $remotes` with the operand
+/// list interpolated *unquoted*, so an operand that looks like an option is one:
+/// `git cherry-pick -Xtheirs --strategy=resolve` reaches here as `--theirs` and
+/// dies as an unknown option. `super::merge_resolve` runs this scan for exactly
+/// that reason, so the refusal is read-tree's own rather than a second opinion
+/// about which operands are acceptable.
+///
+/// `Err(code)` means git already printed the diagnosis.
+pub(super) fn parse_args(argv: &[String]) -> Result<std::result::Result<Opts, ExitCode>> {
+    /// The scan's early exits go through `read_tree`'s own helpers, which return
+    /// `Result<ExitCode>`; lift them into this function's shape.
+    macro_rules! reject {
+        ($e:expr) => {
+            return Ok(Err($e?))
+        };
+    }
+
     let mut o = Opts::default();
     let mut only_positionals = false;
     let mut i = 0usize;
@@ -265,9 +292,9 @@ pub fn read_tree(args: &[String]) -> Result<ExitCode> {
                     'v' | 'q' => {}
                     'h' => {
                         print!("{USAGE}");
-                        return Ok(ExitCode::from(129));
+                        return Ok(Err(ExitCode::from(129)));
                     }
-                    _ => return usage_err(format!("unknown switch `{c}'")),
+                    _ => reject!(usage_err(format!("unknown switch `{c}'"))),
                 }
             }
             continue;
@@ -285,7 +312,7 @@ pub fn read_tree(args: &[String]) -> Result<ExitCode> {
         macro_rules! no_value {
             () => {
                 if inline.is_some() {
-                    return opt_err(format!("option `{name}' takes no value"));
+                    reject!(opt_err(format!("option `{name}' takes no value")));
                 }
             };
         }
@@ -299,7 +326,7 @@ pub fn read_tree(args: &[String]) -> Result<ExitCode> {
                             i += 1;
                             next.clone()
                         }
-                        None => return opt_err(format!("option `{name}' requires a value")),
+                        None => reject!(opt_err(format!("option `{name}' requires a value"))),
                     },
                 }
             };
@@ -358,7 +385,7 @@ pub fn read_tree(args: &[String]) -> Result<ExitCode> {
                 // The optional value is a boolean; anything else is fatal in git.
                 if let Some(v) = inline {
                     if parse_maybe_bool(v).is_none() {
-                        return fatal(format!("bad recurse-submodules argument: {v}"));
+                        reject!(fatal(format!("bad recurse-submodules argument: {v}")));
                     }
                 }
             }
@@ -370,16 +397,35 @@ pub fn read_tree(args: &[String]) -> Result<ExitCode> {
                 // scan — before the tree-ishes are resolved, and it only sees the
                 // `-u` seen so far.
                 if !o.update {
-                    return fatal("--exclude-per-directory is meaningless unless -u");
+                    reject!(fatal("--exclude-per-directory is meaningless unless -u"));
                 }
             }
-            _ => return usage_err(format!("unknown option `{name}'")),
+            _ => reject!(usage_err(format!("unknown option `{name}'"))),
         }
     }
 
-    // ---- Argument validation, in git's own order (builtin/read-tree.c). ----
+    Ok(Ok(o))
+}
+
+/// The one check `cmd_read_tree` makes before it touches the repository, and so
+/// the only one a caller can run without also performing the read.
+///
+/// Shared with `super::merge_resolve` for the same reason [`parse_args`] is: the
+/// mode conflict is reachable from an operand that looks like an option
+/// (`merge-resolve --prefix <base> -- …`), and the refusal has to be read-tree's.
+pub(super) fn check_options(o: &Opts) -> Result<std::result::Result<(), ExitCode>> {
     if 1 < usize::from(o.merge) + usize::from(o.reset) + usize::from(o.prefix.is_some()) {
-        return fatal("Which one? -m, --reset, or --prefix?");
+        return Ok(Err(fatal("Which one? -m, --reset, or --prefix?")?));
+    }
+    Ok(Ok(()))
+}
+
+/// Everything `cmd_read_tree` does once `parse_options` has returned: the
+/// argument validation, then the read itself.
+fn finish(o: Opts) -> Result<ExitCode> {
+    // ---- Argument validation, in git's own order (builtin/read-tree.c). ----
+    if let Err(code) = check_options(&o)? {
+        return Ok(code);
     }
 
     let repo = gix::discover(".")?;

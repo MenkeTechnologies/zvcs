@@ -1963,7 +1963,7 @@ fn load_pseudo_merges_from_config(repo: &gix::Repository) -> Vec<PseudoMergeGrou
             }
         }
         if let Some(raw) = value("threshold") {
-            match parse_expiry_date(&raw, now) {
+            match parse_expiry_date(&raw) {
                 Some(at) => group.threshold = at,
                 None => {
                     eprintln!("error: '{raw}' for '{}' is not a valid timestamp", var("threshold"));
@@ -1985,7 +1985,7 @@ fn load_pseudo_merges_from_config(repo: &gix::Repository) -> Vec<PseudoMergeGrou
             }
         }
         if let Some(raw) = value("stableThreshold") {
-            match parse_expiry_date(&raw, now) {
+            match parse_expiry_date(&raw) {
                 Some(at) => group.stable_threshold = at,
                 None => {
                     eprintln!("error: '{raw}' for '{}' is not a valid timestamp", var("stableThreshold"));
@@ -2035,40 +2035,11 @@ fn load_pseudo_merges_from_config(repo: &gix::Repository) -> Vec<PseudoMergeGrou
     out
 }
 
-/// git's `parse_expiry_date()`, which is `approxidate_careful()` with two pairs
-/// of words taken over first.
-///
-/// # Deliberate departure from git
-///
-/// git's `approxidate_str()` is its own tokenizer: it walks the string, treats
-/// every non-alphanumeric byte as a separator, and folds each number-and-unit
-/// pair into a `struct tm`. That is why `1.week.ago` and `1 week ago` mean the
-/// same thing to it. [`gix::date::parse`] is this tree's port of the *other*
-/// half of `date.c`, `parse_date_basic()`, plus the spaced relative forms — so
-/// the dotted spelling is reduced to the spaced one here and handed to it,
-/// rather than the tokenizer being ported a second time.
-fn parse_expiry_date(value: &str, now: std::time::SystemTime) -> Option<i64> {
-    let trimmed = value.trim();
-    // git takes these over before approxidate ever sees them, so that "now"
-    // means "expire everything" rather than the current second.
-    if trimmed == "never" || trimmed == "false" {
-        return Some(0);
-    }
-    if trimmed == "all" || trimmed == "now" {
-        return Some(i64::MAX);
-    }
-    if let Ok(time) = gix::date::parse(trimmed, Some(now)) {
-        return Some(time.seconds);
-    }
-    // `1.week.ago`, `2.months.ago`: git's separators, spelled the way the
-    // spaced parser expects.
-    let spaced: String = trimmed
-        .chars()
-        .map(|c| if c == '.' || c == '_' { ' ' } else { c })
-        .collect();
-    let spaced = spaced.split_whitespace().collect::<Vec<_>>().join(" ");
-    gix::date::parse(&spaced, Some(now)).ok().map(|time| time.seconds)
-}
+// git's `parse_expiry_date()` (date.c:957), which `--unpack-unreachable` and
+// `--cruft-expiration` both take (`builtin/pack-objects.c:4981`). Shared with every other
+// expiry option; `1.week.ago` needs no rewriting, since approxidate's own tokenizer treats
+// every non-alphanumeric byte as a separator.
+use crate::date::parse_expiry_date;
 
 /// The `.bitmap` for a freshly written pack, or `None` when one cannot be
 /// written.

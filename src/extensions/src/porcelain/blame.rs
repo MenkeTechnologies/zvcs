@@ -280,20 +280,9 @@ fn parse_color_fields(spec: &str) -> ColorFields {
     ColorFields::Ok(fields)
 }
 
-/// git's approxidate, as `parse_color_fields` uses it for each heat threshold:
-/// an absolute or relative date resolved against `GIT_TEST_DATE_NOW`/now, with
-/// an unparseable value falling back to now — the same rule `log`'s
-/// `--since`/`--until` handling follows.
-fn approxidate(value: &str) -> i64 {
-    let now_s = crate::date::now_seconds();
-    if value.trim() == "now" {
-        return now_s;
-    }
-    let now = std::time::UNIX_EPOCH + std::time::Duration::from_secs(now_s.max(0) as u64);
-    gix::date::parse(value, Some(now))
-        .map(|t| t.seconds)
-        .unwrap_or(now_s)
-}
+// git's `approxidate()`, which `parse_color_fields` runs over each heat threshold
+// (`builtin/blame.c:421`) — the same shared parser every `--since`/`--until` goes through.
+use crate::date::approxidate;
 
 /// `git blame` — line-by-line last-modifying commit, backed by `gix-blame`.
 ///
@@ -526,6 +515,15 @@ pub(super) fn blame_with(args: &[String], cmd: &str) -> Result<ExitCode> {
             writeln!(err, "error: unknown option `{name}'")?;
             err.flush()?;
             return print_usage(cmd, false);
+        }
+        // A rejected option *value*: only the callback's own `error()` line is
+        // written, then `exit(129)`. No usage block, unlike the unknown-option
+        // path above.
+        ParseOutcome::OptError(msg) => {
+            let mut err = std::io::stderr().lock();
+            writeln!(err, "error: {msg}")?;
+            err.flush()?;
+            return Ok(ExitCode::from(129));
         }
         ParseOutcome::Opts(opts) => *opts,
     };
@@ -1510,7 +1508,13 @@ fn object_name_width(repo: &gix::Repository, opts: &Options) -> usize {
         match opts.abbrev {
             // `--abbrev=0` means "no abbreviation" to git.
             Some(0) => hexsz,
-            Some(n) => n.clamp(MINIMUM_ABBREV, hexsz),
+            // `parse_abbrev_cb` has already applied git's `MINIMUM_ABBREV` floor.
+            // There is deliberately no ceiling: `cmd_blame` only adds the boundary
+            // column when `abbrev < hexsz`, and `emit_other`'s `%.*s` then prints
+            // however much of the hash the budget covers. So `--abbrev=40` spends a
+            // column on `^` and shows 39 digits, while `--abbrev=41` and up show all
+            // 40 — a ceiling here would collapse the two.
+            Some(n) => n,
             None => configured_abbrev(repo, hexsz).clamp(MINIMUM_ABBREV, hexsz),
         }
     };
@@ -1545,6 +1549,10 @@ fn emit_object_name(buf: &mut Vec<u8>, ci: &CommitInfo, line: &Line, name_width:
         buf.push(b'?');
         length -= 1;
     }
+    // git prints `%.*s` over a NUL-terminated hex buffer, so a budget wider than the
+    // hash (`--abbrev=41` and up) simply stops at the hash — and `-b`'s `memset`
+    // blanks exactly `strlen(hex)` bytes, so the blank run is capped the same way.
+    let length = length.min(ci.hex.len());
     if blanked {
         pad(buf, length);
     } else {
@@ -2921,6 +2929,13 @@ enum ParseOutcome {
     /// The payload is the name git puts in its `unknown option` diagnostic —
     /// see [`unknown_option_name`] for why that is sometimes `(null)`.
     Unknown(String),
+    /// An option *callback* rejected its value: `parse-options` turns the
+    /// callback's non-zero return into `PARSE_OPT_ERROR`, which `cmd_blame`'s
+    /// own `parse_options_step` loop answers with a bare `exit(129)`
+    /// (`builtin/blame.c:1016`) — the callback's `error()` line is the whole
+    /// diagnostic, with no usage block after it. The payload is that line's
+    /// text without the `error: ` prefix.
+    OptError(String),
     Opts(Box<Options>),
 }
 
@@ -3163,13 +3178,13 @@ impl Options {
                         .ok_or_else(|| anyhow!("option `-L` requires a value"))?;
                     line_specs.push(spec.clone());
                 }
-                "--abbrev" => {
-                    i += 1;
-                    let v = args
-                        .get(i)
-                        .ok_or_else(|| anyhow!("option `--abbrev` requires a value"))?;
-                    abbrev = Some(v.parse().map_err(|_| anyhow!("invalid --abbrev value: {v}"))?);
-                }
+                // `OPT__ABBREV` is `PARSE_OPT_OPTARG`, so a bare `--abbrev` never
+                // reaches for the next argument: the callback runs with a NULL arg
+                // and stores `DEFAULT_ABBREV`, which is -1 unless `core.abbrev` names
+                // a number — the same "work it out" state as no `--abbrev` at all.
+                // `git blame --abbrev 8 f` therefore leaves `8` as a revision, which
+                // is why stock answers it with `fatal: bad revision '8'`.
+                "--abbrev" => abbrev = None,
                 // `--date <mode>` / `--date=<mode>` set the default date format for
                 // the human-format timestamp column (validated against the repo in
                 // `blame`, so the last one wins here and errors surface there).
@@ -3188,10 +3203,20 @@ impl Options {
                     let v = args
                         .get(i)
                         .ok_or_else(|| anyhow!("option `--diff-algorithm` requires a value"))?;
-                    diff_algorithm = Some(parse_diff_algorithm(v)?);
+                    match parse_diff_algorithm(v)? {
+                        Some(alg) => diff_algorithm = Some(alg),
+                        None => {
+                            return Ok(ParseOutcome::OptError(DIFF_ALGORITHM_ERROR.to_string()))
+                        }
+                    }
                 }
                 _ if a.starts_with("--diff-algorithm=") => {
-                    diff_algorithm = Some(parse_diff_algorithm(&a["--diff-algorithm=".len()..])?);
+                    match parse_diff_algorithm(&a["--diff-algorithm=".len()..])? {
+                        Some(alg) => diff_algorithm = Some(alg),
+                        None => {
+                            return Ok(ParseOutcome::OptError(DIFF_ALGORITHM_ERROR.to_string()))
+                        }
+                    }
                 }
                 "--contents" => {
                     i += 1;
@@ -3286,8 +3311,10 @@ impl Options {
                     }
                 }
                 _ if a.starts_with("--abbrev=") => {
-                    let v = &a["--abbrev=".len()..];
-                    abbrev = Some(v.parse().map_err(|_| anyhow!("invalid --abbrev value: {v}"))?);
+                    match parse_abbrev_cb(&a["--abbrev=".len()..]) {
+                        Ok(v) => abbrev = Some(v),
+                        Err(msg) => return Ok(ParseOutcome::OptError(msg.to_string())),
+                    }
                 }
                 // A long option no git parser knows: git answers with its own
                 // diagnostic and the usage, so reproduce that rather than
@@ -3363,24 +3390,74 @@ impl Options {
     }
 }
 
-/// git's `diff-algorithm` value parser: the names git accepts for `-A/--diff-algorithm`.
-/// `patience` is a valid git algorithm the vendored `gix-diff` does not implement, so
-/// it is reported as such rather than silently substituted.
-fn parse_diff_algorithm(name: &str) -> Result<gix::diff::blob::Algorithm> {
+/// The text of `blame_diff_algorithm_callback`'s `error()`
+/// (`builtin/blame.c:868`), reported without a usage block at exit 129.
+const DIFF_ALGORITHM_ERROR: &str =
+    "option diff-algorithm accepts \"myers\", \"minimal\", \"patience\" and \"histogram\"";
+
+/// git's `diff-algorithm` value parser: the names `parse_algorithm_value()` accepts.
+///
+/// `Ok(None)` is git's `parse_algorithm_value() < 0`, which
+/// `blame_diff_algorithm_callback` turns into [`DIFF_ALGORITHM_ERROR`] and
+/// `parse-options` into exit 129 — *not* a `die()`, so it must not be reported as
+/// `fatal:`. `Err` is reserved for `patience`, a valid git algorithm the vendored
+/// `gix-diff` does not implement, which is refused rather than silently substituted.
+fn parse_diff_algorithm(name: &str) -> Result<Option<gix::diff::blob::Algorithm>> {
     use gix::diff::blob::Algorithm;
     if name.eq_ignore_ascii_case("myers") || name.eq_ignore_ascii_case("default") {
-        Ok(Algorithm::Myers)
+        Ok(Some(Algorithm::Myers))
     } else if name.eq_ignore_ascii_case("minimal") {
-        Ok(Algorithm::MyersMinimal)
+        Ok(Some(Algorithm::MyersMinimal))
     } else if name.eq_ignore_ascii_case("histogram") {
-        Ok(Algorithm::Histogram)
+        Ok(Some(Algorithm::Histogram))
     } else if name.eq_ignore_ascii_case("patience") {
         bail!("diff algorithm 'patience' is not implemented")
     } else {
-        crate::git_fatal!(
-            "option diff-algorithm accepts \"myers\", \"minimal\", \"patience\" and \"histogram\""
-        )
+        Ok(None)
     }
+}
+
+/// `parse_opt_abbrev_cb()` (`parse-options-cb.c:19`) for an *attached* value.
+///
+/// `Err` is the callback's `error()` — reported as
+/// ``option `abbrev' expects a numerical value`` at exit 129 — which fires for an
+/// empty value and for anything `strtol()` cannot consume in full (so `0x10` stops
+/// at `x` and is rejected, and a lone tab has no digits at all).
+///
+/// The value itself is C's, quirks included: `strtol` saturates at `LONG_MAX`, the
+/// result is stored into an `int`, and only *then* is a non-zero value below
+/// `MINIMUM_ABBREV` raised to it. That is why `--abbrev=-1` and
+/// `--abbrev=99999999999999999999999999` both mean 4 — the latter truncates to `-1`
+/// — while `--abbrev=999999999` survives whole and later prints the full hash.
+fn parse_abbrev_cb(arg: &str) -> Result<usize, &'static str> {
+    const ERR: &str = "option `abbrev' expects a numerical value";
+    if arg.is_empty() {
+        return Err(ERR);
+    }
+    // `strtol`: optional leading whitespace, optional sign, then base-10 digits.
+    let rest = arg.trim_start_matches(|c: char| c.is_ascii_whitespace());
+    let (sign, digits) = match rest.strip_prefix('-') {
+        Some(d) => (-1i64, d),
+        None => (1i64, rest.strip_prefix('+').unwrap_or(rest)),
+    };
+    let consumed: String = digits.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if consumed.is_empty() || consumed.len() != digits.len() {
+        return Err(ERR);
+    }
+    // Overflow saturates at `LONG_MIN`/`LONG_MAX` the way `strtol` does, then
+    // narrows the way the `int v` it is assigned to does.
+    let magnitude = consumed.parse::<i64>();
+    let wide = match (sign, magnitude) {
+        (-1, Ok(m)) => -m,
+        (_, Ok(m)) => m,
+        (-1, Err(_)) => i64::MIN,
+        (_, Err(_)) => i64::MAX,
+    };
+    let mut v = wide as i32;
+    if v != 0 && v < MINIMUM_ABBREV as i32 {
+        v = MINIMUM_ABBREV as i32;
+    }
+    Ok(v as usize)
 }
 
 /// Why a `-L` spec could not be turned into a range.
@@ -3793,6 +3870,38 @@ mod tests {
             Err(LineSpecError::Usage) => panic!("expected a fatal, got a usage error"),
             Err(LineSpecError::Unimplementable(w)) => panic!("expected a fatal, got {w}"),
             Ok(r) => panic!("expected a fatal, got {r:?}"),
+        }
+    }
+
+    /// `--abbrev=<v>`, whose value parser is C's `strtol` plus one clamp and so
+    /// answers several plausible values counter-intuitively.
+    ///
+    /// Every expectation was read off stock git 2.55.0, not off `parse-options-cb.c`:
+    /// each value was run as `git blame --abbrev=<v> README.md` against a repository
+    /// whose sole commit is a boundary commit, and the width was counted from the
+    /// hex digits printed after the `^` marker (which spends one column of the
+    /// budget). Rejections were read from the exit code and the `error:` line.
+    #[test]
+    fn abbrev_callback_matches_git() {
+        // Accepted, used as given once the `MINIMUM_ABBREV` floor is applied.
+        assert_eq!(parse_abbrev_cb("8"), Ok(8));
+        assert_eq!(parse_abbrev_cb("40"), Ok(40));
+        assert_eq!(parse_abbrev_cb("999999999"), Ok(999999999));
+        // `0` is "no abbreviation", and is the one value the floor lets through.
+        assert_eq!(parse_abbrev_cb("0"), Ok(0));
+        // The floor is applied *after* the read, so a below-minimum or negative
+        // value becomes 4 rather than being rejected: stock prints 4 hex digits for
+        // both of these.
+        assert_eq!(parse_abbrev_cb("1"), Ok(4));
+        assert_eq!(parse_abbrev_cb("-1"), Ok(4));
+        // `strtol` saturates at `LONG_MAX`, which truncates to -1 in the `int` the
+        // callback stores it in, which the floor then raises to 4. Stock agrees: it
+        // prints 4 digits for this, not the full hash.
+        assert_eq!(parse_abbrev_cb("99999999999999999999999999"), Ok(4));
+        // Rejected: nothing at all, or anything `strtol` cannot consume whole —
+        // `0x10` stops at `x`, and a lone tab never reaches a digit.
+        for bad in ["", "abc", "true", "false", "v1", "=", "%H%n", "\t", "0x10", "8x"] {
+            assert!(parse_abbrev_cb(bad).is_err(), "{bad:?} should be rejected");
         }
     }
 

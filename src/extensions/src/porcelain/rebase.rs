@@ -2987,12 +2987,13 @@ impl<'r> Sequencer<'r> {
         if !self.st.quiet {
             eprintln!("Executing: {command}");
         }
-        let status = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(&command)
-            .env_remove("GIT_CHERRY_PICK_HELP")
-            .status()
-            .map_err(|e| anyhow!("cannot run 'sh -c': {e}"))?;
+        // `cmd.use_shell = 1; strvec_push(&cmd.args, command_line);` — a
+        // one-element argv, so `prepare_shell_cmd` takes the no-`"$@"` branch.
+        let status =
+            crate::external::prepare_shell_cmd_str(&command, crate::external::NO_ARGS)
+                .env_remove("GIT_CHERRY_PICK_HELP")
+                .status()
+                .map_err(|e| anyhow!("cannot run '{command}': {e}"))?;
         self.refresh_index()?;
         let (unstaged, staged, _) = dirty_state(self.repo)?;
         let dirty = unstaged || staged;

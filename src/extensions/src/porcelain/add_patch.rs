@@ -747,13 +747,12 @@ fn run_git_in_index(
     Ok((status.success(), out))
 }
 
-/// Run `command` through `sh -c`, feeding it `input` and capturing its stdout —
-/// git's `use_shell` child for `interactive.diffFilter`. `None` on spawn/IO
-/// failure (the exit status is ignored, as git's `pipe_command` ignores it here).
+/// Run `command`, feeding it `input` and capturing its stdout — git's
+/// `use_shell` child for `interactive.diffFilter` (`filter_cp.use_shell = 1`
+/// with the filter string as the whole argv). `None` on spawn/IO failure (the
+/// exit status is ignored, as git's `pipe_command` ignores it here).
 fn run_shell(command: &str, input: &[u8]) -> Option<Vec<u8>> {
-    let mut child = Command::new("sh")
-        .arg("-c")
-        .arg(command)
+    let mut child = crate::external::prepare_shell_cmd_str(command, crate::external::NO_ARGS)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
@@ -1727,12 +1726,7 @@ fn launch_editor(repo: &gix::Repository, path: &std::path::Path) -> Result<()> {
     if editor == ":" {
         return Ok(());
     }
-    let status = Command::new("sh")
-        .arg("-c")
-        .arg(format!("{editor} \"$@\""))
-        .arg(&editor)
-        .arg(path)
-        .status()?;
+    let status = crate::external::prepare_shell_cmd_str(&editor, [path]).status()?;
     if !status.success() {
         crate::git_fatal!("There was a problem with the editor '{editor}'.");
     }
@@ -2017,8 +2011,8 @@ fn page_bytes(repo: &gix::Repository, data: &[u8]) {
         let _ = std::io::stdout().write_all(data);
         return;
     }
-    let mut cmd = Command::new("sh");
-    cmd.arg("-c").arg(&program).stdin(Stdio::piped());
+    let mut cmd = crate::external::prepare_shell_cmd_str(&program, crate::external::NO_ARGS);
+    cmd.stdin(Stdio::piped());
     if std::env::var_os("LESS").is_none() {
         cmd.env("LESS", "FRX");
     }

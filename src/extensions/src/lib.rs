@@ -29,6 +29,7 @@ pub mod porcelain;
 pub mod progress;
 pub mod rcache;
 pub mod revfilter;
+pub mod sequencer;
 pub mod shallow_serve;
 pub mod sigpipe;
 pub mod superset;

@@ -551,7 +551,9 @@ merge_tool_path="$5"
 GIT_PREFIX="${GIT_PREFIX:-.}"
 export GIT_PREFIX
 eval "$6""#;
-    let status = Command::new("sh")
+    // `git-mergetool.sh` runs under `#!@SHELL_PATH@`, so this transcription of
+    // its body runs under the same interpreter.
+    let status = crate::external::shell()
         .arg("-c")
         .arg(SCRIPT)
         .arg("sh")

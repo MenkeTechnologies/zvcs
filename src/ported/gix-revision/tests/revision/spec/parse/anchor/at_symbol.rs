@@ -1,5 +1,32 @@
 use crate::spec::parse::{parse, try_parse};
 
+/// Epoch seconds right now, the reference `approxidate()` resolves a relative date against.
+fn seconds_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock is after the unix epoch")
+        .as_secs() as i64
+}
+
+/// Assert that a recorded `<seconds> +0000` reflog date is `now - shift`, where `now` is pinned by
+/// bracketing the clock around the `parse()` call rather than by a tolerance.
+///
+/// `approxidate()` computes relative dates by subtracting from the epoch value of `now`, so
+/// `shift` is exact across DST transitions.
+fn assert_reflog_date_is_now_minus(entry: Option<&String>, before: i64, after: i64, shift: i64, spec: &str) {
+    let entry = entry.unwrap_or_else(|| panic!("{spec}: a reflog date lookup should have been recorded"));
+    let (seconds, offset) = entry
+        .split_once(' ')
+        .unwrap_or_else(|| panic!("{spec}: recorded as `<seconds> <offset>`, got {entry:?}"));
+    assert_eq!(offset, "+0000", "{spec}: approxidate yields a UTC instant");
+    let seconds: i64 = seconds.parse().expect("the recorded timestamp is a number");
+    let window = (before - shift)..=(after - shift);
+    assert!(
+        window.contains(&seconds),
+        "{spec}: expected now-{shift}s, i.e. within {window:?}, got {seconds}"
+    );
+}
+
 #[test]
 fn braces_must_be_closed() {
     for unclosed_spec in ["@{something", "@{", "@{..@"] {
@@ -36,16 +63,29 @@ fn reflog_by_entry_for_current_branch() {
 
 #[test]
 fn reflog_by_date_for_current_branch() {
-    let rec = parse("@{42 +0030}");
+    // `object-name.c:780` runs the selector through `approxidate_careful()`. Expectations below
+    // are what stock git 2.55.0 answered for the same strings:
+    //   TZ=UTC GIT_TEST_DATE_NOW=1698400800 git rev-parse --since=<sel>
+    //     "42 +0030"   -> --max-age=1698400800   (== now, i.e. shift 0)
+    //     "2.days.ago" -> --max-age=1698228000   (== now - 172800)
+    //     "2 days ago" -> --max-age=1698228000
+    // `42 +0030` reads as a raw commit-header date to a format-list parser, but approxidate is a
+    // tokenizer: `42` is neither a day-of-month nor a year, and `+0030` is zero-padded past two
+    // digits so `approxidate_digit()` discards it. Nothing is left, and the answer is `now`.
+    for (spec, shift) in [("@{42 +0030}", 0), ("@{2.days.ago}", 2 * 86_400), ("@{2 days ago}", 2 * 86_400)] {
+        let before = seconds_now();
+        let rec = parse(spec);
+        let after = seconds_now();
 
-    assert!(rec.kind.is_none());
-    assert_eq!(rec.find_ref[0], None);
-    assert_eq!(
-        rec.prefix[0], None,
-        "neither ref nor prefixes are set, straight to navigation"
-    );
-    assert_eq!(rec.current_branch_reflog_entry[0], Some("42 +0030".to_string()));
-    assert_eq!(rec.calls, 1);
+        assert!(rec.kind.is_none());
+        assert_eq!(rec.find_ref[0], None);
+        assert_eq!(
+            rec.prefix[0], None,
+            "neither ref nor prefixes are set, straight to navigation"
+        );
+        assert_reflog_date_is_now_minus(rec.current_branch_reflog_entry[0].as_ref(), before, after, shift, spec);
+        assert_eq!(rec.calls, 1);
+    }
 }
 
 #[test]
@@ -94,17 +134,24 @@ fn reflog_by_date_for_hash_is_invalid() {
 
 #[test]
 fn reflog_by_date_for_given_ref_name() {
-    for (spec, expected_ref) in [
-        ("main@{42 +0030}", "main"),
-        ("refs/heads/other@{42 +0030}", "refs/heads/other"),
-        ("refs/worktree/feature/a@{42 +0030}", "refs/worktree/feature/a"),
+    // Same `approxidate_careful()` rule as above (`object-name.c:780`), just behind a ref name.
+    // Stock git 2.55.0, TZ=UTC GIT_TEST_DATE_NOW=1698400800:
+    //   git rev-parse --since="42 +0030"   -> --max-age=1698400800  (== now)
+    //   git rev-parse --since="2.days.ago" -> --max-age=1698228000  (== now - 172800)
+    for (spec, expected_ref, shift) in [
+        ("main@{42 +0030}", "main", 0),
+        ("refs/heads/other@{42 +0030}", "refs/heads/other", 0),
+        ("refs/worktree/feature/a@{42 +0030}", "refs/worktree/feature/a", 0),
+        ("main@{2.days.ago}", "main", 2 * 86_400),
     ] {
+        let before = seconds_now();
         let rec = parse(spec);
+        let after = seconds_now();
 
         assert!(rec.kind.is_none());
         assert_eq!(rec.get_ref(0), expected_ref);
         assert_eq!(rec.prefix[0], None);
-        assert_eq!(rec.current_branch_reflog_entry[0], Some("42 +0030".to_string()));
+        assert_reflog_date_is_now_minus(rec.current_branch_reflog_entry[0].as_ref(), before, after, shift, spec);
         assert_eq!(rec.calls, 2, "first the ref, then the reflog entry");
     }
 }

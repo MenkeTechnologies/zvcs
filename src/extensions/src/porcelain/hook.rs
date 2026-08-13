@@ -40,6 +40,7 @@
 use anyhow::{bail, Result};
 use std::collections::BTreeMap;
 use std::io::Write;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
@@ -374,7 +375,14 @@ fn run(args: &[String]) -> Result<ExitCode> {
     // Hooks inherit stderr, and their stdout is pointed at it too.
     let stderr = stderr_dup()?;
     let mut rc: i32 = 0;
-    for cmd in &commands {
+    for (idx, cmd) in commands.iter().enumerate() {
+        // `pick_next_hook` (hook.c:611-622) runs the two kinds differently: a
+        // `HOOK_CONFIGURED` command is a config one-liner and gets
+        // `cp->use_shell = true`, while a `HOOK_TRADITIONAL` hook is a *path* and
+        // is pushed as argv[0] with no shell — so a hooks directory whose name
+        // contains a space still runs. `commands` is built configured-first with
+        // the hookdir script appended last, so the index tells them apart.
+        let traditional = idx >= configured_count;
         let stdin = match &to_stdin {
             Some(path) => match std::fs::File::open(path) {
                 Ok(f) => Stdio::from(f),
@@ -388,7 +396,13 @@ fn run(args: &[String]) -> Result<ExitCode> {
             },
             None => Stdio::null(),
         };
-        let mut child = shell_command(cmd, &hook_args)?;
+        let mut child = if traditional {
+            let mut c = Command::new(std::ffi::OsStr::from_bytes(cmd));
+            c.args(&hook_args);
+            c
+        } else {
+            shell_command(cmd, &hook_args)
+        };
         child
             .stdin(stdin)
             .stdout(Stdio::from(stderr.try_clone()?))
@@ -620,29 +634,12 @@ fn display_path(path: &Path) -> String {
     shown.strip_prefix("./").unwrap_or(&shown).to_owned()
 }
 
-/// Build the child process for one hook command, reproducing git's
-/// `prepare_shell_cmd`.
-///
-/// A command containing any shell metacharacter runs under `/bin/sh -c`, with
-/// ` "$@"` appended only when there are hook arguments to pass, and the command
-/// itself repeated as `$0`. Anything else is executed directly.
-fn shell_command(command: &[u8], args: &[String]) -> Result<Command> {
-    const META: &[u8] = b"|&;<>()$`\\\"' \t\n*?[#~=%";
-
-    let cmd = command.to_os_str()?;
-    if !command.iter().any(|b| META.contains(b)) {
-        let mut c = Command::new(cmd);
-        c.args(args);
-        return Ok(c);
-    }
-
-    let mut script = command.to_vec();
-    if !args.is_empty() {
-        script.extend_from_slice(b" \"$@\"");
-    }
-    let mut c = Command::new("/bin/sh");
-    c.arg("-c").arg(script.to_os_str()?).arg(cmd).args(args);
-    Ok(c)
+/// Build the child process for one `HOOK_CONFIGURED` hook command — git's
+/// `prepare_shell_cmd`, reached through `cp->use_shell = true` "to enable
+/// oneliners" (hook.c:615). A hook command need not be valid UTF-8, so its bytes
+/// go through unconverted.
+fn shell_command(command: &[u8], args: &[String]) -> Command {
+    crate::external::prepare_shell_cmd(std::ffi::OsStr::from_bytes(command), args)
 }
 
 /// The bare strerror text of an I/O error, without Rust's ` (os error N)` tail,

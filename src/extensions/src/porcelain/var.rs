@@ -230,8 +230,13 @@ fn ident(cfg: &ConfigFile, role: &str) -> Result<String> {
 
     let date_var = format!("GIT_{role}_DATE");
     let time = match env(&date_var) {
-        Some(raw) => gix::date::parse(&raw, Some(std::time::SystemTime::now()))
-            .map_err(|e| anyhow::anyhow!("invalid date in {date_var}: {e}"))?,
+        // `ident.c:534` parses `GIT_AUTHOR_DATE`/`GIT_COMMITTER_DATE` with `parse_date()`, which
+        // is `parse_date_basic()` — approxidate is not in this path, so a relative date is an
+        // error here even though `commit --date=` would accept it.
+        Some(raw) => match crate::date::parse_date_basic(&raw) {
+            Some(time) => time,
+            None => crate::git_fatal!("invalid date format: {raw}"),
+        },
         None => gix::date::Time::now_local_or_utc(),
     };
 

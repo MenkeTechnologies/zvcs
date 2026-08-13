@@ -736,7 +736,7 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
             set_orig_head(&repo, prev.detach())?;
         }
         move_head(&repo, target_commit, reflog_spec)?;
-        remove_branch_state(repo.git_dir());
+        remove_branch_state(&repo);
         super::checkout::maybe_recurse_submodules(&repo, recurse_submodules, true)?;
         // No `HEAD is now at` here: `cmd_reset()` gates `print_new_head_line()`
         // on `reset_type == HARD`, so `--merge` and `--keep` move the branch in
@@ -751,7 +751,7 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
         set_orig_head(&repo, prev.detach())?;
     }
     move_head(&repo, target_commit, reflog_spec)?;
-    remove_branch_state(repo.git_dir());
+    remove_branch_state(&repo);
 
     match mode {
         ResetMode::Soft => {}
@@ -820,21 +820,21 @@ fn set_orig_head(repo: &gix::Repository, id: ObjectId) -> Result<()> {
     Ok(())
 }
 
-/// The state files `remove_branch_state()` (branch.c) unlinks after a whole-tree reset.
-fn remove_branch_state(git_dir: &std::path::Path) {
-    for name in [
-        "MERGE_HEAD",
-        "MERGE_RR",
-        "MERGE_MSG",
-        "MERGE_MODE",
-        "AUTO_MERGE",
-        "SQUASH_MSG",
-        "CHERRY_PICK_HEAD",
-        "REVERT_HEAD",
-    ] {
+/// The state files `remove_branch_state()` (branch.c) unlinks after a whole-tree
+/// reset.
+///
+/// `remove_branch_state()` opens with `sequencer_post_commit_cleanup()`, which
+/// drops the pseudo-refs but takes `.git/sequencer` **only** when a pick was in
+/// progress *and* `have_finished_the_last_pick()` — a todo list of one line.
+/// Removing it unconditionally would break `git cherry-pick --skip`, which is
+/// `git reset --merge HEAD` followed by resuming the very todo list this would
+/// have deleted.
+fn remove_branch_state(repo: &gix::Repository) {
+    let git_dir = repo.git_dir();
+    let _ = crate::sequencer::post_commit_cleanup(repo);
+    for name in ["MERGE_HEAD", "MERGE_RR", "MERGE_MSG", "MERGE_MODE", "SQUASH_MSG"] {
         let _ = std::fs::remove_file(git_dir.join(name));
     }
-    let _ = std::fs::remove_dir_all(git_dir.join("sequencer"));
 }
 
 /// `REFRESH_INDEX_DELAY_WARNING_IN_MS` (builtin/reset.c): two seconds.
@@ -1156,7 +1156,18 @@ fn reset_two_tree(
     } else {
         HashMap::new()
     };
-    let index = index_entry_map(old);
+    // `repo_read_index_unmerged()`, which `reset_index()` runs before
+    // `unpack_trees()`: every unmerged path collapses to a single stage-0 entry
+    // carrying a null object id and the `CE_CONFLICTED` flag. The null id is
+    // what makes it compare unequal to the target, and the flag is what makes
+    // `merged_entry()`/`deleted_entry()` skip `verify_uptodate()` for it — which
+    // is why `git reset --merge` succeeds over a conflicted index while the same
+    // worktree state would abort a clean one.
+    let mut index = index_entry_map(old);
+    let unmerged = unmerged_paths(old);
+    for (path, mode) in &unmerged {
+        index.insert(path.clone(), (*mode, ObjectId::null(repo.object_hash())));
+    }
 
     let mut all: BTreeSet<BString> = BTreeSet::new();
     all.extend(index.keys().cloned());
@@ -1178,10 +1189,14 @@ fn reset_two_tree(
         } else {
             classify_merge(t, i)
         };
+        // The `CE_CONFLICTED` marker `read_index_unmerged()` left behind: git
+        // skips the uptodate check for it outright, so the half-merged worktree
+        // file is overwritten rather than protected.
+        let conflicted = unmerged.contains_key(path);
         match act {
             Act::Keep => {}
             Act::Delete => {
-                if worktree_uptodate(repo, BStr::new(path), i.map(|(_, o)| *o)) {
+                if conflicted || worktree_uptodate(repo, BStr::new(path), i.map(|(_, o)| *o)) {
                     deletes.push(path.clone());
                 } else {
                     conflicts.insert((path.clone(), "not uptodate"));
@@ -1189,10 +1204,11 @@ fn reset_two_tree(
             }
             Act::Update => {
                 let (tm, to) = *t.expect("update implies a target entry");
-                let clean = match i {
-                    Some((_, io)) => worktree_uptodate(repo, BStr::new(path), Some(*io)),
-                    None => worktree_absent_or_matches(repo, BStr::new(path), to),
-                };
+                let clean = conflicted
+                    || match i {
+                        Some((_, io)) => worktree_uptodate(repo, BStr::new(path), Some(*io)),
+                        None => worktree_absent_or_matches(repo, BStr::new(path), to),
+                    };
                 if clean {
                     updates.push((path.clone(), tm, to));
                 } else {
@@ -1223,7 +1239,12 @@ fn reset_two_tree(
         .map(|(p, _, _)| p.clone())
         .chain(deletes.iter().cloned())
         .collect();
-    new_index.remove_entries(|_, path, _| changed.contains(path));
+    // Stage 1/2/3 entries never survive: `read_index_unmerged()` already
+    // replaced them with the marker that has just been resolved one way or the
+    // other, so the result is a stage-0-only index either way.
+    new_index.remove_entries(|_, path, entry| {
+        changed.contains(path) || entry.stage_raw() != 0
+    });
     for (p, mode, oid) in &updates {
         new_index.dangerously_push_entry(Stat::default(), *oid, Flags::empty(), *mode, BStr::new(p));
     }
@@ -1292,6 +1313,19 @@ fn tree_map(repo: &gix::Repository, tree: ObjectId) -> Result<HashMap<BString, (
 }
 
 /// The stage-0 entries of `index` as `path -> (mode, oid)`.
+/// The paths `repo_read_index_unmerged()` collapses, with the mode it keeps for
+/// each — git copies `ce_mode` from the last stage it walks, so the highest
+/// stage present wins.
+fn unmerged_paths(index: &gix::index::File) -> HashMap<BString, Mode> {
+    let backing = index.path_backing();
+    index
+        .entries()
+        .iter()
+        .filter(|e| e.stage_raw() != 0)
+        .map(|e| (e.path_in(backing).to_owned(), e.mode))
+        .collect()
+}
+
 fn index_entry_map(index: &gix::index::File) -> HashMap<BString, (Mode, ObjectId)> {
     let backing = index.path_backing();
     index

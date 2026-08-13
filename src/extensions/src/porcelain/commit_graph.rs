@@ -496,7 +496,8 @@ fn write_graph(args: &[String], inherited_object_dir: Option<String>) -> Result<
                 let Some(v) = args.get(i) else {
                     return Ok(missing_value("expire-time"));
                 };
-                if gix::date::parse(v, Some(std::time::SystemTime::now())).is_err() {
+                // `OPT_EXPIRY_DATE` (parse-options-cb.c:45) is `parse_expiry_date()`.
+                if crate::date::parse_expiry_date(v).is_none() {
                     return Ok(fatal(&format!("malformed expiration date '{v}'")));
                 }
             }
@@ -534,7 +535,8 @@ fn write_graph(args: &[String], inherited_object_dir: Option<String>) -> Result<
             }
             s if long_value(s, "expire-time").is_some() => {
                 let v = long_value(s, "expire-time").unwrap_or_default();
-                if gix::date::parse(v, Some(std::time::SystemTime::now())).is_err() {
+                // `OPT_EXPIRY_DATE` (parse-options-cb.c:45) is `parse_expiry_date()`.
+                if crate::date::parse_expiry_date(v).is_none() {
                     return Ok(fatal(&format!("malformed expiration date '{v}'")));
                 }
             }

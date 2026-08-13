@@ -1317,14 +1317,12 @@ pub(crate) fn launch_sequence_editor(repo: &gix::Repository, path: &std::path::P
         .or_else(|| env("VISUAL"))
         .or_else(|| env("EDITOR"))
         .unwrap_or_else(|| "vi".to_string());
-    // `:` is git's documented no-op editor and must not be shelled out to with
-    // the file as an argument, or it would silently succeed anyway; running it
-    // through the shell does the right thing either way.
-    let status = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(format!("{editor} \"$@\""))
-        .arg(&editor)
-        .arg(path)
+    // `if (strcmp(editor, ":"))` (editor.c:66): git's documented no-op editor is
+    // recognised before any child is built, leaving the todo list untouched.
+    if editor == ":" {
+        return Ok(());
+    }
+    let status = crate::external::prepare_shell_cmd_str(&editor, [path])
         .status()
         .map_err(|e| anyhow!("cannot run editor '{editor}': {e}"))?;
     if !status.success() {

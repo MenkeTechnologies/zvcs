@@ -549,12 +549,23 @@ where
                     .raise())
                 }?;
             } else if has_ref_or_implied_name {
+                // `object-name.c:780`: `<ref>@{<date>}` goes through `approxidate_careful()`, not
+                // a format list, so `HEAD@{2.days.ago}` reads the same as `HEAD@{2 days ago}` and
+                // `@{42 +0030}` is *not* a raw header — approxidate finds nothing usable in it and
+                // answers `now`. Only a selector with no date-like token at all is an error; that
+                // is git's `error_ret`.
                 let time = nav
                     .to_str()
                     .map_err(|_| Error::new_with_input("could not parse time for reflog lookup", nav))
                     .and_then(|date| {
-                        gix_date::parse(date, Some(SystemTime::now()))
-                            .map_err(|_| Error::new_with_input("could not parse time for reflog lookup", nav))
+                        let now = SystemTime::now()
+                            .duration_since(SystemTime::UNIX_EPOCH)
+                            .map(|d| d.as_secs() as i64)
+                            .unwrap_or_default();
+                        match gix_date::parse::approxidate_careful(date, now) {
+                            (seconds, false) => Ok(gix_date::Time::new(seconds, 0)),
+                            (_, true) => Err(Error::new_with_input("could not parse time for reflog lookup", nav)),
+                        }
                     })?;
                 let lookup = delegate::ReflogLookup::Date(time);
                 delegate

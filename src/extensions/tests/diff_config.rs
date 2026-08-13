@@ -122,23 +122,27 @@ fn diff_algorithm_invalid_value_errors() {
 }
 
 #[test]
-fn diff_algorithm_patience_bails_but_flag_overrides() {
+fn diff_algorithm_patience_renders_and_flag_overrides() {
     let (repo, home) = fixture("algopat");
     git(&repo, &["config", "diff.algorithm", "patience"]);
 
-    // `patience` is git-valid but has no imara-diff equivalent, so an unqualified
-    // run bails rather than faking myers/histogram output. This also proves the
-    // config is actually consumed by the algorithm selection.
+    // `patience` used to bail — imara-diff had no equivalent, so the honest answer
+    // was a refusal rather than myers output wearing patience's name. `xpatience.c`
+    // is ported now (`gix-imara-diff`'s `patience` module), so the config renders.
+    // The expected text is stock git 2.55.0's, captured from this same fixture:
+    //   git -c diff.algorithm=patience diff
     let o = diff(&repo, &home, &[]);
-    assert!(!o.status.success(), "patience default must bail");
-    let err = String::from_utf8_lossy(&o.stderr);
-    assert!(
-        err.contains("diff algorithm \"patience\" is not available"),
-        "stderr: {err}"
-    );
+    assert!(o.status.success(), "stderr: {}", String::from_utf8_lossy(&o.stderr));
+    let patch = out(&o);
+    assert!(patch.contains("@@ -2,7 +2,7 @@ l1\n"), "patience hunk header:\n{patch}");
+    assert!(patch.contains("\n-l5\n+CHANGED\n"), "patience body:\n{patch}");
 
-    // An overriding `--diff-algorithm=` flag is honored, matching git's precedence
-    // (git renders patience; a flag makes both agree).
+    // The config is genuinely consumed rather than ignored: asking for the same
+    // algorithm explicitly must produce the identical patch.
+    let explicit = diff(&repo, &home, &["--diff-algorithm=patience"]);
+    assert_eq!(out(&explicit), patch, "config and flag must select the same algorithm");
+
+    // An overriding `--diff-algorithm=` flag still wins, matching git's precedence.
     let ok = diff(&repo, &home, &["--diff-algorithm=histogram"]);
     assert!(ok.status.success(), "flag must override patience config");
     assert!(out(&ok).contains("@@ "), "override must emit a patch");

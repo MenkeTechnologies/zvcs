@@ -1113,12 +1113,12 @@ fn edit_config(target: &WriteTarget) -> Result<ExitCode> {
         std::fs::File::create(&target.path)?;
     }
 
-    let status = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(format!("{editor} \"$@\"", editor = editor))
-        .arg(editor)
-        .arg(&target.path)
-        .status()?;
+    // `if (strcmp(editor, ":"))` (editor.c:66): the no-op editor spawns nothing.
+    if editor == ":" {
+        return Ok(ExitCode::SUCCESS);
+    }
+    let status =
+        crate::external::prepare_shell_cmd_str(&editor, [&target.path]).status()?;
     Ok(match status.code() {
         Some(0) | None => ExitCode::SUCCESS,
         Some(code) => ExitCode::from(code as u8),

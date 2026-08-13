@@ -130,7 +130,7 @@ pub fn spawn_daemon_loop() {
 fn run_command(command: &str, e: &crate::db::EventRow) {
     let cwd = e.workdir.clone().unwrap_or_else(|| ".".into());
     let repo = e.workdir.as_deref().or(e.git_dir.as_deref()).unwrap_or("");
-    if let Ok(child) = std::process::Command::new("sh")
+    if let Ok(child) = crate::external::shell()
         .arg("-c")
         .arg(command)
         .current_dir(&cwd)

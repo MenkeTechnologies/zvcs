@@ -766,7 +766,8 @@ impl<'repo> Textconv<'repo> {
         let dir = temp_blob_dir()?;
         let file = self.prep_temp_blob(&dir, path, blob)?;
 
-        let output = shell_command(program).arg(&file).output();
+        let output =
+            crate::external::prepare_shell_cmd_str(program, [&file]).output();
         let _ = std::fs::remove_dir_all(&dir);
 
         match output {
@@ -826,23 +827,6 @@ pub(crate) fn diff_driver_config(
         }
     }
     winner
-}
-
-/// `run_textconv()` and `run_external_diff()` both build their child with
-/// `use_shell`, so git's `prepare_shell_cmd()` decides the shape: a command
-/// carrying any shell metacharacter is run as `sh -c '<cmd> "$@"' <cmd> <args…>`,
-/// and a bare program name is executed directly with the arguments appended.
-/// Callers push the arguments; both call sites always have at least one, so the
-/// argument-less `sh -c '<cmd>'` branch is unreachable here.
-pub(crate) fn shell_command(program: &str) -> std::process::Command {
-    const SHELL_META: &[u8] = b"|&;<>()$`\\\"' \t\n*?[#~=%";
-    if program.bytes().any(|b| SHELL_META.contains(&b)) {
-        let mut cmd = std::process::Command::new("/bin/sh");
-        cmd.arg("-c").arg(format!("{program} \"$@\"")).arg(program);
-        cmd
-    } else {
-        std::process::Command::new(program)
-    }
 }
 
 /// `mks_tempfile_ts()`'s directory: a fresh `git-blob-XXXXXX` under `TMPDIR`, so

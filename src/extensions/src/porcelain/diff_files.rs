@@ -812,6 +812,13 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed, Fatal> {
     let mut quiet = false;
     let mut paths: Vec<BString> = Vec::new();
     let mut unsupported: Option<String> = None;
+    // `setup_revisions()` does not reject an option it does not know: it hands it
+    // back in the leftover argv, and only once the whole line has been walked does
+    // `cmd_diff_files()`'s `while (1 < argc && argv[1][0] == '-')` loop reach it and
+    // call `usage(diff_files_usage)`. So an unknown flag loses to anything the rest
+    // of the line dies on — `git diff-files --bogus-flag README.md -not-a-flag`
+    // reports the trailing `-not-a-flag` (128), not the bogus flag (129).
+    let mut unknown: Option<String> = None;
     let mut after_dashdash = false;
     // `setup_revisions()` records the first pathspec; from then on any dashed
     // option is rejected before it is even classified.
@@ -872,7 +879,11 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed, Fatal> {
                         unsupported = Some(s.to_owned());
                     }
                 }
-                Flag::Unknown => return Err(Fatal::Usage),
+                Flag::Unknown => {
+                    if unknown.is_none() {
+                        unknown = Some(s.to_owned());
+                    }
+                }
             }
             // `OPT_BITOP`: a positive output-format flag clears `NO_OUTPUT`, so a
             // later `--raw`/`-p`/`--stat` re-enables output after an earlier `-s`.
@@ -918,6 +929,12 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed, Fatal> {
     // format, i.e. `-s` came after them with nothing re-enabling output.
     if opts.fmt & F_NO_OUTPUT != 0 && opts.fmt & (F_NAME | F_NAME_STATUS | F_CHECKDIFF) != 0 {
         return Err(Fatal::NameStatusNoPatch);
+    }
+    // `setup_revisions()` has now finished (its closing `diff_setup_done()` is the
+    // check just above), so this is where `cmd_diff_files()` walks the leftover argv
+    // and answers the first unrecognized option with its usage text.
+    if unknown.is_some() {
+        return Err(Fatal::Usage);
     }
     if quiet {
         // `--quiet` wins over every other format and turns on the exit status.
@@ -1624,7 +1641,13 @@ fn run(repo: &gix::Repository, opts: Opts, paths: Vec<BString>) -> Result<ExitCo
     // Rotation runs before `--relative` strips anything: `git diff-files
     // --relative=src --rotate-to=src/lib.rs` succeeds while `--rotate-to=lib.rs`
     // fails, so the anchor always names the repository-root relative path.
+    //
+    // `diffcore_rotate()` opens with `if (!q->nr) return;`, so an empty diff is not
+    // a missing path: `git diff-files --skip-to=src/lib.rs` on a clean worktree
+    // prints nothing and exits 0 rather than dying, even though nothing in the diff
+    // is named `src/lib.rs`.
     match &opts.anchor {
+        _ if deltas.is_empty() && combined.is_empty() => {}
         None => {}
         Some(Anchor::Rotate(p)) => match deltas.iter().position(|d| &d.path == p) {
             Some(i) => deltas.rotate_left(i),

@@ -12,7 +12,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::process::{Command, ExitCode};
+use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Result};
@@ -99,7 +99,7 @@ pub fn spawn_scheduler() {
 /// Run one schedule's command detached, logging the fire to the daemon log.
 fn fire(s: &Sched) {
     log_line(&format!("[zsched] fire #{}: {}", s.id, s.command));
-    let _ = Command::new("sh")
+    let _ = crate::external::shell()
         .arg("-c")
         .arg(&s.command)
         .stdin(std::process::Stdio::null())
@@ -187,7 +187,7 @@ fn run_now(rest: &[String]) -> Result<ExitCode> {
         bail!("git zsched: no schedule #{id}");
     };
     println!("running #{id}: {}", s.command);
-    let status = Command::new("sh").arg("-c").arg(&s.command).status()?;
+    let status = crate::external::shell().arg("-c").arg(&s.command).status()?;
     Ok(if status.success() { ExitCode::SUCCESS } else { ExitCode::FAILURE })
 }
 

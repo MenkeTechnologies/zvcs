@@ -1122,45 +1122,22 @@ pub(super) fn too_many_packs(repo: &gix::Repository) -> bool {
 /// that resolves to the `never` sentinel (`0`). An unset value is not `never`,
 /// so the default is to run — matching `gc_config_is_timestamp_never()`.
 fn reflog_expire_enabled(repo: &gix::Repository) -> bool {
-    let now = SystemTime::now();
     let cfg = repo.config_snapshot();
     let is_never = |key: &str| {
         cfg.string(key)
             .and_then(|v| v.to_str().ok().map(str::to_owned))
-            .and_then(|v| parse_reflog_expiry(&v, now))
+            .and_then(|v| parse_reflog_expiry(&v))
             .is_some_and(|t| t == 0)
     };
     !(is_never("gc.reflogExpire") && is_never("gc.reflogExpireUnreachable"))
 }
 
-/// git's `parse_expiry_date` for a reflog cutoff: `never`/`false` are the `0`
-/// sentinel (never expire), `all`/`now` are `i64::MAX` (expire everything),
-/// `@<n>` is a raw epoch, and anything else is an approxidate resolved against
-/// `now`. A lighter approximation of [`super::prune`]'s approxidate handling:
-/// `.`/`,`/`_`/`/` split into words and a bare `<n> <unit>` is read as past.
-/// Unparseable values yield `None`, which callers treat as "unset".
-pub(super) fn parse_reflog_expiry(value: &str, now: SystemTime) -> Option<i64> {
-    let v = value.trim();
-    match v {
-        "" => return None,
-        "never" | "false" => return Some(0),
-        "all" | "now" => return Some(i64::MAX),
-        _ => {}
-    }
-    if let Some(rest) = v.strip_prefix('@') {
-        return rest.trim().parse::<i64>().ok();
-    }
-    let spaced: String = v
-        .chars()
-        .map(|c| if matches!(c, '.' | ',' | '_' | '/') { ' ' } else { c })
-        .collect();
-    let spaced = spaced.split_whitespace().collect::<Vec<_>>().join(" ");
-    for form in [v.to_owned(), spaced.clone(), format!("{spaced} ago")] {
-        if let Ok(t) = gix::date::parse(&form, Some(now)) {
-            return Some(t.seconds);
-        }
-    }
-    None
+/// git's `parse_expiry_date()` (date.c:957) for a reflog cutoff, through the one shared parser:
+/// `never`/`false` are the `0` sentinel (never expire), `all`/`now` are `i64::MAX` (expire
+/// everything), and anything else is an approxidate. An empty or unreadable value yields `None`,
+/// which callers treat as "unset".
+pub(super) fn parse_reflog_expiry(value: &str) -> Option<i64> {
+    crate::date::parse_expiry_date(value.trim())
 }
 
 /// A per-pattern `gc.<pattern>.reflog*` override; a missing slot falls back to
@@ -1203,7 +1180,7 @@ impl ReflogExpireConfig {
 /// forms. The built-in defaults match `REFLOG_EXPIRE_OPTIONS_INIT`: total is
 /// `now - 30 days`, unreachable is `now - 90 days` (verified against git 2.55.0,
 /// whose macro values differ from the historical documentation).
-pub(super) fn load_reflog_config(repo: &gix::Repository, now: SystemTime, now_secs: i64) -> ReflogExpireConfig {
+pub(super) fn load_reflog_config(repo: &gix::Repository, now_secs: i64) -> ReflogExpireConfig {
     let mut default_total = now_secs - 30 * 24 * 3600;
     let mut default_unreach = now_secs - 90 * 24 * 3600;
     let mut entries: Vec<ReflogEntryOpt> = Vec::new();
@@ -1217,11 +1194,11 @@ pub(super) fn load_reflog_config(repo: &gix::Repository, now: SystemTime, now_se
         // Last value wins, as git's config reader does.
         let mut total = None;
         for value in section.body().values("reflogExpire") {
-            total = parse_reflog_expiry(value.to_str_lossy().as_ref(), now);
+            total = parse_reflog_expiry(value.to_str_lossy().as_ref());
         }
         let mut unreach = None;
         for value in section.body().values("reflogExpireUnreachable") {
-            unreach = parse_reflog_expiry(value.to_str_lossy().as_ref(), now);
+            unreach = parse_reflog_expiry(value.to_str_lossy().as_ref());
         }
         match header.subsection_name() {
             None => {
@@ -1308,7 +1285,7 @@ enum ReflogKind {
 pub(super) fn expire_reflogs(repo: &gix::Repository) -> Result<()> {
     let now = SystemTime::now();
     let now_secs = now.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
-    let cfg = load_reflog_config(repo, now, now_secs);
+    let cfg = load_reflog_config(repo, now_secs);
 
     let logs_dir = repo.common_dir().join("logs");
     let mut files: Vec<(String, PathBuf)> = Vec::new();
@@ -1595,14 +1572,14 @@ pub(super) fn prune_worktrees(repo: &gix::Repository) -> Result<()> {
     // `gc.worktreePruneExpire` (default `3.months.ago`); an empty value disables
     // the step, matching git's `cfg.prune_worktrees_expire` guard.
     let default_expire =
-        parse_reflog_expiry("3.months.ago", now).unwrap_or(now_secs - 90 * 24 * 3600);
+        parse_reflog_expiry("3.months.ago").unwrap_or(now_secs - 90 * 24 * 3600);
     let expire = match repo.config_snapshot().string("gc.worktreePruneExpire") {
         Some(v) => {
             let raw = v.to_str_lossy().into_owned();
             if raw.is_empty() {
                 return Ok(());
             }
-            parse_reflog_expiry(&raw, now).unwrap_or(default_expire)
+            parse_reflog_expiry(&raw).unwrap_or(default_expire)
         }
         None => default_expire,
     };

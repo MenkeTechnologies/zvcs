@@ -3,7 +3,6 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use gix::bstr::ByteSlice;
 use gix::date::time::Format as TimeFormat;
@@ -582,13 +581,10 @@ fn note_first(slot: &mut Option<String>, what: String) {
     }
 }
 
-/// Resolve a `--since`/`--until` value to a unix instant the way git's approxidate
-/// does: parse it against the current time, and fall back to that same current
-/// time for anything unparseable — git never errors on a date limiter.
+/// Resolve a `--since`/`--until` value to a unix instant the way git's `approxidate()` does —
+/// through the one shared parser, which never errors on a date limiter.
 fn parse_limit_date(value: &str) -> i64 {
-    let now = SystemTime::now();
-    let now_secs = now.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
-    gix::date::parse(value, Some(now)).map_or(now_secs, |t| t.seconds)
+    crate::date::approxidate(value)
 }
 
 /// git pathspec match: an entry survives when at least one of its changed paths (a
@@ -936,7 +932,37 @@ fn show(repo: &gix::Repository, rest: &[String]) -> Result<ExitCode> {
             // Each of these was verified byte-identical to plain `git reflog`.
             "--first-parent" => opts.first_parent = true,
             "--walk-reflogs" | "-g" | "--single-worktree" | "--boundary"
-            | "--source" | "--color=never" | "--color=auto" | "--no-color" => {}
+            | "--source" | "--no-color" => {}
+
+            // `--color[=<when>]` is `OPT__COLOR`, whose `parse_opt_color_flag_cb()`
+            // (`parse-options-cb.c:50`) calls `git_config_colorbool(NULL, arg)`. With
+            // no variable name to fall back on, that accepts only `always`, `auto`
+            // and `never` (case-insensitively) — boolean spellings such as `true` are
+            // config values, not `--color` values — and anything else is the
+            // callback's `error()` followed by parse-options' exit 129. That is an
+            // immediate exit at this argument's position, so it beats every check
+            // deferred to the end of the scan, including the revision resolution the
+            // remaining arguments would otherwise reach.
+            s if s == "--color" || s.starts_with("--color=") => {
+                let when = s.strip_prefix("--color=");
+                match when {
+                    // A missing value is the option's `defval`, `always`.
+                    None => note_first(&mut unimplemented, a.to_owned()),
+                    Some(v) if v.eq_ignore_ascii_case("always") => {
+                        note_first(&mut unimplemented, a.to_owned());
+                    }
+                    // Both are "no color" for a non-terminal stdout, which is what
+                    // this renderer already produces.
+                    Some(v)
+                        if v.eq_ignore_ascii_case("never") || v.eq_ignore_ascii_case("auto") => {}
+                    Some(_) => {
+                        eprintln!(
+                            "error: option `color' expects \"always\", \"auto\", or \"never\""
+                        );
+                        return Ok(ExitCode::from(129));
+                    }
+                }
+            }
 
             // ---- recognized, deliberately unimplemented ---------------------
             // `log -p`'s renderer is shared, so the patch body is real output
@@ -948,7 +974,7 @@ fn show(repo: &gix::Repository, rest: &[String]) -> Result<ExitCode> {
                 opts.diff.stat = true;
                 opts.diff.patch = true;
             }
-            "--dirstat" | "--color" | "--color=always" => {
+            "--dirstat" => {
                 note_first(&mut unimplemented, a.to_owned());
             }
             // `--stat=<width>[,<name-width>[,<count>]]` needs `show_stats()`'s
@@ -1378,17 +1404,19 @@ fn resolve_spec(repo: &gix::Repository, spec: &str) -> Result<Resolved> {
             let Some(entries) = entries else {
                 return Ok(Resolved::Fatal(fatal_ambiguous(spec)));
             };
-            // git's `@{...}` accepts dots where approxidate wants spaces.
-            let normalized = text.replace('.', " ");
-            let Ok(target) = gix::date::parse(&normalized, Some(SystemTime::now())) else {
+            // `object-name.c:780`: approxidate reads the selector, and only a value with nothing
+            // date-like in it is ambiguous. Dots need no rewriting — approxidate tokenizes on
+            // every non-alphanumeric byte, so `2.days.ago` is native to it.
+            let (target, error) = crate::date::approxidate_careful(text);
+            if error {
                 return Ok(Resolved::Fatal(fatal_ambiguous(spec)));
-            };
+            }
 
             // Entries are newest-first; the answer is the newest one that was
             // already current at `target`.
             let start = entries
                 .iter()
-                .position(|e| e.time.seconds <= target.seconds)
+                .position(|e| e.time.seconds <= target)
                 .unwrap_or(entries.len());
             if start == entries.len() {
                 if let Some(oldest) = entries.last() {
@@ -3402,9 +3430,10 @@ fn expire_entries(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
         match value {
             "now" | "all" => Some(i64::MAX),
             "never" | "false" => Some(i64::MIN),
-            _ => gix::date::parse(value, Some(std::time::SystemTime::now()))
-                .ok()
-                .map(|t| t.seconds),
+            _ => {
+                let (timestamp, error) = crate::date::approxidate_careful(value);
+                (!error).then_some(timestamp)
+            }
         }
     };
     for a in args {

@@ -925,22 +925,9 @@ fn parse_pretty(arg: &str) -> Option<Option<String>> {
     None
 }
 
-/// git's `approxidate()` as far as this port needs it. git deliberately never
-/// fails here: anything it cannot read becomes "now".
-fn approxidate(value: &str) -> i64 {
-    let now = std::time::SystemTime::now();
-    let now_seconds = now
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    if value.trim() == "now" {
-        return now_seconds;
-    }
-    match gix::date::parse(value, Some(now)) {
-        Ok(time) => time.seconds,
-        Err(_) => now_seconds,
-    }
-}
+// git's `approxidate()`, which `--since`/`--until` reach through the revision machinery
+// (`revision.c:2383`). Shared with every other verb that takes a date argument.
+use crate::date::approxidate;
 
 /// git's `--glob`/`--branches`/`--tags`/`--remotes` ref expansion, including
 /// the implicit `/*` `for_each_glob_ref_in()` appends to a plain prefix.

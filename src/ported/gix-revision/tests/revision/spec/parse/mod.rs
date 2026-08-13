@@ -244,28 +244,42 @@ fn all_characters_are_taken_verbatim_which_includes_whitespace() {
 mod fuzz {
     use crate::spec::parse::{Options, try_parse_opts};
 
+    fn fuzzed(spec: &str) -> Result<super::Recorder, gix_error::Exn<gix_revision::spec::parse::Error>> {
+        try_parse_opts(
+            spec,
+            Options {
+                no_internal_assertions: true,
+                ..Default::default()
+            },
+        )
+    }
+
     #[test]
     fn failures() {
-        for spec in [
-            "@{6255520 day ago}: ",
-            "|^--",
-            "^^-^",
-            "^^-",
-            ":/!-",
-            "A6a^-09223372036854775808",
-            "^^^^^^-(",
-        ] {
-            drop(
-                try_parse_opts(
-                    spec,
-                    Options {
-                        no_internal_assertions: true,
-                        ..Default::default()
-                    },
-                )
-                .unwrap_err(),
-            );
+        for spec in ["|^--", "^^-^", "^^-", ":/!-", "A6a^-09223372036854775808", "^^^^^^-("] {
+            drop(fuzzed(spec).unwrap_err());
         }
+    }
+
+    /// Still a crash guard for the input the fuzzer found — it must not panic, hang, or overflow —
+    /// but the date half of it is valid, so the parse itself succeeds.
+    ///
+    /// `object-name.c:780` reads `@{...}` with `approxidate_careful()`, whose `error_ret` is set
+    /// only when the selector holds no date-like token at all; a digit run always clears it.
+    /// Stock git 2.55.0 agrees, and fails on the *path* rather than on the date:
+    ///
+    /// ```text
+    /// $ git rev-parse "HEAD@{6255520 day ago}: "
+    /// fatal: path ' ' does not exist in 'HEAD@{6255520 day ago}'
+    /// ```
+    #[test]
+    fn huge_relative_date_parses_and_fails_later() {
+        let rec = fuzzed("@{6255520 day ago}: ").expect("the date half is valid to approxidate");
+        assert!(
+            rec.current_branch_reflog_entry[0].is_some(),
+            "the reflog lookup was handed a resolved instant"
+        );
+        assert_eq!(rec.peel_to, vec![super::PeelToOwned::Path(" ".into())], "the path is left to the delegate");
     }
 }
 mod anchor;

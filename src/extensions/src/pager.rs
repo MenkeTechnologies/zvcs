@@ -14,7 +14,7 @@
 
 use std::io::{IsTerminal, Write};
 use std::os::unix::io::AsRawFd;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::Mutex;
 
 /// The subcommands git pages by default when stdout is a terminal — the read /
@@ -105,11 +105,13 @@ pub(crate) fn resolve_pager(cfg: Option<&gix::config::Snapshot<'_>>) -> String {
     "less".into()
 }
 
-/// Spawn the pager through the shell (so `core.pager = "less -S"` and pipelines
-/// work) and redirect our stdout — and stderr when it is a tty — onto it.
+/// Spawn the pager and redirect our stdout — and stderr when it is a tty — onto
+/// it. `prepare_pager_args()` pushes the pager string as the whole argv of a
+/// `use_shell` child, so `core.pager = "less -S"` and pipelines go through the
+/// shell while a bare `less` is exec'd directly.
 fn spawn(program: &str) {
-    let mut cmd = Command::new("sh");
-    cmd.arg("-c").arg(program).stdin(Stdio::piped());
+    let mut cmd = crate::external::prepare_shell_cmd_str(program, crate::external::NO_ARGS);
+    cmd.stdin(Stdio::piped());
     // git's build-time PAGER_ENV, applied only when unset, plus the in-use flag.
     if std::env::var_os("LESS").is_none() {
         cmd.env("LESS", "FRX");

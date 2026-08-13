@@ -2466,12 +2466,7 @@ fn launch_editor(repo: &gix::Repository, path: &Path) -> Result<bool> {
     if editor == ":" {
         return Ok(true);
     }
-    let status = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(format!("{editor} \"$@\""))
-        .arg(&editor) // $0
-        .arg(path) // $1
-        .status();
+    let status = crate::external::prepare_shell_cmd_str(&editor, [path]).status();
     match status {
         Ok(status) if status.success() => Ok(true),
         Ok(_) => {

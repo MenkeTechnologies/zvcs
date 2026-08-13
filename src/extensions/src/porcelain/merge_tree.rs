@@ -140,7 +140,7 @@ struct Message {
 /// The parsed `-X`/`--strategy-option` state, mirroring the subset of git's
 /// `struct merge_options` that `parse_merge_opt()` can touch.
 #[derive(Default)]
-struct StrategyOptions {
+pub(super) struct StrategyOptions {
     /// `ours` / `theirs`.
     favor: Option<FileFavor>,
     /// `subtree` (empty shift) or `subtree=<path>`.
@@ -350,9 +350,8 @@ pub fn merge_tree(args: &[String]) -> Result<ExitCode> {
                 return Ok(ExitCode::from(128));
             };
 
-            let tree_options = strategy.apply(repo.tree_merge_options()?)?;
             let mut outcome =
-                match resolve_outcome(&repo, base, s1, s2, allow_unrelated, tree_options)? {
+                match resolve_outcome(&repo, base, s1, s2, allow_unrelated, &strategy)? {
                     Ok(o) => o,
                     // A bad operand is a `die()` in git, aborting the whole batch.
                     Err(code) => return Ok(code),
@@ -433,14 +432,13 @@ pub fn merge_tree(args: &[String]) -> Result<ExitCode> {
     }
 
     let (spec1, spec2) = (revs[0].as_str(), revs[1].as_str());
-    let tree_options = strategy.apply(repo.tree_merge_options()?)?;
     let mut outcome = match resolve_outcome(
         &repo,
         merge_base.as_deref(),
         spec1,
         spec2,
         allow_unrelated,
-        tree_options,
+        &strategy,
     )? {
         Ok(o) => o,
         Err(code) => return Ok(code),
@@ -471,13 +469,22 @@ pub fn merge_tree(args: &[String]) -> Result<ExitCode> {
 /// `--stdin` batch paths. Returns `Err(code)` when an operand does not name
 /// something mergeable — git's diagnostic is already printed and `code` is the
 /// exit status of its `die()`/failure (which, in batch mode, aborts the batch).
+///
+/// The strategy options are folded in *here*, not by the caller, because
+/// [`StrategyOptions::apply`] refuses the ones `gix-merge` has no way to express
+/// and that refusal must not outrank a bad operand. git validates `-X` values in
+/// `cmd_merge_tree` (`parse_merge_opt`, which [`StrategyOptions::absorb`] already
+/// mirrors) but *uses* them only inside `real_merge`, after `get_merge_parent`
+/// has reported an unmergeable operand. So `-Xignore-cr-at-eol does-not-exist
+/// main` is `merge-tree: does-not-exist - not something we can merge` in git, and
+/// applying the options any earlier reported the unsupported option instead.
 fn resolve_outcome<'repo>(
     repo: &'repo gix::Repository,
     merge_base: Option<&str>,
     spec1: &str,
     spec2: &str,
     allow_unrelated: bool,
-    tree_options: gix::merge::tree::Options,
+    strategy: &StrategyOptions,
 ) -> Result<std::result::Result<gix::merge::tree::Outcome<'repo>, ExitCode>> {
     let labels = Labels {
         ancestor: None,
@@ -501,7 +508,7 @@ fn resolve_outcome<'repo>(
             eprintln!("fatal: could not parse as tree '{bad}'");
             return Ok(Err(ExitCode::from(128)));
         };
-        repo.merge_trees(base, ours, theirs, labels, tree_options)?
+        repo.merge_trees(base, ours, theirs, labels, strategy.apply(repo.tree_merge_options()?)?)?
     } else {
         let Some(ours) = peel_commit(repo, spec1) else {
             eprintln!("merge-tree: {spec1} - not something we can merge");
@@ -515,8 +522,9 @@ fn resolve_outcome<'repo>(
             eprintln!("fatal: refusing to merge unrelated histories");
             return Ok(Err(ExitCode::from(128)));
         }
-        let commit_options = gix::merge::commit::Options::from(tree_options)
-            .with_allow_missing_merge_base(allow_unrelated);
+        let commit_options =
+            gix::merge::commit::Options::from(strategy.apply(repo.tree_merge_options()?)?)
+                .with_allow_missing_merge_base(allow_unrelated);
         repo.merge_commits(ours, theirs, labels, commit_options)?
             .tree_merge
     };
@@ -655,7 +663,7 @@ fn trivial_merge_is_exclusive() -> ExitCode {
 impl StrategyOptions {
     /// Absorb one `-X` value, returning `false` for anything git's
     /// `parse_merge_opt()` rejects. Later values win, exactly as in git.
-    fn absorb(&mut self, s: &str) -> bool {
+    pub(super) fn absorb(&mut self, s: &str) -> bool {
         match s {
             "ours" => self.favor = Some(FileFavor::Ours),
             "theirs" => self.favor = Some(FileFavor::Theirs),
@@ -704,7 +712,10 @@ impl StrategyOptions {
 
     /// Fold the strategy options into the merge options, refusing the ones
     /// `gix-merge` has no way to express rather than silently ignoring them.
-    fn apply(&self, options: gix::merge::tree::Options) -> Result<gix::merge::tree::Options> {
+    pub(super) fn apply(
+        &self,
+        options: gix::merge::tree::Options,
+    ) -> Result<gix::merge::tree::Options> {
         if let Some(flag) = &self.ignore_whitespace {
             anyhow::bail!("unsupported strategy option \"{flag}\" (gix-merge's text driver has no whitespace-insensitive tokenizer)");
         }

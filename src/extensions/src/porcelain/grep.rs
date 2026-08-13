@@ -522,8 +522,10 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
                 "no-recurse-submodules" | "no-all-match" => {}
                 "color" => match color_wanted(inline.as_deref()) {
                     Ok(v) => opts.color = v,
-                    Err(v) => {
-                        eprintln!("error: option `color' expects \"always\", \"auto\", or \"never\", not \"{v}\"");
+                    // The callback's `error()` is the whole diagnostic; parse-options
+                    // exits 129 without printing a usage block after it.
+                    Err(()) => {
+                        eprintln!("error: option `color' expects \"always\", \"auto\", or \"never\"");
                         return Ok(ExitCode::from(129));
                     }
                 },
@@ -1420,22 +1422,7 @@ fn run_pager(
 /// (or plain `sh -c '<cmd>'` when there are no arguments); anything else is
 /// executed directly.
 fn spawn_with_shell(cmd: &str, args: &[std::ffi::OsString]) -> std::io::Result<i32> {
-    const META: &[u8] = b"|&;<>()$`\\\"' \t\n*?[#~=%";
-    let mut child = if cmd.bytes().any(|b| META.contains(&b)) {
-        let mut c = std::process::Command::new("sh");
-        c.arg("-c");
-        if args.is_empty() {
-            c.arg(cmd);
-        } else {
-            c.arg(format!("{cmd} \"$@\"")).arg(cmd).args(args);
-        }
-        c
-    } else {
-        let mut c = std::process::Command::new(cmd);
-        c.args(args);
-        c
-    };
-    let status = child.status()?;
+    let status = crate::external::prepare_shell_cmd_str(cmd, args).status()?;
     // git's `wait_or_whine` reports a signalled child as 128 + the signal.
     Ok(match status.code() {
         Some(code) => code,
@@ -2001,14 +1988,24 @@ fn apply_max_depth(
     });
 }
 
-/// Whether colourised output was asked for. `Err` carries an unrecognised
-/// `--color=<when>` value so the caller can report it the way git does.
-fn color_wanted(when: Option<&str>) -> Result<bool, String> {
+/// Whether colourised output was asked for, following `parse_opt_color_flag_cb()`
+/// (`parse-options-cb.c:50`) — the callback behind `OPT__COLOR`, which `git grep`
+/// declares for `--color` (`builtin/grep.c:1119`).
+///
+/// It calls `git_config_colorbool(NULL, arg)` with a NULL variable name, and with no
+/// variable to fall back on that function only knows `never`, `always` and `auto`
+/// (case-insensitively) — the boolean spellings a *config* value would accept are
+/// not among them, so `--color=true` and `--color=false` are rejected rather than
+/// read as on and off. A missing value is the option's `defval`, `always`.
+///
+/// `Err` marks that rejection so the caller can report git's own diagnostic.
+fn color_wanted(when: Option<&str>) -> Result<bool, ()> {
     match when {
-        None | Some("always") | Some("true") => Ok(true),
-        Some("never") | Some("false") => Ok(false),
-        Some("auto") => Ok(std::io::stdout().is_terminal()),
-        Some(other) => Err(other.to_string()),
+        None => Ok(true),
+        Some(v) if v.eq_ignore_ascii_case("always") => Ok(true),
+        Some(v) if v.eq_ignore_ascii_case("never") => Ok(false),
+        Some(v) if v.eq_ignore_ascii_case("auto") => Ok(std::io::stdout().is_terminal()),
+        Some(_) => Err(()),
     }
 }
 
@@ -2362,14 +2359,9 @@ fn run_textconv(cmd: &str, content: &[u8]) -> Result<Vec<u8>> {
         let mut f = std::fs::File::create(&path)?;
         f.write_all(content)?;
     }
-    // `sh -c '<cmd> "$@"' <cmd> <tmp>` reproduces git's `use_shell` invocation,
-    // passing the temp path as the single positional argument to the command.
-    let output = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(format!("{cmd} \"$@\""))
-        .arg(cmd)
-        .arg(&path)
-        .output();
+    // git's `use_shell` invocation, with the temp path as the command's single
+    // positional argument.
+    let output = crate::external::prepare_shell_cmd_str(cmd, [&path]).output();
     let _ = std::fs::remove_file(&path);
     match output {
         Ok(o) if o.status.success() => Ok(o.stdout),
@@ -3353,4 +3345,31 @@ fn unsupported(flag: &str) -> String {
          --color, -O/--open-files-in-pager, --threads, <tree>/<revision> search, \
          and pathspecs)"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `--color=<when>`, which `OPT__COLOR` routes through
+    /// `git_config_colorbool(NULL, arg)` — a *narrower* vocabulary than the
+    /// `color.*` config values of the same name accept.
+    ///
+    /// Read off stock git 2.55.0 rather than off `color.c`: each value was run as
+    /// `git grep --color=<v> fixture` and the exit code and `error:` line recorded.
+    /// The boolean spellings were the surprise — `--color=true` and `--color=false`
+    /// are usage errors (129), not synonyms for `always` and `never`.
+    #[test]
+    fn color_flag_values_match_git() {
+        assert_eq!(color_wanted(Some("always")), Ok(true));
+        assert_eq!(color_wanted(Some("never")), Ok(false));
+        // `git_config_colorbool` compares with `strcasecmp`.
+        assert_eq!(color_wanted(Some("ALWAYS")), Ok(true));
+        assert_eq!(color_wanted(Some("Never")), Ok(false));
+        // A missing value is the option's `defval`, `always`.
+        assert_eq!(color_wanted(None), Ok(true));
+        for bad in ["true", "false", "on", "off", "yes", "no", "1", "0", "", "=", "auto "] {
+            assert_eq!(color_wanted(Some(bad)), Err(()), "{bad:?} should be rejected");
+        }
+    }
 }

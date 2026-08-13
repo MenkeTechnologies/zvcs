@@ -4,14 +4,15 @@
 //! Resolution runs before paging and dispatch. A verb that dispatch already
 //! serves wins over a same-named alias, exactly as git's builtins do; otherwise
 //! the configured `alias.<cmd>` string is expanded:
-//!   * a leading `!` marks a shell alias, run via `sh -c` with the user's extra
-//!     arguments as `"$@"`, then its exit code is returned directly;
+//!   * a leading `!` marks a shell alias, run as a `use_shell` child — the
+//!     user's extra arguments arrive as `"$@"` — and its exit code is returned
+//!     directly;
 //!   * anything else is word-split ([`split_cmdline`]) and spliced in place of
 //!     the alias token, then re-resolved so aliases can chain — with git's
 //!     self-reference and loop guards.
 
 use crate::dispatch;
-use std::process::{Command, ExitCode};
+use std::process::ExitCode;
 
 /// The result of resolving the leading verb through the alias table.
 pub enum Outcome {
@@ -171,20 +172,13 @@ fn lookup(name: &str) -> Option<String> {
     found
 }
 
-/// Run a `!`-prefixed shell alias, git's `handle_alias` shell path: the alias
-/// body runs via `sh -c` with the user's remaining arguments bound to `"$@"`
-/// (`$0` set to the body, as git's `use_shell` `run_command` does). Returns the
-/// child's exit code, or a failure code if the shell could not be spawned.
+/// Run a `!`-prefixed shell alias, git's `handle_alias` shell path: the body is
+/// pushed as the whole argv of a `use_shell` child, so `prepare_shell_cmd`
+/// binds the user's remaining arguments to `"$@"` with `$0` set to the body —
+/// or, for a body that is a bare program name, execs it directly. Returns the
+/// child's exit code, or a failure code if it could not be spawned.
 fn run_shell_alias(body: &str, user_args: &[String]) -> ExitCode {
-    let mut cmd = Command::new("sh");
-    cmd.arg("-c");
-    if user_args.is_empty() {
-        cmd.arg(body);
-    } else {
-        cmd.arg(format!("{body} \"$@\""));
-        cmd.arg(body); // $0
-        cmd.args(user_args); // $1, $2, ...
-    }
+    let mut cmd = crate::external::prepare_shell_cmd_str(body, user_args);
     match cmd.status() {
         Ok(status) => ExitCode::from(status.code().unwrap_or(1) as u8),
         Err(e) => {

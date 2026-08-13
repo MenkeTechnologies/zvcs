@@ -3217,17 +3217,27 @@ fn run_external_diff(
         }
     };
 
-    let mut cmd = super::cat_file::shell_command(&pgm.cmd);
-    cmd.arg(std::ffi::OsStr::from_bytes(&name));
-    cmd.arg(&one.name).arg(&one.hex).arg(&one.mode);
-    cmd.arg(&two.name).arg(&two.hex).arg(&two.mode);
+    // `run_external_diff()` builds a `use_shell` child, so the whole argv goes
+    // through `prepare_shell_cmd()` at once — the arguments decide whether the
+    // `"$@"` form or the bare `sh -c <cmd>` form is used, so they are collected
+    // before the command is built rather than pushed onto it afterwards.
+    let mut argv: Vec<std::ffi::OsString> = vec![
+        std::ffi::OsStr::from_bytes(&name).to_os_string(),
+        one.name.clone().into(),
+        one.hex.clone().into(),
+        one.mode.clone().into(),
+        two.name.clone().into(),
+        two.hex.clone().into(),
+        two.mode.clone().into(),
+    ];
     if let Some(other) = &other {
-        cmd.arg(std::ffi::OsStr::from_bytes(other));
+        argv.push(std::ffi::OsStr::from_bytes(other).to_os_string());
         let xfrm = external_xfrm_msg(repo, p, opts, base_abbrev);
         if !xfrm.is_empty() {
-            cmd.arg(std::ffi::OsStr::from_bytes(&xfrm));
+            argv.push(std::ffi::OsStr::from_bytes(&xfrm).to_os_string());
         }
     }
+    let mut cmd = crate::external::prepare_shell_cmd_str(&pgm.cmd, &argv);
     ctx.counter.set(ctx.counter.get() + 1);
     cmd.env("GIT_DIFF_PATH_COUNTER", ctx.counter.get().to_string());
     cmd.env("GIT_DIFF_PATH_TOTAL", total.to_string());

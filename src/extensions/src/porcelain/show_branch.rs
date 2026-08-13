@@ -1347,12 +1347,10 @@ fn reflog_base_index(base: Option<&str>, entries: &[gix::refs::log::Line]) -> i3
     if end == base.len() {
         return base.parse().unwrap_or(0);
     }
-    let Ok(at) = gix::date::parse(base, Some(std::time::SystemTime::now())) else {
-        return 0;
-    };
+    let at = crate::date::approxidate(base);
     entries
         .iter()
-        .position(|e| e.signature.time.seconds <= at.seconds)
+        .position(|e| e.signature.time.seconds <= at)
         .map_or(0, |i| i as i32)
 }
 

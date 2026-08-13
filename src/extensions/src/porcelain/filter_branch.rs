@@ -320,7 +320,9 @@ struct Shell {
 }
 
 impl Shell {
-    /// Start `/bin/sh` in `cwd` with `env` exported and a status pipe on fd 3.
+    /// Start the shell in `cwd` with `env` exported and a status pipe on fd 3.
+    /// `git-filter-branch.sh` evaluates the user's filters in its own
+    /// `#!@SHELL_PATH@` process, so the same interpreter runs them here.
     fn spawn(cwd: &Path, env: &[(&str, String)]) -> Result<Self> {
         let mut fds = [0 as libc::c_int; 2];
         // A plain pipe(2): neither end is close-on-exec, which is what lets the
@@ -330,7 +332,7 @@ impl Shell {
         }
         let (read_fd, write_fd) = (fds[0], fds[1]);
 
-        let mut cmd = Command::new("/bin/sh");
+        let mut cmd = crate::external::shell();
         cmd.arg("-s").current_dir(cwd).stdin(Stdio::piped());
         for (key, value) in env {
             cmd.env(key, value);
@@ -346,7 +348,7 @@ impl Shell {
         let mut child = cmd.spawn().map_err(|e| {
             unsafe { libc::close(read_fd) };
             unsafe { libc::close(write_fd) };
-            anyhow::anyhow!("cannot run /bin/sh: {e}")
+            anyhow::anyhow!("cannot run {}: {e}", crate::external::SHELL_PATH)
         })?;
         // Only the shell may hold the write end open, or the status pipe never
         // reports end-of-file when it dies.

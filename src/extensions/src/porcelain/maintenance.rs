@@ -1217,10 +1217,9 @@ fn worktree_prune_condition(repo: &gix::Repository) -> bool {
 /// the `worktree-prune` task and its auto condition measure against; `3.months.ago`
 /// when unset.
 fn worktree_prune_expiry(repo: &gix::Repository) -> Option<i64> {
-    let now = std::time::SystemTime::now();
     match repo.config_snapshot().string("gc.worktreePruneExpire") {
-        Some(value) => super::gc::parse_reflog_expiry(value.to_str_lossy().as_ref(), now),
-        None => super::gc::parse_reflog_expiry("3.months.ago", now),
+        Some(value) => super::gc::parse_reflog_expiry(value.to_str_lossy().as_ref()),
+        None => super::gc::parse_reflog_expiry("3.months.ago"),
     }
 }
 
@@ -1246,7 +1245,7 @@ fn reflog_expire_condition(repo: &gix::Repository) -> bool {
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs() as i64);
     let (expire_total, expire_unreach) =
-        super::gc::load_reflog_config(repo, now, now_secs).resolve("HEAD");
+        super::gc::load_reflog_config(repo, now_secs).resolve("HEAD");
 
     let Ok(body) = std::fs::read(repo.git_dir().join("logs").join("HEAD")) else {
         return false;

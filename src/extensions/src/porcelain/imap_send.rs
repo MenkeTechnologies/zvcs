@@ -1265,9 +1265,8 @@ fn imap_open_store(
 
     if let Some(tunnel) = cfg.tunnel.clone() {
         info(&format!("Starting tunnel '{tunnel}'... "));
-        let mut child = Command::new("sh")
-            .arg("-c")
-            .arg(&tunnel)
+        // `strvec_push(&tunnel.args, srvc->tunnel); tunnel.use_shell = 1;`
+        let mut child = crate::external::prepare_shell_cmd_str(&tunnel, crate::external::NO_ARGS)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()

@@ -27,14 +27,20 @@
 //!
 //! git has three distinct failure contracts here and this module reproduces all
 //! three. An argument that is not an option, or an option value outside the set
-//! git names, ends the run with git's one-line `usage:` text and exit 129 having
-//! touched nothing. Anything else fatal prints `fatal: <reason>` and exits 128 —
-//! and, as git's `die_nicely` does, still writes the `--export-marks` file on the
-//! way out, unless an `--import-marks` file was named and never successfully
-//! read, in which case `dump_marks` declines to overwrite an export from a
-//! half-loaded table. Options take effect strictly left to right, so a failure
-//! leaves every option to its left already applied — which is what decides
-//! whether the marks file exists after a fatal.
+//! git names, ends the run with git's one-line `usage:` text and exit 129,
+//! leaving no ref, object or marks file changed — but leaving behind the empty
+//! `objects/pack/tmp_pack_XXXXXX` git opened before it ever looked at argv,
+//! because `usage()` exits without running any of the cleanup `die_nicely`
+//! runs (see [`TempPack`]). Anything else fatal prints `fatal: <reason>` and
+//! exits 128 — and, as git's `die_nicely` does, unlinks that temporary and then
+//! still writes the `--export-marks` file on the way out, unless an
+//! `--import-marks` file was named and never successfully read, in which case
+//! `dump_marks` declines to overwrite an export from a half-loaded table.
+//! Options take effect strictly left to right, so a failure leaves every option
+//! to its left already applied — which is what decides whether the marks file
+//! exists after a fatal. A lone `-h` or `--help-all` is not a failure at all:
+//! `show_usage_if_asked` prints the same summary on *stdout*, exits 129, and
+//! runs before the repository is even opened.
 //!
 //! Signatures follow git's `--signed-commits=`/`--signed-tags=` modes:
 //! `verbatim` and `warn-verbatim` keep them (a commit's `gpgsig`/`gpgsig-sha256`
@@ -62,7 +68,9 @@
 //! Two deliberate substrate differences, neither of which changes the objects or
 //! refs a caller can observe: objects are written as loose objects rather than
 //! into a new packfile (git itself explodes small packs into loose objects below
-//! `fastimport.unpackLimit`, which defaults to 100), and the `--stats` block —
+//! `fastimport.unpackLimit`, which defaults to 100, so the temporary packfile is
+//! opened and discarded exactly as git opens and discards it), and the
+//! `--stats` block —
 //! stderr only, and full of allocator and pack-window counters that have no
 //! equivalent here — is never printed. No crash report is dumped on a fatal
 //! error either; the `fast_import_crash_<pid>` file could never match anyway,
@@ -71,6 +79,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, Read, Write as _};
+use std::os::unix::fs::PermissionsExt as _;
 use std::process::ExitCode;
 
 use gix::hash::ObjectId;
@@ -105,6 +114,67 @@ impl std::error::Error for UsageError {}
 /// The bare option summary, for an argument that is not an option at all.
 fn usage() -> anyhow::Error {
     UsageError(USAGE.to_string()).into()
+}
+
+/// The `objects/pack/tmp_pack_XXXXXX` git's `start_packfile()` opens, tracked
+/// for its lifetime on disk rather than for anything written into it.
+///
+/// `cmd_fast_import` opens it before it reads a byte of the stream and long
+/// before argv is looked at — `start_packfile()` sits at
+/// `builtin/fast-import.c:3978`, `parse_argv()` is only reached at 4020 (or, if
+/// the stream opens with a data command, from `read_next_command` at 1869) — so
+/// the temporary is already in the object store by the time any option can be
+/// rejected. Which exit route the run then takes is what decides whether it
+/// survives:
+///
+///   * `usage()` calls `exit(129)` itself, running neither `die_nicely` nor
+///     `end_packfile`, so the temporary stays. It is the only thing a rejected
+///     `fast-import` command line leaves changed on disk.
+///   * `die()` runs `die_nicely`, which calls `end_packfile()` ahead of
+///     `dump_marks()` (`fast-import.c:441`). A run that stored nothing takes
+///     `end_packfile`'s `discard_pack` branch — close, then
+///     `unlink_or_warn(pack_data->pack_name)` (935-936).
+///   * A clean run reaches `end_packfile()` at 4025. This port writes loose
+///     objects instead of a pack, which is the state git itself ends in for any
+///     import at or below `fastimport.unpackLimit` (100 by default): there
+///     `end_packfile` explodes the pack with `unpack-objects` and jumps to that
+///     same `discard_pack`. So the temporary goes here too.
+///
+/// It is left empty on the surviving route because the twelve bytes
+/// `write_pack_header` produces sit in the `hashfd` buffer until
+/// `finalize_hashfile`, which only a run that stored objects reaches. Verified
+/// against git 2.55.0: a rejected command line leaves a zero-byte
+/// `tmp_pack_XXXXXX` mode 0444.
+///
+/// `checkpoint`'s `cycle_packfile()` (3602) is not modelled, because it unlinks
+/// the temporary and immediately opens another: one temporary is alive either
+/// way, and only its random tail — which nothing reads — would differ.
+struct TempPack {
+    path: std::path::PathBuf,
+}
+
+impl TempPack {
+    /// git's `start_packfile()`: `odb_mkstemp(…, "pack/tmp_pack_XXXXXX")`, which
+    /// creates the leading directory and then the file itself, mode 0444.
+    fn start(repo: &gix::Repository) -> Result<TempPack> {
+        let dir = repo.objects.store_ref().path().join("pack");
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join(format!(
+            "tmp_pack_{}",
+            crate::porcelain::index_pack::mkstemp_suffix()
+        ));
+        std::fs::File::create(&path)?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444))?;
+        Ok(TempPack { path })
+    }
+
+    /// git's `end_packfile()` down its `discard_pack` branch: drop the
+    /// temporary. Takes `self` by value, which gives the same once-only
+    /// guarantee as `end_packfile`'s `running`/`!pack_data` guard.
+    fn end(self) {
+        // `unlink_or_warn`: git does not treat a failure here as fatal.
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
 
 /// Which `--date-format` the stream uses.
@@ -252,6 +322,15 @@ pub fn fast_import(args: &[String]) -> Result<ExitCode> {
         Some(a) if a == "fast-import" => &args[1..],
         _ => args,
     };
+    // `show_usage_if_asked(argc, argv, fast_import_usage)` at
+    // `builtin/fast-import.c:3941`: the help flag alone, and only alone, prints
+    // the summary on *stdout* and exits 129. It runs ahead of the repository
+    // setup git.c would otherwise do, so it answers outside a repository too,
+    // and ahead of `start_packfile()`, so it leaves no temporary behind.
+    if args.len() == 1 && (args[0] == "-h" || args[0] == "--help-all") {
+        print!("{USAGE}");
+        return Ok(ExitCode::from(129));
+    }
     match run(args) {
         Ok(code) => Ok(code),
         Err(e) => match e.downcast_ref::<UsageError>() {
@@ -288,12 +367,25 @@ fn run(args: &[String]) -> Result<ExitCode> {
         submodule_rewrites: Vec::new(),
     };
 
+    // `cmd_fast_import` opens the packfile before it reads the stream and before
+    // argv is parsed, so it exists no matter how the run ends. See [`TempPack`].
+    let pack = TempPack::start(&imp.repo)?;
+
     match imp.import(args) {
-        Ok(code) => Ok(code),
+        Ok(code) => {
+            pack.end();
+            Ok(code)
+        }
         // git's `usage()` exits without running `die_nicely`, so a usage error
-        // leaves the marks file alone; every other failure still dumps it.
-        Err(e) if e.downcast_ref::<UsageError>().is_some() => Err(e),
+        // leaves both the marks file and the temporary packfile alone; every
+        // other failure runs `end_packfile()` and then dumps the marks.
+        Err(e) if e.downcast_ref::<UsageError>().is_some() => {
+            // Dropping a `TempPack` without `end()` is what leaves it on disk.
+            drop(pack);
+            Err(e)
+        }
         Err(e) => {
+            pack.end();
             imp.dump_marks_on_fatal();
             Err(e)
         }
@@ -320,12 +412,39 @@ fn date_format(name: &str) -> Result<DateFormat> {
     }
 }
 
-/// git's `parse_non_negative_integer`, used for `--depth`, `--active-branches`
-/// and `--cat-blob-fd`.
-fn non_negative(flag: &str, value: &str) -> Result<u64> {
-    value
-        .parse::<u64>()
-        .map_err(|_| anyhow!("{flag}: argument must be a non-negative integer"))
+/// The largest `--depth` git accepts: `MAX_DEPTH`, `(1 << DEPTH_BITS) - 1` with
+/// `DEPTH_BITS` 13, because a delta depth is stored in a 13-bit bitfield
+/// (`fast-import.c:36-37,56`).
+const MAX_DEPTH: u64 = (1 << 13) - 1;
+
+/// git's `ulong_arg`, used for `--depth`, `--active-branches` and
+/// `--cat-blob-fd`: `strtoul(arg, &endptr, 0)`, rejected unless the whole
+/// argument was consumed and it holds no `-` anywhere (`fast-import.c:3684`).
+///
+/// Base 0 means the prefix picks the radix — `0x`/`0X` hexadecimal, a leading
+/// `0` octal, otherwise decimal — so `--depth=0x10` and `--depth=010` are
+/// accepted, as is a leading `+` or leading whitespace. `strtoul` also saturates
+/// at `ULONG_MAX` instead of failing, which is why an absurd
+/// `--depth=99999999999999999999999` reaches `option_depth`'s ceiling and
+/// reports `--depth cannot exceed 8191` rather than a parse error. All four
+/// verified against git 2.55.0.
+fn ulong_arg(flag: &str, value: &str) -> Result<u64> {
+    let bad = || anyhow!("{flag}: argument must be a non-negative integer");
+    // `strchr(arg, '-')`: any `-` at all, not just a leading sign.
+    if value.contains('-') {
+        return Err(bad());
+    }
+    let s = value.trim_start_matches([' ', '\t', '\n', '\u{b}', '\u{c}', '\r']);
+    let s = s.strip_prefix('+').unwrap_or(s);
+    let (digits, radix) = match s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        Some(hex) => (hex, 16),
+        None if s.len() > 1 && s.starts_with('0') => (&s[1..], 8),
+        None => (s, 10),
+    };
+    if digits.is_empty() || !digits.chars().all(|c| c.is_digit(radix)) {
+        return Err(bad());
+    }
+    Ok(u64::from_str_radix(digits, radix).unwrap_or(u64::MAX))
 }
 
 /// git's `parse_ulong_with_suffix`, used for the two byte-size options. A value
@@ -517,10 +636,13 @@ impl Importer {
                 // Pack tuning only: identical objects and refs either way, but
                 // the values are still validated so a typo fails as it does in git.
                 _ if starts(a, "--depth=") => {
-                    non_negative("--depth", &a["--depth=".len()..])?;
+                    // `option_depth`: parsed, then held to the bitfield's ceiling.
+                    if ulong_arg("--depth", &a["--depth=".len()..])? > MAX_DEPTH {
+                        crate::git_fatal!("--depth cannot exceed {MAX_DEPTH}");
+                    }
                 }
                 _ if starts(a, "--active-branches=") => {
-                    non_negative("--active-branches", &a["--active-branches=".len()..])?;
+                    ulong_arg("--active-branches", &a["--active-branches=".len()..])?;
                 }
                 _ if starts(a, "--big-file-threshold=") => {
                     byte_size(&a["--big-file-threshold=".len()..])
@@ -546,11 +668,12 @@ impl Importer {
                 }
                 _ if starts(a, "--cat-blob-fd=") => {
                     let v = &a["--cat-blob-fd=".len()..];
-                    let fd = non_negative("--cat-blob-fd", v)?;
-                    self.opts.cat_blob_fd = Some(
-                        i32::try_from(fd)
-                            .map_err(|_| anyhow!("--cat-blob-fd: argument must be a non-negative integer"))?,
-                    );
+                    // `option_cat_blob_fd`: the fd has to survive the cast to int.
+                    let fd = ulong_arg("--cat-blob-fd", v)?;
+                    if fd > i32::MAX as u64 {
+                        crate::git_fatal!("--cat-blob-fd cannot exceed {}", i32::MAX);
+                    }
+                    self.opts.cat_blob_fd = Some(fd as i32);
                 }
                 _ if starts(a, "--signed-commits=") => {
                     self.opts.signed_commits =

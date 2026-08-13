@@ -135,12 +135,32 @@ pub(crate) mod function {
                     cursor.push(DOT_GIT_DIR);
                     cursor_metadata_backup = cursor_metadata.take();
                 }
+                // `git` probes `<dir>/.git` before it probes `<dir>` itself, and the two hits mean
+                // different things (`setup_git_directory_gently_1()` in `setup.c`):
+                //
+                // * a hit on `<dir>/.git` is `GIT_DIR_DISCOVERED`: `<dir>` is the work tree.
+                // * a hit on `<dir>` itself is `GIT_DIR_BARE`: `<dir>` *becomes* `GIT_DIR` and there
+                //   is no work tree, no matter what the directory is called. This is what makes
+                //   `git log` work from inside a `.git` directory, and what makes `git status`
+                //   there fail with "this operation must be run in a work tree".
+                //
+                // `dot_git_only` is not git's discovery - it deliberately looks for work trees only
+                // and ignores bare repositories - so it keeps treating a `.git` cursor as a work
+                // tree's git directory.
+                let probed_dot_git_child = *append_dot_git && !started_as_dot_git;
+                let cursor_is_the_git_dir = !probed_dot_git_child && !dot_git_only;
                 if let Ok(kind) = match cursor_metadata.take() {
                     Some(metadata) => is_git_with_metadata(&cursor, metadata, &cwd),
                     None => is_git(&cursor),
                 } {
                     match filter_by_trust(&cursor)? {
                         Ok(trust) => {
+                            if cursor_is_the_git_dir {
+                                // `GIT_DIR_BARE`: adopt the directory as-is. `shorten_path_with_cwd()`
+                                // is not applicable here as it only knows how to shorten paths that
+                                // end in `.git`.
+                                break 'outer Ok((crate::repository::Path::Repository(cursor), trust));
+                            }
                             // TODO: test this more, it definitely doesn't always find the shortest path to a directory
                             let path = if dir_made_absolute {
                                 shorten_path_with_cwd(cursor, cwd.as_ref())

@@ -24,6 +24,7 @@ pub mod jobrun;
 pub mod lock;
 pub mod merge_apply;
 pub mod merge_guard;
+pub mod optint;
 pub mod pager;
 pub mod porcelain;
 pub mod progress;

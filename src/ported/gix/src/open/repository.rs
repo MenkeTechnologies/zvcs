@@ -11,7 +11,7 @@ use std::{
     path::PathBuf,
 };
 
-use super::{Error, Options};
+use super::{Error, ImplicitWorkTree, Options};
 use crate::{
     ThreadSafeRepository,
     bstr::BString,
@@ -125,6 +125,7 @@ impl ThreadSafeRepository {
     ) -> Result<Self, Error> {
         let _span = gix_trace::coarse!("ThreadSafeRepository::open_with_environment_overrides()");
         let overrides = EnvironmentOverrides::from_env()?;
+        let git_dir_is_explicit = overrides.git_dir.is_some();
         let (path, path_kind): (PathBuf, _) = match overrides.git_dir {
             Some(git_dir) => gix_discover::is_git(&git_dir)
                 .map_err(|err| Error::NotARepository {
@@ -145,14 +146,38 @@ impl ThreadSafeRepository {
 
         // To be altered later based on `core.precomposeUnicode`.
         let cwd = gix_fs::current_dir(false)?;
-        let (git_dir, worktree_dir) = gix_discover::repository::Path::from_dot_git_dir(path, path_kind, &cwd)
-            .expect("we have sanitized path with is_git()")
-            .into_repository_and_work_tree_directories();
-        let worktree_dir = worktree_dir.or(overrides.worktree_dir);
+        let (git_dir, worktree_dir, implicit_work_tree) = if git_dir_is_explicit {
+            // `setup_explicit_git_dir()`: `$GIT_DIR` *is* the git directory, resolved through a
+            // `.git` file if it is one and otherwise taken verbatim — it is never re-derived from
+            // a work tree, which is what makes `GIT_DIR=.` work from inside a `.git` directory.
+            //
+            // Nor does an explicit `$GIT_DIR` bring a work tree with it: `GIT_WORK_TREE` wins,
+            // then `core.bare`, then `core.worktree`, and what is left is
+            // `set_git_work_tree(repo, ".")` — the cwd, even when `$GIT_DIR` is some other
+            // repository's. So any linkage `is_git()` found is deliberately dropped here.
+            let git_dir = match &path_kind {
+                gix_discover::repository::Kind::Submodule { git_dir } => git_dir.clone(),
+                gix_discover::repository::Kind::WorkTree {
+                    linked_git_dir: Some(git_dir),
+                } => git_dir.clone(),
+                _ => path,
+            };
+            (git_dir, overrides.worktree_dir, ImplicitWorkTree::CurrentDir)
+        } else {
+            let (git_dir, worktree_dir) = gix_discover::repository::Path::from_dot_git_dir(path, path_kind, &cwd)
+                .expect("we have sanitized path with is_git()")
+                .into_repository_and_work_tree_directories();
+            (
+                git_dir,
+                worktree_dir.or(overrides.worktree_dir),
+                ImplicitWorkTree::ParentOfDotGitDir,
+            )
+        };
 
         let git_dir_trust = gix_sec::Trust::from_path_ownership(&git_dir)?;
         let mut options = trust_map.into_value_by_level(git_dir_trust);
         options.git_dir_trust = git_dir_trust.into();
+        options.implicit_work_tree = implicit_work_tree;
         options.current_dir = Some(cwd);
         ThreadSafeRepository::open_from_paths(git_dir, worktree_dir, options)
     }
@@ -172,6 +197,7 @@ impl ThreadSafeRepository {
             lenient_config,
             bail_if_untrusted,
             open_path_as_is: _,
+            implicit_work_tree,
             permissions:
                 Permissions {
                     ref env,
@@ -330,9 +356,18 @@ impl ThreadSafeRepository {
         {
             let looks_like_standard_git_dir =
                 || refs.git_dir().file_name() == Some(OsStr::new(gix_discover::DOT_GIT_DIR));
+            // git's `setup_explicit_git_dir()` reaches `set_git_work_tree(repo, ".")` no matter what
+            // the git directory is called, while `setup_discovered_git_dir()` only ever pairs a
+            // `.git` directory with its parent.
+            let implied = match implicit_work_tree {
+                ImplicitWorkTree::None => None,
+                ImplicitWorkTree::CurrentDir => Some(current_dir.to_owned()),
+                ImplicitWorkTree::ParentOfDotGitDir => looks_like_standard_git_dir()
+                    .then(|| git_dir.parent().expect("parent is always available").to_owned()),
+            };
             match worktree_dir {
-                None if !config.is_bare_but_assume_bare_if_unconfigured() && looks_like_standard_git_dir() => {
-                    worktree_dir = Some(git_dir.parent().expect("parent is always available").to_owned());
+                None if implied.is_some() && !config.is_bare_but_assume_bare_if_unconfigured() => {
+                    worktree_dir = implied;
                 }
                 // We may assume that the presence of a worktree-dir means it's not bare, but only if there
                 // is no configuration saying otherwise.

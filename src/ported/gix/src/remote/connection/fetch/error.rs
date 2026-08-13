@@ -43,7 +43,10 @@ pub enum Error {
         path: std::path::PathBuf,
         source: std::io::Error,
     },
-    #[error("Could not check whether the objects the remote sent are connected")]
+    /// The connectivity check could not be carried out. Every variant names the connectivity check
+    /// itself, except the object-database one, which is passed through verbatim so a local failure
+    /// like a too-small slotmap keeps its own reason instead of being dressed up as a fetch problem.
+    #[error(transparent)]
     CheckConnected(#[from] super::connected::Error),
     /// The remote's answer left out objects the refs it offered need, so no ref may be stored.
     ///

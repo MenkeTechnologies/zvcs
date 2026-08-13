@@ -608,7 +608,6 @@ fn start(args: &[String]) -> Result<ExitCode> {
     let mut first_parent = false;
     let mut must_write_terms = false;
     let mut resolved: Vec<ObjectId> = Vec::new();
-    let mut pathspecs: Vec<String> = Vec::new();
 
     // git scans once for a `--`: its presence turns an unresolvable revision
     // into a hard error rather than the start of the pathspec list.
@@ -623,7 +622,6 @@ fn start(args: &[String]) -> Result<ExitCode> {
     while i < args.len() {
         let arg = args[i].as_str();
         if arg == "--" {
-            pathspecs = args[i + 1..].to_vec();
             break;
         } else if arg == "--no-checkout" {
             no_checkout = true;
@@ -668,14 +666,14 @@ fn start(args: &[String]) -> Result<ExitCode> {
                     return Ok(ExitCode::from(128));
                 }
                 // An unresolvable token with no `--` present starts the pathspec.
-                Err(_) => {
-                    pathspecs = args[i..].to_vec();
-                    break;
-                }
+                Err(_) => break,
             }
         }
         i += 1;
     }
+    // `pathspec_pos`: where the scan stopped — at the `--`, at the first token
+    // that is neither an option nor a revision, or past the end.
+    let pathspec_pos = i;
 
     // Naming any revision commits the session to the default terms.
     if !resolved.is_empty() {
@@ -711,16 +709,7 @@ fn start(args: &[String]) -> Result<ExitCode> {
     let start_head = head_label(&ctx.repo)?;
     std::fs::create_dir_all(ctx.refs_dir())?;
     std::fs::write(ctx.file("BISECT_START"), format!("{start_head}\n"))?;
-    let bisect_names = if pathspecs.is_empty() {
-        String::new()
-    } else {
-        pathspecs
-            .iter()
-            .map(|p| sq_quote(p))
-            .collect::<Vec<_>>()
-            .join(" ")
-    };
-    std::fs::write(ctx.file("BISECT_NAMES"), format!("{bisect_names}\n"))?;
+    std::fs::write(ctx.file("BISECT_NAMES"), bisect_names(args, pathspec_pos))?;
     std::fs::write(ctx.file("BISECT_LOG"), "")?;
     if first_parent {
         std::fs::write(ctx.file("BISECT_FIRST_PARENT"), "\n")?;
@@ -762,6 +751,31 @@ fn start(args: &[String]) -> Result<ExitCode> {
     auto_next(&ctx, &terms, no_checkout)
 }
 
+/// The whole contents of `BISECT_NAMES`, including its terminating newline.
+///
+/// ```c
+/// if (pathspec_pos < argc - 1)
+///         sq_quote_argv(&bisect_names, argv + pathspec_pos);
+/// write_file(git_path_bisect_names(), "%s\n", bisect_names.buf);
+/// ```
+/// — builtin/bisect.c:874. Three details the bytes depend on, all of them git's:
+///
+///  * the tail starts **at** `pathspec_pos`, so a `--` separator is quoted into
+///    the file alongside the paths it introduces;
+///  * `sq_quote_argv()` (quote.c) writes a space *before* every argument, so a
+///    non-empty list begins with one;
+///  * the `< argc - 1` gate means a single trailing token records nothing —
+///    `git bisect start no-such-rev` leaves an empty `BISECT_NAMES`, and so does
+///    a run whose arguments were all revisions.
+fn bisect_names(args: &[String], pathspec_pos: usize) -> String {
+    if pathspec_pos + 1 >= args.len() {
+        return "\n".to_string();
+    }
+    let quoted: String =
+        args[pathspec_pos..].iter().map(|p| format!(" {}", sq_quote(p))).collect();
+    format!("{quoted}\n")
+}
+
 /// The label `BISECT_START` records: the branch name, or the full oid when HEAD
 /// is detached.
 fn head_label(repo: &gix::Repository) -> Result<String> {
@@ -800,11 +814,14 @@ fn sq_quote(s: &str) -> String {
 /// Mark one or more revisions, then advance the bisection.
 fn mark(word: &str, args: &[String]) -> Result<ExitCode> {
     let ctx = Ctx::open()?;
-    if !ctx.in_progress() {
-        eprintln!("You need to start by \"git bisect start\"");
-        return Ok(ExitCode::from(1));
-    }
 
+    // `check_and_set_terms()` runs in `cmd_bisect`'s fallback branch
+    // (builtin/bisect.c:1477-1482), *before* `bisect_state()` reaches
+    // `bisect_autostart()`. So the marking word settles the terms — and writes
+    // `BISECT_TERMS` — even when there is no session to mark, which is why
+    // `git bisect bad` in a fresh repository still leaves `bad\ngood\n` behind
+    // while `git bisect skip` (a real subcommand, so `check_and_set_terms`
+    // returns early for it) leaves nothing.
     let terms = match read_terms(&ctx)? {
         Some(t) => t,
         None => match terms_for_first_marking(word) {
@@ -818,6 +835,11 @@ fn mark(word: &str, args: &[String]) -> Result<ExitCode> {
     let Some(side) = side_of(word, &terms) else {
         return unknown_command(word);
     };
+
+    if !ctx.in_progress() {
+        eprintln!("You need to start by \"git bisect start\"");
+        return Ok(ExitCode::from(1));
+    }
 
     // git treats every argument as a revision; a leading `-` is not a flag, it is
     // a commit-ish that fails to resolve into a `Bad rev input` error below.
@@ -1831,4 +1853,50 @@ fn decimal_width(mut n: u32) -> usize {
         w += 1;
     }
     w
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{bisect_names, terms_for_first_marking};
+
+    fn argv(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Every string here is stock git 2.55.0's own `.git/BISECT_NAMES`, read back
+    /// after the named invocation. The leading space and the quoted `--` are the
+    /// two details `sq_quote_argv()` contributes and the two this port had wrong:
+    /// it wrote the pathspec tail without them, so a `bisect start` that named no
+    /// pathspec at all recorded the last *revision* as one.
+    #[test]
+    fn bisect_names_matches_sq_quote_argv() {
+        // `git bisect start HEAD HEAD~2` — both operands parse as revisions, so
+        // the scan runs off the end and nothing is recorded.
+        assert_eq!(bisect_names(&argv(&["HEAD", "HEAD~2"]), 2), "\n");
+        // `git bisect start HEAD -- src` — the separator is part of the tail.
+        assert_eq!(bisect_names(&argv(&["HEAD", "--", "src"]), 1), " '--' 'src'\n");
+        assert_eq!(bisect_names(&argv(&["--", "src"]), 0), " '--' 'src'\n");
+        // `git bisect start no-such-rev` — one unresolvable trailing token is
+        // below git's `pathspec_pos < argc - 1` gate, so it records nothing.
+        assert_eq!(bisect_names(&argv(&["no-such-rev"]), 0), "\n");
+        // …and the same token followed by another one is recorded, both of them.
+        assert_eq!(bisect_names(&argv(&["a", "b"]), 0), " 'a' 'b'\n");
+        // A path needing shell quoting keeps `sq_quote_buf`'s escaping.
+        assert_eq!(bisect_names(&argv(&["--", "it's"]), 0), " '--' 'it'\\''s'\n");
+    }
+
+    /// The marking word decides the term pair, and only for the four words git
+    /// recognises — `check_and_set_terms()` returns early for `skip`, which is
+    /// why `git bisect skip` in a fresh repository writes no `BISECT_TERMS`.
+    #[test]
+    fn first_marking_word_picks_the_term_pair() {
+        for (word, bad, good) in
+            [("bad", "bad", "good"), ("good", "bad", "good"), ("new", "new", "old"), ("old", "new", "old")]
+        {
+            let t = terms_for_first_marking(word).expect("marking word");
+            assert_eq!((t.bad.as_str(), t.good.as_str()), (bad, good), "for {word}");
+        }
+        assert!(terms_for_first_marking("skip").is_none());
+        assert!(terms_for_first_marking("start").is_none());
+    }
 }

@@ -753,6 +753,31 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
         }
     }
 
+    // `-N` reaches `set_object_name_for_intent_to_add_entry()` for every path
+    // `add_files_to_cache()` and `add_files()` actually index, and that helper
+    // writes the empty blob before `add_to_index()` ever looks at
+    // `ADD_CACHE_PRETEND` — so `--dry-run` leaves the object behind too. A
+    // pathspec that matched only unchanged tracked paths indexes nothing and
+    // therefore writes nothing.
+    let intent_visited = intent_to_add && {
+        let changed: std::collections::HashMap<&BString, &Staged> =
+            staged.iter().filter(|s| s.was_tracked).map(|s| (&s.path, s)).collect();
+        let backing = index.path_backing();
+        staged.iter().any(|s| !s.was_tracked)
+            || index.entries().iter().any(|e| {
+                e.stage() == Stage::Unconflicted
+                    && e.mode != Mode::COMMIT
+                    && changed
+                        .get(&e.path_in(backing).to_owned())
+                        // `--renormalize` indexes every matched blob, changed or
+                        // not, so any match at all reaches `add_to_index()`.
+                        .is_some_and(|s| renormalize || s.id != e.id || s.mode != e.mode)
+            })
+    };
+    if intent_visited {
+        repo.write_blob(b"")?;
+    }
+
     // Build the `-n`/`-v` report exactly as git orders it: first the matched
     // tracked entries in index order (a removed file → `remove`, a changed file
     // — or any matched file under `-N` — → `add`, an unchanged file omitted),
@@ -773,7 +798,19 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
             if deletion_lookup.contains(&path) {
                 lines.push(format!("remove '{path}'"));
             } else if let Some(s) = staged_tracked.get(&path) {
-                if intent_to_add || s.id != e.id || s.mode != e.mode {
+                // A tracked path is reported only when the worktree really
+                // differs from its index entry: `add_files_to_cache()` drives
+                // the report from `run_diff_files()`, which never hands an
+                // unchanged path to `add_file_to_index()` at all. `-N` does not
+                // widen that — it changes what gets *staged* for a path already
+                // known to differ, not which paths are visited.
+                //
+                // `--renormalize` is the exception, and reports every matched
+                // blob: `renormalize_tracked_files()` walks the index rather
+                // than a diff, and `add_to_index()` skips its `alias` lookup
+                // under `ADD_CACHE_RENORMALIZE` — so `was_same` is never true
+                // and the `add '<path>'` line is unconditional.
+                if renormalize || s.id != e.id || s.mode != e.mode {
                     lines.push(format!("add '{path}'"));
                 }
             }

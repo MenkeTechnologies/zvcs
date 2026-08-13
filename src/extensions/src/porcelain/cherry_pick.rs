@@ -1005,14 +1005,11 @@ fn pick_one(
             let tree_id = merge.tree.write()?.detach();
 
             // `merge_switch_to_result()` (merge-ort.c) records the merged tree
-            // as `AUTO_MERGE` for every result it checks out — clean or
-            // conflicted, and regardless of whether a commit follows. That is
-            // why stock leaves `.git/AUTO_MERGE` behind after a *successful*
-            // `git cherry-pick <commit>`, and why `git rev-parse AUTO_MERGE`
-            // resolves there. Only this in-process arm goes through merge-ort:
-            // a `merge-<strategy>` child never writes the file, which is what
-            // makes `--strategy=resolve` leave none.
-            std::fs::write(repo.git_dir().join("AUTO_MERGE"), format!("{tree_id}\n"))?;
+            // as `AUTO_MERGE` for every result it checks out. Only this
+            // in-process arm goes through merge-ort: a `merge-<strategy>` child
+            // never writes the file, which is what makes `--strategy=resolve`
+            // leave none.
+            crate::merge_apply::write_auto_merge(repo, tree_id)?;
 
             // git's merge-ort emits messages grouped per path: an
             // `Auto-merging` line for every attempted blob merge, then a
@@ -1039,6 +1036,16 @@ fn pick_one(
                 println!("CONFLICT ({kind}): Merge conflict in {path}");
                 conflicted.push(path);
             }
+            // `res |= write_message(ctx->message…, git_path_merge_msg(r), 0);`
+            // — sequencer.c:2450, immediately after `do_recursive_merge()` and
+            // before anything decides whether a commit follows. A pick that
+            // commits has it consumed and unlinked again below; `--no-commit`
+            // stops first, which is why stock leaves `.git/MERGE_MSG` holding
+            // the picked message (and, under `-x`, its
+            // `(cherry picked from commit …)` line) for the `git commit` the
+            // user is expected to run next. The conflict arm rewrites it with
+            // git's `# Conflicts:` block appended.
+            std::fs::write(repo.git_dir().join("MERGE_MSG"), &message[..])?;
             (tree_id, Some(merge))
         }
         Some(strategy) => {
@@ -1187,15 +1194,17 @@ fn pick_one(
     let reflog = gix::reference::log::message("cherry-pick", message.as_bstr(), 1);
     advance_head(&repo, head_id, new_id, reflog)?;
     state.index = update_clean_worktree(&repo, &state.index, tree_id, &should_interrupt)?;
-    // Only the strategy-child path wrote `MERGE_MSG` up front, and the commit
-    // consumes it; stock git's `.git` holds neither it nor `CHERRY_PICK_HEAD`
-    // after a `--strategy=resolve` pick lands. The in-process path is left
-    // alone — it wrote nothing here, and the sequencer directory belongs to
-    // the whole sequence rather than to one pick.
-    if merge.is_none() {
+    // The commit consumes `MERGE_MSG` — `do_commit()` passes it as the message
+    // file and `remove_branch_state()` unlinks it — so a landed pick leaves
+    // neither it nor `CHERRY_PICK_HEAD` behind, whichever arm wrote them.
+    // The sequencer directory is untouched: it belongs to the whole sequence
+    // rather than to one pick.
+    {
         let git_dir = repo.git_dir();
-        let _ = std::fs::remove_file(git_dir.join("CHERRY_PICK_HEAD"));
         let _ = std::fs::remove_file(git_dir.join("MERGE_MSG"));
+        if merge.is_none() {
+            let _ = std::fs::remove_file(git_dir.join("CHERRY_PICK_HEAD"));
+        }
     }
 
     // --- summary, matching git's `print_commit_summary` ----------------

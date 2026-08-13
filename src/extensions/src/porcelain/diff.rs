@@ -885,15 +885,15 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                 eprintln!("error: switch `l' requires a value");
                 return Ok(ExitCode::from(129));
             }
-            s if s.starts_with("-l") && s.len() > 2 => match s[2..].parse::<i64>() {
-                Ok(n) => ro.rename_limit = n,
-                Err(_) => {
-                    eprintln!(
-                        "error: switch `l' expects an integer value with an optional k/m/g suffix"
-                    );
-                    return Ok(ExitCode::from(129));
+            s if s.starts_with("-l") && s.len() > 2 => {
+                match crate::optint::integer(&crate::optint::short_opt('l'), &s[2..]) {
+                    Ok(n) => ro.rename_limit = n,
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        return Ok(ExitCode::from(129));
+                    }
                 }
-            },
+            }
             // `-U` / `--unified[=<n>]`: git's `diff_opt_unified()` enables patch
             // output unconditionally, so any of these implies `-p` even alongside
             // `--raw`/`--stat`/`--numstat`. A bare `-U` / `--unified` keeps the
@@ -1056,7 +1056,7 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     } else {
         let workdir = repo
             .workdir()
-            .ok_or_else(|| anyhow::anyhow!("this operation must be run in a work tree"))?
+            .ok_or_else(|| crate::fatal::need_work_tree())?
             .to_owned();
         if revs.len() == 1 {
             old_tree_id = Some(tree_id_for(&repo, revs.first())?);

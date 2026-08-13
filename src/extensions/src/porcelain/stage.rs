@@ -960,6 +960,51 @@ fn read_worktree_bytes(
     }
 }
 
+/// `match_stat_data()`'s field selection for a default git build: `core.trustctime`
+/// and `core.checkStat` are on, `USE_NSEC` is a compile-time option almost nobody
+/// enables, and `st_dev` is left out for the same reason gitoxide leaves it out.
+pub(super) const STAT_MATCH: gix::index::entry::stat::Options = gix::index::entry::stat::Options {
+    trust_ctime: true,
+    check_stat: true,
+    use_nsec: false,
+    use_stdev: false,
+};
+
+/// The stage-0 paths `is_racy_stat()` (read-cache.c) considers racily clean: the
+/// index file's own timestamp is not newer than the entry's recorded mtime, so a
+/// write in the same filesystem tick could have gone unnoticed.
+///
+/// `run_diff_files()` matches with `CE_MATCH_RACY_IS_DIRTY`, so those paths are
+/// reported as modified regardless of content — which is why a freshly checked
+/// out or freshly copied worktree hands every tracked path to
+/// `add_file_to_index()`, `-N` included.
+fn racy_paths(index: &gix::index::File, repo: &gix::Repository) -> HashSet<BString> {
+    let Ok(meta) = std::fs::metadata(repo.index_path()) else {
+        return HashSet::new();
+    };
+    let Ok(modified) = meta.modified() else {
+        return HashSet::new();
+    };
+    let Ok(since) = modified.duration_since(std::time::UNIX_EPOCH) else {
+        return HashSet::new();
+    };
+    let (idx_sec, idx_nsec) = (since.as_secs(), since.subsec_nanos());
+    if idx_sec == 0 {
+        return HashSet::new();
+    }
+    let backing = index.path_backing();
+    index
+        .entries()
+        .iter()
+        .filter(|e| e.stage() == Stage::Unconflicted)
+        .filter(|e| {
+            let (sec, nsec) = (u64::from(e.stat.mtime.secs), e.stat.mtime.nsecs);
+            idx_sec < sec || (idx_sec == sec && idx_nsec <= nsec)
+        })
+        .map(|e| e.path_in(backing).to_owned())
+        .collect()
+}
+
 /// A worktree path that will be written into the index.
 struct Staged {
     path: BString,
@@ -987,6 +1032,23 @@ fn add(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
             .iter()
             .filter(|e| e.stage() == Stage::Unconflicted)
             .map(|e| (e.path_in(backing).to_owned(), (e.id, e.mode)))
+            .collect()
+    };
+    // The stage-0 paths `is_racy_stat()` calls racily clean: their recorded
+    // mtime is not older than the index file's own, so the stat cache cannot
+    // prove them unchanged. `ie_match_stat()` is asked with
+    // `CE_MATCH_RACY_IS_DIRTY` here (that is what `run_diff_files()` passes), so
+    // every one of them counts as modified whatever its content says.
+    let racily_clean: HashSet<BString> = racy_paths(&index, &repo);
+    // The stat cache itself, for the `match_stat_data()` comparison that decides
+    // which tracked paths `run_diff_files()` hands to `add_file_to_index()`.
+    let tracked_stat: HashMap<BString, Stat> = {
+        let backing = index.path_backing();
+        index
+            .entries()
+            .iter()
+            .filter(|e| e.stage() == Stage::Unconflicted)
+            .map(|e| (e.path_in(backing).to_owned(), e.stat))
             .collect()
     };
 
@@ -1063,9 +1125,16 @@ fn add(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
             // the blob before the entry is recorded. The loop therefore leaves the
             // objects for every path it got through in the store even when a later
             // path aborts the command, which is observable in `cat-file
-            // --batch-all-objects`.
-            if let Ok(content) = std::fs::read(&full) {
-                let _ = repo.write_blob(&content);
+            // --batch-all-objects`. Under `--dry-run` it hashes without writing:
+            // `hash_flags` starts as `pretend ? 0 : INDEX_WRITE_OBJECT`. Under
+            // `-N` it never hashes at all: `add_to_index()` takes the
+            // `intent_only` branch and calls
+            // `set_object_name_for_intent_to_add_entry()` in place of
+            // `index_path()`, so the empty blob is the only object written.
+            if !o.dry_run && !o.intent_to_add {
+                if let Ok(content) = std::fs::read(&full) {
+                    let _ = repo.write_blob(&content);
+                }
             }
         }
     }
@@ -1074,6 +1143,9 @@ fn add(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
     let mut staged: Vec<Staged> = Vec::new();
     let mut printed: BTreeMap<BString, &'static str> = BTreeMap::new();
     let mut had_error = false;
+    // Whether any path actually reached `add_to_index()` under `-N`, which is
+    // what decides the empty-blob side effect further down.
+    let mut intent_visited = false;
     // The paths git counts toward "did the pathspec match anything": everything
     // that cleared the ignore/update filters below, plus the tracked set added
     // after the loop. Fed to `mark_seen_per_spec` so overlapping and
@@ -1091,7 +1163,10 @@ fn add(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
             continue;
         }
         // `-u/--update` restages tracked paths only; brand-new files are not its business.
-        if o.update && !already_tracked {
+        // `--renormalize` likewise: it clears `add_new_files`, and
+        // `renormalize_tracked_files()` walks the index, so an untracked path is
+        // never reported and never staged.
+        if (o.update || o.renormalize) && !already_tracked {
             continue;
         }
         universe.push(path.clone());
@@ -1113,20 +1188,49 @@ fn add(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
             }
         };
 
-        // `-N` records untracked paths as the empty blob and reports every matched
-        // path as added, leaving already-tracked entries untouched.
+        // `-N` records untracked paths as the empty blob, leaving already-tracked
+        // entries untouched.
         if o.intent_to_add {
-            printed.insert(path.clone(), "add");
-            if !already_tracked {
-                let stat = Stat::from_fs(&md).unwrap_or_default();
-                staged.push(Staged {
-                    path,
-                    id: repo.object_hash().empty_blob(),
-                    mode: Mode::FILE,
-                    stat,
-                    intent: true,
-                });
+            if already_tracked {
+                // Whether this path reaches `add_to_index()` at all is decided
+                // just below; the empty-blob side effect follows from that.
+                // A tracked path still has to *differ* to be reported: the report
+                // comes from `add_files_to_cache()`, whose `run_diff_files()` walk
+                // never hands an unchanged path to `add_file_to_index()`. `-N`
+                // changes what an already-visited path stages, not which paths
+                // are visited.
+                // `run_diff_files()` decides this on the **stat cache**, not on
+                // content: `ie_match_stat()` compares the recorded stat with the
+                // worktree's and reports a mismatch as modified even when the
+                // bytes are identical. A path it skips never reaches
+                // `add_to_index()`, so it is neither reported nor responsible for
+                // the empty blob.
+                //
+                // Under `--renormalize` the walk is
+                // `renormalize_tracked_files()`'s index scan instead, which has
+                // no such filter and hands over every matched blob.
+                let stat_now = Stat::from_fs(&md).unwrap_or_default();
+                let unchanged = !o.renormalize
+                    && !racily_clean.contains(&path)
+                    && tracked_stat
+                        .get(&path)
+                        .is_some_and(|recorded| recorded.matches(&stat_now, STAT_MATCH));
+                if !unchanged {
+                    printed.insert(path.clone(), "add");
+                    intent_visited = true;
+                }
+                continue;
             }
+            printed.insert(path.clone(), "add");
+            intent_visited = true;
+            let stat = Stat::from_fs(&md).unwrap_or_default();
+            staged.push(Staged {
+                path,
+                id: repo.object_hash().empty_blob(),
+                mode: Mode::FILE,
+                stat,
+                intent: true,
+            });
             continue;
         }
 
@@ -1140,7 +1244,11 @@ fn add(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
 
         // Unchanged content and mode: nothing to report, nothing to write. This is
         // what keeps `--verbose` quiet for paths git would leave alone.
-        if current == Some(&(id, mode)) {
+        //
+        // `--renormalize` is the exception: `add_to_index()` skips its `alias`
+        // lookup under `ADD_CACHE_RENORMALIZE`, so `was_same` never becomes true
+        // and every matched tracked blob is reported.
+        if !o.renormalize && current == Some(&(id, mode)) {
             continue;
         }
         printed.insert(path.clone(), "add");
@@ -1225,13 +1333,16 @@ fn add(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
         return Ok(ExitCode::from(FATAL));
     }
 
-    // `--intent-to-add` deposits the empty blob into the object store the moment it
-    // reaches the add phase, as a side effect of git's intent machinery — even in
-    // `--dry-run`, and even when no path actually becomes an intent-to-add entry
-    // (e.g. `-N -u`, or `-N` over an all-tracked pathspec). Only a pathspec that
-    // failed validation above skips it, which is why this sits after that check.
+    // `--intent-to-add` deposits the empty blob into the object store as a side
+    // effect of `set_object_name_for_intent_to_add_entry()`, which
+    // `add_to_index()` calls *before* the `pretend` check — so `--dry-run`
+    // leaves it behind too. It is not unconditional though: only a path that
+    // actually reaches `add_to_index()` triggers it, which is a modified tracked
+    // path or an untracked one. `-N` over an all-clean pathspec (`-N -u` in a
+    // clean worktree, `-N .` with nothing modified) writes no object at all,
+    // because `run_diff_files()` hands it no path to index.
     // The write is atomic and idempotent, so it needs no index lock.
-    if o.intent_to_add {
+    if o.intent_to_add && intent_visited {
         repo.write_blob(b"")?;
     }
 

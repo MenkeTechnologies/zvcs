@@ -30,8 +30,12 @@ pub enum Error {
     References(#[from] crate::reference::iter::Error),
     #[error("Could not iterate the references to exclude from the connectivity check")]
     ReferencesIter(#[from] crate::reference::iter::init::Error),
-    #[error("Could not load the alternate object databases")]
+    #[error("Could not load the alternate object databases for the connectivity check")]
     LoadAlternates(#[from] gix_odb::store::load_index::Error),
+    /// The object database failed outright, which is not the remote's doing and is passed on as-is
+    /// so the actual reason - a too-small slotmap, a corrupt pack - is what the user gets to read.
+    #[error(transparent)]
+    FindObject(#[from] gix_object::find::Error),
 }
 
 /// git's `struct check_connected_options`, reduced to the fields the fetch call site sets.
@@ -81,7 +85,10 @@ pub fn check_connected(
     if !opts.is_deepening_fetch {
         for repo in std::iter::once(repo).chain(alternate_repos(repo)?.iter()) {
             for reference in repo.references()?.all()?.filter_map(Result::ok) {
-                if let Some(Peeled::Commit(id)) = reference.try_id().and_then(|id| peel(repo, id.detach())) {
+                if let Some(Peeled::Commit(id)) = reference
+                    .try_id()
+                    .and_then(|id| peel(repo, id.detach()).ok().flatten())
+                {
                     hidden.push(id);
                 }
             }
@@ -93,7 +100,7 @@ pub fn check_connected(
     let mut commit_tips = Vec::new();
     let mut extra_trees = Vec::new();
     for tip in tips {
-        match peel(repo, *tip) {
+        match peel(repo, *tip)? {
             Some(Peeled::Commit(id)) => commit_tips.push(id),
             Some(Peeled::Tree(id)) => extra_trees.push(id),
             Some(Peeled::Blob) => {}
@@ -124,13 +131,13 @@ pub fn check_connected(
     let mut want_trees = Vec::with_capacity(interesting.len());
     let mut edge_trees = Vec::new();
     for info in &interesting {
-        match tree_of(repo, &info.id) {
+        match tree_of(repo, &info.id)? {
             Some(tree) => want_trees.push(tree),
             None => return Ok(false),
         }
         for parent in info.parent_ids.iter() {
             if !ids.contains(parent) {
-                if let Some(tree) = tree_of(repo, parent) {
+                if let Some(tree) = tree_of(repo, parent)? {
                     edge_trees.push(tree);
                 }
             }
@@ -139,10 +146,10 @@ pub fn check_connected(
 
     let mut seen = HashSet::new();
     for tree in edge_trees {
-        walk_tree(repo, tree, &mut seen, Missing::Tolerate);
+        walk_tree(repo, tree, &mut seen, Missing::Tolerate)?;
     }
     for tree in want_trees.into_iter().chain(extra_trees) {
-        if !walk_tree(repo, tree, &mut seen, Missing::Fail) {
+        if !walk_tree(repo, tree, &mut seen, Missing::Fail)? {
             return Ok(false);
         }
     }
@@ -164,16 +171,21 @@ enum Missing {
 /// Blobs are recorded but never read - `rev-list --objects` names them from their containing tree
 /// and does not open them, which is the difference between "connected" and "valid" that
 /// `connected.c` calls out.
-fn walk_tree(repo: &crate::Repository, root: ObjectId, seen: &mut HashSet<ObjectId>, missing: Missing) -> bool {
+fn walk_tree(
+    repo: &crate::Repository,
+    root: ObjectId,
+    seen: &mut HashSet<ObjectId>,
+    missing: Missing,
+) -> Result<bool, gix_object::find::Error> {
     let mut queue = VecDeque::from_iter(Some(root));
     let mut buf = Vec::new();
     while let Some(id) = queue.pop_front() {
         if !seen.insert(id) {
             continue;
         }
-        let Ok(Some(data)) = repo.objects.try_find(&id, &mut buf) else {
+        let Some(data) = repo.objects.try_find(&id, &mut buf)? else {
             if missing == Missing::Fail {
-                return false;
+                return Ok(false);
             }
             continue;
         };
@@ -189,7 +201,7 @@ fn walk_tree(repo: &crate::Repository, root: ObjectId, seen: &mut HashSet<Object
             }
         }
     }
-    true
+    Ok(true)
 }
 
 /// What a ref tip turned out to be once tags were followed.
@@ -201,30 +213,42 @@ enum Peeled {
 
 /// Follow `id` through any number of tag objects, as `parse_object()` does for a pending object.
 ///
-/// `None` means the chain ran into something that is not here, which is a disconnection.
-fn peel(repo: &crate::Repository, id: ObjectId) -> Option<Peeled> {
+/// `Ok(None)` means the chain ran into something that is not here, which is a disconnection. An
+/// `Err` is the object database itself failing, which says nothing about what the remote sent and
+/// must not be reported as one - `rev-list` prints its own reason in that case rather than letting
+/// git blame the server.
+fn peel(repo: &crate::Repository, id: ObjectId) -> Result<Option<Peeled>, gix_object::find::Error> {
     let mut id = id;
     let mut buf = Vec::new();
     loop {
-        let data = repo.objects.try_find(&id, &mut buf).ok().flatten()?;
+        let Some(data) = repo.objects.try_find(&id, &mut buf)? else {
+            return Ok(None);
+        };
         match data.kind {
-            gix_object::Kind::Commit => return Some(Peeled::Commit(id)),
-            gix_object::Kind::Tree => return Some(Peeled::Tree(id)),
-            gix_object::Kind::Blob => return Some(Peeled::Blob),
+            gix_object::Kind::Commit => return Ok(Some(Peeled::Commit(id))),
+            gix_object::Kind::Tree => return Ok(Some(Peeled::Tree(id))),
+            gix_object::Kind::Blob => return Ok(Some(Peeled::Blob)),
             gix_object::Kind::Tag => {
-                id = gix_object::TagRefIter::from_bytes(data.data, id.kind()).target_id().ok()?;
+                let Ok(target) = gix_object::TagRefIter::from_bytes(data.data, id.kind()).target_id() else {
+                    return Ok(None);
+                };
+                id = target;
             }
         }
     }
 }
 
-/// The tree of the commit `id`, or `None` if the commit is missing or unparseable.
-fn tree_of(repo: &crate::Repository, id: &oid) -> Option<ObjectId> {
+/// The tree of the commit `id`, or `Ok(None)` if the commit is missing or unparseable.
+///
+/// As in [`peel()`], a failing object database is an `Err` and not a missing object.
+fn tree_of(repo: &crate::Repository, id: &oid) -> Result<Option<ObjectId>, gix_object::find::Error> {
     let mut buf = Vec::new();
-    let data = repo.objects.try_find(id, &mut buf).ok().flatten()?;
-    (data.kind == gix_object::Kind::Commit)
+    let Some(data) = repo.objects.try_find(id, &mut buf)? else {
+        return Ok(None);
+    };
+    Ok((data.kind == gix_object::Kind::Commit)
         .then(|| gix_object::CommitRefIter::from_bytes(data.data, id.kind()).tree_id().ok())
-        .flatten()
+        .flatten())
 }
 
 /// git's `find_pack_entry_one()` restricted to packs marked `.promisor`.

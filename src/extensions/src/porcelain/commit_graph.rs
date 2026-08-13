@@ -470,9 +470,12 @@ fn write_graph(args: &[String], inherited_object_dir: Option<String>) -> Result<
                 let Some(v) = args.get(i) else {
                     return Ok(missing_value("max-new-filters"));
                 };
-                match v.parse::<i64>() {
-                    Ok(n) => max_new_filters = Some(n),
-                    Err(_) => {
+                // `write_option_max_new_filters()` reads the value with C `strtol`, so
+                // overflow saturates instead of failing and only trailing junk is an
+                // error.
+                match crate::optint::strtol_all(v) {
+                    Some(n) => max_new_filters = Some(n),
+                    None => {
                         eprintln!("error: option `max-new-filters' expects a numerical value");
                         return Ok(ExitCode::from(129));
                     }
@@ -513,9 +516,12 @@ fn write_graph(args: &[String], inherited_object_dir: Option<String>) -> Result<
             }
             s if long_value(s, "max-new-filters").is_some() => {
                 let v = long_value(s, "max-new-filters").unwrap_or_default();
-                match v.parse::<i64>() {
-                    Ok(n) => max_new_filters = Some(n),
-                    Err(_) => {
+                // `write_option_max_new_filters()` reads the value with C `strtol`, so
+                // overflow saturates instead of failing and only trailing junk is an
+                // error.
+                match crate::optint::strtol_all(v) {
+                    Some(n) => max_new_filters = Some(n),
+                    None => {
                         eprintln!("error: option `max-new-filters' expects a numerical value");
                         return Ok(ExitCode::from(129));
                     }

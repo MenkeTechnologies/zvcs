@@ -490,7 +490,7 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
     let repo = gix::discover(".")?;
     let workdir = repo
         .workdir()
-        .ok_or_else(|| anyhow!("this operation must be run in a work tree"))?
+        .ok_or_else(|| crate::fatal::need_work_tree())?
         .to_owned();
     let cwd = std::env::current_dir()?;
     // Pathspecs given relative to the current directory are resolved against the

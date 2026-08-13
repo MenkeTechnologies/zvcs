@@ -265,6 +265,13 @@ fn collapse_slashes(refname: &[u8]) -> Vec<u8> {
 /// Shared with the reference-database check in [`super::fsck`], which is git's
 /// `git refs verify` and calls the same function for `badRefName` and
 /// `badReferentName`.
+/// `check_refname_format(refname, REFNAME_ALLOW_ONELEVEL)` — the form
+/// `ref_transaction_update()` applies to every ref it is about to write, which
+/// is why `git update-ref main <oid>` is legal and lands in `$GIT_DIR/main`.
+pub(crate) fn check_refname_format_onelevel(refname: &[u8]) -> bool {
+    check_refname_format(refname, ALLOW_ONELEVEL)
+}
+
 pub(crate) fn check_refname_format(refname: &[u8], mut flags: u32) -> bool {
     if refname == b"@" {
         return false;

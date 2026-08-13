@@ -567,15 +567,16 @@ fn parse_opts(
                                 return Err(ExitCode::from(128));
                             }
                         }
-                    } else if v.parse::<usize>().is_err() {
-                        eprintln!(
-                            "error: switch `C' expects a non-negative integer value with an optional k/m/g suffix"
-                        );
-                        return Err(ExitCode::from(129));
                     } else {
-                        o.p_context = v.parse::<usize>().ok();
-                        if o.p_context.is_none() {
-                            mark(unhonoured, "context", &format!("-C{v}"), R_CONTEXT);
+                        // `-C` is `OPT_UNSIGNED` over an `unsigned int`, so its
+                        // range clause reads `[0,4294967295]` and `0x10`/`1k`
+                        // are values it accepts.
+                        match crate::optint::unsigned_prec(&crate::optint::short_opt('C'), &v, 4) {
+                            Ok(n) => o.p_context = Some(n as usize),
+                            Err(e) => {
+                                eprintln!("error: {e}");
+                                return Err(ExitCode::from(129));
+                            }
                         }
                     }
                 }

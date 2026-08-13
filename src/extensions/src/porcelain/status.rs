@@ -435,6 +435,11 @@ pub fn status(args: &[String]) -> Result<ExitCode> {
     super::column::finalize(&mut colopts);
 
     let repo = gix::discover(".")?;
+    // git.c runs `status` with `RUN_SETUP | NEED_WORK_TREE`, so a setup that found no work tree —
+    // a bare repository, or a cwd inside the git directory — dies here rather than in the walk.
+    if repo.workdir().is_none() {
+        return Err(crate::fatal::need_work_tree());
+    }
 
     // `status.displayCommentPrefix` (git's `git_status_config`): when true the
     // long human format prefixes every line with the comment string. Resolved to

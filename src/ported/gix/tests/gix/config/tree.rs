@@ -8,12 +8,15 @@ mod keys {
         assert!(gix::config::tree::Http::USER_AGENT.validate("agent".into()).is_ok());
 
         let invalid = b"\xF0\x80\x80".as_bstr();
+        // A key that names an environment override says so, because the bad value may well have
+        // come from there rather than from a config file: git-config(1) for `http.userAgent` -
+        // "Can be overridden by the GIT_HTTP_USER_AGENT environment variable."
         assert_eq!(
             gix::config::tree::Http::USER_AGENT
                 .try_into_string(invalid)
                 .unwrap_err()
                 .to_string(),
-            "The utf-8 string at \"http.userAgent=���\" could not be decoded"
+            "The utf-8 string at \"http.userAgent=���\" (possibly from GIT_HTTP_USER_AGENT) could not be decoded"
         );
         assert!(gix::config::tree::Http::USER_AGENT.validate(invalid).is_err());
 

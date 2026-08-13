@@ -282,7 +282,12 @@ impl PatchDiffOpts {
     /// command: `--patch` for `reset`/`checkout`, `--interactive/--patch` for
     /// `add` and `commit`, whose `-i` reaches the same hunk selector.
     pub(super) fn require_patch_named(&self, patch: bool, what: &str) -> Option<ExitCode> {
-        self.reject_negative()?;
+        // `?` would be exactly backwards here: `reject_negative()` returning
+        // `None` means *no* negative value was given, which is the case that has
+        // to fall through to the `requires` half rather than end the check.
+        if let Some(code) = self.reject_negative() {
+            return Some(code);
+        }
         self.require_patch_only(patch, what)
     }
 
@@ -800,7 +805,11 @@ fn move_head(repo: &gix::Repository, target: ObjectId, spec: &str) -> Result<()>
 }
 
 /// Point `ORIG_HEAD` at `id`, as `reset_refs()` does before `HEAD` moves.
-fn set_orig_head(repo: &gix::Repository, id: ObjectId) -> Result<()> {
+///
+/// Shared with [`crate::porcelain::stash`]: `do_push_stash()` clears the
+/// worktree by running `git reset --hard`, so a push inherits this side effect
+/// rather than having its own.
+pub(crate) fn set_orig_head(repo: &gix::Repository, id: ObjectId) -> Result<()> {
     let name: FullName = "ORIG_HEAD"
         .try_into()
         .map_err(|e| anyhow!("invalid ref name ORIG_HEAD: {e}"))?;

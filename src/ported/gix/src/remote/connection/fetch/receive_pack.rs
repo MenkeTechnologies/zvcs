@@ -1,5 +1,6 @@
 use std::{ops::DerefMut, path::PathBuf, sync::atomic::AtomicBool};
 
+use gix_object::Exists;
 use gix_odb::store::RefreshMode;
 use gix_protocol::fetch::{Arguments, negotiate};
 #[cfg(feature = "async-network-client")]
@@ -330,6 +331,19 @@ where
                 self.write_packed_refs,
                 self.atomic,
             )?;
+            // With `tagOpt` left at its default, every `refs/tags/*` the server advertised is in
+            // the ref map, including the ones that point outside the history being fetched. git
+            // drops those before the connectivity check: `find_non_local_tags()` only follows a
+            // tag whose object `has_object()` or is in `fetch_oids`, so an unrelated tag never
+            // reaches `iterate_ref_map()`. gitoxide drops them later instead, in `update_refs()`
+            // as `ImplicitTagNotSentByRemote` - and that classification needs the 'object exists'
+            // check which `DryRun::Yes` deliberately skips, so `planned` above cannot report it
+            // and the rule has to be applied here, against the pack that is now on disk.
+            let implicit_tag_spec = con
+                .remote
+                .fetch_tags
+                .to_refspec()
+                .filter(|_| matches!(con.remote.fetch_tags, fetch::Tags::Included));
             let tips: Vec<_> = planned
                 .updates
                 .iter()
@@ -347,7 +361,18 @@ where
                         && !update.mode.is_rejected()
                         && !matches!(update.mode, refs::update::Mode::NoChangeNeeded)
                 })
-                .filter_map(|(_, m)| m.remote.as_id().map(ToOwned::to_owned))
+                .filter_map(|(_, m)| {
+                    let id = m.remote.as_id()?;
+                    let is_implicit_tag = implicit_tag_spec.is_some_and(|tag_spec| {
+                        m.spec_index
+                            .get(con.remote.fetch_refspecs(), &self.ref_map.extra_refspecs)
+                            .is_some_and(|spec| spec.to_ref() == tag_spec)
+                    });
+                    if is_implicit_tag && !repo.objects.exists(id) {
+                        return None;
+                    }
+                    Some(id.to_owned())
+                })
                 .collect();
             let options = connected::Options {
                 from_promisor: self.filter.is_some(),

@@ -365,29 +365,10 @@ fn parse_unsigned(value: &str, name: &str) -> Result<i64, ParseError> {
     })
 }
 
-/// git's `git_parse_signed`: `strtol` base 10 followed by a binary unit suffix.
+/// git's `git_parse_signed`, through the shared [`crate::optint`] grammar:
+/// `strtoimax` with base 0 followed by a binary unit suffix.
 fn parse_with_unit(value: &str) -> Option<i64> {
-    let s = value.trim_start_matches([' ', '\t', '\n', '\r']);
-    let (sign, rest) = match s.strip_prefix('-') {
-        Some(r) => (-1i64, r),
-        None => (1i64, s.strip_prefix('+').unwrap_or(s)),
-    };
-    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
-    if digits.is_empty() {
-        return None;
-    }
-    let factor: i64 = match &rest[digits.len()..] {
-        "" => 1,
-        "k" | "K" => 1024,
-        "m" | "M" => 1024 * 1024,
-        "g" | "G" => 1024 * 1024 * 1024,
-        _ => return None,
-    };
-    digits
-        .parse::<i64>()
-        .ok()
-        .and_then(|n| n.checked_mul(factor))
-        .map(|n| sign * n)
+    crate::optint::integer(&crate::optint::long_opt(""), value).ok()
 }
 
 /// Apply `column.ui` and, when `--command=<name>` led the command line,

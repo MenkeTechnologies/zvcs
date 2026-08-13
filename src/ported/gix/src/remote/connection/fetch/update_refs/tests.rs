@@ -54,6 +54,14 @@ mod update {
             .expect("ref peels to an object")
             .detach()
     }
+    /// The `atomic` argument of [`fetch::refs::update`], spelled out for the call sites below.
+    ///
+    /// git's `fetch --atomic` is opt-in and off by default: every update that passes on its own is
+    /// applied, and a rejected one is simply left out. That per-ref behaviour is what these tests
+    /// assert, so they all pass `false`. Passing `true` would keep the returned `updates`/`edits`
+    /// identical while silently skipping the ref transaction for any case that has a rejection in
+    /// it - the tests would still pass but would no longer exercise a write.
+    const NON_ATOMIC: bool = false;
     use gix_ref::{
         Target, TargetRef,
         transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog},
@@ -87,28 +95,31 @@ mod update {
                 None,
                 "without local destination ref there is nothing to do for us, ever (except for FETCH_HEADs) later",
             ),
+            // A ref that has to be created is named after the *remote* side (builtin/fetch.c:1023-1031),
+            // so all three of these log "storing head" - the local `refs/remotes/`, `refs/heads/` or
+            // `refs/tags/` destination has no say in it.
             (
                 "refs/heads/main:refs/remotes/origin/new-main",
                 fetch::refs::update::Mode::New,
-                Some("storing ref"),
+                Some("storing head"),
                 "the destination branch doesn't exist and needs to be created",
             ),
             (
                 "refs/heads/main:refs/heads/feature",
                 fetch::refs::update::Mode::New,
                 Some("storing head"),
-                "reflog messages are specific to the type of branch stored, to some limited extend",
+                "the remote side is under refs/heads/, which is what the message is chosen from",
             ),
             (
                 "refs/heads/main:refs/tags/new-tag",
                 fetch::refs::update::Mode::New,
-                Some("storing tag"),
-                "reflog messages are specific to the type of branch stored, to some limited extend",
+                Some("storing head"),
+                "a new local tag fed from a branch is still 'storing head' - the remote name decides",
             ),
             (
                 "+refs/heads/main:refs/remotes/origin/new-main",
                 fetch::refs::update::Mode::New,
-                Some("storing ref"),
+                Some("storing head"),
                 "just to validate that we really are in dry-run mode, or else this ref would be present now",
             ),
             (
@@ -154,6 +165,7 @@ mod update {
                 fetch::Tags::None,
                 reflog_message.map_or(fetch::DryRun::No, |_| fetch::DryRun::Yes),
                 fetch::WritePackedRefs::Never,
+                NON_ATOMIC,
             )
             .unwrap();
 
@@ -201,6 +213,7 @@ mod update {
             fetch::Tags::None,
             fetch::DryRun::No,
             fetch::WritePackedRefs::Never,
+            NON_ATOMIC,
         )
         .unwrap();
         assert_eq!(
@@ -244,6 +257,7 @@ mod update {
                 fetch::Tags::None,
                 fetch::DryRun::Yes,
                 fetch::WritePackedRefs::Never,
+                NON_ATOMIC,
             )?;
 
             assert_eq!(
@@ -276,6 +290,7 @@ mod update {
             fetch::Tags::None,
             fetch::DryRun::Yes,
             fetch::WritePackedRefs::Never,
+            NON_ATOMIC,
         )?;
         assert_eq!(
             out.updates,
@@ -303,6 +318,7 @@ mod update {
             fetch::Tags::None,
             fetch::DryRun::Yes,
             fetch::WritePackedRefs::Never,
+            NON_ATOMIC,
         )?;
         assert_eq!(
             out.updates,
@@ -343,6 +359,7 @@ mod update {
             fetch::Tags::None,
             fetch::DryRun::Yes,
             fetch::WritePackedRefs::Never,
+            NON_ATOMIC,
         )?;
         assert_eq!(
             out.updates,
@@ -394,6 +411,7 @@ mod update {
             fetch::Tags::None,
             fetch::DryRun::Yes,
             fetch::WritePackedRefs::Never,
+            NON_ATOMIC,
         )?;
         assert_eq!(
             out.updates,
@@ -442,6 +460,7 @@ mod update {
             fetch::Tags::None,
             fetch::DryRun::Yes,
             fetch::WritePackedRefs::Never,
+            NON_ATOMIC,
         )?;
         assert_eq!(
             out.updates,
@@ -472,6 +491,7 @@ mod update {
             fetch::Tags::None,
             fetch::DryRun::Yes,
             fetch::WritePackedRefs::Never,
+            NON_ATOMIC,
         )?;
         assert_eq!(
             out.updates,
@@ -613,6 +633,7 @@ mod update {
                 fetch::Tags::None,
                 fetch::DryRun::Yes,
                 fetch::WritePackedRefs::Never,
+                NON_ATOMIC,
             )
             .unwrap();
 
@@ -649,6 +670,7 @@ mod update {
             fetch::Tags::None,
             fetch::DryRun::Yes,
             fetch::WritePackedRefs::Never,
+            NON_ATOMIC,
         )
         .unwrap();
 
@@ -671,7 +693,9 @@ mod update {
         let edit = &out.edits[0];
         match &edit.change {
             Change::Update { log, new, .. } => {
-                assert_eq!(log.message, "action: storing ref");
+                // Remote side is `refs/heads/symbolic`, so builtin/fetch.c:1026-1028 picks
+                // "storing head" no matter that the local destination is a remote-tracking ref.
+                assert_eq!(log.message, "action: storing head");
                 let target = peeled_id(&repo, "refs/heads/main");
                 assert_eq!(
                     new.try_id(),
@@ -696,6 +720,7 @@ mod update {
             fetch::Tags::None,
             fetch::DryRun::Yes,
             fetch::WritePackedRefs::Never,
+            NON_ATOMIC,
         )
         .unwrap();
 
@@ -728,6 +753,7 @@ mod update {
             fetch::Tags::None,
             fetch::DryRun::Yes,
             fetch::WritePackedRefs::Never,
+            NON_ATOMIC,
         )
         .unwrap();
 
@@ -779,6 +805,7 @@ mod update {
             fetch::Tags::None,
             fetch::DryRun::Yes,
             fetch::WritePackedRefs::Never,
+            NON_ATOMIC,
         )
         .unwrap();
 
@@ -801,6 +828,8 @@ mod update {
         let edit = &out.edits[0];
         match &edit.change {
             Change::Update { log, new, .. } => {
+                // Remote side is `HEAD`, which is neither `refs/tags/` nor `refs/heads/`, so
+                // builtin/fetch.c:1029-1031 falls through to "storing ref".
                 assert_eq!(log.message, "action: storing ref");
                 let target = peeled_id(&repo, "refs/heads/main");
                 assert_eq!(
@@ -830,6 +859,7 @@ mod update {
             fetch::Tags::None,
             fetch::DryRun::Yes,
             fetch::WritePackedRefs::Never,
+            NON_ATOMIC,
         )
         .unwrap();
 
@@ -865,6 +895,7 @@ mod update {
             fetch::Tags::None,
             fetch::DryRun::No,
             fetch::WritePackedRefs::Never,
+            NON_ATOMIC,
         )
         .unwrap();
 
@@ -888,6 +919,7 @@ mod update {
             fetch::Tags::None,
             fetch::DryRun::No,
             fetch::WritePackedRefs::Never,
+            NON_ATOMIC,
         )
         .unwrap();
 
@@ -922,6 +954,7 @@ mod update {
             fetch::Tags::None,
             fetch::DryRun::No,
             fetch::WritePackedRefs::Never,
+            NON_ATOMIC,
         )
         .unwrap();
 

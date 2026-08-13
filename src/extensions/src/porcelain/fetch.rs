@@ -294,16 +294,17 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
             "--no-recurse-submodules" => recurse_submodules = Some(Recurse::No),
             "-j" | "--jobs" => {
                 let v = take_value!("--jobs");
-                // `OPT_INTEGER`'s own rejection, which names the unit suffixes it
-                // would have accepted.
-                let Ok(n) = v.parse::<usize>() else {
-                    eprintln!(
-                        "error: option `jobs' expects an integer value with an optional k/m/g suffix"
-                    );
-                    return Ok(ExitCode::from(129));
+                // `OPT_INTEGER`, through the shared parse-options grammar so the
+                // unit suffixes its own rejection advertises actually work.
+                let n = match crate::optint::integer(&crate::optint::long_opt("jobs"), &v) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        return Ok(ExitCode::from(129));
+                    }
                 };
                 // `0` is git's "pick a reasonable number", resolved below.
-                jobs = Some(n);
+                jobs = Some(n.max(0) as usize);
             }
 
             "--depth" => {
@@ -320,13 +321,14 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
             "--deepen" => {
                 let v = take_value!("--deepen");
                 // `OPT_INTEGER`, so a bad value is parse-options' rejection.
-                let Ok(n) = v.parse::<u32>() else {
-                    eprintln!(
-                        "error: option `deepen' expects an integer value with an optional k/m/g suffix"
-                    );
-                    return Ok(ExitCode::from(129));
+                let n = match crate::optint::integer(&crate::optint::long_opt("deepen"), &v) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        return Ok(ExitCode::from(129));
+                    }
                 };
-                opts.shallow = Some(Shallow::Deepen(n));
+                opts.shallow = Some(Shallow::Deepen(n.max(0) as u32));
             }
             // Shallow boundary at a cutoff date (git's `deepen_since`). `fetch-pack.c:439` runs
             // the value through `approxidate()`, which never fails — an unreadable date is the

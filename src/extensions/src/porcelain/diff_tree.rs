@@ -1450,6 +1450,10 @@ fn is_known_unsupported(a: &str) -> bool {
         "--word-diff",
         "--color-moved",
         "--no-color-moved",
+        // `--no-color-moved-ws` is `OPT_CALLBACK_F(..., PARSE_OPT_NONEG)`'s twin
+        // in `diff_opt_color_moved_ws()`: git takes it and clears the mode, so it
+        // is a recognised flag here rather than an unknown one.
+        "--no-color-moved-ws",
         "--anchored",
     ];
     const PREFIX: &[&str] = &[

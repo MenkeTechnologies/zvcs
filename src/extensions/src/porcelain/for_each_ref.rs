@@ -1134,13 +1134,7 @@ fn quote(value: &[u8], style: QuoteStyle) -> Vec<u8> {
 /// git's `OPT_INTEGER` operand: a decimal count with an optional `k`/`m`/`g`
 /// scaling suffix.
 fn parse_count(v: &str) -> Option<i64> {
-    let (digits, scale): (&str, i64) = match v.as_bytes().last().copied() {
-        Some(b'k') | Some(b'K') => (&v[..v.len() - 1], 1024),
-        Some(b'm') | Some(b'M') => (&v[..v.len() - 1], 1024 * 1024),
-        Some(b'g') | Some(b'G') => (&v[..v.len() - 1], 1024 * 1024 * 1024),
-        _ => (v, 1),
-    };
-    digits.parse::<i64>().ok()?.checked_mul(scale)
+    crate::optint::integer(&crate::optint::long_opt("count"), v).ok()
 }
 
 /// Resolve a filter operand the way `parse_opt_commits` does: parse the

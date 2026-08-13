@@ -203,9 +203,14 @@ struct Options {
     /// 0 means "not given"; git stores it the same way.
     mainline: usize,
     cleanup: Option<String>,
-    /// Kept only so `--strategy-option` can be reported as incompatible with a
-    /// command mode; a revert never consults the value.
-    xopts: usize,
+    /// `opts->strategy`. A revert never *runs* a strategy — `do_pick_commit()`
+    /// routes `TODO_REVERT` through merge-ort whatever this says — but
+    /// `save_opts()` still records it, so a stopped sequence remembers the name
+    /// across a `--continue`.
+    strategy: Option<String>,
+    /// `opts->xopts`. Reported as incompatible with a command mode, and
+    /// persisted by `save_opts()`; never consulted while reverting.
+    xopts: Vec<String>,
     /// `Some(true)` for `--rerere-autoupdate`, `Some(false)` for the negation.
     rerere: Option<bool>,
     mode: Option<Cmd>,
@@ -266,8 +271,8 @@ pub fn revert(args: &[String]) -> Result<ExitCode> {
             "--no-gpg-sign" => {}
             "--no-mainline" => o.mainline = 0,
             "--no-cleanup" => o.cleanup = None,
-            "--no-strategy" => {}
-            "--no-strategy-option" => o.xopts = 0,
+            "--no-strategy" => o.strategy = None,
+            "--no-strategy-option" => o.xopts.clear(),
             "-m" | "--mainline" => {
                 i += 1;
                 let Some(v) = args.get(i) else {
@@ -289,18 +294,19 @@ pub fn revert(args: &[String]) -> Result<ExitCode> {
             }
             "--strategy" => {
                 i += 1;
-                if args.get(i).is_none() {
+                let Some(v) = args.get(i) else {
                     eprintln!("error: option `strategy' requires a value");
                     return Ok(ExitCode::from(129));
-                }
+                };
+                o.strategy = Some(v.clone());
             }
             "-X" | "--strategy-option" => {
                 i += 1;
-                if args.get(i).is_none() {
+                let Some(v) = args.get(i) else {
                     eprintln!("error: option `strategy-option' requires a value");
                     return Ok(ExitCode::from(129));
-                }
-                o.xopts += 1;
+                };
+                o.xopts.push(v.clone());
             }
             "--quit" => {
                 if let Some(code) = set_mode(&mut o, Cmd::Quit) {
@@ -333,9 +339,15 @@ pub fn revert(args: &[String]) -> Result<ExitCode> {
             _ if a.starts_with("--cleanup=") => {
                 o.cleanup = Some(a["--cleanup=".len()..].to_string());
             }
-            _ if a.starts_with("--strategy-option=") => o.xopts += 1,
-            _ if a.starts_with("-X") && !a.starts_with("--") => o.xopts += 1,
-            _ if a.starts_with("--strategy=") => {}
+            _ if a.starts_with("--strategy-option=") => {
+                o.xopts.push(a["--strategy-option=".len()..].to_string());
+            }
+            _ if a.starts_with("-X") && !a.starts_with("--") => {
+                o.xopts.push(a[2..].to_string());
+            }
+            _ if a.starts_with("--strategy=") => {
+                o.strategy = Some(a["--strategy=".len()..].to_string());
+            }
             _ if a.starts_with("-S") || a.starts_with("--gpg-sign") => {
                 bail!("GPG signing is not supported")
             }
@@ -387,7 +399,7 @@ pub fn revert(args: &[String]) -> Result<ExitCode> {
             ("--no-commit", o.no_commit),
             ("--signoff", o.signoff),
             ("--mainline", o.mainline != 0),
-            ("--strategy-option", o.xopts > 0),
+            ("--strategy-option", !o.xopts.is_empty()),
             ("--rerere-autoupdate", o.rerere == Some(true)),
             ("--no-rerere-autoupdate", o.rerere == Some(false)),
         ] {
@@ -434,7 +446,8 @@ pub fn revert(args: &[String]) -> Result<ExitCode> {
         }
         let head = repo.head_id()?.detach();
         crate::sequencer::save_head(git_dir, head)?;
-        crate::sequencer::save_opts(git_dir, &saved_opts(&o, cleanup))?;
+        let xopts: Vec<&str> = o.xopts.iter().map(String::as_str).collect();
+        crate::sequencer::save_opts(git_dir, &saved_opts(&o, &xopts, cleanup))?;
         crate::sequencer::update_abort_safety_file(&repo)?;
     }
     // With `-n` nothing is committed between steps; each further revert stacks
@@ -470,12 +483,26 @@ fn build_todo(
 /// keys than a cherry-pick does — `--reference` is `opts->commit_use_reference`,
 /// which `save_opts` does not persist at all, so it is lost across a
 /// `--continue` in stock too.
-fn saved_opts<'a>(o: &Options, cleanup: Option<Cleanup>) -> crate::sequencer::SavedOpts<'a> {
+///
+/// `--strategy` and `-X` are persisted even though a revert never runs a
+/// strategy: `save_opts()` writes `options.strategy` and
+/// `options.strategy-option` from `opts->strategy`/`opts->xopts` with no regard
+/// for the action (sequencer.c). Dropping them left a stopped
+/// `git revert --strategy=<x> A B` with no `.git/sequencer/opts` at all where
+/// stock has one — the fuzz corpus found it as
+/// `revert --strategy=<TAB> -- HEAD^ v0.1.0 HEAD`.
+fn saved_opts<'a>(
+    o: &'a Options,
+    xopts: &'a [&'a str],
+    cleanup: Option<Cleanup>,
+) -> crate::sequencer::SavedOpts<'a> {
     crate::sequencer::SavedOpts {
         no_commit: o.no_commit,
         edit: o.edit_given,
         signoff: o.signoff,
         mainline: o.mainline as u32,
+        strategy: o.strategy.as_deref(),
+        xopts,
         allow_rerere_auto: o.rerere,
         default_msg_cleanup: cleanup.map(Cleanup::name),
         ..Default::default()
@@ -675,7 +702,8 @@ fn sequencer_continue(repo: &gix::Repository, git_dir: &std::path::Path) -> Resu
         reference: false,
         mainline: loaded.mainline as usize,
         cleanup: loaded.default_msg_cleanup.clone(),
-        xopts: loaded.xopts.len(),
+        strategy: loaded.strategy.clone(),
+        xopts: loaded.xopts.clone(),
         rerere: loaded.allow_rerere_auto,
         mode: None,
     };

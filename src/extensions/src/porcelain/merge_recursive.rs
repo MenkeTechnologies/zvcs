@@ -265,6 +265,10 @@ pub fn merge_recursive(args: &[String]) -> Result<ExitCode> {
     index.remove_tree();
     index.write(Default::default())?;
 
+    // `merge_ort_generic()` reaches `merge_switch_to_result()` like every other
+    // merge-ort caller, so the plumbing verb leaves `AUTO_MERGE` behind too.
+    crate::merge_apply::write_auto_merge(&repo, merged_tree)?;
+
     let mut buf: Vec<u8> = Vec::new();
     for m in &messages {
         buf.extend_from_slice(m.text.as_bytes());

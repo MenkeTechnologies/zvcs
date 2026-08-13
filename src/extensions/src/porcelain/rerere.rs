@@ -254,7 +254,7 @@ fn cmd_diff(repo: &gix::Repository) -> Result<ExitCode> {
         let minus = std::fs::read(variant_path(&id_dir, e.variant, "preimage")).map_err(|_| fail())?;
         let worktree = repo
             .workdir_path(&e.path)
-            .ok_or_else(|| anyhow::anyhow!("this operation must be run in a work tree"))?;
+            .ok_or_else(|| crate::fatal::need_work_tree())?;
         let plus = std::fs::read(&worktree).map_err(|_| fail())?;
 
         out.extend_from_slice(b"--- a/");

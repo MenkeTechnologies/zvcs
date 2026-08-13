@@ -36,8 +36,26 @@ pub struct Options {
     pub(crate) api_config_overrides: Vec<BString>,
     pub(crate) cli_config_overrides: Vec<BString>,
     pub(crate) open_path_as_is: bool,
+    /// Where the work tree comes from when neither the caller, `GIT_WORK_TREE` nor `core.worktree`
+    /// names one.
+    pub(crate) implicit_work_tree: ImplicitWorkTree,
     /// Internal to pass an already obtained CWD on to where it may also be used. This avoids the CWD being queried more than once per repo.
     pub(crate) current_dir: Option<PathBuf>,
+}
+
+/// The work tree a non-bare repository falls back to, which git decides in `setup.c` based on
+/// *how* the repository was located.
+#[derive(Copy, Clone, Ord, PartialOrd, PartialEq, Eq, Debug, Hash)]
+pub(crate) enum ImplicitWorkTree {
+    /// The parent of a git directory named `.git`, which is what `GIT_DIR_DISCOVERED` means.
+    ParentOfDotGitDir,
+    /// The current working directory: `setup_explicit_git_dir()` ends in `set_git_work_tree(repo, ".")`
+    /// when `GIT_DIR` was given outright and nothing else names a work tree.
+    CurrentDir,
+    /// No work tree at all. `setup_bare_git_dir()` sets `GIT_IMPLICIT_WORK_TREE=0` for this, so a
+    /// repository found by standing inside its own git directory has no work tree even though
+    /// `core.bare` is false.
+    None,
 }
 
 /// The error returned by [`crate::open()`].

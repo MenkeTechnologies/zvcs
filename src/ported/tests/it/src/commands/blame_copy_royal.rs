@@ -11,7 +11,7 @@ pub(super) mod function {
         objs::FindExt,
     };
     use std::{
-        collections::BTreeSet,
+        collections::{BTreeSet, HashSet},
         ffi::OsStr,
         fmt::Display,
         path::{Path, PathBuf},
@@ -35,12 +35,33 @@ pub(super) mod function {
         let mut resource_cache = repo.diff_resource_cache_for_tree_diff()?;
         let diff_algorithm = repo.diff_algorithm()?;
 
+        // A plain `git blame <file>` walked backwards from `HEAD`, with rename tracking on and the
+        // path recorded, which is all this command needs: `blame_path` is what the generated
+        // history script is built from. The remaining knobs are all off on purpose - each of them
+        // changes which commits enter the blame history, and so would change the fixture this
+        // command emits, and nothing on its command line asks for any of them. They are listed
+        // rather than left to `..Default::default()` so that a new blame option has to be decided
+        // here instead of being adopted silently.
         let options = gix::blame::Options {
             diff_algorithm,
             ranges: gix::blame::BlameRanges::default(),
             since: None,
             rewrites: Some(gix::diff::Rewrites::default()),
             debug_track_path: true,
+            // `-w`
+            ignore_whitespace: false,
+            // `-M`
+            detect_moved: None,
+            // `--ignore-rev`
+            ignore_revs: HashSet::new(),
+            // `-C`
+            detect_copied: None,
+            // `--first-parent`
+            first_parent: false,
+            // `--reverse`; this command blames backwards from `suspect`, so there is no children map.
+            children: None,
+            // No working-tree overlay: the final image is the blob at `suspect`, not a file on disk.
+            fake_commit: None,
         };
 
         let index = repo.index_or_empty()?;

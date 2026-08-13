@@ -1501,40 +1501,26 @@ fn parse_filter(v: &str) -> Result<Filter, Fatal> {
     Ok(Filter { keep, all_or_none })
 }
 
-/// `OPT_UNSIGNED`'s value (`parse_options.c` `parse_opt_unsigned`): an optional leading
-/// `+`, one or more decimal digits, then an optional single k/m/g suffix
-/// (case-insensitive) multiplying by 1024, 1024² or 1024³.
+/// `OPT_UNSIGNED`'s value, through the shared `parse-options` grammar: base 0
+/// (so `0x10` is sixteen and `010` is eight), an optional leading `+`, and one
+/// optional `k`/`m`/`g` suffix. The target is a C `int`, which is what makes the
+/// range clause read `[0,4294967295]`.
 ///
 /// `None` for anything that does not match, which every caller turns into git's 129.
 pub(crate) fn parse_magnitude(v: &str) -> Option<u64> {
-    let b = v.as_bytes();
-    let mut i = usize::from(b.first() == Some(&b'+'));
-    let digits_start = i;
-    while i < b.len() && b[i].is_ascii_digit() {
-        i += 1;
-    }
-    if i == digits_start {
-        return None;
-    }
-    let mut n: u64 = v[digits_start..i].parse().ok()?;
-    if i < b.len() {
-        n = n.checked_mul(match b[i] {
-            b'k' | b'K' => 1024,
-            b'm' | b'M' => 1024 * 1024,
-            b'g' | b'G' => 1024 * 1024 * 1024,
-            _ => return None,
-        })?;
-        i += 1;
-    }
-    (i == b.len()).then_some(n)
+    crate::optint::unsigned_prec(&crate::optint::long_opt(""), v, 4).ok()
 }
 
-/// `OPT_UNSIGNED` validation. An empty value and a malformed one carry distinct messages.
+/// `OPT_UNSIGNED` validation. The empty value, the unreadable one and the
+/// out-of-range one each carry their own message.
 fn validate_magnitude(v: &str, opt: &'static str) -> Result<u64, Fatal> {
-    if v.is_empty() {
-        return Err(Fatal::Magnitude(opt));
+    use crate::optint::IntError;
+    match crate::optint::unsigned_prec(&crate::optint::long_opt(opt), v, 4) {
+        Ok(n) => Ok(n),
+        Err(IntError::Empty(_)) => Err(Fatal::Magnitude(opt)),
+        Err(IntError::NotANumber(_)) => Err(Fatal::BadMagnitude(opt)),
+        Err(IntError::OutOfRange(m)) => Err(Fatal::OptionError(format!("error: {m}"))),
     }
-    parse_magnitude(v).ok_or(Fatal::BadMagnitude(opt))
 }
 
 /// How many times `needle` occurs in `hay`, without overlaps.
@@ -1599,7 +1585,7 @@ fn names_an_existing_file(arg: &str) -> bool {
 fn run(repo: &gix::Repository, opts: Opts, paths: Vec<BString>) -> Result<ExitCode> {
     let workdir = repo
         .workdir()
-        .ok_or_else(|| anyhow::anyhow!("this operation must be run in a work tree"))?
+        .ok_or_else(|| crate::fatal::need_work_tree())?
         .to_owned();
     let hash_kind = repo.object_hash();
     // `--color[=<when>]` / `--no-color`, falling back to `color.diff` /
@@ -2415,7 +2401,7 @@ fn collect(
     let index = repo.index_or_empty()?;
     let workdir = repo
         .workdir()
-        .ok_or_else(|| anyhow::anyhow!("this operation must be run in a work tree"))?
+        .ok_or_else(|| crate::fatal::need_work_tree())?
         .to_owned();
     let caps = repo.filesystem_options()?;
 

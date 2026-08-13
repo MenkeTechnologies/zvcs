@@ -1533,7 +1533,7 @@ fn checkout_subset(
     }
     let workdir = repo
         .workdir()
-        .ok_or_else(|| anyhow!("this operation must be run in a work tree"))?
+        .ok_or_else(|| crate::fatal::need_work_tree())?
         .to_owned();
 
     // Checking out a subset index writes only those paths, leaving the worktree

@@ -105,9 +105,12 @@
 //!   * `--compact-summary`, `--encode-email-headers` as a *deferred* spelling,
 //!     whitespace-insensitive diffing, patience diff (imara-diff has Myers,
 //!     MyersMinimal and Histogram only), and copy detection (`-C`; renames are
-//!     detected, as git's default asks). `--ignore-if-in-upstream` reproduces the
-//!     refusal git raises for it (`need exactly one range`) but the patch-id
-//!     comparison itself is not ported.
+//!     detected, as git's default asks). `--ignore-if-in-upstream` reproduces
+//!     everything `cmd_format_patch` decides before the comparison — the
+//!     single-endpoint promotion that turns a lone rev into `<rev>..HEAD`, the
+//!     silent exit when both endpoints are the same commit, and the two
+//!     refusals (`need exactly one range`, `not a range`) — but the patch-id
+//!     comparison itself is not ported, so a real range is still refused.
 //!   * `--src-prefix=<p>`, `--dst-prefix=<p>`, `--no-prefix`, `--default-prefix` and
 //!     `--output=<file>` *are* ported; unknown options report git's own
 //!     `fatal: unrecognized argument: <arg>` (128).
@@ -484,10 +487,24 @@ pub fn format_patch(args: &[String]) -> Result<ExitCode> {
     }
 
     // `--ignore-if-in-upstream` compares the series against the other side of a
-    // range, so git requires exactly two pending endpoints (`A..B`).
-    if opts.deferred.iter().any(|f| f == "--ignore-if-in-upstream") && pending_endpoints(&opts) != 2
-    {
-        return Ok(fatal("need exactly one range"));
+    // range, so `get_patch_ids()` requires exactly two pending endpoints
+    // (`A..B`) and dies `need exactly one range` otherwise.
+    //
+    // The count it sees is not simply the argument count. `cmd_format_patch`
+    // first applies the "traditional `git format-patch origin`" rule: a lone
+    // endpoint, with neither `-<n>`/`--max-count` nor `--root` given, is marked
+    // UNINTERESTING and `HEAD` is appended — so one endpoint becomes two. That
+    // rule is also why a bare `git format-patch --ignore-if-in-upstream` is
+    // silent rather than fatal: `s_r_opt.def` supplies `HEAD`, the rule turns it
+    // into `HEAD..HEAD`, and the two endpoints resolve to the same object, which
+    // git answers with `goto done` — exit 0, no patches.
+    if opts.deferred.iter().any(|f| f == "--ignore-if-in-upstream") {
+        match upstream_endpoints(&repo, &opts) {
+            Endpoints::Identical => return Ok(ExitCode::SUCCESS),
+            Endpoints::Range => {}
+            Endpoints::NotOne => return Ok(fatal("need exactly one range")),
+            Endpoints::NotARange => return Ok(fatal("not a range")),
+        }
     }
 
     // git: "Make sure 0000-$sub.patch gives non-negative length for $sub".
@@ -1250,7 +1267,10 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
             "-q" | "--quiet" => o.quiet = true,
             "--filename-max-length" => {
                 i += 1;
-                o.name_max = parse_num(&value_at(args, i, a)?)?;
+                match parse_filename_max_length(&value_at(args, i, a)?) {
+                    Ok(n) => o.name_max = n,
+                    Err(code) => return Ok(Parsed::Exit(code)),
+                }
             }
             "--cover-letter" => {
                 o.cover_letter = true;
@@ -1414,7 +1434,10 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
                 o.sig_cli = SigCli::Value(s["--signature=".len()..].to_owned());
             }
             s if s.starts_with("--filename-max-length=") => {
-                o.name_max = parse_num(&s["--filename-max-length=".len()..])?;
+                match parse_filename_max_length(&s["--filename-max-length=".len()..]) {
+                    Ok(n) => o.name_max = n,
+                    Err(code) => return Ok(Parsed::Exit(code)),
+                }
             }
             s if s.starts_with("--rfc=") => {
                 o.subject_prefix = format!("{} PATCH", &s["--rfc=".len()..]);
@@ -1988,6 +2011,20 @@ fn parse_num(s: &str) -> Result<usize> {
         .map_err(|_| anyhow!("invalid number `{s}`"))
 }
 
+/// `OPT_INTEGER(0, "filename-max-length", …)` — an `int`, so the value reads
+/// base 0 with a `k`/`m`/`g` suffix and each rejection is one of
+/// parse-options' three diagnostics at exit 129. git keeps a negative length as
+/// it is and clamps at use, which here is the same as no limit.
+fn parse_filename_max_length(value: &str) -> std::result::Result<usize, ExitCode> {
+    match crate::optint::integer(&crate::optint::long_opt("filename-max-length"), value) {
+        Ok(n) => Ok(n.max(0) as usize),
+        Err(e) => {
+            eprintln!("error: {e}");
+            Err(ExitCode::from(129))
+        }
+    }
+}
+
 /// Record a diff-option value error the way git would report it from inside
 /// `setup_revisions()`: it is not fatal in place, because a revision error at an
 /// earlier command-line position preempts it. Only the earliest such error is
@@ -2423,6 +2460,62 @@ fn pending_endpoints(opts: &Opts) -> usize {
         .iter()
         .map(|r| if r.contains("..") { 2 } else { 1 })
         .sum()
+}
+
+/// What `--ignore-if-in-upstream` finds on the pending list once
+/// `cmd_format_patch`'s single-endpoint rule has run.
+enum Endpoints {
+    /// Two endpoints naming the same object: git's `goto done`, a silent exit 0.
+    Identical,
+    /// Two distinct endpoints — a range `get_patch_ids()` accepts.
+    Range,
+    /// Any other count: `get_patch_ids()`'s `need exactly one range`.
+    NotOne,
+    /// Two endpoints that are both interesting or both uninteresting, which
+    /// `get_patch_ids()` refuses with `not a range`.
+    NotARange,
+}
+
+/// Classify the pending list the way `cmd_format_patch` leaves it for
+/// `--ignore-if-in-upstream`.
+///
+/// The single-endpoint promotion (`rev.pending.nr == 1` → mark UNINTERESTING and
+/// `add_head_to_pending`) is skipped when `--max-count`/`-<n>` or `--root` was
+/// given, which is exactly when `format-patch --root HEAD --ignore-if-in-upstream`
+/// still dies with one endpoint.
+fn upstream_endpoints(repo: &gix::Repository, opts: &Opts) -> Endpoints {
+    let promoted = opts.max_count.is_none() && !opts.root;
+    let (a, b) = match opts.revs.as_slice() {
+        // No revision at all: `s_r_opt.def` supplies `HEAD`.
+        [] if promoted => ("HEAD".to_string(), "HEAD".to_string()),
+        [one] if !one.contains("..") && promoted => (one.clone(), "HEAD".to_string()),
+        [one] if one.contains("..") => match one.split_once("..") {
+            // `A...B` is a symmetric difference, not two plain endpoints; leave
+            // it to the range half, which is what git's two-object pending list
+            // amounts to here.
+            Some((left, right)) => (
+                left.trim_end_matches('.').to_string(),
+                right.trim_start_matches('.').to_string(),
+            ),
+            None => return Endpoints::NotOne,
+        },
+        // Two or more separate revisions. `get_patch_ids()` compares the
+        // UNINTERESTING flags of the two pending objects and refuses when they
+        // agree, which is every `git format-patch A B` — both are positive.
+        _ if pending_endpoints(opts) == 2 => {
+            let negatives = opts.revs.iter().filter(|r| r.starts_with('^')).count();
+            return if negatives == 1 { Endpoints::Range } else { Endpoints::NotARange };
+        }
+        _ => return Endpoints::NotOne,
+    };
+    let resolve = |spec: &str| {
+        let spec = if spec.is_empty() { "HEAD" } else { spec };
+        repo.rev_parse_single(spec).ok().map(|id| id.detach())
+    };
+    match (resolve(&a), resolve(&b)) {
+        (Some(x), Some(y)) if x == y => Endpoints::Identical,
+        _ => Endpoints::Range,
+    }
 }
 
 fn fatal(msg: &str) -> ExitCode {

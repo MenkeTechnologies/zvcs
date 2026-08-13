@@ -57,6 +57,42 @@ pub struct Applied {
     pub index: gix::index::File,
 }
 
+/// `merge_switch_to_result()`'s last act: record the merged tree as `AUTO_MERGE`
+/// (merge-ort.c:4950, the `write_auto_merge` region).
+///
+/// git writes it for **every** result merge-ort checks out — clean or
+/// conflicted, committed or not — which is why `.git/AUTO_MERGE` survives a
+/// successful `git cherry-pick <commit>` and a `git merge` that a refused
+/// checkout aborted, and why `git rev-parse AUTO_MERGE` resolves in both. It is
+/// removed only by `remove_merge_branch_state()` (branch.c:829) and
+/// `sequencer_post_commit_cleanup()`, which is why a merge that goes on to
+/// *commit* leaves none.
+///
+/// One function rather than a `fs::write` at each merge site: git has exactly
+/// one, and copies of the same three lines is how most of them came to be
+/// missing — `merge`, `pull`, `rebase`, `merge-recursive`, `merge-subtree` and
+/// `stash apply` all left the file unwritten while `cherry-pick` wrote it.
+///
+/// **Called by each merge site rather than from [`three_way_merge`] itself.**
+/// This module's tree-merge is used by two kinds of caller: the ones that stand
+/// in for merge-ort (`merge`, `pull`, `cherry-pick`, `rebase`'s picks, `stash
+/// apply`) and the ones that stand in for something else git implements with
+/// `read-tree`/`merge-index` — `git-merge-octopus.sh` above all, which leaves no
+/// `AUTO_MERGE` because no merge-ort ever runs. Writing from inside would put
+/// the file where git has none. The wrappers also return *before*
+/// `merge_switch_to_result()` in cases this port still merges through:
+/// `merge_ort_nonrecursive()` short-circuits on `merge_base == merge`
+/// ("Already up to date."), which is why a `git stash apply` of an
+/// untracked-only stash writes nothing.
+///
+/// Written as a loose root ref file, not through the ref store: that is what the
+/// files backend produces for a name outside `refs/`, and what
+/// [`crate::sequencer::delete_state_ref`] expects to remove.
+pub fn write_auto_merge(repo: &gix::Repository, tree_id: ObjectId) -> Result<()> {
+    std::fs::write(repo.git_dir().join("AUTO_MERGE"), format!("{tree_id}\n"))?;
+    Ok(())
+}
+
 /// Three-way merge `ours_tree` and `theirs_tree` against `base_tree`.
 ///
 /// Prints git's `Auto-merging` / `CONFLICT (…)` lines, checks the merged tree out

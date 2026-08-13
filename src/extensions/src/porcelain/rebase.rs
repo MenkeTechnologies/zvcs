@@ -1743,6 +1743,28 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
             )?;
             tip = new;
         }
+        // `do_pick_commit()` runs every pick through merge-ort, and
+        // `merge_switch_to_result()` records each result as `AUTO_MERGE`
+        // (merge-ort.c:4950); the last pick's is the one that survives the run,
+        // since nothing on the success path removes it. An exact replay reuses
+        // each commit's tree verbatim instead of merging for it — the merge base
+        // is the pick's own parent, so the answer is known — but the artifact is
+        // the same tree, so it is recorded here rather than skipped along with
+        // the merge. The apply backend is excluded: `git am` applies patches and
+        // only falls back to a three-way merge per patch, so a clean replay
+        // through it writes none.
+        // Gated on `REBASE_FORCE` for the same reason the sequencer path is
+        // gated on `!fast_forward`: with `allow_ff` still on, `do_pick_commit()`
+        // takes its fast-forward arm and never calls `do_recursive_merge()`, so
+        // no merge-ort runs and no `AUTO_MERGE` is written. `-f`/`--no-ff` clear
+        // `allow_ff`, and so do `--signoff`, `--committer-date-is-author-date`,
+        // `--ignore-date` and `--reset-author-date`, which is exactly the set of
+        // rebases stock leaves an `AUTO_MERGE` behind for.
+        if !apply_backend && flags & FORCE != 0 {
+            if let Some(last) = plan.last() {
+                crate::merge_apply::write_auto_merge(&repo, last.tree)?;
+            }
+        }
     } else if apply_backend {
         println!("Fast-forwarded {branch_name} to {onto_spec}.");
     } else if flags & FORCE != 0 && flags & NO_QUIET != 0 {
@@ -3111,6 +3133,18 @@ impl<'r> Sequencer<'r> {
                 Some(p) => p == head,
                 None => create_root,
             };
+        // `merge_switch_to_result()`'s `write_auto_merge` region — but only for
+        // a pick that git really merged. `do_pick_commit()` tests the
+        // fast-forward arm *before* `do_recursive_merge()` and `goto leave`s
+        // through `fast_forward_to()`, so no merge-ort runs and no `AUTO_MERGE`
+        // is written; this port runs the merge either way (it is what keeps the
+        // worktree and index in step) and so has to withhold the record here
+        // instead. Observable: `git rebase --onto main HEAD~1` leaves none while
+        // `git rebase -f HEAD~1`, whose `-f` clears `allow_ff`, leaves the last
+        // pick's tree.
+        if !fast_forward {
+            crate::merge_apply::write_auto_merge(repo, applied.tree_id)?;
+        }
         if fast_forward {
             write_author_script(repo, &commit)?;
             set_head(repo, Target::Object(oid), "rebase: fast-forward")?;
@@ -3146,6 +3180,14 @@ impl<'r> Sequencer<'r> {
                     .message()
                     .map(|m| m.summary().to_string())
                     .unwrap_or_default();
+                // `allow_empty() == 2` (sequencer.c:2500-2511) tears the pick's
+                // state back down before it reports the drop: `CHERRY_PICK_HEAD`,
+                // `MERGE_MSG` and `AUTO_MERGE` all go, so a dropped pick leaves
+                // no trace of the merge that produced it.
+                let git_dir = repo.git_dir();
+                let _ = std::fs::remove_file(git_dir.join("CHERRY_PICK_HEAD"));
+                let _ = std::fs::remove_file(git_dir.join("MERGE_MSG"));
+                let _ = std::fs::remove_file(git_dir.join("AUTO_MERGE"));
                 eprintln!(
                     "dropping {} {subject} -- patch contents already upstream",
                     oid.to_hex()

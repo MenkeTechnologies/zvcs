@@ -132,6 +132,12 @@ fn opt_error(arg: &str, usage: &str) -> ExitCode {
 
 fn cmd_list(args: &[String]) -> Result<ExitCode> {
     let repo = gix::discover(".")?;
+    // `sparse_checkout_list()` calls `setup_work_tree()` before it looks at sparsity, so a bare
+    // repository or a cwd inside the git dir reports the missing work tree, not the missing
+    // sparsity.
+    if repo.workdir().is_none() {
+        return Err(crate::fatal::need_work_tree());
+    }
     // git checks for sparsity before it parses options.
     if !is_sparse(&repo)? {
         eprintln!("fatal: this worktree is not sparse");
@@ -444,7 +450,7 @@ fn cmd_clean(args: &[String]) -> Result<ExitCode> {
 
     let workdir = repo
         .workdir()
-        .ok_or_else(|| anyhow!("this operation must be run in a work tree"))?
+        .ok_or_else(|| crate::fatal::need_work_tree())?
         .to_owned();
     let sparsity = load_sparsity(&repo)?;
     let index = repo.open_index()?;
@@ -995,7 +1001,7 @@ struct Snapshot {
 fn apply(repo: &gix::Repository, sparsity: &Sparsity) -> Result<()> {
     let workdir = repo
         .workdir()
-        .ok_or_else(|| anyhow!("this operation must be run in a work tree"))?
+        .ok_or_else(|| crate::fatal::need_work_tree())?
         .to_owned();
 
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());

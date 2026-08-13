@@ -244,6 +244,11 @@ pub fn gc(args: &[String]) -> Result<ExitCode> {
     // default only when the command line was silent — matching git, where the
     // command line overrides the config.
     let mut prune: Option<Prune> = None;
+    // The raw text of the last `--prune=<value>`, kept so `parse_expiry_date()`
+    // can be applied once after parsing, the way `cmd_gc()` applies it to
+    // `prune_expire_arg` — last occurrence wins, and an unreadable earlier one is
+    // never seen.
+    let mut prune_raw: Option<String> = None;
     // Parsed eagerly, at the point the option is seen, because git's
     // `parse_max_cruft_size()` runs as a parse-options callback: a bad value
     // beats a later `-h` or a later unknown option, but a *valid* small value
@@ -288,17 +293,10 @@ pub fn gc(args: &[String]) -> Result<ExitCode> {
             | "--no-keep-largest-pack" | "--no-expire-to" => {}
             // `--prune=<date>` is the only optional-value option.
             _ if a.starts_with("--prune=") => {
-                // NB: git validates the expiry with its *approxidate* parser and
-                // dies 128 on an unreadable value (e.g. `abc`). gix::date is
-                // stricter than approxidate — it rejects `2.weeks.ago` and bare
-                // unix timestamps git accepts — so validating with it here would
-                // regress more cases than it fixes. Left unvalidated until a
-                // faithful approxidate is available.
-                prune = Some(match &a["--prune=".len()..] {
-                    "now" => Prune::Now,
-                    "never" => Prune::Disabled,
-                    _ => Prune::Dated,
-                });
+                // `--prune` is an `OPT_STRING`: the value is only kept here and
+                // checked once, after parsing, on whichever occurrence came last.
+                prune_raw = Some(a["--prune=".len()..].to_string());
+                prune = Some(Prune::Dated);
             }
             _ if VALUE_OPTS
                 .iter()
@@ -378,6 +376,29 @@ pub fn gc(args: &[String]) -> Result<ExitCode> {
             eprintln!("fatal: {message}");
             return Ok(ExitCode::from(128));
         }
+    }
+
+    // `cmd_gc()`: `if (prune_expire_arg && parse_expiry_date(prune_expire_arg, &dummy))
+    // die(_("failed to parse prune expiry value %s"), prune_expire_arg)`. It runs
+    // after `parse_options()` and after the stray-positional usage error, and it
+    // sees only the last `--prune=` on the line — `--prune== --prune=2.weeks.ago`
+    // is accepted for exactly that reason.
+    if let Some(raw) = &prune_raw {
+        let Some(expiry) = crate::date::parse_expiry_date(raw) else {
+            eprintln!("fatal: failed to parse prune expiry value {raw}");
+            return Ok(ExitCode::from(128));
+        };
+        // `parse_expiry_date()` folds four words to the two extremes:
+        // `never`/`false` expire nothing, `all`/`now` expire everything.
+        // Comparing the resolved timestamp catches all four without spelling
+        // them out a second time.
+        prune = Some(if expiry == 0 {
+            Prune::Disabled
+        } else if expiry == i64::MAX {
+            Prune::Now
+        } else {
+            Prune::Dated
+        });
     }
 
     // `gc --auto` is a no-op below the thresholds; git returns before touching
@@ -1638,19 +1659,12 @@ pub(super) fn should_prune_worktree(admin: &Path, expire: i64) -> bool {
     }
 }
 
-/// git's size parser for `--max-cruft-size`: a non-negative decimal integer with
-/// an optional `k`/`m`/`g` suffix (either case). `None` is git's `-1` return,
-/// which the caller turns into exit 129.
+/// git's size parser for `--max-cruft-size`: `OPT_UNSIGNED` over a `size_t`, so
+/// base 0 (`0x400`) and a `k`/`m`/`g` suffix both read, and the bound is the one
+/// that prints as `[0,-1]`. `None` is git's `-1` return, which the caller turns
+/// into exit 129.
 fn parse_size(raw: &str) -> Option<u64> {
-    let (digits, multiplier) = match raw.as_bytes().last() {
-        Some(b'k' | b'K') => (&raw[..raw.len() - 1], 1024_u64),
-        Some(b'm' | b'M') => (&raw[..raw.len() - 1], 1024 * 1024),
-        Some(b'g' | b'G') => (&raw[..raw.len() - 1], 1024 * 1024 * 1024),
-        _ => (raw, 1),
-    };
-    // `u64` parsing rejects a leading `-` and any non-digit, matching git's
-    // "non-negative integer" wording.
-    digits.parse::<u64>().ok()?.checked_mul(multiplier)
+    crate::optint::unsigned(&crate::optint::long_opt("max-cruft-size"), raw).ok()
 }
 
 /// `parse_max_cruft_size()` reports through `error()` rather than
@@ -1659,15 +1673,13 @@ fn parse_size(raw: &str) -> Option<u64> {
 /// respectively, both exit 129).
 ///
 /// An empty value never reaches the k/m/g parser: parse-options rejects it first
-/// with its generic integer message, which is why the two messages differ.
+/// with its generic integer message, and a value past `size_t` reports the range
+/// clause instead, which is why the three messages differ.
 fn bad_cruft_size(raw: &str) -> ExitCode {
-    if raw.is_empty() {
-        eprintln!("error: option `max-cruft-size' expects a numerical value");
-    } else {
-        eprintln!(
-            "error: option `max-cruft-size' expects a non-negative integer value \
-             with an optional k/m/g suffix"
-        );
+    let name = crate::optint::long_opt("max-cruft-size");
+    match crate::optint::unsigned(&name, raw) {
+        Ok(_) => {}
+        Err(e) => eprintln!("error: {e}"),
     }
     ExitCode::from(129)
 }

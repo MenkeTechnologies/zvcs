@@ -101,9 +101,9 @@ pub fn describe(args: &[String]) -> Result<ExitCode> {
             "--no-abbrev" => abbrev = Some(0),
             "--debug" | "--no-debug" => {}
             "--candidates" => match it.next() {
-                Some(v) => match v.parse::<i64>() {
+                Some(v) => match opt_integer("candidates", v) {
                     Ok(n) => max_candidates = n.max(0) as usize,
-                    Err(_) => return integer_value_error("candidates"),
+                    Err(code) => return Ok(code),
                 },
                 None => return missing_value_error("candidates"),
             },
@@ -131,9 +131,9 @@ pub fn describe(args: &[String]) -> Result<ExitCode> {
                 None => return numerical_value_error("abbrev"),
             },
             _ if a.starts_with("--candidates=") => {
-                match a["--candidates=".len()..].parse::<i64>() {
+                match opt_integer("candidates", &a["--candidates=".len()..]) {
                     Ok(n) => max_candidates = n.max(0) as usize,
-                    Err(_) => return integer_value_error("candidates"),
+                    Err(code) => return Ok(code),
                 }
             }
             _ if a.starts_with("--match=") => match_pats.push(BString::from(&a["--match=".len()..])),
@@ -1140,10 +1140,14 @@ fn missing_value_error(name: &str) -> Result<ExitCode> {
     Ok(ExitCode::from(129))
 }
 
-/// parse-options' message for a malformed `OPT_MAGNITUDE`-style value.
-fn integer_value_error(name: &str) -> Result<ExitCode> {
-    eprintln!("error: option `{name}' expects an integer value with an optional k/m/g suffix");
-    Ok(ExitCode::from(129))
+/// `OPT_INTEGER` through the shared `parse-options` grammar, so `--candidates`
+/// reads base-0 and `k`/`m`/`g` values the way stock git does. Whichever of
+/// git's three diagnostics applies is printed, then exit 129.
+fn opt_integer(name: &str, value: &str) -> std::result::Result<i64, ExitCode> {
+    crate::optint::integer(&crate::optint::long_opt(name), value).map_err(|e| {
+        eprintln!("error: {e}");
+        ExitCode::from(129)
+    })
 }
 
 const USAGE: &str = "\

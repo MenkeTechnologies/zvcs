@@ -679,6 +679,30 @@ const MERGE_STATE_FILES: &[&str] = &["MERGE_HEAD", "MERGE_RR", "MERGE_MSG", "MER
 /// `git merge --abort` reaches it by running `git reset --merge`.
 const BRANCH_STATE_FILES: &[&str] = &["SQUASH_MSG", "CHERRY_PICK_HEAD", "REVERT_HEAD"];
 
+/// The one thing `restore_state()` (builtin/merge.c) leaves behind after a
+/// strategy failure: `AUTO_MERGE`, set to the snapshot's tree.
+///
+/// `restore_state()` rewinds with `git read-tree --reset -u <head>` and then
+/// re-applies the `save_state()` snapshot with `git stash apply --index`. That
+/// apply is itself a merge-ort merge, so it runs `merge_switch_to_result()` and
+/// records its result as `AUTO_MERGE` — and since the merge failed, nothing
+/// afterwards removes it. The result of re-applying a snapshot onto the `HEAD`
+/// it was taken from is the snapshot's own tree, so the residue is exactly that;
+/// verified against stock 2.55.0 on five failing merges (`merge div-cold` over a
+/// staged change, `merge div-hot`/`div-squat`/`--no-ff ff-hot` over an unstaged
+/// one, `merge origin/div --no-ff`), where `.git/AUTO_MERGE` equalled
+/// `git stash create`'s tree in every case.
+///
+/// `if (is_null_oid(stash)) goto refresh_cache;` — a clean worktree is
+/// snapshotted as nothing, no stash is applied, and no `AUTO_MERGE` is written.
+/// The rewind itself is a no-op here: this port computes the whole merge before
+/// touching the worktree, so a failed strategy has moved nothing to rewind.
+fn restore_state_residue(repo: &gix::Repository, snapshot: Option<ObjectId>) -> Result<()> {
+    let Some(commit) = snapshot else { return Ok(()) };
+    let tree = repo.find_commit(commit)?.tree_id()?.detach();
+    crate::merge_apply::write_auto_merge(repo, tree)
+}
+
 fn remove_merge_state(git_dir: &Path, and_branch_state: bool) {
     for name in MERGE_STATE_FILES {
         let _ = std::fs::remove_file(git_dir.join(name));
@@ -1003,6 +1027,16 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
     // merge-base analysis. An empty set of merge bases means unrelated histories,
     // which git refuses without `--allow-unrelated-histories`.
     let bases = repo.merge_bases_many(local_id, &[target_id])?;
+
+    // `refs_update_ref("updating ORIG_HEAD", …)` sits between the merge-base
+    // computation and everything that decides what to do with it
+    // (builtin/merge.c:1634). Every outcome below is downstream of it: the
+    // unrelated-histories refusal, `Already up to date.`, the fast-forward, and
+    // the strategy dispatch alike leave `ORIG_HEAD` at the pre-merge `HEAD`.
+    // Writing it only on the paths that move `HEAD` left a stale `ORIG_HEAD`
+    // from an earlier operation behind an up-to-date `git merge`/`git pull`.
+    set_orig_head(&repo, local_id)?;
+
     if bases.is_empty() && !opts.allow_unrelated {
         eprintln!("fatal: refusing to merge unrelated histories");
         return Ok(ExitCode::from(128));
@@ -1058,29 +1092,27 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
     let head_tree = repo.find_object(local_id)?.peel_to_tree()?.id;
     let target_tree = repo.find_object(target_id)?.peel_to_tree()?.id;
 
-    // `update_ref("updating ORIG_HEAD", …)` runs before the strategy dispatch, so
-    // a merge that is refused below still leaves ORIG_HEAD at the pre-merge HEAD
-    // (checked against git 2.50.1).
-    set_orig_head(&repo, local_id)?;
-
     // `save_state()`: git snapshots a dirty worktree into a `stash create` commit
     // before running a strategy, so `restore_state()` can rewind to it if the strategy
     // fails part-way. The snapshot is left dangling in the object database either way,
     // which is what `git fsck --dangling` reports after a merge over dirty files.
-    // No `restore_state()` follows here: the strategy below computes the whole result
-    // before touching the worktree and reports `Merge with strategy ort failed.`
-    // without having moved anything, so there is nothing to rewind.
+    // The rewind half of `restore_state()` is a no-op here — the strategy below
+    // computes the whole result before touching the worktree and reports
+    // `Merge with strategy ort failed.` without having moved anything — but its
+    // `stash apply` half still leaves `AUTO_MERGE`; see [`restore_state_residue`].
     // merge-ort's `merge_start()`: the index must match HEAD before any strategy
     // runs, whatever the change is and wherever it sits. A fast-forward never
     // reaches this — git happily fast-forwards over a staged change — so it is
     // gated on the same `runs_ort` that decides whether `-X` is parsed.
+    let mut snapshot = None;
     if runs_ort {
         stash = begin_autostash(&repo, opts)?;
-        let _snapshot = super::stash::create_snapshot(&repo)?;
+        snapshot = super::stash::create_snapshot(&repo)?;
         let staged = crate::merge_guard::index_changes_from_head(&repo, head_tree, &old_index)?;
         if !staged.is_empty() {
             crate::merge_guard::report_index_changes(&staged);
             eprintln!("Merge with strategy ort failed.");
+            restore_state_residue(&repo, snapshot)?;
             end_autostash(&repo, stash, false)?;
             log_strategy_failure(&repo, local_id, &reflog_spec);
             return Ok(ExitCode::from(2));
@@ -1148,12 +1180,18 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
             crate::merge_apply::Merged::Refused(clobber) => {
                 clobber.report("merge");
                 eprintln!("Merge with strategy ort failed.");
+                restore_state_residue(&repo, snapshot)?;
                 end_autostash(&repo, stash, false)?;
                 return Ok(ExitCode::from(2));
             }
         };
         let mut index = applied.index;
         index.write(Default::default())?;
+        // `merge_switch_to_result()`'s `write_auto_merge` region: the strategy
+        // ran and its result is on disk, so the merged tree is recorded. A
+        // commit below removes it again; `--no-commit`, `--squash` and a
+        // conflict all stop first and leave it for `git diff AUTO_MERGE`.
+        crate::merge_apply::write_auto_merge(&repo, applied.tree_id)?;
 
         if applied.conflicts.is_empty() {
             return finalize_clean(
@@ -1200,12 +1238,19 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
     // exactly the target's tree. Sync the worktree, then finish as a merge commit.
     if opts.ff == Ff::Never {
         // The strategy still ran (git dispatches `--no-ff` through `ort`), so a
-        // refusal here is a strategy failure.
+        // refusal here is a strategy failure — and, like every other one, leaves
+        // `restore_state()`'s `AUTO_MERGE` behind.
         if let Some(code) = guard_checkout(&repo, head_tree, target_tree, &old_index, true)? {
+            restore_state_residue(&repo, snapshot)?;
             end_autostash(&repo, stash, false)?;
             return Ok(code);
         }
         update_worktree(&repo, &old_index, Some(head_tree), target_tree, &should_interrupt)?;
+        // `merge_switch_to_result()` again: the shortcut skips the tree merge
+        // because its answer is known — the merge base is our own commit, so the
+        // result is the target's tree — but git still ran merge-ort and recorded
+        // that tree. `--no-commit` stops before the commit that would remove it.
+        crate::merge_apply::write_auto_merge(&repo, target_tree)?;
         return finalize_clean(
             &repo,
             local_id,
@@ -1286,6 +1331,12 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
         print!("{}", diffstat(&repo, head_tree, target_tree, opts.stat)?);
     }
     end_autostash(&repo, stash, true)?;
+    // `finish(); remove_merge_branch_state();` — builtin/merge.c:1688. The order
+    // is the point: `finish()` is what re-applies the autostash
+    // (builtin/merge.c:539), and *that* apply is a `git stash apply` child that
+    // records its own `AUTO_MERGE`. Removing the merge state first would leave
+    // the file behind, which is exactly what `git pull --autostash` was doing.
+    remove_merge_state(repo.git_dir(), false);
     Ok(ExitCode::SUCCESS)
 }
 
@@ -1504,13 +1555,16 @@ fn finalize_clean(
             reflog_action(&spec_label)
         ),
     )?;
-    // git's `finish()` → `remove_merge_branch_state()`: the merge is over.
-    remove_merge_state(git_dir, false);
     if !opts.quiet {
         println!("Merge made by the '{strategy_name}' strategy.");
         print!("{}", diffstat(repo, head_tree, merged_tree, opts.stat)?);
     }
     end_autostash(repo, stash, true)?;
+    // git's `finish(); remove_merge_branch_state();` (builtin/merge.c:1007,
+    // 1038), in that order — `finish()` re-applies the autostash, whose `git
+    // stash apply` child writes its own `AUTO_MERGE`, and only then is the merge
+    // state cleared. Clearing first left that file behind.
+    remove_merge_state(git_dir, false);
     Ok(ExitCode::SUCCESS)
 }
 
@@ -1545,6 +1599,11 @@ fn merge_ours(
             break;
         }
     }
+    // `cmd_merge` records ORIG_HEAD once, between the merge-base computation
+    // and the up-to-date test (builtin/merge.c:1634), for every strategy it
+    // dispatches — so `-s ours` with nothing left to merge writes it too.
+    set_orig_head(repo, local_id)?;
+
     if all_reachable {
         if !opts.quiet {
             println!("{}", up_to_date_line(opts));
@@ -1558,11 +1617,10 @@ fn merge_ours(
     // `save_state()` runs for every strategy `cmd_merge` dispatches, `ours` included:
     // the dirty worktree is snapshotted into a dangling `stash create` commit before
     // the strategy is given a chance to fail.
-    let _snapshot = super::stash::create_snapshot(repo)?;
+    let snapshot = super::stash::create_snapshot(repo)?;
 
     let head_tree = repo.find_object(local_id)?.peel_to_tree()?.id;
     let old_index = repo.index_or_load_from_head()?.into_owned();
-    set_orig_head(repo, local_id)?;
 
     // `builtin/merge-ours.c`: "The index must match HEAD, or this merge cannot
     // proceed" — it exits 2 without a word of its own, and `cmd_merge` supplies
@@ -1570,6 +1628,7 @@ fn merge_ours(
     // business: our tree is kept verbatim, so nothing is checked out over them.
     if !crate::merge_guard::index_changes_from_head(repo, head_tree, &old_index)?.is_empty() {
         eprintln!("Merge with strategy ours failed.");
+        restore_state_residue(repo, snapshot)?;
         end_autostash(repo, stash, false)?;
         log_strategy_failure(repo, local_id, &refs.join(" "));
         return Ok(ExitCode::from(2));
@@ -1623,7 +1682,7 @@ fn do_octopus(
 
     // `save_state()`: the octopus is a strategy like any other, so a dirty worktree is
     // snapshotted into a dangling `stash create` commit before it runs.
-    let _snapshot = super::stash::create_snapshot(repo)?;
+    let snapshot = super::stash::create_snapshot(repo)?;
 
     let mut cur_index = repo.index_or_load_from_head()?.into_owned();
     let mut mrt = repo.find_object(local_id)?.peel_to_tree()?.id; // merge result tree
@@ -1656,6 +1715,7 @@ fn do_octopus(
             println!("    {}", quote_path(path));
         }
         eprintln!("Merge with strategy octopus failed.");
+        restore_state_residue(repo, snapshot)?;
         end_autostash(repo, stash, false)?;
         log_strategy_failure(repo, local_id, &refs.join(" "));
         return Ok(ExitCode::from(2));
@@ -1690,6 +1750,7 @@ fn do_octopus(
             // carry the plumbing wording — `setup_unpack_trees_porcelain()`
             // never runs for a strategy script.
             if let Some(code) = guard_octopus(repo, mrt, head_tree, &cur_index)? {
+                restore_state_residue(repo, snapshot)?;
                 end_autostash(repo, stash, false)?;
                 return Ok(code);
             }
@@ -1709,6 +1770,7 @@ fn do_octopus(
         // here rather than over the merged tree is what keeps a failed octopus
         // from leaving that tree in the object database.
         if let Some(code) = guard_octopus_three_way(repo, base_tree, mrt, head_tree, &cur_index)? {
+            restore_state_residue(repo, snapshot)?;
             end_autostash(repo, stash, false)?;
             return Ok(code);
         }
@@ -1747,6 +1809,7 @@ fn do_octopus(
             crate::merge_apply::Merged::Refused(clobber) => {
                 clobber.report_plumbing();
                 eprintln!("Merge with strategy octopus failed.");
+                restore_state_residue(repo, snapshot)?;
                 end_autostash(repo, stash, false)?;
                 return Ok(ExitCode::from(2));
             }
@@ -1918,17 +1981,12 @@ fn shortlog_config(snapshot: &gix::config::Snapshot<'_>) -> i64 {
         .unwrap_or(0)
 }
 
-/// `git_parse_int()` behind parse-options' `OPT_INTEGER`: `strtoimax` over the
-/// value (leading whitespace allowed) with an optional `k`/`m`/`g` binary
-/// suffix. `None` is git's "not an integer".
+/// `git_parse_int()` behind parse-options' `OPT_INTEGER`, through the shared
+/// [`crate::optint`] grammar: `strtoimax` with **base 0** (so `0x10` and `010`
+/// are hex and octal), leading whitespace and `+` allowed, one optional
+/// `k`/`m`/`g` binary suffix. `None` is git's "not an integer".
 fn parse_option_int(value: &str) -> Option<i64> {
-    let (digits, factor) = match value.chars().last() {
-        Some('k' | 'K') => (&value[..value.len() - 1], 1024i64),
-        Some('m' | 'M') => (&value[..value.len() - 1], 1024 * 1024),
-        Some('g' | 'G') => (&value[..value.len() - 1], 1024 * 1024 * 1024),
-        _ => (value, 1),
-    };
-    digits.trim_start().parse::<i64>().ok()?.checked_mul(factor)
+    crate::optint::integer(&crate::optint::long_opt("log"), value).ok()
 }
 
 /// `git_config_bool_or_int()` as the shortlog length reads it.

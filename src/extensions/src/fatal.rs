@@ -68,3 +68,16 @@ macro_rules! git_fatal {
         )
     };
 }
+
+/// The same message as [`git_fatal!`] as a value, for the places that build an
+/// error instead of returning one — `ok_or_else`, `map_err`, and friends.
+pub fn die(message: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(Fatal(message.into()))
+}
+
+/// git's `setup_work_tree()`: the commands that need a work tree die with this
+/// when setup did not find one, which is what standing in a `.git` directory or
+/// a bare repository leaves them with.
+pub fn need_work_tree() -> anyhow::Error {
+    die("this operation must be run in a work tree")
+}

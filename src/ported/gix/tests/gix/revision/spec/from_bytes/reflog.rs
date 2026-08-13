@@ -105,10 +105,31 @@ fn by_index() {
 fn by_date() {
     let repo = repo("complex_graph").unwrap();
 
+    // `@{<date>}` goes through git's approxidate, where a bare integer is only a unix timestamp
+    // from 100000000 up (`match_digit()`, date.c:686) and anything it cannot make sense of folds
+    // into "now". So "42 +0030" is *now*, past every reflog entry, and resolves to the tip - not
+    // to epoch+42. Stock git 2.55.0: `rev-parse --since='42 +0030'` -> `--max-age=1786586403`
+    // (the current time), and `rev-parse 'main@{42 +0030}'` -> 55e825ebe8fd2ff78cad3826afb696b96b576a7e.
     let spec = parse_spec_no_baseline("main@{42 +0030}", &repo).unwrap();
+    assert_eq!(
+        spec,
+        Spec::from_id(hex_to_id_sha1_only("55e825ebe8fd2ff78cad3826afb696b96b576a7e").attach(&repo))
+    );
 
+    // A date git *can* parse picks the entry that was current then. Older than the whole reflog
+    // means the oldest entry; stock git 2.55.0 warns "log for 'main' only goes back to Thu,
+    // 7 Apr 2005 15:13:13 -0700" and prints 9f9eac6bd1cd4b4cc6a494f044b28c985a22972b.
+    let spec = parse_spec_no_baseline("main@{1970-01-01}", &repo).unwrap();
     assert_eq!(
         spec,
         Spec::from_id(hex_to_id_sha1_only("9f9eac6bd1cd4b4cc6a494f044b28c985a22972b").attach(&repo))
+    );
+
+    // And a date inside the reflog's span picks the entry in effect at that moment. Stock git
+    // 2.55.0: `rev-parse 'main@{2005-04-07 15:20:00 -0700}'` -> a8fbd8e0c8753ef07ccdbfa93da030d53b68f0bc.
+    let spec = parse_spec_no_baseline("main@{2005-04-07 15:20:00 -0700}", &repo).unwrap();
+    assert_eq!(
+        spec,
+        Spec::from_id(hex_to_id_sha1_only("a8fbd8e0c8753ef07ccdbfa93da030d53b68f0bc").attach(&repo))
     );
 }

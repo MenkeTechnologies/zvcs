@@ -598,9 +598,34 @@ fn execute(st: &State) -> Result<ExitCode> {
             return Ok(ExitCode::from(128));
         }
     };
+    // `finish_tmp_packfile()` (pack-write.c) builds every artifact under a
+    // temporary name in `objects/pack` and only then renames them into place,
+    // pack first. That ordering is observable: a destination directory that does
+    // not exist fails at the *pack* rename, after the `.idx`, `.rev` and
+    // `.mtimes` temporaries already exist. Only the pack's temporary is
+    // registered with git's `tempfile` machinery, so `die()` unlinks that one and
+    // leaves `tmp_idx_*` / `tmp_rev_*` / `tmp_mtimes_*` behind in the object
+    // store.
+    let pack_dir = repo.git_dir().join("objects").join("pack");
+    let _ = std::fs::create_dir_all(&pack_dir);
+    let mut staged_files: Vec<(std::path::PathBuf, &String, crate::config::FsyncComponent)> =
+        Vec::with_capacity(files.len());
     for (path, bytes, component) in &files {
-        if let Some(code) = write_artifact(path.as_str(), &bytes[..], &fsync, *component) {
+        let tmp = temp_artifact_path(&pack_dir, path, staged_files.len());
+        if let Some(code) = write_artifact(&tmp, path.as_str(), &bytes[..], &fsync, *component) {
             return Ok(code);
+        }
+        staged_files.push((tmp, path, *component));
+    }
+    for (i, (tmp, path, _)) in staged_files.iter().enumerate() {
+        if let Err(err) = std::fs::rename(tmp, path.as_str()) {
+            eprintln!("error: unable to write file {path}: {}", errno_text(&err));
+            eprintln!("fatal: unable to rename temporary file to '{path}'");
+            // Only the temporary being renamed right now is the one git's
+            // `tempfile` list owns; the ones still queued behind it stay.
+            let _ = std::fs::remove_file(tmp);
+            let _ = i;
+            return Ok(ExitCode::from(128));
         }
     }
 
@@ -3187,22 +3212,34 @@ pub(super) fn append_checksum(bytes: &mut Vec<u8>, kind: gix::hash::Kind) -> Res
     Ok(())
 }
 
-/// Write one pack artifact, reporting a failure the way git does.
+/// `odb_mkstemp(&tmpname, "pack/tmp_<kind>_XXXXXX")` — the temporary an artifact
+/// is built under before it is renamed into place. `<kind>` is the destination's
+/// extension, exactly as git names them: `tmp_pack_`, `tmp_idx_`, `tmp_rev_`,
+/// `tmp_mtimes_`.
 ///
-/// git builds each file under a temporary name in the object store and only
-/// then renames it into place, so a path it cannot create is diagnosed twice:
-/// once for the write and once for the rename that never happened.
-///
-/// The rename is also why any existing file is unlinked first: a rename replaces
-/// its destination whatever that destination's mode is, whereas writing straight
-/// into the `0444` a previous run left behind would fail with `EACCES` and be
-/// misreported as an unwritable directory.
+/// The suffix only has to be unique within this run; `mkstemp`'s six random
+/// characters and this pid/slot pair are equally arbitrary to every reader.
+fn temp_artifact_path(pack_dir: &std::path::Path, dest: &str, slot: usize) -> std::path::PathBuf {
+    let kind = std::path::Path::new(dest)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("pack");
+    pack_dir.join(format!("tmp_{kind}_{}{slot}", std::process::id()))
+}
+
+/// Write one pack artifact to its temporary, reporting a failure the way git
+/// does: a path it cannot create is diagnosed twice, once for the write and once
+/// for the rename that never happened. `dest` names the file in the diagnostic
+/// even though `tmp` is what is being written, because that is the name git's
+/// message carries.
 fn write_artifact(
-    path: &str,
+    tmp: &std::path::Path,
+    dest: &str,
     bytes: &[u8],
     fsync: &crate::config::FsyncPolicy,
     component: crate::config::FsyncComponent,
 ) -> Option<ExitCode> {
+    let path = tmp;
     let _ = std::fs::remove_file(path);
     match std::fs::write(path, bytes) {
         // git leaves `.pack`, `.idx`, `.rev` and `.mtimes` world-readable but
@@ -3213,13 +3250,13 @@ fn write_artifact(
             // Harden before the mode change, while the file is still writable:
             // `core.fsync=pack` covers the pack itself and `pack-metadata` its
             // `.idx`/`.rev`/`.mtimes` companions, which is the split git uses.
-            fsync.harden_path(component, std::path::Path::new(path));
+            fsync.harden_path(component, path);
             let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o444));
             None
         }
         Err(err) => {
-            eprintln!("error: unable to write file {path}: {}", errno_text(&err));
-            eprintln!("fatal: unable to rename temporary file to '{path}'");
+            eprintln!("error: unable to write file {dest}: {}", errno_text(&err));
+            eprintln!("fatal: unable to rename temporary file to '{dest}'");
             Some(ExitCode::from(128))
         }
     }
@@ -3361,18 +3398,22 @@ fn long_opt(body: &str, args: &[String], i: &mut usize, st: &mut State) -> Optio
 /// Both fire during the parse walk, so they are reported in argv order and
 /// before the no-output usage check.
 fn check_value(def: &OptDef, shown: &str, v: &str) -> Option<ExitCode> {
+    // The shared parse-options grammar: base 0 and a `k`/`m`/`g` suffix, with
+    // git's bound for the option's target — `int` for `OPT_INTEGER`, `size_t`
+    // for the byte counts, which is why the latter's range clause reads `[0,-1]`.
+    let name = crate::optint::long_opt(shown);
     match def.kind {
-        Kind::Int if !is_number(v, true) => {
-            eprintln!(
-                "error: option `{shown}' expects an integer value with an optional k/m/g suffix"
-            );
-            return Some(ExitCode::from(129));
+        Kind::Int => {
+            if let Err(e) = crate::optint::integer(&name, v) {
+                eprintln!("error: {e}");
+                return Some(ExitCode::from(129));
+            }
         }
-        Kind::Magnitude if !is_number(v, false) => {
-            eprintln!(
-                "error: option `{shown}' expects a non-negative integer value with an optional k/m/g suffix"
-            );
-            return Some(ExitCode::from(129));
+        Kind::Magnitude => {
+            if let Err(e) = crate::optint::unsigned(&name, v) {
+                eprintln!("error: {e}");
+                return Some(ExitCode::from(129));
+            }
         }
         _ => {}
     }
@@ -3811,37 +3852,11 @@ fn short_opts(cluster: &str, i: &mut usize, st: &mut State) -> Option<ExitCode> 
     None
 }
 
-/// git's number grammar for `OPT_INTEGER` / `OPT_MAGNITUDE`: digits with an
-/// optional single `k`/`m`/`g` suffix (either case), and a sign only when
-/// `signed` (i.e. never for a magnitude).
-fn is_number(v: &str, signed: bool) -> bool {
-    let digits = match v.strip_prefix('-') {
-        Some(rest) if signed => rest,
-        Some(_) => return false,
-        None => v,
-    };
-    let digits = match digits.chars().last() {
-        Some('k' | 'K' | 'm' | 'M' | 'g' | 'G') => &digits[..digits.len() - 1],
-        _ => digits,
-    };
-    !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit())
-}
-
-/// The integer value of a string already accepted by [`is_number`], applying the
-/// `k`/`m`/`g` multiplier. This is the number git's diagnostics print.
+/// The integer value of a string already accepted by [`check_value`], read with
+/// the same shared grammar so `--window=0x10` is the sixteen git makes of it.
+/// This is the number git's diagnostics print.
 fn to_number(v: &str) -> Option<i64> {
-    let (negative, body) = match v.strip_prefix('-') {
-        Some(rest) => (true, rest),
-        None => (false, v),
-    };
-    let (body, scale) = match body.chars().last() {
-        Some('k' | 'K') => (&body[..body.len() - 1], 1024),
-        Some('m' | 'M') => (&body[..body.len() - 1], 1024 * 1024),
-        Some('g' | 'G') => (&body[..body.len() - 1], 1024 * 1024 * 1024),
-        _ => (body, 1),
-    };
-    let n = body.parse::<i64>().ok()?.checked_mul(scale)?;
-    Some(if negative { -n } else { n })
+    crate::optint::integer_prec(&crate::optint::long_opt(""), v, 8).ok()
 }
 
 /// Everything stock git checks after parsing and before it does any work, in

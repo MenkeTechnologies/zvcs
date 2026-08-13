@@ -132,12 +132,7 @@ const UNIMPLEMENTED_EXACT: &[&str] = &[
     "--resolve-git-dir",
     "--git-path",
     "--shared-index-path",
-    "--absolute-git-dir",
-    "--git-common-dir",
-    "--is-inside-git-dir",
     "--is-shallow-repository",
-    "--show-cdup",
-    "--show-prefix",
     "--show-superproject-working-tree",
     "--remotes",
     "--bisect",
@@ -263,6 +258,17 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
             warn_ambiguous_refname(&repo, arg, o.quiet);
             repo.rev_parse_single(arg.as_str()).ok().map(|id| id.detach())
         };
+
+        // A reflog ordinal past the end of an existing ref's log is its own
+        // `die()` inside `get_oid()`, ahead of any path interpretation — nothing
+        // has been echoed yet at this point, which is what keeps stdout empty.
+        if resolved.is_none() {
+            if let Some((name, count)) = reflog_overflow(&repo, arg) {
+                out.flush()?;
+                eprintln!("fatal: log for '{name}' only has {count} entries");
+                return Ok(ExitCode::from(128));
+            }
+        }
 
         match resolved {
             Some(id) => {
@@ -512,8 +518,19 @@ enum Opt {
 #[derive(Clone, Copy)]
 enum Query {
     GitDir,
+    /// `--absolute-git-dir`: the same directory, always symlink-resolved and absolute.
+    AbsoluteGitDir,
+    /// `--git-common-dir`: `$GIT_COMMON_DIR` — the git directory a linked worktree shares with
+    /// the main one, which is the git directory itself when there is no `commondir` file.
+    GitCommonDir,
     ShowToplevel,
+    /// `--show-prefix`: the path from the top of the work tree down to the cwd, slash-terminated.
+    ShowPrefix,
+    /// `--show-cdup`: the `../` sequence that climbs from the cwd back to the top of the work tree.
+    ShowCdup,
     IsInsideWorkTree,
+    /// `--is-inside-git-dir`: whether the cwd is the git directory or below it.
+    IsInsideGitDir,
     IsBareRepository,
     /// `--show-object-format[=(storage|input|output)]`: the hash algorithm's name.
     /// All three modes read the same algorithm here — this port stores, reads and
@@ -549,8 +566,13 @@ fn option(o: &mut Opts, arg: &str) -> Result<Opt> {
         "--symbolic-full-name" => o.sym = Sym::Full,
         "--abbrev-ref" => o.abbrev_ref = true,
         "--git-dir" => return Ok(Opt::Query(Query::GitDir)),
+        "--absolute-git-dir" => return Ok(Opt::Query(Query::AbsoluteGitDir)),
+        "--git-common-dir" => return Ok(Opt::Query(Query::GitCommonDir)),
         "--show-toplevel" => return Ok(Opt::Query(Query::ShowToplevel)),
+        "--show-prefix" => return Ok(Opt::Query(Query::ShowPrefix)),
+        "--show-cdup" => return Ok(Opt::Query(Query::ShowCdup)),
         "--is-inside-work-tree" => return Ok(Opt::Query(Query::IsInsideWorkTree)),
+        "--is-inside-git-dir" => return Ok(Opt::Query(Query::IsInsideGitDir)),
         "--is-bare-repository" => return Ok(Opt::Query(Query::IsBareRepository)),
         "--show-object-format" => return Ok(Opt::Query(Query::ObjectFormat)),
         "--show-ref-format" => return Ok(Opt::Query(Query::RefFormat)),
@@ -588,20 +610,32 @@ fn option(o: &mut Opts, arg: &str) -> Result<Opt> {
 fn query(out: &mut impl Write, repo: &gix::Repository, q: Query) -> Result<Option<ExitCode>> {
     match q {
         Query::GitDir => {
-            // git prints `$GIT_DIR` verbatim when set; otherwise `.git` when the
-            // cwd is the top of the worktree, and an absolute path when it is not.
-            if let Some(dir) = std::env::var_os("GIT_DIR") {
-                emit(out, dir.as_os_str().as_encoded_bytes())?;
-            } else {
-                match toplevel(repo) {
-                    Some(top) if is_cwd(&top) => emit(out, b".git")?,
-                    Some(top) => emit(out, top.join(".git").as_os_str().as_encoded_bytes())?,
-                    // Bare: git reports `.` when the cwd is the git dir itself.
-                    None => match std::fs::canonicalize(repo.git_dir()) {
-                        Ok(dir) if is_cwd(&dir) => emit(out, b".")?,
-                        _ => emit(out, repo.git_dir().as_os_str().as_encoded_bytes())?,
-                    },
+            // git prints `$GIT_DIR` verbatim when set. Otherwise the value is whatever
+            // `setup.c` left in it:
+            //
+            // * `.git`, its default, which `setup_discovered_git_dir()` leaves alone when the
+            //   `.git` it found is a plain directory at the top of the work tree we stand in.
+            //   A `.git` *file* — a linked worktree or a submodule checkout — is resolved and
+            //   set outright, so those print the absolute private git dir even at the top.
+            // * `.` from `setup_bare_git_dir()` when the cwd *is* the git directory.
+            // * the absolute path in every other case.
+            emit(out, git_dir_display(repo).as_os_str().as_encoded_bytes())?;
+        }
+        Query::AbsoluteGitDir => emit(out, absolute(repo.git_dir()).as_os_str().as_encoded_bytes())?,
+        Query::GitCommonDir => {
+            // `print_path(…, DEFAULT_RELATIVE_IF_SHARED)`: relative to the prefix when there is
+            // one, and otherwise the stored value as-is — which is the same string `--git-dir`
+            // prints whenever there is no separate common directory.
+            let common = absolute(repo.common_dir());
+            match prefix(repo) {
+                Some(pfx) => {
+                    let up: std::path::PathBuf = pfx.components().map(|_| "..").collect();
+                    emit(out, up.join(&common).as_os_str().as_encoded_bytes())?;
                 }
+                None if common == absolute(repo.git_dir()) => {
+                    emit(out, git_dir_display(repo).as_os_str().as_encoded_bytes())?;
+                }
+                None => emit(out, common.as_os_str().as_encoded_bytes())?,
             }
         }
         Query::ShowToplevel => match toplevel(repo) {
@@ -612,14 +646,27 @@ fn query(out: &mut impl Write, repo: &gix::Repository, q: Query) -> Result<Optio
                 return Ok(Some(ExitCode::from(128)));
             }
         },
-        Query::IsInsideWorkTree => {
-            let inside_git_dir = std::env::current_dir()
-                .ok()
-                .and_then(|cwd| std::fs::canonicalize(cwd).ok())
-                .zip(std::fs::canonicalize(repo.git_dir()).ok())
-                .is_some_and(|(cwd, git)| cwd.starts_with(git));
-            emit(out, yes_no(repo.workdir().is_some() && !inside_git_dir))?;
+        Query::ShowPrefix => match prefix(repo) {
+            // git's prefix is slash-terminated; without one it still prints the empty line.
+            Some(pfx) => emit(out, format!("{}/", pfx.display()).as_bytes())?,
+            None => emit(out, b"")?,
+        },
+        Query::ShowCdup => {
+            // Outside the work tree git prints the work tree itself rather than a `../` climb.
+            if !is_inside_work_tree(repo) {
+                match toplevel(repo) {
+                    Some(top) => emit(out, top.as_os_str().as_encoded_bytes())?,
+                    None => emit(out, b"")?,
+                }
+            } else {
+                let up: String = prefix(repo).map_or_else(String::new, |pfx| {
+                    pfx.components().map(|_| "../").collect()
+                });
+                emit(out, up.as_bytes())?;
+            }
         }
+        Query::IsInsideWorkTree => emit(out, yes_no(is_inside_work_tree(repo)))?,
+        Query::IsInsideGitDir => emit(out, yes_no(is_inside_git_dir(repo)))?,
         Query::IsBareRepository => emit(out, yes_no(repo.is_bare()))?,
         Query::ObjectFormat => emit(out, repo.object_hash().to_string().as_bytes())?,
         Query::RefFormat => emit(out, b"files")?,
@@ -639,6 +686,56 @@ fn yes_no(b: bool) -> &'static [u8] {
 fn toplevel(repo: &gix::Repository) -> Option<std::path::PathBuf> {
     let wd = repo.workdir()?;
     std::fs::canonicalize(wd).ok()
+}
+
+/// `path` symlink-resolved and absolute, or unchanged when it cannot be resolved.
+fn absolute(path: &std::path::Path) -> std::path::PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_owned())
+}
+
+/// The git directory the way `--git-dir` prints it, which is the string `setup.c` left in
+/// `$GIT_DIR`: the environment value verbatim when it was given, `.git` when discovery found a
+/// plain `.git` directory at the top of the work tree we stand in, `.` when the cwd *is* the git
+/// directory, and the absolute path otherwise.
+fn git_dir_display(repo: &gix::Repository) -> std::path::PathBuf {
+    if let Some(dir) = std::env::var_os("GIT_DIR") {
+        return dir.into();
+    }
+    let git_dir = absolute(repo.git_dir());
+    match toplevel(repo) {
+        Some(top) if is_cwd(&top) && git_dir == top.join(".git") => ".git".into(),
+        _ if is_cwd(&git_dir) => ".".into(),
+        _ => git_dir,
+    }
+}
+
+/// git's `prefix`: the path from the top of the work tree down to the cwd, or `None` when there is
+/// no work tree or the cwd sits outside of it.
+fn prefix(repo: &gix::Repository) -> Option<std::path::PathBuf> {
+    let top = toplevel(repo)?;
+    let cwd = std::env::current_dir().ok().and_then(|c| std::fs::canonicalize(c).ok())?;
+    let rel = cwd.strip_prefix(&top).ok()?;
+    (!rel.as_os_str().is_empty()).then(|| rel.to_owned())
+}
+
+/// git's `is_inside_git_dir()`: whether the cwd is the git directory or below it.
+fn is_inside_git_dir(repo: &gix::Repository) -> bool {
+    std::env::current_dir()
+        .ok()
+        .and_then(|cwd| std::fs::canonicalize(cwd).ok())
+        .is_some_and(|cwd| cwd.starts_with(absolute(repo.git_dir())))
+}
+
+/// git's `is_inside_work_tree()`: `is_inside_dir(repo_get_work_tree())` — purely whether the cwd
+/// sits in the work tree, which says nothing about the git directory. Both this and
+/// [`is_inside_git_dir`] are true at once for `GIT_DIR=.` inside a `.git` directory, because that
+/// setup makes the git directory its own work tree.
+fn is_inside_work_tree(repo: &gix::Repository) -> bool {
+    let Some(top) = toplevel(repo) else { return false };
+    std::env::current_dir()
+        .ok()
+        .and_then(|cwd| std::fs::canonicalize(cwd).ok())
+        .is_some_and(|cwd| cwd.starts_with(top))
 }
 
 fn is_cwd(dir: &std::path::Path) -> bool {
@@ -768,6 +865,35 @@ fn emit_range(
         }
     }
     Ok(())
+}
+
+/// `get_oid_basic()`'s reflog branch: `<ref>@{<n>}` whose `<n>` is past the end
+/// of that ref's reflog is `die("log for '%s' only has %d entries")` (exit 128),
+/// not an unknown revision — the ref resolved fine, only the ordinal did not.
+///
+/// Returns the name git puts in the message and the entry count it reports.
+/// `None` for anything that is not that shape: a non-numeric `@{...}` is a date
+/// or tracking spec, and a `<ref>` that does not exist or has no reflog falls
+/// through to the ordinary `ambiguous argument` path.
+///
+/// An empty `<ref>` (`@{2}`) means the current branch, which is why git answers
+/// `git rev-parse @{999}` with `log for 'main' …` rather than `log for '@' …`.
+fn reflog_overflow(repo: &gix::Repository, spec: &str) -> Option<(String, usize)> {
+    let rest = spec.strip_suffix('}')?;
+    let (name, ordinal) = rest.rsplit_once("@{")?;
+    if ordinal.is_empty() || !ordinal.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let nth: usize = ordinal.parse().ok()?;
+    let name = if name.is_empty() || name == "@" {
+        repo.head_name().ok()??.shorten().to_string()
+    } else {
+        name.to_string()
+    };
+    let mut reference = repo.find_reference(name.as_str()).ok()?;
+    let mut platform = reference.log_iter();
+    let count = platform.all().ok()??.count();
+    (nth >= count).then_some((name, count))
 }
 
 /// git's `dwim_ref`: resolve a bare name to the full ref it designates, then

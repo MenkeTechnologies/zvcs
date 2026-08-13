@@ -115,11 +115,17 @@ fn from_inside_bare_git_dir() -> crate::Result {
 fn from_git_dir() -> crate::Result {
     let dir = repo_path()?.join(".git");
     let (path, trust) = gix_discover::upwards(&dir)?;
-    assert_eq!(path.kind(), Kind::WorkTree { linked_git_dir: None });
+    // `setup_git_directory_gently_1()` in git's `setup.c` reaches `is_git_directory(dir)` here and
+    // returns `GIT_DIR_BARE`, so the directory becomes `GIT_DIR` and no work tree is attached:
+    //
+    //     $ cd repo/.git && git rev-parse --git-dir --show-toplevel
+    //     .
+    //     fatal: this operation must be run in a work tree
+    assert_eq!(path.kind(), Kind::PossiblyBare);
     assert_eq!(
-        path.into_repository_and_work_tree_directories().0,
-        dir,
-        "the .git dir is directly returned if valid"
+        path.into_repository_and_work_tree_directories(),
+        (dir, None),
+        "the .git dir is directly returned if valid, and is the git dir rather than a work tree"
     );
     assert_eq!(trust, expected_trust());
     Ok(())
@@ -203,8 +209,18 @@ fn from_nested_dir_inside_a_git_dir() -> crate::Result {
     let working_dir = repo_path()?;
     let dir = working_dir.join(".git").join("objects");
     let (path, trust) = gix_discover::upwards(&dir)?;
-    assert_eq!(path.kind(), Kind::WorkTree { linked_git_dir: None });
-    assert_eq!(path.as_ref(), working_dir, "we find .git directories on the way");
+    // The upwards walk stops at the `.git` directory, which git adopts as `GIT_DIR` without a
+    // work tree (`GIT_DIR_BARE`):
+    //
+    //     $ cd repo/.git/objects && git rev-parse --git-dir --show-toplevel
+    //     /private/tmp/.../repo/.git
+    //     fatal: this operation must be run in a work tree
+    assert_eq!(path.kind(), Kind::PossiblyBare);
+    assert_eq!(
+        path.into_repository_and_work_tree_directories(),
+        (working_dir.join(".git"), None),
+        "we find .git directories on the way, and use them as the git dir"
+    );
     assert_eq!(trust, expected_trust());
     Ok(())
 }
@@ -223,26 +239,31 @@ fn from_non_existing_worktree() {
 #[test]
 fn from_existing_worktree_inside_dot_git() {
     let top_level_repo = repo_path().unwrap();
-    let (path, _trust) = gix_discover::upwards(&top_level_repo.join(".git/worktrees/a")).unwrap();
-    let suffix = std::path::Path::new(top_level_repo.file_name().unwrap())
-        .join("worktrees")
-        .join("a");
-    assert!(
-        matches!(path, gix_discover::repository::Path::LinkedWorkTree { work_dir, .. } if work_dir.ends_with(suffix)),
-        "we can handle to start from within a (somewhat partial) worktree git dir"
+    let private_git_dir = top_level_repo.join(".git/worktrees/a");
+    let (path, _trust) = gix_discover::upwards(&private_git_dir).unwrap();
+    // Standing in a worktree's private git dir is `GIT_DIR_BARE` for git — it does not follow the
+    // `gitdir` back-link to attach the checkout:
+    //
+    //     $ cd repo/.git/worktrees/a && git rev-parse --git-dir --show-toplevel
+    //     .
+    //     fatal: this operation must be run in a work tree
+    assert_eq!(
+        path,
+        gix_discover::repository::Path::Repository(private_git_dir),
+        "we can handle to start from within a (somewhat partial) worktree git dir, and it is the git dir"
     );
 }
 
 #[test]
 fn from_non_existing_worktree_inside_dot_git() {
     let top_level_repo = repo_path().unwrap();
-    let (path, _trust) = gix_discover::upwards(&top_level_repo.join(".git/worktrees/c-worktree-deleted")).unwrap();
-    let suffix = std::path::Path::new(top_level_repo.file_name().unwrap())
-        .join("worktrees")
-        .join("c-worktree-deleted");
-    assert!(
-        matches!(path, gix_discover::repository::Path::LinkedWorkTree { work_dir, .. } if work_dir.ends_with(suffix)),
-        "it's no problem if work-dirs don't exist - this can be discovered later and a lot of operations are possible anyway."
+    let private_git_dir = top_level_repo.join(".git/worktrees/c-worktree-deleted");
+    let (path, _trust) = gix_discover::upwards(&private_git_dir).unwrap();
+    assert_eq!(
+        path,
+        gix_discover::repository::Path::Repository(private_git_dir),
+        "it's no problem if work-dirs don't exist - the private git dir is usable on its own, \
+         which is also what git does when standing in it (`GIT_DIR_BARE`)."
     );
 }
 
@@ -294,7 +315,10 @@ fn from_existing_worktree_with_relative_linking_files() -> crate::Result {
         "the private git dir points back to the checkout with a relative path"
     );
 
-    for discover_path in [&linked, &private_git_dir] {
+    // Starting from the checkout resolves the back-link to the private git dir, while starting
+    // from the private git dir itself is `GIT_DIR_BARE` and yields no work tree at all - both
+    // match `git rev-parse --absolute-git-dir --show-toplevel` run from those directories.
+    for (discover_path, expect_worktree) in [(&linked, true), (&private_git_dir, false)] {
         let (path, trust) = gix_discover::upwards(discover_path)?;
         assert_eq!(trust, expected_trust());
         let (actual_git_dir, actual_worktree) = path.into_repository_and_work_tree_directories();
@@ -305,8 +329,9 @@ fn from_existing_worktree_with_relative_linking_files() -> crate::Result {
         );
         assert_eq!(
             actual_worktree.as_deref().map(gix_path::realpath).transpose()?,
-            Some(gix_path::realpath(&linked)?),
-            "discovery resolves the linked worktree from relative worktree metadata"
+            expect_worktree.then(|| gix_path::realpath(&linked)).transpose()?,
+            "discovery resolves the linked worktree from relative worktree metadata, \
+             but only when it started from the checkout"
         );
     }
 

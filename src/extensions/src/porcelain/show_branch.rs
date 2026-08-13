@@ -409,10 +409,6 @@ type ParseFail = Option<String>;
 /// `OPT__COLOR`'s rejection of an unknown `<when>`.
 const BAD_COLOR: &str = "error: option `color' expects \"always\", \"auto\", or \"never\"";
 
-/// `OPTION_INTEGER`'s rejection of a non-numeric `--more` value.
-const BAD_MORE: &str =
-    "error: option `more' expects an integer value with an optional k/m/g suffix";
-
 /// `parse_reflog_param()` — `<n>[,<base>]`, with an absent or zero `<n>` meaning
 /// `DEFAULT_REFLOG`. The leading digit run is read `strtoul`-style, so anything
 /// after it must be the `,<base>` separator.
@@ -482,7 +478,9 @@ fn parse_args(argv: &[String], opts: &mut Opts) -> Result<Vec<String>, ParseFail
                 }
                 _ if long.starts_with("more=") => {
                     let n = &long["more=".len()..];
-                    opts.extra = n.parse::<i32>().map_err(|_| Some(BAD_MORE.to_string()))?;
+                    let v = crate::optint::integer(&crate::optint::long_opt("more"), n)
+                        .map_err(|e| Some(format!("error: {e}")))?;
+                    opts.extra = v as i32;
                 }
                 _ if long.starts_with("color=") => {
                     opts.color = match &long["color=".len()..] {

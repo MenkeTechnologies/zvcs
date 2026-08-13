@@ -2009,26 +2009,25 @@ fn color_wanted(when: Option<&str>) -> Result<bool, ()> {
     }
 }
 
-/// Parse an option value that git declares as an integer, reporting git's own
-/// usage error (exit 129) when it is not one.
+/// `OPT_INTEGER` (`--threads`, `--max-count`, `--max-depth`), through the shared
+/// `parse-options` grammar so `0x10`, `010`, `+1` and a `k`/`m`/`g` suffix read
+/// the way stock git reads them. Rejections are git's own, at exit 129.
 fn parse_int(name: &str, value: &str) -> Result<i64, ExitCode> {
-    value.parse::<i64>().map_err(|_| {
-        eprintln!("error: option `{name}' expects an integer value with an optional k/m/g suffix");
+    crate::optint::integer(&crate::optint::long_opt(name), value).map_err(|e| {
+        eprintln!("error: {e}");
         ExitCode::from(129)
     })
 }
 
-/// Parse a `-A`/`-B` (`--after-context`/`--before-context`) value, which git
-/// requires to be a non-negative integer. `spelled` is how git names the flag in
-/// its usage error — `switch `A'` for the short form, `option `after-context'`
-/// for the long — reported at exit 129 exactly as git does.
+/// `OPT_UNSIGNED` for `-A`/`-B` (`--after-context`/`--before-context`), whose
+/// target is an `unsigned int`, so its range clause reads `[0,4294967295]`.
+/// `spelled` is git's `optname()` rendering — `switch `A'` for the short form,
+/// `option `after-context'` for the long.
 fn parse_context_nonneg(spelled: &str, value: &str) -> Result<usize, ExitCode> {
-    match value.parse::<i64>() {
-        Ok(n) if n >= 0 => Ok(n as usize),
-        _ => {
-            eprintln!(
-                "error: {spelled} expects a non-negative integer value with an optional k/m/g suffix"
-            );
+    match crate::optint::unsigned_prec(&spelled.to_string(), value, 4) {
+        Ok(n) => Ok(n as usize),
+        Err(e) => {
+            eprintln!("error: {e}");
             Err(ExitCode::from(129))
         }
     }

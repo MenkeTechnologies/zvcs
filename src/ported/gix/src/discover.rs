@@ -18,8 +18,13 @@ pub enum Error {
 impl ThreadSafeRepository {
     /// Try to open a git repository in `directory` and search upwards through its parents until one is found,
     /// using default trust options which matters in case the found repository isn't owned by the current user.
+    ///
+    /// This is git's setup: `setup_git_directory_gently_1()` in `setup.c` reads `GIT_DIR` before it
+    /// walks anywhere and returns `GIT_DIR_EXPLICIT` if it is set, and consults
+    /// `GIT_CEILING_DIRECTORIES` and `GIT_DISCOVERY_ACROSS_FILESYSTEM` for the walk itself. Use
+    /// [`discover_opts()`][Self::discover_opts()] to search without consulting the environment.
     pub fn discover(directory: impl AsRef<Path>) -> Result<Self, Error> {
-        Self::discover_opts(directory, Default::default(), Default::default())
+        Self::discover_with_environment_overrides(directory)
     }
 
     /// Try to open a git repository in `directory` and search upwards through its parents until one is found,
@@ -37,9 +42,18 @@ impl ThreadSafeRepository {
     ) -> Result<Self, Error> {
         let _span = gix_trace::coarse!("ThreadSafeRepository::discover()");
         let (path, trust) = upwards_opts(directory.as_ref(), options)?;
+        // Discovery landing on a git directory itself is git's `GIT_DIR_BARE`, and
+        // `setup_bare_git_dir()` in `setup.c` turns the implicit work tree off for it: from inside
+        // `<repo>/.git`, only `GIT_WORK_TREE` or `core.worktree` may still attach one.
+        let implicit_work_tree = if matches!(path, gix_discover::repository::Path::Repository(_)) {
+            crate::open::ImplicitWorkTree::None
+        } else {
+            crate::open::ImplicitWorkTree::ParentOfDotGitDir
+        };
         let (git_dir, worktree_dir) = path.into_repository_and_work_tree_directories();
         let mut options = trust_map.into_value_by_level(trust);
         options.git_dir_trust = trust.into();
+        options.implicit_work_tree = implicit_work_tree;
         // Note that we will adjust the `current_dir` later so it matches the value of `core.precomposeUnicode`.
         options.current_dir = Some(gix_fs::current_dir(false).map_err(upwards::Error::CurrentDir)?);
         Self::open_from_paths(git_dir, worktree_dir, options).map_err(Into::into)
@@ -51,7 +65,17 @@ impl ThreadSafeRepository {
     ///
     /// For more, see [`ThreadSafeRepository::discover_with_environment_overrides_opts()`].
     pub fn discover_with_environment_overrides(directory: impl AsRef<Path>) -> Result<Self, Error> {
-        Self::discover_with_environment_overrides_opts(directory, Default::default(), Default::default())
+        Self::discover_with_environment_overrides_opts(
+            directory,
+            upwards::Options {
+                // git turns a `GIT_CEILING_DIRECTORIES` that contains no ancestor of the search
+                // directory into "no ceiling at all" (`ceil_offset = min_offset - 2` in
+                // `setup_git_directory_gently_1()`), it does not refuse to search.
+                match_ceiling_dir_or_error: false,
+                ..Default::default()
+            },
+            Default::default(),
+        )
     }
 
     /// Try to open a git repository directly from the environment, which reads `GIT_DIR`

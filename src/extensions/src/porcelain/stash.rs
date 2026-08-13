@@ -549,6 +549,15 @@ fn push(repo: &gix::Repository, opts: &PushOpts) -> Result<ExitCode> {
         if let Ok(head_id) = repo.head_id() {
             let id = head_id.detach();
             super::checkout::record_head_move(repo, Some(id), Some(id), "reset: moving to HEAD");
+            // The same `reset --hard` also runs `reset_refs()`, which records
+            // the pre-reset `HEAD` in `ORIG_HEAD` (builtin/reset.c:314). The
+            // reset names no revision, so the value is `HEAD` itself — but it
+            // still *moves*, overwriting whatever an earlier operation left
+            // there, which is what a `git stash push` in a repository that has
+            // stashed before is observed to do. `--keep-index` and `-u`/`-a`
+            // take the same branch of `do_push_stash()`; only a pathspec
+            // (`git apply -R`) or `-S` skips the reset, and neither writes it.
+            super::reset::set_orig_head(repo, id)?;
         }
     }
 
@@ -1511,6 +1520,21 @@ fn restore_stash_commit(
             None
         }
     };
+    // `merge_switch_to_result()`'s `write_auto_merge` region again — `stash
+    // apply` merges through `merge_ort_nonrecursive()` like everything else, so
+    // a stash that really merges leaves `.git/AUTO_MERGE` behind and
+    // `git diff AUTO_MERGE` works on the result.
+    //
+    // Both of that wrapper's early returns are honoured: it bails before
+    // `merge_switch_to_result()` when the base already equals the other side
+    // (the `Already up to date.` above, which is what an untracked-only entry
+    // looks like), and a refused checkout returns from inside
+    // `merge_switch_to_result()` before the region is entered.
+    if w_tree != base_tree {
+        if let Some(a) = applied.as_ref() {
+            crate::merge_apply::write_auto_merge(repo, a.tree_id)?;
+        }
+    }
     let merged_cleanly = applied.as_ref().is_some_and(|a| a.conflicts.is_empty());
     if !merged_cleanly {
         // git leaves the conflicted worktree in place and fails the apply; the
@@ -1649,6 +1673,15 @@ pub fn apply_autostash(repo: &gix::Repository, commit_id: ObjectId, quiet: bool)
         &should_interrupt,
         !quiet,
     )?;
+    // The re-apply is a `git stash apply` child like any other, so it records
+    // the merged tree as `AUTO_MERGE` too. It only outlives the command when
+    // nothing removes it afterwards: `finish()` (builtin/merge.c:539) applies
+    // the autostash and its caller then runs `remove_merge_branch_state()`, so a
+    // `git merge --autostash` that completes leaves none, while a `rebase
+    // --autostash` — whose `finish_rebase()` has no such cleanup — does.
+    if base != theirs {
+        crate::merge_apply::write_auto_merge(repo, applied.tree_id)?;
+    }
 
     if applied.conflicts.is_empty() {
         // three_way_merge already wrote the merged content to the worktree. git's

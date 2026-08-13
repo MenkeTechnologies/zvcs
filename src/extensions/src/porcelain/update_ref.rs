@@ -26,8 +26,16 @@
 //! reports, and with `--stdin` each staged edit is applied on its own so one
 //! rejection no longer aborts the rest.
 //!
-//! Not covered: one-level lowercase ref names such as `foo` are rejected by
-//! `gix-validate`, where stock git would write `.git/foo`.
+//! One-level lowercase ref names such as `foo` are served too, even though
+//! `gix-validate` refuses them: `ref_transaction_update()` validates an update
+//! with `check_refname_format(refname, REFNAME_ALLOW_ONELEVEL)`, so
+//! `git update-ref main <oid>` writes `$GIT_DIR/main` and this port writes it
+//! directly rather than through a gitoxide transaction. A null new value takes
+//! git's other branch (`refname_is_safe()`), which refuses such a name, and no
+//! reflog is autocreated for one.
+//!
+//! Not covered: `--create-reflog` on a one-level name, which would have to write
+//! `$GIT_DIR/logs/<name>` by hand; it keeps the bad-name refusal instead.
 
 use anyhow::{anyhow, bail, Result};
 use std::io::Read;
@@ -178,6 +186,19 @@ pub fn update_ref(args: &[String]) -> Result<ExitCode> {
         // `gix-validate` is stricter than git's `refname_is_safe`; a deletion
         // git would accept targets a ref that cannot exist, so it is a no-op.
         Err(_) if opts.delete => return Ok(ExitCode::SUCCESS),
+        // `ref_transaction_update()` validates an update with
+        // `check_refname_format(refname, REFNAME_ALLOW_ONELEVEL)`, so a
+        // single-component name like `main` or `v0.2.0` is well formed and lands
+        // in `$GIT_DIR/<name>`. gitoxide's `FullName` refuses those (its
+        // `SomeLowercase` rule wants either a `/` or an all-caps pseudo-ref), so
+        // the write goes through directly rather than through a transaction.
+        Err(_)
+            if !opts.create_reflog
+                && matches!(new, Val::Oid(_))
+                && one_level_update_ok(name) =>
+        {
+            return write_one_level_ref(&repo, name, &new, &old);
+        }
         Err(_) => {
             eprintln!(
                 "fatal: update_ref failed for ref '{name}': refusing to update ref with bad name '{name}'"
@@ -303,6 +324,92 @@ fn apply_long(o: &mut Opts, name: &str) {
         "no-batch-updates" => o.batch_updates = false,
         _ => unreachable!("resolve_long only yields known names"),
     }
+}
+
+/// Whether `name` is the single-component form git accepts for an update and
+/// gitoxide does not: well formed under `REFNAME_ALLOW_ONELEVEL` and carrying no
+/// `/`, which is exactly the set `FullName` rejects out of what git allows.
+///
+/// `HEAD` and the other all-caps pseudo-refs are excluded because `FullName`
+/// already takes them, so they never reach here.
+///
+/// Only an update to a real object may use this. `ref_transaction_update()`
+/// picks its check on the new value — `check_refname_format(…, ALLOW_ONELEVEL)`
+/// for a non-null one, `refname_is_safe()` for a null one — and the latter
+/// refuses a lowercase one-level name, which is why `git update-ref main 0{40}`
+/// is `refusing to update ref with bad name 'main'` rather than a deletion.
+fn one_level_update_ok(name: &str) -> bool {
+    !name.contains('/')
+        && super::check_ref_format::check_refname_format_onelevel(name.as_bytes())
+}
+
+/// `update_ref()`'s die-on-error wrapper around a failed lock: one line,
+/// carrying the ref it was updating and the `cannot lock ref` reason inside it,
+/// then exit 128.
+fn lock_failure(name: &str, reason: &str) -> ExitCode {
+    eprintln!("fatal: update_ref failed for ref '{name}': cannot lock ref '{name}': {reason}");
+    ExitCode::from(128)
+}
+
+/// Write a single-component ref the way `files_transaction_finish()` does:
+/// through `<name>.lock` in `$GIT_DIR`, renamed into place, holding the 41-byte
+/// `<hex>\n` body.
+///
+/// No reflog is written. `should_autocreate_reflog()` covers only `HEAD` and the
+/// `refs/heads/`, `refs/remotes/`, `refs/notes/` and `refs/worktree/` prefixes,
+/// so a one-level ref gets none unless `--create-reflog` forces one — and that
+/// spelling is left to the caller's existing rejection rather than served here.
+fn write_one_level_ref(
+    repo: &gix::Repository,
+    name: &str,
+    new: &Val,
+    old: &Val,
+) -> Result<ExitCode> {
+    let path = repo.git_dir().join(name);
+    let current = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| gix::ObjectId::from_hex(s.trim().as_bytes()).ok());
+
+    // The `<oldvalue>` constraint, with git's two diagnostics: a mismatch names
+    // both values, and a zero old value asserts the ref does not exist yet.
+    match old {
+        Val::Missing => {}
+        Val::Zero => {
+            if let Some(have) = current {
+                let _ = have;
+                return Ok(lock_failure(name, "reference already exists"));
+            }
+        }
+        Val::Oid(want) => match current {
+            Some(have) if have == *want => {}
+            Some(have) => {
+                return Ok(lock_failure(name, &format!("is at {have} but expected {want}")));
+            }
+            None => {
+                return Ok(lock_failure(
+                    name,
+                    &format!("unable to resolve reference '{name}'"),
+                ));
+            }
+        },
+    }
+
+    match new {
+        Val::Oid(id) => {
+            let lock = repo.git_dir().join(format!("{name}.lock"));
+            if std::fs::write(&lock, format!("{id}\n")).is_err() {
+                return Ok(lock_failure(name, "unable to create lock file"));
+            }
+            if std::fs::rename(&lock, &path).is_err() {
+                let _ = std::fs::remove_file(&lock);
+                return Ok(lock_failure(name, "unable to write lock file"));
+            }
+        }
+        Val::Zero | Val::Missing => {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 /// git's `refname_is_safe()`: the weaker check a deletion has to pass.

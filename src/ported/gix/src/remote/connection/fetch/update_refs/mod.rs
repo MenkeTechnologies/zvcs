@@ -241,12 +241,18 @@ pub(crate) fn update(
                     }
                     None => {
                         let name: gix_ref::FullName = name.try_into()?;
-                        // `update_local_ref()`: a new tag is "storing tag" and everything
-                        // else — a local branch, a remote-tracking branch, any other ref
-                        // a refspec names — is "storing head".
-                        let reflog_msg = match name.category() {
-                            Some(gix_ref::Category::Tag) => "storing tag",
-                            _ => "storing head",
+                        // `update_local_ref()` (builtin/fetch.c:1023-1031) names a ref it is
+                        // creating after the *remote* side, "as it's more likely to follow a
+                        // standard layout": `refs/tags/` is "storing tag", `refs/heads/` is
+                        // "storing head", and everything else - `HEAD`, `refs/foo/bar`, a
+                        // refspec whose source is a plain object id - is "storing ref". The
+                        // local name the refspec writes to has no say in it, so fetching
+                        // `refs/heads/main:refs/remotes/origin/x` logs "storing head" while
+                        // `refs/tags/v1:refs/heads/x` logs "storing tag".
+                        let reflog_msg = match remote.as_name() {
+                            Some(remote_name) if remote_name.starts_with(b"refs/tags/") => "storing tag",
+                            Some(remote_name) if remote_name.starts_with(b"refs/heads/") => "storing head",
+                            _ => "storing ref",
                         };
                         (
                             Mode::New,

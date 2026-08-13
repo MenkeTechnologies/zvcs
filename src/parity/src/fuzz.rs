@@ -110,10 +110,18 @@ const VALUES: &[&str] = &[
     "abc", "true", "false", "v1", "=", "%H%n", "\t", "0x10",
 ];
 
-/// Read-only grammars only. Fuzzing mutating commands with random flags
-/// produces cases whose *stock* behavior is itself ambiguous (interactive
-/// prompts, editor spawns), which yields noise rather than findings. Mutating
-/// coverage stays curated in the corpus.
+/// The hand-written grammars: read-only commands, described by hand because
+/// their flag sets are worth stating deliberately.
+///
+/// These are **not** the whole fuzz corpus — [`all_grammars`] concatenates
+/// [`crate::grammars_generated::generated`], which covers eighty-odd more
+/// commands including mutating ones (`init`, `cherry-pick`, `rebase`, `revert`,
+/// `submodule`, `gc`, `repack`, …). That was once untrue: fuzzing a mutating
+/// command used to hang on an editor or a prompt, so the corpus carried
+/// read-only grammars only. `env::harden` closed that by neutralizing every
+/// interactive hook, and the generated grammars followed. The comment here
+/// outlived the restriction it described, which is worth remembering the next
+/// time this file explains what the harness does not do.
 pub fn grammars() -> Vec<Grammar> {
     vec![
         Grammar {

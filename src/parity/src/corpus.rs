@@ -14,6 +14,7 @@ use crate::fixture::Shape;
 use crate::runner::Case;
 
 mod diff_family;
+mod discovery;
 mod history_rewrite;
 mod info_attrs;
 mod mail_patch;
@@ -90,6 +91,21 @@ pub fn cases() -> Vec<Case> {
     c.push(Case::new("log", &["log", "--oneline", "--all"], Shape::Branched));
     c.push(Case::new("log", &["log", "--oneline", "--graph"], Shape::Merged));
     c.push(Case::new("log", &["log", "--merges", "--oneline"], Shape::Merged));
+    // The graph renderer, on histories that make its rows do work.
+    //
+    // `--oneline` prints one row per commit, so it exercises almost none of
+    // `graph.c`: the pre-commit expansion rows, the padding row between records,
+    // and the collapsing rows only appear once a record spans several lines or a
+    // commit has more than two parents. A separator-row bug survived in ordinary
+    // two-parent merges precisely because no case here rendered a multi-line
+    // record, and the octopus rows had no fixture at all.
+    c.push(Case::new("log", &["log", "--graph", "--pretty=medium", "--all"], Shape::Merged));
+    c.push(Case::new("log", &["log", "--graph", "--oneline", "--all"], Shape::Octopus));
+    c.push(Case::new("log", &["log", "--graph", "--pretty=medium", "--all"], Shape::Octopus));
+    c.push(Case::new("log", &["log", "--graph", "--oneline"], Shape::Octopus));
+    c.push(Case::new("log", &["log", "--graph", "--oneline", "--all", "--date-order"], Shape::Octopus));
+    c.push(Case::new("log", &["log", "--graph", "--oneline", "--all", "--topo-order"], Shape::Octopus));
+    c.push(Case::new("log", &["log", "--graph", "--oneline", "--first-parent"], Shape::Octopus));
     read_only("rev-list", &["rev-list", "HEAD"], &mut c);
     read_only("rev-list", &["rev-list", "--count", "HEAD"], &mut c);
     read_only("rev-list", &["rev-list", "--max-count=1", "HEAD"], &mut c);
@@ -199,6 +215,7 @@ pub fn cases() -> Vec<Case> {
 
     // ---- per-subsystem corpora, one module each ----
     diff_family::cases(&mut c);
+    discovery::cases(&mut c);
     history_rewrite::cases(&mut c);
     info_attrs::cases(&mut c);
     mail_patch::cases(&mut c);

@@ -112,6 +112,44 @@ pub enum Shape {
     /// rewrites (so that merge must refuse per path) — the two halves of the
     /// dirty-pull question that shipped broken twice.
     BehindRemote,
+    /// A second, *linked* worktree of the same repository: `wt/` beside the main
+    /// worktree, with its administrative directory at `.git/worktrees/wt`.
+    ///
+    /// The one repository layout in which `--git-dir` and `--git-common-dir`
+    /// answer differently, and the only one where `HEAD` is read from somewhere
+    /// other than the common directory — `wt` is on its own branch, so a
+    /// discovery path that resolves the common `HEAD` reports the wrong branch
+    /// while every other shape hides the mistake. No existing shape can express
+    /// it: a linked worktree has to be created by `worktree add`, which a case
+    /// (one argv against a pristine copy) cannot do, and adding one to an
+    /// existing shape would change what every case already using that shape
+    /// sees.
+    ///
+    /// Two construction details are load-bearing and are explained where they
+    /// are done in [`build`]: the worktree is registered with relative paths so
+    /// the per-case copy points at itself rather than at the template, and its
+    /// index is rewritten by `read-tree` so the shape hashes the same at two
+    /// build locations.
+    Worktree,
+    /// A merge with four parents, with one branch left unmerged beside it.
+    ///
+    /// `--graph` draws a merge past the second parent with rows no two-parent
+    /// merge produces — the commit row's `*---.` reach, the `|\ \ \` post-merge
+    /// row, and the expansion rows that open space around a merge that is not the
+    /// rightmost column. [`Shape::Merged`] is the only shape carrying a merge at
+    /// all and it has exactly two parents, so every one of those rows was
+    /// unmeasured by the corpus.
+    ///
+    /// No existing shape can express it: an octopus needs a commit with three or
+    /// more parents and no shape has one (`fixture.rs` runs `merge` twice in the
+    /// whole file, both two-way), and a case is one argv against a pristine copy
+    /// so it cannot create the merge itself. Adding the merge to `Merged` would
+    /// change what every case already on that shape sees.
+    ///
+    /// `oct-side` forks before the merge and is never merged, so `--all` keeps a
+    /// lane to the octopus's right and the expansion rows are reached; without it
+    /// the merge is the last column and git skips them.
+    Octopus,
 }
 
 impl Shape {
@@ -134,6 +172,8 @@ impl Shape {
         Shape::MergeableStaged,
         Shape::Stashed,
         Shape::BehindRemote,
+        Shape::Worktree,
+        Shape::Octopus,
     ];
 
     pub fn name(self) -> &'static str {
@@ -156,6 +196,8 @@ impl Shape {
             Shape::MergeableStaged => "mergeable-staged",
             Shape::Stashed => "stashed",
             Shape::BehindRemote => "behind-remote",
+            Shape::Worktree => "worktree",
+            Shape::Octopus => "octopus",
         }
     }
 }
@@ -740,6 +782,62 @@ pub fn build(shape: Shape, dir: &Path, home: &Path) -> Result<()> {
             // refuses the whole merge over it anyway.
             write(dir, "keep.txt", "keep, staged\n")?;
             git(dir, home, &["add", "keep.txt"])?;
+        }
+
+        Shape::Worktree => {
+            // The linked worktree lives inside the fixture root so the per-case
+            // copy carries it, and is hidden from the main worktree's status the
+            // same way `BehindRemote` hides its bare remote.
+            write(dir, ".git/info/exclude", "wt/\n")?;
+
+            // `--relative-paths` is what makes the shape copyable at all. By
+            // default `worktree add` records the *absolute* path of the worktree
+            // in `.git/worktrees/wt/gitdir` and of the git dir in `wt/.git`, so
+            // both copies of the fixture would point back at the template: the
+            // two sides would share one repository and the comparison would
+            // measure nothing. With relative paths each copy points at itself.
+            git(dir, home, &["worktree", "add", "--relative-paths", "-q", "-b", "linked", "wt"])?;
+
+            // `worktree add` checks the files out and records their `stat` data
+            // in `.git/worktrees/wt/index`. That data is inode and mtime, so two
+            // builds of the shape would differ there and the shape would stop
+            // being reproducible — `shapes_build_reproducibly` exempts the main
+            // `.git/index` for exactly this reason, and a second index is not
+            // covered by that exemption. `read-tree` rewrites the same entries
+            // from the tree with the stat fields zeroed, which is a state git
+            // writes itself (any `read-tree` without `-u` does) and refreshes on
+            // first use, so the worktree stays a normal checked-out one.
+            git(&dir.join("wt"), home, &["read-tree", "HEAD"])?;
+        }
+
+        Shape::Octopus => {
+            // Three branches off the base, each touching one path of its own so
+            // the octopus merges cleanly and needs no strategy of substance.
+            for branch in ["oct-a", "oct-b", "oct-c"] {
+                git(dir, home, &["checkout", "-q", "-b", branch, "main"])?;
+                write(dir, &format!("{branch}.txt"), &format!("{branch}\n"))?;
+                git(dir, home, &["add", &format!("{branch}.txt")])?;
+                git(dir, home, &["commit", "-qm", &format!("{branch} commit")])?;
+            }
+
+            // Forked before the merge and never merged, so it survives as a lane
+            // beside the octopus under `--all`.
+            git(dir, home, &["checkout", "-q", "-b", "oct-side", "main"])?;
+            write(dir, "oct-side.txt", "oct-side\n")?;
+            git(dir, home, &["add", "oct-side.txt"])?;
+            git(dir, home, &["commit", "-qm", "oct-side commit"])?;
+
+            // `main` moves on first, so the merge's first parent is not the base
+            // and the graph has a lane to collapse under the octopus as well.
+            git(dir, home, &["checkout", "-q", "main"])?;
+            write(dir, "trunk.txt", "trunk\n")?;
+            git(dir, home, &["add", "trunk.txt"])?;
+            git(dir, home, &["commit", "-qm", "main moves on"])?;
+            git(
+                dir,
+                home,
+                &["merge", "-q", "--no-ff", "-m", "octopus merge", "oct-a", "oct-b", "oct-c"],
+            )?;
         }
     }
     Ok(())

@@ -328,7 +328,18 @@ fn sample(rng: &mut Rng, g: &Grammar) -> Case {
 
     // Generated cases get closed stdin: an input payload is part of a case's
     // meaning, and the grammars describe argv only. stdin coverage is curated.
-    Case { cmd: g.cmd, args, shape: *rng.pick(g.shapes), stdin: None, compare_stderr: false }
+    // Generated cases also run at the fixture root with no extra environment:
+    // the grammars describe argv, and a discovery situation is a property of
+    // where a command is invoked from, which is curated rather than sampled.
+    Case {
+        cmd: g.cmd,
+        args,
+        shape: *rng.pick(g.shapes),
+        stdin: None,
+        compare_stderr: false,
+        cwd: None,
+        env: &[],
+    }
 }
 
 /// Shrink a failing case to a minimal still-failing one by greedily dropping

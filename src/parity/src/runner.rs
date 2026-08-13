@@ -53,7 +53,47 @@ pub struct Case {
     /// are measured on it; the rest of the corpus is unaffected, so no existing
     /// score moves.
     pub compare_stderr: bool,
+    /// Directory the command runs in, **relative to the fixture root**.
+    ///
+    /// `None` means the fixture root, which is what every case did before this
+    /// field existed — and that was the blind spot. Git decides *which
+    /// repository it is in* before it does anything else
+    /// (`setup.c:setup_git_directory_gently_1`), and that decision is a function
+    /// of the working directory: whether it is inside `.git`, inside a linked
+    /// worktree, inside a bare repository, or inside a submodule. With every
+    /// case pinned to the worktree root, the whole of discovery was
+    /// structurally unmeasurable, and it shipped broken more than once —
+    /// commands run from inside `.git` failed outright, and a command run in a
+    /// bare repository's subdirectory aborted the process.
+    ///
+    /// Created on both sides if the fixture does not already contain it, by the
+    /// same code, so "the directory exists" is never itself a difference
+    /// between the two runs.
+    ///
+    /// Deliberately relative and `&'static str`: an absolute path would name one
+    /// side's copy, and the two copies live at different roots.
+    pub cwd: Option<&'static str>,
+    /// Environment applied **on top of** [`crate::env::harden`], identically to
+    /// both sides.
+    ///
+    /// Additive only. [`crate::env::is_pinned`] rejects any key `harden`
+    /// already sets, because a case that re-points `HOME` or `GIT_COMMITTER_DATE`
+    /// puts the machine back into a comparison whose premise is that nothing but
+    /// the binary differs. What it *is* for is the variables `harden` leaves
+    /// unset precisely because it clears the environment — `GIT_DIR`,
+    /// `GIT_WORK_TREE`, `GIT_CEILING_DIRECTORIES` — each of which redirects
+    /// discovery and none of which any case could reach before.
+    ///
+    /// Values may not contain a literal absolute path, for the same reason `cwd`
+    /// may not: the two sides run in different directories. Write
+    /// [`REPO_PLACEHOLDER`] instead and it is replaced with that side's own
+    /// fixture root.
+    pub env: &'static [(&'static str, &'static str)],
 }
+
+/// Stands in for the running side's fixture root inside a case's [`Case::env`]
+/// values, so one literal can name both copies.
+pub const REPO_PLACEHOLDER: &str = "{repo}";
 
 impl Case {
     pub fn new(cmd: &'static str, args: &[&str], shape: Shape) -> Self {
@@ -63,6 +103,8 @@ impl Case {
             shape,
             stdin: None,
             compare_stderr: false,
+            cwd: None,
+            env: &[],
         }
     }
 
@@ -81,19 +123,51 @@ impl Case {
         Self { stdin: Some(stdin), ..Self::new(cmd, args, shape) }
     }
 
+    /// Run this case from `cwd`, a path relative to the fixture root.
+    ///
+    /// A builder rather than another constructor: cwd and extra environment
+    /// combine with each other and with every existing constructor, and four
+    /// more `Case::new`-shaped functions to spell the combinations would be
+    /// worse than two methods that compose.
+    pub fn in_dir(self, cwd: &'static str) -> Self {
+        Self { cwd: Some(cwd), ..self }
+    }
+
+    /// Run this case with `env` added on top of [`crate::env::harden`].
+    pub fn with_env(self, env: &'static [(&'static str, &'static str)]) -> Self {
+        Self { env, ..self }
+    }
+
     /// Stable identity for reporting and for reproducing a single failure.
     ///
     /// The stdin payload is part of the identity: two cases can share a shape
     /// and an argv and still be different invocations, and a report that
     /// collapsed them would name the wrong one.
+    ///
+    /// Working directory and extra environment are part of it for exactly the
+    /// same reason, and they are the *whole* difference between the discovery
+    /// cases: `rev-parse --git-dir` is one argv against one shape and means
+    /// something different in each of a dozen directories. They are appended as
+    /// their own segments, so a case that sets neither keeps the identity it
+    /// already had — the report and `scripts/split_failures.pl` key on these
+    /// strings, and the environment is rendered unsubstituted so the id is the
+    /// same on every machine.
     pub fn id(&self) -> String {
         let strict = if self.compare_stderr { "!" } else { "" };
-        let base =
+        let mut id =
             format!("{}{}::{}::{}", strict, self.shape.name(), self.cmd, self.args.join(" "));
-        match self.stdin {
-            None => base,
-            Some(bytes) => format!("{base}::stdin[{}B/{:016x}]", bytes.len(), fnv1a64(bytes)),
+        if let Some(cwd) = self.cwd {
+            id.push_str(&format!("::cwd[{cwd}]"));
         }
+        if !self.env.is_empty() {
+            let rendered: Vec<String> =
+                self.env.iter().map(|(k, v)| format!("{k}={v}")).collect();
+            id.push_str(&format!("::env[{}]", rendered.join(" ")));
+        }
+        if let Some(bytes) = self.stdin {
+            id.push_str(&format!("::stdin[{}B/{:016x}]", bytes.len(), fnv1a64(bytes)));
+        }
+        id
     }
 }
 
@@ -192,16 +266,56 @@ pub struct Outcome {
 /// being reported as the defect it is.
 const CASE_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// The directory a case runs in, created if the fixture does not contain it.
+///
+/// `create_dir_all` is a no-op on a directory that already exists, so the same
+/// call covers both "the fixture has this path" (`.git/refs/heads`) and "the
+/// case needs a directory that is not tracked and so cannot be in the fixture"
+/// (an empty non-repository directory to run from). Both sides go through here,
+/// so the directory's existence is never itself an asymmetry.
+fn case_dir(repo: &Path, cwd: Option<&str>) -> Result<PathBuf> {
+    let Some(rel) = cwd else { return Ok(repo.to_path_buf()) };
+    let dir = repo.join(rel);
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("creating case working directory {}", dir.display()))?;
+    Ok(dir)
+}
+
+/// Apply a case's extra environment on top of the hardened one.
+///
+/// Two invariants, both asserted rather than documented-and-hoped: the key is
+/// not one of `harden`'s pins (see [`env::is_pinned`]), and the value names this
+/// side's fixture root through [`REPO_PLACEHOLDER`] rather than as a literal
+/// path. A corpus-wide test checks both statically; the asserts catch a case
+/// added without running it.
+fn apply_case_env(cmd: &mut Command, repo: &Path, extra: &[(&'static str, &'static str)]) {
+    for (key, value) in extra {
+        assert!(
+            !env::is_pinned(key),
+            "case environment may not override the hardened pin {key}"
+        );
+        assert!(
+            !value.starts_with('/'),
+            "case environment {key} must use {REPO_PLACEHOLDER}, not the absolute path {value}"
+        );
+        cmd.env(key, value.replace(REPO_PLACEHOLDER, &repo.to_string_lossy()));
+    }
+}
+
 fn run_side(
     bin: &Path,
     repo: &Path,
     home: &Path,
     args: &[String],
     stdin: Option<&'static [u8]>,
+    cwd: Option<&str>,
+    extra_env: &[(&'static str, &'static str)],
 ) -> Result<Side> {
+    let dir = case_dir(repo, cwd)?;
     let mut cmd = Command::new(bin);
     env::harden(&mut cmd, home);
-    cmd.current_dir(repo)
+    apply_case_env(&mut cmd, repo, extra_env);
+    cmd.current_dir(&dir)
         .args(args)
         // Closed stdin stays the default. A command that reads input it was not
         // given must still hit EOF rather than block, or the `Hang` verdict
@@ -313,7 +427,143 @@ fn probe_state(repo: &Path, home: &Path) -> String {
     digest.push_str(&probe_storage(repo));
     digest.push_str(&probe_reflogs(repo));
     digest.push_str(&probe_rr_cache(repo));
+    digest.push_str(&probe_op_state(repo));
     digest
+}
+
+/// Root-level files and refs that record an **in-progress operation**.
+///
+/// Enumerated from git 2.55.0 rather than globbed over `.git`, because a glob
+/// would sweep in `index`, `COMMIT_EDITMSG`, `FETCH_HEAD`, `shallow` and the
+/// hook samples — machine-local scratch and already-measured facts — and would
+/// make the probe's meaning depend on whatever else happens to sit in the
+/// directory. Each name below is cited to the code that writes or deletes it:
+///
+///  * `wt-status.c:1823` `wt_status_get_state` reads `MERGE_HEAD`,
+///    `CHERRY_PICK_HEAD` and `REVERT_HEAD` to decide which operation is live;
+///  * `wt-status.c:1783` `wt_status_check_bisect` keys on `BISECT_LOG` and
+///    reads `BISECT_START`;
+///  * `bisect.c:1191` `bisect_clean_state` is the authoritative list of what a
+///    finished bisect must remove — `BISECT_ANCESTORS_OK`, `BISECT_LOG`,
+///    `BISECT_NAMES`, `BISECT_RUN`, `BISECT_TERMS`, `BISECT_FIRST_PARENT`,
+///    `BISECT_START`, plus the `BISECT_HEAD` and `BISECT_EXPECTED_REV` refs;
+///  * `path.c:1582` names `SQUASH_MSG`, `MERGE_MSG`, `MERGE_RR`, `MERGE_MODE`
+///    and `MERGE_HEAD`;
+///  * `merge-ort.c:4950` writes `AUTO_MERGE`, `branch.c:835` deletes it;
+///  * `sequencer.c:1713` writes `REBASE_HEAD`, `sequencer.c:5047` clears it;
+///  * `reset.c:53`, `builtin/merge.c:1635` and `builtin/am.c:1092` write
+///    `ORIG_HEAD`;
+///  * `refs.c:917` lists `MERGE_AUTOSTASH`, `NOTES_MERGE_REF` and
+///    `NOTES_MERGE_PARTIAL` as root refs.
+///
+/// `COMMIT_EDITMSG` is deliberately *not* here. It is the editor scratch buffer
+/// every commit leaves behind, not state any `--continue`/`--abort` consults,
+/// and `wt_status_get_state` never looks at it.
+const OP_STATE_FILES: &[&str] = &[
+    "AUTO_MERGE",
+    "BISECT_ANCESTORS_OK",
+    "BISECT_EXPECTED_REV",
+    "BISECT_FIRST_PARENT",
+    "BISECT_HEAD",
+    "BISECT_LOG",
+    "BISECT_NAMES",
+    "BISECT_RUN",
+    "BISECT_START",
+    "BISECT_TERMS",
+    "CHERRY_PICK_HEAD",
+    "MERGE_AUTOSTASH",
+    "MERGE_HEAD",
+    "MERGE_MODE",
+    "MERGE_MSG",
+    "MERGE_RR",
+    "NOTES_MERGE_PARTIAL",
+    "NOTES_MERGE_REF",
+    "ORIG_HEAD",
+    "REBASE_HEAD",
+    "REVERT_HEAD",
+    "SQUASH_MSG",
+];
+
+/// Directories whose whole contents are operation state.
+///
+/// Walked rather than whitelisted, on the same reasoning as `probe_storage`'s
+/// listing: git writes twenty-odd files under `rebase-merge` alone
+/// (`sequencer.c:75`-`212`) and `builtin/am.c` another twenty under
+/// `rebase-apply`, the set differs per invocation, and a file nobody thought of
+/// is exactly the one a port forgets to write.
+///
+///  * `sequencer/` — `sequencer.c:68`-`73`: `todo`, `opts`, `head`,
+///    `abort-safety`.
+///  * `rebase-merge/` — `sequencer.c:75`, the interactive/merge rebase state.
+///  * `rebase-apply/` — `wt-status.c:1753` and `builtin/am.c:161`, the `am` and
+///    `rebase --apply` state.
+///  * `NOTES_MERGE_WORKTREE/` — `notes-merge.c:282`, where a conflicted notes
+///    merge parks its per-note files.
+const OP_STATE_DIRS: &[&str] = &["NOTES_MERGE_WORKTREE", "rebase-apply", "rebase-merge", "sequencer"];
+
+/// In-progress operation state: `.git/sequencer`, `.git/rebase-merge`,
+/// `.git/rebase-apply`, and the root state files, as one `key: value` line each.
+///
+/// Nothing above this reads any of it. That is the whole state that makes
+/// `--continue`, `--abort` and `--skip` work, and it was invisible: a
+/// `cherry-pick A B C` that stopped on a conflict without writing
+/// `.git/sequencer` at all scored the same as one that wrote it correctly, and
+/// only tripped a probe later, incidentally, when the follow-up `--abort` left
+/// an extra commit that `for-each-ref` happened to see.
+///
+/// **Contents, not presence.** Presence alone would pass a `sequencer/todo`
+/// that lists the wrong commits or the wrong verbs, which is the same class of
+/// silent-but-wrong that `probe_reflogs` was added to close. Nothing is elided:
+/// unlike pack filenames, every value in these files — object ids, branch
+/// names, todo verbs, `am` patch text — is a function of repository content
+/// that two correct implementations must agree on, and both sides run the same
+/// fixture. Verified by building seven interrupted operations (cherry-pick,
+/// revert, merge, `rebase`, `rebase -i`, `am`, `bisect`) twice with stock 2.55.0
+/// under `env::harden` and diffing the two `.git` trees: no differences, so
+/// nothing here can push a case into `Nondeterministic`. Absolute paths, if a
+/// future git writes one, are already covered by `normalize`'s `<REPO>`/`<HOME>`
+/// substitution, which is applied to the whole digest.
+///
+/// **One line per fact**, with content newlines escaped, because the report
+/// pairs the two digests line by line (`report.rs:259`) to name the fact that
+/// moved. A multi-line value spliced in raw would shift every following line and
+/// report a dozen phantom differences instead of the one real one.
+fn probe_op_state(repo: &Path) -> String {
+    let git = repo.join(".git");
+    let mut out = String::from("# op-state\n");
+
+    for name in OP_STATE_FILES {
+        out.push_str(&format!("{name}: {}\n", read_as_value(&git.join(name))));
+    }
+
+    for dir in OP_STATE_DIRS {
+        let path = git.join(dir);
+        if !path.is_dir() {
+            out.push_str(&format!("{dir}/: <absent>\n"));
+            continue;
+        }
+        // Recorded separately from the file lines so that an operation that
+        // creates the directory and writes nothing into it is still visible.
+        out.push_str(&format!("{dir}/: <dir>\n"));
+        for (rel, file) in walk_files(&path) {
+            out.push_str(&format!("{dir}/{rel}: {}\n", read_as_value(&file)));
+        }
+    }
+    out
+}
+
+/// One state file as a single `value` field: `<absent>` when it is not there,
+/// otherwise its bytes with backslash, newline and carriage return escaped so
+/// the fact occupies exactly one line.
+fn read_as_value(path: &Path) -> String {
+    match std::fs::read(path) {
+        Ok(bytes) => String::from_utf8_lossy(&bytes)
+            .replace('\\', "\\\\")
+            .replace('\n', "\\n")
+            .replace('\r', "\\r"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => "<absent>".to_string(),
+        Err(_) => "<unreadable>".to_string(),
+    }
 }
 
 /// Every regular file under `dir`, as `(path relative to dir, absolute path)`,
@@ -669,8 +919,8 @@ pub fn run_case(
     templates.instantiate(case.shape, &zvcs_repo)?;
 
     let home = &templates.home;
-    let stock = run_side(crate::stock::git()?, &stock_repo, home, &case.args, case.stdin)?;
-    let zvcs = run_side(zvcs_bin, &zvcs_repo, home, &case.args, case.stdin)?;
+    let stock = run_side(crate::stock::git()?, &stock_repo, home, &case.args, case.stdin, case.cwd, case.env)?;
+    let zvcs = run_side(zvcs_bin, &zvcs_repo, home, &case.args, case.stdin, case.cwd, case.env)?;
 
     let stock_state = probe_state(&stock_repo, home);
     let zvcs_state = probe_state(&zvcs_repo, home);
@@ -764,7 +1014,7 @@ fn stock_disagrees_with_itself(
     let _ = std::fs::remove_dir_all(&repo);
     templates.instantiate(case.shape, &repo)?;
     let home = &templates.home;
-    let again = run_side(crate::stock::git()?, &repo, home, &case.args, case.stdin)?;
+    let again = run_side(crate::stock::git()?, &repo, home, &case.args, case.stdin, case.cwd, case.env)?;
     if normalize(&again.stdout, &repo, home, stock_exec_dir(home)) != *first_stdout {
         return Ok(true);
     }
@@ -796,7 +1046,77 @@ pub fn locate_zvcs_bin(explicit: Option<&str>) -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::is_unsupported;
+    use super::{is_unsupported, probe_op_state, OP_STATE_DIRS, OP_STATE_FILES};
+    use std::path::PathBuf;
+
+    /// A scratch `.git` tree. The probe only reads the filesystem, so the test
+    /// needs no git binary, no network and no fixture — just a temp directory.
+    fn scratch(tag: &str) -> PathBuf {
+        let repo: PathBuf =
+            std::env::temp_dir().join(format!("zvcs-parity-op-state-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&repo);
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        repo
+    }
+
+    /// Every enumerated fact is reported even when nothing is in progress, so
+    /// the two digests being compared line up positionally.
+    #[test]
+    fn op_state_reports_absent_facts() {
+        let repo = scratch("op-state-empty");
+        let probe = probe_op_state(&repo);
+        assert_eq!(probe.lines().next(), Some("# op-state"));
+        for name in OP_STATE_FILES {
+            assert!(
+                probe.lines().any(|l| l == format!("{name}: <absent>")),
+                "missing absent line for {name} in:\n{probe}"
+            );
+        }
+        for dir in OP_STATE_DIRS {
+            assert!(probe.lines().any(|l| l == format!("{dir}/: <absent>")));
+        }
+    }
+
+    /// Contents are compared, not just presence, and a multi-line value stays on
+    /// one line — `report.rs` pairs the two digests by line position, so a raw
+    /// newline here would misalign every following fact.
+    #[test]
+    fn op_state_flattens_contents_to_one_line_per_fact() {
+        let repo = scratch("op-state-inprogress");
+        let git = repo.join(".git");
+        std::fs::write(git.join("CHERRY_PICK_HEAD"), b"0123456789abcdef\n").unwrap();
+        std::fs::create_dir_all(git.join("sequencer")).unwrap();
+        std::fs::write(git.join("sequencer/todo"), b"pick aaa one\npick bbb two\n").unwrap();
+        std::fs::create_dir_all(git.join("rebase-merge")).unwrap();
+
+        let probe = probe_op_state(&repo);
+        let lines: Vec<&str> = probe.lines().collect();
+        assert!(lines.contains(&"CHERRY_PICK_HEAD: 0123456789abcdef\\n"));
+        assert!(lines.contains(&"sequencer/: <dir>"));
+        assert!(lines.contains(&"sequencer/todo: pick aaa one\\npick bbb two\\n"));
+        // An operation that creates its directory but writes nothing into it is
+        // still distinguishable from one that never started.
+        assert!(lines.contains(&"rebase-merge/: <dir>"));
+        assert!(lines.contains(&"rebase-apply/: <absent>"));
+        // Every line carries exactly one fact.
+        assert!(lines.iter().skip(1).all(|l| l.contains(": ")));
+    }
+
+    /// A todo list that names different commits must not compare equal to one
+    /// that names the right ones. This is the `cherry-pick A B C` blind spot.
+    #[test]
+    fn op_state_distinguishes_differing_sequencer_todos() {
+        let a = scratch("op-state-todo-a");
+        let b = scratch("op-state-todo-b");
+        for (repo, todo) in [(&a, "pick aaa one\npick bbb two\n"), (&b, "pick aaa one\n")] {
+            std::fs::create_dir_all(repo.join(".git/sequencer")).unwrap();
+            std::fs::write(repo.join(".git/sequencer/todo"), todo).unwrap();
+        }
+        assert_ne!(probe_op_state(&a), probe_op_state(&b));
+        // …and a missing sequencer differs from a present one.
+        let c = scratch("op-state-todo-c");
+        assert_ne!(probe_op_state(&a), probe_op_state(&c));
+    }
 
     /// A gap is only a gap when the port says so in its own voice.
     ///

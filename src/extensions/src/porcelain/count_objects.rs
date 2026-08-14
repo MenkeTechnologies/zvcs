@@ -105,7 +105,9 @@ pub fn count_objects(args: &[String]) -> Result<ExitCode> {
         };
         match a {
             "--" => end_of_opts = true,
-            "-h" => {
+            // `--help-all` renders `USAGE_FULL`, identical to the `-h` block:
+            // no entry of this table is `PARSE_OPT_HIDDEN`.
+            "-h" | "--help-all" => {
                 print!("{USAGE}");
                 return Ok(ExitCode::from(129));
             }

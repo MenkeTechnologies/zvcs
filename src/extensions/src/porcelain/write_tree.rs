@@ -38,6 +38,20 @@ const USAGE: &str = "usage: git write-tree [--missing-ok] [--prefix=<prefix>/]\n
                      \x20                         write tree object for a subdirectory <prefix>\n\
                      \n";
 
+/// `usage_with_options_internal()`'s `USAGE_FULL` rendering — what `--help-all`
+/// prints. It is [`USAGE`] with the `PARSE_OPT_HIDDEN` entries left in:
+/// `--[no-]ignore-cache-tree`.
+/// Captured byte-for-byte from stock git 2.55.0's `git write-tree --help-all`.
+const USAGE_ALL: &str = r#"usage: git write-tree [--missing-ok] [--prefix=<prefix>/]
+
+    --[no-]missing-ok     allow missing objects
+    --[no-]prefix <prefix>/
+                          write tree object for a subdirectory <prefix>
+    --[no-]ignore-cache-tree
+                          only useful for debugging
+
+"#;
+
 /// git reports at most this many unmerged index entries before printing `...`
 /// and giving up (`cache-tree.c`'s counter is global across directories, which
 /// a flat walk of the index in path order reproduces).
@@ -81,6 +95,13 @@ pub fn write_tree(args: &[String]) -> Result<ExitCode> {
         match a {
             "-h" => {
                 print!("{USAGE}");
+                return Ok(ExitCode::from(129));
+            }
+            // `if (internal_help && !strcmp(arg + 2, "help-all"))`
+            // (parse-options.c:1122): an exact match, never an abbreviation and
+            // never with an `=<value>`, rendering `USAGE_FULL`.
+            "--help-all" => {
+                print!("{USAGE_ALL}");
                 return Ok(ExitCode::from(129));
             }
             // `--ignore-cache-tree` (builtin/write-tree.c:37, "only useful for

@@ -88,6 +88,16 @@ pub fn mktree(args: &[String]) -> Result<ExitCode> {
         if no_more_opts || arg == "-" || !arg.starts_with('-') {
             continue;
         }
+        // parse_options_step() tests `--help-all` with a `strcmp()` of its own,
+        // ahead of parse_long_opt(): the name never abbreviates and never takes
+        // an `=<value>`, and it is not reached past `--`. This table has no
+        // `PARSE_OPT_HIDDEN` entry, so `USAGE_FULL` renders the same block `-h`
+        // prints. Unlike the lone-`-h` fast path above, git.c's pre-setup check
+        // is `-h` only, so this one runs after repository discovery.
+        if arg == "--help-all" {
+            print!("{USAGE}");
+            return Ok(ExitCode::from(129));
+        }
         if let Some(long) = arg.strip_prefix("--") {
             if long.is_empty() {
                 no_more_opts = true;

@@ -143,6 +143,14 @@ fn parse_options(args: &[String]) -> Parsed {
         if !arg.starts_with('-') || arg == "-" {
             break;
         }
+        // `parse_options_step()` tests `--help-all` with a `strcmp()` of its own,
+        // ahead of `parse_long_opt()`: the name never abbreviates and never takes
+        // an `=<value>`. This table has no `PARSE_OPT_HIDDEN` entry, so
+        // `USAGE_FULL` renders the same block `-h` prints.
+        if arg == "--help-all" {
+            print!("{USAGE}");
+            return Parsed::Exit(ExitCode::from(129));
+        }
 
         if let Some(long) = arg.strip_prefix("--") {
             let (name, value) = match long.split_once('=') {

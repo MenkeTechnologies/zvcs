@@ -219,6 +219,60 @@ usage: git multi-pack-index [<options>] repack [--batch-size=<size>]
 
 ";
 
+use super::{Arg, LongOpt};
+
+/// `common_opts[]` (builtin/multi-pack-index.c:96-104), which
+/// `add_common_options()` concatenates *ahead* of each sub-command's own table —
+/// hence the leading position in every table below, and in every usage block.
+const COMMON_OBJECT_DIR: LongOpt = LongOpt { name: "object-dir", neg: true, arg: Arg::Required };
+const COMMON_PROGRESS: LongOpt = LongOpt { name: "progress", neg: true, arg: Arg::None };
+
+/// The top-level table is `parse_options_concat(builtin_multi_pack_index_options,
+/// common_opts)`, and `parse_long_opt()` skips `OPTION_SUBCOMMAND` entries
+/// outright (parse-options.c:542-543) — so the five sub-command names are not
+/// abbreviatable long options and only the two common ones resolve here.
+pub(super) const MPI_OPTS: &[LongOpt] = &[COMMON_OBJECT_DIR, COMMON_PROGRESS];
+
+/// `builtin_multi_pack_index_write_options[]` (builtin/multi-pack-index.c:151-169)
+/// behind the two common entries.
+pub(super) const WRITE_OPTS: &[LongOpt] = &[
+    COMMON_OBJECT_DIR,
+    COMMON_PROGRESS,
+    LongOpt { name: "preferred-pack", neg: true, arg: Arg::Required },
+    LongOpt { name: "bitmap", neg: true, arg: Arg::None },
+    LongOpt { name: "base", neg: true, arg: Arg::Required },
+    LongOpt { name: "incremental", neg: true, arg: Arg::None },
+    LongOpt { name: "write-chain-file", neg: true, arg: Arg::None },
+    LongOpt { name: "stdin-packs", neg: true, arg: Arg::None },
+    LongOpt { name: "refs-snapshot", neg: true, arg: Arg::Required },
+];
+
+/// `builtin_multi_pack_index_compact_options[]` (builtin/multi-pack-index.c:244-255).
+/// Note the order: `base` precedes `bitmap` here, the reverse of `write`, and the
+/// order decides which two names an `ambiguous option:` sentence reports.
+pub(super) const COMPACT_OPTS: &[LongOpt] = &[
+    COMMON_OBJECT_DIR,
+    COMMON_PROGRESS,
+    LongOpt { name: "base", neg: true, arg: Arg::Required },
+    LongOpt { name: "bitmap", neg: true, arg: Arg::None },
+    LongOpt { name: "incremental", neg: true, arg: Arg::None },
+    LongOpt { name: "write-chain-file", neg: true, arg: Arg::None },
+];
+
+/// `builtin_multi_pack_index_verify_options[]` and
+/// `..._expire_options[]` are both just `OPT_END()`, so each is the commons alone.
+pub(super) const VERIFY_OPTS: &[LongOpt] = &[COMMON_OBJECT_DIR, COMMON_PROGRESS];
+
+/// `builtin_multi_pack_index_repack_options[]` (builtin/multi-pack-index.c:377-381):
+/// one `OPT_UNSIGNED`, which carries `PARSE_OPT_NONEG` (parse-options.h:287-296)
+/// and so has no `--no-batch-size` — which is why `-h` renders it as
+/// `--batch-size <n>` while every other entry here is `--[no-]…`.
+pub(super) const REPACK_OPTS: &[LongOpt] = &[
+    COMMON_OBJECT_DIR,
+    COMMON_PROGRESS,
+    LongOpt { name: "batch-size", neg: false, arg: Arg::Required },
+];
+
 /// `git multi-pack-index` — write, verify, expire and compact the multi-pack-index.
 ///
 /// Supported forms (stdout, exit code and resulting MIDX file matching stock git):
@@ -254,11 +308,31 @@ pub fn multi_pack_index(args: &[String]) -> Result<ExitCode> {
     // bare word is the sub-command and everything after it belongs to that
     // sub-command's own parser (which re-accepts the two common options).
     let mut it = args.iter().map(String::as_str);
-    while let Some(a) = it.next() {
+    while let Some(orig) = it.next() {
         if subcommand.is_some() {
-            rest.push(a);
+            rest.push(orig);
             continue;
         }
+        // parse_options_step() tests `--help-all` with a `strcmp()` of its own,
+        // ahead of parse_long_opt(): the name never abbreviates and never takes
+        // an `=<value>`, so it is matched before the prefix resolution below
+        // rather than added to the option table. This table has no
+        // `PARSE_OPT_HIDDEN` entry, so `USAGE_FULL` renders the same block `-h`
+        // prints.
+        if orig == "--help-all" {
+            print!("{USAGE}");
+            return Ok(ExitCode::from(129));
+        }
+        // An unambiguous prefix names the option it abbreviates. Sub-command
+        // names are not in this space (`parse_long_opt()` skips them), so a bare
+        // word still falls through to the dispatch below unchanged.
+        let resolved = match super::canonical_long(orig, MPI_OPTS) {
+            super::Long::Name(name) => name,
+            super::Long::Ambiguous(first, second) => {
+                return Ok(super::ambiguous_option(orig, &first, &second, USAGE))
+            }
+        };
+        let a = resolved.as_ref();
         match take_common(a, &mut it, &mut object_dir)? {
             Common::Consumed => continue,
             Common::MissingValue(name) => {
@@ -286,7 +360,7 @@ pub fn multi_pack_index(args: &[String]) -> Result<ExitCode> {
             let c = a.chars().nth(1).expect("checked length");
             return Ok(usage_error(Some(&format!("unknown switch `{c}'")), USAGE));
         }
-        subcommand = Some(a);
+        subcommand = Some(orig);
     }
 
     match subcommand {
@@ -316,16 +390,32 @@ fn write(rest: &[&str], mut object_dir: Option<PathBuf>) -> Result<ExitCode> {
     let mut stdin_packs = false;
     let mut preferred: Option<String> = None;
     let mut it = rest.iter().copied();
-    while let Some(a) = it.next() {
+    while let Some(orig) = it.next() {
         if after_dd {
             // Everything past `--` is an operand and `write` takes none, so git
             // prints the bare usage block with no `error:` line.
             return Ok(usage_error(None, WRITE_USAGE));
         }
-        if a == "--" {
+        if orig == "--" {
             after_dd = true;
             continue;
         }
+        // parse_options_step() tests `--help-all` with a `strcmp()` of its own,
+        // ahead of parse_long_opt(): the name never abbreviates, never takes an
+        // `=<value>`, and is not reached past `--`. This table has no
+        // `PARSE_OPT_HIDDEN` entry, so `USAGE_FULL` renders the same block `-h`
+        // prints.
+        if orig == "--help-all" {
+            print!("{WRITE_USAGE}");
+            return Ok(ExitCode::from(129));
+        }
+        let resolved = match super::canonical_long(orig, WRITE_OPTS) {
+            super::Long::Name(name) => name,
+            super::Long::Ambiguous(first, second) => {
+                return Ok(super::ambiguous_option(orig, &first, &second, WRITE_USAGE))
+            }
+        };
+        let a = resolved.as_ref();
         match take_common(a, &mut it, &mut object_dir)? {
             Common::Consumed => continue,
             Common::MissingValue(name) => {
@@ -602,16 +692,32 @@ fn write_midx_from(
 fn verify(rest: &[&str], mut object_dir: Option<PathBuf>) -> Result<ExitCode> {
     let mut after_dd = false;
     let mut it = rest.iter().copied();
-    while let Some(a) = it.next() {
+    while let Some(orig) = it.next() {
         if after_dd {
             // Operands after `--`; `verify` takes none, so git prints the bare
             // usage block (this is also what `verify extra` produces).
             return Ok(usage_error(None, VERIFY_USAGE));
         }
-        if a == "--" {
+        if orig == "--" {
             after_dd = true;
             continue;
         }
+        // parse_options_step() tests `--help-all` with a `strcmp()` of its own,
+        // ahead of parse_long_opt(): the name never abbreviates, never takes an
+        // `=<value>`, and is not reached past `--`. This table has no
+        // `PARSE_OPT_HIDDEN` entry, so `USAGE_FULL` renders the same block `-h`
+        // prints.
+        if orig == "--help-all" {
+            print!("{VERIFY_USAGE}");
+            return Ok(ExitCode::from(129));
+        }
+        let resolved = match super::canonical_long(orig, VERIFY_OPTS) {
+            super::Long::Name(name) => name,
+            super::Long::Ambiguous(first, second) => {
+                return Ok(super::ambiguous_option(orig, &first, &second, VERIFY_USAGE))
+            }
+        };
+        let a = resolved.as_ref();
         match take_common(a, &mut it, &mut object_dir)? {
             Common::Consumed => continue,
             Common::MissingValue(name) => {
@@ -667,15 +773,33 @@ fn verify(rest: &[&str], mut object_dir: Option<PathBuf>) -> Result<ExitCode> {
 fn expire(rest: &[&str], mut object_dir: Option<PathBuf>) -> Result<ExitCode> {
     let mut after_dd = false;
     let mut it = rest.iter().copied();
-    while let Some(a) = it.next() {
+    while let Some(orig) = it.next() {
         if after_dd {
             // Operands after `--`; `expire` takes none.
             return Ok(usage_error(None, EXPIRE_USAGE));
         }
-        if a == "--" {
+        if orig == "--" {
             after_dd = true;
             continue;
         }
+        // parse_options_step() tests `--help-all` with a `strcmp()` of its own,
+        // ahead of parse_long_opt(): the name never abbreviates, never takes an
+        // `=<value>`, and is not reached past `--`. This table has no
+        // `PARSE_OPT_HIDDEN` entry, so `USAGE_FULL` renders the same block `-h`
+        // prints.
+        if orig == "--help-all" {
+            print!("{EXPIRE_USAGE}");
+            return Ok(ExitCode::from(129));
+        }
+        // `builtin_multi_pack_index_expire_options[]` is `OPT_END()` alone, so
+        // `expire`'s table is the two commons — the same as `verify`'s.
+        let resolved = match super::canonical_long(orig, VERIFY_OPTS) {
+            super::Long::Name(name) => name,
+            super::Long::Ambiguous(first, second) => {
+                return Ok(super::ambiguous_option(orig, &first, &second, EXPIRE_USAGE))
+            }
+        };
+        let a = resolved.as_ref();
         match take_common(a, &mut it, &mut object_dir)? {
             Common::Consumed => continue,
             Common::MissingValue(name) => {
@@ -772,17 +896,33 @@ fn compact(rest: &[&str], mut object_dir: Option<PathBuf>) -> Result<ExitCode> {
     let mut positional: Vec<&str> = Vec::new();
     let mut after_dd = false;
     let mut it = rest.iter().copied();
-    while let Some(a) = it.next() {
+    while let Some(orig) = it.next() {
         if after_dd {
             // Past `--` every token is a literal endpoint, even another `--` or a
             // `--flag`-looking word (`compact -- --base=z a` looks up `--base=z`).
-            positional.push(a);
+            positional.push(orig);
             continue;
         }
-        if a == "--" {
+        if orig == "--" {
             after_dd = true;
             continue;
         }
+        // parse_options_step() tests `--help-all` with a `strcmp()` of its own,
+        // ahead of parse_long_opt(): the name never abbreviates, never takes an
+        // `=<value>`, and is not reached past `--`. This table has no
+        // `PARSE_OPT_HIDDEN` entry, so `USAGE_FULL` renders the same block `-h`
+        // prints.
+        if orig == "--help-all" {
+            print!("{COMPACT_USAGE}");
+            return Ok(ExitCode::from(129));
+        }
+        let resolved = match super::canonical_long(orig, COMPACT_OPTS) {
+            super::Long::Name(name) => name,
+            super::Long::Ambiguous(first, second) => {
+                return Ok(super::ambiguous_option(orig, &first, &second, COMPACT_USAGE))
+            }
+        };
+        let a = resolved.as_ref();
         match take_common(a, &mut it, &mut object_dir)? {
             Common::Consumed => continue,
             Common::MissingValue(name) => {
@@ -823,7 +963,7 @@ fn compact(rest: &[&str], mut object_dir: Option<PathBuf>) -> Result<ExitCode> {
                     COMPACT_USAGE,
                 ));
             }
-            _ => positional.push(a),
+            _ => positional.push(orig),
         }
     }
 
@@ -873,15 +1013,31 @@ fn repack(rest: &[&str], mut object_dir: Option<PathBuf>) -> Result<ExitCode> {
     // only fires after the loop.
     let mut has_operand = false;
     let mut it = rest.iter().copied();
-    while let Some(a) = it.next() {
+    while let Some(orig) = it.next() {
         if after_dd {
             has_operand = true;
             continue;
         }
-        if a == "--" {
+        if orig == "--" {
             after_dd = true;
             continue;
         }
+        // parse_options_step() tests `--help-all` with a `strcmp()` of its own,
+        // ahead of parse_long_opt(): the name never abbreviates, never takes an
+        // `=<value>`, and is not reached past `--`. This table has no
+        // `PARSE_OPT_HIDDEN` entry, so `USAGE_FULL` renders the same block `-h`
+        // prints.
+        if orig == "--help-all" {
+            print!("{REPACK_USAGE}");
+            return Ok(ExitCode::from(129));
+        }
+        let resolved = match super::canonical_long(orig, REPACK_OPTS) {
+            super::Long::Name(name) => name,
+            super::Long::Ambiguous(first, second) => {
+                return Ok(super::ambiguous_option(orig, &first, &second, REPACK_USAGE))
+            }
+        };
+        let a = resolved.as_ref();
         match take_common(a, &mut it, &mut object_dir)? {
             Common::Consumed => continue,
             Common::MissingValue(name) => {

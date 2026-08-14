@@ -163,7 +163,10 @@ pub fn backfill(args: &[String]) -> Result<ExitCode> {
     while i < args.len() {
         let a = args[i].as_str();
         match a {
-            "-h" => {
+            // `parse_options_step()` tests `--help-all` with a `strcmp()` of its
+            // own, so it renders `USAGE_FULL` — the same block `-h` prints, this
+            // table having no `PARSE_OPT_HIDDEN` entry.
+            "-h" | "--help-all" => {
                 print!("{USAGE}");
                 return Ok(ExitCode::from(129));
             }
@@ -300,10 +303,8 @@ pub fn backfill(args: &[String]) -> Result<ExitCode> {
             }
             if a == "--stdin" {
                 bail!(
-                    "unsupported flag \"--stdin\" (ported: --min-batch-size, --sparse/--no-sparse, \
-                     --include-edges/--no-include-edges, <revision-range>): it reads revisions from \
-                     stdin, and this port has no walk to spend them on, so invalid input git reports \
-                     would go unreported"
+                    "unsupported flag \"--stdin\": it reads revisions from stdin, and this port \
+                     has no walk to spend them on, so invalid input git reports would go unreported"
                 );
             }
             unrecognized.get_or_insert(a);
@@ -379,8 +380,7 @@ pub fn backfill(args: &[String]) -> Result<ExitCode> {
             "backfill cannot download from a promisor remote: the vendored gitoxide has no \
              partial-clone support — no crate mentions promisor remotes or extensions.partialClone, \
              gix-protocol's fetch arguments expose no filter line, and there is no way to request \
-             explicit blob ids (ported: argument, revision and sparse-checkout validation, and the \
-             complete no-op git performs when no promisor remote is configured)"
+             explicit blob ids"
         );
     }
 

@@ -111,7 +111,12 @@ pub fn last_modified(args: &[String]) -> Result<ExitCode> {
             continue;
         }
         match a {
-            "-h" => {
+            // `--help-all` joins `-h`: parse_options_step() tests that name with
+            // a `strcmp()` of its own, ahead of parse_long_opt(), and renders
+            // `USAGE_FULL` — identical here because this option table has no
+            // `PARSE_OPT_HIDDEN` entry. The compare is exact, so `--help-a` and
+            // `--help-all=x` fall through to the unknown-argument report.
+            "-h" | "--help-all" => {
                 // `parse_options` writes the usage to stdout for an explicit
                 // `-h` and exits 129 with nothing on stderr.
                 print!("{USAGE}");

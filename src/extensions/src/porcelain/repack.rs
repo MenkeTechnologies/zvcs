@@ -207,6 +207,62 @@ const USAGE: &str = r#"usage: git repack [-a] [-A] [-d] [-f] [-F] [-l] [-n] [-q]
 
 "#;
 
+/// `usage_with_options_internal()`'s `USAGE_FULL` rendering — what `--help-all`
+/// prints. It is [`USAGE`] with the `PARSE_OPT_HIDDEN` entries left in:
+/// `-m`.
+/// Captured byte-for-byte from stock git 2.55.0's `git repack --help-all`.
+const USAGE_ALL: &str = r#"usage: git repack [-a] [-A] [-d] [-f] [-F] [-l] [-n] [-q] [-b] [-m]
+       [--window=<n>] [--depth=<n>] [--threads=<n>] [--keep-pack=<pack-name>]
+       [--write-midx[=<mode>]] [--name-hash-version=<n>] [--path-walk]
+
+    -a                    pack everything in a single pack
+    -A                    same as -a, and turn unreachable objects loose
+    --[no-]cruft          same as -a, pack unreachable cruft objects separately
+    --[no-]cruft-expiration <approxidate>
+                          with --cruft, expire objects older than this
+    --combine-cruft-below-size <n>
+                          with --cruft, only repack cruft packs smaller than this
+    --max-cruft-size <n>  with --cruft, limit the size of new cruft packs
+    -d                    remove redundant packs, and run git-prune-packed
+    -f                    pass --no-reuse-delta to git-pack-objects
+    -F                    pass --no-reuse-object to git-pack-objects
+    --[no-]name-hash-version <n>
+                          specify the name hash version to use for grouping similar objects by path
+    --[no-]path-walk      pass --path-walk to git-pack-objects
+    -n                    do not run git-update-server-info
+    -q, --[no-]quiet      be quiet
+    -l, --[no-]local      pass --local to git-pack-objects
+    -b, --[no-]write-bitmap-index
+                          write bitmap index
+    -i, --[no-]delta-islands
+                          pass --delta-islands to git-pack-objects
+    --[no-]unpack-unreachable <approxidate>
+                          with -A, do not loosen objects older than this
+    -k, --[no-]keep-unreachable
+                          with -a, repack unreachable objects
+    --[no-]window <n>     size of the window used for delta compression
+    --[no-]window-memory <bytes>
+                          same as the above, but limit memory size instead of entries count
+    --[no-]depth <n>      limits the maximum delta depth
+    --[no-]threads <n>    limits the maximum number of threads
+    --max-pack-size <n>   maximum size of each packfile
+    --[no-]filter <args>  object filtering
+    --[no-]pack-kept-objects
+                          repack objects in packs marked with .keep
+    --[no-]keep-pack <name>
+                          do not repack this pack
+    -g, --[no-]geometric <n>
+                          find a geometric progression with factor <N>
+    --[no-]write-midx[=<mode>]
+                          write a multi-pack index of the resulting packs
+    -m                    write a multi-pack index of the resulting packs
+    --[no-]expire-to <dir>
+                          pack prefix to store a pack containing pruned objects
+    --[no-]filter-to <dir>
+                          pack prefix to store a pack containing filtered out objects
+
+"#;
+
 /// How an option consumes (and validates) its value.
 #[derive(Clone, Copy, PartialEq)]
 enum Kind {
@@ -773,6 +829,15 @@ fn parse(args: &[String]) -> Parsed {
             end_of_opts = true;
             i += 1;
             continue;
+        }
+
+        // `if (internal_help && !strcmp(arg + 2, "help-all"))`
+        // (parse-options.c:1122): an exact match, tested after the `--` break
+        // above and before any table lookup, so it never abbreviates and never
+        // takes an `=<value>`. It renders `USAGE_FULL`, which for `repack` is
+        // `USAGE` plus the hidden `-m`.
+        if a == "--help-all" {
+            return Parsed::Exit(super::show_usage(USAGE_ALL));
         }
 
         if let Some(body) = a.strip_prefix("--") {

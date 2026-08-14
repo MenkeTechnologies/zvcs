@@ -655,7 +655,9 @@ pub fn for_each_ref(args: &[String]) -> Result<ExitCode> {
         match name {
             // parse_options_step()'s `internal_help`: the block on stdout at
             // 129, with no `error:` line ahead of it.
-            "-h" => return Ok(super::show_usage(USAGE)),
+            // `--help-all` reaches the same renderer with USAGE_FULL, which this
+            // table renders identically: it has no `PARSE_OPT_HIDDEN` entry.
+            "-h" | "--help-all" => return Ok(super::show_usage(USAGE)),
             "--format" => format = value!(rest, "format").into_bytes(),
             "--count" => {
                 let v = value!(rest, "count");
@@ -1696,8 +1698,7 @@ fn parse_atom(spec: &str, ctx: &AtomCtx<'_>) -> std::result::Result<Atom, AtomEr
                 Some("relative") => DateFmt::Relative,
                 Some(m) => {
                     return Err(unported_atom(format!(
-                        "date format `:{m}` is not ported (ported: default, short, iso8601, \
-                         iso8601-strict, rfc2822, unix, raw, relative)"
+                        "date format `:{m}` is not ported"
                     )))
                 }
             };
@@ -3082,13 +3083,11 @@ fn render_signature(obj: &ObjInfo, option: SigOption) -> Result<Vec<u8>> {
         SigOption::Bare => crate::git_fatal!(
             "%(signature) on a signed object needs `sigc->output` — gpg's own report, which \
              check_signature() keeps verbatim; crate::gitsig discards gpg's stderr and cannot \
-             reproduce it (ported: :signer, :key, :grade, :trustlevel, and every option on an \
-             unsigned object)"
+             reproduce it"
         ),
         SigOption::Fingerprint | SigOption::PrimaryKeyFingerprint => crate::git_fatal!(
             "%(signature:fingerprint) / %(signature:primarykeyfingerprint) need the \
-             VALIDSIG status line's fingerprint fields, which crate::gitsig does not parse \
-             (ported: :signer, :key, :grade, :trustlevel, and every option on an unsigned object)"
+             VALIDSIG status line's fingerprint fields, which crate::gitsig does not parse"
         ),
     })
 }

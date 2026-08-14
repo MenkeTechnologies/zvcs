@@ -111,6 +111,29 @@ const USAGE: &str = concat!(
     "\n",
 );
 
+/// `usage_with_options_internal()`'s `USAGE_FULL` rendering — what `--help-all`
+/// prints. It is [`USAGE`] with the `PARSE_OPT_HIDDEN` entries left in:
+/// `--prompt`.
+/// Captured byte-for-byte from stock git 2.55.0's `git difftool --help-all`.
+const USAGE_ALL: &str = r#"usage: git difftool [<options>] [<commit> [<commit>]] [--] [<path>...]
+
+    -g, --[no-]gui        use `diff.guitool` instead of `diff.tool`
+    -d, --[no-]dir-diff   perform a full-directory diff
+    -y, --no-prompt       do not prompt before launching a diff tool
+    --prompt
+    --[no-]symlinks       use symlinks in dir-diff mode
+    -t, --[no-]tool <tool>
+                          use the specified diff tool
+    --[no-]tool-help      print a list of diff tools that may be used with `--tool`
+    --[no-]trust-exit-code
+                          make 'git-difftool' exit when an invoked diff tool returns a non-zero exit code
+    -x, --[no-]extcmd <command>
+                          specify a custom command for viewing diffs
+    --no-index            passed to `diff`
+    --index               opposite of --no-index
+
+"#;
+
 /// The options that take a separate value argument, as `(long, short)`.
 const VALUE_OPTS: [(&str, char); 2] = [("tool", 't'), ("extcmd", 'x')];
 
@@ -203,6 +226,14 @@ pub fn difftool(args: &[String]) -> Result<ExitCode> {
             }
             "-h" => {
                 print!("{USAGE}");
+                return Ok(ExitCode::from(129));
+            }
+            // `if (internal_help && !strcmp(arg + 2, "help-all"))`
+            // (parse-options.c:1122), an exact match tested ahead of
+            // parse_long_opt(): never an abbreviation, never with an
+            // `=<value>`, and rendered as `USAGE_FULL`.
+            "--help-all" => {
+                print!("{USAGE_ALL}");
                 return Ok(ExitCode::from(129));
             }
             "--tool-help" => opts.tool_help = true,
@@ -459,9 +490,7 @@ fn tool_command(config: &gix::config::File, tool: &Tool) -> Result<Option<DiffCm
         Some(text) => Ok(Some(DiffCmd { text, append: false, tool_path })),
         None => crate::git_fatal!(
             "the built-in diff tool {name:?} keeps its diff_cmd in a mergetools/ shell script \
-             under $(git --exec-path), which is not present in the vendored crates \
-             (ported: -x/--extcmd, any tool with a difftool.<tool>.cmd or \
-             mergetool.<tool>.cmd, and every diagnostic that precedes the launch)"
+             under $(git --exec-path), which is not present in the vendored crates"
         ),
     }
 }
@@ -1335,8 +1364,7 @@ fn no_index(opts: &Opts) -> Result<ExitCode> {
         crate::git_fatal!(
             "--no-index: {a:?} and {b:?} differ; launching a built-in tool needs the mergetools/ \
              catalogue and a directory pair needs --no-index's recursive walk, neither present in \
-             the vendored crates (ported: an identical pair, an inaccessible path, and a differing \
-             regular-file pair under -x/--extcmd)"
+             the vendored crates"
         );
     }
     crate::git_fatal!(

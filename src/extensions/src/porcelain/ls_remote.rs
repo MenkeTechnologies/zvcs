@@ -85,6 +85,31 @@ usage: git ls-remote [--branches] [--tags] [--refs] [--upload-pack=<exec>]
 
 ";
 
+/// `usage_with_options_internal()`'s `USAGE_FULL` rendering — what `--help-all`
+/// prints. It is [`USAGE`] with the `PARSE_OPT_HIDDEN` entries left in:
+/// `--[no-]exec`, `--[no-]heads`.
+/// Captured byte-for-byte from stock git 2.55.0's `git ls-remote --help-all`.
+const USAGE_ALL: &str = r#"usage: git ls-remote [--branches] [--tags] [--refs] [--upload-pack=<exec>]
+                     [-q | --quiet] [--exit-code] [--get-url] [--sort=<key>]
+                     [--symref] [<repository> [<patterns>...]]
+
+    -q, --[no-]quiet      do not print remote URL
+    --[no-]upload-pack <exec>
+                          path of git-upload-pack on the remote host
+    --[no-]exec <exec>    path of git-upload-pack on the remote host
+    -t, --[no-]tags       limit to tags
+    -b, --[no-]branches   limit to branches
+    -h, --[no-]heads      deprecated synonym for --branches
+    --[no-]refs           do not show peeled tags
+    --[no-]get-url        take url.<base>.insteadOf into account
+    --[no-]sort <key>     field name to sort on
+    --[no-]exit-code      exit with exit code 2 if no matching refs are found
+    --[no-]symref         show underlying ref in addition to the object pointed by it
+    -o, --[no-]server-option <server-specific>
+                          option to transmit
+
+"#;
+
 /// Parsed command line for a single `ls-remote` invocation.
 struct Opts {
     branches: bool,  // -b/--branches (-h/--heads): git's REF_HEADS
@@ -338,6 +363,19 @@ fn parse_args<'a>(
         }
 
         i += 1;
+
+        // `if (internal_help && !strcmp(arg + 2, "help-all"))`
+        // (parse-options.c:1122): an exact match tested after the `--` and
+        // non-option breaks above and before any table lookup, so it never
+        // abbreviates and never takes an `=<value>`. Unlike `-h`, which this
+        // table claims as the deprecated `--branches` synonym once it is not
+        // the sole argument, `--help-all` is help wherever the option region
+        // reaches it — and it renders `USAGE_FULL`, which lists both the hidden
+        // `--exec` and the `-h` spelling of `--branches`.
+        if arg == "--help-all" {
+            print!("{USAGE_ALL}");
+            return Err(ExitCode::from(129));
+        }
 
         // Short options cluster (`-tb`) and `-o` may take a sticky value (`-ofoo`).
         if !arg.starts_with("--") {

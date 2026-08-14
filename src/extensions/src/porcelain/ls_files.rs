@@ -352,6 +352,14 @@ pub fn ls_files(args: &[String]) -> Result<ExitCode> {
             i += 1;
             continue;
         }
+        // `if (internal_help && !strcmp(arg + 2, "help-all"))`
+        // (parse-options.c:1122): an exact match tested ahead of
+        // parse_long_opt(), so it neither abbreviates nor takes an `=<value>`.
+        // This table has no `PARSE_OPT_HIDDEN` entry, so `USAGE_FULL` renders
+        // the same block `-h` prints.
+        if s == "--help-all" {
+            return Ok(super::show_usage(USAGE));
+        }
         // Resolve a long option's name the way `parse_long_opt()` does before
         // dispatching on it, so a unique abbreviation (`--stag`) reaches the arm
         // its full spelling reaches and an ambiguous one is refused by name.

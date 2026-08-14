@@ -174,6 +174,15 @@ fn parse(args: &[String]) -> std::result::Result<Opts, ExitCode> {
             i += 1;
             continue;
         }
+        // parse_options_step() tests `--help-all` with a `strcmp()` of its own,
+        // ahead of parse_long_opt(): the name never abbreviates and never takes
+        // an `=<value>`. This table has no `PARSE_OPT_HIDDEN` entry, so
+        // `USAGE_FULL` renders the same block `-h` prints.
+        if a == "--help-all" {
+            print!("{USAGE}");
+            let _ = std::io::stdout().flush();
+            return Err(ExitCode::from(129));
+        }
 
         if let Some(body) = a.strip_prefix("--") {
             // Split `--name=value` before resolving, so the `=value` part is

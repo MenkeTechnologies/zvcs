@@ -211,6 +211,15 @@ pub fn merge_tree(args: &[String]) -> Result<ExitCode> {
             break;
         }
 
+        // parse_options_step() tests `--help-all` with a `strcmp()` of its own,
+        // ahead of parse_long_opt(): the name never abbreviates and never takes
+        // an `=<value>`, so `--help-a` and `--help-all=x` stay unknown options.
+        // This table has no `PARSE_OPT_HIDDEN` entry, so `USAGE_FULL` renders
+        // the same block `-h` prints.
+        if a == "--help-all" {
+            return Ok(super::show_usage(USAGE));
+        }
+
         // Respell a unique abbreviation as the name it resolves to, so `--allow-unre`
         // reaches the same arm as `--allow-unrelated-histories`.
         let canonical;

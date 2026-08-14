@@ -89,8 +89,10 @@ struct Rejected {
 
 #[allow(non_snake_case)] // maps to git's `upload-archive--writer` subcommand
 pub fn upload_archive__writer(args: &[String]) -> Result<ExitCode> {
-    // `-h` alone prints to stdout; every other bad argument count to stderr.
-    if args.len() == 1 && args[0] == "-h" {
+    // `-h` alone prints to stdout, and so does `--help-all`, which asks for the
+    // same block with hidden entries shown — there are no options at all here.
+    // Every other bad argument count goes to stderr.
+    if args.len() == 1 && matches!(args[0].as_str(), "-h" | "--help-all") {
         println!("{USAGE}");
         return Ok(ExitCode::from(129));
     }

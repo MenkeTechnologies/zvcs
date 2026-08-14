@@ -101,6 +101,51 @@ const USAGE_BODY: &str = concat!(
     "\n",
 );
 
+/// `usage_with_options_internal()`'s `USAGE_FULL` rendering — what `--help-all`
+/// prints. It is [`USAGE_BODY`] with the `PARSE_OPT_HIDDEN` entries left in:
+/// `--[no-]minimal`.
+/// Captured byte-for-byte from stock git 2.55.0's `git blame --help-all`, less
+/// its synopsis line — which [`print_usage`] builds per command name, exactly
+/// as `builtin/blame.c` does for `blame`, `annotate` and `pickaxe`.
+const USAGE_BODY_ALL: &str = r#"
+    <rev-opts> are documented in git-rev-list(1)
+
+    --[no-]incremental    show blame entries as we find them, incrementally
+    -b                    do not show object names of boundary commits (Default: off)
+    --[no-]root           do not treat root commits as boundaries (Default: off)
+    --[no-]show-stats     show work cost statistics
+    --[no-]progress       force progress reporting
+    --[no-]score-debug    show output score for blame entries
+    -f, --[no-]show-name  show original filename (Default: auto)
+    -n, --[no-]show-number
+                          show original linenumber (Default: off)
+    -p, --[no-]porcelain  show in a format designed for machine consumption
+    --[no-]line-porcelain show porcelain format with per-line commit information
+    -c                    use the same output mode as git-annotate (Default: off)
+    -t                    show raw timestamp (Default: off)
+    -l                    show long commit SHA1 (Default: off)
+    -s                    suppress author name and timestamp (Default: off)
+    -e, --[no-]show-email show author email instead of name (Default: off)
+    -w                    ignore whitespace differences
+    --diff-algorithm <algorithm>
+                          choose a diff algorithm
+    --[no-]ignore-rev <rev>
+                          ignore <rev> when blaming
+    --[no-]ignore-revs-file <file>
+                          ignore revisions from <file>
+    --[no-]color-lines    color redundant metadata from previous line differently
+    --[no-]color-by-age   color lines by age
+    --[no-]minimal        spend extra cycles to find a better match
+    -S <file>             use revisions from <file> instead of calling git-rev-list
+    --[no-]contents <file>
+                          use <file>'s contents as the final image
+    -C[<score>]           find line copies within and across files
+    -M[<score>]           find line movements within and across files
+    -L <range>            process only line range <start>,<end> or function :<funcname>
+    --[no-]abbrev[=<n>]   use <n> digits to display object names
+
+"#;
+
 /// The synthetic author git attributes not-yet-committed lines to.
 const NOT_COMMITTED_NAME: &[u8] = b"Not Committed Yet";
 const NOT_COMMITTED_MAIL: &[u8] = b"not.committed.yet";
@@ -536,6 +581,7 @@ pub(super) fn blame_with(args: &[String], cmd: &str) -> Result<ExitCode> {
         // `parse_options()` answers `-h` the moment it reaches it, before it looks
         // at anything that follows, so this returns from inside the parse loop.
         ParseOutcome::Help => return print_usage(cmd, true),
+        ParseOutcome::HelpAll => return print_usage_all(cmd),
         // `parse_revision_opt()` prints the diagnostic and then
         // `usage_with_options()`, both on stderr, and exits 129.
         ParseOutcome::Unknown(name) => {
@@ -2246,7 +2292,20 @@ fn format_tz(offset_seconds: i32) -> String {
 /// `git blame -h` wrote 2097 bytes to stdout and 0 to stderr; `git blame` with
 /// no operand wrote 0 to stdout and the same 2097 bytes to stderr.
 fn print_usage(cmd: &str, to_stdout: bool) -> Result<ExitCode> {
-    let text = format!("usage: git {cmd} [<options>] [<rev-opts>] [<rev>] [--] <file>\n{USAGE_BODY}");
+    write_usage(cmd, USAGE_BODY, to_stdout)
+}
+
+/// `--help-all`: the same synopsis over [`USAGE_BODY_ALL`], always on stdout —
+/// only a help request reaches `USAGE_FULL`, and a help request is never a
+/// rejection.
+fn print_usage_all(cmd: &str) -> Result<ExitCode> {
+    write_usage(cmd, USAGE_BODY_ALL, true)
+}
+
+/// The synopsis line, named for the command that was actually invoked, followed
+/// by whichever option block was asked for.
+fn write_usage(cmd: &str, body: &str, to_stdout: bool) -> Result<ExitCode> {
+    let text = format!("usage: git {cmd} [<options>] [<rev-opts>] [<rev>] [--] <file>\n{body}");
     if to_stdout {
         let mut out = std::io::stdout().lock();
         out.write_all(text.as_bytes())?;
@@ -2966,6 +3025,9 @@ struct ConfigDefaults {
 /// the `-h` short-circuit git answers from inside the loop.
 enum ParseOutcome {
     Help,
+    /// `--help-all`: the same block with the `PARSE_OPT_HIDDEN` `--minimal`
+    /// left in, on the same stream at the same 129.
+    HelpAll,
     /// An option neither `options[]` nor `handle_revision_opt()` recognises.
     /// The payload is the name git puts in its `unknown option` diagnostic —
     /// see [`unknown_option_name`] for why that is sometimes `(null)`.
@@ -3214,6 +3276,9 @@ impl Options {
                 // `parse_options()` answers `-h` where it finds it, without
                 // looking at the rest of the command line.
                 "-h" => return Ok(ParseOutcome::Help),
+                // `if (internal_help && !strcmp(arg + 2, "help-all"))`
+                // (parse-options.c:1122), the same answer over `USAGE_FULL`.
+                "--help-all" => return Ok(ParseOutcome::HelpAll),
                 // `--first-parent` is a rev-list option blame forwards to
                 // `setup_revisions()`, which sets `revs->first_parent_only`.
                 "--first-parent" => first_parent = true,

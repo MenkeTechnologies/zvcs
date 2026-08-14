@@ -99,11 +99,12 @@ pub fn check_ref_format(args: &[String]) -> Result<ExitCode> {
         _ => args,
     };
 
-    // `-h` is honoured only as the sole argument, exactly as the C `argc == 2`
-    // guard does; `-h <anything>` falls through to the option loop and errors.
-    if argv.len() == 1 && argv[0] == "-h" {
-        print!("{USAGE}");
-        return Ok(ExitCode::from(129));
+    // `-h` and `--help-all` are honoured only as the sole argument, exactly as
+    // the C `argc == 2` guard does; `-h <anything>` falls through to the option
+    // loop and errors. The option table has no `PARSE_OPT_HIDDEN` entry, so
+    // `USAGE_FULL` renders the same block as `USAGE_NORMAL`.
+    if let Some(code) = super::show_usage_if_asked(argv, USAGE) {
+        return Ok(code);
     }
 
     if argv.len() == 2 && argv[0] == "--branch" {

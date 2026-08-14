@@ -100,11 +100,16 @@ const USAGE: &str = "usage: git push [<options>] [<repository> [<refspec>...]]\n
 pub fn push(args: &[String]) -> Result<ExitCode> {
     // `parse_options()` answers `-h` before the command body runs, so this
     // precedes repository discovery and every other flag. `--` ends option
-    // parsing, so an `-h` behind it is a plain argument.
+    // parsing, so an `-h` behind it is a plain argument. `--help-all` is tested
+    // the same way: parse_options_step() gives it a `strcmp()` of its own ahead
+    // of parse_long_opt(), which is why it is compared whole here instead of
+    // going through `LONG_OPTS` (so `--help-a` stays an unknown option and
+    // `--help-all=x` stays a rejected value). It renders `USAGE_FULL`, the same
+    // block as `-h` because this option table has no `PARSE_OPT_HIDDEN` entry.
     if args
         .iter()
         .take_while(|a| a.as_str() != "--")
-        .any(|a| a == "-h")
+        .any(|a| a == "-h" || a == "--help-all")
     {
         print!("{USAGE}");
         return Ok(ExitCode::from(129));

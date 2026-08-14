@@ -295,9 +295,11 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
     };
 
     // `show_usage_if_asked(argc, argv, diff_tree_usage)` (builtin/diff-tree.c:125)
-    // answers a LONE `-h` on stdout, before the repository is discovered. `-h`
-    // alongside anything else is not a help request: it falls through to the
-    // ordinary scan, where `usage()` reports it on stderr.
+    // answers a LONE `-h` or `--help-all` on stdout, before the repository is
+    // discovered. Either spelling alongside anything else is not a help request:
+    // it falls through to the ordinary scan, where `usage()` reports it on
+    // stderr. The option table has no `PARSE_OPT_HIDDEN` entry, so the two
+    // spellings render the same block.
     if let Some(code) = super::show_usage_if_asked(args, USAGE) {
         return Ok(code);
     }

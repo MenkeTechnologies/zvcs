@@ -126,6 +126,15 @@ pub fn merge_file(args: &[String]) -> Result<ExitCode> {
             no_more_opts = true;
             continue;
         }
+        // parse_options_step() tests `--help-all` with a `strcmp()` of its own,
+        // ahead of parse_long_opt(): the name never abbreviates and never takes
+        // an `=<value>`, which is why the test sits before `canonical_long`
+        // rather than in `LONG_OPTS`. This table has no `PARSE_OPT_HIDDEN`
+        // entry, so `USAGE_FULL` renders the same block `-h` prints.
+        if arg == "--help-all" {
+            print!("{USAGE}");
+            return Ok(ExitCode::from(129));
+        }
 
         let resolved = match super::canonical_long(arg, LONG_OPTS) {
             super::Long::Name(name) => name,
@@ -283,7 +292,7 @@ pub fn merge_file(args: &[String]) -> Result<ExitCode> {
     let algorithm = match algorithm {
         DiffAlgorithm::Imara(algorithm) => algorithm,
         DiffAlgorithm::Patience => anyhow::bail!(
-            "--diff-algorithm=patience is unsupported (ported: myers, minimal, histogram)"
+            "--diff-algorithm=patience is unsupported"
         ),
     };
 

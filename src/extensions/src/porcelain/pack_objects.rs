@@ -221,6 +221,88 @@ const USAGE: &str = r#"usage: git pack-objects [-q | --progress | --all-progress
 
 "#;
 
+/// `USAGE_FULL`: the same block with the one `PARSE_OPT_HIDDEN` entry left in
+/// (4265 bytes, git 2.55.0). `--write-bitmap-index-quiet` is hidden from `-h`
+/// and shown by `--help-all`; the flag is otherwise a normal table entry, so it
+/// resolves — and makes `--write-bit` ambiguous — either way.
+const USAGE_ALL: &str = r#"usage: git pack-objects [-q | --progress | --all-progress] [--all-progress-implied]
+                        [--no-reuse-delta] [--delta-base-offset] [--non-empty]
+                        [--local] [--incremental] [--window=<n>] [--depth=<n>]
+                        [--revs [--unpacked | --all]] [--keep-pack=<pack-name>]
+                        [--cruft] [--cruft-expiration=<time>]
+                        [--stdout [--filter=<filter-spec>] | <base-name>]
+                        [--shallow] [--keep-true-parents] [--[no-]sparse]
+                        [--name-hash-version=<n>] [--path-walk] < <object-list>
+
+    -q, --[no-]quiet      do not show progress meter
+    --[no-]progress       show progress meter
+    --[no-]all-progress   show progress meter during object writing phase
+    --[no-]all-progress-implied
+                          similar to --all-progress when progress meter is shown
+    --index-version <version>[,<offset>]
+                          write the pack index file in the specified idx format version
+    --max-pack-size <n>   maximum size of each output pack file
+    --[no-]local          ignore borrowed objects from alternate object store
+    --[no-]incremental    ignore packed objects
+    --[no-]window <n>     limit pack window by objects
+    --window-memory <n>   limit pack window by memory in addition to object limit
+    --[no-]depth <n>      maximum length of delta chain allowed in the resulting pack
+    --[no-]reuse-delta    reuse existing deltas
+    --[no-]reuse-object   reuse existing objects
+    --[no-]delta-base-offset
+                          use OFS_DELTA objects
+    --[no-]threads <n>    use threads when searching for best delta matches
+    --[no-]non-empty      do not create an empty pack output
+    --[no-]revs           read revision arguments from standard input
+    --unpacked            limit the objects to those that are not yet packed
+    --all                 include objects reachable from any reference
+    --reflog              include objects referred by reflog entries
+    --indexed-objects     include objects referred to by the index
+    --[no-]stdin-packs[=<mode>]
+                          read packs from stdin
+    --[no-]stdout         output pack to stdout
+    --[no-]include-tag    include tag objects that refer to objects to be packed
+    --[no-]keep-unreachable
+                          keep unreachable objects
+    --[no-]pack-loose-unreachable
+                          pack loose unreachable objects
+    --[no-]unpack-unreachable[=<time>]
+                          unpack unreachable objects newer than <time>
+    --[no-]cruft          create a cruft pack
+    --[no-]cruft-expiration[=<time>]
+                          expire cruft objects older than <time>
+    --[no-]sparse         use the sparse reachability algorithm
+    --[no-]thin           create thin packs
+    --[no-]path-walk      use the path-walk API to walk objects when possible
+    --[no-]shallow        create packs suitable for shallow fetches
+    --[no-]honor-pack-keep
+                          ignore packs that have companion .keep file
+    --[no-]keep-pack <name>
+                          ignore this pack
+    --[no-]compression <n>
+                          pack compression level
+    --[no-]keep-true-parents
+                          do not hide commits by grafts
+    --[no-]use-bitmap-index
+                          use a bitmap index if available to speed up counting objects
+    --[no-]write-bitmap-index
+                          write a bitmap index together with the pack index
+    --[no-]write-bitmap-index-quiet
+                          write a bitmap index if possible
+    --[no-]filter <args>  object filtering
+    --missing <action>    handling for missing objects
+    --[no-]exclude-promisor-objects
+                          do not pack objects in promisor packfiles
+    --[no-]exclude-promisor-objects-best-effort
+                          implies --missing=allow-any
+    --[no-]delta-islands  respect islands during delta compression
+    --[no-]uri-protocol <protocol>
+                          exclude any configured uploadpack.blobpackfileuri with this protocol
+    --[no-]name-hash-version <n>
+                          use the specified name-hash function to group similar objects
+
+"#;
+
 /// How an option consumes (and validates) its value.
 #[derive(Clone, Copy, PartialEq)]
 enum Kind {
@@ -288,6 +370,10 @@ const OPTS: &[OptDef] = &[
     OptDef { long: "keep-true-parents", kind: Kind::Bool, negatable: true },
     OptDef { long: "use-bitmap-index", kind: Kind::Bool, negatable: true },
     OptDef { long: "write-bitmap-index", kind: Kind::Bool, negatable: true },
+    // `PARSE_OPT_HIDDEN` (pack-objects.c:5134-5137): absent from `-h`, present in
+    // `--help-all`, and a first-class entry for resolution either way — which is
+    // what makes `--write-bit` ambiguous with `--write-bitmap-index`.
+    OptDef { long: "write-bitmap-index-quiet", kind: Kind::Bool, negatable: true },
     OptDef { long: "filter", kind: Kind::Str, negatable: true },
     OptDef { long: "missing", kind: Kind::Str, negatable: false },
     OptDef { long: "exclude-promisor-objects", kind: Kind::Bool, negatable: true },
@@ -296,6 +382,30 @@ const OPTS: &[OptDef] = &[
     OptDef { long: "uri-protocol", kind: Kind::Str, negatable: true },
     OptDef { long: "name-hash-version", kind: Kind::Int, negatable: true },
 ];
+
+/// [`OPTS`] projected into the shape the shared `parse_long_opt()` port reads
+/// (`porcelain::resolve_long`). Derived rather than written out a second time,
+/// so the two can never drift and the indices stay interchangeable: [`OPTS`]
+/// says what a value does once the name is resolved, this says what the
+/// resolver itself reads while resolving it.
+const LONG_OPTS: &[super::LongOpt] = &{
+    let mut out = [super::LongOpt { name: "", neg: false, arg: super::Arg::None }; OPTS.len()];
+    let mut i = 0;
+    while i < OPTS.len() {
+        let def = &OPTS[i];
+        out[i] = super::LongOpt {
+            name: def.long,
+            neg: def.negatable,
+            arg: match def.kind {
+                Kind::Bool => super::Arg::None,
+                Kind::OptStr => super::Arg::Optional,
+                _ => super::Arg::Required,
+            },
+        };
+        i += 1;
+    }
+    out
+};
 
 /// The only `--missing=<action>` values git accepts.
 const MISSING_ACTIONS: [&str; 3] = ["error", "allow-any", "allow-promisor"];
@@ -3300,6 +3410,14 @@ fn parse(args: &[String]) -> Parsed {
         }
 
         if let Some(body) = a.strip_prefix("--") {
+            // `if (internal_help && !strcmp(arg + 2, "help-all"))`
+            // (parse-options.c:1124): checked before any table lookup, at
+            // whatever position the option loop has reached, and rendered
+            // `USAGE_FULL` — which for `pack-objects` means the block with the
+            // hidden `--write-bitmap-index-quiet` left in.
+            if body == "help-all" {
+                return Parsed::Exit(super::show_usage(USAGE_ALL));
+            }
             match long_opt(body, args, &mut i, &mut st) {
                 Some(code) => return Parsed::Exit(code),
                 None => continue,
@@ -3325,14 +3443,13 @@ fn long_opt(body: &str, args: &[String], i: &mut usize, st: &mut State) -> Optio
         None => (body, None),
     };
 
-    let (idx, negated) = match resolve_long(name) {
+    let (idx, negated) = match resolve_long(body) {
         Resolved::Unique(idx, negated) => (idx, negated),
         Resolved::Ambiguous(first, second) => {
             // Verified quirk: unlike every other diagnostic here, the ambiguity
-            // message goes to stderr while its usage block goes to *stdout*.
-            eprintln!("error: ambiguous option: {name} (could be --{first} or --{second})");
-            print!("{USAGE}");
-            return Some(ExitCode::from(129));
+            // message goes to stderr while its usage block goes to *stdout* —
+            // and it echoes the argument as typed, `=<value>` and all.
+            return Some(super::ambiguous_option(body, &first, &second, USAGE));
         }
         Resolved::Unknown => {
             // git echoes the argument as written, `=value` included.
@@ -3725,7 +3842,13 @@ fn set_long(long: &str, value: Option<&str>, on: bool, st: &mut State) {
         "unpacked" => st.unpacked = on,
         "incremental" => st.incremental = on,
         "non-empty" => st.non_empty = on,
-        "write-bitmap-index" => st.write_bitmap_index = on,
+        // Both write into git's single `write_bitmap_index`; the hidden one
+        // stores `WRITE_BITMAP_QUIET` rather than `WRITE_BITMAP_TRUE`, and every
+        // `if (write_bitmap_index)` in pack-objects.c treats the two alike. The
+        // one place they differ (pack-objects.c:1416, :1883) only decides whether
+        // a `warning()` is printed when bitmaps have to be turned back off, and
+        // this port emits neither warning.
+        "write-bitmap-index" | "write-bitmap-index-quiet" => st.write_bitmap_index = on,
         "delta-islands" => st.delta_islands = on,
         "quiet" => st.progress = !on,
         "progress" | "all-progress" => st.progress = on,
@@ -3790,44 +3913,28 @@ enum Resolved {
     Unknown,
 }
 
-/// Resolve `name` (the text between `--` and any `=`) the way parse-options
-/// does: an exact match wins outright, otherwise every prefix match is
-/// collected and two or more of them is an ambiguity.
-fn resolve_long(name: &str) -> Resolved {
-    for (idx, o) in OPTS.iter().enumerate() {
-        if o.long == name {
-            return Resolved::Unique(idx, false);
+/// Resolve `body` — everything after `--`, **including** any `=<value>` — through
+/// the shared `parse_long_opt()` port, and translate the entry it picked back
+/// into an index into [`OPTS`].
+///
+/// The `=<value>` must be passed through rather than split off first: git's
+/// `starts_with("no-", arg)` test (parse-options.c:569) reads the *whole*
+/// argument, so `--n` names every negatable option while `--n=x` names only the
+/// two whose spelling starts with `n`. Splitting first collapsed those into one
+/// answer and made `git pack-objects --n=x` report a pair stock git does not
+/// (`--name-hash-version or --no-name-hash-version` where stock says
+/// `--non-empty or --name-hash-version`).
+fn resolve_long(body: &str) -> Resolved {
+    match super::resolve_long(LONG_OPTS, body) {
+        super::Resolved::One(opt, negated) => {
+            let idx = LONG_OPTS
+                .iter()
+                .position(|o| std::ptr::eq(o, opt))
+                .expect("the entry came from LONG_OPTS");
+            Resolved::Unique(idx, negated)
         }
-        if o.negatable && name.strip_prefix("no-") == Some(o.long) {
-            return Resolved::Unique(idx, true);
-        }
-    }
-
-    // git keeps only the last two matches it walked past and names those.
-    let mut last: Option<(usize, bool)> = None;
-    let mut prev: Option<(usize, bool)> = None;
-    for (idx, o) in OPTS.iter().enumerate() {
-        if o.long.starts_with(name) {
-            prev = last;
-            last = Some((idx, false));
-        }
-        if o.negatable && format!("no-{}", o.long).starts_with(name) {
-            prev = last;
-            last = Some((idx, true));
-        }
-    }
-
-    let display = |(idx, neg): (usize, bool)| {
-        if neg {
-            format!("no-{}", OPTS[idx].long)
-        } else {
-            OPTS[idx].long.to_string()
-        }
-    };
-    match (prev, last) {
-        (Some(p), Some(l)) => Resolved::Ambiguous(display(p), display(l)),
-        (None, Some(l)) => Resolved::Unique(l.0, l.1),
-        _ => Resolved::Unknown,
+        super::Resolved::Ambiguous(first, second) => Resolved::Ambiguous(first, second),
+        super::Resolved::Unknown => Resolved::Unknown,
     }
 }
 
@@ -3942,4 +4049,134 @@ fn preflight(st: &State) -> Option<ExitCode> {
 fn fatal(msg: &str) -> ExitCode {
     eprintln!("fatal: {msg}");
     ExitCode::from(128)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Kind, Resolved, LONG_OPTS, OPTS, USAGE, USAGE_ALL};
+
+    /// The two usage blocks differ by exactly the one `PARSE_OPT_HIDDEN` entry.
+    ///
+    /// They are separate literals because each has to be byte-identical to what
+    /// stock git prints (4170 and 4265 bytes for 2.55.0), and a copy-paste edit
+    /// to one of them is invisible until a differential run. Deriving the
+    /// relationship here is the check: `--help-all` is `-h` plus two lines, in
+    /// the position the table puts them, and nothing else.
+    #[test]
+    fn help_all_is_the_h_block_plus_the_hidden_entry() {
+        const HIDDEN: &str = concat!(
+            "    --[no-]write-bitmap-index-quiet\n",
+            "                          write a bitmap index if possible\n",
+        );
+        let at = USAGE
+            .find("    --[no-]filter <args>")
+            .expect("the entry after the hidden one");
+        let (head, tail) = USAGE.split_at(at);
+        assert_eq!(USAGE_ALL, format!("{head}{HIDDEN}{tail}"));
+        assert_eq!(USAGE.len(), 4170);
+        assert_eq!(USAGE_ALL.len(), 4265);
+    }
+
+    /// Resolution runs off the shared `parse_long_opt()` port, and the entry it
+    /// returns has to map back onto the [`OPTS`] row that says what the value
+    /// does. The projection keeps the two index-parallel by construction; this
+    /// pins that the mapping is actually round-tripping.
+    #[test]
+    fn every_name_resolves_to_its_own_row() {
+        assert_eq!(LONG_OPTS.len(), OPTS.len());
+        for (want, def) in OPTS.iter().enumerate() {
+            match super::resolve_long(def.long) {
+                Resolved::Unique(got, false) => assert_eq!(
+                    got, want,
+                    "--{} resolved to --{}",
+                    def.long, OPTS[got].long
+                ),
+                _ => panic!("--{} did not resolve to itself", def.long),
+            }
+        }
+    }
+
+    /// The `PARSE_OPT_NONEG` entries of this table have no `--no-` spelling.
+    ///
+    /// Each `--no-` below was run against stock 2.55.0 and answered
+    /// ``error: unknown option `no-<name>'`` at exit 129. `--no-all` is the
+    /// deliberate exception: `--all` is `OPT_SET_INT_F(... PARSE_OPT_NONEG)` and
+    /// contributes nothing, but `--all-progress` and `--all-progress-implied`
+    /// are both negatable and both start with `all`, so stock answers
+    /// ``ambiguous option: no-all (could be --no-all-progress or
+    /// --no-all-progress-implied)``. A NONEG entry removes its own negation, not
+    /// the negations of the names that happen to extend it.
+    #[test]
+    fn noneg_entries_have_no_negation() {
+        for name in [
+            "index-version",
+            "max-pack-size",
+            "window-memory",
+            "unpacked",
+            "reflog",
+            "indexed-objects",
+            "missing",
+        ] {
+            assert!(
+                matches!(super::resolve_long(name), Resolved::Unique(..)),
+                "--{name} should resolve"
+            );
+            assert!(
+                matches!(super::resolve_long(&format!("no-{name}")), Resolved::Unknown),
+                "--no-{name} must not resolve (the entry is PARSE_OPT_NONEG)"
+            );
+        }
+        assert!(matches!(super::resolve_long("all"), Resolved::Unique(..)));
+        match super::resolve_long("no-all") {
+            Resolved::Ambiguous(a, b) => assert_eq!(
+                (a.as_str(), b.as_str()),
+                ("no-all-progress", "no-all-progress-implied")
+            ),
+            _ => panic!("--no-all names the two negatable options that extend `all'"),
+        }
+        // …and a negatable entry still negates, so the loop cannot pass by
+        // resolving nothing at all.
+        assert!(matches!(super::resolve_long("no-thin"), Resolved::Unique(..)));
+    }
+
+    /// `starts_with("no-", arg)` (parse-options.c:569) reads the argument
+    /// *including* any `=<value>`, which is what separates these two answers.
+    /// Both were taken from stock 2.55.0.
+    #[test]
+    fn an_attached_value_changes_which_names_are_ambiguous() {
+        match super::resolve_long("n") {
+            Resolved::Ambiguous(a, b) => {
+                assert_eq!((a.as_str(), b.as_str()), ("name-hash-version", "no-name-hash-version"))
+            }
+            _ => panic!("--n names every negatable option at once"),
+        }
+        match super::resolve_long("n=x") {
+            Resolved::Ambiguous(a, b) => {
+                assert_eq!((a.as_str(), b.as_str()), ("non-empty", "name-hash-version"))
+            }
+            _ => panic!("--n=x names only the two spelled with a leading n"),
+        }
+    }
+
+    /// The hidden entry is a real table row, so it shadows nothing and makes the
+    /// visible `--write-bitmap-index` no longer reachable by abbreviation.
+    #[test]
+    fn the_hidden_entry_makes_write_bit_ambiguous() {
+        match super::resolve_long("write-bit") {
+            Resolved::Ambiguous(a, b) => assert_eq!(
+                (a.as_str(), b.as_str()),
+                ("write-bitmap-index", "write-bitmap-index-quiet")
+            ),
+            _ => panic!("--write-bit must be ambiguous"),
+        }
+        assert!(matches!(
+            super::resolve_long("write-bitmap-index"),
+            Resolved::Unique(..)
+        ));
+        let quiet = OPTS
+            .iter()
+            .find(|d| d.long == "write-bitmap-index-quiet")
+            .expect("hidden entry present");
+        assert!(quiet.kind == Kind::Bool, "the hidden entry takes no value");
+    }
 }

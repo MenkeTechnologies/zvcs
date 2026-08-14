@@ -389,7 +389,9 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
             "--" => after_dashdash = true,
             // parse_options_step()'s `internal_help`: the block on stdout at
             // 129, with no `error:` line — a help request is not a rejection.
-            "-h" => return Ok(super::show_usage(USAGE)),
+            // `--help-all` reaches the same renderer with USAGE_FULL, which this
+            // table renders identically: it has no `PARSE_OPT_HIDDEN` entry.
+            "-h" | "--help-all" => return Ok(super::show_usage(USAGE)),
             "--staged" | "-S" => staged = true,
             // Every `--no-<x>` below is parse-options' unset for that entry:
             // an `OPT_BOOL` writes 0, an `OPT_STRING`/`OPT_FILENAME` writes NULL,

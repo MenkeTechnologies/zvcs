@@ -11,19 +11,48 @@ use gix::bstr::ByteSlice;
 /// git's effective `core.abbrev`: an explicit number, `auto`/absent → derived
 /// from the object count, or `no`/`off`/`false` → the full hash length.
 pub fn configured_abbrev(repo: &gix::Repository, hexsz: usize) -> usize {
-    match repo
+    let value = repo
         .config_snapshot()
         .string("core.abbrev")
         .as_ref()
-        .and_then(|v| v.to_str().ok().map(str::to_ascii_lowercase))
-    {
-        None => auto_abbrev(repo, hexsz),
+        .and_then(|v| v.to_str().ok().map(str::to_ascii_lowercase));
+    resolve(value, hexsz, || auto_abbrev(repo, hexsz))
+}
+
+/// git's `FALLBACK_DEFAULT_ABBREV` (object-name.h:140) — the width `auto` means
+/// when there is no object database to size it against.
+pub const FALLBACK_DEFAULT_ABBREV: usize = 7;
+
+/// The same length for a command running *outside* a repository, which is
+/// `git diff --no-index`: its two operands need not live in one.
+///
+/// `diff_abbrev_oid()` (diff.c:4842-4856) branches on
+/// `startup_info->have_repository`. With a repository it asks the object database
+/// for a length that is unique there; without one it just cuts the hex at
+/// `options->abbrev`, which is still `default_abbrev` — git reads the system and
+/// per-user config whether or not it found a repository, so a user's
+/// `core.abbrev = 10` applies to a `--no-index` comparison of two paths in `/tmp`.
+/// Only `auto` differs: with no object count to work from it lands on
+/// [`FALLBACK_DEFAULT_ABBREV`].
+pub fn global_abbrev(hexsz: usize) -> usize {
+    let config = crate::config::global_config();
+    let value = config
+        .string("core.abbrev")
+        .as_ref()
+        .and_then(|v| v.to_str().ok().map(str::to_ascii_lowercase));
+    resolve(value, hexsz, || FALLBACK_DEFAULT_ABBREV)
+}
+
+/// `git_default_core_config()`'s `core.abbrev` arm (environment.c:349-363), over
+/// a value already lowercased: `auto` and an unreadable number defer to `auto`,
+/// a false-y word means the whole name, anything else is the number itself.
+fn resolve(value: Option<String>, hexsz: usize, auto: impl Fn() -> usize) -> usize {
+    match value {
+        None => auto(),
         Some(v) => match v.as_str() {
-            "auto" => auto_abbrev(repo, hexsz),
+            "auto" => auto(),
             "no" | "off" | "false" => hexsz,
-            other => other
-                .parse::<usize>()
-                .unwrap_or_else(|_| auto_abbrev(repo, hexsz)),
+            other => other.parse::<usize>().unwrap_or_else(|_| auto()),
         },
     }
 }
@@ -147,6 +176,30 @@ pub fn parse_opt_abbrev_value(value: &str) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `core.abbrev`'s four shapes (environment.c:349-363). The `auto` fallback is
+    /// a closure because it means two different things: the object-count estimate
+    /// inside a repository, and `FALLBACK_DEFAULT_ABBREV` outside one, where
+    /// `diff --no-index` reads it.
+    #[test]
+    fn core_abbrev_reads_the_way_git_reads_it() {
+        let auto = || 12usize;
+        // Absent and `auto` both defer.
+        assert_eq!(resolve(None, 40, auto), 12);
+        assert_eq!(resolve(Some("auto".into()), 40, auto), 12);
+        // The false-y words mean the whole name.
+        for word in ["no", "off", "false"] {
+            assert_eq!(resolve(Some(word.into()), 40, auto), 40, "{word}");
+        }
+        // A number is itself — this is the `core.abbrev = 10` that makes a
+        // `--no-index` `index` line ten characters wide rather than seven.
+        assert_eq!(resolve(Some("10".into()), 40, auto), 10);
+        // Anything unreadable falls back rather than erroring, which is what keeps
+        // a bad config value from taking a diff down.
+        assert_eq!(resolve(Some("nonsense".into()), 40, auto), 12);
+        // With no repository the fallback is git's literal 7.
+        assert_eq!(resolve(None, 40, || FALLBACK_DEFAULT_ABBREV), 7);
+    }
 
     /// The C `long`-to-`int` narrowing inside `parse_opt_abbrev_cb`, checked
     /// against git 2.55.0 run as `git cherry -v --abbrev=<v> main feature` in a

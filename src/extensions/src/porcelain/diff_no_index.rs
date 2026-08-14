@@ -39,6 +39,9 @@ use super::diff_color;
 /// the pair takes the other side's name.
 const DEV_NULL: &str = "/dev/null";
 
+/// `the_hash_algo` for a comparison that has no repository to take one from.
+const HASH_KIND: gix::hash::Kind = gix::hash::Kind::Sha1;
+
 /// One side of a pair, as `queue_diff()` resolved it.
 #[derive(Clone)]
 struct Side {
@@ -95,6 +98,13 @@ fn read_side(side: &Side) -> Result<Vec<u8>> {
         return Ok(gix::path::into_bstr(target).into_owned().into());
     }
     Ok(std::fs::read(path)?)
+}
+
+/// `hash_object_file()` over a blob's bytes — the id both `fill_metainfo()` and
+/// `hash_filespec()` arrive at for a file no repository has ever stored.
+fn blob_id(data: &[u8]) -> gix::ObjectId {
+    gix::objs::compute_hash(HASH_KIND, gix::objs::Kind::Blob, data)
+        .expect("sha1 of an in-memory blob")
 }
 
 /// `git diff --no-index`'s two operands, after `/dev/null` and directories are
@@ -181,9 +191,24 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<BString>) {
     }
 }
 
-/// One emitted pair, as the non-patch formats need it: the two display names, the
-/// line counts, whether it was binary, whether each side existed, and the modes.
-type Row = (BString, BString, u32, u32, bool, bool, bool, u32, u32);
+/// One emitted pair, as the non-patch formats need it.
+struct Row {
+    /// The pre-image's display name, `/dev/null` when it does not exist.
+    a_name: BString,
+    /// The post-image's, likewise.
+    b_name: BString,
+    added: u32,
+    deleted: u32,
+    binary: bool,
+    a_exists: bool,
+    b_exists: bool,
+    a_mode: u32,
+    b_mode: u32,
+    /// The blob id `find_exact_renames()` leaves on a one-sided pair's existing
+    /// side, and which `--raw` then prints. `None` on a pair with two sides,
+    /// which rename detection never hashes.
+    oid: Option<gix::ObjectId>,
+}
 
 /// The formats `--no-index` understands, as bits in the same order `diff` uses.
 #[derive(Default, Clone, Copy)]
@@ -227,7 +252,12 @@ struct Opts {
     func_context: bool,
     src_prefix: Vec<u8>,
     dst_prefix: Vec<u8>,
+    /// The `index` line's width: `fill_metainfo()`'s `o->abbrev ? o->abbrev :
+    /// DEFAULT_ABBREV` (diff.c:4915), so `--no-abbrev`'s zero does not reach it.
     abbrev: usize,
+    /// `--raw`'s, which is `opt->abbrev` untouched (diff.c:6477) and therefore
+    /// the whole name under `--no-abbrev`.
+    raw_abbrev: usize,
     full_index: bool,
     text: bool,
     colors: diff_color::DiffColors,
@@ -270,7 +300,11 @@ fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
     let mut func_context = false;
     let mut src_prefix = b"a/".to_vec();
     let mut dst_prefix = b"b/".to_vec();
-    let mut abbrev = 7usize;
+    // `options->abbrev` starts at `DEFAULT_ABBREV`, which is the `core.abbrev`
+    // git read at startup; `None` here stands for that deferred value, resolved
+    // below once it is known whether a repository was found.
+    let mut abbrev: Option<usize> = None;
+    let mut no_abbrev = false;
     let mut full_index = false;
     let mut text = false;
     let mut color_when: Option<diff_color::ColorWhen> = None;
@@ -343,8 +377,41 @@ fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
                     }
                 }
             }
+            // `OPT__ABBREV(&options->abbrev)` (diff.c:6128), whose
+            // `parse_opt_abbrev_cb()` takes the argument as optional: bare
+            // `--abbrev` restores `DEFAULT_ABBREV` and `--no-abbrev` is a zero,
+            // which the two consumers read differently.
+            "--abbrev" => {
+                abbrev = None;
+                no_abbrev = false;
+            }
+            "--no-abbrev" => {
+                abbrev = None;
+                no_abbrev = true;
+            }
             s if s.starts_with("--abbrev=") => {
-                abbrev = s["--abbrev=".len()..].parse().unwrap_or(7);
+                let Some(v) = super::super::abbrev::parse_opt_abbrev_value(&s["--abbrev=".len()..])
+                else {
+                    // `parse_options()` turns a callback's `PARSE_OPT_ERROR` into
+                    // a bare `exit(129)` (parse-options.c:1200), so the message
+                    // stands alone — no usage block follows it.
+                    eprintln!("error: option `abbrev' expects a numerical value");
+                    return Ok(ExitCode::from(129));
+                };
+                // `if (v && v < MINIMUM_ABBREV) v = MINIMUM_ABBREV; else if (v >
+                // hexsz) v = hexsz;` — a zero survives both arms and means the
+                // whole name, exactly as `--no-abbrev` does.
+                let hexsz = HASH_KIND.len_in_hex() as i32;
+                let v = match v {
+                    0 => 0,
+                    v if v < super::super::abbrev::MINIMUM_ABBREV as i32 => {
+                        super::super::abbrev::MINIMUM_ABBREV as i32
+                    }
+                    v if v > hexsz => hexsz,
+                    v => v,
+                };
+                abbrev = (v != 0).then_some(v as usize);
+                no_abbrev = v == 0;
             }
             // `parse_options()` rejects these outright: they belong to
             // `cmd_diff()`, not to the no-index parser, and never reach it.
@@ -390,9 +457,28 @@ fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
         Some(diff_color::ColorWhen::Never) => false,
         _ => std::io::IsTerminal::is_terminal(&std::io::stdout()),
     };
-    let colors = match (want_color, gix::discover(".")) {
-        (true, Ok(repo)) => diff_color::DiffColors::resolve(&repo, true),
+    // git's `startup_info->have_repository`, which `diff_abbrev_oid()` branches
+    // on: `--no-index` runs either way, but an id is only sized against an object
+    // database when there is one.
+    let repo = gix::discover(".").ok();
+    let colors = match (want_color, &repo) {
+        (true, Some(repo)) => diff_color::DiffColors::resolve(repo, true),
         _ => diff_color::DiffColors::disabled(),
+    };
+    let hexsz = HASH_KIND.len_in_hex();
+    let default_abbrev = match &repo {
+        Some(repo) => super::super::abbrev::configured_abbrev(repo, hexsz),
+        None => super::super::abbrev::global_abbrev(hexsz),
+    };
+    // `--no-abbrev`'s zero reaches `--raw` as the whole name, while the `index`
+    // line's `o->abbrev ? o->abbrev : DEFAULT_ABBREV` turns it back into the
+    // configured width.
+    let (abbrev, raw_abbrev) = match (no_abbrev, abbrev) {
+        (true, _) => (default_abbrev, hexsz),
+        (false, explicit) => {
+            let v = explicit.unwrap_or(default_abbrev);
+            (v, v)
+        }
     };
     // `builtin_diff()`: `a_prefix = o->b_prefix; b_prefix = o->a_prefix` under
     // `-R` (diff.c:3862-3868). The exchange is of whatever the two prefixes ended
@@ -409,6 +495,7 @@ fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
         src_prefix,
         dst_prefix,
         abbrev,
+        raw_abbrev,
         full_index,
         text,
         colors,
@@ -446,17 +533,27 @@ fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
             && (super::diff::looks_binary(&old_data) || super::diff::looks_binary(&new_data));
         let (added, deleted, body) =
             super::diff::no_index_body(&old_data, &new_data, &opts.ctx_geometry(), opts.ws, binary);
-        stats.push((
-            a.display_name().clone(),
-            b.display_name().clone(),
+        // `hash_filespec()` (diffcore-rename.c:264-274) hashes the existing side
+        // of every one-sided pair; whether the result is ever printed is decided
+        // once the whole queue is known, below. `--raw` is its only reader here,
+        // so nothing is hashed for a format that would not show it.
+        let oid = match (opts.fmt.raw, a.file.is_some(), b.file.is_some()) {
+            (true, true, false) => Some(blob_id(&old_data)),
+            (true, false, true) => Some(blob_id(&new_data)),
+            _ => None,
+        };
+        stats.push(Row {
+            a_name: a.display_name().clone(),
+            b_name: b.display_name().clone(),
             added,
             deleted,
             binary,
-            a.file.is_some(),
-            b.file.is_some(),
-            a.mode,
-            b.mode,
-        ));
+            a_exists: a.file.is_some(),
+            b_exists: b.file.is_some(),
+            a_mode: a.mode,
+            b_mode: b.mode,
+            oid,
+        });
         if opts.fmt.patch {
             emit_header(&mut out, a, b, &old_data, &new_data, &opts, same_content, binary);
             if binary {
@@ -537,9 +634,7 @@ fn emit_header(
         if !exists {
             return "0".repeat(opts.abbrev);
         }
-        let id = gix::objs::compute_hash(gix::hash::Kind::Sha1, gix::objs::Kind::Blob, data)
-            .expect("sha1 of an in-memory blob");
-        let hex = id.to_hex().to_string();
+        let hex = blob_id(data).to_hex().to_string();
         let len = if opts.full_index { hex.len() } else { opts.abbrev.min(hex.len()) };
         hex[..len].to_string()
     };
@@ -593,35 +688,57 @@ fn render_non_patch(out: &mut Vec<u8>, rows: &[Row], opts: &Opts) {
     // `--name-status` print the pre-image one, which for an addition is the only
     // name there is.
     if opts.fmt.name_only {
-        for (_, b, _, _, _, _, _, _, _) in rows {
-            out.extend_from_slice(b.as_bytes());
+        for row in rows {
+            out.extend_from_slice(row.b_name.as_bytes());
             out.push(b'\n');
         }
         return;
     }
     if opts.fmt.name_status || opts.fmt.raw {
-        for (a, b, _, _, _, a_exists, b_exists, a_mode, b_mode) in rows {
-            let status = match (a_exists, b_exists) {
+        // Whether `find_exact_renames()` ran at all: `diffcore_rename()` gives up
+        // before it when the queue holds no destination or no source
+        // (diffcore-rename.c:1461-1462), and it is that pass — not the diff — that
+        // leaves a blob id on a filespec `queue_diff()` created with the null one.
+        // So a directory pair with one file added *and* one removed prints two
+        // real ids, while the same pair with only an addition prints zeros.
+        let hashed = rows.iter().any(|r| r.a_exists && !r.b_exists)
+            && rows.iter().any(|r| !r.a_exists && r.b_exists);
+        for row in rows {
+            let status = match (row.a_exists, row.b_exists) {
                 (false, true) => b'A',
                 (true, false) => b'D',
                 _ => b'M',
             };
             if opts.fmt.raw {
+                let side = |mine: bool| match (hashed && mine).then_some(row.oid).flatten() {
+                    Some(id) => {
+                        let hex = id.to_hex().to_string();
+                        hex[..opts.raw_abbrev.min(hex.len())].to_string()
+                    }
+                    None => "0".repeat(opts.raw_abbrev),
+                };
                 out.extend_from_slice(
-                    format!(":{:06o} {:06o} {} {} ", a_mode, b_mode, "0".repeat(7), "0".repeat(7))
-                        .as_bytes(),
+                    format!(
+                        ":{:06o} {:06o} {} {} ",
+                        row.a_mode,
+                        row.b_mode,
+                        side(row.a_exists && !row.b_exists),
+                        side(!row.a_exists && row.b_exists),
+                    )
+                    .as_bytes(),
                 );
             }
             out.push(status);
             out.push(b'\t');
-            out.extend_from_slice(if *a_exists { a.as_bytes() } else { b.as_bytes() });
+            let name = if row.a_exists { &row.a_name } else { &row.b_name };
+            out.extend_from_slice(name.as_bytes());
             out.push(b'\n');
         }
         return;
     }
     let stat_rows: Vec<(BString, BString, u32, u32, bool)> = rows
         .iter()
-        .map(|(a, b, add, del, bin, _, _, _, _)| (a.clone(), b.clone(), *add, *del, *bin))
+        .map(|r| (r.a_name.clone(), r.b_name.clone(), r.added, r.deleted, r.binary))
         .collect();
     if opts.fmt.numstat {
         super::diff::render_rows_numstat(out, &stat_rows, false);
@@ -632,19 +749,23 @@ fn render_non_patch(out: &mut Vec<u8>, rows: &[Row], opts: &Opts) {
     if opts.fmt.shortstat {
         let (adds, dels) = rows
             .iter()
-            .filter(|(_, _, _, _, bin, _, _, _, _)| !bin)
-            .fold((0u32, 0u32), |(a, d), (_, _, add, del, _, _, _, _, _)| (a + add, d + del));
+            .filter(|r| !r.binary)
+            .fold((0u32, 0u32), |(a, d), r| (a + r.added, d + r.deleted));
         super::diff::stat_summary(out, rows.len() as u32, adds, dels);
     }
     if opts.fmt.summary {
-        for (_, b, _, _, _, a_exists, b_exists, _, b_mode) in rows {
-            match (a_exists, b_exists) {
-                (false, true) => {
-                    out.extend_from_slice(format!(" create mode {:06o} {b}\n", b_mode).as_bytes())
-                }
-                (true, false) => {
-                    out.extend_from_slice(format!(" delete mode {:06o} {b}\n", b_mode).as_bytes())
-                }
+        // `show_file_mode_name(opt, "create", p->two)` and `(…, "delete", p->one)`
+        // (diff.c): each takes the mode *and* the path off its own side of the
+        // pair, so a deletion names the file that was there — not the `/dev/null`
+        // that replaced it, whose mode is zero.
+        for row in rows {
+            match (row.a_exists, row.b_exists) {
+                (false, true) => out.extend_from_slice(
+                    format!(" create mode {:06o} {}\n", row.b_mode, row.b_name).as_bytes(),
+                ),
+                (true, false) => out.extend_from_slice(
+                    format!(" delete mode {:06o} {}\n", row.a_mode, row.a_name).as_bytes(),
+                ),
                 _ => {}
             }
         }
@@ -657,6 +778,149 @@ mod tests {
 
     fn present(name: &str) -> Side {
         Side { name: BString::from(name), file: Some(PathBuf::from(name)), mode: 0o100644 }
+    }
+
+    /// A pair that exists on one side only, as `queue_dirs()` builds it: the
+    /// missing half is named `/dev/null` and has no mode.
+    fn one_sided(name: &str, exists_on_left: bool, oid: Option<gix::ObjectId>) -> Row {
+        let (a_name, b_name) = match exists_on_left {
+            true => (BString::from(name), BString::from(DEV_NULL)),
+            false => (BString::from(DEV_NULL), BString::from(name)),
+        };
+        Row {
+            a_name,
+            b_name,
+            added: u32::from(!exists_on_left),
+            deleted: u32::from(exists_on_left),
+            binary: false,
+            a_exists: exists_on_left,
+            b_exists: !exists_on_left,
+            a_mode: if exists_on_left { 0o100644 } else { 0 },
+            b_mode: if exists_on_left { 0 } else { 0o100644 },
+            oid,
+        }
+    }
+
+    fn opts(fmt: Format, raw_abbrev: usize) -> Opts {
+        Opts {
+            fmt,
+            ctx: 3,
+            ws: super::super::diff::Whitespace::Keep,
+            func_context: false,
+            src_prefix: b"a/".to_vec(),
+            dst_prefix: b"b/".to_vec(),
+            abbrev: 7,
+            raw_abbrev,
+            full_index: false,
+            text: false,
+            colors: diff_color::DiffColors::disabled(),
+        }
+    }
+
+    fn rendered(rows: &[Row], o: &Opts) -> String {
+        let mut out = Vec::new();
+        render_non_patch(&mut out, rows, o);
+        String::from_utf8(out).expect("ascii fixtures")
+    }
+
+    /// `--summary`'s deletion line takes both its mode and its name from the
+    /// *pre*-image (`show_file_mode_name(opt, "delete", p->one)`), not from the
+    /// `/dev/null` the pair's other half became. Stock git 2.55.0 over a directory
+    /// pair where `only_a.txt` exists on the left and `only_b.txt` on the right:
+    ///
+    /// ```text
+    /// $ git diff --no-index --summary da db
+    ///  delete mode 100644 da/only_a.txt
+    ///  create mode 100644 db/only_b.txt
+    /// ```
+    ///
+    /// Reading the post-image for both lines — which is the shape this port
+    /// shipped — turns the first into ` delete mode 000000 /dev/null`, because
+    /// that side has neither a name nor a mode of its own.
+    #[test]
+    fn summary_names_the_side_each_line_is_about() {
+        let rows =
+            [one_sided("da/only_a.txt", true, None), one_sided("db/only_b.txt", false, None)];
+        let o = opts(Format { summary: true, ..Format::default() }, 7);
+        assert_eq!(
+            rendered(&rows, &o),
+            " delete mode 100644 da/only_a.txt\n create mode 100644 db/only_b.txt\n"
+        );
+    }
+
+    /// `--raw` shows a real blob id exactly when rename detection got far enough
+    /// to compute one. `diffcore_rename()` gives up before its exact-match pass
+    /// unless the queue holds *both* a destination and a source
+    /// (diffcore-rename.c:1461), and that pass — `hash_filespec()` — is the only
+    /// thing that ever replaces the null id `queue_diff()` created the filespecs
+    /// with. Stock git 2.55.0, same two directories as above:
+    ///
+    /// ```text
+    /// $ git diff --no-index --raw da db
+    /// :100644 100644 0000000 0000000 M	da/common.txt
+    /// :100644 000000 f8779b8 0000000 D	da/only_a.txt
+    /// :000000 100644 0000000 5709f57 A	db/only_b.txt
+    /// $ git diff --no-index --raw addonly_a addonly_b     # nothing deleted
+    /// :000000 100644 0000000 0000000 A	addonly_b/n1.txt
+    /// ```
+    ///
+    /// The modified pair keeps two null ids in both runs: it is neither a rename
+    /// source nor a destination, so nothing hashes it.
+    #[test]
+    fn raw_prints_ids_only_when_rename_detection_would_have_hashed_them() {
+        let deleted = gix::ObjectId::from_hex(b"f8779b82a49aeea68c066a40cc5828aa69af10e6").unwrap();
+        let added = gix::ObjectId::from_hex(b"5709f57480157adcd6e54fdea37b43fbec0598bc").unwrap();
+        let o = opts(Format { raw: true, ..Format::default() }, 7);
+
+        let both = [
+            one_sided("da/only_a.txt", true, Some(deleted)),
+            one_sided("db/only_b.txt", false, Some(added)),
+        ];
+        assert_eq!(
+            rendered(&both, &o),
+            ":100644 000000 f8779b8 0000000 D\tda/only_a.txt\n\
+             :000000 100644 0000000 5709f57 A\tdb/only_b.txt\n"
+        );
+
+        // A queue with no deletion never reaches the hashing pass, so the id the
+        // row carries stays unprinted.
+        let adds_only = [one_sided("db/only_b.txt", false, Some(added))];
+        assert_eq!(
+            rendered(&adds_only, &o),
+            ":000000 100644 0000000 0000000 A\tdb/only_b.txt\n"
+        );
+    }
+
+    /// `--no-abbrev` widens `--raw` to the whole name (`diff_flush_raw()` passes
+    /// `opt->abbrev` straight through, and zero means "all of it"), and the null
+    /// id widens with it. Stock git 2.55.0:
+    ///
+    /// ```text
+    /// $ git diff --no-index --no-abbrev --raw da db
+    /// :100644 000000 f8779b82a49aeea68c066a40cc5828aa69af10e6 0000000000000000000000000000000000000000 D	da/only_a.txt
+    /// ```
+    #[test]
+    fn raw_widths_follow_the_requested_abbreviation() {
+        let deleted = gix::ObjectId::from_hex(b"f8779b82a49aeea68c066a40cc5828aa69af10e6").unwrap();
+        let added = gix::ObjectId::from_hex(b"5709f57480157adcd6e54fdea37b43fbec0598bc").unwrap();
+        let rows = [
+            one_sided("da/only_a.txt", true, Some(deleted)),
+            one_sided("db/only_b.txt", false, Some(added)),
+        ];
+        let wide = rendered(&rows, &opts(Format { raw: true, ..Format::default() }, 40));
+        assert!(
+            wide.starts_with(
+                ":100644 000000 f8779b82a49aeea68c066a40cc5828aa69af10e6 \
+                 0000000000000000000000000000000000000000 D\tda/only_a.txt\n"
+            ),
+            "{wide}"
+        );
+        // The configured width, which is what `core.abbrev = 10` produces.
+        let ten = rendered(&rows, &opts(Format { raw: true, ..Format::default() }, 10));
+        assert!(
+            ten.starts_with(":100644 000000 f8779b82a4 0000000000 D\tda/only_a.txt\n"),
+            "{ten}"
+        );
     }
 
     /// `-R` and the `/dev/null` naming rule, which interact.

@@ -287,8 +287,9 @@ pub fn archive(args: &[String]) -> Result<ExitCode> {
         match a {
             "--" => literal = true,
             // git's `parse_options()` prints the full usage to *stdout* and exits
-            // 129 on `-h` / `--help`.
-            "-h" | "--help" => {
+            // 129 on `-h` / `--help`. `--help-all` renders `USAGE_FULL`, which is
+            // this same block: the option table has no `PARSE_OPT_HIDDEN` entry.
+            "-h" | "--help" | "--help-all" => {
                 print!("{USAGE}");
                 return Ok(ExitCode::from(129));
             }

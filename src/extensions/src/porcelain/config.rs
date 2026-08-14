@@ -16,6 +16,203 @@ const USAGE: &str = r"usage: git config list [<file-option>] [<display-option>] 
 
 ";
 
+/// The block `cmd_config_actions()` renders (3100 bytes, git 2.55.0): the same
+/// usage lines as [`USAGE`] followed by the whole legacy option table.
+///
+/// git has two usage renderings for `config` and they are not interchangeable.
+/// `-h` and `--help-all` are answered by the *outer* `parse_options()` call,
+/// whose table is nothing but `OPT_SUBCOMMAND`s, so the block is the usage lines
+/// alone. Every failure inside `cmd_config_actions()` — an unknown option, an
+/// ambiguous abbreviation — is rendered from *its* table instead, and that one
+/// lists all thirty-six entries.
+const USAGE_ACTIONS: &str = r#"usage: git config list [<file-option>] [<display-option>] [--includes]
+   or: git config get [<file-option>] [<display-option>] [--includes] [--all] [--regexp] [--value=<pattern>] [--fixed-value] [--default=<default>] [--url=<url>] <name>
+   or: git config set [<file-option>] [--type=<type>] [--all] [--value=<pattern>] [--fixed-value] <name> <value>
+   or: git config unset [<file-option>] [--all] [--value=<pattern>] [--fixed-value] <name>
+   or: git config rename-section [<file-option>] <old-name> <new-name>
+   or: git config remove-section [<file-option>] <name>
+   or: git config edit [<file-option>]
+   or: git config [<file-option>] --get-colorbool <name> [<stdout-is-tty>]
+
+Config file location
+    --[no-]global         use global config file
+    --[no-]system         use system config file
+    --[no-]local          use repository config file
+    --[no-]worktree       use per-worktree config file
+    -f, --[no-]file <file>
+                          use given config file
+    --[no-]blob <blob-id> read config from given blob object
+
+Action
+    --get                 get value: name [<value-pattern>]
+    --get-all             get all values: key [<value-pattern>]
+    --get-regexp          get values for regexp: name-regex [<value-pattern>]
+    --get-urlmatch        get value specific for the URL: section[.var] URL
+    --replace-all         replace all matching variables: name value [<value-pattern>]
+    --add                 add a new variable: name value
+    --unset               remove a variable: name [<value-pattern>]
+    --unset-all           remove all matches: name [<value-pattern>]
+    --rename-section      rename section: old-name new-name
+    --remove-section      remove a section: name
+    -l, --list            list all
+    -e, --edit            open an editor
+    --get-color           find the color configured: slot [<default>]
+    --get-colorbool       find the color setting: slot [<stdout-is-tty>]
+
+Display options
+    -z, --[no-]null       terminate values with NUL byte
+    --[no-]name-only      show variable names only
+    --[no-]show-origin    show origin of config (file, standard input, blob, command line)
+    --[no-]show-scope     show scope of config (worktree, local, global, system, command)
+    --[no-]show-names     show config keys in addition to their values
+
+Type
+    -t, --[no-]type <type>
+                          value is given this type
+    --bool                value is "true" or "false"
+    --int                 value is decimal number
+    --bool-or-int         value is --bool or --int
+    --bool-or-str         value is --bool or string
+    --path                value is a path (file or directory name)
+    --expiry-date         value is an expiry date
+
+Other
+    --[no-]default <value>
+                          with --get, use default value when missing entry
+    --[no-]comment <value>
+                          human-readable comment string (# will be prepended as needed)
+    --[no-]fixed-value    use string equality when comparing values to value pattern
+    --[no-]includes       respect include directives on lookup
+
+"#;
+
+/// `cmd_config_actions()`'s `opts[]` (builtin/config.c:1368-1393), flattened
+/// through the three macros it is built from, in declaration order — which is
+/// the order the block above lists them in and the order an `ambiguous option:`
+/// sentence reports its two candidates in.
+///
+/// The outer `cmd_config()` table is not represented: it is `OPT_SUBCOMMAND`s
+/// only (skipped by `parse_long_opt()`, parse-options.c:542-543) and is parsed
+/// with `PARSE_OPT_KEEP_UNKNOWN_OPT`, under which `register_abbrev()` returns
+/// without recording anything (parse-options.c:509-510). Nothing abbreviates
+/// there; every long option this command has resolves here.
+pub(super) const ACTION_OPTS: &[super::LongOpt] = {
+    use super::{Arg, LongOpt};
+    /// `OPT_CMDMODE` is `PARSE_OPT_CMDMODE|PARSE_OPT_NOARG|PARSE_OPT_NONEG`
+    /// (parse-options.h:274-283): no value, and no `--no-` spelling.
+    const fn cmdmode(name: &'static str) -> LongOpt {
+        LongOpt { name, neg: false, arg: Arg::None }
+    }
+    /// `OPT_CALLBACK_VALUE` (builtin/config.c:140-149) is
+    /// `PARSE_OPT_NOARG | PARSE_OPT_NONEG` — the six legacy type spellings.
+    const fn type_value(name: &'static str) -> LongOpt {
+        LongOpt { name, neg: false, arg: Arg::None }
+    }
+    &[
+        // CONFIG_LOCATION_OPTIONS (builtin/config.c:68-74)
+        LongOpt { name: "global", neg: true, arg: Arg::None },
+        LongOpt { name: "system", neg: true, arg: Arg::None },
+        LongOpt { name: "local", neg: true, arg: Arg::None },
+        LongOpt { name: "worktree", neg: true, arg: Arg::None },
+        LongOpt { name: "file", neg: true, arg: Arg::Required },
+        LongOpt { name: "blob", neg: true, arg: Arg::Required },
+        // Action
+        cmdmode("get"),
+        cmdmode("get-all"),
+        cmdmode("get-regexp"),
+        cmdmode("get-urlmatch"),
+        cmdmode("replace-all"),
+        cmdmode("add"),
+        cmdmode("unset"),
+        cmdmode("unset-all"),
+        cmdmode("rename-section"),
+        cmdmode("remove-section"),
+        cmdmode("list"),
+        cmdmode("edit"),
+        cmdmode("get-color"),
+        cmdmode("get-colorbool"),
+        // CONFIG_DISPLAY_OPTIONS (builtin/config.c:111-118)
+        LongOpt { name: "null", neg: true, arg: Arg::None },
+        LongOpt { name: "name-only", neg: true, arg: Arg::None },
+        LongOpt { name: "show-origin", neg: true, arg: Arg::None },
+        LongOpt { name: "show-scope", neg: true, arg: Arg::None },
+        LongOpt { name: "show-names", neg: true, arg: Arg::None },
+        // CONFIG_TYPE_OPTIONS (builtin/config.c:102-109)
+        LongOpt { name: "type", neg: true, arg: Arg::Required },
+        type_value("bool"),
+        type_value("int"),
+        type_value("bool-or-int"),
+        type_value("bool-or-str"),
+        type_value("path"),
+        type_value("expiry-date"),
+        // Other
+        LongOpt { name: "default", neg: true, arg: Arg::Required },
+        LongOpt { name: "comment", neg: true, arg: Arg::Required },
+        LongOpt { name: "fixed-value", neg: true, arg: Arg::None },
+        LongOpt { name: "includes", neg: true, arg: Arg::None },
+    ]
+};
+
+/// Refuse a dashed argument the legacy table did not dispatch on.
+///
+/// Two different refusals hide behind one arm, and telling them apart is the
+/// whole point: a name [`ACTION_OPTS`] claims is a flag stock git *has* and this
+/// port has not ported, so it is refused by its full name at every spelling that
+/// reaches it; a name no entry claims is not this port's business at all and
+/// gets git's own `unknown option` / `unknown switch`, with the legacy block on
+/// stderr and exit 129.
+/// `option_parse_type()` (builtin/config.c:151-200): the callback behind
+/// `--type=<t>`, behind `-t`, and behind each of the six `--<type>` spellings —
+/// whose `OPT_CALLBACK_VALUE` `defval` names the type outright instead of
+/// parsing an argument.
+///
+/// Two refusals belong to it rather than to any later check, and both were
+/// verified against stock 2.55.0:
+///
+/// * an unrecognized name is a `die()`: `fatal: unrecognized --type argument, zz`
+///   on stderr, exit 128 — not a usage error.
+/// * a *second, different* type is rejected the moment it is parsed:
+///   `git config --bool --type=int` is `error: only one type at a time` at 129,
+///   while `--int --type=int` and `--type=int --type=int` are both fine.
+///
+/// The slot holds git's own name for the type, not this port's [`ValueType`],
+/// so that a type git has and this port has not canonicalized is refused by
+/// name instead of being reported as unrecognized.
+fn select_type(slot: &mut Option<&'static str>, arg: &str) -> std::result::Result<(), ExitCode> {
+    // `TYPE_COLOR` is the one with no `--<type>` spelling of its own.
+    const TYPES: [&str; 7] = [
+        "bool",
+        "int",
+        "bool-or-int",
+        "bool-or-str",
+        "path",
+        "expiry-date",
+        "color",
+    ];
+    let Some(&new) = TYPES.iter().find(|t| **t == arg) else {
+        eprintln!("fatal: unrecognized --type argument, {arg}");
+        return Err(ExitCode::from(128));
+    };
+    if slot.is_some_and(|old| old != new) {
+        eprintln!("error: only one type at a time");
+        return Err(ExitCode::from(129));
+    }
+    *slot = Some(new);
+    Ok(())
+}
+
+fn reject(tok: &str) -> Result<ExitCode> {
+    if let Some(body) = tok.strip_prefix("--") {
+        let stem = body.split_once('=').map_or(body, |(n, _)| n);
+        if matches!(super::resolve_long(ACTION_OPTS, stem), super::Resolved::One(..)) {
+            bail!("{tok} is not implemented");
+        }
+    }
+    // Every switch the table declares (`-f`, `-z`, `-t`, `-l`, `-e`) is handled
+    // by the caller, so a short one reaching here really is unknown.
+    Ok(super::unknown_option(tok, USAGE_ACTIONS))
+}
+
 #[derive(PartialEq, Clone, Copy)]
 enum Mode {
     Auto,
@@ -286,6 +483,10 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
     let mut scope = Scope::Default;
     let mut name_only = false;
     let mut d = Display::default();
+    // git's `display_opts.type` slot, holding its own name for the type so that
+    // `--bool --type=int` can be rejected and an unported type named. Mapped to
+    // a [`ValueType`] once every usage check has run.
+    let mut ty_name: Option<&'static str> = None;
     // `include.path` / `includeIf` following. git resolves includes for the
     // implicit scopes and, for an explicitly named file, only when asked.
     let mut includes = false;
@@ -329,7 +530,19 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
             continue;
         }
 
-        let action = match a.as_str() {
+        // Every long option below is reached through the name `parse_long_opt()`
+        // resolves, so an unambiguous prefix lands on exactly the arm its full
+        // spelling lands on — including the arms that refuse.
+        let orig: &str = a.as_str();
+        let resolved = match super::canonical_long(orig, ACTION_OPTS) {
+            super::Long::Name(name) => name,
+            super::Long::Ambiguous(first, second) => {
+                return Ok(super::ambiguous_option(orig, &first, &second, USAGE_ACTIONS))
+            }
+        };
+        let a: &str = resolved.as_ref();
+
+        let action = match a {
             "-l" | "--list" => Some(Mode::List),
             "--get" => Some(Mode::Get),
             "--get-all" => Some(Mode::GetAll),
@@ -364,7 +577,7 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
         // Scope flags (`OPT_CMDMODE` on `given_config_source.scope` in git): each
         // pins the target file, and a second, different one is a usage error the
         // moment it is parsed.
-        let new_scope = match a.as_str() {
+        let new_scope = match a {
             "--local" => Some(Scope::Local),
             "--global" => Some(Scope::Global),
             "--system" => Some(Scope::System),
@@ -381,7 +594,7 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
         // `-f`/`--file` takes a path, in all four of git's parse-options
         // spellings: separate (`-f p`, `--file p`), sticky (`-fp`), and
         // `--file=p`. An empty value is a legal (unreadable) path, not an error.
-        let file_value = match a.as_str() {
+        let file_value = match a {
             "-f" | "--file" => match args.get(i) {
                 Some(v) => {
                     i += 1;
@@ -408,53 +621,97 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
         }
 
         // `--type=<t>` and its legacy spellings canonicalize the value on the way
-        // out; an unknown type is git's usage error.
-        if let Some(t) = a.strip_prefix("--type=") {
-            match ValueType::parse(t) {
-                Some(ty) => {
-                    d.ty = Some(ty);
-                    continue;
-                }
-                None => return usage_error(&format!("unrecognized --type argument, {t}")),
+        // out; see [`select_type`] for the two refusals it owns.
+        // `-t<type>` is parse-options' sticky short form; `--type` never matches
+        // it, since its second character is another dash.
+        let sticky_type = a.strip_prefix("--type=").or_else(|| match a.strip_prefix("-t") {
+            Some(t) if !t.is_empty() => Some(t),
+            _ => None,
+        });
+        if let Some(t) = sticky_type {
+            if let Err(code) = select_type(&mut ty_name, t) {
+                return Ok(code);
             }
+            continue;
         }
 
-        match a.as_str() {
+        match a {
             "--includes" => includes = true,
             "--no-includes" => includes = false,
             "--show-origin" => d.show_origin = true,
             // parse_options_step()'s `internal_help`, ahead of the
             // subcommand dispatch: the block on stdout at 129.
-            "-h" => return Ok(super::show_usage(USAGE)),
+            // `--help-all` reaches the same renderer with USAGE_FULL, which this
+            // table renders identically: it has no `PARSE_OPT_HIDDEN` entry.
+            "-h" | "--help-all" => return Ok(super::show_usage(USAGE)),
             "--show-scope" => d.show_scope = true,
             "-z" | "--null" => d.null = true,
-            "--bool" => d.ty = Some(ValueType::Bool),
-            "--int" => d.ty = Some(ValueType::Int),
-            "--bool-or-int" => d.ty = Some(ValueType::BoolOrInt),
-            "--path" => d.ty = Some(ValueType::Path),
-            "--type" => {
-                let v = args.get(i).cloned().unwrap_or_default();
+            // The six `OPT_CALLBACK_VALUE` spellings reach `option_parse_type()`
+            // with the type in `defval` and no argument of their own.
+            "--bool" | "--int" | "--bool-or-int" | "--bool-or-str" | "--path"
+            | "--expiry-date" => {
+                if let Err(code) = select_type(&mut ty_name, &a[2..]) {
+                    return Ok(code);
+                }
+            }
+            "-t" | "--type" => {
+                let Some(v) = args.get(i) else {
+                    // `get_arg()`'s PARSE_OPT_ERROR: no usage block, and the
+                    // wording follows the spelling that was used.
+                    return Ok(super::missing_option_value(a));
+                };
                 i += 1;
-                match ValueType::parse(&v) {
-                    Some(ty) => d.ty = Some(ty),
-                    None => return usage_error(&format!("unrecognized --type argument, {v}")),
+                if let Err(code) = select_type(&mut ty_name, v) {
+                    return Ok(code);
                 }
             }
             "--name-only" => name_only = true,
+            // The unset sense of every display/type entry. `option_parse_type()`
+            // stores `TYPE_NONE` when `unset` (builtin/config.c:156-159) and the
+            // four `OPT_BOOL`s clear their int, so each of these is the option's
+            // default — including for the display flags this port does not
+            // otherwise honour (`--show-names`), whose default *is* off.
+            "--no-null" => d.null = false,
+            "--no-name-only" => name_only = false,
+            "--no-show-origin" => d.show_origin = false,
+            "--no-show-scope" => d.show_scope = false,
+            "--no-show-names" => {}
+            "--no-type" => ty_name = None,
+            // `--no-<location>` clears the corresponding `use_*_config` int (or
+            // NULLs the `--file`/`--blob` string), which is exactly "unpin the
+            // file again": back to git's implicit merged read.
+            "--no-global" | "--no-local" | "--no-system" | "--no-file" => {
+                scope = Scope::Default;
+            }
+            "--no-worktree" | "--no-blob" => {}
+            // `--no-default` and `--no-comment` NULL an `OPT_STRING` that this
+            // port never reads, and `--no-fixed-value` clears a bit it never
+            // sets; the unset sense is the behaviour already in place.
+            "--no-default" | "--no-comment" | "--no-fixed-value" => {}
             "--worktree" => bail!(
                 "--worktree scope is not supported: it reads and writes \
                  $GIT_COMMON_DIR/worktrees/<id>/config.worktree behind the \
                  `extensions.worktreeConfig` gate, a config source this port does not open"
             ),
-            other if other.starts_with('-') => bail!("unknown option {other}"),
-            other => positional.push(other),
+            other if other.starts_with('-') => return reject(other),
+            // Unreachable: a token that does not start with `-` ended option
+            // parsing above. Push the argument as typed, never the respelling.
+            _ => positional.push(orig),
         }
     }
 
     // Post-parse validation, in git's own order and — like git — ahead of any
     // repository lookup, so a usage error reports the same way outside a repo.
     //
-    // An entirely actionless invocation is reported first. Without an action
+    // `if ((actions & (ACTION_GET_COLOR|ACTION_GET_COLORBOOL)) && display_opts.type)`
+    // (builtin/config.c:1407-1410) runs before every other check, including the
+    // actionless one, and exits 129 through `error()` + `exit()` rather than
+    // through `usage_with_options()`, so it carries no usage block.
+    if mode == Mode::GetColorBool && ty_name.is_some() {
+        return usage_error("--get-color and variable type are incoherent");
+    }
+    //
+    // An entirely actionless invocation is reported next. Without an action
     // flag the form is `<name> [value [value-pattern]]`, and git recognizes no
     // action at all outside that 1..=3 window, the zero-argument case included.
     if mode == Mode::Auto && !(1..=3).contains(&positional.len()) {
@@ -473,6 +730,20 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
         }
         _ => {}
     }
+
+    // Every usage error git reports has now been reported, so this is the first
+    // point at which refusing an unported type cannot shadow one of them. Three
+    // of git's seven types have no canonicalization here and are named rather
+    // than reported as unrecognized — git recognizes them perfectly well.
+    d.ty = match ty_name {
+        None => None,
+        Some(name) => match ValueType::parse(name) {
+            Some(ty) => Some(ty),
+            None => bail!(
+                "--type={name} is not implemented: no canonicalizer for it here"
+            ),
+        },
+    };
 
     // A repository is optional: reads resolve fine outside one (git reads global
     // and system config with no repo present), while writes target the local

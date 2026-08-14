@@ -1037,7 +1037,11 @@ pub(crate) fn render_raw_stream(
             continue;
         }
         match s {
-            "-h" => {
+            // `--help-all` is matched whole by a `strcmp()` of its own inside
+            // `parse_options_step()`, so it neither abbreviates nor takes an
+            // `=<value>`; it renders `USAGE_FULL`, which is this same block
+            // because no entry of the table is `PARSE_OPT_HIDDEN`.
+            "-h" | "--help-all" => {
                 print!("{USAGE_LINE}{DIFF_OPTIONS}");
                 return Ok(ExitCode::from(129));
             }

@@ -767,18 +767,6 @@ impl Fatal {
     }
 }
 
-/// The flag list quoted back at the user when an unimplemented option shows up.
-const PORTED: &str = "--raw, --name-only, --name-status, -z, --abbrev[=<n>], --no-abbrev, \
-                      -p/-u/--patch, -U<n>, --stat[=<w>], --numstat, --shortstat, \
-                      --compact-summary, --dirstat[=<p>], --dirstat-by-file, --cumulative, \
-                      --summary, --check, -w, -b, --ignore-space-at-eol, --ignore-cr-at-eol, \
-                      -R, --diff-filter=<f>, -S<s>, -G<re>, --pickaxe-regex, --pickaxe-all, \
-                      --find-object=<id>, -O<file>, --output=<file>, \
-                      -0/-1/-2/-3, --base/--ours/--theirs, \
-                      --exit-code, --quiet, -s/--no-patch, -q, --no-renames, --full-index, \
-                      --line-prefix=<s>, --rotate-to=<p>, --skip-to=<p>, --relative[=<p>], \
-                      --ignore-submodules[=<when>]";
-
 /// Status letters `--diff-filter` understands.
 const FILTER_LETTERS: &[u8] = b"ACDMRTUXB";
 
@@ -800,14 +788,12 @@ pub fn diff_files(args: &[String]) -> Result<ExitCode> {
     init_quote_path(&repo);
     match parse(&repo, args) {
         Ok(Parsed::Run { opts, paths }) => run(&repo, opts, paths),
-        Ok(Parsed::Unsupported(flag)) => {
-            let mut err = std::io::stderr().lock();
-            let _ = writeln!(
-                err,
-                "zvcs: diff-files: unsupported flag {flag:?} (ported: {PORTED})"
-            );
-            Ok(ExitCode::from(1))
-        }
+        // A real `diff-files` flag this port has not implemented. It names the
+        // flag and stops there: an inventory of what *is* implemented is this
+        // port's state, not anything git would say, and it goes stale the moment
+        // a flag lands. A flag git itself does not know never reaches here — it
+        // takes parse-options' own `unknown option` path at 129.
+        Ok(Parsed::Unsupported(flag)) => anyhow::bail!("unsupported flag {flag:?}"),
         Err(fatal) => Ok(fatal.report()),
     }
 }

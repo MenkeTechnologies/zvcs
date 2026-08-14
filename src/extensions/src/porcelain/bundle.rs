@@ -158,7 +158,10 @@ pub fn bundle(args: &[String]) -> Result<ExitCode> {
     let rest = &args[1..];
 
     match sub.as_str() {
-        "-h" => {
+        // `--help-all` is a `strcmp()` of its own inside `parse_options_step()`,
+        // rendering `USAGE_FULL` — the same block as `-h` here, since no entry of
+        // this table is `PARSE_OPT_HIDDEN`.
+        "-h" | "--help-all" => {
             print!("{TOP_USAGE}");
             Ok(ExitCode::from(129))
         }
@@ -397,7 +400,9 @@ fn list_heads(args: &[String]) -> Result<ExitCode> {
 
     for a in args {
         match a.as_str() {
-            "-h" => {
+            // `--help-all` renders `USAGE_FULL`, identical to the `-h` block:
+            // no entry of this subcommand's table is `PARSE_OPT_HIDDEN`.
+            "-h" | "--help-all" => {
                 print!("{LIST_HEADS_USAGE}");
                 return Ok(ExitCode::from(129));
             }
@@ -448,7 +453,9 @@ fn verify(args: &[String]) -> Result<ExitCode> {
 
     for a in args {
         match a.as_str() {
-            "-h" => {
+            // `--help-all` renders `USAGE_FULL`, identical to the `-h` block:
+            // no entry of this subcommand's table is `PARSE_OPT_HIDDEN`.
+            "-h" | "--help-all" => {
                 print!("{VERIFY_USAGE}");
                 return Ok(ExitCode::from(129));
             }
@@ -597,7 +604,10 @@ fn history_is_complete(repo: &gix::Repository, tips: &[ObjectId]) -> bool {
 /// prerequisite lines, the ref lines, the blank line that ends the header, and
 /// the pack.
 fn create(args: &[String]) -> Result<ExitCode> {
-    if args.iter().any(|a| a == "-h") {
+    // `--help-all` is its own `strcmp()` inside `parse_options_step()` and prints
+    // `USAGE_FULL`, which is this same block — no entry here is
+    // `PARSE_OPT_HIDDEN`.
+    if args.iter().any(|a| a == "-h" || a == "--help-all") {
         print!("{CREATE_USAGE}");
         return Ok(ExitCode::from(129));
     }
@@ -874,7 +884,9 @@ fn unbundle(args: &[String]) -> Result<ExitCode> {
 
     for a in args {
         match a.as_str() {
-            "-h" => {
+            // `--help-all` renders `USAGE_FULL`, identical to the `-h` block:
+            // no entry of this subcommand's table is `PARSE_OPT_HIDDEN`.
+            "-h" | "--help-all" => {
                 print!("{UNBUNDLE_USAGE}");
                 return Ok(ExitCode::from(129));
             }

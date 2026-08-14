@@ -233,6 +233,16 @@ fn parseopt(argv: &[String]) -> Result<(Vec<String>, Vec<String>)> {
             continue;
         }
 
+        // parse_options_step() tests `--help-all` with a `strcmp()` of its own,
+        // ahead of parse_long_opt() and after the `--` break above: the name
+        // never abbreviates and never takes an `=<value>`, which is why it is
+        // not an [`SPECS`] line. The `OPTS_SPEC` declares no hidden option, so
+        // `USAGE_FULL` renders the same block `-h` prints.
+        if arg == "--help-all" {
+            print!("{USAGE}");
+            return exit_with(129);
+        }
+
         if let Some(body) = arg.strip_prefix("--") {
             parse_long(body, argv, &mut i, &mut opts)?;
             continue;

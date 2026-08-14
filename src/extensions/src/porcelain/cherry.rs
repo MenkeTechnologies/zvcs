@@ -139,7 +139,10 @@ pub fn cherry(args: &[String]) -> Result<ExitCode> {
             "--no-verbose" => verbose = false,
             "--abbrev" => abbrev = Abbrev::Configured,
             "--no-abbrev" => abbrev = Abbrev::Full,
-            "-h" => {
+            // `--help-all` is a `strcmp()` of its own in `parse_options_step()`
+            // and renders `USAGE_FULL`, which is this same block: no entry of the
+            // table is `PARSE_OPT_HIDDEN`.
+            "-h" | "--help-all" => {
                 print!("{USAGE}");
                 return Ok(ExitCode::from(129));
             }

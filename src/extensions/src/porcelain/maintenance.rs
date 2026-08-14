@@ -1,9 +1,9 @@
-//! `git maintenance` — run tasks to optimize repository data.
+//! `git maintenance` â run tasks to optimize repository data.
 //!
 //! Four of the six subcommands are genuinely ported. Two are pure config
 //! manipulation and need nothing beyond `gix-config`:
 //!
-//!   * `register [--config-file <path>]` — appends the repository's realpath to
+//!   * `register [--config-file <path>]` â appends the repository's realpath to
 //!     `maintenance.repo` in the global config (or `--config-file`), sets
 //!     `maintenance.auto = false` in the repository's own config, and sets
 //!     `maintenance.strategy = incremental` there when no value is already
@@ -13,7 +13,7 @@
 //!     config file <path>` plus git's `fatal: unable to add 'maintenance.repo'
 //!     value of '<path>'` and exits 128 rather than claiming a write it did not
 //!     perform.
-//!   * `unregister [--config-file <path>] [-f|--force]` — removes that entry
+//!   * `unregister [--config-file <path>] [-f|--force]` â removes that entry
 //!     again, dropping the `[maintenance]` section once it holds nothing else
 //!     (git's `git_config_set` does the same). Silent, exit 0; a config that
 //!     cannot be locked is `fatal: unable to unset 'maintenance.repo' value of
@@ -29,9 +29,9 @@
 //!     counts as needed, so the answer is independent of the task set, of the
 //!     `maintenance.<task>.enabled` config and of repository state. The one
 //!     config read that survives is `maintenance.strategy`, which git validates
-//!     before deriving a task set — an unusable value is fatal here too, unless
+//!     before deriving a task set â an unusable value is fatal here too, unless
 //!     `--task` named the set and made the read unnecessary. With `--auto` the
-//!     answer is the first task whose condition trips — see [`auto_condition`].
+//!     answer is the first task whose condition trips â see [`auto_condition`].
 //!
 //! `--auto` gates each task on the same per-task condition git's `tasks[]` table
 //! attaches to it, and each condition on its own `maintenance.<task>.auto` key:
@@ -44,21 +44,21 @@
 //! `need_to_gc()` plus the `pre-auto-gc` hook. `prefetch` is the one task git
 //! leaves without a condition, so `--auto` never selects it.
 //!
-//! [`run_auto_maintenance`] is the other half — the automatic run the commands
+//! [`run_auto_maintenance`] is the other half â the automatic run the commands
 //! that add objects trigger, gated on `maintenance.auto`/`gc.auto` and detached
 //! or not per `maintenance.autoDetach`/`gc.autoDetach`.
 //!
 //! `run` is a task driver, and this port runs the tasks that have a home in the
-//! tree — see [`run_tasks`] for the task set, the ordering, and the two tasks
+//! tree â see [`run_tasks`] for the task set, the ordering, and the two tasks
 //! that are deliberately no-ops.
 //!
 //! Everything else validates its arguments exactly as git's parse-options does
-//! — `-h` (usage on stdout, exit 129), unknown option/switch, missing option
-//! value, stray positional, invalid `--task`/`--schedule`/`--scheduler` value —
+//! â `-h` (usage on stdout, exit 129), unknown option/switch, missing option
+//! value, stray positional, invalid `--task`/`--schedule`/`--scheduler` value â
 //! and then bails naming the substrate that is missing, rather than exiting 0
 //! and pretending the work happened:
 //!
-//!   * `start` and `stop` are OS scheduler integration — writing launchd plists,
+//!   * `start` and `stop` are OS scheduler integration â writing launchd plists,
 //!     crontab stanzas, systemd units or schtasks entries and invoking
 //!     `launchctl`/`crontab`/`systemctl`. None of that is repository work, none
 //!     of it lives in gitoxide, and guessing at it would mutate machine-wide
@@ -127,7 +127,7 @@ const IS_NEEDED_USAGE: &str = "usage: git maintenance is-needed [--task=<task>] 
 ///
 /// The order was read off git 2.55.0 rather than guessed: passing all ten names
 /// to `maintenance run` under `GIT_TRACE2_PERF=1` and reading the
-/// `region_enter … maintenance … label:<task>` lines yields exactly this
+/// `region_enter â¦ maintenance â¦ label:<task>` lines yields exactly this
 /// sequence, whatever order the `--task` arguments appeared in.
 ///
 /// `geometric-repack` is the tenth. It does not appear in git's documentation
@@ -148,7 +148,7 @@ const TASKS: [&str; 10] = [
     "geometric-repack",
 ];
 
-/// The order a *config-driven* selection runs tasks in — a bare
+/// The order a *config-driven* selection runs tasks in â a bare
 /// `maintenance run` and a `maintenance run --schedule=<frequency>` alike, both
 /// of which pick their set from `maintenance.strategy`,
 /// `maintenance.<task>.enabled` and `maintenance.<task>.schedule` rather than
@@ -158,7 +158,7 @@ const TASKS: [&str; 10] = [
 /// copy: read off git 2.55.0 with all ten tasks switched on
 /// (`GIT_TRACE2_PERF=1`, keeping the `region_enter` lines whose category is
 /// `maintenance`), a run selected by config enters them as below, while the same
-/// ten passed as `--task` arguments enter in the `TASKS` sequence — `gc` moves
+/// ten passed as `--task` arguments enter in the `TASKS` sequence â `gc` moves
 /// from fourth to seventh and `geometric-repack` from tenth to sixth.
 const CONFIG_ORDER: [&str; 10] = [
     "pack-refs",
@@ -174,7 +174,7 @@ const CONFIG_ORDER: [&str; 10] = [
 ];
 
 /// The tasks the `geometric` strategy enables, which is what a bare
-/// `maintenance run` gets when `maintenance.strategy` is unset — git documents
+/// `maintenance run` gets when `maintenance.strategy` is unset â git documents
 /// `geometric` as "the default strategy for manual maintenance", and a run with
 /// no config at all does select exactly these six.
 const GEOMETRIC_TASKS: [&str; 6] = [
@@ -190,7 +190,7 @@ const GEOMETRIC_TASKS: [&str; 6] = [
 ///
 /// A `--schedule=<frequency>` run selects every task whose own frequency is at
 /// most the requested one, so an hourly task also runs in the daily and weekly
-/// passes — checked against git 2.55.0 with a single task pinned at each
+/// passes â checked against git 2.55.0 with a single task pinned at each
 /// frequency and each of the three passes requested.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 enum Schedule {
@@ -224,7 +224,7 @@ impl Schedule {
 /// A `maintenance.strategy` value git accepts.
 ///
 /// git 2.55.0 takes exactly these three, case-insensitively, and dies on
-/// anything else — including the `none` its own documentation lists, which the
+/// anything else â including the `none` its own documentation lists, which the
 /// code never implemented. So `maintenance.strategy = none` is a fatal, not an
 /// empty task set.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -235,7 +235,7 @@ enum Strategy {
 }
 
 /// The configured `maintenance.strategy`, `Ok(None)` when the key is unset, or
-/// the rejected spelling for git's `fatal: unknown maintenance strategy: '…'`.
+/// the rejected spelling for git's `fatal: unknown maintenance strategy: 'â¦'`.
 ///
 /// git only reads the key when the selection is config-driven: a `--task` run
 /// never looks at it, and so never rejects a bad value.
@@ -252,7 +252,7 @@ fn configured_strategy(repo: &gix::Repository) -> std::result::Result<Option<Str
     }
 }
 
-/// The tasks `maintenance.strategy` enables for a *manual* run — one with
+/// The tasks `maintenance.strategy` enables for a *manual* run â one with
 /// neither `--task` nor `--schedule`.
 ///
 /// An unset key means `geometric`, git's documented default for manual
@@ -269,7 +269,7 @@ fn strategy_manual_tasks(strategy: Option<Strategy>) -> &'static [&'static str] 
 /// The frequency `maintenance.strategy` attaches to `task`, or `None` when that
 /// strategy does not schedule it.
 ///
-/// An unset key schedules nothing at all — which is why
+/// An unset key schedules nothing at all â which is why
 /// `maintenance.<task>.schedule` alone never makes a task run: membership in
 /// this table is also what supplies the task's default `enabled` state for a
 /// scheduled run, so a task the strategy does not schedule additionally needs an
@@ -314,14 +314,14 @@ const SCHEDULERS: [&str; 5] = ["auto", "crontab", "systemd-timer", "launchctl", 
 /// The multi-valued key holding the registry of maintained repositories.
 const REPO_KEY: &str = "maintenance.repo";
 
-/// `run_auto_maintenance()` — the automatic `maintenance run --auto` the
+/// `run_auto_maintenance()` â the automatic `maintenance run --auto` the
 /// commands that add objects trigger on their way out (`am`, `commit`, `fetch`,
 /// `merge`, `rebase`, `receive-pack`).
 ///
 /// A faithful port of `run-command.c`'s `prepare_auto_maintenance()`:
 ///
 ///   * `maintenance.auto` switches it off. When that key is unset the decision
-///     falls back to `gc.auto`, which disables it at zero or below — the
+///     falls back to `gc.auto`, which disables it at zero or below â the
 ///     compatibility path from when this used to be `git gc --auto`.
 ///   * `maintenance.autoDetach` decides whether the caller waits for the run.
 ///     When it is unset `gc.autoDetach` answers instead, and when neither is set
@@ -330,7 +330,7 @@ const REPO_KEY: &str = "maintenance.repo";
 ///
 /// git builds `maintenance run --auto --[no-]quiet --[no-]detach` and lets the
 /// child daemonize itself; here the detached form is a child process with its
-/// standard streams on `/dev/null` — the state `daemonize()` leaves them in —
+/// standard streams on `/dev/null` â the state `daemonize()` leaves them in â
 /// that the caller does not wait for. Either way the caller never sees the
 /// child's output, and its own exit code is unaffected.
 pub fn run_auto_maintenance(repo: &gix::Repository, quiet: bool) -> Result<()> {
@@ -375,7 +375,7 @@ pub fn run_auto_maintenance(repo: &gix::Repository, quiet: bool) -> Result<()> {
     Ok(())
 }
 
-/// `git maintenance` — dispatch to a subcommand.
+/// `git maintenance` â dispatch to a subcommand.
 ///
 /// `run`, `register`, `unregister` and `is-needed` are ported; `start` and
 /// `stop` validate their arguments and then bail, naming the missing substrate.
@@ -394,7 +394,12 @@ pub fn maintenance(args: &[String]) -> Result<ExitCode> {
     let rest = &args[1..];
 
     match first {
-        "-h" => {
+        // `--help-all` joins `-h`: parse_options_step() tests that name with a
+        // `strcmp()` of its own ahead of parse_long_opt(), so it never
+        // abbreviates and never takes an `=<value>`, and it renders
+        // `USAGE_FULL` — the same block, this table having no
+        // `PARSE_OPT_HIDDEN` entry.
+        "-h" | "--help-all" => {
             print!("{TOP_USAGE}");
             Ok(ExitCode::from(129))
         }
@@ -428,7 +433,7 @@ fn usage_error(usage: &str, msg: Option<&str>) -> ExitCode {
     ExitCode::from(129)
 }
 
-/// git's `error: <msg>` line with no usage block after it, exit 129 — the shape
+/// git's `error: <msg>` line with no usage block after it, exit 129 â the shape
 /// used for a missing option value and for a rejected `--scheduler` argument.
 fn bare_error(msg: &str) -> ExitCode {
     eprintln!("error: {msg}");
@@ -438,7 +443,7 @@ fn bare_error(msg: &str) -> ExitCode {
 /// The parse-options wording for an argument that looks like an option but is
 /// not recognized: `unknown option \`<rest>'` for `--<rest>` (git quotes the
 /// whole remainder, `--x=1` included) and `unknown switch \`<c>'` for the first
-/// character of a short cluster. `None` when `arg` is a positional — a lone `-`
+/// character of a short cluster. `None` when `arg` is a positional â a lone `-`
 /// counts as a positional, as it does for git.
 fn option_name(arg: &str) -> Option<String> {
     if let Some(long) = arg.strip_prefix("--") {
@@ -449,7 +454,7 @@ fn option_name(arg: &str) -> Option<String> {
     Some(format!("unknown switch `{c}'"))
 }
 
-/// `git maintenance run` — validate arguments, then run the selected tasks.
+/// `git maintenance run` â validate arguments, then run the selected tasks.
 fn run_sub(args: &[String]) -> Result<ExitCode> {
     let mut auto = false;
     let mut quiet = false;
@@ -463,7 +468,12 @@ fn run_sub(args: &[String]) -> Result<ExitCode> {
             return Ok(usage_error(RUN_USAGE, None));
         }
         match a {
-            "-h" => {
+            // `--help-all` joins `-h`: parse_options_step() tests that name with
+            // a `strcmp()` of its own ahead of parse_long_opt(), so it never
+            // abbreviates and never takes an `=<value>`, and it renders
+            // `USAGE_FULL` — the same block, this table having no
+            // `PARSE_OPT_HIDDEN` entry.
+            "-h" | "--help-all" => {
                 print!("{RUN_USAGE}");
                 return Ok(ExitCode::from(129));
             }
@@ -479,7 +489,7 @@ fn run_sub(args: &[String]) -> Result<ExitCode> {
             // port runs synchronously.
             "--detach" | "--no-detach" => {}
             // git's `--schedule` callback rejects the negated form outright, at
-            // the position it appears — before any later option is parsed.
+            // the position it appears â before any later option is parsed.
             "--no-schedule" => {
                 eprintln!("fatal: --no-schedule is not allowed");
                 return Ok(ExitCode::from(128));
@@ -537,7 +547,7 @@ fn run_sub(args: &[String]) -> Result<ExitCode> {
     };
 
     // git validates `maintenance.strategy` only when it is about to consult it,
-    // which a `--task` run never does — `run --task=gc` succeeds under a strategy
+    // which a `--task` run never does â `run --task=gc` succeeds under a strategy
     // value that makes a bare `run` die. The check lands before `--auto`'s work,
     // so a bad value is fatal even there.
     let strategy = if selected.is_empty() {
@@ -560,48 +570,48 @@ fn run_sub(args: &[String]) -> Result<ExitCode> {
 /// `selected` is the `--task` set, empty when none was given. With it non-empty
 /// the tasks run in [`TASKS`] order and the config is not consulted at all.
 /// Otherwise [`plan`] derives the set from `maintenance.strategy`,
-/// `maintenance.<task>.enabled` and — for a `--schedule` run —
+/// `maintenance.<task>.enabled` and â for a `--schedule` run â
 /// `maintenance.<task>.schedule`, in [`CONFIG_ORDER`].
 ///
 /// # What the tasks do
 ///
-///   * **`pack-refs`** → [`super::pack_refs::pack_refs`] with `--all --prune`,
+///   * **`pack-refs`** â [`super::pack_refs::pack_refs`] with `--all --prune`,
 ///     which is git's own argument list and a real port.
-///   * **`reflog-expire`** → [`super::gc::expire_reflogs`], the same
+///   * **`reflog-expire`** â [`super::gc::expire_reflogs`], the same
 ///     `reflog expire --all` port `git gc` runs, including the per-pattern
 ///     `gc.<pattern>.reflogExpire*` policy and the reachability arm.
-///   * **`geometric-repack`** and **`gc`** → the ported [`super::repack::repack`]
+///   * **`geometric-repack`** and **`gc`** â the ported [`super::repack::repack`]
 ///     and [`super::gc::gc`], invoked with the exact argument lists git's
 ///     `run-command` uses (read off `GIT_TRACE2_PERF=1`, which prints each
 ///     child's argv). `repack` writes a valid pack, `.idx` and `.rev`, drops the
 ///     packs it supersedes and prunes the loose objects it folded in.
 ///
 ///     **The pack's bytes differ from git's by design.** `gix-pack` has no delta
-///     compression — its only output mode is `Mode::PackCopyAndBaseObjects`,
+///     compression â its only output mode is `Mode::PackCopyAndBaseObjects`,
 ///     "Copy base objects and deltas from packs, while non-packed objects will
 ///     be treated as base objects (i.e. without trying to delta compress them)"
-///     (`gix-pack/src/data/output/entry/iter_from_counts.rs:362`) — so every
+///     (`gix-pack/src/data/output/entry/iter_from_counts.rs:362`) â so every
 ///     object is stored undeltified and the pack is larger than git's, sharing
 ///     none of its bytes and, since the name embeds the checksum, none of its
 ///     name either. What it *is* is a well-formed pack holding the correct
 ///     object set. Delta selection is an optimization, not part of the pack's
 ///     meaning, so its absence changes the file's size, not its correctness.
-///   * **`rerere-gc`** → [`super::rerere::rerere`], guarded on `rr-cache`
+///   * **`rerere-gc`** â [`super::rerere::rerere`], guarded on `rr-cache`
 ///     existing so a repository that never recorded a resolution does not enter
 ///     the delegate's `read_dir` error path, which git has no equivalent of.
 ///
-///   * **`worktree-prune`** → [`super::gc::prune_worktrees`], the same
+///   * **`worktree-prune`** â [`super::gc::prune_worktrees`], the same
 ///     `worktree prune --expire <gc.worktreePruneExpire>` port `git gc` runs,
 ///     with git's `locked` and expiry semantics.
 ///
-///   * **`commit-graph`** → [`super::commit_graph::commit_graph`] with
+///   * **`commit-graph`** â [`super::commit_graph::commit_graph`] with
 ///     `write --split --reachable`, git's own argument list
 ///     (`run_write_commit_graph()`, gc.c).
 ///
-///   * **`loose-objects`** → [`prune_packed_task`] then [`pack_loose`], which is
+///   * **`loose-objects`** â [`prune_packed_task`] then [`pack_loose`], which is
 ///     `prune_packed(opts) || pack_loose(opts)` verbatim.
 ///
-///   * **`incremental-repack`** → [`incremental_repack`], the
+///   * **`incremental-repack`** â [`incremental_repack`], the
 ///     `multi-pack-index write` / `expire` / `repack --batch-size=<n>` sequence.
 ///
 /// # The one task that is still unported, and why
@@ -621,7 +631,7 @@ fn run_tasks(
 ) -> Result<ExitCode> {
     let order = plan(repo, selected, scheduled, strategy);
 
-    // git reports a failing task on stderr and keeps going, then exits 1 —
+    // git reports a failing task on stderr and keeps going, then exits 1 â
     // `error: task 'incremental-repack' failed` on a repository with no packs,
     // observed on git 2.55.0.
     let mut failed = false;
@@ -700,7 +710,7 @@ fn run_tasks(
 ///
 /// `--task` short-circuits everything below it: git ignores the config entirely
 /// once a task is named. Otherwise the set comes from `maintenance.strategy`,
-/// with `maintenance.<task>.enabled` and — for a `--schedule` run —
+/// with `maintenance.<task>.enabled` and â for a `--schedule` run â
 /// `maintenance.<task>.schedule` overriding what the strategy decided, and the
 /// order comes from [`CONFIG_ORDER`].
 fn plan(
@@ -732,7 +742,7 @@ fn plan(
     // A scheduled run: a task needs both a frequency at or below the requested
     // one and an `enabled` verdict, and the strategy supplies the default for
     // each. `maintenance.<task>.schedule`, when present, replaces the strategy's
-    // frequency outright — including when it is unparseable, which reads as
+    // frequency outright â including when it is unparseable, which reads as
     // "never".
     CONFIG_ORDER
         .into_iter()
@@ -752,7 +762,7 @@ fn plan(
 /// A delegate's outcome as the success flag git's task runner works in.
 ///
 /// git judges a task by its child's exit status. `ExitCode` cannot be inspected
-/// — it is opaque and implements neither `PartialEq` nor a getter — so the test
+/// â it is opaque and implements neither `PartialEq` nor a getter â so the test
 /// here is whether the delegate returned an error instead. The two agree for
 /// every call this module makes: each delegate is handed a fixed, valid argument
 /// list, and a non-zero `ExitCode` from these modules means a usage error or a
@@ -762,14 +772,14 @@ fn delegate(outcome: Result<ExitCode>) -> bool {
     outcome.is_ok()
 }
 
-/// Run one of git's maintenance children — `git <args>` in this repository — and
+/// Run one of git's maintenance children â `git <args>` in this repository â and
 /// report whether it succeeded, which is `!run_command(&child)` in gc.c.
 ///
 /// A child rather than an in-process call because that is the only way to see
 /// the verb's *exit code*: a porcelain that fails politely returns
 /// `Ok(ExitCode::from(1))`, which [`delegate`] cannot tell from success, and git
 /// keys every one of these tasks on exactly that code. `git multi-pack-index
-/// write` in a repository with no packs is the case that matters — it reports
+/// write` in a repository with no packs is the case that matters â it reports
 /// `error: no pack files to index.` and exits non-zero, and the task has to fail
 /// with it.
 ///
@@ -884,8 +894,8 @@ fn loose_object_ids(repo: &gix::Repository, limit: usize) -> Vec<String> {
                     && name.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
             })
             .collect();
-        // `readdir` order is filesystem-dependent; sorting makes the id list — and
-        // so the pack git names after it — the same on two runs of the same repo.
+        // `readdir` order is filesystem-dependent; sorting makes the id list â and
+        // so the pack git names after it â the same on two runs of the same repo.
         names.sort();
         for name in names {
             out.push(format!("{prefix}{name}"));
@@ -932,7 +942,7 @@ fn incremental_repack(repo: &gix::Repository, quiet: bool) -> bool {
 /// capped at two gigabytes.
 ///
 /// git's comment: "we optimize for one large pack-file (i.e. from a clone) and
-/// expect the rest to be small and they can be repacked quickly … This ensures
+/// expect the rest to be small and they can be repacked quickly â¦ This ensures
 /// that we will repack at least two packs if there are three or more packs."
 fn auto_pack_size(repo: &gix::Repository) -> u64 {
     const TWO_GIGABYTES: u64 = i32::MAX as u64;
@@ -960,7 +970,7 @@ fn strings(args: &[&str]) -> Vec<String> {
     args.iter().map(|s| (*s).to_string()).collect()
 }
 
-/// `git maintenance is-needed` — report whether maintenance would do work.
+/// `git maintenance is-needed` â report whether maintenance would do work.
 ///
 /// Exit 0 means "needed", exit 1 means "not needed"; nothing is ever printed and
 /// nothing in the repository is touched. A repository is still required, but
@@ -974,7 +984,7 @@ fn strings(args: &[&str]) -> Vec<String> {
 /// on the `maintenance.<task>.enabled` config, or on the state of the
 /// repository. That was checked against git 2.55.0 in an empty repo, a bare
 /// repo, a freshly `gc`-ed repo and a detached HEAD, for each of the nine task
-/// names and with every task explicitly disabled — 0 in every case.
+/// names and with every task explicitly disabled â 0 in every case.
 ///
 /// The exception is `maintenance.strategy`: deriving the default task set reads
 /// it, so a value outside `gc`/`geometric`/`incremental` is fatal (128) before
@@ -993,7 +1003,7 @@ fn strings(args: &[&str]) -> Vec<String> {
 /// guess is silent.
 ///
 /// Note that `--schedule` is *not* accepted here despite appearing in git's own
-/// usage block — the option belongs to `run`, and `is-needed --schedule=daily`
+/// usage block â the option belongs to `run`, and `is-needed --schedule=daily`
 /// reports ``unknown option `schedule=daily'``.
 fn is_needed_sub(args: &[String]) -> Result<ExitCode> {
     let mut auto = false;
@@ -1006,7 +1016,12 @@ fn is_needed_sub(args: &[String]) -> Result<ExitCode> {
             return Ok(usage_error(IS_NEEDED_USAGE, None));
         }
         match a {
-            "-h" => {
+            // `--help-all` joins `-h`: parse_options_step() tests that name with
+            // a `strcmp()` of its own ahead of parse_long_opt(), so it never
+            // abbreviates and never takes an `=<value>`, and it renders
+            // `USAGE_FULL` — the same block, this table having no
+            // `PARSE_OPT_HIDDEN` entry.
+            "-h" | "--help-all" => {
                 print!("{IS_NEEDED_USAGE}");
                 return Ok(ExitCode::from(129));
             }
@@ -1046,7 +1061,7 @@ fn is_needed_sub(args: &[String]) -> Result<ExitCode> {
     };
 
     // Without `--task` the answer is derived from the strategy's task set, so an
-    // unusable `maintenance.strategy` is fatal here exactly as it is for `run` —
+    // unusable `maintenance.strategy` is fatal here exactly as it is for `run` â
     // and, as there, naming a task skips the read and with it the rejection.
     let strategy = if selected.is_empty() {
         match configured_strategy(&repo) {
@@ -1059,7 +1074,7 @@ fn is_needed_sub(args: &[String]) -> Result<ExitCode> {
 
     if auto {
         // git's loop stops at the first task whose condition says yes. The task
-        // set is the *manual* one — `is-needed` has no `--schedule`.
+        // set is the *manual* one â `is-needed` has no `--schedule`.
         let needed = plan(&repo, &selected, None, strategy)
             .into_iter()
             .any(|task| auto_condition(&repo, task));
@@ -1075,7 +1090,7 @@ fn is_needed_sub(args: &[String]) -> Result<ExitCode> {
 }
 
 // ---------------------------------------------------------------------------
-// `--auto` — git's per-task auto conditions (`builtin/gc.c`'s `tasks[]` table)
+// `--auto` â git's per-task auto conditions (`builtin/gc.c`'s `tasks[]` table)
 // ---------------------------------------------------------------------------
 
 /// The verdict a `maintenance.<task>.auto` value carries.
@@ -1130,7 +1145,7 @@ fn pre_auto_gc_allows(repo: &gix::Repository) -> bool {
 
 /// `loose_object_auto_condition()`: at least `maintenance.loose-objects.auto`
 /// (default 100) loose objects exist. Unlike `too_many_loose_objects()` this
-/// counts for real — git walks the fan-out directories and stops at the limit.
+/// counts for real â git walks the fan-out directories and stops at the limit.
 fn loose_objects_condition(repo: &gix::Repository) -> bool {
     let limit = match gate(repo, "maintenance.loose-objects.auto", 100) {
         Gate::Never => return false,
@@ -1141,7 +1156,7 @@ fn loose_objects_condition(repo: &gix::Repository) -> bool {
 }
 
 /// Loose objects in the repository's own object directory, counted no further
-/// than `limit` — git's `for_each_loose_file_in_source` stops as soon as its
+/// than `limit` â git's `for_each_loose_file_in_source` stops as soon as its
 /// callback returns non-zero.
 fn count_loose_objects(repo: &gix::Repository, limit: i64) -> i64 {
     let objdir = repo.objects.store_ref().path().to_path_buf();
@@ -1169,7 +1184,7 @@ fn count_loose_objects(repo: &gix::Repository, limit: i64) -> i64 {
 }
 
 /// `rerere_gc_condition()`: an `rr-cache` directory exists and holds at least
-/// one entry. The limit is a plain on/off switch here — git compares nothing
+/// one entry. The limit is a plain on/off switch here â git compares nothing
 /// against it, so any positive value behaves like the default 1.
 fn rerere_gc_condition(repo: &gix::Repository) -> bool {
     let limit = repo
@@ -1230,7 +1245,7 @@ fn worktree_prune_expiry(repo: &gix::Repository) -> Option<i64> {
 /// `HEAD`, then counts with `should_expire_reflog_ent()`. That callback's
 /// reachability arm degenerates here: the condition leaves `mark_list` empty, so
 /// `is_unreachable()` reports every non-null commit as unreachable. With the
-/// defaults it never runs at all — `expire_total` (30 days) is later than
+/// defaults it never runs at all â `expire_total` (30 days) is later than
 /// `expire_unreachable` (90 days), so an entry old enough for the second test has
 /// already been caught by the first.
 fn reflog_expire_condition(repo: &gix::Repository) -> bool {
@@ -1279,7 +1294,7 @@ fn reflog_entry(line: &[u8]) -> Option<(gix::ObjectId, gix::ObjectId, i64)> {
 /// `pack_refs_condition()`: more loose references than git's packed-refs-size
 /// heuristic allows.
 ///
-/// The budget is `log2(packed-refs size / 100) * 5`, floored at 16 — roughly
+/// The budget is `log2(packed-refs size / 100) * 5`, floored at 16 â roughly
 /// sixteen more loose refs per factor of ten of already-packed refs. Only the
 /// refs `pack-refs --all` would actually pack are counted: shared (non
 /// per-worktree) names that are neither symbolic nor broken.
@@ -1388,7 +1403,7 @@ fn peel_to_commit(repo: &gix::Repository, id: gix::ObjectId) -> Option<gix::Obje
     object.peel_to_kind(gix::object::Kind::Commit).ok().map(|c| c.id)
 }
 
-/// The parents of `id`, or an empty list when it cannot be read — git's
+/// The parents of `id`, or an empty list when it cannot be read â git's
 /// `repo_parse_commit()` failure path, which skips the commit.
 fn commit_parents(repo: &gix::Repository, id: gix::ObjectId) -> Vec<gix::ObjectId> {
     repo.find_object(id)
@@ -1439,7 +1454,7 @@ fn midx_pack_names(pack_dir: &Path) -> std::collections::HashSet<String> {
 }
 
 /// `geometric_repack_auto_condition()`: the geometric split would merge at least
-/// two packs, or — when it would not — there are enough loose objects to be
+/// two packs, or â when it would not â there are enough loose objects to be
 /// worth a new pack.
 fn geometric_repack_condition(repo: &gix::Repository) -> bool {
     let auto_value = match gate(repo, "maintenance.geometric-repack.auto", 100) {
@@ -1458,7 +1473,7 @@ fn geometric_repack_condition(repo: &gix::Repository) -> bool {
 /// next `repack --geometric=<factor>` would roll into one.
 ///
 /// `maintenance.geometric-repack.splitFactor` (default 2) is the progression's
-/// ratio — the same value the task passes to `repack --geometric=`.
+/// ratio â the same value the task passes to `repack --geometric=`.
 pub(super) fn geometric_split(repo: &gix::Repository) -> usize {
     let factor = repo
         .config_snapshot()
@@ -1493,7 +1508,7 @@ fn compute_split(weights: &[u64], factor: u64) -> usize {
         i -= 1;
     }
     // The top element of the last-compared pair cannot be in the progression, so
-    // the split moves one right — unless the scan ran all the way to the end.
+    // the split moves one right â unless the scan ran all the way to the end.
     let mut split = if i == 0 { 0 } else { i + 1 };
 
     let mut total: u64 = weights[..split].iter().copied().sum();
@@ -1516,14 +1531,14 @@ struct Pack {
     objects: u64,
     /// A `.keep` file sits beside it.
     keep: bool,
-    /// A `.mtimes` file sits beside it — git's `is_cruft`.
+    /// A `.mtimes` file sits beside it â git's `is_cruft`.
     cruft: bool,
     /// A `.promisor` file sits beside it.
     promisor: bool,
 }
 
 /// Every pack in `pack_dir`. git's conditions only ever look at `pack_local`
-/// packs, which is exactly the repository's own pack directory — alternates
+/// packs, which is exactly the repository's own pack directory â alternates
 /// live elsewhere and are never counted.
 fn local_packs(pack_dir: &Path, hash: gix::hash::Kind) -> Vec<Pack> {
     let Ok(entries) = std::fs::read_dir(pack_dir) else {
@@ -1572,7 +1587,7 @@ fn push_task(selected: &mut Vec<String>, value: &str) {
 
 /// Validate a `--task` or `--schedule` value the way git's option callbacks do,
 /// recording an accepted task name in `selected` and an accepted frequency in
-/// `scheduled` — the callback overwrites, so a repeated `--schedule` keeps the
+/// `scheduled` â the callback overwrites, so a repeated `--schedule` keeps the
 /// last one.
 ///
 /// Returns `Some(exit_code)` when the value is rejected, `None` when accepted.
@@ -1602,7 +1617,7 @@ fn check_value(
     Ok(None)
 }
 
-/// `git maintenance start` — validates arguments, then bails: no scheduler.
+/// `git maintenance start` â validates arguments, then bails: no scheduler.
 fn start_sub(args: &[String]) -> Result<ExitCode> {
     let mut end_of_opts = false;
     let mut i = 0;
@@ -1612,7 +1627,12 @@ fn start_sub(args: &[String]) -> Result<ExitCode> {
             return Ok(usage_error(START_USAGE, None));
         }
         match a {
-            "-h" => {
+            // `--help-all` joins `-h`: parse_options_step() tests that name with
+            // a `strcmp()` of its own ahead of parse_long_opt(), so it never
+            // abbreviates and never takes an `=<value>`, and it renders
+            // `USAGE_FULL` — the same block, this table having no
+            // `PARSE_OPT_HIDDEN` entry.
+            "-h" | "--help-all" => {
                 print!("{START_USAGE}");
                 return Ok(ExitCode::from(129));
             }
@@ -1641,9 +1661,8 @@ fn start_sub(args: &[String]) -> Result<ExitCode> {
 
     bail!(
         "maintenance start is not ported: it installs an OS scheduler entry (launchd plist, \
-         crontab stanza, systemd timer or schtasks task) and invokes launchctl/crontab/systemctl — \
-         machine-wide state with no counterpart in the vendored crates \
-         (ported: register, unregister, and argument validation)"
+         crontab stanza, systemd timer or schtasks task) and invokes launchctl/crontab/systemctl â \
+         machine-wide state with no counterpart in the vendored crates"
     );
 }
 
@@ -1655,7 +1674,7 @@ fn check_scheduler(value: &str) -> Option<ExitCode> {
     })
 }
 
-/// `git maintenance stop` — takes no options at all; validates, then bails.
+/// `git maintenance stop` â takes no options at all; validates, then bails.
 fn stop_sub(args: &[String]) -> Result<ExitCode> {
     let mut end_of_opts = false;
     for a in args {
@@ -1664,7 +1683,12 @@ fn stop_sub(args: &[String]) -> Result<ExitCode> {
             return Ok(usage_error(STOP_USAGE, None));
         }
         match a {
-            "-h" => {
+            // `--help-all` joins `-h`: parse_options_step() tests that name with
+            // a `strcmp()` of its own ahead of parse_long_opt(), so it never
+            // abbreviates and never takes an `=<value>`, and it renders
+            // `USAGE_FULL` — the same block, this table having no
+            // `PARSE_OPT_HIDDEN` entry.
+            "-h" | "--help-all" => {
                 print!("{STOP_USAGE}");
                 return Ok(ExitCode::from(129));
             }
@@ -1678,9 +1702,8 @@ fn stop_sub(args: &[String]) -> Result<ExitCode> {
 
     bail!(
         "maintenance stop is not ported: it removes the OS scheduler entry installed by \
-         `maintenance start` (launchd, crontab, systemd timer or schtasks) — machine-wide state \
-         with no counterpart in the vendored crates \
-         (ported: register, unregister, and argument validation)"
+         `maintenance start` (launchd, crontab, systemd timer or schtasks) â machine-wide state \
+         with no counterpart in the vendored crates"
     );
 }
 
@@ -1690,7 +1713,7 @@ fn stop_sub(args: &[String]) -> Result<ExitCode> {
 /// visible in the merged config, `maintenance.strategy = incremental` into the
 /// repository's own config; then appends the repository's realpath to
 /// `maintenance.repo` in the target config unless it is already listed. Prints
-/// nothing and exits 0, as stock git does — unless a config file cannot be
+/// nothing and exits 0, as stock git does â unless a config file cannot be
 /// locked, in which case `config.c` reports it and the caller dies: the
 /// `error: could not lock config file <path>` line, then git's `fatal:` line,
 /// exit 128.
@@ -1844,7 +1867,12 @@ fn parse_config_file_opts(args: &[String], usage: &str, with_force: bool) -> Res
             return Ok(Parsed::Error(usage_error(usage, None)));
         }
         match a {
-            "-h" => {
+            // `--help-all` joins `-h`: parse_options_step() tests that name with
+            // a `strcmp()` of its own ahead of parse_long_opt(), so it never
+            // abbreviates and never takes an `=<value>`, and it renders
+            // `USAGE_FULL` — the same block, this table having no
+            // `PARSE_OPT_HIDDEN` entry.
+            "-h" | "--help-all" => {
                 print!("{usage}");
                 return Ok(Parsed::Error(ExitCode::from(129)));
             }

@@ -109,6 +109,15 @@ pub fn commit_tree(args: &[String]) -> Result<ExitCode> {
             continue;
         }
 
+        // `if (internal_help && !strcmp(arg + 2, "help-all"))`
+        // (parse-options.c:1122): an exact match tested ahead of
+        // parse_long_opt(), so it neither abbreviates nor takes an `=<value>`.
+        // This table has no `PARSE_OPT_HIDDEN` entry, so `USAGE_FULL` renders
+        // the same block `-h` prints.
+        if a == "--help-all" {
+            return Ok(super::show_usage(USAGE));
+        }
+
         // Respell a unique abbreviation as the name it resolves to, so an
         // abbreviation lands on the arm its full spelling lands on.
         let canonical;

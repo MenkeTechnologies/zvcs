@@ -191,7 +191,9 @@ pub fn commit_graph(args: &[String]) -> Result<ExitCode> {
             }
         };
         match a {
-            "-h" => {
+            // `--help-all` renders `USAGE_FULL`, identical to the `-h` block:
+            // no entry of this table is `PARSE_OPT_HIDDEN`.
+            "-h" | "--help-all" => {
                 print!("{TOP_USAGE}");
                 return Ok(ExitCode::from(129));
             }
@@ -336,7 +338,9 @@ fn verify(args: &[String], inherited_object_dir: Option<String>) -> Result<ExitC
             return Ok(usage_error(None, VERIFY_USAGE));
         }
         match a {
-            "-h" => {
+            // `--help-all` renders `USAGE_FULL`, identical to the `-h` block:
+            // no entry of this subcommand's table is `PARSE_OPT_HIDDEN`.
+            "-h" | "--help-all" => {
                 print!("{VERIFY_USAGE}");
                 return Ok(ExitCode::from(129));
             }
@@ -460,7 +464,9 @@ fn write_graph(args: &[String], inherited_object_dir: Option<String>) -> Result<
             return Ok(usage_error(None, WRITE_USAGE));
         }
         match a {
-            "-h" => {
+            // `--help-all` renders `USAGE_FULL`, identical to the `-h` block:
+            // no entry of this subcommand's table is `PARSE_OPT_HIDDEN`.
+            "-h" | "--help-all" => {
                 print!("{WRITE_USAGE}");
                 return Ok(ExitCode::from(129));
             }

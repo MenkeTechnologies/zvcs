@@ -1047,7 +1047,7 @@ fn reject_unported(opts: &Opts) -> Result<()> {
     }
     if let Some(fmt) = &opts.object_format {
         if fmt != "sha1" {
-            anyhow::bail!("unsupported object format {fmt:?} (ported: sha1)");
+            anyhow::bail!("unsupported object format {fmt:?}");
         }
     }
     if let Some((version, off32_limit)) = opts.index_version {

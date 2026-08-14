@@ -217,6 +217,66 @@ const USAGE: &str = r"usage: git am [<options>] [(<mbox> | <Maildir>)...]
 
 ";
 
+/// `usage_with_options_internal()`'s `USAGE_FULL` rendering — what `--help-all`
+/// prints. It is [`USAGE`] with the `PARSE_OPT_HIDDEN` entries left in:
+/// `--[no-]binary`, `--[no-]rebasing`.
+/// Captured byte-for-byte from stock git 2.55.0's `git am --help-all`.
+const USAGE_ALL: &str = r#"usage: git am [<options>] [(<mbox> | <Maildir>)...]
+   or: git am [<options>] (--continue | --skip | --abort)
+
+    -i, --[no-]interactive
+                          run interactively
+    -n, --no-verify       bypass pre-applypatch and applypatch-msg hooks
+    --verify              opposite of --no-verify
+    -b, --[no-]binary     historical option -- no-op
+    -3, --[no-]3way       allow fall back on 3way merging if needed
+    -q, --[no-]quiet      be quiet
+    -s, --[no-]signoff    add a Signed-off-by trailer to the commit message
+    -u, --[no-]utf8       recode into utf8 (default)
+    -k, --[no-]keep       pass -k flag to git-mailinfo
+    --[no-]keep-non-patch pass -b flag to git-mailinfo
+    -m, --[no-]message-id pass -m flag to git-mailinfo
+    --[no-]keep-cr        pass --keep-cr flag to git-mailsplit for mbox format
+    -c, --[no-]scissors   strip everything before a scissors line
+    --quoted-cr <action>  pass it through git-mailinfo
+    --[no-]whitespace <action>
+                          pass it through git-apply
+    --[no-]ignore-space-change
+                          pass it through git-apply
+    --[no-]ignore-whitespace
+                          pass it through git-apply
+    --[no-]directory <root>
+                          pass it through git-apply
+    --[no-]exclude <path> pass it through git-apply
+    --[no-]include <path> pass it through git-apply
+    -C <n>                pass it through git-apply
+    -p <num>              pass it through git-apply
+    --[no-]patch-format <format>
+                          format the patch(es) are in
+    --[no-]reject         pass it through git-apply
+    --[no-]resolvemsg ... override error message when patch failure occurs
+    --continue            continue applying patches after resolving a conflict
+    -r, --resolved        synonyms for --continue
+    --skip                skip the current patch
+    --abort               restore the original branch and abort the patching operation
+    --quit                abort the patching operation but keep HEAD where it is
+    --show-current-patch[=(diff|raw)]
+                          show the patch being applied
+    --retry               try to apply current patch again
+    --allow-empty         record the empty patch as an empty commit
+    --[no-]committer-date-is-author-date
+                          lie about committer date
+    --[no-]ignore-date    use current timestamp for author date
+    --[no-]rerere-autoupdate
+                          update the index with reused conflict resolution if possible
+    -S, --[no-]gpg-sign[=<key-id>]
+                          GPG-sign commits
+    --empty (stop|drop|keep)
+                          how to handle empty patches
+    --[no-]rebasing       (internal use for git-rebase)
+
+"#;
+
 /// `enum resume_type`. `Apply` is never selected by an argument; `cmd_am`
 /// promotes a bare `git am` inside a live session into it.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -325,6 +385,9 @@ enum Usage {
     /// `-h`: `parse_options_step()` renders the block to **stdout** and exits
     /// 129, with no `error:` line — a help request is not a rejection.
     Help,
+    /// `--help-all`: the same renderer with `USAGE_FULL`, which for `am` keeps
+    /// the hidden `-b` and `--rebasing` entries.
+    HelpAll,
     /// The `PARSE_OPT_ERROR` shape: the `error:` line alone, exit 129, no usage
     /// block. `PARSE_OPT_ERROR` is `-1`, what `get_arg()` and a rejecting callback
     /// return, and `parse_options()` exits on it without calling
@@ -400,6 +463,7 @@ pub fn am(args: &[String]) -> Result<ExitCode> {
     let opts = match parse(args, &defaults) {
         Ok(o) => o,
         Err(Usage::Help) => return Ok(super::show_usage(USAGE)),
+        Err(Usage::HelpAll) => return Ok(super::show_usage(USAGE_ALL)),
         Err(Usage::Error(msg)) => {
             eprintln!("{msg}");
             return Ok(ExitCode::from(129));
@@ -526,6 +590,14 @@ fn parse(args: &[String], defaults: &AmDefaults) -> Result<Opts, Usage> {
         if tok == "--" {
             end_of_opts = true;
             continue;
+        }
+
+        // `if (internal_help && !strcmp(arg + 2, "help-all"))`
+        // (parse-options.c:1122): tested on the token as typed, after the `--`
+        // break above and ahead of the abbreviation resolver, because it is a
+        // `strcmp` — `--help-a` and `--help-all=x` stay unknown options.
+        if tok == "--help-all" {
+            return Err(Usage::HelpAll);
         }
 
         // Respell a unique abbreviation as the name it resolves to, so `--interact`

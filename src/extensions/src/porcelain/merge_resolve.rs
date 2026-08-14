@@ -204,7 +204,7 @@ pub fn merge_resolve(args: &[String]) -> Result<ExitCode> {
             "unsupported: {} merge bases need read-tree's multi-base --aggressive merge \
              (a stage-collapsing unpack_trees state machine gitoxide has no equivalent for); \
              the recursive strategy's virtual merge base is a different algorithm and is not \
-             substituted (ported: the single-base three-way resolve merge)",
+             substituted",
             parsed.bases.len()
         );
     }
@@ -217,7 +217,7 @@ pub fn merge_resolve(args: &[String]) -> Result<ExitCode> {
         _ => bail!(
             "unsupported: merge-resolve without exactly one head and one remote \
              (`<base> -- <head> <remote>`) would drive read-tree's two-way or multi-tree merge, \
-             which is not ported (ported: the standard single-base three-way resolve merge)"
+             which is not ported"
         ),
     };
     let base_spec = parsed.bases[0].as_str();

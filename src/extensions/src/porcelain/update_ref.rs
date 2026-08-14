@@ -248,6 +248,15 @@ fn parse_args(args: &[String]) -> Result<Opts, ExitCode> {
             i += 1;
             continue;
         }
+        // parse_options_step() tests `--help-all` with a `strcmp()` of its own,
+        // placed after that `--` break and ahead of parse_long_opt(): the name
+        // never abbreviates and never takes an `=<value>`, so `resolve_long()`
+        // is never asked about it. update-ref's table has no `PARSE_OPT_HIDDEN`
+        // entry, so `USAGE_FULL` renders the same block `-h` prints.
+        if a == "--help-all" {
+            print!("{USAGE}");
+            return Err(ExitCode::from(129));
+        }
         if let Some(long) = a.strip_prefix("--") {
             // git splits `--name=value` first; none of these options take one.
             let stem = long.split('=').next().unwrap_or(long);

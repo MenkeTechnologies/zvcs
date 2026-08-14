@@ -98,6 +98,13 @@ pub fn check_ignore(args: &[String]) -> Result<ExitCode> {
             no_more_flags = true;
             continue;
         }
+        // `parse_options_step()` tests `--help-all` with a `strcmp()` of its own,
+        // ahead of `parse_long_opt()`: the name never abbreviates and never takes
+        // an `=<value>`. This table has no `PARSE_OPT_HIDDEN` entry, so
+        // `USAGE_FULL` renders the same block `-h` prints.
+        if !no_more_flags && a == "--help-all" {
+            return Ok(show_usage());
+        }
         // A bare `-` is a pathname, not an option, exactly as in parse-options.
         if !no_more_flags && a.len() > 1 && a.starts_with('-') {
             let resolved = match super::canonical_long(a, LONG_OPTS) {

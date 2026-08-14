@@ -80,6 +80,16 @@ pub fn version(args: &[String]) -> Result<ExitCode> {
             continue;
         }
 
+        // parse_options_step() tests `--help-all` with a `strcmp()` of its own,
+        // after the `--` break above and ahead of parse_long_opt(): the name
+        // never abbreviates and never takes an `=<value>`, so it never reaches
+        // `match_long()`. `cmd_version`'s table holds only [`OPT`] and no
+        // `PARSE_OPT_HIDDEN` entry, so `USAGE_FULL` is the block `-h` prints.
+        if a == "--help-all" {
+            print!("{USAGE}");
+            return Ok(ExitCode::from(129));
+        }
+
         if let Some(long) = a.strip_prefix("--") {
             let (name, value) = match long.split_once('=') {
                 Some((n, v)) => (n, Some(v)),

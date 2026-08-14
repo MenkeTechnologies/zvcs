@@ -1513,9 +1513,8 @@ impl Importer {
             DateFormat::Raw => true,
             DateFormat::RawPermissive => false,
             other => bail!(
-                "unsupported flag \"--date-format={}\" (ported: raw, raw-permissive) — \
-                 porting it would mean reimplementing git's date parser, and a near-miss \
-                 would silently store the wrong timestamp",
+                "unsupported flag \"--date-format={}\" — porting it would mean reimplementing \
+                 git's date parser, and a near-miss would silently store the wrong timestamp",
                 other.name()
             ),
         };

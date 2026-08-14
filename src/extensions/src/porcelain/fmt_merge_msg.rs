@@ -99,6 +99,23 @@ usage: git fmt-merge-msg [-m <message>] [--log[=<n>] | --no-log] [--file <file>]
 
 ";
 
+/// `usage_with_options_internal()`'s `USAGE_FULL` rendering — what `--help-all`
+/// prints. It is [`USAGE`] with the `PARSE_OPT_HIDDEN` entries left in:
+/// `--[no-]summary`.
+/// Captured byte-for-byte from stock git 2.55.0's `git fmt-merge-msg --help-all`.
+const USAGE_ALL: &str = r#"usage: git fmt-merge-msg [-m <message>] [--log[=<n>] | --no-log] [--file <file>]
+
+    --[no-]log[=<n>]      populate log with at most <n> entries from shortlog
+    --[no-]summary[=<n>]  alias for --log (deprecated)
+    -m, --[no-]message <text>
+                          use <text> as start of message
+    --[no-]into-name <name>
+                          use <name> instead of the real target branch
+    -F, --[no-]file <file>
+                          file to read from
+
+"#;
+
 /// Signature block openers `parse_signed_buffer()` recognises.
 const SIG_MARKERS: &[&str] = &[
     "-----BEGIN PGP SIGNATURE-----",
@@ -153,9 +170,22 @@ pub fn fmt_merge_msg(args: &[String]) -> Result<ExitCode> {
     // `handle_builtin()` answers a lone `-h` before any repository setup.
     // `dispatch::run` strips the `fmt-merge-msg` verb, so `args` is git's
     // `argv[1..]` and the lone `-h` is the whole of it.
-    if args.len() == 1 && args[0] == "-h" {
-        print!("{USAGE}");
-        return Ok(ExitCode::from(129));
+    // `run_builtin()` (git.c) computes `help = argc == 2 && (!strcmp(argv[1],
+    // "-h") || !strcmp(argv[1], "--help-all"))` and demotes `RUN_SETUP` to
+    // `RUN_SETUP_GENTLY` for it, so both spellings answer outside a repository —
+    // but only as the sole argument. `--quiet --help-all` still needs one.
+    if args.len() == 1 {
+        match args[0].as_str() {
+            "-h" => {
+                print!("{USAGE}");
+                return Ok(ExitCode::from(129));
+            }
+            "--help-all" => {
+                print!("{USAGE_ALL}");
+                return Ok(ExitCode::from(129));
+            }
+            _ => {}
+        }
     }
     // Everything else needs the repository first: `git_config()` runs before
     // `parse_options()`, so a bad flag outside a repository still reports the
@@ -182,6 +212,14 @@ pub fn fmt_merge_msg(args: &[String]) -> Result<ExitCode> {
         match a {
             "-h" => {
                 print!("{USAGE}");
+                return Ok(ExitCode::from(129));
+            }
+            // `if (internal_help && !strcmp(arg + 2, "help-all"))`
+            // (parse-options.c:1122), an exact match tested ahead of
+            // parse_long_opt(): never an abbreviation, never with an
+            // `=<value>`, and rendered as `USAGE_FULL`.
+            "--help-all" => {
+                print!("{USAGE_ALL}");
                 return Ok(ExitCode::from(129));
             }
             "--log" | "--summary" => shortlog_len = DEFAULT_MERGE_LOG_LEN,

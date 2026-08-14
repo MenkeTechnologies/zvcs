@@ -7,7 +7,7 @@ use gix::objs::tree::EntryKind;
 use gix::objs::{Kind, TreeRefIter};
 
 /// The usage block up to and including the `--use-mailmap` line.
-const USAGE_HEAD: &str = "\
+pub(super) const USAGE_HEAD: &str = "\
 usage: git cat-file <type> <object>
    or: git cat-file (-e | -p | -t | -s) <object>
    or: git cat-file (--textconv | --filters)
@@ -25,6 +25,30 @@ Emit [broken] object attributes
     -s                    show object size
     --[no-]use-mailmap    use mail map file
 ";
+
+/// [`USAGE_HEAD`] as `usage_with_options_internal()` renders it for
+/// `USAGE_FULL`: the hidden `--allow-unknown-type` is left in. Captured
+/// byte-for-byte from stock git 2.55.0's `git cat-file --help-all`, cut at the
+/// same `--mailmap` line [`USAGE_HEAD`] is cut at.
+pub(super) const USAGE_HEAD_ALL: &str = r#"usage: git cat-file <type> <object>
+   or: git cat-file (-e | -p | -t | -s) <object>
+   or: git cat-file (--textconv | --filters)
+                    [<rev>:<path|tree-ish> | --path=<path|tree-ish> <rev>]
+   or: git cat-file (--batch | --batch-check | --batch-command) [--batch-all-objects]
+                    [--buffer] [--follow-symlinks] [--unordered]
+                    [--textconv | --filters] [-Z]
+
+Check object existence or emit object contents
+    -e                    check if <object> exists
+    -p                    pretty-print <object> content
+
+Emit [broken] object attributes
+    -t                    show object type (one of 'blob', 'tree', 'commit', 'tag', ...)
+    -s                    show object size
+    --[no-]allow-unknown-type
+                          historical option -- no-op
+    --[no-]use-mailmap    use mail map file
+"#;
 
 /// `--mailmap` renders differently depending on **which option table** the block
 /// was rendered from, not on which stream it went to.
@@ -46,7 +70,7 @@ const ALIAS_HELP: &str = "    --[no-]mailmap        alias of --use-mailmap\n";
 const ALIAS_ERROR: &str = "    --[no-]mailmap ...    alias of --use-mailmap\n";
 
 /// Everything after the `--mailmap` line.
-const USAGE_TAIL: &str = "
+pub(super) const USAGE_TAIL: &str = "
 Batch objects requested on stdin (or --batch-all-objects)
     --batch[=<format>]    show full <object> or <rev> contents
     --batch-check[=<format>]
@@ -70,8 +94,42 @@ Emit object (blob or tree) with conversion or filter (stand-alone, or with batch
 
 ";
 
+/// [`USAGE_TAIL`] for `USAGE_FULL`: the hidden `-z` is left in. Same capture,
+/// same cut.
+pub(super) const USAGE_TAIL_ALL: &str = r#"
+Batch objects requested on stdin (or --batch-all-objects)
+    --batch[=<format>]    show full <object> or <rev> contents
+    --batch-check[=<format>]
+                          like --batch, but don't emit <contents>
+    -z                    stdin is NUL-terminated
+    -Z                    stdin and stdout is NUL-terminated
+    --batch-command[=<format>]
+                          read commands from stdin
+    --batch-all-objects   with --batch[-check]: ignores stdin, batches all known objects
+
+Change or optimize batch output
+    --[no-]buffer         buffer --batch output
+    --[no-]follow-symlinks
+                          follow in-tree symlinks
+    --[no-]unordered      do not order objects before emitting them
+
+Emit object (blob or tree) with conversion or filter (stand-alone, or with batch)
+    --textconv            run textconv on object's content
+    --filters             run filters on object's content
+    --[no-]path blob|tree use a <path> for (--textconv | --filters); Not with 'batch'
+    --[no-]filter <args>  object filtering
+
+"#;
+
 fn usage(alias: &str) -> String {
     format!("{USAGE_HEAD}{alias}{USAGE_TAIL}")
+}
+
+/// [`usage`] over the `USAGE_FULL` halves, for `--help-all`. The alias line is
+/// still chosen by the caller: which spelling it gets depends on the option
+/// table the block was rendered from, not on which block it is.
+fn usage_all(alias: &str) -> String {
+    format!("{USAGE_HEAD_ALL}{alias}{USAGE_TAIL_ALL}")
 }
 
 /// `cmd_cat_file()`'s `struct option options[]` (builtin/cat-file.c:1095-1130),
@@ -269,6 +327,18 @@ pub fn cat_file(args: &[String]) -> Result<ExitCode> {
         if arg == "--" {
             end_of_options = true;
             continue;
+        }
+
+        // `if (internal_help && !strcmp(arg + 2, "help-all"))`
+        // (parse-options.c:1122): tested on the token as typed, after the `--`
+        // break above and ahead of the abbreviation resolver, because it is a
+        // `strcmp` — `--help-a` and `--help-all=x` stay unknown options. It
+        // renders `USAGE_FULL`, which keeps the hidden `--allow-unknown-type`
+        // and `-z`; the `--mailmap` line is still the in-`parse_options()`
+        // spelling, because this block is rendered from inside it.
+        if arg == "--help-all" {
+            print!("{}", usage_all(ALIAS_HELP));
+            return Ok(ExitCode::from(129));
         }
 
         let raw = arg;

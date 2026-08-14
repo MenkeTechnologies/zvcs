@@ -131,6 +131,37 @@ usage: git revert [--[no-]edit] [-n] [-m <parent-number>] [-s] [-S[<keyid>]] <co
 
 ";
 
+/// `usage_with_options_internal()`'s `USAGE_FULL` rendering — what `--help-all`
+/// prints. It is [`USAGE`] with the `PARSE_OPT_HIDDEN` entries left in:
+/// `-r`.
+/// Captured byte-for-byte from stock git 2.55.0's `git revert --help-all`.
+const USAGE_ALL: &str = r#"usage: git revert [--[no-]edit] [-n] [-m <parent-number>] [-s] [-S[<keyid>]] <commit>...
+   or: git revert (--continue | --skip | --abort | --quit)
+
+    --quit                end revert or cherry-pick sequence
+    --continue            resume revert or cherry-pick sequence
+    --abort               cancel revert or cherry-pick sequence
+    --skip                skip current commit and continue
+    --[no-]cleanup <mode> how to strip spaces and #comments from message
+    -n, --no-commit       don't automatically commit
+    --commit              opposite of --no-commit
+    -e, --[no-]edit       edit the commit message
+    -r                    no-op (backward compatibility)
+    -s, --[no-]signoff    add a Signed-off-by trailer
+    -m, --[no-]mainline <parent-number>
+                          select mainline parent
+    --[no-]rerere-autoupdate
+                          update the index with reused conflict resolution if possible
+    --[no-]strategy <strategy>
+                          merge strategy
+    -X, --[no-]strategy-option <option>
+                          option for merge strategy
+    -S, --[no-]gpg-sign[=<key-id>]
+                          GPG sign commit
+    --[no-]reference      use the 'reference' format to refer to commits
+
+"#;
+
 /// The title git puts on a `--reference` revert, left for the user to replace.
 const REFERENCE_TITLE: &str = "# *** SAY WHY WE ARE REVERTING ON THE TITLE LINE ***";
 
@@ -253,6 +284,10 @@ pub fn revert(args: &[String]) -> Result<ExitCode> {
             // parse_options_step() answers `-h` where it meets it, on stdout at
             // 129 — `usage_error()`'s stderr is for rejections only.
             "-h" => return Ok(super::show_usage(USAGE)),
+            // `if (internal_help && !strcmp(arg + 2, "help-all"))`
+            // (parse-options.c:1122): an exact match, never an abbreviation and
+            // never with an `=<value>`, rendering `USAGE_FULL`.
+            "--help-all" => return Ok(super::show_usage(USAGE_ALL)),
             "-n" | "--no-commit" => o.no_commit = true,
             "--commit" => o.no_commit = false,
             "-s" | "--signoff" => o.signoff = true,

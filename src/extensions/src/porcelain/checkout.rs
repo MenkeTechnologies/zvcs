@@ -141,6 +141,48 @@ const USAGE: &str = r"usage: git checkout [<options>] <branch>
 
 ";
 
+/// `cmd_checkout`'s option table, which git builds by concatenating four:
+/// `checkout_options[]` (builtin/checkout.c:2096-2108), then
+/// `add_common_options()` (:1767-1778), `add_common_switch_branch_options()`
+/// (:1787-1802) and `add_checkout_path_options()` (:1811-1826). The order is the
+/// order the usage block above lists them in, and it decides which two names an
+/// `ambiguous option:` sentence reports.
+///
+/// `-b`, `-B` and `-l` are `OPT_STRING`/`OPT_BOOL` with a NULL `long_name`, so
+/// `parse_long_opt()` skips them (parse-options.c:544-545) and they are absent
+/// here. The five `PARSE_OPT_NONEG` entries are the two writeout-stage selectors
+/// and the two diff-context integers.
+pub(super) const LONG_OPTS: &[super::LongOpt] = {
+    use super::{Arg, LongOpt};
+    &[
+        LongOpt { name: "guess", neg: true, arg: Arg::None },
+        LongOpt { name: "overlay", neg: true, arg: Arg::None },
+        LongOpt { name: "auto-advance", neg: true, arg: Arg::None },
+        LongOpt { name: "quiet", neg: true, arg: Arg::None },
+        LongOpt { name: "recurse-submodules", neg: true, arg: Arg::Optional },
+        LongOpt { name: "progress", neg: true, arg: Arg::None },
+        LongOpt { name: "merge", neg: true, arg: Arg::None },
+        LongOpt { name: "conflict", neg: true, arg: Arg::Required },
+        LongOpt { name: "detach", neg: true, arg: Arg::None },
+        LongOpt { name: "track", neg: true, arg: Arg::Optional },
+        LongOpt { name: "force", neg: true, arg: Arg::None },
+        LongOpt { name: "orphan", neg: true, arg: Arg::Required },
+        LongOpt { name: "overwrite-ignore", neg: true, arg: Arg::None },
+        LongOpt { name: "ignore-other-worktrees", neg: true, arg: Arg::None },
+        // `OPT_SET_INT_F(..., PARSE_OPT_NONEG)`.
+        LongOpt { name: "ours", neg: false, arg: Arg::None },
+        LongOpt { name: "theirs", neg: false, arg: Arg::None },
+        LongOpt { name: "patch", neg: true, arg: Arg::None },
+        // `OPT_DIFF_UNIFIED` / `OPT_DIFF_INTERHUNK_CONTEXT` are
+        // `OPT_INTEGER_F(..., PARSE_OPT_NONEG)` (parse-options.h:627-628).
+        LongOpt { name: "unified", neg: false, arg: Arg::Required },
+        LongOpt { name: "inter-hunk-context", neg: false, arg: Arg::Required },
+        LongOpt { name: "ignore-skip-worktree-bits", neg: true, arg: Arg::None },
+        LongOpt { name: "pathspec-from-file", neg: true, arg: Arg::Required },
+        LongOpt { name: "pathspec-file-nul", neg: true, arg: Arg::None },
+    ]
+};
+
 pub fn checkout(args: &[String]) -> Result<ExitCode> {
     // Every ref this moves carries a reflog line, and git writes those with an
     // identity it synthesizes from the OS when `user.*` is unset — only a
@@ -197,7 +239,24 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
 
     let mut i = 0;
     while i < args.len() {
-        let a = args[i].as_str();
+        let orig = args[i].as_str();
+        // Respell the token the way `parse_long_opt()` reads it, so any
+        // unambiguous prefix lands on the arm its full spelling lands on. Two
+        // positions are exempt because parse-options never looks them up: the
+        // argument owed to a `-U`/`--unified`/`--inter-hunk-context`, and
+        // everything past `--`.
+        let resolved;
+        let a: &str = if patch_opts.awaiting_value() || has_dashdash {
+            orig
+        } else {
+            resolved = match super::canonical_long(orig, LONG_OPTS) {
+                super::Long::Name(name) => name,
+                super::Long::Ambiguous(first, second) => {
+                    return Ok(super::ambiguous_option(orig, &first, &second, USAGE))
+                }
+            };
+            resolved.as_ref()
+        };
         // A `-U`/`--unified`/`--inter-hunk-context` value still owed is taken
         // verbatim even past `--`, the way parse-options takes it; outside that,
         // these options are only recognised before `--`.
@@ -212,7 +271,7 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
             }
         }
         if has_dashdash {
-            post.push(a);
+            post.push(orig);
             i += 1;
             continue;
         }
@@ -275,7 +334,9 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
             "--" => has_dashdash = true,
             // parse_options_step()'s `internal_help`: the block on stdout at
             // 129, with no `error:` line — a help request is not a rejection.
-            "-h" => return Ok(super::show_usage(USAGE)),
+            // `--help-all` reaches the same renderer with USAGE_FULL, which this
+            // table renders identically: it has no `PARSE_OPT_HIDDEN` entry.
+            "-h" | "--help-all" => return Ok(super::show_usage(USAGE)),
             "-b" | "-B" => {
                 let name = args
                     .get(i + 1)
@@ -324,6 +385,12 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
             "--overlay" => overlay = true,
             "--no-overlay" => overlay = false,
             "--pathspec-file-nul" => pathspec_file_nul = true,
+            // The unset sense of the three value-carrying entries: git NULLs the
+            // `OPT_STRING`/`OPT_FILENAME` pointer and clears the `OPT_BOOL`, so
+            // each is "as if never given".
+            "--no-orphan" => orphan = None,
+            "--no-pathspec-from-file" => pathspec_from_file = None,
+            "--no-pathspec-file-nul" => pathspec_file_nul = false,
             // Accepted no-ops: progress is discarded, ignored-file overwrite is the
             // default, and the other-worktree / skip-worktree checks git guards
             // against are not enforced here, so toggling them changes nothing.
@@ -338,8 +405,13 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
             // `--recurse-submodules=<pathspec>` limits which submodules move; this
             // port recurses into all active ones rather than honoring the pathspec.
             _ if a.starts_with("--recurse-submodules=") => recurse_submodules = Some(true),
-            _ if a.starts_with('-') && a.len() > 1 => bail!("unsupported flag {a:?}"),
-            _ => pre.push(a),
+            // Every name the table carries is dispatched above, so anything left
+            // with a dash is unknown to stock git too and gets git's own
+            // refusal — the `error:` line and the usage block on stderr, at 129.
+            _ if a.starts_with('-') && a.len() > 1 => {
+                return Ok(super::unknown_option(a, USAGE))
+            }
+            _ => pre.push(orig),
         }
         i += 1;
     }

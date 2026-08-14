@@ -161,6 +161,15 @@ fn parse_options(args: &[String]) -> Result<Option<String>, ParseFailure> {
             no_more_opts = true;
             continue;
         }
+        // `parse_options_step()` tests `--help-all` with a `strcmp()` of its own,
+        // ahead of `parse_long_opt()`: the name never abbreviates and never takes
+        // an `=<value>`. This table has no `PARSE_OPT_HIDDEN` entry, so
+        // `USAGE_FULL` renders the same block `-h` prints. It is not the `argc ==
+        // 2 && !strcmp(argv[1], "-h")` spelling `git.c` looks for, so unlike `-h`
+        // it does not skip `setup_git_directory()`.
+        if a == "--help-all" {
+            return Err(ParseFailure::Help);
+        }
         if let Some(long) = a.strip_prefix("--") {
             // Split `--name=value` so the diagnostics name the option exactly
             // as git does, negation included.
@@ -248,8 +257,7 @@ fn worker_loop() -> Result<ExitCode> {
             Ok(Pkt::Item(len)) => anyhow::bail!(
                 "unsupported: parallel-checkout item packet ({len}B) — its wire format is a raw \
                  C `pc_item_fixed_portion` dump and the reply embeds a raw `struct stat`, and \
-                 writing the entry needs convert.c's pre-resolved `conv_attrs` filters (ported: \
-                 option parsing, packet framing, the flush/EOF loop exits)"
+                 writing the entry needs convert.c's pre-resolved `conv_attrs` filters"
             ),
             Err(code) => return Ok(code),
         }

@@ -162,6 +162,15 @@ pub fn ls_tree(args: &[String]) -> Result<ExitCode> {
             no_more_opts = true;
             continue;
         }
+        // parse_options_step() tests `--help-all` with a `strcmp()` of its own,
+        // ahead of parse_long_opt(): the name never abbreviates and never takes
+        // an `=<value>`, which is why the test sits before `canonical_long`
+        // rather than in `LONG_OPTS`. This table has no `PARSE_OPT_HIDDEN`
+        // entry, so `USAGE_FULL` renders the same block `-h` prints.
+        if !no_more_opts && a == "--help-all" {
+            print!("{USAGE}");
+            return Ok(ExitCode::from(129));
+        }
         if !no_more_opts && a.len() > 1 && a.starts_with('-') {
             let resolved = match super::canonical_long(a, LONG_OPTS) {
                 super::Long::Name(name) => name,

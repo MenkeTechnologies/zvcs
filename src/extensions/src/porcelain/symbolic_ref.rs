@@ -118,7 +118,9 @@ pub fn symbolic_ref(args: &[String]) -> Result<ExitCode> {
             "--" => no_more_opts = true,
             // parse_options_step() answers `-h` on stdout at 129, ahead of
             // `usage_error()`'s stderr path for a rejection.
-            "-h" => return Ok(super::show_usage(USAGE)),
+            // `--help-all` reaches the same renderer with USAGE_FULL, which this
+            // table renders identically: it has no `PARSE_OPT_HIDDEN` entry.
+            "-h" | "--help-all" => return Ok(super::show_usage(USAGE)),
             "-q" | "--quiet" => opts.quiet = true,
             "--no-quiet" => opts.quiet = false,
             "--short" => opts.short = true,

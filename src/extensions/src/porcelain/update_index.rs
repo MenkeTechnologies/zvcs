@@ -418,6 +418,16 @@ fn run(ctx: &mut Ctx, args: &[String]) -> Result<Outcome> {
             continue;
         }
 
+        // parse_options_step() tests `--help-all` with a `strcmp()` of its own,
+        // placed after that `--` break and ahead of parse_long_opt(): the name
+        // never abbreviates and never takes an `=<value>`, which is why it is
+        // absent from [`LONG_OPTS`]. update-index's table has no
+        // `PARSE_OPT_HIDDEN` entry, so `USAGE_FULL` renders the same block `-h`
+        // prints — [`Outcome::Help`] for both.
+        if !end_of_opts && a == "--help-all" {
+            return Ok(Outcome::Help);
+        }
+
         // Short options, including clusters like `-qz`.
         if !end_of_opts && a.len() > 1 && a.starts_with('-') && !a.starts_with("--") {
             let mut swallowed_rest = false;

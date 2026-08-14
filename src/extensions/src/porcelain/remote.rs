@@ -43,15 +43,28 @@ use gix::refs::{FullName, Target};
 pub fn remote(args: &[String]) -> Result<ExitCode> {
     let mut verbose = false;
     let mut idx = 0;
-    while let Some(a) = args.get(idx).map(String::as_str) {
-        match a {
+    while let Some(orig) = args.get(idx).map(String::as_str) {
+        // parse_options_step() tests `--help-all` with a `strcmp()` of its own,
+        // ahead of parse_long_opt(): the name never abbreviates and never takes
+        // an `=<value>`, which is why it is absent from `OPTS_MAIN` and checked
+        // here instead. This table has no `PARSE_OPT_HIDDEN` entry, so
+        // `USAGE_FULL` renders the same block `-h` prints.
+        if orig == "--help-all" {
+            print!("{}", USAGE_MAIN);
+            return Ok(ExitCode::from(129));
+        }
+        let resolved = match canonical(orig, OPTS_MAIN, USAGE_MAIN) {
+            Ok(name) => name,
+            Err(code) => return Ok(code),
+        };
+        match resolved.as_ref() {
             "-v" | "--verbose" => verbose = true,
             "--no-verbose" => verbose = false,
             "-h" | "--help" => {
                 print!("{}", USAGE_MAIN);
                 return Ok(ExitCode::from(129));
             }
-            _ if a.starts_with('-') => {
+            a if a.starts_with('-') => {
                 unknown_option(a);
                 return usage(USAGE_MAIN);
             }
@@ -192,6 +205,86 @@ usage: git remote update [<options>] [<group> | <remote>]...
     -p, --[no-]prune      prune remotes after fetching
 
 ";
+
+// ---------------------------------------------------------------------------
+// option tables — one per `struct option options[]` in builtin/remote.c, so an
+// unambiguous prefix resolves in each sub-command exactly as it does in stock
+// git. `parse_long_opt()` skips `OPTION_SUBCOMMAND` entries (parse-options.c:
+// 542-543) and entries with no `long_name`, which is why the top level lists
+// only `verbose` and `show` lists nothing at all.
+// ---------------------------------------------------------------------------
+
+use super::{Arg, LongOpt};
+
+/// `options[]` at builtin/remote.c:1939-1955: `OPT__VERBOSE` plus eleven
+/// `OPT_SUBCOMMAND`s, none of which is a long option.
+pub(super) const OPTS_MAIN: &[LongOpt] = &[LongOpt { name: "verbose", neg: true, arg: Arg::None }];
+
+/// `add`'s table (builtin/remote.c:189-201).
+pub(super) const OPTS_ADD: &[LongOpt] = &[
+    LongOpt { name: "fetch", neg: true, arg: Arg::None },
+    LongOpt { name: "tags", neg: true, arg: Arg::None },
+    LongOpt { name: "track", neg: true, arg: Arg::Required },
+    LongOpt { name: "master", neg: true, arg: Arg::Required },
+    // `OPT_CALLBACK_F(... PARSE_OPT_OPTARG | PARSE_OPT_COMP_ARG ...)`.
+    LongOpt { name: "mirror", neg: true, arg: Arg::Optional },
+];
+
+/// `rename`'s table (builtin/remote.c:860-862).
+pub(super) const OPTS_RENAME: &[LongOpt] = &[LongOpt { name: "progress", neg: true, arg: Arg::None }];
+
+/// `rm`/`remove`'s table (builtin/remote.c:1009-1011) is `OPT_END()` alone, so
+/// no long option resolves and every `--x` is unknown.
+const OPTS_REMOVE: &[LongOpt] = &[];
+
+/// `show`'s table (builtin/remote.c:1425-1428) is a single
+/// `OPT_BOOL('n', NULL, ...)`: a short-only entry, skipped by the long-option
+/// resolver, so `git remote show --n` is unknown just like `--anything`.
+const OPTS_SHOW: &[LongOpt] = &[];
+
+/// `set-head`'s table (builtin/remote.c:1555-1560).
+pub(super) const OPTS_SET_HEAD: &[LongOpt] = &[
+    LongOpt { name: "auto", neg: true, arg: Arg::None },
+    LongOpt { name: "delete", neg: true, arg: Arg::None },
+];
+
+/// `prune`'s table (builtin/remote.c:1673-1676): `OPT__DRY_RUN`, i.e.
+/// `OPT_BOOL('n', "dry-run", ...)`.
+pub(super) const OPTS_PRUNE: &[LongOpt] = &[LongOpt { name: "dry-run", neg: true, arg: Arg::None }];
+
+/// `update`'s table (builtin/remote.c:1705-1708).
+pub(super) const OPTS_UPDATE: &[LongOpt] = &[LongOpt { name: "prune", neg: true, arg: Arg::None }];
+
+/// `set-branches`' table (builtin/remote.c:1788-1791).
+pub(super) const OPTS_SET_BRANCHES: &[LongOpt] = &[LongOpt { name: "add", neg: true, arg: Arg::None }];
+
+/// `get-url`'s table (builtin/remote.c:1811-1816).
+pub(super) const OPTS_GET_URL: &[LongOpt] = &[
+    LongOpt { name: "push", neg: true, arg: Arg::None },
+    LongOpt { name: "all", neg: true, arg: Arg::None },
+];
+
+/// `set-url`'s table (builtin/remote.c:1856-1863).
+pub(super) const OPTS_SET_URL: &[LongOpt] = &[
+    LongOpt { name: "push", neg: true, arg: Arg::None },
+    LongOpt { name: "add", neg: true, arg: Arg::None },
+    LongOpt { name: "delete", neg: true, arg: Arg::None },
+];
+
+/// Respell one argument the way `parse_long_opt()` reads it, or hand back the
+/// ambiguity refusal already rendered.
+fn canonical<'a>(
+    tok: &'a str,
+    table: &'static [LongOpt],
+    usage_text: &str,
+) -> std::result::Result<std::borrow::Cow<'a, str>, ExitCode> {
+    match super::canonical_long(tok, table) {
+        super::Long::Name(name) => Ok(name),
+        super::Long::Ambiguous(first, second) => {
+            Err(super::ambiguous_option(tok, &first, &second, usage_text))
+        }
+    }
+}
 
 /// Print a usage block and return git's usage exit code.
 fn usage(text: &str) -> Result<ExitCode> {
@@ -461,8 +554,13 @@ fn add(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
     let mut pos: Vec<&str> = Vec::new();
 
     let mut i = 0;
-    while let Some(a) = args.get(i).map(String::as_str) {
+    while let Some(orig) = args.get(i).map(String::as_str) {
         i += 1;
+        let resolved = match canonical(orig, OPTS_ADD, USAGE_ADD) {
+            Ok(name) => name,
+            Err(code) => return Ok(code),
+        };
+        let a = resolved.as_ref();
         match a {
             "-f" | "--fetch" => do_fetch = true,
             "--no-fetch" => do_fetch = false,
@@ -506,7 +604,7 @@ fn add(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
                 unknown_option(a);
                 return usage(USAGE_ADD);
             }
-            _ => pos.push(a),
+            _ => pos.push(orig),
         }
     }
 
@@ -597,14 +695,18 @@ fn add(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
 /// and the refspecs untouched, exactly as git leaves it.
 fn rename(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
     let mut pos: Vec<&str> = Vec::new();
-    for a in args {
-        match a.as_str() {
+    for orig in args {
+        let resolved = match canonical(orig, OPTS_RENAME, USAGE_RENAME) {
+            Ok(name) => name,
+            Err(code) => return Ok(code),
+        };
+        match resolved.as_ref() {
             "--progress" | "--no-progress" => {}
             s if s.starts_with('-') && s.len() > 1 => {
                 unknown_option(s);
                 return usage(USAGE_RENAME);
             }
-            s => pos.push(s),
+            _ => pos.push(orig.as_str()),
         }
     }
     if pos.len() != 2 {
@@ -758,6 +860,12 @@ fn rename(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
 fn remove(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
     let mut pos: Vec<&str> = Vec::new();
     for a in args {
+        // The table is `OPT_END()` alone, so nothing resolves and the walk below
+        // rejects every dashed word; the call is here so the option surface is
+        // derived from the C table rather than assumed.
+        if let Err(code) = canonical(a, OPTS_REMOVE, USAGE_REMOVE) {
+            return Ok(code);
+        }
         if a.starts_with('-') && a.len() > 1 {
             unknown_option(a);
             return usage(USAGE_REMOVE);
@@ -844,15 +952,21 @@ fn set_head(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
     let mut auto = false;
     let mut delete = false;
     let mut pos: Vec<&str> = Vec::new();
-    for a in args {
-        match a.as_str() {
+    for orig in args {
+        let resolved = match canonical(orig, OPTS_SET_HEAD, USAGE_SET_HEAD) {
+            Ok(name) => name,
+            Err(code) => return Ok(code),
+        };
+        match resolved.as_ref() {
             "-a" | "--auto" => auto = true,
+            "--no-auto" => auto = false,
             "-d" | "--delete" => delete = true,
+            "--no-delete" => delete = false,
             s if s.starts_with('-') && s.len() > 1 => {
                 unknown_option(s);
                 return usage(USAGE_SET_HEAD);
             }
-            s => pos.push(s),
+            _ => pos.push(orig.as_str()),
         }
     }
     if pos.is_empty() || (!auto && !delete && pos.len() != 2) {
@@ -934,15 +1048,19 @@ fn set_head(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
 fn set_branches(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
     let mut append = false;
     let mut pos: Vec<&str> = Vec::new();
-    for a in args {
-        match a.as_str() {
+    for orig in args {
+        let resolved = match canonical(orig, OPTS_SET_BRANCHES, USAGE_SET_BRANCHES) {
+            Ok(name) => name,
+            Err(code) => return Ok(code),
+        };
+        match resolved.as_ref() {
             "--add" => append = true,
             "--no-add" => append = false,
             s if s.starts_with('-') && s.len() > 1 => {
                 unknown_option(s);
                 return usage(USAGE_SET_BRANCHES);
             }
-            s => pos.push(s),
+            _ => pos.push(orig.as_str()),
         }
     }
     let Some(name) = pos.first().copied() else {
@@ -980,7 +1098,11 @@ fn get_url(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
     let mut all = false;
     let mut pos: Vec<&str> = Vec::new();
     for a in args {
-        match a.as_str() {
+        let resolved = match canonical(a, OPTS_GET_URL, USAGE_GET_URL) {
+            Ok(name) => name,
+            Err(code) => return Ok(code),
+        };
+        match resolved.as_ref() {
             "--push" => push = true,
             "--no-push" => push = false,
             "--all" => all = true,
@@ -989,7 +1111,7 @@ fn get_url(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
                 unknown_option(s);
                 return usage(USAGE_GET_URL);
             }
-            s => pos.push(s),
+            _ => pos.push(a.as_str()),
         }
     }
     if pos.len() != 1 {
@@ -1021,7 +1143,11 @@ fn set_url(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
     let mut delete = false;
     let mut pos: Vec<&str> = Vec::new();
     for a in args {
-        match a.as_str() {
+        let resolved = match canonical(a, OPTS_SET_URL, USAGE_SET_URL) {
+            Ok(name) => name,
+            Err(code) => return Ok(code),
+        };
+        match resolved.as_ref() {
             "--push" => push = true,
             "--no-push" => push = false,
             "--add" => append = true,
@@ -1032,7 +1158,7 @@ fn set_url(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
                 unknown_option(s);
                 return usage(USAGE_SET_URL);
             }
-            s => pos.push(s),
+            _ => pos.push(a.as_str()),
         }
     }
     if append && delete {
@@ -1141,13 +1267,21 @@ fn show(repo: &gix::Repository, args: &[String], verbose: bool) -> Result<ExitCo
     let mut no_query = false;
     let mut names: Vec<&str> = Vec::new();
     for a in args {
-        match a.as_str() {
-            "-n" | "--no-query" => no_query = true,
+        // `show`'s only option is `OPT_BOOL('n', NULL, ...)` — short-only, so
+        // there is no long spelling at all and `--no-query` is as unknown to
+        // stock git as any other `--x` (verified against 2.55.0:
+        // ``error: unknown option `no-query'``, exit 129).
+        let resolved = match canonical(a, OPTS_SHOW, USAGE_SHOW) {
+            Ok(name) => name,
+            Err(code) => return Ok(code),
+        };
+        match resolved.as_ref() {
+            "-n" => no_query = true,
             s if s.starts_with('-') && s.len() > 1 => {
                 unknown_option(s);
                 return usage(USAGE_SHOW);
             }
-            s => names.push(s),
+            _ => names.push(a.as_str()),
         }
     }
     if names.is_empty() {
@@ -1698,13 +1832,18 @@ fn prune(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
     let mut dry_run = false;
     let mut pos: Vec<&str> = Vec::new();
     for a in args {
-        match a.as_str() {
+        let resolved = match canonical(a, OPTS_PRUNE, USAGE_PRUNE) {
+            Ok(name) => name,
+            Err(code) => return Ok(code),
+        };
+        match resolved.as_ref() {
             "-n" | "--dry-run" => dry_run = true,
+            "--no-dry-run" => dry_run = false,
             s if s.starts_with('-') && s.len() > 1 => {
                 unknown_option(s);
                 return usage(USAGE_PRUNE);
             }
-            s => pos.push(s),
+            _ => pos.push(a.as_str()),
         }
     }
     if pos.len() != 1 {
@@ -1945,14 +2084,18 @@ fn update(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
     let mut do_prune = false;
     let mut pos: Vec<&str> = Vec::new();
     for a in args {
-        match a.as_str() {
+        let resolved = match canonical(a, OPTS_UPDATE, USAGE_UPDATE) {
+            Ok(name) => name,
+            Err(code) => return Ok(code),
+        };
+        match resolved.as_ref() {
             "-p" | "--prune" => do_prune = true,
             "--no-prune" => do_prune = false,
             s if s.starts_with('-') && s.len() > 1 => {
                 unknown_option(s);
                 return usage(USAGE_UPDATE);
             }
-            s => pos.push(s),
+            _ => pos.push(a.as_str()),
         }
     }
 

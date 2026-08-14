@@ -82,6 +82,17 @@ pub fn verify_commit(args: &[String]) -> Result<ExitCode> {
             continue;
         }
 
+        // parse_options_step() tests `--help-all` with a `strcmp()` of its own,
+        // ahead of parse_long_opt(): the name never abbreviates and never takes
+        // an `=<value>`, which is why it is absent from [`LONG_OPTS`] and
+        // matched here rather than after resolution. verify-commit's table has
+        // no `PARSE_OPT_HIDDEN` entry, so `USAGE_FULL` renders the same block
+        // `-h` prints.
+        if a == "--help-all" {
+            print!("{USAGE}");
+            return Ok(ExitCode::from(129));
+        }
+
         // Respell a unique abbreviation as the name it resolves to, so an
         // abbreviation lands on the arm its full spelling lands on.
         let canonical;

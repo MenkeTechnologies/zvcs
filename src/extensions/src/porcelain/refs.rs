@@ -152,7 +152,12 @@ pub fn refs(args: &[String]) -> Result<ExitCode> {
     };
 
     match sub.as_str() {
-        "-h" => {
+        // `parse_options_step()` answers `--help-all` with a `strcmp()` of its
+        // own, ahead of `parse_long_opt()`, so the name never abbreviates and
+        // never takes an `=<value>` — `--help-a` and `--help-all=x` stay
+        // unknown options below. It renders `USAGE_FULL`, which is this same
+        // block: the table has no `PARSE_OPT_HIDDEN` entry to reveal.
+        "-h" | "--help-all" => {
             print!("{USAGE}");
             Ok(ExitCode::from(129))
         }
@@ -199,7 +204,11 @@ fn exists(args: &[String]) -> Result<ExitCode> {
             continue;
         }
         if !end_of_opts && a.len() > 1 && a.starts_with('-') {
-            if a == "-h" {
+            // `--help-all` is a `strcmp()` inside `parse_options_step()`'s own
+            // loop, ahead of `parse_long_opt()`: never abbreviated, never
+            // `=<value>`, and never seen past the `--` handled above. Its
+            // `USAGE_FULL` is this block — the table has no hidden entry.
+            if a == "-h" || a == "--help-all" {
                 print!("{USAGE_EXISTS}");
                 return Ok(ExitCode::from(129));
             }
@@ -290,7 +299,11 @@ fn verify(args: &[String]) -> Result<ExitCode> {
 
     for a in args {
         match a.as_str() {
-            "-h" => {
+            // `--help-all`'s own `strcmp()` in `parse_options_step()` runs
+            // before `parse_long_opt()`, so it never abbreviates and never
+            // takes a value; `USAGE_FULL` equals this block because the table
+            // has no `PARSE_OPT_HIDDEN` entry.
+            "-h" | "--help-all" => {
                 print!("{USAGE_VERIFY}");
                 return Ok(ExitCode::from(129));
             }
@@ -367,7 +380,11 @@ fn migrate(args: &[String]) -> Result<ExitCode> {
             continue;
         }
         match a {
-            "-h" => {
+            // Same `strcmp()` in `parse_options_step()`, ahead of
+            // `parse_long_opt()` and after the `--` break above: exact name
+            // only, and `USAGE_FULL` is this block, there being no hidden
+            // entry in the table.
+            "-h" | "--help-all" => {
                 print!("{USAGE_MIGRATE}");
                 return Ok(ExitCode::from(129));
             }
@@ -452,7 +469,11 @@ fn list(args: &[String]) -> Result<ExitCode> {
         if !end_of_opts {
             if a == "--" {
                 end_of_opts = true;
-            } else if a == "-h" {
+            // `--help-all` reaches `usage_with_options_internal()` through its
+            // own `strcmp()` in `parse_options_step()`, before any long-option
+            // resolution, so no prefix of it and no `=<value>` form counts. The
+            // block is the same one `-h` prints: no hidden entry to add.
+            } else if a == "-h" || a == "--help-all" {
                 print!("{USAGE_LIST}");
                 return Ok(ExitCode::from(129));
             } else if a == "-s" {
@@ -472,6 +493,14 @@ fn list(args: &[String]) -> Result<ExitCode> {
 /// as it skips its own subcommand name. Only `-h` is intercepted, so that the
 /// usage block names `git refs optimize` rather than `git pack-refs`.
 fn optimize(args: &[String]) -> Result<ExitCode> {
+    // `--help-all` is `parse_options_step()`'s own `strcmp()`, placed after the
+    // `--` break and before `parse_long_opt()`: the exact name only (no prefix,
+    // no `=<value>`) and never past a `--`, which is why this scan stops there.
+    // `USAGE_FULL` is the same block, pack-refs' table having no hidden entry.
+    if args[1..].iter().take_while(|a| a.as_str() != "--").any(|a| a == "--help-all") {
+        print!("{USAGE_OPTIMIZE}");
+        return Ok(ExitCode::from(129));
+    }
     if args[1..].iter().any(|a| a == "-h") {
         print!("{USAGE_OPTIMIZE}");
         return Ok(ExitCode::from(129));

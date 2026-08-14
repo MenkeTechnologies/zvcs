@@ -237,6 +237,14 @@ fn scan(args: &[String]) -> Scan {
             opts.positional |= it.next().is_some();
             break;
         }
+        // parse_options_step() tests `--help-all` with a `strcmp()` of its own,
+        // ahead of parse_long_opt(): the name never abbreviates and never takes
+        // an `=<value>`, and it is not reached past `--`. This table has no
+        // `PARSE_OPT_HIDDEN` entry, so `USAGE_FULL` renders the same block `-h`
+        // prints.
+        if arg == "--help-all" {
+            return Scan::Help;
+        }
 
         if let Some(body) = arg.strip_prefix("--") {
             let (spelled, value) = match body.split_once('=') {

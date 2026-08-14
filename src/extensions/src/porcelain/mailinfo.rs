@@ -55,6 +55,24 @@ const USAGE: &str = "usage: git mailinfo [<options>] <msg> <patch> < mail >info
 
 ";
 
+/// `usage_with_options_internal()`'s `USAGE_FULL` rendering — what `--help-all`
+/// prints. It is [`USAGE`] with the `PARSE_OPT_HIDDEN` entries left in:
+/// `--[no-]inbody-headers`.
+/// Captured byte-for-byte from stock git 2.55.0's `git mailinfo --help-all`.
+const USAGE_ALL: &str = r#"usage: git mailinfo [<options>] <msg> <patch> < mail >info
+
+    -k                    keep subject
+    -b                    keep non patch brackets in subject
+    -m, --[no-]message-id copy Message-ID to the end of commit message
+    -u                    re-code metadata to i18n.commitEncoding
+    -n                    disable charset re-coding of metadata
+    --encoding <encoding> re-code metadata to this encoding
+    --[no-]scissors       use scissors
+    --quoted-cr <action>  action when quoted CR is found
+    --[no-]inbody-headers use headers in message's body
+
+"#;
+
 /// `enum quoted_cr_action`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum QuotedCr {
@@ -255,6 +273,17 @@ fn parse_options(
             no_more_opts = true;
             i += 1;
             continue;
+        }
+
+        // `if (internal_help && !strcmp(arg + 2, "help-all"))`
+        // (parse-options.c:1122): an exact match, tested after the `--` break
+        // above and before any table lookup, so it neither abbreviates nor
+        // takes an `=<value>`. It renders `USAGE_FULL`, which for `mailinfo` is
+        // `USAGE` plus the hidden `--inbody-headers`.
+        if arg == "--help-all" {
+            print!("{USAGE_ALL}");
+            let _ = std::io::stdout().flush();
+            return Ok(Err(ExitCode::from(129)));
         }
 
         if let Some(body) = arg.strip_prefix("--") {

@@ -138,6 +138,16 @@ pub fn submodule__helper(args: &[String]) -> Result<ExitCode> {
         if a == "--" || a == "--end-of-options" {
             break;
         }
+        // parse_options_step() tests `--help-all` with a `strcmp()` of its own,
+        // placed after those two breaks and ahead of parse_long_opt(): the name
+        // never abbreviates and never takes an `=<value>`, so `--help-a` and
+        // `--help-all=x` still reach the unknown-option refusal below. The
+        // builtin's table holds nothing but `OPT_SUBCOMMAND` entries — no
+        // `PARSE_OPT_HIDDEN` one — so `USAGE_FULL` is the block `-h` prints.
+        if a == "--help-all" {
+            print!("{USAGE}");
+            return Ok(ExitCode::from(129));
+        }
         if let Some(name) = a.strip_prefix("--") {
             eprintln!("error: unknown option `{name}'");
             eprint!("{USAGE}");
@@ -200,16 +210,16 @@ pub fn submodule__helper(args: &[String]) -> Result<ExitCode> {
         // the wrapper's is the `git-submodule.sh` usage block (exit 1).
         "add" => add(tail),
         "clone" => anyhow::bail!(
-            "unsupported subcommand \"clone\": cloning a submodule needs transport plus worktree checkout (ported: gitdir, get-default-remote, status, init, foreach, summary, sync, update, deinit, absorbgitdirs, set-branch, set-url, add)"
+            "unsupported subcommand \"clone\": cloning a submodule needs transport plus worktree checkout"
         ),
         "push-check" => anyhow::bail!(
-            "unsupported subcommand \"push-check\": needs the remote/refspec machinery (ported: gitdir, get-default-remote, status, init, foreach, summary, sync, update, deinit, absorbgitdirs, set-branch, set-url, add)"
+            "unsupported subcommand \"push-check\": needs the remote/refspec machinery"
         ),
         "create-branch" => anyhow::bail!(
-            "unsupported subcommand \"create-branch\": creates a branch inside a submodule (ported: gitdir, get-default-remote, status, init, foreach, summary, sync, update, deinit, absorbgitdirs, set-branch, set-url, add)"
+            "unsupported subcommand \"create-branch\": creates a branch inside a submodule"
         ),
         "migrate-gitdir-configs" => bail!(
-            "unsupported subcommand \"migrate-gitdir-configs\": the extensions.submodulePathConfig migration is not ported (ported: gitdir, get-default-remote, status, init, foreach, summary, sync, update, deinit, absorbgitdirs, set-branch, set-url, add)"
+            "unsupported subcommand \"migrate-gitdir-configs\": the extensions.submodulePathConfig migration is not ported"
         ),
         other => {
             eprintln!("error: unknown subcommand: `{other}'");

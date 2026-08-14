@@ -32,6 +32,30 @@ pub(super) const USAGE: &str = r"usage: git log [<options>] [<revision-range>] [
 
 ";
 
+/// `usage_with_options_internal()`'s `USAGE_FULL` rendering — what `--help-all`
+/// prints. `git show` and `git whatchanged` are the same builtin and print it
+/// too. It is [`USAGE`] with the `PARSE_OPT_HIDDEN` entries left in:
+/// `--[no-]i-still-use-this`.
+/// Captured byte-for-byte from stock git 2.55.0's `git log --help-all`.
+pub(super) const USAGE_ALL: &str = r#"usage: git log [<options>] [<revision-range>] [[--] <path>...]
+   or: git show [<options>] <object>...
+
+    -q, --[no-]quiet      suppress diff output
+    --[no-]source         show source
+    --[no-]use-mailmap    use mail map file
+    --[no-]i-still-use-this
+                          <use this deprecated command>
+    --[no-]mailmap        alias of --use-mailmap
+    --clear-decorations   clear all previously-defined decoration filters
+    --[no-]decorate-refs <pattern>
+                          only decorate refs that match <pattern>
+    --[no-]decorate-refs-exclude <pattern>
+                          do not decorate refs that match <pattern>
+    --[no-]decorate[=...] decorate options
+    -L <range:file>       trace the evolution of line range <start>,<end> or function :<funcname> in <file>
+
+"#;
+
 /// The terminal width git assumes for `--stat` when stdout is not a terminal.
 /// git's `MINIMUM_ABBREV`: no `--abbrev` may cut an id shorter than this.
 const MINIMUM_ABBREV: usize = 4;
@@ -522,6 +546,12 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         // before `setup_revisions`: the block on stdout at 129, no `error:` line.
         if a == "-h" {
             return Ok(super::show_usage(USAGE));
+        }
+        // `if (internal_help && !strcmp(arg + 2, "help-all"))`
+        // (parse-options.c:1122), one exact `strcmp` after the `--` break above:
+        // the same block with the hidden `--i-still-use-this` left in.
+        if a == "--help-all" {
+            return Ok(super::show_usage(USAGE_ALL));
         }
         // The value checks `diff_opt_parse`'s callbacks run as each option is seen.
         // `cmd_log` hands the whole argument list to `setup_revisions`, so a diff

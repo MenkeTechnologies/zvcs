@@ -379,7 +379,6 @@ pub fn cvsimport(args: &[String]) -> Result<ExitCode> {
 
     anyhow::bail!(
         "unsupported: importing {module:?} from {cvsroot:?} needs the external `cvs` client and \
-         `cvsps` v2, neither of which has a substrate in the vendored gitoxide crates \
-         (ported: option and config parsing, -h, CVSROOT/module resolution)"
+         `cvsps` v2, neither of which has a substrate in the vendored gitoxide crates"
     );
 }

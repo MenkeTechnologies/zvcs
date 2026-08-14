@@ -104,6 +104,16 @@ pub fn stripspace(args: &[String]) -> Result<ExitCode> {
                 no_more_opts = true;
                 continue;
             }
+            // parse_options_step() tests `--help-all` with a `strcmp()` of its
+            // own, ahead of parse_long_opt() and just past the `--` break
+            // above: the name never abbreviates and never takes an `=<value>`,
+            // so `resolve_long()` is never asked about it. stripspace's table
+            // has no `PARSE_OPT_HIDDEN` entry, so `USAGE_FULL` renders the same
+            // block `-h` prints.
+            if long == "help-all" {
+                print!("{USAGE}");
+                return Ok(ExitCode::from(129));
+            }
             let (name, value) = match long.split_once('=') {
                 Some((name, value)) => (name, Some(value)),
                 None => (long, None),

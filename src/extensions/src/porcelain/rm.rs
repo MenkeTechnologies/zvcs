@@ -180,6 +180,13 @@ pub fn rm(args: &[String]) -> Result<ExitCode> {
             i += 1;
             continue;
         }
+        // parse_options_step() tests `--help-all` with a `strcmp()` of its own,
+        // ahead of parse_long_opt(): the name never abbreviates and never takes
+        // an `=<value>`. This table has no `PARSE_OPT_HIDDEN` entry, so
+        // `USAGE_FULL` renders the same block `-h` prints.
+        if a == "--help-all" {
+            return Ok(super::show_usage(USAGE));
+        }
         if let Some(body) = a.strip_prefix("--") {
             let (name, inline_val) = match body.split_once('=') {
                 Some((n, v)) => (n, Some(v.to_string())),

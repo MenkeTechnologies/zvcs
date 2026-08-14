@@ -170,6 +170,14 @@ fn parseopt(args: &[String]) -> Parseopt {
         if arg == "--" {
             break;
         }
+        // parse_options_step() tests `--help-all` with a `strcmp()` of its own,
+        // ahead of parse_long_opt(): the name never abbreviates and never takes
+        // an `=<value>`, and it is not reached past `--`. The spec has no
+        // `PARSE_OPT_HIDDEN` entry, so `USAGE_FULL` renders the same block `-h`
+        // prints.
+        if arg == "--help-all" {
+            return Parseopt::Exit(usage_stdout(129));
+        }
         // A lone `-` and anything without a leading dash is a positional; they
         // are permuted past the `--` and thus unreachable.
         let Some(body) = arg.strip_prefix('-').filter(|b| !b.is_empty()) else {
@@ -448,7 +456,7 @@ pub fn quiltimport(args: &[String]) -> Result<ExitCode> {
                 "--patches" => quilt_patches = value.clone(),
                 "--series" => quilt_series = value.clone(),
                 "--keep-non-patch" => keep_non_patch = true,
-                other => bail!("unsupported flag {other:?} (ported: -n/--dry-run, --author, --patches, --series, --keep-non-patch)"),
+                other => bail!("unsupported flag {other:?}"),
             },
         }
     }

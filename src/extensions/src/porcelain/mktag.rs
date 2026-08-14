@@ -68,6 +68,14 @@ pub fn mktag(args: &[String]) -> Result<ExitCode> {
         if no_more_opts || a == "-" || !a.starts_with('-') {
             continue;
         }
+        // parse_options_step() tests `--help-all` with a `strcmp()` of its own,
+        // ahead of parse_long_opt(): the name never abbreviates and never takes
+        // an `=<value>`, so it is matched whole here instead of going through
+        // the prefix matching below. This table has no `PARSE_OPT_HIDDEN` entry,
+        // so `USAGE_FULL` renders the same block `-h` prints.
+        if a == "--help-all" {
+            return Ok(super::show_usage(USAGE));
+        }
         let Some(long) = a.strip_prefix("--") else {
             let flag = a[1..].chars().next().expect("`-` alone was handled above");
             // parse_options_step() answers `-h` before it can be an unknown

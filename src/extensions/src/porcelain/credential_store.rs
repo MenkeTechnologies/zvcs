@@ -119,6 +119,13 @@ fn parse_args(args: &[String]) -> std::result::Result<Parsed, UsageError> {
             i += 1;
             continue;
         }
+        // `parse_options_step()` tests `--help-all` with a `strcmp()` of its own,
+        // ahead of `parse_long_opt()`: the name never abbreviates and never takes
+        // an `=<value>`. This table has no `PARSE_OPT_HIDDEN` entry, so
+        // `USAGE_FULL` renders the same block `-h` prints.
+        if a == "--help-all" {
+            return Err(UsageError::Help);
+        }
         if let Some(long) = a.strip_prefix("--") {
             let (name, inline) = match long.split_once('=') {
                 Some((n, v)) => (n, Some(v)),

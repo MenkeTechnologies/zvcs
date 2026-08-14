@@ -26,9 +26,12 @@
 //!
 //!   * `-h` → the 368-byte usage block on **stdout**, exit 129, before any
 //!     repository is touched (so it works outside a repository).
-//!   * no `<directory>`, or more than one → the 458-byte usage block (the
-//!     longer variant, which also lists the hidden `--advertise-refs` alias) on
-//!     **stderr**, exit 129.
+//!   * `--help-all` → the 532-byte block on **stdout**, exit 129: the same
+//!     table with the two hidden entries (`--http-backend-info-refs` and its
+//!     `--advertise-refs` alias) left in, each on its own line.
+//!   * no `<directory>`, or more than one → the 458-byte usage block (a third
+//!     variant, which lists only the `--advertise-refs` alias and renders it
+//!     with the `...` argument marker) on **stderr**, exit 129.
 //!   * an unknown long option → ``error: unknown option `<name>'`` followed by
 //!     the short usage block, both on **stderr**, exit 129.
 //!   * an unknown short switch → ``error: unknown switch `<c>'`` followed by the
@@ -98,6 +101,22 @@ const USAGE_SHORT: &str = concat!(
     "    --[no-]timeout <n>    interrupt transfer after <n> seconds of inactivity\n",
     "\n",
 );
+
+/// `usage_with_options_internal()`'s `USAGE_FULL` rendering — what `--help-all`
+/// prints. It is [`USAGE_SHORT`] with the `PARSE_OPT_HIDDEN` entries left in:
+/// `--[no-]http-backend-info-refs`, `--[no-]advertise-refs`.
+/// Captured byte-for-byte from stock git 2.55.0's `git upload-pack --help-all`.
+const USAGE_HELP_ALL: &str = r#"usage: git-upload-pack [--[no-]strict] [--timeout=<n>] [--stateless-rpc]
+                       [--advertise-refs] <directory>
+
+    --[no-]stateless-rpc  quit after a single request/response exchange
+    --[no-]http-backend-info-refs
+                          serve up the info/refs for git-http-backend
+    --[no-]advertise-refs alias of --http-backend-info-refs
+    --[no-]strict         do not try <directory>/.git/ if <directory> is no Git directory
+    --[no-]timeout <n>    interrupt transfer after <n> seconds of inactivity
+
+"#;
 
 /// The usage block git prints when the `<directory>` count is wrong: 458 bytes.
 /// This is the explicit `usage_with_options()` call in the command itself, which
@@ -192,6 +211,18 @@ pub fn upload_pack(args: &[String]) -> Result<ExitCode> {
             end_of_opts = true;
             i += 1;
             continue;
+        }
+
+        // `if (internal_help && !strcmp(arg + 2, "help-all"))`
+        // (parse-options.c:1122): an exact match tested after the `--` break
+        // above and before `resolve_long()`, so it neither abbreviates nor takes
+        // an `=<value>`. `USAGE_FULL` here is not [`USAGE_FULL`] the constant:
+        // that one is `usage_with_options()`'s rendering of the *original*
+        // option array for the argument-count error, whose alias slot still
+        // prints `...`.
+        if a == "--help-all" {
+            print!("{USAGE_HELP_ALL}");
+            return Ok(ExitCode::from(129));
         }
 
         // A long option, possibly abbreviated, possibly `--name=value`.

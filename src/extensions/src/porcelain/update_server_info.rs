@@ -90,7 +90,12 @@ pub fn update_server_info(args: &[String]) -> Result<ExitCode> {
         }
         match a {
             "--" => end_of_opts = true,
-            "-h" => {
+            // parse_options_step() tests `--help-all` with a `strcmp()` of its
+            // own, after the `--` break above and ahead of parse_long_opt(), so
+            // the name never abbreviates and never takes an `=<value>` — it
+            // never reaches the prefix matching below. The table has no
+            // `PARSE_OPT_HIDDEN` entry, so `USAGE_FULL` is this same block.
+            "-h" | "--help-all" => {
                 print!("{USAGE}");
                 return Ok(ExitCode::from(129));
             }

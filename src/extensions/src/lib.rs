@@ -28,6 +28,7 @@ pub mod merge_guard;
 pub mod optint;
 pub mod pager;
 pub mod porcelain;
+pub mod precompose;
 pub mod progress;
 pub mod rcache;
 pub mod revfilter;
@@ -275,6 +276,13 @@ fn run_command() -> ExitCode {
     // is where git calls `trace2_cmd_name`, and where the `def_param` records for
     // `trace2.configParams` / `trace2.envVars` follow it.
     trace2::cmd_name(&sub);
+
+    // `precompose_argv_prefix(argc, argv, NULL)` (git.c:488), which `run_builtin()`
+    // runs over the dispatched command's arguments — after repository setup, so
+    // `core.precomposeunicode` is readable, and after alias expansion, so an alias
+    // is still looked up under the name that was typed. macOS only; see the module.
+    let mut rest = rest;
+    precompose::argv(&mut rest);
 
     // git's repository setup runs next, and its one refusal that is pure policy —
     // `safe.bareRepository` — has to happen before the verb touches the repository.

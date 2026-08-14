@@ -169,6 +169,11 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
         if !after_dashdash && s == "-h" {
             return Ok(super::show_usage(super::log::USAGE));
         }
+        // `--help-all` is the same block with the hidden `--i-still-use-this`
+        // left in (`USAGE_FULL`), and `git show` shares that too.
+        if !after_dashdash && s == "--help-all" {
+            return Ok(super::show_usage(super::log::USAGE_ALL));
+        }
         // Everything after `--` is a pathspec, even tokens that look like flags:
         // `git show -- --stat` limits by the path `--stat`, it does not enable stat.
         if after_dashdash {

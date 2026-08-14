@@ -15,7 +15,7 @@ fn usage_error(msg: String) -> anyhow::Error {
 /// `usage_with_options()` rendering of `builtin/commit.c`'s option table,
 /// verbatim. `parse_options` writes it after an `error:` line for an unknown
 /// option or a malformed value, and to stdout for `-h`; both exit 129.
-const USAGE: &str = r"usage: git commit [-a | --interactive | --patch] [-s] [-v] [-u[<mode>]] [--amend]
+pub(super) const USAGE: &str = r"usage: git commit [-a | --interactive | --patch] [-s] [-v] [-u[<mode>]] [--amend]
                   [--dry-run] [(-c | -C | --squash) <commit> | --fixup [(amend|reword):]<commit>]
                   [-F <file> | -m <msg>] [--reset-author] [--allow-empty]
                   [--allow-empty-message] [--no-verify] [-e] [--author=<author>]
@@ -84,6 +84,83 @@ Commit contents options
                           with --pathspec-from-file, pathspec elements are separated with NUL character
 
 ";
+
+/// `usage_with_options_internal()`'s `USAGE_FULL` rendering — what `--help-all`
+/// prints. It is [`USAGE`] with the `PARSE_OPT_HIDDEN` entries left in:
+/// `--[no-]allow-empty`, `--[no-]allow-empty-message`.
+/// Captured byte-for-byte from stock git 2.55.0's `git commit --help-all`.
+pub(super) const USAGE_ALL: &str = r#"usage: git commit [-a | --interactive | --patch] [-s] [-v] [-u[<mode>]] [--amend]
+                  [--dry-run] [(-c | -C | --squash) <commit> | --fixup [(amend|reword):]<commit>]
+                  [-F <file> | -m <msg>] [--reset-author] [--allow-empty]
+                  [--allow-empty-message] [--no-verify] [-e] [--author=<author>]
+                  [--date=<date>] [--cleanup=<mode>] [--[no-]status]
+                  [-i | -o] [--pathspec-from-file=<file> [--pathspec-file-nul]]
+                  [(--trailer <token>[(=|:)<value>])...] [-S[<keyid>]]
+                  [--] [<pathspec>...]
+
+    -q, --[no-]quiet      suppress summary after successful commit
+    -v, --[no-]verbose    show diff in commit message template
+
+Commit message options
+    -F, --[no-]file <file>
+                          read message from file
+    --[no-]author <author>
+                          override author for commit
+    --[no-]date <date>    override date for commit
+    -m, --[no-]message <message>
+                          commit message
+    -c, --[no-]reedit-message <commit>
+                          reuse and edit message from specified commit
+    -C, --[no-]reuse-message <commit>
+                          reuse message from specified commit
+    --[no-]fixup [(amend|reword):]commit
+                          use autosquash formatted message to fixup or amend/reword specified commit
+    --[no-]squash <commit>
+                          use autosquash formatted message to squash specified commit
+    --[no-]reset-author   the commit is authored by me now (used with -C/-c/--amend)
+    --[no-]trailer <trailer>
+                          add custom trailer(s)
+    -s, --[no-]signoff    add a Signed-off-by trailer
+    -t, --[no-]template <file>
+                          use specified template file
+    -e, --[no-]edit       force edit of commit
+    --[no-]cleanup <mode> how to strip spaces and #comments from message
+    --[no-]status         include status in commit message template
+    -S, --[no-]gpg-sign[=<key-id>]
+                          GPG sign commit
+
+Commit contents options
+    -a, --[no-]all        commit all changed files
+    -i, --[no-]include    add specified files to index for commit
+    --[no-]interactive    interactively add files
+    -p, --[no-]patch      interactively add changes
+    -U, --unified <n>     generate diffs with <n> lines context
+    --inter-hunk-context <n>
+                          show context between diff hunks up to the specified number of lines
+    -o, --[no-]only       commit only specified files
+    -n, --no-verify       bypass pre-commit and commit-msg hooks
+    --verify              opposite of --no-verify
+    --[no-]dry-run        show what would be committed
+    --[no-]short          show status concisely
+    --[no-]branch         show branch information
+    --[no-]ahead-behind   compute full ahead/behind values
+    --[no-]porcelain      machine-readable output
+    --[no-]long           show status in long format (default)
+    -z, --[no-]null       terminate entries with NUL
+    --[no-]amend          amend previous commit
+    --no-post-rewrite     bypass post-rewrite hook
+    --post-rewrite        opposite of --no-post-rewrite
+    -u, --[no-]untracked-files[=<mode>]
+                          show untracked files, optional modes: all, normal, no. (Default: all)
+    --[no-]pathspec-from-file <file>
+                          read pathspec from file
+    --[no-]pathspec-file-nul
+                          with --pathspec-from-file, pathspec elements are separated with NUL character
+    --[no-]allow-empty    ok to record an empty change
+    --[no-]allow-empty-message
+                          ok to record a change with an empty message
+
+"#;
 
 use gix::bstr::{BString, ByteSlice};
 use gix::index::entry::{Flags, Mode, Stage, Stat};
@@ -639,6 +716,14 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
             pathspecs.push(args[i].clone());
             i += 1;
             continue;
+        }
+        // `if (internal_help && !strcmp(arg + 2, "help-all"))`
+        // (parse-options.c:1122): tested on the token as typed, ahead of the
+        // abbreviation resolver, because it is a `strcmp` — `--help-a` and
+        // `--help-all=x` stay unknown options. It renders `USAGE_FULL`, which
+        // for `commit` keeps the hidden `--allow-empty[-message]`.
+        if args[i] == "--help-all" {
+            return Ok(super::show_usage(USAGE_ALL));
         }
         // Respell a unique abbreviation as the name it resolves to, ahead of both
         // the shared value-option handler and the match below, so `--allow-empty-m`
@@ -1501,6 +1586,16 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
                  remove the commit entirely with \"git reset HEAD^\"."
             );
         }
+        // `run_status(stdout, index_file, prefix, 0, s)` (builtin/commit.c:1085).
+        // The refusal *is* a status report: git runs the engine `git status` runs,
+        // over the index this commit would have used, on stdout — and only then
+        // adds whatever advice the situation calls for on stderr. Nothing else is
+        // printed for a plain empty commit, so this report is the whole message.
+        //
+        // The long format is the only one reachable: a `--short`/`--porcelain`/
+        // `-z` request has already turned the command into a dry run
+        // (builtin/commit.c:1422-1423) and returned far above.
+        report_nothing_to_commit(untracked_arg.as_deref())?;
         // A cherry-pick or rebase pick whose conflict resolution left nothing to
         // record is a distinct situation from "you staged nothing": the pick has
         // to be either recorded empty or skipped, and git says which.
@@ -1519,7 +1614,9 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
             }
             return Ok(ExitCode::from(1));
         }
-        anyhow::bail!("nothing to commit (no changes staged)");
+        // `prepare_to_commit()` returns 0, which `cmd_commit()` turns into
+        // `ret = 1` — an exit code and not a word of its own on stderr.
+        return Ok(ExitCode::from(1));
     }
 
     // --- message: `prepare_to_commit()` -----------------------------------
@@ -2232,6 +2329,27 @@ fn dry_run_commit(repo: &gix::Repository, o: &DryRun) -> Result<ExitCode> {
     } else {
         ExitCode::from(1)
     })
+}
+
+/// The report the empty-commit refusal is made of: `run_status(stdout,
+/// index_file, prefix, 0, s)` (builtin/commit.c:1085).
+///
+/// Same engine as [`dry_run_commit`], and for the same reason — git points one
+/// `wt_status` at the index the commit would have used and prints it. No index is
+/// installed here because by this point the port has already applied `-a`, `-i`,
+/// `--only` and the interactive selection to the real one, which is what git's
+/// prepared index holds.
+///
+/// `-u<mode>` reaches `wt_status` through `handle_untracked_files_arg()` before
+/// the refusal, so it is forwarded. `-v` is not: git's `wt_longstatus_print()`
+/// would append the staged diff, and there is by definition nothing staged.
+fn report_nothing_to_commit(untracked: Option<&str>) -> Result<()> {
+    let mut sargs = vec!["--long".to_string()];
+    if let Some(u) = untracked {
+        sargs.push(format!("--untracked-files={u}"));
+    }
+    super::status::status(&sargs)?;
+    Ok(())
 }
 
 /// Whether the given index (or the on-disk one when `None`) records anything

@@ -188,6 +188,29 @@ const USAGE: &str = "usage: git gc [<options>]\n\
                      \x20                         pack prefix to store a pack containing pruned objects\n\
                      \n";
 
+/// `usage_with_options_internal()`'s `USAGE_FULL` rendering — what `--help-all`
+/// prints. It is [`USAGE`] with the `PARSE_OPT_HIDDEN` entries left in:
+/// `--[no-]skip-foreground-tasks`.
+/// Captured byte-for-byte from stock git 2.55.0's `git gc --help-all`.
+const USAGE_ALL: &str = r#"usage: git gc [<options>]
+
+    -q, --[no-]quiet      suppress progress reporting
+    --[no-]prune[=<date>] prune unreferenced objects
+    --[no-]cruft          pack unreferenced objects separately
+    --max-cruft-size <n>  with --cruft, limit the size of new cruft packs
+    --[no-]aggressive     be more thorough (increased runtime)
+    --[no-]auto           enable auto-gc mode
+    --[no-]detach         perform garbage collection in the background
+    --[no-]force          force running gc even if there may be another gc running
+    --[no-]keep-largest-pack
+                          repack all other packs except the largest pack
+    --[no-]expire-to <dir>
+                          pack prefix to store a pack containing pruned objects
+    --[no-]skip-foreground-tasks
+                          skip maintenance tasks typically done in the foreground
+
+"#;
+
 /// Options that take a separate value argument, so a missing value can be
 /// reported the way git's parse-options does instead of being read as the next
 /// flag.
@@ -295,6 +318,14 @@ pub fn gc(args: &[String]) -> Result<ExitCode> {
             "--" => end_of_opts = true,
             "-h" => {
                 print!("{USAGE}");
+                return Ok(ExitCode::from(129));
+            }
+            // `if (internal_help && !strcmp(arg + 2, "help-all"))`
+            // (parse-options.c:1122), an exact match tested ahead of
+            // parse_long_opt(): never an abbreviation, never with an
+            // `=<value>`, and rendered as `USAGE_FULL`.
+            "--help-all" => {
+                print!("{USAGE_ALL}");
                 return Ok(ExitCode::from(129));
             }
             "--auto" => auto = true,

@@ -11,7 +11,8 @@
 //!   truncated file still leaves the successfully read lines on stdout.
 //!
 //! The only option is `--object-format=<sha1|sha256>` (also accepted as two
-//! arguments, and as `--no-object-format` to fall back to the default). It only
+//! arguments, as any unambiguous abbreviation of the name, and as
+//! `--no-object-format` to fall back to the default). It only
 //! selects the raw hash width used to walk the index, so both algorithms work
 //! here even though this build of the vendored `gix-hash` compiles SHA-1 only.
 //! Without it the hash comes from the repository (`gix::discover`), and outside a
@@ -41,6 +42,14 @@ usage: git show-index [--object-format=<hash-algorithm>] < <pack-idx-file>
                           specify the hash algorithm to use
 
 ";
+
+/// `show_index_options` (builtin/show-index.c:27-32), the whole table: one
+/// `OPT_STRING`, which is negatable and takes a mandatory value.
+pub(super) const LONG_OPTS: &[super::LongOpt] = &[super::LongOpt {
+    name: "object-format",
+    neg: true,
+    arg: super::Arg::Required,
+}];
 
 /// The `\xfftOc` magic that marks an index of version 2 or newer.
 const IDX_SIGNATURE: u32 = 0xff74_4f63;
@@ -125,11 +134,30 @@ pub fn show_index(args: &[String]) -> Result<ExitCode> {
     let mut no_more_opts = false;
     let mut i = 0;
     while i < argv.len() {
-        let a = argv[i].as_str();
+        let raw = argv[i].as_str();
         if no_more_opts {
             i += 1;
             continue;
         }
+        // parse_options_step() tests `--help-all` with a `strcmp()` of its own,
+        // ahead of parse_long_opt(): the name never abbreviates and never takes
+        // an `=<value>`, which is why it is not a [`LONG_OPTS`] entry and is
+        // matched here rather than after resolution. show-index's table has no
+        // `PARSE_OPT_HIDDEN` entry, so `USAGE_FULL` renders the same block `-h`
+        // prints.
+        if raw == "--help-all" {
+            print!("{USAGE}");
+            return Ok(ExitCode::from(129));
+        }
+        // Any unambiguous prefix of a long option names it, so `--object-f`
+        // lands on the same arm `--object-format` does.
+        let resolved = match super::canonical_long(raw, LONG_OPTS) {
+            super::Long::Name(name) => name,
+            super::Long::Ambiguous(first, second) => {
+                return Ok(super::ambiguous_option(raw, &first, &second, USAGE))
+            }
+        };
+        let a = resolved.as_ref();
         match a {
             "--" => no_more_opts = true,
             "-h" | "--help" => {
@@ -138,9 +166,9 @@ pub fn show_index(args: &[String]) -> Result<ExitCode> {
             }
             "--object-format" => {
                 let Some(v) = argv.get(i + 1) else {
-                    eprintln!("error: option `object-format' requires a value");
-                    eprint!("{USAGE}");
-                    return Ok(ExitCode::from(129));
+                    // `get_arg()` returns PARSE_OPT_ERROR, which
+                    // `parse_options_step()` reports without the usage block.
+                    return Ok(super::missing_option_value("--object-format"));
                 };
                 hash_name = Some(v.clone());
                 i += 1;

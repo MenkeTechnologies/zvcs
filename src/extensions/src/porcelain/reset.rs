@@ -543,6 +543,14 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
             paths.push(a.clone());
             continue;
         }
+        // parse_options_step() tests `--help-all` with a `strcmp()` of its own,
+        // ahead of parse_long_opt() and so ahead of the unknown-option refusal
+        // below: the name never abbreviates and never takes an `=<value>`. This
+        // table has no `PARSE_OPT_HIDDEN` entry, so `USAGE_FULL` renders the
+        // same block `-h` prints.
+        if a == "--help-all" {
+            return Ok(super::show_usage(USAGE));
+        }
         // Respell a unique abbreviation as the name it resolves to, ahead of both
         // the shared value-option handler and the match below, so `--intent-to`
         // reaches the same arm as `--intent-to-add`.

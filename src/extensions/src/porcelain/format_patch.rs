@@ -1282,7 +1282,9 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
             "--" => pathspec_mode = true,
             // parse_options_step()'s `internal_help`, which `cmd_format_patch`
             // runs before `setup_revisions`: the block on stdout at 129.
-            "-h" => return Ok(Parsed::Exit(super::show_usage(USAGE))),
+            // `--help-all` is the same step's own `strcmp()` and renders
+            // `USAGE_FULL`, identical here — no entry is `PARSE_OPT_HIDDEN`.
+            "-h" | "--help-all" => return Ok(Parsed::Exit(super::show_usage(USAGE))),
             "--stdout" => o.to_stdout = true,
             "-o" | "--output-directory" => {
                 i += 1;

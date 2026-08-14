@@ -122,6 +122,74 @@ use gix::remote::fetch::{Shallow, Tags};
 /// stdout for `-h` and on stderr for a usage error, both exiting 129.
 const USAGE: &str = "usage: git clone [<options>] [--] <repo> [<dir>]\n\n    -v, --[no-]verbose    be more verbose\n    -q, --[no-]quiet      be more quiet\n    --[no-]progress       force progress reporting\n    --[no-]reject-shallow don't clone shallow repository\n    -n, --no-checkout     don't create a checkout\n    --checkout            opposite of --no-checkout\n    --[no-]bare           create a bare repository\n    --[no-]mirror         create a mirror repository (implies --bare)\n    -l, --[no-]local      to clone from a local repository\n    --no-hardlinks        don't use local hardlinks, always copy\n    --hardlinks           opposite of --no-hardlinks\n    -s, --[no-]shared     setup as shared repository\n    --[no-]recurse-submodules[=<pathspec>]\n                          initialize submodules in the clone\n    --[no-]recursive[=<pathspec>]\n                          alias of --recurse-submodules\n    -j, --[no-]jobs <n>   number of submodules cloned in parallel\n    --[no-]template <template-directory>\n                          directory from which templates will be used\n    --[no-]reference <repo>\n                          reference repository\n    --[no-]reference-if-able <repo>\n                          reference repository\n    --[no-]dissociate     use --reference only while cloning\n    -o, --[no-]origin <name>\n                          use <name> instead of 'origin' to track upstream\n    -b, --[no-]branch <branch>\n                          checkout <branch> instead of the remote's HEAD\n    --[no-]revision <rev> clone single revision <rev> and check out\n    -u, --[no-]upload-pack <path>\n                          path to git-upload-pack on the remote\n    --[no-]depth <depth>  create a shallow clone of that depth\n    --[no-]shallow-since <time>\n                          create a shallow clone since a specific time\n    --[no-]shallow-exclude <ref>\n                          deepen history of shallow clone, excluding ref\n    --[no-]single-branch  clone only one branch, HEAD or --branch\n    --[no-]tags           clone tags, and make later fetches not to follow them\n    --[no-]shallow-submodules\n                          any cloned submodules will be shallow\n    --[no-]separate-git-dir <gitdir>\n                          separate git dir from working tree\n    --[no-]ref-format <format>\n                          specify the reference format to use\n    -c, --[no-]config <key=value>\n                          set config inside the new repository\n    --[no-]server-option <server-specific>\n                          option to transmit\n    -4, --ipv4            use IPv4 addresses only\n    -6, --ipv6            use IPv6 addresses only\n    --[no-]filter <args>  object filtering\n    --[no-]also-filter-submodules\n                          apply partial clone filters to submodules\n    --[no-]remote-submodules\n                          any cloned submodules will use their remote-tracking branch\n    --[no-]sparse         initialize sparse-checkout file to include only files at root\n    --[no-]bundle-uri <uri>\n                          a URI for downloading bundles before fetching from origin remote\n\n";
 
+/// `usage_with_options_internal()`'s `USAGE_FULL` rendering — what `--help-all`
+/// prints. It is [`USAGE`] with the `PARSE_OPT_HIDDEN` entries left in:
+/// `--[no-]naked`.
+/// Captured byte-for-byte from stock git 2.55.0's `git clone --help-all`.
+const USAGE_ALL: &str = r#"usage: git clone [<options>] [--] <repo> [<dir>]
+
+    -v, --[no-]verbose    be more verbose
+    -q, --[no-]quiet      be more quiet
+    --[no-]progress       force progress reporting
+    --[no-]reject-shallow don't clone shallow repository
+    -n, --no-checkout     don't create a checkout
+    --checkout            opposite of --no-checkout
+    --[no-]bare           create a bare repository
+    --[no-]naked          create a bare repository
+    --[no-]mirror         create a mirror repository (implies --bare)
+    -l, --[no-]local      to clone from a local repository
+    --no-hardlinks        don't use local hardlinks, always copy
+    --hardlinks           opposite of --no-hardlinks
+    -s, --[no-]shared     setup as shared repository
+    --[no-]recurse-submodules[=<pathspec>]
+                          initialize submodules in the clone
+    --[no-]recursive[=<pathspec>]
+                          alias of --recurse-submodules
+    -j, --[no-]jobs <n>   number of submodules cloned in parallel
+    --[no-]template <template-directory>
+                          directory from which templates will be used
+    --[no-]reference <repo>
+                          reference repository
+    --[no-]reference-if-able <repo>
+                          reference repository
+    --[no-]dissociate     use --reference only while cloning
+    -o, --[no-]origin <name>
+                          use <name> instead of 'origin' to track upstream
+    -b, --[no-]branch <branch>
+                          checkout <branch> instead of the remote's HEAD
+    --[no-]revision <rev> clone single revision <rev> and check out
+    -u, --[no-]upload-pack <path>
+                          path to git-upload-pack on the remote
+    --[no-]depth <depth>  create a shallow clone of that depth
+    --[no-]shallow-since <time>
+                          create a shallow clone since a specific time
+    --[no-]shallow-exclude <ref>
+                          deepen history of shallow clone, excluding ref
+    --[no-]single-branch  clone only one branch, HEAD or --branch
+    --[no-]tags           clone tags, and make later fetches not to follow them
+    --[no-]shallow-submodules
+                          any cloned submodules will be shallow
+    --[no-]separate-git-dir <gitdir>
+                          separate git dir from working tree
+    --[no-]ref-format <format>
+                          specify the reference format to use
+    -c, --[no-]config <key=value>
+                          set config inside the new repository
+    --[no-]server-option <server-specific>
+                          option to transmit
+    -4, --ipv4            use IPv4 addresses only
+    -6, --ipv6            use IPv6 addresses only
+    --[no-]filter <args>  object filtering
+    --[no-]also-filter-submodules
+                          apply partial clone filters to submodules
+    --[no-]remote-submodules
+                          any cloned submodules will use their remote-tracking branch
+    --[no-]sparse         initialize sparse-checkout file to include only files at root
+    --[no-]bundle-uri <uri>
+                          a URI for downloading bundles before fetching from origin remote
+
+"#;
+
 /// `cmd_clone()`'s `struct option builtin_clone_options[]` (builtin/clone.c), in
 /// table order, as [`super::resolve_long_aliased`] reads it.
 const LONG_OPTS: &[super::LongOpt] = &[
@@ -192,6 +260,19 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     // `-h` is answered by `parse-options` before anything else, on stdout.
     if args.iter().any(|a| a == "-h") {
         print!("{USAGE}");
+        return Ok(ExitCode::from(129));
+    }
+    // `--help-all` likewise, rendering `USAGE_FULL` — `USAGE` plus the hidden
+    // `--naked`. `parse_options_step()` *breaks* on `--` and `--end-of-options`
+    // one line before it tests the name (parse-options.c:1112-1122), so the
+    // search stops at the terminator; and because the test is a `strcmp`, no
+    // abbreviation and no `=<value>` spelling reaches it.
+    if args
+        .iter()
+        .take_while(|a| a.as_str() != "--" && a.as_str() != "--end-of-options")
+        .any(|a| a == "--help-all")
+    {
+        print!("{USAGE_ALL}");
         return Ok(ExitCode::from(129));
     }
     let mut bare = false;

@@ -528,7 +528,9 @@ pub fn merge(args: &[String]) -> Result<ExitCode> {
             // `show_usage_with_options_if_asked()` (builtin/merge.c:1380) and
             // parse_options' own `internal_help` both answer `-h` on stdout at
             // 129, with no `error:` line.
-            "-h" => return Ok(super::show_usage(USAGE)),
+            // `--help-all` reaches the same renderer with USAGE_FULL, which this
+            // table renders identically: it has no `PARSE_OPT_HIDDEN` entry.
+            "-h" | "--help-all" => return Ok(super::show_usage(USAGE)),
             // `--log[=<n>]` is git's `OPT_INTEGER` with `PARSE_OPT_OPTARG` and a
             // default of DEFAULT_MERGE_LOG_LEN, so only the `=<n>` spelling takes a
             // value (`--log 5` leaves `5` as a head to merge). `--no-log` is 0.

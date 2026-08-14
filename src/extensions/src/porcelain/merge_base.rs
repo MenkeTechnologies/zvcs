@@ -100,7 +100,9 @@ pub fn merge_base(args: &[String]) -> Result<ExitCode> {
             "--fork-point" => Mode::ForkPoint,
             // parse_options_step() answers `-h` on stdout at 129, with no
             // `error:` line — a help request is not a rejection.
-            "-h" => return Ok(super::show_usage(USAGE)),
+            // `--help-all` reaches the same renderer with USAGE_FULL, which this
+            // table renders identically: it has no `PARSE_OPT_HIDDEN` entry.
+            "-h" | "--help-all" => return Ok(super::show_usage(USAGE)),
             // `PARSE_OPT_UNKNOWN` names a *switch* for a short argument
             // (parse-options.c:889-898).
             _ => {

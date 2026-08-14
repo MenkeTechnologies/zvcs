@@ -107,6 +107,7 @@ pub(crate) enum Arg {
 
 /// One entry of a builtin's `struct option options[]`, carrying only what
 /// `parse_long_opt()` reads while it resolves a name.
+#[derive(Clone, Copy)]
 pub(crate) struct LongOpt {
     /// `long_name`, spelled exactly as the C table spells it — including a
     /// leading `no-` where the table itself has one (`--no-contains`), which
@@ -387,6 +388,45 @@ pub(crate) fn ambiguous_option(
     let body = tok.strip_prefix("--").unwrap_or(tok);
     eprintln!("error: ambiguous option: {body} (could be --{first} or --{second})");
     print!("{usage}");
+    std::process::ExitCode::from(129)
+}
+
+/// `PARSE_OPT_UNKNOWN`: the refusal for an argument no table entry claims.
+///
+/// `parse_options_step()` returns it and the caller reports both the reason and
+/// the usage block on **stderr** (parse-options.c:1198-1224), which is the pair
+/// that separates this from every other rejection:
+///
+/// ```c
+///         case PARSE_OPT_UNKNOWN:
+///                 if (ctx.argv[0][1] == '-')
+///                         error(_("unknown option `%s'"), ctx.argv[0] + 2);
+///                 else if (isascii(*ctx.opt))
+///                         error(_("unknown switch `%c'"), *ctx.opt);
+///                 else
+///                         error(_("unknown non-ascii option in string: `%s'"),
+///                               ctx.argv[0]);
+///                 usage_with_options(usagestr, options);
+/// ```
+///
+/// A long one is named without its `--` and **with** any `=<value>`; a short one
+/// is named by its first character only, however many were clustered behind it.
+/// Both exit 129. The contrast to keep straight: `PARSE_OPT_ERROR` — what
+/// `get_arg()` returns for a missing value, and what a rejecting callback returns
+/// — prints its own line and *no* block, so a bad value for a known option looks
+/// nothing like an unknown option.
+pub(crate) fn unknown_option(tok: &str, usage: &str) -> std::process::ExitCode {
+    match tok.strip_prefix("--") {
+        Some(body) => eprintln!("error: unknown option `{body}'"),
+        None => {
+            let c = tok[1..].chars().next().unwrap_or('-');
+            match c.is_ascii() {
+                true => eprintln!("error: unknown switch `{c}'"),
+                false => eprintln!("error: unknown non-ascii option in string: `{tok}'"),
+            }
+        }
+    }
+    eprint!("{usage}");
     std::process::ExitCode::from(129)
 }
 
@@ -929,6 +969,14 @@ mod tests {
     /// * `git show-branch --no-reflog` — `PARSE_OPT_OPTARG | PARSE_OPT_NONEG`
     /// * `git range-diff --no-binary` — `diff.c`'s `--binary` callback
     /// * `git fetch --no-refetch` — `OPT_SET_INT_F(... PARSE_OPT_NONEG)`
+    /// * `git config --no-get` — fourteen more `OPT_CMDMODE`s, plus the six
+    ///   `OPT_CALLBACK_VALUE` type spellings (`PARSE_OPT_NOARG|PARSE_OPT_NONEG`,
+    ///   builtin/config.c:140-149)
+    /// * `git checkout --no-ours` / `--no-unified` — `OPT_SET_INT_F` and
+    ///   `OPT_DIFF_UNIFIED`, which is `OPT_INTEGER_F(..., PARSE_OPT_NONEG)`
+    /// * `git stash push --no-unified` — the same two, per sub-command table
+    /// * `git multi-pack-index repack --no-batch-size` — `OPT_UNSIGNED`, whose
+    ///   macro carries `PARSE_OPT_NONEG` outright (parse-options.h:287-296)
     ///
     /// The positive spelling of each is asserted alongside it, so a table that
     /// went missing entirely could not pass this by resolving nothing at all.
@@ -943,6 +991,29 @@ mod tests {
             ("range-diff", super::range_diff::LONG_OPTS, "name-only"),
             ("fetch", super::fetch::LONG_OPTS, "refetch"),
             ("fetch", super::fetch::LONG_OPTS, "unshallow"),
+            // `config`'s legacy action table: `OPT_CMDMODE`s and the
+            // `OPT_CALLBACK_VALUE` type spellings.
+            ("config", super::config::ACTION_OPTS, "get"),
+            ("config", super::config::ACTION_OPTS, "get-urlmatch"),
+            ("config", super::config::ACTION_OPTS, "replace-all"),
+            ("config", super::config::ACTION_OPTS, "unset-all"),
+            ("config", super::config::ACTION_OPTS, "rename-section"),
+            ("config", super::config::ACTION_OPTS, "remove-section"),
+            ("config", super::config::ACTION_OPTS, "list"),
+            ("config", super::config::ACTION_OPTS, "edit"),
+            ("config", super::config::ACTION_OPTS, "get-color"),
+            ("config", super::config::ACTION_OPTS, "get-colorbool"),
+            ("config", super::config::ACTION_OPTS, "bool-or-int"),
+            ("config", super::config::ACTION_OPTS, "bool-or-str"),
+            ("config", super::config::ACTION_OPTS, "expiry-date"),
+            ("checkout", super::checkout::LONG_OPTS, "ours"),
+            ("checkout", super::checkout::LONG_OPTS, "theirs"),
+            ("checkout", super::checkout::LONG_OPTS, "unified"),
+            ("checkout", super::checkout::LONG_OPTS, "inter-hunk-context"),
+            ("stash push", super::stash::PUSH_OPTS, "unified"),
+            ("stash push", super::stash::PUSH_OPTS, "inter-hunk-context"),
+            ("stash save", super::stash::SAVE_OPTS, "unified"),
+            ("multi-pack-index repack", super::multi_pack_index::REPACK_OPTS, "batch-size"),
         ];
         for &(verb, table, name) in cases {
             assert!(
@@ -982,6 +1053,88 @@ mod tests {
             assert!(
                 super::show_usage_if_asked(&args(&line), "usage: x\n").is_none(),
                 "{line:?} must not be read as a lone -h"
+            );
+        }
+    }
+
+    /// `show_usage_with_options_if_asked()` reads `--help-all` under the same
+    /// `ac == 2` guard as `-h`, and renders the *other* block for it.
+    ///
+    /// Both halves have been wrong in this port before. The guard is easy to
+    /// widen by accident, because `--help-all` fires anywhere for the
+    /// `parse_options()` family and only here for this one; and the two blocks
+    /// are easy to cross, because for 101 of git's 143 subcommands they are the
+    /// same bytes, so a swap is invisible until someone tries one of the other
+    /// 42.
+    #[test]
+    fn help_all_shares_the_lone_argument_guard_but_not_the_block() {
+        let args = |v: &[&str]| v.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        let (normal, full) = ("usage: x\n", "usage: x\n    --hidden\n");
+
+        assert!(super::show_usage_if_asked_full(&args(&["--help-all"]), normal, full).is_some());
+        assert!(super::show_usage_if_asked_full(&args(&["-h"]), normal, full).is_some());
+
+        for line in [
+            vec!["--help-all", "HEAD"],  // a trailing operand
+            vec!["--cached", "--help-all"], // an option ahead of it
+            vec!["--help-all", "-h"],    // still not `argc == 2`
+            vec!["--help-a"],            // `strcmp`, so no abbreviation
+            vec!["--help-all=x"],        // `strcmp`, so no attached value
+            vec!["--no-help-all"],
+            vec!["help-all"],
+        ] {
+            assert!(
+                super::show_usage_if_asked_full(&args(&line), normal, full).is_none(),
+                "{line:?} must not be read as a lone --help-all"
+            );
+        }
+
+        // The one-block wrapper is not a `-h`-only shortcut: the 101 commands
+        // whose two blocks are the same bytes still have to answer both
+        // spellings, and they reach that through this call.
+        assert!(super::show_usage_if_asked(&args(&["--help-all"]), normal).is_some());
+    }
+
+    /// `USAGE_FULL` *inserts* the `PARSE_OPT_HIDDEN` rows into `USAGE_NORMAL`;
+    /// it never edits or drops one.
+    ///
+    /// `usage_with_options_internal()` walks one option table and skips hidden
+    /// entries unless `full`, so the two renderings agree line for line
+    /// everywhere else. Keeping the pair as two captured strings is what makes
+    /// them able to disagree, and this is the disagreement that would go
+    /// unnoticed: a wording fix applied to one block and not the other still
+    /// prints a plausible usage text for whichever spelling was missed.
+    ///
+    /// The counts are git 2.55.0's, the version this port reproduces; the six
+    /// verbs here are the ones with the most hidden rows to lose.
+    #[test]
+    fn help_all_blocks_are_their_normal_block_plus_hidden_rows() {
+        let cat_file_usage = super::cat_file::USAGE_HEAD.to_string()
+            + super::cat_file::USAGE_TAIL;
+        let cat_file_usage_all = super::cat_file::USAGE_HEAD_ALL.to_string()
+            + super::cat_file::USAGE_TAIL_ALL;
+        let cases: [(&str, &str, &str, usize); 7] = [
+            ("apply", super::apply::USAGE, super::apply::USAGE_ALL, 3),
+            ("branch", super::branch::USAGE, super::branch::USAGE_ALL, 3),
+            ("cat-file", &cat_file_usage, &cat_file_usage_all, 3),
+            ("commit", super::commit::USAGE, super::commit::USAGE_ALL, 3),
+            ("fetch", super::fetch::USAGE, super::fetch::USAGE_ALL, 4),
+            ("log", super::log::USAGE, super::log::USAGE_ALL, 2),
+            ("rebase", super::rebase::USAGE, super::rebase::USAGE_ALL, 6),
+        ];
+
+        for (verb, normal, full, hidden) in cases {
+            let mut remaining = full.lines();
+            for line in normal.lines() {
+                assert!(
+                    remaining.any(|candidate| candidate == line),
+                    "{verb}: --help-all dropped or reworded a -h line: {line:?}"
+                );
+            }
+            assert_eq!(
+                full.lines().count(),
+                normal.lines().count() + hidden,
+                "{verb}: --help-all should add exactly {hidden} hidden lines"
             );
         }
     }

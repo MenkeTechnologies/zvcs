@@ -324,6 +324,9 @@ pub fn fast_export(args: &[String]) -> Result<ExitCode> {
     let mut import_marks: Option<(String, bool)> = None;
     let mut refspecs: Vec<String> = Vec::new();
     let mut pathspecs: Vec<String> = Vec::new();
+    // Set once a `--` has been seen, which is where `parse_options_step()` stops
+    // looking for `-h`/`--help-all`.
+    let mut after_dashdash = false;
 
     for a in args {
         let s = a.as_str();
@@ -345,11 +348,18 @@ pub fn fast_export(args: &[String]) -> Result<ExitCode> {
             // For fast-export the separator therefore has no observable effect,
             // so it is consumed and the tokens after it flow through the same
             // rev/pathspec resolution as the ones before (see the resolve stage).
-            "--" => {}
+            // The one exception is the help request: `parse_options_step()`
+            // *breaks* on `--` before it ever tests `internal_help`, so a `-h`
+            // or `--help-all` behind the separator is not a help request at all
+            // — it reaches `setup_revisions` as a stray `-`-token and leaves
+            // through `usage_exit()`'s stderr like any other.
+            "--" => after_dashdash = true,
 
             // parse_options()'s own `-h`: the block on stdout, exit 129 — not
             // `usage_exit()`, whose stderr is reserved for rejections.
-            "-h" => return Ok(super::show_usage(USAGE)),
+            // `--help-all` reaches the same renderer with USAGE_FULL, which this
+            // table renders identically: it has no `PARSE_OPT_HIDDEN` entry.
+            "-h" | "--help-all" if !after_dashdash => return Ok(super::show_usage(USAGE)),
 
             // ---- fast-export's own options ----
             "--no-data" => opts.no_data = true,

@@ -209,6 +209,14 @@ fn parse_options(args: &[String]) -> Result<Parsed> {
             no_more_opts = true;
             continue;
         }
+        // `parse_options_step()` tests `--help-all` with a `strcmp()` of its own,
+        // ahead of `parse_long_opt()`: the name never abbreviates and never takes
+        // an `=<value>`. This table has no `PARSE_OPT_HIDDEN` entry, so
+        // `USAGE_FULL` renders the same block `-h` prints.
+        if a == "--help-all" {
+            println!("{USAGE}");
+            return Ok(Parsed::Exit(EXIT_USAGE));
+        }
 
         if let Some(long) = a.strip_prefix("--") {
             // Split `--name=value` before resolving the name.

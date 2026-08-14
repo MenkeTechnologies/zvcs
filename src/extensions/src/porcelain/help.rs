@@ -1430,6 +1430,38 @@ const USAGE: &str = r#"usage: git help [-a|--all] [--[no-]verbose] [--[no-]exter
 
 "#;
 
+/// `usage_with_options_internal()`'s `USAGE_FULL` rendering — what `--help-all`
+/// prints. It is [`USAGE`] with the `PARSE_OPT_HIDDEN` entries left in:
+/// `--[no-]exclude-guides`, `--config-for-completion`,
+/// `--config-sections-for-completion`, `--aliases-for-completion`.
+/// Captured byte-for-byte from stock git 2.55.0's `git help --help-all`.
+const USAGE_ALL: &str = r#"usage: git help [-a|--all] [--[no-]verbose] [--[no-]external-commands] [--[no-]aliases]
+   or: git help [[-i|--info] [-m|--man] [-w|--web]] [<command>|<doc>]
+   or: git help [-g|--guides]
+   or: git help [-c|--config]
+   or: git help [--user-interfaces]
+   or: git help [--developer-interfaces]
+
+    -a, --all             print all available commands
+    --[no-]external-commands
+                          show external commands in --all
+    --[no-]aliases        show aliases in --all
+    --[no-]exclude-guides exclude guides
+    -m, --[no-]man        show man page
+    -w, --[no-]web        show manual in web browser
+    -i, --[no-]info       show info page
+    -v, --[no-]verbose    print command description
+    -g, --guides          print list of useful guides
+    --user-interfaces     print list of user-facing repository, command and file interfaces
+    --developer-interfaces
+                          print list of file formats, protocols and other developer interfaces
+    -c, --config          print all configuration variable names
+    --config-for-completion
+    --config-sections-for-completion
+    --aliases-for-completion
+
+"#;
+
 /// Column width of the name field in `git help -a`, i.e. git's `longest + 3`.
 /// The longest name in [`ALL_COMMANDS`] is `protocol-capabilities` (21).
 const ALL_WIDTH: usize = 24;
@@ -1520,6 +1552,14 @@ pub fn help(args: &[String]) -> Result<ExitCode> {
         };
         if let Some(long) = a.strip_prefix("--") {
             match long {
+                // `if (internal_help && !strcmp(arg + 2, "help-all"))`
+                // (parse-options.c:1122), one line ahead of the `"help"` test
+                // below and rendering `USAGE_FULL` rather than `USAGE_NORMAL`.
+                // Both are exact matches, so neither abbreviates.
+                "help-all" => {
+                    print!("{USAGE_ALL}");
+                    return Ok(ExitCode::from(129));
+                }
                 "help" => {
                     print!("{USAGE}");
                     return Ok(ExitCode::from(129));

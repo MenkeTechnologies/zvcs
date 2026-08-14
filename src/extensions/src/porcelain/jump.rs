@@ -426,7 +426,7 @@ fn unmerged_paths(repo: &gix::Repository, args: &[String]) -> Result<BTreeSet<BS
         if !no_more_flags && a.starts_with('-') {
             anyhow::bail!(
                 "unsupported argument {a:?}: git jump forwards it to `git ls-files -u`, whose \
-                 option parser and usage text are not reproduced here (ported: -- and pathspecs)"
+                 option parser and usage text are not reproduced here"
             );
         }
         patterns.push(BString::from(a.as_str()));

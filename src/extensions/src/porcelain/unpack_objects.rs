@@ -193,8 +193,9 @@ pub fn unpack_objects(args: &[String]) -> Result<ExitCode> {
     // `git.c` intercepts a lone `-h` before the builtin ever runs and prints the
     // usage line on stdout. It is not part of the builtin's own flag loop, so
     // `-h` alongside anything else is just an unknown argument and lands on
-    // stderr through the catch-all below.
-    if args.len() == 1 && args[0] == "-h" {
+    // stderr through the catch-all below. `--help-all` is the same sole-argument
+    // request for `USAGE_FULL`, which here renders the same single line.
+    if args.len() == 1 && matches!(args[0].as_str(), "-h" | "--help-all") {
         println!("{USAGE}");
         return Ok(ExitCode::from(129));
     }

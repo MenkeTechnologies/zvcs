@@ -265,7 +265,9 @@ pub fn replay(args: &[String]) -> Result<ExitCode> {
             "--ref-action" => ref_action = Some(value_of(args, &mut i, inline, name)?),
             // parse_options_step()'s `internal_help`: the block on stdout at
             // 129, ahead of every unported-flag refusal below.
-            "-h" => return Ok(super::show_usage(USAGE)),
+            // `--help-all` reaches the same renderer with USAGE_FULL, which this
+            // table renders identically: it has no `PARSE_OPT_HIDDEN` entry.
+            "-h" | "--help-all" => return Ok(super::show_usage(USAGE)),
             "--" => bail!(
                 "unsupported flag \"--\" (pathspec-limited replay is not ported; \
                  ported: --contained, --onto, --advance, --revert, --ref, --ref-action)"

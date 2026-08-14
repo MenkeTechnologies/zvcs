@@ -66,10 +66,14 @@ pub fn unpack_file(args: &[String]) -> Result<ExitCode> {
     // to stderr. Verified against git 2.55.0:
     //
     //   git unpack-file -h          -> stdout, 129
+    //   git unpack-file --help-all  -> stdout, 129
     //   git unpack-file             -> stderr, 129
     //   git unpack-file -h extra    -> stderr, 129
     //   git unpack-file -- <blob>   -> stderr, 129
-    let help_requested = args.len() == 1 && args[0] == "-h";
+    //
+    // `--help-all` is the same request against `USAGE_FULL`; with no options at
+    // all in the table there is nothing hidden to add, so it prints `USAGE`.
+    let help_requested = args.len() == 1 && matches!(args[0].as_str(), "-h" | "--help-all");
     if help_requested {
         println!("{USAGE}");
         return Ok(ExitCode::from(129));

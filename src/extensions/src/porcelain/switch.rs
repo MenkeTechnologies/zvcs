@@ -369,7 +369,19 @@ fn parse<'a>(args: &'a [String]) -> Result<Parse<'a>> {
 
 pub fn switch(args: &[String]) -> Result<ExitCode> {
     // `-h` as any argument prints usage on stdout and exits 129.
-    if args.iter().any(|a| a == "-h") {
+    //
+    // `--help-all` prints the same block. parse_options_step() tests it with a
+    // `strcmp()` of its own, ahead of parse_long_opt(), so the name never
+    // abbreviates and never takes an `=<value>` — it is deliberately not a
+    // [`LONG_OPTS`] entry. That test sits inside the argv loop *after* the `--`
+    // and `--end-of-options` breaks, so unlike `-h` it is not seen past either
+    // terminator, which is what the `take_while` reproduces. switch's option
+    // table has no `PARSE_OPT_HIDDEN` entry, so `USAGE_FULL` is this block.
+    let help_all = args
+        .iter()
+        .take_while(|a| a.as_str() != "--" && a.as_str() != "--end-of-options")
+        .any(|a| a == "--help-all");
+    if help_all || args.iter().any(|a| a == "-h") {
         print!("{USAGE}");
         return Ok(ExitCode::from(129));
     }

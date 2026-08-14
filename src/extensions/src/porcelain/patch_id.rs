@@ -92,9 +92,17 @@ pub fn patch_id(args: &[String]) -> Result<ExitCode> {
                 no_more_opts = true;
                 continue;
             }
-            "--help" => anyhow::bail!(
-                "unsupported flag \"--help\" (ported: -h, --stable, --unstable, --verbatim)"
-            ),
+            "--help" => anyhow::bail!("unsupported flag \"--help\""),
+            // parse_options_step() tests `--help-all` with a `strcmp()` of its
+            // own, ahead of parse_long_opt(): the name never abbreviates and
+            // never takes an `=<value>`, so it is matched here rather than
+            // resolved by `resolve_long` below. This table has no
+            // `PARSE_OPT_HIDDEN` entry, so `USAGE_FULL` renders the same block
+            // `-h` prints.
+            "--help-all" => {
+                print!("{USAGE}");
+                return Ok(ExitCode::from(129));
+            }
             _ if s.starts_with("--") => match resolve_long(&s[2..]) {
                 Long::Mode(val, name) => (val, name),
                 // `parse_options` rejects a value on a flag with the bare option

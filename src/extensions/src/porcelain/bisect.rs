@@ -126,8 +126,9 @@ pub fn bisect(args: &[String]) -> Result<ExitCode> {
         "replay" => replay_cmd(rest),
         "next" => next_cmd(),
         // `parse_options` answers `-h` on stdout, `usage_with_options` (which is
-        // what the `help` word reaches) on stderr. Both exit 129.
-        "-h" => {
+        // what the `help` word reaches) on stderr. Both exit 129. `--help-all`
+        // renders `USAGE_FULL`, identical here: no entry is `PARSE_OPT_HIDDEN`.
+        "-h" | "--help-all" => {
             print!("{USAGE}");
             Ok(ExitCode::from(129))
         }

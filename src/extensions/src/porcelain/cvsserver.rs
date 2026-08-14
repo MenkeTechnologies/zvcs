@@ -235,12 +235,10 @@ pub fn cvsserver(args: &[String]) -> Result<ExitCode> {
             return Ok(ExitCode::from(255));
         }
         bail!(
-            "the pserver authentication exchange is not ported (ported: option parsing, \
-             --version/-V, the operand split, the `BEGIN … REQUEST` header check and the \
-             request loop's end-of-input path). Past the header it reads the root, user and \
-             scrambled password and answers I LOVE YOU / I HATE YOU against the [gitcvs] \
-             authdb, which needs the CVS root resolution the server half provides plus a \
-             crypt(3) check of the descrambled password"
+            "the pserver authentication exchange is not ported. Past the header it reads the \
+             root, user and scrambled password and answers I LOVE YOU / I HATE YOU against the \
+             [gitcvs] authdb, which needs the CVS root resolution the server half provides plus \
+             a crypt(3) check of the descrambled password"
         );
     }
 
@@ -276,8 +274,7 @@ fn request_loop() -> Result<ExitCode> {
             return Ok(ExitCode::from(255));
         }
         bail!(
-            "the CVS request {verb:?} is not ported (ported: option parsing, --version/-V, \
-             the operand split and the request loop's end-of-input path). Stock \
+            "the CVS request {verb:?} is not ported. Stock \
              git-cvsserver answers it from a DBD::SQLite revision database it maintains \
              per head (gitcvs.<module>.sqlite), whose schema and incremental-update rules \
              are defined only by that Perl script; the vendored gitoxide has neither a CVS \

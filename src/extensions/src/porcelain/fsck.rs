@@ -901,7 +901,11 @@ impl Options {
             // `git.c` intercepts `--help` into a man page and parse-options turns
             // `-h` into the usage block; neither is reproducible past the usage
             // text, so both print it to stdout and exit 129 like `-h` does.
-            if s == "-h" || s == "--help" {
+            // `--help-all` is a `strcmp()` of its own in `parse_options_step()`,
+            // ahead of `parse_long_opt()`: it never abbreviates and never takes
+            // an `=<value>`. It renders `USAGE_FULL`, the same block as `-h`
+            // here, since no entry of this table is `PARSE_OPT_HIDDEN`.
+            if s == "-h" || s == "--help" || s == "--help-all" {
                 print!("{FSCK_USAGE}");
                 return ParseControl::Exit(129);
             }

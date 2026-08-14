@@ -164,6 +164,14 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
             i += 1;
             continue;
         }
+        // `if (internal_help && !strcmp(arg + 2, "help-all"))`
+        // (parse-options.c:1122): tested on the token as typed, ahead of the
+        // abbreviation resolver, because it is a `strcmp` — `--help-a` and
+        // `--help-all=x` stay unknown options. It renders `USAGE_FULL`, which
+        // for `add` is `USAGE` plus the hidden `--warn-embedded-repo`.
+        if a == "--help-all" {
+            return print_usage_all();
+        }
         // Respell a unique abbreviation as the name it resolves to, ahead of both
         // the shared value-option handler and the match below, so `--unif 3` and
         // `--intent-to` land where their full spellings land.
@@ -1241,9 +1249,54 @@ const USAGE: &str = concat!(
     "\n",
 );
 
+/// `usage_with_options_internal()`'s `USAGE_FULL` rendering — what `--help-all`
+/// prints. It is [`USAGE`] with the `PARSE_OPT_HIDDEN` entries left in:
+/// `--[no-]warn-embedded-repo`.
+/// Captured byte-for-byte from stock git 2.55.0's `git add --help-all`.
+const USAGE_ALL: &str = r#"usage: git add [<options>] [--] <pathspec>...
+
+    -n, --[no-]dry-run    dry run
+    -v, --[no-]verbose    be verbose
+
+    -i, --[no-]interactive
+                          interactive picking
+    -p, --[no-]patch      select hunks interactively
+    --[no-]auto-advance   auto advance to the next file when selecting hunks interactively
+    -U, --unified <n>     generate diffs with <n> lines context
+    --inter-hunk-context <n>
+                          show context between diff hunks up to the specified number of lines
+    -e, --[no-]edit       edit current diff and apply
+    -f, --[no-]force      allow adding otherwise ignored files
+    -u, --[no-]update     update tracked files
+    --[no-]renormalize    renormalize EOL of tracked files (implies -u)
+    -N, --[no-]intent-to-add
+                          record only the fact that the path will be added later
+    -A, --[no-]all        add changes from all tracked and untracked files
+    --[no-]ignore-removal ignore paths removed in the working tree (same as --no-all)
+    --[no-]refresh        don't add, only refresh the index
+    --[no-]ignore-errors  just skip files which cannot be added because of errors
+    --[no-]ignore-missing check if - even missing - files are ignored in dry run
+    --[no-]sparse         allow updating entries outside of the sparse-checkout cone
+    --[no-]chmod (+|-)x   override the executable bit of the listed files
+    --[no-]warn-embedded-repo
+                          warn when adding an embedded repository
+    --[no-]pathspec-from-file <file>
+                          read pathspec from file
+    --[no-]pathspec-file-nul
+                          with --pathspec-from-file, pathspec elements are separated with NUL character
+
+"#;
+
 /// `-h`: `parse_options()` prints the whole table on *stdout* and still exits 129.
 fn print_usage() -> Result<ExitCode> {
     print!("{USAGE}");
+    Ok(ExitCode::from(129))
+}
+
+/// `--help-all`: the same renderer over `USAGE_FULL`, so the hidden entry is
+/// listed too. Same stream, same 129.
+fn print_usage_all() -> Result<ExitCode> {
+    print!("{USAGE_ALL}");
     Ok(ExitCode::from(129))
 }
 

@@ -209,7 +209,12 @@ pub fn reflog(args: &[String]) -> Result<ExitCode> {
     // subcommand. So `-h` is this command's help exactly while it is the FIRST
     // token — the subcommand synopsis on stdout, exit 129. Once a subcommand has
     // been named, `-h` belongs to that subcommand's own parser instead.
-    if args.first().is_some_and(|a| a == "-h") {
+    // `--help-all` answers the same way: parse_options_step() tests it with a
+    // `strcmp()` of its own ahead of parse_long_opt(), and renders `USAGE_FULL`
+    // — identical here because this option table has no `PARSE_OPT_HIDDEN`
+    // entry. The compare is exact, which is why `--help-a` and `--help-all=x`
+    // stay `unrecognized argument` reports.
+    if args.first().is_some_and(|a| a == "-h" || a == "--help-all") {
         return Ok(super::show_usage(USAGE));
     }
 

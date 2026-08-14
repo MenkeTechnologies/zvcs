@@ -189,6 +189,52 @@ const STASH_USAGE: &str = r#"usage: git stash list [<log-options>]
 
 /// `git stash save -h`: the same option table as `push`, minus the pathspec
 /// options `save` does not take.
+/// The block a *push-assumed* failure renders (1978 bytes, git 2.55.0).
+///
+/// `git stash <flag>` with no sub-command re-enters `push_stash()` with
+/// `push_assumed` set, and that call renders `git_stash_usage` — the same usage
+/// lines `-h` prints — against the *push* option table, so the block carries
+/// push's twelve options where the `-h` block carries none (`cmd_stash`'s table
+/// is `OPT_SUBCOMMAND`s only). Same lines, different option list, 883 bytes
+/// apart: `git stash --bogus` and `git stash -h` do not print the same thing.
+const STASH_PUSH_USAGE: &str = r#"usage: git stash list [<log-options>]
+   or: git stash show [-u | --include-untracked | --only-untracked] [<diff-options>] [<stash>]
+   or: git stash drop [-q | --quiet] [<stash>]
+   or: git stash pop [--index] [-q | --quiet] [<stash>]
+   or: git stash apply [--index] [-q | --quiet] [--label-ours=<label>] [--label-theirs=<label>] [--label-base=<label>] [<stash>]
+   or: git stash branch <branchname> [<stash>]
+   or: git stash [push] [-p | --patch] [-S | --staged] [-k | --[no-]keep-index] [-q | --quiet]
+                 [-u | --include-untracked] [-a | --all] [(-m | --message) <message>]
+                 [--pathspec-from-file=<file> [--pathspec-file-nul]]
+                 [--] [<pathspec>...]
+   or: git stash save [-p | --patch] [-S | --staged] [-k | --[no-]keep-index] [-q | --quiet]
+                 [-u | --include-untracked] [-a | --all] [<message>]
+   or: git stash clear
+   or: git stash create [<message>]
+   or: git stash store [(-m | --message) <message>] [-q | --quiet] <commit>
+   or: git stash export (--print | --to-ref <ref>) [<stash>...]
+   or: git stash import <commit>
+
+    -k, --[no-]keep-index keep index
+    -S, --[no-]staged     stash staged changes only
+    -p, --[no-]patch      stash in patch mode
+    --[no-]auto-advance   auto advance to the next file when selecting hunks interactively
+    -U, --unified <n>     generate diffs with <n> lines context
+    --inter-hunk-context <n>
+                          show context between diff hunks up to the specified number of lines
+    -q, --[no-]quiet      quiet mode
+    -u, --[no-]include-untracked
+                          include untracked files in stash
+    -a, --[no-]all        include ignore files
+    -m, --[no-]message <message>
+                          stash message
+    --[no-]pathspec-from-file <file>
+                          read pathspec from file
+    --[no-]pathspec-file-nul
+                          with --pathspec-from-file, pathspec elements are separated with NUL character
+
+"#;
+
 const SAVE_USAGE: &str = r#"usage: git stash save [-p | --patch] [-S | --staged] [-k | --[no-]keep-index] [-q | --quiet]
                  [-u | --include-untracked] [-a | --all] [<message>]
 
@@ -269,10 +315,102 @@ const LIST_USAGE: &str = r#"usage: git stash list [<log-options>]
 
 "#;
 
+// ---------------------------------------------------------------------------
+// Option tables — one per `struct option options[]` in builtin/stash.c.
+//
+// `stash` is the command where a single shared table would be wrong in both
+// directions: `--label-ours` resolves under `apply` and is unknown under `pop`,
+// `--pathspec-from-file` resolves under `push` and is unknown under `save`, and
+// `--index` resolves under both `apply` and `pop` but under nothing else. Each
+// table below is its own sub-command's, in the C's declaration order.
+//
+// Five of the thirteen are deliberately absent, all for the same reason:
+// `register_abbrev()` returns without recording anything when
+// `PARSE_OPT_KEEP_UNKNOWN_OPT` is set (parse-options.c:502-503), so under that
+// flag a name matches exactly or not at all and there is nothing for a resolver
+// to do. `cmd_stash`'s own table (`OPT_SUBCOMMAND`s), `list_stash()`,
+// `store_stash()` and `show_stash()` all parse that way — `git stash show
+// --no-only-untracked` is not an unknown option in stock git, it is forwarded
+// verbatim to `setup_revisions()`. `create_stash()` has no table at all.
+// ---------------------------------------------------------------------------
+
+use super::{Arg, LongOpt};
+
+/// `push_stash()`'s table (builtin/stash.c:1917-1938). It is also the table the
+/// bare `git stash <flag>` form parses against, via the push-assumed re-entry.
+pub(super) const PUSH_OPTS: &[LongOpt] = &[
+    LongOpt { name: "keep-index", neg: true, arg: Arg::None },
+    LongOpt { name: "staged", neg: true, arg: Arg::None },
+    LongOpt { name: "patch", neg: true, arg: Arg::None },
+    LongOpt { name: "auto-advance", neg: true, arg: Arg::None },
+    // `OPT_DIFF_UNIFIED` / `OPT_DIFF_INTERHUNK_CONTEXT` are
+    // `OPT_INTEGER_F(..., PARSE_OPT_NONEG)` (parse-options.h:627-628).
+    LongOpt { name: "unified", neg: false, arg: Arg::Required },
+    LongOpt { name: "inter-hunk-context", neg: false, arg: Arg::Required },
+    LongOpt { name: "quiet", neg: true, arg: Arg::None },
+    LongOpt { name: "include-untracked", neg: true, arg: Arg::None },
+    LongOpt { name: "all", neg: true, arg: Arg::None },
+    LongOpt { name: "message", neg: true, arg: Arg::Required },
+    LongOpt { name: "pathspec-from-file", neg: true, arg: Arg::Required },
+    LongOpt { name: "pathspec-file-nul", neg: true, arg: Arg::None },
+];
+
+/// `save_stash()`'s table (builtin/stash.c:2024-2043): `push`'s first ten
+/// entries. The two pathspec options are `push`-only, so `git stash save
+/// --pathspec-from-file=x` is an unknown option where `push` accepts it.
+pub(super) const SAVE_OPTS: &[LongOpt] = PUSH_OPTS.split_at(10).0;
+
+/// `apply_stash()`'s table (builtin/stash.c:780-791).
+pub(super) const APPLY_OPTS: &[LongOpt] = &[
+    LongOpt { name: "quiet", neg: true, arg: Arg::None },
+    LongOpt { name: "index", neg: true, arg: Arg::None },
+    LongOpt { name: "label-ours", neg: true, arg: Arg::Required },
+    LongOpt { name: "label-theirs", neg: true, arg: Arg::Required },
+    LongOpt { name: "label-base", neg: true, arg: Arg::Required },
+];
+
+/// `pop_stash()`'s table (builtin/stash.c:886-891): `apply`'s first two. The
+/// three conflict-label options belong to `apply` alone.
+pub(super) const POP_OPTS: &[LongOpt] = APPLY_OPTS.split_at(2).0;
+
+/// `drop_stash()`'s table (builtin/stash.c:862-865): `OPT__QUIET` alone.
+pub(super) const DROP_OPTS: &[LongOpt] = APPLY_OPTS.split_at(1).0;
+
+/// `clear_stash()` (:319-321), `branch_stash()` (:918-920) and `import_stash()`
+/// (:2276-2278) each declare `OPT_END()` and nothing else, so no long option
+/// resolves and every `--x` is unknown.
+const NO_OPTS: &[LongOpt] = &[];
+
+/// Respell one token the way `parse_long_opt()` reads it against `table`, or
+/// hand back the already-rendered ambiguity refusal.
+fn canonical<'a>(
+    tok: &'a str,
+    table: &'static [LongOpt],
+    usage: &str,
+) -> std::result::Result<std::borrow::Cow<'a, str>, ExitCode> {
+    match super::canonical_long(tok, table) {
+        super::Long::Name(name) => Ok(name),
+        super::Long::Ambiguous(first, second) => {
+            Err(super::ambiguous_option(tok, &first, &second, usage))
+        }
+    }
+}
+
 /// `parse_options()`' built-in `-h`: the usage block on stdout, exit 129. It
 /// fires wherever the flag appears in the subcommand's own arguments.
+///
+/// `--help-all` is the same block. `parse_options_step()` tests it with a
+/// `strcmp()` of its own, ahead of `parse_long_opt()`, so the name never
+/// abbreviates and never takes an `=<value>`; and because that test sits inside
+/// the argv loop *after* the `--` and `--end-of-options` breaks, it is not seen
+/// past either terminator — hence the `take_while`. None of stash's option
+/// tables has a `PARSE_OPT_HIDDEN` entry, so its `USAGE_FULL` is this block.
 fn usage_requested(args: &[String], usage: &str) -> Option<ExitCode> {
-    args.iter().any(|a| a == "-h").then(|| {
+    let help_all = args
+        .iter()
+        .take_while(|a| a.as_str() != "--" && a.as_str() != "--end-of-options")
+        .any(|a| a == "--help-all");
+    (help_all || args.iter().any(|a| a == "-h")).then(|| {
         print!("{usage}");
         ExitCode::from(129)
     })
@@ -301,7 +439,7 @@ pub fn stash(args: &[String]) -> Result<ExitCode> {
             if let Some(code) = usage_requested(&args[1..], PUSH_USAGE) {
                 return Ok(code);
             }
-            let opts = match parse_push_options(&args[1..])? {
+            let opts = match parse_push_options(&args[1..], PUSH_USAGE)? {
                 Ok(o) => o,
                 Err(code) => return Ok(code),
             };
@@ -332,7 +470,10 @@ pub fn stash(args: &[String]) -> Result<ExitCode> {
             if let Some(code) = usage_requested(&args[1..], POP_USAGE) {
                 return Ok(code);
             }
-            let opts = parse_apply_options(&repo, &args[1..])?;
+            let opts = match parse_apply_options(&repo, &args[1..], POP_OPTS, POP_USAGE)? {
+                Ok(o) => o,
+                Err(code) => return Ok(code),
+            };
             let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
             apply_or_pop(&repo, &opts, true)
         }
@@ -340,7 +481,10 @@ pub fn stash(args: &[String]) -> Result<ExitCode> {
             if let Some(code) = usage_requested(&args[1..], APPLY_USAGE) {
                 return Ok(code);
             }
-            let opts = parse_apply_options(&repo, &args[1..])?;
+            let opts = match parse_apply_options(&repo, &args[1..], APPLY_OPTS, APPLY_USAGE)? {
+                Ok(o) => o,
+                Err(code) => return Ok(code),
+            };
             let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
             apply_or_pop(&repo, &opts, false)
         }
@@ -391,7 +535,12 @@ pub fn stash(args: &[String]) -> Result<ExitCode> {
                 if !a.starts_with('-') || a == "-" {
                     break;
                 }
-                if a == "-h" {
+                // `--help-all`'s own `strcmp()` in `parse_options_step()` runs
+                // after the two breaks above and before `parse_long_opt()`:
+                // exact name only, and `USAGE_FULL` is this block because
+                // `clear`'s table is empty of hidden entries — of entries at
+                // all, in fact.
+                if a == "-h" || a == "--help-all" {
                     return Ok(super::show_usage(CLEAR_USAGE));
                 }
                 return Ok(usage_error(a, CLEAR_USAGE));
@@ -428,7 +577,10 @@ pub fn stash(args: &[String]) -> Result<ExitCode> {
         }
         Some(flag) if flag.starts_with('-') => {
             // Implicit push with options, e.g. `git stash -m msg` or `git stash -u`.
-            let opts = match parse_push_options(args)? {
+            // `cmd_stash` re-enters `push_stash()` with `push_assumed` set, which
+            // renders `git_stash_usage` against push's option table — the same
+            // option surface as `git stash push`, a different usage block.
+            let opts = match parse_push_options(args, STASH_PUSH_USAGE)? {
                 Ok(o) => o,
                 Err(code) => return Ok(code),
             };
@@ -1439,8 +1591,14 @@ enum ShowUntracked {
 fn branch_stash(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
     let mut positionals: Vec<&str> = Vec::new();
     for a in args {
+        // `branch_stash()`'s table is `OPT_END()` alone, so nothing resolves and
+        // every dashed word is git's own `unknown option`/`unknown switch` with
+        // the block on stderr at 129.
+        if let Err(code) = canonical(a, NO_OPTS, BRANCH_USAGE) {
+            return Ok(code);
+        }
         if a.starts_with('-') && a.as_str() != "-" {
-            anyhow::bail!("unsupported stash branch option '{a}'");
+            return Ok(usage_error(a, BRANCH_USAGE));
         }
         positionals.push(a);
     }
@@ -2282,23 +2440,15 @@ fn parse_drop_options(args: &[String]) -> std::result::Result<(bool, Vec<String>
                 only_names = true;
                 continue;
             }
-            let (name, attached) = match body.split_once('=') {
-                Some((name, value)) => (name, Some(value)),
-                None => (body, None),
+            // The whole table is `OPT__QUIET`, so the only question is which
+            // sense the name resolves to — including the `--n`/`--no` spelling
+            // parse_long_opt reaches through "negated and abbreviated very much".
+            let set = match canonical(a, DROP_OPTS, DROP_USAGE)? {
+                name if name.starts_with("--no-") => false,
+                name if name.starts_with("--quiet") => true,
+                _ => return Err(usage_error(a, DROP_USAGE)),
             };
-            // The whole table is `quiet`, reachable positively by prefix and
-            // negatively through `no-` (including a `no-` that is itself only a
-            // prefix, parse_long_opt's "negated and abbreviated very much").
-            let set = if "quiet".starts_with(name) {
-                true
-            } else if "no-".starts_with(name) {
-                false
-            } else if name.strip_prefix("no-").is_some_and(|r| "quiet".starts_with(r)) {
-                false
-            } else {
-                return Err(usage_error(a, DROP_USAGE));
-            };
-            if attached.is_some() {
+            if body.contains('=') {
                 let shown = match set {
                     true => "quiet",
                     false => "no-quiet",
@@ -2535,7 +2685,10 @@ impl PushOpts {
 /// negations git generates for every boolean. Note that `--only-untracked` is
 /// *not* among them — git rejects it as an unknown option, so it is not
 /// accepted here either.
-fn parse_push_options(args: &[String]) -> Result<std::result::Result<PushOpts, ExitCode>> {
+fn parse_push_options(
+    args: &[String],
+    usage: &'static str,
+) -> Result<std::result::Result<PushOpts, ExitCode>> {
     let mut o = PushOpts::with_message(None);
     let mut from_file: Option<String> = None;
     let mut nul = false;
@@ -2545,7 +2698,20 @@ fn parse_push_options(args: &[String]) -> Result<std::result::Result<PushOpts, E
     let mut patch_opts = super::reset::PatchDiffOpts::default();
     let mut i = 0;
     while i < args.len() {
-        let a = args[i].as_str();
+        let orig = args[i].as_str();
+        // Respell the token the way `parse_long_opt()` reads it. Two positions
+        // are exempt because parse-options never looks them up: an argument owed
+        // to `-U`/`--unified`/`--inter-hunk-context`, and everything past `--`.
+        let resolved;
+        let a: &str = if patch_opts.awaiting_value() || rest_are_paths {
+            orig
+        } else {
+            resolved = match canonical(orig, PUSH_OPTS, usage) {
+                Ok(name) => name,
+                Err(code) => return Ok(Err(code)),
+            };
+            resolved.as_ref()
+        };
         // A value still owed is taken verbatim, even past `--`; otherwise these
         // options are only recognised while options are still being read.
         if patch_opts.awaiting_value() || !rest_are_paths {
@@ -2559,7 +2725,7 @@ fn parse_push_options(args: &[String]) -> Result<std::result::Result<PushOpts, E
             }
         }
         if rest_are_paths {
-            o.pathspecs.push(a.to_string());
+            o.pathspecs.push(orig.to_string());
             i += 1;
             continue;
         }
@@ -2569,6 +2735,11 @@ fn parse_push_options(args: &[String]) -> Result<std::result::Result<PushOpts, E
                 let m = args.get(i).ok_or_else(|| anyhow!("option '{a}' requires a value"))?;
                 o.message = Some(m.clone());
             }
+            // `OPT_STRING`/`OPT_FILENAME`/`OPT_BOOL` negations: git NULLs the
+            // pointer or clears the int, i.e. "as if never given".
+            "--no-message" => o.message = None,
+            "--no-pathspec-from-file" => from_file = None,
+            "--no-pathspec-file-nul" => nul = false,
             "-q" | "--quiet" => o.quiet = true,
             "--no-quiet" => o.quiet = false,
             "-u" | "--include-untracked" => o.untracked = Untracked::Include,
@@ -2598,9 +2769,9 @@ fn parse_push_options(args: &[String]) -> Result<std::result::Result<PushOpts, E
                 } else if other.starts_with('-') {
                     // `parse_options()`: the unknown flag, then the whole usage
                     // block, exit 129 — not a one-line `zvcs:` error.
-                    return Ok(Err(usage_error(other, PUSH_USAGE)));
+                    return Ok(Err(usage_error(other, usage)));
                 } else {
-                    o.pathspecs.push(other.to_string());
+                    o.pathspecs.push(orig.to_string());
                 }
             }
         }
@@ -2695,7 +2866,20 @@ fn parse_save_options(args: &[String]) -> Result<std::result::Result<PushOpts, E
     let mut words: Vec<String> = Vec::new();
     let mut rest_are_words = false;
     let mut patch_opts = super::reset::PatchDiffOpts::default();
-    for a in args {
+    let mut i = 0;
+    while i < args.len() {
+        let orig = args[i].as_str();
+        i += 1;
+        let resolved;
+        let a: &str = if patch_opts.awaiting_value() || rest_are_words {
+            orig
+        } else {
+            resolved = match canonical(orig, SAVE_OPTS, SAVE_USAGE) {
+                Ok(name) => name,
+                Err(code) => return Ok(Err(code)),
+            };
+            resolved.as_ref()
+        };
         if patch_opts.awaiting_value() || !rest_are_words {
             match patch_opts.take_arg(a) {
                 Err(code) => return Ok(Err(code)),
@@ -2704,10 +2888,10 @@ fn parse_save_options(args: &[String]) -> Result<std::result::Result<PushOpts, E
             }
         }
         if rest_are_words {
-            words.push(a.clone());
+            words.push(orig.to_string());
             continue;
         }
-        match a.as_str() {
+        match a {
             "-q" | "--quiet" => o.quiet = true,
             "--no-quiet" => o.quiet = false,
             "-u" | "--include-untracked" => o.untracked = Untracked::Include,
@@ -2720,11 +2904,30 @@ fn parse_save_options(args: &[String]) -> Result<std::result::Result<PushOpts, E
             "--no-staged" => o.staged_only = false,
             "-p" | "--patch" => o.patch = true,
             "--no-patch" => o.patch = false,
-            "--" => rest_are_words = true,
-            other if other.starts_with('-') && other != "-" => {
-                return Ok(Err(usage_error(other, SAVE_USAGE)))
+            // `save` has `-m`/`--message` in its table too, but the positional
+            // words win: `save_stash()` overwrites `stash_msg` with them whenever
+            // `argc` is non-zero (stash.c:2049-2050), so the parsed value only
+            // survives when nothing positional followed.
+            "-m" | "--message" => {
+                let Some(m) = args.get(i) else {
+                    return Ok(Err(super::missing_option_value(a)));
+                };
+                i += 1;
+                o.message = Some(m.clone());
             }
-            other => words.push(other.to_string()),
+            "--no-message" => o.message = None,
+            "--" => rest_are_words = true,
+            other => {
+                if let Some(m) = other.strip_prefix("--message=") {
+                    o.message = Some(m.to_string());
+                } else if let Some(m) = other.strip_prefix("-m") {
+                    o.message = Some(m.to_string());
+                } else if other.starts_with('-') && other != "-" {
+                    return Ok(Err(usage_error(other, SAVE_USAGE)));
+                } else {
+                    words.push(orig.to_string());
+                }
+            }
         }
     }
     if let Err(code) = patch_opts.finish() {
@@ -2750,7 +2953,11 @@ fn parse_save_options(args: &[String]) -> Result<std::result::Result<PushOpts, E
     if o.patch {
         o.staged_only = false;
     }
-    o.message = (!words.is_empty()).then(|| words.join(" "));
+    // `if (argc) stash_msg = strbuf_join_argv(...)`: the words replace whatever
+    // `-m` parsed, and an empty word list leaves that value alone.
+    if !words.is_empty() {
+        o.message = Some(words.join(" "));
+    }
     Ok(Ok(o))
 }
 
@@ -2828,50 +3035,84 @@ impl Default for ConflictLabels {
 /// `stash.index` seeds `restore_index` before the loop, exactly as `git_config`
 /// runs before `parse_options`, so an explicit `--no-index` on the command line
 /// countermands the config and an explicit `--index` is redundant with it.
-fn parse_apply_options(repo: &gix::Repository, args: &[String]) -> Result<ApplyOptions> {
+fn parse_apply_options(
+    repo: &gix::Repository,
+    args: &[String],
+    table: &'static [LongOpt],
+    usage: &'static str,
+) -> Result<std::result::Result<ApplyOptions, ExitCode>> {
     let mut restore_index = repo.config_snapshot().boolean("stash.index").unwrap_or(false);
     let mut quiet = false;
     let mut specs: Vec<String> = Vec::new();
     let mut labels = ConflictLabels::default();
-    for a in args {
-        // The label options take their value attached, as git's usage spells them.
-        if let Some(v) = a.strip_prefix("--label-ours=") {
-            labels.ours = v.to_string();
+    let mut i = 0;
+    while i < args.len() {
+        let orig = args[i].as_str();
+        i += 1;
+        let resolved = match canonical(orig, table, usage) {
+            Ok(name) => name,
+            Err(code) => return Ok(Err(code)),
+        };
+        let a: &str = resolved.as_ref();
+
+        // The three conflict-label options are `OPT_STRING`s, so each takes its
+        // value attached *or* as the next argument. They belong to `apply`
+        // alone, which is why the table decides whether they resolve at all.
+        let label = ["label-ours", "label-theirs", "label-base"]
+            .into_iter()
+            .find_map(|name| match a.strip_prefix(&format!("--{name}")) {
+                Some("") => Some((name, None)),
+                Some(rest) => rest.strip_prefix('=').map(|v| (name, Some(v.to_string()))),
+                None => None,
+            });
+        if let Some((name, attached)) = label {
+            let value = match attached {
+                Some(v) => v,
+                None => match args.get(i) {
+                    Some(v) => {
+                        i += 1;
+                        v.clone()
+                    }
+                    None => return Ok(Err(super::missing_option_value(&format!("--{name}")))),
+                },
+            };
+            match name {
+                "label-ours" => labels.ours = value,
+                "label-theirs" => labels.theirs = value,
+                _ => labels.base = Some(value),
+            }
             continue;
         }
-        if let Some(v) = a.strip_prefix("--label-theirs=") {
-            labels.theirs = v.to_string();
-            continue;
-        }
-        if let Some(v) = a.strip_prefix("--label-base=") {
-            labels.base = Some(v.to_string());
-            continue;
-        }
-        match a.as_str() {
+
+        match a {
             "--index" => restore_index = true,
             "--no-index" => restore_index = false,
             "-q" | "--quiet" => quiet = true,
             "--no-quiet" => quiet = false,
-            // `stash -p` runs the hunk selector against a SCRATCH index
-            // (`.git/stash-index`, seeded from HEAD and pointed at with
-            // `GIT_INDEX_FILE`), then turns that index into the stash tree.
-            // This port ignores `GIT_INDEX_FILE` everywhere, so the selector
-            // would stage into the REAL index instead — silently corrupting the
-            // user's staged state. Refused until the scratch-index plumbing
-            // exists; the selector itself is ready (`super::add_patch`).
-            "-p" | "--patch" => bail!("--patch is not ported"),
-            other if other.starts_with('-') && other != "-" => {
-                anyhow::bail!("unsupported stash option '{other}'")
+            // An `OPT_STRING` negation NULLs the pointer, and `do_apply_stash()`
+            // substitutes its own default for a NULL label.
+            "--no-label-ours" | "--no-label-theirs" | "--no-label-base" => {
+                let d = ConflictLabels::default();
+                match a {
+                    "--no-label-ours" => labels.ours = d.ours,
+                    "--no-label-theirs" => labels.theirs = d.theirs,
+                    _ => labels.base = d.base,
+                }
             }
-            other => specs.push(other.to_string()),
+            other if other.starts_with('-') && other != "-" => {
+                // Neither table has `--patch`; `git stash apply -p` is
+                // ``error: unknown switch `p'`` in stock git too.
+                return Ok(Err(usage_error(other, usage)));
+            }
+            _ => specs.push(orig.to_string()),
         }
     }
-    Ok(ApplyOptions {
+    Ok(Ok(ApplyOptions {
         specs,
         restore_index,
         quiet,
         labels,
-    })
+    }))
 }
 
 #[cfg(test)]

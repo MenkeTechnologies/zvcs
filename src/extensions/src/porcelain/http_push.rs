@@ -127,8 +127,7 @@ pub fn http_push(args: &[String]) -> Result<ExitCode> {
              (client/blocking_io/http/traits.rs), so none of the WebDAV verbs http-push is \
              built from — PROPFIND, MKCOL, LOCK/UNLOCK, PUT, MOVE — can be issued, and \
              gix-protocol implements no push at all; the <head> arguments are additionally \
-             left unvalidated because gix-refspec's push grammar diverges from git's \
-             (ported: -h, the usage check, and the -d/-D arity check only)"
+             left unvalidated because gix-refspec's push grammar diverges from git's"
         )
     }
 
@@ -151,8 +150,7 @@ pub fn http_push(args: &[String]) -> Result<ExitCode> {
         "http-push is not ported: pushing to {url} needs a WebDAV client (PROPFIND for DAV \
          compliance and the activity collection, MKCOL, LOCK/UNLOCK of info/refs, PUT and \
          MOVE of objects), but gix-transport's `trait Http` declares only `get` and `post` \
-         and gix-protocol exports only handshake, ls-refs and fetch (ported: -h, the usage \
-         check, and the -d/-D arity check only)"
+         and gix-protocol exports only handshake, ls-refs and fetch"
     )
 }
 

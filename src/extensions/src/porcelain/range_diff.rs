@@ -898,7 +898,9 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
             // parse_options_step() answers `-h` where it meets it, on stdout at
             // 129 — ahead of `unknown_option()`, whose `error:` line and stderr
             // belong to rejections.
-            "-h" => return Ok(super::show_usage(USAGE)),
+            // `--help-all` reaches the same renderer with USAGE_FULL, which this
+            // table renders identically: it has no `PARSE_OPT_HIDDEN` entry.
+            "-h" | "--help-all" => return Ok(super::show_usage(USAGE)),
             // A name `parse_options()` has never heard of loses immediately — it never
             // reaches the revision arguments, so unlike an unimplemented option there is
             // nothing to defer it behind.

@@ -41,6 +41,14 @@ usage: git rerere [clear | forget <pathspec>... | diff | status | remaining | gc
 
 ";
 
+/// `options[]` (builtin/rerere.c:60-65), the whole table: one `OPT_SET_INT`,
+/// which is negatable and takes no value.
+pub(super) const LONG_OPTS: &[super::LongOpt] = &[super::LongOpt {
+    name: "rerere-autoupdate",
+    neg: true,
+    arg: super::Arg::None,
+}];
+
 /// `rr_dir->status[variant]` bits from `rerere.c`.
 const RR_HAS_POSTIMAGE: u8 = 1;
 const RR_HAS_PREIMAGE: u8 = 2;
@@ -142,15 +150,30 @@ pub fn rerere(args: &[String]) -> Result<ExitCode> {
                 no_more_opts = true;
                 continue;
             }
-            if a == "-h" {
+            // parse_options_step() tests `--help-all` with a `strcmp()` of its
+            // own, ahead of parse_long_opt() and after the `--` break above, so
+            // the name never abbreviates and never takes an `=<value>` — that
+            // is why it is absent from `LONG_OPTS`. This table has no
+            // `PARSE_OPT_HIDDEN` entry, so `USAGE_FULL` renders the same block
+            // `-h` prints. Unlike `-h` it is not short-circuited by git.c
+            // before `RUN_SETUP`, so it lands here rather than above.
+            if a == "-h" || a == "--help-all" {
                 print!("{USAGE}");
                 return Ok(ExitCode::from(129));
             }
-            if a == "--rerere-autoupdate" {
+            // Any unambiguous prefix names the option, so `--rerere-au` and
+            // `--r` are both `--rerere-autoupdate` and `--n` is its negation.
+            let resolved = match super::canonical_long(a, LONG_OPTS) {
+                super::Long::Name(name) => name,
+                super::Long::Ambiguous(first, second) => {
+                    return Ok(super::ambiguous_option(a, &first, &second, USAGE))
+                }
+            };
+            if resolved == "--rerere-autoupdate" {
                 autoupdate = Some(true);
                 continue;
             }
-            if a == "--no-rerere-autoupdate" {
+            if resolved == "--no-rerere-autoupdate" {
                 autoupdate = Some(false);
                 continue;
             }

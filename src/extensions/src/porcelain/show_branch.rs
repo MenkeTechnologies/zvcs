@@ -479,6 +479,15 @@ fn parse_args(argv: &[String], opts: &mut Opts) -> Result<Vec<String>, ParseFail
         if !a.starts_with('-') || a == "-" {
             break;
         }
+        // parse_options_step() tests `--help-all` with a `strcmp()` of its own,
+        // ahead of parse_long_opt() and after the `--` break above: the name
+        // never abbreviates and never takes an `=<value>`, which is why it is
+        // absent from [`LONG_OPTS`]. show-branch's table has no
+        // `PARSE_OPT_HIDDEN` entry, so `USAGE_FULL` renders the same block `-h`
+        // prints, and both land on [`ParseFail::Help`].
+        if a == "--help-all" {
+            return Err(ParseFail::Help);
+        }
         // Respell a unique abbreviation as the name it resolves to, so `--indep`
         // reaches the same arm as `--independent`.
         let canonical;

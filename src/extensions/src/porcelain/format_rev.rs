@@ -265,9 +265,12 @@ pub fn format_rev(args: &[String]) -> Result<ExitCode> {
             "--stdin-mode" => mode_arg = Some(value(&mut i, "stdin-mode")?),
             "--notes" => notes.push(value(&mut i, "notes")?),
             "--no-notes" => notes.clear(), // the default: notes are not displayed
-            "-h" => {
+            "-h" | "--help-all" => {
                 // `parse_options` prints the usage on stdout for an explicit
-                // `-h` and exits 129, leaving stderr empty.
+                // `-h` and exits 129, leaving stderr empty. `--help-all` is
+                // `parse_options_step()`'s own `strcmp()`, rendering
+                // `USAGE_FULL` — the same block, as no entry of this table is
+                // `PARSE_OPT_HIDDEN`.
                 print!("{USAGE}");
                 std::io::stdout().flush()?;
                 return Ok(ExitCode::from(129));
@@ -411,7 +414,7 @@ fn resolve_format(arg: &str) -> Result<Option<Format>> {
         // git implements `reference` as this exact user format with a short date.
         "reference" => Format::User(parse_user_format("%h (%s, %as)")?),
         "email" | "mboxrd" => anyhow::bail!(
-            "unsupported --format \"{arg}\" (ported: oneline, short, medium, full, fuller, raw, reference, format:, tformat:, and user formats)"
+            "unsupported --format \"{arg}\""
         ),
         _ if arg.is_empty() || arg.contains('%') => Format::User(parse_user_format(arg)?),
         _ => return Ok(None),
@@ -628,7 +631,7 @@ fn parse_user_format(fmt: &str) -> Result<Vec<Item>> {
                     _ => {
                         let bad = sub as char;
                         anyhow::bail!(
-                            "unsupported placeholder \"%{ch}{bad}\" (ported: %{ch}n, %{ch}e, %{ch}l, %{ch}N, %{ch}E, %{ch}d, %{ch}D, %{ch}i, %{ch}I, %{ch}s, %{ch}t)"
+                            "unsupported placeholder \"%{ch}{bad}\""
                         );
                     }
                 };
@@ -935,7 +938,7 @@ fn parse_atom(b: &[u8], i: usize, items: &mut Vec<Item>, lit: &mut Vec<u8>) -> R
             SelectRef::AllRefs
         } else {
             anyhow::bail!(
-                "unsupported %(describe) options (ported: %(describe), %(describe:tags), %(describe:all))"
+                "unsupported %(describe) options"
             );
         };
         flush_lit(items, lit);

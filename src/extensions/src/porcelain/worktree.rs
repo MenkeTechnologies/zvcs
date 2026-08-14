@@ -107,7 +107,15 @@ pub fn worktree(args: &[String]) -> Result<ExitCode> {
         // `--help` is intercepted by the `git` wrapper and shows the man page,
         // which this binary has no equivalent for; the usage block is the
         // closest honest substitute.
-        "-h" | "--help" => {
+        //
+        // `--help-all` reaches the same renderer through a `strcmp()` of its
+        // own in parse_options_step(), ahead of parse_long_opt(): it never
+        // abbreviates and never takes an `=<value>`, so `--help-a` and
+        // `--help-all=x` still fall to the unknown-option refusal below. None
+        // of worktree's tables carries a `PARSE_OPT_HIDDEN` entry, so the
+        // `USAGE_FULL` it renders is the block `-h` prints — here and in every
+        // subcommand below.
+        "-h" | "--help" | "--help-all" => {
             print!("{MAIN_USAGE}");
             return Ok(ExitCode::from(129));
         }
@@ -409,7 +417,8 @@ fn list(args: &[String]) -> Result<ExitCode> {
     while i < args.len() {
         let a = args[i].as_str();
         match a {
-            "-h" | "--help" => {
+            // `--help-all` renders `USAGE_FULL`, the same block: no hidden entry.
+            "-h" | "--help" | "--help-all" => {
                 print!("{LIST_USAGE}");
                 return Ok(ExitCode::from(129));
             }
@@ -662,7 +671,8 @@ fn lock(args: &[String]) -> Result<ExitCode> {
     while i < args.len() {
         let a = args[i].as_str();
         match a {
-            "-h" | "--help" => {
+            // `--help-all` renders `USAGE_FULL`, the same block: no hidden entry.
+            "-h" | "--help" | "--help-all" => {
                 print!("{LOCK_USAGE}");
                 return Ok(ExitCode::from(129));
             }
@@ -719,7 +729,8 @@ fn unlock(args: &[String]) -> Result<ExitCode> {
     let mut target: Option<&str> = None;
     for a in args {
         match a.as_str() {
-            "-h" | "--help" => {
+            // `--help-all` renders `USAGE_FULL`, the same block: no hidden entry.
+            "-h" | "--help" | "--help-all" => {
                 print!("{UNLOCK_USAGE}");
                 return Ok(ExitCode::from(129));
             }
@@ -889,7 +900,8 @@ fn prune(args: &[String]) -> Result<ExitCode> {
     while i < args.len() {
         let a = args[i].as_str();
         match a {
-            "-h" | "--help" => {
+            // `--help-all` renders `USAGE_FULL`, the same block: no hidden entry.
+            "-h" | "--help" | "--help-all" => {
                 print!("{PRUNE_USAGE}");
                 return Ok(ExitCode::from(129));
             }
@@ -1140,7 +1152,8 @@ fn repair(args: &[String]) -> Result<ExitCode> {
     while i < args.len() {
         let a = args[i].as_str();
         match a {
-            "-h" | "--help" => {
+            // `--help-all` renders `USAGE_FULL`, the same block: no hidden entry.
+            "-h" | "--help" | "--help-all" => {
                 print!("{REPAIR_USAGE}");
                 return Ok(ExitCode::from(129));
             }
@@ -1676,7 +1689,8 @@ fn add(args: &[String]) -> Result<ExitCode> {
     while i < args.len() {
         let a = args[i].as_str();
         match a {
-            "-h" | "--help" => {
+            // `--help-all` renders `USAGE_FULL`, the same block: no hidden entry.
+            "-h" | "--help" | "--help-all" => {
                 print!("{MAIN_USAGE}");
                 return Ok(ExitCode::from(129));
             }
@@ -2027,7 +2041,8 @@ fn remove(args: &[String]) -> Result<ExitCode> {
     let mut target: Option<&str> = None;
     for a in args {
         match a.as_str() {
-            "-h" | "--help" => {
+            // `--help-all` renders `USAGE_FULL`, the same block: no hidden entry.
+            "-h" | "--help" | "--help-all" => {
                 print!("{MAIN_USAGE}");
                 return Ok(ExitCode::from(129));
             }
@@ -2105,7 +2120,8 @@ fn move_worktree(args: &[String]) -> Result<ExitCode> {
     let mut positionals: Vec<&str> = Vec::new();
     for a in args {
         match a.as_str() {
-            "-h" | "--help" => {
+            // `--help-all` renders `USAGE_FULL`, the same block: no hidden entry.
+            "-h" | "--help" | "--help-all" => {
                 print!("{MAIN_USAGE}");
                 return Ok(ExitCode::from(129));
             }

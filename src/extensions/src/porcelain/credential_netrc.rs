@@ -197,9 +197,7 @@ fn parse_args(args: &[String]) -> Result<(Opts, Vec<String>)> {
                 // `gpg|g:s` — the value is optional, so a bare `--gpg` only
                 // absorbs the next argument when it does not look like a flag.
                 "gpg" => opts.gpg = Some(attached.unwrap_or_else(|| take_optional_value(args, &mut i))),
-                _ => bail!(
-                    "unsupported flag {a:?} (ported: -f/--file, -g/--gpg, -k/--insecure, -d/--debug, -v/--verbose, -h/--help)"
-                ),
+                _ => bail!("unsupported flag {a:?}"),
             }
             continue;
         }
@@ -237,10 +235,7 @@ fn parse_args(args: &[String]) -> Result<(Opts, Vec<String>)> {
                         };
                         opts.gpg = Some(v);
                     }
-                    _ => bail!(
-                        "unsupported flag {:?} (ported: -f/--file, -g/--gpg, -k/--insecure, -d/--debug, -v/--verbose, -h/--help)",
-                        format!("-{c}")
-                    ),
+                    _ => bail!("unsupported flag {:?}", format!("-{c}")),
                 }
             }
             continue;

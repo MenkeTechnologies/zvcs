@@ -86,6 +86,15 @@ pub fn fsmonitor__daemon(args: &[String]) -> Result<ExitCode> {
             i += 1;
             continue;
         }
+        // parse_options_step() tests `--help-all` with a `strcmp()` of its own,
+        // ahead of parse_long_opt(): the name never abbreviates and never takes
+        // an `=<value>`, and it is not reached past `--`. This table has no
+        // `PARSE_OPT_HIDDEN` entry, so `USAGE_FULL` renders the same block `-h`
+        // prints.
+        if a == "--help-all" {
+            println!("{USAGE}");
+            return Ok(ExitCode::from(129));
+        }
         match a {
             "--" => no_more_options = true,
             "--detach" | "--no-detach" => {}
@@ -178,7 +187,7 @@ pub fn fsmonitor__daemon(args: &[String]) -> Result<ExitCode> {
         }
         "stop" => stop(&socket),
         "start" | "run" => crate::git_fatal!(
-            "`{}` needs the daemon substrate (a filesystem-notification backend and a simple-IPC server), which the vendored gitoxide crates do not provide (ported: status, stop)",
+            "`{}` needs the daemon substrate (a filesystem-notification backend and a simple-IPC server), which the vendored gitoxide crates do not provide",
             positional[0]
         ),
         other => {

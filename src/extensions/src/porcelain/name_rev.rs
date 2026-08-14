@@ -115,6 +115,29 @@ usage: git name-rev [<options>] <commit>...
 
 ";
 
+/// `usage_with_options_internal()`'s `USAGE_FULL` rendering — what `--help-all`
+/// prints. It is [`USAGE`] with the `PARSE_OPT_HIDDEN` entries left in:
+/// `--[no-]stdin`, `--[no-]peel-tag`.
+/// Captured byte-for-byte from stock git 2.55.0's `git name-rev --help-all`.
+const USAGE_ALL: &str = r#"usage: git name-rev [<options>] <commit>...
+   or: git name-rev [<options>] --all
+   or: git name-rev [<options>] --annotate-stdin
+
+    --[no-]name-only      print only ref-based names (no object names)
+    --[no-]tags           only use tags to name the commits
+    --[no-]refs <pattern> only use refs matching <pattern>
+    --[no-]exclude <pattern>
+                          ignore refs matching <pattern>
+
+    --[no-]all            list all commits reachable from all refs
+    --[no-]stdin          deprecated: use --annotate-stdin instead
+    --[no-]annotate-stdin annotate text from stdin
+    --[no-]undefined      allow to print `undefined` names (default)
+    --[no-]always         show abbreviated commit object as fallback
+    --[no-]peel-tag       dereference tags in the input (internal use)
+
+"#;
+
 /// git's `struct rev_name`: the best name found so far for one commit.
 struct RevName {
     /// The tip this name descends from, e.g. `tags/v1` or `master^2`.
@@ -441,6 +464,13 @@ pub fn name_rev(args: &[String]) -> Result<ExitCode> {
             "-h" => {
                 // git's `parse_options` prints the usage on stdout and exits 129.
                 print!("{USAGE}");
+                return Ok(ExitCode::from(129));
+            }
+            // `if (internal_help && !strcmp(arg + 2, "help-all"))`
+            // (parse-options.c:1122): an exact match, never an abbreviation and
+            // never with an `=<value>`, rendering `USAGE_FULL`.
+            "--help-all" => {
+                print!("{USAGE_ALL}");
                 return Ok(ExitCode::from(129));
             }
             "--name-only" => name_only = true,

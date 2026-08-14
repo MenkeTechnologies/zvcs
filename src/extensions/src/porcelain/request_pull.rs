@@ -97,7 +97,12 @@ pub fn request_pull(args: &[String]) -> Result<ExitCode> {
         match a {
             "--" => no_more_opts = true,
             "-p" => patch = true,
-            "-h" | "--help" => {
+            // parse_options_step() tests `--help-all` with a `strcmp()` of its
+            // own, ahead of parse_long_opt() and after the `--` break above, so
+            // the name never abbreviates and never takes an `=<value>`. The
+            // `OPTIONS_SPEC` declares no hidden entry, so `USAGE_FULL` renders
+            // the same block `-h` prints.
+            "-h" | "--help" | "--help-all" => {
                 print!("{USAGE}");
                 return Ok(ExitCode::from(129));
             }

@@ -31,11 +31,13 @@
 //!     It is also the only session shape in which a certificate can echo a nonce
 //!     this process did not mint, which is what `receive.certNonceSlop` grades.
 //!   * **Argument handling**: `-h` prints the 68-byte usage block on *stdout*
-//!     and exits 129; an unknown option prints ``error: unknown option `x'``
-//!     (or ``unknown switch `c'``) followed by that usage block on stderr, 129;
-//!     `--quiet=<v>` prints ``error: option `quiet' takes no value`` alone, 129;
-//!     no directory / more than one directory print `fatal: …` followed by the
-//!     158-byte usage block that also lists the hidden `--advertise-refs`, 129.
+//!     and exits 129; `--help-all` prints the 262-byte block that lists all
+//!     five hidden entries, also on stdout at 129; an unknown option prints
+//!     ``error: unknown option `x'`` (or ``unknown switch `c'``) followed by
+//!     the 68-byte block on stderr, 129; `--quiet=<v>` prints ``error: option
+//!     `quiet' takes no value`` alone, 129; no directory / more than one
+//!     directory print `fatal: …` followed by the 158-byte block that lists
+//!     only the hidden `--advertise-refs`, 129. All three blocks differ.
 //!   * **`<git-dir>` resolution** without upward discovery — `<dir>` or
 //!     `<dir>/.git`, the two forms git's `enter_repo()` resolves in practice;
 //!     anything else is `fatal: '<dir>' does not appear to be a git
@@ -173,6 +175,23 @@ usage: git receive-pack <git-dir>
 
 ";
 
+/// `usage_with_options_internal()`'s `USAGE_FULL` rendering — what `--help-all`
+/// prints. It is [`SHORT_USAGE`] with the `PARSE_OPT_HIDDEN` entries left in:
+/// `--[no-]skip-connectivity-check`, `--[no-]stateless-rpc`,
+/// `--[no-]http-backend-info-refs`, `--[no-]advertise-refs`,
+/// `--[no-]reject-thin-pack-for-testing`.
+/// Captured byte-for-byte from stock git 2.55.0's `git receive-pack --help-all`.
+const HELP_ALL_USAGE: &str = r#"usage: git receive-pack <git-dir>
+
+    -q, --[no-]quiet      quiet
+    --[no-]skip-connectivity-check
+    --[no-]stateless-rpc
+    --[no-]http-backend-info-refs
+    --[no-]advertise-refs alias of --http-backend-info-refs
+    --[no-]reject-thin-pack-for-testing
+
+"#;
+
 /// The same block as `usage_msg_opt` renders it for the two argument-count
 /// errors, which also lists the hidden `--advertise-refs` (158 bytes).
 const FULL_USAGE: &str = "\
@@ -283,6 +302,17 @@ fn parse(args: &[String]) -> Result<Parsed> {
         if a == "--" {
             no_more_opts = true;
             continue;
+        }
+
+        // `if (internal_help && !strcmp(arg + 2, "help-all"))`
+        // (parse-options.c:1122): an exact match tested after the `--` break
+        // above and before any table lookup, so it neither abbreviates nor takes
+        // an `=<value>`. `USAGE_FULL` here is neither of the other two blocks:
+        // it lists all five hidden entries, where [`FULL_USAGE`]'s
+        // `usage_msg_opt()` rendering lists only `--advertise-refs`.
+        if a == "--help-all" {
+            print!("{HELP_ALL_USAGE}");
+            return Ok(Parsed::Exit(ExitCode::from(129)));
         }
 
         if let Some(long) = a.strip_prefix("--") {

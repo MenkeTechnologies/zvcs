@@ -179,7 +179,9 @@ pub fn describe(args: &[String]) -> Result<ExitCode> {
             }
             // parse_options_step() answers `-h` on stdout at 129 — no
             // `error:` line, because it is not a rejection.
-            "-h" => return Ok(super::show_usage(USAGE)),
+            // `--help-all` reaches the same renderer with USAGE_FULL, which this
+            // table renders identically: it has no `PARSE_OPT_HIDDEN` entry.
+            "-h" | "--help-all" => return Ok(super::show_usage(USAGE)),
             _ => return unknown_arg_error(a),
         }
     }

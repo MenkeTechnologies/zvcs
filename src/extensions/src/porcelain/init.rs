@@ -182,6 +182,16 @@ pub fn init(args: &[String]) -> Result<ExitCode> {
             i += 1;
             continue;
         }
+        // parse_options_step() tests `--help-all` with a `strcmp()` of its own,
+        // ahead of parse_long_opt(): the name never abbreviates and never takes
+        // an `=<value>`, which is why the test sits before the abbreviation
+        // resolution below rather than in `LONG_OPTS`. This table has no
+        // `PARSE_OPT_HIDDEN` entry, so `USAGE_FULL` renders the same block `-h`
+        // prints.
+        if arg == "--help-all" {
+            print!("{USAGE}");
+            return Ok(ExitCode::from(129));
+        }
         // Respell a unique abbreviation as the name it resolves to, so `--init-b`
         // reaches the same arm as `--initial-branch`.
         let canonical;

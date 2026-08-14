@@ -216,7 +216,7 @@ const LONG_OPTS: &[LongOpt] = &[
 ];
 /// git's `apply` usage block, printed after `unknown option`/`unknown switch` on
 /// stderr with exit 129 (`parse-options`' `PARSE_OPT_ERROR`).
-const USAGE: &str = r"usage: git apply [<options>] [<patch>...]
+pub(super) const USAGE: &str = r"usage: git apply [<options>] [<patch>...]
 
     --exclude <path>      don't apply changes matching the given path
     --include <path>      apply changes matching the given path
@@ -260,6 +260,58 @@ const USAGE: &str = r"usage: git apply [<options>] [<patch>...]
     --[no-]allow-empty    don't return error for empty patches
 
 ";
+
+/// `usage_with_options_internal()`'s `USAGE_FULL` rendering — what `--help-all`
+/// prints. It is [`USAGE`] with the `PARSE_OPT_HIDDEN` entries left in:
+/// `--[no-]allow-binary-replacement`, `--[no-]binary`.
+/// Captured byte-for-byte from stock git 2.55.0's `git apply --help-all`.
+pub(super) const USAGE_ALL: &str = r#"usage: git apply [<options>] [<patch>...]
+
+    --exclude <path>      don't apply changes matching the given path
+    --include <path>      apply changes matching the given path
+    -p <num>              remove <num> leading slashes from traditional diff paths
+    --no-add              ignore additions made by the patch
+    --add                 opposite of --no-add
+    --[no-]stat           instead of applying the patch, output diffstat for the input
+    --[no-]allow-binary-replacement
+                          no-op (backward compatibility)
+    --[no-]binary         no-op (backward compatibility)
+    --[no-]numstat        show number of added and deleted lines in decimal notation
+    --[no-]summary        instead of applying the patch, output a summary for the input
+    --[no-]check          instead of applying the patch, see if the patch is applicable
+    --[no-]index          make sure the patch is applicable to the current index
+    -N, --[no-]intent-to-add
+                          mark new files with `git add --intent-to-add`
+    --[no-]cached         apply a patch without touching the working tree
+    --[no-]unsafe-paths   accept a patch that touches outside the working area
+    --[no-]apply          also apply the patch (use with --stat/--summary/--check)
+    -3, --[no-]3way       attempt three-way merge, fall back on normal patch if that fails
+    --ours                for conflicts, use our version
+    --theirs              for conflicts, use their version
+    --union               for conflicts, use a union version
+    --[no-]build-fake-ancestor <file>
+                          build a temporary index based on embedded index information
+    -z                    paths are separated with NUL character
+    -C <n>                ensure at least <n> lines of context match
+    --[no-]whitespace <action>
+                          detect new or modified lines that have whitespace errors
+    --[no-]ignore-space-change
+                          ignore changes in whitespace when finding context
+    --[no-]ignore-whitespace
+                          ignore changes in whitespace when finding context
+    -R, --[no-]reverse    apply the patch in reverse
+    --[no-]unidiff-zero   don't expect at least one line of context
+    --[no-]reject         leave the rejected hunks in corresponding *.rej files
+    --[no-]allow-overlap  allow overlapping hunks
+    -v, --[no-]verbose    be more verbose
+    -q, --[no-]quiet      be more quiet
+    --[no-]inaccurate-eof tolerate incorrectly detected missing new-line at the end of file
+    --[no-]recount        do not trust the line counts in the hunk headers
+    --[no-]directory <root>
+                          prepend <root> to all filenames
+    --[no-]allow-empty    don't return error for empty patches
+
+"#;
 
 // Reasons quoted back in the deferred unsupported-flag error.
 const R_INDEX: &str = "index mutation is not implemented";
@@ -458,6 +510,15 @@ fn parse_opts(
         if typed == "--" {
             no_more_opts = true;
             continue;
+        }
+
+        // `if (internal_help && !strcmp(arg + 2, "help-all"))`
+        // (parse-options.c:1122): tested on the token as typed, after the `--`
+        // break above and ahead of the abbreviation resolver, because it is a
+        // `strcmp` — `--help-a` and `--help-all=x` stay unknown options. It
+        // renders `USAGE_FULL`, which for `apply` keeps the two hidden no-ops.
+        if typed == "--help-all" {
+            return Err(super::show_usage(USAGE_ALL));
         }
 
         // Respell a unique abbreviation as the name it resolves to, so `--unidiff`

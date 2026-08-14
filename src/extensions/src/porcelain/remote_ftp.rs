@@ -121,7 +121,7 @@ fn command_loop() -> Result<ExitCode> {
             let verb = line.split(' ').next().unwrap_or(&line).to_string();
             anyhow::bail!(
                 "remote-ftp {verb:?} is unsupported: no FTP transport and no dumb-protocol \
-                 walker in the vendored gitoxide crates (ported: capabilities, option)"
+                 walker in the vendored gitoxide crates"
             );
         }
 

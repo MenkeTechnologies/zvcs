@@ -78,7 +78,12 @@ pub fn notes(args: &[String]) -> Result<ExitCode> {
             i += 1;
             break;
         }
-        if a == "-h" {
+        // parse_options_step() tests `--help-all` with a `strcmp()` of its own,
+        // ahead of parse_long_opt(): the name never abbreviates and never takes
+        // an `=<value>`, and it is not reached past the `--` handled above. This
+        // table has no `PARSE_OPT_HIDDEN` entry, so `USAGE_FULL` renders the
+        // same block `-h` prints.
+        if a == "-h" || a == "--help-all" {
             print_usage(&mut std::io::stdout())?;
             return Ok(ExitCode::from(129));
         }
@@ -2000,7 +2005,12 @@ fn merge(repo: &gix::Repository, notes_ref: &str, args: &[String]) -> Result<Exi
                 strategy = Some(s["--strategy=".len()..].to_string())
             }
             s if s.starts_with("-s") && s.len() > 2 => strategy = Some(s[2..].to_string()),
-            "-h" => {
+            // `--help-all` joins `-h`: parse_options_step() tests that name with
+            // a `strcmp()` of its own ahead of parse_long_opt() and renders
+            // `USAGE_FULL`, identical here because the merge option table has no
+            // `PARSE_OPT_HIDDEN` entry. The compare is exact, so `--help-a` and
+            // `--help-all=x` stay unknown-option reports.
+            "-h" | "--help-all" => {
                 merge_print_usage(&mut std::io::stdout())?;
                 return Ok(ExitCode::from(129));
             }

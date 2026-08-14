@@ -235,8 +235,7 @@ pub fn p4(args: &[String]) -> Result<ExitCode> {
         anyhow::bail!(
             "unsupported subcommand {cmd_name:?}: P4Submit's constructor probes the external `p4` \
              client for its `move` command before parsing any argument, and no Perforce client \
-             exists in the vendored gitoxide crates (ported: branches, and the option/help \
-             handling of sync, rebase, clone, unshelve)"
+             exists in the vendored gitoxide crates"
         );
     }
 
@@ -292,8 +291,7 @@ pub fn p4(args: &[String]) -> Result<ExitCode> {
         }
         _ => anyhow::bail!(
             "unsupported subcommand {cmd_name:?}: it reads depot content through the external `p4` \
-             client, for which there is no substrate in the vendored gitoxide crates \
-             (ported: branches, and the option/help handling of sync, rebase, clone, unshelve)"
+             client, for which there is no substrate in the vendored gitoxide crates"
         ),
     }
 }
@@ -989,8 +987,7 @@ fn run_unshelve_preflight(
 
     anyhow::bail!(
         "unsupported: unshelving changelist {:?} reads the shelved files through the external `p4` \
-         client, for which there is no substrate in the vendored gitoxide crates (ported: the \
-         changelist-count and --origin pre-flight)",
+         client, for which there is no substrate in the vendored gitoxide crates",
         parsed.positional[0]
     );
 }

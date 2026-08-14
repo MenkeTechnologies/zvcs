@@ -119,7 +119,14 @@ pub fn hook(args: &[String]) -> Result<ExitCode> {
         // answers `-h` before it looks for a subcommand: the two usage lines on
         // stdout, exit 129. Its option table is empty, so no option list follows
         // — only the blank line `usage_with_options_internal()` always ends on.
-        Some("-h") => Ok(super::show_usage(&format!("{USAGE_RUN}{USAGE_LIST_ALT}\n"))),
+        // `--help-all` is the same answer: parse_options_step() tests it with a
+        // `strcmp()` of its own ahead of parse_long_opt() and renders
+        // `USAGE_FULL`, which is this same block because the (empty) option table
+        // has no `PARSE_OPT_HIDDEN` entry. The compare is exact, so `--help-a`
+        // and `--help-all=x` stay unknown-subcommand reports.
+        Some("-h" | "--help-all") => {
+            Ok(super::show_usage(&format!("{USAGE_RUN}{USAGE_LIST_ALT}\n")))
+        }
         None => {
             eprint!("error: need a subcommand\n{USAGE_RUN}{USAGE_LIST_ALT}\n");
             Ok(ExitCode::from(129))

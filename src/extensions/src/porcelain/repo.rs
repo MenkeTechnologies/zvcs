@@ -103,8 +103,12 @@ pub fn repo(args: &[String]) -> Result<ExitCode> {
     };
 
     match first {
-        "-h" => {
-            // parse-options writes `-h` output to stdout and still exits 129.
+        // parse-options writes `-h` output to stdout and still exits 129.
+        // `--help-all` gets there through a `strcmp()` of its own inside
+        // parse_options_step(), ahead of parse_long_opt(): never abbreviated,
+        // never `=<value>`. It renders `USAGE_FULL`, identical to this block
+        // because the table has no `PARSE_OPT_HIDDEN` entry.
+        "-h" | "--help-all" => {
             print!("{USAGE_TOP}");
             Ok(ExitCode::from(129))
         }
@@ -139,7 +143,10 @@ fn info(args: &[String]) -> Result<ExitCode> {
         }
         match a {
             "--" => end_of_opts = true,
-            "-h" => {
+            // `--help-all` is its own `strcmp()` in parse_options_step(), after
+            // the `--` break above and before parse_long_opt(): exact name
+            // only, and `USAGE_FULL` is this block, no hidden entry existing.
+            "-h" | "--help-all" => {
                 print!("{USAGE_INFO}");
                 return Ok(ExitCode::from(129));
             }
@@ -304,7 +311,10 @@ fn structure(args: &[String]) -> Result<ExitCode> {
         }
         match a {
             "--" => end_of_opts = true,
-            "-h" => {
+            // Same `strcmp()` in parse_options_step(), ahead of
+            // parse_long_opt() and after the `--` break: exact name only, and
+            // `USAGE_FULL` is this block, the table having no hidden entry.
+            "-h" | "--help-all" => {
                 print!("{USAGE_STRUCTURE}");
                 return Ok(ExitCode::from(129));
             }

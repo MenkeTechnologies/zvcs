@@ -182,6 +182,41 @@ Merging
 
 ";
 
+/// `usage_with_options_internal()`'s `USAGE_FULL` rendering — what `--help-all`
+/// prints. It is [`USAGE`] with the `PARSE_OPT_HIDDEN` entries left in:
+/// `--[no-]super-prefix`.
+/// Captured byte-for-byte from stock git 2.55.0's `git read-tree --help-all`.
+const USAGE_ALL: &str = r#"usage: git read-tree [(-m [--trivial] [--aggressive] | --reset | --prefix=<prefix>)
+                     [-u | -i]] [--index-output=<file>] [--no-sparse-checkout]
+                     (--empty | <tree-ish1> [<tree-ish2> [<tree-ish3>]])
+
+    --[no-]super-prefix <prefix>
+                          prefixed path to initial superproject
+    --index-output <file> write resulting index to <file>
+    --[no-]empty          only empty the index
+    -v, --[no-]verbose    be verbose
+
+Merging
+    -m                    perform a merge in addition to a read
+    --[no-]trivial        3-way merge if no file level merging required
+    --[no-]aggressive     3-way merge in presence of adds and removes
+    --[no-]reset          same as -m, but discard unmerged entries
+    --prefix <subdirectory>/
+                          read the tree into the index under <subdirectory>/
+    -u                    update working tree with merge result
+    --exclude-per-directory <gitignore>
+                          allow explicitly ignored files to be overwritten
+    -i                    don't check the working tree after merging
+    -n, --[no-]dry-run    don't update the index or the work tree
+    --no-sparse-checkout  skip applying sparse checkout filter
+    --sparse-checkout     opposite of --no-sparse-checkout
+    --[no-]debug-unpack   debug unpack-trees
+    --[no-]recurse-submodules[=<checkout>]
+                          control recursive updating of submodules
+    -q, --[no-]quiet      suppress feedback messages
+
+"#;
+
 /// Report a git-style fatal and return git's exit code for it.
 fn fatal(msg: impl std::fmt::Display) -> Result<ExitCode> {
     eprintln!("fatal: {msg}");
@@ -302,6 +337,16 @@ pub(super) fn parse_args(argv: &[String]) -> Result<std::result::Result<Opts, Ex
         if a == "--" {
             only_positionals = true;
             continue;
+        }
+
+        // `if (internal_help && !strcmp(arg + 2, "help-all"))`
+        // (parse-options.c:1122): an exact match, tested after the `--` break
+        // above and before any table lookup, so it never abbreviates and never
+        // takes an `=<value>`. It renders `USAGE_FULL`, which for `read-tree`
+        // is `USAGE` plus the hidden `--super-prefix`.
+        if a == "--help-all" {
+            print!("{USAGE_ALL}");
+            return Ok(Err(ExitCode::from(129)));
         }
 
         // ---- Short option clusters (`-mu` is accepted by parse-options). ----

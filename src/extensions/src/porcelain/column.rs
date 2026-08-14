@@ -200,7 +200,11 @@ fn parse_args(
     while i < args.len() {
         let a = args[i].as_str();
 
-        if a == "-h" || a == "--help" {
+        // `--help-all` is a `strcmp()` of its own inside `parse_options_step()`,
+        // rendering `USAGE_FULL` — the same block `-h` prints, this table having
+        // no `PARSE_OPT_HIDDEN` entry. It never abbreviates and never takes an
+        // `=<value>`, so it is matched whole rather than resolved below.
+        if a == "-h" || a == "--help" || a == "--help-all" {
             return Ok(Outcome::Help);
         }
         if a == "--" {

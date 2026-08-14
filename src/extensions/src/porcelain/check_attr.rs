@@ -87,6 +87,14 @@ pub fn check_attr(args: &[String]) -> Result<ExitCode> {
             i += 1;
             continue;
         }
+        // `parse_options_step()` tests `--help-all` with a `strcmp()` of its own,
+        // ahead of `parse_long_opt()`: the name never abbreviates and never takes
+        // an `=<value>`. This table has no `PARSE_OPT_HIDDEN` entry, so
+        // `USAGE_FULL` renders the same block `-h` prints.
+        if a == "--help-all" {
+            print!("{USAGE}");
+            return Ok(ExitCode::from(129));
+        }
         let resolved = match super::canonical_long(a, LONG_OPTS) {
             super::Long::Name(name) => name,
             super::Long::Ambiguous(first, second) => {

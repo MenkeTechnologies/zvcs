@@ -85,11 +85,16 @@ pub fn prune_packed(args: &[String]) -> Result<ExitCode> {
         }
         match a {
             "--" => end_of_opts = true,
-            "-h" => {
+            // `--help-all` joins `-h`: parse_options_step() tests that name with
+            // a `strcmp()` of its own ahead of parse_long_opt(), so it is matched
+            // whole here rather than resolved by `resolve_long` below, and it
+            // renders `USAGE_FULL` — the same block, this table having no
+            // `PARSE_OPT_HIDDEN` entry.
+            "-h" | "--help-all" => {
                 print!("{USAGE}");
                 return Ok(ExitCode::from(129));
             }
-            "--help" => bail!("--help is not supported (ported: -h, -n/--dry-run, -q/--quiet)"),
+            "--help" => bail!("--help is not supported"),
             s if s.starts_with("--") => {
                 let body = &s[2..];
                 // parse-options resolves the positive spelling first, so an input

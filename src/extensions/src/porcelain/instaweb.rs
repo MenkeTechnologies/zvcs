@@ -1399,6 +1399,14 @@ fn parseopt(args: &[String]) -> Result<Vec<String>, Fail> {
             no_more_opts = true;
             continue;
         }
+        // parse_options_step() tests `--help-all` with a `strcmp()` of its own,
+        // ahead of parse_long_opt(): the name never abbreviates and never takes
+        // an `=<value>`, and it is not reached past `--`. The parseopt spec has
+        // no `PARSE_OPT_HIDDEN` entry, so `USAGE_FULL` renders the same block
+        // `-h` prints.
+        if arg == "--help-all" {
+            return Err(Fail { error: None, usage: Usage::Stdout });
+        }
         if let Some(name) = arg.strip_prefix("--") {
             parse_long(name, &mut rest, &mut out)?;
             continue;

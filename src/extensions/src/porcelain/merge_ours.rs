@@ -48,15 +48,11 @@ const USAGE: &str = "usage: git merge-ours <base>... -- HEAD <remote>...\n";
 /// `git merge-ours` — succeed iff the index still matches `HEAD`.
 pub fn merge_ours(args: &[String]) -> Result<ExitCode> {
     // show_usage_with_options_if_asked(): only when it is the *sole* argument.
-    if args.len() == 1 {
-        if args[0] == "-h" {
-            print!("{USAGE}");
-            return Ok(ExitCode::from(129));
-        }
-        if args[0] == "--help-all" {
-            eprint!("{USAGE}");
-            return Ok(ExitCode::from(129));
-        }
+    // The option table has no `PARSE_OPT_HIDDEN` entry — it has no entries at
+    // all — so `USAGE_FULL` renders the same block as `USAGE_NORMAL`, and both
+    // spellings land on stdout.
+    if let Some(code) = super::show_usage_if_asked(args, USAGE) {
+        return Ok(code);
     }
     // Every other argument is ignored, exactly as the C builtin ignores argv.
 

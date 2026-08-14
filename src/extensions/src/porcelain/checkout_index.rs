@@ -175,6 +175,14 @@ pub fn checkout_index(args: &[String]) -> Result<ExitCode> {
             i += 1;
             continue;
         }
+        // `if (internal_help && !strcmp(arg + 2, "help-all"))`
+        // (parse-options.c:1122): an exact match tested after the `--` break
+        // above and ahead of parse_long_opt(), so it neither abbreviates nor
+        // takes an `=<value>`. This table has no `PARSE_OPT_HIDDEN` entry, so
+        // `USAGE_FULL` renders the same block `-h` prints.
+        if a == "--help-all" {
+            return Ok(super::show_usage(USAGE));
+        }
         let resolved = match super::canonical_long(a, LONG_OPTS) {
             super::Long::Name(name) => name,
             super::Long::Ambiguous(first, second) => {

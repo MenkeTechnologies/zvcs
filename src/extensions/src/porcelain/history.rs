@@ -156,7 +156,11 @@ pub fn history(args: &[String]) -> Result<ExitCode> {
     };
 
     // `-h` anywhere in the leading position prints to stdout and still exits 129.
-    if first == "-h" || first == "--help" {
+    // `--help-all` joins it: parse_options_step() tests that name with a
+    // `strcmp()` of its own, ahead of parse_long_opt(), and renders `USAGE_FULL`
+    // — the same block, because this option table has no `PARSE_OPT_HIDDEN`
+    // entry. The exact compare is why `--help-a` and `--help-all=x` stay errors.
+    if first == "-h" || first == "--help" || first == "--help-all" {
         println!("{USAGE}");
         std::io::stdout().flush()?;
         return Ok(ExitCode::from(EXIT_USAGE));
@@ -1007,6 +1011,16 @@ fn parse(sub: Sub, args: &[String]) -> Result<Parsed> {
             no_more_opts = true;
             i += 1;
             continue;
+        }
+        // parse_options_step() tests `--help-all` with a `strcmp()` of its own,
+        // ahead of parse_long_opt(): the name never abbreviates and never takes
+        // an `=<value>`, so the test happens before the `=` split below. This
+        // table has no `PARSE_OPT_HIDDEN` entry, so `USAGE_FULL` renders the
+        // same block `-h` prints.
+        if a == "--help-all" {
+            println!("{}", sub.usage());
+            std::io::stdout().flush()?;
+            return Ok(Parsed::Exit(ExitCode::from(EXIT_USAGE)));
         }
 
         let (name, value) = match a.split_once('=') {

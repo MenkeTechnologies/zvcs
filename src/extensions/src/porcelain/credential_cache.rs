@@ -87,6 +87,14 @@ pub fn credential_cache(args: &[String]) -> Result<ExitCode> {
             }
             continue;
         }
+        // `parse_options_step()` tests `--help-all` with a `strcmp()` of its own,
+        // ahead of `parse_long_opt()`: the name never abbreviates and never takes
+        // an `=<value>`. This table has no `PARSE_OPT_HIDDEN` entry, so
+        // `USAGE_FULL` renders the same block `-h` prints.
+        if a == "--help-all" {
+            print!("{USAGE}");
+            return Ok(ExitCode::from(129));
+        }
 
         if let Some(long) = a.strip_prefix("--") {
             let (name, inline) = match long.split_once('=') {

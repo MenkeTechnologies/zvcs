@@ -228,7 +228,7 @@ use super::rebase_todo as todo;
 
 /// git's `builtin/rebase.c` usage block, reproduced verbatim (git 2.55.0) so the
 /// `-h` and unknown-option paths are byte-identical.
-const USAGE: &str = "\
+pub(super) const USAGE: &str = "\
 usage: git rebase [-i] [options] [--exec <cmd>] [--onto <newbase> | --keep-base] [<upstream> [<branch>]]
    or: git rebase [-i] [options] [--exec <cmd>] [--onto <newbase>] --root [<branch>]
    or: git rebase --continue | --abort | --skip | --edit-todo
@@ -292,6 +292,81 @@ usage: git rebase [-i] [options] [--exec <cmd>] [--onto <newbase> | --keep-base]
                           apply all changes, even those already present upstream
 
 ";
+
+/// `usage_with_options_internal()`'s `USAGE_FULL` rendering — what `--help-all`
+/// prints. It is [`USAGE`] with the `PARSE_OPT_HIDDEN` entries left in:
+/// `--[no-]ignore-date`, `--[no-]preserve-merges`, `--[no-]keep-empty`,
+/// `--[no-]allow-empty-message`.
+/// Captured byte-for-byte from stock git 2.55.0's `git rebase --help-all`.
+pub(super) const USAGE_ALL: &str = r#"usage: git rebase [-i] [options] [--exec <cmd>] [--onto <newbase> | --keep-base] [<upstream> [<branch>]]
+   or: git rebase [-i] [options] [--exec <cmd>] [--onto <newbase>] --root [<branch>]
+   or: git rebase --continue | --abort | --skip | --edit-todo
+
+    --[no-]onto <revision>
+                          rebase onto given branch instead of upstream
+    --[no-]keep-base      use the merge-base of upstream and branch as the current base
+    --no-verify           allow pre-rebase hook to run
+    --verify              opposite of --no-verify
+    -q, --[no-]quiet      be quiet. implies --no-stat
+    -v, --[no-]verbose    display a diffstat of what changed upstream
+    -n, --no-stat         do not show diffstat of what changed upstream
+    --stat                opposite of --no-stat
+    --[no-]trailer <trailer>
+                          add custom trailer(s)
+    --[no-]signoff        add a Signed-off-by trailer to each commit
+    --[no-]committer-date-is-author-date
+                          make committer date match author date
+    --[no-]reset-author-date
+                          ignore author date and use current date
+    --[no-]ignore-date    synonym of --reset-author-date
+    -C <n>                passed to 'git apply'
+    --[no-]ignore-whitespace
+                          ignore changes in whitespace
+    --[no-]whitespace <action>
+                          passed to 'git apply'
+    -f, --[no-]force-rebase
+                          cherry-pick all commits, even if unchanged
+    --no-ff               cherry-pick all commits, even if unchanged
+    --ff                  opposite of --no-ff
+    --continue            continue
+    --skip                skip current patch and continue
+    --abort               abort and check out the original branch
+    --quit                abort but keep HEAD where it is
+    --edit-todo           edit the todo list during an interactive rebase
+    --show-current-patch  show the patch file being applied or merged
+    --apply               use apply strategies to rebase
+    -m, --merge           use merging strategies to rebase
+    -i, --interactive     let the user edit the list of commits to rebase
+    -p, --[no-]preserve-merges
+                          (REMOVED) was: try to recreate merges instead of ignoring them
+    --[no-]rerere-autoupdate
+                          update the index with reused conflict resolution if possible
+    --empty (drop|keep|stop)
+                          how to handle commits that become empty
+    -k, --[no-]keep-empty keep commits which start empty
+    --[no-]autosquash     move commits that begin with squash!/fixup! under -i
+    --[no-]update-refs    update branches that point to commits that are being rebased
+    -S, --[no-]gpg-sign[=<key-id>]
+                          GPG-sign commits
+    --[no-]autostash      automatically stash/stash pop before and after
+    -x, --[no-]exec <exec>
+                          add exec lines after each commit of the editable list
+    --[no-]allow-empty-message
+                          allow rebasing commits with empty messages
+    -r, --[no-]rebase-merges[=<mode>]
+                          try to rebase merges instead of skipping them
+    --[no-]fork-point     use 'merge-base --fork-point' to refine upstream
+    -s, --[no-]strategy <strategy>
+                          use the given merge strategy
+    -X, --[no-]strategy-option <option>
+                          pass the argument through to the merge strategy
+    --[no-]root           rebase all reachable commits up to the root(s)
+    --[no-]reschedule-failed-exec
+                          automatically re-schedule any `exec` that fails
+    --[no-]reapply-cherry-picks
+                          apply all changes, even those already present upstream
+
+"#;
 
 /// `options.flags`, mirroring the `REBASE_*` bits in `builtin/rebase.c`.
 const NO_QUIET: u32 = 1 << 0;
@@ -491,6 +566,16 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
             no_more_options = true;
             i += 1;
             continue;
+        }
+
+        // `if (internal_help && !strcmp(arg + 2, "help-all"))`
+        // (parse-options.c:1122): an exact match tested after the `--` break
+        // above and ahead of parse_long_opt(), so it wins over the unknown-name
+        // refusal just below, never abbreviates, and never takes an `=<value>`.
+        // It renders `USAGE_FULL`, which for `rebase` keeps six hidden entries
+        // including the `(REMOVED)` `--preserve-merges`.
+        if a == "--help-all" {
+            return Ok(super::show_usage(USAGE_ALL));
         }
 
         // A long name no table entry claims loses here, before the `no-` splitting

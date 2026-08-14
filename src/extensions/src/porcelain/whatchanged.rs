@@ -778,6 +778,11 @@ fn parse_args(
         if a == "-h" {
             return Err(Fatal::help(super::log::USAGE));
         }
+        // `--help-all` renders `USAGE_FULL`: the same block with the hidden
+        // `--i-still-use-this` left in.
+        if a == "--help-all" {
+            return Err(Fatal::help(super::log::USAGE_ALL));
+        }
 
         if a.starts_with('-') && a.len() > 1 {
             i += consume_option(args, i, &mut p, &mut st, &mut unrecognized)?;

@@ -103,7 +103,79 @@ use gix::remote::fetch::{RefLogMessage, Shallow, Status, Tags};
 #[allow(unused_assignments)]
 /// `git fetch`'s usage block, byte-for-byte from stock git 2.55.0, printed on stdout
 /// for `-h` with exit 129 — `parse-options` answers it before anything else.
-const USAGE: &str = "usage: git fetch [<options>] [<repository> [<refspec>...]]\n   or: git fetch [<options>] <group>\n   or: git fetch --multiple [<options>] [(<repository>|<group>)...]\n   or: git fetch --all [<options>]\n\n    -v, --[no-]verbose    be more verbose\n    -q, --[no-]quiet      be more quiet\n    --[no-]all            fetch from all remotes\n    --[no-]set-upstream   set upstream for git pull/fetch\n    -a, --[no-]append     append to .git/FETCH_HEAD instead of overwriting\n    --[no-]atomic         use atomic transaction to update references\n    --[no-]upload-pack <path>\n                          path to upload pack on remote end\n    -f, --[no-]force      force overwrite of local reference\n    -m, --[no-]multiple   fetch from multiple remotes\n    -t, --[no-]tags       fetch all tags and associated objects\n    -n                    do not fetch all tags (--no-tags)\n    -j, --[no-]jobs <n>   number of submodules fetched in parallel\n    --[no-]prefetch       modify the refspec to place all refs within refs/prefetch/\n    -p, --[no-]prune      prune remote-tracking branches no longer on remote\n    -P, --[no-]prune-tags prune local tags no longer on remote and clobber changed tags\n    --[no-]recurse-submodules[=<on-demand>]\n                          control recursive fetching of submodules\n    --[no-]dry-run        dry run\n    --[no-]porcelain      machine-readable output\n    --[no-]write-fetch-head\n                          write fetched references to the FETCH_HEAD file\n    -k, --[no-]keep       keep downloaded pack\n    -u, --[no-]update-head-ok\n                          allow updating of HEAD ref\n    --[no-]progress       force progress reporting\n    --[no-]depth <depth>  deepen history of shallow clone\n    --[no-]shallow-since <time>\n                          deepen history of shallow repository based on time\n    --[no-]shallow-exclude <ref>\n                          deepen history of shallow clone, excluding ref\n    --[no-]deepen <n>     deepen history of shallow clone\n    --unshallow           convert to a complete repository\n    --refetch             re-fetch without negotiating common commits\n    --[no-]update-shallow accept refs that update .git/shallow\n    --refmap <refmap>     specify fetch refmap\n    -o, --[no-]server-option <server-specific>\n                          option to transmit\n    -4, --ipv4            use IPv4 addresses only\n    -6, --ipv6            use IPv6 addresses only\n    --[no-]negotiation-restrict <revision>\n                          report that we have only objects reachable from this object\n    --[no-]negotiation-tip <revision>\n                          alias of --negotiation-restrict\n    --[no-]negotiation-include <revision>\n                          ensure this ref is always sent as a negotiation have\n    --[no-]negotiate-only do not fetch a packfile; instead, print ancestors of negotiation tips\n    --[no-]filter <args>  object filtering\n    --[no-]auto-maintenance\n                          run 'maintenance --auto' after fetching\n    --[no-]auto-gc        run 'maintenance --auto' after fetching\n    --[no-]show-forced-updates\n                          check for forced-updates on all updated branches\n    --[no-]write-commit-graph\n                          write the commit-graph after fetching\n    --[no-]stdin          accept refspecs from stdin\n\n";
+pub(super) const USAGE: &str = "usage: git fetch [<options>] [<repository> [<refspec>...]]\n   or: git fetch [<options>] <group>\n   or: git fetch --multiple [<options>] [(<repository>|<group>)...]\n   or: git fetch --all [<options>]\n\n    -v, --[no-]verbose    be more verbose\n    -q, --[no-]quiet      be more quiet\n    --[no-]all            fetch from all remotes\n    --[no-]set-upstream   set upstream for git pull/fetch\n    -a, --[no-]append     append to .git/FETCH_HEAD instead of overwriting\n    --[no-]atomic         use atomic transaction to update references\n    --[no-]upload-pack <path>\n                          path to upload pack on remote end\n    -f, --[no-]force      force overwrite of local reference\n    -m, --[no-]multiple   fetch from multiple remotes\n    -t, --[no-]tags       fetch all tags and associated objects\n    -n                    do not fetch all tags (--no-tags)\n    -j, --[no-]jobs <n>   number of submodules fetched in parallel\n    --[no-]prefetch       modify the refspec to place all refs within refs/prefetch/\n    -p, --[no-]prune      prune remote-tracking branches no longer on remote\n    -P, --[no-]prune-tags prune local tags no longer on remote and clobber changed tags\n    --[no-]recurse-submodules[=<on-demand>]\n                          control recursive fetching of submodules\n    --[no-]dry-run        dry run\n    --[no-]porcelain      machine-readable output\n    --[no-]write-fetch-head\n                          write fetched references to the FETCH_HEAD file\n    -k, --[no-]keep       keep downloaded pack\n    -u, --[no-]update-head-ok\n                          allow updating of HEAD ref\n    --[no-]progress       force progress reporting\n    --[no-]depth <depth>  deepen history of shallow clone\n    --[no-]shallow-since <time>\n                          deepen history of shallow repository based on time\n    --[no-]shallow-exclude <ref>\n                          deepen history of shallow clone, excluding ref\n    --[no-]deepen <n>     deepen history of shallow clone\n    --unshallow           convert to a complete repository\n    --refetch             re-fetch without negotiating common commits\n    --[no-]update-shallow accept refs that update .git/shallow\n    --refmap <refmap>     specify fetch refmap\n    -o, --[no-]server-option <server-specific>\n                          option to transmit\n    -4, --ipv4            use IPv4 addresses only\n    -6, --ipv6            use IPv6 addresses only\n    --[no-]negotiation-restrict <revision>\n                          report that we have only objects reachable from this object\n    --[no-]negotiation-tip <revision>\n                          alias of --negotiation-restrict\n    --[no-]negotiation-include <revision>\n                          ensure this ref is always sent as a negotiation have\n    --[no-]negotiate-only do not fetch a packfile; instead, print ancestors of negotiation tips\n    --[no-]filter <args>  object filtering\n    --[no-]auto-maintenance\n                          run 'maintenance --auto' after fetching\n    --[no-]auto-gc        run 'maintenance --auto' after fetching\n    --[no-]show-forced-updates\n                          check for forced-updates on all updated branches\n    --[no-]write-commit-graph\n                          write the commit-graph after fetching\n    --[no-]stdin          accept refspecs from stdin\n\n";
+
+/// `usage_with_options_internal()`'s `USAGE_FULL` rendering — what `--help-all`
+/// prints. It is [`USAGE`] with the `PARSE_OPT_HIDDEN` entries left in:
+/// `--[no-]submodule-prefix`, `--[no-]recurse-submodules-default`.
+/// Captured byte-for-byte from stock git 2.55.0's `git fetch --help-all`.
+pub(super) const USAGE_ALL: &str = r#"usage: git fetch [<options>] [<repository> [<refspec>...]]
+   or: git fetch [<options>] <group>
+   or: git fetch --multiple [<options>] [(<repository>|<group>)...]
+   or: git fetch --all [<options>]
+
+    -v, --[no-]verbose    be more verbose
+    -q, --[no-]quiet      be more quiet
+    --[no-]all            fetch from all remotes
+    --[no-]set-upstream   set upstream for git pull/fetch
+    -a, --[no-]append     append to .git/FETCH_HEAD instead of overwriting
+    --[no-]atomic         use atomic transaction to update references
+    --[no-]upload-pack <path>
+                          path to upload pack on remote end
+    -f, --[no-]force      force overwrite of local reference
+    -m, --[no-]multiple   fetch from multiple remotes
+    -t, --[no-]tags       fetch all tags and associated objects
+    -n                    do not fetch all tags (--no-tags)
+    -j, --[no-]jobs <n>   number of submodules fetched in parallel
+    --[no-]prefetch       modify the refspec to place all refs within refs/prefetch/
+    -p, --[no-]prune      prune remote-tracking branches no longer on remote
+    -P, --[no-]prune-tags prune local tags no longer on remote and clobber changed tags
+    --[no-]recurse-submodules[=<on-demand>]
+                          control recursive fetching of submodules
+    --[no-]dry-run        dry run
+    --[no-]porcelain      machine-readable output
+    --[no-]write-fetch-head
+                          write fetched references to the FETCH_HEAD file
+    -k, --[no-]keep       keep downloaded pack
+    -u, --[no-]update-head-ok
+                          allow updating of HEAD ref
+    --[no-]progress       force progress reporting
+    --[no-]depth <depth>  deepen history of shallow clone
+    --[no-]shallow-since <time>
+                          deepen history of shallow repository based on time
+    --[no-]shallow-exclude <ref>
+                          deepen history of shallow clone, excluding ref
+    --[no-]deepen <n>     deepen history of shallow clone
+    --unshallow           convert to a complete repository
+    --refetch             re-fetch without negotiating common commits
+    --[no-]submodule-prefix <dir>
+                          prepend this to submodule path output
+    --[no-]recurse-submodules-default <on-demand>
+                          default for recursive fetching of submodules (lower priority than config files)
+    --[no-]update-shallow accept refs that update .git/shallow
+    --refmap <refmap>     specify fetch refmap
+    -o, --[no-]server-option <server-specific>
+                          option to transmit
+    -4, --ipv4            use IPv4 addresses only
+    -6, --ipv6            use IPv6 addresses only
+    --[no-]negotiation-restrict <revision>
+                          report that we have only objects reachable from this object
+    --[no-]negotiation-tip <revision>
+                          alias of --negotiation-restrict
+    --[no-]negotiation-include <revision>
+                          ensure this ref is always sent as a negotiation have
+    --[no-]negotiate-only do not fetch a packfile; instead, print ancestors of negotiation tips
+    --[no-]filter <args>  object filtering
+    --[no-]auto-maintenance
+                          run 'maintenance --auto' after fetching
+    --[no-]auto-gc        run 'maintenance --auto' after fetching
+    --[no-]show-forced-updates
+                          check for forced-updates on all updated branches
+    --[no-]write-commit-graph
+                          write the commit-graph after fetching
+    --[no-]stdin          accept refspecs from stdin
+
+"#;
 
 /// `cmd_fetch()`'s `struct option builtin_fetch_options[]` (builtin/fetch.c), in
 /// table order, as [`super::resolve_long_aliased`] reads it.
@@ -167,6 +239,20 @@ const ALIAS_GROUPS: &[&[&str]] = &[&["negotiation-tip", "negotiation-restrict"]]
 pub fn fetch(args: &[String]) -> Result<ExitCode> {
     if args.iter().any(|a| a == "-h") {
         print!("{USAGE}");
+        return Ok(ExitCode::from(129));
+    }
+    // `--help-all` renders `USAGE_FULL` — `USAGE` plus the hidden
+    // `--submodule-prefix` and `--recurse-submodules-default`.
+    // `parse_options_step()` *breaks* on `--` and `--end-of-options` one line
+    // before it tests the name (parse-options.c:1112-1122), so the search stops
+    // at the terminator; and because the test is a `strcmp`, no abbreviation
+    // and no `=<value>` spelling reaches it.
+    if args
+        .iter()
+        .take_while(|a| a.as_str() != "--" && a.as_str() != "--end-of-options")
+        .any(|a| a == "--help-all")
+    {
+        print!("{USAGE_ALL}");
         return Ok(ExitCode::from(129));
     }
     let mut repo = gix::discover(".")?;

@@ -141,6 +141,16 @@ pub fn url_parse(args: &[String]) -> Result<ExitCode> {
             i += 1;
             continue;
         }
+        // parse_options_step() tests `--help-all` with a `strcmp()` of its own,
+        // after the `--` break above and ahead of parse_long_opt(): the name
+        // never abbreviates and never takes an `=<value>`, so it never reaches
+        // the `is_abbrev` matching below. url-parse's table has no
+        // `PARSE_OPT_HIDDEN` entry, so `USAGE_FULL` renders the same block `-h`
+        // prints.
+        if arg == "--help-all" {
+            print!("{USAGE}");
+            return Ok(ExitCode::from(129));
+        }
         if let Some(long) = arg.strip_prefix("--") {
             let (name, inline) = match long.split_once('=') {
                 Some((n, v)) => (n, Some(v)),

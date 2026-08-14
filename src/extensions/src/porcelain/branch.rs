@@ -20,7 +20,7 @@ const RESET: &str = "\x1b[m";
 
 /// The exact usage block stock git prints for an option-parsing error,
 /// reproduced verbatim so `--list --show-current` and friends match byte for byte.
-const USAGE: &str = r#"usage: git branch [<options>] [-r | -a] [--merged] [--no-merged]
+pub(super) const USAGE: &str = r#"usage: git branch [<options>] [-r | -a] [--merged] [--no-merged]
    or: git branch [<options>] [-f] [--recurse-submodules] <branch-name> [<start-point>]
    or: git branch [<options>] [-l] [<pattern>...]
    or: git branch [<options>] [-r] (-d | -D) <branch-name>...
@@ -42,6 +42,68 @@ Generic options
     --contains <commit>   print only branches that contain the commit
     --no-contains <commit>
                           print only branches that don't contain the commit
+    --[no-]abbrev[=<n>]   use <n> digits to display object names
+
+Specific git-branch actions:
+    -a, --all             list both remote-tracking and local branches
+    -d, --[no-]delete     delete fully merged branch
+    -D                    delete branch (even if not merged)
+    -m, --[no-]move       move/rename a branch and its reflog
+    -M                    move/rename a branch, even if target exists
+    --[no-]omit-empty     do not output a newline after empty formatted refs
+    -c, --[no-]copy       copy a branch and its reflog
+    -C                    copy a branch, even if target exists
+    -l, --[no-]list       list branch names
+    --[no-]show-current   show current branch name
+    --[no-]create-reflog  create the branch's reflog
+    --[no-]edit-description
+                          edit the description for the branch
+    -f, --[no-]force      force creation, move/rename, deletion
+    --merged <commit>     print only branches that are merged
+    --no-merged <commit>  print only branches that are not merged
+    --[no-]column[=<style>]
+                          list branches in columns
+    --[no-]sort <key>     field name to sort on
+    --[no-]points-at <object>
+                          print only branches of the object
+    -i, --[no-]ignore-case
+                          sorting and filtering are case insensitive
+    --[no-]recurse-submodules
+                          recurse through submodules
+    --[no-]format <format>
+                          format to use for the output
+
+"#;
+
+/// `usage_with_options_internal()`'s `USAGE_FULL` rendering — what `--help-all`
+/// prints. It is [`USAGE`] with the `PARSE_OPT_HIDDEN` entries left in:
+/// `--[no-]set-upstream`, `--with`, `--without`.
+/// Captured byte-for-byte from stock git 2.55.0's `git branch --help-all`.
+pub(super) const USAGE_ALL: &str = r#"usage: git branch [<options>] [-r | -a] [--merged] [--no-merged]
+   or: git branch [<options>] [-f] [--recurse-submodules] <branch-name> [<start-point>]
+   or: git branch [<options>] [-l] [<pattern>...]
+   or: git branch [<options>] [-r] (-d | -D) <branch-name>...
+   or: git branch [<options>] (-m | -M) [<old-branch>] <new-branch>
+   or: git branch [<options>] (-c | -C) [<old-branch>] <new-branch>
+   or: git branch [<options>] [-r | -a] [--points-at]
+   or: git branch [<options>] [-r | -a] [--format]
+
+Generic options
+    -v, --[no-]verbose    show hash and subject, give twice for upstream branch
+    -q, --[no-]quiet      suppress informational messages
+    -t, --[no-]track[=(direct|inherit)]
+                          set branch tracking configuration
+    --[no-]set-upstream   do not use
+    -u, --[no-]set-upstream-to <upstream>
+                          change the upstream info
+    --[no-]unset-upstream unset the upstream info
+    --[no-]color[=<when>] use colored output
+    -r, --remotes         act on remote-tracking branches
+    --contains <commit>   print only branches that contain the commit
+    --no-contains <commit>
+                          print only branches that don't contain the commit
+    --with <commit>       print only branches that contain the commit
+    --without <commit>    print only branches that don't contain the commit
     --[no-]abbrev[=<n>]   use <n> digits to display object names
 
 Specific git-branch actions:
@@ -538,6 +600,13 @@ pub fn branch(args: &[String]) -> Result<ExitCode> {
         match a {
             _ if only_names => o.names.push(a.to_string()),
             "--" | "--end-of-options" => only_names = true,
+            // `if (internal_help && !strcmp(arg + 2, "help-all"))`
+            // (parse-options.c:1122): an exact match tested right after those
+            // two breaks and ahead of parse_long_opt(), so it never abbreviates
+            // and never takes an `=<value>`. It renders `USAGE_FULL`, which for
+            // `branch` keeps the hidden `--set-upstream`, `--with` and
+            // `--without`.
+            "--help-all" => return Ok(super::show_usage(USAGE_ALL)),
             // Every long option goes through the parse-options resolver, so an
             // abbreviation is honored and an unrecognized name is refused here
             // rather than silently becoming a branch to create.

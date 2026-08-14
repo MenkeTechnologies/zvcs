@@ -585,6 +585,14 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                 ctx = n as u32;
             }
         }
+        // `diff.relative` seeds the very flag `--relative` sets (`options->flags
+        // .relative_name = diff_relative`, diff.c:4639), so the config alone both
+        // narrows the change list to the current directory and shortens the paths
+        // reported. `--no-relative` clears it again, which falls out of the flags
+        // below assigning `relative` unconditionally.
+        if snap.boolean("diff.relative") == Some(true) {
+            relative = Some(cwd_prefix(&repo));
+        }
         if snap.boolean("diff.noPrefix") == Some(true) {
             src_prefix.clear();
             dst_prefix.clear();

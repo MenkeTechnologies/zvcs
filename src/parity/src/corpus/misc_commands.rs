@@ -1055,6 +1055,47 @@ fn usage_only(out: &mut Vec<Case>) {
     ] {
         out.push(Case::strict(args[0], args, Shape::Linear).in_dir("src"));
     }
+    // Config that sets a FLAG's default. Both of these were unreferenced anywhere
+    // in the source the binary is built from: the flag worked and the variable
+    // that turns it on by default did nothing, which no case could see because
+    // every case passed the flag explicitly.
+    //
+    // `log.follow` is not a synonym for `--follow` and the difference is the
+    // interesting part: it seeds `default_follow_renames`, which becomes real
+    // following ONLY with exactly one pathspec (builtin/log.c:857-859). With two
+    // it is dropped in silence where the flag dies, `--no-follow` clears it
+    // (diff.c:5192-5194) while `--follow` does not, and `whatchanged` installs no
+    // tweak so it never applies there.
+    for args in [
+        &["-c", "log.follow=true", "log", "--oneline", "--", "moved/alpha.txt"][..],
+        &["-c", "log.follow=true", "log", "--oneline", "-p", "--", "moved/alpha.txt"],
+        &["-c", "log.follow=false", "log", "--oneline", "--", "moved/alpha.txt"],
+        &["-c", "log.follow=true", "log", "--oneline", "--no-follow", "--", "moved/alpha.txt"],
+        &["-c", "log.follow=true", "log", "--oneline", "--follow", "--", "moved/alpha.txt"],
+        // Two pathspecs: silently no follow from config, fatal from the flag.
+        &["-c", "log.follow=true", "log", "--oneline", "--", "moved/alpha.txt", "orig/beta.txt"],
+        &["log", "--oneline", "--follow", "--", "moved/alpha.txt", "orig/beta.txt"],
+        // No pathspec at all, and the verb the tweak does not reach.
+        &["-c", "log.follow=true", "log", "--oneline"],
+        &["-c", "log.follow=true", "whatchanged", "--oneline", "--", "moved/alpha.txt"],
+    ] {
+        out.push(Case::strict(verb_of(args), args, Shape::Renamed));
+    }
+    // `diff.relative` seeds `relative_name` (diff.c:4639), so it both narrows the
+    // change list to the current directory and shortens the paths printed. Run
+    // from `src/`, where the Dirty shape's deletion lives.
+    for args in [
+        &["-c", "diff.relative=true", "diff", "--name-only"][..],
+        &["-c", "diff.relative=true", "diff", "--stat"],
+        &["-c", "diff.relative=true", "diff"],
+        &["-c", "diff.relative=true", "diff", "--no-relative", "--name-only"],
+        &["-c", "diff.relative=false", "diff", "--name-only"],
+        &["-c", "diff.relative=true", "diff", "--cached", "--name-only"],
+        &["-c", "diff.relative=true", "status", "--porcelain"],
+    ] {
+        out.push(Case::strict(verb_of(args), args, Shape::Dirty).in_dir("src"));
+    }
+
     // Two levels down, and a path that needs quoting once the prefix is on it.
     for args in [
         &["add", "-n", "deep/path.txt"][..],
@@ -1084,4 +1125,19 @@ fn usage_only(out: &mut Vec<Case>) {
     out.push(Case::new("credential-cache", &["credential-cache", "no-such-op"], Shape::Linear));
     out.push(Case::new("p4", &["p4", "no-such-sub"], Shape::Linear));
     out.push(Case::new("quiltimport", &["quiltimport", "--patches", "/no/such/series"], Shape::Linear));
+}
+
+/// The subcommand an argv names, skipping the leading `git -c <name>=<value>`
+/// pairs. The report groups by this, so getting it wrong files a case under
+/// `-c` or a flag instead of the verb it exercises.
+fn verb_of(args: &[&'static str]) -> &'static str {
+    let mut i = 0;
+    while i < args.len() {
+        match args[i] {
+            "-c" | "-C" => i += 2,
+            a if a.starts_with('-') => i += 1,
+            a => return a,
+        }
+    }
+    args.first().copied().unwrap_or("git")
 }

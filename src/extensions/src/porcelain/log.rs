@@ -604,9 +604,16 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // Config supplies the defaults; the flags below override them. git reads
     // these in `git_log_config` before parsing args, and validates `log.date`
     // there — an invalid value is fatal even when `--date` later overrides it.
-    let (cfg_abbrev_commit, cfg_date_mode, cfg_show_root, cfg_decorate, cfg_mailmap) = {
+    let (cfg_abbrev_commit, cfg_date_mode, cfg_show_root, cfg_decorate, cfg_mailmap, cfg_follow) = {
         let snap = repo.config_snapshot();
         let abbrev = snap.boolean("log.abbrevCommit").unwrap_or(false);
+        // `log.follow` (`default_follow` in builtin/log.c:588) is NOT `--follow`:
+        // it sets `default_follow_renames`, which `log_setup_revisions_tweak()`
+        // promotes to real following only when there is exactly one pathspec
+        // (builtin/log.c:857-859). With none or several it is silently dropped —
+        // where the explicit flag dies — and `cmd_whatchanged()` installs no tweak
+        // at all, so the key does not reach it.
+        let follow = snap.boolean("log.follow").unwrap_or(false) && flavor == Flavor::Log;
         // `log.mailmap` has defaulted to true since git 2.24, so the built-in
         // formats route identities through `.mailmap` unless `--no-use-mailmap`
         // or `log.mailmap=false` turns it off.
@@ -641,7 +648,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             }
             None => DateMode::Default,
         };
-        (abbrev, date, show_root, decorate, mailmap)
+        (abbrev, date, show_root, decorate, mailmap, follow)
     };
 
     // `--stat` width geometry, seeded from `diff.statNameWidth`/`diff.statGraphWidth`
@@ -801,6 +808,10 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     let mut diff_merges = DiffMerges::Off;
     // `--follow`: keep following the one pathspec across renames.
     let mut follow = false;
+    // `log.follow`'s separate flag, mirroring git's `default_follow_renames`:
+    // `--no-follow` clears BOTH (diff.c:5192-5194), so an explicit negation beats
+    // the config, while `--follow` leaves this one alone.
+    let mut default_follow = cfg_follow;
     // `-L<range>:<file>`, repeatable: line-level traversal (see `line_log`).
     let mut line_ranges: Vec<String> = Vec::new();
     // `-s`/`--no-patch` resets the diff output format to git's NO_OUTPUT. That is a
@@ -1244,6 +1255,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             follow = true;
         } else if a == "--no-follow" {
             follow = false;
+            default_follow = false;
         } else if a == "-m" {
             // `diff_merges_set_dense_combined_if_unset()` and friends
             // (diff-merges.c): each spelling selects a mode, and the last one wins.
@@ -1815,6 +1827,12 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // For a merge that is what removes both the merge itself and the entire side
     // whose changes it did not take; comparing only against the first parent
     // leaves the merge in the log and lists the other side's commits as well.
+    // `log_setup_revisions_tweak()`: the config default becomes real following
+    // only with exactly one pathspec. It deliberately cannot reach the die below —
+    // that belongs to the explicit flag.
+    if default_follow && pathspecs.len() == 1 {
+        follow = true;
+    }
     if follow {
         // `cmd_log_init_finish()`: `--follow` rewrites the pathspec as the walk
         // goes back, so it can only track one path.

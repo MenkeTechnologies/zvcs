@@ -325,8 +325,15 @@ enum Usage {
     /// `-h`: `parse_options_step()` renders the block to **stdout** and exits
     /// 129, with no `error:` line — a help request is not a rejection.
     Help,
-    /// A rejection: the `error:` line parse-options prints, exit 129.
+    /// The `PARSE_OPT_ERROR` shape: the `error:` line alone, exit 129, no usage
+    /// block. `PARSE_OPT_ERROR` is `-1`, what `get_arg()` and a rejecting callback
+    /// return, and `parse_options()` exits on it without calling
+    /// `usage_with_options()` — so a bad *value* for a known option gets one line.
     Error(String),
+    /// The `PARSE_OPT_UNKNOWN` shape: the same `error:` line **followed by** the
+    /// usage block, both on stderr, exit 129 (parse-options.c:1210-1224). An
+    /// unrecognised option name is the only thing that takes this path.
+    Unknown(String),
     /// An abbreviation two entries claim: the token as typed and the two candidate
     /// spellings. Unlike [`Usage::Error`] this one also prints the option block —
     /// `parse_long_opt()` returns `PARSE_OPT_HELP` after its `error()`, which
@@ -395,6 +402,11 @@ pub fn am(args: &[String]) -> Result<ExitCode> {
         Err(Usage::Help) => return Ok(super::show_usage(USAGE)),
         Err(Usage::Error(msg)) => {
             eprintln!("{msg}");
+            return Ok(ExitCode::from(129));
+        }
+        Err(Usage::Unknown(msg)) => {
+            eprintln!("{msg}");
+            eprint!("{USAGE}");
             return Ok(ExitCode::from(129));
         }
         Err(Usage::Ambiguous(tok, first, second)) => {
@@ -729,7 +741,7 @@ fn parse_long(
             };
             cmdmode_checked(o, tok, Resume::ShowPatch(sub))?;
         }
-        _ => return Err(Usage::Error(format!("error: unknown option `{name}'"))),
+        _ => return Err(Usage::Unknown(format!("error: unknown option `{name}'"))),
     }
     Ok(())
 }
@@ -750,7 +762,7 @@ fn parse_short(
     // Every short option git defines is ASCII, so byte indices below are always
     // char boundaries and the `-C<n>`/`-p<num>` value slice cannot panic.
     if !body.is_ascii() {
-        return Err(Usage::Error(format!("error: unknown switch `{body}'")));
+        return Err(Usage::Unknown(format!("error: unknown switch `{body}'")));
     }
     let bytes = body.as_bytes();
     let mut at = 0;
@@ -792,7 +804,7 @@ fn parse_short(
             // parse_options_step() tests `internal_help` inside the
             // short-option loop, so `-h` answers from anywhere in a cluster.
             'h' => return Err(Usage::Help),
-            _ => return Err(Usage::Error(format!("error: unknown switch `{c}'"))),
+            _ => return Err(Usage::Unknown(format!("error: unknown switch `{c}'"))),
         }
     }
     Ok(())

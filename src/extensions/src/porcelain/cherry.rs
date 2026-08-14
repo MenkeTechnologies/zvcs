@@ -64,6 +64,16 @@ use gix::revision::walk::Sorting;
 use gix::traverse::commit::simple::CommitTimeOrder;
 
 /// git's own usage block for `cherry`, reproduced verbatim.
+/// `cmd_cherry()`'s `struct option options[]` (builtin/cherry.c), in table order,
+/// as [`super::resolve_long`] reads it.
+
+/// `cmd_cherry()`'s `struct option options[]` (builtin/log.c:2749 — `cherry` lives
+/// in log.c, not a `cherry.c`), in table order, as [`super::resolve_long`] reads it.
+const LONG_OPTS: &[super::LongOpt] = &[
+    super::LongOpt { name: "abbrev",                      neg: true,  arg: super::Arg::Optional },
+    super::LongOpt { name: "verbose",                     neg: true,  arg: super::Arg::None },
+];
+
 const USAGE: &str = "\
 usage: git cherry [-v] [<upstream> [<head> [<limit>]]]
 
@@ -104,12 +114,25 @@ pub fn cherry(args: &[String]) -> Result<ExitCode> {
     let mut positional: Vec<&str> = Vec::new();
     let mut end_of_options = false;
 
-    for a in args.iter() {
-        let a = a.as_str();
+    for typed in args.iter() {
+        let typed = typed.as_str();
+        let a = typed;
         if end_of_options {
-            positional.push(a);
+            positional.push(typed);
             continue;
         }
+        // Respell a unique abbreviation as the name it resolves to, so an
+        // abbreviation lands on the arm its full spelling lands on.
+        let canonical;
+        let a = match super::canonical_long(a, LONG_OPTS) {
+            super::Long::Name(name) => {
+                canonical = name;
+                canonical.as_ref()
+            }
+            super::Long::Ambiguous(first, second) => {
+                return Ok(super::ambiguous_option(a, &first, &second, USAGE))
+            }
+        };
         match a {
             "--" => end_of_options = true,
             "-v" | "--verbose" => verbose = true,
@@ -120,10 +143,7 @@ pub fn cherry(args: &[String]) -> Result<ExitCode> {
                 print!("{USAGE}");
                 return Ok(ExitCode::from(129));
             }
-            "--help" => bail!(
-                "unsupported flag \"--help\" (ported: -h, -v, --verbose, --no-verbose, \
-                 --abbrev, --abbrev=<n>, --no-abbrev)"
-            ),
+            "--help" => bail!("unsupported flag \"--help\""),
             _ if a.starts_with("--abbrev=") => {
                 match parse_abbrev(&a["--abbrev=".len()..], hexsz) {
                     Some(v) => abbrev = v,
@@ -153,7 +173,9 @@ pub fn cherry(args: &[String]) -> Result<ExitCode> {
                     None => verbose = true,
                 }
             }
-            _ => positional.push(a),
+            // A non-option argument is handed back unchanged by the resolver, so the
+            // argv slice itself is pushed and the operand keeps `args`' lifetime.
+            _ => positional.push(typed),
         }
     }
 

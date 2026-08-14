@@ -122,6 +122,57 @@ use gix::remote::fetch::{Shallow, Tags};
 /// stdout for `-h` and on stderr for a usage error, both exiting 129.
 const USAGE: &str = "usage: git clone [<options>] [--] <repo> [<dir>]\n\n    -v, --[no-]verbose    be more verbose\n    -q, --[no-]quiet      be more quiet\n    --[no-]progress       force progress reporting\n    --[no-]reject-shallow don't clone shallow repository\n    -n, --no-checkout     don't create a checkout\n    --checkout            opposite of --no-checkout\n    --[no-]bare           create a bare repository\n    --[no-]mirror         create a mirror repository (implies --bare)\n    -l, --[no-]local      to clone from a local repository\n    --no-hardlinks        don't use local hardlinks, always copy\n    --hardlinks           opposite of --no-hardlinks\n    -s, --[no-]shared     setup as shared repository\n    --[no-]recurse-submodules[=<pathspec>]\n                          initialize submodules in the clone\n    --[no-]recursive[=<pathspec>]\n                          alias of --recurse-submodules\n    -j, --[no-]jobs <n>   number of submodules cloned in parallel\n    --[no-]template <template-directory>\n                          directory from which templates will be used\n    --[no-]reference <repo>\n                          reference repository\n    --[no-]reference-if-able <repo>\n                          reference repository\n    --[no-]dissociate     use --reference only while cloning\n    -o, --[no-]origin <name>\n                          use <name> instead of 'origin' to track upstream\n    -b, --[no-]branch <branch>\n                          checkout <branch> instead of the remote's HEAD\n    --[no-]revision <rev> clone single revision <rev> and check out\n    -u, --[no-]upload-pack <path>\n                          path to git-upload-pack on the remote\n    --[no-]depth <depth>  create a shallow clone of that depth\n    --[no-]shallow-since <time>\n                          create a shallow clone since a specific time\n    --[no-]shallow-exclude <ref>\n                          deepen history of shallow clone, excluding ref\n    --[no-]single-branch  clone only one branch, HEAD or --branch\n    --[no-]tags           clone tags, and make later fetches not to follow them\n    --[no-]shallow-submodules\n                          any cloned submodules will be shallow\n    --[no-]separate-git-dir <gitdir>\n                          separate git dir from working tree\n    --[no-]ref-format <format>\n                          specify the reference format to use\n    -c, --[no-]config <key=value>\n                          set config inside the new repository\n    --[no-]server-option <server-specific>\n                          option to transmit\n    -4, --ipv4            use IPv4 addresses only\n    -6, --ipv6            use IPv6 addresses only\n    --[no-]filter <args>  object filtering\n    --[no-]also-filter-submodules\n                          apply partial clone filters to submodules\n    --[no-]remote-submodules\n                          any cloned submodules will use their remote-tracking branch\n    --[no-]sparse         initialize sparse-checkout file to include only files at root\n    --[no-]bundle-uri <uri>\n                          a URI for downloading bundles before fetching from origin remote\n\n";
 
+/// `cmd_clone()`'s `struct option builtin_clone_options[]` (builtin/clone.c), in
+/// table order, as [`super::resolve_long_aliased`] reads it.
+const LONG_OPTS: &[super::LongOpt] = &[
+    super::LongOpt { name: "verbose",                     neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "quiet",                       neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "progress",                    neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "reject-shallow",              neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "no-checkout",                 neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "bare",                        neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "naked",                       neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "mirror",                      neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "local",                       neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "no-hardlinks",                neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "shared",                      neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "recurse-submodules",          neg: true,  arg: super::Arg::Optional },
+    // `OPT_ALIAS(0, "recursive", "recurse-submodules")`: `preprocess_options()`
+    // copies the source entry over the alias, keeping only the alias's own name.
+    super::LongOpt { name: "recursive",                   neg: true,  arg: super::Arg::Optional },
+    super::LongOpt { name: "jobs",                        neg: true,  arg: super::Arg::Required },
+    super::LongOpt { name: "template",                    neg: true,  arg: super::Arg::Required },
+    super::LongOpt { name: "reference",                   neg: true,  arg: super::Arg::Required },
+    super::LongOpt { name: "reference-if-able",           neg: true,  arg: super::Arg::Required },
+    super::LongOpt { name: "dissociate",                  neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "origin",                      neg: true,  arg: super::Arg::Required },
+    super::LongOpt { name: "branch",                      neg: true,  arg: super::Arg::Required },
+    super::LongOpt { name: "revision",                    neg: true,  arg: super::Arg::Required },
+    super::LongOpt { name: "upload-pack",                 neg: true,  arg: super::Arg::Required },
+    super::LongOpt { name: "depth",                       neg: true,  arg: super::Arg::Required },
+    super::LongOpt { name: "shallow-since",               neg: true,  arg: super::Arg::Required },
+    super::LongOpt { name: "shallow-exclude",             neg: true,  arg: super::Arg::Required },
+    super::LongOpt { name: "single-branch",               neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "tags",                        neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "shallow-submodules",          neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "separate-git-dir",            neg: true,  arg: super::Arg::Required },
+    super::LongOpt { name: "ref-format",                  neg: true,  arg: super::Arg::Required },
+    super::LongOpt { name: "config",                      neg: true,  arg: super::Arg::Required },
+    super::LongOpt { name: "server-option",               neg: true,  arg: super::Arg::Required },
+    super::LongOpt { name: "ipv4",                        neg: false, arg: super::Arg::None },
+    super::LongOpt { name: "ipv6",                        neg: false, arg: super::Arg::None },
+    super::LongOpt { name: "filter",                      neg: true,  arg: super::Arg::Required },
+    super::LongOpt { name: "also-filter-submodules",      neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "remote-submodules",           neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "sparse",                      neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "bundle-uri",                  neg: true,  arg: super::Arg::Required },
+];
+
+/// The one `OPT_ALIAS()` group in `builtin_clone_options[]`. `is_alias()`
+/// (parse-options.c:471) reads it so `--recurs` does not report itself as
+/// ambiguous between the alias and the option it aliases.
+const ALIAS_GROUPS: &[&[&str]] = &[&["recursive", "recurse-submodules"]];
+
 /// `die()`: the `fatal: ` prefix and exit 128, which is what every clone refusal but the
 /// usage errors exits with.
 fn fatal(msg: &str) -> ExitCode {
@@ -215,13 +266,29 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     let mut i = 0;
     let mut end_of_options = false;
     while i < args.len() {
-        let a = args[i].as_str();
+        let typed = args[i].as_str();
         i += 1;
 
         if end_of_options {
-            positionals.push(a);
+            positionals.push(typed);
             continue;
         }
+
+        // Respell a unique abbreviation as the name it resolves to, so `--single-b`
+        // reaches the same arm as `--single-branch`. The aliased form is needed
+        // because `builtin_clone_options[]` has an `OPT_ALIAS()`: without the group,
+        // `--recurs` would report itself ambiguous between `--recursive` and the
+        // `--recurse-submodules` it aliases.
+        let canonical;
+        let a = match super::canonical_long_aliased(typed, LONG_OPTS, ALIAS_GROUPS) {
+            super::Long::Name(name) => {
+                canonical = name;
+                canonical.as_ref()
+            }
+            super::Long::Ambiguous(first, second) => {
+                return Ok(super::ambiguous_option(typed, &first, &second, USAGE))
+            }
+        };
 
         // Split `--opt=value` for the value-taking long options.
         let (key, inline_val) = match (a.starts_with("--"), a.split_once('=')) {
@@ -387,10 +454,28 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
             other if other.starts_with("-c") && other.len() > 2 => {
                 config_pairs.push(parse_config_pair(&other[2..])?);
             }
+            // A long name no table entry claims is `parse_options()`' own refusal —
+            // the `error:` line and the block, both on stderr, exit 129 — not a gap
+            // in this port. It has to be decided against the table rather than by
+            // spelling, because `-4`/`--ipv4` and `-6`/`--ipv6` carry
+            // `PARSE_OPT_NONEG` and so have no `--no-` form to resolve.
+            other
+                if other.starts_with("--")
+                    && matches!(
+                        super::resolve_long(LONG_OPTS, &other[2..]),
+                        super::Resolved::Unknown
+                    ) =>
+            {
+                eprintln!("error: unknown option `{}'", &other[2..]);
+                eprint!("{USAGE}");
+                return Ok(ExitCode::from(129));
+            }
             other if other.starts_with('-') && other.len() > 1 => {
                 bail!("unsupported option {other:?}");
             }
-            other => positionals.push(other),
+            // A non-option argument is handed back unchanged by the resolver, so the
+            // argv slice itself is pushed and the operand keeps `args`' lifetime.
+            _ => positionals.push(typed),
         }
     }
 

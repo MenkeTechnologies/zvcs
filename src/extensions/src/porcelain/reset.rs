@@ -420,6 +420,32 @@ fn git_parse_maybe_bool(v: &str) -> Option<bool> {
     }
 }
 
+/// `cmd_reset()`'s `struct option options[]` (builtin/reset.c), in table order, as
+/// [`super::resolve_long`] reads it.
+///
+/// The five mode selectors (`--mixed`, `--soft`, `--hard`, `--merge`, `--keep`)
+/// are `OPT_SET_INT_F ... PARSE_OPT_NONEG`, and `--unified` /
+/// `--inter-hunk-context` are `PARSE_OPT_NONEG` too, so none of the seven has a
+/// `--no-` spelling. `no-refresh` is an entry spelled with its own `no-`, which
+/// parse-options reads as the *unset* sense of `refresh`.
+const LONG_OPTS: &[super::LongOpt] = &[
+    super::LongOpt { name: "quiet",                       neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "no-refresh",                  neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "mixed",                       neg: false, arg: super::Arg::None },
+    super::LongOpt { name: "soft",                        neg: false, arg: super::Arg::None },
+    super::LongOpt { name: "hard",                        neg: false, arg: super::Arg::None },
+    super::LongOpt { name: "merge",                       neg: false, arg: super::Arg::None },
+    super::LongOpt { name: "keep",                        neg: false, arg: super::Arg::None },
+    super::LongOpt { name: "recurse-submodules",          neg: true,  arg: super::Arg::Optional },
+    super::LongOpt { name: "patch",                       neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "auto-advance",                neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "unified",                     neg: false, arg: super::Arg::Required },
+    super::LongOpt { name: "inter-hunk-context",          neg: false, arg: super::Arg::Required },
+    super::LongOpt { name: "intent-to-add",               neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "pathspec-from-file",          neg: true,  arg: super::Arg::Required },
+    super::LongOpt { name: "pathspec-file-nul",           neg: true,  arg: super::Arg::None },
+];
+
 /// `git reset -h` / the block parse-options prints on a bad option, verbatim.
 const USAGE: &str = "\
 usage: git reset [--mixed | --soft | --hard | --merge | --keep] [-q] [<commit>]
@@ -495,7 +521,8 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
     // submodule, matching git's `unpack_trees()` submodule updater.
     let mut recurse_submodules: Option<bool> = None;
 
-    for a in args {
+    for typed in args {
+        let a = typed;
         // `--pathspec-from-file <file>` (separate-argument form): parse-options
         // consumes the very next token as the value regardless of what it looks like.
         if take_pff_value {
@@ -503,9 +530,9 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
             take_pff_value = false;
             continue;
         }
-        // Likewise for a `-U`/`--unified`/`--inter-hunk-context` value still owed;
-        // outside that, these options are only recognised before `--`.
-        if patch_opts.awaiting_value() || !saw_dd {
+        // Likewise for a `-U`/`--unified`/`--inter-hunk-context` value still owed —
+        // and precisely because it is a value, it is never resolved as an option name.
+        if patch_opts.awaiting_value() {
             match patch_opts.take_arg(a) {
                 Err(code) => return Ok(code),
                 Ok(true) => continue,
@@ -516,7 +543,25 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
             paths.push(a.clone());
             continue;
         }
-        match a.as_str() {
+        // Respell a unique abbreviation as the name it resolves to, ahead of both
+        // the shared value-option handler and the match below, so `--intent-to`
+        // reaches the same arm as `--intent-to-add`.
+        let canonical;
+        let a = match super::canonical_long(a, LONG_OPTS) {
+            super::Long::Name(name) => {
+                canonical = name;
+                canonical.as_ref()
+            }
+            super::Long::Ambiguous(first, second) => {
+                return Ok(super::ambiguous_option(a, &first, &second, USAGE))
+            }
+        };
+        match patch_opts.take_arg(a) {
+            Err(code) => return Ok(code),
+            Ok(true) => continue,
+            Ok(false) => {}
+        }
+        match a {
             "--" => saw_dd = true,
             "--soft" => mode = Some(ResetMode::Soft),
             "--mixed" => mode = Some(ResetMode::Mixed),
@@ -569,7 +614,9 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
                 eprint!("{USAGE}");
                 return Ok(ExitCode::from(129));
             }
-            other => positionals.push(other),
+            // A non-option argument is handed back unchanged by the resolver, so the
+            // argv slice itself is pushed and the operand keeps `args`' lifetime.
+            _ => positionals.push(typed),
         }
     }
 

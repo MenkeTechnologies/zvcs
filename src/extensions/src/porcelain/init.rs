@@ -96,6 +96,23 @@ use crate::lock::RepoLock;
 ///     unrecognized value reproduces git's exact error text (`unknown hash
 ///     algorithm '<v>'` / `unknown ref storage format '<v>'`).
 /// ```
+
+/// `cmd_init_db()`'s `struct option init_db_options[]` (builtin/init-db.c), in
+/// table order, as [`super::resolve_long`] reads it. `git init-db` is the same
+/// builtin ([`super::init_db`] forwards here), so it is the same table.
+///
+/// `--shared` is an `OPT_CALLBACK_F(... PARSE_OPT_OPTARG | PARSE_OPT_NONEG)`, so
+/// `--no-shared` is not a spelling parse-options resolves.
+const LONG_OPTS: &[super::LongOpt] = &[
+    super::LongOpt { name: "template",                    neg: true,  arg: super::Arg::Required },
+    super::LongOpt { name: "bare",                        neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "shared",                      neg: false, arg: super::Arg::Optional },
+    super::LongOpt { name: "quiet",                       neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "separate-git-dir",            neg: true,  arg: super::Arg::Required },
+    super::LongOpt { name: "initial-branch",              neg: true,  arg: super::Arg::Required },
+    super::LongOpt { name: "object-format",               neg: true,  arg: super::Arg::Required },
+    super::LongOpt { name: "ref-format",                  neg: true,  arg: super::Arg::Required },
+];
 /// `git init`'s usage block, byte-for-byte from stock git 2.55.0. `-h` prints it on
 /// stdout; a usage error prints the complaint and then this on stderr. Both exit 129.
 const USAGE: &str = "usage: git init [-q | --quiet] [--bare] [--template=<template-directory>]\n                [--separate-git-dir <git-dir>] [--object-format=<format>]\n                [--ref-format=<format>]\n                [-b <branch-name> | --initial-branch=<branch-name>]\n                [--shared[=<permissions>]] [<directory>]\n\n    --[no-]template <template-directory>\n                          directory from which templates will be used\n    --[no-]bare           create a bare repository\n    --shared[=<permissions>]\n                          specify that the git repository is to be shared amongst several users\n    -q, --[no-]quiet      be quiet\n    --[no-]separate-git-dir <gitdir>\n                          separate git dir from working tree\n    -b, --[no-]initial-branch <name>\n                          override the name of the initial branch\n    --[no-]object-format <hash>\n                          specify the hash algorithm to use\n    --[no-]ref-format <format>\n                          specify the reference format to use\n\n";
@@ -165,7 +182,19 @@ pub fn init(args: &[String]) -> Result<ExitCode> {
             i += 1;
             continue;
         }
-        match arg.as_str() {
+        // Respell a unique abbreviation as the name it resolves to, so `--init-b`
+        // reaches the same arm as `--initial-branch`.
+        let canonical;
+        let arg = match super::canonical_long(arg, LONG_OPTS) {
+            super::Long::Name(name) => {
+                canonical = name;
+                canonical.as_ref()
+            }
+            super::Long::Ambiguous(first, second) => {
+                return Ok(super::ambiguous_option(arg, &first, &second, USAGE))
+            }
+        };
+        match arg {
             "--" => positional_only = true,
             "--bare" => bare = true,
             // git's parse-options auto-generates a `--no-` form for every OPT_BOOL

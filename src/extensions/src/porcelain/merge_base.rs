@@ -20,9 +20,8 @@
 //! false), 128 for a bad object name or a mode/`--all` conflict, 129 for a
 //! usage error (unknown option, wrong argument count, conflicting modes).
 //!
-//! Not covered: option abbreviation (`--oct` for `--octopus`) — git's
-//! `parse_options` accepts unique prefixes, this rejects them as unknown
-//! options, which is the only intentional divergence.
+//! Option abbreviation (`--oct` for `--octopus`) resolves the way `parse_long_opt()`
+//! resolves it, against [`LONG_OPTS`].
 
 use anyhow::Result;
 use std::process::ExitCode;

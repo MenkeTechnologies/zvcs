@@ -530,9 +530,11 @@ fn parse_opts(
                         }
                     }
                 }
-                // Hidden legacy spellings: binary application needs no opt-in in
-                // modern git, so both are genuine no-ops.
-                "binary" | "allow-binary-replacement" if !neg => {}
+                // Hidden legacy spellings, both `OPT_NOOP_NOARG` (apply.c:5216-5217)
+                // — `parse_opt_noop_cb` does nothing in either sense, and neither
+                // entry carries `PARSE_OPT_NONEG`, so `--no-binary` and
+                // `--no-allow-binary-replacement` resolve and are no-ops too.
+                "binary" | "allow-binary-replacement" => {}
                 // `--add` is the default; it cancels a preceding `--no-add`.
                 "add" if !neg => o.no_add = false,
                 "no-add" if !neg => o.no_add = true,

@@ -36,6 +36,13 @@ use gix::hash::ObjectId;
 use gix::objs::Kind;
 
 /// git's own usage block, printed on stderr next to `error: unknown …`.
+/// `cmd_commit_tree()`'s `struct option options[]` (builtin/commit-tree.c), in
+/// table order, as [`super::resolve_long`] reads it. `-p`, `-m` and `-F` are
+/// short-only and so have no entry.
+const LONG_OPTS: &[super::LongOpt] = &[
+    super::LongOpt { name: "gpg-sign",                    neg: true,  arg: super::Arg::Optional },
+];
+
 const USAGE: &str = "\
 usage: git commit-tree <tree> [(-p <parent>)...]
    or: git commit-tree [(-p <parent>)...] [-S[<keyid>]] [(-m <message>)...]
@@ -102,6 +109,18 @@ pub fn commit_tree(args: &[String]) -> Result<ExitCode> {
             continue;
         }
 
+        // Respell a unique abbreviation as the name it resolves to, so an
+        // abbreviation lands on the arm its full spelling lands on.
+        let canonical;
+        let a = match super::canonical_long(a, LONG_OPTS) {
+            super::Long::Name(name) => {
+                canonical = name;
+                canonical.as_ref()
+            }
+            super::Long::Ambiguous(first, second) => {
+                return Ok(super::ambiguous_option(a, &first, &second, USAGE))
+            }
+        };
         // Long options. `commit-tree` has no long form for -p/-m/-F.
         if let Some(long) = a.strip_prefix("--") {
             match long {

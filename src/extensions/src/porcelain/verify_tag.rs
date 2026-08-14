@@ -47,6 +47,14 @@ use gix::bstr::ByteSlice;
 use gix::objs::Kind;
 
 /// The parse-options usage block, byte-for-byte as git 2.55 emits it.
+/// `cmd_verify_tag()`'s `struct option verify_tag_options[]`
+/// (builtin/verify-tag.c), in table order, as [`super::resolve_long`] reads it.
+const LONG_OPTS: &[super::LongOpt] = &[
+    super::LongOpt { name: "verbose",                     neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "raw",                         neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "format",                      neg: true,  arg: super::Arg::Required },
+];
+
 const USAGE: &str = "\
 usage: git verify-tag [-v | --verbose] [--format=<format>] [--raw] <tag>...
 
@@ -81,13 +89,26 @@ pub fn verify_tag(args: &[String]) -> Result<ExitCode> {
 
     let mut i = 0;
     while i < args.len() {
-        let a = args[i].as_str();
+        let typed = args[i].as_str();
+        let a = typed;
         i += 1;
 
         if operands_only || !a.starts_with('-') || a == "-" {
-            names.push(a);
+            names.push(typed);
             continue;
         }
+        // Respell a unique abbreviation as the name it resolves to, so an
+        // abbreviation lands on the arm its full spelling lands on.
+        let canonical;
+        let a = match super::canonical_long(a, LONG_OPTS) {
+            super::Long::Name(name) => {
+                canonical = name;
+                canonical.as_ref()
+            }
+            super::Long::Ambiguous(first, second) => {
+                return Ok(super::ambiguous_option(a, &first, &second, USAGE))
+            }
+        };
         match a {
             "--" => operands_only = true,
             "-v" | "--verbose" => verbose = true,
@@ -113,7 +134,12 @@ pub fn verify_tag(args: &[String]) -> Result<ExitCode> {
                 }
             },
             "--no-format" => format = None,
-            _ if a.starts_with("--format=") => format = Some(&a["--format=".len()..]),
+            // The value is sliced out of the token as typed: the resolver copies it
+            // through verbatim, and only that copy borrows from `args`, which is what
+            // `format` holds on to past the loop.
+            _ if a.starts_with("--format=") => {
+                format = typed.split_once('=').map(|(_, v)| v)
+            }
             _ => {
                 // git's parse-options wording, then the usage block.
                 let (kind, name) = match a.strip_prefix("--") {
@@ -407,7 +433,7 @@ fn atom_value(
         "contents:body" => data[sub.body_start..sub.body_start + sub.nonsiglen].to_vec(),
         // C_SIG: the signature block, verbatim.
         "contents:signature" => data[sub.sig.0..sub.sig.0 + sub.sig.1].to_vec(),
-        _ => anyhow::bail!("unsupported format atom \"%({name})\" (ported: tag, objectname, objecttype, objectsize, taggername, taggeremail, taggerdate, creatordate, contents:subject, contents:body, contents:signature, if, then, else, end)"),
+        _ => anyhow::bail!("unsupported format atom \"%({name})\""),
     })
 }
 

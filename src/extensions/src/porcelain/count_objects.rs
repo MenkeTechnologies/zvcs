@@ -36,6 +36,13 @@ use gix::odb::pack;
 
 /// Stock git's `count-objects` usage block, byte-for-byte (186 bytes), including
 /// the trailing blank line. Printed on `-h` (stdout) and for a usage error (stderr).
+/// `cmd_count_objects()`'s `struct option opts[]` (builtin/count-objects.c),
+/// in table order, as [`super::resolve_long`] reads it.
+const LONG_OPTS: &[super::LongOpt] = &[
+    super::LongOpt { name: "verbose",                     neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "human-readable",              neg: true,  arg: super::Arg::None },
+];
+
 const USAGE: &str = "usage: git count-objects [-v] [-H | --human-readable]\n\
                      \n\
                      \x20   -v, --[no-]verbose    be verbose\n\
@@ -84,6 +91,18 @@ pub fn count_objects(args: &[String]) -> Result<ExitCode> {
             // straight to `usage_with_options()`.
             return Ok(usage_error(None));
         }
+        // Respell a unique abbreviation as the name it resolves to, so an
+        // abbreviation lands on the arm its full spelling lands on.
+        let canonical;
+        let a = match super::canonical_long(a, LONG_OPTS) {
+            super::Long::Name(name) => {
+                canonical = name;
+                canonical.as_ref()
+            }
+            super::Long::Ambiguous(first, second) => {
+                return Ok(super::ambiguous_option(a, &first, &second, USAGE))
+            }
+        };
         match a {
             "--" => end_of_opts = true,
             "-h" => {

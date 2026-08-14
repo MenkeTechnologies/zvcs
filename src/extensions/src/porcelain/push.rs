@@ -11,6 +11,48 @@ use super::push_proto::{self, Request};
 
 /// `git push`'s usage block, byte-for-byte from stock git 2.55.0. `parse-options`
 /// answers `-h` with it on stdout and exits 129, before any repository setup.
+/// `cmd_push()`'s `struct option options[]` (builtin/push.c), in table order, as
+/// [`super::resolve_long_aliased`] reads it. `-4`/`--ipv4` and `-6`/`--ipv6`
+/// come from `OPT_IPVERSION`, which is `PARSE_OPT_NONEG`.
+const LONG_OPTS: &[super::LongOpt] = &[
+    super::LongOpt { name: "verbose",                     neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "quiet",                       neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "repo",                        neg: true,  arg: super::Arg::Required },
+    super::LongOpt { name: "all",                         neg: true,  arg: super::Arg::None },
+    // `OPT_ALIAS(0, "branches", "all")`: `preprocess_options()` copies the source
+    // entry over the alias, keeping only the alias's own name.
+    super::LongOpt { name: "branches",                    neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "mirror",                      neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "delete",                      neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "tags",                        neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "dry-run",                     neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "porcelain",                   neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "force",                       neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "force-with-lease",            neg: true,  arg: super::Arg::Optional },
+    // `OPT_BIT(0, TRANS_OPT_FORCE_IF_INCLUDES, ...)`; the macro is the string
+    // "force-if-includes" (transport.h:242).
+    super::LongOpt { name: "force-if-includes"        , neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "recurse-submodules",          neg: true,  arg: super::Arg::Required },
+    super::LongOpt { name: "thin",                        neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "receive-pack",                neg: true,  arg: super::Arg::Required },
+    super::LongOpt { name: "exec",                        neg: true,  arg: super::Arg::Required },
+    super::LongOpt { name: "set-upstream",                neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "progress",                    neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "prune",                       neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "no-verify",                   neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "follow-tags",                 neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "signed",                      neg: true,  arg: super::Arg::Optional },
+    super::LongOpt { name: "atomic",                      neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "push-option",                 neg: true,  arg: super::Arg::Required },
+    super::LongOpt { name: "ipv4",                        neg: false, arg: super::Arg::None },
+    super::LongOpt { name: "ipv6",                        neg: false, arg: super::Arg::None },
+];
+
+/// The one `OPT_ALIAS()` group in `builtin_push_options[]`. `is_alias()`
+/// (parse-options.c:471) reads it so `--a` does not report itself as ambiguous
+/// between the alias and the option it aliases.
+const ALIAS_GROUPS: &[&[&str]] = &[&["branches", "all"]];
+
 const USAGE: &str = "usage: git push [<options>] [<repository> [<refspec>...]]\n\n    -v, --[no-]verbose    be more verbose\n    -q, --[no-]quiet      be more quiet\n    --[no-]repo <repository>\n                          repository\n    --[no-]all            push all branches\n    --[no-]branches       alias of --all\n    --[no-]mirror         mirror all refs\n    -d, --[no-]delete     delete refs\n    --[no-]tags           push tags (can't be used with --all or --branches or --mirror)\n    -n, --[no-]dry-run    dry run\n    --[no-]porcelain      machine-readable output\n    -f, --[no-]force      force updates\n    --[no-]force-with-lease[=<refname>:<expect>]\n                          require old value of ref to be at this value\n    --[no-]force-if-includes\n                          require remote updates to be integrated locally\n    --[no-]recurse-submodules (check|on-demand|no)\n                          control recursive pushing of submodules\n    --[no-]thin           use thin pack\n    --[no-]receive-pack <receive-pack>\n                          receive pack program\n    --[no-]exec <receive-pack>\n                          receive pack program\n    -u, --[no-]set-upstream\n                          set upstream for git pull/status\n    --[no-]progress       force progress reporting\n    --[no-]prune          prune locally removed refs\n    --no-verify           bypass pre-push hook\n    --verify              opposite of --no-verify\n    --[no-]follow-tags    push missing but relevant tags\n    --[no-]signed[=(yes|no|if-asked)]\n                          GPG sign the push\n    --[no-]atomic         request atomic transaction on remote side\n    -o, --[no-]push-option <server-specific>\n                          option to transmit\n    -4, --ipv4            use IPv4 addresses only\n    -6, --ipv6            use IPv6 addresses only\n\n";
 
 /// `git push [<options>] [<repository> [<refspec>...]]` — upload commits and
@@ -82,12 +124,25 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
     let mut signed_explicit = false;
     let mut i = 0;
     while i < args.len() {
-        let a = args[i].as_str();
-        if end_of_options || !a.starts_with('-') || a == "-" {
-            positionals.push(a.to_string());
+        let typed = args[i].as_str();
+        if end_of_options || !typed.starts_with('-') || typed == "-" {
+            positionals.push(typed.to_string());
             i += 1;
             continue;
         }
+        // Respell a unique abbreviation as the name it resolves to, so `--force-with-l`
+        // reaches the same arm as `--force-with-lease`. The aliased form is needed
+        // because `builtin_push_options[]` has an `OPT_ALIAS()`.
+        let canonical;
+        let a = match super::canonical_long_aliased(typed, LONG_OPTS, ALIAS_GROUPS) {
+            super::Long::Name(name) => {
+                canonical = name;
+                canonical.as_ref()
+            }
+            super::Long::Ambiguous(first, second) => {
+                return Ok(super::ambiguous_option(typed, &first, &second, USAGE))
+            }
+        };
         // Split `--opt=value` up front; a value-taking flag without `=` consumes
         // the next argv entry.
         let (name, inline) = match a.split_once('=') {
@@ -193,6 +248,20 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
                     Some(v) => crate::git_fatal!("bad signed argument: {v}"),
                 };
                 signed_explicit = true;
+            }
+            // A long name no table entry claims is `parse_options()`' own refusal —
+            // the `error:` line and the block, both on stderr, exit 129 — not a gap
+            // in this port. It is decided against the table rather than by spelling,
+            // because the `PARSE_OPT_NONEG` entries have no `--no-` form to resolve.
+            other if other.starts_with("--")
+                && matches!(
+                    super::resolve_long(LONG_OPTS, &other[2..]),
+                    super::Resolved::Unknown
+                ) =>
+            {
+                eprintln!("error: unknown option `{}'", &other[2..]);
+                eprint!("{USAGE}");
+                return Ok(ExitCode::from(129));
             }
             other => bail!("unsupported option {other:?}"),
         }

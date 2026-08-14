@@ -33,7 +33,8 @@ use gix::prelude::ObjectIdExt;
 ///   * the `--no-*` negations `parse_options` synthesizes for every `OPT_BOOL`
 ///   * the multi-valued `showbranch.default` config, used when no argument is given
 ///
-/// Not covered: unique-prefix abbreviations of long options.
+/// Unique-prefix abbreviations of long options resolve the way `parse_long_opt()`
+/// resolves them, against [`LONG_OPTS`].
 ///
 /// Known deviations:
 ///   * commits carrying an `encoding` header are not run through
@@ -68,6 +69,9 @@ pub fn show_branch(args: &[String]) -> Result<ExitCode> {
             }
             eprint!("{USAGE}");
             return Ok(ExitCode::from(129));
+        }
+        Err(ParseFail::Ambiguous(tok, first, second)) => {
+            return Ok(super::ambiguous_option(&tok, &first, &second, USAGE))
         }
     };
 
@@ -328,6 +332,29 @@ const MAX_REVS: usize = 27;
 /// `DEFAULT_REFLOG` — how many entries a bare `-g`/`--reflog` asks for.
 const DEFAULT_REFLOG: i32 = 4;
 
+/// `cmd_show_branch()`'s `struct option builtin_show_branch_options[]`
+/// (builtin/show-branch.c), in table order, as [`super::resolve_long`] reads it.
+///
+/// `--topo-order`, `--date-order` and `--reflog` carry `PARSE_OPT_NONEG`, so none
+/// of the three has a `--no-` spelling; `no-name` is an entry spelled with its own
+/// `no-`, which parse-options reads as the *unset* sense of `name`.
+pub(super) const LONG_OPTS: &[super::LongOpt] = &[
+    super::LongOpt { name: "all",                         neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "remotes",                     neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "color",                       neg: true,  arg: super::Arg::Optional },
+    super::LongOpt { name: "more",                        neg: true,  arg: super::Arg::Optional },
+    super::LongOpt { name: "list",                        neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "no-name",                     neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "current",                     neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "sha1-name",                   neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "merge-base",                  neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "independent",                 neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "topo-order",                  neg: false, arg: super::Arg::None },
+    super::LongOpt { name: "topics",                      neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "sparse",                      neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "date-order",                  neg: false, arg: super::Arg::None },
+    super::LongOpt { name: "reflog",                      neg: false, arg: super::Arg::Optional },
+];
 /// `show_branch_usage` plus the option list `usage_with_options` renders under it.
 const USAGE: &str = "\
 usage: git show-branch [-a | --all] [-r | --remotes] [--topo-order | --date-order]
@@ -411,6 +438,11 @@ enum ParseFail {
     /// A rejection: `usage_with_options()`'s `error:` line (when there is one)
     /// and the block, both on stderr, 129.
     Rejected(Option<String>),
+    /// An abbreviation two entries claim, carrying the token as typed and the two
+    /// candidate spellings. It is the one refusal whose block goes to **stdout**:
+    /// `parse_long_opt()` prints the reason with `error()` and returns
+    /// `PARSE_OPT_HELP`, which routes to `USAGE_TO_STDOUT`.
+    Ambiguous(String, String, String),
 }
 
 /// `OPT__COLOR`'s rejection of an unknown `<when>`.
@@ -447,6 +479,18 @@ fn parse_args(argv: &[String], opts: &mut Opts) -> Result<Vec<String>, ParseFail
         if !a.starts_with('-') || a == "-" {
             break;
         }
+        // Respell a unique abbreviation as the name it resolves to, so `--indep`
+        // reaches the same arm as `--independent`.
+        let canonical;
+        let a = match super::canonical_long(a, LONG_OPTS) {
+            super::Long::Name(name) => {
+                canonical = name;
+                canonical.as_ref()
+            }
+            super::Long::Ambiguous(first, second) => {
+                return Err(ParseFail::Ambiguous(a.to_string(), first, second))
+            }
+        };
         if let Some(long) = a.strip_prefix("--") {
             match long {
                 "all" => opts.all_heads = true,
@@ -475,11 +519,11 @@ fn parse_args(argv: &[String], opts: &mut Opts) -> Result<Vec<String>, ParseFail
                 "more" => opts.extra = 1,
                 "no-color" => opts.color = Some(false),
                 "color" => opts.color = Some(true),
+                // `-g`/`--reflog` carries `PARSE_OPT_OPTARG | PARSE_OPT_NONEG`
+                // (builtin/show-branch.c), so `--no-reflog` is not a spelling
+                // parse-options resolves at all — it falls through to the
+                // `unknown option` refusal below, exactly as stock rejects it.
                 "reflog" => parse_reflog_param("", opts)?,
-                "no-reflog" => {
-                    opts.reflog = 0;
-                    opts.reflog_base = None;
-                }
                 _ if long.starts_with("reflog=") => {
                     parse_reflog_param(&long["reflog=".len()..], opts)?;
                 }

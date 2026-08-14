@@ -86,6 +86,42 @@ use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
 use gix::refs::{FullName, Target};
 
 /// `usage_with_options()` over `builtin/tag.c`'s option table.
+/// `cmd_tag()`'s `struct option options[]` (builtin/tag.c), in table order, as
+/// [`super::resolve_long`] reads it.
+///
+/// The `OPT_CMDMODE`s (`--list`, `--delete`, `--verify`), `-m`/`--message`, and
+/// the `--contains`/`--no-contains`/`--with`/`--without`/`--merged`/`--no-merged`
+/// family all carry `PARSE_OPT_NONEG`, so none of them has a `--no-` spelling.
+const LONG_OPTS: &[super::LongOpt] = &[
+    super::LongOpt { name: "list",                        neg: false, arg: super::Arg::None },
+    // `{ .type = OPTION_INTEGER, .short_name = 'n' }` — short-only, no entry.
+    super::LongOpt { name: "delete",                      neg: false, arg: super::Arg::None },
+    super::LongOpt { name: "verify",                      neg: false, arg: super::Arg::None },
+    super::LongOpt { name: "annotate",                    neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "message",                     neg: false, arg: super::Arg::Required },
+    super::LongOpt { name: "file",                        neg: true,  arg: super::Arg::Required },
+    super::LongOpt { name: "trailer",                     neg: true,  arg: super::Arg::Required },
+    super::LongOpt { name: "edit",                        neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "sign",                        neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "cleanup",                     neg: true,  arg: super::Arg::Required },
+    super::LongOpt { name: "local-user",                  neg: true,  arg: super::Arg::Required },
+    super::LongOpt { name: "force",                       neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "create-reflog",               neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "column",                      neg: true,  arg: super::Arg::Optional },
+    super::LongOpt { name: "contains",                    neg: false, arg: super::Arg::LastArg },
+    super::LongOpt { name: "no-contains",                 neg: false, arg: super::Arg::LastArg },
+    super::LongOpt { name: "with",                        neg: false, arg: super::Arg::LastArg },
+    super::LongOpt { name: "without",                     neg: false, arg: super::Arg::LastArg },
+    super::LongOpt { name: "merged",                      neg: false, arg: super::Arg::LastArg },
+    super::LongOpt { name: "no-merged",                   neg: false, arg: super::Arg::LastArg },
+    super::LongOpt { name: "omit-empty",                  neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "sort",                        neg: true,  arg: super::Arg::Required },
+    super::LongOpt { name: "points-at",                   neg: true,  arg: super::Arg::LastArg },
+    super::LongOpt { name: "format",                      neg: true,  arg: super::Arg::Required },
+    super::LongOpt { name: "color",                       neg: true,  arg: super::Arg::Optional },
+    super::LongOpt { name: "ignore-case",                 neg: true,  arg: super::Arg::None },
+];
+
 const USAGE: &str = r"usage: git tag [-a | -s | -u <key-id>] [-f] [-m <msg> | -F <file>] [-e]
                [(--trailer <token>[(=|:)<value>])...]
                <tagname> [<commit> | <object>]
@@ -237,12 +273,25 @@ pub fn tag(args: &[String]) -> Result<ExitCode> {
 
     let mut i = 0;
     while i < args.len() {
-        let a = args[i].as_str();
+        let typed = args[i].as_str();
+        let a = typed;
         i += 1;
         if operands_only || !a.starts_with('-') || a == "-" {
-            positionals.push(a);
+            positionals.push(typed);
             continue;
         }
+        // Respell a unique abbreviation as the name it resolves to, so an
+        // abbreviation lands on the arm its full spelling lands on.
+        let canonical;
+        let a = match super::canonical_long(a, LONG_OPTS) {
+            super::Long::Name(name) => {
+                canonical = name;
+                canonical.as_ref()
+            }
+            super::Long::Ambiguous(first, second) => {
+                return Ok(super::ambiguous_option(a, &first, &second, USAGE))
+            }
+        };
         match a {
             "--" => operands_only = true,
             // parse_options_step()'s `internal_help`: the block on stdout at
@@ -358,6 +407,21 @@ pub fn tag(args: &[String]) -> Result<ExitCode> {
                     message_file = Some(take_value(args, &mut i, "file")?.to_string());
                 } else if let Some(rest) = a.strip_prefix("-F") {
                     message_file = Some(rest.to_string());
+                // A long name no table entry claims is `parse_options()`' own refusal
+                // — the `error:` line and the block, both on stderr, exit 129 — not a
+                // gap in this port. It is decided against the table rather than by
+                // spelling, because the `OPT_CMDMODE`s, `-m`/`--message` and the
+                // `--contains`/`--merged` family are `PARSE_OPT_NONEG` and so have no
+                // `--no-` form for parse-options to resolve.
+                } else if a.starts_with("--")
+                    && matches!(
+                        super::resolve_long(LONG_OPTS, &a[2..]),
+                        super::Resolved::Unknown
+                    )
+                {
+                    eprintln!("error: unknown option `{}'", &a[2..]);
+                    eprint!("{USAGE}");
+                    return Ok(ExitCode::from(129));
                 } else if let Some(rest) = a.strip_prefix("-n") {
                     let n: usize = rest
                         .parse()

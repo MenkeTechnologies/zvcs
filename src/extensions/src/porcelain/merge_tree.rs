@@ -86,6 +86,23 @@ enum Merged {
     Done { clean: bool, body: Vec<u8> },
 }
 
+/// `cmd_merge_tree()`'s `struct option mt_options[]` (builtin/merge-tree.c), in
+/// table order, as [`super::resolve_long`] reads it.
+///
+/// The two mode selectors and the `OPT_BOOL_F(... PARSE_OPT_NONEG)` flags carry
+/// `PARSE_OPT_NONEG`, so only `--messages`, `--merge-base` and
+/// `--strategy-option` have a `--no-` spelling.
+const LONG_OPTS: &[super::LongOpt] = &[
+    super::LongOpt { name: "write-tree",                  neg: false, arg: super::Arg::None },
+    super::LongOpt { name: "trivial-merge",               neg: false, arg: super::Arg::None },
+    super::LongOpt { name: "messages",                    neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "quiet",                       neg: false, arg: super::Arg::None },
+    super::LongOpt { name: "name-only",                   neg: false, arg: super::Arg::None },
+    super::LongOpt { name: "allow-unrelated-histories",   neg: false, arg: super::Arg::None },
+    super::LongOpt { name: "stdin",                       neg: false, arg: super::Arg::None },
+    super::LongOpt { name: "merge-base",                  neg: true,  arg: super::Arg::Required },
+    super::LongOpt { name: "strategy-option",             neg: true,  arg: super::Arg::Required },
+];
 /// Verbatim `git merge-tree` usage text, printed to stderr for usage errors
 /// (git exits 129 in those cases).
 const USAGE: &str = "\
@@ -193,6 +210,19 @@ pub fn merge_tree(args: &[String]) -> Result<ExitCode> {
             revs.extend(args[i..].iter().cloned());
             break;
         }
+
+        // Respell a unique abbreviation as the name it resolves to, so `--allow-unre`
+        // reaches the same arm as `--allow-unrelated-histories`.
+        let canonical;
+        let a = match super::canonical_long(a, LONG_OPTS) {
+            super::Long::Name(name) => {
+                canonical = name;
+                canonical.as_ref()
+            }
+            super::Long::Ambiguous(first, second) => {
+                return Ok(super::ambiguous_option(a, &first, &second, USAGE))
+            }
+        };
 
         if let Some(long) = a.strip_prefix("--") {
             let (name, inline) = match long.split_once('=') {

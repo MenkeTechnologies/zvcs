@@ -714,6 +714,32 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
             "--allow-empty" => allow_empty = true,
             "--allow-empty-message" => allow_empty_message = true,
             "-q" | "--quiet" => quiet = true,
+            // The unset halves of the message-source options. Each is exactly what
+            // parse-options writes for that entry's type, so a later `--no-<x>`
+            // discards an earlier value rather than being an unknown option:
+            //
+            //   `-m` is an `OPT_CALLBACK` over `opt_parse_m()`, whose unset arm
+            //     clears the accumulated buffer (builtin/commit.c:172-174);
+            //   `-F`/`--file` is an `OPT_FILENAME` and `--author`, `--date`,
+            //     `-c`, `-C`, `--fixup`, `--squash` are `OPT_STRING`s, whose unset
+            //     writes NULL over the slot (parse-options.c:200-202, 214-215);
+            //   `--reset-author` and the two hidden `--allow-empty*` are
+            //     `OPT_BOOL`/`OPT_HIDDEN_BOOL`, whose unset writes 0;
+            //   `-q` is an `OPT__QUIET` (`OPT_COUNTUP`), whose unset resets to 0.
+            "--no-message" => messages.clear(),
+            "--no-file" => file_args.clear(),
+            "--no-reuse-message" | "--no-reedit-message" => {
+                reuse_arg = None;
+                reedit = false;
+            }
+            "--no-date" => date_arg = None,
+            "--no-author" => author_arg = None,
+            "--no-fixup" => fixup_arg = None,
+            "--no-squash" => squash_arg = None,
+            "--no-reset-author" => reset_author = false,
+            "--no-allow-empty" => allow_empty = false,
+            "--no-allow-empty-message" => allow_empty_message = false,
+            "--no-quiet" => quiet = false,
             "-a" | "--all" => all = true,
             "--no-all" => all = false,
             // `-n`/`--no-verify` skips `pre-commit` + `commit-msg`; `--verify` is
@@ -1637,7 +1663,13 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
         if from_flags {
             crate::git_fatal!("empty commit message (use --allow-empty-message to override)");
         }
-        crate::git_fatal!("Aborting commit due to empty commit message.");
+        // Not a `die()`: `commit.c:1906-1909` writes this with `fprintf(stderr,
+        // …)` and calls `exit(1)`, so it carries no `fatal:` prefix and exits 1,
+        // exactly like the untouched-template abort a few lines above. Reachable
+        // whenever the message clears — `--no-message` after a `-m`, an emptied
+        // editor buffer, an all-comment `-F` file.
+        eprintln!("Aborting commit due to empty commit message.");
+        return Ok(ExitCode::from(1));
     }
     if !message.is_empty() && !message.ends_with('\n') {
         message.push('\n');

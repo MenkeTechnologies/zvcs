@@ -112,6 +112,21 @@ use gix::traverse::commit::simple::CommitTimeOrder;
 use super::pretty_pad::{FlushType, PadState, WrapState};
 use crate::revfilter::{compile_patterns, ident_line, Dialect};
 
+/// `cmd_shortlog()`'s `struct option options[]` (builtin/shortlog.c), in table
+/// order, as [`super::resolve_long`] reads it.
+///
+/// It is deliberately only these five. `cmd_shortlog()` steps `parse_options_step()`
+/// over this table and routes every `PARSE_OPT_UNKNOWN` to `parse_revision_opt()`
+/// (builtin/shortlog.c:430-445), which is `revision.c`'s hand-written argv walk and
+/// abbreviates nothing — so the revision options `git shortlog` also accepts must
+/// stay exact-match, and are absent here on purpose.
+const LONG_OPTS: &[super::LongOpt] = &[
+    super::LongOpt { name: "committer",                   neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "numbered",                    neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "summary",                     neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "email",                       neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "group",                       neg: true,  arg: super::Arg::Required },
+];
 /// The `usage_with_options` block git prints for `-h`, and again after every
 /// `error: unknown option ...`. It ends with a blank line.
 const USAGE: &str = "\
@@ -322,6 +337,23 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
             actions.push(RevAction::Rev(a.to_string()));
             continue;
         }
+
+        // Respell a unique abbreviation as the name it resolves to, so `--numb`
+        // reaches the same arm as `--numbered`. `cmd_shortlog()` drives
+        // `parse_options_step()` over its own five-entry table and hands whatever
+        // that table does not claim to `parse_revision_opt()`, which does no
+        // abbreviating — so a name outside [`LONG_OPTS`] must come back untouched,
+        // which is exactly what the resolver does.
+        let canonical;
+        let a = match super::canonical_long(a, LONG_OPTS) {
+            super::Long::Name(name) => {
+                canonical = name;
+                canonical.as_ref()
+            }
+            super::Long::Ambiguous(first, second) => {
+                return Ok(super::ambiguous_option(a, &first, &second, USAGE))
+            }
+        };
 
         if let Some(long) = a.strip_prefix("--") {
             let (name, value) = match long.split_once('=') {

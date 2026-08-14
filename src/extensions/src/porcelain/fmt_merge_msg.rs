@@ -51,9 +51,9 @@
 //!     no signature-verification driver in the vendored crates.
 //!
 //! Known deviations, both on inputs stock git treats specially:
-//!   * option abbreviation (`--int` for `--into-name`) is not accepted; git's
-//!     `parse_options` allows unambiguous prefixes, and `--help` is rejected as
-//!     an unknown option rather than opening the manual page.
+//!   * `--help` is rejected as an unknown option rather than opening the manual
+//!     page. (Option abbreviation — `--int` for `--into-name` — does resolve,
+//!     against [`LONG_OPTS`].)
 //!   * the wording of the `error: ...` diagnostics is approximate for the
 //!     unknown-option and missing-value cases; only stderr is affected, and the
 //!     exit code still matches.
@@ -75,6 +75,16 @@ use gix::Repository;
 /// git's `DEFAULT_MERGE_LOG_LEN`.
 const DEFAULT_MERGE_LOG_LEN: i64 = 20;
 
+/// `cmd_fmt_merge_msg()`'s `struct option options[]` (builtin/fmt-merge-msg.c),
+/// in table order, as [`super::resolve_long`] reads it. `--summary` is the
+/// deprecated synonym of `--log`, a table entry of its own rather than an alias.
+const LONG_OPTS: &[super::LongOpt] = &[
+    super::LongOpt { name: "log",                         neg: true,  arg: super::Arg::Optional },
+    super::LongOpt { name: "summary",                     neg: true,  arg: super::Arg::Optional },
+    super::LongOpt { name: "message",                     neg: true,  arg: super::Arg::Required },
+    super::LongOpt { name: "into-name",                   neg: true,  arg: super::Arg::Required },
+    super::LongOpt { name: "file",                        neg: true,  arg: super::Arg::Required },
+];
 /// The `usage_with_options` block, verbatim from `fmt_merge_msg_usage`.
 const USAGE: &str = "\
 usage: git fmt-merge-msg [-m <message>] [--log[=<n>] | --no-log] [--file <file>]
@@ -157,7 +167,18 @@ pub fn fmt_merge_msg(args: &[String]) -> Result<ExitCode> {
 
     let mut i = 0;
     while i < args.len() {
-        let a = args[i].as_str();
+        // Respell a unique abbreviation as the name it resolves to, so `--into-n`
+        // reaches the same arm as `--into-name`.
+        let canonical;
+        let a = match super::canonical_long(args[i].as_str(), LONG_OPTS) {
+            super::Long::Name(name) => {
+                canonical = name;
+                canonical.as_ref()
+            }
+            super::Long::Ambiguous(first, second) => {
+                return Ok(super::ambiguous_option(&args[i], &first, &second, USAGE))
+            }
+        };
         match a {
             "-h" => {
                 print!("{USAGE}");

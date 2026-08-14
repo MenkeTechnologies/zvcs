@@ -47,6 +47,23 @@ use std::process::ExitCode;
 use gix::bstr::{BStr, ByteSlice};
 use gix::protocol::handshake::Ref;
 
+/// `cmd_ls_remote()`'s `struct option options[]` (builtin/ls-remote.c), in table
+/// order, as [`super::resolve_long`] reads it. `--heads` is `OPT_ALIAS`-free here:
+/// it is a table entry of its own, hidden but real.
+const LONG_OPTS: &[super::LongOpt] = &[
+    super::LongOpt { name: "quiet",                       neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "upload-pack",                 neg: true,  arg: super::Arg::Required },
+    super::LongOpt { name: "exec",                        neg: true,  arg: super::Arg::Required },
+    super::LongOpt { name: "tags",                        neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "branches",                    neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "heads",                       neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "refs",                        neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "get-url",                     neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "sort",                        neg: true,  arg: super::Arg::Required },
+    super::LongOpt { name: "exit-code",                   neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "symref",                      neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "server-option",               neg: true,  arg: super::Arg::Required },
+];
 /// `git ls-remote -h` used with nothing else prints this and exits 129.
 const USAGE: &str = "\
 usage: git ls-remote [--branches] [--tags] [--refs] [--upload-pack=<exec>]
@@ -354,6 +371,20 @@ fn parse_args<'a>(
             }
             continue;
         }
+
+        // Respell a unique abbreviation as the name it resolves to, so `--get-u`
+        // reaches the same arm as `--get-url`. Names no entry claims come back
+        // untouched, so the refusal below still quotes what was typed.
+        let canonical;
+        let arg = match super::canonical_long(arg, LONG_OPTS) {
+            super::Long::Name(name) => {
+                canonical = name;
+                canonical.as_ref()
+            }
+            super::Long::Ambiguous(first, second) => {
+                return Err(super::ambiguous_option(arg, &first, &second, USAGE))
+            }
+        };
 
         // `--no-<flag>` clears the corresponding setting, as parse_options does.
         let (name, value, on) = split_long(arg);

@@ -916,6 +916,46 @@ mod tests {
         );
     }
 
+    /// The shipped verb tables keep their `PARSE_OPT_NONEG` entries un-negatable.
+    ///
+    /// This is the guard for a bug that shipped four times over: a command whose
+    /// own parser hand-rolled the `no-` split (or simply listed a `--no-<x>` arm)
+    /// accepted a negation stock git has never had, because `PARSE_OPT_NONEG`
+    /// lives in the C table and nothing in the Rust arm list recorded it. Each
+    /// name below was verified against stock 2.55.0, which answers every one of
+    /// them with `error: unknown option` and exit 129:
+    ///
+    /// * `git rebase --no-abort` — the nine `OPT_CMDMODE`s (builtin/rebase.c)
+    /// * `git show-branch --no-reflog` — `PARSE_OPT_OPTARG | PARSE_OPT_NONEG`
+    /// * `git range-diff --no-binary` — `diff.c`'s `--binary` callback
+    /// * `git fetch --no-refetch` — `OPT_SET_INT_F(... PARSE_OPT_NONEG)`
+    ///
+    /// The positive spelling of each is asserted alongside it, so a table that
+    /// went missing entirely could not pass this by resolving nothing at all.
+    #[test]
+    fn noneg_entries_of_the_shipped_tables_have_no_negation() {
+        let cases: &[(&str, &[LongOpt], &str)] = &[
+            ("rebase", super::rebase::LONG_OPTS, "abort"),
+            ("rebase", super::rebase::LONG_OPTS, "continue"),
+            ("rebase", super::rebase::LONG_OPTS, "edit-todo"),
+            ("show-branch", super::show_branch::LONG_OPTS, "reflog"),
+            ("range-diff", super::range_diff::LONG_OPTS, "binary"),
+            ("range-diff", super::range_diff::LONG_OPTS, "name-only"),
+            ("fetch", super::fetch::LONG_OPTS, "refetch"),
+            ("fetch", super::fetch::LONG_OPTS, "unshallow"),
+        ];
+        for &(verb, table, name) in cases {
+            assert!(
+                matches!(resolve_long(table, name), Resolved::One(..)),
+                "{verb}: --{name} should resolve"
+            );
+            assert!(
+                matches!(resolve_long(table, &format!("no-{name}")), Resolved::Unknown),
+                "{verb}: --no-{name} must not resolve (the entry is PARSE_OPT_NONEG)"
+            );
+        }
+    }
+
     /// `show_usage_if_asked()` fires on a lone `-h` and on nothing else.
     ///
     /// This is the one rule that separates the two `-h` families, and getting it

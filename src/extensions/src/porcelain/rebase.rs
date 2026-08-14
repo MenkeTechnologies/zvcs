@@ -180,7 +180,7 @@ use super::{Arg, LongOpt};
 /// `OPT_CMDMODE` entries (`--continue`, `--skip`, `--abort`, `--quit`,
 /// `--edit-todo`, `--show-current-patch`, `--apply`, `--merge`, `--interactive`)
 /// and `--empty` carry `PARSE_OPT_NONEG`, so none of those has a `--no-` spelling.
-const LONG_OPTS: &[LongOpt] = &[
+pub(super) const LONG_OPTS: &[LongOpt] = &[
     LongOpt { name: "onto",                        neg: true,  arg: Arg::Required },
     LongOpt { name: "keep-base",                   neg: true,  arg: Arg::None },
     LongOpt { name: "no-verify",                   neg: true,  arg: Arg::None },
@@ -491,6 +491,22 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
             no_more_options = true;
             i += 1;
             continue;
+        }
+
+        // A long name no table entry claims loses here, before the `no-` splitting
+        // below ever sees it. That order is load-bearing: `--abort`, `--continue`,
+        // `--skip`, `--quit`, `--edit-todo`, `--show-current-patch`, `--apply`,
+        // `--merge` and `--interactive` are `OPT_CMDMODE`s, which carry
+        // `PARSE_OPT_NONEG` and therefore have no `--no-` spelling at all — the
+        // hand-rolled splitter would otherwise read `--no-abort` as a negated
+        // `--abort` and act on it, where stock answers `unknown option`.
+        if let Some(long) = a.strip_prefix("--") {
+            if matches!(
+                super::resolve_long(LONG_OPTS, long),
+                super::Resolved::Unknown
+            ) {
+                opterr!("unknown option `{long}'");
+            }
         }
 
         // Respell a unique abbreviation as the name it resolves to, so `--autosq`

@@ -391,7 +391,14 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
             // 129, with no `error:` line — a help request is not a rejection.
             "-h" => return Ok(super::show_usage(USAGE)),
             "--staged" | "-S" => staged = true,
+            // Every `--no-<x>` below is parse-options' unset for that entry:
+            // an `OPT_BOOL` writes 0, an `OPT_STRING`/`OPT_FILENAME` writes NULL,
+            // and `parse_opt_conflict()` (builtin/checkout.c:1750) sets
+            // `conflict_style = -1`. None of them is a gap in this port; they are
+            // the other half of options it already implements.
+            "--no-staged" => staged = false,
             "--worktree" | "-W" => worktree = true,
+            "--no-worktree" => worktree = false,
             "-s" | "--source" => {
                 i += 1;
                 match args.get(i) {
@@ -412,6 +419,7 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
             "--ours" | "-2" => pick = Some(Pick::Ours),
             "--theirs" | "-3" => pick = Some(Pick::Theirs),
             "-m" | "--merge" => merge_flag = true,
+            "--no-merge" => merge_flag = false,
             "--conflict" => {
                 i += 1;
                 match args.get(i) {
@@ -429,7 +437,12 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
                 }
             }
             "--ignore-unmerged" => ignore_unmerged = true,
+            "--no-ignore-unmerged" => ignore_unmerged = false,
             "--pathspec-file-nul" => pathspec_file_nul = true,
+            "--no-pathspec-file-nul" => pathspec_file_nul = false,
+            "--no-pathspec-from-file" => pathspec_from_file = None,
+            "--no-source" => source = None,
+            "--no-conflict" => conflict_style = None,
             "--pathspec-from-file" => {
                 i += 1;
                 match args.get(i) {
@@ -442,7 +455,7 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
             }
             // Accepted no-ops: quiet/progress/default no-recurse/diff-context knobs
             // (context knobs only affect interactive `--patch`, unsupported here).
-            "-q" | "--quiet" | "--progress" | "--no-progress"
+            "-q" | "--quiet" | "--no-quiet" | "--progress" | "--no-progress"
             | "--ignore-skip-worktree-bits" | "--no-ignore-skip-worktree-bits" => {}
             "-p" | "--patch" => patch_mode = true,
             "--no-patch" => patch_mode = false,
@@ -463,8 +476,20 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
                 pathspec_from_file = Some(s["--pathspec-from-file=".len()..].to_string());
             }
             s if s.starts_with("-s") && s.len() > 2 => source = Some(s[2..].to_string()),
+            // `PARSE_OPT_UNKNOWN` (parse-options.c:1210-1224): the `error:` line and
+            // then the whole usage block, both on stderr, exit 129. That block is
+            // what separates this from a bad option *value*, which returns
+            // `PARSE_OPT_ERROR` and exits 129 with the one line alone — which is why
+            // the value refusals above print no block. A short option is named by
+            // its letter (`unknown switch \`Z'`), a long one by its body.
+            s if s.starts_with("--") => {
+                eprintln!("error: unknown option `{}'", &s[2..]);
+                eprint!("{USAGE}");
+                return Ok(ExitCode::from(129));
+            }
             s if s.starts_with('-') && s != "-" => {
-                eprintln!("error: unknown option `{}'", s.trim_start_matches('-'));
+                eprintln!("error: unknown switch `{}'", &s[1..2]);
+                eprint!("{USAGE}");
                 return Ok(ExitCode::from(129));
             }
             // A non-option argument is handed back unchanged by the resolver.

@@ -87,6 +87,17 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 /// Top-level usage, byte-for-byte as git 2.55 emits it.
+/// `cmd_commit_graph()`'s top-level option table (builtin/commit-graph.c:347),
+/// which is `parse_options_concat(builtin_commit_graph_options, common_opts)`.
+///
+/// The two `OPT_SUBCOMMAND` entries carry no long *option* name — `parse_long_opt()`
+/// skips `OPTION_SUBCOMMAND` outright (parse-options.c:542-543) — so `--object-dir`
+/// from `common_opts` is the only name this level resolves. The `verify` and `write`
+/// tables belong to those subcommands and are reached only after one is named.
+const LONG_OPTS: &[super::LongOpt] = &[
+    super::LongOpt { name: "object-dir",                  neg: true,  arg: super::Arg::Required },
+];
+
 const TOP_USAGE: &str = "\
 usage: git commit-graph verify [--object-dir <dir>] [--shallow] [--[no-]progress]
    or: git commit-graph write [--object-dir <dir>] [--append]
@@ -167,6 +178,18 @@ pub fn commit_graph(args: &[String]) -> Result<ExitCode> {
     let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
+        // Respell a unique abbreviation as the name it resolves to, so an
+        // abbreviation lands on the arm its full spelling lands on.
+        let canonical;
+        let a = match super::canonical_long(a, LONG_OPTS) {
+            super::Long::Name(name) => {
+                canonical = name;
+                canonical.as_ref()
+            }
+            super::Long::Ambiguous(first, second) => {
+                return Ok(super::ambiguous_option(a, &first, &second, TOP_USAGE))
+            }
+        };
         match a {
             "-h" => {
                 print!("{TOP_USAGE}");
@@ -641,7 +664,7 @@ fn write_graph(args: &[String], inherited_object_dir: Option<String>) -> Result<
         bail!(
             "unsupported flag \"--split\" over an existing commit-graph: the chain merge, \
              BASE chunk and expiry strategies are not modelled by the read-only vendored \
-             gix-commitgraph (ported: writing the first layer of a chain)"
+             gix-commitgraph"
         );
     }
 

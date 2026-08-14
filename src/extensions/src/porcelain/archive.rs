@@ -145,6 +145,27 @@ const FORMATS: &[&str] = &["tar", "tgz", "tar.gz", "zip"];
 /// level is observable from here since none of these three can be produced yet.
 const LEVEL_FORMATS: &[&str] = &["tgz", "tar.gz", "zip"];
 
+/// `parse_archive_args()`'s `struct option opts[]` (archive.c), in table order, as
+/// [`super::resolve_long`] reads it.
+///
+/// `cmd_archive()` runs a first `parse_options()` over a three-entry
+/// `local_opts[]` (`--output`, `--remote`, `--exec`) with `PARSE_OPT_KEEP_ALL`,
+/// which keeps everything it does not claim, and the surviving argv then reaches
+/// this table — where those same three names appear again. One table therefore
+/// answers both passes identically. `--mtime` is `PARSE_OPT_NONEG`.
+const LONG_OPTS: &[super::LongOpt] = &[
+    super::LongOpt { name: "format",                      neg: true,  arg: super::Arg::Required },
+    super::LongOpt { name: "prefix",                      neg: true,  arg: super::Arg::Required },
+    super::LongOpt { name: "add-file",                    neg: true,  arg: super::Arg::Required },
+    super::LongOpt { name: "add-virtual-file",            neg: true,  arg: super::Arg::Required },
+    super::LongOpt { name: "output",                      neg: true,  arg: super::Arg::Required },
+    super::LongOpt { name: "worktree-attributes",         neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "verbose",                     neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "mtime",                       neg: false, arg: super::Arg::Required },
+    super::LongOpt { name: "list",                        neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "remote",                      neg: true,  arg: super::Arg::Required },
+    super::LongOpt { name: "exec",                        neg: true,  arg: super::Arg::Required },
+];
 /// git's `archive_usage` followed by the option list `parse_options()` renders,
 /// byte for byte, as printed on stderr for a usage error.
 const USAGE: &str = "\
@@ -251,6 +272,18 @@ pub fn archive(args: &[String]) -> Result<ExitCode> {
             i += 1;
             continue;
         }
+        // Respell a unique abbreviation as the name it resolves to, so `--worktree-a`
+        // reaches the same arm as `--worktree-attributes`.
+        let canonical;
+        let a = match super::canonical_long(a, LONG_OPTS) {
+            super::Long::Name(name) => {
+                canonical = name;
+                canonical.as_ref()
+            }
+            super::Long::Ambiguous(first, second) => {
+                return Ok(super::ambiguous_option(a, &first, &second, USAGE))
+            }
+        };
         match a {
             "--" => literal = true,
             // git's `parse_options()` prints the full usage to *stdout* and exits
@@ -294,6 +327,11 @@ pub fn archive(args: &[String]) -> Result<ExitCode> {
                     }
                 }
             }
+            // `add_file_cb()`'s unset arm clears the whole extra-file list
+            // (archive.c:571-574), so either spelling discards every `--add-file`
+            // and `--add-virtual-file` seen so far — the two share one callback and
+            // one list.
+            "--no-add-file" | "--no-add-virtual-file" => opts.added.clear(),
             _ if a.starts_with("--format=") => opts.format = Some(a[9..].to_string()),
             _ if a.starts_with("--prefix=") => opts.prefix = Some(a[9..].to_string()),
             _ if a.starts_with("--output=") => opts.output = Some(a[9..].to_string()),
@@ -324,6 +362,10 @@ pub fn archive(args: &[String]) -> Result<ExitCode> {
             _ if a.starts_with("--remote=") || a.starts_with("--exec=") => {
                 bail!("{a} drives the git-upload-archive protocol, which is not supported here");
             }
+            // Both are `OPT_STRING`s, so their unset writes NULL over the slot
+            // (parse-options.c:200-202) — asking for the local archive this port
+            // already produces, rather than for the protocol it cannot drive.
+            "--no-remote" | "--no-exec" => {}
             _ if compression_level(a).is_some() => opts.level = compression_level(a),
             // git's `parse_options()` rejects any other dashed token with the
             // usage block on stderr and exit 129 — `unknown option` for a `--long`
@@ -569,7 +611,7 @@ pub fn archive(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::from(128));
     }
     if !gzipped && format != "tar" && format != "zip" {
-        bail!("archive format {format:?} is not supported (ported: tar, tgz, tar.gz, zip)");
+        bail!("archive format {format:?} is not supported");
     }
 
     let base = opts.prefix.clone().unwrap_or_default();

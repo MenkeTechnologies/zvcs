@@ -105,6 +105,65 @@ use gix::remote::fetch::{RefLogMessage, Shallow, Status, Tags};
 /// for `-h` with exit 129 — `parse-options` answers it before anything else.
 const USAGE: &str = "usage: git fetch [<options>] [<repository> [<refspec>...]]\n   or: git fetch [<options>] <group>\n   or: git fetch --multiple [<options>] [(<repository>|<group>)...]\n   or: git fetch --all [<options>]\n\n    -v, --[no-]verbose    be more verbose\n    -q, --[no-]quiet      be more quiet\n    --[no-]all            fetch from all remotes\n    --[no-]set-upstream   set upstream for git pull/fetch\n    -a, --[no-]append     append to .git/FETCH_HEAD instead of overwriting\n    --[no-]atomic         use atomic transaction to update references\n    --[no-]upload-pack <path>\n                          path to upload pack on remote end\n    -f, --[no-]force      force overwrite of local reference\n    -m, --[no-]multiple   fetch from multiple remotes\n    -t, --[no-]tags       fetch all tags and associated objects\n    -n                    do not fetch all tags (--no-tags)\n    -j, --[no-]jobs <n>   number of submodules fetched in parallel\n    --[no-]prefetch       modify the refspec to place all refs within refs/prefetch/\n    -p, --[no-]prune      prune remote-tracking branches no longer on remote\n    -P, --[no-]prune-tags prune local tags no longer on remote and clobber changed tags\n    --[no-]recurse-submodules[=<on-demand>]\n                          control recursive fetching of submodules\n    --[no-]dry-run        dry run\n    --[no-]porcelain      machine-readable output\n    --[no-]write-fetch-head\n                          write fetched references to the FETCH_HEAD file\n    -k, --[no-]keep       keep downloaded pack\n    -u, --[no-]update-head-ok\n                          allow updating of HEAD ref\n    --[no-]progress       force progress reporting\n    --[no-]depth <depth>  deepen history of shallow clone\n    --[no-]shallow-since <time>\n                          deepen history of shallow repository based on time\n    --[no-]shallow-exclude <ref>\n                          deepen history of shallow clone, excluding ref\n    --[no-]deepen <n>     deepen history of shallow clone\n    --unshallow           convert to a complete repository\n    --refetch             re-fetch without negotiating common commits\n    --[no-]update-shallow accept refs that update .git/shallow\n    --refmap <refmap>     specify fetch refmap\n    -o, --[no-]server-option <server-specific>\n                          option to transmit\n    -4, --ipv4            use IPv4 addresses only\n    -6, --ipv6            use IPv6 addresses only\n    --[no-]negotiation-restrict <revision>\n                          report that we have only objects reachable from this object\n    --[no-]negotiation-tip <revision>\n                          alias of --negotiation-restrict\n    --[no-]negotiation-include <revision>\n                          ensure this ref is always sent as a negotiation have\n    --[no-]negotiate-only do not fetch a packfile; instead, print ancestors of negotiation tips\n    --[no-]filter <args>  object filtering\n    --[no-]auto-maintenance\n                          run 'maintenance --auto' after fetching\n    --[no-]auto-gc        run 'maintenance --auto' after fetching\n    --[no-]show-forced-updates\n                          check for forced-updates on all updated branches\n    --[no-]write-commit-graph\n                          write the commit-graph after fetching\n    --[no-]stdin          accept refspecs from stdin\n\n";
 
+/// `cmd_fetch()`'s `struct option builtin_fetch_options[]` (builtin/fetch.c), in
+/// table order, as [`super::resolve_long_aliased`] reads it.
+///
+/// `--unshallow`, `--refetch`, `--refmap` and `-4`/`-6` carry `PARSE_OPT_NONEG`,
+/// so none of those has a `--no-` spelling.
+pub(super) const LONG_OPTS: &[super::LongOpt] = &[
+    super::LongOpt { name: "verbose",                     neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "quiet",                       neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "all",                         neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "set-upstream",                neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "append",                      neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "atomic",                      neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "upload-pack",                 neg: true,  arg: super::Arg::Required },
+    super::LongOpt { name: "force",                       neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "multiple",                    neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "tags",                        neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "jobs",                        neg: true,  arg: super::Arg::Required },
+    super::LongOpt { name: "prefetch",                    neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "prune",                       neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "prune-tags",                  neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "recurse-submodules",          neg: true,  arg: super::Arg::Optional },
+    super::LongOpt { name: "dry-run",                     neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "porcelain",                   neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "write-fetch-head",            neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "keep",                        neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "update-head-ok",              neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "progress",                    neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "depth",                       neg: true,  arg: super::Arg::Required },
+    super::LongOpt { name: "shallow-since",               neg: true,  arg: super::Arg::Required },
+    super::LongOpt { name: "shallow-exclude",             neg: true,  arg: super::Arg::Required },
+    super::LongOpt { name: "deepen",                      neg: true,  arg: super::Arg::Required },
+    super::LongOpt { name: "unshallow",                   neg: false, arg: super::Arg::None },
+    super::LongOpt { name: "refetch",                     neg: false, arg: super::Arg::None },
+    super::LongOpt { name: "submodule-prefix",            neg: true,  arg: super::Arg::Required },
+    super::LongOpt { name: "recurse-submodules-default",  neg: true,  arg: super::Arg::Required },
+    super::LongOpt { name: "update-shallow",              neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "refmap",                      neg: false, arg: super::Arg::Required },
+    super::LongOpt { name: "server-option",               neg: true,  arg: super::Arg::Required },
+    super::LongOpt { name: "ipv4",                        neg: false, arg: super::Arg::None },
+    super::LongOpt { name: "ipv6",                        neg: false, arg: super::Arg::None },
+    super::LongOpt { name: "negotiation-restrict",        neg: true,  arg: super::Arg::Required },
+    // `OPT_ALIAS(0, "negotiation-tip", "negotiation-restrict")`: `preprocess_options()`
+    // copies the source entry over the alias, keeping only the alias's own name.
+    super::LongOpt { name: "negotiation-tip",            neg: true,  arg: super::Arg::Required },
+    super::LongOpt { name: "negotiation-include",         neg: true,  arg: super::Arg::Required },
+    super::LongOpt { name: "negotiate-only",              neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "filter",                      neg: true,  arg: super::Arg::Required },
+    super::LongOpt { name: "auto-maintenance",            neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "auto-gc",                     neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "show-forced-updates",         neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "write-commit-graph",          neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "stdin",                       neg: true,  arg: super::Arg::None },
+];
+
+/// The one `OPT_ALIAS()` group in `builtin_fetch_options[]`. `is_alias()`
+/// (parse-options.c:471) reads it so `--negotiation-` does not report itself as
+/// ambiguous between an alias and the option it aliases.
+const ALIAS_GROUPS: &[&[&str]] = &[&["negotiation-tip", "negotiation-restrict"]];
+
 pub fn fetch(args: &[String]) -> Result<ExitCode> {
     if args.iter().any(|a| a == "-h") {
         print!("{USAGE}");
@@ -155,8 +214,24 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
 
     let mut i = 0;
     while i < args.len() {
-        let a = args[i].as_str();
+        let typed = args[i].as_str();
         i += 1;
+
+        // Respell a unique abbreviation as the name it resolves to, so `--negotiate-o`
+        // reaches the same arm as `--negotiate-only`. The aliased form is needed
+        // because `builtin_fetch_options[]` has an `OPT_ALIAS()`: without the group,
+        // `--negotiation-` would report itself ambiguous between the alias and its
+        // source.
+        let canonical;
+        let a = match super::canonical_long_aliased(typed, LONG_OPTS, ALIAS_GROUPS) {
+            super::Long::Name(name) => {
+                canonical = name;
+                canonical.as_ref()
+            }
+            super::Long::Ambiguous(first, second) => {
+                return Ok(super::ambiguous_option(typed, &first, &second, USAGE))
+            }
+        };
 
         // Split `--opt=value` for the value-taking long options.
         let (key, inline_val) = match (a.starts_with("--"), a.split_once('=')) {
@@ -388,7 +463,9 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
 
             // Ask for everything, negotiating nothing.
             "--refetch" => opts.refetch = true,
-            "--no-refetch" => opts.refetch = false,
+            // `--refetch` is `OPT_SET_INT_F(... PARSE_OPT_NONEG)`
+            // (builtin/fetch.c), so `--no-refetch` is not a spelling parse-options
+            // resolves; it falls through to the `unknown option` refusal below.
 
             // The `git maintenance run --auto` git runs on its way out. Two spellings of one flag,
             // enabled by default.
@@ -407,8 +484,26 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
                 positionals.extend(args[i..].iter().map(String::as_str));
                 break;
             }
+            // A long name no table entry claims is `parse_options()`' own refusal —
+            // the `error:` line and the block, both on stderr, exit 129 — not a gap
+            // in this port. It has to be decided against the table rather than by
+            // spelling, because `--unshallow`, `--refetch`, `--refmap`, `-4`/`--ipv4`
+            // and `-6`/`--ipv6` carry `PARSE_OPT_NONEG` and so have no `--no-` form
+            // for parse-options to resolve.
+            s if s.starts_with("--")
+                && matches!(
+                    super::resolve_long(LONG_OPTS, &s[2..]),
+                    super::Resolved::Unknown
+                ) =>
+            {
+                eprintln!("error: unknown option `{}'", &s[2..]);
+                eprint!("{USAGE}");
+                return Ok(ExitCode::from(129));
+            }
             s if s.starts_with('-') && s.len() > 1 => anyhow::bail!("unsupported option {s:?}"),
-            s => positionals.push(s),
+            // A non-option argument is handed back unchanged by the resolver, so the
+            // argv slice itself is pushed and the operand keeps `args`' lifetime.
+            _ => positionals.push(typed),
         }
     }
 

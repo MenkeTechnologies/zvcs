@@ -49,6 +49,14 @@ use gix::odb::pack;
 
 /// Stock git's `verify-pack` usage block, byte-for-byte, including the trailing
 /// blank line. Printed on `-h` (stdout) and for a usage error (stderr).
+/// `cmd_verify_pack()`'s `struct option verify_pack_options[]`
+/// (builtin/verify-pack.c), in table order, as [`super::resolve_long`] reads it.
+const LONG_OPTS: &[super::LongOpt] = &[
+    super::LongOpt { name: "verbose",                     neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "stat-only",                   neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "object-format",               neg: true,  arg: super::Arg::Required },
+];
+
 const USAGE: &str = "usage: git verify-pack [-v | --verbose] [-s | --stat-only] [--] <pack>.idx...\n\
                      \n\
                      \x20   -v, --[no-]verbose    verbose\n\
@@ -88,12 +96,25 @@ pub fn verify_pack(args: &[String]) -> Result<ExitCode> {
     let mut end_of_opts = false;
 
     let mut it = args.iter();
-    while let Some(a) = it.next() {
-        let a = a.as_str();
+    while let Some(typed) = it.next() {
+        let typed = typed.as_str();
+        let a = typed;
         if end_of_opts {
-            packs.push(a);
+            packs.push(typed);
             continue;
         }
+        // Respell a unique abbreviation as the name it resolves to, so an
+        // abbreviation lands on the arm its full spelling lands on.
+        let canonical;
+        let a = match super::canonical_long(a, LONG_OPTS) {
+            super::Long::Name(name) => {
+                canonical = name;
+                canonical.as_ref()
+            }
+            super::Long::Ambiguous(first, second) => {
+                return Ok(super::ambiguous_option(a, &first, &second, USAGE))
+            }
+        };
         match a {
             "--" => end_of_opts = true,
             "-h" => {
@@ -130,7 +151,9 @@ pub fn verify_pack(args: &[String]) -> Result<ExitCode> {
                     }
                 }
             }
-            s => packs.push(s),
+            // A non-option argument is handed back unchanged by the resolver, so the
+            // argv slice itself is pushed and the operand keeps `args`' lifetime.
+            _ => packs.push(typed),
         }
     }
 

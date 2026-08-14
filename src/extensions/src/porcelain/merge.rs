@@ -189,6 +189,43 @@ use gix::revision::walk::Sorting;
 use super::filespec;
 use gix::traverse::commit::simple::CommitTimeOrder;
 
+/// `cmd_merge()`'s `struct option builtin_merge_options[]` (builtin/merge.c), in
+/// table order, as [`super::resolve_long`] reads it.
+///
+/// `--ff-only` and `-F`/`--file` carry `PARSE_OPT_NONEG`, so neither has a `--no-`
+/// spelling; `no-verify` is an entry spelled with its own `no-`, which
+/// parse-options reads as the *unset* sense of `verify`.
+const LONG_OPTS: &[super::LongOpt] = &[
+    super::LongOpt { name: "stat",                        neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "summary",                     neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "compact-summary",             neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "log",                         neg: true,  arg: super::Arg::Optional },
+    super::LongOpt { name: "squash",                      neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "commit",                      neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "edit",                        neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "cleanup",                     neg: true,  arg: super::Arg::Required },
+    super::LongOpt { name: "ff",                          neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "ff-only",                     neg: false, arg: super::Arg::None },
+    super::LongOpt { name: "rerere-autoupdate",           neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "verify-signatures",           neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "strategy",                    neg: true,  arg: super::Arg::Required },
+    super::LongOpt { name: "strategy-option",             neg: true,  arg: super::Arg::Required },
+    super::LongOpt { name: "message",                     neg: true,  arg: super::Arg::Required },
+    super::LongOpt { name: "file",                        neg: false, arg: super::Arg::Required },
+    super::LongOpt { name: "into-name",                   neg: true,  arg: super::Arg::Required },
+    super::LongOpt { name: "verbose",                     neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "quiet",                       neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "abort",                       neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "quit",                        neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "continue",                    neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "allow-unrelated-histories",   neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "progress",                    neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "gpg-sign",                    neg: true,  arg: super::Arg::Optional },
+    super::LongOpt { name: "autostash",                   neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "overwrite-ignore",            neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "signoff",                     neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "no-verify",                   neg: true,  arg: super::Arg::None },
+];
 /// `usage_with_options()` over `builtin/merge.c`'s option table.
 const USAGE: &str = r"usage: git merge [<options>] [<commit>...]
    or: git merge --abort
@@ -429,7 +466,18 @@ pub fn merge(args: &[String]) -> Result<ExitCode> {
 
     let mut i = 0;
     while i < args.len() {
-        let a = args[i].as_str();
+        // Respell a unique abbreviation as the name it resolves to, so `--allow-unre`
+        // reaches the same arm as `--allow-unrelated-histories`.
+        let canonical;
+        let a = match super::canonical_long(args[i].as_str(), LONG_OPTS) {
+            super::Long::Name(name) => {
+                canonical = name;
+                canonical.as_ref()
+            }
+            super::Long::Ambiguous(first, second) => {
+                return Ok(super::ambiguous_option(&args[i], &first, &second, USAGE))
+            }
+        };
         match a {
             "--abort" => op = Op::Abort,
             "--quit" => op = Op::Quit,
@@ -655,6 +703,21 @@ pub fn merge(args: &[String]) -> Result<ExitCode> {
                 .push(a["--strategy-option=".len()..].to_string()),
             _ if a.len() > 2 && a.starts_with("-X") && !a.starts_with("--") => {
                 opts.strategy_options.push(a[2..].to_string())
+            }
+            // A long name no table entry claims is `parse_options()`' own refusal —
+            // the `error:` line and the block, both on stderr, exit 129 — not a gap
+            // in this port. It has to be decided against the table rather than by
+            // spelling, because `--ff-only` and `-F`/`--file` are `PARSE_OPT_NONEG`
+            // and so have no `--no-` form for parse-options to resolve.
+            _ if a.starts_with("--")
+                && matches!(
+                    super::resolve_long(LONG_OPTS, &a[2..]),
+                    super::Resolved::Unknown
+                ) =>
+            {
+                eprintln!("error: unknown option `{}'", &a[2..]);
+                eprint!("{USAGE}");
+                return Ok(ExitCode::from(129));
             }
             _ if a.len() > 1 && a.starts_with('-') => {
                 anyhow::bail!("unsupported flag {a}")

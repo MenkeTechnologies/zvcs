@@ -419,7 +419,7 @@ const LONG_TAKES_VALUE: &[&str] = &[
 /// it decides which two spellings an `ambiguous option:` sentence names, and
 /// `--no-patch` / `--no-prefix` / `--no-renames` are entries spelled with their own
 /// `no-`, which parse-options reads as the *unset* sense of the stem.
-const LONG_OPTS: &[LongOpt] = &[
+pub(super) const LONG_OPTS: &[LongOpt] = &[
     LongOpt { name: "creation-factor",             neg: true,  arg: Arg::Required },
     LongOpt { name: "no-dual-color",               neg: true,  arg: Arg::None },
     LongOpt { name: "notes",                       neg: true,  arg: Arg::Optional },

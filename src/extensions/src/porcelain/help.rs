@@ -1386,6 +1386,25 @@ worktree.guessRemote
 worktree.useRelativePaths
 "#;
 
+/// `cmd_help()`'s `struct option builtin_help_options[]` (builtin/help.c), in
+/// table order, as [`super::resolve_long`] reads it.
+const LONG_OPTS: &[super::LongOpt] = &[
+    super::LongOpt { name: "all",                         neg: false, arg: super::Arg::None },
+    super::LongOpt { name: "external-commands",           neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "aliases",                     neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "exclude-guides",              neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "man",                         neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "web",                         neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "info",                        neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "verbose",                     neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "guides",                      neg: false, arg: super::Arg::None },
+    super::LongOpt { name: "user-interfaces",             neg: false, arg: super::Arg::None },
+    super::LongOpt { name: "developer-interfaces",        neg: false, arg: super::Arg::None },
+    super::LongOpt { name: "config",                      neg: false, arg: super::Arg::None },
+    super::LongOpt { name: "config-for-completion",       neg: false, arg: super::Arg::None },
+    super::LongOpt { name: "config-sections-for-completion", neg: false, arg: super::Arg::None },
+    super::LongOpt { name: "aliases-for-completion",      neg: false, arg: super::Arg::None },
+];
 /// The usage block git prints for `-h`, for unknown options, and after the
 /// fatal argument-combination errors. Ends with a blank line, as git's does.
 const USAGE: &str = r#"usage: git help [-a|--all] [--[no-]verbose] [--[no-]external-commands] [--[no-]aliases]
@@ -1477,15 +1496,28 @@ pub fn help(args: &[String]) -> Result<ExitCode> {
     let mut rest: Vec<&str> = Vec::new();
     let mut no_more_opts = false;
 
-    for a in args {
+    for typed in args {
+        let a = typed;
         if no_more_opts {
-            rest.push(a.as_str());
+            rest.push(typed.as_str());
             continue;
         }
         if a == "--" {
             no_more_opts = true;
             continue;
         }
+        // Respell a unique abbreviation as the name it resolves to, so `--user-i`
+        // reaches the same arm as `--user-interfaces`.
+        let canonical;
+        let a = match super::canonical_long(a, LONG_OPTS) {
+            super::Long::Name(name) => {
+                canonical = name;
+                canonical.as_ref()
+            }
+            super::Long::Ambiguous(first, second) => {
+                return Ok(super::ambiguous_option(a, &first, &second, USAGE))
+            }
+        };
         if let Some(long) = a.strip_prefix("--") {
             match long {
                 "help" => {
@@ -1526,8 +1558,10 @@ pub fn help(args: &[String]) -> Result<ExitCode> {
                 "web" => viewer = Some("--web"),
                 "info" => viewer = Some("--info"),
                 "no-man" | "no-web" | "no-info" => viewer = None,
-                // Kept by git as a hidden no-op for backwards compatibility.
-                "exclude-guides" => {}
+                // Kept by git as a hidden no-op for backwards compatibility. It is
+                // an `OPT_HIDDEN_BOOL` (builtin/help.c:72), so its unset writes 0 —
+                // the state this command already runs in — and resolves too.
+                "exclude-guides" | "no-exclude-guides" => {}
                 _ => return Ok(unknown_option(long, false)),
             }
             continue;
@@ -1569,7 +1603,9 @@ pub fn help(args: &[String]) -> Result<ExitCode> {
             }
             continue;
         }
-        rest.push(a.as_str());
+        // A non-option argument is handed back unchanged by the resolver, so the
+        // argv slice itself is pushed and the operand keeps `args`' lifetime.
+        rest.push(typed.as_str());
     }
 
     // git's post-parse validation, in git's own order.

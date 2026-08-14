@@ -23,6 +23,14 @@ use gix::objs::tree::EntryMode;
 /// Stock git's `write-tree` usage block, byte-for-byte (208 bytes), including
 /// the trailing blank line. Printed on `-h` (stdout) and after the `error:`
 /// line for a usage error (stderr).
+/// `cmd_write_tree()`'s `struct option write_tree_options[]`
+/// (builtin/write-tree.c), in table order, as [`super::resolve_long`] reads it.
+const LONG_OPTS: &[super::LongOpt] = &[
+    super::LongOpt { name: "missing-ok",                  neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "prefix",                      neg: true,  arg: super::Arg::Required },
+    super::LongOpt { name: "ignore-cache-tree",           neg: true,  arg: super::Arg::None },
+];
+
 const USAGE: &str = "usage: git write-tree [--missing-ok] [--prefix=<prefix>/]\n\
                      \n\
                      \x20   --[no-]missing-ok     allow missing objects\n\
@@ -58,11 +66,29 @@ pub fn write_tree(args: &[String]) -> Result<ExitCode> {
     let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
+        // Respell a unique abbreviation as the name it resolves to, so an
+        // abbreviation lands on the arm its full spelling lands on.
+        let canonical;
+        let a = match super::canonical_long(a, LONG_OPTS) {
+            super::Long::Name(name) => {
+                canonical = name;
+                canonical.as_ref()
+            }
+            super::Long::Ambiguous(first, second) => {
+                return Ok(super::ambiguous_option(a, &first, &second, USAGE))
+            }
+        };
         match a {
             "-h" => {
                 print!("{USAGE}");
                 return Ok(ExitCode::from(129));
             }
+            // `--ignore-cache-tree` (builtin/write-tree.c:37, "only useful for
+            // debugging") makes git recompute every tree instead of reusing the
+            // index's `TREE` extension. This port never reads that extension — it
+            // always walks the index and writes the trees it finds — so both senses
+            // are exact no-ops here and produce the object id stock produces.
+            "--ignore-cache-tree" | "--no-ignore-cache-tree" => {}
             "--missing-ok" => missing_ok = true,
             "--no-missing-ok" => missing_ok = false,
             "--no-prefix" => prefix = None,

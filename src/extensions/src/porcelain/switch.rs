@@ -207,11 +207,11 @@ fn parse<'a>(args: &'a [String]) -> Result<Parse<'a>> {
         }
 
         // Respell a unique abbreviation as the name it resolves to, so `--disc`
-        // reaches the same arm as `--discard-changes`. Short options and names no
-        // entry claims come back untouched, so the refusals below still quote what
-        // was typed.
+        // dispatches where `--discard-changes` dispatches. Short options and names
+        // no entry claims come back untouched, so the refusals below still quote
+        // what was typed.
         let canonical;
-        let a = match super::canonical_long(a, LONG_OPTS) {
+        let resolved = match super::canonical_long(a, LONG_OPTS) {
             super::Long::Name(name) => {
                 canonical = name;
                 canonical.as_ref()
@@ -225,10 +225,14 @@ fn parse<'a>(args: &'a [String]) -> Result<Parse<'a>> {
 
         // Long options, with or without an attached `=value`.
         if let Some(long) = a.strip_prefix("--") {
-            let (name, attached) = match long.split_once('=') {
-                Some((n, v)) => (n, Some(v)),
-                None => (long, None),
-            };
+            // The *value* is taken from the token as typed. The resolver copies it
+            // through verbatim, so the two spell the same bytes — but only this one
+            // borrows from `args`, which is what the parsed options hold on to.
+            let attached = long.split_once('=').map(|(_, v)| v);
+            // The *name* is the resolved spelling, and is only ever matched and
+            // formatted, never stored, so it may borrow from `canonical`.
+            let name = resolved.strip_prefix("--").unwrap_or(resolved);
+            let name = name.split_once('=').map_or(name, |(n, _)| n);
             macro_rules! take_value {
                 ($optname:literal) => {
                     match attached {
@@ -254,6 +258,12 @@ fn parse<'a>(args: &'a [String]) -> Result<Parse<'a>> {
                 "create" => p.create = Some(take_value!("create")),
                 "force-create" => p.force_create = Some(take_value!("force-create")),
                 "orphan" => p.orphan = Some(take_value!("orphan")),
+                // The unset half of the three `OPT_STRING`s: parse-options writes
+                // NULL over the slot (parse-options.c:200-202), so a later
+                // `--no-create` discards an earlier `--create=<branch>`.
+                "no-create" => p.create = None,
+                "no-force-create" => p.force_create = None,
+                "no-orphan" => p.orphan = None,
                 "quiet" => p.quiet = true,
                 "no-quiet" => p.quiet = false,
                 "detach" => p.detach = true,
@@ -274,6 +284,11 @@ fn parse<'a>(args: &'a [String]) -> Result<Parse<'a>> {
                     p.track = Some(true);
                 }
                 "no-track" => p.track = Some(false),
+                // `--no-merge` is the `OPT_BOOL` unset (0) and `--no-conflict` is
+                // `parse_opt_conflict()`'s unset arm (builtin/checkout.c:1750,
+                // `conflict_style = -1`). Both ask for the state this port already
+                // runs in, so neither reaches the three-way refusal below.
+                "no-merge" | "no-conflict" => {}
                 // A real 3-way worktree merge — not reproducible here.
                 "merge" | "conflict" => {
                     bail!("three-way merge on switch (--{name}) is not supported")

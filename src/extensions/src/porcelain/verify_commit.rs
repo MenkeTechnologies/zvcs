@@ -35,11 +35,23 @@ use std::process::ExitCode;
 
 /// git's own usage block, printed on stderr next to `error: unknown …` and on
 /// stdout for `-h`.
+/// `cmd_verify_commit()`'s `struct option verify_commit_options[]`
+/// (builtin/verify-commit.c), in table order, as [`super::resolve_long`] reads it.
+const LONG_OPTS: &[super::LongOpt] = &[
+    super::LongOpt { name: "verbose",                     neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "raw",                         neg: true,  arg: super::Arg::None },
+];
+
+/// `usage_with_options()` over `builtin/verify-commit.c`'s option table. It ends
+/// with the blank line the renderer emits after the last entry, so every site
+/// writes it with `print!`/`eprint!` rather than adding a newline of its own —
+/// which is what `-h` and the `ambiguous option:` block have to agree on.
 const USAGE: &str = "\
 usage: git verify-commit [-v | --verbose] [--raw] <commit>...
 
     -v, --[no-]verbose    print commit contents
     --[no-]raw            print raw gpg status output
+
 ";
 
 /// `git verify-commit` — validate the signature made by `git commit -S`.
@@ -70,6 +82,18 @@ pub fn verify_commit(args: &[String]) -> Result<ExitCode> {
             continue;
         }
 
+        // Respell a unique abbreviation as the name it resolves to, so an
+        // abbreviation lands on the arm its full spelling lands on.
+        let canonical;
+        let a = match super::canonical_long(a, LONG_OPTS) {
+            super::Long::Name(name) => {
+                canonical = name;
+                canonical.as_ref()
+            }
+            super::Long::Ambiguous(first, second) => {
+                return Ok(super::ambiguous_option(a, &first, &second, USAGE))
+            }
+        };
         if let Some(long) = a.strip_prefix("--") {
             match long {
                 "" => no_more_opts = true,
@@ -79,7 +103,7 @@ pub fn verify_commit(args: &[String]) -> Result<ExitCode> {
                 "no-raw" => raw = false,
                 _ => {
                     eprintln!("error: unknown option `{long}'");
-                    eprintln!("{USAGE}");
+                    eprint!("{USAGE}");
                     return Ok(ExitCode::from(129));
                 }
             }
@@ -92,12 +116,12 @@ pub fn verify_commit(args: &[String]) -> Result<ExitCode> {
                 'v' => verbose = true,
                 // `-h` short-circuits before anything else, repo included.
                 'h' => {
-                    println!("{USAGE}");
+                    print!("{USAGE}");
                     return Ok(ExitCode::from(129));
                 }
                 _ => {
                     eprintln!("error: unknown switch `{c}'");
-                    eprintln!("{USAGE}");
+                    eprint!("{USAGE}");
                     return Ok(ExitCode::from(129));
                 }
             }
@@ -105,7 +129,7 @@ pub fn verify_commit(args: &[String]) -> Result<ExitCode> {
     }
 
     if names.is_empty() {
-        eprintln!("{USAGE}");
+        eprint!("{USAGE}");
         return Ok(ExitCode::from(129));
     }
 

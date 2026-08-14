@@ -216,6 +216,19 @@ pub enum Verdict {
     /// parity denominator: counting an unmeasurable case as a failure is as
     /// wrong as counting it as a pass.
     Nondeterministic,
+    /// Stock git did not finish inside [`CASE_TIMEOUT`], so there is no oracle to
+    /// compare against.
+    ///
+    /// Kept apart from [`Verdict::Nondeterministic`] because the cause is
+    /// different and the reader should be able to tell them apart: stock did not
+    /// disagree with itself, it never answered. Excluded from the denominator for
+    /// the same reason — a case the harness could not measure is not a case the
+    /// port failed. It cannot mask a zvcs defect, because a zvcs side that hangs
+    /// or crashes is judged before this is reached.
+    ///
+    /// Seeing many of these means the machine is too loaded for the ceiling, not
+    /// that anything regressed.
+    StockTimeout,
 }
 
 impl Verdict {
@@ -234,6 +247,7 @@ impl Verdict {
             Verdict::Crash => "CRASH",
             Verdict::Hang => "HANG",
             Verdict::Nondeterministic => "NONDETERMINISTIC",
+            Verdict::StockTimeout => "STOCK-TIMEOUT",
         }
     }
 }
@@ -940,7 +954,24 @@ pub fn run_case(
 
     // Ordering matters: a crash outranks a gap, and a gap outranks the ordinary
     // diffs it would otherwise masquerade as.
-    let verdict = if zvcs.timed_out {
+    //
+    // The stock timeout is checked first because it is not a verdict about zvcs at
+    // all. `timed_out` was recorded for both sides and only ever read for one, so a
+    // stock side the harness had killed fell through to the exit-code comparison
+    // and was scored against the port: `stock=None` against a perfectly good exit
+    // code reads as `exit-diff`. That is the same error the `Nondeterministic`
+    // bucket exists to avoid — "counting an unmeasurable case as a failure is as
+    // wrong as counting it as a pass".
+    //
+    // It is not hypothetical. `difftool --tool-help` and `mergetool --tool-help`
+    // shell out to probe every tool on `PATH`; stock takes 1.6s for the first on an
+    // idle machine and was measured at 29.7s under sixteen concurrent agents, past
+    // the 20s ceiling, while this port answers in 88ms. Given the time, the two
+    // agree byte for byte on stdout and stderr — verified — so every one of those
+    // 60-odd failures in a loaded sweep was the harness timing out its own oracle.
+    let verdict = if stock.timed_out {
+        Verdict::StockTimeout
+    } else if zvcs.timed_out {
         Verdict::Hang
     } else if looks_like_panic(&zvcs_stderr) || zvcs.code.is_none() {
         Verdict::Crash

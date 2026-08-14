@@ -44,6 +44,10 @@ pub(crate) fn read_only(cmd: &'static str, args: &[&str], out: &mut Vec<Case>) {
     }
 }
 
+/// An index file that is not there. `{repo}` is [`crate::runner::REPO_PLACEHOLDER`],
+/// replaced with the running side's own fixture root.
+const NO_INDEX: &[(&str, &str)] = &[("GIT_INDEX_FILE", "{repo}/.git/no-such-index")];
+
 /// The full curated corpus.
 pub fn cases() -> Vec<Case> {
     let mut c = Vec::new();
@@ -137,6 +141,30 @@ pub fn cases() -> Vec<Case> {
     read_only("diff", &["diff", "--cached"], &mut c);
     c.push(Case::new("diff", &["diff", "HEAD~1", "HEAD"], Shape::Detached));
     c.push(Case::new("diff", &["diff", "main", "feature"], Shape::Branched));
+    // `-R` against a *worktree*, which used to be refused outright.
+    //
+    // Reversing a worktree diff is not the same code as reversing tree-vs-tree:
+    // the pre-image is the file on disk, so the blob platform's worktree root has
+    // to move to the old side, and the pair's ids, modes and submodule dirt swap
+    // with it. Tree-vs-tree `-R` already worked, so only these reach it.
+    //
+    // Deliberately not covered here: the bug that survived longest lived in the
+    // *parallel* analyze path, which needs four or more changed paths before a
+    // second worker starts, and no shape has that many worktree deltas. A shape
+    // added for it would cost every run, so it is pinned in the unit tests
+    // instead (`reversing_moves_the_worktree_side_onto_the_pre_image`).
+    c.push(Case::new("diff", &["diff", "-R"], Shape::Dirty));
+    c.push(Case::new("diff", &["diff", "-R", "--stat"], Shape::Dirty));
+    c.push(Case::new("diff", &["diff", "-R", "--raw"], Shape::Dirty));
+    c.push(Case::new("diff", &["diff", "-R", "--name-status"], Shape::Dirty));
+    c.push(Case::new("diff", &["diff", "-R", "HEAD"], Shape::Dirty));
+    c.push(Case::new("diff", &["diff", "-R", "-w"], Shape::Whitespace));
+    c.push(Case::new("diff", &["diff", "-R"], Shape::Submodule));
+    // `apply` over-stripping names the *header's* line, not the name line: git
+    // returns NULL from `find_name_common()` and the caller reports. `-p1` says
+    // "component" where `-p9` says "components".
+    c.push(Case::new("apply", &["apply", "-p9", "patches/valid.patch"], Shape::Patches));
+    c.push(Case::new("apply", &["apply", "-p1", "patches/valid.patch"], Shape::Patches));
     read_only("blame", &["blame", "README.md"], &mut c);
     read_only("blame", &["blame", "--porcelain", "README.md"], &mut c);
 
@@ -156,6 +184,36 @@ pub fn cases() -> Vec<Case> {
     read_only("config", &["config", "--list"], &mut c);
     read_only("remote", &["remote"], &mut c);
     read_only("remote", &["remote", "-v"], &mut c);
+
+    // ---- an index file that is not there, which readers must treat as empty ----
+    // A repository that has never staged anything has no index file, and every
+    // `ls-files` mode still has to work: `do_read_index()` only dies on an
+    // `open()` failure when the caller demanded the file, and `ls-files` reaches
+    // it through `read_index_from()` with `must_exist == 0`, so `ENOENT` yields
+    // an initialized-but-empty index — the cached list prints nothing and exits
+    // 0 while `-o` still walks the work tree. Treating it as an error instead is
+    // a defect the port shipped, and until now it was pinned only by an
+    // integration test, which measures one binary rather than two.
+    //
+    // No shape is added for it. Three routes to a repository whose index file is
+    // absent were measured against stock 2.55.0 first, and only the third has
+    // both halves agreeing today:
+    //
+    //  * `cwd` into [`Shape::BehindRemote`]'s bare `.remote.git`, which genuinely
+    //    has no index. Plain `ls-files` agrees there (nothing, exit 0), but `-o`
+    //    needs a work tree and the two sides refuse differently — stock
+    //    `fatal: this operation must be run in a work tree` at 128, the port
+    //    `zvcs: ls-files: …` at 1. That is a live divergence of its own and not
+    //    this group's to pin, so the route cannot carry the `-o` half.
+    //  * the same bare repository handed a work tree through `GIT_WORK_TREE`,
+    //    which stock accepts and the port refuses in the same words as above.
+    //  * `GIT_INDEX_FILE` naming a file that is not there, over an ordinary
+    //    shape. It is the same `open()` returning `ENOENT` on the index path, so
+    //    it reaches the same code, and both sides agree on both halves: nothing
+    //    from `ls-files`, and `README.md`/`src/lib.rs` — every tracked file, now
+    //    untracked because the index is empty — from `ls-files -o`.
+    c.push(Case::new("ls-files", &["ls-files"], Shape::Linear).with_env(NO_INDEX));
+    c.push(Case::new("ls-files", &["ls-files", "-o"], Shape::Linear).with_env(NO_INDEX));
 
     // ---- mutating: each case runs against its own pristine copy ----
     c.push(Case::new("add", &["add", "untracked.txt"], Shape::Dirty));
@@ -179,6 +237,76 @@ pub fn cases() -> Vec<Case> {
     // ran against clean or merely dirty shapes.
     c.push(Case::new("reset", &["reset", "--merge"], Shape::Conflicted));
     c.push(Case::new("reset", &["reset", "--merge", "HEAD"], Shape::Conflicted));
+    // `reset` in a bare repository, where there is no work tree to reset. Both
+    // refusals are decided by two adjacent lines of `cmd_reset()`, in this order:
+    //
+    //     if (reset_type != SOFT && (reset_type != MIXED || repo_get_work_tree(…)))
+    //             setup_work_tree(the_repository);
+    //
+    //     if (reset_type == MIXED && is_bare_repository())
+    //             die(_("%s reset is not allowed in a bare repository"), …);
+    //
+    // `--hard` satisfies the first condition, so it dies inside
+    // `setup_work_tree()` with `this operation must be run in a work tree` and
+    // never reaches the second. `--mixed` is excused from the first *because*
+    // `repo_get_work_tree()` is NULL here, falls through, and is then rejected by
+    // name: `mixed reset is not allowed in a bare repository`. Both exit 128, so
+    // the exit code cannot tell the two apart and the message *is* the behaviour
+    // — these are `Case::strict`, compared on stderr byte for byte, the same rule
+    // the refusal cases in `nested` follow. `Shape::BehindRemote`'s `.remote.git`
+    // is the bare repository and is already in the fixture, so no shape is added.
+    c.push(Case::strict("reset", &["reset", "--mixed"], Shape::BehindRemote).in_dir(".remote.git"));
+    c.push(Case::strict("reset", &["reset", "--hard"], Shape::BehindRemote).in_dir(".remote.git"));
+
+    // ---- the work-tree gate, in a bare repository ----
+    //
+    // git runs `setup_work_tree()` from `run_builtin()` for the 24 commands
+    // flagged `NEED_WORK_TREE` (git.c:499-500), before the builtin is entered and
+    // with a lone `-h` exempted (git.c:474-477). Without that gate `commit -m`
+    // *created a commit* in a bare repository, `switch` printed git's fatal and
+    // then exited 0 anyway, and `merge` reported `Already up to date.` — none of
+    // it reachable by a case, because every other case runs in a work tree.
+    //
+    // All 24 verbs now pass through one `if`, so 24 rows would test one branch 24
+    // times. These are chosen for what each *alone* would catch if the gate came
+    // undone, which is the property worth paying fixture time for.
+    let bare = |cmd: &'static str, args: &'static [&'static str]| -> Case {
+        Case::strict(cmd, args, Shape::BehindRemote).in_dir(".remote.git")
+    };
+    // The mutation, and the reason the gate exists. Caught twice over: the exit
+    // code, and a post-state that must not have gained a commit.
+    c.push(bare("commit", &["commit", "-m", "bare commit"]));
+    // The other mutating verb, and a different pre-fix failure shape.
+    c.push(bare("stash", &["stash"]));
+    // "Succeeded plausibly": exit 0, and no state change to betray it, so only
+    // stdout and the exit code can catch a regression here.
+    c.push(bare("merge", &["merge", "main"]));
+    // Printed git's fatal on stderr and *then* exited 0 — stderr looks right, so
+    // the exit code is the only witness. `switch` over `checkout`: same path,
+    // and far fewer existing cases competing to notice.
+    c.push(bare("switch", &["switch", "main"]));
+    // Ordering: the gate must outrank parse-options, which used to answer 129
+    // first. This is what regresses when a verb's argument parsing is rewritten.
+    c.push(bare("merge-recursive", &["merge-recursive"]));
+    // The cheapest row on the most-used gated verb.
+    c.push(bare("status", &["status"]));
+    // The exemption. Without it, deleting the `-h` check still passes everything.
+    c.push(bare("status", &["status", "-h"]));
+    // Not the table gate — `ls-files` gates per *option* (builtin/ls-files.c:707),
+    // and the gate must also sit ahead of the `-i` guards it used to lose to.
+    c.push(bare("ls-files", &["ls-files", "-o"]));
+    c.push(bare("ls-files", &["ls-files", "-i"]));
+    // `grep`'s gate is conditional too, and `verify_non_filename` must stand down
+    // outside a work tree (setup.c:299) or a revision collides with a stray file.
+    c.push(bare("grep", &["grep", "-n", "line"]));
+    c.push(bare("grep", &["grep", "-n", "line", "HEAD"]));
+    // The positive case. Without it the whole group is satisfiable by a port that
+    // simply refuses everything in a bare repository.
+    c.push(
+        Case::new("ls-files", &["ls-files", "-o"], Shape::BehindRemote)
+            .in_dir(".remote.git")
+            .with_env(&[("GIT_WORK_TREE", "{repo}")]),
+    );
     c.push(Case::new("commit", &["commit", "-m", "parity commit"], Shape::Dirty));
     c.push(Case::new("commit", &["commit", "-am", "parity commit all"], Shape::Dirty));
     c.push(Case::new("commit", &["commit", "--allow-empty", "-m", "empty"], Shape::Linear));

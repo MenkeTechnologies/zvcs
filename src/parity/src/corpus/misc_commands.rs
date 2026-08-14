@@ -632,6 +632,55 @@ fn usage_only(out: &mut Vec<Case>) {
         out.push(Case::new(cmd, &[cmd], Shape::Linear));
     }
 
+    // `-h` on the porcelain people actually type it at.
+    //
+    // parse-options has one renderer and two callers that differ only in the
+    // stream: `-h` goes to **stdout** at 129 with no `error:` line, a rejection
+    // goes to **stderr** at 129 with one. The exit code is identical, so nothing
+    // but a byte comparison of the two streams can tell them apart — which is how
+    // 46 of these verbs came to answer `-h` through the rejection path unnoticed,
+    // several of them also dropping the trailing blank line the renderer always
+    // emits. `diff` is the deliberate odd one out: its help comes from
+    // `usage(builtin_diff_usage)`, so stock puts it on stderr.
+    for cmd in [
+        "log", "diff", "commit", "checkout", "branch", "show", "tag", "merge", "reset", "config",
+        "rm", "restore", "rev-parse", "am", "apply", "cherry-pick", "revert", "format-patch",
+        "reflog", "status",
+    ] {
+        out.push(Case::strict(cmd, &[cmd, "-h"], Shape::Linear));
+    }
+
+    // The other `-h` family: `show_usage_if_asked` answers only when `-h` is the
+    // *sole* argument (`ac == 2`), where parse-options answers wherever it appears.
+    // Nothing distinguishes the two families except a second argument, so without
+    // these a verb can be moved to the wrong family and no case would notice.
+    for cmd in [
+        "diff-index", "diff-files", "diff-tree", "rev-list", "var", "fetch-pack", "index-pack",
+        "merge-index", "merge-recursive", "merge-subtree", "merge-ours", "checkout-index",
+        "commit-tree", "ls-files",
+    ] {
+        out.push(Case::strict(cmd, &[cmd, "-h", "--quux"], Shape::Linear));
+    }
+
+    // Two verbs own `-h` as a real option, so help is the *wrong* answer here:
+    // `show-ref`'s is a hidden `--head` alias (builtin/show-ref.c:317) and
+    // `grep`'s is `--no-filename` (builtin/grep.c:1101). Both are one-line
+    // regressions waiting to happen the next time `-h` handling is touched.
+    out.push(Case::new("show-ref", &["show-ref", "-h", "HEAD"], Shape::Linear));
+    out.push(Case::new("grep", &["grep", "-h", "fixture"], Shape::Linear));
+
+    // `-h` inside a short cluster still means help for a parse-options verb,
+    // which the obvious `args[0] == "-h"` implementation gets wrong.
+    out.push(Case::strict("status", &["status", "-sh"], Shape::Linear));
+    out.push(Case::strict("branch", &["branch", "-ah"], Shape::Linear));
+
+    // The rejection half of the same renderer, so the shared usage text cannot
+    // drift on one path while staying right on the other. Several of these were
+    // themselves wrong by exactly one trailing newline.
+    for cmd in ["status", "rm", "merge-base", "rev-list", "diff-files", "range-diff"] {
+        out.push(Case::strict(cmd, &[cmd, "--bogus"], Shape::Linear));
+    }
+
     // A few argument-validation paths that go one level past the usage check
     // and still cannot reach a socket or a peer.
     out.push(Case::new("daemon", &["daemon", "--port=not-a-number"], Shape::Linear));

@@ -76,13 +76,17 @@ pub struct Tally {
     pub stderr_diff: usize,
     pub crash: usize,
     pub nondeterministic: usize,
+    /// Cases where stock never answered inside the timeout, so nothing could be
+    /// compared. Excluded from the denominator like `nondeterministic`, and
+    /// counted apart from it because the cause is the machine, not stock.
+    pub stock_timeout: usize,
     pub hang: usize,
 }
 
 impl Tally {
     /// Every case run, including ones nothing could score.
     pub fn total(&self) -> usize {
-        self.scored() + self.nondeterministic
+        self.scored() + self.nondeterministic + self.stock_timeout
     }
 
     /// Cases a byte comparison can actually judge — the parity denominator.
@@ -114,6 +118,7 @@ impl Tally {
             Verdict::Crash => self.crash += 1,
             Verdict::Hang => self.hang += 1,
             Verdict::Nondeterministic => self.nondeterministic += 1,
+            Verdict::StockTimeout => self.stock_timeout += 1,
         }
     }
 
@@ -202,6 +207,13 @@ impl Report {
             println!(
                 "           excluded={} (stock git does not reproduce these itself)",
                 self.overall.nondeterministic
+            );
+        }
+        if self.overall.stock_timeout > 0 {
+            println!(
+                "           excluded={} (stock git did not answer within the case timeout \
+                 — the machine is loaded, not the port)",
+                self.overall.stock_timeout
             );
         }
 

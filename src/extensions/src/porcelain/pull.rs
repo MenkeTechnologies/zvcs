@@ -712,7 +712,7 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
             // `parse-options`' own rejection: the offending name without its
             // dashes, then the whole option table, exit 129.
             other if other.starts_with("--") => {
-                eprintln!("error: unknown option `{}'", key.trim_start_matches('-'));
+                eprintln!("error: unknown option `{}'", &typed[2..]);
                 eprint!("{USAGE}");
                 return Ok(ExitCode::from(129));
             }

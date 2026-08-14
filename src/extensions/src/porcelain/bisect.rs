@@ -139,6 +139,15 @@ pub fn bisect(args: &[String]) -> Result<ExitCode> {
         "skip" => skip_cmd(rest),
         "run" => run_cmd(rest),
         "visualize" | "view" => visualize_cmd(rest),
+        // A dashed word is never a marking term: `cmd_bisect`'s table is
+        // `OPT_SUBCOMMAND`s only, so `parse_options_step()` hands it to
+        // `parse_long_opt()`, finds nothing and answers `PARSE_OPT_UNKNOWN` —
+        // parse-options' own refusal (the argument named as typed, `=<value>`
+        // and all, then the block, on stderr at 129) rather than bisect's
+        // `fatal: unknown command`, which only the legacy word path reaches.
+        other if other.len() > 1 && other.starts_with('-') => {
+            Ok(super::unknown_option(other, USAGE))
+        }
         // Anything else is a marking word — `bad`/`good`, `new`/`old`, or a
         // custom term a stock-git session recorded — or a genuine typo.
         other => {

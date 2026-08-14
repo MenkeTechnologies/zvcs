@@ -264,7 +264,7 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
                     super::Resolved::Unknown
                 ) =>
             {
-                eprintln!("error: unknown option `{}'", &other[2..]);
+                eprintln!("error: unknown option `{}'", &typed[2..]);
                 eprint!("{USAGE}");
                 return Ok(ExitCode::from(129));
             }

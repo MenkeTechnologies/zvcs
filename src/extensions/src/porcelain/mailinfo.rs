@@ -315,7 +315,7 @@ fn parse_options(
                     match matches.len() {
                         1 => matches[0].clone(),
                         0 => {
-                            eprintln!("error: unknown option `{typed}'");
+                            eprintln!("error: unknown option `{body}'");
                             return Ok(Err(usage(false)));
                         }
                         _ => {

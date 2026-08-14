@@ -650,7 +650,7 @@ fn parse_opts(
 
                 // `given`, not `name`: git names the option as it was written.
                 _ => {
-                    eprintln!("error: unknown option `{given}'");
+                    eprintln!("error: unknown option `{long}'");
                     eprint!("{USAGE}");
                     return Err(ExitCode::from(129));
                 }

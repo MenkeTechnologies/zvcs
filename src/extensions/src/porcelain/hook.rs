@@ -131,6 +131,15 @@ pub fn hook(args: &[String]) -> Result<ExitCode> {
             eprint!("error: need a subcommand\n{USAGE_RUN}{USAGE_LIST_ALT}\n");
             Ok(ExitCode::from(129))
         }
+        // A dashed word is not a candidate sub-command: `cmd_hook`'s table is
+        // `OPT_SUBCOMMAND`s only, so `parse_options_step()` hands it to
+        // `parse_long_opt()`, finds nothing, and reports `PARSE_OPT_UNKNOWN` —
+        // the option (named as typed, `=<value>` and all) or the switch, then
+        // the block, both on stderr at 129.
+        Some(other) if other.len() > 1 && other.starts_with('-') => Ok(super::unknown_option(
+            other,
+            &format!("{USAGE_RUN}{USAGE_LIST_ALT}\n"),
+        )),
         Some(other) => {
             eprint!("error: unknown subcommand: `{other}'\n{USAGE_RUN}{USAGE_LIST_ALT}\n");
             Ok(ExitCode::from(129))

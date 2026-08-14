@@ -170,7 +170,7 @@ pub fn url_parse(args: &[String]) -> Result<ExitCode> {
                     }
                 }
             } else {
-                return Ok(unknown_opt("option", name));
+                return Ok(unknown_opt("option", long));
             }
             i += 1;
             continue;

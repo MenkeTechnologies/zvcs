@@ -550,9 +550,13 @@ fn parse_args(argv: &[String], opts: &mut Opts) -> Result<Vec<String>, ParseFail
                         _ => return Err(ParseFail::Rejected(Some(BAD_COLOR.to_string()))),
                     };
                 }
+                // `error(_("unknown option `%s'"), ctx.argv[0] + 2)`
+                // (parse-options.c:1215-1216) names the argument as typed,
+                // `=<value>` and all, so it quotes `long` whole.
                 _ => {
-                    let name = long.split('=').next().unwrap_or(long);
-                    return Err(ParseFail::Rejected(Some(format!("error: unknown option `{name}'"))));
+                    return Err(ParseFail::Rejected(Some(format!(
+                        "error: unknown option `{long}'"
+                    ))));
                 }
             }
         } else {

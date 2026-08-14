@@ -149,6 +149,13 @@ pub fn merge_file(args: &[String]) -> Result<ExitCode> {
                 Some((n, v)) => (n, Some(v)),
                 None => (long, None),
             };
+            // `parse_long_opt()` resolves the name before `get_value()` ever
+            // looks at the attached value, so an unknown name stays an unknown
+            // option even when it carries one — and the message quotes the
+            // argument as typed, `=<value>` and all (parse-options.c:1215-1216).
+            if matches!(super::resolve_long(LONG_OPTS, long), super::Resolved::Unknown) {
+                return Ok(usage_error(&format!("unknown option `{long}'")));
+            }
             // Boolean options reject `--opt=v` the way parse-options does.
             if value.is_some() && !matches!(name, "marker-size" | "diff-algorithm") {
                 return Ok(option_error(&format!("option `{name}' takes no value")));
@@ -198,7 +205,7 @@ pub fn merge_file(args: &[String]) -> Result<ExitCode> {
                         }
                     };
                 }
-                other => return Ok(usage_error(&format!("unknown option `{other}'"))),
+                _ => return Ok(usage_error(&format!("unknown option `{long}'"))),
             }
             continue;
         }

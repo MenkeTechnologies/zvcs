@@ -263,7 +263,7 @@ fn parse_args(args: &[String]) -> Result<Opts, ExitCode> {
             match resolve_long(stem) {
                 Some(name) => apply_long(&mut o, name),
                 None => {
-                    eprintln!("error: unknown option `{stem}'");
+                    eprintln!("error: unknown option `{long}'");
                     eprint!("{USAGE}");
                     return Err(ExitCode::from(129));
                 }

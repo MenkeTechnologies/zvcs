@@ -239,7 +239,7 @@ pub fn checkout_index(args: &[String]) -> Result<ExitCode> {
                         }
                     }
                 }
-                _ => return unknown_option(&format!("unknown option `{name}'")),
+                _ => return unknown_option(&format!("unknown option `{long}'")),
             }
             i += 1;
             continue;

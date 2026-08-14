@@ -228,7 +228,7 @@ pub fn ls_tree(args: &[String]) -> Result<ExitCode> {
                         };
                         opts.format = Some(value);
                     }
-                    _ => return Ok(error_with_usage(&format!("unknown option `{name}'"))),
+                    _ => return Ok(error_with_usage(&format!("unknown option `{long_opt}'"))),
                 }
             } else {
                 // Grouped short flags, e.g. `-rt`.

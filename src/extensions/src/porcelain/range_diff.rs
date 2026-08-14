@@ -649,6 +649,15 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
             i += 1;
             continue;
         }
+        // `if (internal_help && !strcmp(arg + 2, "help-all"))`
+        // (parse-options.c:1124) is a bare `strcmp` ahead of `parse_long_opt()`,
+        // so the name neither abbreviates nor takes a value: matching it after
+        // the `=` split below accepted `--help-all=x` as a help request where
+        // stock git answers ``error: unknown option `help-all=x'``. This table
+        // has no `PARSE_OPT_HIDDEN` entry, so `USAGE_FULL` is the `-h` block.
+        if a == "--help-all" {
+            return Ok(super::show_usage(USAGE));
+        }
 
         // Respell a unique abbreviation as the name it resolves to, so `--creation-fac`
         // reaches the same arm as `--creation-factor` — including the arm that defers
@@ -900,7 +909,7 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
             // belong to rejections.
             // `--help-all` reaches the same renderer with USAGE_FULL, which this
             // table renders identically: it has no `PARSE_OPT_HIDDEN` entry.
-            "-h" | "--help-all" => return Ok(super::show_usage(USAGE)),
+            "-h" => return Ok(super::show_usage(USAGE)),
             // A name `parse_options()` has never heard of loses immediately — it never
             // reaches the revision arguments, so unlike an unimplemented option there is
             // nothing to defer it behind.

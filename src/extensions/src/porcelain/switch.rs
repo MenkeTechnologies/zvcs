@@ -302,9 +302,11 @@ fn parse<'a>(args: &'a [String]) -> Result<Parse<'a>> {
                 | "no-ignore-other-worktrees"
                 | "recurse-submodules"
                 | "no-recurse-submodules" => {}
+                // The message names the argument as typed, `=<value>` and all
+                // (parse-options.c:1215-1216), so it quotes `long` whole.
                 _ => {
                     return Ok(Parse::Failed(unknown_option(format!(
-                        "unknown option `{name}'"
+                        "unknown option `{long}'"
                     ))))
                 }
             }

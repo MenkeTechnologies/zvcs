@@ -547,9 +547,12 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
                         super::Resolved::Unknown
                     ) =>
             {
-                eprintln!("error: unknown option `{}'", &other[2..]);
-                eprint!("{USAGE}");
-                return Ok(ExitCode::from(129));
+                // `error(_("unknown option `%s'"), ctx.argv[0] + 2)`
+                // (parse-options.c:1215-1216) names the argument as *typed*,
+                // value and all: `--quux=x` is reported as `quux=x`, not `quux`.
+                // `other` here is already split at the `=`, so the message has to
+                // go back to the token.
+                return Ok(super::unknown_option(typed, USAGE));
             }
             other if other.starts_with('-') && other.len() > 1 => {
                 bail!("unsupported option {other:?}");

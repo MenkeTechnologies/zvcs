@@ -161,7 +161,7 @@ fn parse_options(args: &[String]) -> Parsed {
             let lookup = negated.unwrap_or(name);
 
             let Some(resolved) = resolve_option(lookup) else {
-                eprint!("error: unknown option `{name}'\n{USAGE}");
+                eprint!("error: unknown option `{long}'\n{USAGE}");
                 return Parsed::Exit(ExitCode::from(129));
             };
 

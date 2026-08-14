@@ -696,7 +696,7 @@ fn parse_args(args: &[String]) -> Result<Parsed> {
             None => (long, None),
         };
 
-        let m = match resolve_long(name) {
+        let m = match resolve_long(name, long) {
             Ok(m) => m,
             Err(code) => return Ok(Parsed::Exit(code)),
         };
@@ -790,7 +790,7 @@ fn parse_args(args: &[String]) -> Result<Parsed> {
 /// Candidates are the canonical names and, for negatable options, their negated
 /// spellings — `no-<name>`, or the `no-` stripped form when the name already
 /// carries it (`no-divider` negates to `divider`).
-fn resolve_long(name: &str) -> Result<Match, ExitCode> {
+fn resolve_long(name: &str, typed: &str) -> Result<Match, ExitCode> {
     let mut spellings: Vec<(String, Match)> = Vec::new();
     for (index, &(opt, _, negatable)) in LONG_OPTS.iter().enumerate() {
         spellings.push((
@@ -822,7 +822,7 @@ fn resolve_long(name: &str) -> Result<Match, ExitCode> {
         .filter(|(s, _)| s.starts_with(name))
         .collect();
     match hits.as_slice() {
-        [] => Err(usage_error(&format!("unknown option `{name}'"))),
+        [] => Err(usage_error(&format!("unknown option `{typed}'"))),
         [(_, m)] => Ok(Match {
             index: m.index,
             unset: m.unset,

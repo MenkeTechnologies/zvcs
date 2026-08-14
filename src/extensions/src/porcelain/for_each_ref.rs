@@ -630,7 +630,8 @@ pub fn for_each_ref(args: &[String]) -> Result<ExitCode> {
     }
 
     while i < args.len() {
-        let a = args[i].as_str();
+        let typed = args[i].as_str();
+        let a = typed;
         if only_patterns {
             patterns.push(a.to_string());
             i += 1;
@@ -640,6 +641,14 @@ pub fn for_each_ref(args: &[String]) -> Result<ExitCode> {
             only_patterns = true;
             i += 1;
             continue;
+        }
+        // `if (internal_help && !strcmp(arg + 2, "help-all"))`
+        // (parse-options.c:1124) is a bare `strcmp` sitting ahead of
+        // `parse_long_opt()`, so the name neither abbreviates nor takes a value:
+        // `--help-a` and `--help-all=x` are both unknown options. Matching it
+        // after the `=` split accepted `--help-all=x` as a help request.
+        if a == "--help-all" {
+            return Ok(super::show_usage(USAGE));
         }
         let resolved = match super::canonical_long(a, LONG_OPTS) {
             super::Long::Name(name) => name,
@@ -655,9 +664,7 @@ pub fn for_each_ref(args: &[String]) -> Result<ExitCode> {
         match name {
             // parse_options_step()'s `internal_help`: the block on stdout at
             // 129, with no `error:` line ahead of it.
-            // `--help-all` reaches the same renderer with USAGE_FULL, which this
-            // table renders identically: it has no `PARSE_OPT_HIDDEN` entry.
-            "-h" | "--help-all" => return Ok(super::show_usage(USAGE)),
+            "-h" => return Ok(super::show_usage(USAGE)),
             "--format" => format = value!(rest, "format").into_bytes(),
             "--count" => {
                 let v = value!(rest, "count");
@@ -737,8 +744,10 @@ pub fn for_each_ref(args: &[String]) -> Result<ExitCode> {
             "--no-stdin" => from_stdin = false,
             // `PARSE_OPT_UNKNOWN` (parse-options.c:889-898) names an *option*
             // for a `--` spelling and a *switch* for a short one.
+            // The message names the argument as typed, `=<value>` and all, so it
+            // has to come from `typed` rather than from the split `name`.
             s if s.starts_with("--") => {
-                return Ok(usage_error(&format!("unknown option `{}'", &s[2..])))
+                return Ok(usage_error(&format!("unknown option `{}'", &typed[2..])))
             }
             s if s.starts_with('-') && s.len() > 1 => {
                 let c = s[1..].chars().next().unwrap_or_default();

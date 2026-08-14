@@ -478,7 +478,7 @@ pub(super) fn parse_args(argv: &[String]) -> Result<std::result::Result<Opts, Ex
                     reject!(fatal("--exclude-per-directory is meaningless unless -u"));
                 }
             }
-            _ => reject!(usage_err(format!("unknown option `{name}'"))),
+            _ => reject!(usage_err(format!("unknown option `{body}'"))),
         }
     }
 

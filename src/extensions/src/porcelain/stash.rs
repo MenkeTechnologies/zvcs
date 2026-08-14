@@ -2443,8 +2443,13 @@ fn parse_drop_options(args: &[String]) -> std::result::Result<(bool, Vec<String>
             // The whole table is `OPT__QUIET`, so the only question is which
             // sense the name resolves to — including the `--n`/`--no` spelling
             // parse_long_opt reaches through "negated and abbreviated very much".
+            // The negation has to be matched on the resolved *name*, not on a
+            // bare `--no-` prefix: the table holds `quiet` alone, so a name it
+            // does not hold comes back from the resolver untouched, and testing
+            // only the prefix read every unknown `--no-<x>` as `--no-quiet` and
+            // dropped the stash git refuses to drop.
             let set = match canonical(a, DROP_OPTS, DROP_USAGE)? {
-                name if name.starts_with("--no-") => false,
+                name if name.starts_with("--no-quiet") => false,
                 name if name.starts_with("--quiet") => true,
                 _ => return Err(usage_error(a, DROP_USAGE)),
             };
@@ -3045,6 +3050,11 @@ fn parse_apply_options(
     let mut quiet = false;
     let mut specs: Vec<String> = Vec::new();
     let mut labels = ConflictLabels::default();
+    /// Does the caller's table hold this long name at all? `POP_OPTS` and
+    /// `DROP_OPTS` are prefixes of `APPLY_OPTS`, so the arms below have to ask
+    /// rather than assume: an entry missing from the table never resolves, and
+    /// `parse_long_opt()` answers `PARSE_OPT_UNKNOWN` for it.
+    let held = |name: &str| table.iter().any(|o| o.name == name);
     let mut i = 0;
     while i < args.len() {
         let orig = args[i].as_str();
@@ -3055,11 +3065,33 @@ fn parse_apply_options(
         };
         let a: &str = resolved.as_ref();
 
+        // A `PARSE_OPT_NOARG` entry rejects an attached value outright:
+        // `get_value()` answers ``error: option `%s' takes no value``
+        // (parse-options.c:88-90) and exits 129 with no block. The name quoted
+        // is the entry's, not the abbreviation's — `--q=x` names `quiet` — and
+        // the `no-` sense keeps its own spelling, which is why this reads the
+        // resolved token rather than the one typed.
+        if let Some((stem, _)) = a.split_once('=') {
+            let bare = stem.trim_start_matches('-');
+            let named = bare.strip_prefix("no-").unwrap_or(bare);
+            if table.iter().any(|o| o.name == named && o.arg == super::Arg::None) {
+                eprintln!("error: option `{bare}' takes no value");
+                return Ok(Err(ExitCode::from(129)));
+            }
+        }
+
         // The three conflict-label options are `OPT_STRING`s, so each takes its
         // value attached *or* as the next argument. They belong to `apply`
-        // alone, which is why the table decides whether they resolve at all.
+        // alone, which is why `held` gates the whole block on the caller's
+        // table: `pop` is handed `apply`'s first two entries and `drop` its
+        // first. The gate has to sit *ahead* of the value split, because the
+        // `=<value>` spelling is exactly the one that would otherwise reach the
+        // label arms without ever being looked up — a restriction that only
+        // holds for the valueless form is not a restriction, and the attached
+        // form would have silently applied the stash git refuses to apply.
         let label = ["label-ours", "label-theirs", "label-base"]
             .into_iter()
+            .filter(|name| held(*name))
             .find_map(|name| match a.strip_prefix(&format!("--{name}")) {
                 Some("") => Some((name, None)),
                 Some(rest) => rest.strip_prefix('=').map(|v| (name, Some(v.to_string()))),
@@ -3090,8 +3122,11 @@ fn parse_apply_options(
             "-q" | "--quiet" => quiet = true,
             "--no-quiet" => quiet = false,
             // An `OPT_STRING` negation NULLs the pointer, and `do_apply_stash()`
-            // substitutes its own default for a NULL label.
-            "--no-label-ours" | "--no-label-theirs" | "--no-label-base" => {
+            // substitutes its own default for a NULL label. The negation exists
+            // only where the entry does, so this arm asks the table too.
+            "--no-label-ours" | "--no-label-theirs" | "--no-label-base"
+                if held(&a["--no-".len()..]) =>
+            {
                 let d = ConflictLabels::default();
                 match a {
                     "--no-label-ours" => labels.ours = d.ours,
@@ -3121,6 +3156,46 @@ mod tests {
 
     fn v(args: &[&str]) -> Vec<String> {
         args.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// A table restriction that only holds for the valueless spelling is not a
+    /// restriction. `pop_stash()` gets `apply`'s first two entries and
+    /// `drop_stash()` its first, so the three `--label-*` options resolve for
+    /// `apply` alone — and the resolver has to say so for `--label-ours=x` just
+    /// as it does for `--label-ours`, because the attached form is the one that
+    /// reached the label arms unchecked and *popped the stash* git refuses to
+    /// pop. Both spellings, both shorter tables, plus the entries each table
+    /// does hold, so a table shrunk too far fails here too.
+    #[test]
+    fn conflict_labels_resolve_for_apply_alone_in_both_spellings() {
+        // `held` is the gate the parser consults; it reads the table, so the
+        // membership half of the invariant is asserted against the table.
+        let held = |name: &str, table: &'static [LongOpt]| table.iter().any(|o| o.name == name);
+        // An abbreviation is the half the resolver decides: a name no entry
+        // claims comes back untouched, whatever it carries after the `=`.
+        let resolves = |tok: &str, table: &'static [LongOpt]| {
+            !matches!(super::super::canonical_long(tok, table),
+                      super::super::Long::Name(n) if n == tok)
+        };
+        for name in ["label-ours", "label-theirs", "label-base"] {
+            assert!(held(name, APPLY_OPTS), "{name} is one of apply's five");
+            for (sub, table) in [("pop", POP_OPTS), ("drop", DROP_OPTS)] {
+                assert!(!held(name, table), "{name} must not be in {sub}'s table");
+            }
+        }
+        for tok in ["--label-o", "--label-o=x", "--no-label-o", "--lab=x"] {
+            assert!(resolves(tok, APPLY_OPTS), "{tok} abbreviates for apply");
+            for (sub, table) in [("pop", POP_OPTS), ("drop", DROP_OPTS)] {
+                assert!(!resolves(tok, table), "{tok} must stay unknown for {sub}");
+            }
+        }
+        // What the shorter tables *do* hold, so this fails just as loudly if one
+        // is truncated past the entries git actually gives that subcommand.
+        for table in [APPLY_OPTS, POP_OPTS, DROP_OPTS] {
+            assert!(held("quiet", table), "every one of the three has OPT__QUIET");
+        }
+        assert!(held("index", POP_OPTS), "index is pop's second entry");
+        assert!(!held("index", DROP_OPTS), "drop is OPT__QUIET alone");
     }
 
     #[test]

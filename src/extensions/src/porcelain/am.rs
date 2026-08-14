@@ -813,7 +813,15 @@ fn parse_long(
             };
             cmdmode_checked(o, tok, Resume::ShowPatch(sub))?;
         }
-        _ => return Err(Usage::Unknown(format!("error: unknown option `{name}'"))),
+        // `error(_("unknown option `%s'"), ctx.argv[0] + 2)` (parse-options.c:
+        // 1215-1216) names the argument as typed, `=<value>` and all, so it
+        // comes from `tok` rather than from the `name` split off it.
+        _ => {
+            return Err(Usage::Unknown(format!(
+                "error: unknown option `{}'",
+                tok.strip_prefix("--").unwrap_or(tok)
+            )))
+        }
     }
     Ok(())
 }

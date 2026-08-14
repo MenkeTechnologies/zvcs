@@ -582,9 +582,11 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
                     super::Resolved::Unknown
                 ) =>
             {
-                eprintln!("error: unknown option `{}'", &s[2..]);
-                eprint!("{USAGE}");
-                return Ok(ExitCode::from(129));
+                // `error(_("unknown option `%s'"), ctx.argv[0] + 2)`
+                // (parse-options.c:1215-1216) echoes the argument as typed,
+                // `=<value>` included; `s` here has already been split at the
+                // `=`, so the message goes back to the token.
+                return Ok(super::unknown_option(typed, USAGE));
             }
             s if s.starts_with('-') && s.len() > 1 => anyhow::bail!("unsupported option {s:?}"),
             // A non-option argument is handed back unchanged by the resolver, so the

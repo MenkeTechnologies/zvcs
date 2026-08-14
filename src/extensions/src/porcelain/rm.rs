@@ -143,7 +143,11 @@ fn fatal(msg: impl std::fmt::Display) -> ExitCode {
 
 /// Resolve a long-option name (already stripped of `--` and any `no-`/`=value`) to
 /// its canonical option, honoring exact-match precedence then unambiguous prefix.
-fn resolve_long(name: &str) -> std::result::Result<Long, ExitCode> {
+/// `typed` is the whole argument after `--`, `=<value>` and any `no-` included:
+/// `error(_("unknown option `%s'"), ctx.argv[0] + 2)` (parse-options.c:
+/// 1215-1216) quotes it exactly as written, so `--quux=x` is reported as
+/// `quux=x` and not as the `quux` the lookup was done with.
+fn resolve_long(name: &str, typed: &str) -> std::result::Result<Long, ExitCode> {
     if let Some((_, opt)) = LONGS.iter().find(|(n, _)| *n == name) {
         return Ok(*opt);
     }
@@ -154,7 +158,7 @@ fn resolve_long(name: &str) -> std::result::Result<Long, ExitCode> {
         .collect();
     match hits.len() {
         1 => Ok(hits[0]),
-        0 => Err(usage_err(format!("unknown option `{name}'"))),
+        0 => Err(usage_err(format!("unknown option `{typed}'"))),
         _ => Err(usage_err(format!("ambiguous option: {name}"))),
     }
 }
@@ -196,7 +200,7 @@ pub fn rm(args: &[String]) -> Result<ExitCode> {
                 Some(rest) => (true, rest),
                 None => (false, name),
             };
-            let opt = match resolve_long(bare) {
+            let opt = match resolve_long(bare, body) {
                 Ok(o) => o,
                 Err(code) => return Ok(code),
             };

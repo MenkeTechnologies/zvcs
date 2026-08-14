@@ -769,7 +769,7 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
                 // unknown option; a name nothing in the table claims is
                 // parse-options' `unknown option` instead.
                 _ => match super::resolve_long(LONG_OPTS, name) {
-                    super::Resolved::Unknown => return Ok(unknown_long(name)),
+                    super::Resolved::Unknown => return Ok(unknown_long(&a[2..])),
                     _ => anyhow::bail!("{}", unsupported(a)),
                 },
             }

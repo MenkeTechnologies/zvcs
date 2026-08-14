@@ -96,7 +96,7 @@ pub fn version(args: &[String]) -> Result<ExitCode> {
                 None => (long, None),
             };
             let Some((negated, canonical)) = match_long(name) else {
-                return Ok(usage_error(&format!("unknown option `{name}'")));
+                return Ok(usage_error(&format!("unknown option `{long}'")));
             };
             if value.is_some() {
                 return Ok(usage_error(&format!(

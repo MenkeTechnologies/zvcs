@@ -266,7 +266,7 @@ pub fn merge_tree(args: &[String]) -> Result<ExitCode> {
                     None => return Ok(requires_value("option `strategy-option'")),
                 },
                 _ => {
-                    eprintln!("error: unknown option `{name}'");
+                    eprintln!("error: unknown option `{long}'");
                     eprint!("{USAGE}");
                     return Ok(ExitCode::from(129));
                 }

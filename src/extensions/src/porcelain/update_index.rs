@@ -493,6 +493,16 @@ fn run(ctx: &mut Ctx, args: &[String]) -> Result<Outcome> {
                 None => (long, None),
             };
 
+            // `parse_long_opt()` resolves the name before `get_value()` ever sees
+            // the attached value, so an unknown name is an unknown option even
+            // when it carries one — `--quux=x` is `unknown option 'quux=x'`, not
+            // ``option `quux' takes no value``. The name is quoted as typed,
+            // `=<value>` included (builtin/update-index.c:1171-1176).
+            if matches!(super::resolve_long(LONG_OPTS, long), super::Resolved::Unknown) {
+                eprintln!("error: unknown option '{long}'");
+                eprint!("{USAGE}");
+                return Ok(Outcome::Usage);
+            }
             // Every option but these two is `PARSE_OPT_NOARG`, and git rejects an
             // attached value on those outright rather than ignoring it.
             if attached.is_some() && !matches!(name, "chmod" | "index-version") {

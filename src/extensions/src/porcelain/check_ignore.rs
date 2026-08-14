@@ -170,7 +170,7 @@ pub fn check_ignore(args: &[String]) -> Result<ExitCode> {
                     // `--help` is not handled here: stock git intercepts it above
                     // the builtin and renders the man page, which this layer
                     // cannot reproduce, so it is left to fall through.
-                    _ => return Ok(usage_error(&format!("unknown option `{name}'"))),
+                    _ => return Ok(usage_error(&format!("unknown option `{long}'"))),
                 };
                 if has_value {
                     return Ok(usage_error(&format!(

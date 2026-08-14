@@ -170,6 +170,13 @@ pub fn history(args: &[String]) -> Result<ExitCode> {
         "fixup" => Sub::Fixup,
         "reword" => Sub::Reword,
         "split" => Sub::Split,
+        // A dashed word never reaches the sub-command lookup: the top-level
+        // table is `OPT_SUBCOMMAND`s only, so `parse_options_step()` sends it to
+        // `parse_long_opt()`, finds nothing and reports `PARSE_OPT_UNKNOWN` —
+        // the option named as typed, `=<value>` and all, then the block.
+        other if other.len() > 1 && other.starts_with('-') => {
+            return Ok(super::unknown_option(other, &format!("{USAGE}\n")));
+        }
         other => {
             eprint!("error: unknown subcommand: `{other}'\n{USAGE}\n");
             return Ok(ExitCode::from(EXIT_USAGE));

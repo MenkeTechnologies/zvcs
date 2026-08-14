@@ -477,7 +477,7 @@ fn parse_args<'a>(
                 }
             }
             other => {
-                eprintln!("error: unknown option `{other}'");
+                eprintln!("error: unknown option `{}'", &arg[2..]);
                 eprint!("{USAGE}");
                 return Err(ExitCode::from(129));
             }

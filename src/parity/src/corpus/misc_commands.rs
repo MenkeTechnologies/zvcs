@@ -751,6 +751,45 @@ fn usage_only(out: &mut Vec<Case>) {
     // repository git reads no `.gitattributes` and no `info/exclude`, so these
     // pin that the walk's inputs are rebuilt rather than borrowed from a
     // repository that is not there.
+    // Unique-prefix option abbreviation, which git accepts and 68 verbs refused.
+    //
+    // One case per *mechanism* rather than per verb: all of them now route through
+    // one port of `parse_long_opt()`, so 68 rows would test one resolver 68 times.
+    // What can independently break is each rule inside it.
+    //
+    // A plain unique prefix resolves.
+    out.push(Case::strict("ls-files", &["ls-files", "--stag"], Shape::Dirty));
+    out.push(Case::strict("status", &["status", "--porcel"], Shape::Dirty));
+    out.push(Case::strict("cat-file", &["cat-file", "--batch-al"], Shape::Linear));
+    // An ambiguous prefix is its own error, and git splits the streams oddly:
+    // the `error:` goes to stderr and the usage block to *stdout*.
+    out.push(Case::strict("show-ref", &["show-ref", "--hea"], Shape::Branched));
+    out.push(Case::strict("branch", &["branch", "--col"], Shape::Linear));
+    // The degenerate case: `--no-` names one option twice, which only a faithful
+    // `register_abbrev` (called twice per entry here) reproduces.
+    out.push(Case::strict("branch", &["branch", "--no-"], Shape::Linear));
+    // `PARSE_OPT_NONEG` means the negation is *unknown*, not merely rejected.
+    out.push(Case::strict("grep", &["grep", "--no-before-context", "pub"], Shape::Linear));
+    out.push(Case::strict("merge-base", &["merge-base", "--no-octopus", "HEAD", "HEAD"], Shape::Branched));
+    // An entry literally named `no-<stem>` owns *both* spellings — `--index` is
+    // that entry unset, not a missing option.
+    out.push(Case::strict("check-ignore", &["check-ignore", "--index", "src/lib.rs"], Shape::Attributes));
+    out.push(Case::strict("update-index", &["update-index", "--no-assume-unchanged", "README.md"], Shape::Linear));
+    // Short unknowns say "switch", long ones say "option" — four verbs had it
+    // backwards, and nothing else distinguishes the two words.
+    for cmd in ["describe", "for-each-ref", "merge-base", "format-rev"] {
+        out.push(Case::strict(cmd, &[cmd, "-Z"], Shape::Branched));
+    }
+    // `get_value()` names the option *being parsed* first, not the one that came
+    // first on the command line.
+    out.push(Case::strict(
+        "merge-base",
+        &["merge-base", "--octopus", "--independent", "HEAD", "HEAD"],
+        Shape::Branched,
+    ));
+    // A usage error must print the whole block, not just its first line.
+    out.push(Case::strict("mv", &["mv"], Shape::Linear));
+
     const CEIL_SRC: &[(&str, &str)] = &[("GIT_CEILING_DIRECTORIES", "{repo}/src")];
     for args in [
         &["grep", "--no-index", "pub"][..],

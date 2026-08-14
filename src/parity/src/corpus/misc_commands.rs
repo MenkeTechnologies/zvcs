@@ -844,6 +844,65 @@ fn usage_only(out: &mut Vec<Case>) {
     out.push(Case::strict("bisect", &["bisect", "--quux=x"], Shape::Branched));
     out.push(Case::strict("hook", &["hook", "--quux=x"], Shape::Linear));
 
+    // Subcommand-level help, which 99 divergences hid behind.
+    //
+    // The corpus had 12 `remote`, 1 `hook`, 33 `notes`, 43 `reflog` and 35
+    // `worktree` cases and not one asked a *subcommand* for help, so all five
+    // verbs sat at 100% while their subcommands answered `error: unknown switch
+    // 'h'`, printed the parent's usage, or died `fatal: unrecognized argument`.
+    //
+    // One case per subcommand is one case per mechanism here: each carries its
+    // own captured usage constant, so each can drift on its own. The `-h` form
+    // is the one pinned because it is where the stream matters — help goes to
+    // stdout at 129 with no `error:` line.
+    for (verb, subs) in [
+        ("remote", &["add", "rename", "remove", "set-head", "set-branches", "get-url", "set-url", "show", "prune", "update"][..]),
+        ("worktree", &["prune", "add", "remove", "move", "lock", "unlock", "list", "repair"]),
+        ("hook", &["run", "list"]),
+        ("notes", &["add", "copy", "append", "edit", "show", "merge", "remove", "prune", "list", "get-ref"]),
+        ("reflog", &["show", "list", "expire", "delete", "exists", "drop", "write"]),
+    ] {
+        for sub in subs {
+            out.push(Case::strict(verb, &[verb, sub, "-h"], Shape::Linear));
+            // `reflog drop` and `write` answer help but their bodies are not
+            // ported, so an unknown option is refused as a gap before the option
+            // scan can report it. Pinning that would pin the gap, not the parser.
+            if !(verb == "reflog" && (*sub == "drop" || *sub == "write")) {
+                out.push(Case::strict(verb, &[verb, sub, "--zzbogus=x"], Shape::Linear));
+            }
+        }
+    }
+    // `-h` is not matched as a name: it reaches the help renderer as an
+    // *unrecognised short option*, so it fires wherever the first character the
+    // table does not define is `h`. These four are the pairs that prove it —
+    // `expire` has no `-n`, `list` does, and `remote add -t` takes a value, so
+    // `-th` is `--track=h` rather than help.
+    out.push(Case::strict("reflog", &["reflog", "expire", "-nh"], Shape::Linear));
+    out.push(Case::strict("reflog", &["reflog", "list", "-nh"], Shape::Linear));
+    out.push(Case::strict("reflog", &["reflog", "show", "-habc"], Shape::Linear));
+    out.push(Case::strict("remote", &["remote", "add", "-th"], Shape::Linear));
+    // Near-misses that must stay unknown rather than becoming help.
+    out.push(Case::strict("notes", &["notes", "list", "--help-al"], Shape::Linear));
+    out.push(Case::strict("notes", &["notes", "list", "--help-all=x"], Shape::Linear));
+
+    // `reflog`'s own argument contracts, none of which any case reached.
+    out.push(Case::strict("reflog", &["reflog", "list", "x"], Shape::Branched));
+    out.push(Case::strict("reflog", &["reflog", "delete"], Shape::Branched));
+    out.push(Case::strict("reflog", &["reflog", "exists", "x", "y"], Shape::Branched));
+    out.push(Case::strict("reflog", &["reflog", "delete", "-q", "x"], Shape::Branched));
+
+    // Forwarding: a subcommand that hands an unclaimed token to `log` or `diff`
+    // must still report *its own* usage and exit code. `cmd_stash` squashes every
+    // subcommand's return through `!!fn(...)`, so only paths that exit() keep
+    // their status — which is why `list` leaked `git log`'s 128 and `show`
+    // printed `git diff`'s block.
+    out.push(Case::strict("stash", &["stash", "list", "--zzbogus"], Shape::Stashed));
+    out.push(Case::strict("stash", &["stash", "list", "--max-count=notanumber"], Shape::Stashed));
+    out.push(Case::strict("stash", &["stash", "show", "--zzbogus"], Shape::Stashed));
+    out.push(Case::strict("stash", &["stash", "show", "--cached"], Shape::Stashed));
+    out.push(Case::strict("stash", &["stash", "show", "--no-only-untracked"], Shape::Stashed));
+    out.push(Case::strict("stash", &["stash", "push", "--pathspec-from-file=x"], Shape::Dirty));
+
     // `--help-all`, one verb per mechanism.
     //
     // It is matched by a bare `strcmp` in `parse_options_step()`, sitting after

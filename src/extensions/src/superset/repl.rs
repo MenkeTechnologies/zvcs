@@ -118,6 +118,7 @@ fn superset_spec(verb: &str) -> Option<(&'static [&'static str], &'static [&'sta
         // (sourced from zconfig.rs); only options belong in the static spec.
         "zconfig" => (&["-h", "--help"], &[]),
         "zstatus" => (&["--all"], &[]),
+        "zbanner" => (&["--color", "--no-color", "--mono"], &[]),
         "zreindex" => (&["--sync", "--async"], &[]),
         "zunclaim" => (&["--force"], &[]),
         "zjobs" => (&["-n"], &[]),

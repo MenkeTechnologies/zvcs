@@ -162,7 +162,7 @@ Two namespaces share one dispatch table (`src/extensions/src/dispatch.rs`):
 | Hooks | `zhook set/unset/show/list/test` | manage & test the current repo's ref-change hook (`zvcs.hook`); `zvcs.autohook` fires each repo's own local hook |
 | Triggers | `ztrigger DIR <cmd> [--throttle <dur>]` `ztrigger list/rm/test/tail/top` | watch **any directory** (git repo or not) and run a command on **any file change** under it — command runs with the dir as cwd and `$ZVCS_DIR` set; a leading-edge throttle (default 500ms) collapses the event burst of one file action into a single fire; `tail` streams fires live, `top` is an in-place fire-rate HUD |
 | Watch | `zwatch DIR` `zwatch list/rm` | watch any directory and log each change to the daemon log (a trigger with a built-in logging command) |
-| Console | `zrepl` | interactive line console over **every** command — each line runs as `git <line>`, so the `z*` verbs and all git porcelain work alike (startup stats banner + Tab completion of every verb) |
+| Console | `zrepl` `zbanner [--color\|--no-color]` | interactive line console over **every** command — each line runs as `git <line>`, so the `z*` verbs and all git porcelain work alike (startup stats banner + Tab completion of every verb); `zbanner` reprints that banner on demand, with every stat re-read at call time |
 | Shell | `zcd` `zpwd` `zls` `zenv` `zunset` `zecho` `zmkdir` `ztouch` `zrm` `zcp` `zmv` `zcat` `zln` | shell builtins so `zrepl` drives like a shell — `zcd`/`zenv`/`zunset` mutate the console's cwd/environment and persist across lines; `zls` is a git-aware listing (per-file status like `eza --git`); `zmkdir`/`ztouch`/`zrm`/`zcp`/`zmv`/`zcat`/`zln` are native filesystem commands (`zrm`/`zmv` are on-disk, distinct from `git rm`/`git mv`) |
 | Discovery | `zverbs` | list every extension verb and its one-line usage (sourced from each verb's own `-h`) |
 | Setup | `zshadow [<dir>] [-n\|--print] [--all]` | install the whole `~/.zvcs` shadow — `git` shim + `git-<verb>` dashed links in `~/.zvcs/bin`, man pages in `~/.zvcs/man`, the HTML doc set in `~/.zvcs/share/doc/git-doc`, the forked zsh `_git` in `~/.zvcs/completions` — then print the `PATH`, `MANPATH`, and `fpath` lines on stdout (shell code only, so `eval "$(git zshadow)"` works; a line the environment already satisfies is printed commented out) |
@@ -318,7 +318,10 @@ the `z*` superset verbs and every git-compat porcelain command alike (the latter
 operating on the current repo) — doubling as a live daemon/ledger console. On a
 tty it opens with a stats banner and edits with Tab-completion of every verb plus
 persistent history; piped stdin falls back to a raw reader so scripts stay
-usable.
+usable. `git zbanner [--color|--no-color]` prints that banner again on demand —
+the logo plus os/arch/pid, cores, indexed repos, and the superset/git-compat/total
+verb counts, all read at call time, so a long-lived console can refresh the
+numbers instead of showing what was true when it opened.
 
 **Shell builtins.** Because the console is one long-lived process, a handful of
 shell verbs make it navigable like a shell: `git zcd [<dir>|-]` changes the

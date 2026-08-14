@@ -6803,6 +6803,7 @@ _git_commands () {
     zshadow:'zvcs: install the ~/.zvcs shadow and print the PATH/MANPATH/fpath lines'
     zdashed:'zvcs: install git-<verb> symlinks for every verb (dashed forms)'
     zrepl:'zvcs: interactive console over every command (z-verbs + git porcelain)'
+    zbanner:'zvcs: reprint the zrepl startup banner (logo + live stats)'
     zverbs:'zvcs: list every extension verb and its usage'
     zselectors:'zvcs: the shared [selectors] grammar the parallel verbs accept'
     zcd:'zvcs: change the working directory (zrepl console)'

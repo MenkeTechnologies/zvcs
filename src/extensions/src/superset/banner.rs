@@ -1,4 +1,5 @@
-//! zvcs ASCII logo + live-stats box banner, shown on `git zrepl` startup.
+//! zvcs ASCII logo + live-stats box banner, shown on `git zrepl` startup and
+//! reprinted on demand by `git zbanner`.
 //!
 //! Ported from strykelang's `banner.rs`: the same width-correct renderer (a
 //! `visible_width` that ignores ANSI SGR escapes, and a `row` helper that pads
@@ -6,6 +7,10 @@
 //! zvcs's own logo, stats, and tagline. Every count is pulled at call time —
 //! the dispatch tables for verb counts, the ledger for the indexed-repo count —
 //! so the banner never goes stale after a `cargo build` adds verbs.
+
+use anyhow::Result;
+use std::io::IsTerminal;
+use std::process::ExitCode;
 
 /// Count of visible columns in `s`, ignoring ANSI SGR escape sequences.
 /// Multi-byte UTF-8 counts as one column per char — sufficient for the
@@ -129,6 +134,34 @@ pub fn print_banner(colored: bool) {
     print!("{}", render_banner(colored));
 }
 
+/// `git zbanner [--color|--no-color]` — print the banner `git zrepl` shows at
+/// startup, on demand. Every count is read at call time, so re-running it inside
+/// a long-lived console reflects the tree as it is now (repos indexed since the
+/// console opened, a newer build's verb counts), not as it was at startup.
+///
+/// Color follows the same rule as the rest of the tree — on for a terminal
+/// unless `NO_COLOR` is set — with `--color`/`--no-color` forcing either way so
+/// the ANSI form can be captured to a file and the plain form kept on a tty.
+pub fn zbanner(args: &[String]) -> Result<ExitCode> {
+    let default = std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
+    print_banner(color_choice(args, default)?);
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Resolve `--color`/`--no-color` against `default` (the tty + `NO_COLOR` rule).
+/// The last flag wins, as with git's own `--color`/`--no-color` pairs.
+fn color_choice(args: &[String], default: bool) -> Result<bool> {
+    let mut colored = default;
+    for arg in args {
+        match arg.as_str() {
+            "--color" => colored = true,
+            "--no-color" | "--mono" => colored = false,
+            other => anyhow::bail!("unknown option `{other}`"),
+        }
+    }
+    Ok(colored)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -158,6 +191,22 @@ mod tests {
         let s = render_banner(true);
         assert!(s.contains("\x1b["));
         assert!(s.contains("\x1b[0m"));
+    }
+
+    #[test]
+    fn color_choice_last_flag_wins_over_the_tty_default() {
+        let f = |v: &[&str]| {
+            let args: Vec<String> = v.iter().map(|s| (*s).to_string()).collect();
+            color_choice(&args, false)
+        };
+        assert!(f(&["--color"]).expect("--color parses"));
+        assert!(!f(&["--color", "--no-color"]).expect("--no-color parses"));
+        assert!(f(&["--mono", "--color"]).expect("--mono parses"));
+        // With no flags the caller's tty/NO_COLOR decision stands, either way.
+        assert!(!f(&[]).expect("no flags"));
+        assert!(color_choice(&[], true).expect("no flags"));
+        let bad = vec!["--rainbow".to_string()];
+        assert!(color_choice(&bad, true).is_err(), "unknown option must fail");
     }
 
     #[test]

@@ -76,6 +76,7 @@ pub mod ztop;
 mod zsync;
 
 pub use attach::{ensure_attached, Attached};
+pub use banner::zbanner;
 pub use claim::{zclaim, zidle, zsessions, zunclaim, zwho};
 pub use dashed::zdashed;
 pub use zshadow::zshadow;

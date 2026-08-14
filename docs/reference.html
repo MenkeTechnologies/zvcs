@@ -57,7 +57,7 @@
             <span class="sep">/</span>
             <a href="https://github.com/MenkeTechnologies/zvcs" target="_blank" rel="noopener noreferrer">GitHub</a>
           </nav>
-          <p class="docs-build-line">zvcs v0.14.11 · 117 superset verbs · generated from <code>src/extensions/src/superset/manpage.rs</code>, the same table <code>git help &lt;verb&gt;</code> renders</p>
+          <p class="docs-build-line">zvcs v0.14.11 · 118 superset verbs · generated from <code>src/extensions/src/superset/manpage.rs</code>, the same table <code>git help &lt;verb&gt;</code> renders</p>
         </div>
         <div class="tutorial-toolbar">
           <button type="button" class="btn btn-secondary" id="btnTheme" title="Toggle light/dark">Theme</button>
@@ -79,7 +79,7 @@
 
     <main class="tutorial-main">
       <h2 class="tutorial-title"><span class="step-hash">&gt;_</span>SUPERSET VERBS</h2>
-      <p class="tutorial-subtitle">The 117 <code>z*</code> verbs — the coordination layer stock git has no equivalent for. Every entry is the verb's man page: <code>git help &lt;verb&gt;</code> shows the same text in a terminal.</p>
+      <p class="tutorial-subtitle">The 118 <code>z*</code> verbs — the coordination layer stock git has no equivalent for. Every entry is the verb's man page: <code>git help &lt;verb&gt;</code> shows the same text in a terminal.</p>
 
       <section class="tutorial-section" id="verb-index">
         <h2>Index</h2>
@@ -96,6 +96,7 @@
         <li><a href="#zpush">zpush</a> <span class="verb-summary">queue an async push job with a fast-forward pre-flight</span></li>
         <li><a href="#zsubmit">zsubmit</a> <span class="verb-summary">run an arbitrary command as an async daemon job</span></li>
         <li><a href="#zrepl">zrepl</a> <span class="verb-summary">interactive console over every zvcs command</span></li>
+        <li><a href="#zbanner">zbanner</a> <span class="verb-summary">reprint the zrepl startup banner</span></li>
         <li><a href="#zclaim">zclaim</a> <span class="verb-summary">lease a repository for this session</span></li>
         <li><a href="#zunclaim">zunclaim</a> <span class="verb-summary">release a repository lease</span></li>
         <li><a href="#zwho">zwho</a> <span class="verb-summary">list active claims</span></li>
@@ -288,6 +289,14 @@
         <pre class="doc-synopsis"><code>git zrepl</code></pre>
         <p>Opens an interactive line console. Each line is run exactly as <code>git &lt;line&gt;</code> would be, so it drives every dispatchable command — the z* superset verbs and every git-compat porcelain command alike (the latter operating on the current repository), doubling as a live daemon/ledger console.</p>
         <p>On a terminal it opens with a stats banner and full line editing: Tab completes the command word against every verb (superset + porcelain), with command history persisted across sessions. Piped stdin falls back to a raw line reader so scripts and heredocs stay usable. Type exit or quit, or press Ctrl-D, to leave.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zbanner">
+        <h3><span class="doc-sigil">git</span> zbanner <span class="doc-summary">reprint the zrepl startup banner</span></h3>
+        <pre class="doc-synopsis"><code>git zbanner [--color|--no-color]</code></pre>
+        <p>Prints the banner git zrepl shows at startup: the zvcs logo, then a box of live stats — os/arch/pid, core count, indexed repository count, and the superset/git-compat/total verb counts.</p>
+        <p>Every number is read at call time, so re-running it inside a console reflects the tree as it is now (repos indexed since the console opened, a newer build's verb counts) rather than as it was at startup. The repository count comes from the ledger and reads as — when no index exists yet.</p>
+        <p>Color is on for a terminal unless NO_COLOR is set; --color and --no-color (alias --mono) force it either way, so the ANSI form can be redirected to a file and the plain form kept on a tty.</p>
         <a class="doc-top" href="#verb-index">↑ index</a>
       </article>
       <article class="doc-entry" id="zclaim">

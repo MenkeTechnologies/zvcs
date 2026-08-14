@@ -128,6 +128,16 @@ pub const DOCS: &[Doc] = &[
         ],
     },
     Doc {
+        verb: "zbanner",
+        summary: "reprint the zrepl startup banner",
+        synopsis: "git zbanner [--color|--no-color]",
+        desc: &[
+            "Prints the banner git zrepl shows at startup: the zvcs logo, then a box of live stats \\(em os/arch/pid, core count, indexed repository count, and the superset/git-compat/total verb counts.",
+            "Every number is read at call time, so re-running it inside a console reflects the tree as it is now (repos indexed since the console opened, a newer build's verb counts) rather than as it was at startup. The repository count comes from the ledger and reads as \\(em when no index exists yet.",
+            "Color is on for a terminal unless NO_COLOR is set; --color and --no-color (alias --mono) force it either way, so the ANSI form can be redirected to a file and the plain form kept on a tty.",
+        ],
+    },
+    Doc {
         verb: "zclaim",
         summary: "lease a repository for this session",
         synopsis: "git zclaim [<path>]",

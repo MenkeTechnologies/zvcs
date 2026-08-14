@@ -790,6 +790,37 @@ fn usage_only(out: &mut Vec<Case>) {
     // A usage error must print the whole block, not just its first line.
     out.push(Case::strict("mv", &["mv"], Shape::Linear));
 
+    // `OPT_CMDMODE` is `PARSE_OPT_NONEG`, and this shipped wrong four times:
+    // every one of these negations was *accepted*. A unit test now asserts the
+    // property against the real tables; these pin the user-visible answer.
+    out.push(Case::strict("rebase", &["rebase", "--no-abort"], Shape::Branched));
+    out.push(Case::strict("rebase", &["rebase", "--no-continue"], Shape::Branched));
+    out.push(Case::strict("range-diff", &["range-diff", "--no-binary", "HEAD~1...HEAD"], Shape::Branched));
+    out.push(Case::strict("show-branch", &["show-branch", "--no-reflog"], Shape::Branched));
+    out.push(Case::strict("fetch", &["fetch", "--no-refetch"], Shape::BehindRemote));
+
+    // The two parse-options failure arms, paired on one verb so neither can be
+    // "fixed" into the other: an unknown option prints the usage block, a missing
+    // value for a known option does not.
+    out.push(Case::strict("restore", &["restore", "--bogus"], Shape::Dirty));
+    out.push(Case::strict("restore", &["restore", "--conflict"], Shape::Dirty));
+    out.push(Case::strict("am", &["am", "--bogus"], Shape::Linear));
+    // Ambiguity puts its block on stdout, which is where a usage text one newline
+    // short becomes visible.
+    out.push(Case::strict("verify-commit", &["verify-commit", "--n"], Shape::Branched));
+    // These answered `unsupported flag` at rc 1 where stock gives `unknown
+    // option` and a block at 129 — the port's voice leaking into git's contract.
+    out.push(Case::strict("merge", &["merge", "--no-ff-only"], Shape::Branched));
+    out.push(Case::strict("push", &["push", "--bogus"], Shape::BehindRemote));
+    out.push(Case::strict("tag", &["tag", "--bogus"], Shape::Branched));
+    out.push(Case::strict("clone", &["clone", "--no-ipv4", ".", "dst"], Shape::Linear));
+    // Unset semantics that *clear* rather than reject, which is the half of
+    // negation handling a NONEG fix can easily overshoot.
+    out.push(Case::strict("commit", &["commit", "-m", "x", "--no-message"], Shape::Dirty));
+    // An abbreviated value option, reached through the verb git registers as an
+    // alias of another (`stage` is `cmd_add`, sharing one table).
+    out.push(Case::strict("stage", &["stage", "--pathspec-from-f", "nope"], Shape::Dirty));
+
     const CEIL_SRC: &[(&str, &str)] = &[("GIT_CEILING_DIRECTORIES", "{repo}/src")];
     for args in [
         &["grep", "--no-index", "pub"][..],

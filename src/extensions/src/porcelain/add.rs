@@ -56,7 +56,6 @@
 
 use anyhow::{bail, Result};
 use std::collections::HashSet;
-use std::io::Read;
 use std::process::ExitCode;
 
 use gix::bstr::{BStr, BString, ByteSlice};
@@ -364,7 +363,7 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
                 "'--pathspec-from-file' and pathspec arguments cannot be used together".into(),
             );
         }
-        pathspecs = read_pathspec_file(&src, file_nul)?;
+        pathspecs = super::commit::read_pathspec_file(&src, file_nul)?;
     } else if file_nul {
         return usage_fatal(
             "the option '--pathspec-file-nul' requires '--pathspec-from-file'".into(),
@@ -437,8 +436,62 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
     // `prefix_path()` runs every command-line path through `normalize_path_copy()`
     // first, so `./.` is `.`, `src/.` is `src`, and `a/../b` is `b` before anything
     // asks whether the path exists or is ignored.
+    //
     for spec in pathspecs.iter_mut() {
         *spec = normalize_pathspec(spec);
+    }
+
+    // `prefix_pathspec()` also PREPENDS the prefix (pathspec.c:455-467, via
+    // `prefix_path_gently`), and the port needs it in exactly one place. The
+    // dirwalk does not: gitoxide resolves the patterns against the repository
+    // prefix itself, so handing it `sub/f.txt` from `sub/` would look for
+    // `sub/sub/f.txt`. The bookkeeping below does, because it compares each
+    // element against index and worktree paths, which are ALWAYS repo-relative —
+    // that mismatch is why `git add f.txt` in a subdirectory reported `pathspec
+    // 'f.txt' did not match any files` for a file the walk had just staged.
+    //
+    // So each element is carried as a pair: as typed, which is what git quotes
+    // back in its diagnostics, and repo-relative, which is what those comparisons
+    // need. git's `prefix` is directory-terminated ("sub/") while gix reports it
+    // without the separator; concatenating that would produce `subf.txt`.
+    let prefix = repo
+        .prefix()
+        .ok()
+        .flatten()
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .filter(|p| !p.is_empty())
+        .map(|p| if p.ends_with('/') { p } else { format!("{p}/") })
+        .unwrap_or_default();
+    let mut checked: Vec<(String, String)> = Vec::with_capacity(pathspecs.len());
+    for i in 0..pathspecs.len() {
+        let spec = pathspecs[i].clone();
+        match prefixed_pathspec(&spec, &prefix, &repo) {
+            Ok(relative) => {
+                // An absolute pathspec is the one case the matcher cannot take as
+                // typed — gitoxide reads it as a path outside the worktree and
+                // refuses. Its repo-relative form cannot be handed over bare
+                // either, since the walk would resolve THAT against the prefix a
+                // second time; `:(top)` is the spelling that says "already rooted".
+                if spec.starts_with('/') {
+                    pathspecs[i] = format!(":(top){relative}");
+                }
+                checked.push((spec, relative));
+            }
+            // `prefix_path_gently()` returning NULL is a die, not a skip: the path
+            // resolved to somewhere outside the worktree entirely.
+            Err(copyfrom) => {
+                // `absolute_path(hint_path)`: the worktree gix hands back can be
+                // relative to the cwd ("..") and git always names an absolute one.
+                let root = repo
+                    .workdir()
+                    .unwrap_or_else(|| repo.git_dir())
+                    .canonicalize()
+                    .unwrap_or_else(|_| repo.git_dir().to_path_buf())
+                    .display()
+                    .to_string();
+                crate::git_fatal!("{spec}: '{copyfrom}' is outside repository at '{root}'");
+            }
+        }
     }
     if at_root {
         for spec in pathspecs.iter_mut() {
@@ -729,8 +782,11 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
     // add a gitignored path without `-f`. Magic pathspecs are left to the matcher.
     // `--ignore-missing` (dry-run only) tolerates non-matching pathspecs.
     let deletion_set: HashSet<&BString> = deletions.iter().collect();
-    for p in &pathspecs {
-        if p == "." || p.is_empty() || p.starts_with(':') || p.contains(['*', '?', '[']) {
+    // `element` is the pathspec as the user typed it — what git quotes back — and
+    // `p` is the same element made repo-relative, which is the only form that can
+    // be compared with the index and worktree paths gathered above.
+    for (element, p) in &checked {
+        if p == "." || p.is_empty() || element.starts_with(':') || p.contains(['*', '?', '[']) {
             continue;
         }
         let on_disk = repo
@@ -759,7 +815,7 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
                 continue;
             }
             if !ignore_missing {
-                eprintln!("fatal: pathspec '{p}' did not match any files");
+                eprintln!("fatal: pathspec '{element}' did not match any files");
                 return Ok(ExitCode::from(128));
             }
             continue;
@@ -778,7 +834,7 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
             return Ok(ExitCode::from(1));
         }
         if !on_disk && !ignore_missing {
-            eprintln!("fatal: pathspec '{p}' did not match any files");
+            eprintln!("fatal: pathspec '{element}' did not match any files");
             return Ok(ExitCode::from(128));
         }
     }
@@ -1076,6 +1132,108 @@ pub(crate) fn record_stage_event(repo: &gix::Repository, count: usize) {
     }
 }
 
+/// Where the path starts inside `spec`, and whether its magic says `top`.
+///
+/// `parse_short_magic()` (pathspec.c:365-398) walks the characters after the
+/// leading `:` while they are magic mnemonics — only `/` (top) and `!`/`^`
+/// (exclude) have one — and steps over a terminating `:`. The long form
+/// (`parse_long_magic`) is a comma-separated list up to `)`. `prefix:N` counts as
+/// "already prefixed" for the same reason `top` does: `prefix_pathspec()` takes
+/// the element verbatim in both cases (pathspec.c:452-457).
+fn split_pathspec_magic(spec: &str) -> (usize, bool) {
+    let b = spec.as_bytes();
+    if b.first() != Some(&b':') {
+        return (0, false);
+    }
+    if b.get(1) == Some(&b'(') {
+        // A missing `)` is git's "Missing ')' at the end of pathspec magic", which
+        // the matcher below reports; treat the element as all-magic so this pass
+        // leaves it exactly as typed.
+        let Some(close) = spec[2..].find(')').map(|i| i + 2) else {
+            return (spec.len(), true);
+        };
+        let rooted =
+            spec[2..close].split(',').any(|m| m == "top" || m.starts_with("prefix:"));
+        (close + 1, rooted)
+    } else {
+        let mut i = 1;
+        let mut rooted = false;
+        while i < b.len() && b[i] != b':' {
+            match b[i] {
+                b'/' => rooted = true,
+                b'!' | b'^' => {}
+                // Not a mnemonic: the path starts here.
+                _ => break,
+            }
+            i += 1;
+        }
+        if i < b.len() && b[i] == b':' {
+            i += 1;
+        }
+        (i, rooted)
+    }
+}
+
+/// `prefix_path_gently()` (setup.c:103-130) applied to one pathspec element,
+/// keeping its magic.
+///
+/// Relative paths are resolved against `prefix` — that is what makes `git add
+/// f.txt` in `sub/` mean `sub/f.txt` — and absolute ones are cut down to the part
+/// inside the worktree (`abspath_part_inside_repo`). `Err` carries the path git
+/// names in its "is outside repository" die: the element resolved above the
+/// worktree root, which `normalize_path_copy_len()` reports by failing.
+fn prefixed_pathspec(
+    spec: &str,
+    prefix: &str,
+    repo: &gix::Repository,
+) -> Result<String, String> {
+    let (path_at, rooted) = split_pathspec_magic(spec);
+    let (magic, path) = spec.split_at(path_at);
+    // `:/` and `:(top)` are precisely the request to skip the prefix, and an
+    // element that is nothing but magic has no path to resolve.
+    if rooted || path.is_empty() {
+        return Ok(spec.to_string());
+    }
+
+    let normalized = if path.starts_with('/') {
+        // `abspath_part_inside_repo()` compares REALPATHS (`strbuf_realpath`), and
+        // it has to: on macOS the worktree reached through `$TMPDIR` is `/var/…`
+        // while its real path is `/private/var/…`, so a plain string compare calls
+        // a path inside the repo an outside one. The file itself need not exist —
+        // `git add` names paths that do not — so an unresolvable leaf falls back to
+        // resolving its directory.
+        let real = |p: &std::path::Path| -> std::path::PathBuf {
+            p.canonicalize().unwrap_or_else(|_| match (p.parent(), p.file_name()) {
+                (Some(dir), Some(name)) => {
+                    dir.canonicalize().map(|d| d.join(name)).unwrap_or_else(|_| p.to_path_buf())
+                }
+                _ => p.to_path_buf(),
+            })
+        };
+        let normalized = real(std::path::Path::new(&normalize_pathspec(path)))
+            .to_string_lossy()
+            .replace('\\', "/");
+        let root = repo.workdir().ok_or_else(|| path.to_string())?;
+        let root = real(root).to_string_lossy().replace('\\', "/");
+        // Only a path at or under the worktree is a pathspec; git says the same
+        // thing about every other absolute path.
+        let rest = normalized
+            .strip_prefix(&root)
+            .filter(|rest| rest.is_empty() || rest.starts_with('/'))
+            .ok_or_else(|| path.to_string())?;
+        rest.trim_start_matches('/').to_string()
+    } else {
+        normalize_pathspec(&format!("{prefix}{path}"))
+    };
+
+    // A `..` that survives normalization climbed past the root, which is the
+    // failure `prefix_path_gently()` turns into a NULL.
+    if normalized == ".." || normalized.starts_with("../") {
+        return Err(path.to_string());
+    }
+    Ok(format!("{magic}{normalized}"))
+}
+
 /// `normalize_path_copy_len()` (path.c), the pass `prefix_path()` puts every
 /// command-line path through: a `.` component disappears, a `..` component pops the
 /// one before it, and repeated slashes collapse into one. So `./.` reaches the
@@ -1314,31 +1472,6 @@ fn usage_fatal(msg: String) -> Result<ExitCode> {
     Ok(ExitCode::from(128))
 }
 
-/// Read newline- (or NUL-) separated pathspecs from a file, or from stdin when
-/// `src` is `-`. Trailing CR is stripped from newline-separated lines.
-fn read_pathspec_file(src: &str, nul: bool) -> Result<Vec<String>> {
-    let data = if src == "-" {
-        let mut buf = Vec::new();
-        std::io::stdin().read_to_end(&mut buf)?;
-        buf
-    } else {
-        std::fs::read(src)?
-    };
-    let sep = if nul { b'\0' } else { b'\n' };
-    let mut out = Vec::new();
-    for chunk in data.split(|&b| b == sep) {
-        let mut c = chunk;
-        if !nul && c.last() == Some(&b'\r') {
-            c = &c[..c.len() - 1];
-        }
-        if c.is_empty() {
-            continue;
-        }
-        out.push(c.to_str_lossy().into_owned());
-    }
-    Ok(out)
-}
-
 /// Return `true` if any path in `iter` equals `p` or lives under the directory
 /// `p` (i.e. starts with `p` + `/`), the way a directory pathspec matches.
 ///
@@ -1355,4 +1488,61 @@ fn path_is_or_under<'a>(mut iter: impl Iterator<Item = &'a BString>, p: &str) ->
     let mut prefix = pb.to_vec();
     prefix.push(b'/');
     iter.any(|x| x.as_slice() == pb || x.as_slice().starts_with(&prefix))
+}
+
+#[cfg(test)]
+mod pathspec_prefix_tests {
+    use super::split_pathspec_magic;
+
+    /// Every element git treats as "already rooted" — and only those — must opt
+    /// out of the prefix. Getting this backwards is silent in both directions: a
+    /// `:/` that gains a prefix stops matching, and a plain path that skips one
+    /// matches the wrong file.
+    #[test]
+    fn only_top_magic_opts_out_of_the_prefix() {
+        for rooted in [":/", ":/README.md", ":(top)README.md", ":(top,icase)x", ":(prefix:2)x"] {
+            assert!(split_pathspec_magic(rooted).1, "{rooted} should skip the prefix");
+        }
+        for prefixed in ["README.md", "./x", ":!x", ":^x", ":(icase)X", ":(exclude,icase)X", ":x"] {
+            assert!(!split_pathspec_magic(prefixed).1, "{prefixed} should take the prefix");
+        }
+    }
+
+    /// The path has to be split off at exactly the right byte: one short and the
+    /// magic is re-emitted into the path, one long and the path loses a character.
+    #[test]
+    fn the_path_begins_after_the_magic() {
+        for (spec, path) in [
+            ("README.md", "README.md"),
+            (":!src/x", "src/x"),
+            (":^src/x", "src/x"),
+            (":(icase)X", "X"),
+            (":(exclude,icase)X", "X"),
+            // `parse_short_magic` steps over the `:` that terminates the mnemonics,
+            // which is what lets a path start with one of them.
+            ("::x", "x"),
+            (":!:x", "x"),
+        ] {
+            let (at, _) = split_pathspec_magic(spec);
+            assert_eq!(&spec[at..], path, "path of {spec}");
+        }
+    }
+
+    /// `!` and `^` are the same magic, so they must split identically — `:^x`
+    /// losing its alias would send `^x` to the matcher as a literal filename.
+    #[test]
+    fn exclude_aliases_agree() {
+        assert_eq!(split_pathspec_magic(":!x"), split_pathspec_magic(":^x"));
+    }
+
+    /// A magic-only element has no path to resolve, and an unterminated long form
+    /// is git's "Missing ')'" — neither may be handed a prefix on the way past.
+    #[test]
+    fn degenerate_elements_are_left_alone() {
+        assert_eq!(split_pathspec_magic(":/").0, 2);
+        let unterminated = ":(icase";
+        let (at, rooted) = split_pathspec_magic(unterminated);
+        assert_eq!(at, unterminated.len(), "no path to prefix");
+        assert!(rooted, "an unparseable element is passed through untouched");
+    }
 }

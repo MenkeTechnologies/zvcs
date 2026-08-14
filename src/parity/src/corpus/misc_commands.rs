@@ -1025,6 +1025,46 @@ fn usage_only(out: &mut Vec<Case>) {
         out.push(Case::strict("grep", args, Shape::Linear).in_dir("src").with_env(CEIL_SRC));
     }
 
+    // `add` run from a SUBDIRECTORY. Every other case in this corpus runs at the
+    // repository root, and that blind spot hid a bug in the oldest, most-used
+    // path in the command: `git add lib.rs` inside `src/` answered `pathspec
+    // 'lib.rs' did not match any files` for a tracked file, because the element
+    // was compared against the repo-relative `src/lib.rs` it had just staged.
+    // Nothing at the root can catch it — the prefix is empty there, so every
+    // comparison accidentally lines up.
+    //
+    // `prefix_pathspec()` applies the prefix to every element EXCEPT one carrying
+    // `top` magic, so both halves are pinned: the plain forms must gain `src/`,
+    // and `:/`/`:(top)` must not. The diagnostics matter as much as the matching —
+    // git quotes the element as the user typed it (`nosuch.txt`, not
+    // `src/nosuch.txt`) and reports an escape as `is outside repository`.
+    for args in [
+        &["add", "-n", "lib.rs"][..],
+        &["add", "-n", "./lib.rs"],
+        &["add", "-n", "../README.md"],
+        &["add", "-n", "."],
+        &["add", "-n", "../src"],
+        &["add", "-n", "nosuch.txt"],
+        &["add", "-n", "../../outside.txt"],
+        &["add", "-n", ":/README.md"],
+        &["add", "-n", ":(top)README.md"],
+        &["add", "-n", ":!lib.rs"],
+        &["add", "-n", ":^lib.rs"],
+        // `stage` is `cmd_add` under another name, so it inherits the same rule.
+        &["stage", "-n", "lib.rs"],
+    ] {
+        out.push(Case::strict(args[0], args, Shape::Linear).in_dir("src"));
+    }
+    // Two levels down, and a path that needs quoting once the prefix is on it.
+    for args in [
+        &["add", "-n", "deep/path.txt"][..],
+        &["add", "-n", "deep"],
+        &["add", "-n", "../with space.txt"],
+        &["add", "-n", "../nested/deep/path.txt"],
+    ] {
+        out.push(Case::strict("add", args, Shape::AwkwardPaths).in_dir("nested"));
+    }
+
 
     // A few argument-validation paths that go one level past the usage check
     // and still cannot reach a socket or a peer.

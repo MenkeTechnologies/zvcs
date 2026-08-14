@@ -681,6 +681,93 @@ fn usage_only(out: &mut Vec<Case>) {
         out.push(Case::strict(cmd, &[cmd, "--bogus"], Shape::Linear));
     }
 
+    // An unrecognised flag must never become an operand.
+    //
+    // These are not cosmetic. Before the fix, `stash clear --zzbogus` **erased
+    // every stash entry**, `stash drop --zzbogus` destroyed one, `switch --orphan
+    // --zzbogus` emptied the index and deleted every tracked file, `worktree add
+    // -b --zzbogus` created both a ref and a checked-out worktree, and
+    // `branch -m -- -bad` renamed the *current branch* — each from a typo, each
+    // exiting 0. The post-state probe is doing at least as much work as stdout
+    // in this group, which is the point of choosing the destructive shapes.
+    //
+    // `-- -foo` is here because the leading-dash rule lives in `check_branch_ref`
+    // (refs.c), ahead of `check_refname_format`, and gitoxide only implements the
+    // latter — so `--` was not a way to smuggle the name past it.
+    out.push(Case::strict("stash", &["stash", "clear", "--zzbogus"], Shape::Stashed));
+    out.push(Case::strict("stash", &["stash", "clear", "-Z"], Shape::Stashed));
+    out.push(Case::strict("stash", &["stash", "clear", "junkarg"], Shape::Stashed));
+    out.push(Case::strict("stash", &["stash", "drop", "--zzbogus"], Shape::Stashed));
+    out.push(Case::strict("stash", &["stash", "drop", "-Z"], Shape::Stashed));
+    out.push(Case::strict("branch", &["branch", "--bogus"], Shape::Linear));
+    out.push(Case::strict("branch", &["branch", "--bogus", "newbr"], Shape::Linear));
+    out.push(Case::strict("branch", &["branch", "newbr", "--bogus"], Shape::Linear));
+    out.push(Case::strict("branch", &["branch", "-Z"], Shape::Linear));
+    out.push(Case::strict("branch", &["branch", "--", "-foo"], Shape::Linear));
+    out.push(Case::strict("branch", &["branch", "--", "HEAD"], Shape::Linear));
+    out.push(Case::strict("branch", &["branch", "-m", "--", "-bad"], Shape::Linear));
+    out.push(Case::strict("branch", &["branch", "-c", "--", "-bad2"], Shape::Linear));
+    out.push(Case::strict("checkout", &["checkout", "-b", "--zzbogus"], Shape::Linear));
+    out.push(Case::strict("checkout", &["checkout", "--orphan", "--zzbogus"], Shape::Linear));
+    out.push(Case::strict("switch", &["switch", "-c", "--zzbogus"], Shape::Linear));
+    out.push(Case::strict("switch", &["switch", "--orphan", "--zzbogus"], Shape::Linear));
+    // Unique-prefix abbreviation and negation must keep resolving as git resolves
+    // them, or the rejection above would be bought by refusing valid input.
+    out.push(Case::strict("branch", &["branch", "--verb"], Shape::Linear));
+    out.push(Case::strict("branch", &["branch", "--no-all"], Shape::Linear));
+    out.push(Case::strict("branch", &["branch", "--end-of-options", "--bogus"], Shape::Linear));
+
+    // Column padding, on the three verbs that carry their own formatter.
+    //
+    // `shortlog`, `reflog` and `format-rev` were each at 100% while refusing
+    // padding outright, and stayed at 100% after it was wired up — because no
+    // case here had ever typed `%<`. That gap let a panic reach a commit:
+    // `log --format='%<(20)%Cred%%|'` hit an `unreachable!`, since a `%C` chain
+    // hands the formatter the second half of a `%%` and the validator had only
+    // checked the pair. Width is in display columns, so the CJK subject in
+    // `AwkwardPaths` is the shape that matters, not the ASCII one.
+    for cmd in ["shortlog", "reflog", "format-rev"] {
+        out.push(Case::new(cmd, &[cmd, "--format=%<(20)%s|"], Shape::Branched));
+        out.push(Case::new(cmd, &[cmd, "--format=%<(10,mtrunc)%s|"], Shape::AwkwardPaths));
+        out.push(Case::new(cmd, &[cmd, "--format=%>>(20)%s|"], Shape::Branched));
+    }
+    out.push(Case::new("log", &["log", "--format=%<(20)%Cred%%s|"], Shape::Branched));
+    out.push(Case::new("log", &["log", "--format=a%x00b%<|(20)%s|"], Shape::Branched));
+    out.push(Case::new("log", &["log", "--format=%<(10,mtrunc)%s|"], Shape::AwkwardPaths));
+    out.push(Case::new("log", &["log", "--format=%w(20,2,4)%s %s %s"], Shape::Branched));
+
+    // The commands that must work with **no repository at all**.
+    //
+    // Every fixture root is a repository and `cwd` is relative to it, so "outside
+    // a repository" looks inexpressible — but a ceiling naming the working
+    // directory itself stops discovery before it can walk up, which is exactly
+    // the semantics wanted, and `src/` has tracked files to actually search.
+    // Verified against stock: with the ceiling in place `grep --no-index` finds
+    // `src/lib.rs` on both sides, and plain `grep` gets the repo-less fatal.
+    //
+    // `grep --no-index` died `fatal: not a git repository` here until the repo
+    // handle became optional, which also blocked `grep.fallbackToNoIndex` — a
+    // config whose entire purpose is converting a repo-less invocation. Outside a
+    // repository git reads no `.gitattributes` and no `info/exclude`, so these
+    // pin that the walk's inputs are rebuilt rather than borrowed from a
+    // repository that is not there.
+    const CEIL_SRC: &[(&str, &str)] = &[("GIT_CEILING_DIRECTORIES", "{repo}/src")];
+    for args in [
+        &["grep", "--no-index", "pub"][..],
+        &["grep", "--no-index", "-n", "pub"],
+        &["grep", "--no-index", "-l", "pub"],
+        &["grep", "--no-index", "--exclude-standard", "pub"],
+        // Escaping the tree and the flag conflict are both `fatal:` at 128.
+        &["grep", "--no-index", "pub", "--", "../README.md"],
+        &["grep", "--no-index", "--untracked", "pub"],
+        &["-c", "grep.fallbackToNoIndex=true", "grep", "pub"],
+        // No repository and no `--no-index`: the plain repo-less refusal.
+        &["grep", "pub"],
+    ] {
+        out.push(Case::strict("grep", args, Shape::Linear).in_dir("src").with_env(CEIL_SRC));
+    }
+
+
     // A few argument-validation paths that go one level past the usage check
     // and still cannot reach a socket or a peer.
     out.push(Case::new("daemon", &["daemon", "--port=not-a-number"], Shape::Linear));

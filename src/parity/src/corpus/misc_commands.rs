@@ -844,6 +844,44 @@ fn usage_only(out: &mut Vec<Case>) {
     out.push(Case::strict("bisect", &["bisect", "--quux=x"], Shape::Branched));
     out.push(Case::strict("hook", &["hook", "--quux=x"], Shape::Linear));
 
+    // The fourth destructive typo of the same family.
+    //
+    // `git rm --no-pathspec-from-file=x f.txt` **deleted f.txt** at rc 0 where
+    // stock refuses at 129 — a prefix test standing in for a table lookup, with
+    // only the value-carrying form escaping, exactly as in `stash clear`,
+    // `stash drop` and `stash pop`. The post-state is the assertion.
+    out.push(Case::strict("rm", &["rm", "--no-pathspec-from-file=x", "README.md"], Shape::Linear));
+    out.push(Case::strict("rm", &["rm", "--cach=x", "README.md"], Shape::Linear));
+    out.push(Case::strict("rm", &["rm", "--no-"], Shape::Linear));
+
+    // The rest of the abbreviation class, one case per rule rather than per verb.
+    //
+    // `update-ref --deref=x` is the sharp one: stock answers `no-no-deref`,
+    // because the table's own entry is named `no-deref` and the optname prefixes
+    // it again. A resolver that special-cased the `no-` spelling gets this wrong.
+    out.push(Case::strict("update-ref", &["update-ref", "--deref=x"], Shape::Linear));
+    out.push(Case::strict("update-ref", &["update-ref", "--stdin=x"], Shape::Linear));
+    out.push(Case::strict("for-each-repo", &["for-each-repo", "--no-conf=x"], Shape::Linear));
+    out.push(Case::strict("url-parse", &["url-parse", "--no-c=x", "https://example.invalid/r"], Shape::Linear));
+    out.push(Case::strict("version", &["version", "--no-b=x"], Shape::Linear));
+    out.push(Case::strict("mailinfo", &["mailinfo", "--no-scissors=x"], Shape::Linear));
+    out.push(Case::strict("interpret-trailers", &["interpret-trailers", "--no-no-divider"], Shape::Linear));
+    out.push(Case::strict("read-tree", &["read-tree", "--su"], Shape::Linear));
+    out.push(Case::strict("read-tree", &["read-tree", "--no-super-prefix"], Shape::Linear));
+    // `for-each-ref`'s six missing negations. `--no-format` is deliberately
+    // absent: stock 2.55.0 **segfaults** on it (the default format is installed
+    // before `parse_options`, `OPTION_STRING`'s unset arm nulls it, and
+    // `verify_ref_format()` walks it unguarded), so the only faithful behaviour
+    // is one no case should encode.
+    for flag in ["--no-count", "--no-exclude", "--no-sort", "--no-points-at", "--no-start-after"] {
+        out.push(Case::strict("for-each-ref", &["for-each-ref", flag], Shape::Branched));
+    }
+    // The port used to put its own refusal *ahead* of git's gate here: stock
+    // accepts `--binary` unconditionally and then dies on the `-z` check.
+    for flag in ["--bin", "--binar", "--anchored=x"] {
+        out.push(Case::strict("diff-pairs", &["diff-pairs", flag], Shape::Linear));
+    }
+
     // Subcommand-level help, which 99 divergences hid behind.
     //
     // The corpus had 12 `remote`, 1 `hook`, 33 `notes`, 43 `reflog` and 35

@@ -765,41 +765,6 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
         }
     }
 
-    // Resolve which remote-tracking ref the fetched upstream lands at.
-    // `<repository>` may just as well be a URL, and then there is no `remote.<name>` section and
-    // nothing under `refs/remotes/` for the fetch to have updated. git never depends on one:
-    // `cmd_pull()` collects its merge heads from `FETCH_HEAD`, which the fetch has just written for
-    // exactly the refs that were asked for. Only a configured remote gets the tracking-ref
-    // treatment, because that is the one whose name a tracking ref can be built from.
-    let named_remote = positionals
-        .first()
-        .is_some_and(|name| repo.remote_names().iter().any(|known| known == name));
-    let target_ref = if positionals.len() >= 2 && named_remote {
-        // Explicit `<remote> <branch>`: after a default-refspec fetch the branch
-        // lands at refs/remotes/<remote>/<branch>.
-        format!("refs/remotes/{}/{}", positionals[0], positionals[1])
-    } else if positionals.len() >= 2 {
-        "FETCH_HEAD".to_string()
-    } else {
-        // No explicit branch: derive the tracking ref from the current branch's
-        // upstream configuration (branch.<name>.remote / .merge).
-        let head = match head_name.as_ref() {
-            Some(head) => head,
-            None => return Ok(no_merge_candidates(&repo, None, rebasing)),
-        };
-        match repo.branch_remote_tracking_ref_name(head.as_ref(), Direction::Fetch) {
-            Some(Ok(name)) => name.as_bstr().to_string(),
-            Some(Err(err)) => return Err(err.into()),
-            None => {
-                return Ok(no_merge_candidates(
-                    &repo,
-                    Some(head.shorten().to_string()).as_deref(),
-                    rebasing,
-                ))
-            }
-        }
-    };
-
     // ---- phase 1: fetch --------------------------------------------------
     // Delegate to the ported fetch, which acquires the repo lock itself, prints
     // the git-style `From …` per-ref summary, and honors the forwarded knobs.
@@ -909,18 +874,59 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
     // below then reports the missing upstream, as git's pull does.
     let fetch_code = super::fetch(&fetch_args)?;
 
-    // `--dry-run` stops here: git's pull returns right after `run_fetch` without
-    // touching the worktree, so no merge or rebase is attempted and the tracking
-    // refs the integration step would need were never written.
-    if f_dry_run {
-        return Ok(fetch_code);
-    }
-
     // `cmd_pull()` is `if (run_fetch(...)) return 1;` - a fetch that failed ends the pull right
     // there, with 1 whatever the fetch itself exited with, and no integration step is attempted.
     if fetch_code != ExitCode::SUCCESS {
         return Ok(ExitCode::FAILURE);
     }
+
+    // `--dry-run` stops here: git's pull returns right after `run_fetch` without
+    // touching the worktree, so no merge or rebase is attempted and the tracking
+    // refs the integration step would need were never written.
+    if f_dry_run {
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    // Resolve which remote-tracking ref the fetched upstream lands at.
+    // `<repository>` may just as well be a URL, and then there is no `remote.<name>` section and
+    // nothing under `refs/remotes/` for the fetch to have updated. git never depends on one:
+    // `cmd_pull()` collects its merge heads from `FETCH_HEAD`, which the fetch has just written for
+    // exactly the refs that were asked for. Only a configured remote gets the tracking-ref
+    // treatment, because that is the one whose name a tracking ref can be built from.
+    //
+    // This sits *below* the fetch because `cmd_pull()` puts it there: `run_fetch()` runs first and
+    // only `get_merge_heads()` afterwards decides there is nothing to merge. Resolving the upstream
+    // first would answer for the fetch — a `git pull` with no upstream would report the missing
+    // tracking information instead of fetching, and an option only the fetch knows how to reject
+    // (`--no-ipv4`) would never reach it.
+    let named_remote = positionals
+        .first()
+        .is_some_and(|name| repo.remote_names().iter().any(|known| known == name));
+    let target_ref = if positionals.len() >= 2 && named_remote {
+        // Explicit `<remote> <branch>`: after a default-refspec fetch the branch
+        // lands at refs/remotes/<remote>/<branch>.
+        format!("refs/remotes/{}/{}", positionals[0], positionals[1])
+    } else if positionals.len() >= 2 {
+        "FETCH_HEAD".to_string()
+    } else {
+        // No explicit branch: derive the tracking ref from the current branch's
+        // upstream configuration (branch.<name>.remote / .merge).
+        let head = match head_name.as_ref() {
+            Some(head) => head,
+            None => return Ok(no_merge_candidates(&repo, None, rebasing)),
+        };
+        match repo.branch_remote_tracking_ref_name(head.as_ref(), Direction::Fetch) {
+            Some(Ok(name)) => name.as_bstr().to_string(),
+            Some(Err(err)) => return Err(err.into()),
+            None => {
+                return Ok(no_merge_candidates(
+                    &repo,
+                    Some(head.shorten().to_string()).as_deref(),
+                    rebasing,
+                ))
+            }
+        }
+    };
 
     // `get_merge_heads()`: everything the fetch marked for-merge in `FETCH_HEAD`,
     // which is what `cmd_pull()` integrates — not a remote-tracking ref. A

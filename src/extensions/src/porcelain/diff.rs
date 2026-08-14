@@ -5101,7 +5101,7 @@ fn cq_body(s: &[u8], out: &mut Vec<u8>) {
 }
 
 /// `write_name_quoted()`: the path, double-quoted and escaped only if needed.
-fn quoted_name(path: &BString) -> Vec<u8> {
+pub(super) fn quoted_name(path: &BString) -> Vec<u8> {
     let s = path.as_slice();
     if !needs_quote(s) {
         return s.to_vec();

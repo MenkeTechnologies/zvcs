@@ -460,6 +460,8 @@ fn run_sub(args: &[String]) -> Result<ExitCode> {
     let mut quiet = false;
     let mut scheduled: Option<Schedule> = None;
     let mut selected: Vec<String> = Vec::new();
+    // The `--task` arguments as typed, which is what git tests for a repeat.
+    let mut typed_tasks: Vec<String> = Vec::new();
     let mut end_of_opts = false;
     let mut i = 0;
     while i < args.len() {
@@ -499,15 +501,21 @@ fn run_sub(args: &[String]) -> Result<ExitCode> {
                 let Some(value) = args.get(i + 1) else {
                     return Ok(bare_error(&format!("option `{name}' requires a value")));
                 };
-                if let Some(code) = check_value(name, value, &mut scheduled, &mut selected)? {
+                if let Some(code) =
+                    check_value(name, value, &mut scheduled, &mut selected, &mut typed_tasks)?
+                {
                     return Ok(code);
                 }
                 i += 1;
             }
             _ if a.starts_with("--task=") => {
-                if let Some(code) =
-                    check_value("task", &a["--task=".len()..], &mut scheduled, &mut selected)?
-                {
+                if let Some(code) = check_value(
+                    "task",
+                    &a["--task=".len()..],
+                    &mut scheduled,
+                    &mut selected,
+                    &mut typed_tasks,
+                )? {
                     return Ok(code);
                 }
             }
@@ -517,6 +525,7 @@ fn run_sub(args: &[String]) -> Result<ExitCode> {
                     &a["--schedule=".len()..],
                     &mut scheduled,
                     &mut selected,
+                    &mut typed_tasks,
                 )? {
                     return Ok(code);
                 }
@@ -1009,6 +1018,8 @@ fn is_needed_sub(args: &[String]) -> Result<ExitCode> {
     let mut auto = false;
     let mut end_of_opts = false;
     let mut selected: Vec<String> = Vec::new();
+    // The `--task` arguments as typed, which is what git tests for a repeat.
+    let mut typed_tasks: Vec<String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
@@ -1032,18 +1043,17 @@ fn is_needed_sub(args: &[String]) -> Result<ExitCode> {
                 let Some(value) = args.get(i + 1) else {
                     return Ok(bare_error("option `task' requires a value"));
                 };
-                if let Some(code) = check_task(value) {
-                    return Ok(code);
+                match take_task(&mut typed_tasks, value) {
+                    Err(code) => return Ok(code),
+                    Ok(canonical) => push_task(&mut selected, canonical),
                 }
-                push_task(&mut selected, value);
                 i += 1;
             }
             _ if a.starts_with("--task=") => {
-                let value = &a["--task=".len()..];
-                if let Some(code) = check_task(value) {
-                    return Ok(code);
+                match take_task(&mut typed_tasks, &a["--task=".len()..]) {
+                    Err(code) => return Ok(code),
+                    Ok(canonical) => push_task(&mut selected, canonical),
                 }
-                push_task(&mut selected, value);
             }
             _ => match option_name(a) {
                 Some(msg) => return Ok(usage_error(IS_NEEDED_USAGE, Some(&msg))),
@@ -1571,14 +1581,40 @@ fn local_packs(pack_dir: &Path, hash: gix::hash::Kind) -> Vec<Pack> {
     packs
 }
 
-/// Reject an unknown `--task` value the way git's callback does: a lone
-/// `error:` line, exit 129. `None` when the name is one git knows.
-fn check_task(value: &str) -> Option<ExitCode> {
-    (!TASKS.contains(&value)).then(|| bare_error(&format!("'{value}' is not a valid task")))
+/// `task_option_parse()` (builtin/gc.c:2009-2033): one `--task=<name>` argument,
+/// recorded in `typed` and answered with the table entry it selected. `Err` is the
+/// callback's `error()` return, which `parse_options` turns into a lone `error:` line
+/// at 129 — at the position the argument appears, before any later one is parsed.
+///
+/// git's two tests are deliberately not symmetric and the asymmetry is reproduced
+/// rather than tidied up. The name is *found* with `strcasecmp`, so `--task=GC`
+/// selects `gc`; the already-selected test is `unsorted_string_list_has_string()` over
+/// the arguments as typed, so only a byte-identical repeat is refused and
+/// `--task=GC --task=gc` is accepted. Validity is decided first, which is why an
+/// invalid name reports even when a duplicate is also present.
+///
+/// Selecting one twice used to be silently collapsed here on the reasoning that git's
+/// callback set a per-task bit; in git 2.55.0 it keeps a list and refuses instead, so
+/// the port answered nothing where git refuses at 129.
+fn take_task(
+    typed: &mut Vec<String>,
+    value: &str,
+) -> std::result::Result<&'static str, ExitCode> {
+    let Some(canonical) = TASKS.into_iter().find(|task| task.eq_ignore_ascii_case(value)) else {
+        return Err(bare_error(&format!("'{value}' is not a valid task")));
+    };
+    if typed.iter().any(|seen| seen == value) {
+        return Err(bare_error(&format!(
+            "task '{value}' cannot be selected multiple times"
+        )));
+    }
+    typed.push(value.to_string());
+    Ok(canonical)
 }
 
-/// Record an accepted `--task` name once: git's callback sets the task's
-/// `selected` bit, so naming one twice still runs it once.
+/// Record an accepted `--task` name once. git keeps a repeat only when the two
+/// spellings differ, and then runs the task twice; [`plan`] selects by name, so a
+/// second entry for the same task would change nothing here.
 fn push_task(selected: &mut Vec<String>, value: &str) {
     if !selected.iter().any(|s| s == value) {
         selected.push(value.to_string());
@@ -1596,14 +1632,13 @@ fn check_value(
     value: &str,
     scheduled: &mut Option<Schedule>,
     selected: &mut Vec<String>,
+    typed: &mut Vec<String>,
 ) -> Result<Option<ExitCode>> {
     match name {
-        "task" => {
-            if let Some(code) = check_task(value) {
-                return Ok(Some(code));
-            }
-            push_task(selected, value);
-        }
+        "task" => match take_task(typed, value) {
+            Err(code) => return Ok(Some(code)),
+            Ok(canonical) => push_task(selected, canonical),
+        },
         "schedule" => {
             let Some(frequency) = Schedule::parse(value) else {
                 // git's `parse_schedule` dies rather than raising a usage error.
@@ -2018,5 +2053,65 @@ fn errno_text(e: &std::io::Error) -> String {
             .to_string_lossy()
             .into_owned(),
         None => e.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod task_option_tests {
+    use super::take_task;
+
+    fn err(typed: &mut Vec<String>, value: &str) -> bool {
+        take_task(typed, value).is_err()
+    }
+
+    /// `task_option_parse()` refuses a second `--task=` naming a task already
+    /// selected. This was silently collapsed here — the port ran the task once and
+    /// said nothing where stock git 2.55.0 stops at 129:
+    ///
+    /// ```text
+    /// $ git maintenance run --task=gc --task=gc
+    /// error: task 'gc' cannot be selected multiple times
+    /// ```
+    #[test]
+    fn a_repeated_task_is_refused_rather_than_collapsed() {
+        let mut typed = Vec::new();
+        assert_eq!(take_task(&mut typed, "gc"), Ok("gc"));
+        assert!(err(&mut typed, "gc"));
+        // The refused argument is not recorded, so the list still holds one entry.
+        assert_eq!(typed, vec!["gc".to_string()]);
+        // An unrelated task in between changes nothing about the repeat.
+        let mut typed = Vec::new();
+        assert!(take_task(&mut typed, "gc").is_ok());
+        assert!(take_task(&mut typed, "pack-refs").is_ok());
+        assert!(err(&mut typed, "gc"));
+    }
+
+    /// git looks the name up with `strcasecmp` but tests for a repeat with an exact
+    /// string compare against the arguments as typed, so `--task=GC` selects `gc`
+    /// and `--task=GC --task=gc` is accepted. Stock git 2.55.0 exits 0 for both.
+    /// Collapsing the two tests onto one spelling breaks it either way: a
+    /// case-sensitive lookup rejects `--task=GC` as invalid, a case-insensitive
+    /// repeat test refuses a pair git runs.
+    #[test]
+    fn the_lookup_ignores_case_while_the_repeat_test_does_not() {
+        let mut typed = Vec::new();
+        assert_eq!(take_task(&mut typed, "GC"), Ok("gc"));
+        assert_eq!(take_task(&mut typed, "gc"), Ok("gc"));
+        assert_eq!(take_task(&mut typed, "Pack-Refs"), Ok("pack-refs"));
+    }
+
+    /// Validity is decided before the repeat, so a name git does not have reports as
+    /// invalid even when it is also a duplicate — and an invalid name later in the
+    /// line reports even though an earlier valid one was accepted, because the
+    /// callback runs at the position the argument appears.
+    #[test]
+    fn an_invalid_name_is_reported_ahead_of_a_repeat() {
+        let mut typed = Vec::new();
+        assert!(err(&mut typed, "zzbogus"));
+        assert!(err(&mut typed, "zzbogus"));
+        assert!(typed.is_empty());
+        let mut typed = Vec::new();
+        assert!(take_task(&mut typed, "gc").is_ok());
+        assert!(err(&mut typed, "zzbogus"));
     }
 }

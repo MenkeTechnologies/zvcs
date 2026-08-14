@@ -56,6 +56,281 @@ pub(super) const USAGE_ALL: &str = r#"usage: git log [<options>] [<revision-rang
 
 "#;
 
+/// Every long option `git log` recognises, without its leading `--`, sorted so a
+/// binary search resolves it.
+///
+/// git's `cmd_log_init_finish()` runs `parse_options()` over `builtin_log_options`
+/// and then `setup_revisions()` over `revision.c`'s `handle_revision_opt()` and
+/// `diff.c`'s `diff_opt_parse()`; whatever those three leave unconsumed is reported
+/// by `builtin/log.c:320` as `unrecognized argument`. Membership here is therefore
+/// what separates "git has no such option" from "git has it and this port does not
+/// implement it" — the two must not answer with the same message, so this list
+/// exists to keep the second population out of git's wording.
+///
+/// Derived from git 2.55.0 and verified against the stock binary: every option-shaped
+/// token in the git tree (`--[a-z][a-z0-9-]*` literals plus the `"name"` field of every
+/// `OPT_*`/`parse_long_opt` entry) was run through `git log <tok>` and `git log <tok>=x`,
+/// and every token that did not answer `unrecognized argument` is listed here.
+const GIT_LOG_LONG_OPTS: &[&str] = &[
+    "abbrev",
+    "abbrev-commit",
+    "after",
+    "all",
+    "all-match",
+    "alternate-refs",
+    "always",
+    "ancestry-path",
+    "anchored",
+    "author",
+    "author-date-order",
+    "basic-regexp",
+    "before",
+    "binary",
+    "bisect",
+    "boundary",
+    "branches",
+    "break-rewrites",
+    "cc",
+    "check",
+    "cherry",
+    "cherry-mark",
+    "cherry-pick",
+    "children",
+    "clear-decorations",
+    "color",
+    "color-moved",
+    "color-moved-ws",
+    "color-words",
+    "combined-all-paths",
+    "committer",
+    "compact-summary",
+    "count",
+    "cumulative",
+    "date",
+    "date-order",
+    "dd",
+    "decorate",
+    "decorate-refs",
+    "decorate-refs-exclude",
+    "default",
+    "default-prefix",
+    "dense",
+    "diff-algorithm",
+    "diff-filter",
+    "diff-merges",
+    "dirstat",
+    "dirstat-by-file",
+    "do-walk",
+    "dst-prefix",
+    "encode-email-headers",
+    "encoding",
+    "end-of-options",
+    "exclude",
+    "exclude-first-parent-only",
+    "exclude-hidden",
+    "exit-code",
+    "expand-tabs",
+    "ext-diff",
+    "extended-regexp",
+    "filter",
+    "find-copies",
+    "find-copies-harder",
+    "find-object",
+    "find-renames",
+    "first-parent",
+    "fixed-strings",
+    "follow",
+    "format",
+    "full-diff",
+    "full-history",
+    "full-index",
+    "function-context",
+    "git-completion-helper",
+    "git-completion-helper-all",
+    "glob",
+    "graph",
+    "graph-lane-limit",
+    "grep",
+    "grep-reflog",
+    "help",
+    "help-all",
+    "histogram",
+    "i-still-use-this",
+    "ignore-all-space",
+    "ignore-blank-lines",
+    "ignore-cr-at-eol",
+    "ignore-matching-lines",
+    "ignore-missing",
+    "ignore-space-at-eol",
+    "ignore-space-change",
+    "ignore-submodules",
+    "in-commit-order",
+    "indent-heuristic",
+    "indexed-objects",
+    "inter-hunk-context",
+    "invert-grep",
+    "irreversible-delete",
+    "ita-invisible-in-index",
+    "ita-visible-in-index",
+    "left-only",
+    "left-right",
+    "line-prefix",
+    "log-size",
+    "mailmap",
+    "max-age",
+    "max-count",
+    "max-count-oldest",
+    "max-depth",
+    "max-parents",
+    "maximal-only",
+    "merge",
+    "merges",
+    "min-age",
+    "min-parents",
+    "minimal",
+    "name-only",
+    "name-status",
+    "no-abbrev",
+    "no-abbrev-commit",
+    "no-color",
+    "no-color-moved",
+    "no-color-moved-ws",
+    "no-commit-id",
+    "no-compact-summary",
+    "no-decorate",
+    "no-decorate-refs",
+    "no-decorate-refs-exclude",
+    "no-diff-merges",
+    "no-encode-email-headers",
+    "no-exit-code",
+    "no-expand-tabs",
+    "no-ext-diff",
+    "no-filter",
+    "no-find-copies-harder",
+    "no-follow",
+    "no-full-index",
+    "no-function-context",
+    "no-graph",
+    "no-i-still-use-this",
+    "no-ignore-matching-lines",
+    "no-indent-heuristic",
+    "no-kept-objects",
+    "no-mailmap",
+    "no-max-parents",
+    "no-merges",
+    "no-min-parents",
+    "no-notes",
+    "no-patch",
+    "no-prefix",
+    "no-quiet",
+    "no-relative",
+    "no-rename-empty",
+    "no-renames",
+    "no-show-signature",
+    "no-source",
+    "no-standard-notes",
+    "no-text",
+    "no-textconv",
+    "no-use-mailmap",
+    "no-walk",
+    "not",
+    "notes",
+    "numstat",
+    "objects",
+    "objects-edge",
+    "objects-edge-aggressive",
+    "oneline",
+    "output",
+    "output-indicator-context",
+    "output-indicator-new",
+    "output-indicator-old",
+    "parents",
+    "patch",
+    "patch-with-raw",
+    "patch-with-stat",
+    "patience",
+    "perl-regexp",
+    "pickaxe-all",
+    "pickaxe-regex",
+    "pretty",
+    "quiet",
+    "raw",
+    "reflog",
+    "regexp-ignore-case",
+    "relative",
+    "relative-date",
+    "remerge-diff",
+    "remotes",
+    "remove-empty",
+    "rename-empty",
+    "reverse",
+    "right-only",
+    "root",
+    "rotate-to",
+    "shortstat",
+    "show-linear-break",
+    "show-notes",
+    "show-notes-by-default",
+    "show-pulls",
+    "show-signature",
+    "simplify-by-decoration",
+    "simplify-merges",
+    "since",
+    "since-as-filter",
+    "single-worktree",
+    "skip",
+    "skip-to",
+    "source",
+    "sparse",
+    "src-prefix",
+    "standard-notes",
+    "stat",
+    "stat-count",
+    "stat-graph-width",
+    "stat-name-width",
+    "stat-width",
+    "stdin",
+    "submodule",
+    "summary",
+    "tags",
+    "text",
+    "textconv",
+    "topo-order",
+    "unified",
+    "unpacked",
+    "until",
+    "use-mailmap",
+    "verify-objects",
+    "walk-reflogs",
+    "word-diff",
+    "word-diff-regex",
+    "ws-error-highlight",
+];
+
+/// Every short option `git log` recognises, verified the same way (`-a` through `-Z`
+/// against the stock binary). Digits are absent because `-<n>` is `--max-count=<n>`
+/// and is consumed before the fallthrough that consults this.
+const GIT_LOG_SHORT_OPTS: &str = "abcghilmnpqrstuvwzBCDEFGILMOPRSUWX";
+
+/// Whether `git log`'s own parser would recognise `arg` — the test `builtin/log.c`
+/// makes implicitly by having consumed it before its leftover check.
+///
+/// A long option is matched by name with any `=<value>` cut off, which is git's
+/// granularity: `--pretty` and `--pretty=x` are the same table entry, while
+/// `--no-pretty` is a distinct one that git does not have. A short option is matched
+/// on its first letter only, because that is the one `parse_options` looks up before
+/// it either consumes an attached value (`-U5`) or re-emits the rest of the cluster.
+fn git_log_knows(arg: &str) -> bool {
+    if let Some(rest) = arg.strip_prefix("--") {
+        let name = rest.split('=').next().unwrap_or(rest);
+        return GIT_LOG_LONG_OPTS.binary_search(&name).is_ok();
+    }
+    match arg.strip_prefix('-').and_then(|rest| rest.chars().next()) {
+        Some(c) => GIT_LOG_SHORT_OPTS.contains(c),
+        None => false,
+    }
+}
+
 /// The terminal width git assumes for `--stat` when stdout is not a terminal.
 /// git's `MINIMUM_ABBREV`: no `--abbrev` may cut an id shorter than this.
 const MINIMUM_ABBREV: usize = 4;
@@ -1128,6 +1403,16 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                         return Ok(ExitCode::from(128));
                     }
                 }
+            } else if !git_log_knows(a) {
+                // git has no such option, so this is git's own refusal rather than
+                // an unported feature: `parse_options()` and `setup_revisions()`
+                // both leave the token behind and `cmd_log_init_finish()` reports
+                // the first survivor (`builtin/log.c:320`). Options git *does* have
+                // fall through to the gap message below, which is the truthful
+                // answer for them — borrowing git's wording there would claim git
+                // rejects an option it accepts.
+                eprintln!("fatal: unrecognized argument: {a}");
+                return Ok(ExitCode::from(128));
             } else {
                 bail!("unsupported flag {a:?}");
             }
@@ -8252,6 +8537,66 @@ fn trim_end_ws(mut s: &[u8]) -> &[u8] {
         }
     }
     s
+}
+
+#[cfg(test)]
+mod option_surface_tests {
+    use super::{git_log_knows, GIT_LOG_LONG_OPTS};
+
+    /// The table has to stay sorted, because [`git_log_knows`] binary-searches it.
+    #[test]
+    fn the_long_option_table_is_sorted_and_bare() {
+        let mut sorted = GIT_LOG_LONG_OPTS.to_vec();
+        sorted.sort_unstable();
+        assert_eq!(sorted.as_slice(), GIT_LOG_LONG_OPTS);
+        assert!(GIT_LOG_LONG_OPTS.iter().all(|n| !n.starts_with("--")));
+    }
+
+    /// The whole point of the table: a name git has keeps this port's own
+    /// "unsupported flag" gap message, while a name git does not have gets git's
+    /// `unrecognized argument`. Answering both the same way means either lying about
+    /// git rejecting an option it accepts, or hiding an unported one behind git's
+    /// wording. Each expectation below was run against stock git 2.55.0.
+    #[test]
+    fn a_real_option_is_known_and_an_invented_one_is_not() {
+        // Recognised by `setup_revisions()`/`diff_opt_parse()` but not implemented
+        // here, so the honest gap message is the right answer.
+        for real in ["--cherry-pick", "--dirstat", "--color-words", "--ita-visible-in-index"] {
+            assert!(git_log_knows(real), "{real} is a git log option");
+        }
+        for invented in ["--zzbogus", "--zzbogus=x", "--cherry-picks", "--no-zzbogus"] {
+            assert!(!git_log_knows(invented), "{invented} is not a git log option");
+        }
+    }
+
+    /// The name is matched with any `=<value>` cut off — git's own granularity, since
+    /// `parse_long_opt()` looks the name up before it splits the value — but `--no-`
+    /// is part of the name, so a negation git does not have stays unknown.
+    #[test]
+    fn a_value_and_a_negation_are_two_different_questions() {
+        assert!(git_log_knows("--pretty"));
+        assert!(git_log_knows("--pretty=oneline"));
+        // `--no-pretty` is absent from git's table; stock reports it unrecognized.
+        assert!(!git_log_knows("--no-pretty"));
+        // `--no-merges` is a table entry in its own right.
+        assert!(git_log_knows("--no-merges"));
+    }
+
+    /// A short option is looked up on its first letter, because that is what
+    /// `parse_options` resolves before it takes an attached value or re-emits the
+    /// rest of the cluster. Stock: `git log -Zp` reports `-Zp`, `git log -o5`
+    /// reports `-o5`, and `git log -U5` is a context width.
+    #[test]
+    fn a_short_option_is_judged_by_its_first_letter() {
+        assert!(git_log_knows("-U5"));
+        assert!(git_log_knows("-p"));
+        assert!(!git_log_knows("-Zp"));
+        assert!(!git_log_knows("-o5"));
+        // Degenerate tokens git also reports as unrecognized arguments.
+        assert!(!git_log_knows("-"));
+        assert!(!git_log_knows("---"));
+        assert!(!git_log_knows("--=x"));
+    }
 }
 
 #[cfg(test)]

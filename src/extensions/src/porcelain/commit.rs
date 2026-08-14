@@ -2233,19 +2233,31 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
 }
 
 /// `--pathspec-from-file=<file>` — the pathspec list read from a file, or from
-/// stdin for `-`. Entries are separated by `NUL` with `--pathspec-file-nul` and
-/// by newlines otherwise; git also drops a trailing `\r` from the line form.
+/// stdin for `-`. A port of `parse_pathspec_file()` (pathspec.c), shared by every
+/// verb that offers the option: `add`, `checkout`, `commit`, `rm` and `stash` all
+/// call git's one function, so they call one here too.
+///
+/// Entries are separated by `NUL` with `--pathspec-file-nul` (`strbuf_getline_nul`)
+/// and by newlines otherwise (`strbuf_getline`, which also drops a trailing `\r`).
+/// In the line form only, a line that opens with `"` is C-unquoted.
+///
+/// A blank line is a real, empty entry, not a skipped one: git hands the list
+/// straight to `parse_pathspec()`, which dies on the first empty element. That check
+/// belongs here rather than in each caller because every caller reaches it through
+/// this one function. It runs after the whole file is read, so a badly-quoted line
+/// anywhere reports first — `unquote_c_style()` fails inside the read loop while
+/// `parse_pathspec()` only sees the finished list.
 pub(super) fn read_pathspec_file(src: &str, nul: bool) -> Result<Vec<String>> {
     let raw = if src == "-" {
         let mut buf = Vec::new();
         std::io::Read::read_to_end(&mut std::io::stdin(), &mut buf)?;
         buf
     } else {
-        // `parse_pathspec_file()` (parse-options-cb.c) reads the list with
-        // `die_errno(_("could not open '%s' for reading"), file)`, so the failure
-        // is git's `fatal:` at 128 — not this port's own `zvcs: <cmd>:` line at
-        // 1, which is what a caller testing `$?` for 128 would miss. `strerror()`
-        // has no Rust `(os error <n>)` tail, so the tail is trimmed off.
+        // `parse_pathspec_file()` opens the list with `xfopen()`, whose read-mode
+        // failure is `die_errno(_("could not open '%s' for reading"), path)`
+        // (wrapper.c) — git's `fatal:` at 128, not this port's own `zvcs: <cmd>:`
+        // line at 1, which is what a caller testing `$?` for 128 would miss.
+        // `strerror()` has no Rust `(os error <n>)` tail, so the tail is trimmed.
         std::fs::read(src).map_err(|e| {
             let text = e.to_string();
             let reason = text.split(" (os error ").next().unwrap_or(&text);
@@ -2253,14 +2265,96 @@ pub(super) fn read_pathspec_file(src: &str, nul: bool) -> Result<Vec<String>> {
         })?
     };
     let sep = if nul { b'\0' } else { b'\n' };
-    Ok(raw
-        .split(|&b| b == sep)
-        .map(|s| {
-            let s = if !nul { s.strip_suffix(b"\r").unwrap_or(s) } else { s };
-            String::from_utf8_lossy(s).into_owned()
-        })
-        .filter(|s| !s.is_empty())
-        .collect())
+    let mut out = Vec::new();
+    // `getline` yields a line per separator and one more for a final unterminated
+    // tail, so a trailing separator closes the last line instead of opening an empty
+    // one — and an empty file has no lines at all.
+    let body = raw.strip_suffix(&[sep]).unwrap_or(&raw);
+    if !raw.is_empty() {
+        for chunk in body.split(|&b| b == sep) {
+            let line = if nul { chunk } else { chunk.strip_suffix(b"\r").unwrap_or(chunk) };
+            if !nul && line.first() == Some(&b'"') {
+                match unquote_c_style(line) {
+                    Some(v) => out.push(String::from_utf8_lossy(&v).into_owned()),
+                    None => {
+                        return Err(crate::fatal::die(format!(
+                            "line is badly quoted: {}",
+                            String::from_utf8_lossy(line)
+                        )))
+                    }
+                }
+            } else {
+                out.push(String::from_utf8_lossy(line).into_owned());
+            }
+        }
+    }
+    if out.iter().any(String::is_empty) {
+        return Err(crate::fatal::die(
+            "empty string is not a valid pathspec. \
+             please use . instead if you meant to match all paths",
+        ));
+    }
+    Ok(out)
+}
+
+/// Port of `unquote_c_style()` (quote.c) for one double-quoted line; `None` is its
+/// `-1`, which `parse_pathspec_file()` turns into `line is badly quoted: <line>`.
+///
+/// Everything up to the first unescaped `"` is the result and whatever follows the
+/// closing quote is ignored, because git passes a NULL `endp` and never looks. The
+/// octal escape is the strict `\NNN` form: exactly three digits, and a leading digit
+/// above `3` is rejected rather than wrapped, since it would overflow a byte.
+///
+/// git walks a NUL-terminated string, so a read past the end lands on `\0`, which
+/// no arm accepts — reading out of range as `0` here reproduces that exactly, and
+/// an embedded NUL byte truncates the same way `strcspn()` does.
+fn unquote_c_style(line: &[u8]) -> Option<Vec<u8>> {
+    let at = |i: usize| line.get(i).copied().unwrap_or(0);
+    if at(0) != b'"' {
+        return None;
+    }
+    let mut i = 1;
+    let mut out = Vec::with_capacity(line.len());
+    loop {
+        // `strcspn(quoted, "\"\\")`: copy through to the next delimiter.
+        while !matches!(at(i), b'"' | b'\\' | 0) {
+            out.push(at(i));
+            i += 1;
+        }
+        let delim = at(i);
+        i += 1;
+        match delim {
+            b'"' => return Some(out),
+            b'\\' => {}
+            _ => return None,
+        }
+        let esc = at(i);
+        i += 1;
+        let byte = match esc {
+            b'a' => 0x07,
+            b'b' => 0x08,
+            b'f' => 0x0c,
+            b'n' => b'\n',
+            b'r' => b'\r',
+            b't' => b'\t',
+            b'v' => 0x0b,
+            b'\\' | b'"' => esc,
+            b'0'..=b'3' => {
+                let mut ac = (esc - b'0') << 6;
+                for shift in [3, 0] {
+                    let d = at(i);
+                    i += 1;
+                    if !d.is_ascii_digit() || d > b'7' {
+                        return None;
+                    }
+                    ac |= (d - b'0') << shift;
+                }
+                ac
+            }
+            _ => return None,
+        };
+        out.push(byte);
+    }
 }
 
 /// Open the on-disk index, or an empty one when the repo has never had a file
@@ -3874,4 +3968,101 @@ fn wt_status_locate_end(s: &[u8], comment: &str) -> usize {
         return p + 1;
     }
     s.len()
+}
+
+#[cfg(test)]
+mod pathspec_file_tests {
+    use super::{read_pathspec_file, unquote_c_style};
+
+    fn unquoted(line: &str) -> Option<String> {
+        unquote_c_style(line.as_bytes()).map(|v| String::from_utf8(v).expect("ascii fixtures"))
+    }
+
+    /// `parse_pathspec_file()` C-unquotes a line that opens with `"`, and the
+    /// decoding stops at the closing quote because git passes a NULL `endp` and
+    /// never looks at what follows. Verified against stock git 2.55.0, where a file
+    /// holding `"a b"junk` stages `a b`.
+    #[test]
+    fn a_quoted_line_decodes_and_ignores_its_tail() {
+        assert_eq!(unquoted(r#""a b""#).as_deref(), Some("a b"));
+        assert_eq!(unquoted(r#""a b"junk"#).as_deref(), Some("a b"));
+        assert_eq!(unquoted(r#""tab\there""#).as_deref(), Some("tab\there"));
+        assert_eq!(unquoted(r#""q\"q""#).as_deref(), Some("q\"q"));
+    }
+
+    /// The octal escape is the strict three-digit form with a leading digit of `0`
+    /// through `3`; every other shape is `-1`, which the caller turns into
+    /// `line is badly quoted`. Stock git 2.55.0 accepts `"\101"` and refuses `"\1"`,
+    /// `"\41"` and `"\501"` — the last because a first digit above `3` would
+    /// overflow the byte. A port that accepted one or two digits, or any first digit
+    /// up to `7`, silently invented pathspecs git rejects.
+    #[test]
+    fn the_octal_escape_is_exactly_three_digits_and_fits_a_byte() {
+        assert_eq!(unquoted(r#""\101""#).as_deref(), Some("A"));
+        assert_eq!(unquoted(r#""\1""#), None);
+        assert_eq!(unquoted(r#""\41""#), None);
+        assert_eq!(unquoted(r#""\501""#), None);
+    }
+
+    /// The other `goto error` paths: an unterminated line, an escape git has no arm
+    /// for, and a trailing backslash that runs off the end of the string. git walks a
+    /// NUL-terminated buffer, so running off the end lands on a byte no arm accepts.
+    #[test]
+    fn a_malformed_quoting_is_refused_rather_than_guessed() {
+        assert_eq!(unquoted(r#""unterminated"#), None);
+        assert_eq!(unquoted(r#""bad\q""#), None);
+        assert_eq!(unquoted(r#""trailing\"#), None);
+        // Not quoted at all: the caller only asks about lines opening with `"`.
+        assert_eq!(unquoted("plain"), None);
+    }
+
+    /// `strbuf_getline` yields one line per separator plus a final unterminated tail,
+    /// so a trailing newline closes the last line instead of opening an empty one and
+    /// an empty file has no lines at all. An interior blank line *is* an entry, and
+    /// `parse_pathspec()` dies on it — which is why `read_pathspec_file` carries that
+    /// check rather than each of its five callers. Verified against stock git 2.55.0:
+    /// `printf 'A\n'` stages `A`, `printf 'A\n\n'` dies, an empty file is a no-op.
+    #[test]
+    fn blank_lines_are_entries_but_a_trailing_separator_is_not() {
+        let dir = std::env::temp_dir().join(format!("zvcs-pathspec-file-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch directory");
+        let read = |body: &str| {
+            let path = dir.join("list");
+            std::fs::write(&path, body).expect("scratch file");
+            read_pathspec_file(&path.to_string_lossy(), false)
+        };
+
+        assert_eq!(read("A\n").expect("one entry"), vec!["A".to_string()]);
+        assert_eq!(read("A").expect("one entry"), vec!["A".to_string()]);
+        assert_eq!(read("").expect("no entries"), Vec::<String>::new());
+        assert_eq!(
+            read("A\n\n").unwrap_err().to_string(),
+            "empty string is not a valid pathspec. \
+             please use . instead if you meant to match all paths"
+        );
+        // A badly quoted line fails inside the read loop, so it reports before the
+        // empty-entry check ever sees the finished list.
+        assert_eq!(
+            read("\n\"bad\n").unwrap_err().to_string(),
+            r#"line is badly quoted: "bad"#
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A missing file is `xfopen()`'s `die_errno()`, which is git's `fatal:` at 128
+    /// rather than this port's own `zvcs: <cmd>:` line at 1 — and `strerror()` has no
+    /// Rust `(os error <n>)` tail to carry.
+    #[test]
+    fn a_missing_file_reports_the_way_git_does() {
+        let missing = std::env::temp_dir()
+            .join(format!("zvcs-absent-{}", std::process::id()))
+            .join("nope");
+        let err = read_pathspec_file(&missing.to_string_lossy(), false).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!("could not open '{}' for reading: No such file or directory", missing.display())
+        );
+        assert!(err.downcast_ref::<crate::fatal::Fatal>().is_some(), "carries git's exit 128");
+    }
 }

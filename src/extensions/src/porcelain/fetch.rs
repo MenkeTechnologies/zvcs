@@ -795,6 +795,20 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
     // local ref and print a set nobody asked for, and with submodule recursion there would be no fetch
     // for the submodules to recurse into.
     if opts.negotiate_only {
+        // `cmd_fetch` resolves the remote before it looks at the tips, so a run with
+        // no remote to negotiate with is refused for that reason first. `--all` holds
+        // a remote only when it collected exactly one; otherwise, and with no
+        // positional, the arm that runs is `remote_get(NULL)` — note that `argc == 0`
+        // is tested ahead of `--multiple`, so a bare `--multiple` lands there too.
+        let no_remote = if all {
+            repo.remote_names().len() != 1
+        } else {
+            positionals.is_empty() && default_fetch_remote_missing(&repo)
+        };
+        if no_remote {
+            eprintln!("fatal: must supply remote when using --negotiate-only");
+            return Ok(ExitCode::from(128));
+        }
         // The check is on the tips the transport ends up with, which `set_transport_options()` also
         // fills from `remote.<name>.negotiationRestrict`, so a configured remote can satisfy it alone.
         let configured_tips = {
@@ -969,6 +983,22 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
             }
         } else {
             let name = positionals.first().map(|s| BStr::new(*s));
+            // `cmd_fetch`'s no-argument arm is `remote = remote_get(NULL)`, which
+            // comes back NULL when the name it settles on — `branch.<current>.remote`,
+            // else the sole configured remote, else `origin` — has no URL. git then
+            // reaches neither `fetch_one()` nor an error but the `fetch_multiple()`
+            // arm, over a list nothing was ever added to: the loop runs zero times
+            // and the command succeeds without a word. Three options are refused
+            // there first, because none of them means anything with no remote.
+            if name.is_none() && default_fetch_remote_missing(&repo) {
+                if opts.atomic {
+                    crate::git_fatal!("--atomic can only be used when fetching from one remote");
+                }
+                if read_stdin {
+                    crate::git_fatal!("--stdin can only be used when fetching from one remote");
+                }
+                return Ok(());
+            }
             let mut refspecs: Vec<&str> = positional_specs.iter().map(String::as_str).collect();
             refspecs.extend(stdin_specs.iter().map(String::as_str));
             match fetch_one(
@@ -1605,6 +1635,20 @@ pub(super) fn server_options_for(
                 })
         })
         .unwrap_or_default()
+}
+
+/// Whether git's `remote_get(NULL)` would come back NULL here — no remote is named
+/// by `branch.<current>.remote`, there is no sole configured remote to fall back on,
+/// and `origin` is not configured either.
+///
+/// Only that one gitoxide error stands for git's NULL. The rest (an unparsable URL,
+/// a malformed refspec on a remote that *is* configured) are failures git reaches
+/// with a remote in hand and dies on, so they must keep unwinding.
+fn default_fetch_remote_missing(repo: &gix::Repository) -> bool {
+    matches!(
+        repo.find_fetch_remote(None),
+        Err(gix::remote::find::for_fetch::Error::ExactlyOneRemoteNotAvailable)
+    )
 }
 
 /// Run the fetch pipeline for a single remote and print its summary.

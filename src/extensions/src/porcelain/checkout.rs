@@ -87,7 +87,6 @@
 
 use anyhow::{anyhow, bail, Result};
 use std::collections::{HashMap, HashSet};
-use std::io::Read as _;
 use std::process::ExitCode;
 use std::sync::atomic::AtomicBool;
 
@@ -480,7 +479,7 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
         if new_branch.is_some() || orphan.is_some() || writeout_stage.is_some() {
             crate::git_fatal!("--pathspec-from-file cannot be combined with branch creation or --ours/--theirs");
         }
-        let specs = read_pathspec_file(&file, pathspec_file_nul)?;
+        let specs = super::commit::read_pathspec_file(&file, pathspec_file_nul)?;
         let refs: Vec<&str> = specs.iter().map(String::as_str).collect();
         return match pre.len() {
             0 => restore_from_index(&repo, &refs, false, quiet),
@@ -1378,88 +1377,6 @@ fn unique_remote_branch(repo: &gix::Repository, name: &str) -> Result<Dwim> {
             Ok(Dwim::Many { count: n })
         }
     }
-}
-
-// --- `--pathspec-from-file` ------------------------------------------------
-
-/// Read pathspecs from `file` (or stdin for `-`). With `nul`, entries are split
-/// on NUL and taken verbatim; otherwise on newlines (trailing `\r` stripped,
-/// blank lines skipped) and a C-quoted line (`"…"`) is unquoted — matching git's
-/// `parse_pathspec_from_file` / `strbuf_getline` + `unquote_c_style`.
-fn read_pathspec_file(file: &str, nul: bool) -> Result<Vec<String>> {
-    let raw = if file == "-" {
-        let mut buf = Vec::new();
-        std::io::stdin().read_to_end(&mut buf)?;
-        buf
-    } else {
-        std::fs::read(file)?
-    };
-
-    if nul {
-        return Ok(raw
-            .split(|&b| b == 0)
-            .filter(|s| !s.is_empty())
-            .map(|s| String::from_utf8_lossy(s).into_owned())
-            .collect());
-    }
-
-    let mut out = Vec::new();
-    for line in raw.split(|&b| b == b'\n') {
-        let line = line.strip_suffix(b"\r").unwrap_or(line);
-        if line.is_empty() {
-            continue;
-        }
-        let spec = if line.first() == Some(&b'"') {
-            unquote_c_style(line)?
-        } else {
-            String::from_utf8_lossy(line).into_owned()
-        };
-        out.push(spec);
-    }
-    Ok(out)
-}
-
-/// Port of git's `unquote_c_style` (quote.c) for a double-quoted pathspec line:
-/// `\a \b \f \n \r \t \v \\ \"` and up to three octal digits `\NNN`.
-fn unquote_c_style(quoted: &[u8]) -> Result<String> {
-    let mut out: Vec<u8> = Vec::with_capacity(quoted.len());
-    let mut it = quoted[1..].iter().copied().peekable();
-    while let Some(c) = it.next() {
-        match c {
-            b'"' => return Ok(String::from_utf8_lossy(&out).into_owned()),
-            b'\\' => {
-                let Some(e) = it.next() else {
-                    crate::git_fatal!("unterminated quoted pathspec");
-                };
-                match e {
-                    b'a' => out.push(0x07),
-                    b'b' => out.push(0x08),
-                    b'f' => out.push(0x0c),
-                    b'n' => out.push(b'\n'),
-                    b'r' => out.push(b'\r'),
-                    b't' => out.push(b'\t'),
-                    b'v' => out.push(0x0b),
-                    b'\\' | b'"' => out.push(e),
-                    b'0'..=b'7' => {
-                        let mut val = (e - b'0') as u32;
-                        for _ in 0..2 {
-                            match it.peek() {
-                                Some(&d @ b'0'..=b'7') => {
-                                    val = val * 8 + (d - b'0') as u32;
-                                    it.next();
-                                }
-                                _ => break,
-                            }
-                        }
-                        out.push(val as u8);
-                    }
-                    _ => crate::git_fatal!("invalid escape in quoted pathspec"),
-                }
-            }
-            _ => out.push(c),
-        }
-    }
-    crate::git_fatal!("missing closing quote in pathspec")
 }
 
 /// Restore `paths` in the worktree from the current index (index left unchanged;

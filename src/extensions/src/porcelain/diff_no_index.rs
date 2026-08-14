@@ -1021,19 +1021,47 @@ fn render_non_patch(out: &mut Vec<u8>, rows: &[Row], opts: &Opts) {
                     )
                     .as_bytes(),
                 );
+                // `show_rename_copy()` closes with `show_mode_change(opt, p, 0)`: the
+                // moved file may also have changed mode, and the name is left off
+                // because the line above just gave both spellings of it.
+                show_mode_change(out, row, false);
                 continue;
             }
             match (row.a_exists, row.b_exists) {
-                (false, true) => out.extend_from_slice(
-                    format!(" create mode {:06o} {}\n", row.b_mode, row.b_name).as_bytes(),
-                ),
-                (true, false) => out.extend_from_slice(
-                    format!(" delete mode {:06o} {}\n", row.a_mode, row.a_name).as_bytes(),
-                ),
-                _ => {}
+                (false, true) => {
+                    out.extend_from_slice(format!(" create mode {:06o} ", row.b_mode).as_bytes());
+                    out.extend_from_slice(&super::diff::quoted_name(&row.b_name));
+                    out.push(b'\n');
+                }
+                (true, false) => {
+                    out.extend_from_slice(format!(" delete mode {:06o} ", row.a_mode).as_bytes());
+                    out.extend_from_slice(&super::diff::quoted_name(&row.a_name));
+                    out.push(b'\n');
+                }
+                // `diff_summary()`'s `default:` arm — a pair that is on both sides
+                // reports only the mode, and only when it moved.
+                _ => show_mode_change(out, row, true),
             }
         }
     }
+}
+
+/// `show_mode_change()` (diff.c): the `--summary` line for a file whose mode moved.
+/// Both sides must have a mode — a create or delete has already said everything
+/// there is to say — and `show_name` is what separates the standalone line from the
+/// one that trails a rename, whose name was printed by the rename line itself.
+fn show_mode_change(out: &mut Vec<u8>, row: &Row, show_name: bool) {
+    if row.a_mode == 0 || row.b_mode == 0 || row.a_mode == row.b_mode {
+        return;
+    }
+    out.extend_from_slice(
+        format!(" mode change {:06o} => {:06o}", row.a_mode, row.b_mode).as_bytes(),
+    );
+    if show_name {
+        out.push(b' ');
+        out.extend_from_slice(&super::diff::quoted_name(&row.b_name));
+    }
+    out.push(b'\n');
 }
 
 #[cfg(test)]
@@ -1165,6 +1193,75 @@ mod tests {
             rendered(&rows, &o),
             " delete mode 100644 da/only_a.txt\n create mode 100644 db/only_b.txt\n"
         );
+    }
+
+    /// `diff_summary()`'s `default:` arm is `show_mode_change(opt, p, !p->score)`, so
+    /// a pair present on both sides reports its mode and nothing else — and only when
+    /// the mode actually moved. Stock git 2.55.0 over two directories whose `m`
+    /// differs only in its executable bit:
+    ///
+    /// ```text
+    /// $ git diff --no-index --summary x y
+    ///  mode change 100644 => 100755 y/m
+    /// ```
+    ///
+    /// Dropping the both-sides case — which is the shape this port shipped — prints
+    /// nothing at all for that pair.
+    #[test]
+    fn summary_reports_a_mode_change_on_a_pair_that_stayed() {
+        let rows = [Row {
+            a_name: BString::from("x/m"),
+            b_name: BString::from("y/m"),
+            added: 0,
+            deleted: 0,
+            binary: false,
+            a_exists: true,
+            b_exists: true,
+            a_mode: 0o100644,
+            b_mode: 0o100755,
+            a_oid: None,
+            b_oid: None,
+            status: b'M',
+            score: 0,
+        }];
+        let o = opts(Format { summary: true, ..Format::default() }, 7);
+        assert_eq!(rendered(&rows, &o), " mode change 100644 => 100755 y/m\n");
+    }
+
+    /// The same pair with an unchanged mode says nothing: `show_mode_change()` returns
+    /// before it writes when `p->one->mode == p->two->mode`.
+    #[test]
+    fn summary_is_silent_when_only_the_content_moved() {
+        let rows = [Row {
+            a_name: BString::from("x/m"),
+            b_name: BString::from("y/m"),
+            added: 1,
+            deleted: 1,
+            binary: false,
+            a_exists: true,
+            b_exists: true,
+            a_mode: 0o100644,
+            b_mode: 0o100644,
+            a_oid: None,
+            b_oid: None,
+            status: b'M',
+            score: 0,
+        }];
+        let o = opts(Format { summary: true, ..Format::default() }, 7);
+        assert_eq!(rendered(&rows, &o), "");
+    }
+
+    /// `show_file_mode_name()` writes the path through `quote_c_style()`, so a name
+    /// carrying a `"` comes out double-quoted and escaped. Stock git 2.55.0:
+    ///
+    /// ```text
+    ///  delete mode 100644 "x/we ird\"n.txt"
+    /// ```
+    #[test]
+    fn summary_c_quotes_a_name_that_needs_it() {
+        let rows = [one_sided("x/we ird\"n.txt", true, None)];
+        let o = opts(Format { summary: true, ..Format::default() }, 7);
+        assert_eq!(rendered(&rows, &o), " delete mode 100644 \"x/we ird\\\"n.txt\"\n");
     }
 
     /// `--raw` shows a real blob id exactly when rename detection got far enough

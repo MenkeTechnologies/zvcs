@@ -302,24 +302,13 @@ pub fn reflog(args: &[String]) -> Result<ExitCode> {
         Some("exists") => ("exists", &args[1..]),
         Some("delete") => ("delete", &args[1..]),
         Some("expire") => ("expire", &args[1..]),
-        // `parse_options()` answers help before the sub-command body runs, so
-        // these two print their blocks even though nothing behind them is ported.
-        Some(s @ ("write" | "drop")) => {
-            let block = if s == "drop" { DROP_USAGE } else { WRITE_USAGE };
-            if args[1..].iter().any(|a| super::asks_for_help(a, "")) {
-                return Ok(super::show_usage(block));
-            }
-            bail!(
-                "`reflog {s}` is not ported: the reflog write path (entry selectors, \
-                 relinking, --rewrite/--updateref, and the expire option set) has no \
-                 implementation yet"
-            )
-        }
+        Some("drop") => ("drop", &args[1..]),
+        Some("write") => ("write", &args[1..]),
         // Anything else is a `<ref>` for the implicit `show`.
         _ => ("show", args),
     };
 
-    let repo = gix::discover(".")?;
+    let mut repo = gix::discover(".")?;
     match sub {
         "show" => {
             // `cmd_reflog_show`'s table is empty, so no token is ever a value and
@@ -339,6 +328,8 @@ pub fn reflog(args: &[String]) -> Result<ExitCode> {
         "exists" => exists(&repo, rest),
         "delete" => delete_entries(&repo, rest),
         "expire" => expire_entries(&repo, rest),
+        "drop" => drop_reflogs(&repo, rest),
+        "write" => write_reflog(&mut repo, rest),
         _ => unreachable!("subcommand set is closed above"),
     }
 }
@@ -3925,6 +3916,404 @@ fn expire_entries(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+// ---------------------------------------------------------------------------
+// drop / write — whole reflogs, rather than entries within one
+// ---------------------------------------------------------------------------
+
+/// `cmd_reflog_drop`'s option table (builtin/reflog.c:358-363): two `OPT_BOOL`s,
+/// so both negate and neither takes a value.
+const DROP_OPTS: &[super::LongOpt] = &[
+    super::LongOpt { name: "all",             neg: true, arg: super::Arg::None },
+    super::LongOpt { name: "single-worktree", neg: true, arg: super::Arg::None },
+];
+
+/// `git reflog drop [--all [--single-worktree]] [<ref>...]` — port of
+/// `cmd_reflog_drop`, which removes whole reflogs rather than entries inside one.
+///
+/// A named ref goes through `repo_dwim_log()`, so the reflog has to belong to a ref
+/// that resolves: a log file left behind by a ref that no longer exists is not found
+/// by name. Each miss is an `error()` that does not stop the loop, and the `-1` it
+/// ORs into the return reaches `exit(3)` as 255.
+fn drop_reflogs(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
+    let mut all = false;
+    let mut single_worktree = false;
+    let mut refs: Vec<&str> = Vec::new();
+    let mut opts_done = false;
+    for a in args {
+        let s = a.as_str();
+        if opts_done {
+            refs.push(s);
+            continue;
+        }
+        if s == "--" || s == "--end-of-options" {
+            opts_done = true;
+            continue;
+        }
+        // This table has no short entry at all, so the first character behind a
+        // single `-` is the one `parse_short_opt()` tests for help.
+        if super::asks_for_help(s, "") {
+            return Ok(super::show_usage(DROP_USAGE));
+        }
+        if let Some(body) = s.strip_prefix("--") {
+            // Resolved on the whole body, `=<value>` included, as `parse_long_opt()`
+            // does — the lookup is what keeps `--all=x` from reaching the flag.
+            let (opt, unset) = match super::resolve_long(DROP_OPTS, body) {
+                super::Resolved::One(opt, unset) => (opt, unset),
+                super::Resolved::Ambiguous(first, second) => {
+                    return Ok(super::ambiguous_option(s, &first, &second, DROP_USAGE))
+                }
+                super::Resolved::Unknown => return Ok(super::unknown_option(s, DROP_USAGE)),
+            };
+            if body.contains('=') {
+                // `PARSE_OPT_ERROR` out of `get_value()`: one line and no block,
+                // naming the table entry however far it was abbreviated.
+                let shown = if unset { format!("no-{}", opt.name) } else { opt.name.to_string() };
+                eprintln!("error: option `{shown}' takes no value");
+                return Ok(ExitCode::from(129));
+            }
+            match opt.name {
+                "all" => all = !unset,
+                "single-worktree" => single_worktree = !unset,
+                _ => unreachable!("resolve_long only returns DROP_OPTS entries"),
+            }
+            continue;
+        }
+        if s.len() > 1 && s.starts_with('-') {
+            return Ok(super::unknown_option(s, DROP_USAGE));
+        }
+        refs.push(s);
+    }
+
+    if !refs.is_empty() && all {
+        // `usage(_("references specified along with --all"))` — the bare `usage()`,
+        // which prints the string it was handed rather than the option block.
+        eprintln!("usage: references specified along with --all");
+        return Ok(ExitCode::from(129));
+    }
+
+    if all {
+        // git collects from every worktree's ref store, or from this one alone under
+        // `--single-worktree`, and deletes what it collected from the *main* store.
+        // [`reflog_roots`] returns this worktree's private root and the shared one, so
+        // both settings produce the same set here and the flag changes nothing: what
+        // is missed is another worktree's per-worktree logs, which `--single-worktree`
+        // would have excluded anyway. Kept as the same walk `expire --all` uses.
+        let _ = single_worktree;
+        let mut names = Vec::new();
+        for root in reflog_roots(repo) {
+            collect_logs(&root, "", &mut names)?;
+        }
+        names.sort();
+        names.dedup();
+        for name in names {
+            remove_reflog_file(&log_file(repo, &name))?;
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    let mut ret = ExitCode::SUCCESS;
+    for name in refs {
+        let Some(full) = dwim_log(repo, name) else {
+            eprintln!("error: reflog could not be found: '{name}'");
+            ret = ExitCode::from(255);
+            continue;
+        };
+        remove_reflog_file(&log_file(repo, &full))?;
+    }
+    Ok(ret)
+}
+
+/// `repo_dwim_log()` (refs.c:840-879): the first of git's rev-parse spellings of
+/// `name` that both resolves as a reference and has a reflog. When the reference
+/// resolves somewhere else and only the target carries a log, that target is the
+/// answer instead — which is how a symref's log is found through its own name.
+fn dwim_log(repo: &gix::Repository, name: &str) -> Option<String> {
+    let substituted = substitute_branch_name(repo, name);
+    let name = substituted.as_deref().unwrap_or(name);
+    // `ref_rev_parse_rules` (refs.c), in order.
+    const RULES: &[&str] = &[
+        "",
+        "refs/",
+        "refs/tags/",
+        "refs/heads/",
+        "refs/remotes/",
+    ];
+    let candidates = RULES
+        .iter()
+        .map(|prefix| format!("{prefix}{name}"))
+        .chain(std::iter::once(format!("refs/remotes/{name}/HEAD")));
+    for path in candidates {
+        // `refs_resolve_ref_unsafe(refs, path.buf, RESOLVE_REF_READING, …)`: the
+        // spelling has to name a reference that exists, not merely a log file, and a
+        // symref chain that dead-ends counts as not existing.
+        let Some(resolved) = resolve_ref_reading(repo, &path) else {
+            continue;
+        };
+        if log_file(repo, &path).is_file() {
+            return Some(path);
+        }
+        // `else if (strcmp(ref, path.buf) && refs_reflog_exists(refs, ref))`.
+        if resolved != path && log_file(repo, &resolved).is_file() {
+            return Some(resolved);
+        }
+    }
+    None
+}
+
+/// `substitute_branch_name()` (refs.c:826-841): the name `repo_dwim_log()` really
+/// looks up, when `repo_interpret_branch_name()` rewrites the whole spec. `None`
+/// leaves the spec as typed.
+///
+/// Two of the three rewrites are here: the bare `@` that `interpret_empty_at()` turns
+/// into `HEAD`, and `@{-<n>}`, which `interpret_nth_prior_checkout()` reads off HEAD's
+/// own log. The third, `@{upstream}`/`@{push}`, is not — it resolves through the
+/// branch's remote configuration and carries its own family of `die()`s, so
+/// `git reflog drop @{u}` still reports the spec as a reflog it could not find rather
+/// than git's `no upstream configured for branch '<name>'`.
+fn substitute_branch_name(repo: &gix::Repository, name: &str) -> Option<String> {
+    if name == "@" {
+        return Some("HEAD".to_owned());
+    }
+    // The rewrite only applies when it consumed the entire spec; `@{-1}~2` keeps the
+    // remainder, which is not a reflog name anyway.
+    let (nth, used) = super::check_ref_format::parse_nth_prior(name.as_bytes())?;
+    if used != name.len() {
+        return None;
+    }
+    let branch = super::check_ref_format::nth_branch_switch(repo, nth)?;
+    String::from_utf8(branch).ok()
+}
+
+/// `refs_resolve_ref_unsafe(…, RESOLVE_REF_READING, …)`: the name `path` finally
+/// resolves to after following symrefs, or `None` when `path` names no reference or
+/// the chain does not end at an object.
+///
+/// gitoxide's `try_find` takes a *partial* name and will fall back to `refs/tags/`,
+/// `refs/heads/` and `refs/remotes/` on its own. This caller is already walking git's
+/// rule list itself, so a lookup that answered under a different name is discarded —
+/// otherwise every candidate would resolve and the first one would always win.
+fn resolve_ref_reading(repo: &gix::Repository, path: &str) -> Option<String> {
+    // git's `SYMREF_MAXDEPTH`.
+    const MAX_DEPTH: usize = 5;
+    let mut name = path.to_owned();
+    for _ in 0..MAX_DEPTH {
+        let found = repo.refs.try_find(name.as_str()).ok().flatten()?;
+        if found.name.as_bstr() != name.as_str() {
+            return None;
+        }
+        match found.target {
+            gix::refs::Target::Object(_) => return Some(name),
+            gix::refs::Target::Symbolic(next) => name = next.as_bstr().to_str_lossy().into_owned(),
+        }
+    }
+    None
+}
+
+/// `refs_delete_reflog()` for the files backend: unlink the log and then take the
+/// directories it left empty, up to and including `logs` itself.
+fn remove_reflog_file(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    }
+    let mut dir = path.parent();
+    while let Some(d) = dir {
+        if std::fs::remove_dir(d).is_err() {
+            break;
+        }
+        if d.file_name().is_some_and(|n| n == "logs") {
+            break;
+        }
+        dir = d.parent();
+    }
+    Ok(())
+}
+
+/// `git reflog write <ref> <old-oid> <new-oid> <message>` — port of
+/// `cmd_reflog_write`, which appends one entry to a reflog and touches nothing else:
+/// the reference itself is neither created nor moved, and the two ids are recorded
+/// exactly as given rather than read off the ref.
+fn write_reflog(repo: &mut gix::Repository, args: &[String]) -> Result<ExitCode> {
+    // The table is `OPT_END()` alone, so every dashed token is unknown — except the
+    // help test, which `parse_options_step()` makes before it consults the table.
+    let mut operands: Vec<&str> = Vec::new();
+    let mut opts_done = false;
+    for a in args {
+        let s = a.as_str();
+        if opts_done {
+            operands.push(s);
+            continue;
+        }
+        if s == "--" || s == "--end-of-options" {
+            opts_done = true;
+            continue;
+        }
+        if super::asks_for_help(s, "") {
+            return Ok(super::show_usage(WRITE_USAGE));
+        }
+        if s.len() > 1 && s.starts_with('-') {
+            return Ok(super::unknown_option(s, WRITE_USAGE));
+        }
+        operands.push(s);
+    }
+    // `usage_with_options()`, which unlike `-h` writes to stderr.
+    if operands.len() != 4 {
+        eprint!("{WRITE_USAGE}");
+        return Ok(ExitCode::from(129));
+    }
+    let (name, old_spec, new_spec, message) = (operands[0], operands[1], operands[2], operands[3]);
+
+    if !is_root_ref(name) && !super::check_ref_format::check_refname_format(name.as_bytes(), 0) {
+        crate::git_fatal!("invalid reference name: {name}");
+    }
+
+    let old = parse_write_oid(repo, old_spec, "old")?;
+    let new = parse_write_oid(repo, new_spec, "new")?;
+
+    // `git_committer_info(0)`: `<name> <<email>> <seconds> <tz>`, the same string the
+    // reflog writer would have filled in on its own. The non-strict form, so a machine
+    // with no `user.*` gets the synthesized identity rather than a refusal.
+    crate::ensure_reflog_identity(repo);
+    let committer = repo
+        .committer()
+        .transpose()?
+        .ok_or_else(|| anyhow!("no committer identity available for the reflog entry"))?;
+    let mut line = format!(
+        "{old} {new} {} <{}> {}",
+        committer.name.to_str_lossy(),
+        committer.email.to_str_lossy(),
+        committer.time,
+    )
+    .into_bytes();
+    // `log_ref_write_fd()` adds the tab and the message only when the normalized
+    // message has something in it.
+    let message = normalize_reflog_message(message);
+    if !message.is_empty() {
+        line.push(b'\t');
+        line.extend_from_slice(message.as_bytes());
+    }
+    line.push(b'\n');
+
+    // `ref_transaction_commit()` locks the ref before it appends, so a name that
+    // collides with the reference namespace is refused there rather than by the file
+    // system. `refs_verify_refname_available()` reports the *other* ref by name.
+    if let Some(other) = df_conflicting_ref(repo, name)? {
+        crate::git_fatal!(
+            "cannot commit reflog update: cannot lock ref '{name}': \
+             '{other}' exists; cannot create '{name}'"
+        );
+    }
+    let path = log_file(repo, name);
+    // With no ref in the way it can still be the *logs* that collide: a directory
+    // where this entry's file belongs holds some other ref's log.
+    if path.is_dir() {
+        crate::git_fatal!(
+            "cannot commit reflog update: cannot update the ref '{name}': \
+             there are still logs under '{}'",
+            git_path_display(repo, &path)
+        );
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    use std::io::Write as _;
+    let mut file = std::fs::OpenOptions::new().create(true).append(true).open(&path)?;
+    file.write_all(&line)?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `refs_verify_refname_available()`: the existing reference that stops `name` from
+/// being a reference too, because one of them would have to be a directory the other
+/// is a file in. git checks the prefixes of `name` first and then the names under it.
+fn df_conflicting_ref(repo: &gix::Repository, name: &str) -> Result<Option<String>> {
+    let mut names: Vec<String> = Vec::new();
+    for reference in repo.references()?.all()?.filter_map(Result::ok) {
+        names.push(reference.name().as_bstr().to_str_lossy().into_owned());
+    }
+    names.sort();
+    let mut prefix_end = 0;
+    while let Some(slash) = name[prefix_end..].find('/') {
+        prefix_end += slash;
+        let prefix = &name[..prefix_end];
+        if names.iter().any(|n| n == prefix) {
+            return Ok(Some(prefix.to_owned()));
+        }
+        prefix_end += 1;
+    }
+    let under = format!("{name}/");
+    Ok(names.into_iter().find(|n| n.starts_with(&under)))
+}
+
+/// `git_path()`'s rendering of a path inside the git directory. `setup.c` has already
+/// moved to the top of the work tree by the time a message is printed, so an ordinary
+/// repository shows its git directory as `.git` however deep the command was run.
+fn git_path_display(repo: &gix::Repository, path: &Path) -> String {
+    let git_dir = repo.git_dir();
+    let shown = match repo.workdir() {
+        Some(top) if git_dir == top.join(".git") => Path::new(".git"),
+        _ => git_dir,
+    };
+    match path.strip_prefix(git_dir) {
+        Ok(rest) => shown.join(rest).display().to_string(),
+        Err(_) => path.display().to_string(),
+    }
+}
+
+/// One of `reflog write`'s two object arguments: a full hex id, which must name an
+/// object that is present unless it is the null id.
+fn parse_write_oid(repo: &gix::Repository, spec: &str, which: &str) -> Result<ObjectId> {
+    let Ok(id) = ObjectId::from_hex(spec.as_bytes()) else {
+        crate::git_fatal!("invalid {which} object ID: '{spec}'");
+    };
+    if !id.is_null() && !repo.has_object(id) {
+        crate::git_fatal!("{which} object '{spec}' does not exist");
+    }
+    Ok(id)
+}
+
+/// `is_root_ref()` (refs.c:915-939): an all-upper-case-`-`-`_` name that is not one
+/// of the two pseudo-refs, and then either ends in `_HEAD` or is on the short list of
+/// irregular root refs.
+fn is_root_ref(name: &str) -> bool {
+    let syntax_ok = !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b == b'-' || b == b'_');
+    if !syntax_ok || matches!(name, "FETCH_HEAD" | "MERGE_HEAD") {
+        return false;
+    }
+    name.ends_with("_HEAD")
+        || matches!(
+            name,
+            "HEAD"
+                | "AUTO_MERGE"
+                | "BISECT_EXPECTED_REV"
+                | "NOTES_MERGE_PARTIAL"
+                | "NOTES_MERGE_REF"
+                | "MERGE_AUTOSTASH"
+        )
+}
+
+/// `copy_reflog_msg()` (refs.c:1031-1045): every run of whitespace becomes one space,
+/// a leading run is dropped outright, and the result is right-trimmed.
+fn normalize_reflog_message(msg: &str) -> String {
+    let mut out = String::with_capacity(msg.len());
+    let mut was_space = true;
+    for c in msg.chars() {
+        let is_space = c.is_ascii_whitespace();
+        if was_space && is_space {
+            continue;
+        }
+        was_space = is_space;
+        out.push(if is_space { ' ' } else { c });
+    }
+    while out.ends_with(char::is_whitespace) {
+        out.pop();
+    }
+    out
+}
+
 /// Every commit reachable from a ref's current tip, which is what decides whether an
 /// entry counts as unreachable for `--expire-unreachable`.
 fn reachable_from_ref(
@@ -3948,4 +4337,51 @@ fn reachable_from_ref(
         set.insert(info.id);
     }
     Ok(set)
+}
+
+#[cfg(test)]
+mod drop_write_tests {
+    use super::{is_root_ref, normalize_reflog_message};
+
+    /// `copy_reflog_msg()`: a run of whitespace becomes one space, a leading run is
+    /// dropped, and the result is right-trimmed — so the entry stays one line however
+    /// the message was typed. Verified against stock git 2.55.0, where
+    /// `git reflog write <ref> <old> <new> "  lots   of\n\nwhitespace\there   "`
+    /// records `lots of whitespace here`.
+    #[test]
+    fn a_message_is_collapsed_to_single_spaces_and_trimmed() {
+        assert_eq!(
+            normalize_reflog_message("  lots   of\n\nwhitespace\there   "),
+            "lots of whitespace here"
+        );
+        assert_eq!(normalize_reflog_message("plain"), "plain");
+    }
+
+    /// An empty result means no tab and no message at all in the written line, which
+    /// is `log_ref_write_fd()`'s `if (msg && *msg)`. Stock writes the same line for
+    /// `""` and for `"   "`.
+    #[test]
+    fn a_message_of_only_whitespace_becomes_nothing() {
+        assert_eq!(normalize_reflog_message(""), "");
+        assert_eq!(normalize_reflog_message("   "), "");
+        assert_eq!(normalize_reflog_message("\n\t "), "");
+    }
+
+    /// `is_root_ref()`: upper-case-`-`-`_` syntax, not one of the two pseudo-refs, and
+    /// then either `_HEAD`-suffixed or on the irregular list. This is what lets
+    /// `reflog write` name a root ref at all — everything else has to pass
+    /// `check_refname_format(ref, 0)`, which one-level names fail. Each of these was
+    /// run against stock git 2.55.0: `HEAD`, `ORIG_HEAD`, `AUTO_MERGE` and `FOO_HEAD`
+    /// are written, while `MERGE_HEAD`, `onelevel` and `FOO` are
+    /// `fatal: invalid reference name`.
+    #[test]
+    fn only_git_s_root_refs_skip_the_refname_check() {
+        for ok in ["HEAD", "ORIG_HEAD", "FOO_HEAD", "AUTO_MERGE", "MERGE_AUTOSTASH"] {
+            assert!(is_root_ref(ok), "{ok} is a root ref");
+        }
+        // The two pseudo-refs are excluded even though they match the syntax.
+        for no in ["MERGE_HEAD", "FETCH_HEAD", "FOO", "onelevel", "refs/heads/main", ""] {
+            assert!(!is_root_ref(no), "{no} is not a root ref");
+        }
+    }
 }

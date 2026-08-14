@@ -56,11 +56,11 @@
 //! carries the index `SKIP_WORKTREE` bit; git additionally re-checks the path
 //! against the sparse patterns (`path_in_sparse_checkout`), which only differs
 //! for an index left out of sync with an edited pattern file. Pathspec files are
-//! not C-style unquoted (git-generated pathspec files are not quoted).
+//! read through the one shared `parse_pathspec_file` port in `commit`.
 
 use anyhow::{bail, Result};
 use std::collections::{HashMap, HashSet};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::process::ExitCode;
 
 use gix::bstr::{BString, ByteSlice};
@@ -274,10 +274,7 @@ pub fn rm(args: &[String]) -> Result<ExitCode> {
                 "'--pathspec-from-file' and pathspec arguments cannot be used together",
             ));
         }
-        match read_pathspec_file(file, opts.pathspec_file_nul) {
-            Ok(v) => pathspecs = v,
-            Err(code) => return Ok(code),
-        }
+        pathspecs = super::commit::read_pathspec_file(file, opts.pathspec_file_nul)?;
     }
 
     if pathspecs.is_empty() {
@@ -652,38 +649,6 @@ pub fn rm(args: &[String]) -> Result<ExitCode> {
     index.write(gix::index::write::Options::default())?;
 
     Ok(ret)
-}
-
-/// Read pathspecs from `spec` (a file path, or `-` for stdin). Entries are split
-/// on NUL when `nul`, else on newline with a trailing `\r` stripped; empty entries
-/// are dropped. A missing/unreadable file is fatal (exit 128) like git.
-fn read_pathspec_file(spec: &str, nul: bool) -> std::result::Result<Vec<String>, ExitCode> {
-    let data = if spec == "-" {
-        let mut b = Vec::new();
-        if std::io::stdin().read_to_end(&mut b).is_err() {
-            return Err(fatal("could not read pathspec from stdin"));
-        }
-        b
-    } else {
-        match std::fs::read(spec) {
-            Ok(b) => b,
-            Err(e) => return Err(fatal(format!("could not open '{spec}' for reading: {e}"))),
-        }
-    };
-
-    let mut out = Vec::new();
-    let sep = if nul { 0u8 } else { b'\n' };
-    for part in data.split(|&b| b == sep) {
-        let mut p = part;
-        if !nul && p.last() == Some(&b'\r') {
-            p = &p[..p.len() - 1];
-        }
-        if p.is_empty() {
-            continue;
-        }
-        out.push(String::from_utf8_lossy(p).into_owned());
-    }
-    Ok(out)
 }
 
 /// Hash the working-tree content at `path` into its git blob id, or `None` if the

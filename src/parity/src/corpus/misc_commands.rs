@@ -797,6 +797,53 @@ fn usage_only(out: &mut Vec<Case>) {
     // A usage error must print the whole block, not just its first line.
     out.push(Case::strict("mv", &["mv"], Shape::Linear));
 
+    // Per-subcommand option tables, where one verb's tables genuinely differ.
+    //
+    // `stash` has thirteen in git and they are not interchangeable: the two
+    // pathspec options are push-only, the three `--label-*` are apply-only, and
+    // five subcommands parse under `PARSE_OPT_KEEP_UNKNOWN_OPT`, where
+    // `register_abbrev()` returns without recording (parse-options.c:502-503) —
+    // so `stash show --no-only-untracked` is forwarded to `setup_revisions()`
+    // rather than rejected. A single shared table would pass a shallow check and
+    // be wrong on every one of these.
+    out.push(Case::strict("stash", &["stash", "save", "--pathspec-from-file=x"], Shape::Stashed));
+    // These two destroyed a stash entry from a flag stock rejects. Both were a
+    // *prefix test standing in for a table lookup*: the label block matched
+    // `--label-ours` by string prefix before any table was consulted, so
+    // `--label-ours=x` was stripped and the pop proceeded; and `drop` read its
+    // negation off a bare `--no-` prefix, so every unclaimed `--no-*` became
+    // `--no-quiet` and was accepted. The value-carrying spelling is the one that
+    // escaped, which is why `=x` is pinned and not just the bare name.
+    out.push(Case::strict("stash", &["stash", "pop", "--label-ours=x"], Shape::Stashed));
+    out.push(Case::strict("stash", &["stash", "drop", "--no-index"], Shape::Stashed));
+    out.push(Case::strict("stash", &["stash", "apply", "--q=x"], Shape::Stashed));
+    out.push(Case::strict("stash", &["stash", "apply", "-p"], Shape::Stashed));
+    out.push(Case::strict("stash", &["stash", "push", "--pat"], Shape::Dirty));
+    // Bare `git stash <flag>` re-enters push-assumed and renders a *third* usage
+    // constant, 883 bytes larger than the `-h` block.
+    out.push(Case::strict("stash", &["stash", "--bogus"], Shape::Dirty));
+    // A hidden entry is what makes a prefix ambiguous — remove it and this
+    // silently starts resolving.
+    out.push(Case::strict("pack-objects", &["pack-objects", "--write-bit"], Shape::Packed));
+    out.push(Case::strict("config", &["config", "--get-col"], Shape::Linear));
+    out.push(Case::strict("config", &["config", "--bogus"], Shape::Linear));
+    out.push(Case::strict("checkout", &["checkout", "--bogus"], Shape::Branched));
+    out.push(Case::strict("remote", &["remote", "show", "--no-query"], Shape::Linear));
+    out.push(Case::strict("multi-pack-index", &["multi-pack-index", "--prog"], Shape::Packed));
+
+    // An unknown option must be quoted *as typed*, `=value` included.
+    //
+    // `parse_long_opt()` splits at the `=` to find a value, but the error path
+    // reports the whole token — 117 probes across 30 verbs quoted the bare stem
+    // instead. Three of these route a dashed word into subcommand dispatch and
+    // used to answer `fatal: unknown command`; `update-index` has its own
+    // diagnostic with single quotes rather than backticks.
+    out.push(Case::strict("mktree", &["mktree", "--help-all=x"], Shape::Linear));
+    out.push(Case::strict("read-tree", &["read-tree", "--quux="], Shape::Linear));
+    out.push(Case::strict("update-index", &["update-index", "--quux=x"], Shape::Linear));
+    out.push(Case::strict("bisect", &["bisect", "--quux=x"], Shape::Branched));
+    out.push(Case::strict("hook", &["hook", "--quux=x"], Shape::Linear));
+
     // `--help-all`, one verb per mechanism.
     //
     // It is matched by a bare `strcmp` in `parse_options_step()`, sitting after

@@ -188,6 +188,13 @@ fn list(args: &[String]) -> Result<ExitCode> {
 
     for a in args {
         match a.as_str() {
+            // `cmd_hook_list()`'s own `parse_options()` owns `-h` once `list` has
+            // been named — the sub-command's block on stdout at 129, never
+            // `cmd_hook`'s. `--help-all` renders `USAGE_FULL`, which is this same
+            // block: `list`'s table carries no `PARSE_OPT_HIDDEN` entry.
+            s if super::asks_for_help(s, "z") => {
+                return Ok(super::show_usage(&format!("{USAGE_LIST}{OPTS_LIST}")))
+            }
             "-z" => nul = true,
             "--show-scope" => show_scope = true,
             "--no-show-scope" => show_scope = false,
@@ -195,11 +202,7 @@ fn list(args: &[String]) -> Result<ExitCode> {
             "--no-allow-unknown-hook-name" => allow_unknown = false,
             "--end-of-options" => {}
             s if s.starts_with('-') && s.len() > 1 => {
-                eprint!(
-                    "error: unknown option `{}'\n{USAGE_LIST}{OPTS_LIST}",
-                    s.trim_start_matches('-')
-                );
-                return Ok(ExitCode::from(129));
+                return Ok(super::unknown_option(s, &format!("{USAGE_LIST}{OPTS_LIST}")));
             }
             s => {
                 if event.is_some() {
@@ -281,6 +284,17 @@ fn run(args: &[String]) -> Result<ExitCode> {
             i += 1;
             continue;
         }
+        // `-h` and `--help-all` belong to `cmd_hook_run()`'s own parse_options()
+        // once `run` has been named, so they print *its* block rather than
+        // `cmd_hook`'s two-line synopsis. Both are tested against the argument
+        // as typed and ahead of the `=<value>` split below: `--help-all` reaches
+        // the renderer through a `strcmp()` in `parse_options_step()`, so
+        // `--help-all=x` is an unknown option, not a request for help. Neither is
+        // seen past `--`/`--end-of-options`, which the branch above already
+        // diverted into `hook_args`.
+        if super::asks_for_help(a, "") {
+            return Ok(super::show_usage(&format!("{USAGE_RUN}{OPTS_RUN}")));
+        }
         // Pull `--opt=<v>`, or consume the following argument for `--opt <v>`.
         let next = |i: &mut usize, inline: Option<&str>, name: &str| -> Result<String> {
             match inline {
@@ -311,12 +325,12 @@ fn run(args: &[String]) -> Result<ExitCode> {
             "--jobs" => jobs_flag = Some(parse_jobs(&next(&mut i, inline, "--jobs")?)?),
             "-j" => jobs_flag = Some(parse_jobs(&next(&mut i, None, "-j")?)?),
             s if s.starts_with("-j") && s.len() > 2 => jobs_flag = Some(parse_jobs(&s[2..])?),
+            // Named as typed, `=<value>` and all — `parse_options_step()` reports
+            // `ctx->argv[0] + 2`, which still carries whatever followed the `=`.
+            // `a` rather than `s` for exactly that reason: `s` is the name half of
+            // the split above.
             s if s.starts_with('-') && s.len() > 1 => {
-                eprint!(
-                    "error: unknown option `{}'\n{USAGE_RUN}{OPTS_RUN}",
-                    s.trim_start_matches('-')
-                );
-                return Ok(ExitCode::from(129));
+                return Ok(super::unknown_option(a, &format!("{USAGE_RUN}{OPTS_RUN}")));
             }
             s => {
                 if event.is_some() {

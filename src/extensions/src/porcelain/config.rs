@@ -301,14 +301,34 @@ struct Display {
 }
 
 /// `--type=<t>` and its legacy spellings (`--bool`, `--int`, `--bool-or-int`,
-/// `--path`). git canonicalizes the value on the way out; an unparsable value is
-/// `fatal: bad <t> config value '<v>' for '<key>'` at exit 128.
+/// `--bool-or-str`, `--path`, `--expiry-date`), plus `--type=color`, which has no
+/// legacy spelling of its own. These are git's seven `format_config()` arms
+/// (builtin/config.c:425-452).
 #[derive(Clone, Copy, PartialEq)]
 enum ValueType {
     Bool,
     Int,
     BoolOrInt,
+    BoolOrStr,
     Path,
+    ExpiryDate,
+    Color,
+}
+
+/// Why a value would not canonicalize, and therefore which of git's three
+/// different failure shapes the caller has to reproduce.
+enum TypeError {
+    /// `die_bad_number()` (config.c:1188): one self-contained `fatal:` naming the
+    /// value, the key, the file it came from and whether the number was out of
+    /// range or carried a unit suffix git does not know.
+    BadNumber { out_of_range: bool },
+    /// `git_config_bool()` (config.c:1292): a bare `die()` with no origin.
+    BadBool,
+    /// The arms that `error()` and hand a negative return back to the config
+    /// machinery, which then aborts the parse with its own second line — the
+    /// physical config line for a file, or `unable to parse command-line config`
+    /// for a `-c` / `GIT_CONFIG_*` value.
+    Callback(String),
 }
 
 impl ValueType {
@@ -317,56 +337,120 @@ impl ValueType {
             "bool" => Some(ValueType::Bool),
             "int" => Some(ValueType::Int),
             "bool-or-int" => Some(ValueType::BoolOrInt),
+            "bool-or-str" => Some(ValueType::BoolOrStr),
             "path" => Some(ValueType::Path),
+            "expiry-date" => Some(ValueType::ExpiryDate),
+            "color" => Some(ValueType::Color),
             _ => None,
         }
     }
 
-    fn label(self) -> &'static str {
-        match self {
-            ValueType::Bool => "boolean",
-            ValueType::Int => "numerical",
-            ValueType::BoolOrInt => "numerical",
-            ValueType::Path => "path",
-        }
-    }
-
-    /// Canonicalize `value` the way git prints it under this type, or `None`
-    /// when the value does not parse as the type.
-    fn canonicalize(self, value: &[u8]) -> Option<Vec<u8>> {
+    /// Canonicalize `value` the way git prints it under this type.
+    ///
+    /// The `gently` flag is `format_config()`'s: `show_all_config()` passes 1 —
+    /// `git config --list --type=<t>` silently drops every entry that does not
+    /// parse — while `collect_config()` passes 0, so a read of a named key dies on
+    /// the first value that does not. Only the message differs; what parses and
+    /// what does not is the same either way, so the error is always described and
+    /// the caller decides whether to print it.
+    fn canonicalize(self, key: &str, value: &[u8]) -> std::result::Result<Vec<u8>, TypeError> {
         let text = String::from_utf8_lossy(value).trim().to_string();
         match self {
-            ValueType::Bool => canonical_bool(&text).map(|b| b.to_string().into_bytes()),
-            ValueType::Int => canonical_int(&text).map(|n| n.to_string().into_bytes()),
-            // git tries integer first, then boolean, and prints 1/0 for a bool.
-            ValueType::BoolOrInt => canonical_int(&text)
-                .map(|n| n.to_string().into_bytes())
-                .or_else(|| canonical_bool(&text).map(|b| u8::from(b).to_string().into_bytes())),
-            ValueType::Path => Some(expand_config_path(&text).into_bytes()),
+            ValueType::Bool => canonical_bool(&text)
+                .map(|b| b.to_string().into_bytes())
+                .ok_or(TypeError::BadBool),
+            ValueType::Int => canonical_int(&text),
+            // `git_config_bool_or_int()` (config.c:1280) asks
+            // `git_parse_maybe_bool_text()` — the *word* half of the boolean
+            // grammar, with no number fallback — and prints `true`/`false` when it
+            // answers. A digit string therefore falls through to the integer arm
+            // and prints as a number, which is the whole point of the type.
+            ValueType::BoolOrInt => match maybe_bool_text(&text) {
+                Some(b) => Ok(b.to_string().into_bytes()),
+                None => canonical_int(&text),
+            },
+            // `format_config_bool_or_str()` (builtin/config.c:332) is documented as
+            // "always gentle": a value that is not a boolean is simply itself, so
+            // this arm cannot fail.
+            ValueType::BoolOrStr => Ok(match canonical_bool(&text) {
+                Some(b) => b.to_string().into_bytes(),
+                None => value.to_vec(),
+            }),
+            ValueType::Path => Ok(expand_config_path(&text).into_bytes()),
+            // `git_config_expiry_date()` (config.c) — `parse_expiry_date()` with an
+            // `error()` in front of the failure, and the epoch seconds printed raw.
+            ValueType::ExpiryDate => match crate::date::parse_expiry_date(&text) {
+                Some(t) => Ok(t.to_string().into_bytes()),
+                None => Err(TypeError::Callback(format!(
+                    "error: '{text}' for '{key}' is not a valid timestamp"
+                ))),
+            },
+            // `git_config_color()` → `color_parse()`, which prints the ANSI escape
+            // the spec resolves to. A spec selecting nothing yields the empty
+            // string, which git prints as an empty line.
+            ValueType::Color => match super::color::parse_color_spec(&text) {
+                Some(sgr) => Ok(sgr.into_bytes()),
+                None => Err(TypeError::Callback(format!("error: invalid color value: {text}"))),
+            },
         }
     }
 }
 
-/// git's boolean grammar: the empty value is true, and the words are matched
-/// case-insensitively (`git_parse_maybe_bool`).
-fn canonical_bool(text: &str) -> Option<bool> {
+/// `git_parse_maybe_bool_text()` (config.c): the *word* half of git's boolean
+/// grammar — `true`/`yes`/`on` and `false`/`no`/`off`, case-insensitively, and
+/// nothing else. A valueless key (git's NULL value) is true.
+///
+/// This is the half `--type=bool-or-int` uses, so that a digit string is left for
+/// the integer reader rather than collapsing to `true`/`false`.
+fn maybe_bool_text(text: &str) -> Option<bool> {
     match text.to_ascii_lowercase().as_str() {
-        "" | "true" | "yes" | "on" | "1" => Some(true),
-        "false" | "no" | "off" | "0" => Some(false),
+        "" | "true" | "yes" | "on" => Some(true),
+        "false" | "no" | "off" => Some(false),
         _ => None,
+    }
+}
+
+/// `git_parse_maybe_bool()` (config.c): [`maybe_bool_text`], then any integer git
+/// can read, as its truthiness — so `2` is true, `0` is false and `1k` is true.
+fn canonical_bool(text: &str) -> Option<bool> {
+    if let Some(b) = maybe_bool_text(text) {
+        return Some(b);
+    }
+    match canonical_int(text) {
+        Ok(bytes) => Some(bytes != b"0"),
+        Err(_) => None,
     }
 }
 
 /// git's integer grammar: an optional `k`/`m`/`g` suffix scales the number
 /// (`git_parse_int`), so `1k` reads as 1024.
-fn canonical_int(text: &str) -> Option<i64> {
+///
+/// The two failures are distinct to git: a digit string that does not fit the
+/// target width sets `errno` to `ERANGE` and is reported as `out of range`, while
+/// anything else is `invalid unit` (config.c:1191-1192).
+fn canonical_int(text: &str) -> std::result::Result<Vec<u8>, TypeError> {
     let (digits, scale) = match text.chars().last() {
         Some('k') | Some('K') => (&text[..text.len() - 1], 1024i64),
         Some('m') | Some('M') => (&text[..text.len() - 1], 1024 * 1024),
         Some('g') | Some('G') => (&text[..text.len() - 1], 1024 * 1024 * 1024),
         _ => (text, 1),
     };
-    digits.trim().parse::<i64>().ok().and_then(|n| n.checked_mul(scale))
+    let digits = digits.trim();
+    match digits.parse::<i64>() {
+        Ok(n) => match n.checked_mul(scale) {
+            Some(n) => Ok(n.to_string().into_bytes()),
+            None => Err(TypeError::BadNumber { out_of_range: true }),
+        },
+        // `strtoimax()` sets `ERANGE` only when the digits themselves overflow;
+        // a non-numeric string is a plain parse failure, which git blames on the
+        // unit suffix it could not read.
+        Err(err) => Err(TypeError::BadNumber {
+            out_of_range: matches!(
+                err.kind(),
+                std::num::IntErrorKind::PosOverflow | std::num::IntErrorKind::NegOverflow
+            ),
+        }),
+    }
 }
 
 /// `--type=path`: expand a leading `~` / `~user` the way git's
@@ -731,19 +815,9 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
         _ => {}
     }
 
-    // Every usage error git reports has now been reported, so this is the first
-    // point at which refusing an unported type cannot shadow one of them. Three
-    // of git's seven types have no canonicalization here and are named rather
-    // than reported as unrecognized — git recognizes them perfectly well.
-    d.ty = match ty_name {
-        None => None,
-        Some(name) => match ValueType::parse(name) {
-            Some(ty) => Some(ty),
-            None => bail!(
-                "--type={name} is not implemented: no canonicalizer for it here"
-            ),
-        },
-    };
+    // `select_type()` has already rejected any name git does not know, so every
+    // surviving name is one of the seven [`ValueType`] arms.
+    d.ty = ty_name.and_then(ValueType::parse);
 
     // A repository is optional: reads resolve fine outside one (git reads global
     // and system config with no repo present), while writes target the local
@@ -881,24 +955,38 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
         Mode::Edit => edit_config(&write_target()?),
         Mode::RenameSection => rename_section(&write_target()?, &positional),
         Mode::RemoveSection => remove_section(&write_target()?, &positional),
+        // Every write of a *value* runs it through `normalize_value()` first, so
+        // `--type=int x.y 1k` stores `1024` and `--type=bool x.y zzz` is refused
+        // before the file is touched. `--unset`/`--unset-all` carry no value and
+        // are left alone.
         Mode::ReplaceAll => {
             let name = positional.first().copied().unwrap_or_default();
             let value = positional.get(1).copied().unwrap_or_default();
-            replace_all(&write_target()?, name, value, positional.get(2).copied())
+            match normalized(d.ty, name, value) {
+                Ok(value) => replace_all(&write_target()?, name, &value, positional.get(2).copied()),
+                Err(code) => Ok(code),
+            }
         }
         // No action flag: one positional reads, two set the value.
         Mode::Auto if positional.len() == 1 => get(file, positional[0], false, None, &d),
-        Mode::Auto if positional.len() == 2 => {
-            write_scoped(&write_target()?, positional[0], positional[1], WriteOp::Set)
-        }
+        Mode::Auto if positional.len() == 2 => match normalized(d.ty, positional[0], positional[1]) {
+            Ok(value) => write_scoped(&write_target()?, positional[0], &value, WriteOp::Set),
+            Err(code) => Ok(code),
+        },
         // `<name> <value> <value-pattern>` rewrites the values whose text matches
         // the POSIX ERE, or adds a new value when none match.
-        Mode::Auto => {
-            set_with_value_pattern(&write_target()?, positional[0], positional[1], positional[2])
-        }
+        Mode::Auto => match normalized(d.ty, positional[0], positional[1]) {
+            Ok(value) => {
+                set_with_value_pattern(&write_target()?, positional[0], &value, positional[2])
+            }
+            Err(code) => Ok(code),
+        },
         Mode::Add => {
             let (name, value) = name_and_value(&positional)?;
-            write_scoped(&write_target()?, name, value, WriteOp::Add)
+            match normalized(d.ty, name, value) {
+                Ok(value) => write_scoped(&write_target()?, name, &value, WriteOp::Add),
+                Err(code) => Ok(code),
+            }
         }
         Mode::Unset => {
             let name = one_name(&positional)?;
@@ -1009,7 +1097,7 @@ fn get(
     // later one, so the error names the same value stock git names.
     let mut canonical: Vec<(Vec<u8>, gix::config::file::Metadata)> = Vec::new();
     for (v, meta) in &selected {
-        match typed(d, name, v) {
+        match typed(d, name, v, meta) {
             Ok(v) => canonical.push((v, meta.clone())),
             Err(code) => return Ok(code),
         }
@@ -1092,21 +1180,178 @@ fn origin_word(source: Source) -> &'static str {
     }
 }
 
-/// Apply `--type` to a value, reporting git's fatal and exit 128 when the value
-/// does not parse as that type.
-fn typed(d: &Display, key: &str, value: &[u8]) -> std::result::Result<Vec<u8>, ExitCode> {
-    match d.ty {
-        None => Ok(value.to_vec()),
-        Some(t) => t.canonicalize(value).ok_or_else(|| {
-            eprintln!(
-                "fatal: bad {} config value '{}' for '{}'",
-                t.label(),
-                String::from_utf8_lossy(value),
-                key
-            );
-            ExitCode::from(128)
-        }),
+/// Apply `--type` to a value — `format_config()` (builtin/config.c:406) for one
+/// entry, in its non-gentle mode.
+///
+/// A value that will not parse is fatal at exit 128, in whichever of git's three
+/// shapes the type uses. Two of them name the source the value came from, so the
+/// entry's metadata is needed as well as its key.
+fn typed(
+    d: &Display,
+    key: &str,
+    value: &[u8],
+    meta: &gix::config::file::Metadata,
+) -> std::result::Result<Vec<u8>, ExitCode> {
+    let Some(t) = d.ty else { return Ok(value.to_vec()) };
+    t.canonicalize(key, value)
+        .map_err(|err| report_type_error(err, key, value, meta.path.as_deref()))
+}
+
+/// Put one of git's three type-failure shapes on stderr and hand back its exit
+/// code. `origin` is the file the value came from, absent for a `-c` /
+/// `GIT_CONFIG_*` value or one typed on the command line.
+fn report_type_error(
+    err: TypeError,
+    key: &str,
+    value: &[u8],
+    origin: Option<&std::path::Path>,
+) -> ExitCode {
+    let shown = String::from_utf8_lossy(value);
+    match err {
+        TypeError::BadNumber { out_of_range } => {
+            let reason = if out_of_range { "out of range" } else { "invalid unit" };
+            // `die_bad_number()` splits on whether the value has a file behind it:
+            // one that does not gets the short form (config.c:1201-1202).
+            match origin {
+                Some(path) => eprintln!(
+                    "fatal: bad numeric config value '{shown}' for '{key}' in file {}: {reason}",
+                    display_origin_path(path)
+                ),
+                None => eprintln!("fatal: bad numeric config value '{shown}' for '{key}': {reason}"),
+            }
+        }
+        TypeError::BadBool => eprintln!("fatal: bad boolean config value '{shown}' for '{key}'"),
+        // The callback's own `error()`, then the line the config machinery adds
+        // when a callback aborts the parse (config.c's `git_parse_source` /
+        // `git_config_from_parameters`).
+        TypeError::Callback(message) => {
+            eprintln!("{message}");
+            match origin {
+                Some(path) => eprintln!(
+                    "fatal: bad config line {} in file {}",
+                    config_line_of(path, key, value).unwrap_or(0),
+                    display_origin_path(path)
+                ),
+                None => eprintln!("fatal: unable to parse command-line config"),
+            }
+        }
     }
+    ExitCode::from(128)
+}
+
+/// `normalize_value()` (builtin/config.c:654): what a `--type`d *write* stores.
+///
+/// This is deliberately not the same as the read-side canonicalization:
+///
+///   * no type at all, `--type=path` and `--type=expiry-date` store the value
+///     verbatim — git keeps `~/foobar` in the file and expands the `~` on the way
+///     back out, and says outright that expiry dates are not normalized either
+///     (so an unparsable one is written without complaint);
+///   * `--type=color` *validates* the spec and then stores the original text,
+///     since the escape sequence it parses to is not something a config file can
+///     hold;
+///   * the rest store the canonical form — `1k` becomes `1024`, `2` becomes
+///     `true`.
+///
+/// `None` means the value was rejected and the diagnostic is already on stderr;
+/// every one of git's rejections here is a `die()`, so the caller exits 128.
+fn normalized(
+    ty: Option<ValueType>,
+    key: &str,
+    value: &str,
+) -> std::result::Result<String, ExitCode> {
+    match normalize_value(ty, key, value) {
+        Some(v) => Ok(v),
+        None => Err(ExitCode::from(128)),
+    }
+}
+
+/// See [`normalized`], which is the same thing with the exit code attached.
+fn normalize_value(ty: Option<ValueType>, key: &str, value: &str) -> Option<String> {
+    let Some(ty) = ty else { return Some(value.to_string()) };
+    if matches!(ty, ValueType::Path | ValueType::ExpiryDate) {
+        return Some(value.to_string());
+    }
+    match ty.canonicalize(key, value.as_bytes()) {
+        // The parsed escape sequence is a "sanity-check" only; git returns the
+        // value it was given (builtin/config.c:693-700).
+        Ok(_) if ty == ValueType::Color => Some(value.to_string()),
+        Ok(canonical) => Some(String::from_utf8_lossy(&canonical).into_owned()),
+        Err(err) => {
+            match err {
+                // A value handed to `git config` on the command line has no file
+                // behind it, so `die_bad_number()` takes its short form.
+                TypeError::BadNumber { .. } | TypeError::BadBool => {
+                    report_type_error(err, key, value.as_bytes(), None);
+                }
+                TypeError::Callback(message) => {
+                    eprintln!("{message}");
+                    eprintln!("fatal: cannot parse color '{value}'");
+                }
+            }
+            None
+        }
+    }
+}
+
+/// A config file's path as git prints it in a diagnostic: exactly as it resolved
+/// it, without the `./` a relative discovery leaves on the front.
+fn display_origin_path(path: &std::path::Path) -> String {
+    let text = path.to_string_lossy();
+    text.strip_prefix("./").unwrap_or(&text).to_string()
+}
+
+/// The physical line an entry sits on, which is what `cf->linenr` holds when a
+/// callback aborts the parse and git reports `bad config line <n> in file <f>`.
+///
+/// The file is re-read and walked as a token stream because `gix_config` keeps a
+/// parsed section/value model with no source positions in it. Every `Newline`
+/// event advances the counter, so a value continued over several lines is blamed
+/// on the line it *ends* on — the line git's reader had just consumed when it
+/// handed the value to the callback.
+fn config_line_of(path: &std::path::Path, key: &str, value: &[u8]) -> Option<usize> {
+    use gix::bstr::ByteSlice;
+    use gix::config::parse::EventRef;
+
+    let bytes = std::fs::read(path).ok()?;
+    let events = gix::config::parse::Events::from_bytes(&bytes, None).ok()?;
+    let mut line = 1usize;
+    // The git-normalized `section[.subsection].` prefix the current header sets.
+    let mut prefix: Option<String> = None;
+    let mut name: Option<String> = None;
+    let mut collected: Vec<u8> = Vec::new();
+    for event in events.iter() {
+        match event {
+            // A run of consecutive line endings arrives as one event, so the
+            // counter advances by however many the run holds.
+            EventRef::Newline(nl) => line += nl.iter().filter(|b| **b == b'\n').count(),
+            EventRef::SectionHeader {
+                name: section,
+                subsection_name,
+                ..
+            } => {
+                prefix = Some(match subsection_name {
+                    Some(sub) => format!("{}.{}.", section.to_str_lossy().to_lowercase(), sub),
+                    None => format!("{}.", section.to_str_lossy().to_lowercase()),
+                });
+                name = None;
+            }
+            EventRef::SectionValueName(n) => {
+                name = Some(n.to_str_lossy().to_lowercase());
+                collected.clear();
+            }
+            EventRef::ValueNotDone(v) => collected.extend_from_slice(v.as_bytes()),
+            EventRef::Value(v) | EventRef::ValueDone(v) => {
+                collected.extend_from_slice(v.as_bytes());
+                let (Some(p), Some(n)) = (&prefix, &name) else { continue };
+                if format!("{p}{n}") == key && collected == value {
+                    return Some(line);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// `git config -l` — emit every `key=value` from the merged snapshot, in file
@@ -1120,20 +1365,24 @@ fn typed(d: &Display, key: &str, value: &[u8]) -> std::result::Result<Vec<u8>, E
 fn list(file: &gix::config::File, d: &Display) -> Result<ExitCode> {
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
-    let mut failed: Option<ExitCode> = None;
 
+    // `show_all_config()` (builtin/config.c:473) is the one caller that passes
+    // `gently = 1` to `format_config()` and prints only when it returns `>= 0`, so
+    // a `--list --type=<t>` quietly drops every entry the type cannot read rather
+    // than dying on the first one.
     for_each_entry(file, |key, value, meta| {
-        if failed.is_some() {
-            return Ok(());
-        }
-        match typed(d, key, value) {
-            Ok(v) => emit_kv(&mut out, d, key, &v, meta, b'=', true)?,
-            Err(code) => failed = Some(code),
-        }
-        Ok(())
+        let _ = meta;
+        let canonical = match d.ty {
+            None => value.to_vec(),
+            Some(t) => match t.canonicalize(key, value) {
+                Ok(v) => v,
+                Err(_) => return Ok(()),
+            },
+        };
+        emit_kv(&mut out, d, key, &canonical, meta, b'=', true)
     })?;
 
-    Ok(failed.unwrap_or(ExitCode::SUCCESS))
+    Ok(ExitCode::SUCCESS)
 }
 
 /// `git config --get-regexp <name-regex>` — every entry whose canonical key
@@ -1166,10 +1415,11 @@ fn get_regexp(
         None => None,
     };
 
-    let stdout = std::io::stdout();
-    let mut out = stdout.lock();
-    let mut matched = false;
-
+    // `get_value()` (builtin/config.c:538) collects every match into a strbuf list
+    // and writes the list only once the whole walk succeeded, so a value that will
+    // not canonicalize suppresses the matches found *before* it as well as the
+    // ones after. Collecting here rather than streaming reproduces that.
+    let mut collected: Vec<(String, Vec<u8>, gix::config::file::Metadata)> = Vec::new();
     let mut failed: Option<ExitCode> = None;
     for_each_entry(file, |key, value, meta| {
         if failed.is_some() || !re.is_match(key.as_bytes()) {
@@ -1178,9 +1428,8 @@ fn get_regexp(
         if filter.as_ref().is_some_and(|f| !f.matches(value)) {
             return Ok(());
         }
-        matched = true;
-        match typed(d, key, value) {
-            Ok(v) => emit_kv(&mut out, d, key, &v, meta, b' ', true)?,
+        match typed(d, key, value, meta) {
+            Ok(v) => collected.push((key.to_owned(), v, meta.clone())),
             Err(code) => failed = Some(code),
         }
         Ok(())
@@ -1189,7 +1438,13 @@ fn get_regexp(
         return Ok(code);
     }
 
-    Ok(if matched { ExitCode::SUCCESS } else { ExitCode::from(1) })
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    for (key, value, meta) in &collected {
+        emit_kv(&mut out, d, key, value, meta, b' ', true)?;
+    }
+
+    Ok(if collected.is_empty() { ExitCode::from(1) } else { ExitCode::SUCCESS })
 }
 
 /// Walk every visible entry of `file` in file order, handing `emit` the

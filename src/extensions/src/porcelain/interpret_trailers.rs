@@ -42,10 +42,14 @@
 //!   `error: file <f> is not a regular file` / `is not writable by user` /
 //!   `error: could not stat <f>: <strerror>` followed by a silent `die(NULL)` (128)
 //! * the usage shapes: `-h` prints git's block on stdout (129); `` error: unknown
-//!   option `x' ``, `` error: unknown switch `x' `` and `error: ambiguous option:
-//!   …` print it on stderr after the message (129); `` error: option `x' takes no
-//!   value `` and `` error: option `x' requires a value `` print no usage block
-//!   (129); an unrecognised `--where`/`--if-exists`/`--if-missing` value exits 129
+//!   option `x' `` and `` error: unknown switch `x' `` print it on stderr after
+//!   the message (`PARSE_OPT_UNKNOWN`, 129); `error: ambiguous option: n (could
+//!   be --no-divider or --no-trailer)` puts its message on stderr and the block
+//!   on **stdout**, because `parse_long_opt()` reports it with `error()` and then
+//!   returns `PARSE_OPT_HELP` (129); `` error: option `x' takes no value `` and
+//!   `` error: option `x' requires a value `` print no usage block at all
+//!   (`PARSE_OPT_ERROR`, 129), and name the entry the way `optname()` spells it,
+//!   so `--divider=x` reports `no-no-divider`; an unrecognised `--where`/`--if-exists`/`--if-missing` value exits 129
 //!   silently, as git's `parse_options` callback failure does; and
 //!   `fatal: --trailer with --only-input does not make sense` prints a blank line
 //!   and the block (129)
@@ -500,30 +504,33 @@ struct Opts {
     no_divider: bool,
 }
 
-/// Every long option the builtin declares, with how `parse_options` treats it.
+/// `cmd_interpret_trailers`'s `struct option options[]`
+/// (builtin/interpret-trailers.c:120-146), in table order, as
+/// [`super::resolve_long`] reads it.
 ///
-/// `takes_value` distinguishes `OPT_CALLBACK` from `OPT_BOOL`; `negatable` is
-/// false only for `--parse` (`PARSE_OPT_NONEG`). `no-divider` is spelled with the
-/// negation baked into the name, so its "negated" form is `--divider`.
-const LONG_OPTS: [(&str, bool, bool); 11] = [
-    ("in-place", false, true),
-    ("trim-empty", false, true),
-    ("where", true, true),
-    ("if-exists", true, true),
-    ("if-missing", true, true),
-    ("only-trailers", false, true),
-    ("only-input", false, true),
-    ("unfold", false, true),
-    ("parse", false, false),
-    ("no-divider", false, true),
-    ("trailer", true, true),
+/// `Arg::Required` distinguishes the `OPT_CALLBACK`s from the `OPT_BOOL`s;
+/// `neg` is false only for `--parse`, whose `OPT_CALLBACK_F` carries
+/// `PARSE_OPT_NOARG | PARSE_OPT_NONEG`. `no-divider` is spelled with the
+/// negation baked into the name, so `--divider` is that same entry unset.
+///
+/// Table *order* is load-bearing here and was the whole bug: `register_abbrev()`
+/// keeps the last two candidates it saw, so `--n` has to report
+/// `--no-divider or --no-trailer` — the final two negatable entries — and a
+/// resolver that collected candidates per-entry as `name`/`no-name` pairs
+/// reported `--no-in-place or --no-trim-empty` instead.
+pub(super) const LONG_OPTS: &[super::LongOpt] = &[
+    super::LongOpt { name: "in-place",      neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "trim-empty",    neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "where",         neg: true,  arg: super::Arg::Required },
+    super::LongOpt { name: "if-exists",     neg: true,  arg: super::Arg::Required },
+    super::LongOpt { name: "if-missing",    neg: true,  arg: super::Arg::Required },
+    super::LongOpt { name: "only-trailers", neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "only-input",    neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "unfold",        neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "parse",         neg: false, arg: super::Arg::None },
+    super::LongOpt { name: "no-divider",    neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "trailer",       neg: true,  arg: super::Arg::Required },
 ];
-
-/// A resolved long option: which entry, and whether the spelling was the negation.
-struct Match {
-    index: usize,
-    unset: bool,
-}
 
 /// The result of parsing the command line.
 enum Parsed {
@@ -691,20 +698,38 @@ fn parse_args(args: &[String]) -> Result<Parsed> {
             bail!("--help is not supported (stock git delegates it to `git help`)");
         }
 
-        let (name, inline) = match long.split_once('=') {
-            Some((n, v)) => (n, Some(v)),
-            None => (long, None),
-        };
+        // `parse_long_opt()` resolves the whole body — `=<value>` included — as
+        // one name before any value is split off.
+        let inline = long.split_once('=').map(|(_, v)| v);
 
-        let m = match resolve_long(name, long) {
-            Ok(m) => m,
-            Err(code) => return Ok(Parsed::Exit(code)),
+        let (opt, unset) = match super::resolve_long(LONG_OPTS, long) {
+            super::Resolved::One(opt, unset) => (opt, unset),
+            // Reported with `error()` on stderr and the block on **stdout**,
+            // which is the one rejection that splits its two halves across the
+            // streams.
+            super::Resolved::Ambiguous(first, second) => {
+                return Ok(Parsed::Exit(super::ambiguous_option(
+                    arg, &first, &second, USAGE,
+                )))
+            }
+            super::Resolved::Unknown => {
+                return Ok(Parsed::Exit(usage_error(&format!(
+                    "unknown option `{long}'"
+                ))))
+            }
         };
-        let (opt_name, takes_value, _) = LONG_OPTS[m.index];
+        // `optname()`: the table's own spelling, `no-`-prefixed for the unset
+        // sense — so the `no-divider` entry reached as `--divider` reports as
+        // `no-no-divider`.
+        let shown = match unset {
+            true => format!("no-{}", opt.name),
+            false => opt.name.to_string(),
+        };
+        let opt_name = opt.name;
 
         // Fetch the value for a value-taking option: `--opt=v` or `--opt v`.
         // A negated spelling (`--no-trailer`) never takes one.
-        let value: Option<&str> = if takes_value && !m.unset {
+        let value: Option<&str> = if opt.arg == super::Arg::Required && !unset {
             match inline {
                 Some(v) => Some(v),
                 None => match args.get(i) {
@@ -714,7 +739,7 @@ fn parse_args(args: &[String]) -> Result<Parsed> {
                     }
                     None => {
                         return Ok(Parsed::Exit(plain_error(&format!(
-                            "option `{opt_name}' requires a value"
+                            "option `{shown}' requires a value"
                         ))))
                     }
                 },
@@ -722,13 +747,13 @@ fn parse_args(args: &[String]) -> Result<Parsed> {
         } else {
             if inline.is_some() {
                 return Ok(Parsed::Exit(plain_error(&format!(
-                    "option `{opt_name}' takes no value"
+                    "option `{shown}' takes no value"
                 ))));
             }
             None
         };
 
-        let set = !m.unset;
+        let set = !unset;
         match opt_name {
             "in-place" => opts.in_place = set,
             "trim-empty" => opts.trim_empty = set,
@@ -782,56 +807,6 @@ fn parse_args(args: &[String]) -> Result<Parsed> {
         trailers,
         files,
     })))
-}
-
-/// Resolve a long-option spelling to a table entry, honouring negation and
-/// unambiguous abbreviation.
-///
-/// Candidates are the canonical names and, for negatable options, their negated
-/// spellings — `no-<name>`, or the `no-` stripped form when the name already
-/// carries it (`no-divider` negates to `divider`).
-fn resolve_long(name: &str, typed: &str) -> Result<Match, ExitCode> {
-    let mut spellings: Vec<(String, Match)> = Vec::new();
-    for (index, &(opt, _, negatable)) in LONG_OPTS.iter().enumerate() {
-        spellings.push((
-            opt.to_string(),
-            Match {
-                index,
-                unset: false,
-            },
-        ));
-        if !negatable {
-            continue;
-        }
-        let negated = match opt.strip_prefix("no-") {
-            Some(rest) => rest.to_string(),
-            None => format!("no-{opt}"),
-        };
-        spellings.push((negated, Match { index, unset: true }));
-    }
-
-    if let Some((_, m)) = spellings.iter().find(|(s, _)| s.as_str() == name) {
-        return Ok(Match {
-            index: m.index,
-            unset: m.unset,
-        });
-    }
-
-    let hits: Vec<&(String, Match)> = spellings
-        .iter()
-        .filter(|(s, _)| s.starts_with(name))
-        .collect();
-    match hits.as_slice() {
-        [] => Err(usage_error(&format!("unknown option `{typed}'"))),
-        [(_, m)] => Ok(Match {
-            index: m.index,
-            unset: m.unset,
-        }),
-        // Candidate spellings are stored already-negated, so they print as given.
-        [(a, _), (b, _), ..] => Err(usage_error(&format!(
-            "ambiguous option: {name} (could be --{a} or --{b})"
-        ))),
-    }
 }
 
 // ---------------------------------------------------------------------------

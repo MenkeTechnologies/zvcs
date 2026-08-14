@@ -288,6 +288,12 @@ struct DryRun {
     include: bool,
     /// The pathspecs, if any.
     pathspecs: Vec<String>,
+    /// `--amend`, which points the report at `HEAD^1` instead of `HEAD`
+    /// (builtin/commit.c:571-574).
+    amend: bool,
+    /// `-v`/`--verbose`, which `run_status()` forwards as `s->verbose`
+    /// (builtin/commit.c:575) so the report ends with the staged patch.
+    verbose: bool,
 }
 
 /// git's `enum commit_whence` (commit.h): where the commit being recorded came
@@ -1266,12 +1272,6 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
         if amend && repo.head()?.try_peel_to_id()?.is_none() {
             crate::git_fatal!("You have nothing to amend.");
         }
-        if amend {
-            anyhow::bail!(
-                "--dry-run with --amend is not ported: git reports against HEAD^, \
-                 which the status engine cannot be pointed at"
-            );
-        }
         return dry_run_commit(
             &repo,
             &DryRun {
@@ -1283,6 +1283,14 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
                 all,
                 include: include_flag,
                 pathspecs: pathspecs.clone(),
+                amend,
+                // `if (verbose == -1) verbose = config_commit_verbose` runs in
+                // `cmd_commit` *before* it branches to `dry_run_commit()`
+                // (builtin/commit.c:1827-1828), so `commit.verbose` reaches the dry
+                // run just as `-v` does.
+                verbose: verbose.unwrap_or_else(|| {
+                    repo.config_snapshot().boolean("commit.verbose") == Some(true)
+                }),
             },
         );
     }
@@ -1529,7 +1537,11 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     let mut head = repo.head()?;
     let head_tip = head.try_peel_to_id()?.map(|id| id.detach());
     let amend_head = if amend {
-        let hid = head_tip.ok_or_else(|| anyhow::anyhow!("You have nothing to amend."))?;
+        // `die(_("You have nothing to amend."))` (builtin/commit.c), so this is a
+        // `fatal:` at 128 rather than this port's own error voice at 1.
+        let Some(hid) = head_tip else {
+            crate::git_fatal!("You have nothing to amend.");
+        };
         Some(repo.find_commit(hid)?)
     } else {
         None
@@ -1572,30 +1584,46 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
         Some(pt) => pt == tree_id,
         None => tree_id == ObjectId::empty_tree(hash),
     };
-    // `--amend` always produces a new commit (a message- or author-only amend is
-    // valid), so it is exempt from the empty-change guard. So is concluding a
-    // merge — git's `!committable && whence != FROM_MERGE` — because resolving
-    // every conflict back to `HEAD`'s content still has to record the merge.
-    if unchanged && !allow_empty && whence != Whence::Merge {
-        if amend {
-            // git refuses an amend whose result would be empty (tree unchanged
-            // from the parent) unless --allow-empty, with its own message.
-            crate::git_fatal!(
-                "You asked to amend the most recent commit, but doing so would make\n\
-                 it empty. You can repeat your command with --allow-empty, or you can\n\
-                 remove the commit entirely with \"git reset HEAD^\"."
-            );
-        }
+    // git's guard is `!committable && whence != FROM_MERGE && !allow_empty &&
+    // !(amend && is_a_merge(current_head))` (builtin/commit.c:1081-1082).
+    // Concluding a merge is exempt because resolving every conflict back to
+    // `HEAD`'s content still has to record the merge, and *amending* a merge is
+    // exempt for the same reason — the commit being rewritten is a merge, so it
+    // stays one whatever its tree says.
+    let amending_a_merge = amend && parents.len() > 1;
+    if unchanged && !allow_empty && whence != Whence::Merge && !amending_a_merge {
         // `run_status(stdout, index_file, prefix, 0, s)` (builtin/commit.c:1085).
         // The refusal *is* a status report: git runs the engine `git status` runs,
         // over the index this commit would have used, on stdout — and only then
         // adds whatever advice the situation calls for on stderr. Nothing else is
         // printed for a plain empty commit, so this report is the whole message.
         //
+        // An `--amend` refusal takes the same route: `s->amend`/`s->reference` were
+        // set by `run_status()` long before the guard ran, so the report is the
+        // `HEAD^1` one and only the advice underneath it differs. What git does
+        // *not* do here is `die()` — the advice goes to stderr with no `fatal:` in
+        // front of it and the exit code is 1, not 128.
+        //
         // The long format is the only one reachable: a `--short`/`--porcelain`/
         // `-z` request has already turned the command into a dry run
         // (builtin/commit.c:1422-1423) and returned far above.
-        report_nothing_to_commit(untracked_arg.as_deref())?;
+        report_nothing_to_commit(
+            untracked_arg.as_deref(),
+            match amend {
+                true => super::status::Reference::AmendParent,
+                false => super::status::Reference::Commit,
+            },
+        )?;
+        if amend {
+            // `fputs(_(empty_amend_advice), stderr)` (builtin/commit.c:1086-1087),
+            // whose text is a single trailing-newline-terminated block.
+            eprint!(
+                "You asked to amend the most recent commit, but doing so would make\n\
+                 it empty. You can repeat your command with --allow-empty, or you can\n\
+                 remove the commit entirely with \"git reset HEAD^\".\n"
+            );
+            return Ok(ExitCode::from(1));
+        }
         // A cherry-pick or rebase pick whose conflict resolution left nothing to
         // record is a distinct situation from "you staged nothing": the pick has
         // to be either recorded empty or skipped, and git says which.
@@ -2213,8 +2241,16 @@ pub(super) fn read_pathspec_file(src: &str, nul: bool) -> Result<Vec<String>> {
         std::io::Read::read_to_end(&mut std::io::stdin(), &mut buf)?;
         buf
     } else {
-        std::fs::read(src)
-            .map_err(|e| anyhow::anyhow!("could not open '{src}' for reading: {e}"))?
+        // `parse_pathspec_file()` (parse-options-cb.c) reads the list with
+        // `die_errno(_("could not open '%s' for reading"), file)`, so the failure
+        // is git's `fatal:` at 128 — not this port's own `zvcs: <cmd>:` line at
+        // 1, which is what a caller testing `$?` for 128 would miss. `strerror()`
+        // has no Rust `(os error <n>)` tail, so the tail is trimmed off.
+        std::fs::read(src).map_err(|e| {
+            let text = e.to_string();
+            let reason = text.split(" (os error ").next().unwrap_or(&text);
+            crate::fatal::die(format!("could not open '{src}' for reading: {reason}"))
+        })?
     };
     let sep = if nul { b'\0' } else { b'\n' };
     Ok(raw
@@ -2289,7 +2325,13 @@ fn dry_run_commit(repo: &gix::Repository, o: &DryRun) -> Result<ExitCode> {
         None
     };
 
-    let committable = index_differs_from_head(repo, prepared.as_ref())?;
+    // `run_status()`'s reference: `--amend` measures against `HEAD^1`, since the
+    // commit it would write replaces `HEAD` rather than following it.
+    let reference = match o.amend {
+        true => super::status::Reference::AmendParent,
+        false => super::status::Reference::Commit,
+    };
+    let committable = index_differs_from_reference(repo, prepared.as_ref(), reference)?;
 
     // Translate commit's report flags into the status engine's own spelling.
     let mut sargs: Vec<String> = Vec::new();
@@ -2313,14 +2355,19 @@ fn dry_run_commit(repo: &gix::Repository, o: &DryRun) -> Result<ExitCode> {
     if let Some(u) = &o.untracked {
         sargs.push(format!("--untracked-files={u}"));
     }
+    // `s->verbose = verbose` (builtin/commit.c:575): the dry run ends with the
+    // staged patch, which the status engine already knows how to append.
+    if o.verbose {
+        sargs.push("--verbose".to_string());
+    }
 
     match &prepared {
         Some(index) => {
             let _swap = IndexSwap::install(repo, index)?;
-            super::status::status(&sargs)?;
+            super::status::status_with(&sargs, reference)?;
         }
         None => {
-            super::status::status(&sargs)?;
+            super::status::status_with(&sargs, reference)?;
         }
     }
 
@@ -2343,21 +2390,29 @@ fn dry_run_commit(repo: &gix::Repository, o: &DryRun) -> Result<ExitCode> {
 /// `-u<mode>` reaches `wt_status` through `handle_untracked_files_arg()` before
 /// the refusal, so it is forwarded. `-v` is not: git's `wt_longstatus_print()`
 /// would append the staged diff, and there is by definition nothing staged.
-fn report_nothing_to_commit(untracked: Option<&str>) -> Result<()> {
+fn report_nothing_to_commit(
+    untracked: Option<&str>,
+    reference: super::status::Reference,
+) -> Result<()> {
     let mut sargs = vec!["--long".to_string()];
     if let Some(u) = untracked {
         sargs.push(format!("--untracked-files={u}"));
     }
-    super::status::status(&sargs)?;
+    super::status::status_with(&sargs, reference)?;
     Ok(())
 }
 
 /// Whether the given index (or the on-disk one when `None`) records anything
-/// different from `HEAD`'s tree — git's `wt_status.committable`, which decides a
-/// dry run's exit status. An unmerged entry always counts as committable.
-fn index_differs_from_head(
+/// different from the reference's tree — git's `wt_status.committable`, which
+/// decides a dry run's exit status. An unmerged entry always counts as
+/// committable.
+///
+/// The reference is `HEAD` for an ordinary commit and `HEAD^1` under `--amend`
+/// (builtin/commit.c:1035-1036), which is the same split `run_status()` makes.
+fn index_differs_from_reference(
     repo: &gix::Repository,
     index: Option<&gix::index::File>,
+    reference: super::status::Reference,
 ) -> Result<bool> {
     let owned;
     let index = match index {
@@ -2377,11 +2432,14 @@ fn index_differs_from_head(
     if index.entries().iter().any(|e| e.stage() != Stage::Unconflicted) {
         return Ok(true);
     }
-    let head_tree = match repo.head()?.try_peel_to_id()? {
+    // `if (repo_get_oid(parent, &oid))` — an unresolvable parent (an amend of a
+    // root commit, or a commit with no `HEAD` yet) makes git fall back to "is
+    // there anything in the index at all", which the empty tree stands in for.
+    let reference_tree = match repo.rev_parse_single(reference.spec()).ok() {
         Some(id) => Some(repo.find_commit(id.detach())?.tree_id()?.detach()),
         None => None,
     };
-    let old = match head_tree {
+    let old = match reference_tree {
         Some(t) => flatten(&repo.index_from_tree(&t)?),
         None => Vec::new(),
     };

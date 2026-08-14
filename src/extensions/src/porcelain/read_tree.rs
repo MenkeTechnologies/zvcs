@@ -30,6 +30,13 @@
 //! * `-i`, `-n`/`--dry-run`, `-q`/`--quiet`, `-v`/`--verbose`,
 //!   `--index-output=<file>`, `--exclude-per-directory=<file>`,
 //!   `--[no-]sparse-checkout`, `--[no-]recurse-submodules`, `--[no-]debug-unpack`.
+//! * `--no-super-prefix` — the hidden `OPT__SUPER_PREFIX` in its unset sense,
+//!   which restores the `NULL` this port never leaves, so it is an exact no-op.
+//!   The *set* sense (`--super-prefix=<p>`) is refused: git threads the value
+//!   through `super_prefixed()` (unpack-trees.c:85) to prefix the path in every
+//!   `ERRORMSG()` the read can emit, and those messages are rendered here from
+//!   the bare path. `--super-prefix` with no value is stock's own
+//!   `` error: option `super-prefix' requires a value `` (129, no usage block).
 //!
 //! Up-to-dateness is decided the way `ie_match_stat()` decides it: from the entry's
 //! cached `stat` data, not from content. A file whose mtime, size, inode or owner
@@ -102,7 +109,7 @@ use super::{Arg, LongOpt};
 /// reads it. `--index-output`, `--prefix` and `--exclude-per-directory` carry
 /// `PARSE_OPT_NONEG`; `--no-sparse-checkout` is an `OPT_BOOL` whose name already
 /// carries the `no-`, so `--sparse-checkout` is that same entry unset.
-const LONG_OPTS: &[LongOpt] = &[
+pub(super) const LONG_OPTS: &[LongOpt] = &[
     LongOpt { name: "super-prefix", neg: true, arg: Arg::Required },
     LongOpt { name: "index-output", neg: false, arg: Arg::Required },
     LongOpt { name: "empty", neg: true, arg: Arg::None },
@@ -466,6 +473,30 @@ pub(super) fn parse_args(argv: &[String]) -> Result<std::result::Result<Opts, Ex
                         reject!(fatal(format!("bad recurse-submodules argument: {v}")));
                     }
                 }
+            }
+            // `OPT__SUPER_PREFIX` (parse-options.h:573-575) is an
+            // `OPT_STRING_F(..., PARSE_OPT_HIDDEN)`, so it is negatable and its
+            // set sense demands a value. The unset sense restores the default
+            // `NULL`, which is the only state this port has, so it is an exact
+            // no-op rather than an unimplemented flag.
+            "no-super-prefix" => no_value!(),
+            "super-prefix" => {
+                // The set sense demands a value, and that refusal is stock's own
+                // — it outranks this port's gap, so it has to come first. Spelled
+                // out rather than via `value!()` because the value is never used:
+                // the macro's `i += 1` would be a dead advance.
+                if inline.is_none() && argv.get(i).is_none() {
+                    reject!(opt_err("option `super-prefix' requires a value"));
+                }
+                // git threads this through `super_prefixed()` (unpack-trees.c:85)
+                // to prefix the path in every `ERRORMSG()` this read can emit.
+                // Those messages are rendered here from the bare path, so
+                // honouring the flag would mean carrying it into each of them;
+                // accepting and ignoring it would silently print unprefixed
+                // paths where git prints prefixed ones.
+                anyhow::bail!(
+                    "unsupported --super-prefix (unpack-trees messages here are not super-prefixed)"
+                );
             }
             "prefix" => o.prefix = Some(value!()),
             "index-output" => o.index_output = Some(PathBuf::from(value!())),

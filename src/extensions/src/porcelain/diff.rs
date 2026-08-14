@@ -2689,7 +2689,7 @@ const KNOWN_SHORT: &[u8] = b"abcghilmnpqrstuvwzBCDEFGIMOPRSUWX0123";
 ///
 /// A long option is looked up without its `=<value>`; a short option carries its value
 /// attached (`-S<string>`, `-U3`), so only the letter is looked up.
-fn is_known_option(arg: &str) -> bool {
+pub(crate) fn is_known_option(arg: &str) -> bool {
     match arg.starts_with("--") {
         true => KNOWN_LONG.contains(&arg.split_once('=').map_or(arg, |(n, _)| n)),
         false => arg.as_bytes().get(1).is_some_and(|c| KNOWN_SHORT.contains(c)),
@@ -4253,7 +4253,7 @@ fn summary_mode_change(out: &mut Vec<u8>, d: &Delta, show_name: bool) {
 
 /// `pprint_rename()`: compress the common leading directory and trailing suffix of a
 /// rename/copy into `pfx{old-mid => new-mid}sfx`.
-fn pprint_rename(a: &[u8], b: &[u8]) -> Vec<u8> {
+pub(crate) fn pprint_rename(a: &[u8], b: &[u8]) -> Vec<u8> {
     let (la, lb) = (a.len(), b.len());
     // git walks NUL-terminated strings, so index past the end reads as NUL.
     let at = |s: &[u8], i: usize| -> u8 { if i < s.len() { s[i] } else { 0 } };
@@ -5112,9 +5112,22 @@ fn quoted_name(path: &BString) -> Vec<u8> {
     out
 }
 
+/// `name_a += (*name_a == '/')` (diff.c:1899-1900 in `builtin_diff()`, and again at
+/// diff.c:3899-3900 where the `diff --git` pair is built): exactly one leading
+/// slash comes off the name before the `a/` / `b/` prefix goes on. An index path
+/// never starts with `/`, so this only bites when the name came from the file
+/// system — but git applies it to every name it prefixes, and so does this.
+fn strip_one_leading_slash(path: &BString) -> &[u8] {
+    let bytes = path.as_slice();
+    match bytes.first() {
+        Some(b'/') => &bytes[1..],
+        _ => bytes,
+    }
+}
+
 /// `quote_two_c_style()` for a single prefixed name (the `---`/`+++` lines).
 fn quote_one(prefix: &[u8], path: &BString) -> Vec<u8> {
-    let s = path.as_slice();
+    let s = strip_one_leading_slash(path);
     if !needs_quote(prefix) && !needs_quote(s) {
         let mut out = prefix.to_vec();
         out.extend_from_slice(s);

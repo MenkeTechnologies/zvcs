@@ -73,16 +73,19 @@ usage: git update-ref [<options>] -d <refname> [<old-oid>]
 
 ";
 
-/// Every long option name git accepts, including the auto-generated negations.
-const LONG_NAMES: &[&str] = &[
-    "no-deref",
-    "deref",
-    "stdin",
-    "no-stdin",
-    "create-reflog",
-    "no-create-reflog",
-    "batch-updates",
-    "no-batch-updates",
+/// `cmd_update_ref`'s `struct option options[]` (builtin/update-ref.c), in table
+/// order, as [`super::resolve_long`] reads it. Only the entries with a
+/// `long_name` appear; `-m`, `-d` and `-z` have none.
+///
+/// `no-deref` is spelled with its negation baked into the name, so it is the
+/// *unset* sense of `deref` rather than a name of its own — which is why
+/// `--deref=x` is refused as ``option `no-no-deref' takes no value``:
+/// `optname()` prefixes `no-` to the table's own spelling.
+const LONG_OPTS: &[super::LongOpt] = &[
+    super::LongOpt { name: "no-deref",      neg: true, arg: super::Arg::None },
+    super::LongOpt { name: "stdin",         neg: true, arg: super::Arg::None },
+    super::LongOpt { name: "create-reflog", neg: true, arg: super::Arg::None },
+    super::LongOpt { name: "batch-updates", neg: true, arg: super::Arg::None },
 ];
 
 /// The parsed command line, mirroring the variables in git's `cmd_update_ref`.
@@ -258,16 +261,24 @@ fn parse_args(args: &[String]) -> Result<Opts, ExitCode> {
             return Err(ExitCode::from(129));
         }
         if let Some(long) = a.strip_prefix("--") {
-            // git splits `--name=value` first; none of these options take one.
-            let stem = long.split('=').next().unwrap_or(long);
-            match resolve_long(stem) {
-                Some(name) => apply_long(&mut o, name),
-                None => {
+            let (opt, unset) = match super::resolve_long(LONG_OPTS, long) {
+                super::Resolved::One(opt, unset) => (opt, unset),
+                super::Resolved::Ambiguous(first, second) => {
+                    return Err(super::ambiguous_option(a, &first, &second, USAGE))
+                }
+                super::Resolved::Unknown => {
                     eprintln!("error: unknown option `{long}'");
                     eprint!("{USAGE}");
                     return Err(ExitCode::from(129));
                 }
+            };
+            // Every entry here is a flag, so an attached value is
+            // `PARSE_OPT_ERROR` out of `get_value()`: one line, no usage block.
+            if long.contains('=') {
+                eprintln!("error: option `{}' takes no value", optname(opt, unset));
+                return Err(ExitCode::from(129));
             }
+            apply_long(&mut o, opt.name, !unset);
             i += 1;
             continue;
         }
@@ -313,28 +324,28 @@ fn parse_args(args: &[String]) -> Result<Opts, ExitCode> {
     Ok(o)
 }
 
-/// Resolve one long option name, allowing any unambiguous abbreviation.
-fn resolve_long(stem: &str) -> Option<&'static str> {
-    if let Some(exact) = LONG_NAMES.iter().find(|n| **n == stem) {
-        return Some(*exact);
+/// `optname()` (parse-options.c:69-91) for a long option: the table's own
+/// spelling, with `no-` prefixed when the unset sense was selected. That is
+/// literally `"no-%s"` on `long_name`, so an entry already named `no-deref`
+/// reports as `no-no-deref` — verified against stock 2.55.0, where
+/// `git update-ref --deref=x` says ``error: option `no-no-deref' takes no
+/// value``.
+fn optname(opt: &super::LongOpt, unset: bool) -> String {
+    match unset {
+        true => format!("no-{}", opt.name),
+        false => opt.name.to_string(),
     }
-    let mut hits = LONG_NAMES.iter().filter(|n| n.starts_with(stem));
-    let first = hits.next()?;
-    hits.next().is_none().then_some(*first)
 }
 
-/// Set the flag a resolved long option controls.
-fn apply_long(o: &mut Opts, name: &str) {
+/// Set the flag a resolved long option controls. `set` is the sense the spelling
+/// selected, so `--deref` reaches the `no-deref` entry with `set == false`.
+fn apply_long(o: &mut Opts, name: &str, set: bool) {
     match name {
-        "no-deref" => o.no_deref = true,
-        "deref" => o.no_deref = false,
-        "stdin" => o.read_stdin = true,
-        "no-stdin" => o.read_stdin = false,
-        "create-reflog" => o.create_reflog = true,
-        "no-create-reflog" => o.create_reflog = false,
-        "batch-updates" => o.batch_updates = true,
-        "no-batch-updates" => o.batch_updates = false,
-        _ => unreachable!("resolve_long only yields known names"),
+        "no-deref" => o.no_deref = set,
+        "stdin" => o.read_stdin = set,
+        "create-reflog" => o.create_reflog = set,
+        "batch-updates" => o.batch_updates = set,
+        _ => unreachable!("resolve_long only returns LONG_OPTS entries"),
     }
 }
 

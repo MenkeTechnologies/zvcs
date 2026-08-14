@@ -310,6 +310,22 @@ const STORE_USAGE: &str = r#"usage: git stash store [(-m | --message) <message>]
 
 "#;
 
+/// `git stash export -h` over `export_stash()`'s table (builtin/stash.c:2431-2438).
+/// `--print` is an `OPT_CMDMODE`, which is why it alone has no `--[no-]` row.
+const EXPORT_USAGE: &str = "\
+usage: git stash export (--print | --to-ref <ref>) [<stash>...]
+
+    --print               print the object ID instead of writing it to a ref
+    --[no-]to-ref <ref>   save the data to the given ref
+
+";
+
+/// `git stash import -h`. `import_stash()`'s table is `OPT_END()` alone.
+const IMPORT_USAGE: &str = "\
+usage: git stash import <commit>
+
+";
+
 /// `git stash list -h`, which forwards everything else to `git log`.
 const LIST_USAGE: &str = r#"usage: git stash list [<log-options>]
 
@@ -375,6 +391,14 @@ pub(super) const POP_OPTS: &[LongOpt] = APPLY_OPTS.split_at(2).0;
 
 /// `drop_stash()`'s table (builtin/stash.c:862-865): `OPT__QUIET` alone.
 pub(super) const DROP_OPTS: &[LongOpt] = APPLY_OPTS.split_at(1).0;
+
+/// `export_stash()`'s table (builtin/stash.c:2431-2438). `--print` is an
+/// `OPT_CMDMODE`, i.e. `OPT_SET_INT_F(..., PARSE_OPT_NONEG)`, so it has no
+/// `--no-` sense; `--to-ref` is a plain `OPT_STRING` and does.
+const EXPORT_OPTS: &[LongOpt] = &[
+    LongOpt { name: "print", neg: false, arg: Arg::None },
+    LongOpt { name: "to-ref", neg: true, arg: Arg::Required },
+];
 
 /// `clear_stash()` (:319-321), `branch_stash()` (:918-920) and `import_stash()`
 /// (:2276-2278) each declare `OPT_END()` and nothing else, so no long option
@@ -586,6 +610,50 @@ pub fn stash(args: &[String]) -> Result<ExitCode> {
             };
             let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
             push(&repo, &opts)
+        }
+        // Neither body is ported, but `parse_options()` runs before either one,
+        // so the option surface is still git's: `-h` and `--help-all` print the
+        // sub-command's block on stdout and an unclaimed flag is refused with it
+        // on stderr, both at 129. Only a well-formed invocation reaches the bail.
+        Some(sub @ ("export" | "import")) => {
+            let (usage, table) = match sub {
+                "export" => (EXPORT_USAGE, EXPORT_OPTS),
+                _ => (IMPORT_USAGE, NO_OPTS),
+            };
+            let rest = &args[1..];
+            let mut i = 0;
+            while let Some(a) = rest.get(i).map(String::as_str) {
+                i += 1;
+                // `PARSE_OPT_KEEP_DASHDASH` leaves the `--` in argv but still
+                // ends the option scan, so nothing past it is an option.
+                if a == "--" {
+                    break;
+                }
+                if super::asks_for_help(a, "") {
+                    return Ok(super::show_usage(usage));
+                }
+                if !a.starts_with('-') || a == "-" {
+                    continue;
+                }
+                let resolved = match canonical(a, table, usage) {
+                    Ok(name) => name,
+                    Err(code) => return Ok(code),
+                };
+                match resolved.as_ref() {
+                    "--print" | "--no-to-ref" => {}
+                    // `OPT_STRING` takes the next argument when no `=<value>` is
+                    // attached, and `get_arg()` refuses at 129 when there is
+                    // none — which is also what keeps a following `-h` from
+                    // being read as a request for help.
+                    "--to-ref" => match rest.get(i) {
+                        Some(_) => i += 1,
+                        None => return Ok(super::missing_option_value("--to-ref")),
+                    },
+                    other if other.starts_with("--to-ref=") => {}
+                    _ => return Ok(usage_error(a, usage)),
+                }
+            }
+            crate::git_fatal!("`stash {sub}` is not ported")
         }
         Some(other) => crate::git_fatal!("{other} is not a stash command"),
     }
@@ -1506,7 +1574,14 @@ fn show_stash(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
     };
     for a in args {
         match a.as_str() {
+            // `show_stash()` parses under `PARSE_OPT_KEEP_UNKNOWN_OPT`, where
+            // `register_abbrev()` returns without recording
+            // (parse-options.c:502-503), so these names match exactly or not at
+            // all. `--only-untracked` is `OPT_SET_INT_F(..., PARSE_OPT_NONEG)`
+            // and so has no negation; `-u` is a plain `OPT_SET_INT`, and its
+            // `--no-` sense resets the field to `UNTRACKED_NONE`.
             "-u" | "--include-untracked" => untracked_mode = ShowUntracked::Include,
+            "--no-include-untracked" => untracked_mode = ShowUntracked::No,
             "--only-untracked" => untracked_mode = ShowUntracked::Only,
             s if s.starts_with('-') && s != "-" => diff_flags.push(a.clone()),
             _ => stash_specs.push(a.clone()),
@@ -1520,6 +1595,26 @@ fn show_stash(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
         Ok(spec) => spec.id,
         Err(code) => return Ok(code),
     };
+
+    // What `setup_revisions()` declines is `show_stash`'s problem, not the diff
+    // parser's. git pushes every dashed word into `revision_args`, runs
+    // `setup_revisions_from_strvec()` — which *consumes* what it understands and
+    // leaves the rest at the front rather than complaining — and then:
+    //
+    // ```c
+    //         setup_revisions_from_strvec(&revision_args, &rev, NULL);
+    //         if (revision_args.nr > 1)
+    //                 goto usage;
+    // ```
+    //
+    // with `usage:` reaching `usage_with_options(git_stash_show_usage, options)`.
+    // So the block a rejected option prints is *stash show's*, on stderr at 129,
+    // with no `error:` line — never `git diff`'s, which is what forwarding the
+    // token to this port's `diff` produced instead.
+    if diff_flags.iter().any(|f| !show_accepts(f)) {
+        eprint!("{SHOW_USAGE}");
+        return Ok(ExitCode::from(129));
+    }
 
     let commit = repo.find_commit(commit_id)?;
     let parents: Vec<ObjectId> = commit.parent_ids().map(|id| id.detach()).collect();
@@ -1575,6 +1670,32 @@ fn show_stash(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
     diff_flags.push(left);
     diff_flags.push(right);
     super::diff::diff(&diff_flags)
+}
+
+/// The seven names `git diff` resolves that `git stash show` does not.
+///
+/// `cmd_diff()` claims these itself, before and outside `setup_revisions()`
+/// (builtin/diff.c) — so they exist for `git diff` and are leftovers for
+/// `show_stash()`, which only ever runs `setup_revisions()`. Verified by putting
+/// every name in [`super::diff::is_known_option`]'s table through stock git
+/// 2.55.0 as `git stash show <name>`: these seven answer with the `stash show`
+/// usage block, the other 164 do not.
+const SHOW_NOT_A_REVISION_OPT: &[&str] = &[
+    "--base",
+    "--cached",
+    "--no-index",
+    "--ours",
+    "--staged",
+    "--theirs",
+    "-q",
+];
+
+/// Whether `setup_revisions()` would claim this option for `git stash show`.
+///
+/// The union `git diff` accepts, less the handful only `cmd_diff()` reaches.
+fn show_accepts(flag: &str) -> bool {
+    let name = flag.split_once('=').map_or(flag, |(n, _)| n);
+    super::diff::is_known_option(flag) && !SHOW_NOT_A_REVISION_OPT.contains(&name)
 }
 
 /// What `git stash show`'s `-u`/`--only-untracked` ask of the `^3` tree.
@@ -1680,7 +1801,14 @@ fn list(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
     rf.push("--first-parent".into());
     rf.extend(args.iter().cloned());
     rf.push("refs/stash".into());
-    super::reflog_show_as_log(&rf)
+    // `list_stash()` ends on `return run_command(&cp)`, and `cmd_stash` returns
+    // `!!fn(...)` (builtin/stash.c:2496), so the child's status only survives as
+    // "did it fail": `git stash list --zzbogus` prints `git log`'s
+    // `fatal: unrecognized argument: --zzbogus` and then exits **1**, not 128.
+    // The forwarded parser's message is git's; the forwarded parser's exit code
+    // is not.
+    let status = super::reflog_show_as_log_status(&rf)?;
+    Ok(ExitCode::from(u8::from(status != 0)))
 }
 
 /// `git stash apply` / `pop` — restore `stash@{n}` onto a clean worktree+index.
@@ -3271,4 +3399,38 @@ mod tests {
         assert_eq!(named, v(&["--zzbogus"]));
     }
 
+    /// `show_stash()` runs `setup_revisions()` and nothing else, so the options
+    /// `cmd_diff()` claims for itself are leftovers here — and a leftover is what
+    /// sends git to `usage_with_options(git_stash_show_usage, options)`.
+    ///
+    /// Forwarding the token to this port's `diff` instead printed *`git diff`'s*
+    /// block, which is the wrong command's synopsis for a `git stash show`
+    /// command line. The seven names below are the entire difference between the
+    /// two surfaces, measured by putting every name `diff` resolves through stock
+    /// git 2.55.0 as `git stash show <name>`; the accepted list is a sample of
+    /// the 164 that answered normally, including the negations that make
+    /// `--no-stat` (rejected, no table entry) and `--no-renames` (accepted) two
+    /// different answers.
+    #[test]
+    fn show_accepts_what_setup_revisions_claims_and_nothing_cmd_diff_owns() {
+        for flag in ["--base", "--cached", "--no-index", "--ours", "--staged", "--theirs", "-q"] {
+            assert!(!show_accepts(flag), "stash show must not claim {flag}");
+        }
+        for flag in [
+            "--stat",
+            "--numstat",
+            "--exit-code",
+            "--no-color",
+            "--no-renames",
+            "--no-prefix",
+            "-U3",
+            "--find-object=deadbeef",
+        ] {
+            assert!(show_accepts(flag), "stash show must claim {flag}");
+        }
+        // Not a diff option at all, so it is a leftover for the same reason.
+        for flag in ["--zzbogus", "--zzbogus=x", "--no-stat"] {
+            assert!(!show_accepts(flag), "stash show must not claim {flag}");
+        }
+    }
 }

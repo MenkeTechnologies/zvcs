@@ -286,6 +286,25 @@ fn canonical<'a>(
     }
 }
 
+/// `parse_options()`' built-in help, asked of a *sub-command's* own parser.
+///
+/// Every `git remote` sub-command runs its own `parse_options()` over its own
+/// `struct option options[]`, so once the sub-command word has been read `-h`
+/// stops being `cmd_remote`'s question and becomes that sub-command's:
+/// `git remote add -h` prints `builtin_remote_add_usage`, not
+/// `builtin_remote_usage`. Both spellings reach
+/// `usage_with_options_internal(..., USAGE_TO_STDOUT)`, so the block goes to
+/// **stdout** with no `error:` line — the one thing that separates asking for
+/// help from being refused, since both exit 129.
+///
+/// `shorts` names the sub-command's argument-less short options, which
+/// [`super::asks_for_help`] needs to know where a cluster stops being understood;
+/// none of `remote`'s tables has a `PARSE_OPT_HIDDEN` entry, so `USAGE_FULL` is
+/// the block `-h` prints.
+fn help_requested(tok: &str, shorts: &str, text: &str) -> Option<ExitCode> {
+    super::asks_for_help(tok, shorts).then(|| super::show_usage(text))
+}
+
 /// Print a usage block and return git's usage exit code.
 fn usage(text: &str) -> Result<ExitCode> {
     eprint!("{text}");
@@ -556,6 +575,9 @@ fn add(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
     let mut i = 0;
     while let Some(orig) = args.get(i).map(String::as_str) {
         i += 1;
+        if let Some(code) = help_requested(orig, "f", USAGE_ADD) {
+            return Ok(code);
+        }
         let resolved = match canonical(orig, OPTS_ADD, USAGE_ADD) {
             Ok(name) => name,
             Err(code) => return Ok(code),
@@ -696,6 +718,9 @@ fn add(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
 fn rename(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
     let mut pos: Vec<&str> = Vec::new();
     for orig in args {
+        if let Some(code) = help_requested(orig, "", USAGE_RENAME) {
+            return Ok(code);
+        }
         let resolved = match canonical(orig, OPTS_RENAME, USAGE_RENAME) {
             Ok(name) => name,
             Err(code) => return Ok(code),
@@ -860,6 +885,12 @@ fn rename(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
 fn remove(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
     let mut pos: Vec<&str> = Vec::new();
     for a in args {
+        // An empty table is still a table `parse_options()` answers `-h` against,
+        // which is why the help test comes before the walk that rejects every
+        // other dashed word.
+        if let Some(code) = help_requested(a, "", USAGE_REMOVE) {
+            return Ok(code);
+        }
         // The table is `OPT_END()` alone, so nothing resolves and the walk below
         // rejects every dashed word; the call is here so the option surface is
         // derived from the C table rather than assumed.
@@ -953,6 +984,9 @@ fn set_head(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
     let mut delete = false;
     let mut pos: Vec<&str> = Vec::new();
     for orig in args {
+        if let Some(code) = help_requested(orig, "ad", USAGE_SET_HEAD) {
+            return Ok(code);
+        }
         let resolved = match canonical(orig, OPTS_SET_HEAD, USAGE_SET_HEAD) {
             Ok(name) => name,
             Err(code) => return Ok(code),
@@ -1049,6 +1083,9 @@ fn set_branches(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
     let mut append = false;
     let mut pos: Vec<&str> = Vec::new();
     for orig in args {
+        if let Some(code) = help_requested(orig, "", USAGE_SET_BRANCHES) {
+            return Ok(code);
+        }
         let resolved = match canonical(orig, OPTS_SET_BRANCHES, USAGE_SET_BRANCHES) {
             Ok(name) => name,
             Err(code) => return Ok(code),
@@ -1098,6 +1135,9 @@ fn get_url(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
     let mut all = false;
     let mut pos: Vec<&str> = Vec::new();
     for a in args {
+        if let Some(code) = help_requested(a, "", USAGE_GET_URL) {
+            return Ok(code);
+        }
         let resolved = match canonical(a, OPTS_GET_URL, USAGE_GET_URL) {
             Ok(name) => name,
             Err(code) => return Ok(code),
@@ -1143,6 +1183,9 @@ fn set_url(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
     let mut delete = false;
     let mut pos: Vec<&str> = Vec::new();
     for a in args {
+        if let Some(code) = help_requested(a, "", USAGE_SET_URL) {
+            return Ok(code);
+        }
         let resolved = match canonical(a, OPTS_SET_URL, USAGE_SET_URL) {
             Ok(name) => name,
             Err(code) => return Ok(code),
@@ -1267,6 +1310,9 @@ fn show(repo: &gix::Repository, args: &[String], verbose: bool) -> Result<ExitCo
     let mut no_query = false;
     let mut names: Vec<&str> = Vec::new();
     for a in args {
+        if let Some(code) = help_requested(a, "n", USAGE_SHOW) {
+            return Ok(code);
+        }
         // `show`'s only option is `OPT_BOOL('n', NULL, ...)` — short-only, so
         // there is no long spelling at all and `--no-query` is as unknown to
         // stock git as any other `--x` (verified against 2.55.0:
@@ -1832,6 +1878,9 @@ fn prune(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
     let mut dry_run = false;
     let mut pos: Vec<&str> = Vec::new();
     for a in args {
+        if let Some(code) = help_requested(a, "n", USAGE_PRUNE) {
+            return Ok(code);
+        }
         let resolved = match canonical(a, OPTS_PRUNE, USAGE_PRUNE) {
             Ok(name) => name,
             Err(code) => return Ok(code),
@@ -2084,6 +2133,9 @@ fn update(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
     let mut do_prune = false;
     let mut pos: Vec<&str> = Vec::new();
     for a in args {
+        if let Some(code) = help_requested(a, "p", USAGE_UPDATE) {
+            return Ok(code);
+        }
         let resolved = match canonical(a, OPTS_UPDATE, USAGE_UPDATE) {
             Ok(name) => name,
             Err(code) => return Ok(code),

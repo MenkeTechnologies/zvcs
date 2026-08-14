@@ -12,6 +12,84 @@ use gix::hash::ObjectId;
 use gix::prelude::ObjectIdExt;
 use regex::bytes::{Regex, RegexBuilder};
 
+// ---------------------------------------------------------------------------
+// usage blocks — one per `parse_options()` call in builtin/reflog.c.
+//
+// Every sub-command runs its own parser over its own `struct option options[]`,
+// so once the sub-command word has been read `-h` is that sub-command's question
+// and prints that sub-command's block: `git reflog expire -h` renders
+// `reflog_expire_usage`, never `reflog_usage`. `--help-all` renders `USAGE_FULL`,
+// which is the same block for all seven — no table here carries a
+// `PARSE_OPT_HIDDEN` entry.
+// ---------------------------------------------------------------------------
+
+/// `cmd_reflog_show`'s block (builtin/reflog.c:40-43). Its table is `OPT_END()`
+/// alone; everything else is forwarded to `cmd_log_reflog()`.
+const SHOW_USAGE: &str = "\
+usage: git reflog [show] [<log-options>] [<ref>]
+
+";
+
+/// `cmd_reflog_list`'s block (builtin/reflog.c:45-48), table `OPT_END()`.
+const LIST_USAGE: &str = "\
+usage: git reflog list
+
+";
+
+/// `cmd_reflog_exists`'s block (builtin/reflog.c:50-53), table `OPT_END()`.
+const EXISTS_USAGE: &str = "\
+usage: git reflog exists <ref>
+
+";
+
+/// `cmd_reflog_write`'s block (builtin/reflog.c:55-58), table `OPT_END()`.
+const WRITE_USAGE: &str = "\
+usage: git reflog write <ref> <old-oid> <new-oid> <message>
+
+";
+
+/// `cmd_reflog_delete`'s block over its table (builtin/reflog.c:310-321).
+const DELETE_USAGE: &str = "\
+usage: git reflog delete [--rewrite] [--updateref]
+                         [--dry-run | -n] [--verbose] <ref>@{<specifier>}...
+
+    -n, --[no-]dry-run    do not actually prune any entries
+    --[no-]rewrite        rewrite the old SHA1 with the new SHA1 of the entry that now precedes it
+    --[no-]updateref      update the reference to the value of the top reflog entry
+    --[no-]verbose        print extra information on screen
+
+";
+
+/// `cmd_reflog_drop`'s block over its table (builtin/reflog.c:358-363).
+const DROP_USAGE: &str = "\
+usage: git reflog drop [--all [--single-worktree] | <refs>...]
+
+    --[no-]all            drop the reflogs of all references
+    --[no-]single-worktree
+                          drop reflogs from the current worktree only
+
+";
+
+/// `cmd_reflog_expire`'s block over its table (builtin/reflog.c:190-213).
+const EXPIRE_USAGE: &str = "\
+usage: git reflog expire [--expire=<time>] [--expire-unreachable=<time>]
+                         [--rewrite] [--updateref] [--stale-fix]
+                         [--dry-run | -n] [--verbose] [--all [--single-worktree] | <refs>...]
+
+    -n, --[no-]dry-run    do not actually prune any entries
+    --[no-]rewrite        rewrite the old SHA1 with the new SHA1 of the entry that now precedes it
+    --[no-]updateref      update the reference to the value of the top reflog entry
+    --[no-]verbose        print extra information on screen
+    --expire <timestamp>  prune entries older than the specified time
+    --expire-unreachable <timestamp>
+                          prune entries older than <time> that are not reachable from the current tip of the branch
+    --[no-]stale-fix      prune any reflog entries that point to broken commits
+    --[no-]all            process the reflogs of all references
+    --[no-]single-worktree
+                          limits processing to reflogs from the current worktree only
+
+";
+
 /// `usage_with_options()` over `builtin/reflog.c`'s subcommand table.
 const USAGE: &str = r"usage: git reflog [show] [<log-options>] [<ref>]
    or: git reflog list
@@ -224,18 +302,39 @@ pub fn reflog(args: &[String]) -> Result<ExitCode> {
         Some("exists") => ("exists", &args[1..]),
         Some("delete") => ("delete", &args[1..]),
         Some("expire") => ("expire", &args[1..]),
-        Some(s @ ("write" | "drop")) => bail!(
-            "`reflog {s}` is not ported: the reflog write path (entry selectors, \
-             relinking, --rewrite/--updateref, and the expire option set) has no \
-             implementation yet"
-        ),
+        // `parse_options()` answers help before the sub-command body runs, so
+        // these two print their blocks even though nothing behind them is ported.
+        Some(s @ ("write" | "drop")) => {
+            let block = if s == "drop" { DROP_USAGE } else { WRITE_USAGE };
+            if args[1..].iter().any(|a| super::asks_for_help(a, "")) {
+                return Ok(super::show_usage(block));
+            }
+            bail!(
+                "`reflog {s}` is not ported: the reflog write path (entry selectors, \
+                 relinking, --rewrite/--updateref, and the expire option set) has no \
+                 implementation yet"
+            )
+        }
         // Anything else is a `<ref>` for the implicit `show`.
         _ => ("show", args),
     };
 
     let repo = gix::discover(".")?;
     match sub {
-        "show" => show(&repo, rest, Tweak::Reflog),
+        "show" => {
+            // `cmd_reflog_show`'s table is empty, so no token is ever a value and
+            // each is tested on its own. `PARSE_OPT_KEEP_DASHDASH` leaves the `--`
+            // in argv for the revision parser but still breaks the option loop,
+            // so nothing past it asks for help.
+            if rest
+                .iter()
+                .take_while(|a| a.as_str() != "--")
+                .any(|a| super::asks_for_help(a, ""))
+            {
+                return Ok(super::show_usage(SHOW_USAGE));
+            }
+            show(&repo, rest, Tweak::Reflog).map(ExitCode::from)
+        }
         "list" => list(&repo, rest),
         "exists" => exists(&repo, rest),
         "delete" => delete_entries(&repo, rest),
@@ -254,6 +353,19 @@ pub fn reflog(args: &[String]) -> Result<ExitCode> {
 /// latter. Every stash entry is a merge commit, so that tweak is the only reason
 /// `git stash list -p` renders a patch at all.
 pub fn reflog_show_as_log(args: &[String]) -> Result<ExitCode> {
+    reflog_show_as_log_status(args).map(ExitCode::from)
+}
+
+/// [`reflog_show_as_log`] with the status still readable as a number.
+///
+/// `cmd_stash` returns `!!fn(argc, argv, prefix, repo)` (builtin/stash.c:2496),
+/// so every sub-command's *return* value is squashed to 0 or 1 before it leaves
+/// the process: `git stash list --zzbogus` exits 1 even though the `git log` it
+/// spawned exited 128. Only the paths that `exit()` on their own — `die()` and
+/// `usage_with_options()` — keep their own status, which is why
+/// `git stash show --zzbogus` still exits 129. `std::process::ExitCode` cannot be
+/// read back, so `list_stash()`'s caller needs the number rather than the code.
+pub fn reflog_show_as_log_status(args: &[String]) -> Result<u8> {
     let repo = gix::discover(".")?;
     show(&repo, args, Tweak::Log)
 }
@@ -778,7 +890,7 @@ impl Decorations {
 }
 
 /// `git reflog show` — render the log of each `<ref>` (default `HEAD`).
-fn show(repo: &gix::Repository, rest: &[String], tweak: Tweak) -> Result<ExitCode> {
+fn show(repo: &gix::Repository, rest: &[String], tweak: Tweak) -> Result<u8> {
     let full_hex = repo.object_hash().len_in_hex();
     let mut opts = Opts {
         quote_high: repo
@@ -803,7 +915,7 @@ fn show(repo: &gix::Repository, rest: &[String], tweak: Tweak) -> Result<ExitCod
             DateMode::Unimplemented => opts.log_date_unsupported = Some(value),
             DateMode::Unknown => {
                 eprintln!("fatal: unknown date format {value}");
-                return Ok(ExitCode::from(128));
+                return Ok(128);
             }
         }
     }
@@ -847,11 +959,11 @@ fn show(repo: &gix::Repository, rest: &[String], tweak: Tweak) -> Result<ExitCod
                     } else {
                         eprintln!("error: option `{}' requires a value", &a[2..]);
                     }
-                    return Ok(ExitCode::from(128));
+                    return Ok(128);
                 };
                 let Ok(n) = v.parse::<usize>() else {
                     eprintln!("fatal: '{v}': not an integer");
-                    return Ok(ExitCode::from(128));
+                    return Ok(128);
                 };
                 if a == "--skip" {
                     opts.skip = n;
@@ -863,7 +975,7 @@ fn show(repo: &gix::Repository, rest: &[String], tweak: Tweak) -> Result<ExitCod
                 let (key, v) = s.split_once('=').expect("checked for `=` above");
                 let Ok(n) = v.parse::<usize>() else {
                     eprintln!("fatal: '{v}': not an integer");
-                    return Ok(ExitCode::from(128));
+                    return Ok(128);
                 };
                 if key == "--skip" {
                     opts.skip = n;
@@ -893,7 +1005,7 @@ fn show(repo: &gix::Repository, rest: &[String], tweak: Tweak) -> Result<ExitCod
                 DateMode::Unimplemented => note_first(&mut unimplemented, s.to_owned()),
                 DateMode::Unknown => {
                     eprintln!("fatal: unknown date format {}", &s["--date=".len()..]);
-                    return Ok(ExitCode::from(128));
+                    return Ok(128);
                 }
             },
             "--relative-date" => note_first(&mut unimplemented, a.to_owned()),
@@ -938,7 +1050,7 @@ fn show(repo: &gix::Repository, rest: &[String], tweak: Tweak) -> Result<ExitCod
                     Pretty::Unimplemented => note_first(&mut unimplemented, s.to_owned()),
                     Pretty::Invalid => {
                         eprintln!("fatal: invalid --pretty format: {v}");
-                        return Ok(ExitCode::from(128));
+                        return Ok(128);
                     }
                 }
             }
@@ -1037,7 +1149,7 @@ fn show(repo: &gix::Repository, rest: &[String], tweak: Tweak) -> Result<ExitCod
                         eprintln!(
                             "error: option `color' expects \"always\", \"auto\", or \"never\""
                         );
-                        return Ok(ExitCode::from(129));
+                        return Ok(129);
                     }
                 }
             }
@@ -1092,21 +1204,21 @@ fn show(repo: &gix::Repository, rest: &[String], tweak: Tweak) -> Result<ExitCod
             "fatal: options '--name-only', '--name-status', '--check', and '-s' \
              cannot be used together"
         );
-        return Ok(ExitCode::from(128));
+        return Ok(128);
     }
     opts.diff.resolve();
 
     if limited {
         eprintln!("fatal: cannot combine --walk-reflogs with history-limiting options");
-        return Ok(ExitCode::from(128));
+        return Ok(128);
     }
     if reverse {
         eprintln!("fatal: options '--reverse' and '--walk-reflogs' cannot be used together");
-        return Ok(ExitCode::from(128));
+        return Ok(128);
     }
     if let Some(arg) = unrecognized {
         eprintln!("fatal: unrecognized argument: {arg}");
-        return Ok(ExitCode::from(128));
+        return Ok(128);
     }
 
     // git compiles `--grep` patterns once the whole command line is parsed; a bad
@@ -1114,7 +1226,7 @@ fn show(repo: &gix::Repository, rest: &[String], tweak: Tweak) -> Result<ExitCod
     if !grep_patterns.is_empty() || !grep_reflog_patterns.is_empty() {
         // git names the origin of a bad pattern: `command line` for a message
         // grep, `header` for the `reflog` header grep `--grep-reflog` adds.
-        let compile = |pats: &[String], origin: &str| -> std::result::Result<Vec<Regex>, ExitCode> {
+        let compile = |pats: &[String], origin: &str| -> std::result::Result<Vec<Regex>, u8> {
             let mut compiled: Vec<Regex> = Vec::with_capacity(pats.len());
             for pat in pats {
                 let translated = match grep_kind {
@@ -1130,7 +1242,7 @@ fn show(repo: &gix::Repository, rest: &[String], tweak: Tweak) -> Result<ExitCod
                     Ok(re) => compiled.push(re),
                     Err(_) => {
                         eprintln!("fatal: {origin}, '{pat}': invalid regular expression");
-                        return Err(ExitCode::from(128));
+                        return Err(128);
                     }
                 }
             }
@@ -1162,7 +1274,7 @@ fn show(repo: &gix::Repository, rest: &[String], tweak: Tweak) -> Result<ExitCod
                     .map(|n| n.shorten().to_str_lossy().into_owned())
                     .unwrap_or_else(|| "master".to_owned());
                 eprintln!("fatal: your current branch '{branch}' does not have any commits yet");
-                return Ok(ExitCode::from(128));
+                return Ok(128);
             }
         }
         match resolve_spec(repo, "HEAD")? {
@@ -1190,7 +1302,7 @@ fn render(
     full_hex: usize,
     unimplemented: &Option<String>,
     tweak: Tweak,
-) -> Result<ExitCode> {
+) -> Result<u8> {
     let fallback_len = abbrev_len(repo, full_hex);
     // `diff_merges_default_to_first_parent()`, which only `git log`'s tweak hook
     // calls. Without it a merge entry has no diff in any format.
@@ -1429,14 +1541,14 @@ fn render(
     }
 
     std::io::stdout().write_all(&out)?;
-    Ok(ExitCode::SUCCESS)
+    Ok(0)
 }
 
 /// The outcome of resolving one non-option argument.
 enum Resolved {
     Section(Section),
     Empty,
-    Fatal(ExitCode),
+    Fatal(u8),
 }
 
 /// Resolve a `<ref>`, `<ref>@{<n>}` or `<ref>@{<date>}` argument the way git's
@@ -1473,7 +1585,7 @@ fn resolve_spec(repo: &gix::Repository, spec: &str) -> Result<Resolved> {
             }
             if n >= entries.len() {
                 eprintln!("fatal: log for '{base}' only has {} entries", entries.len());
-                return Ok(Resolved::Fatal(ExitCode::from(128)));
+                return Ok(Resolved::Fatal(128));
             }
             Ok(Resolved::Section(Section {
                 display: base.to_owned(),
@@ -3272,10 +3384,50 @@ fn read_block(data: &[u8], mut pos: usize, counts: &TzCounts, time_size: usize) 
 // list / exists
 // ---------------------------------------------------------------------------
 
+/// `parse_options()` over an `OPT_END()`-only table with no flags — the shape
+/// `list`, `exists` and `write` share.
+///
+/// Everything dashed is `PARSE_OPT_UNKNOWN` (reported with its `=<value>` intact
+/// and the block on stderr at 129) except the two help spellings, which reach the
+/// same block on stdout. `--` and `--end-of-options` end the scan and are dropped,
+/// leaving what follows for the caller to count.
+fn scan_no_options<'a>(
+    args: &'a [String],
+    usage: &str,
+) -> std::result::Result<Vec<&'a String>, ExitCode> {
+    let mut operands = Vec::new();
+    let mut literal = false;
+    for a in args {
+        if literal {
+            operands.push(a);
+            continue;
+        }
+        match a.as_str() {
+            "--" | "--end-of-options" => literal = true,
+            s if super::asks_for_help(s, "") => return Err(super::show_usage(usage)),
+            s if s.starts_with('-') && s != "-" => {
+                return Err(super::unknown_option(s, usage))
+            }
+            _ => operands.push(a),
+        }
+    }
+    Ok(operands)
+}
+
 /// `git reflog list` — every ref under `$GIT_DIR/logs` that owns a log file.
 fn list(repo: &gix::Repository, rest: &[String]) -> Result<ExitCode> {
-    if let Some(a) = rest.first() {
-        anyhow::bail!("unsupported argument {a:?} for `reflog list`");
+    // `cmd_reflog_list` parses an empty table with no flags, so every dashed word
+    // is `PARSE_OPT_UNKNOWN` and only then does the leftover count matter:
+    // ``error(_("%s does not accept arguments: '%s'"), "list", argv[0])``, whose
+    // -1 return reaches exit(3) as 255.
+    match scan_no_options(rest, LIST_USAGE) {
+        Err(code) => return Ok(code),
+        Ok(operands) => {
+            if let Some(a) = operands.first() {
+                eprintln!("error: list does not accept arguments: '{a}'");
+                return Ok(ExitCode::from(255));
+            }
+        }
     }
     if repo.git_dir() != repo.common_dir() {
         bail!("`reflog list` from a linked worktree is not supported");
@@ -3295,8 +3447,14 @@ fn list(repo: &gix::Repository, rest: &[String]) -> Result<ExitCode> {
 
 /// `git reflog exists <ref>` — a literal test for `$GIT_DIR/logs/<ref>`.
 fn exists(repo: &gix::Repository, rest: &[String]) -> Result<ExitCode> {
-    let [name] = rest else {
-        eprint!("usage: git reflog exists <ref>\n\n");
+    let operands = match scan_no_options(rest, EXISTS_USAGE) {
+        Ok(operands) => operands,
+        Err(code) => return Ok(code),
+    };
+    // `if (!argc) usage_with_options(...)` — no `error:` line, and only the
+    // *first* operand is read, so a second one is ignored rather than refused.
+    let Some(name) = operands.first() else {
+        eprint!("{EXISTS_USAGE}");
         return Ok(ExitCode::from(129));
     };
 
@@ -3322,13 +3480,13 @@ fn exists(repo: &gix::Repository, rest: &[String]) -> Result<ExitCode> {
 // ---------------------------------------------------------------------------
 
 /// Emit git's "unknown revision" fatal block verbatim and return its exit code.
-fn fatal_ambiguous(spec: &str) -> ExitCode {
+fn fatal_ambiguous(spec: &str) -> u8 {
     eprintln!(
         "fatal: ambiguous argument '{spec}': unknown revision or path not in the working tree."
     );
     eprintln!("Use '--' to separate paths from revisions, like this:");
     eprintln!("'git <command> [<revision>...] -- [<file>...]'");
-    ExitCode::from(128)
+    128
 }
 
 enum Selector<'a> {
@@ -3555,19 +3713,32 @@ fn delete_entries(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
     let mut updateref = false;
     let mut dry_run = false;
     let mut selectors: Vec<&str> = Vec::new();
+    let mut literal = false;
     for a in args {
+        if literal {
+            selectors.push(a);
+            continue;
+        }
         match a.as_str() {
+            "--" | "--end-of-options" => literal = true,
+            // `-n` is the only short entry in the table, so it is what
+            // `parse_short_opt()` consumes before the `h` test.
+            s if super::asks_for_help(s, "n") => return Ok(super::show_usage(DELETE_USAGE)),
             "--rewrite" => rewrite = true,
             "--updateref" => updateref = true,
             "-n" | "--dry-run" => dry_run = true,
-            "--verbose" | "-q" | "--quiet" => {}
-            s if s.starts_with('-') => anyhow::bail!("unsupported argument {s:?} for `reflog delete`"),
+            "--verbose" => {}
+            s if s.starts_with('-') && s != "-" => {
+                return Ok(super::unknown_option(s, DELETE_USAGE))
+            }
             s => selectors.push(s),
         }
     }
     if selectors.is_empty() {
-        eprintln!("usage: git reflog delete [--rewrite] [--updateref] [--dry-run] [--verbose] <ref>@{{<specifier>}}…");
-        return Ok(ExitCode::from(129));
+        // `return error(_("no reflog specified to delete"))` — a bare `error()`,
+        // so no usage block, and its -1 reaches exit(3) as 255.
+        eprintln!("error: no reflog specified to delete");
+        return Ok(ExitCode::from(255));
     }
 
     for spec in selectors {
@@ -3658,15 +3829,24 @@ fn expire_entries(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
             }
         }
     };
+    let mut literal = false;
     for a in args {
         let s = a.as_str();
+        if literal {
+            refs.push(s.to_owned());
+            continue;
+        }
         match s {
+            "--" | "--end-of-options" => literal = true,
+            // `-n` is `expire`'s only short entry, so it is what
+            // `parse_short_opt()` consumes before the `h` test that answers help.
+            _ if super::asks_for_help(s, "n") => return Ok(super::show_usage(EXPIRE_USAGE)),
             "--all" => all = true,
             "--single-worktree" => {}
             "-n" | "--dry-run" => dry_run = true,
             "--rewrite" => rewrite = true,
             "--updateref" => updateref = true,
-            "--stale-fix" | "--verbose" | "-q" | "--quiet" => {}
+            "--stale-fix" | "--verbose" => {}
             _ if s.starts_with("--expire-unreachable=") => {
                 let v = &s["--expire-unreachable=".len()..];
                 match cutoff(v) {
@@ -3681,7 +3861,9 @@ fn expire_entries(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
                     None => crate::git_fatal!("'{v}' is not a valid timestamp"),
                 }
             }
-            _ if s.starts_with('-') => anyhow::bail!("unsupported argument {s:?} for `reflog expire`"),
+            _ if s.starts_with('-') && s != "-" => {
+                return Ok(super::unknown_option(s, EXPIRE_USAGE))
+            }
             _ => refs.push(s.to_owned()),
         }
     }
@@ -3698,8 +3880,10 @@ fn expire_entries(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
         names.dedup();
         names
     } else if refs.is_empty() {
-        eprintln!("usage: git reflog expire [--expire=<time>] [--expire-unreachable=<time>] [--rewrite] [--updateref] [--stale-fix] [--dry-run] [--verbose] [--all [--single-worktree] | <refs>…]");
-        return Ok(ExitCode::from(129));
+        // `cmd_reflog_expire` loops over `argc` refs and says nothing when there
+        // are none: `git reflog expire` on its own is a successful no-op, not a
+        // usage error.
+        Vec::new()
     } else {
         refs.iter().map(|r| resolve_log_ref(repo, r)).collect()
     };

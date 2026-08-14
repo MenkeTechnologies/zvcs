@@ -265,26 +265,51 @@ pub fn into(
         let mut config = gix_config::File::default();
         let caps = {
             let caps = fs_capabilities.unwrap_or_else(|| gix_fs::Capabilities::probe(&dot_git));
+
+            // Git writes this file one `repo_config_set()` at a time, in the order
+            // `create_default_files()` (setup.c:2541-2635) makes the calls, and the
+            // file it leaves behind is a fixture every other test compares against.
+            // So the order below is git's call order, not a tidier one:
+            //
+            //  1. `initialize_repository_version()` (setup.c:2419) — the object
+            //     format first (which is why a SHA-256 repository opens with
+            //     `[extensions]`, before `[core]` exists at all), then
+            //     `core.repositoryformatversion`.
+            //  2. `core.filemode` (setup.c:2601), `core.bare` (2603/2606).
+            //  3. `core.logallrefupdates`, for a non-bare repository only (2609).
+            //  4. `core.symlinks`, written *only* as `false` and *only* when the
+            //     symlink probe failed (2624) — a filesystem that supports them
+            //     gets no key.
+            //  5. `core.ignorecase`, written only as `true` (2629) — likewise.
+            //  6. `core.precomposeunicode`, from
+            //     `probe_utf8_pathname_composition()` (compat/precompose_utf8.c:45),
+            //     which is a no-op macro off macOS and so writes nothing there.
+            #[cfg(feature = "sha256")]
+            if let Some(gix_hash::Kind::Sha256) = object_hash {
+                let mut extensions = config.new_section("extensions", None).expect("valid section name");
+                extensions.push("objectformat", gix_hash::Kind::Sha256.to_string())?;
+            }
             let mut core = config.new_section("core", None).expect("valid section name");
 
+            let format_version = match object_hash {
+                #[cfg(feature = "sha256")]
+                Some(gix_hash::Kind::Sha256) => "1",
+                _ => "0",
+            };
+            core.push("repositoryformatversion", format_version)?;
             core.push("filemode", bool(caps.executable_bit))?;
             core.push("bare", bool(bare))?;
-            core.push("logallrefupdates", bool(!bare))?;
-            core.push("symlinks", bool(caps.symlink))?;
-            core.push("ignorecase", bool(caps.ignore_case))?;
-            core.push("precomposeunicode", bool(caps.precompose_unicode))?;
-
-            match object_hash {
-                #[cfg(feature = "sha256")]
-                Some(gix_hash::Kind::Sha256) => {
-                    core.push("repositoryformatversion", "1")?;
-
-                    let mut extensions = config.new_section("extensions", None).expect("valid section name");
-                    extensions.push("objectformat", gix_hash::Kind::Sha256.to_string())?;
-                }
-                _ => {
-                    core.push("repositoryformatversion", "0")?;
-                }
+            if !bare {
+                core.push("logallrefupdates", "true")?;
+            }
+            if !caps.symlink {
+                core.push("symlinks", "false")?;
+            }
+            if caps.ignore_case {
+                core.push("ignorecase", "true")?;
+            }
+            if cfg!(target_os = "macos") {
+                core.push("precomposeunicode", bool(caps.precompose_unicode))?;
             }
 
             caps

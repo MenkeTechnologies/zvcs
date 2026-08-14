@@ -154,8 +154,20 @@ pub fn notes(args: &[String]) -> Result<ExitCode> {
         "list" => list(&repo, &notes_ref, sub_args),
         "show" => show(&repo, &notes_ref, sub_args),
         "get-ref" => {
+            // `get_ref()` runs a `parse_options()` of its own over an empty
+            // table before it counts what is left, so a dashed word is an
+            // unknown option rather than an extra argument — and `-h` is a
+            // question the empty table still answers.
+            for a in sub_args {
+                if is_help(a, "") {
+                    return Ok(sub_help(GET_REF_USAGE, &[]));
+                }
+                if a.starts_with('-') && a != "-" {
+                    return sub_usage(&unknown_opt(a), GET_REF_USAGE, &[]);
+                }
+            }
             if !sub_args.is_empty() {
-                return usage(&["git notes get-ref"], "too many arguments");
+                return sub_usage("too many arguments", GET_REF_USAGE, &[]);
             }
             println!("{notes_ref}");
             Ok(ExitCode::SUCCESS)
@@ -815,6 +827,10 @@ fn parse_msg_opts(
 
         match a {
             "--" => literal = true,
+            // Ahead of every `starts_with` arm below so that `--help-all=x`
+            // stays an unknown option, as `parse_options_step()`'s exact
+            // `strcmp()` leaves it.
+            _ if is_help(a, msg_shorts(sub)) => return Ok(Err(msg_sub_help(sub))),
             "-f" | "--force" => o.force = true,
             "--allow-empty" => o.allow_empty = true,
             "--stripspace" => o.stripspace = Some(true),
@@ -1131,19 +1147,6 @@ fn strip_space(input: &[u8]) -> Vec<u8> {
     out
 }
 
-/// git's `usage_with_options()` path: `error:` then the usage block, exit 129.
-fn usage(lines: &[&str], msg: &str) -> Result<ExitCode> {
-    eprintln!("error: {msg}");
-    for (n, l) in lines.iter().enumerate() {
-        if n == 0 {
-            eprintln!("usage: {l}");
-        } else {
-            eprintln!("   or: {l}");
-        }
-    }
-    Ok(ExitCode::from(129))
-}
-
 /// git's parse-options wording for an option it does not recognise: `--foo`
 /// becomes ``unknown option `foo'`` and `-x` becomes ``unknown switch `x'``.
 fn unknown_opt(a: &str) -> String {
@@ -1160,17 +1163,50 @@ fn unknown_opt(a: &str) -> String {
 /// option help (with its own trailing blank line) when the subcommand has any.
 fn sub_usage(msg: &str, lines: &[&str], options: &[&str]) -> Result<ExitCode> {
     eprintln!("error: {msg}");
+    eprint!("{}", rendered(lines, options));
+    Ok(ExitCode::from(129))
+}
+
+/// The same block [`sub_usage`] renders, reached the way `-h` reaches it:
+/// `usage_with_options_internal(..., USAGE_TO_STDOUT)` with no `error:` line.
+///
+/// Each `git notes` subcommand runs its own `parse_options()` over its own
+/// table, so once the subcommand word has been read the help question is that
+/// subcommand's — `git notes add -h` prints `git_notes_add_usage`, not
+/// `git_notes_usage`. Both still exit 129; the stream and the missing `error:`
+/// line are the whole difference from a refusal.
+fn sub_help(lines: &[&str], options: &[&str]) -> ExitCode {
+    super::show_usage(&rendered(lines, options))
+}
+
+/// Whether this argument is one of the spellings `parse_options()` answers
+/// itself, for a subcommand whose argument-less short options are `shorts`.
+///
+/// No `notes` table has a `PARSE_OPT_HIDDEN` entry, so `-h` and `--help-all`
+/// render the same block. `-m`/`-F`/`-c`/`-C` take values and so are absent from
+/// every `shorts` below: `git notes add -Ch` reuses the note named `h`, it does
+/// not ask for help.
+fn is_help(tok: &str, shorts: &str) -> bool {
+    super::asks_for_help(tok, shorts)
+}
+
+/// `usage_with_options_internal()`'s layout, stream-independent.
+fn rendered(lines: &[&str], options: &[&str]) -> String {
+    let mut out = String::new();
     for (n, l) in lines.iter().enumerate() {
-        eprintln!("{} {l}", if n == 0 { "usage:" } else { "   or:" });
+        out.push_str(if n == 0 { "usage: " } else { "   or: " });
+        out.push_str(l);
+        out.push('\n');
     }
-    eprintln!();
+    out.push('\n');
     if !options.is_empty() {
         for o in options {
-            eprintln!("{o}");
+            out.push_str(o);
+            out.push('\n');
         }
-        eprintln!();
+        out.push('\n');
     }
-    Ok(ExitCode::from(129))
+    out
 }
 
 const ADD_USAGE: &[&str] = &["git notes add [<options>] [<object>]"];
@@ -1224,6 +1260,15 @@ const REMOVE_OPTS: &[&str] = &[
     "    --[no-]ignore-missing attempt to remove non-existent note is not an error",
     "    --[no-]stdin          read object names from the standard input",
 ];
+const PRUNE_USAGE: &[&str] = &["git notes prune [<options>]"];
+const PRUNE_OPTS: &[&str] = &[
+    "    -n, --[no-]dry-run    do not remove, show only",
+    "    -v, --[no-]verbose    report pruned notes",
+];
+/// `get_ref()`'s table (builtin/notes.c:1111) is `OPT_END()` alone, so the block
+/// is the usage line and the blank line `usage_with_options_internal()` always
+/// ends on.
+const GET_REF_USAGE: &[&str] = &["git notes get-ref"];
 
 /// The `add`/`append`/`edit` usage block, chosen by the subcommand name.
 fn msg_sub_usage(sub: &str, msg: &str) -> Result<ExitCode> {
@@ -1231,6 +1276,24 @@ fn msg_sub_usage(sub: &str, msg: &str) -> Result<ExitCode> {
         "append" => sub_usage(msg, APPEND_USAGE, APPEND_OPTS),
         "edit" => sub_usage(msg, EDIT_USAGE, APPEND_OPTS),
         _ => sub_usage(msg, ADD_USAGE, ADD_OPTS),
+    }
+}
+
+/// The argument-less short options of `add`/`append`/`edit`: `-e` for all three,
+/// plus `add`'s own `OPT__FORCE`.
+fn msg_shorts(sub: &str) -> &'static str {
+    match sub {
+        "append" | "edit" => "e",
+        _ => "fe",
+    }
+}
+
+/// [`msg_sub_usage`]'s help twin, for the same three subcommands.
+fn msg_sub_help(sub: &str) -> ExitCode {
+    match sub {
+        "append" => sub_help(APPEND_USAGE, APPEND_OPTS),
+        "edit" => sub_help(EDIT_USAGE, APPEND_OPTS),
+        _ => sub_help(ADD_USAGE, ADD_OPTS),
     }
 }
 
@@ -1243,6 +1306,9 @@ fn list(repo: &gix::Repository, notes_ref: &str, args: &[String]) -> Result<Exit
     // "too many arguments"; `list` itself has no options of its own.
     let mut positional: Vec<&String> = Vec::new();
     for a in args {
+        if is_help(a, "") {
+            return Ok(sub_help(LIST_USAGE, &[]));
+        }
         if a.starts_with('-') && a != "-" {
             return sub_usage(&unknown_opt(a), LIST_USAGE, &[]);
         }
@@ -1285,6 +1351,9 @@ fn list(repo: &gix::Repository, notes_ref: &str, args: &[String]) -> Result<Exit
 fn show(repo: &gix::Repository, notes_ref: &str, args: &[String]) -> Result<ExitCode> {
     let mut positional: Vec<&String> = Vec::new();
     for a in args {
+        if is_help(a, "") {
+            return Ok(sub_help(SHOW_USAGE, &[]));
+        }
         if a.starts_with('-') && a != "-" {
             return sub_usage(&unknown_opt(a), SHOW_USAGE, &[]);
         }
@@ -1533,6 +1602,7 @@ fn copy(repo: &gix::Repository, notes_ref: &str, args: &[String]) -> Result<Exit
     while i < args.len() {
         let a = args[i].as_str();
         match a {
+            _ if is_help(a, "f") => return Ok(sub_help(COPY_USAGE, COPY_OPTS)),
             "-f" | "--force" => force = true,
             "--stdin" => stdin = true,
             "--for-rewrite" => {
@@ -1807,28 +1877,19 @@ fn prune(repo: &gix::Repository, notes_ref: &str, args: &[String]) -> Result<Exi
     let mut literal = false;
     for a in args {
         if literal {
-            return usage(&["git notes prune [<options>]"], "too many arguments");
+            return sub_usage("too many arguments", PRUNE_USAGE, PRUNE_OPTS);
         }
         match a.as_str() {
             // `--` ends option parsing; prune takes no positional, so anything
             // after it is one argument too many.
             "--" => literal = true,
+            s if is_help(s, "nv") => return Ok(sub_help(PRUNE_USAGE, PRUNE_OPTS)),
             "-n" | "--dry-run" => dry_run = true,
             "-v" | "--verbose" => verbose = true,
-            s if s.starts_with("--") => {
-                return usage(
-                    &["git notes prune [<options>]"],
-                    &format!("unknown option `{}'", &s[2..]),
-                )
-            }
             s if s.starts_with('-') && s != "-" => {
-                let switch = s[1..].chars().next().unwrap_or(' ');
-                return usage(
-                    &["git notes prune [<options>]"],
-                    &format!("unknown switch `{switch}'"),
-                );
+                return sub_usage(&unknown_opt(s), PRUNE_USAGE, PRUNE_OPTS)
             }
-            _ => return usage(&["git notes prune [<options>]"], "too many arguments"),
+            _ => return sub_usage("too many arguments", PRUNE_USAGE, PRUNE_OPTS),
         }
     }
     if let Some(code) = check_writable(notes_ref, "prune")? {
@@ -1871,6 +1932,7 @@ fn remove(repo: &gix::Repository, notes_ref: &str, args: &[String]) -> Result<Ex
     let mut specs: Vec<String> = Vec::new();
     for a in args {
         match a.as_str() {
+            s if is_help(s, "") => return Ok(sub_help(REMOVE_USAGE, REMOVE_OPTS)),
             "--ignore-missing" => ignore_missing = true,
             "--stdin" => from_stdin = true,
             s if s.starts_with('-') && s != "-" => {

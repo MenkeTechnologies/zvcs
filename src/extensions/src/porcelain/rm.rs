@@ -17,8 +17,19 @@
 //!
 //! Long options accept unambiguous abbreviations (`--dry`, `--cach`) and `--no-`
 //! negations (`--no-cached`), matching git's parse-options; the last spelling of a
-//! toggle wins. Unknown options/switches exit 129 with git's usage block; an empty
-//! or missing pathspec exits 128 ("No pathspec was given").
+//! toggle wins. Unknown options/switches exit 129 with git's usage block on
+//! stderr; an ambiguous abbreviation (`--p`, which names both
+//! `--pathspec-from-file` and `--pathspec-file-nul`) puts its message on stderr
+//! and the block on **stdout**, also 129; `` error: option `no-cached' takes no
+//! value `` and `` error: option `pathspec-from-file' requires a value `` are
+//! `PARSE_OPT_ERROR` and print no block at all. An empty or missing pathspec
+//! exits 128 ("No pathspec was given").
+//!
+//! The name is looked up in the option table *before* any `=<value>` is split
+//! off, which is what `parse_long_opt()` does and what keeps a value-carrying
+//! spelling from reaching an arm its bare form cannot:
+//! `git rm --no-pathspec-from-file=x <file>` used to clear the option and go on
+//! to delete `<file>`, where stock refuses at 129 without touching anything.
 //!
 //! Faithfully reproduced: literal, glob, and full magic-signature pathspecs
 //! (`:(glob)`, `:(literal)`, `:(icase)`, `:(top)`, `:(exclude)`/`:!`, `:(attr:…)`)
@@ -104,28 +115,24 @@ struct Opts {
     pathspec_file_nul: bool,
 }
 
-/// The long options `git rm` accepts, in the order git registers them.
-#[derive(Clone, Copy, PartialEq)]
-enum Long {
-    DryRun,
-    Quiet,
-    Cached,
-    Force,
-    IgnoreUnmatch,
-    Sparse,
-    PathspecFromFile,
-    PathspecFileNul,
-}
-
-const LONGS: &[(&str, Long)] = &[
-    ("dry-run", Long::DryRun),
-    ("quiet", Long::Quiet),
-    ("cached", Long::Cached),
-    ("force", Long::Force),
-    ("ignore-unmatch", Long::IgnoreUnmatch),
-    ("sparse", Long::Sparse),
-    ("pathspec-from-file", Long::PathspecFromFile),
-    ("pathspec-file-nul", Long::PathspecFileNul),
+/// `cmd_rm`'s `struct option builtin_rm_options[]` (builtin/rm.c:288-303), in
+/// table order, as [`super::resolve_long`] reads it. Only the entries carrying a
+/// `long_name` appear; `OPT_BOOL('r', NULL, …)` has none.
+///
+/// Every entry is negatable: `OPT__DRY_RUN` and the `OPT_BOOL`s are plain,
+/// `OPT__QUIET`/`OPT__FORCE` are `OPT_COUNTUP_F` whose only flags are
+/// `PARSE_OPT_NOARG` (plus `PARSE_OPT_NOCOMPLETE` on `--force`, which governs
+/// completion rather than negation), and `OPT_PATHSPEC_FROM_FILE` is an
+/// `OPT_FILENAME` with no flags at all.
+const LONG_OPTS: &[super::LongOpt] = &[
+    super::LongOpt { name: "dry-run",            neg: true, arg: super::Arg::None },
+    super::LongOpt { name: "quiet",              neg: true, arg: super::Arg::None },
+    super::LongOpt { name: "cached",             neg: true, arg: super::Arg::None },
+    super::LongOpt { name: "force",              neg: true, arg: super::Arg::None },
+    super::LongOpt { name: "ignore-unmatch",     neg: true, arg: super::Arg::None },
+    super::LongOpt { name: "sparse",             neg: true, arg: super::Arg::None },
+    super::LongOpt { name: "pathspec-from-file", neg: true, arg: super::Arg::Required },
+    super::LongOpt { name: "pathspec-file-nul",  neg: true, arg: super::Arg::None },
 ];
 
 /// `error: <msg>` + usage, exit 129 (git's usage-error convention).
@@ -139,28 +146,6 @@ fn usage_err(msg: impl std::fmt::Display) -> ExitCode {
 fn fatal(msg: impl std::fmt::Display) -> ExitCode {
     eprintln!("fatal: {msg}");
     ExitCode::from(128)
-}
-
-/// Resolve a long-option name (already stripped of `--` and any `no-`/`=value`) to
-/// its canonical option, honoring exact-match precedence then unambiguous prefix.
-/// `typed` is the whole argument after `--`, `=<value>` and any `no-` included:
-/// `error(_("unknown option `%s'"), ctx.argv[0] + 2)` (parse-options.c:
-/// 1215-1216) quotes it exactly as written, so `--quux=x` is reported as
-/// `quux=x` and not as the `quux` the lookup was done with.
-fn resolve_long(name: &str, typed: &str) -> std::result::Result<Long, ExitCode> {
-    if let Some((_, opt)) = LONGS.iter().find(|(n, _)| *n == name) {
-        return Ok(*opt);
-    }
-    let hits: Vec<Long> = LONGS
-        .iter()
-        .filter(|(n, _)| n.starts_with(name))
-        .map(|(_, o)| *o)
-        .collect();
-    match hits.len() {
-        1 => Ok(hits[0]),
-        0 => Err(usage_err(format!("unknown option `{typed}'"))),
-        _ => Err(usage_err(format!("ambiguous option: {name}"))),
-    }
 }
 
 pub fn rm(args: &[String]) -> Result<ExitCode> {
@@ -192,25 +177,29 @@ pub fn rm(args: &[String]) -> Result<ExitCode> {
             return Ok(super::show_usage(USAGE));
         }
         if let Some(body) = a.strip_prefix("--") {
-            let (name, inline_val) = match body.split_once('=') {
-                Some((n, v)) => (n, Some(v.to_string())),
-                None => (body, None),
-            };
-            let (negate, bare) = match name.strip_prefix("no-") {
-                Some(rest) => (true, rest),
-                None => (false, name),
-            };
-            let opt = match resolve_long(bare, body) {
-                Ok(o) => o,
-                Err(code) => return Ok(code),
-            };
-            // Value option.
-            if opt == Long::PathspecFromFile {
-                if negate {
-                    opts.pathspec_from_file = None;
-                    i += 1;
-                    continue;
+            // The table lookup happens on the whole body, *before* the
+            // `=<value>` split, exactly as `parse_long_opt()` does. Gating on
+            // table membership first is what stops a value-carrying spelling
+            // from escaping a restriction its bare form obeys:
+            // `--no-pathspec-from-file=x` used to clear the option and go on to
+            // remove the named files, where stock refuses at 129.
+            let (opt, unset) = match super::resolve_long(LONG_OPTS, body) {
+                super::Resolved::One(opt, unset) => (opt, unset),
+                super::Resolved::Ambiguous(first, second) => {
+                    return Ok(super::ambiguous_option(a, &first, &second, USAGE))
                 }
+                // `error(_("unknown option `%s'"), ctx.argv[0] + 2)` quotes the
+                // argument exactly as typed, `=<value>` and all.
+                super::Resolved::Unknown => {
+                    return Ok(usage_err(format!("unknown option `{body}'")))
+                }
+            };
+            let inline_val = body.split_once('=').map(|(_, v)| v.to_string());
+
+            // The set sense of the one value-taking entry is the only spelling
+            // that consumes a value; every other spelling, the unset sense of
+            // that same entry included, is a pure boolean.
+            if opt.arg == super::Arg::Required && !unset {
                 let val = match inline_val {
                     Some(v) => v,
                     None => match args.get(i + 1) {
@@ -218,27 +207,39 @@ pub fn rm(args: &[String]) -> Result<ExitCode> {
                             i += 1;
                             v.clone()
                         }
-                        None => return Ok(usage_err(format!("option `{bare}' requires a value"))),
+                        None => return Ok(super::missing_option_value("--pathspec-from-file")),
                     },
                 };
                 opts.pathspec_from_file = Some(val);
                 i += 1;
                 continue;
             }
-            // Boolean options never take an inline value.
             if inline_val.is_some() {
-                return Ok(usage_err(format!("option `{bare}' takes no value")));
+                // `PARSE_OPT_ERROR` out of `get_value()`: one line, no usage
+                // block, naming the entry the way `optname()` spells it — the
+                // table's own name, `no-`-prefixed for the unset sense,
+                // however far it was abbreviated.
+                let shown = match unset {
+                    true => format!("no-{}", opt.name),
+                    false => opt.name.to_string(),
+                };
+                eprintln!("error: option `{shown}' takes no value");
+                return Ok(ExitCode::from(129));
             }
-            let on = !negate;
-            match opt {
-                Long::DryRun => opts.dry_run = on,
-                Long::Quiet => opts.quiet = on,
-                Long::Cached => opts.cached = on,
-                Long::Force => opts.force = on,
-                Long::IgnoreUnmatch => opts.ignore_unmatch = on,
-                Long::Sparse => opts.sparse = on,
-                Long::PathspecFileNul => opts.pathspec_file_nul = on,
-                Long::PathspecFromFile => unreachable!(),
+
+            let on = !unset;
+            match opt.name {
+                "dry-run" => opts.dry_run = on,
+                "quiet" => opts.quiet = on,
+                "cached" => opts.cached = on,
+                "force" => opts.force = on,
+                "ignore-unmatch" => opts.ignore_unmatch = on,
+                "sparse" => opts.sparse = on,
+                "pathspec-file-nul" => opts.pathspec_file_nul = on,
+                // Reached only as `--no-pathspec-from-file`; the set sense
+                // returned above.
+                "pathspec-from-file" => opts.pathspec_from_file = None,
+                _ => unreachable!("resolve_long only returns LONG_OPTS entries"),
             }
             i += 1;
             continue;

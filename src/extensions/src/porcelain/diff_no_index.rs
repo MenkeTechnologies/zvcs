@@ -107,6 +107,78 @@ fn blob_id(data: &[u8]) -> gix::ObjectId {
         .expect("sha1 of an in-memory blob")
 }
 
+/// `diff_populate_filespec()` for a `--no-index` filespec, whose "object" is a
+/// path on disk.
+///
+/// A no-index filespec is identified by the name it prints, which is the path it
+/// was found at, so that name is the key. Reads are cached because rename
+/// detection asks for the same blob many times and the emitters ask again after.
+#[derive(Default)]
+struct DiskContent {
+    on_disk: std::collections::HashMap<BString, (PathBuf, u32)>,
+    cache: std::collections::HashMap<BString, Option<Vec<u8>>>,
+}
+
+impl DiskContent {
+    /// Remember where a side's blob lives. A side that is not there has nothing
+    /// to read and is never asked for.
+    fn register(&mut self, side: &Side) {
+        if side.file.is_some() {
+            self.on_disk
+                .insert(side.name.clone(), (side.file.clone().expect("just checked"), side.mode));
+        }
+    }
+
+    /// The bytes of the named side, or `None` when it cannot be read — git's
+    /// `diff_populate_filespec()` returning non-zero.
+    fn bytes(&mut self, name: &BString) -> Option<Vec<u8>> {
+        if let Some(hit) = self.cache.get(name) {
+            return hit.clone();
+        }
+        let read = self.on_disk.get(name).and_then(|(path, mode)| {
+            read_side(&Side { name: name.clone(), file: Some(path.clone()), mode: *mode }).ok()
+        });
+        self.cache.insert(name.clone(), read.clone());
+        read
+    }
+}
+
+impl super::diffcore_rename::Content for DiskContent {
+    fn size(&mut self, spec: &super::diffcore_rename::FileSpec) -> Option<u64> {
+        self.bytes(&spec.path).map(|data| data.len() as u64)
+    }
+
+    fn data(&mut self, spec: &super::diffcore_rename::FileSpec) -> Option<Vec<u8>> {
+        self.bytes(&spec.path)
+    }
+}
+
+/// The `diff_filespec` a side stands for. A no-index side has no object id until
+/// `hash_filespec()` gives it one, so `oid_valid` starts false exactly as
+/// `alloc_filespec()` + `fill_filespec(…, 0, mode)` leaves it.
+fn spec_of(side: &Side) -> super::diffcore_rename::FileSpec {
+    match side.file {
+        Some(_) => super::diffcore_rename::FileSpec::new(
+            side.name.clone(),
+            side.mode,
+            gix::ObjectId::null(HASH_KIND),
+            false,
+        ),
+        None => super::diffcore_rename::FileSpec::absent(side.name.clone()),
+    }
+}
+
+/// The inverse, for reading a pair back out of the queue after rename detection
+/// has re-paired the specs across the pairs they arrived in.
+fn side_of(spec: &super::diffcore_rename::FileSpec, content: &DiskContent) -> Side {
+    match content.on_disk.get(&spec.path) {
+        Some((path, _)) if spec.valid() => {
+            Side { name: spec.path.clone(), file: Some(path.clone()), mode: spec.mode }
+        }
+        _ => Side::absent(spec.path.clone()),
+    }
+}
+
 /// `git diff --no-index`'s two operands, after `/dev/null` and directories are
 /// resolved into the pair list `diff_queue` would hold.
 fn queue(lhs: &str, rhs: &str) -> Result<Vec<(Side, Side)>, String> {
@@ -204,10 +276,25 @@ struct Row {
     b_exists: bool,
     a_mode: u32,
     b_mode: u32,
-    /// The blob id `find_exact_renames()` leaves on a one-sided pair's existing
-    /// side, and which `--raw` then prints. `None` on a pair with two sides,
-    /// which rename detection never hashes.
-    oid: Option<gix::ObjectId>,
+    /// The pre-image's blob id once `hash_filespec()` has given the filespec one,
+    /// which `--raw` prints. `None` while `oid_valid` is false — rename detection
+    /// is the only thing that hashes, so a run it declined to start leaves the
+    /// null id and `--raw` shows zeros.
+    a_oid: Option<gix::ObjectId>,
+    /// The post-image's, likewise.
+    b_oid: Option<gix::ObjectId>,
+    /// `diff_resolve_rename_copy()`'s letter: `A`, `D`, `M`, `T`, `R` or `C`.
+    status: u8,
+    /// The similarity `R`/`C` was matched at, in `MAX_SCORE` units.
+    score: u32,
+}
+
+impl Row {
+    /// Whether `diff_resolve_rename_copy()` called this pair a rename or a copy,
+    /// which is what makes the formats print two names instead of one.
+    fn renamed(&self) -> bool {
+        matches!(self.status, b'R' | b'C')
+    }
 }
 
 /// The formats `--no-index` understands, as bits in the same order `diff` uses.
@@ -314,6 +401,12 @@ fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
     // NULL long name is why there is no `--no-R` to turn it back off, and why a
     // repeated `-R` re-sets rather than toggles.
     let mut reverse = false;
+    // `options->detect_rename`, `rename_score` and `flags.find_copies_harder`
+    // (diff.c:6162-6189). `None` leaves `diff_detect_rename_default`, which is
+    // `DIFF_DETECT_RENAME` unless `diff.renames` says otherwise (diff.c:284/399).
+    let mut detect_rename: Option<u8> = None;
+    let mut rename_score: u32 = 0;
+    let mut find_copies_harder = false;
 
     for a in args {
         if after_dashdash || !a.starts_with('-') || a == "-" {
@@ -338,6 +431,45 @@ fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
             "-b" | "--ignore-space-change" => ws = super::diff::Whitespace::IgnoreChange,
             "--ignore-space-at-eol" => ws = super::diff::Whitespace::IgnoreAtEol,
             "-R" => reverse = true,
+            // `diff_opt_find_renames()` (diff.c:5742) and `diff_opt_find_copies()`
+            // (diff.c:5722). Both take an optional score; anything left over after
+            // `parse_rename_score()` is `error: invalid argument to <long-name>`
+            // followed by the usage block. A second `-C` is what turns copy
+            // detection into `--find-copies-harder`.
+            s if s == "-M" || s == "--find-renames" || s.starts_with("-M") || s.starts_with("--find-renames=") => {
+                let arg = s
+                    .strip_prefix("--find-renames=")
+                    .unwrap_or_else(|| s.strip_prefix("-M").unwrap_or(""));
+                let (score, rest) = super::diffcore_rename::parse_rename_score(arg);
+                if !rest.is_empty() {
+                    // `parse_options()` turns a callback's `PARSE_OPT_ERROR` into
+                    // a bare `exit(129)` (parse-options.c:1200), so the message
+                    // stands alone — no usage block follows it.
+                    eprintln!("error: invalid argument to find-renames");
+                    return Ok(ExitCode::from(129));
+                }
+                rename_score = score;
+                detect_rename = Some(super::diffcore_rename::DETECT_RENAME);
+            }
+            s if s == "-C" || s == "--find-copies" || s.starts_with("-C") || s.starts_with("--find-copies=") => {
+                let arg = s
+                    .strip_prefix("--find-copies=")
+                    .unwrap_or_else(|| s.strip_prefix("-C").unwrap_or(""));
+                let (score, rest) = super::diffcore_rename::parse_rename_score(arg);
+                if !rest.is_empty() {
+                    eprintln!("error: invalid argument to find-copies");
+                    return Ok(ExitCode::from(129));
+                }
+                rename_score = score;
+                if detect_rename == Some(super::diffcore_rename::DETECT_COPY) {
+                    find_copies_harder = true;
+                } else {
+                    detect_rename = Some(super::diffcore_rename::DETECT_COPY);
+                }
+            }
+            "--find-copies-harder" => find_copies_harder = true,
+            "--no-find-copies-harder" => find_copies_harder = false,
+            "--no-renames" => detect_rename = Some(0),
             "-W" | "--function-context" => func_context = true,
             "--no-function-context" => func_context = false,
             "--full-index" => full_index = true,
@@ -501,76 +633,44 @@ fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
         colors,
     };
 
-    let mut pairs = match queue(&operands[0], &operands[1]) {
-        Ok(pairs) => pairs,
+    // `diff_setup_done()`: `--find-copies-harder` implies copy detection
+    // (diff.c:5288-5289), and `--quiet` — git's `flags.quick` — turns detection
+    // off entirely along with it (diff.c:5348-5352). Without a command-line
+    // opinion the default is `diff_detect_rename_default`, which `git_diff_ui_config`
+    // sets from `diff.renames` and which is `DIFF_DETECT_RENAME` when that is unset.
+    let mut rename_detection = detect_rename.unwrap_or_else(|| match &repo {
+        Some(repo) => {
+            let snapshot = repo.config_snapshot();
+            let configured = snapshot.string("diff.renames");
+            super::diffcore_rename::config_rename(configured.as_ref().map(|v| v.as_ref()))
+        }
+        None => super::diffcore_rename::DETECT_RENAME,
+    });
+    if find_copies_harder {
+        rename_detection = super::diffcore_rename::DETECT_COPY;
+    }
+    if opts.fmt.quiet {
+        rename_detection = 0;
+        find_copies_harder = false;
+    }
+
+    let rename_opts = super::diffcore_rename::Options {
+        detect_rename: rename_detection,
+        rename_score,
+        rename_limit: -1,
+        find_copies_harder,
+        rename_empty: true,
+        break_opt: -1,
+        hash_kind: HASH_KIND,
+    };
+
+    let (out, changed) = match compare(&operands[0], &operands[1], reverse, &opts, &rename_opts) {
+        Ok(result) => result,
         Err(message) => {
             eprintln!("error: {message}");
             return Ok(ExitCode::from(1));
         }
     };
-    // `queue_diff()`'s `SWAP(mode1, mode2); SWAP(name1, name2); SWAP(special1,
-    // special2)` (diff-no-index.c:279-283). It sits at the leaf of the walk, past
-    // the directory recursion that decided which names pair with which, so the
-    // queue keeps its order and each pair simply trades sides.
-    if reverse {
-        for (a, b) in &mut pairs {
-            std::mem::swap(a, b);
-        }
-    }
-
-    let mut out: Vec<u8> = Vec::new();
-    let mut changed = false;
-    let mut stats: Vec<Row> = Vec::new();
-    for (a, b) in &pairs {
-        let old_data = read_side(a)?;
-        let new_data = read_side(b)?;
-        let same_content = a.file.is_some() == b.file.is_some() && old_data == new_data;
-        if same_content && a.mode == b.mode {
-            continue;
-        }
-        changed = true;
-        let binary = !opts.text
-            && (super::diff::looks_binary(&old_data) || super::diff::looks_binary(&new_data));
-        let (added, deleted, body) =
-            super::diff::no_index_body(&old_data, &new_data, &opts.ctx_geometry(), opts.ws, binary);
-        // `hash_filespec()` (diffcore-rename.c:264-274) hashes the existing side
-        // of every one-sided pair; whether the result is ever printed is decided
-        // once the whole queue is known, below. `--raw` is its only reader here,
-        // so nothing is hashed for a format that would not show it.
-        let oid = match (opts.fmt.raw, a.file.is_some(), b.file.is_some()) {
-            (true, true, false) => Some(blob_id(&old_data)),
-            (true, false, true) => Some(blob_id(&new_data)),
-            _ => None,
-        };
-        stats.push(Row {
-            a_name: a.display_name().clone(),
-            b_name: b.display_name().clone(),
-            added,
-            deleted,
-            binary,
-            a_exists: a.file.is_some(),
-            b_exists: b.file.is_some(),
-            a_mode: a.mode,
-            b_mode: b.mode,
-            oid,
-        });
-        if opts.fmt.patch {
-            emit_header(&mut out, a, b, &old_data, &new_data, &opts, same_content, binary);
-            if binary {
-                out.extend_from_slice(b"Binary files ");
-                push_name(&mut out, &opts.src_prefix, a.header_name(b), a.file.is_some());
-                out.extend_from_slice(b" and ");
-                push_name(&mut out, &opts.dst_prefix, b.header_name(a), b.file.is_some());
-                out.extend_from_slice(b" differ\n");
-            } else {
-                out.extend_from_slice(&body);
-            }
-        }
-    }
-
-    if !opts.fmt.patch && !stats.is_empty() {
-        render_non_patch(&mut out, &stats, &opts);
-    }
 
     if !opts.fmt.quiet {
         let painted = diff_color::colorize_patch(
@@ -589,6 +689,122 @@ fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
     Ok(if changed { ExitCode::from(1) } else { ExitCode::SUCCESS })
 }
 
+/// The comparison itself: `queue_diff()`, then `diffcore_std()`'s passes, then
+/// `diff_flush()`. Returns the uncoloured output and git's `has_changes`.
+fn compare(
+    lhs: &str,
+    rhs: &str,
+    reverse: bool,
+    opts: &Opts,
+    rename_opts: &super::diffcore_rename::Options,
+) -> std::result::Result<(Vec<u8>, bool), String> {
+    let mut pairs = queue(lhs, rhs)?;
+    // `queue_diff()`'s `SWAP(mode1, mode2); SWAP(name1, name2); SWAP(special1,
+    // special2)` (diff-no-index.c:279-283). It sits at the leaf of the walk, past
+    // the directory recursion that decided which names pair with which, so the
+    // queue keeps its order and each pair simply trades sides.
+    if reverse {
+        for (a, b) in &mut pairs {
+            std::mem::swap(a, b);
+        }
+    }
+
+    // Every blob the rest of this function reads, from one cache: `diffcore_rename`
+    // asks for the same file repeatedly and the emitters ask again afterwards.
+    let mut content = DiskContent::default();
+    for (a, b) in &pairs {
+        content.register(a);
+        content.register(b);
+    }
+
+    // `diffcore_skip_stat_unmatch()` (diff.c:7396), which `--no-index` arms by
+    // setting `skip_stat_unmatch = 1` (diff-no-index.c:407). Neither side of a
+    // no-index pair carries an object id, so `diff_filespec_check_stat_unmatch()`
+    // reduces to "both sides present, same mode, same bytes" — and this has to
+    // happen *before* rename detection, because a pair the two directories share
+    // by name must be gone by the time a deletion and an addition are considered
+    // for pairing with each other.
+    pairs.retain(|(a, b)| {
+        !(a.file.is_some()
+            && b.file.is_some()
+            && a.mode == b.mode
+            && content.bytes(&a.name) == content.bytes(&b.name))
+    });
+
+    // `diffcore_std()`'s rename slice (diff.c:7507-7516) over the queue
+    // `queue_diff()` left, then `diff_resolve_rename_copy()` (diff.c:7525) to turn
+    // each surviving pair into its status letter. `-B` is not accepted here, so
+    // `break_opt` stays `-1` and the break/merge-broken passes are no-ops.
+    let mut q = super::diffcore_rename::Queue::default();
+    for (a, b) in &pairs {
+        let one = q.add_spec(spec_of(a));
+        let two = q.add_spec(spec_of(b));
+        q.add_pair(one, two);
+    }
+    super::diffcore_rename::run(&mut q, rename_opts, &mut content).emit("diff.renameLimit");
+    super::diffcore_rename::resolve_rename_copy(&mut q);
+
+    let mut out: Vec<u8> = Vec::new();
+    let mut changed = false;
+    let mut stats: Vec<Row> = Vec::new();
+    for pi in 0..q.pairs.len() {
+        let pair = q.pairs[pi].clone();
+        let a = side_of(&q.specs[pair.one], &content);
+        let b = side_of(&q.specs[pair.two], &content);
+        let (a, b) = (&a, &b);
+        let old_data = content.bytes(&a.name).filter(|_| a.file.is_some()).unwrap_or_default();
+        let new_data = content.bytes(&b.name).filter(|_| b.file.is_some()).unwrap_or_default();
+        // A pair that reaches this point and still has identical content is a
+        // rename or copy the detection just made; the stat-unmatch pass above
+        // already dropped every same-name pair whose content never changed.
+        let same_content = a.file.is_some() == b.file.is_some() && old_data == new_data;
+        changed = true;
+        let binary = !opts.text
+            && (super::diff::looks_binary(&old_data) || super::diff::looks_binary(&new_data));
+        let (added, deleted, body) =
+            super::diff::no_index_body(&old_data, &new_data, &opts.ctx_geometry(), opts.ws, binary);
+        // `hash_filespec()` (diffcore-rename.c) is what leaves an object id on a
+        // filespec `queue_diff()` created with the null one, and it runs only
+        // inside rename detection. `--raw` therefore prints real ids exactly when
+        // detection got far enough to hash — which is what `oid_valid` records.
+        let spec_oid = |i: usize| -> Option<gix::ObjectId> {
+            q.specs[i].oid_valid.then(|| q.specs[i].oid)
+        };
+        stats.push(Row {
+            a_name: a.display_name().clone(),
+            b_name: b.display_name().clone(),
+            added,
+            deleted,
+            binary,
+            a_exists: a.file.is_some(),
+            b_exists: b.file.is_some(),
+            a_mode: a.mode,
+            b_mode: b.mode,
+            a_oid: spec_oid(pair.one),
+            b_oid: spec_oid(pair.two),
+            status: pair.status,
+            score: pair.score,
+        });
+        if opts.fmt.patch {
+            emit_header(&mut out, a, b, &old_data, &new_data, &opts, same_content, binary, &pair);
+            if binary {
+                out.extend_from_slice(b"Binary files ");
+                push_name(&mut out, &opts.src_prefix, a.header_name(b), a.file.is_some());
+                out.extend_from_slice(b" and ");
+                push_name(&mut out, &opts.dst_prefix, b.header_name(a), b.file.is_some());
+                out.extend_from_slice(b" differ\n");
+            } else {
+                out.extend_from_slice(&body);
+            }
+        }
+    }
+
+    if !opts.fmt.patch && !stats.is_empty() {
+        render_non_patch(&mut out, &stats, opts);
+    }
+    Ok((out, changed))
+}
+
 impl Opts {
     fn ctx_geometry(&self) -> super::diff_pairs::EmitGeometry {
         super::diff_pairs::EmitGeometry {
@@ -599,6 +815,19 @@ impl Opts {
     }
 }
 
+/// `name_a += (*name_a == '/')` (diff.c:1899-1900, and again at diff.c:3899-3900
+/// where the `diff --git` names are built): exactly *one* leading slash is dropped
+/// before the `a/` / `b/` prefix goes on, so an absolute operand reads
+/// `a/private/tmp/x` rather than `a//private/tmp/x`. The increment is a boolean, so
+/// a name that really does start with two slashes keeps the second one.
+fn strip_one_leading_slash(name: &BString) -> &[u8] {
+    let bytes = name.as_bytes();
+    match bytes.first() {
+        Some(b'/') => &bytes[1..],
+        _ => bytes,
+    }
+}
+
 /// `<prefix><name>`, with `/dev/null` written bare for a side that is not there.
 fn push_name(out: &mut Vec<u8>, prefix: &[u8], name: &BString, exists: bool) {
     if !exists {
@@ -606,7 +835,7 @@ fn push_name(out: &mut Vec<u8>, prefix: &[u8], name: &BString, exists: bool) {
         return;
     }
     out.extend_from_slice(prefix);
-    out.extend_from_slice(name.as_bytes());
+    out.extend_from_slice(strip_one_leading_slash(name));
 }
 
 /// `fill_metainfo()` + `emit_diff_symbol(DIFF_SYMBOL_HEADER)`: the `diff --git`
@@ -621,13 +850,14 @@ fn emit_header(
     opts: &Opts,
     same_content: bool,
     binary: bool,
+    pair: &super::diffcore_rename::Pair,
 ) {
     out.extend_from_slice(b"diff --git ");
     out.extend_from_slice(&opts.src_prefix);
-    out.extend_from_slice(a.header_name(b).as_bytes());
+    out.extend_from_slice(strip_one_leading_slash(a.header_name(b)));
     out.push(b' ');
     out.extend_from_slice(&opts.dst_prefix);
-    out.extend_from_slice(b.header_name(a).as_bytes());
+    out.extend_from_slice(strip_one_leading_slash(b.header_name(a)));
     out.push(b'\n');
 
     let hash = |data: &[u8], exists: bool| -> String {
@@ -652,8 +882,28 @@ fn emit_header(
         }
         _ => {}
     }
-    // A pure mode change has no content to describe, so no `index` line and no
-    // file markers follow it.
+
+    // `fill_metainfo()`'s `xfrm_msg` for a rename or copy, between the mode lines
+    // and the `index` line. The two names go in raw — no `a/`/`b/` prefix and, as
+    // stock confirms for an absolute operand, no leading-slash strip either.
+    if matches!(pair.status, b'R' | b'C') {
+        let verb = if pair.status == b'C' { "copy" } else { "rename" };
+        out.extend_from_slice(
+            format!(
+                "similarity index {}%\n",
+                super::diffcore_rename::similarity_index(pair.score)
+            )
+            .as_bytes(),
+        );
+        out.extend_from_slice(format!("{verb} from ").as_bytes());
+        out.extend_from_slice(a.name.as_bytes());
+        out.extend_from_slice(format!("\n{verb} to ").as_bytes());
+        out.extend_from_slice(b.name.as_bytes());
+        out.push(b'\n');
+    }
+
+    // A pure mode change — and a rename or copy that moved the content unaltered —
+    // has nothing to describe, so no `index` line and no file markers follow.
     if same_content {
         return;
     }
@@ -695,22 +945,9 @@ fn render_non_patch(out: &mut Vec<u8>, rows: &[Row], opts: &Opts) {
         return;
     }
     if opts.fmt.name_status || opts.fmt.raw {
-        // Whether `find_exact_renames()` ran at all: `diffcore_rename()` gives up
-        // before it when the queue holds no destination or no source
-        // (diffcore-rename.c:1461-1462), and it is that pass — not the diff — that
-        // leaves a blob id on a filespec `queue_diff()` created with the null one.
-        // So a directory pair with one file added *and* one removed prints two
-        // real ids, while the same pair with only an addition prints zeros.
-        let hashed = rows.iter().any(|r| r.a_exists && !r.b_exists)
-            && rows.iter().any(|r| !r.a_exists && r.b_exists);
         for row in rows {
-            let status = match (row.a_exists, row.b_exists) {
-                (false, true) => b'A',
-                (true, false) => b'D',
-                _ => b'M',
-            };
             if opts.fmt.raw {
-                let side = |mine: bool| match (hashed && mine).then_some(row.oid).flatten() {
+                let side = |oid: Option<gix::ObjectId>| match oid {
                     Some(id) => {
                         let hex = id.to_hex().to_string();
                         hex[..opts.raw_abbrev.min(hex.len())].to_string()
@@ -722,16 +959,28 @@ fn render_non_patch(out: &mut Vec<u8>, rows: &[Row], opts: &Opts) {
                         ":{:06o} {:06o} {} {} ",
                         row.a_mode,
                         row.b_mode,
-                        side(row.a_exists && !row.b_exists),
-                        side(!row.a_exists && row.b_exists),
+                        side(row.a_oid),
+                        side(row.b_oid),
                     )
                     .as_bytes(),
                 );
             }
-            out.push(status);
-            out.push(b'\t');
-            let name = if row.a_exists { &row.a_name } else { &row.b_name };
-            out.extend_from_slice(name.as_bytes());
+            out.push(row.status);
+            // `diff_flush_raw()`/`--name-status`: a rename or copy carries the
+            // similarity as three digits and then *both* names, TAB-separated.
+            if row.renamed() {
+                out.extend_from_slice(
+                    format!("{:03}", super::diffcore_rename::similarity_index(row.score)).as_bytes(),
+                );
+                out.push(b'\t');
+                out.extend_from_slice(row.a_name.as_bytes());
+                out.push(b'\t');
+                out.extend_from_slice(row.b_name.as_bytes());
+            } else {
+                out.push(b'\t');
+                let name = if row.a_exists { &row.a_name } else { &row.b_name };
+                out.extend_from_slice(name.as_bytes());
+            }
             out.push(b'\n');
         }
         return;
@@ -759,6 +1008,21 @@ fn render_non_patch(out: &mut Vec<u8>, rows: &[Row], opts: &Opts) {
         // pair, so a deletion names the file that was there — not the `/dev/null`
         // that replaced it, whose mode is zero.
         for row in rows {
+            // `show_rename_copy()` (diff.c): the `pprint_rename`d name pair and the
+            // similarity, which is the only summary line a two-sided pair produces.
+            if row.renamed() {
+                let verb = if row.status == b'C' { "copy" } else { "rename" };
+                out.extend_from_slice(format!(" {verb} ").as_bytes());
+                out.extend_from_slice(&super::diff::pprint_rename(&row.a_name, &row.b_name));
+                out.extend_from_slice(
+                    format!(
+                        " ({}%)\n",
+                        super::diffcore_rename::similarity_index(row.score)
+                    )
+                    .as_bytes(),
+                );
+                continue;
+            }
             match (row.a_exists, row.b_exists) {
                 (false, true) => out.extend_from_slice(
                     format!(" create mode {:06o} {}\n", row.b_mode, row.b_name).as_bytes(),
@@ -781,7 +1045,9 @@ mod tests {
     }
 
     /// A pair that exists on one side only, as `queue_dirs()` builds it: the
-    /// missing half is named `/dev/null` and has no mode.
+    /// missing half is named `/dev/null` and has no mode. `oid` is the id
+    /// `hash_filespec()` left on the side that is there, or `None` when rename
+    /// detection never ran far enough to hash it.
     fn one_sided(name: &str, exists_on_left: bool, oid: Option<gix::ObjectId>) -> Row {
         let (a_name, b_name) = match exists_on_left {
             true => (BString::from(name), BString::from(DEV_NULL)),
@@ -797,8 +1063,61 @@ mod tests {
             b_exists: !exists_on_left,
             a_mode: if exists_on_left { 0o100644 } else { 0 },
             b_mode: if exists_on_left { 0 } else { 0o100644 },
-            oid,
+            a_oid: exists_on_left.then_some(oid).flatten(),
+            b_oid: (!exists_on_left).then_some(oid).flatten(),
+            status: if exists_on_left { b'D' } else { b'A' },
+            score: 0,
         }
+    }
+
+    /// A scratch directory that removes itself, so the end-to-end tests can build
+    /// real trees for [`compare`] to walk without leaving anything behind.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(tag: &str) -> Scratch {
+            let dir = std::env::temp_dir().join(format!(
+                "zvcs-no-index-{tag}-{}-{:?}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("clock after the epoch")
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&dir).expect("scratch directory");
+            Scratch(dir)
+        }
+
+        fn write(&self, rela: &str, body: &str) {
+            let path = self.0.join(rela);
+            std::fs::create_dir_all(path.parent().expect("a parent")).expect("scratch subdirectory");
+            std::fs::write(path, body).expect("scratch file");
+        }
+
+        fn at(&self, rela: &str) -> String {
+            self.0.join(rela).to_string_lossy().into_owned()
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// The `--no-index` default: rename detection on, at the default score.
+    fn renames_on() -> super::super::diffcore_rename::Options {
+        super::super::diffcore_rename::Options {
+            detect_rename: super::super::diffcore_rename::DETECT_RENAME,
+            hash_kind: HASH_KIND,
+            ..Default::default()
+        }
+    }
+
+    fn compared(s: &Scratch, fmt: Format, rename: &super::super::diffcore_rename::Options) -> String {
+        let o = opts(fmt.resolved(), 7);
+        let (out, _) = compare(&s.at("A"), &s.at("B"), false, &o, rename).expect("readable operands");
+        String::from_utf8(out).expect("ascii fixtures")
     }
 
     fn opts(fmt: Format, raw_abbrev: usize) -> Opts {
@@ -853,7 +1172,8 @@ mod tests {
     /// unless the queue holds *both* a destination and a source
     /// (diffcore-rename.c:1461), and that pass — `hash_filespec()` — is the only
     /// thing that ever replaces the null id `queue_diff()` created the filespecs
-    /// with. Stock git 2.55.0, same two directories as above:
+    /// with. Stock git 2.55.0, over a directory pair where `only_a.txt` exists on
+    /// the left, `only_b.txt` on the right and `common.txt` differs on both:
     ///
     /// ```text
     /// $ git diff --no-index --raw da db
@@ -865,29 +1185,164 @@ mod tests {
     /// ```
     ///
     /// The modified pair keeps two null ids in both runs: it is neither a rename
-    /// source nor a destination, so nothing hashes it.
+    /// source nor a destination, so nothing hashes it. The whole pipeline is run
+    /// here rather than the renderer alone, because it is the detection pass that
+    /// decides — the row only reports what the filespec ended up holding.
     #[test]
     fn raw_prints_ids_only_when_rename_detection_would_have_hashed_them() {
-        let deleted = gix::ObjectId::from_hex(b"f8779b82a49aeea68c066a40cc5828aa69af10e6").unwrap();
-        let added = gix::ObjectId::from_hex(b"5709f57480157adcd6e54fdea37b43fbec0598bc").unwrap();
-        let o = opts(Format { raw: true, ..Format::default() }, 7);
-
-        let both = [
-            one_sided("da/only_a.txt", true, Some(deleted)),
-            one_sided("db/only_b.txt", false, Some(added)),
-        ];
+        let s = Scratch::new("raw-gate");
+        s.write("A/common.txt", "left\n");
+        s.write("B/common.txt", "right\n");
+        s.write("A/only_a.txt", "gone\n");
+        s.write("B/only_b.txt", "fresh\n");
+        let gone = blob_id(b"gone\n").to_hex().to_string();
+        let fresh = blob_id(b"fresh\n").to_hex().to_string();
         assert_eq!(
-            rendered(&both, &o),
-            ":100644 000000 f8779b8 0000000 D\tda/only_a.txt\n\
-             :000000 100644 0000000 5709f57 A\tdb/only_b.txt\n"
+            compared(&s, Format { raw: true, ..Format::default() }, &renames_on()),
+            format!(
+                ":100644 100644 0000000 0000000 M\t{}\n\
+                 :100644 000000 {} 0000000 D\t{}\n\
+                 :000000 100644 0000000 {} A\t{}\n",
+                s.at("A/common.txt"),
+                &gone[..7],
+                s.at("A/only_a.txt"),
+                &fresh[..7],
+                s.at("B/only_b.txt"),
+            )
         );
 
-        // A queue with no deletion never reaches the hashing pass, so the id the
-        // row carries stays unprinted.
-        let adds_only = [one_sided("db/only_b.txt", false, Some(added))];
+        // A queue with no deletion never reaches the hashing pass, so both sides
+        // of the addition stay null.
+        let adds = Scratch::new("raw-gate-adds");
+        adds.write("A/keep.txt", "same\n");
+        adds.write("B/keep.txt", "same\n");
+        adds.write("B/only_b.txt", "fresh\n");
         assert_eq!(
-            rendered(&adds_only, &o),
-            ":000000 100644 0000000 0000000 A\tdb/only_b.txt\n"
+            compared(&adds, Format { raw: true, ..Format::default() }, &renames_on()),
+            format!(":000000 100644 0000000 0000000 A\t{}\n", adds.at("B/only_b.txt"))
+        );
+
+        // `--no-renames` skips the pass outright, so even a queue with both a
+        // source and a destination prints zeros on every side.
+        let no_renames = super::super::diffcore_rename::Options {
+            hash_kind: HASH_KIND,
+            ..Default::default()
+        };
+        assert_eq!(
+            compared(&s, Format { raw: true, ..Format::default() }, &no_renames),
+            format!(
+                ":100644 100644 0000000 0000000 M\t{}\n\
+                 :100644 000000 0000000 0000000 D\t{}\n\
+                 :000000 100644 0000000 0000000 A\t{}\n",
+                s.at("A/common.txt"),
+                s.at("A/only_a.txt"),
+                s.at("B/only_b.txt"),
+            )
+        );
+    }
+
+    /// Identical content that moved between the two directories is a rename, and
+    /// every format says so. `diffcore_std()` runs its rename pass over the
+    /// `--no-index` queue exactly as it does over a tracked one
+    /// (diff-no-index.c:426), which is what makes the delete/create pair collapse.
+    /// Stock git 2.55.0, with `ra/x.txt` and `rb/y.txt` holding the same bytes:
+    ///
+    /// ```text
+    /// $ git diff --no-index ra rb
+    /// diff --git a/ra/x.txt b/rb/y.txt
+    /// similarity index 100%
+    /// rename from ra/x.txt
+    /// rename to rb/y.txt
+    /// $ git diff --no-index --raw ra rb
+    /// :100644 100644 7a28df3 7a28df3 R100	ra/x.txt	rb/y.txt
+    /// $ git diff --no-index --summary ra rb
+    ///  rename ra/x.txt => rb/y.txt (100%)
+    /// $ git diff --no-index --stat ra rb
+    ///  ra/x.txt => rb/y.txt | 0
+    ///  1 file changed, 0 insertions(+), 0 deletions(-)
+    /// ```
+    ///
+    /// The patch carries no `index` line and no `---`/`+++` pair: the content is
+    /// unchanged, so there is nothing to describe past the rename itself.
+    #[test]
+    fn an_exact_move_between_directories_is_one_rename() {
+        let s = Scratch::new("exact-rename");
+        let body = "alpha\nbeta\ngamma\ndelta\n";
+        s.write("A/x.txt", body);
+        s.write("B/y.txt", body);
+        let (src, dst) = (s.at("A/x.txt"), s.at("B/y.txt"));
+        let id = blob_id(body.as_bytes()).to_hex().to_string();
+
+        assert_eq!(
+            compared(&s, Format::default(), &renames_on()),
+            format!(
+                "diff --git a{src} b{dst}\n\
+                 similarity index 100%\n\
+                 rename from {src}\n\
+                 rename to {dst}\n"
+            )
+        );
+        assert_eq!(
+            compared(&s, Format { raw: true, ..Format::default() }, &renames_on()),
+            format!(":100644 100644 {0} {0} R100\t{src}\t{dst}\n", &id[..7])
+        );
+        assert_eq!(
+            compared(&s, Format { name_status: true, ..Format::default() }, &renames_on()),
+            format!("R100\t{src}\t{dst}\n")
+        );
+        assert_eq!(
+            compared(&s, Format { summary: true, ..Format::default() }, &renames_on()),
+            format!(
+                " rename {} (100%)\n",
+                String::from_utf8(super::super::diff::pprint_rename(src.as_bytes(), dst.as_bytes()))
+                    .expect("ascii fixtures")
+            )
+        );
+
+        // Without detection the same tree is a delete plus a create, which is what
+        // this port produced for every `--no-index` run before the pass was wired
+        // in.
+        let off = super::super::diffcore_rename::Options {
+            hash_kind: HASH_KIND,
+            ..Default::default()
+        };
+        let plain = compared(&s, Format { name_status: true, ..Format::default() }, &off);
+        assert_eq!(plain, format!("D\t{src}\nA\t{dst}\n"));
+    }
+
+    /// A move that also edited the file is a rename below 100%, and then the patch
+    /// *does* carry an `index` line and a body. Stock git 2.55.0, over a 60-line
+    /// file with one line changed:
+    ///
+    /// ```text
+    /// diff --git a/A/near.txt b/B/near_moved.txt
+    /// similarity index 98%
+    /// rename from A/near.txt
+    /// rename to B/near_moved.txt
+    /// index 51ed5c4870..4e295424cc 100644
+    /// --- a/A/near.txt
+    /// +++ b/B/near_moved.txt
+    /// ```
+    #[test]
+    fn a_move_with_an_edit_keeps_its_index_line_and_body() {
+        let s = Scratch::new("near-rename");
+        let before: String = (0..60).map(|i| format!("line {i}\n")).collect();
+        let after = before.replace("line 3\n", "CHANGED\n");
+        s.write("A/near.txt", &before);
+        s.write("B/moved.txt", &after);
+        let (src, dst) = (s.at("A/near.txt"), s.at("B/moved.txt"));
+
+        let patch = compared(&s, Format::default(), &renames_on());
+        assert!(patch.starts_with(&format!("diff --git a{src} b{dst}\n")), "{patch}");
+        assert!(patch.contains("similarity index 98%\n"), "{patch}");
+        assert!(patch.contains(&format!("rename from {src}\nrename to {dst}\n")), "{patch}");
+        assert!(patch.contains("\nindex "), "{patch}");
+        assert!(patch.contains(&format!("\n--- a{src}\n+++ b{dst}\n")), "{patch}");
+        assert!(patch.contains("\n-line 3\n+CHANGED\n"), "{patch}");
+
+        assert_eq!(
+            compared(&s, Format { name_status: true, ..Format::default() }, &renames_on()),
+            format!("R098\t{src}\t{dst}\n")
         );
     }
 

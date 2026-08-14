@@ -16,13 +16,18 @@
 //!     block on stderr, exit 129. Unknown short → ``error: unknown switch
 //!     `<c>'``, same shape.
 //!   * `--build-options=<v>` → ``error: option `build-options' takes no value``
-//!     plus usage on stderr, exit 129, using the canonical option name (git
-//!     reports `build-options` for the positive spelling and `no-build-options`
-//!     for the negated one, regardless of how far either was abbreviated).
+//!     on stderr with **no** usage block (it is `PARSE_OPT_ERROR`, not
+//!     `PARSE_OPT_UNKNOWN`), exit 129, using the canonical option name
+//!     `optname()` would print — `build-options` for the positive spelling and
+//!     `no-build-options` for the negated one, however far either was
+//!     abbreviated.
 //!   * `parse_options` long-option abbreviation (`--b`, `--bu`, … all resolve to
 //!     `--build-options`) and `--no-`-prefixed negation, including negation of
 //!     an abbreviation (`--no-b`). `--no-build-options` leaves the flag clear,
-//!     so it prints exactly the plain-`git version` output.
+//!     so it prints exactly the plain-`git version` output. Because the sole
+//!     entry is negatable, `starts_with("no-", arg)` makes a bare `--n` and
+//!     `--no` name its negation, while `--no-` names it twice over and is the
+//!     `ambiguous option:` refusal — error on stderr, block on stdout, 129.
 //!
 //!   * `--build-options` — [`get_version_info`], reduced to the lines that are
 //!     true of *this* binary. Each of git's lines is either reported honestly or
@@ -44,6 +49,8 @@
 use anyhow::Result;
 use std::process::{Command, ExitCode};
 
+use super::{resolve_long, Arg, LongOpt, Resolved};
+
 /// The git version this port reproduces, as printed by `git version`.
 ///
 /// `diagnose.rs` heads its report with the same string; `git version` and
@@ -60,9 +67,13 @@ const USAGE: &str = concat!(
     "\n",
 );
 
-/// The sole long option, used both for abbreviation matching and for the
-/// canonical name git names in its `takes no value` error.
-const OPT: &str = "build-options";
+/// `cmd_version`'s `struct option options[]` (help.c:841-844), which holds one
+/// `OPT_BOOL` and nothing else.
+const LONG_OPTS: &[LongOpt] = &[LongOpt {
+    name: "build-options",
+    neg: true,
+    arg: Arg::None,
+}];
 
 /// `git version` — print the version string, optionally with build options.
 pub fn version(args: &[String]) -> Result<ExitCode> {
@@ -91,17 +102,27 @@ pub fn version(args: &[String]) -> Result<ExitCode> {
         }
 
         if let Some(long) = a.strip_prefix("--") {
-            let (name, value) = match long.split_once('=') {
-                Some((n, v)) => (n, Some(v)),
-                None => (long, None),
+            let negated = match resolve_long(LONG_OPTS, long) {
+                Resolved::One(_, sense) => sense,
+                Resolved::Ambiguous(first, second) => {
+                    return Ok(super::ambiguous_option(a, &first, &second, USAGE))
+                }
+                Resolved::Unknown => {
+                    return Ok(usage_error(&format!("unknown option `{long}'")))
+                }
             };
-            let Some((negated, canonical)) = match_long(name) else {
-                return Ok(usage_error(&format!("unknown option `{long}'")));
-            };
-            if value.is_some() {
-                return Ok(usage_error(&format!(
-                    "option `{canonical}' takes no value"
-                )));
+            if long.contains('=') {
+                // `optname()` spells the entry the way this sense of it parses,
+                // however far it was abbreviated: `--no-b=x` names
+                // `no-build-options`.
+                let canonical = match negated {
+                    true => "no-build-options",
+                    false => "build-options",
+                };
+                // `get_value()` returns `PARSE_OPT_ERROR` here, which prints its
+                // own line and *no* usage block.
+                eprintln!("error: option `{canonical}' takes no value");
+                return Ok(ExitCode::from(129));
             }
             build_options = !negated;
         } else {
@@ -221,23 +242,6 @@ fn host_cpu() -> String {
         // Without `uname` there is nothing better to say than the target arch.
         _ => std::env::consts::ARCH.to_string(),
     }
-}
-
-/// Resolve a long-option spelling (already stripped of `--` and any `=value`).
-///
-/// Returns `(negated, canonical_name)`, where `canonical_name` is the spelling
-/// git uses in its `takes no value` diagnostic. Mirrors `parse_options`'
-/// unique-prefix abbreviation and its `no-` negation prefix, which composes with
-/// abbreviation (`--no-b` is `--no-build-options`).
-fn match_long(name: &str) -> Option<(bool, &'static str)> {
-    if !name.is_empty() && OPT.starts_with(name) {
-        return Some((false, OPT));
-    }
-    let rest = name.strip_prefix("no-")?;
-    if !rest.is_empty() && OPT.starts_with(rest) {
-        return Some((true, "no-build-options"));
-    }
-    None
 }
 
 /// Stock's usage-error path: `error: <msg>` followed by the usage block, both

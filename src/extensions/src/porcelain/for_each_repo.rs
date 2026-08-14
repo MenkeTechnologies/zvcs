@@ -21,11 +21,16 @@
 //! Unique-prefix abbreviations (`--conf=x`, `--keep`) are accepted as git accepts
 //! them, and the diagnostics match byte-for-byte:
 //! ```text
-//!   * `error: unknown option \`bogus'` / `error: unknown switch \`x'`
+//!   * `error: unknown option \`bogus'` / `error: unknown switch \`x'`, plus the
+//!     usage block on stderr — `PARSE_OPT_UNKNOWN`
+//!   * `error: ambiguous option: n (could be --no-config or --no-keep-going)` on
+//!     stderr with the block on *stdout* — `parse_long_opt()`'s own refusal
 //!   * `error: option \`config' requires a value`
-//!   * `error: option \`keep-going' takes no value`
+//!   * `error: option \`no-config' takes no value`, naming the entry the way
+//!     `optname()` spells it however far it was abbreviated
 //! ```
-//!   all followed by the usage block on stderr, exit 129.
+//!   The last two are `PARSE_OPT_ERROR` out of `get_value()`, so they print their
+//!   line and *no* usage block. All exit 129.
 //!
 //! Config handling mirrors `repo_config_get_string_multi`:
 //!   * The key is validated by a direct port of `git_config_parse_key`, so
@@ -75,8 +80,12 @@ const USAGE: &str = concat!(
     "\n",
 );
 
-/// The long options `cmd_for_each_repo` declares, in table order.
-const OPTIONS: [&str; 2] = ["config", "keep-going"];
+/// `cmd_for_each_repo`'s `struct option options[]` (builtin/for-each-repo.c),
+/// in table order, as [`super::resolve_long`] reads it.
+const LONG_OPTS: &[super::LongOpt] = &[
+    super::LongOpt { name: "config",     neg: true, arg: super::Arg::Required },
+    super::LongOpt { name: "keep-going", neg: true, arg: super::Arg::None },
+];
 
 /// Outcome of parsing the option prefix of the argument vector.
 enum Parsed {
@@ -152,54 +161,61 @@ fn parse_options(args: &[String]) -> Parsed {
             return Parsed::Exit(ExitCode::from(129));
         }
 
-        if let Some(long) = arg.strip_prefix("--") {
-            let (name, value) = match long.split_once('=') {
+        if arg.starts_with("--") {
+            // Respell a unique abbreviation as the name it resolves to, so an
+            // abbreviation lands on the arm its full spelling lands on — and so
+            // the `takes no value` diagnostic names `no-config` for `--no-conf=x`
+            // the way `optname()` does.
+            let canonical;
+            let arg = match super::canonical_long(arg, LONG_OPTS) {
+                super::Long::Name(name) => {
+                    canonical = name;
+                    canonical.as_ref()
+                }
+                super::Long::Ambiguous(first, second) => {
+                    return Parsed::Exit(super::ambiguous_option(arg, &first, &second, USAGE))
+                }
+            };
+            let (name, value) = match arg.split_once('=') {
                 Some((name, value)) => (name, Some(value)),
-                None => (long, None),
-            };
-            let negated = name.strip_prefix("no-");
-            let lookup = negated.unwrap_or(name);
-
-            let Some(resolved) = resolve_option(lookup) else {
-                eprint!("error: unknown option `{long}'\n{USAGE}");
-                return Parsed::Exit(ExitCode::from(129));
+                None => (arg, None),
             };
 
-            // Negated forms are pure booleans in `parse_options`, whatever the
-            // option's own type is.
-            if negated.is_some() {
-                if value.is_some() {
-                    eprint!("error: option `{name}' takes no value\n{USAGE}");
-                    return Parsed::Exit(ExitCode::from(129));
-                }
-                match resolved {
-                    "config" => config_key = None,
-                    _ => keep_going = false,
-                }
-                i += 1;
-                continue;
-            }
+            // `get_value()` returns `PARSE_OPT_ERROR` for both of these, so they
+            // print their line and *no* usage block.
+            let takes_no_value = || {
+                eprintln!("error: option `{}' takes no value", &name[2..]);
+                Parsed::Exit(ExitCode::from(129))
+            };
 
-            match resolved {
-                "config" => match value {
+            match name {
+                "--config" => match value {
                     Some(value) => config_key = Some(value.to_string()),
                     None => match args.get(i + 1) {
                         Some(next) => {
                             config_key = Some(next.clone());
                             i += 1;
                         }
-                        None => {
-                            eprint!("error: option `config' requires a value\n{USAGE}");
-                            return Parsed::Exit(ExitCode::from(129));
-                        }
+                        None => return Parsed::Exit(super::missing_option_value("--config")),
                     },
                 },
+                // Negated forms are pure booleans in `parse_options`, whatever
+                // the option's own type is.
+                "--no-config" => match value {
+                    Some(_) => return takes_no_value(),
+                    None => config_key = None,
+                },
+                "--keep-going" => match value {
+                    Some(_) => return takes_no_value(),
+                    None => keep_going = true,
+                },
+                "--no-keep-going" => match value {
+                    Some(_) => return takes_no_value(),
+                    None => keep_going = false,
+                },
                 _ => {
-                    if value.is_some() {
-                        eprint!("error: option `keep-going' takes no value\n{USAGE}");
-                        return Parsed::Exit(ExitCode::from(129));
-                    }
-                    keep_going = true;
+                    eprint!("error: unknown option `{}'\n{USAGE}", &arg[2..]);
+                    return Parsed::Exit(ExitCode::from(129));
                 }
             }
             i += 1;
@@ -221,22 +237,6 @@ fn parse_options(args: &[String]) -> Parsed {
         config_key,
         keep_going,
         rest: args[i..].to_vec(),
-    }
-}
-
-/// Resolve a long-option name, accepting unique-prefix abbreviations the way
-/// `parse_long_opt` does. Exact matches win outright.
-fn resolve_option(name: &str) -> Option<&'static str> {
-    if let Some(exact) = OPTIONS.iter().find(|o| **o == name) {
-        return Some(exact);
-    }
-    if name.is_empty() {
-        return None;
-    }
-    let mut hits = OPTIONS.iter().filter(|o| o.starts_with(name));
-    match (hits.next(), hits.next()) {
-        (Some(one), None) => Some(one),
-        _ => None,
     }
 }
 

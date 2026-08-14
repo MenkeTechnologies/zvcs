@@ -76,7 +76,7 @@ use super::{Arg, LongOpt};
 /// they take the next argument or their `HEAD` default and have no `--no-`
 /// spelling. `--no-merged` and `--no-contains` are entries in their own right,
 /// which is why they appear here rather than being generated negations.
-const LONG_OPTS: &[LongOpt] = &[
+pub(super) const LONG_OPTS: &[LongOpt] = &[
     LongOpt { name: "shell", neg: true, arg: Arg::None },
     LongOpt { name: "perl", neg: true, arg: Arg::None },
     LongOpt { name: "python", neg: true, arg: Arg::None },
@@ -573,7 +573,27 @@ pub fn for_each_ref(args: &[String]) -> Result<ExitCode> {
     // That ordering is observable, so the repository has to be open first.
     let repo = gix::discover(".")?;
 
-    let mut format: Vec<u8> = b"%(objectname) %(objecttype)\t%(refname)".to_vec();
+    // What `--no-format` restores, and the one place this port deliberately does
+    // *not* reproduce stock byte for byte.
+    //
+    // `for_each_ref_core()` assigns this default at builtin/for-each-ref.c:55,
+    // which is *before* `parse_options()` at :62, and never re-checks it
+    // afterwards. `OPTION_STRING`'s unset arm is
+    // `*(const char **)opt->value = NULL`, so `--no-format` leaves `format.format`
+    // NULL and `verify_ref_format()` (ref-filter.c:1390) opens with
+    // `for (cp = format->format; *cp && ...)` — an unguarded NULL dereference.
+    // Verified against stock 2.55.0: `git for-each-ref --no-format` dies of
+    // SIGSEGV (shell status 139), as does `--format=<x> --no-format`.
+    //
+    // Reproducing a segfault is not parity with anything worth having, so this
+    // restores the built-in default instead: the value the field held before
+    // `--no-format` was seen, which is what the option plainly means and what git
+    // would do had the assignment sat after the parse. Name resolution is
+    // unaffected either way — `--no-format` and every prefix of it resolve here
+    // exactly as they do in stock, which is what the abbreviation census checks.
+    const DEFAULT_FORMAT: &[u8] = b"%(objectname) %(objecttype)\t%(refname)";
+
+    let mut format: Vec<u8> = DEFAULT_FORMAT.to_vec();
     let mut count: i64 = 0;
     let mut sort_specs: Vec<String> = Vec::new();
     let mut patterns: Vec<String> = Vec::new();
@@ -661,6 +681,26 @@ pub fn for_each_ref(args: &[String]) -> Result<ExitCode> {
             Some((n, v)) if n.starts_with("--") => (n, Some(v)),
             _ => (a, None),
         };
+        // `get_value()` decides whether an attached value is legal from the
+        // entry's *type*, not per arm: an `OPTION_SET_INT`/`OPTION_BIT`/
+        // `OPTION_BOOL` never takes one, and neither does the unset sense of
+        // anything, because that sense is a pure boolean whatever the entry is.
+        // Refusing it is `PARSE_OPT_ERROR`, so the line goes out alone with no
+        // usage block. Deriving this from the table rather than repeating it in
+        // fifteen arms is what keeps `--no-sort=x` from slipping through when
+        // `--no-sort` is right.
+        if rest.is_some() {
+            if let Some(body) = name.strip_prefix("--") {
+                if let super::Resolved::One(opt, unset) = super::resolve_long(LONG_OPTS, body) {
+                    if unset || opt.arg == super::Arg::None {
+                        // `optname()`: the table's own spelling, `no-`-prefixed
+                        // for the unset sense.
+                        eprintln!("error: option `{}' takes no value", &body);
+                        return Ok(ExitCode::from(129));
+                    }
+                }
+            }
+        }
         match name {
             // parse_options_step()'s `internal_help`: the block on stdout at
             // 129, with no `error:` line ahead of it.
@@ -679,6 +719,22 @@ pub fn for_each_ref(args: &[String]) -> Result<ExitCode> {
             "--sort" => sort_specs.push(value!(rest, "sort")),
             "--exclude" => excludes.push(value!(rest, "exclude")),
             "--start-after" => start_after = Some(value!(rest, "start-after")),
+            // The unset sense of each value-taking entry, which every one of
+            // these has because none carries `PARSE_OPT_NONEG`. What it does is
+            // fixed by the entry's *type*, not by the builtin:
+            //   * `OPTION_STRING`  → `NULL` (parse-options.c, `do_get_value`)
+            //   * `OPTION_INTEGER` → `0`, which `cmd_for_each_ref` reads as
+            //     "no limit"
+            //   * `OPT_STRVEC`      → `strvec_clear()` (parse_opt_strvec)
+            //   * `OPT_STRING_LIST` → `string_list_clear()`
+            //     (parse_opt_string_list)
+            //   * `parse_opt_object_name` → `oid_array_clear()`
+            "--no-format" => format = DEFAULT_FORMAT.to_vec(),
+            "--no-count" => count = 0,
+            "--no-start-after" => start_after = None,
+            "--no-exclude" => excludes.clear(),
+            "--no-sort" => sort_specs.clear(),
+            "--no-points-at" => points_at = None,
             "--points-at" => {
                 let v = value!(rest, "points-at");
                 points_at = match repo.rev_parse_single(v.as_str()) {

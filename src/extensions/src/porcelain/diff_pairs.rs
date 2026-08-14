@@ -970,6 +970,17 @@ pub(crate) fn render_raw_stream(
     let mut find_object_args: Vec<String> = Vec::new();
     let mut pickaxe_all = false;
     let mut pickaxe_regex = false;
+    // A flag stock git parses happily but this port cannot serve. It is recorded
+    // here rather than refused on the spot because `cmd_diff_pairs()` has no
+    // opinion about any of these at parse time: its own option table is a bare
+    // `OPT_END()` and every name comes from `add_diff_options()`, so
+    // `parse_options()` accepts them all and the very next statement is the
+    // `-z` requirement. Refusing during the scan put this port's gap ahead of
+    // git's own gate, so `git diff-pairs --bin` answered `unsupported flag
+    // "--binary"` where stock answers `usage: working without -z is not
+    // supported`. The first one seen is the one reported, which is the order the
+    // scan used to refuse in.
+    let mut unsupported: Option<String> = None;
 
     let mut i = 0usize;
     while i < args.len() {
@@ -1517,10 +1528,14 @@ pub(crate) fn render_raw_stream(
                 match &s["--submodule=".len()..] {
                     "short" => opts.submodule_format = SubmoduleFormat::Short,
                     "log" => opts.submodule_format = SubmoduleFormat::Log,
-                    "diff" => bail!(
-                        "unsupported flag \"--submodule=diff\" (runs a second `git diff` \
-                         inside the submodule; --submodule=short and --submodule=log are ported)"
-                    ),
+                    "diff" => {
+                        unsupported.get_or_insert_with(|| {
+                            "unsupported flag \"--submodule=diff\" (runs a second `git diff` \
+                             inside the submodule; --submodule=short and --submodule=log are \
+                             ported)"
+                                .to_string()
+                        });
+                    }
                     v => {
                         eprintln!("error: failed to parse --submodule option parameter: '{v}'");
                         return Ok(ExitCode::from(129));
@@ -1534,7 +1549,9 @@ pub(crate) fn render_raw_stream(
             // message carries no inventory of what *is* ported: that list is an
             // implementation detail of this module, it goes stale the moment a flag
             // lands, and stock git never prints anything like it.
-            _ => bail!("unsupported flag {s:?}"),
+            _ => {
+                unsupported.get_or_insert_with(|| format!("unsupported flag {s:?}"));
+            }
         }
         i += 1;
     }
@@ -1571,6 +1588,11 @@ pub(crate) fn render_raw_stream(
     if !nul && pairs.is_none() {
         eprintln!("usage: working without -z is not supported");
         return Ok(ExitCode::from(129));
+    }
+    // Only now, once every refusal `cmd_diff_pairs()` itself makes has had its
+    // turn, does a gap in this port get to speak.
+    if let Some(msg) = unsupported {
+        bail!("{msg}");
     }
     opts.formats.nul = nul;
     // `skip_resolving_statuses` exists because `diff-pairs` is handed status letters on

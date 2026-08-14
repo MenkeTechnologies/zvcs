@@ -192,7 +192,46 @@ usage: git worktree prune [-n] [-v] [--expire <expire>]
     -n, --[no-]dry-run    do not remove, show only
     -v, --[no-]verbose    report pruned working trees
     --[no-]expire <expiry-date>
-                          expire working trees older than <time>
+                          prune missing working trees older than <time>
+
+";
+
+/// `add_worktree`'s table (builtin/worktree.c:804-827). `-b`/`-B` are
+/// short-only `OPT_STRING`s, so neither has a `--[no-]` row.
+const ADD_USAGE: &str = "\
+usage: git worktree add [-f] [--detach] [--checkout] [--lock [--reason <string>]]
+                        [--orphan] [(-b | -B) <new-branch>] <path> [<commit-ish>]
+
+    -f, --[no-]force      checkout <branch> even if already checked out in other worktree
+    -b <branch>           create a new branch
+    -B <branch>           create or reset a branch
+    --[no-]orphan         create unborn branch
+    -d, --[no-]detach     detach HEAD at named commit
+    --[no-]checkout       populate the new working tree
+    --[no-]lock           keep the new working tree locked
+    --[no-]reason <string>
+                          reason for locking
+    -q, --[no-]quiet      suppress progress reporting
+    --[no-]track          set up tracking mode (see git-branch(1))
+    --[no-]guess-remote   try to match the new branch name with a remote-tracking branch
+    --[no-]relative-paths use relative paths for worktrees
+
+";
+
+/// `move_worktree`'s table (builtin/worktree.c:1249-1256).
+const MOVE_USAGE: &str = "\
+usage: git worktree move <worktree> <new-path>
+
+    -f, --[no-]force      force move even if worktree is dirty or locked
+    --[no-]relative-paths use relative paths for worktrees
+
+";
+
+/// `remove_worktree`'s table (builtin/worktree.c:1382-1387).
+const REMOVE_USAGE: &str = "\
+usage: git worktree remove [-f] <worktree>
+
+    -f, --[no-]force      force removal even if worktree is dirty or locked
 
 ";
 
@@ -418,7 +457,7 @@ fn list(args: &[String]) -> Result<ExitCode> {
         let a = args[i].as_str();
         match a {
             // `--help-all` renders `USAGE_FULL`, the same block: no hidden entry.
-            "-h" | "--help" | "--help-all" => {
+            s if s == "--help" || super::asks_for_help(s, "vz") => {
                 print!("{LIST_USAGE}");
                 return Ok(ExitCode::from(129));
             }
@@ -672,7 +711,7 @@ fn lock(args: &[String]) -> Result<ExitCode> {
         let a = args[i].as_str();
         match a {
             // `--help-all` renders `USAGE_FULL`, the same block: no hidden entry.
-            "-h" | "--help" | "--help-all" => {
+            s if s == "--help" || super::asks_for_help(s, "") => {
                 print!("{LOCK_USAGE}");
                 return Ok(ExitCode::from(129));
             }
@@ -685,7 +724,7 @@ fn lock(args: &[String]) -> Result<ExitCode> {
             }
             "--no-reason" => reason = None,
             _ if a.starts_with("--reason=") => reason = Some(a["--reason=".len()..].to_owned()),
-            _ if a.starts_with('-') && a != "-" => return usage(None, LOCK_USAGE),
+            _ if a.starts_with('-') && a != "-" => return Ok(super::unknown_option(a, LOCK_USAGE)),
             _ if target.is_none() => target = Some(a),
             _ => return usage(None, LOCK_USAGE),
         }
@@ -730,11 +769,11 @@ fn unlock(args: &[String]) -> Result<ExitCode> {
     for a in args {
         match a.as_str() {
             // `--help-all` renders `USAGE_FULL`, the same block: no hidden entry.
-            "-h" | "--help" | "--help-all" => {
+            s if s == "--help" || super::asks_for_help(s, "") => {
                 print!("{UNLOCK_USAGE}");
                 return Ok(ExitCode::from(129));
             }
-            s if s.starts_with('-') && s != "-" => return usage(None, UNLOCK_USAGE),
+            s if s.starts_with('-') && s != "-" => return Ok(super::unknown_option(s, UNLOCK_USAGE)),
             s if target.is_none() => target = Some(s),
             _ => return usage(None, UNLOCK_USAGE),
         }
@@ -901,7 +940,7 @@ fn prune(args: &[String]) -> Result<ExitCode> {
         let a = args[i].as_str();
         match a {
             // `--help-all` renders `USAGE_FULL`, the same block: no hidden entry.
-            "-h" | "--help" | "--help-all" => {
+            s if s == "--help" || super::asks_for_help(s, "nv") => {
                 print!("{PRUNE_USAGE}");
                 return Ok(ExitCode::from(129));
             }
@@ -1153,7 +1192,7 @@ fn repair(args: &[String]) -> Result<ExitCode> {
         let a = args[i].as_str();
         match a {
             // `--help-all` renders `USAGE_FULL`, the same block: no hidden entry.
-            "-h" | "--help" | "--help-all" => {
+            s if s == "--help" || super::asks_for_help(s, "") => {
                 print!("{REPAIR_USAGE}");
                 return Ok(ExitCode::from(129));
             }
@@ -1690,13 +1729,13 @@ fn add(args: &[String]) -> Result<ExitCode> {
         let a = args[i].as_str();
         match a {
             // `--help-all` renders `USAGE_FULL`, the same block: no hidden entry.
-            "-h" | "--help" | "--help-all" => {
-                print!("{MAIN_USAGE}");
+            s if s == "--help" || super::asks_for_help(s, "fdq") => {
+                print!("{ADD_USAGE}");
                 return Ok(ExitCode::from(129));
             }
             "-b" | "-B" => {
                 let Some(v) = args.get(i + 1) else {
-                    return usage(Some(&format!("error: switch `{}' requires a value", &a[1..])), MAIN_USAGE);
+                    return usage(Some(&format!("error: switch `{}' requires a value", &a[1..])), ADD_USAGE);
                 };
                 new_branch = Some(v.clone());
                 force_branch = a == "-B";
@@ -1710,7 +1749,7 @@ fn add(args: &[String]) -> Result<ExitCode> {
             "--lock" => lock_it = true,
             "--reason" => {
                 let Some(v) = args.get(i + 1) else {
-                    return usage(Some("error: option `reason' requires a value"), MAIN_USAGE);
+                    return usage(Some("error: option `reason' requires a value"), ADD_USAGE);
                 };
                 lock_reason = Some(v.clone());
                 i += 1;
@@ -1722,8 +1761,11 @@ fn add(args: &[String]) -> Result<ExitCode> {
             | "--relative-paths" | "--no-relative-paths" => {
                 bail!("`worktree add {a}` is not ported")
             }
+            // Named as parse-options names it: a long one keeps whatever
+            // followed its `=`, a short one is reported as a switch by its first
+            // character alone.
             s if s.starts_with('-') && s.len() > 1 => {
-                return usage(Some(&format!("error: unknown option `{}'", s.trim_start_matches('-'))), MAIN_USAGE)
+                return Ok(super::unknown_option(s, ADD_USAGE))
             }
             s => positional.push(s),
         }
@@ -1731,7 +1773,8 @@ fn add(args: &[String]) -> Result<ExitCode> {
     }
 
     let Some(path_arg) = positional.first().copied() else {
-        return usage(Some("error: need a path"), MAIN_USAGE);
+        // `if (ac < 1) usage_with_options(...)` — the block alone, no `error:` line.
+        return usage(None, ADD_USAGE);
     };
     let commit_ish = positional.get(1).copied();
 
@@ -2042,19 +2085,19 @@ fn remove(args: &[String]) -> Result<ExitCode> {
     for a in args {
         match a.as_str() {
             // `--help-all` renders `USAGE_FULL`, the same block: no hidden entry.
-            "-h" | "--help" | "--help-all" => {
-                print!("{MAIN_USAGE}");
+            s if s == "--help" || super::asks_for_help(s, "f") => {
+                print!("{REMOVE_USAGE}");
                 return Ok(ExitCode::from(129));
             }
             "-f" | "--force" => force += 1,
             "--no-force" => force = 0,
-            s if s.starts_with('-') && s != "-" => return usage(None, MAIN_USAGE),
+            s if s.starts_with('-') && s != "-" => return Ok(super::unknown_option(s, REMOVE_USAGE)),
             s if target.is_none() => target = Some(s),
-            _ => return usage(None, MAIN_USAGE),
+            _ => return usage(None, REMOVE_USAGE),
         }
     }
     let Some(arg) = target else {
-        return usage(None, MAIN_USAGE);
+        return usage(None, REMOVE_USAGE);
     };
 
     let repo = gix::discover(".")?;
@@ -2121,18 +2164,18 @@ fn move_worktree(args: &[String]) -> Result<ExitCode> {
     for a in args {
         match a.as_str() {
             // `--help-all` renders `USAGE_FULL`, the same block: no hidden entry.
-            "-h" | "--help" | "--help-all" => {
-                print!("{MAIN_USAGE}");
+            s if s == "--help" || super::asks_for_help(s, "f") => {
+                print!("{MOVE_USAGE}");
                 return Ok(ExitCode::from(129));
             }
             "-f" | "--force" => force = true,
             "--no-force" => force = false,
-            s if s.starts_with('-') && s != "-" => return usage(None, MAIN_USAGE),
+            s if s.starts_with('-') && s != "-" => return Ok(super::unknown_option(s, MOVE_USAGE)),
             s => positionals.push(s),
         }
     }
     if positionals.len() != 2 {
-        return usage(None, MAIN_USAGE);
+        return usage(None, MOVE_USAGE);
     }
     let (arg, dest_arg) = (positionals[0], positionals[1]);
 

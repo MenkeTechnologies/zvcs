@@ -239,6 +239,23 @@ pub fn mailinfo(args: &[String]) -> Result<ExitCode> {
     mi.run(&files.0, &files.1)
 }
 
+/// `cmd_mailinfo`'s `struct option options[]` (builtin/mailinfo.c:22-45), in
+/// table order, as [`super::resolve_long`] reads it. Only the entries carrying a
+/// `long_name` appear; `-k`, `-b`, `-u` and `-n` have none.
+///
+/// `--encoding` and `--quoted-cr` are `OPT_CALLBACK_F(..., PARSE_OPT_NONEG, ...)`
+/// and so have no `--no-` spelling. `--inbody-headers` is `OPT_HIDDEN_BOOL`,
+/// which is `PARSE_OPT_NOARG | PARSE_OPT_HIDDEN` — hidden from `-h`, but
+/// negatable and accepted just the same, which is why it is the last name a
+/// bare `--n` reports.
+pub(super) const LONG_OPTS: &[super::LongOpt] = &[
+    super::LongOpt { name: "message-id",     neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "encoding",       neg: false, arg: super::Arg::Required },
+    super::LongOpt { name: "scissors",       neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "quoted-cr",      neg: false, arg: super::Arg::Required },
+    super::LongOpt { name: "inbody-headers", neg: true,  arg: super::Arg::None },
+];
+
 /// Parse the command line the way `parse_options()` does for this builtin.
 ///
 /// The outer `Result` carries an I/O failure, the inner one the exit code git
@@ -248,16 +265,6 @@ fn parse_options(
     mi: &mut Mailinfo,
     policy: &mut CharsetPolicy,
 ) -> Result<std::result::Result<(String, String), ExitCode>> {
-    // (long name, takes a value, negatable). `--inbody-headers` is hidden from
-    // the usage text but accepted, exactly as `OPT_HIDDEN_BOOL` arranges.
-    const LONG: [(&str, bool, bool); 5] = [
-        ("message-id", false, true),
-        ("encoding", true, false),
-        ("scissors", false, true),
-        ("quoted-cr", true, false),
-        ("inbody-headers", false, true),
-    ];
-
     let mut operands: Vec<String> = Vec::new();
     let mut no_more_opts = false;
     let mut i = 0;
@@ -287,55 +294,32 @@ fn parse_options(
         }
 
         if let Some(body) = arg.strip_prefix("--") {
-            let (typed, inline) = match body.split_once('=') {
-                Some((n, v)) => (n, Some(v)),
-                None => (body, None),
-            };
+            let inline = body.split_once('=').map(|(_, v)| v);
 
-            // Every spelling the table accepts, positive and negated.
-            let mut candidates: Vec<(String, usize, bool)> = Vec::new();
-            for (idx, (name, _, negatable)) in LONG.iter().enumerate() {
-                candidates.push(((*name).to_string(), idx, false));
-                if *negatable {
-                    candidates.push((format!("no-{name}"), idx, true));
+            // `parse_long_opt()` looks the whole body up before splitting off any
+            // `=<value>`, keeps the *last two* candidates it registered rather
+            // than the first and the last, and reads `starts_with("no-", arg)`
+            // in the direction that makes a bare `--n` name every negatable
+            // entry at once.
+            let (opt, negated) = match super::resolve_long(LONG_OPTS, body) {
+                super::Resolved::One(opt, unset) => (opt, unset),
+                super::Resolved::Ambiguous(first, second) => {
+                    return Ok(Err(super::ambiguous_option(arg, &first, &second, USAGE)))
                 }
-            }
-
-            let exact = candidates
-                .iter()
-                .find(|(name, _, _)| name.as_str() == typed);
-            let hit = match exact {
-                Some(hit) => hit.clone(),
-                None => {
-                    let matches: Vec<_> = candidates
-                        .iter()
-                        .filter(|(name, _, _)| name.starts_with(typed))
-                        .cloned()
-                        .collect();
-                    match matches.len() {
-                        1 => matches[0].clone(),
-                        0 => {
-                            eprintln!("error: unknown option `{body}'");
-                            return Ok(Err(usage(false)));
-                        }
-                        _ => {
-                            // git keeps the first and the last match it saw.
-                            let first = &matches[0];
-                            let last = &matches[matches.len() - 1];
-                            eprintln!(
-                                "error: ambiguous option: {typed} (could be --{} or --{})",
-                                first.0, last.0
-                            );
-                            return Ok(Err(usage(false)));
-                        }
-                    }
+                super::Resolved::Unknown => {
+                    eprintln!("error: unknown option `{body}'");
+                    return Ok(Err(usage(false)));
                 }
             };
+            // `optname()`: the table's own spelling, `no-`-prefixed for the
+            // unset sense, however far the name was abbreviated.
+            let shown = match negated {
+                true => format!("no-{}", opt.name),
+                false => opt.name.to_string(),
+            };
+            let canonical = opt.name;
 
-            let (_typed_name, idx, negated) = hit;
-            let (canonical, takes_value, _) = LONG[idx];
-
-            if takes_value {
+            if opt.arg == super::Arg::Required {
                 let value = match inline {
                     Some(v) => v.to_string(),
                     None => {
@@ -365,7 +349,7 @@ fn parse_options(
                 }
             } else {
                 if inline.is_some() {
-                    eprintln!("error: option `{canonical}' takes no value");
+                    eprintln!("error: option `{shown}' takes no value");
                     return Ok(Err(ExitCode::from(129)));
                 }
                 let on = !negated;

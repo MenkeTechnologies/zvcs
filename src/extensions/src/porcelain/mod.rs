@@ -88,6 +88,45 @@ pub(crate) fn show_usage_if_asked_full(
     }
 }
 
+/// Whether `parse_options()` would answer this argument with its own help,
+/// for a command that drives its own argv walk rather than calling
+/// [`show_usage_if_asked`].
+///
+/// The two spellings arrive by different routes, and the difference shows:
+///
+/// * `--help-all` is an exact `strcmp()` at parse-options.c:1125, ahead of
+///   `parse_long_opt()`. It never abbreviates and never takes an `=<value>`, so
+///   `--help-al` and `--help-all=x` are ordinary unknown options.
+/// * `-h` has no table entry anywhere. It arrives as an *unrecognised short
+///   option*: `parse_short_opt()` consumes the leading characters the table does
+///   define, then `parse_options_step()` tests `*ctx->opt == 'h'`
+///   (parse-options.c:1066-1069 for the first character, :1085-1086 for the rest
+///   of a cluster). A cluster therefore asks for help exactly when the first
+///   character the table does *not* define is `h`: `git remote prune -nh` prints
+///   the block because `-n` is `prune`'s, while `git reflog list -nh` reports
+///   ``unknown switch `n'`` because `list`'s table is empty.
+///
+/// `shorts` is the sub-command's **argument-less** short options only. One that
+/// takes a value swallows the rest of the token as that value
+/// (`parse_short_opt()` → `get_arg()`), so `git remote add -th` is
+/// `--track=h` and not a request for help.
+///
+/// The test also survives `PARSE_OPT_KEEP_UNKNOWN_OPT`: it sits in the `UNKNOWN`
+/// arm *before* the `unknown:` label that flag diverts to, which is why
+/// `git reflog show -h` prints usage while `git reflog show --zzbogus` is
+/// forwarded to the revision parser.
+pub(crate) fn asks_for_help(tok: &str, shorts: &str) -> bool {
+    if tok == "--help-all" {
+        return true;
+    }
+    match tok.strip_prefix('-') {
+        Some(body) if !body.is_empty() && !body.starts_with('-') => body
+            .trim_start_matches(|c| shorts.contains(c))
+            .starts_with('h'),
+        _ => false,
+    }
+}
+
 /// What a long option does with a value, mirroring the `struct option` entry it
 /// was derived from.
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -765,7 +804,7 @@ pub use range_diff::range_diff;
 pub use read_tree::read_tree;
 pub use rebase::rebase;
 pub use receive_pack::receive_pack;
-pub use reflog::{reflog, reflog_show_as_log};
+pub use reflog::{reflog, reflog_show_as_log, reflog_show_as_log_status};
 pub use refs::refs;
 pub use remote::remote;
 pub use remote_ext::remote_ext;
@@ -1014,6 +1053,18 @@ mod tests {
             ("stash push", super::stash::PUSH_OPTS, "inter-hunk-context"),
             ("stash save", super::stash::SAVE_OPTS, "unified"),
             ("multi-pack-index repack", super::multi_pack_index::REPACK_OPTS, "batch-size"),
+            // `OPT_CALLBACK_F(..., PARSE_OPT_NONEG, ...)` in builtin/mailinfo.c.
+            ("mailinfo", super::mailinfo::LONG_OPTS, "encoding"),
+            ("mailinfo", super::mailinfo::LONG_OPTS, "quoted-cr"),
+            // `--parse` is `PARSE_OPT_NOARG | PARSE_OPT_NONEG`
+            // (builtin/interpret-trailers.c).
+            ("interpret-trailers", super::interpret_trailers::LONG_OPTS, "parse"),
+            // builtin/read-tree.c: `--index-output` and `--exclude-per-directory`
+            // are `OPT_CALLBACK_F(..., PARSE_OPT_NONEG, ...)` and `--prefix` is a
+            // designated-initializer `OPTION_STRING` carrying the same flag.
+            ("read-tree", super::read_tree::LONG_OPTS, "index-output"),
+            ("read-tree", super::read_tree::LONG_OPTS, "prefix"),
+            ("read-tree", super::read_tree::LONG_OPTS, "exclude-per-directory"),
         ];
         for &(verb, table, name) in cases {
             assert!(
@@ -1023,6 +1074,47 @@ mod tests {
             assert!(
                 matches!(resolve_long(table, &format!("no-{name}")), Resolved::Unknown),
                 "{verb}: --no-{name} must not resolve (the entry is PARSE_OPT_NONEG)"
+            );
+        }
+    }
+
+    /// A `no-`-named `PARSE_OPT_NONEG` entry is reachable in exactly one sense,
+    /// and it is the one that spells itself.
+    ///
+    /// `for-each-ref` is where the two rules meet: `OPT_MERGED`/`OPT_NO_MERGED`
+    /// and `OPT_CONTAINS`/`OPT_NO_CONTAINS` put `merged` and `no-merged` in the
+    /// same table, both `PARSE_OPT_NONEG`. So `--no-merged` is *not* the
+    /// negation of `--merged` — it is its own entry, selected positively — while
+    /// the unset sense of either is unreachable. Reading `--no-merged` as a
+    /// negation would silently invert the filter, and reading it as unknown
+    /// would refuse an option git accepts.
+    ///
+    /// This is also what the value rule in `for_each_ref` leans on: it refuses
+    /// an attached value whenever the *unset* sense was selected, which is only
+    /// sound if these four never report as unset.
+    #[test]
+    fn a_no_named_noneg_entry_is_reachable_only_in_its_own_sense() {
+        let table = super::for_each_ref::LONG_OPTS;
+        for (typed, want) in [
+            ("merged", "merged"),
+            ("no-merged", "no-merged"),
+            ("contains", "contains"),
+            ("no-contains", "no-contains"),
+        ] {
+            match resolve_long(table, typed) {
+                Resolved::One(opt, unset) => {
+                    assert_eq!(opt.name, want, "--{typed} should be the {want} entry");
+                    assert!(!unset, "--{typed} is PARSE_OPT_NONEG: it cannot be unset");
+                }
+                _ => panic!("--{typed} should resolve to exactly one entry"),
+            }
+        }
+        // The spelling that would be the negation of a `no-`-named entry is the
+        // one `PARSE_OPT_NONEG` removes.
+        for typed in ["no-no-merged", "no-no-contains"] {
+            assert!(
+                matches!(resolve_long(table, typed), Resolved::Unknown),
+                "--{typed} must not resolve"
             );
         }
     }
@@ -1135,6 +1227,43 @@ mod tests {
                 full.lines().count(),
                 normal.lines().count() + hidden,
                 "{verb}: --help-all should add exactly {hidden} hidden lines"
+            );
+        }
+    }
+
+    /// [`super::asks_for_help`] stops at the first short option the table does
+    /// not define, and the answer depends on which table is asking.
+    ///
+    /// Every expectation below is stock git 2.55.0's, measured. The pair that
+    /// makes the rule visible is `-nh`: `git reflog expire -nh` prints the expire
+    /// block on stdout because `-n` is `expire`'s `OPT_BIT`, while
+    /// `git reflog list -nh` prints ``error: unknown switch `n'`` on stderr
+    /// because `list`'s table is `OPT_END()` alone and `parse_short_opt()` never
+    /// reaches the `h`. Collapsing this to `tok == "-h"` silently loses the first
+    /// case; collapsing it to "contains an h" silently steals the second.
+    #[test]
+    fn a_cluster_asks_for_help_only_where_the_table_runs_out_at_h() {
+        // `shorts` is the argument-less short set, which is why `-t` (an
+        // `OPT_STRING`) is absent from `remote add`'s: it swallows the `h`.
+        let cases: [(&str, &str, bool); 12] = [
+            ("-h", "", true),
+            ("--help-all", "", true),
+            ("-nh", "n", true),   // reflog expire: -n is its own
+            ("-nh", "", false),   // reflog list: unknown switch `n'
+            ("-habc", "", true),  // reflog show: h is still first
+            ("-th", "f", false),  // remote add: -t takes "h" as its value
+            ("-n", "n", false),
+            ("--help-al", "", false),
+            ("--help-all=x", "", false),
+            ("--no-help-all", "", false),
+            ("-", "", false),
+            ("h", "", false),
+        ];
+        for (tok, shorts, want) in cases {
+            assert_eq!(
+                super::asks_for_help(tok, shorts),
+                want,
+                "asks_for_help({tok:?}, shorts={shorts:?})"
             );
         }
     }

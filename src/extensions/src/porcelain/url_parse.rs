@@ -29,7 +29,10 @@
 //! * `git url-parse [-c <component>] [--] <url>...` for the six components git
 //!   defines: `scheme`, `user`, `password`, `host`, `port`, `path`
 //! * `-c`, `-c<value>`, `--component <value>`, `--component=<value>`,
-//!   `--no-component`, and unambiguous long-option abbreviations
+//!   `--no-component`, and unambiguous long-option abbreviations. `--no-` names
+//!   the sole negatable entry twice over, so it is the `ambiguous option:`
+//!   refusal rather than a resolution; `--no-component=x` is
+//!   `error: option \`no-component' takes no value` with no usage block.
 //! * no `--component`: pure validation, no output, exit 0 / 128
 //! * `scheme://` URLs, the scp shorthand, IPv6 literals in both forms, and the
 //!   `ssh`/`git`/`git+ssh`/`ssh+git` rule that turns a `/~user` path into
@@ -46,6 +49,14 @@
 use anyhow::Result;
 use std::io::Write;
 use std::process::ExitCode;
+
+/// `cmd_url_parse`'s `struct option options[]` (builtin/url-parse.c), which
+/// holds one `OPT_STRING` and nothing else, as [`super::resolve_long`] reads it.
+const LONG_OPTS: &[super::LongOpt] = &[super::LongOpt {
+    name: "component",
+    neg: true,
+    arg: super::Arg::Required,
+}];
 
 /// Stock git's usage block, byte-for-byte. Stdout on `-h`, stderr on any
 /// argument error; both exit 129.
@@ -151,15 +162,34 @@ pub fn url_parse(args: &[String]) -> Result<ExitCode> {
             print!("{USAGE}");
             return Ok(ExitCode::from(129));
         }
-        if let Some(long) = arg.strip_prefix("--") {
-            let (name, inline) = match long.split_once('=') {
-                Some((n, v)) => (n, Some(v)),
-                None => (long, None),
+        if arg.starts_with("--") {
+            // Respell a unique abbreviation as the name it resolves to, so an
+            // abbreviation lands on the arm its full spelling lands on.
+            let canonical;
+            let arg = match super::canonical_long(arg, LONG_OPTS) {
+                super::Long::Name(name) => {
+                    canonical = name;
+                    canonical.as_ref()
+                }
+                super::Long::Ambiguous(first, second) => {
+                    return Ok(super::ambiguous_option(arg, &first, &second, USAGE))
+                }
             };
-            if is_abbrev(name, "no-component") {
-                component = None;
-            } else if is_abbrev(name, "component") {
-                match inline {
+            let (name, inline) = match arg.split_once('=') {
+                Some((n, v)) => (n, Some(v)),
+                None => (arg, None),
+            };
+            match name {
+                // The unset sense is a pure boolean whatever the entry's own
+                // type is, so an attached value is `PARSE_OPT_ERROR`.
+                "--no-component" => match inline {
+                    Some(_) => {
+                        eprintln!("error: option `no-component' takes no value");
+                        return Ok(ExitCode::from(129));
+                    }
+                    None => component = None,
+                },
+                "--component" => match inline {
                     Some(v) => component = Some(v.to_string()),
                     None => {
                         i += 1;
@@ -168,9 +198,8 @@ pub fn url_parse(args: &[String]) -> Result<ExitCode> {
                             None => return Ok(missing_value("option `component'")),
                         }
                     }
-                }
-            } else {
-                return Ok(unknown_opt("option", long));
+                },
+                _ => return Ok(unknown_opt("option", &arg[2..])),
             }
             i += 1;
             continue;
@@ -254,13 +283,6 @@ fn missing_value(what: &str) -> ExitCode {
     ExitCode::from(129)
 }
 
-/// parse-options accepts any unambiguous prefix of a long option name. `c` is
-/// the only option here, so a non-empty prefix of `full` is unambiguous unless
-/// it is also a prefix of the other spelling — which cannot happen, since
-/// `component` and `no-component` differ at the first byte.
-fn is_abbrev(given: &str, full: &str) -> bool {
-    !given.is_empty() && full.starts_with(given)
-}
 
 /// The bytes of one component, or an empty slice when it is absent.
 ///

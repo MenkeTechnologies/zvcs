@@ -128,6 +128,71 @@ enum Untracked {
 /// Intent-to-add entries (`git add -N`) render as git does: a new file in the
 /// worktree column (` A`), absent from HEAD and index in porcelain v2.
 pub fn status(args: &[String]) -> Result<ExitCode> {
+    status_with(args, Reference::Status)
+}
+
+/// What the staged half of the report is measured against: git's `s->reference`,
+/// with `s->amend` riding along because the two are only ever set together
+/// (builtin/commit.c:571-574).
+///
+/// `git status` leaves both alone and compares the index against `HEAD`. `git
+/// commit --amend` points the engine at `HEAD^1` instead, because the commit it
+/// is about to write replaces `HEAD` rather than following it — so "what would
+/// this commit record" is the difference from `HEAD`'s *parent*. Five things in
+/// the long format change with it, all of them because git branched on
+/// `s->reference` or `s->amend` rather than on `HEAD`:
+///
+///   * the staged section is the index against `HEAD^1` (wt-status.c:673);
+///   * `s->is_initial` becomes "`HEAD^1` does not resolve", which is true when
+///     `HEAD` is a root commit, so amending one prints the initial-commit block;
+///   * the unstage hint names the reference:
+///     `git restore --source=HEAD^1 --staged <file>...` (wt-status.c:208-211);
+///   * an uncommittable report ends in `No changes` instead of one of the
+///     `nothing to commit` wordings (wt-status.c:1974-1976);
+///   * the "use `git commit --amend`" advice on a rebase banner is suppressed —
+///     the user is already doing that (wt-status.c:1542).
+/// The third variant is not about the reference at all but travels with it:
+/// `cmd_commit()` sets `s->commit_template = 1` for every report it produces
+/// (builtin/commit.c:1809), which is what turns the unborn-repository notice from
+/// "No commits yet" into "Initial commit" (wt-status.c:1929-1934). Since only
+/// `git commit` ever asks for a non-default reference, one enum carries both.
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum Reference {
+    /// `git status`: `s->reference = "HEAD"`, `s->amend = 0`, no commit template.
+    Status,
+    /// `git commit`: the same reference, but reported as a commit would.
+    Commit,
+    /// `git commit --amend`: `s->reference = "HEAD^1"`, `s->amend = 1`.
+    AmendParent,
+}
+
+impl Reference {
+    /// git's `s->amend`.
+    fn amend(self) -> bool {
+        self == Reference::AmendParent
+    }
+
+    /// git's `s->commit_template`.
+    fn commit_template(self) -> bool {
+        self != Reference::Status
+    }
+
+    /// The revision `s->reference` names — the hint that prints it, and the
+    /// `committable` test that diffs the index against it, both need it.
+    pub(crate) fn spec(self) -> &'static str {
+        match self {
+            Reference::Status | Reference::Commit => "HEAD",
+            Reference::AmendParent => "HEAD^1",
+        }
+    }
+}
+
+/// `git status`, and the same engine pointed somewhere else — see [`Reference`].
+///
+/// git reaches this second form through `run_status()` (builtin/commit.c:563),
+/// which `git commit` calls both for `--dry-run` and for the report that stands
+/// in for a refusal; the port's callers in [`super::commit`] mirror those two.
+pub(crate) fn status_with(args: &[String], reference: Reference) -> Result<ExitCode> {
     let mut short = false;
     let mut porcelain_v2 = false;
     // `--porcelain` selects the short *machine* format, which git never colors;
@@ -592,8 +657,11 @@ pub fn status(args: &[String]) -> Result<ExitCode> {
     // Resolve the head into an owned description so the borrow ends before we
     // re-open references for the tracking computation.
     let head = repo.head()?;
-    let unborn = head.is_unborn();
-    let head_state = if unborn {
+    // `s->branch` is always read off `HEAD`, whatever `s->reference` is: the
+    // "On branch …" line names where the commit will land, not what it is measured
+    // against.
+    let head_unborn = head.is_unborn();
+    let head_state = if head_unborn {
         HeadState::Unborn(referent_short(head.referent_name(), "main"))
     } else if head.is_detached() {
         let short_id = head
@@ -605,6 +673,26 @@ pub fn status(args: &[String]) -> Result<ExitCode> {
         HeadState::Branch(referent_short(head.referent_name(), "HEAD"))
     };
     drop(head);
+
+    // `s->is_initial = repo_get_oid(s->reference, &oid) ? 1 : 0` (builtin/commit.c:580):
+    // whether the *reference* resolves, which for `--amend` is `HEAD^1` and so is
+    // false as soon as `HEAD` is a root commit. `reference_tree` is the tree side
+    // the staged section is diffed against — git's `opt.def`, which falls back to
+    // the empty tree when the reference is unresolvable (wt-status.c:673).
+    let reference_tree = match reference {
+        Reference::Status | Reference::Commit => None,
+        Reference::AmendParent => {
+            let resolved = match repo.rev_parse_single("HEAD^1").ok() {
+                Some(id) => Some(repo.find_commit(id.detach())?.tree_id()?.detach()),
+                None => None,
+            };
+            Some(resolved)
+        }
+    };
+    let unborn = match &reference_tree {
+        Some(resolved) => resolved.is_none(),
+        None => head_unborn,
+    };
 
     // `MERGE_HEAD` is what makes git treat the run as "from merge": it both
     // enables the in-progress banner and suppresses the unstage hint.
@@ -658,6 +746,13 @@ pub fn status(args: &[String]) -> Result<ExitCode> {
             Untracked::Normal => gix::status::UntrackedFiles::Collapsed,
             Untracked::All => gix::status::UntrackedFiles::Files,
         });
+    // `opt.def = s->is_initial ? empty_tree : s->reference` (wt-status.c:673): the
+    // staged section is the index against whatever the reference resolved to.
+    // Leaving the platform alone keeps gitoxide's own `HEAD` default, which is the
+    // same tree a plain `git status` would have used.
+    if let Some(resolved) = reference_tree {
+        platform = platform.head_tree(resolved.unwrap_or_else(|| repo.object_hash().empty_tree()));
+    }
     if show_ignored {
         // git lists ignored entries at the same granularity as untracked ones.
         // `--ignored=matching` reports whatever the ignore pattern matched, so it never
@@ -914,6 +1009,7 @@ pub fn status(args: &[String]) -> Result<ExitCode> {
                 repo.workdir(),
                 path_prefix,
                 submodule_summary_limit,
+                reference,
             )
         );
     }
@@ -2527,6 +2623,8 @@ fn render_long(
     // git's `s->submodule_summary` once the `--ignore-submodules=all` gate has
     // been applied: `Some(<summary-limit>)` (`-1` = unlimited) or `None` for off.
     submodule_summary_limit: Option<i64>,
+    // `s->reference` / `s->amend`, which change four of the lines below.
+    reference: Reference,
 ) -> String {
     let mut out = String::new();
     // When columns are active, the untracked/ignored path lists are replaced by a
@@ -2683,7 +2781,10 @@ fn render_long(
                 ),
                 None => "You are currently editing a commit during a rebase.\n".to_string(),
             }));
-            if hints {
+            // `if (s->hints && !s->amend)` (wt-status.c:1542): telling someone who
+            // is *running* `git commit --amend` to run `git commit --amend` is the
+            // one hint git withholds.
+            if hints && !reference.amend() {
                 out.push_str(&h("  (use \"git commit --amend\" to amend the current commit)\n"));
                 out.push_str(&h(
                     "  (use \"git rebase --continue\" once you are satisfied with your changes)\n",
@@ -2763,21 +2864,40 @@ fn render_long(
     if unborn {
         // `wt_longstatus_print`'s initial-commit block: a header-colored blank
         // line, the notice, then another blank line — all three header writes.
+        // `s->commit_template` picks the wording (wt-status.c:1929-1934): `git
+        // commit` sets it (builtin/commit.c:1809) and gets "Initial commit", while
+        // `git status` leaves it clear and gets "No commits yet".
         out.push_str(&trailer());
-        out.push_str(&h("No commits yet\n"));
+        out.push_str(&h(match reference.commit_template() {
+            true => "Initial commit\n",
+            false => "No commits yet\n",
+        }));
         out.push_str(&trailer());
     }
+
+    // `wt_longstatus_print_cached_header()` (wt-status.c:227): the unstage hint
+    // names `s->reference` whenever it is not plain `HEAD`, so an `--amend` report
+    // says `--source=HEAD^1` — restoring from `HEAD` would put back the very
+    // content the amend is replacing.
+    let unstage_hint = |out: &mut String| {
+        if unborn {
+            out.push_str(&h("  (use \"git rm --cached <file>...\" to unstage)\n"));
+        } else if reference.spec() == "HEAD" {
+            out.push_str(&h("  (use \"git restore --staged <file>...\" to unstage)\n"));
+        } else {
+            out.push_str(&h(&format!(
+                "  (use \"git restore --source={} --staged <file>...\" to unstage)\n",
+                reference.spec()
+            )));
+        }
+    };
 
     if !staged.is_empty() {
         out.push_str(&h("Changes to be committed:\n"));
         // Mid-merge git offers no unstage hint, as `git restore --staged` is not
         // the right advice while `MERGE_HEAD` is around.
         if hints && !progress.suppresses_unstage_hint() {
-            if unborn {
-                out.push_str(&h("  (use \"git rm --cached <file>...\" to unstage)\n"));
-            } else {
-                out.push_str(&h("  (use \"git restore --staged <file>...\" to unstage)\n"));
-            }
+            unstage_hint(&mut out);
         }
         for (kind, path, orig) in staged {
             let label = stage_label(*kind);
@@ -2798,11 +2918,7 @@ fn render_long(
             // conflict left by something other than a merge in progress (a
             // `stash apply`, say) says how to unstage it.
             if !progress.suppresses_unstage_hint() {
-                if unborn {
-                    out.push_str(&h("  (use \"git rm --cached <file>...\" to unstage)\n"));
-                } else {
-                    out.push_str(&h("  (use \"git restore --staged <file>...\" to unstage)\n"));
-                }
+                unstage_hint(&mut out);
             }
             out.push_str(&h(unmerged_hint(unmerged)));
         }
@@ -2946,6 +3062,12 @@ fn render_long(
         if labelled {
             staged_args.extend_from_slice(&["--src-prefix=c/", "--dst-prefix=i/"]);
         }
+        // `opt.def = s->reference` again (wt-status.c:1173): the verbose patch is
+        // measured against the same commit the staged section was, so an `--amend`
+        // report diffs the index against `HEAD^1` rather than `HEAD`.
+        if !unborn && reference.spec() != "HEAD" {
+            staged_args.push(reference.spec());
+        }
         out.push_str(&format!("\u{1}{}\u{1}\n", blocks.len()));
         blocks.push(verbose_patch(workdir, &staged_args));
 
@@ -2972,7 +3094,18 @@ fn render_long(
 
     // Trailing summary — omitted entirely when there is anything staged
     // (git's "committable" state), matching stock output.
-    if !committable {
+    // `if (s->amend) status_printf_ln(s, GIT_COLOR_NORMAL, _("No changes"))`
+    // (wt-status.c:1974-1976) takes the whole `!committable` branch, so none of the
+    // `nothing to commit` wordings below can be reached under `--amend`. Note which
+    // writer it uses: `status_printf_ln` goes through `status_vprintf` and so picks
+    // up `status.displayCommentPrefix`, while every other summary is a bare
+    // `fprintf` that never does — which is why this one line joins the body rather
+    // than the raw trailer.
+    if !committable && reference.amend() {
+        // `GIT_COLOR_NORMAL` is the empty string, so the line carries no SGR pair
+        // even when `color.status.header` is set — only the comment prefix.
+        out.push_str("No changes\n");
+    } else if !committable {
         let workdir_dirty = !unstaged.is_empty() || !unmerged.is_empty();
         // Each summary has a hints-on and a hints-off wording in
         // `wt_longstatus_print`; only the clean-tree line is the same either way.

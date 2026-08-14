@@ -84,7 +84,16 @@ fn run(bin: &str, dir: &Path, home: &Path, extra: &[&str]) -> Output {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    child.stdin.take().unwrap().write_all(LIST.as_bytes()).unwrap();
+    // A case whose config is invalid dies before it ever reads stdin, so this
+    // write races the child's exit and loses with `EPIPE`. Losing that race is
+    // the child behaving correctly, and the assertions that matter are on its
+    // status and stderr — so a broken pipe here is not a test failure. Any other
+    // write error is, and still panics.
+    let mut pipe = child.stdin.take().unwrap();
+    if let Err(e) = pipe.write_all(LIST.as_bytes()) {
+        assert_eq!(e.kind(), std::io::ErrorKind::BrokenPipe, "feeding {bin} stdin: {e}");
+    }
+    drop(pipe);
     child.wait_with_output().unwrap()
 }
 

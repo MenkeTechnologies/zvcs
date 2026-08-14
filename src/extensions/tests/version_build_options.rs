@@ -47,6 +47,12 @@ fn run(dir: &Path, args: &[&str]) -> Output {
         .env("ZVCS_HOME", dir)
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("TERM", "dumb")
+        // `git bugreport` opens the finished report in an editor, so without a
+        // pinned one the test reads the machine instead of the binary: it passes
+        // wherever `EDITOR` happens to be set and dies with "Terminal is dumb,
+        // but EDITOR unset" on a runner where it is not. `:` is the shell no-op
+        // git's own suite uses — the report is still written, just not opened.
+        .env("GIT_EDITOR", ":")
         .stdin(std::process::Stdio::null())
         .output()
         .unwrap()

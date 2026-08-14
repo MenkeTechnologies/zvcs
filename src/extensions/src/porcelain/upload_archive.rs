@@ -66,9 +66,10 @@ const DEADCHILD: &str = "git upload-archive: archiver died with error";
 const USAGE: &str = "usage: git upload-archive <repository>";
 
 pub fn upload_archive(args: &[String]) -> Result<ExitCode> {
-    // git's `show_usage_if_asked`: `-h` as the sole argument prints to stdout
-    // and exits 129, before anything protocol-shaped happens.
-    if args.len() == 1 && args[0] == "-h" {
+    // git's `show_usage_if_asked`: `-h` or `--help-all` as the sole argument
+    // prints to stdout and exits 129, before anything protocol-shaped happens.
+    // There is no hidden option to add, so both print the same line.
+    if args.len() == 1 && matches!(args[0].as_str(), "-h" | "--help-all") {
         println!("{USAGE}");
         return Ok(ExitCode::from(129));
     }

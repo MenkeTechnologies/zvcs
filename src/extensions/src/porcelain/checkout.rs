@@ -906,8 +906,15 @@ fn create_and_switch(
     merge_worktree: bool,
 ) -> Result<ExitCode> {
     let full = format!("refs/heads/{name}");
-    if gix::validate::reference::branch_name(BStr::new(full.as_bytes())).is_err() {
-        crate::git_fatal!("'{name}' is not a valid branch name");
+    if !super::branch::valid_branch_name(name) {
+        // `validate_branchname()` pairs the die with the refSyntax advice:
+        //
+        //     int code = die_message(_("'%s' is not a valid branch name"), name);
+        //     advise_if_enabled(ADVICE_REF_SYNTAX, _("See 'git help check-ref-format'"));
+        //     exit(code);
+        eprintln!("fatal: '{name}' is not a valid branch name");
+        crate::advice::Advice::RefSyntax.advise_in(repo, "See 'git help check-ref-format'");
+        return Ok(ExitCode::from(128));
     }
 
     // `-t`: resolve the upstream before any mutation, so a bad start-point fails
@@ -1058,7 +1065,7 @@ fn orphan_checkout(
     };
 
     let full = format!("refs/heads/{name}");
-    if gix::validate::reference::branch_name(BStr::new(full.as_bytes())).is_err() {
+    if !super::branch::valid_branch_name(name) {
         eprintln!("fatal: '{name}' is not a valid branch name");
         crate::advice::Advice::RefSyntax.advise_in(repo, "See 'git help check-ref-format'");
         return Ok(ExitCode::from(128));

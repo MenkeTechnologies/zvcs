@@ -25,6 +25,12 @@
 //!     `--date`; `%as`/`%cs` is always the short date). A `%a`/`%c` at end of
 //!     string, and any unrecognised `%a`/`%c` sub-form, are copied through
 //!     verbatim exactly as git does (its `format_person_part` returns 0).
+//!     The column atoms `%<(<N>)`, `%>(<N>)`, `%><(<N>)`, `%>>(<N>)` — with
+//!     their `%<|(<N>)` column-target and `,trunc`/`,ltrunc`/`,mtrunc` forms —
+//!     and the `%w(<width>,<indent1>,<indent2>)` wrap atom go through the shared
+//!     [`super::pretty_pad`] port, so a field is measured in display columns and
+//!     a CJK subject costs two per glyph. `%C…` is not among the placeholders
+//!     above, so `format_and_pad_commit()`'s colour chain can never open here.
 //!   * `--date=<fmt>` — validated the way `parse_date_format()` validates it.
 //!   * revision selection: `<rev>`, `^<rev>`, `<a>..<b>`, `<a>...<b>`, `--not`,
 //!     `--all`, `--branches[=<glob>]`, `--tags[=<glob>]`, `--remotes[=<glob>]`,

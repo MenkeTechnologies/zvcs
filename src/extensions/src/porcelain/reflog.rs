@@ -112,8 +112,14 @@ const USAGE: &str = r"usage: git reflog [show] [<log-options>] [<ref>]
 /// the default is when stdout is not a tty.
 ///
 /// Output: `--parents`, and `--format=`/`--pretty=` for the placeholders
-/// `%H %h %T %P %p %s %an %ae %ad %cn %ce %cd %gd %gD %gn %ge %gs %n %% %x<hh>`
-/// plus the `oneline` built-in. Empty formats print nothing at all, and a format
+/// `%H %h %T %P %p %s %an %ae %ad %cn %ce %cd %gd %gD %gn %ge %gs %n %% %x<hh>`,
+/// the column atoms `%<(<N>)`, `%>(<N>)`, `%><(<N>)`, `%>>(<N>)` (with their
+/// `%<|(<N>)` column-target and `,trunc`/`,ltrunc`/`,mtrunc` forms) and the
+/// `%w(<width>,<indent1>,<indent2>)` wrap atom — all through the shared
+/// [`super::pretty_pad`] port, so a field is measured in display columns and a
+/// CJK subject costs two per glyph. `%C…` is refused below, so
+/// `format_and_pad_commit()`'s colour chain can never open here.
+/// Also supported is the `oneline` built-in. Empty formats print nothing at all, and a format
 /// string is newline-terminated per entry, both matching git. The multi-line
 /// built-ins `medium` (also bare `--pretty`), `short`, `full`, `fuller`, `raw` and
 /// `reference` render with git's `Reflog:`/`Reflog message:` header lines; only

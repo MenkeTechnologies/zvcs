@@ -74,11 +74,23 @@
 //! `invalid number of threads specified` fatal and its `ignoring --threads`
 //! warning under `-O` are observable, so both are reproduced.
 //!
-//! Not covered: `grep.fallbackToNoIndex` (it turns a repo-less invocation into a
-//! `--no-index` one, and this port's `--no-index` still requires a repository to
-//! discover), and — within the function-context renderers — funcname detection
-//! driven by git's built-in userdiff regex tables (see above; such files are
-//! refused, not approximated).
+//! `grep` is not a `NEED_WORK_TREE` command and does not need a repository at
+//! all: `--no-index` walks the current directory, and `grep.fallbackToNoIndex`
+//! turns any other repo-less invocation into that same walk instead of dying
+//! (builtin/grep.c:1203-1211). So [`Repository`](gix::Repository) is optional
+//! throughout, and the branches that need one — the index, `<tree>` searches,
+//! submodule recursion, `.gitattributes` — are exactly the branches `--no-index`
+//! rules out. Two consequences are observable and reproduced: without a
+//! repository there are no attributes, so `--textconv` finds no driver to run and
+//! the function-context renderers fall back to git's built-in funcname heuristic
+//! rather than a `diff=<driver>` one; and `--exclude-standard`'s stack is
+//! `core.excludesFile` plus the `.gitignore` files met along the walk, with no
+//! `info/exclude` to add (`setup_standard_excludes()` guards that one on
+//! `startup_info->have_repository`, dir.c:3494).
+//!
+//! Not covered: within the function-context renderers, funcname detection driven
+//! by git's built-in userdiff regex tables (see above; such files are refused,
+//! not approximated).
 //!
 //! The function-context renderers only shape the *rendering* of a match, so they
 //! are accepted during parsing (git itself diagnoses a missing pattern before it
@@ -502,6 +514,16 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
             break;
         }
         if let Some(long) = a.strip_prefix("--") {
+            // `if (internal_help && !strcmp(arg + 2, "help-all"))`
+            // (parse-options.c:1124). Unlike the lone-`-h` rule above this one
+            // fires wherever the option loop is still running — `git grep -i
+            // --help-all foo` prints help — but it is a whole-token comparison,
+            // so `--help-all=x` is an unknown option rather than a help request.
+            // Past a `--` or the first non-option the loop has already broken out,
+            // which is why `git grep foo --help-all` searches for `foo` instead.
+            if long == "help-all" {
+                return Ok(super::show_usage(USAGE));
+            }
             // `--name=value` and `--name value` are both accepted by git for
             // every long option that takes one.
             let (name, inline) = match long.split_once('=') {
@@ -847,23 +869,50 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::from(128));
     }
 
+    // builtin/grep.c:1203-1211. `grep` runs gently, so a missing repository is
+    // only fatal for an invocation that wants one: `--no-index` never does, and
+    // `grep.fallbackToNoIndex` converts any other repo-less invocation into a
+    // `--no-index` one rather than letting `setup_git_directory()` die. The
+    // config is read from the global cascade, which is all git has to read it
+    // from here either.
+    let mut repo = match gix::discover(".") {
+        Ok(repo) => Some(repo),
+        Err(err) => {
+            if !opts.no_index {
+                let fallback = crate::config::global_config()
+                    .boolean("grep.fallbackToNoIndex")
+                    .ok()
+                    .flatten()
+                    == Some(true);
+                if !fallback {
+                    return Err(err.into());
+                }
+                opts.no_index = true;
+            }
+            None
+        }
+    };
+
     // git resolves an unset `--exclude-standard` to whether an index is being
     // consulted, so `--no-index` searches ignored files and everything else does
     // not. This is why `git help grep` calls `--exclude-standard` "only useful"
     // with `--no-index` and `--no-exclude-standard` "only useful" with
-    // `--untracked`: each is the flag that departs from its default.
+    // `--untracked`: each is the flag that departs from its default. git resolves
+    // it at builtin/grep.c:1412, past the fallback above, so a fallback-induced
+    // `--no-index` moves the default with it.
     if !exclude_standard_explicit {
         opts.exclude_standard = !opts.no_index;
     }
 
-    let mut repo = gix::discover(".")?;
     // Object-heavy path: give gix the caches it does not enable by default —
     // a decoded-object cache and a git-sized delta-base cache (gix ships a
     // 64-entry linked list; git's core.deltaBaseCacheLimit default is 96MB).
-    repo.object_cache_size_if_unset(16 * 1024 * 1024);
-    repo.objects.set_pack_cache(|| {
-        Box::new(gix::odb::pack::cache::lru::MemoryCappedHashmap::new(96 * 1024 * 1024))
-    });
+    if let Some(repo) = repo.as_mut() {
+        repo.object_cache_size_if_unset(16 * 1024 * 1024);
+        repo.objects.set_pack_cache(|| {
+            Box::new(gix::odb::pack::cache::lru::MemoryCappedHashmap::new(96 * 1024 * 1024))
+        });
+    }
 
     // Split the remaining tokens into revisions and pathspecs the way git does.
     // With a `--` present every token before it must resolve as a revision; with
@@ -890,13 +939,16 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
             path_start = r;
             break;
         }
+        // `allow_revs` is false without a repository (it implies `--no-index`), so
+        // this only ever runs with one.
+        let repo = repo.as_ref().expect("revisions require a repository");
         if repo.rev_parse_single(arg.as_str()).is_ok() {
             // git's `verify_non_filename`: a token that is both a revision and an
             // existing path is ambiguous unless a `--` disambiguates it — but only
             // where a worktree path could have been meant, which is why the check
             // stands down in a bare repository (where `HEAD` is a file in the cwd).
             if !seen_dashdash {
-                if let Some(msg) = crate::setup::verify_non_filename(&repo, &arg) {
+                if let Some(msg) = crate::setup::verify_non_filename(repo, &arg) {
                     eprintln!("fatal: {msg}");
                     return Ok(ExitCode::from(128));
                 }
@@ -950,7 +1002,7 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
     let pager: Option<String> = match &pager_req {
         None => None,
         Some(PagerReq::Named(p)) => Some(p.clone()),
-        Some(PagerReq::Default) => git_pager(&repo),
+        Some(PagerReq::Default) => git_pager(repo.as_ref()),
     };
 
     // git's thread bookkeeping: `-O` forces a single thread and warns when the
@@ -1052,7 +1104,7 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
         && !opts.untracked
         && !opts.cached
         && revs.is_empty()
-        && !repo.workdir().is_some_and(|wt| wt.is_dir())
+        && !repo.as_ref().and_then(gix::Repository::workdir).is_some_and(|wt| wt.is_dir())
     {
         return Err(crate::fatal::need_work_tree());
     }
@@ -1060,31 +1112,41 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
     // `repo_read_index()` reaches `do_read_index()` with `must_exist == 0`
     // (read-cache.c:2216-2224), so a repository that has never staged anything —
     // every bare one included — hands `grep` an empty index rather than an error.
-    let index = match repo.open_index() {
-        Ok(index) => index,
-        Err(gix::worktree::open_index::Error::IndexFile(gix::index::file::init::Error::Io(err)))
-            if err.kind() == std::io::ErrorKind::NotFound =>
-        {
-            gix::index::File::from_state(
+    // With no repository at all, `the_repository`'s index is the same empty one,
+    // and `grep_directory()` still hands it to `fill_directory()`.
+    let index = match repo.as_ref() {
+        None => gix::index::File::from_state(
+            gix::index::State::new(gix::hash::Kind::Sha1),
+            std::path::PathBuf::new(),
+        ),
+        Some(repo) => match repo.open_index() {
+            Ok(index) => index,
+            Err(gix::worktree::open_index::Error::IndexFile(
+                gix::index::file::init::Error::Io(err),
+            )) if err.kind() == std::io::ErrorKind::NotFound => gix::index::File::from_state(
                 gix::index::State::new(repo.object_hash()),
                 repo.index_path(),
-            )
-        }
-        Err(err) => return Err(err.into()),
+            ),
+            Err(err) => return Err(err.into()),
+        },
     };
 
     // `--textconv` can only change what is searched when there is a converter to
     // run, and one exists only if some `diff.<driver>.textconv` command is
-    // configured. With none, honouring the setting and ignoring it agree, so the
-    // per-path resolver is only built when a converter actually exists.
-    let textconv_active = textconv && has_textconv_driver(&repo);
+    // configured *and* a `diff` attribute names it. Outside a repository git
+    // reads no attributes at all, so no driver can be selected and `--textconv`
+    // is a no-op there — verified against stock, which greps the raw bytes of a
+    // file whose `.gitattributes` entry would have converted it inside a repo.
+    let textconv_active = textconv && repo.as_ref().is_some_and(has_textconv_driver);
 
     // The `diff` attribute resolver, shared by `--textconv` and the
-    // function-context renderers; built lazily since both are uncommon.
-    let mut diff_attrs = if textconv_active || opts.show_function || opts.funcbody {
-        Some(DiffAttrs::new(&repo, &index)?)
-    } else {
-        None
+    // function-context renderers; built lazily since both are uncommon, and not
+    // at all without a repository to resolve attributes against.
+    let mut diff_attrs = match repo.as_ref() {
+        Some(repo) if textconv_active || opts.show_function || opts.funcbody => {
+            Some(DiffAttrs::new(repo, &index)?)
+        }
+        _ => None,
     };
 
     let specs: Vec<BString> = positionals
@@ -1095,8 +1157,10 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
     // The repo-root-relative prefix of the current directory. It scopes a bare
     // invocation to the current subtree, is the base `--max-depth` counts from
     // when no pathspec narrows it, and is stripped from printed paths unless
-    // `--full-name` was given.
-    let cwd_prefix: Vec<u8> = match repo.prefix()? {
+    // `--full-name` was given. Outside a repository git's `prefix` is NULL and
+    // paths are named from the current directory, so there is nothing to strip.
+    let cwd_prefix: Vec<u8> = match repo.as_ref().map(gix::Repository::prefix).transpose()?.flatten()
+    {
         Some(p) if !p.as_os_str().is_empty() => {
             let mut b = gix::path::into_bstr(p).into_owned().to_vec();
             b.push(b'/');
@@ -1158,15 +1222,24 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
     if revs.is_empty() {
         let mut files: Vec<(BString, Option<gix::hash::ObjectId>)> = Vec::new();
         if opts.no_index {
-            // gitoxide's dirwalk is a *worktree* walk and has none to run in a bare
-            // repository; git's has no such requirement, so the walk falls back to
-            // the plain directory one git actually describes.
-            if repo.workdir().is_some() {
-                collect_no_index(&repo, &index, &specs, &opts, &mut files)?;
-            } else {
-                collect_directory_no_worktree(&repo, &index, &specs, &opts, &mut files)?;
+            // gitoxide's dirwalk is a *worktree* walk, and there is none to run in
+            // a bare repository or outside one entirely; git's `read_directory()`
+            // has no such requirement, so both fall back to the plain directory
+            // walk git actually describes.
+            match repo.as_ref().filter(|r| r.workdir().is_some()) {
+                Some(repo) => collect_no_index(repo, &index, &specs, &opts, &mut files)?,
+                None => collect_directory_no_worktree(
+                    repo.as_ref(),
+                    &index,
+                    &specs,
+                    &opts,
+                    &mut files,
+                )?,
             }
         } else {
+            // Every branch below reads the index or the object database, which
+            // `--no-index` above is the only way to reach without a repository.
+            let repo = repo.as_ref().expect("index and tree searches require a repository");
             // `empty_patterns_match_prefix = true` reproduces git's behaviour of
             // limiting a bare invocation to the current directory's subtree.
             let mut ps = repo.pathspec(
@@ -1185,7 +1258,7 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
             // the main walk only because that walk keeps `ps` borrowed for its
             // whole iteration; the merge below restores git's path order.
             if recurse_submodules {
-                let subs = open_submodules(&repo);
+                let subs = open_submodules(repo);
                 for entry in index.entries() {
                     if entry.mode != gix::index::entry::Mode::COMMIT {
                         continue;
@@ -1227,9 +1300,9 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
 
             if opts.untracked {
                 if repo.workdir().is_some() {
-                    collect_untracked(&repo, &index, &specs, &opts, &mut files)?;
+                    collect_untracked(repo, &index, &specs, &opts, &mut files)?;
                 } else {
-                    collect_directory_no_worktree(&repo, &index, &specs, &opts, &mut files)?;
+                    collect_directory_no_worktree(Some(repo), &index, &specs, &opts, &mut files)?;
                 }
             }
         }
@@ -1272,7 +1345,7 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
             return Ok(ExitCode::from(128));
         }
         collect_trees(
-            &repo,
+            repo.as_ref().expect("revisions require a repository"),
             &revs,
             &specs,
             prefix,
@@ -1313,7 +1386,7 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
         // Pre-scan on raw content (no textconv side effects) so the refusal fires
         // before any output is written, keeping stdout all-or-nothing.
         for (_, rela, src) in &cands {
-            let Some(content) = load_content(&repo, &subrepos, None, false, rela.as_bstr(), src)? else {
+            let Some(content) = load_content(repo.as_ref(), &subrepos, None, false, rela.as_bstr(), src)? else {
                 continue;
             };
             if !passes_gate(&content) {
@@ -1341,7 +1414,7 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
         let mut hunk_mark = false;
         for (name, rela, src) in &cands {
             let Some(content) =
-                load_content(&repo, &subrepos, diff_attrs.as_mut(), textconv_active, rela.as_bstr(), src)?
+                load_content(repo.as_ref(), &subrepos, diff_attrs.as_mut(), textconv_active, rela.as_bstr(), src)?
             else {
                 continue;
             };
@@ -1403,7 +1476,7 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
         let mut printed_any = false;
         for (name, rela, src) in &cands {
             let Some(content) =
-                load_content(&repo, &subrepos, diff_attrs.as_mut(), textconv_active, rela.as_bstr(), src)?
+                load_content(repo.as_ref(), &subrepos, diff_attrs.as_mut(), textconv_active, rela.as_bstr(), src)?
             else {
                 continue;
             };
@@ -1448,7 +1521,7 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
     let mut emitted_any = false;
     for (name, rela, src) in &cands {
         let Some(content) =
-            load_content(&repo, &subrepos, diff_attrs.as_mut(), textconv_active, rela.as_bstr(), src)?
+            load_content(repo.as_ref(), &subrepos, diff_attrs.as_mut(), textconv_active, rela.as_bstr(), src)?
         else {
             continue;
         };
@@ -1488,9 +1561,13 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
 /// compiled-in `less`. A value that came from the environment or config and is
 /// either empty or exactly `cat` turns paging off; the built-in default never
 /// does.
-fn git_pager(repo: &gix::Repository) -> Option<String> {
-    let configured = std::env::var("GIT_PAGER").ok().or_else(|| {
-        repo.config_snapshot().string("core.pager").map(|v| v.to_string())
+fn git_pager(repo: Option<&gix::Repository>) -> Option<String> {
+    let configured = std::env::var("GIT_PAGER").ok().or_else(|| match repo {
+        Some(repo) => repo.config_snapshot().string("core.pager").map(|v| v.to_string()),
+        // `git_pager(the_repository, …)` still reads the global cascade when the
+        // repository was never set up, which is where a repo-less `core.pager`
+        // has to come from.
+        None => crate::config::global_config().string("core.pager").map(|v| v.to_string()),
     });
     let pager = match configured.or_else(|| std::env::var("PAGER").ok()) {
         None => return Some("less".into()),
@@ -1964,6 +2041,112 @@ fn has_textconv_driver(repo: &gix::Repository) -> bool {
     found
 }
 
+/// The pathspec matcher [`collect_directory_no_worktree`] tests each name with.
+///
+/// A repository's matcher can resolve `:(attr:…)` magic and inherits
+/// `core.ignoreCase`; without one there is neither an attribute source nor a
+/// config to read the case rule from, which is exactly what git has outside a
+/// repository too.
+enum DirSpecs<'repo> {
+    Repo(gix::Pathspec<'repo>),
+    Bare(gix::pathspec::Search),
+}
+
+impl DirSpecs<'_> {
+    fn is_included(&mut self, path: &BStr, is_dir: Option<bool>) -> bool {
+        match self {
+            DirSpecs::Repo(ps) => ps.is_included(path, is_dir),
+            // `attributes` is never consulted: `bare_pathspec` rejects the
+            // patterns that would ask for it before the search is built.
+            DirSpecs::Bare(search) => search
+                .pattern_matching_relative_path(path, is_dir, &mut |_, _, _, _| false)
+                .is_some_and(|m| !m.is_excluded()),
+        }
+    }
+}
+
+/// The exclude stack [`collect_directory_no_worktree`] skips names with, which is
+/// `setup_standard_excludes()`'s `dir_struct` in git.
+enum DirExcludes<'repo> {
+    Repo(gix::AttributeStack<'repo>),
+    Bare(gix::worktree::Stack),
+}
+
+impl DirExcludes<'_> {
+    fn is_excluded(&mut self, path: &BStr, mode: Option<gix::index::entry::Mode>) -> bool {
+        let stack = match self {
+            DirExcludes::Repo(stack) => &mut **stack,
+            DirExcludes::Bare(stack) => stack,
+        };
+        stack
+            .at_entry(path, mode, &gix::objs::find::Never)
+            .map(|p| p.is_excluded())
+            .unwrap_or(false)
+    }
+}
+
+/// The pathspec search for a walk with no repository behind it.
+///
+/// git parses these with `prefix = NULL` (it never changed directory) and
+/// normalizes them against the cwd, which is why `git grep --no-index -- ../x`
+/// outside a repository dies with `'../x' is outside the directory tree` and an
+/// absolute path does the same.
+fn bare_pathspec(specs: &[BString], cwd: &Path) -> Result<gix::pathspec::Search> {
+    let defaults = gix::pathspec::Defaults::from_environment(&mut |name| std::env::var_os(name))
+        .unwrap_or_default();
+    let mut patterns = Vec::with_capacity(specs.len());
+    for spec in specs {
+        let pattern = gix::pathspec::parse(spec.as_ref(), defaults)?;
+        // `:(attr:…)` needs an attribute source, and outside a repository git has
+        // none to consult — refusing beats silently matching nothing.
+        if !pattern.attributes.is_empty() {
+            bail!("attribute pathspec magic is not supported outside a repository");
+        }
+        patterns.push(pattern);
+    }
+    gix::pathspec::Search::from_specs(patterns, None, cwd).map_err(|err| match err {
+        gix::pathspec::normalize::Error::AbsolutePathOutsideOfWorktree { path, .. }
+        | gix::pathspec::normalize::Error::OutsideOfWorktree { path, .. } => {
+            crate::fatal::die(format!("'{}' is outside the directory tree", path.display()))
+        }
+        err => err.into(),
+    })
+}
+
+/// `setup_standard_excludes()` (dir.c:3482-3500) with no repository: the
+/// `core.excludesFile` (or its `$XDG_CONFIG_HOME/git/ignore` default) plus the
+/// `.gitignore` met in each directory. `info/exclude` is skipped — git guards it
+/// on `startup_info->have_repository`, which is false here.
+fn bare_excludes(cwd: &Path) -> Result<gix::worktree::Stack> {
+    let config = crate::config::global_config();
+    let excludes_file = config
+        .path("core.excludesFile")
+        .and_then(|p| p.interpolate(Default::default()).ok())
+        .or_else(|| gix::path::env::xdg_config("ignore", &mut |name: &str| std::env::var_os(name)));
+    let parse = gix::ignore::search::Ignore::default();
+    let mut buf = Vec::with_capacity(512);
+    // A git directory that does not exist contributes no `info/exclude`, which is
+    // the omission git makes explicitly.
+    let globals =
+        gix::ignore::Search::from_git_dir(Path::new(""), excludes_file, &mut buf, parse)?;
+    let state = gix::worktree::stack::State::IgnoreStack(
+        gix::worktree::stack::state::Ignore::new(
+            Default::default(),
+            globals,
+            None,
+            gix::worktree::stack::state::ignore::Source::WorktreeThenIdMappingIfNotSkipped,
+            parse,
+        ),
+    );
+    Ok(gix::worktree::Stack::new(
+        cwd,
+        state,
+        gix::glob::pattern::Case::Sensitive,
+        buf,
+        Vec::new(),
+    ))
+}
+
 /// git's `grep_directory()` (builtin/grep.c:914-933) where there is no work tree
 /// to walk.
 ///
@@ -1980,38 +2163,47 @@ fn has_textconv_driver(repo: &gix::Repository) -> bool {
 /// from `use_index`. When it is on, `setup_standard_excludes()`'s stack — the
 /// repository's `info/exclude`, `core.excludesFile` and the `.gitignore` files
 /// found along the way — decides what the walk skips, directories included.
+///
+/// `repo` is `None` when there is no repository at all, which is the `--no-index`
+/// case git reaches with `startup_info->have_repository` false. The walk itself
+/// is unchanged; only its two inputs are rebuilt without one — the pathspec loses
+/// `:(attr:…)` support (there are no attributes to read) and the exclude stack
+/// loses `info/exclude` (dir.c:3494 guards it on the same flag).
 fn collect_directory_no_worktree(
-    repo: &gix::Repository,
+    repo: Option<&gix::Repository>,
     index: &gix::index::File,
     specs: &[BString],
     opts: &Opts,
     files: &mut Vec<(BString, Option<gix::hash::ObjectId>)>,
 ) -> Result<()> {
     let cwd = std::env::current_dir()?;
-    let mut ps = repo.pathspec(
-        true,
-        specs,
-        false,
-        index,
-        gix::worktree::stack::state::attributes::Source::IdMapping,
-    )?;
-    let mut excludes = opts
-        .exclude_standard
-        .then(|| {
-            repo.excludes(
-                index,
-                None,
-                gix::worktree::stack::state::ignore::Source::IdMapping,
-            )
-        })
-        .transpose()?;
+    let mut ps = match repo {
+        Some(repo) => DirSpecs::Repo(repo.pathspec(
+            true,
+            specs,
+            false,
+            index,
+            gix::worktree::stack::state::attributes::Source::IdMapping,
+        )?),
+        None => DirSpecs::Bare(bare_pathspec(specs, &cwd)?),
+    };
+    let mut excludes = match (opts.exclude_standard, repo) {
+        (false, _) => None,
+        (true, Some(repo)) => Some(DirExcludes::Repo(repo.excludes(
+            index,
+            None,
+            gix::worktree::stack::state::ignore::Source::IdMapping,
+        )?)),
+        (true, None) => Some(DirExcludes::Bare(bare_excludes(&cwd)?)),
+    };
     // The exclude stack is rooted at the git directory when there is no work tree
     // (gix's `Repository::excludes`), so a cwd below it has to contribute its own
     // path for the per-directory `.gitignore` lookups to land in the right place.
     // A cwd outside the root — `GIT_DIR` pointing elsewhere — has no such path and
-    // is queried by its own relative names.
-    let stack_prefix: Vec<u8> = gix::path::realpath(repo.git_dir())
-        .ok()
+    // is queried by its own relative names. The repo-less stack is rooted at the
+    // cwd already, so it needs no prefix at all.
+    let stack_prefix: Vec<u8> = repo
+        .and_then(|repo| gix::path::realpath(repo.git_dir()).ok())
         .and_then(|root| cwd.strip_prefix(root).ok().map(Path::to_path_buf))
         .filter(|rel| !rel.as_os_str().is_empty())
         .map(|rel| {
@@ -2049,11 +2241,7 @@ fn collect_directory_no_worktree(
                 let mut probe = BString::from(stack_prefix.clone());
                 probe.extend_from_slice(&path);
                 let mode = is_dir.then_some(gix::index::entry::Mode::DIR);
-                if stack
-                    .at_entry(probe.as_bstr(), mode)
-                    .map(|p| p.is_excluded())
-                    .unwrap_or(false)
-                {
+                if stack.is_excluded(probe.as_bstr(), mode) {
                     continue;
                 }
             }
@@ -2601,7 +2789,7 @@ static TEXTCONV_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 /// (index or tree) is always present. With `textconv_active` false (or no
 /// converter for the path) the raw content is returned unchanged.
 fn load_content(
-    repo: &gix::Repository,
+    repo: Option<&gix::Repository>,
     subrepos: &[gix::Repository],
     diff_attrs: Option<&mut DiffAttrs>,
     textconv_active: bool,
@@ -2611,9 +2799,10 @@ fn load_content(
     let raw = match src {
         Source::Work(path) => {
             // A worktree walk names paths from the work tree root; the directory
-            // walk of a repository that has none names them from the current
-            // directory, which is where `grep_file()` opens them from too.
-            let abs = match repo.workdir_path(path.as_bstr()) {
+            // walk of a repository that has none — or of no repository at all —
+            // names them from the current directory, which is where `grep_file()`
+            // opens them from too.
+            let abs = match repo.and_then(|repo| repo.workdir_path(path.as_bstr())) {
                 Some(abs) => abs,
                 None => gix::path::from_bstr(path.as_bstr()).into_owned(),
             };
@@ -2623,7 +2812,13 @@ fn load_content(
                 Err(e) => return Err(e.into()),
             }
         }
-        Source::Blob(id) => repo.find_object(*id)?.data.clone(),
+        // Both blob sources come from an index or tree walk, neither of which is
+        // reachable without a repository.
+        Source::Blob(id) => repo
+            .context("blob contents require a repository")?
+            .find_object(*id)?
+            .data
+            .clone(),
         Source::SubBlob(slot, id) => subrepos
             .get(*slot)
             .context("submodule repository slot out of range")?
@@ -3632,5 +3827,89 @@ mod tests {
         for bad in ["true", "false", "on", "off", "yes", "no", "1", "0", "", "=", "auto "] {
             assert_eq!(color_wanted(Some(bad)), Err(()), "{bad:?} should be rejected");
         }
+    }
+
+    /// The two pathspecs a repo-less `--no-index` walk refuses, and the wording it
+    /// refuses them with.
+    ///
+    /// Both were read off stock git 2.55.0 run outside any repository:
+    ///
+    /// ```text
+    /// $ git grep --no-index hello -- ../a.txt
+    /// fatal: '../a.txt' is outside the directory tree
+    /// $ git grep --no-index hello -- /abs/path/a.txt
+    /// fatal: '/abs/path/a.txt' is outside the directory tree
+    /// ```
+    ///
+    /// The rule is git's `prefix_path_gently()`: with no repository there is no
+    /// root above the current directory, so nothing outside it can be named. It is
+    /// worth pinning because the message is the *only* thing that distinguishes
+    /// this from "no such path", and a matcher that silently accepted the escape
+    /// would walk files git never looks at.
+    #[test]
+    fn a_repoless_pathspec_cannot_escape_the_current_directory() {
+        let cwd = Path::new("/nonexistent/parity/tree");
+        for escape in ["../a.txt", "/nonexistent/parity/a.txt", "../"] {
+            let err = bare_pathspec(&[BString::from(escape)], cwd)
+                .expect_err("{escape} names something above the cwd");
+            assert!(
+                err.to_string().contains("is outside the directory tree"),
+                "{escape:?} was refused as {err}"
+            );
+        }
+        // A name inside the tree is fine, including one that walks back down into it.
+        for ok in ["a.txt", "sub/c.txt", "sub/../a.txt", "*.txt", ":!sub"] {
+            bare_pathspec(&[BString::from(ok)], cwd)
+                .unwrap_or_else(|err| panic!("{ok:?} should be accepted, got {err}"));
+        }
+    }
+
+    /// `:(attr:…)` is refused rather than quietly matching nothing.
+    ///
+    /// Outside a repository git reads no `.gitattributes` at all — verified
+    /// against stock, where a file whose attributes name a `diff` driver still
+    /// greps as raw bytes and picks the built-in funcname heuristic. A pathspec
+    /// that asks about an attribute therefore has no source to ask, and an honest
+    /// refusal beats a walk that silently drops every candidate.
+    #[test]
+    fn attribute_pathspec_magic_is_refused_without_a_repository() {
+        let cwd = Path::new("/nonexistent/parity/tree");
+        let err = bare_pathspec(&[BString::from(":(attr:binary)x")], cwd)
+            .expect_err("attribute magic has no source outside a repository");
+        assert!(err.to_string().contains("attribute pathspec magic"), "got {err}");
+    }
+
+    /// The repo-less matcher agrees with the walk stock performs.
+    ///
+    /// Each expectation is a path stock printed (or did not print) for
+    /// `git grep --no-index hello -- <spec>` in a tree of `a.txt`, `b.txt` and
+    /// `sub/c.txt`. The two that matter are the ones a naive matcher gets wrong:
+    /// `*.txt` reaches *into* `sub/`, because git's fnmatch is not anchored at a
+    /// directory boundary, and a bare directory name matches everything under it.
+    #[test]
+    fn the_repoless_matcher_selects_what_stock_walks() {
+        let cwd = Path::new("/nonexistent/parity/tree");
+        let cases: &[(&str, &[(&str, bool)])] = &[
+            ("*.txt", &[("a.txt", true), ("sub/c.txt", true)]),
+            ("sub", &[("a.txt", false), ("sub/c.txt", true)]),
+            (":!sub", &[("a.txt", true), ("sub/c.txt", false)]),
+            ("a.txt", &[("a.txt", true), ("b.txt", false), ("sub/c.txt", false)]),
+        ];
+        for (spec, expected) in cases {
+            let mut search = DirSpecs::Bare(
+                bare_pathspec(&[BString::from(*spec)], cwd).expect("spec parses"),
+            );
+            for (path, want) in *expected {
+                assert_eq!(
+                    search.is_included(BString::from(*path).as_bstr(), Some(false)),
+                    *want,
+                    "spec {spec:?} against {path:?}"
+                );
+            }
+        }
+        // No pathspec at all matches every file, which is the bare `git grep
+        // --no-index <pattern>` case.
+        let mut all = DirSpecs::Bare(bare_pathspec(&[], cwd).expect("empty spec list"));
+        assert!(all.is_included(BString::from("sub/c.txt").as_bstr(), Some(false)));
     }
 }

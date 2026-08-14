@@ -498,7 +498,7 @@ fn switch_create(
     let start = positionals.first().copied();
     let full = format!("refs/heads/{branch}");
 
-    if let Some(code) = reject_invalid_branch_name(repo, branch, &full) {
+    if let Some(code) = reject_invalid_branch_name(repo, branch) {
         return Ok(code);
     }
     let full_name: FullName = full
@@ -718,7 +718,7 @@ fn switch_orphan(
     }
 
     let full = format!("refs/heads/{branch}");
-    if let Some(code) = reject_invalid_branch_name(repo, branch, &full) {
+    if let Some(code) = reject_invalid_branch_name(repo, branch) {
         return Ok(code);
     }
     let full_name: FullName = full
@@ -970,12 +970,8 @@ fn dwim_ref(repo: &gix::Repository, name: &str) -> Option<String> {
 
 /// Validate a name as a local branch, reporting git's fatal + advice on failure.
 /// Returns `Some(exit)` when rejected, `None` when the name is valid.
-fn reject_invalid_branch_name(
-    repo: &gix::Repository,
-    branch: &str,
-    full: &str,
-) -> Option<ExitCode> {
-    if gix::validate::reference::branch_name(BStr::new(full.as_bytes())).is_ok() {
+fn reject_invalid_branch_name(repo: &gix::Repository, branch: &str) -> Option<ExitCode> {
+    if super::branch::valid_branch_name(branch) {
         return None;
     }
     eprintln!("fatal: '{branch}' is not a valid branch name");

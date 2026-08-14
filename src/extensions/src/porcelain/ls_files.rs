@@ -7,6 +7,43 @@ use std::process::ExitCode;
 use gix::bstr::{BStr, BString, ByteSlice};
 use gix::prelude::ObjectIdExt;
 
+use super::{Arg, LongOpt};
+
+/// `builtin_ls_files_options[]` (builtin/ls-files.c:601-666), in table order, as
+/// [`super::resolve_long`] reads it. Only the long names appear: the short-only
+/// entries (`-z`, `-t`, `-v`, `-f`) are never reached by name.
+///
+/// `-x`/`--exclude`, `-X`/`--exclude-from`, `--exclude-standard`, `--full-name`
+/// and `--format` carry `PARSE_OPT_NONEG`, so they have no `--no-` spelling;
+/// every other entry does. Nothing here is `PARSE_OPT_LASTARG_DEFAULT`.
+const LONG_OPTS: &[LongOpt] = &[
+    LongOpt { name: "cached", neg: true, arg: Arg::None },
+    LongOpt { name: "deleted", neg: true, arg: Arg::None },
+    LongOpt { name: "modified", neg: true, arg: Arg::None },
+    LongOpt { name: "others", neg: true, arg: Arg::None },
+    LongOpt { name: "ignored", neg: true, arg: Arg::None },
+    LongOpt { name: "stage", neg: true, arg: Arg::None },
+    LongOpt { name: "killed", neg: true, arg: Arg::None },
+    LongOpt { name: "directory", neg: true, arg: Arg::None },
+    LongOpt { name: "eol", neg: true, arg: Arg::None },
+    LongOpt { name: "empty-directory", neg: true, arg: Arg::None },
+    LongOpt { name: "unmerged", neg: true, arg: Arg::None },
+    LongOpt { name: "resolve-undo", neg: true, arg: Arg::None },
+    LongOpt { name: "exclude", neg: false, arg: Arg::Required },
+    LongOpt { name: "exclude-from", neg: false, arg: Arg::Required },
+    LongOpt { name: "exclude-per-directory", neg: true, arg: Arg::Required },
+    LongOpt { name: "exclude-standard", neg: false, arg: Arg::None },
+    LongOpt { name: "full-name", neg: false, arg: Arg::None },
+    LongOpt { name: "recurse-submodules", neg: true, arg: Arg::None },
+    LongOpt { name: "error-unmatch", neg: true, arg: Arg::None },
+    LongOpt { name: "with-tree", neg: true, arg: Arg::Required },
+    LongOpt { name: "abbrev", neg: true, arg: Arg::Optional },
+    LongOpt { name: "debug", neg: true, arg: Arg::None },
+    LongOpt { name: "deduplicate", neg: true, arg: Arg::None },
+    LongOpt { name: "sparse", neg: true, arg: Arg::None },
+    LongOpt { name: "format", neg: false, arg: Arg::Required },
+];
+
 /// The exact usage block stock `git ls-files` prints on a usage error (exit 129).
 const USAGE: &str = "usage: git ls-files [<options>] [<file>...]
 
@@ -300,6 +337,16 @@ pub fn ls_files(args: &[String]) -> Result<ExitCode> {
             i += 1;
             continue;
         }
+        // Resolve a long option's name the way `parse_long_opt()` does before
+        // dispatching on it, so a unique abbreviation (`--stag`) reaches the arm
+        // its full spelling reaches and an ambiguous one is refused by name.
+        let resolved = match super::canonical_long(s, LONG_OPTS) {
+            super::Long::Name(name) => name,
+            super::Long::Ambiguous(first, second) => {
+                return Ok(super::ambiguous_option(s, &first, &second, USAGE))
+            }
+        };
+        let s = resolved.as_ref();
         match s {
             "--" => no_more_flags = true,
             "--cached" => opts.cached = true,

@@ -316,9 +316,17 @@ impl PadState {
         let mut padding = padding;
         if padding < 0 {
             // Pad to a column: subtract what the current line already holds.
-            let start = match sb.iter().rposition(|&b| b == b'\n') {
-                Some(p) => &sb[p..],
-                None => &sb[..],
+            //
+            // git measures this one with `strrchr(sb->buf, '\n')` and
+            // `strlen(start)` — the only place in `format_and_pad_commit()` that
+            // walks the output as a C string rather than by its recorded length.
+            // Both stop at the first NUL, so bytes a `%x00` put in the buffer are
+            // invisible here: `%x00ab%<|(20)%s` measures an occupied width of 0,
+            // not 2.
+            let cstr = &sb[..sb.iter().position(|&b| b == 0).unwrap_or(sb.len())];
+            let start = match cstr.iter().rposition(|&b| b == b'\n') {
+                Some(p) => &cstr[p..],
+                None => cstr,
             };
             let occupied = utf8_strnwidth(start, true) + graph_width;
             padding = -padding - occupied;
@@ -747,6 +755,40 @@ mod tests {
         let padding = st.padding;
         st.apply(&mut sb, b"short".to_vec(), padding, 2);
         assert_eq!(sb, b"short             ");
+    }
+
+    /// The occupied-width measurement is git's only C-string walk in
+    /// `format_and_pad_commit()`, so a NUL a `%x00` put in the buffer hides
+    /// everything after it. Captured from stock git 2.55.0:
+    ///
+    /// ```text
+    /// $ git log -1 --format='a%x00b%<|(20)%s|' | xxd
+    /// 00000000: 6100 6273 686f 7274 2020 2020 2020 2020  a.bshort
+    /// 00000010: 2020 2020 2020 7c0a                            |.
+    ///
+    /// $ git log -1 --format='ab%x00cc%ndddd%<|(20)%x78|' | xxd
+    /// 00000000: 6162 0063 630a 6464 6464 7820 2020 2020  ab.cc.ddddx
+    /// 00000010: 2020 2020 2020 2020 2020 2020 7c0a                |.
+    /// ```
+    ///
+    /// `short` plus fourteen spaces is a field of nineteen — one occupied column
+    /// (`a`), not the two a length-based walk would find. The second case shows
+    /// the `strrchr` half: a newline *after* the NUL is invisible too, so the
+    /// whole `ab` run counts rather than the `dddd` that ends the last line.
+    #[test]
+    fn column_target_stops_at_an_embedded_nul() {
+        let field = |sb: &mut Vec<u8>, local: &[u8]| {
+            let mut st = PadState::default();
+            st.parse(&"<|(20)".chars().collect::<Vec<_>>(), 0).unwrap();
+            let padding = st.padding;
+            st.apply(sb, local.to_vec(), padding, 0);
+        };
+        let mut sb: Vec<u8> = b"a\0b".to_vec();
+        field(&mut sb, b"short");
+        assert_eq!(sb, [b"a\0bshort".as_slice(), &[b' '; 14]].concat());
+        let mut sb: Vec<u8> = b"ab\0cc\ndddd".to_vec();
+        field(&mut sb, b"x");
+        assert_eq!(sb, [b"ab\0cc\nddddx".as_slice(), &[b' '; 17]].concat());
     }
 
     #[test]

@@ -46,19 +46,339 @@ pub(crate) fn show_usage(usage: &str) -> std::process::ExitCode {
     std::process::ExitCode::from(129)
 }
 
-/// `show_usage_with_options_if_asked()` (parse-options.c:1490): the same block
-/// on stdout at 129, but **only when `-h` is the sole argument**.
+/// `show_usage_with_options_if_asked()` (parse-options.c:1490-1505): the same
+/// block on stdout at 129, but **only when `-h` or `--help-all` is the sole
+/// argument**.
 ///
 /// Commands that do their own argv walk rather than calling `parse_options()`
 /// — `fast-import`, `get-tar-commit-id`, `credential`, `merge-index`,
 /// `merge-recursive` and the rest of the `show_usage_if_asked()` set — call it
 /// on entry. The `ac == 2` guard is the whole difference from [`show_usage`]:
-/// `git merge-index -h` prints usage, `git merge-index -h foo` does not.
+/// `git merge-index -h` prints usage, `git merge-index -h foo` does not, and
+/// `git merge-index --help-all foo` does not either.
+///
+/// The two spellings differ only in `full_usage`: `-h` renders `USAGE_NORMAL`
+/// and `--help-all` renders `USAGE_FULL`, which is the same table with the
+/// `PARSE_OPT_HIDDEN` entries left in. Most option tables have no hidden entry,
+/// so most commands print the same block for both — verified across stock git
+/// 2.55.0, where 101 of 143 subcommands emit byte-identical `-h` and
+/// `--help-all` output. [`show_usage_if_asked`] is the spelling for those;
+/// [`show_usage_if_asked_full`] takes the second block for the rest.
 pub(crate) fn show_usage_if_asked(
     args: &[String],
     usage: &str,
 ) -> Option<std::process::ExitCode> {
-    (args.len() == 1 && args[0] == "-h").then(|| show_usage(usage))
+    show_usage_if_asked_full(args, usage, usage)
+}
+
+/// [`show_usage_if_asked`] for a command whose option table has a
+/// `PARSE_OPT_HIDDEN` entry, so `USAGE_FULL` is not `USAGE_NORMAL`.
+pub(crate) fn show_usage_if_asked_full(
+    args: &[String],
+    usage: &str,
+    full_usage: &str,
+) -> Option<std::process::ExitCode> {
+    if args.len() != 1 {
+        return None;
+    }
+    match args[0].as_str() {
+        "-h" => Some(show_usage(usage)),
+        "--help-all" => Some(show_usage(full_usage)),
+        _ => None,
+    }
+}
+
+/// What a long option does with a value, mirroring the `struct option` entry it
+/// was derived from.
+#[derive(PartialEq, Eq, Clone, Copy)]
+pub(crate) enum Arg {
+    /// No value at all: `OPT_BOOL`, `OPT_BIT`, `OPT_COUNTUP`, `OPT_SET_INT`.
+    None,
+    /// A value is mandatory, attached or as the next argument: `OPT_STRING`,
+    /// `OPT_INTEGER`, `OPT_STRING_LIST`, plain `OPT_CALLBACK`.
+    Required,
+    /// `PARSE_OPT_OPTARG`: only an attached `=<value>` is taken, never the next
+    /// argument.
+    Optional,
+    /// `PARSE_OPT_LASTARG_DEFAULT`: an attached value, else the next argument,
+    /// else the option's built-in default when this is the last argument.
+    LastArg,
+}
+
+/// One entry of a builtin's `struct option options[]`, carrying only what
+/// `parse_long_opt()` reads while it resolves a name.
+pub(crate) struct LongOpt {
+    /// `long_name`, spelled exactly as the C table spells it — including a
+    /// leading `no-` where the table itself has one (`--no-contains`), which
+    /// parse-options treats as the *unset* sense of the stem.
+    pub(crate) name: &'static str,
+    /// Whether the automatic `--no-<name>` resolves: true unless the entry
+    /// carries `PARSE_OPT_NONEG`. `-h` renders exactly these as `--[no-]x`.
+    pub(crate) neg: bool,
+    /// What the entry does with a value. Read by the commands that drive their
+    /// whole parse off the table; a command that only borrows the *resolver*
+    /// still records it, because it is the same line of C.
+    pub(crate) arg: Arg,
+}
+
+/// What `parse_long_opt()` made of a long option's name.
+pub(crate) enum Resolved {
+    /// The option, and whether it was reached in the `OPT_UNSET` sense.
+    One(&'static LongOpt, bool),
+    /// Two candidate spellings, already carrying their `no-` prefix where the
+    /// match was a negation — reported in that order.
+    Ambiguous(String, String),
+    /// No entry claimed the name.
+    Unknown,
+}
+
+/// `is_alias()` (parse-options.c:471): whether two long names were joined by an
+/// `OPT_ALIAS()` in this command's table, which stops the second one from making
+/// the first ambiguous. `alias_groups` is empty for every command that declares
+/// no `OPT_ALIAS`, and `is_alias()` then returns 0 unconditionally.
+fn is_alias(groups: &[&[&str]], one: &str, other: &str) -> bool {
+    groups.iter().any(|g| g.contains(&one) && g.contains(&other))
+}
+
+/// [`resolve_long_aliased`] for the commands whose option table has no
+/// `OPT_ALIAS()` entry, which is all but a handful.
+pub(crate) fn resolve_long(table: &'static [LongOpt], arg: &str) -> Resolved {
+    resolve_long_aliased(table, &[], arg)
+}
+
+/// `parse_long_opt()` (parse-options.c:519-594), the half that turns a typed
+/// `--<arg>` into the table entry it names: exact match, else unique
+/// abbreviation, else the `ambiguous option:` refusal.
+///
+/// ```c
+/// static enum parse_opt_result parse_long_opt(
+///         struct parse_opt_ctx_t *p, const char *arg,
+///         const struct option *options)
+/// {
+///         const char *arg_end = strchrnul(arg, '=');
+///         const char *arg_start = arg;
+///         enum opt_parsed flags = OPT_LONG;
+///         int arg_starts_with_no_no = 0;
+///         struct parsed_option abbrev = { .option = NULL, .flags = OPT_LONG };
+///         struct parsed_option ambiguous = { .option = NULL, .flags = OPT_LONG };
+///
+///         if (skip_prefix(arg_start, "no-", &arg_start)) {
+///                 if (skip_prefix(arg_start, "no-", &arg_start))
+///                         arg_starts_with_no_no = 1;
+///                 else
+///                         flags |= OPT_UNSET;
+///         }
+///
+///         for (; options->type != OPTION_END; options++) {
+///                 const char *rest, *long_name = options->long_name;
+///                 enum opt_parsed opt_flags = OPT_LONG;
+///                 int allow_unset = !(options->flags & PARSE_OPT_NONEG);
+///                 ...
+///                 if (skip_prefix(long_name, "no-", &long_name))
+///                         opt_flags |= OPT_UNSET;
+///                 else if (arg_starts_with_no_no)
+///                         continue;
+///
+///                 if (((flags ^ opt_flags) & OPT_UNSET) && !allow_unset)
+///                         continue;
+///
+///                 if (skip_prefix(arg_start, long_name, &rest)) {
+///                         if (*rest == '=')
+///                                 p->opt = rest + 1;
+///                         else if (*rest)
+///                                 continue;
+///                         return get_value(p, options, flags ^ opt_flags);
+///                 }
+///
+///                 /* abbreviated? */
+///                 if (!strncmp(long_name, arg_start, arg_end - arg_start))
+///                         register_abbrev(p, options, flags ^ opt_flags,
+///                                         &abbrev, &ambiguous);
+///
+///                 /* negated and abbreviated very much? */
+///                 if (allow_unset && starts_with("no-", arg))
+///                         register_abbrev(p, options, OPT_UNSET ^ opt_flags,
+///                                         &abbrev, &ambiguous);
+///         }
+/// ```
+///
+/// Three details carry the whole behavior and each one was a bug on the way in:
+///
+/// * `arg` is the body **including** any `=<value>`, and `starts_with("no-", arg)`
+///   asks whether *`arg` is a prefix of `"no-"`* — the one direction that makes
+///   `--n` name every negatable option at once.
+/// * a table entry spelled `no-<stem>` is the unset sense of `<stem>`, so
+///   `--no-contains` and `--contains` are two entries that must not shadow each
+///   other; the sense actually selected is `flags ^ opt_flags`.
+/// * `register_abbrev()` keeps the *last two* candidates, so the two names in an
+///   `ambiguous option:` sentence are in table order and reordering a table
+///   changes the message.
+///
+/// `disallow_abbreviated_options` (the `GIT_TEST_DISALLOW_ABBREVIATED_OPTIONS`
+/// escape hatch git's own test suite sets) is not reproduced; nothing outside
+/// git's test suite sets it.
+pub(crate) fn resolve_long_aliased(
+    table: &'static [LongOpt],
+    alias_groups: &[&[&str]],
+    arg: &str,
+) -> Resolved {
+    // `arg_end = strchrnul(arg, '=')`: names are matched without their value.
+    let name = arg.split_once('=').map_or(arg, |(n, _)| n);
+
+    let mut start = name;
+    let mut unset = false;
+    let mut no_no = false;
+    if let Some(rest) = start.strip_prefix("no-") {
+        start = rest;
+        match start.strip_prefix("no-") {
+            Some(rest) => {
+                start = rest;
+                no_no = true;
+            }
+            None => unset = true,
+        }
+    }
+
+    let mut abbrev: Option<(&'static LongOpt, bool)> = None;
+    let mut ambiguous: Option<(&'static LongOpt, bool)> = None;
+    // `register_abbrev()` (parse-options.c:497): the previous candidate becomes
+    // the ambiguity report unless it was the same option under an alias.
+    let mut register = |opt: &'static LongOpt, sense: bool| {
+        if let Some(prev) = abbrev {
+            if !(prev.1 == sense && is_alias(alias_groups, prev.0.name, opt.name)) {
+                ambiguous = Some(prev);
+            }
+        }
+        abbrev = Some((opt, sense));
+    };
+
+    for opt in table {
+        let (long_name, opt_unset) = match opt.name.strip_prefix("no-") {
+            Some(stem) => (stem, true),
+            // Only a `no-`-named entry can answer a `--no-no-...` spelling.
+            None if no_no => continue,
+            None => (opt.name, false),
+        };
+        let sense = unset ^ opt_unset;
+        if sense && !opt.neg {
+            continue;
+        }
+        if let Some(rest) = start.strip_prefix(long_name) {
+            // `rest` is empty here whenever the C sees `=`, since the value was
+            // split off above; a non-empty remainder is a longer, different name.
+            if rest.is_empty() {
+                return Resolved::One(opt, sense);
+            }
+        }
+        if long_name.starts_with(start) {
+            register(opt, sense);
+        }
+        if opt.neg && "no-".starts_with(arg) {
+            register(opt, !opt_unset);
+        }
+    }
+
+    // `(flags & OPT_UNSET) ? "no-" : ""` prefixed to `option->long_name`, which
+    // is the table's own spelling — a `no-`-named entry keeps its `no-`.
+    let spell = |(opt, sense): (&LongOpt, bool)| match sense {
+        true => format!("no-{}", opt.name),
+        false => opt.name.to_string(),
+    };
+    match (ambiguous, abbrev) {
+        (Some(a), Some(b)) => Resolved::Ambiguous(spell(a), spell(b)),
+        (None, Some(b)) => Resolved::One(b.0, b.1),
+        _ => Resolved::Unknown,
+    }
+}
+
+/// A `--<something>` token, respelled the way [`resolve_long`] reads it.
+pub(crate) enum Long<'a> {
+    /// The spelling to match on: the token as typed when it was already exact
+    /// (or when no entry claims it, so the command's own "unknown option" arm
+    /// still echoes what the user wrote), else the full name it abbreviates.
+    Name(std::borrow::Cow<'a, str>),
+    /// Two candidates, for [`ambiguous_option`].
+    Ambiguous(String, String),
+}
+
+/// Expand a long option's abbreviation to the name it resolves to, so a command
+/// that dispatches on exact spellings answers `--stag` the same way it answers
+/// `--stage`.
+///
+/// This is the resolution half of `parse_long_opt()` used as a pre-step rather
+/// than as a parser: the command keeps its own argument walk, its own value
+/// handling and its own diagnostics, and only the *name* is normalized on the
+/// way in. An abbreviation therefore lands on exactly the arm its full spelling
+/// lands on — including the arm that refuses an option this port has not
+/// implemented. Resolving a name is not the same as implementing it, and this
+/// deliberately does not turn one into the other.
+///
+/// A name no entry claims is handed back untouched, so the command's own
+/// `unknown option` refusal quotes what was typed.
+pub(crate) fn canonical_long<'a>(tok: &'a str, table: &'static [LongOpt]) -> Long<'a> {
+    canonical_long_aliased(tok, table, &[])
+}
+
+/// [`canonical_long`] for a command whose table has `OPT_ALIAS()` entries.
+pub(crate) fn canonical_long_aliased<'a>(
+    tok: &'a str,
+    table: &'static [LongOpt],
+    alias_groups: &[&[&str]],
+) -> Long<'a> {
+    let Some(body) = tok.strip_prefix("--") else {
+        return Long::Name(tok.into());
+    };
+    // `--` and `--end-of-options` are consumed by parse_options_step() before
+    // any table lookup happens.
+    if body.is_empty() || body == "end-of-options" {
+        return Long::Name(tok.into());
+    }
+    match resolve_long_aliased(table, alias_groups, body) {
+        Resolved::Unknown => Long::Name(tok.into()),
+        Resolved::Ambiguous(first, second) => Long::Ambiguous(first, second),
+        Resolved::One(opt, negated) => {
+            let mut out = String::from("--");
+            if negated {
+                out.push_str("no-");
+            }
+            out.push_str(opt.name);
+            if let Some((_, value)) = body.split_once('=') {
+                out.push('=');
+                out.push_str(value);
+            }
+            match out == tok {
+                true => Long::Name(tok.into()),
+                false => Long::Name(out.into()),
+            }
+        }
+    }
+}
+
+/// The ambiguous-abbreviation refusal, which is the odd one out among
+/// parse-options' rejections: `parse_long_opt()` reports the reason with
+/// `error()` on **stderr** and then returns `PARSE_OPT_HELP`, which
+/// `parse_options_step()` routes to
+///
+/// ```c
+///  show_usage:
+///         return usage_with_options_internal(ctx, usagestr, options,
+///                                            USAGE_NORMAL, USAGE_TO_STDOUT);
+/// ```
+///
+/// so the block lands on **stdout** while its explanation is on stderr, at 129.
+///
+/// `tok` is the argument as typed; git echoes the body after `--`, value and
+/// all (`error(_("ambiguous option: %s ..."), arg)` with `arg = argv[0] + 2`).
+pub(crate) fn ambiguous_option(
+    tok: &str,
+    first: &str,
+    second: &str,
+    usage: &str,
+) -> std::process::ExitCode {
+    let body = tok.strip_prefix("--").unwrap_or(tok);
+    eprintln!("error: ambiguous option: {body} (could be --{first} or --{second})");
+    print!("{usage}");
+    std::process::ExitCode::from(129)
 }
 
 mod add;

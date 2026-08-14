@@ -63,6 +63,13 @@ use gix::refs::FullName;
 /// only the first. `--track`, `--guess-remote`, `--orphan` and `--relative-paths`
 /// are refused rather than approximated.
 ///
+/// git creates the `-b` branch by running `git branch` in the new worktree, so
+/// an option-shaped name is refused by that child rather than by `worktree`
+/// itself; [`super::branch::child_branch_option_rejection`] reproduces what the
+/// child says and the status it fails with, which is what keeps
+/// `git worktree add -b --zzbogus <path>` from creating a ref and a checkout
+/// from a typo.
+///
 /// NOT ported, and reported as such rather than approximated: `move` and
 /// `remove`. Both need git's `check_clean_worktree()` (a `git status --porcelain`
 /// of the linked tree) plus `validate_worktree()`/`update_worktree_location()`;
@@ -1730,6 +1737,19 @@ fn add(args: &[String]) -> Result<ExitCode> {
 
     if !quiet {
         eprintln!("Preparing worktree ({})", start.preparing(&repo));
+    }
+
+    // The `-b` branch is created by a child `git branch <name> <commit>`, so an
+    // option-shaped name is refused by that child — after the line above has
+    // already been printed, and with `git branch`'s usage block. The child's
+    // failure surfaces as 255 and nothing is left behind. Without this,
+    // `git worktree add -b --zzbogus <path>` created `refs/heads/--zzbogus`
+    // *and* a checked-out worktree from a typo.
+    if let Start::NewBranch { name, .. } = &start {
+        let short = name.as_bstr().to_str_lossy().trim_start_matches("refs/heads/").to_string();
+        if let Some(code) = super::branch::child_branch_option_rejection(&repo, &short) {
+            return Ok(code);
+        }
     }
 
     // `die_if_checked_out()`: a branch may be checked out in one worktree only.

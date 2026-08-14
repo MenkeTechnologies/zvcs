@@ -10,6 +10,8 @@ use gix::objs::{CommitRef, Kind};
 use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
 use gix::refs::{FullName, Target};
 
+use super::{resolve_long, Arg, LongOpt, Resolved};
+
 /// git's smallest permitted abbreviation length, shared with `git blame`.
 const MINIMUM_ABBREV: usize = 4;
 
@@ -87,9 +89,222 @@ fn error_exit(msg: impl std::fmt::Display) -> Result<ExitCode> {
 }
 
 /// git's option-parsing convention: the full usage block on stderr, exit 129.
+///
+/// This is a bare `usage_with_options()` — the shape `cmd_branch()` uses for its
+/// own post-parse checks (`noncreate_actions > 1`, too many operands), which
+/// carry no `error:` line of their own.
 fn usage_exit() -> Result<ExitCode> {
     eprint!("{USAGE}");
     Ok(ExitCode::from(129))
+}
+
+/// `parse_options()`' rejection half: an `error:` line, then the same usage block
+/// on **stderr**, exit 129.
+///
+/// ```c
+/// case PARSE_OPT_UNKNOWN:
+///         if (ctx.argv[0][1] == '-') {
+///                 error(_("unknown option `%s'"), ctx.argv[0] + 2);
+///         } else if (isascii(*ctx.opt)) {
+///                 error(_("unknown switch `%c'"), *ctx.opt);
+///         } else {
+///                 error(_("unknown non-ascii option in string: `%s'"),
+///                       ctx.argv[0]);
+///         }
+///         usage_with_options(usagestr, options);
+/// ```
+///
+/// The stream is the whole difference from [`super::show_usage`], which serves
+/// `-h` on stdout: asking for help is not an error, being rejected is.
+fn usage_error(msg: impl std::fmt::Display) -> Result<ExitCode> {
+    eprintln!("error: {msg}");
+    eprint!("{USAGE}");
+    Ok(ExitCode::from(129))
+}
+
+/// An option-value complaint with no usage block: `get_value()` and the option
+/// callbacks `return error(...)`, which becomes `PARSE_OPT_ERROR` and a bare
+/// `exit(129)` in `parse_options()` — nothing renders the usage block on that
+/// path.
+fn value_error(msg: impl std::fmt::Display) -> Result<ExitCode> {
+    eprintln!("error: {msg}");
+    Ok(ExitCode::from(129))
+}
+
+/// [`super::ambiguous_option`] against `git branch`'s usage block: the
+/// explanation on stderr, the block on stdout, exit 129. Verified against stock
+/// 2.55.0, `git branch --col` → `error: ambiguous option: col (could be --color
+/// or --column)`.
+fn ambiguous_exit(body: &str, first: &str, second: &str) -> Result<ExitCode> {
+    Ok(super::ambiguous_option(body, first, second, USAGE))
+}
+
+/// Every long option `git branch` resolves, **in `builtin/branch.c` table
+/// order**.
+///
+/// The order is load-bearing twice over: `parse_long_opt()` walks the table and
+/// keeps the last two abbreviation candidates, so reordering this array changes
+/// which two names an `ambiguous option:` diagnostic reports. Verified against
+/// stock 2.55.0: `--c` → `--create-reflog or --column`, `--col` → `--color or
+/// --column`, `--s` → `--show-current or --sort`, `--wit` → `--with or
+/// --without`, `--n` → `--no-recurse-submodules or --no-format`.
+///
+/// `set-upstream`, `with` and `without` are `PARSE_OPT_HIDDEN`: absent from the
+/// usage block but resolved by the parser like any other, so they belong here.
+/// `-D`, `-M` and `-C` have no long name and so have no entry.
+const LONG_OPTS: &[LongOpt] = &[
+    LongOpt { name: "verbose", neg: true, arg: Arg::None },
+    LongOpt { name: "quiet", neg: true, arg: Arg::None },
+    LongOpt { name: "track", neg: true, arg: Arg::Optional },
+    LongOpt { name: "set-upstream", neg: true, arg: Arg::None },
+    LongOpt { name: "set-upstream-to", neg: true, arg: Arg::Required },
+    LongOpt { name: "unset-upstream", neg: true, arg: Arg::None },
+    LongOpt { name: "color", neg: true, arg: Arg::Optional },
+    LongOpt { name: "remotes", neg: false, arg: Arg::None },
+    LongOpt { name: "contains", neg: false, arg: Arg::LastArg },
+    LongOpt { name: "no-contains", neg: false, arg: Arg::LastArg },
+    LongOpt { name: "with", neg: false, arg: Arg::LastArg },
+    LongOpt { name: "without", neg: false, arg: Arg::LastArg },
+    LongOpt { name: "abbrev", neg: true, arg: Arg::Optional },
+    LongOpt { name: "all", neg: false, arg: Arg::None },
+    LongOpt { name: "delete", neg: true, arg: Arg::None },
+    LongOpt { name: "move", neg: true, arg: Arg::None },
+    LongOpt { name: "omit-empty", neg: true, arg: Arg::None },
+    LongOpt { name: "copy", neg: true, arg: Arg::None },
+    LongOpt { name: "list", neg: true, arg: Arg::None },
+    LongOpt { name: "show-current", neg: true, arg: Arg::None },
+    LongOpt { name: "create-reflog", neg: true, arg: Arg::None },
+    LongOpt { name: "edit-description", neg: true, arg: Arg::None },
+    LongOpt { name: "force", neg: true, arg: Arg::None },
+    LongOpt { name: "merged", neg: false, arg: Arg::LastArg },
+    LongOpt { name: "no-merged", neg: false, arg: Arg::LastArg },
+    LongOpt { name: "column", neg: true, arg: Arg::Optional },
+    LongOpt { name: "sort", neg: true, arg: Arg::Required },
+    LongOpt { name: "points-at", neg: true, arg: Arg::Required },
+    LongOpt { name: "ignore-case", neg: true, arg: Arg::None },
+    LongOpt { name: "recurse-submodules", neg: true, arg: Arg::None },
+    LongOpt { name: "format", neg: true, arg: Arg::Required },
+];
+
+/// The short options the loop in [`branch`] accepts; kept beside it so the two
+/// stay in step. Only [`child_branch_option_rejection`] reads it — the loop
+/// itself matches the letters directly.
+const SHORT_OPTS: &str = "arlvqidDmMcCtfhu";
+
+/// What a child `git branch <name> HEAD` does when `<name>` is option-shaped,
+/// and so is parsed as an option instead of taken as the branch to create.
+/// `Some(code)` means it refused (and this has printed the child's diagnosis).
+///
+/// `add_worktree()` creates the `-b` branch by *running `git branch`* in the new
+/// worktree rather than calling into the branch code, so
+/// `git worktree add -b --zzbogus <path>` is refused by that child process, not
+/// by `worktree` itself — and stock leaves neither the ref nor the worktree
+/// behind. Verified against stock 2.55.0, all with `<name>` untouched on disk:
+///
+/// | `-b <name>` | child sees | result |
+/// |---|---|---|
+/// | `--zzbogus` | no such option | ``unknown option `zzbogus'`` + usage, **255** |
+/// | `-Z` | no such switch | ``unknown switch `Z'`` + usage, **255** |
+/// | `--force`, `--no-verb` | a flag; `HEAD` is left as the branch to create | `fatal: 'HEAD' is not a valid branch name`, **255** |
+/// | `--sort`, `--merged` | an option that eats `HEAD` as its value | `fatal: invalid reference: <name>`, **128** |
+///
+/// One documented gap in the last row: stock's child also prints its branch
+/// listing on stdout (`* main`) before `worktree` reports the bad reference,
+/// which is not reproduced here — the exit code, the stderr and the empty
+/// post-state all match.
+pub(crate) fn child_branch_option_rejection(
+    repo: &gix::Repository,
+    name: &str,
+) -> Option<ExitCode> {
+    /// The child was left with `HEAD` as its only positional.
+    fn head_is_not_a_branch_name(repo: &gix::Repository) -> Option<ExitCode> {
+        eprintln!("fatal: 'HEAD' is not a valid branch name");
+        ref_syntax_hints(repo);
+        Some(ExitCode::from(255))
+    }
+    /// The child ate `HEAD` as an option value, so no branch was ever created
+    /// and `worktree` fails to resolve the one it asked for.
+    fn invalid_reference(name: &str) -> Option<ExitCode> {
+        eprintln!("fatal: invalid reference: {name}");
+        Some(ExitCode::from(128))
+    }
+
+    let rest = name.strip_prefix('-')?;
+    if rest.is_empty() {
+        // A bare `-` is an operand to the child, and `check_branch_ref()`
+        // refuses it for the leading dash like any other name.
+        eprintln!("fatal: '-' is not a valid branch name");
+        ref_syntax_hints(repo);
+        return Some(ExitCode::from(255));
+    }
+    let Some(body) = rest.strip_prefix('-') else {
+        // Short: the child reports the first letter of the bundle.
+        let c = rest.chars().next().unwrap_or_default();
+        return match SHORT_OPTS.contains(c) {
+            // `-u` is the only short option taking a value.
+            true if c == 'u' => invalid_reference(name),
+            true => head_is_not_a_branch_name(repo),
+            false => {
+                let _ = match c.is_ascii() {
+                    true => usage_error(format!("unknown switch `{c}'")),
+                    false => usage_error(format!("unknown non-ascii option in string: `{name}'")),
+                };
+                Some(ExitCode::from(255))
+            }
+        };
+    };
+    if body.is_empty() {
+        // `--` ends the child's options, leaving `HEAD` as its only operand.
+        return head_is_not_a_branch_name(repo);
+    }
+    let head = body.split_once('=').map_or(body, |(n, _)| n);
+    match resolve_long(LONG_OPTS, head) {
+        Resolved::Unknown => {
+            let _ = usage_error(format!("unknown option `{body}'"));
+            Some(ExitCode::from(255))
+        }
+        Resolved::Ambiguous(first, second) => {
+            let _ = ambiguous_exit(body, &first, &second);
+            Some(ExitCode::from(255))
+        }
+        // A flag leaves `HEAD` as the branch to create; anything that takes a
+        // value swallows it instead. An attached `=value` never reaches for the
+        // next argument, so it leaves `HEAD` behind too.
+        Resolved::One(opt, negated) => {
+            match !negated && body.split_once('=').is_none() && opt.arg != Arg::None {
+                true => invalid_reference(name),
+                false => head_is_not_a_branch_name(repo),
+            }
+        }
+    }
+}
+
+/// `check_branch_ref()` (refs.c): whether `name` may become `refs/heads/<name>`.
+///
+/// ```c
+/// int check_branch_ref(struct strbuf *sb, const char *name)
+/// {
+///         ...
+///         strbuf_splice(sb, 0, 0, "refs/heads/", 11);
+///
+///         if (*name == '-' ||
+///             !strcmp(sb->buf, "refs/heads/HEAD"))
+///                 return -1;
+///
+///         return check_refname_format(sb->buf, 0);
+/// }
+/// ```
+///
+/// The leading-dash rule lives *here*, not in `check_refname_format()`, which is
+/// all `gix::validate::reference::branch_name()` implements — so a name like
+/// `-foo` or `--bogus` passes the gitoxide check and has to be rejected
+/// separately. Without it `git branch -- -foo` created `refs/heads/-foo` and
+/// `git branch -m -- -bad` renamed the current branch to `-bad`.
+pub(crate) fn valid_branch_name(name: &str) -> bool {
+    let full = format!("refs/heads/{name}");
+    !name.starts_with('-')
+        && full != "refs/heads/HEAD"
+        && gix::validate::reference::branch_name(BStr::new(full.as_bytes())).is_ok()
 }
 
 /// The `refSyntax` advice git prints after rejecting a branch name. git spells
@@ -121,6 +336,10 @@ enum Track {
     Direct,
     /// `--track=inherit`: copy the start-point branch's own upstream configuration.
     Inherit,
+    /// The hidden `--set-upstream`: `OPT_SET_INT_F(0, "set-upstream", &track,
+    /// N_("do not use"), BRANCH_TRACK_OVERRIDE, PARSE_OPT_HIDDEN)`. Accepted by
+    /// the parser, then refused by name in the creation path.
+    Override,
 }
 
 /// `--color[=<when>]` tri-state, matching `git branch`'s default of `auto`.
@@ -167,6 +386,12 @@ struct Opts {
     merged: Vec<String>,
     no_merged: Vec<String>,
     points_at: Vec<String>,
+    /// `--omit-empty`: drop a formatted line that rendered to nothing, rather
+    /// than printing its bare newline (`format.array_opts.omit_empty`).
+    omit_empty: bool,
+    /// `--recurse-submodules`: git's `recurse_submodules_explicit`, which only
+    /// means anything once `submodule.propagateBranches` is enabled.
+    recurse_submodules: bool,
     names: Vec<String>,
 }
 
@@ -243,14 +468,25 @@ impl Filters {
 /// and `--unset-upstream`, the `--contains`/`--no-contains`/`--merged`/
 /// `--no-merged`/`--points-at` reachability filters, `--abbrev[=<n>]`/
 /// `--no-abbrev`, `-i`/`--ignore-case`, `-q`/`--quiet`, `--color[=<when>]`/
-/// `--no-color`, `--create-reflog`, and `--column[=<opts>]`/`--no-column`
-/// (honoring `column.ui`/`column.branch`, resolving `auto` against the terminal,
-/// and mutually exclusive with `-v`/`--verbose`).
+/// `--no-color`, `--create-reflog`, `--omit-empty`, and `--column[=<opts>]`/
+/// `--no-column` (honoring `column.ui`/`column.branch`, resolving `auto` against
+/// the terminal, and mutually exclusive with `-v`/`--verbose`).
+///
+/// Option parsing goes through [`LONG_OPTS`] and [`resolve_long`], which
+/// reproduce `parse_long_opt()`: unique-prefix abbreviations (`--verb`), the
+/// automatic `--no-` negations for every entry without `PARSE_OPT_NONEG`, the
+/// `PARSE_OPT_HIDDEN` entries (`--set-upstream`, `--with`, `--without`), and
+/// `--end-of-options`. A name no entry claims is `error: unknown option
+/// '<name>'` plus the usage block on stderr at 129, *before* anything is
+/// created — it is not taken as a branch to create.
 ///
 /// `--format` supports the `refname`, `refname:short`, `objectname`,
 /// `objectname:short`, and `HEAD` atoms; any other atom is rejected rather than
 /// rendered as empty. `--edit-description` is refused: it needs an interactive
-/// editor loop that is not wired in this environment.
+/// editor loop that is not wired in this environment. `--recurse-submodules`
+/// reproduces both of git's refusals (`submodule.propagateBranches` unset, and
+/// the non-creation actions) and then says it is not ported, rather than
+/// claiming the flag is unknown.
 ///
 /// The merge check for `-d` uses reachability from HEAD only (not a configured
 /// upstream), which is git's behavior when no upstream is set.
@@ -281,6 +517,8 @@ pub fn branch(args: &[String]) -> Result<ExitCode> {
         merged: Vec::new(),
         no_merged: Vec::new(),
         points_at: Vec::new(),
+        omit_empty: false,
+        recurse_submodules: false,
         names: Vec::new(),
     };
 
@@ -292,130 +530,24 @@ pub fn branch(args: &[String]) -> Result<ExitCode> {
     }
 
     let mut i = 0;
+    // `--` and `--end-of-options` both end option parsing; everything after is an
+    // operand. parse_options drops the token itself in either case.
+    let mut only_names = false;
     while i < args.len() {
         let a = args[i].as_str();
         match a {
-            "--" => {
-                o.names.extend(args[i + 1..].iter().cloned());
-                break;
-            }
-            // `--column[=<opts>]` / `--no-column`: lay the branch list out in columns
-            // (git's `OPT_COLUMN`). A bad `<opts>` token is a usage error, as in git.
-            "--column" => {
-                if super::column::parseopt_column(&mut o.colopts, None, false).is_err() {
-                    return usage_exit();
+            _ if only_names => o.names.push(a.to_string()),
+            "--" | "--end-of-options" => only_names = true,
+            // Every long option goes through the parse-options resolver, so an
+            // abbreviation is honored and an unrecognized name is refused here
+            // rather than silently becoming a branch to create.
+            _ if a.starts_with("--") => {
+                if let Some(code) = apply_long(&mut o, args, &mut i, &a[2..])? {
+                    return Ok(code);
                 }
-            }
-            "--no-column" => {
-                let _ = super::column::parseopt_column(&mut o.colopts, None, true);
-            }
-            _ if a.starts_with("--column=") => {
-                if super::column::parseopt_column(&mut o.colopts, Some(&a["--column=".len()..]), false)
-                    .is_err()
-                {
-                    return usage_exit();
-                }
-            }
-            "--all" => o.mode = ListMode::All,
-            "--remotes" => o.mode = ListMode::Remotes,
-            "--list" => o.explicit_list = true,
-            "--verbose" => o.verbose = o.verbose.saturating_add(1),
-            "--no-verbose" => o.verbose = 0,
-            "--show-current" => o.show_current = true,
-            "--delete" => o.delete = true,
-            "--move" => o.rename = true,
-            "--copy" => o.copy = true,
-            "--force" => o.force = true,
-            "--quiet" => o.quiet = true,
-            "--no-quiet" => o.quiet = false,
-            "--ignore-case" => o.ignore_case = true,
-            "--no-ignore-case" => o.ignore_case = false,
-            "--create-reflog" => o.create_reflog = true,
-            "--no-create-reflog" => o.create_reflog = false,
-            "--edit-description" => o.edit_description = true,
-            "--unset-upstream" => o.unset_upstream = true,
-            "--track" => o.track = Track::Direct,
-            "--no-track" => o.track = Track::No,
-            _ if a.starts_with("--track=") => {
-                o.track = match &a["--track=".len()..] {
-                    "direct" => Track::Direct,
-                    "inherit" => Track::Inherit,
-                    _ => return usage_exit(),
-                };
-            }
-            "--color" => o.color = ColorWhen::Always,
-            "--no-color" => o.color = ColorWhen::Never,
-            _ if a.starts_with("--color=") => {
-                o.color = match &a["--color=".len()..] {
-                    "always" => ColorWhen::Always,
-                    "never" | "false" => ColorWhen::Never,
-                    "auto" => ColorWhen::Auto,
-                    _ => return usage_exit(),
-                };
-            }
-            "--abbrev" => o.abbrev = None,
-            "--no-abbrev" => o.abbrev = Some(0),
-            _ if a.starts_with("--abbrev=") => {
-                let n = a["--abbrev=".len()..]
-                    .parse::<usize>()
-                    .map_err(|_| anyhow!("option `abbrev' expects a numerical value"))?;
-                o.abbrev = Some(n);
-            }
-            "--format" => {
-                i += 1;
-                let v = args
-                    .get(i)
-                    .ok_or_else(|| anyhow!("option `format' requires a value"))?;
-                o.format = Some(v.clone());
-            }
-            _ if a.starts_with("--format=") => {
-                o.format = Some(a["--format=".len()..].to_string());
-            }
-            "--sort" => {
-                i += 1;
-                let v = args
-                    .get(i)
-                    .ok_or_else(|| anyhow!("option `sort' requires a value"))?;
-                o.sorts.push(v.clone());
-            }
-            _ if a.starts_with("--sort=") => {
-                o.sorts.push(a["--sort=".len()..].to_string());
-            }
-            "--set-upstream-to" => {
-                i += 1;
-                let v = args
-                    .get(i)
-                    .ok_or_else(|| anyhow!("option `set-upstream-to' requires a value"))?;
-                o.set_upstream_to = Some(v.clone());
-            }
-            _ if a.starts_with("--set-upstream-to=") => {
-                o.set_upstream_to = Some(a["--set-upstream-to=".len()..].to_string());
-            }
-            // The reachability filters take git's `LASTARG_DEFAULT` value: an
-            // attached `=val`, else the next token, else `HEAD` when this is the
-            // last argument on the command line.
-            "--contains" => o.contains.push(lastarg_default(args, &mut i)),
-            _ if a.starts_with("--contains=") => {
-                o.contains.push(a["--contains=".len()..].to_string())
-            }
-            "--no-contains" => o.no_contains.push(lastarg_default(args, &mut i)),
-            _ if a.starts_with("--no-contains=") => {
-                o.no_contains.push(a["--no-contains=".len()..].to_string())
-            }
-            "--merged" => o.merged.push(lastarg_default(args, &mut i)),
-            _ if a.starts_with("--merged=") => o.merged.push(a["--merged=".len()..].to_string()),
-            "--no-merged" => o.no_merged.push(lastarg_default(args, &mut i)),
-            _ if a.starts_with("--no-merged=") => {
-                o.no_merged.push(a["--no-merged=".len()..].to_string())
-            }
-            "--points-at" => o.points_at.push(lastarg_default(args, &mut i)),
-            _ if a.starts_with("--points-at=") => {
-                o.points_at.push(a["--points-at=".len()..].to_string())
             }
             // A single-dash argument is a bundle of short flags (`-vv`, `-dr`).
-            // Long options are matched explicitly above; an unrecognized `--foo`
-            // falls through to the positional arm, as it did before.
-            _ if a.starts_with('-') && a.len() > 1 && !a.starts_with("--") => {
+            _ if a.starts_with('-') && a.len() > 1 => {
                 let flags = &a[1..];
                 let bytes = flags.as_bytes();
                 let mut ci = 0;
@@ -455,16 +587,39 @@ pub fn branch(args: &[String]) -> Result<ExitCode> {
                             let rest = &flags[ci + 1..];
                             let v = if rest.is_empty() {
                                 i += 1;
-                                args.get(i).cloned().ok_or_else(|| {
-                                    anyhow!("option `set-upstream-to' requires a value")
-                                })?
+                                match args.get(i) {
+                                    Some(v) => v.clone(),
+                                    None => return Ok(super::missing_option_value("-u")),
+                                }
                             } else {
                                 rest.to_string()
                             };
                             o.set_upstream_to = Some(v);
                             break;
                         }
-                        _ => return usage_exit(),
+                        // An unrecognized short option is `unknown switch` when
+                        // it is ASCII, and otherwise the whole (possibly
+                        // rewritten) argument:
+                        //
+                        //     } else if (isascii(*ctx.opt)) {
+                        //             error(_("unknown switch `%c'"), *ctx.opt);
+                        //     } else {
+                        //             error(_("unknown non-ascii option in string: `%s'"),
+                        //                   ctx.argv[0]);
+                        //     }
+                        //
+                        // parse_options_step() rebuilds `argv[0]` as `-` plus the
+                        // rest of the bundle for every switch after the first, so
+                        // `git branch -vé` reports `-é`, not `-vé`.
+                        c => {
+                            return match c.is_ascii() {
+                                true => usage_error(format!("unknown switch `{c}'")),
+                                false => usage_error(format!(
+                                    "unknown non-ascii option in string: `-{}'",
+                                    &flags[ci..]
+                                )),
+                            }
+                        }
                     }
                     ci += 1;
                 }
@@ -478,6 +633,46 @@ pub fn branch(args: &[String]) -> Result<ExitCode> {
     // becomes a pattern rather than a branch to create.
     if o.has_filter() {
         o.explicit_list = true;
+    }
+
+    // ```c
+    // if (recurse_submodules_explicit) {
+    //         if (!submodule_propagate_branches)
+    //                 die(_("branch with --recurse-submodules can only be used if submodule.propagateBranches is enabled"));
+    //         if (noncreate_actions)
+    //                 die(_("--recurse-submodules can only be used to create branches"));
+    // }
+    // ```
+    //
+    // Both refusals are reachable without any submodule machinery, so they are
+    // reproduced exactly; only the recursive creation itself is missing, and it
+    // says so rather than pretending the flag was unknown.
+    if o.recurse_submodules {
+        let propagate = gix::open(".")
+            .ok()
+            .and_then(|r| r.config_snapshot().boolean("submodule.propagateBranches"))
+            .unwrap_or(false);
+        if !propagate {
+            return fatal(
+                "branch with --recurse-submodules can only be used if \
+                 submodule.propagateBranches is enabled",
+            );
+        }
+        if o.delete
+            || o.rename
+            || o.copy
+            || o.explicit_list
+            || o.show_current
+            || o.edit_description
+            || o.unset_upstream
+            || o.set_upstream_to.is_some()
+        {
+            return fatal("--recurse-submodules can only be used to create branches");
+        }
+        bail!(
+            "`git branch --recurse-submodules` is not ported: creating a branch in every \
+             submodule needs the submodule worktree walk that is not wired here"
+        );
     }
 
     // git's option table marks --show-current and the list options as mutually
@@ -545,6 +740,158 @@ pub fn branch(args: &[String]) -> Result<ExitCode> {
 
 /// Consume git's `LASTARG_DEFAULT` value for a bare filter flag: the next token
 /// if there is one, otherwise `HEAD`. Advances `i` past a consumed token.
+/// Resolve and apply one `--<body>` argument, advancing `i` past a detached
+/// value. `Some(code)` means the command is over.
+///
+/// This is `parse_long_opt()` plus the `get_value()` call it ends in: the name is
+/// resolved first, so a rejection happens before any branch is created — the bug
+/// this replaced let `git branch --bogus` fall through to the positional arm and
+/// create `refs/heads/--bogus`.
+fn apply_long(
+    o: &mut Opts,
+    args: &[String],
+    i: &mut usize,
+    body: &str,
+) -> Result<Option<ExitCode>> {
+    // `arg_end = strchrnul(arg, '=')`: the name is looked up without its value,
+    // but every diagnostic that echoes what was typed uses the whole body.
+    let (name, attached) = match body.split_once('=') {
+        Some((name, value)) => (name, Some(value)),
+        None => (body, None),
+    };
+
+    let (opt, negated) = match resolve_long(LONG_OPTS, name) {
+        Resolved::One(opt, negated) => (opt, negated),
+        Resolved::Unknown => return usage_error(format!("unknown option `{body}'")).map(Some),
+        Resolved::Ambiguous(first, second) => {
+            return ambiguous_exit(body, &first, &second).map(Some)
+        }
+    };
+
+    // How `optname()` spells the option in a diagnostic: the resolved long name,
+    // carrying `no-` when it was reached through negation, so `--no-format=1`
+    // complains about `no-format` and an abbreviation complains about the full
+    // name it resolved to.
+    let shown = match negated {
+        true => format!("no-{}", opt.name),
+        false => opt.name.to_string(),
+    };
+
+    // `get_value()` refuses a value for a negated option and for a flag:
+    // `if (unset && p->opt) return error(_("%s takes no value"), ...)`.
+    if attached.is_some() && (negated || opt.arg == Arg::None) {
+        return value_error(format!("option `{shown}' takes no value")).map(Some);
+    }
+
+    let value: Option<String> = match (negated, opt.arg) {
+        (true, _) | (_, Arg::None) => None,
+        // PARSE_OPT_OPTARG never reaches for the next argument.
+        (_, Arg::Optional) => attached.map(str::to_string),
+        (_, Arg::Required) => match attached {
+            Some(v) => Some(v.to_string()),
+            None => {
+                *i += 1;
+                match args.get(*i) {
+                    Some(v) => Some(v.clone()),
+                    None => {
+                        return Ok(Some(super::missing_option_value(&format!("--{shown}"))))
+                    }
+                }
+            }
+        },
+        (_, Arg::LastArg) => Some(match attached {
+            Some(v) => v.to_string(),
+            None => lastarg_default(args, i),
+        }),
+    };
+    // Every arm below that reads a value has one by construction.
+    let val = || value.clone().unwrap_or_default();
+
+    match (opt.name, negated) {
+        ("verbose", false) => o.verbose = o.verbose.saturating_add(1),
+        ("verbose", true) => o.verbose = 0,
+        ("quiet", n) => o.quiet = !n,
+        ("track", false) => {
+            o.track = match value.as_deref() {
+                None | Some("direct") => Track::Direct,
+                Some("inherit") => Track::Inherit,
+                Some(_) => {
+                    return value_error("option `--track' expects \"direct\" or \"inherit\"")
+                        .map(Some)
+                }
+            }
+        }
+        ("track", true) => o.track = Track::No,
+        // The hidden `--set-upstream` only selects BRANCH_TRACK_OVERRIDE here;
+        // the creation path is where git refuses it by name. `OPT_SET_INT`
+        // unset writes 0, which is the same "never track" `--no-track` picks.
+        ("set-upstream", false) => o.track = Track::Override,
+        ("set-upstream", true) => o.track = Track::No,
+        ("set-upstream-to", false) => o.set_upstream_to = value,
+        ("set-upstream-to", true) => o.set_upstream_to = None,
+        ("unset-upstream", n) => o.unset_upstream = !n,
+        ("color", false) => {
+            o.color = match value.as_deref() {
+                None | Some("always") => ColorWhen::Always,
+                Some("never" | "false") => ColorWhen::Never,
+                Some("auto") => ColorWhen::Auto,
+                Some(_) => {
+                    return value_error(
+                        "option `color' expects \"always\", \"auto\", or \"never\"",
+                    )
+                    .map(Some)
+                }
+            }
+        }
+        ("color", true) => o.color = ColorWhen::Never,
+        ("remotes", _) => o.mode = ListMode::Remotes,
+        ("all", _) => o.mode = ListMode::All,
+        // `--with` / `--without` are the hidden aliases of `--contains` /
+        // `--no-contains`, sharing their `filter.with_commit` slot.
+        ("contains" | "with", _) => o.contains.push(val()),
+        ("no-contains" | "without", _) => o.no_contains.push(val()),
+        ("merged", _) => o.merged.push(val()),
+        ("no-merged", _) => o.no_merged.push(val()),
+        ("abbrev", false) => {
+            o.abbrev = match value {
+                None => None,
+                Some(v) => match v.parse::<usize>() {
+                    Ok(n) => Some(n),
+                    Err(_) => {
+                        return value_error("option `abbrev' expects a numerical value").map(Some)
+                    }
+                },
+            }
+        }
+        ("abbrev", true) => o.abbrev = Some(0),
+        ("delete", n) => o.delete = !n,
+        ("move", n) => o.rename = !n,
+        ("copy", n) => o.copy = !n,
+        ("omit-empty", n) => o.omit_empty = !n,
+        ("list", n) => o.explicit_list = !n,
+        ("show-current", n) => o.show_current = !n,
+        ("create-reflog", n) => o.create_reflog = !n,
+        ("edit-description", n) => o.edit_description = !n,
+        ("force", n) => o.force = !n,
+        ("ignore-case", n) => o.ignore_case = !n,
+        ("recurse-submodules", n) => o.recurse_submodules = !n,
+        ("format", false) => o.format = value,
+        ("format", true) => o.format = None,
+        ("sort", false) => o.sorts.push(val()),
+        ("sort", true) => o.sorts.clear(),
+        ("points-at", false) => o.points_at.push(val()),
+        ("points-at", true) => o.points_at.clear(),
+        // `OPT_COLUMN`: a bad `<style>` token is the callback's own error.
+        ("column", n) => {
+            if super::column::parseopt_column(&mut o.colopts, value.as_deref(), n).is_err() {
+                return usage_exit().map(Some);
+            }
+        }
+        (other, _) => bail!("unsupported option --{other}"),
+    }
+    Ok(None)
+}
+
 fn lastarg_default(args: &[String], i: &mut usize) -> String {
     if *i + 1 < args.len() {
         *i += 1;
@@ -1213,6 +1560,11 @@ fn list_branches(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
                 render_format(repo, fmt, e)?
             });
         }
+        // `--omit-empty` drops a line that rendered to nothing rather than
+        // printing its bare newline (ref-filter's `array_opts.omit_empty`).
+        if o.omit_empty {
+            lines.retain(|l| !l.is_empty());
+        }
         if column_on {
             emit_columns(o.colopts, lines.iter().map(|l| l.as_bytes().to_vec()).collect());
         } else {
@@ -1467,7 +1819,20 @@ fn create_branch(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
     let name = o.names[0].as_str();
     let full = format!("refs/heads/{name}");
 
-    if gix::validate::reference::branch_name(BStr::new(full.as_bytes())).is_err() {
+    // The hidden `--set-upstream` is accepted by the parser and refused here, by
+    // name, ahead of any name validation:
+    //
+    //     if (track == BRANCH_TRACK_OVERRIDE)
+    //             die(_("the '--set-upstream' option is no longer supported. "
+    //                   "Please use '--track' or '--set-upstream-to' instead"));
+    if o.track == Track::Override {
+        return fatal(
+            "the '--set-upstream' option is no longer supported. \
+             Please use '--track' or '--set-upstream-to' instead",
+        );
+    }
+
+    if !valid_branch_name(name) {
         let code = fatal(format!("'{name}' is not a valid branch name"))?;
         ref_syntax_hints(repo);
         return Ok(code);
@@ -1917,7 +2282,7 @@ fn rename_branch(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
     let old_full = format!("refs/heads/{old}");
     let new_full = format!("refs/heads/{new}");
 
-    if gix::validate::reference::branch_name(BStr::new(new_full.as_bytes())).is_err() {
+    if !valid_branch_name(&new) {
         let code = fatal(format!("'{new}' is not a valid branch name"))?;
         ref_syntax_hints(repo);
         return Ok(code);
@@ -2040,7 +2405,7 @@ fn copy_branch(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
     let old_full = format!("refs/heads/{old}");
     let new_full = format!("refs/heads/{new}");
 
-    if gix::validate::reference::branch_name(BStr::new(new_full.as_bytes())).is_err() {
+    if !valid_branch_name(&new) {
         let code = fatal(format!("'{new}' is not a valid branch name"))?;
         ref_syntax_hints(repo);
         return Ok(code);
@@ -2704,4 +3069,139 @@ fn rewrite_last_reflog_old_id(path: &std::path::Path, old: gix::ObjectId) {
     let mut out = body.clone();
     out[start..start + hex.len()].copy_from_slice(hex.as_bytes());
     let _ = std::fs::write(path, out);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{resolve_long, valid_branch_name, Arg, Resolved, LONG_OPTS};
+
+    /// Resolve a name the way the parse loop does, reporting the outcome as a
+    /// short string so a whole table of cases reads at a glance.
+    fn r(name: &str) -> String {
+        match resolve_long(LONG_OPTS, name) {
+            Resolved::One(opt, false) => opt.name.to_string(),
+            Resolved::One(opt, true) => format!("no-{}", opt.name),
+            Resolved::Ambiguous(a, b) => format!("ambiguous:{a}|{b}"),
+            Resolved::Unknown => "unknown".to_string(),
+        }
+    }
+
+    /// The whole point of the table: a name git does not resolve must come back
+    /// `Unknown` so the caller can refuse it, rather than falling through to the
+    /// positional arm and becoming a branch to create.
+    ///
+    /// `git branch --bogus` used to exit 0 having created `refs/heads/--bogus`.
+    #[test]
+    fn an_unresolvable_name_is_unknown_not_an_operand() {
+        for name in ["bogus", "zzbogus", "colour", "no-all", "no-remotes", "unknown-thing"] {
+            assert_eq!(r(name), "unknown", "--{name} must not resolve");
+        }
+    }
+
+    /// `-a`/`--all`, `-r`/`--remotes` and the `--contains` family carry
+    /// `PARSE_OPT_NONEG`, so their `no-` forms are unknown rather than negations
+    /// — which is exactly why `--no-all` cannot be waved through as a negation
+    /// of something.
+    #[test]
+    fn noneg_entries_have_no_negation() {
+        assert_eq!(r("all"), "all");
+        assert_eq!(r("remotes"), "remotes");
+        assert_eq!(r("no-all"), "unknown");
+        assert_eq!(r("no-remotes"), "unknown");
+        // `no-contains` and `no-merged` are entries in their own right, not
+        // negations of `contains`/`merged`.
+        assert_eq!(r("no-contains"), "no-contains");
+        assert_eq!(r("no-merged"), "no-merged");
+    }
+
+    /// Unique-prefix abbreviation, which stock accepts. Getting this wrong in
+    /// the rejecting direction is the other half of the bug: `--verb` is a real
+    /// spelling of `--verbose`, so answering `unknown option` would be a
+    /// fabricated refusal of something git honours.
+    #[test]
+    fn unique_prefixes_resolve_to_the_full_option() {
+        assert_eq!(r("verb"), "verbose");
+        assert_eq!(r("ver"), "verbose");
+        assert_eq!(r("forc"), "force");
+        assert_eq!(r("abbre"), "abbrev");
+        assert_eq!(r("omit"), "omit-empty");
+        assert_eq!(r("show"), "show-current");
+        // Negated abbreviations resolve too.
+        assert_eq!(r("no-verb"), "no-verbose");
+        assert_eq!(r("no-forc"), "no-force");
+    }
+
+    /// The two candidates an ambiguous abbreviation names, and their order, come
+    /// from `parse_long_opt()` keeping the last two matches as it walks the
+    /// table — so [`super::LONG_OPTS`] has to stay in `builtin/branch.c` order.
+    /// Every expectation here was taken from stock git 2.55.0.
+    #[test]
+    fn ambiguous_prefixes_name_the_last_two_candidates_in_table_order() {
+        assert_eq!(r("c"), "ambiguous:create-reflog|column");
+        assert_eq!(r("col"), "ambiguous:color|column");
+        assert_eq!(r("s"), "ambiguous:show-current|sort");
+        assert_eq!(r("wit"), "ambiguous:with|without");
+        // A name that is itself a prefix of `no-` makes every negatable option a
+        // candidate ("negated and abbreviated very much").
+        assert_eq!(r("n"), "ambiguous:no-recurse-submodules|no-format");
+        assert_eq!(r("no"), "ambiguous:no-recurse-submodules|no-format");
+    }
+
+    /// `--set-upstream`, `--with` and `--without` are `PARSE_OPT_HIDDEN`: absent
+    /// from the usage block but resolved like any other, so they must not be
+    /// mistaken for unknown names.
+    #[test]
+    fn hidden_options_still_resolve() {
+        assert_eq!(r("set-upstream"), "set-upstream");
+        assert_eq!(r("with"), "with");
+        assert_eq!(r("without"), "without");
+    }
+
+    /// The value shape drives whether a detached value is consumed, so an entry
+    /// with the wrong `Arg` silently eats the next operand (or fails to).
+    #[test]
+    fn value_shapes_match_the_option_table() {
+        let arg = |name: &str| match resolve_long(LONG_OPTS, name) {
+            Resolved::One(opt, _) => opt.arg,
+            _ => panic!("--{name} did not resolve"),
+        };
+        assert!(arg("force") == Arg::None);
+        assert!(arg("sort") == Arg::Required);
+        assert!(arg("format") == Arg::Required);
+        assert!(arg("points-at") == Arg::Required);
+        // PARSE_OPT_OPTARG: an attached value only.
+        assert!(arg("track") == Arg::Optional);
+        assert!(arg("color") == Arg::Optional);
+        assert!(arg("abbrev") == Arg::Optional);
+        assert!(arg("column") == Arg::Optional);
+        // PARSE_OPT_LASTARG_DEFAULT.
+        assert!(arg("contains") == Arg::LastArg);
+        assert!(arg("merged") == Arg::LastArg);
+        assert!(arg("with") == Arg::LastArg);
+    }
+
+    /// `check_branch_ref()` rejects a leading dash before `check_refname_format()`
+    /// ever runs. gitoxide only implements the latter, so without the extra rule
+    /// `git branch -- -foo` created `refs/heads/-foo` and `git branch -m -- -bad`
+    /// renamed the current branch to `-bad`.
+    #[test]
+    fn a_leading_dash_is_not_a_valid_branch_name() {
+        for name in ["-foo", "--bogus", "-", "--", "-Z"] {
+            assert!(!valid_branch_name(name), "{name} must be refused");
+        }
+        // The other two rules `check_branch_ref()` applies.
+        assert!(!valid_branch_name("HEAD"));
+        assert!(!valid_branch_name("..dots"));
+        // …and names that are fine keep working.
+        for name in ["main", "topic", "feature/x", "a-b", "wip-2"] {
+            assert!(valid_branch_name(name), "{name} must be accepted");
+        }
+    }
+
+    /// A dash mid-name is not a leading dash.
+    #[test]
+    fn only_the_first_character_triggers_the_dash_rule() {
+        assert!(valid_branch_name("x-y"));
+        assert!(valid_branch_name("release-1.0"));
+    }
 }

@@ -80,8 +80,10 @@ pub fn mailsplit(args: &[String]) -> Result<ExitCode> {
 
 /// `cmd_mailsplit()`.
 fn run(args: &[String]) -> R<ExitCode> {
-    // show_usage_if_asked(): `-h` as the sole argument, and nothing else.
-    if args.len() == 1 && args[0] == "-h" {
+    // show_usage_if_asked(): `-h` or `--help-all` as the sole argument, and
+    // nothing else. mailsplit's option table has no hidden entry, so both print
+    // the same block (parse-options.c:1490-1505).
+    if args.len() == 1 && matches!(args[0].as_str(), "-h" | "--help-all") {
         println!("usage: {USAGE}");
         return Err(Halt(129));
     }

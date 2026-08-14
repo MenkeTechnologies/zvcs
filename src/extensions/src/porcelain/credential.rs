@@ -91,8 +91,9 @@ pub fn credential(args: &[String]) -> Result<ExitCode> {
     // Dispatch strips the verb; every element here is a real argument.
     let rest = args;
     // `show_usage_if_asked(argc, argv, usage_msg)` runs before the arity check and
-    // fires only for a lone `-h`. Unlike `usage()` below, it prints to *stdout*.
-    if rest.len() == 1 && rest[0] == "-h" {
+    // fires only for a lone `-h` or `--help-all`. Unlike `usage()` below, it
+    // prints to *stdout*.
+    if rest.len() == 1 && matches!(rest[0].as_str(), "-h" | "--help-all") {
         println!("{USAGE}");
         return Ok(ExitCode::from(129));
     }

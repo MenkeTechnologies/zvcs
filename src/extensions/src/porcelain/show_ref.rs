@@ -53,7 +53,7 @@ pub fn show_ref(args: &[String]) -> Result<ExitCode> {
     // parse-options' lone-`-h` rule (parse-options.c:1049,
     // `internal_help && ctx->total == 1`). It cannot live in the option loop
     // because show-ref's own hidden `-h` means `--head`.
-    if let Some(code) = super::show_usage_if_asked(args, USAGE) {
+    if let Some(code) = super::show_usage_if_asked_full(args, USAGE, USAGE_ALL) {
         return Ok(code);
     }
 
@@ -85,6 +85,12 @@ pub fn show_ref(args: &[String]) -> Result<ExitCode> {
         }
         if let Some(long) = a.strip_prefix("--") {
             match long {
+                // `if (internal_help && !strcmp(arg + 2, "help-all"))`
+                // (parse-options.c:1124), which fires at any position the option
+                // loop reaches — `git show-ref --head --help-all` prints help.
+                // The sole-argument spelling is handled before the loop instead,
+                // because it shares that entry point with `-h`.
+                "help-all" => return Ok(super::show_usage(USAGE_ALL)),
                 "head" => opts.head = true,
                 "dereference" => opts.deref = true,
                 "hash" => opts.hash_only = true,
@@ -207,6 +213,37 @@ const USAGE: &str = r#"usage: git show-ref [--head] [-d | --dereference]
     --[no-]branches       only show branches (can be combined with --tags)
     --[no-]exists         check for reference existence without resolving
     --[no-]verify         stricter reference checking, requires exact ref path
+    --[no-]head           show the HEAD reference, even if it would be filtered out
+    -d, --[no-]dereference
+                          dereference tags into object IDs
+    -s, --[no-]hash[=<n>] only show SHA1 hash using <n> digits
+    --[no-]abbrev[=<n>]   use <n> digits to display object names
+    -q, --[no-]quiet      do not print results to stdout (useful with --verify)
+    --exclude-existing[=<pattern>]
+                          show refs from stdin that aren't in local repository
+
+"#;
+
+/// [`USAGE`] with the `PARSE_OPT_HIDDEN` entries left in, which is what
+/// `usage_with_options_internal()` prints for `USAGE_FULL` — the `--help-all`
+/// block. `show-ref` has two of them: `--heads`, kept as a deprecated synonym,
+/// and the short `-h` form of `--head`, hidden because a lone `-h` is help.
+/// Byte-for-byte from stock git 2.55.0's `git show-ref --help-all`.
+const USAGE_ALL: &str = r#"usage: git show-ref [--head] [-d | --dereference]
+                    [-s | --hash[=<n>]] [--abbrev[=<n>]] [--branches] [--tags]
+                    [--] [<pattern>...]
+   or: git show-ref --verify [-q | --quiet] [-d | --dereference]
+                    [-s | --hash[=<n>]] [--abbrev[=<n>]]
+                    [--] [<ref>...]
+   or: git show-ref --exclude-existing[=<pattern>]
+   or: git show-ref --exists <ref>
+
+    --[no-]tags           only show tags (can be combined with --branches)
+    --[no-]branches       only show branches (can be combined with --tags)
+    --[no-]heads          deprecated synonym for --branches
+    --[no-]exists         check for reference existence without resolving
+    --[no-]verify         stricter reference checking, requires exact ref path
+    -h                    show the HEAD reference, even if it would be filtered out
     --[no-]head           show the HEAD reference, even if it would be filtered out
     -d, --[no-]dereference
                           dereference tags into object IDs

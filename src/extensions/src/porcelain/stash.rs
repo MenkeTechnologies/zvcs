@@ -65,6 +65,12 @@
 //!   like `git reflog delete --rewrite --updateref`. The ref itself moves (or is
 //!   deleted) through the ref store, so a `refs/stash` that lives in
 //!   `packed-refs` is removed rather than left resolving to a dropped stash.
+//!   Both parse their argv first: `drop` takes only `OPT__QUIET`, and `clear`
+//!   takes nothing at all (`PARSE_OPT_STOP_AT_NON_OPTION` over an empty table,
+//!   so an operand is `error: git stash clear with arguments is unimplemented`
+//!   at 1). An unrecognized option is refused at 129 *before* an entry is
+//!   removed — `git stash drop --zzbogus` must not drop, and
+//!   `git stash clear --zzbogus` must not erase everything.
 //! * `<stash>` resolution is `get_stash_info()`: `stash@{n}` (or a bare `n`) is a
 //!   reflog entry, and anything else is any stash-like commit — two parents at
 //!   least — which `apply`, `show` and `branch` take as readily as git does.
@@ -231,6 +237,10 @@ const DROP_USAGE: &str = r#"usage: git stash drop [-q | --quiet] [<stash>]
 
 "#;
 
+/// `git stash clear -h`. `clear_stash()`'s option table is just `OPT_END()`, so
+/// the block is the usage line alone.
+const CLEAR_USAGE: &str = "usage: git stash clear\n\n";
+
 /// `git stash show -h`.
 const SHOW_USAGE: &str = r#"usage: git stash show [-u | --include-untracked | --only-untracked] [<diff-options>] [<stash>]
 
@@ -338,8 +348,10 @@ pub fn stash(args: &[String]) -> Result<ExitCode> {
             if let Some(code) = usage_requested(&args[1..], DROP_USAGE) {
                 return Ok(code);
             }
-            let quiet = args[1..].iter().any(|a| a == "-q" || a == "--quiet");
-            let named = positionals(&args[1..]);
+            let (quiet, named) = match parse_drop_options(&args[1..]) {
+                Ok(parsed) => parsed,
+                Err(code) => return Ok(code),
+            };
             let spec = match resolve_stash(&repo, &named)? {
                 Ok(spec) => spec,
                 Err(code) => return Ok(code),
@@ -351,6 +363,43 @@ pub fn stash(args: &[String]) -> Result<ExitCode> {
             do_drop_stash(&repo, &spec, quiet)
         }
         Some("clear") => {
+            // ```c
+            // static int clear_stash(int argc, const char **argv, const char *prefix)
+            // {
+            //         struct option options[] = { OPT_END() };
+            //         argc = parse_options(argc, argv, prefix, options,
+            //                              git_stash_clear_usage,
+            //                              PARSE_OPT_STOP_AT_NON_OPTION);
+            //         if (argc)
+            //                 return error(_("git stash clear with arguments is unimplemented"));
+            //         return do_clear_stash();
+            // }
+            // ```
+            //
+            // The table is empty, so *every* option is unknown; the first
+            // operand stops parsing and makes whatever follows the caller's
+            // problem. Skipping this entirely is what let `git stash clear
+            // --zzbogus` silently erase every entry.
+            let rest = &args[1..];
+            let mut stop = 0;
+            while stop < rest.len() {
+                let a = rest[stop].as_str();
+                if a == "--" || a == "--end-of-options" {
+                    stop += 1;
+                    break;
+                }
+                if !a.starts_with('-') || a == "-" {
+                    break;
+                }
+                if a == "-h" {
+                    return Ok(super::show_usage(CLEAR_USAGE));
+                }
+                return Ok(usage_error(a, CLEAR_USAGE));
+            }
+            if stop < rest.len() {
+                eprintln!("error: git stash clear with arguments is unimplemented");
+                return Ok(ExitCode::FAILURE);
+            }
             let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
             clear(&repo)
         }
@@ -2206,8 +2255,69 @@ fn set_prev(line: &mut Vec<u8>, prev: &[u8]) -> Result<()> {
 
 /// Every non-flag argument — `parse_options()`'s leftovers, which is what
 /// `get_stash_info()` counts when it refuses more than one revision.
-fn positionals(args: &[String]) -> Vec<String> {
-    args.iter().filter(|a| !a.starts_with('-')).cloned().collect()
+/// `drop_stash()`'s option table is a single `OPT__QUIET(&quiet, …)` parsed with
+/// no `PARSE_OPT_STOP_AT_NON_OPTION`, so an option may follow the `<stash>`
+/// operand. Returns `(quiet, operands)`.
+///
+/// The point of parsing rather than filtering: [`positionals`] drops every
+/// dash-prefixed word on the floor, so `git stash drop --zzbogus` used to fall
+/// through to the default `stash@{0}` and delete it. An unrecognized option has
+/// to be refused *before* anything is dropped.
+///
+/// With one entry in the table an abbreviation can never be ambiguous, so
+/// `--q`, `--quie`, `--n` and `--no` all resolve — as they do in stock.
+fn parse_drop_options(args: &[String]) -> std::result::Result<(bool, Vec<String>), ExitCode> {
+    let mut quiet = false;
+    let mut named = Vec::new();
+    let mut only_names = false;
+
+    for a in args {
+        let a = a.as_str();
+        if only_names || !a.starts_with('-') || a == "-" {
+            named.push(a.to_string());
+            continue;
+        }
+        if let Some(body) = a.strip_prefix("--") {
+            if body.is_empty() || body == "end-of-options" {
+                only_names = true;
+                continue;
+            }
+            let (name, attached) = match body.split_once('=') {
+                Some((name, value)) => (name, Some(value)),
+                None => (body, None),
+            };
+            // The whole table is `quiet`, reachable positively by prefix and
+            // negatively through `no-` (including a `no-` that is itself only a
+            // prefix, parse_long_opt's "negated and abbreviated very much").
+            let set = if "quiet".starts_with(name) {
+                true
+            } else if "no-".starts_with(name) {
+                false
+            } else if name.strip_prefix("no-").is_some_and(|r| "quiet".starts_with(r)) {
+                false
+            } else {
+                return Err(usage_error(a, DROP_USAGE));
+            };
+            if attached.is_some() {
+                let shown = match set {
+                    true => "quiet",
+                    false => "no-quiet",
+                };
+                eprintln!("error: option `{shown}' takes no value");
+                return Err(ExitCode::from(129));
+            }
+            quiet = set;
+            continue;
+        }
+        // Short options group; `-h` was answered before we got here.
+        for c in a[1..].chars() {
+            match c {
+                'q' => quiet = true,
+                _ => return Err(usage_error(&format!("-{c}"), DROP_USAGE)),
+            }
+        }
+    }
+    Ok((quiet, named))
 }
 
 /// What a `<stash>` argument resolved to — `get_stash_info()` (builtin/stash.c).
@@ -2554,8 +2664,21 @@ fn parse_push_options(args: &[String]) -> Result<std::result::Result<PushOpts, E
 /// `parse_options()`'s rejection: the unknown flag, then the subcommand's usage
 /// block, then exit 129 — not a one-line `zvcs: stash: …` error, which is what a
 /// caller checking `$?` for 129 sees. Both go to stderr, unlike the `-h` form.
+/// A long option is named without its dashes, a short one by its letter alone,
+/// matching parse-options' two spellings:
+///
+/// ```c
+/// if (ctx.argv[0][1] == '-') {
+///         error(_("unknown option `%s'"), ctx.argv[0] + 2);
+/// } else if (isascii(*ctx.opt)) {
+///         error(_("unknown switch `%c'"), *ctx.opt);
+/// }
+/// ```
 fn usage_error(flag: &str, usage: &str) -> ExitCode {
-    eprintln!("error: unknown option `{}'", flag.trim_start_matches('-'));
+    match flag.strip_prefix("--") {
+        Some(long) => eprintln!("error: unknown option `{long}'"),
+        None => eprintln!("error: unknown switch `{}'", &flag[1..]),
+    }
     eprint!("{usage}");
     ExitCode::from(129)
 }
@@ -2788,4 +2911,48 @@ mod tests {
         let many = parse_store_options(&v(&["a", "b"])).unwrap_err().to_string();
         assert_eq!(many, "\"git stash store\" requires one <commit> argument");
     }
+
+    /// `git stash drop`'s argv used to be filtered through `positionals()`,
+    /// which threw away every dash-prefixed word — so `git stash drop --zzbogus`
+    /// silently fell through to the default `stash@{0}` and deleted it. An
+    /// unrecognized option has to be refused before anything is dropped.
+    #[test]
+    fn drop_refuses_an_unknown_option_instead_of_ignoring_it() {
+        assert!(parse_drop_options(&v(&["--zzbogus"])).is_err());
+        assert!(parse_drop_options(&v(&["-Z"])).is_err());
+        assert!(parse_drop_options(&v(&["stash@{1}", "--zzbogus"])).is_err());
+        // A value on a flag is refused too.
+        assert!(parse_drop_options(&v(&["--quiet=1"])).is_err());
+    }
+
+    /// The single `OPT__QUIET` entry, in every spelling stock resolves. With one
+    /// option in the table an abbreviation can never be ambiguous, so `--q`,
+    /// `--quie`, `--n` and `--no` all resolve — rejecting them would be a
+    /// fabricated refusal of something git accepts.
+    #[test]
+    fn drop_resolves_quiet_in_every_spelling() {
+        for spelling in ["-q", "--quiet", "--q", "--quie"] {
+            let (quiet, named) = parse_drop_options(&v(&[spelling])).expect(spelling);
+            assert!(quiet, "{spelling} must set quiet");
+            assert!(named.is_empty());
+        }
+        for spelling in ["--no-quiet", "--no-q", "--n", "--no"] {
+            let (quiet, _) = parse_drop_options(&v(&[spelling])).expect(spelling);
+            assert!(!quiet, "{spelling} must clear quiet");
+        }
+    }
+
+    /// `drop_stash()` parses with no `PARSE_OPT_STOP_AT_NON_OPTION`, so an
+    /// option may follow the operand, and `--` ends option parsing.
+    #[test]
+    fn drop_keeps_operands_and_honours_dash_dash() {
+        let (quiet, named) = parse_drop_options(&v(&["stash@{1}", "-q"])).unwrap();
+        assert!(quiet);
+        assert_eq!(named, v(&["stash@{1}"]));
+
+        // After `--`, an option-shaped word is an operand, not a refusal.
+        let (_, named) = parse_drop_options(&v(&["--", "--zzbogus"])).unwrap();
+        assert_eq!(named, v(&["--zzbogus"]));
+    }
+
 }

@@ -3976,7 +3976,15 @@ fn expand_format(
             out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
             continue;
         }
-        let Some(&p) = chars.get(i) else { break };
+        let Some(&p) = chars.get(i) else {
+            // A `%` with nothing after it: `format_commit_one()` switches on the
+            // NUL and returns 0, so the driver prints the `%`. [`check_format`]
+            // rejects a format that simply ends in one, so the only way here is a
+            // `%C…` chain having realigned onto the second `%` of a trailing `%%`
+            // — which has already laid out the field it was holding open.
+            out.push(b'%');
+            break;
+        };
         // `strbuf_expand_step()` handles `%%` before `format_commit_item()` is
         // reached, so it is neither padded nor does it spend a pending field.
         if p == '%' {
@@ -4193,7 +4201,18 @@ fn expand_one(
             }
             *i += 1;
         }
-        _ => unreachable!("check_format rejected this already"),
+        // A `%` reaches `format_commit_one()` when `format_and_pad_commit()`'s
+        // `%C…` chain swallows the `%` of a `%%` (pretty.c:1828-1831) and hands
+        // it the second one. git falls off the end of the switch and returns 0
+        // (pretty.c:1799), which breaks the chain without printing a bare `%`,
+        // and the driver rescans from this `%`.
+        '%' => return Ok(false),
+        // That rescan realigns the format by one byte, so the placeholders after
+        // it are not the ones [`check_format`] validated — `%<(20)%Cred%%|` walks
+        // in here with `%|`, which the pair reading made literal text. Report it
+        // the way `check_format` would rather than treat an unvalidated character
+        // as impossible.
+        _ => anyhow::bail!("unsupported format placeholder %{p}"),
     }
     Ok(true)
 }
@@ -4219,7 +4238,10 @@ fn expand_color(
         if let Some(close) = rest.find(')') {
             let spec = &rest[1..close];
             out.extend_from_slice(parse_color_spec(spec, want_color, auto, out_empty).as_bytes());
-            *i += close + 1; // consume through ')'
+            // Consume through the `)`. `find` answered in bytes and `i` indexes
+            // characters, so a non-ASCII byte in the spec would otherwise push the
+            // cursor past it — `%C(café)%s` swallowed the `%` of the `%s`.
+            *i += rest[..=close].chars().count();
             return true;
         }
         // No closing paren: git prints the rest verbatim. Fall through to literal.

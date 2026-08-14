@@ -412,10 +412,15 @@ fn parse_user_format(fmt: &str) -> Result<Vec<Item>> {
     // resolved here, once, and the snapshots replayed per record.
     let mut pad = PadState::default();
 
+    // Where the field state will stand when the renderer reaches this byte, which
+    // decides how a `%%` here is read. See [`ChainState`].
+    let mut chain = ChainState::default();
+
     while i < b.len() {
         if b[i] != b'%' {
             lit.push(b[i]);
             i += 1;
+            chain.saw_literal();
             continue;
         }
         let Some(&c) = b.get(i + 1) else {
@@ -423,9 +428,24 @@ fn parse_user_format(fmt: &str) -> Result<Vec<Item>> {
             // returns 0.
             push_unconsumed(&mut items, &mut lit);
             i += 1;
+            chain.saw(&Item::Unconsumed);
             continue;
         };
+        let items_before = items.len();
+        let lit_before = lit.len();
         match c {
+            // Inside a `%C…` chain the leading `%` is not an escape half at all:
+            // `format_and_pad_commit()` has already claimed it, and the second `%`
+            // is what `format_commit_one()` is handed — where it is an unknown
+            // placeholder worth 0. So only one byte is consumed, the field is laid
+            // out, the chain's non-zero `total_consumed` suppresses the bare `%`,
+            // and git rescans from the second `%`. Every placeholder after it is
+            // one byte out of step with the escape reading, which is why this
+            // cannot be sorted out later from the item list.
+            b'%' if chain.chaining => {
+                push_unconsumed(&mut items, &mut lit);
+                i += 1;
+            }
             b'%' => {
                 lit.push(b'%');
                 i += 2;
@@ -597,12 +617,76 @@ fn parse_user_format(fmt: &str) -> Result<Vec<Item>> {
                 i += 1;
             }
         }
+        chain.absorb(&items[items_before..], lit.len() > lit_before);
     }
 
     if !lit.is_empty() {
         items.push(Item::Literal(lit));
     }
     Ok(items)
+}
+
+/// The parse-time mirror of the field state [`render_user`] runs on.
+///
+/// Nothing it tracks depends on the commit — which item a `%` becomes, and which
+/// items close a pending field, are fixed by the format string — so the parser can
+/// know whether a field will be open when the renderer reaches a given byte.
+///
+/// It has to, for one case. Inside a pending field `format_and_pad_commit()`
+/// swallows the `%` that follows a `%C…` before calling `format_commit_one()`
+/// again (pretty.c:1828-1831), so a `%%` there never reaches the driver's escape
+/// handling: git consumes the first `%` into the chain and rescans from the
+/// second. That shifts every placeholder after it by a byte —
+/// `%<(20)%Cred%%s|` renders the *subject*, not a literal `%s` — and a shift is a
+/// re-parse, which only the parser can do.
+#[derive(Default)]
+struct ChainState {
+    /// A `%<`/`%>` atom is holding a field open.
+    field: bool,
+    /// The last item was a `%C…` laid inside that field, so the chain is still
+    /// running and the next `%` belongs to it.
+    chaining: bool,
+}
+
+impl ChainState {
+    /// Replay the items one parse step appended. `literal` reports that the step
+    /// also began a run of literal bytes, which may not be flushed into an
+    /// [`Item::Literal`] until a later step but ends a chain right here.
+    fn absorb(&mut self, appended: &[Item], literal: bool) {
+        if literal {
+            self.saw_literal();
+        }
+        for item in appended {
+            self.saw(item);
+        }
+    }
+
+    /// Literal text passes through a pending field untouched — but it is not a
+    /// `%`, so it ends a `%C…` chain, and the field the chain was holding open is
+    /// laid out the moment that happens.
+    fn saw_literal(&mut self) {
+        if self.chaining {
+            self.field = false;
+        }
+        self.chaining = false;
+    }
+
+    fn saw(&mut self, item: &Item) {
+        match item {
+            Item::Literal(_) => self.saw_literal(),
+            // The chain keeps the field open across a `%C…`.
+            Item::Placeholder(Ph::Color(_)) if self.field => self.chaining = true,
+            // Everything else is the placeholder the field was waiting for, so
+            // `PadState::apply` lays it out and clears the flush. A padding atom
+            // opens the next field with what it stored — unless it was itself the
+            // padded placeholder, in which case `apply` clears what it just stored.
+            item => {
+                let was_open = self.field;
+                self.field = matches!(item, Item::Pad { state: Some(_), .. }) && !was_open;
+                self.chaining = false;
+            }
+        }
+    }
 }
 
 /// Flush a pending run of literal bytes into `items`.
@@ -1543,6 +1627,61 @@ mod tests {
         assert_eq!(color_from_paren(b"always,bold red").unwrap(), b"\x1b[1;31m");
         // "underline" is not a valid attribute name in git (only "ul").
         assert!(parse_always_color(b"underline").is_err());
+    }
+
+    /// A `%C…` inside a pending field swallows the `%` that follows it, so the
+    /// `%%` after one is not the escape pair the driver would have expanded: git
+    /// takes the first `%` into the chain and rescans from the second, shifting
+    /// every placeholder after it by a byte. Captured from stock git 2.55.0 on a
+    /// repository whose `HEAD` subject is `short`:
+    ///
+    /// ```text
+    /// $ printf 'HEAD\n' | git format-rev --stdin-mode=revs --format='%<(20)%Cred%%s|'
+    ///                     short|
+    /// $ printf 'HEAD\n' | git format-rev --stdin-mode=revs --format='%<(20)%Cred%%%s|'
+    ///                     %s|
+    /// $ printf 'HEAD\n' | git format-rev --stdin-mode=revs --format='%s%Cred%%s|'
+    /// short%s|
+    /// ```
+    ///
+    /// The third shows the rule's edge: with no field open there is no chain, so
+    /// the `%%` is an ordinary escape and `%s` stays literal text.
+    #[test]
+    fn a_color_chain_swallows_the_first_half_of_a_following_escape() {
+        let kinds = |fmt: &str| -> Vec<&'static str> {
+            parse_user_format(fmt)
+                .unwrap()
+                .iter()
+                .map(|item| match item {
+                    Item::Literal(_) => "lit",
+                    Item::Placeholder(Ph::Color(_)) => "color",
+                    Item::Placeholder(Ph::Subject) => "subject",
+                    Item::Placeholder(_) => "ph",
+                    Item::Pad { .. } => "pad",
+                    Item::Wrap { .. } => "wrap",
+                    Item::Unconsumed => "unconsumed",
+                })
+                .collect()
+        };
+        // Inside a field: the pair is broken up, and `%s` past it is the subject.
+        assert_eq!(
+            kinds("%<(20)%Cred%%s|"),
+            ["pad", "color", "unconsumed", "subject", "lit"]
+        );
+        // One `%` further along, the rescan lands on a real pair again.
+        assert_eq!(
+            kinds("%<(20)%Cred%%%s|"),
+            ["pad", "color", "unconsumed", "lit"]
+        );
+        // No field open, so no chain: the pair is an ordinary escape.
+        assert_eq!(kinds("%s%Cred%%s|"), ["subject", "color", "lit"]);
+        // A literal between the colour atom and the `%%` ends the chain too.
+        assert_eq!(kinds("%<(20)%Credx%%s|"), ["pad", "color", "lit"]);
+        // The chain survives a second colour atom.
+        assert_eq!(
+            kinds("%<(20)%Cred%Cgreen%%s|"),
+            ["pad", "color", "color", "unconsumed", "subject", "lit"]
+        );
     }
 
     #[test]

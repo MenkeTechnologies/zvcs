@@ -88,8 +88,9 @@ pub fn remote_fd(args: &[String]) -> Result<ExitCode> {
         .chain(args.iter().map(String::as_str))
         .collect();
 
-    // `show_usage_if_asked()`: a lone `-h` prints the usage on stdout, exit 129.
-    if argv.len() == 2 && argv[1] == "-h" {
+    // `show_usage_if_asked()`: a lone `-h` or `--help-all` prints the usage on
+    // stdout, exit 129. remote-fd has no hidden option, so both print the same.
+    if argv.len() == 2 && matches!(argv[1], "-h" | "--help-all") {
         print!("{USAGE}");
         std::io::stdout().flush()?;
         return Ok(ExitCode::from(129));

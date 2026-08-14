@@ -19,6 +19,14 @@
 //!
 //! `--exit-code` is implied (git-diff(1): "this option implies `--exit-code`"), so
 //! a difference exits 1.
+//!
+//! `-R` is the one option that reaches into the pairing rather than the rendering.
+//! git spends it in two places and this port follows both: `queue_diff()` swaps
+//! `name`/`mode`/`special` at the leaf of the walk (diff-no-index.c:279-283), so
+//! the pair order is untouched and only each pair's two sides trade places; and
+//! `builtin_diff()` swaps the prefixes it prints with (diff.c:3862-3868), which is
+//! why the header reads `diff --git b/<rhs> a/<lhs>` — the *values* are exchanged,
+//! so `--src-prefix`/`--dst-prefix` follow along and `--no-prefix` is unaffected.
 
 use anyhow::Result;
 use gix::bstr::{BString, ByteSlice};
@@ -268,6 +276,10 @@ fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
     let mut color_when: Option<diff_color::ColorWhen> = None;
     let mut operands: Vec<String> = Vec::new();
     let mut after_dashdash = false;
+    // `OPT_BOOL('R', NULL, &options->flags.reverse_diff, …)` (diff.c:6254). The
+    // NULL long name is why there is no `--no-R` to turn it back off, and why a
+    // repeated `-R` re-sets rather than toggles.
+    let mut reverse = false;
 
     for a in args {
         if after_dashdash || !a.starts_with('-') || a == "-" {
@@ -291,6 +303,7 @@ fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
             "-w" | "--ignore-all-space" => ws = super::diff::Whitespace::IgnoreAll,
             "-b" | "--ignore-space-change" => ws = super::diff::Whitespace::IgnoreChange,
             "--ignore-space-at-eol" => ws = super::diff::Whitespace::IgnoreAtEol,
+            "-R" => reverse = true,
             "-W" | "--function-context" => func_context = true,
             "--no-function-context" => func_context = false,
             "--full-index" => full_index = true,
@@ -381,6 +394,13 @@ fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
         (true, Ok(repo)) => diff_color::DiffColors::resolve(&repo, true),
         _ => diff_color::DiffColors::disabled(),
     };
+    // `builtin_diff()`: `a_prefix = o->b_prefix; b_prefix = o->a_prefix` under
+    // `-R` (diff.c:3862-3868). The exchange is of whatever the two prefixes ended
+    // up as, so an explicit `--src-prefix`/`--dst-prefix` pair swaps with them and
+    // `--no-prefix`'s two empty strings swap to no visible effect.
+    if reverse {
+        std::mem::swap(&mut src_prefix, &mut dst_prefix);
+    }
     let opts = Opts {
         fmt: fmt.resolved(),
         ctx,
@@ -394,13 +414,22 @@ fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
         colors,
     };
 
-    let pairs = match queue(&operands[0], &operands[1]) {
+    let mut pairs = match queue(&operands[0], &operands[1]) {
         Ok(pairs) => pairs,
         Err(message) => {
             eprintln!("error: {message}");
             return Ok(ExitCode::from(1));
         }
     };
+    // `queue_diff()`'s `SWAP(mode1, mode2); SWAP(name1, name2); SWAP(special1,
+    // special2)` (diff-no-index.c:279-283). It sits at the leaf of the walk, past
+    // the directory recursion that decided which names pair with which, so the
+    // queue keeps its order and each pair simply trades sides.
+    if reverse {
+        for (a, b) in &mut pairs {
+            std::mem::swap(a, b);
+        }
+    }
 
     let mut out: Vec<u8> = Vec::new();
     let mut changed = false;
@@ -619,5 +648,92 @@ fn render_non_patch(out: &mut Vec<u8>, rows: &[Row], opts: &Opts) {
                 _ => {}
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn present(name: &str) -> Side {
+        Side { name: BString::from(name), file: Some(PathBuf::from(name)), mode: 0o100644 }
+    }
+
+    /// `-R` and the `/dev/null` naming rule, which interact.
+    ///
+    /// `queue_diff()` swaps the two sides (diff-no-index.c:279-283) while
+    /// `header_name()` makes an absent side borrow its peer's name, so a swapped
+    /// addition has to end up printing the *same* name on both halves of the
+    /// header — with the prefixes exchanged. Stock git 2.55.0, on a directory pair
+    /// where `da/only_a.txt` exists only on the left:
+    ///
+    /// ```text
+    /// $ git diff --no-index da db          # forward
+    /// diff --git a/da/only_a.txt b/da/only_a.txt
+    /// --- a/da/only_a.txt
+    /// +++ /dev/null
+    /// $ git diff --no-index -R da db       # reversed
+    /// diff --git b/da/only_a.txt a/da/only_a.txt
+    /// --- /dev/null
+    /// +++ a/da/only_a.txt
+    /// ```
+    ///
+    /// The `/dev/null` marker moves to the other half and the borrowed name stays
+    /// put. A swap that forgot the borrow would print `/dev/null` as a name.
+    #[test]
+    fn reversing_a_one_sided_pair_moves_dev_null_and_keeps_the_borrowed_name() {
+        let (mut a, mut b) = (present("da/only_a.txt"), Side::absent(BString::from("da/only_a.txt")));
+        assert_eq!(a.header_name(&b), "da/only_a.txt");
+        assert_eq!(b.header_name(&a), "da/only_a.txt");
+
+        std::mem::swap(&mut a, &mut b);
+        // The deletion has become an addition: the absent side is now the first.
+        assert!(a.file.is_none() && b.file.is_some());
+        // Both halves still name the file that exists, never `/dev/null`.
+        assert_eq!(a.header_name(&b), "da/only_a.txt");
+        assert_eq!(b.header_name(&a), "da/only_a.txt");
+
+        // `push_name` is what turns the absent side into the literal marker, and
+        // it ignores the prefix when it does.
+        let mut out = Vec::new();
+        push_name(&mut out, b"b/", a.header_name(&b), a.file.is_some());
+        out.push(b' ');
+        push_name(&mut out, b"a/", b.header_name(&a), b.file.is_some());
+        assert_eq!(out.as_bstr(), "/dev/null a/da/only_a.txt");
+    }
+
+    /// A two-sided pair reversed: names trade places and the prefixes trade with
+    /// them, which is `diff --git b/<rhs> a/<lhs>` in stock's output.
+    ///
+    /// ```text
+    /// $ git diff --no-index -R d1/a.txt d1/b.txt
+    /// diff --git b/d1/b.txt a/d1/a.txt
+    /// $ git diff --no-index -R --src-prefix=S/ --dst-prefix=D/ a.txt b.txt
+    /// diff --git D/b.txt S/a.txt
+    /// ```
+    ///
+    /// The second line is the one worth pinning: git exchanges the prefix
+    /// *values* (diff.c:3862-3868), so a custom pair follows the swap rather than
+    /// staying pinned to its side of the diff.
+    #[test]
+    fn reversing_a_two_sided_pair_swaps_names_and_prefix_values() {
+        let (mut a, mut b) = (present("d1/a.txt"), present("d1/b.txt"));
+        let (mut src, mut dst) = (b"a/".to_vec(), b"b/".to_vec());
+        std::mem::swap(&mut a, &mut b);
+        std::mem::swap(&mut src, &mut dst);
+
+        let mut out = Vec::new();
+        push_name(&mut out, &src, a.header_name(&b), true);
+        out.push(b' ');
+        push_name(&mut out, &dst, b.header_name(&a), true);
+        assert_eq!(out.as_bstr(), "b/d1/b.txt a/d1/a.txt");
+
+        let (mut src, mut dst) = (b"S/".to_vec(), b"D/".to_vec());
+        std::mem::swap(&mut src, &mut dst);
+        let mut out = Vec::new();
+        push_name(&mut out, &src, a.header_name(&b), true);
+        out.push(b' ');
+        push_name(&mut out, &dst, b.header_name(&a), true);
+        assert_eq!(out.as_bstr(), "D/d1/b.txt S/d1/a.txt");
     }
 }

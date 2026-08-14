@@ -63,8 +63,25 @@ use gix::objs::{Kind, Write as _};
 use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
 use gix::refs::Target;
 
+use super::{Arg, LongOpt};
+
 /// The namespace every replace ref lives in.
 const REPLACE_BASE: &str = "refs/replace/";
+
+/// `cmd_replace()`'s `struct option options[]` (builtin/replace.c), in table
+/// order, as [`super::resolve_long`] reads it. The five mode selectors are
+/// `OPT_CMDMODE`, which carries `PARSE_OPT_NONEG`; `--force`, `--raw` and
+/// `--format` negate.
+const LONG_OPTS: &[LongOpt] = &[
+    LongOpt { name: "list", neg: false, arg: Arg::None },
+    LongOpt { name: "delete", neg: false, arg: Arg::None },
+    LongOpt { name: "edit", neg: false, arg: Arg::None },
+    LongOpt { name: "graft", neg: false, arg: Arg::None },
+    LongOpt { name: "convert-graft-file", neg: false, arg: Arg::None },
+    LongOpt { name: "force", neg: true, arg: Arg::None },
+    LongOpt { name: "raw", neg: true, arg: Arg::None },
+    LongOpt { name: "format", neg: true, arg: Arg::Required },
+];
 
 /// `git replace`'s usage block, verbatim, including the trailing blank line.
 const USAGE: &str = "\
@@ -150,6 +167,13 @@ pub fn replace(args: &[String]) -> Result<ExitCode> {
             i += 1;
             continue;
         }
+        let resolved = match super::canonical_long(a, LONG_OPTS) {
+            super::Long::Name(name) => name,
+            super::Long::Ambiguous(first, second) => {
+                return Ok(super::ambiguous_option(a, &first, &second, USAGE))
+            }
+        };
+        let a = resolved.as_ref();
         if let Some(long) = a.strip_prefix("--") {
             match long {
                 "list" => cmdmode!(Mode::List, "--list"),

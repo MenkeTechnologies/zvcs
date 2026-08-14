@@ -106,6 +106,56 @@ use std::process::ExitCode;
 use gix::bstr::{BStr, BString, ByteSlice};
 
 /// `usage_with_options()` over `builtin/grep.c`'s option table.
+/// `cmd_grep()`'s `struct option options[]` (builtin/grep.c:1040-1160), in table
+/// order, as [`super::resolve_long`] reads it. `--no-index` is an `OPT_NEGBIT`
+/// whose name already carries the `no-`, so `--index` is that same entry unset —
+/// there is no separate slot for it. `-e`, `-f`, `-I`, `-h`, `-H` and the `(`/`)`
+/// `PARSE_OPT_NODASH` grammar tokens have no long name.
+const LONG_OPTS: &[super::LongOpt] = &[
+    super::LongOpt { name: "cached", neg: true, arg: super::Arg::None },
+    super::LongOpt { name: "no-index", neg: true, arg: super::Arg::None },
+    super::LongOpt { name: "untracked", neg: true, arg: super::Arg::None },
+    super::LongOpt { name: "exclude-standard", neg: true, arg: super::Arg::None },
+    super::LongOpt { name: "recurse-submodules", neg: true, arg: super::Arg::None },
+    super::LongOpt { name: "invert-match", neg: true, arg: super::Arg::None },
+    super::LongOpt { name: "ignore-case", neg: true, arg: super::Arg::None },
+    super::LongOpt { name: "word-regexp", neg: true, arg: super::Arg::None },
+    super::LongOpt { name: "text", neg: true, arg: super::Arg::None },
+    super::LongOpt { name: "textconv", neg: true, arg: super::Arg::None },
+    super::LongOpt { name: "recursive", neg: true, arg: super::Arg::None },
+    super::LongOpt { name: "max-depth", neg: false, arg: super::Arg::Required },
+    super::LongOpt { name: "extended-regexp", neg: true, arg: super::Arg::None },
+    super::LongOpt { name: "basic-regexp", neg: true, arg: super::Arg::None },
+    super::LongOpt { name: "fixed-strings", neg: true, arg: super::Arg::None },
+    super::LongOpt { name: "perl-regexp", neg: true, arg: super::Arg::None },
+    super::LongOpt { name: "line-number", neg: true, arg: super::Arg::None },
+    super::LongOpt { name: "column", neg: true, arg: super::Arg::None },
+    super::LongOpt { name: "full-name", neg: true, arg: super::Arg::None },
+    super::LongOpt { name: "files-with-matches", neg: true, arg: super::Arg::None },
+    super::LongOpt { name: "name-only", neg: true, arg: super::Arg::None },
+    super::LongOpt { name: "files-without-match", neg: true, arg: super::Arg::None },
+    super::LongOpt { name: "null", neg: true, arg: super::Arg::None },
+    super::LongOpt { name: "only-matching", neg: true, arg: super::Arg::None },
+    super::LongOpt { name: "count", neg: true, arg: super::Arg::None },
+    super::LongOpt { name: "color", neg: true, arg: super::Arg::Optional },
+    super::LongOpt { name: "break", neg: true, arg: super::Arg::None },
+    super::LongOpt { name: "heading", neg: true, arg: super::Arg::None },
+    super::LongOpt { name: "context", neg: true, arg: super::Arg::Required },
+    super::LongOpt { name: "before-context", neg: false, arg: super::Arg::Required },
+    super::LongOpt { name: "after-context", neg: false, arg: super::Arg::Required },
+    super::LongOpt { name: "threads", neg: true, arg: super::Arg::Required },
+    super::LongOpt { name: "show-function", neg: true, arg: super::Arg::None },
+    super::LongOpt { name: "function-context", neg: true, arg: super::Arg::None },
+    super::LongOpt { name: "and", neg: false, arg: super::Arg::None },
+    super::LongOpt { name: "or", neg: false, arg: super::Arg::None },
+    super::LongOpt { name: "not", neg: false, arg: super::Arg::None },
+    super::LongOpt { name: "quiet", neg: true, arg: super::Arg::None },
+    super::LongOpt { name: "all-match", neg: true, arg: super::Arg::None },
+    super::LongOpt { name: "open-files-in-pager", neg: true, arg: super::Arg::Optional },
+    super::LongOpt { name: "ext-grep", neg: true, arg: super::Arg::None },
+    super::LongOpt { name: "max-count", neg: true, arg: super::Arg::Required },
+];
+
 const USAGE: &str = r"usage: git grep [<options>] [-e] <pattern> [<rev>...] [[--] <path>...]
 
     --[no-]cached         search in index instead of in the work tree
@@ -513,6 +563,15 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
         if a == "--" || a == "-" || !a.starts_with('-') {
             break;
         }
+        // Resolve the long name the way `parse_long_opt()` resolves it, so a
+        // unique abbreviation reaches the arm its full spelling reaches.
+        let resolved = match super::canonical_long(a, LONG_OPTS) {
+            super::Long::Name(name) => name,
+            super::Long::Ambiguous(first, second) => {
+                return Ok(super::ambiguous_option(a, &first, &second, USAGE))
+            }
+        };
+        let a = resolved.as_ref();
         if let Some(long) = a.strip_prefix("--") {
             // `if (internal_help && !strcmp(arg + 2, "help-all"))`
             // (parse-options.c:1124). Unlike the lone-`-h` rule above this one
@@ -695,12 +754,24 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
                     }
                     Err(code) => return Ok(code),
                 },
-                "no-context" | "no-after-context" | "no-before-context" => {}
+                // `-C`/`--context` is an `OPT_CALLBACK` without
+                // `PARSE_OPT_NONEG`, so it negates; `-A`/`--after-context` and
+                // `-B`/`--before-context` are `OPT_UNSIGNED`, whose macro sets
+                // `PARSE_OPT_NONEG` (parse-options.h:287-296), so they have no
+                // `--no-` spelling at all.
+                "no-context" => {}
                 "all-match" => deferred.all_match = true,
                 "recurse-submodules" => {
                     deferred.set_changing.get_or_insert_with(|| a.to_string());
                 }
-                _ => anyhow::bail!("{}", unsupported(a)),
+                // The name resolved against git's table but no arm here
+                // implements it, so this is an honest gap rather than an
+                // unknown option; a name nothing in the table claims is
+                // parse-options' `unknown option` instead.
+                _ => match super::resolve_long(LONG_OPTS, name) {
+                    super::Resolved::Unknown => return Ok(unknown_long(name)),
+                    _ => anyhow::bail!("{}", unsupported(a)),
+                },
             }
             i += 1;
             continue;
@@ -835,6 +906,7 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
                     c = group.len();
                     continue;
                 }
+                other if !SHORT_OPTS.contains(other) => return Ok(unknown_short(other)),
                 other => anyhow::bail!("{}", unsupported(&format!("-{other}"))),
             }
             c += 1;
@@ -3789,19 +3861,40 @@ fn quote_path(bytes: &[u8]) -> String {
     out
 }
 
-/// The terse rejection used for every flag this port does not implement.
+/// The terse rejection used for a flag `git grep` accepts and this port has not
+/// implemented.
+///
+/// It deliberately carries no inventory of what *is* ported: that list is an
+/// implementation detail of this module, it goes stale the moment a flag lands,
+/// and stock git never prints anything like it. A flag stock git itself does not
+/// know takes the [`unknown_long`] / [`unknown_short`] path instead, which is
+/// parse-options' own refusal.
 fn unsupported(flag: &str) -> String {
-    format!(
-        "unsupported flag {flag:?} (ported: -e, -f/--file, -i, -v, -w, -a, -I, -n, --column, \
-         -l/--files-with-matches/--name-only, -L/--files-without-match, -c, -q, -z, -o, \
-         -h, -H, -E, -G, -F, -P, -m/--max-count, --max-depth, -r/--[no-]recursive, \
-         -A/-B/-C context, -W/-p function context, --and/--or/--not/() grammar, \
-         --heading, --break, --all-match, --full-name, --cached, --untracked, \
-         --no-index/--index, --[no-]exclude-standard, --recurse-submodules, --textconv, \
-         --color, -O/--open-files-in-pager, --threads, <tree>/<revision> search, \
-         and pathspecs)"
-    )
+    format!("unsupported flag {flag:?}")
 }
+
+/// `PARSE_OPT_UNKNOWN` for a long option (parse-options.c:889-898): the `error:`
+/// line and the usage block, both on stderr, exit 129.
+fn unknown_long(name: &str) -> ExitCode {
+    eprintln!("error: unknown option `{name}'");
+    eprint!("{USAGE}");
+    ExitCode::from(129)
+}
+
+/// `PARSE_OPT_UNKNOWN` for a short one, which parse-options calls a *switch*.
+fn unknown_short(c: char) -> ExitCode {
+    match c.is_ascii() {
+        true => eprintln!("error: unknown switch `{c}'"),
+        false => eprintln!("error: unknown non-ascii option in string: `-{c}'"),
+    }
+    eprint!("{USAGE}");
+    ExitCode::from(129)
+}
+
+/// Every short option `cmd_grep()`'s table defines (builtin/grep.c:1040-1160),
+/// so a letter git does not know can be told apart from one it knows and this
+/// port has not implemented.
+const SHORT_OPTS: &str = "aABcCeEfFGhHiIlLmnNoOpPqrvwWz";
 
 #[cfg(test)]
 mod tests {

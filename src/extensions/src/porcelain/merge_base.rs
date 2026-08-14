@@ -30,6 +30,19 @@ use std::process::ExitCode;
 use gix::hash::ObjectId;
 use gix::Repository;
 
+use super::{Arg, LongOpt};
+
+/// `cmd_merge_base()`'s `struct option options[]` (builtin/merge-base.c), in
+/// table order, as [`super::resolve_long`] reads it. The four mode flags are
+/// `OPT_CMDMODE`, which carries `PARSE_OPT_NONEG`, so only `--all` negates.
+const LONG_OPTS: &[LongOpt] = &[
+    LongOpt { name: "all", neg: true, arg: Arg::None },
+    LongOpt { name: "octopus", neg: false, arg: Arg::None },
+    LongOpt { name: "independent", neg: false, arg: Arg::None },
+    LongOpt { name: "is-ancestor", neg: false, arg: Arg::None },
+    LongOpt { name: "fork-point", neg: false, arg: Arg::None },
+];
+
 /// The operation mode selected by the (mutually exclusive) mode flags.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -48,17 +61,27 @@ enum Mode {
 /// `git merge-base` — see the module docs for the covered forms.
 pub fn merge_base(args: &[String]) -> Result<ExitCode> {
     let mut mode = Mode::Bases;
-    let mut mode_flag = "";
+    // The spelling `get_value()` would report for the mode flag already seen:
+    // `optnamearg()` renders the *resolved* long name, so an abbreviation is
+    // reported by the option it named.
+    let mut mode_flag = String::new();
     let mut show_all = false;
     let mut revs: Vec<&str> = Vec::new();
     let mut no_more_opts = false;
 
-    for a in args.iter() {
-        let a = a.as_str();
-        if no_more_opts || !a.starts_with('-') || a == "-" {
-            revs.push(a);
+    for arg in args.iter() {
+        let raw = arg.as_str();
+        if no_more_opts || !raw.starts_with('-') || raw == "-" {
+            revs.push(raw);
             continue;
         }
+        let resolved = match super::canonical_long(raw, LONG_OPTS) {
+            super::Long::Name(name) => name,
+            super::Long::Ambiguous(first, second) => {
+                return Ok(super::ambiguous_option(raw, &first, &second, USAGE))
+            }
+        };
+        let a = resolved.as_ref();
         let next_mode = match a {
             "--" => {
                 no_more_opts = true;
@@ -79,18 +102,41 @@ pub fn merge_base(args: &[String]) -> Result<ExitCode> {
             // parse_options_step() answers `-h` on stdout at 129, with no
             // `error:` line — a help request is not a rejection.
             "-h" => return Ok(super::show_usage(USAGE)),
+            // `PARSE_OPT_UNKNOWN` names a *switch* for a short argument
+            // (parse-options.c:889-898).
             _ => {
-                eprintln!("error: unknown option `{}'", a.trim_start_matches('-'));
+                let _ = match a.strip_prefix("--") {
+                    Some(body) => eprintln!("error: unknown option `{body}'"),
+                    None => {
+                        let c = a[1..].chars().next().unwrap_or_default();
+                        match c.is_ascii() {
+                            true => eprintln!("error: unknown switch `{c}'"),
+                            false => eprintln!(
+                                "error: unknown non-ascii option in string: `{a}'"
+                            ),
+                        }
+                    }
+                };
                 return Ok(usage());
             }
         };
-        // git's OPT_CMDMODE: a second, different mode flag is a usage error.
+        // git's `OPT_CMDMODE`: a second, different mode flag is refused by
+        // `get_value()` (parse-options.c:394-423), which names the option being
+        // parsed *first* and the one already recorded second, and then
+        // `return -1`.
+        //
+        // That -1 is `PARSE_OPT_ERROR` (`parse-options.h:62`: "must be the same
+        // as error()"), which `parse_options()` answers with a bare
+        // `exit(129)` — **no usage block**, unlike the `PARSE_OPT_UNKNOWN` arm
+        // three lines below it that does call `usage_with_options()`. Verified
+        // against stock 2.55.0: `merge-base --octopus --independent HEAD HEAD`
+        // writes 71 bytes to stderr, `merge-base -Z` writes 662.
         if mode != Mode::Bases && mode != next_mode {
-            eprintln!("error: options '{mode_flag}' and '{a}' cannot be used together");
-            return Ok(usage());
+            eprintln!("error: options '{a}' and '{mode_flag}' cannot be used together");
+            return Ok(ExitCode::from(129));
         }
         mode = next_mode;
-        mode_flag = a;
+        mode_flag = a.to_string();
     }
 
     let repo = gix::discover(".")?;

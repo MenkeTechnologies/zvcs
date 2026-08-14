@@ -174,6 +174,21 @@ fn usage_error(msg: &str) -> ExitCode {
     ExitCode::from(129)
 }
 
+/// The other parse-options failure shape: the `error:` line alone, exit 129, no
+/// usage block.
+///
+/// `get_arg()` and a rejecting option callback `return error(...)`, which is
+/// `PARSE_OPT_ERROR` (`parse-options.h:62`: "must be the same as error()"), and
+/// `parse_options()` answers that with a bare `exit(129)` — only the
+/// `PARSE_OPT_UNKNOWN` arm below it calls `usage_with_options()`. Verified
+/// against stock 2.55.0, stderr only: `ls-files --exclude` 41 bytes,
+/// `--format` 40, `--with-tree` 43, `--abbrev=x` 49,
+/// `--exclude-per-directory` 55, `-x` 35 — against 2117 for `--zzbogus`.
+fn option_error(msg: &str) -> ExitCode {
+    eprintln!("error: {msg}");
+    ExitCode::from(129)
+}
+
 /// git's `usage_msg_opt`, used for the incompatible-option combinations the
 /// command rejects after parsing: a `fatal:` line, a blank line, then the usage
 /// block, still at exit code 129.
@@ -401,7 +416,7 @@ pub fn ls_files(args: &[String]) -> Result<ExitCode> {
                     i += 1;
                 }
                 None => {
-                    return Ok(usage_error("option `exclude-per-directory' requires a value"));
+                    return Ok(option_error("option `exclude-per-directory' requires a value"));
                 }
             },
             _ if s.starts_with("--exclude-per-directory=") => {
@@ -417,7 +432,7 @@ pub fn ls_files(args: &[String]) -> Result<ExitCode> {
                     opts.exc_given = true;
                     i += 1;
                 }
-                None => return Ok(usage_error("option `exclude' requires a value")),
+                None => return Ok(option_error("option `exclude' requires a value")),
             },
             _ if s.starts_with("--exclude=") => {
                 opts.exclude.push(s["--exclude=".len()..].to_string());
@@ -429,7 +444,7 @@ pub fn ls_files(args: &[String]) -> Result<ExitCode> {
                     opts.exc_given = true;
                     i += 1;
                 }
-                None => return Ok(usage_error("option `exclude-from' requires a value")),
+                None => return Ok(option_error("option `exclude-from' requires a value")),
             },
             _ if s.starts_with("--exclude-from=") => {
                 opts.exclude_from.push(s["--exclude-from=".len()..].to_string());
@@ -440,7 +455,7 @@ pub fn ls_files(args: &[String]) -> Result<ExitCode> {
                     opts.format = Some(v.clone());
                     i += 1;
                 }
-                None => return Ok(usage_error("option `format' requires a value")),
+                None => return Ok(option_error("option `format' requires a value")),
             },
             _ if s.starts_with("--format=") => {
                 opts.format = Some(s["--format=".len()..].to_string());
@@ -450,7 +465,7 @@ pub fn ls_files(args: &[String]) -> Result<ExitCode> {
                     opts.with_tree = Some(v.clone());
                     i += 1;
                 }
-                None => return Ok(usage_error("option `with-tree' requires a value")),
+                None => return Ok(option_error("option `with-tree' requires a value")),
             },
             _ if s.starts_with("--with-tree=") => {
                 opts.with_tree = Some(s["--with-tree=".len()..].to_string());
@@ -459,7 +474,7 @@ pub fn ls_files(args: &[String]) -> Result<ExitCode> {
             _ if s.starts_with("--abbrev=") => {
                 let raw = &s["--abbrev=".len()..];
                 let Ok(n) = raw.parse::<usize>() else {
-                    return Ok(usage_error("option `abbrev' expects a numerical value"));
+                    return Ok(option_error("option `abbrev' expects a numerical value"));
                 };
                 // git maps `--abbrev=0` to "print the full object name".
                 opts.abbrev = if n == 0 {
@@ -507,7 +522,7 @@ pub fn ls_files(args: &[String]) -> Result<ExitCode> {
                                         v.clone()
                                     }
                                     None => {
-                                        return Ok(usage_error(&format!(
+                                        return Ok(option_error(&format!(
                                             "switch `{c}' requires a value"
                                         )));
                                     }

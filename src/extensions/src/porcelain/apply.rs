@@ -171,15 +171,49 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-/// The flag set this port honours, quoted verbatim in the unsupported-flag error.
-const PORTED: &str = "-p<n>, -R/--reverse, --check, --numstat, --stat, --summary, \
-                      -z, --apply, --allow-empty, --unidiff-zero, --no-add, \
-                      --index, --cached, -3/--3way, --ours, --theirs, --union, \
-                      --exclude, --include, -v/--verbose, --reject, --binary, \
-                      -q/--quiet, --whitespace=warn|nowarn, --recount, \
-                      --directory=<root>, --ignore-whitespace, \
-                      --ignore-space-change";
+use super::{Arg, LongOpt};
 
+/// `apply_parse_options()`'s `struct option builtin_apply_options[]` (apply.c:5202),
+/// in table order, as [`super::resolve_long`] reads it.
+///
+/// `no-add` is an entry spelled with its own `no-`, which parse-options reads as the
+/// *unset* sense of `add` — so `--add` and `--no-add` are the two senses of one
+/// entry, not two options. `--exclude`/`--include` and the three
+/// `--ours`/`--theirs`/`--union` conflict modes carry `PARSE_OPT_NONEG`.
+const LONG_OPTS: &[LongOpt] = &[
+    LongOpt { name: "exclude",                     neg: false, arg: Arg::Required },
+    LongOpt { name: "include",                     neg: false, arg: Arg::Required },
+    LongOpt { name: "no-add",                      neg: true,  arg: Arg::None },
+    LongOpt { name: "stat",                        neg: true,  arg: Arg::None },
+    LongOpt { name: "allow-binary-replacement",    neg: true,  arg: Arg::None },
+    LongOpt { name: "binary",                      neg: true,  arg: Arg::None },
+    LongOpt { name: "numstat",                     neg: true,  arg: Arg::None },
+    LongOpt { name: "summary",                     neg: true,  arg: Arg::None },
+    LongOpt { name: "check",                       neg: true,  arg: Arg::None },
+    LongOpt { name: "index",                       neg: true,  arg: Arg::None },
+    LongOpt { name: "intent-to-add",               neg: true,  arg: Arg::None },
+    LongOpt { name: "cached",                      neg: true,  arg: Arg::None },
+    LongOpt { name: "unsafe-paths",                neg: true,  arg: Arg::None },
+    LongOpt { name: "apply",                       neg: true,  arg: Arg::None },
+    LongOpt { name: "3way",                        neg: true,  arg: Arg::None },
+    LongOpt { name: "ours",                        neg: false, arg: Arg::None },
+    LongOpt { name: "theirs",                      neg: false, arg: Arg::None },
+    LongOpt { name: "union",                       neg: false, arg: Arg::None },
+    LongOpt { name: "build-fake-ancestor",         neg: true,  arg: Arg::Required },
+    LongOpt { name: "whitespace",                  neg: true,  arg: Arg::Required },
+    LongOpt { name: "ignore-space-change",         neg: true,  arg: Arg::None },
+    LongOpt { name: "ignore-whitespace",           neg: true,  arg: Arg::None },
+    LongOpt { name: "reverse",                     neg: true,  arg: Arg::None },
+    LongOpt { name: "unidiff-zero",                neg: true,  arg: Arg::None },
+    LongOpt { name: "reject",                      neg: true,  arg: Arg::None },
+    LongOpt { name: "allow-overlap",               neg: true,  arg: Arg::None },
+    LongOpt { name: "verbose",                     neg: true,  arg: Arg::None },
+    LongOpt { name: "quiet",                       neg: true,  arg: Arg::None },
+    LongOpt { name: "inaccurate-eof",              neg: true,  arg: Arg::None },
+    LongOpt { name: "recount",                     neg: true,  arg: Arg::None },
+    LongOpt { name: "directory",                   neg: true,  arg: Arg::Required },
+    LongOpt { name: "allow-empty",                 neg: true,  arg: Arg::None },
+];
 /// git's `apply` usage block, printed after `unknown option`/`unknown switch` on
 /// stderr with exit 129 (`parse-options`' `PARSE_OPT_ERROR`).
 const USAGE: &str = r"usage: git apply [<options>] [<patch>...]
@@ -414,17 +448,27 @@ fn parse_opts(
     let mut i = 0;
 
     while i < args.len() {
-        let a = args[i].clone();
+        let typed = args[i].clone();
         i += 1;
 
-        if no_more_opts || a == "-" || !a.starts_with('-') {
-            sources.push(a);
+        if no_more_opts || typed == "-" || !typed.starts_with('-') {
+            sources.push(typed);
             continue;
         }
-        if a == "--" {
+        if typed == "--" {
             no_more_opts = true;
             continue;
         }
+
+        // Respell a unique abbreviation as the name it resolves to, so `--unidiff`
+        // reaches the same arm as `--unidiff-zero` — including the arms that record
+        // an option as unhonoured. Short bundles pass through untouched.
+        let a = match super::canonical_long(&typed, LONG_OPTS) {
+            super::Long::Name(name) => name.into_owned(),
+            super::Long::Ambiguous(first, second) => {
+                return Err(super::ambiguous_option(&typed, &first, &second, USAGE))
+            }
+        };
 
         if let Some(long) = a.strip_prefix("--") {
             let (given, inline) = match long.split_once('=') {
@@ -804,7 +848,7 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
     // Past here a flag we cannot honour would change the result, so report it.
     if let Some(u) = unhonoured.first() {
         let (flag, why) = (&u.spelling, u.why);
-        bail!("unsupported flag {flag:?}: {why} (ported: {PORTED})");
+        bail!("unsupported flag {flag:?}: {why}");
     }
 
     if let Some(root) = &o.directory {
@@ -848,7 +892,7 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
         if matches!(o.ws, WsAction::Fix) && !ws_fix_supported(rule) {
             bail!(
                 "unsupported flag \"--whitespace=fix\": {R_WS} for a non-default \
-                 core.whitespace (ported: {PORTED})"
+                 core.whitespace"
             );
         }
         let errors = report_whitespace(&patches, &spans, rule, &o.ws, o.quiet);
@@ -914,7 +958,7 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
     // stage the index. Rather than silently leave the index un-updated, refuse the
     // combination (git supports it; this port floors it honestly).
     if o.reject && check_index {
-        bail!("--reject with --index/--cached is not implemented (ported: {PORTED})");
+        bail!("--reject with --index/--cached is not implemented");
     }
 
     // --reject takes a wholly separate path: it applies each file's hunks
@@ -2106,7 +2150,7 @@ fn parse_one(
             p.is_rename = true;
             p.new_name = strip_path(&unquote(rest)?, strip.saturating_sub(1))?;
         } else if l.starts_with("copy from ") || l.starts_with("copy to ") {
-            anyhow::bail!("copy patches are not implemented (ported: {PORTED})");
+            anyhow::bail!("copy patches are not implemented");
         } else if let Some(rest) = l.strip_prefix("similarity index ") {
             // Drives the `(N%)` in the summary's rename line.
             p.score = rest.trim().trim_end_matches('%').parse().unwrap_or(0);
@@ -3008,7 +3052,7 @@ fn reject_apply(patches: &[Patch], o: &Opts) -> Result<ExitCode> {
 
     for p in patches {
         if p.binary {
-            bail!("binary patch application is not implemented (ported: {PORTED})");
+            bail!("binary patch application is not implemented");
         }
         let name = p.new_name.as_deref().or(p.old_name.as_deref()).unwrap_or("");
         let label = p.old_name.as_deref().or(p.new_name.as_deref()).unwrap_or("");

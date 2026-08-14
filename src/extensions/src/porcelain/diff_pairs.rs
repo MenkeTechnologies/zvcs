@@ -177,7 +177,7 @@ use gix::objs::tree::EntryKind;
 use gix::prelude::ObjectIdExt;
 use regex::bytes::Regex;
 
-use super::diff_color;
+use super::{diff_color, Arg, LongOpt};
 use super::diff_files;
 use super::diffcore_rename;
 
@@ -341,111 +341,96 @@ enum Whitespace {
     IgnoreCrAtEol,
 }
 
-/// Every long option `git diff-pairs` accepts — its own `-z` plus everything
-/// `add_diff_options()` contributes. `parse_options()` resolves an argument against
-/// this table before anything else happens, so a name missing from it is
-/// `error: unknown option` and 129, not a gap in this port. Transcribed from
-/// `git diff-pairs -h` (git 2.55.0), including the negations `parse_options()`
-/// generates but the usage table leaves implicit.
-const KNOWN_LONG: &[&str] = &[
-    "--abbrev",
-    "--anchored",
-    "--binary",
-    "--break-rewrites",
-    "--check",
-    "--color",
-    "--color-moved",
-    "--color-moved-ws",
-    "--color-words",
-    "--compact-summary",
-    "--cumulative",
-    "--default-prefix",
-    "--diff-algorithm",
-    "--diff-filter",
-    "--dirstat",
-    "--dirstat-by-file",
-    "--dst-prefix",
-    "--exit-code",
-    "--ext-diff",
-    "--find-copies",
-    "--find-copies-harder",
-    "--find-object",
-    "--find-renames",
-    "--follow",
-    "--full-index",
-    "--function-context",
-    "--histogram",
-    "--ignore-all-space",
-    "--ignore-blank-lines",
-    "--ignore-cr-at-eol",
-    "--ignore-matching-lines",
-    "--ignore-space-at-eol",
-    "--ignore-space-change",
-    "--ignore-submodules",
-    "--indent-heuristic",
-    "--inter-hunk-context",
-    "--irreversible-delete",
-    "--ita-invisible-in-index",
-    "--ita-visible-in-index",
-    "--line-prefix",
-    "--max-depth",
-    "--minimal",
-    "--name-only",
-    "--name-status",
-    "--no-abbrev",
-    "--no-color",
-    "--no-color-moved",
-    "--no-color-moved-ws",
-    "--no-compact-summary",
-    "--no-exit-code",
-    "--no-ext-diff",
-    "--no-find-copies",
-    "--no-find-copies-harder",
-    "--no-follow",
-    "--no-full-index",
-    "--no-function-context",
-    "--no-ignore-matching-lines",
-    "--no-indent-heuristic",
-    "--no-patch",
-    "--no-prefix",
-    "--no-quiet",
-    "--no-relative",
-    "--no-rename-empty",
-    "--no-renames",
-    "--no-text",
-    "--no-textconv",
-    "--numstat",
-    "--output",
-    "--output-indicator-context",
-    "--output-indicator-new",
-    "--output-indicator-old",
-    "--patch",
-    "--patch-with-raw",
-    "--patch-with-stat",
-    "--patience",
-    "--pickaxe-all",
-    "--pickaxe-regex",
-    "--quiet",
-    "--raw",
-    "--relative",
-    "--rename-empty",
-    "--rotate-to",
-    "--shortstat",
-    "--skip-to",
-    "--src-prefix",
-    "--stat",
-    "--stat-count",
-    "--stat-graph-width",
-    "--stat-name-width",
-    "--stat-width",
-    "--submodule",
-    "--summary",
-    "--text",
-    "--textconv",
-    "--unified",
-    "--word-diff",
-    "--word-diff-regex",
-    "--ws-error-highlight",
+/// Every long option `git diff-pairs` accepts, in `struct option` order. Its own
+/// table is `OPT_END()` alone (builtin/diff-pairs.c:45), so the whole table is what
+/// `add_diff_options()` appends (diff.c:6041).
+///
+/// `parse_options()` resolves an argument against this table before anything else
+/// happens, so a name no entry claims is `error: unknown option` and 129, not a gap
+/// in this port. Order is load-bearing: it decides which two spellings an
+/// `ambiguous option:` sentence names, and `--no-patch` / `--no-prefix` /
+/// `--no-renames` are entries spelled with their own `no-`, which parse-options
+/// reads as the *unset* sense of the stem.
+const LONG_OPTS: &[LongOpt] = &[
+    LongOpt { name: "patch",                       neg: false, arg: Arg::None },
+    LongOpt { name: "no-patch",                    neg: true,  arg: Arg::None },
+    LongOpt { name: "unified",                     neg: false, arg: Arg::Optional },
+    LongOpt { name: "function-context",            neg: true,  arg: Arg::None },
+    LongOpt { name: "raw",                         neg: false, arg: Arg::None },
+    LongOpt { name: "patch-with-raw",              neg: false, arg: Arg::None },
+    LongOpt { name: "patch-with-stat",             neg: false, arg: Arg::None },
+    LongOpt { name: "numstat",                     neg: false, arg: Arg::None },
+    LongOpt { name: "shortstat",                   neg: false, arg: Arg::None },
+    LongOpt { name: "dirstat",                     neg: false, arg: Arg::Optional },
+    LongOpt { name: "cumulative",                  neg: false, arg: Arg::None },
+    LongOpt { name: "dirstat-by-file",             neg: false, arg: Arg::Optional },
+    LongOpt { name: "check",                       neg: false, arg: Arg::None },
+    LongOpt { name: "summary",                     neg: false, arg: Arg::None },
+    LongOpt { name: "name-only",                   neg: false, arg: Arg::None },
+    LongOpt { name: "name-status",                 neg: false, arg: Arg::None },
+    LongOpt { name: "stat",                        neg: false, arg: Arg::Optional },
+    LongOpt { name: "stat-width",                  neg: false, arg: Arg::Required },
+    LongOpt { name: "stat-name-width",             neg: false, arg: Arg::Required },
+    LongOpt { name: "stat-graph-width",            neg: false, arg: Arg::Required },
+    LongOpt { name: "stat-count",                  neg: false, arg: Arg::Required },
+    LongOpt { name: "compact-summary",             neg: true,  arg: Arg::None },
+    LongOpt { name: "binary",                      neg: false, arg: Arg::None },
+    LongOpt { name: "full-index",                  neg: true,  arg: Arg::None },
+    LongOpt { name: "color",                       neg: true,  arg: Arg::Optional },
+    LongOpt { name: "ws-error-highlight",          neg: false, arg: Arg::Required },
+    LongOpt { name: "abbrev",                      neg: true,  arg: Arg::Optional },
+    LongOpt { name: "src-prefix",                  neg: false, arg: Arg::Required },
+    LongOpt { name: "dst-prefix",                  neg: false, arg: Arg::Required },
+    LongOpt { name: "line-prefix",                 neg: false, arg: Arg::Required },
+    LongOpt { name: "no-prefix",                   neg: false, arg: Arg::None },
+    LongOpt { name: "default-prefix",              neg: false, arg: Arg::None },
+    LongOpt { name: "inter-hunk-context",          neg: false, arg: Arg::Required },
+    LongOpt { name: "output-indicator-new",        neg: false, arg: Arg::Required },
+    LongOpt { name: "output-indicator-old",        neg: false, arg: Arg::Required },
+    LongOpt { name: "output-indicator-context",    neg: false, arg: Arg::Required },
+    LongOpt { name: "break-rewrites",              neg: false, arg: Arg::Optional },
+    LongOpt { name: "find-renames",                neg: false, arg: Arg::Optional },
+    LongOpt { name: "irreversible-delete",         neg: false, arg: Arg::None },
+    LongOpt { name: "find-copies",                 neg: false, arg: Arg::Optional },
+    LongOpt { name: "find-copies-harder",          neg: true,  arg: Arg::None },
+    LongOpt { name: "no-renames",                  neg: false, arg: Arg::None },
+    LongOpt { name: "rename-empty",                neg: true,  arg: Arg::None },
+    LongOpt { name: "follow",                      neg: true,  arg: Arg::None },
+    LongOpt { name: "minimal",                     neg: false, arg: Arg::None },
+    LongOpt { name: "ignore-all-space",            neg: false, arg: Arg::None },
+    LongOpt { name: "ignore-space-change",         neg: false, arg: Arg::None },
+    LongOpt { name: "ignore-space-at-eol",         neg: false, arg: Arg::None },
+    LongOpt { name: "ignore-cr-at-eol",            neg: false, arg: Arg::None },
+    LongOpt { name: "ignore-blank-lines",          neg: false, arg: Arg::None },
+    LongOpt { name: "ignore-matching-lines",       neg: true,  arg: Arg::Required },
+    LongOpt { name: "indent-heuristic",            neg: true,  arg: Arg::None },
+    LongOpt { name: "patience",                    neg: false, arg: Arg::None },
+    LongOpt { name: "histogram",                   neg: false, arg: Arg::None },
+    LongOpt { name: "diff-algorithm",              neg: false, arg: Arg::Required },
+    LongOpt { name: "anchored",                    neg: false, arg: Arg::Required },
+    LongOpt { name: "word-diff",                   neg: false, arg: Arg::Optional },
+    LongOpt { name: "word-diff-regex",             neg: false, arg: Arg::Required },
+    LongOpt { name: "color-words",                 neg: false, arg: Arg::Optional },
+    LongOpt { name: "color-moved",                 neg: true,  arg: Arg::Optional },
+    LongOpt { name: "color-moved-ws",              neg: true,  arg: Arg::Required },
+    LongOpt { name: "relative",                    neg: true,  arg: Arg::Optional },
+    LongOpt { name: "text",                        neg: true,  arg: Arg::None },
+    LongOpt { name: "exit-code",                   neg: true,  arg: Arg::None },
+    LongOpt { name: "quiet",                       neg: true,  arg: Arg::None },
+    LongOpt { name: "ext-diff",                    neg: true,  arg: Arg::None },
+    LongOpt { name: "textconv",                    neg: true,  arg: Arg::None },
+    LongOpt { name: "ignore-submodules",           neg: false, arg: Arg::Optional },
+    LongOpt { name: "submodule",                   neg: false, arg: Arg::Optional },
+    LongOpt { name: "ita-invisible-in-index",      neg: false, arg: Arg::None },
+    LongOpt { name: "ita-visible-in-index",        neg: false, arg: Arg::None },
+    LongOpt { name: "pickaxe-all",                 neg: false, arg: Arg::None },
+    LongOpt { name: "pickaxe-regex",               neg: false, arg: Arg::None },
+    LongOpt { name: "rotate-to",                   neg: false, arg: Arg::Required },
+    LongOpt { name: "skip-to",                     neg: false, arg: Arg::Required },
+    LongOpt { name: "find-object",                 neg: false, arg: Arg::Required },
+    LongOpt { name: "diff-filter",                 neg: false, arg: Arg::Required },
+    LongOpt { name: "max-depth",                   neg: false, arg: Arg::Required },
+    LongOpt { name: "output",                      neg: false, arg: Arg::Required },
 ];
 
 /// Every short option the same table accepts.
@@ -456,12 +441,16 @@ const KNOWN_SHORT: &[u8] = b"abhlpsuwzBCDGIMORSUWX";
 /// A long option is looked up without its `=<value>`; a short option carries its value
 /// attached, so only the letter is looked up.
 fn is_known_option(arg: &str) -> bool {
-    match arg.starts_with("--") {
-        true => {
-            let name = arg.split_once('=').map_or(arg, |(n, _)| n);
-            KNOWN_LONG.contains(&name)
-        }
-        false => arg.as_bytes().get(1).is_some_and(|c| KNOWN_SHORT.contains(c)),
+    match arg.strip_prefix("--") {
+        // The caller has already run the name through [`super::canonical_long`], so an
+        // abbreviation arrives spelled out; the lookup still goes through the resolver
+        // rather than a second list, to keep one table as the only statement of what
+        // the command accepts.
+        Some(body) => matches!(
+            super::resolve_long(LONG_OPTS, body),
+            super::Resolved::One(..)
+        ),
+        None => arg.as_bytes().get(1).is_some_and(|c| KNOWN_SHORT.contains(c)),
     }
 }
 
@@ -984,7 +973,26 @@ pub(crate) fn render_raw_stream(
 
     let mut i = 0usize;
     while i < args.len() {
-        let s = args[i].as_str();
+        // Respell a unique abbreviation as the name it resolves to, ahead of every
+        // arm below — including the two value-taking pre-match handlers, so
+        // `--color-moved-w <mode>` consumes its separate value the way its full
+        // spelling does. Short options and unknown names pass through untouched, so
+        // the refusals below still quote what was typed.
+        let canonical;
+        let s = match super::canonical_long(args[i].as_str(), LONG_OPTS) {
+            super::Long::Name(name) => {
+                canonical = name;
+                canonical.as_ref()
+            }
+            super::Long::Ambiguous(first, second) => {
+                return Ok(super::ambiguous_option(
+                    &args[i],
+                    &first,
+                    &second,
+                    &format!("{USAGE_LINE}{DIFF_OPTIONS}"),
+                ))
+            }
+        };
         // Fetch the value of a `--opt=v` / `--opt v` / `-Xv` / `-X v` option, advancing
         // the cursor past a separate value argument.
         macro_rules! want_value {
@@ -1518,23 +1526,11 @@ pub(crate) fn render_raw_stream(
             // A name `parse_options()` has never heard of is rejected there, before any
             // of this command's own work begins — it is git's error, not a gap here.
             _ if !is_known_option(&s) => return Ok(unknown_option(&s)),
-            _ => bail!(
-                "unsupported flag {s:?} (ported: -z, -p/-u/--patch, -s/--no-patch, --raw, \
-                 --name-only, --name-status, --numstat, --stat[=<w>], --shortstat, --summary, \
-                 --compact-summary, --patch-with-raw, --patch-with-stat, -U<n>/--unified[=<n>], \
-                 --full-index, --no-prefix, --default-prefix, --src-prefix=, --dst-prefix=, \
-                 -R, --diff-filter=<f>, -w/-b/--ignore-space-at-eol/--ignore-cr-at-eol, \
-                 -I<re>, -S<s>/-G<re>/--find-object=<id>/--pickaxe-regex/--pickaxe-all, \
-                 --relative[=<p>]/--no-relative, --rotate-to=<p>/--skip-to=<p>, \
-                 --line-prefix=<s>, --output=<file>, -D/--irreversible-delete, -O<file>, \
-                 -W/--function-context, --inter-hunk-context=<n>, --ignore-blank-lines, \
-                 --no-renames, --indent-heuristic/--no-indent-heuristic, \
-                 --output-indicator-new/-old/-context=<char>, \
-                 -a/--text, --minimal/--histogram/--diff-algorithm=<myers|minimal|histogram>, \
-                 --textconv/--no-textconv, --ext-diff/--no-ext-diff, \
-                 --ignore-submodules[=<when>], --submodule[=short|log], \
-                 --exit-code, --quiet, --abbrev[=<n>], -h)"
-            ),
+            // A flag stock git accepts and this port has not implemented. The
+            // message carries no inventory of what *is* ported: that list is an
+            // implementation detail of this module, it goes stale the moment a flag
+            // lands, and stock git never prints anything like it.
+            _ => bail!("unsupported flag {s:?}"),
         }
         i += 1;
     }

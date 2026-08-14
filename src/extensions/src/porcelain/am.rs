@@ -119,6 +119,49 @@ use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 
+use super::{Arg, LongOpt};
+
+/// `cmd_am()`'s `struct option options[]` (builtin/am.c), in table order, as
+/// [`super::resolve_long`] reads it.
+const LONG_OPTS: &[LongOpt] = &[
+    LongOpt { name: "interactive",                 neg: true,  arg: Arg::None },
+    LongOpt { name: "no-verify",                   neg: true,  arg: Arg::None },
+    LongOpt { name: "binary",                      neg: true,  arg: Arg::None },
+    LongOpt { name: "3way",                        neg: true,  arg: Arg::None },
+    LongOpt { name: "quiet",                       neg: true,  arg: Arg::None },
+    LongOpt { name: "signoff",                     neg: true,  arg: Arg::None },
+    LongOpt { name: "utf8",                        neg: true,  arg: Arg::None },
+    LongOpt { name: "keep",                        neg: true,  arg: Arg::None },
+    LongOpt { name: "keep-non-patch",              neg: true,  arg: Arg::None },
+    LongOpt { name: "message-id",                  neg: true,  arg: Arg::None },
+    LongOpt { name: "keep-cr",                     neg: true,  arg: Arg::None },
+    LongOpt { name: "scissors",                    neg: true,  arg: Arg::None },
+    LongOpt { name: "quoted-cr",                   neg: false, arg: Arg::Required },
+    LongOpt { name: "whitespace",                  neg: true,  arg: Arg::Required },
+    LongOpt { name: "ignore-space-change",         neg: true,  arg: Arg::None },
+    LongOpt { name: "ignore-whitespace",           neg: true,  arg: Arg::None },
+    LongOpt { name: "directory",                   neg: true,  arg: Arg::Required },
+    LongOpt { name: "exclude",                     neg: true,  arg: Arg::Required },
+    LongOpt { name: "include",                     neg: true,  arg: Arg::Required },
+    LongOpt { name: "patch-format",                neg: true,  arg: Arg::Required },
+    LongOpt { name: "reject",                      neg: true,  arg: Arg::None },
+    LongOpt { name: "resolvemsg",                  neg: true,  arg: Arg::Required },
+    LongOpt { name: "continue",                    neg: false, arg: Arg::None },
+    LongOpt { name: "resolved",                    neg: false, arg: Arg::None },
+    LongOpt { name: "skip",                        neg: false, arg: Arg::None },
+    LongOpt { name: "abort",                       neg: false, arg: Arg::None },
+    LongOpt { name: "quit",                        neg: false, arg: Arg::None },
+    LongOpt { name: "show-current-patch",          neg: false, arg: Arg::Optional },
+    LongOpt { name: "retry",                       neg: false, arg: Arg::None },
+    LongOpt { name: "allow-empty",                 neg: false, arg: Arg::None },
+    LongOpt { name: "committer-date-is-author-date", neg: true,  arg: Arg::None },
+    LongOpt { name: "ignore-date",                 neg: true,  arg: Arg::None },
+    LongOpt { name: "rerere-autoupdate",           neg: true,  arg: Arg::None },
+    LongOpt { name: "gpg-sign",                    neg: true,  arg: Arg::Optional },
+    LongOpt { name: "empty",                       neg: false, arg: Arg::Required },
+    LongOpt { name: "rebasing",                    neg: true,  arg: Arg::None },
+];
+
 /// `usage_with_options()` over `builtin/am.c`'s option table, verbatim.
 const USAGE: &str = r"usage: git am [<options>] [(<mbox> | <Maildir>)...]
    or: git am [<options>] (--continue | --skip | --abort)
@@ -284,6 +327,11 @@ enum Usage {
     Help,
     /// A rejection: the `error:` line parse-options prints, exit 129.
     Error(String),
+    /// An abbreviation two entries claim: the token as typed and the two candidate
+    /// spellings. Unlike [`Usage::Error`] this one also prints the option block —
+    /// `parse_long_opt()` returns `PARSE_OPT_HELP` after its `error()`, which
+    /// routes to `usage_with_options_internal(..., USAGE_TO_STDOUT)`.
+    Ambiguous(String, String, String),
 }
 
 /// The `am.*` config values `git_am_config` reads before option parsing. Only
@@ -348,6 +396,9 @@ pub fn am(args: &[String]) -> Result<ExitCode> {
         Err(Usage::Error(msg)) => {
             eprintln!("{msg}");
             return Ok(ExitCode::from(129));
+        }
+        Err(Usage::Ambiguous(tok, first, second)) => {
+            return Ok(super::ambiguous_option(&tok, &first, &second, USAGE))
         }
     };
 
@@ -464,6 +515,18 @@ fn parse(args: &[String], defaults: &AmDefaults) -> Result<Opts, Usage> {
             end_of_opts = true;
             continue;
         }
+
+        // Respell a unique abbreviation as the name it resolves to, so `--interact`
+        // reaches the same arm as `--interactive`. `tok` itself is still what the
+        // rejections below quote, since the resolver hands an unclaimed name back
+        // untouched.
+        let canonical = match super::canonical_long(tok, LONG_OPTS) {
+            super::Long::Name(name) => name,
+            super::Long::Ambiguous(first, second) => {
+                return Err(Usage::Ambiguous(tok.to_string(), first, second))
+            }
+        };
+        let tok = canonical.as_ref();
 
         if let Some(long) = tok.strip_prefix("--") {
             let (name, attached) = match long.find('=') {

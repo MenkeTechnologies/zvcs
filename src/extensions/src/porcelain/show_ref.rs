@@ -16,6 +16,8 @@ use gix::bstr::BStr;
 use gix::hash::ObjectId;
 use gix::prelude::ObjectIdExt;
 
+use super::{Arg, LongOpt};
+
 /// How object ids are rendered.
 #[derive(Clone, Copy)]
 enum Abbrev {
@@ -26,6 +28,25 @@ enum Abbrev {
     /// An explicit `--abbrev=<n>` / `--hash=<n>` length (already clamped to >= 4).
     Len(usize),
 }
+
+/// `cmd_show_ref()`'s `struct option show_ref_options[]` (builtin/show-ref.c:309),
+/// in table order, as [`super::resolve_long`] reads it. `--heads` is
+/// `PARSE_OPT_HIDDEN` — absent from the `-h` block but resolved like any other
+/// entry, which is what makes `--hea` *ambiguous* rather than unknown.
+/// `--exclude-existing` is the only `PARSE_OPT_NONEG` entry.
+const LONG_OPTS: &[LongOpt] = &[
+    LongOpt { name: "tags", neg: true, arg: Arg::None },
+    LongOpt { name: "branches", neg: true, arg: Arg::None },
+    LongOpt { name: "heads", neg: true, arg: Arg::None },
+    LongOpt { name: "exists", neg: true, arg: Arg::None },
+    LongOpt { name: "verify", neg: true, arg: Arg::None },
+    LongOpt { name: "head", neg: true, arg: Arg::None },
+    LongOpt { name: "dereference", neg: true, arg: Arg::None },
+    LongOpt { name: "hash", neg: true, arg: Arg::Optional },
+    LongOpt { name: "abbrev", neg: true, arg: Arg::Optional },
+    LongOpt { name: "quiet", neg: true, arg: Arg::None },
+    LongOpt { name: "exclude-existing", neg: false, arg: Arg::Optional },
+];
 
 /// Parsed command line for a single `show-ref` invocation.
 struct Opts {
@@ -83,6 +104,13 @@ pub fn show_ref(args: &[String]) -> Result<ExitCode> {
             no_more_opts = true;
             continue;
         }
+        let resolved = match super::canonical_long(a, LONG_OPTS) {
+            super::Long::Name(name) => name,
+            super::Long::Ambiguous(first, second) => {
+                return Ok(super::ambiguous_option(a, &first, &second, USAGE))
+            }
+        };
+        let a = resolved.as_ref();
         if let Some(long) = a.strip_prefix("--") {
             match long {
                 // `if (internal_help && !strcmp(arg + 2, "help-all"))`
@@ -92,14 +120,27 @@ pub fn show_ref(args: &[String]) -> Result<ExitCode> {
                 // because it shares that entry point with `-h`.
                 "help-all" => return Ok(super::show_usage(USAGE_ALL)),
                 "head" => opts.head = true,
+                "no-head" => opts.head = false,
                 "dereference" => opts.deref = true,
-                "hash" => opts.hash_only = true,
+                "no-dereference" => opts.deref = false,
+                // `hash_callback()` sets `hash_only = 1` before it ever looks at
+                // `arg`, and returns early when there is none — so `--no-hash`
+                // turns hashes *on*, exactly like a bare `--hash`.
+                "hash" | "no-hash" => opts.hash_only = true,
                 "quiet" => opts.quiet = true,
+                "no-quiet" => opts.quiet = false,
                 "tags" => opts.tags = true,
+                "no-tags" => opts.tags = false,
                 "branches" | "heads" => opts.branches = true,
+                "no-branches" | "no-heads" => opts.branches = false,
                 "verify" => verify = true,
+                "no-verify" => verify = false,
                 "exists" => exists = true,
+                "no-exists" => exists = false,
                 "abbrev" => opts.abbrev = Abbrev::Auto,
+                // `parse_opt_abbrev_cb()` with no argument stores `unset ? 0 :
+                // DEFAULT_ABBREV`, and 0 is the full hex id.
+                "no-abbrev" => opts.abbrev = Abbrev::Full,
                 _ if long.starts_with("hash=") => {
                     opts.hash_only = true;
                     match parse_abbrev(&long["hash=".len()..]) {

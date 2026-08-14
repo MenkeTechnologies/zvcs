@@ -5,6 +5,24 @@ use gix::hash::ObjectId;
 use gix::object::tree::{EntryKind, EntryMode};
 use gix::prelude::ObjectIdExt;
 
+use super::{Arg, LongOpt};
+
+/// `cmd_ls_tree()`'s `struct option ls_tree_options[]` (builtin/ls-tree.c), in
+/// table order, as [`super::resolve_long`] reads it. The four output selectors
+/// are `OPT_CMDMODE` and `--format` is `OPT_STRING_F(… PARSE_OPT_NONEG)`, so
+/// only `--full-name`, `--full-tree` and `--abbrev` negate. `-d`, `-r`, `-t`
+/// and `-z` are short-only and so have no entry.
+const LONG_OPTS: &[LongOpt] = &[
+    LongOpt { name: "long", neg: false, arg: Arg::None },
+    LongOpt { name: "name-only", neg: false, arg: Arg::None },
+    LongOpt { name: "name-status", neg: false, arg: Arg::None },
+    LongOpt { name: "object-only", neg: false, arg: Arg::None },
+    LongOpt { name: "full-name", neg: true, arg: Arg::None },
+    LongOpt { name: "full-tree", neg: true, arg: Arg::None },
+    LongOpt { name: "format", neg: false, arg: Arg::Required },
+    LongOpt { name: "abbrev", neg: true, arg: Arg::Optional },
+];
+
 /// The exact usage block stock `git ls-tree` prints (parse-options generated).
 ///
 /// Emitted verbatim on `-h`, on an unknown option, and when `<tree-ish>` is
@@ -145,6 +163,13 @@ pub fn ls_tree(args: &[String]) -> Result<ExitCode> {
             continue;
         }
         if !no_more_opts && a.len() > 1 && a.starts_with('-') {
+            let resolved = match super::canonical_long(a, LONG_OPTS) {
+                super::Long::Name(name) => name,
+                super::Long::Ambiguous(first, second) => {
+                    return Ok(super::ambiguous_option(a, &first, &second, USAGE))
+                }
+            };
+            let a = resolved.as_ref();
             if let Some(long_opt) = a.strip_prefix("--") {
                 // `--<name>=<value>` splits here; a bare `--<name>` has no value.
                 let (name, inline) = match long_opt.split_once('=') {

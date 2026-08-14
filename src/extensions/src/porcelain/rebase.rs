@@ -170,6 +170,60 @@ use gix::index::entry::{Mode, Stat};
 use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
 use gix::refs::{FullName, Target};
 
+use super::{Arg, LongOpt};
+
+/// `cmd_rebase()`'s `struct option builtin_rebase_options[]` (builtin/rebase.c),
+/// in table order, as [`super::resolve_long`] reads it.
+///
+/// `no-verify`, `no-stat` and `no-ff` are entries spelled with their own `no-`,
+/// which parse-options reads as the *unset* sense of `verify` / `stat` / `ff`; the
+/// `OPT_CMDMODE` entries (`--continue`, `--skip`, `--abort`, `--quit`,
+/// `--edit-todo`, `--show-current-patch`, `--apply`, `--merge`, `--interactive`)
+/// and `--empty` carry `PARSE_OPT_NONEG`, so none of those has a `--no-` spelling.
+const LONG_OPTS: &[LongOpt] = &[
+    LongOpt { name: "onto",                        neg: true,  arg: Arg::Required },
+    LongOpt { name: "keep-base",                   neg: true,  arg: Arg::None },
+    LongOpt { name: "no-verify",                   neg: true,  arg: Arg::None },
+    LongOpt { name: "quiet",                       neg: true,  arg: Arg::None },
+    LongOpt { name: "verbose",                     neg: true,  arg: Arg::None },
+    LongOpt { name: "no-stat",                     neg: true,  arg: Arg::None },
+    LongOpt { name: "trailer",                     neg: true,  arg: Arg::Required },
+    LongOpt { name: "signoff",                     neg: true,  arg: Arg::None },
+    LongOpt { name: "committer-date-is-author-date", neg: true,  arg: Arg::None },
+    LongOpt { name: "reset-author-date",           neg: true,  arg: Arg::None },
+    LongOpt { name: "ignore-date",                 neg: true,  arg: Arg::None },
+    LongOpt { name: "ignore-whitespace",           neg: true,  arg: Arg::None },
+    LongOpt { name: "whitespace",                  neg: true,  arg: Arg::Required },
+    LongOpt { name: "force-rebase",                neg: true,  arg: Arg::None },
+    LongOpt { name: "no-ff",                       neg: true,  arg: Arg::None },
+    LongOpt { name: "continue",                    neg: false, arg: Arg::None },
+    LongOpt { name: "skip",                        neg: false, arg: Arg::None },
+    LongOpt { name: "abort",                       neg: false, arg: Arg::None },
+    LongOpt { name: "quit",                        neg: false, arg: Arg::None },
+    LongOpt { name: "edit-todo",                   neg: false, arg: Arg::None },
+    LongOpt { name: "show-current-patch",          neg: false, arg: Arg::None },
+    LongOpt { name: "apply",                       neg: false, arg: Arg::None },
+    LongOpt { name: "merge",                       neg: false, arg: Arg::None },
+    LongOpt { name: "interactive",                 neg: false, arg: Arg::None },
+    LongOpt { name: "preserve-merges",             neg: true,  arg: Arg::None },
+    LongOpt { name: "rerere-autoupdate",           neg: true,  arg: Arg::None },
+    LongOpt { name: "empty",                       neg: false, arg: Arg::Required },
+    LongOpt { name: "keep-empty",                  neg: true,  arg: Arg::None },
+    LongOpt { name: "autosquash",                  neg: true,  arg: Arg::None },
+    LongOpt { name: "update-refs",                 neg: true,  arg: Arg::None },
+    LongOpt { name: "gpg-sign",                    neg: true,  arg: Arg::Optional },
+    LongOpt { name: "autostash",                   neg: true,  arg: Arg::None },
+    LongOpt { name: "exec",                        neg: true,  arg: Arg::Required },
+    LongOpt { name: "allow-empty-message",         neg: true,  arg: Arg::None },
+    LongOpt { name: "rebase-merges",               neg: true,  arg: Arg::Optional },
+    LongOpt { name: "fork-point",                  neg: true,  arg: Arg::None },
+    LongOpt { name: "strategy",                    neg: true,  arg: Arg::Required },
+    LongOpt { name: "strategy-option",             neg: true,  arg: Arg::Required },
+    LongOpt { name: "root",                        neg: true,  arg: Arg::None },
+    LongOpt { name: "reschedule-failed-exec",      neg: true,  arg: Arg::None },
+    LongOpt { name: "reapply-cherry-picks",        neg: true,  arg: Arg::None },
+];
+
 use super::rebase_todo as todo;
 
 /// git's `builtin/rebase.c` usage block, reproduced verbatim (git 2.55.0) so the
@@ -438,6 +492,21 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
             i += 1;
             continue;
         }
+
+        // Respell a unique abbreviation as the name it resolves to, so `--autosq`
+        // reaches the same arm as `--autosquash`. The `no-` handling below is left
+        // exactly as it was: the resolver hands back a full spelling, which that
+        // code then splits the same way it always split a full spelling.
+        let canonical;
+        let a = match super::canonical_long(a, LONG_OPTS) {
+            super::Long::Name(name) => {
+                canonical = name;
+                canonical.as_ref()
+            }
+            super::Long::Ambiguous(first, second) => {
+                return Ok(super::ambiguous_option(a, &first, &second, USAGE))
+            }
+        };
 
         if let Some(long) = a.strip_prefix("--") {
             let (name, inline) = match long.find('=') {

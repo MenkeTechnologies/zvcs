@@ -26,9 +26,22 @@ Emit [broken] object attributes
     --[no-]use-mailmap    use mail map file
 ";
 
-/// `--mailmap` renders differently depending on how the block was reached:
-/// `-h` prints the alias bare, the error path prints it with parse-options'
-/// `...` argument marker. The two blocks are otherwise byte-identical.
+/// `--mailmap` renders differently depending on **which option table** the block
+/// was rendered from, not on which stream it went to.
+///
+/// `preprocess_options()` (parse-options.c:903-963) replaces each `OPTION_ALIAS`
+/// slot with a copy of its source option — here `--use-mailmap`, an `OPT_BOOL`,
+/// which carries `PARSE_OPT_NOARG`. Every block rendered from *inside*
+/// `parse_options()` therefore sees the copy and prints no argument marker.
+/// The builtin's own `usage_with_options()` calls run after `parse_options()`
+/// has returned and are handed the **original** array, whose alias slot has no
+/// `PARSE_OPT_NOARG`, so `usage_argh()` fires and prints `_("...")` for its null
+/// `argh` (parse-options.c:1443-1445, 1286).
+///
+/// Verified against stock 2.55.0: `git cat-file -h`, `--help-all`, `--zzbogus`
+/// and `-Q` all print `--[no-]mailmap`; bare `git cat-file` and
+/// `git cat-file --batch --path=x` print `--[no-]mailmap ...`. The two blocks
+/// are otherwise byte-identical.
 const ALIAS_HELP: &str = "    --[no-]mailmap        alias of --use-mailmap\n";
 const ALIAS_ERROR: &str = "    --[no-]mailmap ...    alias of --use-mailmap\n";
 
@@ -61,10 +74,42 @@ fn usage(alias: &str) -> String {
     format!("{USAGE_HEAD}{alias}{USAGE_TAIL}")
 }
 
+/// `cmd_cat_file()`'s `struct option options[]` (builtin/cat-file.c:1095-1130),
+/// in table order, as [`super::resolve_long`] reads it. The four `--batch*`
+/// entries, `--textconv` and `--filters` carry `PARSE_OPT_NONEG`.
+const LONG_OPTS: &[super::LongOpt] = &[
+    super::LongOpt { name: "allow-unknown-type", neg: true, arg: super::Arg::None },
+    super::LongOpt { name: "use-mailmap", neg: true, arg: super::Arg::None },
+    super::LongOpt { name: "mailmap", neg: true, arg: super::Arg::None },
+    super::LongOpt { name: "batch", neg: false, arg: super::Arg::Optional },
+    super::LongOpt { name: "batch-check", neg: false, arg: super::Arg::Optional },
+    super::LongOpt { name: "batch-command", neg: false, arg: super::Arg::Optional },
+    super::LongOpt { name: "batch-all-objects", neg: false, arg: super::Arg::None },
+    super::LongOpt { name: "buffer", neg: true, arg: super::Arg::None },
+    super::LongOpt { name: "follow-symlinks", neg: true, arg: super::Arg::None },
+    super::LongOpt { name: "unordered", neg: true, arg: super::Arg::None },
+    super::LongOpt { name: "textconv", neg: false, arg: super::Arg::None },
+    super::LongOpt { name: "filters", neg: false, arg: super::Arg::None },
+    super::LongOpt { name: "path", neg: true, arg: super::Arg::Required },
+    super::LongOpt { name: "filter", neg: true, arg: super::Arg::Required },
+];
+
+/// `OPT_ALIAS(0, "mailmap", "use-mailmap")` (builtin/cat-file.c:1111).
+/// `preprocess_options()` turns each alias into a copy of its source and records
+/// the pair in `ctx->alias_groups`, which is the only thing that stops the two
+/// from making each other ambiguous.
+const ALIAS_GROUPS: &[&[&str]] = &[&["mailmap", "use-mailmap"]];
+
 /// Print the usage block the way git's `usage_with_options()` does — on stderr,
 /// with the `...` alias rendering.
 fn usage_err() {
     eprint!("{}", usage(ALIAS_ERROR));
+}
+
+/// The block as `parse_options()` renders it — from the preprocessed table, so
+/// the alias prints bare. This is the one an unknown option or switch gets.
+fn parse_usage_err() {
+    eprint!("{}", usage(ALIAS_HELP));
 }
 
 /// git prefixes a `fatal:` line, then a blank line, then the usage block.
@@ -226,6 +271,20 @@ pub fn cat_file(args: &[String]) -> Result<ExitCode> {
             continue;
         }
 
+        let raw = arg;
+        let resolved = match super::canonical_long_aliased(arg, LONG_OPTS, ALIAS_GROUPS) {
+            super::Long::Name(name) => name,
+            super::Long::Ambiguous(first, second) => {
+                return Ok(super::ambiguous_option(
+                    arg,
+                    &first,
+                    &second,
+                    &usage(ALIAS_HELP),
+                ))
+            }
+        };
+        let arg = resolved.as_ref();
+
         if let Some(long) = arg.strip_prefix("--") {
             // Split `--opt=value` so the value never reaches the name match.
             let (name, attached) = match long.split_once('=') {
@@ -266,9 +325,11 @@ pub fn cat_file(args: &[String]) -> Result<ExitCode> {
                                 iter.next();
                                 value
                             }
+                            // `get_arg()` returns `PARSE_OPT_ERROR`, which
+                            // `parse_options()` answers with a bare `exit(129)`
+                            // — no usage block, unlike the unknown-option arm.
                             None => {
                                 eprintln!("error: option `{name}' requires a value");
-                                usage_err();
                                 return Ok(ExitCode::from(129));
                             }
                         },
@@ -281,7 +342,7 @@ pub fn cat_file(args: &[String]) -> Result<ExitCode> {
                 }
                 _ => {
                     eprintln!("error: unknown option `{long}'");
-                    usage_err();
+                    parse_usage_err();
                     return Ok(ExitCode::from(129));
                 }
             }
@@ -319,7 +380,7 @@ pub fn cat_file(args: &[String]) -> Result<ExitCode> {
                         }
                         _ => {
                             eprintln!("error: unknown switch `{c}'");
-                            usage_err();
+                            parse_usage_err();
                             return Ok(ExitCode::from(129));
                         }
                     };
@@ -331,7 +392,9 @@ pub fn cat_file(args: &[String]) -> Result<ExitCode> {
             }
         }
 
-        positional.push(arg);
+        // A non-option argument is handed back unchanged by the resolver, so
+        // this keeps `positional` borrowed from `args`.
+        positional.push(raw);
     }
 
     // ---- cross-option validation, in git's order ---------------------------

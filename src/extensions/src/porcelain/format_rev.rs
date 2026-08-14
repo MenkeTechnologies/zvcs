@@ -55,11 +55,25 @@ use std::io::{BufRead, Write};
 use std::process::ExitCode;
 
 use super::pretty_pad::{parse_wrap, FlushType, PadState, WrapState};
+use super::{Arg, LongOpt};
 use gix::bstr::ByteSlice;
 use gix::commit::describe::SelectRef;
 use gix::hash::ObjectId;
 
 /// The usage block git prints alongside `error:` diagnostics from its option parser.
+/// `cmd_format_rev()`'s `struct option opts[]` (builtin/name-rev.c:828-843), in
+/// table order, as [`super::resolve_long`] reads it. `-z`/`--null` is
+/// `OPT_CALLBACK_F(… PARSE_OPT_NOARG | PARSE_OPT_NONEG …)`; the other five
+/// negate.
+const LONG_OPTS: &[LongOpt] = &[
+    LongOpt { name: "format", neg: true, arg: Arg::Required },
+    LongOpt { name: "stdin-mode", neg: true, arg: Arg::Required },
+    LongOpt { name: "notes", neg: true, arg: Arg::Required },
+    LongOpt { name: "null", neg: false, arg: Arg::None },
+    LongOpt { name: "null-input", neg: true, arg: Arg::None },
+    LongOpt { name: "null-output", neg: true, arg: Arg::None },
+];
+
 const USAGE: &str = "\
 usage: (EXPERIMENTAL!) git format-rev --stdin-mode=<mode> --format=<pretty> [--[no-]notes=<ref>] [-z] [--[no-]null-output] [--[no-]null-input]
 
@@ -239,6 +253,13 @@ pub fn format_rev(args: &[String]) -> Result<ExitCode> {
                 .cloned()
                 .ok_or_else(|| anyhow!("option `{name}' requires a value"))
         };
+        let resolved = match super::canonical_long(a, LONG_OPTS) {
+            super::Long::Name(name) => name,
+            super::Long::Ambiguous(first, second) => {
+                return Ok(super::ambiguous_option(a, &first, &second, USAGE))
+            }
+        };
+        let a = resolved.as_ref();
         match a {
             "--format" => format_arg = Some(value(&mut i, "format")?),
             "--stdin-mode" => mode_arg = Some(value(&mut i, "stdin-mode")?),
@@ -266,9 +287,19 @@ pub fn format_rev(args: &[String]) -> Result<ExitCode> {
                     mode_arg = Some(v.to_string());
                 } else if let Some(v) = a.strip_prefix("--notes=") {
                     notes.push(v.to_string());
+                } else if let Some(body) = a.strip_prefix("--") {
+                    eprint!("error: unknown option `{body}'\n{USAGE}");
+                    return Ok(ExitCode::from(129));
                 } else if a.starts_with('-') {
-                    let name = a.trim_start_matches('-');
-                    eprint!("error: unknown option `{name}'\n{USAGE}");
+                    // `PARSE_OPT_UNKNOWN` names a *switch* for a short argument
+                    // (parse-options.c:889-898).
+                    let c = a[1..].chars().next().unwrap_or_default();
+                    match c.is_ascii() {
+                        true => eprint!("error: unknown switch `{c}'\n{USAGE}"),
+                        false => {
+                            eprint!("error: unknown non-ascii option in string: `{a}'\n{USAGE}")
+                        }
+                    }
                     return Ok(ExitCode::from(129));
                 } else {
                     eprint!("error: too many arguments\n{USAGE}");

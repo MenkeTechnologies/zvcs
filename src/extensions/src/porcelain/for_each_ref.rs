@@ -65,6 +65,39 @@ use gix::hash::ObjectId;
 use gix::objs::{CommitRef, Kind, TagRef};
 use gix::prelude::ObjectIdExt;
 
+use super::{Arg, LongOpt};
+
+/// `cmd_for_each_ref()`'s `struct option opts[]` (builtin/for-each-ref.c:23-53),
+/// in table order, as [`super::resolve_long`] reads it.
+///
+/// The four filter entries come from the ref-filter macros and carry
+/// `PARSE_OPT_LASTARG_DEFAULT | PARSE_OPT_NONEG` (`_OPT_MERGED_NO_MERGED`,
+/// ref-filter.h:119-130; `_OPT_CONTAINS_OR_WITH`, parse-options.h:609-620), so
+/// they take the next argument or their `HEAD` default and have no `--no-`
+/// spelling. `--no-merged` and `--no-contains` are entries in their own right,
+/// which is why they appear here rather than being generated negations.
+const LONG_OPTS: &[LongOpt] = &[
+    LongOpt { name: "shell", neg: true, arg: Arg::None },
+    LongOpt { name: "perl", neg: true, arg: Arg::None },
+    LongOpt { name: "python", neg: true, arg: Arg::None },
+    LongOpt { name: "tcl", neg: true, arg: Arg::None },
+    LongOpt { name: "omit-empty", neg: true, arg: Arg::None },
+    LongOpt { name: "count", neg: true, arg: Arg::Required },
+    LongOpt { name: "format", neg: true, arg: Arg::Required },
+    LongOpt { name: "start-after", neg: true, arg: Arg::Required },
+    LongOpt { name: "color", neg: true, arg: Arg::Optional },
+    LongOpt { name: "exclude", neg: true, arg: Arg::Required },
+    LongOpt { name: "sort", neg: true, arg: Arg::Required },
+    LongOpt { name: "points-at", neg: true, arg: Arg::Required },
+    LongOpt { name: "merged", neg: false, arg: Arg::LastArg },
+    LongOpt { name: "no-merged", neg: false, arg: Arg::LastArg },
+    LongOpt { name: "contains", neg: false, arg: Arg::LastArg },
+    LongOpt { name: "no-contains", neg: false, arg: Arg::LastArg },
+    LongOpt { name: "ignore-case", neg: true, arg: Arg::None },
+    LongOpt { name: "stdin", neg: true, arg: Arg::None },
+    LongOpt { name: "include-root-refs", neg: true, arg: Arg::None },
+];
+
 /// `usage_with_options()` over `builtin/for-each-ref.c`'s option table.
 const USAGE: &str = r"usage: git for-each-ref [--count=<count>] [--shell|--perl|--python|--tcl]
                                 [(--sort=<key>)...] [--format=<format>]
@@ -433,8 +466,43 @@ fn fatal(msg: &str) -> ExitCode {
     ExitCode::from(128)
 }
 
-/// git's `parse-options` failure: message on stderr, exit 129.
+/// The rejections that reach `usage_with_options()`: the `error:` line **and**
+/// the usage block, both on stderr, exit 129.
+///
+/// parse-options splits its two failure shapes by which one prints the block,
+/// and the split is not cosmetic — it is which C path produced the failure:
+///
+/// ```c
+/// case PARSE_OPT_ERROR:
+///         exit(129);                                  /* no block */
+/// ...
+/// case PARSE_OPT_UNKNOWN:
+///         ...
+///         error(_("unknown switch `%c'"), *ctx.opt);
+///         usage_with_options(usagestr, options);      /* block */
+/// ```
+///
+/// `PARSE_OPT_ERROR` is what `get_arg()` and a rejecting option callback return
+/// (`PARSE_OPT_ERROR = -1, /* must be the same as error() */`), so a bad option
+/// *value* gets one line — that is [`option_error`]. Everything else here —
+/// an unknown option or switch, and the two checks `cmd_for_each_ref()` runs
+/// itself after `parse_options()` returns (`invalid --count argument` and
+/// `more than one quoting style?`, builtin/for-each-ref.c:63-69) — calls
+/// `usage_with_options()` and gets the block.
+///
+/// Verified against stock 2.55.0 in a one-commit repo, stderr only:
+/// `for-each-ref -Z` 1923 bytes, `--count=-1` 1935, `--shell --perl` 1933,
+/// `--format=%(refname` 1938; against `--count` 39, `--sort` 38 and
+/// `--points-at zzz` 35 for the value errors.
 fn usage_error(msg: &str) -> ExitCode {
+    eprintln!("error: {msg}");
+    eprint!("{USAGE}");
+    ExitCode::from(129)
+}
+
+/// The `PARSE_OPT_ERROR` shape: the `error:` line alone, exit 129, no usage
+/// block. See [`usage_error`] for why the two are different.
+fn option_error(msg: &str) -> ExitCode {
     eprintln!("error: {msg}");
     ExitCode::from(129)
 }
@@ -540,7 +608,7 @@ pub fn for_each_ref(args: &[String]) -> Result<ExitCode> {
         ($rest:expr, $name:expr) => {
             match take_value(&mut i, $rest) {
                 Some(v) => v,
-                None => return Ok(usage_error(&format!("option `{}' requires a value", $name))),
+                None => return Ok(option_error(&format!("option `{}' requires a value", $name))),
             }
         };
     }
@@ -573,6 +641,13 @@ pub fn for_each_ref(args: &[String]) -> Result<ExitCode> {
             i += 1;
             continue;
         }
+        let resolved = match super::canonical_long(a, LONG_OPTS) {
+            super::Long::Name(name) => name,
+            super::Long::Ambiguous(first, second) => {
+                return Ok(super::ambiguous_option(a, &first, &second, USAGE))
+            }
+        };
+        let a = resolved.as_ref();
         let (name, rest) = match a.split_once('=') {
             Some((n, v)) if n.starts_with("--") => (n, Some(v)),
             _ => (a, None),
@@ -587,7 +662,7 @@ pub fn for_each_ref(args: &[String]) -> Result<ExitCode> {
                 count =
                     match parse_count(&v) {
                         Some(n) => n,
-                        None => return Ok(usage_error(
+                        None => return Ok(option_error(
                             "option `count' expects an integer value with an optional k/m/g suffix",
                         )),
                     };
@@ -600,13 +675,13 @@ pub fn for_each_ref(args: &[String]) -> Result<ExitCode> {
                 points_at = match repo.rev_parse_single(v.as_str()) {
                     Ok(id) => Some(id.detach()),
                     // git quotes the operand here but not in the filter options.
-                    Err(_) => return Ok(usage_error(&format!("malformed object name '{v}'"))),
+                    Err(_) => return Ok(option_error(&format!("malformed object name '{v}'"))),
                 };
             }
             "--contains" | "--no-contains" => {
                 let v = commit_operand!(rest);
                 let Some(id) = resolve_commit(&repo, &v) else {
-                    return Ok(usage_error(&format!("malformed object name {v}")));
+                    return Ok(option_error(&format!("malformed object name {v}")));
                 };
                 if name == "--contains" {
                     filters.contains.push(id);
@@ -635,7 +710,7 @@ pub fn for_each_ref(args: &[String]) -> Result<ExitCode> {
                     Some("never") => ColorWhen::Never,
                     Some("auto") => ColorWhen::Auto,
                     Some(_) => {
-                        return Ok(usage_error(
+                        return Ok(option_error(
                             "option `color' expects \"always\", \"auto\", or \"never\"",
                         ))
                     }
@@ -658,11 +733,17 @@ pub fn for_each_ref(args: &[String]) -> Result<ExitCode> {
             "--no-tcl" => quote_bits &= !Q_TCL,
             "--stdin" => from_stdin = true,
             "--no-stdin" => from_stdin = false,
+            // `PARSE_OPT_UNKNOWN` (parse-options.c:889-898) names an *option*
+            // for a `--` spelling and a *switch* for a short one.
+            s if s.starts_with("--") => {
+                return Ok(usage_error(&format!("unknown option `{}'", &s[2..])))
+            }
             s if s.starts_with('-') && s.len() > 1 => {
-                return Ok(usage_error(&format!(
-                    "unknown option `{}'",
-                    s.trim_start_matches('-')
-                )))
+                let c = s[1..].chars().next().unwrap_or_default();
+                return Ok(usage_error(&match c.is_ascii() {
+                    true => format!("unknown switch `{c}'"),
+                    false => format!("unknown non-ascii option in string: `{s}'"),
+                }));
             }
             s => patterns.push(s.to_string()),
         }

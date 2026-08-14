@@ -34,6 +34,34 @@ fn parse_score(arg: &str) -> Option<u32> {
 /// `parse_options` renders `blame_opt_usage` through that name, so
 /// `git annotate -h` differs from `git blame -h` in exactly that one line
 /// (verified against git 2.55.0 with `diff <(git blame -h) <(git annotate -h)`).
+/// `cmd_blame()`'s `struct option options[]` (builtin/blame.c), in table order,
+/// as [`super::resolve_long`] reads it. `--diff-algorithm` is the only
+/// `PARSE_OPT_NONEG` entry. `-b`, `-c`, `-t`, `-l`, `-s`, `-w`, `-S`, `-C`, `-M`
+/// and `-L` are short-only and so have no entry, and the revision options
+/// (`--date=`, `--reverse`, `--first-parent`, …) are not in this table at all:
+/// git reaches them through `parse_revision_opt()` after `parse_options_step()`
+/// returns `PARSE_OPT_UNKNOWN`, which is why they are never abbreviated.
+const LONG_OPTS: &[super::LongOpt] = &[
+    super::LongOpt { name: "incremental", neg: true, arg: super::Arg::None },
+    super::LongOpt { name: "root", neg: true, arg: super::Arg::None },
+    super::LongOpt { name: "show-stats", neg: true, arg: super::Arg::None },
+    super::LongOpt { name: "progress", neg: true, arg: super::Arg::None },
+    super::LongOpt { name: "score-debug", neg: true, arg: super::Arg::None },
+    super::LongOpt { name: "show-name", neg: true, arg: super::Arg::None },
+    super::LongOpt { name: "show-number", neg: true, arg: super::Arg::None },
+    super::LongOpt { name: "porcelain", neg: true, arg: super::Arg::None },
+    super::LongOpt { name: "line-porcelain", neg: true, arg: super::Arg::None },
+    super::LongOpt { name: "show-email", neg: true, arg: super::Arg::None },
+    super::LongOpt { name: "diff-algorithm", neg: false, arg: super::Arg::Required },
+    super::LongOpt { name: "ignore-rev", neg: true, arg: super::Arg::Required },
+    super::LongOpt { name: "ignore-revs-file", neg: true, arg: super::Arg::Required },
+    super::LongOpt { name: "color-lines", neg: true, arg: super::Arg::None },
+    super::LongOpt { name: "color-by-age", neg: true, arg: super::Arg::None },
+    super::LongOpt { name: "minimal", neg: true, arg: super::Arg::None },
+    super::LongOpt { name: "contents", neg: true, arg: super::Arg::Required },
+    super::LongOpt { name: "abbrev", neg: true, arg: super::Arg::Optional },
+];
+
 const USAGE_BODY: &str = concat!(
     "\n",
     "    <rev-opts> are documented in git-rev-list(1)\n",
@@ -524,6 +552,19 @@ pub(super) fn blame_with(args: &[String], cmd: &str) -> Result<ExitCode> {
             writeln!(err, "error: {msg}")?;
             err.flush()?;
             return Ok(ExitCode::from(129));
+        }
+        // `parse_long_opt()` reports the ambiguity with `error()` on stderr and
+        // then returns `PARSE_OPT_HELP`, so the block that follows it lands on
+        // *stdout* — the one rejection that splits its two halves across the two
+        // streams.
+        ParseOutcome::Ambiguous(body, first, second) => {
+            let mut err = std::io::stderr().lock();
+            writeln!(
+                err,
+                "error: ambiguous option: {body} (could be --{first} or --{second})"
+            )?;
+            err.flush()?;
+            return print_usage(cmd, true);
         }
         ParseOutcome::Opts(opts) => *opts,
     };
@@ -2936,6 +2977,11 @@ enum ParseOutcome {
     /// diagnostic, with no usage block after it. The payload is that line's
     /// text without the `error: ` prefix.
     OptError(String),
+    /// An abbreviation that two entries of `options[]` both answer to, as
+    /// `(<body as typed>, <first candidate>, <second candidate>)`. The
+    /// explanation goes to stderr and the usage block to stdout, which is what
+    /// makes it its own outcome rather than an [`ParseOutcome::Unknown`].
+    Ambiguous(String, String, String),
     Opts(Box<Options>),
 }
 
@@ -3015,10 +3061,22 @@ static GIT_BLAME_LONG_OPTIONS: &[&str] = &[
 /// of the spellings `parse_long_opt()` accepts: `--name`, `--name=<value>` and
 /// the `--no-name` negation.
 fn git_knows_long_option(a: &str) -> bool {
-    let Some(name) = a.strip_prefix("--") else {
+    let Some(body) = a.strip_prefix("--") else {
         return false;
     };
-    let name = name.split('=').next().unwrap_or(name);
+    // This command's own table decides first, and it decides negatability too:
+    // `--diff-algorithm` is `PARSE_OPT_NONEG`, so `--no-diff-algorithm` is an
+    // unknown option however familiar the stem looks.
+    if !matches!(super::resolve_long(LONG_OPTS, body), super::Resolved::Unknown) {
+        return true;
+    }
+    let name = body.split('=').next().unwrap_or(body);
+    let stem = name.strip_prefix("no-").unwrap_or(name);
+    if LONG_OPTS.iter().any(|o| o.name == stem) {
+        return false;
+    }
+    // Everything else is `handle_revision_opt()`'s, which matches its names
+    // exactly (no abbreviation) and spells its own negations.
     GIT_BLAME_LONG_OPTIONS.contains(&name)
         || name
             .strip_prefix("no-")
@@ -3082,6 +3140,19 @@ impl Options {
                 i += 1;
                 continue;
             }
+            // Resolve the long name the way `parse_long_opt()` resolves it. Only
+            // names this command's own table claims are rewritten; anything it
+            // does not claim is handed back untouched and goes on to the
+            // revision-option arms below, exactly as `parse_options_step()`
+            // hands `PARSE_OPT_UNKNOWN` to `parse_revision_opt()`.
+            let resolved = match super::canonical_long(a, LONG_OPTS) {
+                super::Long::Name(name) => name,
+                super::Long::Ambiguous(first, second) => {
+                    let body = a.strip_prefix("--").unwrap_or(a).to_string();
+                    return Ok(ParseOutcome::Ambiguous(body, first, second));
+                }
+            };
+            let a = resolved.as_ref();
             match a {
                 // The first `--` ends option parsing; everything after it is a
                 // pathspec, including a further `--`.

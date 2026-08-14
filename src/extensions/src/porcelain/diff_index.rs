@@ -406,14 +406,6 @@ struct IdxInfo {
     unmerged: bool,
 }
 
-/// The flag list quoted back at the user when an unimplemented option shows up.
-const PORTED: &str = "--cached, --merge-base, -m, --raw, --name-only, --name-status, -z, \
-                      --abbrev[=<n>], --no-abbrev, --full-index, --exit-code, --quiet, \
-                      -s/--no-patch, -R, --diff-filter=, --line-prefix=, --relative[=], \
-                      -w/-b/--ignore-*-space*, -I, -S, -G, --dirstat[=], -X, \
-                      --dirstat-by-file[=], --cumulative, -p/-u/--patch, -U<n>/--unified=, \
-                      --patch-with-raw, --patch-with-stat, --stat[=], --numstat, \
-                      --shortstat, --summary, --compact-summary";
 
 /// Stock `git diff-index`'s usage text, reproduced byte for byte (including the
 /// trailing blank line) because it is written to stderr on every usage error.
@@ -1364,7 +1356,7 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
     };
 
     if let Some(flag) = unsupported {
-        bail!("unsupported flag {flag:?} (ported: {PORTED})");
+        bail!("unsupported flag {flag:?}");
     }
     if let Some(msg) = &bad_regex {
         std::io::stderr().lock().write_all(msg)?;
@@ -1498,7 +1490,7 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
         // content-driven in git, so an all-clean pair list renders as nothing; only a run
         // that would produce real bytes is refused.
         if !deltas.is_empty() {
-            anyhow::bail!("unsupported output format {flag:?} (ported: {PORTED})");
+            anyhow::bail!("unsupported output format {flag:?}");
         }
     } else if opts.format != Format::Silent {
         // Per-pair blob analysis for the content formats. The stat family and the patch

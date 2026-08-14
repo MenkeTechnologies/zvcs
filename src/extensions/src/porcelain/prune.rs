@@ -113,6 +113,18 @@ use gix::hash::ObjectId;
 use gix::objs::Kind;
 use gix::odb::pack;
 
+use super::{Arg, LongOpt};
+
+/// `cmd_prune()`'s `struct option options[]` (builtin/prune.c), in table order,
+/// as [`super::resolve_long`] reads it. No entry carries `PARSE_OPT_NONEG`.
+const LONG_OPTS: &[LongOpt] = &[
+    LongOpt { name: "dry-run", neg: true, arg: Arg::None },
+    LongOpt { name: "verbose", neg: true, arg: Arg::None },
+    LongOpt { name: "progress", neg: true, arg: Arg::None },
+    LongOpt { name: "expire", neg: true, arg: Arg::Required },
+    LongOpt { name: "exclude-promisor-objects", neg: true, arg: Arg::None },
+];
+
 /// Stock git's `prune` usage block, byte-for-byte (423 bytes, git 2.55.0),
 /// including the trailing blank line. Printed on `-h` (stdout) and on a usage
 /// error (stderr).
@@ -157,6 +169,13 @@ pub fn prune(args: &[String]) -> Result<ExitCode> {
             heads.push(a);
             continue;
         }
+        let resolved = match super::canonical_long(a, LONG_OPTS) {
+            super::Long::Name(name) => name,
+            super::Long::Ambiguous(first, second) => {
+                return Ok(super::ambiguous_option(a, &first, &second, USAGE))
+            }
+        };
+        let a = resolved.as_ref();
         match a {
             "--" => end_of_opts = true,
             "-h" => {
@@ -230,7 +249,10 @@ pub fn prune(args: &[String]) -> Result<ExitCode> {
                     }
                 }
             }
-            _ => heads.push(a),
+            // A non-option argument is handed back unchanged by the resolver, so
+            // this pushes the original slice and keeps `heads` borrowed from
+            // `args`.
+            _ => heads.push(args[i - 1].as_str()),
         }
     }
 

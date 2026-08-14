@@ -6,6 +6,29 @@ use gix::bstr::BString;
 use gix::hash::ObjectId;
 
 use super::color::{Slot, StatusColors};
+use super::{Arg, LongOpt};
+
+/// `cmd_status()`'s `struct option builtin_status_options[]`
+/// (builtin/commit.c:1568-1599), in table order, as [`super::resolve_long`]
+/// reads it. `-M`/`--find-renames` is `PARSE_OPT_OPTARG | PARSE_OPT_NONEG`, and
+/// `--no-renames` is an `OPT_BOOL` whose name already carries the `no-`, so
+/// `--renames` is that same entry unset rather than a slot of its own.
+const LONG_OPTS: &[LongOpt] = &[
+    LongOpt { name: "verbose", neg: true, arg: Arg::None },
+    LongOpt { name: "short", neg: true, arg: Arg::None },
+    LongOpt { name: "branch", neg: true, arg: Arg::None },
+    LongOpt { name: "show-stash", neg: true, arg: Arg::None },
+    LongOpt { name: "ahead-behind", neg: true, arg: Arg::None },
+    LongOpt { name: "porcelain", neg: true, arg: Arg::Optional },
+    LongOpt { name: "long", neg: true, arg: Arg::None },
+    LongOpt { name: "null", neg: true, arg: Arg::None },
+    LongOpt { name: "untracked-files", neg: true, arg: Arg::Optional },
+    LongOpt { name: "ignored", neg: true, arg: Arg::Optional },
+    LongOpt { name: "ignore-submodules", neg: true, arg: Arg::Optional },
+    LongOpt { name: "column", neg: true, arg: Arg::Optional },
+    LongOpt { name: "no-renames", neg: true, arg: Arg::None },
+    LongOpt { name: "find-renames", neg: false, arg: Arg::Optional },
+];
 
 /// The exact usage block stock `git status` prints on a usage error (exit 129).
 const USAGE: &str = "usage: git status [<options>] [--] [<pathspec>...]
@@ -174,6 +197,13 @@ pub fn status(args: &[String]) -> Result<ExitCode> {
             pathspecs.push(s.into());
             continue;
         }
+        let resolved = match super::canonical_long(s, LONG_OPTS) {
+            super::Long::Name(name) => name,
+            super::Long::Ambiguous(first, second) => {
+                return Ok(super::ambiguous_option(s, &first, &second, USAGE))
+            }
+        };
+        let s = resolved.as_ref();
         match s {
             "-s" | "--short" => {
                 short = true;

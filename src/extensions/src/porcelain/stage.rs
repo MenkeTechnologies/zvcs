@@ -148,6 +148,25 @@ fn parse(args: &[String]) -> Result<std::result::Result<Opts, ExitCode>> {
             i += 1;
             continue;
         }
+        // Respell a unique abbreviation as the name it resolves to, ahead of the
+        // value-taking pre-match arms below, so `--pathspec-from-f <file>` consumes
+        // its separate value the way its full spelling does. The table is
+        // [`super::add::LONG_OPTS`] itself rather than a copy: git.c:658 registers
+        // `stage` as `cmd_add`, so the two verbs are one option table.
+        let canonical;
+        let a = match super::canonical_long(a, super::add::LONG_OPTS) {
+            super::Long::Name(name) => {
+                canonical = name;
+                canonical.as_ref()
+            }
+            // An ambiguous abbreviation is parse-options' refusal, printed with
+            // `git add`'s usage block — which is this verb's usage block. Hand the
+            // untouched argv to `add` and let the one implementation report it.
+            super::Long::Ambiguous(..) => {
+                o.delegate = true;
+                break 'argv;
+            }
+        };
         // `--chmod` and `--pathspec-from-file` take a value. git's parse_options
         // accepts both the sticky `--opt=val` and the separate `--opt val` forms,
         // consuming the following argv element for the latter (dying 129 if there
@@ -193,7 +212,7 @@ fn parse(args: &[String]) -> Result<std::result::Result<Opts, ExitCode>> {
             i += 2;
             continue;
         }
-        match a.as_str() {
+        match a {
             "--" => positional_only = true,
 
             "-n" | "--dry-run" => o.dry_run = true,
@@ -331,7 +350,8 @@ fn parse(args: &[String]) -> Result<std::result::Result<Opts, ExitCode>> {
                 o.delegate = true;
                 break 'argv;
             }
-            _ => o.pathspecs.push(a.clone()),
+            // A non-option argument is handed back unchanged by the resolver.
+            _ => o.pathspecs.push(a.to_string()),
         }
         i += 1;
     }

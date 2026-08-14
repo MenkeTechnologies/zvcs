@@ -8,6 +8,30 @@ use std::borrow::Cow;
 use std::fmt::Display;
 use std::process::ExitCode;
 
+use super::{Arg, LongOpt};
+
+/// `cmd_describe()`'s `struct option options[]` (builtin/describe.c:660-684), in
+/// table order, as [`super::resolve_long`] reads it. Every entry is a plain
+/// `OPT_BOOL`/`OPT_INTEGER`/`OPT_STRING_LIST`/`OPT_CALLBACK` with no
+/// `PARSE_OPT_NONEG`, so all of them negate; `--abbrev`, `--dirty` and
+/// `--broken` are `PARSE_OPT_OPTARG`.
+const LONG_OPTS: &[LongOpt] = &[
+    LongOpt { name: "contains", neg: true, arg: Arg::None },
+    LongOpt { name: "debug", neg: true, arg: Arg::None },
+    LongOpt { name: "all", neg: true, arg: Arg::None },
+    LongOpt { name: "tags", neg: true, arg: Arg::None },
+    LongOpt { name: "long", neg: true, arg: Arg::None },
+    LongOpt { name: "first-parent", neg: true, arg: Arg::None },
+    LongOpt { name: "abbrev", neg: true, arg: Arg::Optional },
+    LongOpt { name: "exact-match", neg: true, arg: Arg::None },
+    LongOpt { name: "candidates", neg: true, arg: Arg::Required },
+    LongOpt { name: "match", neg: true, arg: Arg::Required },
+    LongOpt { name: "exclude", neg: true, arg: Arg::Required },
+    LongOpt { name: "always", neg: true, arg: Arg::None },
+    LongOpt { name: "dirty", neg: true, arg: Arg::Optional },
+    LongOpt { name: "broken", neg: true, arg: Arg::Optional },
+];
+
 /// `git describe` — name a commit from the tags (or refs) in its past.
 ///
 /// Backed by gitoxide's `commit().describe()` platform (`gix_revision::describe`),
@@ -76,6 +100,15 @@ pub fn describe(args: &[String]) -> Result<ExitCode> {
             revs.push(a);
             continue;
         }
+        // Resolve the long name the way `parse_long_opt()` resolves it, so a
+        // unique abbreviation reaches the arm its full spelling reaches.
+        let resolved = match super::canonical_long(a, LONG_OPTS) {
+            super::Long::Name(name) => name,
+            super::Long::Ambiguous(first, second) => {
+                return Ok(super::ambiguous_option(a, &first, &second, USAGE))
+            }
+        };
+        let a = resolved.as_ref();
         match a {
             "--" => no_more_options = true,
             "--all" => all = true,
@@ -107,6 +140,10 @@ pub fn describe(args: &[String]) -> Result<ExitCode> {
                 },
                 None => return missing_value_error("candidates"),
             },
+            // `OPT_INTEGER` unset writes 0 (`case OPTION_INTEGER: if (unset)
+            // value = 0`), which is the same "no candidate walk" state
+            // `--exact-match` selects.
+            "--no-candidates" => max_candidates = 0,
             "--match" => match it.next() {
                 Some(v) => match_pats.push(BString::from(v.as_str())),
                 None => return missing_value_error("match"),
@@ -143,7 +180,7 @@ pub fn describe(args: &[String]) -> Result<ExitCode> {
             // parse_options_step() answers `-h` on stdout at 129 — no
             // `error:` line, because it is not a rejection.
             "-h" => return Ok(super::show_usage(USAGE)),
-            _ => return unknown_option_error(a.trim_start_matches('-')),
+            _ => return unknown_arg_error(a),
         }
     }
 
@@ -1088,6 +1125,45 @@ fn fatal(msg: impl Display) -> Result<ExitCode> {
 /// full usage block, exit 129.
 fn unknown_option_error(name: &str) -> Result<ExitCode> {
     eprintln!("error: unknown option `{name}'");
+    eprint!("{USAGE}");
+    Ok(ExitCode::from(129))
+}
+
+/// `PARSE_OPT_UNKNOWN` (parse-options.c:889-898), which names a *switch* when
+/// the rejected argument was a short one:
+///
+/// ```c
+/// if (ctx.argv[0][1] == '-') {
+///         error(_("unknown option `%s'"), ctx.argv[0] + 2);
+/// } else if (isascii(*ctx.opt)) {
+///         error(_("unknown switch `%c'"), *ctx.opt);
+/// } else {
+///         error(_("unknown non-ascii option in string: `%s'"), ctx.argv[0]);
+/// }
+/// ```
+///
+/// `git describe -Z` therefore says `unknown switch \`Z'`, not `unknown option`;
+/// this command has no short options of its own beyond `-h`, so the first
+/// character of the argument is always the one it names.
+fn unknown_arg_error(arg: &str) -> Result<ExitCode> {
+    match arg.strip_prefix("--") {
+        Some(body) => unknown_option_error(body),
+        None => {
+            let c = arg[1..].chars().next().unwrap_or_default();
+            match c.is_ascii() {
+                true => unknown_option_switch(&format!("unknown switch `{c}'")),
+                false => unknown_option_switch(&format!(
+                    "unknown non-ascii option in string: `{arg}'"
+                )),
+            }
+        }
+    }
+}
+
+/// The same stderr-plus-usage shape as [`unknown_option_error`], for a message
+/// that is already fully rendered.
+fn unknown_option_switch(msg: &str) -> Result<ExitCode> {
+    eprintln!("error: {msg}");
     eprint!("{USAGE}");
     Ok(ExitCode::from(129))
 }

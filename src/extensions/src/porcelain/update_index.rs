@@ -78,6 +78,51 @@ use gix::hash::ObjectId;
 use gix::index::entry::{Flags, Mode, Stage, Stat};
 
 /// `usage_with_options()` over `builtin/update-index.c`'s option table.
+/// `cmd_update_index()`'s `struct option options[]`
+/// (builtin/update-index.c:938-1095), in table order, as
+/// [`super::resolve_long`] reads it.
+///
+/// The `no-`-named entries here are *not* generated negations: `assume-unchanged`
+/// / `no-assume-unchanged`, `skip-worktree` / `no-skip-worktree` and
+/// `fsmonitor-valid` / `no-fsmonitor-valid` are six separate `OPTION_SET_INT`
+/// slots, each `PARSE_OPT_NOARG | PARSE_OPT_NONEG`, writing `MARK_FLAG` and
+/// `UNMARK_FLAG` into the same variable. `-q`, `-z` and `-g` are short-only.
+const LONG_OPTS: &[super::LongOpt] = &[
+    super::LongOpt { name: "ignore-submodules", neg: true, arg: super::Arg::None },
+    super::LongOpt { name: "add", neg: true, arg: super::Arg::None },
+    super::LongOpt { name: "replace", neg: true, arg: super::Arg::None },
+    super::LongOpt { name: "remove", neg: true, arg: super::Arg::None },
+    super::LongOpt { name: "unmerged", neg: true, arg: super::Arg::None },
+    super::LongOpt { name: "refresh", neg: false, arg: super::Arg::None },
+    super::LongOpt { name: "really-refresh", neg: false, arg: super::Arg::None },
+    super::LongOpt { name: "cacheinfo", neg: false, arg: super::Arg::Required },
+    super::LongOpt { name: "chmod", neg: false, arg: super::Arg::Required },
+    super::LongOpt { name: "assume-unchanged", neg: false, arg: super::Arg::None },
+    super::LongOpt { name: "no-assume-unchanged", neg: false, arg: super::Arg::None },
+    super::LongOpt { name: "skip-worktree", neg: false, arg: super::Arg::None },
+    super::LongOpt { name: "no-skip-worktree", neg: false, arg: super::Arg::None },
+    super::LongOpt { name: "ignore-skip-worktree-entries", neg: true, arg: super::Arg::None },
+    super::LongOpt { name: "info-only", neg: true, arg: super::Arg::None },
+    super::LongOpt { name: "force-remove", neg: true, arg: super::Arg::None },
+    super::LongOpt { name: "stdin", neg: false, arg: super::Arg::None },
+    super::LongOpt { name: "index-info", neg: false, arg: super::Arg::None },
+    super::LongOpt { name: "unresolve", neg: false, arg: super::Arg::None },
+    super::LongOpt { name: "again", neg: false, arg: super::Arg::None },
+    super::LongOpt { name: "ignore-missing", neg: true, arg: super::Arg::None },
+    super::LongOpt { name: "verbose", neg: true, arg: super::Arg::None },
+    super::LongOpt { name: "clear-resolve-undo", neg: false, arg: super::Arg::None },
+    super::LongOpt { name: "index-version", neg: true, arg: super::Arg::Required },
+    super::LongOpt { name: "show-index-version", neg: true, arg: super::Arg::None },
+    super::LongOpt { name: "split-index", neg: true, arg: super::Arg::None },
+    super::LongOpt { name: "untracked-cache", neg: true, arg: super::Arg::None },
+    super::LongOpt { name: "test-untracked-cache", neg: true, arg: super::Arg::None },
+    super::LongOpt { name: "force-untracked-cache", neg: true, arg: super::Arg::None },
+    super::LongOpt { name: "force-write-index", neg: true, arg: super::Arg::None },
+    super::LongOpt { name: "fsmonitor", neg: true, arg: super::Arg::None },
+    super::LongOpt { name: "fsmonitor-valid", neg: false, arg: super::Arg::None },
+    super::LongOpt { name: "no-fsmonitor-valid", neg: false, arg: super::Arg::None },
+];
+
 const USAGE: &str = r#"usage: git update-index [<options>] [--] [<file>...]
 
     -q                    continue refresh even when index needs update
@@ -393,8 +438,25 @@ fn run(ctx: &mut Ctx, args: &[String]) -> Result<Outcome> {
                     // (builtin/update-index.c:1097) covers the lone-`-h` case
                     // ahead of parse_options; both land here.
                     'h' => return Ok(Outcome::Help),
+                    // `cmd_update_index()` drives `parse_options_step()` itself
+                    // and answers `PARSE_OPT_UNKNOWN` with its *own* diagnostic
+                    // (builtin/update-index.c:1171-1176), which quotes the name
+                    // between plain apostrophes rather than parse-options'
+                    // backtick-apostrophe pair, and then calls
+                    // `usage_with_options()`:
+                    //
+                    //     case PARSE_OPT_UNKNOWN:
+                    //             if (ctx.argv[0][1] == '-')
+                    //                     error("unknown option '%s'", ctx.argv[0] + 2);
+                    //             else
+                    //                     error("unknown switch '%c'", *ctx.opt);
+                    //             usage_with_options(update_index_usage, options);
+                    //
+                    // Every *other* refusal here is parse-options' own, so those
+                    // keep the backtick form and print no block.
                     _ => {
-                        eprintln!("error: unknown switch `{c}'");
+                        eprintln!("error: unknown switch '{c}'");
+                        eprint!("{USAGE}");
                         return Ok(Outcome::Usage);
                     }
                 }
@@ -403,6 +465,17 @@ fn run(ctx: &mut Ctx, args: &[String]) -> Result<Outcome> {
             continue;
         }
 
+        // Resolve the long name the way `parse_long_opt()` resolves it, so a
+        // unique abbreviation reaches the arm its full spelling reaches.
+        let resolved = match super::canonical_long(a, LONG_OPTS) {
+            super::Long::Name(name) => name,
+            super::Long::Ambiguous(first, second) if !end_of_opts => {
+                let _ = super::ambiguous_option(a, &first, &second, USAGE);
+                return Ok(Outcome::Usage);
+            }
+            super::Long::Ambiguous(..) => std::borrow::Cow::Borrowed(a),
+        };
+        let a = resolved.as_ref();
         if !end_of_opts && a.starts_with("--") && a.len() > 2 {
             let long = &a[2..];
             let (name, attached) = match long.split_once('=') {
@@ -578,8 +651,11 @@ fn run(ctx: &mut Ctx, args: &[String]) -> Result<Outcome> {
                     }
                 }
 
+                // The builtin's own `PARSE_OPT_UNKNOWN` arm: plain apostrophes,
+                // then the usage block. See the short-option arm above.
                 _ => {
-                    eprintln!("error: unknown option `{name}'");
+                    eprintln!("error: unknown option '{name}'");
+                    eprint!("{USAGE}");
                     return Ok(Outcome::Usage);
                 }
             }
@@ -688,7 +764,9 @@ fn option_with_value(
             None => match args.get(i + 1) {
                 Some(v) => v.as_str(),
                 None => {
-                    eprintln!("error: option 'chmod' requires a value");
+                    // `get_arg()`'s own message, which is the backtick form —
+                    // only the builtin's unknown-option arm uses apostrophes.
+                    eprintln!("error: option `chmod' requires a value");
                     return Ok(Err(ParseFail::Usage));
                 }
             },

@@ -53,8 +53,29 @@ use gix::hash::ObjectId;
 use gix::index::entry::stat::Options as StatOptions;
 use gix::index::entry::{Mode, Stat};
 
+use super::{Arg, LongOpt};
+
 /// git's `CHECKOUT_ALL` sentinel for `--stage=all`.
 const CHECKOUT_ALL: u32 = 4;
+
+/// `cmd_checkout_index()`'s `struct option builtin_checkout_index_options[]`
+/// (builtin/checkout-index.c:227-250), in table order, as
+/// [`super::resolve_long`] reads it. `--stage` is
+/// `OPT_CALLBACK_F(… PARSE_OPT_NONEG …)`; every other entry is an `OPT_BOOL` or
+/// `OPT_STRING` and negates, including `--no-create`, whose name already carries
+/// the `no-` (so `--create` is that same entry, unset). `-z` is short-only.
+const LONG_OPTS: &[LongOpt] = &[
+    LongOpt { name: "all", neg: true, arg: Arg::None },
+    LongOpt { name: "ignore-skip-worktree-bits", neg: true, arg: Arg::None },
+    LongOpt { name: "force", neg: true, arg: Arg::None },
+    LongOpt { name: "quiet", neg: true, arg: Arg::None },
+    LongOpt { name: "no-create", neg: true, arg: Arg::None },
+    LongOpt { name: "index", neg: true, arg: Arg::None },
+    LongOpt { name: "stdin", neg: true, arg: Arg::None },
+    LongOpt { name: "temp", neg: true, arg: Arg::None },
+    LongOpt { name: "prefix", neg: true, arg: Arg::Required },
+    LongOpt { name: "stage", neg: false, arg: Arg::Required },
+];
 
 /// git's usage block, printed verbatim alongside an unknown-option error.
 const USAGE: &str = "usage: git checkout-index [<options>] [--] [<file>...]
@@ -154,6 +175,13 @@ pub fn checkout_index(args: &[String]) -> Result<ExitCode> {
             i += 1;
             continue;
         }
+        let resolved = match super::canonical_long(a, LONG_OPTS) {
+            super::Long::Name(name) => name,
+            super::Long::Ambiguous(first, second) => {
+                return Ok(super::ambiguous_option(a, &first, &second, USAGE))
+            }
+        };
+        let a = resolved.as_ref();
         if let Some(long) = a.strip_prefix("--") {
             let (name, inline) = match long.split_once('=') {
                 Some((n, v)) => (n, Some(v)),

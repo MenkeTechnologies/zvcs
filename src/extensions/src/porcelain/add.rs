@@ -62,6 +62,40 @@ use std::process::ExitCode;
 use gix::bstr::{BStr, BString, ByteSlice};
 use gix::index::entry::{Flags, Mode, Stage, Stat};
 
+use super::{Arg, LongOpt};
+
+/// `cmd_add()`'s `struct option builtin_add_options[]` (builtin/add.c), in table
+/// order, as [`super::resolve_long`] reads it. `-h` and the short-only bundle are
+/// answered by the parse loop itself and have no entry here.
+///
+/// `--unified` and `--inter-hunk-context` come from `OPT_DIFF_UNIFIED` /
+/// `OPT_DIFF_INTERHUNK_CONTEXT`, both `PARSE_OPT_NONEG`, so neither has a `--no-`
+/// spelling; every other entry does.
+pub(super) const LONG_OPTS: &[LongOpt] = &[
+    LongOpt { name: "dry-run",                     neg: true,  arg: Arg::None },
+    LongOpt { name: "verbose",                     neg: true,  arg: Arg::None },
+    LongOpt { name: "interactive",                 neg: true,  arg: Arg::None },
+    LongOpt { name: "patch",                       neg: true,  arg: Arg::None },
+    LongOpt { name: "auto-advance",                neg: true,  arg: Arg::None },
+    LongOpt { name: "unified",                     neg: false, arg: Arg::Required },
+    LongOpt { name: "inter-hunk-context",          neg: false, arg: Arg::Required },
+    LongOpt { name: "edit",                        neg: true,  arg: Arg::None },
+    LongOpt { name: "force",                       neg: true,  arg: Arg::None },
+    LongOpt { name: "update",                      neg: true,  arg: Arg::None },
+    LongOpt { name: "renormalize",                 neg: true,  arg: Arg::None },
+    LongOpt { name: "intent-to-add",               neg: true,  arg: Arg::None },
+    LongOpt { name: "all",                         neg: true,  arg: Arg::None },
+    LongOpt { name: "ignore-removal",              neg: true,  arg: Arg::None },
+    LongOpt { name: "refresh",                     neg: true,  arg: Arg::None },
+    LongOpt { name: "ignore-errors",               neg: true,  arg: Arg::None },
+    LongOpt { name: "ignore-missing",              neg: true,  arg: Arg::None },
+    LongOpt { name: "sparse",                      neg: true,  arg: Arg::None },
+    LongOpt { name: "chmod",                       neg: true,  arg: Arg::Required },
+    LongOpt { name: "warn-embedded-repo",          neg: true,  arg: Arg::None },
+    LongOpt { name: "pathspec-from-file",          neg: true,  arg: Arg::Required },
+    LongOpt { name: "pathspec-file-nul",           neg: true,  arg: Arg::None },
+];
+
 pub fn add(args: &[String]) -> Result<ExitCode> {
     let repo = gix::discover(".")?;
     if repo.workdir().is_none() {
@@ -113,8 +147,9 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
     while i < args.len() {
         let a = &args[i];
         // A value still owed to `-U`/`--unified`/`--inter-hunk-context` is taken
-        // verbatim, even past `--`, the way parse-options takes it.
-        if patch_opts.awaiting_value() || !positional_only {
+        // verbatim, even past `--`, the way parse-options takes it — and precisely
+        // because it is a value, it is never resolved as an option name.
+        if patch_opts.awaiting_value() {
             match patch_opts.take_arg(a) {
                 Err(code) => return Ok(code),
                 Ok(true) => {
@@ -129,7 +164,28 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
             i += 1;
             continue;
         }
-        match a.as_str() {
+        // Respell a unique abbreviation as the name it resolves to, ahead of both
+        // the shared value-option handler and the match below, so `--unif 3` and
+        // `--intent-to` land where their full spellings land.
+        let canonical;
+        let a = match super::canonical_long(a, LONG_OPTS) {
+            super::Long::Name(name) => {
+                canonical = name;
+                canonical.as_ref()
+            }
+            super::Long::Ambiguous(first, second) => {
+                return Ok(super::ambiguous_option(a, &first, &second, USAGE))
+            }
+        };
+        match patch_opts.take_arg(a) {
+            Err(code) => return Ok(code),
+            Ok(true) => {
+                i += 1;
+                continue;
+            }
+            Ok(false) => {}
+        }
+        match a {
             "--" => positional_only = true,
             "-n" | "--dry-run" => dry_run = true,
             "--no-dry-run" => dry_run = false,
@@ -150,6 +206,7 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
             "-N" | "--intent-to-add" => intent_to_add = true,
             "--no-intent-to-add" => intent_to_add = false,
             "--refresh" => refresh = true,
+            "--no-refresh" => refresh = false,
             // `--renormalize` re-stages tracked paths (implies -u). Content filters
             // are not applied here, so it restages the verbatim worktree bytes.
             "--renormalize" => renormalize = true,
@@ -180,6 +237,11 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
                     None => return usage_fatal(format!("--chmod param '{v}' must be either -x or +x")),
                 }
             }
+            // `chmod` is an `OPT_STRING`, whose unset writes NULL over whatever an
+            // earlier `--chmod=<v>` recorded (parse-options.c:200-202) — including
+            // the validation that value would have failed, since `cmd_add()` only
+            // inspects the surviving string.
+            "--no-chmod" => chmod = None,
             s if s.starts_with("--chmod=") => match parse_chmod(&s["--chmod=".len()..]) {
                 Some(b) => chmod = Some(b),
                 None => {
@@ -194,6 +256,10 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
             s if s.starts_with("--pathspec-from-file=") => {
                 from_file = Some(s["--pathspec-from-file=".len()..].to_string());
             }
+            // `OPT_FILENAME`'s unset writes NULL (parse-options.c:214-215), so a
+            // later `--no-pathspec-from-file` discards an earlier value and the
+            // pathspecs come from argv again.
+            "--no-pathspec-from-file" => from_file = None,
             // Interactive hunk selection (`add-patch.c`), served by
             // [`super::add_patch`]. `-e`/`--edit` (diff the worktree into an
             // editor and `apply --recount --cached` the result) is a separate
@@ -203,6 +269,10 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
             "-i" | "--interactive" => add_interactive = true,
             "--no-interactive" => add_interactive = false,
             "-e" | "--edit" => bail!("edit mode (-e/--edit) needs an interactive editor; not ported"),
+            // `edit_interactive` is an `OPT_BOOL`, so its unset writes 0 — which is
+            // the state this command already starts in. Nothing to refuse: git runs
+            // the ordinary add for `--no-edit`, and so does this.
+            "--no-edit" => {}
             // `-h` is handled by `parse_options()` before any other switch in the
             // same bundle, so `git add -hv` still prints the table.
             other if other.starts_with('-')
@@ -228,7 +298,8 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
                 }
             }
             other if other.starts_with('-') => return usage_error(format!("unknown option `{}'", other.trim_start_matches('-'))),
-            _ => pathspecs.push(a.clone()),
+            // A non-option argument is handed back unchanged by the resolver.
+            _ => pathspecs.push(a.to_string()),
         }
         i += 1;
     }

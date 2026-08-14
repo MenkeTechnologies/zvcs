@@ -10,8 +10,8 @@
 //! `--diff3`, `--zdiff3`, `--ours`, `--theirs`, `--union`, `--marker-size=<n>`,
 //! `--diff-algorithm=<myers|minimal|patience|histogram>`, `--object-id`, `--`
 //! and the `--no-` negations parse-options accepts, plus the
-//! `merge.conflictStyle` config default. Unique-prefix abbreviation of long
-//! options is *not* accepted.
+//! `merge.conflictStyle` config default. Long options may be abbreviated to any
+//! unique prefix, as [`super::resolve_long`] resolves them.
 //!
 //! `merge.conflictStyle` is read and validated the way git's `git_xmerge_config`
 //! does: it runs before option parsing, so an unknown value (`Diff3`, `zealous`,
@@ -45,6 +45,25 @@ use gix::bstr::ByteSlice;
 use gix::config::Source;
 use gix::diff::blob::{Algorithm, InternedInput};
 use gix::merge::blob::builtin_driver::text::{Conflict, ConflictStyle, Labels, Level, Merge, Rendering};
+
+use super::{Arg, LongOpt};
+
+/// `cmd_merge_file()`'s `struct option options[]` (builtin/merge-file.c), in
+/// table order, as [`super::resolve_long`] reads it. `--diff-algorithm` is the
+/// only `PARSE_OPT_NONEG` entry; `-L`, `-p` and `-q` reach the same slots by
+/// their short names.
+const LONG_OPTS: &[LongOpt] = &[
+    LongOpt { name: "stdout", neg: true, arg: Arg::None },
+    LongOpt { name: "object-id", neg: true, arg: Arg::None },
+    LongOpt { name: "diff3", neg: true, arg: Arg::None },
+    LongOpt { name: "zdiff3", neg: true, arg: Arg::None },
+    LongOpt { name: "ours", neg: true, arg: Arg::None },
+    LongOpt { name: "theirs", neg: true, arg: Arg::None },
+    LongOpt { name: "union", neg: true, arg: Arg::None },
+    LongOpt { name: "diff-algorithm", neg: false, arg: Arg::Required },
+    LongOpt { name: "marker-size", neg: true, arg: Arg::Required },
+    LongOpt { name: "quiet", neg: true, arg: Arg::None },
+];
 
 const USAGE: &str = "\
 usage: git merge-file [<options>] [-L <name1> [-L <orig> [-L <name2>]]] <file1> <orig-file> <file2>
@@ -107,6 +126,14 @@ pub fn merge_file(args: &[String]) -> Result<ExitCode> {
             no_more_opts = true;
             continue;
         }
+
+        let resolved = match super::canonical_long(arg, LONG_OPTS) {
+            super::Long::Name(name) => name,
+            super::Long::Ambiguous(first, second) => {
+                return Ok(super::ambiguous_option(arg, &first, &second, USAGE))
+            }
+        };
+        let arg = resolved.as_ref();
 
         if let Some(long) = arg.strip_prefix("--") {
             let (name, value) = match long.split_once('=') {

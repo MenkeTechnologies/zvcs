@@ -63,6 +63,35 @@ use gix::prelude::ObjectIdExt;
 use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
 use gix::refs::{FullName, Target};
 
+use super::{Arg, LongOpt};
+
+/// `cmd_switch()`'s option table (builtin/checkout.c:2148), in the order
+/// `parse_options_concat()` builds it: `switch_options[]`, then
+/// `add_common_options()`, then `add_common_switch_branch_options()`.
+///
+/// `add_checkout_path_options()` is *not* concatenated here, which is why
+/// `--patch`, `--ours`, `--unified` and `--pathspec-from-file` are unknown to
+/// `git switch` even though `git checkout` takes all four.
+const LONG_OPTS: &[LongOpt] = &[
+    // switch_options[] (builtin/checkout.c:2148)
+    LongOpt { name: "create",                      neg: true,  arg: Arg::Required },
+    LongOpt { name: "force-create",                neg: true,  arg: Arg::Required },
+    LongOpt { name: "guess",                       neg: true,  arg: Arg::None },
+    LongOpt { name: "discard-changes",             neg: true,  arg: Arg::None },
+    // add_common_options() (builtin/checkout.c:1767)
+    LongOpt { name: "quiet",                       neg: true,  arg: Arg::None },
+    LongOpt { name: "recurse-submodules",          neg: true,  arg: Arg::Optional },
+    LongOpt { name: "progress",                    neg: true,  arg: Arg::None },
+    LongOpt { name: "merge",                       neg: true,  arg: Arg::None },
+    LongOpt { name: "conflict",                    neg: true,  arg: Arg::Required },
+    // add_common_switch_branch_options() (builtin/checkout.c:1787)
+    LongOpt { name: "detach",                      neg: true,  arg: Arg::None },
+    LongOpt { name: "track",                       neg: true,  arg: Arg::Optional },
+    LongOpt { name: "force",                       neg: true,  arg: Arg::None },
+    LongOpt { name: "orphan",                      neg: true,  arg: Arg::Required },
+    LongOpt { name: "overwrite-ignore",            neg: true,  arg: Arg::None },
+    LongOpt { name: "ignore-other-worktrees",      neg: true,  arg: Arg::None },
+];
 /// Stock git's `git switch` usage block, byte-for-byte (git 2.55.0). Printed to
 /// stdout on `-h`, and to stderr after the `error:` line on an unknown option.
 const USAGE: &str = "\
@@ -176,6 +205,23 @@ fn parse<'a>(args: &'a [String]) -> Result<Parse<'a>> {
             i += 1;
             continue;
         }
+
+        // Respell a unique abbreviation as the name it resolves to, so `--disc`
+        // reaches the same arm as `--discard-changes`. Short options and names no
+        // entry claims come back untouched, so the refusals below still quote what
+        // was typed.
+        let canonical;
+        let a = match super::canonical_long(a, LONG_OPTS) {
+            super::Long::Name(name) => {
+                canonical = name;
+                canonical.as_ref()
+            }
+            super::Long::Ambiguous(first, second) => {
+                return Ok(Parse::Failed(super::ambiguous_option(
+                    a, &first, &second, USAGE,
+                )))
+            }
+        };
 
         // Long options, with or without an attached `=value`.
         if let Some(long) = a.strip_prefix("--") {
@@ -297,7 +343,9 @@ fn parse<'a>(args: &'a [String]) -> Result<Parse<'a>> {
             continue;
         }
 
-        p.positionals.push(a);
+        // A non-option argument is handed back unchanged by the resolver, so the
+        // argv slice itself is pushed and the operand keeps `args`' lifetime.
+        p.positionals.push(args[i].as_str());
         i += 1;
     }
 

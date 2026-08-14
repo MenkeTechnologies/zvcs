@@ -28,6 +28,8 @@ use gix::hash::ObjectId;
 use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
 use gix::refs::{Category, FullName, FullNameRef, Target};
 
+use super::{Arg, LongOpt};
+
 /// git's `SYMREF_MAXDEPTH` — the number of indirections `resolve_ref_unsafe`
 /// follows before giving up.
 const SYMREF_MAXDEPTH: usize = 5;
@@ -43,6 +45,16 @@ const REV_PARSE_RULES: [(&str, &str); 6] = [
     ("refs/heads/", ""),
     ("refs/remotes/", ""),
     ("refs/remotes/", "/HEAD"),
+];
+
+/// `cmd_symbolic_ref()`'s `struct option options[]` (builtin/symbolic-ref.c), in
+/// table order, as [`super::resolve_long`] reads it. No entry carries
+/// `PARSE_OPT_NONEG`; `-m <reason>` is short-only and so has no entry.
+const LONG_OPTS: &[LongOpt] = &[
+    LongOpt { name: "quiet", neg: true, arg: Arg::None },
+    LongOpt { name: "delete", neg: true, arg: Arg::None },
+    LongOpt { name: "short", neg: true, arg: Arg::None },
+    LongOpt { name: "recurse", neg: true, arg: Arg::None },
 ];
 
 /// The usage block stock git prints for every argument error, verbatim.
@@ -95,6 +107,13 @@ pub fn symbolic_ref(args: &[String]) -> Result<ExitCode> {
             i += 1;
             continue;
         }
+        let resolved = match super::canonical_long(a, LONG_OPTS) {
+            super::Long::Name(name) => name,
+            super::Long::Ambiguous(first, second) => {
+                return Ok(super::ambiguous_option(a, &first, &second, USAGE))
+            }
+        };
+        let a = resolved.as_ref();
         match a {
             "--" => no_more_opts = true,
             // parse_options_step() answers `-h` on stdout at 129, ahead of

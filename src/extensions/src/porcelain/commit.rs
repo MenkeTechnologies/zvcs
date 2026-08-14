@@ -88,6 +88,58 @@ Commit contents options
 use gix::bstr::{BString, ByteSlice};
 use gix::index::entry::{Flags, Mode, Stage, Stat};
 use gix::objs::tree::EntryMode;
+
+use super::{Arg, LongOpt};
+
+/// `cmd_commit()`'s `struct option builtin_commit_options[]` (builtin/commit.c),
+/// in table order, as [`super::resolve_long`] reads it.
+///
+/// `--unified` and `--inter-hunk-context` come from `OPT_DIFF_UNIFIED` /
+/// `OPT_DIFF_INTERHUNK_CONTEXT`, both `PARSE_OPT_NONEG`; `no-verify` and
+/// `no-post-rewrite` are entries spelled with their own `no-`, which parse-options
+/// reads as the *unset* sense of `verify` / `post-rewrite`.
+const LONG_OPTS: &[LongOpt] = &[
+    LongOpt { name: "quiet",                       neg: true,  arg: Arg::None },
+    LongOpt { name: "verbose",                     neg: true,  arg: Arg::None },
+    LongOpt { name: "file",                        neg: true,  arg: Arg::Required },
+    LongOpt { name: "author",                      neg: true,  arg: Arg::Required },
+    LongOpt { name: "date",                        neg: true,  arg: Arg::Required },
+    LongOpt { name: "message",                     neg: true,  arg: Arg::Required },
+    LongOpt { name: "reedit-message",              neg: true,  arg: Arg::Required },
+    LongOpt { name: "reuse-message",               neg: true,  arg: Arg::Required },
+    LongOpt { name: "fixup",                       neg: true,  arg: Arg::Required },
+    LongOpt { name: "squash",                      neg: true,  arg: Arg::Required },
+    LongOpt { name: "reset-author",                neg: true,  arg: Arg::None },
+    LongOpt { name: "trailer",                     neg: true,  arg: Arg::Required },
+    LongOpt { name: "signoff",                     neg: true,  arg: Arg::None },
+    LongOpt { name: "template",                    neg: true,  arg: Arg::Required },
+    LongOpt { name: "edit",                        neg: true,  arg: Arg::None },
+    LongOpt { name: "cleanup",                     neg: true,  arg: Arg::Required },
+    LongOpt { name: "status",                      neg: true,  arg: Arg::None },
+    LongOpt { name: "gpg-sign",                    neg: true,  arg: Arg::Optional },
+    LongOpt { name: "all",                         neg: true,  arg: Arg::None },
+    LongOpt { name: "include",                     neg: true,  arg: Arg::None },
+    LongOpt { name: "interactive",                 neg: true,  arg: Arg::None },
+    LongOpt { name: "patch",                       neg: true,  arg: Arg::None },
+    LongOpt { name: "unified",                     neg: false, arg: Arg::Required },
+    LongOpt { name: "inter-hunk-context",          neg: false, arg: Arg::Required },
+    LongOpt { name: "only",                        neg: true,  arg: Arg::None },
+    LongOpt { name: "no-verify",                   neg: true,  arg: Arg::None },
+    LongOpt { name: "dry-run",                     neg: true,  arg: Arg::None },
+    LongOpt { name: "short",                       neg: true,  arg: Arg::None },
+    LongOpt { name: "branch",                      neg: true,  arg: Arg::None },
+    LongOpt { name: "ahead-behind",                neg: true,  arg: Arg::None },
+    LongOpt { name: "porcelain",                   neg: true,  arg: Arg::None },
+    LongOpt { name: "long",                        neg: true,  arg: Arg::None },
+    LongOpt { name: "null",                        neg: true,  arg: Arg::None },
+    LongOpt { name: "amend",                       neg: true,  arg: Arg::None },
+    LongOpt { name: "no-post-rewrite",             neg: true,  arg: Arg::None },
+    LongOpt { name: "untracked-files",             neg: true,  arg: Arg::Optional },
+    LongOpt { name: "pathspec-from-file",          neg: true,  arg: Arg::Required },
+    LongOpt { name: "pathspec-file-nul",           neg: true,  arg: Arg::None },
+    LongOpt { name: "allow-empty",                 neg: true,  arg: Arg::None },
+    LongOpt { name: "allow-empty-message",         neg: true,  arg: Arg::None },
+];
 use gix::prelude::ObjectIdExt;
 use gix::ObjectId;
 
@@ -570,11 +622,11 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
 
     let mut i = 0;
     while i < args.len() {
-        let a = args[i].as_str();
         // A value still owed to `-U`/`--unified`/`--inter-hunk-context` is taken
-        // verbatim, even past `--`, the way parse-options takes it.
-        if patch_opts.awaiting_value() || !positional_only {
-            match patch_opts.take_arg(a) {
+        // verbatim, even past `--`, the way parse-options takes it — and precisely
+        // because it is a value, it is never resolved as an option name.
+        if patch_opts.awaiting_value() {
+            match patch_opts.take_arg(args[i].as_str()) {
                 Err(code) => return Ok(code),
                 Ok(true) => {
                     i += 1;
@@ -587,6 +639,27 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
             pathspecs.push(args[i].clone());
             i += 1;
             continue;
+        }
+        // Respell a unique abbreviation as the name it resolves to, ahead of both
+        // the shared value-option handler and the match below, so `--allow-empty-m`
+        // reaches the same arm as `--allow-empty-message`.
+        let canonical;
+        let a = match super::canonical_long(args[i].as_str(), LONG_OPTS) {
+            super::Long::Name(name) => {
+                canonical = name;
+                canonical.as_ref()
+            }
+            super::Long::Ambiguous(first, second) => {
+                return Ok(super::ambiguous_option(&args[i], &first, &second, USAGE))
+            }
+        };
+        match patch_opts.take_arg(a) {
+            Err(code) => return Ok(code),
+            Ok(true) => {
+                i += 1;
+                continue;
+            }
+            Ok(false) => {}
         }
         match a {
             "-m" | "--message" => {

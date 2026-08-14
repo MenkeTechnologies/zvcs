@@ -23,6 +23,18 @@ use gix::bstr::{BStr, BString, ByteSlice};
 use gix::index::entry::Mode;
 use gix::worktree::stack::state::attributes::Source;
 
+use super::{Arg, LongOpt};
+
+/// `cmd_check_attr()`'s `struct option check_attr_options[]`
+/// (builtin/check-attr.c), in table order, as [`super::resolve_long`] reads it.
+/// `-z` is short-only and so has no entry; no entry carries `PARSE_OPT_NONEG`.
+const LONG_OPTS: &[LongOpt] = &[
+    LongOpt { name: "all", neg: true, arg: Arg::None },
+    LongOpt { name: "cached", neg: true, arg: Arg::None },
+    LongOpt { name: "stdin", neg: true, arg: Arg::None },
+    LongOpt { name: "source", neg: true, arg: Arg::Required },
+];
+
 /// git's `check_attr_usage` plus its option block, verbatim.
 const USAGE: &str = "\
 usage: git check-attr [--source <tree-ish>] [-a | --all | <attr>...] [--] <pathname>...
@@ -75,7 +87,13 @@ pub fn check_attr(args: &[String]) -> Result<ExitCode> {
             i += 1;
             continue;
         }
-        match a {
+        let resolved = match super::canonical_long(a, LONG_OPTS) {
+            super::Long::Name(name) => name,
+            super::Long::Ambiguous(first, second) => {
+                return Ok(super::ambiguous_option(a, &first, &second, USAGE))
+            }
+        };
+        match resolved.as_ref() {
             "--" => {
                 after_dashdash = true;
                 rest.push(a);
@@ -124,7 +142,9 @@ pub fn check_attr(args: &[String]) -> Result<ExitCode> {
                     }
                 }
             }
-            s => rest.push(s),
+            // A non-option argument is never rewritten by the resolver, so this
+            // pushes the original slice and keeps `rest` borrowed from `args`.
+            _ => rest.push(a),
         }
         i += 1;
     }

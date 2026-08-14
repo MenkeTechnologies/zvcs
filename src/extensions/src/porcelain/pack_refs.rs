@@ -36,11 +36,24 @@ use gix::refs::file::transaction::PackedRefs;
 use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
 use gix::refs::{FullName, Target};
 
+use super::{Arg, LongOpt};
+
 /// The first line of a `packed-refs` file, byte-identical to what git writes.
 const HEADER_LINE: &[u8] = b"# pack-refs with: peeled fully-peeled sorted \n";
 
 /// Ref name prefixes that are per-worktree and therefore never packed.
 const PER_WORKTREE: [&str; 3] = ["refs/bisect/", "refs/worktree/", "refs/rewritten/"];
+
+/// `cmd_pack_refs()`'s `struct option opts[]` (builtin/pack-refs.c), in table
+/// order, as [`super::resolve_long`] reads it. No entry carries
+/// `PARSE_OPT_NONEG`.
+const LONG_OPTS: &[LongOpt] = &[
+    LongOpt { name: "all", neg: true, arg: Arg::None },
+    LongOpt { name: "prune", neg: true, arg: Arg::None },
+    LongOpt { name: "auto", neg: true, arg: Arg::None },
+    LongOpt { name: "include", neg: true, arg: Arg::Required },
+    LongOpt { name: "exclude", neg: true, arg: Arg::Required },
+];
 
 /// git's own usage block, reproduced byte-for-byte (it is part of the output
 /// contract for `-h` on stdout and for usage errors on stderr).
@@ -94,6 +107,13 @@ pub fn pack_refs(args: &[String]) -> Result<ExitCode> {
             eprint!("{USAGE}");
             return Ok(ExitCode::from(129));
         }
+        let resolved = match super::canonical_long(a, LONG_OPTS) {
+            super::Long::Name(name) => name,
+            super::Long::Ambiguous(first, second) => {
+                return Ok(super::ambiguous_option(a, &first, &second, USAGE))
+            }
+        };
+        let a = resolved.as_ref();
         match a {
             "-h" => {
                 print!("{USAGE}");

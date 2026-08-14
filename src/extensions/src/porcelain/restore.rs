@@ -41,6 +41,39 @@ use gix::merge::blob::builtin_driver::text::{Conflict, ConflictStyle, Labels, Op
 use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
 use gix::refs::Target;
 
+use super::{Arg, LongOpt};
+
+/// `cmd_restore()`'s option table (builtin/checkout.c:2187), in the order
+/// `parse_options_concat()` builds it: `restore_options[]`, then
+/// `add_common_options()`, then `add_checkout_path_options()`.
+///
+/// `--ours`/`--theirs` are `PARSE_OPT_NONEG` `OPT_SET_INT_F`s and `--unified` /
+/// `--inter-hunk-context` are `PARSE_OPT_NONEG` too, so none of the four has a
+/// `--no-` spelling. `--auto-advance` belongs to `checkout_options[]` alone and is
+/// deliberately absent here, exactly as `git restore` rejects it.
+const LONG_OPTS: &[LongOpt] = &[
+    // restore_options[] (builtin/checkout.c:2187)
+    LongOpt { name: "source",                      neg: true,  arg: Arg::Required },
+    LongOpt { name: "staged",                      neg: true,  arg: Arg::None },
+    LongOpt { name: "worktree",                    neg: true,  arg: Arg::None },
+    LongOpt { name: "ignore-unmerged",             neg: true,  arg: Arg::None },
+    LongOpt { name: "overlay",                     neg: true,  arg: Arg::None },
+    // add_common_options() (builtin/checkout.c:1767)
+    LongOpt { name: "quiet",                       neg: true,  arg: Arg::None },
+    LongOpt { name: "recurse-submodules",          neg: true,  arg: Arg::Optional },
+    LongOpt { name: "progress",                    neg: true,  arg: Arg::None },
+    LongOpt { name: "merge",                       neg: true,  arg: Arg::None },
+    LongOpt { name: "conflict",                    neg: true,  arg: Arg::Required },
+    // add_checkout_path_options() (builtin/checkout.c:1811)
+    LongOpt { name: "ours",                        neg: false, arg: Arg::None },
+    LongOpt { name: "theirs",                      neg: false, arg: Arg::None },
+    LongOpt { name: "patch",                       neg: true,  arg: Arg::None },
+    LongOpt { name: "unified",                     neg: false, arg: Arg::Required },
+    LongOpt { name: "inter-hunk-context",          neg: false, arg: Arg::Required },
+    LongOpt { name: "ignore-skip-worktree-bits",   neg: true,  arg: Arg::None },
+    LongOpt { name: "pathspec-from-file",          neg: true,  arg: Arg::Required },
+    LongOpt { name: "pathspec-file-nul",           neg: true,  arg: Arg::None },
+];
 /// `usage_with_options()` over `builtin/checkout.c`'s `restore` option table.
 const USAGE: &str = r"usage: git restore [<options>] [--source=<branch>] <file>...
 
@@ -302,19 +335,22 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
         }
     };
 
-    // `-U`/`--unified`, `--inter-hunk-context`, `--[no-]auto-advance`: the
-    // interactive hunk selector's options, parsed and diagnosed by the same code
-    // `git reset` and `git checkout` use.
-    let mut patch_opts = super::reset::PatchDiffOpts::default();
+    // `-U`/`--unified` and `--inter-hunk-context`: the interactive hunk selector's
+    // options, parsed and diagnosed by the same code `git reset` and `git checkout`
+    // use. `--[no-]auto-advance` is *not* among them — `OPT_ADD_AUTO_ADVANCE` sits in
+    // `checkout_options[]` alone (builtin/checkout.c:2100), not in the
+    // `add_checkout_path_options()` block `cmd_restore()` concatenates, so stock
+    // answers `git restore --auto-advance` with `unknown option`.
+    let mut patch_opts = super::reset::PatchDiffOpts::without_auto_advance();
     let mut patch_mode = false;
 
     let mut i = 0;
     while i < args.len() {
-        let a = &args[i];
         // A value still owed to `-U`/`--inter-hunk-context` is taken verbatim,
-        // even past `--`, exactly as parse-options takes it.
-        if patch_opts.awaiting_value() || !after_dashdash {
-            match patch_opts.take_arg(a) {
+        // even past `--`, exactly as parse-options takes it — and precisely because
+        // it is a value, it is never resolved as an option name.
+        if patch_opts.awaiting_value() {
+            match patch_opts.take_arg(&args[i]) {
                 Err(code) => return Ok(code),
                 Ok(true) => {
                     i += 1;
@@ -324,11 +360,32 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
             }
         }
         if after_dashdash {
-            pathspecs.push(a.clone());
+            pathspecs.push(args[i].clone());
             i += 1;
             continue;
         }
-        match a.as_str() {
+        // Respell a unique abbreviation as the name it resolves to, ahead of both
+        // the shared value-option handler and the match below, so `--ignore-unm`
+        // reaches the same arm as `--ignore-unmerged`.
+        let canonical;
+        let a = match super::canonical_long(&args[i], LONG_OPTS) {
+            super::Long::Name(name) => {
+                canonical = name;
+                canonical.as_ref()
+            }
+            super::Long::Ambiguous(first, second) => {
+                return Ok(super::ambiguous_option(&args[i], &first, &second, USAGE))
+            }
+        };
+        match patch_opts.take_arg(a) {
+            Err(code) => return Ok(code),
+            Ok(true) => {
+                i += 1;
+                continue;
+            }
+            Ok(false) => {}
+        }
+        match a {
             "--" => after_dashdash = true,
             // parse_options_step()'s `internal_help`: the block on stdout at
             // 129, with no `error:` line — a help request is not a rejection.
@@ -410,7 +467,8 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
                 eprintln!("error: unknown option `{}'", s.trim_start_matches('-'));
                 return Ok(ExitCode::from(129));
             }
-            _ => pathspecs.push(a.clone()),
+            // A non-option argument is handed back unchanged by the resolver.
+            _ => pathspecs.push(a.to_string()),
         }
         i += 1;
     }

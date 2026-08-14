@@ -32,6 +32,18 @@ use gix::bstr::{BStr, BString};
 use gix::hash::ObjectId;
 use gix::index::entry::{Flags, Mode, Stage, Stat};
 
+use super::{Arg, LongOpt};
+
+/// `cmd_mv()`'s `struct option builtin_mv_options[]` (builtin/mv.c), in table
+/// order, as [`super::resolve_long`] reads it. `-k` is short-only and so has no
+/// entry; no entry carries `PARSE_OPT_NONEG`.
+const LONG_OPTS: &[LongOpt] = &[
+    LongOpt { name: "verbose", neg: true, arg: Arg::None },
+    LongOpt { name: "dry-run", neg: true, arg: Arg::None },
+    LongOpt { name: "force", neg: true, arg: Arg::None },
+    LongOpt { name: "sparse", neg: true, arg: Arg::None },
+];
+
 /// `git mv -h` help, printed verbatim to stdout (git exits 129 after it).
 const HELP: &str = "\
 usage: git mv [-v] [-f] [-n] [-k] <source> <destination>
@@ -55,7 +67,9 @@ fn fatal(msg: impl std::fmt::Display) -> Result<ExitCode> {
 
 /// Print the usage line to stderr and return git's usage exit code (129).
 fn usage_err() -> Result<ExitCode> {
-    eprintln!("usage: git mv [-v] [-f] [-n] [-k] <source> <destination>");
+    // `usage_with_options()` writes the whole block — both `or:` lines and the
+    // option list — not just the first line.
+    eprint!("{HELP}");
     Ok(ExitCode::from(129))
 }
 
@@ -93,7 +107,13 @@ pub fn mv(args: &[String]) -> Result<ExitCode> {
             positional.push(a);
             continue;
         }
-        match a.as_str() {
+        let resolved = match super::canonical_long(a, LONG_OPTS) {
+            super::Long::Name(name) => name,
+            super::Long::Ambiguous(first, second) => {
+                return Ok(super::ambiguous_option(a, &first, &second, HELP))
+            }
+        };
+        match resolved.as_ref() {
             "--" => opts_done = true,
             "-h" => {
                 // git prints the full help to stdout and exits 129, before any
@@ -104,16 +124,21 @@ pub fn mv(args: &[String]) -> Result<ExitCode> {
                 return Ok(ExitCode::from(129));
             }
             "-f" | "--force" => force = true,
+            // Every flag here is an `OPT_BOOL`, whose unset writes 0.
+            "--no-force" => force = false,
             "-k" => skip = true,
             "-n" | "--dry-run" => dry_run = true,
+            "--no-dry-run" => dry_run = false,
             "-v" | "--verbose" => verbose = true,
+            "--no-verbose" => verbose = false,
             "--sparse" => ignore_sparse = true,
             "--no-sparse" => ignore_sparse = false,
             s if s.starts_with('-') && s.len() > 1 => {
                 eprintln!("error: unknown option `{}'", s.trim_start_matches('-'));
                 return usage_err();
             }
-            s => positional.push(s),
+            // A non-option argument is handed back unchanged by the resolver.
+            _ => positional.push(a),
         }
     }
 

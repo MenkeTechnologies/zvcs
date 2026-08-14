@@ -60,6 +60,8 @@ use gix::hash::ObjectId;
 use gix::objs::Kind;
 use gix::prelude::ObjectIdExt;
 
+use super::{Arg, LongOpt};
+
 /// How many generations are maximally preferred over _one_ merge traversal.
 const MERGE_TRAVERSAL_WEIGHT: i32 = 65535;
 /// One day of slop on the date cutoff, to tolerate slight clock skew.
@@ -75,6 +77,22 @@ const REV_PARSE_RULES: [(&str, &str); 6] = [
     ("refs/heads/", ""),
     ("refs/remotes/", ""),
     ("refs/remotes/", "/HEAD"),
+];
+
+/// `cmd_name_rev()`'s `struct option opts[]` (builtin/name-rev.c), in table
+/// order, as [`super::resolve_long`] reads it. No entry carries
+/// `PARSE_OPT_NONEG`, so every one of them negates.
+const LONG_OPTS: &[LongOpt] = &[
+    LongOpt { name: "name-only", neg: true, arg: Arg::None },
+    LongOpt { name: "tags", neg: true, arg: Arg::None },
+    LongOpt { name: "refs", neg: true, arg: Arg::Required },
+    LongOpt { name: "exclude", neg: true, arg: Arg::Required },
+    LongOpt { name: "all", neg: true, arg: Arg::None },
+    LongOpt { name: "stdin", neg: true, arg: Arg::None },
+    LongOpt { name: "annotate-stdin", neg: true, arg: Arg::None },
+    LongOpt { name: "undefined", neg: true, arg: Arg::None },
+    LongOpt { name: "always", neg: true, arg: Arg::None },
+    LongOpt { name: "peel-tag", neg: true, arg: Arg::None },
 ];
 
 /// The exact `usage_with_options` block git prints when the invocation mixes a
@@ -393,6 +411,10 @@ pub fn name_rev(args: &[String]) -> Result<ExitCode> {
     let mut exclude_filters: Vec<String> = Vec::new();
     let mut all = false;
     let mut annotate_stdin = false;
+    // git's separate `transform_stdin`, which the deprecated `--stdin` sets and
+    // `--no-stdin` clears; it is folded into `annotate_stdin` after parsing, the
+    // way `cmd_name_rev()` does at `if (transform_stdin)`.
+    let mut transform_stdin = false;
     let mut allow_undefined = true;
     let mut always = false;
     let mut peel_tag = false;
@@ -407,6 +429,13 @@ pub fn name_rev(args: &[String]) -> Result<ExitCode> {
             i += 1;
             continue;
         }
+        let resolved = match super::canonical_long(a, LONG_OPTS) {
+            super::Long::Name(name) => name,
+            super::Long::Ambiguous(first, second) => {
+                return Ok(super::ambiguous_option(a, &first, &second, USAGE))
+            }
+        };
+        let a = resolved.as_ref();
         match a {
             "--" => no_more_opts = true,
             "-h" => {
@@ -422,14 +451,8 @@ pub fn name_rev(args: &[String]) -> Result<ExitCode> {
             "--no-all" => all = false,
             "--annotate-stdin" => annotate_stdin = true,
             "--no-annotate-stdin" => annotate_stdin = false,
-            "--stdin" => {
-                eprintln!(
-                    "warning: --stdin is deprecated. Please use --annotate-stdin instead, \
-                     which is functionally equivalent.\n\
-                     This option will be removed in a future release."
-                );
-                annotate_stdin = true;
-            }
+            "--stdin" => transform_stdin = true,
+            "--no-stdin" => transform_stdin = false,
             "--undefined" => allow_undefined = true,
             "--no-undefined" => allow_undefined = false,
             "--always" => always = true,
@@ -472,6 +495,23 @@ pub fn name_rev(args: &[String]) -> Result<ExitCode> {
             }
         }
         i += 1;
+    }
+
+    // ```c
+    // if (transform_stdin) {
+    //         warning("--stdin is deprecated. …");
+    //         annotate_stdin = 1;
+    // }
+    // ```
+    // The warning is emitted once, after parsing, so `--stdin --no-stdin` is
+    // silent and does not read stdin.
+    if transform_stdin {
+        eprintln!(
+            "warning: --stdin is deprecated. Please use --annotate-stdin instead, \
+             which is functionally equivalent.\n\
+             This option will be removed in a future release."
+        );
+        annotate_stdin = true;
     }
 
     // git: `if (all + annotate_stdin + !!argc > 1)` -> error + usage, exit 129.

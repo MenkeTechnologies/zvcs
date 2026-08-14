@@ -95,6 +95,30 @@ use gix::hash::ObjectId;
 use gix::index::entry::stat::Options;
 use gix::index::entry::{Flags, Mode, Stat};
 
+use super::{Arg, LongOpt};
+
+/// `cmd_read_tree()`'s `struct option read_tree_options[]`
+/// (builtin/read-tree.c:130-170), in table order, as [`super::resolve_long`]
+/// reads it. `--index-output`, `--prefix` and `--exclude-per-directory` carry
+/// `PARSE_OPT_NONEG`; `--no-sparse-checkout` is an `OPT_BOOL` whose name already
+/// carries the `no-`, so `--sparse-checkout` is that same entry unset.
+const LONG_OPTS: &[LongOpt] = &[
+    LongOpt { name: "super-prefix", neg: true, arg: Arg::Required },
+    LongOpt { name: "index-output", neg: false, arg: Arg::Required },
+    LongOpt { name: "empty", neg: true, arg: Arg::None },
+    LongOpt { name: "verbose", neg: true, arg: Arg::None },
+    LongOpt { name: "trivial", neg: true, arg: Arg::None },
+    LongOpt { name: "aggressive", neg: true, arg: Arg::None },
+    LongOpt { name: "reset", neg: true, arg: Arg::None },
+    LongOpt { name: "prefix", neg: false, arg: Arg::Required },
+    LongOpt { name: "exclude-per-directory", neg: false, arg: Arg::Required },
+    LongOpt { name: "dry-run", neg: true, arg: Arg::None },
+    LongOpt { name: "no-sparse-checkout", neg: true, arg: Arg::None },
+    LongOpt { name: "debug-unpack", neg: true, arg: Arg::None },
+    LongOpt { name: "recurse-submodules", neg: true, arg: Arg::Optional },
+    LongOpt { name: "quiet", neg: true, arg: Arg::None },
+];
+
 /// Parsed command line for a single `read-tree` invocation.
 #[derive(Default)]
 pub(super) struct Opts {
@@ -301,6 +325,15 @@ pub(super) fn parse_args(argv: &[String]) -> Result<std::result::Result<Opts, Ex
         }
 
         // ---- Long options: `--name` or `--name=<value>`. ----
+        // The name is resolved the way `parse_long_opt()` resolves it first, so a
+        // unique abbreviation reaches the arm its full spelling reaches.
+        let resolved = match super::canonical_long(a, LONG_OPTS) {
+            super::Long::Name(name) => name,
+            super::Long::Ambiguous(first, second) => {
+                return Ok(Err(super::ambiguous_option(a, &first, &second, USAGE)))
+            }
+        };
+        let a = resolved.as_ref();
         let body = &a[2..];
         let (name, inline) = match body.find('=') {
             Some(eq) => (&body[..eq], Some(&body[eq + 1..])),

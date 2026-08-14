@@ -336,12 +336,21 @@ pub(crate) fn canonical_long_aliased<'a>(
     match resolve_long_aliased(table, alias_groups, body) {
         Resolved::Unknown => Long::Name(tok.into()),
         Resolved::Ambiguous(first, second) => Long::Ambiguous(first, second),
-        Resolved::One(opt, negated) => {
+        Resolved::One(opt, sense) => {
+            // The spelling that parses back to this same entry and sense. For a
+            // `no-`-named entry the two are crossed: `--no-verify` selects the
+            // `no-verify` entry positively and `--verify` selects it unset, so
+            // the `no-` belongs on the token exactly when `sense` and the
+            // entry's own `no-` disagree.
+            let (stem, opt_unset) = match opt.name.strip_prefix("no-") {
+                Some(stem) => (stem, true),
+                None => (opt.name, false),
+            };
             let mut out = String::from("--");
-            if negated {
+            if sense ^ opt_unset {
                 out.push_str("no-");
             }
-            out.push_str(opt.name);
+            out.push_str(stem);
             if let Some((_, value)) = body.split_once('=') {
                 out.push('=');
                 out.push_str(value);
@@ -778,6 +787,135 @@ pub use write_tree::write_tree;
 
 #[cfg(test)]
 mod tests {
+    use super::{canonical_long, resolve_long, Arg, Long, LongOpt, Resolved};
+
+    /// A table with one of every shape `parse_long_opt()` treats differently: a
+    /// plain negatable flag, a `PARSE_OPT_NONEG` flag, two entries sharing a
+    /// prefix, and a `no-`-named entry (which is the *unset* sense of its stem,
+    /// not a separate name).
+    const TABLE: &[LongOpt] = &[
+        LongOpt { name: "verbose", neg: true, arg: Arg::None },
+        LongOpt { name: "version", neg: true, arg: Arg::None },
+        LongOpt { name: "quiet", neg: false, arg: Arg::None },
+        LongOpt { name: "no-index", neg: true, arg: Arg::None },
+        LongOpt { name: "sort", neg: true, arg: Arg::Required },
+    ];
+
+    fn r(name: &str) -> String {
+        match resolve_long(TABLE, name) {
+            Resolved::One(opt, false) => opt.name.to_string(),
+            Resolved::One(opt, true) => format!("unset:{}", opt.name),
+            Resolved::Ambiguous(a, b) => format!("ambiguous:{a}|{b}"),
+            Resolved::Unknown => "unknown".to_string(),
+        }
+    }
+
+    fn c(tok: &str) -> String {
+        match canonical_long(tok, TABLE) {
+            Long::Name(name) => name.into_owned(),
+            Long::Ambiguous(a, b) => format!("ambiguous:{a}|{b}"),
+        }
+    }
+
+    /// The abbreviation rule itself: any unique prefix resolves, a shared one
+    /// does not, and the full name always wins over a prefix of a longer one.
+    #[test]
+    fn a_unique_prefix_resolves_and_a_shared_one_does_not() {
+        assert_eq!(r("sor"), "sort");
+        assert_eq!(r("s"), "sort");
+        assert_eq!(r("verbose"), "verbose");
+        assert_eq!(r("versio"), "version");
+        // Both `verbose` and `version` start with `ver`.
+        assert_eq!(r("ver"), "ambiguous:verbose|version");
+        assert_eq!(r("zz"), "unknown");
+    }
+
+    /// `PARSE_OPT_NONEG` is the only thing that removes the automatic `--no-`
+    /// spelling, and it removes it from the abbreviations too.
+    #[test]
+    fn noneg_entries_have_no_negation() {
+        assert_eq!(r("no-sort"), "unset:sort");
+        assert_eq!(r("no-so"), "unset:sort");
+        assert_eq!(r("quiet"), "quiet");
+        assert_eq!(r("no-quiet"), "unknown");
+        assert_eq!(r("no-qui"), "unknown");
+    }
+
+    /// `starts_with("no-", arg)` asks whether *`arg` is a prefix of `"no-"`*, so
+    /// `--n` names every negatable entry at once and reports the last two in
+    /// table order. The `no-index` entry is registered in the sense that spells
+    /// itself, so it appears as `--no-index` rather than `--no-no-index`.
+    #[test]
+    fn a_bare_n_is_an_abbreviation_of_every_negation() {
+        assert_eq!(r("n"), "ambiguous:no-index|no-sort");
+        assert_eq!(r("no"), "ambiguous:no-index|no-sort");
+    }
+
+    /// A table entry whose own name starts with `no-` is the unset sense of its
+    /// stem: `--index` is that entry, not a missing one, and the canonical
+    /// spellings of the two senses are crossed.
+    #[test]
+    fn a_no_named_entry_owns_both_spellings() {
+        assert_eq!(r("no-index"), "no-index");
+        assert_eq!(r("index"), "unset:no-index");
+        assert_eq!(c("--no-ind"), "--no-index");
+        assert_eq!(c("--ind"), "--index");
+    }
+
+    /// What the verbs actually consume: the token respelled, with any attached
+    /// value carried across, and anything unresolvable left exactly as typed so
+    /// the command's own `unknown option` still quotes what the user wrote.
+    #[test]
+    fn canonicalization_rewrites_only_what_it_resolves() {
+        assert_eq!(c("--sor=x"), "--sort=x");
+        assert_eq!(c("--no-verb"), "--no-verbose");
+        assert_eq!(c("--sort"), "--sort");
+        assert_eq!(c("--zz"), "--zz");
+        assert_eq!(c("--ver"), "ambiguous:verbose|version");
+        // Not long options at all.
+        assert_eq!(c("--"), "--");
+        assert_eq!(c("--end-of-options"), "--end-of-options");
+        assert_eq!(c("-s"), "-s");
+        assert_eq!(c("sort"), "sort");
+    }
+
+    /// `is_alias()`: two entries joined by an `OPT_ALIAS()` do not make each
+    /// other ambiguous, so a prefix that names both still resolves.
+    ///
+    /// This is `git clone`'s `OPT_ALIAS(0, "recursive", "recurse-submodules")`.
+    /// Verified against stock 2.55.0: `git clone --recur` gets as far as
+    /// `fatal: You must specify a repository to clone.` rather than reporting an
+    /// ambiguity, even though both names start with `recur`.
+    #[test]
+    fn an_alias_pair_is_not_ambiguous_with_itself() {
+        const ALIASED: &[LongOpt] = &[
+            LongOpt { name: "recurse-submodules", neg: true, arg: Arg::Optional },
+            LongOpt { name: "recursive", neg: true, arg: Arg::Optional },
+        ];
+        let groups: &[&[&str]] = &[&["recursive", "recurse-submodules"]];
+
+        let describe = |res| match res {
+            Resolved::One(opt, _) => format!("one:{}", opt.name),
+            Resolved::Ambiguous(a, b) => format!("ambiguous:{a}|{b}"),
+            Resolved::Unknown => "unknown".to_string(),
+        };
+
+        assert_eq!(
+            describe(super::resolve_long(ALIASED, "recur")),
+            "ambiguous:recurse-submodules|recursive"
+        );
+        assert_eq!(
+            describe(super::resolve_long_aliased(ALIASED, groups, "recur")),
+            "one:recursive"
+        );
+        // An alias group only covers its own pair; `--r` here is the same two
+        // names, so it resolves too, but a third unrelated entry would not.
+        assert_eq!(
+            describe(super::resolve_long_aliased(ALIASED, groups, "recursi")),
+            "one:recursive"
+        );
+    }
+
     /// `show_usage_if_asked()` fires on a lone `-h` and on nothing else.
     ///
     /// This is the one rule that separates the two `-h` families, and getting it

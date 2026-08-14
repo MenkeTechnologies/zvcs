@@ -150,6 +150,24 @@ use gix::odb::pack;
 // The pack artifacts all end the same way and name the hash the same way, so
 // the two encoders `pack-objects` already had are shared rather than repeated.
 use super::pack_objects::{append_checksum, hash_id};
+use super::{Arg, LongOpt};
+
+/// `cmd_gc()`'s `struct option builtin_gc_options[]` (builtin/gc.c), in table
+/// order, as [`super::resolve_long`] reads it. `--max-cruft-size` is the only
+/// `PARSE_OPT_NONEG` entry; `--prune` is `PARSE_OPT_OPTARG`.
+const LONG_OPTS: &[LongOpt] = &[
+    LongOpt { name: "quiet", neg: true, arg: Arg::None },
+    LongOpt { name: "prune", neg: true, arg: Arg::Optional },
+    LongOpt { name: "cruft", neg: true, arg: Arg::None },
+    LongOpt { name: "max-cruft-size", neg: false, arg: Arg::Required },
+    LongOpt { name: "aggressive", neg: true, arg: Arg::None },
+    LongOpt { name: "auto", neg: true, arg: Arg::None },
+    LongOpt { name: "detach", neg: true, arg: Arg::None },
+    LongOpt { name: "force", neg: true, arg: Arg::None },
+    LongOpt { name: "keep-largest-pack", neg: true, arg: Arg::None },
+    LongOpt { name: "expire-to", neg: true, arg: Arg::Required },
+    LongOpt { name: "skip-foreground-tasks", neg: true, arg: Arg::None },
+];
 
 /// Stock git's `gc` usage block, byte-for-byte (744 bytes, git 2.55.0),
 /// including the trailing blank line. Printed on `-h` (stdout) and on any usage
@@ -266,6 +284,13 @@ pub fn gc(args: &[String]) -> Result<ExitCode> {
         if end_of_opts {
             return Ok(usage_error(None));
         }
+        let resolved = match super::canonical_long(a, LONG_OPTS) {
+            super::Long::Name(name) => name,
+            super::Long::Ambiguous(first, second) => {
+                return Ok(super::ambiguous_option(a, &first, &second, USAGE))
+            }
+        };
+        let a = resolved.as_ref();
         match a {
             "--" => end_of_opts = true,
             "-h" => {

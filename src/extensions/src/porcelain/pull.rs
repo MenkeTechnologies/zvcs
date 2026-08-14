@@ -112,6 +112,72 @@ use std::process::ExitCode;
 
 use gix::remote::Direction;
 
+use super::{Arg, LongOpt};
+
+/// `cmd_pull()`'s `struct option pull_options[]` (builtin/pull.c), in table order,
+/// as [`super::resolve_long_aliased`] reads it.
+///
+/// `--ff-only`, `--unshallow` and `--refmap` carry `PARSE_OPT_NONEG` and so have no
+/// `--no-` spelling; `-4`/`-6` are `OPT_PASSTHRU`s with only `PARSE_OPT_NOARG`, so
+/// they do.
+const LONG_OPTS: &[LongOpt] = &[
+    LongOpt { name: "verbose",                     neg: true,  arg: Arg::None },
+    LongOpt { name: "quiet",                       neg: true,  arg: Arg::None },
+    LongOpt { name: "progress",                    neg: true,  arg: Arg::None },
+    LongOpt { name: "recurse-submodules",          neg: true,  arg: Arg::Optional },
+    LongOpt { name: "rebase",                      neg: true,  arg: Arg::Optional },
+    LongOpt { name: "stat",                        neg: true,  arg: Arg::None },
+    LongOpt { name: "summary",                     neg: true,  arg: Arg::None },
+    LongOpt { name: "compact-summary",             neg: true,  arg: Arg::None },
+    LongOpt { name: "log",                         neg: true,  arg: Arg::Optional },
+    LongOpt { name: "signoff",                     neg: true,  arg: Arg::Optional },
+    LongOpt { name: "squash",                      neg: true,  arg: Arg::None },
+    LongOpt { name: "commit",                      neg: true,  arg: Arg::None },
+    LongOpt { name: "edit",                        neg: true,  arg: Arg::None },
+    LongOpt { name: "cleanup",                     neg: true,  arg: Arg::Required },
+    LongOpt { name: "ff",                          neg: true,  arg: Arg::None },
+    LongOpt { name: "ff-only",                     neg: false, arg: Arg::None },
+    LongOpt { name: "verify",                      neg: true,  arg: Arg::None },
+    LongOpt { name: "verify-signatures",           neg: true,  arg: Arg::None },
+    LongOpt { name: "autostash",                   neg: true,  arg: Arg::None },
+    LongOpt { name: "strategy",                    neg: true,  arg: Arg::Required },
+    LongOpt { name: "strategy-option",             neg: true,  arg: Arg::Required },
+    LongOpt { name: "gpg-sign",                    neg: true,  arg: Arg::Optional },
+    LongOpt { name: "allow-unrelated-histories",   neg: true,  arg: Arg::None },
+    LongOpt { name: "all",                         neg: true,  arg: Arg::None },
+    LongOpt { name: "append",                      neg: true,  arg: Arg::None },
+    LongOpt { name: "upload-pack",                 neg: true,  arg: Arg::Required },
+    LongOpt { name: "force",                       neg: true,  arg: Arg::None },
+    LongOpt { name: "tags",                        neg: true,  arg: Arg::None },
+    LongOpt { name: "prune",                       neg: true,  arg: Arg::None },
+    LongOpt { name: "jobs",                        neg: true,  arg: Arg::Optional },
+    LongOpt { name: "dry-run",                     neg: true,  arg: Arg::None },
+    LongOpt { name: "keep",                        neg: true,  arg: Arg::None },
+    LongOpt { name: "depth",                       neg: true,  arg: Arg::Required },
+    LongOpt { name: "shallow-since",               neg: true,  arg: Arg::Required },
+    LongOpt { name: "shallow-exclude",             neg: true,  arg: Arg::Required },
+    LongOpt { name: "deepen",                      neg: true,  arg: Arg::Required },
+    LongOpt { name: "unshallow",                   neg: false, arg: Arg::None },
+    LongOpt { name: "update-shallow",              neg: true,  arg: Arg::None },
+    LongOpt { name: "refmap",                      neg: false, arg: Arg::Required },
+    LongOpt { name: "server-option",               neg: true,  arg: Arg::Required },
+    LongOpt { name: "ipv4",                        neg: true,  arg: Arg::None },
+    LongOpt { name: "ipv6",                        neg: true,  arg: Arg::None },
+    LongOpt { name: "negotiation-restrict",        neg: true,  arg: Arg::Required },
+    // `OPT_ALIAS(0, "negotiation-tip", "negotiation-restrict")`: `preprocess_options()`
+    // copies the source entry over the alias, keeping only the alias's own name, so it
+    // resolves with the source's negatability and value handling.
+    LongOpt { name: "negotiation-tip",            neg: true,  arg: Arg::Required },
+    LongOpt { name: "negotiation-include",         neg: true,  arg: Arg::Required },
+    LongOpt { name: "show-forced-updates",         neg: true,  arg: Arg::None },
+    LongOpt { name: "set-upstream",                neg: true,  arg: Arg::None },
+];
+
+/// The one `OPT_ALIAS()` group in `pull_options[]`. `is_alias()` (parse-options.c:471)
+/// reads it so `--negotiation-` does not report itself as ambiguous between an alias
+/// and the option it aliases.
+const ALIAS_GROUPS: &[&[&str]] = &[&["negotiation-tip", "negotiation-restrict"]];
+
 /// `usage_with_options()` rendering of `builtin/pull.c`'s option table, verbatim
 /// (git's `-h` writes it to stdout and exits 129).
 const USAGE: &str = concat!(
@@ -339,8 +405,23 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
 
     let mut i = 0;
     while i < args.len() {
-        let a = args[i].as_str();
+        let typed = args[i].as_str();
         i += 1;
+
+        // Respell a unique abbreviation as the name it resolves to, so `--autost`
+        // reaches the same arm as `--autostash`. The aliased form is needed because
+        // `pull_options[]` has an `OPT_ALIAS()`: without the group, `--negotiation-`
+        // would report itself ambiguous between the alias and its source.
+        let canonical;
+        let a = match super::canonical_long_aliased(typed, LONG_OPTS, ALIAS_GROUPS) {
+            super::Long::Name(name) => {
+                canonical = name;
+                canonical.as_ref()
+            }
+            super::Long::Ambiguous(first, second) => {
+                return Ok(super::ambiguous_option(typed, &first, &second, USAGE))
+            }
+        };
 
         // Split `--opt=value` for the value-taking long options.
         let (key, inline) = match (a.starts_with("--"), a.split_once('=')) {
@@ -503,6 +584,12 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
                 let mode = take_value!("cleanup");
                 merge_passthru.push(format!("--cleanup={mode}"));
             }
+            // `OPT_CLEANUP` is an `OPT_STRING`, so its unset writes NULL over
+            // `cleanup_arg` (parse-options.c:200-202) — and `cmd_pull()` only
+            // forwards `--cleanup=<mode>` to the merge `if (cleanup_arg)`
+            // (builtin/pull.c:549). A `--no-cleanup` therefore discards an earlier
+            // value and sends nothing, rather than being an unknown option.
+            "--no-cleanup" => merge_passthru.retain(|o| !o.starts_with("--cleanup=")),
 
             // Absent substrate. `--no-set-upstream`/`--no-gpg-sign` ask for the
             // default (do neither), so they are accepted where the positive form
@@ -547,7 +634,9 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
                 eprint!("{USAGE}");
                 return Ok(ExitCode::from(129));
             }
-            other => positionals.push(other),
+            // A non-option argument: the resolver hands those back untouched, so
+            // the argv slice itself is pushed and the operand keeps `args`' lifetime.
+            _ => positionals.push(typed),
         }
     }
 

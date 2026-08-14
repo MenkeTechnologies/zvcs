@@ -101,10 +101,24 @@ pub fn request_pull(args: &[String]) -> Result<ExitCode> {
                 print!("{USAGE}");
                 return Ok(ExitCode::from(129));
             }
+            // `git rev-parse --parseopt` runs the rejected argument through
+            // parse-options, which names an *option* for a `--` spelling and a
+            // *switch* for a short one (parse-options.c:889-898). The
+            // `OPTIONS_SPEC` in git-request-pull.sh declares only `p`, so no
+            // long name resolves and every `--x` is unknown by name.
             _ => {
-                // parseopt's own diagnostic, both lines on stderr.
-                let sw = a.trim_start_matches('-');
-                eprintln!("error: unknown switch `{sw}'");
+                let _ = match a.strip_prefix("--") {
+                    Some(body) => eprintln!("error: unknown option `{body}'"),
+                    None => {
+                        let c = a[1..].chars().next().unwrap_or_default();
+                        match c.is_ascii() {
+                            true => eprintln!("error: unknown switch `{c}'"),
+                            false => {
+                                eprintln!("error: unknown non-ascii option in string: `{a}'")
+                            }
+                        }
+                    }
+                };
                 eprint!("{USAGE}");
                 return Ok(ExitCode::from(129));
             }

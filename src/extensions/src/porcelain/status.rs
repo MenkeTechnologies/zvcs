@@ -31,6 +31,7 @@ const USAGE: &str = "usage: git status [<options>] [--] [<pathspec>...]
     --renames             opposite of --no-renames
     -M, --find-renames[=<n>]
                           detect renames, optionally set similarity index
+
 ";
 
 /// How untracked files are reported, mirroring git's `--untracked-files` modes.
@@ -320,6 +321,11 @@ pub fn status(args: &[String]) -> Result<ExitCode> {
                         }
                         'v' => verbose += 1,
                         'z' => null_term = true,
+                        // parse_options_step() tests `internal_help` inside the
+                        // short-option loop, so `-h` answers wherever it appears
+                        // in a cluster — and on stdout, with no `error:` line,
+                        // because asking for help is not a rejection.
+                        'h' => return Ok(super::show_usage(USAGE)),
                         'u' => {
                             // A bare `-u` (no attached value) is git's `all` default;
                             // an attached value is captured raw and validated after

@@ -263,6 +263,9 @@ pub fn replay(args: &[String]) -> Result<ExitCode> {
             "--revert" => revert_name = Some(value_of(args, &mut i, inline, name)?),
             "--ref" => ref_name = Some(value_of(args, &mut i, inline, name)?),
             "--ref-action" => ref_action = Some(value_of(args, &mut i, inline, name)?),
+            // parse_options_step()'s `internal_help`: the block on stdout at
+            // 129, ahead of every unported-flag refusal below.
+            "-h" => return Ok(super::show_usage(USAGE)),
             "--" => bail!(
                 "unsupported flag \"--\" (pathspec-limited replay is not ported; \
                  ported: --contained, --onto, --advance, --revert, --ref, --ref-action)"

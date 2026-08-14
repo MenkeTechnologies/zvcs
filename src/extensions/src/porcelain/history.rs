@@ -521,7 +521,7 @@ fn split_commit(
 
 /// git's `write_ondisk_index()`: unpack `tree` into a fresh index and write it
 /// to `path`, so the hunk selector has something to stage into.
-fn write_ondisk_index(
+pub(super) fn write_ondisk_index(
     repo: &gix::Repository,
     tree: ObjectId,
     path: &std::path::Path,
@@ -536,7 +536,7 @@ fn write_ondisk_index(
 
 /// `read_index_from()` + `write_in_core_index_as_tree()` over the scratch index
 /// the selector staged into. `None` is git's `failed split tree`.
-fn tree_of_index_file(repo: &gix::Repository, path: &std::path::Path) -> Option<ObjectId> {
+pub(super) fn tree_of_index_file(repo: &gix::Repository, path: &std::path::Path) -> Option<ObjectId> {
     let index = gix::index::File::at(
         path,
         repo.object_hash(),

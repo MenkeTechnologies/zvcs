@@ -146,6 +146,12 @@ impl ThreadSafeRepository {
 
         // To be altered later based on `core.precomposeUnicode`.
         let cwd = gix_fs::current_dir(false)?;
+        // `set_git_work_tree()` (setup.c:1904) stores the *real* path of what it is handed, so a
+        // relative `GIT_WORK_TREE` is resolved here, against the directory git resolved it in.
+        let env_worktree_dir = overrides
+            .worktree_dir
+            .map(|wt| gix_path::normalize(wt.clone().into(), &cwd).map_or(wt, std::borrow::Cow::into_owned));
+        let work_tree_is_explicit = env_worktree_dir.is_some();
         let (git_dir, worktree_dir, implicit_work_tree) = if git_dir_is_explicit {
             // `setup_explicit_git_dir()`: `$GIT_DIR` *is* the git directory, resolved through a
             // `.git` file if it is one and otherwise taken verbatim — it is never re-derived from
@@ -162,14 +168,17 @@ impl ThreadSafeRepository {
                 } => git_dir.clone(),
                 _ => path,
             };
-            (git_dir, overrides.worktree_dir, ImplicitWorkTree::CurrentDir)
+            (git_dir, env_worktree_dir, ImplicitWorkTree::CurrentDir)
         } else {
             let (git_dir, worktree_dir) = gix_discover::repository::Path::from_dot_git_dir(path, path_kind, &cwd)
                 .expect("we have sanitized path with is_git()")
                 .into_repository_and_work_tree_directories();
+            // `setup_discovered_git_dir()` (setup.c:1216-1228) hands the git directory it found to
+            // `setup_explicit_git_dir()` as soon as `GIT_WORK_TREE` is set, so the environment's
+            // work tree replaces the one that comes with the location, it does not merely fill in.
             (
                 git_dir,
-                worktree_dir.or(overrides.worktree_dir),
+                env_worktree_dir.or(worktree_dir),
                 ImplicitWorkTree::ParentOfDotGitDir,
             )
         };
@@ -178,6 +187,7 @@ impl ThreadSafeRepository {
         let mut options = trust_map.into_value_by_level(git_dir_trust);
         options.git_dir_trust = git_dir_trust.into();
         options.implicit_work_tree = implicit_work_tree;
+        options.work_tree_is_explicit = work_tree_is_explicit;
         options.current_dir = Some(cwd);
         ThreadSafeRepository::open_from_paths(git_dir, worktree_dir, options)
     }
@@ -198,6 +208,7 @@ impl ThreadSafeRepository {
             bail_if_untrusted,
             open_path_as_is: _,
             implicit_work_tree,
+            work_tree_is_explicit,
             permissions:
                 Permissions {
                     ref env,
@@ -282,8 +293,13 @@ impl ThreadSafeRepository {
             cli_config_overrides,
         )?;
 
-        // core.worktree might be used to overwrite the worktree directory
-        let worktree_dir_override_from_configuration = if !config.is_bare_but_assume_bare_if_unconfigured() {
+        // core.worktree might be used to overwrite the worktree directory, but only when the work
+        // tree is not already spoken for: `setup_explicit_git_dir()` (setup.c:1142-1179) is an
+        // if-chain that starts at `GIT_WORK_TREE`, so `core.worktree` is reached only when the
+        // environment named no work tree.
+        let worktree_dir_override_from_configuration = if !work_tree_is_explicit
+            && !config.is_bare_but_assume_bare_if_unconfigured()
+        {
             fn assure_config_is_from_current_repo(
                 section: &gix_config::file::Metadata,
                 git_dir: &Path,
@@ -373,8 +389,12 @@ impl ThreadSafeRepository {
                 // is no configuration saying otherwise.
                 // Thus, if we are here and the common-dir config claims it's bare, and we have inferred a worktree anyway,
                 // forget about it.
+                // A work tree named by `GIT_WORK_TREE` is not an inference and survives: git sets it
+                // in `setup_explicit_git_dir()` before it ever looks at `core.bare`, which is why
+                // `GIT_WORK_TREE=<dir> git ls-files -o` works from inside a bare repository.
                 Some(_)
-                    if !worktree_dir_override_from_configuration
+                    if !work_tree_is_explicit
+                        && !worktree_dir_override_from_configuration
                         && refs.git_dir().ancestors().nth(1).and_then(|p| p.file_name())
                             != Some("worktrees".as_ref())
                         && config.is_bare.unwrap_or_default() =>

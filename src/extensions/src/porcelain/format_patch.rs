@@ -165,6 +165,73 @@ use gix::prelude::ObjectIdExt;
 use gix::revision::walk::Sorting;
 use gix::traverse::commit::simple::CommitTimeOrder;
 
+/// `usage_with_options()` over `builtin/log.c`'s `format-patch` option table.
+const USAGE: &str = r"usage: git format-patch [<options>] [<since> | <revision-range>]
+
+    -n, --[no-]numbered   use [PATCH n/m] even with a single patch
+    -N, --no-numbered     use [PATCH] even with multiple patches
+    -s, --[no-]signoff    add a Signed-off-by trailer
+    --[no-]stdout         print patches to standard out
+    --[no-]cover-letter   generate a cover letter
+    --[no-]commit-list-format <format-spec>
+                          format spec used for the commit list in the cover letter
+    --[no-]numbered-files use simple number sequence for output file names
+    --[no-]suffix <sfx>   use <sfx> instead of '.patch'
+    --[no-]start-number <n>
+                          start numbering patches at <n> instead of 1
+    -v, --[no-]reroll-count <reroll-count>
+                          mark the series as Nth re-roll
+    --[no-]filename-max-length <n>
+                          max length of output filename
+    --[no-]rfc[=<rfc>]    add <rfc> (default 'RFC') before 'PATCH'
+    --[no-]cover-from-description <cover-from-description-mode>
+                          generate parts of a cover letter based on a branch's description
+    --[no-]description-file <file>
+                          use branch description from file
+    --subject-prefix <prefix>
+                          use [<prefix>] instead of [PATCH]
+    -o, --output-directory <dir>
+                          store resulting files in <dir>
+    -k, --keep-subject    don't strip/add [PATCH]
+    --no-binary           don't output binary diffs
+    --binary              opposite of --no-binary
+    --[no-]zero-commit    output all-zero hash in From header
+    --[no-]ignore-if-in-upstream
+                          don't include a patch matching a commit upstream
+    -p, --no-stat         show patch format instead of default (patch + stat)
+
+Messaging
+    --[no-]add-header <header>
+                          add email header
+    --[no-]to <email>     add To: header
+    --[no-]cc <email>     add Cc: header
+    --[no-]from[=<ident>] set From address to <ident> (or committer ident if absent)
+    --[no-]in-reply-to <message-id>
+                          make first mail a reply to <message-id>
+    --[no-]attach[=<boundary>]
+                          attach the patch
+    --inline[=<boundary>] inline the patch
+    --[no-]thread[=<style>]
+                          enable message threading, styles: shallow, deep
+    --[no-]signature <signature>
+                          add a signature
+    --[no-]base <base-commit>
+                          add prerequisite tree info to the patch series
+    --[no-]signature-file <file>
+                          add a signature from a file
+    -q, --[no-]quiet      don't print the patch filenames
+    --[no-]progress       show progress while generating patches
+    --[no-]interdiff <rev>
+                          show changes against <rev> in cover letter or single patch
+    --[no-]range-diff <refspec>
+                          show changes against <refspec> in cover letter or single patch
+    --[no-]creation-factor <n>
+                          percentage by which creation is weighted
+    --[no-]force-in-body-from
+                          show in-body From: even if identical to the e-mail header
+
+";
+
 /// The version reported in the trailing `-- \n<version>\n` signature. Stock git
 /// emits its own `git_version_string` here, so this constant is what makes the
 /// signature line comparable; override per-invocation with `--signature=<s>`,
@@ -484,6 +551,12 @@ pub fn format_patch(args: &[String]) -> Result<ExitCode> {
     // does, so it is left behind either way.
     if opts.output.is_some() && opts.to_stdout {
         return Ok(fatal("options '--stdout' and '--output' cannot be used together"));
+    }
+
+    // `-o`/`--output-directory` is the same story, and git checks it whichever
+    // order the two were given in.
+    if opts.outdir.is_some() && opts.to_stdout {
+        return Ok(fatal("options '--stdout' and '--output-directory' cannot be used together"));
     }
 
     // `--ignore-if-in-upstream` compares the series against the other side of a
@@ -1196,8 +1269,20 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
             i += 1;
             continue;
         }
+        // The value checks `diff_opt_parse`'s callbacks run. Unlike every other
+        // caller of this module, `cmd_format_patch` reaches them through
+        // `setup_revisions()`, which runs *after* its own `parse_options()` pass
+        // and walks argv resolving revisions as it goes — so a bad revision
+        // earlier on the command line dies first. Recorded with its position and
+        // resolved against the revisions, like the other value errors here.
+        if let Some(line) = super::diff_optval::reject(a) {
+            record_opt_error(&mut o.opt_error, i, 129, line);
+        }
         match a {
             "--" => pathspec_mode = true,
+            // parse_options_step()'s `internal_help`, which `cmd_format_patch`
+            // runs before `setup_revisions`: the block on stdout at 129.
+            "-h" => return Ok(Parsed::Exit(super::show_usage(USAGE))),
             "--stdout" => o.to_stdout = true,
             "-o" | "--output-directory" => {
                 i += 1;
@@ -1713,12 +1798,10 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
                 }
             }
             s if s.len() > 2 && s.starts_with("-o") => o.outdir = Some(s[2..].to_owned()),
-            s if s.len() > 2
-                && s.starts_with("-v")
-                && s[2..].bytes().all(|c| c.is_ascii_digit()) =>
-            {
-                o.reroll = Some(s[2..].to_owned());
-            }
+            // `OPT_STRING('v', "reroll-count", …)`: git stores the value verbatim
+            // and never checks it is a number — `-vabc` names the series `vabc`,
+            // and only `diff_title()` later asks whether it parses as an integer.
+            s if s.len() > 2 && s.starts_with("-v") => o.reroll = Some(s[2..].to_owned()),
             // `-<n>` is a commit count, unlike `-n` which means --numbered.
             s if s.len() > 1
                 && s.starts_with('-')

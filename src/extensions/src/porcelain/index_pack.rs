@@ -181,6 +181,12 @@ impl Opts {
 }
 
 pub fn index_pack(args: &[String]) -> Result<ExitCode> {
+    // `show_usage_if_asked(argc, argv, index_pack_usage)` (builtin/index-pack.c:1909):
+    // a LONE `-h` on stdout at 129, before any of the scan below.
+    if let Some(code) = super::show_usage_if_asked(args, USAGE) {
+        return Ok(code);
+    }
+
     let mut opts = Opts::new();
 
     // git's own loop: anything starting with '-' is a flag (so a bare "-" and
@@ -205,10 +211,6 @@ pub fn index_pack(args: &[String]) -> Result<ExitCode> {
         }
 
         match a {
-            "-h" => {
-                print!("{USAGE}");
-                return Ok(ExitCode::from(129));
-            }
             "-v" => {} // progress is not drawn; stdout is unaffected
             "--stdin" => opts.stdin = true,
             "--fix-thin" => opts.fix_thin = true,

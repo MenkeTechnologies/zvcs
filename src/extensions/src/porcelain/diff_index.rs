@@ -479,6 +479,9 @@ fn render_only_option(a: &str) -> bool {
         "--no-diff-merges",
         "--no-ext-diff",
         "--no-function-context",
+        // `revision.c`'s `--no-notes` turns off a display that is off by default
+        // here, so it cannot change any output this command produces.
+        "--no-notes",
         "--no-prefix",
         "--no-rename-empty",
         "--no-renames",
@@ -631,6 +634,13 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
         _ => args,
     };
 
+    // `show_usage_if_asked(argc, argv, diff_cache_usage)` is the first statement
+    // of `cmd_diff_index()` (builtin/diff-index.c:29): stdout, exit 129, and only
+    // for a lone `-h`. Every later refusal is `usage()`, which is stderr.
+    if let Some(code) = super::show_usage_if_asked(args, USAGE) {
+        return Ok(code);
+    }
+
     let mut opts = Opts {
         cached: false,
         match_missing: false,
@@ -745,6 +755,12 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
         i += 1;
         if after_dashdash {
             paths.push(a.into());
+            continue;
+        }
+        // The value checks `diff_opt_parse`'s callbacks run as each option is seen.
+        // Deferred like every other one so a bad revision earlier in argv still wins.
+        if let Some(line) = super::diff_optval::reject(a) {
+            deferred.get_or_insert((cur, 129, format!("{line}\n").into_bytes()));
             continue;
         }
         // `--ws-error-highlight <kind>`, `--color-moved-ws <modes>` and
@@ -1294,6 +1310,13 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
     if let Some((_, code, msg)) = &deferred {
         std::io::stderr().lock().write_all(msg)?;
         return Ok(ExitCode::from(*code));
+    }
+    // `diff_setup_done()`'s pickaxe check: a `die()` after the revisions are
+    // resolved, and — measured against 2.55.0 — ahead of the operand-count usage
+    // error, so a `diff-index -Gx -Sx` with no tree-ish reports the conflict.
+    if super::diff_optval::pickaxe_conflict(args) {
+        eprintln!("{}", super::diff_optval::PICKAXE_CONFLICT);
+        return Ok(ExitCode::from(128));
     }
     if pending != 1 {
         eprint!("{}", USAGE);

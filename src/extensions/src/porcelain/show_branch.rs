@@ -61,8 +61,9 @@ pub fn show_branch(args: &[String]) -> Result<ExitCode> {
     let mut opts = Opts::new();
     let revs = match parse_args(&argv, &mut opts) {
         Ok(revs) => revs,
-        Err(fail) => {
-            if let Some(msg) = fail {
+        Err(ParseFail::Help) => return Ok(super::show_usage(USAGE)),
+        Err(ParseFail::Rejected(msg)) => {
+            if let Some(msg) = msg {
                 eprintln!("{msg}");
             }
             eprint!("{USAGE}");
@@ -402,9 +403,15 @@ impl Opts {
     }
 }
 
-/// A rejected command line: the `error:` line `parse_options` prints before the
-/// usage block, if it printed one at all.
-type ParseFail = Option<String>;
+/// How `parse_options` stopped short of a parsed command line.
+enum ParseFail {
+    /// `-h`: `parse_options_step()` renders the block to **stdout** and exits
+    /// 129 with no `error:` line — a help request is not a rejection.
+    Help,
+    /// A rejection: `usage_with_options()`'s `error:` line (when there is one)
+    /// and the block, both on stderr, 129.
+    Rejected(Option<String>),
+}
 
 /// `OPT__COLOR`'s rejection of an unknown `<when>`.
 const BAD_COLOR: &str = "error: option `color' expects \"always\", \"auto\", or \"never\"";
@@ -419,7 +426,7 @@ fn parse_reflog_param(arg: &str, opts: &mut Opts) -> Result<(), ParseFail> {
     if let Some(base) = rest.strip_prefix(',') {
         opts.reflog_base = Some(base.to_string());
     } else if !rest.is_empty() {
-        return Err(Some(format!("error: unrecognized reflog param '{arg}'")));
+        return Err(ParseFail::Rejected(Some(format!("error: unrecognized reflog param '{arg}'"))));
     } else {
         opts.reflog_base = None;
     }
@@ -479,7 +486,7 @@ fn parse_args(argv: &[String], opts: &mut Opts) -> Result<Vec<String>, ParseFail
                 _ if long.starts_with("more=") => {
                     let n = &long["more=".len()..];
                     let v = crate::optint::integer(&crate::optint::long_opt("more"), n)
-                        .map_err(|e| Some(format!("error: {e}")))?;
+                        .map_err(|e| ParseFail::Rejected(Some(format!("error: {e}"))))?;
                     opts.extra = v as i32;
                 }
                 _ if long.starts_with("color=") => {
@@ -487,12 +494,12 @@ fn parse_args(argv: &[String], opts: &mut Opts) -> Result<Vec<String>, ParseFail
                         "always" => Some(true),
                         "never" => Some(false),
                         "auto" => None,
-                        _ => return Err(Some(BAD_COLOR.to_string())),
+                        _ => return Err(ParseFail::Rejected(Some(BAD_COLOR.to_string()))),
                     };
                 }
                 _ => {
                     let name = long.split('=').next().unwrap_or(long);
-                    return Err(Some(format!("error: unknown option `{name}'")));
+                    return Err(ParseFail::Rejected(Some(format!("error: unknown option `{name}'"))));
                 }
             }
         } else {
@@ -507,7 +514,10 @@ fn parse_args(argv: &[String], opts: &mut Opts) -> Result<Vec<String>, ParseFail
                         parse_reflog_param(arg, opts)?;
                         break;
                     }
-                    _ => return Err(Some(format!("error: unknown switch `{c}'"))),
+                    // parse_options_step() answers `-h` from inside the
+                    // short-option loop, on stdout at 129.
+                    'h' => return Err(ParseFail::Help),
+                    _ => return Err(ParseFail::Rejected(Some(format!("error: unknown switch `{c}'")))),
                 }
             }
         }

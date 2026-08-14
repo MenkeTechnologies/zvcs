@@ -119,6 +119,61 @@ use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 
+/// `usage_with_options()` over `builtin/am.c`'s option table, verbatim.
+const USAGE: &str = r"usage: git am [<options>] [(<mbox> | <Maildir>)...]
+   or: git am [<options>] (--continue | --skip | --abort)
+
+    -i, --[no-]interactive
+                          run interactively
+    -n, --no-verify       bypass pre-applypatch and applypatch-msg hooks
+    --verify              opposite of --no-verify
+    -3, --[no-]3way       allow fall back on 3way merging if needed
+    -q, --[no-]quiet      be quiet
+    -s, --[no-]signoff    add a Signed-off-by trailer to the commit message
+    -u, --[no-]utf8       recode into utf8 (default)
+    -k, --[no-]keep       pass -k flag to git-mailinfo
+    --[no-]keep-non-patch pass -b flag to git-mailinfo
+    -m, --[no-]message-id pass -m flag to git-mailinfo
+    --[no-]keep-cr        pass --keep-cr flag to git-mailsplit for mbox format
+    -c, --[no-]scissors   strip everything before a scissors line
+    --quoted-cr <action>  pass it through git-mailinfo
+    --[no-]whitespace <action>
+                          pass it through git-apply
+    --[no-]ignore-space-change
+                          pass it through git-apply
+    --[no-]ignore-whitespace
+                          pass it through git-apply
+    --[no-]directory <root>
+                          pass it through git-apply
+    --[no-]exclude <path> pass it through git-apply
+    --[no-]include <path> pass it through git-apply
+    -C <n>                pass it through git-apply
+    -p <num>              pass it through git-apply
+    --[no-]patch-format <format>
+                          format the patch(es) are in
+    --[no-]reject         pass it through git-apply
+    --[no-]resolvemsg ... override error message when patch failure occurs
+    --continue            continue applying patches after resolving a conflict
+    -r, --resolved        synonyms for --continue
+    --skip                skip the current patch
+    --abort               restore the original branch and abort the patching operation
+    --quit                abort the patching operation but keep HEAD where it is
+    --show-current-patch[=(diff|raw)]
+                          show the patch being applied
+    --retry               try to apply current patch again
+    --allow-empty         record the empty patch as an empty commit
+    --[no-]committer-date-is-author-date
+                          lie about committer date
+    --[no-]ignore-date    use current timestamp for author date
+    --[no-]rerere-autoupdate
+                          update the index with reused conflict resolution if possible
+    -S, --[no-]gpg-sign[=<key-id>]
+                          GPG-sign commits
+    --empty (stop|drop|keep)
+                          how to handle empty patches
+
+";
+
 /// `enum resume_type`. `Apply` is never selected by an argument; `cmd_am`
 /// promotes a bare `git am` inside a live session into it.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -223,7 +278,13 @@ impl Default for Opts {
 }
 
 /// A parse failure. git prints the message and exits 129 without usage text.
-struct Usage(String);
+enum Usage {
+    /// `-h`: `parse_options_step()` renders the block to **stdout** and exits
+    /// 129, with no `error:` line — a help request is not a rejection.
+    Help,
+    /// A rejection: the `error:` line parse-options prints, exit 129.
+    Error(String),
+}
 
 /// The `am.*` config values `git_am_config` reads before option parsing. Only
 /// the keys whose effect this port actually reproduces are carried: both feed a
@@ -283,7 +344,8 @@ pub fn am(args: &[String]) -> Result<ExitCode> {
 
     let opts = match parse(args, &defaults) {
         Ok(o) => o,
-        Err(Usage(msg)) => {
+        Err(Usage::Help) => return Ok(super::show_usage(USAGE)),
+        Err(Usage::Error(msg)) => {
             eprintln!("{msg}");
             return Ok(ExitCode::from(129));
         }
@@ -432,13 +494,13 @@ fn take_value<'a>(
         *i += 1;
         return Ok(v);
     }
-    Err(Usage(format!("error: option `{}' requires a value", trim_dashes(tok))))
+    Err(Usage::Error(format!("error: option `{}' requires a value", trim_dashes(tok))))
 }
 
 fn no_value(tok: &str, attached: Option<&str>) -> Result<(), Usage> {
     match attached {
         None => Ok(()),
-        Some(_) => Err(Usage(format!(
+        Some(_) => Err(Usage::Error(format!(
             "error: option `{}' takes no value",
             trim_dashes(tok)
         ))),
@@ -520,7 +582,7 @@ fn parse_long(
                 "warn" => "warn",
                 "strip" => "strip",
                 _ => {
-                    return Err(Usage(format!(
+                    return Err(Usage::Error(format!(
                         "error: bad action '{v}' for '--quoted-cr'"
                     )))
                 }
@@ -535,7 +597,7 @@ fn parse_long(
                 "hg" => Format::Hg,
                 "mboxrd" => Format::Mboxrd,
                 _ => {
-                    return Err(Usage(format!(
+                    return Err(Usage::Error(format!(
                         "error: invalid value for '--patch-format': '{v}'"
                     )))
                 }
@@ -551,7 +613,7 @@ fn parse_long(
                 "stop" => Empty::Stop,
                 "drop" => Empty::Drop,
                 "keep" => Empty::Keep,
-                _ => return Err(Usage(format!("error: invalid value for '--empty': '{v}'"))),
+                _ => return Err(Usage::Error(format!("error: invalid value for '--empty': '{v}'"))),
             };
         }
         // Consulted only when a patch fails to apply.
@@ -597,14 +659,14 @@ fn parse_long(
                 None | Some("raw") => Sub::Raw,
                 Some("diff") => Sub::Diff,
                 Some(v) => {
-                    return Err(Usage(format!(
+                    return Err(Usage::Error(format!(
                         "error: invalid value for '--show-current-patch': '{v}'"
                     )))
                 }
             };
             cmdmode_checked(o, tok, Resume::ShowPatch(sub))?;
         }
-        _ => return Err(Usage(format!("error: unknown option `{name}'"))),
+        _ => return Err(Usage::Error(format!("error: unknown option `{name}'"))),
     }
     Ok(())
 }
@@ -625,7 +687,7 @@ fn parse_short(
     // Every short option git defines is ASCII, so byte indices below are always
     // char boundaries and the `-C<n>`/`-p<num>` value slice cannot panic.
     if !body.is_ascii() {
-        return Err(Usage(format!("error: unknown switch `{body}'")));
+        return Err(Usage::Error(format!("error: unknown switch `{body}'")));
     }
     let bytes = body.as_bytes();
     let mut at = 0;
@@ -655,7 +717,7 @@ fn parse_short(
                     *i += 1;
                     v
                 } else {
-                    return Err(Usage(format!("error: option `{c}' requires a value")));
+                    return Err(Usage::Error(format!("error: option `{c}' requires a value")));
                 };
                 o.apply_opts.push(format!("-{c}{v}"));
             }
@@ -664,7 +726,10 @@ fn parse_short(
                 o.gpg_sign = true;
                 at = bytes.len();
             }
-            _ => return Err(Usage(format!("error: unknown switch `{c}'"))),
+            // parse_options_step() tests `internal_help` inside the
+            // short-option loop, so `-h` answers from anywhere in a cluster.
+            'h' => return Err(Usage::Help),
+            _ => return Err(Usage::Error(format!("error: unknown switch `{c}'"))),
         }
     }
     Ok(())
@@ -679,7 +744,7 @@ fn cmdmode(o: &mut Opts, tok: &str, want: Resume, attached: Option<&str>) -> Res
 
 fn cmdmode_checked(o: &mut Opts, tok: &str, want: Resume) -> Result<(), Usage> {
     match &o.resume {
-        Some((prev, prev_tok)) if *prev != want => Err(Usage(format!(
+        Some((prev, prev_tok)) if *prev != want => Err(Usage::Error(format!(
             "error: options '{tok}' and '{prev_tok}' cannot be used together"
         ))),
         Some(_) => Ok(()),

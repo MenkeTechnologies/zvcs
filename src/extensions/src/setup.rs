@@ -1,0 +1,104 @@
+//! The questions commands ask `setup.c` after setup has run.
+//!
+//! Most of `setup.c` executes before a builtin is entered and has no caller here.
+//! What is left are the few predicates a command consults about the repository it
+//! was handed — whether the current directory sits in the work tree, whether it
+//! sits in the git directory — and the argument checks built on them. They belong
+//! in one place because they are one rule: a command that re-derives "is there a
+//! work tree here" from `workdir()` alone gets a different answer than git does
+//! whenever the cwd is somewhere else, and the answers have to agree across verbs.
+
+use std::path::{Path, PathBuf};
+
+/// `strbuf_realpath()`: `path` symlink-resolved and absolute, or unchanged when it
+/// cannot be resolved.
+pub fn realpath(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_owned())
+}
+
+/// The work tree, symlink-resolved, or `None` when the repository has none.
+fn work_tree(repo: &gix::Repository) -> Option<PathBuf> {
+    std::fs::canonicalize(repo.workdir()?).ok()
+}
+
+/// `is_inside_dir()`: whether the current directory is `dir` or below it.
+fn is_inside_dir(dir: &Path) -> bool {
+    std::env::current_dir()
+        .ok()
+        .and_then(|cwd| std::fs::canonicalize(cwd).ok())
+        .is_some_and(|cwd| cwd.starts_with(dir))
+}
+
+/// git's `is_inside_git_dir()` (setup.c:472-478): whether the cwd is the git
+/// directory or below it.
+pub fn is_inside_git_dir(repo: &gix::Repository) -> bool {
+    is_inside_dir(&realpath(repo.git_dir()))
+}
+
+/// git's `is_inside_work_tree()` (setup.c:480-494): whether the cwd sits in the
+/// work tree, which says nothing about the git directory. Both this and
+/// [`is_inside_git_dir`] are true at once for `GIT_DIR=.` inside a `.git`
+/// directory, because that setup makes the git directory its own work tree.
+pub fn is_inside_work_tree(repo: &gix::Repository) -> bool {
+    work_tree(repo).is_some_and(|top| is_inside_dir(&top))
+}
+
+/// git's `verify_non_filename()` (setup.c:299-310): an argument already parsed as
+/// a revision must not also name an existing file, or the command line is
+/// ambiguous and git refuses to guess.
+///
+/// The first line of that function is the part that is easy to lose:
+///
+/// ```c
+/// if (!is_inside_work_tree(repo) || is_inside_git_dir(repo))
+///         return;
+/// ```
+///
+/// Standing outside a work tree — in a bare repository, or in a `.git` directory —
+/// there are no worktree paths for a revision to collide with, so the check does
+/// not run at all. Without that guard `git grep <pattern> HEAD` in a bare
+/// repository calls `HEAD` ambiguous, because a file by that name is sitting right
+/// there in the cwd.
+///
+/// Returns the message git would `die()` with, or `None` when the argument is
+/// unambiguous.
+pub fn verify_non_filename(repo: &gix::Repository, arg: &str) -> Option<String> {
+    if !is_inside_work_tree(repo) || is_inside_git_dir(repo) {
+        return None;
+    }
+    if arg.starts_with('-') {
+        return None; // flag
+    }
+    if !check_filename(arg) {
+        return None;
+    }
+    Some(format!(
+        "ambiguous argument '{arg}': both revision and filename\n\
+         Use '--' to separate paths from revisions, like this:\n\
+         'git <command> [<revision>...] -- [<file>...]'"
+    ))
+}
+
+/// git's `check_filename()` (setup.c:173-200): whether `arg` names something that
+/// exists in the worktree. It strips the leading pathspec magic that still leaves
+/// a path behind and stats what remains. Magic with nothing after it counts as
+/// existing without a stat — `:/` names the root, and excluding everything with a
+/// bare `:!`/`:^` is pointless but legal. A bare empty argument gets no such
+/// exemption: it reaches the stat and fails it, which is why
+/// `git grep --no-index <pattern> ""` is a fatal rather than a match-nothing.
+///
+/// Paths are resolved against the current directory, which is where git resolves
+/// them from too for every form but `:/<path>`: that one is root-relative, and git
+/// can say so because it has already changed directory to the root by this point.
+/// The two agree whenever the command is run from the root.
+pub fn check_filename(arg: &str) -> bool {
+    let path = match [":/", ":!", ":^"]
+        .into_iter()
+        .find_map(|magic| arg.strip_prefix(magic))
+    {
+        Some("") => return true,
+        Some(rest) => rest,
+        None => arg,
+    };
+    std::fs::symlink_metadata(path).is_ok()
+}

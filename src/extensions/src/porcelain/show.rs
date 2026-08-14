@@ -16,6 +16,7 @@ use gix::revision::plumbing::Spec as RevSpec;
 use super::filespec::{content_of, count_changed_lines_ws, is_binary};
 use super::line_log;
 use super::log::{DecorateStyle, Decorations, Mailmap};
+use super::pretty_pad::{FlushType, PadState, WrapState};
 
 /// git's `MINIMUM_ABBREV`: the shortest id `--abbrev=<n>` may ask for, and the width
 /// the all-zero side of an `index`/raw line is padded to when nothing longer is set.
@@ -163,6 +164,11 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
 
     for a in args {
         let s = a.as_str();
+        // parse_options_step()'s `internal_help`. `git show` is `builtin/log.c`,
+        // so the block it prints is `git log`'s — on stdout at 129.
+        if !after_dashdash && s == "-h" {
+            return Ok(super::show_usage(super::log::USAGE));
+        }
         // Everything after `--` is a pathspec, even tokens that look like flags:
         // `git show -- --stat` limits by the path `--stat`, it does not enable stat.
         if after_dashdash {
@@ -175,6 +181,13 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
                 _ => pickaxe_g = Some(a.clone()),
             }
             continue;
+        }
+        // The value checks `diff_opt_parse`'s callbacks run as each option is seen.
+        // `cmd_show` runs the same `cmd_log_init_finish` as `git log`, so a diff
+        // option's value is validated here whether or not this command renders it.
+        if let Some(line) = super::diff_optval::reject(s) {
+            eprintln!("{line}");
+            return Ok(ExitCode::from(129));
         }
         if std::mem::take(&mut pending_line_range) {
             line_ranges.push(a.clone());
@@ -753,6 +766,8 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
                     // below, never through the date-ordered heap.
                     seq: 0,
                     boundary: false,
+                    // `git show -L` never draws a graph.
+                    graph_width: 0,
                 });
             }
             nodes = super::log::topo_sort(nodes, false);
@@ -902,6 +917,11 @@ fn check_format(fmt: &str) -> Result<()> {
                 Some(x) => anyhow::bail!("unsupported format placeholder %a{x}"),
                 None => anyhow::bail!("unsupported trailing % in format"),
             },
+            // The column-control atoms — `%<(<N>)`, `%>(<N>)`, `%><(<N>)`, `%>>(<N>)`
+            // and their `|`/`trunc`/`ltrunc`/`mtrunc` forms — and `%w(…)` are
+            // validated where they are expanded: git prints a malformed one
+            // literally rather than failing (see [`super::pretty_pad`]).
+            Some('<' | '>' | 'w') => {}
             Some(x) => anyhow::bail!("unsupported format placeholder %{x}"),
             None => anyhow::bail!("unsupported trailing % in format"),
         }
@@ -910,50 +930,124 @@ fn check_format(fmt: &str) -> Result<()> {
 }
 
 /// Expand the placeholders accepted by [`check_format`] for `commit`.
+///
+/// The loop is git's `repo_format_commit_message()` driver: `%%` is expanded here
+/// (so it never spends a pending padding field), every other placeholder goes
+/// through [`expand_one`], and a `%<`/`%>` atom holds a column field open for
+/// whichever placeholder comes next.
 fn expand_format(
     out: &mut Vec<u8>,
     commit: &gix::Commit<'_>,
     fmt: &str,
     notes: &[super::notes::Tree],
 ) -> Result<()> {
-    let mut it = fmt.chars();
-    while let Some(c) = it.next() {
+    let chars: Vec<char> = fmt.chars().collect();
+    let mut pad = PadState::default();
+    let mut wrap = WrapState::default();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        i += 1;
         if c != '%' {
             let mut buf = [0u8; 4];
             out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
             continue;
         }
-        match it.next() {
-            Some('H') => out.extend_from_slice(commit.id().to_string().as_bytes()),
-            // `%N`: the raw note text, the only way a user format shows notes.
-            Some('N') => out.extend_from_slice(&super::notes::format_display(
-                commit.repo,
-                notes,
-                commit.id().detach(),
-                true,
-            )?),
-            Some('h') => out.extend_from_slice(commit.id().shorten_or_id().to_string().as_bytes()),
-            Some('T') => out.extend_from_slice(commit.tree_id()?.to_string().as_bytes()),
-            Some('t') => {
-                out.extend_from_slice(commit.tree_id()?.shorten_or_id().to_string().as_bytes());
+        let Some(&p) = chars.get(i) else { break };
+        if p == '%' {
+            out.push(b'%');
+            i += 1;
+            continue;
+        }
+        i += 1;
+        if pad.flush == FlushType::None {
+            if !expand_one(out, commit, &chars, &mut i, p, notes, &mut pad, &mut wrap)? {
+                out.push(b'%');
+                i -= 1;
             }
-            Some('P') => write_parents(out, commit, false),
-            Some('p') => write_parents(out, commit, true),
-            Some('s') => out.extend_from_slice(&subject(commit.message_raw()?)),
-            Some('n') => out.push(b'\n'),
-            Some('%') => out.push(b'%'),
-            Some('a') => {
-                let author = commit.author()?;
-                match it.next() {
-                    Some('n') => out.extend_from_slice(author.name),
-                    Some('e') => out.extend_from_slice(author.email),
-                    _ => unreachable!("check_format rejected this already"),
-                }
-            }
-            _ => unreachable!("check_format rejected this already"),
+            continue;
+        }
+        // `format_and_pad_commit()`: measure the placeholder's own output, in
+        // display columns, and lay it out in the pending field.
+        let padding = pad.padding;
+        let mut local: Vec<u8> = Vec::new();
+        let consumed = expand_one(&mut local, commit, &chars, &mut i, p, notes, &mut pad, &mut wrap)?;
+        // `git show` has no `%C…`, so the colour-chaining half of
+        // `format_and_pad_commit()` has nothing to chain here.
+        pad.apply(out, local, padding, 0);
+        if !consumed {
+            out.push(b'%');
+            i -= 1;
         }
     }
+    wrap.rewrap_message_tail(out, 0, 0, 0);
     Ok(())
+}
+
+/// `format_commit_one()`: expand the single placeholder `p`, whose following
+/// character is at `chars[*i]`. `false` is git's "consumed nothing", which makes
+/// the caller print the `%` literally.
+fn expand_one(
+    out: &mut Vec<u8>,
+    commit: &gix::Commit<'_>,
+    chars: &[char],
+    i: &mut usize,
+    p: char,
+    notes: &[super::notes::Tree],
+    pad: &mut PadState,
+    wrap: &mut WrapState,
+) -> Result<bool> {
+    match p {
+        // The column atoms expand to nothing and leave the field pending.
+        '<' | '>' => {
+            return Ok(match pad.parse(chars, *i - 1) {
+                Some(consumed) => {
+                    *i = *i - 1 + consumed;
+                    true
+                }
+                None => false,
+            })
+        }
+        // `%w(<width>,<indent1>,<indent2>)` re-wraps everything emitted after it.
+        'w' => {
+            return Ok(match wrap.parse_and_apply(out, chars, *i - 1) {
+                Some(consumed) => {
+                    *i = *i - 1 + consumed;
+                    true
+                }
+                None => false,
+            })
+        }
+        'H' => out.extend_from_slice(commit.id().to_string().as_bytes()),
+        // `%N`: the raw note text, the only way a user format shows notes.
+        'N' => out.extend_from_slice(&super::notes::format_display(
+            commit.repo,
+            notes,
+            commit.id().detach(),
+            true,
+        )?),
+        'h' => out.extend_from_slice(commit.id().shorten_or_id().to_string().as_bytes()),
+        'T' => out.extend_from_slice(commit.tree_id()?.to_string().as_bytes()),
+        't' => {
+            out.extend_from_slice(commit.tree_id()?.shorten_or_id().to_string().as_bytes());
+        }
+        'P' => write_parents(out, commit, false),
+        'p' => write_parents(out, commit, true),
+        's' => out.extend_from_slice(&subject(commit.message_raw()?)),
+        'n' => out.push(b'\n'),
+        '%' => out.push(b'%'),
+        'a' => {
+            let author = commit.author()?;
+            match chars.get(*i).copied() {
+                Some('n') => out.extend_from_slice(author.name),
+                Some('e') => out.extend_from_slice(author.email),
+                _ => unreachable!("check_format rejected this already"),
+            }
+            *i += 1;
+        }
+        _ => unreachable!("check_format rejected this already"),
+    }
+    Ok(true)
 }
 
 /// Space-separated parent ids, abbreviated for `%p` and full for `%P`.

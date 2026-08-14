@@ -130,6 +130,13 @@ struct Ctx<'repo> {
 /// With no paths and no `-a` this does nothing and exits 0, which is git's
 /// documented "no arguments means no work" contract for scripted use.
 pub fn checkout_index(args: &[String]) -> Result<ExitCode> {
+    // `show_usage_with_options_if_asked()` (builtin/checkout-index.c:253) is the
+    // first thing `cmd_checkout_index` does: a lone `-h` goes to stdout at 129,
+    // ahead of the index read. Any other `-h` is an unknown switch, as before.
+    if let Some(code) = super::show_usage_if_asked(args, USAGE) {
+        return Ok(code);
+    }
+
     let mut opts = Opts::default();
     let mut files: Vec<String> = Vec::new();
 
@@ -210,6 +217,10 @@ pub fn checkout_index(args: &[String]) -> Result<ExitCode> {
                     'n' => opts.not_new = true,
                     'u' => opts.refresh_cache = true,
                     'z' => opts.nul_term = true,
+                    // parse_options' `internal_help` inside the short-option
+                    // loop, which `show_usage_with_options_if_asked()` above
+                    // only covers for a lone `-h`.
+                    'h' => return Ok(super::show_usage(USAGE)),
                     _ => return unknown_option(&format!("unknown switch `{c}'")),
                 }
             }

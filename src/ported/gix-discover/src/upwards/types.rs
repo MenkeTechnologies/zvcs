@@ -58,9 +58,26 @@ pub struct Options<'a> {
     pub trust: TrustPolicy,
     /// When discovering a repository, ignore any repositories that are located in these directories or any of their parents.
     ///
+    /// These are made absolute and normalized before they are compared to the search directory, so a ceiling may be
+    /// spelled relatively or contain `.` and `..` components and still match.
+    ///
     /// Note that we ignore ceiling directories if the search directory is directly on top of one, which by default is an error
     /// if `match_ceiling_dir_or_error` is true, the default.
     pub ceiling_dirs: Vec<PathBuf>,
+    /// Like [`ceiling_dirs`][Self::ceiling_dirs], but these are compared to the search directory *verbatim*, as the very
+    /// bytes they are spelled with, without being normalized or made absolute first.
+    ///
+    /// This is what git does to the entries of `GIT_CEILING_DIRECTORIES` that follow an empty entry: an empty entry turns
+    /// canonicalization off for everything after it (`canonicalize_ceiling_entry()` in `setup.c`), and the comparison that
+    /// follows is a plain string prefix test (`longest_ancestor_length()` in `path.c`). An entry that only names an ancestor
+    /// after normalization, like `/parent/child/..`, therefore does *not* stop the search there.
+    ///
+    /// [`apply_environment()`][Self::apply_environment()] is the only thing in this crate that fills it in, so ceilings
+    /// set by hand keep [`ceiling_dirs`][Self::ceiling_dirs]'s normalizing behaviour unless they are put here deliberately.
+    ///
+    /// The two lists do not have to preserve their relative order, because the deepest ceiling out of both wins no matter
+    /// where it was spelled - git likewise takes the *longest* ancestor over the whole list.
+    pub ceiling_dirs_verbatim: Vec<PathBuf>,
     /// If true, default true, and `ceiling_dirs` is not empty, we expect at least one ceiling directory to
     /// contain our search dir or else there will be an error.
     pub match_ceiling_dir_or_error: bool,
@@ -91,6 +108,7 @@ impl Default for Options<'_> {
         Options {
             trust: TrustPolicy::default(),
             ceiling_dirs: vec![],
+            ceiling_dirs_verbatim: vec![],
             match_ceiling_dir_or_error: true,
             cross_fs: false,
             dot_git_only: false,
@@ -111,22 +129,45 @@ impl Options<'_> {
     pub fn apply_environment(mut self) -> Self {
         let name = "GIT_CEILING_DIRECTORIES";
         if let Some(ceiling_dirs) = env::var_os(name) {
-            self.ceiling_dirs = parse_ceiling_dirs(&ceiling_dirs);
+            let CeilingDirs { canonicalized, verbatim } = parse_ceiling_dirs(&ceiling_dirs);
+            self.ceiling_dirs = canonicalized;
+            self.ceiling_dirs_verbatim = verbatim;
         }
         self
     }
 }
 
-/// Parse a byte-string of `:`-separated paths into `Vec<PathBuf>`.
+/// The two kinds of ceiling directory that `GIT_CEILING_DIRECTORIES` can hold, mirroring the two ways
+/// git's `canonicalize_ceiling_entry()` can keep an entry.
+#[derive(Default, Debug)]
+pub(crate) struct CeilingDirs {
+    /// Entries seen before the first empty entry, with their symlinks resolved.
+    pub canonicalized: Vec<PathBuf>,
+    /// Entries seen after the first empty entry, kept exactly as they were spelled.
+    pub verbatim: Vec<PathBuf>,
+}
+
+/// Parse a byte-string of `:`-separated paths into [`CeilingDirs`].
 /// On Windows, paths are separated by `;`.
 /// Non-absolute paths are discarded.
-/// To match git, all paths are normalized, until an empty path is encountered.
-pub(crate) fn parse_ceiling_dirs(ceiling_dirs: &OsStr) -> Vec<PathBuf> {
-    let mut should_normalize = true;
-    let mut out = Vec::new();
+///
+/// To match git, all paths are canonicalized until an empty path is encountered. From there on entries are kept as-is,
+/// which git's `canonicalize_ceiling_entry()` in `setup.c` does by returning early with a comment that says as much:
+///
+/// ```text
+/// } else if (*empty_entry_found) {
+///         /* Keep entry but do not canonicalize it */
+///         return 1;
+/// ```
+///
+/// Such an entry is never touched again, so it also never gets normalized - hence the separate list, whose entries are
+/// compared verbatim later on.
+pub(crate) fn parse_ceiling_dirs(ceiling_dirs: &OsStr) -> CeilingDirs {
+    let mut empty_entry_found = false;
+    let mut out = CeilingDirs::default();
     for ceiling_dir in std::env::split_paths(ceiling_dirs) {
         if ceiling_dir.as_os_str().is_empty() {
-            should_normalize = false;
+            empty_entry_found = true;
             continue;
         }
 
@@ -135,13 +176,12 @@ pub(crate) fn parse_ceiling_dirs(ceiling_dirs: &OsStr) -> Vec<PathBuf> {
             continue;
         }
 
-        let mut dir = ceiling_dir;
-        if should_normalize {
-            if let Ok(normalized) = gix_path::realpath(&dir) {
-                dir = normalized;
-            }
+        if empty_entry_found {
+            out.verbatim.push(ceiling_dir);
+        } else {
+            let canonicalized = gix_path::realpath(&ceiling_dir).unwrap_or(ceiling_dir);
+            out.canonicalized.push(canonicalized);
         }
-        out.push(dir);
     }
     out
 }
@@ -165,18 +205,23 @@ mod tests {
 
         // Parse & build ceiling dirs string
         let symlink_str = symlink_path.to_str().expect("symlink path is valid utf8");
-        let ceiling_dir_string = format!("{symlink_str}:relative::{symlink_str}");
+        let ceiling_dir_string = format!("{symlink_str}:relative::{symlink_str}/..");
         let ceiling_dirs = parse_ceiling_dirs(OsStr::new(ceiling_dir_string.as_str()));
 
-        assert_eq!(ceiling_dirs.len(), 2, "Relative path is discarded");
         assert_eq!(
-            ceiling_dirs[0],
-            symlink_path.canonicalize().expect("symlink path exists"),
+            ceiling_dirs.canonicalized.len() + ceiling_dirs.verbatim.len(),
+            2,
+            "Relative path is discarded"
+        );
+        assert_eq!(
+            ceiling_dirs.canonicalized,
+            vec![symlink_path.canonicalize().expect("symlink path exists")],
             "Symlinks are resolved"
         );
         assert_eq!(
-            ceiling_dirs[1], symlink_path,
-            "Symlink are not resolved after empty item"
+            ceiling_dirs.verbatim,
+            vec![symlink_path.join("..")],
+            "After an empty item entries are kept exactly as spelled - neither the symlink nor the `..` is resolved"
         );
 
         dir.close()
@@ -198,14 +243,19 @@ mod tests {
 
         // Parse & build ceiling dirs string
         let symlink_str = symlink_path.to_str().expect("symlink path is valid utf8");
-        let ceiling_dir_string = format!("{};relative;;{}", symlink_str, symlink_str);
+        let ceiling_dir_string = format!("{};relative;;{}\\..", symlink_str, symlink_str);
         let ceiling_dirs = parse_ceiling_dirs(OsStr::new(ceiling_dir_string.as_str()));
 
-        assert_eq!(ceiling_dirs.len(), 2, "Relative path is discarded");
-        assert_eq!(ceiling_dirs[0], direct_path, "Symlinks are resolved");
         assert_eq!(
-            ceiling_dirs[1], symlink_path,
-            "Symlink are not resolved after empty item"
+            ceiling_dirs.canonicalized.len() + ceiling_dirs.verbatim.len(),
+            2,
+            "Relative path is discarded"
+        );
+        assert_eq!(ceiling_dirs.canonicalized, vec![direct_path], "Symlinks are resolved");
+        assert_eq!(
+            ceiling_dirs.verbatim,
+            vec![symlink_path.join("..")],
+            "After an empty item entries are kept exactly as spelled - neither the symlink nor the `..` is resolved"
         );
 
         dir.close()

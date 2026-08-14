@@ -86,14 +86,19 @@
 //!   (`merge_apply::three_way_merge`) of the stash onto the moved `HEAD`, since
 //!   autostash by definition re-applies over a tree the rebase/merge advanced.
 //!
+//! `-p/--patch` is `stash_patch()`: the hunk selector (`super::add_patch`) runs
+//! against a scratch index at `$GIT_DIR/index.stash.<pid>` seeded from `HEAD` and
+//! exported to its children as `GIT_INDEX_FILE`, so the chosen hunks land there
+//! and the real index is untouched. That index becomes the stash's `W` tree, and
+//! the `diff-tree -p -U1 HEAD <W>` it amounts to is reversed out of the worktree
+//! with `git apply -R` — which is how an unselected edit in the same file survives
+//! the push. `--patch` defaults `--keep-index` on, overrides `--staged`, refuses
+//! `-u`/`-a` and `--pathspec-from-file`, and takes `-U<n>`,
+//! `--inter-hunk-context=<n>` and `--[no-]auto-advance` (which every other mode
+//! refuses with `the option '<opt>' requires '--patch'`).
+//!
 //! ### Honest boundaries (precise bail, never fake success)
 //!
-//! * `-p/--patch` is not backed and bails. It runs the hunk selector against a
-//!   scratch index (`.git/stash-index`, seeded from `HEAD` and named by
-//!   `GIT_INDEX_FILE`); nothing in this port honors `GIT_INDEX_FILE`, so the
-//!   selector would stage into the REAL index and corrupt the user's staged
-//!   state. The selector itself (`super::add_patch`) is ready — only the
-//!   scratch-index plumbing is missing.
 //! * `stash.index` is honored for `apply`/`pop` (and `branch`, which git always
 //!   applies with the index). git also lets it reach the `--autostash` re-apply
 //!   of `merge`/`rebase`/`pull`; that path always behaves as `--no-index` here,
@@ -426,6 +431,10 @@ fn push(repo: &gix::Repository, opts: &PushOpts) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
+    // `do_push_stash()`: `--patch` defaults `--keep-index` on, because the index
+    // is not what the selection came from.
+    let keep_index = opts.keep_index.unwrap_or(opts.patch);
+
     let StashBuild {
         w_commit,
         stash_msg,
@@ -434,7 +443,19 @@ fn push(repo: &gix::Repository, opts: &PushOpts) -> Result<ExitCode> {
         affected,
         untracked_paths,
         worktree_tree,
+        patch,
     } = build_stash_commit(repo, &scratch, opts.message.as_deref(), opts)?;
+
+    // `stash_patch()` returning an empty patch is "the user took nothing":
+    // `do_create_stash()` stops there, so no stash is stored and no reset runs.
+    if let Some(patch) = &patch {
+        if patch.is_empty() {
+            if !opts.quiet {
+                eprintln!("No changes selected");
+            }
+            return Ok(ExitCode::FAILURE);
+        }
+    }
 
     // Nothing survived the filter: a pathspec that matched only clean paths, or
     // `-S` with an empty index diff. git distinguishes the two.
@@ -472,6 +493,37 @@ fn push(repo: &gix::Repository, opts: &PushOpts) -> Result<ExitCode> {
         println!("Saved working directory and index state {stash_msg}");
     }
 
+    // Patch mode subtracts exactly the hunks that were taken: git pipes the same
+    // patch it built the stash from back through `git apply -R`, which leaves
+    // every *unselected* edit on disk untouched — a tree-level reset could not,
+    // since two hunks of one file can land on opposite sides of the selection.
+    if let Some(patch) = &patch {
+        let (ok, _) = super::add_patch::run_git(
+            &["apply".to_string(), "-R".to_string()],
+            Some(patch),
+            false,
+            None,
+        )?;
+        if !ok {
+            if !opts.quiet {
+                eprintln!("Cannot remove worktree changes");
+            }
+            return Ok(ExitCode::FAILURE);
+        }
+        // `keep_index < 1`: the index still describes the pre-stash state, so git
+        // refreshes it against the worktree it just rewound.
+        if !keep_index {
+            let mut args: Vec<String> =
+                ["reset", "-q", "--refresh", "--"].iter().map(|s| (*s).to_string()).collect();
+            args.extend(opts.pathspecs.iter().cloned());
+            let (ok, _) = super::add_patch::run_git(&args, None, false, None)?;
+            if !ok {
+                return Ok(ExitCode::FAILURE);
+            }
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+
     // Reset the tracked worktree + index (untracked files handled separately
     // below). `--keep-index` resets to the index tree rather than HEAD, which is
     // precisely what leaves the staged changes staged and their content on disk.
@@ -481,7 +533,7 @@ fn push(repo: &gix::Repository, opts: &PushOpts) -> Result<ExitCode> {
     // builtin/stash.c) — including under `-k`, which only skips the index reset
     // that follows. Reverting the whole path to `HEAD` here would delete work the
     // stash does not hold.
-    let worktree_target = match (opts.staged_only, opts.keep_index) {
+    let worktree_target = match (opts.staged_only, keep_index) {
         (true, _) => match revert_staged_in_worktree(
             &scratch,
             i_tree_id,
@@ -515,7 +567,7 @@ fn push(repo: &gix::Repository, opts: &PushOpts) -> Result<ExitCode> {
     // index holds right now) and reverting only the affected paths is what keeps
     // a staged change to an unmatched path staged, which is what git does under
     // a pathspec. Reverting nothing is `--keep-index`.
-    let index_target = if opts.keep_index {
+    let index_target = if keep_index {
         i_tree_id
     } else {
         revert_paths_in_tree(repo, i_tree_id, head_tree_id, &affected)?
@@ -545,7 +597,7 @@ fn push(repo: &gix::Repository, opts: &PushOpts) -> Result<ExitCode> {
     // log gains an entry. Only the pathspec-less path runs that reset: with a
     // pathspec git restores the named paths through `checkout-index`/`clean` instead,
     // and `-S` reverses the staged patch with `apply -R`; neither logs anything.
-    if opts.pathspecs.is_empty() && !opts.staged_only {
+    if opts.pathspecs.is_empty() && !opts.staged_only && !opts.patch {
         if let Ok(head_id) = repo.head_id() {
             let id = head_id.detach();
             super::checkout::record_head_move(repo, Some(id), Some(id), "reset: moving to HEAD");
@@ -681,6 +733,10 @@ struct StashBuild {
     /// Untracked (and with `-a`, ignored) files captured into the third parent,
     /// which `push` deletes from the worktree afterwards.
     untracked_paths: Vec<BString>,
+    /// `-p`: the `diff-tree -p -U1 HEAD <w_tree>` text `stash_patch()` produced,
+    /// which `push` reverses out of the worktree with `git apply -R`. Empty means
+    /// nothing was selected — `do_create_stash()` stops there. `None` without `-p`.
+    patch: Option<Vec<u8>>,
 }
 
 /// Build the stash commit graph (`I` index commit then `W` merge commit) from
@@ -810,7 +866,15 @@ fn build_stash_commit(
     for (path, _) in &wt_mods {
         affected.insert(path.clone());
     }
-    let w_tree_id = tree_with_worktree_mods(repo, i_tree_id, &wt_mods)?;
+    // `do_create_stash()` picks one of three ways to build `W`: the hunks the
+    // user selected (`stash_patch`), the staged changes alone (`stash_staged`,
+    // handled above), or the whole worktree (`stash_working_tree`).
+    let (w_tree_id, patch) = if opts.patch {
+        let (tree, patch) = stash_patch(repo, opts)?;
+        (tree, Some(patch))
+    } else {
+        (tree_with_worktree_mods(repo, i_tree_id, &wt_mods)?, None)
+    };
 
     // `I` commit (parent: HEAD), then `W` merge commit (parents: HEAD, I).
     //
@@ -861,7 +925,57 @@ fn build_stash_commit(
         affected,
         untracked_paths,
         worktree_tree,
+        patch,
     })
+}
+
+/// `stash_patch()` (builtin/stash.c): run the hunk selector against a scratch
+/// index seeded from `HEAD`, and answer the tree it staged plus the patch that
+/// tree amounts to.
+///
+/// The scratch index is `$GIT_DIR/index.stash.<pid>`, exported to every child of
+/// the selector as `GIT_INDEX_FILE`, so the `apply --cached` that stages a chosen
+/// hunk lands there and the user's real index is never touched. The patch is
+/// `diff-tree -p -U1 HEAD <w_tree>`, generated with one line of context precisely
+/// so that reversing it later subtracts only the selected hunks and leaves an
+/// unselected edit nearby in place.
+///
+/// An empty patch is git's "nothing was selected", which the caller turns into
+/// `No changes selected` without storing anything.
+fn stash_patch(repo: &gix::Repository, opts: &PushOpts) -> Result<(ObjectId, Vec<u8>)> {
+    let index_file = repo.git_dir().join(format!("index.stash.{}", std::process::id()));
+    let head_tree = repo.head_commit()?.tree_id()?.detach();
+    // `create_index_from_tree()`; `write_ondisk_index` also clears a stale file
+    // an interrupted run left behind, which is git's `remove_path()` on entry.
+    let seeded = super::history::write_ondisk_index(repo, head_tree, &index_file);
+    let result = (|| -> Result<(ObjectId, Vec<u8>)> {
+        seeded?;
+        // `run_add_p(the_repository, ADD_P_STASH, …, NULL, ps, 0)`: no revision
+        // (the mode's diff command already names `HEAD`) and no `DISALLOW_EDIT`.
+        // Its status is deliberately dropped, exactly as `stash_patch()` drops it:
+        // what was selected is decided by the tree the selector left behind.
+        let _ = super::add_patch::run_in_index(
+            repo,
+            super::add_patch::Mode::Stash,
+            &index_file,
+            opts.interactive,
+            &opts.pathspecs,
+        )?;
+        let w_tree = super::history::tree_of_index_file(repo, &index_file)
+            .ok_or_else(|| anyhow!("Cannot save the current worktree state"))?;
+        let args: Vec<String> = ["diff-tree", "-p", "-U1", "HEAD", "--no-color"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .chain([w_tree.to_string(), "--".to_string()])
+            .collect();
+        let (ok, patch) = super::add_patch::run_git(&args, None, true, None)?;
+        if !ok {
+            bail!("Cannot save the current worktree state");
+        }
+        Ok((w_tree, patch))
+    })();
+    let _ = std::fs::remove_file(&index_file);
+    result
 }
 
 /// `base` with the unstaged worktree changes in `wt_mods` applied — the tree the
@@ -1346,18 +1460,20 @@ fn list(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
     let has_format = args
         .iter()
         .any(|a| a.starts_with("--format") || a.starts_with("--pretty"));
-    let mut rf: Vec<String> = vec!["show".into()];
+    let mut rf: Vec<String> = Vec::new();
     if !has_format {
         rf.push("--format=%gd: %gs".into());
     }
     // `list_stash()` runs `log -g --first-parent`, and the `--first-parent` is
     // what gives a diff option anything to render: every stash entry is a merge
     // commit, which is otherwise skipped. Without it `stash list --name-only`
-    // silently prints subjects alone.
+    // silently prints subjects alone. It has to go in through `log`'s entry
+    // point, not `git reflog show`'s — only the former installs the tweak hook
+    // that makes `--first-parent` mean that.
     rf.push("--first-parent".into());
     rf.extend(args.iter().cloned());
     rf.push("refs/stash".into());
-    super::reflog(&rf)
+    super::reflog_show_as_log(&rf)
 }
 
 /// `git stash apply` / `pop` — restore `stash@{n}` onto a clean worktree+index.
@@ -2272,13 +2388,19 @@ pub(crate) enum Untracked {
 pub(crate) struct PushOpts {
     pub message: Option<String>,
     pub quiet: bool,
-    /// `-k`: leave the index staged after the reset.
-    pub keep_index: bool,
+    /// `-k`/`--no-keep-index`: leave the index staged after the reset. `None` is
+    /// git's `keep_index = -1` — unset, which `--patch` turns into "keep".
+    pub keep_index: Option<bool>,
     /// `-S`: stash the staged changes only, leaving unstaged work alone.
     pub staged_only: bool,
     pub untracked: Untracked,
     /// Empty means "everything", matching git's unrestricted push.
     pub pathspecs: Vec<String>,
+    /// `-p`: pick the hunks to stash interactively.
+    pub patch: bool,
+    /// `-U<n>`/`--inter-hunk-context=<n>`/`--[no-]auto-advance`, which git parses
+    /// into `struct interactive_options` and only `--patch` may use.
+    pub interactive: super::add_patch::Options,
 }
 
 impl PushOpts {
@@ -2287,10 +2409,12 @@ impl PushOpts {
         PushOpts {
             message,
             quiet: false,
-            keep_index: false,
+            keep_index: None,
             staged_only: false,
             untracked: Untracked::No,
             pathspecs: Vec::new(),
+            patch: false,
+            interactive: super::add_patch::Options::default(),
         }
     }
 }
@@ -2306,9 +2430,24 @@ fn parse_push_options(args: &[String]) -> Result<std::result::Result<PushOpts, E
     let mut from_file: Option<String> = None;
     let mut nul = false;
     let mut rest_are_paths = false;
+    // `OPT_DIFF_UNIFIED`/`OPT_DIFF_INTERHUNK_CONTEXT`/`--[no-]auto-advance`, the
+    // hunk selector's knobs, parsed by the same helper `reset -p` uses.
+    let mut patch_opts = super::reset::PatchDiffOpts::default();
     let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
+        // A value still owed is taken verbatim, even past `--`; otherwise these
+        // options are only recognised while options are still being read.
+        if patch_opts.awaiting_value() || !rest_are_paths {
+            match patch_opts.take_arg(a) {
+                Err(code) => return Ok(Err(code)),
+                Ok(true) => {
+                    i += 1;
+                    continue;
+                }
+                Ok(false) => {}
+            }
+        }
         if rest_are_paths {
             o.pathspecs.push(a.to_string());
             i += 1;
@@ -2326,18 +2465,12 @@ fn parse_push_options(args: &[String]) -> Result<std::result::Result<PushOpts, E
             "--no-include-untracked" => o.untracked = Untracked::No,
             "-a" | "--all" => o.untracked = Untracked::All,
             "--no-all" => o.untracked = Untracked::No,
-            "-k" | "--keep-index" => o.keep_index = true,
-            "--no-keep-index" => o.keep_index = false,
+            "-k" | "--keep-index" => o.keep_index = Some(true),
+            "--no-keep-index" => o.keep_index = Some(false),
             "-S" | "--staged" => o.staged_only = true,
             "--no-staged" => o.staged_only = false,
-            // `stash -p` runs the hunk selector against a SCRATCH index
-            // (`.git/stash-index`, seeded from HEAD and pointed at with
-            // `GIT_INDEX_FILE`), then turns that index into the stash tree.
-            // This port ignores `GIT_INDEX_FILE` everywhere, so the selector
-            // would stage into the REAL index instead — silently corrupting the
-            // user's staged state. Refused until that plumbing exists; the
-            // selector itself is ready (`super::add_patch`).
-            "-p" | "--patch" => bail!("--patch is not ported"),
+            "-p" | "--patch" => o.patch = true,
+            "--no-patch" => o.patch = false,
             "--pathspec-file-nul" => nul = true,
             "--pathspec-from-file" => {
                 i += 1;
@@ -2364,7 +2497,23 @@ fn parse_push_options(args: &[String]) -> Result<std::result::Result<PushOpts, E
         i += 1;
     }
 
+    if let Err(code) = patch_opts.finish() {
+        return Ok(Err(code));
+    }
+
     if let Some(f) = from_file {
+        // `push_stash()` refuses `--pathspec-from-file` against `--patch` and
+        // `--staged` before it looks at the pathspec arguments.
+        if o.patch {
+            crate::git_fatal!(
+                "options '--pathspec-from-file' and '--patch' cannot be used together"
+            );
+        }
+        if o.staged_only {
+            crate::git_fatal!(
+                "options '--pathspec-from-file' and '--staged' cannot be used together"
+            );
+        }
         if !o.pathspecs.is_empty() {
             crate::git_fatal!("--pathspec-from-file is incompatible with pathspec arguments");
         }
@@ -2373,11 +2522,31 @@ fn parse_push_options(args: &[String]) -> Result<std::result::Result<PushOpts, E
         crate::git_fatal!("--pathspec-file-nul requires --pathspec-from-file");
     }
 
+    // `push_stash()` checks the selector knobs in this order — `requires
+    // '--patch'` first, `cannot be negative` second. `save_stash()` checks the
+    // same two in the opposite order, which is why they are separate calls.
+    if let Some(code) = patch_opts.require_patch_only(o.patch, "--patch") {
+        return Ok(Err(code));
+    }
+    if let Some(code) = patch_opts.reject_negative() {
+        return Ok(Err(code));
+    }
+    o.interactive = patch_opts.to_interactive(false);
+
     // git refuses the combination outright rather than picking a winner, on
     // stderr and unprefixed (`do_push_stash()`).
     if o.staged_only && o.untracked != Untracked::No {
         eprintln!("Can't use --staged and --include-untracked or --all at the same time");
         return Ok(Err(ExitCode::FAILURE));
+    }
+    // `--patch` and `-u`/`-a` describe two different things to capture, so git
+    // takes neither; `--patch` silently wins over `--staged`.
+    if o.patch && o.untracked != Untracked::No {
+        eprintln!("Can't use --patch and --include-untracked or --all at the same time");
+        return Ok(Err(ExitCode::FAILURE));
+    }
+    if o.patch {
+        o.staged_only = false;
     }
     Ok(Ok(o))
 }
@@ -2402,7 +2571,15 @@ fn parse_save_options(args: &[String]) -> Result<std::result::Result<PushOpts, E
     let mut o = PushOpts::with_message(None);
     let mut words: Vec<String> = Vec::new();
     let mut rest_are_words = false;
+    let mut patch_opts = super::reset::PatchDiffOpts::default();
     for a in args {
+        if patch_opts.awaiting_value() || !rest_are_words {
+            match patch_opts.take_arg(a) {
+                Err(code) => return Ok(Err(code)),
+                Ok(true) => continue,
+                Ok(false) => {}
+            }
+        }
         if rest_are_words {
             words.push(a.clone());
             continue;
@@ -2414,18 +2591,12 @@ fn parse_save_options(args: &[String]) -> Result<std::result::Result<PushOpts, E
             "--no-include-untracked" => o.untracked = Untracked::No,
             "-a" | "--all" => o.untracked = Untracked::All,
             "--no-all" => o.untracked = Untracked::No,
-            "-k" | "--keep-index" => o.keep_index = true,
-            "--no-keep-index" => o.keep_index = false,
+            "-k" | "--keep-index" => o.keep_index = Some(true),
+            "--no-keep-index" => o.keep_index = Some(false),
             "-S" | "--staged" => o.staged_only = true,
             "--no-staged" => o.staged_only = false,
-            // `stash -p` runs the hunk selector against a SCRATCH index
-            // (`.git/stash-index`, seeded from HEAD and pointed at with
-            // `GIT_INDEX_FILE`), then turns that index into the stash tree.
-            // This port ignores `GIT_INDEX_FILE` everywhere, so the selector
-            // would stage into the REAL index instead — silently corrupting the
-            // user's staged state. Refused until the scratch-index plumbing
-            // exists; the selector itself is ready (`super::add_patch`).
-            "-p" | "--patch" => bail!("--patch is not ported"),
+            "-p" | "--patch" => o.patch = true,
+            "--no-patch" => o.patch = false,
             "--" => rest_are_words = true,
             other if other.starts_with('-') && other != "-" => {
                 return Ok(Err(usage_error(other, SAVE_USAGE)))
@@ -2433,9 +2604,28 @@ fn parse_save_options(args: &[String]) -> Result<std::result::Result<PushOpts, E
             other => words.push(other.to_string()),
         }
     }
+    if let Err(code) = patch_opts.finish() {
+        return Ok(Err(code));
+    }
+    // `save_stash()` checks these two in the opposite order to `push_stash()`:
+    // `cannot be negative` first, `requires '--patch'` second.
+    if let Some(code) = patch_opts.reject_negative() {
+        return Ok(Err(code));
+    }
+    if let Some(code) = patch_opts.require_patch_only(o.patch, "--patch") {
+        return Ok(Err(code));
+    }
+    o.interactive = patch_opts.to_interactive(false);
     if o.staged_only && o.untracked != Untracked::No {
         eprintln!("Can't use --staged and --include-untracked or --all at the same time");
         return Ok(Err(ExitCode::FAILURE));
+    }
+    if o.patch && o.untracked != Untracked::No {
+        eprintln!("Can't use --patch and --include-untracked or --all at the same time");
+        return Ok(Err(ExitCode::FAILURE));
+    }
+    if o.patch {
+        o.staged_only = false;
     }
     o.message = (!words.is_empty()).then(|| words.join(" "));
     Ok(Ok(o))

@@ -4,6 +4,18 @@ use std::process::ExitCode;
 
 use gix::config::{File as ConfigFile, KeyRef, Source};
 
+/// `usage_with_options()` over `builtin/config.c`'s subcommand table.
+const USAGE: &str = r"usage: git config list [<file-option>] [<display-option>] [--includes]
+   or: git config get [<file-option>] [<display-option>] [--includes] [--all] [--regexp] [--value=<pattern>] [--fixed-value] [--default=<default>] [--url=<url>] <name>
+   or: git config set [<file-option>] [--type=<type>] [--all] [--value=<pattern>] [--fixed-value] <name> <value>
+   or: git config unset [<file-option>] [--all] [--value=<pattern>] [--fixed-value] <name>
+   or: git config rename-section [<file-option>] <old-name> <new-name>
+   or: git config remove-section [<file-option>] <name>
+   or: git config edit [<file-option>]
+   or: git config [<file-option>] --get-colorbool <name> [<stdout-is-tty>]
+
+";
+
 #[derive(PartialEq, Clone, Copy)]
 enum Mode {
     Auto,
@@ -411,6 +423,9 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
             "--includes" => includes = true,
             "--no-includes" => includes = false,
             "--show-origin" => d.show_origin = true,
+            // parse_options_step()'s `internal_help`, ahead of the
+            // subcommand dispatch: the block on stdout at 129.
+            "-h" => return Ok(super::show_usage(USAGE)),
             "--show-scope" => d.show_scope = true,
             "-z" | "--null" => d.null = true,
             "--bool" => d.ty = Some(ValueType::Bool),
@@ -426,8 +441,11 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
                 }
             }
             "--name-only" => name_only = true,
-            // Per-worktree config needs `extensions.worktreeConfig`; not ported.
-            "--worktree" => bail!("--worktree scope is not supported"),
+            "--worktree" => bail!(
+                "--worktree scope is not supported: it reads and writes \
+                 $GIT_COMMON_DIR/worktrees/<id>/config.worktree behind the \
+                 `extensions.worktreeConfig` gate, a config source this port does not open"
+            ),
             other if other.starts_with('-') => bail!("unknown option {other}"),
             other => positional.push(other),
         }

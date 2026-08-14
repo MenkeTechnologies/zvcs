@@ -32,12 +32,15 @@ pub mod progress;
 pub mod rcache;
 pub mod revfilter;
 pub mod sequencer;
+pub mod setup;
 pub mod shallow_serve;
 pub mod sigpipe;
 pub mod superset;
 pub mod threads;
 pub mod transport_err;
 pub mod trace2;
+pub mod unicode_width;
+pub mod utf8;
 pub mod worktree;
 
 use std::process::ExitCode;

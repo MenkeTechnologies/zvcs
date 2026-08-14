@@ -83,6 +83,11 @@ enum Renames {
 /// `git merge-recursive [--<option>]... <base>... -- <head> <remote>`.
 pub fn merge_recursive(args: &[String]) -> Result<ExitCode> {
     // git checks `argc < 4`, counting argv[0]; args[0] is the subcommand name.
+    // `show_usage_if_asked(argc, argv, msg.buf)` (builtin/merge-recursive.c:45)
+    // precedes the `argc < 4` refusal and prints to stdout instead of stderr.
+    if let Some(code) = super::show_usage_if_asked(args, USAGE) {
+        return Ok(code);
+    }
     if args.len() < 4 {
         eprint!("{USAGE}");
         return Ok(ExitCode::from(129));

@@ -27,8 +27,13 @@
 //! pointing at `--no-index`, the `--no-index` usage block, and exit 129 rather
 //! than the `fatal:` / 128 every command that needs a repository dies with.
 //!
-//! Beyond the format selectors, these options are honored: `-R` (reverse, for
-//! tree/tree and `--cached` pairs), `-z`, `--full-index`, `--abbrev[=<n>]`,
+//! Beyond the format selectors, these options are honored: `-R` (reverse — the two
+//! filespecs are swapped as `diff_change()` swaps them, before diffcore and every
+//! format sees the pair, so a worktree diff reverses too: the file becomes the
+//! pre-image, the blob platform's worktree root moves to that side, and the
+//! `index` line names it by the hash of what is on disk while `--raw` keeps
+//! printing all-zero for a side that has no id of its own), `-z`, `--full-index`,
+//! `--abbrev[=<n>]`,
 //! `--no-prefix`/`--default-prefix`/`--src-prefix=`/`--dst-prefix=`/`--line-prefix=`,
 //! `--summary`, `--compact-summary`/`--no-compact-summary`, `--diff-filter=<...>`,
 //! `--color[=always|auto|never]`/`--no-color` and `--ws-error-highlight=<kind>` (the
@@ -96,7 +101,14 @@
 //!
 //! * `-R` on a worktree diff bails: the worktree "new" side has no object id to move
 //!   onto the old side within this pipeline.
-//! * A type change (regular file ↔ symlink) in the worktree bails.
+//! * A pair whose two sides differ in `S_IFMT` — a regular file that became a
+//!   symlink, a blob that became a gitlink — renders as a deletion section followed
+//!   by a creation section, which is what `run_diff()` (diff.c:5052) does. The stat,
+//!   raw, name and summary formats are handed the unsplit pair, so they still show
+//!   one row, one `T` record and one `mode change` line.
+//! * A path deleted from the index whose name a *directory* has since taken bails:
+//!   the post-image would have to be read through a blob platform with no worktree
+//!   root, and this pipeline shares one platform with the post-image side.
 //! * `--ignore-submodules[=<when>]` is accepted and inert: gitlink changes are
 //!   reported whatever it says, apart from the untracked files every diff ignores.
 //! * `-c diff.submodule=<bad value>` warns once. Stock git repeats the warning when
@@ -239,6 +251,11 @@ struct Delta {
     path: BString,
     /// `None` means the path did not exist before (an addition).
     old: Option<(ObjectId, EntryKind)>,
+    /// `!p->one->oid_valid`: the pre-image is the file in the worktree, not an
+    /// object, so its id is the null one and its content is read by path. Only a
+    /// reversed worktree diff (`-R`) produces one — everywhere else the pre-image
+    /// comes out of a tree or the index.
+    old_worktree: bool,
     new: NewSide,
     /// An unmerged (conflicted) index entry: rendered as status `U`, counted as
     /// zero changes by the stat formats, and never diffed through the blob pipeline.
@@ -260,6 +277,14 @@ struct Delta {
     /// none (git prints all-zero), but `hash_filespec()` gives one to every rename
     /// candidate, and `diff_flush_raw()` then prints that real id.
     new_id: Option<ObjectId>,
+    /// The id `--raw` prints for a worktree-backed pre-image: git's `p->one->oid`,
+    /// which `run_diff_files()` leaves null for a worktree side unless the submodule
+    /// sits exactly where the index says. Only a reversed worktree diff sets it.
+    old_raw_id: Option<ObjectId>,
+    /// git's `p->one->dirty_submodule`, which only a reversed worktree diff sets:
+    /// `diff_change()` swaps the two dirty flags along with the filespecs, so the
+    /// `-dirty` marker moves to the pre-image with the worktree side it describes.
+    old_dirty_submodule: u8,
     /// git's `p->two->dirty_submodule`: the `DIRTY_SUBMODULE_*` bits describing what
     /// the submodule worktree holds beyond its recorded commit. Always zero for a
     /// pair whose post-image is an object.
@@ -305,15 +330,31 @@ impl Delta {
             path,
             old,
             new,
+            old_worktree: false,
             unmerged: false,
             stages: None,
             src_path: None,
             score: 0,
             status: 0,
             new_id: None,
+            old_raw_id: None,
+            old_dirty_submodule: 0,
             dirty_submodule: 0,
             new_commit: None,
         }
+    }
+
+    /// `run_diff()` (diff.c:5052): both sides are valid and their `S_IFMT` bits
+    /// differ, so the patch formats render the pair as a deletion followed by a
+    /// creation. A permission-only change (`100644` → `100755`) is *not* one: both
+    /// modes are `S_IFREG`, and git keeps that as a single `old mode`/`new mode`
+    /// section.
+    fn type_changed(&self) -> bool {
+        !self.unmerged
+            && match (self.old, self.new_kind()) {
+                (Some((_, ok)), Some(nk)) => ifmt_class(ok) != ifmt_class(nk),
+                _ => false,
+            }
     }
 
     /// `builtin_diff()`'s submodule branch (diff.c:3870): both sides are either
@@ -333,9 +374,76 @@ impl Delta {
     }
 }
 
+/// The `S_IFMT` class of a tree entry mode — what `run_diff()` compares when it
+/// decides a pair is a type change (diff.c:5054). `100644` and `100755` are both
+/// `S_IFREG` and therefore share a class; a blob, a symlink, a tree and a gitlink
+/// each get their own.
+fn ifmt_class(kind: EntryKind) -> u8 {
+    match kind {
+        EntryKind::Blob | EntryKind::BlobExecutable => 0,
+        EntryKind::Link => 1,
+        EntryKind::Tree => 2,
+        EntryKind::Commit => 3,
+    }
+}
+
+/// The two halves `run_diff()` renders for a type change (diff.c:5052): the
+/// pre-image against an invalid post-image, then an invalid pre-image against the
+/// post-image. git allocates each null filespec with the *other* side's path, but
+/// `diffcore_rename` never scores a rename across a type change, so both halves
+/// carry the pair's single name.
+///
+/// Only the patch formats see this. `run_diffstat()` (diff.c:5078) and
+/// `diff_flush_raw()` are handed the unsplit pair, which is why `--stat` shows one
+/// row and `--raw`/`--name-status` one `T` record.
+fn split_type_change(d: &Delta) -> Option<(Delta, Delta)> {
+    let old = d.old.filter(|_| d.type_changed())?;
+    let deletion = Delta {
+        path: d.path.clone(),
+        old: Some(old),
+        old_worktree: d.old_worktree,
+        new: NewSide::Absent,
+        unmerged: false,
+        stages: None,
+        src_path: None,
+        score: 0,
+        status: b'D',
+        new_id: None,
+        old_raw_id: None,
+        old_dirty_submodule: 0,
+        dirty_submodule: 0,
+        new_commit: None,
+    };
+    let creation = Delta {
+        path: d.path.clone(),
+        old: None,
+        old_worktree: false,
+        new: match d.new {
+            NewSide::Absent => return None,
+            NewSide::Blob(id, k) => NewSide::Blob(id, k),
+            NewSide::Worktree(k) => NewSide::Worktree(k),
+        },
+        unmerged: false,
+        stages: None,
+        src_path: None,
+        score: 0,
+        status: b'A',
+        new_id: d.new_id,
+        old_raw_id: None,
+        old_dirty_submodule: 0,
+        dirty_submodule: d.dirty_submodule,
+        new_commit: d.new_commit,
+    };
+    Some((deletion, creation))
+}
+
 /// Per-delta blob analysis: the new-side object id plus line counts and the
 /// rendered hunks (only computed when a patch is actually requested).
 struct Analysis {
+    /// The pre-image id the `index` line prints. Normally [`Delta::old`]'s own id,
+    /// but a worktree-backed pre-image ([`Delta::old_worktree`]) has none until its
+    /// content is hashed, which is what `diff_populate_filespec()` does for git.
+    old_id: ObjectId,
     new_id: ObjectId,
     added: u32,
     deleted: u32,
@@ -598,6 +706,12 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
             trailing_paths.push(a.clone());
             continue;
         }
+        // The value checks `diff_opt_parse`'s callbacks run as each option is seen,
+        // ahead of every other decision this loop makes about the argument.
+        if let Some(line) = super::diff_optval::reject(a) {
+            eprintln!("{line}");
+            return Ok(ExitCode::from(129));
+        }
         // `--color-moved[=<mode>]`, `--color-moved-ws=<modes>`, `--word-diff[=<mode>]`,
         // `--word-diff-regex=<re>` and `--color-words[=<re>]`.
         if let Some(res) = move_word.parse_flag(a, &mut color_when) {
@@ -710,6 +824,9 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
             // `xdl_mark_ignorable_lines`); wiring this command through it is the fix.
             // The remaining entries are believed to match zvcs's default behavior, but
             // that has not been measured flag by flag — treat them as unverified.
+            // `revision.c`'s `--no-notes` turns off a display that is off by
+            // default here, so it cannot change any output this command produces.
+            "--no-notes" => {}
             "--ignore-cr-at-eol" => ws = Whitespace::IgnoreCrAtEol,
             "--ignore-blank-lines" | "--text" | "-a"
             | "--no-ext-diff" | "--ext-diff" | "--textconv"
@@ -941,6 +1058,10 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
             s if s.starts_with('-') && !is_known_option(s) => {
                 invalid_arg.get_or_insert_with(|| s.to_owned());
             }
+            // `-h` is `diff_opt_parse()`'s internal help, which `usage()`s the
+            // block on **stderr** at 129 with no `error:` line — diff never
+            // routes it to stdout, unlike the parse_options porcelain.
+            "-h" => return Ok(usage_error()),
             s if s.starts_with('-') => bail!("unsupported option {s:?}"),
             s => {
                 // A positional is a revision while we are still in the revision
@@ -1081,11 +1202,21 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
         } else {
             collect_index_worktree(&repo, &workdir, &paths, &mut deltas)?;
         }
+        // The side the platform resolves by *reading the path* rather than by id.
+        // `-R` swaps the two filespecs, so the worktree side becomes the pre-image
+        // and the root has to travel with it.
         cache = repo.diff_resource_cache(
             Mode::ToGit,
-            WorktreeRoots {
-                old_root: None,
-                new_root: Some(workdir.clone()),
+            if reverse {
+                WorktreeRoots {
+                    old_root: Some(workdir.clone()),
+                    new_root: None,
+                }
+            } else {
+                WorktreeRoots {
+                    old_root: None,
+                    new_root: Some(workdir.clone()),
+                }
             },
         )?;
         worktree_mode = true;
@@ -1106,16 +1237,13 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
         deltas.retain(|d| d.path.starts_with(prefix.as_bytes()));
     }
 
-    // `-R`: swap the two sides of every pair. The worktree "new" side has no object
-    // id to move onto the old side, so a reversed worktree diff genuinely cannot be
-    // expressed through this pipeline.
+    // `-R`: swap the two sides of every pair, before diffcore and every format sees
+    // them, the way `diff_change()` does.
     if reverse {
-        if worktree_mode {
-            bail!("-R (reverse) with a worktree diff is not supported");
-        }
         std::mem::swap(&mut src_prefix, &mut dst_prefix);
+        let null = repo.object_hash().null();
         for d in &mut deltas {
-            reverse_delta(d);
+            reverse_delta(d, null);
         }
     }
 
@@ -1209,12 +1337,121 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
             want_patch,
             algorithm,
             worktree_mode,
+            reverse,
             want_dirstat && !dirstat.by_line && !dirstat.by_file,
             // Only a rendered patch carries the payload, so a `--stat`-only run with
             // `--binary` reads nothing extra.
             binary && want_patch,
             func_context,
         )?;
+    }
+
+    // `run_diff()` splits a type change into a deletion patch and a creation patch
+    // (diff.c:5052) — but only for the patch formats, so the split lives beside
+    // `deltas` rather than in it. The entry is `None` for every pair git renders
+    // whole, which is all of them in the overwhelmingly common case; the two halves
+    // are analyzed here so the patch loop has hunks for each.
+    let mut splits: Vec<Option<(Delta, Analysis, Delta, Analysis)>> = Vec::new();
+    if want_patch && deltas.iter().any(Delta::type_changed) {
+        // The deletion half's post-image is git's invalid filespec — no content at
+        // all. A worktree diff's blob platform resolves a null object id by *reading
+        // the path*, which for a type change is the file that replaced the old one,
+        // so that half is analyzed through a platform with no worktree root, where a
+        // null id really is empty. The creation half keeps the caller's platform,
+        // since its post-image is exactly the worktree file.
+        let mut null_cache = repo.diff_resource_cache_for_tree_diff()?;
+        // `-R` swaps which half owns the worktree: the deletion half's *pre*-image is
+        // then the file, and the creation half's pre-image is the invalid filespec.
+        let reversed_worktree = reverse && worktree_mode;
+        for delta in &deltas {
+            splits.push(match split_type_change(delta) {
+                Some((del, add)) => {
+                    let (del_an, add_an) = if reversed_worktree {
+                        let del_an = analyze(
+                            &mut cache,
+                            &repo.objects,
+                            &del,
+                            ctx,
+                            ws,
+                            indent_heuristic,
+                            hash_kind,
+                            workdir.as_deref(),
+                            true,
+                            algorithm,
+                            None,
+                            false,
+                            binary,
+                            func_context,
+                        )?;
+                        let add_an = analyze(
+                            &mut null_cache,
+                            &repo.objects,
+                            &add,
+                            ctx,
+                            ws,
+                            indent_heuristic,
+                            hash_kind,
+                            None,
+                            true,
+                            algorithm,
+                            None,
+                            false,
+                            binary,
+                            func_context,
+                        )?;
+                        (del_an, add_an)
+                    } else {
+                        let del_an = analyze(
+                            &mut null_cache,
+                            &repo.objects,
+                            &del,
+                            ctx,
+                            ws,
+                            indent_heuristic,
+                            hash_kind,
+                            None,
+                            true,
+                            algorithm,
+                            None,
+                            false,
+                            binary,
+                            func_context,
+                        )?;
+                        let add_an = analyze(
+                            &mut cache,
+                            &repo.objects,
+                            &add,
+                            ctx,
+                            ws,
+                            indent_heuristic,
+                            hash_kind,
+                            workdir.as_deref(),
+                            true,
+                            algorithm,
+                            None,
+                            false,
+                            binary,
+                            func_context,
+                        )?;
+                        (del_an, add_an)
+                    };
+                    Some((del, del_an, add, add_an))
+                }
+                None => None,
+            });
+        }
+    }
+    /// The pairs a patch format renders for one queued delta: the delta itself, or
+    /// the deletion/creation halves of a type change.
+    fn patch_steps<'a>(
+        delta: &'a Delta,
+        an: &'a Analysis,
+        split: Option<&'a (Delta, Analysis, Delta, Analysis)>,
+    ) -> Vec<(&'a Delta, &'a Analysis)> {
+        match split {
+            Some((del, del_an, add, add_an)) => vec![(del, del_an), (add, add_an)],
+            None => vec![(delta, an)],
+        }
     }
 
     // With no explicit `--abbrev`, the `index` line honors `core.abbrev`
@@ -1404,45 +1641,52 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
             // `--color-moved` is the only thing a split buffer would cost, and this
             // command rejects it outright.
             let sub_abbrev = crate::abbrev::configured_abbrev(&repo, repo.object_hash().len_in_hex());
-            for (delta, an) in deltas.iter().zip(&analyses) {
-                if !delta.unmerged && unmerged.contains(&delta.path) {
+            for (i, (queued, queued_an)) in deltas.iter().zip(&analyses).enumerate() {
+                if !queued.unmerged && unmerged.contains(&queued.path) {
                     continue;
                 }
-                if submodule_format != SubmoduleFormat::Short
-                    && !delta.unmerged
-                    && delta.is_submodule_pair()
+                // The submodule branch lives in `builtin_diff()`, downstream of
+                // `run_diff()`'s split, so each half is tested on its own: the
+                // deletion half of a gitlink-to-blob change is a submodule pair even
+                // though the whole pair is not.
+                for (delta, an) in patch_steps(queued, queued_an, splits.get(i).and_then(|s| s.as_ref()))
                 {
-                    out.extend_from_slice(&diff_color::colorize_patch_ex(
-                        &plain,
-                        &colors,
-                        &paint_opts,
-                        &files,
-                        diff_color::FilePaint::new(ws_rule),
-                        &extra,
-                    ));
-                    plain.clear();
-                    files.clear();
-                    render_submodule(
-                        &mut out,
-                        &repo,
-                        delta,
-                        submodule_format,
-                        sub_abbrev,
-                        &colors,
-                        &r,
-                    );
-                    // `builtin_diff()`'s submodule branches set `o->found_changes`
-                    // unconditionally (diff.c:3570, diff.c:3579).
-                    found_changes = true;
-                    continue;
-                }
-                let before = plain.len();
-                render_patch(&mut plain, &repo, delta, an, ctx, &r)?;
-                if plain.len() != before {
-                    files.push(diff_color::FilePaint { ws_rule, blank_at_eof: an.blank_at_eof });
-                    // Every `builtin_diff()` arm that emits a header or a hunk sets
-                    // `o->found_changes`, so having written anything is the answer.
-                    found_changes = true;
+                    if submodule_format != SubmoduleFormat::Short
+                        && !delta.unmerged
+                        && delta.is_submodule_pair()
+                    {
+                        out.extend_from_slice(&diff_color::colorize_patch_ex(
+                            &plain,
+                            &colors,
+                            &paint_opts,
+                            &files,
+                            diff_color::FilePaint::new(ws_rule),
+                            &extra,
+                        ));
+                        plain.clear();
+                        files.clear();
+                        render_submodule(
+                            &mut out,
+                            &repo,
+                            delta,
+                            submodule_format,
+                            sub_abbrev,
+                            &colors,
+                            &r,
+                        );
+                        // `builtin_diff()`'s submodule branches set `o->found_changes`
+                        // unconditionally (diff.c:3570, diff.c:3579).
+                        found_changes = true;
+                        continue;
+                    }
+                    let before = plain.len();
+                    render_patch(&mut plain, &repo, delta, an, ctx, &r)?;
+                    if plain.len() != before {
+                        files.push(diff_color::FilePaint { ws_rule, blank_at_eof: an.blank_at_eof });
+                        // Every `builtin_diff()` arm that emits a header or a hunk sets
+                        // `o->found_changes`, so having written anything is the answer.
+                        found_changes = true;
+                    }
                 }
             }
             out.extend_from_slice(&diff_color::colorize_patch_ex(
@@ -1461,10 +1705,15 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     // reports a change, because that is the only way to know the exit status.
     if exit_needs_patch {
         let mut sink: Vec<u8> = Vec::new();
-        for (delta, an) in deltas.iter().zip(&analyses) {
-            if pair_reports_change(&mut sink, &repo, delta, an, ctx, &r, submodule_format)? {
-                found_changes = true;
-                break;
+        'pairs: for (i, (queued, queued_an)) in deltas.iter().zip(&analyses).enumerate() {
+            // `diff_flush_patch_quietly()` goes through `run_diff()` too, so a type
+            // change is asked about as its two halves.
+            for (delta, an) in patch_steps(queued, queued_an, splits.get(i).and_then(|s| s.as_ref()))
+            {
+                if pair_reports_change(&mut sink, &repo, delta, an, ctx, &r, submodule_format)? {
+                    found_changes = true;
+                    break 'pairs;
+                }
             }
         }
     }
@@ -1499,20 +1748,48 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// Reverse (`-R`) one object-backed pair: the new side becomes the old side and
-/// vice-versa. Worktree pairs are never reversed (rejected earlier).
-fn reverse_delta(d: &mut Delta) {
-    let new_as_old = match &d.new {
-        NewSide::Blob(id, k) => Some((*id, *k)),
-        NewSide::Absent => None,
-        NewSide::Worktree(_) => return,
+/// Reverse (`-R`) one pair: the new side becomes the old side and vice-versa,
+/// exactly as `diff_change()`/`diff_addremove()` (diff.c) swap the two filespecs
+/// before queueing them.
+///
+/// git swaps `oid_valid` along with the ids, which is how a worktree post-image —
+/// a filespec with no id, read by path — becomes a worktree *pre*-image. The same
+/// bit is [`Delta::old_worktree`] here, and the blob platform's worktree root
+/// moves to the old side with it (see [`diff`]).
+fn reverse_delta(d: &mut Delta, null: ObjectId) {
+    let (new_as_old, new_was_worktree) = match &d.new {
+        NewSide::Blob(id, k) => (Some((*id, *k)), false),
+        // A worktree gitlink is the one worktree side that knows an id — the commit
+        // the submodule has checked out, which `run_diff_files()` keeps beside the
+        // invalid filespec — so the swap carries it onto the pre-image. The side is
+        // still worktree-backed (its `oid_valid` is false, which is what `--raw`
+        // reports); a gitlink simply never goes through the blob platform.
+        NewSide::Worktree(EntryKind::Commit) => {
+            (Some((d.new_commit.unwrap_or(null), EntryKind::Commit)), true)
+        }
+        // Every other post-image had no id, so the pre-image it becomes has none.
+        NewSide::Worktree(k) => (Some((null, *k)), true),
+        NewSide::Absent => (None, false),
     };
-    let old_as_new = match d.old {
-        Some((id, k)) => NewSide::Blob(id, k),
-        None => NewSide::Absent,
+    let old_as_new = match (d.old, d.old_worktree) {
+        (Some((_, k)), true) => NewSide::Worktree(k),
+        (Some((id, k)), false) => NewSide::Blob(id, k),
+        (None, _) => NewSide::Absent,
     };
     d.old = new_as_old;
+    d.old_worktree = new_was_worktree;
     d.new = old_as_new;
+    // The id `--raw` printed for the post-image now belongs to the pre-image, and
+    // the new post-image prints its own — a real one when it came out of the object
+    // database, none for a side that was only ever a file.
+    d.old_raw_id = d.new_id;
+    d.new_id = match d.new {
+        NewSide::Blob(id, _) => Some(id),
+        _ => None,
+    };
+    // `SWAP(old_dirty_submodule, new_dirty_submodule)`: the `-dirty` marker belongs
+    // to the worktree side wherever it lands.
+    std::mem::swap(&mut d.old_dirty_submodule, &mut d.dirty_submodule);
     if let Some((a, b)) = d.stages {
         d.stages = Some((b, a));
     }
@@ -1682,6 +1959,12 @@ fn run_diffcore_rename(
     // pair also has to keep the submodule state it arrived with, which no filespec
     // has room for.
     let mut new_sides: BTreeMap<usize, NewSide> = BTreeMap::new();
+    // The same for the pre-image: `hash_filespec()` may give a worktree side a real
+    // id mid-pass, so `oid_valid` alone no longer says where the content lives.
+    let mut old_worktree_specs: BTreeSet<usize> = BTreeSet::new();
+    // …and the printable id such a side may still carry, which no filespec has room
+    // for either.
+    let mut old_raw_ids: BTreeMap<usize, ObjectId> = BTreeMap::new();
     let mut submodule_state: BTreeMap<usize, (u8, Option<ObjectId>, Option<ObjectId>)> =
         BTreeMap::new();
 
@@ -1691,22 +1974,28 @@ fn run_diffcore_rename(
             continue;
         }
         let one = match d.old {
-            Some((id, k)) => q.add_spec(diffcore_rename::FileSpec::new(
-                d.path.clone(),
-                kind_mode(k),
-                id,
-                true,
-            )),
+            Some((id, k)) => {
+                let mut spec =
+                    diffcore_rename::FileSpec::new(d.path.clone(), kind_mode(k), id, !d.old_worktree);
+                spec.dirty_submodule = d.old_dirty_submodule;
+                q.add_spec(spec)
+            }
             None => q.add_spec(diffcore_rename::FileSpec::absent(d.path.clone())),
         };
+        if d.old_worktree {
+            old_worktree_specs.insert(one);
+            if let Some(id) = d.old_raw_id {
+                old_raw_ids.insert(one, id);
+            }
+        }
         let two = match &d.new {
             NewSide::Absent => q.add_spec(diffcore_rename::FileSpec::absent(d.path.clone())),
-            NewSide::Blob(id, k) => q.add_spec(diffcore_rename::FileSpec::new(
-                d.path.clone(),
-                kind_mode(*k),
-                *id,
-                true,
-            )),
+            NewSide::Blob(id, k) => {
+                let mut spec =
+                    diffcore_rename::FileSpec::new(d.path.clone(), kind_mode(*k), *id, true);
+                spec.dirty_submodule = d.dirty_submodule;
+                q.add_spec(spec)
+            }
             NewSide::Worktree(k) => q.add_spec(diffcore_rename::FileSpec::new(
                 d.path.clone(),
                 kind_mode(*k),
@@ -1757,6 +2046,7 @@ fn run_diffcore_rename(
             path,
             old,
             new,
+            old_worktree: old_worktree_specs.contains(&p.one),
             unmerged: false,
             stages: None,
             src_path,
@@ -1768,6 +2058,13 @@ fn run_diffcore_rename(
                 Some((_, _, id)) => id,
                 None => (two.valid() && two.oid_valid).then_some(two.oid),
             },
+            // `hash_filespec()` may have given the worktree *pre*-image a real id
+            // too, and `diff_flush_raw()` prints that one; otherwise whatever the
+            // side arrived with (a submodule sitting where the index says).
+            old_raw_id: (one.valid() && one.oid_valid)
+                .then_some(one.oid)
+                .or_else(|| old_raw_ids.get(&p.one).copied()),
+            old_dirty_submodule: q.specs[p.one].dirty_submodule,
             dirty_submodule: sub_state.map(|(d, _, _)| d).unwrap_or(0),
             new_commit: sub_state.and_then(|(_, c, _)| c),
         });
@@ -1853,12 +2150,15 @@ fn collect_tree_index(
             path,
             old,
             new: NewSide::Absent,
+            old_worktree: false,
             unmerged: true,
             stages: None,
             src_path: None,
             score: 0,
             status: 0,
             new_id: None,
+            old_raw_id: None,
+            old_dirty_submodule: 0,
             dirty_submodule: 0,
             new_commit: None,
         });
@@ -2025,6 +2325,7 @@ fn collect_index_worktree(
         deltas.push(Delta {
             path: path.clone(),
             old: None,
+            old_worktree: false,
             new: match wt_kind {
                 Some(k) => NewSide::Worktree(k),
                 None => NewSide::Absent,
@@ -2035,6 +2336,8 @@ fn collect_index_worktree(
             score: 0,
             status: 0,
             new_id: None,
+            old_raw_id: None,
+            old_dirty_submodule: 0,
             dirty_submodule: 0,
             new_commit: None,
         });
@@ -2043,6 +2346,36 @@ fn collect_index_worktree(
         }
     }
     Ok(())
+}
+
+/// The post-image of an index-vs-worktree type change: the worktree's own type,
+/// which `run_diff_files()` derives with `ce_mode_from_stat()` and `run_diff()`
+/// then renders as a deletion followed by a creation.
+///
+/// gix reports `Mode::COMMIT` for *any* path that became a directory, because
+/// `change_to_match_fs()` cannot tell a checked-out submodule from a plain
+/// directory. git can: `check_removed()` (diff-lib.c) calls `resolve_gitlink_ref()`
+/// on the directory and, when it is not a repository, reports the tracked blob as
+/// simply removed instead. That lookup is the missing piece, so this one case is
+/// refused rather than guessed at.
+fn worktree_type_change(
+    rela_path: BString,
+    worktree_mode: gix::index::entry::Mode,
+    old_kind: EntryKind,
+) -> Result<Option<(BString, NewSide, u8, Option<ObjectId>)>> {
+    let Some(new_kind) = index_mode_kind(worktree_mode) else {
+        bail!(
+            "worktree mode {:o} at {rela_path:?} has no tree-entry equivalent",
+            worktree_mode.bits()
+        )
+    };
+    if new_kind == EntryKind::Commit && old_kind != EntryKind::Commit {
+        bail!(
+            "{rela_path:?} was replaced by a directory; telling a checked-out submodule from a \
+             plain directory needs git's resolve_gitlink_ref(), which is not ported"
+        )
+    }
+    Ok(Some((rela_path, NewSide::Worktree(new_kind), 0, None)))
 }
 
 /// The "new" side an index-vs-worktree status item implies, together with the
@@ -2084,8 +2417,10 @@ fn worktree_new_side(
             }
             // The whole submodule directory is gone from the worktree.
             EntryStatus::Change(Change::Removed) => Some((rela_path, NewSide::Absent, 0, None)),
-            EntryStatus::Change(Change::Type { .. }) => {
-                bail!("type change at {rela_path:?} is not supported")
+            // The gitlink's path is no longer a directory. `ce_mode_from_stat()`
+            // gives the pair the worktree's own type and `run_diff()` then splits it.
+            EntryStatus::Change(Change::Type { worktree_mode }) => {
+                worktree_type_change(rela_path, worktree_mode, old_kind)?
             }
             _ => None,
         });
@@ -2103,8 +2438,8 @@ fn worktree_new_side(
             Some((rela_path, NewSide::Worktree(new_kind), 0, None))
         }
         EntryStatus::Change(Change::Removed) => Some((rela_path, NewSide::Absent, 0, None)),
-        EntryStatus::Change(Change::Type { .. }) => {
-            bail!("type change at {rela_path:?} is not supported")
+        EntryStatus::Change(Change::Type { worktree_mode }) => {
+            worktree_type_change(rela_path, worktree_mode, old_kind)?
         }
         // A conflicted path still has worktree content; only `git diff` with no
         // revision treats it specially, and that caller intercepts it first.
@@ -2828,25 +3163,34 @@ fn commit_patch_with(
 
     let hash_kind = repo.object_hash();
     let mut out: Vec<u8> = Vec::new();
-    for delta in &deltas {
-        // A worktree side never arises for a tree diff, so `workdir` is `None`.
-        let an = analyze(
-            cache,
-            &repo.objects,
-            delta,
-            opts.ctx,
-            opts.ws,
-            true,
-            hash_kind,
-            None,
-            true,
-            None,
-            None,
-            false,
-            r.binary,
-            opts.func_context,
-        )?;
-        render_patch(&mut out, repo, delta, &an, opts.ctx, r)?;
+    for queued in &deltas {
+        // `run_diff()` (diff.c:5052) renders a type change as a deletion followed by
+        // a creation; every other pair is one section.
+        let halves = split_type_change(queued);
+        let steps: Vec<&Delta> = match &halves {
+            Some((del, add)) => vec![del, add],
+            None => vec![queued],
+        };
+        for delta in steps {
+            // A worktree side never arises for a tree diff, so `workdir` is `None`.
+            let an = analyze(
+                cache,
+                &repo.objects,
+                delta,
+                opts.ctx,
+                opts.ws,
+                true,
+                hash_kind,
+                None,
+                true,
+                None,
+                None,
+                false,
+                r.binary,
+                opts.func_context,
+            )?;
+            render_patch(&mut out, repo, delta, &an, opts.ctx, r)?;
+        }
     }
     Ok(out)
 }
@@ -2954,6 +3298,9 @@ fn analyze_all(
     want_patch: bool,
     algorithm: Option<gix::diff::blob::Algorithm>,
     worktree_mode: bool,
+    // `-R`: the worktree root belongs to the pre-image side, as it does on the
+    // caller's platform.
+    reverse: bool,
     // Whether `--dirstat` will need each pair's content damage.
     want_dirstat: bool,
     // Whether `--binary` will need each binary pair's two images.
@@ -3006,7 +3353,11 @@ fn analyze_all(
                 let mut cache = match (worktree_mode, workdir) {
                     (true, Some(root)) => repo.diff_resource_cache(
                         Mode::ToGit,
-                        WorktreeRoots { old_root: None, new_root: Some(root.to_owned()) },
+                        if reverse {
+                            WorktreeRoots { old_root: Some(root.to_owned()), new_root: None }
+                        } else {
+                            WorktreeRoots { old_root: None, new_root: Some(root.to_owned()) }
+                        },
                     )?,
                     _ => repo.diff_resource_cache_for_tree_diff()?,
                 };
@@ -3083,6 +3434,7 @@ fn analyze(
     let null = hash_kind.null();
     if delta.unmerged {
         return Ok(Analysis {
+            old_id: null,
             new_id: null,
             added: 0,
             deleted: 0,
@@ -3111,6 +3463,7 @@ fn analyze(
         return analyze_gitlink(
             old_commit,
             new_commit,
+            delta.old_dirty_submodule,
             delta.dirty_submodule,
             null,
             ctx,
@@ -3137,11 +3490,49 @@ fn analyze(
             cache.set_resource(null, *k, path, ResourceKind::NewOrDestination, objects)?;
         }
         NewSide::Absent => {
+            // A deletion's post-image is git's invalid filespec: no content. With
+            // `new_root` set, though, the blob platform resolves this null id by
+            // *reading the path*, and it only comes out empty because the file is
+            // normally gone. When a directory has taken the name the read fails, and
+            // the failure is the platform's rather than the diff's, so it is named
+            // here instead of surfacing raw. (`--raw`, `--name-status` and `--stat`
+            // are unaffected: they never reach the blob platform.)
+            // Under `-R` the worktree root sits on the *old* side instead, so the
+            // post-image is read from nowhere and the collision cannot arise.
+            if let Some(base) = workdir.filter(|_| !delta.old_worktree) {
+                let full = base.join(gix::path::from_bstr(path));
+                if full.symlink_metadata().is_ok_and(|m| m.is_dir()) {
+                    bail!(
+                        "{path:?} is deleted from the index but a directory now has that \
+                         name: rendering its patch needs a blob platform with no worktree \
+                         root, and this pipeline shares one with the post-image side"
+                    )
+                }
+            }
             cache.set_resource(null, old_kind, path, ResourceKind::NewOrDestination, objects)?;
         }
     };
 
     let prep = cache.prepare_diff()?;
+
+    // `diff_populate_filespec()` hashes a filespec that has no id of its own, which
+    // is how the `index` line of a reversed worktree diff still names both sides.
+    let old_id: ObjectId = match (delta.old, delta.old_worktree) {
+        (None, _) => null,
+        (Some((id, _)), false) => id,
+        (Some(_), true) => {
+            if !prep.old.id.is_null() {
+                prep.old.id.to_owned()
+            } else if let Some(buf) = prep.old.data.as_slice() {
+                gix::objs::compute_hash(hash_kind, gix::objs::Kind::Blob, buf)?
+            } else {
+                let base = workdir.ok_or_else(|| anyhow::anyhow!("missing work tree"))?;
+                let full = base.join(gix::path::from_bstr(old_side_path));
+                let bytes = std::fs::read(&full)?;
+                gix::objs::compute_hash(hash_kind, gix::objs::Kind::Blob, &bytes)?
+            }
+        }
+    };
 
     let new_id: ObjectId = match &delta.new {
         NewSide::Absent => null,
@@ -3167,11 +3558,14 @@ fn analyze(
             // are read back here — and only if `--dirstat` or `--binary` is going to
             // use them, since for a binary pair that is the whole file on both sides.
             let images = if want_dirstat || want_binary {
-                let old_bytes = delta
-                    .old
-                    .map(|(id, _)| read_blob(objects, id))
-                    .transpose()?
-                    .unwrap_or_default();
+                let old_bytes = match (delta.old, delta.old_worktree) {
+                    (None, _) => Vec::new(),
+                    (Some(_), true) => workdir
+                        .map(|base| std::fs::read(base.join(gix::path::from_bstr(old_side_path))))
+                        .transpose()?
+                        .unwrap_or_default(),
+                    (Some((id, _)), false) => read_blob(objects, id)?,
+                };
                 let new_bytes = match &delta.new {
                     NewSide::Blob(id, _) => read_blob(objects, *id)?,
                     NewSide::Worktree(_) => workdir
@@ -3185,13 +3579,14 @@ fn analyze(
                 None
             };
             Ok(Analysis {
+                old_id,
                 new_id,
                 // `diffstat_consume()` never sees a binary pair; `show_stats()` reads
                 // the two *sizes* out of the filespecs instead and prints them as
                 // `Bin <old> -> <new> bytes`, so that is what these two carry here.
                 // Every consumer that counts lines skips a pair with `binary` set.
                 added: blob_size_new(objects, delta, workdir, path)?,
-                deleted: blob_size_old(objects, delta)?,
+                deleted: blob_size_old(objects, delta, workdir)?,
                 binary: true,
                 hunks: None,
                 blank_at_eof: (0, 0),
@@ -3227,6 +3622,7 @@ fn analyze(
                 let added = count_lines(new_data);
                 let hunks = want_patch.then(|| emit_rewrite_diff(old_data, new_data));
                 return Ok(Analysis {
+                    old_id,
                     new_id,
                     added,
                     deleted,
@@ -3318,6 +3714,7 @@ fn analyze(
                 None
             };
             Ok(Analysis {
+                old_id,
                 new_id,
                 added,
                 deleted,
@@ -3337,9 +3734,20 @@ fn analyze(
 
 /// `diff_populate_filespec(..., CHECK_SIZE_ONLY)` for the pre-image: the blob's
 /// size without reading it, which is all `show_stats()` wants for a binary pair.
-fn blob_size_old(objects: &gix::OdbHandle, delta: &Delta) -> Result<u32> {
+fn blob_size_old(
+    objects: &gix::OdbHandle,
+    delta: &Delta,
+    workdir: Option<&std::path::Path>,
+) -> Result<u32> {
     use gix::objs::FindHeader;
     let Some((id, _)) = delta.old else { return Ok(0) };
+    // A worktree-backed pre-image (`-R`) has no object to ask; its size is the
+    // file's, exactly as [`blob_size_new`] reads it for the other side.
+    if delta.old_worktree {
+        let Some(base) = workdir else { return Ok(0) };
+        let full = base.join(gix::path::from_bstr(delta.old_path().as_bstr()));
+        return Ok(std::fs::metadata(&full).map(|m| m.len()).unwrap_or(0) as u32);
+    }
     Ok(objects.try_header(&id).ok().flatten().map(|h| h.size).unwrap_or(0) as u32)
 }
 
@@ -3466,6 +3874,7 @@ fn synthetic_rows(rows: &[(BString, BString, u32, u32, bool)]) -> (Vec<Delta>, V
         }
         deltas.push(d);
         analyses.push(Analysis {
+            old_id: null,
             new_id: null,
             added: *added,
             deleted: *deleted,
@@ -3558,6 +3967,7 @@ fn emit_rewrite_lines(out: &mut Vec<u8>, prefix: u8, data: &[u8]) {
 fn analyze_gitlink(
     old_commit: Option<ObjectId>,
     new_commit: Option<ObjectId>,
+    old_dirty: u8,
     dirty: u8,
     null: ObjectId,
     ctx: u32,
@@ -3573,7 +3983,9 @@ fn analyze_gitlink(
         v.push(b'\n');
         v
     };
-    let before: Vec<Vec<u8>> = old_commit.map(|id| vec![line(id, false)]).unwrap_or_default();
+    let before: Vec<Vec<u8>> = old_commit
+        .map(|id| vec![line(id, old_dirty != 0)])
+        .unwrap_or_default();
     let after: Vec<Vec<u8>> = new_commit
         .map(|id| vec![line(id, dirty != 0)])
         .unwrap_or_default();
@@ -3591,7 +4003,7 @@ fn analyze_gitlink(
     // `+Subproject commit <oid>-dirty` hunk while `git diff --numstat` prints
     // `0\t0\tsub` and `--shortstat` prints `1 file changed, 0 insertions(+),
     // 0 deletions(-)`. So the counts come from the two commit ids alone.
-    let (added, deleted) = if dirty != 0 && old_commit == new_commit {
+    let (added, deleted) = if (dirty | old_dirty) != 0 && old_commit == new_commit {
         (0, 0)
     } else {
         (diff.count_additions(), diff.count_removals())
@@ -3610,6 +4022,7 @@ fn analyze_gitlink(
         None
     };
     Ok(Analysis {
+        old_id: old_commit.unwrap_or(null),
         new_id: new_commit.unwrap_or(null),
         added,
         deleted,
@@ -3710,10 +4123,17 @@ fn render_raw(out: &mut Vec<u8>, delta: &Delta, fmt: u32, r: &Render) {
     let status = status_char(delta);
     if fmt & F_NAME_STATUS == 0 {
         let null = r.hash_kind.null().to_hex_with_len(r.raw_abbrev).to_string();
-        let old_hash = delta
-            .old
-            .map(|(id, _)| id.to_hex_with_len(r.raw_abbrev).to_string())
-            .unwrap_or_else(|| null.clone());
+        let old_hash = match (delta.old, delta.old_worktree) {
+            (None, _) => null.clone(),
+            (Some((id, _)), false) => id.to_hex_with_len(r.raw_abbrev).to_string(),
+            // A worktree pre-image has no id of its own, which git reports as
+            // all-zero — unless the side kept a printable one (`hash_filespec()`, or
+            // a submodule sitting where the index says).
+            (Some(_), true) => match delta.old_raw_id {
+                Some(id) => id.to_hex_with_len(r.raw_abbrev).to_string(),
+                None => null.clone(),
+            },
+        };
         // Worktree content has no object id yet, which git reports as all-zero —
         // unless rename detection already hashed it (`hash_filespec()`).
         let new_hash = match (&delta.new, delta.unmerged) {
@@ -3922,10 +4342,13 @@ fn diffstat_pairs<'a>(deltas: &'a [Delta], analyses: &'a [Analysis]) -> Vec<(&'a
             if d.unmerged || an.binary || d.complete_rewrite() {
                 return true;
             }
-            let (Some((old_id, old_kind)), Some(new_kind)) = (d.old, d.new_kind()) else {
+            let (Some((_, old_kind)), Some(new_kind)) = (d.old, d.new_kind()) else {
                 return true;
             };
-            let may_differ = old_id != an.new_id;
+            // `!DIFF_FILE_VALID(p->one) || !oid_eq(...)`: a side with no id of its
+            // own (worktree content) can always differ, which is what
+            // [`Analysis::old_id`] carries once it has been hashed.
+            let may_differ = an.old_id != an.new_id;
             let dropped = may_differ
                 && status_char(d) == b'M'
                 && an.added == 0
@@ -4429,10 +4852,11 @@ fn render_patch(
         r.abbrev
     };
     let null_hash = r.hash_kind.null().to_hex_with_len(hlen).to_string();
-    let old_hash = delta
-        .old
-        .map(|(id, _)| id.to_hex_with_len(hlen).to_string())
-        .unwrap_or_else(|| null_hash.clone());
+    let old_hash = if delta.old.is_some() {
+        an.old_id.to_hex_with_len(hlen).to_string()
+    } else {
+        null_hash.clone()
+    };
     let new_hash = if matches!(delta.new, NewSide::Absent) {
         null_hash.clone()
     } else {
@@ -5643,4 +6067,142 @@ fn new_hunk_start(header: &[u8]) -> usize {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(1)
+}
+
+#[cfg(test)]
+mod type_change_tests {
+    use super::*;
+
+    fn blob_id(byte: u8) -> ObjectId {
+        ObjectId::from_bytes_or_panic(&[byte; 20])
+    }
+
+    fn pair(old: EntryKind, new: EntryKind) -> Delta {
+        Delta::plain(
+            BString::from("g.txt"),
+            Some((blob_id(1), old)),
+            NewSide::Blob(blob_id(2), new),
+        )
+    }
+
+    /// `run_diff()` (diff.c:5054) compares `S_IFMT & mode`, so a permission change
+    /// is not a type change while a blob/symlink or blob/gitlink swap is. Verified
+    /// against git 2.55.0: `git diff` over a `100644` → `100755` change prints one
+    /// section with `old mode`/`new mode`, and over `100644` → `120000` prints a
+    /// deletion section followed by a creation section.
+    #[test]
+    fn only_a_change_of_s_ifmt_counts_as_a_type_change() {
+        assert!(!pair(EntryKind::Blob, EntryKind::BlobExecutable).type_changed());
+        assert!(!pair(EntryKind::Blob, EntryKind::Blob).type_changed());
+        assert!(pair(EntryKind::Blob, EntryKind::Link).type_changed());
+        assert!(pair(EntryKind::Link, EntryKind::BlobExecutable).type_changed());
+        assert!(pair(EntryKind::Blob, EntryKind::Commit).type_changed());
+        // A creation and a deletion have only one valid side, so neither is one.
+        let creation = Delta::plain(
+            BString::from("g.txt"),
+            None,
+            NewSide::Blob(blob_id(2), EntryKind::Link),
+        );
+        assert!(!creation.type_changed());
+        let deletion = Delta::plain(
+            BString::from("g.txt"),
+            Some((blob_id(1), EntryKind::Blob)),
+            NewSide::Absent,
+        );
+        assert!(!deletion.type_changed());
+    }
+
+    /// The two halves `run_diff()` hands to `run_diff_cmd()`: the pre-image against
+    /// an invalid post-image, then an invalid pre-image against the post-image. Both
+    /// keep the pair's single name, since no rename is ever scored across a type
+    /// change.
+    #[test]
+    fn a_type_change_splits_into_a_deletion_then_a_creation() {
+        let p = pair(EntryKind::Blob, EntryKind::Link);
+        let (del, add) = split_type_change(&p).expect("blob -> symlink splits");
+
+        assert_eq!(del.path, p.path);
+        assert_eq!(del.old.map(|(id, k)| (id, k)), Some((blob_id(1), EntryKind::Blob)));
+        assert!(matches!(del.new, NewSide::Absent));
+        assert_eq!(del.status, b'D');
+
+        assert_eq!(add.path, p.path);
+        assert!(add.old.is_none());
+        assert!(matches!(add.new, NewSide::Blob(id, EntryKind::Link) if id == blob_id(2)));
+        assert_eq!(add.status, b'A');
+
+        // Everything else stays whole, which is what keeps the split invisible to
+        // every pair git renders as one section.
+        assert!(split_type_change(&pair(EntryKind::Blob, EntryKind::BlobExecutable)).is_none());
+        assert!(split_type_change(&pair(EntryKind::Blob, EntryKind::Blob)).is_none());
+    }
+
+    /// A worktree post-image splits the same way, with the creation half still
+    /// reading the worktree: that is the half whose content is the new symlink.
+    #[test]
+    fn a_worktree_type_change_keeps_the_worktree_on_the_creation_half() {
+        let p = Delta::plain(
+            BString::from("g.txt"),
+            Some((blob_id(1), EntryKind::Blob)),
+            NewSide::Worktree(EntryKind::Link),
+        );
+        let (del, add) = split_type_change(&p).expect("blob -> worktree symlink splits");
+        assert!(matches!(del.new, NewSide::Absent));
+        assert!(matches!(add.new, NewSide::Worktree(EntryKind::Link)));
+    }
+
+    /// `diff_change()` swaps the two filespecs, `oid_valid` and the dirty-submodule
+    /// bits included, before anything downstream sees the pair. A worktree
+    /// post-image therefore becomes a worktree *pre*-image: no id of its own, read
+    /// by path — which is the whole of what `-R` on a worktree diff needs.
+    #[test]
+    fn reversing_moves_the_worktree_side_onto_the_pre_image() {
+        let null = ObjectId::null(gix::hash::Kind::Sha1);
+        let mut d = Delta::plain(
+            BString::from("f.txt"),
+            Some((blob_id(1), EntryKind::Blob)),
+            NewSide::Worktree(EntryKind::Blob),
+        );
+        reverse_delta(&mut d, null);
+        assert_eq!(d.old, Some((null, EntryKind::Blob)));
+        assert!(d.old_worktree, "the file is now the pre-image");
+        assert!(matches!(d.new, NewSide::Blob(id, EntryKind::Blob) if id == blob_id(1)));
+        // `--raw` prints the post-image id, which after the swap is the object's.
+        assert_eq!(d.new_id, Some(blob_id(1)));
+
+        // Reversing a deletion gives a creation, with no worktree side at all.
+        let mut d = Delta::plain(
+            BString::from("f.txt"),
+            Some((blob_id(1), EntryKind::Blob)),
+            NewSide::Absent,
+        );
+        reverse_delta(&mut d, null);
+        assert_eq!(d.old, None);
+        assert!(!d.old_worktree);
+        assert!(matches!(d.new, NewSide::Blob(id, EntryKind::Blob) if id == blob_id(1)));
+    }
+
+    /// A worktree gitlink is the one worktree side that carries an id — the commit
+    /// the submodule has checked out — so the swap moves that id onto the pre-image
+    /// while `--raw` keeps printing what `p->one->oid` holds, and the `-dirty`
+    /// marker travels with the side it describes.
+    #[test]
+    fn reversing_carries_a_submodules_commit_and_dirt_onto_the_pre_image() {
+        let null = ObjectId::null(gix::hash::Kind::Sha1);
+        let mut d = Delta::plain(
+            BString::from("sub"),
+            Some((blob_id(1), EntryKind::Commit)),
+            NewSide::Worktree(EntryKind::Commit),
+        );
+        d.new_commit = Some(blob_id(2));
+        d.dirty_submodule = 1;
+        d.new_id = None; // the submodule moved, so git prints all-zero for it
+        reverse_delta(&mut d, null);
+        assert_eq!(d.old, Some((blob_id(2), EntryKind::Commit)));
+        assert!(d.old_worktree);
+        assert_eq!(d.old_dirty_submodule, 1);
+        assert_eq!(d.dirty_submodule, 0);
+        assert_eq!(d.old_raw_id, None, "a moved submodule has no printable id");
+        assert!(matches!(d.new, NewSide::Blob(id, EntryKind::Commit) if id == blob_id(1)));
+    }
 }

@@ -25,21 +25,25 @@
 //!
 //! Deviations (bailed or noted, never faked):
 //! ```text
-//!   * `.gitattributes` content filters (autocrlf, `clean`/`smudge`) are NOT
-//!     applied — the blob is the verbatim worktree bytes. `--renormalize` exists
-//!     only to re-run those filters, so it is rejected outright whenever the repo
-//!     is configured in a way that could engage one.
+//!   * `.gitattributes` content filters (`text`/`eol`/`core.autocrlf`,
+//!     `working-tree-encoding`, `ident`, `clean` drivers) run on the way in, so a
+//!     staged blob is byte-identical to the one `git add` writes — `cmd_stage()`
+//!     *is* `cmd_add()`. `--renormalize` additionally drops the `text=auto` guard
+//!     that normally leaves a file alone when the indexed blob already holds CRLF.
 //!   * `--sparse`/`--no-sparse` are accepted only while the repo has no
 //!     sparse-checkout; with one configured they are rejected rather than ignored.
 //!   * submodule gitlinks are skipped here (use `git zbump`).
-//!   * interactive/patch/edit are rejected with a precise message rather than
-//!     silently ignored (they require a TTY this port does not drive).
+//!   * `-e`/`--edit` is rejected with a precise message rather than silently
+//!     ignored (it requires an interactive editor this port does not drive).
+//!     `-p`/`--patch` and `-i`/`--interactive` are served: they hand the argv to
+//!     [`add`](super::add), the same `cmd_add()` git dispatches `stage` to.
 //!   * `-U/--unified`, `--inter-hunk-context`, `--[no-]auto-advance` only configure
 //!     the interactive/patch diff: their values are magnitude-validated exactly as
-//!     git's `OPT_MAGNITUDE` (bad value ⇒ exit 129), then — since patch mode is
-//!     never entered — git's `fatal: the option '<x>' requires '--interactive/--patch'`
-//!     (exit 128) is reproduced. A bare `--auto-advance` is the default and stages
-//!     normally; only `--no-auto-advance` triggers the fatal.
+//!     git's `OPT_MAGNITUDE` (bad value ⇒ exit 129), then — when neither interactive
+//!     mode was asked for — git's
+//!     `fatal: the option '<x>' requires '--interactive/--patch'` (exit 128) is
+//!     reproduced. A bare `--auto-advance` is the default and stages normally; only
+//!     `--no-auto-advance` triggers the fatal.
 //!   * pathspecs are resolved relative to the repository root, not to the current
 //!     working directory's prefix.
 //! ```
@@ -48,7 +52,7 @@
 //! also carries. The two should be hoisted into one shared engine that both verbs
 //! call; this copy is the git-accurate one.
 
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Result};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::process::ExitCode;
 
@@ -86,10 +90,21 @@ struct Opts {
     /// The validated form of `chmod_arg`: `Some(true)` for `+x`, `Some(false)`
     /// for `-x`. Filled in after option validation, never during parsing.
     chmod: Option<bool>,
+    /// `-p`/`--patch` and `-i`/`--interactive` (git's `patch_interactive` and
+    /// `add_interactive`). Both are `OPT_BOOL`, so the `--no-` forms clear them.
+    /// Either one hands the whole argv to [`add`](super::add), which is the same
+    /// `cmd_add()` git dispatches `stage` to and owns both interactive modes.
+    patch_interactive: bool,
+    add_interactive: bool,
+    /// Hand the untouched argv to [`add`](super::add) instead of staging here:
+    /// `-h` (print the option table, exit 129) and any option this parser does not
+    /// know (git's `unknown option`/`unknown switch` usage error, exit 129). Both
+    /// belong to the option table `stage` shares with `add`, so `add` renders them.
+    delegate: bool,
     /// `-U`/`--unified` and `--inter-hunk-context` only feed the interactive/patch
-    /// diff this port never runs. Their values are magnitude-validated during parse
-    /// and then discarded; only whether the option appeared is kept, to raise git's
-    /// `requires '--interactive/--patch'` fatal in `stage()`.
+    /// diff. Their values are magnitude-validated during parse and then discarded;
+    /// only whether the option appeared is kept, to raise git's
+    /// `requires '--interactive/--patch'` fatal in `stage()` when neither mode ran.
     unified_seen: bool,
     interhunk_seen: bool,
     /// Final value of `--[no-]auto-advance` (last occurrence wins). `Some(false)`
@@ -123,7 +138,10 @@ fn parse(args: &[String]) -> Result<std::result::Result<Opts, ExitCode>> {
     let mut positional_only = false;
 
     let mut i = 0;
-    while i < args.len() {
+    // `parse_options()` stops at the first switch it cannot serve here, so the
+    // delegating arms below leave the scan rather than keep reading argv: git
+    // reports the *first* such switch, not the last.
+    'argv: while i < args.len() {
         let a = &args[i];
         if positional_only {
             o.pathspecs.push(a.clone());
@@ -269,11 +287,24 @@ fn parse(args: &[String]) -> Result<std::result::Result<Opts, ExitCode>> {
                 o.interhunk_seen = true;
             }
 
+            // The two interactive modes; `stage()` hands them to `git add`.
+            "-p" | "--patch" => o.patch_interactive = true,
+            "--no-patch" => o.patch_interactive = false,
+            "-i" | "--interactive" => o.add_interactive = true,
+            "--no-interactive" => o.add_interactive = false,
             // Recognized git flags that this port does not implement: name them.
-            "-p" | "--patch" => bail!("interactive patch mode (-p/--patch) is not supported"),
-            "-i" | "--interactive" => bail!("interactive mode (-i/--interactive) is not supported"),
             "-e" | "--edit" => bail!("--edit is not supported"),
 
+            // `-h` is handled by `parse_options()` before any other switch in the
+            // same bundle, so `git stage -hv` still prints the table — `git add`'s
+            // table, byte for byte, since both verbs share one option set.
+            other if other.starts_with('-')
+                && !other.starts_with("--")
+                && other[1..].contains('h') =>
+            {
+                o.delegate = true;
+                break 'argv;
+            }
             // Bundled short flags like `-nv`; every char must be a known toggle.
             other if other.starts_with('-') && !other.starts_with("--") && other.len() > 1 => {
                 for c in other[1..].chars() {
@@ -284,14 +315,22 @@ fn parse(args: &[String]) -> Result<std::result::Result<Opts, ExitCode>> {
                         'A' => o.addremove = Some(true),
                         'u' => o.update = true,
                         'N' => o.intent_to_add = true,
-                        'p' => bail!("interactive patch mode (-p/--patch) is not supported"),
-                        'i' => bail!("interactive mode (-i/--interactive) is not supported"),
+                        'p' => o.patch_interactive = true,
+                        'i' => o.add_interactive = true,
                         'e' => bail!("--edit is not supported"),
-                        _ => bail!("unsupported flag -{c}"),
+                        // parse-options reports the *first* unknown switch and
+                        // stops; `add` re-reads the same argv and renders it.
+                        _ => {
+                            o.delegate = true;
+                            break 'argv;
+                        }
                     }
                 }
             }
-            other if other.starts_with("--") => bail!("unsupported flag {other}"),
+            other if other.starts_with("--") && other != "--" => {
+                o.delegate = true;
+                break 'argv;
+            }
             _ => o.pathspecs.push(a.clone()),
         }
         i += 1;
@@ -480,14 +519,26 @@ pub fn stage(args: &[String]) -> Result<ExitCode> {
         Err(code) => return Ok(code),
     };
 
+    // `git stage` is an alias entry in git's command table pointing at the very same
+    // `cmd_add()` (`git-stage(1)`: "This is a synonym for git-add(1)"; `git stage -h`
+    // and `git add -h` print byte-identical usage), so `-p`/`-i` are `git add`'s
+    // interactive modes rather than anything of `stage`'s own. Hand the untouched
+    // argv to [`add`](super::add), which parses it the same way and owns the hunk
+    // selector and the numbered menu — including `-p` implying `-i`, the
+    // `requires '--interactive/--patch'` fatals and the two
+    // "cannot be used together" fatals, all in git's order.
+    if o.delegate || o.patch_interactive || o.add_interactive {
+        return super::add::add(args);
+    }
+
     // `-U`/`--unified`, `--inter-hunk-context`, and `--no-auto-advance` only feed
-    // the interactive/patch diff machinery, which this port does not serve. git
-    // collects them into `add_p_opt` and, when neither `--patch` nor `--interactive`
-    // is active, dies here — before every other validation, including the `-A`/`-u`
-    // conflict (verified against git 2.55.0). `-p`/`-i`/`-e` already bailed in
-    // `parse`, so reaching this point means patch mode is off; reproduce the fatal.
-    // The cited option follows git's fixed precedence: `--unified`, then
-    // `--inter-hunk-context`, then `--no-auto-advance`.
+    // the interactive/patch diff machinery. git collects them into `add_p_opt` and,
+    // when neither `--patch` nor `--interactive` is active, dies here — before every
+    // other validation, including the `-A`/`-u` conflict (verified against git
+    // 2.55.0). Both interactive modes left for `add` above, so reaching this point
+    // means patch mode is off; reproduce the fatal. The cited option follows git's
+    // fixed precedence: `--unified`, then `--inter-hunk-context`, then
+    // `--no-auto-advance`.
     if o.unified_seen || o.interhunk_seen || o.auto_advance == Some(false) {
         let opt = if o.unified_seen {
             "--unified"
@@ -613,40 +664,11 @@ fn reject_unsupportable_config(repo: &gix::Repository, o: &Opts) -> Result<()> {
         bail!("--sparse/--no-sparse is not supported in a sparse-checkout repository");
     }
 
-    // `--renormalize` exists only to re-run content filters, and this port applies
-    // none. Accepting it where a filter could engage would silently write the
-    // unconverted bytes, so refuse whenever conversion is configurable at all.
-    if o.renormalize {
-        if cfg.string("core.attributesFile").is_some() {
-            bail!("--renormalize is not supported: core.attributesFile configures content conversion");
-        }
-        if let Some(raw) = cfg.string("core.autocrlf") {
-            let value = raw.to_str_lossy().trim().to_ascii_lowercase();
-            if !matches!(value.as_str(), "false" | "0" | "no" | "off" | "") {
-                bail!("--renormalize is not supported: core.autocrlf={value} configures content conversion");
-            }
-        }
-        if cfg.string("core.eol").is_some() {
-            bail!("--renormalize is not supported: core.eol configures content conversion");
-        }
-        if repo.common_dir().join("info").join("attributes").exists() {
-            bail!("--renormalize is not supported: $GIT_DIR/info/attributes configures content conversion");
-        }
-        // A `.gitattributes` at any depth can drive conversion, so check the whole
-        // tracked set rather than just the worktree root.
-        let index = open_index(repo)?;
-        let backing = index.path_backing();
-        if index
-            .entries()
-            .iter()
-            .any(|e| {
-                let p = e.path_in(backing);
-                p == ".gitattributes" || p.ends_with_str(b"/.gitattributes")
-            })
-        {
-            bail!("--renormalize is not supported: .gitattributes configures content conversion");
-        }
-    }
+    // `--renormalize` used to be refused here, because this staging path wrote the
+    // verbatim worktree bytes and re-running content filters was the one thing the
+    // flag is for. Both halves are now real: staging goes through
+    // `convert_to_git()` (see [`read_converted_bytes`]) and the flag switches off
+    // the `text=auto` index guard, exactly as `git add --renormalize` does.
     Ok(())
 }
 
@@ -828,6 +850,11 @@ fn unmatched_pathspec_exit(
 fn refresh(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
     let index = open_index(repo)?;
     let patterns = pathspec_patterns(repo, o)?;
+    // `--refresh` compares the worktree against the index, and the index holds
+    // *converted* content — so the comparison has to convert too, or every file
+    // the filters touch looks modified. It writes no object, which is git's
+    // `hash_flags` without `HASH_WRITE_OBJECT`.
+    let mut filters = super::convert_to_git::WorktreeFilter::new(repo, false, false)?;
 
     let mut ps = repo.pathspec(
         true,
@@ -872,7 +899,7 @@ fn refresh(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
                 unstaged.insert(owned, 'D');
                 continue;
             };
-            match read_worktree_blob(repo, &abs, &md) {
+            match read_worktree_blob(repo, &mut filters, path, &abs, &md) {
                 Ok((id, mode)) if id == e.id && mode == e.mode => {
                     // Content is unchanged; adopt the fresh stat so later commands
                     // can take the lstat shortcut. Recording only genuine changes
@@ -927,12 +954,35 @@ fn refresh(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
 /// caller decides that, so `--dry-run` can stay side-effect free.
 fn read_worktree_blob(
     repo: &gix::Repository,
+    filters: &mut super::convert_to_git::WorktreeFilter,
+    rela: &BStr,
     abs: &std::path::Path,
     md: &gix::index::fs::Metadata,
 ) -> Result<(gix::hash::ObjectId, Mode)> {
-    let (bytes, mode) = read_worktree_bytes(abs, md)?;
+    let (bytes, mode) = read_converted_bytes(repo, filters, rela, abs, md)?;
     let id = gix::objs::compute_hash(repo.object_hash(), gix::objs::Kind::Blob, &bytes)?;
     Ok((id, mode))
+}
+
+/// The worktree bytes of `abs` as git would store them: a regular file goes
+/// through `convert_to_git()` (`.gitattributes` filters, `core.autocrlf`, …), a
+/// symlink's target is stored verbatim.
+fn read_converted_bytes(
+    repo: &gix::Repository,
+    filters: &mut super::convert_to_git::WorktreeFilter,
+    rela: &BStr,
+    abs: &std::path::Path,
+    md: &gix::index::fs::Metadata,
+) -> Result<(Vec<u8>, Mode)> {
+    let (bytes, mode) = read_worktree_bytes(abs, md)?;
+    if mode == Mode::SYMLINK {
+        return Ok((bytes, mode));
+    }
+    let rela = gix::path::from_bstr(rela).into_owned();
+    let converted = filters
+        .convert(repo, &rela, &bytes)
+        .map_err(|e| anyhow!("{e}"))?;
+    Ok((converted, mode))
 }
 
 fn read_worktree_bytes(
@@ -1017,6 +1067,21 @@ struct Staged {
 
 fn add(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
     let index = open_index(repo)?;
+    // The content filters every staged blob passes through — the same pipeline
+    // `git add` uses, since `cmd_stage()` *is* `cmd_add()`. `--dry-run` and `-N`
+    // write no object, so `core.safecrlf` stays quiet for them, and
+    // `--renormalize` turns the `text=auto` index guard off.
+    let mut filters = super::convert_to_git::WorktreeFilter::new(
+        repo,
+        !o.dry_run && !o.intent_to_add,
+        o.renormalize,
+    )?;
+    // The scan below hashes each candidate to decide whether it changed at all;
+    // only the write pass at the end reaches git's `index_path()`. Giving the scan
+    // a non-writing pipeline is what keeps `core.safecrlf`'s warning to the one
+    // git prints — the check rides on `HASH_WRITE_OBJECT`, which the scan does not
+    // carry.
+    let mut scan_filters = super::convert_to_git::WorktreeFilter::new(repo, false, o.renormalize)?;
 
     // git applies `--chmod` only when a pathspec is present: cmd_add runs it under
     // `if (chmod_arg && pathspec.nr)`, and `-A`/`-u` do not synthesize a pathspec.
@@ -1132,8 +1197,12 @@ fn add(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
             // `set_object_name_for_intent_to_add_entry()` in place of
             // `index_path()`, so the empty blob is the only object written.
             if !o.dry_run && !o.intent_to_add {
-                if let Ok(content) = std::fs::read(&full) {
-                    let _ = repo.write_blob(&content);
+                if let Ok(md) = gix::index::fs::Metadata::from_path_no_follow(&full) {
+                    if let Ok((content, _)) =
+                        read_converted_bytes(repo, &mut filters, path.as_ref(), &full, &md)
+                    {
+                        let _ = repo.write_blob(&content);
+                    }
                 }
             }
         }
@@ -1234,7 +1303,7 @@ fn add(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
             continue;
         }
 
-        let (id, mode) = match read_worktree_blob(repo, &abs, &md) {
+        let (id, mode) = match read_worktree_blob(repo, &mut scan_filters, path.as_ref(), &abs, &md) {
             Ok(v) => v,
             Err(e) => {
                 report_read_error(path.as_ref(), &e, &mut had_error);
@@ -1384,7 +1453,7 @@ fn add(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
         } else {
             let abs = repo.workdir_path(&s.path).expect("path came from this worktree");
             let md = gix::index::fs::Metadata::from_path_no_follow(&abs)?;
-            let (bytes, mode) = read_worktree_bytes(&abs, &md)?;
+            let (bytes, mode) = read_converted_bytes(repo, &mut filters, s.path.as_ref(), &abs, &md)?;
             s.mode = mode;
             repo.write_blob(&bytes)?.detach()
         };

@@ -373,10 +373,9 @@ HUNKS SUMMARY - Hunks: %d, USE: %d, SKIP: %d\n";
 pub(crate) enum Mode {
     /// `git add -p` / `git commit -p`.
     Add,
-    /// `git stash -p`. No caller yet: `stash` refuses `-p` because the selector
-    /// would have to stage into a scratch index (`GIT_INDEX_FILE`), which this
-    /// port does not honour — see the comment at `stash.rs`'s `-p` arm.
-    #[allow(dead_code)]
+    /// `git stash -p` — the selector runs against the scratch index
+    /// `stash_patch()` seeds from `HEAD` and points `GIT_INDEX_FILE` at, so the
+    /// hunks the user takes land there and the real index is untouched.
     Stash,
     /// `git reset -p`.
     Reset,
@@ -397,8 +396,9 @@ pub(crate) struct Options {
     /// `--[no-]auto-advance`: when off, the file list is navigable with `<`/`>`
     /// and nothing is applied until every file has been visited.
     pub(crate) auto_advance: bool,
-    /// git's `ADD_P_DISALLOW_EDIT`: hide the `e` command (set by `git stash -p`,
-    /// whose second apply pass cannot cope with a hand-edited hunk).
+    /// git's `ADD_P_DISALLOW_EDIT`: hide the `e` command. `git history split`
+    /// passes it (`run_add_p_index`); `git stash -p` passes flags of 0, so
+    /// editing a hunk stays available there.
     pub(crate) disallow_edit: bool,
 }
 
@@ -2521,6 +2521,38 @@ pub(crate) fn run_status(
     opts: Options,
     pathspecs: &[String],
 ) -> Result<u8> {
+    run_on_index(repo, mode, revision, None, opts, pathspecs)
+}
+
+/// [`run_status`] against a caller-supplied index file rather than the
+/// repository's own — git's `run_add_p()` with `r->index_file` and
+/// `GIT_INDEX_FILE` pointed elsewhere for the duration.
+///
+/// Two callers. `git stash -p`: `stash_patch()` seeds a scratch index from
+/// `HEAD`, lets the selector stage the chosen hunks into it, and turns the result
+/// into the stash's `W` tree — reading that tree back out is its job. And
+/// `git commit -p`, which seeds the scratch from the repository's own index and
+/// renames it into place once the selector returns, so a half-finished selection
+/// is never visible in the real index.
+pub(crate) fn run_in_index(
+    repo: &gix::Repository,
+    mode: Mode,
+    index_file: &std::path::Path,
+    opts: Options,
+    pathspecs: &[String],
+) -> Result<u8> {
+    run_on_index(repo, mode, None, Some(index_file), opts, pathspecs)
+}
+
+/// The body behind [`run_status`] and [`run_in_index`].
+fn run_on_index(
+    repo: &gix::Repository,
+    mode: Mode,
+    revision: Option<&str>,
+    index_file: Option<&std::path::Path>,
+    opts: Options,
+    pathspecs: &[String],
+) -> Result<u8> {
     let cfg = match Config::init(repo, &opts) {
         Ok(c) => c,
         Err(e) => {
@@ -2540,7 +2572,7 @@ pub(crate) fn run_status(
         files: Vec::new(),
         single_key_warned: false,
         diff_extra: Vec::new(),
-        index_file: None,
+        index_file: index_file.map(std::path::Path::to_path_buf),
     };
     run_common(state, opts, pathspecs)
 }

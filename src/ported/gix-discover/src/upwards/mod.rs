@@ -29,6 +29,7 @@ pub(crate) mod function {
         Options {
             trust,
             ceiling_dirs,
+            ceiling_dirs_verbatim,
             match_ceiling_dir_or_error,
             cross_fs,
             current_dir,
@@ -78,8 +79,8 @@ pub(crate) mod function {
             }
         };
 
-        let max_height = if !ceiling_dirs.is_empty() {
-            let max_height = find_ceiling_height(&dir, &ceiling_dirs, cwd.as_ref());
+        let max_height = if !(ceiling_dirs.is_empty() && ceiling_dirs_verbatim.is_empty()) {
+            let max_height = find_ceiling_height(&dir, &ceiling_dirs, &ceiling_dirs_verbatim, cwd.as_ref());
             if max_height.is_none() && match_ceiling_dir_or_error {
                 return Err(Error::NoMatchingCeilingDir);
             }

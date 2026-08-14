@@ -103,6 +103,7 @@ use gix::prelude::ObjectIdExt;
 use gix::revision::walk::Sorting;
 use gix::traverse::commit::simple::CommitTimeOrder;
 
+use super::pretty_pad::{FlushType, PadState, WrapState};
 use crate::revfilter::{compile_patterns, ident_line, Dialect};
 
 /// The `usage_with_options` block git prints for `-h`, and again after every
@@ -1340,10 +1341,24 @@ fn group_keys(
     Ok(keys)
 }
 
-/// Port of `format_commit_message()` covering the placeholders shortlog can be
-/// asked for here. An unhandled `%<char>` bails rather than silently rendering
-/// something git would render differently. `date_format` is the `--date=<fmt>`
-/// value that `%ad`/`%cd` honour (`None` = git's default ctime-like format).
+/// git's `repo_format_commit_message()` driver loop (pretty.c:2014), which is
+/// what `shortlog_add_commit()` reaches for both `--format=<fmt>` and each
+/// `--group=format:<fmt>` — so the column and wrap atoms work here exactly as
+/// they do under `git log`.
+///
+/// Literal text is copied, `%%` is expanded by `strbuf_expand_step()` before
+/// `format_commit_item()` is reached (so it is neither padded nor spends a
+/// pending field), and every other `%` placeholder goes through [`expand_one`] —
+/// directly, or into a measured buffer when a `%<`/`%>` atom left a field
+/// pending. A placeholder that consumes nothing still pads: git prints the `%`
+/// and rescans from the placeholder character *after* `format_and_pad_commit()`
+/// has laid out an empty field.
+///
+/// `format_and_pad_commit()`'s `%C…` chain is absent because [`expand_one`]
+/// refuses `%C` outright, so a colour atom can never open a chain here.
+///
+/// `date_format` is the `--date=<fmt>` value that `%ad`/`%cd` honour
+/// (`None` = git's default ctime-like format).
 fn expand_format(
     repo: &gix::Repository,
     commit: &gix::Commit<'_>,
@@ -1351,8 +1366,12 @@ fn expand_format(
     fmt: &str,
     date_format: Option<&str>,
 ) -> Result<BString> {
-    let mut out = BString::default();
+    let mut out: Vec<u8> = Vec::new();
     let bytes = fmt.as_bytes();
+    // The deferred state `struct format_commit_context` carries: a column field a
+    // `%<`/`%>` atom is holding open, and the `%w()` wrap parameters.
+    let mut pad = PadState::default();
+    let mut wrap = WrapState::default();
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] != b'%' {
@@ -1360,34 +1379,116 @@ fn expand_format(
             i += 1;
             continue;
         }
-        let Some(&next) = bytes.get(i + 1) else {
+        if bytes.get(i + 1) == Some(&b'%') {
             out.push(b'%');
-            i += 1;
-            continue;
-        };
-
-        // `%(...)`: git copies an unrecognised group through verbatim. The
-        // recognised ones do real work this port does not implement.
-        if next == b'(' {
-            let Some(end) = bytes[i + 2..].iter().position(|&b| b == b')') else {
-                out.push(b'%');
-                i += 1;
-                continue;
-            };
-            let inner = &fmt[i + 2..i + 2 + end];
-            for known in ["trailers", "describe", "decorate", "wrap", "ahead-behind"] {
-                if inner == known || inner.starts_with(&format!("{known}:")) {
-                    bail!("`--format` placeholder `%({inner})` is not ported");
-                }
-            }
-            out.extend_from_slice(&bytes[i..i + 3 + end]);
-            i += 3 + end;
+            i += 2;
             continue;
         }
+        // The cursor sits on the placeholder character. `expand_one` advances it
+        // past whatever it consumes and leaves it untouched when it consumes
+        // nothing, which is how git rescans from that character.
+        let mut at = i + 1;
+        if pad.flush == FlushType::None {
+            if !expand_one(&mut out, repo, commit, mailmap, bytes, &mut at, date_format, &mut pad, &mut wrap)? {
+                out.push(b'%');
+            }
+            i = at;
+            continue;
+        }
+        // `format_and_pad_commit()`: the placeholder renders into a buffer of its
+        // own so its *display* width can be measured. `padding` is read before it
+        // expands, so a nested `%<(…)` retargets the next field, not this one.
+        let padding = pad.padding;
+        let mut local: Vec<u8> = Vec::new();
+        let consumed =
+            expand_one(&mut local, repo, commit, mailmap, bytes, &mut at, date_format, &mut pad, &mut wrap)?;
+        pad.apply(&mut out, local, padding, 0);
+        if !consumed {
+            out.push(b'%');
+        }
+        i = at;
+    }
+    // `repo_format_commit_message()` closes with a rewrap to width 0, which wraps
+    // whatever a trailing `%w()` was still governing.
+    wrap.rewrap_message_tail(&mut out, 0, 0, 0);
+    Ok(out.into())
+}
 
-        i += 2;
+/// `format_commit_one()`: expand the single placeholder at `bytes[*at]`,
+/// advancing `*at` past whatever it consumes.
+///
+/// `Ok(false)` is git's "consumed 0 bytes" — the placeholder is not one git
+/// expands, nothing was written, and `*at` is left on the placeholder character
+/// so the caller can print the `%` and rescan. A placeholder git *does* expand
+/// but this port does not render identically bails instead, rather than emitting
+/// something divergent.
+#[allow(clippy::too_many_arguments)]
+fn expand_one(
+    out: &mut Vec<u8>,
+    repo: &gix::Repository,
+    commit: &gix::Commit<'_>,
+    mailmap: &gix::mailmap::Snapshot,
+    bytes: &[u8],
+    at: &mut usize,
+    date_format: Option<&str>,
+    pad: &mut PadState,
+    wrap: &mut WrapState,
+) -> Result<bool> {
+    let start = *at;
+    // Every early return that means "git consumed nothing" rewinds to here.
+    let unconsumed = |at: &mut usize| {
+        *at = start;
+        Ok(false)
+    };
+    let Some(&next) = bytes.get(start) else {
+        // A trailing `%`: `format_commit_one()` switches on the NUL and returns 0,
+        // so git prints the `%` — after padding an empty field, when one is open.
+        return unconsumed(at);
+    };
+
+    // `%(...)`: the groups git recognises do real work this port does not
+    // implement. Anything else is unknown to git too — it consumes nothing, so
+    // the `%` prints and `(foo)` is rescanned as literal text.
+    if next == b'(' {
+        let Some(end) = bytes[start + 1..].iter().position(|&b| b == b')') else {
+            return unconsumed(at);
+        };
+        let inner = String::from_utf8_lossy(&bytes[start + 1..start + 1 + end]).into_owned();
+        for known in ["trailers", "describe", "decorate", "wrap", "ahead-behind"] {
+            if inner == known || inner.starts_with(&format!("{known}:")) {
+                bail!("`--format` placeholder `%({inner})` is not ported");
+            }
+        }
+        return unconsumed(at);
+    }
+
+    // The column atoms `%<(<N>)`, `%>(<N>)`, `%><(<N>)`, `%>>(<N>)` and their
+    // `|`/`trunc`/`ltrunc`/`mtrunc` forms: they expand to nothing and leave the
+    // field pending for the next placeholder.
+    if next == b'<' || next == b'>' {
+        return Ok(match pad.parse(bytes, start) {
+            Some(consumed) => {
+                *at = start + consumed;
+                true
+            }
+            None => false,
+        });
+    }
+    // `%w(<width>,<indent1>,<indent2>)`: everything emitted after it is re-wrapped
+    // to that width when the parameters next change.
+    if next == b'w' {
+        return Ok(match wrap.parse_and_apply(out, bytes, start) {
+            Some(consumed) => {
+                *at = start + consumed;
+                true
+            }
+            None => false,
+        });
+    }
+
+    let mut i = start + 1;
+    {
         match next {
-            b'%' => out.push(b'%'),
             b'n' => out.push(b'\n'),
             b'H' => out.extend_from_slice(commit.id.to_string().as_bytes()),
             b'h' => {
@@ -1432,12 +1533,9 @@ fn expand_format(
                     out.push((hi * 16 + lo) as u8);
                     i += 2;
                 }
-                // Otherwise git prints `%x` verbatim, leaving the trailing bytes
-                // to be read as literals.
-                _ => {
-                    out.push(b'%');
-                    i -= 1;
-                }
+                // Otherwise `format_commit_one()` consumes nothing: the `%` prints
+                // and `x` plus the trailing bytes are rescanned as literals.
+                _ => return unconsumed(at),
             },
             b'a' | b'c' => {
                 let raw = if next == b'a' {
@@ -1448,12 +1546,10 @@ fn expand_format(
                 let sig = raw.trim();
                 let Some(&which) = bytes.get(i) else {
                     // `%a`/`%c` at end of string: git's `format_person_part`
-                    // sees a NUL sub-form, returns 0 (unknown), and the caller
-                    // copies the `%` plus the letter through verbatim, e.g.
-                    // `end%a` → `end%a`. Reproduce that byte-for-byte.
-                    out.push(b'%');
-                    out.push(next);
-                    continue;
+                    // sees a NUL sub-form and returns 0 (unknown), so the driver
+                    // prints the `%` and rescans from the `a`, giving `end%a` →
+                    // `end%a` — and, inside a pending field, an empty field first.
+                    return unconsumed(at);
                 };
                 i += 1;
                 let (mapped_name, mapped_email) = match mailmap.try_resolve_ref(sig) {
@@ -1500,19 +1596,17 @@ fn expand_format(
                         which as char
                     ),
                     // Any other sub-form is unknown to git, whose
-                    // `format_person_part` returns 0 so the `%` and both letters
-                    // are copied through literally (`%aZ` → `%aZ`). Match it.
-                    other => {
-                        out.push(b'%');
-                        out.push(next);
-                        out.push(other);
-                    }
+                    // `format_person_part` returns 0: the driver prints the `%`
+                    // and rescans, so both letters come back as literals
+                    // (`%aZ` → `%aZ`). Match it.
+                    _ => return unconsumed(at),
                 }
             }
             other => bail!("`--format` placeholder `%{}` is not ported", other as char),
         }
     }
-    Ok(out)
+    *at = i;
+    Ok(true)
 }
 
 /// Format an ident timestamp for the `%ad`/`%cd` placeholder family. `which` is

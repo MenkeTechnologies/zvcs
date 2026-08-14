@@ -11,6 +11,26 @@ use gix::objs::tree::EntryKind;
 
 use super::filespec::{content_of, count_changed_lines_ws, is_binary};
 use super::line_log;
+use super::pretty_pad::{FlushType, PadState, WrapState};
+
+/// `usage_with_options()` over `builtin/log.c`'s `builtin_log_usage` and option
+/// table. `git show` and `git whatchanged` are the same builtin and print it too.
+pub(super) const USAGE: &str = r"usage: git log [<options>] [<revision-range>] [[--] <path>...]
+   or: git show [<options>] <object>...
+
+    -q, --[no-]quiet      suppress diff output
+    --[no-]source         show source
+    --[no-]use-mailmap    use mail map file
+    --[no-]mailmap        alias of --use-mailmap
+    --clear-decorations   clear all previously-defined decoration filters
+    --[no-]decorate-refs <pattern>
+                          only decorate refs that match <pattern>
+    --[no-]decorate-refs-exclude <pattern>
+                          do not decorate refs that match <pattern>
+    --[no-]decorate[=...] decorate options
+    -L <range:file>       trace the evolution of line range <start>,<end> or function :<funcname> in <file>
+
+";
 
 /// The terminal width git assumes for `--stat` when stdout is not a terminal.
 /// git's `MINIMUM_ABBREV`: no `--abbrev` may cut an id shorter than this.
@@ -497,7 +517,20 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             // flags — git stops option parsing at the separator.
             pathspecs.extend(args[i + 1..].iter().cloned());
             break;
-        } else if a == "-n" || a == "--max-count" {
+        }
+        // parse_options_step()'s `internal_help`, which `cmd_log_init` runs
+        // before `setup_revisions`: the block on stdout at 129, no `error:` line.
+        if a == "-h" {
+            return Ok(super::show_usage(USAGE));
+        }
+        // The value checks `diff_opt_parse`'s callbacks run as each option is seen.
+        // `cmd_log` hands the whole argument list to `setup_revisions`, so a diff
+        // option's value is validated here whether or not this command renders it.
+        if let Some(line) = super::diff_optval::reject(a) {
+            eprintln!("{line}");
+            return Ok(ExitCode::from(129));
+        }
+        if a == "-n" || a == "--max-count" {
             i += 1;
             let v = args
                 .get(i)
@@ -1969,6 +2002,15 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         nodes.extend(edge);
     }
 
+    // `show_log()` reads `graph_width(opt->graph)` for each commit right after
+    // `graph_update()` has laid its row out, and a `%<|(<N>)` column target in the
+    // format has to leave room for that prefix. The records are rendered before
+    // the graph is drawn here, so the widths are measured up front — the same
+    // state machine, run for its column bookkeeping alone.
+    if graph {
+        measure_graph_widths(&mut nodes, first_parent);
+    }
+
     // `--children`: git records a child on every parent as it walks, so the list
     // names only commits this run reached.
     let children: Option<HashMap<ObjectId, Vec<ObjectId>>> = show_children.then(|| {
@@ -2840,6 +2882,7 @@ fn entry_block_from(
         repo,
         mark: if node.boundary && !p.graph { "- " } else { "" },
         parents: &node.parents,
+        graph_width: node.graph_width,
     };
     let mut block: Vec<u8> = Vec::new();
     render_entry(&mut block, &commit, p.pretty, &ctx)?;
@@ -3022,6 +3065,11 @@ pub(crate) struct Node {
     /// `--follow`: the name the tracked file had *at this commit*, which is what
     /// its diff and name formats are limited to. `None` when not following.
     pub(crate) follow_path: Option<gix::bstr::BString>,
+    /// `graph_width(opt->graph)` at the moment `show_log()` renders this commit —
+    /// the width of the `--graph` prefix its first row carries, which a `%<|(<N>)`
+    /// column target has to leave room for. Zero unless `--graph` is on; filled in
+    /// by [`measure_graph_widths`] once the walk's node list is final.
+    pub(crate) graph_width: i32,
 }
 
 /// Heap order for the walk's frontier: newest commit-date first, ties broken by
@@ -3437,6 +3485,7 @@ fn read_node(repo: &gix::Repository, id: ObjectId) -> Result<Node> {
         boundary: false,
         follow_path: None,
         source: String::new(),
+        graph_width: 0,
     })
 }
 
@@ -3474,7 +3523,8 @@ impl NodeReader {
                     source: String::new(),
                     seq: 0,
                     boundary: false,
-        follow_path: None,
+                    follow_path: None,
+                    graph_width: 0,
                 });
             }
         }
@@ -3795,6 +3845,12 @@ fn check_format(fmt: &str) -> Result<()> {
             // expanded — an unknown option prints literally there rather than
             // failing here, exactly as git does.
             Some('(') => {}
+            // The column-control atoms — `%<(<N>)`, `%>(<N>)`, `%><(<N>)`, `%>>(<N>)`
+            // and their `|`, `trunc`, `ltrunc` and `mtrunc` forms — and the `%w(…)`
+            // wrap atom are validated where they are expanded: a malformed one is
+            // not a placeholder at all, and git prints it literally rather than
+            // failing (see [`pretty_pad`]).
+            Some('<' | '>' | 'w') => {}
             Some(x) => anyhow::bail!("unsupported format placeholder %{x}"),
             None => anyhow::bail!("unsupported trailing % in format"),
         }
@@ -3835,6 +3891,8 @@ pub(crate) fn format_commit(
         repo,
         mark: "",
         parents: &[],
+        // No `--graph` behind either of these callers.
+        graph_width: 0,
     };
     let mut out = Vec::new();
     expand_format(&mut out, commit, &unabbreviated(fmt), &ctx)?;
@@ -3887,13 +3945,17 @@ fn trailers_placeholder(chars: &[char], i: usize) -> Option<(String, usize)> {
     Some((spec.to_string(), close + 1))
 }
 
+/// git's `repo_format_commit_message()` driver loop: literal text is copied,
+/// `%%` is expanded here (which is why it never consumes a pending padding
+/// request), and every other `%` placeholder goes through
+/// [`expand_one`] — directly, or through the padding machinery when a `%<`/`%>`
+/// atom left a field pending.
 fn expand_format(
     out: &mut Vec<u8>,
     commit: &gix::Commit<'_>,
     fmt: &str,
     ctx: &RenderCtx<'_>,
 ) -> Result<()> {
-    let date_mode = ctx.date_mode;
     // `%C(auto)` latches auto-coloring on for the placeholders that follow it —
     // notably `%d`/`%D`, which stay uncolored until it appears (matching git).
     let mut auto = false;
@@ -3901,6 +3963,10 @@ fn expand_format(
     // shared between %G? and %GK.
     let mut gsig: Option<(crate::gitsig::GStatus, String)> = None;
     let chars: Vec<char> = fmt.chars().collect();
+    // The deferred state `struct format_commit_context` carries: a column field a
+    // `%<`/`%>` atom is holding open, and the `%w()` wrap parameters.
+    let mut pad = PadState::default();
+    let mut wrap = WrapState::default();
     let mut i = 0;
     while i < chars.len() {
         let c = chars[i];
@@ -3911,131 +3977,239 @@ fn expand_format(
             continue;
         }
         let Some(&p) = chars.get(i) else { break };
-        // `%(trailers[:<options>])` — the one parenthesised placeholder that is not
-        // a colour request. `format_trailers_from_commit()` renders the message's
-        // trailer block; an unparsable option list makes git print the placeholder
-        // literally rather than fail, which is what a `None` here reproduces.
-        if p == '(' {
-            if let Some((spec, next)) = trailers_placeholder(&chars, i) {
-                match super::interpret_trailers::PrettyOpts::parse(spec.as_bytes()) {
-                    Some(opts) => {
-                        out.extend_from_slice(&super::interpret_trailers::format_pretty(
-                            commit.message_raw()?,
-                            &opts,
-                        ));
-                        i = next;
-                        continue;
-                    }
-                    None => {
-                        out.extend_from_slice(b"%(");
-                        i += 1;
-                        continue;
-                    }
-                }
-            }
+        // `strbuf_expand_step()` handles `%%` before `format_commit_item()` is
+        // reached, so it is neither padded nor does it spend a pending field.
+        if p == '%' {
+            out.push(b'%');
+            i += 1;
+            continue;
         }
         i += 1;
-        match p {
-            // Under `%C(auto)`, git paints the commit hash with `color.diff.commit`.
-            'H' => push_maybe_auto(out, &commit.id().to_string(), auto_commit_color(ctx, auto)),
-'h' => push_maybe_auto(
-                out,
-                &ctx.abbrev.borrow_mut().get(commit.id()),
-                auto_commit_color(ctx, auto),
-            ),
-            'T' => out.extend_from_slice(commit.tree_id()?.to_string().as_bytes()),
-'t' => {
-                out.extend_from_slice(ctx.abbrev.borrow_mut().get(commit.tree_id()?).as_bytes());
+        if pad.flush == FlushType::None {
+            if !expand_one(out, commit, &chars, &mut i, p, ctx, &mut auto, &mut gsig, &mut pad, &mut wrap)? {
+                // `format_commit_item()` answered 0: git prints the `%` and
+                // rescans from the placeholder character itself.
+                out.push(b'%');
+                i -= 1;
             }
-            'P' => write_parents(out, false, ctx.abbrev, ctx.parents, ctx.repo),
-            'p' => write_parents(out, true, ctx.abbrev, ctx.parents, ctx.repo),
-            's' => out.extend_from_slice(&subject(commit.message_raw()?)),
-            'b' => out.extend_from_slice(&body(commit.message_raw()?)),
-            'B' => out.extend_from_slice(commit.message_raw()?),
-            // `%N`: the raw note text — no header, no indent — which is the only
-            // way a user format shows notes at all.
-            'N' => {
-                if !ctx.notes.is_empty() {
-                    out.extend_from_slice(&super::notes::format_display(
-                        ctx.repo,
-                        ctx.notes,
-                        commit.id().detach(),
-                        true,
-                    )?);
-                }
+            continue;
+        }
+        // `format_and_pad_commit()`: the placeholder renders into a buffer of its
+        // own so its *display* width can be measured, and a `%C…` color keeps
+        // pulling the following placeholder into the same field — the escape adds
+        // bytes but no columns, so the field measures the text.
+        let padding = pad.padding;
+        let mut local: Vec<u8> = Vec::new();
+        let mut p = p;
+        // Whether the chain has already swallowed a `%`. `format_and_pad_commit()`
+        // counts it in `total_consumed`, so a *later* placeholder that expands to
+        // nothing still leaves the driver with a non-zero count — and the driver
+        // only prints a bare `%` when the count is zero.
+        let mut chained = false;
+        let consumed = loop {
+            let modifier = p == 'C';
+            let consumed =
+                expand_one(&mut local, commit, &chars, &mut i, p, ctx, &mut auto, &mut gsig, &mut pad, &mut wrap)?;
+            if !modifier || !consumed {
+                break consumed;
             }
-            'f' => out.extend_from_slice(&sanitized_subject(&subject(commit.message_raw()?))),
-            'n' => out.push(b'\n'),
-            '%' => out.push(b'%'),
-            // `%xNN`: the byte with that hex code, which is how a format asks for
-            // a literal tab, NUL or any byte the shell would eat. Two hex digits
-            // are required; anything else is not a placeholder at all and git
-            // prints the text as typed.
-            'x' => match hex_byte(chars.get(i).copied(), chars.get(i + 1).copied()) {
-                Some(byte) => {
-                    out.push(byte);
-                    i += 2;
-                }
-                None => out.extend_from_slice(b"%x"),
-            },
-            'C' => expand_color(out, &chars, &mut i, ctx.want_color, &mut auto),
-            // `%d`/`%D` are always shown (short by default); `log.decorate=full`
-            // / `--decorate=full` switches them to full ref names.
-            'd' => expand_decoration(out, commit, ctx, auto, true, ctx.decorate == DecorateStyle::Full),
-            'D' => expand_decoration(out, commit, ctx, auto, false, ctx.decorate == DecorateStyle::Full),
-            'a' => {
-                let author = commit.author()?;
-                match chars.get(i).copied() {
-                    Some('n') => out.extend_from_slice(author.name),
-                    Some('e') => out.extend_from_slice(author.email),
-                    Some('N') => out.extend_from_slice(mapped_name(&author, ctx.identity_mailmap)),
-                    Some('E') => out.extend_from_slice(mapped_email(&author, ctx.identity_mailmap)),
-                    Some('d') => expand_date(out, &author, date_mode, ctx.now)?,
-                    Some('i') => expand_date(out, &author, DateMode::Iso, ctx.now)?,
-                    Some('I') => expand_date(out, &author, DateMode::IsoStrict, ctx.now)?,
-                    Some('r') => expand_date(out, &author, DateMode::Relative, ctx.now)?,
-                    Some('t') => write!(out, "{}", author.time()?.seconds)?,
-                    _ => unreachable!("check_format rejected this already"),
-                }
-                i += 1;
+            if chars.get(i) != Some(&'%') {
+                break consumed;
             }
-            'c' => {
-                let committer = commit.committer()?;
-                match chars.get(i).copied() {
-                    Some('n') => out.extend_from_slice(committer.name),
-                    Some('e') => out.extend_from_slice(committer.email),
-                    Some('N') => out.extend_from_slice(mapped_name(&committer, ctx.identity_mailmap)),
-                    Some('E') => out.extend_from_slice(mapped_email(&committer, ctx.identity_mailmap)),
-                    Some('d') => expand_date(out, &committer, date_mode, ctx.now)?,
-                    Some('i') => expand_date(out, &committer, DateMode::Iso, ctx.now)?,
-                    Some('I') => expand_date(out, &committer, DateMode::IsoStrict, ctx.now)?,
-                    Some('r') => expand_date(out, &committer, DateMode::Relative, ctx.now)?,
-                    Some('t') => write!(out, "{}", committer.time()?.seconds)?,
-                    _ => unreachable!("check_format rejected this already"),
+            i += 1;
+            match chars.get(i) {
+                Some(&next) => {
+                    chained = true;
+                    p = next;
+                    i += 1;
                 }
-                i += 1;
+                None => break consumed,
             }
-            'G' => {
-                let (status, key) =
-                    gsig.get_or_insert_with(|| crate::gitsig::evaluate(&commit.data));
-                match chars.get(i).copied() {
-                    Some('?') => out.push(status.code() as u8),
-                    Some('K') => out.extend_from_slice(key.as_bytes()),
-                    _ => unreachable!("check_format rejected this already"),
-                }
-                i += 1;
+        };
+        pad.apply(out, local, padding, ctx.graph_width);
+        if !consumed {
+            i -= 1;
+            if !chained {
+                out.push(b'%');
             }
-            _ => unreachable!("check_format rejected this already"),
         }
     }
+    // `repo_format_commit_message()` closes with a rewrap to width 0, which wraps
+    // whatever a trailing `%w()` was still governing.
+    wrap.rewrap_message_tail(out, 0, 0, 0);
     Ok(())
+}
+
+/// `format_commit_one()`: expand the single placeholder `p`, whose following
+/// character is at `chars[*i]`, advancing `*i` past whatever it consumes.
+///
+/// `false` is git's "consumed 0 bytes" — the placeholder is not one git knows how
+/// to expand, nothing was written, and the caller prints the `%` literally.
+#[allow(clippy::too_many_arguments)]
+fn expand_one(
+    out: &mut Vec<u8>,
+    commit: &gix::Commit<'_>,
+    chars: &[char],
+    i: &mut usize,
+    p: char,
+    ctx: &RenderCtx<'_>,
+    auto: &mut bool,
+    gsig: &mut Option<(crate::gitsig::GStatus, String)>,
+    pad: &mut PadState,
+    wrap: &mut WrapState,
+) -> Result<bool> {
+    let date_mode = ctx.date_mode;
+    // `%(trailers[:<options>])` — the one parenthesised placeholder that is not
+    // a colour request. `format_trailers_from_commit()` renders the message's
+    // trailer block; an unparsable option list makes git print the placeholder
+    // literally rather than fail.
+    if p == '(' {
+        let Some((spec, next)) = trailers_placeholder(chars, *i - 1) else {
+            return Ok(false);
+        };
+        let Some(opts) = super::interpret_trailers::PrettyOpts::parse(spec.as_bytes()) else {
+            return Ok(false);
+        };
+        out.extend_from_slice(&super::interpret_trailers::format_pretty(
+            commit.message_raw()?,
+            &opts,
+        ));
+        *i = next;
+        return Ok(true);
+    }
+    // The column atoms `%<(<N>)`, `%>(<N>)`, `%><(<N>)`, `%>>(<N>)` and their
+    // `|`/`trunc`/`ltrunc`/`mtrunc` forms: they expand to nothing and leave the
+    // field pending for the next placeholder.
+    if p == '<' || p == '>' {
+        return Ok(match pad.parse(chars, *i - 1) {
+            Some(consumed) => {
+                *i = *i - 1 + consumed;
+                true
+            }
+            None => false,
+        });
+    }
+    // `%w(<width>,<indent1>,<indent2>)`: everything emitted after it is
+    // re-wrapped to that width when the parameters next change.
+    if p == 'w' {
+        return Ok(match wrap.parse_and_apply(out, chars, *i - 1) {
+            Some(consumed) => {
+                *i = *i - 1 + consumed;
+                true
+            }
+            None => false,
+        });
+    }
+    match p {
+        // Under `%C(auto)`, git paints the commit hash with `color.diff.commit`.
+        'H' => push_maybe_auto(out, &commit.id().to_string(), auto_commit_color(ctx, *auto)),
+        'h' => push_maybe_auto(
+            out,
+            &ctx.abbrev.borrow_mut().get(commit.id()),
+            auto_commit_color(ctx, *auto),
+        ),
+        'T' => out.extend_from_slice(commit.tree_id()?.to_string().as_bytes()),
+'t' => {
+            out.extend_from_slice(ctx.abbrev.borrow_mut().get(commit.tree_id()?).as_bytes());
+        }
+        'P' => write_parents(out, false, ctx.abbrev, ctx.parents, ctx.repo),
+        'p' => write_parents(out, true, ctx.abbrev, ctx.parents, ctx.repo),
+        's' => out.extend_from_slice(&subject(commit.message_raw()?)),
+        'b' => out.extend_from_slice(&body(commit.message_raw()?)),
+        'B' => out.extend_from_slice(commit.message_raw()?),
+        // `%N`: the raw note text — no header, no indent — which is the only
+        // way a user format shows notes at all.
+        'N' => {
+            if !ctx.notes.is_empty() {
+                out.extend_from_slice(&super::notes::format_display(
+                    ctx.repo,
+                    ctx.notes,
+                    commit.id().detach(),
+                    true,
+                )?);
+            }
+        }
+        'f' => out.extend_from_slice(&sanitized_subject(&subject(commit.message_raw()?))),
+        'n' => out.push(b'\n'),
+        // `%xNN`: the byte with that hex code, which is how a format asks for
+        // a literal tab, NUL or any byte the shell would eat. Two hex digits
+        // are required; `strbuf_expand_literal()` answers 0 for anything else,
+        // and git then prints the text as typed.
+        'x' => match hex_byte(chars.get(*i).copied(), chars.get(*i + 1).copied()) {
+            Some(byte) => {
+                out.push(byte);
+                *i += 2;
+            }
+            None => return Ok(false),
+        },
+        'C' => {
+            if !expand_color(out, chars, i, ctx.want_color, auto) {
+                return Ok(false);
+            }
+        }
+        // `%d`/`%D` are always shown (short by default); `log.decorate=full`
+        // / `--decorate=full` switches them to full ref names.
+        'd' => expand_decoration(out, commit, ctx, *auto, true, ctx.decorate == DecorateStyle::Full),
+        'D' => expand_decoration(out, commit, ctx, *auto, false, ctx.decorate == DecorateStyle::Full),
+        'a' => {
+            let author = commit.author()?;
+            match chars.get(*i).copied() {
+                Some('n') => out.extend_from_slice(author.name),
+                Some('e') => out.extend_from_slice(author.email),
+                Some('N') => out.extend_from_slice(mapped_name(&author, ctx.identity_mailmap)),
+                Some('E') => out.extend_from_slice(mapped_email(&author, ctx.identity_mailmap)),
+                Some('d') => expand_date(out, &author, date_mode, ctx.now)?,
+                Some('i') => expand_date(out, &author, DateMode::Iso, ctx.now)?,
+                Some('I') => expand_date(out, &author, DateMode::IsoStrict, ctx.now)?,
+                Some('r') => expand_date(out, &author, DateMode::Relative, ctx.now)?,
+                Some('t') => write!(out, "{}", author.time()?.seconds)?,
+                _ => unreachable!("check_format rejected this already"),
+            }
+            *i += 1;
+        }
+        'c' => {
+            let committer = commit.committer()?;
+            match chars.get(*i).copied() {
+                Some('n') => out.extend_from_slice(committer.name),
+                Some('e') => out.extend_from_slice(committer.email),
+                Some('N') => out.extend_from_slice(mapped_name(&committer, ctx.identity_mailmap)),
+                Some('E') => out.extend_from_slice(mapped_email(&committer, ctx.identity_mailmap)),
+                Some('d') => expand_date(out, &committer, date_mode, ctx.now)?,
+                Some('i') => expand_date(out, &committer, DateMode::Iso, ctx.now)?,
+                Some('I') => expand_date(out, &committer, DateMode::IsoStrict, ctx.now)?,
+                Some('r') => expand_date(out, &committer, DateMode::Relative, ctx.now)?,
+                Some('t') => write!(out, "{}", committer.time()?.seconds)?,
+                _ => unreachable!("check_format rejected this already"),
+            }
+            *i += 1;
+        }
+        'G' => {
+            let (status, key) =
+                gsig.get_or_insert_with(|| crate::gitsig::evaluate(&commit.data));
+            match chars.get(*i).copied() {
+                Some('?') => out.push(status.code() as u8),
+                Some('K') => out.extend_from_slice(key.as_bytes()),
+                _ => unreachable!("check_format rejected this already"),
+            }
+            *i += 1;
+        }
+        _ => unreachable!("check_format rejected this already"),
+    }
+    Ok(true)
 }
 
 /// Expand a `%C…` color placeholder starting just past the `C` (index `i` points
 /// at the first following char). Advances `i` over whatever the placeholder
 /// consumes. Recognizes git's `%Cred`/`%Cgreen`/`%Cblue`/`%Creset` shortcuts and
-/// the general `%C(<spec>)` form; anything else leaves `%C` rendered literally.
-fn expand_color(out: &mut Vec<u8>, chars: &[char], i: &mut usize, want_color: bool, auto: &mut bool) {
+/// the general `%C(<spec>)` form; anything else is `parse_color()` answering 0,
+/// reported as `false` so the caller renders the `%C` literally.
+fn expand_color(
+    out: &mut Vec<u8>,
+    chars: &[char],
+    i: &mut usize,
+    want_color: bool,
+    auto: &mut bool,
+) -> bool {
     // git suppresses the `%C(auto)` reset when nothing has been emitted yet for
     // this commit's format, so record that before appending anything.
     let out_empty = out.is_empty();
@@ -4046,7 +4220,7 @@ fn expand_color(out: &mut Vec<u8>, chars: &[char], i: &mut usize, want_color: bo
             let spec = &rest[1..close];
             out.extend_from_slice(parse_color_spec(spec, want_color, auto, out_empty).as_bytes());
             *i += close + 1; // consume through ')'
-            return;
+            return true;
         }
         // No closing paren: git prints the rest verbatim. Fall through to literal.
     }
@@ -4062,11 +4236,11 @@ fn expand_color(out: &mut Vec<u8>, chars: &[char], i: &mut usize, want_color: bo
                 out.extend_from_slice(ansi.as_bytes());
             }
             *i += name.len();
-            return;
+            return true;
         }
     }
     // Unrecognized: git renders the `%C` literally and continues.
-    out.extend_from_slice(b"%C");
+    false
 }
 
 /// Parse a `%C(<spec>)` color specification into an ANSI escape (empty when color
@@ -5056,6 +5230,8 @@ pub(crate) fn rev_list_pretty_body(
         repo,
         mark: "",
         parents: &[],
+        // No `--graph` behind either of these callers.
+        graph_width: 0,
     };
     let mut out = Vec::new();
     match pretty {
@@ -5205,6 +5381,9 @@ struct RenderCtx<'a> {
     /// The commit's effective parents — its own, or the rewritten list a history
     /// simplification left behind. What `Merge:` and `--parents` print.
     parents: &'a [ObjectId],
+    /// `pretty_ctx->graph_width`: the columns `--graph` prefixes this commit's row
+    /// with, which count against a `%<|(<N>)` column target. Zero without `--graph`.
+    graph_width: i32,
 }
 
 /// The `Notes[ (<ref>)]:` blocks for `commit`, or empty.
@@ -6995,6 +7174,29 @@ fn graph_colors(repo: &gix::Repository) -> Vec<String> {
     }
     colors.push(RESET.to_string());
     colors
+}
+
+/// Record each commit's `graph_width(opt->graph)` — the width of the `--graph`
+/// prefix its commit row will carry — in `Node::graph_width`.
+///
+/// `graph->width` is set entirely by `graph_update()`/`graph_update_columns()`
+/// (graph.c:651-718); drawing the rows never changes it. Running the state
+/// machine over the node list therefore yields the same widths `show_log()` reads
+/// one commit at a time, and costs a pass over the columns rather than a second
+/// render. The colors are irrelevant to the width, so the cheapest palette is used.
+fn measure_graph_widths(nodes: &mut [Node], first_parent: bool) {
+    let mut graph = Graph::new(vec![String::new()], false);
+    for node in nodes.iter_mut() {
+        let drawn_parents: &[ObjectId] = if node.boundary {
+            &[]
+        } else if first_parent {
+            &node.parents[..node.parents.len().min(1)]
+        } else {
+            &node.parents
+        };
+        graph.update(node.id, drawn_parents, node.boundary);
+        node.graph_width = graph.width as i32;
+    }
 }
 
 /// Prefix every line of every commit's block with git's ASCII graph, flushing the

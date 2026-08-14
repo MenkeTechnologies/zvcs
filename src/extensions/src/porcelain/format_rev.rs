@@ -23,6 +23,12 @@
 //! `%(else)`/`%(end)` and any other unrecognised `%(…)` — which git echoes
 //! verbatim, as we do.
 //!
+//! Also covered: the column atoms `%<(<N>)`, `%>(<N>)`, `%><(<N>)`, `%>>(<N>)`,
+//! their `%<|(<N>)` column-target and `,trunc`/`,ltrunc`/`,mtrunc` forms, and the
+//! `%w(<width>,<indent1>,<indent2>)` wrap atom — all through the shared
+//! [`super::pretty_pad`] port, so widths are display columns and a CJK subject
+//! costs two per glyph.
+//!
 //! `--notes=<ref>` is accepted and, like git, has no effect unless the format
 //! expands `%N`: git only calls `load_display_notes()` when
 //! `userformat_find_requirements()` reports the format wants notes.
@@ -33,9 +39,8 @@
 //! and MIME body handling are not built), the `%(trailers…)` atoms (a faithful
 //! port of git's `find_trailer_block_start` + folding + the full option matrix
 //! could not be validated to byte-parity here without an integration build),
-//! `%<`/`%>`/`%|` padding and `%w()` wrapping (git's utf-8 display-width and
-//! word-wrap machinery), the `%+`/`%-`/`% ` conditional line feeds, and `%G*`
-//! (signature verification needs GPG, which is absent).
+//! the `%+`/`%-`/`% ` conditional line feeds, and `%G*` (signature verification
+//! needs GPG, which is absent).
 //! Placeholders git itself does not recognise are echoed verbatim, as git does.
 //!
 //! Known divergence: a commit carrying an `encoding` header is rendered from its
@@ -49,6 +54,7 @@ use anyhow::{anyhow, bail, Result};
 use std::io::{BufRead, Write};
 use std::process::ExitCode;
 
+use super::pretty_pad::{parse_wrap, FlushType, PadState, WrapState};
 use gix::bstr::ByteSlice;
 use gix::commit::describe::SelectRef;
 use gix::hash::ObjectId;
@@ -97,15 +103,58 @@ enum Format {
 }
 
 /// One element of a parsed user format.
+///
+/// The split mirrors what git's driver treats as a placeholder, because that is
+/// what the column atoms pad: only [`Item::Literal`] passes through a pending
+/// field untouched. `%n`, `%xNN` and `%C*` are placeholders in `pretty.c` even
+/// though they expand to fixed bytes, so they get their own [`Ph`] variants
+/// rather than folding into a literal run; `%%`, which `strbuf_expand_step()`
+/// handles before `format_commit_item()` is reached, stays literal.
 enum Item {
-    /// Literal bytes, including the expansion of `%%`, `%n`, `%xNN` and a
-    /// resolved `%C*` color code.
+    /// Literal bytes, including the expansion of `%%`.
     Literal(Vec<u8>),
     Placeholder(Ph),
+    /// A `%<`/`%>` column atom.
+    ///
+    /// `state` is the deferred padding request the atom stored, snapshotted at
+    /// parse time — or `None` when the atom stored nothing, which is every form
+    /// git rejects before reaching `c->padding = …` (a zero, missing, negative or
+    /// over-limit width). Those must leave the running state alone rather than
+    /// replay a snapshot: `PadState::apply` clears `flush` between fields, so a
+    /// stale snapshot would reopen one git had already closed.
+    ///
+    /// `consumed` is false for a malformed truncation modifier too — but that form
+    /// *does* store, so it carries a `Some`. It has to ride on the same item
+    /// rather than become a following [`Item::Unconsumed`]: git makes *one*
+    /// `format_commit_item()` call here, so the atom stores the new state and
+    /// prints its bare `%` without ever flushing the field it just opened. Two
+    /// items would make the second consume the first's field.
+    Pad { state: Option<PadState>, consumed: bool },
+    /// A `%w(<width>,<indent1>,<indent2>)` wrap atom.
+    Wrap { width: usize, indent1: usize, indent2: usize },
+    /// A `%` that `format_commit_item()` answered 0 for: an unknown placeholder,
+    /// a malformed column or wrap atom, an unterminated `%(`, or a trailing `%`.
+    ///
+    /// git prints the `%` and rescans from the next character — which the parser
+    /// has already turned into literal text — but only *after*
+    /// `format_and_pad_commit()` has laid out an empty field when one is pending.
+    /// That flush is why this cannot simply be a literal `%`.
+    Unconsumed,
 }
 
 /// The user-format placeholders this module evaluates.
 enum Ph {
+    /// `%n` — a newline. A placeholder in `pretty.c`, so a pending field pads it.
+    Newline,
+    /// `%xNN` — one raw byte. Likewise a placeholder, not literal text.
+    Byte(u8),
+    /// `%C*` — the resolved colour escape, empty for every form but an explicit
+    /// `%C(always,<spec>)` while colour is off.
+    ///
+    /// The one placeholder that *chains*: `format_and_pad_commit()` keeps pulling
+    /// the following placeholder into the same field after a `%C…`, so the escape
+    /// contributes bytes but no columns and the field measures the text.
+    Color(Vec<u8>),
     /// `%H` / `%h`
     Commit { abbrev: bool },
     /// `%T` / `%t`
@@ -356,11 +405,12 @@ fn parse_user_format(fmt: &str) -> Result<Vec<Item>> {
     let mut i = 0;
 
     let push = |items: &mut Vec<Item>, lit: &mut Vec<u8>, ph: Ph| {
-        if !lit.is_empty() {
-            items.push(Item::Literal(std::mem::take(lit)));
-        }
+        flush_lit(items, lit);
         items.push(Item::Placeholder(ph));
     };
+    // The running `struct format_commit_context` padding state. The atoms are
+    // resolved here, once, and the snapshots replayed per record.
+    let mut pad = PadState::default();
 
     while i < b.len() {
         if b[i] != b'%' {
@@ -369,7 +419,9 @@ fn parse_user_format(fmt: &str) -> Result<Vec<Item>> {
             continue;
         }
         let Some(&c) = b.get(i + 1) else {
-            lit.push(b'%');
+            // A trailing `%`: `format_commit_one()` switches on the NUL and
+            // returns 0.
+            push_unconsumed(&mut items, &mut lit);
             i += 1;
             continue;
         };
@@ -379,7 +431,7 @@ fn parse_user_format(fmt: &str) -> Result<Vec<Item>> {
                 i += 2;
             }
             b'n' => {
-                lit.push(b'\n');
+                push(&mut items, &mut lit, Ph::Newline);
                 i += 2;
             }
             b'x' => {
@@ -387,16 +439,43 @@ fn parse_user_format(fmt: &str) -> Result<Vec<Item>> {
                 let lo = b.get(i + 3).and_then(|c| (*c as char).to_digit(16));
                 match (hi, lo) {
                     (Some(hi), Some(lo)) => {
-                        lit.push((hi * 16 + lo) as u8);
+                        push(&mut items, &mut lit, Ph::Byte((hi * 16 + lo) as u8));
                         i += 4;
                     }
                     // Not a valid `%xNN`: git leaves the whole thing alone.
                     _ => {
-                        lit.push(b'%');
+                        push_unconsumed(&mut items, &mut lit);
                         i += 1;
                     }
                 }
             }
+            // The column atoms `%<(<N>)`, `%>(<N>)`, `%><(<N>)`, `%>>(<N>)` and
+            // their `|`/`trunc`/`ltrunc`/`mtrunc` forms. The snapshot is recorded
+            // even when the parse fails, because a bad truncation modifier leaves
+            // the width and flush type already stored — and because the attempt
+            // itself flushes a field that was already pending.
+            b'<' | b'>' => {
+                let (parsed, stored) = pad.parse_reporting(b, i + 1);
+                flush_lit(&mut items, &mut lit);
+                items.push(Item::Pad {
+                    state: stored.then_some(pad),
+                    consumed: parsed.is_some(),
+                });
+                i += parsed.map_or(1, |consumed| 1 + consumed);
+            }
+            // `%w(<width>,<indent1>,<indent2>)`: everything emitted after it is
+            // re-wrapped to that width when the parameters next change.
+            b'w' => match parse_wrap(b, i + 1) {
+                Some((consumed, width, indent1, indent2)) => {
+                    flush_lit(&mut items, &mut lit);
+                    items.push(Item::Wrap { width, indent1, indent2 });
+                    i += 1 + consumed;
+                }
+                None => {
+                    push_unconsumed(&mut items, &mut lit);
+                    i += 1;
+                }
+            },
             b'H' => {
                 push(&mut items, &mut lit, Ph::Commit { abbrev: false });
                 i += 2;
@@ -466,7 +545,7 @@ fn parse_user_format(fmt: &str) -> Result<Vec<Item>> {
                         i += 3;
                     }
                     _ => {
-                        lit.push(b'%');
+                        push_unconsumed(&mut items, &mut lit);
                         i += 1;
                     }
                 }
@@ -505,15 +584,16 @@ fn parse_user_format(fmt: &str) -> Result<Vec<Item>> {
                 push(&mut items, &mut lit, ph);
                 i += 3;
             }
-            b'G' | b'w' | b'<' | b'>' | b'|' | b'+' | b'-' | b' ' => {
+            b'G' | b'|' | b'+' | b'-' | b' ' => {
                 bail!(
-                    "unsupported placeholder \"%{}\" (signature, padding, wrapping and conditional line feeds are not ported)",
+                    "unsupported placeholder \"%{}\" (signature and conditional line feeds are not ported)",
                     c as char
                 );
             }
-            // Unknown to git as well: echoed verbatim.
+            // Unknown to git as well: it consumes nothing, so the `%` prints and
+            // the rest is rescanned as literal text.
             _ => {
-                lit.push(b'%');
+                push_unconsumed(&mut items, &mut lit);
                 i += 1;
             }
         }
@@ -525,26 +605,46 @@ fn parse_user_format(fmt: &str) -> Result<Vec<Item>> {
     Ok(items)
 }
 
+/// Flush a pending run of literal bytes into `items`.
+fn flush_lit(items: &mut Vec<Item>, lit: &mut Vec<u8>) {
+    if !lit.is_empty() {
+        items.push(Item::Literal(std::mem::take(lit)));
+    }
+}
+
+/// Record a `%` that `format_commit_item()` answered 0 for. See
+/// [`Item::Unconsumed`] for why this is not just a literal `%`.
+fn push_unconsumed(items: &mut Vec<Item>, lit: &mut Vec<u8>) {
+    flush_lit(items, lit);
+    items.push(Item::Unconsumed);
+}
+
 /// Parse a `%C*` color placeholder starting at `b[i] == '%'` (`b[i+1] == 'C'`),
 /// appending the resolved bytes to `lit`, and return the new index.
 ///
 /// `format-rev` is invoked piped with no `--color`, so color output is off:
 /// every form expands to nothing except an explicit `%C(always,<spec>)`.
-fn parse_color(b: &[u8], i: usize, _items: &mut Vec<Item>, lit: &mut Vec<u8>) -> Result<usize> {
+fn parse_color(b: &[u8], i: usize, items: &mut Vec<Item>, lit: &mut Vec<u8>) -> Result<usize> {
+    let mut color = |items: &mut Vec<Item>, lit: &mut Vec<u8>, bytes: Vec<u8>| {
+        flush_lit(items, lit);
+        items.push(Item::Placeholder(Ph::Color(bytes)));
+    };
     let after = &b[i + 2..];
     if after.first() == Some(&b'(') {
         // Find the matching ')'.
         if let Some(rel) = after[1..].iter().position(|&x| x == b')') {
             let inner = &after[1..1 + rel];
-            lit.extend_from_slice(&color_from_paren(inner)?);
+            color(items, lit, color_from_paren(inner)?);
             // Consumed: '%', 'C', '(', inner, ')'.
             return Ok(i + rel + 4);
         }
-        // No closing ')': git treats `%C(` as unknown and echoes '%'.
-        lit.push(b'%');
+        // No closing ')': git treats `%C(` as unknown and consumes nothing.
+        push_unconsumed(items, lit);
         return Ok(i + 1);
     }
-    // Bare color words. With color off they all expand to nothing.
+    // Bare color words. With color off they all expand to nothing — but they are
+    // still `%C…` placeholders, so they consume a pending field and chain into
+    // the placeholder that follows.
     for (word, len) in [
         (&b"reset"[..], 5usize),
         (&b"green"[..], 5),
@@ -552,11 +652,12 @@ fn parse_color(b: &[u8], i: usize, _items: &mut Vec<Item>, lit: &mut Vec<u8>) ->
         (&b"red"[..], 3),
     ] {
         if after.starts_with(word) {
+            color(items, lit, Vec::new());
             return Ok(i + 2 + len);
         }
     }
-    // `%C` followed by anything else: unknown, echo '%'.
-    lit.push(b'%');
+    // `%C` followed by anything else: unknown, consumes nothing.
+    push_unconsumed(items, lit);
     Ok(i + 1)
 }
 
@@ -697,8 +798,8 @@ fn color_code(t: &[u8], is_bg: bool) -> Result<Option<String>> {
 fn parse_atom(b: &[u8], i: usize, items: &mut Vec<Item>, lit: &mut Vec<u8>) -> Result<usize> {
     let after = &b[i + 2..]; // content following "%("
     let Some(rel) = after.iter().position(|&x| x == b')') else {
-        // Unterminated: echo '%'.
-        lit.push(b'%');
+        // Unterminated: consumes nothing.
+        push_unconsumed(items, lit);
         return Ok(i + 1);
     };
     let content = &after[..rel];
@@ -722,16 +823,15 @@ fn parse_atom(b: &[u8], i: usize, items: &mut Vec<Item>, lit: &mut Vec<u8>) -> R
                 "unsupported %(describe) options (ported: %(describe), %(describe:tags), %(describe:all))"
             );
         };
-        if !lit.is_empty() {
-            items.push(Item::Literal(std::mem::take(lit)));
-        }
+        flush_lit(items, lit);
         items.push(Item::Placeholder(Ph::Describe(select)));
         // Consumed: '%', '(', content, ')'.
         return Ok(i + 2 + rel + 1);
     }
 
-    // Anything else: git does not expand it — echo '%'.
-    lit.push(b'%');
+    // Anything else: git does not expand it, so it consumes nothing — the `%`
+    // prints and `(…)` is rescanned as literal text.
+    push_unconsumed(items, lit);
     Ok(i + 1)
 }
 
@@ -820,7 +920,14 @@ fn render(
     }
 }
 
-/// Evaluate a parsed user format against one commit.
+/// Evaluate a parsed user format against one commit — git's
+/// `repo_format_commit_message()` driver loop over the pre-parsed item list.
+///
+/// [`Item::Literal`] is copied straight through, leaving a pending field pending.
+/// Everything else came from a `%` and so goes through `format_commit_item()`:
+/// directly when no field is open, or into a buffer of its own whose *display*
+/// width the field measures. A `%C…` keeps pulling the following placeholder into
+/// the same field, which is why the colour escape adds bytes but no columns.
 fn render_user(
     repo: &gix::Repository,
     commit: &gix::Commit<'_>,
@@ -829,12 +936,106 @@ fn render_user(
     mailmap: &gix::mailmap::Snapshot,
     out: &mut Vec<u8>,
 ) -> Result<()> {
+    // The deferred state `struct format_commit_context` carries.
+    let mut pad = PadState::default();
+    let mut wrap = WrapState::default();
+    let mut k = 0;
+    while k < items.len() {
+        if let Item::Literal(bytes) = &items[k] {
+            out.extend_from_slice(bytes);
+            k += 1;
+            continue;
+        }
+        if pad.flush == FlushType::None {
+            match &items[k] {
+                Item::Pad { state, consumed } => {
+                    if let Some(state) = state {
+                        pad = *state;
+                    }
+                    if !consumed {
+                        out.push(b'%');
+                    }
+                }
+                Item::Wrap { width, indent1, indent2 } => {
+                    wrap.rewrap_message_tail(out, *width, *indent1, *indent2);
+                }
+                Item::Unconsumed => out.push(b'%'),
+                Item::Placeholder(ph) => render_placeholder(repo, commit, cr, ph, mailmap, out)?,
+                Item::Literal(_) => unreachable!("handled above"),
+            }
+            k += 1;
+            continue;
+        }
+        // `format_and_pad_commit()`. `padding` is read before the placeholder
+        // expands, so a nested `%<(…)` retargets the *next* field, not this one;
+        // the flush and truncation modes are read afterwards and do see it.
+        let padding = pad.padding;
+        let mut local: Vec<u8> = Vec::new();
+        let mut unconsumed = false;
+        // Whether the chain has already swallowed a `%`. git counts it in
+        // `total_consumed`, so a later placeholder that consumes nothing still
+        // leaves a non-zero count — and only a zero count prints a bare `%`.
+        let mut chained = false;
+        loop {
+            let modifier = matches!(&items[k], Item::Placeholder(Ph::Color(_)));
+            match &items[k] {
+                Item::Pad { state, consumed } => {
+                    if let Some(state) = state {
+                        pad = *state;
+                    }
+                    unconsumed = !consumed;
+                }
+                Item::Wrap { width, indent1, indent2 } => {
+                    // git rewraps whatever buffer `format_commit_one()` was handed,
+                    // which inside a pending field is the field's own.
+                    wrap.rewrap_message_tail(&mut local, *width, *indent1, *indent2);
+                }
+                Item::Unconsumed => unconsumed = true,
+                Item::Placeholder(ph) => {
+                    render_placeholder(repo, commit, cr, ph, mailmap, &mut local)?;
+                }
+                Item::Literal(_) => unreachable!("handled above"),
+            }
+            k += 1;
+            if !modifier || unconsumed {
+                break;
+            }
+            // git chains only while the next character is a `%` — every item but
+            // a literal run, and the end of the format is not one either.
+            match items.get(k) {
+                Some(Item::Literal(_)) | None => break,
+                Some(_) => chained = true,
+            }
+        }
+        pad.apply(out, local, padding, 0);
+        if unconsumed && !chained {
+            out.push(b'%');
+        }
+    }
+    // `repo_format_commit_message()` closes with a rewrap to width 0, which wraps
+    // whatever a trailing `%w()` was still governing.
+    wrap.rewrap_message_tail(out, 0, 0, 0);
+    Ok(())
+}
+
+/// `format_commit_one()` for the placeholders that render commit data, appending
+/// to `out` — which is the output buffer directly, or a pending field's own.
+fn render_placeholder(
+    repo: &gix::Repository,
+    commit: &gix::Commit<'_>,
+    cr: &gix::objs::CommitRef<'_>,
+    ph: &Ph,
+    mailmap: &gix::mailmap::Snapshot,
+    out: &mut Vec<u8>,
+) -> Result<()> {
     let id = commit.id;
     let msg = cr.message.as_bytes();
-    for item in items {
-        match item {
-            Item::Literal(bytes) => out.extend_from_slice(bytes),
-            Item::Placeholder(ph) => match ph {
+    {
+        {
+            match ph {
+                Ph::Newline => out.push(b'\n'),
+                Ph::Byte(b) => out.push(*b),
+                Ph::Color(bytes) => out.extend_from_slice(bytes),
                 Ph::Commit { abbrev } => push_oid(repo, out, &id, *abbrev)?,
                 Ph::Tree { abbrev } => push_oid(repo, out, &cr.tree(), *abbrev)?,
                 Ph::Parents { abbrev } => {
@@ -899,7 +1100,7 @@ fn render_user(
                         out.extend_from_slice(fmt.to_string().as_bytes());
                     }
                 }
-            },
+            }
         }
     }
     Ok(())

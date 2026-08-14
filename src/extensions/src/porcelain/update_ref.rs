@@ -158,14 +158,10 @@ pub fn update_ref(args: &[String]) -> Result<ExitCode> {
         }
     };
 
-    // A deletion only requires a "safe" name, not a well-formed one, and a bad
-    // one is an `error:` with exit 1 rather than a fatal.
-    if opts.delete && !refname_is_safe(name) {
-        eprintln!("error: refusing to update ref with bad name '{name}'");
-        return Ok(ExitCode::from(1));
-    }
-
     // Value parsing failures are `fatal:` in git and exit 128, not usage errors.
+    // `cmd_update_ref` resolves the new value, then the old one, and only then
+    // hands the refname to `refs_delete_ref` — so a bad old SHA1 outranks a bad
+    // ref name: `update-ref -d main v0.2.0` reports the *value*, not the name.
     let new = match parse_slot(&repo, new_spec, false, Slot::New) {
         Ok(v) => v,
         Err(e) => return fatal(e),
@@ -174,6 +170,13 @@ pub fn update_ref(args: &[String]) -> Result<ExitCode> {
         Ok(v) => v,
         Err(e) => return fatal(e),
     };
+
+    // A deletion only requires a "safe" name, not a well-formed one, and a bad
+    // one is an `error:` with exit 1 rather than a fatal.
+    if opts.delete && !refname_is_safe(name) {
+        eprintln!("error: refusing to update ref with bad name '{name}'");
+        return Ok(ExitCode::from(1));
+    }
     // git reports this one through `update_ref`'s die-on-error wrapper, so it
     // carries the ref name and the same 128 the other update failures use.
     if let Err(e) = check_new_object(&repo, name, &new) {

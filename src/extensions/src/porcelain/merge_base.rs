@@ -76,6 +76,9 @@ pub fn merge_base(args: &[String]) -> Result<ExitCode> {
             "--independent" => Mode::Independent,
             "--is-ancestor" => Mode::IsAncestor,
             "--fork-point" => Mode::ForkPoint,
+            // parse_options_step() answers `-h` on stdout at 129, with no
+            // `error:` line — a help request is not a rejection.
+            "-h" => return Ok(super::show_usage(USAGE)),
             _ => {
                 eprintln!("error: unknown option `{}'", a.trim_start_matches('-'));
                 return Ok(usage());
@@ -197,13 +200,26 @@ fn fatal(msg: &str) -> ExitCode {
     ExitCode::from(128)
 }
 
-/// Print the usage synopsis and return git's usage status.
+/// `usage_with_options()` over `builtin/merge-base.c`'s option table: the five
+/// synopsis lines, a blank line, then the options — the synopsis alone was only
+/// half of what git prints, on `-h` and on a rejection alike.
+const USAGE: &str = r"usage: git merge-base [-a | --all] <commit> <commit>...
+   or: git merge-base [-a | --all] --octopus <commit>...
+   or: git merge-base --is-ancestor <commit> <commit>
+   or: git merge-base --independent <commit>...
+   or: git merge-base --fork-point <ref> [<commit>]
+
+    -a, --[no-]all        output all common ancestors
+    --octopus             find ancestors for a single n-way merge
+    --independent         list revs not reachable from others
+    --is-ancestor         is the first one ancestor of the other?
+    --fork-point          find where <commit> forked from reflog of <ref>
+
+";
+
+/// Print the usage block on stderr and return git's usage status.
 fn usage() -> ExitCode {
-    eprintln!("usage: git merge-base [-a | --all] <commit> <commit>...");
-    eprintln!("   or: git merge-base [-a | --all] --octopus <commit>...");
-    eprintln!("   or: git merge-base --is-ancestor <commit> <commit>");
-    eprintln!("   or: git merge-base --independent <commit>...");
-    eprintln!("   or: git merge-base --fork-point <ref> [<commit>]");
+    eprint!("{USAGE}");
     ExitCode::from(129)
 }
 

@@ -160,6 +160,15 @@ const UNIMPLEMENTED_PREFIX: &[&str] = &[
 ];
 
 pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
+    // `show_usage_if_asked(argc, argv, builtin_rev_parse_usage)`
+    // (builtin/rev-parse.c:723) is the first statement of `cmd_rev_parse`: a
+    // lone `-h` goes to stdout at 129, before the repository is opened. `-h`
+    // anywhere else is not help — rev-parse has no parse-options table, so it
+    // falls through to the ordinary argument handling.
+    if let Some(code) = super::show_usage_if_asked(args, USAGE) {
+        return Ok(code);
+    }
+
     // `setup_git_directory()` looks at `$GIT_DIR` before it walks upwards, so
     // `git --git-dir=<path> rev-parse <rev>` resolves against THAT repository.
     // Plain discovery ignores the variable and silently answers about whatever
@@ -310,7 +319,7 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
                 };
                 match parsed {
                     Some(Parsed::Range(range)) => {
-                        emit_range(&mut out, &repo, &o, range)?;
+                        emit_range(&mut out, &repo, &o, range, arg)?;
                         // A range is never a single revision. Under
                         // `--verify`/`--short` the endpoints still print, but the
                         // scan then fails afterward with "Needed a single revision".
@@ -542,6 +551,13 @@ enum Query {
 }
 
 fn option(o: &mut Opts, arg: &str) -> Result<Opt> {
+    // A `-h` that was not the sole argument (the lone-`-h` case is answered at
+    // the entry point) is `usage(builtin_rev_parse_usage)`: the same block, but
+    // on stderr and with no `error:` line, exit 129.
+    if arg == "-h" {
+        eprint!("{USAGE}");
+        return Err(crate::fatal::Silent(129).into());
+    }
     if UNIMPLEMENTED_EXACT.contains(&arg) || UNIMPLEMENTED_PREFIX.iter().any(|p| arg.starts_with(p)) {
         anyhow::bail!("{arg} is not ported yet");
     }
@@ -731,25 +747,18 @@ fn prefix(repo: &gix::Repository) -> Option<std::path::PathBuf> {
     (!rel.as_os_str().is_empty()).then(|| rel.to_owned())
 }
 
-/// git's `is_inside_git_dir()`: whether the cwd is the git directory or below it.
-fn is_inside_git_dir(repo: &gix::Repository) -> bool {
-    std::env::current_dir()
-        .ok()
-        .and_then(|cwd| std::fs::canonicalize(cwd).ok())
-        .is_some_and(|cwd| cwd.starts_with(absolute(repo.git_dir())))
-}
+// `is_inside_git_dir()` and `is_inside_work_tree()` are shared with the other commands that ask
+// setup the same questions — see [`crate::setup`].
+use crate::setup::{is_inside_git_dir, is_inside_work_tree};
 
-/// git's `is_inside_work_tree()`: `is_inside_dir(repo_get_work_tree())` — purely whether the cwd
-/// sits in the work tree, which says nothing about the git directory. Both this and
-/// [`is_inside_git_dir`] are true at once for `GIT_DIR=.` inside a `.git` directory, because that
-/// setup makes the git directory its own work tree.
-fn is_inside_work_tree(repo: &gix::Repository) -> bool {
-    let Some(top) = toplevel(repo) else { return false };
-    std::env::current_dir()
-        .ok()
-        .and_then(|cwd| std::fs::canonicalize(cwd).ok())
-        .is_some_and(|cwd| cwd.starts_with(top))
-}
+/// `builtin_rev_parse_usage` — the bare synopsis `show_usage_if_asked()`
+/// and `usage()` both print. rev-parse has no parse-options table of its own.
+const USAGE: &str = r#"usage: git rev-parse --parseopt [<options>] -- [<args>...]
+   or: git rev-parse --sq-quote [<arg>...]
+   or: git rev-parse [<options>] [<arg>...]
+
+Run "git rev-parse --parseopt -h" for more information on the first usage.
+"#;
 
 fn is_cwd(dir: &std::path::Path) -> bool {
     std::env::current_dir()
@@ -854,21 +863,28 @@ fn emit_exclude(out: &mut impl Write, bytes: &[u8]) -> std::io::Result<()> {
 ///
 /// `a..b` prints `b` then `^a`; `a...b` prints `b`, `a`, then `^<merge-base>` for
 /// each merge base between the two sides (none is printed when the histories are
-/// unrelated). Endpoints honor the current abbreviation state.
+/// unrelated).
+///
+/// `spec` is the argument as typed. `try_difference()` hands each endpoint to
+/// `show_rev` with its *name*, so the endpoints of a range answer to
+/// `--symbolic`, `--abbrev-ref` and `--symbolic-full-name` exactly as a bare
+/// revision does. A merge base has no name and is always an object id.
 fn emit_range(
     out: &mut impl Write,
     repo: &gix::Repository,
     o: &Opts,
     range: RangeSpec,
+    spec: &str,
 ) -> Result<()> {
+    let (left, right) = endpoint_names(spec);
     match range {
         RangeSpec::Range { from, to } => {
-            emit(out, render_id(repo, o, &to)?)?;
-            emit_exclude(out, &render_id(repo, o, &from)?)?;
+            show_rev(out, repo, o, &to, Some(right.as_bytes().as_bstr()), None, false)?;
+            show_rev(out, repo, o, &from, Some(left.as_bytes().as_bstr()), None, true)?;
         }
         RangeSpec::Merge { theirs, ours } => {
-            emit(out, render_id(repo, o, &ours)?)?;
-            emit(out, render_id(repo, o, &theirs)?)?;
+            show_rev(out, repo, o, &ours, Some(right.as_bytes().as_bstr()), None, false)?;
+            show_rev(out, repo, o, &theirs, Some(left.as_bytes().as_bstr()), None, false)?;
             let bases = repo
                 .merge_bases_many(theirs, &[ours])
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -878,6 +894,22 @@ fn emit_range(
         }
     }
     Ok(())
+}
+
+/// Split `a..b` / `a...b` into the two endpoint names `try_difference()` builds,
+/// including its defaults: an omitted side is `HEAD`.
+fn endpoint_names(spec: &str) -> (&str, &str) {
+    let Some(at) = spec.find("..") else {
+        return ("HEAD", "HEAD");
+    };
+    let left = &spec[..at];
+    let rest = &spec[at + 2..];
+    // `symmetric = (*next == '.')`, and the extra dot belongs to the separator.
+    let right = rest.strip_prefix('.').unwrap_or(rest);
+    (
+        if left.is_empty() { "HEAD" } else { left },
+        if right.is_empty() { "HEAD" } else { right },
+    )
 }
 
 /// `get_oid_basic()`'s reflog branch: `<ref>@{<n>}` whose `<n>` is past the end

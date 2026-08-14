@@ -622,17 +622,46 @@ enum Fatal {
     UnableToResolve(String),
 }
 
+/// `diff_files_usage` — the synopsis *and* the `common diff options:` table
+/// `usage()` prints under it. The synopsis alone was only its first line.
+const USAGE: &str = r"usage: git diff-files [-q] [-0 | -1 | -2 | -3 | -c | --cc] [<common-diff-options>] [<path>...]
+
+common diff options:
+  -z            output diff-raw with lines terminated with NUL.
+  -p            output patch format.
+  -u            synonym for -p.
+  --patch-with-raw
+                output both a patch and the diff-raw format.
+  --stat        show diffstat instead of patch.
+  --numstat     show numeric diffstat instead of patch.
+  --patch-with-stat
+                output a patch and prepend its diffstat.
+  --name-only   show only names of changed files.
+  --name-status show names and status of changed files.
+  --full-index  show full object name on index lines.
+  --abbrev=<n>  abbreviate object names in diff-tree header and diff-raw.
+  -R            swap input file pairs.
+  -B            detect complete rewrites.
+  -M            detect renames.
+  -C            detect copies.
+  --find-copies-harder
+                try unchanged files as candidate for copy detection.
+  -l<n>         limit rename attempts up to <n> paths.
+  -O<file>      reorder diffs according to the <file>.
+  -S<string>    find filepair whose only one side contains the string.
+  --pickaxe-all
+                show all files diff when -S is used and hit is found.
+  -a  --text    treat all files as text.
+
+";
+
 impl Fatal {
     /// Report on stderr the way git does and hand back git's exit code.
     fn report(self) -> ExitCode {
         let mut err = std::io::stderr().lock();
         match self {
             Fatal::Usage => {
-                let _ = writeln!(
-                    err,
-                    "usage: git diff-files [-q] [-0 | -1 | -2 | -3 | -c | --cc] \
-                     [<common-diff-options>] [<path>...]"
-                );
+                let _ = write!(err, "{USAGE}");
                 return ExitCode::from(129);
             }
             Fatal::Ambiguous(arg) => {
@@ -754,6 +783,12 @@ const PORTED: &str = "--raw, --name-only, --name-status, -z, --abbrev[=<n>], --n
 const FILTER_LETTERS: &[u8] = b"ACDMRTUXB";
 
 pub fn diff_files(args: &[String]) -> Result<ExitCode> {
+    // `show_usage_if_asked(argc, argv, diff_files_usage)` (builtin/diff-files.c:32):
+    // a lone `-h` answers on stdout at 129, before anything else runs.
+    if let Some(code) = super::show_usage_if_asked(args, USAGE) {
+        return Ok(code);
+    }
+
     // Dispatch strips the subcommand, but tolerate it being present so the entry
     // point behaves the same either way.
     let args = match args.first() {
@@ -1099,6 +1134,9 @@ const ACCEPTED_NOOP: &[&str] = &[
     "--no-textconv",
     "--no-prefix",
     "--default-prefix",
+    // `revision.c`'s `--no-notes` turns off a display that is off by default here,
+    // so it cannot change any output this command produces.
+    "--no-notes",
     "--ita-invisible-in-index",
     "--ita-visible-in-index",
     // XDF_IGNORE_BLANK_LINES is not one of XDF_WHITESPACE_FLAGS, so it does not

@@ -115,6 +115,11 @@ pub fn hook(args: &[String]) -> Result<ExitCode> {
     match args.first().map(String::as_str) {
         Some("run") => run(&args[1..]),
         Some("list") => list(&args[1..]),
+        // `cmd_hook`'s own `parse_options(..., PARSE_OPT_SUBCOMMAND_OPTIONAL)`
+        // answers `-h` before it looks for a subcommand: the two usage lines on
+        // stdout, exit 129. Its option table is empty, so no option list follows
+        // — only the blank line `usage_with_options_internal()` always ends on.
+        Some("-h") => Ok(super::show_usage(&format!("{USAGE_RUN}{USAGE_LIST_ALT}\n"))),
         None => {
             eprint!("error: need a subcommand\n{USAGE_RUN}{USAGE_LIST_ALT}\n");
             Ok(ExitCode::from(129))

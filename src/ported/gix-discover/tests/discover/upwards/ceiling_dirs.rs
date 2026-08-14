@@ -207,6 +207,122 @@ fn ceiling_dirs_are_not_processed_differently_than_the_git_dir_candidate() -> cr
     Ok(())
 }
 
+/// A ceiling that follows an empty entry in `GIT_CEILING_DIRECTORIES` is compared to the search
+/// directory exactly as it was spelled, so one that only *names* an ancestor after normalization
+/// does not stop the search. git's `canonicalize_ceiling_entry()` returns early for those entries
+/// with `/* Keep entry but do not canonicalize it */`, and `longest_ancestor_length()` then does a
+/// plain `strncmp()` against them.
+///
+/// Measured against stock 2.55.0 with a repository at `R` and the search starting in `R/a/b`:
+///
+/// ```text
+/// $ GIT_CEILING_DIRECTORIES=:R        git rev-parse --git-dir   # fatal: not a git repository, 128
+/// $ GIT_CEILING_DIRECTORIES=:R/       git rev-parse --git-dir   # fatal: not a git repository, 128
+/// $ GIT_CEILING_DIRECTORIES=:R//      git rev-parse --git-dir   # R/.git, exit 0
+/// $ GIT_CEILING_DIRECTORIES=:R/.      git rev-parse --git-dir   # R/.git, exit 0
+/// $ GIT_CEILING_DIRECTORIES=:R/a/..   git rev-parse --git-dir   # R/.git, exit 0
+/// ```
+///
+/// The same five spellings in [`Options::ceiling_dirs`] would all stop the search, which is that
+/// list's own documented behaviour and is what the rest of this file measures.
+#[test]
+fn verbatim_ceiling_dirs_are_compared_exactly_as_spelled() -> crate::Result {
+    let work_dir = repo_path()?;
+    let dir = work_dir.join("some/very/deeply/nested/subdir");
+    let cwd = std::env::current_dir()?;
+    let absolute = gix_path::realpath_opts(&work_dir, &cwd, 8)?;
+    // Appended to the path's bytes rather than to a `String`, because the whole point of these
+    // entries is that they are compared as the exact bytes they were spelled with.
+    let spelled = |suffix: &str| -> Vec<std::path::PathBuf> {
+        let mut spelling = absolute.clone().into_os_string();
+        spelling.push(suffix);
+        vec![spelling.into()]
+    };
+
+    for exact in ["", "/"] {
+        let err = gix_discover::upwards_opts(
+            &dir,
+            Options {
+                ceiling_dirs_verbatim: spelled(exact),
+                ..Default::default()
+            },
+        )
+        .expect_err("spelled as the ancestor itself, the ceiling matches and stops the search");
+        assert!(
+            matches!(
+                err,
+                gix_discover::upwards::Error::NoGitRepositoryWithinCeiling { ceiling_height: 5, .. }
+            ),
+            "`{exact}`: a lone trailing slash is part of a root's name, so git excludes it from the \
+             compared length rather than letting it fail the match"
+        );
+    }
+
+    for renamed in ["//", "/.", "/some/.."] {
+        let (repo_path, _trust) = gix_discover::upwards_opts(
+            &dir,
+            Options {
+                match_ceiling_dir_or_error: false,
+                ceiling_dirs_verbatim: spelled(renamed),
+                ..Default::default()
+            },
+        )
+        .unwrap_or_else(|err| panic!("`{renamed}` names the ancestor but is not spelled as it, so it must not match: {err}"));
+        assert_repo_is_current_workdir(repo_path, &work_dir);
+    }
+
+    Ok(())
+}
+
+/// The two lists are one ceiling set: the deepest match out of either stops the search, which is
+/// git taking the *longest* ancestor over the whole of `GIT_CEILING_DIRECTORIES` regardless of
+/// where the empty entry falls. Measured against stock 2.55.0 from `R/a/b` with a repository at
+/// `R`, where the verbatim half is the deeper of the two and is the one that decides:
+///
+/// ```text
+/// $ GIT_CEILING_DIRECTORIES=<R's parent>::R/a git rev-parse --git-dir  # fatal: …, exit 128
+/// ```
+#[test]
+fn the_deepest_ceiling_wins_across_both_lists() -> crate::Result {
+    let work_dir = repo_path()?;
+    let dir = work_dir.join("some/very/deeply/nested/subdir");
+    let cwd = std::env::current_dir()?;
+    let absolute = gix_path::realpath_opts(&work_dir, &cwd, 8)?;
+
+    let err = gix_discover::upwards_opts(
+        &dir,
+        Options {
+            ceiling_dirs: vec![absolute.clone()],
+            ceiling_dirs_verbatim: vec![absolute.join("some/very")],
+            ..Default::default()
+        },
+    )
+    .expect_err("a ceiling in either list stops the search");
+    assert!(
+        matches!(
+            err,
+            gix_discover::upwards::Error::NoGitRepositoryWithinCeiling { ceiling_height: 3, .. }
+        ),
+        "the verbatim `some/very` is deeper than the normalized work dir, so it is the one that stops the search"
+    );
+
+    let err = gix_discover::upwards_opts(
+        &dir,
+        Options {
+            ceiling_dirs: vec![absolute.join("some/very")],
+            ceiling_dirs_verbatim: vec![absolute],
+            ..Default::default()
+        },
+    )
+    .expect_err("and the same pair the other way around picks the same ceiling");
+    assert!(matches!(
+        err,
+        gix_discover::upwards::Error::NoGitRepositoryWithinCeiling { ceiling_height: 3, .. }
+    ));
+
+    Ok(())
+}
+
 #[test]
 fn no_matching_ceiling_dirs_errors_by_default() -> crate::Result {
     let relative_work_dir = repo_path()?;

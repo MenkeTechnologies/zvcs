@@ -46,6 +46,7 @@ usage: git commit-tree <tree> [(-p <parent>)...]
     -F <file>             read commit log message from file
     -S, --[no-]gpg-sign[=<key-id>]
                           GPG sign commit
+
 ";
 
 /// `git commit-tree` — write a commit object naming `<tree>` and print its id.
@@ -63,6 +64,14 @@ pub fn commit_tree(args: &[String]) -> Result<ExitCode> {
         Some(a) if a == "commit-tree" => &args[1..],
         _ => args,
     };
+
+    // `show_usage_with_options_if_asked()` (builtin/commit-tree.c:131) runs
+    // ahead of `parse_options` and of anything that could fail: a lone `-h`
+    // prints the block on stdout at 129, before the identity check below could
+    // complain about a repository that has no author configured.
+    if let Some(code) = super::show_usage_if_asked(args, USAGE) {
+        return Ok(code);
+    }
 
     // The object this writes carries an identity, and git fills the halves
     // the user did not give rather than refusing — except under
@@ -102,7 +111,7 @@ pub fn commit_tree(args: &[String]) -> Result<ExitCode> {
                 _ if long.starts_with("gpg-sign=") => sign = true,
                 _ => {
                     eprintln!("error: unknown option `{long}'");
-                    eprintln!("{USAGE}");
+                    eprint!("{USAGE}");
                     return Ok(ExitCode::from(129));
                 }
             }
@@ -120,9 +129,12 @@ pub fn commit_tree(args: &[String]) -> Result<ExitCode> {
                 continue;
             }
             'p' | 'm' | 'F' => {}
+            // parse_options' `internal_help` inside the short-option loop,
+            // which the entry-point check only covers for a lone `-h`.
+            'h' => return Ok(super::show_usage(USAGE)),
             _ => {
                 eprintln!("error: unknown switch `{flag}'");
-                eprintln!("{USAGE}");
+                eprint!("{USAGE}");
                 return Ok(ExitCode::from(129));
             }
         }

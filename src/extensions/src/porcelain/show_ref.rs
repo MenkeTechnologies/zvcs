@@ -50,6 +50,13 @@ pub fn show_ref(args: &[String]) -> Result<ExitCode> {
         _ => args,
     };
 
+    // parse-options' lone-`-h` rule (parse-options.c:1049,
+    // `internal_help && ctx->total == 1`). It cannot live in the option loop
+    // because show-ref's own hidden `-h` means `--head`.
+    if let Some(code) = super::show_usage_if_asked(args, USAGE) {
+        return Ok(code);
+    }
+
     let mut opts = Opts {
         head: false,
         deref: false,
@@ -127,6 +134,12 @@ pub fn show_ref(args: &[String]) -> Result<ExitCode> {
                         continue;
                     }
                 }
+                // `OPT_HIDDEN_BOOL('h', NULL, &patterns_opts.show_head, …)`
+                // (builtin/show-ref.c:317): show-ref owns `-h` as an undocumented
+                // alias of `--head`, which is why the lone-`-h` help is handled
+                // up front rather than here. `git show-ref -h <anything>` shows
+                // HEAD; only `git show-ref -h` by itself is a help request.
+                'h' => opts.head = true,
                 c => return unknown_option("switch", &c.to_string()),
             }
             i += 1;

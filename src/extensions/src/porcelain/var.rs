@@ -99,9 +99,11 @@ pub fn var(args: &[String]) -> Result<ExitCode> {
         _ => args,
     };
 
-    if argv.iter().any(|a| a == "-h") {
-        print!("{USAGE}");
-        return Ok(ExitCode::from(129));
+    // `show_usage_if_asked(argc, argv, var_usage)` (builtin/var.c:225): a LONE
+    // `-h` only. `git var -h <anything>` is an ordinary command line, and the
+    // wrong-arity `usage()` below answers it on stderr.
+    if let Some(code) = super::show_usage_if_asked(argv, USAGE) {
+        return Ok(code);
     }
 
     let [request] = argv else {

@@ -92,6 +92,7 @@ usage: git switch [<options>] [<branch>]
                           update ignored files (default)
     --[no-]ignore-other-worktrees
                           do not check if another worktree is using this branch
+
 ";
 
 /// git's fatal error convention: `fatal: <msg>` on stderr, exit 128.

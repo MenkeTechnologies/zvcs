@@ -85,11 +85,16 @@
 //! empty-blob placeholder, git's `ita_only` path),
 //! `--build-fake-ancestor` (writes a temporary
 //! index),
-//! `--ignore-whitespace`/`--ignore-space-change` (whitespace-insensitive match
-//! with pre/post-image fixup), `--inaccurate-eof` (subtle trailing-newline
-//! semantics), copy patches, non-UTF-8 paths, and running from a
-//! subdirectory of the worktree (git reinterprets patch paths against the repo
-//! prefix there).
+//! `--inaccurate-eof` (subtle trailing-newline
+//! semantics), copy patches, and non-UTF-8 paths.
+//!
+//! Running below the worktree root behaves as git does. `setup_git_directory()`
+//! leaves the command at the top of the worktree and hands it the invocation
+//! directory as `prefix`, so [`worktree_prefix`] does both, and the prefix then
+//! reaches the same three places apply.c uses it: the patch-file operands are
+//! resolved through it, a traditional (non-`diff --git`) patch's names gain it
+//! ([`prefix_patch`]), and [`use_patch`] drops every path that does not live
+//! strictly below it — silently, exit 0, as git does.
 //!
 //! Binary patches are applied: the `GIT binary patch` payload is base85-decoded and
 //! inflated, then either used whole (`literal`) or applied as a git delta to the
@@ -97,6 +102,16 @@
 //! against the ids the `index` line names, so a payload meets the pre-image it was made
 //! against or the patch is refused — which also means a patch without a full index line
 //! is refused, as git refuses it.
+//!
+//! `--ignore-whitespace`/`--ignore-space-change` (both are the same flag in git,
+//! `ws_ignore_action = ignore_ws_change`) relax the search: a hunk that does not
+//! land byte for byte is retried with `fuzzy_matchlines()`, which compares the
+//! lines with every whitespace run collapsed — a run may differ in width but may
+//! not disappear, so `a b` still does not match `ab`, and line endings are ignored
+//! on both sides. A hunk that only lands that way then goes through
+//! `update_pre_post_images()`: every context line of the result is re-taken from
+//! the file rather than the patch, so the file's own indentation survives and only
+//! added lines come out of the patch.
 //!
 //! `-C<n>` reduces context the way `apply_one_fragment()` does: a hunk that does not
 //! land as written sheds one context line from whichever end has more of them and is
@@ -135,8 +150,9 @@
 //! unsupported-flag path (as those byte-altering actions are unimplemented); an
 //! invalid value there is fatal (128) at startup, before the patch is opened and
 //! ahead of any `--whitespace` on the command line, matching git's config parse
-//! order. `apply.ignoreWhitespace` is not read: the `--ignore-whitespace`
-//! machinery it would default is itself unimplemented.
+//! order. `apply.ignoreWhitespace` is read straight after it, as git does: `change`
+//! turns the relaxed match on, `no`/`false`/`never`/`none` off, and any other value
+//! is the same startup fatal (`unrecognized whitespace ignore option '<v>'`, 128).
 //!
 //! `-q`/`--quiet` silences every `error:` diagnostic, matching git, where they
 //! all go through `error()`; exit codes are unaffected, and `fatal:` messages and
@@ -161,7 +177,8 @@ const PORTED: &str = "-p<n>, -R/--reverse, --check, --numstat, --stat, --summary
                       --index, --cached, -3/--3way, --ours, --theirs, --union, \
                       --exclude, --include, -v/--verbose, --reject, --binary, \
                       -q/--quiet, --whitespace=warn|nowarn, --recount, \
-                      --directory=<root>";
+                      --directory=<root>, --ignore-whitespace, \
+                      --ignore-space-change";
 
 /// git's `apply` usage block, printed after `unknown option`/`unknown switch` on
 /// stderr with exit 129 (`parse-options`' `PARSE_OPT_ERROR`).
@@ -214,7 +231,6 @@ const USAGE: &str = r"usage: git apply [<options>] [<patch>...]
 const R_INDEX: &str = "index mutation is not implemented";
 const R_CONTEXT: &str = "context reduction is not implemented";
 const R_WS: &str = "whitespace fixing is not implemented";
-const R_IGNORE_WS: &str = "whitespace-insensitive matching is not implemented";
 const R_EOF: &str = "EOF-newline fudging is not implemented";
 const R_ANCESTOR: &str = "building a fake ancestor index is not implemented";
 
@@ -275,6 +291,9 @@ struct Opts {
     /// itself. `fix`/`strip` never reach here — they are deferred as unsupported.
     ws: WsAction,
     strip: usize,               // -p<n>: leading path components to drop (default 1)
+    /// `state->p_value_known`: `-p<n>` appeared, so a traditional patch may not
+    /// infer its own value through `guess_p_value()`.
+    strip_explicit: bool,
     /// `-C<n>`: the fewest context lines a hunk may be reduced to when it does not
     /// apply as written. `None` is git's default of keeping every context line.
     p_context: Option<usize>,
@@ -285,6 +304,10 @@ struct Opts {
     summary: bool,              // --summary: create/delete/rename/mode-change lines
     nul: bool,                  // -z: NUL-terminate --numstat records
     unidiff_zero: bool,         // --unidiff-zero: relax the begin/end anchoring
+    /// `state->ws_ignore_action == ignore_ws_change`, set by
+    /// `--ignore-whitespace`/`--ignore-space-change` and `apply.ignoreWhitespace`:
+    /// context is matched with `fuzzy_matchlines()` instead of byte equality.
+    ignore_ws: bool,
     allow_empty: bool,          // --allow-empty: an input with no patches is not an error
     no_add: bool,               // --no-add: apply context/deletions, drop additions
     verbose: bool,              // -v/--verbose: Checking/Applied progress on stderr
@@ -319,6 +342,7 @@ impl Default for Opts {
             ws: WsAction::Warn,
             p_context: None,
             strip: 1,
+            strip_explicit: false,
             reverse: false,
             check: false,
             numstat: false,
@@ -326,6 +350,7 @@ impl Default for Opts {
             summary: false,
             nul: false,
             unidiff_zero: false,
+            ignore_ws: false,
             allow_empty: false,
             no_add: false,
             verbose: false,
@@ -504,13 +529,9 @@ fn parse_opts(
                         mark(unhonoured, "inaccurate-eof", &a, R_EOF)
                     }
                 }
-                "ignore-space-change" | "ignore-whitespace" => {
-                    if neg {
-                        unmark(unhonoured, "ignore-whitespace");
-                    } else {
-                        mark(unhonoured, "ignore-whitespace", &a, R_IGNORE_WS)
-                    }
-                }
+                // Both spellings run `apply_option_parse_space_change()`
+                // (apply.c:5048), which is a plain on/off for `ws_ignore_action`.
+                "ignore-space-change" | "ignore-whitespace" => o.ignore_ws = !neg,
                 "build-fake-ancestor" => {
                     if neg {
                         unmark(unhonoured, "build-fake-ancestor");
@@ -559,7 +580,12 @@ fn parse_opts(
                         // git parses -p itself, so its rejection is `fatal:`/128,
                         // not parse-options' `error:`/129.
                         match v.parse::<usize>() {
-                            Ok(n) => o.strip = n,
+                            Ok(n) => {
+                                o.strip = n;
+                                // `state->p_value_known`: an explicit `-p` stops
+                                // `guess_p_value()` overriding it.
+                                o.strip_explicit = true;
+                            }
                             Err(_) => {
                                 eprintln!(
                                     "fatal: option -p expects a non-negative integer, got '{v}'"
@@ -586,6 +612,10 @@ fn parse_opts(
                 'v' => o.verbose = true,
                 'N' => mark(unhonoured, "intent-to-add", "-N", R_INDEX),
                 '3' => o.three_way = true,
+                // parse_options_step()'s `internal_help` check sits inside the
+                // short-option loop: `-h` answers on stdout at 129, without the
+                // `error:` line that precedes a rejection's copy of the block.
+                'h' => return Err(super::show_usage(USAGE)),
                 _ => {
                     eprintln!("error: unknown switch `{c}'");
                     eprint!("{USAGE}");
@@ -639,6 +669,19 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
                 }
             }
         }
+        // `apply.ignorewhitespace`, read straight after it (apply.c:132) and just
+        // as fatal when the value is neither the off-spelling nor `change`.
+        if let Some(v) = repo.config_snapshot().string("apply.ignorewhitespace") {
+            let v = v.to_str_lossy();
+            match v.as_ref() {
+                "no" | "false" | "never" | "none" => o.ignore_ws = false,
+                "change" => o.ignore_ws = true,
+                _ => {
+                    eprintln!("error: unrecognized whitespace ignore option '{v}'");
+                    return Ok(ExitCode::from(128));
+                }
+            }
+        }
     }
 
     if let Err(code) = parse_opts(args, &mut o, &mut sources, &mut unhonoured) {
@@ -662,6 +705,29 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
         let flag = if o.index { "--index" } else { "--cached" };
         eprintln!("error: '{flag}' outside a repository");
         return Ok(ExitCode::from(128));
+    }
+
+    // `setup_git_directory()` leaves every `RUN_SETUP` builtin standing at the top
+    // of the worktree and hands it the directory it was invoked from as `prefix`
+    // (with a trailing slash). apply.c then uses that prefix in three places, all
+    // reproduced below: the patch-file operands are resolved through it
+    // (apply.c's `prefix_filename(state->prefix, arg)` in `apply_all_patches`),
+    // a traditional patch's names are prefixed by it ([`prefix_patch`]), and
+    // `use_patch()` drops every path that does not live under it.
+    let prefix = worktree_prefix()?;
+    // `state->root`: `--directory=<root>` with `strbuf_complete(&root, '/')`.
+    let apply_root = match &o.directory {
+        Some(r) if !r.is_empty() => {
+            if r.ends_with('/') { r.clone() } else { format!("{r}/") }
+        }
+        _ => String::new(),
+    };
+    if !prefix.is_empty() {
+        for src in &mut sources {
+            if src != "-" && !std::path::Path::new(src.as_str()).is_absolute() {
+                *src = format!("{prefix}{src}");
+            }
+        }
     }
 
     // ---- read the patch text ------------------------------------------------
@@ -698,14 +764,29 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
     }
 
     let spans = InputSpans { spans };
-    let mut patches = match parse_patches(&split_lines(&buf), o.strip, o.recount, &spans) {
+    let mut patches = match parse_patches(
+        &split_lines(&buf),
+        o.strip,
+        o.strip_explicit,
+        &prefix,
+        &apply_root,
+        o.recount,
+        &spans,
+    ) {
         Ok(p) => p,
         // apply.c reports a corrupt fragment through `error()` and unwinds to
         // `git apply`'s exit 128, rather than dying with the crate's usual
         // `zvcs: apply: …` prefix and exit 1.
         Err(e) => {
-            let corrupt = e.downcast::<CorruptPatch>()?;
-            err(o.quiet, &format!("error: {corrupt}"));
+            let e = match e.downcast::<CorruptPatch>() {
+                Ok(corrupt) => {
+                    err(o.quiet, &format!("error: {corrupt}"));
+                    return Ok(ExitCode::from(128));
+                }
+                Err(e) => e,
+            };
+            let header = e.downcast::<HeaderError>()?;
+            err(o.quiet, &format!("error: {header}"));
             return Ok(ExitCode::from(128));
         }
     };
@@ -731,17 +812,26 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
             prefix_names(p, root)?;
         }
     }
+    // `prefix_patch()` (apply.c:2191), which `parse_chunk()` runs on every patch as
+    // it is parsed: a traditional diff's names were written relative to the
+    // invocation directory, so they gain the prefix. A `diff --git` patch is already
+    // root-relative and is left alone.
+    if !prefix.is_empty() {
+        for p in &mut patches {
+            prefix_patch(p, &prefix);
+        }
+    }
     if o.reverse {
         for p in &mut patches {
             p.reverse();
         }
     }
 
-    // --include/--exclude: keep only the patches whose (post-strip, post-prefix)
-    // name the rule list admits (git's `use_patch`). An empty result is not an
-    // error — the input still held valid patches.
-    if !o.limits.is_empty() {
-        patches.retain(|p| use_patch(p, &o.limits, o.has_include));
+    // --include/--exclude and the invocation prefix: keep only the patches whose
+    // (post-strip, post-prefix) name the rule list admits (git's `use_patch`). An
+    // empty result is not an error — the input still held valid patches.
+    if !o.limits.is_empty() || !prefix.is_empty() {
+        patches.retain(|p| use_patch(p, &prefix, &o.limits, o.has_include));
     }
 
     // `check_whitespace()`: every added line is checked before anything is written,
@@ -818,17 +908,6 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
     }
     if !o.apply && !o.check {
         return Ok(ExitCode::SUCCESS);
-    }
-
-    // git reinterprets patch paths against the repo prefix when invoked below the
-    // worktree root; rather than silently applying to the wrong paths, refuse.
-    if let Ok(repo) = gix::discover(".") {
-        if let Some(workdir) = repo.workdir() {
-            let here = std::env::current_dir()?.canonicalize()?;
-            if workdir.canonicalize()? != here {
-                bail!("running apply from a subdirectory of the worktree is not supported");
-            }
-        }
     }
 
     // The reject path applies each file independently and writes *.rej; it does not
@@ -986,7 +1065,9 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
                     continue;
                 }
             }
-        } else if let Err(idx) = apply_hunks(&mut image, p, o.unidiff_zero, o.no_add, o.p_context) {
+        } else if let Err(idx) =
+            apply_hunks(&mut image, p, o.unidiff_zero, o.no_add, o.p_context, o.ignore_ws)
+        {
             let h = &p.hunks[idx];
             if o.verbose {
                 let pre: Vec<u8> = h.pre.concat();
@@ -1251,7 +1332,7 @@ fn try_threeway(
         .into_iter()
         .map(<[u8]>::to_vec)
         .collect();
-    if apply_hunks(&mut post, p, o.unidiff_zero, o.no_add, o.p_context).is_err() {
+    if apply_hunks(&mut post, p, o.unidiff_zero, o.no_add, o.p_context, o.ignore_ws).is_err() {
         return Ok(ThreeWayOutcome::Fallback(None));
     }
     let post_bytes: Vec<u8> = post.concat();
@@ -1466,6 +1547,12 @@ struct Patch {
     index_old: Option<String>,
     index_new: Option<String>,
     score: u32, // `similarity index N%`, for the summary's rename line
+    /// `patch->is_toplevel_relative`: set by `parse_git_header()` (apply.c:1457) for
+    /// a `diff --git` patch, whose names are already relative to the worktree root.
+    /// A traditional `---`/`+++` diff leaves it clear (apply.c:1596) and its names
+    /// are read as relative to the directory `git apply` was invoked from, so
+    /// [`prefix_patch`] prepends the prefix to them.
+    is_toplevel_relative: bool,
     hunks: Vec<Hunk>,
     added: usize,
     deleted: usize,
@@ -1499,6 +1586,7 @@ impl Patch {
         std::mem::swap(&mut self.old_mode, &mut self.new_mode);
         for h in &mut self.hunks {
             std::mem::swap(&mut h.pre, &mut h.post);
+            std::mem::swap(&mut h.pre_common, &mut h.post_common);
             std::mem::swap(&mut h.old_pos, &mut h.new_pos);
         }
     }
@@ -1513,7 +1601,14 @@ struct Hunk {
     old_pos: usize,
     new_pos: usize,
     pre: Vec<Vec<u8>>,
+    /// `LINE_COMMON` on the pre-image: which of `pre`'s lines are context rather
+    /// than deletions, so a relaxed match can pair them with the post-image's
+    /// context lines the way `update_pre_post_images()` does.
+    pre_common: Vec<bool>,
     post: Vec<Vec<u8>>,
+    /// `LINE_COMMON` on the post-image: which of `post`'s lines are context rather
+    /// than additions.
+    post_common: Vec<bool>,
     /// `(index into the concatenated input, index into `post`)` for every added line,
     /// which is what the whitespace check reports against (`<patch>:<line>: …`).
     added_at: Vec<(usize, usize)>,
@@ -1539,25 +1634,73 @@ fn apply_hunks(
     // `-C<n>`: the fewest context lines a hunk may be reduced to before it is called
     // a failure. `None` keeps every context line, which is git's default.
     p_context: Option<usize>,
+    // `state->ws_ignore_action == ignore_ws_change`.
+    ignore_ws: bool,
 ) -> Result<(), usize> {
     for (idx, h) in p.hunks.iter().enumerate() {
-        if let Some(at) = place_hunk(image.as_slice(), h, unidiff_zero) {
-            let repl = if no_add { &h.context } else { &h.post };
-            image.splice(at..at + h.pre.len(), repl.iter().cloned());
+        if let Some(at) = place_hunk(image.as_slice(), h, unidiff_zero, ignore_ws) {
+            let repl = replacement(image.as_slice(), at, h, no_add, ignore_ws);
+            image.splice(at..at + h.pre.len(), repl);
             continue;
         }
         // `apply_one_fragment()`'s reduction loop: drop a context line from whichever
         // end has more of them and try again, down to the `-C<n>` floor.
         if let Some(floor) = p_context {
-            if let Some((at, trimmed)) = place_reduced(image.as_slice(), h, unidiff_zero, floor) {
-                let repl = if no_add { &trimmed.context } else { &trimmed.post };
-                image.splice(at..at + trimmed.pre.len(), repl.iter().cloned());
+            if let Some((at, trimmed)) =
+                place_reduced(image.as_slice(), h, unidiff_zero, floor, ignore_ws)
+            {
+                let repl = replacement(image.as_slice(), at, &trimmed, no_add, ignore_ws);
+                image.splice(at..at + trimmed.pre.len(), repl);
                 continue;
             }
         }
         return Err(idx);
     }
     Ok(())
+}
+
+/// The lines that replace the pre-image at `at`.
+///
+/// `update_pre_post_images()` (apply.c:2433), which `line_by_line_fuzzy_match()`
+/// runs once a hunk has matched only under relaxed whitespace: the pre-image is
+/// replaced by the bytes actually in the file, and every context line of the
+/// post-image is re-taken from its counterpart there, in order. So a context line
+/// keeps the file's whitespace rather than the patch's — only added lines come out
+/// of the patch. When the two matched byte for byte this copies each line onto
+/// itself, which is why it needs no separate "was the match fuzzy" flag.
+fn replacement(
+    image: &[Vec<u8>],
+    at: usize,
+    h: &Hunk,
+    no_add: bool,
+    ignore_ws: bool,
+) -> Vec<Vec<u8>> {
+    let source = if no_add { &h.context } else { &h.post };
+    if !ignore_ws {
+        return source.clone();
+    }
+    // The pre-image lines that are context, which the post-image's context lines
+    // pair with one for one and in order (git's `LINE_COMMON` walk).
+    let mut common = h
+        .pre_common
+        .iter()
+        .enumerate()
+        .filter(|(_, &c)| c)
+        .map(|(j, _)| j);
+    let mut out = Vec::with_capacity(source.len());
+    for (k, line) in source.iter().enumerate() {
+        // Under `--no-add` the replacement is the context lines alone, so every
+        // one of them is common.
+        if !no_add && !h.post_common.get(k).copied().unwrap_or(false) {
+            out.push(line.clone());
+            continue;
+        }
+        match common.next().and_then(|j| image.get(at + j)) {
+            Some(file_line) => out.push(file_line.clone()),
+            None => out.push(line.clone()),
+        }
+    }
+    out
 }
 
 /// Trim context off `h` one line at a time — the longer end first, as git does — and
@@ -1567,6 +1710,7 @@ fn place_reduced(
     h: &Hunk,
     unidiff_zero: bool,
     floor: usize,
+    ignore_ws: bool,
 ) -> Option<(usize, Hunk)> {
     let mut cur = h.clone();
     while cur.leading > floor || cur.trailing > floor {
@@ -1574,7 +1718,9 @@ fn place_reduced(
         if from_front {
             cur.leading -= 1;
             cur.pre.remove(0);
+            cur.pre_common.remove(0);
             cur.post.remove(0);
+            cur.post_common.remove(0);
             if !cur.context.is_empty() {
                 cur.context.remove(0);
             }
@@ -1584,10 +1730,12 @@ fn place_reduced(
         } else {
             cur.trailing -= 1;
             cur.pre.pop();
+            cur.pre_common.pop();
             cur.post.pop();
+            cur.post_common.pop();
             cur.context.pop();
         }
-        if let Some(at) = place_hunk(image, &cur, unidiff_zero) {
+        if let Some(at) = place_hunk(image, &cur, unidiff_zero, ignore_ws) {
             return Some((at, cur));
         }
     }
@@ -1595,7 +1743,7 @@ fn place_reduced(
 }
 
 /// Where hunk `h`'s pre-image lands in `image`, or `None` if it does not apply.
-fn place_hunk(image: &[Vec<u8>], h: &Hunk, unidiff_zero: bool) -> Option<usize> {
+fn place_hunk(image: &[Vec<u8>], h: &Hunk, unidiff_zero: bool, ignore_ws: bool) -> Option<usize> {
     // "a hunk that is (oldpos <= 1) with or without leading context must match at
     // the beginning"; "a hunk without trailing lines must match at the end" —
     // both defeated by --unidiff-zero, which makes the absence of context
@@ -1603,7 +1751,7 @@ fn place_hunk(image: &[Vec<u8>], h: &Hunk, unidiff_zero: bool) -> Option<usize> 
     let match_beginning = h.old_pos == 0 || (h.old_pos == 1 && !unidiff_zero);
     let match_end = !unidiff_zero && h.trailing == 0;
     let start = h.new_pos.saturating_sub(1);
-    find_pos(image, &h.pre, start, match_beginning, match_end)
+    find_pos(image, &h.pre, start, match_beginning, match_end, ignore_ws)
 }
 
 /// Locate `pre` in `image`, starting at `line` and walking outward one line at a
@@ -1615,6 +1763,7 @@ fn find_pos(
     mut line: usize,
     match_beginning: bool,
     match_end: bool,
+    ignore_ws: bool,
 ) -> Option<usize> {
     if match_beginning {
         line = 0;
@@ -1628,7 +1777,7 @@ fn find_pos(
     let (mut backwards, mut forwards, mut current) = (line, line, line);
     let mut i: usize = 0;
     loop {
-        if matches_at(image, pre, current, match_beginning, match_end) {
+        if matches_at(image, pre, current, match_beginning, match_end, ignore_ws) {
             return Some(current);
         }
         // Pick the next candidate: odd steps go backwards, even steps forwards,
@@ -1665,6 +1814,7 @@ fn matches_at(
     at: usize,
     match_beginning: bool,
     match_end: bool,
+    ignore_ws: bool,
 ) -> bool {
     if at + pre.len() > image.len() {
         return false;
@@ -1675,7 +1825,60 @@ fn matches_at(
     if match_beginning && at != 0 {
         return false;
     }
-    image[at..at + pre.len()] == *pre
+    if image[at..at + pre.len()] == *pre {
+        return true;
+    }
+    // `match_fragment()` tries the byte-exact comparison first and only then, under
+    // `--ignore-whitespace`, `line_by_line_fuzzy_match()`. Its trailing check that
+    // whatever of the pre-image runs past EOF is blank cannot fire here: the
+    // pre-image is only allowed to overrun the file under `--whitespace=fix`
+    // (`correct_ws_error`), and the length test above has already ruled it out.
+    ignore_ws
+        && image[at..at + pre.len()]
+            .iter()
+            .zip(pre)
+            .all(|(a, b)| fuzzy_matchlines(a, b))
+}
+
+/// C's `isspace()` in the C locale, which is what apply.c compares against — one
+/// character wider than Rust's `is_ascii_whitespace` (vertical tab).
+fn c_space(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r')
+}
+
+/// `fuzzy_matchlines()` (apply.c:2500): the two lines are equal once every run of
+/// whitespace is collapsed — but a run may not vanish, so `a b` still does not
+/// match `ab`. Line endings are ignored on both sides.
+fn fuzzy_matchlines(s1: &[u8], s2: &[u8]) -> bool {
+    let trim = |s: &[u8]| {
+        let mut end = s.len();
+        while end > 0 && (s[end - 1] == b'\r' || s[end - 1] == b'\n') {
+            end -= 1;
+        }
+        end
+    };
+    let (e1, e2) = (trim(s1), trim(s2));
+    let (mut i, mut j) = (0, 0);
+    while i < e1 && j < e2 {
+        if c_space(s1[i]) {
+            if !c_space(s2[j]) {
+                return false;
+            }
+            while i < e1 && c_space(s1[i]) {
+                i += 1;
+            }
+            while j < e2 && c_space(s2[j]) {
+                j += 1;
+            }
+        } else if s1[i] != s2[j] {
+            return false;
+        } else {
+            i += 1;
+            j += 1;
+        }
+    }
+    // "If we reached the end on one side only, lines don't match."
+    i == e1 && j == e2
 }
 
 // ---------------------------------------------------------------------------
@@ -1699,6 +1902,19 @@ impl std::fmt::Display for CorruptPatch {
 }
 
 impl std::error::Error for CorruptPatch {}
+
+/// A header diagnostic that already reads the way git prints it, reported through
+/// `error()` and unwound to exit 128 exactly as a corrupt fragment is.
+#[derive(Debug)]
+struct HeaderError(String);
+
+impl std::fmt::Display for HeaderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for HeaderError {}
 
 /// `apply_state.patch_input_file` + `apply_state.linenr`.
 ///
@@ -1772,10 +1988,22 @@ fn txt(line: &[u8]) -> String {
 fn parse_patches(
     lines: &[&[u8]],
     strip: usize,
+    // `state->p_value_known`: `-p<n>` was given, so no traditional patch may infer
+    // its own value.
+    strip_explicit: bool,
+    // The invocation prefix, which `guess_p_value()` matches names against, and
+    // `--directory=<root>` (slash-terminated), which it prepends first.
+    prefix: &str,
+    root: &str,
     recount: bool,
     spans: &InputSpans,
 ) -> Result<Vec<Patch>> {
     let mut out = Vec::new();
+    // `state->p_value` / `state->p_value_known`: the running pair
+    // `parse_traditional_patch()` fixes on the first traditional patch whose two
+    // name lines agree, and every later patch in the same input then reuses.
+    let mut strip = strip;
+    let mut known = strip_explicit;
     let mut i = 0;
     while i < lines.len() {
         let l = txt(lines[i]);
@@ -1786,6 +2014,20 @@ fn parse_patches(
         } else if l.starts_with("--- ")
             && lines.get(i + 1).map(|n| txt(n).starts_with("+++ ")) == Some(true)
         {
+            if !known {
+                // `parse_traditional_patch()` (apply-lib.c:865): guess from both
+                // sides, let a `/dev/null` side defer to the other, and adopt the
+                // value only when the two agree.
+                let p = guess_p_value(&txt(lines[i])[4..], root, prefix);
+                let q = guess_p_value(&txt(lines[i + 1])[4..], root, prefix);
+                let p = p.or(q);
+                if let (Some(p), Some(q)) = (p, q) {
+                    if p == q {
+                        strip = p;
+                        known = true;
+                    }
+                }
+            }
             let (p, next) = parse_one(lines, i, strip, false, recount, spans)?;
             i = next;
             out.push(p);
@@ -1820,11 +2062,19 @@ fn parse_one(
         index_old: None,
         index_new: None,
         score: 0,
+        is_toplevel_relative: git_style,
         hunks: Vec::new(),
         added: 0,
         deleted: 0,
     };
     let mut i = start;
+    // The `--- `/`+++ ` name lines of a traditional patch, kept raw: git resolves
+    // the two together in `parse_traditional_patch()` rather than one at a time,
+    // so the pair is only usable once both have been read.
+    let (mut trad_old, mut trad_new) = (None, None);
+    // `parse_chunk()`'s handover to `parse_binary()`: `(line the header parse
+    // stopped at, first line after the binary section)`.
+    let mut binary_stop: Option<(usize, usize)> = None;
 
     if git_style {
         let header = txt(lines[i]);
@@ -1851,10 +2101,10 @@ fn parse_one(
             p.old_mode = Some(octal(rest)?);
         } else if let Some(rest) = l.strip_prefix("rename from ") {
             p.is_rename = true;
-            p.old_name = Some(strip_path(&unquote(rest)?, strip.saturating_sub(1))?);
+            p.old_name = strip_path(&unquote(rest)?, strip.saturating_sub(1))?;
         } else if let Some(rest) = l.strip_prefix("rename to ") {
             p.is_rename = true;
-            p.new_name = Some(strip_path(&unquote(rest)?, strip.saturating_sub(1))?);
+            p.new_name = strip_path(&unquote(rest)?, strip.saturating_sub(1))?;
         } else if l.starts_with("copy from ") || l.starts_with("copy to ") {
             anyhow::bail!("copy patches are not implemented (ported: {PORTED})");
         } else if let Some(rest) = l.strip_prefix("similarity index ") {
@@ -1878,11 +2128,20 @@ fn parse_one(
                 p.index_new = Some(new.to_string());
             }
         } else if let Some(rest) = l.strip_prefix("--- ") {
-            p.old_name = header_path(rest, strip)?;
+            if git_style {
+                p.old_name = header_path(rest, strip)?;
+            } else {
+                trad_old = Some(rest.to_string());
+            }
         } else if let Some(rest) = l.strip_prefix("+++ ") {
-            p.new_name = header_path(rest, strip)?;
+            if git_style {
+                p.new_name = header_path(rest, strip)?;
+            } else {
+                trad_new = Some(rest.to_string());
+            }
         } else if l.starts_with("GIT binary patch") || l.starts_with("Binary files ") {
             p.binary = true;
+            let stop = i;
             i += 1;
             // `parse_binary()`: the forward payload, then the reverse one when the
             // patch was written with `--binary`. Anything else ends the section.
@@ -1902,11 +2161,25 @@ fn parse_one(
                 }
                 i += 1;
             }
-            return Ok((normalise(p)?, i));
+            binary_stop = Some((stop, i));
+            break;
         } else {
             break;
         }
         i += 1;
+    }
+
+    // `parse_git_diff_header()`'s `done:` (apply.c:1425), which every exit from the
+    // header table reaches: the line the parse stopped at is the one both
+    // filename diagnostics report.
+    let hdr_stop = binary_stop.map_or(i, |(stop, _)| stop);
+    if !git_style {
+        resolve_traditional(&mut p, trad_old.as_deref(), trad_new.as_deref(), strip)?;
+    }
+    require_names(&p, git_style, strip, spans, if git_style { hdr_stop } else { start })?;
+
+    if let Some((_, next)) = binary_stop {
+        return Ok((normalise(p)?, next));
     }
 
     while i < lines.len() && txt(lines[i]).starts_with("@@ ") {
@@ -1918,6 +2191,77 @@ fn parse_one(
     }
 
     Ok((normalise(p)?, i))
+}
+
+/// `parse_traditional_patch()` (apply.c:856): the two name lines are resolved
+/// together, not one at a time. A `/dev/null` on either side makes the patch a
+/// creation or a deletion and the other line supplies the name; otherwise the
+/// `+++` line is read with the `---` line's name as `find_name_common()`'s `def`,
+/// and the single name that comes out is used for *both* sides. That is what lets
+/// `-p<n>` over-strip one side without failing, and what makes `--- a/f.txt.orig`
+/// / `+++ a/f.txt` a patch to `f.txt` rather than a rename.
+fn resolve_traditional(
+    p: &mut Patch,
+    first: Option<&str>,
+    second: Option<&str>,
+    strip: usize,
+) -> Result<()> {
+    let (Some(first), Some(second)) = (first, second) else {
+        return Ok(());
+    };
+    if is_dev_null(first.split('\t').next().unwrap_or("")) {
+        p.is_new = true;
+        p.new_name = header_path(second, strip)?;
+    } else if is_dev_null(second.split('\t').next().unwrap_or("")) {
+        p.is_delete = true;
+        p.old_name = header_path(first, strip)?;
+    } else {
+        let def = header_path(first, strip)?;
+        let name = match (header_path(second, strip)?, def) {
+            // "Generally we prefer the shorter name, especially if the other one
+            // is just a variation of that with something else tacked on to the
+            // end (ie "file.orig" or "file~")."
+            (Some(name), Some(def)) if def.len() < name.len() && name.starts_with(&def) => {
+                Some(def)
+            }
+            (Some(name), _) => Some(name),
+            // `find_name_common()` falls back to `def` when the second line
+            // yields nothing.
+            (None, def) => def,
+        };
+        p.old_name = name.clone();
+        p.new_name = name;
+    }
+    Ok(())
+}
+
+/// The two "this header named no file" diagnostics: `parse_git_diff_header()`'s
+/// `done:` block (apply.c:1425) for a `diff --git` header, and
+/// `parse_traditional_patch()`'s tail (apply.c:904) for a `---`/`+++` pair. Both
+/// carry `state->patch_input_file` and the line the parse was sitting on — the
+/// header's last line for a git patch, the `---` line for a traditional one.
+fn require_names(
+    p: &Patch,
+    git_style: bool,
+    strip: usize,
+    spans: &InputSpans,
+    idx: usize,
+) -> Result<()> {
+    if p.old_name.is_some() || p.new_name.is_some() {
+        return Ok(());
+    }
+    let (file, line) = spans.location(idx);
+    let msg = if git_style {
+        // `Q_()`: singular for one component only.
+        let unit = if strip == 1 { "component" } else { "components" };
+        format!(
+            "git diff header lacks filename information when removing \
+             {strip} leading pathname {unit} at {file}:{line}"
+        )
+    } else {
+        format!("unable to find filename in patch at {file}:{line}")
+    };
+    Err(anyhow::Error::new(HeaderError(msg)))
 }
 
 /// Reconcile the creation/deletion flags with the two names, so that exactly one
@@ -1962,7 +2306,9 @@ fn parse_hunk(
         old_pos,
         new_pos,
         pre: Vec::new(),
+        pre_common: Vec::new(),
         post: Vec::new(),
+        post_common: Vec::new(),
         added_at: Vec::new(),
         context: Vec::new(),
         raw: Vec::new(),
@@ -2006,7 +2352,9 @@ fn parse_hunk(
                     h.leading += 1;
                 }
                 h.pre.push(body.to_vec());
+                h.pre_common.push(true);
                 h.post.push(body.to_vec());
+                h.post_common.push(true);
                 h.context.push(body.to_vec());
                 h.trailing += 1;
                 last = Side::Context;
@@ -2015,6 +2363,7 @@ fn parse_hunk(
             }
             b'-' => {
                 h.pre.push(body.to_vec());
+                h.pre_common.push(false);
                 h.trailing = 0;
                 deleted += 1;
                 last = Side::Pre;
@@ -2023,6 +2372,7 @@ fn parse_hunk(
             _ => {
                 h.added_at.push((i, h.post.len()));
                 h.post.push(body.to_vec());
+                h.post_common.push(false);
                 h.trailing = 0;
                 added += 1;
                 last = Side::Post;
@@ -2097,10 +2447,55 @@ fn one_range(s: &str) -> Option<(usize, usize)> {
 /// a timestamp there), `/dev/null` meaning "this side does not exist".
 fn header_path(rest: &str, strip: usize) -> Result<Option<String>> {
     let name = rest.split('\t').next().unwrap_or("");
-    if name == "/dev/null" {
+    if is_dev_null(name) {
         return Ok(None);
     }
-    Ok(Some(strip_path(&unquote(name)?, strip)?))
+    strip_path(&unquote(name)?, strip)
+}
+
+/// `is_dev_null()` (apply.c:493): the name is `/dev/null`, optionally followed by
+/// whitespace (a traditional diff's timestamp).
+fn is_dev_null(name: &str) -> bool {
+    match name.strip_prefix("/dev/null") {
+        Some(rest) => rest.is_empty() || rest.starts_with(char::is_whitespace),
+        None => false,
+    }
+}
+
+/// `guess_p_value()` (apply-lib.c:747): the `-p<n>` a *traditional* (non-`diff
+/// --git`) patch implies, or `None` when the name says nothing.
+///
+/// `parse_traditional_patch()` runs it on both name lines of the first such patch
+/// and, when the two agree, fixes `p_value` for the rest of the input. This is what
+/// lets `diff -u old new > p` apply with no `-p0`: a name with no slash at all can
+/// only be meant whole, so the answer is 0.
+///
+/// `nameline` is the text after `--- `/`+++ `, and the name is read with `p_value`
+/// 0 — the whole thing, timestamp trimmed and unquoted, with `--directory=<root>`
+/// already in front of it, because `find_name_common()` prepends `state->root`
+/// before the guess ever looks for a slash. That is why `--directory=X` changes the
+/// answer for a one-component name: `X/s.txt` has a directory part and `s.txt`
+/// does not.
+fn guess_p_value(nameline: &str, root: &str, prefix: &str) -> Option<usize> {
+    let name = header_path(nameline, 0).ok().flatten()?;
+    let name = if root.is_empty() { name } else { format!("{root}{name}") };
+    let Some(slash) = name.find('/') else {
+        // No directory part: the name is already relative to the worktree root.
+        return Some(0);
+    };
+    if prefix.is_empty() {
+        return None;
+    }
+    // "Does it begin with `a/$our-prefix` and such?  Then this is very likely to
+    // apply to our directory."
+    let slashes = prefix.matches('/').count();
+    if name.starts_with(prefix) {
+        return Some(slashes);
+    }
+    if name[slash + 1..].starts_with(prefix) {
+        return Some(slashes + 1);
+    }
+    None
 }
 
 /// Both names off a `diff --git a/x b/y` line.
@@ -2115,14 +2510,18 @@ fn git_header_names(rest: &str, strip: usize) -> Result<Option<(String, String)>
     #[allow(clippy::manual_strip)]
     if rest.starts_with('"') {
         if let Some(end) = rest[1..].find('"').map(|i| i + 1) {
-            let a = strip_path(&unquote(&rest[..=end])?, strip)?;
-            let b = strip_path(&unquote(rest[end + 2..].trim())?, strip)?;
+            let (Some(a), Some(b)) = (
+                strip_path(&unquote(&rest[..=end])?, strip)?,
+                strip_path(&unquote(rest[end + 2..].trim())?, strip)?,
+            ) else {
+                return Ok(None);
+            };
             return Ok(Some((a, b)));
         }
         return Ok(None);
     }
     for (idx, _) in rest.match_indices(' ') {
-        let (Ok(a), Ok(b)) = (
+        let (Ok(Some(a)), Ok(Some(b))) = (
             strip_path(&rest.as_bytes()[..idx], strip),
             strip_path(&rest.as_bytes()[idx + 1..], strip),
         ) else {
@@ -2136,20 +2535,26 @@ fn git_header_names(rest: &str, strip: usize) -> Result<Option<(String, String)>
 }
 
 /// Drop `n` leading slash-separated components, as `-p<n>` asks.
-fn strip_path(name: &[u8], n: usize) -> Result<String> {
+///
+/// `None` is `find_name_common()` (apply.c:654) returning NULL: the name ran out
+/// of components before `-p<n>` was satisfied (`start` never set), or nothing was
+/// left after them (`len == 0`). git does not treat that as an error where it
+/// happens — the name is simply absent, and whoever wanted one says so later,
+/// which is why the diagnostic can name the header's line.
+fn strip_path(name: &[u8], n: usize) -> Result<Option<String>> {
     let mut s: &[u8] = name;
     for _ in 0..n {
         match s.iter().position(|&b| b == b'/') {
             Some(i) => s = &s[i + 1..],
-            None => crate::git_fatal!(
-                "removing {n} leading path components from {:?} would leave nothing",
-                String::from_utf8_lossy(name)
-            ),
+            None => return Ok(None),
         }
+    }
+    if s.is_empty() {
+        return Ok(None);
     }
     let out = String::from_utf8(s.to_vec())
         .map_err(|_| anyhow::anyhow!("non-UTF-8 paths in patches are not supported"))?;
-    check_path(out)
+    Ok(Some(check_path(out)?))
 }
 
 /// Reject anything that would escape the working tree. `--unsafe-paths`, which
@@ -2174,6 +2579,49 @@ fn prefix_names(p: &mut Patch, root: &str) -> Result<()> {
         *n = check_path(joined)?;
     }
     Ok(())
+}
+
+/// `prefix_patch()` (apply.c:2191): a patch that is not already root-relative has
+/// the invocation prefix prepended to both of its names, exactly as `prefix_one()`
+/// does. A `/dev/null` side is `None` here and stays that way.
+fn prefix_patch(p: &mut Patch, prefix: &str) {
+    if p.is_toplevel_relative {
+        return;
+    }
+    for n in [&mut p.old_name, &mut p.new_name].into_iter().flatten() {
+        *n = format!("{prefix}{n}");
+    }
+}
+
+/// `setup_git_directory()`'s two results, in one step: chdir to the top of the
+/// worktree and return the slash-terminated path of the directory the command was
+/// invoked from, relative to that top. Empty when already at the top, when the
+/// repository is bare, or when there is no repository at all — the three cases where
+/// git leaves `state->prefix` NULL and every path in the patch is taken as given.
+fn worktree_prefix() -> Result<String> {
+    let Ok(repo) = gix::discover(".") else {
+        return Ok(String::new());
+    };
+    let Some(workdir) = repo.workdir() else {
+        return Ok(String::new());
+    };
+    let root = workdir.canonicalize()?;
+    let here = std::env::current_dir()?.canonicalize()?;
+    let Ok(rel) = here.strip_prefix(&root) else {
+        return Ok(String::new());
+    };
+    if rel.as_os_str().is_empty() {
+        return Ok(String::new());
+    }
+    // Every path this port compares the prefix against is a slash-joined patch
+    // header name, so the prefix is built the same way rather than through the
+    // platform separator.
+    let mut parts: Vec<String> = Vec::new();
+    for c in rel.components() {
+        parts.push(c.as_os_str().to_string_lossy().into_owned());
+    }
+    std::env::set_current_dir(&root)?;
+    Ok(format!("{}/", parts.join("/")))
 }
 
 /// Undo git's C-style quoting when a header path is wrapped in double quotes.
@@ -2453,8 +2901,16 @@ fn rename_line(p: &Patch) -> String {
 /// Whether a patch survives the `--include`/`--exclude` rule list: the first rule
 /// whose glob matches the patch's post-image name decides (its include/exclude
 /// sense); with no match, a path is kept unless any `--include` rule exists.
-fn use_patch(p: &Patch, limits: &[(bool, String)], has_include: bool) -> bool {
+fn use_patch(p: &Patch, prefix: &str, limits: &[(bool, String)], has_include: bool) -> bool {
     let name = p.new_name.as_deref().or(p.old_name.as_deref()).unwrap_or("");
+    // "Paths outside are not touched regardless of `--include`" (apply.c:2218): the
+    // path must live strictly *below* the directory `git apply` was invoked from.
+    if !prefix.is_empty() {
+        match name.strip_prefix(prefix) {
+            Some(rest) if !rest.is_empty() => {}
+            _ => return false,
+        }
+    }
     for (is_include, pat) in limits {
         if wildmatch0(pat.as_bytes(), name.as_bytes()) {
             return *is_include;
@@ -2583,9 +3039,9 @@ fn reject_apply(patches: &[Patch], o: &Opts) -> Result<ExitCode> {
 
         let mut applied: Vec<bool> = Vec::with_capacity(p.hunks.len());
         for h in &p.hunks {
-            if let Some(at) = place_hunk(&image, h, o.unidiff_zero) {
-                let repl = if o.no_add { &h.context } else { &h.post };
-                image.splice(at..at + h.pre.len(), repl.iter().cloned());
+            if let Some(at) = place_hunk(&image, h, o.unidiff_zero, o.ignore_ws) {
+                let repl = replacement(&image, at, h, o.no_add, o.ignore_ws);
+                image.splice(at..at + h.pre.len(), repl);
                 applied.push(true);
             } else {
                 let pre: Vec<u8> = h.pre.concat();
@@ -3053,4 +3509,264 @@ fn ws_fix_supported(rule: u32) -> bool {
     const FIXABLE: u32 = WS_BLANK_AT_EOL | WS_BLANK_AT_EOF | WS_SPACE_BEFORE_TAB;
     // Ignore the low six bits, which carry the tab width rather than a rule.
     (rule & !0x3f) == FIXABLE
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn patch(name: &str, toplevel_relative: bool) -> Patch {
+        Patch {
+            old_name: Some(name.to_string()),
+            new_name: Some(name.to_string()),
+            old_mode: None,
+            new_mode: None,
+            is_new: false,
+            is_delete: false,
+            is_rename: false,
+            binary: false,
+            binary_forward: None,
+            binary_reverse: None,
+            index_old: None,
+            index_new: None,
+            score: 0,
+            is_toplevel_relative: toplevel_relative,
+            hunks: Vec::new(),
+            added: 0,
+            deleted: 0,
+        }
+    }
+
+    /// `use_patch()`'s prefix gate (apply.c:2219): run from `sub/`, only paths
+    /// strictly below `sub/` are touched. Verified against git 2.55.0 — `git apply`
+    /// from a subdirectory applies the in-tree half of a whole-tree patch and
+    /// silently skips the rest, exit 0.
+    #[test]
+    fn the_invocation_prefix_drops_paths_outside_it() {
+        let keep = patch("sub/s.txt", true);
+        let outside = patch("f.txt", true);
+        let sibling = patch("subsidiary/x.txt", true);
+        // The prefix directory itself has an empty remainder and is not a path.
+        let bare = patch("sub/", true);
+        assert!(use_patch(&keep, "sub/", &[], false));
+        assert!(!use_patch(&outside, "sub/", &[], false));
+        assert!(!use_patch(&sibling, "sub/", &[], false));
+        assert!(!use_patch(&bare, "sub/", &[], false));
+        // With no prefix (invoked at the top) every path is in scope.
+        assert!(use_patch(&outside, "", &[], false));
+    }
+
+    /// "Paths outside are not touched regardless of `--include`" — the prefix test
+    /// runs before the rule list, so an include naming an out-of-prefix path still
+    /// loses. Matching happens on the whole root-relative name, which is why
+    /// `--include=deep/*` from `sub/` matches nothing.
+    #[test]
+    fn the_prefix_outranks_an_explicit_include() {
+        let outside = patch("f.txt", true);
+        let inside = patch("sub/deep/t.txt", true);
+        let rules = vec![(true, "f.txt".to_string())];
+        assert!(!use_patch(&outside, "sub/", &rules, true));
+        let rules = vec![(true, "deep/*".to_string())];
+        assert!(!use_patch(&inside, "sub/", &rules, true));
+        let rules = vec![(true, "sub/deep/*".to_string())];
+        assert!(use_patch(&inside, "sub/", &rules, true));
+    }
+
+    /// `guess_p_value()` (apply-lib.c:747), the inference that lets a plain
+    /// `diff -u old new` patch apply with no `-p0`. Verified against git 2.55.0:
+    /// `git apply --stat` over `--- s.txt`/`+++ s.txt` prints ` s.txt | 2 +-` from
+    /// the worktree root, from a subdirectory, and outside a repository entirely.
+    #[test]
+    fn a_name_with_no_directory_part_infers_p0() {
+        assert_eq!(guess_p_value("s.txt", "", ""), Some(0));
+        assert_eq!(guess_p_value("s.txt", "", "sub/"), Some(0));
+        // A `/dev/null` side says nothing; the caller falls back to the other one.
+        assert_eq!(guess_p_value("/dev/null", "", ""), None);
+        // A trailing timestamp is not part of the name.
+        assert_eq!(guess_p_value("s.txt\t2005-04-07 22:13:13", "", ""), Some(0));
+    }
+
+    /// With a directory part the guess only speaks when the name embeds the
+    /// invocation prefix, so an ordinary `a/`-prefixed patch keeps the default
+    /// `-p1` — which is why nothing about existing patches changes.
+    #[test]
+    fn a_name_with_a_directory_part_needs_the_prefix_to_match() {
+        assert_eq!(guess_p_value("a/s.txt", "", ""), None);
+        assert_eq!(guess_p_value("a/s.txt", "", "sub/"), None);
+        // `sub/s.txt` from `sub/`: the name starts with the prefix, so strip its
+        // own depth (one slash → 0 components before it).
+        assert_eq!(guess_p_value("sub/s.txt", "", "sub/"), Some(1));
+        // `a/sub/s.txt` from `sub/`: the prefix begins after the first component.
+        assert_eq!(guess_p_value("a/sub/s.txt", "", "sub/"), Some(2));
+        // `--directory=X` is prepended before the slash test, so a one-component
+        // name stops looking like one and the guess declines.
+        assert_eq!(guess_p_value("s.txt", "X/", "sub/"), None);
+        assert_eq!(guess_p_value("s.txt", "X/", ""), None);
+    }
+
+    /// `prefix_patch()` (apply.c:2191): a `diff --git` patch is already relative to
+    /// the worktree root and keeps its names; a traditional `---`/`+++` diff was
+    /// written relative to the invocation directory and gains the prefix.
+    #[test]
+    fn only_a_traditional_patch_gains_the_prefix() {
+        let mut git_style = patch("s.txt", true);
+        prefix_patch(&mut git_style, "sub/");
+        assert_eq!(git_style.old_name.as_deref(), Some("s.txt"));
+        assert_eq!(git_style.new_name.as_deref(), Some("s.txt"));
+
+        let mut traditional = patch("s.txt", false);
+        prefix_patch(&mut traditional, "sub/");
+        assert_eq!(traditional.old_name.as_deref(), Some("sub/s.txt"));
+        assert_eq!(traditional.new_name.as_deref(), Some("sub/s.txt"));
+    }
+
+    /// The `HeaderError` text `parse_patches()` fails with, or a panic naming what
+    /// happened instead.
+    fn header_error(lines: &[&[u8]], strip: usize, spans: &InputSpans) -> String {
+        match parse_patches(lines, strip, true, "", "", false, spans) {
+            Ok(p) => panic!("expected a header diagnostic, parsed {} patch(es)", p.len()),
+            Err(e) => match e.downcast_ref::<HeaderError>() {
+                Some(h) => h.to_string(),
+                None => panic!("expected a header diagnostic, got: {e}"),
+            },
+        }
+    }
+
+    /// The two shapes `-p<n>` over-strip produces, which git reports with the input
+    /// file and the line the header parse stopped at. Measured against git 2.55.0:
+    /// a traditional patch names its `---` line, a `diff --git` header names the
+    /// line the header ended on (the `@@`, or one past the last line when the patch
+    /// has no body), and the component count is singular only at one.
+    #[test]
+    fn over_stripping_reports_the_headers_own_line() {
+        let spans = InputSpans { spans: vec![("p.patch".to_string(), 0)] };
+        let trad = concat!(
+            "--- a/sub/deep/f.txt\n",
+            "+++ b/sub/deep/f.txt\n",
+            "@@ -1,1 +1,1 @@\n",
+            "-one\n",
+            "+two\n",
+        );
+        let lines = split_lines(trad.as_bytes());
+        let err = header_error(&lines, 9, &spans);
+        assert_eq!(
+            err,
+            "unable to find filename in patch at p.patch:1"
+        );
+
+        let git_style = concat!(
+            "diff --git a/sub/deep/f.txt b/sub/deep/f.txt\n",
+            "index 1234567..89abcde 100644\n",
+            "--- a/sub/deep/f.txt\n",
+            "+++ b/sub/deep/f.txt\n",
+            "@@ -1,1 +1,1 @@\n",
+            "-one\n",
+            "+two\n",
+        );
+        let lines = split_lines(git_style.as_bytes());
+        let err = header_error(&lines, 9, &spans);
+        assert_eq!(
+            err,
+            "git diff header lacks filename information when removing 9 leading \
+             pathname components at p.patch:5"
+        );
+
+        // A pure mode change has no `@@` at all, so the parse runs off the end and
+        // git reports the line one past the last.
+        let mode_only = "diff --git x y\nold mode 100644\nnew mode 100755\n";
+        let lines = split_lines(mode_only.as_bytes());
+        let err = header_error(&lines, 1, &spans);
+        assert_eq!(
+            err,
+            "git diff header lacks filename information when removing 1 leading \
+             pathname component at p.patch:4"
+        );
+    }
+
+    /// `parse_traditional_patch()` reads the `+++` line with the `---` line's name as
+    /// `find_name_common()`'s `def`, so one side may over-strip without failing and
+    /// both sides end up with the single name that came out. Measured against git
+    /// 2.55.0: `-p2` on `--- a/f.txt` / `+++ b/deep/f.txt` patches `f.txt`.
+    #[test]
+    fn a_traditional_patch_resolves_both_names_together() {
+        let spans = InputSpans { spans: vec![("p.patch".to_string(), 0)] };
+        let text = concat!(
+            "--- a/f.txt\n",
+            "+++ b/deep/f.txt\n",
+            "@@ -1,1 +1,1 @@\n",
+            "-one\n",
+            "+two\n",
+        );
+        let lines = split_lines(text.as_bytes());
+        let patches = parse_patches(&lines, 2, true, "", "", false, &spans).unwrap();
+        assert_eq!(patches[0].old_name.as_deref(), Some("f.txt"));
+        assert_eq!(patches[0].new_name.as_deref(), Some("f.txt"));
+
+        // "Generally we prefer the shorter name": `f.txt.orig` vs `f.txt` is a patch
+        // to `f.txt`, not a rename.
+        let orig = concat!(
+            "--- a/f.txt\n",
+            "+++ b/f.txt.orig\n",
+            "@@ -1,1 +1,1 @@\n",
+            "-one\n",
+            "+two\n",
+        );
+        let lines = split_lines(orig.as_bytes());
+        let patches = parse_patches(&lines, 1, true, "", "", false, &spans).unwrap();
+        assert_eq!(patches[0].old_name.as_deref(), Some("f.txt"));
+        assert_eq!(patches[0].new_name.as_deref(), Some("f.txt"));
+    }
+
+    /// `fuzzy_matchlines()` (apply.c:2500): whitespace runs may differ in width but
+    /// may not appear or disappear, and line endings do not count on either side.
+    #[test]
+    fn fuzzy_matching_collapses_runs_but_not_their_absence() {
+        assert!(fuzzy_matchlines(b"\tbeta   gamma\n", b"    beta gamma\n"));
+        assert!(fuzzy_matchlines(b"a b\r\n", b"a\tb"));
+        assert!(fuzzy_matchlines(b"same\n", b"same\n"));
+        // A run that vanishes is a different line, and so is one that appears only
+        // on one side.
+        assert!(!fuzzy_matchlines(b"a b\n", b"ab\n"));
+        assert!(!fuzzy_matchlines(b"  indented\n", b"indented\n"));
+        assert!(!fuzzy_matchlines(b"one\n", b"two\n"));
+        // Trailing whitespace is a run the other side does not have.
+        assert!(!fuzzy_matchlines(b"trail \n", b"trail\n"));
+    }
+
+    /// `update_pre_post_images()`: a hunk that only matched under relaxed whitespace
+    /// takes its context lines from the file, not from the patch, so the file's own
+    /// indentation survives and only added lines come out of the patch.
+    #[test]
+    fn a_relaxed_match_keeps_the_files_whitespace_on_context_lines() {
+        let image: Vec<Vec<u8>> = vec![
+            b"\tone\n".to_vec(),
+            b"  two\n".to_vec(),
+            b"\tthree\n".to_vec(),
+        ];
+        let h = Hunk {
+            old_pos: 1,
+            new_pos: 1,
+            pre: vec![b" one\n".to_vec(), b"\ttwo\n".to_vec(), b" three\n".to_vec()],
+            pre_common: vec![true, false, true],
+            post: vec![b" one\n".to_vec(), b"NEW\n".to_vec(), b" three\n".to_vec()],
+            post_common: vec![true, false, true],
+            added_at: vec![(0, 1)],
+            context: vec![b" one\n".to_vec(), b" three\n".to_vec()],
+            raw: Vec::new(),
+            trailing: 1,
+            leading: 1,
+        };
+        assert_eq!(
+            place_hunk(&image, &h, false, false),
+            None,
+            "byte-exact matching still rejects it"
+        );
+        assert_eq!(place_hunk(&image, &h, false, true), Some(0));
+        assert_eq!(
+            replacement(&image, 0, &h, false, true),
+            vec![b"\tone\n".to_vec(), b"NEW\n".to_vec(), b"\tthree\n".to_vec()]
+        );
+        // Without the flag the replacement is the patch's own text.
+        assert_eq!(replacement(&image, 0, &h, false, false), h.post);
+    }
 }

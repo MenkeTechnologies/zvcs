@@ -256,6 +256,10 @@ pub fn merge_tree(args: &[String]) -> Result<ExitCode> {
                     }
                     c = bytes.len();
                 }
+                // parse_options_step() tests `internal_help` inside the
+                // short-option loop: `-h` is answered on stdout at 129, without
+                // the `error:` line a rejection carries.
+                b'h' => return Ok(super::show_usage(USAGE)),
                 other => {
                     eprintln!("error: unknown switch `{}'", other as char);
                     eprint!("{USAGE}");

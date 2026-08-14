@@ -4,12 +4,27 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use super::pretty_pad::{FlushType, PadState, WrapState};
 use gix::bstr::ByteSlice;
 use gix::date::time::Format as TimeFormat;
 use gix::date::time::{CustomFormat, format as tfmt};
 use gix::hash::ObjectId;
 use gix::prelude::ObjectIdExt;
 use regex::bytes::{Regex, RegexBuilder};
+
+/// `usage_with_options()` over `builtin/reflog.c`'s subcommand table.
+const USAGE: &str = r"usage: git reflog [show] [<log-options>] [<ref>]
+   or: git reflog list
+   or: git reflog exists <ref>
+   or: git reflog write <ref> <old-oid> <new-oid> <message>
+   or: git reflog delete [--rewrite] [--updateref]
+                         [--dry-run | -n] [--verbose] <ref>@{<specifier>}...
+   or: git reflog drop [--all [--single-worktree] | <refs>...]
+   or: git reflog expire [--expire=<time>] [--expire-unreachable=<time>]
+                         [--rewrite] [--updateref] [--stale-fix]
+                         [--dry-run | -n] [--verbose] [--all [--single-worktree] | <refs>...]
+
+";
 
 /// `git reflog` — read the reference logs recorded under `$GIT_DIR/logs`.
 ///
@@ -183,6 +198,15 @@ pub fn reflog(args: &[String]) -> Result<ExitCode> {
         _ => args,
     };
 
+    // `cmd_reflog`'s `parse_options(..., PARSE_OPT_SUBCOMMAND_OPTIONAL)` scans
+    // leading options and stops at the first non-option, which becomes the
+    // subcommand. So `-h` is this command's help exactly while it is the FIRST
+    // token — the subcommand synopsis on stdout, exit 129. Once a subcommand has
+    // been named, `-h` belongs to that subcommand's own parser instead.
+    if args.first().is_some_and(|a| a == "-h") {
+        return Ok(super::show_usage(USAGE));
+    }
+
     let (sub, rest): (&str, &[String]) = match args.first().map(String::as_str) {
         Some("show") => ("show", &args[1..]),
         Some("list") => ("list", &args[1..]),
@@ -200,13 +224,39 @@ pub fn reflog(args: &[String]) -> Result<ExitCode> {
 
     let repo = gix::discover(".")?;
     match sub {
-        "show" => show(&repo, rest),
+        "show" => show(&repo, rest, Tweak::Reflog),
         "list" => list(&repo, rest),
         "exists" => exists(&repo, rest),
         "delete" => delete_entries(&repo, rest),
         "expire" => expire_entries(&repo, rest),
         _ => unreachable!("subcommand set is closed above"),
     }
+}
+
+/// `git log -g`'s reflog walk, for a caller that is `log` rather than `reflog`.
+///
+/// The two entry points differ in exactly one place. `cmd_log` installs
+/// `log_setup_revisions_tweak`, which calls `diff_merges_default_to_first_parent`
+/// when `--first-parent` was given; `cmd_log_reflog` (`builtin/log.c`) installs
+/// no tweak at all. So `git reflog show -p --first-parent` prints no merge diff
+/// while `git log -g -p --first-parent` does — and `list_stash()` runs the
+/// latter. Every stash entry is a merge commit, so that tweak is the only reason
+/// `git stash list -p` renders a patch at all.
+pub fn reflog_show_as_log(args: &[String]) -> Result<ExitCode> {
+    let repo = gix::discover(".")?;
+    show(&repo, args, Tweak::Log)
+}
+
+/// Which of git's two reflog-walk entry points is running.
+///
+/// Named after the `setup_revision_opt::tweak` hook that is the actual
+/// difference between them; see [`reflog_show_as_log`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tweak {
+    /// `git reflog show`: no tweak, so `--first-parent` never diffs a merge.
+    Reflog,
+    /// `git log -g`: `--first-parent` promotes merges to a first-parent diff.
+    Log,
 }
 
 /// One reflog line, already flipped into git's newest-first order.
@@ -227,11 +277,28 @@ struct Section {
     full: String,
     /// Index of the first entry to print (a `@{<n>}` or `@{<date>}` start point).
     start: usize,
-    /// Whether this argument used a `@{<date>}` selector, which switches only this
-    /// section's selector column to date form (git decides this per argument, not
-    /// once for the whole command).
-    date_selector: bool,
+    /// Which selector form this argument used, which decides the `@{…}` column
+    /// for this section alone (git decides it per argument, not once for the
+    /// whole command).
+    selector: SelectorKind,
     entries: Vec<Entry>,
+}
+
+/// git's `enum selector_type` (`reflog-walk.c`), recorded per argument.
+///
+/// It is what decides the `@{…}` column: `get_reflog_selector` prints a date
+/// only for [`SelectorKind::Date`], or for [`SelectorKind::None`] when `--date=`
+/// was given explicitly. An `@{<n>}` argument is [`SelectorKind::Index`] and
+/// keeps counting even under `--date=` — so `reflog main@{1} --date=unix` prints
+/// `main@{1}`, not `main@{1700000000}`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SelectorKind {
+    /// No `@{…}` was typed: the column counts, unless `--date=` forces dates.
+    None,
+    /// `<ref>@{<n>}`: the column counts, whatever `--date=` says.
+    Index,
+    /// `<ref>@{<date>}`: the column shows dates, whatever `--date=` says.
+    Date,
 }
 
 /// How commit ids are rendered.
@@ -700,7 +767,7 @@ impl Decorations {
 }
 
 /// `git reflog show` — render the log of each `<ref>` (default `HEAD`).
-fn show(repo: &gix::Repository, rest: &[String]) -> Result<ExitCode> {
+fn show(repo: &gix::Repository, rest: &[String], tweak: Tweak) -> Result<ExitCode> {
     let full_hex = repo.object_hash().len_in_hex();
     let mut opts = Opts {
         quote_high: repo
@@ -1094,7 +1161,7 @@ fn show(repo: &gix::Repository, rest: &[String]) -> Result<ExitCode> {
         }
     }
 
-    render(repo, &sections, &opts, full_hex, &unimplemented)
+    render(repo, &sections, &opts, full_hex, &unimplemented, tweak)
 }
 
 /// Walk the collected sections and write git's output for them.
@@ -1111,8 +1178,12 @@ fn render(
     opts: &Opts,
     full_hex: usize,
     unimplemented: &Option<String>,
+    tweak: Tweak,
 ) -> Result<ExitCode> {
     let fallback_len = abbrev_len(repo, full_hex);
+    // `diff_merges_default_to_first_parent()`, which only `git log`'s tweak hook
+    // calls. Without it a merge entry has no diff in any format.
+    let first_parent_merges = opts.first_parent && tweak == Tweak::Log;
     // The field date format (`%ad`/`%cd`, the `Date:` header lines): an explicit
     // `--date=` wins, then `log.date`, then git's default layout.
     let field_fmt: DateFormat = opts
@@ -1145,11 +1216,14 @@ fn render(
     let decorations = deco_mode.map(|mode| Decorations::build(repo, mode));
 
     'outer: for section in sections {
-        // `--date` forces every section to date form; otherwise only a section
-        // whose argument used a `@{<date>}` selector shows dates, the rest count.
-        let selector_fmt: Option<DateFormat> = opts
-            .date
-            .or_else(|| section.date_selector.then(|| DateFormat::plain(tfmt::DEFAULT)));
+        // `reflog-walk.c:get_reflog_selector`: dates for a `@{<date>}` argument,
+        // or for an argument with no selector at all when `--date=` forced them.
+        // An `@{<n>}` argument counts regardless.
+        let selector_fmt: Option<DateFormat> = match section.selector {
+            SelectorKind::Date => Some(opts.date.unwrap_or_else(|| DateFormat::plain(tfmt::DEFAULT))),
+            SelectorKind::None => opts.date,
+            SelectorKind::Index => None,
+        };
         for (n, entry) in section.entries.iter().enumerate().skip(section.start) {
             if let Some(want_merge) = opts.merges {
                 if is_merge(repo, entry.oid) != want_merge {
@@ -1180,7 +1254,7 @@ fn render(
             // reflog message says the entry was. Computed before the skip/count
             // budget because pathspec filtering must run first.
             let changes = match diff_cache.as_mut() {
-                Some(cache) => collect_changes(repo, entry.oid, cache, opts.first_parent),
+                Some(cache) => collect_changes(repo, entry.oid, cache, first_parent_merges),
                 None => Vec::new(),
             };
             // Pathspecs keep only entries whose diff touches the set.
@@ -1324,14 +1398,12 @@ fn render(
                     out.push(b'\n');
                 }
                 if let Ok(commit) = repo.find_commit(entry.oid) {
-                    // Measured against 2.55.0: `git log -g -p --first-parent`
-                    // diffs a merge entry against its first parent — that is what
-                    // `stash list -p` is — while `git reflog show -p
-                    // --first-parent` prints the entry lines alone. The custom
-                    // format is what tells the two apart here, since `stash list`
-                    // always passes one.
+                    // A merge is diffed only where git's `log_setup_revisions_tweak`
+                    // ran, i.e. under `git log -g --first-parent`. `git reflog show`
+                    // installs no tweak, so it prints the entry lines alone however
+                    // it was formatted and whether or not `--first-parent` was given.
                     let merge = commit.parent_ids().count() > 1;
-                    if merge && !matches!(opts.out, OutFmt::Custom(_)) {
+                    if merge && !first_parent_merges {
                         printed += 1;
                         continue;
                     }
@@ -1377,7 +1449,7 @@ fn resolve_spec(repo: &gix::Repository, spec: &str) -> Result<Resolved> {
                 display: base.to_owned(),
                 full: full_name(repo, base),
                 start: 0,
-                date_selector: false,
+                selector: SelectorKind::None,
                 entries,
             }))
         }
@@ -1396,7 +1468,7 @@ fn resolve_spec(repo: &gix::Repository, spec: &str) -> Result<Resolved> {
                 display: base.to_owned(),
                 full: full_name(repo, base),
                 start: n,
-                date_selector: false,
+                selector: SelectorKind::Index,
                 entries,
             }))
         }
@@ -1431,7 +1503,7 @@ fn resolve_spec(repo: &gix::Repository, spec: &str) -> Result<Resolved> {
                 full: full_name(repo, base),
                 start,
                 // A date selector switches only this section's column to date form.
-                date_selector: true,
+                selector: SelectorKind::Date,
                 entries,
             }))
         }
@@ -1517,7 +1589,7 @@ fn expand_all(repo: &gix::Repository, excludes: &[String]) -> Result<Vec<Section
                 display: name.clone(),
                 full: name,
                 start: 0,
-                date_selector: false,
+                selector: SelectorKind::None,
                 entries,
             });
         }
@@ -1527,7 +1599,7 @@ fn expand_all(repo: &gix::Repository, excludes: &[String]) -> Result<Vec<Section
             display: "HEAD".to_owned(),
             full: "HEAD".to_owned(),
             start: 0,
-            date_selector: false,
+            selector: SelectorKind::None,
             entries,
         });
     }
@@ -1560,7 +1632,7 @@ fn expand_prefixed(
                 display: short,
                 full: name,
                 start: 0,
-                date_selector: false,
+                selector: SelectorKind::None,
                 entries,
             });
         }
@@ -1588,7 +1660,7 @@ fn expand_glob(
                 display: name.clone(),
                 full: name,
                 start: 0,
-                date_selector: false,
+                selector: SelectorKind::None,
                 entries,
             });
         }
@@ -1824,6 +1896,13 @@ fn unsupported_placeholder(fmt: &str) -> Option<String> {
             b'n' | b'%' => i += 2,
             // `%d`/`%D` are the ref decorations (parenthesised / bare).
             b'H' | b'T' | b'P' | b'p' | b'h' | b's' | b'd' | b'D' => i += 2,
+            // The column atoms `%<(<N>)`, `%>(<N>)`, `%><(<N>)`, `%>>(<N>)` and
+            // the `%w(…)` wrap atom are validated where they are expanded: a
+            // malformed one is not a placeholder at all, and git prints it
+            // literally rather than failing. Skipping just the two bytes leaves
+            // the parenthesised tail to be scanned as literal text, which carries
+            // no `%` and so cannot be mistaken for another placeholder.
+            b'<' | b'>' | b'w' => i += 2,
             b'x' => {
                 if b.get(i + 2).is_some_and(u8::is_ascii_hexdigit)
                     && b.get(i + 3).is_some_and(u8::is_ascii_hexdigit)
@@ -1901,6 +1980,18 @@ fn custom_has_field_date(fmt: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 /// Expand a validated `--format` string for one entry.
+///
+/// git's `repo_format_commit_message()` driver loop (pretty.c:2014), which
+/// `builtin/reflog.c` reaches through `show_reflog()`'s `pretty_print_commit()`:
+/// literal text is copied, `%%` is expanded by `strbuf_expand_step()` before
+/// `format_commit_item()` is reached (so it is neither padded nor spends a
+/// pending field), and every other `%` placeholder goes through
+/// [`expand_one_placeholder`] — directly, or into a measured buffer when a
+/// `%<`/`%>` atom left a field pending.
+///
+/// `format_and_pad_commit()`'s `%C…` chain is absent because
+/// [`unsupported_placeholder`] refuses `%C` up front, so a colour atom can never
+/// open a chain here.
 #[allow(clippy::too_many_arguments)]
 fn expand_format(
     repo: &gix::Repository,
@@ -1916,6 +2007,10 @@ fn expand_format(
     let commit = repo.find_commit(entry.oid).ok();
     let b = fmt.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(fmt.len() + 32);
+    // The deferred state `struct format_commit_context` carries: a column field a
+    // `%<`/`%>` atom is holding open, and the `%w()` wrap parameters.
+    let mut pad = PadState::default();
+    let mut wrap = WrapState::default();
     let mut i = 0;
     while i < b.len() {
         if b[i] != b'%' {
@@ -1923,9 +2018,125 @@ fn expand_format(
             i += 1;
             continue;
         }
-        // Indexing stays on bytes so a multi-byte literal in the format string
-        // can never split a `char` boundary. `unsupported_placeholder` already
-        // rejected every sequence not handled below.
+        if b.get(i + 1) == Some(&b'%') {
+            out.push(b'%');
+            i += 2;
+            continue;
+        }
+        // The cursor sits on the placeholder character; the expander advances it
+        // past whatever it consumes and leaves it alone when it consumes nothing,
+        // which is how git rescans from that character.
+        let mut at = i + 1;
+        let args = PlaceholderArgs {
+            repo,
+            section,
+            entry,
+            selector,
+            opts,
+            field_fmt,
+            fallback_len,
+            decorations,
+            commit: &commit,
+        };
+        if pad.flush == FlushType::None {
+            if !expand_one_placeholder(&mut out, b, &mut at, &args, &mut pad, &mut wrap) {
+                out.push(b'%');
+            }
+            i = at;
+            continue;
+        }
+        // `format_and_pad_commit()`: the placeholder renders into a buffer of its
+        // own so its *display* width can be measured. `padding` is read before it
+        // expands, so a nested `%<(…)` retargets the next field, not this one.
+        let padding = pad.padding;
+        let mut local: Vec<u8> = Vec::new();
+        let consumed = expand_one_placeholder(&mut local, b, &mut at, &args, &mut pad, &mut wrap);
+        pad.apply(&mut out, local, padding, 0);
+        if !consumed {
+            out.push(b'%');
+        }
+        i = at;
+    }
+    // `repo_format_commit_message()` closes with a rewrap to width 0, which wraps
+    // whatever a trailing `%w()` was still governing.
+    wrap.rewrap_message_tail(&mut out, 0, 0, 0);
+    out
+}
+
+/// Everything one reflog entry's placeholders can read, bundled so the expander
+/// keeps a manageable signature.
+struct PlaceholderArgs<'a> {
+    repo: &'a gix::Repository,
+    section: &'a Section,
+    entry: &'a Entry,
+    selector: &'a str,
+    opts: &'a Opts,
+    field_fmt: DateFormat,
+    fallback_len: usize,
+    decorations: Option<&'a Decorations>,
+    /// The entry's commit, when it still resolves — `%s`, `%T` and the person
+    /// placeholders expand to nothing when it does not.
+    commit: &'a Option<gix::Commit<'a>>,
+}
+
+/// `format_commit_one()`: expand the single placeholder at `b[*at]`, advancing
+/// `*at` past whatever it consumes.
+///
+/// `false` is git's "consumed 0 bytes" — nothing was written and `*at` is left on
+/// the placeholder character, so the caller prints the `%` and rescans.
+fn expand_one_placeholder(
+    out: &mut Vec<u8>,
+    b: &[u8],
+    at: &mut usize,
+    args: &PlaceholderArgs<'_>,
+    pad: &mut PadState,
+    wrap: &mut WrapState,
+) -> bool {
+    let PlaceholderArgs {
+        repo,
+        section,
+        entry,
+        selector,
+        opts,
+        field_fmt,
+        fallback_len,
+        decorations,
+        commit,
+    } = *args;
+    let (field_fmt, fallback_len) = (field_fmt, fallback_len);
+
+    // The column atoms `%<(<N>)`, `%>(<N>)`, `%><(<N>)`, `%>>(<N>)` and their
+    // `|`/`trunc`/`ltrunc`/`mtrunc` forms expand to nothing and leave the field
+    // pending; `%w(…)` re-wraps everything emitted after it. Both are validated
+    // here rather than by `unsupported_placeholder`, because a malformed one is
+    // not a placeholder at all and git prints it literally.
+    match b.get(*at) {
+        Some(b'<' | b'>') => {
+            return match pad.parse(b, *at) {
+                Some(consumed) => {
+                    *at += consumed;
+                    true
+                }
+                None => false,
+            };
+        }
+        Some(b'w') => {
+            return match wrap.parse_and_apply(out, b, *at) {
+                Some(consumed) => {
+                    *at += consumed;
+                    true
+                }
+                None => false,
+            };
+        }
+        _ => {}
+    }
+
+    // `i` tracks git's cursor on the `%` itself, so the per-atom widths below read
+    // as they do in `pretty.c`. Indexing stays on bytes so a multi-byte literal in
+    // the format string can never split a `char` boundary.
+    let mut i = *at - 1;
+    {
         let one = b.get(i + 1).copied();
         let two = b.get(i + 2).copied();
         match (one, two) {
@@ -1992,10 +2203,6 @@ fn expand_format(
                     }
                 }
                 i += 3;
-            }
-            (Some(b'%'), _) => {
-                out.push(b'%');
-                i += 2;
             }
             (Some(b'n'), _) => {
                 out.push(b'\n');
@@ -2071,13 +2278,14 @@ fn expand_format(
                 }
                 i += 4;
             }
-            _ => {
-                out.push(b'%');
-                i += 1;
-            }
+            // `format_commit_one()` consumed nothing — a trailing `%`, or a
+            // sequence `unsupported_placeholder` let through that this expander
+            // does not write. The caller prints the `%` and rescans.
+            _ => return false,
         }
     }
-    out
+    *at = i;
+    true
 }
 
 /// The parent ids of the commit an entry points at, empty when it is not a
@@ -2338,20 +2546,23 @@ struct FileChange {
 ///
 /// Empty for a merge (`git log` does not diff merges unless asked with `-m`/`-c`,
 /// and `git reflog` never asks) and for an object that is not a readable commit.
+///
+/// `first_parent_merges` is git's `diff_merges_default_to_first_parent()`, which
+/// only `git log -g --first-parent` reaches — that is how `git stash list
+/// --name-only` gets a diff at all, every stash entry being a merge commit.
 fn collect_changes(
     repo: &gix::Repository,
     oid: ObjectId,
     cache: &mut gix::diff::blob::Platform,
-    first_parent: bool,
+    first_parent_merges: bool,
 ) -> Vec<FileChange> {
     let Ok(commit) = repo.find_commit(oid) else {
         return Vec::new();
     };
     let parents: Vec<ObjectId> = commit.parent_ids().map(|p| p.detach()).collect();
-    // A merge has no single diff to show — unless `--first-parent` picks one,
-    // which is how `git stash list --name-only` gets a diff at all: every stash
-    // entry is a merge commit, and `list_stash()` passes `--first-parent`.
-    if parents.len() > 1 && !first_parent {
+    // A merge has no single diff to show unless the caller was `git log`, whose
+    // tweak hook promotes `--first-parent` to a first-parent merge diff.
+    if parents.len() > 1 && !first_parent_merges {
         return Vec::new();
     }
     let Ok(new_tree) = commit.tree() else {

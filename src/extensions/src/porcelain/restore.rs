@@ -41,6 +41,38 @@ use gix::merge::blob::builtin_driver::text::{Conflict, ConflictStyle, Labels, Op
 use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
 use gix::refs::Target;
 
+/// `usage_with_options()` over `builtin/checkout.c`'s `restore` option table.
+const USAGE: &str = r"usage: git restore [<options>] [--source=<branch>] <file>...
+
+    -s, --[no-]source <tree-ish>
+                          which tree-ish to checkout from
+    -S, --[no-]staged     restore the index
+    -W, --[no-]worktree   restore the working tree (default)
+    --[no-]ignore-unmerged
+                          ignore unmerged entries
+    --[no-]overlay        use overlay mode
+    -q, --[no-]quiet      suppress progress reporting
+    --[no-]recurse-submodules[=<checkout>]
+                          control recursive updating of submodules
+    --[no-]progress       force progress reporting
+    -m, --[no-]merge      perform a 3-way merge with the new branch
+    --[no-]conflict <style>
+                          conflict style (merge, diff3, or zdiff3)
+    -2, --ours            checkout our version for unmerged files
+    -3, --theirs          checkout their version for unmerged files
+    -p, --[no-]patch      select hunks interactively
+    -U, --unified <n>     generate diffs with <n> lines context
+    --inter-hunk-context <n>
+                          show context between diff hunks up to the specified number of lines
+    --[no-]ignore-skip-worktree-bits
+                          do not limit pathspecs to sparse entries only
+    --[no-]pathspec-from-file <file>
+                          read pathspec from file
+    --[no-]pathspec-file-nul
+                          with --pathspec-from-file, pathspec elements are separated with NUL character
+
+";
+
 /// True if `path` matches any of the (repo-root-relative, slash-separated)
 /// pathspecs. A spec matches its own exact path, or any path under it as a
 /// directory prefix. `match_all` (a `.` or empty spec) matches everything.
@@ -298,6 +330,9 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
         }
         match a.as_str() {
             "--" => after_dashdash = true,
+            // parse_options_step()'s `internal_help`: the block on stdout at
+            // 129, with no `error:` line — a help request is not a rejection.
+            "-h" => return Ok(super::show_usage(USAGE)),
             "--staged" | "-S" => staged = true,
             "--worktree" | "-W" => worktree = true,
             "-s" | "--source" => {

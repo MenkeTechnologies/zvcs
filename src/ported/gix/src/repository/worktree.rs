@@ -60,12 +60,25 @@ impl crate::Repository {
         self.workdir().map(|path| Worktree { parent: self, path })
     }
 
-    /// Return true if this repository is bare, or in absence of a known configuration value, if it has no work tree.
+    /// Return true if this repository has no work tree, and nothing said it should have one.
+    ///
+    /// This is git's `is_bare_repository()` (environment.c:131-135):
+    ///
+    /// ```c
+    /// /* if core.bare is not 'false', let's see if there is a work tree */
+    /// return is_bare_repository_cfg && !repo_get_work_tree(the_repository);
+    /// ```
+    ///
+    /// Both halves matter. `core.bare = false` settles it on its own, and an unset `core.bare` is
+    /// `is_bare_repository_cfg = -1` — truthy — so it defers to the work tree just as `true` does.
+    /// A repository whose configuration says `bare` but which *has* a work tree is therefore not
+    /// bare: that is what a linked worktree of a bare repository is, and what `GIT_WORK_TREE`
+    /// makes of a bare one.
     ///
     /// This is not to be confused with the [`worktree()`](crate::Repository::worktree()) method, which may exist if this instance
     /// was opened in a worktree that was created separately.
     pub fn is_bare(&self) -> bool {
-        self.config.is_bare.unwrap_or_else(|| self.workdir().is_none())
+        self.config.is_bare.unwrap_or(true) && self.workdir().is_none()
     }
 
     /// If `id` points to a tree, produce a stream that yields one worktree entry after the other. The index of the tree at `id`

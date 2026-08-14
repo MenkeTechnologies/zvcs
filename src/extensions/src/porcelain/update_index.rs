@@ -77,6 +77,56 @@ use gix::bstr::{BStr, BString, ByteSlice};
 use gix::hash::ObjectId;
 use gix::index::entry::{Flags, Mode, Stage, Stat};
 
+/// `usage_with_options()` over `builtin/update-index.c`'s option table.
+const USAGE: &str = r#"usage: git update-index [<options>] [--] [<file>...]
+
+    -q                    continue refresh even when index needs update
+    --[no-]ignore-submodules
+                          refresh: ignore submodules
+    --[no-]add            do not ignore new files
+    --[no-]replace        let files replace directories and vice-versa
+    --[no-]remove         notice files missing from worktree
+    --[no-]unmerged       refresh even if index contains unmerged entries
+    --refresh             refresh stat information
+    --really-refresh      like --refresh, but ignore assume-unchanged setting
+    --cacheinfo <mode>,<object>,<path>
+                          add the specified entry to the index
+    --chmod (+|-)x        override the executable bit of the listed files
+    --assume-unchanged    mark files as "not changing"
+    --no-assume-unchanged clear assumed-unchanged bit
+    --skip-worktree       mark files as "index-only"
+    --no-skip-worktree    clear skip-worktree bit
+    --[no-]ignore-skip-worktree-entries
+                          do not touch index-only entries
+    --[no-]info-only      add to index only; do not add content to object database
+    --[no-]force-remove   remove named paths even if present in worktree
+    -z                    with --stdin: input lines are terminated by null bytes
+    --stdin               read list of paths to be updated from standard input
+    --index-info          add entries from standard input to the index
+    --unresolve           repopulate stages #2 and #3 for the listed paths
+    -g, --again           only update entries that differ from HEAD
+    --[no-]ignore-missing ignore files missing from worktree
+    --[no-]verbose        report actions to standard output
+    --clear-resolve-undo  (for porcelains) forget saved unresolved conflicts
+    --[no-]index-version <n>
+                          write index in this format
+    --[no-]show-index-version
+                          report on-disk index format version
+    --[no-]split-index    enable or disable split index
+    --[no-]untracked-cache
+                          enable/disable untracked cache
+    --[no-]test-untracked-cache
+                          test if the filesystem supports untracked cache
+    --[no-]force-untracked-cache
+                          enable untracked cache without testing the filesystem
+    --[no-]force-write-index
+                          write out the index even if is not flagged as changed
+    --[no-]fsmonitor      enable or disable file system monitor
+    --fsmonitor-valid     mark files as fsmonitor valid
+    --no-fsmonitor-valid  clear fsmonitor valid bit
+
+"#;
+
 /// git's `ce_match_stat_basic` change bits, kept separate because
 /// `ie_modified` reacts differently to each.
 const DATA_CHANGED: u8 = 1 << 0;
@@ -219,6 +269,7 @@ pub fn update_index(args: &[String]) -> Result<ExitCode> {
     match run(&mut ctx, args)? {
         Outcome::Die => Ok(ExitCode::from(128)),
         Outcome::Usage => Ok(ExitCode::from(129)),
+        Outcome::Help => Ok(super::show_usage(USAGE)),
         Outcome::Exit(code) => Ok(ExitCode::from(code)),
         Outcome::Done => {
             if ctx.dirty || ctx.force_write {
@@ -281,6 +332,8 @@ enum Outcome {
     Die,
     /// git's option parser rejected the command line: exit 129.
     Usage,
+    /// `-h`: the usage block on stdout, exit 129, index untouched.
+    Help,
     /// git returned before reaching the index write (`--test-untracked-cache`).
     Exit(u8),
 }
@@ -304,6 +357,9 @@ fn run(ctx: &mut Ctx, args: &[String]) -> Result<Outcome> {
     // does cancel an out-of-range `--index-version`.
     let mut preferred_index_format: i32 = 0;
     let mut untracked_cache = UntrackedCache::Unspecified;
+    // git's `fsmonitor`, a tri-state initialised to -1: `None` here. Only the
+    // tail block below acts on it (`if (fsmonitor > 0) … else if (!fsmonitor)`).
+    let mut fsmonitor: Option<bool> = None;
     let mut nul_term_line = false;
     let mut end_of_opts = false;
     let mut i = 0;
@@ -331,6 +387,12 @@ fn run(ctx: &mut Ctx, args: &[String]) -> Result<Outcome> {
                         swallowed_rest = true;
                         break;
                     }
+                    // parse_options_step() tests `internal_help` inside the
+                    // short-option loop: `-h` answers on stdout at 129, with no
+                    // `error:` line. `show_usage_with_options_if_asked()`
+                    // (builtin/update-index.c:1097) covers the lone-`-h` case
+                    // ahead of parse_options; both land here.
+                    'h' => return Ok(Outcome::Help),
                     _ => {
                         eprintln!("error: unknown switch `{c}'");
                         return Ok(Outcome::Usage);
@@ -407,12 +469,15 @@ fn run(ctx: &mut Ctx, args: &[String]) -> Result<Outcome> {
                             }
                         },
                     };
-                    match value.trim().parse::<i32>() {
-                        Ok(n) => preferred_index_format = n,
-                        Err(_) => {
-                            eprintln!(
-                                "error: option `index-version' expects a numerical value"
-                            );
+                    // `OPT_INTEGER` on an `int`, so parse-options' full grammar:
+                    // base 0 (`0x10` is 16, `010` is 8), a k/m/g multiplier, and
+                    // three distinct diagnostics. A decimal-only parse reported
+                    // "expects a numerical value" where git accepts `0x3`, and
+                    // read `010` as ten rather than eight.
+                    match crate::optint::integer(&crate::optint::long_opt("index-version"), value) {
+                        Ok(n) => preferred_index_format = n as i32,
+                        Err(e) => {
+                            eprintln!("error: {}", e.message());
                             return Ok(Outcome::Usage);
                         }
                     }
@@ -476,14 +541,10 @@ fn run(ctx: &mut Ctx, args: &[String]) -> Result<Outcome> {
                 // crates; see the module documentation. Accepting them keeps
                 // exit codes and everything observable through git in step.
                 "split-index" | "no-split-index" => {}
-                "fsmonitor" => {
-                    if ctx.repo.config_snapshot().string("core.fsmonitor").is_none() {
-                        eprintln!(
-                            "warning: core.fsmonitor is unset; set it if you really want to enable fsmonitor"
-                        );
-                    }
-                }
-                "no-fsmonitor" => {}
+                // git's `fsmonitor` is a tri-state that only the tail acts on, so
+                // the warning fires once however many times the flag was given.
+                "fsmonitor" => fsmonitor = Some(true),
+                "no-fsmonitor" => fsmonitor = Some(false),
                 "untracked-cache" => untracked_cache = UntrackedCache::Enable,
                 "no-untracked-cache" => untracked_cache = UntrackedCache::Disable,
                 "force-untracked-cache" => untracked_cache = UntrackedCache::Force,
@@ -549,8 +610,58 @@ fn run(ctx: &mut Ctx, args: &[String]) -> Result<Outcome> {
         }
     }
 
-    if untracked_cache == UntrackedCache::Test {
-        return Ok(Outcome::Exit(u8::from(!test_untracked_cache_supported())));
+    // `report()`: `printf` under `--verbose`, silence otherwise. The extensions
+    // themselves are not writable through the vendored crates (see the module
+    // documentation), but the line git prints about them is, and its absence is
+    // a stdout difference on every verbose invocation.
+    let report = |line: &str| {
+        if ctx.verbose {
+            println!("{line}");
+        }
+    };
+    match untracked_cache {
+        UntrackedCache::Unspecified => {}
+        UntrackedCache::Disable => report("Untracked cache disabled"),
+        UntrackedCache::Test => {
+            return Ok(Outcome::Exit(u8::from(!test_untracked_cache_supported())))
+        }
+        UntrackedCache::Enable | UntrackedCache::Force => {
+            // `repo_get_work_tree()` is an absolute path — `setup_work_tree()`
+            // chdir's there and takes `getcwd()`, so symlinks are already
+            // resolved — and NULL in a bare repository, which git's `printf`
+            // renders as the literal `(null)` rather than declining to print.
+            let tree = ctx
+                .repo
+                .workdir()
+                .map(|p| {
+                    std::fs::canonicalize(p)
+                        .unwrap_or_else(|_| p.to_path_buf())
+                        .display()
+                        .to_string()
+                })
+                .unwrap_or_else(|| "(null)".to_owned());
+            report(&format!("Untracked cache enabled for '{tree}'"));
+        }
+    }
+
+    match fsmonitor {
+        Some(true) => {
+            if ctx.repo.config_snapshot().string("core.fsmonitor").is_none() {
+                eprintln!(
+                    "warning: core.fsmonitor is unset; set it if you really want to enable fsmonitor"
+                );
+            }
+            report("fsmonitor enabled");
+        }
+        Some(false) => {
+            if ctx.repo.config_snapshot().string("core.fsmonitor").is_some() {
+                eprintln!(
+                    "warning: core.fsmonitor is set; remove it if you really want to disable fsmonitor"
+                );
+            }
+            report("fsmonitor disabled");
+        }
+        None => {}
     }
 
     Ok(Outcome::Done)

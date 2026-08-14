@@ -82,7 +82,7 @@ use gix::object::tree::{EntryKind, EntryMode};
 
 /// Verbatim `builtin_merge_recursive_usage`, already interpolated with the
 /// `merge-subtree` command name that dispatch reaches this module under.
-const USAGE: &str = "usage: git merge-subtree <base>... -- <head> <remote> ...";
+const USAGE: &str = "usage: git merge-subtree <base>... -- <head> <remote> ...\n";
 
 /// The most merge bases `cmd_merge_recursive` will hold (`ARRAY_SIZE(bases) - 1`).
 const MAX_BASES: usize = 20;
@@ -118,8 +118,13 @@ enum SubtreeShift {
 pub fn merge_subtree(args: &[String]) -> Result<ExitCode> {
     // `if (argc < 4) usagef(...)`. argc counts argv[0], so this is three
     // arguments here, and it fires before the repository is opened.
+    // `show_usage_if_asked(argc, argv, msg.buf)` (builtin/merge-recursive.c:45)
+    // precedes the `argc < 4` refusal and prints to stdout instead of stderr.
+    if let Some(code) = super::show_usage_if_asked(args, USAGE) {
+        return Ok(code);
+    }
     if args.len() < 3 {
-        eprintln!("{USAGE}");
+        eprint!("{USAGE}");
         return Ok(ExitCode::from(129));
     }
 

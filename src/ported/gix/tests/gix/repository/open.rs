@@ -182,11 +182,25 @@ fn worktree_of_bare_repo() -> crate::Result {
             .is_main(),
         "linked worktrees can exist for any repository, even bare"
     );
+    // `is_bare_repository()` (environment.c:134) is `is_bare_repository_cfg && !get_work_tree()`,
+    // so the work tree decides here even though the configuration says bare — stock git 2.55.0
+    // answers `--is-bare-repository` with `false` from inside this worktree.
     assert!(
-        repo.is_bare(),
-        "this repository is bare per configuration, and the worktree is linked"
+        repo.config_snapshot().boolean("core.bare").expect("set by the fixture"),
+        "the configuration really does say bare, so this is the work tree overruling it"
     );
+    assert!(!repo.is_bare(), "a repository with a work tree is not bare");
     assert_eq!(repo.kind(), gix::repository::Kind::LinkedWorkTree);
+
+    // The other half of the same rule: the repository these worktrees hang off has no work tree of
+    // its own, and stays bare.
+    let main_repo = named_subrepo_opts(
+        "make_worktree_repo.sh",
+        "non-bare-turned-bare",
+        gix::open::Options::isolated(),
+    )?;
+    assert_eq!(main_repo.workdir(), None);
+    assert!(main_repo.is_bare());
     Ok(())
 }
 
@@ -209,11 +223,28 @@ fn worktree_of_natively_bare_repo() -> crate::Result {
             .is_main(),
         "linked worktrees can exist for any repository, even bare"
     );
+    // The shared config has `core.bare = true` and the linked worktree does inherit it, but
+    // `is_bare_repository()` (environment.c:134) reads that config *and* the work tree, and this
+    // one has a work tree. Stock git 2.55.0 says `false` here too.
     assert!(
-        repo.is_bare(),
-        "the shared config has core.bare=true, which a linked worktree inherits even though it has a workdir"
+        repo.config_snapshot()
+            .boolean("core.bare")
+            .expect("set by `clone --bare`"),
+        "the inherited configuration really does say bare"
     );
+    assert!(!repo.is_bare(), "a repository with a work tree is not bare");
     assert_eq!(repo.kind(), gix::repository::Kind::LinkedWorkTree);
+
+    let main_repo = named_subrepo_opts(
+        "make_worktree_repo.sh",
+        "natively-bare-repo",
+        gix::open::Options::isolated(),
+    )?;
+    assert_eq!(main_repo.workdir(), None);
+    assert!(
+        main_repo.is_bare(),
+        "the repository the worktree hangs off is still bare"
+    );
     Ok(())
 }
 

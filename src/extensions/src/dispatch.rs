@@ -217,6 +217,44 @@ pub const PORCELAIN_VERBS: &[&str] = &[
     // ---- END generated porcelain verbs ----
 ];
 
+/// git's `NEED_WORK_TREE` commands, verbatim from the command table in `git.c`
+/// (v2.55.0, lines 530-663): the ones `run_builtin()` puts through
+/// `setup_work_tree()` before the builtin is entered, so they refuse in a bare
+/// repository no matter what they were asked to do.
+///
+/// The flag is the whole rule for these; a command not listed here may still need
+/// a work tree for *some* of its options and asks for it itself — `ls-files` for
+/// its five worktree selectors (`builtin/ls-files.c:707`), `reset` for every mode
+/// but `--soft` (`builtin/reset.c:471`), `update-index`, `rm`, `diff`,
+/// `diff-index`, `read-tree -u`, `sparse-checkout`, `check-attr`, `grep` and
+/// `describe --dirty` likewise.
+const NEED_WORK_TREE: &[&str] = &[
+    "add",
+    "am",
+    "check-ignore",
+    "checkout",
+    "checkout--worker",
+    "checkout-index",
+    "cherry-pick",
+    "clean",
+    "commit",
+    "diff-files",
+    "merge",
+    "merge-recursive",
+    "merge-recursive-ours",
+    "merge-recursive-theirs",
+    "merge-subtree",
+    "mv",
+    "pull",
+    "rebase",
+    "restore",
+    "revert",
+    "stage",
+    "stash",
+    "status",
+    "switch",
+];
+
 /// Whether `sub` names a verb [`run`] dispatches — a superset verb or a ported
 /// porcelain command. Alias expansion uses this to stop at a real command
 /// (builtins win over an `alias.<cmd>` of the same name, exactly as git does)
@@ -462,6 +500,31 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
         if let Some(usage) = z_usage(sub) {
             println!("{usage}");
             return Ok(ExitCode::SUCCESS);
+        }
+    }
+
+    // git.c:499-500, `run_builtin()`:
+    //
+    //     if (!help && p->option & NEED_WORK_TREE)
+    //             setup_work_tree(the_repository);
+    //
+    // The gate is the dispatcher's, not the builtin's, which is why it precedes
+    // everything a `NEED_WORK_TREE` command would otherwise say — its usage error,
+    // its "nothing to commit", its "Already up to date." A lone `-h` (or
+    // `--help-all`) skips it, since git.c:474-477 demotes that to a gentle setup so
+    // `git <cmd> -h` answers outside a repository too.
+    //
+    // Only a repository that was found but has no work tree refuses here: when
+    // there is none at all, git's `RUN_SETUP` has already died with "not a git
+    // repository", which each command still reports for itself.
+    let help_only = args.len() == 1 && (args[0] == "-h" || args[0] == "--help-all");
+    if !help_only && NEED_WORK_TREE.contains(&sub) {
+        if let Ok(repo) = gix::discover(".") {
+            // `setup_work_tree()` dies the same way for a work tree that is not
+            // configured and for one it cannot `chdir()` into (setup.c:503-505).
+            if !repo.workdir().is_some_and(|wt| wt.is_dir()) {
+                return Err(crate::fatal::need_work_tree());
+            }
         }
     }
 

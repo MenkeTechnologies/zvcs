@@ -3,9 +3,6 @@ use std::collections::{HashMap, HashSet};
 use std::io::IsTerminal;
 use std::process::ExitCode;
 
-/// `usage_with_options()` rendering of `builtin/commit.c`'s option table,
-/// verbatim. `parse_options` writes it after an `error:` line for an unknown
-/// option or a malformed value, and to stdout for `-h`; both exit 129.
 /// `parse_options` rejecting an option: `error: <message>` and the usage table on
 /// stderr, exit 129. Distinct from a `die()` — different stream shape, different
 /// code — so it goes out here and unwinds carrying only the code.
@@ -15,72 +12,78 @@ fn usage_error(msg: String) -> anyhow::Error {
     anyhow::Error::new(crate::fatal::Silent(129))
 }
 
-const USAGE: &str = concat!(
-    "usage: git commit [-a | --interactive | --patch] [-s] [-v] [-u[<mode>]] [--amend]\n",
-    "                  [--dry-run] [(-c | -C | --squash) <commit> | --fixup [(amend|reword):]<commit>]\n",
-    "                  [-F <file> | -m <msg>] [--reset-author] [--allow-empty]\n",
-    "                  [--allow-empty-message] [--no-verify] [-e] [--author=<author>]\n",
-    "                  [--date=<date>] [--cleanup=<mode>] [--[no-]status]\n",
-    "                  [-i | -o] [--pathspec-from-file=<file> [--pathspec-file-nul]]\n",
-    "                  [(--trailer <token>[(=|:)<value>])...] [-S[<keyid>]]\n",
-    "                  [--] [<pathspec>...]\n",
-    "\n",
-    "    -q, --[no-]quiet      suppress summary after successful commit\n",
-    "    -v, --[no-]verbose    show diff in commit message template\n",
-    "\n",
-    "Commit message options\n",
-    "    -F, --[no-]file <file>\n",
-    "                          read message from file\n",
-    "    --[no-]author <author>\n",
-    "                          override author for commit\n",
-    "    --[no-]date <date>    override date for commit\n",
-    "    -m, --[no-]message <message>\n",
-    "                          commit message\n",
-    "    -c, --[no-]reedit-message <commit>\n",
-    "                          reuse and edit message from specified commit\n",
-    "    -C, --[no-]reuse-message <commit>\n",
-    "                          reuse message from specified commit\n",
-    "    --[no-]fixup [(amend|reword):]commit\n",
-    "                          use autosquash formatted message to fixup or amend/reword specified commit\n",
-    "    --[no-]squash <commit>\n",
-    "                          use autosquash formatted message to squash specified commit\n",
-    "    --[no-]reset-author   the commit is authored by me now (used with -C/-c/--amend)\n",
-    "    --trailer <trailer>   add custom trailer(s)\n",
-    "    -s, --[no-]signoff    add a Signed-off-by trailer\n",
-    "    -t, --[no-]template <file>\n",
-    "                          use specified template file\n",
-    "    -e, --[no-]edit       force edit of commit\n",
-    "    --[no-]cleanup <mode> how to strip spaces and #comments from message\n",
-    "    --[no-]status         include status in commit message template\n",
-    "    -S, --[no-]gpg-sign[=<key-id>]\n",
-    "                          GPG sign commit\n",
-    "\n",
-    "Commit contents options\n",
-    "    -a, --[no-]all        commit all changed files\n",
-    "    -i, --[no-]include    add specified files to index for commit\n",
-    "    --[no-]interactive    interactively add files\n",
-    "    -p, --[no-]patch      interactively add changes\n",
-    "    -o, --[no-]only       commit only specified files\n",
-    "    -n, --no-verify       bypass pre-commit and commit-msg hooks\n",
-    "    --verify              opposite of --no-verify\n",
-    "    --[no-]dry-run        show what would be committed\n",
-    "    --[no-]short          show status concisely\n",
-    "    --[no-]branch         show branch information\n",
-    "    --[no-]ahead-behind   compute full ahead/behind values\n",
-    "    --[no-]porcelain      machine-readable output\n",
-    "    --[no-]long           show status in long format (default)\n",
-    "    -z, --[no-]null       terminate entries with NUL\n",
-    "    --[no-]amend          amend previous commit\n",
-    "    --no-post-rewrite     bypass post-rewrite hook\n",
-    "    --post-rewrite        opposite of --no-post-rewrite\n",
-    "    -u, --[no-]untracked-files[=<mode>]\n",
-    "                          show untracked files, optional modes: all, normal, no. (Default: all)\n",
-    "    --[no-]pathspec-from-file <file>\n",
-    "                          read pathspec from file\n",
-    "    --[no-]pathspec-file-nul\n",
-    "                          with --pathspec-from-file, pathspec elements are separated with NUL character\n",
-    "\n",
-);
+/// `usage_with_options()` rendering of `builtin/commit.c`'s option table,
+/// verbatim. `parse_options` writes it after an `error:` line for an unknown
+/// option or a malformed value, and to stdout for `-h`; both exit 129.
+const USAGE: &str = r"usage: git commit [-a | --interactive | --patch] [-s] [-v] [-u[<mode>]] [--amend]
+                  [--dry-run] [(-c | -C | --squash) <commit> | --fixup [(amend|reword):]<commit>]
+                  [-F <file> | -m <msg>] [--reset-author] [--allow-empty]
+                  [--allow-empty-message] [--no-verify] [-e] [--author=<author>]
+                  [--date=<date>] [--cleanup=<mode>] [--[no-]status]
+                  [-i | -o] [--pathspec-from-file=<file> [--pathspec-file-nul]]
+                  [(--trailer <token>[(=|:)<value>])...] [-S[<keyid>]]
+                  [--] [<pathspec>...]
+
+    -q, --[no-]quiet      suppress summary after successful commit
+    -v, --[no-]verbose    show diff in commit message template
+
+Commit message options
+    -F, --[no-]file <file>
+                          read message from file
+    --[no-]author <author>
+                          override author for commit
+    --[no-]date <date>    override date for commit
+    -m, --[no-]message <message>
+                          commit message
+    -c, --[no-]reedit-message <commit>
+                          reuse and edit message from specified commit
+    -C, --[no-]reuse-message <commit>
+                          reuse message from specified commit
+    --[no-]fixup [(amend|reword):]commit
+                          use autosquash formatted message to fixup or amend/reword specified commit
+    --[no-]squash <commit>
+                          use autosquash formatted message to squash specified commit
+    --[no-]reset-author   the commit is authored by me now (used with -C/-c/--amend)
+    --[no-]trailer <trailer>
+                          add custom trailer(s)
+    -s, --[no-]signoff    add a Signed-off-by trailer
+    -t, --[no-]template <file>
+                          use specified template file
+    -e, --[no-]edit       force edit of commit
+    --[no-]cleanup <mode> how to strip spaces and #comments from message
+    --[no-]status         include status in commit message template
+    -S, --[no-]gpg-sign[=<key-id>]
+                          GPG sign commit
+
+Commit contents options
+    -a, --[no-]all        commit all changed files
+    -i, --[no-]include    add specified files to index for commit
+    --[no-]interactive    interactively add files
+    -p, --[no-]patch      interactively add changes
+    -U, --unified <n>     generate diffs with <n> lines context
+    --inter-hunk-context <n>
+                          show context between diff hunks up to the specified number of lines
+    -o, --[no-]only       commit only specified files
+    -n, --no-verify       bypass pre-commit and commit-msg hooks
+    --verify              opposite of --no-verify
+    --[no-]dry-run        show what would be committed
+    --[no-]short          show status concisely
+    --[no-]branch         show branch information
+    --[no-]ahead-behind   compute full ahead/behind values
+    --[no-]porcelain      machine-readable output
+    --[no-]long           show status in long format (default)
+    -z, --[no-]null       terminate entries with NUL
+    --[no-]amend          amend previous commit
+    --no-post-rewrite     bypass post-rewrite hook
+    --post-rewrite        opposite of --no-post-rewrite
+    -u, --[no-]untracked-files[=<mode>]
+                          show untracked files, optional modes: all, normal, no. (Default: all)
+    --[no-]pathspec-from-file <file>
+                          read pathspec from file
+    --[no-]pathspec-file-nul
+                          with --pathspec-from-file, pathspec elements are separated with NUL character
+
+";
 
 use gix::bstr::{BString, ByteSlice};
 use gix::index::entry::{Flags, Mode, Stage, Stat};
@@ -874,6 +877,10 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
                             }
                             break;
                         }
+                        // parse_options_step() tests `internal_help` inside the
+                        // short-option loop, so `-h` answers wherever it lands
+                        // in a cluster — on stdout at 129, with no `error:` line.
+                        'h' => return Ok(super::show_usage(USAGE)),
                         _ => return Err(usage_error(format!("unknown switch `{c}'"))),
                     }
                 }
@@ -1041,12 +1048,15 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     // commit succeeds.
     let mut interactive_stage = None;
     if interactive {
-        let guard = InteractiveStage::hold(&repo)?;
+        let mut guard = InteractiveStage::hold(&repo, patch_interactive)?;
         let status = if patch_interactive {
-            super::add_patch::run_status(
+            // git's `interactive_add()` under a `GIT_INDEX_FILE` pointed at the
+            // prepared copy: the selector's `apply --cached` children stage there
+            // and the repository's index is untouched until [`InteractiveStage::adopt`].
+            super::add_patch::run_in_index(
                 &repo,
                 super::add_patch::Mode::Add,
-                None,
+                guard.staging_index(),
                 patch_opts.to_interactive(false),
                 &pathspecs,
             )?
@@ -1056,6 +1066,9 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
         if status != 0 {
             crate::git_fatal!("interactive add failed");
         }
+        // `read_index_from(get_lock_file_path(&index_lock))`: the selection becomes
+        // the index the tree is built from below.
+        guard.adopt()?;
         interactive_stage = Some(guard);
         // The selector is done and its `apply` children have exited, so the lane
         // is safe to hold again for the tree build, the commit and the ref update.
@@ -2152,48 +2165,116 @@ fn index_differs_from_head(
     Ok(flatten(index) != old)
 }
 
-/// Installs a prepared index as the repository's index for the lifetime of the
-/// guard, restoring the original on drop — the equivalent of git pointing
-/// `the_repository->index_file` at its `next-index-<pid>` file and rolling back.
+/// git's `index.lock` around `commit --interactive` (`prepare_index()`,
+/// builtin/commit.c:395).
 ///
-/// The original file is *moved* aside rather than copied, so it comes back with
-/// its inode, mode and mtime intact, and the restore runs on every exit path
-/// including a panic. `index.lock` is held exclusively for the whole window —
-/// the same lock git's own `prepare_index()` takes with `LOCK_DIE_ON_ERROR`, so
-/// a concurrent writer (stock git included) cannot walk into the swap.
-/// The rollback half of git's `index.lock` around `commit --interactive`.
-///
-/// git writes the current index into `index.lock`, points `GIT_INDEX_FILE` at
-/// the lock, lets the selector stage into *that* copy, and only
+/// git writes the current index into `index.lock`, points
+/// `the_repository->index_file` and `GIT_INDEX_FILE` at that copy, lets the
+/// selector stage into it, and reads the result back into its in-memory index.
 /// `commit_index_files()` — reached once the commit object exists and `HEAD` has
-/// moved — renames it over the real index. An aborted commit (empty message,
-/// failing `pre-commit`, an editor that exits non-zero) instead rolls the lock
-/// back and the selection is discarded.
+/// moved — renames the copy over the real index; an aborted commit (empty
+/// message, a failing `pre-commit`, an editor that exits non-zero) instead rolls
+/// it back and the selection is discarded.
 ///
-/// This build's index plumbing ignores `GIT_INDEX_FILE`, so the `apply --cached`
-/// child would write the real index whatever the environment said. The selector
-/// therefore runs against the real index and the *original* bytes are held here
-/// instead, restored by [`Drop`] unless [`Self::keep`] has been called. Both
-/// end states — kept on success, discarded on abort — are git's.
+/// `commit -p` reproduces the scratch index. [`Self::staging_index`] is the path
+/// [`super::add_patch::run_in_index`] exports as `GIT_INDEX_FILE` to the
+/// selector's `apply --cached` children, so the repository's own index never
+/// holds a half-finished selection — not even while the selector sits waiting on
+/// the next keystroke, which under an interactive command can be a long time.
+///
+/// What is *not* reproduced is git's in-memory index, and that is what the swap
+/// below is for. git can point `index_file` back at the real index and still
+/// build the tree out of the scratch copy, because that content lives in
+/// `the_repository->index`. Every read here goes to disk through
+/// `repo.open_index()` — the tree build in [`commit`] among them — so the
+/// prepared index has to *be* at `repo.index_path()` before the commit proceeds.
+/// [`Self::adopt`] moves the original aside and renames the scratch index into
+/// place as soon as the selector returns; [`Drop`] renames the original back
+/// unless [`Self::keep`] has been called. Both end states — kept on success,
+/// discarded on abort — are git's.
+///
+/// An earlier comment here justified the swap by claiming this build ignores
+/// `GIT_INDEX_FILE`. It does not: `gix::Repository::index_path()` reads the
+/// variable, which is exactly how the scratch index above works and how
+/// `git history split` and `git stash -p` drive the same selector.
+///
+/// `commit --interactive` — the numbered menu rather than `-p` — has no scratch
+/// index, because [`super::add_interactive`] reads and writes `repo.index_path()`
+/// itself instead of shelling out with `GIT_INDEX_FILE` set, so there is nothing
+/// to point elsewhere. It stages into the repository's index directly and only
+/// the rollback half applies, which is why [`Self::hold`] copies the original
+/// aside for that mode instead of seeding a scratch index.
 struct InteractiveStage {
-    /// The repository index the selector stages into.
+    /// The repository index the prepared selection has to end up at.
     index: std::path::PathBuf,
-    /// The index as it was before the selector ran, or `None` when the
-    /// repository had no index file at all.
-    original: Option<Vec<u8>>,
+    /// The scratch index the `-p` selector stages into, until [`Self::adopt`]
+    /// renames it over [`Self::index`]. `None` for the numbered menu, which
+    /// stages into the repository's index directly.
+    scratch: Option<std::path::PathBuf>,
+    /// Where the index as it was before the selector ran is parked, or `None`
+    /// when the repository had no index file at all.
+    original: Option<std::path::PathBuf>,
     /// Set once the commit has succeeded, which disarms the rollback.
     keep: bool,
 }
 
+/// The scratch index `commit -p` stages into, and where the original is parked
+/// for the duration. Both sit beside the index so that moving one into place is a
+/// rename on the same filesystem rather than a copy.
+const SCRATCH_INDEX: &str = "index.zvcs-interactive";
+const ORIGINAL_INDEX: &str = "index.zvcs-interactive-orig";
+
 impl InteractiveStage {
-    fn hold(repo: &gix::Repository) -> Result<Self> {
+    /// `patch` picks git's scratch-index arrangement; the numbered menu gets the
+    /// copy-aside fallback described on the type.
+    fn hold(repo: &gix::Repository, patch: bool) -> Result<Self> {
         let index = repo.index_path();
-        let original = match std::fs::read(&index) {
-            Ok(bytes) => Some(bytes),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => return Err(e.into()),
-        };
-        Ok(Self { index, original, keep: false })
+        let exists = index.exists();
+        let mut guard = Self { index, scratch: None, original: None, keep: false };
+        if patch {
+            let scratch = guard.index.with_file_name(SCRATCH_INDEX);
+            // A scratch index left behind by a killed run must not be inherited.
+            let _ = std::fs::remove_file(&scratch);
+            if exists {
+                std::fs::copy(&guard.index, &scratch)?;
+            }
+            guard.scratch = Some(scratch);
+        } else if exists {
+            let original = guard.index.with_file_name(ORIGINAL_INDEX);
+            let _ = std::fs::remove_file(&original);
+            std::fs::copy(&guard.index, &original)?;
+            guard.original = Some(original);
+        }
+        Ok(guard)
+    }
+
+    /// The index the selector stages into: the scratch copy under `-p`, the
+    /// repository's own under the numbered menu.
+    fn staging_index(&self) -> &std::path::Path {
+        self.scratch.as_deref().unwrap_or(&self.index)
+    }
+
+    /// git's `read_index_from(get_lock_file_path(&index_lock))`: the selection
+    /// becomes the index the rest of the commit reads. The original is *moved*
+    /// aside rather than copied, so a rollback brings it back with its inode,
+    /// mode and mtime intact.
+    ///
+    /// A no-op for the numbered menu, which has already staged into `index`.
+    fn adopt(&mut self) -> Result<()> {
+        let Some(scratch) = self.scratch.take() else { return Ok(()) };
+        if self.index.exists() {
+            let original = self.index.with_file_name(ORIGINAL_INDEX);
+            let _ = std::fs::remove_file(&original);
+            std::fs::rename(&self.index, &original)?;
+            self.original = Some(original);
+        }
+        // The selector only writes the scratch index when something was staged,
+        // so a run that selected nothing in a repository that had no index leaves
+        // none behind — which is what git's empty prepared index amounts to.
+        if scratch.exists() {
+            std::fs::rename(&scratch, &self.index)?;
+        }
+        Ok(())
     }
 
     /// git's `commit_index_files()`: the staged selection stands.
@@ -2204,20 +2285,36 @@ impl InteractiveStage {
 
 impl Drop for InteractiveStage {
     fn drop(&mut self) {
-        if self.keep {
-            return;
+        // Reached only when the selector itself failed, since `adopt` takes it.
+        if let Some(scratch) = &self.scratch {
+            let _ = std::fs::remove_file(scratch);
         }
         match &self.original {
-            Some(bytes) => {
-                let _ = std::fs::write(&self.index, bytes);
+            Some(original) if self.keep => {
+                let _ = std::fs::remove_file(original);
             }
-            None => {
+            Some(original) => {
+                let _ = std::fs::rename(original, &self.index);
+            }
+            // There was no index before the selector ran, so git's rollback leaves
+            // the repository without one.
+            None if !self.keep => {
                 let _ = std::fs::remove_file(&self.index);
             }
+            None => {}
         }
     }
 }
 
+/// Installs a prepared index as the repository's index for the lifetime of the
+/// guard, restoring the original on drop — the equivalent of git pointing
+/// `the_repository->index_file` at its `next-index-<pid>` file and rolling back.
+///
+/// The original file is *moved* aside rather than copied, so it comes back with
+/// its inode, mode and mtime intact, and the restore runs on every exit path
+/// including a panic. `index.lock` is held exclusively for the whole window —
+/// the same lock git's own `prepare_index()` takes with `LOCK_DIE_ON_ERROR`, so
+/// a concurrent writer (stock git included) cannot walk into the swap.
 struct IndexSwap {
     /// The repository index path the prepared index was written to.
     index: std::path::PathBuf,

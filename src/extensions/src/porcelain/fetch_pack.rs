@@ -121,6 +121,13 @@ pub fn fetch_pack(args: &[String]) -> Result<ExitCode> {
         _ => args,
     };
 
+    // `show_usage_if_asked(argc, argv, fetch_pack_usage)` (builtin/fetch-pack.c:78):
+    // a LONE `-h` on stdout at 129. With anything else on the line `-h` is just
+    // an unrecognized flag, which the scan below reports on stderr.
+    if let Some(code) = super::show_usage_if_asked(args, USAGE) {
+        return Ok(code);
+    }
+
     // --- argument parsing -------------------------------------------------
     // git stops option parsing at the first non-option, which becomes
     // <repository>; everything after it is a ref name, even if it looks like a
@@ -152,11 +159,6 @@ pub fn fetch_pack(args: &[String]) -> Result<ExitCode> {
             continue;
         }
         match a {
-            // git.c intercepts a bare `-h` and prints the usage on stdout.
-            "-h" => {
-                print!("{USAGE}");
-                return Ok(ExitCode::from(129));
-            }
             "--all" => all = true,
             "--stdin" => from_stdin = true,
             // Progress and verbosity only ever reached stderr, which this port

@@ -57,11 +57,24 @@ use gix::hash::ObjectId;
 use gix::index::entry::Mode;
 use gix::pathspec::search::MatchKind;
 
-/// git's `git rm` usage block, emitted verbatim on a usage error (exit 129).
-const USAGE: &str = "\
-usage: git rm [-f | --force] [-n] [-r] [--cached] [--ignore-unmatch]
+/// `usage_with_options()` over `builtin/rm.c`'s option table: the synopsis, a
+/// blank line, the options, and the blank line the renderer always ends on.
+const USAGE: &str = r"usage: git rm [-f | --force] [-n] [-r] [--cached] [--ignore-unmatch]
               [--quiet] [--pathspec-from-file=<file> [--pathspec-file-nul]]
               [--] [<pathspec>...]
+
+    -n, --[no-]dry-run    dry run
+    -q, --[no-]quiet      do not list removed files
+    --[no-]cached         only remove from the index
+    -f, --[no-]force      override the up-to-date check
+    -r                    allow recursive removal
+    --[no-]ignore-unmatch exit with a zero status even if nothing matched
+    --[no-]sparse         allow updating entries outside of the sparse-checkout cone
+    --[no-]pathspec-from-file <file>
+                          read pathspec from file
+    --[no-]pathspec-file-nul
+                          with --pathspec-from-file, pathspec elements are separated with NUL character
+
 ";
 
 /// A tracked path selected for removal, captured before the index is mutated.
@@ -224,6 +237,10 @@ pub fn rm(args: &[String]) -> Result<ExitCode> {
                 match c {
                     'f' => opts.force = true,
                     'r' => opts.recursive = true,
+                    // parse_options_step() tests `internal_help` inside the
+                    // short-option loop: `-h` prints the block on stdout at 129
+                    // and stops, with no `error:` line.
+                    'h' => return Ok(super::show_usage(USAGE)),
                     'n' => opts.dry_run = true,
                     'q' => opts.quiet = true,
                     _ => return Ok(usage_err(format!("unknown switch `{c}'"))),

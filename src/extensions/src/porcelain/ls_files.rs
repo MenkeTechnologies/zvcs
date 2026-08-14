@@ -276,6 +276,12 @@ fn pathspec_parse_fatal(err: &gix::pathspec::parse::Error, raw: &str) -> Option<
 /// `-v`, `-f`, `--debug`, `--format`, `--resolve-undo` and `--with-tree` are
 /// ported as well.
 pub fn ls_files(args: &[String]) -> Result<ExitCode> {
+    // `show_usage_with_options_if_asked()` (builtin/ls-files.c:670): a lone `-h`
+    // answers on stdout at 129, before the index is read.
+    if let Some(code) = super::show_usage_if_asked(args, USAGE) {
+        return Ok(code);
+    }
+
     let mut opts = Opts::default();
     let mut no_more_flags = false;
     // Original pathspec spelling, kept for `--error-unmatch` diagnostics.
@@ -468,6 +474,10 @@ pub fn ls_files(args: &[String]) -> Result<ExitCode> {
                             }
                             break;
                         }
+                        // parse_options' `internal_help` inside the
+                        // short-option loop, which the entry-point check only
+                        // covers for a lone `-h`.
+                        'h' => return Ok(super::show_usage(USAGE)),
                         _ => return Ok(usage_error(&format!("unknown switch `{c}'"))),
                     }
                     j += 1;
@@ -504,6 +514,37 @@ pub fn ls_files(args: &[String]) -> Result<ExitCode> {
     // stage columns make every line distinguishable, so dedup is turned off.
     if opts.tags || opts.stage {
         opts.dedup = false;
+    }
+
+    // git's setup runs before `cmd_ls_files()` is entered at all, so a missing
+    // repository outranks every check above; here it can only outrank the ones
+    // below. Opening it this early is also what the work-tree gate needs.
+    let repo = gix::discover(".")?;
+
+    // git's `require_work_tree` (builtin/ls-files.c:707-708, 720-721): the five
+    // selectors that read the filesystem need one, and `setup_work_tree()` dies
+    // for them when setup found none.
+    //
+    //     if (show_modified || show_others || show_deleted ||
+    //         (dir.flags & DIR_SHOW_IGNORED) || show_killed)
+    //             require_work_tree = 1;
+    //
+    // Nothing else is in the set. `--directory` and `--exclude-standard` only
+    // shape a walk one of those five has to have asked for, and `-c`, `-s`, `-u`,
+    // `-t` and `--resolve-undo` read the index alone — all of them work in a bare
+    // repository. The gate sits *before* the guards below, which is why
+    // `ls-files -i` in one reports the work tree rather than the missing
+    // `-o`/`-c`, and after the `--format` rejection above, which still wins.
+    //
+    // A work tree named by `GIT_WORK_TREE` satisfies it: git installs that in
+    // `setup_explicit_git_dir()` before `core.bare` is read, so `ls-files -o` in a
+    // bare repository lists the given tree instead of dying.
+    if (opts.modified || opts.others || opts.deleted || opts.ignored || opts.killed)
+        && !repo.workdir().is_some_and(|wt| wt.is_dir())
+    {
+        // `setup_work_tree()` dies with the same line whether no work tree was
+        // configured or `chdir()` into the configured one failed (setup.c:503-505).
+        return Err(crate::fatal::need_work_tree());
     }
 
     // git's `--recurse-submodules` guards, both fatal (exit 128) and both checked
@@ -553,7 +594,6 @@ pub fn ls_files(args: &[String]) -> Result<ExitCode> {
         opts.cached = true;
     }
 
-    let repo = gix::discover(".")?;
     // git's `do_read_index` (read-cache.c:2216-2224) only dies on an open
     // failure when the caller demanded the file; `ls-files` reaches it through
     // `read_index_from`'s `must_exist == 0` path, so a missing index is an

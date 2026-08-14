@@ -65,6 +65,44 @@ use gix::hash::ObjectId;
 use gix::objs::{CommitRef, Kind, TagRef};
 use gix::prelude::ObjectIdExt;
 
+/// `usage_with_options()` over `builtin/for-each-ref.c`'s option table.
+const USAGE: &str = r"usage: git for-each-ref [--count=<count>] [--shell|--perl|--python|--tcl]
+                                [(--sort=<key>)...] [--format=<format>]
+                                [--include-root-refs] [--points-at=<object>]
+                                [--merged[=<object>]] [--no-merged[=<object>]]
+                                [--contains[=<object>]] [--no-contains[=<object>]]
+                                [(--exclude=<pattern>)...] [--start-after=<marker>]
+                                [ --stdin | (<pattern>...)]
+
+    -s, --[no-]shell      quote placeholders suitably for shells
+    -p, --[no-]perl       quote placeholders suitably for perl
+    --[no-]python         quote placeholders suitably for python
+    --[no-]tcl            quote placeholders suitably for Tcl
+    --[no-]omit-empty     do not output a newline after empty formatted refs
+
+    --[no-]count <n>      show only <n> matched refs
+    --[no-]format <format>
+                          format to use for the output
+    --[no-]start-after <marker>
+                          start iteration after the provided marker
+    --[no-]color[=<when>] respect format colors
+    --[no-]exclude <pattern>
+                          exclude refs which match pattern
+    --[no-]sort <key>     field name to sort on
+    --[no-]points-at <object>
+                          print only refs which points at the given object
+    --merged <commit>     print only refs that are merged
+    --no-merged <commit>  print only refs that are not merged
+    --contains <commit>   print only refs which contain the commit
+    --no-contains <commit>
+                          print only refs which don't contain the commit
+    --[no-]ignore-case    sorting and filtering are case insensitive
+    --[no-]stdin          read reference patterns from stdin
+    --[no-]include-root-refs
+                          also include HEAD ref and pseudorefs
+
+";
+
 /// The `%(...)` fields this module can evaluate.
 #[derive(Clone)]
 enum Field {
@@ -540,6 +578,9 @@ pub fn for_each_ref(args: &[String]) -> Result<ExitCode> {
             _ => (a, None),
         };
         match name {
+            // parse_options_step()'s `internal_help`: the block on stdout at
+            // 129, with no `error:` line ahead of it.
+            "-h" => return Ok(super::show_usage(USAGE)),
             "--format" => format = value!(rest, "format").into_bytes(),
             "--count" => {
                 let v = value!(rest, "count");

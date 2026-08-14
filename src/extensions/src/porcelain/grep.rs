@@ -88,9 +88,93 @@
 use anyhow::{bail, Context, Result};
 use std::collections::BTreeMap;
 use std::io::{IsTerminal, Write};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use gix::bstr::{BStr, BString, ByteSlice};
+
+/// `usage_with_options()` over `builtin/grep.c`'s option table.
+const USAGE: &str = r"usage: git grep [<options>] [-e] <pattern> [<rev>...] [[--] <path>...]
+
+    --[no-]cached         search in index instead of in the work tree
+    --no-index            find in contents not managed by git
+    --index               opposite of --no-index
+    --[no-]untracked      search in both tracked and untracked files
+    --[no-]exclude-standard
+                          ignore files specified via '.gitignore'
+    --[no-]recurse-submodules
+                          recursively search in each submodule
+
+    -v, --[no-]invert-match
+                          show non-matching lines
+    -i, --[no-]ignore-case
+                          case insensitive matching
+    -w, --[no-]word-regexp
+                          match patterns only at word boundaries
+    -a, --[no-]text       process binary files as text
+    -I                    don't match patterns in binary files
+    --[no-]textconv       process binary files with textconv filters
+    -r, --[no-]recursive  search in subdirectories (default)
+    --max-depth <n>       descend at most <n> levels
+
+    -E, --[no-]extended-regexp
+                          use extended POSIX regular expressions
+    -G, --[no-]basic-regexp
+                          use basic POSIX regular expressions (default)
+    -F, --[no-]fixed-strings
+                          interpret patterns as fixed strings
+    -P, --[no-]perl-regexp
+                          use Perl-compatible regular expressions
+
+    -n, --[no-]line-number
+                          show line numbers
+    --[no-]column         show column number of first match
+    -h                    don't show filenames
+    -H                    show filenames
+    --[no-]full-name      show filenames relative to top directory
+    -l, --[no-]files-with-matches
+                          show only filenames instead of matching lines
+    --[no-]name-only      synonym for --files-with-matches
+    -L, --[no-]files-without-match
+                          show only the names of files without match
+    -z, --[no-]null       print NUL after filenames
+    -o, --[no-]only-matching
+                          show only matching parts of a line
+    -c, --[no-]count      show the number of matches instead of matching lines
+    --[no-]color[=<when>] highlight matches
+    --[no-]break          print empty line between matches from different files
+    --[no-]heading        show filename only once above matches from same file
+
+    -C, --[no-]context <n>
+                          show <n> context lines before and after matches
+    -B, --before-context <n>
+                          show <n> context lines before matches
+    -A, --after-context <n>
+                          show <n> context lines after matches
+    --[no-]threads <n>    use <n> worker threads
+    -NUM                  shortcut for -C NUM
+    -p, --[no-]show-function
+                          show a line with the function name before matches
+    -W, --[no-]function-context
+                          show the surrounding function
+
+    -f <file>             read patterns from file
+    -e <pattern>          match <pattern>
+    --and                 combine patterns specified with -e
+    --or
+    --not
+    (
+    )
+    -q, --[no-]quiet      indicate hit with exit status without output
+    --[no-]all-match      show only matches from files that match all patterns
+
+    -O, --[no-]open-files-in-pager[=<pager>]
+                          show matching files in the pager
+    --[no-]ext-grep       allow calling of grep(1) (ignored by this build)
+    -m, --[no-]max-count <n>
+                          maximum number of results per file
+
+";
 
 /// git's `FIRST_FEW_BYTES`: only this much of a file is scanned for NUL when
 /// deciding whether it is binary (`buffer_is_binary()` in `xdiff-interface.c`).
@@ -273,6 +357,15 @@ enum Expr {
 /// `-L`, when at least one file was listed), `1` when none did, `128` for a
 /// fatal such as a missing pattern, and `129` for a malformed option value.
 pub fn grep(args: &[String]) -> Result<ExitCode> {
+    // parse-options' lone-`-h` rule (parse-options.c:1049,
+    // `internal_help && ctx->total == 1`). It has to be spelled as the sole
+    // argument here rather than handled in the option loop, because grep owns
+    // `-h`: `OPT_NEGBIT('h', NULL, &opt.pathname, …)` is `--no-filename`, so
+    // `git grep -h <pattern>` is a search, not a help request.
+    if let Some(code) = super::show_usage_if_asked(args, USAGE) {
+        return Ok(code);
+    }
+
     let mut opts = Opts {
         invert: false,
         ignore_case: false,
@@ -799,12 +892,14 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
         }
         if repo.rev_parse_single(arg.as_str()).is_ok() {
             // git's `verify_non_filename`: a token that is both a revision and an
-            // existing path is ambiguous unless a `--` disambiguates it.
-            if !seen_dashdash && check_filename(&arg) {
-                eprintln!("fatal: ambiguous argument '{arg}': both revision and filename");
-                eprintln!("Use '--' to separate paths from revisions, like this:");
-                eprintln!("'git <command> [<revision>...] -- [<file>...]'");
-                return Ok(ExitCode::from(128));
+            // existing path is ambiguous unless a `--` disambiguates it — but only
+            // where a worktree path could have been meant, which is why the check
+            // stands down in a bare repository (where `HEAD` is a file in the cwd).
+            if !seen_dashdash {
+                if let Some(msg) = crate::setup::verify_non_filename(&repo, &arg) {
+                    eprintln!("fatal: {msg}");
+                    return Ok(ExitCode::from(128));
+                }
             }
             revs.push(arg);
             r += 1;
@@ -948,7 +1043,35 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
         column: opts.column,
     };
 
-    let index = repo.open_index()?;
+    // builtin/grep.c:1416-1418. `grep` is not a `NEED_WORK_TREE` command, so only
+    // the one branch of its else-if chain that reads worktree files asks for a work
+    // tree: the default search, with no `<tree>` to read blobs from, no `--cached`
+    // to read the index instead, and neither `--no-index` nor `--untracked` (both
+    // of which walk the directory git is standing in and want no index at all).
+    if !opts.no_index
+        && !opts.untracked
+        && !opts.cached
+        && revs.is_empty()
+        && !repo.workdir().is_some_and(|wt| wt.is_dir())
+    {
+        return Err(crate::fatal::need_work_tree());
+    }
+
+    // `repo_read_index()` reaches `do_read_index()` with `must_exist == 0`
+    // (read-cache.c:2216-2224), so a repository that has never staged anything —
+    // every bare one included — hands `grep` an empty index rather than an error.
+    let index = match repo.open_index() {
+        Ok(index) => index,
+        Err(gix::worktree::open_index::Error::IndexFile(gix::index::file::init::Error::Io(err)))
+            if err.kind() == std::io::ErrorKind::NotFound =>
+        {
+            gix::index::File::from_state(
+                gix::index::State::new(repo.object_hash()),
+                repo.index_path(),
+            )
+        }
+        Err(err) => return Err(err.into()),
+    };
 
     // `--textconv` can only change what is searched when there is a converter to
     // run, and one exists only if some `diff.<driver>.textconv` command is
@@ -1035,7 +1158,14 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
     if revs.is_empty() {
         let mut files: Vec<(BString, Option<gix::hash::ObjectId>)> = Vec::new();
         if opts.no_index {
-            collect_no_index(&repo, &index, &specs, &opts, &mut files)?;
+            // gitoxide's dirwalk is a *worktree* walk and has none to run in a bare
+            // repository; git's has no such requirement, so the walk falls back to
+            // the plain directory one git actually describes.
+            if repo.workdir().is_some() {
+                collect_no_index(&repo, &index, &specs, &opts, &mut files)?;
+            } else {
+                collect_directory_no_worktree(&repo, &index, &specs, &opts, &mut files)?;
+            }
         } else {
             // `empty_patterns_match_prefix = true` reproduces git's behaviour of
             // limiting a bare invocation to the current directory's subtree.
@@ -1096,7 +1226,11 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
             }
 
             if opts.untracked {
-                collect_untracked(&repo, &index, &specs, &opts, &mut files)?;
+                if repo.workdir().is_some() {
+                    collect_untracked(&repo, &index, &specs, &opts, &mut files)?;
+                } else {
+                    collect_directory_no_worktree(&repo, &index, &specs, &opts, &mut files)?;
+                }
             }
         }
 
@@ -1770,7 +1904,7 @@ fn verify_filename(arg: &str, diagnose_misspelt_rev: bool) -> Option<ExitCode> {
         eprintln!("fatal: option '{arg}' must come before non-option arguments");
         return Some(ExitCode::from(128));
     }
-    if looks_like_pathspec(arg) || check_filename(arg) {
+    if looks_like_pathspec(arg) || crate::setup::check_filename(arg) {
         return None;
     }
     if diagnose_misspelt_rev {
@@ -1784,25 +1918,6 @@ fn verify_filename(arg: &str, diagnose_misspelt_rev: bool) -> Option<ExitCode> {
         eprintln!("Use 'git <command> -- <path>...' to specify paths that do not exist locally.");
     }
     Some(ExitCode::from(128))
-}
-
-/// git's `check_filename()`: whether `arg` names something that exists in the
-/// worktree. It strips the leading pathspec magic that still leaves a path behind
-/// and stats what remains. Magic with nothing after it counts as existing without
-/// a stat — `:/` names the root, and excluding everything with a bare `:!`/`:^`
-/// is pointless but legal. A bare empty argument gets no such exemption: it
-/// reaches the stat and fails it, which is why `git grep --no-index <pattern> ""`
-/// is a fatal rather than a match-nothing.
-fn check_filename(arg: &str) -> bool {
-    let path = match [":/", ":!", ":^"]
-        .into_iter()
-        .find_map(|magic| arg.strip_prefix(magic))
-    {
-        Some("") => return true,
-        Some(rest) => rest,
-        None => arg,
-    };
-    std::fs::symlink_metadata(path).is_ok()
 }
 
 /// git's `looks_like_pathspec()`: raw pathspec magic, or an unescaped glob
@@ -1847,6 +1962,114 @@ fn has_textconv_driver(repo: &gix::Repository) -> bool {
                 && section.value("textconv").is_some()
         });
     found
+}
+
+/// git's `grep_directory()` (builtin/grep.c:914-933) where there is no work tree
+/// to walk.
+///
+/// `fill_directory()` walks the *current directory*; a work tree is nowhere in it,
+/// which is how `--no-index` greps outside a repository entirely and how
+/// `--untracked` in a bare repository greps the git directory it is standing in.
+/// Paths stay relative to the cwd because a bare setup leaves git with no prefix
+/// to prepend — `setup_bare_git_dir()` (setup.c:1254-1286) returns `NULL` — so
+/// running this from `<bare>/hooks` prints `pre-commit.sample`, not
+/// `hooks/pre-commit.sample`.
+///
+/// `exc_std` in git's signature is [`Opts::exclude_standard`] here: off under
+/// `--no-index` and on under `--untracked`, which is git resolving `opt_exclude`
+/// from `use_index`. When it is on, `setup_standard_excludes()`'s stack — the
+/// repository's `info/exclude`, `core.excludesFile` and the `.gitignore` files
+/// found along the way — decides what the walk skips, directories included.
+fn collect_directory_no_worktree(
+    repo: &gix::Repository,
+    index: &gix::index::File,
+    specs: &[BString],
+    opts: &Opts,
+    files: &mut Vec<(BString, Option<gix::hash::ObjectId>)>,
+) -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    let mut ps = repo.pathspec(
+        true,
+        specs,
+        false,
+        index,
+        gix::worktree::stack::state::attributes::Source::IdMapping,
+    )?;
+    let mut excludes = opts
+        .exclude_standard
+        .then(|| {
+            repo.excludes(
+                index,
+                None,
+                gix::worktree::stack::state::ignore::Source::IdMapping,
+            )
+        })
+        .transpose()?;
+    // The exclude stack is rooted at the git directory when there is no work tree
+    // (gix's `Repository::excludes`), so a cwd below it has to contribute its own
+    // path for the per-directory `.gitignore` lookups to land in the right place.
+    // A cwd outside the root — `GIT_DIR` pointing elsewhere — has no such path and
+    // is queried by its own relative names.
+    let stack_prefix: Vec<u8> = gix::path::realpath(repo.git_dir())
+        .ok()
+        .and_then(|root| cwd.strip_prefix(root).ok().map(Path::to_path_buf))
+        .filter(|rel| !rel.as_os_str().is_empty())
+        .map(|rel| {
+            let mut p = gix::path::into_bstr(rel).into_owned().to_vec();
+            p.push(b'/');
+            p
+        })
+        .unwrap_or_default();
+
+    let mut dirs = vec![(cwd, BString::default())];
+    while let Some((dir, rela)) = dirs.pop() {
+        let Ok(read) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in read.flatten() {
+            let name = gix::path::into_bstr(PathBuf::from(entry.file_name())).into_owned();
+            // `read_directory()` never descends a nested `.git`.
+            if name == ".git" {
+                continue;
+            }
+            let mut path = BString::from(rela.to_vec());
+            if !path.is_empty() {
+                path.push(b'/');
+            }
+            path.extend_from_slice(&name);
+            // `file_type` does not follow symlinks, so a symlink to a directory is
+            // not a directory to descend into here, exactly as `DT_LNK` is not for
+            // git.
+            let Ok(kind) = entry.file_type() else { continue };
+            let is_dir = kind.is_dir();
+            if !is_dir && !kind.is_file() {
+                continue;
+            }
+            if let Some(stack) = excludes.as_mut() {
+                let mut probe = BString::from(stack_prefix.clone());
+                probe.extend_from_slice(&path);
+                let mode = is_dir.then_some(gix::index::entry::Mode::DIR);
+                if stack
+                    .at_entry(probe.as_bstr(), mode)
+                    .map(|p| p.is_excluded())
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+            }
+            if is_dir {
+                dirs.push((dir.join(entry.file_name()), path));
+                continue;
+            }
+            if !ps.is_included(path.as_bstr(), Some(false)) {
+                continue;
+            }
+            // `None` for the id: the bytes come from disk, read relative to the
+            // cwd the walk started in.
+            files.push((path, None));
+        }
+    }
+    Ok(())
 }
 
 /// Collect every file under `specs` for `--no-index`, which searches the
@@ -2387,8 +2610,12 @@ fn load_content(
 ) -> Result<Option<Vec<u8>>> {
     let raw = match src {
         Source::Work(path) => {
-            let Some(abs) = repo.workdir_path(path.as_bstr()) else {
-                return Ok(None);
+            // A worktree walk names paths from the work tree root; the directory
+            // walk of a repository that has none names them from the current
+            // directory, which is where `grep_file()` opens them from too.
+            let abs = match repo.workdir_path(path.as_bstr()) {
+                Some(abs) => abs,
+                None => gix::path::from_bstr(path.as_bstr()).into_owned(),
             };
             match std::fs::read(&abs) {
                 Ok(bytes) => bytes,
@@ -3168,17 +3395,32 @@ fn translate_pattern(pattern: &str, dialect: Dialect) -> Result<String> {
 /// the *escaped* forms (`\(` `\)` `\{` `\}` `\+` `\?` `\|`) while the bare
 /// characters are literals; ERE (and this crate) are the reverse. Bytes inside a
 /// `[...]` bracket expression are copied verbatim.
+///
+/// `*` is the exception that is not a matter of escaping: it is a quantifier only
+/// where something precedes it to repeat, and a plain literal everywhere else —
+/// at the start of the pattern, after a leading `^`, after `\(`, and after `\|`.
+/// So `git grep -- '*.rs'` searches for the three characters `*.r` followed by
+/// any byte, and cannot fail to compile. Verified against git 2.55.0: `*x`,
+/// `\(*x\)` and `a\|*x` all match a line containing `*x`, and `^*x` matches only
+/// a line *starting* `*x`.
 fn bre_to_regex(p: &str) -> String {
     let b = p.as_bytes();
     let mut out = String::new();
     let mut i = 0;
     let mut in_class = false;
+    // Whether a repeatable expression precedes this position. False at the start
+    // and immediately after `\(` or `\|`, which are exactly the places a `*` has
+    // nothing to quantify. An anchor leaves it alone: `^` is itself an anchor
+    // only where this is already false, and a literal `^` elsewhere is repeatable
+    // either way, so `a^*b` quantifies the caret while `^*b` does not.
+    let mut repeatable = false;
     while i < b.len() {
         let c = b[i];
         if in_class {
             out.push(c as char);
             if c == b']' {
                 in_class = false;
+                repeatable = true;
             }
             i += 1;
             continue;
@@ -3192,11 +3434,15 @@ fn bre_to_regex(p: &str) -> String {
                 let n = b[i + 1];
                 match n {
                     // BRE's escaped operators become bare operators.
-                    b'(' | b')' | b'{' | b'}' | b'+' | b'?' | b'|' => out.push(n as char),
+                    b'(' | b')' | b'{' | b'}' | b'+' | b'?' | b'|' => {
+                        out.push(n as char);
+                        repeatable = !matches!(n, b'(' | b'|');
+                    }
                     // Everything else keeps its backslash (`\.`, `\\`, `\b`, …).
                     _ => {
                         out.push('\\');
                         out.push(n as char);
+                        repeatable = true;
                     }
                 }
                 i += 1;
@@ -3205,8 +3451,24 @@ fn bre_to_regex(p: &str) -> String {
             b'(' | b')' | b'{' | b'}' | b'+' | b'?' | b'|' => {
                 out.push('\\');
                 out.push(c as char);
+                repeatable = true;
             }
-            _ => out.push(c as char),
+            b'*' => {
+                if repeatable {
+                    out.push('*');
+                } else {
+                    out.push_str("\\*");
+                    // A literal `*` is itself repeatable: `**` at the start of a
+                    // BRE is a literal star, quantified.
+                    repeatable = true;
+                }
+            }
+            // Anchors do not change what a following `*` can repeat.
+            b'^' | b'$' => out.push(c as char),
+            _ => {
+                out.push(c as char);
+                repeatable = true;
+            }
         }
         i += 1;
     }

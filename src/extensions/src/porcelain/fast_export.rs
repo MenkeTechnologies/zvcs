@@ -347,6 +347,10 @@ pub fn fast_export(args: &[String]) -> Result<ExitCode> {
             // rev/pathspec resolution as the ones before (see the resolve stage).
             "--" => {}
 
+            // parse_options()'s own `-h`: the block on stdout, exit 129 — not
+            // `usage_exit()`, whose stderr is reserved for rejections.
+            "-h" => return Ok(super::show_usage(USAGE)),
+
             // ---- fast-export's own options ----
             "--no-data" => opts.no_data = true,
             "--data" => opts.no_data = false,

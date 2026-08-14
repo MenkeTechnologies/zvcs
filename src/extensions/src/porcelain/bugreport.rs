@@ -69,6 +69,7 @@ usage: git bugreport [(-o | --output-directory) <path>]
                           specify a destination for the bugreport file(s)
     -s, --[no-]suffix <format>
                           specify a strftime format suffix for the filename(s)
+
 ";
 
 /// `usage()` output: the synopsis string verbatim, so the continuation lines

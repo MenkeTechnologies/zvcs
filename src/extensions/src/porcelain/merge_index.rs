@@ -63,7 +63,7 @@ use std::process::{Command, ExitCode};
 use gix::bstr::{BStr, BString, ByteSlice};
 use gix::hash::ObjectId;
 
-const USAGE: &str = "usage: git merge-index [-o] [-q] <merge-program> (-a | [--] [<filename>...])";
+const USAGE: &str = "usage: git merge-index [-o] [-q] <merge-program> (-a | [--] [<filename>...])\n";
 
 /// One index entry, flattened out of the index so the borrow on it ends before
 /// we start spawning children.
@@ -101,8 +101,14 @@ pub fn merge_index(args: &[String]) -> Result<ExitCode> {
     // git checks this before touching the repository, so an argument-starved
     // invocation is a usage error even outside a repository. `args` excludes the
     // `merge-index` verb, so git's `argc < 3` is `args.len() < 2` here.
+    // `show_usage_if_asked(argc, argv, usage_string)` (builtin/merge-index.c:93)
+    // runs first and writes to stdout; the `argc < 3` refusal below is `usage()`,
+    // which writes the same text to stderr.
+    if let Some(code) = super::show_usage_if_asked(args, USAGE) {
+        return Ok(code);
+    }
     if args.len() < 2 {
-        eprintln!("{USAGE}");
+        eprint!("{USAGE}");
         return Ok(ExitCode::from(129));
     }
 

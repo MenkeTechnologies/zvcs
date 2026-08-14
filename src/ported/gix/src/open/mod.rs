@@ -39,6 +39,10 @@ pub struct Options {
     /// Where the work tree comes from when neither the caller, `GIT_WORK_TREE` nor `core.worktree`
     /// names one.
     pub(crate) implicit_work_tree: ImplicitWorkTree,
+    /// The work tree was named outright by `GIT_WORK_TREE`, which in git's `setup_explicit_git_dir()`
+    /// (`setup.c:1142`) is set before `core.bare` and `core.worktree` are ever consulted — so neither
+    /// may take it away again.
+    pub(crate) work_tree_is_explicit: bool,
     /// Internal to pass an already obtained CWD on to where it may also be used. This avoids the CWD being queried more than once per repo.
     pub(crate) current_dir: Option<PathBuf>,
 }

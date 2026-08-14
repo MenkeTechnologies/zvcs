@@ -19,6 +19,48 @@ pub(crate) fn missing_option_value(key: &str) -> std::process::ExitCode {
     std::process::ExitCode::from(129)
 }
 
+/// `parse-options`' answer to `-h`: the command's usage block on **stdout**,
+/// exit 129.
+///
+/// parse-options.c has one renderer, `usage_with_options_internal()`, and two
+/// callers that differ only in where it writes. A `-h` reaches it through
+/// `parse_options_step()`:
+///
+/// ```c
+/// if (internal_help && *ctx->opt == 'h')
+///         return usage_with_options_internal(ctx, usagestr, options,
+///                                            USAGE_NORMAL, USAGE_TO_STDOUT);
+/// ```
+///
+/// while every *rejection* reaches it through `usage_with_options()`, which
+/// passes `USAGE_TO_STDERR` and prefixes an `error:` line of its own. Both exit
+/// 129 — the status is not what distinguishes them, the stream is. That is the
+/// single rule the whole port kept getting backwards: asking for help is not an
+/// error, so it does not go to stderr and it is not announced as one.
+///
+/// The block itself is bespoke per command (each `builtin/<cmd>.c` owns its
+/// `<cmd>_usage[]` and `struct option` table), so it stays a per-module `USAGE`
+/// const; what is shared, and lives here, is the policy.
+pub(crate) fn show_usage(usage: &str) -> std::process::ExitCode {
+    print!("{usage}");
+    std::process::ExitCode::from(129)
+}
+
+/// `show_usage_with_options_if_asked()` (parse-options.c:1490): the same block
+/// on stdout at 129, but **only when `-h` is the sole argument**.
+///
+/// Commands that do their own argv walk rather than calling `parse_options()`
+/// — `fast-import`, `get-tar-commit-id`, `credential`, `merge-index`,
+/// `merge-recursive` and the rest of the `show_usage_if_asked()` set — call it
+/// on entry. The `ac == 2` guard is the whole difference from [`show_usage`]:
+/// `git merge-index -h` prints usage, `git merge-index -h foo` does not.
+pub(crate) fn show_usage_if_asked(
+    args: &[String],
+    usage: &str,
+) -> Option<std::process::ExitCode> {
+    (args.len() == 1 && args[0] == "-h").then(|| show_usage(usage))
+}
+
 mod add;
 pub(crate) mod add_interactive;
 pub(crate) mod add_patch;
@@ -73,6 +115,7 @@ mod diff;
 pub(crate) mod diff_color;
 mod diff_files;
 mod diff_index;
+mod diff_optval;
 mod diff_pairs;
 mod diff_tree;
 /// The diffcore rename/copy/break passes shared by the diff-producing commands.
@@ -188,6 +231,8 @@ mod send_pack;
 mod sh_i18n__envsubst;
 mod shell;
 mod shortlog;
+mod convert_to_git;
+mod pretty_pad;
 mod show;
 mod show_branch;
 mod show_index;
@@ -351,7 +396,7 @@ pub use range_diff::range_diff;
 pub use read_tree::read_tree;
 pub use rebase::rebase;
 pub use receive_pack::receive_pack;
-pub use reflog::reflog;
+pub use reflog::{reflog, reflog_show_as_log};
 pub use refs::refs;
 pub use remote::remote;
 pub use remote_ext::remote_ext;
@@ -410,3 +455,36 @@ pub use web__browse::web__browse;
 pub use whatchanged::whatchanged;
 pub use worktree::worktree;
 pub use write_tree::write_tree;
+
+#[cfg(test)]
+mod tests {
+    /// `show_usage_if_asked()` fires on a lone `-h` and on nothing else.
+    ///
+    /// This is the one rule that separates the two `-h` families, and getting it
+    /// backwards is silent: the command still prints a plausible usage block, on
+    /// the wrong stream, for command lines where stock git prints something else
+    /// entirely. `git diff-tree -h HEAD` and `git var -h GIT_EDITOR` both used to
+    /// answer with help on stdout where stock answers on stderr, because the
+    /// `argc == 2` guard had been dropped.
+    #[test]
+    fn lone_dash_h_is_the_whole_predicate() {
+        let args = |v: &[&str]| v.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+
+        assert!(super::show_usage_if_asked(&args(&["-h"]), "usage: x\n").is_some());
+
+        for line in [
+            vec!["-h", "HEAD"],   // a trailing operand
+            vec!["--cached", "-h"], // an option ahead of it
+            vec!["-h", "-h"],     // still not `argc == 2`
+            vec!["--help"],       // rewritten to `git help <cmd>` by the dispatcher
+            vec!["-help"],
+            vec!["h"],
+            vec![],
+        ] {
+            assert!(
+                super::show_usage_if_asked(&args(&line), "usage: x\n").is_none(),
+                "{line:?} must not be read as a lone -h"
+            );
+        }
+    }
+}

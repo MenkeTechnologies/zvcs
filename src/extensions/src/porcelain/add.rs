@@ -399,16 +399,7 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
     // EOL normalization `text`/`core.autocrlf` ask for. `git add` hashes the
     // *converted* bytes, so staging the verbatim worktree copy writes a different
     // blob than git does in any repository that normalizes line endings.
-    let (mut filters, filter_index) = repo.filter_pipeline(None)?;
-    // `get_conv_flags()` (convert.c): the `core.safecrlf` round-trip check rides on
-    // `HASH_WRITE_OBJECT`, so it runs only when this add really writes a blob. A dry
-    // run, `-N` and `--refresh` write nothing, and `--renormalize` passes
-    // `HASH_RENORMALIZE`, which returns `CONV_EOL_RENORMALIZE` alone — none of them
-    // warns or fails, however `core.safecrlf` is set.
-    if !write_content || renormalize {
-        filters.options_mut().crlf_roundtrip_check =
-            gix::filter::plumbing::pipeline::CrlfRoundTripCheck::Skip;
-    }
+    let mut filters = super::convert_to_git::WorktreeFilter::new(&repo, write_content, renormalize)?;
     // `path_in_sparse_checkout()`: without `--sparse`, a path the sparse-checkout
     // definition leaves out of the worktree is skipped and reported instead of
     // staged. Loaded only when there is a definition to consult.
@@ -558,14 +549,9 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
             // the pipeline, which is also where git's CRLF round-trip warning
             // (and `core.safecrlf`'s refusal) comes from.
             let bytes = {
-                use std::io::Read;
                 let rela = gix::path::from_bstr(path.as_bstr()).into_owned();
-                let mut converted = Vec::with_capacity(bytes.len());
-                match filters.convert_to_git(bytes.as_slice(), &rela, &filter_index) {
-                    Ok(mut outcome) => {
-                        outcome.read_to_end(&mut converted)?;
-                        converted
-                    }
+                match filters.convert(&repo, &rela, &bytes) {
+                    Ok(converted) => converted,
                     Err(err) => {
                         // `core.safecrlf=true` makes an unsafe conversion fatal:
                         // git names the path, stages nothing and exits 128.
@@ -1160,6 +1146,10 @@ const USAGE: &str = concat!(
     "    -i, --[no-]interactive\n",
     "                          interactive picking\n",
     "    -p, --[no-]patch      select hunks interactively\n",
+    "    --[no-]auto-advance   auto advance to the next file when selecting hunks interactively\n",
+    "    -U, --unified <n>     generate diffs with <n> lines context\n",
+    "    --inter-hunk-context <n>\n",
+    "                          show context between diff hunks up to the specified number of lines\n",
     "    -e, --[no-]edit       edit current diff and apply\n",
     "    -f, --[no-]force      allow adding otherwise ignored files\n",
     "    -u, --[no-]update     update tracked files\n",

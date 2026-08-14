@@ -14,47 +14,48 @@ use crate::revfilter::{compile_patterns, CommitFilter, Dialect};
 /// The usage block stock git prints on a usage error, verbatim. git exits 129
 /// for these, not 1, so the block travels with an explicit exit code rather
 /// than through `anyhow`.
-const USAGE: &str = "usage: git rev-list [<options>] <commit>... [--] [<path>...]\n\
-\n\
-  limiting output:\n\
-    --max-count=<n>\n\
-    --max-age=<epoch>\n\
-    --min-age=<epoch>\n\
-    --sparse\n\
-    --no-merges\n\
-    --min-parents=<n>\n\
-    --no-min-parents\n\
-    --max-parents=<n>\n\
-    --no-max-parents\n\
-    --remove-empty\n\
-    --all\n\
-    --branches\n\
-    --tags\n\
-    --remotes\n\
-    --stdin\n\
-    --exclude-hidden=[fetch|receive|uploadpack]\n\
-    --quiet\n\
-  ordering output:\n\
-    --topo-order\n\
-    --date-order\n\
-    --reverse\n\
-  formatting output:\n\
-    --parents\n\
-    --children\n\
-    --objects | --objects-edge\n\
-    --disk-usage[=human]\n\
-    --unpacked\n\
-    --header | --pretty\n\
-    --[no-]object-names\n\
-    --abbrev=<n> | --no-abbrev\n\
-    --abbrev-commit\n\
-    --left-right\n\
-    --count\n\
-    -z\n\
-  special purpose:\n\
-    --bisect\n\
-    --bisect-vars\n\
-    --bisect-all\n";
+const USAGE: &str = r"usage: git rev-list [<options>] <commit>... [--] [<path>...]
+
+  limiting output:
+    --max-count=<n>
+    --max-age=<epoch>
+    --min-age=<epoch>
+    --sparse
+    --no-merges
+    --min-parents=<n>
+    --no-min-parents
+    --max-parents=<n>
+    --no-max-parents
+    --remove-empty
+    --all
+    --branches
+    --tags
+    --remotes
+    --stdin
+    --exclude-hidden=[fetch|receive|uploadpack]
+    --quiet
+  ordering output:
+    --topo-order
+    --date-order
+    --reverse
+  formatting output:
+    --parents
+    --children
+    --objects | --objects-edge
+    --disk-usage[=human]
+    --unpacked
+    --header | --pretty
+    --[no-]object-names
+    --abbrev=<n> | --no-abbrev
+    --abbrev-commit
+    --left-right
+    --count
+    -z
+  special purpose:
+    --bisect
+    --bisect-vars
+    --bisect-all
+";
 
 /// Print the usage block and return git's usage exit code.
 fn usage_error() -> ExitCode {
@@ -214,6 +215,13 @@ struct ObjectWalk<'a> {
 /// plumbing, and a `--cherry-mark` whose two sides are both non-empty, which is
 /// the only case where git computes patch ids.
 pub fn rev_list(args: &[String]) -> Result<ExitCode> {
+    // `show_usage_if_asked(argc, argv, rev_list_usage)` (builtin/rev-list.c:711)
+    // fires before the repository is opened, prints to stdout and exits 129 —
+    // and only for a lone `-h`. Every other refusal is `usage()`, on stderr.
+    if let Some(code) = super::show_usage_if_asked(args, USAGE) {
+        return Ok(code);
+    }
+
     let repo = match gix::discover(".") {
         Ok(repo) => repo,
         Err(_) => {

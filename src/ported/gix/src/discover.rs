@@ -3,7 +3,11 @@ use std::path::Path;
 
 pub use gix_discover::*;
 
-use crate::{ThreadSafeRepository, bstr::BString};
+use crate::{
+    ThreadSafeRepository,
+    bstr::BString,
+    config::tree::{Core, Key},
+};
 
 /// The error returned by [`crate::discover()`].
 #[derive(Debug, thiserror::Error)]
@@ -40,6 +44,23 @@ impl ThreadSafeRepository {
         options: upwards::Options<'_>,
         trust_map: gix_sec::trust::Mapping<crate::open::Options>,
     ) -> Result<Self, Error> {
+        Self::discover_opts_with_work_tree(directory, options, trust_map, None)
+    }
+
+    /// [`discover_opts()`][Self::discover_opts()] with `work_tree_dir` naming the work tree outright,
+    /// as `GIT_WORK_TREE` does.
+    ///
+    /// Both endings of git's discovery re-enter `setup_explicit_git_dir()` with the directory they
+    /// found when that variable is set — `setup_discovered_git_dir()` at `setup.c:1216-1228` and
+    /// `setup_bare_git_dir()` at `setup.c:1266-1274` — where the given work tree is installed before
+    /// `core.bare` or `core.worktree` are consulted. So it replaces whatever the location implies,
+    /// including the nothing that a bare repository implies.
+    fn discover_opts_with_work_tree(
+        directory: impl AsRef<Path>,
+        options: upwards::Options<'_>,
+        trust_map: gix_sec::trust::Mapping<crate::open::Options>,
+        work_tree_dir: Option<std::path::PathBuf>,
+    ) -> Result<Self, Error> {
         let _span = gix_trace::coarse!("ThreadSafeRepository::discover()");
         let (path, trust) = upwards_opts(directory.as_ref(), options)?;
         // Discovery landing on a git directory itself is git's `GIT_DIR_BARE`, and
@@ -55,8 +76,14 @@ impl ThreadSafeRepository {
         options.git_dir_trust = trust.into();
         options.implicit_work_tree = implicit_work_tree;
         // Note that we will adjust the `current_dir` later so it matches the value of `core.precomposeUnicode`.
-        options.current_dir = Some(gix_fs::current_dir(false).map_err(upwards::Error::CurrentDir)?);
-        Self::open_from_paths(git_dir, worktree_dir, options).map_err(Into::into)
+        let current_dir = gix_fs::current_dir(false).map_err(upwards::Error::CurrentDir)?;
+        // `set_git_work_tree()` (setup.c:1904) stores the real path of what it is handed, so a
+        // relative work tree is resolved against the directory the search started in.
+        let work_tree_dir = work_tree_dir
+            .map(|wt| gix_path::normalize(wt.clone().into(), &current_dir).map_or(wt, std::borrow::Cow::into_owned));
+        options.work_tree_is_explicit = work_tree_dir.is_some();
+        options.current_dir = Some(current_dir);
+        Self::open_from_paths(git_dir, work_tree_dir.or(worktree_dir), options).map_err(Into::into)
     }
 
     /// Try to open a git repository directly from the environment.
@@ -116,6 +143,10 @@ impl ThreadSafeRepository {
         }
 
         options = apply_additional_environment(options.apply_environment());
-        Self::discover_opts(directory, options, trust_map)
+        // `GIT_WORK_TREE` without `GIT_DIR`: git still walks upwards, then hands what it found to
+        // `setup_explicit_git_dir()` (setup.c:1217, 1267), so the variable attaches a work tree to a
+        // discovered repository — a bare one included.
+        let work_tree_dir = std::env::var_os(Core::WORKTREE.the_environment_override()).map(std::path::PathBuf::from);
+        Self::discover_opts_with_work_tree(directory, options, trust_map, work_tree_dir)
     }
 }

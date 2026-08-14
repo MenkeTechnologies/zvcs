@@ -182,6 +182,10 @@ pub struct FileSpec {
     pub oid: ObjectId,
     /// git's `oid_valid`: `false` for a worktree side whose blob was never hashed.
     pub oid_valid: bool,
+    /// git's `dirty_submodule`: the `DIRTY_SUBMODULE_*` bits of a gitlink whose
+    /// worktree holds more than the commit it records. `diff_unmodified_pair()`
+    /// (diff.c:6528) keeps a pair alive for them even when both ids match.
+    pub dirty_submodule: u8,
     /// git's `rename_used`, the count of pairs that consume this spec as a source.
     pub rename_used: u32,
     /// Cached blob bytes (`diff_populate_filespec` with `check_size_only = 0`).
@@ -203,6 +207,7 @@ impl FileSpec {
             mode: 0,
             oid: ObjectId::null(gix::hash::Kind::Sha1),
             oid_valid: false,
+            dirty_submodule: 0,
             rename_used: 0,
             data: None,
             size: None,
@@ -218,6 +223,7 @@ impl FileSpec {
             mode,
             oid,
             oid_valid,
+            dirty_submodule: 0,
             rename_used: 0,
             data: None,
             size: None,
@@ -309,7 +315,12 @@ impl Queue {
         if one.valid() != two.valid() || one.mode != two.mode || one.path != two.path {
             return false;
         }
-        if one.oid_valid && two.oid_valid && one.oid == two.oid {
+        if one.oid_valid
+            && two.oid_valid
+            && one.oid == two.oid
+            && one.dirty_submodule == 0
+            && two.dirty_submodule == 0
+        {
             return true; // no change
         }
         !one.oid_valid && !two.oid_valid

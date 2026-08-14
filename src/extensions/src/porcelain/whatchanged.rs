@@ -107,11 +107,16 @@ const DEPRECATION: &str = concat!(
     "fatal: refusing to run without --i-still-use-this\n",
 );
 
-/// A message git writes to stderr before exiting non-zero. `text` is complete, already
+/// A message git writes before exiting non-zero. `text` is complete, already
 /// newline-terminated, and includes its own `fatal: ` / `error: ` prefix.
+///
+/// Almost always stderr; `-h` is the exception, since parse-options treats a
+/// help request as an answer rather than a complaint and writes it to stdout.
 struct Fatal {
     text: String,
     code: u8,
+    /// `-h` only: `usage_with_options_internal(…, USAGE_TO_STDOUT)`.
+    to_stdout: bool,
 }
 
 impl Fatal {
@@ -120,6 +125,7 @@ impl Fatal {
         Fatal {
             text: format!("fatal: {}\n", msg.into()),
             code: 128,
+            to_stdout: false,
         }
     }
 
@@ -128,6 +134,25 @@ impl Fatal {
         Fatal {
             text: format!("error: {}\n", msg.into()),
             code: 129,
+            to_stdout: false,
+        }
+    }
+
+    /// parse-options answering `-h`: the usage block on stdout, exit 129.
+    fn help(usage: &str) -> Self {
+        Fatal {
+            text: usage.to_string(),
+            code: 129,
+            to_stdout: true,
+        }
+    }
+
+    /// Write the message to the stream it belongs on.
+    fn emit(&self) {
+        if self.to_stdout {
+            print!("{}", self.text);
+        } else {
+            eprint!("{}", self.text);
         }
     }
 }
@@ -576,7 +601,7 @@ pub fn whatchanged(args: &[String]) -> Result<ExitCode> {
     let cfg = match read_log_config(&repo) {
         Ok(c) => c,
         Err(f) => {
-            eprint!("{}", f.text);
+            f.emit();
             return Ok(ExitCode::from(f.code));
         }
     };
@@ -588,7 +613,7 @@ pub fn whatchanged(args: &[String]) -> Result<ExitCode> {
     let phase1 = match extract_log_options(args) {
         Ok(p) => p,
         Err(f) => {
-            eprint!("{}", f.text);
+            f.emit();
             return Ok(ExitCode::from(f.code));
         }
     };
@@ -597,7 +622,7 @@ pub fn whatchanged(args: &[String]) -> Result<ExitCode> {
     // `setup_revisions` classifies the whole array before the deprecation check, so
     // its exit-128/129 paths come first and are reproduced here.
     if let Err(f) = parse_args(&repo, &args, phase1.quiet, &cfg) {
-        eprint!("{}", f.text);
+        f.emit();
         return Ok(ExitCode::from(f.code));
     }
 
@@ -747,6 +772,11 @@ fn parse_args(
             seen_dashdash = true;
             i += 1;
             continue;
+        }
+        // parse_options_step()'s `internal_help`. `git whatchanged` is
+        // `builtin/log.c`, so the block is `git log`'s — stdout, 129.
+        if a == "-h" {
+            return Err(Fatal::help(super::log::USAGE));
         }
 
         if a.starts_with('-') && a.len() > 1 {
@@ -987,6 +1017,7 @@ fn consume_option(
             let v = next.ok_or_else(|| Fatal {
                 text: "error: -n requires an argument\n".into(),
                 code: 128,
+                to_stdout: false,
             })?;
             p.max_count = parse_count(v)?;
             return Ok(2);

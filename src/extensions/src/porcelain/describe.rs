@@ -140,6 +140,9 @@ pub fn describe(args: &[String]) -> Result<ExitCode> {
             _ if a.starts_with("--exclude=") => {
                 exclude_pats.push(BString::from(&a["--exclude=".len()..]))
             }
+            // parse_options_step() answers `-h` on stdout at 129 — no
+            // `error:` line, because it is not a rejection.
+            "-h" => return Ok(super::show_usage(USAGE)),
             _ => return unknown_option_error(a.trim_start_matches('-')),
         }
     }
@@ -1133,4 +1136,5 @@ usage: git describe [--all] [--tags] [--contains] [--abbrev=<n>] [<commit-ish>..
     --[no-]dirty[=<mark>] append <mark> on dirty working tree (default: \"-dirty\")
     --[no-]broken[=<mark>]
                           append <mark> on broken working tree (default: \"-broken\")
+
 ";

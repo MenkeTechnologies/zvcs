@@ -294,14 +294,12 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
         _ => args,
     };
 
-    // `-h` must work outside a repository, so it is answered before discovery.
-    if args
-        .iter()
-        .take_while(|a| a.as_str() != "--")
-        .any(|a| a == "-h")
-    {
-        print!("{USAGE}");
-        return Ok(ExitCode::from(USAGE_ERROR));
+    // `show_usage_if_asked(argc, argv, diff_tree_usage)` (builtin/diff-tree.c:125)
+    // answers a LONE `-h` on stdout, before the repository is discovered. `-h`
+    // alongside anything else is not a help request: it falls through to the
+    // ordinary scan, where `usage()` reports it on stderr.
+    if let Some(code) = super::show_usage_if_asked(args, USAGE) {
+        return Ok(code);
     }
 
     let repo = gix::discover(".")?;
@@ -391,6 +389,13 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
             }
         }
         if a.starts_with('-') && a != "-" {
+            // The value checks `diff_opt_parse`'s callbacks run as each option is
+            // seen — before any revision is resolved, and before this module gets
+            // to decide whether it can render the option at all.
+            if let Some(line) = super::diff_optval::reject(a) {
+                eprintln!("{line}");
+                return Ok(ExitCode::from(USAGE_ERROR));
+            }
             // Everything `diff_opt_parse` owns is remembered verbatim: a routed run
             // replays exactly these onto `diff-pairs`, in order.
             if !is_diff_tree_option(a) {
@@ -455,10 +460,12 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
                     opts.format = Format::NoOutput;
                     opts.exit_code = true;
                 }
-                // Normally answered before discovery; kept so `-h` never falls
-                // through to the unknown-option arm.
+                // The lone-`-h` help is answered before discovery. Reaching
+                // here means `-h` had company, which `cmd_diff_tree` treats as
+                // any other unhandled argument: `usage(diff_tree_usage)`, so the
+                // same block but on stderr.
                 "-h" => {
-                    print!("{USAGE}");
+                    eprint!("{USAGE}");
                     return Ok(ExitCode::from(USAGE_ERROR));
                 }
                 // `cmd_diff_tree` starts from `opt->abbrev = 0` (full object names) and
@@ -599,6 +606,14 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
             raw_paths.push(rest.clone());
         }
         break;
+    }
+
+    // `diff_setup_done()`'s pickaxe check. It is a `die()`, not a usage error, and
+    // it runs after every revision has been resolved — a bad revision anywhere in
+    // argv still wins, which is why this waits until the scan is over.
+    if super::diff_optval::pickaxe_conflict(args) {
+        eprintln!("{}", super::diff_optval::PICKAXE_CONFLICT);
+        return Ok(ExitCode::from(FATAL));
     }
 
     for p in &raw_paths {
@@ -1359,6 +1374,9 @@ fn is_ignorable(a: &str) -> bool {
         "--no-ext-diff",
         "--ita-invisible-in-index",
         "--ita-visible-in-index",
+        // `revision.c`'s `--no-notes` turns off a display that is off by default,
+        // so it cannot change any output this command produces.
+        "--no-notes",
     ];
     const PREFIX: &[&str] = &[
         "--src-prefix=",

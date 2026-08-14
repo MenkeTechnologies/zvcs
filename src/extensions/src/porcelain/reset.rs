@@ -560,6 +560,9 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
                 eprint!("{USAGE}");
                 return Ok(ExitCode::from(129));
             }
+            // parse_options_step()'s `internal_help` check: `-h` answers on
+            // stdout at 129, with no `error:` line — it is not a rejection.
+            "-h" => return Ok(super::show_usage(USAGE)),
             other if other.starts_with('-') && other != "-" => {
                 let sw = other.chars().nth(1).unwrap_or('-');
                 eprintln!("error: unknown switch `{sw}'");

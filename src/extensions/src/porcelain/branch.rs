@@ -444,6 +444,11 @@ pub fn branch(args: &[String]) -> Result<ExitCode> {
                         }
                         't' => o.track = Track::Direct,
                         'f' => o.force = true,
+                        // parse_options_step(): `if (internal_help && *ctx->opt
+                        // == 'h')` is tested inside the short-option loop, so a
+                        // clustered `-ah` answers with help too — and on stdout,
+                        // not through `usage_exit()`'s stderr.
+                        'h' => return Ok(super::show_usage(USAGE)),
                         // `-u` takes an upstream: the rest of this token, else the
                         // next argument.
                         'u' => {

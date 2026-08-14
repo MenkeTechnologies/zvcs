@@ -329,11 +329,31 @@ struct Opts<'a> {
     /// accumulate and `--no-strategy-option` clears the whole list).
     xopts: Vec<&'a str>,
     gpg_sign: bool,
+    /// `--keep-redundant-commits` / `--no-keep-redundant-commits` on their own
+    /// (`OPT_BOOL` on `opts->keep_redundant_commits`), kept apart from
+    /// [`Opts::empty`] because `verify_opt_compatible` reads the two separately:
+    /// `--no-keep-redundant-commits --quit` is fine while `--empty=stop --quit`
+    /// is not.
+    keep_redundant_flag: bool,
+    /// Whether `--empty=<action>` was given at all — git's `empty_opt !=
+    /// EMPTY_COMMIT_UNSPECIFIED`. Not implied by `--keep-redundant-commits`,
+    /// which leaves `empty_opt` alone.
+    empty_given: bool,
+    /// `opts->allow_rerere_auto`: `Some(true)` for `--rerere-autoupdate`,
+    /// `Some(false)` for `--no-rerere-autoupdate`, `None` for neither. Both
+    /// spellings are no-ops for the pick itself and differ only here.
+    rerere_auto: Option<bool>,
 }
 
 impl Opts<'_> {
     fn empty_action(&self) -> Empty {
         self.empty.unwrap_or(Empty::Stop)
+    }
+
+    /// `opts->keep_redundant_commits` as `run_sequencer` leaves it: the flag,
+    /// or `--empty=keep`, which `builtin/revert.c` folds into it for a pick.
+    fn keep_redundant_commits(&self) -> bool {
+        self.keep_redundant_flag || self.empty == Some(Empty::Keep)
     }
 }
 
@@ -463,6 +483,7 @@ fn parse<'a>(args: &'a [String]) -> Result<Opts<'a>, ExitCode> {
             "--no-cleanup" => o.cleanup = None,
             "--empty" => {
                 o.empty = Some(parse_empty(take_value(inline, args, &mut i, "empty")?)?);
+                o.empty_given = true;
             }
             "--mainline" => {
                 o.mainline = Some(parse_mainline(take_value(inline, args, &mut i, "mainline")?)?);
@@ -500,11 +521,19 @@ fn parse<'a>(args: &'a [String]) -> Result<Opts<'a>, ExitCode> {
             "--no-allow-empty" => o.allow_empty = false,
             "--allow-empty-message" => o.allow_empty_message = true,
             "--no-allow-empty-message" => o.allow_empty_message = false,
-            "--keep-redundant-commits" => o.empty = Some(Empty::Keep),
-            "--no-keep-redundant-commits" => o.empty = Some(Empty::Stop),
+            "--keep-redundant-commits" => {
+                o.empty = Some(Empty::Keep);
+                o.keep_redundant_flag = true;
+            }
+            "--no-keep-redundant-commits" => {
+                o.empty = Some(Empty::Stop);
+                o.keep_redundant_flag = false;
+            }
             // rerere only ever participates in conflict resolution, and every
-            // conflicted pick is refused below, so both spellings are no-ops.
-            "--rerere-autoupdate" | "--no-rerere-autoupdate" => {}
+            // conflicted pick is refused below, so both spellings are no-ops for
+            // the pick — but `verify_opt_compatible` still reads which was given.
+            "--rerere-autoupdate" => o.rerere_auto = Some(true),
+            "--no-rerere-autoupdate" => o.rerere_auto = Some(false),
 
             _ if name.starts_with("--") => o.leftover_unknown = true,
 
@@ -542,6 +571,11 @@ fn parse<'a>(args: &'a [String]) -> Result<Opts<'a>, ExitCode> {
                             o.gpg_sign = true;
                             break;
                         }
+                        // parse_options_step() tests `internal_help` inside the
+                        // short-option loop and answers at once, on stdout —
+                        // never through `usage()`, whose stderr belongs to
+                        // rejections. `revert` shares this table.
+                        b'h' => return Err(super::show_usage(USAGE)),
                         _ => {
                             o.leftover_unknown = true;
                             break;
@@ -1308,6 +1342,10 @@ fn handle_verb(verb: Verb, opts: &Opts<'_>) -> Result<ExitCode> {
         ("--strategy-option", !opts.xopts.is_empty()),
         ("-x", opts.record_origin),
         ("--ff", opts.allow_ff),
+        ("--rerere-autoupdate", opts.rerere_auto == Some(true)),
+        ("--no-rerere-autoupdate", opts.rerere_auto == Some(false)),
+        ("--keep-redundant-commits", opts.keep_redundant_commits()),
+        ("--empty", opts.empty_given),
     ] {
         if given {
             return Ok(fatal(&format!(
@@ -1315,6 +1353,14 @@ fn handle_verb(verb: Verb, opts: &Opts<'_>) -> Result<ExitCode> {
                 verb.name()
             )));
         }
+    }
+
+    // `run_sequencer`: a verb sets `opts->revs = NULL` and skips `setup_revisions`
+    // entirely, so any operand left on the command line trips the `argc > 1` usage
+    // check — before the verb is carried out, which is why `--skip <rev>` prints
+    // usage rather than "no cherry-pick in progress".
+    if !opts.specs.is_empty() {
+        return Ok(usage());
     }
 
     let repo = gix::discover(".")?;
@@ -1426,6 +1472,13 @@ fn resume_todo(
         specs: Vec::new(),
         leftover_unknown: false,
         verb: None,
+        // Reconstructed from `sequencer/opts`, which records the *effect* of the
+        // original command line rather than its spelling. Only
+        // `verify_opt_compatible` reads these three, and that ran when the
+        // sequence started — a resumed pick never re-checks them.
+        keep_redundant_flag: loaded.keep_redundant_commits,
+        empty_given: false,
+        rerere_auto: None,
     };
     let cleanup = match opts.cleanup {
         Some(raw) => match parse_cleanup(raw) {

@@ -101,6 +101,9 @@ use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
 use gix::refs::Target;
 
 /// Verbatim `git revert -h` text, printed on a usage error exactly as git does.
+///
+/// The trailing blank line is git's, not padding: `usage_with_options_internal()`
+/// closes every block with `fputc('\n', outfile)` after the last option.
 const USAGE: &str = "\
 usage: git revert [--[no-]edit] [-n] [-m <parent-number>] [-s] [-S[<keyid>]] <commit>...
    or: git revert (--continue | --skip | --abort | --quit)
@@ -125,6 +128,7 @@ usage: git revert [--[no-]edit] [-n] [-m <parent-number>] [-s] [-S[<keyid>]] <co
     -S, --[no-]gpg-sign[=<key-id>]
                           GPG sign commit
     --[no-]reference      use the 'reference' format to refer to commits
+
 ";
 
 /// The title git puts on a `--reference` revert, left for the user to replace.
@@ -246,6 +250,9 @@ pub fn revert(args: &[String]) -> Result<ExitCode> {
         }
         match a {
             "--" => no_more_opts = true,
+            // parse_options_step() answers `-h` where it meets it, on stdout at
+            // 129 — `usage_error()`'s stderr is for rejections only.
+            "-h" => return Ok(super::show_usage(USAGE)),
             "-n" | "--no-commit" => o.no_commit = true,
             "--commit" => o.no_commit = false,
             "-s" | "--signoff" => o.signoff = true,

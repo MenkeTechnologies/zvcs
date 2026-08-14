@@ -43,6 +43,7 @@ const USAGE: &str = "\
 usage: git mktag
 
     --[no-]strict         enable more strict checking
+
 ";
 
 /// `git mktag` — create a tag object from stdin after a strict fsck check.
@@ -69,6 +70,11 @@ pub fn mktag(args: &[String]) -> Result<ExitCode> {
         }
         let Some(long) = a.strip_prefix("--") else {
             let flag = a[1..].chars().next().expect("`-` alone was handled above");
+            // parse_options_step() answers `-h` before it can be an unknown
+            // switch, and on stdout — a help request is not a rejection.
+            if flag == 'h' {
+                return Ok(super::show_usage(USAGE));
+            }
             eprintln!("error: unknown switch `{flag}'");
             eprint!("{USAGE}");
             return Ok(ExitCode::from(129));

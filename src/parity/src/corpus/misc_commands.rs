@@ -739,11 +739,18 @@ fn usage_only(out: &mut Vec<Case>) {
     // The commands that must work with **no repository at all**.
     //
     // Every fixture root is a repository and `cwd` is relative to it, so "outside
-    // a repository" looks inexpressible — but a ceiling naming the working
-    // directory itself stops discovery before it can walk up, which is exactly
-    // the semantics wanted, and `src/` has tracked files to actually search.
-    // Verified against stock: with the ceiling in place `grep --no-index` finds
-    // `src/lib.rs` on both sides, and plain `grep` gets the repo-less fatal.
+    // a repository" looks inexpressible — but a ceiling stops the upward walk, and
+    // `src/` has tracked files to actually search.
+    //
+    // The ceiling must be a **proper ancestor** of the working directory, not the
+    // directory itself: `longest_ancestor_length()` (path.c:1263-1264) only accepts
+    // a prefix when `path[len]` is `/` with something after it, so a ceiling equal
+    // to the cwd matches nothing and discovery walks up as though it were unset.
+    // These first shipped as `{repo}/src` with cwd `src` and therefore ran *inside*
+    // the repository while claiming otherwise — they passed, but measured the wrong
+    // thing. Verified with stock: ceiling `{repo}/src` from `src` gives
+    // `--show-toplevel` = the repo at rc 0; ceiling `{repo}` gives
+    // `fatal: not a git repository`, which is the premise these cases need.
     //
     // `grep --no-index` died `fatal: not a git repository` here until the repo
     // handle became optional, which also blocked `grep.fallbackToNoIndex` — a
@@ -790,6 +797,43 @@ fn usage_only(out: &mut Vec<Case>) {
     // A usage error must print the whole block, not just its first line.
     out.push(Case::strict("mv", &["mv"], Shape::Linear));
 
+    // `--help-all`, one verb per mechanism.
+    //
+    // It is matched by a bare `strcmp` in `parse_options_step()`, sitting after
+    // the `--`/`--end-of-options` breaks and before `parse_long_opt()`. So it
+    // never abbreviates and never takes a value, and the two families differ on
+    // *where* it may appear: a `parse_options()` verb answers it anywhere, while
+    // a `show_usage_with_options_if_asked()` verb answers only when it is the
+    // sole argument. Nothing but a second argument distinguishes them, which is
+    // why each `--help-all` here has a `--quux` twin.
+    for cmd in ["log", "show-ref", "ls-remote", "blame", "cat-file", "receive-pack"] {
+        out.push(Case::strict(cmd, &[cmd, "--help-all"], Shape::Linear));
+        out.push(Case::strict(cmd, &[cmd, "--help-all", "--quux"], Shape::Linear));
+    }
+    // `rev-parse` is the `ac == 2` family: with a second argument it is *not*
+    // help at all and exits 0.
+    out.push(Case::strict("rev-parse", &["rev-parse", "--help-all"], Shape::Linear));
+    out.push(Case::strict("rev-parse", &["rev-parse", "--help-all", "--quux"], Shape::Linear));
+    // A terminator must still win, and `fast-export` had this wrong.
+    out.push(Case::strict("fast-export", &["fast-export", "--", "--help-all"], Shape::Linear));
+
+    // Nothing to commit: git prints a *status report* on stdout and exits 1.
+    //
+    // The port answered `zvcs: commit: nothing to commit (no changes staged)` on
+    // stderr — its own voice where git runs `run_status()` (commit.c:1081-1099)
+    // — and that was the sole exit for every non-amend empty-commit path, not
+    // just `-p`. The `-u` variants are here because the status honours them, so
+    // they prove the report is really the status engine and not a fixed string.
+    for args in [
+        &["commit", "-m", "msg"][..],
+        &["commit", "-p", "-m", "msg"],
+        &["commit", "--interactive", "-m", "msg"],
+        &["commit", "-m", "msg", "-u", "no"],
+        &["commit", "-m", "msg", "-uall"],
+    ] {
+        out.push(Case::strict("commit", args, Shape::Linear));
+    }
+
     // `OPT_CMDMODE` is `PARSE_OPT_NONEG`, and this shipped wrong four times:
     // every one of these negations was *accepted*. A unit test now asserts the
     // property against the real tables; these pin the user-visible answer.
@@ -821,7 +865,7 @@ fn usage_only(out: &mut Vec<Case>) {
     // alias of another (`stage` is `cmd_add`, sharing one table).
     out.push(Case::strict("stage", &["stage", "--pathspec-from-f", "nope"], Shape::Dirty));
 
-    const CEIL_SRC: &[(&str, &str)] = &[("GIT_CEILING_DIRECTORIES", "{repo}/src")];
+    const CEIL_SRC: &[(&str, &str)] = &[("GIT_CEILING_DIRECTORIES", "{repo}")];
     for args in [
         &["grep", "--no-index", "pub"][..],
         &["grep", "--no-index", "-n", "pub"],

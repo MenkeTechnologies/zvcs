@@ -150,6 +150,60 @@ pub enum Shape {
     /// lane to the octopus's right and the expansion rows are reached; without it
     /// the merge is the last column and git skips them.
     Octopus,
+    /// Two directory trees to diff *against each other*, the two degenerate
+    /// halves of that comparison, and a repository config carrying a
+    /// non-default `core.abbrev`. Everything lives under `ni/`.
+    ///
+    /// `diff --no-index` reads both sides off the filesystem and never opens an
+    /// object store, so nothing a repository *contains* can stand in for its
+    /// input — and a case is one argv against a pristine copy, so it cannot
+    /// write the trees first.
+    ///
+    /// Three queue shapes, because the blob ids `--raw` prints are a function of
+    /// which one it is. `diffcore_rename()` returns before its hashing pass
+    /// unless the queue holds both a source and a destination
+    /// (diffcore-rename.c:1461-1462), and in no-index mode that pass is the only
+    /// thing that ever fills an id in. So `da`/`db` — a modified file, a
+    /// left-only file and a right-only file — print real ids for the delete and
+    /// the add, while `addonly_a`/`addonly_b` and `delonly_a`/`delonly_b` are
+    /// add-only and delete-only and legitimately keep zeros. A fixture carrying
+    /// only the first of the three would score a port that hashes
+    /// unconditionally as correct.
+    ///
+    /// `core.abbrev = 10` sits in the repository config so the width those ids
+    /// are printed at is a *configured* value rather than the built-in default.
+    /// Every other shape is small enough that git's `auto` width and the
+    /// hard-coded 7 coincide, which is exactly what let an implementation that
+    /// ignored the setting pass.
+    ///
+    /// The two empty directories are empty on purpose: an add-only queue needs a
+    /// side with nothing in it, and git cannot track an empty directory, so they
+    /// survive only because the per-case copy is a directory walk rather than a
+    /// checkout.
+    NoIndexTrees,
+    /// A tracked path whose on-disk name is *decomposed*: `e` followed by
+    /// U+0301 COMBINING ACUTE ACCENT, not the single code point `é`.
+    ///
+    /// macOS hands decomposed names out of `readdir()` and, through shell
+    /// completion, into `argv`; git composes both back before anything compares
+    /// them (`compat/precompose_utf8.c`, gated on `core.precomposeunicode`). No
+    /// other shape carries a combining mark at all — [`Shape::AwkwardPaths`]
+    /// writes `üñïçødé.txt` in the composed form — so neither the conversion nor
+    /// its absence had a fixture.
+    ///
+    /// Portable by construction rather than by luck. The conversion is
+    /// `#ifdef PRECOMPOSE_UNICODE` in git (`git-compat-util.h:167-179` supplies
+    /// pass-through inlines otherwise, and `config.mak.uname:156` defines the
+    /// macro inside the `ifeq ($(uname_S),Darwin)` block alone) and
+    /// `cfg(target_os = "macos")` in the
+    /// port (`extensions/src/precompose.rs:46,202`). On Linux both sides leave
+    /// the bytes alone and agree on the decomposed answer, exactly as they agree
+    /// on the composed one on macOS.
+    ///
+    /// One file is tracked and edited in the worktree and one is untracked, so
+    /// `status` has to name the path from both directions — through the index
+    /// and through the directory walk.
+    DecomposedPaths,
 }
 
 impl Shape {
@@ -174,6 +228,8 @@ impl Shape {
         Shape::BehindRemote,
         Shape::Worktree,
         Shape::Octopus,
+        Shape::NoIndexTrees,
+        Shape::DecomposedPaths,
     ];
 
     pub fn name(self) -> &'static str {
@@ -198,6 +254,8 @@ impl Shape {
             Shape::BehindRemote => "behind-remote",
             Shape::Worktree => "worktree",
             Shape::Octopus => "octopus",
+            Shape::NoIndexTrees => "no-index-trees",
+            Shape::DecomposedPaths => "decomposed-paths",
         }
     }
 }
@@ -839,9 +897,59 @@ pub fn build(shape: Shape, dir: &Path, home: &Path) -> Result<()> {
                 &["merge", "-q", "--no-ff", "-m", "octopus merge", "oct-a", "oct-b", "oct-c"],
             )?;
         }
+
+        Shape::NoIndexTrees => {
+            // The queue with both a source and a destination: one path changed
+            // on both sides, one only on the left, one only on the right.
+            write(dir, "ni/da/common.txt", "common one\ncommon two\ncommon three\n")?;
+            write(dir, "ni/db/common.txt", "common one\ncommon two changed\ncommon three\n")?;
+            write(dir, "ni/da/left.txt", "only on the left\n")?;
+            write(dir, "ni/db/right.txt", "only on the right\n")?;
+            // The two degenerate queues. Their other half is an empty directory,
+            // which is the only way to make a comparison that is purely an add
+            // or purely a delete.
+            write(dir, "ni/addonly_b/added.txt", "added on the right\n")?;
+            write(dir, "ni/delonly_a/gone.txt", "gone from the right\n")?;
+            std::fs::create_dir_all(dir.join("ni").join("addonly_a"))?;
+            std::fs::create_dir_all(dir.join("ni").join("delonly_b"))?;
+            // Two plain files, for the cases that want a single modified pair
+            // and nothing else in the queue.
+            write(dir, "ni/a.txt", "alpha\nbeta\ngamma\n")?;
+            write(dir, "ni/b.txt", "alpha\nBETA\ngamma\n")?;
+
+            // Tracked, so the state probe's `status` stays quiet and the shape
+            // reports only what a case did. The empty directories cannot be
+            // tracked and are invisible to `status` for the same reason.
+            git(dir, home, &["add", "ni"])?;
+            git(dir, home, &["commit", "-qm", "no-index: subject trees"])?;
+
+            // Read only by the cases that run *inside* this repository; the ones
+            // that run outside it never see this file. Ten is deliberately not
+            // 7 and not what `auto` would pick for a repository this small.
+            git(dir, home, &["config", "core.abbrev", "10"])?;
+        }
+
+        Shape::DecomposedPaths => {
+            write(dir, NFD_TRACKED, "decomposed\n")?;
+            git(dir, home, &["add", "--", NFD_TRACKED])?;
+            git(dir, home, &["commit", "-qm", "nfd: a decomposed path"])?;
+            // Dirty through the index, and dirty through the directory walk:
+            // `status` has to name the same decomposed path from both.
+            write(dir, NFD_TRACKED, "decomposed\nworktree edit\n")?;
+            write(dir, NFD_UNTRACKED, "untracked, decomposed\n")?;
+        }
     }
     Ok(())
 }
+
+/// `é.txt`, decomposed: `e` + U+0301, the form macOS stores and hands back.
+///
+/// Written as an escape rather than as a literal so the bytes are unambiguous
+/// in the source — an editor that normalises on save would otherwise turn this
+/// shape into a duplicate of [`Shape::AwkwardPaths`] without anything noticing.
+pub const NFD_TRACKED: &str = "e\u{301}.txt";
+/// The same combining mark on an untracked path.
+pub const NFD_UNTRACKED: &str = "e\u{301}-new.txt";
 
 /// The history the two mergeable shapes share.
 ///

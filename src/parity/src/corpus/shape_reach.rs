@@ -1,6 +1,6 @@
-//! Cases that only exist because of the six repository shapes added alongside
-//! this module: `Attributes`, `Renamed`, `Whitespace`, `Packed`, `Patches` and
-//! `Sparse`.
+//! Cases that only exist because of the repository shapes added alongside them:
+//! `Attributes`, `Renamed`, `Whitespace`, `Packed`, `Patches` and `Sparse`
+//! first, `NoIndexTrees` and `DecomposedPaths` since.
 //!
 //! Grouped by shape rather than by subsystem, which is the exception to how the
 //! rest of the corpus is arranged. The reason is that the shape *is* the thing
@@ -29,6 +29,12 @@
 //!   under `quilt/`, all applying to `main`'s tree.
 //! * `Sparse` — cone mode with `inside/` in and `outside/` out, plus an
 //!   untracked file inside the excluded cone.
+//! * `NoIndexTrees` — under `ni/`: `da`/`db` (a modification, a left-only file
+//!   and a right-only file), the add-only pair `addonly_a`/`addonly_b`, the
+//!   delete-only pair `delonly_a`/`delonly_b`, two plain files `a.txt`/`b.txt`,
+//!   and `core.abbrev = 10` in the repository config.
+//! * `DecomposedPaths` — `e`+U+0301`.txt` tracked and edited in the worktree,
+//!   and `e`+U+0301`-new.txt` untracked.
 
 use crate::fixture::Shape;
 use crate::runner::Case;
@@ -43,6 +49,8 @@ pub fn cases(out: &mut Vec<Case>) {
     packs(out);
     patches(out);
     sparse(out);
+    no_index_trees(out);
+    decomposed_paths(out);
 }
 
 /// Push one case per argv against `shape`.
@@ -922,3 +930,162 @@ fn sparse(out: &mut Vec<Case>) {
     );
     each(Shape::Sparse, "stash", &[&["stash", "list"], &["stash", "push", "-u"]], out);
 }
+
+/// Outside every repository, from `ni/`.
+///
+/// A ceiling has to be a *strict* ancestor of the working directory to have any
+/// effect: `longest_ancestor_length()` rejects a prefix unless `path[len]` is a
+/// `/` with something after it (path.c:1263-1264), so a ceiling equal to the
+/// working directory matches nothing, the offset comes back `-1`, and discovery
+/// walks up as though nothing were set. Naming the fixture root and running one
+/// level below it is what actually stops the walk —
+/// verified against stock 2.55.0, which answers `fatal: not a git repository`
+/// for `rev-parse --show-toplevel` under this pair and prints the toplevel when
+/// the ceiling names `ni/` instead.
+const OUTSIDE: &[(&str, &str)] = &[("GIT_CEILING_DIRECTORIES", "{repo}")];
+
+/// The same, with `core.abbrev = 10` supplied by configuration rather than by
+/// the repository that is deliberately out of reach.
+///
+/// `GIT_CONFIG_KEY_0`/`VALUE_0` rather than `GIT_CONFIG_GLOBAL`, which
+/// [`crate::env::harden`] pins to `/dev/null` and
+/// [`crate::env::is_pinned`] therefore forbids a case from re-pointing — a case
+/// that could aim `GIT_CONFIG_GLOBAL` anywhere could aim it at the machine's own
+/// file. The two reach the same place: both are ordinary config sources read by
+/// `git_config_from_parameters()` before any repository is looked for, which is
+/// all these cases need, because what is under test is whether the width comes
+/// from `core.abbrev` at all.
+const OUTSIDE_ABBREV_10: &[(&str, &str)] = &[
+    ("GIT_CEILING_DIRECTORIES", "{repo}"),
+    ("GIT_CONFIG_COUNT", "1"),
+    ("GIT_CONFIG_KEY_0", "core.abbrev"),
+    ("GIT_CONFIG_VALUE_0", "10"),
+];
+
+/// `diff --no-index`: two directory trees compared to each other, with no
+/// repository in reach.
+///
+/// Three fixes are pinned here, and the first two are only visible in some of
+/// the queue shapes:
+///
+///  * the `index` line and the `--raw` columns are abbreviated to
+///    `core.abbrev`, not to a hard-coded 7 — invisible in every other shape,
+///    where `auto` and 7 agree;
+///  * `--raw` prints the real blob ids when the queue holds both a source and a
+///    destination, and zeros when it cannot — `diffcore_rename()` skips its
+///    hashing pass on an add-only or delete-only queue
+///    (diffcore-rename.c:1461-1462), so a port that always hashes and a port
+///    that never does each pass one half of this block;
+///  * `--summary` names the side that exists on a delete line, which is why
+///    `a.txt /dev/null` is here: the pre-fix output was
+///    ` delete mode 000000 /dev/null`.
+fn no_index_trees(out: &mut Vec<Case>) {
+    for args in [
+        // Both halves present: rename detection runs, so the delete and the add
+        // carry real ids and the modified pair keeps zeros.
+        &["diff", "--no-index", "--raw", "da", "db"][..],
+        &["diff", "--no-index", "--summary", "da", "db"],
+        // Reversed, which swaps which side the create and delete lines name.
+        &["diff", "--no-index", "-R", "--raw", "da", "db"],
+        &["diff", "--no-index", "-R", "--summary", "da", "db"],
+        // A delete written as an explicit `/dev/null` destination.
+        &["diff", "--no-index", "--summary", "a.txt", "/dev/null"],
+        // The two degenerate queues, where zeros are the correct answer.
+        &["diff", "--no-index", "--raw", "addonly_a", "addonly_b"],
+        &["diff", "--no-index", "--raw", "delonly_a", "delonly_b"],
+        // The width, spelled every way the option takes it. `--abbrev=2` and
+        // `--abbrev=0` run against `a.txt`/`b.txt`, whose single modified pair
+        // never gets hashed, so they measure the width applied to the zeros.
+        &["diff", "--no-index", "--no-abbrev", "--raw", "da", "db"],
+        &["diff", "--no-index", "--abbrev", "--raw", "da", "db"],
+        &["diff", "--no-index", "--abbrev=12", "--raw", "da", "db"],
+        &["diff", "--no-index", "--abbrev=2", "--raw", "a.txt", "b.txt"],
+        &["diff", "--no-index", "--abbrev=-5", "a.txt", "b.txt"],
+        &["diff", "--no-index", "--abbrev=0", "--raw", "a.txt", "b.txt"],
+    ] {
+        out.push(Case::new("diff", args, Shape::NoIndexTrees).in_dir("ni").with_env(OUTSIDE));
+    }
+
+    // A value that is not a number. `PARSE_OPT_ERROR` prints the one-line
+    // `error: option 'abbrev' expects a numerical value` and exits 129 with **no
+    // usage block** after it, which is the half an implementation that answers
+    // every parse failure with the usage text gets wrong while still exiting
+    // 129 — so the message is the behaviour and this one is compared on stderr.
+    out.push(
+        Case::strict(
+            "diff",
+            &["diff", "--no-index", "--abbrev=abc", "a.txt", "b.txt"],
+            Shape::NoIndexTrees,
+        )
+        .in_dir("ni")
+        .with_env(OUTSIDE),
+    );
+
+    // `core.abbrev = 10`, in play both ways it can be: from a config source
+    // with no repository anywhere, and from the repository's own config with
+    // the working directory inside it. Without one of these nothing in the
+    // corpus distinguishes "abbreviates to `core.abbrev`" from "abbreviates to
+    // 7", because every other fixture is small enough that git's `auto` width
+    // is 7 as well.
+    for args in [
+        &["diff", "--no-index", "--raw", "da", "db"][..],
+        &["diff", "--no-index", "da", "db"],
+    ] {
+        out.push(
+            Case::new("diff", args, Shape::NoIndexTrees).in_dir("ni").with_env(OUTSIDE_ABBREV_10),
+        );
+    }
+    for args in [
+        &["diff", "--no-index", "--raw", "ni/da", "ni/db"][..],
+        &["diff", "--no-index", "ni/da", "ni/db"],
+    ] {
+        out.push(Case::new("diff", args, Shape::NoIndexTrees));
+    }
+}
+
+/// A decomposed path, through the three places the composition happens.
+///
+/// The `log` pair is the direct observation of the argv conversion and needs no
+/// filesystem at all: git composes *every* argument, not only the ones that name
+/// files, so the same format string prints `%H` followed by `é` under
+/// `core.precomposeunicode=true` and by `e`+U+0301 under `false`. On macOS the
+/// two cases produce different bytes, which is what makes them a test; on Linux
+/// the conversion does not exist on either side and both print the decomposed
+/// form, so the pair still agrees. Measured both ways against stock 2.55.0 on
+/// macOS before being added.
+fn decomposed_paths(out: &mut Vec<Case>) {
+    // Pathspec against index: the argument arrives decomposed and the index
+    // entry is composed (on macOS), so a missing conversion makes `add` report
+    // that the path matched no files. The post-state probe reads the index back,
+    // which is the `ls-files` half of the check.
+    each(
+        Shape::DecomposedPaths,
+        "add",
+        &[&["add", crate::fixture::NFD_TRACKED], &["add", "--", crate::fixture::NFD_TRACKED]],
+        out,
+    );
+
+    // Every argument is converted, files or not — and the config gate decides
+    // whether any of it happens.
+    each(
+        Shape::DecomposedPaths,
+        "log",
+        &[
+            &["-c", "core.precomposeunicode=true", "log", "-1", NFD_FORMAT],
+            &["-c", "core.precomposeunicode=false", "log", "-1", NFD_FORMAT],
+        ],
+        out,
+    );
+
+    // The readdir side, which `gix` already handled: one decomposed path dirty
+    // through the index and one untracked, so the walk has to name both.
+    each(
+        Shape::DecomposedPaths,
+        "status",
+        &[&["status", "--porcelain"], &["status", "--porcelain", "-uall"]],
+        out,
+    );
+}
+
+/// `--format=%H` followed by the same decomposed `é` the shape's paths carry.
+const NFD_FORMAT: &str = "--format=%He\u{301}";

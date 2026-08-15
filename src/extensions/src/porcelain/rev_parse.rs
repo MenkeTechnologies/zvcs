@@ -840,16 +840,35 @@ fn show_rev(
 fn render_id(repo: &gix::Repository, o: &Opts, id: &ObjectId) -> Result<Vec<u8>> {
     Ok(match o.abbrev {
         None => id.to_string().into_bytes(),
-        Some(0) => id.attach(repo).shorten()?.to_string().into_bytes(),
+        Some(0) => match id.attach(repo).shorten() {
+            Ok(prefix) => prefix.to_string().into_bytes(),
+            Err(_) => truncate_hex(id, crate::abbrev::configured_abbrev(repo, id.kind().len_in_hex())),
+        },
         Some(n) => {
             let n = n.clamp(4, id.kind().len_in_hex());
             let candidate = gix::odb::store::prefix::disambiguate::Candidate::new(*id, n)?;
             match repo.objects.disambiguate_prefix(candidate)? {
                 Some(prefix) => prefix.to_string().into_bytes(),
-                None => id.to_string().into_bytes(),
+                None => truncate_hex(id, n),
             }
         }
     })
+}
+
+/// Cut a full hex id to `len` without consulting the object database.
+///
+/// Abbreviation normally asks the odb for the shortest unambiguous prefix, which
+/// needs the object to be present. A gitlink names a commit that lives in the
+/// submodule's odb, not the parent's, so `HEAD:<submodule>` has nothing local to
+/// disambiguate against. git does not fail there and does not widen back to the
+/// full hash — `find_unique_abbrev_r()` (object-name.c:900-916) returns early with
+/// `len` when `repo_find_cmp_by_hash()` misses, so the id is simply cut at the
+/// requested width. Both callers above reproduce that: `--short` cuts at
+/// `core.abbrev`, `--short=n` cuts at `n`.
+fn truncate_hex(id: &ObjectId, len: usize) -> Vec<u8> {
+    let mut hex = id.to_string().into_bytes();
+    hex.truncate(len.clamp(4, hex.len()));
+    hex
 }
 
 /// Emit `^<id>` for the excluded side of a range.

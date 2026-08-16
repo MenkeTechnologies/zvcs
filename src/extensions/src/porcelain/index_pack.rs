@@ -18,8 +18,9 @@
 //!     size (<n>)` when exceeded.
 //!   * `git index-pack --verify <pack-file>` — checks an existing `.idx`
 //!     against its pack and exits 0 with no output when they agree.
-//!   * `--threads=<n>` (`0` = auto), `--object-format=sha1`, and `-h` (usage on
-//!     stdout, exit 129).
+//!   * `--threads=<n>` (`0` = auto), `--object-format=<sha1|sha256>`, and `-h`
+//!     (usage on stdout, exit 129). Without the flag the hash comes from the
+//!     surrounding repository, and outside one it is git's compiled-in `sha1`.
 //!
 //! Argument handling mirrors `cmd_index_pack()`'s hand-rolled loop rather than
 //! `parse_options()`, because the two disagree in ways the harness sees: only
@@ -61,9 +62,10 @@
 //! File modes match git: `.pack`/`.idx`/`.rev` are left `0444`, a `.keep` is
 //! `0600` and holds `<msg>\n` (empty for a bare `--keep`). The `.rev` payload
 //! is written here directly against `gitformat-pack(5)` — RIDX magic, version
-//! 1, hash id 1, one 4-byte index position per object sorted by pack offset,
-//! the pack checksum, then a SHA-1 over all of the above — because the
-//! vendored `gix-pack` has no reverse-index writer.
+//! 1, the hash function id (1 for SHA-1, 2 for SHA-256), one 4-byte index
+//! position per object sorted by pack offset, the pack checksum, then a digest
+//! of all of the above in that same algorithm — because the vendored `gix-pack`
+//! has no reverse-index writer.
 //!
 //! Thin-pack completion (`--fix-thin`) is honoured through the object database:
 //! `gix_pack::data::input::LookupRefDeltaObjectsIter` resolves each REF_DELTA
@@ -89,7 +91,7 @@
 //! `--check-self-contained-and-connected` (git's connectivity pass over the
 //! whole reachable set, which exceeds the vendored `gix-fsck` primitive),
 //! `--promisor`, `--pack_header`, `--index-version` other than a plain `2`,
-//! `--object-format=sha256`, `--verify` combined with `--stdin`, `--keep`
+//! `--verify` combined with `--stdin`, `--keep`
 //! without `--stdin`, and a `<pack-file>` on disk (or a self-contained pack read
 //! from stdin without `--fix-thin`) holding REF_DELTA entries — which stock git
 //! resolves in-pack — since `gix_pack::index::write_data_iter_to_stream` refuses
@@ -177,6 +179,23 @@ impl Opts {
             pack_header: false,
             pack: None,
         }
+    }
+
+    /// The hash algorithm every object id in this pack is spelled in, resolved
+    /// the way git's `cmd_index_pack()` resolves `the_hash_algo`: an explicit
+    /// `--object-format` wins, otherwise the surrounding repository's format,
+    /// and outside a repository git falls back to the compiled-in `sha1`
+    /// (`index-pack --object-format` exists precisely because there is no
+    /// repository to ask in that case).
+    fn object_hash(&self) -> Kind {
+        if let Some(fmt) = self.object_format.as_deref() {
+            if let Ok(kind) = fmt.parse::<Kind>() {
+                return kind;
+            }
+        }
+        gix::discover(".")
+            .map(|repo| repo.object_hash())
+            .unwrap_or(Kind::Sha1)
     }
 }
 
@@ -468,7 +487,7 @@ fn index_pack_file(opts: &Opts, pack_path: &Path, index_path: &Path) -> Result<E
     let hash = write_index_for_pack(opts, pack_path, index_path)?;
 
     if want_rev_index(opts) {
-        write_rev_index(index_path, &hash)?;
+        write_rev_index(index_path, &hash, opts.object_hash())?;
     }
     set_read_only(index_path)?;
 
@@ -483,12 +502,13 @@ fn index_pack_file(opts: &Opts, pack_path: &Path, index_path: &Path) -> Result<E
 /// leaves a half-written index behind — the same `git_mkstemp`/`rename` dance
 /// git performs.
 fn write_index_for_pack(opts: &Opts, pack_path: &Path, index_path: &Path) -> Result<ObjectId> {
+    let hash = opts.object_hash();
     let file = io::BufReader::new(fs::File::open(pack_path)?);
     let mut entries = pack::data::input::BytesToEntriesIter::new_from_header(
         file,
         pack::data::input::Mode::Verify,
         pack::data::input::EntryDataMode::Crc32,
-        Kind::Sha1,
+        hash,
     )?;
     let pack_version = entries.version();
 
@@ -505,7 +525,7 @@ fn write_index_for_pack(opts: &Opts, pack_path: &Path, index_path: &Path) -> Res
         &mut gix::progress::Discard,
         &mut out,
         &AtomicBool::new(false),
-        Kind::Sha1,
+        hash,
         None,
         pack_version,
     )?;
@@ -516,7 +536,7 @@ fn write_index_for_pack(opts: &Opts, pack_path: &Path, index_path: &Path) -> Res
     // temporary, so a failure leaves the repository exactly as git leaves it:
     // the checks git runs before `write_idx_file()` have already failed by then.
     if opts.strict || opts.fsck_objects {
-        if let Err(e) = fsck_pack(pack_path, &tmp, opts.strict) {
+        if let Err(e) = fsck_pack(pack_path, &tmp, opts.strict, hash) {
             let _ = fs::remove_file(&tmp);
             return Err(e);
         }
@@ -542,9 +562,10 @@ fn verify_existing(opts: &Opts, index_path: &Path) -> Result<ExitCode> {
     };
     let pack_path = PathBuf::from(format!("{stem}.pack"));
 
-    let opened = pack::index::File::at(index_path, Kind::Sha1)
+    let hash = opts.object_hash();
+    let opened = pack::index::File::at(index_path, hash)
         .ok()
-        .zip(pack::data::File::at(&pack_path, Kind::Sha1).ok());
+        .zip(pack::data::File::at(&pack_path, hash).ok());
     let Some((index, data)) = opened else {
         return Ok(cannot_open());
     };
@@ -578,7 +599,7 @@ fn verify_existing(opts: &Opts, index_path: &Path) -> Result<ExitCode> {
     // `do_fsck_object` is independent of `--verify`: the object checks still run
     // over everything the pack holds.
     if opts.strict || opts.fsck_objects {
-        fsck_pack(&pack_path, index_path, opts.strict)?;
+        fsck_pack(&pack_path, index_path, opts.strict, hash)?;
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -694,7 +715,7 @@ fn index_from_stdin(
             resolver,
             pack::bundle::write::Options {
                 thread_limit: opts.threads,
-                object_hash: Kind::Sha1,
+                object_hash: opts.object_hash(),
                 ..Default::default()
             },
         )?;
@@ -708,7 +729,7 @@ fn index_from_stdin(
         // in `objects/pack` — the state git leaves, since its own checks run
         // ahead of `write_idx_file()`.
         if opts.strict || opts.fsck_objects {
-            if let Err(e) = fsck_pack(gix_data, gix_index, opts.strict) {
+            if let Err(e) = fsck_pack(gix_data, gix_index, opts.strict, opts.object_hash()) {
                 for path in [gix_data, gix_index].into_iter().chain(outcome.keep_path.as_ref()) {
                     let _ = fs::remove_file(path);
                 }
@@ -750,7 +771,7 @@ fn index_from_stdin(
     }
 
     if want_rev_index(opts) {
-        write_rev_index(&index_path, &hash)?;
+        write_rev_index(&index_path, &hash, opts.object_hash())?;
     }
     set_read_only(&index_path)?;
     set_read_only(&data_path)?;
@@ -836,13 +857,13 @@ fn index_empty_from_stdin(
 /// rename. Here all three run against a finished index that has not been moved
 /// into place, so a failure still leaves no artifact behind — the caller removes
 /// the temporary it passed.
-fn fsck_pack(pack_path: &Path, index_path: &Path, strict: bool) -> Result<()> {
+fn fsck_pack(pack_path: &Path, index_path: &Path, strict: bool, hash: Kind) -> Result<()> {
     use super::fsck::{check_blob, check_object, Severity};
     use gix::object::Kind as ObjKind;
 
     let bundle = pack::Bundle {
-        index: pack::index::File::at(index_path, Kind::Sha1)?,
-        pack: pack::data::File::at(pack_path, Kind::Sha1)?,
+        index: pack::index::File::at(index_path, hash)?,
+        pack: pack::data::File::at(pack_path, hash)?,
     };
 
     // `sha1_object()` sees objects in the order they are unpacked, so the first
@@ -867,7 +888,7 @@ fn fsck_pack(pack_path: &Path, index_path: &Path, strict: bool) -> Result<()> {
         let (object, _) = bundle.get_object_by_index(*index, &mut buf, &mut inflate, &mut cache)?;
         let (kind, data) = (object.kind, object.data.to_vec());
 
-        let checked = check_object(kind, &data, true);
+        let checked = check_object(kind, &data, true, hash.len_in_hex());
         // `init_tree_desc_gently()` and `update_tree_entry_gently()` call
         // `error()` themselves, with no msg-id and so no severity to consult.
         for line in &checked.raw {
@@ -893,7 +914,7 @@ fn fsck_pack(pack_path: &Path, index_path: &Path, strict: bool) -> Result<()> {
             queued.push((*blob, false, true));
         }
         if strict {
-            collect_links(kind, &data, &mut links);
+            collect_links(kind, &data, &mut links, hash);
         }
     }
     if object_error {
@@ -995,16 +1016,21 @@ fn strict_severity(msg: &super::fsck::Msg) -> super::fsck::Severity {
 /// `fsck_walk_{commit,tree,tag}`: the objects `obj` links to, each with the type
 /// the link gives it. A gitlink is skipped — it names a commit in another
 /// repository, which `fsck_walk_tree()` never follows.
-fn collect_links(kind: gix::object::Kind, data: &[u8], out: &mut Vec<(ObjectId, gix::object::Kind)>) {
+fn collect_links(
+    kind: gix::object::Kind,
+    data: &[u8],
+    out: &mut Vec<(ObjectId, gix::object::Kind)>,
+    hash: Kind,
+) {
     use gix::object::Kind as ObjKind;
     match kind {
         ObjKind::Commit => {
-            let Ok(commit) = gix::objs::CommitRef::from_bytes(data, Kind::Sha1) else { return };
+            let Ok(commit) = gix::objs::CommitRef::from_bytes(data, hash) else { return };
             out.push((commit.tree(), ObjKind::Tree));
             out.extend(commit.parents().map(|id| (id, ObjKind::Commit)));
         }
         ObjKind::Tree => {
-            let Ok(tree) = gix::objs::TreeRef::from_bytes(data, Kind::Sha1) else { return };
+            let Ok(tree) = gix::objs::TreeRef::from_bytes(data, hash) else { return };
             for entry in tree.entries {
                 match entry.mode.kind() {
                     gix::objs::tree::EntryKind::Commit => {}
@@ -1016,7 +1042,7 @@ fn collect_links(kind: gix::object::Kind, data: &[u8], out: &mut Vec<(ObjectId, 
             }
         }
         ObjKind::Tag => {
-            let Ok(tag) = gix::objs::TagRef::from_bytes(data, Kind::Sha1) else { return };
+            let Ok(tag) = gix::objs::TagRef::from_bytes(data, hash) else { return };
             out.push((tag.target(), tag.target_kind));
         }
         ObjKind::Blob => {}
@@ -1045,8 +1071,12 @@ fn reject_unported(opts: &Opts) -> Result<()> {
     if opts.pack_header {
         bail!("unsupported flag \"--pack_header\" (internal fetch fast-path is not ported)");
     }
+    // `sha1` and `sha256` are the two `hash_algo_by_name()` accepts, and
+    // [`Opts::object_hash`] resolves either into the `gix_hash::Kind` every
+    // pack read and write below is parameterized on. Anything else names no
+    // algorithm at all.
     if let Some(fmt) = &opts.object_format {
-        if fmt != "sha1" {
+        if fmt.parse::<Kind>().is_err() {
             anyhow::bail!("unsupported object format {fmt:?}");
         }
     }
@@ -1083,7 +1113,7 @@ fn want_rev_index(opts: &Opts) -> bool {
 /// Best-effort per pack: a `.rev` that cannot be produced is skipped rather than
 /// failing the clone, since git's own `index-pack` treats the reverse index as
 /// an accelerator and the repository is complete without it.
-pub(super) fn write_missing_rev_indexes(pack_dir: &Path) {
+pub(super) fn write_missing_rev_indexes(pack_dir: &Path, hash: Kind) {
     let Ok(entries) = fs::read_dir(pack_dir) else {
         return;
     };
@@ -1094,37 +1124,44 @@ pub(super) fn write_missing_rev_indexes(pack_dir: &Path) {
         // The trailer of the `.idx` is the checksum of the pack it indexes, which
         // is the id the `.rev` records. Reading it from the index rather than the
         // filename keeps this correct for a pack named any other way.
-        let Ok(index) = pack::index::File::at(&path, Kind::Sha1) else {
+        let Ok(index) = pack::index::File::at(&path, hash) else {
             continue;
         };
-        let _ = write_rev_index(&path, &index.pack_checksum());
+        let _ = write_rev_index(&path, &index.pack_checksum(), hash);
     }
 }
 
 /// Write the reverse index for `index_path` per `gitformat-pack(5)`.
 ///
-/// Layout: `RIDX`, version 1, hash id 1 (SHA-1), then one 4-byte big-endian
-/// index position per object ordered by pack offset, the pack checksum, and a
-/// SHA-1 trailer over everything preceding it. The file lands beside the index
-/// with the `.idx` suffix swapped for `.rev`, matching git even under `-o`.
-fn write_rev_index(index_path: &Path, pack_hash: &ObjectId) -> Result<()> {
-    let index = pack::index::File::at(index_path, Kind::Sha1)?;
+/// Layout: `RIDX`, version 1, the hash function id (`gitformat-pack(5)`: 1 for
+/// SHA-1, 2 for SHA-256), then one 4-byte big-endian index position per object
+/// ordered by pack offset, the pack checksum, and a trailer over everything
+/// preceding it in that same algorithm. The file lands beside the index with the
+/// `.idx` suffix swapped for `.rev`, matching git even under `-o`.
+fn write_rev_index(index_path: &Path, pack_hash: &ObjectId, hash: Kind) -> Result<()> {
+    let index = pack::index::File::at(index_path, hash)?;
 
     let mut by_offset: Vec<(u64, u32)> = (0..index.num_objects())
         .map(|position| (index.pack_offset_at_index(position), position))
         .collect();
     by_offset.sort_unstable();
 
-    let mut buf = Vec::with_capacity(12 + 4 * by_offset.len() + 40);
+    let mut buf = Vec::with_capacity(12 + 4 * by_offset.len() + 2 * hash.len_in_bytes());
     buf.extend_from_slice(b"RIDX");
     buf.extend_from_slice(&1u32.to_be_bytes()); // version
-    buf.extend_from_slice(&1u32.to_be_bytes()); // hash function id: SHA-1
+    // `gitformat-pack(5)`'s hash function id, the same mapping
+    // `gix-pack`'s own reverse-index writer uses.
+    let hash_id: u32 = match hash {
+        Kind::Sha1 => 1,
+        _ => 2,
+    };
+    buf.extend_from_slice(&hash_id.to_be_bytes());
     for (_, position) in &by_offset {
         buf.extend_from_slice(&position.to_be_bytes());
     }
     buf.extend_from_slice(pack_hash.as_slice());
 
-    let mut hasher = gix::hash::hasher(Kind::Sha1);
+    let mut hasher = gix::hash::hasher(hash);
     hasher.update(&buf);
     let checksum = hasher.try_finalize()?;
     buf.extend_from_slice(checksum.as_slice());

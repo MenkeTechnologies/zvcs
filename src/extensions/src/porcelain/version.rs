@@ -176,6 +176,22 @@ const SHELL_PATH: &str = crate::external::SHELL_PATH;
 /// bail-out configuration — in git's own vocabulary for it.
 const SHA1_BACKEND: &str = "SHA1_DC";
 
+/// git's `SHA256_BACKEND` for the backend this build actually uses.
+///
+/// Like [`SHA1_BACKEND`] the token names a *backend category*. `hash.h` picks
+/// between `"SHA256_NETTLE"`, `"SHA256_GCRYPT"`, `"SHA256_OPENSSL"` and
+/// `"SHA256_BLK"`; the first three each name an external crypto library, and
+/// `SHA256_BLK` is the `#else` — git's own in-tree block implementation,
+/// linking no crypto library at all.
+///
+/// This build's SHA-256 is the `sha2` crate, reached through `gix-hash`'s
+/// `sha256` feature (`src/ported/gix-hash/src/hasher.rs:24-25,41-42,88`). It is
+/// a self-contained software implementation — a portable `soft` block compressor
+/// plus optional CPU intrinsics, no C and no crypto library — which is the same
+/// category `SHA256_BLK` names. So `SHA-256: SHA256_BLK` states the true thing
+/// about this build in git's own vocabulary for it.
+const SHA256_BACKEND: &str = "SHA256_BLK";
+
 /// The version of `zlib-rs` the workspace lockfile resolved, harvested by
 /// `build.rs` (empty when the crate is not in the graph, in which case the line
 /// is dropped rather than guessed).
@@ -203,10 +219,16 @@ const ZLIB_RS_VERSION: &str = env!("ZVCS_ZLIB_RS_VERSION");
 ///     `deflate.c`/`trees.c` — part of this binary, with no library version of
 ///     its own to print.
 ///   * `SHA-1:` — [`SHA1_BACKEND`].
-///   * `default-ref-format:` / `default-hash:` — `files` and `sha1`. Both are
-///     the defaults here *and* the only formats this port accepts;
-///     `porcelain::init` rejects `--ref-format=reftable` and
-///     `--object-format=sha256` for want of a backend.
+///   * `SHA-256:` — [`SHA256_BACKEND`]. `gix-hash`'s `sha256` feature is on, so
+///     `Kind::Sha256` is compiled in and drives the object, pack, index and ref
+///     paths: `git init --object-format=sha256` writes the same
+///     `extensions.objectformat` + `core.repositoryformatversion=1` pair stock
+///     writes, and the repository it lays down produces stock's object ids.
+///   * `default-ref-format:` / `default-hash:` — `files` and `sha1`, git's
+///     compiled-in defaults, and the defaults here too. `sha1` is a statement
+///     about the default rather than about what is accepted: both object formats
+///     work. `files` is still the only ref format this port has a backend for —
+///     `porcelain::init` rejects `--ref-format=reftable`.
 ///
 /// Omitted, because this build has no such component — the same reason git's own
 /// `#ifdef`s drop a line:
@@ -221,11 +243,6 @@ const ZLIB_RS_VERSION: &str = env!("ZVCS_ZLIB_RS_VERSION");
 ///     `ZLIB_VERSION` of its own, so the version it *is* built from is reported
 ///     under its own name (`zlib-rs:`, above) instead. Printing either of git's
 ///     two spellings would name a library that is not there.
-///   * `SHA-256:` — git prints it unconditionally because it always has a
-///     backend; its four tokens (`SHA256_BLK`, `SHA256_OPENSSL`,
-///     `SHA256_NETTLE`, `SHA256_GCRYPT`) all name one. This build has none:
-///     `gix-hash`'s `sha256` feature is off, so `sha2` is not in the dependency
-///     graph and `Kind::Sha256` is not even compiled in.
 pub(crate) fn get_version_info(out: &mut String, show_build_options: bool) {
     // "The format of this string should be kept stable for compatibility with
     // external projects that rely on the output of `git version`."
@@ -252,6 +269,7 @@ pub(crate) fn get_version_info(out: &mut String, show_build_options: bool) {
         out.push_str(&format!("zlib-rs: {ZLIB_RS_VERSION} (inflate only)\n"));
     }
     out.push_str(&format!("SHA-1: {SHA1_BACKEND}\n"));
+    out.push_str(&format!("SHA-256: {SHA256_BACKEND}\n"));
     out.push_str("default-ref-format: files\n");
     out.push_str("default-hash: sha1\n");
 }

@@ -36,9 +36,12 @@ use crate::lock::RepoLock;
 ///   * `git init --separate-git-dir=<gitdir>`             (real git dir elsewhere + `.git` link file)
 ///   * `git init --shared[=<permissions>]`                (group/world/octal sharing)
 ///   * `git init --object-format=<hash>` / `--object-format <hash>`
-///                                                        (`sha1` accepted; `sha256` rejected — see deviations)
+///                                                        (both `sha1` and `sha256`)
 ///     with git's precedence: the option > the `GIT_DEFAULT_HASH` env var >
-///     the `init.defaultObjectFormat` config > the compiled-in `sha1`.
+///     the `init.defaultObjectFormat` config > the compiled-in `sha1`. `sha256`
+///     writes the same `extensions.objectformat` + `core.repositoryformatversion
+///     = 1` pair stock writes; the config level is resolved *before* the
+///     repository is laid down, since the hash it names decides what is written.
 ///   * `git init --ref-format=<format>` / `--ref-format <format>`
 ///                                                        (`files` accepted; `reftable` rejected — see deviations)
 ///     with git's precedence: the option > the `GIT_DEFAULT_REF_FORMAT` env var >
@@ -87,14 +90,13 @@ use crate::lock::RepoLock;
 ///     already-initialized repo is not re-templated, re-shared, or migrated to a
 ///     separate git dir. The overwhelmingly common `git init` into a fresh dir
 ///     is unaffected.
-///   * `--object-format=sha256` and `--ref-format=reftable` are rejected with an
-///     honest "not supported" error (not "silently accepted", and never faked
-///     into a mismatched-format repo): the sha256 object write path is unverified
-///     against gix and there is no vendored reftable backend. The defaults
-///     `--object-format=sha1` and `--ref-format=files` ARE honored — they are
-///     no-ops that match the repository gix already writes — and an otherwise
-///     unrecognized value reproduces git's exact error text (`unknown hash
-///     algorithm '<v>'` / `unknown ref storage format '<v>'`).
+///   * `--ref-format=reftable` is rejected with an honest "not supported" error
+///     (not "silently accepted", and never faked into a mismatched-format repo):
+///     there is no vendored reftable backend. `--ref-format=files` is a no-op
+///     that matches the repository gix already writes, both object formats are
+///     laid down for real, and an otherwise unrecognized value reproduces git's
+///     exact error text (`unknown hash algorithm '<v>'` / `unknown ref storage
+///     format '<v>'`).
 /// ```
 
 /// `cmd_init_db()`'s `struct option init_db_options[]` (builtin/init-db.c), in
@@ -404,16 +406,42 @@ pub fn init(args: &[String]) -> Result<ExitCode> {
     // an opened handle with an unborn HEAD on the default branch. gix refuses
     // `--bare` into a non-empty directory where stock git permits it, so fall
     // back to a scratch-dir build in that one case.
+    //
+    // The object format decides what is laid down, so the config level of its
+    // precedence chain has to be resolved *before* the repository exists rather
+    // than out of the finished repository's snapshot below. That is also where
+    // git reads it: `cmd_init_db()` calls `git_config_get_string()` for
+    // `init.defaultobjectformat` with no repository open, so the value can only
+    // come from the global/system files — [`crate::config::global_config`] is
+    // that same pair. An unrecognized value selects nothing here and is warned
+    // about below, which is git's fall back to the compiled-in default.
+    let configured_object_format = match object_format {
+        Some(_) => None,
+        None => crate::config::global_config()
+            .string("init.defaultObjectFormat")
+            .map(|v| v.to_string())
+            .filter(|v| matches!(check_object_format(v), Ok(FormatCheck::Implemented))),
+    };
+    let create_opts = gix::create::Options {
+        object_hash: object_hash_of(
+            object_format
+                .as_deref()
+                .or(configured_object_format.as_deref()),
+        ),
+        ..Default::default()
+    };
     let repo = if bare {
-        match gix::init_bare(&target) {
-            Ok(r) => r,
+        match gix::ThreadSafeRepository::init(&target, gix::create::Kind::Bare, create_opts) {
+            Ok(r) => r.to_thread_local(),
             Err(gix::init::Error::Init(gix::create::Error::DirectoryNotEmpty { .. })) => {
-                init_bare_into_nonempty(&target)?
+                init_bare_into_nonempty(&target, create_opts)?
             }
             Err(e) => return Err(anyhow::anyhow!("{e}")),
         }
     } else {
-        gix::init(&target).map_err(|e| anyhow::anyhow!("{e}"))?
+        gix::ThreadSafeRepository::init(&target, gix::create::Kind::WithWorktree, create_opts)
+            .map(|r| r.to_thread_local())
+            .map_err(|e| anyhow::anyhow!("{e}"))?
     };
 
     // The config level of the format precedence chain: consulted only when
@@ -587,19 +615,28 @@ enum FormatCheck {
     Unrecognized,
 }
 
-/// git's `hash_algo_by_name` recognizes exactly `sha1` and `sha256`. gix lays
-/// down sha1 repositories, so `sha1` (also the compiled-in default) is a no-op
-/// that matches stock git byte-for-byte. `sha256` needs a verified sha256 object
-/// write path that is not vendored (the `gix` `sha256` feature is off), so it is
-/// rejected honestly rather than silently producing a sha1 repository.
+/// git's `hash_algo_by_name` recognizes exactly `sha1` and `sha256`, and this
+/// port lays down both. `sha1` is the compiled-in default, so it is a no-op that
+/// matches stock git byte-for-byte; `sha256` routes [`object_hash_of`]'s
+/// `gix_hash::Kind::Sha256` into `gix::create::Options`, which writes
+/// `extensions.objectformat = sha256` together with the
+/// `core.repositoryformatversion = 1` bump every extension requires
+/// (`src/ported/gix/src/create.rs:287-299`).
 fn check_object_format(fmt: &str) -> Result<FormatCheck> {
     match fmt {
-        "sha1" => Ok(FormatCheck::Implemented),
-        "sha256" => anyhow::bail!(
-            "the sha256 object format is not supported: no vendored, verified \
-             sha256 object write path"
-        ),
+        "sha1" | "sha256" => Ok(FormatCheck::Implemented),
         _ => Ok(FormatCheck::Unrecognized),
+    }
+}
+
+/// The `gix_hash::Kind` a resolved `--object-format` name selects, as
+/// `gix::create::Options::object_hash` wants it: `None` is git's legacy sha1
+/// repository, which carries no `extensions.objectformat` key at all, and
+/// `Some(Sha256)` is the one that does.
+fn object_hash_of(fmt: Option<&str>) -> Option<gix::hash::Kind> {
+    match fmt {
+        Some("sha256") => Some(gix::hash::Kind::Sha256),
+        _ => None,
     }
 }
 
@@ -650,11 +687,15 @@ pub(super) fn enable_submodule_path_config(git_dir: &Path) -> Result<()> {
 /// (`create::into` checks emptiness unconditionally for bare), while stock git
 /// permits it. Lay the layout down in an empty scratch subdirectory, then move
 /// each entry up into `target`, yielding the same on-disk result git produces.
-fn init_bare_into_nonempty(target: &Path) -> Result<gix::Repository> {
+fn init_bare_into_nonempty(
+    target: &Path,
+    create_opts: gix::create::Options,
+) -> Result<gix::Repository> {
     std::fs::create_dir_all(target)?;
     let scratch = target.join(format!(".git-init-scratch-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&scratch);
-    gix::init_bare(&scratch).map_err(|e| anyhow::anyhow!("{e}"))?;
+    gix::ThreadSafeRepository::init(&scratch, gix::create::Kind::Bare, create_opts)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
     for entry in std::fs::read_dir(&scratch)? {
         let entry = entry?;
         std::fs::rename(entry.path(), target.join(entry.file_name()))?;

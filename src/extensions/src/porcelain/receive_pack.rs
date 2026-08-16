@@ -1582,7 +1582,7 @@ fn ingest_pack(
         &AtomicBool::new(false),
         Some(repo.objects.clone()),
         gix::odb::pack::bundle::write::Options {
-            object_hash: gix::hash::Kind::Sha1,
+            object_hash: repo.object_hash(),
             ..Default::default()
         },
     );
@@ -1608,7 +1608,7 @@ fn ingest_pack(
 
     // `--strict`: every object the push brought in is linted before any ref
     // moves, and the first error kills the whole push.
-    let received = match pack_object_ids(&index_path) {
+    let received = match pack_object_ids(&index_path, repo.object_hash()) {
         Ok(ids) => ids,
         Err(e) => {
             band.fatal(&e.to_string());
@@ -1663,8 +1663,11 @@ impl<R: Read> Read for Counted<R> {
 }
 
 /// Every object id an index file lists, in pack order.
-fn pack_object_ids(index_path: &std::path::Path) -> Result<Vec<gix::ObjectId>> {
-    let index = gix::odb::pack::index::File::at(index_path, gix::hash::Kind::Sha1)?;
+fn pack_object_ids(
+    index_path: &std::path::Path,
+    object_hash: gix::hash::Kind,
+) -> Result<Vec<gix::ObjectId>> {
+    let index = gix::odb::pack::index::File::at(index_path, object_hash)?;
     Ok(index.iter().map(|e| e.oid).collect())
 }
 
@@ -1710,7 +1713,7 @@ fn fsck_received(
 
     for id in received {
         let Ok(object) = repo.find_object(*id) else { continue };
-        let checked = check_object(object.kind, &object.data, true);
+        let checked = check_object(object.kind, &object.data, true, repo.object_hash().len_in_hex());
         // The tree-entry decoder's own `error:` lines, already prefixed.
         for line in &checked.raw {
             band.write(&format!("{line}\n"));

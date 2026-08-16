@@ -746,7 +746,7 @@ fn receive(
         Status::NoPackReceived { .. } => Ok(()),
         Status::Change {
             write_pack_bundle, ..
-        } if keep => keep_pack(write_pack_bundle),
+        } if keep => keep_pack(repo, write_pack_bundle),
         Status::Change {
             write_pack_bundle, ..
         } => explode(repo, write_pack_bundle),
@@ -771,7 +771,7 @@ fn receive(
 ///
 /// `finalize_object_file()` leaves the pack, its index and its reverse index
 /// read-only, so the three are chmod'd to match.
-fn keep_pack(bundle: gix::odb::pack::bundle::write::Outcome) -> Result<()> {
+fn keep_pack(repo: &gix::Repository, bundle: gix::odb::pack::bundle::write::Outcome) -> Result<()> {
     let (Some(index_path), Some(data_path)) = (bundle.index_path.clone(), bundle.data_path.clone())
     else {
         // gitoxide found a pack with these bytes already on disk and reused it,
@@ -794,7 +794,7 @@ fn keep_pack(bundle: gix::odb::pack::bundle::write::Outcome) -> Result<()> {
     // git's `index-pack` writes the reverse index for the pack it just built;
     // `gix-pack` does not, so it is filled in beside the index here.
     if let Some(pack_dir) = data_path.parent() {
-        super::index_pack::write_missing_rev_indexes(pack_dir);
+        super::index_pack::write_missing_rev_indexes(pack_dir, repo.object_hash());
     }
     for path in [&data_path, &index_path] {
         let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o444));

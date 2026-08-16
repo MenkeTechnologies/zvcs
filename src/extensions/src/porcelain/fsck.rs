@@ -405,7 +405,7 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
         };
         // `fsck_loose()` parses before it does anything else, and skips
         // `fsck_obj()` — the verbose line included — when the parse fails.
-        let decoded = match parse_object_buffer(id, kind, &data) {
+        let decoded = match parse_object_buffer(id, kind, &data, repo.object_hash().len_in_hex()) {
             Ok(d) => d,
             Err(failed) => {
                 let slot = Slot::Scan(id.as_bytes()[0]);
@@ -459,7 +459,7 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
 
         // `fsck_object()` next; `fsck_obj()` skips the `root`/`tagged` line when
         // it reported an error.
-        let checked = check_object(kind, &data, opt.strict);
+        let checked = check_object(kind, &data, opt.strict, repo.object_hash().len_in_hex());
         for line in checked.raw {
             msg_lines.push((Slot::Scan(id.as_bytes()[0]), id, line));
         }
@@ -1143,18 +1143,32 @@ struct ParseFailed {
 /// repository, which is also what git's `fsck_walk_tree()` does.
 fn decode(repo: &gix::Repository, id: ObjectId) -> Result<Result<Decoded, ParseFailed>> {
     let object = repo.find_object(id)?;
-    Ok(parse_object_buffer(id, object.kind, &object.data))
+    Ok(parse_object_buffer(
+        id,
+        object.kind,
+        &object.data,
+        repo.object_hash().len_in_hex(),
+    ))
 }
 
 /// The buffer half of [`decode`], so `receive-pack` can reuse it.
-fn parse_object_buffer(id: ObjectId, kind: Kind, data: &[u8]) -> Result<Decoded, ParseFailed> {
+///
+/// `hexsz` is git's `the_hash_algo->hexsz` — 40 in a sha1 repository, 64 in a
+/// sha256 one. Every header offset below is expressed in terms of it, exactly as
+/// `commit.c`/`tag.c` write them, so the same code parses either format.
+fn parse_object_buffer(
+    id: ObjectId,
+    kind: Kind,
+    data: &[u8],
+    hexsz: usize,
+) -> Result<Decoded, ParseFailed> {
     let mut children = Vec::new();
     let mut is_root_commit = false;
     let mut tag = None;
     let mut walk_error = None;
     match kind {
         Kind::Commit => {
-            let (tree, parents) = parse_commit_buffer(id, data)?;
+            let (tree, parents) = parse_commit_buffer(id, data, hexsz)?;
             children.push((tree, Kind::Tree));
             is_root_commit = parents.is_empty();
             children.extend(parents.into_iter().map(|p| (p, Kind::Commit)));
@@ -1163,7 +1177,7 @@ fn parse_object_buffer(id: ObjectId, kind: Kind, data: &[u8]) -> Result<Decoded,
             // `parse_tree_buffer()` only hands the buffer to the tree object;
             // a malformed entry is not noticed until `fsck_walk_tree()` decodes
             // it, which is what the rest of this arm is.
-            let (entries, stop) = tree_entries(data);
+            let (entries, stop) = tree_entries(data, hexsz);
             for entry in &entries {
                 // `fsck_walk_tree()` canonicalizes the mode (its `tree_desc`
                 // has no `TREE_DESC_RAW_MODES`) and skips gitlinks.
@@ -1191,7 +1205,7 @@ fn parse_object_buffer(id: ObjectId, kind: Kind, data: &[u8]) -> Result<Decoded,
             };
         }
         Kind::Tag => {
-            let (target, target_kind, name) = parse_tag_buffer(id, data)?;
+            let (target, target_kind, name) = parse_tag_buffer(id, data, hexsz)?;
             children.push((target, target_kind));
             tag = Some((target_kind, target, name));
         }
@@ -1205,37 +1219,49 @@ fn parse_object_buffer(id: ObjectId, kind: Kind, data: &[u8]) -> Result<Decoded,
     })
 }
 
-/// The length of a `tree <hex>` line without its newline (`the_hash_algo->hexsz
-/// + 5`), and of a `parent <hex>` line (`+ 7`).
-const TREE_ENTRY_LEN: usize = 45;
-/// See [`TREE_ENTRY_LEN`].
-const PARENT_ENTRY_LEN: usize = 47;
+/// The length of a `tree <hex>` line without its newline
+/// (`the_hash_algo->hexsz + 5`), for a repository whose hex digest is `hexsz`
+/// characters wide.
+fn tree_entry_len(hexsz: usize) -> usize {
+    hexsz + 5
+}
+/// The `parent <hex>` counterpart of [`tree_entry_len`]
+/// (`the_hash_algo->hexsz + 7`).
+fn parent_entry_len(hexsz: usize) -> usize {
+    hexsz + 7
+}
 
 /// `commit.c::parse_commit_buffer`, which reads only the `tree` line and the
 /// `parent` lines and leaves every other header to the message layer. Its two
 /// `lookup_*` failures are not modelled: they need an id already known to this
 /// process under a conflicting type.
-fn parse_commit_buffer(id: ObjectId, data: &[u8]) -> Result<(ObjectId, Vec<ObjectId>), ParseFailed> {
+fn parse_commit_buffer(
+    id: ObjectId,
+    data: &[u8],
+    hexsz: usize,
+) -> Result<(ObjectId, Vec<ObjectId>), ParseFailed> {
+    let tree_entry_len = tree_entry_len(hexsz);
+    let parent_entry_len = parent_entry_len(hexsz);
     let bogus = || ParseFailed { diagnostic: Some(format!("error: bogus commit object {id}")) };
-    if data.len() <= TREE_ENTRY_LEN + 1
+    if data.len() <= tree_entry_len + 1
         || !data.starts_with(b"tree ")
-        || data[TREE_ENTRY_LEN] != b'\n'
+        || data[tree_entry_len] != b'\n'
     {
         return Err(bogus());
     }
-    let tree = ObjectId::from_hex(&data[5..TREE_ENTRY_LEN]).map_err(|_| ParseFailed {
+    let tree = ObjectId::from_hex(&data[5..tree_entry_len]).map_err(|_| ParseFailed {
         diagnostic: Some(format!("error: bad tree pointer in commit {id}")),
     })?;
 
-    let mut at = TREE_ENTRY_LEN + 1;
+    let mut at = tree_entry_len + 1;
     let mut parents = Vec::new();
-    while at + PARENT_ENTRY_LEN < data.len() && data[at..].starts_with(b"parent ") {
+    while at + parent_entry_len < data.len() && data[at..].starts_with(b"parent ") {
         let bad = || ParseFailed { diagnostic: Some(format!("error: bad parents in commit {id}")) };
-        if data.len() <= at + PARENT_ENTRY_LEN + 1 || data[at + PARENT_ENTRY_LEN] != b'\n' {
+        if data.len() <= at + parent_entry_len + 1 || data[at + parent_entry_len] != b'\n' {
             return Err(bad());
         }
-        parents.push(ObjectId::from_hex(&data[at + 7..at + PARENT_ENTRY_LEN]).map_err(|_| bad())?);
-        at += PARENT_ENTRY_LEN + 1;
+        parents.push(ObjectId::from_hex(&data[at + 7..at + parent_entry_len]).map_err(|_| bad())?);
+        at += parent_entry_len + 1;
     }
     Ok((tree, parents))
 }
@@ -1243,17 +1269,24 @@ fn parse_commit_buffer(id: ObjectId, data: &[u8]) -> Result<(ObjectId, Vec<Objec
 /// `tag.c::parse_tag_buffer`, which reads only the `object`, `type` and `tag`
 /// headers. Every failure but the unknown type is silent — it returns `-1`
 /// without printing.
-fn parse_tag_buffer(id: ObjectId, data: &[u8]) -> Result<(ObjectId, Kind, String), ParseFailed> {
+fn parse_tag_buffer(
+    id: ObjectId,
+    data: &[u8],
+    hexsz: usize,
+) -> Result<(ObjectId, Kind, String), ParseFailed> {
     let silent = || ParseFailed { diagnostic: None };
     // `hexsz + 24`: the shortest buffer that could hold all three headers.
-    if data.len() < 64 || !data.starts_with(b"object ") {
+    if data.len() < hexsz + 24 || !data.starts_with(b"object ") {
         return Err(silent());
     }
-    let target = ObjectId::from_hex(&data[7..47]).map_err(|_| silent())?;
-    if data[47] != b'\n' || !data[48..].starts_with(b"type ") {
+    // `object ` is 7 bytes, so the hex digest ends at `7 + hexsz` and the `type`
+    // header starts one newline later.
+    let object_end = 7 + hexsz;
+    let target = ObjectId::from_hex(&data[7..object_end]).map_err(|_| silent())?;
+    if data[object_end] != b'\n' || !data[object_end + 1..].starts_with(b"type ") {
         return Err(silent());
     }
-    let after_type = &data[53..];
+    let after_type = &data[object_end + 6..];
     let nl = after_type.iter().position(|&b| b == b'\n').ok_or_else(silent)?;
     // `char type[20]`, so a type name of 19 characters is the longest that fits.
     if nl >= 20 {
@@ -3604,11 +3637,18 @@ pub struct Checked {
 /// `fsck.c::fsck_object` for the three types whose contents this port lints.
 /// A blob is linted separately by [`check_blob`], because whether it is linted
 /// at all depends on the trees walked before it.
-pub fn check_object(kind: Kind, data: &[u8], strict: bool) -> Checked {
+///
+/// `hexsz` is git's `the_hash_algo->hexsz` for the repository the object came
+/// from — 40 in a sha1 repository, 64 in a sha256 one. Tree entries carry raw
+/// ids of `hexsz / 2` bytes and a commit's `parent` lines carry `hexsz` hex
+/// characters, so the checks below cannot be written against one width.
+pub fn check_object(kind: Kind, data: &[u8], strict: bool, hexsz: usize) -> Checked {
     let mut out = Checked::default();
     match kind {
-        Kind::Commit => check_commit(data, &mut out.findings),
-        Kind::Tree => check_tree(data, &mut out, strict),
+        Kind::Commit => check_commit(data, &mut out.findings, hexsz),
+        Kind::Tree => check_tree(data, &mut out, strict, hexsz),
+        // `fsck_tag` walks its headers line by line and never measures an id, so
+        // it needs no hash width.
         Kind::Tag => check_tag(data, &mut out.findings),
         Kind::Blob => {}
     }
@@ -3651,10 +3691,10 @@ fn verify_headers(data: &[u8], out: &mut Vec<Finding>) -> bool {
 ///
 /// A malformed `parent` line *can* survive that parse, because
 /// `parse_commit_buffer()` only enters its own parent loop while
-/// `bufptr + 47 < tail` — a `parent` line in the last 48 bytes of the buffer is
-/// never looked at there and reaches `fsck_commit` intact. So `badParentSha1`
-/// is reported here.
-fn check_commit(data: &[u8], out: &mut Vec<Finding>) {
+/// `bufptr + hexsz + 7 < tail` — a `parent` line in the last `hexsz + 8` bytes
+/// of the buffer is never looked at there and reaches `fsck_commit` intact. So
+/// `badParentSha1` is reported here.
+fn check_commit(data: &[u8], out: &mut Vec<Finding>, hexsz: usize) {
     if verify_headers(data, out) {
         return;
     }
@@ -3663,14 +3703,14 @@ fn check_commit(data: &[u8], out: &mut Vec<Finding>) {
     p = rest;
     while let Some(after) = strip(p, b"parent ") {
         // `parse_oid_hex_algop(buffer, &parent_oid, &p) || *p != '\n'`.
-        let well_formed = after.len() > HEXSZ
-            && after[..HEXSZ].iter().all(u8::is_ascii_hexdigit)
-            && after[HEXSZ] == b'\n';
+        let well_formed = after.len() > hexsz
+            && after[..hexsz].iter().all(u8::is_ascii_hexdigit)
+            && after[hexsz] == b'\n';
         if !well_formed {
             report(out, &BAD_PARENT_SHA1, "invalid 'parent' line format - bad sha1");
             return;
         }
-        p = &after[HEXSZ + 1..];
+        p = &after[hexsz + 1..];
     }
 
     let mut authors = 0;
@@ -3797,11 +3837,12 @@ fn skip_line(data: &[u8]) -> Option<&[u8]> {
 /// mode git also accepts, but only when `--strict` is off.
 const GOOD_MODES: [u32; 5] = [0o100644, 0o100755, 0o120000, 0o040000, 0o160000];
 
-/// The raw size of a SHA-1, `the_hash_algo->rawsz`.
-const RAWSZ: usize = 20;
-
-/// The hex size of a SHA-1, `the_hash_algo->hexsz`.
-const HEXSZ: usize = RAWSZ * 2;
+/// `the_hash_algo->rawsz` for a repository whose hex digest is `hexsz`
+/// characters wide: 20 for sha1, 32 for sha256. git derives one from the other
+/// the same way (`hash.h`: `hexsz == 2 * rawsz`).
+fn rawsz(hexsz: usize) -> usize {
+    hexsz / 2
+}
 
 /// One decoded tree entry — `struct name_entry` plus the raw mode field, which
 /// `zeroPaddedFilemode` needs.
@@ -3820,8 +3861,9 @@ struct TreeEntry<'a> {
 /// `init_tree_desc_gently()`/`update_tree_entry_gently()` would print on
 /// failure. The two `strlen`-based reads git makes past `size` are bounded here
 /// instead, and report `too-short tree object`.
-fn decode_tree_entry(buf: &[u8]) -> Result<TreeEntry<'_>, &'static str> {
-    if buf.len() < RAWSZ + 3 || buf[buf.len() - (RAWSZ + 1)] != 0 {
+fn decode_tree_entry(buf: &[u8], hexsz: usize) -> Result<TreeEntry<'_>, &'static str> {
+    let raw = rawsz(hexsz);
+    if buf.len() < raw + 3 || buf[buf.len() - (raw + 1)] != 0 {
         return Err("too-short tree object");
     }
     // `parse_mode()`: octal digits up to the separating space.
@@ -3850,21 +3892,21 @@ fn decode_tree_entry(buf: &[u8]) -> Result<TreeEntry<'_>, &'static str> {
     let Some(nul) = path.iter().position(|&b| b == 0) else {
         return Err("too-short tree object");
     };
-    if path.len() < nul + 1 + RAWSZ {
+    if path.len() < nul + 1 + raw {
         return Err("too-short tree object");
     }
     Ok(TreeEntry {
         mode,
         raw_mode,
         name: &path[..nul],
-        oid: &path[nul + 1..nul + 1 + RAWSZ],
+        oid: &path[nul + 1..nul + 1 + raw],
     })
 }
 
 /// How far past an entry the next one starts — `update_tree_entry_internal`'s
 /// `end - buf`.
-fn tree_entry_span(entry: &TreeEntry<'_>) -> usize {
-    entry.raw_mode.len() + 1 + entry.name.len() + 1 + RAWSZ
+fn tree_entry_span(entry: &TreeEntry<'_>, hexsz: usize) -> usize {
+    entry.raw_mode.len() + 1 + entry.name.len() + 1 + rawsz(hexsz)
 }
 
 /// Where a tree walk stopped.
@@ -3881,17 +3923,17 @@ enum TreeStop {
 
 /// `init_tree_desc_gently()` followed by `update_tree_entry_gently()` until the
 /// buffer runs out or an entry fails to decode.
-fn tree_entries(data: &[u8]) -> (Vec<TreeEntry<'_>>, TreeStop) {
+fn tree_entries(data: &[u8], hexsz: usize) -> (Vec<TreeEntry<'_>>, TreeStop) {
     let mut out = Vec::new();
     if data.is_empty() {
         return (out, TreeStop::End);
     }
     let mut buf = data;
-    let entry = match decode_tree_entry(buf) {
+    let entry = match decode_tree_entry(buf, hexsz) {
         Ok(entry) => entry,
         Err(msg) => return (out, TreeStop::AtInit(msg)),
     };
-    let mut span = tree_entry_span(&entry);
+    let mut span = tree_entry_span(&entry, hexsz);
     out.push(entry);
     loop {
         if buf.len() < span {
@@ -3903,18 +3945,18 @@ fn tree_entries(data: &[u8]) -> (Vec<TreeEntry<'_>>, TreeStop) {
         if buf.is_empty() {
             return (out, TreeStop::End);
         }
-        let entry = match decode_tree_entry(buf) {
+        let entry = match decode_tree_entry(buf, hexsz) {
             Ok(entry) => entry,
             Err(msg) => return (out, TreeStop::AtUpdate(msg)),
         };
-        span = tree_entry_span(&entry);
+        span = tree_entry_span(&entry, hexsz);
         out.push(entry);
     }
 }
 
 /// `fsck.c::fsck_tree`. Every defect is accumulated over the whole tree and
 /// reported once, in git's fixed order.
-fn check_tree(data: &[u8], checked: &mut Checked, strict: bool) {
+fn check_tree(data: &[u8], checked: &mut Checked, strict: bool, hexsz: usize) {
     let mut has_null_oid = false;
     let mut has_full_path = false;
     let mut has_dot = false;
@@ -3926,7 +3968,7 @@ fn check_tree(data: &[u8], checked: &mut Checked, strict: bool) {
     let mut not_properly_sorted = false;
     let mut has_large_name = false;
 
-    let (entries, stop) = tree_entries(data);
+    let (entries, stop) = tree_entries(data, hexsz);
     if let TreeStop::AtInit(msg) = stop {
         // `init_tree_desc_gently()` printed its own diagnostic and `fsck_tree`
         // gave up before accumulating anything.

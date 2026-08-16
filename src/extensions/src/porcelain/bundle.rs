@@ -663,10 +663,21 @@ fn create(args: &[String]) -> Result<ExitCode> {
     let pending = resolve_revisions(&repo, &rev_args)?;
 
     // `if (version == -1) version = min_version;` — 2 for sha1, and only 2 or 3
-    // exist (bundle.c:525-531).
-    let version = version.unwrap_or(2);
+    // exist (bundle.c:525-531). The v2 header carries no `@object-format`
+    // capability, so it can only describe sha1: a sha256 repository defaults to
+    // 3, and an explicit `--version=2` is refused rather than written as a
+    // bundle whose reader would take 64-hex ids for 40-hex ones.
+    let sha1_repo = repo.object_hash() == gix::hash::Kind::Sha1;
+    let version = version.unwrap_or(if sha1_repo { 2 } else { 3 });
     if !(2..=3).contains(&version) {
         eprintln!("fatal: unsupported bundle version {version}");
+        return Ok(ExitCode::from(128));
+    }
+    if version < 3 && !sha1_repo {
+        eprintln!(
+            "fatal: cannot write bundle version {version} with algorithm {}",
+            repo.object_hash()
+        );
         return Ok(ExitCode::from(128));
     }
 

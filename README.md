@@ -569,23 +569,31 @@ either side — they are not executable, so `list_commands_in_dir()` skips them.
 **`git version --build-options` describes the build that prints it.** Stock
 reports the C toolchain it was compiled and linked against; this binary reports
 what is true of a Rust binary on gitoxide and omits the rest, rather than copying
-stock's values into a report about itself. `cpu`, the no-build-commit line,
-`sizeof-long`, `sizeof-size_t`, `default-ref-format` and `default-hash` agree with
-stock because they are the same facts. `SHA-1: SHA1_DC` agrees too: `hash.h`'s
-token names the collision-detecting backend — its three alternatives all read
-`(No collision detection)` — and this build's `sha1-checked` is
-`sha1collisiondetection` in git's own bail-out configuration. `rust: enabled`
-disagrees because the answers really are different here, and no honest report can
-close that line. `zlib-rs` takes the slot stock fills with `zlib`, naming the
-flate library this build does link and the version its lockfile resolved,
-qualified `(inflate only)` because deflate here is an in-tree transcription of
-zlib's `deflate.c`/`trees.c` rather than that crate. `feature:
-fsmonitor--daemon`, `gettext`, `libcurl`, `OpenSSL` and `SHA-256` are absent
-because no such component is present — only the client half of
-`fsmonitor--daemon` is ported, and none of the other four is linked — the same
-reason git's own `#ifdef`s drop a line. The same
-block is what `git diagnose` and `git bugreport` embed, through the same function
-git shares between them.
+stock's values into a report about itself. Ten of stock's fifteen lines match.
+`cpu`, the no-build-commit line, `sizeof-long`, `sizeof-size_t`,
+`default-ref-format` and `default-hash` agree because they are the same facts.
+`SHA-1: SHA1_DC` and `SHA-256: SHA256_BLK` agree because both tokens name a
+backend *category* in `hash.h` and this build is in both categories: `SHA1_DC` is
+the collision-detecting one — its three alternatives all read `(No collision
+detection)` — and this build's `sha1-checked` is `sha1collisiondetection` in
+git's own bail-out configuration, while `SHA256_BLK` is the `#else` against
+`SHA256_NETTLE`/`SHA256_GCRYPT`/`SHA256_OPENSSL` and this build's `sha2` links no
+crypto library either. The `SHA-256` line is backed by a working object format,
+not just a compiled-in enum: `git init --object-format=sha256` writes stock's
+`extensions.objectformat` + `core.repositoryformatversion = 1` pair, and the
+objects, packs, index, refs, bundles, pushes and `fsck` walks over that
+repository all produce stock's bytes and stock's ids.
+
+`rust: enabled` disagrees because the answers really are different here, and no
+honest report can close that line. `zlib-rs` takes the slot stock fills with
+`zlib`, naming the flate library this build does link and the version its
+lockfile resolved, qualified `(inflate only)` because deflate here is an in-tree
+transcription of zlib's `deflate.c`/`trees.c` rather than that crate. `feature:
+fsmonitor--daemon`, `gettext`, `libcurl` and `OpenSSL` are absent because no such
+component is present — only the client half of `fsmonitor--daemon` is ported, and
+none of the other three is linked — the same reason git's own `#ifdef`s drop a
+line. The same block is what `git diagnose` and `git bugreport` embed, through
+the same function git shares between them.
 
 `subtree`, `filter-branch` and `instaweb` are ported directly from their stock
 shell scripts. `subtree add`, `merge`, `pull`, `split`, and `push` all produce

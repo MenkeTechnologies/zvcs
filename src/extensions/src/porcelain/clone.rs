@@ -1130,17 +1130,23 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     // leaves behind (loose objects stay loose, packs stay packs).
     if local_path_source && !no_local && filter.is_none() {
         adopt_local_objects(Path::new(url_str), &git_dir, hardlinks)?;
-    } else if gix::open(&git_dir)
+    } else if let Some(cloned) = gix::open(&git_dir)
         .ok()
-        .and_then(|repo| repo.config_snapshot().boolean("pack.writeReverseIndex"))
-        .unwrap_or(true)
+        .filter(|repo| repo.config_snapshot().boolean("pack.writeReverseIndex").unwrap_or(true))
     {
         // A clone that really fetched received its pack through gitoxide, which
         // writes no reverse index; git's `index-pack` writes one for every pack
         // it produces unless `pack.writeReverseIndex` says otherwise. The adopted
         // local objects above are exempt: they are the source's own pack files,
         // carried across with whatever sidecars the source already had.
-        super::index_pack::write_missing_rev_indexes(&git_dir.join("objects").join("pack"));
+        //
+        // The hash comes from the cloned repository, which has already adopted
+        // the remote's `object-format` — a sha256 remote leaves a sha256 clone,
+        // and its `.rev` files have to be written in that algorithm.
+        super::index_pack::write_missing_rev_indexes(
+            &git_dir.join("objects").join("pack"),
+            cloned.object_hash(),
+        );
     }
 
     // `write_remote_refs()` commits the remote-tracking refs through

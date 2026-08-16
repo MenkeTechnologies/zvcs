@@ -27,16 +27,14 @@
 //! where git resolves it: a name it cannot use does not abort the command, it
 //! fails each `<pack>` in turn — diagnostic repeated per argument, `<name>.pack:
 //! bad` still printed under `-v`/`-s`, exit 1 rather than a `die()` code. This
-//! covers `sha256` too, which git accepts as a name but which never verifies a
-//! SHA-1 pack: it sizes the index by the requested algorithm, so the index fails
-//! its length check before any object is read.
+//! covers `sha256`, which is a real backend here: a genuine SHA-256 pack
+//! verifies, and a SHA-1 pack asked for as `sha256` fails the same way it does
+//! under git, which sizes the index by the requested algorithm so the length
+//! check fails before any object is read.
 //!
-//! Not covered exactly: a genuine SHA-256 pack, which git verifies and this build
-//! reports as `bad`, since the vendored gix is compiled without its `sha256`
-//! feature and so cannot open one. Every SHA-1 repository — which is all the
-//! parity corpus builds — agrees byte-for-byte. The per-object diagnostics git
-//! writes to stderr for a corrupt pack are likewise replaced by a single terse
-//! `error:` line; stdout and the exit code still match.
+//! Not covered exactly: the per-object diagnostics git writes to stderr for a
+//! corrupt pack, which are replaced by a single terse `error:` line; stdout and
+//! the exit code still match.
 //! Nothing is written to the repository, so post-command state is unchanged.
 
 use anyhow::Result;
@@ -191,7 +189,7 @@ pub fn verify_pack(args: &[String]) -> Result<ExitCode> {
             )
         }
         Some("sha1") => HashChoice::Kind(gix::hash::Kind::Sha1),
-        Some("sha256") => HashChoice::Sha256,
+        Some("sha256") => HashChoice::Kind(gix::hash::Kind::Sha256),
         Some(other) => HashChoice::Unknown(other.to_string()),
     };
 
@@ -224,12 +222,9 @@ fn usage_error(msg: Option<&str>) -> ExitCode {
 /// git resolves the algorithm name late, so a name it cannot use is reported for
 /// every pack rather than aborting the command — see the note in [`verify_pack`].
 enum HashChoice {
-    /// An algorithm this build can actually open a pack with.
+    /// An algorithm this build can open a pack with — both of git's, since
+    /// `gix-hash`'s `sha256` feature is on.
     Kind(gix::hash::Kind),
-    /// `sha256`: a name git accepts, but which this build cannot open a pack
-    /// with, because the vendored gix is compiled without its `sha256` feature
-    /// (`src/ported/gix-hash/Cargo.toml` gates `Kind::Sha256` behind it).
-    Sha256,
     /// Any other name — git's `unknown hash algorithm` path.
     Unknown(String),
 }
@@ -260,30 +255,6 @@ fn verify_one(path: &str, verbose: bool, stat_only: bool, choice: &HashChoice) -
         HashChoice::Kind(k) => *k,
         HashChoice::Unknown(name) => {
             eprintln!("fatal: unknown hash algorithm '{name}'");
-            if verbose || stat_only {
-                println!("{pack_name}: bad");
-            }
-            return false;
-        }
-        HashChoice::Sha256 => {
-            // git gets no further either. It sizes the index by the requested
-            // algorithm, so a SHA-1 index read as SHA-256 fails its length check
-            // before any object is touched; a missing index fails to open at all.
-            // Both end at exit 1 with `bad`, which is what parity turns on. The
-            // one case that would genuinely differ is a real SHA-256 pack, which
-            // git verifies and this build cannot open — see the module note.
-            if idx_path.exists() {
-                eprintln!("error: wrong index v2 file size in {}", idx_path.display());
-                eprintln!(
-                    "fatal: Cannot open existing pack idx file for '{}'",
-                    idx_path.display()
-                );
-            } else {
-                eprintln!(
-                    "fatal: Cannot open existing pack file '{}'",
-                    idx_path.display()
-                );
-            }
             if verbose || stat_only {
                 println!("{pack_name}: bad");
             }

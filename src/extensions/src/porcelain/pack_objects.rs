@@ -3045,7 +3045,7 @@ fn collect_counts(
 /// Ids are *not* checked against the object database: git does not check them
 /// here either, and one that names nothing is carried all the way to the write,
 /// where it becomes `unable to read <oid>`.
-fn read_object_list_from_stdin(stdin: &[u8]) -> Result<Vec<ObjectId>, String> {
+fn read_object_list_from_stdin(stdin: &[u8], hex_len: usize) -> Result<Vec<ObjectId>, String> {
     let mut out = Vec::new();
     // `split_inclusive` hands back exactly what `fgets` would: every line keeps
     // its newline, a final unterminated line is still a line, and the empty
@@ -3055,7 +3055,9 @@ fn read_object_list_from_stdin(stdin: &[u8]) -> Result<Vec<ObjectId>, String> {
             Some((b'-', rest)) => (rest, "edge object ID"),
             _ => (line, "object ID"),
         };
-        let hex = body.get(..40).filter(|h| h.iter().all(u8::is_ascii_hexdigit));
+        // `parse_oid_hex()` reads exactly `the_hash_algo->hexsz` characters, so
+        // the width comes from the repository being packed, not from a constant.
+        let hex = body.get(..hex_len).filter(|h| h.iter().all(u8::is_ascii_hexdigit));
         let Some(id) = hex.and_then(|h| ObjectId::from_hex(h).ok()) else {
             let line = String::from_utf8_lossy(line);
             return Err(format!("expected {what}, got garbage:\n {line}"));
@@ -3140,7 +3142,7 @@ fn rev_list_objects(
             }
         }
     } else if !st.internal_rev_list {
-        from_stdin = read_object_list_from_stdin(stdin)?;
+        from_stdin = read_object_list_from_stdin(stdin, repo.object_hash().len_in_hex())?;
     }
 
     // An id read off stdin becomes a pack entry *as it stands*: with no internal

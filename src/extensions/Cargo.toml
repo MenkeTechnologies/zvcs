@@ -31,6 +31,7 @@ gix = { path = "../ported/gix", features = [
     "blocking-http-transport-reqwest-rust-tls",
     "tree-editor",
     "merge",
+    "sha256",
 ] }
 # Clone progress rendering. gitoxide already depends on prodash 31.0.0 (registry)
 # and drives fetch/checkout through its progress traits; enabling the line

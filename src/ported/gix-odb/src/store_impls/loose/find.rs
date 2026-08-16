@@ -60,7 +60,12 @@ impl Store {
             .max_depth(1)
             .follow_links(false)
             .into_iter(),
-            hash_hex_len: prefix.as_oid().kind().len_in_hex(),
+            // The width of the loose file names in THIS store, not the width the
+            // prefix happens to imply: `Kind::from_hex_len()` maps any prefix of
+            // 40 characters or fewer to `Sha1`, so a short prefix in a sha256
+            // repository would otherwise make the iterator reject every 62-character
+            // file name it walks past and report the id as unknown.
+            hash_hex_len: self.object_hash.len_in_hex(),
         };
         let mut candidate = None;
         for oid in single_directory_iter {

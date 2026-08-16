@@ -186,12 +186,6 @@ const AMBIGUOUS_TAIL: &str = "unknown revision or path not in the working tree.\
                              Use '--' to separate paths from revisions, like this:\n\
                              'git <command> [<revision>...] -- [<file>...]'";
 
-/// git's `die_verify_filename()` text for the remaining arguments, which are already
-/// known to be paths.
-const NO_SUCH_PATH_TAIL: &str = "no such path in the working tree.\n\
-                                 Use 'git <command> -- <path>...' to specify paths \
-                                 that do not exist locally.";
-
 /// The `S_IFMT` mask git uses to decide whether a pair is a *type* change (`T`) or a
 /// plain modification (`M`); `100644` and `100755` share a type, `120000` and
 /// `160000` do not.
@@ -397,6 +391,13 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
             if let Some(line) = super::diff_optval::reject(a) {
                 eprintln!("{line}");
                 return Ok(ExitCode::from(USAGE_ERROR));
+            }
+            // `--dirstat`'s callback dies rather than erroring, so it exits 128 —
+            // and it runs here, ahead of the synopsis this command prints when no
+            // tree-ish was named.
+            if let Some(text) = super::diff_optval::dirstat_reject(a) {
+                eprint!("{text}");
+                return Ok(ExitCode::from(FATAL));
             }
             // Everything `diff_opt_parse` owns is remembered verbatim: a routed run
             // replays exactly these onto `diff-pairs`, in order.
@@ -926,44 +927,14 @@ fn stat_and_patch(opts: &Opts) -> bool {
     stat && patch
 }
 
-/// git's `verify_filename()`: `Some(code)` when the argument cannot be a path, after
-/// printing the message git prints for it.
+/// [`crate::setup::verify_filename`], reported and turned into git's exit code.
 ///
-/// `first` selects between the two texts git uses — the leading non-revision argument
-/// is diagnosed as a possibly-misspelt revision, later ones simply as missing paths.
+/// `first` is git's `diagnose_misspelt_rev`: the leading non-revision argument is
+/// diagnosed as a possibly-misspelt revision, later ones simply as missing paths.
 fn verify_filename(arg: &str, first: bool) -> Option<u8> {
-    if arg.starts_with('-') {
-        eprintln!("fatal: option '{arg}' must come before non-option arguments");
-        return Some(FATAL);
-    }
-    if looks_like_pathspec(arg) || std::path::Path::new(arg).symlink_metadata().is_ok() {
-        return None;
-    }
-    if first {
-        eprintln!("fatal: ambiguous argument '{arg}': {AMBIGUOUS_TAIL}");
-    } else {
-        eprintln!("fatal: {arg}: {NO_SUCH_PATH_TAIL}");
-    }
+    let msg = crate::setup::verify_filename(arg, first)?;
+    eprintln!("fatal: {msg}");
     Some(FATAL)
-}
-
-/// git's `looks_like_pathspec()`: a leading `:` marks magic, and an unescaped glob
-/// metacharacter means the argument was never meant to name a file directly.
-fn looks_like_pathspec(arg: &str) -> bool {
-    if arg.starts_with(':') {
-        return true;
-    }
-    let mut escaped = false;
-    for b in arg.bytes() {
-        if escaped {
-            escaped = false;
-        } else if b == b'\\' {
-            escaped = true;
-        } else if matches!(b, b'*' | b'?' | b'[') {
-            return true;
-        }
-    }
-    false
 }
 
 /// `--diff-filter` status bits. Bit 0 is git's "all or none" marker (`*`).

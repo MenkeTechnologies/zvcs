@@ -69,6 +69,17 @@ fn fatal(message: &str) -> ExitCode {
     ExitCode::from(128)
 }
 
+/// The message `setup_revisions()` raises for a revision argument it could not
+/// resolve, shared with `git log` — `rev-list` runs the same `setup_revisions()`.
+/// Stripped of the `fatal: ` prefix and trailing newline that [`fatal`] adds back.
+fn unresolvable(repo: &gix::Repository, spec: &str) -> String {
+    let hex_len = repo.object_hash().len_in_hex();
+    super::log::bad_revision_message(spec, hex_len)
+        .trim_start_matches("fatal: ")
+        .trim_end_matches('\n')
+        .to_string()
+}
+
 /// Reject a malformed integer flag value exactly as git does: `fatal: '<v>': not
 /// an integer`, exit 128 — not the 129 usage path.
 fn not_an_integer(value: &str) -> ExitCode {
@@ -170,11 +181,17 @@ struct ObjectWalk<'a> {
 ///                                       either side but not from their merge bases
 ///   * `--not`                        — flip the sense of the revisions that
 ///                                       follow, until the next `--not`
+///   * `<rev>^@` / `<rev>^!`          — the parents alone, or the commit with its
+///                                       parents excluded
 ///   * `--all` / `--branches` / `--tags` / `--remotes`, each with an optional
-///     `=<pattern>` — seed from a ref set, at the position the flag appears
+///     `=<pattern>`, and `--glob=<pattern>` — seed from a ref set, at the position
+///     the flag appears
+///   * `--exclude=<pattern>`          — drop refs from the next ref-set flag, and
+///                                       only that one (`clear_ref_exclusions`)
 ///   * `--stdin`                      — read further revisions, and pathspecs
 ///                                       after a `--` line, from standard input
-///   * `--no-walk[=(sorted|unsorted)]` — list the named commits only
+///   * `--no-walk[=(sorted|unsorted)]` — list the named commits only, in commit-date
+///                                       order or in the order they were pended
 /// ```
 ///
 /// Shaping the walk:
@@ -201,6 +218,9 @@ struct ObjectWalk<'a> {
 ///   * `--quiet`                      — walk, print nothing
 ///   * `--parents` / `--children`     — append the commit's parents or children
 ///   * `--left-right` / `--cherry-mark` / `--boundary` — per-commit marks
+///   * `--abbrev-commit` with `--abbrev[=<n>]` / `--no-abbrev` — shorten the object
+///                                       name (git needs *both*: `--abbrev=<n>` on
+///                                       its own leaves the id whole)
 ///   * `--header` / `--pretty[=<fmt>]` / `--format=<fmt>` — render each commit
 ///   * `--[no-]commit-header`         — keep or drop the object-name line
 ///   * `--objects` / `--in-commit-order` / `--filter=<spec>` — also list the
@@ -222,7 +242,7 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
         return Ok(code);
     }
 
-    let repo = match gix::discover(".") {
+    let mut repo = match gix::discover(".") {
         Ok(repo) => repo,
         Err(_) => {
             return Ok(fatal(
@@ -257,6 +277,10 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     // `--abbrev-commit`: shorten the object name rev-list prints, which is what
     // `--oneline` turns on together with the oneline format.
     let mut abbrev_commit = false;
+    // `revs->abbrev`. `None` is git's `DEFAULT_ABBREV`, the auto-sized length
+    // `builtin/rev-list.c` starts from; `Some(0)` is `--no-abbrev`, which turns
+    // the abbreviation off however `--abbrev-commit` stands.
+    let mut abbrev_len: Option<usize> = None;
     let mut pretty: Option<Pretty> = None;
     let mut order = Order::Date;
     let mut filter: Option<Filter> = None;
@@ -275,6 +299,11 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     let mut min_age: Option<i64> = None;
     let mut pathspecs: Vec<Vec<u8>> = Vec::new();
     let mut seeds: Vec<Seed> = Vec::new();
+    // `--exclude=<glob>`, held until the next ref-selecting option consumes it.
+    let mut ref_excludes: Vec<String> = Vec::new();
+    // Commits the command line already caused to be parsed. Only `--no-walk`
+    // cares — see [`super::log::no_walk_uninteresting`].
+    let mut parsed_commits: HashSet<ObjectId> = HashSet::new();
     // Annotated tag objects encountered while peeling seeds. `--objects` lists
     // them, named by the tag's own name field, ahead of any tree.
     let mut pending_tags: Vec<(ObjectId, Vec<u8>)> = Vec::new();
@@ -402,6 +431,20 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
             }
             "--abbrev-commit" => abbrev_commit = true,
             "--no-abbrev-commit" => abbrev_commit = false,
+            // `revs->abbrev` (revision.c:2639-2653). It is the *minimum* width
+            // `repo_find_unique_abbrev()` is asked for, clamped to
+            // `[MINIMUM_ABBREV, hexsz]`; `--no-abbrev` is git's zero, and
+            // `builtin/rev-list.c:277-282` prints the whole id unless
+            // `--abbrev-commit` and a non-zero `revs->abbrev` are both set — so
+            // `--abbrev=8` on its own changes nothing here.
+            "--no-abbrev" => abbrev_len = Some(0),
+            "--abbrev" => abbrev_len = None,
+            s if s.starts_with("--abbrev=") => {
+                abbrev_len = Some(crate::abbrev::parse_abbrev_arg(
+                    &s["--abbrev=".len()..],
+                    repo.object_hash().len_in_hex(),
+                ));
+            }
             "-n" => {
                 i += 1;
                 let Some(n) = args.get(i) else {
@@ -418,18 +461,51 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
                 pathspecs.extend(args[i + 1..].iter().map(|s| s.as_bytes().to_vec()));
                 break;
             }
-            s if s == "--all"
-                || s == "--branches"
-                || s == "--tags"
-                || s == "--remotes"
-                || s.starts_with("--branches=")
-                || s.starts_with("--tags=")
-                || s.starts_with("--remotes=") =>
-            {
+            // `--exclude=<glob>` accumulates until the next ref-selecting option
+            // consumes and clears it (`clear_ref_exclusions`); anything else in
+            // between leaves the accumulation alone.
+            "--exclude" => {
+                i += 1;
+                let Some(v) = args.get(i) else {
+                    eprintln!("error: option 'exclude' requires a value");
+                    return Ok(usage_error());
+                };
+                ref_excludes.push(v.clone());
+            }
+            s if s.starts_with("--exclude=") => {
+                ref_excludes.push(s["--exclude=".len()..].to_string());
+            }
+            "--glob" => {
+                i += 1;
+                let Some(v) = args.get(i) else {
+                    eprintln!("error: option 'glob' requires a value");
+                    return Ok(usage_error());
+                };
+                let sel = super::log::RefSelection::new(
+                    0,
+                    super::log::RefSelector::Glob,
+                    Some(v),
+                    std::mem::take(&mut ref_excludes),
+                    negate,
+                );
+                if let Err(e) = seed_ref_set(&repo, &sel, negate, &mut seeds, &mut pending_tags) {
+                    return Ok(fatal(&e));
+                }
+                rev_input_given = true;
+            }
+            s if super::log::ref_selector(s).is_some() => {
                 // Seeded in place: git processes a ref-set selector where it
                 // appears, and with every commit sharing a timestamp the seed
                 // order is what decides the output order.
-                if let Err(e) = seed_ref_set(&repo, s, negate, &mut seeds, &mut pending_tags) {
+                let (kind, pattern) = super::log::ref_selector(s).expect("checked above");
+                let sel = super::log::RefSelection::new(
+                    0,
+                    kind,
+                    pattern,
+                    std::mem::take(&mut ref_excludes),
+                    negate,
+                );
+                if let Err(e) = seed_ref_set(&repo, &sel, negate, &mut seeds, &mut pending_tags) {
                     return Ok(fatal(&e));
                 }
                 rev_input_given = true;
@@ -532,6 +608,7 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
                 if let Err(e) = seed_revision(&repo, s, negate, &mut seeds, &mut pending_tags) {
                     return Ok(fatal(&e));
                 }
+                note_parsed(&repo, s, &seeds[seeds_before..], &mut parsed_commits)?;
                 rev_input_given = true;
             }
         }
@@ -554,6 +631,16 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
         ));
     }
 
+    // `revs->abbrev` is the minimum width every abbreviation in the run is asked
+    // for, so it goes in front of the same `core.abbrev` lookup gitoxide already
+    // makes. Zero (`--no-abbrev`) is handled at the print site instead — it turns
+    // abbreviation off rather than choosing a width.
+    if let Some(n) = abbrev_len.filter(|n| *n > 0) {
+        let mut config = repo.config_snapshot_mut();
+        config.append_config(Some(format!("core.abbrev={n}")), gix::config::Source::Cli)?;
+        config.commit()?;
+    }
+
     if read_stdin {
         let mut text = String::new();
         std::io::stdin().read_to_string(&mut text)?;
@@ -573,6 +660,7 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
                 if let Err(e) = seed_revision(&repo, line, negate, &mut seeds, &mut pending_tags) {
                     return Ok(fatal(&e));
                 }
+                note_parsed(&repo, line, &seeds[seeds_before..], &mut parsed_commits)?;
                 // The same `handle_revision_arg()` reads these lines, so an
                 // exclusion arriving on stdin cancels `--no-walk` just as one on
                 // the command line does.
@@ -613,9 +701,22 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     let mut parents_of: HashMap<ObjectId, Vec<ObjectId>> = HashMap::new();
     if no_walk {
         // `prepare_revision_walk` returns before `limit_list` under `--no-walk`,
-        // so the list is exactly the named commits, sorted by date unless
-        // `--no-walk=unsorted` kept the command-line order.
-        commits = tips.clone();
+        // so the list is exactly the pending commits, deduplicated by the SEEN
+        // flag `handle_commit()` sets as it reads them — first occurrence wins,
+        // and an id first pended UNINTERESTING keeps that flag however it is
+        // named again. `<a>...<b>` pends the merge bases ahead of both endpoints,
+        // which is why `git rev-list --no-walk a...b` drops an endpoint that *is*
+        // a merge base.
+        let excluded = super::log::no_walk_uninteresting(&repo, &hidden, &parsed_commits);
+        let mut pending: Vec<ObjectId> = Vec::new();
+        for seed in &seeds {
+            if !pending.contains(&seed.id) {
+                pending.push(seed.id);
+            }
+        }
+        commits = pending.into_iter().filter(|id| !excluded.contains(id)).collect();
+        // `commit_list_sort_by_date()` is a *stable* mergesort (`mergesort.h`:
+        // "Take from `list` on equality"), so a date tie keeps the pending order.
         if !unsorted_input {
             let dates: HashMap<ObjectId, i64> = commits
                 .iter()
@@ -728,7 +829,11 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     // 2. Reorder, 3. filter by parent count, 4. limit, 5. reverse — in that
     // order, because git sorts the whole list, then drops commits at output
     // time, and only counts what it actually emits against `--max-count`.
-    if order != Order::Date {
+    // `prepare_revision_walk()` returns as soon as `revs->no_walk` survived
+    // (revision.c:4009), which is *before* both `sort_in_topological_order()` and
+    // `init_topo_walk()` — so `--topo-order` and `--date-order` are silently inert
+    // under `--no-walk`, and the pending order (or its date sort) stands.
+    if order != Order::Date && !no_walk {
         let dates: Option<HashMap<ObjectId, i64>> = (order == Order::DateTopo).then(|| {
             commits
                 .iter()
@@ -970,7 +1075,10 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
                     left_right,
                     cherry_mark,
                 ));
-                if abbrev_commit {
+                // `if (revs->abbrev_commit && revs->abbrev)` — both are needed,
+                // which is why `--abbrev=8` alone prints the whole id and
+                // `--abbrev-commit --no-abbrev` does too.
+                if abbrev_commit && abbrev_len != Some(0) {
                     out.extend_from_slice(id.attach(&repo).shorten_or_id().to_string().as_bytes());
                 } else {
                     out.extend_from_slice(id.to_string().as_bytes());
@@ -1142,57 +1250,28 @@ fn revision_mark(
     }
 }
 
-/// Seed from a ref set: `--all`, `--branches`, `--tags`, `--remotes`, each with
-/// an optional `=<pattern>`.
+/// Seed from a ref set: `--all`, `--branches`, `--tags`, `--remotes` (each with
+/// an optional `=<pattern>`) and `--glob=<pattern>`, minus whatever `--exclude`
+/// patterns the selection consumed.
 ///
-/// `--all` is every ref under `refs/` in name order followed by `HEAD`; the other
-/// three are their own namespace only, with no `HEAD`. A pattern is matched
-/// against the ref name with the namespace prefix stripped, and — as git
-/// documents — gains an implicit `/*` when it contains no glob character.
+/// `--all` is every ref under `refs/` in name order followed by `HEAD`; the
+/// others are their own namespace only, with no `HEAD`. Which refs a selection
+/// yields is [`super::log::RefSelection`]'s business — it is the same
+/// `refs_for_each_ref_ext()` rule `git log` uses.
 fn seed_ref_set(
     repo: &gix::Repository,
-    arg: &str,
+    sel: &super::log::RefSelection,
     negate: bool,
     seeds: &mut Vec<Seed>,
     tags: &mut Vec<(ObjectId, Vec<u8>)>,
 ) -> Result<(), String> {
-    let (name, pattern) = match arg.split_once('=') {
-        Some((name, pat)) => (name, Some(pat)),
-        None => (arg, None),
-    };
-    let prefix = match name {
-        "--all" => None,
-        "--branches" => Some("refs/heads/"),
-        "--tags" => Some("refs/tags/"),
-        "--remotes" => Some("refs/remotes/"),
-        _ => return Err(format!("unknown ref selector {arg}")),
-    };
-    // git appends `/*` to a pattern with no wildcard, so `--branches=topic`
-    // selects the branches *below* `topic/`, not `topic` itself.
-    let glob = pattern.map(|p| {
-        if p.bytes().any(|b| matches!(b, b'?' | b'*' | b'[')) {
-            p.as_bytes().to_vec()
-        } else {
-            let mut g = p.as_bytes().to_vec();
-            g.extend_from_slice(b"/*");
-            g
-        }
-    });
-
     let refs = repo.references().map_err(|e| e.to_string())?;
     let iter = refs.all().map_err(|e| e.to_string())?;
     for reference in iter {
         let reference = reference.map_err(|e| e.to_string())?;
         let full = reference.name().as_bstr().to_string();
-        if let Some(prefix) = prefix {
-            let Some(rest) = full.strip_prefix(prefix) else {
-                continue;
-            };
-            if let Some(glob) = &glob {
-                if !wildmatch(glob, rest.as_bytes()) {
-                    continue;
-                }
-            }
+        if sel.selects(&full).is_none() {
+            continue;
         }
         let target = match reference.try_id() {
             Some(id) => id.detach(),
@@ -1211,7 +1290,10 @@ fn seed_ref_set(
             });
         }
     }
-    if prefix.is_none() {
+    // `handle_refs(refs, revs, flags, refs_head_ref)`: `--all` pends `HEAD` too,
+    // after the ref list and under that literal name — which is why a `refs/…`
+    // exclusion pattern never removes it.
+    if sel.head && !sel.excluded("HEAD") {
         if let Ok(head) = repo.head_id() {
             if let Some(id) = peel_recording_tags(repo, head.detach(), tags) {
                 seeds.push(Seed {
@@ -1239,9 +1321,7 @@ fn seed_revision(
     seeds: &mut Vec<Seed>,
     tags: &mut Vec<(ObjectId, Vec<u8>)>,
 ) -> Result<(), String> {
-    let unknown = |s: &str| {
-        format!("ambiguous argument '{s}': unknown revision or path not in the working tree.")
-    };
+    let unknown = |s: &str| unresolvable(repo, s);
     if let Some(rest) = spec.strip_prefix('^') {
         let id = resolve(repo, rest, tags).ok_or_else(|| unknown(spec))?;
         seeds.push(Seed {
@@ -1250,6 +1330,41 @@ fn seed_revision(
             symmetric_left: false,
             bottom: !negate,
         });
+        return Ok(());
+    }
+    // `add_parents_only()`: `<rev>^@` pends the parents alone and returns, while
+    // `<rev>^!` pends them with `flags ^ (UNINTERESTING | BOTTOM)` and then falls
+    // through so the commit itself is pended after them.
+    if let Some(base) = spec.strip_suffix("^@").or_else(|| spec.strip_suffix("^!")) {
+        let excludes_parents = spec.ends_with("^!");
+        let id = resolve(repo, base, tags).ok_or_else(|| unknown(spec))?;
+        let parents: Vec<ObjectId> = match repo.find_object(id).and_then(|o| o.peel_tags_to_end()) {
+            Ok(o) => match o.try_into_commit() {
+                Ok(c) => c.parent_ids().map(|p| p.detach()).collect(),
+                // `if (it->type != OBJ_COMMIT) return 0;` — a non-commit makes
+                // `add_parents_only()` fail, and the spelling falls back to being
+                // read as an ordinary revision.
+                Err(_) => return seed_plain(repo, spec, negate, seeds, tags),
+            },
+            Err(_) => return Err(unknown(spec)),
+        };
+        let parents_negated = if excludes_parents { !negate } else { negate };
+        for p in parents {
+            seeds.push(Seed {
+                id: p,
+                uninteresting: parents_negated,
+                symmetric_left: false,
+                bottom: parents_negated,
+            });
+        }
+        if excludes_parents {
+            seeds.push(Seed {
+                id,
+                uninteresting: negate,
+                symmetric_left: false,
+                bottom: negate,
+            });
+        }
         return Ok(());
     }
     if let Some((l, r)) = spec.split_once("...") {
@@ -1301,7 +1416,42 @@ fn seed_revision(
         });
         return Ok(());
     }
-    let id = resolve(repo, spec, tags).ok_or_else(|| unknown(spec))?;
+    seed_plain(repo, spec, negate, seeds, tags)
+}
+
+/// Record the commits reading one revision word caused to be parsed.
+///
+/// Only `--no-walk` cares: nothing paints UNINTERESTING there, so how far
+/// `mark_parents_uninteresting()` reaches is decided by which commits already
+/// had their parent list loaded (see [`super::log::no_walk_uninteresting`]).
+/// Two things load one: navigating a `~<n>`/`^<n>` chain, and the merge-base
+/// search a `<a>...<b>` runs, which parses its way past the bases it finds.
+fn note_parsed(
+    repo: &gix::Repository,
+    spec: &str,
+    added: &[Seed],
+    parsed: &mut HashSet<ObjectId>,
+) -> Result<()> {
+    for endpoint in spec.trim_start_matches('^').split("..") {
+        let e = endpoint.trim_start_matches('.');
+        parsed.extend(super::log::navigation_path(repo, if e.is_empty() { "HEAD" } else { e }));
+    }
+    if spec.contains("...") {
+        let bases: Vec<ObjectId> = added.iter().map(|s| s.id).collect();
+        parsed.extend(super::log::ancestor_closure(repo, &bases)?);
+    }
+    Ok(())
+}
+
+/// One ordinary revision word, pended with the flags `--not` left in force.
+fn seed_plain(
+    repo: &gix::Repository,
+    spec: &str,
+    negate: bool,
+    seeds: &mut Vec<Seed>,
+    tags: &mut Vec<(ObjectId, Vec<u8>)>,
+) -> Result<(), String> {
+    let id = resolve(repo, spec, tags).ok_or_else(|| unresolvable(repo, spec))?;
     seeds.push(Seed {
         id,
         uninteresting: negate,

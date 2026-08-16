@@ -319,6 +319,7 @@ const PREFIX_OPTS: &[&str] = &[
     "--pretty=",
     "--format=",
     "--abbrev=",
+    "--expand-tabs=",
     "--unified=",
     "--inter-hunk-context=",
     "--color=",
@@ -1333,49 +1334,15 @@ fn consume_option(
     Ok(1)
 }
 
-/// git's `verify_filename`: decide whether a non-revision argument is an acceptable
-/// pathspec, and produce the exact complaint when it is not. `first` marks the argument
-/// that failed revision resolution, which gets the `ambiguous argument` wording.
+/// [`crate::setup::verify_filename`], raised as this module's fatal.
+///
+/// `first` is git's `diagnose_misspelt_rev`: it marks the argument that failed
+/// revision resolution, which gets the `ambiguous argument` wording.
 fn verify_filename(arg: &str, first: bool) -> Result<(), Fatal> {
-    if arg.starts_with('-') {
-        return Err(Fatal::die(format!(
-            "option '{arg}' must come before non-option arguments"
-        )));
+    match crate::setup::verify_filename(arg, first) {
+        Some(msg) => Err(Fatal::die(msg)),
+        None => Ok(()),
     }
-    if looks_like_pathspec(arg) || std::fs::symlink_metadata(arg).is_ok() {
-        return Ok(());
-    }
-    if first {
-        Err(Fatal::die(format!(
-            "ambiguous argument '{arg}': unknown revision or path not in the working tree.\n\
-             Use '--' to separate paths from revisions, like this:\n\
-             'git <command> [<revision>...] -- [<file>...]'"
-        )))
-    } else {
-        Err(Fatal::die(format!(
-            "{arg}: no such path in the working tree.\n\
-             Use 'git <command> -- <path>...' to specify paths that do not exist locally."
-        )))
-    }
-}
-
-/// git's `looks_like_pathspec`: a leading `:` is pathspec magic, and so is any
-/// unescaped glob special (`*`, `?`, `[`).
-fn looks_like_pathspec(arg: &str) -> bool {
-    if arg.starts_with(':') {
-        return true;
-    }
-    let mut escaped = false;
-    for b in arg.bytes() {
-        if escaped {
-            escaped = false;
-        } else if b == b'\\' {
-            escaped = true;
-        } else if matches!(b, b'*' | b'?' | b'[') {
-            return true;
-        }
-    }
-    false
 }
 
 /// git's `strtol_i` for commit counts. A negative count means "no limit", as in git.

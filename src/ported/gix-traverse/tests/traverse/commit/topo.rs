@@ -192,6 +192,59 @@ mod basic {
         Ok(())
     }
 
+    /// The same commit named twice — `git shortlog --topo-order main main`, or an `--all` that
+    /// supplies one tip through two refs. git's `SEEN` flag makes the second mention a no-op, so
+    /// the output is unchanged. The seeding loop used to queue such a commit once per mention,
+    /// which yielded it twice *and* let `indegree_walk_step` count its parents twice.
+    #[test]
+    fn repeated_tip_is_seeded_once() -> crate::Result {
+        let odb = odb()?;
+        let tip = hex_to_id("62ed296d9986f50477e9f7b7e81cd0258939a43d");
+        let merge = hex_to_id("d09384f312b03e4a1413160739805ff25e8fe99d");
+
+        for sorting in [topo::Sorting::TopoOrder, topo::Sorting::DateOrder] {
+            let once = traverse_both([tip], [], &odb, sorting, Parents::All)?;
+            assert_eq!(
+                traverse_both([tip, tip], [], &odb, sorting, Parents::All)?,
+                once,
+                "a repeated tip changes nothing, sorting = {sorting:?}"
+            );
+            assert_eq!(
+                traverse_both([tip, tip, tip], [], &odb, sorting, Parents::All)?,
+                once,
+                "and neither does a third mention, sorting = {sorting:?}"
+            );
+
+            // A merge repeated *below* another tip is the case that also corrupted the indegree
+            // bookkeeping: every parent of the duplicate was counted twice, which could strand it
+            // below the `== 1` gate in `expand_topo_walk` and drop it from the output entirely.
+            assert_eq!(
+                traverse_both([tip, merge, merge], [], &odb, sorting, Parents::All)?,
+                once,
+                "a repeated tip that another tip already reaches keeps the full history, sorting = {sorting:?}"
+            );
+        }
+        Ok(())
+    }
+
+    /// An end named twice is deduplicated the same way, and still excludes its history.
+    #[test]
+    fn repeated_end_is_seeded_once() -> crate::Result {
+        let odb = odb()?;
+        let tip = hex_to_id("62ed296d9986f50477e9f7b7e81cd0258939a43d");
+        let end = hex_to_id("f1cce1b5c7efcdfa106e95caa6c45a2cae48a481");
+
+        for sorting in [topo::Sorting::TopoOrder, topo::Sorting::DateOrder] {
+            let once = traverse_both([tip], [end], &odb, sorting, Parents::All)?;
+            assert_eq!(
+                traverse_both([tip], [end, end], &odb, sorting, Parents::All)?,
+                once,
+                "a repeated end changes nothing, sorting = {sorting:?}"
+            );
+        }
+        Ok(())
+    }
+
     #[test]
     fn two_tips_two_ends() -> crate::Result {
         let odb = odb()?;

@@ -378,11 +378,16 @@ mod init {
         }
 
         /// Change our commit parent handling mode to the given one.
+        ///
+        /// Note that this is orthogonal to the [sorting](Self::sorting()): git's `first_parent_only`
+        /// only makes `add_parents_to_list()` stop after the first parent (`revision.c`), it never
+        /// changes which queue the walk pops from. The parent it does queue still goes through
+        /// `commit_list_insert_by_date()`, so `--first-parent` under a commit-date sort stays in
+        /// commit-date order. An earlier version of this method flattened the date queue into the
+        /// FIFO one here, which silently downgraded every date-sorted first-parent walk to
+        /// [`BreadthFirst`](Sorting::BreadthFirst).
         pub fn parents(mut self, mode: Parents) -> Self {
             self.parents = mode;
-            if matches!(self.parents, Parents::First) {
-                self.queue_to_vecdeque();
-            }
             self
         }
 
@@ -557,14 +562,10 @@ mod init {
                     return Some(Err(err));
                 }
             }
-            if matches!(self.parents, Parents::First) {
-                self.next_by_topology()
-            } else {
-                match self.sorting {
-                    Sorting::BreadthFirst => self.next_by_topology(),
-                    Sorting::ByCommitTime(order) => self.next_by_commit_date(order, None),
-                    Sorting::ByCommitTimeCutoff { seconds, order } => self.next_by_commit_date(order, seconds.into()),
-                }
+            match self.sorting {
+                Sorting::BreadthFirst => self.next_by_topology(),
+                Sorting::ByCommitTime(order) => self.next_by_commit_date(order, None),
+                Sorting::ByCommitTimeCutoff { seconds, order } => self.next_by_commit_date(order, seconds.into()),
             }
         }
     }
@@ -580,6 +581,7 @@ mod init {
             order: CommitTimeOrder,
             cutoff: Option<SecondsSinceUnixEpoch>,
         ) -> Option<Result<Info, Error>> {
+            let follow_first_parent_only = matches!(self.parents, Parents::First);
             let state = &mut self.state;
             let next = &mut state.queue;
 
@@ -602,6 +604,13 @@ mod init {
                         }
                         for (id, parent_commit_time) in state.parent_ids.drain(..) {
                             parents.push(id);
+                            if follow_first_parent_only && parents.len() > 1 {
+                                // `--first-parent` stops the *walk* here, not the parent list:
+                                // git's `add_parents_to_list()` breaks out of its loop while
+                                // `commit->parents` keeps every parent, which is what `%P`,
+                                // `--parents` and the `--min-parents`/`--max-parents` gate read.
+                                continue;
+                            }
                             insert_into_seen_and_queue(
                                 &mut state.seen,
                                 &state.hidden,
@@ -620,6 +629,11 @@ mod init {
                                 Ok(gix_object::commit::ref_iter::Token::Tree { .. }) => continue,
                                 Ok(gix_object::commit::ref_iter::Token::Parent { id }) => {
                                     parents.push(id);
+                                    if follow_first_parent_only && parents.len() > 1 {
+                                        // See the comment in the cached-commit arm above: the
+                                        // remaining parents are recorded but not walked.
+                                        continue;
+                                    }
                                     insert_into_seen_and_queue(
                                         &mut state.seen,
                                         &state.hidden,
@@ -656,6 +670,7 @@ mod init {
         }
 
         fn next_by_topology(&mut self) -> Option<Result<Info, Error>> {
+            let follow_first_parent_only = matches!(self.parents, Parents::First);
             let state = &mut self.state;
             let next = &mut state.next;
 
@@ -677,10 +692,14 @@ mod init {
 
                         for (pid, _commit_time) in state.parent_ids.drain(..) {
                             parents.push(pid);
-                            insert_into_seen_and_next(&mut state.seen, &state.hidden, pid, &mut self.predicate, next);
-                            if matches!(self.parents, Parents::First) {
-                                break;
+                            if follow_first_parent_only && parents.len() > 1 {
+                                // `--first-parent` stops the *walk* here, not the parent list:
+                                // git's `add_parents_to_list()` breaks out of its loop while
+                                // `commit->parents` keeps every parent, which is what `%P`,
+                                // `--parents` and the `--min-parents`/`--max-parents` gate read.
+                                continue;
                             }
+                            insert_into_seen_and_next(&mut state.seen, &state.hidden, pid, &mut self.predicate, next);
                         }
                     }
                     Ok(Either::CommitRefIter(commit_iter)) => {
@@ -689,6 +708,11 @@ mod init {
                                 Ok(gix_object::commit::ref_iter::Token::Tree { .. }) => continue,
                                 Ok(gix_object::commit::ref_iter::Token::Parent { id: pid }) => {
                                     parents.push(pid);
+                                    if follow_first_parent_only && parents.len() > 1 {
+                                        // See the comment in the cached-commit arm above: the
+                                        // remaining parents are recorded but not walked.
+                                        continue;
+                                    }
                                     insert_into_seen_and_next(
                                         &mut state.seen,
                                         &state.hidden,
@@ -696,9 +720,6 @@ mod init {
                                         &mut self.predicate,
                                         next,
                                     );
-                                    if matches!(self.parents, Parents::First) {
-                                        break;
-                                    }
                                 }
                                 Ok(_a_token_past_the_parents) => break,
                                 Err(err) => return Some(Err(err.into())),

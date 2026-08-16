@@ -51,7 +51,9 @@ pub enum Parents {
 
 /// The collection of parent ids we saw as part of the iteration.
 ///
-/// Note that this list is truncated if [`Parents::First`] was used.
+/// Note that this is always the commit's complete parent list, even under [`Parents::First`]:
+/// git's `first_parent_only` limits which parent `add_parents_to_list()` follows, it does not
+/// rewrite `commit->parents`.
 pub type ParentIds = SmallVec<[gix_hash::ObjectId; 1]>;
 
 /// Information about a commit that we obtained naturally as part of the iteration.
@@ -59,7 +61,8 @@ pub type ParentIds = SmallVec<[gix_hash::ObjectId; 1]>;
 pub struct Info {
     /// The id of the commit.
     pub id: gix_hash::ObjectId,
-    /// All parent ids we have encountered. Note that these will be at most one if [`Parents::First`] is enabled.
+    /// All parent ids the commit declares, which is its full parent list even under
+    /// [`Parents::First`] — that mode only picks the parent the traversal follows.
     pub parent_ids: ParentIds,
     /// The time at which the commit was created. It will only be `Some(_)` if the chosen traversal was
     /// taking dates into consideration.

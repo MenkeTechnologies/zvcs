@@ -83,7 +83,9 @@ impl Sorting {
 pub struct Info<'repo> {
     /// The detached id of the commit.
     pub id: gix_hash::ObjectId,
-    /// All parent ids we have encountered. Note that these will be at most one if [`Parents::First`][gix_traverse::commit::Parents::First] is enabled.
+    /// All parent ids the commit declares, which is its full parent list even under
+    /// [`Parents::First`][gix_traverse::commit::Parents::First] — that mode only picks the parent
+    /// the traversal follows.
     pub parent_ids: gix_traverse::commit::ParentIds,
     /// The time at which the commit was created. It will only be `Some(_)` if the chosen traversal was
     /// taking dates into consideration.

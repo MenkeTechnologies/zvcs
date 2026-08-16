@@ -382,3 +382,132 @@ fn packing_refs_adds_no_head_entry() {
     assert_eq!(f.log_lines("HEAD"), head_before);
     assert_eq!(f.rev("refs/heads/main"), f.rev("HEAD"), "packing preserved the value");
 }
+
+// ---------------------------------------------------------------------------
+// The other side of the rule: `files_copy_or_rename_ref()` is not a transaction.
+// It ends in `commit_ref_update()`, which calls `files_log_ref_write()` outright,
+// so a rename or copy onto a branch's own name logs an entry the transaction
+// machinery above would have withheld.
+// ---------------------------------------------------------------------------
+
+/// `branch -m main` on the checked-out `main`. The branch's own log gains the
+/// `<tip> <tip>` entry `commit_ref_update()` writes; `.git/logs/HEAD` gains the pair
+/// left by the deletion of the old name and the re-creation of the new one.
+#[test]
+fn renaming_a_branch_onto_its_own_name_logs_the_branch() {
+    let f = Fixture::new("rename-same");
+    let tip = f.rev("HEAD");
+    let branch_before = f.log_lines("refs/heads/main").len();
+    let head_before = f.log_lines("HEAD").len();
+
+    f.git(&["branch", "-m", "main"]);
+
+    let message = "Branch: renamed refs/heads/main to refs/heads/main".to_string();
+    let branch = f.log_lines("refs/heads/main");
+    assert_eq!(
+        branch.len(),
+        branch_before + 1,
+        "the rename logs the branch even though its value never moved"
+    );
+    assert_eq!(
+        split_entry(branch.last().unwrap()),
+        (tip.clone(), tip.clone(), message.clone())
+    );
+
+    let head = f.log_lines("HEAD");
+    assert_eq!(head.len(), head_before + 2, "the delete half and the create half");
+    assert_eq!(
+        split_entry(&head[head.len() - 2]),
+        (tip.clone(), NULL_ID.to_string(), message.clone()),
+        "the old name going away"
+    );
+    assert_eq!(
+        split_entry(&head[head.len() - 1]),
+        (tip.clone(), tip, message),
+        "the new name arriving"
+    );
+}
+
+/// `branch -C main main` takes the copy route, which deletes nothing — so `.git/logs/HEAD`
+/// gains only the one entry `commit_ref_update()` mirrors into it, not a pair.
+#[test]
+fn copying_a_branch_onto_its_own_name_logs_the_branch() {
+    let f = Fixture::new("copy-same");
+    let tip = f.rev("HEAD");
+    let branch_before = f.log_lines("refs/heads/main").len();
+    let head_before = f.log_lines("HEAD").len();
+
+    f.git(&["branch", "-C", "main", "main"]);
+
+    let message = "Branch: copied refs/heads/main to refs/heads/main".to_string();
+    let branch = f.log_lines("refs/heads/main");
+    assert_eq!(branch.len(), branch_before + 1);
+    assert_eq!(
+        split_entry(branch.last().unwrap()),
+        (tip.clone(), tip.clone(), message.clone())
+    );
+
+    let head = f.log_lines("HEAD");
+    assert_eq!(head.len(), head_before + 1, "a copy deletes nothing");
+    assert_eq!(split_entry(head.last().unwrap()), (tip.clone(), tip, message));
+}
+
+/// Renaming a branch `HEAD` does not point at onto its own name logs that branch and
+/// nothing else — `commit_ref_update()`'s mirror only fires when `HEAD` names the ref.
+#[test]
+fn renaming_an_idle_branch_onto_its_own_name_leaves_the_head_log_alone() {
+    let f = Fixture::new("rename-same-idle");
+    f.git(&["branch", "side", "HEAD~1"]);
+    let tip = f.rev("refs/heads/side");
+    let side_before = f.log_lines("refs/heads/side").len();
+    let head_before = f.log_lines("HEAD");
+
+    f.git(&["branch", "-m", "side", "side"]);
+
+    let side = f.log_lines("refs/heads/side");
+    assert_eq!(side.len(), side_before + 1);
+    assert_eq!(
+        split_entry(side.last().unwrap()),
+        (
+            tip.clone(),
+            tip,
+            "Branch: renamed refs/heads/side to refs/heads/side".to_string()
+        )
+    );
+    assert_eq!(f.log_lines("HEAD"), head_before);
+}
+
+/// The line the rename fix must not cross: a *transactional* update to the value a branch
+/// already holds still logs nothing of its own. `lock_ref_for_update()` withholds
+/// `REF_NEEDS_COMMIT` for it, and only the log-only `HEAD` half — present when the branch
+/// is the checked-out one — is written.
+#[test]
+fn updating_a_branch_to_the_value_it_already_holds_leaves_its_log_alone() {
+    let f = Fixture::new("update-noop");
+    f.git(&["branch", "side"]);
+    let tip = f.rev("HEAD");
+    let side_before = f.log_lines("refs/heads/side");
+    let main_before = f.log_lines("refs/heads/main");
+    let head_before = f.log_lines("HEAD").len();
+
+    f.git(&["update-ref", "-m", "idle side", "refs/heads/side", &tip]);
+    assert_eq!(
+        f.log_lines("refs/heads/side"),
+        side_before,
+        "an unchanged value writes no entry, message or not"
+    );
+    assert_eq!(f.log_lines("HEAD").len(), head_before, "and nothing mirrors into HEAD");
+
+    f.git(&["update-ref", "-m", "idle main", "refs/heads/main", &tip]);
+    assert_eq!(
+        f.log_lines("refs/heads/main"),
+        main_before,
+        "the checked-out branch is no different"
+    );
+    let head = f.log_lines("HEAD");
+    assert_eq!(head.len(), head_before + 1, "only the log-only HEAD half is written");
+    assert_eq!(
+        split_entry(head.last().unwrap()),
+        (tip.clone(), tip, "idle main".to_string())
+    );
+}

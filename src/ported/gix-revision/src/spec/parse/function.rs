@@ -660,6 +660,23 @@ where
                         } else {
                             return Err(Error::new_with_input("unconsumed input", &input[cursor..]).raise());
                         }
+                        // Re-anchoring above restored the *name* only, so the
+                        // navigation that preceded the `^-` — everything in
+                        // `input[..cursor - 1]` — has to be replayed onto it.
+                        // git takes the same view: `handle_revision_arg_1()`
+                        // splits at the mark with
+                        // `xmemdupz(arg, mark - arg)` and hands that whole
+                        // prefix both to `add_parents_only()` and, as the
+                        // rewritten `arg`, to the lookup that follows, so
+                        // `main^^-` is `main^^..main^` rather than
+                        // `main^^..main`.
+                        let replay = input[..cursor - 1].as_bstr();
+                        if !replay.is_empty() {
+                            let rest = navigate(replay, delegate)?;
+                            if !rest.is_empty() {
+                                return Err(Error::new_with_input("unconsumed input", rest).raise());
+                            }
+                        }
                         cursor += consumed;
                         let rest = input[cursor..].as_bstr();
                         delegate.done().or_raise(|| Error::new_with_input(done_msg, rest))?;

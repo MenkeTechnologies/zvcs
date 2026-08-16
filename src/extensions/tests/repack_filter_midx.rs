@@ -225,9 +225,9 @@ fn incremental_filtered_pack_inherits_the_existing_packs() {
 /// fails, which is what makes this an assertion about the locality rule rather
 /// than about the filter.
 ///
-/// Only the exit status and the repository's own `objects/pack` are asserted:
-/// where the filtered pack lands is a separate, still-open question, git reading
-/// `--filter-to` as a pack *prefix* while this port reads it as a directory.
+/// Only the exit status and the repository's own `objects/pack` are asserted
+/// here; where a `--filter-to` pack lands, and which values count as outside the
+/// object store, is `repack_filter_to.rs`.
 #[test]
 fn filtered_pack_written_elsewhere_is_not_preferred() {
     let (repo, home) = fixture("filterto");

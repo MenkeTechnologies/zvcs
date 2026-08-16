@@ -49,7 +49,13 @@
 //!     prerequisites, the `<oid> <ref>` tip list, the header-terminating blank
 //!     line, and the pack, in git's order and with git's ref-naming rules
 //!     (`HEAD` stays `HEAD` because it is a symref; a short name is written out
-//!     as the full ref it dwims to). `-` writes to stdout, any other name is
+//!     as the full ref it dwims to). The revision arguments are the ones
+//!     `setup_revisions()` reads — `create_bundle()` calls it directly
+//!     (`bundle.c:501`) — so `<rev>`, `^<rev>`, `<a>..<b>`, `--not` and the whole
+//!     ref-selecting family (`--all`, `--branches`, `--tags`, `--remotes`, each
+//!     optionally `=<glob>`, plus `--glob=<glob>` and the `--exclude=<glob>`
+//!     patterns the next of them consumes) all reach it. `-` writes to stdout,
+//!     any other name is
 //!     written through a `.lock` and renamed, as `hold_lock_file_for_update`
 //!     does. `Refusing to create empty bundle.` and `unsupported bundle
 //!     version <n>` are reproduced.
@@ -89,6 +95,13 @@
 //!     and the deltas are `OBJ_OFS_DELTA`, because `write_pack_data()` spawns
 //!     `pack-objects --stdout --thin --delta-base-offset` unconditionally
 //!     (`bundle.c:333-336`).
+//!
+//!     `create`'s options are `PARSE_OPT_STOP_AT_NON_OPTION`, so the `<file>`
+//!     operand ends option parsing: `git bundle create <file> -q` reports
+//!     `error: unrecognized argument: -q` and writes nothing, exactly as stock
+//!     does — except for the exit code, because git 2.55.0 prints that line and
+//!     then aborts (a shell sees 134). This returns the 255 an `error()` return
+//!     normally becomes rather than reproducing a `SIGABRT`.
 //!
 //! Two further deliberate gaps, so this doc claims no more than the code does:
 //! a v3 bundle carrying any capability other than `@object-format` is rejected
@@ -399,6 +412,13 @@ fn list_heads(args: &[String]) -> Result<ExitCode> {
     let mut filters: Vec<&[u8]> = Vec::new();
 
     for a in args {
+        // `PARSE_OPT_STOP_AT_NON_OPTION`: the `<file>` operand ends option
+        // parsing, so every later token is a `<refname>` filter — even one that
+        // looks like a switch.
+        if file.is_some() {
+            filters.push(a.as_bytes());
+            continue;
+        }
         match a.as_str() {
             // `--help-all` renders `USAGE_FULL`, identical to the `-h` block:
             // no entry of this subcommand's table is `PARSE_OPT_HIDDEN`.
@@ -412,8 +432,7 @@ fn list_heads(args: &[String]) -> Result<ExitCode> {
             s if s.starts_with('-') && s.len() > 1 => {
                 return Ok(bad_option(&s[1..], LIST_HEADS_USAGE, true));
             }
-            s if file.is_none() => file = Some(s),
-            s => filters.push(s.as_bytes()),
+            s => file = Some(s),
         }
     }
 
@@ -452,6 +471,13 @@ fn verify(args: &[String]) -> Result<ExitCode> {
     let mut file: Option<&str> = None;
 
     for a in args {
+        // `PARSE_OPT_STOP_AT_NON_OPTION` (`parse_options_cmd_bundle`): the
+        // `<file>` operand ends option parsing, and `cmd_bundle_verify` reads
+        // `argv[0]` alone — so everything after the file is ignored, an
+        // unrecognised switch included.
+        if file.is_some() {
+            continue;
+        }
         match a.as_str() {
             // `--help-all` renders `USAGE_FULL`, identical to the `-h` block:
             // no entry of this subcommand's table is `PARSE_OPT_HIDDEN`.
@@ -467,9 +493,7 @@ fn verify(args: &[String]) -> Result<ExitCode> {
             s if s.starts_with('-') && s.len() > 1 => {
                 return Ok(bad_option(&s[1..], VERIFY_USAGE, true));
             }
-            // git's verify takes a single <file>; further operands are ignored.
-            s if file.is_none() => file = Some(s),
-            _ => {}
+            s => file = Some(s),
         }
     }
 
@@ -616,7 +640,8 @@ fn create(args: &[String]) -> Result<ExitCode> {
     // same `progress` int, which only decides what `pack-objects` narrates on
     // stderr. Nothing here narrates, so all four spellings are accepted and
     // dropped. `--version` is the one option that changes the bytes.
-    let mut version: Option<u8> = None;
+    // `int version = -1`, which `create_bundle()` reads as "pick the minimum".
+    let mut version: Option<i64> = None;
     let mut rev_args: Vec<&str> = Vec::new();
     let mut file: Option<&str> = None;
     let mut end_of_opts = false;
@@ -633,6 +658,15 @@ fn create(args: &[String]) -> Result<ExitCode> {
             i += 1;
             continue;
         }
+        // `PARSE_OPT_STOP_AT_NON_OPTION` (builtin/bundle.c:104): the `<file>`
+        // operand ends option parsing, so everything after it is handed to
+        // `setup_revisions()` — which is why `git bundle create <file> --progress`
+        // reports an unrecognized argument while `--progress <file>` is accepted.
+        if file.is_some() {
+            rev_args.push(a);
+            i += 1;
+            continue;
+        }
         match a {
             "--" => end_of_opts = true,
             "-q" | "--quiet" | "--progress" | "--all-progress" | "--all-progress-implied" => {}
@@ -641,15 +675,18 @@ fn create(args: &[String]) -> Result<ExitCode> {
                     eprintln!("error: option `version' requires a value");
                     return Ok(ExitCode::from(129));
                 };
-                version = Some(parse_version(v)?);
+                match parse_version(v) {
+                    Ok(n) => version = Some(n),
+                    Err(code) => return Ok(code),
+                }
                 i += 1;
             }
             _ if a.starts_with("--version=") => {
-                version = Some(parse_version(&a["--version=".len()..])?)
+                match parse_version(&a["--version=".len()..]) {
+                    Ok(n) => version = Some(n),
+                    Err(code) => return Ok(code),
+                }
             }
-            // Everything else is a rev-list argument: `--all`, `^<rev>`,
-            // `--not`, and the rest of the revision grammar.
-            _ if file.is_some() => rev_args.push(a),
             _ => return Ok(bad_option(a.trim_start_matches('-'), CREATE_USAGE, !a.starts_with("--"))),
         }
         i += 1;
@@ -660,7 +697,10 @@ fn create(args: &[String]) -> Result<ExitCode> {
     };
 
     let repo = gix::discover(".")?;
-    let pending = resolve_revisions(&repo, &rev_args)?;
+    let pending = match resolve_revisions(&repo, &rev_args)? {
+        Ok(p) => p,
+        Err(code) => return Ok(code),
+    };
 
     // `if (version == -1) version = min_version;` — 2 for sha1, and only 2 or 3
     // exist (bundle.c:525-531). The v2 header carries no `@object-format`
@@ -668,7 +708,9 @@ fn create(args: &[String]) -> Result<ExitCode> {
     // 3, and an explicit `--version=2` is refused rather than written as a
     // bundle whose reader would take 64-hex ids for 40-hex ones.
     let sha1_repo = repo.object_hash() == gix::hash::Kind::Sha1;
-    let version = version.unwrap_or(if sha1_repo { 2 } else { 3 });
+    // `-1` is the sentinel `cmd_bundle_create` starts from, so an explicit
+    // `--version=-1` takes the same default as no `--version` at all.
+    let version = version.filter(|v| *v != -1).unwrap_or(if sha1_repo { 2 } else { 3 });
     if !(2..=3).contains(&version) {
         eprintln!("fatal: unsupported bundle version {version}");
         return Ok(ExitCode::from(128));
@@ -768,11 +810,16 @@ fn create(args: &[String]) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// `--version=<n>`: git's `OPT_INTEGER`, so a non-numeric value is a usage
-/// error before the version range is ever looked at.
-fn parse_version(v: &str) -> Result<u8> {
-    v.parse::<u8>()
-        .map_err(|_| anyhow::anyhow!("option `version' expects a numerical value"))
+/// `--version=<n>`: git's `OPT_INTEGER` against a C `int`, so a non-numeric value
+/// and one outside `[-2147483648, 2147483647]` are both parse-options' own usage
+/// error (exit 129) — reported before the version range is ever looked at, and
+/// with `parse-options`' two distinct texts. A value inside the `int` range but
+/// outside `[2, 3]` is `create_bundle()`'s later fatal, not this one.
+fn parse_version(v: &str) -> std::result::Result<i64, ExitCode> {
+    crate::optint::integer(&crate::optint::long_opt("version"), v).map_err(|e| {
+        eprintln!("error: {}", e.message());
+        ExitCode::from(129)
+    })
 }
 
 /// One entry of git's `revs.pending`: the object a revision argument named, the
@@ -789,46 +836,134 @@ struct Pending {
 }
 
 /// `setup_revisions()` reduced to the grammar `bundle create` is documented
-/// with: `--all`, `<rev>`, `^<rev>`, and `<a>..<b>`.
-fn resolve_revisions(repo: &gix::Repository, args: &[&str]) -> Result<Vec<Pending>> {
+/// with: the ref-selecting pseudo-options (`--all`, `--branches`, `--tags`,
+/// `--remotes`, `--glob`, each filtered by the `--exclude` patterns it consumes),
+/// `<rev>`, `^<rev>`, and `<a>..<b>`.
+///
+/// `builtin/bundle.c:104` hands its whole post-`parse_options` argv to
+/// `create_bundle()`, which calls `setup_revisions()` (bundle.c:501) — so the
+/// pseudo-option family reaches `git bundle create` unchanged.
+fn resolve_revisions(
+    repo: &gix::Repository,
+    args: &[&str],
+) -> Result<std::result::Result<Vec<Pending>, ExitCode>> {
     let mut pending = Vec::new();
-    for arg in args {
-        match *arg {
+    let mut excludes: Vec<String> = Vec::new();
+    let mut negate = false;
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i];
+        // `--exclude=<glob>` only accumulates; the next ref-selecting option
+        // applies and clears it (`clear_ref_exclusions`).
+        if let Some(v) = a.strip_prefix("--exclude=") {
+            excludes.push(v.to_string());
+            i += 1;
+            continue;
+        }
+        if a == "--exclude" {
+            i += 1;
+            let Some(v) = args.get(i) else {
+                anyhow::bail!("option 'exclude' requires a value");
+            };
+            excludes.push((*v).to_string());
+            i += 1;
+            continue;
+        }
+        if a == "--not" {
+            negate = !negate;
+            i += 1;
+            continue;
+        }
+        // `--glob` takes its value attached or as the next argv element.
+        let glob_value = if a == "--glob" {
+            i += 1;
+            match args.get(i) {
+                Some(v) => Some((*v).to_string()),
+                None => anyhow::bail!("option 'glob' requires a value"),
+            }
+        } else {
+            None
+        };
+        if let Some((kind, attached)) = super::log::ref_selector(a) {
+            let sel = super::log::RefSelection::new(
+                0,
+                kind,
+                attached.or(glob_value.as_deref()),
+                std::mem::take(&mut excludes),
+                negate,
+            );
             // `handle_refs(for_each_ref)` then `handle_refs(head_ref)`
             // (revision.c) — which is why `HEAD` lands after the ref list.
-            "--all" => {
-                for r in repo.references()?.all()? {
-                    let Ok(r) = r else { continue };
-                    let name = r.name().as_bstr().to_string();
-                    if let Some(id) = r.try_id() {
-                        pending.push(Pending {
-                            id: id.detach(),
-                            display_ref: Some(name),
-                            uninteresting: false,
-                        });
-                    }
+            for r in repo.references()?.all()? {
+                let Ok(r) = r else { continue };
+                let full = r.name().as_bstr().to_string();
+                if sel.selects(&full).is_none() {
+                    continue;
                 }
+                if let Some(id) = r.try_id() {
+                    // `write_bundle_refs()` re-dwims each pending name through
+                    // `repo_dwim_ref()`, so a `--branches` entry named `topic`
+                    // comes back out as `refs/heads/topic`.
+                    pending.push(Pending {
+                        id: id.detach(),
+                        display_ref: Some(full),
+                        uninteresting: negate,
+                    });
+                }
+            }
+            if sel.head && !sel.excluded("HEAD") {
                 if let Ok(head) = repo.head_id() {
                     pending.push(Pending {
                         id: head.detach(),
                         display_ref: Some("HEAD".into()),
-                        uninteresting: false,
+                        uninteresting: negate,
                     });
                 }
             }
-            a => {
-                if let Some(rest) = a.strip_prefix('^') {
-                    pending.push(one_pending(repo, rest, true)?);
-                } else if let Some((left, right)) = a.split_once("..") {
-                    pending.push(one_pending(repo, left, true)?);
-                    pending.push(one_pending(repo, right, false)?);
-                } else {
-                    pending.push(one_pending(repo, a, false)?);
+            i += 1;
+            continue;
+        }
+        // `if (argc > 1) error(_("unrecognized argument: %s"), argv[1])`
+        // (bundle.c:503-506): whatever `setup_revisions()` left behind. `bundle
+        // create`'s own switches are exactly that once the `<file>` operand has
+        // ended option parsing, which is why `git bundle create <file> -q` is an
+        // error while `git bundle create -q <file>` is not.
+        //
+        // (git 2.55.0 aborts on this path — one `error:` line, then SIGABRT, so a
+        // shell sees 134. This returns the 255 an `error()` return normally
+        // becomes, and writes no bundle, which is the part that matters.)
+        if matches!(a, "-q" | "--quiet" | "--progress" | "--all-progress" | "--all-progress-implied")
+            || a == "--version"
+            || a.starts_with("--version=")
+        {
+            eprintln!("error: unrecognized argument: {a}");
+            return Ok(Err(ExitCode::from(255)));
+        }
+        // `setup_revisions()` reports an unresolvable revision itself, with the
+        // token as written and its own exit code — the same message `git log`
+        // raises, since it is the same function.
+        let mut resolved = Vec::new();
+        let parts: Vec<(&str, bool)> = match a.strip_prefix('^') {
+            Some(rest) => vec![(rest, !negate)],
+            None => match a.split_once("..") {
+                Some((left, right)) => vec![(left, !negate), (right, negate)],
+                None => vec![(a, negate)],
+            },
+        };
+        for (spec, uninteresting) in parts {
+            match one_pending(repo, spec, uninteresting) {
+                Ok(p) => resolved.push(p),
+                Err(_) => {
+                    let hex_len = repo.object_hash().len_in_hex();
+                    eprint!("{}", super::log::bad_revision_message(a, hex_len));
+                    return Ok(Err(ExitCode::from(128)));
                 }
             }
         }
+        pending.extend(resolved);
+        i += 1;
     }
-    Ok(pending)
+    Ok(Ok(pending))
 }
 
 /// Resolve one revision argument, recording the name `write_bundle_refs` would
@@ -864,8 +999,17 @@ fn boundary_commits(
         return Vec::new();
     }
     let mut boundary = Vec::new();
+    // The prerequisite lines come out in the order `get_revision_1()` first met
+    // each boundary parent (`revision.c:4583-4591` appends to
+    // `revs->boundary_commits`; `create_boundary_commit_list()` reverses it and
+    // `sort_in_topological_order()` with the default `REV_SORT_IN_GRAPH_ORDER`
+    // — a LIFO priority queue — reverses it back). So the walk has to be git's
+    // own commit-date order, not gitoxide's default breadth-first.
     let walk = repo
         .rev_walk(tips.to_vec())
+        .sorting(gix::revision::walk::Sorting::ByCommitTime(
+            gix::traverse::commit::simple::CommitTimeOrder::NewestFirst,
+        ))
         .with_hidden(excluded.to_vec())
         .all();
     for info in walk.into_iter().flatten() {
@@ -905,6 +1049,13 @@ fn unbundle(args: &[String]) -> Result<ExitCode> {
     let mut filters: Vec<&[u8]> = Vec::new();
 
     for a in args {
+        // `PARSE_OPT_STOP_AT_NON_OPTION`: the `<file>` operand ends option
+        // parsing, so every later token is a `<refname>` filter — even one that
+        // looks like a switch.
+        if file.is_some() {
+            filters.push(a.as_bytes());
+            continue;
+        }
         match a.as_str() {
             // `--help-all` renders `USAGE_FULL`, identical to the `-h` block:
             // no entry of this subcommand's table is `PARSE_OPT_HIDDEN`.
@@ -920,8 +1071,7 @@ fn unbundle(args: &[String]) -> Result<ExitCode> {
             s if s.starts_with('-') && s.len() > 1 => {
                 return Ok(bad_option(&s[1..], UNBUNDLE_USAGE, true));
             }
-            s if file.is_none() => file = Some(s),
-            s => filters.push(s.as_bytes()),
+            s => file = Some(s),
         }
     }
 

@@ -54,31 +54,87 @@
 //! * `--creation-factor=<n>` (and its `--creation-factor <n>` /
 //!   `--no-creation-factor` spellings), `--left-only`, `--right-only`,
 //!   `--no-dual-color`, `--no-color`, `--color=never`, `--color=auto`, `-p` /
-//!   `-u` / `--patch`, `--no-notes`, and `--ws-error-highlight=<kind>` (a no-op
-//!   with color off, which is the only mode this port emits). Dual and simple
-//!   coloring are byte-identical once color is off.
+//!   `-u` / `--patch`, and `--ws-error-highlight=<kind>` (a no-op with color
+//!   off, which is the only mode this port emits). Dual and simple coloring are
+//!   byte-identical once color is off.
+//! * `--notes[=<ref>]` / `--no-notes`, upstream's `notes_callback()` reproduced
+//!   through [`super::notes::DisplayOpt`]: notes are on by default (the inner
+//!   `git log` uses a built-in pretty format, so `cmd_log_init_finish()` enables
+//!   the default tree), a bare `--notes` re-adds that tree plus
+//!   `notes.displayRef`, `--notes=<ref>` adds `<ref>` *instead* of the default —
+//!   its block reads ` ## Notes (<ref>) ##` — and the two together print both
+//!   blocks, in that order.
 //! * `-s` / `--no-patch`: `DIFF_FORMAT_NO_OUTPUT`, which keeps the pair headers
 //!   (`=`/`!`/`<`/`>` and the abbreviated ids) and drops every diff-of-diffs
-//!   body — reproduced by suppressing the inner `patch_diff()` call.
+//!   body — reproduced by suppressing the inner `patch_diff()` call. `--quiet`
+//!   is the same output: `flags.quick` assigns `DIFF_FORMAT_NO_OUTPUT` and
+//!   `exit_with_status` (diff.c:5348-5352), and the status is never read here.
+//! * `--max-memory=<size>`: the cost matrix budget, checked in
+//!   [`get_correspondences`] before any pairing is computed, so it fires even
+//!   when one range is empty. The refusal is upstream's `die()` verbatim,
+//!   `strbuf_humanise_bytes()` rendering included.
+//! * `--output=<file>`: the whole page — pair headers included, since
+//!   `output_pair_header()` also writes to `diffopt->file` — goes to the file
+//!   and stdout stays empty. The file is opened while options are parsed, so a
+//!   path that cannot be created is fatal ahead of every other check and a path
+//!   that can is truncated even when the run then fails.
+//! * The diff-of-diffs body format: `--diff-algorithm=<myers|minimal|patience|
+//!   histogram>` with its `--minimal` / `--patience` / `--histogram` aliases,
+//!   `--indent-heuristic` / `--no-indent-heuristic`, `-U<n>` / `--unified=<n>`,
+//!   and the three `--output-indicator-*` markers (an empty value stores NUL,
+//!   which drops the marker column entirely). None of them reaches
+//!   [`diffsize`], whose `xpparam_t` upstream leaves zeroed, so the *matching*
+//!   is unchanged by all of them.
 //! * `--abbrev` / `--no-abbrev` / `--abbrev=<n>`: the abbreviation length of the
 //!   ids in every pair header, ported from `find_unique_abbrev()` and
 //!   `parse_opt_abbrev_cb()` (bare `--abbrev` is 7, `--no-abbrev` / `--abbrev=0`
 //!   the full id, `--abbrev=<n>` clamps `<n>` to `[4, 40]`, and a non-numeric
 //!   `<n>` is the 129 `error: option 'abbrev' expects a numerical value`).
 //! * The diff options that upstream forwards but that touch only patch bytes
-//!   this port already discards, so accepting them changes nothing:
-//!   `--full-index` (the abbreviated/full `index` line is dropped), `--binary`
-//!   (text files gain no binary hunk; the `Binary files … differ` label is
-//!   unchanged), and every `--diff-merges` variant (`--no-diff-merges`,
-//!   `--remerge-diff`, `--diff-merges=<fmt>`) because range-diff excludes
-//!   merges. They are accepted silently, not deferred.
+//!   this port already discards, or that address machinery the diff-of-diffs
+//!   does not have, so accepting them changes nothing. Each was verified
+//!   byte-identical to the flagless run on a both-sides-non-empty range against
+//!   git 2.55.0, and each is accepted silently rather than deferred:
+//!   * `--full-index` (the abbreviated/full `index` line is dropped) and
+//!     `--binary` (text files gain no binary hunk; the `Binary files … differ`
+//!     label is unchanged).
+//!   * Every `--diff-merges` variant (`--no-diff-merges`, `--remerge-diff`,
+//!     `--diff-merges=<fmt>`) *when neither range contains a merge*, which is
+//!     the patch-series shape range-diff exists for. See the known deviation
+//!     below for what happens when one does.
+//!   * `--textconv` / `--no-textconv`: `get_textconv()` (diff.c:3762) asks
+//!     `diff_filespec_load_driver()`, which returns immediately because a driver
+//!     is already set (diff.c:2312-2313) — the hardcoded `section_headers`
+//!     (range-diff.c:486), whose NULL `.textconv` makes
+//!     `userdiff_get_textconv()` give up (userdiff.c:551-552).
+//!   * `--src-prefix=` / `--dst-prefix=` / `--no-prefix` / `--default-prefix`:
+//!     the prefixes only reach the `diff --git`, `---` and `+++` lines, which
+//!     `suppress_diff_headers` drops (range-diff.c:523).
+//!   * `--line-prefix=`: overwritten by the four-space `output_prefix_data`
+//!     (range-diff.c:527-529) after the user's `diff_options` is memcpy'd in.
+//!   * `--exit-code` / `--no-exit-code`: `cmd_range_diff()` returns
+//!     `show_range_diff()`'s value (builtin/range-diff.c:189-196) and never
+//!     calls `diff_result_code()`, so the status stays 0.
+//!   * `--relative` / `--no-relative`, `--ignore-submodules[=<when>]`,
+//!     `--submodule[=<fmt>]`, `--ita-invisible-in-index`,
+//!     `--ita-visible-in-index` and `--max-depth=<n>`: there is no tree walk, no
+//!     submodule and no index here — the two filespecs are the `is_stdin`
+//!     buffers `get_filespec()` builds (range-diff.c:477-489).
 //! * The failure paths, with upstream's exit status: a bad argument shape exits
 //!   129, a two-range operand that names nothing exits 128 (`bad revision`, the
 //!   fatal `is_range_diff_range()` raises), `--left-only` together with
-//!   `--right-only` exits 255, a range naming an unknown revision exits 255, and
-//!   combining two or more of `--name-only` / `--name-status` / `--check` / `-s`
-//!   exits 128 — upstream's `diff_setup_done()` fatal, raised before any
-//!   revision is resolved (so it precedes the shape and range checks above).
+//!   `--right-only` exits 255, and a range naming an unknown revision exits 255.
+//!   Ahead of all of those come the four `diff_setup_done()` refusals, raised
+//!   before any revision is resolved and in this order (diff.c:5259-5273,
+//!   5364-5365), each exit 128:
+//!   1. two or more of `--name-only` / `--name-status` / `--check` / `-s`;
+//!   2. two or more of `-G` / `-S` / `--find-object`;
+//!   3. `-G` together with `--pickaxe-regex`;
+//!   4. `--pickaxe-all` together with `--find-object`;
+//!   5. `--follow` in any form — range-diff routes a `-- <path>` to `log_arg`
+//!      rather than to `diffopt.pathspec` (builtin/range-diff.c:128/148/179), so
+//!      that pathspec is always empty and `diff_check_follow_pathspec()` always
+//!      takes its `--follow requires exactly one pathspec` die.
 //!
 //! ### Option handling — nothing is silently ignored
 //!
@@ -86,15 +142,21 @@
 //! rendering. This port implements only the options listed above; every other
 //! option is *deferred*, meaning it is recorded and never applied:
 //!
-//! * A deferred option is forwarded to the inner patch rendering, so it can only
-//!   change the diff-of-diffs body of a matched pair or the matching itself —
-//!   never a subject or the `<`/`>` header of an unmatched commit. When one of
-//!   the two ranges is empty no commit can match, every commit renders as a bare
-//!   header with no body, and the option provably cannot reach the output, so
-//!   the page is emitted (exit 0) exactly as upstream emits it — this is the
-//!   common `<old>...<new>` ancestor case. Otherwise, if a body would be
-//!   produced, the run stops with a terse `unsupported flag` message on stderr
-//!   rather than emitting a patch that ignored the option.
+//! * A deferred option configures the *outer* diff — the diff-of-diffs — and
+//!   nothing else. `add_diff_options()` binds the whole `git diff` table to
+//!   `diffopt` (builtin/range-diff.c:83), and only `--notes`, `--diff-merges`
+//!   and `--remerge-diff` are `OPT_PASSTHRU_ARGV` entries that reach the inner
+//!   `git log` (builtin/range-diff.c:56-66). The matching is out of reach too:
+//!   `diffsize()` builds its own zeroed `xpparam_t` (range-diff.c:307).
+//! * That outer diff runs in exactly one place — `patch_diff()`, which
+//!   `output()` calls only for a *matched* pair and only when the format is not
+//!   `DIFF_FORMAT_NO_OUTPUT` (range-diff.c:567-573). So when no pair matched, or
+//!   `-s`/`--quiet` suppressed the bodies, no byte of the page can depend on a
+//!   deferred option and the page is emitted (exit 0) exactly as upstream emits
+//!   it — which covers the common `<old>...<new>` ancestor case, where one range
+//!   is empty, and every disjoint pair of ranges besides. Otherwise, if a body
+//!   would be produced, the run stops with a terse `unsupported flag` message on
+//!   stderr rather than emitting a diff-of-diffs that ignored the option.
 //! * If the run instead ends earlier — a usage error, or a range that names an
 //!   unknown revision — the deferred option never becomes observable, because
 //!   upstream's behaviour on those two paths does not depend on it. That was
@@ -102,12 +164,15 @@
 //!   grammar can emit with no range argument: all 84 produce the same
 //!   `fatal: need two commit ranges` and the same exit status 129.
 //! * The exception is an option upstream *validates while parsing*, before any
-//!   revision is resolved: `--creation-factor` (`OPTION_INTEGER`) and
-//!   `--inter-hunk-context` (`OPTION_UNSIGNED`, a k/m/g magnitude via
-//!   [`git_parse_unsigned`]). A malformed value for either is the 129 `error:`
-//!   upstream reports at parse time, not a deferred `unsupported flag`. A
-//!   `--inter-hunk-context` value upstream accepts is deferred like the rest,
-//!   because rendering it would change the inner patch text.
+//!   revision is resolved: `--creation-factor` (`OPTION_INTEGER`),
+//!   `--inter-hunk-context` and `--max-memory` (both k/m/g magnitudes via
+//!   [`git_parse_unsigned`]), and `--find-object`, whose value
+//!   `diff_opt_find_object()` resolves against the repository before it records
+//!   anything (diff.c:5531). A malformed value for any of them is the 129
+//!   `error:` upstream reports at parse time, not a deferred `unsupported
+//!   flag`. An `--inter-hunk-context` or `--find-object` value upstream accepts
+//!   is deferred like the rest, because honouring it would change the rendered
+//!   patch text.
 //!
 //! An option this port does not recognise at all is deferred too, rather than
 //! rejected: upstream accepts the whole `git diff` option list here, and
@@ -121,9 +186,28 @@
 //!
 //! * Color in any form: `--color`, `--color=always`, and `--dual-color` (which
 //!   upstream uses to *force* color on). The dual-color markup is not ported.
-//! * `--diff-merges=<format>` / `--remerge-diff` (merges are ignored here, which
-//!   is the default upstream behaviour), a magic or wildcard pathspec, and every
-//!   other `git diff` option upstream forwards to the inner patches.
+//! * The output formats that replace the patch body — `--stat` and its width
+//!   options, `--compact-summary`, `--numstat`, `--shortstat`, `--dirstat`,
+//!   `--summary`, `--raw`, `--name-only`, `--name-status`, `--check` — none of
+//!   which this port renders.
+//! * The pickaxe *filters* `-S`, `-G` and `--find-object`: `diffcore_pickaxe()`
+//!   can drop the diff-of-diffs' single filepair, which empties the body. Their
+//!   modifiers `--pickaxe-all` and `--pickaxe-regex` are accepted instead, since
+//!   `diffcore_std()` never reaches the pickaxe unless one of those three set a
+//!   kind bit (diff.c:7517). All five contribute their `pickaxe_opts` bit, for
+//!   the three refusals listed above.
+//! * `--inter-hunk-context=<n>`, which merges hunks closer than `<n>` context
+//!   lines: gitoxide's `UnifiedDiff` exposes only a symmetrical context size, so
+//!   the merging has no counterpart here.
+//! * `--anchored=<text>`, which is patience diff plus anchor lines; gitoxide's
+//!   `Algorithm::Patience` takes no anchors.
+//! * The whitespace-comparison flags (`-w`, `-b`, `--ignore-space-at-eol`,
+//!   `--ignore-cr-at-eol`, `--ignore-blank-lines`, `-I<regex>`), the rename and
+//!   copy detection flags, `--word-diff`, `--color-moved`, `-R`,
+//!   `--function-context`, `--diff-filter`, `--rotate-to` / `--skip-to`,
+//!   `--ext-diff` and `-O`.
+//! * A magic (`:(glob)`, `:!exclude`, …) or wildcard pathspec, and every other
+//!   `git diff` option upstream forwards to the inner patches.
 //! * Commits containing a rename that git's `diffcore-rename` would detect.
 //!   These are found by re-running the tree diff with gitoxide's rename tracker
 //!   at git's default 50% threshold, and refused: upstream's `old => new`
@@ -137,15 +221,45 @@
 //! * Upstream orders each range with `--date-order`, i.e. commit-date order
 //!   constrained by topology. This port implements the topological constraint
 //!   exactly (Kahn's algorithm over in-range child counts, newest commit date
-//!   first), which is identical for the linear patch series range-diff exists to
-//!   compare, but may break commit-date ties differently on merge-heavy ranges,
-//!   because upstream's tie-break is its binary heap's internal order.
+//!   first), and a commit-date tie falls back to the position the traversal
+//!   reached the commit at — the stand-in for `prio_queue`'s insertion counter,
+//!   which is what breaks the tie in `sort_in_topological_order()`. That
+//!   traversal is asked for commit-date order so it mirrors the `revs->commits`
+//!   list `prepare_revision_walk()` hands that function, rather than gitoxide's
+//!   default breadth-first. What is *not* established is that gitoxide's own
+//!   ordering of two commits sharing a second matches git's insertion order, so
+//!   a merge-heavy range with tied commit dates may still order the tied
+//!   commits differently. No such case has been produced: 100 randomly
+//!   generated merge histories whose commit dates were drawn from three values
+//!   (so ties are the norm) all matched git 2.55.0 exactly, both before and
+//!   after the traversal order was changed.
 //! * A usage error prints `fatal: <reason>` and the three-line synopsis on
 //!   stderr and exits 129 like upstream, but without the ~90-line option list
 //!   upstream prints after the synopsis. Stdout is empty either way.
 //! * An unrecognised option reaches the usage error as "need two commit ranges"
 //!   rather than upstream's "unknown option", because unrecognised options are
 //!   deferred (see above). The exit status, 129, is the same.
+//! * Any `--diff-merges` spelling — `--remerge-diff` and `--no-diff-merges`
+//!   included, since both push onto `diff_merges_arg` — makes upstream set
+//!   `range_diff_opts.include_merges` (builtin/range-diff.c:94-97), so a merge
+//!   inside either range then gets its own pair-header line. This port always
+//!   walks with merges excluded, so on such a range it prints one line fewer.
+//!   Confirmed against git 2.55.0: on a range holding one merge,
+//!   `range-diff -s --remerge-diff <r1> <r2>` lists the merge and the flagless
+//!   run does not. These options are still accepted rather than deferred,
+//!   because on a merge-free range — the patch series range-diff is for — they
+//!   are byte-identical.
+//! * `is_range_diff_range()` counts the *objects* `setup_revisions()` left
+//!   pending and demands at least one positive and one negative. When both ends
+//!   of `<a>..<b>` name the same commit, upstream sees one object carrying
+//!   `UNINTERESTING`, counts zero positives, and rejects the operand — so
+//!   `range-diff <tag>..<branch> …` with the tag *on* the branch tip is
+//!   upstream's `need two commit ranges` (129) while this port accepts it and
+//!   prints a page. Confirmed against git 2.55.0.
+//! * `diff.algorithm` in config is not read: upstream's
+//!   `repo_config(git_diff_ui_config)` (builtin/range-diff.c:79) makes it the
+//!   default the command line then overrides, while this port always starts from
+//!   Myers. Only a repository that sets that key is affected.
 
 use anyhow::{anyhow, bail, Result};
 use std::collections::{BinaryHeap, HashMap};
@@ -171,6 +285,32 @@ const FUNC_BUF_SIZE: usize = 80;
 const FIRST_FEW_BYTES: usize = 8000;
 /// The four-space `output_prefix` upstream installs for the diff-of-diffs.
 const INDENT: &[u8] = b"    ";
+/// `RANGE_DIFF_MAX_MEMORY_DEFAULT` — the cost matrix budget `--max-memory`
+/// overrides, which `git range-diff -h` documents as "default 4G".
+const MAX_MEMORY_DEFAULT: u64 = 4 * 1024 * 1024 * 1024;
+/// `sizeof(int)`, the element size `get_correspondences()` multiplies the `n*n`
+/// cost matrix by (range-diff.c:334).
+const COST_ELEMENT_SIZE: u64 = 4;
+/// Indices into [`Opts::indicators`], upstream's `OUTPUT_INDICATOR_*`.
+const IND_NEW: usize = 0;
+const IND_OLD: usize = 1;
+const IND_CONTEXT: usize = 2;
+
+/// The `diff_setup_done()` pickaxe bits (`diff.h`), each set by the option that
+/// names it and never cleared. Upstream reports three separate `cannot be used
+/// together` fatals over them (diff.c:5263-5273), all before any revision is
+/// resolved.
+const PICKAXE_ALL: u32 = 1;
+const PICKAXE_REGEX: u32 = 1 << 1;
+const PICKAXE_KIND_S: u32 = 1 << 2;
+const PICKAXE_KIND_G: u32 = 1 << 3;
+const PICKAXE_KIND_OBJFIND: u32 = 1 << 4;
+/// `DIFF_PICKAXE_KINDS_MASK`: two or more of `-G`, `-S`, `--find-object`.
+const PICKAXE_KINDS_MASK: u32 = PICKAXE_KIND_S | PICKAXE_KIND_G | PICKAXE_KIND_OBJFIND;
+/// `DIFF_PICKAXE_KINDS_G_REGEX_MASK`: `-G` together with `--pickaxe-regex`.
+const PICKAXE_G_REGEX_MASK: u32 = PICKAXE_KIND_G | PICKAXE_REGEX;
+/// `DIFF_PICKAXE_KINDS_ALL_OBJFIND_MASK`: `--pickaxe-all` with `--find-object`.
+const PICKAXE_ALL_OBJFIND_MASK: u32 = PICKAXE_ALL | PICKAXE_KIND_OBJFIND;
 
 /// The four `diff.h` output-format bits `diff_setup_done()` forbids combining:
 /// `--name-only`, `--name-status`, `--check` and `-s`. Two or more set is the
@@ -569,12 +709,40 @@ struct Opts {
     creation_factor: i64,
     left_only: bool,
     right_only: bool,
-    /// Whether upstream would ask `git log` to render notes. On by default;
-    /// `--no-notes` turns it off, which is the only setting this port renders.
-    notes: bool,
+    /// The notes trees upstream's inner `git log` would render, built by
+    /// `--notes[=<ref>]` / `--no-notes` exactly as `notes_callback()` builds
+    /// `struct display_notes_opt`. Range-diff renders notes by default, because
+    /// its `git log` uses a built-in pretty format and so takes
+    /// `cmd_log_init_finish()`'s default-notes branch.
+    notes: super::notes::DisplayOpt,
     /// `-s` / `--no-patch`: emit only the pair headers, no diff-of-diffs body,
     /// exactly as `DIFF_FORMAT_NO_OUTPUT` suppresses the inner patch.
     no_patch: bool,
+    /// `--max-memory=<size>`: the cost matrix's byte budget, checked in
+    /// [`get_correspondences`] (range-diff.c:335-344). The default is the 4 GiB
+    /// `RANGE_DIFF_MAX_MEMORY_DEFAULT` the `-h` text spells "default 4G".
+    max_memory: u64,
+    /// The xdiff algorithm of the *outer* diff-of-diffs: `--diff-algorithm=`,
+    /// `--minimal`, `--patience`, `--histogram` (diff.c:3825-3838, where each
+    /// spelling clears the previous one, so the last flag wins). It does not
+    /// reach [`diffsize`], whose `xpparam_t` is zeroed (range-diff.c:307).
+    algorithm: Algorithm,
+    /// `XDF_INDENT_HEURISTIC`, on by default and cleared by
+    /// `--no-indent-heuristic` (diff.c:6214-6216).
+    indent_heuristic: bool,
+    /// `diffopt.context`: `-U<n>` / `--unified=<n>` (diff.c:5945-5960),
+    /// three lines by default.
+    context: u32,
+    /// `output_indicators[NEW/OLD/CONTEXT]` (diff.c:5143-5145), the three
+    /// markers `--output-indicator-*` rewrites. A `0` byte is the empty value
+    /// `diff_opt_char()` stores, which `emit_line_0()` writes as nothing at all
+    /// (`if (first) fputc(first, file)`, diff.c:786-787).
+    indicators: [u8; 3],
+    /// `--output=<file>`: the sink `diffopt.file` names, opened while
+    /// parse-options runs (diff.c:5821-5835) so the pair headers
+    /// `output_pair_header()` writes with `fwrite(…, diffopt->file)`
+    /// (range-diff.c:467) land there too.
+    output: Option<std::fs::File>,
     /// Abbreviation length for the ids printed in every pair header, driven by
     /// `--abbrev` / `--no-abbrev` / `--abbrev=<n>`.
     abbrev: Abbrev,
@@ -602,8 +770,17 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
         creation_factor: CREATION_FACTOR_DEFAULT,
         left_only: false,
         right_only: false,
-        notes: true,
+        // Left at `given == false` here: the inner `git log` only falls back to
+        // the default notes tree when no `--notes`/`--no-notes` reached it, so
+        // the fallback is applied after the whole command line has been read.
+        notes: super::notes::DisplayOpt::default(),
         no_patch: false,
+        max_memory: MAX_MEMORY_DEFAULT,
+        algorithm: Algorithm::Myers,
+        indent_heuristic: true,
+        context: 3,
+        indicators: [b'+', b'-', b' '],
+        output: None,
         abbrev: Abbrev::Default,
         deferred: None,
         colors: diff_color::DiffColors::disabled(),
@@ -624,6 +801,15 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
 
     // The accumulated `diff_setup_done()` output-format bits (see [`FMT_NAME`]).
     let mut fmt_mask: u32 = 0;
+    // The accumulated `diffopt.pickaxe_opts` bits (see [`PICKAXE_ALL`]) and
+    // `diffopt.flags.follow_renames`, the other two things `diff_setup_done()`
+    // refuses before any revision is resolved.
+    let mut pickaxe_mask: u32 = 0;
+    let mut follow = false;
+    // `--find-object` resolves its value against the repository while
+    // parse-options runs (diff.c:5531), so discovery has to happen here rather
+    // than after the loop; the handle is reused below.
+    let mut repo: Option<gix::Repository> = None;
 
     // The first `--diff-merges` style the inner `git log` would reject, held
     // back until that log runs so the ordering matches upstream.
@@ -738,13 +924,25 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
             }
             // Patch output is what this port emits; `-p`/`-u` ask for it.
             "-p" | "-u" | "--patch" => {}
-            "--no-notes" => opts.notes = false,
-            // `--notes[=<ref>]` turns note rendering on — the default. The value
-            // is an attached OPTARG (a separate argv element is not consumed).
-            // With no notes ref present this is identical to the default output;
-            // the guard below still stops honestly when a `refs/notes/commits`
-            // ref exists, whose rendering is not ported.
-            "--notes" => opts.notes = true,
+            // `--notes` is an `OPT_PASSTHRU_ARGV` with `PARSE_OPT_OPTARG`
+            // (builtin/range-diff.c:56-58): the spelling reaches the inner `git
+            // log` verbatim, so these are `notes_callback()`'s three cases and
+            // the value is an attached OPTARG — a separate argv element is never
+            // consumed. A bare `--notes` re-enables the default tree (plus
+            // `notes.displayRef`), `--notes=<ref>` adds that ref *instead* of
+            // the default, so both together print both blocks, and `--no-notes`
+            // forgets every ref asked for.
+            "--no-notes" => {
+                opts.notes.disable();
+                opts.notes.given = true;
+            }
+            "--notes" => {
+                match inline {
+                    Some(v) => opts.notes.enable_ref(v),
+                    None => opts.notes.enable_default(),
+                }
+                opts.notes.given = true;
+            }
             // `--abbrev`/`--no-abbrev`/`--abbrev=<n>` rewrite the abbreviated id
             // printed in every pair header. Upstream's `parse_opt_abbrev_cb`:
             // a bare `--abbrev` is `DEFAULT_ABBREV` (7), `--no-abbrev` is 0 (the
@@ -778,6 +976,209 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
             // not a spelling parse-options resolves at all; it falls through to the
             // `unknown option` refusal below, exactly as stock rejects it.
             "--full-index" | "--binary" | "--no-diff-merges" | "--remerge-diff" => {}
+            // The rest of the provable no-ops, each one a diff option
+            // `add_diff_options()` wires to the *outer* diff-of-diffs
+            // (builtin/range-diff.c:83) whose effect that diff cannot have:
+            //
+            // * `--textconv`/`--no-textconv`: `get_textconv()` asks
+            //   `diff_filespec_load_driver()` for a driver, which returns at
+            //   once because one is already set (diff.c:2312-2313) — the
+            //   hardcoded `section_headers` (range-diff.c:486), whose
+            //   `.textconv` is NULL, so `userdiff_get_textconv()` gives up
+            //   (userdiff.c:551-552).
+            // * `--src-prefix`/`--dst-prefix`/`--no-prefix`/`--default-prefix`:
+            //   the prefixes only reach the `diff --git`, `---` and `+++` lines,
+            //   which `suppress_diff_headers` drops (range-diff.c:523).
+            // * `--line-prefix`: overwritten by the four-space
+            //   `output_prefix_data` (range-diff.c:527-529) after the user's
+            //   `diff_options` is memcpy'd in.
+            // * `--exit-code`/`--no-exit-code`: `cmd_range_diff()` returns
+            //   `show_range_diff()`'s value (builtin/range-diff.c:189-196) and
+            //   never calls `diff_result_code()`, so the status stays 0.
+            // * `--relative`, `--ignore-submodules`, `--submodule`,
+            //   `--ita-*-in-index`, `--max-depth`: there is no tree walk, no
+            //   submodule and no index here — the two filespecs are `is_stdin`
+            //   buffers built by `get_filespec()` (range-diff.c:477-489).
+            //
+            // Verified byte-identical to the flagless run on a both-sides
+            // non-empty range against git 2.55.0.
+            "--textconv" | "--no-textconv" | "--no-prefix" | "--default-prefix"
+            | "--exit-code" | "--no-exit-code" | "--relative" | "--no-relative"
+            | "--ignore-submodules" | "--submodule" | "--ita-invisible-in-index"
+            | "--ita-visible-in-index" => {}
+            // The same, for the ones whose value can be a separate argv element
+            // (`LONG_TAKES_VALUE`), which has to be consumed so it is not
+            // classified as a revision.
+            "--src-prefix" | "--dst-prefix" | "--line-prefix" | "--max-depth" => {
+                if inline.is_none() {
+                    i += 1;
+                }
+            }
+            // `--quiet` is `flags.quick`, which `diff_setup_done()` turns into
+            // `DIFF_FORMAT_NO_OUTPUT` plus `exit_with_status` (diff.c:5348-5352)
+            // — and the status is never read here, so it is exactly `-s`. It is
+            // set *after* the `check_mask` test at diff.c:5259, so unlike `-s`
+            // it never joins the `cannot be used together` fatal.
+            "--quiet" => opts.no_patch = true,
+            "--no-quiet" => opts.no_patch = false,
+            // `--output=<file>` is opened by `xfopen()` while parse-options runs
+            // (diff.c:5829-5830), so a path that cannot be created is fatal
+            // before every other check, and a path that can is truncated even
+            // when the run then fails. It also forces colour off unless
+            // `--color=always` already turned it on (diff.c:5832-5833).
+            "--output" => {
+                let path = match required_value(args, &mut i, name, inline) {
+                    Ok(v) => v,
+                    Err(code) => return Ok(code),
+                };
+                match std::fs::File::create(&path) {
+                    Ok(f) => opts.output = Some(f),
+                    Err(e) => {
+                        crate::git_fatal!(
+                            "could not open '{path}' for writing: {}",
+                            io_reason(&e)
+                        );
+                    }
+                }
+                if color_when != Some(diff_color::ColorWhen::Always) {
+                    color_when = Some(diff_color::ColorWhen::Never);
+                }
+            }
+            // `parse_max_memory()` (builtin/range-diff.c:20-33): a
+            // `git_parse_unsigned` magnitude bounded by `SIZE_MAX`, whose single
+            // failure message is reported at parse time. `--no-max-memory`
+            // returns early *without* touching the value, so it does not restore
+            // the default.
+            "--no-max-memory" => {}
+            "--max-memory" => {
+                let value = match required_value(args, &mut i, name, inline) {
+                    Ok(v) => v,
+                    Err(code) => return Ok(code),
+                };
+                match git_parse_unsigned(&value, u64::MAX) {
+                    Ok(n) => opts.max_memory = n,
+                    Err(_) => {
+                        return Ok(option_error(&format!("invalid max-memory value: {value}")))
+                    }
+                }
+            }
+            // `--follow` sets `flags.follow_renames`, and `diff_setup_done()`
+            // then hands `diffopt.pathspec` to `diff_check_follow_pathspec()`
+            // (diff.c:5364-5365). Range-diff never fills that pathspec in — a
+            // trailing `-- <path>` goes to `log_arg` instead
+            // (builtin/range-diff.c:128/148/179) — so `ps->nr` is always 0 and
+            // the check always dies (diff.c:5223-5226).
+            "--follow" => follow = true,
+            "--no-follow" => follow = false,
+            // The pickaxe options. Their `pickaxe_opts` bits are tracked for the
+            // three fatals `diff_setup_done()` raises before any revision is
+            // resolved (diff.c:5263-5273).
+            //
+            // `--pickaxe-all` and `--pickaxe-regex` are modifiers, not filters:
+            // `diffcore_std()` only reaches `diffcore_pickaxe()` when a *kind*
+            // bit is set (`options->pickaxe_opts & DIFF_PICKAXE_KINDS_MASK`,
+            // diff.c:7517), and every option that sets one is deferred below —
+            // so on their own they cannot change a byte, and are accepted.
+            "--pickaxe-all" => pickaxe_mask |= PICKAXE_ALL,
+            "--pickaxe-regex" => pickaxe_mask |= PICKAXE_REGEX,
+            // `-S`, `-G` and `--find-object` do filter, and a filtered-out
+            // filepair means no diff-of-diffs body at all, so they are deferred.
+            // Both carry their value either attached (`-Sfoo`) or as the next
+            // argv element (`-S foo`), and the bit is set for each spelling.
+            _ if name.starts_with("-S") || name.starts_with("-G") => {
+                pickaxe_mask |= match name.as_bytes()[1] {
+                    b'S' => PICKAXE_KIND_S,
+                    _ => PICKAXE_KIND_G,
+                };
+                opts.defer(unsupported_flag(a));
+                if name.len() == 2 {
+                    i += 1;
+                }
+            }
+            // `diff_opt_find_object()` resolves its value before it sets the
+            // bit, and an unresolvable one is the 129 `error:` it reports
+            // instead (diff.c:5531-5537).
+            "--find-object" => {
+                let value = match required_value(args, &mut i, name, inline) {
+                    Ok(v) => v,
+                    Err(code) => return Ok(code),
+                };
+                // `diff_opt_find_object()`'s own `--find-object requires a git
+                // repository` (diff.c:5529) is unreachable from here: `git.c`
+                // marks `range-diff` `RUN_SETUP`, so a run outside a repository
+                // has already died with `not a git repository` — which is what
+                // this discovery failure reports too.
+                if repo.is_none() {
+                    repo = Some(gix::discover(".")?);
+                }
+                let found = repo
+                    .as_ref()
+                    .expect("discovered just above")
+                    .rev_parse_single(value.as_str())
+                    .is_ok();
+                if !found {
+                    return Ok(option_error(&format!("unable to resolve '{value}'")));
+                }
+                pickaxe_mask |= PICKAXE_KIND_OBJFIND;
+                opts.defer(unsupported_flag(a));
+            }
+            // The xdiff algorithm of the diff-of-diffs. `set_diff_algorithm()`
+            // clears the previous choice before setting the new one
+            // (diff.c:3833-3835), so the last spelling on the line wins, and
+            // `--minimal`/`--patience`/`--histogram` are the same callback with
+            // the option's own name as the value (diff.c:5689-5704).
+            // `parse_algorithm_value()` is case-insensitive (diff.c:220-236) and
+            // `crate::diffopt::check` has already rejected an unknown name.
+            "--minimal" => opts.algorithm = Algorithm::MyersMinimal,
+            "--patience" => opts.algorithm = Algorithm::Patience,
+            "--histogram" => opts.algorithm = Algorithm::Histogram,
+            "--diff-algorithm" => {
+                let value = match required_value(args, &mut i, name, inline) {
+                    Ok(v) => v,
+                    Err(code) => return Ok(code),
+                };
+                opts.algorithm = match value.to_ascii_lowercase().as_str() {
+                    "minimal" => Algorithm::MyersMinimal,
+                    "patience" => Algorithm::Patience,
+                    "histogram" => Algorithm::Histogram,
+                    // `myers` and `default`, the only names left once
+                    // `crate::diffopt::check` has run.
+                    _ => Algorithm::Myers,
+                };
+            }
+            // `XDF_INDENT_HEURISTIC` is an `OPT_BIT` (diff.c:6214), on by
+            // default, so only `--no-indent-heuristic` changes anything.
+            "--indent-heuristic" => opts.indent_heuristic = true,
+            "--no-indent-heuristic" => opts.indent_heuristic = false,
+            // `-U<n>` / `--unified[=<n>]`, the context size of the
+            // diff-of-diffs. `diff_opt_unified()` only assigns when a value came
+            // with the option (`if (arg)`, diff.c:5953), and the option is
+            // `PARSE_OPT_OPTARG`, so a bare `-U` / `--unified` leaves the
+            // default 3 alone and never eats the next argv element.
+            // `crate::diffopt::check` has already refused a non-numeric or
+            // negative value, so `shared_value` parses here.
+            _ if name == "--unified" || name.starts_with("-U") => {
+                if let Some(v) = shared_value {
+                    opts.context = crate::diffopt::strtol_long(v).unwrap_or(3).max(0) as u32;
+                }
+            }
+            // The three `--output-indicator-*` markers. `diff_opt_char()` stores
+            // `arg[0]`, so an empty value stores NUL and the marker column
+            // disappears; a value longer than one byte was already rejected by
+            // `crate::diffopt::check`.
+            "--output-indicator-new" | "--output-indicator-old"
+            | "--output-indicator-context" => {
+                let value = match required_value(args, &mut i, name, inline) {
+                    Ok(v) => v,
+                    Err(code) => return Ok(code),
+                };
+                let slot = match name {
+                    "--output-indicator-new" => IND_NEW,
+                    "--output-indicator-old" => IND_OLD,
+                    _ => IND_CONTEXT,
+                };
+                opts.indicators[slot] = value.as_bytes().first().copied().unwrap_or(0);
+            }
             // `--diff-merges` is an `OPT_PASSTHRU_ARGV`, so its value is not
             // checked here — it is handed to the inner `git log`, which dies on
             // a style it does not know. Record the first bad one and report it
@@ -926,6 +1327,13 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
         i += 1;
     }
 
+    // `cmd_log_init_finish()`: with no `--notes`/`--no-notes` of its own, a run
+    // whose pretty format is a built-in one — and the inner `git log` uses
+    // `--pretty=medium` — renders the default notes tree.
+    if !opts.notes.given {
+        opts.notes.enable_default();
+    }
+
     // `diff_setup_done()` runs before any revision is resolved: two or more of
     // `--name-only`/`--name-status`/`--check`/`-s` is a fatal (128) here, ahead
     // of the argument-shape (129), `--left-only`/`--right-only` (255) and range
@@ -939,8 +1347,41 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
         );
         return Ok(ExitCode::from(128));
     }
+    // The three pickaxe refusals, in `diff_setup_done()`'s own order
+    // (diff.c:5263-5273), each a `HAS_MULTI_BITS` test on `pickaxe_opts`.
+    for (mask, message) in [
+        (
+            PICKAXE_KINDS_MASK,
+            "options '-G', '-S', and '--find-object' cannot be used together",
+        ),
+        (
+            PICKAXE_G_REGEX_MASK,
+            "options '-G' and '--pickaxe-regex' cannot be used together, \
+             use '--pickaxe-regex' with '-S'",
+        ),
+        (
+            PICKAXE_ALL_OBJFIND_MASK,
+            "options '--pickaxe-all' and '--find-object' cannot be used together, \
+             use '--pickaxe-all' with '-G' and '-S'",
+        ),
+    ] {
+        if (pickaxe_mask & mask).count_ones() >= 2 {
+            eprintln!("fatal: {message}");
+            return Ok(ExitCode::from(128));
+        }
+    }
+    // `--follow` last (diff.c:5364-5365), and unconditionally: range-diff routes
+    // every `-- <path>` to `log_arg`, so `diffopt.pathspec` is always empty and
+    // `diff_check_follow_pathspec()` always takes its `ps->nr != 1` die.
+    if follow {
+        eprintln!("fatal: --follow requires exactly one pathspec");
+        return Ok(ExitCode::from(128));
+    }
 
-    let repo = gix::discover(".")?;
+    let repo = match repo {
+        Some(r) => r,
+        None => gix::discover(".")?,
+    };
 
     // builtin/range-diff.c:89 — "force color when --dual-color was used", applied after
     // `diff_setup_done()` so it overrides `--no-color` and the `color.diff`/`color.ui`
@@ -1019,36 +1460,33 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
 
 
     let mailmap = repo.open_mailmap();
-    // `--notes`/`--no-notes` are passed straight to the `git log` upstream runs;
-    // with notes on, the display refs are the same ones `git log` would use.
-    let notes = if opts.notes {
-        // `git log --notes` with no ref: the default tree plus whatever
-        // `notes.displayRef`/`GIT_NOTES_DISPLAY_REF` add, which `enable_default()`
-        // sets up.
-        let mut opt = super::notes::DisplayOpt::default();
-        opt.enable_default();
-        opt.given = true;
-        super::notes::load_display(&repo, &opt)?
-    } else {
-        Vec::new()
-    };
-    let mut a = read_patches(&repo, ends1, &mailmap, matcher.as_ref(), &opts.abbrev, &notes)?;
-    let mut b = read_patches(&repo, ends2, &mailmap, matcher.as_ref(), &opts.abbrev, &notes)?;
+    // `--notes[=<ref>]`/`--no-notes` are passed straight to the `git log`
+    // upstream runs, so the display refs are the ones that log would have used.
+    // Loaded once per range because upstream runs one log per range: a ref that
+    // does not resolve warns once for each of them.
+    let notes1 = super::notes::load_display(&repo, &opts.notes)?;
+    let mut a = read_patches(&repo, ends1, &mailmap, matcher.as_ref(), &opts.abbrev, &notes1)?;
+    let notes2 = super::notes::load_display(&repo, &opts.notes)?;
+    let mut b = read_patches(&repo, ends2, &mailmap, matcher.as_ref(), &opts.abbrev, &notes2)?;
 
     find_exact_matches(&mut a, &mut b);
-    get_correspondences(&mut a, &mut b, opts.creation_factor);
+    if let Err(msg) = get_correspondences(&mut a, &mut b, opts.creation_factor, opts.max_memory) {
+        crate::git_fatal!("{msg}");
+    }
 
-    // A deferred (unimplemented) diff option is forwarded to the inner patch
-    // rendering, so it can only alter the diff-of-diffs body of a matched pair
-    // or the matching itself — never a subject or the `<`/`>` header of an
-    // unmatched commit. When one range is empty no commit can match, every
-    // commit renders as a bare header with no body, and the option provably
-    // cannot reach the output — so it is emitted, matching upstream, which
-    // accepts these options and prints the same header-only page (this is the
-    // common `<old>...<new>` ancestor case). Otherwise stop rather than emit a
-    // patch that ignored the option.
+    // A deferred (unimplemented) diff option configures the *outer* diff, the
+    // diff-of-diffs, and nothing else: `add_diff_options()` binds the whole diff
+    // table to `diffopt` (builtin/range-diff.c:83) and only `--notes`,
+    // `--diff-merges` and `--remerge-diff` are `OPT_PASSTHRU_ARGV` into the
+    // inner `git log`. That outer diff is reached from exactly one place,
+    // `patch_diff()`, which `output()` calls only for a *matched* pair and only
+    // when the format is not `DIFF_FORMAT_NO_OUTPUT` (range-diff.c:567-573). So
+    // when no pair matched — or `-s` suppressed the bodies — not one byte of the
+    // page can depend on the option, and it is emitted exactly as upstream emits
+    // it. Otherwise stop rather than print a diff-of-diffs that ignored it.
+    let renders_a_body = !opts.no_patch && b.iter().any(|p| p.matching >= 0);
     if let Some(reason) = &opts.deferred {
-        if !(a.is_empty() || b.is_empty()) {
+        if renders_a_body {
             crate::git_fatal!("{reason}");
         }
     }
@@ -1056,10 +1494,20 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
     let mut rendered: Vec<u8> = Vec::new();
     output(&mut rendered, &mut a, &b, &opts)?;
 
-    let stdout = std::io::stdout();
-    let mut out = stdout.lock();
-    out.write_all(&rendered)?;
-    out.flush()?;
+    // Everything upstream writes — the pair headers included — goes to
+    // `diffopt.file`, which `--output=<file>` has replaced.
+    match opts.output.take() {
+        Some(mut file) => {
+            file.write_all(&rendered)?;
+            file.flush()?;
+        }
+        None => {
+            let stdout = std::io::stdout();
+            let mut out = stdout.lock();
+            out.write_all(&rendered)?;
+            out.flush()?;
+        }
+    }
     Ok(ExitCode::SUCCESS)
 }
 
@@ -1089,12 +1537,27 @@ pub(super) fn show_range_diff(
     notes_on: bool,
     out: &mut Vec<u8>,
 ) -> Result<std::result::Result<(), ExitCode>> {
+    // `get_notes_args()`: `format-patch` forwards a bare `--notes` (the default
+    // tree) or `--no-notes`, never an explicit ref.
+    let mut notes_opt = super::notes::DisplayOpt::default();
+    if notes_on {
+        notes_opt.enable_default();
+    }
+    notes_opt.given = true;
     let opts = Opts {
         creation_factor,
         left_only: false,
         right_only: false,
-        notes: notes_on,
+        notes: notes_opt,
         no_patch: false,
+        // `show_range_diff()` is reached from `log-tree.c`, which leaves
+        // `range_diff_opts` at its defaults.
+        max_memory: MAX_MEMORY_DEFAULT,
+        algorithm: Algorithm::Myers,
+        indent_heuristic: true,
+        context: 3,
+        indicators: [b'+', b'-', b' '],
+        output: None,
         abbrev: Abbrev::Default,
         deferred: None,
         // `format-patch --range-diff` embeds the range-diff in a patch, which is never
@@ -1111,19 +1574,14 @@ pub(super) fn show_range_diff(
     };
 
     let mailmap = repo.open_mailmap();
-    let notes = if opts.notes {
-        let mut opt = super::notes::DisplayOpt::default();
-        opt.enable_default();
-        opt.given = true;
-        super::notes::load_display(repo, &opt)?
-    } else {
-        Vec::new()
-    };
+    let notes = super::notes::load_display(repo, &opts.notes)?;
     let mut a = read_patches(repo, ends1, &mailmap, None, &opts.abbrev, &notes)?;
     let mut b = read_patches(repo, ends2, &mailmap, None, &opts.abbrev, &notes)?;
 
     find_exact_matches(&mut a, &mut b);
-    get_correspondences(&mut a, &mut b, opts.creation_factor);
+    if let Err(msg) = get_correspondences(&mut a, &mut b, opts.creation_factor, opts.max_memory) {
+        crate::git_fatal!("{msg}");
+    }
     output(out, &mut a, &b, &opts)?;
     Ok(Ok(()))
 }
@@ -1161,6 +1619,40 @@ fn log_parse_failed(range: &str) -> ExitCode {
 fn option_error(reason: &str) -> ExitCode {
     eprintln!("error: {reason}");
     ExitCode::from(129)
+}
+
+/// parse-options' required-value fetch for a long option: the attached
+/// `=<value>` if there is one, else the next argv element (consumed), else the
+/// 129 ``error: option `<name>' requires a value``.
+///
+/// `name` arrives spelled with its leading `--`, which the message drops.
+fn required_value(
+    args: &[String],
+    i: &mut usize,
+    name: &str,
+    inline: Option<&str>,
+) -> std::result::Result<String, ExitCode> {
+    if let Some(v) = inline {
+        return Ok(v.to_string());
+    }
+    *i += 1;
+    match args.get(*i) {
+        Some(v) => Ok(v.clone()),
+        None => Err(option_error(&format!(
+            "option `{}' requires a value",
+            name.trim_start_matches('-')
+        ))),
+    }
+}
+
+/// The bare `strerror` text of an I/O failure: Rust appends ` (os error <n>)` to
+/// the system message, which git's `%s` of `strerror(errno)` never prints.
+fn io_reason(e: &std::io::Error) -> String {
+    let text = e.to_string();
+    match text.find(" (os error ") {
+        Some(at) => text[..at].to_string(),
+        None => text,
+    }
 }
 
 /// The errno `git_parse_unsigned()` sets, which parse-options turns into two
@@ -1640,7 +2132,15 @@ fn ordered_commits(
     tips: Vec<ObjectId>,
     hidden: Vec<ObjectId>,
 ) -> Result<Vec<ObjectId>> {
-    let mut walk = repo.rev_walk(tips);
+    // `sort_in_topological_order()` is handed `revs->commits`, which
+    // `prepare_revision_walk()` has already sorted newest-commit-date-first, and
+    // the list index is what breaks a date tie in the ready set below. So the
+    // traversal has to be git's commit-date order, not gitoxide's default
+    // breadth-first — otherwise two commits sharing a second come out in graph
+    // order instead.
+    let mut walk = repo.rev_walk(tips).sorting(gix::revision::walk::Sorting::ByCommitTime(
+        gix::traverse::commit::simple::CommitTimeOrder::NewestFirst,
+    ));
     if !hidden.is_empty() {
         walk = walk.with_hidden(hidden);
     }
@@ -1745,18 +2245,22 @@ fn build_patch(
         text.push(b'\n');
     }
 
-    // ` ## Notes ##` — upstream generates each patch with `git log --notes`, so a
-    // note becomes part of the compared text, indented like the message and
-    // separated from it by a blank line.
+    // The notes blocks — upstream generates each patch with `git log`'s notes
+    // on, so a note becomes part of the compared text. `read_patches()` rewrites
+    // the header line of each block (range-diff.c:181-186): any in-header line
+    // that starts with `Notes` and ends with `:` becomes `\n\n ## <that line
+    // without its colon> ##\n`, which is what turns `Notes (alt):` into
+    // ` ## Notes (alt) ##`. Every other in-header line is kept only if it
+    // carries `git log`'s four-space indent, right-trimmed (range-diff.c:187-192).
     if !notes.is_empty() {
-        let note = super::notes::format_display(repo, notes, id, true)?;
-        if !note.is_empty() {
-            text.extend_from_slice(b"\n\n ## Notes ##\n");
-            for line in message_lines(gix::bstr::BStr::new(&note)) {
-                if !line.is_empty() {
-                    text.extend_from_slice(b"    ");
-                    text.extend_from_slice(&line);
-                }
+        let note = super::notes::format_display(repo, notes, id, false)?;
+        for line in note.split(|&b| b == b'\n') {
+            if line.starts_with(b"Notes") && line.last() == Some(&b':') {
+                text.extend_from_slice(b"\n\n ## ");
+                text.extend_from_slice(&line[..line.len() - 1]);
+                text.extend_from_slice(b" ##\n");
+            } else if line.starts_with(b"    ") {
+                text.extend_from_slice(trim_end_ws(line));
                 text.push(b'\n');
             }
         }
@@ -2201,10 +2705,31 @@ impl ConsumeHunk for LineCounter {
 }
 
 /// Build and solve the cost matrix, recording the resulting correspondences.
-fn get_correspondences(a: &mut [Patch], b: &mut [Patch], creation_factor: i64) {
+///
+/// `Err` is upstream's `die()` when the matrix would outgrow `max_memory`
+/// (range-diff.c:335-344) — raised *before* any pairing is computed, so it
+/// precedes the output even when one of the two ranges is empty.
+fn get_correspondences(
+    a: &mut [Patch],
+    b: &mut [Patch],
+    creation_factor: i64,
+    max_memory: u64,
+) -> std::result::Result<(), String> {
     let n = a.len() + b.len();
+    // `st_mult(sizeof(int), st_mult(n, n))`, compared with `>=` so a budget
+    // equal to the requirement is already too small.
+    let cost_bytes = COST_ELEMENT_SIZE * (n as u64) * (n as u64);
+    if cost_bytes >= max_memory {
+        return Err(format!(
+            "range-diff: unable to compute the range-diff, since it exceeds the \
+             maximum memory for the cost matrix: {} ({cost_bytes} bytes) needed, \
+             limited to {} ({max_memory} bytes)",
+            humanise(cost_bytes),
+            humanise(max_memory)
+        ));
+    }
     if n == 0 {
-        return;
+        return Ok(());
     }
     let mut cost = vec![0i64; n * n];
 
@@ -2255,6 +2780,34 @@ fn get_correspondences(a: &mut [Patch], b: &mut [Patch], creation_factor: i64) {
             a[i].matching = j;
             b[j as usize].matching = i as i64;
         }
+    }
+    Ok(())
+}
+
+/// `strbuf_humanise_bytes()` (`strbuf.c`), the `%s` of the `--max-memory` fatal:
+/// git's truncating fraction arithmetic and its `>` (not `>=`) unit boundaries,
+/// so `1048576` renders as `1024.00 KiB` and `1` as `1 byte`.
+//
+// NOTE: `index_pack.rs` carries a byte-identical private copy for its
+// `--max-input-size` fatal. Hoisting one of them into a shared module is the
+// right cleanup, but that is an edit outside this file.
+fn humanise(bytes: u64) -> String {
+    if bytes > 1 << 30 {
+        format!(
+            "{}.{:02} GiB",
+            bytes >> 30,
+            (bytes & ((1 << 30) - 1)) / 10_737_419
+        )
+    } else if bytes > 1 << 20 {
+        let x = bytes + 5243; // git's rounding nudge
+        format!("{}.{:02} MiB", x >> 20, ((x & ((1 << 20) - 1)) * 100) >> 20)
+    } else if bytes > 1 << 10 {
+        let x = bytes + 5;
+        format!("{}.{:02} KiB", x >> 10, ((x & ((1 << 10) - 1)) * 100) >> 10)
+    } else if bytes == 1 {
+        "1 byte".to_string()
+    } else {
+        format!("{bytes} bytes")
     }
 }
 
@@ -2538,7 +3091,7 @@ fn output(out: &mut Vec<u8>, a: &mut [Patch], b: &[Patch], opts: &Opts) -> Resul
             let ai = b[j].matching as usize;
             pair_header(out, patch_no_width, &mut dashes, Some(&a[ai]), Some(&b[j]), &opts.colors)?;
             if !opts.no_patch {
-                patch_diff(out, &a[ai].text, &b[j].text)?;
+                patch_diff(out, &a[ai].text, &b[j].text, opts)?;
             }
             a[ai].shown = true;
             j += 1;
@@ -2636,18 +3189,36 @@ fn decimal_width(mut number: u64) -> usize {
 
 /// The diff-of-diffs: four-space indented, no file headers, and a hunk header
 /// of `@@` plus the section name the `section_headers` driver finds.
-fn patch_diff(out: &mut Vec<u8>, a: &[u8], b: &[u8]) -> Result<()> {
+///
+/// Unlike [`diffsize`], this is the diff the user's `diff_options` configure —
+/// `--diff-algorithm`, `--no-indent-heuristic`, `-U<n>` and the three
+/// `--output-indicator-*` markers all land here and nowhere else.
+fn patch_diff(out: &mut Vec<u8>, a: &[u8], b: &[u8], opts: &Opts) -> Result<()> {
     let input = InternedInput::new(a, b);
-    let diff = diff_with_slider_heuristics(Algorithm::Myers, &input);
+    let diff = match opts.indent_heuristic {
+        true => diff_with_slider_heuristics(opts.algorithm, &input),
+        false => {
+            let mut d = Diff::compute(opts.algorithm, &input);
+            d.postprocess_no_heuristic(&input);
+            d
+        }
+    };
     let before: Vec<&[u8]> = input.before.iter().map(|&t| input.interner[t]).collect();
 
     let writer = OuterHunks {
         out,
         before,
+        indicators: opts.indicators,
         func_line: Vec::new(),
         funclineprev: -1,
     };
-    UnifiedDiff::new(&diff, &input, writer, ContextSize::symmetrical(3)).consume()?;
+    UnifiedDiff::new(
+        &diff,
+        &input,
+        writer,
+        ContextSize::symmetrical(opts.context),
+    )
+    .consume()?;
     Ok(())
 }
 
@@ -2656,6 +3227,9 @@ fn patch_diff(out: &mut Vec<u8>, a: &[u8], b: &[u8]) -> Result<()> {
 struct OuterHunks<'a> {
     out: &'a mut Vec<u8>,
     before: Vec<&'a [u8]>,
+    /// `o->output_indicators`, indexed by [`IND_NEW`] / [`IND_OLD`] /
+    /// [`IND_CONTEXT`].
+    indicators: [u8; 3],
     /// Deliberately *not* reset per hunk: `get_func_line()` only overwrites its
     /// buffer on a match, so a hunk with no match repeats the previous name.
     func_line: Vec<u8>,
@@ -2686,14 +3260,19 @@ impl ConsumeHunk for OuterHunks<'_> {
         self.out.push(b'\n');
 
         // `emit_line_0()` writes the prefix, the sign, then the record verbatim
-        // — the patch text always ends its lines, so nothing is appended.
+        // — the patch text always ends its lines, so nothing is appended. A NUL
+        // sign (the empty `--output-indicator-*` value) writes no column at all:
+        // `if (first) fputc(first, file)` (diff.c:786-787).
         for &(kind, content) in lines {
             self.out.extend_from_slice(INDENT);
-            self.out.push(match kind {
-                DiffLineKind::Context => b' ',
-                DiffLineKind::Add => b'+',
-                DiffLineKind::Remove => b'-',
-            });
+            let sign = self.indicators[match kind {
+                DiffLineKind::Context => IND_CONTEXT,
+                DiffLineKind::Add => IND_NEW,
+                DiffLineKind::Remove => IND_OLD,
+            }];
+            if sign != 0 {
+                self.out.push(sign);
+            }
             self.out.extend_from_slice(content);
             if !content.ends_with(b"\n") {
                 self.out.push(b'\n');

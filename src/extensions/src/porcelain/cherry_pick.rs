@@ -157,10 +157,19 @@
 //! ## Revision arguments
 //!
 //! Everything `setup_revisions()` accepts for the sequencer:
-//! `<commit>`, `^<commit>`, `<a>..<b>`, `<a>...<b>`, `<a>^!`, `<a>^@`, a leading
-//! `-` for `@{-1}`, and any mix of them in one command line —
-//! [`crate::sequencer::prepare_revs`] resolves the whole list through one
+//! `<commit>`, `^<commit>`, `<a>..<b>`, `<a>...<b>`, `<a>^!`, `<a>^@`,
+//! `<a>^-[<n>]`, a leading `-` for `@{-1}`, and any mix of them in one command
+//! line — [`crate::sequencer::prepare_revs`] resolves the whole list through one
 //! revision walk, exactly as git's does.
+//!
+//! The pseudo-revisions `handle_revision_pseudo_opt()` claims out of the same
+//! list are served too: `--not`, `--all`, `--branches[=<pattern>]`,
+//! `--tags[=<pattern>]`, `--remotes[=<pattern>]`, `--glob=<pattern>`,
+//! `--exclude=<pattern>` and `--single-worktree`. The rest of that function —
+//! `--bisect`, `--reflog`, `--indexed-objects`, `--alternate-refs`,
+//! `--no-walk[=<mode>]`, `--do-walk`, `--exclude-hidden=<section>`, `--stdin`,
+//! `--filter=<spec>` — and all of `handle_revision_opt()`'s walk options are
+//! not, so those reach stage 5 as unknown options where stock walks them.
 //!
 //! Refused with a precise message: `-e`/`--edit` and `-S`.
 //! The `-X` values `gix-merge` cannot express — the whitespace family,
@@ -354,10 +363,15 @@ impl Verb {
 /// Everything the command line established, in the shape the pipeline consumes.
 #[derive(Default)]
 struct Opts<'a> {
+    /// The operand list `setup_revisions()` gets, in command-line order.
+    ///
+    /// `PARSE_OPT_KEEP_UNKNOWN_OPT` keeps an option git's table does not contain
+    /// *in argv* rather than rejecting it, so an unknown dash argument lands
+    /// here beside the revisions. That placement is load-bearing:
+    /// `setup_revisions()` is what claims the pseudo-revisions (`--all`,
+    /// `--not`, …) out of this list, and only what it leaves behind is fatal, at
+    /// stage 5.
     specs: Vec<&'a str>,
-    /// An option git's table does not contain. Kept rather than rejected, and
-    /// only fatal once every revision has resolved (stage 5).
-    leftover_unknown: bool,
     verb: Option<Verb>,
     record_origin: bool,
     allow_ff: bool,
@@ -503,9 +517,10 @@ fn take_value<'a>(
 
 /// Walk the command line once, left to right, exactly like `parse_options`.
 ///
-/// Returns `Err(code)` for the errors that abort parsing immediately; unknown
-/// options are recorded in `leftover_unknown` instead, so that a later bad
-/// revision can outrank them.
+/// Returns `Err(code)` for the errors that abort parsing immediately; an
+/// unknown option is appended to [`Opts::specs`] instead, exactly where
+/// `PARSE_OPT_KEEP_UNKNOWN_OPT` leaves it in argv, so `setup_revisions()` gets
+/// its chance at it and a later bad revision can still outrank what is left.
 fn parse<'a>(args: &'a [String]) -> Result<Opts<'a>, ExitCode> {
     let mut o = Opts::default();
     let mut only_specs = false;
@@ -601,7 +616,8 @@ fn parse<'a>(args: &'a [String]) -> Result<Opts<'a>, ExitCode> {
             "--rerere-autoupdate" => o.rerere_auto = Some(true),
             "--no-rerere-autoupdate" => o.rerere_auto = Some(false),
 
-            _ if name.starts_with("--") => o.leftover_unknown = true,
+            // `PARSE_OPT_KEEP_UNKNOWN_OPT`: kept in argv for `setup_revisions()`.
+            _ if name.starts_with("--") => o.specs.push(arg),
 
             // Short options, including clusters like `-xn` and attached values
             // like `-Xtheirs` / `-m1` / `-S<keyid>`. A non-ASCII argument cannot
@@ -643,7 +659,9 @@ fn parse<'a>(args: &'a [String]) -> Result<Opts<'a>, ExitCode> {
                         // rejections. `revert` shares this table.
                         b'h' => return Err(super::show_usage(USAGE)),
                         _ => {
-                            o.leftover_unknown = true;
+                            // The whole cluster is kept as typed, letters
+                            // already consumed above included.
+                            o.specs.push(arg);
                             break;
                         }
                     }
@@ -652,7 +670,7 @@ fn parse<'a>(args: &'a [String]) -> Result<Opts<'a>, ExitCode> {
             }
 
             // Any other dashed argument: unknown, so kept for stage 5.
-            _ if name.len() > 1 && name.starts_with('-') => o.leftover_unknown = true,
+            _ if name.len() > 1 && name.starts_with('-') => o.specs.push(arg),
 
             _ => o.specs.push(arg),
         }
@@ -716,7 +734,7 @@ pub fn cherry_pick(args: &[String]) -> Result<ExitCode> {
     // `setup_revisions` handed back, so it outranks everything the sequencer
     // itself diagnoses below — an unknown option with an empty commit set is a
     // usage error (129), not `empty commit set passed` (128).
-    if opts.leftover_unknown || matches!(revs, crate::sequencer::Revs::UnknownOption) {
+    if matches!(revs, crate::sequencer::Revs::UnknownOption) {
         return Ok(usage());
     }
 
@@ -1396,11 +1414,20 @@ fn sequencer_failed_tail() -> ExitCode {
 /// Stage 2 of git's pipeline: a sequencer verb was given.
 fn handle_verb(verb: Verb, opts: &Opts<'_>) -> Result<ExitCode> {
     // git's `verify_opt_compatible`, in its declaration order.
+    //
+    // Its `"--strategy", opts->strategy ? 1 : 0` entry is dead and deliberately
+    // not reproduced. `run_sequencer` parses `--strategy` into a *local*
+    // `strategy` pointer (`builtin/revert.c:116,133`) and only copies it into
+    // `opts->strategy` at the tail, after the check
+    // (`builtin/revert.c:260-262`), so `opts->strategy` is still NULL when
+    // `verify_opt_compatible` reads it at `builtin/revert.c:211`. Stock 2.55.0
+    // therefore exits 0 for `git cherry-pick --strategy=ort --quit`; putting
+    // `--strategy` in this list made that a `fatal:` 128. `revert`'s copy of
+    // the list omits it for the same reason.
     for (name, given) in [
         ("--no-commit", opts.no_commit),
         ("--signoff", opts.signoff),
         ("--mainline", opts.mainline.is_some()),
-        ("--strategy", opts.strategy.is_some()),
         ("--strategy-option", !opts.xopts.is_empty()),
         ("-x", opts.record_origin),
         ("--ff", opts.allow_ff),
@@ -1532,7 +1559,6 @@ fn resume_todo(
         xopts,
         gpg_sign: false,
         specs: Vec::new(),
-        leftover_unknown: false,
         verb: None,
         // Reconstructed from `sequencer/opts`, which records the *effect* of the
         // original command line rather than its spelling. Only

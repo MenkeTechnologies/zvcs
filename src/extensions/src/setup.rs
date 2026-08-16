@@ -79,17 +79,44 @@ pub fn verify_non_filename(repo: &gix::Repository, arg: &str) -> Option<String> 
     ))
 }
 
-/// git's `looks_like_pathspec()` (setup.c): an argument that can only have been
-/// meant as a pathspec, whether or not anything by that name exists.
+/// git's `looks_like_pathspec()` (setup.c:232-260): an argument that can only have
+/// been meant as a pathspec, whether or not anything by that name exists.
 ///
-/// An unescaped glob special — `*`, `?`, `[` — says the caller means to *match*
-/// paths, so the argument need not exist on disk. Backslash is a glob special
-/// too, but on its own it only escapes the next character rather than widening
-/// the match, so it neither qualifies nor is skipped over blindly. A leading
-/// `:(` opens long-form pathspec magic, which nothing else spells.
+/// ```c
+/// for (p = arg; *p; p++) {
+///         if (escaped) {
+///                 escaped = 0;
+///         } else if (is_glob_special(*p)) {
+///                 if (*p == '\\')
+///                         escaped = 1;
+///                 else
+///                         return 1;
+///         }
+/// }
 ///
-/// A bare leading `:` is deliberately *not* enough: short-form magic such as
-/// `:/` is handled by [`check_filename`], which strips it and stats what is left.
+/// /* long-form pathspec magic */
+/// if (starts_with(arg, ":("))
+///         return 1;
+///
+/// return 0;
+/// ```
+///
+/// `is_glob_special()` is the `GIT_GLOB_SPECIAL` class of `sane_ctype`, which
+/// ctype.c:12 spells out as `*, ?, [, \\`. An unescaped `*`, `?` or `[` says the
+/// caller means to *match* paths, so the argument need not exist on disk.
+/// Backslash is in the class too, but the `if` above turns it into the escape flag
+/// instead of an accept — on its own it only escapes the next character rather
+/// than widening the match, so `a\*b` is a name, not a pattern.
+///
+/// The two conditions git checks are exactly these, and nothing else:
+///
+/// * A bare leading `:` is deliberately *not* enough. Short-form magic such as
+///   `:/`, `:!` and `:^` is handled by [`check_filename`] (setup.c:178-186), which
+///   strips it and stats what is left, so `:/nope` is a missing path rather than an
+///   accepted pathspec.
+/// * `:(` needs no closing `)` here. An unterminated `:(icase` is accepted by this
+///   function and rejected later, by the pathspec parser, with its own
+///   `Missing ')' at the end of pathspec magic` message.
 pub fn looks_like_pathspec(arg: &str) -> bool {
     let mut escaped = false;
     for b in arg.bytes() {
@@ -155,4 +182,59 @@ pub fn check_filename(arg: &str) -> bool {
         None => arg,
     };
     std::fs::symlink_metadata(path).is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{check_filename, looks_like_pathspec};
+
+    /// The whole of git's rule, one case per branch of setup.c:232-260. Every verb
+    /// that splits revisions from paths reads it from here, so a change that suits
+    /// one caller has to be defended against all of them.
+    #[test]
+    fn matches_the_rule_in_setup_c() {
+        // An unescaped glob special is a pattern, existing or not.
+        assert!(looks_like_pathspec("no*pe"));
+        assert!(looks_like_pathspec("a?b"));
+        assert!(looks_like_pathspec("a[bc]"));
+        // Backslash is `GIT_GLOB_SPECIAL` too, but it escapes rather than accepts.
+        assert!(!looks_like_pathspec(r"a\*b"));
+        assert!(!looks_like_pathspec(r"a\"));
+        assert!(looks_like_pathspec(r"a\\*b"), "the escape is consumed by the second backslash");
+        // Long-form magic, with or without its closing paren: git checks only the
+        // two-byte prefix and leaves `Missing ')'` to the pathspec parser.
+        assert!(looks_like_pathspec(":(top)nope"));
+        assert!(looks_like_pathspec(":(icase"));
+        assert!(looks_like_pathspec(":("));
+        // Short-form magic is *not* long-form magic; `check_filename` stats it.
+        assert!(!looks_like_pathspec(":/nope"));
+        assert!(!looks_like_pathspec(":!nope"));
+        assert!(!looks_like_pathspec(":^nope"));
+        assert!(!looks_like_pathspec(":nope"));
+        assert!(!looks_like_pathspec(":"));
+        // Plain names are plain names.
+        assert!(!looks_like_pathspec("README.md"));
+        assert!(!looks_like_pathspec(""));
+    }
+
+    /// The other half of the pair: what [`looks_like_pathspec`] declines,
+    /// `check_filename()` decides by stripping short magic and stating the rest. A
+    /// bare `:/` (the repository root) and a bare `:!`/`:^` (excluding everything)
+    /// are present without a lookup, which is why `git backfill README.md :/` exits
+    /// 0 in a repository that has no file named `:/`.
+    #[test]
+    fn check_filename_strips_short_magic_before_stating() {
+        assert!(check_filename(":/"));
+        assert!(check_filename(":!"));
+        assert!(check_filename(":^"));
+        assert!(!check_filename(":/definitely-not-present"));
+        assert!(!check_filename(":!definitely-not-present"));
+        assert!(!check_filename(":^definitely-not-present"));
+        // No magic to strip, so the whole argument is stated as-is.
+        assert!(!check_filename(":definitely-not-present"));
+        assert!(!check_filename("definitely-not-present"));
+        // An empty argument reaches the stat and fails it — `:/` gets an exemption,
+        // `""` does not, which is why `git grep --no-index <pat> ""` is fatal.
+        assert!(!check_filename(""));
+    }
 }

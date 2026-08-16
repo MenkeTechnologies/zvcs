@@ -129,9 +129,10 @@ pub enum Revs {
         name: String,
         kind: gix::object::Kind,
     },
-    /// A dash operand git's option table did not know. `setup_revisions()` keeps
-    /// it and `run_sequencer()` reports it as the usage block with status 129
-    /// once the whole list is scanned, so a bad revision anywhere outranks it.
+    /// A dash operand neither git's option table nor
+    /// `handle_revision_pseudo_opt()` knew. `setup_revisions()` keeps it and
+    /// `run_sequencer()` reports it as the usage block with status 129 once the
+    /// whole list is scanned, so a bad revision anywhere outranks it.
     UnknownOption,
 }
 
@@ -166,34 +167,40 @@ pub enum Revs {
 /// `argv[1]` alone, so a `-` anywhere else stays an unrecognized option.
 ///
 /// The ranges are split here and everything else goes through `gix`'s rev-spec
-/// parser, which covers `^<commit>` and the `<a>^!`/`<a>^@` parent spellings.
-/// Two `handle_revision_arg` spellings stay unserved and are reported as
-/// refusals rather than approximated: `<a>^-[<n>]` (`gix` does not parse it, so
-/// it is a bad revision here while stock picks `<a>^..<a>`), and the
-/// `--not`/`--all` pseudo-revisions, which reach this port as unknown options.
+/// parser, which covers `^<commit>`, the `<a>^!`/`<a>^@` parent spellings and
+/// `<a>^-[<n>]` — reported as a `Range`, the same `<a>^<n>..<a>` pair
+/// `add_parents_only()` builds.
+///
+/// A dash-prefixed operand is offered to [`pseudo_opt`] first, as
+/// `setup_revisions()` offers it to `handle_revision_pseudo_opt()`; whatever
+/// that does not claim stays an unrecognized option for `run_sequencer()`. The
+/// *other* half of the dash arguments git accepts here — `handle_revision_opt`'s
+/// `--reverse`, `--max-count`, the grep and date filters — is still unserved, so
+/// those reach this port as unknown options where stock walks them.
 pub fn prepare_revs<S: AsRef<str>>(
     repo: &gix::Repository,
     specs: &[S],
     action: Action,
 ) -> Result<Revs> {
-    let mut include: Vec<ObjectId> = Vec::new();
-    let mut exclude: Vec<ObjectId> = Vec::new();
-    let mut walked = false;
+    let mut pending = Pending::default();
+    let mut state = RevState::default();
     let mut unknown_option = false;
-    // `single_pick()`'s test is on the command line, not on the selection:
-    // `cmdline.nr == 1 && whence == REV_CMD_REV && no_walk && !flags`. Only a
-    // plain `<commit>` operand carries `REV_CMD_REV`, so a `^`, a range or a
-    // parent spelling disqualifies it however few commits it ends up naming.
-    let mut plain_operands = 0usize;
 
-    for (n, spec) in specs.iter().enumerate() {
-        let spec = spec.as_ref();
+    let mut n = 0usize;
+    while n < specs.len() {
+        let spec = specs[n].as_ref();
         let spec = if n == 0 && spec == "-" { "@{-1}" } else { spec };
-        // A dash-prefixed operand is not a revision: git keeps it as an
-        // unrecognized option and only reports it once the whole list is
-        // scanned, so a later bad revision still wins.
+        n += 1;
+        // `if (!seen_end_of_options && *arg == '-')`: a dash operand is never a
+        // revision. What `handle_revision_pseudo_opt()` claims is consumed here;
+        // the rest git keeps and only reports once the whole list is scanned, so
+        // a later bad revision still wins.
         if spec.starts_with('-') {
-            unknown_option = true;
+            match pseudo_opt(repo, spec, specs.get(n).map(AsRef::as_ref), &mut state, &mut pending)? {
+                Pseudo::Handled(extra) => n += extra,
+                Pseudo::Unknown => unknown_option = true,
+                Pseudo::NotACommit { name, kind } => return Ok(Revs::NotACommit { name, kind }),
+            }
             continue;
         }
 
@@ -207,12 +214,13 @@ pub fn prepare_revs<S: AsRef<str>>(
                 }
                 _ => return Ok(Revs::BadRevision(spec.to_owned())),
             };
+            // `handle_dotdot_1()`'s symmetric arm: the merge bases take
+            // `flags_exclude`, both tips take `flags`.
             for base in repo.merge_bases_many(left, &[right])? {
-                exclude.push(base.detach());
-                walked = true;
+                pending.add(base.detach(), !state.uninteresting);
             }
-            include.push(left);
-            include.push(right);
+            pending.add(left, state.uninteresting);
+            pending.add(right, state.uninteresting);
             continue;
         }
 
@@ -220,9 +228,8 @@ pub fn prepare_revs<S: AsRef<str>>(
         if let Some((lhs, rhs)) = spec.split_once("..") {
             match (peel_side(repo, lhs), peel_side(repo, rhs)) {
                 (Side::Commit(from), Side::Commit(to)) => {
-                    exclude.push(from);
-                    include.push(to);
-                    walked = true;
+                    pending.add(from, !state.uninteresting);
+                    pending.add(to, state.uninteresting);
                 }
                 (Side::NotACommit(name, kind), _) | (_, Side::NotACommit(name, kind)) => {
                     return Ok(Revs::NotACommit { name, kind })
@@ -232,51 +239,83 @@ pub fn prepare_revs<S: AsRef<str>>(
             continue;
         }
 
-        let Ok(parsed) = repo.rev_parse(spec) else {
+        // `handle_revision_arg_1`'s `local_flags`, applied *after* the `^!`,
+        // `^@` and `^-` marks are handled: a leading `^` inverts the sense of
+        // this one operand and is then stripped. Doing it here rather than
+        // leaning on `gix`'s `Spec::Exclude` is what serves `^<a>^-<n>`, which
+        // git's own `rev-parse` rejects but `setup_revisions()` accepts —
+        // `add_parents_only()` strips the same `^` a second time, so the parent
+        // stays interesting while `<a>` does not.
+        //
+        // The stripped word is what resolves; every diagnostic still quotes the
+        // operand as it was typed, which is what `die("bad revision '%s'", arg)`
+        // does with its untouched `arg`.
+        let (word, uninteresting) = match spec.strip_prefix('^') {
+            Some(rest) if !rest.is_empty() => (rest, !state.uninteresting),
+            _ => (spec, state.uninteresting),
+        };
+        let Ok(parsed) = repo.rev_parse(word) else {
             return Ok(Revs::BadRevision(spec.to_owned()));
         };
         match *parsed {
             gix::revision::plumbing::Spec::Include(id) => match peel_id(repo, id) {
-                Side::Commit(id) => {
-                    include.push(id);
-                    plain_operands += 1;
-                }
+                Side::Commit(id) => pending.add_rev(id, uninteresting),
                 Side::NotACommit(_, kind) => {
                     return Ok(Revs::NotACommit { name: spec.to_owned(), kind })
                 }
                 Side::Unresolved => return Ok(Revs::BadRevision(spec.to_owned())),
             },
+            // `gix` reports a leading `^` itself when the word survived the strip
+            // above — an operand that is nothing but `^`.
             gix::revision::plumbing::Spec::Exclude(id) => match peel_id(repo, id) {
-                Side::Commit(id) => {
-                    exclude.push(id);
-                    walked = true;
-                }
+                Side::Commit(id) => pending.add_rev(id, !uninteresting),
                 Side::NotACommit(_, kind) => {
                     return Ok(Revs::NotACommit { name: spec.to_owned(), kind })
                 }
                 Side::Unresolved => return Ok(Revs::BadRevision(spec.to_owned())),
             },
             // `<a>^!`: `<a>` itself, with everything its parents reach excluded.
+            // `add_parents_only()` queues the parents first and `<a>` is added
+            // afterwards from the trimmed argument, which is the order git's
+            // `pending` ends up in.
             gix::revision::plumbing::Spec::ExcludeParents(id) => {
                 let Side::Commit(id) = peel_id(repo, id) else {
                     return Ok(Revs::BadRevision(spec.to_owned()));
                 };
-                include.push(id);
                 for parent in repo.find_commit(id)?.parent_ids() {
-                    exclude.push(parent.detach());
-                    walked = true;
+                    pending.add(parent.detach(), !uninteresting);
                 }
+                pending.add_rev(id, uninteresting);
             }
-            // `<a>^@`: every parent of `<a>`, but not `<a>`.
+            // `<a>^@`: every parent of `<a>`, but not `<a>`. `add_parents_only()`
+            // succeeded, so `handle_revision_arg_1` returns before `<a>` is ever
+            // added and every entry is a `REV_CMD_PARENTS_ONLY` one.
             gix::revision::plumbing::Spec::IncludeOnlyParents(id) => {
                 let Side::Commit(id) = peel_id(repo, id) else {
                     return Ok(Revs::BadRevision(spec.to_owned()));
                 };
-                include.extend(repo.find_commit(id)?.parent_ids().map(|p| p.detach()));
+                for parent in repo.find_commit(id)?.parent_ids() {
+                    pending.add(parent.detach(), uninteresting);
+                }
             }
-            // The range spellings are handled above; `gix` can only produce these
-            // for an operand that reached neither branch, which it cannot.
-            gix::revision::plumbing::Spec::Range { .. } | gix::revision::plumbing::Spec::Merge { .. } => {
+            // `<a>^-<n>`: parent `<n>` of `<a>` excluded, `<a>` itself included —
+            // `add_parents_only(…, flags ^ (UNINTERESTING | BOTTOM), n)` followed
+            // by `<a>` at the plain flags. `gix` reports that pair as the range
+            // `<a>^<n>..<a>`, and rejects the spellings git rejects: `^-0`, a
+            // non-numeric suffix, and an `<n>` past the parent count all come
+            // back as a bad revision.
+            gix::revision::plumbing::Spec::Range { from, to } => {
+                let (Side::Commit(from), Side::Commit(to)) =
+                    (peel_id(repo, from), peel_id(repo, to))
+                else {
+                    return Ok(Revs::BadRevision(spec.to_owned()));
+                };
+                pending.add(from, !uninteresting);
+                pending.add_rev(to, uninteresting);
+            }
+            // `<a>...<b>` is split textually above, so `gix` can only produce
+            // this for an operand that reached neither branch, which it cannot.
+            gix::revision::plumbing::Spec::Merge { .. } => {
                 return Ok(Revs::BadRevision(spec.to_owned()))
             }
         }
@@ -286,11 +325,13 @@ pub fn prepare_revs<S: AsRef<str>>(
         return Ok(Revs::UnknownOption);
     }
 
+    let Pending { mut include, exclude, walked, cmdline, plain } = pending;
+
     if !walked {
         // `add_pending_object()` sets `SEEN`, so an operand named twice is
-        // replayed once — but the operand count above was read before this, as
-        // git reads `cmdline.nr`.
-        let sequencer = !(specs.len() == 1 && plain_operands == 1);
+        // replayed once — but `cmdline.nr` was counted before this, as git reads
+        // it off the command line rather than off the selection.
+        let sequencer = !(cmdline == 1 && plain == 1);
         let mut seen = std::collections::HashSet::new();
         include.retain(|id| seen.insert(*id));
         return Ok(Revs::Picks { commits: include, sequencer });
@@ -314,6 +355,311 @@ pub fn prepare_revs<S: AsRef<str>>(
     }
     // A walked selection always runs through the sequencer, even at length 1.
     Ok(Revs::Picks { commits, sequencer: true })
+}
+
+/// `revs->pending` as this port needs it: the tips to walk from, the ones to
+/// stop at, and the two counters `sequencer_pick_revisions()` reads off the
+/// command line rather than off the selection.
+#[derive(Default)]
+struct Pending {
+    include: Vec<ObjectId>,
+    exclude: Vec<ObjectId>,
+    /// `revs->no_walk`, inverted. `add_pending_object_with_path()` clears
+    /// `no_walk` the first time an UNINTERESTING object is queued, so the
+    /// *sense* an operand ends up with, not its spelling, turns the walk on.
+    walked: bool,
+    /// `revs->cmdline.nr`, which counts revisions rather than operands: a range
+    /// contributes two, `<a>^!` one per parent plus the commit, `--all` one per
+    /// ref.
+    cmdline: usize,
+    /// How many of those entries carry `REV_CMD_REV` — the whence a plain
+    /// `<commit>` or `^<commit>` operand gets. `single_pick()` needs
+    /// `cmdline.nr == 1` *and* that one entry to be one of those, which is why
+    /// `git cherry-pick --tags` writes a `.git/sequencer` even in a repository
+    /// with exactly one tag.
+    plain: usize,
+}
+
+impl Pending {
+    /// `add_rev_cmdline(…, REV_CMD_REV, …)` + `add_pending_object()`.
+    fn add_rev(&mut self, id: ObjectId, uninteresting: bool) {
+        self.add(id, uninteresting);
+        self.plain += 1;
+    }
+
+    /// `add_pending_object()` under any other whence.
+    fn add(&mut self, id: ObjectId, uninteresting: bool) {
+        self.cmdline += 1;
+        if uninteresting {
+            self.exclude.push(id);
+            self.walked = true;
+        } else {
+            self.include.push(id);
+        }
+    }
+}
+
+/// What the pseudo-revision arguments accumulate as `setup_revisions()` walks
+/// the command line.
+#[derive(Default)]
+struct RevState {
+    /// `flags & UNINTERESTING`, flipped by every `--not` and applied to every
+    /// operand *after* it — which is why `--not <a> <b>` selects nothing while
+    /// `<a> --not <b>` is `<a> ^<b>`.
+    uninteresting: bool,
+    /// `revs->ref_excludes`: the `--exclude=<glob>` patterns waiting for the
+    /// next ref selector, which consumes them and then calls
+    /// `clear_ref_exclusions()`.
+    excludes: Vec<String>,
+    /// `revs->single_worktree`, which keeps `--all` from reaching the other
+    /// worktrees' `HEAD`s.
+    single_worktree: bool,
+}
+
+/// What [`pseudo_opt`] made of a dash operand.
+enum Pseudo {
+    /// Claimed, along with this many *following* arguments — one for the
+    /// detached `--glob <pattern>` / `--exclude <pattern>` spelling.
+    Handled(usize),
+    /// `handle_revision_pseudo_opt()` returned 0: not a pseudo-revision, so
+    /// `setup_revisions()` keeps it for `run_sequencer()`'s `argc > 1` usage
+    /// check.
+    Unknown,
+    /// A ref naming something that is not commit-ish.
+    NotACommit { name: String, kind: gix::object::Kind },
+}
+
+/// `handle_revision_pseudo_opt()`, restricted to the ref-selecting arguments and
+/// `--not`.
+///
+/// `--bisect`, `--reflog`, `--indexed-objects`, `--alternate-refs`,
+/// `--no-walk[=<mode>]`, `--do-walk`, `--exclude-hidden=<section>`, `--stdin`
+/// and `--filter=<spec>` are not served and stay unknown options here.
+fn pseudo_opt(
+    repo: &gix::Repository,
+    arg: &str,
+    next: Option<&str>,
+    state: &mut RevState,
+    pending: &mut Pending,
+) -> Result<Pseudo> {
+    // `parse_long_opt()` takes `--opt=<value>` and `--opt <value>` alike; only
+    // the detached spelling consumes a following argument.
+    let long_opt = |name: &str| -> Option<(String, usize)> {
+        if let Some(value) = arg.strip_prefix(&format!("--{name}=")) {
+            return Some((value.to_owned(), 0));
+        }
+        if arg == format!("--{name}") {
+            return next.map(|value| (value.to_owned(), 1));
+        }
+        None
+    };
+
+    // Every `handle_refs()` arm ends in `clear_ref_exclusions()`, so one
+    // `--exclude` applies to the next ref selector and to nothing after it.
+    let mut select = |prefix: Option<&str>, pattern: Option<&str>| -> Result<Option<Pseudo>> {
+        let refused = handle_refs(repo, prefix, pattern, state, pending)?;
+        state.excludes.clear();
+        Ok(refused.map(|(name, kind)| Pseudo::NotACommit { name, kind }))
+    };
+
+    match arg {
+        "--all" => {
+            if let Some(refused) = select(None, None)? {
+                return Ok(refused);
+            }
+            // `refs_head_ref()` — `HEAD` is not part of the `refs/` iteration —
+            // and then the other worktrees' `HEAD`s. An unborn `HEAD` resolves to
+            // nothing and adds nothing, as `refs_read_ref_full()` fails for it.
+            if let Some(id) = repo.head_id().ok().map(|id| id.detach()) {
+                match peel_id(repo, id) {
+                    Side::Commit(id) => pending.add(id, state.uninteresting),
+                    Side::NotACommit(_, kind) => {
+                        return Ok(Pseudo::NotACommit { name: "HEAD".into(), kind })
+                    }
+                    Side::Unresolved => {}
+                }
+            }
+            if !state.single_worktree {
+                for wt in repo.worktrees().unwrap_or_default() {
+                    // `wt->is_current`: the worktree we are already in is the
+                    // `HEAD` just added.
+                    if wt.git_dir() == repo.git_dir() {
+                        continue;
+                    }
+                    let name = format!("worktrees/{}/HEAD", wt.id());
+                    let Ok(linked) = wt.into_repo() else {
+                        continue;
+                    };
+                    let Ok(id) = linked.head_id().map(|id| id.detach()) else {
+                        continue;
+                    };
+                    match peel_id(repo, id) {
+                        Side::Commit(id) => pending.add(id, state.uninteresting),
+                        Side::NotACommit(_, kind) => {
+                            return Ok(Pseudo::NotACommit { name, kind })
+                        }
+                        Side::Unresolved => {}
+                    }
+                }
+            }
+        }
+        "--branches" => {
+            if let Some(refused) = select(Some("refs/heads/"), None)? {
+                return Ok(refused);
+            }
+        }
+        "--tags" => {
+            if let Some(refused) = select(Some("refs/tags/"), None)? {
+                return Ok(refused);
+            }
+        }
+        "--remotes" => {
+            if let Some(refused) = select(Some("refs/remotes/"), None)? {
+                return Ok(refused);
+            }
+        }
+        "--not" => state.uninteresting = !state.uninteresting,
+        "--single-worktree" => state.single_worktree = true,
+        _ => {
+            // `--branches=`/`--tags=`/`--remotes=` are `skip_prefix()` tests, so
+            // only `--glob` and `--exclude` accept the detached value spelling.
+            for (name, prefix) in [
+                ("branches", Some("refs/heads/")),
+                ("tags", Some("refs/tags/")),
+                ("remotes", Some("refs/remotes/")),
+                ("glob", None),
+            ] {
+                if let Some((pattern, extra)) = long_opt(name) {
+                    if extra > 0 && name != "glob" {
+                        return Ok(Pseudo::Unknown);
+                    }
+                    if let Some(refused) = select(prefix, Some(&pattern))? {
+                        return Ok(refused);
+                    }
+                    return Ok(Pseudo::Handled(extra));
+                }
+            }
+            if let Some((pattern, extra)) = long_opt("exclude") {
+                state.excludes.push(pattern);
+                return Ok(Pseudo::Handled(extra));
+            }
+            return Ok(Pseudo::Unknown);
+        }
+    }
+    Ok(Pseudo::Handled(0))
+}
+
+/// `handle_refs()` + `handle_one_ref()`: queue every ref the iterator yields, in
+/// refname order, minus the `--exclude=<glob>` matches.
+///
+/// `prefix` is the `refs_for_each_{branch,tag,remote}_ref()` prefix, and git
+/// *trims* it off the name the callback sees. That is observable: the exclusions
+/// are matched against the trimmed name, so `--exclude=side` is what skips a
+/// branch under `--branches` while `--all` needs `--exclude=refs/heads/side`.
+///
+/// A ref whose object is missing is skipped; git's `get_reference()` dies on
+/// one, which is a repository-corruption path this port does not reproduce.
+fn handle_refs(
+    repo: &gix::Repository,
+    prefix: Option<&str>,
+    pattern: Option<&str>,
+    state: &RevState,
+    pending: &mut Pending,
+) -> Result<Option<(String, gix::object::Kind)>> {
+    let real = pattern.map(|pattern| ref_pattern(prefix, pattern));
+    let platform = repo.references()?;
+    let iter = match prefix {
+        Some(prefix) => platform.prefixed(prefix.as_bytes())?,
+        None => platform.all()?,
+    };
+    // Materialise first: the iterator holds the packed-refs buffer, which the
+    // symref resolution below needs too.
+    let mut refs: Vec<(String, String, Option<ObjectId>)> = Vec::new();
+    for r in iter {
+        let r = r.map_err(|e| anyhow::anyhow!("{e}"))?;
+        let full = r.name().as_bstr().to_string();
+        // The pattern always matches the *full* name; only the callback sees the
+        // trimmed one.
+        if real.as_deref().is_some_and(|real| !wildmatch0(real, &full)) {
+            continue;
+        }
+        let name = match prefix {
+            Some(prefix) => full[prefix.len()..].to_owned(),
+            None => full.clone(),
+        };
+        if ref_excluded(&state.excludes, &name) {
+            continue;
+        }
+        let id = match r.target() {
+            gix::refs::TargetRef::Object(id) => Some(id.to_owned()),
+            gix::refs::TargetRef::Symbolic(_) => None,
+        };
+        refs.push((full, name, id));
+    }
+
+    for (full, name, id) in refs {
+        // `RESOLVE_REF_READING`: a symref is followed to the first object, but an
+        // annotated tag is left as the tag it is — the sequencer peels.
+        let id = match id {
+            Some(id) => id,
+            None => match repo
+                .find_reference(full.as_str())
+                .ok()
+                .and_then(|mut r| r.follow_to_object().ok())
+            {
+                Some(id) => id.detach(),
+                None => continue,
+            },
+        };
+        match peel_id(repo, id) {
+            Side::Commit(id) => pending.add(id, state.uninteresting),
+            Side::NotACommit(_, kind) => return Ok(Some((name, kind))),
+            Side::Unresolved => continue,
+        }
+    }
+    Ok(None)
+}
+
+/// `has_glob_specials()`.
+fn has_glob_specials(pattern: &str) -> bool {
+    pattern.bytes().any(|b| matches!(b, b'*' | b'?' | b'['))
+}
+
+/// `refs_for_each_ref_ext()`'s pattern normalisation: a pattern without a prefix
+/// that does not already name a `refs/` path is rooted there, and one with no
+/// glob character selects everything *below* it. That second rule is why
+/// `--glob=refs/heads/side` — which becomes `refs/heads/side/*` — matches
+/// nothing at all while `--glob=refs/heads/sid*` matches the branch.
+fn ref_pattern(prefix: Option<&str>, pattern: &str) -> String {
+    let mut real = String::new();
+    match prefix {
+        Some(prefix) => real.push_str(prefix),
+        None if !pattern.starts_with("refs/") => real.push_str("refs/"),
+        None => {}
+    }
+    real.push_str(pattern);
+    if !has_glob_specials(pattern) {
+        if !real.ends_with('/') {
+            real.push('/');
+        }
+        real.push('*');
+    }
+    real
+}
+
+/// `wildmatch(pattern, text, 0)`: no `WM_PATHNAME`, so `*` spans `/` too.
+fn wildmatch0(pattern: &str, text: &str) -> bool {
+    gix::glob::wildmatch(
+        gix::bstr::BStr::new(pattern.as_bytes()),
+        gix::bstr::BStr::new(text.as_bytes()),
+        gix::glob::wildmatch::Mode::empty(),
+    )
+}
+
+/// `ref_excluded()`, minus the `--exclude-hidden=` half this port does not
+/// serve.
+fn ref_excluded(excludes: &[String], name: &str) -> bool {
+    excludes.iter().any(|pattern| wildmatch0(pattern, name))
 }
 
 /// What one revision word resolved to.

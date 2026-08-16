@@ -6,6 +6,14 @@ use crate::commit::{
     topo::{Error, Sorting, WalkFlags, iter::gen_and_commit_time},
 };
 
+/// Drop repeated ids, keeping the first mention of each — the order git's pending list has after
+/// its `SEEN` flag is applied. Order is load-bearing: it decides the seed order of the topological
+/// queue and therefore how commits sharing a commit date come out.
+fn dedup_first_wins(ids: &mut Vec<ObjectId>) {
+    let mut seen = gix_hashtable::HashSet::<ObjectId>::default();
+    ids.retain(|id| seen.insert(*id));
+}
+
 /// Builder for [`Topo`].
 pub struct Builder<Find, Predicate> {
     commit_graph: Option<gix_commitgraph::Graph>,
@@ -109,7 +117,19 @@ where
     /// Build a new [`Topo`] instance.
     ///
     /// Note that merely building an instance is currently expensive.
-    pub fn build(self) -> Result<Topo<Find, Predicate>, Error> {
+    pub fn build(mut self) -> Result<Topo<Find, Predicate>, Error> {
+        // git's `SEEN` flag: `prepare_revision_walk()` walks `revs->pending` and only inserts a
+        // commit into `revs->commits` the first time it meets it, so naming the same commit twice
+        // — two refs on one tip, `--all` next to an explicit branch, or a literal
+        // `rev-list --topo-order main main` — contributes exactly one entry. Deduplicating here
+        // rather than at each call site is what keeps `sort_in_topological_order`'s invariants
+        // intact: a repeated seed used to be pushed onto `topo_queue` twice (yielding the commit
+        // twice) *and* to be walked twice by `indegree_walk_step`, which bumped every parent's
+        // indegree once too often and could strand it below the `== 1` gate in
+        // `expand_topo_walk`.
+        dedup_first_wins(&mut self.tips);
+        dedup_first_wins(&mut self.ends);
+
         let mut w = Topo {
             commit_graph: self.commit_graph,
             find: self.find,
@@ -136,6 +156,15 @@ where
             .map(|id| (id, tip_flags))
             .chain(self.ends.iter().map(|id| (id, end_flags)))
         {
+            // The same commit named as a tip *and* as an end — `rev-list --topo-order main ^main`,
+            // or an `--all` that re-adds an excluded ref. git ORs `UNINTERESTING` onto the object
+            // it already saw and leaves the queues alone; queueing it a second time here would
+            // double-count its parents' indegrees just like a repeated tip would.
+            if let Some(state) = w.states.get_mut(id) {
+                *state |= flags;
+                continue;
+            }
+
             *w.indegrees.entry(*id).or_default() = 1;
             let commit = find(w.commit_graph.as_ref(), &w.find, id, &mut w.buf)?;
             let (generation, time) = gen_and_commit_time(commit)?;

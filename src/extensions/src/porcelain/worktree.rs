@@ -309,7 +309,7 @@ fn rtrim(bytes: &[u8]) -> &[u8] {
     &bytes[..end]
 }
 
-fn path_to_string(p: &Path) -> String {
+pub(super) fn path_to_string(p: &Path) -> String {
     gix::path::into_bstr(p).to_str_lossy().into_owned()
 }
 
@@ -1955,6 +1955,88 @@ fn resolve_start(
             }
         }
     }
+}
+
+/// `branch_checked_out()` (branch.c): the path of the worktree that holds
+/// `refname`, or `None` when no worktree does. `git branch -d` reports it as
+/// `used by worktree at '<path>'`, so the path is git's `wt->path` —
+/// `get_main_worktree()`'s `real_path(get_git_common_dir())` with a trailing
+/// `/.git` cut off for the main worktree, and the (realpath'd, `/.git`-stripped)
+/// content of `worktrees/<id>/gitdir` for a linked one. Both are absolute
+/// regardless of how the repository was discovered, which is what `collect()`
+/// already computes for `git worktree list`.
+///
+/// `prepare_checked_out_branches()` fills the map from three sources per
+/// worktree — the branch `HEAD` names, the branch an interrupted rebase will
+/// return to, and the branch a bisect started from — and skips a bare worktree
+/// entirely, which is why deleting the branch a bare repository's `HEAD` names
+/// is allowed. Later worktrees overwrite earlier ones for the same branch
+/// (`strmap_put()`), so the last match wins.
+///
+/// Not covered: the sequencer's `update-refs` state, git's fourth source, which
+/// would need `rebase --update-refs`' file format parsed.
+pub(super) fn branch_checked_out(repo: &gix::Repository, refname: &str) -> Result<Option<PathBuf>> {
+    let common = gix::path::realpath(repo.common_dir())?;
+    let mut found = None;
+    for wt in collect(repo, u64::MAX)? {
+        if wt.is_bare {
+            continue;
+        }
+        // `get_worktree_git_dir()`: the common dir for the main worktree, the
+        // administrative directory for a linked one.
+        let wt_gitdir = match &wt.id {
+            Some(id) => common.join("worktrees").join(id),
+            None => common.clone(),
+        };
+
+        if let HeadInfo::Branch { name, .. } = &wt.head {
+            if name.as_bstr() == refname {
+                found = Some(wt.path.clone());
+            }
+        }
+        // `wt_status_check_rebase()`: `rebase-apply` without `applying` is a
+        // rebase (with it, an `am`, which records no branch), `rebase-merge` is
+        // one either way. Both keep the original branch in `head-name`.
+        let rebase_head_name = if wt_gitdir.join("rebase-apply").is_dir() {
+            (!wt_gitdir.join("rebase-apply/applying").exists())
+                .then(|| wt_gitdir.join("rebase-apply/head-name"))
+        } else if wt_gitdir.join("rebase-merge").is_dir() {
+            Some(wt_gitdir.join("rebase-merge/head-name"))
+        } else {
+            None
+        };
+        if let Some(branch) = rebase_head_name.and_then(|p| state_branch(&p)) {
+            if format!("refs/heads/{branch}") == refname {
+                found = Some(wt.path.clone());
+            }
+        }
+        // `wt_status_check_bisect()`: `BISECT_LOG` marks a bisect in progress and
+        // `BISECT_START` names what it started from.
+        if wt_gitdir.join("BISECT_LOG").exists() {
+            if let Some(branch) = state_branch(&wt_gitdir.join("BISECT_START")) {
+                if format!("refs/heads/{branch}") == refname {
+                    found = Some(wt.path.clone());
+                }
+            }
+        }
+    }
+    Ok(found)
+}
+
+/// `get_branch()` (wt-status.c): read a state file naming a branch, trim its
+/// trailing newlines and shorten a `refs/heads/` target. An empty file, or the
+/// `detached HEAD` a rebase off a detached `HEAD` records, names no branch;
+/// anything else (another `refs/` ref, an object id, a bisect's free-form start)
+/// is returned as-is, which simply fails to match a `refs/heads/` name later.
+fn state_branch(path: &Path) -> Option<String> {
+    let raw = std::fs::read(path).ok()?;
+    let text = String::from_utf8_lossy(raw.as_slice())
+        .trim_end_matches('\n')
+        .to_owned();
+    if text.is_empty() || text == "detached HEAD" {
+        return None;
+    }
+    Some(text.strip_prefix("refs/heads/").unwrap_or(&text).to_owned())
 }
 
 /// The worktree whose `HEAD` already points at `branch`, if any — git's

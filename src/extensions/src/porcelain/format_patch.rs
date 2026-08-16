@@ -17,6 +17,19 @@
 //! Covered:
 //!   * revision selection — `<since>` (implicit `<since>..HEAD`), `<a>..<b>`,
 //!     `<a>...<b>`, `^<rev>`, `-<n>`, `--root`; merges are excluded as git does.
+//!     The `<since>` shorthand fires on `rev.pending.nr == 1` — the count of
+//!     pending *objects*, which includes an excluded one, so `format-patch
+//!     ^<rev>` walks `<rev>..HEAD` just as `format-patch <rev>` does while
+//!     `^<a> <b>` is a two-endpoint range and is left alone. With no revision
+//!     argument at all `s_r_opt.def` supplies HEAD, which is what makes a bare
+//!     `format-patch` silent (`HEAD..HEAD`) and an unborn branch there fatal.
+//!   * pseudo-revisions — the `--all` family `handle_revision_pseudo_opt()`
+//!     seeds into the same pending list: `--all`, `--branches`, `--tags`,
+//!     `--remotes`, each with an optional `=<glob>`, plus `--glob=<pattern>`,
+//!     `--exclude=<glob>` (which feeds the next selector and is then cleared)
+//!     and `--not`. Each is seeded where it stands on the command line, because
+//!     that is the order the walk's commit-date queue breaks ties in, and each
+//!     counts as revision input even when it matches nothing.
 //!   * revision errors — git's own `fatal: ambiguous argument …` / `bad object`
 //!     / `bad revision` / `Invalid revision range` text on stderr with exit 128,
 //!     and a positional that names an existing path is a pathspec, not an error.
@@ -59,6 +72,12 @@
 //!     `-X<params>`, `--dirstat-by-file`, `--cumulative`), selected the way
 //!     git's `diff_flush()` selects them and separated the way `log_tree_diff()`
 //!     separates them (`---` only when the diffstat and the patch are both on).
+//!   * merges the parent-count bounds admit. `--max-parents=<n>` (n > 1) or
+//!     `--min-parents` can put a merge in the series, and `log_tree_diff()`
+//!     produces nothing for one without `-m`/`-c`/`--cc`, none of which
+//!     format-patch sets. `log_tree_commit()`'s `always_show_header` fallback
+//!     then emits the mail headers and the message alone — no three-dash
+//!     separator, no diffstat and no patch, whatever diff format was asked for.
 //!   * width-tuned diffstat — `--stat=<width>[,<name-width>[,<count>]]`,
 //!     `--stat-width`, `--stat-name-width`, `--stat-graph-width`,
 //!     `--stat-count`, a port of `diff_opt_stat()`'s field parsing and the
@@ -126,10 +145,14 @@
 //!   * a glob in `notes.displayRef`/`GIT_NOTES_DISPLAY_REF`/`--notes=<glob>`:
 //!     expanding a pattern over the ref store is not ported, so a pattern is
 //!     refused rather than read as a literal ref name.
-//!   * `--first-parent`. The traversal underneath reports only the followed
-//!     parent for each commit it hands back, which would make every merge look
-//!     like an ordinary commit and defeat the `max_parents = 1` filter that keeps
-//!     merges out of a series, so the flag is deferred rather than half-applied.
+//!   * the rest of `handle_revision_pseudo_opt()`: `--reflog`, `--bisect`,
+//!     `--indexed-objects`, `--alternate-refs`, `--exclude-hidden=<section>`,
+//!     `--filter=<spec>`, `--single-worktree` and `--stdin`. Each still reports
+//!     `unrecognized argument`, which is a real divergence rather than a
+//!     deferral. Relatedly, `--all` here is every ref plus `HEAD`, without the
+//!     `other_head_refs()` pass that adds a linked worktree's HEAD — so in a
+//!     repository with linked worktrees it is already what `--single-worktree`
+//!     would have asked for.
 //!
 //! ### Config
 //!
@@ -359,6 +382,53 @@ enum Order {
     AuthorDateTopo,
 }
 
+/// One `--all`-family selector, with everything `handle_revision_pseudo_opt()`
+/// (revision.c) needs to turn it into pending objects.
+///
+/// The four namespace forms (`--all`, `--branches`, `--tags`, `--remotes`) go
+/// through `handle_refs()`, the `=<pattern>` and `--glob=<pattern>` forms
+/// through `refs_for_each_ref_ext()`; both end in `handle_one_ref()`, which
+/// drops a ref the pending `--exclude` patterns match and adds the rest.
+#[derive(Clone)]
+struct RefSet {
+    /// The namespace this walks — `refs/heads/` for `--branches`, and so on.
+    /// `None` is `--all`/`--glob`, which see the whole ref store.
+    prefix: Option<&'static str>,
+    /// `=<pattern>`, or `--glob`'s argument. `refs_for_each_ref_ext()` matches
+    /// it against the *full* ref name with `prefix` — or, for a `--glob` pattern
+    /// that does not already start with it, `refs/` — glued in front, and
+    /// appends an implied `/` `*` when the pattern carries no wildcard.
+    pattern: Option<String>,
+    /// Only `--all` follows its refs with `HEAD`.
+    with_head: bool,
+    /// The `--exclude=<glob>` patterns standing when this selector was read.
+    /// Each selector ends with `clear_ref_exclusions()`, so a list applies to
+    /// exactly one of them. They are matched against the name
+    /// `handle_one_ref()` receives, which the namespace forms have already
+    /// trimmed — hence `--exclude=side --branches` but `--exclude=refs/heads/side
+    /// --all`.
+    excludes: Vec<String>,
+    /// Whether a `--not` was in force, which makes every ref UNINTERESTING.
+    negate: bool,
+}
+
+/// One revision-ish word of the command line, in the order `setup_revisions()`
+/// reads it — which is the order the pending list ends up in, and so the order
+/// the walk's commit-date queue breaks ties in.
+enum RevWord {
+    /// A revision argument: `<rev>`, `^<rev>`, `<a>..<b>` or `<a>...<b>`.
+    Rev {
+        spec: String,
+        /// Where it stood on the command line, which is what orders a revision
+        /// error against a diff-option value error.
+        pos: usize,
+        /// Whether a `--not` was in force, which flips the sense `^` gives it.
+        negate: bool,
+    },
+    /// An `--all`-family selector.
+    Refs(RefSet),
+}
+
 /// git's `mime_boundary_leader` (log-tree.c).
 const MIME_BOUNDARY_LEADER: &str = "------------";
 
@@ -514,6 +584,10 @@ struct Opts {
     reverse: bool,
     min_parents: usize,
     max_parents: Option<usize>,
+    /// `revs->first_parent_only`: follow only the first parent of each merge.
+    /// It changes which commits the walk reaches, not the parent list it reports,
+    /// so `max_parents = 1` still drops the merges it walks through.
+    first_parent: bool,
     /// `--topo-order`/`--date-order`/`--author-date-order`.
     order: Order,
     /// `revs->no_walk`: list the named commits without traversing to their
@@ -524,7 +598,9 @@ struct Opts {
     /// `revs->unsorted_input`, which only `--no-walk=unsorted` sets: keep the
     /// pending list in command-line order instead of sorting it by commit date.
     unsorted_input: bool,
-    revs: Vec<String>,
+    /// Everything that feeds `rev.pending`: the revision arguments and the
+    /// `--all`-family selectors, interleaved in command-line order.
+    revs: Vec<RevWord>,
     paths: Vec<String>,
 
     // Diff rendering.
@@ -566,10 +642,6 @@ struct Opts {
     /// `--output=<file>`: the whole series goes to this one file, which is created (and
     /// truncated) while the option parses — before the `--stdout` conflict below.
     output: Option<String>,
-
-    /// Arg index of each entry in `revs`, so a revision error can be ordered
-    /// against a diff-option value error the way git's `setup_revisions()` does.
-    rev_pos: Vec<usize>,
 
     /// The earliest diff-option value error, as `(arg index, exit code, stderr
     /// line)`. git reports these from inside `setup_revisions()`, so a revision
@@ -613,7 +685,7 @@ pub fn format_patch(args: &[String]) -> Result<ExitCode> {
     // into `HEAD..HEAD`, and the two endpoints resolve to the same object, which
     // git answers with `goto done` — exit 0, no patches.
     if opts.deferred.iter().any(|f| f == "--ignore-if-in-upstream") {
-        match upstream_endpoints(&repo, &opts) {
+        match upstream_endpoints(&repo, &opts)? {
             Endpoints::Identical => return Ok(ExitCode::SUCCESS),
             Endpoints::Range => {}
             Endpoints::NotOne => return Ok(fatal("need exactly one range")),
@@ -1095,7 +1167,6 @@ const DEFERRED: &[&str] = &[
     "--output-indicator-old",
     "--output-indicator-context",
     "--anchored",
-    "--first-parent",
     "-b",
     "-w",
     "-D",
@@ -1103,6 +1174,44 @@ const DEFERRED: &[&str] = &[
 
 /// Short options that carry an attached value, e.g. `-M50%` or `-S<string>`.
 const DEFERRED_SHORT: &[&str] = &["-l", "-M", "-C", "-B", "-O", "-S", "-G"];
+
+/// The namespace `--branches`/`--tags`/`--remotes` iterate, as
+/// `refs_for_each_branch_ref()` and friends spell it.
+fn namespace(opt: &str) -> Option<&'static str> {
+    match opt {
+        "--branches" => Some("refs/heads/"),
+        "--tags" => Some("refs/tags/"),
+        "--remotes" => Some("refs/remotes/"),
+        _ => None,
+    }
+}
+
+/// Record one `--all`-family selector at the position it stands on the command
+/// line, taking the `--exclude` patterns that were waiting for it.
+///
+/// `handle_revision_pseudo_opt()` ends every one of these arms with
+/// `clear_ref_exclusions()`, so the patterns never carry over to the next
+/// selector. A selector under `--not` puts UNINTERESTING objects on the pending
+/// list, which is what `add_pending_object_with_path()` clears `no_walk` for.
+fn push_ref_set(
+    o: &mut Opts,
+    excludes: &mut Vec<String>,
+    negate: bool,
+    prefix: Option<&'static str>,
+    pattern: Option<String>,
+    with_head: bool,
+) {
+    if negate {
+        o.no_walk = false;
+    }
+    o.revs.push(RevWord::Refs(RefSet {
+        prefix,
+        pattern,
+        with_head,
+        excludes: std::mem::take(excludes),
+        negate,
+    }));
+}
 
 /// True when `arg` is exactly `name` or the `name=<value>` form.
 fn is_flag(arg: &str, name: &str) -> bool {
@@ -1270,6 +1379,7 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
         min_parents: 0,
         // format-patch sets `rev.max_parents = 1`: merges never get a patch.
         max_parents: Some(1),
+        first_parent: false,
         order: Order::Default,
         no_walk: false,
         unsorted_input: false,
@@ -1287,12 +1397,17 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
         interdiff: Vec::new(),
         cover_letter_given: false,
         output: None,
-        rev_pos: Vec::new(),
         opt_error: None,
     };
 
     let mut i = 0;
     let mut pathspec_mode = false;
+    // `handle_revision_pseudo_opt()`'s `*flags ^= UNINTERESTING | BOTTOM`: `--not`
+    // reverses the sense of everything after it and toggles again at the next one.
+    let mut negate = false;
+    // `revs->ref_excludes`, which every `--all`-family selector consumes and then
+    // empties with `clear_ref_exclusions()`.
+    let mut ref_excludes: Vec<String> = Vec::new();
     // git stores `--cover-from-description`'s value as a plain string during
     // option parsing and only validates it *after* the whole command line is
     // parsed. So an inline value error earlier or later on the line (e.g. a
@@ -1560,6 +1675,8 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
             }
             "--do-walk" => o.no_walk = false,
             "--no-merges" => o.max_parents = Some(1),
+            // git has no `--no-first-parent`; the flag is one-way.
+            "--first-parent" => o.first_parent = true,
             "--minimal" => o.algorithm = Algorithm::MyersMinimal,
             "--histogram" => o.algorithm = Algorithm::Histogram,
             "-a" | "--text" => o.text = true,
@@ -1885,6 +2002,56 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
                 o.max_count = Some(parse_num(&s[1..])?);
                 o.no_walk = false;
             }
+            // The `--all` family. These are not format-patch options at all:
+            // `parse_options()` keeps them (`PARSE_OPT_KEEP_UNKNOWN_OPT`) and
+            // `handle_revision_pseudo_opt()` seeds them into the same pending list
+            // the revision arguments feed, right where they stand — which is what
+            // decides the walk's tie-break order, so each one is recorded in place.
+            "--not" => negate = !negate,
+            "--all" => push_ref_set(
+                &mut o,
+                &mut ref_excludes,
+                negate,
+                None,
+                None,
+                /* with_head */ true,
+            ),
+            "--branches" | "--tags" | "--remotes" => {
+                push_ref_set(&mut o, &mut ref_excludes, negate, namespace(a), None, false);
+            }
+            s if matches!(
+                s.split_once('='),
+                Some(("--branches" | "--tags" | "--remotes", _))
+            ) =>
+            {
+                let (name, pat) = s.split_once('=').expect("checked above");
+                let pat = pat.to_owned();
+                push_ref_set(&mut o, &mut ref_excludes, negate, namespace(name), Some(pat), false);
+            }
+            // `--glob`/`--exclude` take their value stuck or separate, since
+            // `handle_revision_pseudo_opt()` reads them with `parse_long_opt()`
+            // (diff.c) — which has its own wording for a missing value, and
+            // `die()`s rather than going through parse-options' usage block.
+            "--glob" | "--exclude" => {
+                i += 1;
+                let Some(value) = args.get(i).cloned() else {
+                    return Ok(Parsed::Exit(fatal(&format!(
+                        "Option '{a}' requires a value"
+                    ))));
+                };
+                if a == "--exclude" {
+                    ref_excludes.push(value);
+                } else {
+                    push_ref_set(&mut o, &mut ref_excludes, negate, None, Some(value), false);
+                }
+            }
+            s if s.starts_with("--glob=") => {
+                let pat = s["--glob=".len()..].to_owned();
+                push_ref_set(&mut o, &mut ref_excludes, negate, None, Some(pat), false);
+            }
+            s if s.starts_with("--exclude=") => {
+                ref_excludes.push(s["--exclude=".len()..].to_owned());
+            }
             s if NO_OP.contains(&s) => {}
             s if DEFERRED.iter().any(|f| is_flag(s, f))
                 || DEFERRED_SHORT.iter().any(|f| s.starts_with(f)) =>
@@ -1900,13 +2067,16 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
                 // `add_pending_object_with_path()` clears `no_walk` the moment an
                 // UNINTERESTING object joins the pending list, so an exclusion or
                 // a range cancels it — and, being positional, a later `--no-walk`
-                // turns it back on. `format-patch` has no `--not`, so no token here
-                // is ever read the other way round.
-                if super::log::argument_excludes(s, false) {
+                // turns it back on. A `--not` in force reverses which of them
+                // count, exactly as it reverses the `^` prefix.
+                if super::log::argument_excludes(s, negate) {
                     o.no_walk = false;
                 }
-                o.revs.push(s.to_owned());
-                o.rev_pos.push(i);
+                o.revs.push(RevWord::Rev {
+                    spec: s.to_owned(),
+                    pos: i,
+                    negate,
+                });
             }
         }
         i += 1;
@@ -2017,24 +2187,38 @@ fn set_base(o: &mut Opts, arg: &str) {
 /// current branch; otherwise the single *interesting* revision argument names a
 /// branch iff it resolves to `refs/heads/<name>` at that exact tip.
 fn find_branch_name(repo: &gix::Repository, o: &Opts) -> Option<String> {
-    // Each argument contributes one pending object, except a range, which
-    // contributes both of its sides.
-    let mut cmdline: Vec<(&str, bool)> = Vec::new();
-    for spec in &o.revs {
+    // `rev->cmdline` as `add_rev_cmdline()` fills it: the name each pending
+    // object was named by, and whether it is UNINTERESTING. A range contributes
+    // both of its sides, a ref-set selector one entry per ref it matched.
+    let mut cmdline: Vec<(String, bool)> = Vec::new();
+    for word in &o.revs {
+        let (spec, negate) = match word {
+            RevWord::Rev { spec, negate, .. } => (spec, *negate),
+            RevWord::Refs(rs) => {
+                cmdline.extend(ref_set_pending(repo, rs).into_iter().map(|(n, _)| (n, rs.negate)));
+                continue;
+            }
+        };
         if let Some((l, r)) = spec.split_once("...") {
-            cmdline.push((l, false));
-            cmdline.push((r, false));
+            // `handle_dotdot_1()` substitutes HEAD for an empty side before it
+            // records either name.
+            cmdline.push((or_head(l).to_owned(), negate));
+            cmdline.push((or_head(r).to_owned(), negate));
         } else if let Some((l, r)) = spec.split_once("..") {
-            cmdline.push((l, true));
-            cmdline.push((r, false));
+            cmdline.push((or_head(l).to_owned(), !negate));
+            cmdline.push((or_head(r).to_owned(), negate));
         } else if let Some(rest) = spec.strip_prefix('^') {
-            cmdline.push((rest, true));
+            // `add_pending_object_with_path()` is handed `arg` *after* the `^`,
+            // so `^HEAD` is still recorded under the name `HEAD`.
+            cmdline.push((rest.to_owned(), !negate));
         } else {
-            cmdline.push((spec, false));
+            cmdline.push((spec.clone(), negate));
         }
     }
     if cmdline.is_empty() {
-        cmdline.push(("HEAD", false));
+        // `revs->def` put HEAD on the pending list without an `add_rev_cmdline()`
+        // of its own, and `cmd_format_patch` reads the *pending* entry's name.
+        cmdline.push(("HEAD".to_owned(), false));
     }
 
     let head_branch = || {
@@ -2045,14 +2229,13 @@ fn find_branch_name(repo: &gix::Repository, o: &Opts) -> Option<String> {
             .and_then(|n| n.strip_prefix("refs/heads/").map(str::to_owned))
             .or_else(|| Some(String::new()))
     };
-    if cmdline.len() == 1 && !cmdline[0].1 {
-        if o.max_count.is_none() && !o.root {
-            // The `<since>` shorthand adds HEAD itself.
-            return head_branch();
-        }
-        if cmdline[0].0 == "HEAD" {
-            return head_branch();
-        }
+    // `cmd_format_patch`'s `check_head`, which turns on `rev.pending.nr == 1`
+    // alone — an excluded lone endpoint (`^<rev>`) counts, because the promotion
+    // below adds HEAD next to it either way.
+    if cmdline.len() == 1
+        && ((o.max_count.is_none() && !o.root) || cmdline[0].0 == "HEAD")
+    {
+        return head_branch();
     }
 
     let mut interesting = cmdline.iter().filter(|(_, hidden)| !*hidden);
@@ -2062,7 +2245,7 @@ fn find_branch_name(repo: &gix::Repository, o: &Opts) -> Option<String> {
     }
     // `repo_dwim_ref()` hands back the ref name a symref *resolves to*, so a
     // plain `HEAD` on the command line still names the branch it points at.
-    let mut r = repo.find_reference(*name).ok()?;
+    let mut r = repo.find_reference(name.as_str()).ok()?;
     while let Some(Ok(next)) = r.follow() {
         r = next;
     }
@@ -2073,9 +2256,106 @@ fn find_branch_name(repo: &gix::Repository, o: &Opts) -> Option<String> {
         .ok()?
         .strip_prefix("refs/heads/")?
         .to_owned();
-    let tip = repo.rev_parse_single(BStr::new(*name)).ok()?;
+    let tip = repo.rev_parse_single(BStr::new(name.as_str())).ok()?;
     let head = r.into_fully_peeled_id().ok()?;
     (head.detach() == tip.detach()).then_some(branch)
+}
+
+/// An empty side of a range means HEAD, as in `..main` or `main..`.
+/// A named fn, not a closure: closure inference unifies the input and output
+/// lifetimes into one variable that cannot outlive the call.
+fn or_head(s: &str) -> &str {
+    if s.is_empty() {
+        "HEAD"
+    } else {
+        s
+    }
+}
+
+/// The pending objects one `--all`-family selector contributes, as
+/// `(name, commit id)` in `for_each_ref` order.
+///
+/// The name is the one `handle_one_ref()` is handed — trimmed of the namespace
+/// prefix for `--branches`/`--tags`/`--remotes`, full for `--all`/`--glob` —
+/// which is both what `--exclude` matches against and what `add_rev_cmdline()`
+/// records for `find_branch_name()`. Refs that do not peel to a commit are
+/// dropped: format-patch asks for neither trees nor blobs, so `handle_commit()`
+/// has nothing to do with them.
+fn ref_set_pending(repo: &gix::Repository, rs: &RefSet) -> Vec<(String, ObjectId)> {
+    // `refs_for_each_ref_ext()` builds the pattern it matches full ref names
+    // against, and appends the implied `/` `*` when there is no wildcard in it.
+    let pattern = rs.pattern.as_ref().map(|p| {
+        let mut pat = String::new();
+        match rs.prefix {
+            Some(prefix) => pat.push_str(prefix),
+            None if !p.starts_with("refs/") => pat.push_str("refs/"),
+            None => {}
+        }
+        pat.push_str(p);
+        if !p.bytes().any(|b| matches!(b, b'?' | b'*' | b'[')) {
+            if !pat.ends_with('/') {
+                pat.push('/');
+            }
+            pat.push('*');
+        }
+        pat
+    });
+    let peel = |id: ObjectId| -> Option<ObjectId> {
+        repo.find_object(id)
+            .ok()
+            .and_then(|o| o.peel_to_commit().ok())
+            .map(|c| c.id)
+    };
+
+    let mut out: Vec<(String, ObjectId)> = Vec::new();
+    let Ok(platform) = repo.references() else {
+        return out;
+    };
+    let Ok(iter) = platform.all() else {
+        return out;
+    };
+    for reference in iter.filter_map(Result::ok) {
+        let full = reference.name().as_bstr().to_string();
+        if let Some(prefix) = rs.prefix {
+            if !full.starts_with(prefix) {
+                continue;
+            }
+        }
+        if let Some(pat) = &pattern {
+            if !super::log::wildmatch(pat.as_bytes(), full.as_bytes()) {
+                continue;
+            }
+        }
+        let name = match rs.prefix {
+            Some(prefix) => full[prefix.len()..].to_owned(),
+            None => full,
+        };
+        if rs
+            .excludes
+            .iter()
+            .any(|g| super::log::wildmatch(g.as_bytes(), name.as_bytes()))
+        {
+            continue;
+        }
+        let target = match reference.try_id() {
+            Some(id) => id.detach(),
+            None => match reference.into_fully_peeled_id() {
+                Ok(id) => id.detach(),
+                Err(_) => continue,
+            },
+        };
+        if let Some(id) = peel(target) {
+            out.push((name, id));
+        }
+    }
+    // `--all` alone follows every ref with `refs_head_ref`, which is why it can
+    // reach a detached HEAD that no ref points at.
+    if rs.with_head && !rs.excludes.iter().any(|g| super::log::wildmatch(g.as_bytes(), b"HEAD")) {
+        if let Some(id) = repo.head_id().ok().and_then(|h| peel(h.detach())) {
+            out.push(("HEAD".to_owned(), id));
+        }
+    }
+    out
 }
 
 /// Port of `parse_dirstat_params()` (diff.c), plus `parse_dirstat_opt()`'s
@@ -2615,20 +2895,6 @@ fn at_worktree_top(repo: &gix::Repository) -> bool {
 // Revision selection
 // ---------------------------------------------------------------------------
 
-/// git exits 128 on a fatal error; `anyhow::bail!` would collapse that to 1, so
-/// the message goes to stderr here and the code is returned explicitly.
-/// The number of objects `setup_revisions()` would leave pending: a range names two
-/// endpoints, a bare revision one, and an empty command line defaults to `HEAD`.
-fn pending_endpoints(opts: &Opts) -> usize {
-    if opts.revs.is_empty() {
-        return 1;
-    }
-    opts.revs
-        .iter()
-        .map(|r| if r.contains("..") { 2 } else { 1 })
-        .sum()
-}
-
 /// What `--ignore-if-in-upstream` finds on the pending list once
 /// `cmd_format_patch`'s single-endpoint rule has run.
 enum Endpoints {
@@ -2644,44 +2910,24 @@ enum Endpoints {
 }
 
 /// Classify the pending list the way `cmd_format_patch` leaves it for
-/// `--ignore-if-in-upstream`.
+/// `--ignore-if-in-upstream`, in the order it asks the questions: the two
+/// endpoints being one object is the silent `goto done`, then `get_patch_ids()`
+/// wants exactly two of them, then it wants their UNINTERESTING flags to differ.
 ///
-/// The single-endpoint promotion (`rev.pending.nr == 1` → mark UNINTERESTING and
-/// `add_head_to_pending`) is skipped when `--max-count`/`-<n>` or `--root` was
-/// given, which is exactly when `format-patch --root HEAD --ignore-if-in-upstream`
-/// still dies with one endpoint.
-fn upstream_endpoints(repo: &gix::Repository, opts: &Opts) -> Endpoints {
-    let promoted = opts.max_count.is_none() && !opts.root;
-    let (a, b) = match opts.revs.as_slice() {
-        // No revision at all: `s_r_opt.def` supplies `HEAD`.
-        [] if promoted => ("HEAD".to_string(), "HEAD".to_string()),
-        [one] if !one.contains("..") && promoted => (one.clone(), "HEAD".to_string()),
-        [one] if one.contains("..") => match one.split_once("..") {
-            // `A...B` is a symmetric difference, not two plain endpoints; leave
-            // it to the range half, which is what git's two-object pending list
-            // amounts to here.
-            Some((left, right)) => (
-                left.trim_end_matches('.').to_string(),
-                right.trim_start_matches('.').to_string(),
-            ),
-            None => return Endpoints::NotOne,
-        },
-        // Two or more separate revisions. `get_patch_ids()` compares the
-        // UNINTERESTING flags of the two pending objects and refuses when they
-        // agree, which is every `git format-patch A B` — both are positive.
-        _ if pending_endpoints(opts) == 2 => {
-            let negatives = opts.revs.iter().filter(|r| r.starts_with('^')).count();
-            return if negatives == 1 { Endpoints::Range } else { Endpoints::NotARange };
-        }
-        _ => return Endpoints::NotOne,
+/// The single-endpoint promotion the count is taken after is skipped when
+/// `--max-count`/`-<n>` or `--root` was given, which is exactly when
+/// `format-patch --root HEAD --ignore-if-in-upstream` still dies with one endpoint.
+fn upstream_endpoints(repo: &gix::Repository, opts: &Opts) -> Result<Endpoints> {
+    // A revision `setup_revisions()` would have died on: it reports itself a
+    // moment later, from `select_commits`, so say nothing about it here.
+    let Ok(p) = seed_pending(repo, opts)? else {
+        return Ok(Endpoints::Range);
     };
-    let resolve = |spec: &str| {
-        let spec = if spec.is_empty() { "HEAD" } else { spec };
-        repo.rev_parse_single(spec).ok().map(|id| id.detach())
-    };
-    match (resolve(&a), resolve(&b)) {
-        (Some(x), Some(y)) if x == y => Endpoints::Identical,
-        _ => Endpoints::Range,
+    match (p.tips.as_slice(), p.hidden.as_slice()) {
+        ([a], [b]) | ([a, b], []) | ([], [a, b]) if a == b => Ok(Endpoints::Identical),
+        ([_], [_]) => Ok(Endpoints::Range),
+        ([_, _], []) | ([], [_, _]) => Ok(Endpoints::NotARange),
+        _ => Ok(Endpoints::NotOne),
     }
 }
 
@@ -2738,14 +2984,33 @@ enum Selected {
     Exit(ExitCode),
 }
 
-/// Resolve the revision arguments into the commits to format, oldest first and
-/// with merges dropped (git sets `rev.max_parents = 1`).
+/// `rev.pending` split the way the walk consumes it.
+struct Pending {
+    /// The interesting endpoints, in command-line order — which is the order the
+    /// commit-date queue breaks ties in, so it is load-bearing.
+    tips: Vec<ObjectId>,
+    /// The UNINTERESTING endpoints, plus the merge bases a `<a>...<b>` excludes.
+    hidden: Vec<ObjectId>,
+    /// Positionals that named a path rather than a revision.
+    paths: Vec<String>,
+    /// `revs->rev_input_given`: set by every revision argument that resolved and
+    /// by every `--all`-family selector, whether or not that selector matched
+    /// anything. It is what keeps `s_r_opt.def` from adding HEAD behind the
+    /// caller's back — `format-patch --tags` in a repository with no tags formats
+    /// nothing rather than falling back to HEAD.
+    rev_input_given: bool,
+}
+
+/// `setup_revisions()`'s left-to-right pass over the revision words: resolve each
+/// one and put what it names on the pending list.
 ///
-/// A lone revision with neither `-<n>` nor `--root` is git's traditional
-/// `format-patch <since>` shorthand for `<since>..HEAD`; anything else is an
-/// ordinary walk over the given tips and exclusions. With no tips at all git
-/// formats nothing unless `-<n>` or `--root` asked for HEAD implicitly.
-fn select_commits(repo: &gix::Repository, o: &Opts) -> Result<Selected> {
+/// The `Err` arm is git's `die()` for a word that names neither a revision nor a
+/// path, ordered against a recorded diff-option value error by command-line
+/// position the way git's single pass orders them.
+fn seed_pending(
+    repo: &gix::Repository,
+    o: &Opts,
+) -> Result<std::result::Result<Pending, ExitCode>> {
     let hexsz = repo.object_hash().len_in_hex();
     let resolve = |spec: &str| -> Option<ObjectId> {
         repo.rev_parse_single(BStr::new(spec))
@@ -2754,28 +3019,30 @@ fn select_commits(repo: &gix::Repository, o: &Opts) -> Result<Selected> {
             .and_then(|obj| obj.peel_to_commit().ok())
             .map(|c| c.id)
     };
-    // An empty side of a range means HEAD, as in `..main` or `main..`.
-    // A named fn, not a closure: closure inference unifies the input and output
-    // lifetimes into one variable that cannot outlive the call.
-    fn or_head(s: &str) -> &str {
-        if s.is_empty() {
-            "HEAD"
-        } else {
-            s
-        }
-    }
 
-    let mut tips: Vec<ObjectId> = Vec::new();
-    let mut hidden: Vec<ObjectId> = Vec::new();
-    let mut paths: Vec<String> = o.paths.clone();
-    let mut plain_tips = 0usize;
+    let mut p = Pending {
+        tips: Vec::new(),
+        hidden: Vec::new(),
+        paths: o.paths.clone(),
+        rev_input_given: false,
+    };
 
-    for (k, spec) in o.revs.iter().enumerate() {
+    for word in &o.revs {
+        // A ref-set selector cannot fail: `handle_one_ref()` simply adds what it
+        // finds, in `for_each_ref` order, and adds nothing when it finds nothing.
+        let (spec, negate, rpos) = match word {
+            RevWord::Rev { spec, negate, pos } => (spec, *negate, *pos),
+            RevWord::Refs(rs) => {
+                p.rev_input_given = true;
+                let side = if rs.negate { &mut p.hidden } else { &mut p.tips };
+                side.extend(ref_set_pending(repo, rs).into_iter().map(|(_, id)| id));
+                continue;
+            }
+        };
         // git resolves revisions and diff options in one left-to-right pass, so
         // a recorded diff-option value error preempts this revision iff it sits
         // earlier on the command line. `rev_err` defers computing the revision
         // error (which prints its own message) until that check has passed.
-        let rpos = o.rev_pos[k];
         let rev_err = |compute: &dyn Fn() -> ExitCode| -> ExitCode {
             match opt_preempts(o, rpos) {
                 Some(e) => e,
@@ -2796,38 +3063,59 @@ fn select_commits(repo: &gix::Repository, o: &Opts) -> Result<Selected> {
         if let Some((left, right)) = spec.split_once("...") {
             let (left, right) = (or_head(left), or_head(right));
             let Some(a) = resolve(left) else {
-                return Ok(Selected::Exit(rev_err(&|| range_error(left))));
+                return Ok(Err(rev_err(&|| range_error(left))));
             };
             let Some(b) = resolve(right) else {
-                return Ok(Selected::Exit(rev_err(&|| range_error(right))));
+                return Ok(Err(rev_err(&|| range_error(right))));
             };
-            // `a...b` is everything reachable from either tip but not both.
+            p.rev_input_given = true;
+            // `a...b` is everything reachable from either tip but not both. Both
+            // sides carry the sense in force and the merge bases carry its
+            // opposite, which is what `handle_dotdot_1()`'s `flags_exclude` is.
+            let (sides, bases) = if negate {
+                (&mut p.hidden, &mut p.tips)
+            } else {
+                (&mut p.tips, &mut p.hidden)
+            };
+            sides.push(a);
+            sides.push(b);
             for base in repo.merge_bases_many(a, &[b])? {
-                hidden.push(base.detach());
+                bases.push(base.detach());
             }
-            tips.push(a);
-            tips.push(b);
         } else if let Some((left, right)) = spec.split_once("..") {
             let (left, right) = (or_head(left), or_head(right));
             let Some(a) = resolve(left) else {
-                return Ok(Selected::Exit(rev_err(&|| range_error(left))));
+                return Ok(Err(rev_err(&|| range_error(left))));
             };
             let Some(b) = resolve(right) else {
-                return Ok(Selected::Exit(rev_err(&|| range_error(right))));
+                return Ok(Err(rev_err(&|| range_error(right))));
             };
-            hidden.push(a);
-            tips.push(b);
+            p.rev_input_given = true;
+            // The left side always carries the opposite sense of the right.
+            if negate {
+                p.tips.push(a);
+                p.hidden.push(b);
+            } else {
+                p.hidden.push(a);
+                p.tips.push(b);
+            }
         } else if let Some(rest) = spec.strip_prefix('^') {
             match resolve(rest) {
-                Some(id) => hidden.push(id),
+                Some(id) => {
+                    p.rev_input_given = true;
+                    // `^` flips the sense `--not` set, as git XORs both.
+                    if negate {
+                        p.tips.push(id);
+                    } else {
+                        p.hidden.push(id);
+                    }
+                }
                 None if is_full_oid(rest, hexsz) => {
-                    return Ok(Selected::Exit(rev_err(&|| {
-                        fatal(&format!("bad object {rest}"))
-                    })))
+                    return Ok(Err(rev_err(&|| fatal(&format!("bad object {rest}")))))
                 }
                 // An exclusion is never retried as a filename.
                 None => {
-                    return Ok(Selected::Exit(rev_err(&|| {
+                    return Ok(Err(rev_err(&|| {
                         fatal(&format!("bad revision '{spec}'"))
                     })))
                 }
@@ -2835,18 +3123,22 @@ fn select_commits(repo: &gix::Repository, o: &Opts) -> Result<Selected> {
         } else {
             match resolve(spec) {
                 Some(id) => {
-                    tips.push(id);
-                    plain_tips += 1;
+                    p.rev_input_given = true;
+                    if negate {
+                        p.hidden.push(id);
+                    } else {
+                        p.tips.push(id);
+                    }
                 }
                 // git falls back to treating the argument as a pathspec when it
-                // names something that exists in the worktree.
-                None if std::path::Path::new(spec).exists() => paths.push(spec.clone()),
+                // names something that exists in the worktree. That is
+                // `handle_revision_arg()` returning non-zero, so it leaves
+                // `rev_input_given` alone.
+                None if std::path::Path::new(spec).exists() => p.paths.push(spec.clone()),
                 None if is_full_oid(spec, hexsz) => {
-                    return Ok(Selected::Exit(rev_err(&|| {
-                        fatal(&format!("bad object {spec}"))
-                    })))
+                    return Ok(Err(rev_err(&|| fatal(&format!("bad object {spec}")))))
                 }
-                None => return Ok(Selected::Exit(rev_err(&|| ambiguous(spec)))),
+                None => return Ok(Err(rev_err(&|| ambiguous(spec)))),
             }
         }
     }
@@ -2854,19 +3146,67 @@ fn select_commits(repo: &gix::Repository, o: &Opts) -> Result<Selected> {
     // Every revision resolved (or became a pathspec). git still reaches any
     // recorded diff-option value error during the same pass, so it fires now.
     if let Some(e) = emit_opt_error(o) {
-        return Ok(Selected::Exit(e));
+        return Ok(Err(e));
     }
 
-    // `format-patch <since>` prepares what the other side does not have yet.
-    if plain_tips == 1 && tips.len() == 1 && o.max_count.is_none() && !o.root {
-        let since = tips.pop().expect("a single tip was just counted");
-        hidden.push(since);
-        tips.push(repo.head_id()?.detach());
-    } else if tips.is_empty() && (o.max_count.is_some() || o.root) {
-        // `format-patch -3` and `format-patch --root` walk from HEAD; with no
-        // revision argument at all git formats nothing.
-        tips.push(repo.head_id()?.detach());
+    // `setup_revisions()`'s last act: `s_r_opt.def` ("HEAD") joins a pending list
+    // that no revision argument contributed to. An unborn HEAD is
+    // `diagnose_missing_default()`, which dies rather than formatting nothing.
+    if p.tips.is_empty() && p.hidden.is_empty() && !p.rev_input_given {
+        let head = repo.head()?;
+        if head.is_unborn() {
+            let branch = head
+                .referent_name()
+                .map(|n| n.shorten().to_str_lossy().into_owned())
+                .unwrap_or_else(|| "master".to_owned());
+            return Ok(Err(fatal(&format!(
+                "your current branch '{branch}' does not have any commits yet"
+            ))));
+        }
+        p.tips.push(repo.head_id()?.detach());
     }
+
+    // `cmd_format_patch`: "This is traditional behaviour of `git format-patch
+    // origin` that prepares what the origin side still does not have." With
+    // exactly one pending object it is marked UNINTERESTING and HEAD is appended,
+    // turning `<since>` into `<since>..HEAD`; `-<n>`/`--max-count` and `--root`
+    // opt out and leave `get_revision()` the usual traversal.
+    //
+    // git counts *pending objects*, not positive arguments. `^<rev>` is one of
+    // them and gets the same treatment — re-marking an already-UNINTERESTING
+    // object changes nothing, so `format-patch ^<rev>` walks `<rev>..HEAD` just
+    // like `format-patch <rev>` — while `^<a> <b>` is two and gets none.
+    //
+    // `add_head_to_pending()` gives up quietly when HEAD does not resolve, so on
+    // an unborn branch the endpoint is left excluded and nothing is formatted.
+    if p.tips.len() + p.hidden.len() == 1 && o.max_count.is_none() && !o.root {
+        if let Some(since) = p.tips.pop() {
+            p.hidden.push(since);
+        }
+        if let Ok(head) = repo.head_id() {
+            p.tips.push(head.detach());
+        }
+    }
+
+    Ok(Ok(p))
+}
+
+/// Resolve the revision arguments into the commits to format, oldest first and
+/// with merges dropped (git sets `rev.max_parents = 1`).
+///
+/// A lone endpoint with neither `-<n>` nor `--root` is git's traditional
+/// `format-patch <since>` shorthand for `<since>..HEAD`; anything else is an
+/// ordinary walk over the given tips and exclusions.
+fn select_commits(repo: &gix::Repository, o: &Opts) -> Result<Selected> {
+    let Pending {
+        tips,
+        hidden,
+        paths,
+        ..
+    } = match seed_pending(repo, o)? {
+        Ok(p) => p,
+        Err(code) => return Ok(Selected::Exit(code)),
+    };
 
     if tips.is_empty() {
         return Ok(Selected::Commits {
@@ -2912,6 +3252,9 @@ fn select_commits(repo: &gix::Repository, o: &Opts) -> Result<Selected> {
         let mut platform = repo
             .rev_walk(tips)
             .sorting(Sorting::ByCommitTime(CommitTimeOrder::NewestFirst));
+        if o.first_parent {
+            platform = platform.first_parent_only();
+        }
         if !hidden.is_empty() {
             platform = platform.with_hidden(hidden);
         }
@@ -3202,9 +3545,22 @@ fn render_message(
     }
     out.extend_from_slice(sb.as_bytes());
 
-    // The patch itself.
-    let new_tree = commit.tree()?;
+    // The patch itself — but only when this commit has at most one parent.
+    //
+    // `log_tree_diff()` (log-tree.c) reaches its diff loop for a merge only when
+    // `separate_merges` is set, which is `-m`/`--diff-merges=separate`; with
+    // neither that nor `-c`/`--cc` it `return 0`s before producing anything.
+    // format-patch never sets any of them, so `log_tree_commit()` sees nothing
+    // shown, falls back to its `always_show_header` branch and emits the header
+    // alone. A merge that `--max-parents=<n>` (n > 1) or `--min-parents` let
+    // through therefore carries no three-dash separator, no diffstat and no
+    // patch — only the mail headers, the message, and whatever commentary block
+    // (`Notes:`) the message itself opened.
     let parents: Vec<_> = commit.parent_ids().collect();
+    if parents.len() > 1 {
+        return Ok(());
+    }
+    let new_tree = commit.tree()?;
     let old_tree = match parents.first() {
         Some(pid) => Some(pid.object()?.try_into_commit()?.tree()?),
         None => None,

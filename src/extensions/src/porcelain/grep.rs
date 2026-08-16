@@ -2031,61 +2031,16 @@ fn source_conflict(opts: &Opts) -> Option<ExitCode> {
     Some(ExitCode::from(128))
 }
 
-/// git's `verify_filename()`. A leftover token sitting in path position that
-/// starts with `-` is a misplaced option — git dies with the "must come before
-/// non-option arguments" message rather than treating it as a path. Otherwise it
-/// has to look like a pathspec or name an existing path, or git dies before
-/// searching anything. `diagnose_misspelt_rev` picks git's wording: the
-/// "ambiguous argument" form when a revision was still admissible at this
-/// position (the first path, with revs allowed), the plainer "no such path" form
-/// otherwise (subsequent paths, or when revisions were never in play — including
-/// every `--no-index`/`--untracked` path).
+/// [`crate::setup::verify_filename`], reported and turned into git's exit code.
 ///
-/// Returns the exit code to stop with, having already reported it, or `None`
-/// when the argument is acceptable.
-///
-/// Paths are resolved against the current directory, which is where git resolves
-/// them from too for every form but `:/<path>`: that one is root-relative, and
-/// git can say so because it has already changed directory to the root by this
-/// point. The two agree whenever grep is run from the root.
+/// `diagnose_misspelt_rev` picks git's wording: the "ambiguous argument" form when
+/// a revision was still admissible at this position (the first path, with revs
+/// allowed), the plainer "no such path" form otherwise (subsequent paths, or when
+/// revisions were never in play — including every `--no-index`/`--untracked` path).
 fn verify_filename(arg: &str, diagnose_misspelt_rev: bool) -> Option<ExitCode> {
-    if arg.starts_with('-') {
-        eprintln!("fatal: option '{arg}' must come before non-option arguments");
-        return Some(ExitCode::from(128));
-    }
-    if looks_like_pathspec(arg) || crate::setup::check_filename(arg) {
-        return None;
-    }
-    if diagnose_misspelt_rev {
-        eprintln!(
-            "fatal: ambiguous argument '{arg}': unknown revision or path not in the working tree."
-        );
-        eprintln!("Use '--' to separate paths from revisions, like this:");
-        eprintln!("'git <command> [<revision>...] -- [<file>...]'");
-    } else {
-        eprintln!("fatal: {arg}: no such path in the working tree.");
-        eprintln!("Use 'git <command> -- <path>...' to specify paths that do not exist locally.");
-    }
+    let msg = crate::setup::verify_filename(arg, diagnose_misspelt_rev)?;
+    eprintln!("fatal: {msg}");
     Some(ExitCode::from(128))
-}
-
-/// git's `looks_like_pathspec()`: raw pathspec magic, or an unescaped glob
-/// metacharacter, means the argument is a pattern rather than a name to stat.
-fn looks_like_pathspec(arg: &str) -> bool {
-    if arg.starts_with(":(") && arg.contains(')') {
-        return true;
-    }
-    let mut escaped = false;
-    for b in arg.bytes() {
-        if escaped {
-            escaped = false;
-        } else if b == b'\\' {
-            escaped = true;
-        } else if matches!(b, b'*' | b'?' | b'[') {
-            return true;
-        }
-    }
-    false
 }
 
 /// Whether any `diff.<driver>.textconv` command is configured.

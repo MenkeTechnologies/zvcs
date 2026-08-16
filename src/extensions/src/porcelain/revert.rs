@@ -23,10 +23,12 @@
 //!
 //! What this port covers, byte-for-byte against stock git:
 //!   * `git revert <commit>...`, including `<a>..<b>` ranges, `<a>...<b>`,
-//!     `^<commit>` exclusions and the `<a>^!`/`<a>^@` parent spellings, resolved
-//!     through the one revision walk [`crate::sequencer::prepare_revs`] runs, as
-//!     git's sequencer does. A revert never reverses that walk, so a range is
-//!     backed out newest first — the opposite of `cherry-pick`
+//!     `^<commit>` exclusions, the `<a>^!`/`<a>^@`/`<a>^-[<n>]` parent
+//!     spellings and the `--not`/`--all`/`--branches`/`--tags`/`--remotes`/
+//!     `--glob=`/`--exclude=` pseudo-revisions, resolved through the one
+//!     revision walk [`crate::sequencer::prepare_revs`] runs, as git's sequencer
+//!     does. A revert never reverses that walk, so a range is backed out newest
+//!     first — the opposite of `cherry-pick`
 //!   * `-n`/`--no-commit`, `-s`/`--signoff`, `-m <n>`/`--mainline <n>`,
 //!     `--no-edit`, `--reference`, `--cleanup=<mode>`
 //!   * `--strategy`/`-X`, which git's sequencer ignores outright for a revert:
@@ -438,8 +440,12 @@ pub fn revert(args: &[String]) -> Result<ExitCode> {
 
     if let Some(mode) = o.mode {
         // git's `verify_opt_compatible` walks this list and reports the first
-        // option that is set. `--strategy` is deliberately absent: git does not
-        // check it here, so neither does this.
+        // option that is set. Its `"--strategy", opts->strategy ? 1 : 0` entry
+        // is absent here because it is dead in stock too: `run_sequencer`
+        // parses `--strategy` into a local pointer and only copies it into
+        // `opts->strategy` after this check runs (`builtin/revert.c:116,133`
+        // versus `:211` and `:260-262`), so the field is still NULL when it is
+        // read and `git revert --strategy=ort --quit` exits 0.
         for (name, active) in [
             ("--no-commit", o.no_commit),
             ("--signoff", o.signoff),

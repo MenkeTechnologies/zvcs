@@ -563,8 +563,11 @@ impl Analysis {
 enum Fatal {
     /// git's `usage(diff_files_usage)`, exit 129.
     Usage,
-    /// `fatal: ambiguous argument '<arg>': …`, exit 128.
-    Ambiguous(String),
+    /// An already-formatted `verify_filename()` complaint — "option … must come
+    /// before non-option arguments", "ambiguous argument …" or "… no such path in
+    /// the working tree" — exit 128. Which of the three it is depends on the
+    /// argument's position, so the choice is made in [`crate::setup`].
+    VerifyFilename(String),
     /// `fatal: '<rest>': not an integer` from `-n<rest>`, exit 128.
     NotAnInteger(String),
     /// `error: -n requires an argument`, exit 128.
@@ -664,13 +667,8 @@ impl Fatal {
                 let _ = write!(err, "{USAGE}");
                 return ExitCode::from(129);
             }
-            Fatal::Ambiguous(arg) => {
-                let _ = writeln!(
-                    err,
-                    "fatal: ambiguous argument '{arg}': unknown revision or path not in the working tree.\n\
-                     Use '--' to separate paths from revisions, like this:\n\
-                     'git <command> [<revision>...] -- [<file>...]'"
-                );
+            Fatal::VerifyFilename(msg) => {
+                let _ = writeln!(err, "fatal: {msg}");
             }
             Fatal::NotAnInteger(v) => {
                 let _ = writeln!(err, "fatal: '{v}': not an integer");
@@ -946,13 +944,25 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed, Fatal> {
             }
             continue;
         }
+        // A lone `-` is not an option parse-options recognises, so `setup_revisions()`
+        // leaves it in the unhandled set and `cmd_diff_files()`'s `argc > 1` check
+        // answers with the usage text. Only while it stands *before* any path,
+        // though: past one, `verify_filename()` has already claimed every remaining
+        // argument and complains that the option came too late.
+        if s == "-" && !seen_non_option {
+            return Err(Fatal::Usage);
+        }
         // A bare argument is a revision, an existing path, or an error — git
         // tries them in that order and dies on the first one that fits none.
         if repo.rev_parse_single(s).is_ok() {
             return Err(Fatal::Usage);
         }
-        if !looks_like_pathspec(s) && !names_an_existing_file(s) {
-            return Err(Fatal::Ambiguous(s.to_owned()));
+        // `setup_revisions()` hands the argument that failed revision resolution and
+        // every one after it to `verify_filename()`, with `diagnose_misspelt_rev` set
+        // only for the first — so a second bad path gets the plainer "no such path"
+        // wording rather than a second "ambiguous argument".
+        if let Some(msg) = crate::setup::verify_filename(s, !seen_non_option) {
+            return Err(Fatal::VerifyFilename(msg));
         }
         paths.push(s.into());
         seen_non_option = true;
@@ -1663,35 +1673,6 @@ fn count_occurrences_of(hay: &[u8], needle: &[u8]) -> usize {
 fn parse_ws_error_highlight_opt(v: &str) -> Result<u32, Fatal> {
     diff_color::parse_ws_error_highlight(v)
         .map_err(|accepted| Fatal::WsErrorHighlight(v[..accepted].to_owned()))
-}
-
-/// git's `looks_like_pathspec()`: long-form magic, or an unescaped glob character.
-fn looks_like_pathspec(arg: &str) -> bool {
-    if arg.starts_with(":(") {
-        return true;
-    }
-    let mut escaped = false;
-    for b in arg.bytes() {
-        if escaped {
-            escaped = false;
-        } else if b == b'\\' {
-            escaped = true;
-        } else if matches!(b, b'*' | b'?' | b'[') {
-            return true;
-        }
-    }
-    false
-}
-
-/// git's `check_filename()`: strip the short-form magic prefixes, then `lstat`.
-/// A bare `:/`, `:!` or `:^` is a whole-tree pathspec and needs no file behind it.
-fn names_an_existing_file(arg: &str) -> bool {
-    for magic in [":/", ":!", ":^"] {
-        if let Some(rest) = arg.strip_prefix(magic) {
-            return rest.is_empty() || Path::new(rest).symlink_metadata().is_ok();
-        }
-    }
-    !arg.is_empty() && Path::new(arg).symlink_metadata().is_ok()
 }
 
 // ---------------------------------------------------------------------------

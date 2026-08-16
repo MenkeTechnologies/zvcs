@@ -1621,13 +1621,12 @@ fn list_branches(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
         // without having emitted a partial listing.
         let mut lines = Vec::with_capacity(entries.len());
         for e in &entries {
-            // git prints the detached pseudo entry verbatim rather than feeding
-            // it through the format, since it has no ref name to expand.
-            lines.push(if e.detached {
-                e.display.clone()
-            } else {
-                render_format(repo, fmt, e)?
-            });
+            // The detached pseudo entry is a `ref_array_item` like any other, so it
+            // renders through the format too: `--format=0` prints `0` for it, and an
+            // empty format an empty line. Only its name is special — `%(refname)`
+            // resolves to `get_head_description()`, which is what `atom_value()` hands
+            // back for a detached entry.
+            lines.push(render_format(repo, fmt, e)?);
         }
         // `--omit-empty` drops a line that rendered to nothing rather than
         // printing its bare newline (ref-filter's `array_opts.omit_empty`).
@@ -1857,6 +1856,10 @@ fn render_format(repo: &gix::Repository, fmt: &str, e: &Entry<'_>) -> Result<Str
 /// Resolve a single `%(...)` atom.
 fn atom_value(repo: &gix::Repository, atom: &str, e: &Entry<'_>) -> Result<String> {
     Ok(match atom {
+        // The detached pseudo entry has no ref name; `get_head_description()` stands in
+        // for it, which is why `%(refname)` and `%(refname:short)` both print
+        // `(HEAD detached at <abbrev>)`.
+        "refname" if e.detached => e.display.clone(),
         "refname" => e.full.to_string(),
         "refname:short" => e.short.clone(),
         "objectname" => e.id.map(|id| id.to_string()).unwrap_or_default(),
@@ -2328,6 +2331,57 @@ fn install_tracking(
     Ok(())
 }
 
+/// Append the `<tip> <tip>` entry a rename or copy onto the branch's *own* name
+/// leaves in that branch's reflog.
+///
+/// `files_copy_or_rename_ref()` is not a ref transaction: it ends in
+/// `commit_ref_update()`, which calls `files_log_ref_write()` unconditionally, so
+/// the destination is logged even when it already held the value. A transaction
+/// takes the other path — `lock_ref_for_update()` withholds `REF_NEEDS_COMMIT`
+/// when `oideq(&lock->old_oid, &update->new_oid)`, and `files_transaction_finish()`
+/// logs only `REF_NEEDS_COMMIT || REF_LOG_ONLY` updates — which is why
+/// `update-ref refs/heads/main <its own tip>` and `branch -f` leave the branch's
+/// log untouched while `branch -m main main` does not.
+///
+/// `RefLog::Only` is that `REF_LOG_ONLY`: it writes the log and not the ref, which
+/// is right because the ref already holds `target`, and — like git's flag in
+/// `split_head_update()` — it is exempt from the `HEAD` mirror, whose entry the
+/// caller's own update already produced.
+///
+/// The entry's own "old" side is patched in afterwards rather than demanded up
+/// front: a `PreviousValue::MustExistAndMatch` constraint is checked against the
+/// loose reference alone and fails outright on a branch that lives only in
+/// `packed-refs`, which is every branch of a fresh bare clone.
+fn log_unchanged_rename(
+    repo: &gix::Repository,
+    name: &FullName,
+    target: ObjectId,
+    message: &str,
+    force_create_reflog: bool,
+) -> Result<()> {
+    repo.edit_reference(RefEdit {
+        change: Change::Update {
+            log: LogChange {
+                mode: RefLog::Only,
+                force_create_reflog,
+                message: message.into(),
+            },
+            expected: PreviousValue::Any,
+            new: Target::Object(target),
+        },
+        name: name.clone(),
+        deref: false,
+    })?;
+    rewrite_last_reflog_old_id(
+        &repo
+            .git_dir()
+            .join("logs")
+            .join(name.as_bstr().to_str_lossy().as_ref()),
+        target,
+    );
+    Ok(())
+}
+
 /// `-m`/`-M`: rename a branch, carrying its reflog and `branch.<name>.*` config
 /// across and re-pointing HEAD when the renamed branch is the checked-out one.
 ///
@@ -2420,6 +2474,8 @@ fn rename_branch(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
     // *ref that already pointed there*, and its entry reads `<tip> <tip>`.
     if old_full != new_full {
         rewrite_last_reflog_old_id(&repo.git_dir().join("logs").join(&new_full), target);
+    } else {
+        log_unchanged_rename(repo, &new_name, target, &message, o.create_reflog)?;
     }
 
     if old_full != new_full {
@@ -2538,7 +2594,7 @@ fn copy_branch(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
             log: LogChange {
                 mode: RefLog::AndReference,
                 force_create_reflog: o.create_reflog,
-                message: message.into(),
+                message: message.clone().into(),
             },
             expected: if o.force {
                 PreviousValue::Any
@@ -2547,9 +2603,15 @@ fn copy_branch(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
             },
             new: Target::Object(target),
         },
-        name: new_name,
+        name: new_name.clone(),
         deref: false,
     })?;
+    // Copying a branch onto its own name changes no value, so the update above logged
+    // nothing; git's copy ends in the same unconditional `commit_ref_update()` a rename
+    // does and records the entry regardless.
+    if old_full == new_full {
+        log_unchanged_rename(repo, &new_name, target, &message, o.create_reflog)?;
+    }
 
     // git duplicates the branch's config section into the new name.
     if old_full != new_full {
@@ -2634,28 +2696,30 @@ fn delete_branches(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
         return fatal("branch name required");
     }
 
-    // Full ref name of the current branch (None if detached/unborn).
-    let current: Option<BString> = repo.head_name()?.map(|n| n.as_bstr().to_owned());
-
     // Serialize all deletions through the repo coordinator, held across the loop.
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
 
     for name in &o.names {
         let full = format!("refs/heads/{name}");
 
-        // `delete_branches()` (builtin/branch.c) refuses on
-        // `find_shared_symref(…, "HEAD", name) && !wt->is_bare`: a bare repository's `HEAD`
-        // is a default for future clones, not a checkout, so deleting the branch it names is
-        // allowed there. That is the one way `branch -d` reaches the deletion-of-`HEAD`'s
-        // referent path, where `split_head_update()` then logs `<old> <null>` into
-        // `logs/HEAD` with no message — `refs_delete_refs()` is called with a null `logmsg`.
-        if let Some(workdir) = repo.workdir() {
-            if current.as_ref().map(|c| c.as_slice()) == Some(full.as_bytes()) {
-                return error_exit(format!(
-                    "cannot delete branch '{name}' used by worktree at '{}'",
-                    workdir.display()
-                ));
-            }
+        // `delete_branches()` (builtin/branch.c) refuses when `branch_checked_out(name)`
+        // names a worktree: any worktree's `HEAD`, not just this one's, and the branch an
+        // interrupted rebase or bisect will return to as well. A bare worktree contributes
+        // nothing to that map — a bare repository's `HEAD` is a default for future clones,
+        // not a checkout — so deleting the branch it names is allowed. That is the one way
+        // `branch -d` reaches the deletion-of-`HEAD`'s referent path, where
+        // `split_head_update()` then logs `<old> <null>` into `logs/HEAD` with no message —
+        // `refs_delete_refs()` is called with a null `logmsg`.
+        //
+        // The reported path is the worktree's, which git derives absolutely from the common
+        // dir; `repo.workdir()` is relative whenever the repository was discovered from the
+        // current directory, and printed `.` or `../..` where git prints the checkout's
+        // full path.
+        if let Some(path) = super::worktree::branch_checked_out(repo, &full)? {
+            return error_exit(format!(
+                "cannot delete branch '{name}' used by worktree at '{}'",
+                super::worktree::path_to_string(&path)
+            ));
         }
 
         let mut reference = match repo.try_find_reference(full.as_str())? {

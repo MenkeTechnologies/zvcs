@@ -6,6 +6,7 @@ use gix_traverse::commit::{Parents, Simple, simple::Sorting};
 mod adjusted_dates;
 mod different_date;
 mod different_date_intermixed;
+mod first_parent;
 mod hide;
 mod same_date;
 

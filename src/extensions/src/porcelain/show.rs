@@ -65,13 +65,20 @@ const STAT_TERM_WIDTH: usize = 80;
 /// prints its header alone). See [`super::line_log`].
 ///
 /// Diff output formats: `-p`/`--patch`, `--stat`, `--shortstat`, `--numstat`, `--raw`,
-/// `--summary`, `--name-only`, `--name-status`, `-s`/`--no-patch`, and `-q`/`--quiet`.
+/// `--summary`, `--name-only`, `--name-status`, `-s`/`--no-patch`, `-q`/`--quiet`, and
+/// the two combining `OPT_BITOP` spellings `--patch-with-stat` / `--patch-with-raw`,
+/// which are exactly `-p --stat` and `-p --raw`.
 /// Their interaction is git's, reproduced in [`Formats`]; `-q`/`--quiet` suppresses the
 /// default patch but yields to any explicit format flag regardless of position (git
 /// applies its NO_OUTPUT bit before the other diff flags parse). `--abbrev[=<n>]` and
 /// `--no-abbrev` set the width of the ids the raw columns and the patch `index` line
 /// carry, applied as a `core.abbrev` override — `--no-abbrev` is git's zero, so the raw
 /// columns widen to the whole hash while the `index` line keeps the configured default.
+///
+/// The commit message is reprinted under a four-space indent with its tabs expanded
+/// against the message's own left edge — git's `expand_tabs_in_log`, 8 by default —
+/// so whatever the author lined up in columns survives the indent.
+/// `--expand-tabs[=<n>]` and `--no-expand-tabs` change or disable that.
 ///
 /// The patch uses git's default settings: Myers diff with the indent (slider)
 /// heuristic, three lines of context, `@@`-hunk function-context, binary-file
@@ -96,9 +103,22 @@ const STAT_TERM_WIDTH: usize = 80;
 /// which flips the sense of every revision after it (and is undone by a second
 /// `--not`). Under a walk the pending objects are peeled through their tag chain and
 /// anything that is not a commit — a tree, a blob — contributes nothing, while `a^@`
-/// stays a no-walk record of the parents themselves. Pathspecs after `--` limit each
-/// commit's diff by plain path prefix (pathspec magic is not interpreted). Every flag
-/// not listed above is rejected explicitly.
+/// stays a no-walk record of the parents themselves. The walk itself is `git log`'s
+/// (see [`super::log::walk`]), because `cmd_show` hands its pending list to
+/// `cmd_log_walk`: a commit-date-ordered frontier whose ties break by the order tips
+/// and parents entered it, reordered by `--topo-order`/`--date-order` and reversed by
+/// `--reverse`. Pathspecs after `--` limit each commit's diff by plain path prefix
+/// (pathspec magic is not interpreted).
+///
+/// The ref-selecting pseudo-options are accepted too — `--all`, `--branches`,
+/// `--tags`, `--remotes` (each optionally `=<glob>`), `--glob=<glob>` and the
+/// `--exclude=<glob>` patterns the next of them consumes — pending their refs at the
+/// argument position they were written at, and counting as `rev_input_given` so the
+/// implicit `HEAD` is not added on top. `--no-walk[=(sorted|unsorted)]` and
+/// `--do-walk` set and clear `no_walk` positionally against the revision arguments
+/// that clear it; `unsorted_input` never reaches `cmd_show`'s own pending loop, so
+/// `sorted` and `unsorted` are indistinguishable here. Every flag not listed above is
+/// rejected explicitly.
 pub fn show(args: &[String]) -> Result<ExitCode> {
     let mut specs: Vec<&str> = Vec::new();
     // `--stdin`: further revisions, one per line, read after the command line is
@@ -175,6 +195,30 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
     // with `git log` — `cmd_show` runs the same `cmd_log_init_finish`.
     let mut line_ranges: Vec<String> = Vec::new();
     let mut pending_line_range = false;
+    // `cmd_show` starts with `rev.no_walk = 1` and hands the pending list to
+    // `cmd_log_walk` only when something cleared it — an UNINTERESTING object
+    // (`^<rev>`, a range, `<rev>^!`) or an explicit `--do-walk`. A later
+    // `--no-walk` sets it again, so the flag is positional on both sides.
+    // `unsorted_input` never reaches `cmd_show`'s own loop, which is why
+    // `--no-walk=sorted` and `--no-walk=unsorted` are indistinguishable here.
+    let mut no_walk = true;
+    // `--all`, `--branches`/`--tags`/`--remotes`, `--glob` and the `--exclude`
+    // patterns they consume, slotted at the argument index they were written at
+    // so their tips land where `setup_revisions()` pends them.
+    let mut ref_selections: Vec<super::log::RefSelection> = Vec::new();
+    let mut ref_excludes: Vec<String> = Vec::new();
+    // Set while a detached `--glob <pattern>` (`Some(true)`) or
+    // `--exclude <pattern>` (`Some(false)`) waits for its value.
+    let mut pending_ref_value: Option<bool> = None;
+    // `--reverse`: reverses `cmd_log_walk`'s output. Inert while `no_walk` holds,
+    // because `cmd_show` prints its pending list without consulting it.
+    let mut reverse = false;
+    // `--topo-order` / `--date-order`, applied to the walk a cleared `no_walk`
+    // hands to `cmd_log_walk`.
+    let mut order = super::log::Order::Default;
+    // `--expand-tabs[=<n>]` / `--no-expand-tabs`; `None` keeps the indented
+    // formats on git's `expand_tabs_in_log_default` of 8.
+    let mut expand_tabs: Option<usize> = None;
 
     for a in args {
         let s = a.as_str();
@@ -220,6 +264,23 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
             }
             continue;
         }
+        if let Some(is_glob) = pending_ref_value.take() {
+            if is_glob {
+                if negate_revs {
+                    no_walk = false;
+                }
+                ref_selections.push(super::log::RefSelection::new(
+                    specs.len(),
+                    super::log::RefSelector::Glob,
+                    Some(s),
+                    std::mem::take(&mut ref_excludes),
+                    negate_revs,
+                ));
+            } else {
+                ref_excludes.push(a.clone());
+            }
+            continue;
+        }
         match s {
             "-S" => pending_pickaxe = Some('S'),
             "-G" => pending_pickaxe = Some('G'),
@@ -242,6 +303,17 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
             "--shortstat" => formats.shortstat = true,
             "--summary" => formats.summary = true,
             "--raw" => formats.raw = true,
+            // `diff_opt_parse`'s two combining spellings: each `OPT_BITOP` sets
+            // its own format bit *and* `DIFF_FORMAT_PATCH`, so they are exactly
+            // `-p --raw` and `-p --stat`.
+            "--patch-with-raw" => {
+                formats.patch = true;
+                formats.raw = true;
+            }
+            "--patch-with-stat" => {
+                formats.patch = true;
+                formats.stat = true;
+            }
             "--stat" => formats.stat = true,
             "--oneline" => {
                 pretty = Pretty::Oneline;
@@ -279,6 +351,11 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
             // merge as a plain diff against its first parent instead of the dense
             // combined (`--cc`) diff. A no-op for a single non-merge commit.
             "--first-parent" => first_parent = true,
+            // `sort_in_topological_order()` runs inside `prepare_revision_walk`,
+            // which `cmd_show` only reaches once something cleared `no_walk` —
+            // so these reorder a `git show <range>` and are inert otherwise.
+            "--topo-order" => order = super::log::Order::Topo,
+            "--date-order" => order = super::log::Order::Date,
             "--no-first-parent" => first_parent = false,
             // Ref decorations on the `commit <id>` / oneline header, exactly as
             // `git log` renders them (same filter, same ordering, same colors).
@@ -465,9 +542,73 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
                     abbrev_raw = Some(v.to_string());
                     abbrev_len = None;
                     no_abbrev = false;
+                // `--no-walk[=(sorted|unsorted)]` / `--do-walk`. `cmd_show` never
+                // reads `unsorted_input`, so the two values only have to be
+                // validated, not acted on.
+                // `revs->expand_tabs_in_log`: how wide a tab is when the message
+                // is reprinted under a four-space indent. A bare `--expand-tabs`
+                // is `expand_tabs_in_log_default` (8), `--no-expand-tabs` is zero.
+                } else if s == "--expand-tabs" {
+                    expand_tabs = Some(8);
+                } else if s == "--no-expand-tabs" {
+                    expand_tabs = Some(0);
+                } else if let Some(v) = s.strip_prefix("--expand-tabs=") {
+                    match v.parse::<usize>() {
+                        Ok(n) => expand_tabs = Some(n),
+                        Err(_) => {
+                            eprintln!("fatal: '{v}': not a non-negative integer");
+                            return Ok(ExitCode::from(128));
+                        }
+                    }
+                } else if s == "--no-walk" {
+                    no_walk = true;
+                } else if let Some(v) = s.strip_prefix("--no-walk=") {
+                    if v != "sorted" && v != "unsorted" {
+                        eprintln!("error: invalid argument to --no-walk");
+                        eprintln!("fatal: unrecognized argument: {s}");
+                        return Ok(ExitCode::from(128));
+                    }
+                    no_walk = true;
+                } else if s == "--do-walk" {
+                    no_walk = false;
+                // `--reverse` reverses what `cmd_log_walk` emits; `cmd_show`'s own
+                // pending loop never consults it, so it does nothing while
+                // `no_walk` stands.
+                } else if s == "--reverse" {
+                    // `revs->reverse ^= 1` (revision.c): a toggle, so an even
+                    // number of `--reverse`s leaves the order alone.
+                    reverse = !reverse;
+                // The ref-selecting pseudo-options, at the slot `setup_revisions()`
+                // would pend their refs at. `--glob` and `--exclude` may carry
+                // their value as the next argv element (`parse_long_opt`), which
+                // the pending flags above collect.
+                } else if s == "--glob" {
+                    pending_ref_value = Some(true);
+                } else if s == "--exclude" {
+                    pending_ref_value = Some(false);
+                } else if let Some(v) = s.strip_prefix("--exclude=") {
+                    ref_excludes.push(v.to_string());
+                } else if let Some((sel, pattern)) = super::log::ref_selector(s) {
+                    if negate_revs {
+                        no_walk = false;
+                    }
+                    ref_selections.push(super::log::RefSelection::new(
+                        specs.len(),
+                        sel,
+                        pattern,
+                        std::mem::take(&mut ref_excludes),
+                        negate_revs,
+                    ));
                 } else if s.starts_with('-') {
                     bail!("unsupported option {s}");
                 } else {
+                    // `add_pending_object_with_path()` clears `revs->no_walk` the
+                    // moment an UNINTERESTING object is pended, so the two are
+                    // positional against each other: `git show A..B --no-walk`
+                    // prints the pending objects, `git show --no-walk A..B` walks.
+                    if super::log::argument_excludes(s, negate_revs) {
+                        no_walk = false;
+                    }
                     specs.push(s);
                     spec_negated.push(negate_revs);
                 }
@@ -523,13 +664,18 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
     // `--not` state the last argument left behind — git reads them through the same
     // `handle_revision_arg()` with the same `flags`.
     for line in stdin_text.lines().filter(|l| !l.is_empty()) {
+        if super::log::argument_excludes(line, negate_revs) {
+            no_walk = false;
+        }
         specs.push(line);
         spec_negated.push(negate_revs);
     }
 
     // `revs->def`: the fallback pending object is added with no flags at all, so a
-    // trailing `--not` never turns the implicit `HEAD` into an exclusion.
-    if specs.is_empty() {
+    // trailing `--not` never turns the implicit `HEAD` into an exclusion. A ref
+    // selection is `rev_input_given` too (`init_all_refs_cb`), so `git show --tags`
+    // never adds `HEAD` on top of the tags it named.
+    if specs.is_empty() && ref_selections.is_empty() {
         specs.push("HEAD");
         spec_negated.push(false);
     }
@@ -643,94 +789,178 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
     // a revision walk; plain object names are shown directly.
     let mut walk_tips: Vec<ObjectId> = Vec::new();
     let mut walk_hidden: Vec<ObjectId> = Vec::new();
-    let mut plain: Vec<(&str, ObjectId)> = Vec::new();
-    let mut needs_walk = false;
+    let mut plain: Vec<(String, ObjectId)> = Vec::new();
+    // Commits the command line already caused to be parsed, which is as far as
+    // `mark_parents_uninteresting()` reaches while `no_walk` stands.
+    let mut parsed_commits: std::collections::HashSet<ObjectId> =
+        std::collections::HashSet::new();
     // Parallel to `walk_tips` and used only under `--source`: the name git records
     // for each pending object, which is the endpoint token rather than the whole
     // argument (`main~2..main` names its tip `main`).
     let mut walk_tip_sources: Vec<String> = Vec::new();
-    for (spec, negated) in specs.iter().zip(spec_negated.iter().copied()) {
+    // The ref-selecting pseudo-options pend their refs at the argument index they
+    // were written at, ahead of the revision that stood there.
+    let mut push_ref_tips = |at: usize,
+                             walk_tips: &mut Vec<ObjectId>,
+                             walk_tip_sources: &mut Vec<String>,
+                             walk_hidden: &mut Vec<ObjectId>,
+                             plain: &mut Vec<(String, ObjectId)>,
+                             no_walk: &mut bool|
+     -> Result<()> {
+        for sel in ref_selections.iter().filter(|s| s.at == at) {
+            let mut pend = |oid: ObjectId, name: &str| {
+                if sel.negated {
+                    *no_walk = false;
+                    walk_hidden.push(oid);
+                    return;
+                }
+                plain.push((name.to_string(), oid));
+                walk_tips.push(oid);
+                walk_tip_sources.push(name.to_string());
+            };
+            for reference in repo.references()?.all()? {
+                let Ok(reference) = reference else { continue };
+                let full = reference.name().as_bstr().to_string();
+                let Some(name) = sel.selects(&full) else { continue };
+                let Ok(id) = reference.into_fully_peeled_id() else { continue };
+                let oid = id.detach();
+                if !repo.find_object(oid).is_ok_and(|o| o.kind == Kind::Commit) {
+                    continue;
+                }
+                pend(oid, name);
+            }
+            if sel.head && !sel.excluded("HEAD") {
+                if let Some(id) = repo.head().ok().and_then(|mut h| h.try_peel_to_id().ok().flatten())
+                {
+                    pend(id.detach(), "HEAD");
+                }
+            }
+        }
+        Ok(())
+    };
+    for (at, (spec, negated)) in specs.iter().zip(spec_negated.iter().copied()).enumerate() {
+        push_ref_tips(
+            at,
+            &mut walk_tips,
+            &mut walk_tip_sources,
+            &mut walk_hidden,
+            &mut plain,
+            &mut no_walk,
+        )?;
+        // The `~<n>`/`^<n>` chains a token navigates are how far
+        // `mark_parents_uninteresting()` can reach while `no_walk` stands.
+        for endpoint in spec.trim_start_matches('^').split("..") {
+            let e = endpoint.trim_start_matches('.');
+            parsed_commits.extend(super::log::navigation_path(
+                &repo,
+                if e.is_empty() { "HEAD" } else { e },
+            ));
+        }
         let parsed = match repo.rev_parse(BStr::new(*spec)) {
             Ok(p) => p.detach(),
-            Err(_) => return Ok(fatal(&bad_revision_message(spec, hex_len))),
+            Err(_) => return Ok(bad_revision(spec, hex_len)),
         };
         match parsed {
             // `--not <rev>` and `^<rev>` are the same thing twice: `handle_revision_arg_1`
             // flips `UNINTERESTING` once for the `^` and `setup_revisions` flips it once
             // for the `--not`, so the two together cancel back to a positive revision.
             RevSpec::Include(id) if negated => {
-                needs_walk = true;
+                plain.push(((*spec).to_string(), id));
                 walk_hidden.push(id);
             }
             RevSpec::Include(id) => {
-                plain.push((*spec, id));
+                plain.push(((*spec).to_string(), id));
                 walk_tips.push(id);
                 walk_tip_sources.push((*spec).to_string());
             }
-            // `<rev>^!` is `add_parents_only()` with the flags flipped: the commit
-            // itself stays positive while every parent is added UNINTERESTING, which
-            // clears `no_walk` and makes the record a one-commit walk. It matters as
-            // soon as a second argument names one of those parents — `git show HEAD^!
-            // HEAD^@` prints the merge alone, because the `^@` parents are already
-            // excluded by the `^!`.
+            // `<rev>^!` is `add_parents_only()` with the flags flipped: every parent
+            // is pended UNINTERESTING *first*, and only then does
+            // `handle_revision_arg_1()` fall through and pend the commit itself
+            // positive. That clears `no_walk` and makes the record a one-commit
+            // walk. It matters as soon as a second argument names one of those
+            // parents — `git show HEAD^! HEAD^@` prints the merge alone, because
+            // the `^@` parents are already excluded by the `^!`.
             RevSpec::ExcludeParents(id) => {
-                needs_walk = true;
                 let parents = parents_of(&repo, id)?;
                 if negated {
-                    walk_hidden.push(id);
                     for p in parents {
+                        plain.push(((*spec).to_string(), p));
                         walk_tips.push(p);
                         walk_tip_sources.push((*spec).to_string());
                     }
+                    plain.push(((*spec).to_string(), id));
+                    walk_hidden.push(id);
                 } else {
-                    plain.push((*spec, id));
+                    for p in &parents {
+                        plain.push(((*spec).to_string(), *p));
+                    }
+                    walk_hidden.extend(parents);
+                    plain.push(((*spec).to_string(), id));
                     walk_tips.push(id);
                     walk_tip_sources.push((*spec).to_string());
-                    walk_hidden.extend(parents);
                 }
             }
             RevSpec::Exclude(id) if negated => {
-                plain.push((*spec, id));
+                plain.push(((*spec).to_string(), id));
                 walk_tips.push(id);
                 walk_tip_sources.push((*spec).to_string());
             }
             RevSpec::Exclude(id) => {
-                needs_walk = true;
+                plain.push(((*spec).to_string(), id));
                 walk_hidden.push(id);
             }
             RevSpec::Range { from, to } => {
                 // `A..B` is `^A B`, and under `--not` each endpoint takes the other
-                // side — `handle_dotdot_1` derives both from the one `flags` word.
-                needs_walk = true;
+                // side — `handle_dotdot_1` derives both from the one `flags` word,
+                // and pends the excluded endpoint first.
                 let (tip, hidden, right) = if negated { (from, to, false) } else { (to, from, true) };
-                walk_tips.push(tip);
-                walk_tip_sources.push(range_endpoint(spec, "..", right));
+                let name = range_endpoint(spec, "..", right);
+                plain.push((range_endpoint(spec, "..", !right), hidden));
                 walk_hidden.push(hidden);
+                // The positive endpoint is an ordinary pending object, which is
+                // what `cmd_show` prints when a later `--no-walk` restored the
+                // flag the range had cleared.
+                plain.push((name.clone(), tip));
+                walk_tips.push(tip);
+                walk_tip_sources.push(name);
             }
             RevSpec::Merge { theirs, ours } => {
                 // `theirs...ours` = reachable from either but not both, which git
                 // computes as `theirs ours --not $(merge-base theirs ours)`. Under
                 // `--not` the endpoints take the excluded flags and the merge bases
                 // the positive ones: the same three objects with their sides swapped.
-                needs_walk = true;
                 let bases: Vec<ObjectId> = repo
                     .merge_bases_many(theirs, &[ours])?
                     .iter()
                     .map(|c| c.detach())
                     .collect();
+                // `paint_down_to_common()` parses its way from both endpoints
+                // past the bases, so a base's whole ancestry is loaded before
+                // `mark_parents_uninteresting()` runs over it.
+                parsed_commits.extend(super::log::ancestor_closure(&repo, &bases)?);
+                // `handle_dotdot_1()` pends the merge bases before either endpoint.
+                let (left, right) =
+                    (range_endpoint(spec, "...", false), range_endpoint(spec, "...", true));
+                for mb in &bases {
+                    plain.push(((*spec).to_string(), *mb));
+                }
                 if negated {
-                    walk_hidden.push(theirs);
-                    walk_hidden.push(ours);
                     for mb in bases {
                         walk_tips.push(mb);
                         walk_tip_sources.push((*spec).to_string());
                     }
+                    plain.push((left, theirs));
+                    plain.push((right, ours));
+                    walk_hidden.push(theirs);
+                    walk_hidden.push(ours);
                 } else {
-                    walk_tips.push(theirs);
-                    walk_tip_sources.push(range_endpoint(spec, "...", false));
-                    walk_tips.push(ours);
-                    walk_tip_sources.push(range_endpoint(spec, "...", true));
                     walk_hidden.extend(bases);
+                    plain.push((left.clone(), theirs));
+                    plain.push((right.clone(), ours));
+                    walk_tips.push(theirs);
+                    walk_tip_sources.push(left);
+                    walk_tips.push(ours);
+                    walk_tip_sources.push(right);
                 }
             }
             // `<rev>^@` is `add_parents_only()` with the plain flags: the parents enter
@@ -740,10 +970,10 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
             RevSpec::IncludeOnlyParents(id) => {
                 for p in parents_of(&repo, id)? {
                     if negated {
-                        needs_walk = true;
+                        plain.push(((*spec).to_string(), p));
                         walk_hidden.push(p);
                     } else {
-                        plain.push((*spec, p));
+                        plain.push(((*spec).to_string(), p));
                         walk_tips.push(p);
                         walk_tip_sources.push((*spec).to_string());
                     }
@@ -751,11 +981,21 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
             }
         }
     }
+    // Ref selections written after the last revision argument.
+    push_ref_tips(
+        specs.len(),
+        &mut walk_tips,
+        &mut walk_tip_sources,
+        &mut walk_hidden,
+        &mut plain,
+        &mut no_walk,
+    )?;
     // Any `^<rev>` clears `revs->no_walk` (`add_pending_object_with_path`), so `cmd_show` hands
     // the whole pending list to `cmd_log_walk` instead of printing the objects one by one. Both
     // gates that list then passes — `check_single_commit`'s `deref_tag` and `handle_commit`'s tag
     // loop — see through an annotated tag to the commit it names, on the positive and the negative
     // side alike, which is why `git show v1 ^v1` prints nothing rather than the tag's own header.
+    let needs_walk = !no_walk;
     if needs_walk {
         for id in walk_tips.iter_mut().chain(walk_hidden.iter_mut()) {
             if let Some(peeled) = repo
@@ -784,18 +1024,41 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
         walk_tips = tips;
         walk_tip_sources = sources;
     }
-    // `--source` over a walk: resolve each reached commit's source with git's own
-    // inheritance rule, shared with `git log --source`.
-    let sources = if source_mode && needs_walk {
-        super::log::source_map(
+    // `cmd_show` hands its pending list to `cmd_log_walk`, so the traversal is
+    // `git log`'s: a commit-date-ordered frontier whose ties break by the order
+    // tips and parents entered it. Sharing `git log`'s walk is what keeps
+    // `git show <range>` from ordering a merge's two lanes differently from
+    // `git log <range>` — gitoxide's default `Sorting::BreadthFirst` did.
+    let walked = if needs_walk && !line_level {
+        let hidden = if walk_hidden.is_empty() {
+            std::collections::HashSet::new()
+        } else {
+            super::log::ancestor_closure(&repo, &walk_hidden)?
+        };
+        let nodes = super::log::walk(
             &repo,
             &walk_tips,
             &walk_tip_sources,
             first_parent,
-            &walk_hidden,
-        )?
+            &hidden,
+            None,
+            None,
+        )?;
+        if order == super::log::Order::Default {
+            nodes
+        } else {
+            super::log::topo_sort(nodes, order == super::log::Order::Date)
+        }
     } else {
-        std::collections::HashMap::new()
+        Vec::new()
+    };
+    // While `no_walk` stands nothing paints UNINTERESTING over the history, so a
+    // pending object is dropped only when `mark_parents_uninteresting()` already
+    // reached it (`get_commit_action`'s `commit_ignore`).
+    let no_walk_hidden = if !needs_walk && !walk_hidden.is_empty() {
+        super::log::no_walk_uninteresting(&repo, &walk_hidden, &parsed_commits)
+    } else {
+        std::collections::HashSet::new()
     };
 
     let selection = match formats.resolve() {
@@ -842,6 +1105,7 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
         decorations: decorations.as_ref(),
         mailmap: mailmap.as_ref(),
         z,
+        expand_tabs,
     };
     if line_level {
         // `check_single_commit`: the ranges are resolved against exactly one pending
@@ -870,29 +1134,13 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
         if needs_walk {
             // A range endpoint clears `no_walk`, so this is `cmd_log_walk` — the same
             // line-level traversal `git log -L` runs, topological order included.
-            let mut nodes: Vec<super::log::Node> = Vec::new();
-            let mut platform = repo.rev_walk(vec![start]).with_hidden(walk_hidden);
-            if first_parent {
-                platform = platform.first_parent_only();
-            }
-            for info in platform.all()? {
-                let info = info?;
-                let commit = repo.find_object(info.id)?.try_into_commit()?;
-                nodes.push(super::log::Node {
-                    follow_path: None,
-                    id: info.id,
-                    parents: commit.parent_ids().map(|p| p.detach()).collect(),
-                    time: commit.time()?.seconds,
-                    source: String::new(),
-                    // These are collected in walk order and topologically sorted
-                    // below, never through the date-ordered heap.
-                    seq: 0,
-                    boundary: false,
-                    // `git show -L` never draws a graph.
-                    graph_width: 0,
-                });
-            }
-            nodes = super::log::topo_sort(nodes, false);
+            let hidden = if walk_hidden.is_empty() {
+                std::collections::HashSet::new()
+            } else {
+                super::log::ancestor_closure(&repo, &walk_hidden)?
+            };
+            let nodes = super::log::walk(&repo, &[start], &[], first_parent, &hidden, None, None)?;
+            let nodes = super::log::topo_sort(nodes, false);
             let mut tracker = line_log::Tracker::new(&repo, start, tracked, first_parent);
             for node in &nodes {
                 let (Some(range), _) = tracker.process(node.id, &node.parents)? else {
@@ -920,21 +1168,43 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
             show_one(&repo, &mut out, spec, start, &pretty, selection, &pathspecs, &disp, &pickaxe, &mut shown, source_mode.then_some(spec), &mut shown_one, Some(&pairs))?;
         }
     } else if needs_walk {
-        let mut platform = repo.rev_walk(walk_tips).with_hidden(walk_hidden);
-        if first_parent {
-            platform = platform.first_parent_only();
+        // `--reverse` is applied to what the walk produced, which is where
+        // `get_revision()` applies it too.
+        let mut nodes = walked;
+        if reverse {
+            nodes.reverse();
         }
-        let walk = platform.all()?;
-        for info in walk {
-            let id = info?.id;
-            let source = source_mode
-                .then(|| sources.get(&id).cloned().unwrap_or_default())
-                .unwrap_or_default();
-            show_one(&repo, &mut out, &id.to_string(), id, &pretty, selection, &pathspecs, &disp, &pickaxe, &mut shown, source_mode.then_some(source.as_str()), &mut shown_one, None)?;
+        for node in &nodes {
+            let id = node.id;
+            show_one(&repo, &mut out, &id.to_string(), id, &pretty, selection, &pathspecs, &disp, &pickaxe, &mut shown, source_mode.then_some(node.source.as_str()), &mut shown_one, None)?;
         }
     } else {
+        // `cmd_show` reuses one `rev_info` across its pending loop, and the first
+        // commit it hands to `cmd_log_walk` consumes `--reverse`
+        // (`revs->reverse = 0; revs->reverse_output_stage = 1`, revision.c:4683).
+        // Every commit after that is popped straight off `revs->commits`
+        // (revision.c:4687-4692), past the `commit_ignore` check
+        // `get_revision_internal()` would have applied — which is why
+        // `git show --no-walk --reverse main ^main~2` prints `main~2` as well.
+        let mut reverse_stage = false;
+        // `handle_commit()` sets SEEN on the object, and the flag outlives the
+        // one-entry walk it was set in, so a commit pended twice — the merge base
+        // of `A...B` and the endpoint that names it, say — is walked once.
+        let mut seen_pending: Vec<ObjectId> = Vec::new();
         for (spec, id) in &plain {
-            show_one(&repo, &mut out, spec, *id, &pretty, selection, &pathspecs, &disp, &pickaxe, &mut shown, source_mode.then_some(*spec), &mut shown_one, None)?;
+            let is_commit = repo.find_object(*id).is_ok_and(|o| o.kind == Kind::Commit);
+            if is_commit {
+                if seen_pending.contains(id) {
+                    continue;
+                }
+                seen_pending.push(*id);
+                if !reverse_stage && no_walk_hidden.contains(id) {
+                    reverse_stage = reverse;
+                    continue;
+                }
+                reverse_stage = reverse;
+            }
+            show_one(&repo, &mut out, spec, *id, &pretty, selection, &pathspecs, &disp, &pickaxe, &mut shown, source_mode.then_some(spec.as_str()), &mut shown_one, None)?;
         }
     }
 
@@ -989,18 +1259,13 @@ fn fatal(msg: &str) -> ExitCode {
     ExitCode::from(128)
 }
 
-/// git distinguishes a well-formed but absent object id from an unresolvable name:
-/// the former is a "bad object", the latter an "ambiguous argument".
-fn bad_revision_message(spec: &str, hex_len: usize) -> String {
-    if spec.len() == hex_len && spec.bytes().all(|b| b.is_ascii_hexdigit()) {
-        format!("bad object {spec}\n")
-    } else {
-        format!(
-            "ambiguous argument '{spec}': unknown revision or path not in the working tree.\n\
-             Use '--' to separate paths from revisions, like this:\n\
-             'git <command> [<revision>...] -- [<file>...]'\n"
-        )
-    }
+/// The fatal `setup_revisions()` raises for an unresolvable revision argument,
+/// shared with `git log` — `cmd_show` runs the same `cmd_log_init`. Already
+/// carries its own `fatal: ` prefix, so it goes to stderr directly rather than
+/// through [`fatal`].
+fn bad_revision(spec: &str, hex_len: usize) -> ExitCode {
+    eprint!("{}", super::log::bad_revision_message(spec, hex_len));
+    ExitCode::from(128)
 }
 
 // ---------------------------------------------------------------------------
@@ -1343,6 +1608,10 @@ struct DisplayOpts<'a> {
     /// terminator too — `git show --name-status -z --format=%H` ends the id with a
     /// NUL — and, for a merge's combined record, the separator that follows it.
     z: bool,
+    /// `revs->expand_tabs_in_log`, when `--expand-tabs[=<n>]`/`--no-expand-tabs`
+    /// set one. `None` leaves the indented header formats on
+    /// `expand_tabs_in_log_default`, which is 8.
+    expand_tabs: Option<usize>,
 }
 
 /// A path as a record field: quoted the way `write_name_quoted()` does it, or raw
@@ -1469,7 +1738,16 @@ fn show_one(
                 break;
             }
             Kind::Tree => {
+                // `case OBJ_TREE:` in `cmd_show` — `if (rev.shown_one) putchar('\n')`
+                // before the header, `rev.shown_one = 1` after the listing. Both
+                // halves matter: without the first a tree run into a preceding
+                // record, without the second whatever followed a tree ran into it.
+                // `OBJ_BLOB` does neither, which is why a blob has no separator.
+                if *shown_one {
+                    out.push(b'\n');
+                }
                 show_tree(out, &obj, spec)?;
+                *shown_one = true;
                 break;
             }
             Kind::Commit => {
@@ -1703,13 +1981,11 @@ fn show_commit(
             out.push(b'\n');
 
             // Message, each line indented four spaces (blank lines become four
-            // spaces), with trailing blank lines stripped.
-            let msg = commit.message_raw()?;
-            for line in trim_trailing_newlines(msg).split(|&b| b == b'\n') {
-                out.extend_from_slice(b"    ");
-                out.extend_from_slice(line);
-                out.push(b'\n');
-            }
+            // spaces), with trailing blank lines stripped — and its tabs expanded
+            // against the message's own left edge, which is what keeps whatever
+            // the author lined up in columns from shifting under the indent.
+            // Shared with `git log`, whose `medium`/`full`/`fuller` do the same.
+            super::log::indent_message(out, commit.message_raw()?, disp.expand_tabs.unwrap_or(8));
             out.extend_from_slice(&notes_block(repo, disp, commit.id().detach())?);
         }
     }

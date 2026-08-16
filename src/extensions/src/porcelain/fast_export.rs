@@ -15,17 +15,32 @@
 //!
 //! ### Argument handling
 //!
-//! git processes a `fast-export` command line in a fixed order, and the exit
-//! code depends on which stage rejects it. This module reproduces that order:
+//! git processes a `fast-export` command line in a fixed order, and the exit code
+//! depends on which stage rejects it. The order is *not* argv order: `cmd_
+//! fast_export` runs its own `parse_options` to completion before `setup_revisions`
+//! ever sees argv, so every option fast-export owns is diagnosed ahead of every
+//! rev-list option, diff option and revision argument, wherever they sit relative
+//! to one another. This module reproduces the stages:
 //!
 //! 1. no arguments at all → the option usage on stderr, exit 129
-//! 2. `setup_revisions` classifies each positional: a spec that resolves is a
-//!    revision; one that names a working-tree path is a pathspec; one that is
-//!    neither is `fatal: ambiguous argument ...`, exit 128. A `--` here is inert
-//!    — git consumes it and classifies the rest identically.
-//! 3. leftover/unknown arguments → the option usage on stderr, exit 129
-//! 4. `--anonymize-map` without `--anonymize` → fatal, exit 128
-//! 5. `--ancestry-path` with no negative revision → fatal, exit 128
+//! 2. `parse_options` sweeps the whole command line for fast-export's own table
+//!    (`--signed-tags`, `--signed-commits`, `--tag-of-filtered-object`,
+//!    `--reencode`, `--progress`, `--anonymize`, `--export-marks`, …). A bad value
+//!    is its callback's own `error: <msg>` line — no option list behind it — and
+//!    exit 129. `PARSE_OPT_KEEP_UNKNOWN_OPT` copies everything else through in
+//!    order for stage 3, and `--` ends this sweep and is dropped, so an option
+//!    behind the separator is never fast-export's to parse (nor is a `-h`).
+//! 3. `setup_revisions` walks what survived, left to right, so here the *earlier*
+//!    argument wins: `--max-count`/`--skip` die `fatal: '<v>': not an integer`
+//!    (128), a malformed `-M`/`-C`/`-B` score is `error: …` (129), and a positional
+//!    that resolves is a revision. One that does not ends revision parsing
+//!    outright: it and every argument after it are pathspecs, checked by
+//!    `verify_filename` — so a later `--max-count=1` is reported as a path
+//!    beginning with `-`, not applied. A `^` that fails is `fatal: bad revision`,
+//!    since it could only ever have been a revision.
+//! 4. leftover/unknown arguments → the option usage on stderr, exit 129
+//! 5. `--anonymize-map` without `--anonymize` → fatal, exit 128
+//! 6. `--ancestry-path` with no negative revision → fatal, exit 128
 //!
 //! ### Covered (byte-identical stdout, exit code and marks file against stock git)
 //!
@@ -50,7 +65,12 @@
 //!   `--import-marks` dies `could not open '<file>' for reading` (128) on a
 //!   missing file; the `-if-exists` form treats it as empty
 //! * `--reference-excluded-parents` — a parent outside the stream is named by raw
-//!   object id (`from <oid>` / `merge <oid>`) instead of being dropped
+//!   object id (`from <oid>` / `merge <oid>`) instead of being dropped, and naming
+//!   it changes two more things: the commit is diffed against that parent's tree
+//!   rather than emitted as a root against the empty one, and a ref left on an
+//!   excluded commit is `reset` to its object id instead of the null oid. Under
+//!   `--anonymize` the `from` goes through `anonymize_oid` but the trailing `reset`
+//!   does not, matching git
 //! * `--refspec=<src>:<dst>` — renames exported ref labels/resets/tags through the
 //!   exact and single-`*` wildcard forms; a ref matching no refspec passes through
 //! * `--anonymize` with `--no-data`, `--show-original-ids`, or a gitlink entry —
@@ -174,16 +194,6 @@ fn usage_error(msg: &str) -> ExitCode {
     ExitCode::from(129)
 }
 
-/// git's `die()` for a revision that neither resolves nor names a path.
-fn fatal_ambiguous(arg: &str) -> ExitCode {
-    eprint!(
-        "fatal: ambiguous argument '{arg}': unknown revision or path not in the working tree.\n\
-         Use '--' to separate paths from revisions, like this:\n\
-         'git <command> [<revision>...] -- [<file>...]'\n"
-    );
-    ExitCode::from(128)
-}
-
 /// git's `die()`: `fatal: <msg>` on stderr, exit 128.
 fn fatal(msg: &str) -> ExitCode {
     eprintln!("fatal: {msg}");
@@ -215,9 +225,13 @@ enum SignedMode {
 }
 
 impl SignedMode {
+    /// git's `parse_sign_mode` (`gpg-interface.c`) as narrowed by fast-export's
+    /// `parse_opt_sign_mode`, which additionally rejects the three
+    /// `*-if-invalid` modes `parse_sign_mode` accepts — they are for signing, not
+    /// exporting, so fast-export treats them as unknown like any other word.
     fn parse(s: &str) -> Option<Self> {
         Some(match s {
-            "verbatim" => SignedMode::Verbatim,
+            "verbatim" | "ignore" => SignedMode::Verbatim,
             "warn" | "warn-verbatim" => SignedMode::WarnVerbatim,
             "warn-strip" => SignedMode::WarnStrip,
             "strip" => SignedMode::Strip,
@@ -308,7 +322,6 @@ pub fn fast_export(args: &[String]) -> Result<ExitCode> {
     };
 
     // Revision selection, in command-line order so `--not` scopes correctly.
-    let mut rev_tokens: Vec<(String, bool)> = Vec::new();
     let mut negate_rest = false;
     let (mut use_all, mut use_branches, mut use_tags, mut use_remotes, mut use_reflog) =
         (false, false, false, false, false);
@@ -331,12 +344,143 @@ pub fn fast_export(args: &[String]) -> Result<ExitCode> {
     let mut import_marks: Option<(String, bool)> = None;
     let mut refspecs: Vec<String> = Vec::new();
     let mut pathspecs: Vec<String> = Vec::new();
-    // Set once a `--` has been seen, which is where `parse_options_step()` stops
-    // looking for `-h`/`--help-all`.
-    let mut after_dashdash = false;
 
-    for a in args {
+    // ---- Stage 1: git's `parse_options` over fast-export's own option table. ----
+    // `cmd_fast_export` runs `parse_options(..., PARSE_OPT_KEEP_ARGV0 |
+    // PARSE_OPT_KEEP_UNKNOWN_OPT)` to completion *before* `setup_revisions` ever
+    // looks at argv, so this is a full left-to-right sweep of its own table and
+    // nothing else: an option it owns reports its error here, ahead of anything a
+    // later rev-list option, diff option or revision argument would have said.
+    // Options it does not own — and every positional — are kept, in order, for
+    // stage 2. `parse_options_step()` breaks on `--` and, with
+    // `PARSE_OPT_KEEP_DASHDASH` unset, drops it, so a token behind the separator
+    // is no longer fast-export's to parse and reaches `setup_revisions` verbatim.
+    // The `-h` test lives inside that same loop, which is why a `-h` behind the
+    // separator is not a help request either.
+    let mut rest: Vec<&str> = Vec::new();
+    let mut argv = args.iter();
+    while let Some(a) = argv.next() {
         let s = a.as_str();
+        match s {
+            "--" => {
+                rest.extend(argv.map(String::as_str));
+                break;
+            }
+
+            // parse_options()'s own `-h`: the block on stdout, exit 129 — not
+            // `usage_exit()`, whose stderr is reserved for rejections.
+            // `--help-all` reaches the same renderer with USAGE_FULL, which this
+            // table renders identically: it has no `PARSE_OPT_HIDDEN` entry.
+            "-h" | "--help-all" => return Ok(super::show_usage(USAGE)),
+
+            "--no-data" => opts.no_data = true,
+            "--data" => opts.no_data = false,
+            "--full-tree" => opts.full_tree = true,
+            "--use-done-feature" => opts.use_done = true,
+            "--show-original-ids" => opts.show_original_ids = true,
+            "--mark-tags" => opts.mark_tags = true,
+            "--fake-missing-tagger" => opts.fake_missing_tagger = true,
+            "--anonymize" => opts.anonymize = true,
+            "--reference-excluded-parents" => opts.reference_excluded_parents = true,
+
+            _ if s.starts_with("--progress=") => {
+                // git's `--progress` is a parse-options `OPTION_INTEGER`: base-0
+                // magnitude, an optional k/m/g suffix, a signed C-int range. A
+                // value outside that is `opterror()`'s single `error:` line and
+                // exit 129, with no option list behind it.
+                let v = &s["--progress=".len()..];
+                match parse_progress_int(v) {
+                    Some(n) => opts.progress = Some(n),
+                    None => {
+                        return Ok(usage_error(
+                            "option `progress' expects an integer value with an optional k/m/g suffix",
+                        ))
+                    }
+                }
+            }
+            _ if s.starts_with("--export-marks=") => {
+                opts.export_marks = Some(s["--export-marks=".len()..].to_string());
+            }
+            _ if s.starts_with("--import-marks=") => {
+                import_marks = Some((s["--import-marks=".len()..].to_string(), false));
+            }
+            _ if s.starts_with("--import-marks-if-exists=") => {
+                import_marks = Some((s["--import-marks-if-exists=".len()..].to_string(), true));
+            }
+            _ if s.starts_with("--refspec=") => {
+                refspecs.push(s["--refspec=".len()..].to_string());
+            }
+            _ if s.starts_with("--anonymize-map=") => {
+                anonymize_map.push(s["--anonymize-map=".len()..].to_string());
+            }
+            // git's `parse_opt_sign_mode` names the failing option through
+            // `opt->long_name`, so the two sign-mode options share one message
+            // shape and differ only in that name.
+            _ if s.starts_with("--signed-tags=") => {
+                let v = &s["--signed-tags=".len()..];
+                match SignedMode::parse(v) {
+                    Some(m) => opts.signed_tags = m,
+                    None => return Ok(usage_error(&format!("unknown signed-tags mode: {v}"))),
+                }
+            }
+            _ if s.starts_with("--signed-commits=") => {
+                let v = &s["--signed-commits=".len()..];
+                match SignedMode::parse(v) {
+                    Some(m) => opts.signed_commits = m,
+                    None => return Ok(usage_error(&format!("unknown signed-commits mode: {v}"))),
+                }
+            }
+            _ if s.starts_with("--tag-of-filtered-object=") => {
+                let v = &s["--tag-of-filtered-object=".len()..];
+                opts.filtered_tag = match v {
+                    "abort" => FilteredTagMode::Abort,
+                    "drop" => FilteredTagMode::Drop,
+                    "rewrite" => FilteredTagMode::Rewrite,
+                    // `parse_opt_tag_of_filtered_mode` spells the option short.
+                    _ => return Ok(usage_error(&format!("unknown tag-of-filtered mode: {v}"))),
+                };
+            }
+            _ if s.starts_with("--reencode=") => {
+                // git's `parse_opt_reencode_mode`: a `git_parse_maybe_bool` value
+                // (so `yes`/`true`/`on`/`1`/any non-zero int → yes, `no`/`false`/
+                // `off`/`0`/empty → no), else a case-insensitive `abort`.
+                let v = &s["--reencode=".len()..];
+                match parse_reencode(v) {
+                    Some(m) => opts.reencode = m,
+                    None => return Ok(usage_error(&format!("unknown reencoding mode: {v}"))),
+                }
+            }
+
+            // Not fast-export's: `PARSE_OPT_KEEP_UNKNOWN_OPT` copies it through
+            // for `setup_revisions`, and so does a bare positional.
+            _ => rest.push(s),
+        }
+    }
+
+    let repo = gix::discover(".")?;
+
+    // ---- Stage 2: `setup_revisions` over what `parse_options` kept. ----
+    // Before its own sweep, `setup_revisions` searches the argv it was handed for
+    // a `--` and truncates there, pushing everything behind the separator into
+    // `prune_data` as pathspecs without inspecting them at all. fast-export's
+    // `parse_options` already consumed the *first* `--`, so this only ever fires
+    // on a second one — and when it does, `seen_dashdash` also declares every
+    // argument in front of it a revision.
+    let mut seen_dashdash = false;
+    if let Some(p) = rest.iter().position(|t| *t == "--") {
+        pathspecs.extend(rest[p + 1..].iter().map(|t| t.to_string()));
+        rest.truncate(p);
+        seen_dashdash = true;
+    }
+
+    // Then one left-to-right sweep, so the first rejection in *this* stream wins
+    // — a bad `--max-count` before a bad revision reports the integer, and the
+    // other way round reports the ambiguous argument.
+    let mut sel = Selection::default();
+    let mut i = 0;
+    while i < rest.len() {
+        let s = rest[i];
+        i += 1;
         // git's `setup_revisions` forwards the diffcore rename/copy/break-detection
         // options (`-M`/`-C`/`-B` and their long forms) straight into
         // `diff_scoreopt_parse`. They only steer diffcore-rename, whose `R`/`C`
@@ -349,36 +493,6 @@ pub fn fast_export(args: &[String]) -> Result<ExitCode> {
             RenameOpt::Other => {}
         }
         match s {
-            // git keeps `--` in argv but, once its own `parse_options` has run,
-            // `setup_revisions` classifies each following token exactly as it
-            // classifies one before `--`: a rev, an existing path, or a fatal.
-            // For fast-export the separator therefore has no observable effect,
-            // so it is consumed and the tokens after it flow through the same
-            // rev/pathspec resolution as the ones before (see the resolve stage).
-            // The one exception is the help request: `parse_options_step()`
-            // *breaks* on `--` before it ever tests `internal_help`, so a `-h`
-            // or `--help-all` behind the separator is not a help request at all
-            // — it reaches `setup_revisions` as a stray `-`-token and leaves
-            // through `usage_exit()`'s stderr like any other.
-            "--" => after_dashdash = true,
-
-            // parse_options()'s own `-h`: the block on stdout, exit 129 — not
-            // `usage_exit()`, whose stderr is reserved for rejections.
-            // `--help-all` reaches the same renderer with USAGE_FULL, which this
-            // table renders identically: it has no `PARSE_OPT_HIDDEN` entry.
-            "-h" | "--help-all" if !after_dashdash => return Ok(super::show_usage(USAGE)),
-
-            // ---- fast-export's own options ----
-            "--no-data" => opts.no_data = true,
-            "--data" => opts.no_data = false,
-            "--full-tree" => opts.full_tree = true,
-            "--use-done-feature" => opts.use_done = true,
-            "--show-original-ids" => opts.show_original_ids = true,
-            "--mark-tags" => opts.mark_tags = true,
-            "--fake-missing-tagger" => opts.fake_missing_tagger = true,
-            "--anonymize" => opts.anonymize = true,
-            "--reference-excluded-parents" => opts.reference_excluded_parents = true,
-
             // ---- rev-list selection ----
             "--all" => use_all = true,
             "--branches" => use_branches = true,
@@ -402,16 +516,6 @@ pub fn fast_export(args: &[String]) -> Result<ExitCode> {
             // untouched, which is the only way fast-export can be invoked here.
             "--full-history" | "--simplify-merges" | "--sparse" | "--dense" => {}
 
-            _ if s.starts_with("--progress=") => {
-                // git's `--progress` is a parse-options `OPTION_INTEGER`: base-0
-                // magnitude, an optional k/m/g suffix, a signed C-int range, and
-                // a *usage* (129) error on anything else.
-                let v = &s["--progress=".len()..];
-                match parse_progress_int(v) {
-                    Some(n) => opts.progress = Some(n),
-                    None => return Ok(usage_exit()),
-                }
-            }
             _ if s.starts_with("--max-count=") => {
                 // rev-list's `--max-count` is a strict signed decimal (`atoi`
                 // family): garbage dies `fatal: '<v>': not an integer` (128, not
@@ -430,81 +534,41 @@ pub fn fast_export(args: &[String]) -> Result<ExitCode> {
                     None => return Ok(fatal(&format!("'{v}': not an integer"))),
                 }
             }
-            _ if s.starts_with("--export-marks=") => {
-                opts.export_marks = Some(s["--export-marks=".len()..].to_string());
-            }
-            _ if s.starts_with("--import-marks=") => {
-                import_marks = Some((s["--import-marks=".len()..].to_string(), false));
-            }
-            _ if s.starts_with("--import-marks-if-exists=") => {
-                import_marks = Some((s["--import-marks-if-exists=".len()..].to_string(), true));
-            }
-            _ if s.starts_with("--refspec=") => {
-                refspecs.push(s["--refspec=".len()..].to_string());
-            }
-            _ if s.starts_with("--anonymize-map=") => {
-                anonymize_map.push(s["--anonymize-map=".len()..].to_string());
-            }
-            _ if s.starts_with("--signed-tags=") => {
-                match SignedMode::parse(&s["--signed-tags=".len()..]) {
-                    Some(m) => opts.signed_tags = m,
-                    None => return Ok(usage_exit()),
-                }
-            }
-            _ if s.starts_with("--signed-commits=") => {
-                match SignedMode::parse(&s["--signed-commits=".len()..]) {
-                    Some(m) => opts.signed_commits = m,
-                    None => return Ok(usage_exit()),
-                }
-            }
-            _ if s.starts_with("--tag-of-filtered-object=") => {
-                opts.filtered_tag = match &s["--tag-of-filtered-object=".len()..] {
-                    "abort" => FilteredTagMode::Abort,
-                    "drop" => FilteredTagMode::Drop,
-                    "rewrite" => FilteredTagMode::Rewrite,
-                    _ => return Ok(usage_exit()),
-                };
-            }
-            _ if s.starts_with("--reencode=") => {
-                // git's `parse_opt_reencode_mode`: `abort`, or a
-                // `git_parse_maybe_bool` value (so `yes`/`true`/`on`/`1`/any
-                // non-zero int → yes, `no`/`false`/`off`/`0`/empty → no).
-                // Unrecognised values are a usage error (129).
-                match parse_reencode(&s["--reencode=".len()..]) {
-                    Some(m) => opts.reencode = m,
-                    None => return Ok(usage_exit()),
-                }
-            }
 
             // Anything else beginning with `-` survives both option parsers and
-            // ends up as a leftover argument, which git turns into a usage error.
+            // ends up as a leftover argument, which git turns into a usage error
+            // — but only once the whole revision walk has been set up, so a bad
+            // revision later on the line still reports first.
             _ if s.starts_with('-') && s != "-" => leftover = true,
 
-            _ => rev_tokens.push((s.to_string(), negate_rest)),
-        }
-    }
-
-    let repo = gix::discover(".")?;
-
-    // ---- Stage 2: `setup_revisions` resolves revisions and dies on the first bad one. ----
-    // A token that resolves is a revision; one that does not is, as in git's
-    // `handle_revision_arg`, a pathspec when it names a working-tree path and a
-    // `fatal: ambiguous argument` otherwise. Magic/glob pathspecs are matched by
-    // git's own parser, which this port does not reproduce, so they bail terse.
-    let mut sel = Selection::default();
-    for (tok, negated) in &rev_tokens {
-        if add_rev_token(&repo, tok, *negated, &mut sel).is_ok() {
-            continue;
-        }
-        if *negated {
-            return Ok(fatal_ambiguous(tok));
-        }
-        // A magic or wildcard pathspec names no worktree path of its own; it is a
-        // pathspec regardless, and the shared engine resolves it below.
-        if is_magic_or_glob(tok) || is_worktree_path(&repo, tok) {
-            pathspecs.push(tok.clone());
-        } else {
-            return Ok(fatal_ambiguous(tok));
+            _ => {
+                if add_rev_token(&repo, s, negate_rest, &mut sel).is_ok() {
+                    continue;
+                }
+                // `handle_revision_arg` failed. A `^` could only ever have been a
+                // revision, and so could anything before a `--` the sweep above
+                // found, so both die outright instead of falling back to a path.
+                // Note that `--not` is *not* such a case: it flags the revisions
+                // that follow without declaring them revisions, so an argument
+                // after it can still turn out to be a pathspec.
+                if seen_dashdash || s.starts_with('^') {
+                    eprintln!("fatal: bad revision '{s}'");
+                    return Ok(ExitCode::from(128));
+                }
+                // Otherwise this argument *and every one after it* are pathspecs:
+                // `setup_revisions` runs `verify_filename` over `argv + i`, pushes
+                // the whole tail into `prune_data` and breaks out of the loop. So
+                // revision and option parsing both stop here — which is why a
+                // later `--max-count=1` is not an option at all but a path that
+                // begins with `-`, and reported as one.
+                for (n, t) in rest[i - 1..].iter().enumerate() {
+                    if let Some(code) = verify_filename(t, n == 0) {
+                        return Ok(code);
+                    }
+                }
+                pathspecs.extend(rest[i - 1..].iter().map(|t| t.to_string()));
+                break;
+            }
         }
     }
 
@@ -670,6 +734,13 @@ pub fn fast_export(args: &[String]) -> Result<ExitCode> {
 
     // git dedupes pending objects through the `SEEN` flag: the first mention of
     // an object wins and the order of the rest is left alone.
+    //
+    // Both walks below apply that same rule to their own seeds, so this is not what keeps a
+    // repeated ref out of the output. It has to happen *here* because of the ordering: git
+    // deduplicates while filling `revs->commits` and only then calls `prio_queue_reverse` on it,
+    // whereas the `Order::Topo` seed below is this list reversed. Deduplicating after the reversal
+    // — which is all the walk itself can do — would keep each commit's *last* mention instead of
+    // its first, and the seed order is what breaks ties between commits sharing a commit date.
     dedup_first_wins(&mut tips);
 
     let hidden = sel.hidden.clone();
@@ -704,7 +775,11 @@ pub fn fast_export(args: &[String]) -> Result<ExitCode> {
             let Some(src) = sources.get(&info.id).cloned() else {
                 continue;
             };
-            for parent in &info.parent_ids {
+            // `add_parents_to_list` assigns `revs->sources` inside the loop it breaks out of
+            // under `first_parent_only`, so a merge's later parents inherit nothing there — and
+            // `Info::parent_ids` reports the full parent list regardless of the walk mode.
+            let followed = if first_parent { 1 } else { info.parent_ids.len() };
+            for parent in info.parent_ids.iter().take(followed) {
                 sources.entry(*parent).or_insert_with(|| src.clone());
             }
         }
@@ -887,11 +962,24 @@ pub fn fast_export(args: &[String]) -> Result<ExitCode> {
                 // same `show_progress()` call, so only this one ticks.
                 st.tick(&opts);
             }
-            // The commit was excluded from this export; git points the ref at the
-            // null oid, which fast-import reads as "delete this branch".
-            None => st
-                .out
-                .extend_from_slice(format!("\nfrom {NULL_OID}\n\n").as_bytes()),
+            // The commit was excluded from this export. git's default reading is
+            // "the user wants the branch exported but every commit in its history
+            // deleted", so it points the ref at the null oid, which fast-import
+            // takes as a branch deletion. `--reference-excluded-parents` says the
+            // opposite — the excluded commits are assumed to be in the importing
+            // repository already — so the ref is set to that commit's raw object
+            // id instead. git prints it unanonymized here (unlike the `from` in a
+            // commit stanza), and skips `show_progress()` on both arms.
+            None => {
+                let target = match target {
+                    // `rewrite_commit()` returned NULL: the ref's history was
+                    // filtered away entirely, which is a deletion either way.
+                    Some(id) if opts.reference_excluded_parents => id.to_hex().to_string(),
+                    _ => NULL_OID.to_string(),
+                };
+                st.out
+                    .extend_from_slice(format!("\nfrom {target}\n\n").as_bytes());
+            }
         }
     }
 
@@ -1207,23 +1295,16 @@ struct Simpl {
     followed: Vec<ObjectId>,
 }
 
-/// git's `looks_like_pathspec` territory this port does not implement: a magic
-/// pathspec (`:(glob)`, `:!exclude`, `:/`) or one carrying glob metacharacters.
-fn is_magic_or_glob(tok: &str) -> bool {
-    tok.starts_with(':') || tok.bytes().any(|b| matches!(b, b'*' | b'?' | b'['))
+/// [`crate::setup::verify_filename`], reported and turned into git's exit code.
+///
+/// `first` is git's `diagnose_misspelt_rev`, set only for the argument that failed
+/// revision resolution; the ones trailing it were already known to be paths, so
+/// they get the plainer wording.
+fn verify_filename(arg: &str, first: bool) -> Option<ExitCode> {
+    let msg = crate::setup::verify_filename(arg, first)?;
+    eprintln!("fatal: {msg}");
+    Some(ExitCode::from(128))
 }
-
-/// git's `file_exists`: whether a plain pathspec names something in the working
-/// tree. `lstat`-style so a directory or a broken symlink still counts.
-fn is_worktree_path(repo: &gix::Repository, tok: &str) -> bool {
-    repo.workdir()
-        .map(|wd| wd.join(tok).symlink_metadata().is_ok())
-        .unwrap_or(false)
-}
-
-/// git's plain (non-magic) pathspec match: a pathspec matches a path when equal
-/// to it or a leading directory prefix ending at a component boundary, so `dir`
-/// matches `dir/file` but `fil` does not match `file`.
 
 /// The id of a commit's tree, for the pathspec-restricted TREESAME comparisons.
 fn commit_tree_id(repo: &gix::Repository, id: ObjectId) -> Result<ObjectId> {
@@ -1388,25 +1469,47 @@ impl Anon {
         out
     }
 
-    /// Rewrite every `/`-separated component through `table`, minting
-    /// `<prefix><n>` for components never seen before. `n` is the table size, so
-    /// tokens are handed out in first-mention order across the whole stream.
+    /// git's `anonymize_path`: rewrite every `/`-separated component through
+    /// `table`, minting `<prefix><n>` for components never seen before. `n` is the
+    /// table size, so tokens are handed out in first-mention order across the whole
+    /// stream.
+    ///
+    /// ```c
+    /// while (*path) {
+    ///         const char *end_of_component = strchrnul(path, '/');
+    ///         size_t len = end_of_component - path;
+    ///         const char *c = anonymize_str(map, generate, path, len);
+    ///         strbuf_addstr(out, c);
+    ///         path = end_of_component;
+    ///         if (*path)
+    ///                 strbuf_addch(out, *path++);
+    /// }
+    /// ```
+    ///
+    /// The loop tests the *remaining* string, not a component count, so it mints
+    /// nothing at all for an empty input and nothing after a trailing `/`. Both
+    /// matter: `--reflog` labels a commit it reached through no ref with an empty
+    /// refname, and anonymizing it has to leave it empty rather than invent a
+    /// `ref0` that the stream then carries.
     fn map_components(
         table: &mut HashMap<BString, BString>,
-        input: &[u8],
+        mut path: &[u8],
         prefix: &str,
         out: &mut BString,
     ) {
-        for (i, component) in input.split(|b| *b == b'/').enumerate() {
-            if i > 0 {
-                out.push(b'/');
-            }
-            let key = BString::from(component.to_vec());
+        while !path.is_empty() {
+            let end = path.iter().position(|b| *b == b'/').unwrap_or(path.len());
+            let key = BString::from(path[..end].to_vec());
             if !table.contains_key(&key) {
                 let value = BString::from(format!("{prefix}{}", table.len()));
                 table.insert(key.clone(), value);
             }
             out.extend_from_slice(&table[&key]);
+            path = &path[end..];
+            if let Some((separator, rest)) = path.split_first() {
+                out.push(*separator);
+                path = rest;
+            }
         }
     }
 
@@ -1640,13 +1743,29 @@ fn emit_commit(
         }
     }
 
-    // git diffs against the first parent only when that parent is itself in the
-    // stream; otherwise the commit is emitted as a root against the empty tree.
+    // git's `handle_commit` picks the diff base from one condition:
+    //
+    //     if (commit->parents &&
+    //         (get_object_mark(&commit->parents->item->object) != 0 ||
+    //          reference_excluded_commits) &&
+    //         !full_tree)
+    //             diff_tree_oid(<first parent's tree>, <this tree>, ...);
+    //     else
+    //             diff_root_tree_oid(<this tree>, ...);
+    //
+    // so an *unmarked* first parent normally forces the root diff — the importer
+    // has never seen that commit, and a delta against it would not apply. Under
+    // `--reference-excluded-parents` the stanza names that parent by raw object
+    // id instead of dropping it, which means the importer *does* resolve it, so
+    // the same option flips this choice back to the incremental diff. Emitting a
+    // full tree there would repeat every path the excluded parent already has.
     let base = if opts.full_tree {
         None
     } else {
         match parents.first() {
-            Some(p) if st.marks.contains_key(p) => Some(repo.find_object(*p)?.peel_to_tree()?.id),
+            Some(p) if st.marks.contains_key(p) || opts.reference_excluded_parents => {
+                Some(repo.find_object(*p)?.peel_to_tree()?.id)
+            }
             _ => None,
         }
     };
@@ -1690,10 +1809,18 @@ fn emit_commit(
         st.out
             .extend_from_slice(format!("original-oid {id}\n").as_bytes());
     }
+    // The stanza prints `author` then `committer`, but `handle_commit` anonymizes
+    // them the other way round:
+    //
+    //     anonymize_ident_line(&committer, &committer_end);
+    //     anonymize_ident_line(&author, &author_end);
+    //
+    // and the generated tokens are handed out in call order, so on a commit whose
+    // two identities differ the committer is `User 0` and the author `User 1`.
+    let committer = st.anon_ident_line(opts, committer);
     let author = st.anon_ident_line(opts, author);
     st.out.extend_from_slice(&author);
     st.out.push(b'\n');
-    let committer = st.anon_ident_line(opts, committer);
     st.out.extend_from_slice(&committer);
     st.out.push(b'\n');
     let message: Vec<u8> = if opts.anonymize {
@@ -1710,14 +1837,24 @@ fn emit_commit(
     // first *printed* parent is `from`, the rest are `merge`.
     let mut printed = 0usize;
     for p in &parents {
-        let reference = match st.marks.get(p).copied() {
-            Some(pmark) => format!(":{pmark}"),
-            None if opts.reference_excluded_parents => p.to_hex().to_string(),
+        let reference: BString = match st.marks.get(p).copied() {
+            Some(pmark) => BString::from(format!(":{pmark}")),
+            // `printf("%s\n", anonymize ? anonymize_oid(...) : oid_to_hex(...))`:
+            // a raw id would leak real history through an anonymized stream, so
+            // git hands it to the same sequential-fake-id table `--no-data` blobs
+            // and gitlinks use.
+            None if opts.reference_excluded_parents => {
+                if opts.anonymize {
+                    st.anon.oid(*p)
+                } else {
+                    BString::from(p.to_hex().to_string())
+                }
+            }
             None => continue,
         };
         st.out
             .extend_from_slice(if printed == 0 { b"from " } else { b"merge " });
-        st.out.extend_from_slice(reference.as_bytes());
+        st.out.extend_from_slice(&reference);
         st.out.push(b'\n');
         printed += 1;
     }

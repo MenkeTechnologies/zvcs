@@ -176,6 +176,32 @@ fn value_of<'a>(arg: &'a str, long: &str, short: &str) -> Option<&'a str> {
     arg.strip_prefix(&format!("--{long}="))
 }
 
+/// The `--dirstat` family's own value check, which is a `die()` rather than the
+/// `error()` every callback in [`reject`] raises — so it exits 128 and its text
+/// spans two lines.
+///
+/// `diff_opt_dirstat()` (diff.c) hands the value to `parse_dirstat_params()` and
+/// dies on whatever that could not read, listing each offending parameter. It runs
+/// while the option list is being read, so it precedes a command's own "no
+/// tree-ish given" usage error: `git diff-tree --dirstat=bogus` reports the bad
+/// parameter, not the synopsis.
+///
+/// Returns the whole `fatal:` text — trailing newline included, matching git's
+/// blank line after the parameter list — for a caller to print before exiting 128.
+pub(super) fn dirstat_reject(arg: &str) -> Option<String> {
+    let value = ["--dirstat=", "--dirstat-by-file=", "-X"]
+        .iter()
+        .find_map(|p| arg.strip_prefix(p))?;
+    // A bare `-X` carries no value, and `--dirstat-by-file` is `files` already.
+    if value.is_empty() {
+        return None;
+    }
+    let mut ignored = super::diff_files::DirStat::default();
+    let errors = super::diff_files::parse_dirstat_params(value, &mut ignored);
+    (!errors.is_empty())
+        .then(|| format!("fatal: Failed to parse --dirstat/-X option parameter:\n{errors}\n"))
+}
+
 /// git's `diff_setup_done()` check that at most one of `-G`, `-S` and
 /// `--find-object` was given (`diff.c`, `HAS_MULTI_BITS(pickaxe_opts &
 /// DIFF_PICKAXE_KINDS_MASK)`), which is a `die()` — exit 128 — rather than the

@@ -37,7 +37,11 @@
 //!     `unknown option`, `unknown switch`, `ambiguous option`, `takes no value`,
 //!     `requires a value`, plus the integer/magnitude value-type messages and
 //!     the `not in range [-2147483648,2147483647]` message for an integer that
-//!     overflows a C `int` once its `k`/`m`/`g` suffix is applied
+//!     overflows a C `int` once its `k`/`m`/`g` suffix is applied — the last two
+//!     for the options repack itself parses (`-g`, `--name-hash-version`,
+//!     `--max-pack-size`, `--max-cruft-size`, `--combine-cruft-below-size`); for
+//!     the four it forwards to `pack-objects` the same messages arrive later, see
+//!     below
 //!   * `--filter` spec validation, which is a parse-options callback and so
 //!     dies (exit 128) at its own position in argv: `invalid filter-spec`,
 //!     `expected 'tree:<depth>'`, `expected something after combine:`,
@@ -94,6 +98,50 @@
 //!     incremental run with nothing new to pack copies *every* packed object
 //!     into it, since there is no new pack to subtract; only when the new pack
 //!     already covers the old ones is the second pack written empty.
+//!   * **`--filter-to=<value>`** is a pack *prefix*, not a directory:
+//!     `write_filtered_pack()` hands it to `pack-objects` as the `base-name`
+//!     positional (`prepare_pack_objects()`, `repack.c:43`), so the artifacts are
+//!     `<value>-<hash>.pack` / `.idx` / `.rev`. `--filter-to=/tmp/x` therefore
+//!     writes `/tmp/x-<hash>.pack`, and a `<value>` that happens to name an
+//!     existing directory writes a *sibling* of it rather than anything inside
+//!     it. git creates no directory for it either: when `<value>`'s parent does
+//!     not exist, `pack-objects` cannot move its temporary file into place and
+//!     the run ends 128 with
+//!     `error: unable to write file <value>-<hash>.pack: No such file or
+//!     directory` followed by `fatal: unable to rename temporary file to
+//!     '<value>-<hash>.pack'`. Without `--filter-to` the destination is the run's
+//!     own `packtmp` prefix, `<packdir>/.tmp-<pid>-pack`, which is what puts the
+//!     filtered pack beside the main one.
+//!   * **The locality rule**, `write_pack_opts_is_local()` (`repack.c:86-89`), is
+//!     a plain `starts_with()` over the two *strings* — the destination as typed
+//!     and `packdir` as `cmd_repack()` built it, which is
+//!     `repo_get_object_directory()` plus `/pack` and so ordinarily relative
+//!     (`.git/objects/pack` in a worktree, `objects/pack` in a bare repository
+//!     opened as `.`). No path is resolved, so an *absolute* `--filter-to` naming
+//!     the object store is still non-local. A non-local pack is kept out of
+//!     `names` ("avoid putting packs written outside of the repository in the
+//!     list of names", `repack.c:107-115`) and so is neither installed as
+//!     `pack-<hash>` nor eligible to be `--preferred-pack`; it simply stays where
+//!     it was written. A *local* `--filter-to` is the losing case in git:
+//!     `generated_pack_populate()` looks for the artifacts under `packtmp`, finds
+//!     none, and `generated_pack_install()` dies `fatal: pack-objects did not
+//!     write a '.pack' file for pack <packtmp>-<hash>` (exit 128) — after the
+//!     pack has been written at the prefix, and before `-d`, the MIDX write and
+//!     `update-server-info`. All of it verified against git 2.55.0.
+//!   * **`--window`/`--window-memory`/`--depth`/`--threads`** are `OPT_STRING`s
+//!     in repack's own table (`builtin/repack.c:206-213`): repack never parses
+//!     them, it forwards them verbatim and `pack-objects` is what rejects a bad
+//!     one. So the diagnostic arrives *after* the whole of repack's parse and
+//!     after its pre-flight `fatal:`s, in the order `prepare_pack_objects()`
+//!     pushes them (window, window-memory, depth, threads) rather than in argv
+//!     order: `--threads=x --window=y` reports `window`, and
+//!     `--window= --filter=false` reports the filter spec. The messages are
+//!     parse-options' own — `expects an integer value with an optional k/m/g
+//!     suffix`, `expects a non-negative integer value...` for the magnitude,
+//!     `expects a numerical value` for an empty one, and the
+//!     `not in range [-2147483648,2147483647]` overflow — all at exit 129. The
+//!     accepted values then shadow `pack.window`, `pack.windowMemory`,
+//!     `pack.depth` and `pack.threads` in the delta search.
 //!   * **`--write-midx` over an empty new pack.** `write_midx_included_packs()`
 //!     hands `multi-pack-index write` a `--preferred-pack`: the first of the
 //!     packs this run wrote, `names` sorted and cruft packs skipped. An empty
@@ -126,12 +174,6 @@
 //!     value is fatal even for `-h`).
 //!   * **`--geometric`** repacks everything rather than selecting the subset of
 //!     packs that restores a geometric size progression.
-//!   * **`--filter-to=<value>`** is read as a directory to put the filtered pack
-//!     in; git reads it as a pack *prefix*, so `--filter-to=/tmp/x` gives git
-//!     `/tmp/x-<hash>.pack` and this port `/tmp/x/pack-<hash>.pack`. What the
-//!     pack contains, and the fact that it stays out of the `names` list that
-//!     `--preferred-pack` is drawn from when it lands outside the object store,
-//!     are the same either way.
 //!   * **`--write-midx`** writes `objects/pack/multi-pack-index` over the packs
 //!     the run leaves behind, through the same writer `git multi-pack-index
 //!     write` uses. `--write-midx=incremental` asks for a MIDX *chain* instead
@@ -145,9 +187,7 @@
 //!     reduce to a rule the observed output confirms, and guessing one would put
 //!     the wrong object set in the pack. Observable only under `--filter=tree:*`
 //!     *together with* `-d`, where a loose object git prunes may survive.
-//!   * **`--window`/`--window-memory`/`--depth`/`--threads`** are forwarded to
-//!     the delta search, shadowing the `pack.*` keys of the same name.
-//!     **`-f`/`-F`/`--path-walk`/`--delta-islands`/`--name-hash-version`** tune
+//!   * **`-f`/`-F`/`--path-walk`/`--delta-islands`/`--name-hash-version`** tune
 //!     parts of git's search that have no counterpart here, and stay no-ops.
 //!   * `repack.writeBitmaps`, or its older spelling `pack.writeBitmaps`, turns
 //!     `-b` on by itself; `--no-write-bitmap-index` overrides either.
@@ -162,12 +202,7 @@
 //!     `update-server-info` it gates is real; see [`execute`].
 //!   * `--filter=sparse:oid=<rev>` is accepted on syntax alone — git's rejection
 //!     of it depends on resolving and parsing the named blob;
-//!   * `combine:` sub-specs are not percent-decoded;
-//!   * with an invalid *integer* value earlier in argv than an invalid filter
-//!     spec, git reports the filter (`--window=x --filter=bogus:spec` → exit
-//!     128) while this reports the integer (exit 129). The mechanism behind
-//!     that inversion was not identified, and the ordering is otherwise
-//!     positional, so the positional behaviour is what is implemented.
+//!   * `combine:` sub-specs are not percent-decoded.
 //! ```
 
 use anyhow::{bail, Context, Result};
@@ -329,10 +364,13 @@ const OPTS: &[OptDef] = &[
     OptDef { long: "delta-islands", kind: Kind::Bool, negatable: true },
     OptDef { long: "unpack-unreachable", kind: Kind::Str, negatable: true },
     OptDef { long: "keep-unreachable", kind: Kind::Bool, negatable: true },
-    OptDef { long: "window", kind: Kind::Int, negatable: true },
-    OptDef { long: "window-memory", kind: Kind::Magnitude, negatable: true },
-    OptDef { long: "depth", kind: Kind::Int, negatable: true },
-    OptDef { long: "threads", kind: Kind::Int, negatable: true },
+    // `OPT_STRING` in git's table (`builtin/repack.c:206-213`): repack does not
+    // parse these, it forwards them to `pack-objects`, which is what rejects a
+    // bad value — see [`forwarded_value_check`].
+    OptDef { long: "window", kind: Kind::Str, negatable: true },
+    OptDef { long: "window-memory", kind: Kind::Str, negatable: true },
+    OptDef { long: "depth", kind: Kind::Str, negatable: true },
+    OptDef { long: "threads", kind: Kind::Str, negatable: true },
     OptDef { long: "max-pack-size", kind: Kind::Magnitude, negatable: false },
     OptDef { long: "filter", kind: Kind::Str, negatable: true },
     OptDef { long: "pack-kept-objects", kind: Kind::Bool, negatable: true },
@@ -382,8 +420,18 @@ struct State {
     quiet: bool,
     /// The last `--filter` spec, already validated.
     filter_spec: Option<String>,
-    /// The last `--filter-to` directory, which diverts the filtered-out pack.
-    filter_to_dir: Option<String>,
+    /// The last `--filter-to` value: a pack *prefix*, not a directory, and so
+    /// the `destination` of git's `write_pack_opts` for the filtered pack.
+    filter_to_prefix: Option<String>,
+    /// The last `--window`, `--window-memory`, `--depth` and `--threads`, each
+    /// as the raw string git's `OPT_STRING` kept and `None` once the matching
+    /// `--no-` form cleared it. Validated by [`forwarded_value_check`] rather
+    /// than at parse time, because git's validation happens in the
+    /// `pack-objects` child.
+    window: Option<String>,
+    window_memory: Option<String>,
+    depth: Option<String>,
+    threads: Option<String>,
     /// Every `--keep-pack` name; those packs survive `-d`.
     keep_packs: Vec<String>,
     /// `--max-pack-size=<n>` as the magnitude git parsed, which repack forwards
@@ -438,6 +486,13 @@ pub fn repack(args: &[String]) -> Result<ExitCode> {
         return Ok(code);
     }
 
+    // The four `OPT_STRING`s repack forwards are parsed by the `pack-objects`
+    // child, which `cmd_repack()` starts only after the pre-flight `fatal:`s
+    // above — so their diagnostics come last, and in the child's argv order.
+    if let Some(code) = forwarded_value_check(&state) {
+        return Ok(code);
+    }
+
     // git's repack does not apply the limit itself: it forwards
     // `--max-pack-size` (or, absent one, `pack.packSizeLimit`) to the
     // `pack-objects` child, and the warning below is the child's. It therefore
@@ -468,6 +523,9 @@ fn execute(st: &State) -> Result<ExitCode> {
     };
     let objdir = repo.objects.store_ref().path().to_path_buf();
     let pack_dir = objdir.join("pack");
+    // git's `packdir` *string*, which is the only thing the locality rule looks
+    // at; see [`git_packdir`].
+    let packdir = git_packdir(&repo, &objdir);
 
     // git refreshes `objects/info/packs` at the end of a successful run unless
     // `-n` was given or `repack.updateServerInfo` is false (default true). git
@@ -573,20 +631,26 @@ fn execute(st: &State) -> Result<ExitCode> {
         enumerating.advance(to_pack.len());
         enumerating.done();
     }
-    // git's `names`: every pack this run wrote *into the repository's own*
-    // `objects/pack`, each with the number of objects it holds. It is the set
-    // `write_midx_included_packs()` picks the preferred pack out of, so it is
-    // collected as the packs are written.
+    // git writes every pack a run produces under one temporary prefix and only
+    // moves them into place afterwards, in a single `generated_pack_install()`
+    // pass; anything that goes wrong in between therefore leaves the object
+    // store as it found it. The prefix is `packtmp`, which is also the default
+    // `--filter-to` destination.
+    let packtmp_name = format!(".tmp-{}-pack", std::process::id());
+    let packtmp = pack_dir.join(&packtmp_name);
+    let packtmp_shown = format!("{packdir}/{packtmp_name}");
+    // git's `names`: the hash of every pack this run wrote *into the
+    // repository's own* `objects/pack`, with the number of objects it holds. It
+    // is the set `write_midx_included_packs()` picks the preferred pack out of.
     let mut new_packs: Vec<(String, usize)> = Vec::new();
     // Everything filtered out is about to be written elsewhere, so a run whose
     // spec rejects the whole set still has a second pack to produce.
-    let written = if to_pack.is_empty() {
-        PathBuf::new()
-    } else {
+    if !to_pack.is_empty() {
         let path = write_pack(
             &repo,
+            st,
             &to_pack,
-            &pack_dir,
+            &packtmp,
             write_rev,
             progress,
             // `cmd_repack()` asks `pack-objects` for a `.bitmap` only when no
@@ -594,40 +658,79 @@ fn execute(st: &State) -> Result<ExitCode> {
             // around both `--write-bitmap-index` pushes): with `--write-midx` the
             // bitmap belongs to the MIDX instead, and git leaves the packs bare.
             write_bitmaps(st, &repo) && !st.write_midx,
-            st.no_reuse_delta,
         )?;
-        new_packs.push((pack_base_name(&path), to_pack.len()));
-        path
-    };
+        new_packs.push((pack_hash(&pack_base_name(&path)), to_pack.len()));
+    }
 
-    // With `--filter` git writes a second pack holding the filtered-out objects,
-    // in `--filter-to=<dir>` when given and beside the first one otherwise. The
-    // objects have to travel with it: they are only reachable through this pack
-    // once `-d` removes the ones they came from.
+    // With `--filter` git writes a second pack holding the filtered-out objects.
+    // The objects have to travel with it: they are only reachable through this
+    // pack once `-d` removes the ones they came from.
     if st.filter {
-        let dir = match &st.filter_to_dir {
-            Some(d) => PathBuf::from(d),
-            None => pack_dir.clone(),
+        // `write_pack_opts` for the filtered pack: `destination` is
+        // `--filter-to` when given and `packtmp` otherwise (`cmd_repack()`,
+        // `builtin/repack.c:547-557`). Both are pack *prefixes*, which
+        // `pack-objects` completes with `-<hash>` and an extension.
+        let destination = st.filter_to_prefix.as_deref().unwrap_or(&packtmp_shown);
+        // `write_pack_opts_is_local()`: a plain prefix test on the two strings,
+        // with no path resolution of either.
+        let local = is_local_destination(destination, &packdir);
+        let prefix = if destination == packtmp_shown {
+            packtmp.clone()
+        } else {
+            PathBuf::from(destination)
         };
-        fs::create_dir_all(&dir)?;
-        let base = if filtered_out.is_empty() {
+        let outcome = if filtered_out.is_empty() {
             // git still writes the pack, its index and its reverse index when the
             // spec rejected nothing; their presence is what marks a filtered run.
-            write_empty_pack(repo.object_hash(), &dir, write_rev)?
+            write_empty_pack(repo.object_hash(), &prefix, write_rev)
         } else {
             // No bitmap: a bitmap describes a reachability closure, and this pack
             // is deliberately a fragment of one.
-            let path =
-                write_pack(&repo, &filtered_out, &dir, write_rev, progress, false, st.no_reuse_delta)?;
-            pack_base_name(&path)
+            write_pack(&repo, st, &filtered_out, &prefix, write_rev, progress, false)
+                .map(|path| pack_base_name(&path))
         };
-        // `finish_pack_objects_cmd()` keeps a pack out of `names` when it was
-        // written outside the object store ("avoid putting packs written outside
-        // of the repository in the list of names"), which is what `--filter-to`
-        // pointing elsewhere does.
-        if is_local_pack_dir(&dir, &pack_dir) {
-            new_packs.push((base, filtered_out.len()));
+        let stem = match outcome {
+            Ok(stem) => stem,
+            // git creates no directory for `--filter-to`: `pack-objects` writes
+            // its temporary files under the object store and then cannot move
+            // them into a directory that is not there.
+            Err(e) => match e.downcast_ref::<UnplaceablePack>() {
+                Some(UnplaceablePack(path)) => {
+                    let shown = path.display();
+                    eprintln!("error: unable to write file {shown}: No such file or directory");
+                    eprintln!("fatal: unable to rename temporary file to '{shown}'");
+                    return Ok(ExitCode::from(128));
+                }
+                None => return Err(e),
+            },
+        };
+        if local {
+            if destination == packtmp_shown {
+                // `finish_pack_objects_cmd()` appends a locally-written pack to
+                // `names`, which is the set `--preferred-pack` is drawn from and
+                // the set `generated_pack_install()` installs.
+                new_packs.push((pack_hash(&stem), filtered_out.len()));
+            } else {
+                // A local `--filter-to` that is not `packtmp` is the one
+                // combination git cannot complete: the pack is in `names`, but
+                // `generated_pack_populate()` looked for its artifacts under
+                // `packtmp` and found none, so `generated_pack_install()` dies —
+                // after the pack was written at the prefix, and before anything
+                // was installed.
+                eprintln!(
+                    "fatal: pack-objects did not write a '.pack' file for pack {packtmp_shown}-{}",
+                    pack_hash(&stem)
+                );
+                return Ok(ExitCode::from(128));
+            }
         }
+    }
+
+    // `generated_pack_install()`: every pack in `names` moves from `packtmp` to
+    // `<packdir>/pack-<hash>`, extension by extension.
+    let mut installed: Vec<PathBuf> = Vec::new();
+    for (hash, _) in &new_packs {
+        installed.push(install_pack(&pack_dir, &packtmp, hash)?);
     }
 
     // `write_midx_included_packs()`. With no `--geometric` geometry to name a
@@ -645,13 +748,13 @@ fn execute(st: &State) -> Result<ExitCode> {
     // neither does `update-server-info`.
     if st.write_midx && !st.write_midx_incremental {
         new_packs.sort();
-        if let Some((name, 0)) = new_packs.first() {
+        if let Some((hash, 0)) = new_packs.first() {
             // git names the pack the way it opened it, i.e. under the object
             // directory as `get_object_directory()` renders it.
             let shown = super::prune_packed::display_objdir(&repo, &objdir);
             eprintln!(
                 "error: cannot select preferred pack {} with no objects",
-                shown.join("pack").join(format!("{name}.pack")).display()
+                shown.join("pack").join(format!("pack-{hash}.pack")).display()
             );
             return Ok(ExitCode::from(255));
         }
@@ -660,8 +763,8 @@ fn execute(st: &State) -> Result<ExitCode> {
     if st.delete_redundant {
         for index_path in superseded {
             // An identical object set hashes to the same name, in which case the
-            // "superseded" pack *is* the one just written.
-            if index_path == written {
+            // "superseded" pack *is* one this run just installed.
+            if installed.contains(&index_path) {
                 continue;
             }
             for ext in ["pack", "idx", "rev", "bitmap", "mtimes", "promisor"] {
@@ -727,14 +830,17 @@ fn write_bitmaps(st: &State, repo: &gix::Repository) -> bool {
     st.all_into_one && repo.is_bare()
 }
 
+/// Encode `ids` as a pack under the pack *prefix* `base_prefix`, which
+/// `pack-objects` completes with `-<hash>` and the extension of each artifact,
+/// and hand back the path of the `.idx`.
 fn write_pack(
     repo: &gix::Repository,
+    st: &State,
     ids: &[ObjectId],
-    pack_dir: &Path,
+    base_prefix: &Path,
     write_rev: bool,
     progress: bool,
     write_bitmap: bool,
-    no_reuse_delta: bool,
 ) -> Result<PathBuf> {
     let allow_ofs_delta = repo
         .config_snapshot()
@@ -753,7 +859,16 @@ fn write_pack(
             allow_ofs_delta,
             progress,
             use_delta_islands,
-            no_reuse_delta,
+            no_reuse_delta: st.no_reuse_delta,
+            // The four `pack-objects` forwards, already validated by
+            // [`forwarded_value_check`], shadowing `pack.window`,
+            // `pack.windowMemory`, `pack.depth` and `pack.threads`. A negative
+            // value is dropped rather than forwarded: git lets `OPT_INTEGER`
+            // take one and the delta search here has no meaning for it.
+            window: forwarded_size(st.window.as_deref()),
+            window_memory: forwarded_size(st.window_memory.as_deref()).map(|n| n as u64),
+            depth: forwarded_size(st.depth.as_deref()),
+            threads: forwarded_size(st.threads.as_deref()),
             ..super::pack_objects::WriteOptions::default()
         },
     )?;
@@ -762,20 +877,20 @@ fn write_pack(
     }
 
     let kind = repo.object_hash();
-    let base = pack_dir.join(format!("pack-{}", packed.id));
-    install(&base.with_extension("pack"), &packed.bytes)?;
+    let base = suffixed(base_prefix, &format!("-{}", packed.id));
+    install(&suffixed(&base, ".pack"), &packed.bytes)?;
 
     // Both companions index into the pack in object-id order.
     let mut by_oid = packed.entries.clone();
     by_oid.sort_unstable_by_key(|entry| entry.id);
-    let index_path = base.with_extension("idx");
+    let index_path = suffixed(&base, ".idx");
     install(
         &index_path,
         &super::pack_objects::index_file(kind, 2, &packed.id, &by_oid)?,
     )?;
     if write_rev {
         install(
-            &base.with_extension("rev"),
+            &suffixed(&base, ".rev"),
             &super::pack_objects::reverse_index_file(kind, &packed.id, &by_oid)?,
         )?;
     }
@@ -783,7 +898,7 @@ fn write_pack(
         let mut options = super::pack_objects::BitmapOptions::from_repo(repo);
         options.write = true;
         if let Some(bytes) = super::pack_objects::bitmap_file(repo, &packed, &options) {
-            fs::write(base.with_extension("bitmap"), bytes)?;
+            fs::write(suffixed(&base, ".bitmap"), bytes)?;
         }
     }
     Ok(index_path)
@@ -797,7 +912,12 @@ fn write_pack(
 fn install(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
-    let dir = path.parent().unwrap_or(Path::new("."));
+    // A bare `--filter-to=pfx` has no directory component at all, which is the
+    // current one rather than a missing one.
+    let dir = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    if !dir.is_dir() {
+        return Err(UnplaceablePack(path.to_path_buf()).into());
+    }
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("tmp");
     let tmp = dir.join(format!("tmp_{ext}_zvcs_repack_{}", std::process::id()));
     fs::write(&tmp, bytes)
@@ -808,28 +928,116 @@ fn install(path: &Path, bytes: &[u8]) -> Result<()> {
     fs::rename(&tmp, path).with_context(|| format!("unable to rename to {}", path.display()))
 }
 
-/// The `pack-<hash>` stem of a pack artifact, which is the name git carries in
-/// its `names` list and interpolates into `--preferred-pack=pack-%s.pack`.
+/// The `<name>-<hash>` stem of a pack artifact.
 fn pack_base_name(path: &Path) -> String {
     path.file_stem().and_then(|s| s.to_str()).unwrap_or_default().to_string()
 }
 
-/// `write_pack_opts_is_local()`: whether a pack written into `dir` lands in the
-/// repository's own object store, and so counts as one of the packs this run
-/// wrote. git compares the two path strings with `starts_with()`; the same
-/// question is asked here of the resolved paths, `--filter-to` being free to
-/// name the pack directory by any route.
-fn is_local_pack_dir(dir: &Path, pack_dir: &Path) -> bool {
-    let resolve = |p: &Path| fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-    resolve(dir).starts_with(resolve(pack_dir))
+/// The hash a pack is named after, which is what git carries in its `names` list
+/// and interpolates into `pack-%s.pack`. It is the stem's last `-`-separated
+/// field, the prefix before it being free to contain more of them.
+fn pack_hash(stem: &str) -> String {
+    stem.rsplit_once('-').map_or(stem, |(_, hash)| hash).to_string()
 }
 
-/// Write the empty pack, its index and its reverse index into `dir`, returning
-/// its `pack-<hash>` stem.
+/// `generated_pack_install()`: move one pack from the run's temporary prefix to
+/// `<packdir>/pack-<hash>`, and hand back the path of its installed `.idx`.
+///
+/// The extension order is git's `exts[]`, `.idx` last, so the pack is complete
+/// before the index that makes it findable appears. An extension this run did
+/// not write is *removed* at the destination rather than left there, which is
+/// what keeps a previous run's `.bitmap` from outliving the pack it described.
+fn install_pack(pack_dir: &Path, packtmp: &Path, hash: &str) -> Result<PathBuf> {
+    let from = suffixed(packtmp, &format!("-{hash}"));
+    let to = pack_dir.join(format!("pack-{hash}"));
+    for ext in [".pack", ".rev", ".mtimes", ".bitmap", ".promisor", ".idx"] {
+        let src = suffixed(&from, ext);
+        let dst = suffixed(&to, ext);
+        if src.exists() {
+            fs::rename(&src, &dst)
+                .with_context(|| format!("renaming pack to '{}' failed", dst.display()))?;
+        } else if matches!(ext, ".pack" | ".idx") {
+            // git's non-optional extensions, where an absent tempfile is a `die`
+            // rather than something to clean up after.
+            bail!("pack-objects did not write a '{ext}' file for pack {}", from.display());
+        } else {
+            let _ = fs::remove_file(&dst);
+        }
+    }
+    Ok(suffixed(&to, ".idx"))
+}
+
+/// One of the four forwarded values as a size the delta search can use, or
+/// `None` when the option was absent or its value negative.
+fn forwarded_size(value: Option<&str>) -> Option<usize> {
+    value.and_then(scaled).and_then(|n| usize::try_from(n).ok())
+}
+
+/// Append `suffix` to the last component of `prefix`, which is how a pack prefix
+/// becomes a pack name: `objects/pack/pack` + `-<hash>` is
+/// `objects/pack/pack-<hash>`. `Path::join` would make a new component of it.
+fn suffixed(prefix: &Path, suffix: &str) -> PathBuf {
+    let mut name = prefix.as_os_str().to_os_string();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+/// A pack artifact that cannot be moved into place because its directory does
+/// not exist — git's `rename_tmp_packfile()` failure, reached through a
+/// `--filter-to` prefix whose parent was never created. Carries the path git
+/// names in both of the two lines it prints.
+#[derive(Debug)]
+struct UnplaceablePack(PathBuf);
+
+impl std::fmt::Display for UnplaceablePack {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "unable to rename temporary file to '{}'", self.0.display())
+    }
+}
+
+impl std::error::Error for UnplaceablePack {}
+
+/// `write_pack_opts_is_local()` (`repack.c:86-89`): whether the pack this run is
+/// about to write counts as one of the repository's own, and so belongs in
+/// `names`.
+///
+/// git asks it of the two *strings* — `starts_with(opts->destination,
+/// opts->packdir)` — and resolves neither, so an absolute `--filter-to` naming
+/// the object store of a repository whose `packdir` is the usual relative
+/// `.git/objects/pack` is *not* local. Verified against git 2.55.0, where
+/// `--filter-to=$PWD/.git/objects/pack/x` leaves `x-<hash>.pack` in place and
+/// exits 0 while `--filter-to=.git/objects/pack/x` exits 128.
+fn is_local_destination(destination: &str, packdir: &str) -> bool {
+    destination.starts_with(packdir)
+}
+
+/// git's `packdir` string: `mkpathdup("%s/pack", repo_get_object_directory())`.
+///
+/// The object directory is whatever setup left it as, which is relative to the
+/// directory `cmd_repack()` runs in for a repository found there —
+/// `.git/objects` in a worktree (git having already chdir'd to its root),
+/// `objects` in a bare repository opened as `.`, `<dir>/objects` under an
+/// explicit `--git-dir=<dir>` — and absolute only when it was given that way.
+/// Read off `git rev-parse --git-path objects` under git 2.55.0 for each of
+/// those four.
+fn git_packdir(repo: &gix::Repository, objdir: &Path) -> String {
+    let real_objdir = fs::canonicalize(objdir).unwrap_or_else(|_| objdir.to_path_buf());
+    // git renders the object directory relative to the worktree root it chdir'd
+    // to, or — with no worktree — to wherever the bare repository was found.
+    let base = match repo.workdir() {
+        Some(work) => fs::canonicalize(work).unwrap_or_else(|_| work.to_path_buf()),
+        None => std::env::current_dir().ok().and_then(|cwd| fs::canonicalize(cwd).ok()).unwrap_or_default(),
+    };
+    let shown = real_objdir.strip_prefix(&base).unwrap_or(&real_objdir);
+    shown.join("pack").to_string_lossy().into_owned()
+}
+
+/// Write the empty pack, its index and its reverse index under the pack prefix
+/// `base_prefix`, returning the `<name>-<hash>` stem they share.
 ///
 /// An empty pack has no objects to name it after, so its checksum — and
 /// therefore its filename — is a constant for a given hash function.
-fn write_empty_pack(kind: gix::hash::Kind, dir: &Path, write_rev: bool) -> Result<String> {
+fn write_empty_pack(kind: gix::hash::Kind, base_prefix: &Path, write_rev: bool) -> Result<String> {
     // The 12-byte v2 header with a zero object count, and the checksum over it.
     let mut pack = Vec::new();
     pack.extend_from_slice(b"PACK");
@@ -847,9 +1055,9 @@ fn write_empty_pack(kind: gix::hash::Kind, dir: &Path, write_rev: bool) -> Resul
     idx.extend_from_slice(&pack_id);
     append_checksum(&mut idx, kind)?;
 
-    let base = format!("pack-{}", ObjectId::from_bytes_or_panic(&pack_id));
-    fs::write(dir.join(format!("{base}.pack")), &pack)?;
-    fs::write(dir.join(format!("{base}.idx")), &idx)?;
+    let base = suffixed(base_prefix, &format!("-{}", ObjectId::from_bytes_or_panic(&pack_id)));
+    install(&suffixed(&base, ".pack"), &pack)?;
+    install(&suffixed(&base, ".idx"), &idx)?;
 
     if write_rev {
         // The same layout `gix-pack`'s writer produces, with no permutation.
@@ -859,9 +1067,9 @@ fn write_empty_pack(kind: gix::hash::Kind, dir: &Path, write_rev: bool) -> Resul
         rev.extend_from_slice(&(if kind == gix::hash::Kind::Sha1 { 1u32 } else { 2 }).to_be_bytes());
         rev.extend_from_slice(&pack_id);
         append_checksum(&mut rev, kind)?;
-        fs::write(dir.join(format!("{base}.rev")), &rev)?;
+        install(&suffixed(&base, ".rev"), &rev)?;
     }
-    Ok(base)
+    Ok(pack_base_name(&suffixed(&base, ".idx")))
 }
 
 /// Append the hash of everything written so far, which is how every one of
@@ -1195,6 +1403,35 @@ fn check_value(def: &OptDef, shown: &str, v: &str) -> Option<ExitCode> {
     }
 }
 
+/// Validate the four options repack hands to `pack-objects` verbatim, emitting
+/// the child's parse-options diagnostic for the first bad one.
+///
+/// The order is `prepare_pack_objects()`'s (`repack.c:17-24`) — window,
+/// window-memory, depth, threads — not argv's, because the child sees them in
+/// the order repack pushes them: `--threads=x --window=y` reports `window`.
+/// `--window`, `--depth` and `--threads` are `OPT_INTEGER` in `pack-objects`
+/// (negatives and all), `--window-memory` is unsigned.
+fn forwarded_value_check(st: &State) -> Option<ExitCode> {
+    let forwarded: [(&str, &Option<String>, Kind); 4] = [
+        ("window", &st.window, Kind::Int),
+        ("window-memory", &st.window_memory, Kind::Magnitude),
+        ("depth", &st.depth, Kind::Int),
+        ("threads", &st.threads, Kind::Int),
+    ];
+    for (name, value, kind) in forwarded {
+        let Some(v) = value.as_deref() else { continue };
+        let label = format!("option `{name}'");
+        let failure = match kind {
+            Kind::Magnitude => magnitude_value(&label, v),
+            _ => int_value(&label, v).err(),
+        };
+        if failure.is_some() {
+            return failure;
+        }
+    }
+    None
+}
+
 /// git's diagnostic for an empty value, which every numeric option shares.
 fn numerical_value(label: &str) -> ExitCode {
     eprintln!("error: {label} expects a numerical value");
@@ -1323,8 +1560,14 @@ fn set_long(idx: usize, negated: bool, value: Option<&str>, st: &mut State) {
         }
         "filter-to" => {
             st.filter_to = on;
-            st.filter_to_dir = if on { value.map(str::to_string) } else { None };
+            st.filter_to_prefix = if on { value.map(str::to_string) } else { None };
         }
+        // Kept verbatim, exactly as git's `OPT_STRING` does; `--no-<name>` sets
+        // the pointer back to NULL and so drops the option entirely.
+        "window" => st.window = value.filter(|_| on).map(str::to_string),
+        "window-memory" => st.window_memory = value.filter(|_| on).map(str::to_string),
+        "depth" => st.depth = value.filter(|_| on).map(str::to_string),
+        "threads" => st.threads = value.filter(|_| on).map(str::to_string),
         // A repeated `--keep-pack` accumulates; `--no-keep-pack` clears the list,
         // matching git's `string_list_clear()` on the negated form.
         "keep-pack" => match (on, value) {

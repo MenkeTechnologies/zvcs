@@ -602,7 +602,17 @@ where
                     .and_then(|past_sep| try_parse_usize(past_sep.as_bstr()).transpose())
                     .transpose()?
                     .unwrap_or((1, 0));
-                if number != 0 {
+                if number == 0 {
+                    // `<rev>~0` is not a no-op in git: `get_nth_ancestor()` runs
+                    // `lookup_commit_reference()` before its (zero-iteration)
+                    // walk, so the anchor is peeled to a commit and a non
+                    // committish anchor fails outright — object-name.c:1065-1078.
+                    // That makes `~0` behave exactly like `^0`.
+                    let to = delegate::PeelTo::ObjectKind(gix_object::Kind::Commit);
+                    delegate
+                        .peel_until(to)
+                        .or_raise(|| Error::new_with_input(format!("delegate.peel_until({to:?}) failed"), input))?;
+                } else {
                     let traversal = delegate::Traversal::NthAncestor(number);
                     delegate.traverse(traversal).or_raise(|| {
                         Error::new_with_input(format!("delegate.traverse({traversal:?}) failed"), input)

@@ -1005,17 +1005,17 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             let v = args
                 .get(i)
                 .ok_or_else(|| anyhow!("option `{a}` requires a value"))?;
-            match parse_nonneg(v) {
-                Some(n) => skip = n,
-                None => {
+            match parse_skip(v) {
+                Ok(n) => skip = n,
+                Err(()) => {
                     eprintln!("fatal: '{v}': not an integer");
                     return Ok(ExitCode::from(128));
                 }
             }
         } else if let Some(v) = a.strip_prefix("--skip=") {
-            match parse_nonneg(v) {
-                Some(n) => skip = n,
-                None => {
+            match parse_skip(v) {
+                Ok(n) => skip = n,
+                Err(()) => {
                     eprintln!("fatal: '{v}': not an integer");
                     return Ok(ExitCode::from(128));
                 }
@@ -3202,7 +3202,7 @@ fn line_log_name_status(pair: &line_log::Pair) -> (u8, &gix::bstr::BString) {
 /// with no trailing garbage. A negative value means "unlimited" (git's `-1`
 /// sentinel), reported as `Ok(None)`; a non-negative value caps the walk.
 /// `Err(())` marks a value git rejects with `fatal: '<value>': not an integer`.
-fn parse_max_count(value: &str) -> Result<Option<usize>, ()> {
+pub(crate) fn parse_max_count(value: &str) -> Result<Option<usize>, ()> {
     match parse_int(value) {
         Some(n) if n < 0 => Ok(None),
         Some(n) => Ok(Some(n as usize)),
@@ -3210,12 +3210,25 @@ fn parse_max_count(value: &str) -> Result<Option<usize>, ()> {
     }
 }
 
-/// A non-negative base-10 integer (`--skip`, `--min-parents`, `--max-parents`).
+/// A non-negative base-10 integer (`--min-parents`, `--max-parents`).
 /// `None` for anything git would reject with `fatal: '<value>': not an integer`.
 fn parse_nonneg(value: &str) -> Option<usize> {
     match parse_int(value) {
         Some(n) if n >= 0 => Some(n as usize),
         _ => None,
+    }
+}
+
+/// Parse a `--skip=<n>` value the way `revision.c` does: `strtol_i` into a signed
+/// `skip_count`, which the walk then only ever tests with `> 0`. So a negative
+/// value is accepted and skips nothing (verified against git 2.55.0:
+/// `git log --skip=-1` lists the whole history), while a non-numeric value is
+/// `fatal: '<value>': not an integer`.
+pub(crate) fn parse_skip(value: &str) -> Result<usize, ()> {
+    match parse_int(value) {
+        Some(n) if n < 0 => Ok(0),
+        Some(n) => Ok(n as usize),
+        None => Err(()),
     }
 }
 
@@ -7060,6 +7073,16 @@ impl PathspecMatcher {
     /// list — git treats "no pathspec" as "no limiting", not as a set that matches
     /// nothing — so this is only ever handed a non-empty one.
     pub(crate) fn new<S: AsRef<[u8]>>(repo: &gix::Repository, specs: &[S]) -> Result<Self> {
+        // git's `parse_pathspec()` runs over the whole list before the command does
+        // anything, and every way it can fail is a `die()`. gitoxide raises the same
+        // failures from inside the constructor below, where `?` would render them in
+        // this port's voice at exit 1 — so the list is parsed here first, and the
+        // first bad element reported as git reports it. Same `Defaults` as the real
+        // matcher (`inherit_ignore_case: false` below), so acceptance cannot diverge.
+        let defaults = repo.pathspec_defaults_inherit_ignore_case(false)?;
+        if let Some(msg) = crate::pathspec::first_magic_fatal(specs, defaults) {
+            return Err(crate::fatal::die(msg));
+        }
         // `IdMapping` reads `.gitattributes` from the index, and is only consulted
         // at all when a spec carries `:(attr:…)`.
         let index = repo.index_or_empty()?;

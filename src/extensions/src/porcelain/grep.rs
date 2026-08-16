@@ -1226,6 +1226,22 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
         .map(|p| BString::from(p.as_str()))
         .collect();
 
+    // git's `parse_pathspec()` reads the whole list before the search starts, and
+    // a malformed element is a `die()`. The three matchers below (`repo.pathspec`
+    // for the index and tree walks, `bare_pathspec` for `--no-index`) each raise
+    // gitoxide's own wording at exit 1 instead, so the list is checked once here
+    // with whichever `Defaults` the matcher that will be built would use.
+    let pathspec_defaults = match repo.as_ref() {
+        Some(repo) => repo.pathspec_defaults_inherit_ignore_case(false)?,
+        // Outside a repository there is no config to read the rules from, which is
+        // what git has there too.
+        None => gix::pathspec::Defaults::from_environment(&mut |name| std::env::var_os(name))
+            .unwrap_or_default(),
+    };
+    if let Some(msg) = crate::pathspec::first_magic_fatal(&specs, pathspec_defaults) {
+        return Err(crate::fatal::die(msg));
+    }
+
     // The repo-root-relative prefix of the current directory. It scopes a bare
     // invocation to the current subtree, is the base `--max-depth` counts from
     // when no pathspec narrows it, and is stripped from printed paths unless

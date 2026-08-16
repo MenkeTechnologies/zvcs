@@ -950,15 +950,14 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     if let Some(max) = max_count {
         commits.truncate(max);
     }
-    if reverse {
-        commits.reverse();
-    }
 
-    // `--boundary`: the parents of shown commits that are not themselves shown,
-    // discovered in emission order, then emitted after the walk in reverse
-    // discovery order, topologically sorted.
+    // `--boundary`: the parents of the commits the walk returned that were not
+    // themselves returned, appended once `get_revision_1()` runs dry. The marking
+    // runs over the emission order, so it has to happen before `--reverse` — which
+    // `get_revision()` applies to the *whole* sequence, boundary commits included
+    // (revision.c:4673-4692), putting them in front and reversing their own order.
     let boundary_commits = if boundary {
-        boundary_list(&repo, &commits, &mut parents_of)
+        boundary_list(&repo, &commits, &mut parents_of, order == Order::DateTopo)
     } else {
         Vec::new()
     };
@@ -1029,12 +1028,20 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     };
 
     // Shown commits first, then the boundary commits git appends once the walk
-    // has run out; both go through the same renderer.
-    let emitted: Vec<(ObjectId, bool)> = commits
+    // has run out; both go through the same renderer. `--reverse` collects that
+    // whole sequence through `commit_list_insert` and pops it back
+    // (revision.c:4673-4692), so it reverses the two halves together.
+    let mut emitted: Vec<(ObjectId, bool)> = commits
         .iter()
         .map(|id| (*id, false))
         .chain(boundary_commits.iter().map(|id| (*id, true)))
         .collect();
+    if reverse {
+        emitted.reverse();
+        // The `--objects` walk below reads the commit list itself, in the same
+        // order the records came out.
+        commits.reverse();
+    }
 
     for (id, is_boundary) in &emitted {
         if disk_usage {
@@ -1826,16 +1833,42 @@ fn rewrite_parents(
     out
 }
 
-/// git's `--boundary` set: the parents of shown commits that are not themselves
-/// shown, in the order `create_boundary_commit_list` produces them.
+/// git's `--boundary` list, shared by every command that offers the flag:
+/// `log`, `show`, `whatchanged`, `rev-list`, `shortlog` and the prerequisite
+/// lines of `bundle create` (which is `revs.boundary = 1` over the same
+/// machinery, bundle.c:590-601).
 ///
-/// Candidates are recorded as each commit is emitted, then walked in reverse —
-/// `commit_list_insert` prepends — and topologically sorted so a child still
-/// comes before its parent.
-fn boundary_list(
+/// **Membership.** `get_revision_internal()` marks *every* parent of every
+/// commit it returns, not only the ones a `^rev` hid: `for (l = c->parents; l;
+/// l = l->next) { if (p->flags & (CHILD_SHOWN | SHOWN)) continue; p->flags |=
+/// CHILD_SHOWN; add_object_array(p, NULL, &revs->boundary_commits); }`
+/// (revision.c:4583-4591). A parent kept out of the output by `--merges`,
+/// `--no-merges`, a parent-count bound, a date limit or a header grep is never
+/// *returned*, so it never gains SHOWN and stays on the list —
+/// `create_boundary_commit_list()` drops only the ones that were shown
+/// (revision.c:4494-4497). `shown` here is what the command actually emitted,
+/// which is also why a `--skip`ped or `--max-count`-truncated commit marks
+/// nothing: `get_revision_1()`'s result is discarded before the loop above runs.
+///
+/// **Order.** `create_boundary_commit_list()` walks `revs->boundary_commits` in
+/// marking order but splices each survivor onto the *front* of `revs->commits`
+/// with `commit_list_insert()` (revision.c:4490-4500), so the list it hands to
+/// `sort_in_topological_order(&revs->commits, revs->sort_order)`
+/// (revision.c:4506) is in **reverse marking order**. That sort seeds its queue
+/// in list order and, for the default `REV_SORT_IN_GRAPH_ORDER`, reverses the
+/// seed so a LIFO pop reproduces it (commit.c:1015-1016 with the
+/// `compare == NULL` stack in prio-queue.c) — the tips therefore come out in
+/// list order, i.e. reverse marking order. `--topo-order` keeps that sort order
+/// (revision.c:2437); only `--date-order` (`REV_SORT_BY_COMMIT_DATE`,
+/// revision.c:2454) replaces it, which is what `by_date` selects.
+///
+/// `parents_of` is filled in for the boundary commits themselves — the walk
+/// never visited them, and both the sort here and `--parents` need the links.
+pub(crate) fn boundary_list(
     repo: &gix::Repository,
     shown: &[ObjectId],
     parents_of: &mut HashMap<ObjectId, Vec<ObjectId>>,
+    by_date: bool,
 ) -> Vec<ObjectId> {
     let shown_set: HashSet<ObjectId> = shown.iter().copied().collect();
     let mut candidates: Vec<ObjectId> = Vec::new();
@@ -1852,16 +1885,17 @@ fn boundary_list(
         .rev()
         .filter(|id| !shown_set.contains(id))
         .collect();
-    // The walk never visited these commits, so their parent links are missing —
-    // and both the sort below and `--parents` need them.
     for id in &list {
         parents_of
             .entry(*id)
             .or_insert_with(|| commit_parents(repo, *id));
     }
-    // `sort_in_topological_order` is called with `revs->sort_order`, which is
-    // `REV_SORT_IN_GRAPH_ORDER` unless `--date-order` changed it.
-    topo_sort(&list, parents_of, None)
+    let dates: Option<HashMap<ObjectId, i64>> = by_date.then(|| {
+        list.iter()
+            .map(|id| (*id, commit_date(repo, *id)))
+            .collect()
+    });
+    topo_sort(&list, parents_of, dates.as_ref())
 }
 
 /// git's `print_disk_usage` under `--disk-usage=human`: `strbuf_humanise_bytes`.

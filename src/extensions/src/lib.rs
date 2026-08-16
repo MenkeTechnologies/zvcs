@@ -27,6 +27,8 @@ pub mod merge_apply;
 pub mod merge_guard;
 pub mod optint;
 pub mod pager;
+pub mod parseopt;
+pub mod pathspec;
 pub mod porcelain;
 pub mod precompose;
 pub mod progress;

@@ -215,9 +215,10 @@ fn usage_fatal(msg: &str) -> ExitCode {
 /// the specs in argument order and, per spec, parse-then-normalize exactly as
 /// git does, emitting git's message and returning 128 on the first failure.
 ///
-/// Parse failures git does *not* treat as fatal magic (attribute-value corner
-/// cases where gitoxide is stricter than git) are left for `repo.pathspec()`,
-/// so a spec git accepts is never forced to 128 here.
+/// The (a) wording comes from [`crate::pathspec`], which every verb that takes a
+/// pathspec shares; see its notes on why nothing gitoxide rejects there is
+/// something git accepts, so translating the failure is right and gating it is
+/// not.
 fn check_pathspecs(
     repo: &gix::Repository,
     patterns: &[BString],
@@ -236,13 +237,13 @@ fn check_pathspecs(
         // (a) Magic parsing — git rejects bad magic before touching the path.
         let mut parsed = match gix::pathspec::parse(pattern.as_slice(), defaults) {
             Ok(p) => p,
-            Err(err) => match pathspec_parse_fatal(&err, raw) {
-                Some(msg) => {
-                    eprintln!("fatal: {msg}");
-                    return Ok(Some(ExitCode::from(128)));
-                }
-                None => continue,
-            },
+            Err(err) => {
+                eprintln!(
+                    "fatal: {}",
+                    crate::pathspec::parse_error_message(raw.as_str().into(), &err)
+                );
+                return Ok(Some(ExitCode::from(128)));
+            }
         };
         // (b) Path normalization — a spec escaping the worktree is fatal. git
         // quotes the path portion (magic stripped), captured before normalize
@@ -257,28 +258,6 @@ fn check_pathspecs(
         }
     }
     Ok(None)
-}
-
-/// Map a gitoxide pathspec parse error to git's exact `fatal:` message body
-/// (everything after `fatal: `), or `None` for the attribute corner cases where
-/// gitoxide is stricter than git and forcing a 128 would reject a spec git
-/// accepts (e.g. `:(attr:-unset)`), which must instead flow through to gix.
-fn pathspec_parse_fatal(err: &gix::pathspec::parse::Error, raw: &str) -> Option<String> {
-    use gix::pathspec::parse::Error as E;
-    Some(match err {
-        E::InvalidKeyword { keyword } => {
-            format!("Invalid pathspec magic '{}' in '{raw}'", keyword.to_str_lossy())
-        }
-        E::Unimplemented { short_keyword } => {
-            format!("Unimplemented pathspec magic '{short_keyword}' in '{raw}'")
-        }
-        E::MissingClosingParenthesis => {
-            format!("Missing ')' at the end of pathspec magic in '{raw}'")
-        }
-        E::IncompatibleSearchModes => format!("{raw}: 'literal' and 'glob' are incompatible"),
-        E::EmptyAttribute => "attr spec must not be empty".to_string(),
-        _ => return None,
-    })
 }
 
 /// `git ls-files` — list index entries, and optionally worktree-derived sets.

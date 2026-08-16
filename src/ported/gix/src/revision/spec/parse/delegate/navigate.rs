@@ -33,20 +33,17 @@ impl delegate::Navigate for Delegate<'_> {
         for obj in objs.iter() {
             match kind {
                 Traversal::NthParent(num) => {
-                    match self.repo.find_object(*obj).or_erased().and_then(|obj| {
-                        obj.try_into_commit().map_err(|err| {
-                            let object::try_into::Error { actual, expected, id } = err;
-                            message!(
-                                "Object {oid} was a {actual}, but needed it to be a {expected}",
-                                oid = id.attach(repo).shorten_or_id(),
-                            )
-                            .raise_erased()
-                        })
-                    }) {
+                    // `get_parent()` resolves its anchor with
+                    // `GET_OID_COMMITTISH` and then `lookup_commit_reference()`,
+                    // so `<annotated-tag>^<n>` names a parent of the *tagged*
+                    // commit — object-name.c:1031-1053. The replacement is keyed
+                    // by the anchor as it was before peeling, since that is the
+                    // id still recorded in `objs`.
+                    match commit_reference(repo, obj) {
                         Ok(commit) => match commit.parent_ids().nth(num.saturating_sub(1)) {
-                            Some(id) => replacements.push((commit.id, id.detach())),
+                            Some(id) => replacements.push((*obj, id.detach())),
                             None => errors.push((
-                                commit.id,
+                                *obj,
                                 message!(
                                     "Commit {oid} has {available} parents and parent number {desired} is out of range",
                                     oid = commit.id().shorten_or_id(),
@@ -60,7 +57,17 @@ impl delegate::Navigate for Delegate<'_> {
                     }
                 }
                 Traversal::NthAncestor(num) => {
-                    let id = obj.attach(repo);
+                    // `get_nth_ancestor()` peels through the tag chain with
+                    // `lookup_commit_reference()` before walking, so `<tag>~<n>`
+                    // counts from the tagged commit — object-name.c:1065-1078.
+                    let commit = match commit_reference(repo, obj) {
+                        Ok(commit) => commit,
+                        Err(err) => {
+                            errors.push((*obj, err));
+                            continue;
+                        }
+                    };
+                    let id = commit.id().detach().attach(repo);
                     match id
                         .ancestors()
                         .first_parent_only()
@@ -194,7 +201,18 @@ impl delegate::Navigate for Delegate<'_> {
                 let mut errors = Vec::<(ObjectId, Exn)>::new();
                 let mut replacements = Replacements::default();
                 for oid in objs.iter() {
-                    match oid
+                    // `peel_onion()` treats `^{/<text>}` as `expected_type =
+                    // OBJ_COMMIT` and runs `repo_peel_to_type()` before seeding
+                    // the one-line search — object-name.c:1146-1196. Without that
+                    // peel an annotated tag has no ancestry to search.
+                    let start = match commit_reference(repo, oid) {
+                        Ok(commit) => commit.id,
+                        Err(err) => {
+                            errors.push((*oid, err));
+                            continue;
+                        }
+                    };
+                    match start
                         .attach(repo)
                         .ancestors()
                         .sorting(crate::revision::walk::Sorting::ByCommitTime(Default::default()))
@@ -363,6 +381,27 @@ impl delegate::Navigate for Delegate<'_> {
             }
         }
     }
+}
+
+/// Port of `lookup_commit_reference()` (commit.c): dereference the whole tag
+/// chain hanging off `obj`, then require the result to be a commit. This is what
+/// every committish navigation in `object-name.c` runs before it looks at
+/// parents, which is why `<annotated-tag>^`, `<annotated-tag>~<n>` and
+/// `<annotated-tag>^{/<text>}` all work in git.
+fn commit_reference<'repo>(repo: &'repo crate::Repository, obj: &gix_hash::oid) -> Result<crate::Commit<'repo>, Exn> {
+    repo.find_object(obj)
+        .or_erased()
+        .and_then(|obj| obj.peel_tags_to_end().map_err(|err| err.raise_erased()))
+        .and_then(|obj| {
+            obj.try_into_commit().map_err(|err| {
+                let object::try_into::Error { actual, expected, id } = err;
+                message!(
+                    "Object {oid} was a {actual}, but needed it to be a {expected}",
+                    oid = id.attach(repo).shorten_or_id(),
+                )
+                .raise_erased()
+            })
+        })
 }
 
 fn handle_errors_and_replacements(

@@ -449,9 +449,7 @@ fn parse_pathspec_magic(elt: &str) -> std::result::Result<(String, bool), ExitCo
     if let Some(body) = after.strip_prefix('(') {
         // Long form: comma-separated magic names inside parentheses.
         let Some(close) = body.find(')') else {
-            return Err(fatal(&format!(
-                "Missing ')' at the end of pathspec magic in '{elt}'"
-            )));
+            return Err(fatal(&crate::pathspec::missing_closing_paren(elt.into())));
         };
         for field in body[..close].split(',') {
             if field.is_empty() {
@@ -464,17 +462,13 @@ fn parse_pathspec_magic(elt: &str) -> std::result::Result<(String, bool), ExitCo
             match matched {
                 Some((_, _, bit)) => magic |= bit,
                 None => {
-                    return Err(fatal(&format!(
-                        "Invalid pathspec magic '{field}' in '{elt}'"
-                    )))
+                    return Err(fatal(&crate::pathspec::invalid_magic(field.into(), elt.into())))
                 }
             }
         }
         // git rejects this specific pair while parsing, before the support check.
         if magic & M_LITERAL != 0 && magic & M_GLOB != 0 {
-            return Err(fatal(&format!(
-                "{elt}: 'literal' and 'glob' are incompatible"
-            )));
+            return Err(fatal(&crate::pathspec::incompatible_literal_glob(elt.into())));
         }
         path = body[close + 1..].to_string();
     } else {
@@ -518,9 +512,9 @@ fn parse_pathspec_magic(elt: &str) -> std::result::Result<(String, bool), ExitCo
                 }
             }
         }
-        return Err(fatal(&format!(
-            "{elt}: pathspec magic not supported by this command: {}",
-            parts.join(", ")
+        return Err(fatal(&crate::pathspec::magic_not_supported(
+            elt.into(),
+            &parts.join(", "),
         )));
     }
 

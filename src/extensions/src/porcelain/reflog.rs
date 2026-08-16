@@ -754,6 +754,35 @@ impl Default for Opts {
     }
 }
 
+/// Apply a `--skip`/`--max-count` value, reporting git's `not an integer` fatal
+/// and returning `false` when the value is one `strtol_i` rejects.
+///
+/// Both slots are signed `int`s in `struct rev_info`, and the walk only ever
+/// tests them positively (`if (revs->max_count == 0) return NULL;` /
+/// `if (revs->skip_count > 0)`), so a negative value is accepted and means "no
+/// limit" for `--max-count` and "skip nothing" for `--skip`. Shared with
+/// `git log`'s parser so the two agree on every spelling.
+fn set_count(opts: &mut Opts, is_skip: bool, value: &str) -> bool {
+    if is_skip {
+        match super::log::parse_skip(value) {
+            Ok(n) => opts.skip = n,
+            Err(()) => {
+                eprintln!("fatal: '{value}': not an integer");
+                return false;
+            }
+        }
+    } else {
+        match super::log::parse_max_count(value) {
+            Ok(n) => opts.max_count = n,
+            Err(()) => {
+                eprintln!("fatal: '{value}': not an integer");
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// Record the first option that is recognized but not rendered here. Only the
 /// first matters: git would have failed on it before reaching any later one.
 fn note_first(slot: &mut Option<String>, what: String) {
@@ -952,30 +981,23 @@ fn show(repo: &gix::Repository, rest: &[String], tweak: Tweak) -> Result<u8> {
                     }
                     return Ok(128);
                 };
-                let Ok(n) = v.parse::<usize>() else {
-                    eprintln!("fatal: '{v}': not an integer");
+                if !set_count(&mut opts, a == "--skip", v) {
                     return Ok(128);
-                };
-                if a == "--skip" {
-                    opts.skip = n;
-                } else {
-                    opts.max_count = Some(n);
                 }
             }
             s if s.starts_with("--max-count=") || s.starts_with("--skip=") => {
                 let (key, v) = s.split_once('=').expect("checked for `=` above");
-                let Ok(n) = v.parse::<usize>() else {
-                    eprintln!("fatal: '{v}': not an integer");
+                if !set_count(&mut opts, key == "--skip", v) {
                     return Ok(128);
-                };
-                if key == "--skip" {
-                    opts.skip = n;
-                } else {
-                    opts.max_count = Some(n);
                 }
             }
-            s if s.len() > 2 && s.starts_with("-n") && all_digits(&s[2..]) => {
-                opts.max_count = Some(s[2..].parse().expect("all digits"));
+            // `-n<value>`: `skip_prefix(arg, "-n", &optarg)` in `revision.c`, so
+            // the rest of the token is the value whatever it looks like — `-n-1`
+            // is unlimited and `-nabc` is fatal, neither of them an unknown option.
+            s if s.len() > 2 && s.starts_with("-n") => {
+                if !set_count(&mut opts, false, &s[2..]) {
+                    return Ok(128);
+                }
             }
             s if s.len() > 1 && s.starts_with('-') && all_digits(&s[1..]) => {
                 opts.max_count = Some(s[1..].parse().expect("all digits"));

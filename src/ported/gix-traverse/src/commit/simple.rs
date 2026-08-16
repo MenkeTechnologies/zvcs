@@ -90,7 +90,6 @@ bitflags::bitflags! {
     struct PaintFlags: u8 {
         const VISIBLE = 1 << 0;
         const HIDDEN = 1 << 1;
-        const STALE = 1 << 2;
     }
 }
 
@@ -168,13 +167,23 @@ fn to_queue_key(i: i64, order: CommitTimeOrder) -> QueueKey<i64> {
 ///
 /// The algorithm performs a merge-base-style paint in a temporary `gix_revwalk::Graph`:
 /// visible tips are marked with `VISIBLE`, hidden tips with `HIDDEN`, and these flags are
-/// propagated to parents in generation/time order. Once a commit carries both flags, it is part
-/// of the overlap between the two histories and is marked `STALE` so older ancestors no longer
-/// need to keep re-propagating the same combined state.
+/// propagated to parents in generation/time order. A commit carrying both flags is part of the
+/// overlap between the two histories, which is what the visible traversal must not cross.
 ///
-/// The returned set is not all commits reachable from hidden tips. It is only the overlap frontier
-/// where the visible traversal must stop. The actual `Simple` walk then skips these commits and
-/// refuses to enqueue parents across them, which avoids traversing hidden-only history.
+/// Both the painting and its termination are git's `limit_list()`:
+///
+/// * a commit that gains `HIDDEN` hands it to every ancestor the graph has already seen, which is
+///   `mark_parents_uninteresting()` — the recursive descent is what catches a commit that was
+///   painted `VISIBLE` earlier on a path the hidden side reaches only now,
+/// * the loop leaves only when a *hidden* commit was popped and no visible commit is queued any
+///   more, which is `still_interesting()`. Leaving on a visible pop is what git never does, and
+///   what an earlier version of this function did: `git show ^HEAD HEAD~2 HEAD^0` popped `HEAD~2`
+///   last, stopped with the hidden paint still one commit short of it, and printed it plus its
+///   ancestors where stock git prints nothing at all.
+///
+/// The returned set is not all commits reachable from hidden tips: hidden-only history the visible
+/// tips can never reach stays out of it. The actual `Simple` walk then skips the commits in the set
+/// and refuses to enqueue parents across them.
 fn compute_hidden_frontier(
     visible_tips: &[ObjectId],
     hidden_tips: &[ObjectId],
@@ -183,35 +192,33 @@ fn compute_hidden_frontier(
     predicate: &mut impl FnMut(&gix_hash::oid) -> bool,
 ) -> Result<gix_revwalk::graph::IdMap<()>, Error> {
     let mut graph = gix_revwalk::Graph::<gix_revwalk::graph::Commit<PaintFlags>>::new(objects, cache);
-    let mut queue = gix_revwalk::PriorityQueue::<GenThenTime, ObjectId>::new();
+    // The queue value carries whether the entry was still visible-only when it was queued, so the
+    // loop below can test "is any visible commit still pending" in constant time instead of
+    // scanning the whole queue on every iteration. A commit that gains `HIDDEN` after it was
+    // queued is queued again with the flag, so the count is an over-estimate at worst — which
+    // only ever means popping a few entries more than strictly needed, never stopping too early.
+    let mut queue = gix_revwalk::PriorityQueue::<GenThenTime, (ObjectId, bool)>::new();
+    let mut visible_pending = 0usize;
 
     for &visible in visible_tips {
         graph.get_or_insert_full_commit(visible, |commit| {
             commit.data |= PaintFlags::VISIBLE;
-            queue.insert(GenThenTime::from(&*commit), visible);
+            let visible_only = !commit.data.contains(PaintFlags::HIDDEN);
+            visible_pending += usize::from(visible_only);
+            queue.insert(GenThenTime::from(&*commit), (visible, visible_only));
         })?;
     }
     for &hidden in hidden_tips {
         graph.get_or_insert_full_commit(hidden, |commit| {
             commit.data |= PaintFlags::HIDDEN;
-            queue.insert(GenThenTime::from(&*commit), hidden);
+            queue.insert(GenThenTime::from(&*commit), (hidden, false));
         })?;
     }
 
-    while queue.iter_unordered().any(|id| {
-        graph
-            .get(id)
-            .is_some_and(|commit| !commit.data.contains(PaintFlags::STALE))
-    }) {
-        let (_info, commit_id) = match queue.pop() {
-            Some(v) => v,
-            None => break,
-        };
+    while let Some((_info, (commit_id, was_visible_only))) = queue.pop() {
+        visible_pending -= usize::from(was_visible_only);
         let commit = graph.get_mut(&commit_id).expect("queued commits are in the graph");
-        let mut flags = commit.data;
-        if flags == (PaintFlags::VISIBLE | PaintFlags::HIDDEN) {
-            flags |= PaintFlags::STALE;
-        }
+        let flags = commit.data;
 
         for parent_id in commit.parents.clone() {
             // The same predicate the visible walk consults, which is where the
@@ -223,12 +230,25 @@ fn compute_hidden_frontier(
             if !predicate(&parent_id) {
                 continue;
             }
+            let mut newly_hidden = false;
             graph.get_or_insert_full_commit(parent_id, |parent| {
                 if (parent.data & flags) != flags {
+                    newly_hidden = flags.contains(PaintFlags::HIDDEN) && !parent.data.contains(PaintFlags::HIDDEN);
                     parent.data |= flags;
-                    queue.insert(GenThenTime::from(&*parent), parent_id);
+                    let visible_only = !parent.data.contains(PaintFlags::HIDDEN);
+                    visible_pending += usize::from(visible_only);
+                    queue.insert(GenThenTime::from(&*parent), (parent_id, visible_only));
                 }
             })?;
+            if newly_hidden {
+                mark_ancestors_hidden(&mut graph, parent_id);
+            }
+        }
+
+        // git's `still_interesting()`, consulted only after an uninteresting commit: everything
+        // left is hidden, so nothing the visible walk can reach is left to discover.
+        if flags.contains(PaintFlags::HIDDEN) && visible_pending == 0 {
+            break;
         }
     }
 
@@ -242,6 +262,31 @@ fn compute_hidden_frontier(
                 .then_some((id, ()))
         })
         .collect())
+}
+
+/// git's `mark_parents_uninteresting()`: a commit known to be reachable from a hidden tip makes
+/// every ancestor of it hidden as well, and the descent stops at an already-hidden commit.
+///
+/// Only ancestors the graph has already read are visited, which is git's "the parent is not parsed
+/// yet, so it has no parent list to descend into" — such a commit is painted later, when its child
+/// comes off the queue, exactly as git paints it from a later `process_parents()`.
+fn mark_ancestors_hidden(
+    graph: &mut gix_revwalk::Graph<'_, '_, gix_revwalk::graph::Commit<PaintFlags>>,
+    start: ObjectId,
+) {
+    let mut stack = vec![start];
+    while let Some(id) = stack.pop() {
+        let Some(commit) = graph.get(&id) else { continue };
+        for parent_id in commit.parents.clone() {
+            match graph.get_mut(&parent_id) {
+                Some(parent) if !parent.data.contains(PaintFlags::HIDDEN) => {
+                    parent.data |= PaintFlags::HIDDEN;
+                    stack.push(parent_id);
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
 ///

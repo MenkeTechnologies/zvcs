@@ -79,9 +79,13 @@ pub fn strtol_long(v: &str) -> Option<i64> {
             .saturating_add(u64::from(b[i] - b'0'));
         i += 1;
     }
-    // A lone sign is not a number: `end` stays at the start, so the sign trails.
-    if signed && i == digits_start {
-        return None;
+    // "If no conversion is performed, the value of `nptr` is stored in `*endptr`"
+    // — `end` goes back to the *start* of the string, not to where the scan gave
+    // up, so everything the scan skipped is left trailing. A lone sign trails
+    // itself; leading whitespace with no digits behind it trails the whitespace,
+    // which is why `--unified=" "` is a failure while `--unified=""` is not.
+    if i == digits_start {
+        return if v.is_empty() { Some(0) } else { None };
     }
     if i != b.len() {
         return None;
@@ -313,7 +317,12 @@ mod tests {
             check("unified", Some("-99999999999999999999999999")),
             Err("--unified expects a non-negative integer".to_string())
         );
-        for bad in ["v1", "abc", "4 "] {
+        // `strtol` converts nothing here, so `end` returns to the start and the
+        // caller's `*end` test sees the whitespace — unlike the empty value above,
+        // where it sees the terminator. Verified against stock 2.55.0:
+        // `git range-diff --unified=<tab> main...feature` is
+        // `error: --unified expects a numerical value`, exit 129.
+        for bad in [" ", "  ", "\t", "\n", "v1", "abc", "4 "] {
             assert_eq!(
                 check("unified", Some(bad)),
                 Err("--unified expects a numerical value".to_string()),

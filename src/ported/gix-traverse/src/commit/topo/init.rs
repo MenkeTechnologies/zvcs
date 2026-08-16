@@ -167,6 +167,21 @@ where
         // the tips, but then in simplify_commit() Git is told to ignore it. For
         // now the tests pass.
         for id in self.tips.iter() {
+            // git's `UNINTERESTING` is a flag on the *object*, not on the pending entry
+            // that mentioned it, and a negative mention beats a positive one no matter
+            // which order the two arrive in: `limit_list()` drops the commit before
+            // `sort_in_topological_order()` ever sees it. Naming the same commit on both
+            // sides — `git rev-list --topo-order main ^main`, or a `fast-export`/
+            // `shortlog` whose `--all` re-adds a ref that was also excluded — therefore
+            // yields nothing at all. The state map above already carries `end_flags` for
+            // such a commit, because the `ends` are chained after the `tips` and
+            // overwrite them; without this check the seeding loop would queue it anyway
+            // and `pop_commit` hands out whatever the queue holds.
+            let state = w.states.get(id).copied().unwrap_or_else(WalkFlags::empty);
+            if state.contains(WalkFlags::Uninteresting) {
+                continue;
+            }
+
             let i = w.indegrees.get(id).ok_or(Error::MissingIndegreeUnexpected)?;
 
             if *i != 1 {

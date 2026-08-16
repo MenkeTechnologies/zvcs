@@ -23,7 +23,12 @@
 //! * `read-tree --reset <tree-ish>` — as `-m`, but unmerged entries are discarded and
 //!   the safety checks are skipped.
 //! * `read-tree --prefix=<p>/ <tree-ish>` — keep the index and bind the tree under
-//!   `<p>/`, refusing paths that already exist.
+//!   `<p>/`, refusing paths that already exist. `--prefix` is the *traversal base*,
+//!   not a mode: it selects `bind_merge` only at one tree, and with two or three it
+//!   runs the same `twoway_merge`/`threeway_merge` those counts always run, reading
+//!   every tree path under `<p>/`. A prefix with no trailing `/` gains one, an empty
+//!   prefix adds no separator at all (so `--prefix=` overlaps the index immediately),
+//!   and one starting with `/` is refused before the repository is opened.
 //! * `-u` (with `-m`/`--reset`/`--prefix`) — update the worktree for the paths whose
 //!   index entry actually changed, and delete files the read drops. `--reset -u`
 //!   additionally restores tracked files that are dirty or missing.
@@ -67,7 +72,9 @@
 //!   leaving unresolvable paths at stages 1/2/3. `--aggressive` resolves the
 //!   trivial delete/delete and identical-add cases; `--trivial` refuses the whole
 //!   merge (`Merge requires file-level merging`) if any path needed file-level
-//!   merging.
+//!   merging. Four or more trees also run `threeway_merge`, with the last two trees
+//!   as head and remote and the rest as ancestors; the ninth tree is refused
+//!   (`I cannot read more than 8 trees`).
 //!
 //! ## Known deviations
 //!
@@ -85,13 +92,13 @@
 //! * `--sparse-checkout` is accepted but never applies a sparse filter, and
 //!   `--recurse-submodules` never descends into submodules — both need substrate
 //!   this port does not have, so they behave as their `--no-` counterparts.
-//! * `--exclude-per-directory` reproduces git's "meaningless unless -u" gate but the
-//!   ignore file it names is not consulted, since `-u` here never overwrites an
-//!   existing untracked file in the first place.
+//! * `--exclude-per-directory` reproduces git's "meaningless unless -u" and
+//!   "must be .gitignore" gates, but the ignore file it names is not consulted,
+//!   since `-u` here never overwrites an existing untracked file in the first place.
 //! * `--debug-unpack` is accepted and silent; there is no `unpack-trees` to trace.
 //! * `read-tree --help` renders a man page under stock git and is not reproduced.
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::Result;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -501,12 +508,16 @@ pub(super) fn parse_args(argv: &[String]) -> Result<std::result::Result<Opts, Ex
             "prefix" => o.prefix = Some(value!()),
             "index-output" => o.index_output = Some(PathBuf::from(value!())),
             "exclude-per-directory" => {
-                let _ignore_file = value!();
-                // git checks this inside the option callback, so it fires during the
-                // scan — before the tree-ishes are resolved, and it only sees the
-                // `-u` seen so far.
+                let ignore_file = value!();
+                // git checks both of these inside the option callback
+                // (`exclude_per_directory_cb`, builtin/read-tree.c:57-71), so they
+                // fire during the scan — before the tree-ishes are resolved, and
+                // the `-u` test only sees the `-u` seen so far.
                 if !o.update {
                     reject!(fatal("--exclude-per-directory is meaningless unless -u"));
+                }
+                if ignore_file != ".gitignore" {
+                    reject!(fatal("--exclude-per-directory argument must be .gitignore"));
                 }
             }
             _ => reject!(usage_err(format!("unknown option `{body}'"))),
@@ -526,7 +537,37 @@ pub(super) fn check_options(o: &Opts) -> Result<std::result::Result<(), ExitCode
     if 1 < usize::from(o.merge) + usize::from(o.reset) + usize::from(o.prefix.is_some()) {
         return Ok(Err(fatal("Which one? -m, --reset, or --prefix?")?));
     }
+    // "Prefix should not start with a directory separator" (builtin/read-tree.c:181-183).
+    // It sits between the mode conflict and the lock, so it outranks every later
+    // diagnosis: `--prefix=/x does-not-exist` reports the prefix, not the tree-ish.
+    if o.prefix.as_deref().is_some_and(|p| p.starts_with('/')) {
+        return Ok(Err(fatal("Invalid prefix, prefix cannot start with '/'")?));
+    }
     Ok(Ok(()))
+}
+
+/// git's cap on how many trees one `read-tree` may name (`MAX_UNPACK_TREES`,
+/// unpack-trees.h:10). `list_tree()` refuses the ninth (builtin/read-tree.c:33-34).
+const MAX_UNPACK_TREES: usize = 8;
+
+/// The base every tree path is read under, as `setup_traverse_info()` derives it
+/// from `o->prefix` (tree-walk.c:192-205).
+///
+/// git drops one trailing `/` there and `make_traverse_path()` puts one back
+/// between the base and each path, so `sub` and `sub/` both name `sub/` while
+/// `sub//` names `sub//`. An empty prefix leaves `info->pathlen` at 0 and no
+/// separator is inserted at all — which is why `--prefix=` binds the tree over
+/// the index at the tree's own paths and immediately overlaps with it.
+///
+/// The prefix costs no tree-recursion levels: it is the traversal's starting
+/// base, not a level descended into (verified against git 2.55.0 — a one-level
+/// tree binds under a three-segment prefix even at `core.maxTreeDepth=0`).
+fn traverse_base(prefix: &str) -> String {
+    if prefix.is_empty() || prefix.ends_with('/') {
+        prefix.to_string()
+    } else {
+        format!("{prefix}/")
+    }
 }
 
 /// Everything `cmd_read_tree` does once `parse_options` has returned: the
@@ -545,6 +586,12 @@ fn finish(o: Opts) -> Result<ExitCode> {
         let Ok(obj) = repo.rev_parse_single(spec.as_str()) else {
             return fatal(format!("Not a valid object name {spec}"));
         };
+        // `list_tree()` counts before it parses, so the ninth tree-ish is refused
+        // for being the ninth even when it would not have peeled to a tree — but
+        // only after its name resolved, which is `cmd_read_tree`'s own order.
+        if tree_ids.len() >= MAX_UNPACK_TREES {
+            return fatal(format!("I cannot read more than {MAX_UNPACK_TREES} trees"));
+        }
         // `object()` and `peel_to_tree()` have distinct error types, so the two
         // fallible steps are joined through anyhow rather than `and_then`.
         let peeled = obj
@@ -573,13 +620,6 @@ fn finish(o: Opts) -> Result<ExitCode> {
     if o.merge_like() && tree_ids.is_empty() {
         return fatal("you must specify at least one tree to merge");
     }
-    // `--prefix` is `bind_merge`, which git only ever runs with one tree.
-    if o.prefix.is_some() && tree_ids.len() > 1 {
-        anyhow::bail!(
-            "unsupported: {} tree-ishes with --prefix (git's bind merge takes exactly one)",
-            tree_ids.len()
-        );
-    }
 
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
 
@@ -607,8 +647,11 @@ fn finish(o: Opts) -> Result<ExitCode> {
         Err(message) => return fatal(message),
     };
 
-    // Two or three trees select `twoway_merge`/`threeway_merge` instead of the
-    // one-tree `oneway_merge` the rest of this function implements.
+    // The tree count alone picks the unpack function (builtin/read-tree.c:237-259):
+    // two trees select `twoway_merge` and three or more `threeway_merge`, whether
+    // the merge was asked for with `-m`, `--reset` or `--prefix`. Only the one-tree
+    // case reads `opts.prefix`, and only to choose `bind_merge` over `oneway_merge`
+    // — with more trees the prefix stays what it always is, the traversal base.
     if o.merge_like() && tree_ids.len() > 1 {
         return multi_tree_read(&repo, &o, &old, &tree_ids, depth_limit, &fsync);
     }
@@ -803,13 +846,15 @@ fn union_of_trees(
 
 /// `--prefix=<p>`: keep `old` and add every entry of `tree` under `<p>/`.
 ///
+/// Reached only for the one-tree case: `bind_merge` is the single unpack function
+/// git guards with `if (o->merge_size != 1) BUG(...)`, and `cmd_read_tree` only
+/// selects it when exactly one tree was named. With more trees `--prefix` is still
+/// honoured, but through [`multi_tree_read`]'s two- and three-tree merges.
+///
 /// Returns `Err(ExitCode)` for git's bind-overlap rejection and for the
 /// `core.maxTreeDepth` rejection, so the caller can exit with git's code and
 /// message instead of an `anyhow` error. The depth is measured on the tree as
-/// read, *before* the prefix is applied — git's `read_tree_at()` starts the
-/// prefix as its base string at depth 0, so `--prefix=p/q/r/` costs no levels
-/// (verified against git 2.55.0: a one-level tree binds under a three-segment
-/// prefix even at `core.maxTreeDepth=0`).
+/// read, *before* the prefix is applied — see [`traverse_base`].
 fn bind_prefix(
     repo: &gix::Repository,
     old: &gix::index::File,
@@ -817,11 +862,7 @@ fn bind_prefix(
     prefix: &str,
     depth_limit: i64,
 ) -> Result<std::result::Result<gix::index::File, ExitCode>> {
-    let prefix = if prefix.is_empty() || prefix.ends_with('/') {
-        prefix.to_string()
-    } else {
-        format!("{prefix}/")
-    };
+    let prefix = traverse_base(prefix);
 
     let existing: HashSet<BString> = {
         let backing = old.path_backing();
@@ -849,7 +890,7 @@ fn bind_prefix(
     Ok(Ok(index))
 }
 
-/// `read-tree -m` (or `--reset`) with two or three trees: the two- and
+/// `read-tree -m`, `--reset` or `--prefix` with two or more trees: the two- and
 /// three-tree merges of `unpack-trees.c`.
 ///
 /// Decisions are made per path over the union of the index's and the trees'
@@ -859,6 +900,13 @@ fn bind_prefix(
 /// a slot whose path is a directory in that tree) and sparse-directory handling.
 /// Neither is reproduced here, so a path that is a file in one tree and a
 /// directory in another is merged as if the directory side were simply absent.
+///
+/// `--prefix=<p>` is the traversal base ([`traverse_base`]), so every tree path
+/// is read at `<p>/<path>` and nothing else changes: index entries outside the
+/// prefix reach the merge function with all tree slots absent, which is exactly
+/// what git's pre-traversal and left-over `unpack_index_entry()` loops
+/// (unpack-trees.c:1992-2027) hand it, and `twoway_merge`'s "4 and 5" arm is what
+/// carries them through unchanged.
 #[allow(clippy::too_many_arguments)]
 fn multi_tree_read(
     repo: &gix::Repository,
@@ -868,8 +916,10 @@ fn multi_tree_read(
     depth_limit: i64,
     fsync: &crate::config::FsyncPolicy,
 ) -> Result<ExitCode> {
-    // Each tree, flattened to path → entry, with `core.maxTreeDepth` charged as
-    // it is for every other form.
+    // Each tree, flattened to path → entry under the traversal base, with
+    // `core.maxTreeDepth` charged against the tree as read — the prefix is the
+    // base the walk starts from, not a level it descends into.
+    let base = o.prefix.as_deref().map(traverse_base).unwrap_or_default();
     let mut trees: Vec<HashMap<BString, Ce>> = Vec::with_capacity(tree_ids.len());
     for id in tree_ids {
         let from_tree = repo.index_from_tree(id)?;
@@ -883,10 +933,9 @@ fn multi_tree_read(
                 .entries()
                 .iter()
                 .map(|e| {
-                    (
-                        e.path_in(backing).to_owned(),
-                        Ce { id: e.id, mode: e.mode, conflicted: false },
-                    )
+                    let mut path = BString::from(base.as_bytes());
+                    path.extend_from_slice(e.path_in(backing).as_ref());
+                    (path, Ce { id: e.id, mode: e.mode, conflicted: false })
                 })
                 .collect(),
         );

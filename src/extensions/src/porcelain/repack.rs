@@ -79,21 +79,37 @@
 //!     loose objects now present in a pack, delegating to the real
 //!     [`super::prune_packed::prune_packed`] port. A pack with a `.keep`, and
 //!     any pack named by `--keep-pack`, is left alone.
-//!   * **`--filter`** without `--filter-to` makes git write a *second* pack for
-//!     the filtered-out objects, so two `.pack`/`.idx`/`.rev` triples appear
-//!     rather than one; with `--filter-to=<dir>` that second pack goes to
-//!     `<dir>` instead and only one triple lands in `objects/pack`. Both are
-//!     reproduced. `blob:none` and `blob:limit=<n>` are applied to the
-//!     traversal, which the index objects are then unioned back into — the model
-//!     git's own output confirms (on the `branched` fixture, `blob:none` yields
-//!     11 of 13 objects: 13 less 4 blobs, plus the 2 blobs the index holds).
-//!     That second pack holds only what an *existing pack* held:
-//!     `write_filtered_pack()` runs `pack-objects --stdin-packs` over the
-//!     non-kept and cruft packs, so a filtered-out object that was only ever
-//!     loose is not in it and simply stays loose — `prune-packed` removes a
-//!     loose object only when a pack holds it. A run whose spec rejects nothing
-//!     that was packed therefore leaves an *empty* second pack beside the loose
-//!     objects, which is what stock git leaves.
+//!   * **`--filter`** makes git write a *second* pack for the filtered-out
+//!     objects, so two `.pack`/`.idx`/`.rev` triples appear rather than one.
+//!     `blob:none` and `blob:limit=<n>` are applied to the traversal, which the
+//!     index objects are then unioned back into — the model git's own output
+//!     confirms (on the `branched` fixture, `blob:none` yields 11 of 13 objects:
+//!     13 less 4 blobs, plus the 2 blobs the index holds).
+//!     That second pack is not the traversal's leftovers but *the existing packs
+//!     minus the new one*: `write_filtered_pack()` runs `pack-objects
+//!     --stdin-packs` over the non-kept and cruft packs with the new pack
+//!     excluded by `^`. Two consequences, both reproduced. A filtered-out object
+//!     that was only ever loose is not in it and simply stays loose —
+//!     `prune-packed` removes a loose object only when a pack holds it. And an
+//!     incremental run with nothing new to pack copies *every* packed object
+//!     into it, since there is no new pack to subtract; only when the new pack
+//!     already covers the old ones is the second pack written empty.
+//!   * **`--write-midx` over an empty new pack.** `write_midx_included_packs()`
+//!     hands `multi-pack-index write` a `--preferred-pack`: the first of the
+//!     packs this run wrote, `names` sorted and cruft packs skipped. An empty
+//!     pack cannot be that, so `write_midx_internal()` reports `error: cannot
+//!     select preferred pack <objdir>/pack/pack-<hash>.pack with no objects` and
+//!     `goto cleanup`s with `result` still at its `-1` initializer, which the
+//!     child turns into exit 255 and `cmd_repack()` hands back unchanged. That
+//!     is the pairing `--filter` reaches whenever the empty second pack sorts
+//!     first — its name being a constant, it usually does. Everything after the
+//!     MIDX write is skipped: the new packs stay, `-d` deletes nothing,
+//!     `prune-packed` and `update-server-info` do not run, and no
+//!     `multi-pack-index` or `.bitmap` is left behind.
+//!   * **`-b` with `--write-midx`** writes no pack `.bitmap`:
+//!     `cmd_repack()` pushes `--write-bitmap-index` at `pack-objects` only
+//!     `if (write_midx == REPACK_WRITE_MIDX_NONE)`, the bitmap belonging to the
+//!     MIDX in that case.
 //! ```
 //!
 //! # Deliberate gaps, so this doc claims no more than the code does
@@ -110,12 +126,20 @@
 //!     value is fatal even for `-h`).
 //!   * **`--geometric`** repacks everything rather than selecting the subset of
 //!     packs that restores a geometric size progression.
+//!   * **`--filter-to=<value>`** is read as a directory to put the filtered pack
+//!     in; git reads it as a pack *prefix*, so `--filter-to=/tmp/x` gives git
+//!     `/tmp/x-<hash>.pack` and this port `/tmp/x/pack-<hash>.pack`. What the
+//!     pack contains, and the fact that it stays out of the `names` list that
+//!     `--preferred-pack` is drawn from when it lands outside the object store,
+//!     are the same either way.
 //!   * **`--write-midx`** writes `objects/pack/multi-pack-index` over the packs
 //!     the run leaves behind, through the same writer `git multi-pack-index
 //!     write` uses. `--write-midx=incremental` asks for a MIDX *chain* instead
-//!     and is refused; and a MIDX written together with `-b` carries no
-//!     `.bitmap`, git's `write_bitmaps` path for a MIDX being a different
-//!     format from the pack bitmap this port writes.
+//!     and is refused. A MIDX written together with `-b` carries no
+//!     `multi-pack-index-<hash>.bitmap`: that is a different format from the
+//!     pack bitmap this port writes, and `gix-pack` has no writer for it. The
+//!     pack `.bitmap` is not written in its place either, git putting none there
+//!     under `--write-midx`, so the run is a MIDX with no bitmap at all.
 //!   * **`--filter=tree:<depth>`** is accepted but not applied to the traversal;
 //!     unlike the blob filters its interaction with `--indexed-objects` did not
 //!     reduce to a rule the observed output confirms, and guessing one would put
@@ -488,34 +512,43 @@ fn execute(st: &State) -> Result<ExitCode> {
     // rejects goes into a second pack of its own. Dropping those objects instead
     // would destroy them, because `-d` is about to delete the packs they live in
     // now — `git repack -a -d --filter=blob:none` must leave every blob readable.
-    let (mut to_pack, mut filtered_out): (Vec<ObjectId>, Vec<ObjectId>) = candidates
+    let mut to_pack: Vec<ObjectId> = candidates
         .into_iter()
-        .partition(|id| indexed.contains(id) || keeps_object(st, id, &repo));
-    // `write_filtered_pack()` (`repack-filtered.c`) drives that second pack with
-    // `pack-objects --stdin-packs`, fed the existing non-kept and cruft packs
-    // with the just-written pack excluded by `^`. `--stdin-packs` enumerates
-    // objects *out of packs*, so a filtered-out object that was only ever loose
-    // is not in it: `prune-packed` leaves a loose object no pack holds alone, so
-    // it simply stays loose. Keeping it here instead would move it into a pack
-    // git never writes.
-    let packed: HashSet<ObjectId> = existing
-        .iter()
-        .filter(|f| droppable(st, f.path()))
-        .flat_map(|f| f.iter().map(|e| e.oid))
+        .filter(|id| indexed.contains(id) || keeps_object(st, id, &repo))
         .collect();
     // The pack's entry order is ours to choose; sorting makes a run reproducible.
     to_pack.sort();
-    filtered_out.sort();
 
-    // `if (!names.nr)`: git says so and carries on. Everything after the pack
-    // write still runs — in particular `-d`'s `prune_packed_objects()`, which is
-    // what drops the loose copies of objects an *existing* pack already holds,
-    // and `--write-midx`. Returning here instead left those loose objects behind.
-    let nothing_new = to_pack.is_empty() && filtered_out.is_empty();
-    if nothing_new && !st.all_into_one && !st.quiet {
+    // `if (!names.nr)`: git says so and carries on, and it says so about the
+    // *first* `pack-objects` alone — the notice sits between that child and the
+    // cruft and filtered packs, so a run that goes on to write a filtered pack
+    // still prints it. Everything after the pack write still runs too — in
+    // particular `-d`'s `prune_packed_objects()`, which is what drops the loose
+    // copies of objects an *existing* pack already holds, and `--write-midx`.
+    // Returning here instead left those loose objects behind.
+    if to_pack.is_empty() && !st.all_into_one && !st.quiet {
         println!("Nothing new to pack.");
     }
-    filtered_out.retain(|id| packed.contains(id));
+
+    // `write_filtered_pack()` (`repack-filtered.c`) drives the second pack with
+    // `pack-objects --stdin-packs`, fed the existing non-kept and cruft packs
+    // with the just-written pack excluded by `^`. So it holds what those packs
+    // held and the new pack does not — never the run's own traversal, which is
+    // why an incremental run with nothing new to pack still copies every packed
+    // object into it rather than writing an empty pack. `--stdin-packs`
+    // enumerates objects *out of packs*, so a filtered-out object that was only
+    // ever loose is not in it: `prune-packed` leaves a loose object no pack holds
+    // alone, so it simply stays loose. Keeping it here instead would move it into
+    // a pack git never writes.
+    let in_new_pack: HashSet<ObjectId> = to_pack.iter().copied().collect();
+    let mut filtered_out: Vec<ObjectId> = existing
+        .iter()
+        .filter(|f| droppable(st, f.path()))
+        .flat_map(|f| f.iter().map(|e| e.oid))
+        .filter(|id| !in_new_pack.contains(id))
+        .collect();
+    filtered_out.sort();
+    filtered_out.dedup();
 
     // Which packs `-d` may drop: everything that existed before this run, minus
     // any protected by a `.keep` or named by `--keep-pack`. Captured before the
@@ -540,20 +573,31 @@ fn execute(st: &State) -> Result<ExitCode> {
         enumerating.advance(to_pack.len());
         enumerating.done();
     }
+    // git's `names`: every pack this run wrote *into the repository's own*
+    // `objects/pack`, each with the number of objects it holds. It is the set
+    // `write_midx_included_packs()` picks the preferred pack out of, so it is
+    // collected as the packs are written.
+    let mut new_packs: Vec<(String, usize)> = Vec::new();
     // Everything filtered out is about to be written elsewhere, so a run whose
     // spec rejects the whole set still has a second pack to produce.
     let written = if to_pack.is_empty() {
         PathBuf::new()
     } else {
-        write_pack(
+        let path = write_pack(
             &repo,
             &to_pack,
             &pack_dir,
             write_rev,
             progress,
-            write_bitmaps(st, &repo),
+            // `cmd_repack()` asks `pack-objects` for a `.bitmap` only when no
+            // MIDX is being written (`if (write_midx == REPACK_WRITE_MIDX_NONE)`
+            // around both `--write-bitmap-index` pushes): with `--write-midx` the
+            // bitmap belongs to the MIDX instead, and git leaves the packs bare.
+            write_bitmaps(st, &repo) && !st.write_midx,
             st.no_reuse_delta,
-        )?
+        )?;
+        new_packs.push((pack_base_name(&path), to_pack.len()));
+        path
     };
 
     // With `--filter` git writes a second pack holding the filtered-out objects,
@@ -566,14 +610,50 @@ fn execute(st: &State) -> Result<ExitCode> {
             None => pack_dir.clone(),
         };
         fs::create_dir_all(&dir)?;
-        if filtered_out.is_empty() {
+        let base = if filtered_out.is_empty() {
             // git still writes the pack, its index and its reverse index when the
             // spec rejected nothing; their presence is what marks a filtered run.
-            write_empty_pack(repo.object_hash(), &dir, write_rev)?;
+            write_empty_pack(repo.object_hash(), &dir, write_rev)?
         } else {
             // No bitmap: a bitmap describes a reachability closure, and this pack
             // is deliberately a fragment of one.
-            write_pack(&repo, &filtered_out, &dir, write_rev, progress, false, st.no_reuse_delta)?;
+            let path =
+                write_pack(&repo, &filtered_out, &dir, write_rev, progress, false, st.no_reuse_delta)?;
+            pack_base_name(&path)
+        };
+        // `finish_pack_objects_cmd()` keeps a pack out of `names` when it was
+        // written outside the object store ("avoid putting packs written outside
+        // of the repository in the list of names"), which is what `--filter-to`
+        // pointing elsewhere does.
+        if is_local_pack_dir(&dir, &pack_dir) {
+            new_packs.push((base, filtered_out.len()));
+        }
+    }
+
+    // `write_midx_included_packs()`. With no `--geometric` geometry to name a
+    // preferred pack, git points `multi-pack-index write` at the first pack it
+    // just wrote — `names` sorted, cruft packs skipped, which this writer never
+    // produces. `write_midx_internal()` then refuses a preferred pack holding no
+    // objects, and `--filter` produces exactly that when the spec rejected
+    // nothing already packed: an empty second pack, whose constant name sorts
+    // first more often than not. The refusal is an `error()` followed by
+    // `goto cleanup`, leaving `result` at its `-1` initializer, so the child
+    // exits 255 and `cmd_repack()` returns that untouched.
+    //
+    // Everything after the MIDX write is skipped by that `goto cleanup`: the new
+    // packs stay installed, `-d` deletes nothing, `prune-packed` does not run and
+    // neither does `update-server-info`.
+    if st.write_midx && !st.write_midx_incremental {
+        new_packs.sort();
+        if let Some((name, 0)) = new_packs.first() {
+            // git names the pack the way it opened it, i.e. under the object
+            // directory as `get_object_directory()` renders it.
+            let shown = super::prune_packed::display_objdir(&repo, &objdir);
+            eprintln!(
+                "error: cannot select preferred pack {} with no objects",
+                shown.join("pack").join(format!("{name}.pack")).display()
+            );
+            return Ok(ExitCode::from(255));
         }
     }
 
@@ -728,11 +808,28 @@ fn install(path: &Path, bytes: &[u8]) -> Result<()> {
     fs::rename(&tmp, path).with_context(|| format!("unable to rename to {}", path.display()))
 }
 
-/// Write the empty pack, its index and its reverse index into `dir`.
+/// The `pack-<hash>` stem of a pack artifact, which is the name git carries in
+/// its `names` list and interpolates into `--preferred-pack=pack-%s.pack`.
+fn pack_base_name(path: &Path) -> String {
+    path.file_stem().and_then(|s| s.to_str()).unwrap_or_default().to_string()
+}
+
+/// `write_pack_opts_is_local()`: whether a pack written into `dir` lands in the
+/// repository's own object store, and so counts as one of the packs this run
+/// wrote. git compares the two path strings with `starts_with()`; the same
+/// question is asked here of the resolved paths, `--filter-to` being free to
+/// name the pack directory by any route.
+fn is_local_pack_dir(dir: &Path, pack_dir: &Path) -> bool {
+    let resolve = |p: &Path| fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    resolve(dir).starts_with(resolve(pack_dir))
+}
+
+/// Write the empty pack, its index and its reverse index into `dir`, returning
+/// its `pack-<hash>` stem.
 ///
 /// An empty pack has no objects to name it after, so its checksum — and
 /// therefore its filename — is a constant for a given hash function.
-fn write_empty_pack(kind: gix::hash::Kind, dir: &Path, write_rev: bool) -> Result<()> {
+fn write_empty_pack(kind: gix::hash::Kind, dir: &Path, write_rev: bool) -> Result<String> {
     // The 12-byte v2 header with a zero object count, and the checksum over it.
     let mut pack = Vec::new();
     pack.extend_from_slice(b"PACK");
@@ -764,7 +861,7 @@ fn write_empty_pack(kind: gix::hash::Kind, dir: &Path, write_rev: bool) -> Resul
         append_checksum(&mut rev, kind)?;
         fs::write(dir.join(format!("{base}.rev")), &rev)?;
     }
-    Ok(())
+    Ok(base)
 }
 
 /// Append the hash of everything written so far, which is how every one of

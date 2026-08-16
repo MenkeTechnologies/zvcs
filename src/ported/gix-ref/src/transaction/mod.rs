@@ -79,6 +79,15 @@ pub enum Change {
         expected: PreviousValue,
         /// How to treat the reference log during deletion.
         log: RefLog,
+        /// The message to record in a reflog that *outlives* this deletion.
+        ///
+        /// A deleted reference takes its own log with it, so this is never written there. It is
+        /// git's `update->msg` on a deleting `struct ref_update`, which `split_head_update()` and
+        /// `split_symref_update()` (refs/files-backend.c) copy onto the `REF_LOG_ONLY` half they
+        /// synthesize — the entry that lands in `.git/logs/HEAD` when the branch `HEAD` points at
+        /// is deleted. `git update-ref -m <reason> -d refs/heads/main` and `receive-pack`'s
+        /// `"push"` are the two spellings that reach it. Empty means "no message", as in git.
+        message: BString,
     },
 }
 

@@ -694,7 +694,16 @@ fn create(args: &[String]) -> Result<ExitCode> {
     let tips: Vec<ObjectId> = pending.iter().filter(|p| !p.uninteresting).map(|p| p.id).collect();
     let excluded: Vec<ObjectId> =
         pending.iter().filter(|p| p.uninteresting).map(|p| p.id).collect();
-    let prereqs = boundary_commits(&repo, &tips, &excluded);
+    // `UNINTERESTING` sits on the object, and by the time the header is written git
+    // has already run the walk that spreads it to every ancestor of a `^<rev>`. Both
+    // the prerequisite scan and the ref list below read it back off the objects they
+    // hold, so the closure is computed once here.
+    let excluded_closure = if excluded.is_empty() {
+        std::collections::HashSet::new()
+    } else {
+        super::log::ancestor_closure(&repo, &excluded)?
+    };
+    let prereqs = boundary_commits(&repo, &tips, &excluded, &excluded_closure);
     for id in &prereqs {
         let subject = commit_oneline(&repo, *id);
         out.extend_from_slice(format!("-{id} {subject}\n").as_bytes());
@@ -702,8 +711,18 @@ fn create(args: &[String]) -> Result<ExitCode> {
 
     // `write_bundle_refs()` (bundle.c:383-444): the interesting pending entries
     // that dwim to a ref, deduplicated by the name that gets written.
+    //
+    // "Interesting" is `e->item->flags & UNINTERESTING`, a property of the object the
+    // entry points at rather than of the entry, so a ref is dropped as soon as
+    // *anything* excluded reaches its commit — not only when the same name was also
+    // written with a `^`. `git bundle create <file> --all ^main` therefore keeps only
+    // the refs outside main's history, and `... main ^main` keeps none at all and
+    // refuses to write an empty bundle.
     let mut seen: Vec<String> = Vec::new();
-    for entry in pending.iter().filter(|p| !p.uninteresting) {
+    for entry in pending
+        .iter()
+        .filter(|p| !p.uninteresting && !excluded_closure.contains(&p.id))
+    {
         let Some(display) = &entry.display_ref else { continue };
         if seen.iter().any(|s| s == display) {
             continue;
@@ -839,19 +858,11 @@ fn boundary_commits(
     repo: &gix::Repository,
     tips: &[ObjectId],
     excluded: &[ObjectId],
+    hidden: &std::collections::HashSet<ObjectId>,
 ) -> Vec<ObjectId> {
     if excluded.is_empty() {
         return Vec::new();
     }
-    // Everything the exclusions cover; a parent inside this set stops the walk.
-    let hidden: std::collections::HashSet<ObjectId> = repo
-        .rev_walk(excluded.to_vec())
-        .all()
-        .into_iter()
-        .flatten()
-        .filter_map(|info| info.ok().map(|i| i.id))
-        .collect();
-
     let mut boundary = Vec::new();
     let walk = repo
         .rev_walk(tips.to_vec())

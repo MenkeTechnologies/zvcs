@@ -2179,7 +2179,11 @@ fn delete_stash_ref(repo: &gix::Repository) -> Result<()> {
         return Ok(());
     }
     repo.edit_reference(RefEdit {
-        change: Change::Delete { expected: PreviousValue::Any, log: RefLog::AndReference },
+        change: Change::Delete {
+            expected: PreviousValue::Any,
+            log: RefLog::AndReference,
+            message: Default::default(),
+        },
         name: "refs/stash".try_into().map_err(|e| anyhow!("invalid ref name refs/stash: {e}"))?,
         deref: false,
     })?;

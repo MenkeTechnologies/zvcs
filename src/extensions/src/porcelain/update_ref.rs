@@ -26,6 +26,15 @@
 //! reports, and with `--stdin` each staged edit is applied on its own so one
 //! rejection no longer aborts the rest.
 //!
+//! Deleting the branch `HEAD` points at leaves a reflog entry behind. git's
+//! `split_head_update()` (refs/files-backend.c) adds a `REF_LOG_ONLY` update for `HEAD`
+//! alongside the real deletion, carrying the deletion's ids and `-m <reason>`, so
+//! `.git/logs/HEAD` gains a `<old> <null>` line and survives while the branch's own log is
+//! unlinked. That applies to `-d <ref>`, `-d HEAD` and the `--stdin` `delete` command alike,
+//! and to a detached `HEAD` not at all. `--create-reflog` has no say in it: `cmd_update_ref`
+//! ORs `create_reflog_flag` into its `update_ref()` call only, never into `delete_ref()`, so
+//! a deletion force-creates nothing.
+//!
 //! One-level lowercase ref names such as `foo` are served too, even though
 //! `gix-validate` refuses them: `ref_transaction_update()` validates an update
 //! with `check_refname_format(refname, REFNAME_ALLOW_ONELEVEL)`, so
@@ -592,6 +601,7 @@ fn build_edit(
         Val::Zero | Val::Missing => Change::Delete {
             expected: expected_for_delete(old),
             log: RefLog::AndReference,
+            message: delete_message(msg),
         },
     };
     Ok(RefEdit {
@@ -609,6 +619,22 @@ fn log_change(create_reflog: bool, msg: Option<&str>) -> LogChange {
         force_create_reflog: create_reflog,
         message: msg.unwrap_or_default().into(),
     }
+}
+
+/// The `-m <reason>` a deletion records, for the one log that outlives it.
+///
+/// A deleted ref's own log is unlinked, so this only ever reaches the `REF_LOG_ONLY`
+/// mirror git's `split_head_update()`/`split_symref_update()` add for `HEAD` — the
+/// `<old> <null> … <reason>` line `update-ref -m <reason> -d refs/heads/main` leaves in
+/// `.git/logs/HEAD` when `HEAD` points at the branch being deleted.
+///
+/// `--create-reflog` is deliberately absent: `cmd_update_ref` (builtin/update-ref.c) ORs
+/// `create_reflog_flag` into the `update_ref()` call only, never into `delete_ref()`, so
+/// `update-ref -d --create-reflog` force-creates nothing. Verified against stock 2.55.0 in
+/// a bare repo with no `logs/` at all: the update form creates `logs/HEAD`, the delete form
+/// leaves the directory empty.
+fn delete_message(msg: Option<&str>) -> gix::bstr::BString {
+    msg.unwrap_or_default().into()
 }
 
 /// State accumulated while reading `--stdin`: the pending transaction.
@@ -948,6 +974,7 @@ fn stage_oid_command(
                 change: Change::Delete {
                     expected: expected_for_delete(&old),
                     log: RefLog::AndReference,
+                    message: delete_message(msg),
                 },
                 name: refname(name)?,
                 deref,
@@ -1040,6 +1067,7 @@ fn stage_symref_command(
                 change: Change::Delete {
                     expected,
                     log: RefLog::AndReference,
+                    message: delete_message(msg),
                 },
                 name: refname(name)?,
                 deref: false,

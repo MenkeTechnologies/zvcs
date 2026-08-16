@@ -261,6 +261,7 @@ fn delete_symref(repo: &gix::Repository, name: &str) -> Result<ExitCode> {
         change: Change::Delete {
             expected: PreviousValue::MustExistAndMatch(Target::Symbolic(target)),
             log: RefLog::AndReference,
+            message: Default::default(),
         },
         name: full_name(name)?,
         deref: false,

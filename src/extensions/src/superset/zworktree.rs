@@ -240,6 +240,7 @@ fn delete_branch(g: &Path, name: &str) {
                 change: Change::Delete {
                     expected: PreviousValue::Any,
                     log: RefLog::AndReference,
+                    message: Default::default(),
                 },
                 name: fname,
                 deref: false,

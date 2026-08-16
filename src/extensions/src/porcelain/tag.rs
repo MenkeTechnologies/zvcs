@@ -2171,6 +2171,7 @@ fn delete_tags(repo: &gix::Repository, positionals: &[&str]) -> Result<ExitCode>
             change: Change::Delete {
                 expected: PreviousValue::MustExist,
                 log: RefLog::AndReference,
+                message: Default::default(),
             },
             name: full,
             deref: false,

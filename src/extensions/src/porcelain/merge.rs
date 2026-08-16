@@ -2708,6 +2708,7 @@ fn end_autostash(repo: &gix::Repository, stash: Option<ObjectId>, applied: bool)
             change: Change::Delete {
                 expected: PreviousValue::Any,
                 log: RefLog::AndReference,
+                message: Default::default(),
             },
             name: MERGE_AUTOSTASH
                 .try_into()
@@ -2724,6 +2725,7 @@ fn end_autostash(repo: &gix::Repository, stash: Option<ObjectId>, applied: bool)
             change: Change::Delete {
                 expected: PreviousValue::Any,
                 log: RefLog::AndReference,
+                message: Default::default(),
             },
             name: MERGE_AUTOSTASH
                 .try_into()

@@ -79,13 +79,18 @@ where
                             Change::Delete {
                                 expected: previous,
                                 log: mode,
+                                message,
                             } => {
                                 let current_mode = *mode;
                                 *mode = RefLog::Only;
+                                // `split_symref_update()` hands the referent the same `update->msg`
+                                // the symbolic half keeps, so either half can be the one whose log
+                                // survives to record it.
                                 RefEdit {
                                     change: Change::Delete {
                                         expected: previous.clone(),
                                         log: current_mode,
+                                        message: message.clone(),
                                     },
                                     name: referent,
                                     deref: true,

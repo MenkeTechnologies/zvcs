@@ -64,6 +64,7 @@ pub mod delete {
                     change: Change::Delete {
                         expected: PreviousValue::MustExistAndMatch(self.inner.target.clone()),
                         log: RefLog::AndReference,
+                        message: Default::default(),
                     },
                     name: self.inner.name.clone(),
                     deref: false,

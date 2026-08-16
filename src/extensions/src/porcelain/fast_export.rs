@@ -31,6 +31,13 @@
 //!
 //! * `fast-export --all`, `--branches`, `--tags`, `--remotes`, `--reflog`
 //! * `<rev>...`, `<a>..<b>`, `<a>...<b>`, `^<rev>`, `--not`
+//! * git's sticky `UNINTERESTING`: a commit excluded once (`^rev`, the left side
+//!   of a range, `--not`) stays excluded however many times it is named
+//!   positively afterwards — by `--all`/`--branches`/`--tags`/`--remotes` picking
+//!   up the ref it points at, or by a bare `fast-export main ^main`. The ref is
+//!   still recorded and still gets its trailing `reset <ref>\nfrom <null-oid>`,
+//!   because `get_tags_and_duplicates` skips on the command-line *entry's* flags
+//!   rather than the object's
 //! * blob / commit / `reset` / lightweight-tag / annotated-tag stanzas, including
 //!   the trailing `reset`+`tag` block emitted in git's reverse-sorted ref order,
 //!   with `from <null-oid>` for refs whose commit was excluded
@@ -666,6 +673,18 @@ pub fn fast_export(args: &[String]) -> Result<ExitCode> {
     dedup_first_wins(&mut tips);
 
     let hidden = sel.hidden.clone();
+
+    // A commit named on both sides — `--all`/`--branches`/`--tags`/`--remotes`
+    // re-adding a ref that `^feature` already excluded, or a repeated
+    // `fast-export main ^main` — stays uninteresting: git's `UNINTERESTING` is a
+    // flag on the *object*, not on the pending entry that mentioned it. Both
+    // walks below enforce that themselves, so `tips` is left as git's pending
+    // list is (`gix-traverse`'s `Simple` drops such a commit with the rest of the
+    // hidden frontier, and `topo`'s seeding skips it), and the ref bookkeeping
+    // above is deliberately left untouched too: `get_tags_and_duplicates` skips
+    // on the *entry's* flags (`e->flags & UNINTERESTING`), not the object's, so
+    // the `--all` entry for a hidden ref is still recorded and still gets its
+    // trailing `reset <ref>\nfrom <null>`.
 
     // ---- Source propagation over the commit-date walk git uses for it. ----
     if !tips.is_empty() {

@@ -649,6 +649,7 @@ fn delete_replace_refs(names: &[String]) -> Result<ExitCode> {
             change: Change::Delete {
                 expected: PreviousValue::MustExistAndMatch(Target::Object(current)),
                 log: RefLog::AndReference,
+                message: Default::default(),
             },
             name: name
                 .as_str()

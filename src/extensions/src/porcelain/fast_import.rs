@@ -1599,6 +1599,7 @@ impl Importer {
                     change: Change::Delete {
                         expected: PreviousValue::Any,
                         log: RefLog::AndReference,
+                        message: Default::default(),
                     },
                     name: name.as_str().try_into()?,
                     deref: false,

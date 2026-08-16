@@ -1431,6 +1431,9 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         } else {
             // A non-flag token before `--` is a revision; git accepts several and
             // walks the union of their histories.
+            if argument_excludes(a, negate_revs) {
+                no_walk = None;
+            }
             revs.push(a.clone());
             rev_negated.push(negate_revs);
         }
@@ -1505,6 +1508,11 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             } else if line == "--" {
                 in_paths = true;
             } else {
+                // The same `handle_revision_arg()` reads these, so an exclusion
+                // arriving on stdin cancels `--no-walk` like one on the command line.
+                if argument_excludes(line, negate_revs) {
+                    no_walk = None;
+                }
                 revs.push(line.to_string());
                 rev_negated.push(negate_revs);
             }
@@ -3786,8 +3794,32 @@ fn simplify_merges(
     Ok(out)
 }
 
-/// `..` exclusion, gathered by a plain ancestor DFS.
-fn ancestor_closure(repo: &gix::Repository, roots: &[ObjectId]) -> Result<HashSet<ObjectId>> {
+/// Whether a revision argument puts anything on the UNINTERESTING side, judged from
+/// the token alone.
+///
+/// `handle_revision_arg()` answers this from the objects it resolved, but a command
+/// still scanning its arguments needs the same answer before it resolves anything:
+/// `add_pending_object_with_path()` clears `revs->no_walk` the moment an
+/// UNINTERESTING object is pended, which is `git-rev-list(1)`'s "`--no-walk` … has
+/// no effect if a range is specified". Both spellings are positional, so the test
+/// has to run per token rather than over the finished set.
+///
+/// Three forms exclude: `^<rev>`, the left side of `<a>..<b>`, and the merge bases
+/// of `<a>...<b>`. `--not` flips the sense of the first and leaves the ranges alone,
+/// because a range excludes one of its endpoints whichever way round it is read.
+pub(super) fn argument_excludes(spec: &str, negated: bool) -> bool {
+    spec.contains("..") || spec.starts_with('^') != negated
+}
+
+/// Everything a set of negative endpoints covers — the roots and every ancestor —
+/// gathered by a plain ancestor DFS.
+///
+/// This is git's `UNINTERESTING` after `mark_parents_uninteresting()` has run over
+/// the whole set, and it is what a caller needs when the flag has to be read off an
+/// *object* rather than followed during a walk: `log` pre-seeds its `seen` set with
+/// it, and `bundle` decides which pending refs still get written from it. A caller
+/// that only walks does not need this — `gix-traverse` paints the same commits itself.
+pub(super) fn ancestor_closure(repo: &gix::Repository, roots: &[ObjectId]) -> Result<HashSet<ObjectId>> {
     let mut set: HashSet<ObjectId> = HashSet::new();
     let mut stack: Vec<ObjectId> = Vec::new();
     for &r in roots {

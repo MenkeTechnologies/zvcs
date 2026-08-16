@@ -976,20 +976,10 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::from(255));
     }
 
-    // Everything from the form's consumed count onward — including the `--`
-    // itself when present — is forwarded to the inner `git log` (upstream's
-    // `strvec_pushv(&log_arg, argv + …)`). A leading `--` makes the remainder a
-    // pathspec; anything else is a stray operand the inner log rejects.
-    let (pathspec, stray): (Vec<String>, Option<String>) = match extra.first() {
-        Some(first) if first.as_str() == "--" => (extra[1..].to_vec(), None),
-        Some(first) => (Vec::new(), Some(first.clone())),
-        None => (Vec::new(), None),
-    };
-
     // Upstream resolves each range by running `git log` over it, oldest range
     // first; a range naming an unknown revision is fatal before any patch is
     // read, and `git log`'s -1 return becomes exit status 255.
-    let ends1 = match endpoints(&repo, &range1) {
+    let mut ends1 = match endpoints(&repo, &range1) {
         Ok(e) => e,
         Err(_) => return Ok(could_not_parse_log(&range1)),
     };
@@ -1001,21 +991,31 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
         eprintln!("fatal: invalid value for '--diff-merges': '{v}'");
         return Ok(log_parse_failed(&range1));
     }
-    let ends2 = match endpoints(&repo, &range2) {
+    // Everything from the form's consumed count onward — the `--` included — is
+    // what upstream hands that same `git log` after its range
+    // (`strvec_pushv(&log_arg, argv + …)`, builtin/range-diff.c:128/148/179,
+    // spliced in at range-diff.c:71-73). It is resolved here, between the two
+    // ranges, because range1's log is the one that meets it first: an operand it
+    // rejects is reported against range1, and range2's log never runs.
+    let extra = match extra_operands(&repo, &range1, &extra) {
+        Ok(e) => e,
+        Err(code) => return Ok(code),
+    };
+    let mut ends2 = match endpoints(&repo, &range2) {
         Ok(e) => e,
         Err(_) => return Ok(could_not_parse_log(&range2)),
     };
 
-    // A stray operand given without a `--` separator is handed verbatim to the
-    // inner `git log`, which rejects it exactly as it would on its own command
-    // line (see [`stray_operand`]).
-    if let Some(token) = stray {
-        return Ok(stray_operand(&repo, &range1, &token));
+    // The one `log_arg` list is appended to *both* logs, so a revision operand
+    // widens each walk alike.
+    for (tips, hidden) in [&mut ends1, &mut ends2] {
+        tips.extend(extra.tips.iter().copied());
+        hidden.extend(extra.hidden.iter().copied());
     }
 
     // A pathspec limits both which commits appear and which file sections each
     // rendered patch carries.
-    let matcher = build_matcher(&repo, &pathspec)?;
+    let matcher = build_matcher(&repo, &extra.pathspec)?;
 
 
     let mailmap = repo.open_mailmap();
@@ -1449,32 +1449,77 @@ fn bad_revision(spec: &str) -> ExitCode {
     ExitCode::from(128)
 }
 
-/// A stray operand (a range consumed the form, but an extra token followed
-/// without a `--`) is appended to the inner `git log` argument list. Reproduce
-/// how that `git log` rejects it: a token naming a working-tree path is
-/// *ambiguous* (255, wrapped in `range-diff`'s own `could not parse log`), a
-/// token naming nothing is a fatal `bad revision` (128), and a token that does
-/// resolve would silently extend the walk — a shape this port does not render.
-fn stray_operand(repo: &gix::Repository, range: &str, token: &str) -> ExitCode {
-    if repo.rev_parse_single(token).is_ok() {
-        eprintln!("fatal: range-diff: a stray revision operand is not supported: '{token}'");
-        return ExitCode::from(128);
+/// What the operands trailing the chosen argument form contribute to the walk.
+///
+/// They are not range-diff's own: upstream collects them into `log_arg` and hands
+/// them to the inner `git log` of *each* range, so they read as ordinary `git log`
+/// operands — more revisions, or a pathspec.
+struct ExtraOperands {
+    /// Positive endpoints, added to the tips of both ranges.
+    tips: Vec<ObjectId>,
+    /// Negative endpoints, added to the hidden set of both ranges.
+    hidden: Vec<ObjectId>,
+    /// The pathspec limiting both ranges.
+    pathspec: Vec<String>,
+}
+
+/// Resolve the trailing operands the way `setup_revisions()` resolves them, and
+/// report a rejection the way the inner `git log` for `range` would: the message
+/// that log dies with, then `range-diff`'s own `could not parse log`, at 255.
+///
+/// The three outcomes, in `setup_revisions()`'s own order:
+///
+/// * `--` ends the revisions; everything after it is a pathspec, and none of it
+///   is checked against the worktree.
+/// * A token that resolves is another revision — but `verify_non_filename()`
+///   refuses it when a file by that name also exists, because git will not guess
+///   which was meant.
+/// * The first token that does not resolve turns itself and every token after it
+///   into the pathspec, provided each of them can be a path
+///   (`for (j = i; j < argc; j++) verify_filename(…)`). A token starting with `^`
+///   is exempt: it was explicitly negative, so it has no path reading to fall
+///   back on and is a fatal `bad revision` instead.
+fn extra_operands(
+    repo: &gix::Repository,
+    range: &str,
+    extra: &[String],
+) -> std::result::Result<ExtraOperands, ExitCode> {
+    let mut out = ExtraOperands {
+        tips: Vec::new(),
+        hidden: Vec::new(),
+        pathspec: Vec::new(),
+    };
+    for (n, arg) in extra.iter().enumerate() {
+        if arg == "--" {
+            out.pathspec = extra[n + 1..].to_vec();
+            return Ok(out);
+        }
+        match endpoints(repo, arg) {
+            Ok((tips, hidden)) => {
+                if let Some(msg) = crate::setup::verify_non_filename(repo, arg) {
+                    eprintln!("fatal: {msg}");
+                    return Err(log_parse_failed(range));
+                }
+                out.tips.extend(tips);
+                out.hidden.extend(hidden);
+            }
+            Err(_) if arg.starts_with('^') => {
+                eprintln!("fatal: bad revision '{arg}'");
+                return Err(log_parse_failed(range));
+            }
+            Err(_) => {
+                for (j, rest) in extra[n..].iter().enumerate() {
+                    if let Some(msg) = crate::setup::verify_filename(rest, j == 0) {
+                        eprintln!("fatal: {msg}");
+                        return Err(log_parse_failed(range));
+                    }
+                }
+                out.pathspec = extra[n..].to_vec();
+                return Ok(out);
+            }
+        }
     }
-    let on_disk = repo
-        .workdir()
-        .map(|w| w.join(token).exists())
-        .unwrap_or(false);
-    if on_disk {
-        eprintln!(
-            "fatal: ambiguous argument '{token}': unknown revision or path not in the working tree."
-        );
-        eprintln!("Use '--' to separate paths from revisions, like this:");
-        eprintln!("'git <command> [<revision>...] -- [<file>...]'");
-        eprintln!("error: could not parse log for '{range}'");
-        ExitCode::from(255)
-    } else {
-        bad_revision(token)
-    }
+    Ok(out)
 }
 
 /// The pathspec limiter, shared with every other verb.
@@ -1599,6 +1644,12 @@ fn ordered_commits(
     if !hidden.is_empty() {
         walk = walk.with_hidden(hidden);
     }
+
+    // git's rule that `UNINTERESTING` propagates to every ancestor of a negative
+    // endpoint and beats a positive mention of the same commit — which is what makes
+    // `<a>..<b> <c>` with `<c>` an ancestor of `<a>` add nothing — is enforced by the
+    // traversal itself: `gix-traverse`'s hidden frontier paints those commits and
+    // `Simple` drops them, tips included. Nothing is subtracted here.
 
     // The membership of the range, with parents and commit times.
     let mut order: Vec<ObjectId> = Vec::new();

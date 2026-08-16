@@ -79,6 +79,60 @@ pub fn verify_non_filename(repo: &gix::Repository, arg: &str) -> Option<String> 
     ))
 }
 
+/// git's `looks_like_pathspec()` (setup.c): an argument that can only have been
+/// meant as a pathspec, whether or not anything by that name exists.
+///
+/// An unescaped glob special — `*`, `?`, `[` — says the caller means to *match*
+/// paths, so the argument need not exist on disk. Backslash is a glob special
+/// too, but on its own it only escapes the next character rather than widening
+/// the match, so it neither qualifies nor is skipped over blindly. A leading
+/// `:(` opens long-form pathspec magic, which nothing else spells.
+///
+/// A bare leading `:` is deliberately *not* enough: short-form magic such as
+/// `:/` is handled by [`check_filename`], which strips it and stats what is left.
+pub fn looks_like_pathspec(arg: &str) -> bool {
+    let mut escaped = false;
+    for b in arg.bytes() {
+        if escaped {
+            escaped = false;
+        } else if b == b'\\' {
+            escaped = true;
+        } else if matches!(b, b'*' | b'?' | b'[') {
+            return true;
+        }
+    }
+    arg.starts_with(":(")
+}
+
+/// git's `verify_filename()` (setup.c): a token sitting where a path is expected
+/// has to be able to be one. Returns the message git would `die()` with, or
+/// `None` when the token passes.
+///
+/// `diagnose_misspelt_rev` is git's flag for the *first* such token — the one the
+/// caller had just tried and failed to read as a revision, so its failure is
+/// ambiguous between a misspelt revision and a missing path. Every token after it
+/// is already known to be in path position, so its failure can only be a missing
+/// path, and it gets the shorter message.
+pub fn verify_filename(arg: &str, diagnose_misspelt_rev: bool) -> Option<String> {
+    if arg.starts_with('-') {
+        return Some(format!("option '{arg}' must come before non-option arguments"));
+    }
+    if looks_like_pathspec(arg) || check_filename(arg) {
+        return None;
+    }
+    if !diagnose_misspelt_rev {
+        return Some(format!(
+            "{arg}: no such path in the working tree.\n\
+             Use 'git <command> -- <path>...' to specify paths that do not exist locally."
+        ));
+    }
+    Some(format!(
+        "ambiguous argument '{arg}': unknown revision or path not in the working tree.\n\
+         Use '--' to separate paths from revisions, like this:\n\
+         'git <command> [<revision>...] -- [<file>...]'"
+    ))
+}
+
 /// git's `check_filename()` (setup.c:173-200): whether `arg` names something that
 /// exists in the worktree. It strips the leading pathspec magic that still leaves
 /// a path behind and stats what remains. Magic with nothing after it counts as

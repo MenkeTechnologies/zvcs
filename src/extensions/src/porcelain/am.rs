@@ -948,6 +948,7 @@ fn setup(repo: &gix::Repository, state_dir: &Path, o: &Opts) -> Result<Setup> {
             change: Change::Delete {
                 expected: PreviousValue::Any,
                 log: RefLog::AndReference,
+                message: Default::default(),
             },
             name: full_name("REBASE_HEAD")?,
             deref: false,
@@ -1031,6 +1032,7 @@ fn setup(repo: &gix::Repository, state_dir: &Path, o: &Opts) -> Result<Setup> {
                     change: Change::Delete {
                         expected: PreviousValue::Any,
                         log: RefLog::AndReference,
+                        message: Default::default(),
                     },
                     name: full_name("ORIG_HEAD")?,
                     deref: false,
@@ -1957,6 +1959,7 @@ fn am_next(repo: &gix::Repository, state_dir: &Path, cur: &mut usize) -> Result<
             change: Change::Delete {
                 expected: PreviousValue::Any,
                 log: RefLog::AndReference,
+                message: Default::default(),
             },
             name: full_name("REBASE_HEAD")?,
             deref: false,

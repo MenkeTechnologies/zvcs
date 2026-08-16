@@ -123,17 +123,15 @@ impl Transaction<'_, '_> {
                 // A deletion never sets `REF_NEEDS_COMMIT` (`lock_ref_for_update()` skips the
                 // write-and-flag branch for `REF_DELETING`), so it logs nothing and its log is
                 // unlinked below — *unless* it is git's `REF_LOG_ONLY`, the shape
-                // `split_symref_update()` leaves behind for `HEAD`. `update-ref -d HEAD`
-                // therefore appends `<old> <null>` to `.git/logs/HEAD` and keeps that log,
-                // while `refs/heads/main` and its log are removed.
+                // `split_symref_update()` and `split_head_update()` leave behind for `HEAD`.
+                // Both `update-ref -d HEAD` and `update-ref -d refs/heads/main` (with `HEAD`
+                // pointing at it) therefore append `<old> <null>` to `.git/logs/HEAD` and keep
+                // that log, while the branch and its own log are removed.
                 //
                 // `log_only_split` and not `RefLog::Only`: a caller passing `RefLog::Only`
                 // directly means gix's "delete the reflog, keep the reference", which has no
                 // git counterpart and must still delete the log.
-                //
-                // The entry carries no message: `Change::Delete` has nowhere to put one, so
-                // `update-ref -d -m <msg>` loses the message git would have recorded here.
-                Change::Delete { expected, .. } => {
+                Change::Delete { expected, message, .. } => {
                     if change.log_only_split {
                         let previous = match expected {
                             PreviousValue::MustExistAndMatch(Target::Object(oid))
@@ -146,7 +144,7 @@ impl Transaction<'_, '_> {
                             previous,
                             &self.store.object_hash.null(),
                             committer,
-                            "".into(),
+                            message.as_ref(),
                             false,
                         )?;
                     }

@@ -394,6 +394,7 @@ fn delete_state_ref(repo: &gix::Repository, name: &str) -> bool {
                 change: gix::refs::transaction::Change::Delete {
                     expected: gix::refs::transaction::PreviousValue::MustExistAndMatch(current),
                     log: gix::refs::transaction::RefLog::AndReference,
+                    message: Default::default(),
                 },
                 name: reference.name().to_owned(),
                 deref: false,

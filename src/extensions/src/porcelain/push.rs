@@ -1283,6 +1283,7 @@ fn update_tracking_refs(
             Change::Delete {
                 expected: PreviousValue::Any,
                 log: RefLog::AndReference,
+                message: Default::default(),
             }
         } else {
             Change::Update {

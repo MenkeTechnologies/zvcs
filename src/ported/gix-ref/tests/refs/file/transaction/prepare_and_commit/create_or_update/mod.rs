@@ -1010,6 +1010,7 @@ fn packed_refs_deletion_in_deletions_and_updates_mode() -> crate::Result {
                 change: Change::Delete {
                     expected: PreviousValue::MustExistAndMatch(Target::Object(old_id)),
                     log: RefLog::AndReference,
+                    message: Default::default(),
                 },
                 name: "refs/heads/d1".try_into()?,
                 deref: false,

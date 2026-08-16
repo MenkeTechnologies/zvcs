@@ -2394,6 +2394,15 @@ fn rename_branch(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
         }
     }
 
+    // `files_copy_or_rename_ref()` deletes the old name before writing the new one, so the
+    // `<tip> <null>` half always comes first in `.git/logs/HEAD`. When the two names differ
+    // that half falls out of the deletion below, through `split_head_update()`. Renaming a
+    // branch onto its own name performs no deletion at all, so it is written here — ahead of
+    // the update whose own head-split supplies the `<tip> <tip>` half.
+    if head_follows && old_full == new_full {
+        super::checkout::append_head_log(repo, Some(target), None, &message);
+    }
+
     repo.edit_reference(RefEdit {
         change: Change::Update {
             log: LogChange {
@@ -2418,6 +2427,11 @@ fn rename_branch(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
             change: Change::Delete {
                 expected: PreviousValue::Any,
                 log: RefLog::AndReference,
+                // `files_copy_or_rename_ref()` passes `logmsg` to `refs_delete_ref()`, so when
+                // `HEAD` is symbolic to the branch being renamed the deletion's `REF_LOG_ONLY`
+                // mirror lands in `.git/logs/HEAD` carrying this message. That mirror is the
+                // `<tip> <null>` half of the pair below.
+                message: message.clone().into(),
             },
             name: old_name,
             deref: false,
@@ -2431,8 +2445,16 @@ fn rename_branch(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
         // mirrored into its log: the old name going away, then the new one arriving.
         // `refs_rename_ref()` performs the delete and the create, and each is logged
         // through the symref.
-        super::checkout::append_head_log(repo, Some(target), None, &message);
-        super::checkout::append_head_log(repo, None, Some(target), &message);
+        //
+        // Only the *create* half is left to write, and only when the name changed: the
+        // deletion above already contributed its `<tip> <null>` line via
+        // `split_head_update()`, and this create splits off nothing because `HEAD` still
+        // names the old branch rather than the new one. A same-name rename took the other
+        // route — its pair is the manual line before the update plus that update's own
+        // head-split — so nothing more belongs here.
+        if old_full != new_full {
+            super::checkout::append_head_log(repo, None, Some(target), &message);
+        }
         repo.edit_reference(RefEdit {
             change: Change::Update {
                 log: LogChange {
@@ -2621,11 +2643,19 @@ fn delete_branches(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
     for name in &o.names {
         let full = format!("refs/heads/{name}");
 
-        if current.as_ref().map(|c| c.as_slice()) == Some(full.as_bytes()) {
-            return error_exit(format!(
-                "cannot delete branch '{name}' used by worktree at '{}'",
-                repo.workdir().unwrap_or_else(|| repo.git_dir()).display()
-            ));
+        // `delete_branches()` (builtin/branch.c) refuses on
+        // `find_shared_symref(…, "HEAD", name) && !wt->is_bare`: a bare repository's `HEAD`
+        // is a default for future clones, not a checkout, so deleting the branch it names is
+        // allowed there. That is the one way `branch -d` reaches the deletion-of-`HEAD`'s
+        // referent path, where `split_head_update()` then logs `<old> <null>` into
+        // `logs/HEAD` with no message — `refs_delete_refs()` is called with a null `logmsg`.
+        if let Some(workdir) = repo.workdir() {
+            if current.as_ref().map(|c| c.as_slice()) == Some(full.as_bytes()) {
+                return error_exit(format!(
+                    "cannot delete branch '{name}' used by worktree at '{}'",
+                    workdir.display()
+                ));
+            }
         }
 
         let mut reference = match repo.try_find_reference(full.as_str())? {
@@ -2663,6 +2693,7 @@ fn delete_branches(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
             change: Change::Delete {
                 expected: PreviousValue::Any,
                 log: RefLog::AndReference,
+                message: Default::default(),
             },
             name: name_full,
             deref: false,

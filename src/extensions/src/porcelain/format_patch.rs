@@ -21,6 +21,12 @@
 //!     / `bad revision` / `Invalid revision range` text on stderr with exit 128,
 //!     and a positional that names an existing path is a pathspec, not an error.
 //!   * output — file-per-patch (default, names printed to stdout) or `--stdout`.
+//!   * walk ordering — the `setup_revisions()` family format-patch inherits:
+//!     `--topo-order`, `--date-order`, `--author-date-order` (git's three
+//!     `sort_in_topological_order()` tie-breaks), `--no-walk[=(sorted|unsorted)]`
+//!     / `--do-walk`, and `--reverse`. `cmd_format_patch` emits its `list[]`
+//!     backwards, so each of them comes out as the reverse of what `git log`
+//!     would print and `--reverse` cancels that flip rather than adding to it.
 //!   * flags — `--stdout`, `-o`/`--output-directory`, `-<n>`/`--max-count`,
 //!     `--skip`, `--reverse`, `--min-parents`/`--max-parents`/`--no-merges`,
 //!     `-n`/`--numbered`, `-N`/`--no-numbered`, `--start-number`,
@@ -44,7 +50,10 @@
 //!     `prerequisite-patch-id:` list, via a port of `diff_get_patch_id()`).
 //!   * cover letter — `--cover-from-description=<mode>`, `--description-file`
 //!     and the `branch.<name>.description` lookup behind them, plus
-//!     `--commit-list-format=shortlog|modern|log:<fmt>|<fmt>`.
+//!     `--commit-list-format=shortlog|modern|log:<fmt>|<fmt>`. Its magic `From`
+//!     line names `make_cover_letter()`'s `head = list[0]`, and its combined
+//!     diffstat runs only when the walk left exactly one boundary commit —
+//!     git's "we can only do diffstat with a unique reference point".
 //!   * alternate diffstat formats — `--stat`, `--summary`, `--numstat`,
 //!     `--shortstat`, and the whole dirstat family (`--dirstat[=<params>]`,
 //!     `-X<params>`, `--dirstat-by-file`, `--cumulative`), selected the way
@@ -117,6 +126,10 @@
 //!   * a glob in `notes.displayRef`/`GIT_NOTES_DISPLAY_REF`/`--notes=<glob>`:
 //!     expanding a pattern over the ref store is not ported, so a pattern is
 //!     refused rather than read as a literal ref name.
+//!   * `--first-parent`. The traversal underneath reports only the followed
+//!     parent for each commit it hands back, which would make every merge look
+//!     like an ordinary commit and defeat the `max_parents = 1` filter that keeps
+//!     merges out of a series, so the flag is deferred rather than half-applied.
 //!
 //! ### Config
 //!
@@ -153,6 +166,7 @@
 //! rejects all three; every pattern both accept produces the same answer.
 
 use anyhow::{anyhow, bail, Result};
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::process::ExitCode;
 
@@ -328,6 +342,23 @@ enum AutoBase {
     WhenAble,
 }
 
+/// `rev_info`'s `sort_order`/`topo_order` pair, as the ordering flags set it in
+/// `revision.c`. Each of the three flags sets `topo_order = 1` and picks the
+/// tie-break `sort_in_topological_order()` runs with; without one of them the
+/// walk is the plain commit-date priority queue `get_revision()` pops from.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Order {
+    /// No ordering flag given.
+    Default,
+    /// `--topo-order`: `REV_SORT_IN_GRAPH_ORDER`, a LIFO stack that keeps a
+    /// branch contiguous.
+    Topo,
+    /// `--date-order`: `REV_SORT_BY_COMMIT_DATE`.
+    DateTopo,
+    /// `--author-date-order`: `REV_SORT_BY_AUTHOR_DATE`.
+    AuthorDateTopo,
+}
+
 /// git's `mime_boundary_leader` (log-tree.c).
 const MIME_BOUNDARY_LEADER: &str = "------------";
 
@@ -483,6 +514,16 @@ struct Opts {
     reverse: bool,
     min_parents: usize,
     max_parents: Option<usize>,
+    /// `--topo-order`/`--date-order`/`--author-date-order`.
+    order: Order,
+    /// `revs->no_walk`: list the named commits without traversing to their
+    /// parents. It is positional — `--do-walk`, `-<n>`, `--max-count` and any
+    /// UNINTERESTING endpoint each clear it again where they sit on the command
+    /// line, and a later `--no-walk` turns it back on.
+    no_walk: bool,
+    /// `revs->unsorted_input`, which only `--no-walk=unsorted` sets: keep the
+    /// pending list in command-line order instead of sorting it by commit date.
+    unsorted_input: bool,
     revs: Vec<String>,
     paths: Vec<String>,
 
@@ -589,8 +630,12 @@ pub fn format_patch(args: &[String]) -> Result<ExitCode> {
         opts.subject_prefix.push_str(&format!(" v{r}"));
     }
 
-    let (commits, paths) = match select_commits(&repo, &opts)? {
-        Selected::Commits { commits, paths } => (commits, paths),
+    let (commits, paths, pending) = match select_commits(&repo, &opts)? {
+        Selected::Commits {
+            commits,
+            paths,
+            pending,
+        } => (commits, paths, pending),
         Selected::Exit(code) => return Ok(code),
     };
     if commits.is_empty() {
@@ -703,7 +748,8 @@ pub fn format_patch(args: &[String]) -> Result<ExitCode> {
         let mut msg: Vec<u8> = Vec::new();
         // A bad `--commit-list-format` is only caught once the cover letter's
         // headers are already written, so the partial message is emitted first.
-        if let Err(code) = render_cover_letter(&repo, &commits, printed_total, &opts, &th, &mut msg)?
+        if let Err(code) =
+            render_cover_letter(&repo, &commits, &pending, printed_total, &opts, &th, &mut msg)?
         {
             emit_message(&mut buffered, &msg, cover_filename(&opts), &opts)?;
             stdout.write_all(&buffered)?;
@@ -1049,11 +1095,7 @@ const DEFERRED: &[&str] = &[
     "--output-indicator-old",
     "--output-indicator-context",
     "--anchored",
-    "--no-walk",
     "--first-parent",
-    "--topo-order",
-    "--date-order",
-    "--author-date-order",
     "-b",
     "-w",
     "-D",
@@ -1228,6 +1270,9 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
         min_parents: 0,
         // format-patch sets `rev.max_parents = 1`: merges never get a patch.
         max_parents: Some(1),
+        order: Order::Default,
+        no_walk: false,
+        unsorted_input: false,
         revs: Vec::new(),
         paths: Vec::new(),
         context: 3,
@@ -1489,6 +1534,31 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
                 o.base_commit = None;
             }
             "--reverse" => o.reverse = true,
+            // The three ordering flags are the same option in `revision.c`: each
+            // sets `topo_order` and differs only in the `sort_order` tie-break, so
+            // the last one on the command line wins.
+            "--topo-order" => o.order = Order::Topo,
+            "--date-order" => o.order = Order::DateTopo,
+            "--author-date-order" => o.order = Order::AuthorDateTopo,
+            "--no-walk" => o.no_walk = true,
+            s if s.starts_with("--no-walk=") => {
+                match &s["--no-walk=".len()..] {
+                    "sorted" => o.unsorted_input = false,
+                    "unsorted" => o.unsorted_input = true,
+                    // `handle_revision_pseudo_opt()` reports the value and returns
+                    // an error, which `setup_revisions()` does *not* treat as
+                    // fatal: the argument falls through to the unknown-option list
+                    // and `cmd_format_patch` then rejects it as unrecognized.
+                    _ => {
+                        eprintln!("error: invalid argument to --no-walk");
+                        return Ok(Parsed::Exit(fatal(&format!(
+                            "unrecognized argument: {s}"
+                        ))));
+                    }
+                }
+                o.no_walk = true;
+            }
+            "--do-walk" => o.no_walk = false,
             "--no-merges" => o.max_parents = Some(1),
             "--minimal" => o.algorithm = Algorithm::MyersMinimal,
             "--histogram" => o.algorithm = Algorithm::Histogram,
@@ -1542,6 +1612,9 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
                     Some(v) => o.max_count = (v >= 0).then_some(v as usize),
                     None => not_an_integer(&mut o.opt_error, i, val),
                 }
+                // `handle_revision_opt()` clears `no_walk` for every spelling of
+                // the commit count: asking for the newest <n> is asking to walk.
+                o.no_walk = false;
             }
             s if s.starts_with("--skip=") => {
                 let val = &s["--skip=".len()..];
@@ -1810,6 +1883,7 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
                 && s[1..].bytes().all(|c| c.is_ascii_digit()) =>
             {
                 o.max_count = Some(parse_num(&s[1..])?);
+                o.no_walk = false;
             }
             s if NO_OP.contains(&s) => {}
             s if DEFERRED.iter().any(|f| is_flag(s, f))
@@ -1823,6 +1897,14 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
                 return Ok(Parsed::Exit(fatal(&format!("unrecognized argument: {s}"))));
             }
             s => {
+                // `add_pending_object_with_path()` clears `no_walk` the moment an
+                // UNINTERESTING object joins the pending list, so an exclusion or
+                // a range cancels it — and, being positional, a later `--no-walk`
+                // turns it back on. `format-patch` has no `--not`, so no token here
+                // is ever read the other way round.
+                if super::log::argument_excludes(s, false) {
+                    o.no_walk = false;
+                }
                 o.revs.push(s.to_owned());
                 o.rev_pos.push(i);
             }
@@ -2608,6 +2690,24 @@ fn fatal(msg: &str) -> ExitCode {
     ExitCode::from(128)
 }
 
+/// The author timestamp `--author-date-order` sorts on, which is git's
+/// `record_author_date()`: the raw epoch seconds off the `author` header, with
+/// the zone offset ignored. A commit whose header cannot be read keeps the
+/// slab's zero, so it sorts oldest.
+fn author_date(repo: &gix::Repository, id: ObjectId) -> i64 {
+    let Ok(object) = repo.find_object(id) else {
+        return 0;
+    };
+    if object.kind != gix::object::Kind::Commit {
+        return 0;
+    }
+    object
+        .into_commit()
+        .author()
+        .map(|a| a.seconds())
+        .unwrap_or(0)
+}
+
 /// git's `die_verify_filename()` wording for an argument that is neither a
 /// revision nor an existing path.
 fn ambiguous(spec: &str) -> ExitCode {
@@ -2629,6 +2729,11 @@ enum Selected {
         commits: Vec<ObjectId>,
         /// Pathspecs, including positionals that turned out to name a path.
         paths: Vec<String>,
+        /// `rev.pending` as `prepare_revision_walk()` found it: every object the
+        /// revision arguments resolved to, interesting or not. Only `--no-walk`
+        /// needs it, because that is the one path where a commit can reach the
+        /// output while still unparsed — see [`render_cover_letter`].
+        pending: Vec<ObjectId>,
     },
     Exit(ExitCode),
 }
@@ -2767,25 +2872,86 @@ fn select_commits(repo: &gix::Repository, o: &Opts) -> Result<Selected> {
         return Ok(Selected::Commits {
             commits: Vec::new(),
             paths,
+            pending: Vec::new(),
         });
     }
 
-    let mut platform = repo
-        .rev_walk(tips)
-        .sorting(Sorting::ByCommitTime(CommitTimeOrder::NewestFirst));
-    if !hidden.is_empty() {
-        platform = platform.with_hidden(hidden);
+    // `rev.pending` as the walk is about to consume it — `handle_commit()` parses
+    // every one of these, which is what makes their trees readable later even
+    // under `--no-walk`.
+    let pending: Vec<ObjectId> = tips.iter().chain(hidden.iter()).copied().collect();
+
+    // The walk, plus each commit's real parents — `sort_in_topological_order()`
+    // needs them and so does the merge filter below.
+    let mut walked: Vec<ObjectId> = Vec::new();
+    let mut parents_of: HashMap<ObjectId, Vec<ObjectId>> = HashMap::new();
+    if o.no_walk {
+        // `prepare_revision_walk()` returns before `limit_list()` under
+        // `--no-walk`, so the list is exactly the pending commits — sorted by
+        // commit date unless `--no-walk=unsorted` kept the command-line order.
+        // The UNINTERESTING ones are still on it, but `get_commit_action()`
+        // ignores every one of them, which is what dropping them here does.
+        let excluded: HashSet<ObjectId> = hidden.iter().copied().collect();
+        let mut seen = HashSet::new();
+        walked = tips
+            .iter()
+            .copied()
+            .filter(|id| !excluded.contains(id) && seen.insert(*id))
+            .collect();
+        if !o.unsorted_input {
+            let dates: HashMap<ObjectId, i64> = walked
+                .iter()
+                .map(|id| (*id, super::rev_list::commit_date(repo, *id)))
+                .collect();
+            walked.sort_by_key(|id| std::cmp::Reverse(dates[id]));
+        }
+        for id in &walked {
+            parents_of.insert(*id, super::rev_list::commit_parents(repo, *id));
+        }
+    } else {
+        let mut platform = repo
+            .rev_walk(tips)
+            .sorting(Sorting::ByCommitTime(CommitTimeOrder::NewestFirst));
+        if !hidden.is_empty() {
+            platform = platform.with_hidden(hidden);
+        }
+        for info in platform.all()? {
+            let info = info?;
+            parents_of.insert(info.id, info.parent_ids.to_vec());
+            walked.push(info.id);
+        }
+    }
+
+    // `sort_in_topological_order()` runs inside `prepare_revision_walk()`, over
+    // the whole list and before anything is emitted, so an ordering flag
+    // reshuffles the walk and only then do the parent-count bounds, `--skip` and
+    // `-<n>` cut it down. `--no-walk` returns from `prepare_revision_walk()`
+    // *before* that call, so it silently disables the ordering flags: what
+    // survives is the plain commit-date sort of the pending list above.
+    if o.order != Order::Default && !o.no_walk {
+        let dates: Option<HashMap<ObjectId, i64>> = match o.order {
+            // `REV_SORT_IN_GRAPH_ORDER` has no date tie-break at all.
+            Order::Topo | Order::Default => None,
+            Order::DateTopo => Some(
+                walked
+                    .iter()
+                    .map(|id| (*id, super::rev_list::commit_date(repo, *id)))
+                    .collect(),
+            ),
+            Order::AuthorDateTopo => Some(
+                walked
+                    .iter()
+                    .map(|id| (*id, author_date(repo, *id)))
+                    .collect(),
+            ),
+        };
+        walked = super::rev_list::topo_sort(&walked, &parents_of, dates.as_ref());
     }
 
     let mut out: Vec<ObjectId> = Vec::new();
     let mut skipped = 0usize;
-    for info in platform.all()? {
-        let info = info?;
-        let parents = repo
-            .find_object(info.id)?
-            .try_into_commit()?
-            .parent_ids()
-            .count();
+    for id in walked {
+        let parents = parents_of.get(&id).map_or(0, Vec::len);
         if parents < o.min_parents {
             continue;
         }
@@ -2799,7 +2965,7 @@ fn select_commits(repo: &gix::Repository, o: &Opts) -> Result<Selected> {
         if o.max_count.is_some_and(|max| out.len() >= max) {
             break;
         }
-        out.push(info.id);
+        out.push(id);
     }
     // The walk is newest-first; git emits oldest-first unless asked to reverse.
     if !o.reverse {
@@ -2808,6 +2974,7 @@ fn select_commits(repo: &gix::Repository, o: &Opts) -> Result<Selected> {
     Ok(Selected::Commits {
         commits: out,
         paths,
+        pending,
     })
 }
 
@@ -3187,25 +3354,24 @@ fn emit_stat_blocks(
 /// Port of `make_cover_letter()` (log-tree.c): the placeholder subject and
 /// blurb, a shortlog of the series, and the diffstat of the whole range.
 ///
-/// The magic `From` line names the newest commit of the series, and the
+/// The magic `From` line names `list[0]`, the first commit off the walk, and the
 /// identity is the committer's — the cover letter is written now, by whoever
 /// runs the command, not by the author of any one patch.
 fn render_cover_letter(
     repo: &gix::Repository,
     commits: &[ObjectId],
+    pending: &[ObjectId],
     total: usize,
     opts: &Opts,
     th: &ThreadState,
     out: &mut Vec<u8>,
 ) -> Result<std::result::Result<(), ExitCode>> {
-    // The series is oldest-first unless `--reverse` flipped it; either way the
-    // newest commit is the one without a descendant inside the series.
-    let newest = if opts.reverse {
-        *commits.first().expect("a non-empty series")
-    } else {
-        *commits.last().expect("a non-empty series")
-    };
-    write_from_line(out, newest, opts)?;
+    // `make_cover_letter()`'s `head = list[0]`: the first commit the walk handed
+    // back. `cmd_format_patch` emits `list[]` backwards, so `list[0]` is always
+    // the *last* patch of the printed series — including under `--reverse`, which
+    // flips the walk itself and so flips both ends together.
+    let head = *commits.last().expect("a non-empty series");
+    write_from_line(out, head, opts)?;
     write_message_ids(out, th)?;
 
     let mut sb = String::new();
@@ -3228,7 +3394,7 @@ fn render_cover_letter(
             // No committer identity configured: fall back to the series' author
             // so the cover letter is still a well-formed message.
             None => {
-                let commit = repo.find_object(newest)?.try_into_commit()?;
+                let commit = repo.find_object(head)?.try_into_commit()?;
                 let author = commit.author()?;
                 (
                     author.name.to_str()?.to_owned(),
@@ -3282,34 +3448,42 @@ fn render_cover_letter(
         return Ok(Err(code));
     }
 
-    // The range's combined diffstat needs a base to diff against, which a root
-    // commit does not have; git omits the block in that case.
-    let first = repo
-        .find_object(*commits.first().expect("a non-empty series"))?
-        .try_into_commit()?;
-    let base = match first.parent_ids().next() {
-        Some(pid) => Some(pid.object()?.try_into_commit()?.tree()?),
-        None => None,
-    };
+    // "We can only do diffstat with a unique reference point": the block runs
+    // against the walk's single boundary commit, and is skipped entirely when the
+    // series has none or more than one — several roots, several bases, or a
+    // `--no-walk` list whose commits do not share one parent.
+    //
     // `show_diffstat()` (builtin/log.c) builds its own `diff_options` with a
     // hard-coded `DIFF_FORMAT_SUMMARY | DIFF_FORMAT_DIFFSTAT`, so the cover
-    // letter keeps the stat+summary block whatever the series was asked for.
-    if let Some(base) = base {
-        let newest_tree = repo.find_object(newest)?.try_into_commit()?.tree()?;
-        let abbrev = newest_tree.id().shorten()?.hex_len();
-        let changes = tree_changes(repo, Some(&base), Some(&newest_tree))?;
-        if !changes.is_empty() {
-            let mut discard: Vec<u8> = Vec::new();
-            let mut stats: Vec<StatEntry> = Vec::new();
-            for change in &changes {
-                stats.push(emit_change(repo, &mut discard, change, abbrev, opts)?);
-            }
-            // `show_diffstat()` memcpy's `rev->diffopt`, keeping the width knobs,
-            // so the cover letter's combined diffstat honors them too.
-            emit_stats(out, &stats, StatWidths::from_opts(opts))?;
-            emit_summary(out, &changes)?;
-            out.push(b'\n');
+    // letter keeps the stat+summary block whatever the series was asked for, and
+    // closes it with a blank line even when the two trees turn out identical.
+    if let Some(origin) = series_origin(repo, commits)? {
+        // `--no-walk` makes `process_parents()` return before it parses any
+        // parent, so a boundary commit that the revision arguments did not name
+        // themselves reaches `show_diffstat()` unparsed: `get_commit_tree_oid()`
+        // then hands `diff_tree_oid()` a NULL tree and the stat comes out as
+        // everything in `head`'s tree rather than as the range's changes. A
+        // boundary that *was* on the pending list — a merge the series skipped,
+        // say — went through `handle_commit()` and has its tree.
+        let unparsed = opts.no_walk && !pending.contains(&origin);
+        let base = if unparsed {
+            None
+        } else {
+            Some(repo.find_object(origin)?.try_into_commit()?.tree()?)
+        };
+        let head_tree = repo.find_object(head)?.try_into_commit()?.tree()?;
+        let abbrev = head_tree.id().shorten()?.hex_len();
+        let changes = tree_changes(repo, base.as_ref(), Some(&head_tree))?;
+        let mut discard: Vec<u8> = Vec::new();
+        let mut stats: Vec<StatEntry> = Vec::new();
+        for change in &changes {
+            stats.push(emit_change(repo, &mut discard, change, abbrev, opts)?);
         }
+        // `show_diffstat()` memcpy's `rev->diffopt`, keeping the width knobs, so
+        // the cover letter's combined diffstat honors them too.
+        emit_stats(out, &stats, StatWidths::from_opts(opts))?;
+        emit_summary(out, &changes)?;
+        out.push(b'\n');
     }
     Ok(Ok(()))
 }

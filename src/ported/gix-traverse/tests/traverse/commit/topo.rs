@@ -167,6 +167,31 @@ mod basic {
         Ok(())
     }
 
+    /// The same commit named as a tip *and* as an end — `git rev-list --topo-order
+    /// main ^main`, which prints nothing because `UNINTERESTING` sits on the object
+    /// and `limit_list()` drops it long before the topological sort runs. The seeding
+    /// loop used to push every tip into the queue whatever its flags said, so this
+    /// returned the commit (and, with a second tip below it, its whole history).
+    #[test]
+    fn tip_that_is_also_an_end() -> crate::Result {
+        let odb = odb()?;
+        let tip = hex_to_id("62ed296d9986f50477e9f7b7e81cd0258939a43d");
+        let older = hex_to_id("eeab3243aad67bc838fc4425f759453bf0b47785");
+
+        for sorting in [topo::Sorting::TopoOrder, topo::Sorting::DateOrder] {
+            let result = traverse_both([tip], [tip], &odb, sorting, Parents::All)?;
+            assert!(result.is_empty(), "the tip is uninteresting, sorting = {sorting:?}");
+
+            // An older tip the hidden one reaches stays excluded as well.
+            let result = traverse_both([older, tip], [tip], &odb, sorting, Parents::All)?;
+            assert!(
+                result.is_empty(),
+                "an ancestor of the hidden tip is uninteresting too, sorting = {sorting:?}"
+            );
+        }
+        Ok(())
+    }
+
     #[test]
     fn two_tips_two_ends() -> crate::Result {
         let odb = odb()?;

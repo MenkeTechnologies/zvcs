@@ -1822,7 +1822,11 @@ fn ref_edit(
         // transaction refuses outright.
         let expected =
             if old == zero { PreviousValue::Any } else { expected };
-        Change::Delete { expected, log: RefLog::AndReference }
+        // `execute_commands_non_atomic()` passes `"push"` to `ref_transaction_delete()` just
+        // as it does to the update, so deleting the branch the remote's `HEAD` points at
+        // records `<old> <null> … push` in its `logs/HEAD` (the `REF_LOG_ONLY` half git's
+        // `split_head_update()` adds). The deleted ref's own log goes away regardless.
+        Change::Delete { expected, log: RefLog::AndReference, message: "push".into() }
     } else {
         Change::Update {
             log: LogChange { mode: RefLog::AndReference, force_create_reflog: false, message: "push".into() },

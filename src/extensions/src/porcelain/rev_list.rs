@@ -298,6 +298,9 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     let mut i = 0;
     'args: while i < args.len() {
         let a = args[i].as_str();
+        // How many revisions were already pending when this argument was reached,
+        // so the `--no-walk` rule at the end of the iteration can see what it added.
+        let seeds_before = seeds.len();
         // git's `parse_long_opt` takes a value attached (`--grep=x`) or detached
         // (`--grep x`); these are the rev-list options that carry one.
         for (name, sink) in [
@@ -532,6 +535,16 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
                 rev_input_given = true;
             }
         }
+        // `add_pending_object_with_path()` clears `revs->no_walk` the moment an
+        // object carrying UNINTERESTING joins the pending list, which is
+        // `git-rev-list(1)`'s "This has no effect if a range is specified": every
+        // spelling that excludes — `^<rev>`, the left side of `<a>..<b>`, the merge
+        // bases of `<a>...<b>`, anything after `--not`, `--branches`/`--tags`/`--all`
+        // while `--not` is in force — cancels a `--no-walk` seen before it. Both are
+        // positional, so a `--no-walk` written afterwards turns walking off again.
+        if seeds[seeds_before..].iter().any(|s| s.uninteresting) {
+            no_walk = false;
+        }
         i += 1;
     }
 
@@ -556,8 +569,15 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
             } else if line == "--" {
                 in_paths = true;
             } else {
+                let seeds_before = seeds.len();
                 if let Err(e) = seed_revision(&repo, line, negate, &mut seeds, &mut pending_tags) {
                     return Ok(fatal(&e));
+                }
+                // The same `handle_revision_arg()` reads these lines, so an
+                // exclusion arriving on stdin cancels `--no-walk` just as one on
+                // the command line does.
+                if seeds[seeds_before..].iter().any(|s| s.uninteresting) {
+                    no_walk = false;
                 }
                 rev_input_given = true;
             }
@@ -1505,7 +1525,7 @@ fn parse_size(value: &str) -> Option<u64> {
 
 /// The commit's committer timestamp, or 0 when the object cannot be read — the
 /// value git's `parse_commit_gently` failure path leaves behind.
-fn commit_date(repo: &gix::Repository, id: ObjectId) -> i64 {
+pub(crate) fn commit_date(repo: &gix::Repository, id: ObjectId) -> i64 {
     let Ok(object) = repo.find_object(id) else {
         return 0;
     };
@@ -1516,7 +1536,7 @@ fn commit_date(repo: &gix::Repository, id: ObjectId) -> i64 {
 }
 
 /// The commit's parent ids, empty when the object cannot be read.
-fn commit_parents(repo: &gix::Repository, id: ObjectId) -> Vec<ObjectId> {
+pub(crate) fn commit_parents(repo: &gix::Repository, id: ObjectId) -> Vec<ObjectId> {
     let Ok(object) = repo.find_object(id) else {
         return Vec::new();
     };

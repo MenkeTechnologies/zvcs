@@ -460,6 +460,7 @@ fn delete_ref(repo: &gix::Repository, name: FullName) -> Result<()> {
         change: Change::Delete {
             expected: PreviousValue::Any,
             log: RefLog::AndReference,
+            message: Default::default(),
         },
         name,
         deref: false,

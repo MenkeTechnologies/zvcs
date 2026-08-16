@@ -2393,6 +2393,7 @@ fn fetch_one(
                     change: Change::Delete {
                         expected: PreviousValue::Any,
                         log: RefLog::AndReference,
+                        message: Default::default(),
                     },
                     name: name.clone(),
                     deref: false,

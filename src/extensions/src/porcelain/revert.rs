@@ -22,8 +22,11 @@
 //! problem while `--cleanup=bogus --abort -n` reports the cleanup one.
 //!
 //! What this port covers, byte-for-byte against stock git:
-//!   * `git revert <commit>...`, including `<a>..<b>` ranges and `^<commit>`
-//!     exclusions, resolved through one revision walk as git's sequencer does
+//!   * `git revert <commit>...`, including `<a>..<b>` ranges, `<a>...<b>`,
+//!     `^<commit>` exclusions and the `<a>^!`/`<a>^@` parent spellings, resolved
+//!     through the one revision walk [`crate::sequencer::prepare_revs`] runs, as
+//!     git's sequencer does. A revert never reverses that walk, so a range is
+//!     backed out newest first — the opposite of `cherry-pick`
 //!   * `-n`/`--no-commit`, `-s`/`--signoff`, `-m <n>`/`--mainline <n>`,
 //!     `--no-edit`, `--reference`, `--cleanup=<mode>`
 //!   * `--strategy`/`-X`, which git's sequencer ignores outright for a revert:
@@ -467,14 +470,24 @@ pub fn revert(args: &[String]) -> Result<ExitCode> {
     // follows it — the diagnosis order is handled inside `resolve_specs`, not by
     // a blanket pre-scan here.
 
-    let (commits, sequencer) = match resolve_specs(&repo, &specs)? {
-        Selection::List { commits, sequencer } => (commits, sequencer),
-        Selection::Failed(code) => return Ok(code),
-    };
+    let (commits, sequencer) =
+        match crate::sequencer::prepare_revs(&repo, &specs, crate::sequencer::Action::Revert)? {
+            crate::sequencer::Revs::Picks { commits, sequencer } => (commits, sequencer),
+            crate::sequencer::Revs::BadRevision(spec) => {
+                eprintln!("fatal: bad revision '{spec}'");
+                return Ok(ExitCode::from(128));
+            }
+            // `sequencer_pick_revisions()`'s pending-object loop, whose message
+            // says "cherry-pick" for a revert too.
+            crate::sequencer::Revs::NotACommit { name, kind } => {
+                return Ok(sequencer_failed(&format!("{name}: can't cherry-pick a {kind}")));
+            }
+            crate::sequencer::Revs::UnknownOption => return Ok(usage_error()),
+        };
+    // `walk_revs_populate_todo`'s tail: a selection that names no commit at all
+    // is refused before any sequencer state is written.
     if commits.is_empty() {
-        eprintln!("error: empty commit set passed");
-        eprintln!("fatal: revert failed");
-        return Ok(ExitCode::from(128));
+        return Ok(sequencer_failed("empty commit set passed"));
     }
 
     let todo = build_todo(&repo, &commits)?;
@@ -843,107 +856,6 @@ fn index_tree(repo: &gix::Repository, index: &gix::index::File) -> Result<Object
         flat.insert(entry.path_in(backing).to_owned(), (entry.id, kind));
     }
     write_tree(repo, &flat)
-}
-
-/// Turn the operand list into the commits to revert, newest first.
-///
-/// A plain `<commit>` is taken as given and in order, which is what git's
-/// `no_walk` sequencer setup produces. As soon as a range or a `^<commit>`
-/// exclusion appears, the whole set goes through one revision walk instead.
-///
-/// `Failed` carries the exit code of a refusal whose text git has already
-/// printed; `List` is the commit sequence to work through.
-enum Selection {
-    /// The commits to work through, plus whether git's sequencer is in play.
-    /// A lone plain `<commit>` takes git's `no_walk` single-pick fast path,
-    /// which never persists a sequencer or reports a revert "in progress"; any
-    /// range/`^`-exclusion, or more than one operand, switches to the walking
-    /// sequencer, which does. That flag is observable: when such a pick reverts
-    /// to an empty result it stops with the `Revert currently in progress` block
-    /// (`git revert HEAD..x` yields it even for a single walked commit, while
-    /// `git revert x` alone does not).
-    List { commits: Vec<ObjectId>, sequencer: bool },
-    Failed(ExitCode),
-}
-
-fn resolve_specs(repo: &gix::Repository, specs: &[String]) -> Result<Selection> {
-    let mut include: Vec<ObjectId> = Vec::new();
-    let mut exclude: Vec<ObjectId> = Vec::new();
-    let mut walked = false;
-    let mut unknown_option = false;
-
-    for spec in specs {
-        // A dash-prefixed operand is not a revision: git's `setup_revisions`
-        // keeps it as an unrecognized option and, unless a bad revision is hit
-        // first, reports the usage error (129) only after the whole list is
-        // scanned. A lone `-` is the exception — git rewrites it to `@{-1}`.
-        if spec.starts_with('-') && spec != "-" {
-            unknown_option = true;
-            continue;
-        }
-        // git rewrites a lone `-` into the previously checked-out branch.
-        let spec = if spec == "-" { "@{-1}" } else { spec.as_str() };
-
-        if let Some((lhs, rhs)) = spec.split_once("..") {
-            let lhs = if lhs.is_empty() { "HEAD" } else { lhs };
-            let rhs = if rhs.is_empty() { "HEAD" } else { rhs };
-            let (Some(from), Some(to)) = (peel_commit(repo, lhs), peel_commit(repo, rhs)) else {
-                eprintln!("fatal: bad revision '{spec}'");
-                return Ok(Selection::Failed(ExitCode::from(128)));
-            };
-            exclude.push(from);
-            include.push(to);
-            walked = true;
-            continue;
-        }
-
-        let (negated, name) = match spec.strip_prefix('^') {
-            Some(rest) => (true, rest),
-            None => (false, spec),
-        };
-        let Some(id) = peel_commit(repo, name) else {
-            eprintln!("fatal: bad revision '{spec}'");
-            return Ok(Selection::Failed(ExitCode::from(128)));
-        };
-        if negated {
-            exclude.push(id);
-            walked = true;
-        } else {
-            include.push(id);
-        }
-    }
-
-    // No bad revision was hit anywhere in the list; a deferred unrecognized dash
-    // operand now surfaces as the usage error, exactly as git's post-scan option
-    // check does — whether or not any valid commit was resolved.
-    if unknown_option {
-        return Ok(Selection::Failed(usage_error()));
-    }
-
-    if include.is_empty() || !walked {
-        // No walk: git's single-pick fast path only when exactly one operand.
-        // That test is on `opts->revs->cmdline.nr`, the operand count, so it is
-        // read before the de-duplication below.
-        let sequencer = include.len() > 1;
-        // `add_pending_object()` sets `SEEN`, so a commit named twice is walked
-        // once: `git revert A A` writes a one-line todo and reverts `A` once.
-        let mut seen = HashSet::new();
-        include.retain(|id| seen.insert(*id));
-        return Ok(Selection::List { commits: include, sequencer });
-    }
-    let mut out = Vec::new();
-    for info in repo.rev_walk(include).with_hidden(exclude).all()? {
-        out.push(info?.id);
-    }
-    // A walked selection always runs through git's sequencer, even at length 1.
-    Ok(Selection::List { commits: out, sequencer: true })
-}
-
-/// Resolve one revision to the commit it names, or `None` if either step fails
-/// — git reports both as the same "bad revision".
-fn peel_commit(repo: &gix::Repository, spec: &str) -> Option<ObjectId> {
-    let id = repo.rev_parse_single(spec).ok()?;
-    Some(id.object().ok()?.peel_to_commit().ok()?.id)
 }
 
 /// Outcome of one `<commit>` operand.
@@ -1375,6 +1287,15 @@ fn bad_mainline() -> ExitCode {
 fn usage_error() -> ExitCode {
     eprint!("{USAGE}");
     ExitCode::from(129)
+}
+
+/// git's sequencer failure shape: the specific `error:` line the sequencer
+/// printed, then the generic `fatal: revert failed` `cmd_revert` dies with,
+/// status 128.
+fn sequencer_failed(message: &str) -> ExitCode {
+    eprintln!("error: {message}");
+    eprintln!("fatal: revert failed");
+    ExitCode::from(128)
 }
 
 /// Flatten a tree into `path -> (id, kind)` via the index representation, which

@@ -33,15 +33,21 @@
 //!    `--quit` with nothing in progress is a silent success; the other three
 //!    report `no cherry-pick[ or revert] in progress` and exit 128.
 //! 3. **No revisions given** → the usage block on stderr, status 129.
-//! 4. **Revision resolution**, in argument order. The first spec that does not
-//!    resolve dies with `fatal: bad revision '<spec>'` and status 128. This is
-//!    why `--strategy=nonexistent-strategy README.md` reports the *revision*, not
+//! 4. **Revision resolution**, in argument order — `setup_revisions()`, run by
+//!    [`crate::sequencer::prepare_revs`]. The first spec that does not resolve
+//!    dies with `fatal: bad revision '<spec>'` and status 128. This is why
+//!    `--strategy=nonexistent-strategy README.md` reports the *revision*, not
 //!    the strategy: nothing validates a strategy name before this point.
 //! 5. **Leftover unknown options** → usage, status 129. A bad revision in stage 4
 //!    outranks this, matching `setup_revisions`, which dies on the revision as it
 //!    walks the argument list and only reports leftovers once it finishes.
-//! 6. **Dirty worktree** → `fatal: cherry-pick failed`, status 128.
-//! 7. The picks themselves.
+//! 6. **The selection itself**: an operand naming something that is not
+//!    commit-ish is `error: <name>: can't cherry-pick a <type>`, and a selection
+//!    that names no commit at all — an empty range — is
+//!    `error: empty commit set passed`; both then `fatal: cherry-pick failed`
+//!    with status 128, before any sequencer state is written.
+//! 7. **Dirty worktree** → `fatal: cherry-pick failed`, status 128.
+//! 8. The picks themselves.
 //!
 //! ## What is served
 //!
@@ -81,10 +87,14 @@
 //!
 //! `sequencer_pick_revisions()` splits on the command line, not on how many
 //! commits it ends up replaying: exactly one plain `<commit>` operand takes
-//! `single_pick()`, which writes no `.git/sequencer` at all, and anything else
-//! creates the directory and runs `pick_commits()`. Both shapes are served here
-//! — ranges are still refused as *spellings*, so a sequence is always two or
-//! more explicit operands — and the on-disk state is [`crate::sequencer`]'s:
+//! `single_pick()`, which writes no `.git/sequencer` at all, and anything else —
+//! a second operand, a `<a>..<b>` range, a `^<commit>` exclusion — creates the
+//! directory and runs `pick_commits()`. Both shapes are served here, and which
+//! one a command line takes is [`crate::sequencer::prepare_revs`]'s `sequencer`
+//! answer. A range walks, and a walked pick replays *oldest first*
+//! (`prepare_revs()` flips `revs->reverse` for a pick), which is the only order
+//! in which the replayed commits apply to each other. The on-disk state is
+//! [`crate::sequencer`]'s:
 //! `head`, `opts`, `abort-safety` written at the start, `todo` rewritten before
 //! every instruction, the whole directory removed once the last one lands.
 //!
@@ -144,9 +154,16 @@
 //! no-ops `-r`, `--no-gpg-sign` (we never sign) and `--rerere-autoupdate`
 //! (rerere only participates in conflicts, which are refused anyway).
 //!
-//! Refused with a precise message: `-e`/`--edit`, `-S`, and commit *ranges*
-//! (name each commit instead; two or more operands run the same sequencer a
-//! range would). The `-X` values `gix-merge` cannot express — the whitespace family,
+//! ## Revision arguments
+//!
+//! Everything `setup_revisions()` accepts for the sequencer:
+//! `<commit>`, `^<commit>`, `<a>..<b>`, `<a>...<b>`, `<a>^!`, `<a>^@`, a leading
+//! `-` for `@{-1}`, and any mix of them in one command line —
+//! [`crate::sequencer::prepare_revs`] resolves the whole list through one
+//! revision walk, exactly as git's does.
+//!
+//! Refused with a precise message: `-e`/`--edit` and `-S`.
+//! The `-X` values `gix-merge` cannot express — the whitespace family,
 //! `subtree` and `renormalize` — are refused by the shared
 //! `merge_tree::StrategyOptions`, at the point the merge would have used them.
 //!
@@ -681,48 +698,44 @@ pub fn cherry_pick(args: &[String]) -> Result<ExitCode> {
 
     // --- stage 4: resolve every revision, in order ------------------------
     //
-    // git's `setup_revisions` walks the whole argument list and dies on the
-    // *first* spec that fails to resolve, regardless of what comes after it. So a
-    // bad revision outranks the unsupported-range bail below: `main..feature
-    // does-not-exist` must report `bad revision 'does-not-exist'` (128), not the
-    // range. Validate every spec first; only after the list is clean does the
-    // range become the failure.
-    let mut picks: Vec<ObjectId> = Vec::with_capacity(opts.specs.len());
-    let mut range_spec: Option<&str> = None;
-    for spec in &opts.specs {
-        let parsed = match repo.rev_parse(*spec) {
-            Ok(parsed) => parsed,
-            Err(_) => return Ok(fatal(&format!("bad revision '{spec}'"))),
-        };
-        match parsed.single() {
-            // A revision may name an annotated tag (`v0.2.0`); git peels every
-            // commit-ish it is handed before replaying it.
-            Some(id) => picks.push(id.object()?.peel_to_commit()?.id),
-            // Both endpoints resolved, so this is a genuine range. Enumerating it
-            // is unported, and silently picking one end would be wrong — but the
-            // bail waits until every remaining spec has been validated, so a
-            // later bad revision still wins.
-            None => range_spec = range_spec.or(Some(*spec)),
-        }
-    }
-    if let Some(spec) = range_spec {
-        anyhow::bail!(
-            "commit ranges are not supported; name each commit individually (`{spec}`)"
-        );
-    }
-    // `add_pending_object()` sets `SEEN` on each object it queues, so the walk
-    // hands `walk_revs_populate_todo` a given commit exactly once however many
-    // times it was named: `git cherry-pick A A` replays `A` once and its todo
-    // list has one line. The *operand* count still decides single-pick versus
-    // sequence, though (`opts->revs->cmdline.nr`), so that is read separately.
-    {
-        let mut seen = HashSet::new();
-        picks.retain(|id| seen.insert(*id));
+    // `setup_revisions` walks the whole argument list and dies on the *first*
+    // spec that fails to resolve, regardless of what comes after it, so a bad
+    // revision outranks every later diagnosis: `main..feature does-not-exist`
+    // must report `bad revision 'does-not-exist'` (128) rather than anything
+    // stage 5 or 6 would have said. Ranges, `^` exclusions and mixed lists all
+    // go through the one walk [`crate::sequencer::prepare_revs`] runs, which is
+    // also where a pick's oldest-first replay order comes from.
+    let revs = crate::sequencer::prepare_revs(&repo, &opts.specs, crate::sequencer::Action::Pick)?;
+    if let crate::sequencer::Revs::BadRevision(spec) = &revs {
+        return Ok(fatal(&format!("bad revision '{spec}'")));
     }
 
     // --- stage 5: options git kept but never consumed ----------------------
-    if opts.leftover_unknown {
+    //
+    // `run_sequencer`'s `if (argc > 1) usage_with_options(...)` fires on what
+    // `setup_revisions` handed back, so it outranks everything the sequencer
+    // itself diagnoses below — an unknown option with an empty commit set is a
+    // usage error (129), not `empty commit set passed` (128).
+    if opts.leftover_unknown || matches!(revs, crate::sequencer::Revs::UnknownOption) {
         return Ok(usage());
+    }
+
+    // --- stage 6: pending objects that are not commit-ish ------------------
+    let (picks, sequence) = match revs {
+        crate::sequencer::Revs::Picks { commits, sequencer } => (commits, sequencer),
+        crate::sequencer::Revs::NotACommit { name, kind } => {
+            return Ok(sequencer_failed(&format!("{name}: can't cherry-pick a {kind}")));
+        }
+        // Both handled above; `prepare_revs` returns each exactly once.
+        crate::sequencer::Revs::BadRevision(_) | crate::sequencer::Revs::UnknownOption => {
+            unreachable!("stage 4 and stage 5 return on these")
+        }
+    };
+    // `walk_revs_populate_todo`'s tail: a selection that named no commit at all
+    // — an empty range, or nothing but exclusions — is refused before any
+    // sequencer state is written.
+    if picks.is_empty() {
+        return Ok(sequencer_failed("empty commit set passed"));
     }
 
     if opts.edit {
@@ -742,14 +755,15 @@ pub fn cherry_pick(args: &[String]) -> Result<ExitCode> {
         .detach();
     drop(head);
 
-    // --- stage 6: start the sequence ---------------------------------------
+    // --- stage 7: start the sequence ---------------------------------------
     //
     // `sequencer_pick_revisions` splits on the command line rather than on how
     // many commits it ends up replaying: exactly one plain `<commit>` operand
     // takes `single_pick`, which never touches `.git/sequencer` (git's own
     // comment: that is what makes it "possible to cherry-pick in the middle of a
-    // cherry-pick sequence"). Anything else creates the directory and runs
-    // `pick_commits`. Ranges bail above, so the operand count is the whole test.
+    // cherry-pick sequence"). Anything else — a second operand, a range, a `^`
+    // exclusion — creates the directory and runs `pick_commits`, which is the
+    // `sequence` flag `prepare_revs` returned.
     //
     // This runs *before* the dirty-worktree refusal below because git's does:
     // `create_seq_dir()`/`save_head()`/`save_opts()` are all in
@@ -757,7 +771,6 @@ pub fn cherry_pick(args: &[String]) -> Result<ExitCode> {
     // `do_pick_commit` inside `pick_commits`. So a multi-commit pick that is
     // turned away for a dirty worktree still leaves the sequencer state behind,
     // and a *second* one is then refused as "already in progress".
-    let sequence = opts.specs.len() > 1;
     let todo = build_todo(&repo, &picks)?;
 
     if sequence {
@@ -772,7 +785,7 @@ pub fn cherry_pick(args: &[String]) -> Result<ExitCode> {
         crate::sequencer::update_abort_safety_file(&repo)?;
     }
 
-    // --- stage 7: git's `require_clean_work_tree` --------------------------
+    // --- stage 8: git's `require_clean_work_tree` --------------------------
     if repo.is_dirty()? {
         eprintln!("error: your local changes would be overwritten by cherry-pick.");
         // `error_dirty_index` (sequencer.c) gates its one-line direction on

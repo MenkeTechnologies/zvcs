@@ -392,26 +392,34 @@ impl Transaction<'_, '_> {
                             {
                                 continue;
                             }
-                            // git mirrors deletions too, carrying `update->msg` onto the
-                            // `HEAD` entry. `Change::Delete` has no message field, so the
-                            // mirror could only ever be message-less where git writes a
-                            // messaged line — and the delete-through-`HEAD` path that *is*
-                            // reachable (`update-ref -d HEAD`) gets its entry from
-                            // `split_symref_update` instead, which this does not touch.
-                            // Deleting a branch by name while it is checked out therefore
-                            // leaves `.git/logs/HEAD` alone here; `git branch -m` writes that
-                            // entry itself, with the message.
-                            let Change::Update { log, new, .. } = &updates[idx].update.change else {
-                                continue;
-                            };
-                            let mirrored = Change::Update {
-                                log: LogChange {
-                                    mode: RefLog::Only,
-                                    force_create_reflog: log.force_create_reflog,
-                                    message: log.message.clone(),
-                                },
-                                expected: PreviousValue::Any,
-                                new: new.clone(),
+                            // `ref_transaction_add_update(transaction, "HEAD", update->flags |
+                            // REF_LOG_ONLY | REF_NO_DEREF, &update->new_oid, &update->old_oid, …,
+                            // update->msg)`: the mirror copies the value *and* the message,
+                            // whichever kind of change it is. A deletion mirrors as a deletion
+                            // whose log survives — that is the whole point of `REF_LOG_ONLY` —
+                            // so `.git/logs/HEAD` gains a `<old> <null>` line while
+                            // `refs/heads/main` and its own log go away.
+                            let (mirrored, log_only_split) = match &updates[idx].update.change {
+                                Change::Update { log, new, .. } => (
+                                    Change::Update {
+                                        log: LogChange {
+                                            mode: RefLog::Only,
+                                            force_create_reflog: log.force_create_reflog,
+                                            message: log.message.clone(),
+                                        },
+                                        expected: PreviousValue::Any,
+                                        new: new.clone(),
+                                    },
+                                    false,
+                                ),
+                                Change::Delete { message, .. } => (
+                                    Change::Delete {
+                                        expected: PreviousValue::Any,
+                                        log: RefLog::Only,
+                                        message: message.clone(),
+                                    },
+                                    true,
+                                ),
                             };
                             splits.push((
                                 idx,
@@ -424,7 +432,9 @@ impl Transaction<'_, '_> {
                                     lock: None,
                                     parent_index: None,
                                     leaf_referent_previous_oid: None,
-                                    log_only_split: false,
+                                    // `REF_LOG_ONLY` on a deletion: append to the log and keep it,
+                                    // rather than gix's "delete the log, keep the reference".
+                                    log_only_split,
                                 },
                             ));
                             // At most one edit can name `head_ref` — `pre_process` above

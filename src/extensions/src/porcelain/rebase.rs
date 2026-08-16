@@ -3443,6 +3443,7 @@ impl<'r> Sequencer<'r> {
                 change: Change::Delete {
                     expected: PreviousValue::Any,
                     log: RefLog::AndReference,
+                    message: Default::default(),
                 },
                 name: full,
                 deref: false,

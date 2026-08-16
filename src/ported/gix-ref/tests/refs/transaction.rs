@@ -35,6 +35,7 @@ mod refedit_ext {
             change: Change::Delete {
                 expected: PreviousValue::Any,
                 log: RefLog::AndReference,
+                message: Default::default(),
             },
             name: name.try_into().expect("valid name"),
             deref: false,
@@ -50,6 +51,7 @@ mod refedit_ext {
                 change: Change::Delete {
                     expected: PreviousValue::Any,
                     log: RefLog::AndReference,
+                    message: Default::default(),
                 },
                 name: "HEAD".try_into()?,
                 deref: true,
@@ -58,6 +60,7 @@ mod refedit_ext {
                 change: Change::Delete {
                     expected: PreviousValue::Any,
                     log: RefLog::AndReference,
+                    message: Default::default(),
                 },
                 name: "refs/heads/main".try_into()?,
                 deref: false,
@@ -124,6 +127,7 @@ mod refedit_ext {
                     change: Change::Delete {
                         expected: PreviousValue::Any,
                         log: RefLog::AndReference,
+                        message: Default::default(),
                     },
                     name: "SYMBOLIC_PROBABLY_BUT_DEREF_IS_FALSE_SO_IGNORED".try_into()?,
                     deref: false,
@@ -132,6 +136,7 @@ mod refedit_ext {
                     change: Change::Delete {
                         expected: PreviousValue::Any,
                         log: RefLog::AndReference,
+                        message: Default::default(),
                     },
                     name: "refs/heads/anything-but-not-symbolic".try_into()?,
                     deref: true,
@@ -140,6 +145,7 @@ mod refedit_ext {
                     change: Change::Delete {
                         expected: PreviousValue::Any,
                         log: RefLog::AndReference,
+                        message: Default::default(),
                     },
                     name: "refs/heads/does-not-exist-and-deref-is-ignored".try_into()?,
                     deref: true,
@@ -192,6 +198,7 @@ mod refedit_ext {
                     change: Change::Delete {
                         expected: PreviousValue::Any,
                         log: RefLog::AndReference,
+                        message: Default::default(),
                     },
                     name: "refs/heads/delete-symbolic-1".try_into()?,
                     deref: true,
@@ -266,6 +273,7 @@ mod refedit_ext {
                     change: Change::Delete {
                         expected: PreviousValue::Any,
                         log: RefLog::AndReference,
+                        message: Default::default(),
                     },
                     name: "refs/heads/delete-symbolic-1".try_into()?,
                     deref: true,
@@ -299,6 +307,7 @@ mod refedit_ext {
                         change: Change::Delete {
                             expected: PreviousValue::Any,
                             log: RefLog::Only,
+                            message: Default::default(),
                         },
                         name: "refs/heads/delete-symbolic-1".try_into()?,
                         deref: false,
@@ -316,6 +325,7 @@ mod refedit_ext {
                         change: Change::Delete {
                             expected: PreviousValue::Any,
                             log: RefLog::Only,
+                            message: Default::default(),
                         },
                         name: "refs/heads/delete-symbolic-2".try_into()?,
                         deref: false,
@@ -333,6 +343,7 @@ mod refedit_ext {
                         change: Change::Delete {
                             expected: PreviousValue::Any,
                             log: RefLog::AndReference,
+                            message: Default::default(),
                         },
                         name: "refs/heads/delete-symbolic-3".try_into()?,
                         deref: false,

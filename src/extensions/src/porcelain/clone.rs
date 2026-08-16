@@ -1712,6 +1712,7 @@ fn remove_remote_tracking_head(git_dir: &Path) -> Result<()> {
             change: gix::refs::transaction::Change::Delete {
                 expected: gix::refs::transaction::PreviousValue::Any,
                 log: gix::refs::transaction::RefLog::AndReference,
+                message: Default::default(),
             },
             name,
             deref: false,

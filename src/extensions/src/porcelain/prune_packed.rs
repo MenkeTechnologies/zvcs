@@ -255,7 +255,7 @@ fn pack_indices(objdir: &Path, hash: gix::hash::Kind) -> Vec<pack::index::File> 
 /// from anywhere in the worktree is the top-level-relative `.git/objects`, and
 /// for a bare repository opened in place is `./objects`. Both are reproduced;
 /// anything else falls back to a cwd-relative or absolute path.
-fn display_objdir(repo: &gix::Repository, objdir: &Path) -> PathBuf {
+pub(super) fn display_objdir(repo: &gix::Repository, objdir: &Path) -> PathBuf {
     let real_objdir = fs::canonicalize(objdir).unwrap_or_else(|_| objdir.to_path_buf());
 
     if let Some(work) = repo.workdir() {

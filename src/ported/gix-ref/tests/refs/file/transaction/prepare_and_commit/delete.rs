@@ -25,6 +25,7 @@ fn delete_a_ref_which_is_gone_succeeds() -> crate::Result {
                 change: Change::Delete {
                     expected: PreviousValue::Any,
                     log: RefLog::AndReference,
+                    message: Default::default(),
                 },
                 name: "DOES_NOT_EXIST".try_into()?,
                 deref: false,
@@ -45,6 +46,7 @@ fn delete_a_ref_which_is_gone_but_must_exist_fails() -> crate::Result {
             change: Change::Delete {
                 expected: PreviousValue::MustExist,
                 log: RefLog::AndReference,
+                message: Default::default(),
             },
             name: "DOES_NOT_EXIST".try_into()?,
             deref: false,
@@ -76,6 +78,7 @@ fn delete_ref_and_reflog_on_symbolic_no_deref() -> crate::Result {
                 change: Change::Delete {
                     expected: PreviousValue::MustExist,
                     log: RefLog::AndReference,
+                    message: Default::default(),
                 },
                 name: head.name.clone(),
                 deref: false,
@@ -91,6 +94,7 @@ fn delete_ref_and_reflog_on_symbolic_no_deref() -> crate::Result {
             change: Change::Delete {
                 expected: PreviousValue::MustExistAndMatch(Target::Symbolic("refs/heads/main".try_into()?)),
                 log: RefLog::AndReference,
+                message: Default::default(),
             },
             name: head.name,
             deref: false
@@ -117,6 +121,7 @@ fn delete_ref_with_incorrect_previous_value_fails() -> crate::Result {
             change: Change::Delete {
                 expected: PreviousValue::MustExistAndMatch(Target::Symbolic("refs/heads/main".try_into()?)),
                 log: RefLog::Only,
+                message: Default::default(),
             },
             name: head.name,
             deref: true,
@@ -158,6 +163,7 @@ fn delete_reflog_only_of_symbolic_no_deref() -> crate::Result {
                 change: Change::Delete {
                     expected: PreviousValue::MustExistAndMatch(Target::Symbolic("refs/heads/main".try_into()?)),
                     log: RefLog::Only,
+                    message: Default::default(),
                 },
                 name: head.name,
                 deref: false,
@@ -193,6 +199,7 @@ fn delete_reflog_only_of_symbolic_with_deref() -> crate::Result {
                 change: Change::Delete {
                     expected: PreviousValue::MustExist,
                     log: RefLog::Only,
+                    message: Default::default(),
                 },
                 name: head.name,
                 deref: true,
@@ -229,6 +236,7 @@ fn rename_a_to_a_slash_b_in_one_transaction() -> crate::Result {
                     change: Change::Delete {
                         expected: PreviousValue::MustExist,
                         log: RefLog::AndReference,
+                        message: Default::default(),
                     },
                     name: old.name.clone(),
                     deref: true,
@@ -266,6 +274,7 @@ fn rename_a_to_a_slash_b_in_one_transaction() -> crate::Result {
                 change: Change::Delete {
                     expected: PreviousValue::MustExist,
                     log: RefLog::AndReference,
+                    message: Default::default(),
                 },
                 name: old.name,
                 deref: true,
@@ -312,6 +321,7 @@ fn delete_broken_ref_that_must_exist_fails_as_it_is_no_valid_ref() -> crate::Res
             change: Change::Delete {
                 expected: PreviousValue::MustExist,
                 log: RefLog::AndReference,
+                message: Default::default(),
             },
             name: "HEAD".try_into()?,
             deref: true,
@@ -343,6 +353,7 @@ fn non_existing_can_be_deleted_with_the_may_exist_match_constraint() -> crate::R
                 change: Change::Delete {
                     expected: previous_value.clone(),
                     log: RefLog::AndReference,
+                    message: Default::default(),
                 },
                 name: "refs/heads/not-there".try_into()?,
                 deref: true,
@@ -358,6 +369,7 @@ fn non_existing_can_be_deleted_with_the_may_exist_match_constraint() -> crate::R
             change: Change::Delete {
                 expected: previous_value,
                 log: RefLog::AndReference,
+                message: Default::default(),
             },
             name: "refs/heads/not-there".try_into()?,
             deref: false,
@@ -380,6 +392,7 @@ fn delete_broken_ref_that_may_not_exist_works_even_in_deref_mode() -> crate::Res
                 change: Change::Delete {
                     expected: PreviousValue::Any,
                     log: RefLog::AndReference,
+                    message: Default::default(),
                 },
                 name: "HEAD".try_into()?,
                 deref: true,
@@ -396,6 +409,7 @@ fn delete_broken_ref_that_may_not_exist_works_even_in_deref_mode() -> crate::Res
             change: Change::Delete {
                 expected: PreviousValue::Any,
                 log: RefLog::AndReference,
+                message: Default::default(),
             },
             name: "HEAD".try_into()?,
             deref: false,
@@ -422,6 +436,7 @@ fn store_write_mode_has_no_effect_and_reflogs_are_always_deleted() -> crate::Res
                     change: Change::Delete {
                         expected: PreviousValue::Any,
                         log: RefLog::Only,
+                        message: Default::default(),
                     },
                     name: "HEAD".try_into()?,
                     deref: false,
@@ -458,6 +473,7 @@ fn packed_refs_are_consulted_when_determining_previous_value_of_ref_to_be_delete
                 change: Change::Delete {
                     expected: PreviousValue::MustExistAndMatch(Target::Object(old_id)),
                     log: RefLog::AndReference,
+                    message: Default::default(),
                 },
                 name: "refs/heads/main".try_into()?,
                 deref: false,
@@ -467,7 +483,30 @@ fn packed_refs_are_consulted_when_determining_previous_value_of_ref_to_be_delete
         )?
         .commit(committer().to_ref(&mut TimeBuf::default()))?;
 
-    assert_eq!(edits.len(), 1, "an edit was performed in the packed refs store");
+    // The fixture leaves `HEAD` symbolic to `refs/heads/main`, so `split_head_update()`
+    // (refs/files-backend.c) adds its `REF_LOG_ONLY` mirror: the packed deletion, plus the
+    // `<old> <null>` line that lands in `HEAD`'s reflog. `HEAD` itself is untouched.
+    assert_eq!(
+        edits.len(),
+        2,
+        "the edit in the packed refs store, plus git's log-only mirror onto HEAD"
+    );
+    assert!(
+        edits.iter().any(|e| e.name.as_bstr() == "HEAD"
+            && matches!(
+                e.change,
+                Change::Delete {
+                    log: RefLog::Only,
+                    ..
+                }
+            )),
+        "the mirror only appends a reflog entry, it does not delete HEAD"
+    );
+    assert_eq!(
+        store.find_loose("HEAD")?.target,
+        Target::Symbolic("refs/heads/main".try_into()?),
+        "HEAD still points where it did"
+    );
     let packed = store.open_packed_buffer()?.expect("packed ref present");
     assert!(packed.try_find("main")?.is_none(), "no main present after deletion");
     Ok(())
@@ -492,6 +531,7 @@ fn a_loose_ref_with_old_value_check_and_outdated_packed_refs_value_deletes_both_
                 change: Change::Delete {
                     expected: PreviousValue::MustExistAndMatch(Target::Object(branch_id)),
                     log: RefLog::AndReference,
+                    message: Default::default(),
                 },
                 name: branch.name,
                 deref: false,
@@ -501,14 +541,21 @@ fn a_loose_ref_with_old_value_check_and_outdated_packed_refs_value_deletes_both_
         )?
         .commit(committer().to_ref(&mut TimeBuf::default()))?;
 
+    // One edit for the reference — even though it was removed from both the loose and the
+    // packed store — plus the `REF_LOG_ONLY` mirror `split_head_update()` adds because the
+    // fixture checked `newer-as-loose` out, leaving `HEAD` symbolic to it.
     assert_eq!(
         edits.len(),
-        1,
-        "only one edit even though technically two places were changed"
+        2,
+        "one edit even though technically two places were changed, plus git's log-only mirror onto HEAD"
     );
     assert!(
         store.try_find("newer-as-loose")?.is_none(),
         "reference is deleted everywhere"
+    );
+    assert!(
+        store.try_find_loose("HEAD")?.is_some(),
+        "the mirror leaves HEAD itself in place"
     );
     Ok(())
 }
@@ -530,6 +577,7 @@ fn all_contained_references_deletes_the_packed_ref_file_too() -> crate::Result {
                                 _ => unimplemented!("unknown mode: {}", mode),
                             },
                             log: RefLog::AndReference,
+                            message: Default::default(),
                         },
                         name: r.name.into(),
                         deref: false,
@@ -544,8 +592,18 @@ fn all_contained_references_deletes_the_packed_ref_file_too() -> crate::Result {
 
         let packed = store.open_packed_buffer()?;
         assert!(packed.is_none(), "it won't make up packed refs");
+        // `refs/heads/main` is among the packed refs and `HEAD` points at it, so the batch
+        // also carries git's `REF_LOG_ONLY` mirror onto `HEAD`. That one deletes nothing —
+        // it exists to append `<old> <null>` to a log that stays — so only the real
+        // deletions are expected to have gone away.
         for edit in edits {
-            assert!(store.try_find(&edit.name)?.is_none(), "delete ref cannot be found");
+            match edit.change {
+                Change::Delete {
+                    log: RefLog::AndReference,
+                    ..
+                } => assert!(store.try_find(&edit.name)?.is_none(), "delete ref cannot be found"),
+                _ => assert_eq!(edit.name.as_bstr(), "HEAD", "the only log-only edit is the HEAD mirror"),
+            }
         }
     }
     Ok(())

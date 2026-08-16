@@ -74,6 +74,7 @@ pub(crate) mod prepare_and_commit {
             change: Change::Delete {
                 expected: PreviousValue::Any,
                 log: RefLog::AndReference,
+                message: Default::default(),
             },
             name: name.try_into().expect("valid name"),
             deref: false,

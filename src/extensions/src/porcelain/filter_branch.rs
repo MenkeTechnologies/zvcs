@@ -2057,17 +2057,14 @@ fn walk(
     hidden: &[ObjectId],
     pathspecs: &[String],
 ) -> Result<Vec<(ObjectId, Vec<ObjectId>)>> {
-    // Two refs can name the same commit (a tag on a branch tip), and the
-    // traversal would then hand it out twice; git seeds each commit once. A tip
-    // that is itself excluded is not a tip at all — `git rev-list HEAD..HEAD`
-    // is empty — and the traversal would otherwise still hand it out.
+    // Two refs can name the same commit (a tag on a branch tip). git's `SEEN` flag
+    // makes the second mention a no-op, but `topo`'s seeding has no such check and
+    // would push the commit into its queue twice, so the deduplication happens here.
+    // Exclusion, by contrast, needs no handling at this level: `topo` drops a seed
+    // that is also an end, the way git's `limit_list()` does before the topological
+    // sort runs.
     let mut seen: HashSet<ObjectId> = HashSet::new();
-    let seed: Vec<ObjectId> = tips
-        .iter()
-        .rev()
-        .copied()
-        .filter(|id| !hidden.contains(id) && seen.insert(*id))
-        .collect();
+    let seed: Vec<ObjectId> = tips.iter().rev().copied().filter(|id| seen.insert(*id)).collect();
     let topo = gix::traverse::commit::topo::Builder::from_iters(
         &repo.objects,
         seed,

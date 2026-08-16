@@ -88,10 +88,17 @@ const STAT_TERM_WIDTH: usize = 80;
 ///     are honored (flag over config over the 80-column / uncapped default).
 ///
 /// Revision arguments accept the full walk grammar: plain names are shown directly
-/// (deduplicated per commit, in argument order), while ranges (`a..b`), symmetric
-/// differences (`a...b`), and exclusions (`^a`) drive a revision walk. Pathspecs
-/// after `--` limit each commit's diff by plain path prefix (pathspec magic is not
-/// interpreted). Every flag not listed above is rejected explicitly.
+/// (deduplicated per commit, in argument order), while anything that excludes drives a
+/// revision walk instead — `cmd_show` starts with `rev.no_walk = 1` and
+/// `add_pending_object_with_path()` clears it as soon as a pending object carries
+/// `UNINTERESTING`. That covers `^a`, the left side of a range (`a..b`), the merge
+/// bases of a symmetric difference (`a...b`), the parents of `a^!`, and `--not`,
+/// which flips the sense of every revision after it (and is undone by a second
+/// `--not`). Under a walk the pending objects are peeled through their tag chain and
+/// anything that is not a commit — a tree, a blob — contributes nothing, while `a^@`
+/// stays a no-walk record of the parents themselves. Pathspecs after `--` limit each
+/// commit's diff by plain path prefix (pathspec magic is not interpreted). Every flag
+/// not listed above is rejected explicitly.
 pub fn show(args: &[String]) -> Result<ExitCode> {
     let mut specs: Vec<&str> = Vec::new();
     // `--stdin`: further revisions, one per line, read after the command line is
@@ -108,6 +115,13 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
     let mut pretty_given = false;
     let mut notes_opt = super::notes::DisplayOpt::default();
     let mut after_dashdash = false;
+    // `--not` (`setup_revisions`' `flags ^= UNINTERESTING | BOTTOM`): a toggle that
+    // reverses the sense of every revision after it, so `--not A` excludes `A` and a
+    // second `--not` restores the positive reading. Recorded per revision in
+    // `spec_negated`, since the toggle's state at the time a token is read is what
+    // decides that token's side.
+    let mut negate_revs = false;
+    let mut spec_negated: Vec<bool> = Vec::new();
     // Display config shared with `git log`, overridable on the command line. The
     // config defaults are resolved after the repo is discovered; these hold the
     // CLI overrides in the meantime (`None` = fall back to config).
@@ -223,6 +237,7 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
             "--name-status" => formats.name_status = true,
             "-z" => z = true,
             "--stdin" => read_stdin = true,
+            "--not" => negate_revs = !negate_revs,
             "--numstat" => formats.numstat = true,
             "--shortstat" => formats.shortstat = true,
             "--summary" => formats.summary = true,
@@ -454,6 +469,7 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
                     bail!("unsupported option {s}");
                 } else {
                     specs.push(s);
+                    spec_negated.push(negate_revs);
                 }
             }
         }
@@ -503,10 +519,19 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
     } else {
         String::new()
     };
-    specs.extend(stdin_text.lines().filter(|l| !l.is_empty()));
+    // `--stdin` lines are read after the command line is scanned, so they take the
+    // `--not` state the last argument left behind — git reads them through the same
+    // `handle_revision_arg()` with the same `flags`.
+    for line in stdin_text.lines().filter(|l| !l.is_empty()) {
+        specs.push(line);
+        spec_negated.push(negate_revs);
+    }
 
+    // `revs->def`: the fallback pending object is added with no flags at all, so a
+    // trailing `--not` never turns the implicit `HEAD` into an exclusion.
     if specs.is_empty() {
         specs.push("HEAD");
+        spec_negated.push(false);
     }
 
     let mut repo = gix::discover(".")?;
@@ -624,13 +649,47 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
     // for each pending object, which is the endpoint token rather than the whole
     // argument (`main~2..main` names its tip `main`).
     let mut walk_tip_sources: Vec<String> = Vec::new();
-    for spec in &specs {
+    for (spec, negated) in specs.iter().zip(spec_negated.iter().copied()) {
         let parsed = match repo.rev_parse(BStr::new(*spec)) {
             Ok(p) => p.detach(),
             Err(_) => return Ok(fatal(&bad_revision_message(spec, hex_len))),
         };
         match parsed {
-            RevSpec::Include(id) | RevSpec::ExcludeParents(id) => {
+            // `--not <rev>` and `^<rev>` are the same thing twice: `handle_revision_arg_1`
+            // flips `UNINTERESTING` once for the `^` and `setup_revisions` flips it once
+            // for the `--not`, so the two together cancel back to a positive revision.
+            RevSpec::Include(id) if negated => {
+                needs_walk = true;
+                walk_hidden.push(id);
+            }
+            RevSpec::Include(id) => {
+                plain.push((*spec, id));
+                walk_tips.push(id);
+                walk_tip_sources.push((*spec).to_string());
+            }
+            // `<rev>^!` is `add_parents_only()` with the flags flipped: the commit
+            // itself stays positive while every parent is added UNINTERESTING, which
+            // clears `no_walk` and makes the record a one-commit walk. It matters as
+            // soon as a second argument names one of those parents — `git show HEAD^!
+            // HEAD^@` prints the merge alone, because the `^@` parents are already
+            // excluded by the `^!`.
+            RevSpec::ExcludeParents(id) => {
+                needs_walk = true;
+                let parents = parents_of(&repo, id)?;
+                if negated {
+                    walk_hidden.push(id);
+                    for p in parents {
+                        walk_tips.push(p);
+                        walk_tip_sources.push((*spec).to_string());
+                    }
+                } else {
+                    plain.push((*spec, id));
+                    walk_tips.push(id);
+                    walk_tip_sources.push((*spec).to_string());
+                    walk_hidden.extend(parents);
+                }
+            }
+            RevSpec::Exclude(id) if negated => {
                 plain.push((*spec, id));
                 walk_tips.push(id);
                 walk_tip_sources.push((*spec).to_string());
@@ -640,32 +699,90 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
                 walk_hidden.push(id);
             }
             RevSpec::Range { from, to } => {
+                // `A..B` is `^A B`, and under `--not` each endpoint takes the other
+                // side — `handle_dotdot_1` derives both from the one `flags` word.
                 needs_walk = true;
-                walk_tips.push(to);
-                walk_tip_sources.push(range_endpoint(spec, "..", true));
-                walk_hidden.push(from);
+                let (tip, hidden, right) = if negated { (from, to, false) } else { (to, from, true) };
+                walk_tips.push(tip);
+                walk_tip_sources.push(range_endpoint(spec, "..", right));
+                walk_hidden.push(hidden);
             }
             RevSpec::Merge { theirs, ours } => {
                 // `theirs...ours` = reachable from either but not both, which git
-                // computes as `theirs ours --not $(merge-base theirs ours)`.
+                // computes as `theirs ours --not $(merge-base theirs ours)`. Under
+                // `--not` the endpoints take the excluded flags and the merge bases
+                // the positive ones: the same three objects with their sides swapped.
                 needs_walk = true;
-                walk_tips.push(theirs);
-                walk_tip_sources.push(range_endpoint(spec, "...", false));
-                walk_tips.push(ours);
-                walk_tip_sources.push(range_endpoint(spec, "...", true));
-                for mb in repo.merge_bases_many(theirs, &[ours])? {
-                    walk_hidden.push(mb.detach());
+                let bases: Vec<ObjectId> = repo
+                    .merge_bases_many(theirs, &[ours])?
+                    .iter()
+                    .map(|c| c.detach())
+                    .collect();
+                if negated {
+                    walk_hidden.push(theirs);
+                    walk_hidden.push(ours);
+                    for mb in bases {
+                        walk_tips.push(mb);
+                        walk_tip_sources.push((*spec).to_string());
+                    }
+                } else {
+                    walk_tips.push(theirs);
+                    walk_tip_sources.push(range_endpoint(spec, "...", false));
+                    walk_tips.push(ours);
+                    walk_tip_sources.push(range_endpoint(spec, "...", true));
+                    walk_hidden.extend(bases);
                 }
             }
+            // `<rev>^@` is `add_parents_only()` with the plain flags: the parents enter
+            // the pending list positive, and nothing about them is UNINTERESTING, so
+            // `no_walk` survives and `git show HEAD^@` prints the parents themselves
+            // rather than walking their history. `--not` is what makes them exclusions.
             RevSpec::IncludeOnlyParents(id) => {
-                needs_walk = true;
-                let commit = repo.find_object(id)?.try_into_commit()?;
-                for p in commit.parent_ids() {
-                    walk_tips.push(p.detach());
-                    walk_tip_sources.push((*spec).to_string());
+                for p in parents_of(&repo, id)? {
+                    if negated {
+                        needs_walk = true;
+                        walk_hidden.push(p);
+                    } else {
+                        plain.push((*spec, p));
+                        walk_tips.push(p);
+                        walk_tip_sources.push((*spec).to_string());
+                    }
                 }
             }
         }
+    }
+    // Any `^<rev>` clears `revs->no_walk` (`add_pending_object_with_path`), so `cmd_show` hands
+    // the whole pending list to `cmd_log_walk` instead of printing the objects one by one. Both
+    // gates that list then passes — `check_single_commit`'s `deref_tag` and `handle_commit`'s tag
+    // loop — see through an annotated tag to the commit it names, on the positive and the negative
+    // side alike, which is why `git show v1 ^v1` prints nothing rather than the tag's own header.
+    if needs_walk {
+        for id in walk_tips.iter_mut().chain(walk_hidden.iter_mut()) {
+            if let Some(peeled) = repo
+                .find_object(*id)
+                .ok()
+                .and_then(|o| o.peel_tags_to_end().ok())
+            {
+                *id = peeled.id;
+            }
+        }
+    }
+    // What is left after that peel and is still not a commit — a tree, a blob — is an
+    // object for `--objects` to list, never a commit `handle_commit()` hands back to
+    // the walk, so `git show ^HEAD HEAD^{tree}` walks from nothing and prints nothing.
+    // `-L` is excluded because its own gate runs first: `check_single_commit()` dies
+    // naming the non-commit rather than quietly dropping it.
+    if needs_walk && !line_level {
+        let mut tips = Vec::with_capacity(walk_tips.len());
+        let mut sources = Vec::with_capacity(walk_tip_sources.len());
+        for (tip, source) in walk_tips.drain(..).zip(walk_tip_sources.drain(..)) {
+            if repo.find_object(tip).is_ok_and(|o| o.kind == Kind::Commit) {
+                tips.push(tip);
+                sources.push(source);
+            }
+        }
+        walk_tips = tips;
+        walk_tip_sources = sources;
     }
     // `--source` over a walk: resolve each reached commit's source with git's own
     // inheritance rule, shared with `git log --source`.
@@ -831,6 +948,16 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
         }
         Err(e) => Err(e.into()),
     }
+}
+
+/// The parents of the commit `id` names, for the `<rev>^@` and `<rev>^!` forms.
+///
+/// `add_parents_only()` peels the tag chain before it reads the parent list, so
+/// `v1^@` names the parents of the commit `v1` tags rather than failing on the tag
+/// object itself.
+fn parents_of(repo: &gix::Repository, id: ObjectId) -> Result<Vec<ObjectId>> {
+    let commit = repo.find_object(id)?.peel_tags_to_end()?.try_into_commit()?;
+    Ok(commit.parent_ids().map(|p| p.detach()).collect())
 }
 
 /// The name git records for one endpoint of a range argument under `--source`.

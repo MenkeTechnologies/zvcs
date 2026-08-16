@@ -52,6 +52,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use gix::hash::ObjectId;
+use gix::revision::walk::Sorting;
+use gix::traverse::commit::simple::CommitTimeOrder;
 
 /// Which of the two sequencer commands a todo list belongs to.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -96,6 +98,255 @@ impl TodoItem {
     /// The line `save_todo()` writes, without its newline.
     fn line(&self) -> String {
         format!("{} {} {}", self.action.todo_word(), self.abbrev, self.subject)
+    }
+}
+
+/// What a `cherry-pick`/`revert` command line selects, or the refusal it earns.
+///
+/// The three failure shapes are kept apart because git prints them from three
+/// different places, and the order it reports them in is observable: a bad
+/// revision (`setup_revisions`, 128) outranks an unknown option
+/// (`run_sequencer`, 129), which outranks a non-commit operand
+/// (`sequencer_pick_revisions`, 128).
+pub enum Revs {
+    /// The commits to replay, in replay order, and whether git's sequencer runs.
+    ///
+    /// `sequencer` is `sequencer_pick_revisions()`'s split: `false` selects
+    /// `single_pick()`, which writes no `.git/sequencer` at all.
+    Picks {
+        commits: Vec<ObjectId>,
+        sequencer: bool,
+    },
+    /// `setup_revisions()` could not resolve this operand, which it reports as
+    /// `fatal: bad revision '<spec>'` with status 128 the moment it reaches it.
+    BadRevision(String),
+    /// A pending object that is not commit-ish, named as it was written on the
+    /// command line. `sequencer_pick_revisions()` reports
+    /// `error: <name>: can't cherry-pick a <kind>` — that wording is fixed, so a
+    /// `revert` says "cherry-pick" too and only the `fatal: <action> failed`
+    /// tail differs — with status 128.
+    NotACommit {
+        name: String,
+        kind: gix::object::Kind,
+    },
+    /// A dash operand git's option table did not know. `setup_revisions()` keeps
+    /// it and `run_sequencer()` reports it as the usage block with status 129
+    /// once the whole list is scanned, so a bad revision anywhere outranks it.
+    UnknownOption,
+}
+
+/// git's `setup_revisions()` + `prepare_revs()` as `builtin/revert.c` drives
+/// them: turn the operand list into the commits to replay, in replay order.
+///
+/// `run_sequencer()` hands the operand list to `setup_revisions()` having set
+/// `revs->no_walk = 1` and `revs->unsorted_input = 1`, so a list of plain
+/// `<commit>` operands is taken as typed, in order, with no walk at all. What
+/// turns the walk on is an *uninteresting* pending object, because
+/// `add_pending_object_with_path()` clears `no_walk` for one — and `^<commit>`,
+/// the left side of `<a>..<b>` and the merge bases of `<a>...<b>` all queue one.
+/// So the spelling of the operands, not their number, decides between a list and
+/// a walk, and a single `<a>..<b>` walks while `<a> <b>` does not.
+///
+/// `prepare_revs()` then reverses a *pick* that walks:
+///
+/// ```text
+/// /*
+///  * picking (but not reverting) ranges (but not individual revisions)
+///  * should be done in reverse
+///  */
+/// if (opts->action == REPLAY_PICK && !opts->revs->no_walk)
+///         opts->revs->reverse ^= 1;
+/// ```
+///
+/// which is why `git cherry-pick <a>..<b>` replays oldest first — the only order
+/// in which the replayed commits apply to each other — while `git revert
+/// <a>..<b>` backs out newest first, and neither reverses a no-walk list.
+///
+/// A leading `-` operand is `run_sequencer()`'s `@{-1}` rewrite. It is applied to
+/// `argv[1]` alone, so a `-` anywhere else stays an unrecognized option.
+///
+/// The ranges are split here and everything else goes through `gix`'s rev-spec
+/// parser, which covers `^<commit>` and the `<a>^!`/`<a>^@` parent spellings.
+/// Two `handle_revision_arg` spellings stay unserved and are reported as
+/// refusals rather than approximated: `<a>^-[<n>]` (`gix` does not parse it, so
+/// it is a bad revision here while stock picks `<a>^..<a>`), and the
+/// `--not`/`--all` pseudo-revisions, which reach this port as unknown options.
+pub fn prepare_revs<S: AsRef<str>>(
+    repo: &gix::Repository,
+    specs: &[S],
+    action: Action,
+) -> Result<Revs> {
+    let mut include: Vec<ObjectId> = Vec::new();
+    let mut exclude: Vec<ObjectId> = Vec::new();
+    let mut walked = false;
+    let mut unknown_option = false;
+    // `single_pick()`'s test is on the command line, not on the selection:
+    // `cmdline.nr == 1 && whence == REV_CMD_REV && no_walk && !flags`. Only a
+    // plain `<commit>` operand carries `REV_CMD_REV`, so a `^`, a range or a
+    // parent spelling disqualifies it however few commits it ends up naming.
+    let mut plain_operands = 0usize;
+
+    for (n, spec) in specs.iter().enumerate() {
+        let spec = spec.as_ref();
+        let spec = if n == 0 && spec == "-" { "@{-1}" } else { spec };
+        // A dash-prefixed operand is not a revision: git keeps it as an
+        // unrecognized option and only reports it once the whole list is
+        // scanned, so a later bad revision still wins.
+        if spec.starts_with('-') {
+            unknown_option = true;
+            continue;
+        }
+
+        // `<a>...<b>`: both tips, with their merge bases excluded. Checked ahead
+        // of `..` because the two spellings share a prefix.
+        if let Some((lhs, rhs)) = spec.split_once("...") {
+            let (left, right) = match (peel_side(repo, lhs), peel_side(repo, rhs)) {
+                (Side::Commit(l), Side::Commit(r)) => (l, r),
+                (Side::NotACommit(name, kind), _) | (_, Side::NotACommit(name, kind)) => {
+                    return Ok(Revs::NotACommit { name, kind })
+                }
+                _ => return Ok(Revs::BadRevision(spec.to_owned())),
+            };
+            for base in repo.merge_bases_many(left, &[right])? {
+                exclude.push(base.detach());
+                walked = true;
+            }
+            include.push(left);
+            include.push(right);
+            continue;
+        }
+
+        // `<a>..<b>`: everything `<b>` reaches that `<a>` does not.
+        if let Some((lhs, rhs)) = spec.split_once("..") {
+            match (peel_side(repo, lhs), peel_side(repo, rhs)) {
+                (Side::Commit(from), Side::Commit(to)) => {
+                    exclude.push(from);
+                    include.push(to);
+                    walked = true;
+                }
+                (Side::NotACommit(name, kind), _) | (_, Side::NotACommit(name, kind)) => {
+                    return Ok(Revs::NotACommit { name, kind })
+                }
+                _ => return Ok(Revs::BadRevision(spec.to_owned())),
+            }
+            continue;
+        }
+
+        let Ok(parsed) = repo.rev_parse(spec) else {
+            return Ok(Revs::BadRevision(spec.to_owned()));
+        };
+        match *parsed {
+            gix::revision::plumbing::Spec::Include(id) => match peel_id(repo, id) {
+                Side::Commit(id) => {
+                    include.push(id);
+                    plain_operands += 1;
+                }
+                Side::NotACommit(_, kind) => {
+                    return Ok(Revs::NotACommit { name: spec.to_owned(), kind })
+                }
+                Side::Unresolved => return Ok(Revs::BadRevision(spec.to_owned())),
+            },
+            gix::revision::plumbing::Spec::Exclude(id) => match peel_id(repo, id) {
+                Side::Commit(id) => {
+                    exclude.push(id);
+                    walked = true;
+                }
+                Side::NotACommit(_, kind) => {
+                    return Ok(Revs::NotACommit { name: spec.to_owned(), kind })
+                }
+                Side::Unresolved => return Ok(Revs::BadRevision(spec.to_owned())),
+            },
+            // `<a>^!`: `<a>` itself, with everything its parents reach excluded.
+            gix::revision::plumbing::Spec::ExcludeParents(id) => {
+                let Side::Commit(id) = peel_id(repo, id) else {
+                    return Ok(Revs::BadRevision(spec.to_owned()));
+                };
+                include.push(id);
+                for parent in repo.find_commit(id)?.parent_ids() {
+                    exclude.push(parent.detach());
+                    walked = true;
+                }
+            }
+            // `<a>^@`: every parent of `<a>`, but not `<a>`.
+            gix::revision::plumbing::Spec::IncludeOnlyParents(id) => {
+                let Side::Commit(id) = peel_id(repo, id) else {
+                    return Ok(Revs::BadRevision(spec.to_owned()));
+                };
+                include.extend(repo.find_commit(id)?.parent_ids().map(|p| p.detach()));
+            }
+            // The range spellings are handled above; `gix` can only produce these
+            // for an operand that reached neither branch, which it cannot.
+            gix::revision::plumbing::Spec::Range { .. } | gix::revision::plumbing::Spec::Merge { .. } => {
+                return Ok(Revs::BadRevision(spec.to_owned()))
+            }
+        }
+    }
+
+    if unknown_option {
+        return Ok(Revs::UnknownOption);
+    }
+
+    if !walked {
+        // `add_pending_object()` sets `SEEN`, so an operand named twice is
+        // replayed once — but the operand count above was read before this, as
+        // git reads `cmdline.nr`.
+        let sequencer = !(specs.len() == 1 && plain_operands == 1);
+        let mut seen = std::collections::HashSet::new();
+        include.retain(|id| seen.insert(*id));
+        return Ok(Revs::Picks { commits: include, sequencer });
+    }
+
+    // `revs->unsorted_input` governs the *no-walk* list only; a real walk comes
+    // out of `limit_list()` in commit-date order, newest first, which is what
+    // decides how two commits with no ancestry between them interleave. Leaving
+    // `gix`'s graph-order default in place put `git cherry-pick <a>..<b> <side>`
+    // in an order stock never produces.
+    let mut commits = Vec::new();
+    let walk = repo
+        .rev_walk(include)
+        .with_hidden(exclude)
+        .sorting(Sorting::ByCommitTime(CommitTimeOrder::NewestFirst));
+    for info in walk.all()? {
+        commits.push(info?.id);
+    }
+    if action == Action::Pick {
+        commits.reverse();
+    }
+    // A walked selection always runs through the sequencer, even at length 1.
+    Ok(Revs::Picks { commits, sequencer: true })
+}
+
+/// What one revision word resolved to.
+enum Side {
+    Commit(ObjectId),
+    /// The object exists but nothing commit-ish is behind it; the name is kept
+    /// because git's diagnostic quotes the operand as written.
+    NotACommit(String, gix::object::Kind),
+    Unresolved,
+}
+
+/// One side of a range: git defaults an omitted side to `HEAD`.
+fn peel_side(repo: &gix::Repository, name: &str) -> Side {
+    let name = if name.is_empty() { "HEAD" } else { name };
+    let Ok(id) = repo.rev_parse_single(name) else {
+        return Side::Unresolved;
+    };
+    match peel_id(repo, id.detach()) {
+        Side::NotACommit(_, kind) => Side::NotACommit(name.to_owned(), kind),
+        other => other,
+    }
+}
+
+/// `lookup_commit_reference_gently()`: peel tags through to the commit, and
+/// report the object's own type when there is none.
+fn peel_id(repo: &gix::Repository, id: ObjectId) -> Side {
+    let Ok(object) = repo.find_object(id) else {
+        return Side::Unresolved;
+    };
+    let kind = object.kind;
+    match object.peel_to_commit() {
+        Ok(commit) => Side::Commit(commit.id),
+        Err(_) => Side::NotACommit(id.to_string(), kind),
     }
 }
 
@@ -528,6 +779,7 @@ pub fn delete_state_ref(repo: &gix::Repository, name: &str) -> bool {
                 change: gix::refs::transaction::Change::Delete {
                     expected: gix::refs::transaction::PreviousValue::MustExistAndMatch(current),
                     log: gix::refs::transaction::RefLog::AndReference,
+                    message: Default::default(),
                 },
                 name: reference.name().to_owned(),
                 deref: false,

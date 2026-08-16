@@ -54,6 +54,45 @@ fn disjoint_hidden_and_interesting() -> crate::Result {
     Ok(())
 }
 
+/// A tip that is *also* hidden, standing beside an older tip the hidden side reaches
+/// only further down — the shape `git show ^HEAD HEAD~2 HEAD^0` produces, where the
+/// same commit is named positively and negatively and a third argument names one of
+/// its ancestors. stock git prints nothing for it.
+///
+/// The fixture has one commit date for its whole history, so the priority queue that
+/// drives the painting cannot use time to keep the two colours in step: whether the
+/// hidden paint has reached the older tip by the time it comes off the queue is not
+/// something the order guarantees. The paint therefore has to keep travelling after
+/// the overlap is first hit, and has to hand `HIDDEN` back to ancestors it has
+/// already visited. Before that, this returned `c2` and everything below it.
+#[test]
+fn tip_that_is_also_hidden_beside_an_older_tip() -> crate::Result {
+    // The history is the one `same_date` snapshots: a merge `m1b1` over `c5` and the
+    // `branch1` lane, with a `c4..c1` trunk below both.
+    let repo_dir = fixture("make_traversal_repo_for_commits_same_date.sh")?;
+    let odb = odb_at(repo_dir.join(".git").join("objects"))?;
+
+    let merge = hex_to_id("01ec18a3ebf2855708ad3c9d244306bc1fae3e9b"); // m1b1
+    let c2 = hex_to_id("9902e3c3e8f0c569b4ab295ddf473e6de763e1e7");
+    let b1c1 = hex_to_id("9152eeee2328073cf23dcf8e90c949170b711659");
+
+    for sorting in all_sortings() {
+        // `c2` is an ancestor of the merge down the trunk…
+        let result = traverse_both([c2, merge], &odb, sorting, Parents::All, [merge])?;
+        assert!(
+            result.is_empty(),
+            "c2 is reachable from the hidden merge, sorting = {sorting:?}"
+        );
+        // …and `b1c1` is one down the branch lane.
+        let result = traverse_both([b1c1, merge], &odb, sorting, Parents::All, [merge])?;
+        assert!(
+            result.is_empty(),
+            "b1c1 is reachable from the hidden merge, sorting = {sorting:?}"
+        );
+    }
+    Ok(())
+}
+
 #[test]
 fn all_hidden() -> crate::Result {
     let (_repo_dir, odb) = named_fixture("make_repos.sh", "disjoint_branches")?;

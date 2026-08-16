@@ -3,9 +3,15 @@
 //! The build report is the one command whose output is a set of claims about
 //! the binary printing it, which makes it the easiest place in the port to lie
 //! and the hardest place to notice a lie. Stock's values are known
-//! (`libcurl: 8.7.1`, `zlib: 1.2.12`, `SHA-1: SHA1_DC`, `gettext: enabled`,
-//! `SHA-256: SHA256_BLK`) and pasting them in would turn a visibly-failing
-//! parity case into a silently-passing fabrication.
+//! (`libcurl: 8.7.1`, `zlib: 1.2.12`, `gettext: enabled`, `SHA-256: SHA256_BLK`)
+//! and pasting them in would turn a visibly-failing parity case into a
+//! silently-passing fabrication.
+//!
+//! `SHA-1: SHA1_DC` is the one value stock and this build share, and it is
+//! shared because it is true twice over, not because it was copied: the token is
+//! `hash.h`'s name for the collision-detecting backend, and this build's
+//! `sha1-checked` is that algorithm in git's own bail-out configuration. It is
+//! asserted against the dependency graph below for exactly that reason.
 //!
 //! So the assertions here are deliberately one-sided. They do not pin the exact
 //! text of the honest lines — those may legitimately change when the build does.
@@ -69,6 +75,14 @@ fn field<'a>(report: &'a str, name: &str) -> Option<&'a str> {
         .find_map(|l| l.strip_prefix(name)?.strip_prefix(' '))
 }
 
+/// The workspace lockfile: the resolved dependency graph this binary was built
+/// from, and the only thing that can say whether a component claim is still
+/// true. `src/extensions` is a workspace member, so the lock is two up.
+fn cargo_lock() -> String {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..").join("Cargo.lock");
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+}
+
 /// "The format of this string should be kept stable for compatibility with
 /// external projects that rely on the output of `git version`" — so the build
 /// report opens with exactly what plain `git version` prints, and
@@ -118,9 +132,44 @@ fn no_line_claims_a_component_this_build_does_not_link() {
         );
     }
     // The lines that *are* printed say what is true here rather than what stock
-    // says: this binary is Rust, and its SHA-1 is a crate, not a C backend.
+    // says: this binary is Rust where stock's is not.
     assert_eq!(field(&report, "rust:"), Some("enabled"));
-    assert_eq!(field(&report, "SHA-1:"), Some("sha1-checked"));
+    // `SHA-1:` is the one field where stock's token is also the true one.
+    // `SHA1_BACKEND` in `hash.h` names a backend *category* — the three
+    // non-detecting spellings all carry "(No collision detection)", `SHA1_DC`
+    // is the detecting one — and this build detects: `sha1-checked` implements
+    // `cr-marcstevens/sha1collisiondetection`, and `gix-hash` builds it with
+    // `safe_hash(false)`, git's bail-out configuration. Asserted through the
+    // dependency graph rather than as a bare string so the claim dies with the
+    // crate: drop `sha1-checked` and this fails instead of going stale.
+    assert_eq!(field(&report, "SHA-1:"), Some("SHA1_DC"));
+    assert!(
+        cargo_lock().contains("name = \"sha1-checked\""),
+        "SHA-1: SHA1_DC claims collision detection, but `sha1-checked` is no longer in the graph"
+    );
+}
+
+/// The flate line names a real crate at the version the build actually resolved,
+/// not a literal in the source: `build.rs` reads it out of the lockfile, so a
+/// hardcoded version could not survive a `cargo update`. Read back from the same
+/// lockfile here, which is what makes the number falsifiable.
+#[test]
+fn the_flate_line_is_the_version_the_lockfile_resolved() {
+    let dir = fixture("flate");
+    let report = stdout(&run(&dir, &["version", "--build-options"]));
+
+    let lock = cargo_lock();
+    let resolved = lock
+        .lines()
+        .skip_while(|l| l.trim() != "name = \"zlib-rs\"")
+        .take_while(|l| !l.trim_start().starts_with("[["))
+        .find_map(|l| l.trim().strip_prefix("version = \"")?.strip_suffix('"').map(str::to_string))
+        .expect("zlib-rs in the workspace lockfile");
+
+    // `(inflate only)` is not decoration: `zlib_rs` is reached from `gix-zlib`'s
+    // decompress path and nowhere else, while its deflate is an in-tree
+    // transcription. Dropping the qualifier would claim the encoder too.
+    assert_eq!(field(&report, "zlib-rs:"), Some(format!("{resolved} (inflate only)").as_str()));
 }
 
 /// `porcelain::init` rejects `--ref-format=reftable` and

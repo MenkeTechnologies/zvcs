@@ -40,9 +40,11 @@
 //!     `<html-path>/<page>.html` (honoring `help.htmlpath`, and taking a `://`
 //!     path on trust as git does), dying `'%s/%s.html': documentation file not
 //!     found.` when it is absent, then `open_html()` hands the path to
-//!     `git web--browse -c help.browser`. The HTML set the lookup lands in is
+//!     `git web--browse -c help.browser`. The set the lookup lands in is the
+//!     git installation's own HTML manual when the host has one — the same
+//!     deferral the man-page path makes to the system `man` — and otherwise
 //!     [`crate::superset::htmldoc`], generated from the same tables the rest of
-//!     this module prints.
+//!     this module prints. See that module for how the installed set is found.
 //!   * `help.format` (`man`/`info`/`web`/`html`, with git's
 //!     `unrecognized help format '%s'` on anything else) and `help.htmlpath`,
 //!     read after the command line so an explicit `-m`/`-w`/`-i` still wins.
@@ -2251,21 +2253,23 @@ fn help_config() -> Result<HelpConfig, ExitCode> {
 /// `show_html_page()`: resolve the page's path, then open it in a browser.
 ///
 /// git's HTML manual is laid down by `make install`, so the stat in
-/// [`get_html_page_path`] finds a file that the installation put there. This
-/// port is a single binary with no install step, so the page is materialized
-/// first, from the same tables the man pages come from — `git zshadow` and
-/// `git zdashed` write the whole set up front, and this covers the case where
-/// neither has been run. A page that cannot be written (a topic outside the
-/// documented set, an unwritable `$ZVCS_HOME`) falls through to git's own stat,
-/// which gives exactly the answer stock gives for a missing file. A configured
-/// `help.htmlpath` is the user's own tree and is never written to.
+/// [`get_html_page_path`] finds a file that the installation put there. A host
+/// carrying a git installation therefore already has the real manual, and that
+/// is the page this opens — the same deferral `git help <cmd>` makes when it
+/// hands the page name to the system `man`. Only what no git installation holds
+/// (the superset verbs, and every page on a host with no git documentation) is
+/// served from the set this binary generates, which is materialized here for the
+/// case where neither `git zshadow` nor `git zdashed` has written it up front.
+///
+/// A page that can be found in neither (a topic outside both sets, an unwritable
+/// `$ZVCS_HOME`) falls through to git's own stat, which gives exactly the answer
+/// stock gives for a missing file. A configured `help.htmlpath` replaces the
+/// whole lookup: it is the user's own tree, so it is neither searched past nor
+/// written to.
 fn show_html_page(topic: &str, configured: Option<&str>) -> Result<ExitCode> {
     let Some(page) = resolve_page(topic)? else {
         return Ok(ExitCode::SUCCESS);
     };
-    if configured.is_none() {
-        let _ = crate::superset::htmldoc::ensure_page(&page);
-    }
     let path = match get_html_page_path(&page, configured) {
         Ok(path) => path,
         Err(code) => return Ok(code),
@@ -2276,10 +2280,21 @@ fn show_html_page(topic: &str, configured: Option<&str>) -> Result<ExitCode> {
 /// `get_html_page_path()` verbatim: `help.htmlpath` when set, else
 /// `system_path(GIT_HTML_PATH)`. A path holding `://` is a URL git cannot stat,
 /// so it is taken on trust; anything else must name a regular file or git dies.
+///
+/// `system_path(GIT_HTML_PATH)` is compiled into stock git; here it is the
+/// installed set [`crate::superset::htmldoc::installed_dir_for`] finds, and the
+/// generated set when there is none — the directory named in the
+/// `documentation file not found.` message is then the one that was searched.
 fn get_html_page_path(page: &str, configured: Option<&str>) -> Result<String, ExitCode> {
     let path = match configured {
         Some(p) => p.to_string(),
-        None => crate::superset::htmldoc::html_dir().display().to_string(),
+        None => match crate::superset::htmldoc::installed_dir_for(page) {
+            Some(dir) => dir.display().to_string(),
+            None => {
+                let _ = crate::superset::htmldoc::ensure_page(page);
+                crate::superset::htmldoc::html_dir().display().to_string()
+            }
+        },
     };
     if !path.contains("://") {
         let file = Path::new(&path).join(format!("{page}.html"));

@@ -1963,7 +1963,11 @@ fn query_ref_map(repo: &gix::Repository, name: &str) -> Result<gix::remote::fetc
         gix::remote::Direction::Fetch,
         // `git remote` has no `--ipv4`/`--ipv6`.
         gix::remote::connect::Options {
-            upload_pack,
+            upload_pack: super::fetch::local_service_program(
+                remote.url(gix::remote::Direction::Fetch),
+                upload_pack,
+                "upload-pack",
+            ),
             ..Default::default()
         },
     )?;

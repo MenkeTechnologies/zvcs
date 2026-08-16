@@ -147,6 +147,52 @@ pub fn write_tree(args: &[String]) -> Result<ExitCode> {
 
     // An absent index file is an empty index, and yields git's empty-tree id.
     let index = repo.index_or_empty()?;
+
+    let tree_id = match tree_from_index(&repo, &index, missing_ok)? {
+        Ok(id) => id,
+        Err(code) => return Ok(ExitCode::from(code)),
+    };
+
+    // `--prefix` selects a sub-tree of what was just written; the trees are on
+    // disk either way, exactly as with stock git when the prefix does not exist.
+    let out_id = match prefix.as_deref() {
+        None => tree_id,
+        Some(p) if p.trim_end_matches('/').is_empty() => tree_id,
+        Some(p) => {
+            let root = repo.find_tree(tree_id)?;
+            // `Path::components` drops the documented trailing slash for us.
+            let entry = root.lookup_entry_by_path(std::path::Path::new(p))?;
+            match entry {
+                Some(e) if e.mode().is_tree() => e.object_id(),
+                _ => {
+                    eprintln!("fatal: git-write-tree: prefix {p} not found");
+                    return Ok(ExitCode::from(128));
+                }
+            }
+        }
+    };
+
+    println!("{out_id}");
+    Ok(ExitCode::SUCCESS)
+}
+
+/// The tree `index` names, with every tree object beneath it written into
+/// `repo`'s odb — `cmd_write_tree()`'s call into `write_index_as_tree()`, minus
+/// the `--prefix` lookup and the printing, which are the caller's.
+///
+/// `Err(code)` is the exit status stock git leaves after printing the same
+/// diagnostics this prints: the per-entry `unmerged` lines, or the `invalid
+/// object` line for an entry whose blob is not in the odb.
+///
+/// Shared rather than duplicated because `filter-branch` needs exactly this and
+/// nothing else — the script's `tree=$(git write-tree)` is a bare `write-tree`
+/// over the scratch index — and it runs it once per rewritten commit, where a
+/// re-execution of this binary is pure per-commit latency.
+pub(super) fn tree_from_index(
+    repo: &gix::Repository,
+    index: &gix::index::State,
+    missing_ok: bool,
+) -> Result<std::result::Result<gix::ObjectId, u8>> {
     let backing = index.path_backing();
 
     // One pass in index (path) order, mirroring `cache_tree_update`: report
@@ -179,17 +225,14 @@ pub fn write_tree(args: &[String]) -> Result<ExitCode> {
 
         // git checks odb presence for everything but gitlinks, whose commits
         // legitimately live in the submodule's own object database.
-        if !missing_ok
-            && !entry.mode.is_submodule()
-            && repo.try_find_header(entry.id)?.is_none()
-        {
+        if !missing_ok && !entry.mode.is_submodule() && repo.try_find_header(entry.id)?.is_none() {
             eprintln!(
                 "error: invalid object {} {} for '{path}'",
                 octal(mode),
                 entry.id
             );
             eprintln!("fatal: git-write-tree: error building trees");
-            return Ok(ExitCode::from(128));
+            return Ok(Err(128));
         }
 
         editor.upsert(
@@ -201,33 +244,11 @@ pub fn write_tree(args: &[String]) -> Result<ExitCode> {
 
     if unmerged > 0 {
         eprintln!("fatal: git-write-tree: error building trees");
-        return Ok(ExitCode::from(128));
+        return Ok(Err(128));
     }
 
     // Writes the root tree and every sub-tree beneath it into the odb.
-    let tree_id = editor.write(|tree| repo.write_object(tree).map(|id| id.detach()))?;
-
-    // `--prefix` selects a sub-tree of what was just written; the trees are on
-    // disk either way, exactly as with stock git when the prefix does not exist.
-    let out_id = match prefix.as_deref() {
-        None => tree_id,
-        Some(p) if p.trim_end_matches('/').is_empty() => tree_id,
-        Some(p) => {
-            let root = repo.find_tree(tree_id)?;
-            // `Path::components` drops the documented trailing slash for us.
-            let entry = root.lookup_entry_by_path(std::path::Path::new(p))?;
-            match entry {
-                Some(e) if e.mode().is_tree() => e.object_id(),
-                _ => {
-                    eprintln!("fatal: git-write-tree: prefix {p} not found");
-                    return Ok(ExitCode::from(128));
-                }
-            }
-        }
-    };
-
-    println!("{out_id}");
-    Ok(ExitCode::SUCCESS)
+    Ok(Ok(editor.write(|tree| repo.write_object(tree).map(|id| id.detach()))?))
 }
 
 /// git's parse-options failure shape: `error: <msg>` then the usage block on

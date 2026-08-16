@@ -14,13 +14,14 @@
 //! `repack.useDeltaBaseOffset` (default true, as in git) decides whether a delta
 //! names its base by pack offset or by object id.
 //!
-//! The bytes still differ from git's: objects are enumerated in this module's
-//! own order rather than git's `compute_write_order()`, and no delta is ever
-//! reused from an existing pack. Since a pack's filename embeds its checksum,
-//! the name differs too. What the pack *is* is valid, complete and comparable in
-//! size, with a correct `.idx` and `.rev` beside it. `-f` and `-F`, which exist
-//! only to control delta *reuse*, therefore still have nothing to control and
-//! are accepted as no-ops.
+//! The bytes still differ from git's, because objects are enumerated in this
+//! module's own order rather than git's `compute_write_order()`; since a pack's
+//! filename embeds its checksum, the name differs too. What the pack *is* is
+//! valid, complete and comparable in size, with a correct `.idx` and `.rev`
+//! beside it. `-f` *is* honoured — it becomes `pack-objects --no-reuse-delta`,
+//! which the writer acts on, because deltas are otherwise kept from the pack
+//! they are already in. `-F` controls reuse of a stored entry's *bytes*, which
+//! this writer never does, so it is accepted as a no-op.
 //!
 //! # Argument surface
 //!
@@ -337,6 +338,8 @@ struct State {
     /// finally falls back to "only when everything goes into one pack in a bare
     /// repository".
     write_bitmap: Option<bool>,
+    /// `-f`: `po_args.no_reuse_delta`, passed on as `--no-reuse-delta`.
+    no_reuse_delta: bool,
     write_midx: bool,
     /// `--write-midx=incremental`, which asks for a MIDX *chain* rather than a
     /// single `multi-pack-index`. Tracked separately so it can be refused.
@@ -549,6 +552,7 @@ fn execute(st: &State) -> Result<ExitCode> {
             write_rev,
             progress,
             write_bitmaps(st, &repo),
+            st.no_reuse_delta,
         )?
     };
 
@@ -569,7 +573,7 @@ fn execute(st: &State) -> Result<ExitCode> {
         } else {
             // No bitmap: a bitmap describes a reachability closure, and this pack
             // is deliberately a fragment of one.
-            write_pack(&repo, &filtered_out, &dir, write_rev, progress, false)?;
+            write_pack(&repo, &filtered_out, &dir, write_rev, progress, false, st.no_reuse_delta)?;
         }
     }
 
@@ -650,6 +654,7 @@ fn write_pack(
     write_rev: bool,
     progress: bool,
     write_bitmap: bool,
+    no_reuse_delta: bool,
 ) -> Result<PathBuf> {
     let allow_ofs_delta = repo
         .config_snapshot()
@@ -668,6 +673,7 @@ fn write_pack(
             allow_ofs_delta,
             progress,
             use_delta_islands,
+            no_reuse_delta,
             ..super::pack_objects::WriteOptions::default()
         },
     )?;
@@ -1305,11 +1311,16 @@ fn short_opts(cluster: &str, args: &[String], i: &mut usize, st: &mut State) -> 
             'd' => st.delete_redundant = true,
             'n' => st.no_server_info = true,
             'q' => st.quiet = true,
-            // `-f`/`-F` control delta *reuse* and `-l` scopes the search to
-            // local packs; nothing here reuses a pack entry, so both describe a
-            // behaviour this writer already has. `-i` enables delta islands,
-            // which are not modelled.
-            'f' | 'F' | 'l' | 'i' => {}
+            // `po_args.no_reuse_delta`, which `prepare_pack_objects()` turns
+            // into `pack-objects --no-reuse-delta` (`repack.c:27-28`): every
+            // delta is searched for afresh instead of being kept from the pack
+            // it is already in.
+            'f' => st.no_reuse_delta = true,
+            // `-F` controls *object* reuse — copying a stored entry's bytes —
+            // which this writer never does, so it already behaves as asked.
+            // `-l` scopes the search to local packs and `-i` enables delta
+            // islands; neither is modelled.
+            'F' | 'l' | 'i' => {}
             'g' => {
                 // The remainder of the cluster is the value, else the next argv.
                 let rest: String = chars[c + 1..].iter().collect();

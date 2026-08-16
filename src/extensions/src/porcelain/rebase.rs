@@ -1617,9 +1617,25 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
         hidden.push(fp);
     }
     let mut replay_range: Vec<ObjectId> = Vec::new();
+    let mut replay_parents: HashMap<ObjectId, Vec<ObjectId>> = HashMap::new();
     for info in repo.rev_walk([head_oid]).with_hidden(hidden).all()? {
-        replay_range.push(info?.id);
+        let info = info?;
+        replay_parents.insert(info.id, info.parent_ids.to_vec());
+        replay_range.push(info.id);
     }
+    // `sequencer_make_script()` sets `revs.topo_order = 1` with
+    // `revs.sort_order = REV_SORT_IN_GRAPH_ORDER`, so the walk's output is
+    // re-sorted topologically through a LIFO stack before anything is dropped
+    // from it. That sort is what keeps a side branch contiguous, and it decides
+    // which of two commits with no ancestry between them is replayed first:
+    // `sort_in_topological_order()` drains a merge's parents last-pushed-first,
+    // so the *second* parent's side comes out ahead of the first parent's and
+    // the reversal below puts the first-parent side back in front.
+    //
+    // The whole list is sorted, merges included; `revs.max_parents = 1` drops
+    // them at output time (below), after the sort has already used them to
+    // order what stays.
+    let replay_range = super::rev_list::topo_sort(&replay_range, &replay_parents, None);
     // `sequencer_make_script()` walks with `revs.max_parents = 1` unless
     // `--rebase-merges` asked for the merge structure to be recreated: a merge
     // commit has no single patch to replay, and `pick` refuses one outright. git

@@ -885,9 +885,19 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     // prefix (`refs/heads/`) that the filter handles correctly.
     // The transport-level knobs. `remote.<name>.uploadpack`/`serverOption` cannot apply here: the remote is
     // being created by this very clone, so only the command line can supply them.
-    if upload_pack.is_some() || address_family.is_some() {
+    // Cloning a local path runs this binary's own `upload-pack` rather than
+    // whatever `PATH` resolves the bare name to; see
+    // [`super::fetch::local_service_program`]. That makes the option set
+    // non-empty for every local clone, so the previous guard — which only
+    // applied connect options when the command line carried one — is gone.
+    let clone_upload_pack = super::fetch::local_service_program(
+        Some(&url),
+        upload_pack.as_deref().map(Into::into),
+        "upload-pack",
+    );
+    if clone_upload_pack.is_some() || address_family.is_some() {
         prepare = prepare.with_connect_options(gix::remote::connect::Options {
-            upload_pack: upload_pack.as_deref().map(Into::into),
+            upload_pack: clone_upload_pack.clone(),
             address_family,
             // `git clone` never connects for push.
             receive_pack: None,
@@ -910,7 +920,7 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
         let explicit_origin = origin.clone();
         let single_outcome = single_outcome.clone();
         let probe_connect = gix::remote::connect::Options {
-            upload_pack: upload_pack.as_deref().map(Into::into),
+            upload_pack: clone_upload_pack.clone(),
             address_family,
             // `git clone` never connects for push.
             receive_pack: None,

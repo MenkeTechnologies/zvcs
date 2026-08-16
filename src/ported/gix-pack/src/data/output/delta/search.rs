@@ -165,7 +165,11 @@ impl Islands {
     /// An unmarked target may delta against anything, since nothing serves it
     /// on its own. An unmarked *base* is refused outright, since a marked
     /// target would then depend on an object no island guarantees is present.
-    fn in_same_island(&self, trg: usize, src: usize) -> bool {
+    ///
+    /// Public because git asks it from two places: the window scan in
+    /// `try_delta()`, and `can_reuse_delta()` before it keeps a delta an
+    /// existing pack already holds.
+    pub fn in_same_island(&self, trg: usize, src: usize) -> bool {
         if self.marks.is_empty() {
             return true;
         }
@@ -225,6 +229,15 @@ fn type_rank(kind: gix_object::Kind) -> u8 {
 /// Search `objects` for deltas and return, for each of them, the delta chosen
 /// or `None` if it stays a base object.
 ///
+/// `already_deltified` is git's first test in `should_attempt_deltas()`:
+/// `if (DELTA(entry)) return 0`, which holds for an object whose delta was
+/// reused from an existing pack by `check_object()`. Such an object is left out
+/// of the sorted list entirely, so it neither gets searched nor ever occupies a
+/// window slot — the latter is what keeps a searched delta from choosing a
+/// reused delta as its base and closing a cycle. An empty slice means nothing
+/// was reused, which is the `--no-reuse-delta` case and the shape every caller
+/// with no pack to reuse from passes.
+///
 /// `new_state` is called once per thread to build whatever an object read needs
 /// (an object database handle, typically); `read` then fetches one object's
 /// bytes, returning `None` for an object that cannot be read, which is skipped
@@ -233,6 +246,7 @@ pub fn find_deltas<S, New, Read>(
     objects: &[Object],
     islands: &Islands,
     options: &Options,
+    already_deltified: &[bool],
     mut new_state: New,
     read: Read,
 ) -> Vec<Option<Delta>>
@@ -250,6 +264,7 @@ where
     // into the order the window slides over.
     let mut list: Vec<usize> = (0..objects.len())
         .filter(|&i| objects[i].size >= MIN_SIZE_FOR_DELTA)
+        .filter(|&i| !already_deltified.get(i).copied().unwrap_or(false))
         .collect();
     if list.len() < 2 {
         return out;
@@ -694,6 +709,7 @@ mod tests {
             objects,
             &super::Islands::default(),
             options,
+            &[],
             || (),
             |(), oid| {
                 let n = u32::from_be_bytes(oid.as_bytes()[..4].try_into().expect("4 bytes")) as usize;
@@ -824,7 +840,7 @@ mod tests {
         };
 
         let unrestricted = search(&objects, &bodies, &options);
-        let restricted = find_deltas(&objects, &islands, &options, || (), |(), oid| {
+        let restricted = find_deltas(&objects, &islands, &options, &[], || (), |(), oid| {
             let n = u32::from_be_bytes(oid.as_bytes()[..4].try_into().expect("4 bytes")) as usize;
             bodies.get(n).cloned()
         });
@@ -862,6 +878,7 @@ mod tests {
                 threads: 1,
                 ..Options::default()
             },
+            &[],
             || (),
             |(), oid| {
                 let n = u32::from_be_bytes(oid.as_bytes()[..4].try_into().expect("4 bytes")) as usize;

@@ -2,10 +2,18 @@
 //!
 //! `show_html_page()` stats `<html-path>/<page>.html` and dies when the file is
 //! missing, so in stock git `git help -w status` works only because `make
-//! install` laid an HTML manual down beside the binary. This port has no install
-//! step and no asciidoc toolchain, so the set is generated here — from the
-//! tables that are already the source of truth for the rest of `git help`, never
-//! from a second list:
+//! install` laid an HTML manual down beside the binary. Where that manual is
+//! present this port opens *it* — see [`installed_dir_for`]: a stock command's
+//! HTML page is git's own asciidoc manual, exactly as `git help status` opens
+//! git's own roff manual through the system `man` rather than a page this
+//! binary writes. Reproducing the asciidoc prose would be a second, drifting
+//! copy of documentation the git installation already carries.
+//!
+//! The generated set below is the fallback for everything that installation
+//! does not hold: the superset (`z*`) verbs, which exist only in this binary,
+//! and every page at all on a host with no git documentation installed. It is
+//! built from the tables that are already the source of truth for the rest of
+//! `git help`, never from a second list:
 //!
 //!   * [`crate::porcelain::help::topics`] — every command and documentation
 //!     topic in the `command-list` blocks `git help -a` and `git help -g` print,
@@ -28,7 +36,8 @@
 //! is generated at startup, and nothing is read until a page is asked for.
 
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 use crate::porcelain::help;
 use crate::superset::manpage::{self, html_esc as esc, html_inline as inline};
@@ -60,6 +69,85 @@ pub fn html_dir() -> PathBuf {
         .join("share")
         .join("doc")
         .join("git-doc")
+}
+
+/// The installed git documentation directory holding `<page>.html`, when the
+/// host has one — the directory stock git's `system_path(GIT_HTML_PATH)` names.
+///
+/// git compiles that path in; a shadow binary cannot, so it is derived from the
+/// *installed man page for the same page*. That is deliberate rather than a
+/// probe of likely prefixes: `git help <cmd>` already resolves through the
+/// system `man`, so anchoring the HTML lookup to the file `man -w <page>` names
+/// guarantees the two viewers show the same installation's manual, and a host
+/// with no git man pages is exactly a host with no git HTML pages.
+///
+/// `make install` lays the two sets down as siblings under one prefix
+/// (`<prefix>/share/man/man<n>` and `<prefix>/share/doc/git-doc`), so the
+/// candidates below walk out of the man section directory and back down into
+/// `doc/git-doc`. Every candidate is confirmed by stat'ing `<page>.html` inside
+/// it, so a wrong guess is a miss and never a wrong path.
+pub fn installed_dir_for(page: &str) -> Option<PathBuf> {
+    let man_page = installed_man_page(page)?;
+    let section_dir = man_page.parent()?;
+    // The symlinked path first (a package manager's `<prefix>/share/man` link
+    // farm keeps its `doc` sibling), then the file it resolves to (the real
+    // versioned install directory), which is where an unlinked farm leads.
+    let resolved = man_page.canonicalize().ok();
+    let roots = [Some(section_dir), resolved.as_deref().and_then(Path::parent)];
+    for root in roots.into_iter().flatten() {
+        for relative in [
+            "../../doc/git-doc",
+            "../../share/doc/git-doc",
+            "../../../share/doc/git-doc",
+        ] {
+            let dir = root.join(relative);
+            if dir.join(format!("{page}.html")).is_file() {
+                return Some(normalize(&dir));
+            }
+        }
+    }
+    None
+}
+
+/// The directory `git --html-path` reports: the installed set when this host has
+/// one, else the generated set under [`html_dir`]. `git.html` is the page every
+/// git installation carries, so it is what the presence of a set is asked with.
+pub fn reported_dir() -> PathBuf {
+    installed_dir_for(INDEX).unwrap_or_else(html_dir)
+}
+
+/// `man -w <page>` — the path of the installed man page, or `None` when the host
+/// has no `man`, no such page, or a `man` that does not implement `-w`.
+fn installed_man_page(page: &str) -> Option<PathBuf> {
+    let out = Command::new("man")
+        .arg("-w")
+        .arg(page)
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    // `man -w` prints one path per match; the first is the one `man <page>`
+    // would open.
+    let first = String::from_utf8(out.stdout).ok()?;
+    let first = first.lines().next()?.trim();
+    (!first.is_empty()).then(|| PathBuf::from(first))
+}
+
+/// Fold the `..` components the candidate paths are built from, so the directory
+/// reported to the user reads as an installation path rather than a walk.
+/// Purely lexical: the components are ours, and the result is already stat'ed.
+fn normalize(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for part in path.components() {
+        if part.as_os_str() == ".." {
+            out.pop();
+        } else {
+            out.push(part);
+        }
+    }
+    out
 }
 
 /// Every page in the set, index last so it can count the rest.

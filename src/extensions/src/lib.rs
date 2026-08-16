@@ -164,8 +164,13 @@ fn run_command() -> ExitCode {
             // port's is `$ZVCS_HOME`, which is where its man pages, HTML pages and
             // info tree are installed — the same paths `git help -m/-w/-i` resolve
             // against, so a scripted `git --html-path` and `git help -w` agree.
+            //
+            // `--html-path` is the one that can name a directory outside that
+            // prefix: `git help -w <cmd>` opens the git installation's own HTML
+            // manual where the host has one, so that is the directory reported,
+            // and the generated set only when it does not.
             "--html-path" => {
-                println!("{}", superset::htmldoc::html_dir().display());
+                println!("{}", superset::htmldoc::reported_dir().display());
                 return ExitCode::SUCCESS;
             }
             "--man-path" => {

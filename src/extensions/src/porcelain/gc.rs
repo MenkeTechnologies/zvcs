@@ -107,9 +107,8 @@
 //! `pack-objects` arguments for the cruft child; see [`cruft_delta_options`].
 //!
 //! The bytes still differ from git's, because objects are enumerated in this
-//! module's own order rather than git's `compute_write_order()` and no delta is
-//! ever reused from an existing pack — so the checksum embedded in a pack's
-//! filename differs too. What is reproduced is the *object storage layout* —
+//! module's own order rather than git's `compute_write_order()` — so the
+//! checksum embedded in a pack's filename differs too. What is reproduced is the *object storage layout* —
 //! which objects end up loose, which end up packed, how many packs and sidecars
 //! exist, and that every one of them is well-formed. `git fsck`,
 //! `git verify-pack` and `git cat-file` all accept the result.
@@ -126,7 +125,9 @@
 //!      size limit. They are accepted, and `--max-cruft-size` (with its
 //!      `gc.maxCruftSize` default) still warns below git's 1 MiB floor.
 //!      `--aggressive` *is* honoured: it widens the delta search to
-//!      `gc.aggressiveWindow` and `gc.aggressiveDepth`.
+//!      `gc.aggressiveWindow` and `gc.aggressiveDepth`, and passes the `-f`
+//!      git's own `--aggressive` pushes, so no delta is kept from an existing
+//!      pack.
 //!
 //! `--detach` is accepted and always ignored: this port runs synchronously, so
 //! the work is complete by the time `gc` returns rather than shortly after.
@@ -593,6 +594,11 @@ fn delta_options(
         ..super::pack_objects::WriteOptions::default()
     };
     if aggressive {
+        // `strvec_push(&repack_args, "-f")` (builtin/gc.c:920), which reaches
+        // `pack-objects` as `--no-reuse-delta`: the point of `--aggressive` is
+        // to search every pair again rather than keep the deltas already on
+        // disk, and a widened window that reused them would not use it.
+        options.no_reuse_delta = true;
         let positive = |key: &str, default: i64| {
             let value = snapshot.integer(key).unwrap_or(default);
             usize::try_from(value).ok().filter(|n| *n > 0)

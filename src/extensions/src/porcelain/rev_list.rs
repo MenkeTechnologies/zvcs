@@ -1766,7 +1766,7 @@ fn dedup_in_place(ids: &mut Vec<ObjectId>) {
 /// is what `--topo-order` and the boundary list use. `Some(dates)` is
 /// `REV_SORT_BY_COMMIT_DATE` for `--date-order`: a priority queue that takes the
 /// newest ready commit, with insertion order breaking equal timestamps.
-fn topo_sort(
+pub(crate) fn topo_sort(
     commits: &[ObjectId],
     parents_of: &HashMap<ObjectId, Vec<ObjectId>>,
     dates: Option<&HashMap<ObjectId, i64>>,

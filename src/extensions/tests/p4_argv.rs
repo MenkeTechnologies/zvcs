@@ -9,14 +9,22 @@
 //! `printUsage()` and exit 2 directly. Everything lands on stdout; stderr stays
 //! empty.
 //!
-//! The banner interpolates `sys.argv[0]`, the `git-p4` git resolved out of its
-//! exec-path, which is per-installation and is therefore what these tests pin
-//! down: the resolution order (exec-path, then `PATH`), the executable-bit test
-//! that skips a candidate, and the spelling used when nothing is found. Every
+//! The banner interpolates `sys.argv[0]`, the `git-p4` that printed it. Stock
+//! ships `git-p4` inside its exec-path and `setup_path()` prepends the exec-path
+//! to `PATH`, so every banner stock can print reads `<exec-path>/git-p4`. The
+//! shadow serves `p4` from this binary (`p4` is a dispatcher verb, so
+//! `run_argv`'s external arm is never reached) and its own `git-p4` is the
+//! `git zdashed` symlink in its exec-path, so the same spelling is the honest
+//! one — see `porcelain::p4::prog_path`.
+//!
+//! That is what these tests pin down: the banner names the shadow's *own*
+//! exec-path, and nothing on `PATH` can move it. A `git-p4` belonging to some
+//! other installation is not a program this binary would ever exec, so
+//! attributing the output to it would be a lie — and, on a developer machine
+//! whose `PATH` holds an installed shadow, a machine-dependent one. Every
 //! expectation is the text stock git 2.55.0 printed for the same argv with its
-//! own path substituted, and every run gets a `PATH` and a `HOME` built inside
-//! the fixture — nothing here reads the machine's `PATH`, so a `git-p4` sitting
-//! in a real install cannot change an answer.
+//! own exec-path substituted, and every run gets a `PATH` and a `HOME` built
+//! inside the fixture.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -59,7 +67,7 @@ impl Fixture {
     }
 
     /// A `git-p4` inside `dir` with the given mode, and its path. The contents
-    /// never run: only `access(X_OK)` looks at this file.
+    /// never run — these files exist to prove the banner ignores them.
     fn helper(dir: &Path, mode: u32) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let path = dir.join("git-p4");
@@ -154,11 +162,12 @@ fn an_unknown_subcommand_is_echoed_in_the_message() {
 }
 
 // ---------------------------------------------------------------------------
-// sys.argv[0] — how git resolves the helper it execs
+// sys.argv[0] — the program the banner names
 // ---------------------------------------------------------------------------
 
 /// `setup_path()` prepends the exec-path to `PATH`, so an exec-path helper wins
-/// over one that `PATH` also offers.
+/// over one that `PATH` also offers — the case where the shadow's spelling and
+/// stock's resolution agree by construction.
 #[test]
 fn the_exec_path_helper_wins_over_one_on_path() {
     let f = Fixture::new("execwins");
@@ -170,78 +179,91 @@ fn the_exec_path_helper_wins_over_one_on_path() {
     assert_eq!((code, stdout), (2, usage_block(&prog)));
 }
 
-/// With no helper in the exec-path, `locate_in_PATH()` keeps looking and the
-/// banner names the `PATH` entry that has one.
+/// The regression the differential harness caught: an *executable* `git-p4`
+/// on `PATH`, outside the exec-path, must not be named. Stock would exec such a
+/// script and report it as `sys.argv[0]`; the shadow never execs it — `p4` is a
+/// dispatcher verb it serves itself — so naming it would credit output to a
+/// program that did not run. On a machine whose `PATH` holds an installed
+/// shadow (`~/.zvcs/bin`) this is also what made the banner machine-dependent
+/// while stock's stayed rooted at its own exec-path.
 #[test]
-fn a_path_entry_is_used_when_the_exec_path_has_no_helper() {
+fn a_helper_on_path_outside_the_exec_path_is_not_named() {
     let f = Fixture::new("pathfallback");
     let exec = f.dir("exec");
     let elsewhere = f.dir("elsewhere");
-    let prog = Fixture::helper(&elsewhere, 0o755);
+    Fixture::helper(&elsewhere, 0o755);
     let (code, stdout, _) = f.run(Some(&exec), &[&exec, &elsewhere], &[]);
-    assert_eq!((code, stdout), (2, usage_block(&prog)));
+    assert_eq!((code, stdout), (2, usage_block(&exec.join("git-p4"))));
 }
 
-/// `locate_in_PATH()` accepts a candidate on git's `is_executable()`, so a file
-/// of the right name that cannot be executed is passed over rather than named.
+/// The whole banner is a function of the exec-path alone: the same argv under
+/// two very different `PATH`s — one strewn with candidate helpers, one holding
+/// only an empty directory — is byte-identical. Asserted as an equality between
+/// two runs rather than against a literal, so it keeps holding whatever the
+/// spelling becomes.
 #[test]
-fn a_non_executable_candidate_is_skipped() {
-    let f = Fixture::new("noexec");
+fn the_banner_does_not_change_with_path_contents() {
+    let f = Fixture::new("pathindep");
     let exec = f.dir("exec");
-    let unusable = f.dir("unusable");
+    let empty = f.dir("empty");
     let usable = f.dir("usable");
-    Fixture::helper(&unusable, 0o644);
-    let prog = Fixture::helper(&usable, 0o755);
-    let (code, stdout, _) = f.run(Some(&exec), &[&exec, &unusable, &usable], &[]);
-    assert_eq!((code, stdout), (2, usage_block(&prog)));
+    Fixture::helper(&usable, 0o755);
+    let bare = f.run(Some(&exec), &[&empty], &[]);
+    let crowded = f.run(Some(&exec), &[&usable, &exec, &empty], &[]);
+    assert_eq!(bare, crowded);
+    assert_eq!(bare, (2, usage_block(&exec.join("git-p4")), String::new()));
 }
 
-/// `is_executable()` reads the *owner* execute bit, so group and other bits do
-/// not qualify a candidate — the distinction `access(X_OK)` would blur for a
-/// file owned by someone else. Stock git 2.55.0 skips a mode `0o011` candidate
-/// and names the next one.
+/// The mode of a file named `git-p4` is not consulted, in the exec-path or out
+/// of it. Stock's `is_executable()` skips a non-executable candidate and a
+/// group/other-only one (`0o644`, `0o011`) because it is choosing something to
+/// exec; the shadow is not choosing, so all three modes give the same banner.
 #[test]
-fn only_the_owner_execute_bit_qualifies_a_candidate() {
-    let f = Fixture::new("ownerbit");
-    let exec = f.dir("exec");
-    let groupish = f.dir("groupish");
-    let usable = f.dir("usable");
-    Fixture::helper(&groupish, 0o011);
-    let prog = Fixture::helper(&usable, 0o755);
-    let (code, stdout, _) = f.run(Some(&exec), &[&exec, &groupish, &usable], &[]);
-    assert_eq!((code, stdout), (2, usage_block(&prog)));
+fn candidate_file_modes_do_not_affect_the_banner() {
+    let f = Fixture::new("modes");
+    let expected = |exec: &Path| (2, usage_block(&exec.join("git-p4")), String::new());
+    for (tag, mode) in [("unreadable", 0o644), ("groupish", 0o011), ("usable", 0o755)] {
+        let exec = f.dir(&format!("exec-{tag}"));
+        let elsewhere = f.dir(&format!("path-{tag}"));
+        Fixture::helper(&exec, mode);
+        Fixture::helper(&elsewhere, mode);
+        assert_eq!(f.run(Some(&exec), &[&exec, &elsewhere], &[]), expected(&exec), "mode {mode:o}");
+    }
 }
 
-/// A searchable *directory* named `git-p4` passes `access(X_OK)` but fails
-/// `is_executable()`'s `S_ISREG`, and stock git 2.55.0 walks past it.
+/// A searchable *directory* named `git-p4` is the decoy stock's `S_ISREG` test
+/// exists to walk past. It cannot mislead the shadow either, in the exec-path
+/// (where the spelling is used regardless) or on `PATH` (which is not read).
 #[test]
-fn a_directory_named_like_the_helper_is_not_a_candidate() {
+fn a_directory_named_like_the_helper_does_not_change_the_banner() {
     let f = Fixture::new("dircand");
     let exec = f.dir("exec");
     let decoy = f.dir("decoy");
+    std::fs::create_dir_all(exec.join("git-p4")).unwrap();
     std::fs::create_dir_all(decoy.join("git-p4")).unwrap();
     let usable = f.dir("usable");
-    let prog = Fixture::helper(&usable, 0o755);
+    Fixture::helper(&usable, 0o755);
     let (code, stdout, _) = f.run(Some(&exec), &[&exec, &decoy, &usable], &[]);
-    assert_eq!((code, stdout), (2, usage_block(&prog)));
+    assert_eq!((code, stdout), (2, usage_block(&exec.join("git-p4"))));
 }
 
 /// Without `GIT_EXEC_PATH` the shadow's exec-path is `$HOME/.zvcs/bin`, the
-/// directory `git zdashed` installs the `git-p4` entry into.
+/// directory `git zdashed` installs the `git-p4` entry into — so that is what
+/// the banner names, even with `PATH` pointing elsewhere entirely.
 #[test]
-fn without_git_exec_path_the_zvcs_bin_directory_is_searched() {
+fn without_git_exec_path_the_zvcs_bin_directory_is_named() {
     let f = Fixture::new("homeexec");
     let bin = f.dir(".zvcs/bin");
-    let prog = Fixture::helper(&bin, 0o755);
+    Fixture::helper(&bin, 0o755);
     let empty = f.dir("empty");
     let (code, stdout, _) = f.run(None, &[&empty], &[]);
-    assert_eq!((code, stdout), (2, usage_block(&prog)));
+    assert_eq!((code, stdout), (2, usage_block(&bin.join("git-p4"))));
 }
 
-/// No `git-p4` anywhere leaves nothing to resolve. The banner still has to be
-/// printed — the shadow serves `p4` from its own binary — so it keeps the
-/// exec-path spelling, and the exit stays 2. Refusing here instead would turn
-/// git's usage-and-2 into a failure, which is what this guards.
+/// No `git-p4` on disk anywhere. The banner still has to be printed — the
+/// shadow serves `p4` from its own binary — with the same exec-path spelling,
+/// and the exit stays 2. Refusing here instead would turn git's usage-and-2 into
+/// a failure, which is what this guards.
 #[test]
 fn with_no_helper_anywhere_the_exec_path_spelling_is_used() {
     let f = Fixture::new("nohelper");

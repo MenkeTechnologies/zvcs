@@ -316,7 +316,11 @@ pub fn send_pack(
     let mut connection = remote.connect_with_options(
         Direction::Push,
         gix::remote::connect::Options {
-            receive_pack: opts.receive_pack.as_deref().map(Into::into),
+            receive_pack: super::fetch::local_service_program(
+                remote.url(Direction::Push).or_else(|| remote.url(Direction::Fetch)),
+                opts.receive_pack.as_deref().map(Into::into),
+                "receive-pack",
+            ),
             ..Default::default()
         },
     )?;

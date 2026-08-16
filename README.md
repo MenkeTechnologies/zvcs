@@ -355,22 +355,36 @@ export MANPATH="$HOME/.zvcs/man:$MANPATH"
 man git-zsync
 ```
 
-`git help -w <cmd>` opens the HTML manual instead, so zvcs ships one: a page per
-git command, documentation topic and superset verb under
-`~/.zvcs/share/doc/git-doc`, which is what `git --html-path` reports (as
-`--man-path` and `--info-path` report the other two). It is generated from the
-same two tables the rest of `git help` reads — the `command-list` blocks
-`git help -a`/`-g` print, and the superset manual in `manpage.rs` — so a verb
-cannot exist without a page. A `z*` verb's page is its complete manual; a stock
-command's page carries git's own one-line description, the category it is filed
-under, whether this build dispatches it, and the cross-reference to the man page
-that holds the prose (git's asciidoc manual is not reproduced, and no page claims
-to be it). Pages are written on demand by `git help -w`, and all at once by
-`git zshadow` / `git zdashed`; nothing is generated at startup.
+`git help -w <cmd>` opens the HTML manual instead, and resolves it the way the
+man-page path does: git's own installed documentation first. `git help status`
+hands the page name to the system `man`, and `git help -w status` opens the
+`git-status.html` that same installation laid down — so the two viewers show one
+manual, and git's asciidoc prose is never re-written here. The installed
+directory is found from the man page itself (`make install` puts
+`share/man/man<n>` and `share/doc/git-doc` under one prefix), so no path is
+compiled in and a host with no git man pages is exactly a host with no git HTML
+pages.
+
+For everything no git installation holds — the superset verbs, and every page at
+all on a host without git's documentation — zvcs ships its own set under
+`~/.zvcs/share/doc/git-doc`. It is generated from the same two tables the rest of
+`git help` reads — the `command-list` blocks `git help -a`/`-g` print, and the
+superset manual in `manpage.rs` — so a verb cannot exist without a page. A `z*`
+verb's page is its complete manual; a stock command's page carries git's own
+one-line description, the category it is filed under, whether this build
+dispatches it, and the cross-reference to the man page that holds the prose.
+Pages are written on demand by `git help -w`, and all at once by `git zshadow` /
+`git zdashed`; nothing is generated at startup.
+
+`git --html-path` reports whichever of the two the viewer resolves stock pages
+against — the installed directory when there is one, the generated set otherwise
+(`--man-path` and `--info-path` report `~/.zvcs`, which is where this build's man
+pages and info tree live).
 
 ```sh
-git --html-path                       # ~/.zvcs/share/doc/git-doc
-git help -w status                    # write git-status.html, open it
+git --html-path                       # e.g. /usr/share/doc/git-doc, else ~/.zvcs/share/doc/git-doc
+git help -w status                    # open git's own git-status.html
+git help -w zsync                     # write git-zsync.html into the generated set, open it
 git -c help.htmlpath=/elsewhere help -w status   # or point it at your own tree
 ```
 
@@ -557,10 +571,19 @@ reports the C toolchain it was compiled and linked against; this binary reports
 what is true of a Rust binary on gitoxide and omits the rest, rather than copying
 stock's values into a report about itself. `cpu`, the no-build-commit line,
 `sizeof-long`, `sizeof-size_t`, `default-ref-format` and `default-hash` agree with
-stock because they are the same facts; `rust: enabled` and
-`SHA-1: sha1-checked` disagree because the answers really are different here; and
-`gettext`, `libcurl`, `OpenSSL`, `zlib` and `SHA-256` are absent because no such
-component is linked — the same reason git's own `#ifdef`s drop a line. The same
+stock because they are the same facts. `SHA-1: SHA1_DC` agrees too: `hash.h`'s
+token names the collision-detecting backend — its three alternatives all read
+`(No collision detection)` — and this build's `sha1-checked` is
+`sha1collisiondetection` in git's own bail-out configuration. `rust: enabled`
+disagrees because the answers really are different here, and no honest report can
+close that line. `zlib-rs` takes the slot stock fills with `zlib`, naming the
+flate library this build does link and the version its lockfile resolved,
+qualified `(inflate only)` because deflate here is an in-tree transcription of
+zlib's `deflate.c`/`trees.c` rather than that crate. `feature:
+fsmonitor--daemon`, `gettext`, `libcurl`, `OpenSSL` and `SHA-256` are absent
+because no such component is present — only the client half of
+`fsmonitor--daemon` is ported, and none of the other four is linked — the same
+reason git's own `#ifdef`s drop a line. The same
 block is what `git diagnose` and `git bugreport` embed, through the same function
 git shares between them.
 

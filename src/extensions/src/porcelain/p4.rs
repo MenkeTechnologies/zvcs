@@ -363,59 +363,38 @@ fn usage_block() -> String {
     )
 }
 
-/// `sys.argv[0]`: the `git-p4` program git would exec, spelled the way git
-/// spells it.
+/// `sys.argv[0]`: the `git-p4` program that printed this banner, spelled the way
+/// git spells the dashed external it ran.
 ///
-/// git never writes this path down as a literal. `execv_dashed_external()`
-/// hands run-command the bare name `git-p4`, `setup_path()` has already
-/// prepended the exec-path to `PATH`, and `prepare_cmd()` resolves a name with
-/// no directory separator through `locate_in_PATH()` — the first `PATH` entry
-/// holding an executable of that name, joined as the entry is written — before
-/// exec'ing it. Measured against git 2.55.0: a `GIT_EXEC_PATH` directory that
-/// holds a `git-p4` wins; with none there the banner names the `PATH` entry
-/// that does hold one; a candidate that is not executable, or is a directory,
-/// is skipped rather than chosen; a relative `PATH` entry yields a relative
-/// path; and the empty entry POSIX reads as the current directory yields the
-/// bare `git-p4`.
+/// git never writes this path down as a literal. `execv_dashed_external()` hands
+/// run-command the bare name `git-p4`, `setup_path()` has already prepended the
+/// exec-path to `PATH`, and `prepare_cmd()` resolves a name with no directory
+/// separator through `locate_in_PATH()` — the first `PATH` entry holding an
+/// executable of that name — before exec'ing it. Because the exec-path is
+/// prepended, a `git-p4` sitting in the exec-path always wins, and stock ships
+/// `git-p4` inside its exec-path (`libexec/git-core`). So every banner stock can
+/// print reads `<exec-path>/git-p4`: measured against git 2.55.0 from two
+/// prefixes, the two banners differ in exactly that directory and nowhere else.
+/// Stock only names a `PATH` entry instead when its exec-path has no `git-p4` at
+/// all — and then it is naming the foreign script it is *about to exec*.
 ///
-/// The same scan runs here, over the shadow's own exec-path
-/// ([`crate::exec_path`] — `$GIT_EXEC_PATH`, else `$HOME/.zvcs/bin`, where
-/// `git zdashed` installs the `git-p4` entry that would be exec'd). The banner
-/// therefore differs from stock's in exactly one substring: each installation's
-/// own helper directory, the same difference `git --exec-path` reports.
+/// The shadow has no such fall-through to model. `p4` is a dispatcher verb
+/// (`dispatch::is_verb`), so `run_argv`'s external arm is never reached and this
+/// binary serves the command itself; it will not exec a `git-p4` belonging to
+/// some other installation, so naming one would attribute the output to a
+/// program that did not produce it. The shadow's own `git-p4` is this binary,
+/// reachable at `<exec-path>/git-p4` — `git zdashed` installs exactly that entry
+/// into [`crate::exec_path`] (`$GIT_EXEC_PATH`, else `$HOME/.zvcs/bin`) as a
+/// symlink back here. That entry is in the directory `setup_path()` prepends, so
+/// git's own resolution order returns it unconditionally, which is why the scan
+/// collapses to a join.
 ///
-/// With no `git-p4` anywhere there is nothing to resolve, and no git behaviour
-/// to copy either — stock git never reaches the script, it reports `p4` as not
-/// a git command. The shadow serves `p4` from this binary regardless, so the
-/// banner falls back to the exec-path spelling, which is the path an installed
-/// shadow resolves to.
+/// The banner therefore differs from stock's in exactly one substring — each
+/// installation's own helper directory, the same difference `git --exec-path`
+/// reports — and, like stock's, it does not change with what happens to be
+/// installed elsewhere on `PATH`.
 fn prog_path() -> String {
-    const HELPER: &str = "git-p4";
-    let exec_path = crate::exec_path();
-    let path = std::env::var("PATH").unwrap_or_default();
-    for dir in std::iter::once(exec_path.as_str()).chain(path.split(':')) {
-        let candidate = if dir.is_empty() {
-            HELPER.to_string()
-        } else {
-            format!("{dir}/{HELPER}")
-        };
-        if is_executable(&candidate) {
-            return candidate;
-        }
-    }
-    format!("{exec_path}/{HELPER}")
-}
-
-/// git's `is_executable()`, the test `locate_in_PATH` accepts a candidate with:
-/// `stat` (so a symlink is followed), a regular file, and the *owner* execute
-/// bit — not `access(X_OK)`. Both distinctions are observable: a directory named
-/// `git-p4` is searchable and would pass `access`, and a file with only the
-/// group and other execute bits set has an execute bit but not that one; stock
-/// git skips each of them.
-fn is_executable(path: &str) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(path)
-        .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o100 != 0)
+    format!("{}/git-p4", crate::exec_path())
 }
 
 // ---------------------------------------------------------------------------

@@ -1487,6 +1487,63 @@ pub(super) fn upload_pack_program(
         .map(|v| v.to_owned())
 }
 
+/// The program the other end runs for `service`, with this binary supplied as
+/// the default when the other end is *this* machine.
+///
+/// `explicit` is what the command line and `remote.<name>.uploadpack` /
+/// `receivepack` already settled between them (`get_upload_pack()` /
+/// `get_receive_pack()`), and it always wins: a caller that named a program
+/// gets that program.
+///
+/// What this adds is the case where neither named one and the URL is local.
+/// git still spawns the bare name `git-upload-pack` there, but only after
+/// `setup_path()` (`exec-cmd.c`, called from `git.c:main()`) has prepended its
+/// own exec-path to `PATH`, so the service is always the same installation as
+/// the parent process. zvcs has no directory of `git-*` programs to prepend —
+/// one binary serves every helper — so the equivalent is to name that binary
+/// outright. Without this a local clone or fetch hands pack generation to
+/// whichever `git-upload-pack` happens to come first on `PATH`, which can be a
+/// different git, or a different *build* of zvcs, and the pack that lands is
+/// then not the one this process would have written.
+///
+/// Remote URLs are deliberately left alone. Over ssh, `git://` or http the
+/// value names a program on the far machine, where a path out of this
+/// process's filesystem means nothing — so those keep the bare service name
+/// and the far end resolves it.
+pub(super) fn local_service_program(
+    url: Option<&gix::Url>,
+    explicit: Option<BString>,
+    service: &str,
+) -> Option<BString> {
+    if explicit.is_some() {
+        return explicit;
+    }
+    // `Scheme::File` is what gix classifies both `file://` URLs and bare
+    // filesystem paths as, which is the same set git treats as local.
+    if url?.scheme != gix::url::Scheme::File {
+        return None;
+    }
+    let exe = std::env::current_exe().ok()?;
+    let exe = gix::path::into_bstr(exe).into_owned();
+
+    // The local transport hands an override to a shell (`conn->use_shell = 1`
+    // in `git_connect()`, and `command_may_be_shell_script()` here), so the
+    // path has to survive word splitting. Single-quote it, closing and
+    // reopening around any embedded quote, which is the only byte that can end
+    // the literal.
+    let mut out = BString::from("'");
+    for &byte in exe.iter() {
+        if byte == b'\'' {
+            out.extend_from_slice(b"'\\''");
+        } else {
+            out.push(byte);
+        }
+    }
+    out.extend_from_slice(b"' ");
+    out.extend_from_slice(service.as_bytes());
+    Some(out)
+}
+
 /// The protocol-v2 server options to transmit.
 ///
 /// Resolve one `--negotiation-restrict`/`--negotiation-tip`/`--negotiation-include` argument into the
@@ -1900,7 +1957,11 @@ fn fetch_one(
     let abbrev = abbrev_len(repo);
 
     let connect_options = gix::remote::connect::Options {
-        upload_pack: upload_pack_program(repo, remote_name.as_deref(), opts.upload_pack.as_deref()),
+        upload_pack: local_service_program(
+            remote.url(gix::remote::Direction::Fetch),
+            upload_pack_program(repo, remote_name.as_deref(), opts.upload_pack.as_deref()),
+            "upload-pack",
+        ),
         address_family: opts.address_family,
         // `git fetch` never connects for push.
         receive_pack: None,

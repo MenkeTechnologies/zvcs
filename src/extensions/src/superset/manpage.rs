@@ -270,7 +270,7 @@ pub const DOCS: &[Doc] = &[
         summary: "install the ~/.zvcs shadow and print the shell lines for it",
         synopsis: "git zshadow [<dir>] [-n|--print] [--all]",
         desc: &[
-            "Sets up the whole shadow install in one command: a `git` symlink to this binary in <dir> (default ~/.zvcs/bin), a git-<verb> dashed link beside it for every verb the dispatcher serves, every superset man page under ~/.zvcs/man, the HTML documentation set under ~/.zvcs/share/doc/git-doc (the directory `git --html-path` reports and `git help -w <cmd>` opens pages from), and the zvcs-forked zsh completion as ~/.zvcs/completions/_git. Everything installed is compiled into the binary, so nothing is needed from the source tree.",
+            "Sets up the whole shadow install in one command: a `git` symlink to this binary in <dir> (default ~/.zvcs/bin), a git-<verb> dashed link beside it for every verb the dispatcher serves, every superset man page under ~/.zvcs/man, the HTML documentation set under ~/.zvcs/share/doc/git-doc (what `git help -w <cmd>` opens for every page git's own installed HTML manual does not hold), and the zvcs-forked zsh completion as ~/.zvcs/completions/_git. Everything installed is compiled into the binary, so nothing is needed from the source tree.",
             "stdout carries shell code only \\(em the export PATH line for the bin directory, the export MANPATH line for the man directory, and the fpath line for the completion directory \\(em so `eval \"$(git zshadow)\"` sets the current shell up and the same lines paste into ~/.zshrc. The install summary goes to stderr, where an eval leaves it alone.",
             "A PATH or MANPATH line the environment already satisfies is printed commented out, so re-evaluating never duplicates an entry and the line is still visible to uncomment when pasting into an rc file; --all prints every line uncommented. fpath is a zsh variable rather than an exported one, so it cannot be inspected from here and its line is always live \\(em put it before compinit, and `typeset -U fpath` keeps repeats harmless.",
             "-n (--print) prints the lines without installing anything. Paths under $HOME are written as $HOME/... so the lines are portable across machines.",
@@ -284,7 +284,7 @@ pub const DOCS: &[Doc] = &[
         synopsis: "git zdashed [<dir>]",
         desc: &[
             "Installs a git-<verb> symlink for every builtin and superset verb into <dir> (default ~/.zvcs/bin), so the dashed external forms resolve to this binary once stock git is removed.",
-            "It also writes every extension man page under ~/.zvcs/man, so `man git-<verb>` resolves when that directory is on MANPATH, and the HTML documentation set under ~/.zvcs/share/doc/git-doc, so `git help -w <cmd>` finds a page for every command without generating one first.",
+            "It also writes every extension man page under ~/.zvcs/man, so `man git-<verb>` resolves when that directory is on MANPATH, and the HTML documentation set under ~/.zvcs/share/doc/git-doc, so `git help -w <cmd>` finds a page for every command without generating one first, on a host whose git installation ships no HTML manual of its own.",
         ],
     },
     Doc {

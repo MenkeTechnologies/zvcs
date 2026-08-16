@@ -96,9 +96,16 @@ fn echoing_browser(repo: &Path) {
 }
 
 /// `help.format=html` selects the web viewer, exactly as `-w` does: the page is
-/// materialized under `git --html-path` and its path handed to `web--browse`.
+/// resolved under `git --html-path` and its path handed to `web--browse`.
 /// The echoed path is the whole contract — it proves the lookup resolved to the
 /// directory `--html-path` reports, under the name `cmd_to_page()` produces.
+///
+/// Which set that directory is depends on the host: git's own installed HTML
+/// manual when there is one, and the set this binary generates otherwise. The
+/// assertions below hold for either, so the test does not depend on whether the
+/// machine running it has git's documentation installed — the page must be an
+/// HTML document (git's asciidoc manual opens `<!DOCTYPE html>`, the generated
+/// set `<!doctype html>`) carrying git's own description of `status`.
 #[test]
 fn help_format_html_selects_the_web_viewer() {
     let (repo, home) = fixture("format");
@@ -119,7 +126,11 @@ fn help_format_html_selects_the_web_viewer() {
 
     // …and that path is a real page carrying git's own description of `status`.
     let body = std::fs::read_to_string(&page).unwrap();
-    assert!(body.starts_with("<!doctype html>"), "not an HTML document:\n{body}");
+    assert!(
+        body.to_ascii_lowercase().starts_with("<!doctype html>"),
+        "not an HTML document: {:?}",
+        body.lines().next()
+    );
     assert!(body.contains("Show the working tree status"), "no summary in:\n{body}");
 
     let _ = std::fs::remove_dir_all(repo.parent().unwrap());

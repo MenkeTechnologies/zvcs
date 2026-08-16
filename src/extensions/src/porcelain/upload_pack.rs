@@ -689,7 +689,15 @@ fn serve_inner(repo: &gix::Repository, advertise_only: bool, stateless_rpc: bool
     if cap_present(&want_caps, b"include-tag") {
         add_included_tags(repo, &mut objects);
     }
-    let pack = crate::porcelain::pack_objects::pack_bytes_for(repo, &objects)?;
+    // `data->use_ofs_delta`, set by `receive_needs()` from the client's
+    // `ofs-delta` capability and turned into `--delta-base-offset` on the
+    // `pack-objects` git spawns (`create_pack_file()`). It is off until the
+    // client asks, because a receiver that predates offset deltas cannot read
+    // them — and on once it does, because an `OBJ_OFS_DELTA` names its base in
+    // a two-or-three byte varint where an `OBJ_REF_DELTA` spends a full object
+    // id, which is 18 bytes per delta of pure overhead.
+    let use_ofs_delta = cap_present(&want_caps, b"ofs-delta");
+    let pack = crate::porcelain::pack_objects::pack_bytes_with(repo, &objects, use_ofs_delta)?;
     // `data->use_sideband` (upload-pack.c:1135-1138) is the packet size the
     // selected band carries, not a flag: `LARGE_PACKET_MAX` for `side-band-64k`
     // and `DEFAULT_PACKET_MAX` for plain `side-band`. `send_sideband()` chunks at
@@ -824,12 +832,18 @@ impl MultiAck {
 ///
 ///   * `multi_ack` / `multi_ack_detailed` — both acknowledgement dialects are
 ///     driven by [`MultiAck`] in the have loop.
-///   * `thin-pack` / `ofs-delta` / `no-progress` — permissions, not obligations.
-///     A client that sends them asks this server to be *allowed* to accept a
-///     thin or offset-delta'd pack and to skip progress; a pack that is neither
-///     thin nor delta'd and carries no progress satisfies all three, which is
-///     why git advertises them from a fixed string regardless of what
-///     `pack-objects` will produce.
+///   * `thin-pack` / `no-progress` — permissions, not obligations. A client that
+///     sends them asks this server to be *allowed* to accept a thin pack and to
+///     skip progress; a pack that is not thin and carries no progress satisfies
+///     both, which is why git advertises them from a fixed string regardless of
+///     what `pack-objects` will produce.
+///   * `ofs-delta` — a permission this server *takes*, as git does. A client
+///     that sends it sets `data->use_ofs_delta`, which becomes
+///     `--delta-base-offset` on `pack-objects`' command line
+///     (`create_pack_file()`), so every delta names its base by a backwards
+///     pack offset instead of spending a full object id on it. Not taking it
+///     costs 18 bytes per delta and makes the pack — and therefore its name —
+///     differ from git's for the same object set.
 ///   * `side-band` / `side-band-64k` — [`serve`] frames the pack at whichever
 ///     of the two the client selects, with the packet cap that goes with it.
 ///   * `include-tag` — [`add_included_tags`] adds the tags pointing into the
@@ -1886,6 +1900,10 @@ struct FetchArgs {
     done: bool,
     wait_for_done: bool,
     include_tag: bool,
+    /// `data->use_ofs_delta`, set by the `ofs-delta` argument. It reaches
+    /// `pack-objects` as `--delta-base-offset` in `create_pack_file()`, so the
+    /// deltas name their base by pack offset rather than by object id.
+    ofs_delta: bool,
     filter: Option<String>,
     /// `data->shallows` plus the `deepen*` request, answered by the
     /// `shallow-info` section in [`send_pack_section`].
@@ -1985,9 +2003,16 @@ fn process_fetch_args(
         }
 
         match arg.as_str() {
-            // The pack this server builds is never thin and never uses offset
-            // deltas, both of which these two only *permit*.
-            "thin-pack" | "ofs-delta" => continue,
+            // The pack this server builds is never thin, which `thin-pack` only
+            // *permits*.
+            "thin-pack" => continue,
+            // `if (!strcmp(arg, "ofs-delta")) { data->use_ofs_delta = 1; ... }`
+            // (`process_args()`). Unlike `thin-pack` this one is acted on: it is
+            // what puts `--delta-base-offset` on `pack-objects`' command line.
+            "ofs-delta" => {
+                args.ofs_delta = true;
+                continue;
+            }
             // No progress is ever written on band 2, so this is already true.
             "no-progress" => continue,
             "include-tag" => {
@@ -2171,7 +2196,7 @@ fn send_pack_section(
     if args.include_tag {
         add_included_tags(repo, &mut objects);
     }
-    let pack = crate::porcelain::pack_objects::pack_bytes_for(repo, &objects)
+    let pack = crate::porcelain::pack_objects::pack_bytes_with(repo, &objects, args.ofs_delta)
         .map_err(|e| Die(format!("{e:#}")))?;
     // The band byte eats one of the 65516 payload bytes a pkt-line can carry.
     for chunk in pack.chunks(65515) {

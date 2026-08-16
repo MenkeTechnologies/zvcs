@@ -253,7 +253,11 @@ pub fn ls_remote(args: &[String]) -> Result<ExitCode> {
     // advertised ref, not just the ones the remote's refspecs would fetch.
     let remote_name = remote.name().map(|n| n.as_bstr().to_string());
     let connect_options = gix::remote::connect::Options {
-        upload_pack: super::fetch::upload_pack_program(&repo, remote_name.as_deref(), opts.upload_pack.as_deref()),
+        upload_pack: super::fetch::local_service_program(
+            remote.url(gix::remote::Direction::Fetch),
+            super::fetch::upload_pack_program(&repo, remote_name.as_deref(), opts.upload_pack.as_deref()),
+            "upload-pack",
+        ),
         // `git ls-remote` has no `--ipv4`/`--ipv6`, and never connects for push.
         ..Default::default()
     };

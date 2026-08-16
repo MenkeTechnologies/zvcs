@@ -109,9 +109,10 @@
 //!     first, and after the tree filter the work tree is hashed straight back
 //!     into a tree object. `--index-filter` is the case where the index *is* the
 //!     user's interface, so it gets a real one: the tree the filters have
-//!     produced so far is loaded into `$GIT_INDEX_FILE` with `git read-tree -i
-//!     -m <tree>`, the filter runs against it, and `git write-tree` reads the
-//!     result back at the script's own point in the loop. That works because
+//!     produced so far is loaded into `$GIT_INDEX_FILE` where `git read-tree -i
+//!     -m <tree>` would load it, the filter runs against it, and the tree is
+//!     read back off that file at the script's own point in the loop where
+//!     `git write-tree` would read it. That works because
 //!     `GIT_INDEX_FILE` is now honoured — `gix::Repository::index_path()` reads
 //!     it, a port of what `setup_git_env()` passes to `repo_set_gitdir()` — so
 //!     the filter's `git rm --cached` and `git update-index` edit the scratch
@@ -128,10 +129,36 @@
 //!         diff amounts to; a tree filter cannot change them either way.
 //!       - Clearing the work tree removes a nested repository a tree filter may
 //!         have created, where `git clean -d -f -x` would need `-ff`.
+//!   * **The plumbing the script spends per commit runs in this process, not as
+//!     a child.** `git read-tree -i -m <tree>`, `git write-tree`, the default
+//!     `--msg-filter cat` and the default `--commit-filter`'s `git commit-tree`
+//!     are four forks per rewritten commit in the script, and all four land on
+//!     the clock the script's own progress line reports — `start_timestamp` is
+//!     taken just before the loop and every `Rewrite` line prints the seconds
+//!     since. Paying them made a three-commit rewrite report `1 seconds passed`
+//!     where stock reports `0`, and the reported commit counter then froze at
+//!     `(2/3)` because `report_progress` only refreshes `$count` when it
+//!     samples. Each is built here instead, over the same `gix` objects the
+//!     child would have written:
+//!       - read-tree and write-tree read and write `$GIT_INDEX_FILE` directly;
+//!         write-tree shares [`super::write_tree::tree_from_index`] with the
+//!         command, so the two cannot drift.
+//!       - `cat` as the message filter is a copy, and is done as one.
+//!       - the default commit filter is built from the commit's own ident, which
+//!         is what `set_ident` puts in the shell for the child to read. It falls
+//!         back to the shell whenever anything could have moved in between: a
+//!         non-default `--commit-filter` (including `--prune-empty`'s
+//!         `git_commit_non_empty_tree`), an `--env-filter` that may rewrite the
+//!         ident, or a `--parent-filter` that rewrites `$parentstr` where only
+//!         the shell can see it.
+//!     Everything the user wrote still runs in the shell, and the objects and
+//!     the map files are byte-identical either way.
 //!   * The scratch directory holds what the filters can see — `map/<sha>`,
-//!     `commit` and `message` — plus a `message-in` holding the message the msg
-//!     filter reads, where the script pipes it in from its own header-stripping
-//!     loop. Its purely internal files (`backup-refs`, `raw-refs`, `heads`,
+//!     `commit` and `message` — plus a `message-in` holding the message a real
+//!     msg filter reads, where the script pipes it in from its own
+//!     header-stripping loop. `message-in` is only written when there is such a
+//!     filter; the default `cat` writes `message` in one step.
+//!     Its purely internal files (`backup-refs`, `raw-refs`, `heads`,
 //!     `parse`, `revs`) have no on-disk equivalent here; that state is in memory.
 //!   * `GIT_DIR`, `GIT_WORK_TREE=.` and `GIT_INDEX_FILE` are still exported to
 //!     the filters, exactly as the script exports them, so a filter that runs
@@ -244,6 +271,11 @@ die()
 	echo "$*" >&2
 	exit 1
 }"#;
+
+/// `$filter_commit` when neither `--commit-filter` nor `--prune-empty` was given
+/// (line 212). Named because it is also the condition under which the commit can
+/// be written without forking a shell — see `fast_commit` in [`rewrite`].
+const DEFAULT_COMMIT_FILTER: &str = "git commit-tree \"$@\"";
 
 /// Every switch in the inner `case "$ARG"` (lines 166-207). Each takes exactly
 /// one argument, supplied as the following `argv` element — the script offers no
@@ -576,7 +608,7 @@ fn run(args: &[String]) -> Result<ExitCode> {
 
     // Script lines 210-219: only `t,<non-empty>` is an error.
     match (opts.prune_empty, opts.saw_commit_filter) {
-        (false, false) => opts.filter_commit = "git commit-tree \"$@\"".to_string(),
+        (false, false) => opts.filter_commit = DEFAULT_COMMIT_FILTER.to_string(),
         (true, false) => {
             opts.filter_commit = format!("{FUNCTIONS}; git_commit_non_empty_tree \"$@\"");
         }
@@ -765,21 +797,6 @@ impl Ctx {
         cmd
     }
 
-    /// Run a plumbing command and return `(status, stdout)`, with its stderr going
-    /// where the script's would — straight through to the caller's.
-    fn git_output(&self, args: &[&str]) -> Result<(i32, String)> {
-        let out = self
-            .git(args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .output()
-            .map_err(|e| anyhow::anyhow!("could not run git {}: {e}", args.join(" ")))?;
-        Ok((
-            out.status.code().unwrap_or(1),
-            String::from_utf8_lossy(&out.stdout).trim().to_string(),
-        ))
-    }
-
     /// Run a plumbing command, letting its output through, and return its status.
     fn git_status(&self, args: &[&str]) -> Result<i32> {
         Ok(self
@@ -788,6 +805,49 @@ impl Ctx {
             .map_err(|e| anyhow::anyhow!("could not run git {}: {e}", args.join(" ")))?
             .code()
             .unwrap_or(1))
+    }
+
+    /// `GIT_ALLOW_NULL_SHA1=1 git read-tree -i -m <tree>` (line 398), run here
+    /// rather than as a child.
+    ///
+    /// The script's scratch index has no work tree behind it — `$GIT_WORK_TREE`
+    /// is the empty `$tempdir/t` and nothing is ever checked out into it on the
+    /// index-filter path — so `-i` has nothing to skip and the *one*-tree form
+    /// of `-m` degenerates to a plain read: the entries, their ids and their
+    /// modes all come from `tree`, which is what the filter reads and what the
+    /// `write-tree` below turns back into a tree.
+    ///
+    /// What `oneway_merge()` additionally carries — the stat cache and the
+    /// sticky flags (`assume-valid`, `skip-worktree`, `intent-to-add`) of
+    /// entries the tree leaves untouched — is not carried here. Nothing in the
+    /// loop can read it: there is no work tree to stat against, and `write-tree`
+    /// reads ids and modes only. It is observable to an index filter that goes
+    /// looking for it across commits, which is the one behaviour this trades for
+    /// not re-executing this binary once per commit — ~25ms each, all of it on
+    /// the clock the script's progress line reports.
+    fn read_tree(&self, repo: &gix::Repository, tree: ObjectId) -> Result<()> {
+        let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
+        let mut index = repo.index_from_tree(&tree)?;
+        index.set_path(&self.index_file);
+        index.write(crate::config::index_write_options(repo))?;
+        Ok(())
+    }
+
+    /// `tree=$(git write-tree)` (line 476), run here rather than as a child.
+    ///
+    /// Shares [`super::write_tree::tree_from_index`] with the `write-tree`
+    /// command itself, so the two cannot drift; `Err(code)` is the exit status
+    /// that command would have left, with its diagnostics already on stderr.
+    fn write_tree(&self, repo: &gix::Repository) -> Result<std::result::Result<ObjectId, u8>> {
+        let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
+        // An absent index file is an empty index, exactly as `write-tree` reads it.
+        let index = gix::index::File::at_or_default(
+            &self.index_file,
+            repo.object_hash(),
+            false,
+            Default::default(),
+        )?;
+        super::write_tree::tree_from_index(repo, &index, false)
     }
 
     /// `$tempdir/map/<sha>`, the one file per rewritten commit that `map()` reads.
@@ -932,12 +992,29 @@ fn rewrite(
     sh.set("filter_commit", &opts.filter_commit)?;
     sh.set("filter_tag_name", &opts.filter_tag_name)?;
 
+    // Whether the per-commit `git commit-tree` can be built here rather than in
+    // a forked shell. It can only when nothing between `set_ident` and the
+    // filter is allowed to move: the default commit filter is the bare
+    // `git commit-tree "$@"`, an `--env-filter` may rewrite the ident the child
+    // would have used, and a `--parent-filter` rewrites `$parentstr` inside the
+    // shell where this side cannot see it.
+    let fast_commit = opts.filter_commit == DEFAULT_COMMIT_FILTER
+        && opts.filter_env.is_empty()
+        && opts.filter_parent.is_empty();
+    // `git commit-tree` writes the `encoding` header only for a configured
+    // encoding that is not UTF-8 (`is_encoding_utf8`); read once, not per commit.
+    let commit_encoding = fast_commit.then(|| configured_commit_encoding(repo)).flatten();
+
+    // Line 373: `start_timestamp=$(date '+%s')`. The clock starts *before* the
+    // setup filter runs, not after it, so a `--setup` that takes a second is a
+    // second the first `Rewrite` line already reports as passed.
+    let mut progress = Progress::new(commits);
+
     // Line 385: `eval "$filter_setup" < /dev/null`.
     if sh.run("eval \"$filter_setup\" < /dev/null")? != 0 {
         return die(&format!("filter setup failed: {}", opts.filter_setup));
     }
 
-    let mut progress = Progress::new(commits);
     for (commit, parents) in &revs {
         let commit_hex = commit.to_string();
         progress.report(&commit_hex);
@@ -1010,8 +1087,9 @@ fn rewrite(
         // then sees exactly the entries the script would show it, and its own
         // `git rm --cached` / `git update-index` write back to the same file.
         if !opts.filter_index.is_empty() {
-            let code = ctx.git_status(&["read-tree", "-i", "-m", &tree.to_string()])?;
-            if code != 0 {
+            let read = ctx.read_tree(repo, tree);
+            if let Err(e) = read {
+                eprintln!("fatal: {e}");
                 return die("Could not initialize the index");
             }
             if sh.run("eval \"$filter_index\" < /dev/null")? != 0 {
@@ -1046,9 +1124,18 @@ fn rewrite(
             Some(at) => &raw[at + 2..],
             None => &[][..],
         };
-        fs::write(ctx.tempdir.join("message-in"), body)?;
-        if sh.run("eval \"$filter_msg\" < ../message-in > ../message")? != 0 {
-            return die(&format!("msg filter failed: {}", opts.filter_msg));
+        // `cat` is the default `$filter_msg` (line 124) and it is what every
+        // `--msg-filter cat` asks for too: a redirect through `cat` copies the
+        // bytes and nothing else, so write them where the redirect would have
+        // put them instead of forking one `cat` per commit onto the progress
+        // clock. Any other filter is a real program and goes to the shell.
+        if opts.filter_msg == "cat" {
+            fs::write(ctx.tempdir.join("message"), body)?;
+        } else {
+            fs::write(ctx.tempdir.join("message-in"), body)?;
+            if sh.run("eval \"$filter_msg\" < ../message-in > ../message")? != 0 {
+                return die(&format!("msg filter failed: {}", opts.filter_msg));
+            }
         }
 
         // Lines 474-479: `tree=$(git write-tree)` under `$need_index`. Only the
@@ -1057,25 +1144,40 @@ fn rewrite(
         // script's point rather than at the filter, so a msg or parent filter
         // that touches the index is still seen.
         if !opts.filter_index.is_empty() {
-            let (code, out) = ctx.git_output(&["write-tree"])?;
-            if code != 0 {
-                return Err(Exit(code as u8).into());
+            let written = ctx.write_tree(repo)?;
+            match written {
+                Ok(id) => tree = id,
+                Err(code) => return Err(Exit(code).into()),
             }
-            tree = out.parse::<ObjectId>().map_err(|_| {
-                anyhow::anyhow!("git write-tree did not print a tree id: {out}")
-            })?;
         }
 
         // Lines 480-482: the commit filter, in its own shell, with `$workdir`
         // in its environment so `map()` resolves.
+        //
+        // The default filter is the bare `git commit-tree "$@"` (line 212), and
+        // with no `--env-filter` or `--parent-filter` in play its whole input is
+        // already here: the ident is what `set_ident` just put in the shell,
+        // which is the commit's own, and `$parentstr` is `seen`. So the object
+        // is built and written here instead of forking a shell and a child of
+        // this binary for every commit — the two writes are the same bytes
+        // through the same `gix::objs::Commit`, and the fork was the largest
+        // remaining item on the clock the script's progress line reports.
         let map_path = format!("../map/{commit_hex}");
-        let code = sh.run(&format!(
-            "workdir=\"$workdir\" /bin/sh -c \"$filter_commit\" \"git commit-tree\" \
-             {tree} $parentstr < ../message > {}",
-            sq(&map_path)
-        ))?;
-        if code != 0 {
-            return die("could not write rewritten commit");
+        if fast_commit {
+            let message = fs::read(ctx.tempdir.join("message"))?;
+            match write_commit_object(repo, tree, &seen, &message, commit_encoding.clone(), &raw)? {
+                Some(id) => fs::write(ctx.map_file(&commit_hex), format!("{id}\n"))?,
+                None => return die("could not write rewritten commit"),
+            }
+        } else {
+            let code = sh.run(&format!(
+                "workdir=\"$workdir\" /bin/sh -c \"$filter_commit\" \"git commit-tree\" \
+                 {tree} $parentstr < ../message > {}",
+                sq(&map_path)
+            ))?;
+            if code != 0 {
+                return die("could not write rewritten commit");
+            }
         }
     }
     drop(progress);
@@ -1285,6 +1387,59 @@ impl Drop for Progress {
     fn drop(&mut self) {
         let _ = std::io::stdout().flush();
     }
+}
+
+/// `i18n.commitEncoding`, when it names something other than UTF-8.
+///
+/// `git commit-tree` writes no `encoding` header for UTF-8 (`is_encoding_utf8`),
+/// which is the same rule [`super::commit_tree`] applies.
+fn configured_commit_encoding(repo: &gix::Repository) -> Option<gix::bstr::BString> {
+    let snapshot = repo.config_snapshot();
+    snapshot.string("i18n.commitEncoding").and_then(|v| {
+        let name = v.to_str_lossy();
+        let is_utf8 = name.eq_ignore_ascii_case("utf-8") || name.eq_ignore_ascii_case("utf8");
+        (!is_utf8).then(|| v.to_owned())
+    })
+}
+
+/// The default commit filter's `git commit-tree <tree> [-p <parent>…] < ../message`,
+/// built here instead of in a forked shell.
+///
+/// The ident is read back out of `raw` rather than out of the environment: the
+/// only thing that puts it in the environment is `set_ident`, which reads it out
+/// of these same bytes, and the caller only takes this path when no
+/// `--env-filter` can have changed it since. `None` is the child's non-zero
+/// exit, with git's message already on stderr.
+fn write_commit_object(
+    repo: &gix::Repository,
+    tree: ObjectId,
+    parents: &[String],
+    message: &[u8],
+    encoding: Option<gix::bstr::BString>,
+    raw: &[u8],
+) -> Result<Option<ObjectId>> {
+    // `builtin/commit-tree.c`: a NUL in the message is refused, nothing written.
+    if message.contains(&0) {
+        eprintln!("error: a NUL byte in commit log message not allowed.");
+        return Ok(None);
+    }
+    let original = gix::objs::CommitRef::from_bytes(raw, repo.object_hash())?;
+    let commit = gix::objs::Commit {
+        tree,
+        parents: parents
+            .iter()
+            .map(|p| p.parse::<ObjectId>())
+            .collect::<std::result::Result<_, _>>()?,
+        author: original.author()?.to_owned()?,
+        committer: original.committer()?.to_owned()?,
+        encoding,
+        message: message.into(),
+        extra_headers: Vec::new(),
+    };
+    // Serialize the object write through the repo coordinator, exactly as the
+    // `commit-tree` child this replaces does.
+    let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
+    Ok(Some(repo.write_object(&commit)?.detach()))
 }
 
 /// `date '+%s'`.

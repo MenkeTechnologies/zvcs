@@ -44,16 +44,18 @@
 //!   no such fallback (see `gix/src/repository/identity.rs`, "Deviation"), and
 //!   there is no passwd/gethostname substrate to port it onto. Rather than invent
 //!   a different ident, this errors out (exit 128) with a precise message.
-//! * `GIT_ATTR_SYSTEM` and `GIT_CONFIG_SYSTEM` hang off git's *compile-time*
-//!   prefix, which is not derivable from the filesystem: `gix_path::env::system_prefix()`
-//!   is a flat `/` off Windows, and `--exec-path` bears no fixed relation to it
-//!   (Homebrew pairs an exec path of `<prefix>/opt/git/libexec/git-core` with a
-//!   prefix of `<prefix>`). Both therefore resolve through
-//!   `gix_path::env::installation_config_prefix_unsuppressed()`, which reads the
-//!   installation's own `etc/gitconfig` location — the one place the prefix is
-//!   observable at runtime — and falls back to `system_prefix()` when no git
-//!   installation can be found at all. Unlike the plain
-//!   `installation_config_prefix()`, it ignores `GIT_CONFIG_SYSTEM` and
+//! * `GIT_ATTR_SYSTEM` and `GIT_CONFIG_SYSTEM` hang off git's *installation
+//!   prefix*, which git resolves in `exec-cmd.c`'s `system_prefix()` — the
+//!   compiled-in `prefix` for an ordinary build, or, under `RUNTIME_PREFIX`, the
+//!   directory of the running binary with `libexec/git-core`, `bin` or `git`
+//!   stripped off it. A compiled-in constant of *another* program is not readable,
+//!   so [`installation_prefix`] recovers it the two ways it is observable at
+//!   runtime, in order: ask the git installation where its own `etc/gitconfig`
+//!   lives (see [`installation_config`]), then fall back to `system_prefix()`'s
+//!   suffix-stripping applied to this binary's own location, which is the right
+//!   answer once zvcs is itself installed under a prefix. `gix_path::env::system_prefix()`
+//!   — a flat `/` off Windows — is the last resort, correct only for a git
+//!   installed under `/`. The probe deliberately ignores `GIT_CONFIG_SYSTEM` and
 //!   `GIT_CONFIG_NOSYSTEM`, which relocate or switch off the system config *scope*
 //!   without moving the installation — matching git, which keeps printing
 //!   `GIT_ATTR_SYSTEM` under `GIT_CONFIG_NOSYSTEM=1`.
@@ -62,6 +64,7 @@
 
 use anyhow::Result;
 use std::io::Write;
+use std::path::Path;
 use std::process::ExitCode;
 
 use gix::bstr::BString;
@@ -288,24 +291,165 @@ fn pager(cfg: &ConfigFile) -> String {
 ///
 /// Suppressed entirely by a true `GIT_ATTR_NOSYSTEM`, matching git's
 /// `git_attr_system_is_enabled()`. Note that this is the *only* switch that
-/// suppresses it: git derives the path from its compile-time prefix, so
+/// suppresses it: git derives the path from its installation prefix, so
 /// `GIT_CONFIG_NOSYSTEM=1` and a redirected `GIT_CONFIG_SYSTEM` leave it intact.
 ///
-/// The prefix is the directory holding git's own installed `gitconfig`, since git
-/// hangs `etc/gitconfig` and `etc/gitattributes` off the same prefix. Asking the
-/// installation is the only way to recover it: it is baked in at build time and
-/// bears no derivable relation to `--exec-path` (Homebrew reports an exec path of
-/// `<prefix>/opt/git/libexec/git-core` against a prefix of `<prefix>`).
-/// `gix_path::env::system_prefix()` is the fallback, but it is a flat `/` on every
-/// non-Windows target and so only correct for a git installed under `/`.
+/// git spells this `system_path(ETC_GITATTRIBUTES)`, and `ETC_GITATTRIBUTES` is
+/// `<sysconfdir>/gitattributes` — absolute for a distribution build that sets an
+/// absolute `sysconfdir` (Debian's `/etc/gitattributes`), and prefix-relative
+/// otherwise (Homebrew's `<prefix>/etc/gitattributes`). Both cases fall out of
+/// [`installation_prefix`]: its first source is the *directory* of the
+/// installation's own `gitconfig`, which is that same `sysconfdir` whether or not
+/// it sits under the prefix.
 fn attr_system() -> Option<BString> {
     if env_bool("GIT_ATTR_NOSYSTEM") {
         return None;
     }
-    let path = gix::path::env::installation_config_prefix_unsuppressed()
-        .map(|etc| etc.join("gitattributes"))
-        .or_else(|| gix::path::env::system_prefix().map(|p| p.join("etc/gitattributes")))?;
-    Some(path_bytes(path))
+    Some(path_bytes(installation_prefix().etc().join("gitattributes")))
+}
+
+/// Where git's installation keeps `gitconfig` and `gitattributes`.
+///
+/// The two sources answer at different granularities and must not be conflated:
+/// a probe of the installation yields the `etc` directory directly (`/etc` on
+/// Debian, `<prefix>/etc` on Homebrew), while `exec-cmd.c`'s suffix stripping
+/// yields the prefix, whose `etc` subdirectory is only a convention.
+enum Installation {
+    /// git's `sysconfdir`, as the installation itself reported it.
+    Etc(std::path::PathBuf),
+    /// git's `prefix`, from which `etc` is derived the way an ordinary build does.
+    Prefix(std::path::PathBuf),
+}
+
+impl Installation {
+    /// The directory `gitconfig` and `gitattributes` live in.
+    fn etc(self) -> std::path::PathBuf {
+        match self {
+            Installation::Etc(dir) => dir,
+            Installation::Prefix(prefix) => prefix.join("etc"),
+        }
+    }
+}
+
+/// git's `system_prefix()` (`exec-cmd.c`), recovered by a program that *shadows*
+/// git rather than being the build that baked the prefix in.
+///
+/// Ordered by how directly each source observes the installation:
+///
+/// 1. **The installation's own `gitconfig`** ([`installation_config`]). This is
+///    the only source that survives an absolute `sysconfdir`, where the config
+///    and attributes files sit outside the prefix entirely.
+/// 2. **This binary's location**, put through `system_prefix()`'s suffix chain —
+///    `libexec/git-core`, then `bin`, then `git` (see [`strip_path_suffix`]).
+///    That is exactly what a `RUNTIME_PREFIX` build of git computes, and it is
+///    the right answer once zvcs is installed under a prefix of its own
+///    (`<prefix>/bin/zvcs` → `<prefix>`). A build tree (`target/debug/git`) matches
+///    no suffix, which is why it is not the first source.
+/// 3. **`gix_path::env::system_prefix()`**, a flat `/` off Windows — git's
+///    `FALLBACK_RUNTIME_PREFIX` role, and correct only for a git installed
+///    under `/`.
+fn installation_prefix() -> Installation {
+    if let Some(cfg) = installation_config() {
+        if let Some(etc) = cfg.parent() {
+            return Installation::Etc(etc.to_owned());
+        }
+    }
+    if let Some(prefix) = prefix_from_executable() {
+        return Installation::Prefix(prefix);
+    }
+    Installation::Prefix(
+        gix::path::env::system_prefix().map_or_else(|| std::path::PathBuf::from("/"), Path::to_owned),
+    )
+}
+
+/// git's `strip_path_suffix()` (`path.c`), component-wise.
+///
+/// Returns `path` with a trailing `suffix` removed, or `None` when `path` does not
+/// end in it. Matching whole components is what makes the removal a directory
+/// boundary rather than a string one, so `/opt/homebrewbin` does not strip `bin`.
+fn strip_path_suffix(path: &Path, suffix: &str) -> Option<std::path::PathBuf> {
+    let mut left = path.components();
+    let mut right = Path::new(suffix).components().rev().peekable();
+    while right.peek().is_some() {
+        if left.next_back()? != right.next()? {
+            return None;
+        }
+    }
+    let stripped = left.as_path();
+    (!stripped.as_os_str().is_empty()).then(|| stripped.to_owned())
+}
+
+/// `system_prefix()`'s `RUNTIME_PREFIX` branch applied to the running binary.
+///
+/// `executable_dirname` is the directory of this executable, and the suffix chain
+/// is git's own — `GIT_EXEC_PATH` (`libexec/git-core`), `BINDIR` (`bin`), then the
+/// bare `git` a Git-for-Windows layout uses.
+fn prefix_from_executable() -> Option<std::path::PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    ["libexec/git-core", "bin", "git"]
+        .iter()
+        .find_map(|suffix| strip_path_suffix(dir, suffix))
+}
+
+/// The `gitconfig` shipped with the git installation, as the installation reports it.
+///
+/// The probe is `gix_path::env::installation_config_unsuppressed()`'s, argv for
+/// argv: `git config -lz --show-origin --name-only` run from `/` with the
+/// repository- and scope-selecting variables neutralised, keeping the first
+/// `file:` origin — the highest-scoped configuration file, which is the
+/// installation's own. `GIT_CONFIG_SYSTEM` and `GIT_CONFIG_NOSYSTEM` are removed
+/// because they relocate or switch off the system *scope* without moving the
+/// installation, and this asks where git is installed.
+///
+/// It differs in the one respect that matters for a binary that *is* `git` on this
+/// machine's `PATH`: rather than probing whichever `git` `PATH` resolves first and
+/// giving up if it does not answer, it walks every `git` on `PATH` and keeps the
+/// first answer. A shadow that asks itself where git is installed learns nothing,
+/// and gitoxide's probe — written for a library linked *into* a program that is
+/// not git — has no reason to expect that. Candidates resolving to this very
+/// executable are skipped outright, which is both the correct answer (we are not a
+/// second installation) and what stops the probe from spawning itself.
+///
+/// Probed once per process; `git var` is the only caller and asks at most twice.
+fn installation_config() -> Option<&'static Path> {
+    static PATH: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    PATH.get_or_init(|| {
+        let me = std::env::current_exe().and_then(|p| p.canonicalize()).ok();
+        let path = std::env::var_os("PATH")?;
+        std::env::split_paths(&path)
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .map(|dir| dir.join(gix::path::env::exe_invocation()))
+            .filter(|git| git.is_file())
+            .filter(|git| git.canonicalize().ok() != me)
+            .find_map(|git| ask_installation_config(&git))
+    })
+    .as_deref()
+}
+
+/// Ask one `git` binary for the highest-scoped configuration file it can see.
+fn ask_installation_config(git: &Path) -> Option<std::path::PathBuf> {
+    let out = std::process::Command::new(git)
+        .args(["config", "-lz", "--show-origin", "--name-only"])
+        // Run from the root, as gitoxide does: a deleted or deeply nested cwd
+        // costs the child a discovery walk for an answer that does not depend on it.
+        .current_dir(Path::new("/"))
+        .env_remove("GIT_CONFIG")
+        .env_remove("GIT_CONFIG_SYSTEM")
+        .env_remove("GIT_CONFIG_NOSYSTEM")
+        .env_remove("GIT_DISCOVERY_ACROSS_FILESYSTEM")
+        .env_remove("GIT_OBJECT_DIRECTORY")
+        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+        .env_remove("GIT_COMMON_DIR")
+        .env("GIT_DIR", "/dev/null")
+        .env("GIT_WORK_TREE", "/dev/null")
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    let first = out.stdout.strip_prefix(b"file:")?;
+    let end = first.iter().position(|&b| b == 0)?;
+    gix::path::try_from_byte_slice(&first[..end]).ok().map(Path::to_owned)
 }
 
 /// `GIT_ATTR_GLOBAL` — `core.attributesFile` if set, else the XDG attributes path.
@@ -327,10 +471,9 @@ fn attr_global(cfg: &ConfigFile) -> Result<Option<BString>> {
 /// `GIT_CONFIG_SYSTEM` — git's `git_system_config()`.
 ///
 /// `GIT_CONFIG_NOSYSTEM` suppresses it outright; failing that `GIT_CONFIG_SYSTEM`
-/// names the file directly; failing that it is `etc/gitconfig` under git's
-/// installation prefix. That last branch is the same prefix `GIT_ATTR_SYSTEM`
-/// resolves, recovered the same way and for the same reason — `system_prefix()` is
-/// a flat `/` off Windows, which is only right for a git installed under `/`.
+/// names the file directly; failing that it is `gitconfig` in the same directory
+/// `GIT_ATTR_SYSTEM` hangs off, resolved by [`installation_prefix`] — git derives
+/// both from one `system_path()` call, so they cannot disagree.
 fn config_system() -> Option<BString> {
     if env_bool("GIT_CONFIG_NOSYSTEM") {
         return None;
@@ -338,9 +481,7 @@ fn config_system() -> Option<BString> {
     if let Some(configured) = std::env::var_os("GIT_CONFIG_SYSTEM") {
         return Some(path_bytes(std::path::PathBuf::from(configured)));
     }
-    gix::path::env::installation_config_unsuppressed()
-        .map(path_bytes)
-        .or_else(|| gix::path::env::system_prefix().map(|p| path_bytes(p.join("etc/gitconfig"))))
+    Some(path_bytes(installation_prefix().etc().join("gitconfig")))
 }
 
 /// The storage locations of the given config `sources`, highest priority first.
@@ -453,4 +594,62 @@ fn without_crud(s: &str) -> String {
         .chars()
         .filter(|c| !c.is_control())
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `strip_path_suffix()` removes whole components, which is the difference
+    /// between deriving a prefix and truncating a string: `/opt/homebrewbin`
+    /// ends in the *characters* `bin` and is not a `bin` directory.
+    #[test]
+    fn suffix_stripping_respects_component_boundaries() {
+        for (dir, suffix, want) in [
+            ("/opt/homebrew/bin", "bin", Some("/opt/homebrew")),
+            ("/usr/local/libexec/git-core", "libexec/git-core", Some("/usr/local")),
+            // git installed at the root: the prefix is `/`, not "nothing".
+            ("/bin", "bin", Some("/")),
+            ("/opt/homebrewbin", "bin", None),
+            ("/opt/homebrew/bin/x", "bin", None),
+            ("/opt/homebrew/git-core", "libexec/git-core", None),
+            // Nothing is left to be a prefix, so there is no prefix.
+            ("bin", "bin", None),
+        ] {
+            assert_eq!(
+                strip_path_suffix(Path::new(dir), suffix).as_deref(),
+                want.map(Path::new),
+                "strip_path_suffix({dir:?}, {suffix:?})"
+            );
+        }
+    }
+
+    /// The chain git tries in `system_prefix()`, in git's order. A `libexec/git-core`
+    /// layout must not be answered by the `bin` rule, and a build tree must match
+    /// nothing at all — that last case is what sends `installation_prefix()` on to
+    /// its next source instead of inventing a prefix from `target/debug`.
+    #[test]
+    fn executable_suffix_chain_matches_gits_order() {
+        let chain = |dir: &str| {
+            ["libexec/git-core", "bin", "git"]
+                .iter()
+                .find_map(|s| strip_path_suffix(Path::new(dir), s))
+        };
+        assert_eq!(chain("/usr/local/libexec/git-core").as_deref(), Some(Path::new("/usr/local")));
+        assert_eq!(chain("/opt/homebrew/bin").as_deref(), Some(Path::new("/opt/homebrew")));
+        assert_eq!(chain("/c/Program Files/Git/git").as_deref(), Some(Path::new("/c/Program Files/Git")));
+        assert_eq!(chain("/home/u/zvcs/target/debug"), None);
+    }
+
+    /// The two granularities must stay distinct. A probed `sysconfdir` is already
+    /// the directory the files live in — appending `etc` to Debian's `/etc` would
+    /// name `/etc/etc/gitattributes` — while a prefix still needs it.
+    #[test]
+    fn etc_is_appended_to_a_prefix_and_only_to_a_prefix() {
+        assert_eq!(Installation::Etc("/etc".into()).etc(), Path::new("/etc"));
+        assert_eq!(
+            Installation::Prefix("/opt/homebrew".into()).etc(),
+            Path::new("/opt/homebrew/etc")
+        );
+    }
 }

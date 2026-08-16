@@ -39,9 +39,11 @@
 //! The build report will not match stock's byte for byte, and is not meant to:
 //! it describes a Rust binary on gitoxide, not a C binary on zlib/libcurl. The
 //! values that differ do so because they are *true here and false there*
-//! (`rust: enabled`, `SHA-1: sha1-checked`), and the lines that are absent are
-//! absent because this build has no such component to report — the same reason
-//! git's own `#ifdef`s drop `libcurl:` from a build without curl.
+//! (`rust: enabled` against stock's `rust: disabled` is the clearest case, and
+//! is unfixable by construction — the honest value and the matching value are
+//! opposites). The lines that are absent are absent because this build has no
+//! such component to report — the same reason git's own `#ifdef`s drop
+//! `libcurl:` from a build without curl.
 //!
 //! Note that `git <cmd> --help` never reaches a builtin: `git.c` rewrites it to
 //! `git help <cmd>` before dispatch, so `--help` is not handled here.
@@ -155,13 +157,29 @@ pub fn version(args: &[String]) -> Result<ExitCode> {
 /// is therefore a true statement about what the binary will execute.
 const SHELL_PATH: &str = crate::external::SHELL_PATH;
 
-/// The SHA-1 implementation this build links: the `sha1-checked` crate, which
-/// `gix-hash` drives with the same collision-detection algorithm git uses.
+/// git's `SHA1_BACKEND` for the backend this build actually uses.
 ///
-/// git's `SHA1_BACKEND` names a C library (`SHA1_DC`, `BLK_SHA1`,
-/// `OPENSSL_SHA1`, …). None of those is linked here, so the crate is named
-/// instead; printing git's token would claim a C dependency that does not exist.
-const SHA1_BACKEND: &str = "sha1-checked";
+/// The token names a *backend category*, not a library file: `hash.h` picks
+/// between `"SHA1_APPLE (No collision detection)"`, `"SHA1_OPENSSL (No collision
+/// detection)"`, `"SHA1_DC"` and `"SHA1_BLK (No collision detection)"`, and the
+/// one distinction the annotations draw is whether the backend detects collision
+/// attacks. `SHA1_DC` is the collision-detecting one.
+///
+/// This build's SHA-1 is `sha1-checked`, whose own header cites
+/// `cr-marcstevens/sha1collisiondetection` and Stevens' paper as what it
+/// implements — the same code git's `DC_SHA1` builds. `gix-hash` drives it in
+/// git's configuration: `sha1_checked::Builder::default().safe_hash(false)`,
+/// documented there as matching git, which bails out on a detected attack rather
+/// than computing an alternate safe hash
+/// (`src/ported/gix-hash/src/hasher.rs`). So `SHA-1: SHA1_DC` states the true
+/// thing about this build — collision-detecting SHA-1, git's algorithm, git's
+/// bail-out configuration — in git's own vocabulary for it.
+const SHA1_BACKEND: &str = "SHA1_DC";
+
+/// The version of `zlib-rs` the workspace lockfile resolved, harvested by
+/// `build.rs` (empty when the crate is not in the graph, in which case the line
+/// is dropped rather than guessed).
+const ZLIB_RS_VERSION: &str = env!("ZVCS_ZLIB_RS_VERSION");
 
 /// Port of `get_version_info()` (help.c), reduced to what is true of this
 /// binary. `git version --build-options`, `git diagnose` and `git bugreport` all
@@ -177,6 +195,13 @@ const SHA1_BACKEND: &str = "sha1-checked";
 ///     the target this was compiled for, taken from `libc::c_long` and `usize`.
 ///   * `shell-path:` — [`SHELL_PATH`].
 ///   * `rust:` — git's `WITH_RUST`, "this build contains Rust code". It does.
+///   * `zlib-rs:` — [`ZLIB_RS_VERSION`], the flate library this build links, in
+///     git's own `zlib-ng:`-style "name the implementation" slot. Qualified
+///     `(inflate only)` because that is the whole of its use here: `zlib_rs` is
+///     referenced from `gix-zlib`'s `decompress.rs` and nowhere else, while
+///     `gix-zlib`'s `deflate.rs` is an in-tree transcription of zlib's
+///     `deflate.c`/`trees.c` — part of this binary, with no library version of
+///     its own to print.
 ///   * `SHA-1:` — [`SHA1_BACKEND`].
 ///   * `default-ref-format:` / `default-hash:` — `files` and `sha1`. Both are
 ///     the defaults here *and* the only formats this port accepts;
@@ -191,14 +216,16 @@ const SHA1_BACKEND: &str = "sha1-checked";
 ///   * `gettext:` — no message catalogs are compiled in.
 ///   * `libcurl:` / `OpenSSL:` — the transport is reqwest + rustls, a pure-Rust
 ///     stack; neither C library is linked.
-///   * `zlib:` / `zlib-ng:` — git prints the `ZLIB_VERSION` of the library it
-///     links. This build links no zlib: `gix-zlib`'s deflate is an in-tree
-///     transcription of zlib's `deflate.c`/`trees.c` and its inflate is
-///     `zlib-rs`. Neither carries a `ZLIB_VERSION`, and quoting one would name a
-///     library that is not there.
+///   * `zlib:` / `zlib-ng:` — git prints the `ZLIB_VERSION` of the C library it
+///     links. Neither library is linked here, and `zlib-rs` exposes no
+///     `ZLIB_VERSION` of its own, so the version it *is* built from is reported
+///     under its own name (`zlib-rs:`, above) instead. Printing either of git's
+///     two spellings would name a library that is not there.
 ///   * `SHA-256:` — git prints it unconditionally because it always has a
-///     backend. The `sha2` crate is not in this build's dependency graph, so
-///     there is nothing to name.
+///     backend; its four tokens (`SHA256_BLK`, `SHA256_OPENSSL`,
+///     `SHA256_NETTLE`, `SHA256_GCRYPT`) all name one. This build has none:
+///     `gix-hash`'s `sha256` feature is off, so `sha2` is not in the dependency
+///     graph and `Kind::Sha256` is not even compiled in.
 pub(crate) fn get_version_info(out: &mut String, show_build_options: bool) {
     // "The format of this string should be kept stable for compatibility with
     // external projects that rely on the output of `git version`."
@@ -216,6 +243,14 @@ pub(crate) fn get_version_info(out: &mut String, show_build_options: bool) {
     out.push_str(&format!("sizeof-size_t: {}\n", std::mem::size_of::<usize>()));
     out.push_str(&format!("shell-path: {SHELL_PATH}\n"));
     out.push_str("rust: enabled\n");
+    // git's slot for the flate library it links, named after the implementation
+    // the way its own `zlib-ng:` / `zlib:` pair is. The role qualifier follows
+    // `SHA1_BACKEND`'s precedent of annotating the value, and is required for the
+    // line to be true: `zlib-rs` is reached only from `gix-zlib`'s `decompress`
+    // module, never from its `deflate` module.
+    if !ZLIB_RS_VERSION.is_empty() {
+        out.push_str(&format!("zlib-rs: {ZLIB_RS_VERSION} (inflate only)\n"));
+    }
     out.push_str(&format!("SHA-1: {SHA1_BACKEND}\n"));
     out.push_str("default-ref-format: files\n");
     out.push_str("default-hash: sha1\n");

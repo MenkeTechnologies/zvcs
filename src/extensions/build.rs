@@ -17,6 +17,8 @@
 use std::{env, fs, path::Path};
 
 fn main() {
+    emit_zlib_rs_version();
+
     // Package root is src/extensions/; the porcelain modules live under src/.
     let dir = Path::new("src/porcelain");
     println!("cargo:rerun-if-changed=src/porcelain");
@@ -83,6 +85,36 @@ fn main() {
 
     let dest = Path::new(&env::var("OUT_DIR").unwrap()).join("porcelain_spec.rs");
     fs::write(dest, out).unwrap();
+}
+
+/// `git version --build-options` names the flate library the binary links, the
+/// way stock prints `zlib:` / `zlib-ng:` for the one *it* links. The version has
+/// to be read out of the resolved dependency graph rather than written into the
+/// source, or it silently goes stale the first time the lockfile moves.
+///
+/// The lockfile is the workspace root's (`src/extensions` is a member), and an
+/// empty value is emitted rather than a guess when `zlib-rs` is not in the graph
+/// — `porcelain::version` drops the line entirely on an empty string, so a
+/// dropped dependency removes the claim instead of freezing a false one.
+fn emit_zlib_rs_version() {
+    let manifest = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
+    let lock = Path::new(&manifest).join("..").join("..").join("Cargo.lock");
+    println!("cargo:rerun-if-changed={}", lock.display());
+
+    let version = fs::read_to_string(&lock).ok().and_then(|text| lock_version(&text, "zlib-rs"));
+    println!("cargo:rustc-env=ZVCS_ZLIB_RS_VERSION={}", version.unwrap_or_default());
+}
+
+/// The `version = "…"` of the `[[package]]` block whose `name` is `crate_name`,
+/// read straight out of a Cargo.lock. The scan stops at the next `[[package]]`
+/// header so a missing `version` key cannot pick up the next package's.
+fn lock_version(text: &str, crate_name: &str) -> Option<String> {
+    let needle = format!("name = \"{crate_name}\"");
+    let mut lines = text.lines().skip_while(|l| l.trim() != needle);
+    lines.next()?; // consume the matched `name = …` line itself
+    lines
+        .take_while(|l| !l.trim_start().starts_with("[["))
+        .find_map(|l| Some(l.trim().strip_prefix("version = \"")?.strip_suffix('"')?.to_string()))
 }
 
 fn dedup_sorted(it: impl Iterator<Item = String>) -> Vec<String> {

@@ -2521,7 +2521,8 @@ fn read_autostash(repo: &gix::Repository) -> Option<ObjectId> {
 }
 
 /// `git rebase --abort`: restore the worktree, index and branch to `orig-head`,
-/// re-attach `HEAD`, and drop the state directory.
+/// re-attach `HEAD`, clear the merge state the stop recorded, and drop the state
+/// directory.
 fn rebase_abort(repo: &gix::Repository) -> Result<ExitCode> {
     let st = read_basic_state(repo)?;
     let should_interrupt = AtomicBool::new(false);
@@ -2551,6 +2552,23 @@ fn rebase_abort(repo: &gix::Repository) -> Result<ExitCode> {
         set_head(repo, Target::Symbolic(name), &format!("{} (abort): returning", reflog_action()))?;
     } else {
         set_head(repo, Target::Object(st.orig_head), &format!("{} (abort)", reflog_action()))?;
+    }
+    // `remove_branch_state(the_repository, 0)` (builtin/rebase.c's `ACTION_ABORT`),
+    // which is `remove_merge_branch_state()` plus `SQUASH_MSG` (branch.c:803-818),
+    // and `finish_rebase()`'s `delete_ref(NULL, "REBASE_HEAD", …)`
+    // (builtin/rebase.c:551). An abort is the one resume path that drops
+    // `REBASE_HEAD` — `--continue` and `--skip` both leave it naming the commit
+    // they were applying, which stock does too.
+    for f in [
+        "MERGE_HEAD",
+        "MERGE_RR",
+        "MERGE_MSG",
+        "MERGE_MODE",
+        "AUTO_MERGE",
+        "SQUASH_MSG",
+        "REBASE_HEAD",
+    ] {
+        let _ = std::fs::remove_file(repo.git_dir().join(f));
     }
     // Re-apply any autostash the interrupted rebase saved, onto the restored
     // orig-head tree, before dropping the state dir that holds its reference.
@@ -2966,6 +2984,12 @@ fn rebase_continue(repo: &gix::Repository, skip: bool) -> Result<ExitCode> {
         // rebuilds it in `commit_staged_changes()`. Dropping the whole chain is
         // the same thing whenever the skipped instruction was the only member.
         let _ = std::fs::remove_file(dir.join("stopped-sha"));
+        // The per-instruction reset the pick loop runs before every instruction
+        // (sequencer.c:4624-4629) — the merge state the stop recorded belongs to
+        // the instruction being thrown away. `REBASE_HEAD` is *not* dropped here:
+        // stock leaves it naming the skipped commit, and this measured the same.
+        let _ = std::fs::remove_file(repo.git_dir().join("MERGE_MSG"));
+        let _ = std::fs::remove_file(repo.git_dir().join("AUTO_MERGE"));
     } else if let Some(code) = seq.commit_staged_changes()? {
         return Ok(code);
     }
@@ -3409,7 +3433,27 @@ impl<'r> Sequencer<'r> {
         self.index.write(Default::default())?;
 
         if !applied.conflicts.is_empty() {
-            return self.stop_for_conflict(item, oid, &short, &subject, &message);
+            // `merge_switch_to_result()` records the merged tree as `AUTO_MERGE`
+            // whether or not the merge came out clean (merge-ort.c:4702-4707) —
+            // a conflicted pick is precisely when `git diff AUTO_MERGE` is worth
+            // having, and `sequencer_post_commit_cleanup()` is what removes it
+            // again once the stop is over.
+            crate::merge_apply::write_auto_merge(repo, applied.tree_id)?;
+            // `if (is_rebase_i(opts) && write_author_script(msg.message) < 0)`
+            // (sequencer.c:2298) runs *before* the merge, so the picked commit's
+            // author survives a conflict: both a `git commit` made during the
+            // stop and `--continue` read it back through `read_env_script()`.
+            // Writing it only on the paths that reach the commit left a stop with
+            // no record of the author it was replaying.
+            write_author_script(repo, &commit)?;
+            return self.stop_for_conflict(
+                item,
+                oid,
+                &short,
+                &subject,
+                &message,
+                Some(&applied.conflicts),
+            );
         }
 
         let fast_forward = self.st.allow_ff
@@ -3744,7 +3788,7 @@ impl<'r> Sequencer<'r> {
             std::fs::write(repo.git_dir().join("MERGE_MSG"), &message)?;
             let short = todo::short_name(repo, original);
             let subject = first_line(message.as_bstr());
-            return self.stop_for_conflict(item, original, &short, &subject, &message);
+            return self.stop_for_conflict(item, original, &short, &subject, &message, None);
         }
 
         write_author_script(repo, &commit)?;
@@ -3804,7 +3848,11 @@ impl<'r> Sequencer<'r> {
         self.term_clear_line();
         eprintln!("Stopped at {short}...  {}", item.arg.to_str_lossy());
         let dir = self.dir();
-        std::fs::write(dir.join("stopped-sha"), format!("{at}\n"))?;
+        // `error_with_patch(…, to_amend = 1)` runs `make_patch()` first
+        // (sequencer.c:3505-3507), so an `edit` stop records the same
+        // `REBASE_HEAD`/`patch`/`message` a conflict stop does — that is what
+        // makes `git rebase --show-current-patch` work at an `edit`.
+        make_patch(self.repo, &dir, &self.repo.find_commit(at)?)?;
         std::fs::write(dir.join("amend"), format!("{}\n", self.repo.head_id()?.detach()))?;
         eprintln!(
             "You can amend the commit now, with\n\n  git commit --amend \n\n\
@@ -4051,16 +4099,55 @@ impl<'r> Sequencer<'r> {
         short: &str,
         subject: &BString,
         message: &BString,
+        // The conflicted paths a `pick` stopped on, or `None` from the `merge`
+        // command — `do_merge()` has its own `MERGE_MSG` and writes it before
+        // getting here.
+        conflicts: Option<&[BString]>,
     ) -> Result<Step> {
         let dir = self.dir();
+        // The `merge` command's stop never reaches `make_patch()` below, so the
+        // stopped commit is recorded here; a `pick`'s `make_patch()` rewrites the
+        // same id.
         std::fs::write(dir.join("stopped-sha"), format!("{oid}\n"))?;
+        // `do_recursive_merge()` appends `append_conflicts_hint()`'s block to the
+        // message buffer, and `do_pick_commit()` then writes that buffer out with
+        // `write_message(msgbuf.buf, msgbuf.len, git_path_merge_msg(r), 0)`
+        // (sequencer.c:2309-2310). `MERGE_MSG` is what a bare `git commit` made
+        // during the stop picks up, so without it the resolved pick loses the
+        // message it was replaying.
+        let hinted = conflicts.map(|paths| {
+            let mut out = message.to_vec();
+            out.extend_from_slice(b"\n# Conflicts:\n");
+            for path in paths {
+                out.extend_from_slice(b"#\t");
+                out.extend_from_slice(&path[..]);
+                out.push(b'\n');
+            }
+            out
+        });
         // The message `--continue` will commit. A conflicted fixup/squash
         // commits the running combination instead of the picked commit's own
-        // message (`error_failed_squash()`).
+        // message (`error_failed_squash()`), and that copy also replaces
+        // `MERGE_MSG` (sequencer.c:3548-3555).
         if item.cmd.is_fixup() && dir.join("message-squash").exists() {
             std::fs::copy(dir.join("message-squash"), dir.join("message"))?;
+            if conflicts.is_some() {
+                std::fs::copy(dir.join("message"), self.repo.git_dir().join("MERGE_MSG"))?;
+            }
         } else {
-            std::fs::write(dir.join("message"), message)?;
+            match &hinted {
+                Some(hinted) => {
+                    std::fs::write(dir.join("message"), hinted)?;
+                    std::fs::write(self.repo.git_dir().join("MERGE_MSG"), hinted)?;
+                }
+                None => std::fs::write(dir.join("message"), message)?,
+            }
+        }
+        // `error_with_patch()` opens with `make_patch()` whenever it has a commit
+        // (sequencer.c:3505-3507); the `message` above is already on disk, so the
+        // `if (!file_exists(…))` arm there leaves it alone.
+        if conflicts.is_some() {
+            make_patch(self.repo, &dir, &self.repo.find_commit(oid)?)?;
         }
         if let Some(oid) = self.autostash {
             let _ = std::fs::write(dir.join("autostash"), format!("{oid}\n"));
@@ -4193,6 +4280,48 @@ impl<'r> Sequencer<'r> {
         }
         Ok(ExitCode::SUCCESS)
     }
+}
+
+/// `make_patch()` (sequencer.c:3440-3485) — everything an `error_with_patch()`
+/// stop records about the commit it stopped on:
+///
+/// ```c
+/// if (write_message(hex, strlen(hex), rebase_path_stopped_sha(), 1) < 0)
+///         return -1;
+/// res |= write_rebase_head(&commit->object.oid);
+/// …
+/// log_tree_opt.diffopt.file = fopen("$dir/patch", "w");
+/// …
+/// strbuf_addf(&buf, "%s/message", get_dir(opts));
+/// if (!file_exists(buf.buf))
+///         res |= write_message(…);
+/// ```
+///
+/// Each of the three has a reader: `REBASE_HEAD` is what `git show REBASE_HEAD`
+/// resolves and what `git commit` tests for its `FROM_REBASE_PICK` shortcut
+/// (`porcelain::commit`), `patch` is what `--show-current-patch --diff` prints,
+/// and `message` is what `--continue` commits — which is why it is only written
+/// when nothing has put one there already.
+fn make_patch(repo: &gix::Repository, dir: &std::path::Path, commit: &gix::Commit<'_>) -> Result<()> {
+    let oid = commit.id().detach();
+    std::fs::write(dir.join("stopped-sha"), format!("{oid}\n"))?;
+    // `write_rebase_head()` (sequencer.c:1614-1621). The pseudo-ref is a bare
+    // loose file holding the id, with no reflog — verified against stock, whose
+    // `.git/logs` gains nothing when the stop happens.
+    std::fs::write(repo.git_dir().join("REBASE_HEAD"), format!("{oid}\n"))?;
+    let parent = commit.parent_ids().next().map(|p| p.detach());
+    let patch = super::diff::commit_patch(repo, commit, parent, 3)?;
+    std::fs::write(dir.join("patch"), patch)?;
+    let message = dir.join("message");
+    if !message.exists() {
+        // `write_message(…, append_eol = 1)` appends a newline unconditionally
+        // (sequencer.c:498), so the raw message — which already ends in one —
+        // lands with a trailing blank line.
+        let mut body = commit.message_raw()?.to_vec();
+        body.push(b'\n');
+        std::fs::write(message, body)?;
+    }
+    Ok(())
 }
 
 /// `write_author_script()`: the replayed commit's author, in the sq-quoted

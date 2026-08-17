@@ -818,6 +818,8 @@ fn continue_single_pick(
     let committer = repo
         .committer()
         .ok_or_else(|| anyhow::anyhow!("no committer identity configured"))??;
+    let author_ident = format!("{} <{}>", author.name, author.email);
+    let committer_ident = format!("{} <{}>", committer.name, committer.email);
     let commit = gix::objs::Commit {
         message: message.clone().into(),
         tree: tree_id,
@@ -849,7 +851,17 @@ fn continue_single_pick(
     crate::sequencer::post_commit_cleanup(repo)?;
 
     let head_tree = repo.find_commit(head_id)?.tree_id()?.detach();
-    print_summary(repo, new_id, &subject, &author_time, head_tree, tree_id, false)?;
+    print_summary(
+        repo,
+        new_id,
+        &subject,
+        &author_ident,
+        &committer_ident,
+        &author_time,
+        head_tree,
+        tree_id,
+        false,
+    )?;
     Ok(Ok(()))
 }
 
@@ -1240,6 +1252,8 @@ fn revert_one(
         .author()
         .ok_or_else(|| anyhow::anyhow!("no author identity configured"))??;
     let author_time = author.time()?;
+    let author_ident = format!("{} <{}>", author.name, author.email);
+    let committer_ident = format!("{} <{}>", committer.name, committer.email);
     let commit = gix::objs::Commit {
         message: message.clone().into(),
         tree: merged_tree,
@@ -1274,7 +1288,17 @@ fn revert_one(
         let _ = std::fs::remove_file(repo.git_dir().join(f));
     }
 
-    print_summary(repo, new_id, &subject, &author_time, ours_tree, merged_tree, true)?;
+    print_summary(
+        repo,
+        new_id,
+        &subject,
+        &author_ident,
+        &committer_ident,
+        &author_time,
+        ours_tree,
+        merged_tree,
+        true,
+    )?;
     Ok(Step::Done)
 }
 
@@ -1635,12 +1659,16 @@ fn stripspace(s: &str, strip_comments: bool) -> String {
 }
 
 /// The block git prints after a successful revert: the id/subject line, the
-/// author `Date:` line the sequencer always requests, the short-stat, and the
-/// create/delete/mode-change summary.
+/// `Author:` line a divergent identity earns, the author `Date:` line the
+/// sequencer always requests, the short-stat, and the create/delete/mode-change
+/// summary.
+#[allow(clippy::too_many_arguments)]
 fn print_summary(
     repo: &gix::Repository,
     new_id: ObjectId,
     subject: &str,
+    author_ident: &str,
+    committer_ident: &str,
     author_time: &gix::date::Time,
     old_tree: ObjectId,
     new_tree: ObjectId,
@@ -1652,6 +1680,19 @@ fn print_summary(
     };
     let short = new_id.attach(repo).shorten_or_id();
     println!("[{label} {short}] {subject}");
+    // ```c
+    // format_commit_message(commit, "%an <%ae>", &author_ident, &pctx);
+    // format_commit_message(commit, "%cn <%ce>", &committer_ident, &pctx);
+    // if (strbuf_cmp(&author_ident, &committer_ident)) {
+    //         strbuf_addstr(&format, "\n Author: ");
+    // ```
+    //
+    // (sequencer.c:1339-1344). The comparison is of the *new* commit's two
+    // identities, so it is `GIT_AUTHOR_*` at revert time — not the reverted
+    // commit's author, which a revert never reuses — that decides the line.
+    if author_ident != committer_ident {
+        println!(" Author: {author_ident}");
+    }
     // `SUMMARY_SHOW_AUTHOR_DATE`: the sequencer always sets it, but the child
     // `git commit` a `--continue` runs only does when `author_date_is_interesting()`
     // — `author_message || force_date`. A revert reuses no author, so its
@@ -1752,31 +1793,7 @@ fn print_summary(
 /// as `"\303\274\303\261\303\257\303\247\303\270d\303\251.txt"` — while a plain
 /// space, which needs no escape, keeps the path unquoted.
 fn quote_path(path: &BString) -> String {
-    let needs_quoting = path
-        .iter()
-        .any(|&b| !(0x20..0x7f).contains(&b) || b == b'"' || b == b'\\');
-    if !needs_quoting {
-        return path.to_string();
-    }
-    let mut out = String::with_capacity(path.len() + 2);
-    out.push('"');
-    for &b in path.iter() {
-        match b {
-            0x07 => out.push_str("\\a"),
-            0x08 => out.push_str("\\b"),
-            0x09 => out.push_str("\\t"),
-            0x0a => out.push_str("\\n"),
-            0x0b => out.push_str("\\v"),
-            0x0c => out.push_str("\\f"),
-            0x0d => out.push_str("\\r"),
-            b'"' => out.push_str("\\\""),
-            b'\\' => out.push_str("\\\\"),
-            _ if !(0x20..0x7f).contains(&b) => out.push_str(&format!("\\{b:03o}")),
-            _ => out.push(b as char),
-        }
-    }
-    out.push('"');
-    out
+    crate::quote::quoted_name_string(path.as_slice())
 }
 
 /// The 6-digit octal mode git prints in create/delete/mode-change lines.

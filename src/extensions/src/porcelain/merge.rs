@@ -1065,13 +1065,6 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
         true => refs.to_vec(),
         false => fetch_head.iter().map(|(_, described)| described.clone()).collect(),
     };
-    // `GIT_REFLOG_ACTION` is `merge <name>` per head (merge.c:1583-1585), and the
-    // name `get_merge_parent()` records for a FETCH_HEAD line is the object id —
-    // which is why `git merge FETCH_HEAD` reflogs `merge <oid>`.
-    let reflog_spec: String = match fetch_head.is_empty() {
-        true => refs.join(" "),
-        false => fetch_head.iter().map(|(id, _)| id.to_string()).collect::<Vec<_>>().join(" "),
-    };
     // What a *strategy* was handed, which is what `git-merge-octopus` echoes in
     // its per-head lines: the object id for a FETCH_HEAD merge, since that is
     // what `cmd_merge()` passes on, and the spec as typed otherwise.
@@ -1106,13 +1099,43 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
         targets.push(commit.id);
     }
 
+    // `collect_parents()` ends every arm with `reduce_parents()`
+    // (builtin/merge.c:1219/1228), which reduces `{HEAD} ∪ remoteheads` to its
+    // independent members and then drops `HEAD` itself. `HEAD` is in that set
+    // because `collect_parents()` inserts it before the operand loop
+    // (builtin/merge.c:1214-1215), which is what makes an operand `HEAD` already
+    // reaches disappear — so `git merge <side> <ancestor-of-HEAD>` is the
+    // two-head `git merge <side>`, ort and all, not an octopus.
+    //
+    // Everything downstream reads the reduced list: `GIT_REFLOG_ACTION`
+    // (merge.c:1493-1496), `--verify-signatures` (merge.c:1486-1491), the
+    // generated message (merge.c:1229-1233), the strategy choice
+    // (merge.c:1515-1522) and the parents the merge commit records. Reducing
+    // here rather than at each of those is what keeps them in step.
+    let keep = independent_heads(&repo, local_id, &targets)?;
+    let targets = mask(targets, &keep);
+    // `refs` is index-parallel with the operands only when the heads came from
+    // the command line; a `FETCH_HEAD` merge has one operand and any number of
+    // heads, and `FETCH_HEAD` stays the label whichever survive.
+    let refs_owned: Vec<String>;
+    let refs: &[String] = match fetch_head.is_empty() {
+        true => {
+            refs_owned = mask(refs.to_vec(), &keep);
+            &refs_owned
+        }
+        false => refs,
+    };
+    let msg_specs = mask(msg_specs, &keep);
+    let head_labels = mask(head_labels, &keep);
+    // `GIT_REFLOG_ACTION` is `merge` plus `merge_remote_util(p->item)->name` for
+    // each *surviving* head (merge.c:1493-1496) — the same names the strategies
+    // are handed, which is why a `FETCH_HEAD` merge reflogs `merge <oid>`.
+    let reflog_spec: String = head_labels.join(" ");
+
     // `collect_parents()`'s *second* pass over the operands, which is where a
     // generated merge message is built:
     //
     // ```c
-    // if (merge_msg && (!have_message || shortlog_len))
-    //         autogen = &merge_names;
-    // …
     // remoteheads = reduce_parents(head_commit, head_subsumed, remoteheads);
     // if (autogen) {
     //         struct commit_list *p;
@@ -1127,24 +1150,27 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
     // (`have_message`) drops the pass to one warning per operand, `--log` or
     // `merge.log` puts it back even with `-m`, and `reduce_parents()` running
     // first is why merging an ancestor of `HEAD` warns once and not twice — the
-    // head is dropped before `merge_name()` ever sees it.
+    // head is gone from `refs` above before `merge_name()` ever sees it.
     //
     // The message itself is composed much later here (`compose_message`), after
     // `Already up to date.` has had its chance to return, so the pass cannot ride
     // along with it and is done here where git does it.
-    if opts.message.is_none() || opts.log_len != 0 {
-        // `reduce_heads()` walks history; the answer only ever gates a warning,
-        // so it is not asked for unless some operand could produce one.
-        let specs: Vec<&String> = refs.iter().filter(|_| fetch_head.is_empty()).collect();
-        if specs.iter().any(|s| crate::objname::full_hex(&repo, s).is_some()) {
-            for (spec, keep) in
-                specs.iter().zip(independent_heads(&repo, local_id, &targets)?)
-            {
-                if keep {
-                    crate::objname::warn_ambiguous_refname(&repo, spec.as_str());
-                }
-            }
+    if (opts.message.is_none() || opts.log_len != 0) && fetch_head.is_empty() {
+        for spec in refs {
+            crate::objname::warn_ambiguous_refname(&repo, spec.as_str());
         }
+    }
+
+    // `if (!remoteheads) … finish_up_to_date()` (builtin/merge.c:1550-1558):
+    // every operand was reachable from `HEAD`, so there is nothing left to merge.
+    // `ORIG_HEAD` is still recorded — merge.c:1542 sits above that arm — which is
+    // why an up-to-date `git merge` moves it.
+    if targets.is_empty() {
+        set_orig_head(&repo, local_id)?;
+        if !opts.quiet {
+            println!("{}", up_to_date_line(opts));
+        }
+        return Ok(ExitCode::SUCCESS);
     }
 
     // `--verify-signatures` / `merge.verifySignatures`. git runs this over the
@@ -1373,10 +1399,40 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
         }
 
         // Conflicts: record the in-progress merge and stop with git's message.
+        //
+        // `cmd_merge()` forks here rather than after the notice:
+        //
+        // ```c
+        // if (squash) {
+        //         finish(head_commit, remoteheads, NULL, NULL);
+        //         …
+        // } else
+        //         write_merge_state(remoteheads);
+        // ```
+        //
+        // (builtin/merge.c:1770-1775). `finish()` with a NULL new head records
+        // no ref move and no merge state — it only reaches `squash_message()`,
+        // which announces itself and writes `SQUASH_MSG`. So a conflicted squash
+        // leaves neither `MERGE_HEAD` nor `MERGE_MODE`, and that is a state
+        // difference rather than a wording one: `MERGE_HEAD` is what makes the
+        // next `git commit` write a two-parent commit and what gives
+        // `git merge --abort` a merge to abort, and a squash asked for neither.
         let git_dir = repo.git_dir();
-        std::fs::write(git_dir.join("MERGE_HEAD"), format!("{target_id}\n"))?;
-        std::fs::write(git_dir.join("MERGE_MODE"), merge_mode(opts.ff))?;
-        let mut merge_msg = message.into_bytes();
+        let mut merge_msg = Vec::new();
+        if opts.squash {
+            // `squash_message()` prints before it writes, with no verbosity
+            // check of its own (builtin/merge.c:417).
+            println!("Squash commit -- not updating HEAD");
+            write_squash_msg(&repo, &[target_id], local_id)?;
+        } else {
+            std::fs::write(git_dir.join("MERGE_HEAD"), format!("{target_id}\n"))?;
+            std::fs::write(git_dir.join("MERGE_MODE"), merge_mode(opts.ff))?;
+            merge_msg = message.into_bytes();
+        }
+        // `suggest_conflicts()` opens `MERGE_MSG` with `xfopen(filename, "a")`
+        // and appends `append_conflicts_hint()`'s block (builtin/merge.c:967-979),
+        // so the hint's leading blank line is always there and a squash — which
+        // wrote no message for it to follow — leaves the hint alone in the file.
         merge_msg.extend_from_slice(b"\n# Conflicts:\n");
         for path in &applied.conflicts {
             merge_msg.extend_from_slice(b"#\t");
@@ -1553,6 +1609,12 @@ fn independent_heads(
         keep.push(!duplicate && !subsumed);
     }
     Ok(keep)
+}
+
+/// Keep the entries of an operand-parallel vector that [`independent_heads`]
+/// kept, in operand order — the survivors of `reduce_parents()`.
+fn mask<T>(values: Vec<T>, keep: &[bool]) -> Vec<T> {
+    values.into_iter().zip(keep).filter(|(_, k)| **k).map(|(v, _)| v).collect()
 }
 
 fn guard_checkout(
@@ -2027,13 +2089,36 @@ fn do_octopus(
         if !applied.conflicts.is_empty() {
             // Octopus aborts on the first conflicting head, leaving the conflicted
             // worktree/index and MERGE_HEAD listing every head, as git does.
+            //
+            // The `--squash` fork is `cmd_merge()`'s, not the strategy's
+            // (builtin/merge.c:1770-1775), so it applies here exactly as it does
+            // to the two-head stop: `finish()` with a NULL new head records
+            // `SQUASH_MSG` for every merged head and no merge state at all.
             let git_dir = repo.git_dir();
-            let mut merge_head = String::new();
-            for (_, h) in &heads {
-                merge_head.push_str(&format!("{h}\n"));
+            let mut merge_msg = Vec::new();
+            if opts.squash {
+                println!("Squash commit -- not updating HEAD");
+                write_squash_msg(repo, targets, local_id)?;
+            } else {
+                let mut merge_head = String::new();
+                for (_, h) in &heads {
+                    merge_head.push_str(&format!("{h}\n"));
+                }
+                std::fs::write(git_dir.join("MERGE_HEAD"), merge_head)?;
+                std::fs::write(git_dir.join("MERGE_MODE"), b"")?;
+                merge_msg =
+                    compose_message(repo, refs, targets, branch, local_id, opts)?.into_bytes();
             }
-            std::fs::write(git_dir.join("MERGE_HEAD"), merge_head)?;
-            std::fs::write(git_dir.join("MERGE_MODE"), b"")?;
+            // `suggest_conflicts()` appends the hint to `MERGE_MSG` here too — the
+            // conflicted octopus reaches the same tail of `cmd_merge()` the
+            // two-head stop does, so `git commit` finds the same message waiting.
+            merge_msg.extend_from_slice(b"\n# Conflicts:\n");
+            for path in &applied.conflicts {
+                merge_msg.extend_from_slice(b"#\t");
+                merge_msg.extend_from_slice(&path[..]);
+                merge_msg.push(b'\n');
+            }
+            std::fs::write(git_dir.join("MERGE_MSG"), &merge_msg)?;
             // `suggest_conflicts()` again: record or replay before the notice.
             super::rerere::repo_rerere(repo, opts.rerere_autoupdate)?;
             if !opts.quiet {
@@ -3779,32 +3864,12 @@ fn display_width(s: &str) -> i64 {
     s.chars().count() as i64
 }
 
-/// git's `quote_c_style` as applied to diff path names.
+/// `quote_c_style()`: the name verbatim unless some byte needs escaping, in which
+/// case the whole name double-quoted with C escapes. The table and the
+/// `core.quotePath` flag it reads live in [`crate::quote`], shared with every
+/// other verb that prints a path.
 fn quote_path(path: &[u8]) -> String {
-    let needs = path
-        .iter()
-        .any(|&b| b < 0x20 || b == 0x7f || b == b'"' || b == b'\\' || b >= 0x80);
-    if !needs {
-        return String::from_utf8_lossy(path).into_owned();
-    }
-    let mut out = String::from("\"");
-    for &b in path {
-        match b {
-            b'"' => out.push_str("\\\""),
-            b'\\' => out.push_str("\\\\"),
-            0x07 => out.push_str("\\a"),
-            0x08 => out.push_str("\\b"),
-            0x09 => out.push_str("\\t"),
-            0x0a => out.push_str("\\n"),
-            0x0b => out.push_str("\\v"),
-            0x0c => out.push_str("\\f"),
-            0x0d => out.push_str("\\r"),
-            b if b < 0x20 || b == 0x7f || b >= 0x80 => out.push_str(&format!("\\{b:03o}")),
-            b => out.push(b as char),
-        }
-    }
-    out.push('"');
-    out
+    crate::quote::quoted_name_string(path)
 }
 
 /// The block `finish()` (builtin/merge.c) prints after a merge, rendered as one

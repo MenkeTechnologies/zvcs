@@ -159,6 +159,33 @@ pub struct Options {
     pub ranges: BlameRanges,
     /// Don't consider commits before the given date.
     pub since: Option<gix_date::Time>,
+    /// The commits the walk must not dig past — git's `UNINTERESTING` flag, which is what a
+    /// bottom-ended revision range (`git blame <rev>..<rev>`, `git blame ^<rev>`) means.
+    ///
+    /// `assign_blame()` (`blame.c:2612-2620`) tests it in the same breath as [`Self::since`]:
+    ///
+    /// ```c
+    /// if (sb->reverse ||
+    ///     (!(commit->object.flags & UNINTERESTING) &&
+    ///      !(revs->max_age != -1 && commit->date < revs->max_age)))
+    ///         pass_blame(sb, suspect, opt);
+    /// else {
+    ///         commit->object.flags |= UNINTERESTING;
+    ///         if (commit->object.parsed)
+    ///                 mark_parents_uninteresting(sb->revs, commit);
+    /// }
+    /// ```
+    ///
+    /// So a commit in this set does not pass blame to anything: it keeps whatever is still
+    /// suspected of it, which is both why the range's oldest reachable commits collect the lines
+    /// the range did not touch and why they print with blame's boundary marker.
+    ///
+    /// The set must already be closed under ancestry, because git closes it in two places the
+    /// blame walk cannot see: `limit_list()` marks the ancestors of every bottom while
+    /// `prepare_revision_walk()` runs, and `mark_parents_uninteresting()` above extends it as the
+    /// walk goes. Propagating here instead would miss an ancestor the walk reaches by some other
+    /// path — the far side of a merge — which git has already marked.
+    pub bottom: std::collections::HashSet<ObjectId>,
     /// Determine if rename tracking should be performed, and how.
     pub rewrites: Option<gix_diff::Rewrites>,
     /// Collect debug information whenever there's a diff or rename that affects the outcome of a

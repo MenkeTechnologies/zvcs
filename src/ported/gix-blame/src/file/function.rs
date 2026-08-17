@@ -255,14 +255,18 @@ pub fn file(
         {
             let current_file_path = paths.path(suspect.path).to_owned();
 
-            if let Some(since) = options.since {
-                if commit_time < since.seconds {
-                    if unblamed_to_out_is_done(&mut hunks_to_blame, &mut out, suspect, &paths) {
-                        break 'outer;
-                    }
-
-                    continue 'origin;
+            // `assign_blame()`'s `!(commit->object.flags & UNINTERESTING)` and its
+            // `!(revs->max_age != -1 && commit->date < revs->max_age)`, which are one condition in
+            // git and so are one block here: either way `pass_blame()` is skipped and the commit
+            // keeps what is still suspected of it. See [`Options::bottom`].
+            if options.bottom.contains(&commit_id)
+                || options.since.is_some_and(|since| commit_time < since.seconds)
+            {
+                if unblamed_to_out_is_done(&mut hunks_to_blame, &mut out, suspect, &paths) {
+                    break 'outer;
                 }
+
+                continue 'origin;
             }
 
             // A parentless commit has nothing to pass anything to, so it keeps whatever is

@@ -569,6 +569,7 @@ pub(super) fn blame_with(args: &[String], cmd: &str) -> Result<ExitCode> {
     let mark_ignored_lines = repo.config_snapshot().boolean("blame.markIgnoredLines") == Some(true);
 
     let mut opts = match Options::parse(
+        &repo,
         args,
         ConfigDefaults {
             show_email: show_email_default,
@@ -613,6 +614,8 @@ pub(super) fn blame_with(args: &[String], cmd: &str) -> Result<ExitCode> {
             err.flush()?;
             return print_usage(cmd, true);
         }
+        // The parser has already written everything it had to say.
+        ParseOutcome::Reported(code) => return Ok(code),
         ParseOutcome::Opts(opts) => *opts,
     };
 
@@ -711,14 +714,8 @@ pub(super) fn blame_with(args: &[String], cmd: &str) -> Result<ExitCode> {
     let overlay = opts.contents.is_some() || (opts.rev.is_none() && !opts.reverse);
     let path_in_suspect = blob_at(&repo, &suspect, &rel_path).is_some();
     let mut index_only = false;
-    if !path_in_suspect {
+    if !path_in_suspect && overlay {
         let mut err = std::io::stderr().lock();
-        if !overlay {
-            let rev = opts.rev.as_deref().unwrap_or("HEAD");
-            writeln!(err, "fatal: no such path {rel_path} in {rev}")?;
-            err.flush()?;
-            return Ok(ExitCode::from(128));
-        }
         if !path_in_index(&repo, &rel_path) {
             writeln!(err, "fatal: no such path '{rel_path}' in HEAD")?;
             err.flush()?;
@@ -727,6 +724,105 @@ pub(super) fn blame_with(args: &[String], cmd: &str) -> Result<ExitCode> {
         // The path is only in the index, so there is nothing to blame it against:
         // every line belongs to the synthetic commit holding the final image.
         index_only = true;
+    }
+
+    // `fake_working_tree_commit()`'s stat block (`blame.c:237-268`), the statements
+    // after `verify_working_tree_path()` above:
+    //
+    // ```c
+    // if (!contents_from || strcmp("-", contents_from)) {
+    //         struct stat st;
+    //         const char *read_from;
+    //
+    //         if (contents_from) {
+    //                 if (stat(contents_from, &st) < 0)
+    //                         die_errno("Cannot stat '%s'", contents_from);
+    //                 read_from = contents_from;
+    //         }
+    //         else {
+    //                 if (lstat(path, &st) < 0)
+    //                         die_errno("Cannot lstat '%s'", path);
+    //                 read_from = path;
+    //         }
+    //         …
+    //         switch (st.st_mode & S_IFMT) {
+    //         case S_IFREG: … case S_IFLNK: …
+    //         default:
+    //                 die("unsupported file type %s", read_from);
+    //         }
+    // }
+    // ```
+    //
+    // It runs on the overlay path only — `setup_scoreboard()` builds the fake commit
+    // nowhere else — and is skipped entirely for `--contents -`, which reads standard
+    // input and never touches the filesystem. `path` is the prefix-joined,
+    // repo-root-relative name `add_prefix()` built and `setup_work_tree()` has already
+    // chdir'd for, which is `rel_path` here.
+    //
+    // Reading the file with `.ok()` and falling back to the suspect's blob — which is
+    // what this did — turns a deleted or unreadable working-tree file into a silent
+    // blame of `HEAD`, where git refuses outright.
+    if overlay && opts.contents.as_deref() != Some("-") {
+        // `stat()` for `--contents <file>` and `lstat()` for the working-tree copy:
+        // a dangling symlink in the worktree is a file blame reads (`S_IFLNK` below
+        // takes the link target as the image), not a missing one.
+        let (read_from, verb, stat) = match opts.contents.as_deref() {
+            Some(from) => (from.to_string(), "stat", std::fs::metadata(from)),
+            None => {
+                let path = repo.workdir().map(|w| w.join(&rel_path));
+                let stat = match &path {
+                    Some(p) => std::fs::symlink_metadata(p),
+                    None => Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+                };
+                (rel_path.clone(), "lstat", stat)
+            }
+        };
+        let mut err = std::io::stderr().lock();
+        match stat {
+            Err(e) => {
+                writeln!(err, "fatal: Cannot {verb} '{read_from}': {}", errno_text(&e))?;
+                err.flush()?;
+                return Ok(ExitCode::from(128));
+            }
+            // The `S_IFMT` switch: only a regular file and a symlink have an image
+            // to read, and everything else — a directory, a fifo, a device — is
+            // refused by name and without quotes.
+            Ok(st) if !st.is_file() && !st.file_type().is_symlink() => {
+                writeln!(err, "fatal: unsupported file type {read_from}")?;
+                err.flush()?;
+                return Ok(ExitCode::from(128));
+            }
+            Ok(_) => {}
+        }
+    }
+
+    // `prepare_revision_walk()`'s `limit_list()` (`revision.c:1448-1452`), which sits
+    // between the fake working-tree commit above and the final blob read below:
+    //
+    // ```c
+    // if (revs->ancestry_path_implicit_bottoms) {
+    //         collect_bottom_commits(original_list, &revs->ancestry_path_bottoms);
+    //         if (!revs->ancestry_path_bottoms)
+    //                 die("--ancestry-path given but there are no bottom commits");
+    // }
+    // ```
+    if opts.ancestry_path_pending {
+        let mut err = std::io::stderr().lock();
+        writeln!(err, "fatal: --ancestry-path given but there are no bottom commits")?;
+        err.flush()?;
+        return Ok(ExitCode::from(128));
+    }
+
+    // `setup_scoreboard()`'s `fill_blob_sha1_and_mode()` failure, which is the *other*
+    // branch of the `if (sb->contents_from || !sb->final)` above: with a positive
+    // revision and no overlay there is no working tree to fall back on, and the
+    // diagnostic names the revision as the user typed it.
+    if !path_in_suspect && !overlay {
+        let mut err = std::io::stderr().lock();
+        let rev = opts.rev.as_deref().unwrap_or("HEAD");
+        writeln!(err, "fatal: no such path {rel_path} in {rev}")?;
+        err.flush()?;
+        return Ok(ExitCode::from(128));
     }
 
     // The final image is overlaid on top of the suspect when either no revision
@@ -744,9 +840,18 @@ pub(super) fn blame_with(args: &[String], cmd: &str) -> Result<ExitCode> {
         };
         Some(bytes)
     } else if opts.rev.is_none() {
-        repo.workdir()
-            .map(|w| w.join(&rel_path))
-            .and_then(|p| std::fs::read(p).ok())
+        // `case S_IFLNK: strbuf_readlink(&buf, read_from, st.st_size)` — the image of
+        // a symlink is the *link target text*, which is also what the index and the
+        // tree hold for mode 120000. Reading through the link instead blames the
+        // pointed-at file's contents against the symlink's blob.
+        repo.workdir().map(|w| w.join(&rel_path)).and_then(|p| {
+            match std::fs::symlink_metadata(&p) {
+                Ok(st) if st.file_type().is_symlink() => {
+                    std::fs::read_link(&p).ok().map(|t| t.into_os_string().into_encoded_bytes())
+                }
+                _ => std::fs::read(p).ok(),
+            }
+        })
     } else {
         None
     };
@@ -842,6 +947,7 @@ pub(super) fn blame_with(args: &[String], cmd: &str) -> Result<ExitCode> {
         diff_algorithm: opts.diff_algorithm,
         ranges,
         since: None,
+        bottom: opts.bottom.clone(),
         rewrites: Some(gix::diff::Rewrites::default()),
         ignore_whitespace: opts.ignore_whitespace,
         detect_moved: opts.detect_moved,
@@ -875,6 +981,12 @@ pub(super) fn blame_with(args: &[String], cmd: &str) -> Result<ExitCode> {
     // did, and the `blame_origin` refcounts it ended up with — and a cache hit is precisely the
     // case where no walk happened. `--reverse` is a different traversal over a range the key does
     // not name, so it is kept out too.
+    //
+    // A *forward* range is kept out for exactly the same reason as `--reverse`: the key names the
+    // commit dug from and not the range's bottom, so `git blame A..B -- f` and `git blame B -- f`
+    // would share one entry while producing different attributions — and the cache lives in
+    // `~/.zvcs/cache` keyed by commit id alone, so the collision is not even confined to the
+    // repository that caused it.
     let algo_key = format!(
         "{:?}|w={}|M={:?}|C={:?}|1p={}",
         opts.diff_algorithm,
@@ -889,7 +1001,8 @@ pub(super) fn blame_with(args: &[String], cmd: &str) -> Result<ExitCode> {
         && !opts.incremental
         && !opts.show_stats
         && !opts.score_debug
-        && !opts.reverse)
+        && !opts.reverse
+        && opts.bottom.is_empty())
         .then(|| (suspect.to_string(), rel_path.clone(), algo_key));
     // The blamed blob identifies the file content the attribution belongs to.
     let blamed_blob = repo
@@ -1507,8 +1620,15 @@ fn collect_commit_info(
             // arguments named, which is a different flag from the root rule and so is not
             // affected by `--root`: a line the range's oldest commit kept, because the next commit
             // changed it, prints with the boundary marker.
+            //
+            // A forward range marks its bottom commits `UNINTERESTING` the same way
+            // — `assign_blame()` sets the flag on every commit it refuses to pass
+            // blame from, and `emit_other()` reads that one flag for the marker — so
+            // `git blame A..B` prints `^` against whichever of `A`'s ancestors ended
+            // up holding a line the range did not touch.
             let boundary = (!opts.show_root && commit.parent_ids().next().is_none())
-                || opts.reverse_from.is_some_and(|from| from == line.commit_id);
+                || opts.reverse_from.is_some_and(|from| from == line.commit_id)
+                || opts.bottom.contains(&line.commit_id);
             let summary = Vec::from(commit.message()?.summary().into_owned());
             CommitInfo {
                 display_author: display_author(
@@ -2347,6 +2467,13 @@ fn expand_tilde(value: &str) -> String {
     expanded.to_string_lossy().into_owned()
 }
 
+/// `strerror(errno)` as `die_errno()` renders it: Rust spells an OS error
+/// `<strerror> (os error <n>)` and git spells only the first half.
+fn errno_text(e: &std::io::Error) -> String {
+    let text = e.to_string();
+    text.split(" (os error ").next().unwrap_or(&text).to_string()
+}
+
 /// git's `verify_working_tree_path` fallback: the path is tracked in the index even
 /// though the blamed commit does not have it (it was just `git add`ed, or is
 /// unmerged). Blame then still works, against an empty history.
@@ -2472,32 +2599,180 @@ fn setup_revisions_fatal(repo: &gix::Repository, token: &str) -> Option<String> 
     crate::objname::bad_object_name(repo, token).map(|name| format!("fatal: bad object {name}\n"))
 }
 
-/// Report [`setup_revisions_fatal`] and stop, when it has something to say.
-fn setup_revisions_refusal(repo: &gix::Repository, token: &str) -> Result<Option<Targets>> {
-    let Some(message) = setup_revisions_fatal(repo, token) else {
-        return Ok(None);
-    };
-    let mut err = std::io::stderr().lock();
-    write!(err, "{message}")?;
-    err.flush()?;
-    Ok(Some(Targets::Fatal(ExitCode::from(128))))
+/// One entry of git's `revs->pending`: the object an operand named, under the
+/// name `setup_revisions()` recorded for it.
+///
+/// The name is carried because every diagnostic `find_single_final()` raises
+/// quotes it rather than the object id, and it is not always the operand: a ref
+/// selector queues `refs_for_each_ref()`'s refname, `--reflog` and
+/// `--indexed-objects` queue the empty string, and the merge bases `A...B`
+/// contributes are queued under their hex ids.
+struct Pending {
+    name: String,
+    /// The object the name resolved to, before `deref_tag()`. Carried because
+    /// `UNINTERESTING` is a flag on the *object*, not on the pending entry, so
+    /// two entries naming the same object share it — see [`Revs::uninteresting`].
+    id: ObjectId,
+    object: crate::sequencer::Side,
+}
+
+/// git's `struct rev_info` as far as `cmd_blame()` uses it: everything
+/// `setup_revisions()` leaves behind for `setup_scoreboard()` to read.
+#[derive(Default)]
+struct Revs {
+    /// `revs->pending`, in the order the operands and pseudo-options queued it.
+    pending: Vec<Pending>,
+    /// The object ids carrying `UNINTERESTING`.
+    ///
+    /// A set of *ids* rather than a flag per pending entry because git keeps the
+    /// flag on the `struct object`, which two entries share when two operands name
+    /// the same object. `A...B` is where that becomes observable: it queues the
+    /// merge bases as uninteresting and then `A` as the symmetric-left end, and
+    /// when `A` *is* the merge base — every `<ancestor>...<descendant>` — that one
+    /// object is uninteresting for both entries, so `find_single_final()` skips
+    /// them both and the range behaves exactly like `A..B`.
+    uninteresting: std::collections::HashSet<ObjectId>,
+    /// `revs->ancestry_path` together with `revs->ancestry_path_implicit_bottoms`,
+    /// which `--ancestry-path` (without a `=<commit>`) sets in one breath
+    /// (`revision.c:2406-2411`).
+    ancestry_path: bool,
+    /// `revs->show_merge`, which `--merge` sets and `prepare_show_merge()` acts on
+    /// at the end of `setup_revisions()`.
+    show_merge: bool,
+    /// `revs->diffopt.flags.follow_renames` *as `setup_revisions()` leaves it*.
+    ///
+    /// Only the trailing slot can set it: an operand-position `--follow` is
+    /// consumed by `parse_revision_opt()` inside `cmd_blame()`'s own parse loop,
+    /// and the line right after that loop clears the flag again
+    /// (`builtin/blame.c:1035 revs.diffopt.flags.follow_renames = 0;`), so it never
+    /// reaches `diff_setup_done()`'s check.
+    follow: bool,
+}
+
+/// `handle_revision_arg()`'s view of one revision operand, as
+/// `find_single_final()` needs it: the commit it peels to, the fact that it
+/// resolves to something that is not commit-ish, or that it does not resolve.
+///
+/// This is `repo_get_oid()` — [`crate::objname::resolve`], so the full-length-hex
+/// rule and `get_oid_basic()`'s ambiguity warning apply — followed by
+/// `deref_tag()`, which is [`crate::sequencer::peel_id`].
+fn pending_object(repo: &gix::Repository, rev: &str) -> crate::sequencer::Side {
+    match crate::objname::resolve(repo, rev) {
+        Some(id) => crate::sequencer::peel_id(repo, id),
+        None => crate::sequencer::Side::Unresolved,
+    }
 }
 
 /// Resolve a revision to the commit it names (peeling tags), or `None` if it is
 /// not a valid revision — git's `get_oid` followed by a peel to commit.
 ///
-/// Callers must run [`setup_revisions_refusal`] on the operand first: this
+/// This is `repo_get_oid_committish()` as `build_ignorelist()` calls it: it
 /// answers `None` both for a name that does not resolve and for one that
-/// resolves to an object the repository lacks, and git reports those two
-/// differently.
+/// resolves to an object the repository lacks, which is the single
+/// `cannot find revision %s to ignore` that caller wants either way.
 fn resolve_commit(repo: &gix::Repository, rev: &str) -> Option<ObjectId> {
-    repo.rev_parse_single(rev)
-        .ok()?
-        .object()
-        .ok()?
-        .peel_to_commit()
-        .ok()
-        .map(|c| c.id().detach())
+    match pending_object(repo, rev) {
+        crate::sequencer::Side::Commit(id) => Some(id),
+        _ => None,
+    }
+}
+
+/// `find_single_final()` (`blame.c:2663-2686`), which picks the one commit a
+/// forward blame digs from out of `revs->pending`:
+///
+/// ```c
+/// for (i = 0; i < revs->pending.nr; i++) {
+///         struct object *obj = revs->pending.objects[i].item;
+///         if (obj->flags & UNINTERESTING)
+///                 continue;
+///         obj = deref_tag(revs->repo, obj, NULL, 0);
+///         if (!obj || obj->type != OBJ_COMMIT)
+///                 die("Non commit %s?", revs->pending.objects[i].name);
+///         if (found)
+///                 die("More than one commit to dig from %s and %s?",
+///                     revs->pending.objects[i].name, name);
+///         found = (struct commit *)obj;
+///         name = revs->pending.objects[i].name;
+/// }
+/// ```
+///
+/// Note which way round the second diagnostic names its two operands: the one
+/// just reached comes first and the one already held second, so
+/// `git blame HEAD~1 HEAD -- f` says `from HEAD and HEAD~1?`.
+///
+/// The `UNINTERESTING` skip is what makes a range a range here: `A..B` queues
+/// both ends, and only `B` is a candidate to dig from.
+///
+/// `Err` is the `die()` text without its `fatal: ` prefix; `Ok(None)` is the
+/// empty-pending case `setup_scoreboard()` answers with a fake working-tree
+/// commit.
+fn find_single_final(revs: &Revs) -> Result<Option<(String, ObjectId)>, String> {
+    let mut found: Option<(String, ObjectId)> = None;
+    for entry in &revs.pending {
+        if revs.uninteresting.contains(&entry.id) {
+            continue;
+        }
+        let id = match entry.object {
+            crate::sequencer::Side::Commit(id) => id,
+            // `deref_tag()` returning NULL and a non-commit object are the same
+            // arm: an operand naming a tree or a blob is queued by
+            // `handle_revision_arg()` and only refused here.
+            _ => return Err(format!("Non commit {}?", entry.name)),
+        };
+        if let Some((first, _)) = &found {
+            return Err(format!(
+                "More than one commit to dig from {} and {first}?",
+                entry.name
+            ));
+        }
+        found = Some((entry.name.clone(), id));
+    }
+    Ok(found)
+}
+
+/// `find_single_initial()` (`blame.c:2726-2757`), the `--reverse` counterpart:
+/// the same loop over `revs->pending` with the test inverted, so it picks the one
+/// *negative* commit — the range's oldest end, whose file is the final image.
+///
+/// ```c
+/// for (i = 0; i < revs->pending.nr; i++) {
+///         struct object *obj = revs->pending.objects[i].item;
+///         if (!(obj->flags & UNINTERESTING))
+///                 continue;
+///         obj = deref_tag(revs->repo, obj, NULL, 0);
+///         if (!obj || obj->type != OBJ_COMMIT)
+///                 die("Non commit %s?", revs->pending.objects[i].name);
+///         if (found)
+///                 die("More than one commit to dig up from, %s and %s?",
+///                     revs->pending.objects[i].name, name);
+///         found = (struct commit *) obj;
+///         name = revs->pending.objects[i].name;
+/// }
+/// ```
+///
+/// The comma in `dig up from, %s` is git's and is not in the forward wording.
+///
+/// `Ok(None)` is `!name`, which the caller answers with `dwim_reverse_initial()`
+/// and then `die("No commit to dig up from?")`.
+fn find_single_initial(revs: &Revs) -> Result<Option<(String, ObjectId)>, String> {
+    let mut found: Option<(String, ObjectId)> = None;
+    for entry in &revs.pending {
+        if !revs.uninteresting.contains(&entry.id) {
+            continue;
+        }
+        let id = match entry.object {
+            crate::sequencer::Side::Commit(id) => id,
+            _ => return Err(format!("Non commit {}?", entry.name)),
+        };
+        if let Some((first, _)) = &found {
+            return Err(format!(
+                "More than one commit to dig up from, {} and {first}?",
+                entry.name
+            ));
+        }
+        found = Some((entry.name.clone(), id));
+    }
+    Ok(found)
 }
 
 /// The long options reachable from `setup_revisions()` that take a *separate*
@@ -2520,6 +2795,302 @@ static REV_OPT_REVISION_VALUE: &[&str] = &[
     "since-as-filter", "skip", "until",
 ];
 
+/// Which of git's value parsers an option hands its value to, for the options
+/// whose *rejections* this port reproduces.
+///
+/// Everything outside this table is still accepted and dropped: blame ignores
+/// every diff and revision knob that does not change which commit it digs from,
+/// so a value git merely *stores* is one this port has nothing to do with. What
+/// it cannot drop is a value git *refuses*, because refusing is observable.
+enum RevOptValue {
+    /// `parse_count()` (`revision.c:2277`) — `fatal: '<v>': not an integer`, 128.
+    Count,
+    /// `blame_diff_algorithm_callback()` (`builtin/blame.c:868`) and
+    /// `diff_opt_diff_algorithm()` (`diff.c`), which share one message.
+    DiffAlgorithm,
+    /// `diff_opt_find_object()` (`diff.c:5522`) — ``error: unable to resolve '<v>'``,
+    /// 129. It resolves with `repo_get_oid()`, so a full-length hex that is also a
+    /// refname warns here exactly as it would anywhere else.
+    FindObject,
+    /// `handle_revision_opt()`'s `--date=<mode>`, which is `parse_date_format()` —
+    /// `fatal: unknown date format <v>`, 128.
+    Date,
+    /// `diff_opt_break_rewrites()` (`diff.c:5569`).
+    BreakRewrites,
+    /// `diff_opt_find_renames()` / `diff_opt_find_copies()` (`diff.c:5732`,
+    /// `diff.c:5752`), whose message names the option: ``error: invalid argument to
+    /// <long-name>``, 129.
+    RenameScore(&'static str),
+    /// parse-options' `OPT_INTEGER_F(..., PARSE_OPT_NONEG)`, whose two failures are
+    /// separate messages: an empty value "expects a numerical value", anything else
+    /// "expects a non-negative integer value with an optional k/m/g suffix".
+    Integer,
+    /// `diff.c`'s hand-rolled width parsers, which spell the same complaint without
+    /// the backticks and without the leading dashes: `error: <name> expects a
+    /// numerical value`.
+    StatWidth,
+    /// `-U<n>` / `--unified=<n>`, which spells it with the dashes:
+    /// `error: --unified expects a numerical value`.
+    Unified,
+}
+
+/// The parser [`RevOptValue`] names for one long-option *name* (no `--`, no value).
+fn rev_opt_value_parser(name: &str) -> Option<RevOptValue> {
+    Some(match name {
+        "max-count" | "max-count-oldest" | "skip" | "min-parents" | "max-parents"
+        | "graph-lane-limit" => RevOptValue::Count,
+        "diff-algorithm" => RevOptValue::DiffAlgorithm,
+        "find-object" => RevOptValue::FindObject,
+        "date" => RevOptValue::Date,
+        "break-rewrites" => RevOptValue::BreakRewrites,
+        "find-renames" => RevOptValue::RenameScore("find-renames"),
+        "find-copies" => RevOptValue::RenameScore("find-copies"),
+        "inter-hunk-context" => RevOptValue::Integer,
+        "stat-width" | "stat-name-width" | "stat-count" | "stat-graph-width" => {
+            RevOptValue::StatWidth
+        }
+        "unified" => RevOptValue::Unified,
+        _ => return None,
+    })
+}
+
+/// Run one option's value through [`rev_opt_value_parser`]'s choice, answering the
+/// diagnostic and exit status when it is rejected.
+///
+/// `name` is the long name as the message spells it; for the two short spellings
+/// that share a parser (`-B`, `-U`) it is the long option they alias.
+fn rev_opt_value_refusal(
+    repo: &gix::Repository,
+    name: &str,
+    value: &str,
+) -> Result<Option<(String, ExitCode)>> {
+    let Some(parser) = rev_opt_value_parser(name) else {
+        return Ok(None);
+    };
+    Ok(match parser {
+        RevOptValue::Count => parse_count(value)
+            .err()
+            .map(|message| (format!("fatal: {message}\n"), ExitCode::from(128))),
+        RevOptValue::DiffAlgorithm => parse_diff_algorithm(value)
+            .is_none()
+            .then(|| (format!("error: {DIFF_ALGORITHM_ERROR}\n"), ExitCode::from(129))),
+        RevOptValue::FindObject => crate::objname::resolve(repo, value)
+            .is_none()
+            .then(|| (format!("error: unable to resolve '{value}'\n"), ExitCode::from(129))),
+        RevOptValue::Date => match resolve_date_mode(value)? {
+            DateOutcome::Mode(_) => None,
+            // `resolve_date_mode` has already written the `fatal:` line, so there is
+            // nothing left to print — only the status to carry back.
+            DateOutcome::Fatal(_) => Some((String::new(), ExitCode::from(128))),
+        },
+        RevOptValue::BreakRewrites => (!break_rewrites_ok(value))
+            .then(|| ("error: break-rewrites expects <n>/<m> form\n".to_string(), ExitCode::from(129))),
+        RevOptValue::RenameScore(long) => (!rename_score_consumed(value))
+            .then(|| (format!("error: invalid argument to {long}\n"), ExitCode::from(129))),
+        RevOptValue::Integer => match git_parse_unsigned(value) {
+            Unsigned::Ok => None,
+            Unsigned::Empty => Some((
+                format!("error: option `{name}' expects a numerical value\n"),
+                ExitCode::from(129),
+            )),
+            // `errno == ERANGE`, which parse-options reports before the generic
+            // complaint and which names the bound the option's `precision` sets —
+            // 4 bytes for `--inter-hunk-context`, so `[0,4294967295]`.
+            Unsigned::Range => Some((
+                format!("error: value {value} for option `{name}' not in range [0,4294967295]\n"),
+                ExitCode::from(129),
+            )),
+            Unsigned::Bad => Some((
+                format!(
+                    "error: option `{name}' expects a non-negative integer value \
+                     with an optional k/m/g suffix\n"
+                ),
+                ExitCode::from(129),
+            )),
+        },
+        // `strtoul()`, so a leading `-` is consumed and wraps rather than being
+        // refused, and an out-of-range value is `ULONG_MAX` with nothing left over:
+        // `--stat-width=-1` and `--stat-width=99999999999999999999` are both accepted
+        // by git 2.55.0 while `--stat-width=0x10` is not.
+        RevOptValue::StatWidth => strtol_consumed(value)
+            .is_none()
+            .then(|| (format!("error: {name} expects a numerical value\n"), ExitCode::from(129))),
+        // ```c
+        // long val = strtol(arg, &s, 10);
+        // if (*s)
+        //         return error(_("%s expects a numerical value"), "--unified");
+        // if (val < 0)
+        //         return error(_("%s expects a non-negative integer"), "--unified");
+        // ```
+        //
+        // Two separate refusals, and the second is reachable only because `strtol`
+        // takes a sign: `-U-1` is a *number*, so it clears the first test and is
+        // caught by the second.
+        RevOptValue::Unified => match strtol_consumed(value) {
+            None => Some((
+                "error: --unified expects a numerical value\n".to_string(),
+                ExitCode::from(129),
+            )),
+            Some(val) if val < 0 => Some((
+                "error: --unified expects a non-negative integer\n".to_string(),
+                ExitCode::from(129),
+            )),
+            Some(_) => None,
+        },
+    })
+}
+
+/// `strtol(s, &end, 10)` followed by git's near-universal `if (*end)` check: the
+/// value when the whole string was consumed, `None` when anything was left over.
+///
+/// `strtol` skips leading whitespace, takes an optional sign, and on overflow
+/// returns `LONG_MAX`/`LONG_MIN` with `end` still past the digits — so the sign of
+/// an out-of-range value survives, which is what makes
+/// `--unified=-99999999999999999999` a *negative* value rather than a malformed
+/// one. An empty string converts nothing, leaving `end == s` and therefore
+/// `*end == 0`, so it is accepted as 0 — which is why `git blame -- f --unified=`
+/// is not an error while `--max-count=` is (that one is [`strtol_i`], whose extra
+/// `p == s` test rejects it).
+fn strtol_consumed(s: &str) -> Option<i64> {
+    let rest = s.trim_start_matches([' ', '\t', '\n', '\r', '\x0b', '\x0c']);
+    let (negative, digits) = match rest.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, rest.strip_prefix('+').unwrap_or(rest)),
+    };
+    let taken: String = digits.chars().take_while(char::is_ascii_digit).collect();
+    // `end == s` when nothing converted, so only a wholly empty argument passes the
+    // `*end` test; a sign or whitespace with no digits behind it does not.
+    if taken.is_empty() {
+        return s.is_empty().then_some(0);
+    }
+    if taken.len() != digits.len() {
+        return None;
+    }
+    let magnitude = taken.parse::<i64>().unwrap_or(i64::MAX);
+    Some(if negative { -magnitude } else { magnitude })
+}
+
+/// What `git_parse_unsigned()` made of a value, as `OPTION_UNSIGNED`
+/// (`parse-options.c:294-311`) distinguishes the three failures.
+enum Unsigned {
+    /// The value parsed. Blame never reads the number — `--inter-hunk-context`
+    /// only reaches a diff this port does not produce — so only the fact that
+    /// there was one is carried.
+    Ok,
+    /// `!*arg` — tested before the parser runs at all.
+    Empty,
+    /// `errno == ERANGE`: a well-formed number past the option's `precision`.
+    Range,
+    Bad,
+}
+
+/// `git_parse_unsigned(value, ret, max)` (`parse.c:53-86`), with `max` the
+/// `UINT_MAX` an `OPT_UNSIGNED` of `sizeof(unsigned) == 4` sets:
+///
+/// ```c
+/// /* negative values would be accepted by strtoumax */
+/// if (strchr(value, '-')) { errno = EINVAL; return 0; }
+/// errno = 0;
+/// val = strtoumax(value, &end, 0);
+/// if (errno == ERANGE) return 0;
+/// if (end == value) { errno = EINVAL; return 0; }
+/// factor = get_unit_factor(end);
+/// if (!factor) { errno = EINVAL; return 0; }
+/// if (unsigned_mult_overflows(factor, val) || factor * val > max) {
+///         errno = ERANGE; return 0;
+/// }
+/// ```
+///
+/// The base is **0**, not 10, so `0x10` is 16 and `010` is 8 — which is why
+/// `git blame -- f --inter-hunk-context=0x10` succeeds where the base-10
+/// `--max-count=0x10` is `fatal: '0x10': not an integer`. `get_unit_factor()`
+/// accepts only an empty tail or a case-insensitive `k`/`m`/`g`, so the suffix is
+/// not merely stripped: anything else makes the whole value invalid.
+fn git_parse_unsigned(value: &str) -> Unsigned {
+    if value.is_empty() {
+        return Unsigned::Empty;
+    }
+    if value.contains('-') {
+        return Unsigned::Bad;
+    }
+    let Some((val, end)) = strtoumax0(value) else {
+        return Unsigned::Bad;
+    };
+    let Some(val) = val else {
+        // `strtoumax` set `ERANGE`; the tail is still whatever followed the digits,
+        // and git returns before ever looking at it.
+        return Unsigned::Range;
+    };
+    let factor: u64 = match end {
+        "" => 1,
+        _ if end.eq_ignore_ascii_case("k") => 1024,
+        _ if end.eq_ignore_ascii_case("m") => 1024 * 1024,
+        _ if end.eq_ignore_ascii_case("g") => 1024 * 1024 * 1024,
+        _ => return Unsigned::Bad,
+    };
+    match val.checked_mul(factor).filter(|n| *n <= u64::from(u32::MAX)) {
+        Some(_) => Unsigned::Ok,
+        None => Unsigned::Range,
+    }
+}
+
+/// `strtoumax(value, &end, 0)`: leading whitespace and an optional `+`, then a
+/// base chosen from the prefix — `0x`/`0X` hexadecimal, a leading `0` octal,
+/// anything else decimal.
+///
+/// `None` is `end == value`, i.e. nothing was converted. `Some((None, end))` is
+/// `ERANGE`, which git tests before it looks at `end` at all.
+fn strtoumax0(value: &str) -> Option<(Option<u64>, &str)> {
+    let body = value.trim_start_matches([' ', '\t', '\n', '\r', '\x0b', '\x0c']);
+    let body = body.strip_prefix('+').unwrap_or(body);
+    let (radix, digits) = match body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
+        // `0x` with no hex digit behind it converts just the `0`, leaving `x…`.
+        Some(rest) if rest.starts_with(|c: char| c.is_ascii_hexdigit()) => (16, rest),
+        Some(_) => (10, body),
+        None if body.starts_with('0') => (8, body),
+        None => (10, body),
+    };
+    let taken: String = digits.chars().take_while(|c| c.is_digit(radix)).collect();
+    if taken.is_empty() {
+        return None;
+    }
+    let end = &digits[taken.len()..];
+    Some((u64::from_str_radix(&taken, radix).ok(), end))
+}
+
+/// git's `strtol_i(s, 10, &result)` (`git-compat-util.h`), the whole of which is a
+/// base-10 `strtol()` plus `if (errno || *p || p == s || (int) ul != ul) return -1`.
+///
+/// `strtol()` skips leading whitespace and takes an optional sign; the guard then
+/// demands the whole string was consumed and that the value fits an `int`. So `-1`
+/// and `+3` pass while `3x`, `0x10` (base 10 stops at the `x`), the empty string and
+/// `99999999999999999999` do not — all five verified against git 2.55.0 through
+/// `git blame -- <path> --max-count=<v>`.
+fn strtol_i(s: &str) -> Option<i32> {
+    // Rust's own parser is the guard: it rejects leading whitespace, trailing
+    // characters, an empty string and anything outside `i32`, and accepts exactly
+    // the optional sign `strtol` does. Only the whitespace skip has to be added.
+    s.trim_start_matches([' ', '\t', '\n', '\r', '\x0b', '\x0c']).parse::<i32>().ok()
+}
+
+/// `parse_count()` (`revision.c:2277`), which is [`strtol_i`] and a `die()`:
+///
+/// ```c
+/// static int parse_count(const char *arg)
+/// {
+///         int count;
+///
+///         if (strtol_i(arg, 10, &count) < 0)
+///                 die("'%s': not an integer", arg);
+///         return count;
+/// }
+/// ```
+///
+/// `Err` is the `die()` text without its `fatal: ` prefix.
+fn parse_count(arg: &str) -> Result<i32, String> {
+    strtol_i(arg).ok_or_else(|| format!("'{arg}': not an integer"))
+}
+
 /// git's answer to a `-`-leading token in the revision slot of
 /// `git blame -- <path> <token>`, which `setup_revisions()` parses as an option.
 ///
@@ -2530,11 +3101,10 @@ static REV_OPT_REVISION_VALUE: &[&str] = &[
 /// parser owns the name; all three were read off git v2.55.0 by feeding every
 /// option `git blame` accepts through this position.
 ///
-/// The rest of value *validation* is out of scope here: `--max-count=` reaches its
-/// parser with an empty string and fails there (`fatal: '': not an integer`), which
-/// needs the parsers themselves, not this table. Options that change which commits
-/// the walk starts from (`--all`, `--branches`, `--reflog`, `--merge`, `--follow`,
-/// `--ancestry-path`) are likewise still dropped rather than honoured.
+/// Value *validation* — as opposed to a value being absent — is
+/// [`rev_opt_value_refusal`], which the callers run first because a value that is
+/// present and wrong is rejected wherever the option stands, while "requires a
+/// value" is only reachable at the end of the line.
 fn trailing_option_missing_value(arg: &str) -> Result<Option<ExitCode>> {
     let mut err = std::io::stderr().lock();
     if let Some(body) = arg.strip_prefix("--") {
@@ -2561,22 +3131,6 @@ fn trailing_option_missing_value(arg: &str) -> Result<Option<ExitCode>> {
         }
         return Ok(None);
     }
-    // `-C[<score>]` / `-M[<score>]` (`diff_opt_find_copies()` /
-    // `diff_opt_find_renames()`): the attached score goes through
-    // `parse_rename_score()`, which stops at the first character it cannot use, and
-    // whatever is left over is what the callback rejects. `git blame`'s *own*
-    // `-C`/`-M` take the same spelling but `blame_copy_callback()`'s `parse_score()`
-    // silently yields 0 for a score it cannot read, so only here does `-CC` fail.
-    for (flag, name) in [("-C", "find-copies"), ("-M", "find-renames")] {
-        if let Some(score) = arg.strip_prefix(flag) {
-            if !rename_score_consumed(score) {
-                writeln!(err, "error: invalid argument to {name}")?;
-                err.flush()?;
-                return Ok(Some(ExitCode::from(129)));
-            }
-            return Ok(None);
-        }
-    }
     // A short option only lacks its value when nothing is attached to it: `-l5`
     // and `-Sfoo` are complete, `-l` and `-S` are not. A bare `-` is not an option
     // name at all and is dropped like any other unrecognised one.
@@ -2597,25 +3151,797 @@ fn trailing_option_missing_value(arg: &str) -> Result<Option<ExitCode>> {
     }
 }
 
+/// The short options that alias a long one whose *attached* value this port
+/// validates: `-M<score>`, `-C<score>`, `-B<n>/<m>`, `-U<n>` and `-<count>`.
+///
+/// `git blame`'s own `options[]` claims `-M` and `-C` for itself, and
+/// `blame_copy_callback()`'s `parse_score()` silently yields 0 for a score it
+/// cannot read — so those two only reach `diff_opt_find_renames()` in the
+/// *revision* slot, which is why this is asked there and not in the parse loop.
+fn short_opt_value(arg: &str) -> Option<(&'static str, &str)> {
+    for (flag, long) in [
+        ("-M", "find-renames"),
+        ("-C", "find-copies"),
+        ("-B", "break-rewrites"),
+        ("-U", "unified"),
+    ] {
+        if let Some(value) = arg.strip_prefix(flag) {
+            return Some((long, value));
+        }
+    }
+    // `else if ((*arg == '-') && isdigit(arg[1]))` (`revision.c:2364`): the
+    // traditional `head`-style count, whose argument is everything after the dash.
+    let rest = arg.strip_prefix('-')?;
+    rest.starts_with(|c: char| c.is_ascii_digit()).then_some(("max-count", rest))
+}
+
 /// Whether git's `parse_rename_score()` (`diff.c`) consumes `score` whole, which is
 /// the test `-C<score>` / `-M<score>` apply to their argument.
+fn rename_score_consumed(score: &str) -> bool {
+    rename_score_rest(score).is_empty()
+}
+
+/// What `parse_rename_score()` leaves unconsumed.
 ///
 /// The scanner takes digits and at most one `.`; a `%` is "always at the end", so it
 /// stops the scan and anything after it is left over. Everything else stops the scan
 /// too, which is how `C`, `+3`, `1e3` and a second `.` end up rejected while `.`,
-/// `%`, `0` and `50%` are accepted.
-fn rename_score_consumed(score: &str) -> bool {
+/// `%`, `0` and `50%` are accepted whole.
+fn rename_score_rest(score: &str) -> &str {
     let mut dot = false;
-    let mut chars = score.chars();
-    while let Some(c) = chars.next() {
+    for (idx, c) in score.char_indices() {
         match c {
             '.' if !dot => dot = true,
-            '%' => return chars.next().is_none(),
+            '%' => return &score[idx + c.len_utf8()..],
             '0'..='9' => {}
-            _ => return false,
+            _ => return &score[idx..],
         }
     }
+    ""
+}
+
+/// `diff_opt_break_rewrites()` (`diff.c:5569`), the `-B` / `--break-rewrites`
+/// value parser:
+///
+/// ```c
+/// opt1 = parse_rename_score(&arg);
+/// if (*arg == 0)
+///         opt2 = 0;
+/// else if (*arg != '/')
+///         return error(_("%s expects <n>/<m> form"), "break-rewrites");
+/// else {
+///         arg++;
+///         opt2 = parse_rename_score(&arg);
+/// }
+/// if (*arg != 0)
+///         return error(_("%s expects <n>/<m> form"), "break-rewrites");
+/// ```
+///
+/// So a bare `-B`, `-B50`, `-B50%`, `-B/` and `-B20/60` are all accepted while
+/// `-BB` and `-Bx/y` are not — verified against git 2.55.0.
+fn break_rewrites_ok(arg: &str) -> bool {
+    let rest = rename_score_rest(arg);
+    match rest.strip_prefix('/') {
+        Some(after) => rename_score_rest(after).is_empty(),
+        None => rest.is_empty(),
+    }
+}
+
+/// git's `wildmatch(pattern, text, 0)`: no `WM_PATHNAME`, so `*` spans `/` too.
+/// This is what `ref_excluded()` (`revision.c`) matches an exclusion with.
+fn wildmatch0(pattern: &str, text: &str) -> bool {
+    gix::glob::wildmatch(
+        pattern.as_bytes().as_bstr(),
+        text.as_bytes().as_bstr(),
+        gix::glob::wildmatch::Mode::empty(),
+    )
+}
+
+/// `handle_revision_pseudo_opt()`'s ref selectors (`revision.c:2808-2896`), which
+/// all reduce to one `refs_for_each_ref_ext()` call under a prefix, a trim and a
+/// pattern:
+///
+/// | option | prefix | trimmed | pattern |
+/// |---|---|---|---|
+/// | `--all` | none | no | none |
+/// | `--branches` / `--branches=<p>` | `refs/heads/` | yes | `<p>` |
+/// | `--tags` / `--tags=<p>` | `refs/tags/` | yes | `<p>` |
+/// | `--remotes` / `--remotes=<p>` | `refs/remotes/` | yes | `<p>` |
+/// | `--glob=<p>` | none | no | `<p>` |
+/// | `--bisect` | `refs/bisect/` | no | see below |
+///
+/// `handle_one_ref()` queues the ref under the name the iteration handed it — the
+/// *trimmed* one where a prefix was trimmed, which is why `--branches` says
+/// `main` where `--all` says `refs/heads/main` — and it queues the object the ref
+/// points at without peeling, so an annotated tag arrives as the tag object and is
+/// only dereferenced by `find_single_final()`.
+///
+/// `ref_excluded()` is applied to that same (trimmed) name, and every one of these
+/// branches ends with `clear_ref_exclusions()`, so a `--exclude=<p>` covers the
+/// next selector and nothing after it.
+///
+/// The pattern, though, is matched against the *untrimmed* name — see
+/// [`glob_ref_pattern`], which is what makes `--branches=main` select nothing.
+fn queue_refs(
+    repo: &gix::Repository,
+    revs: &mut Revs,
+    not: bool,
+    prefix: Option<&str>,
+    pattern: Option<&str>,
+    excludes: &mut Vec<String>,
+) -> Result<()> {
+    let pattern = pattern.map(|p| glob_ref_pattern(prefix, p));
+    let mut named: Vec<(String, ObjectId)> = Vec::new();
+    for reference in repo.references()?.all()? {
+        let Ok(reference) = reference else { continue };
+        let full = reference.name().as_bstr().to_str_lossy().into_owned();
+        // `refs_for_each_ref()` hands out resolved ids; a symbolic or broken ref
+        // that resolves to nothing is skipped rather than queued.
+        let Some(id) = reference.target().try_id().map(|id| id.to_owned()) else {
+            continue;
+        };
+        // `refs_ref_iterator_begin(refs, prefix, …)` restricts the iteration before
+        // the pattern is ever consulted, so a ref outside the prefix is not a
+        // candidate however the pattern reads.
+        let name = match prefix {
+            Some(p) => match full.strip_prefix(p) {
+                Some(rest) => rest.to_string(),
+                None => continue,
+            },
+            None => full.clone(),
+        };
+        // `for_each_filter_refs()` (`refs.c`) tests the composed pattern against
+        // `ref->name` *before* trimming: "We need to trim the prefix in the callback
+        // function as the pattern is expected to match on the full refname."
+        if pattern.as_deref().is_some_and(|p| !wildmatch0(p, &full)) {
+            continue;
+        }
+        if excludes.iter().any(|p| wildmatch0(p, &name)) {
+            continue;
+        }
+        named.push((name, id));
+    }
+    // `refs_for_each_ref()` iterates in refname order, and that order is what
+    // decides which two names `find_single_final()`'s second diagnostic quotes.
+    named.sort_by(|a, b| a.0.cmp(&b.0));
+    for (name, id) in named {
+        queue_pending(repo, revs, not, name, id);
+    }
+    excludes.clear();
+    Ok(())
+}
+
+/// `refs_for_each_ref_ext()`'s `real_pattern` (`refs.c:1900-1913`), the pattern a
+/// ref selector actually matches with:
+///
+/// ```c
+/// if (opts->pattern) {
+///         if (!opts->prefix && !starts_with(opts->pattern, "refs/"))
+///                 strbuf_addstr(&real_pattern, "refs/");
+///         else if (opts->prefix)
+///                 strbuf_addstr(&real_pattern, opts->prefix);
+///         strbuf_addstr(&real_pattern, opts->pattern);
+///
+///         if (!has_glob_specials(opts->pattern)) {
+///                 /* Append implied '/' '*' if not present. */
+///                 strbuf_complete(&real_pattern, '/');
+///                 /* No need to check for '*', there is none. */
+///                 strbuf_addch(&real_pattern, '*');
+///         }
+/// ```
+///
+/// Two rules, and both are load-bearing for what a blame ends up digging from:
+///
+/// * The pattern is rooted — under the selector's own prefix, or under `refs/` for
+///   a `--glob=` that does not already name one — and matched against the whole
+///   refname, not the trimmed one the entry is later *queued* under.
+/// * A pattern with none of `?`, `*` or `[` (`has_glob_specials()` is
+///   `strpbrk(pattern, "?*[")`) is a *directory* prefix, not a name: it gains `/*`.
+///   So `--branches=main` is `refs/heads/main/*` and selects nothing at all, which
+///   is why `git blame --branches=main -- f.txt` blames the working tree and
+///   `git blame --reverse --branches=main -- f.txt` is
+///   `fatal: No commit to dig up from?` — both verified against git 2.55.0.
+fn glob_ref_pattern(prefix: Option<&str>, pattern: &str) -> String {
+    let mut real = match prefix {
+        Some(p) => p.to_string(),
+        None if !pattern.starts_with("refs/") => "refs/".to_string(),
+        None => String::new(),
+    };
+    real.push_str(pattern);
+    if !pattern.contains(['?', '*', '[']) {
+        if !real.ends_with('/') {
+            real.push('/');
+        }
+        real.push('*');
+    }
+    real
+}
+
+/// `add_pending_object()` for an id whose name is already decided: record the
+/// entry and, when the flags carry it, the object's `UNINTERESTING` bit.
+fn queue_pending(repo: &gix::Repository, revs: &mut Revs, not: bool, name: String, id: ObjectId) {
+    if not {
+        revs.uninteresting.insert(id);
+    }
+    revs.pending.push(Pending {
+        name,
+        id,
+        object: crate::sequencer::peel_id(repo, id),
+    });
+}
+
+/// `handle_revision_pseudo_opt()` (`revision.c:2778`) restricted to what a blame
+/// can observe, plus the two `handle_revision_opt()` flags whose effect only shows
+/// up at the end of `setup_revisions()` (`--merge`, `--follow`).
+///
+/// Every branch here changes `revs->pending` or kills the command; the pseudo-options
+/// that only set a walk knob blame never reads (`--no-walk`, `--do-walk`,
+/// `--single-worktree`, `--filter=`) are accepted and dropped, which is what they
+/// amount to for a command that never runs `get_revision()`.
+///
+/// Returns `true` when the token was one of these, so the caller knows not to treat
+/// it as an ordinary revision operand.
+fn pseudo_revision_opt(
+    repo: &gix::Repository,
+    revs: &mut Revs,
+    arg: &str,
+    not: &mut bool,
+    excludes: &mut Vec<String>,
+) -> Result<Option<bool>> {
+    let handled = match arg {
+        "--all" => {
+            queue_refs(repo, revs, *not, None, None, excludes)?;
+            // `handle_refs(refs, revs, *flags, refs_head_ref)` right after the
+            // for-each-ref pass, which is why `HEAD` comes last however it sorts.
+            if let Ok(head) = repo.head_id() {
+                queue_pending(repo, revs, *not, "HEAD".to_string(), head.detach());
+            }
+            true
+        }
+        "--branches" => {
+            queue_refs(repo, revs, *not, Some("refs/heads/"), None, excludes)?;
+            true
+        }
+        "--tags" => {
+            queue_refs(repo, revs, *not, Some("refs/tags/"), None, excludes)?;
+            true
+        }
+        "--remotes" => {
+            queue_refs(repo, revs, *not, Some("refs/remotes/"), None, excludes)?;
+            true
+        }
+        // `for_each_bad_bisect_ref` / `for_each_good_bisect_ref`, which read the
+        // terms from `.git/BISECT_TERMS`. With no bisect in progress there are no
+        // such refs and the option contributes nothing, which is the only shape a
+        // blame fixture ever has.
+        "--bisect" => {
+            queue_refs(repo, revs, *not, Some("refs/bisect/"), None, excludes)?;
+            true
+        }
+        // `add_reflogs_to_pending()` (`revision.c:1728`): every entry of every
+        // reflog, old id and new id, each queued under the *empty* name
+        // (`add_pending_object(cb->all_revs, o, "")`, `revision.c:1670`) — which is
+        // why `git blame --reflog` says `More than one commit to dig from  and ?`.
+        "--reflog" => {
+            queue_reflogs(repo, revs, *not)?;
+            true
+        }
+        // `add_index_objects_to_pending()` (`revision.c:1829`): the index's blobs,
+        // also under the empty name, and blobs are never commits — so this is
+        // always `fatal: Non commit ?` for a non-empty index.
+        "--indexed-objects" => {
+            queue_index_objects(repo, revs, *not)?;
+            true
+        }
+        // `*flags ^= UNINTERESTING | BOTTOM`: everything after it swaps sides.
+        "--not" => {
+            *not = !*not;
+            true
+        }
+        // `add_alternate_refs_to_pending()`. A repository with no alternate object
+        // database has no alternate refs to add, and this port has no alternates.
+        "--alternate-refs" => true,
+        "--no-walk" | "--do-walk" | "--single-worktree" | "--no-filter" => true,
+        // `revs->show_merge = 1`, acted on by `prepare_show_merge()` at the end of
+        // `setup_revisions()` — so it outranks every diagnostic `setup_scoreboard()`
+        // raises but not an operand this loop has already refused.
+        "--merge" => {
+            revs.show_merge = true;
+            true
+        }
+        // `revs->ancestry_path = 1; … revs->ancestry_path_implicit_bottoms = 1`,
+        // whose refusal comes much later, from `limit_list()`.
+        "--ancestry-path" => {
+            revs.ancestry_path = true;
+            true
+        }
+        // `diff_opt_parse()`'s `--follow`, checked by `diff_setup_done()` at the end
+        // of `setup_revisions()` — see [`Revs::follow`] for why only this position
+        // can set it.
+        "--follow" => {
+            revs.follow = true;
+            true
+        }
+        "--no-follow" => {
+            revs.follow = false;
+            true
+        }
+        _ => false,
+    };
+    if handled {
+        return Ok(Some(true));
+    }
+    for (opt, prefix) in [
+        ("--branches=", Some("refs/heads/")),
+        ("--tags=", Some("refs/tags/")),
+        ("--remotes=", Some("refs/remotes/")),
+        ("--glob=", None),
+    ] {
+        if let Some(pattern) = arg.strip_prefix(opt) {
+            queue_refs(repo, revs, *not, prefix, Some(pattern), excludes)?;
+            return Ok(Some(true));
+        }
+    }
+    // `add_ref_exclusion()`, which the *next* selector consults and then clears.
+    if let Some(pattern) = arg.strip_prefix("--exclude=") {
+        excludes.push(pattern.to_string());
+        return Ok(Some(true));
+    }
+    if arg.starts_with("--no-walk=") || arg.starts_with("--filter=") {
+        return Ok(Some(true));
+    }
+    Ok(None)
+}
+
+/// `add_reflogs_to_pending()` — see the `--reflog` arm of [`pseudo_revision_opt`].
+///
+/// `handle_one_reflog_ent()` offers both ids of every entry to
+/// `handle_one_reflog_commit()`, which drops the null ones (the `old` id of a ref's
+/// first entry) and queues the rest under the empty name.
+fn queue_reflogs(repo: &gix::Repository, revs: &mut Revs, not: bool) -> Result<()> {
+    let mut names: Vec<String> = vec!["HEAD".to_string()];
+    for reference in repo.references()?.all()? {
+        let Ok(reference) = reference else { continue };
+        names.push(reference.name().as_bstr().to_str_lossy().into_owned());
+    }
+    names.sort();
+    names.dedup();
+    let null = ObjectId::null(repo.object_hash());
+    for name in names {
+        let Some(reference) = repo.try_find_reference(name.as_str()).ok().flatten() else {
+            continue;
+        };
+        let mut log = reference.log_iter();
+        let Ok(Some(iter)) = log.all() else {
+            continue;
+        };
+        for line in iter {
+            let Ok(line) = line else { continue };
+            for id in [line.previous_oid(), line.new_oid()] {
+                if id != null && repo.find_object(id).is_ok() {
+                    queue_pending(repo, revs, not, String::new(), id);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `add_index_objects_to_pending()` — see the `--indexed-objects` arm of
+/// [`pseudo_revision_opt`]. Gitlinks are skipped (`S_ISGITLINK(ce->ce_mode)`); the
+/// cache tree's trees are not modelled, because the first blob already decides the
+/// only thing a blame ever gets to say about this option.
+fn queue_index_objects(repo: &gix::Repository, revs: &mut Revs, not: bool) -> Result<()> {
+    let Ok(index) = repo.index_or_empty() else {
+        return Ok(());
+    };
+    for entry in index.entries() {
+        if entry.mode.is_submodule() {
+            continue;
+        }
+        queue_pending(repo, revs, not, String::new(), entry.id);
+    }
+    Ok(())
+}
+
+/// `handle_revision_arg_1()` (`revision.c:2155`) for one operand that is not an
+/// option: the range grammar first, then the `^` exclusion mark, then the name.
+///
+/// `Ok(Some(code))` means the operand was refused and the diagnostic is already on
+/// stderr.
+fn queue_revision_arg(
+    repo: &gix::Repository,
+    revs: &mut Revs,
+    arg: &str,
+    not: bool,
+) -> Result<Option<ExitCode>> {
+    // ```c
+    // if (get_oid_with_context(revs->repo, a_name, oc_flags, &a_oid, a_oc) ||
+    //     get_oid_with_context(revs->repo, b_name, oc_flags, &b_oid, b_oc))
+    //         return -1;
+    // ```
+    //
+    // An endpoint carrying a parent mark cannot clear that: `^@`, `^!` and `^-<n>`
+    // are `handle_revision_arg_1()`'s own grammar and `get_oid_1()` has no case for
+    // them, so `main^!..main` is not a range — and, its `^!` not being the last two
+    // characters of the operand either, not a mark, which leaves the whole word to
+    // be resolved and refused. gitoxide's parser *does* accept `^!`, so without this
+    // the operand would come back as a working range.
+    if crate::objname::split_range(arg)
+        .is_some_and(|r| crate::objname::parents_only_base(r.a) == r.a
+            && crate::objname::parents_only_base(r.b) == r.b)
+    {
+        // `handle_dotdot_1()` resolves both endpoints with
+        // `get_oid_with_context()`, so the ambiguity warning belongs to the
+        // *first* of them that gets that far — the `||` short-circuits.
+        crate::objname::warn_dotdot_endpoints(repo, arg);
+        if let Some(message) = crate::objname::dotdot_fatal(repo, arg) {
+            let mut err = std::io::stderr().lock();
+            write!(err, "{message}")?;
+            err.flush()?;
+            return Ok(Some(ExitCode::from(128)));
+        }
+        let crate::objname::Dotdot::Ok { a, b } = crate::objname::dotdot(repo, arg) else {
+            // Neither endpoint resolved: `handle_dotdot_1()` returns -1 and the
+            // operand falls through to the single-name path below, which reports it.
+            return queue_single_name(repo, revs, arg, not);
+        };
+        let range = crate::objname::split_range(arg).expect("split_range agreed above");
+        // ```c
+        // if (!symmetric) { b_flags = flags; a_flags = flags_exclude; }
+        // else { … add_pending_commit_list(revs, exclude, flags_exclude);
+        //        b_flags = flags; a_flags = flags | SYMMETRIC_LEFT; }
+        // ```
+        // `flags_exclude` is `flags ^ (UNINTERESTING | BOTTOM)`, so under a
+        // preceding `--not` the two ends swap which one is the bottom.
+        if range.symmetric {
+            for base in merge_bases(repo, a, b) {
+                queue_pending(repo, revs, !not, base.to_string(), base);
+            }
+            queue_pending(repo, revs, not, range.a.to_string(), a);
+        } else {
+            queue_pending(repo, revs, !not, range.a.to_string(), a);
+        }
+        queue_pending(repo, revs, not, range.b.to_string(), b);
+        return Ok(None);
+    }
+    // The three parent marks, in git's order and with git's three different
+    // outcomes:
+    //
+    // ```c
+    // mark = strstr(arg, "^@");
+    // if (mark && !mark[2]) {
+    //         arg_minus_at = xmemdupz(arg, mark - arg);
+    //         if (add_parents_only(revs, arg_minus_at, flags, 0)) { ret = 0; goto out; }
+    // }
+    // mark = strstr(arg, "^!");
+    // if (mark && !mark[2]) {
+    //         arg_minus_excl = xmemdupz(arg, mark - arg);
+    //         if (add_parents_only(revs, arg_minus_excl, flags ^ (UNINTERESTING | BOTTOM), 0))
+    //                 arg = arg_minus_excl;
+    // }
+    // mark = strstr(arg, "^-");
+    // if (mark) {
+    //         int exclude_parent = 1;
+    //         if (mark[2]) {
+    //                 if (strtol_i(mark + 2, 10, &exclude_parent) || exclude_parent < 1) {
+    //                         ret = -1; goto out;
+    //                 }
+    //         }
+    //         arg_minus_dash = xmemdupz(arg, mark - arg);
+    //         if (add_parents_only(revs, arg_minus_dash, flags ^ (UNINTERESTING | BOTTOM), exclude_parent))
+    //                 arg = arg_minus_dash;
+    // }
+    // ```
+    //
+    // `^@` *replaces* the operand when it succeeds — `handle_revision_arg_1()`
+    // returns, so the commit itself is never queued and only its parents are. The
+    // other two only *prepend* to it: the parents go in with the flags flipped and
+    // the operand carries on to the name path below under the truncated spelling,
+    // which is why `git blame HEAD^! -- f` is the range `HEAD^..HEAD` while
+    // `git blame HEAD^@ -- f` digs from `HEAD`'s sole parent.
+    //
+    // A mark whose `add_parents_only()` answers 0 leaves `arg` alone, and the
+    // operand is then handed to `get_oid_with_context()` with the mark still
+    // attached. `get_oid_1()` has no case for `^@`, `^!` or `^-<n>` — they are
+    // `handle_revision_arg_1()`'s grammar, not the revision parser's — so that call
+    // cannot do anything but fail, and the operand comes back as
+    // `fatal: bad revision '<arg>'`. `git blame <tree>^! -- f` is that path.
+    let base = crate::objname::parents_only_base(arg);
+    let mark = &arg[base.len()..];
+    let arg = if mark.is_empty() {
+        arg
+    } else {
+        // `^@` is parent 0 (all of them) and *replaces* the operand on success;
+        // `^!` is also 0 but only prepends; `^-<n>` is the `n`th, read by
+        // [`crate::objname::parents_only_parent`].
+        let (nth, replaces) = match mark {
+            "^@" => (0usize, true),
+            "^!" => (0, false),
+            // `if (… || exclude_parent < 1) { ret = -1; goto out; }` — a parent
+            // number below one is refused before `add_parents_only()` is reached.
+            _ => match crate::objname::parents_only_parent(&mark[2..]) {
+                Some(n) if n >= 1 => (n as usize, false),
+                _ => return bad_revision(arg),
+            },
+        };
+        // `^@` keeps `flags`; the other two flip them for the parents they queue.
+        if add_parents_only(repo, revs, base, if replaces { not } else { !not }, nth) {
+            if replaces {
+                return Ok(None);
+            }
+            base
+        } else {
+            return bad_revision(arg);
+        }
+    };
+    queue_single_name(repo, revs, arg, not)
+}
+
+/// `setup_revisions()`'s `die(_("bad revision '%s'"), arg)`, which quotes the
+/// operand as typed — mark, leading `^` and all.
+fn bad_revision(arg: &str) -> Result<Option<ExitCode>> {
+    let mut err = std::io::stderr().lock();
+    writeln!(err, "fatal: bad revision '{arg}'")?;
+    err.flush()?;
+    Ok(Some(ExitCode::from(128)))
+}
+
+/// `add_parents_only()` (`revision.c:2098-2140`), which queues the parents of the
+/// commit a marked operand names:
+///
+/// ```c
+/// if (*arg == '^') { flags ^= UNINTERESTING | BOTTOM; arg++; }
+/// if (repo_get_oid_committish(the_repository, arg, &oid))
+///         return 0;
+/// while (1) { it = get_reference(revs, arg, &oid, 0); … if (it->type != OBJ_TAG) break; … }
+/// if (it->type != OBJ_COMMIT)
+///         return 0;
+/// commit = (struct commit *)it;
+/// if (exclude_parent && exclude_parent > commit_list_count(commit->parents))
+///         return 0;
+/// for (parents = commit->parents, parent_number = 1; parents;
+///      parents = parents->next, parent_number++) {
+///         if (exclude_parent && parent_number != exclude_parent)
+///                 continue;
+///         it = &parents->item->object;
+///         it->flags |= flags;
+///         add_rev_cmdline(revs, it, arg_, REV_CMD_PARENTS_ONLY, flags);
+///         add_pending_object(revs, it, arg);
+/// }
+/// return 1;
+/// ```
+///
+/// `exclude_parent` is 1-based and 0 means "every parent". Every entry is queued
+/// under `arg` — the *base*, with its own leading `^` already stripped — not under
+/// the operand as typed.
+///
+/// A root commit queues nothing and still answers `true`: the loop body simply
+/// never runs, and `return 1` is unconditional. That is what makes
+/// `git blame <root>^@ -- <path>` an empty `revs->pending` rather than an error.
+fn add_parents_only(
+    repo: &gix::Repository,
+    revs: &mut Revs,
+    arg_: &str,
+    not: bool,
+    exclude_parent: usize,
+) -> bool {
+    let (arg, marked) = crate::objname::uninteresting_mark(arg_);
+    let not = not ^ marked;
+    // `repo_get_oid_committish()` and the tag-peeling loop, which is
+    // [`crate::objname::resolve`] followed by [`crate::sequencer::peel_id`] — and
+    // this is the resolution the ambiguity warning is counted for.
+    let Some(id) = crate::objname::resolve(repo, arg) else {
+        return false;
+    };
+    let crate::sequencer::Side::Commit(id) = crate::sequencer::peel_id(repo, id) else {
+        return false;
+    };
+    let Ok(commit) = repo.find_commit(id) else {
+        return false;
+    };
+    let parents: Vec<ObjectId> = commit.parent_ids().map(|p| p.detach()).collect();
+    if exclude_parent != 0 && exclude_parent > parents.len() {
+        return false;
+    }
+    for (n, parent) in parents.iter().enumerate() {
+        if exclude_parent != 0 && n + 1 != exclude_parent {
+            continue;
+        }
+        queue_pending(repo, revs, not, arg.to_string(), *parent);
+    }
     true
+}
+
+/// The tail of `handle_revision_arg_1()`: strip one leading `^`, resolve what is
+/// left, and queue it under *that* name — which is why `git blame --reverse ^A ^B`
+/// names `A` and `B` and not `^A` and `^B`.
+///
+/// ```c
+/// local_flags = 0;
+/// if (*arg == '^') {
+///         local_flags = UNINTERESTING | BOTTOM;
+///         arg++;
+/// }
+/// …
+/// object = get_reference(revs, arg, &oid, flags ^ local_flags);
+/// add_pending_object_with_path(revs, object, arg, oc.mode, oc.path);
+/// ```
+fn queue_single_name(
+    repo: &gix::Repository,
+    revs: &mut Revs,
+    arg: &str,
+    not: bool,
+) -> Result<Option<ExitCode>> {
+    let (name, marked) = crate::objname::uninteresting_mark(arg);
+    // `get_reference()`'s `die("bad object %s", name)` for a well-formed but absent
+    // full-length hex, which resolves without the object database being consulted.
+    if let Some(message) = setup_revisions_fatal(repo, name) {
+        let mut err = std::io::stderr().lock();
+        write!(err, "{message}")?;
+        err.flush()?;
+        return Ok(Some(ExitCode::from(128)));
+    }
+    let Some(id) = crate::objname::resolve(repo, name) else {
+        let mut err = std::io::stderr().lock();
+        writeln!(err, "fatal: bad revision '{arg}'")?;
+        err.flush()?;
+        return Ok(Some(ExitCode::from(128)));
+    };
+    queue_pending(repo, revs, not ^ marked, name.to_string(), id);
+    Ok(None)
+}
+
+/// `repo_get_merge_bases(the_repository, a, b, &exclude)`, whose result `A...B`
+/// queues as the range's uninteresting end.
+///
+/// Non-commit endpoints cannot get here: [`crate::objname::dotdot`] has already
+/// put a symmetric range's ends through `lookup_commit_reference()` and answered
+/// `Missing` when either failed.
+fn merge_bases(repo: &gix::Repository, a: ObjectId, b: ObjectId) -> Vec<ObjectId> {
+    match repo.merge_bases_many(a, &[b]) {
+        Ok(bases) => bases.into_iter().map(|id| id.detach()).collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// `setup_revisions()` (`revision.c:2960`) as `cmd_blame()` reaches it: the operand
+/// list with the path already cut out of it, read left to right, each token either
+/// an option one of the revision parsers owns or a revision to queue.
+///
+/// The two end-of-function refusals come last and in git's order —
+/// `prepare_show_merge()` (`revision.c:3124`) before `diff_setup_done()`'s
+/// `diff_check_follow_pathspec()` (`diff.c:5219`) — and both after every operand has
+/// been read, which is why a bad revision anywhere on the line outranks them.
+fn setup_revisions(
+    repo: &gix::Repository,
+    operands: &[String],
+    revs: &mut Revs,
+) -> Result<Option<ExitCode>> {
+    let mut not = false;
+    let mut excludes: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < operands.len() {
+        let arg = operands[i].as_str();
+        // A bare `-` is not an option name; `setup_revisions()` hands it to
+        // `handle_revision_arg()` like any other word.
+        if arg.starts_with('-') && arg.len() > 1 {
+            if let Some(code) = revision_option(repo, revs, operands, &mut i, &mut not, &mut excludes)? {
+                return Ok(Some(code));
+            }
+            i += 1;
+            continue;
+        }
+        if let Some(code) = queue_revision_arg(repo, revs, arg, not)? {
+            return Ok(Some(code));
+        }
+        i += 1;
+    }
+    if revs.show_merge && lookup_other_head(repo).is_none() {
+        let mut err = std::io::stderr().lock();
+        writeln!(
+            err,
+            "fatal: --merge requires one of the pseudorefs MERGE_HEAD, CHERRY_PICK_HEAD, \
+             REVERT_HEAD or REBASE_HEAD"
+        )?;
+        err.flush()?;
+        return Ok(Some(ExitCode::from(128)));
+    }
+    // `diff_check_follow_pathspec(&revs->prune_data, 1)`: `cmd_blame()` strips the
+    // path out of argv before calling `setup_revisions()`, so `prune_data.nr` is
+    // always 0 here and `--follow` in this position is always fatal.
+    if revs.follow {
+        let mut err = std::io::stderr().lock();
+        writeln!(err, "fatal: --follow requires exactly one pathspec")?;
+        err.flush()?;
+        return Ok(Some(ExitCode::from(128)));
+    }
+    Ok(None)
+}
+
+/// `lookup_other_head()` (`revision.c:1975`): the first of the four pseudo-refs
+/// `--merge` accepts that exists.
+fn lookup_other_head(repo: &gix::Repository) -> Option<&'static str> {
+    ["MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "REBASE_HEAD"]
+        .into_iter()
+        .find(|name| repo.try_find_reference(*name).ok().flatten().is_some())
+}
+
+/// One `-`-leading operand, routed the way `setup_revisions()` routes it: first
+/// `handle_revision_pseudo_opt()`, then the value parsers, then the
+/// "requires a value" tables.
+///
+/// `i` is advanced past a separate value argument the option consumed.
+fn revision_option(
+    repo: &gix::Repository,
+    revs: &mut Revs,
+    operands: &[String],
+    i: &mut usize,
+    not: &mut bool,
+    excludes: &mut Vec<String>,
+) -> Result<Option<ExitCode>> {
+    let arg = operands[*i].as_str();
+    if pseudo_revision_opt(repo, revs, arg, not, excludes)?.is_some() {
+        return Ok(None);
+    }
+    if let Some(code) = rev_option_value_check(repo, arg, operands.get(*i + 1).map(String::as_str))? {
+        return Ok(Some(code));
+    }
+    // A separate value the option consumed must not be read again as a revision.
+    if takes_next_slot(arg) && *i + 1 < operands.len() {
+        *i += 1;
+        return Ok(None);
+    }
+    trailing_option_missing_value(arg).map(|code| code)
+}
+
+/// Whether the option spends the *next* argv slot on its value, which is the two
+/// "requires a value" tables plus the short options that spell it that way.
+fn takes_next_slot(arg: &str) -> bool {
+    if let Some(body) = arg.strip_prefix("--") {
+        return !body.contains('=')
+            && (REV_OPT_PARSE_OPTIONS_VALUE.contains(&body) || REV_OPT_REVISION_VALUE.contains(&body));
+    }
+    matches!(&arg[1..], "n" | "l" | "G" | "I" | "O" | "S")
+}
+
+/// The value validation half of [`revision_option`], split out because both
+/// argument positions need it: a value that is present and wrong is rejected
+/// wherever the option stands, as `git blame --max-count=abc -- f.txt` and
+/// `git blame -- f.txt --max-count=abc` both show (both `fatal: 'abc': not an
+/// integer`, exit 128).
+fn rev_option_value_check(
+    repo: &gix::Repository,
+    arg: &str,
+    next: Option<&str>,
+) -> Result<Option<ExitCode>> {
+    let (name, value) = if let Some(body) = arg.strip_prefix("--") {
+        match body.split_once('=') {
+            Some((name, value)) => (name.to_string(), value.to_string()),
+            None if rev_opt_value_parser(body).is_some() && takes_next_slot(arg) => {
+                match next {
+                    Some(value) => (body.to_string(), value.to_string()),
+                    // No value to check; `trailing_option_missing_value` reports it.
+                    None => return Ok(None),
+                }
+            }
+            None => return Ok(None),
+        }
+    } else {
+        match short_opt_value(arg) {
+            Some((long, value)) => (long.to_string(), value.to_string()),
+            None => return Ok(None),
+        }
+    };
+    let Some((message, code)) = rev_opt_value_refusal(repo, &name, &value)? else {
+        return Ok(None);
+    };
+    if !message.is_empty() {
+        let mut err = std::io::stderr().lock();
+        write!(err, "{message}")?;
+        err.flush()?;
+    }
+    Ok(Some(code))
 }
 
 /// Split the collected positionals into `[<rev>...] <file>` following git
@@ -2623,6 +3949,11 @@ fn rename_score_consumed(score: &str) -> bool {
 /// argument handling for the presence/absence of the `--` separator.
 fn resolve_targets(repo: &gix::Repository, opts: &mut Options) -> Result<Targets> {
     // Determine the revision arguments (in order) and the single path.
+    //
+    // `revs` is `cmd_blame()`'s argv tail after it has cut the path out, so it
+    // still holds the pseudo-revision options `handle_revision_opt()` left in
+    // place — their position among the operands is what decides `revs->pending`
+    // order, and that order is what `find_single_final()`'s diagnostics quote.
     let (revs, file): (Vec<String>, String) = match opts.post.take() {
         // `--` was present: everything after it is a pathspec. blame accepts
         // exactly one path; a trailing second token is DWIM'd as a revision.
@@ -2631,7 +3962,8 @@ fn resolve_targets(repo: &gix::Repository, opts: &mut Options) -> Result<Targets
             match post.len() {
                 0 => return Ok(Targets::Usage),
                 1 => (pre, post.into_iter().next().unwrap()),
-                // `blame -- <file> <rev>`: only legal with no revs before `--`.
+                // `blame -- <file> <rev>`: only legal with no revs before `--`
+                // (git's `if (argc != 4) usage_with_options(...)`).
                 2 if pre.is_empty() => {
                     let mut it = post.into_iter();
                     let file = it.next().unwrap();
@@ -2639,17 +3971,8 @@ fn resolve_targets(repo: &gix::Repository, opts: &mut Options) -> Result<Targets
                     // `cmd_blame` reorders this shape to `<rev> -- <path>` and hands
                     // the whole array to `setup_revisions()`, which routes anything
                     // starting with `-` to `handle_revision_opt()` / `diff_opt_parse()`
-                    // instead of `get_oid()`. So a `-`-leading token here is an
-                    // *option*, never a revision: it is silently dropped unless it is
-                    // one that needs a value it was not given.
-                    if rev.starts_with('-') {
-                        if let Some(code) = trailing_option_missing_value(&rev)? {
-                            return Ok(Targets::Fatal(code));
-                        }
-                        (vec![], file)
-                    } else {
-                        (vec![rev], file)
-                    }
+                    // instead of `get_oid()`.
+                    (vec![rev], file)
                 }
                 _ => return Ok(Targets::Usage),
             }
@@ -2681,37 +4004,47 @@ fn resolve_targets(repo: &gix::Repository, opts: &mut Options) -> Result<Targets
         }
     };
 
-    if opts.reverse {
-        return resolve_reverse_targets(repo, opts, &revs, file);
+    // `setup_revisions()` queues every operand into `revs->pending` first, dying on
+    // the first one it cannot resolve; only then does `setup_scoreboard()` run
+    // `find_single_final()` / `find_single_initial()` over what was queued. So a bad
+    // revision anywhere on the line outranks either of those diagnostics, whichever
+    // order the operands are in.
+    let mut queued = Revs {
+        // `--merge` and `--ancestry-path` set their flag from either position; the
+        // parse loop has already recorded an occurrence in front of the `--`.
+        show_merge: opts.show_merge,
+        ancestry_path: opts.ancestry_path,
+        ..Revs::default()
+    };
+    if let Some(code) = setup_revisions(repo, &revs, &mut queued)? {
+        return Ok(Targets::Fatal(code));
     }
 
-    // Resolve the revisions in order, matching git: the first that fails to
-    // resolve is a `bad revision`; a second one that succeeds is `More than one
-    // commit to dig from`.
-    let mut suspect: Option<(String, ObjectId)> = None;
-    for r in &revs {
-        // `setup_revisions()` runs over the whole operand list before
-        // `cmd_blame()` looks at any of it, so its own refusals come first.
-        if let Some(fatal) = setup_revisions_refusal(repo, r)? {
-            return Ok(fatal);
+    if opts.reverse {
+        return resolve_reverse_targets(repo, opts, queued, file);
+    }
+
+    let suspect = match find_single_final(&queued) {
+        Ok(found) => found,
+        Err(message) => {
+            let mut err = std::io::stderr().lock();
+            writeln!(err, "fatal: {message}")?;
+            err.flush()?;
+            return Ok(Targets::Fatal(ExitCode::from(128)));
         }
-        match resolve_commit(repo, r) {
-            Some(id) => {
-                if let Some((first, _)) = &suspect {
-                    let mut err = std::io::stderr().lock();
-                    writeln!(err, "fatal: More than one commit to dig from {first} and {r}?")?;
-                    err.flush()?;
-                    return Ok(Targets::Fatal(ExitCode::from(128)));
-                }
-                suspect = Some((r.clone(), id));
-            }
-            None => {
-                let mut err = std::io::stderr().lock();
-                writeln!(err, "fatal: bad revision '{r}'")?;
-                err.flush()?;
-                return Ok(Targets::Fatal(ExitCode::from(128)));
-            }
-        }
+    };
+
+    // `prepare_revision_walk()`'s `limit_list()`, which marks every ancestor of a
+    // bottom commit `UNINTERESTING` before `assign_blame()` reads the flag
+    // (`revision.c:1448-1452` for the `--ancestry-path` refusal that shares the
+    // same list). `assign_blame()` then stops at any commit carrying it.
+    opts.bottom = uninteresting_closure(repo, &queued)?;
+    if queued.ancestry_path && opts.bottom.is_empty() {
+        // `die("--ancestry-path given but there are no bottom commits")`, raised from
+        // inside `prepare_revision_walk()` — so after `find_single_final()` and after
+        // the fake working-tree commit's `lstat`, which is why it is reported here
+        // rather than in `setup_revisions()`.
+        opts.ancestry_path_pending = true;
     }
 
     opts.rev = suspect.as_ref().map(|(n, _)| n.clone());
@@ -2720,84 +4053,101 @@ fn resolve_targets(repo: &gix::Repository, opts: &mut Options) -> Result<Targets
     Ok(Targets::Resolved)
 }
 
-/// The revision arguments of a `--reverse` blame, which name a *range* rather than a single
-/// commit: `setup_revisions()` marks the left-hand side of `A..B` (and any `^A`) as
-/// `UNINTERESTING`, and `setup_scoreboard()` then picks the sole negative one with
-/// `find_single_initial()` (`blame.c:2726`) as the commit whose file is the final image.
+/// Every commit reachable from a bottom commit, bottoms included — git's
+/// `UNINTERESTING` flag once `limit_list()` and `mark_parents_uninteresting()`
+/// have finished spreading it.
+///
+/// The closure is computed up front rather than propagated as the blame walk
+/// reaches each bottom, because ancestry can re-enter through the far side of a
+/// merge: a commit the blame reaches by another path is already marked in git and
+/// would not be if the mark only travelled along the blame's own chain.
+fn uninteresting_closure(
+    repo: &gix::Repository,
+    revs: &Revs,
+) -> Result<std::collections::HashSet<ObjectId>> {
+    let mut out: std::collections::HashSet<ObjectId> = std::collections::HashSet::new();
+    // Only commit-ish bottoms limit a walk; a tree or blob queued as uninteresting
+    // (`--indexed-objects --not`) has no ancestry to spread the flag along.
+    let bottoms: Vec<ObjectId> = revs
+        .pending
+        .iter()
+        .filter(|p| revs.uninteresting.contains(&p.id))
+        .filter_map(|p| match p.object {
+            crate::sequencer::Side::Commit(id) => Some(id),
+            _ => None,
+        })
+        .collect();
+    if bottoms.is_empty() {
+        return Ok(out);
+    }
+    let walk = repo
+        .rev_walk(bottoms)
+        .sorting(gix::revision::walk::Sorting::BreadthFirst)
+        .all()?;
+    for info in walk {
+        let Ok(info) = info else { continue };
+        out.insert(info.id);
+    }
+    Ok(out)
+}
+
+/// The `--reverse` half of `setup_scoreboard()`: `find_single_initial()` picks the one
+/// negative commit, `dwim_reverse_initial()` invents one when the line named a single
+/// positive commit and nothing else, and the remaining positives are where the forward
+/// walk stops.
 fn resolve_reverse_targets(
     repo: &gix::Repository,
     opts: &mut Options,
-    revs: &[String],
+    mut queued: Revs,
     file: String,
 ) -> Result<Targets> {
-    let mut negative: Vec<(String, ObjectId)> = Vec::new();
-    let mut positive: Vec<(String, ObjectId)> = Vec::new();
-
-    // `setup_revisions()`'s range grammar, in the forms blame is given one: `A..B` names `^A` and
-    // `B`, an empty endpoint means `HEAD`, and a bare `^A` is the negative on its own. `A...B`
-    // (symmetric difference) is not a range the reverse walk can be expressed over, since it has
-    // no single initial commit.
-    for r in revs {
-        // Same ordering as the forward path: `setup_revisions()` has already
-        // refused the operand before blame gets to read it as a range.
-        if let Some(fatal) = setup_revisions_refusal(repo, r)? {
-            return Ok(fatal);
-        }
-        if r.contains("...") {
+    let mut from = match find_single_initial(&queued) {
+        Ok(found) => found,
+        Err(message) => {
             let mut err = std::io::stderr().lock();
-            writeln!(err, "fatal: unsupported revision range for --reverse: {r}")?;
+            writeln!(err, "fatal: {message}")?;
             err.flush()?;
             return Ok(Targets::Fatal(ExitCode::from(128)));
         }
-        let (name, side) = match r.split_once("..") {
-            Some((lhs, rhs)) => {
-                let lhs = if lhs.is_empty() { "HEAD" } else { lhs };
-                let rhs = if rhs.is_empty() { "HEAD" } else { rhs };
-                match resolve_commit(repo, rhs) {
-                    Some(id) => positive.push((rhs.to_string(), id)),
-                    None => return bad_revision(r),
+    };
+
+    // `dwim_reverse_initial()` (`blame.c:2688`): with `revs->pending.nr == 1` and that
+    // sole entry commit-ish, `git blame --reverse ONE -- PATH` means `ONE..HEAD` — the
+    // entry is marked `UNINTERESTING` and `HEAD` is queued behind it.
+    if from.is_none() && queued.pending.len() == 1 {
+        let only = &queued.pending[0];
+        if let crate::sequencer::Side::Commit(id) = only.object {
+            if let Ok(head) = repo.head_id() {
+                if let crate::sequencer::Side::Commit(head) =
+                    crate::sequencer::peel_id(repo, head.detach())
+                {
+                    from = Some((only.name.clone(), id));
+                    queued.uninteresting.insert(only.id);
+                    queue_pending(repo, &mut queued, false, "HEAD".to_string(), head);
                 }
-                (lhs.to_string(), &mut negative)
             }
-            None => match r.strip_prefix('^') {
-                Some(rest) => (rest.to_string(), &mut negative),
-                None => (r.clone(), &mut positive),
-            },
-        };
-        match resolve_commit(repo, &name) {
-            Some(id) => side.push((name, id)),
-            None => return bad_revision(r),
         }
     }
 
-    if negative.len() > 1 {
-        let mut err = std::io::stderr().lock();
-        writeln!(
-            err,
-            "fatal: More than one commit to dig up from, {} and {}?",
-            negative[0].0, negative[1].0
-        )?;
-        err.flush()?;
-        return Ok(Targets::Fatal(ExitCode::from(128)));
-    }
-
-    // `dwim_reverse_initial()` (`blame.c:2688`): with a single revision and no negative one,
-    // `git blame --reverse ONE -- PATH` means `ONE..HEAD`.
-    if negative.is_empty() && positive.len() == 1 {
-        negative.push(positive.remove(0));
-        match repo.head_id() {
-            Ok(head) => positive.push(("HEAD".to_string(), head.detach())),
-            Err(_) => return no_commit_to_dig_up_from(),
-        }
-    }
-
-    let Some((from_name, from_id)) = negative.pop() else {
+    let Some((from_name, from_id)) = from else {
         return no_commit_to_dig_up_from();
     };
 
+    // The forward walk's tips: `revs->pending` minus the negative one, which is what
+    // `prepare_revision_walk()` builds `revs->children` over.
+    let tips: Vec<ObjectId> = queued
+        .pending
+        .iter()
+        .filter(|p| !queued.uninteresting.contains(&p.id))
+        .filter_map(|p| match p.object {
+            crate::sequencer::Side::Commit(id) => Some(id),
+            _ => None,
+        })
+        .collect();
+
     // `setup_scoreboard()`: `--reverse --first-parent` needs a single latest commit to build the
     // first-parent chain decoration from (`blame.c:2828-2832`).
-    if opts.first_parent && positive.len() != 1 {
+    if opts.first_parent && tips.len() != 1 {
         let mut err = std::io::stderr().lock();
         writeln!(
             err,
@@ -2810,16 +4160,9 @@ fn resolve_reverse_targets(
     opts.rev = Some(from_name);
     opts.suspect_id = Some(from_id);
     opts.reverse_from = Some(from_id);
-    opts.reverse_tips = positive.into_iter().map(|(_, id)| id).collect();
+    opts.reverse_tips = tips;
     opts.file = file;
     Ok(Targets::Resolved)
-}
-
-fn bad_revision(name: &str) -> Result<Targets> {
-    let mut err = std::io::stderr().lock();
-    writeln!(err, "fatal: bad revision '{name}'")?;
-    err.flush()?;
-    Ok(Targets::Fatal(ExitCode::from(128)))
 }
 
 fn no_commit_to_dig_up_from() -> Result<Targets> {
@@ -3138,6 +4481,20 @@ struct Options {
     /// The positive endpoints of a `--reverse` range — where the forward walk stops. git's
     /// `revs->pending` minus the negative one.
     reverse_tips: Vec<ObjectId>,
+    /// git's `UNINTERESTING` closure for a forward blame: the bottom commits a range
+    /// named and everything they reach. `assign_blame()` does not pass blame from a
+    /// commit carrying the flag, so these keep the lines the range did not touch and
+    /// print with the boundary marker.
+    bottom: std::collections::HashSet<ObjectId>,
+    /// `--merge` seen in front of the `--`, where `parse_revision_opt()` consumes it
+    /// into `revs->show_merge`; `prepare_show_merge()` acts on it either way.
+    show_merge: bool,
+    /// `--ancestry-path` seen in front of the `--`, same reasoning.
+    ancestry_path: bool,
+    /// `--ancestry-path` with nothing for `collect_bottom_commits()` to find, whose
+    /// `die()` `prepare_revision_walk()` raises — later than every diagnostic
+    /// `resolve_targets` can, which is why it is carried rather than reported there.
+    ancestry_path_pending: bool,
     /// `--show-stats`: print `blame_scoreboard`'s three work counters after the blame.
     show_stats: bool,
     /// `--score-debug` (git's `OUTPUT_SHOW_SCORE`): add `blame_entry_score()` and the entry's
@@ -3240,6 +4597,11 @@ enum ParseOutcome {
     /// explanation goes to stderr and the usage block to stdout, which is what
     /// makes it its own outcome rather than an [`ParseOutcome::Unknown`].
     Ambiguous(String, String, String),
+    /// A refusal whose whole diagnostic is already on stderr — the value parsers
+    /// `handle_revision_opt()` and `diff_opt_parse()` reach, which spell their own
+    /// message and whose status is 128 or 129 depending on which of them owns the
+    /// option. Nothing further is printed, in particular no usage block.
+    Reported(ExitCode),
     Opts(Box<Options>),
 }
 
@@ -3341,8 +4703,66 @@ fn git_knows_long_option(a: &str) -> bool {
             .is_some_and(|n| GIT_BLAME_LONG_OPTIONS.contains(&n))
 }
 
+/// git's "pseudo revision arguments" — the first block of `handle_revision_opt()`
+/// (`revision.c:2325-2340`), which does not act on them at all:
+///
+/// ```c
+/// if (!strcmp(arg, "--all") || !strcmp(arg, "--branches") ||
+///     !strcmp(arg, "--tags") || !strcmp(arg, "--remotes") ||
+///     !strcmp(arg, "--reflog") || !strcmp(arg, "--not") ||
+///     !strcmp(arg, "--no-walk") || !strcmp(arg, "--do-walk") ||
+///     !strcmp(arg, "--bisect") || starts_with(arg, "--glob=") ||
+///     !strcmp(arg, "--indexed-objects") ||
+///     !strcmp(arg, "--alternate-refs") ||
+///     starts_with(arg, "--exclude=") || starts_with(arg, "--exclude-hidden=") ||
+///     starts_with(arg, "--branches=") || starts_with(arg, "--tags=") ||
+///     starts_with(arg, "--remotes=") || starts_with(arg, "--no-walk="))
+/// {
+///         overwrite_argv(unkc, unkv, &argv[0], opt);
+///         return 1;
+/// }
+/// ```
+///
+/// `overwrite_argv()` moves the token down into the kept-argv array, so it survives
+/// the parse loop and `setup_revisions()` reads it again *in place* — which is what
+/// makes `git blame HEAD --all -- f` queue `HEAD` before `--all`'s refs and
+/// `git blame --all HEAD -- f` queue them the other way round. Keeping them among
+/// the positionals here is that same `overwrite_argv()`.
+fn is_pseudo_revision_arg(a: &str) -> bool {
+    matches!(
+        a,
+        "--all"
+            | "--branches"
+            | "--tags"
+            | "--remotes"
+            | "--reflog"
+            | "--not"
+            | "--no-walk"
+            | "--do-walk"
+            | "--bisect"
+            | "--indexed-objects"
+            | "--alternate-refs"
+    ) || ["--glob=", "--exclude=", "--exclude-hidden=", "--branches=", "--tags=", "--remotes=", "--no-walk="]
+        .iter()
+        .any(|p| a.starts_with(p))
+}
+
+/// Whether [`rev_option_value_check`] knows the value parser this token's option
+/// uses, i.e. whether its value is one git *refuses* rather than merely stores.
+fn rev_opt_value_checked(arg: &str) -> bool {
+    if let Some(body) = arg.strip_prefix("--") {
+        let name = body.split('=').next().unwrap_or(body);
+        return rev_opt_value_parser(name).is_some();
+    }
+    short_opt_value(arg).is_some()
+}
+
 impl Options {
-    fn parse(args: &[String], defaults: ConfigDefaults) -> Result<ParseOutcome> {
+    fn parse(
+        repo: &gix::Repository,
+        args: &[String],
+        defaults: ConfigDefaults,
+    ) -> Result<ParseOutcome> {
         let ConfigDefaults {
             show_email: show_email_default,
             show_root: show_root_default,
@@ -3354,6 +4774,8 @@ impl Options {
         let mut line_specs: Vec<String> = Vec::new();
         let mut first_parent = false;
         let mut reverse = false;
+        let mut show_merge = false;
+        let mut ancestry_path = false;
         let mut show_stats = false;
         let mut score_debug = false;
         let mut long = false;
@@ -3653,6 +5075,34 @@ impl Options {
                         Err(msg) => return Ok(ParseOutcome::OptError(msg.to_string())),
                     }
                 }
+                // `revs->show_merge` and `revs->ancestry_path`, both of which
+                // `handle_revision_opt()` consumes here and neither of which is
+                // acted on until much later — so an occurrence in this position is
+                // indistinguishable from one in the revision slot.
+                "--merge" => show_merge = true,
+                "--ancestry-path" => ancestry_path = true,
+                // `--follow` is consumed the same way, but the line right after
+                // `cmd_blame()`'s parse loop clears `follow_renames` again
+                // (`builtin/blame.c:1035`), so unlike the two above it has no effect
+                // at all from in front of the `--`.
+                "--follow" | "--no-follow" => {}
+                // `handle_revision_opt()`'s pseudo-revision block, which keeps the
+                // token among the operands for `setup_revisions()` — see
+                // [`is_pseudo_revision_arg`].
+                _ if is_pseudo_revision_arg(a) => pre.push(a.to_string()),
+                // An option whose *value* one of git's parsers refuses. This is
+                // asked in both argument positions because git refuses in both:
+                // `git blame --max-count=abc -- f` and `git blame -- f --max-count=abc`
+                // are the same `fatal: 'abc': not an integer`.
+                _ if rev_opt_value_checked(a) => {
+                    let next = args.get(i + 1).map(String::as_str);
+                    if let Some(code) = rev_option_value_check(repo, a, next)? {
+                        return Ok(ParseOutcome::Reported(code));
+                    }
+                    if takes_next_slot(a) && i + 1 < args.len() {
+                        i += 1;
+                    }
+                }
                 // A long option no git parser knows: git answers with its own
                 // diagnostic and the usage, so reproduce that rather than
                 // claiming the option merely is not ported.
@@ -3693,6 +5143,10 @@ impl Options {
             reverse,
             reverse_from: None,
             reverse_tips: Vec::new(),
+            bottom: std::collections::HashSet::new(),
+            show_merge,
+            ancestry_path,
+            ancestry_path_pending: false,
             show_stats,
             score_debug,
             long,

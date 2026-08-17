@@ -532,6 +532,217 @@ pub fn parents_only_base(word: &str) -> &str {
     }
 }
 
+/// What `handle_revision_arg_1()`'s three-mark block made of one operand, before
+/// `add_parents_only()` is called.
+///
+/// The block itself is quoted on [`parents_only`]; this is only the *decode*,
+/// which is identical for every verb that reads revisions out of argv, while the
+/// queueing that follows is not (each command keeps its pending list in its own
+/// shape).
+pub enum ParentsOnly<'a> {
+    /// No `^@`, `^!` or `^-<n>` at the end of the operand, so the mark block
+    /// does nothing at all and the operand is resolved whole.
+    Absent,
+    /// A `^-<n>` whose `<n>` `handle_revision_arg_1()` refuses outright:
+    ///
+    /// ```c
+    /// if (strtol_i(mark + 2, 10, &exclude_parent) || exclude_parent < 1) {
+    ///         ret = -1;
+    ///         goto out;
+    /// }
+    /// ```
+    ///
+    /// `add_parents_only()` is never reached, so the operand is neither resolved
+    /// nor warned about, and `handle_revision_arg()` returns non-zero. For the
+    /// verbs that let a failed revision become a pathspec that is
+    /// indistinguishable from [`ParentsOnly::Absent`] — a marked operand never
+    /// resolves either — but the two are kept apart because
+    /// `setup_revisions()`'s callers with `REVARG_CANNOT_BE_FILENAME` do tell
+    /// them apart, reporting `bad revision '<arg>'` here and only here.
+    BadParent,
+    /// A mark `add_parents_only()` is called for.
+    Mark {
+        /// `add_parents_only()`'s `arg_`: the operand with the mark cut off,
+        /// leading `^` still attached.
+        base: &'a str,
+        /// `exclude_parent`: 0 for `^@` and `^!`, which take every parent, and
+        /// `<n>` for `^-<n>`, which takes only the `n`th.
+        nth: usize,
+        /// True for `^@` alone. `handle_revision_arg_1()` `return 0`s the moment
+        /// `add_parents_only()` succeeds for it, so the operand itself is never
+        /// queued; `^!` and `^-<n>` instead put the truncated name back into
+        /// `arg` and carry on to the single-name path, which is why
+        /// `<rev>^!` is the range `<rev>^..<rev>` while `<rev>^@` is only the
+        /// parents.
+        replaces: bool,
+    },
+}
+
+/// Decode `handle_revision_arg_1()`'s parent-mark block (`revision.c`):
+///
+/// ```c
+/// mark = strstr(arg, "^@");
+/// if (mark && !mark[2]) {
+///         arg_minus_at = xmemdupz(arg, mark - arg);
+///         if (add_parents_only(revs, arg_minus_at, flags, 0)) { ret = 0; goto out; }
+/// }
+/// mark = strstr(arg, "^!");
+/// if (mark && !mark[2]) {
+///         arg_minus_excl = xmemdupz(arg, mark - arg);
+///         if (add_parents_only(revs, arg_minus_excl, flags ^ (UNINTERESTING | BOTTOM), 0))
+///                 arg = arg_minus_excl;
+/// }
+/// mark = strstr(arg, "^-");
+/// if (mark) {
+///         int exclude_parent = 1;
+///         if (mark[2]) {
+///                 if (strtol_i(mark + 2, 10, &exclude_parent) || exclude_parent < 1) {
+///                         ret = -1; goto out;
+///                 }
+///         }
+///         arg_minus_dash = xmemdupz(arg, mark - arg);
+///         if (add_parents_only(revs, arg_minus_dash, flags ^ (UNINTERESTING | BOTTOM), exclude_parent))
+///                 arg = arg_minus_dash;
+/// }
+/// ```
+///
+/// These marks are `handle_revision_arg_1()`'s grammar and not the revision
+/// parser's: `get_oid_1()` has no case for any of them, so an operand that still
+/// carries one when it reaches [`resolve`] can only fail. That is what makes the
+/// decode load-bearing rather than cosmetic — a command that skips this block
+/// does not merely mis-name the operand, it cannot resolve it at all.
+///
+/// The mark is found by [`parents_only_base`], i.e. with `strstr`'s first-match
+/// semantics, so `main^!^!` carries no mark and is `bad revision`.
+pub fn parents_only(word: &str) -> ParentsOnly<'_> {
+    let base = parents_only_base(word);
+    if base.len() == word.len() {
+        return ParentsOnly::Absent;
+    }
+    let mark = &word[base.len()..];
+    match mark {
+        "^@" => ParentsOnly::Mark { base, nth: 0, replaces: true },
+        "^!" => ParentsOnly::Mark { base, nth: 0, replaces: false },
+        // `^-` with an empty tail is parent 1; anything else is `strtol_i`, and
+        // a value below one is refused before `add_parents_only()` is reached.
+        _ => match parents_only_parent(&mark[2..]) {
+            Some(n) if n >= 1 => {
+                ParentsOnly::Mark { base, nth: n as usize, replaces: false }
+            }
+            _ => ParentsOnly::BadParent,
+        },
+    }
+}
+
+/// What `add_parents_only()` answered.
+///
+/// git's return is two-valued, but the function can also `die()` on its way
+/// there — `get_reference()` sits inside its tag-peeling loop — and that third
+/// ending is the caller's to report, because each verb quotes and exits its own
+/// way.
+pub enum Parents {
+    /// `return 1`: the parent selection was queued.
+    Queued,
+    /// `return 0`: the name did not resolve, did not peel to a commit, or asked
+    /// for a parent the commit does not have. `handle_revision_arg_1()` leaves
+    /// `arg` alone for all three, so the operand carries its mark onward.
+    None,
+    /// `get_reference()`'s `die(_("bad object %s"), name)`, where `name` is the
+    /// base with its leading `^` already stripped — which is why
+    /// `<absent-40-hex>^!` is `fatal: bad object <absent-40-hex>` and quotes
+    /// less than the operand did.
+    BadObject,
+}
+
+/// `add_parents_only()` (`revision.c:2098-2140`): queue the parents of the
+/// commit `arg_` names, in git's order and with git's three endings.
+///
+/// ```c
+/// static int add_parents_only(struct rev_info *revs, const char *arg_, int flags,
+///                             int exclude_parent)
+/// {
+///         const char *arg = arg_;
+///
+///         if (*arg == '^') { flags ^= UNINTERESTING | BOTTOM; arg++; }
+///         if (repo_get_oid_committish(revs->repo, arg, &oid))
+///                 return 0;
+///         while (1) {
+///                 it = get_reference(revs, arg, &oid, 0);
+///                 if (!it && revs->ignore_missing) return 0;
+///                 if (it->type != OBJ_TAG) break;
+///                 if (!((struct tag*)it)->tagged) return 0;
+///                 oidcpy(&oid, &((struct tag*)it)->tagged->oid);
+///         }
+///         if (it->type != OBJ_COMMIT) return 0;
+///         commit = (struct commit *)it;
+///         if (exclude_parent &&
+///             exclude_parent > commit_list_count(commit->parents))
+///                 return 0;
+///         for (parents = commit->parents, parent_number = 1;
+///              parents;
+///              parents = parents->next, parent_number++) {
+///                 if (exclude_parent && parent_number != exclude_parent)
+///                         continue;
+///                 it = &parents->item->object;
+///                 it->flags |= flags;
+///                 add_rev_cmdline(revs, it, arg_, REV_CMD_PARENTS_ONLY, flags);
+///                 add_pending_object(revs, it, arg);
+///         }
+///         return 1;
+/// }
+/// ```
+///
+/// `exclude_parent` is 1-based and 0 means "every parent". The bounds test is
+/// git's own and it is *not* an error: `<merge>^-3` is `return 0`, which leaves
+/// the operand to fail its own way rather than dying here.
+///
+/// The `^` is a flag rather than part of the name, so the queued parents are
+/// named by `arg` — the stripped base — while `add_rev_cmdline()` records
+/// `arg_`. `queue` is handed the stripped name, the parent, and whether the
+/// parent is UNINTERESTING; the caller keeps its own pending list in whatever
+/// shape it needs, which is the only part of this that differs between verbs.
+///
+/// The `repo_get_oid_committish()` below is the *first* of a marked operand's
+/// resolutions, so it is where `^!` and `^-<n>` earn the first of their two
+/// ambiguity warnings — `^@` returns before the second, and gets one.
+pub fn add_parents_only(
+    repo: &gix::Repository,
+    arg_: &str,
+    not: bool,
+    exclude_parent: usize,
+    queue: &mut dyn FnMut(&str, ObjectId, bool),
+) -> Parents {
+    let (arg, marked) = uninteresting_mark(arg_);
+    let not = not ^ marked;
+    let Some(id) = resolve(repo, arg) else {
+        return Parents::None;
+    };
+    // `get_reference()` `parse_object()`s what `repo_get_oid_committish()`
+    // decoded, which for a full-length hex is the first time the object database
+    // is consulted at all — and the point where an absent id becomes fatal.
+    if repo.find_object(id).is_err() {
+        return Parents::BadObject;
+    }
+    // The tag-peeling loop plus `if (it->type != OBJ_COMMIT) return 0;`.
+    let crate::sequencer::Side::Commit(id) = crate::sequencer::peel_id(repo, id) else {
+        return Parents::None;
+    };
+    let Ok(commit) = repo.find_commit(id) else {
+        return Parents::None;
+    };
+    let parents: Vec<ObjectId> = commit.parent_ids().map(|id| id.detach()).collect();
+    if exclude_parent != 0 && exclude_parent > parents.len() {
+        return Parents::None;
+    }
+    for (n, parent) in parents.iter().enumerate() {
+        if exclude_parent != 0 && n + 1 != exclude_parent {
+            continue;
+        }
+        queue(arg, *parent, not);
+    }
+    Parents::Queued
+}
+
 /// `handle_revision_arg_1()`'s parent number, read off the tail of a `^-` mark:
 ///
 /// ```c

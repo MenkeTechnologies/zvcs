@@ -33,6 +33,7 @@ pub mod pathspec;
 pub mod porcelain;
 pub mod precompose;
 pub mod progress;
+pub mod quote;
 pub mod rcache;
 pub mod revfilter;
 pub mod sequencer;

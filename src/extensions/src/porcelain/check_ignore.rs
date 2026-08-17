@@ -617,34 +617,10 @@ fn emit(
     out.push(b'\n');
 }
 
-/// C-style path quoting matching git's default `core.quotePath=true`: a path is
-/// wrapped in double quotes and escaped when it contains control bytes, a quote,
-/// a backslash, or any byte >= 0x80; otherwise it is emitted verbatim.
+/// `quote_c_style()`: the name verbatim unless some byte needs escaping, in which
+/// case the whole name double-quoted with C escapes. The table and the
+/// `core.quotePath` flag it reads live in [`crate::quote`], shared with every
+/// other verb that prints a path.
 fn quote_c_style(path: &[u8]) -> Vec<u8> {
-    let needs = path
-        .iter()
-        .any(|&b| b < 0x20 || b == 0x7f || b == b'"' || b == b'\\' || b >= 0x80);
-    if !needs {
-        return path.to_vec();
-    }
-    let mut out: Vec<u8> = vec![b'"'];
-    for &b in path {
-        match b {
-            b'"' => out.extend_from_slice(b"\\\""),
-            b'\\' => out.extend_from_slice(b"\\\\"),
-            0x07 => out.extend_from_slice(b"\\a"),
-            0x08 => out.extend_from_slice(b"\\b"),
-            0x09 => out.extend_from_slice(b"\\t"),
-            0x0a => out.extend_from_slice(b"\\n"),
-            0x0b => out.extend_from_slice(b"\\v"),
-            0x0c => out.extend_from_slice(b"\\f"),
-            0x0d => out.extend_from_slice(b"\\r"),
-            b if b < 0x20 || b == 0x7f || b >= 0x80 => {
-                out.extend_from_slice(format!("\\{b:03o}").as_bytes());
-            }
-            b => out.push(b),
-        }
-    }
-    out.push(b'"');
-    out
+    crate::quote::quoted_name_bytes(path)
 }

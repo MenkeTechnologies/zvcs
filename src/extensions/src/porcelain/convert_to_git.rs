@@ -26,19 +26,28 @@ pub(super) struct WorktreeFilter {
 impl WorktreeFilter {
     /// Build the pipeline for `repo`.
     ///
-    /// `write_object` is git's `HASH_WRITE_OBJECT`: the `core.safecrlf` round-trip
-    /// check rides on it (`get_conv_flags()`), so a dry run, an intent-to-add and a
-    /// refresh — none of which write a blob — never warn and never fail. Neither
-    /// does `renormalize`, whose `get_conv_flags()` returns `CONV_EOL_RENORMALIZE`
-    /// on its own.
+    /// `roundtrip_check` turns on the `core.safecrlf` round-trip test — the
+    /// `in the working copy of '<p>', CRLF will be replaced by LF …` warning and,
+    /// under `core.safecrlf=true`, the refusal that goes with it.
+    ///
+    /// In git that test rides on `INDEX_WRITE_OBJECT` (`get_conv_flags()`), which
+    /// `add_to_index()` computes as `pretend ? 0 : INDEX_WRITE_OBJECT`
+    /// (read-cache.c:723) — so a dry run and an intent-to-add never raise it, and
+    /// `INDEX_RENORMALIZE` bypasses it outright by returning `CONV_EOL_RENORMALIZE`
+    /// on its own. That is a property of the *caller's mode*, not of who happens to
+    /// deposit the blob: git hashes and stores in one `index_path()` call, while
+    /// this port splits the run into a scan that only computes ids and a later pass
+    /// that writes them. Tying the check to "this pipeline writes objects" put it on
+    /// the wrong half — the scan is the pass that stands in for `index_path()`, so
+    /// the flag is the caller's to set and is deliberately independent of any write.
     pub(super) fn new(
         repo: &gix::Repository,
-        write_object: bool,
+        roundtrip_check: bool,
         renormalize: bool,
     ) -> Result<Self> {
         let (pipeline, index) = repo.filter_pipeline(None)?;
         let (mut pipeline, attrs) = pipeline.into_parts();
-        if !write_object || renormalize {
+        if !roundtrip_check || renormalize {
             pipeline.options_mut().crlf_roundtrip_check =
                 gix::filter::plumbing::pipeline::CrlfRoundTripCheck::Skip;
         }

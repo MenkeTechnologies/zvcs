@@ -59,12 +59,13 @@
 //!
 //! What is still this module's own is the worktree walk and the pathspec-accounting
 //! built on it (`mark_seen_per_spec`, `unmatched_pathspec_exit`, the `--refresh`
-//! porcelain report). Two behaviours of `add`'s walk are still missing from this
-//! one, both measured against stock git 2.55.0 and both pre-dating this module's
-//! current shape: the `core.autocrlf` round-trip warning a restaged file produces,
-//! and the racily-clean stat window `run_diff_files()` treats as modified (which is
-//! what makes `-N -v` report every matched tracked path in a freshly checked out
-//! worktree). `add` misses the second one too.
+//! porcelain report). The walk reproduces `run_diff_files(DIFF_RACY_IS_MODIFIED)`'s
+//! selection rule for tracked paths — a stat mismatch under [`stat_match`], or the
+//! racily-clean window [`racy_paths`] describes — because that rule decides three
+//! observable things at once: which paths are hashed (and so which can raise the
+//! `core.autocrlf` round-trip warning), which are reported, and which reach
+//! `add_to_index()` under `-N` and pull the empty blob into the object database.
+//! [`super::add`] applies the same rule off the same two helpers.
 
 use anyhow::{anyhow, bail, Result};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -1028,6 +1029,19 @@ pub(super) fn read_converted_bytes(
     Ok((converted, mode))
 }
 
+/// `create_ce_mode(st.st_mode)` (cache.h): the index mode `add_to_index()` gives an
+/// entry from the worktree stat alone, before it has read a single byte. `-N` never
+/// reads the file, so this is the only mode it has to compare against.
+pub(super) fn mode_from_metadata(md: &gix::index::fs::Metadata) -> Mode {
+    if md.is_symlink() {
+        Mode::SYMLINK
+    } else if md.is_executable() {
+        Mode::FILE_EXECUTABLE
+    } else {
+        Mode::FILE
+    }
+}
+
 fn read_worktree_bytes(
     abs: &std::path::Path,
     md: &gix::index::fs::Metadata,
@@ -1053,25 +1067,52 @@ fn read_worktree_bytes(
     }
 }
 
-/// `match_stat_data()`'s field selection for a default git build: `core.trustctime`
-/// and `core.checkStat` are on, `USE_NSEC` is a compile-time option almost nobody
-/// enables, and `st_dev` is left out for the same reason gitoxide leaves it out.
-pub(super) const STAT_MATCH: gix::index::entry::stat::Options = gix::index::entry::stat::Options {
-    trust_ctime: true,
-    check_stat: true,
-    use_nsec: false,
-    use_stdev: false,
-};
+/// `ce_match_stat_basic()`'s field selection (read-cache.c), which is configurable
+/// and therefore cannot be a constant.
+///
+/// * `core.trustctime` (default true) gates the `CTIME_CHANGED` comparison.
+/// * `core.checkStat` — `default` (true) or `minimal` (false) — gates the ctime,
+///   uid/gid and inode comparisons together. `minimal` leaves only mode, size and
+///   mtime, which is what a repository whose worktree has been copied or restored
+///   from a backup needs: an inode cannot survive a copy, so with the default
+///   setting every entry in the copy reads as modified.
+/// * `USE_NSEC` is a compile-time option git does not enable by default and stock
+///   2.55.0 as shipped does not carry, so the nanosecond fields are never compared.
+///   [`racy_paths`] leaves them out for the same reason.
+/// * `st_dev` is left out for the same reason gitoxide leaves it out.
+pub(super) fn stat_match(repo: &gix::Repository) -> gix::index::entry::stat::Options {
+    let cfg = repo.config_snapshot();
+    gix::index::entry::stat::Options {
+        trust_ctime: cfg.boolean("core.trustctime").unwrap_or(true),
+        check_stat: cfg
+            .string("core.checkStat")
+            .is_none_or(|v| v.as_bstr() != "minimal"),
+        use_nsec: false,
+        use_stdev: false,
+    }
+}
 
 /// The stage-0 paths `is_racy_stat()` (read-cache.c) considers racily clean: the
 /// index file's own timestamp is not newer than the entry's recorded mtime, so a
 /// write in the same filesystem tick could have gone unnoticed.
 ///
-/// `run_diff_files()` matches with `CE_MATCH_RACY_IS_DIRTY`, so those paths are
-/// reported as modified regardless of content — which is why a freshly checked
-/// out or freshly copied worktree hands every tracked path to
-/// `add_file_to_index()`, `-N` included.
-fn racy_paths(index: &gix::index::File, repo: &gix::Repository) -> HashSet<BString> {
+/// `run_diff_files()` matches with `CE_MATCH_RACY_IS_DIRTY`, and so does
+/// `add_to_index()` itself (read-cache.c:717), so those paths are reported as
+/// modified regardless of content — which is why a freshly checked out or freshly
+/// copied worktree hands every tracked path to `add_file_to_index()`, `-N`
+/// included, and why every one of them is hashed with `INDEX_WRITE_OBJECT` and can
+/// therefore raise the `core.safecrlf` round-trip warning.
+///
+/// The comparison is whole seconds. `is_racy_stat()` only consults the nanosecond
+/// field under `USE_NSEC`, which is a compile-time option git does not enable by
+/// default and which stock git 2.55.0 as shipped by Homebrew does not carry: a
+/// repository whose index and worktree files were written in the same second
+/// reports the warning indefinitely, not for a sub-second window. Verified against
+/// that binary — a fixture whose index mtime is `…986.092380002` and whose
+/// `crlf.txt` mtime is `…986.072577080` (index strictly *newer* in nanoseconds, so
+/// not racy under `USE_NSEC`) still warns, three seconds later and every time.
+/// [`stat_match`] leaves `use_nsec` off for the same reason.
+pub(super) fn racy_paths(index: &gix::index::File, repo: &gix::Repository) -> HashSet<BString> {
     let Ok(meta) = std::fs::metadata(repo.index_path()) else {
         return HashSet::new();
     };
@@ -1081,7 +1122,7 @@ fn racy_paths(index: &gix::index::File, repo: &gix::Repository) -> HashSet<BStri
     let Ok(since) = modified.duration_since(std::time::UNIX_EPOCH) else {
         return HashSet::new();
     };
-    let (idx_sec, idx_nsec) = (since.as_secs(), since.subsec_nanos());
+    let idx_sec = since.as_secs();
     if idx_sec == 0 {
         return HashSet::new();
     }
@@ -1090,10 +1131,7 @@ fn racy_paths(index: &gix::index::File, repo: &gix::Repository) -> HashSet<BStri
         .entries()
         .iter()
         .filter(|e| e.stage() == Stage::Unconflicted)
-        .filter(|e| {
-            let (sec, nsec) = (u64::from(e.stat.mtime.secs), e.stat.mtime.nsecs);
-            idx_sec < sec || (idx_sec == sec && idx_nsec <= nsec)
-        })
+        .filter(|e| idx_sec <= u64::from(e.stat.mtime.secs))
         .map(|e| e.path_in(backing).to_owned())
         .collect()
 }
@@ -1111,20 +1149,34 @@ struct Staged {
 fn add(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
     let index = open_index(repo)?;
     // The content filters every staged blob passes through — the same pipeline
-    // `git add` uses, since `cmd_stage()` *is* `cmd_add()`. `--dry-run` and `-N`
-    // write no object, so `core.safecrlf` stays quiet for them, and
-    // `--renormalize` turns the `text=auto` index guard off.
-    let mut filters = super::convert_to_git::WorktreeFilter::new(
+    // `git add` uses, since `cmd_stage()` *is* `cmd_add()`.
+    //
+    // git hashes and stores in one `index_path()` call; this verb splits that into
+    // a scan that computes ids and a write pass that deposits the blobs the scan
+    // selected. The `core.safecrlf` round-trip check belongs to the SCAN, because
+    // the scan is what stands in for `index_path()`: git raises it for every path
+    // `add_to_index()` indexes, including the racily-clean ones whose content turns
+    // out to be unchanged and which therefore never reach this verb's write pass at
+    // all. Giving the check to the write pass instead is what silently dropped the
+    // warning for exactly those paths. The write pass runs with the check off so
+    // the one conversion git performs is reported once.
+    let mut filters = super::convert_to_git::WorktreeFilter::new(repo, false, o.renormalize)?;
+    // `pretend ? 0 : INDEX_WRITE_OBJECT` (read-cache.c:723) plus the `intent_only`
+    // arm that skips `index_path()` outright: `-n` and `-N` convert nothing git
+    // would report on.
+    let mut scan_filters = super::convert_to_git::WorktreeFilter::new(
         repo,
         !o.dry_run && !o.intent_to_add,
         o.renormalize,
     )?;
-    // The scan below hashes each candidate to decide whether it changed at all;
-    // only the write pass at the end reaches git's `index_path()`. Giving the scan
-    // a non-writing pipeline is what keeps `core.safecrlf`'s warning to the one
-    // git prints — the check rides on `HASH_WRITE_OBJECT`, which the scan does not
-    // carry.
-    let mut scan_filters = super::convert_to_git::WorktreeFilter::new(repo, false, o.renormalize)?;
+
+    // `fill_directory()` runs before any of the staging below and before the
+    // pathspec check can die, so its diagnostic comes first. It is skipped for the
+    // two modes that never look for untracked files (`add_new_files`,
+    // builtin/add.c:451).
+    if !o.update && !o.renormalize {
+        super::add::warn_unopenable_walk_prefix(repo, &o.pathspecs, &o.resolved);
+    }
 
     // git applies `--chmod` only when a pathspec is present: cmd_add runs it under
     // `if (chmod_arg && pathspec.nr)`, and `-A`/`-u` do not synthesize a pathspec.
@@ -1183,6 +1235,8 @@ fn add(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
     // `CE_MATCH_RACY_IS_DIRTY` here (that is what `run_diff_files()` passes), so
     // every one of them counts as modified whatever its content says.
     let racily_clean: HashSet<BString> = racy_paths(&index, &repo);
+    // `ce_match_stat_basic()`'s configurable field selection; see [`stat_match`].
+    let stat_match = stat_match(repo);
     // The stat cache itself, for the `match_stat_data()` comparison that decides
     // which tracked paths `run_diff_files()` hands to `add_file_to_index()`.
     let tracked_stat: HashMap<BString, Stat> = {
@@ -1219,6 +1273,11 @@ fn add(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
         candidates.push((entry.rela_path, is_ignored));
     }
     drop(iter);
+    // Put the walk into the order `cmd_add()` visits paths in before anything is
+    // read: every per-path line this scan emits — the `core.autocrlf` round-trip
+    // warnings and the `error: unable to index file` pairs alike — comes out in it.
+    // See [`super::add::staging_order`].
+    candidates.sort_by_key(|(path, _)| super::add::staging_order(tracked.contains_key(path), path));
 
     // A second, independent matcher: unlike the walk's, this one reports *which*
     // pathspec matched, which is what drives the "did not match any files" check
@@ -1306,53 +1365,64 @@ fn add(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
             }
         };
 
+        let stat_now = Stat::from_fs(&md).unwrap_or_default();
+
+        // `run_diff_files(&rev, DIFF_RACY_IS_MODIFIED)` (builtin/add.c:590) is what
+        // picks the tracked paths `add_file_to_index()` ever sees, and it picks them
+        // on the **stat cache**, never on content: `ie_match_stat()` with
+        // `CE_MATCH_RACY_IS_DIRTY` calls a path modified when the recorded stat
+        // differs from the worktree's, and calls a racily-clean one modified
+        // whatever its bytes say. A tracked path it skips is never hashed — so it is
+        // not reported, and it cannot raise the round-trip warning either.
+        //
+        // `--renormalize` replaces that walk with `renormalize_tracked_files()`'s
+        // index scan (builtin/add.c:587-592), which carries no such filter.
+        if already_tracked
+            && !o.renormalize
+            && !racily_clean.contains(&path)
+            && tracked_stat
+                .get(&path)
+                .is_some_and(|recorded| recorded.matches(&stat_now, stat_match))
+        {
+            continue;
+        }
+
         // `-N` records untracked paths as the empty blob, leaving already-tracked
-        // entries untouched.
+        // entries untouched: `add_to_index()` takes the `intent_only` arm, which
+        // skips `index_path()` entirely (so nothing is hashed and nothing is
+        // converted) and adds with `ADD_CACHE_NEW_ONLY`.
         if o.intent_to_add {
+            // `set_object_name_for_intent_to_add_entry()` (read-cache.c:704-710)
+            // deposits the empty blob for every path that reaches `add_to_index()`,
+            // before `ADD_CACHE_PRETEND` is ever consulted.
+            intent_visited = true;
+            let empty = repo.object_hash().empty_blob();
             if already_tracked {
-                // Whether this path reaches `add_to_index()` at all is decided
-                // just below; the empty-blob side effect follows from that.
-                // A tracked path still has to *differ* to be reported: the report
-                // comes from `add_files_to_cache()`, whose `run_diff_files()` walk
-                // never hands an unchanged path to `add_file_to_index()`. `-N`
-                // changes what an already-visited path stages, not which paths
-                // are visited.
-                // `run_diff_files()` decides this on the **stat cache**, not on
-                // content: `ie_match_stat()` compares the recorded stat with the
-                // worktree's and reports a mismatch as modified even when the
-                // bytes are identical. A path it skips never reaches
-                // `add_to_index()`, so it is neither reported nor responsible for
-                // the empty blob.
-                //
-                // Under `--renormalize` the walk is
-                // `renormalize_tracked_files()`'s index scan instead, which has
-                // no such filter and hands over every matched blob.
-                let stat_now = Stat::from_fs(&md).unwrap_or_default();
-                let unchanged = !o.renormalize
-                    && !racily_clean.contains(&path)
-                    && tracked_stat
-                        .get(&path)
-                        .is_some_and(|recorded| recorded.matches(&stat_now, STAT_MATCH));
-                if !unchanged {
+                // `was_same` (read-cache.c:794-797) compares the entry the index
+                // already holds with the one just built — under `-N` that is the
+                // empty blob at the mode the worktree stat gives. Only a difference
+                // is reported, and the entry itself is left alone.
+                if current != Some(&(empty, mode_from_metadata(&md))) {
                     touched.insert(path.clone(), "add");
-                    intent_visited = true;
                 }
                 continue;
             }
             touched.insert(path.clone(), "add");
-            intent_visited = true;
-            let stat = Stat::from_fs(&md).unwrap_or_default();
             staged.push(Staged {
                 path,
-                id: repo.object_hash().empty_blob(),
-                mode: Mode::FILE,
-                stat,
+                id: empty,
+                // `create_ce_mode(st_mode)` again: an intent-to-add entry keeps the
+                // worktree's own mode, so `git stage -N` over an executable records
+                // 100755 and over a symlink 120000. Recording 100644 for all three
+                // made `ls-files -s` disagree with stock for both.
+                mode: mode_from_metadata(&md),
+                stat: stat_now,
                 intent: true,
             });
             continue;
         }
 
-        let (id, mode) = match read_worktree_blob(repo, &mut scan_filters, path.as_ref(), &abs, &md) {
+        let (raw, mode) = match read_worktree_bytes(&abs, &md) {
             Ok(v) => v,
             Err(e) => {
                 if !o.renormalize {
@@ -1366,9 +1436,30 @@ fn add(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
                 continue;
             }
         };
+        // A symlink's target is stored verbatim; a regular file goes through
+        // `convert_to_git()`. This is git's one `index_path()` conversion, so this
+        // is where the `core.autocrlf` round-trip warning — and, under
+        // `core.safecrlf=true`, the refusal that stages nothing and exits 128 —
+        // comes from. The two are told apart from a read failure here rather than
+        // in a shared helper, because a refused conversion is a fatal while an
+        // unreadable file is an `unable to index file` the run can survive.
+        let bytes = if mode == Mode::SYMLINK {
+            raw
+        } else {
+            let rela = gix::path::from_bstr(path.as_bstr()).into_owned();
+            match scan_filters.convert(repo, &rela, &raw) {
+                Ok(converted) => converted,
+                Err(err) => {
+                    eprintln!("fatal: {err}");
+                    return Ok(ExitCode::from(FATAL));
+                }
+            }
+        };
+        let id = gix::objs::compute_hash(repo.object_hash(), gix::objs::Kind::Blob, &bytes)?;
 
-        // Unchanged content and mode: nothing to report, nothing to write. This is
-        // what keeps `--verbose` quiet for paths git would leave alone.
+        // `was_same`: unchanged content and mode, so nothing to report and nothing
+        // to write. This is what keeps `--verbose` quiet for paths git would leave
+        // alone even though it hashed them.
         //
         // `--renormalize` is the exception: `add_to_index()` skips its `alias`
         // lookup under `ADD_CACHE_RENORMALIZE`, so `was_same` never becomes true
@@ -1377,8 +1468,7 @@ fn add(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
             continue;
         }
         touched.insert(path.clone(), "add");
-        let stat = Stat::from_fs(&md).unwrap_or_default();
-        staged.push(Staged { path, id, mode, stat, intent: false });
+        staged.push(Staged { path, id, mode, stat: stat_now, intent: false });
     }
 
     // --- submodule gitlinks: stage a moved submodule's new HEAD (mode 160000) ---

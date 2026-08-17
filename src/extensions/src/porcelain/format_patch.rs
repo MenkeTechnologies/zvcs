@@ -3388,6 +3388,61 @@ fn seed_pending(
                 ExitCode::from(128)
             })));
         }
+        // `handle_revision_arg_1()`'s three-mark block, which sits between the
+        // range rule above and the single-name rule below. It is quoted in full
+        // on [`crate::objname::parents_only`]; what it decides here is only
+        // *which name is resolved*, because `get_oid_1()` has no case for `^@`,
+        // `^!` or `^-<n>` and an operand that still carries one cannot resolve
+        // at all. Skipping the block is therefore not a naming detail:
+        // `format-patch --stdout HEAD^!` formatted nothing before v0.16.0 and
+        // was `ambiguous argument` after it, against stock's one patch.
+        //
+        // A marked operand is never also a range — `<a>..<b>^!`'s right endpoint
+        // does not resolve, so `handle_dotdot()` has already declined it — which
+        // is why testing the marks after the range branch is still git's order.
+        let spec: &str = match crate::objname::parents_only(spec) {
+            // No mark at all, and — for `^-0`, `^--1` and the like — a parent
+            // number `handle_revision_arg_1()` refused before
+            // `add_parents_only()` was reached. Both leave the operand exactly as
+            // typed; the refused number then fails to resolve, which is the
+            // `ambiguous argument` git's own `ret = -1` ends at.
+            crate::objname::ParentsOnly::Absent | crate::objname::ParentsOnly::BadParent => spec,
+            crate::objname::ParentsOnly::Mark { base, nth, replaces } => {
+                // `^@` queues the parents under `flags`; `^!` and `^-<n>` under
+                // `flags ^ (UNINTERESTING | BOTTOM)`, so under a preceding
+                // `--not` all three flip with it.
+                let sense = if replaces { negate } else { !negate };
+                let mut queue = |_name: &str, parent, uninteresting: bool| {
+                    if uninteresting { p.hidden.push(parent) } else { p.tips.push(parent) }
+                };
+                match crate::objname::add_parents_only(repo, base, sense, nth, &mut queue) {
+                    // `get_reference()`'s `die(_("bad object %s"), name)`, raised
+                    // from inside `add_parents_only()`'s tag-peeling loop and
+                    // naming the base rather than the operand:
+                    // `format-patch <absent-40-hex>^!` is
+                    // `fatal: bad object <absent-40-hex>` in stock 2.55.0.
+                    crate::objname::Parents::BadObject => {
+                        let name = crate::objname::uninteresting_mark(base).0;
+                        return Ok(Err(rev_err(&|| fatal(&format!("bad object {name}")))));
+                    }
+                    // `add_parents_only()` answered 0 — a name that did not
+                    // resolve, a non-commit, or a `^-<n>` past the parent count —
+                    // so `arg` is left alone and the operand carries its mark
+                    // into the resolution below, which cannot succeed.
+                    crate::objname::Parents::None => spec,
+                    // `if (add_parents_only(…)) { ret = 0; goto out; }`: the
+                    // operand itself is never queued.
+                    crate::objname::Parents::Queued if replaces => {
+                        p.rev_input_given = true;
+                        continue;
+                    }
+                    // `arg = arg_minus_excl`: the parents are in, and the
+                    // truncated name goes on to the single-name path — which is
+                    // what makes `<rev>^!` the range `<rev>^..<rev>`.
+                    crate::objname::Parents::Queued => base,
+                }
+            }
+        };
         if let Some((symmetric, crate::objname::Dotdot::Ok { a, b })) = range {
             p.rev_input_given = true;
             // The endpoints go on the pending list as the objects git pended —
@@ -6871,57 +6926,18 @@ fn change_path(change: &ChangeDetached) -> &[u8] {
     }
 }
 
-/// True when `quote_c_style()` would escape any byte of `bytes`.
-fn needs_c_quote(bytes: &[u8]) -> bool {
-    bytes
-        .iter()
-        .any(|&b| b < 0x20 || b == 0x7f || b == b'"' || b == b'\\' || b >= 0x80)
-}
-
-fn c_escape_into(out: &mut String, bytes: &[u8]) {
-    for &b in bytes {
-        match b {
-            b'"' => out.push_str("\\\""),
-            b'\\' => out.push_str("\\\\"),
-            0x07 => out.push_str("\\a"),
-            0x08 => out.push_str("\\b"),
-            0x09 => out.push_str("\\t"),
-            0x0a => out.push_str("\\n"),
-            0x0b => out.push_str("\\v"),
-            0x0c => out.push_str("\\f"),
-            0x0d => out.push_str("\\r"),
-            b if b < 0x20 || b == 0x7f || b >= 0x80 => out.push_str(&format!("\\{b:03o}")),
-            b => out.push(b as char),
-        }
-    }
-}
-
-/// C-style path quoting matching git's default `core.quotePath=true`, used for
-/// the stat and summary columns (`quote_c_style`).
+/// `quote_c_style()`: the name verbatim unless some byte needs escaping, in which
+/// case the whole name double-quoted with C escapes. The table and the
+/// `core.quotePath` flag it reads live in [`crate::quote`], shared with every
+/// other verb that prints a path.
 fn quote_path(path: impl AsRef<[u8]>) -> String {
-    let bytes = path.as_ref();
-    if !needs_c_quote(bytes) {
-        return String::from_utf8_lossy(bytes).into_owned();
-    }
-    let mut out = String::from("\"");
-    c_escape_into(&mut out, bytes);
-    out.push('"');
-    out
+    crate::quote::quoted_name_string(path.as_ref())
 }
 
 /// git's `quote_two()`: `<prefix><path>` is quoted as a whole when either half
 /// needs escaping, so `a/` stays inside the quotes.
 fn quote_two(prefix: &str, path: &[u8]) -> Vec<u8> {
-    if !needs_c_quote(prefix.as_bytes()) && !needs_c_quote(path) {
-        let mut out = prefix.as_bytes().to_vec();
-        out.extend_from_slice(path);
-        return out;
-    }
-    let mut out = String::from("\"");
-    c_escape_into(&mut out, prefix.as_bytes());
-    c_escape_into(&mut out, path);
-    out.push('"');
-    out.into_bytes()
+    crate::quote::quote_two_c_style(prefix.as_bytes(), path)
 }
 
 // ---------------------------------------------------------------------------

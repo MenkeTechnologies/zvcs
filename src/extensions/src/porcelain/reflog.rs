@@ -568,8 +568,6 @@ struct Opts {
     /// `Some(true)` for `--merges`, `Some(false)` for `--no-merges`.
     merges: Option<bool>,
     diff: DiffFormats,
-    /// `core.quotePath`, which decides whether bytes >= 0x80 are octal-escaped.
-    quote_high: bool,
     /// `--decorate[=short|full|auto|no]` — how to annotate each entry's commit
     /// with the refs that point at it. `None` is git's piped default (off).
     decorate: Option<Decorate>,
@@ -745,7 +743,6 @@ impl Default for Opts {
             first_parent: false,
             merges: None,
             diff: DiffFormats::default(),
-            quote_high: true,
             decorate: None,
             since: None,
             until: None,
@@ -912,13 +909,10 @@ impl Decorations {
 /// `git reflog show` — render the log of each `<ref>` (default `HEAD`).
 fn show(repo: &gix::Repository, rest: &[String], tweak: Tweak) -> Result<u8> {
     let full_hex = repo.object_hash().len_in_hex();
-    let mut opts = Opts {
-        quote_high: repo
-            .config_snapshot()
-            .boolean("core.quotePath")
-            .unwrap_or(true),
-        ..Opts::default()
-    };
+    // `core.quotePath` is read once, into the flag every `quote_c_style()` caller
+    // shares, exactly as `git_default_core_config()` does.
+    crate::quote::init(repo);
+    let mut opts = Opts::default();
 
     // git validates `log.date` in its log-config callback, which runs before the
     // argument scan, so an unknown value is fatal ahead of any option or revision
@@ -1199,11 +1193,11 @@ fn show(repo: &gix::Repository, rest: &[String], tweak: Tweak) -> Result<u8> {
             // ---- revision ---------------------------------------------------
             s => {
                 saw_ref_source = true;
-                match resolve_spec(repo, s)? {
-                    Resolved::Section(section) => sections.push(section),
-                    // Resolves to an object but owns no reflog: git prints nothing.
-                    Resolved::Empty => {}
-                    Resolved::Fatal(code) => return Ok(code),
+                // One operand can contribute more than one section: `<rev>^@`
+                // queues every parent under the base's name, so a merge's `^@`
+                // walks that reflog once per parent, as stock 2.55.0 does.
+                if let Some(code) = resolve_operand(repo, s, &mut sections)? {
+                    return Ok(code);
                 }
             }
         }
@@ -1524,7 +1518,6 @@ fn render(
                 repo,
                 &changes,
                 opts.diff,
-                opts.quote_high,
                 &opts.abbrev,
                 fallback_len,
             );
@@ -1562,6 +1555,143 @@ enum Resolved {
     Section(Section),
     Empty,
     Fatal(u8),
+}
+
+/// `add_reflog_for_walk()`'s refusal (`reflog-walk.c`):
+///
+/// ```c
+/// if (commit->object.flags & UNINTERESTING)
+///         die("cannot walk reflogs for %s", name);
+/// ```
+///
+/// `name` is `add_pending_object()`'s, i.e. the operand with its `^` and any
+/// `^@`/`^!`/`^-<n>` mark already off — which is why `git reflog show HEAD^!` is
+/// `fatal: cannot walk reflogs for HEAD` and not `… for HEAD^!`.
+fn cannot_walk(name: &str) -> u8 {
+    eprintln!("fatal: cannot walk reflogs for {name}");
+    128
+}
+
+/// One whole `git reflog show` operand, in `handle_revision_arg_1()`'s order:
+/// the parent marks, then the exclusion `^`, then the name.
+///
+/// Sections are appended rather than returned because one operand can produce
+/// several: `add_parents_only()` calls `add_pending_object()` once per parent,
+/// and with `revs->reflog_info` set each of those calls is an
+/// `add_reflog_for_walk()` for the *base's* name — so `<merge>^@` walks that
+/// reflog twice, which stock 2.55.0 duly prints twice.
+///
+/// `Some(code)` is a fatal; `None` means whatever this operand contributed is
+/// already in `sections`, which for a name that owns no reflog is nothing.
+fn resolve_operand(
+    repo: &gix::Repository,
+    spec: &str,
+    sections: &mut Vec<Section>,
+) -> Result<Option<u8>> {
+    // ---- handle_revision_arg_1()'s three-mark block -----------------------
+    //
+    // `git reflog show` reaches `setup_revisions()` through `cmd_log_reflog()`,
+    // so it reads the same grammar as every other revision-taking verb. The
+    // marks are `handle_revision_arg_1()`'s own and `get_oid_1()` has no case
+    // for them, which is why an operand that keeps one cannot resolve at all.
+    // See [`crate::objname::parents_only`] for the C.
+    let spec: &str = match crate::objname::parents_only(spec) {
+        // No mark, or a `^-<n>` whose number git refused outright — both leave
+        // the operand exactly as typed.
+        crate::objname::ParentsOnly::Absent | crate::objname::ParentsOnly::BadParent => spec,
+        crate::objname::ParentsOnly::Mark { base, nth, replaces } => {
+            // `^@` queues the parents under `flags`, which here is "interesting";
+            // `^!` and `^-<n>` under `flags ^ (UNINTERESTING | BOTTOM)`, and an
+            // UNINTERESTING commit is exactly what `add_reflog_for_walk()`
+            // refuses — so `<rev>^!` is a fatal wherever `<rev>` has a parent.
+            let mut uninteresting_parent = None;
+            let mut walks: Vec<String> = Vec::new();
+            let mut queue = |name: &str, _parent, uninteresting: bool| {
+                if uninteresting {
+                    uninteresting_parent = Some(name.to_owned());
+                } else {
+                    walks.push(name.to_owned());
+                }
+            };
+            let queued =
+                crate::objname::add_parents_only(repo, base, !replaces, nth, &mut queue);
+            if let Some(name) = uninteresting_parent {
+                return Ok(Some(cannot_walk(&name)));
+            }
+            match queued {
+                // `get_reference()`'s `die(_("bad object %s"), name)`.
+                crate::objname::Parents::BadObject => {
+                    let name = crate::objname::uninteresting_mark(base).0;
+                    eprintln!("fatal: bad object {name}");
+                    return Ok(Some(128));
+                }
+                // `arg` untouched: the operand carries its mark into a
+                // resolution that cannot succeed, and is diagnosed there.
+                crate::objname::Parents::None => spec,
+                crate::objname::Parents::Queued => {
+                    // `add_reflog_for_walk()` reads the log by *name*; it never
+                    // resolves anything, so these walks add no ambiguity
+                    // warning of their own. The one git prints for the operand
+                    // was already printed by `add_parents_only()` above.
+                    let _quiet = crate::objname::AmbiguityWarnings::off();
+                    for name in &walks {
+                        match resolve_spec(repo, name)? {
+                            Resolved::Section(section) => sections.push(section),
+                            Resolved::Empty => {}
+                            Resolved::Fatal(code) => return Ok(Some(code)),
+                        }
+                    }
+                    // `^@` returns from `handle_revision_arg_1()`; `^!` and
+                    // `^-<n>` go on to pend the base as well — but they only get
+                    // here when the commit had no parent at all, since any
+                    // parent they queued is UNINTERESTING and already died.
+                    if replaces {
+                        return Ok(None);
+                    }
+                    base
+                }
+            }
+        }
+    };
+
+    // ---- the exclusion `^` -------------------------------------------------
+    //
+    // `if (*arg == '^') { flags ^= UNINTERESTING | BOTTOM; arg++; }`, and
+    // `add_pending_object_with_path()` only takes the reflog branch for an
+    // `OBJ_COMMIT`. So `^<commit>` is the refusal above while `^<tag>` and
+    // `^<tree>` are silent — the tag is pended unpeeled and simply dropped.
+    // `get_oid_with_context()` sees the stripped name, so the operand is
+    // resolved — and warned about — exactly once here, as it is below.
+    if let Some(name) = spec.strip_prefix('^') {
+        let Some(id) = crate::objname::resolve(repo, name) else {
+            // `setup_revisions()`: `if (seen_dashdash || *arg == '^') die(_("bad
+            // revision '%s'"), arg);` — quoting the operand as typed, caret and
+            // all, rather than reaching the pathspec fallback.
+            eprintln!("fatal: bad revision '{spec}'");
+            return Ok(Some(128));
+        };
+        // `get_reference()`'s `die(_("bad object %s"), name)` for a full-length
+        // hex the repository does not have — the caret is already off.
+        let Ok(object) = repo.find_object(id) else {
+            eprintln!("fatal: bad object {name}");
+            return Ok(Some(128));
+        };
+        if object.kind == gix::object::Kind::Commit {
+            return Ok(Some(cannot_walk(name)));
+        }
+        // A tag, tree or blob never reaches `add_reflog_for_walk()`: it goes to
+        // `revs->pending` and is dropped by the walk, silently and with exit 0.
+        return Ok(None);
+    }
+
+    Ok(match resolve_spec(repo, spec)? {
+        Resolved::Section(section) => {
+            sections.push(section);
+            None
+        }
+        Resolved::Empty => None,
+        Resolved::Fatal(code) => Some(code),
+    })
 }
 
 /// Resolve a `<ref>`, `<ref>@{<n>}` or `<ref>@{<date>}` argument the way git's
@@ -2928,7 +3058,6 @@ fn append_diff(
     repo: &gix::Repository,
     changes: &[FileChange],
     fmts: DiffFormats,
-    quote_high: bool,
     abbrev: &Abbrev,
     fallback_len: usize,
 ) {
@@ -2961,13 +3090,13 @@ fn append_diff(
             match &change.source {
                 Some(source) => {
                     out.extend_from_slice(format!("{:03}\t", change.score).as_bytes());
-                    out.extend_from_slice(&quote_path(source, quote_high));
+                    out.extend_from_slice(&crate::quote::quoted_name_bytes(source));
                     out.push(b'\t');
-                    out.extend_from_slice(&quote_path(&change.path, quote_high));
+                    out.extend_from_slice(&crate::quote::quoted_name_bytes(&change.path));
                 }
                 None => {
                     out.push(b'\t');
-                    out.extend_from_slice(&quote_path(&change.path, quote_high));
+                    out.extend_from_slice(&crate::quote::quoted_name_bytes(&change.path));
                 }
             }
             out.push(b'\n');
@@ -2976,7 +3105,7 @@ fn append_diff(
 
     if fmts.name_only {
         for change in changes {
-            out.extend_from_slice(&quote_path(&change.path, quote_high));
+            out.extend_from_slice(&crate::quote::quoted_name_bytes(&change.path));
             out.push(b'\n');
         }
     }
@@ -2987,7 +3116,7 @@ fn append_diff(
                 Some(source) => {
                     out.push(change.kind.letter());
                     out.extend_from_slice(format!("{:03}\t", change.score).as_bytes());
-                    out.extend_from_slice(&quote_path(source, quote_high));
+                    out.extend_from_slice(&crate::quote::quoted_name_bytes(source));
                     out.push(b'\t');
                 }
                 None => {
@@ -2995,7 +3124,7 @@ fn append_diff(
                     out.push(b'\t');
                 }
             }
-            out.extend_from_slice(&quote_path(&change.path, quote_high));
+            out.extend_from_slice(&crate::quote::quoted_name_bytes(&change.path));
             out.push(b'\n');
         }
     }
@@ -3027,7 +3156,7 @@ fn append_diff(
                 }
                 None => out.extend_from_slice(b"-\t-\t"),
             }
-            out.extend_from_slice(&display_name(change, quote_high));
+            out.extend_from_slice(&display_name(change));
             out.push(b'\n');
         }
     }
@@ -3059,10 +3188,10 @@ fn append_diff(
         for change in changes {
             match change.kind {
                 ChangeKind::Added => {
-                    append_mode_name(out, "create", change.new_mode, &change.path, quote_high);
+                    append_mode_name(out, "create", change.new_mode, &change.path);
                 }
                 ChangeKind::Deleted => {
-                    append_mode_name(out, "delete", change.old_mode, &change.path, quote_high);
+                    append_mode_name(out, "delete", change.old_mode, &change.path);
                 }
                 ChangeKind::Renamed | ChangeKind::Copied => {
                     let verb = if change.kind == ChangeKind::Renamed {
@@ -3071,13 +3200,13 @@ fn append_diff(
                         "copy"
                     };
                     out.extend_from_slice(format!(" {verb} ").as_bytes());
-                    out.extend_from_slice(&display_name(change, quote_high));
+                    out.extend_from_slice(&display_name(change));
                     out.extend_from_slice(format!(" ({}%)\n", change.score).as_bytes());
                     // git names the file only on a standalone mode change.
-                    append_mode_change(out, change, None, quote_high);
+                    append_mode_change(out, change, None);
                 }
                 ChangeKind::Modified => {
-                    append_mode_change(out, change, Some(&change.path), quote_high);
+                    append_mode_change(out, change, Some(&change.path));
                 }
             }
         }
@@ -3089,17 +3218,17 @@ fn plural(n: u64) -> &'static str {
 }
 
 /// ` create mode 100644 <path>`, git's `show_file_mode_name()`.
-fn append_mode_name(out: &mut Vec<u8>, verb: &str, mode: Option<u16>, path: &[u8], high: bool) {
+fn append_mode_name(out: &mut Vec<u8>, verb: &str, mode: Option<u16>, path: &[u8]) {
     match mode {
         Some(mode) => out.extend_from_slice(format!(" {verb} mode {mode:06o} ").as_bytes()),
         None => out.extend_from_slice(format!(" {verb} ").as_bytes()),
     }
-    out.extend_from_slice(&quote_path(path, high));
+    out.extend_from_slice(&crate::quote::quoted_name_bytes(path));
     out.push(b'\n');
 }
 
 /// git's `show_mode_change()`: only when both sides have a mode and they differ.
-fn append_mode_change(out: &mut Vec<u8>, change: &FileChange, name: Option<&[u8]>, high: bool) {
+fn append_mode_change(out: &mut Vec<u8>, change: &FileChange, name: Option<&[u8]>) {
     let (Some(old), Some(new)) = (change.old_mode, change.new_mode) else {
         return;
     };
@@ -3109,143 +3238,20 @@ fn append_mode_change(out: &mut Vec<u8>, change: &FileChange, name: Option<&[u8]
     out.extend_from_slice(format!(" mode change {old:06o} => {new:06o}").as_bytes());
     if let Some(name) = name {
         out.push(b' ');
-        out.extend_from_slice(&quote_path(name, high));
+        out.extend_from_slice(&crate::quote::quoted_name_bytes(name));
     }
     out.push(b'\n');
 }
 
 /// The name a change is shown under: the compacted `a => b` form for a rename or
 /// copy, the quoted path otherwise.
-fn display_name(change: &FileChange, quote_high: bool) -> Vec<u8> {
+fn display_name(change: &FileChange) -> Vec<u8> {
     match &change.source {
-        Some(source) => pprint_rename(source, &change.path, quote_high),
-        None => quote_path(&change.path, quote_high),
+        Some(source) => super::diff_pairs::pprint_rename(source, &change.path),
+        None => crate::quote::quoted_name_bytes(&change.path),
     }
 }
 
-/// git's `pprint_rename()`. When neither side needs quoting it factors out the
-/// common directory prefix and the common suffix into `pfx{old => new}sfx`;
-/// otherwise it falls back to two separately quoted names.
-fn pprint_rename(a: &[u8], b: &[u8], quote_high: bool) -> Vec<u8> {
-    if needs_quoting(a, quote_high) || needs_quoting(b, quote_high) {
-        let mut out = quote_path(a, quote_high);
-        out.extend_from_slice(b" => ");
-        out.extend_from_slice(&quote_path(b, quote_high));
-        return out;
-    }
-
-    // The common prefix only counts up to the last slash inside it.
-    let mut prefix = 0usize;
-    let mut i = 0usize;
-    while i < a.len() && i < b.len() && a[i] == b[i] {
-        if a[i] == b'/' {
-            prefix = i + 1;
-        }
-        i += 1;
-    }
-
-    // Walk backwards from the terminator. When a prefix was found it ends in a
-    // slash, and git lets this loop run one byte into it to see that same slash.
-    let mut suffix = 0usize;
-    let floor = prefix.saturating_sub(usize::from(prefix > 0));
-    let (mut ai, mut bi) = (a.len(), b.len());
-    loop {
-        if ai < floor || bi < floor {
-            break;
-        }
-        // Index `len` stands for the NUL terminator git compares first.
-        let ca = a.get(ai).copied().unwrap_or(0);
-        let cb = b.get(bi).copied().unwrap_or(0);
-        if ca != cb {
-            break;
-        }
-        if ca == b'/' {
-            suffix = a.len() - ai;
-        }
-        if ai == 0 || bi == 0 {
-            break;
-        }
-        ai -= 1;
-        bi -= 1;
-    }
-
-    let a_mid = a.len().saturating_sub(prefix + suffix);
-    let b_mid = b.len().saturating_sub(prefix + suffix);
-    let mut out = Vec::with_capacity(prefix + a_mid + b_mid + suffix + 7);
-    let braced = prefix + suffix > 0;
-    if braced {
-        out.extend_from_slice(&a[..prefix]);
-        out.push(b'{');
-    }
-    out.extend_from_slice(&a[prefix..prefix + a_mid]);
-    out.extend_from_slice(b" => ");
-    out.extend_from_slice(&b[prefix..prefix + b_mid]);
-    if braced {
-        out.push(b'}');
-        out.extend_from_slice(&a[a.len() - suffix..]);
-    }
-    out
-}
-
-// ---------------------------------------------------------------------------
-// path quoting
-// ---------------------------------------------------------------------------
-
-/// How git's `cq_lookup` table classifies one byte.
-enum Quoted {
-    /// Emitted as-is.
-    Literal,
-    /// Emitted as a backslash followed by this byte.
-    Escaped(u8),
-    /// Emitted as a three-digit octal escape.
-    Octal,
-}
-
-/// `quote_high` is `core.quotePath`, which decides whether bytes >= 0x80 are
-/// octal-escaped or passed through.
-fn classify_byte(byte: u8, quote_high: bool) -> Quoted {
-    match byte {
-        0x07 => Quoted::Escaped(b'a'),
-        0x08 => Quoted::Escaped(b'b'),
-        0x09 => Quoted::Escaped(b't'),
-        0x0a => Quoted::Escaped(b'n'),
-        0x0b => Quoted::Escaped(b'v'),
-        0x0c => Quoted::Escaped(b'f'),
-        0x0d => Quoted::Escaped(b'r'),
-        b'"' => Quoted::Escaped(b'"'),
-        b'\\' => Quoted::Escaped(b'\\'),
-        b if b < 0x20 || b == 0x7f => Quoted::Octal,
-        b if b >= 0x80 && quote_high => Quoted::Octal,
-        _ => Quoted::Literal,
-    }
-}
-
-fn needs_quoting(path: &[u8], quote_high: bool) -> bool {
-    path.iter()
-        .any(|&b| !matches!(classify_byte(b, quote_high), Quoted::Literal))
-}
-
-/// git's `quote_c_style()`: a path that needs no escape is printed bare, and one
-/// that needs any is wrapped in double quotes with C-style escapes throughout.
-fn quote_path(path: &[u8], quote_high: bool) -> Vec<u8> {
-    if !needs_quoting(path, quote_high) {
-        return path.to_vec();
-    }
-    let mut out = Vec::with_capacity(path.len() + 2);
-    out.push(b'"');
-    for &byte in path {
-        match classify_byte(byte, quote_high) {
-            Quoted::Literal => out.push(byte),
-            Quoted::Escaped(c) => {
-                out.push(b'\\');
-                out.push(c);
-            }
-            Quoted::Octal => out.extend_from_slice(format!("\\{byte:03o}").as_bytes()),
-        }
-    }
-    out.push(b'"');
-    out
-}
 
 // ---------------------------------------------------------------------------
 // local timezone

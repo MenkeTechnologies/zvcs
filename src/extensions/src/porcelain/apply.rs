@@ -2779,33 +2779,12 @@ fn unquote(s: &str) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// C-style path quoting for `--numstat`, matching git's default `core.quotePath`.
+/// `quote_c_style()`: the name verbatim unless some byte needs escaping, in which
+/// case the whole name double-quoted with C escapes. The table and the
+/// `core.quotePath` flag it reads live in [`crate::quote`], shared with every
+/// other verb that prints a path.
 fn quote_path(path: &str) -> String {
-    let bytes = path.as_bytes();
-    let needs = bytes
-        .iter()
-        .any(|&b| b < 0x20 || b == 0x7f || b == b'"' || b == b'\\' || b >= 0x80);
-    if !needs {
-        return path.to_owned();
-    }
-    let mut out = String::from("\"");
-    for &b in bytes {
-        match b {
-            b'"' => out.push_str("\\\""),
-            b'\\' => out.push_str("\\\\"),
-            0x07 => out.push_str("\\a"),
-            0x08 => out.push_str("\\b"),
-            0x09 => out.push_str("\\t"),
-            0x0a => out.push_str("\\n"),
-            0x0b => out.push_str("\\v"),
-            0x0c => out.push_str("\\f"),
-            0x0d => out.push_str("\\r"),
-            b if b < 0x20 || b == 0x7f || b >= 0x80 => out.push_str(&format!("\\{b:03o}")),
-            b => out.push(b as char),
-        }
-    }
-    out.push('"');
-    out
+    crate::quote::quoted_name_string(path.as_bytes())
 }
 
 fn octal(s: &str) -> Result<u32> {

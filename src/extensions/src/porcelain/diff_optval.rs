@@ -247,6 +247,26 @@ pub(super) fn dirstat_reject(arg: &str) -> Option<String> {
         .then(|| format!("fatal: Failed to parse --dirstat/-X option parameter:\n{errors}\n"))
 }
 
+/// `diff_opt_pickaxe_string()` and `diff_opt_pickaxe_regex()`'s one refusal
+/// (`diff.c:5888` and `diff.c:5901`):
+///
+/// ```c
+/// options->pickaxe = arg;
+/// options->pickaxe_opts |= DIFF_PICKAXE_KIND_S;
+/// if (arg && !*arg)
+///         return error(_("-S requires a non-empty argument"));
+/// ```
+///
+/// `error()` from a callback is parse-options' `PARSE_OPT_ERROR`: exit 129 with no
+/// usage block, raised at the flag's own argv position — so it beats
+/// `diff_setup_done()`'s conflict `die()`s, which only run once the scan is over,
+/// and loses to a positional standing in front of it. Note the kind bit is set
+/// *before* the refusal, which is why `git diff -S '' -Gx` still reports the empty
+/// argument rather than the two-kind conflict.
+pub(super) fn pickaxe_empty(kind: u8) -> String {
+    format!("error: -{} requires a non-empty argument", kind as char)
+}
+
 /// git's `diff_setup_done()` check that at most one of `-G`, `-S` and
 /// `--find-object` was given (`diff.c`, `HAS_MULTI_BITS(pickaxe_opts &
 /// DIFF_PICKAXE_KINDS_MASK)`), which is a `die()` — exit 128 — rather than the

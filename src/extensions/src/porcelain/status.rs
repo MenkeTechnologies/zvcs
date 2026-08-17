@@ -1932,10 +1932,9 @@ fn relative_path(input: &[u8], prefix: &[u8]) -> Vec<u8> {
 
 /// Port of `quote_path()` (quote.c): make `path` relative to `prefix` (git's
 /// `s->prefix`, which is `NULL` whenever `status.relativePaths` is off or the
-/// format never re-bases paths), then apply the C-style quoting of
-/// `core.quotePath=true` — the path is wrapped in double quotes and escaped when
-/// it contains control bytes, a quote, a backslash, or any byte >= 0x80;
-/// otherwise it is emitted verbatim.
+/// format never re-bases paths), then hand it to `quote_c_style()`. The table and
+/// the `core.quotePath` flag it reads live in [`crate::quote`], shared with every
+/// other verb that prints a path.
 fn quote_path(path: impl AsRef<[u8]>, prefix: Option<&[u8]>) -> String {
     let rebased;
     let bytes = match prefix {
@@ -1945,33 +1944,7 @@ fn quote_path(path: impl AsRef<[u8]>, prefix: Option<&[u8]>) -> String {
         }
         None => path.as_ref(),
     };
-    let needs = bytes
-        .iter()
-        .any(|&b| b < 0x20 || b == 0x7f || b == b'"' || b == b'\\' || b >= 0x80);
-    if !needs {
-        // All bytes are printable ASCII here, so this is lossless.
-        return String::from_utf8_lossy(bytes).into_owned();
-    }
-    let mut out = String::from("\"");
-    for &b in bytes {
-        match b {
-            b'"' => out.push_str("\\\""),
-            b'\\' => out.push_str("\\\\"),
-            0x07 => out.push_str("\\a"),
-            0x08 => out.push_str("\\b"),
-            0x09 => out.push_str("\\t"),
-            0x0a => out.push_str("\\n"),
-            0x0b => out.push_str("\\v"),
-            0x0c => out.push_str("\\f"),
-            0x0d => out.push_str("\\r"),
-            b if b < 0x20 || b == 0x7f || b >= 0x80 => {
-                out.push_str(&format!("\\{b:03o}"));
-            }
-            b => out.push(b as char),
-        }
-    }
-    out.push('"');
-    out
+    crate::quote::quoted_name_string(bytes)
 }
 
 /// `core.preloadIndex` (`read-cache.c`'s `preload_index()`): git fans the index

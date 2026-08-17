@@ -139,13 +139,22 @@
 //!   the way the sub-diff's own `xdl_prepare_env()` would; and `try_lcs()`'s
 //!   occurrence skip is bounded by the before-side end of the region, `ae`
 //!   (`xhistogram.c:207-217`), not by the after-side one.
-//! * `--no-index` is a separate, thinner path here and does not take an algorithm
-//!   at all: `git diff --no-index --histogram A B` is refused as an unsupported
-//!   option rather than rendered with the wrong algorithm.
-//! * `-S<string>` and `-G<regex>` are not rendered here (`diff-index` and
-//!   `diff-files` implement both). They are still parsed far enough to reach
-//!   `diff_setup_done()`, so a combination git refuses — `-S` with `-G`, or either
-//!   with `--find-object` — gets git's own `fatal:` at 128 rather than a bail.
+//!   `--no-index` reads the same four names: `diff_no_index()` builds its option
+//!   table with `add_diff_options()` (diff-no-index.c:372), so every spelling
+//!   `git diff` takes — `--diff-algorithm=<v>`, the separated `--diff-algorithm
+//!   <v>`, `--minimal`, `--patience`, `--histogram` — and the `diff.algorithm`
+//!   default reach it too. Its own default is Myers, git's zero-valued
+//!   `diff_algorithm` (diff.c:78).
+//! * `-S<string>` and `-G<regex>` filter the queue at `diffcore_pickaxe()`'s place
+//!   in `diffcore_std()`, sharing [`super::diff_pickaxe`] with `diff-index` and
+//!   `diff-files`. Both spellings of the value are taken (`-Sfoo` and `-S foo`),
+//!   `--pickaxe-regex` promotes `-S` to a regex, and `--pickaxe-all` keeps the
+//!   whole queue once one pair matched. What is *not* shared is the regex engine:
+//!   a pattern that will not compile gets `fatal: invalid regex: <message>` at 128
+//!   as git does, but the message after the colon is the `regex` crate's rather
+//!   than the platform `regcomp`'s.
+//! * `-I<regex>` / `--ignore-matching-lines=<regex>` is not implemented here
+//!   (`diff-index` and `diff-files` have it) and is refused.
 //! * Magic pathspecs (`:(...)`) and glob pathspecs bail; literal path / directory-prefix
 //!   filtering is supported.
 //! * `--color-moved[=<mode>]`, `--color-moved-ws=`, `--word-diff[=]`,
@@ -539,13 +548,16 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     // `options->objfind`, the one oidset every `--find-object=<id>` inserts into.
     // Empty means the objfind pickaxe was never requested.
     let mut find_object_ids: Vec<ObjectId> = Vec::new();
-    // `DIFF_OPT_PICKAXE_ALL`. Kept only so `diff_setup_done()`'s objfind conflict
-    // can be raised; with no pickaxe kind set it has no effect on the output.
+    // `DIFF_OPT_PICKAXE_ALL`: with any pickaxe kind set, one matching pair keeps the
+    // whole queue. On its own it has no effect on the output and is kept only so
+    // `diff_setup_done()`'s objfind conflict can be raised.
     let mut pickaxe_all = false;
-    // A `-S`/`-G` this command does not render, held until `diff_setup_done()`'s
-    // conflict checks have run — git raises those from after the option scan, so a
-    // bail taken at the flag's own position would pre-empt them.
-    let mut unsupported_pickaxe: Option<String> = None;
+    // `o->pickaxe` and the `DIFF_PICKAXE_KIND_*` bit, as typed: the kind letter and
+    // the raw pattern. Compiled after the scan, since `--pickaxe-regex` may follow
+    // the `-S` it promotes and `diff_setup_done()`'s conflicts outrank a bad regex.
+    let mut pickaxe_arg: Option<(u8, Vec<u8>)> = None;
+    // `DIFF_PICKAXE_REGEX`.
+    let mut pickaxe_regex = false;
     // `XDF_INDENT_HEURISTIC`, on unless `diff.indentHeuristic` or
     // `--no-indent-heuristic` turns it off (`git_diff_basic_config()` sets
     // `diff_indent_heuristic`, whose default is 1).
@@ -614,6 +626,49 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     repo.objects.set_pack_cache(|| {
         Box::new(gix::odb::pack::cache::lru::MemoryCappedHashmap::new(96 * 1024 * 1024))
     });
+
+    // `cmd_diff()`'s *implicit* `--no-index` (builtin/diff.c:466-476), the arm that
+    // fires inside a repository:
+    //
+    // ```c
+    // for (i = 1; i < argc; i++) {
+    //         if (!strcmp(argv[i], "--")) { i++; break; }
+    //         if (!strcmp(argv[i], "--no-index")) no_index = DIFF_NO_INDEX_EXPLICIT;
+    //         if (argv[i][0] != '-') break;
+    // }
+    // …
+    // if (nongit || ((argc == i + 2) &&
+    //                (!path_inside_repo(the_repository, prefix, argv[i]) ||
+    //                 !path_inside_repo(the_repository, prefix, argv[i + 1]))))
+    //         no_index = DIFF_NO_INDEX_IMPLICIT;
+    // ```
+    //
+    // Exactly two operands, at least one of them naming somewhere outside the
+    // worktree: git reads that as "be a colourful `diff(1)`" rather than as a
+    // revision pair. The count is of *all* remaining argv entries, `--` included,
+    // which is what makes `git diff .. --` the no-index usage block (`..` escapes
+    // the worktree, two entries follow the options) while `git diff .. -- a.txt` is
+    // three and stays an ordinary diff.
+    {
+        let mut i = 0;
+        while i < args.len() {
+            if args[i] == "--" {
+                i += 1;
+                break;
+            }
+            if !args[i].starts_with('-') {
+                break;
+            }
+            i += 1;
+        }
+        if args.len() == i + 2 {
+            let prefix = cwd_prefix(&repo);
+            let outside = |p: &String| !path_inside_repo(&repo, &prefix, p);
+            if outside(&args[i]) || outside(&args[i + 1]) {
+                return super::diff_no_index::run_implicit(args);
+            }
+        }
+    }
 
     // Config-provided defaults, overridden by the CLI flags parsed below (git's
     // precedence: diff.context < -U, diff.srcPrefix/dstPrefix/noPrefix < the
@@ -758,6 +813,14 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                     Ok(id) => find_object_ids.push(id),
                     Err(e) => return Ok(e.report()),
                 }
+            } else if flag == "-S" || flag == "-G" {
+                // The separated spelling of the same callback the glued one reaches.
+                let kind = flag.as_bytes()[1];
+                if a.is_empty() {
+                    eprintln!("{}", super::diff_optval::pickaxe_empty(kind));
+                    return Ok(ExitCode::from(129));
+                }
+                pickaxe_arg = Some((kind, a.as_bytes().to_vec()));
             } else if let Some(Err(msg)) =
                 move_word.parse_flag(&format!("{flag}={a}"), &mut color_when)
             {
@@ -771,8 +834,13 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
         // — even one that looks like a revision — and a bare flag at the end of the
         // line is `error: option `<name>' requires a value` (129), which the
         // `pending_value` check after this loop already produces.
+        //
+        // `-S` and `-G` are the same declaration as short options (diff.c:6270-6275),
+        // so a bare one takes the next entry too. Treating it as an *empty* pattern
+        // instead left the real pattern behind to be read as a revision, which is why
+        // `git diff -S dd HEAD~1` died with `fatal: ambiguous argument 'dd'`.
         if diff_color::needs_separate_value(a)
-            || matches!(a.as_str(), "--diff-algorithm" | "--find-object")
+            || matches!(a.as_str(), "--diff-algorithm" | "--find-object" | "-S" | "-G")
         {
             pending_value = Some(a.clone());
             continue;
@@ -1151,13 +1219,21 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
             // stock 2.55.0). Accepting it as the no-op it is also lets
             // `diff_setup_done()`'s objfind conflict below see it.
             "--pickaxe-all" => pickaxe_all = true,
-            // `-S`/`-G` are not rendered here, but they still have to reach
-            // `diff_setup_done()`: the two `HAS_MULTI_BITS` `die()`s run after the
-            // whole option scan, so bailing at the flag's own argv position would
-            // answer with "unsupported option" where git answers with the conflict.
-            // Recorded and re-raised past those checks instead.
-            s if s.starts_with("-S") || s.starts_with("-G") => {
-                unsupported_pickaxe.get_or_insert_with(|| s.to_owned());
+            // `DIFF_PICKAXE_REGEX`: it promotes `-S` from a kwset search to a
+            // `regcomp`, and it may appear on either side of the `-S` it modifies —
+            // `diffcore_pickaxe()` reads `o->pickaxe_opts` once, after the whole
+            // scan — so the pattern is only compiled below.
+            "--pickaxe-regex" => pickaxe_regex = true,
+            "--no-pickaxe-regex" => pickaxe_regex = false,
+            // `OPT_PICKAXE_S`/`OPT_PICKAXE_G` (diff.c:6270-6275). The pattern is
+            // kept raw and the kind recorded: `--pickaxe-regex` may still be ahead,
+            // and `diff_setup_done()`'s two `HAS_MULTI_BITS` `die()`s run after the
+            // whole option scan, so a conflict has to beat a compile failure.
+            s if s.starts_with("-S") => {
+                pickaxe_arg = Some((b'S', s.as_bytes()[2..].to_vec()));
+            }
+            s if s.starts_with("-G") => {
+                pickaxe_arg = Some((b'G', s.as_bytes()[2..].to_vec()));
             }
             s if s.starts_with('-') => bail!("unsupported option {s:?}"),
             s => {
@@ -1316,10 +1392,36 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     if let Some(arg) = &invalid_arg {
         return Ok(invalid_option(arg, !revs.is_empty() || cached));
     }
-    // A `-S`/`-G` that survived both conflict checks is a real git option this
-    // command does not render, and is refused rather than silently ignored.
-    if let Some(flag) = &unsupported_pickaxe {
-        bail!("unsupported option {flag:?}");
+    // `diffcore_pickaxe()` compiles the needle once, past the two conflict `die()`s
+    // above: `-S` is a literal kwset search unless `--pickaxe-regex` promotes it,
+    // `-G` is always a regex, and `--find-object` overrides both because
+    // `pickaxe_match()` tests `o->objfind` before it looks at a needle at all.
+    // A pattern that will not compile is git's `fatal: invalid regex: …` at 128.
+    let mut pickaxe = None;
+    if let Some((kind, pat)) = pickaxe_arg {
+        if kind == b'S' && !pickaxe_regex {
+            pickaxe = Some(super::diff_pickaxe::Kind::Occurrences(
+                super::diff_pickaxe::Needle::Literal(pat),
+            ));
+        } else {
+            match super::diff_pickaxe::compile_regex(&pat) {
+                Ok(re) => {
+                    let needle = super::diff_pickaxe::Needle::Regex(re);
+                    pickaxe = Some(if kind == b'S' {
+                        super::diff_pickaxe::Kind::Occurrences(needle)
+                    } else {
+                        super::diff_pickaxe::Kind::Grep(needle)
+                    });
+                }
+                Err(msg) => {
+                    eprintln!("fatal: invalid regex: {msg}");
+                    return Ok(ExitCode::from(128));
+                }
+            }
+        }
+    }
+    if !find_object_ids.is_empty() {
+        pickaxe = Some(super::diff_pickaxe::Kind::ObjFind(std::mem::take(&mut find_object_ids)));
     }
     paths.extend(trailing_paths);
     // `parse_pathspec()` runs inside `setup_revisions()`, so a rejected element
@@ -1380,10 +1482,19 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     // to the tree dispatch below and surfaced gitoxide's "was blob while trying to
     // peel to tree" at exit 1. Only a blob (or a type git refuses outright) is
     // intercepted here; a tree-ish operand takes exactly the path it always did.
+    //
+    // The loop reads `entry->item` — the object `setup_revisions()` already
+    // attached to the pending entry — and `entry->name` only to *name* it in a
+    // `die()`. It does not resolve the name a second time, so this classification
+    // costs no second trip through `get_oid_basic()` and therefore no second
+    // ambiguity warning. [`crate::objname::resolve_quiet`] is that distinction:
+    // `revs` holds names already resolved (and already warned about) in the
+    // operand loop above, so warning again here made `git diff <40-hex-ref>` say
+    // twice what stock says once.
     let mut blobs = 0usize;
     let mut trees = 0usize;
     for name in &revs {
-        let Some(id) = crate::objname::resolve(&repo, name) else {
+        let Some(id) = crate::objname::resolve_quiet(&repo, name) else {
             continue;
         };
         let Ok(object) = repo.find_object(id) else {
@@ -1623,27 +1734,43 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
         rename_warnings = run_diffcore_rename(&repo, &mut cache, &mut deltas, &ro, worktree_mode)?;
     }
 
-    // `diffcore_pickaxe()` (diff.c:7517), which `diffcore_std()` runs immediately after
-    // the rename passes and before `diffcore_order()`. Only the objfind kind exists
-    // here — `-S`/`-G` are not ported in this command — and `pickaxe_match()` answers
-    // it from the *recorded* ids without reading either side, so a worktree post-image
-    // git has not hashed carries the null id and cannot match.
-    if !find_object_ids.is_empty() {
+    // `diffcore_pickaxe()` (diff.c:7517), which `diffcore_std()` runs immediately
+    // after the rename passes and before `diffcore_order()`.
+    if let Some(pickaxe) = &pickaxe {
         let null = repo.object_hash().null();
-        deltas.retain(|d| {
-            super::diff_files::objfind_hit(
-                &find_object_ids,
-                // `DIFF_FILE_VALID(p->one)` and `p->one->oid`: a worktree pre-image
-                // (only `-R` produces one) carries `old_raw_id`, which is that field.
-                d.old.map(|(id, _)| if d.old_worktree { d.old_raw_id.unwrap_or(null) } else { id }),
-                // `DIFF_FILE_VALID(p->two)` and `p->two->oid`.
-                match &d.new {
-                    NewSide::Absent => None,
-                    NewSide::Blob(id, _) => Some(*id),
-                    NewSide::Worktree(_) => Some(d.new_id.unwrap_or(null)),
-                },
-            )
-        });
+        if let super::diff_pickaxe::Kind::ObjFind(ids) = pickaxe {
+            // `pickaxe_match()` answers the objfind kind from the *recorded* ids and
+            // returns before it would fill either filespec, so no content is read.
+            deltas.retain(|d| {
+                super::diff_pickaxe::objfind_hit(
+                    ids,
+                    // `DIFF_FILE_VALID(p->one)` and `p->one->oid`: a worktree pre-image
+                    // (only `-R` produces one) carries `old_raw_id`, which is that field.
+                    d.old.map(|(id, _)| if d.old_worktree { d.old_raw_id.unwrap_or(null) } else { id }),
+                    // `DIFF_FILE_VALID(p->two)` and `p->two->oid`.
+                    match &d.new {
+                        NewSide::Absent => None,
+                        NewSide::Blob(id, _) => Some(*id),
+                        NewSide::Worktree(_) => Some(d.new_id.unwrap_or(null)),
+                    },
+                )
+            });
+        } else {
+            // `-S`/`-G` fill both filespecs, so each surviving pair is read once here.
+            let objects = repo.objects.clone();
+            let pickaxe_workdir = repo.workdir().map(|p| p.to_owned());
+            let mut hits = Vec::with_capacity(deltas.len());
+            for d in deltas.iter() {
+                let one = pickaxe_side(&objects, pickaxe_workdir.as_deref(), d, true)?;
+                let two = pickaxe_side(&objects, pickaxe_workdir.as_deref(), d, false)?;
+                hits.push(pickaxe.content_hit(one.as_deref(), two.as_deref()));
+            }
+            // `DIFF_OPT_PICKAXE_ALL`: one hit keeps the whole queue.
+            if !(pickaxe_all && hits.iter().any(|h| *h)) {
+                let mut it = hits.into_iter();
+                deltas.retain(|_| it.next().unwrap_or(false));
+            }
+        }
     }
 
     // `--diff-filter`: keep only deltas whose status letter is selected.
@@ -3127,7 +3254,7 @@ fn invalid_option(arg: &str, have_revision: bool) -> ExitCode {
 /// the config accepts exactly the four names, case-insensitively. An unrecognized
 /// one is a hard config error (git exits 128) even when a CLI flag would have
 /// overridden it.
-fn parse_config_algorithm(name: &gix::bstr::BStr) -> Result<gix::diff::blob::Algorithm> {
+pub(crate) fn parse_config_algorithm(name: &gix::bstr::BStr) -> Result<gix::diff::blob::Algorithm> {
     match super::diff_optval::parse_algorithm_value(&name.to_str_lossy()) {
         Some(alg) => Ok(alg),
         None => crate::git_fatal!("diff algorithm {:?} is not available", name.to_str_lossy()),
@@ -3651,6 +3778,62 @@ fn toggle_exec(k: EntryKind) -> EntryKind {
 /// The current directory as a repository-relative prefix with a trailing slash —
 /// git's `prefix`, which is what a valueless `--relative` narrows to. Empty at
 /// the top level, and empty when the cwd cannot be placed inside the worktree.
+/// `path_inside_repo()` (setup.c:162), which is `prefix_path_gently()` reduced to
+/// "did it return non-NULL":
+///
+/// ```c
+/// int path_inside_repo(struct repository *repo, const char *prefix, const char *path)
+/// {
+///         int len = prefix ? strlen(prefix) : 0;
+///         char *r = prefix_path_gently(repo, prefix, len, NULL, path);
+///         if (r) { free(r); return 1; }
+///         return 0;
+/// }
+/// ```
+///
+/// A *relative* path is resolved against the prefix and pushed through
+/// `normalize_path_copy_len()`, which fails — and so answers "outside" — exactly
+/// when a `..` component pops past the start. An *absolute* one is compared
+/// against the worktree by `abspath_part_inside_repo()`, which works on real paths:
+/// on macOS a worktree reached through `$TMPDIR` is `/var/…` while its real path is
+/// `/private/var/…`, so a plain string compare would call an inside path an outside
+/// one.
+///
+/// The file need not exist. `git diff` names paths that do not, and git's own
+/// normalization is textual, so an unresolvable leaf falls back to resolving its
+/// directory.
+fn path_inside_repo(repo: &gix::Repository, prefix: &str, path: &str) -> bool {
+    let real = |p: &std::path::Path| -> std::path::PathBuf {
+        p.canonicalize().unwrap_or_else(|_| match (p.parent(), p.file_name()) {
+            (Some(dir), Some(name)) => {
+                dir.canonicalize().map(|d| d.join(name)).unwrap_or_else(|_| p.to_path_buf())
+            }
+            _ => p.to_path_buf(),
+        })
+    };
+    if path.starts_with('/') {
+        let Some(root) = repo.workdir() else { return false };
+        let (path, root) = (real(std::path::Path::new(path)), real(root));
+        return path.starts_with(&root);
+    }
+    // `normalize_path_copy_len()` over `prefix + path`: a `.` component disappears,
+    // a `..` pops the one before it, and repeated slashes collapse. It reports the
+    // escape by failing, which is a `..` left with nothing in front of it.
+    let mut out: Vec<&str> = Vec::new();
+    for component in format!("{prefix}{path}").split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                if out.pop().is_none() {
+                    return false;
+                }
+            }
+            c => out.push(c),
+        }
+    }
+    true
+}
+
 fn cwd_prefix(repo: &gix::Repository) -> String {
     let (Some(workdir), Ok(cwd)) = (repo.workdir(), std::env::current_dir()) else {
         return String::new();
@@ -4167,6 +4350,57 @@ fn blob_size_new(
     }
 }
 
+/// One side of a pair as `diffcore_pickaxe()` sees it: the bytes
+/// `diff_populate_filespec()` would fill in, or `None` for `!DIFF_FILE_VALID`.
+///
+/// This is read before the blob platform runs, because `diffcore_pickaxe()` is part
+/// of `diffcore_std()` and drops pairs the emitters would otherwise have analysed.
+/// A gitlink contributes its recorded commit id, which is the one-line
+/// `Subproject commit <oid>` blob git synthesises for it.
+fn pickaxe_side(
+    objects: &gix::OdbHandle,
+    workdir: Option<&std::path::Path>,
+    d: &Delta,
+    source: bool,
+) -> Result<Option<Vec<u8>>> {
+    if d.unmerged {
+        return Ok(None);
+    }
+    if source {
+        let Some((id, kind)) = d.old else { return Ok(None) };
+        if kind == EntryKind::Commit {
+            return Ok(Some(id.to_string().into_bytes()));
+        }
+        // A worktree pre-image (only `-R` produces one) has no recorded blob; it is
+        // read by path, exactly as the post-image below is.
+        if d.old_worktree {
+            return Ok(read_worktree_bytes(workdir, d.old_path()));
+        }
+        return Ok(Some(read_blob(objects, id)?));
+    }
+    match &d.new {
+        NewSide::Absent => Ok(None),
+        NewSide::Blob(id, EntryKind::Commit) => Ok(Some(id.to_string().into_bytes())),
+        NewSide::Blob(id, _) => Ok(Some(read_blob(objects, *id)?)),
+        NewSide::Worktree(EntryKind::Commit) => {
+            Ok(d.new_commit.map(|id| id.to_string().into_bytes()))
+        }
+        NewSide::Worktree(_) => Ok(read_worktree_bytes(workdir, &d.path)),
+    }
+}
+
+/// The bytes of a worktree path, with a symlink contributing its target — which is
+/// what git stores as the blob and therefore what the pickaxe searches.
+fn read_worktree_bytes(workdir: Option<&std::path::Path>, path: &BString) -> Option<Vec<u8>> {
+    let full = workdir?.join(gix::path::from_bstr(path.as_bstr()));
+    let meta = std::fs::symlink_metadata(&full).ok()?;
+    if meta.file_type().is_symlink() {
+        let target = std::fs::read_link(&full).ok()?;
+        return Some(gix::path::into_bstr(target).into_owned().into());
+    }
+    std::fs::read(&full).ok()
+}
+
 /// Read a blob's bytes straight from the object database, for the one case the
 /// blob pipeline declines to hand them over: a pair it classified as binary.
 fn read_blob(objects: &gix::OdbHandle, id: ObjectId) -> Result<Vec<u8>> {
@@ -4210,6 +4444,7 @@ pub(crate) fn no_index_body(
     geom: &super::diff_pairs::EmitGeometry,
     ws: Whitespace,
     binary: bool,
+    algorithm: gix::diff::blob::Algorithm,
 ) -> (u32, u32, Vec<u8>) {
     if binary {
         return (0, 0, Vec::new());
@@ -4219,13 +4454,7 @@ pub(crate) fn no_index_body(
     let mut input: InternedInput<Vec<u8>> = InternedInput::default();
     input.update_before(before.iter().map(|l| normalize_line(l, ws)));
     input.update_after(after.iter().map(|l| normalize_line(l, ws)));
-    let diff = super::diff_pairs::compute_compacted(
-        gix::diff::blob::Algorithm::Histogram,
-        &input,
-        &before,
-        &after,
-        true,
-    );
+    let diff = super::diff_pairs::compute_compacted(algorithm, &input, &before, &after, true);
     let changes: Vec<super::diff_pairs::Change> = diff
         .hunks()
         .map(|h| super::diff_pairs::Change {
@@ -4648,60 +4877,7 @@ fn summary_mode_change(out: &mut Vec<u8>, d: &Delta, show_name: bool) {
     out.push(b'\n');
 }
 
-/// `pprint_rename()`: compress the common leading directory and trailing suffix of a
-/// rename/copy into `pfx{old-mid => new-mid}sfx`.
-pub(crate) fn pprint_rename(a: &[u8], b: &[u8]) -> Vec<u8> {
-    let (la, lb) = (a.len(), b.len());
-    // git walks NUL-terminated strings, so index past the end reads as NUL.
-    let at = |s: &[u8], i: usize| -> u8 { if i < s.len() { s[i] } else { 0 } };
-
-    // Common prefix, recorded up to and including the last shared slash.
-    let mut pfx = 0usize;
-    {
-        let mut i = 0;
-        while i < la && i < lb && a[i] == b[i] {
-            if a[i] == b'/' {
-                pfx = i + 1;
-            }
-            i += 1;
-        }
-    }
-
-    // Common suffix, from the (virtual) terminators backwards, stopping at the prefix.
-    let mut sfx = 0usize;
-    {
-        let pfx_adjust = if pfx > 0 { 1isize } else { 0 };
-        let lo = pfx as isize - pfx_adjust;
-        let mut oa = la as isize;
-        let mut ob = lb as isize;
-        while oa >= lo && ob >= lo && at(a, oa as usize) == at(b, ob as usize) {
-            if at(a, oa as usize) == b'/' {
-                sfx = la - oa as usize;
-            }
-            oa -= 1;
-            ob -= 1;
-        }
-    }
-
-    let a_mid = (la as isize - pfx as isize - sfx as isize).max(0) as usize;
-    let b_mid = (lb as isize - pfx as isize - sfx as isize).max(0) as usize;
-
-    let mut out = Vec::new();
-    if pfx + sfx > 0 {
-        out.extend_from_slice(&a[..pfx]);
-        out.push(b'{');
-        out.extend_from_slice(&a[pfx..pfx + a_mid]);
-        out.extend_from_slice(b" => ");
-        out.extend_from_slice(&b[pfx..pfx + b_mid]);
-        out.push(b'}');
-        out.extend_from_slice(&a[la - sfx..]);
-    } else {
-        out.extend_from_slice(a);
-        out.extend_from_slice(b" => ");
-        out.extend_from_slice(b);
-    }
-    out
-}
+pub(crate) use super::diff_pairs::pprint_rename;
 
 /// `--name-status` letter for a delta. `diff_resolve_rename_copy()` has already
 /// decided it whenever the diffcore rename pass ran; otherwise derive it here.
@@ -5455,59 +5631,7 @@ fn apply_line_prefix(out: Vec<u8>, prefix: &[u8]) -> Vec<u8> {
 // path quoting (quote.c)
 // ---------------------------------------------------------------------------
 
-/// The escape character for `b`, or `None` if it can be emitted verbatim.
-/// `Some(0)` means "octal-escape this byte".
-fn cq_escape(b: u8) -> Option<u8> {
-    match b {
-        0x07 => Some(b'a'),
-        0x08 => Some(b'b'),
-        0x09 => Some(b't'),
-        0x0a => Some(b'n'),
-        0x0b => Some(b'v'),
-        0x0c => Some(b'f'),
-        0x0d => Some(b'r'),
-        b'"' => Some(b'"'),
-        b'\\' => Some(b'\\'),
-        // Controls, DEL and (with the default `core.quotePath`) every high byte.
-        0x00..=0x1f | 0x7f..=0xff => Some(0),
-        _ => None,
-    }
-}
-
-fn needs_quote(s: &[u8]) -> bool {
-    s.iter().any(|b| cq_escape(*b).is_some())
-}
-
-/// The escaped body of `s`, without the surrounding double quotes.
-fn cq_body(s: &[u8], out: &mut Vec<u8>) {
-    for &b in s {
-        match cq_escape(b) {
-            None => out.push(b),
-            Some(0) => {
-                out.push(b'\\');
-                out.push(((b >> 6) & 0o3) + b'0');
-                out.push(((b >> 3) & 0o7) + b'0');
-                out.push((b & 0o7) + b'0');
-            }
-            Some(c) => {
-                out.push(b'\\');
-                out.push(c);
-            }
-        }
-    }
-}
-
-/// `write_name_quoted()`: the path, double-quoted and escaped only if needed.
-pub(super) fn quoted_name(path: &BString) -> Vec<u8> {
-    let s = path.as_slice();
-    if !needs_quote(s) {
-        return s.to_vec();
-    }
-    let mut out = vec![b'"'];
-    cq_body(s, &mut out);
-    out.push(b'"');
-    out
-}
+pub(super) use crate::quote::quoted_name;
 
 /// `name_a += (*name_a == '/')` (diff.c:1899-1900 in `builtin_diff()`, and again at
 /// diff.c:3899-3900 where the `diff --git` pair is built): exactly one leading
@@ -5524,17 +5648,7 @@ fn strip_one_leading_slash(path: &BString) -> &[u8] {
 
 /// `quote_two_c_style()` for a single prefixed name (the `---`/`+++` lines).
 fn quote_one(prefix: &[u8], path: &BString) -> Vec<u8> {
-    let s = strip_one_leading_slash(path);
-    if !needs_quote(prefix) && !needs_quote(s) {
-        let mut out = prefix.to_vec();
-        out.extend_from_slice(s);
-        return out;
-    }
-    let mut out = vec![b'"'];
-    cq_body(prefix, &mut out);
-    cq_body(s, &mut out);
-    out.push(b'"');
-    out
+    crate::quote::quote_two_c_style(prefix, strip_one_leading_slash(path))
 }
 
 /// The `diff --git <a> <b>` name pair.

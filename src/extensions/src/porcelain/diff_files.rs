@@ -108,7 +108,6 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::Path;
 use std::process::ExitCode;
-use std::sync::atomic;
 use std::sync::atomic::AtomicBool;
 
 use gix::bstr::{BString, ByteSlice};
@@ -121,6 +120,7 @@ use gix::prelude::ObjectIdExt;
 use regex::bytes::Regex;
 
 use super::diff_color;
+use super::diff_pickaxe;
 
 // ---------------------------------------------------------------------------
 // output formats — mirrors DIFF_FORMAT_* in diff.h
@@ -194,46 +194,7 @@ enum Anchor {
     Skip(BString),
 }
 
-/// A search pattern: a literal substring (git's kwset path for a plain `-S`) or a
-/// compiled regular expression (git's `-G`, `-I`, and `-S --pickaxe-regex`, all of
-/// which call `regcomp` with `REG_EXTENDED | REG_NEWLINE`).
-enum Needle {
-    Literal(Vec<u8>),
-    Regex(Regex),
-}
-
-impl Needle {
-    /// Whether `hay` contains a match — used by `-G` on each changed line and by `-I`.
-    fn is_match(&self, hay: &[u8]) -> bool {
-        match self {
-            Needle::Literal(n) => count_occurrences(hay, n) > 0,
-            Needle::Regex(re) => re.is_match(hay),
-        }
-    }
-
-    /// Non-overlapping match count — used by `-S` to compare the two sides.
-    fn count(&self, hay: &[u8]) -> usize {
-        match self {
-            Needle::Literal(n) => count_occurrences(hay, n),
-            Needle::Regex(re) => re.find_iter(hay).count(),
-        }
-    }
-}
-
-/// Compile a `-G`/`-I`/`-S --pickaxe-regex` pattern the way git's `regcomp` does: on
-/// bytes, without Unicode mode so `.` and the character classes carry git's C-locale
-/// byte semantics, and with multi-line mode standing in for `REG_NEWLINE` since matching
-/// is done a line at a time. `Err` carries the engine's message for the fatal.
-fn compile_regex(pat: &[u8]) -> std::result::Result<Regex, String> {
-    let s = std::str::from_utf8(pat).map_err(|_| "invalid byte sequence in pattern".to_owned())?;
-    regex::bytes::RegexBuilder::new(s)
-        .unicode(false)
-        .multi_line(true)
-        .build()
-        .map_err(|e| e.to_string())
-}
-
-fn matches_any(pats: &[Needle], line: &[u8]) -> bool {
+fn matches_any(pats: &[diff_pickaxe::Needle], line: &[u8]) -> bool {
     pats.iter().any(|p| p.is_match(line))
 }
 
@@ -245,40 +206,13 @@ fn strip_terminator(line: &[u8]) -> &[u8] {
     }
 }
 
-/// `pickaxe_match()`'s `DIFF_PICKAXE_KIND_OBJFIND` branch (`diffcore-pickaxe.c`):
-///
-/// ```c
-/// if (o->objfind) {
-///         return  (DIFF_FILE_VALID(p->one) &&
-///                  oidset_contains(o->objfind, &p->one->oid)) ||
-///                 (DIFF_FILE_VALID(p->two) &&
-///                  oidset_contains(o->objfind, &p->two->oid));
-/// }
-/// ```
-///
-/// It reads `p->one->oid` / `p->two->oid` as *recorded*, never hashing anything, so
-/// a worktree post-image git has not hashed carries the null id and cannot match —
-/// which is why `git diff --find-object=<hash of the working-tree file>` finds
-/// nothing while the same id on the index side does. `None` is `!DIFF_FILE_VALID`,
-/// the side that does not exist at all.
-///
-/// One expression, shared by all three diff verbs, because each of them keeps its
-/// own pair representation and only the two ids are common.
-pub(crate) fn objfind_hit(
-    ids: &[ObjectId],
-    one: Option<ObjectId>,
-    two: Option<ObjectId>,
-) -> bool {
-    one.is_some_and(|id| ids.contains(&id)) || two.is_some_and(|id| ids.contains(&id))
-}
-
 /// `-S<string>` counts occurrences; `-G<pattern>` looks at the changed lines;
 /// `--find-object=<id>` keeps a pair that touches one of the named object ids.
 enum PickaxeKind {
     /// `-S`: a literal count by default, a regex count under `--pickaxe-regex`.
-    Occurrences(Needle),
+    Occurrences(diff_pickaxe::Needle),
     /// `-G`: a regex over the added and removed lines.
-    Grep(Needle),
+    Grep(diff_pickaxe::Needle),
     /// `--find-object=<id>`: `pickaxe_match()`'s `DIFF_PICKAXE_KIND_OBJFIND` branch.
     ObjFind(Vec<ObjectId>),
 }
@@ -419,7 +353,7 @@ struct Opts {
     ctx: u32,
     ws: Whitespace,
     /// `-I<re>`: set with the whitespace family, this forces `diff_from_contents`.
-    ignore_lines: Vec<Needle>,
+    ignore_lines: Vec<diff_pickaxe::Needle>,
     /// The spelling of the first `-I`, for the bail when a patch is also asked for.
     ignore_flag: Option<String>,
     /// A flag that rewrites content output (word diff). Harmless for raw
@@ -978,6 +912,10 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed, Fatal> {
                 // reach the same callback. Re-glued rather than given a second arm so
                 // there is one implementation of each callback.
                 classify_valued(repo, &format!("{flag}={s}"), &mut opts)?;
+            } else if SHORT_GLUED_WHEN_SEPARATED.contains(&flag.as_str()) {
+                // The same re-gluing for a short option, whose value carries no `=`:
+                // `-S dd` and `-Sdd` are one and the same to parse-options.
+                classify_valued(repo, &format!("{flag}{s}"), &mut opts)?;
             } else {
                 let Opts { move_word, color_when, .. } = &mut opts;
                 if let Some(res) = move_word.parse_flag(&format!("{flag}={s}"), color_when) {
@@ -993,6 +931,7 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed, Fatal> {
         if s == "--ws-error-highlight"
             || diff_color::needs_separate_value(s)
             || GLUED_WHEN_SEPARATED.contains(&s)
+            || SHORT_GLUED_WHEN_SEPARATED.contains(&s)
         {
             pending_value = Some(s.to_string());
             continue;
@@ -1194,10 +1133,10 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed, Fatal> {
     // earlier argument has passed.
     if let Some((kind, raw)) = opts.pickaxe_pending.take() {
         let needle = if kind == b'S' && !opts.pickaxe_regex {
-            Needle::Literal(raw)
+            diff_pickaxe::Needle::Literal(raw)
         } else {
-            match compile_regex(&raw) {
-                Ok(re) => Needle::Regex(re),
+            match diff_pickaxe::compile_regex(&raw) {
+                Ok(re) => diff_pickaxe::Needle::Regex(re),
                 Err(msg) => return Err(Fatal::InvalidRegexPickaxe(msg)),
             }
         };
@@ -1317,6 +1256,15 @@ const ACCEPTED_NOOP_VALUED: &[&str] = &[
 /// colour/word-diff members of the same family live in
 /// [`diff_color::needs_separate_value`], which predates this list.
 const GLUED_WHEN_SEPARATED: &[&str] = &["--diff-algorithm", "--find-object"];
+
+/// The same for the short spellings, whose value is glued on without an `=`.
+///
+/// `OPT_PICKAXE_S` and `OPT_PICKAXE_G` (`diff.c:6270-6275`) are `OPT_CALLBACK_F`
+/// without `PARSE_OPT_OPTARG`, so a bare `-S`/`-G` takes the next argv entry as its
+/// pattern. Treating it instead as an *empty* pattern left the real pattern behind
+/// to be read as a pathspec or a revision, which is why `git diff-files -S dd` died
+/// with `fatal: ambiguous argument 'dd'` where stock filtered on `dd`.
+const SHORT_GLUED_WHEN_SEPARATED: &[&str] = &["-S", "-G"];
 
 /// Real git flags whose effect on the output we do not produce. `--find-object`,
 /// `-O` and `--output=` were formerly here and are now implemented.
@@ -1622,7 +1570,13 @@ fn classify_valued(repo: &gix::Repository, s: &str, opts: &mut Opts) -> Result<F
     }
     if let Some(v) = s.strip_prefix("-S") {
         // Finalized after the line is read, since `--pickaxe-regex` may still follow.
+        // The kind bit is set before the empty-argument refusal, exactly as the
+        // callback does, so `-S '' -Gx` reports the empty argument and not the
+        // two-kind conflict.
         opts.pickaxe_kinds |= PICKAXE_KIND_S;
+        if v.is_empty() {
+            return Err(Fatal::OptionError(super::diff_optval::pickaxe_empty(b'S')));
+        }
         opts.pickaxe_pending = Some((b'S', v.as_bytes().to_vec()));
         return Ok(Flag::Handled);
     }
@@ -1630,6 +1584,9 @@ fn classify_valued(repo: &gix::Repository, s: &str, opts: &mut Opts) -> Result<F
         // `-G` is always a regex; it is compiled in the finalize pass so a bad pattern
         // is reported after every earlier argument, as git's `diffcore_pickaxe` does.
         opts.pickaxe_kinds |= PICKAXE_KIND_G;
+        if v.is_empty() {
+            return Err(Fatal::OptionError(super::diff_optval::pickaxe_empty(b'G')));
+        }
         opts.pickaxe_pending = Some((b'G', v.as_bytes().to_vec()));
         return Ok(Flag::Handled);
     }
@@ -1718,9 +1675,9 @@ fn classify_valued(repo: &gix::Repository, s: &str, opts: &mut Opts) -> Result<F
 fn record_ignore_lines(flag: &str, value: &str, opts: &mut Opts) -> Result<Flag, Fatal> {
     // `diff_opt_ignore_regex` compiles inline, so a bad pattern is git's
     // `error: invalid regex given to -I: '<pat>'` (exit 129) at this argv position.
-    match compile_regex(value.as_bytes()) {
+    match diff_pickaxe::compile_regex(value.as_bytes()) {
         Ok(re) => {
-            opts.ignore_lines.push(Needle::Regex(re));
+            opts.ignore_lines.push(diff_pickaxe::Needle::Regex(re));
             if opts.ignore_flag.is_none() {
                 opts.ignore_flag = Some(flag.to_owned());
             }
@@ -1809,24 +1766,6 @@ fn validate_magnitude(v: &str, opt: &'static str) -> Result<u64, Fatal> {
         Err(IntError::NotANumber(_)) => Err(Fatal::BadMagnitude(opt)),
         Err(IntError::OutOfRange(m)) => Err(Fatal::OptionError(format!("error: {m}"))),
     }
-}
-
-/// How many times `needle` occurs in `hay`, without overlaps.
-fn count_occurrences_of(hay: &[u8], needle: &[u8]) -> usize {
-    if needle.is_empty() || hay.len() < needle.len() {
-        return 0;
-    }
-    let mut n = 0usize;
-    let mut i = 0usize;
-    while i + needle.len() <= hay.len() {
-        if &hay[i..i + needle.len()] == needle {
-            n += 1;
-            i += needle.len();
-        } else {
-            i += 1;
-        }
-    }
-    n
 }
 
 /// `diff_opt_ws_error_highlight()`: parse the comma list, turning git's negative
@@ -2097,7 +2036,7 @@ fn run(repo: &gix::Repository, opts: Opts, paths: Vec<BString>) -> Result<ExitCo
         // Every `diff --cc` section ahead of the first ordinary pair consumes a slot,
         // so the per-file states line up with the headers the re-emitter counts.
         let combined_sections =
-            count_occurrences_of(&combined_patch, b"\ndiff --cc ") + usize::from(combined_patch.starts_with(b"diff --cc "));
+            diff_pickaxe::count_occurrences(&combined_patch, b"\ndiff --cc ") + usize::from(combined_patch.starts_with(b"diff --cc "));
         let mut files: Vec<diff_color::FilePaint> =
             vec![diff_color::FilePaint::new(ws_rule); combined_sections];
         // `fill_metainfo()`'s abbreviation length (diff.c:4915):
@@ -2305,7 +2244,7 @@ fn pickaxe_hit(px: &Pickaxe, d: &Delta, an: &Analysis) -> bool {
     // id is left null at this stage (git never hashes it for objfind), so in practice
     // only the staged side can match.
     if let PickaxeKind::ObjFind(ids) = &px.kind {
-        return objfind_hit(
+        return diff_pickaxe::objfind_hit(
             ids,
             d.old_valid().then_some(d.src_id),
             d.new_valid().then_some(d.dst_id),
@@ -2316,7 +2255,7 @@ fn pickaxe_hit(px: &Pickaxe, d: &Delta, an: &Analysis) -> bool {
     }
     match &px.kind {
         PickaxeKind::Occurrences(needle) => {
-            if let Needle::Literal(n) = needle {
+            if let diff_pickaxe::Needle::Literal(n) = needle {
                 if n.is_empty() {
                     return false;
                 }
@@ -2347,23 +2286,6 @@ fn pickaxe_hit(px: &Pickaxe, d: &Delta, an: &Analysis) -> bool {
         }
         PickaxeKind::ObjFind(_) => unreachable!("objfind handled above"),
     }
-}
-
-fn count_occurrences(hay: &[u8], needle: &[u8]) -> usize {
-    if needle.is_empty() || hay.len() < needle.len() {
-        return 0;
-    }
-    let mut n = 0;
-    let mut i = 0;
-    while i + needle.len() <= hay.len() {
-        if &hay[i..i + needle.len()] == needle {
-            n += 1;
-            i += needle.len();
-        } else {
-            i += 1;
-        }
-    }
-    n
 }
 
 /// `prepare_order()`: read the order file into a list of glob patterns. Blank lines
@@ -4933,106 +4855,19 @@ fn combined_raw_hex(repo: &gix::Repository, id: &ObjectId, opts: &Opts) -> Strin
 // ---------------------------------------------------------------------------
 // path quoting (quote.c)
 // ---------------------------------------------------------------------------
+//
+// The table, the `quote_path_fully` global and `quote_c_style()` itself live in
+// `crate::quote`, which every verb in the tree shares. These re-exports keep the
+// `diff_files::…` spelling the raw/name emitters in `diff_pairs`, `diff_tree`,
+// `log` and `show` already use.
 
-/// git's `quote_path_fully` global, seeded from `core.quotePath` (default true) by
-/// [`init_quote_path`]. git keeps this in one place and every `quote_c_style()` caller
-/// reads it, so the four raw/name emitters that share this module's quoting share the
-/// setting too.
-static QUOTE_PATH_FULLY: AtomicBool = AtomicBool::new(true);
-
-/// Seed [`QUOTE_PATH_FULLY`] from `core.quotePath`, git's `git_default_core_config()`.
-/// Call once, right after the repository is open and before anything is rendered.
-pub(crate) fn init_quote_path(repo: &gix::Repository) {
-    let on = repo
-        .config_snapshot()
-        .boolean("core.quotePath")
-        .unwrap_or(true);
-    QUOTE_PATH_FULLY.store(on, atomic::Ordering::Relaxed);
-}
-
-/// The escape character for `b`, or `None` if it can be emitted verbatim.
-/// `Some(0)` means "octal-escape this byte".
-///
-/// This is git's `cq_lookup[]` table combined with `cq_must_quote()`: entries the table
-/// marks `-1` are never quoted, the named escapes and `"`/`\` are always quoted (their
-/// table entries are `>= ' '`, so `quote_path_fully` cannot switch them off), controls
-/// and DEL are always octal-escaped, and the high half (table entry `0`) is octal-escaped
-/// only while `quote_path_fully` is on.
-fn cq_escape(b: u8) -> Option<u8> {
-    match b {
-        0x07 => Some(b'a'),
-        0x08 => Some(b'b'),
-        0x09 => Some(b't'),
-        0x0a => Some(b'n'),
-        0x0b => Some(b'v'),
-        0x0c => Some(b'f'),
-        0x0d => Some(b'r'),
-        b'"' => Some(b'"'),
-        b'\\' => Some(b'\\'),
-        // Table entry 1: quoted whatever `core.quotePath` says.
-        0x00..=0x1f | 0x7f => Some(0),
-        // Table entry 0: quoted only while `quote_path_fully` is on.
-        0x80..=0xff => QUOTE_PATH_FULLY
-            .load(atomic::Ordering::Relaxed)
-            .then_some(0),
-        _ => None,
-    }
-}
-
-/// `quote_c_style(s, NULL, NULL, 0)` used as a predicate: whether quoting would
-/// change the string at all.
-pub(crate) fn needs_c_quote(s: &[u8]) -> bool {
-    s.iter().any(|b| cq_escape(*b).is_some())
-}
-
-/// The escaped body of `s`, without the surrounding double quotes.
-fn cq_body(s: &[u8], out: &mut Vec<u8>) {
-    for &b in s {
-        match cq_escape(b) {
-            None => out.push(b),
-            Some(0) => {
-                out.push(b'\\');
-                out.push(((b >> 6) & 0o3) + b'0');
-                out.push(((b >> 3) & 0o7) + b'0');
-                out.push((b & 0o7) + b'0');
-            }
-            Some(c) => {
-                out.push(b'\\');
-                out.push(c);
-            }
-        }
-    }
-}
-
-/// `write_name_quoted()`: the path, double-quoted and escaped only if needed.
-pub(crate) fn quoted_name(path: &BString) -> Vec<u8> {
-    quoted_name_bytes(path.as_slice())
-}
-
-/// [`quoted_name`] over a plain byte slice, for the callers that never hold a `BString`.
-pub(crate) fn quoted_name_bytes(s: &[u8]) -> Vec<u8> {
-    if !needs_c_quote(s) {
-        return s.to_vec();
-    }
-    let mut out = vec![b'"'];
-    cq_body(s, &mut out);
-    out.push(b'"');
-    out
-}
+pub(crate) use crate::quote::{
+    init as init_quote_path, needs_c_quote, quoted_name, quoted_name_bytes,
+};
 
 /// `quote_two_c_style()` for a single prefixed name (the `---`/`+++` lines).
 pub(crate) fn quote_one(prefix: &str, path: &BString) -> Vec<u8> {
-    let s = path.as_slice();
-    if !needs_c_quote(prefix.as_bytes()) && !needs_c_quote(s) {
-        let mut out = prefix.as_bytes().to_vec();
-        out.extend_from_slice(s);
-        return out;
-    }
-    let mut out = vec![b'"'];
-    cq_body(prefix.as_bytes(), &mut out);
-    cq_body(s, &mut out);
-    out.push(b'"');
-    out
+    crate::quote::quote_two_c_style(prefix.as_bytes(), path.as_slice())
 }
 
 /// The `diff --git <a> <b>` name pair.

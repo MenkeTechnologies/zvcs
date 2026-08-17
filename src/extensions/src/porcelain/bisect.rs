@@ -1735,33 +1735,12 @@ fn is_binary(data: &[u8]) -> bool {
     data.iter().take(8000).any(|&b| b == 0)
 }
 
-/// C-style path quoting matching git's default `core.quotePath=true`.
+/// `quote_c_style()`: the name verbatim unless some byte needs escaping, in which
+/// case the whole name double-quoted with C escapes. The table and the
+/// `core.quotePath` flag it reads live in [`crate::quote`], shared with every
+/// other verb that prints a path.
 fn quote_path(path: impl AsRef<[u8]>) -> String {
-    let bytes = path.as_ref();
-    let needs = bytes
-        .iter()
-        .any(|&b| b < 0x20 || b == 0x7f || b == b'"' || b == b'\\' || b >= 0x80);
-    if !needs {
-        return String::from_utf8_lossy(bytes).into_owned();
-    }
-    let mut out = String::from("\"");
-    for &b in bytes {
-        match b {
-            b'"' => out.push_str("\\\""),
-            b'\\' => out.push_str("\\\\"),
-            0x07 => out.push_str("\\a"),
-            0x08 => out.push_str("\\b"),
-            0x09 => out.push_str("\\t"),
-            0x0a => out.push_str("\\n"),
-            0x0b => out.push_str("\\v"),
-            0x0c => out.push_str("\\f"),
-            0x0d => out.push_str("\\r"),
-            b if b < 0x20 || b == 0x7f || b >= 0x80 => out.push_str(&format!("\\{b:03o}")),
-            b => out.push(b as char),
-        }
-    }
-    out.push('"');
-    out
+    crate::quote::quoted_name_string(path.as_ref())
 }
 
 /// Render the `--stat` block plus the `--summary` lines, reproducing git's

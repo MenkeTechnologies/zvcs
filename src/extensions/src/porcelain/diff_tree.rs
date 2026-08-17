@@ -360,7 +360,25 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
         // command never produces, so the accepted value has no effect here — but
         // parse-options still validates it, and it still has to be consumed so it is
         // not left behind to be misread as a revision.
-        if a == "--ws-error-highlight" || super::diff_color::needs_separate_value(a) {
+        //
+        // `--diff-algorithm <value>` is the same shape — an `OPT_CALLBACK_F` with a
+        // required argument (diff.c:6289) — and unlike the three above it *does*
+        // change what is rendered. Left unconsumed, its value was read as the next
+        // positional and every separated spelling died with `fatal: ambiguous
+        // argument 'myers'` where stock rendered the patch. It is folded into the
+        // `=` spelling on the way into `diff_args` because parse-options makes the
+        // two forms reach `parse_algorithm_value()` identically, and because
+        // everything downstream — [`needs_pairs`] included — keys off that one
+        // spelling.
+        // `-S <string>`, `-G <regex>` and `-I <regex>` are the same shape again, as
+        // short options: `OPT_PICKAXE_S`/`OPT_PICKAXE_G` (diff.c:6270-6275) and
+        // `OPT_CALLBACK_F('I', …)` all take a required argument, so a bare one takes
+        // the next argv entry. Their value re-glues without an `=`.
+        if a == "--ws-error-highlight"
+            || a == "--diff-algorithm"
+            || SHORT_GLUED_WHEN_SEPARATED.contains(&a)
+            || super::diff_color::needs_separate_value(a)
+        {
             let Some(v) = args.get(i + 1).map(String::as_str) else {
                 eprintln!("error: {}", super::diff_color::missing_value(a));
                 return Ok(ExitCode::from(USAGE_ERROR));
@@ -368,8 +386,14 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
             if let Some(code) = validate_render_value(a, v) {
                 return Ok(code);
             }
-            diff_args.push(a.to_string());
-            diff_args.push(v.to_string());
+            if a == "--diff-algorithm" {
+                diff_args.push(format!("{a}={v}"));
+            } else if SHORT_GLUED_WHEN_SEPARATED.contains(&a) {
+                diff_args.push(format!("{a}{v}"));
+            } else {
+                diff_args.push(a.to_string());
+                diff_args.push(v.to_string());
+            }
             i += 2;
             continue;
         }
@@ -620,6 +644,18 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
     // argv still wins, which is why this waits until the scan is over.
     if super::diff_optval::pickaxe_conflict(args) {
         eprintln!("{}", super::diff_optval::PICKAXE_CONFLICT);
+        return Ok(ExitCode::from(FATAL));
+    }
+    // `diff_setup_done()`'s second pickaxe `die()`, immediately after the first:
+    // `--pickaxe-all` has no meaning for the objfind kind, so the combination is
+    // refused rather than given one.
+    if args.iter().take_while(|a| *a != "--").any(|a| a == "--pickaxe-all")
+        && args
+            .iter()
+            .take_while(|a| *a != "--")
+            .any(|a| a == "--find-object" || a.starts_with("--find-object="))
+    {
+        eprintln!("{}", super::diff_optval::PICKAXE_ALL_OBJFIND_CONFLICT);
         return Ok(ExitCode::from(FATAL));
     }
 
@@ -1130,6 +1166,10 @@ fn valid_pretty_format(v: &str) -> bool {
 /// only compiles the pattern once a word diff actually runs.
 ///
 /// `Some(code)` means the message was written and the command must exit with it.
+/// Short options whose value is the next argv entry when nothing is glued on, and
+/// which re-glue without an `=` (`-Sdd`, not `-S=dd`).
+const SHORT_GLUED_WHEN_SEPARATED: &[&str] = &["-S", "-G", "-I"];
+
 fn validate_render_value(flag: &str, value: &str) -> Option<ExitCode> {
     match flag {
         "--ws-error-highlight" => match super::diff_color::parse_ws_error_highlight(value) {
@@ -1152,6 +1192,22 @@ fn validate_render_value(flag: &str, value: &str) -> Option<ExitCode> {
                 }
                 _ => None,
             }
+        }
+        // `diff_opt_diff_algorithm()`'s `error()`, which the `=` spelling already
+        // reaches through [`super::diff_optval::reject`] — the separated form
+        // bypasses that scan, so it is checked here instead.
+        "--diff-algorithm" => match super::diff_optval::parse_algorithm_value(value) {
+            Some(_) => None,
+            None => {
+                eprintln!("{}", super::diff_optval::DIFF_ALGORITHM_ERR);
+                Some(ExitCode::from(USAGE_ERROR))
+            }
+        },
+        // `diff_opt_pickaxe_string()` / `diff_opt_pickaxe_regex()`'s refusal of an
+        // empty pattern, from the same callback the glued spelling reaches.
+        "-S" | "-G" if value.is_empty() => {
+            eprintln!("{}", super::diff_optval::pickaxe_empty(flag.as_bytes()[1]));
+            Some(ExitCode::from(USAGE_ERROR))
         }
         _ => None,
     }

@@ -89,9 +89,7 @@ const STAT_TERM_WIDTH: usize = 80;
 /// colorized (equivalent to `git --no-color show` / a non-tty pipe).
 ///
 /// Deviations, surfaced rather than faked:
-///   * Non-ASCII/special paths are C-quoted the way `write_name_quoted()` quotes them,
-///     but `core.quotePath` itself is not consulted, and `--stat` measures a path in
-///     `char`s rather than display columns.
+///   * `--stat` measures a path in `char`s rather than display columns.
 ///   * `--stat` assumes an 80-column terminal (`COLUMNS` is not consulted), but the
 ///     `--stat-width`/`--stat=<w>`, `--stat-name-width`, `--stat-graph-width`, and
 ///     `--stat-count` flags and the `diff.statNameWidth`/`diff.statGraphWidth` config

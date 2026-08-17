@@ -592,8 +592,16 @@ pub fn fast_export(args: &[String]) -> Result<ExitCode> {
             _ if s.starts_with('-') && s != "-" => leftover = true,
 
             _ => {
-                if add_rev_token(&repo, s, negate, &mut sel).is_ok() {
-                    continue;
+                match add_rev_token(&repo, s, negate, &mut sel) {
+                    Ok(()) => continue,
+                    // A `die()` raised from inside `handle_revision_arg_1()`
+                    // rather than a `-1` returned from it: the operand never
+                    // reaches the pathspec sweep below.
+                    Err(Some(message)) => {
+                        eprint!("{message}");
+                        return Ok(ExitCode::from(128));
+                    }
+                    Err(None) => {}
                 }
                 // `handle_revision_arg` failed — but two shapes never *return* a
                 // failure at all, they die inside it: a range whose endpoints
@@ -1251,25 +1259,88 @@ struct Pending {
 /// when `--not` is on: `^X` becomes positive, `A..B` hides B and shows A, and
 /// `A...B` shows its merge bases and hides both endpoints.
 ///
-/// `Err(())` means the whole argument is neither a revision nor a path, which the
-/// caller turns into git's `ambiguous argument` fatal.
+/// `Err(None)` is `handle_revision_arg()`'s non-zero return: the argument is
+/// neither a revision nor a path, which the caller turns into git's
+/// `ambiguous argument` fatal. `Err(Some(message))` is a `die()` raised *inside*
+/// `handle_revision_arg_1()` — `add_parents_only()`'s `get_reference()` is one —
+/// which never falls back to a pathspec and is reported verbatim.
 fn add_rev_token(
     repo: &gix::Repository,
     tok: &str,
     negated: bool,
     sel: &mut Selection,
-) -> std::result::Result<(), ()> {
+) -> std::result::Result<(), Option<String>> {
     if tok.is_empty() {
-        return Err(());
+        return Err(None);
     }
+    // `handle_revision_arg_1()` keeps the operand it was called with in `arg_`
+    // and only ever moves `arg`. `add_rev_cmdline(revs, object, arg_, …)` at the
+    // end of the function therefore records the operand **as typed**, mark and
+    // all, while `add_pending_object_with_path(revs, object, arg, …)` records
+    // the truncated one — which is why `git fast-export main^!` prints
+    // `commit main` and not `commit refs/heads/main`: `main^!` does not dwim to
+    // a ref, so the pending name is what labels the commit.
+    let cmdline = tok;
+    // `handle_revision_arg_1()`'s three-mark block. It belongs between the range
+    // rule and the single-name rule, but a marked operand is never also a range
+    // — `<a>..<b>^!`'s right endpoint does not resolve, so `handle_dotdot()` has
+    // already declined it — so testing it first is the same pass. The C is
+    // quoted on [`crate::objname::parents_only`]; what it decides here is which
+    // name is resolved at all, because `get_oid_1()` has no case for `^@`, `^!`
+    // or `^-<n>`.
+    let tok: &str = match crate::objname::parents_only(tok) {
+        crate::objname::ParentsOnly::Absent => tok,
+        // `if (strtol_i(…) || exclude_parent < 1) { ret = -1; goto out; }`:
+        // `add_parents_only()` is never reached and `handle_revision_arg()`
+        // returns non-zero, which is this function's `Err(None)`.
+        crate::objname::ParentsOnly::BadParent => return Err(None),
+        crate::objname::ParentsOnly::Mark { base, nth, replaces } => {
+            // `^@` keeps `flags`; `^!` and `^-<n>` use `flags ^ (UNINTERESTING |
+            // BOTTOM)`, so `--not` flips all three.
+            let sense = if replaces { negated } else { !negated };
+            // `add_rev_cmdline(revs, it, arg_, …)` records the base *with* its
+            // `^`, while `add_pending_object(revs, it, arg)` names it without.
+            //
+            // The dwim is built by hand rather than through [`pending`] because
+            // of what `get_tags_and_duplicates()` branches on: `e->item->type`,
+            // the object the *cmdline entry* holds. For every other operand that
+            // object is whatever the name resolved to, so the ref's own target
+            // stands in for it; here the entry holds the parent while the ref
+            // still points at the base. Reading the ref's target instead turns
+            // `fast-export v1^@` into `tag … tags unexported object`, where
+            // stock 2.55.0 simply labels the parents `refs/tags/v1`.
+            let mut queue = |name: &str, parent, uninteresting| {
+                sel.args.push(CmdArg::Rev(Pending {
+                    dwim: dwim_ref(repo, base).map(|(full, _)| (full, parent)),
+                    pending_name: BString::from(name),
+                    commit: parent,
+                    negated: uninteresting,
+                }));
+            };
+            match crate::objname::add_parents_only(repo, base, sense, nth, &mut queue) {
+                // `get_reference()`'s `die(_("bad object %s"), name)`, naming
+                // the base rather than the operand — the mark and any leading
+                // `^` are already off by the time `get_reference()` sees it.
+                crate::objname::Parents::BadObject => {
+                    let name = crate::objname::uninteresting_mark(base).0;
+                    return Err(Some(format!("fatal: bad object {name}\n")));
+                }
+                crate::objname::Parents::None => tok,
+                // `^@` returns from `handle_revision_arg_1()` on success, so the
+                // named commit itself is never pended.
+                crate::objname::Parents::Queued if replaces => return Ok(()),
+                crate::objname::Parents::Queued => base,
+            }
+        }
+    };
     if let Some(rest) = tok.strip_prefix('^') {
         // revision.c:2210-2213 sets `local_flags = UNINTERESTING | BOTTOM` for a
         // leading `^`, and 2229/2234 file the object under `flags ^ local_flags`.
         // Under `--not` the two cancel and `^X` is *positive*: this is the XOR,
         // not an OR, and it is what `fast-export --not ^main base` relies on.
-        let id = commit_of(repo, rest).ok_or(())?;
+        let id = commit_of(repo, rest).ok_or(None)?;
         sel.args
-            .push(CmdArg::Rev(pending(repo, tok, rest, id, !negated)));
+            .push(CmdArg::Rev(pending(repo, cmdline, rest, id, !negated)));
         return Ok(());
     }
     if let Some((l, r)) = tok.split_once("...") {
@@ -1280,13 +1351,13 @@ fn add_rev_token(
         // resolutions below, which stop at the first absent object and would
         // leave the right endpoint unwarned.
         let _quiet = warn_range_once(repo, tok);
-        let (lc, rc) = (commit_of(repo, l).ok_or(())?, commit_of(repo, r).ok_or(())?);
+        let (lc, rc) = (commit_of(repo, l).ok_or(None)?, commit_of(repo, r).ok_or(None)?);
         // `handle_dotdot_1` (revision.c:2087-2107): the merge bases go in under
         // `flags_exclude` (`flags ^ (UNINTERESTING | BOTTOM)`) and both endpoints
         // under `flags`, in that order — so plain `A...B` is
         // `A B --not $(git merge-base --all A B)` and `--not A...B` is its
         // mirror image.
-        for base in repo.merge_bases_many(lc, &[rc]).map_err(|_| ())? {
+        for base in repo.merge_bases_many(lc, &[rc]).map_err(|_| None)? {
             let id = base.detach();
             // `add_rev_cmdline_list` names a merge base by its own hex id.
             let hex = id.to_hex().to_string();
@@ -1303,17 +1374,17 @@ fn add_rev_token(
         // `b_flags = flags; a_flags = flags_exclude` (revision.c:2083-2086).
         let (l, r) = (default_head(l), default_head(r));
         let _quiet = warn_range_once(repo, tok);
-        let lc = commit_of(repo, l).ok_or(())?;
-        let rc = commit_of(repo, r).ok_or(())?;
+        let lc = commit_of(repo, l).ok_or(None)?;
+        let rc = commit_of(repo, r).ok_or(None)?;
         sel.args
             .push(CmdArg::Rev(pending(repo, l, l, lc, !negated)));
         sel.args
             .push(CmdArg::Rev(pending(repo, r, r, rc, negated)));
         return Ok(());
     }
-    let id = commit_of(repo, tok).ok_or(())?;
+    let id = commit_of(repo, tok).ok_or(None)?;
     sel.args
-        .push(CmdArg::Rev(pending(repo, tok, tok, id, negated)));
+        .push(CmdArg::Rev(pending(repo, cmdline, tok, id, negated)));
     Ok(())
 }
 
@@ -2737,29 +2808,8 @@ fn render_change(c: &Change, opts: &Opts, st: &mut State) -> Result<()> {
 /// git's `print_path`: C-style quoting when a byte needs escaping, plain double
 /// quotes when the only special character is a space, bare otherwise.
 fn print_path(out: &mut Vec<u8>, path: &BStr) {
-    let needs_quote = path
-        .iter()
-        .any(|b| *b < 0x20 || *b >= 0x7f || *b == b'"' || *b == b'\\');
-    if needs_quote {
-        out.push(b'"');
-        for b in path.iter().copied() {
-            match b {
-                0x07 => out.extend_from_slice(b"\\a"),
-                0x08 => out.extend_from_slice(b"\\b"),
-                b'\t' => out.extend_from_slice(b"\\t"),
-                b'\n' => out.extend_from_slice(b"\\n"),
-                0x0b => out.extend_from_slice(b"\\v"),
-                0x0c => out.extend_from_slice(b"\\f"),
-                b'\r' => out.extend_from_slice(b"\\r"),
-                b'"' => out.extend_from_slice(b"\\\""),
-                b'\\' => out.extend_from_slice(b"\\\\"),
-                b if !(0x20..0x7f).contains(&b) => {
-                    out.extend_from_slice(format!("\\{b:03o}").as_bytes());
-                }
-                b => out.push(b),
-            }
-        }
-        out.push(b'"');
+    if crate::quote::needs_c_quote(path) {
+        out.extend_from_slice(&crate::quote::quoted_name_bytes(path));
     } else if path.contains(&b' ') {
         out.push(b'"');
         out.extend_from_slice(path);

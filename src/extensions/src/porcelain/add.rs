@@ -56,7 +56,7 @@
 //! ```
 
 use anyhow::{bail, Result};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::process::ExitCode;
 
 use gix::bstr::{BStr, BString, ByteSlice};
@@ -457,16 +457,30 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
         gix::index::File::from_state(gix::index::State::new(repo.object_hash()), repo.index_path())
     };
 
-    // Repo-relative paths of the current stage-0 entries (tracked set).
-    let existing: HashSet<BString> = {
+    // Repo-relative paths of the current stage-0 entries (tracked set), each with
+    // the recorded stat and the object it names. The stat is what
+    // `run_diff_files()` compares to decide which tracked paths are handed to
+    // `add_file_to_index()` at all; the id and mode are `add_to_index()`'s
+    // `was_same` test.
+    let tracked: HashMap<BString, (Stat, gix::hash::ObjectId, Mode)> = {
         let backing = index.path_backing();
         index
             .entries()
             .iter()
             .filter(|e| e.stage() == Stage::Unconflicted)
-            .map(|e| e.path_in(backing).to_owned())
+            .map(|e| (e.path_in(backing).to_owned(), (e.stat, e.id, e.mode)))
             .collect()
     };
+    let existing: HashSet<BString> = tracked.keys().cloned().collect();
+    // The stage-0 paths `is_racy_stat()` calls racily clean. `run_diff_files()` is
+    // asked with `CE_MATCH_RACY_IS_DIRTY` and so is `add_to_index()`
+    // (read-cache.c:717), so each of them is indexed — and hashed with
+    // `INDEX_WRITE_OBJECT` — regardless of what its content says. That is what
+    // makes `git add -N -v .` report every tracked path in a freshly built
+    // worktree. See [`super::stage::racy_paths`].
+    let racily_clean: HashSet<BString> = super::stage::racy_paths(&index, &repo);
+    // `ce_match_stat_basic()`'s configurable field selection; see [`super::stage::stat_match`].
+    let stat_match = super::stage::stat_match(&repo);
 
     // A bare `.` / `./` at the repository root is git's "everything under the
     // current directory", i.e. the whole worktree. gitoxide's dirwalk mishandles
@@ -482,6 +496,14 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
         .flatten()
         .is_none_or(|p| p.as_os_str().is_empty());
     let checked = resolve_pathspecs(&repo, &mut pathspecs)?;
+    // `fill_directory()` (builtin/add.c:510) runs before the pathspec check can die,
+    // so its `could not open directory` warning is the first thing on stderr. Only
+    // the modes that look for untracked files reach it (`add_new_files`,
+    // builtin/add.c:451).
+    if !tracked_only {
+        let (typed, resolved): (Vec<String>, Vec<String>) = checked.iter().cloned().unzip();
+        warn_unopenable_walk_prefix(&repo, &typed, &resolved);
+    }
     if at_root {
         for spec in pathspecs.iter_mut() {
             if spec == "." || spec == "./" {
@@ -515,12 +537,26 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
         was_tracked: bool,
     }
     let mut staged: Vec<Staged> = Vec::new();
+    // Whether any path reached `add_to_index()` at all, which is what decides the
+    // `-N` empty-blob side effect: `set_object_name_for_intent_to_add_entry()` is
+    // called from inside it, so a run that indexes nothing writes nothing.
+    let mut indexed_any = false;
     // The content filters git runs on the way into the object database:
     // `.gitattributes` `clean` drivers, `working-tree-encoding`, `ident`, and the
     // EOL normalization `text`/`core.autocrlf` ask for. `git add` hashes the
     // *converted* bytes, so staging the verbatim worktree copy writes a different
     // blob than git does in any repository that normalizes line endings.
+    //
+    // This walk stands in for git's single `index_path()` call, so it is also the
+    // pass that owns the `core.autocrlf` round-trip warning and the `core.safecrlf`
+    // refusal. `write_content` is exactly git's `pretend ? 0 : INDEX_WRITE_OBJECT`
+    // (read-cache.c:723) plus the `intent_only` and `RENORMALIZE` arms that never
+    // reach the check.
     let mut filters = super::convert_to_git::WorktreeFilter::new(&repo, write_content, renormalize)?;
+    // The pipeline the deferred blob-write pass re-converts with. git converts once;
+    // the check therefore stays with the scan above and is off here, or every warned
+    // path would be warned about twice.
+    let mut write_filters = super::convert_to_git::WorktreeFilter::new(&repo, false, renormalize)?;
     // `path_in_sparse_checkout()`: without `--sparse`, a path the sparse-checkout
     // definition leaves out of the worktree is skipped and reported instead of
     // staged. Loaded only when there is a definition to consult.
@@ -574,22 +610,11 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
     // per repository, the advice at most once per invocation.
     let mut embedded_advised = false;
 
-    // git stages in two passes: `update_files_in_cache()` walks the *index* (so the
-    // tracked matches come first, in path order), then `add_files()` walks the sorted
-    // `dir->entries` for the new ones. Everything the staging emits — the `-v`/`-n`
-    // report, the `core.safecrlf` warnings, the read errors — comes out in that order,
-    // so the walk results are put in it before any file is touched.
     let mut walked: Vec<gix::dir::Entry> = Vec::new();
     for item in iter.by_ref() {
         walked.push(item?.entry);
     }
-    walked.sort_by(|a, b| {
-        let (a_new, b_new) = (
-            !existing.contains(&a.rela_path),
-            !existing.contains(&b.rela_path),
-        );
-        a_new.cmp(&b_new).then_with(|| a.rela_path.cmp(&b.rela_path))
-    });
+    walked.sort_by_key(|e| staging_order(existing.contains(&e.rela_path), &e.rela_path));
 
     for entry in walked {
         let path = entry.rela_path;
@@ -662,14 +687,54 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
             }
             continue;
         }
-        // `-N/--intent-to-add` never rewrites the content of already-tracked
-        // paths; those are kept in the matched set for reporting but filtered
-        // out at write time (only brand-new files get an intent-to-add entry).
-
         let Some(abs) = repo.workdir_path(&path) else {
             continue;
         };
         let md = gix::index::fs::Metadata::from_path_no_follow(&abs)?;
+        let stat_now = Stat::from_fs(&md)?;
+
+        // `run_diff_files(&rev, DIFF_RACY_IS_MODIFIED)` (builtin/add.c:590) picks the
+        // tracked paths `add_file_to_index()` ever sees, and it picks them on the
+        // **stat cache**, never on content: `ie_match_stat()` with
+        // `CE_MATCH_RACY_IS_DIRTY` calls a path modified when the recorded stat
+        // differs from the worktree's, and calls a racily-clean one modified whatever
+        // its bytes say. A tracked path it skips is never hashed — so it is not
+        // reported and cannot raise the round-trip warning. Without this gate every
+        // matched tracked path was converted, which warned about a lossy CRLF file
+        // git leaves alone once the racy window has passed.
+        //
+        // `--renormalize` replaces that walk with `renormalize_tracked_files()`'s
+        // index scan (builtin/add.c:587-592), which carries no such filter.
+        if already_tracked
+            && !renormalize
+            && !racily_clean.contains(&path)
+            && tracked
+                .get(&path)
+                .is_some_and(|(recorded, _, _)| recorded.matches(&stat_now, stat_match))
+        {
+            continue;
+        }
+
+        // `-N/--intent-to-add` takes `add_to_index()`'s `intent_only` arm, which
+        // skips `index_path()` entirely: nothing is read, nothing is converted and
+        // nothing is hashed. The entry it builds carries the empty blob at the mode
+        // the worktree stat gives, and `ADD_CACHE_NEW_ONLY` keeps it from replacing
+        // an entry that already exists — so a tracked path is reported (unless
+        // `was_same`) and otherwise left exactly as it was.
+        if intent_to_add {
+            // `set_object_name_for_intent_to_add_entry()` (read-cache.c:704-710) runs
+            // for every path that reaches `add_to_index()`, before
+            // `ADD_CACHE_PRETEND` is consulted — so even `-n` leaves the empty blob.
+            indexed_any = true;
+            staged.push(Staged {
+                path,
+                id: repo.object_hash().empty_blob(),
+                mode: super::stage::mode_from_metadata(&md),
+                stat: stat_now,
+                was_tracked: already_tracked,
+            });
+            continue;
+        }
 
         let (bytes, mode) = if md.is_symlink() {
             let target = match std::fs::read_link(&abs) {
@@ -724,16 +789,17 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
         // walk both missed those and reported every matched path as changed under
         // `-n`/`-v`, because the flipped mode always differs from the recorded one.
 
-        // Only a real add hashes content into the odb. Other modes still need the
-        // blob id (for change detection in the report) but must not create objects,
-        // so they compute the hash without writing it.
-        let id = if write_content {
-            repo.write_blob(&bytes)?.detach()
-        } else {
-            gix::objs::compute_hash(repo.object_hash(), gix::objs::Kind::Blob, &bytes)?
-        };
-        let stat = Stat::from_fs(&md)?;
-        staged.push(Staged { path, id, mode, stat, was_tracked: already_tracked });
+        // The walk only computes ids; nothing reaches the object database here. git
+        // brackets all of its staging in `odb_transaction_begin()`/`_commit()`
+        // (builtin/add.c:584,603) and every `die()` between them — a pathspec that
+        // matched nothing, an unreadable file under `updating files failed` — leaves
+        // the transaction unfinished, so the blobs it had already hashed are
+        // discarded. Deferring the writes past the last of those dies is the same
+        // guarantee: `git add -A` over an unreadable tracked file used to leave the
+        // blobs of every file the walk reached before it in the store.
+        indexed_any = true;
+        let id = gix::objs::compute_hash(repo.object_hash(), gix::objs::Kind::Blob, &bytes)?;
+        staged.push(Staged { path, id, mode, stat: stat_now, was_tracked: already_tracked });
     }
 
     // Recover the pathspec matcher (usable without borrowing the repo) to decide
@@ -935,27 +1001,41 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
         }
     }
 
+    // --- object writes: everything git does inside its odb transaction ------
+    // `odb_transaction_begin()` opens at builtin/add.c:584, after the pathspec
+    // checks, and `odb_transaction_commit()` closes at :603. Every `die()` in
+    // between — including `updating files failed` just above — leaves it
+    // unfinished, so the blobs already hashed never land. The walk therefore only
+    // computed ids; they are deposited here, past the last of those dies.
+    //
+    // The bytes are re-read and re-converted rather than carried out of the walk, so
+    // an `add -A` over a large worktree holds one file in memory at a time. The
+    // conversion is silent this time round (see `write_filters`); the id the walk
+    // computed is replaced by the one the write returned, so the two can never
+    // disagree even if the file changed in between.
+    if write_content {
+        for s in &mut staged {
+            // A gitlink has no blob and no worktree bytes: its id is the submodule's
+            // HEAD, which lives in the submodule's own object database.
+            if s.mode == Mode::COMMIT {
+                continue;
+            }
+            let abs = repo.workdir_path(&s.path).expect("path came from this worktree");
+            let md = gix::index::fs::Metadata::from_path_no_follow(&abs)?;
+            let (bytes, mode) =
+                super::stage::read_converted_bytes(&repo, &mut write_filters, s.path.as_ref(), &abs, &md)?;
+            s.mode = mode;
+            s.id = repo.write_blob(&bytes)?.detach();
+        }
+    }
+
     // `-N` reaches `set_object_name_for_intent_to_add_entry()` for every path
     // `add_files_to_cache()` and `add_files()` actually index, and that helper
     // writes the empty blob before `add_to_index()` ever looks at
     // `ADD_CACHE_PRETEND` — so `--dry-run` leaves the object behind too. A
     // pathspec that matched only unchanged tracked paths indexes nothing and
     // therefore writes nothing.
-    let intent_visited = intent_to_add && {
-        let changed: std::collections::HashMap<&BString, &Staged> =
-            staged.iter().filter(|s| s.was_tracked).map(|s| (&s.path, s)).collect();
-        let backing = index.path_backing();
-        staged.iter().any(|s| !s.was_tracked)
-            || index.entries().iter().any(|e| {
-                e.stage() == Stage::Unconflicted
-                    && e.mode != Mode::COMMIT
-                    && changed
-                        .get(&e.path_in(backing).to_owned())
-                        // `--renormalize` indexes every matched blob, changed or
-                        // not, so any match at all reaches `add_to_index()`.
-                        .is_some_and(|s| renormalize || s.id != e.id || s.mode != e.mode)
-            })
-    };
+    let intent_visited = intent_to_add && indexed_any;
     if intent_visited {
         repo.write_blob(b"")?;
     }
@@ -1040,7 +1120,23 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
         }));
     }
 
-    if staged.is_empty() && deletions.is_empty() && chmod.is_none() {
+    // Nothing to write: leave the index file alone so its extensions survive a run
+    // that changed nothing. Under `-N` only the brand-new paths become entries — a
+    // tracked one is `ADD_CACHE_NEW_ONLY`, i.e. reported and then left as it was —
+    // so a `-N` run that matched only tracked paths is one of these.
+    let index_entries = if intent_to_add {
+        staged.iter().filter(|s| !s.was_tracked).count()
+    } else {
+        staged.len()
+    };
+    if index_entries == 0 && deletions.is_empty() && chmod.is_none() {
+        // The report still comes out: git prints `add '<path>'` from inside
+        // `add_to_index()` as it goes, whether or not the cache ends up changing.
+        if verbose {
+            for line in &report {
+                println!("{line}");
+            }
+        }
         return Ok(finish_code(Finish {
             had_errors,
             ignore_errors,
@@ -1602,6 +1698,121 @@ pub(super) fn resolve_pathspecs(
         }
     }
     Ok(checked)
+}
+
+/// The order `cmd_add()` visits paths in, as a sort key over the worktree walk.
+///
+/// git stages in two passes: `add_files_to_cache()` goes first and drives
+/// `update_callback()` off `run_diff_files()`, which iterates the *index* — so the
+/// tracked matches come out in path order — and `add_files()` goes second over the
+/// sorted `dir->entries` (builtin/add.c:356-370, 590-598) for the brand-new ones.
+///
+/// Everything a staging pass emits per path comes out in that order, not just the
+/// `-v`/`-n` report: the `core.autocrlf` round-trip warnings and the
+/// `error: unable to index file` pairs too. `stage` used to walk in the directory
+/// order gitoxide handed it, which put an unreadable `u.txt`'s two error lines
+/// ahead of `crlf.txt`'s warning where git has them the other way round.
+pub(super) fn staging_order(already_tracked: bool, path: &BString) -> (bool, BString) {
+    (!already_tracked, path.clone())
+}
+
+/// `common_prefix_len()` (dir.c:215-259): the longest directory prefix shared by
+/// every non-exclude pathspec, always `/`-terminated, or `None` when there is none.
+///
+/// `fill_directory()` (dir.c:287-291) hands that prefix to `read_directory()` as the
+/// place to start the untracked-file walk, which is what makes the walk — and its
+/// diagnostics — talk about a directory nobody typed.
+///
+/// Each element is compared in its repo-relative form (`pathspec.items[i].match`)
+/// and only up to its `nowildcard_len`, so a wildcard truncates the prefix at the
+/// last `/` before it. An element that carries magic is out of scope here: git
+/// computes `nowildcard_len` from the parsed remainder and `:(icase)` switches to
+/// `item->prefix` entirely, so rather than approximate either, the whole
+/// computation bails — which yields no prefix, hence no diagnostic, which is the
+/// conservative answer.
+fn pathspec_common_prefix(typed: &[String], resolved: &[String]) -> Option<String> {
+    if typed.is_empty() || typed.iter().any(|s| s.starts_with(':')) {
+        return None;
+    }
+    let first = resolved.first()?.as_bytes();
+    let mut max = 0usize;
+    for (n, spec) in resolved.iter().enumerate() {
+        let b = spec.as_bytes();
+        let item_len = nowildcard_len(b);
+        let mut len = 0usize;
+        let mut i = 0usize;
+        while i < item_len && (n == 0 || i < max) {
+            let Some(&c) = b.get(i) else { break };
+            if first.get(i) != Some(&c) {
+                break;
+            }
+            if c == b'/' {
+                len = i + 1;
+            }
+            i += 1;
+        }
+        if n == 0 || len < max {
+            max = len;
+            if max == 0 {
+                return None;
+            }
+        }
+    }
+    (max > 0).then(|| String::from_utf8_lossy(&first[..max]).into_owned())
+}
+
+/// `simple_length()` (pathspec.c): how much of a pathspec is literal, i.e. the
+/// offset of the first `is_glob_special()` byte.
+fn nowildcard_len(spec: &[u8]) -> usize {
+    spec.iter()
+        .position(|c| matches!(c, b'*' | b'?' | b'[' | b'\\'))
+        .unwrap_or(spec.len())
+}
+
+/// `read_directory()`'s `opendir()` failure on the pathspec's common prefix
+/// (dir.c:2585-2587, reached through dir.c:3156-3157).
+///
+/// `git add sub/f.txt` run from `sub/` asks for `sub/sub/f.txt`, whose common
+/// prefix `sub/sub/` does not exist — so the untracked walk warns before the
+/// pathspec check gets its chance to die. gitoxide's dirwalk starts from the
+/// worktree root and simply matches, so it never opens that directory and never
+/// has anything to report; the diagnostic is reproduced here instead, from the
+/// same prefix `fill_directory()` computes.
+///
+/// `treat_leading_path()` (dir.c:2811-2880) decides whether the walk starts at all:
+/// it descends the prefix one component at a time and stops at the first one that
+/// is not a directory, returning "recurse" only if it had already descended into
+/// one. So `nosuch/x` never opens anything (nothing to warn about) while
+/// `sub/nosuch/x` does (`sub` is a directory, `sub/nosuch/` is not) — which is
+/// exactly the difference between a silent "did not match" and this warning.
+pub(super) fn warn_unopenable_walk_prefix(
+    repo: &gix::Repository,
+    typed: &[String],
+    resolved: &[String],
+) {
+    let Some(prefix) = pathspec_common_prefix(typed, resolved) else {
+        return;
+    };
+    let Some(root) = repo.workdir() else { return };
+    // `treat_leading_path()`: descend while each component is a directory. The walk
+    // only starts once at least one component has been descended into.
+    let components: Vec<&str> = prefix.trim_end_matches('/').split('/').collect();
+    let mut descended = false;
+    for i in 0..components.len() {
+        if !root.join(components[..=i].join("/")).is_dir() {
+            break;
+        }
+        descended = true;
+    }
+    if !descended {
+        return;
+    }
+    // `opendir(prefix)`. The whole prefix being a directory is the ordinary case and
+    // says nothing; only a failure is reported, with `strerror(errno)` as git's
+    // `warning_errno()` renders it.
+    if let Err(e) = std::fs::read_dir(root.join(prefix.trim_end_matches('/'))) {
+        eprintln!("warning: could not open directory '{prefix}': {}", os_err_message(&e));
+    }
 }
 
 /// `prefix_path_gently()` (setup.c:103-130) applied to one pathspec element,

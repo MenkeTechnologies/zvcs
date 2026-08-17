@@ -939,6 +939,54 @@ fn resolve_revisions(
             eprintln!("error: unrecognized argument: {a}");
             return Ok(Err(ExitCode::from(255)));
         }
+        // `handle_revision_arg_1()`'s three-mark block, which runs before the
+        // operand is resolved at all — `get_oid_1()` has no case for `^@`, `^!`
+        // or `^-<n>`, so a `git bundle create - HEAD^!` that skips it can only
+        // fail. See [`crate::objname::parents_only`] for the C.
+        //
+        // The parents are recorded under the *base* name, which is what makes
+        // `write_bundle_refs()` write `<parent> HEAD` for `HEAD^@`: it dwims
+        // `e->name`, not the object.
+        let a: &str = match crate::objname::parents_only(a) {
+            // No mark, or a parent number `handle_revision_arg_1()` refused
+            // before `add_parents_only()` was reached — both hand the operand on
+            // exactly as typed, and a refused number then fails to resolve.
+            crate::objname::ParentsOnly::Absent | crate::objname::ParentsOnly::BadParent => a,
+            crate::objname::ParentsOnly::Mark { base, nth, replaces } => {
+                // `^@` keeps `flags`; `^!` and `^-<n>` queue their parents under
+                // `flags ^ (UNINTERESTING | BOTTOM)`, so a preceding `--not`
+                // flips all three.
+                let sense = if replaces { negate } else { !negate };
+                let mut queue = |name: &str, parent, uninteresting| {
+                    pending.push(Pending {
+                        id: parent,
+                        display_ref: display_ref(repo, name),
+                        uninteresting,
+                    });
+                };
+                match crate::objname::add_parents_only(repo, base, sense, nth, &mut queue) {
+                    // `get_reference()`'s `die(_("bad object %s"), name)` from
+                    // inside the tag-peeling loop, naming the base.
+                    crate::objname::Parents::BadObject => {
+                        let name = crate::objname::uninteresting_mark(base).0;
+                        eprintln!("fatal: bad object {name}");
+                        return Ok(Err(ExitCode::from(128)));
+                    }
+                    // `add_parents_only()` answered 0, so `arg` is untouched and
+                    // the operand goes on carrying its mark.
+                    crate::objname::Parents::None => a,
+                    // `^@` alone returns from `handle_revision_arg_1()`: the
+                    // named commit itself never joins the pending list.
+                    crate::objname::Parents::Queued if replaces => {
+                        i += 1;
+                        continue;
+                    }
+                    // `arg = arg_minus_excl`, so `HEAD^!` goes on to pend `HEAD`
+                    // beside the parents it just excluded.
+                    crate::objname::Parents::Queued => base,
+                }
+            }
+        };
         // `setup_revisions()` reports an unresolvable revision itself, with the
         // token as written and its own exit code — the same message `git log`
         // raises, since it is the same function.
@@ -993,16 +1041,25 @@ fn one_pending(repo: &gix::Repository, spec: &str, uninteresting: bool) -> Resul
     let id = crate::objname::resolve(repo, spec)
         .filter(|id| repo.find_object(*id).is_ok())
         .ok_or_else(|| anyhow::anyhow!("bad revision '{spec}'"))?;
-    // `repo_dwim_ref()` decides whether this is a ref at all; a symref keeps the
-    // name as typed (bundle.c:398-403).
-    let display_ref = match repo.find_reference(spec) {
+    Ok(Pending { id, display_ref: display_ref(repo, spec), uninteresting })
+}
+
+/// `write_bundle_refs()`'s `display_ref` (bundle.c:398-403): `repo_dwim_ref()`
+/// decides whether the pending entry's *name* is a ref at all, and a symref
+/// keeps the name as typed — which is what makes `HEAD` print as `HEAD` rather
+/// than as its target.
+///
+/// It is asked about the name git recorded, not about the object: the parents
+/// `add_parents_only()` queues for `HEAD^@` are named `HEAD`, so they come back
+/// out of the bundle header under that name even though `HEAD` points elsewhere.
+fn display_ref(repo: &gix::Repository, name: &str) -> Option<String> {
+    match repo.find_reference(name) {
         Ok(r) => {
             let is_symref = matches!(r.target(), gix::refs::TargetRef::Symbolic(_));
-            Some(if is_symref { spec.to_string() } else { r.name().as_bstr().to_string() })
+            Some(if is_symref { name.to_string() } else { r.name().as_bstr().to_string() })
         }
         Err(_) => None,
-    };
-    Ok(Pending { id, display_ref, uninteresting })
+    }
 }
 
 /// The `BOUNDARY` commits of the walk from `tips` with `excluded` marked

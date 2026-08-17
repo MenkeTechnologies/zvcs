@@ -2366,34 +2366,12 @@ fn find_previous(
     Ok(Some((parent_id.to_hex().to_string(), path.to_vec())))
 }
 
-/// git's `quote_c_style`: paths containing control, quote, backslash or non-ASCII
-/// bytes are emitted as a C-style quoted string, everything else verbatim.
+/// `quote_c_style()`: the name verbatim unless some byte needs escaping, in which
+/// case the whole name double-quoted with C escapes. The table and the
+/// `core.quotePath` flag it reads live in [`crate::quote`], shared with every
+/// other verb that prints a path.
 fn quote_name(name: &[u8]) -> Vec<u8> {
-    let needs_quoting = name
-        .iter()
-        .any(|&b| !(0x20..0x7f).contains(&b) || b == b'"' || b == b'\\');
-    if !needs_quoting {
-        return name.to_vec();
-    }
-    let mut out = Vec::with_capacity(name.len() + 2);
-    out.push(b'"');
-    for &b in name {
-        match b {
-            0x07 => out.extend_from_slice(b"\\a"),
-            0x08 => out.extend_from_slice(b"\\b"),
-            0x0c => out.extend_from_slice(b"\\f"),
-            b'\n' => out.extend_from_slice(b"\\n"),
-            b'\r' => out.extend_from_slice(b"\\r"),
-            b'\t' => out.extend_from_slice(b"\\t"),
-            0x0b => out.extend_from_slice(b"\\v"),
-            b'"' => out.extend_from_slice(b"\\\""),
-            b'\\' => out.extend_from_slice(b"\\\\"),
-            b if !(0x20..0x7f).contains(&b) => out.extend_from_slice(format!("\\{b:03o}").as_bytes()),
-            b => out.push(b),
-        }
-    }
-    out.push(b'"');
-    out
+    crate::quote::quoted_name_bytes(name)
 }
 
 /// Format a UTC offset the way git writes the `author-tz`/`committer-tz` field.

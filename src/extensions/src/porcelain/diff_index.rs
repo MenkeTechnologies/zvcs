@@ -207,9 +207,9 @@ use gix::bstr::{BString, ByteSlice};
 use gix::diff::blob::{Algorithm, Diff, InternedInput};
 use gix::hash::ObjectId;
 use gix::prelude::ObjectIdExt;
-use regex::bytes::Regex;
 
 use super::diff_color;
+use super::diff_pickaxe;
 use super::diff_files::{
     count_changes_sides, quote_one, quote_two, quoted_name, quoted_name_bytes, render_dirstat,
     DirStat,
@@ -275,55 +275,6 @@ impl Default for StatWidths {
     }
 }
 
-/// A search pattern, either a literal substring (git's kwset path for a plain `-S`) or a
-/// compiled regular expression (git's `-G`, `-I`, and `-S --pickaxe-regex`, all of which
-/// call `regcomp` with `REG_EXTENDED | REG_NEWLINE`).
-enum Needle {
-    Literal(Vec<u8>),
-    Regex(Regex),
-}
-
-impl Needle {
-    /// Whether `hay` contains a match — used by `-G` on each changed line and by `-I`.
-    fn is_match(&self, hay: &[u8]) -> bool {
-        match self {
-            Needle::Literal(n) => contains(hay, n),
-            Needle::Regex(re) => re.is_match(hay),
-        }
-    }
-
-    /// Non-overlapping match count — used by `-S` to compare the two sides.
-    fn count(&self, hay: &[u8]) -> usize {
-        match self {
-            Needle::Literal(n) => count_occurrences(hay, n),
-            Needle::Regex(re) => re.find_iter(hay).count(),
-        }
-    }
-}
-
-/// Compile a `-G`/`-I`/`-S --pickaxe-regex` pattern the way git's `regcomp` does: on
-/// bytes, without Unicode mode so `.` and the character classes carry git's C-locale byte
-/// semantics, and with multi-line mode standing in for `REG_NEWLINE` since matching is
-/// done a line at a time. `Err` carries the engine's message for the (best-effort) fatal.
-fn compile_regex(pat: &[u8]) -> std::result::Result<Regex, String> {
-    let s = std::str::from_utf8(pat).map_err(|_| "invalid byte sequence in pattern".to_owned())?;
-    regex::bytes::RegexBuilder::new(s)
-        .unicode(false)
-        .multi_line(true)
-        .build()
-        .map_err(|e| e.to_string())
-}
-
-/// The pickaxe: `-S` compares occurrence counts, `-G` greps the changed lines,
-/// `--find-object` keeps a pair that touches one of the named object ids.
-enum Pickaxe {
-    Occurrences(Needle),
-    Grep(Needle),
-    /// `DIFF_PICKAXE_KIND_OBJFIND` — the one `options->objfind` oidset every
-    /// `--find-object=<id>` on the line inserted into.
-    ObjFind(Vec<ObjectId>),
-}
-
 /// Parsed command-line options for a single `diff-index` invocation.
 struct Opts {
     cached: bool,                  // --cached: compare against the index, ignore the worktree
@@ -338,8 +289,8 @@ struct Opts {
     filter_include: Vec<u8>,       // --diff-filter upper-case letters
     filter_exclude: Vec<u8>,       // --diff-filter lower-case letters, upper-cased
     ws: Ws,
-    ignore_lines: Option<Needle>, // -I<s> / --ignore-matching-lines=<s>
-    pickaxe: Option<Pickaxe>,
+    ignore_lines: Option<diff_pickaxe::Needle>, // -I<s> / --ignore-matching-lines=<s>
+    pickaxe: Option<diff_pickaxe::Kind>,
     pickaxe_all: bool,
     detect_rename: bool, // -M/-C: git hashes rename candidates, so additions gain real ids
     /// `-p`/`-u`/`--patch`: render the unified patch body.
@@ -1070,15 +1021,25 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
                 opts.detect_rename = true;
             }
             "-S" | "-G" | "-I" => {
+                // parse-options' own message for a short option declared with a
+                // required argument and given none — not this command's usage block,
+                // which it prints for an operand-count problem instead.
                 let Some(value) = args.get(i) else {
-                    eprint!("{}", USAGE);
+                    eprintln!("error: {}", diff_color::missing_value(a));
                     return Ok(ExitCode::from(129));
                 };
                 i += 1;
                 if a == "-I" {
                     ignore_arg = Some((cur, value.as_bytes().to_vec()));
                 } else {
-                    pickaxe_arg = Some((a.as_bytes()[1], value.as_bytes().to_vec()));
+                    let kind = a.as_bytes()[1];
+                    if value.is_empty() {
+                        set_earliest(
+                            &mut deferred,
+                            (cur, 129, format!("{}\n", super::diff_optval::pickaxe_empty(kind)).into_bytes()),
+                        );
+                    }
+                    pickaxe_arg = Some((kind, value.as_bytes().to_vec()));
                 }
             }
             s if s.starts_with("--dirstat=") => dirstat!(&s["--dirstat=".len()..]),
@@ -1275,15 +1236,15 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
         // `fatal: invalid regex: …` (exit 128), deferred to after the tree-ish just as
         // git compiles it inside `diffcore_pickaxe`.
         if kind == b'S' && !pickaxe_regex {
-            opts.pickaxe = Some(Pickaxe::Occurrences(Needle::Literal(pat)));
+            opts.pickaxe = Some(diff_pickaxe::Kind::Occurrences(diff_pickaxe::Needle::Literal(pat)));
         } else {
-            match compile_regex(&pat) {
+            match diff_pickaxe::compile_regex(&pat) {
                 Ok(re) => {
-                    let needle = Needle::Regex(re);
+                    let needle = diff_pickaxe::Needle::Regex(re);
                     opts.pickaxe = Some(if kind == b'S' {
-                        Pickaxe::Occurrences(needle)
+                        diff_pickaxe::Kind::Occurrences(needle)
                     } else {
-                        Pickaxe::Grep(needle)
+                        diff_pickaxe::Kind::Grep(needle)
                     });
                 }
                 Err(msg) => {
@@ -1295,8 +1256,8 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
     if let Some((idx, pat)) = ignore_arg {
         // `-I` is always a regex (`diff_opt_ignore_regex`), compiled inline; a bad one is
         // `error: invalid regex given to -I: '<pat>'` (exit 129) at its argv position.
-        match compile_regex(&pat) {
-            Ok(re) => opts.ignore_lines = Some(Needle::Regex(re)),
+        match diff_pickaxe::compile_regex(&pat) {
+            Ok(re) => opts.ignore_lines = Some(diff_pickaxe::Needle::Regex(re)),
             Err(_) => {
                 let mut msg = b"error: invalid regex given to -I: '".to_vec();
                 msg.extend_from_slice(&pat);
@@ -1336,7 +1297,7 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
         }
         // `DIFF_PICKAXE_KIND_OBJFIND` outranks `-S`/`-G` in `pickaxe_match()`, which
         // tests `o->objfind` before it looks at the needle at all.
-        opts.pickaxe = Some(Pickaxe::ObjFind(ids));
+        opts.pickaxe = Some(diff_pickaxe::Kind::ObjFind(ids));
     }
 
     // git's `setup_revisions`: each positional before `--` is tried as a revision.
@@ -1932,8 +1893,8 @@ fn buffer_is_binary(buf: &[u8]) -> bool {
 /// `xpp.flags = o->xdl_opts` (diff.c:4243), so the selected algorithm reaches the
 /// by-line damage counts too.
 fn line_counts(one: &[u8], two: &[u8], opts: &Opts) -> (u64, u64) {
-    let before = split_lines(one);
-    let after = split_lines(two);
+    let before = diff_pickaxe::split_lines(one);
+    let after = diff_pickaxe::split_lines(two);
     let fold = opts.ws.any();
     let mut input: InternedInput<Vec<u8>> = InternedInput::default();
     input.update_before(before.iter().map(|l| if fold { fold_line(l, opts.ws) } else { l.to_vec() }));
@@ -2325,9 +2286,9 @@ fn apply_pickaxe(repo: &gix::Repository, deltas: &mut Vec<Delta>, opts: &Opts) -
     };
     // `pickaxe_match()` answers the objfind kind from the *recorded* ids and returns
     // before it would fill either filespec, so no content is read for `--find-object`.
-    if let Pickaxe::ObjFind(ids) = pickaxe {
+    if let diff_pickaxe::Kind::ObjFind(ids) = pickaxe {
         deltas.retain(|d| {
-            super::diff_files::objfind_hit(
+            diff_pickaxe::objfind_hit(
                 ids,
                 d.old_valid().then_some(d.src_id),
                 d.new_valid().then_some(d.dst_id),
@@ -2340,21 +2301,7 @@ fn apply_pickaxe(repo: &gix::Repository, deltas: &mut Vec<Delta>, opts: &Opts) -
     for d in deltas.iter() {
         let one = side_content(repo, workdir.as_deref(), d, true)?;
         let two = side_content(repo, workdir.as_deref(), d, false)?;
-        let hit = match pickaxe {
-            // Answered above; `pickaxe_match()` never reaches the content path for it.
-            Pickaxe::ObjFind(_) => false,
-            Pickaxe::Occurrences(needle) => {
-                let a = one.as_deref().map(|b| needle.count(b)).unwrap_or(0);
-                let b = two.as_deref().map(|b| needle.count(b)).unwrap_or(0);
-                a != b
-            }
-            Pickaxe::Grep(needle) => match (one.as_deref(), two.as_deref()) {
-                (None, None) => false,
-                (None, Some(t)) | (Some(t), None) => needle.is_match(t),
-                (Some(a), Some(b)) => changed_lines_hit(a, b, needle),
-            },
-        };
-        hits.push(hit);
+        hits.push(pickaxe.content_hit(one.as_deref(), two.as_deref()));
     }
     if opts.pickaxe_all && hits.iter().any(|h| *h) {
         return Ok(());
@@ -2434,49 +2381,14 @@ fn read_worktree(workdir: &Path, path: &BString) -> Option<Vec<u8>> {
     }
 }
 
-/// Occurrences of `needle` in `haystack`, counted without overlap, as git's kwset does.
-fn count_occurrences(haystack: &[u8], needle: &[u8]) -> usize {
-    if needle.is_empty() || needle.len() > haystack.len() {
-        return 0;
-    }
-    let mut count = 0;
-    let mut at = 0;
-    while at + needle.len() <= haystack.len() {
-        if &haystack[at..at + needle.len()] == needle {
-            count += 1;
-            at += needle.len();
-        } else {
-            at += 1;
-        }
-    }
-    count
-}
-
-fn contains(haystack: &[u8], needle: &[u8]) -> bool {
-    count_occurrences(haystack, needle) > 0
-}
-
-/// git's `-G`: does any line the diff adds or removes match `needle`?
-fn changed_lines_hit(one: &[u8], two: &[u8], needle: &Needle) -> bool {
-    let before = split_lines(one);
-    let after = split_lines(two);
-    let mut hit = false;
-    for_each_changed_line(&before, &after, |line| {
-        if needle.is_match(line) {
-            hit = true;
-        }
-    });
-    hit
-}
-
 /// `true` when the two blobs carry the same content once `opts`' whitespace folding and
 /// `-I` line filtering are applied.
 fn contents_match(one: &[u8], two: &[u8], opts: &Opts) -> bool {
     if !opts.ws.any() && opts.ignore_lines.is_none() {
         return one == two;
     }
-    let before: Vec<Vec<u8>> = split_lines(one).into_iter().map(|l| fold_line(l, opts.ws)).collect();
-    let after: Vec<Vec<u8>> = split_lines(two).into_iter().map(|l| fold_line(l, opts.ws)).collect();
+    let before: Vec<Vec<u8>> = diff_pickaxe::split_lines(one).into_iter().map(|l| fold_line(l, opts.ws)).collect();
+    let after: Vec<Vec<u8>> = diff_pickaxe::split_lines(two).into_iter().map(|l| fold_line(l, opts.ws)).collect();
     if before == after {
         return true;
     }
@@ -2485,20 +2397,15 @@ fn contents_match(one: &[u8], two: &[u8], opts: &Opts) -> bool {
     };
     // `-I` drops a hunk whose every changed line matches, so the two sides count as
     // equal exactly when no changed line falls outside the pattern.
-    let raw_before = split_lines(one);
-    let raw_after = split_lines(two);
+    let raw_before = diff_pickaxe::split_lines(one);
+    let raw_after = diff_pickaxe::split_lines(two);
     let mut all_match = true;
-    for_each_changed_line(&raw_before, &raw_after, |line| {
+    diff_pickaxe::for_each_changed_line(&raw_before, &raw_after, |line| {
         if !pattern.is_match(line) {
             all_match = false;
         }
     });
     all_match
-}
-
-/// Split into lines, each keeping its terminator, as xdiff records them.
-fn split_lines(data: &[u8]) -> Vec<&[u8]> {
-    data.split_inclusive(|&c| c == b'\n').collect()
 }
 
 /// Apply one line's worth of git's `XDF_IGNORE_*` folding.
@@ -2539,29 +2446,6 @@ fn fold_line(line: &[u8], ws: Ws) -> Vec<u8> {
     s.to_vec()
 }
 
-/// Run a line diff and hand every added or removed line to `visit`.
-///
-/// Myers unconditionally, and not an oversight: this is `-G`'s `diff_grep()`
-/// (diffcore-pickaxe.c:43), which `memset`s its `xpparam_t` and never assigns
-/// `xpp.flags = o->xdl_opts` — so `--diff-algorithm=` does not reach the pickaxe.
-fn for_each_changed_line(before: &[&[u8]], after: &[&[u8]], mut visit: impl FnMut(&[u8])) {
-    let one: Vec<u8> = before.concat();
-    let two: Vec<u8> = after.concat();
-    let input = InternedInput::new(one.as_slice(), two.as_slice());
-    let diff = Diff::compute(Algorithm::Myers, &input);
-    for hunk in diff.hunks() {
-        for i in hunk.before.clone() {
-            if let Some(line) = before.get(i as usize) {
-                visit(line);
-            }
-        }
-        for i in hunk.after.clone() {
-            if let Some(line) = after.get(i as usize) {
-                visit(line);
-            }
-        }
-    }
-}
 
 /// The repository-relative directory the command was invoked from, with a trailing
 /// slash, or empty when it was run at the root.
@@ -2796,8 +2680,8 @@ fn analyze_index_delta(
         });
     }
 
-    let before = split_lines(&old_data);
-    let after = split_lines(&new_data);
+    let before = diff_pickaxe::split_lines(&old_data);
+    let after = diff_pickaxe::split_lines(&new_data);
     let fold = opts.ws.any();
     let mut input: InternedInput<Vec<u8>> = InternedInput::default();
     input.update_before(before.iter().map(|l| if fold { fold_line(l, opts.ws) } else { l.to_vec() }));

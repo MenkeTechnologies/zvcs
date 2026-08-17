@@ -27,6 +27,14 @@
 //! `builtin_diff()` swaps the prefixes it prints with (diff.c:3862-3868), which is
 //! why the header reads `diff --git b/<rhs> a/<lhs>` — the *values* are exchanged,
 //! so `--src-prefix`/`--dst-prefix` follow along and `--no-prefix` is unaffected.
+//!
+//! The option table is `add_diff_options(no_index_options, &revs->diffopt)`
+//! (diff-no-index.c:372) — the *whole* `diff_opts` table, not a subset — so this is
+//! a hand-written implementation of a table `git diff` shares, and a name missing
+//! here is a gap rather than a name git rejects. Algorithm selection is on it:
+//! `--diff-algorithm=<v>`, the separated `--diff-algorithm <v>`, `--minimal`,
+//! `--patience`, `--histogram`, and the `diff.algorithm` default when the
+//! comparison happens to be run from inside a repository.
 
 use anyhow::Result;
 use gix::bstr::{BString, ByteSlice};
@@ -348,6 +356,9 @@ struct Opts {
     full_index: bool,
     text: bool,
     colors: diff_color::DiffColors,
+    /// `options->xdl_opts`' algorithm bits, which `add_diff_options()` exposes to
+    /// this parser as fully as to `git diff`'s own.
+    algorithm: gix::diff::blob::Algorithm,
 }
 
 /// git's `diff_no_index_usage[]`, over the block every `add_diff_options()`
@@ -407,8 +418,31 @@ fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
     let mut detect_rename: Option<u8> = None;
     let mut rename_score: u32 = 0;
     let mut find_copies_harder = false;
+    // `add_diff_options()` (diff-no-index.c:372) hands the no-index parser the
+    // *whole* `diff_opts` table, algorithm selection included, so every spelling
+    // `git diff` takes is taken here too. `None` leaves the `diff.algorithm`
+    // default resolved below.
+    let mut algorithm: Option<gix::diff::blob::Algorithm> = None;
+    // `--diff-algorithm` is an `OPT_CALLBACK_F` without `PARSE_OPT_OPTARG`, so
+    // parse-options consumes the next argv entry as its value before that entry is
+    // examined for anything else — a `--`, an operand, or another option.
+    let mut want_algorithm_value = false;
 
     for a in args {
+        if std::mem::take(&mut want_algorithm_value) {
+            match super::diff_optval::parse_algorithm_value(a) {
+                Some(alg) => algorithm = Some(alg),
+                None => {
+                    eprintln!("{}", super::diff_optval::DIFF_ALGORITHM_ERR);
+                    return Ok(ExitCode::from(129));
+                }
+            }
+            continue;
+        }
+        if a == "--diff-algorithm" {
+            want_algorithm_value = true;
+            continue;
+        }
         if after_dashdash || !a.starts_with('-') || a == "-" {
             operands.push(a.clone());
             continue;
@@ -470,6 +504,27 @@ fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
             "--find-copies-harder" => find_copies_harder = true,
             "--no-find-copies-harder" => find_copies_harder = false,
             "--no-renames" => detect_rename = Some(0),
+            // The algorithm aliases, all of which `parse_algorithm_value()` also
+            // spells: `--minimal` is `XDF_NEED_MINIMAL`, `--patience` is
+            // `XDF_PATIENCE_DIFF`, `--histogram` is `XDF_HISTOGRAM_DIFF`, and
+            // `--myers` clears back to 0. They are `OPT_BIT`s on the same
+            // `xdl_opts` word, so the last one on the line wins.
+            "--minimal" => algorithm = Some(gix::diff::blob::Algorithm::MyersMinimal),
+            "--myers" => algorithm = Some(gix::diff::blob::Algorithm::Myers),
+            "--patience" => algorithm = Some(gix::diff::blob::Algorithm::Patience),
+            "--histogram" => algorithm = Some(gix::diff::blob::Algorithm::Histogram),
+            // `diff_opt_diff_algorithm()`'s glued form, matched case-insensitively
+            // by `parse_algorithm_value()`'s `strcasecmp` — so `--diff-algorithm=MYERS`
+            // is Myers and not the `error()` below.
+            s if s.starts_with("--diff-algorithm=") => {
+                match super::diff_optval::parse_algorithm_value(&s["--diff-algorithm=".len()..]) {
+                    Some(alg) => algorithm = Some(alg),
+                    None => {
+                        eprintln!("{}", super::diff_optval::DIFF_ALGORITHM_ERR);
+                        return Ok(ExitCode::from(129));
+                    }
+                }
+            }
             "-W" | "--function-context" => func_context = true,
             "--no-function-context" => func_context = false,
             "--full-index" => full_index = true,
@@ -554,6 +609,12 @@ fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
             s => anyhow::bail!("unsupported option {s:?}"),
         }
     }
+    // A required-argument option standing at the end of the line: parse-options
+    // reports it and exits 129 before the operand count is looked at.
+    if want_algorithm_value {
+        eprintln!("error: option `diff-algorithm' requires a value");
+        return Ok(ExitCode::from(129));
+    }
 
     // `if (argc < 2)`: too few operands is where the implicit form explains
     // itself, since the user asked for `git diff` and is being shown the usage
@@ -619,6 +680,21 @@ fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
     if reverse {
         std::mem::swap(&mut src_prefix, &mut dst_prefix);
     }
+    // `git_diff_ui_config()`'s `diff.algorithm` arm runs before `diff_no_index()`
+    // does, so the key reaches a no-index comparison exactly as it reaches a
+    // tracked one — and a command-line flag still wins, because
+    // `diff_opt_diff_algorithm()` writes `options->xdl_opts` after
+    // `diff_setup()` copied the configured default in (diff.c:5163). Without a
+    // repository there is no config to read and the default is git's own:
+    // `static long diff_algorithm;` is zero, which is Myers (diff.c:78).
+    let algorithm = match (algorithm, &repo) {
+        (Some(alg), _) => alg,
+        (None, Some(repo)) => match repo.config_snapshot().string("diff.algorithm") {
+            Some(name) => super::diff::parse_config_algorithm(name.as_ref())?,
+            None => gix::diff::blob::Algorithm::Myers,
+        },
+        (None, None) => gix::diff::blob::Algorithm::Myers,
+    };
     let opts = Opts {
         fmt: fmt.resolved(),
         ctx,
@@ -631,6 +707,7 @@ fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
         full_index,
         text,
         colors,
+        algorithm,
     };
 
     // `diff_setup_done()`: `--find-copies-harder` implies copy detection
@@ -762,7 +839,14 @@ fn compare(
         let binary = !opts.text
             && (super::diff::looks_binary(&old_data) || super::diff::looks_binary(&new_data));
         let (added, deleted, body) =
-            super::diff::no_index_body(&old_data, &new_data, &opts.ctx_geometry(), opts.ws, binary);
+        super::diff::no_index_body(
+            &old_data,
+            &new_data,
+            &opts.ctx_geometry(),
+            opts.ws,
+            binary,
+            opts.algorithm,
+        );
         // `hash_filespec()` (diffcore-rename.c) is what leaves an object id on a
         // filespec `queue_diff()` created with the null one, and it runs only
         // inside rename detection. `--raw` therefore prints real ids exactly when
@@ -787,7 +871,22 @@ fn compare(
         });
         if opts.fmt.patch {
             emit_header(&mut out, a, b, &old_data, &new_data, &opts, same_content, binary, &pair);
-            if binary {
+            // `builtin_diff()`'s binary arm stops at the header when the two sides
+            // hold the same object (diff.c):
+            //
+            // ```c
+            // if (oideq(&one->oid, &two->oid)) {
+            //         if (must_show_header)
+            //                 fprintf(o->file, "%s", header.buf);
+            //         goto free_ab_and_return;
+            // }
+            // ```
+            //
+            // The only pair that gets here unchanged is a rename or copy the
+            // detection just made, and a 100%-similar *binary* rename was picking up
+            // a `Binary files … differ` line for content that is identical. The text
+            // side needs no such test: its body is empty when nothing changed.
+            if binary && !same_content {
                 out.extend_from_slice(b"Binary files ");
                 push_name(&mut out, &opts.src_prefix, a.header_name(b), a.file.is_some());
                 out.extend_from_slice(b" and ");

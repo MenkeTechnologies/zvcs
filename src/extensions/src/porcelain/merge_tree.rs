@@ -1779,7 +1779,7 @@ fn is_binary(repo: &gix::Repository, id: &ObjectId) -> Result<bool> {
 }
 
 /// A path as it appears in the conflicted-file-info section: raw under `-z`,
-/// otherwise C-quoted the way git's `core.quotePath` default does.
+/// otherwise C-quoted by `quote_c_style()`.
 fn render_path(path: &BStr, nul: bool) -> Vec<u8> {
     if nul {
         path.to_vec()
@@ -1788,36 +1788,10 @@ fn render_path(path: &BStr, nul: bool) -> Vec<u8> {
     }
 }
 
-/// C-style path quoting matching git's default `core.quotePath=true`: a path is
-/// wrapped in double quotes and escaped when it contains control bytes, a quote,
-/// a backslash, or any byte >= 0x80; otherwise it is emitted verbatim.
+/// `quote_c_style()`: the name verbatim unless some byte needs escaping, in which
+/// case the whole name double-quoted with C escapes. The table and the
+/// `core.quotePath` flag it reads live in [`crate::quote`], shared with every
+/// other verb that prints a path.
 fn quote_path(path: impl AsRef<[u8]>) -> String {
-    let bytes = path.as_ref();
-    let needs = bytes
-        .iter()
-        .any(|&b| b < 0x20 || b == 0x7f || b == b'"' || b == b'\\' || b >= 0x80);
-    if !needs {
-        // All bytes are printable ASCII here, so this is lossless.
-        return String::from_utf8_lossy(bytes).into_owned();
-    }
-    let mut out = String::from("\"");
-    for &b in bytes {
-        match b {
-            b'"' => out.push_str("\\\""),
-            b'\\' => out.push_str("\\\\"),
-            0x07 => out.push_str("\\a"),
-            0x08 => out.push_str("\\b"),
-            0x09 => out.push_str("\\t"),
-            0x0a => out.push_str("\\n"),
-            0x0b => out.push_str("\\v"),
-            0x0c => out.push_str("\\f"),
-            0x0d => out.push_str("\\r"),
-            b if b < 0x20 || b == 0x7f || b >= 0x80 => {
-                out.push_str(&format!("\\{b:03o}"));
-            }
-            b => out.push(b as char),
-        }
-    }
-    out.push('"');
-    out
+    crate::quote::quoted_name_string(path.as_ref())
 }

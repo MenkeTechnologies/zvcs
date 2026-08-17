@@ -793,13 +793,13 @@ pub fn ls_files(args: &[String]) -> Result<ExitCode> {
         None
     };
 
-    // git quotes non-plain paths per `core.quotePath` (default on), but never
-    // when `-z` was asked for: NUL-terminated output is meant to be unambiguous.
-    let quote = !opts.zero
-        && repo
-            .config_snapshot()
-            .boolean("core.quotePath")
-            .unwrap_or(true);
+    // `-z` suppresses quoting outright (`write_name_quoted`'s `line_terminator`
+    // check): NUL-terminated output is meant to be unambiguous. Otherwise the
+    // name goes through `quote_c_style()`, which is where `core.quotePath` is
+    // read — the key decides whether bytes >= 0x80 are escaped, never whether a
+    // control byte, a quote or a backslash is.
+    crate::quote::init(&repo);
+    let quote = !opts.zero;
     // Each rendered line carries its own terminator (and, under `--debug`, the
     // trailing stat block) so the emit loop can stay a verbatim byte copy.
     let terminator = if opts.zero { b'\0' } else { b'\n' };
@@ -2288,38 +2288,12 @@ fn normalize_pattern(pattern: &str) -> BString {
     }
 }
 
-/// C-style path quoting matching git's default `core.quotePath=true`: a path is
-/// wrapped in double quotes and escaped when it contains control bytes, a quote,
-/// a backslash, or any byte >= 0x80; otherwise it is emitted verbatim.
+/// `quote_c_style()`: the name verbatim unless some byte needs escaping, in which
+/// case the whole name double-quoted with C escapes. The table and the
+/// `core.quotePath` flag it reads live in [`crate::quote`], shared with every
+/// other verb that prints a path.
 fn quote_path(path: impl AsRef<[u8]>) -> String {
-    let bytes = path.as_ref();
-    let needs = bytes
-        .iter()
-        .any(|&b| b < 0x20 || b == 0x7f || b == b'"' || b == b'\\' || b >= 0x80);
-    if !needs {
-        // All bytes are printable ASCII here, so this is lossless.
-        return String::from_utf8_lossy(bytes).into_owned();
-    }
-    let mut out = String::from("\"");
-    for &b in bytes {
-        match b {
-            b'"' => out.push_str("\\\""),
-            b'\\' => out.push_str("\\\\"),
-            0x07 => out.push_str("\\a"),
-            0x08 => out.push_str("\\b"),
-            0x09 => out.push_str("\\t"),
-            0x0a => out.push_str("\\n"),
-            0x0b => out.push_str("\\v"),
-            0x0c => out.push_str("\\f"),
-            0x0d => out.push_str("\\r"),
-            b if b < 0x20 || b == 0x7f || b >= 0x80 => {
-                out.push_str(&format!("\\{b:03o}"));
-            }
-            b => out.push(b as char),
-        }
-    }
-    out.push('"');
-    out
+    crate::quote::quoted_name_string(path.as_ref())
 }
 
 #[cfg(test)]

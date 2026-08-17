@@ -471,10 +471,7 @@ fn unmerged_paths(repo: &gix::Repository, args: &[String]) -> Result<BTreeSet<BS
             // A path git would render with `core.quotePath` reaches the shell as
             // its quoted spelling, which `grep` then fails to open. Refuse rather
             // than guess which of the two spellings the harness will see.
-            if display
-                .iter()
-                .any(|&b| !(0x20..0x7f).contains(&b) || b == b'"' || b == b'\\')
-            {
+            if crate::quote::needs_c_quote(display) {
                 anyhow::bail!(
                     "unsupported path {:?}: git ls-files renders it in quoted form and stock \
                      git-jump then greps a filename that does not exist",

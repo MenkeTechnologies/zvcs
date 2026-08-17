@@ -84,8 +84,6 @@ struct Opts {
     /// (cwd prefix applied, trailing slashes preserved), sorted like
     /// `parse_pathspec` sorts them.
     pathspecs: Vec<BString>,
-    /// `core.quotePath`, controlling whether bytes >= 0x80 are octal-escaped.
-    quote_path_fully: bool,
 }
 
 /// `git last-modified` — see the module docs for the covered surface.
@@ -226,17 +224,15 @@ pub fn last_modified(args: &[String]) -> Result<ExitCode> {
     }
     pathspecs.sort();
 
-    let quote_path_fully = repo
-        .config_snapshot()
-        .boolean("core.quotePath")
-        .unwrap_or(true);
+    // git reads `core.quotePath` once, in its config callback, into the global
+    // every `quote_c_style()` caller shares.
+    crate::quote::init(&repo);
 
     let opts = Opts {
         max_depth,
         show_trees,
         nul,
         pathspecs,
-        quote_path_fully,
     };
 
     // Resolve the single starting commit (`rev.def = "HEAD"`).
@@ -654,35 +650,15 @@ fn emit(out: &mut Vec<u8>, path: &BString, commit: &ObjectId, opts: &Opts) {
         out.extend_from_slice(path.as_bytes());
         out.push(0);
     } else {
-        write_c_quoted(out, path.as_bytes(), opts.quote_path_fully);
+        write_c_quoted(out, path.as_bytes());
         out.push(b'\n');
     }
 }
 
-/// `write_name_quoted()`/`quote_c_style()`: emit the name raw unless some byte
-/// needs escaping, in which case emit the whole name double-quoted with
-/// C escapes and 3-digit octal for the rest.
-fn write_c_quoted(out: &mut Vec<u8>, name: &[u8], quote_fully: bool) {
-    let must = |b: u8| b < 0x20 || b == b'"' || b == b'\\' || b == 0x7f || (b >= 0x80 && quote_fully);
-    if !name.iter().any(|&b| must(b)) {
-        out.extend_from_slice(name);
-        return;
-    }
-    out.push(b'"');
-    for &b in name {
-        match b {
-            0x07 => out.extend_from_slice(b"\\a"),
-            0x08 => out.extend_from_slice(b"\\b"),
-            0x09 => out.extend_from_slice(b"\\t"),
-            0x0a => out.extend_from_slice(b"\\n"),
-            0x0b => out.extend_from_slice(b"\\v"),
-            0x0c => out.extend_from_slice(b"\\f"),
-            0x0d => out.extend_from_slice(b"\\r"),
-            b'"' => out.extend_from_slice(b"\\\""),
-            b'\\' => out.extend_from_slice(b"\\\\"),
-            _ if must(b) => out.extend_from_slice(format!("\\{b:03o}").as_bytes()),
-            _ => out.push(b),
-        }
-    }
-    out.push(b'"');
+/// `quote_c_style()`: the name verbatim unless some byte needs escaping, in which
+/// case the whole name double-quoted with C escapes. The table and the
+/// `core.quotePath` flag it reads live in [`crate::quote`], shared with every
+/// other verb that prints a path.
+fn write_c_quoted(out: &mut Vec<u8>, name: &[u8]) {
+    out.extend_from_slice(&crate::quote::quoted_name_bytes(name));
 }

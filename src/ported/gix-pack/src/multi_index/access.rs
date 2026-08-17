@@ -97,6 +97,7 @@ where
             &self.fan,
             &|idx| self.oid_at_index(idx),
             self.num_objects,
+            self.object_hash,
         )
     }
 

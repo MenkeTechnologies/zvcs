@@ -153,7 +153,14 @@ where
         // the other direction: it never checks existence when parsing a full-length hex, and the read
         // that follows calls `promisor_remote_get_direct()`. Asking here keeps the check but lets it
         // succeed. A short prefix is left alone - it names no object the remote could be asked for.
-        if prefix.hex_len() != prefix.as_oid().kind().len_in_hex() {
+        //
+        // "Full-length" has to mean *this* store's hash, not the prefix's own. `Kind::from_hex_len`
+        // calls anything from 41 to 64 characters a sha256 prefix, and `git` accepts such a name in
+        // a sha1 repository (`init_object_disambiguation()` bounds the length by `GIT_MAX_HEXSZ`),
+        // so a 64-character name here would otherwise be handed to the promisor - and from there to
+        // a sha1 loose store, which asserts on the mismatched width - as a 32-byte id.
+        let object_hash = self.store.object_hash();
+        if prefix.as_oid().kind() != object_hash || prefix.hex_len() != object_hash.len_in_hex() {
             return Ok(None);
         }
         self.fetch_from_promisor(prefix.as_oid());

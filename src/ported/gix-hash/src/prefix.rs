@@ -33,6 +33,17 @@ pub mod from_hex {
     }
 }
 
+/// `bytes` extended with zeros to exactly `len` items, the way `git` sees an object id: a
+/// `hash[GIT_MAX_RAWSZ]` array whose tail past the algorithm's length is zero-filled.
+fn zero_padded(bytes: &[u8], len: usize) -> impl Iterator<Item = u8> + '_ {
+    bytes.iter().copied().chain(std::iter::repeat(0)).take(len)
+}
+
+/// The byte at `idx`, or the zero `git` would have read from the padding past a shorter hash.
+fn byte_or_zero(bytes: &[u8], idx: usize) -> u8 {
+    bytes.get(idx).copied().unwrap_or(0)
+}
+
 impl Prefix {
     /// The smallest allowed prefix length below which chances for collisions are too high even in small repositories.
     pub const MIN_HEX_LEN: usize = 4;
@@ -79,17 +90,45 @@ impl Prefix {
 
     /// Provided with candidate id which is a full hash, determine how this prefix compares to it,
     /// only looking at the prefix bytes, ignoring everything behind that.
+    ///
+    /// The prefix may be *wider* than the candidate: [`Kind::from_hex_len()`][crate::Kind::from_hex_len()]
+    /// answers `Sha256` for any hex length of 41 to 64, so a user-typed 41-character name yields a
+    /// 32-byte prefix that is compared against 20-byte SHA-1 object ids. `git` reaches the same
+    /// situation and reads straight through it: an object id there is a fixed-width, zero-filled
+    /// `hash[GIT_MAX_RAWSZ]` array, so `match_hash()` sees zeros past the algorithm's own length.
+    /// `oid` is a variable-length slice instead, so the padding has to be supplied here. Reading a
+    /// too-wide prefix as "not equal" instead would be wrong, not merely safe: `git` resolves a
+    /// 40-hex object id followed by zeros as that very object.
     pub fn cmp_oid(&self, candidate: &oid) -> Ordering {
         let common_len = self.hex_len / 2;
+        let prefix = self.bytes.as_bytes();
+        let candidate = candidate.as_bytes();
 
-        self.bytes.as_bytes()[..common_len]
-            .cmp(&candidate.as_bytes()[..common_len])
+        prefix[..common_len]
+            .iter()
+            .copied()
+            .cmp(zero_padded(candidate, common_len))
             .then(if self.hex_len % 2 == 1 {
-                let half_byte_idx = self.hex_len / 2;
-                self.bytes.as_bytes()[half_byte_idx].cmp(&(candidate.as_bytes()[half_byte_idx] & 0xf0))
+                prefix[common_len].cmp(&(byte_or_zero(candidate, common_len) & 0xf0))
             } else {
                 Ordering::Equal
             })
+    }
+
+    /// This prefix narrowed to `hex_len` hexadecimal characters, or a copy of `self` when it is
+    /// already no wider than that.
+    ///
+    /// Pack lookups need this: `git` admits an object name of up to 64 hex characters whatever the
+    /// repository's own hash is (`init_object_disambiguation()` bounds it by `GIT_MAX_HEXSZ`), but
+    /// then clamps it to `hash_algo->hexsz` before scanning a pack index, so the characters past
+    /// the repository's own hash width are simply dropped there. The loose path does not clamp,
+    /// which is why the two disagree for a name like `<40-hex>f`.
+    pub fn truncated(&self, hex_len: usize) -> Result<Self, Error> {
+        if hex_len >= self.hex_len {
+            Ok(*self)
+        } else {
+            Self::new(self.as_oid(), hex_len)
+        }
     }
 
     /// Create an instance from the given hexadecimal prefix `value`, e.g. `35e77c16` would yield a `Prefix` with `hex_len()` = 8.

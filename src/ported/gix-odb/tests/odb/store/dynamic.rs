@@ -867,6 +867,110 @@ mod lookup_prefix {
         assert_all_indices_loaded(&handle, 1, 2);
         Ok(())
     }
+
+    /// An object name of up to 64 hexadecimal characters is accepted whatever the repository's own
+    /// hash is - `git` bounds it by `GIT_MAX_HEXSZ`, not by `hash_algo->hexsz` - so
+    /// `Kind::from_hex_len` turns anything past 40 characters into a *sha256* prefix that is then
+    /// compared against sha1 object ids. Both stores have to survive that, and each answers the way
+    /// its counterpart in `git` does:
+    ///
+    /// - loose: `oidtree_each` gets the full typed length and compares it against an id that is
+    ///   zero-filled past its own width, so a 40-hex id followed by zeros still names it while any
+    ///   non-zero character past it does not.
+    /// - packed: `for_each_prefixed_object_in_pack` first clamps the length to the repository's own
+    ///   `hexsz`, so every character past the 40th is dropped and even a non-zero tail matches.
+    ///
+    /// Measured against `git version 2.55.0`. Before this was handled, every case below aborted the
+    /// process from inside `Prefix::cmp_oid` rather than answering at all.
+    #[test]
+    fn a_prefix_wider_than_the_object_hash_matches_the_way_git_matches() -> crate::Result {
+        let (mut handle, _tmp) = db_with_all_object_sources()?;
+        handle.refresh.never();
+
+        let ids: Vec<_> = handle.iter()?.map(Result::unwrap).collect();
+        assert!(ids.len() > 1, "the fixture has to hold objects to look up");
+
+        let mut matched_despite_a_non_zero_tail = 0;
+        for id in &ids {
+            let full_hex = id.to_hex().to_string();
+            assert_eq!(full_hex.len(), 40, "the fixture is a sha1 repository");
+
+            for extra in [1, 2, 3, 24] {
+                let padded = gix_hash::Prefix::from_hex(&format!("{full_hex}{}", "0".repeat(extra)))?;
+                assert_eq!(padded.hex_len(), 40 + extra);
+                assert_eq!(
+                    handle.lookup_prefix(padded, None)?,
+                    Some(Ok(*id)),
+                    "{padded} - trailing zeros land in the padding, so this still names the object"
+                );
+
+                let mut tail = "0".repeat(extra);
+                tail.replace_range(extra - 1..extra, "f");
+                let unpadded = gix_hash::Prefix::from_hex(&format!("{full_hex}{tail}"))?;
+                match handle.lookup_prefix(unpadded, None)? {
+                    None => {}
+                    Some(Ok(found)) => {
+                        assert_eq!(found, *id, "{unpadded} - a clamped prefix cannot name a different object");
+                        matched_despite_a_non_zero_tail += 1;
+                    }
+                    Some(Err(())) => unreachable!("{unpadded} - 40 hex characters are never ambiguous"),
+                }
+            }
+        }
+
+        assert!(
+            matched_despite_a_non_zero_tail > 0,
+            "the pack index has to be dropping the characters past the 40th, as git does - \
+             without that clamp being reached this test would only be exercising the loose store"
+        );
+        Ok(())
+    }
+
+    /// A partial clone names objects it does not have, so a *full-length* miss is offered to the
+    /// promisor hook rather than reported as unknown.
+    ///
+    /// "Full length" has to mean this store's own hash. `Kind::from_hex_len` calls anything from 41
+    /// to 64 characters a sha256 prefix, and `git` accepts such a name in a sha1 repository, so a
+    /// 64-character miss would otherwise be handed to the hook - and from there to a sha1 loose
+    /// store, which asserts on the width it is given - as a 32-byte id.
+    #[test]
+    fn only_a_full_length_id_of_this_stores_hash_reaches_the_promisor() -> crate::Result {
+        use std::sync::{Arc, Mutex};
+
+        let (handle, _tmp) = db_with_all_object_sources()?;
+        let asked_for: Arc<Mutex<Vec<gix_hash::ObjectId>>> = Arc::default();
+        let recorder = Arc::clone(&asked_for);
+        handle.store_ref().set_promisor(Box::new(move |ids| {
+            recorder.lock().expect("not poisoned").extend_from_slice(ids);
+            false
+        }));
+
+        let missing_40 = "abcdefabcdefabcdefabcdefabcdefabcdefabcd";
+        assert!(
+            handle.lookup_prefix(gix_hash::Prefix::from_hex(missing_40)?, None)?.is_none(),
+            "no object by that name is here"
+        );
+        assert_eq!(
+            asked_for.lock().expect("not poisoned").len(),
+            1,
+            "a full-length sha1 miss is what a partial clone can still obtain, so the hook is asked"
+        );
+
+        for hex_len in [41, 42, 64] {
+            let too_wide = format!("{missing_40}{}", "a".repeat(hex_len - 40));
+            assert!(
+                handle.lookup_prefix(gix_hash::Prefix::from_hex(&too_wide)?, None)?.is_none(),
+                "{too_wide} names nothing here either"
+            );
+        }
+        assert_eq!(
+            asked_for.lock().expect("not poisoned").len(),
+            1,
+            "but a name wider than this store's hash is not an id the remote could be asked for, \
+             so the hook is left alone and no over-wide id reaches the loose store"
+        );
+        Ok(())
+    }
 }
 
 #[test]

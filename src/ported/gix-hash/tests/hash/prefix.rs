@@ -93,6 +93,63 @@ mod cmp_oid {
         assert_eq!(prefix.cmp_oid(&sha256), Ordering::Equal);
         assert_eq!(prefix.to_string(), "a920bb");
     }
+
+    /// A hex length of 41 to 64 makes `Kind::from_hex_len` answer `Sha256`, so a name a user types
+    /// into a SHA-1 repository produces a 32-byte prefix compared against 20-byte object ids.
+    ///
+    /// `git` stores an object id in a fixed `hash[GIT_MAX_RAWSZ]` array that is zero past the
+    /// algorithm's own length, and `match_hash()` compares straight through that padding. So
+    /// `git rev-parse <40-hex-of-an-object>0` resolves to that object, while appending any non-zero
+    /// hex character does not, and the whole range up to 64 characters behaves the same way.
+    /// Measured against `git version 2.55.0`.
+    ///
+    /// Before this was handled, every one of these indexed past the end of the 20-byte candidate
+    /// and aborted the process.
+    #[test]
+    #[cfg(all(feature = "sha1", feature = "sha256"))]
+    fn a_prefix_wider_than_the_candidate_reads_the_padding_git_would_read() {
+        let id = hex_to_id("a920bbb055e1efb9080592a409d3975738b6efb3");
+        let full_hex = id.to_hex().to_string();
+
+        for extra in 1..=24 {
+            let zeros = "0".repeat(extra);
+            let prefix = gix_hash::Prefix::from_hex(&format!("{full_hex}{zeros}")).expect("41..=64 is in range");
+            assert_eq!(
+                prefix.hex_len(),
+                40 + extra,
+                "the prefix keeps the full width that was typed"
+            );
+            assert_eq!(
+                prefix.cmp_oid(&id),
+                Ordering::Equal,
+                "{extra} trailing zeros still name the object, as they do in git"
+            );
+
+            let mut nonzero = zeros.clone();
+            nonzero.replace_range(extra - 1..extra, "1");
+            let prefix = gix_hash::Prefix::from_hex(&format!("{full_hex}{nonzero}")).expect("41..=64 is in range");
+            assert_eq!(
+                prefix.cmp_oid(&id),
+                Ordering::Greater,
+                "a non-zero at position {} is past the object's own hash, so it cannot match",
+                40 + extra
+            );
+        }
+    }
+
+    /// The over-wide comparison has to stay a usable ordering, because `gix-pack` bisects a
+    /// pack index with it. Zero-extending every candidate to the prefix's width preserves the
+    /// order the index is sorted in, so the search still converges instead of walking off.
+    #[test]
+    #[cfg(all(feature = "sha1", feature = "sha256"))]
+    fn a_prefix_wider_than_the_candidate_still_orders_candidates() {
+        let low = hex_to_id("1111111111111111111111111111111111111111");
+        let high = hex_to_id("9999999999999999999999999999999999999999");
+        let prefix = gix_hash::Prefix::from_hex("5555555555555555555555555555555555555555000").expect("43 chars");
+
+        assert_eq!(prefix.cmp_oid(&low), Ordering::Greater);
+        assert_eq!(prefix.cmp_oid(&high), Ordering::Less);
+    }
 }
 
 mod new {

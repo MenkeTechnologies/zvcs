@@ -151,6 +151,7 @@ where
             &self.fan,
             &|idx| self.oid_at_index(idx),
             self.num_objects,
+            self.object_hash,
         )
     }
 
@@ -216,7 +217,17 @@ pub(crate) fn lookup_prefix<'a>(
     fan: &[u32; FAN_LEN],
     oid_at_index: &dyn Fn(EntryIndex) -> &'a gix_hash::oid,
     num_objects: u32,
+    object_hash: gix_hash::Kind,
 ) -> Option<PrefixLookupResult> {
+    // A name of up to 64 hex characters is accepted whatever this index's hash is, so it can be
+    // wider than the ids stored here. `git` drops the excess rather than comparing it, in
+    // `for_each_prefixed_object_in_pack`:
+    //     int len = opts->prefix_hex_len > p->repo->hash_algo->hexsz ?
+    //             p->repo->hash_algo->hexsz : opts->prefix_hex_len;
+    // Comparing the excess instead would make `<40-hex>f` miss a packed object that `git` finds.
+    let prefix = prefix
+        .truncated(object_hash.len_in_hex())
+        .expect("a hash width is between the 4 character minimum and the widest prefix there can be");
     let first_byte = prefix.as_oid().first_byte() as usize;
     let mut upper_bound = fan[first_byte];
     let mut lower_bound = if first_byte != 0 { fan[first_byte - 1] } else { 0 };

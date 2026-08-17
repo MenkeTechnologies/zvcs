@@ -286,9 +286,31 @@ impl Diff {
         // but the match counts that pass thresholds against are taken before any trimming
         // (`xdl_classify_record()` runs over every record in `xdl_prepare_ctx()`), so the
         // untrimmed sequences have to survive for `myers::diff` to classify against.
+        //
+        // git only trims for Myers. `xdl_trim_ends()` is reached exclusively through
+        // `xdl_optimize_ctxs()`, and `xdl_prepare_env()` skips that call for the two
+        // anchor-based algorithms (`xdiff/xprepare.c:460-462`, git 2.55.0):
+        //
+        //     if ((XDF_DIFF_ALG(xpp->flags) != XDF_PATIENCE_DIFF) &&
+        //         (XDF_DIFF_ALG(xpp->flags) != XDF_HISTOGRAM_DIFF) &&
+        //         xdl_optimize_ctxs(&cf, &xe->xdf1, &xe->xdf2) < 0) {
+        //
+        // Without the call `xdf->dstart`/`dend` keep the values `xdl_prepare_ctx()` gave
+        // them, `0` and `nrec - 1` (`xdiff/xprepare.c:176-177`), i.e. the whole file. That
+        // is not an optimization detail for these two: both decide what to anchor on by how
+        // often a line occurs *within the range they are handed* — patience wants lines
+        // unique in both files (`fill_hashmap()`), histogram the least frequent line
+        // (`scanA()`/`try_lcs()`). Trimming a shared prefix or suffix away removes those
+        // occurrences from the count, so lines that are not unique in the file become unique
+        // in the trimmed range, and the two algorithms anchor somewhere git never would.
         let (untrimmed_before, untrimmed_after) = (before, after);
-        let common_prefix = strip_common_prefix(&mut before, &mut after) as usize;
-        let common_postfix = strip_common_postfix(&mut before, &mut after);
+        let trim_ends = !matches!(algorithm, Algorithm::Patience | Algorithm::Histogram);
+        let (common_prefix, common_postfix) = if trim_ends {
+            let prefix = strip_common_prefix(&mut before, &mut after) as usize;
+            (prefix, strip_common_postfix(&mut before, &mut after))
+        } else {
+            (0, 0)
+        };
         let range = common_prefix..self.removed.len() - common_postfix as usize;
         let removed = &mut self.removed[range];
         let range = common_prefix..self.added.len() - common_postfix as usize;
@@ -364,6 +386,46 @@ impl Diff {
                 IndentLevel::for_ascii_line(input.interner[token].as_ref().iter().copied(), 8)
             }),
         )
+    }
+
+    /// Postprocesses the diff with git's own `xdl_change_compact()`, [`compact`].
+    ///
+    /// This is the alternative to [`postprocess_with`](Self::postprocess_with) and its
+    /// wrappers, which slide hunks the same way but stop there. `xdl_change_compact()` has
+    /// one step past the slide that only exists for [`Algorithm::Histogram`]: when shifting
+    /// merged two change groups, the combined group can contain lines that match in both
+    /// files even though neither original group did, and git re-diffs the merged group with
+    /// Myers to mark them unchanged again (`xdiff/xdiffi.c:940-958`, git 2.55.0):
+    ///
+    /// ```text
+    /// if (go.end != go.start &&
+    ///                 XDF_DIFF_ALG(flags) == XDF_HISTOGRAM_DIFF &&
+    ///                 (g.start != g_orig.start ||
+    ///                  g.end != g_orig.end)) {
+    ///         ...
+    ///         xpp.flags = flags & ~XDF_DIFF_ALGORITHM_MASK;
+    ///         ...
+    ///         if (xdl_fall_back_diff(&xe, &xpp,
+    ///                                g.start + 1, g.end - g.start,
+    ///                                go.start + 1, go.end - go.start)) {
+    /// ```
+    ///
+    /// Histogram's LCS is the only one that can leave such a group behind — Myers is already
+    /// minimal and patience anchors on unique lines that a group cannot be shifted across —
+    /// which is why git gates the re-diff on the algorithm rather than running it always.
+    ///
+    /// `indent_before`/`indent_after` are the indentation of the **original** records of the
+    /// two files, [`compact::get_indent`] per line: git's `get_indent()` reads
+    /// `xdf->recs[i]->ptr`, so under `-w` it measures the unstripped line while the tokens
+    /// compared here are the normalized ones. `None` is `XDF_INDENT_HEURISTIC` unset.
+    pub fn compact_with(
+        &mut self,
+        algorithm: Algorithm,
+        before: &[Token],
+        after: &[Token],
+        indents: Option<(&[i32], &[i32])>,
+    ) {
+        compact::compact_flags(&mut self.removed, &mut self.added, algorithm, before, after, indents);
     }
 
     /// Return an iterator that yields the changed hunks in this diff.

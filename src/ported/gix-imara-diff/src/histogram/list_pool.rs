@@ -62,6 +62,8 @@ pub struct ListHandle {
     index: u32,
     generation: u32,
     len: u32,
+    /// `rec->cnt`: every element ever pushed, including the ones past the stored [`len`].
+    count: u32,
 }
 
 /// Create an empty list.
@@ -71,11 +73,18 @@ impl Default for ListHandle {
             index: 0,
             generation: 0,
             len: 0,
+            count: 0,
         }
     }
 }
 
-const MAX_SIZE_CLASS: SizeClass = sclass_for_length(super::MAX_CHAIN_LEN - 1);
+/// The largest block a list can be reallocated into.
+///
+/// A list is allowed to grow to `MAX_CHAIN_LEN + 1` elements (see [`ListHandle::push`]), and
+/// the block it lives in is grown at every power-of-two length, so the last growth happens at
+/// `MAX_CHAIN_LEN` and asks for `sclass_for_length(MAX_CHAIN_LEN)`. Sizing the free lists off
+/// `MAX_CHAIN_LEN - 1` instead leaves that class without a free list to index.
+const MAX_SIZE_CLASS: SizeClass = sclass_for_length(super::MAX_CHAIN_LEN);
 const NUM_SIZE_CLASS: usize = MAX_SIZE_CLASS as usize + 1;
 
 /// A memory pool for storing lists of `T`.
@@ -206,6 +215,18 @@ impl ListHandle {
         }
     }
 
+    /// How many elements were pushed, whether or not they were stored.
+    ///
+    /// Cleared with the pool the same way [`len`](Self::len) is: the handles outlive
+    /// [`ListPool::clear`] and are recognized as stale by their generation.
+    pub fn count(&self, pool: &ListPool) -> u32 {
+        if self.generation == pool.generation {
+            self.count
+        } else {
+            0
+        }
+    }
+
     /// Get the list as a slice.
     pub fn as_slice<'a>(&'a self, pool: &'a ListPool) -> &'a [u32] {
         let idx = self.index as usize;
@@ -220,6 +241,10 @@ impl ListHandle {
     /// Returns the index where the element was inserted.
     pub fn push(&mut self, element: u32, pool: &mut ListPool) {
         let len = self.len(pool);
+        // `rec->cnt` counts every occurrence, capped at `MAX_CNT` (`xdiff/xhistogram.c:47`,
+        // `UINT_MAX`) — which is what a saturating add on `u32` gives — even once the list
+        // itself has stopped growing below.
+        self.count = if len == 0 { 1 } else { self.count.saturating_add(1) };
         match len {
             0 => {
                 self.generation = pool.generation;
@@ -250,8 +275,10 @@ impl ListHandle {
                 self.len += 1;
             }
 
-            // ignore elements longer then MAX_CHAIN_LEN
-            // these are rarely relevant and if they are we fall back to myers
+            // Past `MAX_CHAIN_LEN + 1` stored elements the list is never read: `try_lcs()`
+            // only walks the occurrences of a record whose `cnt` is at most `index->cnt`,
+            // which starts at `MAX_CHAIN_LEN + 1` and only ever decreases. `count` above
+            // keeps counting so that limit is still applied to the true number.
             _ => (),
         }
     }

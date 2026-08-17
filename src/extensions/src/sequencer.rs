@@ -258,15 +258,27 @@ pub fn prepare_revs<S: AsRef<str>>(
         // [`crate::objname::dotdot`] is that function; what is left here is only
         // what the sequencer does with each of its three answers.
         if let Some(range) = crate::objname::split_range(spec) {
+            // The two `get_oid_with_context()` calls at the top of
+            // `handle_dotdot_1()` are the range's only resolution in this pass,
+            // and the `||` between them short-circuits — which is why
+            // `<nosuch>..<40-hex-ref>` is silent while `<40-hex-ref>..<nosuch>`
+            // warns once. [`crate::objname::dotdot`] is deliberately quiet (it is
+            // asked twice per operand here), so the warning is taken separately.
+            crate::objname::warn_dotdot_endpoints(repo, spec);
             match crate::objname::dotdot(repo, spec) {
                 // `<a>...<b>`: both tips, with their merge bases excluded. The
                 // merge bases take `flags_exclude`, both tips take `flags`.
                 crate::objname::Dotdot::Ok { a, b } if range.symmetric => {
                     for base in repo.merge_bases_many(a, &[b])? {
-                        pending.add(base.detach(), !state.uninteresting);
+                        // `add_pending_commit_list()` names a merge base by its
+                        // own `oid_to_hex()`, so it is always a full-length hex
+                        // and always earns the second-pass warning in a
+                        // repository that has a ref by that name.
+                        let base = base.detach();
+                        pending.add(base, &base.to_string(), !state.uninteresting);
                     }
-                    pending.add(a, state.uninteresting);
-                    pending.add(b, state.uninteresting);
+                    pending.add(a, range.a, state.uninteresting);
+                    pending.add(b, range.b, state.uninteresting);
                 }
                 // `<a>..<b>`: everything `<b>` reaches that `<a>` does not. This
                 // form only `parse_object()`s its endpoints, so a non-commit one
@@ -275,8 +287,8 @@ pub fn prepare_revs<S: AsRef<str>>(
                 crate::objname::Dotdot::Ok { a, b } => {
                     match (peel_id(repo, a), peel_id(repo, b)) {
                         (Side::Commit(from), Side::Commit(to)) => {
-                            pending.add(from, !state.uninteresting);
-                            pending.add(to, state.uninteresting);
+                            pending.add(from, range.a, !state.uninteresting);
+                            pending.add(to, range.b, state.uninteresting);
                         }
                         (Side::NotACommit(kind), _) => {
                             return Ok(Revs::NotACommit { name: range.a.to_owned(), kind })
@@ -320,57 +332,90 @@ pub fn prepare_revs<S: AsRef<str>>(
             _ => (spec, state.uninteresting),
         };
 
+        // The name every resolution of this operand is actually handed, and the
+        // name each pending entry it queues is recorded under: the operand minus
+        // its `^@`/`^!`/`^-<n>` mark and minus the leading `^`, since
+        // `add_parents_only()` strips one of its own from what it was given.
+        let base = crate::objname::uninteresting_mark(crate::objname::parents_only_base(spec)).0;
+        let marked = base.len() != word.len();
+
         // A full-length hex the repository does not have resolves anyway, so git
         // gets as far as `get_reference()` and dies there naming the object
         // rather than the operand. `gix`'s parser consults the odb, so without
         // this the same operand would come back as a bad revision — the
         // divergence this whole module exists to close.
         if let Some(name) = crate::objname::bad_object_name(repo, spec) {
+            // `get_oid_with_context()` decoded it and warned before
+            // `get_reference()` died on it, so the warning still comes out.
+            crate::objname::warn_ambiguous_refname(repo, name);
             return Ok(Revs::BadObject(name.to_owned()));
         }
 
         let Ok(parsed) = repo.rev_parse(word) else {
             return Ok(Revs::BadRevision(spec.to_owned()));
         };
+        // `handle_revision_arg_1()` resolves one operand once or twice, and the
+        // parse above is what says which. A mark hands its base to
+        // `add_parents_only()`, whose first act is `repo_get_oid_committish(arg)`;
+        // `^@` then makes the function return outright, while `^!` and `^-<n>`
+        // put the base back into `arg` and fall through to the function's own
+        // `get_oid_with_context(arg)`. Every one of those calls is handed the
+        // same string, so only the *count* is observable — which is why it is
+        // taken from the outcome here rather than from a second guess at whether
+        // `add_parents_only()` would have succeeded (an `^-<n>` past the parent
+        // count, for one, resolves once and not twice).
+        let warn_resolutions = |n: usize| {
+            for _ in 0..n {
+                crate::objname::warn_ambiguous_refname(repo, base);
+            }
+        };
         match *parsed {
-            gix::revision::plumbing::Spec::Include(id) => match peel_id(repo, id) {
-                Side::Commit(id) => pending.add_rev(id, uninteresting),
-                Side::NotACommit(kind) => {
-                    return Ok(Revs::NotACommit { name: spec.to_owned(), kind })
+            gix::revision::plumbing::Spec::Include(id) => {
+                warn_resolutions(1);
+                match peel_id(repo, id) {
+                    Side::Commit(id) => pending.add_rev(id, word, uninteresting),
+                    Side::NotACommit(kind) => {
+                        return Ok(Revs::NotACommit { name: spec.to_owned(), kind })
+                    }
+                    Side::Unresolved => return Ok(Revs::BadRevision(spec.to_owned())),
                 }
-                Side::Unresolved => return Ok(Revs::BadRevision(spec.to_owned())),
-            },
+            }
             // `gix` reports a leading `^` itself when the word survived the strip
             // above — an operand that is nothing but `^`.
-            gix::revision::plumbing::Spec::Exclude(id) => match peel_id(repo, id) {
-                Side::Commit(id) => pending.add_rev(id, !uninteresting),
-                Side::NotACommit(kind) => {
-                    return Ok(Revs::NotACommit { name: spec.to_owned(), kind })
+            gix::revision::plumbing::Spec::Exclude(id) => {
+                warn_resolutions(1);
+                match peel_id(repo, id) {
+                    Side::Commit(id) => pending.add_rev(id, word, !uninteresting),
+                    Side::NotACommit(kind) => {
+                        return Ok(Revs::NotACommit { name: spec.to_owned(), kind })
+                    }
+                    Side::Unresolved => return Ok(Revs::BadRevision(spec.to_owned())),
                 }
-                Side::Unresolved => return Ok(Revs::BadRevision(spec.to_owned())),
-            },
+            }
             // `<a>^!`: `<a>` itself, with everything its parents reach excluded.
             // `add_parents_only()` queues the parents first and `<a>` is added
             // afterwards from the trimmed argument, which is the order git's
             // `pending` ends up in.
             gix::revision::plumbing::Spec::ExcludeParents(id) => {
+                warn_resolutions(2);
                 let Side::Commit(id) = peel_id(repo, id) else {
                     return Ok(Revs::BadRevision(spec.to_owned()));
                 };
                 for parent in repo.find_commit(id)?.parent_ids() {
-                    pending.add(parent.detach(), !uninteresting);
+                    pending.add(parent.detach(), base, !uninteresting);
                 }
-                pending.add_rev(id, uninteresting);
+                pending.add_rev(id, base, uninteresting);
             }
             // `<a>^@`: every parent of `<a>`, but not `<a>`. `add_parents_only()`
             // succeeded, so `handle_revision_arg_1` returns before `<a>` is ever
             // added and every entry is a `REV_CMD_PARENTS_ONLY` one.
             gix::revision::plumbing::Spec::IncludeOnlyParents(id) => {
+                warn_resolutions(1);
                 let Side::Commit(id) = peel_id(repo, id) else {
                     return Ok(Revs::BadRevision(spec.to_owned()));
                 };
                 for parent in repo.find_commit(id)?.parent_ids() {
-                    pending.add(parent.detach(), uninteresting);
+                    pending.add(parent.detach(), base, uninteresting);
                 }
             }
             // `<a>^-<n>`: parent `<n>` of `<a>` excluded, `<a>` itself included —
@@ -379,14 +424,19 @@ pub fn prepare_revs<S: AsRef<str>>(
             // `<a>^<n>..<a>`, and rejects the spellings git rejects: `^-0`, a
             // non-numeric suffix, and an `<n>` past the parent count all come
             // back as a bad revision.
+            //
+            // `marked` separates it from a `<a>..<b>` this branch can never see —
+            // the textual split above already claimed those — so the mark is what
+            // the two resolutions are counted for.
             gix::revision::plumbing::Spec::Range { from, to } => {
+                warn_resolutions(if marked { 2 } else { 1 });
                 let (Side::Commit(from), Side::Commit(to)) =
                     (peel_id(repo, from), peel_id(repo, to))
                 else {
                     return Ok(Revs::BadRevision(spec.to_owned()));
                 };
-                pending.add(from, !uninteresting);
-                pending.add_rev(to, uninteresting);
+                pending.add(from, base, !uninteresting);
+                pending.add_rev(to, base, uninteresting);
             }
             // `<a>...<b>` is split textually above, so `gix` can only produce
             // this for an operand that reached neither branch, which it cannot.
@@ -400,7 +450,13 @@ pub fn prepare_revs<S: AsRef<str>>(
         return Ok(Revs::UnknownOption);
     }
 
-    let Pending { mut include, exclude, walked, cmdline, plain } = pending;
+    let Pending { mut include, exclude, walked, cmdline, plain, names } = pending;
+
+    // `setup_revisions()` has returned, `builtin/revert.c`'s `argc > 1` usage
+    // check (129, above) has passed, and `run_sequencer()` is now in
+    // `sequencer_pick_revisions()` — whose first act is to resolve every queued
+    // name a second time.
+    warn_pending_names(repo, &names);
 
     if !walked {
         // `add_pending_object()` sets `SEEN`, so an operand named twice is
@@ -453,24 +509,77 @@ struct Pending {
     /// `git cherry-pick --tags` writes a `.git/sequencer` even in a repository
     /// with exactly one tag.
     plain: usize,
+    /// `revs->pending.objects[i].name`, in queue order — the *second* argument
+    /// of every `add_pending_object()`.
+    ///
+    /// git keeps it because `sequencer_pick_revisions()` resolves it all over
+    /// again (see [`warn_pending_names`]), and it is not always the operand as
+    /// typed: `handle_dotdot_1()` queues the two endpoints under the halves it
+    /// split, `add_parents_only()` queues every parent under the *base* name, and
+    /// `add_pending_commit_list()` — the merge bases of `<a>...<b>` — queues them
+    /// under `oid_to_hex()`, a full-length hex every time.
+    names: Vec<String>,
 }
 
 impl Pending {
     /// `add_rev_cmdline(…, REV_CMD_REV, …)` + `add_pending_object()`.
-    fn add_rev(&mut self, id: ObjectId, uninteresting: bool) {
-        self.add(id, uninteresting);
+    fn add_rev(&mut self, id: ObjectId, name: &str, uninteresting: bool) {
+        self.add(id, name, uninteresting);
         self.plain += 1;
     }
 
     /// `add_pending_object()` under any other whence.
-    fn add(&mut self, id: ObjectId, uninteresting: bool) {
+    fn add(&mut self, id: ObjectId, name: &str, uninteresting: bool) {
         self.cmdline += 1;
+        self.names.push(name.to_owned());
         if uninteresting {
             self.exclude.push(id);
             self.walked = true;
         } else {
             self.include.push(id);
         }
+    }
+}
+
+/// `sequencer_pick_revisions()`'s opening loop (`sequencer.c:5549-5569`), which
+/// resolves every queued name a *second* time:
+///
+/// ```c
+/// for (i = 0; i < opts->revs->pending.nr; i++) {
+///         struct object_id oid;
+///         const char *name = opts->revs->pending.objects[i].name;
+///
+///         /* This happens when using --stdin. */
+///         if (!strlen(name))
+///                 continue;
+///
+///         if (!repo_get_oid(r, name, &oid)) {
+///                 if (!lookup_commit_reference_gently(r, &oid, 1)) { … }
+///         } else {
+///                 res = error(_("%s: bad revision"), name);
+///                 goto out;
+///         }
+/// }
+/// ```
+///
+/// `repo_get_oid()` is another trip through `get_oid_basic()`, so this is why
+/// `cherry-pick` and `revert` warn *twice* about a 40-hex operand where a command
+/// that resolves its operands once — `merge-tree`, `bisect start` — warns once:
+/// `setup_revisions()` did the first pass, this is the second. The count follows
+/// the pending list rather than the command line, which is what makes
+/// `git cherry-pick <a>..<b>` four warnings (two endpoints, twice) and
+/// `git cherry-pick <a>^@` only one (`add_parents_only()` claimed the operand, so
+/// `handle_revision_arg_1()` returned before its own resolution).
+///
+/// It runs before the `single_pick()`/sequencer split and before any of the
+/// errors above, which is observable: `git cherry-pick <tree-40-hex> <commit>`
+/// warns about the tree and *then* refuses it.
+///
+/// Only the warning is reproduced here. The type check beside it is
+/// [`prepare_revs`]'s job, which makes it during the walk rather than after it.
+fn warn_pending_names(repo: &gix::Repository, names: &[String]) {
+    for name in names.iter().filter(|name| !name.is_empty()) {
+        crate::objname::warn_ambiguous_refname(repo, name);
     }
 }
 
@@ -547,7 +656,7 @@ fn pseudo_opt(
             // nothing and adds nothing, as `refs_read_ref_full()` fails for it.
             if let Some(id) = repo.head_id().ok().map(|id| id.detach()) {
                 match peel_id(repo, id) {
-                    Side::Commit(id) => pending.add(id, state.uninteresting),
+                    Side::Commit(id) => pending.add(id, "HEAD", state.uninteresting),
                     Side::NotACommit(kind) => {
                         return Ok(Pseudo::NotACommit { name: "HEAD".into(), kind })
                     }
@@ -569,7 +678,7 @@ fn pseudo_opt(
                         continue;
                     };
                     match peel_id(repo, id) {
-                        Side::Commit(id) => pending.add(id, state.uninteresting),
+                        Side::Commit(id) => pending.add(id, &name, state.uninteresting),
                         Side::NotACommit(kind) => {
                             return Ok(Pseudo::NotACommit { name, kind })
                         }
@@ -687,7 +796,9 @@ fn handle_refs(
             },
         };
         match peel_id(repo, id) {
-            Side::Commit(id) => pending.add(id, state.uninteresting),
+            // `handle_one_ref()` queues the ref under the name the iterator gave
+            // its callback, which is the one the prefix was trimmed off.
+            Side::Commit(id) => pending.add(id, &name, state.uninteresting),
             Side::NotACommit(kind) => return Ok(Some((name, kind))),
             Side::Unresolved => continue,
         }
@@ -740,7 +851,12 @@ fn ref_excluded(excludes: &[String], name: &str) -> bool {
 /// What one revision word resolved to. Every caller supplies the *name* to
 /// quote itself, because git's diagnostics quote the operand as written and the
 /// spelling that reached this point has usually been trimmed.
-enum Side {
+///
+/// Shared with `blame`, whose `find_single_final()` draws the same three-way
+/// distinction — a commit, a queued object that is not commit-ish
+/// (`fatal: Non commit <name>?`), and a name that never resolved
+/// (`fatal: bad revision '<name>'`) — off the same `deref_tag()`.
+pub enum Side {
     Commit(ObjectId),
     /// The object is present but nothing commit-ish is behind it.
     NotACommit(gix::object::Kind),
@@ -749,7 +865,7 @@ enum Side {
 
 /// `lookup_commit_reference_gently()`: peel tags through to the commit, and
 /// report the object's own type when there is none.
-fn peel_id(repo: &gix::Repository, id: ObjectId) -> Side {
+pub fn peel_id(repo: &gix::Repository, id: ObjectId) -> Side {
     let Ok(object) = repo.find_object(id) else {
         return Side::Unresolved;
     };
@@ -1172,6 +1288,98 @@ pub fn post_commit_cleanup(repo: &gix::Repository) -> Result<()> {
     }
     remove_state(git_dir);
     Ok(())
+}
+
+/// git's `print_advice()` (`sequencer.c:518-564`), the one place a stopped
+/// cherry-pick or revert says how to resolve the conflict:
+///
+/// ```c
+/// if (is_rebase_i(opts))
+///         msg = rebase_resolvemsg;
+/// else
+///         msg = getenv("GIT_CHERRY_PICK_HELP");
+///
+/// if (msg) {
+///         advise_if_enabled(ADVICE_MERGE_CONFLICT, "%s", msg);
+///         /*
+///          * A conflict has occurred but the porcelain
+///          * (typically rebase --interactive) wants to take care
+///          * of the commit itself so remove CHERRY_PICK_HEAD
+///          */
+///         refs_delete_ref(get_main_ref_store(r), "", "CHERRY_PICK_HEAD",
+///                         NULL, REF_NO_DEREF);
+///         return;
+/// }
+///
+/// if (show_hint) {
+///         if (opts->no_commit)
+///                 advise_if_enabled(ADVICE_MERGE_CONFLICT,
+///                                   _("after resolving the conflicts, mark the corrected paths\n"
+///                                     "with 'git add <paths>' or 'git rm <paths>'"));
+///         else if (opts->action == REPLAY_PICK)
+///                 advise_if_enabled(ADVICE_MERGE_CONFLICT,
+///                                   _("After resolving the conflicts, mark them with\n"
+///                                     "\"git add/rm <pathspec>\", then run\n"
+///                                     "\"git cherry-pick --continue\".\n"
+///                                     "You can instead skip this commit with \"git cherry-pick --skip\".\n"
+///                                     "To abort and get back to the state before \"git cherry-pick\",\n"
+///                                     "run \"git cherry-pick --abort\"."));
+///         else if (opts->action == REPLAY_REVERT)
+///                 advise_if_enabled(ADVICE_MERGE_CONFLICT, … /* the same, spelled "revert" */);
+///         else
+///                 BUG("unexpected pick action in print_advice()");
+/// }
+/// ```
+///
+/// Three things this encodes that a hand-written hint block at a call site keeps
+/// getting wrong, and which is why it lives here rather than in either command:
+///
+/// * **`GIT_CHERRY_PICK_HELP` outranks everything**, `--no-commit` included, and
+///   it is a `getenv() != NULL` test — an empty value still wins and still
+///   prints (an empty `hint:` line). The porcelain that sets it is taking over
+///   the commit, which is why the same branch deletes `CHERRY_PICK_HEAD`: the
+///   variable is how `rebase --interactive` used to reach this function before
+///   `is_rebase_i()` did, and the deletion is what stops `git status` from
+///   claiming a cherry-pick is in progress. `REVERT_HEAD` is deliberately not
+///   touched — only the one ref is named.
+/// * **`no_commit` outranks the action.** The `--no-commit` test comes *first*,
+///   so `cherry-pick -n` and `revert -n` both print the lowercase two-line
+///   variant — the one that names no `--continue`, because with no commit
+///   pending there is no sequence to continue. Only a committing pick reaches
+///   the six-line per-action variant.
+/// * **Every branch is `advise_if_enabled()`, never plain `advise()`**, so all
+///   three carry the `Disable this message with "git config set
+///   advice.mergeConflict false"` trailer while the slot is unconfigured — and
+///   drop it the moment the user sets `advice.mergeConflict` either way
+///   (`vadvise`'s `display_instructions` is `!advice_setting[type].level`).
+///
+/// `show_hint` is the caller's `res == 1` (`sequencer.c:2520`): a merge that
+/// reported conflicts, not a strategy that refused outright.
+pub fn print_advice(repo: &gix::Repository, action: Action, no_commit: bool) {
+    // `is_rebase_i(opts)` cannot be true here: this port's rebase engine prints
+    // `rebase_resolvemsg` itself and never routes through the sequencer's
+    // cherry-pick path, so the first branch reduces to the environment override.
+    if let Some(msg) = std::env::var_os("GIT_CHERRY_PICK_HELP") {
+        crate::advice::Advice::MergeConflict.advise_in(repo, &msg.to_string_lossy());
+        delete_state_ref(repo, "CHERRY_PICK_HEAD");
+        return;
+    }
+    let name = action.name();
+    let body = if no_commit {
+        "after resolving the conflicts, mark the corrected paths\n\
+         with 'git add <paths>' or 'git rm <paths>'"
+            .to_string()
+    } else {
+        format!(
+            "After resolving the conflicts, mark them with\n\
+             \"git add/rm <pathspec>\", then run\n\
+             \"git {name} --continue\".\n\
+             You can instead skip this commit with \"git {name} --skip\".\n\
+             To abort and get back to the state before \"git {name}\",\n\
+             run \"git {name} --abort\"."
+        )
+    };
+    crate::advice::Advice::MergeConflict.advise_in(repo, &body);
 }
 
 /// `refs_delete_ref(…, REF_NO_DEREF)` for a root-level pseudo-ref, reporting

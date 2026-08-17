@@ -122,9 +122,31 @@ impl LcsSearch {
                 };
             }
 
+            // Move on to the first occurrence of the token that the region just measured does
+            // not already cover, `xdiff/xdiffi.c`'s sibling in `try_lcs()`
+            // (`xdiff/xhistogram.c:207-217`, git 2.55.0):
+            //
+            //     if (np == 0)
+            //             break;
+            //
+            //     while (np <= ae) {
+            //             np = NEXT_PTR(index, np);
+            //             if (np == 0) {
+            //                     should_break = 1;
+            //                     break;
+            //             }
+            //     }
+            //
+            // `np` walks the occurrence chain of the *before* file and `ae` is the last
+            // before-side line of the region, so the skip is bounded by `end1` — the
+            // exclusive form of `ae` — and not by `end2`, which indexes the other file
+            // entirely. The two differ by however far the region's two halves sit apart, so
+            // comparing against `end2` skips occurrences git still examines whenever the
+            // after side runs ahead, and re-examines ones git has already covered when it
+            // lags.
             loop {
                 if let Some(next_token_idx) = occurrences_iter.next() {
-                    if next_token_idx > end2 {
+                    if next_token_idx >= end1 {
                         token_idx1 = next_token_idx;
                         break;
                     }

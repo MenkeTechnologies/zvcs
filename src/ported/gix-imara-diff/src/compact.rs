@@ -59,7 +59,7 @@ fn is_space(c: u8) -> bool {
 /// `get_indent()`: the indentation of `line`, a tab counting to the next multiple of 8.
 ///
 /// `-1` if the line is empty or contains only whitespace; clamped at [`MAX_INDENT`].
-fn get_indent(line: &[u8]) -> i32 {
+pub fn get_indent(line: &[u8]) -> i32 {
     let mut ret = 0;
     for &c in line {
         if !is_space(c) {
@@ -356,31 +356,55 @@ pub fn change_compact(
 ) -> Changed {
     let mut removed: Vec<bool> = (0..before.len() as u32).map(|i| diff.is_removed(i)).collect();
     let mut added: Vec<bool> = (0..after.len() as u32).map(|i| diff.is_added(i)).collect();
+    compact_flags(
+        &mut removed,
+        &mut added,
+        algorithm,
+        before,
+        after,
+        Some((indent_before, indent_after)),
+    );
+    Changed { removed, added }
+}
 
+/// [`change_compact`] against flag arrays that are already laid out the way
+/// `xdfenv_t` holds them, rewriting them in place.
+///
+/// `indents` carries `XDF_INDENT_HEURISTIC`: `Some` supplies the indentation of the
+/// *original* records of both files and enables the split scoring, `None` is git's
+/// unset flag, where a slidable pure add/delete group simply stays as far down as
+/// `group_slide_down()` pushed it (`xdiff/xdiffi.c:876` guards the whole scoring
+/// branch with `flags & XDF_INDENT_HEURISTIC`).
+pub fn compact_flags(
+    removed: &mut Vec<bool>,
+    added: &mut Vec<bool>,
+    algorithm: Algorithm,
+    before: &[Token],
+    after: &[Token],
+    indents: Option<(&[i32], &[i32])>,
+) {
     compact_one(
         Sides {
-            removed: &mut removed,
-            added: &mut added,
+            removed,
+            added,
             before,
             after,
         },
         Side::Before,
-        indent_before,
+        indents.map(|(b, _)| b),
         algorithm,
     );
     compact_one(
         Sides {
-            removed: &mut removed,
-            added: &mut added,
+            removed,
+            added,
             before,
             after,
         },
         Side::After,
-        indent_after,
+        indents.map(|(_, a)| a),
         algorithm,
     );
-
-    Changed { removed, added }
 }
 
 /// Which of the two files a `xdl_change_compact()` pass is compacting.
@@ -410,7 +434,7 @@ impl Sides<'_> {
 
 /// One `xdl_change_compact(xdf, xdfo, flags)` call: compact the groups of the file at `side` in
 /// place, walking the other file alongside it.
-fn compact_one(mut f: Sides<'_>, side: Side, indents: &[i32], algorithm: Algorithm) {
+fn compact_one(mut f: Sides<'_>, side: Side, indents: Option<&[i32]>, algorithm: Algorithm) {
     let mut g = group_init(f.this(side).0);
     let mut go = group_init(f.other(side));
 
@@ -474,7 +498,7 @@ fn compact_one(mut f: Sides<'_>, side: Side, indents: &[i32], algorithm: Algorit
                     let ok = group_previous(f.other(side), &mut go);
                     debug_assert!(ok, "BUG: group sync broken sliding to match");
                 }
-            } else {
+            } else if let Some(indents) = indents {
                 // A pure add/delete group implies two splits, one above it and one below it. Score
                 // every position the group can be shifted to and take the least bad one.
                 let mut best_shift = None;

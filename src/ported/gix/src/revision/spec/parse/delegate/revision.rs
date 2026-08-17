@@ -252,6 +252,22 @@ impl delegate::Revision for Delegate<'_> {
             },
             Some(r) => r.clone().attach(self.repo),
         };
+        // `branch_get(NULL)` and `branch_get("HEAD")` are the same lookup in git
+        // (`remote.c`), so `HEAD@{u}` asks about the branch HEAD points at rather
+        // than about a branch literally called `HEAD` — which has no
+        // `branch.HEAD.remote` and would otherwise fail here. This is the same
+        // resolution the `None` arm above performs for a bare `@{u}`.
+        let reference = if reference.name().as_bstr() == "HEAD" {
+            match self.repo.head().map(crate::Head::try_into_referent) {
+                Ok(Some(r)) => r,
+                Ok(None) => {
+                    return Err(message("Unborn heads cannot have push or upstream tracking branches").raise_erased());
+                }
+                Err(err) => return Err(err.raise_erased()),
+            }
+        } else {
+            reference
+        };
         let direction = match kind {
             SiblingBranch::Upstream => remote::Direction::Fetch,
             SiblingBranch::Push => remote::Direction::Push,

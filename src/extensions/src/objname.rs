@@ -37,8 +37,14 @@
 //! — the two hand-written copies this module replaced had already drifted apart
 //! in the order they tried the two resolvers.
 //!
-//! `get_oid_hex()` accepts either case (`hexval()` is case-insensitive) while
-//! `ObjectId::from_hex` wants lowercase, which is why the name is folded first.
+//! `get_oid_hex()` accepts either case, because `hexval()` reads `A`-`F` as well
+//! as `a`-`f`. So does `ObjectId::from_hex` as it stands — it decodes through
+//! `faster_hex::hex_decode`, which is `hex_decode_with_case(…, CheckCase::None)`
+//! (`faster-hex-0.10.0/src/decode.rs:215-217,25-26`). The fold below is
+//! therefore not a fix for a rejection; it pins the case policy to this module
+//! instead of to a transitive dependency's default, so an operand spelled in
+//! upper case cannot start resolving differently because a crate changed its
+//! mind about `CheckCase`.
 
 use crate::advice::Advice;
 use gix::hash::ObjectId;
@@ -202,19 +208,62 @@ pub fn warn_ambiguous_refname(repo: &gix::Repository, name: &str) -> bool {
 /// `@{…}` is deliberately not peeled: a reflog spelling keeps its full length, so
 /// `get_oid_basic()`'s first branch is *not* the one it takes — it falls through
 /// to the reflog handling and to the second, differently-gated warning below it.
+///
+/// The exclusion mark is **not** stripped, and that is the whole distinction
+/// between the two functions that read an object name. `arg++` past a leading `^`
+/// belongs to `handle_revision_arg_1()` (`revision.c`), which only a *revision
+/// walk* goes through:
+///
+/// ```c
+/// if (*arg == '^') {
+///         local_flags = UNINTERESTING | BOTTOM;
+///         arg++;
+/// }
+/// ```
+///
+/// `repo_get_oid()` has no such line, so a command that reaches it directly hands
+/// `get_oid_basic()` the caret as well — one character too many for the full-hex
+/// branch, and therefore silent. Stock 2.55.0 says nothing for
+/// `git cat-file -t ^<40-hex-ref>`, `git name-rev ^<40-hex-ref>` or
+/// `git cherry HEAD ^<40-hex-ref>` while `git rev-list ^<40-hex-ref>` warns once.
+/// Stripping here made every one of those commands over-warn.
+///
+/// A walker therefore does the strip itself, at the point where the C does, and
+/// asks about what is left — [`uninteresting_mark`] is that strip.
 fn ambiguity_base(spec: &str) -> &str {
-    // `handle_revision_arg_1()` strips the exclusion mark before resolving.
-    let mut base = spec.strip_prefix('^').filter(|rest| !rest.is_empty()).unwrap_or(spec);
     // `cp = strchr(name, ':')`, with the empty left side left alone — `:/text`
     // and `:<path>` are their own forms and never reach `get_oid_basic()`.
-    if let Some(at) = base.find(':').filter(|at| *at > 0) {
-        base = &base[..at];
-    }
+    let base = match spec.find(':').filter(|at| *at > 0) {
+        Some(at) => &spec[..at],
+        None => spec,
+    };
+    strip_navigation(base)
+}
+
+/// The suffix reduction `get_oid_1()` and `peel_onion()` run between them, taken
+/// to a fixed point: the name `get_oid_basic()` is finally handed.
+///
+/// Shared by [`ambiguity_base`], which needs it to name the right thing in a
+/// warning, and by [`get_oid_1_has_no_case`], which needs it to decide whether
+/// git would have resolved the operand at all. The two differ only in what they
+/// hand it: `ambiguity_base` reproduces `handle_revision_arg_1()`'s plain
+/// `strchr(name, ':')` while [`object_part`] reproduces the bracket-aware split
+/// `get_oid_with_context_1()` actually uses.
+///
+/// A `^{…}` group is only cut when [`peel_onion_type`] recognises what is inside
+/// it. `peel_onion()` returns -1 for anything else, and `get_oid_1()` then hands
+/// `get_oid_basic()` the operand **whole** — so `<40-hex>^{bogus}` and
+/// `<40-hex>^{{commit}}` are measured at their full length, miss the full-hex
+/// branch and are silent in stock 2.55.0. Cutting the group unconditionally made
+/// them warn.
+fn strip_navigation(mut base: &str) -> &str {
     loop {
         // `peel_onion()`: at least four characters, ending in `}`, and the
         // *rightmost* `{` whose predecessor is `^` opens the type name.
         if base.len() >= 4 && base.ends_with('}') {
-            if let Some(at) = base.rfind("^{").filter(|at| *at > 0) {
+            if let Some(at) =
+                base.rfind("^{").filter(|at| *at > 0 && peel_onion_type(&base[at + 2..]))
+            {
                 base = &base[..at];
                 continue;
             }
@@ -227,6 +276,116 @@ fn ambiguity_base(spec: &str) -> &str {
             None => return base,
         }
     }
+}
+
+/// `peel_onion()`'s type-name table (`object-name.c:936-951`), asked of the text
+/// that follows `^{`:
+///
+/// ```c
+/// sp++; /* beginning of type name, or closing brace for empty */
+/// if (starts_with(sp, "commit}"))       expected_type = OBJ_COMMIT;
+/// else if (starts_with(sp, "tag}"))     expected_type = OBJ_TAG;
+/// else if (starts_with(sp, "tree}"))    expected_type = OBJ_TREE;
+/// else if (starts_with(sp, "blob}"))    expected_type = OBJ_BLOB;
+/// else if (starts_with(sp, "object}"))  expected_type = OBJ_ANY;
+/// else if (sp[0] == '}')                expected_type = OBJ_NONE;
+/// else if (sp[0] == '/')                expected_type = OBJ_COMMIT;
+/// else return -1;
+/// ```
+///
+/// `starts_with` and not an equality test, which is observable: `^{commit}}`
+/// peels while `^{{commit}}` does not, because the backward scan for the opening
+/// brace demands a `^` immediately before it and so lands on the outer pair.
+fn peel_onion_type(after_brace: &str) -> bool {
+    ["commit}", "tag}", "tree}", "blob}", "object}"]
+        .iter()
+        .any(|kind| after_brace.starts_with(kind))
+        || after_brace.starts_with('}')
+        || after_brace.starts_with('/')
+}
+
+/// The `<object>` half of an operand, as `get_oid_with_context_1()` finds it
+/// (`object-name.c:1821-1830`):
+///
+/// ```c
+/// for (cp = name, bracket_depth = 0; *cp; cp++) {
+///         if (strchr("@^", *cp) && cp[1] == '{') {
+///                 cp++;
+///                 bracket_depth++;
+///         } else if (bracket_depth && *cp == '}') {
+///                 bracket_depth--;
+///         } else if (!bracket_depth && *cp == ':') {
+///                 break;
+///         }
+/// }
+/// ```
+///
+/// The scan counts braces, so the `:` in `<rev>^{/a:b}` is part of the search
+/// pattern and only an unbracketed one ends the revision — which is the one place
+/// this differs from [`ambiguity_base`]'s plain `strchr`.
+///
+/// A leading `:` yields the empty string: `:<path>`, `:<n>:<path>` and
+/// `:/<text>` are handled by `get_oid_with_context_1()` itself (the `name[0] ==
+/// ':'` branch at `object-name.c:1758`), so `get_oid_1()` decides nothing about
+/// them and the caret rule below must not either — `git rev-parse :/^two`
+/// resolves in stock 2.55.0 despite the `^`.
+fn object_part(name: &str) -> &str {
+    let b = name.as_bytes();
+    let mut depth = 0usize;
+    let mut i = 0;
+    while i < b.len() {
+        if matches!(b[i], b'@' | b'^') && b.get(i + 1) == Some(&b'{') {
+            i += 1;
+            depth += 1;
+        } else if depth > 0 && b[i] == b'}' {
+            depth -= 1;
+        } else if depth == 0 && b[i] == b':' {
+            return &name[..i];
+        }
+        i += 1;
+    }
+    name
+}
+
+/// Whether `get_oid_1()` (`object-name.c:1084-1142`) has no case for `spec` at
+/// all, so `repo_get_oid()` fails on it however the repository is shaped.
+///
+/// `get_oid_1()` reads a `^` in exactly two ways and no others:
+///
+/// ```c
+/// for (cp = name + len - 1; name <= cp; cp--) {
+///         int ch = *cp;
+///         if ('0' <= ch && ch <= '9')
+///                 continue;
+///         if (ch == '~' || ch == '^')
+///                 has_suffix = ch;
+///         break;
+/// }
+/// …
+/// ret = peel_onion(r, name, len, oid, lookup_flags);
+/// ```
+///
+/// — a trailing `~<n>`/`^<n>` it strips before recursing, and a `^{…}` group
+/// `peel_onion()` cuts. [`strip_navigation`] takes both to a fixed point, and a
+/// `^` that survives it cannot be resolved by anything `get_oid_1()` has left:
+/// `get_oid_basic()`'s full-hex branch and `get_short_oid()` both want hex
+/// digits, `get_describe_name()` wants a `-g<hex>` tail, and `repo_dwim_ref()`
+/// cannot match because `check_refname_format()` bans `^` in a refname
+/// (`refname_disposition[0x5e] == 4`, `refs.c:80-89`).
+///
+/// The three spellings this actually rejects are the *revision-walk* marks
+/// `<rev>^!`, `<rev>^@` and `<rev>^-<n>`, which `handle_revision_arg_1()`
+/// (`revision.c`) strips before it ever calls `repo_get_oid_with_context()` —
+/// see [`parents_only_base`]. A command that reaches `repo_get_oid()` directly
+/// never sees that strip, so stock 2.55.0 answers `fatal: Not a valid object
+/// name HEAD^!` for `git cat-file -t HEAD^!` while `git rev-list HEAD^!` walks
+/// the range. gitoxide draws no such line: its parser returns
+/// `Spec::ExcludeParents` for `<rev>^!`, and `gix::revision::Spec::single()`
+/// hands that back as an ordinary single object
+/// (`src/ported/gix/src/revision/spec/mod.rs:87-97`), so every command resolving
+/// an argv operand through [`resolve`] used to accept a spelling git refuses.
+fn get_oid_1_has_no_case(spec: &str) -> bool {
+    strip_navigation(object_part(spec)).contains('^')
 }
 
 /// `get_oid()` for a single object name: git's ordering, full hex first and the
@@ -251,8 +410,48 @@ pub fn resolve(repo: &gix::Repository, spec: &str) -> Option<ObjectId> {
 /// git warns once per operand because it resolves once per operand; a zvcs
 /// classifier that answers "is this a range?" and is then asked "what range?"
 /// would otherwise warn twice for one argument.
-fn resolve_quiet(repo: &gix::Repository, spec: &str) -> Option<ObjectId> {
-    full_hex(repo, spec).or_else(|| repo.rev_parse_single(spec).ok().map(|id| id.detach()))
+///
+/// The other caller is a command that has already reached
+/// [`warn_ambiguous_refname`] itself because it warns on operand *shapes* this
+/// function never resolves — `reflog show <ref>@{<n>}` warns about the ref and
+/// then reads a log rather than an object, so the warning cannot be bolted onto
+/// the resolution the way [`resolve`] bolts it on.
+pub fn resolve_quiet(repo: &gix::Repository, spec: &str) -> Option<ObjectId> {
+    // `get_oid_1()`'s dispatch comes first, and it is a *narrower* grammar than
+    // gitoxide's rev-parse: the `^!`/`^@`/`^-<n>` marks belong to
+    // `handle_revision_arg_1()` and never reach `repo_get_oid()`.
+    if get_oid_1_has_no_case(spec) {
+        return None;
+    }
+    if let Some(id) = full_hex(repo, spec) {
+        return Some(id);
+    }
+    // The rule survives the suffixes. `get_oid_1()` recurses down to
+    // [`ambiguity_base`] before anything else happens, so a full-length hex there
+    // takes `get_oid_basic()`'s first branch and the ref store is never consulted
+    // — and the suffix operation then works on the object itself:
+    //
+    // ```c
+    // static int peel_onion(struct repository *r, const char *name, int len,
+    //                       struct object_id *oid, unsigned lookup_flags)
+    // {
+    //         …
+    //         if (get_oid_1(r, name, sp - name - 2, &outer, lookup_flags))
+    //                 return -1;
+    //         o = parse_object(r, &outer);
+    //         if (!o)
+    //                 return -1;
+    // ```
+    //
+    // So `<absent-40-hex>^{commit}`, `<absent-40-hex>~1` and
+    // `<absent-40-hex>:<path>` all fail outright. gitoxide instead looks the id
+    // up, misses, and falls back to a *ref* of that name — which in a repository
+    // holding `refs/heads/<40-hex>` resolves the operand to that ref's history
+    // where git reports the name as unknown.
+    if full_hex(repo, ambiguity_base(spec)).is_some_and(|id| repo.find_object(id).is_err()) {
+        return None;
+    }
+    repo.rev_parse_single(spec).ok().map(|id| id.detach())
 }
 
 /// Whether `spec` named an object the repository does not actually have.
@@ -305,14 +504,105 @@ pub fn bad_object_name<'a>(repo: &gix::Repository, word: &'a str) -> Option<&'a 
 /// `^@` and `^!` are only marks at the very end (`!mark[2]`), while `^-` takes
 /// the digits after it as the parent number, so a non-numeric tail is not a mark
 /// at all.
-fn parents_only_base(word: &str) -> &str {
-    if let Some(base) = word.strip_suffix("^@").or_else(|| word.strip_suffix("^!")) {
-        return base;
+///
+/// `strstr()` finds the *first* occurrence and `!mark[2]` then demands that one be
+/// the last two characters, so a second copy behind it disqualifies the operand
+/// rather than being stripped: `main^!^!` has its first `^!` at index 4 with a `^`
+/// after it, so it carries no mark and is resolved whole —
+/// `fatal: bad revision 'main^!^!'` against git 2.55.0, where stripping the
+/// trailing one would have blamed `main`'s parents instead.
+///
+/// Public because the mark decides how many times one operand is *resolved*, not
+/// just how it is diagnosed: `add_parents_only()` opens with its own
+/// `repo_get_oid_committish(arg)`, so a marked operand goes through
+/// `get_oid_basic()` once for the mark and — for `^!` and `^-<n>`, which put the
+/// truncated name back into `arg` and carry on — once more for what is left. A
+/// caller reproducing `handle_revision_arg_1()`'s `warning: refname … is
+/// ambiguous.` output has to know which of the two shapes it is looking at.
+pub fn parents_only_base(word: &str) -> &str {
+    for mark in ["^@", "^!"] {
+        // `mark = strstr(arg, …); if (mark && !mark[2])`.
+        if word.find(mark) == Some(word.len().wrapping_sub(2)) {
+            return &word[..word.len() - 2];
+        }
     }
     match word.find("^-") {
-        // `strtol_i(mark + 2, 10, &num)`, with an empty tail meaning parent 1.
-        Some(at) if word[at + 2..].bytes().all(|b| b.is_ascii_digit()) => &word[..at],
+        Some(at) if parents_only_parent(&word[at + 2..]).is_some() => &word[..at],
         _ => word,
+    }
+}
+
+/// `handle_revision_arg_1()`'s parent number, read off the tail of a `^-` mark:
+///
+/// ```c
+/// mark = strstr(arg, "^-");
+/// if (mark) {
+///         int exclude_parent = 1;
+///
+///         if (mark[2]) {
+///                 if (strtol_i(mark + 2, 10, &exclude_parent) ||
+///                     exclude_parent < 1) {
+///                         ret = -1;
+///                         goto out;
+///                 }
+///         }
+/// ```
+///
+/// So an empty tail is parent 1, and everything else is `strtol_i` — which skips
+/// leading whitespace, takes an optional sign, demands the whole tail be consumed
+/// and demands the value fit an `int`. `^-+1` and `^- 1` are therefore parent 1
+/// while `^-x` and `^-99999999999999999999` are not numbers at all.
+///
+/// `None` is `strtol_i`'s failure. A value below 1 is *not* rejected here: git
+/// rejects it a line later, in the same breath as an `exclude_parent` past the
+/// commit's parent count, and both are the caller's to report.
+pub fn parents_only_parent(tail: &str) -> Option<i32> {
+    if tail.is_empty() {
+        return Some(1);
+    }
+    // Rust's parser is the guard for everything but the whitespace skip: it
+    // rejects trailing characters, an empty subject and anything outside `int`,
+    // and accepts exactly the optional sign `strtol` does.
+    tail.trim_start_matches([' ', '\t', '\n', '\r', '\x0b', '\x0c']).parse::<i32>().ok()
+}
+
+/// `handle_revision_arg_1()`'s exclusion mark, split off the operand
+/// (`revision.c`):
+///
+/// ```c
+/// if (*arg == '^') {
+///         flags ^= UNINTERESTING | BOTTOM;
+///         arg++;
+/// }
+/// ```
+///
+/// The `^` is a *flag*, not part of the name, and the pointer advances past it
+/// unconditionally — so everything downstream (`get_oid_with_context()`,
+/// `verify_non_filename()`, `get_reference()`'s `die("bad object %s")`) sees the
+/// shortened string. That is why an absent full-length hex is reported *without*
+/// its caret while a name that does not resolve at all is reported *with* it:
+/// `setup_revisions()` still holds the original `argv[i]` when it decides
+///
+/// ```c
+/// if (seen_dashdash || *arg == '^')
+///         die(_("bad revision '%s'"), arg);
+/// ```
+///
+/// A bare `^` is not special-cased in git either: `arg++` leaves the empty
+/// string, which resolves to nothing, and the operand comes back as
+/// `fatal: bad revision '^'`. So the empty remainder is returned as-is rather
+/// than being treated as "no mark".
+///
+/// The returned flag decides which of the two diagnostics above applies, and — for
+/// `cmd_diff()` — one more thing: `builtin_diff_tree()` swaps the two trees when
+/// the *second* one carries `UNINTERESTING` (builtin/diff.c:202), which is why
+/// `git diff HEAD ^HEAD~1` diffs `HEAD~1` against `HEAD`. `cmd_diff_index()` and
+/// `cmd_diff_files()` only count `revs->pending` and read the tree out of it, so
+/// there the flag is invisible.
+pub fn uninteresting_mark(arg: &str) -> (&str, bool) {
+    match arg.strip_prefix('^') {
+        Some(rest) => (rest, true),
+        None => (arg, false),
     }
 }
 
@@ -455,6 +745,45 @@ pub fn dotdot(repo: &gix::Repository, spec: &str) -> Dotdot {
         _ => Dotdot::Missing {
             notes: [left.type_error(), right.type_error()].into_iter().flatten().collect(),
         },
+    }
+}
+
+/// The `warning: refname … is ambiguous.` half of the two
+/// `repo_get_oid_with_context()` calls at the top of `handle_dotdot_1()` — the
+/// half [`dotdot`] deliberately leaves out, because it is a classifier every
+/// caller asks at least twice and git warns once per operand.
+///
+/// A command calls this exactly where git resolves the range for real, and gets
+/// the C's own quirks with it:
+///
+/// ```c
+/// if (repo_get_oid_with_context(revs->repo, a_name, oc_flags, &a_oid, a_oc) ||
+///     repo_get_oid_with_context(revs->repo, b_name, oc_flags, &b_oid, b_oc))
+///         return -1;
+/// ```
+///
+/// `||` short-circuits, so a left endpoint that does not resolve means the right
+/// one is never looked at and never warns — `nosuch..<40-hex-ref>` is silent in
+/// stock 2.55.0 while `<40-hex-ref>..nosuch` warns once, since a full-length hex
+/// resolves without the object database being consulted.
+///
+/// An endpoint carrying the exclusion mark is skipped: `handle_dotdot()` runs
+/// before `handle_revision_arg_1()` strips the `^`, so `get_oid_basic()` sees a
+/// name one character too long for its first branch and this pair fails there —
+/// the warning such an operand still earns comes later, from the single-name
+/// resolution of what follows the mark.
+pub fn warn_dotdot_endpoints(repo: &gix::Repository, spec: &str) {
+    let Some(Range { a, b, .. }) = split_range(spec) else {
+        return;
+    };
+    for end in [a, b] {
+        if end.starts_with('^') {
+            return;
+        }
+        warn_ambiguous_refname(repo, end);
+        if resolve_quiet(repo, end).is_none() {
+            return;
+        }
     }
 }
 
@@ -636,18 +965,25 @@ pub struct OperandError {
 }
 
 impl OperandError {
+    /// The exact stderr bytes and exit status, for a caller that has to *hold* the
+    /// diagnostic rather than raise it — a command whose single left-to-right parse
+    /// can still meet an earlier failure and must report that one instead.
+    pub fn rendered(&self) -> (u8, Vec<u8>) {
+        let mut out = String::new();
+        for note in &self.notes {
+            out.push_str(&format!("error: {note}\n"));
+        }
+        let (prefix, code) = if self.fatal { ("fatal", 128) } else { ("error", 129) };
+        out.push_str(&format!("{prefix}: {}\n", self.message));
+        (code, out.into_bytes())
+    }
+
     /// Print the diagnostic on stderr and yield git's exit status for it.
     pub fn report(&self) -> std::process::ExitCode {
-        for note in &self.notes {
-            eprintln!("error: {note}");
-        }
-        if self.fatal {
-            eprintln!("fatal: {}", self.message);
-            std::process::ExitCode::from(128)
-        } else {
-            eprintln!("error: {}", self.message);
-            std::process::ExitCode::from(129)
-        }
+        let (code, bytes) = self.rendered();
+        use std::io::Write;
+        let _ = std::io::stderr().lock().write_all(&bytes);
+        std::process::ExitCode::from(code)
     }
 }
 
@@ -740,4 +1076,430 @@ pub fn parse_opt_object_name(repo: &gix::Repository, arg: &str) -> Result<Object
         message: format!("malformed object name '{arg}'"),
         fatal: false,
     })
+}
+
+/// git's `diff_opt_find_object()` (`diff.c`), behind `--find-object=<object-id>`:
+///
+/// ```c
+/// static int diff_opt_find_object(const struct option *opt,
+///                                 const char *arg, int unset)
+/// {
+///         struct diff_options *options = opt->value;
+///         struct object_id oid;
+///
+///         BUG_ON_OPT_NEG(unset);
+///         if (repo_get_oid(the_repository, arg, &oid))
+///                 return error(_("unable to resolve '%s'"), arg);
+///
+///         if (!options->objfind)
+///                 CALLOC_ARRAY(options->objfind, 1);
+///
+///         options->pickaxe_opts |= DIFF_PICKAXE_KIND_OBJFIND;
+///         options->flags.recursive = 1;
+///         options->flags.tree_in_recursive = 1;
+///         oidset_insert(options->objfind, &oid);
+///         return 0;
+/// }
+/// ```
+///
+/// `repo_get_oid()` again, so the rule at the top of this module decides the
+/// common case: `--find-object` compares *ids*, so an object the repository does
+/// not have is a perfectly good needle that simply matches nothing, and stock
+/// exits 0 with empty output. A site resolving through `rev_parse_single()` alone
+/// turns that into the `error()` below and exit 129, which is what breaks a
+/// script that greps a history for an id it has since gc'd.
+///
+/// The option repeats and each occurrence inserts into the same `oidset`, so this
+/// answers *one* flag: a caller collects the ids and keeps a pair matching any of
+/// them. Per-occurrence rather than per-list because the `error()` below is raised
+/// from the callback, at the flag's own argv position — `--find-object=nosuch <bad
+/// object>` reports the unresolvable name while `<bad object> --find-object=nosuch`
+/// reports the bad object, and only a caller that resolves in argv order can do
+/// both (verified against stock 2.55.0 on all three diff verbs).
+///
+/// `error()` from an option callback is parse-options' `PARSE_OPT_ERROR`, a bare
+/// `exit(129)` with no usage block, which is [`OperandError`] with `fatal: false`.
+pub fn find_object(repo: &gix::Repository, arg: &str) -> Result<ObjectId, OperandError> {
+    resolve(repo, arg).ok_or_else(|| OperandError {
+        notes: Vec::new(),
+        message: format!("unable to resolve '{arg}'"),
+        fatal: false,
+    })
+}
+
+/// What `get_oid_basic()`'s reflog branch has to say about a `<ref>@{…}` operand
+/// whose selector reaches past the end of the log (`object-name.c:758-822`).
+///
+/// The two outcomes are not interchangeable: one ends the command, the other is
+/// printed and the operand still resolves.
+pub enum ReflogReach {
+    /// ```c
+    /// die(_("log for '%.*s' only has %d entries"), len, str, co_cnt);
+    /// ```
+    Fatal(String),
+    /// ```c
+    /// warning(_("log for '%.*s' only goes back to %s"),
+    ///         len, str, show_date(co_time, co_tz, DATE_MODE(RFC2822)));
+    /// ```
+    ///
+    /// `read_ref_at()` has already filled the oid from the oldest entry, so the
+    /// operand goes on to resolve after this is printed.
+    Warning(String),
+}
+
+/// The `@{…}` selector of a reflog operand, as `get_oid_basic()` splits it
+/// (`object-name.c:704-724`):
+///
+/// ```c
+/// reflog_len = at = 0;
+/// if (len && str[len-1] == '}') {
+///         for (at = len-4; at >= 0; at--) {
+///                 if (str[at] == '@' && str[at+1] == '{') {
+///                         if (str[at+2] == '-') {
+///                                 if (at != 0)
+///                                         /* @{-N} not at start */
+///                                         return -1;
+///                                 nth_prior = 1;
+///                                 continue;
+///                         }
+///                         if (!upstream_mark(str + at, len - at) &&
+///                             !push_mark(str + at, len - at)) {
+///                                 reflog_len = (len-1) - (at+2);
+///                                 len = at;
+///                         }
+///                         break;
+///                 }
+///         }
+/// }
+/// ```
+///
+/// `None` when `str` carries no reflog selector at all — no trailing `}`, no
+/// `@{`, or a suffix that `upstream_mark()`/`push_mark()` claims (`@{u}`,
+/// `@{upstream}`, `@{push}`), each of which leaves the name an ordinary ref.
+/// `@{-<n>}` is `interpret_nth_prior_checkout()`'s, not a reflog selector.
+fn split_reflog_selector(spec: &str) -> Option<(&str, &str)> {
+    let b = spec.as_bytes();
+    if b.is_empty() || b[b.len() - 1] != b'}' || b.len() < 4 {
+        return None;
+    }
+    let at = (0..=b.len() - 4).rev().find(|&i| b[i] == b'@' && b[i + 1] == b'{')?;
+    let sel = &spec[at + 2..spec.len() - 1];
+    if sel.starts_with('-') || matches!(sel, "u" | "upstream" | "push") {
+        return None;
+    }
+    Some((&spec[..at], sel))
+}
+
+/// git's `get_oid_basic()` reflog branch (`object-name.c:758-822`), which is the
+/// only place a `<ref>@{<n>}` / `<ref>@{<date>}` operand out of range is
+/// diagnosed. Without it the name simply fails to resolve and every caller
+/// reports `ambiguous argument '<spec>'`, which is not what git prints.
+///
+/// The selector is read the way git reads it — an all-digit run is the N-th
+/// entry, unless it is large enough to be an epoch, and anything else goes
+/// through `approxidate_careful()`:
+///
+/// ```c
+/// for (i = nth = 0; 0 <= nth && i < reflog_len; i++) {
+///         char ch = str[at+2+i];
+///         if ('0' <= ch && ch <= '9')
+///                 nth = nth * 10 + ch - '0';
+///         else
+///                 nth = -1;
+/// }
+/// if (100000000 <= nth) {
+///         at_time = nth;
+///         nth = -1;
+/// } else if (0 <= nth)
+///         at_time = 0;
+/// ```
+///
+/// `None` means git has nothing to say: the name is not a reflog operand, the ref
+/// has no log at all (`repo_dwim_log()` finds nothing, and the operand then fails
+/// to resolve exactly as it does today), or the selector is in range.
+pub fn reflog_reach(repo: &gix::Repository, spec: &str) -> Option<ReflogReach> {
+    let (base, sel) = split_reflog_selector(spec)?;
+    // `repo_dwim_log()`: which ref's log this is. Nothing found is `refs_found ==
+    // 0`, i.e. `return -1` — the operand does not resolve, and the caller's
+    // existing "unknown revision" message is git's.
+    // `get_oid_basic()` splits here, and the two halves do NOT agree on what the
+    // ref is called:
+    //
+    // ```c
+    // if (!len && reflog_len)
+    //         /* allow "@{...}" to mean the current branch reflog */
+    //         refs_found = repo_dwim_ref(r, "HEAD", 4, oid, &real_ref, 0);
+    // else if (reflog_len)
+    //         refs_found = repo_dwim_log(r, str, len, oid, &real_ref);
+    // ```
+    //
+    // `repo_dwim_ref("HEAD")` resolves the symref and reports its *target*, so a
+    // bare `@{99}` is diagnosed as `main`; `repo_dwim_log("HEAD")` finds HEAD's own
+    // log and reports `HEAD`. Detached, there is no target and both say `HEAD`.
+    let full = if base.is_empty() {
+        repo.head_ref()
+            .ok()
+            .flatten()
+            .map(|r| r.name().as_bstr().to_string())
+            .unwrap_or_else(|| "HEAD".to_string())
+    } else {
+        crate::porcelain::reflog::dwim_log(repo, base)?
+    };
+
+    let (nth, at_time) = {
+        let digits = !sel.is_empty() && sel.bytes().all(|c| c.is_ascii_digit());
+        // `nth * 10 + ch - '0'` overflows into a negative `int` for a long enough
+        // run, which the `100000000 <= nth` test then reads as "not an epoch"; the
+        // saturating parse below lands on the same side of that test.
+        let n: i64 = if digits { sel.parse().unwrap_or(i64::MAX) } else { -1 };
+        if n >= 100_000_000 {
+            (-1i64, n)
+        } else if n >= 0 {
+            (n, 0i64)
+        } else {
+            let (t, errors) = crate::date::approxidate_careful(sel);
+            if errors {
+                return None;
+            }
+            (-1, t)
+        }
+    };
+
+    // `read_ref_at()` walks the log newest-entry-first (refs.c:1181), so the
+    // entries are read in that order here too.
+    let entries = reflog_entries(repo, &full)?;
+    if entries.is_empty() {
+        // `if (!cb.reccnt)`: `<ref>@{0}` on an empty log falls back to the ref's
+        // own value, anything else is a different message that names the *full*
+        // ref rather than the operand (refs.c:1183-1203).
+        return (nth != 0).then(|| ReflogReach::Fatal(format!("log for {full} is empty")));
+    }
+    // `warning(…, len, str)` prints the operand's own spelling, except for a bare
+    // `@{…}`, where `get_oid_basic()` substitutes the ref it resolved:
+    //
+    // ```c
+    // if (!len) {
+    //         if (!skip_prefix(real_ref, "refs/heads/", &str))
+    //                 str = "HEAD";
+    //         len = strlen(str);
+    // }
+    // ```
+    let named = if base.is_empty() {
+        full.strip_prefix("refs/heads/").unwrap_or("HEAD").to_string()
+    } else {
+        base.to_string()
+    };
+
+    if nth >= 0 {
+        let count = entries.len() as i64;
+        if nth < count {
+            return None;
+        }
+        // `} else if (nth == co_cnt && !is_null_oid(oid)) {`: asked for one entry
+        // past the end, `read_ref_at_ent_oldest()` left the oldest entry's *old*
+        // id in `oid`, and that is a usable answer whenever it is not the null id.
+        let oldest_old = entries.last().map(|e| e.0);
+        if nth == count && oldest_old.is_some_and(|id| !id.is_null()) {
+            return None;
+        }
+        return Some(ReflogReach::Fatal(format!(
+            "log for '{named}' only has {count} entries"
+        )));
+    }
+
+    // `read_ref_at_ent()`: `if (timestamp <= cb->at_time || cb->cnt == 0)`. With a
+    // date selector `cnt` is 0 from the start only for `@{0}`, so what decides the
+    // walk is whether any entry is old enough.
+    if entries.iter().any(|e| e.1.seconds <= at_time) {
+        return None;
+    }
+    let oldest = entries.last()?;
+    Some(ReflogReach::Warning(format!(
+        "log for '{named}' only goes back to {}",
+        crate::porcelain::log::show_date_rfc2822(oldest.1.seconds, oldest.1.offset)
+    )))
+}
+
+/// [`reflog_reach`]'s [`ReflogReach::Warning`] as `get_oid_basic()` prints it, or
+/// `None` when it has nothing to say about `spec`.
+///
+/// The two halves of the reflog diagnostic reach their callers differently. The
+/// fatal ends the command, so it belongs in the message builders that already own
+/// the "this operand is not a revision" text ([`crate::porcelain::log::
+/// bad_revision_message_in`]). The warning is printed and the operand *still
+/// resolves*, so its caller is whoever resolves an argv operand — the same place
+/// [`warn_ambiguous_refname`] is called, because both warnings come out of the one
+/// `get_oid_basic()` call (`object-name.c:964-967` and `object-name.c:1006-1011`).
+///
+/// `spec` is the operand as written; [`ambiguity_base`] reduces it to what
+/// `get_oid_basic()` is actually handed, so `HEAD@{<date>}^`,
+/// `HEAD@{<date>}^{commit}` and `HEAD@{<date>}:<path>` each warn once, naming the
+/// reflog and not the suffix.
+pub fn reflog_reach_warning(repo: &gix::Repository, spec: &str) -> Option<String> {
+    match reflog_reach(repo, ambiguity_base(spec))? {
+        ReflogReach::Warning(message) => Some(format!("warning: {message}\n")),
+        // `read_ref_at()`'s other outcome is a `die()`, and printing it here would
+        // duplicate the fatal its caller is already building.
+        ReflogReach::Fatal(_) => None,
+    }
+}
+
+/// The `die()` inside `interpret_branch_mark()` (`refs.c`) for an operand
+/// carrying an `@{u}`/`@{upstream}` mark whose upstream cannot be named, or
+/// `None` when git has nothing to die about.
+///
+/// ```c
+/// static int interpret_branch_mark(struct repository *r,
+///                                  const char *name, int namelen,
+///                                  int at, struct strbuf *buf,
+///                                  int (*get_mark)(const char *, int),
+///                                  const char *(*get_data)(struct branch *, struct strbuf *),
+///                                  const struct interpret_branch_name_options *options)
+/// {
+///         len = get_mark(name + at, namelen - at);
+///         if (!len)
+///                 return -1;
+///         if (memchr(name, ':', at))
+///                 return -1;
+///         if (at) {
+///                 char *name_str = xmemdupz(name, at);
+///                 branch = branch_get(name_str);
+///                 free(name_str);
+///         } else
+///                 branch = branch_get(NULL);
+///         value = get_data(branch, &err);
+///         if (!value) {
+///                 if (options->nonfatal_dangling_mark) { … return -1; }
+///                 else
+///                         die("%s", err.buf);
+///         }
+/// ```
+///
+/// with `get_data` = `branch_get_upstream()` (`remote.c`):
+///
+/// ```c
+/// if (!branch)
+///         return error_buf(err, _("HEAD does not point to a branch"));
+/// if (!branch->merge || !branch->merge[0]->dst) {
+///         if (!ref_exists(branch->refname))
+///                 return error_buf(err, _("no such branch: '%s'"), branch->name);
+///         if (!branch->merge)
+///                 return error_buf(err,
+///                                  _("no upstream configured for branch '%s'"),
+///                                  branch->name);
+///         return error_buf(err,
+///                          _("upstream branch '%s' not stored as a remote-tracking branch"),
+///                          branch->merge[0]->src);
+/// }
+/// ```
+///
+/// The `die()` happens inside `get_oid()`, before the command has a failed
+/// operand to report — which is why every caller's own "ambiguous argument"
+/// block is *wrong* here rather than merely differently worded.
+///
+/// Three details the C makes and a re-derivation would not:
+///
+///   * `upstream_mark()` compares with `strncasecmp` and only requires the mark
+///     to *start* at the `@`, so `@{U}` and `@{UpStReAm}` both match and
+///     `lonely@{u}xyz` still dies — the die precedes the caller's check that the
+///     mark consumed the whole name.
+///   * `branch_get(NULL)` and `branch_get("HEAD")` are the same lookup, so
+///     `@{u}` and `HEAD@{u}` diagnose the checked-out branch. A detached HEAD has
+///     no branch at all; an unborn one has a name whose ref does not exist, which
+///     is the `no such branch:` arm rather than the detached one.
+///   * `interpret_branch_name()` walks the `@` positions left to right, so
+///     `a@b@{u}` names the branch `a@b`.
+///
+/// `@{push}` reaches the same `interpret_branch_mark()` but a different
+/// `get_data`: `branch_get_push()` runs `branch_get_push_1()`'s `push.default`
+/// machinery, whose outcomes include several git does *not* die on
+/// (`push.default=matching` on a branch with no upstream resolves to the branch's
+/// own refname and the operand then fails ordinarily). That is a separate port
+/// and is deliberately not answered here.
+pub fn upstream_mark_fatal(repo: &gix::Repository, spec: &str) -> Option<String> {
+    let base = ambiguity_base(spec);
+    let at = upstream_mark_at(base)?;
+    let named = &base[..at];
+    // `branch_get(NULL)` / `branch_get("HEAD")`: the branch HEAD points at, which
+    // is `NULL` when HEAD is detached. `head_name()` keeps answering for an unborn
+    // HEAD, which is what puts that case on the `no such branch:` arm below.
+    let name = if named.is_empty() || named == "HEAD" {
+        match repo.head_name() {
+            Ok(Some(full)) => full.shorten().to_string(),
+            _ => return Some("HEAD does not point to a branch".to_string()),
+        }
+    } else {
+        named.to_string()
+    };
+
+    let full = format!("refs/heads/{name}");
+    // `branch->merge[0]->dst`, which is the whole condition when it is present.
+    if crate::porcelain::branch::upstream_ref(repo, full.as_str().into()).is_some() {
+        return None;
+    }
+    if repo.try_find_reference(full.as_str()).ok().flatten().is_none() {
+        return Some(format!("no such branch: '{name}'"));
+    }
+    match repo.config_snapshot().string(&format!("branch.{name}.merge")) {
+        None => Some(format!("no upstream configured for branch '{name}'")),
+        Some(src) => Some(format!(
+            "upstream branch '{}' not stored as a remote-tracking branch",
+            gix::bstr::ByteSlice::to_str_lossy(src.as_slice())
+        )),
+    }
+}
+
+/// The offset of the `@` that opens an `@{u}`/`@{upstream}` mark in `base`, as
+/// `interpret_branch_name()`'s left-to-right scan finds it:
+///
+/// ```c
+/// for (start = name; (at = memchr(start, '@', namelen - (start - name))); start = at + 1) {
+///         …
+///         len = interpret_branch_mark(r, name, namelen, at - name, buf,
+///                                     upstream_mark, branch_get_upstream, options);
+/// ```
+///
+/// with `upstream_mark()`'s own comparison:
+///
+/// ```c
+/// static int upstream_mark(const char *string, int len)
+/// {
+///         const char *suffix[] = { "@{upstream}", "@{u}" };
+///         for (i = 0; i < ARRAY_SIZE(suffix); i++) {
+///                 int suffix_len = strlen(suffix[i]);
+///                 if (suffix_len <= len && !strncasecmp(string, suffix[i], suffix_len))
+///                         return suffix_len;
+///         }
+///         return 0;
+/// }
+/// ```
+///
+/// `suffix_len <= len` rather than `==`, so anything may follow the mark.
+fn upstream_mark_at(base: &str) -> Option<usize> {
+    base.bytes().enumerate().filter(|(_, b)| *b == b'@').map(|(i, _)| i).find(|&i| {
+        let rest = &base[i..];
+        ["@{upstream}", "@{u}"]
+            .iter()
+            .any(|mark| rest.len() >= mark.len() && rest[..mark.len()].eq_ignore_ascii_case(mark))
+    })
+}
+
+/// One ref's whole reflog, newest entry first, reduced to what
+/// [`reflog_reach`] needs: each entry's *old* id and its timestamp.
+///
+/// `None` when the ref cannot be read at all, which `repo_dwim_log()` has
+/// already ruled out for every caller here.
+fn reflog_entries(
+    repo: &gix::Repository,
+    full: &str,
+) -> Option<Vec<(ObjectId, gix::date::Time)>> {
+    let mut reference = repo.try_find_reference(full).ok().flatten()?;
+    let mut platform = reference.log_iter();
+    let iter = platform.rev().ok().flatten()?;
+    let mut out = Vec::new();
+    for line in iter {
+        let Ok(line) = line else { break };
+        out.push((line.previous_oid, line.signature.time));
+    }
+    Some(out)
 }

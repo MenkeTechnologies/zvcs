@@ -4,14 +4,58 @@
 use crate::histogram::lcs::find_lcs;
 use crate::histogram::list_pool::{ListHandle, ListPool};
 use crate::intern::Token;
-use crate::myers;
+use crate::{Algorithm, Diff};
 
 mod lcs;
 mod list_pool;
 
-/// Maximum number of occurrences tracked for a single token.
-/// Tokens appearing more frequently fall back to Myers algorithm.
-const MAX_CHAIN_LEN: u32 = 63;
+/// `index.max_chain_length`, `xdiff/xhistogram.c:284` (git 2.55.0): the largest number of
+/// occurrences a line may have and still be allowed to anchor an LCS.
+///
+/// ```text
+/// index.max_chain_length = 64;
+/// ...
+/// index.cnt = index.max_chain_length + 1;
+/// ...
+/// if (index.has_common && index.max_chain_length < index.cnt)
+///         ret = 1;
+/// ```
+///
+/// `index.cnt` starts one above the limit and is lowered to the occurrence count of every
+/// anchor that is accepted, so the search succeeds exactly when some line occurring at most
+/// `64` times could anchor it; otherwise `xdl_fall_back_diff()` hands the region to Myers.
+const MAX_CHAIN_LEN: u32 = 64;
+
+/// `fall_back_to_classic_diff()`: a region no line is rare enough to anchor is Myers' problem.
+///
+/// Upstream clears the algorithm bits and calls `xdl_fall_back_diff()`
+/// (`xdiff/xhistogram.c:229-239`), which copies the region into fresh `mmfile_t`s and
+/// re-enters `xdl_do_diff()` (`xdiff/xutils.c:453-482`). Re-entering matters and is why this
+/// cannot call `myers::diff` directly: `xdl_do_diff()` runs `xdl_prepare_env()` first, and
+/// with the algorithm bits cleared that no longer skips `xdl_optimize_ctxs()`, so the region
+/// gets `xdl_trim_ends()` and `xdl_cleanup_records()` applied to it — which is exactly what
+/// [`Diff::compute_with`] does for [`Algorithm::Myers`] and what a bare `myers::diff` skips.
+/// The region *is* the whole file to that sub-diff, so it is also its own untrimmed sequence.
+///
+/// Same shape as `patience::fall_back` and `compact::fall_back_diff`, which port the two
+/// other call sites of `xdl_fall_back_diff()`.
+fn fall_back(before: &[Token], after: &[Token], removed: &mut [bool], added: &mut [bool]) {
+    // Only the histogram algorithm reads this, and Myers is what runs here.
+    let num_tokens = before
+        .iter()
+        .chain(after)
+        .map(|t| u32::from(*t) + 1)
+        .max()
+        .unwrap_or(0);
+    let mut sub = Diff::default();
+    sub.compute_with(Algorithm::Myers, before, after, num_tokens);
+    for (slot, flag) in removed.iter_mut().enumerate() {
+        *flag = sub.is_removed(slot as u32);
+    }
+    for (slot, flag) in added.iter_mut().enumerate() {
+        *flag = sub.is_added(slot as u32);
+    }
+}
 
 /// State for computing histogram-based diffs.
 struct Histogram {
@@ -51,8 +95,16 @@ impl Histogram {
         self.token_occurrences[token.0 as usize].as_slice(&self.pool)
     }
 
+    /// `rec->cnt`: how often the token occurs in the *before* file, counted exactly.
+    ///
+    /// Not the length of the stored occurrence list, which stops growing past
+    /// [`MAX_CHAIN_LEN`] + 1 entries. git caps `rec->cnt` at `MAX_CNT`
+    /// (`xdiff/xhistogram.c:47`), `UINT_MAX`, so within any reachable input it is the true
+    /// count, and `try_lcs()` compares it against `index->cnt` to decide whether a line is
+    /// too common to anchor on. Reporting a saturated length instead would let a line that
+    /// occurs a thousand times pass a limit git applies at 64.
     fn num_token_occurrences(&self, token: Token) -> u32 {
-        self.token_occurrences[token.0 as usize].len(&self.pool)
+        self.token_occurrences[token.0 as usize].count(&self.pool)
     }
 
     fn populate(&mut self, file: &[Token]) {
@@ -97,13 +149,10 @@ impl Histogram {
                     added = &mut added[after_end as usize..];
                 }
                 None => {
-                    // we are diffing two extremely large repetitive files
-                    // this is a worst case for histogram diff with O(N^2) performance
-                    // fallback to myers to maintain linear time complexity
-                    // git's `xdl_fall_back_diff()` copies the sub-region into fresh mmfiles and
-                    // re-enters `xdl_do_diff()`, so the region *is* the whole file as far as
-                    // record classification is concerned — no wider sequence to count over.
-                    myers::diff(before, after, removed, added, false, before, after);
+                    // Every line left in this region occurs too often to anchor on, so
+                    // `find_lcs()` reported `lcs_found` and git hands the region to Myers
+                    // (`fall_back_to_classic_diff()`, `xdiff/xhistogram.c:229-239`).
+                    fall_back(before, after, removed, added);
                     return;
                 }
             }

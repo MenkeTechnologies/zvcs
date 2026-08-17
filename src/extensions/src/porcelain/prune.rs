@@ -68,8 +68,11 @@
 //! `-h`. Exit codes match stock git: 129 with git's usage block for `-h` and for
 //! an unknown option, 129 *without* the usage block for parse-options' value
 //! complaints (`option \`expire' requires a value`, `option \`<name>' takes no
-//! value`), 128 with `fatal: unrecognized argument: <name>` for a `<head>` that
-//! does not resolve, 0 otherwise.
+//! value`), 128 for a `<head>` git cannot use — `fatal: unrecognized argument:
+//! <name>` when the name does not resolve at all, and `fatal: unable to parse
+//! object: <name>` when it resolves to an object the repository does not have,
+//! which a full-length hex id always does because `repo_get_oid()` decodes it
+//! without asking the odb (see [`crate::objname`]) — 0 otherwise.
 //!
 //! `--progress` is accepted and deliberately produces nothing. Git's own
 //! progress is a *delayed* progress written to stderr and suppressed off a tty,
@@ -286,17 +289,38 @@ pub fn prune(args: &[String]) -> Result<ExitCode> {
         );
     }
 
-    // Command-line `<head>`s are resolved before any reachability work, so an
-    // unresolvable one fails exactly where git's `die()` does.
+    // Command-line `<head>`s are resolved before any reachability work — and
+    // before anything is unlinked — so an unusable one fails exactly where
+    // git's `die()` does, leaving the object store untouched.
+    //
+    // `cmd_prune()` spends two steps on each one, and they fail differently:
+    //
+    // ```c
+    // if (!repo_get_oid(the_repository, name, &oid)) {
+    //         struct object *object = parse_object_or_die(&oid, name);
+    //         add_pending_object(&revs, object, "");
+    // } else
+    //         die("unrecognized argument: %s", name);
+    // ```
+    //
+    // `repo_get_oid()` resolves a full-length hex name straight out of the
+    // string (see [`crate::objname`]), so an absent-but-well-formed id gets
+    // *past* the `unrecognized argument` branch and dies in
+    // `parse_object_or_die()` instead, with `unable to parse object`. Resolving
+    // through the odb alone collapses the two and reports the wrong one.
     let mut roots: Vec<ObjectId> = Vec::new();
     for name in &heads {
-        match repo.rev_parse_single(*name) {
-            Ok(id) => roots.push(id.detach()),
-            Err(_) => {
-                eprintln!("fatal: unrecognized argument: {name}");
-                return Ok(ExitCode::from(128));
-            }
+        let Some(oid) = crate::objname::resolve(&repo, name) else {
+            eprintln!("fatal: unrecognized argument: {name}");
+            return Ok(ExitCode::from(128));
+        };
+        // `parse_object_or_die()`: the name resolved to an id, but the object
+        // itself has to be in the odb to become a traversal root.
+        if repo.find_object(oid).is_err() {
+            eprintln!("fatal: unable to parse object: {name}");
+            return Ok(ExitCode::from(128));
         }
+        roots.push(oid);
     }
 
     collect_roots(&repo, &mut roots)?;

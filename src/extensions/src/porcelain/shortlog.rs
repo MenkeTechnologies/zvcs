@@ -34,11 +34,15 @@
 //!   * `--date=<fmt>` — validated the way `parse_date_format()` validates it.
 //!   * revision selection: `<rev>`, `^<rev>`, `<a>..<b>`, `<a>...<b>`, `--not`,
 //!     `--all`, `--branches[=<glob>]`, `--tags[=<glob>]`, `--remotes[=<glob>]`,
-//!     `--glob=<glob>`, `--exclude=<glob>`, `--ignore-missing`.
+//!     `--glob=<glob>`, `--exclude=<glob>`, `--ignore-missing`, `--reflog`
+//!     (`add_reflogs_to_pending()`: the old and the new id of every entry of
+//!     every reflog, HEAD's log first and then each log file below
+//!     `$GIT_DIR/logs`, in the unsorted order git's `dir_iterator` reports).
 //!   * walk limiting: `--max-count=<n>`/`-<n>`, `--skip=<n>`, `--first-parent`,
 //!     `--merges`/`--no-merges`, `--min-parents`/`--max-parents` and their
 //!     `--no-` forms, `--since`/`--after`/`--until`/`--before`, `--boundary`,
-//!     `--reverse`, `--ancestry-path`, `--date-order`/`--topo-order`.
+//!     `--reverse`, `--ancestry-path`, `--date-order`/`--topo-order` and
+//!     `--author-date-order` (`REV_SORT_BY_AUTHOR_DATE`).
 //!   * path-limited traversal: `<rev>... [--] <path>...`. Everything after `--`
 //!     is a pathspec; when a revision is pending, a commit is shown iff its diff
 //!     against a parent touched a matching path (git's TREESAME test) — a merge
@@ -58,15 +62,14 @@
 //!     malformed `-w` argument.
 //!
 //! Not covered — each `bail!`s rather than emitting output that would diverge:
-//! `--reflog`, `--simplify-merges`,
-//! `--author-date-order`, `--bisect`, `--alternate-refs`, `--exclude-hidden`,
+//! `--simplify-merges`, `--bisect`, `--alternate-refs`, `--exclude-hidden`,
 //! and `--boundary` combined with
 //! `--skip`/`--max-count` (git appends boundary commits to the tail of the
 //! revision stream, where a limit can truncate them; that interaction is not
 //! modelled here). git accepts every one of the unported *option* flags in that
 //! list at parse time and only acts on it after parsing every option and
 //! resolving every revision, so their bail is *deferred*: an earlier or later
-//! `fatal:`/usage error on the same line (e.g. `--reflog --date=v1` → `fatal:
+//! `fatal:`/usage error on the same line (e.g. `--bisect --date=v1` → `fatal:
 //! unknown date format v1`, exit 128) is reproduced with git's exact exit code,
 //! and the unported-flag bail fires only when git itself would have succeeded.
 //! `--exclude-first-parent-only` is accepted only when it is
@@ -207,15 +210,21 @@ enum RevAction {
         kind: RefKind,
         pattern: Option<String>,
     },
+    /// `--reflog`, whose pending objects are also positional: `--not` before it
+    /// files them on the excluded side.
+    Reflog,
 }
 
 /// Which walk order was requested. git's default is a plain commit-date queue;
-/// `--date-order` and `--topo-order` additionally keep parents behind children.
+/// `--date-order`, `--topo-order` and `--author-date-order` additionally keep
+/// parents behind children, the first two ranking the ready set by commit date
+/// and the last by author date (`REV_SORT_BY_AUTHOR_DATE`).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Order {
     Default,
     Date,
     Topo,
+    AuthorDate,
 }
 
 /// The `rev_info` fields shortlog's walk actually reads.
@@ -306,8 +315,8 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
     let mut pathspecs: Vec<Vec<u8>> = Vec::new();
 
     // git accepts these options but this port cannot reproduce their behavior
-    // (reflog/bisect/alternate-refs/exclude-hidden change the pending set;
-    // author-date-order/simplify-merges change the walk). git accepts each at
+    // (bisect/alternate-refs/exclude-hidden change the pending set;
+    // simplify-merges changes the walk). git accepts each at
     // parse time and only acts on it after it has parsed every option and
     // resolved every revision — so a `fatal:`/usage error elsewhere on the line
     // is reported first. The bail is therefore deferred: recorded here, acted on
@@ -322,6 +331,10 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
     // `--not` and bare revisions do not arm it, everything else does.
     let mut argv_consumed = false;
 
+    // `setup_revisions()`'s `seen_dashdash`, found in a scan of the whole
+    // argument vector before anything is resolved.
+    let seen_dashdash = argv.iter().any(|a| a == "--");
+
     let mut i = 0;
     while i < argv.len() {
         let a = argv[i].as_str();
@@ -334,7 +347,15 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
             break;
         }
         if a.len() < 2 || !a.starts_with('-') {
-            actions.push(RevAction::Rev(a.to_string()));
+            // `handle_revision_arg_1()` refuses a bare `..` before
+            // `handle_dotdot()` sees it: it is the pathspec for the parent
+            // directory, not `HEAD..HEAD`. See
+            // [`crate::objname::is_parent_directory_pathspec`].
+            if crate::objname::is_parent_directory_pathspec(a, seen_dashdash) {
+                pathspecs.push(a.as_bytes().to_vec());
+            } else {
+                actions.push(RevAction::Rev(a.to_string()));
+            }
             continue;
         }
 
@@ -473,22 +494,22 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
                     Some(RevAction::Exclude(value.unwrap_or_default().to_string()))
                 }
                 "not" if value.is_none() => Some(RevAction::Not),
+                "reflog" if value.is_none() => Some(RevAction::Reflog),
                 _ => None,
             };
             if let Some(action) = pseudo {
                 actions.push(action);
                 continue;
             }
-            if matches!(
-                name,
-                "reflog" | "bisect" | "alternate-refs" | "exclude-hidden"
-            ) {
+            if matches!(name, "bisect" | "alternate-refs" | "exclude-hidden") {
                 // git accepts these; defer the bail so a later parse-time fatal
                 // (e.g. `--date=v1`) or a bad revision still reports git's code.
+                // `handle_revision_pseudo_opt()` owns them, so — like the ref
+                // selectors above — they leave git's error reporter pointing at
+                // the real argv slot and must not arm `argv_consumed`.
                 if unsupported.is_none() {
                     unsupported = Some(a.to_string());
                 }
-                argv_consumed = true;
                 continue;
             }
 
@@ -541,7 +562,8 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
                 ("reverse", None) => opts.reverse = true,
                 ("date-order", None) => filters.order = Order::Date,
                 ("topo-order", None) => filters.order = Order::Topo,
-                ("author-date-order" | "simplify-merges", None) => {
+                ("author-date-order", None) => filters.order = Order::AuthorDate,
+                ("simplify-merges", None) => {
                     // git accepts these; defer as above so a genuine fatal wins.
                     if unsupported.is_none() {
                         unsupported = Some(a.to_string());
@@ -676,6 +698,16 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::from(129));
     }
 
+    // `parse_pathspec()` runs inside `setup_revisions()`, so a rejected element
+    // is fatal here — ahead of the walk, and ahead of the stdin fallback that a
+    // pending-less `git shortlog -- ..` would otherwise take instead.
+    if let Some(repo) = repo.as_ref() {
+        if let Some(msg) = crate::pathspec::parse_pathspec_fatal(repo, &pathspecs) {
+            eprintln!("fatal: {msg}");
+            return Ok(ExitCode::from(128));
+        }
+    }
+
     // Build git's pending object set in command-line order.
     let mut tips: Vec<ObjectId> = Vec::new();
     let mut hidden: Vec<ObjectId> = Vec::new();
@@ -695,6 +727,13 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
                 sink.extend(selected);
                 excludes.clear();
             }
+            // `add_reflogs_to_pending()` reads no ref pattern, so — unlike the
+            // selectors above — it neither consults nor clears `--exclude`.
+            RevAction::Reflog => {
+                let selected = reflog_pending(repo)?;
+                let sink = if negate { &mut hidden } else { &mut tips };
+                sink.extend(selected);
+            }
             RevAction::Rev(spec) => {
                 if let Some(rest) = spec.strip_prefix('^') {
                     match resolve(repo, rest) {
@@ -706,10 +745,7 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
                             }
                         }
                         None if ignore_missing => {}
-                        None => {
-                            eprintln!("fatal: bad revision '{spec}'");
-                            return Ok(ExitCode::from(128));
-                        }
+                        None => return Ok(fatal_rev(repo, spec)),
                     }
                 } else if let Some((left, right)) = spec.split_once("...") {
                     let left = if left.is_empty() { "HEAD" } else { left };
@@ -718,7 +754,7 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
                         if ignore_missing {
                             continue;
                         }
-                        return Ok(fatal_ambiguous(spec));
+                        return Ok(fatal_rev(repo, spec));
                     };
                     // `a...b` is both tips with every merge base excluded.
                     for base in repo.merge_bases_many(a, &[b])? {
@@ -733,7 +769,7 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
                         if ignore_missing {
                             continue;
                         }
-                        return Ok(fatal_ambiguous(spec));
+                        return Ok(fatal_rev(repo, spec));
                     };
                     if negate {
                         tips.push(a);
@@ -752,7 +788,7 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
                             }
                         }
                         None if ignore_missing => {}
-                        None => return Ok(fatal_ambiguous(spec)),
+                        None => return Ok(fatal_rev(repo, spec)),
                     }
                 }
             }
@@ -895,14 +931,26 @@ fn resolve(repo: &gix::Repository, spec: &str) -> Option<ObjectId> {
     Some(object.peel_to_commit().ok()?.id)
 }
 
-/// git's `setup_revisions` failure: the fatal block on stderr, exit code 128.
-/// git names the whole argument, not the half of a range that failed.
-fn fatal_ambiguous(spec: &str) -> ExitCode {
-    eprintln!(
-        "fatal: ambiguous argument '{spec}': unknown revision or path not in the working tree.\n\
-         Use '--' to separate paths from revisions, like this:\n\
-         'git <command> [<revision>...] -- [<file>...]'"
-    );
+/// git's `setup_revisions` failure for a revision argument: the fatal block on
+/// stderr, exit code 128. git names the whole argument, not the half of a range
+/// that failed.
+///
+/// Which block it is depends on how the argument failed, and only the repository
+/// can say: a range whose endpoints resolved but whose objects are missing is
+/// `Invalid revision range`, a full-length hex name the database does not have is
+/// `bad object`, a `^` that is neither is `bad revision`, and everything else is
+/// the three-line "ambiguous argument". The shared renderers draw all of them, so
+/// shortlog does not have its own reading of the rules.
+///
+/// [`super::log::early_revision_fatal`] comes first because it covers the two
+/// shapes git dies on *inside* `handle_revision_arg()` — where shortlog's
+/// resolver, which asks the object database, reports a failure git never had. A
+/// `--` puts every following argument in `pathspecs` before this is reached, so
+/// `cant_be_filename` is never set here.
+fn fatal_rev(repo: &gix::Repository, spec: &str) -> ExitCode {
+    let message = super::log::early_revision_fatal(repo, spec, false)
+        .unwrap_or_else(|| super::log::bad_revision_message_in(repo, spec));
+    eprint!("{message}");
     ExitCode::from(128)
 }
 
@@ -1048,6 +1096,74 @@ fn select_refs(
     Ok(out)
 }
 
+/// git's `add_reflogs_to_pending()`: the old and the new id of every entry of
+/// every reflog, in the order `revision.c` visits them.
+///
+/// `refs_head_ref()` runs first and feeds HEAD's own log to `handle_one_reflog`,
+/// then `refs_for_each_reflog()` walks `$GIT_DIR/logs` — HEAD included a second
+/// time — through the unsorted `dir_iterator` [`super::fsck::collect_log_names`]
+/// reproduces. Duplicates are deliberately kept: the walk queue dedupes on first
+/// sight, and first sight is what orders commits that share a commit date.
+///
+/// A null id (a ref's creation or deletion line) names no object and is skipped,
+/// as `parse_object()` returns NULL for it. An id the object store cannot
+/// produce is `handle_one_reflog_commit()`'s pruned-commit warning, printed once
+/// per log.
+fn reflog_pending(repo: &gix::Repository) -> Result<Vec<ObjectId>> {
+    let mut names: Vec<String> = Vec::new();
+    // `refs_head_ref()` calls its callback only when HEAD resolves, so an unborn
+    // HEAD contributes nothing here. Its log file, if any, is still walked below.
+    let head_resolves = repo
+        .head()
+        .ok()
+        .and_then(|mut head| head.try_peel_to_id().ok().flatten())
+        .is_some();
+    if head_resolves {
+        names.push("HEAD".to_string());
+    }
+    // git reads the main ref store, which is the common directory's logs; a
+    // linked worktree's per-worktree logs are merged in ahead of them.
+    let mut dirs = vec![repo.git_dir().join("logs")];
+    let common = repo.common_dir().join("logs");
+    if common != dirs[0] {
+        dirs.push(common);
+    }
+    for dir in &dirs {
+        super::fsck::collect_log_names(dir, "", &mut names)?;
+    }
+
+    let mut out = Vec::new();
+    let mut buf = Vec::new();
+    for name in names {
+        // A log file whose path is not a well-formed ref name has no reflog to
+        // iterate, exactly as `refs_for_each_reflog_ent()` finds nothing there.
+        let Ok(Some(iter)) = repo.refs.reflog_iter(name.as_str(), &mut buf) else {
+            continue;
+        };
+        let mut warned = false;
+        for line in iter {
+            let Ok(line) = line else { break };
+            for id in [line.previous_oid(), line.new_oid()] {
+                if id.is_null() {
+                    continue;
+                }
+                let Ok(object) = repo.find_object(id) else {
+                    if !warned {
+                        eprintln!("warning: reflog of '{name}' references pruned commits");
+                        warned = true;
+                    }
+                    continue;
+                };
+                // `handle_commit()` peels a tag to the commit it names.
+                if let Ok(commit) = object.peel_to_commit() {
+                    out.push(commit.id);
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// How a ref selector decides membership: a whole namespace, or a glob.
 enum Include {
     Prefix(String),
@@ -1093,7 +1209,7 @@ fn walk(
 ) -> Result<Vec<WalkItem>> {
     let mut items = Vec::new();
     match filters.order {
-        Order::Default => {
+        Order::Default | Order::AuthorDate => {
             let mut platform = repo
                 .rev_walk(tips.to_vec())
                 .sorting(Sorting::ByCommitTime(CommitTimeOrder::NewestFirst));
@@ -1136,7 +1252,39 @@ fn walk(
             }
         }
     }
+    // `sort_in_topological_order()` runs over the whole limited list inside
+    // `prepare_revision_walk()`, so `--author-date-order` reshuffles the
+    // commit-date walk above rather than replacing it: parents stay behind
+    // their children and the ready set is ranked by author date, which is
+    // `record_author_date()` feeding `compare_commits_by_author_date()`.
+    if filters.order == Order::AuthorDate {
+        let ids: Vec<ObjectId> = items.iter().map(|item| item.id).collect();
+        let parents_of: std::collections::HashMap<ObjectId, Vec<ObjectId>> = items
+            .iter()
+            .map(|item| (item.id, item.parents.clone()))
+            .collect();
+        let dates: std::collections::HashMap<ObjectId, i64> =
+            ids.iter().map(|id| (*id, author_date(repo, *id))).collect();
+        let sorted = super::rev_list::topo_sort(&ids, &parents_of, Some(&dates));
+        let mut by_id: std::collections::HashMap<ObjectId, WalkItem> =
+            items.into_iter().map(|item| (item.id, item)).collect();
+        items = sorted
+            .into_iter()
+            .filter_map(|id| by_id.remove(&id))
+            .collect();
+    }
     Ok(items)
+}
+
+/// The author timestamp `--author-date-order` ranks a commit by, which is git's
+/// `record_author_date()`: the epoch seconds off the `author` header with the
+/// zone offset ignored. A commit whose header cannot be read keeps the slab's
+/// zero, so it sorts oldest.
+fn author_date(repo: &gix::Repository, id: ObjectId) -> i64 {
+    repo.find_commit(id)
+        .ok()
+        .and_then(|commit| commit.author().ok().map(|a| a.seconds()))
+        .unwrap_or(0)
 }
 
 /// git's `--ancestry-path`: keep only commits that descend from a bottom

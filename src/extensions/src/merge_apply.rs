@@ -509,10 +509,6 @@ impl std::fmt::Display for StrategyOptionError {
     }
 }
 
-/// The vendored `imara-diff` has Myers, minimal and histogram, but no patience.
-const NO_PATIENCE: &str = "the vendored imara-diff has no patience implementation, \
-                           and substituting another algorithm would change the merge result";
-
 /// git's whitespace-insensitive merge comes from `xdl_recmatch()` hashing and
 /// comparing records under `XDF_IGNORE_*`; `gix-merge`'s text driver interns
 /// whole lines and has no equivalent.
@@ -548,13 +544,12 @@ impl StrategyOptions {
         } else if let Some(arg) = s.strip_prefix("subtree=") {
             self.subtree_shift = Some(BString::from(arg));
         } else if s == "patience" {
-            return Err(unsupported(NO_PATIENCE));
+            self.diff_algorithm = Some(Algorithm::Patience);
         } else if s == "histogram" {
             self.diff_algorithm = Some(Algorithm::Histogram);
         } else if let Some(arg) = s.strip_prefix("diff-algorithm=") {
             match parse_algorithm_value(arg) {
-                Some(Some(algo)) => self.diff_algorithm = Some(algo),
-                Some(None) => return Err(unsupported(NO_PATIENCE)),
+                Some(algo) => self.diff_algorithm = Some(algo),
                 None => return Err(unknown()),
             }
         } else if matches!(
@@ -588,17 +583,17 @@ impl StrategyOptions {
     }
 }
 
-/// `parse_algorithm_value()` (diff.c). `None` is git's `-1`; `Some(None)` is
-/// patience, which git accepts and this build cannot honour.
-fn parse_algorithm_value(value: &str) -> Option<Option<Algorithm>> {
+/// `parse_algorithm_value()` (diff.c). `None` is git's `-1`, the value it
+/// rejects; every name it accepts maps onto a `gix-imara-diff` algorithm.
+fn parse_algorithm_value(value: &str) -> Option<Algorithm> {
     if value.eq_ignore_ascii_case("myers") || value.eq_ignore_ascii_case("default") {
-        Some(Some(Algorithm::Myers))
+        Some(Algorithm::Myers)
     } else if value.eq_ignore_ascii_case("minimal") {
-        Some(Some(Algorithm::MyersMinimal))
+        Some(Algorithm::MyersMinimal)
     } else if value.eq_ignore_ascii_case("patience") {
-        Some(None)
+        Some(Algorithm::Patience)
     } else if value.eq_ignore_ascii_case("histogram") {
-        Some(Some(Algorithm::Histogram))
+        Some(Algorithm::Histogram)
     } else {
         None
     }
@@ -942,6 +937,16 @@ fn get_tree_entry(
     path: &BStr,
 ) -> Result<Option<(ObjectId, u32)>> {
     let hash_len = repo.object_hash().len_in_bytes();
+    // `find_tree_entry()` (tree-walk.c) consumes one trailing `/`: after a
+    // directory entry matches, a remainder of exactly `/` ends the walk on that
+    // entry (`if (++entrylen == namelen)`), which it reaches only past
+    // `if (!S_ISDIR(*mode)) break`, so `src/` names the `src` tree while
+    // `file/` names nothing. Every other empty component — leading, or doubled —
+    // is a name no tree entry carries, and is left to fail in the walk below.
+    let (path, needs_dir) = match path.strip_suffix(b"/") {
+        Some(rest) if !rest.is_empty() => (rest.as_bstr(), true),
+        _ => (path, false),
+    };
     let mut current = tree;
     let mut mode = 0o040000u32;
     for component in path.split(|&b| b == b'/') {
@@ -960,6 +965,9 @@ fn get_tree_entry(
             }
             None => return Ok(None),
         }
+    }
+    if needs_dir && !is_dir(mode) {
+        return Ok(None);
     }
     Ok(Some((current, mode)))
 }
@@ -1054,7 +1062,11 @@ fn shift_tree_by(
 }
 
 /// `shift_tree_object()` (merge-ort.c): the entry point `-Xsubtree` uses.
-fn shift_tree_object(
+///
+/// Shared with `merge-tree`, which runs its own merge rather than going through
+/// [`merge_and_apply`] but shifts exactly the same way, because
+/// `merge_ort_nonrecursive_internal()` is the single place git shifts from.
+pub(crate) fn shift_tree_object(
     repo: &gix::Repository,
     one: ObjectId,
     two: ObjectId,

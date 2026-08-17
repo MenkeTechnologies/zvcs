@@ -264,8 +264,28 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
         let resolved = if arg.is_empty() {
             None
         } else {
-            warn_ambiguous_refname(&repo, arg, o.quiet);
-            repo.rev_parse_single(arg.as_str()).ok().map(|id| id.detach())
+            // `try_difference()` runs ahead of the plain resolution and resolves
+            // each endpoint with `repo_get_oid_committish()`, joined by `&&` — so
+            // a range warns once per endpoint, and not at all for the second one
+            // when the first failed to resolve.
+            match crate::objname::split_range(arg) {
+                Some(range) => {
+                    warn_ambiguous_refname(&repo, range.a, o.quiet);
+                    let a_resolved = {
+                        let _quiet_ambiguity = crate::objname::AmbiguityWarnings::off();
+                        crate::objname::resolve(&repo, range.a).is_some()
+                    };
+                    if a_resolved {
+                        warn_ambiguous_refname(&repo, range.b, o.quiet);
+                    }
+                }
+                None => warn_ambiguous_refname(&repo, arg, o.quiet),
+            }
+            // A full-length hex name *is* the object id and short-circuits ahead
+            // of every database lookup, so it answers even for an object that is
+            // not present — see [`crate::objname::full_hex`].
+            crate::objname::full_hex(&repo, arg)
+                .or_else(|| repo.rev_parse_single(arg.as_str()).ok().map(|id| id.detach()))
         };
 
         // A reflog ordinal past the end of an existing ref's log is its own
@@ -317,6 +337,11 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
                         _ => None,
                     })
                 };
+                // gitoxide resolves every endpoint through the object database, so
+                // a revspec built out of a full-length hex naming an object that is
+                // not present fails to parse at all. git reaches the same specs
+                // through `get_oid()`, which takes full hex at face value.
+                let parsed = parsed.or_else(|| full_hex_spec(&repo, arg));
                 match parsed {
                     Some(Parsed::Range(range)) => {
                         emit_range(&mut out, &repo, &o, range, arg)?;
@@ -438,27 +463,17 @@ pub(crate) fn dwim_ref_matches(repo: &gix::Repository, name: &str) -> Vec<String
 /// Only a bare name goes through `repo_dwim_ref`, so anything carrying revision
 /// grammar (`~`, `^`, `:`, `@{`) is left alone here, as in git.
 pub(crate) fn warn_ambiguous_refname(repo: &gix::Repository, arg: &str, quiet: bool) {
+    // `get_oid_basic` splits in two, and the *full-length* hex half is the whole
+    // of its first branch — shared, because every command that takes an object
+    // name reaches it. It returns whether that branch was the one taken, which is
+    // the `return 0` that keeps the second warning below out of reach.
+    if crate::objname::warn_ambiguous_refname(repo, arg) {
+        return;
+    }
     if arg.contains(['~', '^', ':']) || arg.contains("@{") {
         return;
     }
     if repo.config_snapshot().boolean("core.warnAmbiguousRefs") == Some(false) {
-        return;
-    }
-
-    // `get_oid_basic` splits in two. A *full-length* hex name resolves as the
-    // object and returns immediately, but first checks whether a ref answers to
-    // the same 40 (or 64) characters — which only happens when a ref was created
-    // by accident, hence the paragraph explaining how.
-    let hexsz = repo.object_hash().len_in_hex();
-    if arg.len() == hexsz && arg.bytes().all(|b| b.is_ascii_hexdigit()) {
-        if !dwim_ref_matches(repo, arg).is_empty() {
-            eprintln!("warning: refname '{arg}' is ambiguous.");
-            // git prints this one with a bare `fprintf(stderr, "%s\n", …)`, not
-            // through `advise()`, so it carries no `hint: ` prefix and no color.
-            if Advice::ObjectNameWarning.enabled_in(repo) {
-                eprintln!("{OBJECT_NAME_MSG}");
-            }
-        }
         return;
     }
 
@@ -474,17 +489,36 @@ pub(crate) fn warn_ambiguous_refname(repo: &gix::Repository, arg: &str, quiet: b
     }
 }
 
-/// `object_name_msg` in `object-name.c`, verbatim (git 2.55.0).
-const OBJECT_NAME_MSG: &str = "\
-Git normally never creates a ref that ends with 40 hex characters
-because it will be ignored when you just specify 40-hex. These refs
-may be created by mistake. For example,
+/// The revspecs [`crate::objname::full_hex`] rescues once an endpoint is a full-length hex
+/// whose object is absent, which gitoxide's revspec parser rejects outright:
+///
+/// * `^<full-hex>` — git's `REVERSED` single revision, `^<id>`.
+/// * `<a>..<b>` — `try_difference()` resolves both sides with `get_oid()`, so
+///   `git rev-parse 0{40}..HEAD` prints HEAD's id then `^0{40}` and exits 0.
+///
+/// `<a>...<b>` is deliberately absent: git prints both endpoints and then dies
+/// looking for merge bases against the object it does not have, leaving output
+/// half-written. That is a failure path, not a result worth reproducing here.
+fn full_hex_spec(repo: &gix::Repository, arg: &str) -> Option<Parsed> {
+    if let Some(rest) = arg.strip_prefix('^') {
+        return crate::objname::full_hex(repo, rest).map(|id| Parsed::Single { id, reversed: true });
+    }
+    let at = arg.find("..")?;
+    if arg[at + 2..].starts_with('.') {
+        return None;
+    }
+    let (left, right) = endpoint_names(arg);
+    Some(Parsed::Range(RangeSpec::Range {
+        from: endpoint(repo, left)?,
+        to: endpoint(repo, right)?,
+    }))
+}
 
-  git switch -c $br $(git rev-parse ...)
-
-where \"$br\" is somehow empty and a 40-hex ref is created. Please
-examine these refs and maybe delete them. Turn this message off by
-running \"git config set advice.objectNameWarning false\"";
+/// One side of a range, resolved the way `get_oid()` resolves it: a full-length
+/// hex is its own answer, everything else goes to the ordinary parser.
+fn endpoint(repo: &gix::Repository, name: &str) -> Option<ObjectId> {
+    crate::objname::full_hex(repo, name).or_else(|| repo.rev_parse_single(name).ok().map(|id| id.detach()))
+}
 
 /// `get_short_oid(…, GET_OID_QUIETLY) == 0`: whether `arg` is a hex prefix that
 /// names exactly one object. git's minimum abbreviation is four hex digits.

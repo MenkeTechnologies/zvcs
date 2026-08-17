@@ -602,6 +602,20 @@ struct Opts {
     /// `--all`-family selectors, interleaved in command-line order.
     revs: Vec<RevWord>,
     paths: Vec<String>,
+    /// `seen_dashdash`, which `setup_revisions()` decides in a pre-pass over argv
+    /// before it resolves a single revision. It turns on `REVARG_CANNOT_BE_FILENAME`
+    /// for the words *before* the `--` as well, so `format-patch README.md -- x`
+    /// is `bad revision 'README.md'` rather than a second pathspec.
+    seen_dashdash: bool,
+    /// The command line as given, kept so `setup_revisions()`'s `verify_filename()`
+    /// sweep can look at the words that follow a positional which turned out to
+    /// name a path. git looks at the argv `parse_options()` handed back, which is
+    /// this one minus format-patch's own options — see [`fp_option_slots`].
+    argv: Vec<String>,
+    /// The parsed `-- <pathspec>...` set, built once `setup_revisions()` has
+    /// collected `revs->prune_data`. `None` is "no limiting", which is not the
+    /// same as a set that matches nothing.
+    pathspec: Option<super::log::PathspecMatcher>,
 
     // Diff rendering.
     context: u32,
@@ -616,6 +630,19 @@ struct Opts {
     /// `-W`/`--function-context`: `XDL_EMIT_FUNCCONTEXT`, which grows every hunk
     /// outward to the enclosing function's first and last line.
     function_context: bool,
+    /// `-w`/`-b`/`--ignore-space-at-eol`/`--ignore-cr-at-eol`: xdiff's
+    /// `XDF_WHITESPACE_FLAGS`, the canonical form a record is compared in.
+    ws: super::diff_pairs::Whitespace,
+    /// `--full-index`: `index` lines carry the whole object name rather than the
+    /// abbreviation `diff_unique_abbrev()` would pick.
+    full_index: bool,
+    /// `-D`/`--irreversible-delete`: a deletion stops after its header, so the
+    /// patch cannot be used to restore the file.
+    irreversible_delete: bool,
+    /// `--skip-to=<path>` / `--rotate-to=<path>`, as `(is_skip, path)`. git keeps
+    /// one `rotate_to` string plus a `skip_instead_of_rotate` bit, so the last of
+    /// the two options on the command line wins.
+    skip_or_rotate: Option<(bool, Vec<u8>)>,
 
     /// Flags git accepts that this module has not ported, in the spelling the
     /// caller used. Reported only when a patch would actually be emitted.
@@ -713,6 +740,13 @@ pub fn format_patch(args: &[String]) -> Result<ExitCode> {
     if commits.is_empty() {
         return Ok(ExitCode::SUCCESS);
     }
+    // `revs->prune_data` is now final, so every diff below — the patches, the
+    // diffstats, the summaries, the cover letter's combined diff and the
+    // interdiff — is limited to it, exactly as `rev->diffopt.pathspec` limits
+    // every format git flushes through it.
+    if !paths.is_empty() {
+        opts.pathspec = Some(super::log::PathspecMatcher::new(&repo, &paths)?);
+    }
 
     // git resolves the signature only here — after `setup_revisions()` and after
     // confirming the series is non-empty — so a bad revision, and an empty commit
@@ -780,9 +814,6 @@ pub fn format_patch(args: &[String]) -> Result<ExitCode> {
     // deferred: it would change what those bytes are.
     if let Some(flag) = opts.deferred.first() {
         bail!("unsupported flag {flag:?}");
-    }
-    if let Some(path) = paths.first() {
-        bail!("pathspec-limited format-patch is not supported (got {path:?})");
     }
 
     // Auto-numbering kicks in for a series; -n/-N override it. A cover letter
@@ -1030,8 +1061,8 @@ fn emit_diff_of_diff(
         }
         writeln!(out, "{}", diff_title(opts.reroll.as_deref(), "Interdiff:", "Interdiff against v"))?;
         let mut body: Vec<u8> = Vec::new();
-        let abbrev = new_tree.id().shorten()?.hex_len();
-        for change in &tree_changes(repo, Some(&old_tree), Some(&new_tree))? {
+        let abbrev = index_abbrev(repo, &new_tree, opts)?;
+        for change in &tree_changes(repo, Some(&old_tree), Some(&new_tree), opts.pathspec.as_ref())? {
             emit_change(repo, &mut body, change, abbrev, opts)?;
         }
         write_indented(out, &body, indent);
@@ -1146,19 +1177,11 @@ const DEFERRED: &[&str] = &[
     "--compact-summary",
     "--patience",
     "--no-indent-heuristic",
-    "--full-index",
     "--abbrev",
     "--break-rewrites",
     "--find-renames",
     "--find-copies",
     "--find-copies-harder",
-    "--irreversible-delete",
-    "--skip-to",
-    "--rotate-to",
-    "--ignore-cr-at-eol",
-    "--ignore-space-at-eol",
-    "--ignore-space-change",
-    "--ignore-all-space",
     "--ignore-blank-lines",
     "--inter-hunk-context",
     "--textconv",
@@ -1167,13 +1190,208 @@ const DEFERRED: &[&str] = &[
     "--output-indicator-old",
     "--output-indicator-context",
     "--anchored",
-    "-b",
-    "-w",
-    "-D",
 ];
 
 /// Short options that carry an attached value, e.g. `-M50%` or `-S<string>`.
 const DEFERRED_SHORT: &[&str] = &["-l", "-M", "-C", "-B", "-O", "-S", "-G"];
+
+/// `builtin_format_patch_options` entries that need a value in the next argv
+/// slot (or attached after `=` / directly after the short letter).
+const FP_VALUE_OPTS: &[&str] = &[
+    "--commit-list-format",
+    "--suffix",
+    "--start-number",
+    "--reroll-count",
+    "--filename-max-length",
+    "--cover-from-description",
+    "--description-file",
+    "--subject-prefix",
+    "--output-directory",
+    "--add-header",
+    "--to",
+    "--cc",
+    "--in-reply-to",
+    "--signature",
+    "--base",
+    "--signature-file",
+    "--interdiff",
+    "--range-diff",
+    "--creation-factor",
+];
+
+/// `PARSE_OPT_OPTARG` entries: a value is allowed but only attached, so the next
+/// argv slot is never theirs.
+const FP_OPTARG_OPTS: &[&str] = &["--rfc", "--from", "--attach", "--inline", "--thread"];
+
+/// The valueless entries, `--no-` spellings that stand on their own included.
+const FP_FLAG_OPTS: &[&str] = &[
+    "--numbered",
+    "--no-numbered",
+    "--signoff",
+    "--no-signoff",
+    "--stdout",
+    "--no-stdout",
+    "--cover-letter",
+    "--no-cover-letter",
+    "--numbered-files",
+    "--no-numbered-files",
+    "--keep-subject",
+    "--binary",
+    "--no-binary",
+    "--zero-commit",
+    "--no-zero-commit",
+    "--ignore-if-in-upstream",
+    "--no-ignore-if-in-upstream",
+    "--no-stat",
+    "--quiet",
+    "--no-quiet",
+    "--progress",
+    "--no-progress",
+    "--force-in-body-from",
+    "--no-force-in-body-from",
+];
+
+/// How many argv slots `parse_options()` takes for `arg` against
+/// `builtin_format_patch_options`, or `None` when the option is not in that
+/// table at all.
+///
+/// `cmd_format_patch` parses with `PARSE_OPT_KEEP_UNKNOWN_OPT`, so anything this
+/// returns `None` for stays in argv and reaches `setup_revisions()`. That is the
+/// only distinction that matters here: `verify_filename()` dies on whatever
+/// `-`-prefixed word is *still* in argv once a positional turns out to name a
+/// path, which is why `format-patch <path> --no-thread` is quietly accepted
+/// while `format-patch <path> --always` is fatal.
+fn fp_option_slots(arg: &str) -> Option<usize> {
+    if let Some(rest) = arg.strip_prefix("--") {
+        let (name, attached) = match rest.split_once('=') {
+            Some((n, _)) => (n, true),
+            None => (rest, false),
+        };
+        let long = format!("--{name}");
+        if FP_VALUE_OPTS.contains(&long.as_str()) {
+            return Some(usize::from(!attached));
+        }
+        if FP_OPTARG_OPTS.contains(&long.as_str()) || FP_FLAG_OPTS.contains(&long.as_str()) {
+            return Some(0);
+        }
+        // Negating a value-taking option never takes the value with it.
+        if let Some(bare) = name.strip_prefix("no-") {
+            let bare = format!("--{bare}");
+            let known =
+                FP_VALUE_OPTS.contains(&bare.as_str()) || FP_OPTARG_OPTS.contains(&bare.as_str());
+            if known && !attached {
+                return Some(0);
+            }
+        }
+        return None;
+    }
+    // Short options, which `parse_short_opt()` reads one letter at a time out of
+    // a cluster. An unknown letter abandons the whole word to argv, value letter
+    // or not, so the loop reports `None` for `-n3` exactly as it does for `-3`.
+    let rest = arg.strip_prefix('-').filter(|r| !r.is_empty())?;
+    for (idx, c) in rest.char_indices() {
+        match c {
+            'n' | 'N' | 's' | 'k' | 'p' | 'q' => {}
+            // `-v2`/`-oDIR` carry the value; a trailing `-v`/`-o` eats the next slot.
+            'v' | 'o' => return Some(usize::from(idx + c.len_utf8() == rest.len())),
+            _ => return None,
+        }
+    }
+    Some(0)
+}
+
+/// The words `setup_revisions()` still has in argv from `at` onward — argv as
+/// `parse_options()` handed it back, so format-patch's own options and their
+/// values are gone.
+fn revision_argv_from(argv: &[String], at: usize) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut i = at;
+    while i < argv.len() {
+        match fp_option_slots(&argv[i]) {
+            Some(extra) => i += 1 + extra,
+            None => {
+                out.push(argv[i].as_str());
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// Port of `looks_like_pathspec()` (setup.c): a raw wildcard or long-form magic
+/// makes a word a pathspec without the file having to exist.
+fn looks_like_pathspec(arg: &str) -> bool {
+    let mut escaped = false;
+    for c in arg.chars() {
+        if escaped {
+            escaped = false;
+        } else if c == '\\' {
+            escaped = true;
+        } else if matches!(c, '*' | '?' | '[') {
+            return true;
+        }
+    }
+    arg.starts_with(":(")
+}
+
+/// Port of `check_filename()` (setup.c): does the word name something that
+/// exists, once the short-form magic that cannot be part of a filename is
+/// stripped? `lstat`, so a dangling symlink counts as present.
+fn check_filename(arg: &str) -> bool {
+    let rest = if let Some(r) = arg.strip_prefix(":/") {
+        // ":/" alone is the root directory, which always exists.
+        if r.is_empty() {
+            return true;
+        }
+        r
+    } else if let Some(r) = arg.strip_prefix(":!").or_else(|| arg.strip_prefix(":^")) {
+        // Excluding everything is silly, but git allows it.
+        if r.is_empty() {
+            return true;
+        }
+        r
+    } else {
+        arg
+    };
+    std::fs::symlink_metadata(rest).is_ok()
+}
+
+/// Port of the `for (j = i; j < argc; j++) verify_filename(...)` sweep
+/// `setup_revisions()` runs the moment a word stops being a revision: from there
+/// on every remaining word has to be a usable pathspec, and the first one that
+/// is not decides the message.
+///
+/// Verified against stock git 2.55.0 in a worktree holding `README.md`:
+/// `format-patch README.md --always` is
+/// `fatal: option '--always' must come before non-option arguments`, while
+/// `format-patch README.md HEAD` is `fatal: HEAD: no such path in the working
+/// tree.` and `format-patch README.md --no-thread` — a format-patch option, so
+/// gone from argv before the sweep — is accepted.
+/// Returns the `die()` text, which the caller prints only once it has confirmed
+/// nothing earlier on the command line preempts it.
+fn verify_filenames(words: &[&str]) -> Option<String> {
+    for (n, word) in words.iter().enumerate() {
+        if word.starts_with('-') {
+            return Some(format!(
+                "option '{word}' must come before non-option arguments"
+            ));
+        }
+        if looks_like_pathspec(word) || check_filename(word) {
+            continue;
+        }
+        // `die_verify_filename()`: only the word that failed to be a revision
+        // gets the "did you mean a revision?" wording.
+        return Some(if n == 0 {
+            ambiguous_msg(word)
+        } else {
+            format!(
+                "{word}: no such path in the working tree.\n\
+                 Use 'git <command> -- <path>...' to specify paths that do not exist locally."
+            )
+        });
+    }
+    None
+}
 
 /// The namespace `--branches`/`--tags`/`--remotes` iterate, as
 /// `refs_for_each_branch_ref()` and friends spell it.
@@ -1385,12 +1603,19 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
         unsorted_input: false,
         revs: Vec::new(),
         paths: Vec::new(),
+        seen_dashdash: false,
+        argv: args.to_vec(),
+        pathspec: None,
         context: 3,
         algorithm: Algorithm::Myers,
         text: false,
         no_binary: false,
         ignore_regex: Vec::new(),
         function_context: false,
+        ws: super::diff_pairs::Whitespace::Keep,
+        full_index: false,
+        irreversible_delete: false,
+        skip_or_rotate: None,
         deferred: Vec::new(),
         range_diff: None,
         creation_factor: None,
@@ -1439,7 +1664,10 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
             record_opt_error(&mut o.opt_error, i, 129, line);
         }
         match a {
-            "--" => pathspec_mode = true,
+            "--" => {
+                pathspec_mode = true;
+                o.seen_dashdash = true;
+            }
             // parse_options_step()'s `internal_help`, which `cmd_format_patch`
             // runs before `setup_revisions`: the block on stdout at 129.
             // `--help-all` is the same step's own `strcmp()` and renders
@@ -1871,6 +2099,30 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
             s if s.starts_with("--dst-prefix=") => {
                 o.dst_prefix = s["--dst-prefix=".len()..].to_owned();
                 o.noprefix = false;
+            }
+            // xdiff's `XDF_WHITESPACE_FLAGS`. Each is a plain assignment in
+            // `diff_opt_parse()`, so the last one on the command line decides.
+            "-w" | "--ignore-all-space" => o.ws = super::diff_pairs::Whitespace::IgnoreAll,
+            "-b" | "--ignore-space-change" => o.ws = super::diff_pairs::Whitespace::IgnoreChange,
+            "--ignore-space-at-eol" => o.ws = super::diff_pairs::Whitespace::IgnoreAtEol,
+            "--ignore-cr-at-eol" => o.ws = super::diff_pairs::Whitespace::IgnoreCrAtEol,
+            // `--full-index` pins the `index` line to the full object name;
+            // `diff_setup_done()` lets it win over any `--abbrev` that was given.
+            "--full-index" => o.full_index = true,
+            "--no-full-index" => o.full_index = false,
+            "-D" | "--irreversible-delete" => o.irreversible_delete = true,
+            // `--rotate-to`/`--skip-to` share `diff_options::rotate_to` and differ
+            // only in `skip_instead_of_rotate`, so whichever comes last wins.
+            "--skip-to" | "--rotate-to" => {
+                i += 1;
+                let path = value_at(args, i, a)?;
+                o.skip_or_rotate = Some((a == "--skip-to", path.into_bytes()));
+            }
+            s if s.starts_with("--skip-to=") => {
+                o.skip_or_rotate = Some((true, s["--skip-to=".len()..].as_bytes().to_vec()));
+            }
+            s if s.starts_with("--rotate-to=") => {
+                o.skip_or_rotate = Some((false, s["--rotate-to=".len()..].as_bytes().to_vec()));
             }
             // git's `--color=<when>` runs `git_config_colorbool(NULL, arg)`,
             // which accepts only never/always/auto (case-insensitively) and
@@ -2956,12 +3208,17 @@ fn author_date(repo: &gix::Repository, id: ObjectId) -> i64 {
 
 /// git's `die_verify_filename()` wording for an argument that is neither a
 /// revision nor an existing path.
-fn ambiguous(spec: &str) -> ExitCode {
-    fatal(&format!(
+///
+/// Only the text is needed: every caller has to decide *whether* to print it
+/// before printing it, and a rejected range reaches this message through
+/// `verify_filename()`'s sweep over the remaining arguments rather than on its
+/// own.
+fn ambiguous_msg(spec: &str) -> String {
+    format!(
         "ambiguous argument '{spec}': unknown revision or path not in the working tree.\n\
          Use '--' to separate paths from revisions, like this:\n\
          'git <command> [<revision>...] -- [<file>...]'"
-    ))
+    )
 }
 
 /// A full-length object name is reported as a missing object rather than as an
@@ -3049,50 +3306,67 @@ fn seed_pending(
                 None => compute(),
             }
         };
-        // A missing side of a range is reported against the whole range: as a
-        // missing object when it was spelled as one, else as an ambiguous
-        // argument, exactly as git's `setup_revisions()` does.
-        let range_error = |side: &str| -> ExitCode {
-            if is_full_oid(side, hexsz) {
-                fatal(&format!("Invalid revision range {spec}"))
-            } else {
-                ambiguous(spec)
-            }
-        };
-
-        if let Some((left, right)) = spec.split_once("...") {
-            let (left, right) = (or_head(left), or_head(right));
-            let Some(a) = resolve(left) else {
-                return Ok(Err(rev_err(&|| range_error(left))));
-            };
-            let Some(b) = resolve(right) else {
-                return Ok(Err(rev_err(&|| range_error(right))));
-            };
+        // `handle_dotdot()` is the first thing `handle_revision_arg_1()` tries,
+        // and `handle_dotdot_1()` is the *whole* of the range rule: endpoint
+        // resolution by `get_oid_with_context()`, `parse_object()` on both, and
+        // — for `<a>...<b>` only — `lookup_commit_reference()` on each end. Ask
+        // [`crate::objname`] rather than re-deriving it here; the copy that used
+        // to stand in this spot peeled every endpoint straight to a commit,
+        // which collapsed git's three separate endings into one and printed
+        // `Invalid revision range` even for a symmetric difference.
+        //
+        // A `NotARange` answer is `handle_dotdot()` returning non-zero, which in
+        // git is not an error at all — control simply falls through to the `^`
+        // and single-name branches below, so `^<a>..<b>` still ends as
+        // `bad revision '<token>'` and `nosuchthing..HEAD` as the ambiguous
+        // argument.
+        //
+        // A bare `..` never gets that far: it is the pathspec for the parent
+        // directory (see [`crate::objname::is_parent_directory_pathspec`]), so
+        // it falls through to the single-name branch, fails to resolve, and
+        // joins the prune data.
+        let range = (!crate::objname::is_parent_directory_pathspec(spec, o.seen_dashdash))
+            .then(|| crate::objname::split_range(spec))
+            .flatten()
+            .map(|r| (r.symmetric, crate::objname::dotdot(&repo, spec)));
+        if let Some((symmetric, crate::objname::Dotdot::Missing { .. })) = &range {
+            // `dotdot_missing()`, with whatever `lookup_commit_reference()`
+            // already printed ahead of it. Rendered here but reported through
+            // `rev_err`, which may find an earlier diff-option error preempts it.
+            let message = crate::objname::dotdot_fatal(&repo, spec)
+                .unwrap_or_else(|| format!("fatal: {}\n", crate::objname::dotdot_missing_message(spec, *symmetric)));
+            return Ok(Err(rev_err(&|| {
+                eprint!("{message}");
+                ExitCode::from(128)
+            })));
+        }
+        if let Some((symmetric, crate::objname::Dotdot::Ok { a, b })) = range {
             p.rev_input_given = true;
-            // `a...b` is everything reachable from either tip but not both. Both
-            // sides carry the sense in force and the merge bases carry its
-            // opposite, which is what `handle_dotdot_1()`'s `flags_exclude` is.
-            let (sides, bases) = if negate {
-                (&mut p.hidden, &mut p.tips)
-            } else {
-                (&mut p.tips, &mut p.hidden)
-            };
-            sides.push(a);
-            sides.push(b);
-            for base in repo.merge_bases_many(a, &[b])? {
-                bases.push(base.detach());
-            }
-        } else if let Some((left, right)) = spec.split_once("..") {
-            let (left, right) = (or_head(left), or_head(right));
-            let Some(a) = resolve(left) else {
-                return Ok(Err(rev_err(&|| range_error(left))));
-            };
-            let Some(b) = resolve(right) else {
-                return Ok(Err(rev_err(&|| range_error(right))));
-            };
-            p.rev_input_given = true;
-            // The left side always carries the opposite sense of the right.
-            if negate {
+            // The endpoints go on the pending list as the objects git pended —
+            // for `<a>..<b>` of whatever type, since only the symmetric form
+            // type-checks. A tree or a blob is dropped later, by
+            // `prepare_revision_walk()`, and *not* here: `cmd_format_patch`'s
+            // `<since>` shorthand counts `rev.pending.nr` while the entry is
+            // still on the list, so dropping it early would turn
+            // `<tree>..HEAD` into a one-object pending list and format nothing.
+            if symmetric {
+                // `a...b` is everything reachable from either tip but not both.
+                // Both sides carry the sense in force and the merge bases carry
+                // its opposite — `handle_dotdot_1()`'s `flags_exclude`.
+                let (sides, bases) = if negate {
+                    (&mut p.hidden, &mut p.tips)
+                } else {
+                    (&mut p.tips, &mut p.hidden)
+                };
+                sides.push(a);
+                sides.push(b);
+                // Both ends are commits by now: the symmetric form ran them
+                // through `lookup_commit_reference()` before it got here.
+                for base in repo.merge_bases_many(a, &[b])? {
+                    bases.push(base.detach());
+                }
+            } else if negate {
+                // The left side always carries the opposite sense of the right.
                 p.tips.push(a);
                 p.hidden.push(b);
             } else {
@@ -3130,15 +3404,29 @@ fn seed_pending(
                         p.tips.push(id);
                     }
                 }
-                // git falls back to treating the argument as a pathspec when it
-                // names something that exists in the worktree. That is
-                // `handle_revision_arg()` returning non-zero, so it leaves
-                // `rev_input_given` alone.
-                None if std::path::Path::new(spec).exists() => p.paths.push(spec.clone()),
                 None if is_full_oid(spec, hexsz) => {
                     return Ok(Err(rev_err(&|| fatal(&format!("bad object {spec}")))))
                 }
-                None => return Ok(Err(rev_err(&|| ambiguous(spec)))),
+                // `handle_revision_arg()` returned non-zero. With a `--` anywhere
+                // on the line `REVARG_CANNOT_BE_FILENAME` is in force and the word
+                // has nowhere left to go.
+                None if o.seen_dashdash => {
+                    return Ok(Err(rev_err(&|| {
+                        fatal(&format!("bad revision '{spec}'"))
+                    })))
+                }
+                // Otherwise this word and *every word after it* are prune data, so
+                // git verifies them all as filenames and then stops resolving
+                // revisions entirely. It leaves `rev_input_given` alone, which is
+                // what lets `s_r_opt.def` still supply HEAD.
+                None => {
+                    let rest = revision_argv_from(&o.argv, rpos);
+                    if let Some(msg) = verify_filenames(&rest) {
+                        return Ok(Err(rev_err(&|| fatal(&msg))));
+                    }
+                    p.paths.extend(rest.iter().map(|s| (*s).to_owned()));
+                    break;
+                }
             }
         }
     }
@@ -3207,6 +3495,23 @@ fn select_commits(repo: &gix::Repository, o: &Opts) -> Result<Selected> {
         Ok(p) => p,
         Err(code) => return Ok(Selected::Exit(code)),
     };
+    // `prepare_revision_walk()` runs `handle_commit()` over the pending list, and
+    // that is where a tree or a blob endpoint disappears — silently, because
+    // `rev.tree_objects`/`rev.blob_objects` are off for format-patch. It happens
+    // *after* `cmd_format_patch` has counted `rev.pending.nr`, which is why the
+    // filter is here rather than in `seed_pending`.
+    let walkable = |ids: Vec<ObjectId>| -> Vec<ObjectId> {
+        ids.into_iter().filter_map(|id| crate::objname::walk_pending(repo, id)).collect()
+    };
+    let (tips, hidden) = (walkable(tips), walkable(hidden));
+
+    // `parse_pathspec()` runs inside `setup_revisions()`, so a malformed spec is
+    // fatal before a single commit is walked — including on the paths below that
+    // never consult the set.
+    let specs = match paths.is_empty() {
+        true => None,
+        false => Some(super::log::PathspecMatcher::new(repo, &paths)?),
+    };
 
     if tips.is_empty() {
         return Ok(Selected::Commits {
@@ -3250,7 +3555,7 @@ fn select_commits(repo: &gix::Repository, o: &Opts) -> Result<Selected> {
         }
     } else {
         let mut platform = repo
-            .rev_walk(tips)
+            .rev_walk(tips.clone())
             .sorting(Sorting::ByCommitTime(CommitTimeOrder::NewestFirst));
         if o.first_parent {
             platform = platform.first_parent_only();
@@ -3262,6 +3567,15 @@ fn select_commits(repo: &gix::Repository, o: &Opts) -> Result<Selected> {
             let info = info?;
             parents_of.insert(info.id, info.parent_ids.to_vec());
             walked.push(info.id);
+        }
+    }
+
+    // `limit_list()` simplifies the history over the pathspec before anything is
+    // ordered or counted. `prepare_revision_walk()` returns before that call
+    // under `--no-walk`, so a pathspec limits nothing there.
+    if let Some(specs) = specs.as_ref() {
+        if !o.no_walk {
+            prune_treesame(repo, &mut walked, &parents_of, &tips, specs, o.first_parent)?;
         }
     }
 
@@ -3319,6 +3633,98 @@ fn select_commits(repo: &gix::Repository, o: &Opts) -> Result<Selected> {
         paths,
         pending,
     })
+}
+
+/// Port of `try_to_simplify_commit()` + `get_commit_action()`'s TREESAME arm
+/// (revision.c), which is what `-- <pathspec>` does to the walk.
+///
+/// A commit whose tree matches a parent's over the pathspec is TREESAME: it is
+/// not shown, and the history it stands on is pruned to that one parent, so the
+/// other branches of a merge stop being walked at all. Whatever the pruned
+/// ancestry no longer reaches from the tips is therefore never seen — that is
+/// the reachability sweep below, not an optimisation.
+///
+/// format-patch sets neither `rewrite_parents` nor `children`, so
+/// `want_ancestry()` is false and a TREESAME commit is dropped whatever its
+/// parent count. A root commit is compared against the empty tree, so it shows
+/// exactly when it introduced a matching path.
+///
+/// Observed against stock git 2.55.0 over a fixture whose only `README.md`
+/// change is the root commit: `format-patch -1 -- README.md` formats that root
+/// commit and nothing else, while `format-patch -1 -- nosuch` formats nothing
+/// and exits 0.
+fn prune_treesame(
+    repo: &gix::Repository,
+    walked: &mut Vec<ObjectId>,
+    parents_of: &HashMap<ObjectId, Vec<ObjectId>>,
+    tips: &[ObjectId],
+    specs: &super::log::PathspecMatcher,
+    first_parent: bool,
+) -> Result<()> {
+    // id → (the parents the simplified history follows, whether it is shown).
+    let mut simplified: HashMap<ObjectId, (Vec<ObjectId>, bool)> =
+        HashMap::with_capacity(walked.len());
+    for id in walked.iter() {
+        let all = parents_of.get(id).map_or(&[][..], Vec::as_slice);
+        // `--first-parent` limits the comparison the same way it limits the walk.
+        let parents = if first_parent { &all[..all.len().min(1)] } else { all };
+        if parents.is_empty() {
+            let shown = touches_pathspec(repo, *id, None, specs)?;
+            simplified.insert(*id, (Vec::new(), shown));
+            continue;
+        }
+        let mut treesame: Option<ObjectId> = None;
+        for p in parents {
+            if !touches_pathspec(repo, *id, Some(*p), specs)? {
+                treesame = Some(*p);
+                break;
+            }
+        }
+        match treesame {
+            Some(p) => simplified.insert(*id, (vec![p], false)),
+            None => simplified.insert(*id, (parents.to_vec(), true)),
+        };
+    }
+
+    let mut reachable: HashSet<ObjectId> = HashSet::with_capacity(walked.len());
+    let mut stack: Vec<ObjectId> = tips.to_vec();
+    while let Some(id) = stack.pop() {
+        if !reachable.insert(id) {
+            continue;
+        }
+        if let Some((parents, _)) = simplified.get(&id) {
+            stack.extend(parents.iter().copied());
+        }
+    }
+    walked.retain(|id| {
+        reachable.contains(id) && simplified.get(id).is_some_and(|(_, shown)| *shown)
+    });
+    Ok(())
+}
+
+/// `rev_compare_tree()`: does anything the pathspec selects differ between this
+/// commit and `parent` (or the empty tree)?
+///
+/// `diff_tree_oid()` applies the pathspec while it walks and rename detection
+/// never runs here, so a rename into or out of the set counts as a change on
+/// whichever side the set contains.
+fn touches_pathspec(
+    repo: &gix::Repository,
+    commit: ObjectId,
+    parent: Option<ObjectId>,
+    specs: &super::log::PathspecMatcher,
+) -> Result<bool> {
+    let new_tree = repo.find_object(commit)?.try_into_commit()?.tree()?;
+    let old_tree = match parent {
+        Some(p) => Some(repo.find_object(p)?.try_into_commit()?.tree()?),
+        None => None,
+    };
+    let changes =
+        repo.diff_tree_to_tree(old_tree.as_ref(), Some(&new_tree), gix::diff::Options::default())?;
+    Ok(changes
+        .iter()
+        .filter(|c| !is_tree_entry(c))
+        .any(|c| specs.matches(change_path(c))))
 }
 
 // ---------------------------------------------------------------------------
@@ -3565,21 +3971,19 @@ fn render_message(
         Some(pid) => Some(pid.object()?.try_into_commit()?.tree()?),
         None => None,
     };
-    let abbrev = new_tree.id().shorten()?.hex_len();
-    let changes = tree_changes(repo, old_tree.as_ref(), Some(&new_tree))?;
+    let abbrev = index_abbrev(repo, &new_tree, opts)?;
+    let mut changes = tree_changes(repo, old_tree.as_ref(), Some(&new_tree), opts.pathspec.as_ref())?;
+    rotate_changes(&mut changes, opts);
 
     if !changes.is_empty() {
         let mut patch: Vec<u8> = Vec::new();
-        let mut stats: Vec<StatEntry> = Vec::new();
-        for change in &changes {
-            stats.push(emit_change(repo, &mut patch, change, abbrev, opts)?);
-        }
+        let (kept, stats) = render_changes(repo, &mut patch, &changes, abbrev, opts)?;
 
         let stat_sep = mime_stat_sep(commit, nr, opts)?;
         emit_stat_blocks(
             repo,
             out,
-            &changes,
+            &kept,
             &stats,
             opts,
             shown_dashes,
@@ -3828,17 +4232,15 @@ fn render_cover_letter(
             Some(repo.find_object(origin)?.try_into_commit()?.tree()?)
         };
         let head_tree = repo.find_object(head)?.try_into_commit()?.tree()?;
-        let abbrev = head_tree.id().shorten()?.hex_len();
-        let changes = tree_changes(repo, base.as_ref(), Some(&head_tree))?;
+        let abbrev = index_abbrev(repo, &head_tree, opts)?;
+        let mut changes = tree_changes(repo, base.as_ref(), Some(&head_tree), opts.pathspec.as_ref())?;
+        rotate_changes(&mut changes, opts);
         let mut discard: Vec<u8> = Vec::new();
-        let mut stats: Vec<StatEntry> = Vec::new();
-        for change in &changes {
-            stats.push(emit_change(repo, &mut discard, change, abbrev, opts)?);
-        }
+        let (kept, stats) = render_changes(repo, &mut discard, &changes, abbrev, opts)?;
         // `show_diffstat()` memcpy's `rev->diffopt`, keeping the width knobs, so
         // the cover letter's combined diffstat honors them too.
         emit_stats(out, &stats, StatWidths::from_opts(opts))?;
-        emit_summary(out, &changes)?;
+        emit_summary(out, &kept)?;
         out.push(b'\n');
     }
     Ok(Ok(()))
@@ -4288,7 +4690,7 @@ fn commit_patch_id(repo: &gix::Repository, commit: &gix::Commit<'_>) -> Result<O
         Some(pid) => Some(pid.object()?.try_into_commit()?.tree()?),
         None => None,
     };
-    let changes = tree_changes(repo, old_tree.as_ref(), Some(&new_tree))?;
+    let changes = tree_changes(repo, old_tree.as_ref(), Some(&new_tree), None)?;
 
     let mut result = vec![0u8; kind.len_in_bytes()];
     let mut ctx = gix::hash::hasher(kind);
@@ -4502,17 +4904,108 @@ fn write_signature(out: &mut Vec<u8>, opts: &Opts) {
 /// `tree_with_rewrites` reports the directory entry *and* its recursed contents;
 /// git's patch format only names blobs and submodules, so tree entries are
 /// dropped — keeping one would render a raw tree object as a binary file.
+///
+/// A `-- <pathspec>` is applied here, before rename detection, because git
+/// applies it inside `diff_tree_oid()`'s walk (`tree_entry_interesting()`) and
+/// only then runs `diffcore_std()`. So a rename whose other half the pathspec
+/// excludes never becomes a pair: `format-patch -- old` over a `old` → `new`
+/// rename reports a plain deletion.
 fn tree_changes(
     repo: &gix::Repository,
     old_tree: Option<&gix::Tree<'_>>,
     new_tree: Option<&gix::Tree<'_>>,
+    specs: Option<&super::log::PathspecMatcher>,
 ) -> Result<Vec<ChangeDetached>> {
     let mut changes =
         repo.diff_tree_to_tree(old_tree, new_tree, gix::diff::Options::default())?;
     changes.retain(|c| !is_tree_entry(c));
+    if let Some(specs) = specs {
+        changes.retain(|c| specs.matches(change_path(c)));
+    }
     changes.sort_by(|a, b| change_path(a).cmp(change_path(b)));
     detect_renames(repo, &mut changes)?;
     Ok(changes)
+}
+
+/// Port of `diffcore_rotate()` (diff.c), which `diffcore_std()` runs over the
+/// queue before any format sees it — so the diffstat, the summary, the dirstat
+/// and the patch all agree on the new order.
+///
+/// `--rotate-to=<path>` moves the pair naming `<path>` to the front and sends the
+/// pairs that stood before it to the back; `--skip-to=<path>` drops them instead.
+///
+/// The anchor is the first pair whose name sorts at or *after* `<path>`, not an
+/// exact match: a path the commit did not touch still splits the queue where it
+/// would have stood. When every name sorts before it there is no anchor at all
+/// and the queue is left alone — only `git diff` sets `rotate_to_strict`, so
+/// nothing here dies. Both halves verified against stock git 2.55.0 over a commit
+/// touching `del.txt`, `f.txt` and `new.txt`: `format-patch --skip-to=ig.txt`
+/// prints `new.txt` alone, while `--skip-to=nope` prints all three.
+fn rotate_changes(changes: &mut Vec<ChangeDetached>, opts: &Opts) {
+    let Some((skip, path)) = &opts.skip_or_rotate else {
+        return;
+    };
+    let Some(at) = changes
+        .iter()
+        .position(|c| change_path(c) >= path.as_slice())
+    else {
+        return;
+    };
+    let head: Vec<ChangeDetached> = changes.drain(..at).collect();
+    if !skip {
+        changes.extend(head);
+    }
+}
+
+/// Render every queued change into `patch`, returning the changes and the stat
+/// rows the output formats should be shown.
+///
+/// Once a whitespace option or `-I<re>` is in force git decides the queue from
+/// the rendered body (`diff_setup_done()`'s `diff_from_contents`): an in-place
+/// edit whose diff came out empty is dropped from *every* format, while an
+/// addition, a deletion, a rename and a mode change stay — none of those had the
+/// body as their only reason to appear.
+///
+/// Observed against stock git 2.55.0 over a commit that mixes the shapes: with
+/// `-b`, `git diff --raw`, `--name-status`, `--stat` and the patch all omit the
+/// whitespace-only edit, while the same commit's mode change still prints
+/// ` mode.txt | 0` and a rename carrying a whitespace-only edit still prints
+/// ` ren.txt => ren2.txt | 0` plus a body-less `diff --git` block.
+fn render_changes(
+    repo: &gix::Repository,
+    patch: &mut Vec<u8>,
+    changes: &[ChangeDetached],
+    abbrev: usize,
+    opts: &Opts,
+) -> Result<(Vec<ChangeDetached>, Vec<StatEntry>)> {
+    let from_contents =
+        opts.ws != super::diff_pairs::Whitespace::Keep || !opts.ignore_regex.is_empty();
+    let mut kept: Vec<ChangeDetached> = Vec::with_capacity(changes.len());
+    let mut stats: Vec<StatEntry> = Vec::with_capacity(changes.len());
+    for change in changes {
+        let mut one: Vec<u8> = Vec::new();
+        let stat = emit_change(repo, &mut one, change, abbrev, opts)?;
+        if from_contents && stat.added == 0 && stat.deleted == 0 && is_plain_edit(change) {
+            continue;
+        }
+        patch.extend_from_slice(&one);
+        stats.push(stat);
+        kept.push(change.clone());
+    }
+    Ok((kept, stats))
+}
+
+/// An in-place content edit — both sides present, same path, same mode. It is the
+/// one change shape whose only reason to be in the queue is its diff body.
+fn is_plain_edit(change: &ChangeDetached) -> bool {
+    matches!(
+        change,
+        ChangeDetached::Modification {
+            previous_entry_mode,
+            entry_mode,
+            ..
+        } if previous_entry_mode.value() == entry_mode.value()
+    )
 }
 
 /// `diffcore_rename()`: replace each deletion/addition pair whose content matches (or
@@ -5201,11 +5694,24 @@ fn emit_dirstat(
     let mut changed: u64 = 0;
 
     for change in changes {
-        let damage = match change {
-            // An unchanged blob id means identical content, whatever else moved.
+        // `p->one->oid_valid && p->two->oid_valid && oideq(&p->one->oid,
+        // &p->two->oid)`: an unchanged blob id means identical content, whatever
+        // else moved. git tests that *before* the `--dirstat-by-file` shortcut,
+        // so a pure rename contributes nothing to either mode — verified against
+        // stock git 2.55.0, whose `format-patch --dirstat-by-file` prints no
+        // dirstat block at all for a commit that only renames a file.
+        //
+        // An addition or a deletion has only one valid side, so the test cannot
+        // fire for it and its damage is its whole size (or 1 by file).
+        let unchanged_blob = match change {
             ChangeDetached::Modification {
                 previous_id, id, ..
-            } if previous_id == id => 0,
+            } => previous_id == id,
+            ChangeDetached::Rewrite { source_id, id, .. } => source_id == id,
+            _ => false,
+        };
+        let damage = match change {
+            _ if unchanged_blob => 0,
             _ if cfg.by_file => 1,
             ChangeDetached::Modification {
                 previous_entry_mode,
@@ -5229,7 +5735,7 @@ fn emit_dirstat(
                 entry_mode, id, ..
             } => content_of(repo, *id, entry_mode.is_commit())?.len() as u64,
             // A rename is charged the damage between its two sides, the same way a
-            // modification is; an unchanged move costs nothing.
+            // modification is; an unchanged move was already handled above.
             ChangeDetached::Rewrite {
                 source_entry_mode,
                 source_id,
@@ -5239,14 +5745,16 @@ fn emit_dirstat(
             } => {
                 let old = content_of(repo, *source_id, source_entry_mode.is_commit())?;
                 let new = content_of(repo, *id, entry_mode.is_commit())?;
-                if source_id == id {
-                    0
-                } else {
-                    let (added, copied) = count_changes(&old, &new);
-                    ((old.len() as u64 - copied) + added).max(1)
-                }
+                let (added, copied) = count_changes(&old, &new);
+                ((old.len() as u64 - copied) + added).max(1)
             }
         };
+        // `found_damage: if (!damage) continue;` — a file that did no damage never
+        // joins `dir->files`, and `gather_dirstat()`'s `sources` counter can tell
+        // the difference between an absent entry and a zero-valued one.
+        if damage == 0 {
+            continue;
+        }
         files.push(DirstatFile {
             name: change_path(change).to_vec(),
             changed: damage,
@@ -5632,7 +6140,13 @@ fn emit_change(
             reject_binary(is_sub, &content, path, opts)?;
             let short = short_oid(repo, *id, abbrev, is_sub)?;
             writeln!(out, "index {}..{}", short, "0".repeat(short.len()))?;
-            counts = emit_body(out, Some(path), None, &content, &[], opts)?;
+            // `-D`/`--irreversible-delete`: `builtin_diff()` stops as soon as it
+            // sees `/dev/null` on the post-image side, so a deletion carries no
+            // body. The diffstat is computed by its own pass and is untouched,
+            // so the removed lines are still counted here.
+            let mut sink = Vec::new();
+            let body = if opts.irreversible_delete { &mut sink } else { &mut *out };
+            counts = emit_body(body, Some(path), None, &content, &[], opts)?;
         }
         ChangeDetached::Modification {
             location,
@@ -5830,6 +6344,32 @@ fn emit_text_hunks(
     new: &[u8],
     opts: &Opts,
 ) -> Result<(u64, u64)> {
+    // `-w`/`-b`/`--ignore-space-at-eol`/`--ignore-cr-at-eol`: `xdl_recmatch()`
+    // compares canonicalised records while the emitter prints the originals, so
+    // the interner is fed normalized lines and every emitted line is indexed out
+    // of the raw ones. The hand-rolled `xdl_emit_diff()` port is the only emitter
+    // that can keep the two apart, so the whitespace flags route through it.
+    if opts.ws != super::diff_pairs::Whitespace::Keep {
+        let before = super::diff_pairs::byte_lines(old);
+        let after = super::diff_pairs::byte_lines(new);
+        let mut input: InternedInput<Vec<u8>> = InternedInput::default();
+        input.update_before(
+            before
+                .iter()
+                .map(|l| super::diff_pairs::normalize(l, opts.ws)),
+        );
+        input.update_after(
+            after
+                .iter()
+                .map(|l| super::diff_pairs::normalize(l, opts.ws)),
+        );
+        // `xdl_change_compact()`'s `get_indent()` reads the unmodified record, so
+        // the slider heuristic scores the raw lines, not the normalized tokens.
+        let diff =
+            super::diff_pairs::compute_compacted(opts.algorithm, &input, &before, &after, true);
+        return emit_hunks_with_ignorable(out, &diff, &before, &after, opts);
+    }
+
     let input = InternedInput::new(old, new);
     let diff = diff_with_slider_heuristics(opts.algorithm, &input);
     let before_lines: Vec<&[u8]> = input.before.iter().map(|&t| input.interner[t]).collect();
@@ -6246,11 +6786,23 @@ fn short_oid(
     abbrev: usize,
     is_submodule: bool,
 ) -> Result<String> {
-    if is_submodule {
+    // `--full-index` raises `abbrev` to `the_hash_algo->hexsz` in
+    // `diff_setup_done()`, and `diff_abbrev_oid()` then prints the whole name
+    // without asking the object store how short it could be.
+    if is_submodule || abbrev >= repo.object_hash().len_in_hex() {
         Ok(id.to_hex_with_len(abbrev).to_string())
     } else {
         Ok(id.attach(repo).shorten()?.to_string())
     }
+}
+
+/// The abbreviation every `index` line of one tree diff uses: git's
+/// `diff_setup_done()` pins it to the full hash length under `--full-index`.
+fn index_abbrev(repo: &gix::Repository, tree: &gix::Tree<'_>, opts: &Opts) -> Result<usize> {
+    if opts.full_index {
+        return Ok(repo.object_hash().len_in_hex());
+    }
+    Ok(tree.id().shorten()?.hex_len())
 }
 
 /// The path of a change, for stable diff ordering.

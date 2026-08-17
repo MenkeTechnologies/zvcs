@@ -23,12 +23,9 @@
 //! appends ` at line <n>`. As before, the value is consulted only inside a
 //! repository; a global-only setting outside one still resolves to `merge`.
 //!
-//! `patience` is accepted as a *value* exactly as git accepts it, so command
-//! lines that name it and then fail for an unrelated reason (a bad operand
-//! count, a later bad `--diff-algorithm`, a missing file) fail identically to
-//! git. Only a merge that would actually be computed with patience is refused:
-//! the vendored `imara-diff` has no patience implementation, and silently
-//! substituting another algorithm would change the merge result.
+//! Each `--diff-algorithm` value names a `gix-imara-diff` algorithm, `patience`
+//! included — `gix-imara-diff`'s `patience.rs` is a port of git's
+//! `xdiff/xpatience.c`, so the merge really is computed the way the flag asks.
 //!
 //! The three-way line merge itself is the vendored `gix-merge` crate's built-in
 //! text driver (`blob/builtin_driver/text`), which is a port of git's
@@ -108,7 +105,7 @@ pub fn merge_file(args: &[String]) -> Result<ExitCode> {
     let mut style: Option<ConflictStyle> = None;
     // git stores this in a C `int` and only clamps it (to 7) at merge time.
     let mut marker_size: i64 = 7;
-    let mut algorithm = DiffAlgorithm::Imara(Algorithm::Myers);
+    let mut algorithm = Algorithm::Myers;
     let mut label_args: Vec<String> = Vec::new();
     let mut operands: Vec<&str> = Vec::new();
     let mut no_more_opts = false;
@@ -194,10 +191,10 @@ pub fn merge_file(args: &[String]) -> Result<ExitCode> {
                         return Ok(option_error("option `diff-algorithm' requires a value"));
                     };
                     algorithm = match v {
-                        "myers" | "default" => DiffAlgorithm::Imara(Algorithm::Myers),
-                        "minimal" => DiffAlgorithm::Imara(Algorithm::MyersMinimal),
-                        "histogram" => DiffAlgorithm::Imara(Algorithm::Histogram),
-                        "patience" => DiffAlgorithm::Patience,
+                        "myers" | "default" => Algorithm::Myers,
+                        "minimal" => Algorithm::MyersMinimal,
+                        "histogram" => Algorithm::Histogram,
+                        "patience" => Algorithm::Patience,
                         _ => {
                             return Ok(option_error(
                                 "option diff-algorithm accepts \"myers\", \"minimal\", \"patience\" and \"histogram\"",
@@ -294,15 +291,6 @@ pub fn merge_file(args: &[String]) -> Result<ExitCode> {
         other: Some(label_args.get(2).map_or(operands[2], String::as_str).as_bytes().as_bstr()),
     };
 
-    // Every failure git reports before it diffs has been reproduced by now, so
-    // this is the first point at which the missing algorithm actually matters.
-    let algorithm = match algorithm {
-        DiffAlgorithm::Imara(algorithm) => algorithm,
-        DiffAlgorithm::Patience => anyhow::bail!(
-            "--diff-algorithm=patience is unsupported"
-        ),
-    };
-
     // `builtin/merge-file.c` sets `xmp.level = XDL_MERGE_ZEALOUS_ALNUM`, one level
     // above what `git merge` runs at. `xmp.style` is set independently of
     // `xmp.favor`, so `--zdiff3 --union` still refines regions the zdiff3 way.
@@ -337,16 +325,6 @@ fn next_value<'a>(argv: &'a [String], i: &mut usize) -> Option<&'a str> {
     let value = argv.get(*i)?.as_str();
     *i += 1;
     Some(value)
-}
-
-/// Which diff implementation the merge should run on.
-///
-/// `patience` is a value git accepts, so it has to survive option parsing even
-/// though nothing can execute it; see the module docs.
-#[derive(Copy, Clone, Eq, PartialEq)]
-enum DiffAlgorithm {
-    Imara(Algorithm),
-    Patience,
 }
 
 /// Report an unrecognised option the way parse-options does: reason *and*

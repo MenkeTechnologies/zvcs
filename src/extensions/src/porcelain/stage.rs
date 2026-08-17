@@ -48,9 +48,21 @@
 //!     working directory's prefix.
 //! ```
 //!
-//! NOTE: this module currently duplicates the staging engine that [`add`](super::add)
-//! also carries. The two should be hoisted into one shared engine that both verbs
-//! call; this copy is the git-accurate one.
+//! NOTE: the parts of `cmd_add()` whose behaviour is observable *per index entry*
+//! are shared with [`add`](super::add) rather than reimplemented here — the
+//! `--renormalize` cache scan ([`super::add::renormalize_tracked_files`]), the
+//! sparse-checkout definition lookup ([`super::add::sparsity_to_consult`]), the
+//! submodule gitlink pass ([`super::add::moved_gitlinks`]), and the option table
+//! itself ([`super::add::LONG_OPTS`]). Keeping two copies of the cache scan is what
+//! previously let this verb miss the `ce_skip_worktree()` guard and the `-N`
+//! empty-blob write that `add` already had.
+//!
+//! What is still this module's own is the worktree walk and the pathspec-accounting
+//! built on it (`mark_seen_per_spec`, `unmatched_pathspec_exit`, the `--refresh`
+//! porcelain report, `chmod_pathspec`). Those diverge from `add`'s in ways that are
+//! not yet reconciled — most visibly, `add` prefixes pathspecs with the current
+//! directory and this walk does not, and `add` reports matched tracked paths in
+//! index order ahead of the new ones while [`report`] interleaves them.
 
 use anyhow::{anyhow, bail, Result};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -987,7 +999,10 @@ fn read_worktree_blob(
 /// The worktree bytes of `abs` as git would store them: a regular file goes
 /// through `convert_to_git()` (`.gitattributes` filters, `core.autocrlf`, …), a
 /// symlink's target is stored verbatim.
-fn read_converted_bytes(
+///
+/// Shared with [`super::add::renormalize_tracked_files`], which writes the objects
+/// of a `--renormalize` run for both verbs and needs exactly these bytes.
+pub(super) fn read_converted_bytes(
     repo: &gix::Repository,
     filters: &mut super::convert_to_git::WorktreeFilter,
     rela: &BStr,
@@ -1177,57 +1192,6 @@ fn add(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
     // (gix-pathspec/src/search/matching.rs:114), so it is filtered out here.
     let mut seen: HashSet<usize> = HashSet::new();
 
-    // `--renormalize` is driven by the *index*, not by a worktree walk:
-    // `renormalize_tracked_files()` (builtin/add.c) loops over the cache and hands
-    // every matching stage-0 blob to `add_file_to_index()`, which `die_errno`s on
-    // a failed `lstat`. A tracked file deleted from the worktree therefore aborts
-    // the whole command instead of being quietly skipped, and the index is never
-    // written. The walk below can never see such a path, so the check runs here.
-    if o.renormalize {
-        let backing = index.path_backing();
-        for e in index.entries() {
-            if e.stage() != Stage::Unconflicted {
-                continue; // "do not touch unmerged paths"
-            }
-            if !matches!(e.mode, Mode::FILE | Mode::FILE_EXECUTABLE | Mode::SYMLINK) {
-                continue; // "do not touch non blobs"
-            }
-            let path = e.path_in(backing);
-            let matched = ps
-                .pattern_matching_relative_path(path, Some(false))
-                .is_some_and(|m| !m.is_excluded());
-            if !matched {
-                continue;
-            }
-            let Some(full) = repo.workdir_path(path) else {
-                continue;
-            };
-            if std::fs::symlink_metadata(&full).is_err() {
-                eprintln!("fatal: unable to stat '{path}': No such file or directory");
-                return Ok(ExitCode::from(128));
-            }
-            // `add_to_index()` reaches `index_path()`, which hashes *and writes*
-            // the blob before the entry is recorded. The loop therefore leaves the
-            // objects for every path it got through in the store even when a later
-            // path aborts the command, which is observable in `cat-file
-            // --batch-all-objects`. Under `--dry-run` it hashes without writing:
-            // `hash_flags` starts as `pretend ? 0 : INDEX_WRITE_OBJECT`. Under
-            // `-N` it never hashes at all: `add_to_index()` takes the
-            // `intent_only` branch and calls
-            // `set_object_name_for_intent_to_add_entry()` in place of
-            // `index_path()`, so the empty blob is the only object written.
-            if !o.dry_run && !o.intent_to_add {
-                if let Ok(md) = gix::index::fs::Metadata::from_path_no_follow(&full) {
-                    if let Ok((content, _)) =
-                        read_converted_bytes(repo, &mut filters, path.as_ref(), &full, &md)
-                    {
-                        let _ = repo.write_blob(&content);
-                    }
-                }
-            }
-        }
-    }
-
     // --- decide what each candidate becomes ---------------------------------
     let mut staged: Vec<Staged> = Vec::new();
     let mut printed: BTreeMap<BString, &'static str> = BTreeMap::new();
@@ -1377,6 +1341,15 @@ fn add(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
             if e.stage() != Stage::Unconflicted || e.mode == Mode::COMMIT {
                 continue; // leave conflicted stages and submodule gitlinks alone
             }
+            // `PS_IGNORE_SKIP_WORKTREE`: an entry the sparse-checkout definition keeps
+            // out of the worktree is absent by design, never a deletion. Without this,
+            // `stage -A` in a cone-sparse repo staged the removal of every path outside
+            // the cone — `git stage --renormalize --all -v` reported
+            // `remove 'out/f.txt'` and dropped it from the index, where git touches
+            // neither. `add` has carried this guard all along.
+            if e.flags.contains(Flags::SKIP_WORKTREE) {
+                continue;
+            }
             let path = e.path_in(backing);
             let owned = path.to_owned();
             if staged_set.contains(&owned) || printed.contains_key(&owned) {
@@ -1413,6 +1386,32 @@ fn add(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
     mark_seen_per_spec(repo, &index, &patterns, o, &universe, &mut seen)?;
     if let Some(code) = unmatched_pathspec_exit(repo, o, &seen, o.update) {
         return Ok(code);
+    }
+
+    // `--renormalize` is driven by the *index*, not by the worktree walk above:
+    // `cmd_add()` calls `renormalize_tracked_files()` INSTEAD of
+    // `add_files_to_cache()`, and does so only after the pathspec validation — so
+    // `stage --renormalize a.txt nosuch` over a deleted `a.txt` reports the
+    // unmatched `nosuch`, not the failed stat. One implementation serves both
+    // verbs, because stock git dispatches `stage` to that same `cmd_add()`.
+    if o.renormalize {
+        if let Some(code) = super::add::renormalize_tracked_files(
+            repo,
+            &index,
+            &super::add::RenormalizeOpts {
+                include_sparse: o.sparse == Some(true),
+                dry_run: o.dry_run,
+                verbose: o.verbose,
+                intent_to_add: o.intent_to_add,
+            },
+            &mut filters,
+            |p| {
+                ps.pattern_matching_relative_path(p, Some(false))
+                    .is_some_and(|m| !m.is_excluded())
+            },
+        )? {
+            return Ok(code);
+        }
     }
 
     // An unreadable file is only survivable under `--ignore-errors`; otherwise git
@@ -1500,6 +1499,13 @@ fn add(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
     // restaged it, and never contributes to the verbose report.
     if let Some(executable) = chmod {
         let want = if executable { Mode::FILE_EXECUTABLE } else { Mode::FILE };
+        // `chmod_pathspec()` opens its cache loop with the very same sparse guard
+        // `renormalize_tracked_files()` does, so it is asked here through the same
+        // predicate. Without it, `stage --chmod=+x .` flipped the mode of every entry
+        // the sparse-checkout definition (or a `--skip-worktree` bit) keeps out of the
+        // worktree, which git leaves alone.
+        let include_sparse = o.sparse == Some(true);
+        let sparsity = super::add::sparsity_to_consult(repo, include_sparse)?;
         // Collect first, so the matcher and the index's shared borrow are both
         // released before the entries are mutated below.
         let wanted: HashSet<BString> = {
@@ -1517,6 +1523,12 @@ fn add(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
                 .filter(|e| {
                     e.stage() == Stage::Unconflicted
                         && (e.mode == Mode::FILE || e.mode == Mode::FILE_EXECUTABLE)
+                        && !super::add::skipped_as_sparse(
+                            e.flags,
+                            e.path_in(backing),
+                            include_sparse,
+                            sparsity.as_ref(),
+                        )
                 })
                 .map(|e| e.path_in(backing).to_owned())
                 .filter(|p| matcher.is_included(p.as_bstr(), Some(false)))

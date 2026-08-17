@@ -1196,21 +1196,6 @@ fn is_ancestor(repo: &gix::Repository, ancestor: ObjectId, descendant: ObjectId)
     Ok(bases.into_iter().any(|b| b.detach() == ancestor))
 }
 
-/// Resolve a filter operand to the commit git compares against: parse the rev,
-/// then peel to a commit. `--points-at` compares the object directly, so it does
-/// not peel. The error string is git's `malformed object name` fatal body.
-fn resolve_filter_commit(repo: &gix::Repository, spec: &str, peel: bool) -> Result<ObjectId> {
-    let bad = || anyhow!("malformed object name '{spec}'");
-    let id = repo
-        .rev_parse_single(BStr::new(spec.as_bytes()))
-        .map_err(|_| bad())?;
-    if !peel {
-        return Ok(id.detach());
-    }
-    let obj = id.object().map_err(|_| bad())?;
-    let commit = obj.peel_to_commit().map_err(|_| bad())?;
-    Ok(commit.id)
-}
 
 /// git's `ref_to_worktree_map` (`ref-filter.c`), the table `%(worktreepath)`
 /// looks a branch up in: every working tree whose `HEAD` is symbolic, keyed by
@@ -1605,11 +1590,12 @@ fn list_branches(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
         Ok(keys) => keys,
     };
 
-    // Resolve every reachability filter before walking refs; a bad operand is
-    // git's fatal 128.
+    // Resolve every reachability filter before walking refs. The operand's own
+    // callback decides the diagnostic and the status — 129 for the two that
+    // return `PARSE_OPT_ERROR`, 128 for `--merged`'s outright `die()`.
     let filters = match resolve_filters(repo, o) {
         Ok(f) => f,
-        Err(msg) => return fatal(msg),
+        Err(e) => return Ok(e.report()),
     };
 
     let entries = collect_entries(repo, o, &sort_keys, &filters)?;
@@ -1714,21 +1700,42 @@ fn emit_columns(colopts: u32, cells: Vec<Vec<u8>>) {
 }
 
 /// Resolve every `--contains`/`--no-contains`/`--merged`/`--no-merged`/
-/// `--points-at` operand to a concrete commit id (points-at is not peeled). A bad
-/// operand is reported as git's fatal string.
-fn resolve_filters(repo: &gix::Repository, o: &Opts) -> Result<Filters, String> {
-    let resolve = |specs: &[String], peel: bool| -> Result<Vec<ObjectId>, String> {
+/// `--points-at` operand.
+///
+/// git does this from three different `parse_options()` callbacks, and they do
+/// not share a diagnostic: `OPT_CONTAINS` is `parse_opt_commits`, `OPT_MERGED`
+/// is `parse_opt_merge_filter`, and `--points-at` is `parse_opt_object_name`
+/// (which never peels and never consults the odb, so it accepts an absent id and
+/// simply matches nothing). Routing all five through one resolver is what made
+/// every one of them report `fatal: malformed object name` at 128.
+fn resolve_filters(
+    repo: &gix::Repository,
+    o: &Opts,
+) -> Result<Filters, crate::objname::OperandError> {
+    let commits = |specs: &[String]| -> Result<Vec<ObjectId>, crate::objname::OperandError> {
         specs
             .iter()
-            .map(|s| resolve_filter_commit(repo, s, peel).map_err(|e| e.to_string()))
+            .map(|s| crate::objname::parse_opt_commits(repo, s))
+            .collect()
+    };
+    let merges = |specs: &[String],
+                  long_name: &str|
+     -> Result<Vec<ObjectId>, crate::objname::OperandError> {
+        specs
+            .iter()
+            .map(|s| crate::objname::parse_opt_merge_filter(repo, s, long_name))
             .collect()
     };
     Ok(Filters {
-        contains: resolve(&o.contains, true)?,
-        no_contains: resolve(&o.no_contains, true)?,
-        merged: resolve(&o.merged, true)?,
-        no_merged: resolve(&o.no_merged, true)?,
-        points_at: resolve(&o.points_at, false)?,
+        contains: commits(&o.contains)?,
+        no_contains: commits(&o.no_contains)?,
+        merged: merges(&o.merged, "merged")?,
+        no_merged: merges(&o.no_merged, "no-merged")?,
+        points_at: o
+            .points_at
+            .iter()
+            .map(|s| crate::objname::parse_opt_object_name(repo, s))
+            .collect::<Result<_, _>>()?,
     })
 }
 
@@ -1924,16 +1931,23 @@ fn create_branch(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
     // full name — used to decide tracking.
     let (target, start_ref): (ObjectId, Option<BString>) = match start {
         Some(s) => {
-            let id = match repo.rev_parse_single(BStr::new(s.as_bytes())) {
-                Ok(id) => id,
-                Err(_) => return fatal(format!("not a valid object name: '{s}'")),
+            // git's `dwim_branch_start()` (`branch.c`) draws the line here:
+            // `repo_get_oid_mb()` failing is `not a valid object name`, but a name
+            // that *did* resolve and then fails `lookup_commit_reference()` is
+            // `not a valid branch point` — which is what an absent full-length hex
+            // name reaches, since `get_oid_basic()` decodes it without asking the
+            // odb whether the object exists.
+            let Some(id) = crate::objname::resolve(repo, s) else {
+                return fatal(format!("not a valid object name: '{s}'"));
             };
-            let commit = match id.object() {
-                Ok(obj) => match obj.peel_to_commit() {
-                    Ok(c) => c.id,
-                    Err(_) => return fatal(format!("not a valid object name: '{s}'")),
-                },
-                Err(_) => return fatal(format!("not a valid object name: '{s}'")),
+            let found = crate::objname::lookup_commit_reference(repo, id);
+            let crate::objname::CommitRef::Commit(commit) = found else {
+                // `object_as_type()` has already complained about a present
+                // object of the wrong type; git prints that line before dying.
+                if let Some(note) = found.type_error() {
+                    eprintln!("error: {note}");
+                }
+                return fatal(format!("not a valid branch point: '{s}'"));
             };
             let start_ref = repo
                 .find_reference(s)

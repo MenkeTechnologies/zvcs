@@ -105,11 +105,6 @@
 //!   `drop_redundant_commits`, with its `dropping <oid> <subject> -- patch
 //!   contents already upstream` line. The visible difference is the step count:
 //!   the sheet still holds the commit, so the progress line counts it.
-//! * `-v`/`--verbose` past the up-to-date exit. `-v` prints the upstream diffstat
-//!   *and* a second, post-replay diffstat the sequencer emits in verbose mode;
-//!   only the first is ported, so `-v` is rejected with a message naming the
-//!   reason rather than emitting half of git's output. Plain `--stat` (and
-//!   `rebase.stat=true`, which sets the same bit and nothing else) is ported.
 //! * `--update-refs`, and the `update-ref` instruction it generates: it still
 //!   selects the merge backend and still raises git's apply-backend
 //!   incompatibility errors, but nothing tracks the refs pointing into the
@@ -1362,30 +1357,32 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
                 .ok()
                 .flatten()
                 .is_some();
-            if !is_branch && peel_to_commit(&repo, requested).is_none() {
+            let resolved = peel_to_commit(&repo, requested);
+            if !is_branch && resolved.is_none() {
                 die!("no such branch/commit '{requested}'");
             }
             let current = branch.as_ref().map(|b| b.shorten().to_string());
             // `options.switch_to = argv[0]` (builtin/rebase.c:1698) is set for any
             // `<branch>` argument, the current one included: when the rebase turns out
             // to be a no-op, `checkout_up_to_date()` still records the checkout.
-            if is_branch && current.as_deref() == Some(requested.as_str()) {
-                switch_to = Some(requested.clone());
-            }
-            if current.as_deref() != Some(requested.as_str()) {
-                if !is_branch {
-                    // git only switches to a *branch*; a bare commit-ish is
-                    // resolved as the thing to rebase, with `HEAD` left alone.
-                    die!("no such branch/commit '{requested}'");
-                }
+            switch_to = Some(requested.clone());
+            if !is_branch {
+                // `cmd_rebase()`'s "if not, is it a valid ref (branch or commit)?"
+                // arm, right after the `refs/heads/<arg>` lookup misses: an argument
+                // that names no local branch but does resolve to a commit is *not*
+                // refused — `options.orig_head` becomes that commit and
+                // `options.head_name` stays NULL, so the rebase runs detached.
+                // `git rebase <upstream> HEAD` is the everyday spelling, and an
+                // up-to-date one still detaches `HEAD` before saying so.
+                head_oid = resolved.ok_or_else(|| anyhow!("no such branch/commit '{requested}'"))?;
+                branch = None;
+            } else if current.as_deref() != Some(requested.as_str()) {
                 // Everything below rebases `<branch>`, so its tip stands in for
                 // `HEAD` right away. The worktree switch itself waits until after
                 // `require_clean_work_tree()`, which git runs first — a dirty tree
                 // must produce git's refusal, not the checkout's.
-                head_oid = peel_to_commit(&repo, requested)
-                    .ok_or_else(|| anyhow!("no such branch/commit '{requested}'"))?;
+                head_oid = resolved.ok_or_else(|| anyhow!("no such branch/commit '{requested}'"))?;
                 branch = Some(FullName::try_from(format!("refs/heads/{requested}"))?);
-                switch_to = Some(requested.clone());
                 eager_switch = Some(requested.clone());
             }
             requested.clone()
@@ -1539,14 +1536,27 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
                         &message,
                     );
                 } else {
-                    // Detached: `update_refs()` takes the single
-                    // `refs_update_ref("HEAD", …)` branch instead.
-                    super::checkout::record_head_move(
-                        &repo,
-                        Some(head_oid),
-                        Some(head_oid),
-                        &message,
-                    );
+                    // Detached (`<branch>` named a commit-ish rather than a local
+                    // branch, so `options.head_name` is NULL and `reset_head()` gets
+                    // `RESET_HEAD_DETACH`): `update_refs()` takes the single
+                    // `refs_update_ref("HEAD", …, REF_NO_DEREF)` branch instead, which
+                    // repoints `HEAD` itself at the commit. `reset_head()`'s two-way
+                    // merge carries the worktree and index along with it, so a
+                    // commit-ish that is not where `HEAD` already stands is a real
+                    // checkout, not just a reflog line.
+                    let at = repo.head_id().ok().map(|id| id.detach());
+                    if at == Some(head_oid) {
+                        set_head(&repo, Target::Object(head_oid), &message)?;
+                    } else {
+                        let old_index = repo.index_or_load_from_head()?.into_owned();
+                        set_head(&repo, Target::Object(head_oid), &message)?;
+                        update_clean_worktree(
+                            &repo,
+                            &old_index,
+                            head_oid,
+                            &AtomicBool::new(false),
+                        )?;
+                    }
                 }
             }
             if flags & NO_QUIET != 0 {
@@ -1583,13 +1593,17 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
     // machinery; the one deviation is git's `detect_rename`, which this port has
     // nowhere, so a rename renders as a delete plus an add.
     //
-    // `-v` additionally sets REBASE_VERBOSE, which prefixes a `Changes from <a> to
-    // <b>:` line *and* makes the sequencer emit a second, post-replay diffstat of
-    // its own. That second one is not ported, so `-v` past this point is still
-    // refused rather than answered with half of git's output.
+    // `-v` additionally sets REBASE_VERBOSE, which prefixes the range this diffstat
+    // covers — `Changes from <merge base> to <onto>:`, or `Changes to <onto>:` when
+    // there is no merge base (`is_null_oid(&branch_base)`, which is every `--root`
+    // rebase). It also makes the sequencer emit a second, post-replay diffstat once
+    // the branch is back in place; see [`verbose_replay_diffstat`].
     if flags & DIFFSTAT != 0 {
         if flags & VERBOSE != 0 {
-            bail!("unsupported flag \"-v\"/\"--verbose\" (the sequencer's post-replay diffstat is not ported)");
+            match branch_base {
+                Some(base) => println!("Changes from {base} to {onto_oid}:"),
+                None => println!("Changes to {onto_oid}:"),
+            }
         }
         let base = branch_base.unwrap_or_else(|| ObjectId::empty_tree(repo.object_hash()));
         super::diff::diff(&[
@@ -1992,6 +2006,10 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
         None => "detached HEAD".to_string(),
     };
 
+    if flags & VERBOSE != 0 {
+        verbose_replay_diffstat(head_oid, tip)?;
+    }
+
     // The single-shot rebase completed; re-apply the autostash onto the new tip
     // (before the summary line, matching git's finish_rebase ordering).
     if let Some(oid) = autostash_oid {
@@ -2260,6 +2278,20 @@ pub(super) fn dirty_state(repo: &gix::Repository) -> Result<(bool, bool, Vec<Str
         }
     }
     Ok((unstaged, staged, conflicts))
+}
+
+/// The `opts->verbose` tail of `pick_commits()` (sequencer.c): once the
+/// branch has been re-pointed and `HEAD` re-attached, `-v` prints a diffstat of
+/// what the whole replay changed — `diff_tree_oid(orig-head, HEAD)` — before the
+/// autostash is re-applied and the `Successfully rebased …` line is written.
+///
+/// `log_tree_opt.diffopt.output_format` is `DIFF_FORMAT_DIFFSTAT` alone here, so
+/// unlike the upstream diffstat above there is no `--summary` half. A rebase that
+/// reproduced its commits' trees verbatim (every `--root` no-op, every
+/// fast-forward) diffs to nothing and so prints nothing, exactly as git does.
+fn verbose_replay_diffstat(orig_head: ObjectId, tip: ObjectId) -> Result<()> {
+    super::diff::diff(&["--stat".to_string(), orig_head.to_string(), tip.to_string()])?;
+    Ok(())
 }
 
 fn full_name(name: &str) -> Result<FullName> {
@@ -4079,6 +4111,9 @@ impl<'r> Sequencer<'r> {
         } else {
             "detached HEAD".to_string()
         };
+        if self.st.verbose {
+            verbose_replay_diffstat(self.st.orig_head, tip)?;
+        }
         self.delete_rewritten_refs();
         let _ = std::fs::remove_dir_all(rebase_merge_dir(repo));
         if let Some(oid) = self.autostash {

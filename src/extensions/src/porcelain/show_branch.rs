@@ -1190,6 +1190,12 @@ fn auto_color() -> bool {
 /// `append_ref()` — record a name, skipping duplicates and anything that does not
 /// peel to a commit, and warn once the 26-rev ceiling is reached.
 fn append_ref(repo: &gix::Repository, refname: &str, names: &mut Vec<String>) {
+    // `append_ref(refname, oid, checked)` is handed the id its caller already
+    // resolved and only runs `lookup_commit_reference_gently()` on it, so no name
+    // is looked up here and `get_oid_basic()`'s ambiguity warning is not repeated.
+    // The one `repo_get_oid()` per entry that git does make is the pass over
+    // `ref_name[]` further up, which is where the warning comes from.
+    let _quiet_ambiguity = crate::objname::AmbiguityWarnings::off();
     if resolve_commit(repo, refname).is_none() {
         return;
     }
@@ -1216,9 +1222,11 @@ fn append_short_ref(
     let Some(short) = refname.strip_prefix(full_prefix) else {
         return;
     };
-    let unambiguous = repo
-        .rev_parse_single(short)
-        .is_ok_and(|id| id.detach() == target);
+    // `append_head_ref()`'s disambiguation is `repo_get_oid(refname + 11)`, whose
+    // full-hex branch answers for a branch literally named as an object id
+    // without consulting the odb; only an id equal to this ref's own tip keeps
+    // the short form.
+    let unambiguous = crate::objname::resolve(repo, short).is_some_and(|id| id == target);
     let name = if unambiguous {
         short.to_string()
     } else {
@@ -1257,7 +1265,12 @@ fn snarf_refs(repo: &gix::Repository, heads: bool, remotes: bool, names: &mut Ve
 /// `append_one_rev()` — a literal revision if it resolves, else a glob matched
 /// against every ref. `false` means git's `die("bad sha1 reference %s")`.
 fn append_one_rev(repo: &gix::Repository, av: &str, names: &mut Vec<String>) -> Result<bool> {
-    if repo.rev_parse_single(av).is_ok() {
+    // `repo_get_oid()`, not an odb lookup: a full-length hex name resolves to
+    // itself whether or not the repository has that object. git therefore takes
+    // this branch for an absent id, and `append_ref()` — which peels *quietly* —
+    // then drops it from the list without a word. Reaching the `die()` below with
+    // a well-formed id is the bug this ordering exists to prevent.
+    if crate::objname::resolve(repo, av).is_some() {
         append_ref(repo, av, names);
         return Ok(true);
     }
@@ -1333,11 +1346,17 @@ fn rev_is_head(head: &str, name: &str) -> bool {
     head == name
 }
 
-/// `lookup_commit_reference()` applied to `get_oid()` — resolve a name, peel to a
-/// commit, and report failure as `None`.
+/// `lookup_commit_reference_gently(get_oid(spec), 1)` — resolve a name, peel to a
+/// commit, and report every failure as `None`.
+///
+/// `append_ref()` passes `quiet = 1`, so none of the three failures says
+/// anything: a name that does not resolve, a full-length hex id the repository
+/// does not have, and an object that is not a commit are all simply left out of
+/// the rev list. That silence is what makes `show-branch <absent-id>` print
+/// `No revs to be shown.` at exit 0 instead of failing.
 fn resolve_commit(repo: &gix::Repository, spec: &str) -> Option<ObjectId> {
-    let id = repo.rev_parse_single(spec).ok()?;
-    let object = id.object().ok()?;
+    let id = crate::objname::resolve(repo, spec)?;
+    let object = repo.find_object(id).ok()?;
     object.peel_to_commit().ok().map(|c| c.id)
 }
 
@@ -1472,7 +1491,9 @@ fn collect_reflog(
         // At `@{0}` git keeps the id `dwim_ref` produced rather than the one the
         // log records; the two only diverge on a corrupt log.
         let oid = if nth == 0 { dwim_oid } else { entry.new_oid };
-        // `append_ref()` drops anything that does not peel to a commit.
+        // `append_ref()` drops anything that does not peel to a commit. It is
+        // given the id, not a name, so nothing is resolved and nothing warns.
+        let _quiet_ambiguity = crate::objname::AmbiguityWarnings::off();
         if resolve_commit(repo, &oid.to_string()).is_none() {
             continue;
         }

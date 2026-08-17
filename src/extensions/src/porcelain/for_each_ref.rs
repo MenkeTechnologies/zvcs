@@ -737,16 +737,20 @@ pub fn for_each_ref(args: &[String]) -> Result<ExitCode> {
             "--no-points-at" => points_at = None,
             "--points-at" => {
                 let v = value!(rest, "points-at");
-                points_at = match repo.rev_parse_single(v.as_str()) {
-                    Ok(id) => Some(id.detach()),
-                    // git quotes the operand here but not in the filter options.
-                    Err(_) => return Ok(option_error(&format!("malformed object name '{v}'"))),
+                // `parse_opt_object_name`: the id is recorded without ever asking
+                // the odb whether that object exists, because `--points-at` only
+                // ever compares it against ref tips. An absent full-length hex id
+                // is therefore a filter that matches nothing at exit 0.
+                points_at = match crate::objname::parse_opt_object_name(&repo, &v) {
+                    Ok(id) => Some(id),
+                    Err(e) => return Ok(e.report()),
                 };
             }
             "--contains" | "--no-contains" => {
                 let v = commit_operand!(rest);
-                let Some(id) = resolve_commit(&repo, &v) else {
-                    return Ok(option_error(&format!("malformed object name {v}")));
+                let id = match crate::objname::parse_opt_commits(&repo, &v) {
+                    Ok(id) => id,
+                    Err(e) => return Ok(e.report()),
                 };
                 if name == "--contains" {
                     filters.contains.push(id);
@@ -756,10 +760,13 @@ pub fn for_each_ref(args: &[String]) -> Result<ExitCode> {
             }
             "--merged" | "--no-merged" => {
                 let v = commit_operand!(rest);
-                // These go through `parse_opt_merge_filter`, which dies rather
-                // than returning a usage error, so the exit code is 128 here.
-                let Some(id) = resolve_commit(&repo, &v) else {
-                    return Ok(fatal(&format!("malformed object name {v}")));
+                // `parse_opt_merge_filter` reports the same two failures as
+                // `parse_opt_commits` but not with the same severity, and names
+                // the option rather than the operand; `&name[2..]` is git's
+                // `opt->long_name`.
+                let id = match crate::objname::parse_opt_merge_filter(&repo, &v, &name[2..]) {
+                    Ok(id) => id,
+                    Err(e) => return Ok(e.report()),
                 };
                 if name == "--merged" {
                     filters.merged.push(id);
@@ -1326,16 +1333,6 @@ fn parse_count(v: &str) -> Option<i64> {
     crate::optint::integer(&crate::optint::long_opt("count"), v).ok()
 }
 
-/// Resolve a filter operand the way `parse_opt_commits` does: parse the
-/// revision, then peel it to a commit. `None` covers both failures, which git
-/// reports with the same exit code per option.
-fn resolve_commit(repo: &gix::Repository, spec: &str) -> Option<ObjectId> {
-    let id = repo.rev_parse_single(spec).ok()?.detach();
-    let chain = peel_chain(repo, id).ok()?;
-    let tip = *chain.last().unwrap_or(&id);
-    (repo.find_header(tip).ok()?.kind() == Kind::Commit).then_some(tip)
-}
-
 /// Whether `tip` survives the reachability filters.
 ///
 /// A ref that does not peel to a commit is dropped by every one of them, as git
@@ -1710,9 +1707,22 @@ fn parse_atom(spec: &str, ctx: &AtomCtx<'_>) -> std::result::Result<Atom, AtomEr
                     "expected format: %(ahead-behind:<committish>)",
                 ));
             };
+            // `lookup_commit_reference_by_name()`: `get_oid_committish()` — whose
+            // full-hex branch answers without the odb — then the same non-quiet
+            // peel the filter options use, then `die("failed to find '%s'")`.
             let base = ctx
                 .repo
-                .and_then(|r| resolve_commit(r, arg))
+                .and_then(|r| {
+                    let id = crate::objname::resolve(r, arg)?;
+                    let found = crate::objname::lookup_commit_reference(r, id);
+                    if let Some(note) = found.type_error() {
+                        eprintln!("error: {note}");
+                    }
+                    match found {
+                        crate::objname::CommitRef::Commit(id) => Some(id),
+                        _ => None,
+                    }
+                })
                 .ok_or_else(|| fatal_atom(format!("failed to find '{arg}'")))?;
             Field::AheadBehind(base)
         }

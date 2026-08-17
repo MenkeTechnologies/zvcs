@@ -25,6 +25,7 @@ pub mod jobrun;
 pub mod lock;
 pub mod merge_apply;
 pub mod merge_guard;
+pub mod objname;
 pub mod optint;
 pub mod pager;
 pub mod parseopt;
@@ -71,6 +72,39 @@ fn exit_status(code: ExitCode) -> i32 {
     (0u8..=255).find(|&n| code == ExitCode::from(n)).map_or(1, i32::from)
 }
 
+/// `handle_options()`'s `-C <path>` branch (git.c), shared with the copy that
+/// runs inside `run_argv`'s alias loop ([`alias::resolve`]).
+///
+/// Two details of the C are easy to lose. The chdir is guarded by
+/// `if ((*argv)[1][0])`, so an *empty* path is a deliberate no-op — `git -C ""`
+/// succeeds and stays put. And the failure is `die_errno("cannot change to
+/// '%s'", …)`, so the message carries the bare `strerror` text and the caller
+/// exits 128, not 1.
+///
+/// Returns the `die_errno` message (without git's `fatal: ` prefix) on failure.
+pub fn chdir_global(dir: &str) -> Result<(), String> {
+    if dir.is_empty() {
+        return Ok(());
+    }
+    std::env::set_current_dir(dir).map_err(|e| {
+        // `strerror(errno)` has no Rust ` (os error <n>)` tail.
+        let text = e.to_string();
+        let text = text.split(" (os error ").next().unwrap_or(&text);
+        format!("cannot change to '{dir}': {text}")
+    })
+}
+
+/// `usage(git_usage_string)` after one of `handle_options`' "no value given"
+/// complaints: the reason on stderr, then git's top-level usage block, exit 129.
+///
+/// git prints the reason with a plain `fprintf(stderr, …)` — no `fatal: ` and no
+/// `error: ` prefix — and `usage()` follows it with `usage: <git_usage_string>`.
+fn usage_missing_value(reason: &str) -> ExitCode {
+    eprintln!("{reason}");
+    eprintln!("usage: {}", porcelain::help::GIT_USAGE_STRING);
+    ExitCode::from(129)
+}
+
 /// Parse `argv`, dispatch the subcommand, and return the process exit code.
 /// Errors are reported terse on stderr as `zvcs: <command>: <reason>`.
 fn run_command() -> ExitCode {
@@ -91,9 +125,11 @@ fn run_command() -> ExitCode {
     // (extremely common in scripts and tooling) reaches the verb instead of
     // treating `-C` as the subcommand. `-C <dir>` chdirs (before autostart /
     // failure-surfacing, which key off the cwd); the pager flags force paging on
-    // (`-p`/`--paginate`) or off (`-P`/`--no-pager`). Unrecognized globals (`-c`,
-    // `--git-dir`, …) are left in place and surface as an error rather than being
-    // silently mishandled.
+    // (`-p`/`--paginate`) or off (`-P`/`--no-pager`). A global given without its
+    // value ends the same way `handle_options()` does: the complaint, git's usage
+    // block, exit 129. A global this loop has never heard of is left in place and
+    // surfaces as an unknown verb rather than being silently mishandled — which is
+    // a divergence from git's `unknown option: --<x>` + usage (129).
     let mut idx = 0;
     let mut pager_forced: Option<bool> = None;
     // `-c <name>=<value>` overrides, collected and injected into gix's config
@@ -104,15 +140,19 @@ fn run_command() -> ExitCode {
     while idx < raw.len() {
         match raw[idx].as_str() {
             "-C" => {
-                let Some(dir) = raw.get(idx + 1) else { break };
-                if std::env::set_current_dir(dir).is_err() {
-                    eprintln!("zvcs: -C: cannot chdir to {dir}");
-                    return ExitCode::FAILURE;
+                let Some(dir) = raw.get(idx + 1) else {
+                    return usage_missing_value("no directory given for '-C' option");
+                };
+                if let Err(msg) = chdir_global(dir) {
+                    eprintln!("fatal: {msg}");
+                    return ExitCode::from(fatal::EXIT_FATAL);
                 }
                 idx += 2;
             }
             "-c" => {
-                let Some(pair) = raw.get(idx + 1) else { break };
+                let Some(pair) = raw.get(idx + 1) else {
+                    return usage_missing_value("-c expects a configuration string");
+                };
                 config_overrides.push(pair.clone());
                 idx += 2;
             }
@@ -127,12 +167,14 @@ fn run_command() -> ExitCode {
             // `--git-dir`/`--work-tree`/`--namespace` set the well-known env vars
             // gix honors, in both the `--flag <val>` and `--flag=<val>` forms.
             "--git-dir" | "--work-tree" | "--namespace" => {
-                let key = match raw[idx].as_str() {
-                    "--git-dir" => "GIT_DIR",
-                    "--work-tree" => "GIT_WORK_TREE",
-                    _ => "GIT_NAMESPACE",
+                let (key, missing) = match raw[idx].as_str() {
+                    "--git-dir" => ("GIT_DIR", "no directory given for '--git-dir' option"),
+                    "--work-tree" => ("GIT_WORK_TREE", "no directory given for '--work-tree' option"),
+                    _ => ("GIT_NAMESPACE", "no namespace given for --namespace"),
                 };
-                let Some(val) = raw.get(idx + 1) else { break };
+                let Some(val) = raw.get(idx + 1) else {
+                    return usage_missing_value(missing);
+                };
                 std::env::set_var(key, val);
                 idx += 2;
             }
@@ -227,7 +269,7 @@ fn run_command() -> ExitCode {
     // expanded (recursively) and a `!shell` alias is run directly. Done before
     // the pager so paging keys off the resolved command, not the alias name.
     let (sub, rest): (String, Vec<String>) = match alias::resolve(sub, rest, &mut pager_forced) {
-        alias::Outcome::Shell(code) => return code,
+        alias::Outcome::Shell(code) | alias::Outcome::Exit(code) => return code,
         alias::Outcome::Fatal(msg) => {
             eprintln!("zvcs: {msg}");
             return ExitCode::FAILURE;
@@ -268,7 +310,7 @@ fn run_command() -> ExitCode {
             autocorrect::Correction::None => return ExitCode::FAILURE,
             autocorrect::Correction::Use(corrected) => {
                 match alias::resolve(&corrected, &rest, &mut pager_forced) {
-                    alias::Outcome::Shell(code) => return code,
+                    alias::Outcome::Shell(code) | alias::Outcome::Exit(code) => return code,
                     alias::Outcome::Fatal(msg) => {
                         eprintln!("zvcs: {msg}");
                         return ExitCode::FAILURE;

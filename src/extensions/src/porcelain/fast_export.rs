@@ -10,8 +10,9 @@
 //! the `prio_queue_reverse` gix's queue does not do. The
 //! tree-vs-tree walk is implemented here rather than through
 //! `gix::Repository::diff_tree_to_tree` so the change order matches git's
-//! recursive `diff_tree_oid` emission order, which the stream's `M`/`D` line
-//! order and the blob export order both depend on.
+//! recursive `diff_tree_oid` emission order, which the blob export order depends
+//! on; the `M`/`D` lines are then re-sorted with git's own `depth_first`
+//! comparator, as `show_filemodify` does.
 //!
 //! ### Argument handling
 //!
@@ -46,6 +47,27 @@
 //!
 //! * `fast-export --all`, `--branches`, `--tags`, `--remotes`, `--reflog`
 //! * `<rev>...`, `<a>..<b>`, `<a>...<b>`, `^<rev>`, `--not`
+//! * the `--not` flag word and its XOR. `--not` *toggles* `UNINTERESTING |
+//!   BOTTOM` rather than setting it, and every later argument XORs its own
+//!   contribution into the result: `^X` under `--not` is **positive**, a second
+//!   `--not` cancels the first, `--all`/`--branches`/`--tags`/`--remotes`/
+//!   `--reflog` become negative while it is in force, `A..B` swaps ends, and
+//!   `A...B` shows its merge bases while hiding both endpoints
+//! * command-line order and duplication in `revs->cmdline`: each pseudo-option is
+//!   its own `handle_refs` pass, so `--tags --all` labels a commit `refs/tags/…`
+//!   where `--all --tags` labels it `refs/heads/…`, and a ref two selectors both
+//!   reach is filed twice — which is what makes an annotated tag's block appear
+//!   once per entry (`tag_refs` is never sorted or deduplicated, and `handle_tag`
+//!   has no already-emitted guard, so `--mark-tags` hands the second copy a fresh
+//!   mark)
+//! * `M`/`D` line order: git's `depth_first` (a common-prefix comparison where
+//!   the longer name wins a tie), applied after the blob export, so blob marks
+//!   still follow tree order while `C.a`, `C2`, `C3/x` and everything under a
+//!   deleted `d/` all precede the plain `C` or the file that replaces `d`
+//! * the source label a commit prints under: the dwimmed cmdline ref name when
+//!   there is one, and otherwise the pending entry's name — the argument as
+//!   typed minus any `^` — so a raw object id and a `--not ^main` both label
+//!   their commits with the spec the user wrote
 //! * git's sticky `UNINTERESTING`: a commit excluded once (`^rev`, the left side
 //!   of a range, `--not`) stays excluded however many times it is named
 //!   positively afterwards — by `--all`/`--branches`/`--tags`/`--remotes` picking
@@ -54,13 +76,16 @@
 //!   because `get_tags_and_duplicates` skips on the command-line *entry's* flags
 //!   rather than the object's
 //! * blob / commit / `reset` / lightweight-tag / annotated-tag stanzas, including
-//!   the trailing `reset`+`tag` block emitted in git's reverse-sorted ref order,
-//!   with `from <null-oid>` for refs whose commit was excluded
+//!   the trailing `reset` block (`extra_refs`, sorted-unique and walked
+//!   backwards) and `tag` block (`tag_refs`, walked backwards in insertion
+//!   order), with `from <null-oid>` for refs whose commit was excluded
 //! * `--no-data`, `--data`, `--full-tree`, `--use-done-feature`,
 //!   `--show-original-ids`, `--mark-tags`, `--progress=<n>`, `--export-marks=<file>`
 //! * `--import-marks=<file>` / `--import-marks-if-exists=<file>` — pre-seed the
-//!   mark table from a prior export: already-marked blobs/commits/tags are not
-//!   re-emitted, the id counter continues past the highest imported mark, and
+//!   mark table from a prior export: already-marked blobs and commits are not
+//!   re-emitted (a tag always is — `handle_tag` never consults the mark table,
+//!   and `export_marks` only writes commit marks anyway), the id counter
+//!   continues past the highest imported mark, and
 //!   `from :<mark>` links an incremental commit to its imported parent.
 //!   `--import-marks` dies `could not open '<file>' for reading` (128) on a
 //!   missing file; the `-if-exists` form treats it as empty
@@ -84,6 +109,11 @@
 //! * `--anonymize`
 //! * rev-list limiting: `--max-count=<n>`, `--skip=<n>`, `--no-merges`,
 //!   `--merges`, `--first-parent`, `--topo-order`, `--date-order`, `--reverse`
+//! * `--ancestry-path` (without a pathspec) — git's `limit_to_ancestry` over the
+//!   walked list, keeping only the commits that descend from a bottom commit
+//!   (every negative revision is one). A commit whose first parent is dropped
+//!   that way is exported against the empty tree, and a ref left on a dropped
+//!   commit takes the same trailing `reset` an excluded ref gets
 //! * accepted no-ops (as in git for a pathspec-less export): `--full-history`,
 //!   `--simplify-merges`, `--sparse`, `--dense`, `--boundary` (without negative
 //!   revisions)
@@ -126,9 +156,15 @@
 //! * a nested tag (a tag whose object is another tag) — git flattens the chain to
 //!   the innermost tag's content under the outer tag's name, a convoluted shape
 //!   not reproduced here.
-//! * `--ancestry-path` (with negative revisions), `--boundary` (with negative
-//!   revisions), and magic/glob pathspecs (`:(glob)`, `:!exclude`, `*.rs`), whose
-//!   matcher this port does not reproduce.
+//! * `--ancestry-path` together with a pathspec — the option also clears
+//!   `revs->simplify_history`, and the path limit here implements git's default
+//!   simplification rather than the full-history one that leaves a TREESAME merge
+//!   standing. `--ancestry-path=<commit>` is not recognised either: git adds that
+//!   commit to the pending list under its own `ANCESTRY_PATH` flag and keeps the
+//!   commit's ancestors as well, which the walk here does not model.
+//! * `--boundary` (with negative revisions), and magic/glob pathspecs
+//!   (`:(glob)`, `:!exclude`, `*.rs`), whose matcher this port does not
+//!   reproduce.
 
 use anyhow::{anyhow, bail, Result};
 use std::cmp::Ordering;
@@ -322,9 +358,15 @@ pub fn fast_export(args: &[String]) -> Result<ExitCode> {
     };
 
     // Revision selection, in command-line order so `--not` scopes correctly.
-    let mut negate_rest = false;
-    let (mut use_all, mut use_branches, mut use_tags, mut use_remotes, mut use_reflog) =
-        (false, false, false, false, false);
+    //
+    // `negate` is git's `flags` word carried across `setup_revisions`' sweep,
+    // narrowed to the one bit fast-export cares about. `--not` *toggles* it
+    // (`*flags ^= UNINTERESTING | BOTTOM`, revision.c:2907), so a second `--not`
+    // turns negation back off, and every later argument — pseudo-option and
+    // revision alike — is read through its current value.
+    let mut negate = false;
+    let mut use_reflog = false;
+    let mut reflog_negated = false;
 
     // rev-list limiting.
     let mut order = Order::Topo;
@@ -494,12 +536,20 @@ pub fn fast_export(args: &[String]) -> Result<ExitCode> {
         }
         match s {
             // ---- rev-list selection ----
-            "--all" => use_all = true,
-            "--branches" => use_branches = true,
-            "--tags" => use_tags = true,
-            "--remotes" => use_remotes = true,
-            "--reflog" => use_reflog = true,
-            "--not" => negate_rest = true,
+            // Each of these is a fresh `handle_refs(refs, revs, *flags, …)` pass
+            // over its own ref subset (revision.c:2808-2841), so naming one twice
+            // — or naming a ref both through `--all` and through `--tags` — files
+            // the ref *twice* in `revs->cmdline`. That duplication is visible in
+            // the output, so the passes are recorded rather than folded into a set.
+            "--all" => sel.args.push(CmdArg::Refs(RefKind::All, negate)),
+            "--branches" => sel.args.push(CmdArg::Refs(RefKind::Branches, negate)),
+            "--tags" => sel.args.push(CmdArg::Refs(RefKind::Tags, negate)),
+            "--remotes" => sel.args.push(CmdArg::Refs(RefKind::Remotes, negate)),
+            "--reflog" => {
+                use_reflog = true;
+                reflog_negated = negate;
+            }
+            "--not" => negate = !negate,
 
             // ---- rev-list ordering and limiting ----
             "--topo-order" => order = Order::Topo,
@@ -542,15 +592,25 @@ pub fn fast_export(args: &[String]) -> Result<ExitCode> {
             _ if s.starts_with('-') && s != "-" => leftover = true,
 
             _ => {
-                if add_rev_token(&repo, s, negate_rest, &mut sel).is_ok() {
+                if add_rev_token(&repo, s, negate, &mut sel).is_ok() {
                     continue;
                 }
-                // `handle_revision_arg` failed. A `^` could only ever have been a
-                // revision, and so could anything before a `--` the sweep above
-                // found, so both die outright instead of falling back to a path.
-                // Note that `--not` is *not* such a case: it flags the revisions
-                // that follow without declaring them revisions, so an argument
-                // after it can still turn out to be a pathspec.
+                // `handle_revision_arg` failed — but two shapes never *return* a
+                // failure at all, they die inside it: a range whose endpoints
+                // resolved to objects the database does not have, and a
+                // full-length hex name `get_oid()` decoded and `parse_object()`
+                // could not find. Neither reaches the `^` fatal or the pathspec
+                // sweep below, so both are asked about first.
+                if let Some(message) = super::log::early_revision_fatal(&repo, s, seen_dashdash) {
+                    eprint!("{message}");
+                    return Ok(ExitCode::from(128));
+                }
+                // A `^` could only ever have been a revision, and so could
+                // anything before a `--` the sweep above found, so both die
+                // outright instead of falling back to a path. Note that `--not`
+                // is *not* such a case: it flags the revisions that follow
+                // without declaring them revisions, so an argument after it can
+                // still turn out to be a pathspec.
                 if seen_dashdash || s.starts_with('^') {
                     eprintln!("fatal: bad revision '{s}'");
                     return Ok(ExitCode::from(128));
@@ -577,12 +637,13 @@ pub fn fast_export(args: &[String]) -> Result<ExitCode> {
         return Ok(usage_exit());
     }
 
-    // ---- Stage 4/5: the two late fatals, in git's order. ----
+    // ---- Stage 4: the `--anonymize-map` fatal. ----
+    // The `--ancestry-path` one comes later: git raises it from `limit_list`,
+    // inside `prepare_revision_walk`, which runs after the marks file is read
+    // and after the ref pseudo-options have been expanded — and `--not --all`
+    // is a way of supplying bottom commits without naming one positionally.
     if !anonymize_map.is_empty() && !opts.anonymize {
         return Ok(fatal("the option '--anonymize-map' requires '--anonymize'"));
-    }
-    if ancestry_path && sel.hidden.is_empty() {
-        return Ok(fatal("--ancestry-path given but there are no bottom commits"));
     }
 
     // ---- `--import-marks[-if-exists]`: seed the mark table from a prior export. ----
@@ -635,11 +696,13 @@ pub fn fast_export(args: &[String]) -> Result<ExitCode> {
     }
 
     // ---- Options this port does not implement: refuse rather than mis-export. ----
-    if ancestry_path {
-        bail!("--ancestry-path is not supported");
-    }
-    if boundary && !sel.hidden.is_empty() {
-        bail!("--boundary with negative revisions is not supported");
+    // `--ancestry-path` also sets `revs->simplify_history = 0`, which only bites
+    // once a pathspec is in play: the path limit below implements git's *default*
+    // simplification, where a TREESAME merge collapses onto that parent. Full
+    // history keeps the merge instead, so the two are only interchangeable
+    // without a pathspec.
+    if ancestry_path && !pathspecs.is_empty() {
+        bail!("--ancestry-path with a pathspec is not supported");
     }
     if !anonymize_map.is_empty() {
         bail!("--anonymize-map is not supported");
@@ -649,36 +712,58 @@ pub fn fast_export(args: &[String]) -> Result<ExitCode> {
     opts.refspecs = refspecs.iter().map(|s| BString::from(s.as_str())).collect();
 
     // ---- Ref selection (`--all` and friends), in git's iteration order. ----
-    let mut cmdline: Vec<(BString, ObjectId)> = Vec::new();
-    if use_all || use_branches || use_tags || use_remotes {
+    // Each pseudo-option is expanded where it stood on the command line, so
+    // `revs->cmdline` comes out in argv order — and a ref two selectors both
+    // reach (`--all --tags` on `refs/tags/v1`) is filed twice, exactly as git's
+    // two `handle_refs` passes file it. That duplication is not cosmetic: it is
+    // what makes `handle_tags_and_duplicates` emit the annotated tag's block
+    // once per entry.
+    let mut cmdline: Vec<Pending> = Vec::new();
+    for arg in &sel.args {
+        let (kind, negated) = match arg {
+            CmdArg::Rev(p) => {
+                cmdline.push(p.clone());
+                continue;
+            }
+            CmdArg::Refs(kind, negated) => (*kind, *negated),
+        };
+        let prefix: Option<&[u8]> = match kind {
+            RefKind::All => None,
+            RefKind::Branches => Some(b"refs/heads/"),
+            RefKind::Tags => Some(b"refs/tags/"),
+            RefKind::Remotes => Some(b"refs/remotes/"),
+        };
         let mut names: Vec<BString> = Vec::new();
         for reference in repo.references()?.all()? {
             let reference = reference.map_err(|e| anyhow!("{e}"))?;
             let name = reference.name().as_bstr().to_owned();
-            let keep = use_all
-                || (use_branches && name.starts_with(b"refs/heads/"))
-                || (use_tags && name.starts_with(b"refs/tags/"))
-                || (use_remotes && name.starts_with(b"refs/remotes/"));
-            if keep {
+            if prefix.is_none_or(|p| name.starts_with(p)) {
                 names.push(name);
             }
         }
         names.sort();
+        // git's `--all` also feeds `head_ref` after `for_each_ref`, which only
+        // contributes a distinct entry when HEAD is detached; otherwise it
+        // resolves to a ref already listed.
+        if kind == RefKind::All && repo.head()?.is_detached() {
+            names.push(BString::from("HEAD"));
+        }
         for name in names {
             let spec = name.to_str().map_err(|_| anyhow!("non-UTF-8 ref {name:?}"))?;
-            let id = repo.rev_parse_single(spec)?.detach();
-            cmdline.push((name, id));
+            let Ok(target) = repo.rev_parse_single(spec) else {
+                continue;
+            };
+            let target = target.detach();
+            let Ok(commit) = repo.find_object(target)?.peel_to_commit() else {
+                continue; // a ref to a blob or tree is not exportable, as in git
+            };
+            cmdline.push(Pending {
+                dwim: Some((name.clone(), target)),
+                pending_name: name,
+                commit: commit.id,
+                negated,
+            });
         }
-        // git's `--all` also feeds `head_ref`, which only contributes a distinct
-        // entry when HEAD is detached; otherwise it resolves to a ref already listed.
-        if use_all && repo.head()?.is_detached() {
-            if let Ok(id) = repo.rev_parse_single("HEAD") {
-                cmdline.push((BString::from("HEAD"), id.detach()));
-            }
-        }
-    }
-    for (name, target) in &sel.named {
-        cmdline.push((name.clone(), *target));
     }
 
     // ---- Ref bookkeeping, mirroring `get_tags_and_duplicates`. ----
@@ -698,25 +783,43 @@ pub fn fast_export(args: &[String]) -> Result<ExitCode> {
     // a shared ancestor the name of the *first* pending tip to reach it, and
     // `sort_in_topological_order` seeds its queue from this same list.
     let mut tips: Vec<ObjectId> = Vec::new();
+    // The `UNINTERESTING` half of the same list: `^rev`, the excluded end of a
+    // range, a `...` merge base, anything under an odd number of `--not`s.
+    let mut hidden: Vec<ObjectId> = Vec::new();
 
-    for (name, target) in &cmdline {
-        let object = repo.find_object(*target)?;
-        let is_tag = object.kind == gix::object::Kind::Tag;
-        let Ok(commit) = object.peel_to_commit() else {
-            continue; // a ref to a blob or tree is not exportable, as in git
+    for p in &cmdline {
+        if p.negated {
+            hidden.push(p.commit);
+            // `get_tags_and_duplicates` skips a cmdline entry whose *flags* are
+            // UNINTERESTING (fast-export.c:1065-1066), so a negative ref labels
+            // nothing, contributes no tag block and gets no trailing `reset`.
+            continue;
+        }
+        tips.push(p.commit);
+        // `repo_dwim_ref(e->name)` failing is the other `continue` there: a raw
+        // object id, or a `^main` whose recorded name still has the caret.
+        let Some((name, target)) = &p.dwim else {
+            continue;
         };
-        let commit_id = commit.id;
-        if is_tag {
+        if repo.find_object(*target)?.kind == gix::object::Kind::Tag {
             tag_refs.push((name.clone(), *target));
         } else {
-            commit_refs.push((name.clone(), commit_id));
+            commit_refs.push((name.clone(), p.commit));
         }
-        sources.entry(commit_id).or_insert_with(|| name.clone());
-        tips.push(commit_id);
+        sources.entry(p.commit).or_insert_with(|| name.clone());
     }
-    // Positional revisions that named no ref (a raw commit id) still contribute
-    // history, behind the refs `--all` and friends put in front of them.
-    tips.extend(sel.tips.iter().copied());
+
+    // Whatever `get_tags_and_duplicates` left unclaimed is filled in by
+    // `prepare_revision_walk`, which labels a pending commit with the *pending*
+    // name — the argument as typed, minus any `^` (revision.c:437-442). That is
+    // the only reason `fast-export <oid>` prints `commit <oid>` rather than an
+    // empty refname, and why `--not ^main` prints `commit main` and not
+    // `commit refs/heads/main`.
+    for p in &cmdline {
+        sources
+            .entry(p.commit)
+            .or_insert_with(|| p.pending_name.clone());
+    }
 
     // `--reflog` contributes tips with no name at all: git adds every object a
     // reflog mentions to the pending list under an empty name, so a commit
@@ -726,10 +829,14 @@ pub fn fast_export(args: &[String]) -> Result<ExitCode> {
     if use_reflog {
         let mut reflog_tips: Vec<ObjectId> = Vec::new();
         collect_reflog_tips(&repo, &mut reflog_tips)?;
-        for id in &reflog_tips {
-            sources.entry(*id).or_default();
+        if reflog_negated {
+            hidden.extend(reflog_tips);
+        } else {
+            for id in &reflog_tips {
+                sources.entry(*id).or_default();
+            }
+            tips.extend(reflog_tips);
         }
-        tips.extend(reflog_tips);
     }
 
     // git dedupes pending objects through the `SEEN` flag: the first mention of
@@ -742,8 +849,17 @@ pub fn fast_export(args: &[String]) -> Result<ExitCode> {
     // — which is all the walk itself can do — would keep each commit's *last* mention instead of
     // its first, and the seed order is what breaks ties between commits sharing a commit date.
     dedup_first_wins(&mut tips);
+    dedup_first_wins(&mut hidden);
 
-    let hidden = sel.hidden.clone();
+    // ---- The two checks that need the whole negative set. ----
+    // git raises the `--ancestry-path` fatal from `limit_list`, once every
+    // pseudo-option has contributed its bottoms, so `--not --all` satisfies it.
+    if ancestry_path && hidden.is_empty() {
+        return Ok(fatal("--ancestry-path given but there are no bottom commits"));
+    }
+    if boundary && !hidden.is_empty() {
+        bail!("--boundary with negative revisions is not supported");
+    }
 
     // A commit named on both sides — `--all`/`--branches`/`--tags`/`--remotes`
     // re-adding a ref that `^feature` already excluded, or a repeated
@@ -818,6 +934,31 @@ pub fn fast_export(args: &[String]) -> Result<ExitCode> {
         for info in topo {
             order_list.push(info?);
         }
+    }
+
+    // ---- `--ancestry-path`: git's `limit_to_ancestry`, applied where
+    // `limit_list` applies it — to the walked list, ahead of the path limit and
+    // of every output-time filter. Only commits that reach a bottom commit
+    // through the walked history survive; the rest are marked UNINTERESTING and
+    // drop out, which is what leaves a merge's other side out of the stream.
+    //
+    // `collect_bottom_commits` reads the BOTTOM flag, and
+    // `handle_revision_arg_1` sets it on every negative revision
+    // (`flags = flags & UNINTERESTING ? flags | BOTTOM : flags & ~BOTTOM`) —
+    // `^rev`, the left side of a range, a `...` merge base and a `--not` alike —
+    // so the bottom list is exactly the hidden set the fatal above checked for.
+    // Bottoms are themselves UNINTERESTING and so never in the list.
+    if ancestry_path {
+        let parents_of: HashMap<ObjectId, Vec<ObjectId>> = order_list
+            .iter()
+            .map(|i| (i.id, i.parent_ids.iter().copied().collect()))
+            .collect();
+        let ids: Vec<ObjectId> = order_list.iter().map(|i| i.id).collect();
+        let kept: std::collections::HashSet<ObjectId> =
+            super::rev_list::limit_to_ancestry(&hidden, &ids, &parents_of)
+                .into_iter()
+                .collect();
+        order_list.retain(|i| kept.contains(&i.id));
     }
 
     // ---- Path limiting: git's default history simplification with parent
@@ -983,7 +1124,13 @@ pub fn fast_export(args: &[String]) -> Result<ExitCode> {
         }
     }
 
-    tag_refs.sort();
+    // Unlike `extra_refs`, which `get_tags_and_duplicates` ends with a
+    // `string_list_sort_u`, `tag_refs` is never sorted or deduplicated
+    // (fast-export.c:1043 appends, 1119 sorts only the other list). It is walked
+    // back to front in *insertion* order, so a tag reached by two selectors —
+    // `--all --tags` on the same `refs/tags/v1` — has its whole block emitted
+    // twice, and `--tags --all` emits the two selectors' tags in their own
+    // command-line order rather than by name.
     for (name, tag_id) in tag_refs.iter().rev() {
         if let Some(f) = emit_tag(&repo, name.as_bstr(), *tag_id, &opts, &mut st)? {
             return Ok(die_midstream(&st.out, &f));
@@ -1015,16 +1162,62 @@ pub fn fast_export(args: &[String]) -> Result<ExitCode> {
 // Revision selection
 // ---------------------------------------------------------------------------
 
-/// What the positional arguments selected: named cmdline refs, positive tips,
-/// and the negative (`^rev`, left side of a range) commits.
+/// Every argument `setup_revisions` accepted, in command-line order.
+///
+/// git keeps two parallel lists — `revs->cmdline` (what the user named) and
+/// `revs->pending` (the objects those names resolved to) — and fills both as it
+/// sweeps argv. Order and duplication are both load-bearing downstream, so this
+/// is a list rather than the sets the selection used to be reduced to.
 #[derive(Default)]
 struct Selection {
-    named: Vec<(BString, ObjectId)>,
-    tips: Vec<ObjectId>,
-    hidden: Vec<ObjectId>,
+    args: Vec<CmdArg>,
+}
+
+/// One accepted argument: either a pseudo-option standing for a whole ref
+/// subset, or a revision that resolved to an object.
+enum CmdArg {
+    /// `--all`, `--branches`, `--tags`, `--remotes`, and whether the `--not`
+    /// state in force at that point made the whole pass negative.
+    Refs(RefKind, bool),
+    Rev(Pending),
+}
+
+/// Which `handle_refs` pass a [`CmdArg::Refs`] stands for (revision.c:2808-2841).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RefKind {
+    All,
+    Branches,
+    Tags,
+    Remotes,
+}
+
+/// A `revs->cmdline` entry paired with the `revs->pending` entry beside it.
+#[derive(Clone)]
+struct Pending {
+    /// `repo_dwim_ref(e->name)`: the full ref name the argument named, plus the
+    /// object that ref points at, unpeeled. `None` when the argument named no
+    /// ref — a raw object id, a `HEAD~1`, or the `^main` of `--not ^main`, whose
+    /// `e->name` still carries the `^` that stops it dwimming
+    /// (`add_rev_cmdline(revs, object, arg_, …)`, revision.c:2234).
+    dwim: Option<(BString, ObjectId)>,
+    /// `add_pending_object`'s name, which is `arg` — the argument with a leading
+    /// `^` already consumed. `handle_commit` labels a commit with it when the
+    /// dwim above found nothing (revision.c:437-442), which is why
+    /// `fast-export --not ^main` prints `commit main` and `fast-export <oid>`
+    /// prints `commit <oid>`.
+    pending_name: BString,
+    /// The commit the argument peels to.
+    commit: ObjectId,
+    /// `e->flags & UNINTERESTING`.
+    negated: bool,
 }
 
 /// Resolve one positional revision argument, in git's `handle_revision_arg` shape.
+///
+/// `negated` is the `--not` state in force here. git carries it in `flags` and
+/// **XOR**s the argument's own contribution into it, so every shape below flips
+/// when `--not` is on: `^X` becomes positive, `A..B` hides B and shows A, and
+/// `A...B` shows its merge bases and hides both endpoints.
 ///
 /// `Err(())` means the whole argument is neither a revision nor a path, which the
 /// caller turns into git's `ambiguous argument` fatal.
@@ -1038,35 +1231,67 @@ fn add_rev_token(
         return Err(());
     }
     if let Some(rest) = tok.strip_prefix('^') {
+        // revision.c:2210-2213 sets `local_flags = UNINTERESTING | BOTTOM` for a
+        // leading `^`, and 2229/2234 file the object under `flags ^ local_flags`.
+        // Under `--not` the two cancel and `^X` is *positive*: this is the XOR,
+        // not an OR, and it is what `fast-export --not ^main base` relies on.
         let id = commit_of(repo, rest).ok_or(())?;
-        sel.hidden.push(id);
+        sel.args
+            .push(CmdArg::Rev(pending(repo, tok, rest, id, !negated)));
         return Ok(());
     }
     if let Some((l, r)) = tok.split_once("...") {
         let (l, r) = (default_head(l), default_head(r));
         let (lc, rc) = (commit_of(repo, l).ok_or(())?, commit_of(repo, r).ok_or(())?);
-        // `A...B` is `A B --not $(git merge-base --all A B)`.
+        // `handle_dotdot_1` (revision.c:2087-2107): the merge bases go in under
+        // `flags_exclude` (`flags ^ (UNINTERESTING | BOTTOM)`) and both endpoints
+        // under `flags`, in that order — so plain `A...B` is
+        // `A B --not $(git merge-base --all A B)` and `--not A...B` is its
+        // mirror image.
         for base in repo.merge_bases_many(lc, &[rc]).map_err(|_| ())? {
-            sel.hidden.push(base.detach());
+            let id = base.detach();
+            // `add_rev_cmdline_list` names a merge base by its own hex id.
+            let hex = id.to_hex().to_string();
+            sel.args
+                .push(CmdArg::Rev(pending(repo, &hex, &hex, id, !negated)));
         }
-        add_positive(repo, l, lc, sel);
-        add_positive(repo, r, rc, sel);
+        sel.args
+            .push(CmdArg::Rev(pending(repo, l, l, lc, negated)));
+        sel.args
+            .push(CmdArg::Rev(pending(repo, r, r, rc, negated)));
         return Ok(());
     }
     if let Some((l, r)) = tok.split_once("..") {
+        // `b_flags = flags; a_flags = flags_exclude` (revision.c:2083-2086).
         let (l, r) = (default_head(l), default_head(r));
-        sel.hidden.push(commit_of(repo, l).ok_or(())?);
+        let lc = commit_of(repo, l).ok_or(())?;
         let rc = commit_of(repo, r).ok_or(())?;
-        add_positive(repo, r, rc, sel);
+        sel.args
+            .push(CmdArg::Rev(pending(repo, l, l, lc, !negated)));
+        sel.args
+            .push(CmdArg::Rev(pending(repo, r, r, rc, negated)));
         return Ok(());
     }
     let id = commit_of(repo, tok).ok_or(())?;
-    if negated {
-        sel.hidden.push(id);
-    } else {
-        add_positive(repo, tok, id, sel);
-    }
+    sel.args
+        .push(CmdArg::Rev(pending(repo, tok, tok, id, negated)));
     Ok(())
+}
+
+/// Build one [`Pending`], dwimming the name git's `add_rev_cmdline` records.
+fn pending(
+    repo: &gix::Repository,
+    cmdline_name: &str,
+    pending_name: &str,
+    commit: ObjectId,
+    negated: bool,
+) -> Pending {
+    Pending {
+        dwim: dwim_ref(repo, cmdline_name),
+        pending_name: BString::from(pending_name),
+        commit,
+        negated,
+    }
 }
 
 /// Drop repeated ids, keeping the first occurrence and the surrounding order.
@@ -1344,17 +1569,6 @@ fn rewrite_one(mut id: ObjectId, simpl: &HashMap<ObjectId, Simpl>) -> Option<Obj
     Some(id)
 }
 
-/// Record a positive tip, plus a cmdline ref entry when the spec dwims to a ref.
-///
-/// git's `get_tags_and_duplicates` only names arguments that `dwim_ref` resolves;
-/// a raw commit id contributes history but no label.
-fn add_positive(repo: &gix::Repository, spec: &str, commit_id: ObjectId, sel: &mut Selection) {
-    sel.tips.push(commit_id);
-    if let Some((name, target)) = dwim_ref(repo, spec) {
-        sel.named.push((name, target));
-    }
-}
-
 /// Resolve a revision to the id of the commit it names, peeling tags.
 fn commit_of(repo: &gix::Repository, spec: &str) -> Option<ObjectId> {
     Some(
@@ -1432,9 +1646,9 @@ struct Anon {
     paths: HashMap<BString, BString>,
     idents: HashMap<BString, BString>,
     oids: HashMap<ObjectId, BString>,
+    tag_messages: HashMap<BString, BString>,
     blob_counter: u32,
     message_counter: u32,
-    tag_message_counter: u32,
 }
 
 impl Anon {
@@ -1549,10 +1763,19 @@ impl Anon {
         format!("subject {n}\n\nbody\n").into_bytes()
     }
 
-    fn tag_message(&mut self) -> Vec<u8> {
-        let n = self.tag_message_counter;
-        self.tag_message_counter += 1;
-        format!("tag message {n}").into_bytes()
+    /// git's tag-message anonymization goes through `anonymize_str(&tags, …)`
+    /// (fast-export.c:937-940), so it is keyed on the original message rather
+    /// than being a bare counter like a commit message or a blob: two tags
+    /// carrying the same text — or one tag emitted twice because two selectors
+    /// named it — get the *same* generated string.
+    fn tag_message(&mut self, original: &[u8]) -> Vec<u8> {
+        let key = BString::from(original.to_vec());
+        let next = self.tag_messages.len();
+        self.tag_messages
+            .entry(key)
+            .or_insert_with(|| BString::from(format!("tag message {next}")))
+            .clone()
+            .into()
     }
 }
 
@@ -1862,6 +2085,10 @@ fn emit_commit(
     if opts.full_tree {
         st.out.extend_from_slice(b"deleteall\n");
     }
+    // `show_filemodify` reorders the whole diff queue before rendering it
+    // (`QSORT(q->queue, q->nr, depth_first)`, fast-export.c:445) — after the blob
+    // export above, which is why the mark numbers still follow tree order.
+    changes.sort_by(depth_first);
     for c in &changes {
         render_change(c, opts, st)?;
     }
@@ -1903,13 +2130,20 @@ fn emit_tag(
     opts: &Opts,
     st: &mut State,
 ) -> Result<Option<Fatal>> {
-    // A tag already carrying a mark (seeded by `--import-marks` alongside
-    // `--mark-tags`) has been exported before; git skips it.
-    if st.marks.contains_key(&tag_id) {
-        return Ok(None);
-    }
+    // `handle_tag` has no "already exported" guard of any kind: unlike
+    // `export_blob` and `handle_commit`, it never consults `get_object_mark` on
+    // the tag itself. A tag reached twice is written twice, and under
+    // `--mark-tags` `mark_next_object` (fast-export.c:1015) hands the second copy
+    // a *fresh* mark — verified against stock with a marks file naming the tag
+    // object, which git re-marks and re-emits regardless. `export_marks` only
+    // dumps commit marks, so a tag mark cannot come back through
+    // `--import-marks` in the first place.
     let data = repo.find_object(tag_id)?.data.clone();
     let (headers, mut message) = split_object(&data);
+    // git anonymizes the message straight off the object, before the signature
+    // block is looked at, so the anonymization table is keyed on the message as
+    // stored — not on whatever `--signed-tags=strip` leaves of it.
+    let original_message = message;
     let target = header_value(headers, b"object")
         .ok_or_else(|| anyhow!("tag {tag_id} has no object header"))?;
     let target = ObjectId::from_hex(target).map_err(|e| anyhow!("tag {tag_id}: {e}"))?;
@@ -1980,7 +2214,7 @@ fn emit_tag(
         None => {}
     }
     let message: Vec<u8> = if opts.anonymize {
-        st.anon.tag_message()
+        st.anon.tag_message(original_message)
     } else {
         message.to_vec()
     };
@@ -2177,6 +2411,30 @@ fn join(prefix: &BStr, name: &BStr) -> BString {
     }
     p.extend_from_slice(name);
     p
+}
+
+/// git's `depth_first` (fast-export.c:353-381), the comparator `show_filemodify`
+/// sorts its diff queue with.
+///
+/// Names compare byte-wise over their *common* length, and a tie there puts the
+/// **longer** name first — "strcmp will sort 'd' before 'd/e', we want 'd/e'
+/// before 'd'", so that everything below a directory is emitted before the entry
+/// that replaces the directory itself. The rule is length-based, not `/`-aware,
+/// so it separates prefix-related siblings too: `C2`, `C3/x` and `C.a` all come
+/// out ahead of plain `C`.
+///
+/// git's third leg breaks a remaining tie by moving `R`ename pairs last. This
+/// port emits no `R`/`C` stanzas (see the module note), so every pair here is an
+/// add/modify/delete and the leg is unreachable — and since a tree diff yields
+/// at most one pair per path, the two names can never be equal either, which is
+/// what makes a stable `sort_by` agree with git's unstable `qsort`.
+fn depth_first(a: &Change, b: &Change) -> Ordering {
+    let (x, y) = (a.path.as_slice(), b.path.as_slice());
+    let common = x.len().min(y.len());
+    match x[..common].cmp(&y[..common]) {
+        Ordering::Equal => y.len().cmp(&x.len()),
+        other => other,
+    }
 }
 
 /// git's `show_filemodify`: `D <path>` for a removal, `M <mode> <ref> <path>`

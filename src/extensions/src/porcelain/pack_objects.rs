@@ -3128,6 +3128,10 @@ fn rev_list_objects(
     // stdin is rev-list arguments when git's internal rev list is on, and a
     // plain object list otherwise.
     if st.revs {
+        // `get_object_list()` brackets this loop with
+        // `cfg->warn_on_object_refname_ambiguity = 0`, so a full-length hex on
+        // stdin never draws the ambiguity warning the same name on argv would.
+        let _quiet_ambiguity = crate::objname::AmbiguityWarnings::off();
         for line in stdin.split(|b| *b == b'\n') {
             let Ok(spec) = std::str::from_utf8(line) else { continue };
             let spec = spec.trim();

@@ -352,13 +352,21 @@ pub fn ls_tree(args: &[String]) -> Result<ExitCode> {
         opts.paths.push(cwd_prefix.clone());
     }
 
-    let Ok(id) = repo.rev_parse_single(spec) else {
+    // `cmd_ls_tree` splits the two failures the way `object-name.c` does:
+    // `repo_get_oid_with_flags()` only has to *name* an object — a full-length
+    // hex string is decoded and returned without the odb being consulted (see
+    // [`crate::objname::full_hex`]) — and it is `repo_parse_tree_indirect()`
+    // that reports "not a tree object", for a missing object and a non-tree
+    // alike. Resolving through the odb here would mis-report an absent but
+    // well-formed id as an invalid name.
+    let Some(id) = crate::objname::resolve(&repo, spec) else {
         return Ok(fatal(&format!("Not a valid object name {spec}")));
     };
-    let Ok(object) = id.object() else {
-        return Ok(fatal(&format!("Not a valid object name {spec}")));
-    };
-    let Ok(tree) = object.peel_to_tree() else {
+    let peeled = repo
+        .find_object(id)
+        .ok()
+        .and_then(|object| object.peel_to_tree().ok());
+    let Some(tree) = peeled else {
         return Ok(fatal("not a tree object"));
     };
 

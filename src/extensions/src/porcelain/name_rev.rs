@@ -564,11 +564,15 @@ pub fn name_rev(args: &[String]) -> Result<ExitCode> {
     // Unresolvable arguments are reported and skipped; the exit code stays 0.
     let mut targets: Vec<(String, ObjectId, Kind)> = Vec::new();
     for spec in &revs {
-        let Ok(id) = repo.rev_parse_single(spec.as_str()) else {
+        // git's two failures here are distinct: `repo_get_oid` (which accepts a
+        // full-length hex name as the id without touching the odb) failing gives
+        // "Could not get sha1 for", while a name that *did* resolve but whose
+        // object is missing falls through to `parse_object` returning NULL and
+        // gives "Could not get object for".
+        let Some(oid) = crate::objname::resolve(&repo, spec.as_str()) else {
             eprintln!("Could not get sha1 for {spec}. Skipping.");
             continue;
         };
-        let oid = id.detach();
         let Some(ix) = pool.parse_object(&repo, oid) else {
             eprintln!("Could not get object for {spec}. Skipping.");
             continue;
@@ -646,7 +650,7 @@ pub fn name_rev(args: &[String]) -> Result<ExitCode> {
     };
 
     if annotate_stdin {
-        annotate(&mut out, hexsz, name_only, &pool, &names, &exact)?;
+        annotate(&mut out, &repo, hexsz, name_only, &pool, &names, &exact)?;
         out.flush()?;
         return Ok(ExitCode::SUCCESS);
     }
@@ -1057,6 +1061,7 @@ fn shorten_unambiguous(refname: &str, all_names: &HashSet<String>) -> String {
 /// the commits the naming walk reached, plus non-commit ref tips.
 fn annotate<W: Write>(
     out: &mut W,
+    repo: &gix::Repository,
     hexsz: usize,
     name_only: bool,
     pool: &Pool,
@@ -1097,6 +1102,13 @@ fn annotate<W: Write>(
             counter = 0;
 
             let hex = &raw[i + 1 - hexsz..=i];
+            // `name_rev_line()` reaches every full-length hex run through
+            // `repo_get_oid(the_repository, p - (hexsz - 1), &oid)`, so annotated
+            // text warns about an ambiguous refname exactly as an argv operand
+            // does — `name-rev` is not one of the readers that clears the switch.
+            if let Ok(text) = std::str::from_utf8(hex) {
+                crate::objname::warn_ambiguous_refname(repo, text);
+            }
             let Ok(oid) = ObjectId::from_hex(hex) else {
                 continue;
             };

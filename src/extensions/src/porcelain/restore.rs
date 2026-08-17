@@ -655,14 +655,20 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
     // --- Resolve the restore source ----------------------------------------
     // `source_tree_id == None` means "the current index" (default worktree src).
     let source_tree_id: Option<ObjectId> = match &source {
-        // A `--source` that names nothing is git's own fatal. Propagating the
-        // revision parser's error instead put a Rust type name and a path inside
-        // `src/ported/` in front of the user, and exited 1 where git exits 128.
+        // A `--source` that names nothing is git's own fatal, with the name
+        // quoted. Propagating the revision parser's error instead put a Rust type
+        // name and a path inside `src/ported/` in front of the user, and exited 1
+        // where git exits 128.
+        //
+        // A full-length hex `--source` is the object id itself — `get_oid_basic()`
+        // never asks the odb — so an absent one resolves here and is reported by
+        // the tree lookup as `unable to read tree`, not as a name that would not
+        // resolve.
         Some(rev) => {
-            let Ok(object) = repo.rev_parse_single(rev.as_str()) else {
-                crate::git_fatal!("could not resolve {rev}");
+            let Some(id) = crate::objname::resolve(&repo, rev.as_str()) else {
+                crate::git_fatal!("could not resolve '{rev}'");
             };
-            Some(object.object()?.peel_to_tree()?.id)
+            Some(super::checkout::classify_tree_ish(&repo, id)?.source_tree()?)
         }
         None if staged => Some(repo.head_tree_id_or_empty()?.detach()),
         None => None,

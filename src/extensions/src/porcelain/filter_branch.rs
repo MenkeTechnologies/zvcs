@@ -974,6 +974,15 @@ fn rewrite(
     if !opts.filter_subdir.is_empty() {
         pathspecs.push(opts.filter_subdir.clone());
     }
+    // Line 337-339. `rev-list` reads `../parse` back and dies on the first name
+    // it cannot find — `git rev-parse` passed it through, because an object name
+    // that is exactly `hexsz` hex digits is decoded without the object database
+    // ever being asked (see [`crate::objname`]). Its `fatal:` goes to stderr and
+    // the script's own `die` follows it.
+    if let Some(id) = selection.bad_object {
+        eprintln!("fatal: bad object {id}");
+        return die("Could not get the commits");
+    }
     let revs = walk(repo, &selection.tips, &selection.hidden, &pathspecs)?;
     let commits = revs.len() as i64;
     if commits == 0 {
@@ -1889,6 +1898,75 @@ struct Selection {
     pathspecs: Vec<String>,
     /// `test -z "$nonrevs"` (line 317): any non-revision argument, `--` included.
     saw_nonrev: bool,
+    /// The first object name that resolved but names an object the repository
+    /// does not have — see [`Resolved::Absent`].
+    ///
+    /// `git rev-parse` (lines 269 and 325) hands such a name straight through,
+    /// so the script only notices at line 337, when `git rev-list --stdin` reads
+    /// it back and dies `bad object <oid>`. Recording it here rather than
+    /// failing on the spot keeps the two checks the script makes in between —
+    /// `test -s "$tempdir"/heads` and the `--state-branch` load — ahead of it,
+    /// which is why `git filter-branch -f <absent-full-hex>` reports
+    /// `You must specify a ref to rewrite.` and not the missing object.
+    ///
+    /// It is the *first* such name in `git rev-parse --revs-only` order, because
+    /// that is the order `../parse` feeds `rev-list` and `rev-list` dies on the
+    /// first one it cannot read. Within one `<base>..<tip>` argument rev-parse
+    /// emits the tip before `^<base>`, which is the order the parser below
+    /// records them in.
+    bad_object: Option<ObjectId>,
+}
+
+/// What one revision argument resolved to, splitting the case
+/// [`crate::objname::full_hex`] exists for out of the two git already
+/// distinguishes.
+enum Resolved {
+    /// A name the repository can turn into a commit.
+    Commit(ObjectId),
+    /// A full-length hex whose object the repository does not have.
+    ///
+    /// `get_oid_basic()`'s first branch decodes it without consulting the object
+    /// database, so `rev-parse` prints it like any other id and only `rev-list`
+    /// later complains. Nothing may peel it — there is no object to peel.
+    Absent(ObjectId),
+    /// A name that does not resolve at all, which is the only case `rev-parse`
+    /// itself rejects.
+    Unresolvable,
+}
+
+/// `git rev-parse`'s answer for one revision name: git's ordering, full-length
+/// hex first (`crate::objname`) and the ordinary revspec parser second.
+fn resolve_arg(repo: &gix::Repository, rev: &str) -> Resolved {
+    if let Some(id) = crate::objname::full_hex(repo, rev) {
+        return match repo.find_object(id).ok().and_then(|o| o.peel_to_commit().ok()) {
+            Some(commit) => Resolved::Commit(commit.id),
+            None => Resolved::Absent(id),
+        };
+    }
+    match resolve(repo, rev) {
+        Ok(id) => Resolved::Commit(id),
+        Err(_) => Resolved::Unresolvable,
+    }
+}
+
+/// `die_verify_filename()`'s message for `token`, and the 128 `rev-parse` exits
+/// with (object-name.c). The script's `|| exit` propagates that status rather
+/// than its own 1.
+///
+/// `token` is the whole argument as it was written: `revision.c`'s
+/// `handle_dotdot_1()` resolves both endpoints of a range and, when one of them
+/// fails, hands the *undivided* string back to `verify_filename()`, so the range
+/// is named as one — `'<base>..<tip>'`, never just the endpoint that failed.
+fn die_ambiguous<T>(token: &str) -> Result<T> {
+    die_with_status(
+        128,
+        &format!(
+            "fatal: ambiguous argument '{token}': unknown revision or path not in the \
+             working tree.\n\
+             Use '--' to separate paths from revisions, like this:\n\
+             'git <command> [<revision>...] -- [<file>...]'"
+        ),
+    )
 }
 
 /// The script's three `git rev-parse` calls over `"$@"` (lines 269, 316, 325),
@@ -1935,8 +2013,15 @@ fn select(repo: &gix::Repository, args: &[String]) -> Result<Selection> {
             _ => {}
         }
         if let Some(rev) = arg.strip_prefix('^') {
-            let id = resolve(repo, rev)?;
-            sel.hidden.push(id);
+            match resolve_arg(repo, rev) {
+                Resolved::Commit(id) => sel.hidden.push(id),
+                Resolved::Absent(id) => {
+                    sel.hidden.push(id);
+                    sel.bad_object.get_or_insert(id);
+                }
+                // `^<name>` is one token to `verify_filename()`, caret included.
+                Resolved::Unresolvable => return die_ambiguous(arg),
+            }
             saw_rev = true;
             continue;
         }
@@ -1946,8 +2031,26 @@ fn select(repo: &gix::Repository, args: &[String]) -> Result<Selection> {
             }
             let base = if base.is_empty() { "HEAD" } else { base };
             let tip = if tip.is_empty() { "HEAD" } else { tip };
-            sel.hidden.push(resolve(repo, base)?);
-            sel.tips.push(resolve(repo, tip)?);
+            // Both endpoints are resolved before either is judged, the way
+            // `handle_dotdot_1()` does, so an unresolvable one names the whole
+            // range rather than itself. rev-parse then emits the tip before
+            // `^<base>`, which fixes which of two absent objects `rev-list`
+            // reports — hence the tip is recorded first here.
+            let (base_res, tip_res) = (resolve_arg(repo, base), resolve_arg(repo, tip));
+            let (Resolved::Commit(base_id) | Resolved::Absent(base_id)) = base_res else {
+                return die_ambiguous(arg);
+            };
+            let (Resolved::Commit(tip_id) | Resolved::Absent(tip_id)) = tip_res else {
+                return die_ambiguous(arg);
+            };
+            if let Resolved::Absent(id) = tip_res {
+                sel.bad_object.get_or_insert(id);
+            }
+            if let Resolved::Absent(id) = base_res {
+                sel.bad_object.get_or_insert(id);
+            }
+            sel.hidden.push(base_id);
+            sel.tips.push(tip_id);
             if let Some(name) = symbolic_full_name(repo, tip) {
                 sel.head_refs.push(name);
             }
@@ -1957,33 +2060,32 @@ fn select(repo: &gix::Repository, args: &[String]) -> Result<Selection> {
         if arg.starts_with('-') {
             anyhow::bail!("unsupported rev-list argument: {arg}");
         }
-        match repo.rev_parse_single(arg.as_str()) {
-            Ok(_) => {
-                sel.tips.push(resolve(repo, arg)?);
+        match resolve_arg(repo, arg) {
+            Resolved::Commit(id) => {
+                sel.tips.push(id);
                 if let Some(name) = symbolic_full_name(repo, arg) {
                     sel.head_refs.push(name);
                 }
                 saw_rev = true;
             }
-            Err(_) if Path::new(arg).exists() => {
+            // An absent full-length hex is still a revision, so it never becomes
+            // a pathspec and never reaches the `--` advice — it names no ref
+            // either, which is what leaves `heads` empty and stops the run at
+            // `You must specify a ref to rewrite.` before `rev-list` runs.
+            Resolved::Absent(id) => {
+                sel.tips.push(id);
+                sel.bad_object.get_or_insert(id);
+                saw_rev = true;
+            }
+            Resolved::Unresolvable if Path::new(arg).exists() => {
                 sel.pathspecs.push(arg.clone());
                 sel.saw_nonrev = true;
             }
-            Err(_) => {
-                // `nonrevs=$(git rev-parse --no-revs "$@") || exit`: the message
-                // and the 128 both come from `rev-parse`'s `die_verify_filename`,
-                // and the bare `exit` propagates its status rather than the
-                // script's own 1.
-                return die_with_status(
-                    128,
-                    &format!(
-                        "fatal: ambiguous argument '{arg}': unknown revision or path not in the \
-                         working tree.\n\
-                         Use '--' to separate paths from revisions, like this:\n\
-                         'git <command> [<revision>...] -- [<file>...]'"
-                    ),
-                );
-            }
+            // `nonrevs=$(git rev-parse --no-revs "$@") || exit`: the message and
+            // the 128 both come from `rev-parse`'s `die_verify_filename`, and
+            // the bare `exit` propagates its status rather than the script's
+            // own 1.
+            Resolved::Unresolvable => return die_ambiguous(arg),
         }
     }
     if !sel.pathspecs.is_empty() {

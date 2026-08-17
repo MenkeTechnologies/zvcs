@@ -33,15 +33,15 @@
 //!     resolution errors, all with git's exact wording and exit codes;
 //!   * `parse_merge_opt()`'s accept/reject grammar for the options the merge can
 //!     honour (`--no-renames`, `--find-renames[=<n>]`, `--rename-threshold=<n>`,
-//!     `--histogram`, `--diff-algorithm=<myers|minimal|histogram>`, and the
+//!     `--patience`, `--histogram`,
+//!     `--diff-algorithm=<myers|minimal|patience|histogram>`, and the
 //!     subtree family `--subtree` / `--subtree=<path>`).
 //!
 //! Deliberate floors, refused rather than approximated (identical to the
 //! `merge-recursive` port, which shares gitoxide's merge substrate):
 //!   * `--ours` / `--theirs` / `--renormalize` / `--no-renormalize` /
-//!     `--patience` / `--diff-algorithm=patience` / `--ignore-*` — no
-//!     `gix-merge` knob, so honouring them would silently produce a different
-//!     merge than the flag asks for;
+//!     `--ignore-*` — no `gix-merge` knob, so honouring them would silently
+//!     produce a different merge than the flag asks for;
 //!   * conflict classes outside the content family (rename/rename,
 //!     rename/delete, modify/delete, directory/file, submodule, binary):
 //!     `gix-merge` reports these under a different taxonomy, so reproducing
@@ -706,14 +706,15 @@ fn parse_merge_opt(
     diff_algorithm: &mut Option<gix::diff::blob::Algorithm>,
     subtree_shift: &mut SubtreeShift,
 ) -> Result<bool> {
-    const PORTED: &str = "ported: --subtree[=<path>], --no-renames, --find-renames[=<n>], --rename-threshold=<n>, --histogram, --diff-algorithm=<myers|minimal|histogram>";
+    const PORTED: &str = "ported: --subtree[=<path>], --no-renames, --find-renames[=<n>], --rename-threshold=<n>, --patience, --histogram, --diff-algorithm=<myers|minimal|patience|histogram>";
     match opt {
         "no-renames" => *renames = Renames::Off,
         "find-renames" => *renames = Renames::On,
         "histogram" => *diff_algorithm = Some(gix::diff::blob::Algorithm::Histogram),
         // `--subtree` sets o.subtree_shift = "" -> automatic detection.
         "subtree" => *subtree_shift = SubtreeShift::Auto,
-        "ours" | "theirs" | "renormalize" | "no-renormalize" | "patience"
+        "patience" => *diff_algorithm = Some(gix::diff::blob::Algorithm::Patience),
+        "ours" | "theirs" | "renormalize" | "no-renormalize"
         | "ignore-space-change" | "ignore-all-space" | "ignore-space-at-eol"
         | "ignore-cr-at-eol" => {
             bail!("unsupported flag \"--{opt}\" (no gix-merge equivalent; {PORTED})")
@@ -734,9 +735,7 @@ fn parse_merge_opt(
                 "myers" | "default" => gix::diff::blob::Algorithm::Myers,
                 "minimal" => gix::diff::blob::Algorithm::MyersMinimal,
                 "histogram" => gix::diff::blob::Algorithm::Histogram,
-                "patience" => {
-                    bail!("unsupported flag \"--{opt}\" (gix-merge has no patience diff; {PORTED})")
-                }
+                "patience" => gix::diff::blob::Algorithm::Patience,
                 _ => return Ok(false),
             });
         }
@@ -960,6 +959,8 @@ mod tests {
             "diff-algorithm=default",
             "diff-algorithm=minimal",
             "diff-algorithm=histogram",
+            "patience",
+            "diff-algorithm=patience",
             "no-renames",
             "find-renames",
             "find-renames=",
@@ -982,14 +983,12 @@ mod tests {
         for floored in [
             "ours",
             "theirs",
-            "patience",
             "renormalize",
             "no-renormalize",
             "ignore-space-change",
             "ignore-all-space",
             "ignore-space-at-eol",
             "ignore-cr-at-eol",
-            "diff-algorithm=patience",
         ] {
             assert!(parse(floored).is_err(), "--{floored} is a floor, not a silent drop");
         }

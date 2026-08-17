@@ -276,9 +276,6 @@ pub fn replay(args: &[String]) -> Result<ExitCode> {
                 "unsupported flag {s:?} (rev-list commit-limiting options are not ported; \
                  ported: --contained, --onto, --advance, --revert, --ref, --ref-action)"
             ),
-            s if s.contains("...") => {
-                bail!("unsupported revision range {s:?} (symmetric difference `...` is not ported)")
-            }
             s => rev_exprs.push(s.to_string()),
         }
         i += 1;
@@ -346,32 +343,61 @@ pub fn replay(args: &[String]) -> Result<ExitCode> {
     // --- setup_revisions --------------------------------------------------
     let mut revs: Vec<RevArg> = Vec::new();
     for expr in &rev_exprs {
-        if let Some((left, right)) = expr.split_once("..") {
+        // Every rejection here is `setup_revisions()`'s, not this port's, so the
+        // whole operand goes to the shared diagnosis rather than the endpoint
+        // that failed: an absent full-length hex resolves (see
+        // [`crate::objname`]) and dies as `bad object <hex>` on its own or as
+        // `Invalid revision range <a>..<b>` inside a range, while a name that
+        // resolves to nothing keeps the `ambiguous argument` advice. Reporting
+        // the gitoxide error instead leaked this port's own source paths.
+        let arg = |name: &str, negative: bool| -> Result<RevArg> {
+            Ok(RevArg {
+                name: name.to_string(),
+                negative,
+                oid: peel_to_commit(&repo, name)?,
+            })
+        };
+        // `handle_dotdot()` is the first thing `handle_revision_arg_1()` tries,
+        // so a range git rejects dies here — ahead of the symmetric-difference
+        // refusal below, which is this port's gap and not git's answer. Without
+        // this, `git replay --onto HEAD <tag-of-a-tree>...HEAD` reported the gap
+        // where git reports `error: object … is a tree, not a commit` and
+        // `fatal: Invalid symmetric difference expression …` at 128.
+        match crate::objname::dotdot(&repo, expr) {
+            crate::objname::Dotdot::Missing { .. } => {
+                eprint!("{}", super::log::bad_revision_message_in(&repo, expr));
+                return Ok(ExitCode::from(128));
+            }
+            // A range whose endpoints are all good is the one shape that really
+            // is unported; anything `handle_dotdot()` did not accept falls
+            // through to the per-endpoint resolution below, which reports it the
+            // way `setup_revisions()` does.
+            crate::objname::Dotdot::Ok { .. }
+                if crate::objname::split_range(expr).is_some_and(|r| r.symmetric) =>
+            {
+                bail!(
+                    "unsupported revision range {expr:?} \
+                     (symmetric difference `...` is not ported)"
+                )
+            }
+            _ => {}
+        }
+        let resolved = if let Some((left, right)) = expr.split_once("..") {
             // git substitutes `HEAD` for an omitted side of the range.
             let left = if left.is_empty() { "HEAD" } else { left };
             let right = if right.is_empty() { "HEAD" } else { right };
-            revs.push(RevArg {
-                name: left.to_string(),
-                negative: true,
-                oid: peel_to_commit(&repo, left)?,
-            });
-            revs.push(RevArg {
-                name: right.to_string(),
-                negative: false,
-                oid: peel_to_commit(&repo, right)?,
-            });
+            arg(left, true).and_then(|a| Ok(vec![a, arg(right, false)?]))
         } else if let Some(bare) = expr.strip_prefix('^') {
-            revs.push(RevArg {
-                name: bare.to_string(),
-                negative: true,
-                oid: peel_to_commit(&repo, bare)?,
-            });
+            arg(bare, true).map(|a| vec![a])
         } else {
-            revs.push(RevArg {
-                name: expr.clone(),
-                negative: false,
-                oid: peel_to_commit(&repo, expr)?,
-            });
+            arg(expr, false).map(|a| vec![a])
+        };
+        match resolved {
+            Ok(args) => revs.extend(args),
+            Err(_) => {
+                eprint!("{}", super::log::bad_revision_message_in(&repo, expr));
+                return Ok(ExitCode::from(128));
+            }
         }
     }
 
@@ -647,8 +673,16 @@ fn peel_to_commit(repo: &gix::Repository, spec: &str) -> Result<ObjectId> {
     Ok(repo.rev_parse_single(spec)?.object()?.peel_to_commit()?.id)
 }
 
-/// `peel_committish`, whose two failure modes carry distinct `die` messages.
+/// `peel_committish`, whose three failure modes carry distinct `die` messages.
 fn try_peel_to_commit(repo: &gix::Repository, name: &str, mode: &str) -> Result<ObjectId, String> {
+    // `repo_get_oid()` succeeds for a full-length hex without asking the object
+    // database (see [`crate::objname`]), so `parse_object_or_die()` is the next
+    // thing to run and it dies first, ahead of either message below. It names
+    // the operand as written — verified against stock 2.55.0, which echoes an
+    // uppercase `--onto` argument back uppercase rather than folding it.
+    if crate::objname::resolves_but_absent(repo, name) {
+        return Err(format!("unable to parse object: {name}"));
+    }
     // Resolution and lookup have unrelated error types, so each is reduced to
     // the same `die` message rather than joined through `?`.
     let object = repo

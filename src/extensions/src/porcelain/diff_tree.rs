@@ -584,6 +584,10 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
         }
 
         // A positional. It is a `<tree-ish>` exactly when it resolves as a revision.
+        // `handle_revision_arg()` gets it first either way, so `get_oid_basic()`'s
+        // ambiguity warning belongs here — once per positional, ahead of the
+        // several times this spec is resolved again further down.
+        crate::objname::warn_ambiguous_refname(&repo, a);
         if repo.rev_parse_single(a).is_ok() {
             revs.push(a.to_string());
             i += 1;

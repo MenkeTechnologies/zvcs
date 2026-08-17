@@ -135,6 +135,11 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
     let mut pretty_given = false;
     let mut notes_opt = super::notes::DisplayOpt::default();
     let mut after_dashdash = false;
+    // `setup_revisions()`'s `seen_dashdash`, which it establishes in a scan of
+    // the whole argument vector *before* it resolves anything — so it is in
+    // force for the arguments in front of the separator as well, unlike
+    // `after_dashdash` above.
+    let seen_dashdash = args.iter().any(|a| a == "--");
     // `--not` (`setup_revisions`' `flags ^= UNINTERESTING | BOTTOM`): a toggle that
     // reverses the sense of every revision after it, so `--not A` excludes `A` and a
     // second `--not` restores the positive reading. Recorded per revision in
@@ -606,6 +611,15 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
                     // moment an UNINTERESTING object is pended, so the two are
                     // positional against each other: `git show A..B --no-walk`
                     // prints the pending objects, `git show --no-walk A..B` walks.
+                    // `handle_revision_arg_1()` refuses a bare `..` before
+                    // `handle_dotdot()` ever sees it, so it is prune data rather
+                    // than `HEAD..HEAD`; the pathspec layer then rejects it for
+                    // leaving the repository. See
+                    // [`crate::objname::is_parent_directory_pathspec`].
+                    if crate::objname::is_parent_directory_pathspec(s, seen_dashdash) {
+                        pathspecs.push(s.as_bytes().to_vec());
+                        continue;
+                    }
                     if super::log::argument_excludes(s, negate_revs) {
                         no_walk = false;
                     }
@@ -662,7 +676,11 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
     };
     // `--stdin` lines are read after the command line is scanned, so they take the
     // `--not` state the last argument left behind — git reads them through the same
-    // `handle_revision_arg()` with the same `flags`.
+    // `handle_revision_arg()` with the same `flags`. They are read inside
+    // `read_revisions_from_stdin()` though, which clears
+    // `warn_on_object_refname_ambiguity` for its whole loop, so the boundary
+    // between argv and stdin specs is remembered for the warning below.
+    let argv_specs = specs.len();
     for line in stdin_text.lines().filter(|l| !l.is_empty()) {
         if super::log::argument_excludes(line, negate_revs) {
             no_walk = false;
@@ -847,6 +865,14 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
             &mut plain,
             &mut no_walk,
         )?;
+        // `handle_revision_arg_1()` puts every endpoint of the token through
+        // `get_oid_with_context()`, so `get_oid_basic()`'s ambiguity warning fires
+        // once per endpoint, and not at all for what `--stdin` supplied.
+        if at < argv_specs {
+            for endpoint in super::log::revision_endpoints(spec) {
+                crate::objname::warn_ambiguous_refname(&repo, endpoint);
+            }
+        }
         // The `~<n>`/`^<n>` chains a token navigates are how far
         // `mark_parents_uninteresting()` can reach while `no_walk` stands.
         for endpoint in spec.trim_start_matches('^').split("..") {
@@ -856,9 +882,21 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
                 if e.is_empty() { "HEAD" } else { e },
             ));
         }
+        // `handle_dotdot()` is the first thing `handle_revision_arg_1()` tries,
+        // so a range `handle_dotdot_1()` rejects dies here — before the token is
+        // read as anything else. gitoxide's `rev_parse()` peels a `<a>...<b>` on
+        // its own and so *succeeds* where git dies, which is why the question has
+        // to be asked ahead of it rather than in the `Err` arm below: without
+        // this, `git show <tag-of-a-tree>...HEAD` printed a commit and exited 0
+        // where git prints `error: object … is a tree, not a commit` and
+        // `fatal: Invalid symmetric difference expression …` at 128.
+        if let Some(message) = crate::objname::dotdot_fatal(&repo, spec) {
+            eprint!("{message}");
+            return Ok(ExitCode::from(128));
+        }
         let parsed = match repo.rev_parse(BStr::new(*spec)) {
             Ok(p) => p.detach(),
-            Err(_) => return Ok(bad_revision(spec, hex_len)),
+            Err(_) => return Ok(bad_revision(&repo, spec)),
         };
         match parsed {
             // `--not <rev>` and `^<rev>` are the same thing twice: `handle_revision_arg_1`
@@ -1263,8 +1301,8 @@ fn fatal(msg: &str) -> ExitCode {
 /// shared with `git log` — `cmd_show` runs the same `cmd_log_init`. Already
 /// carries its own `fatal: ` prefix, so it goes to stderr directly rather than
 /// through [`fatal`].
-fn bad_revision(spec: &str, hex_len: usize) -> ExitCode {
-    eprint!("{}", super::log::bad_revision_message(spec, hex_len));
+fn bad_revision(repo: &gix::Repository, spec: &str) -> ExitCode {
+    eprint!("{}", super::log::bad_revision_message_in(repo, spec));
     ExitCode::from(128)
 }
 

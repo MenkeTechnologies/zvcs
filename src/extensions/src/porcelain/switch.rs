@@ -63,6 +63,7 @@ use gix::prelude::ObjectIdExt;
 use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
 use gix::refs::{FullName, Target};
 
+use super::checkout::TreeIsh;
 use super::{Arg, LongOpt};
 
 /// `cmd_switch()`'s option table (builtin/checkout.c:2148), in the order
@@ -591,11 +592,23 @@ fn switch_create(
         .map(|n| n.shorten() == branch)
         .unwrap_or(false);
 
+    // `switch` shares `checkout`'s `parse_branchname_arg()`, so the start-point is
+    // resolved by `get_oid_mb()` — where a full-length hex name is the id itself,
+    // odb untouched — and only then looked up. An absent id therefore reaches
+    // `unable to read tree`, not `invalid reference`, and a tag is peeled to the
+    // commit the branch is actually created at.
     let start_commit: Option<ObjectId> = match start {
-        Some(s) => match repo.rev_parse_single(BStr::new(s)) {
-            Ok(id) => Some(id.detach()),
-            Err(_) => return fatal(format!("invalid reference: {s}")),
-        },
+        Some(s) => {
+            let Some(id) = crate::objname::resolve(repo, s) else {
+                return fatal(format!("invalid reference: {s}"));
+            };
+            match super::checkout::classify_tree_ish(repo, id)? {
+                TreeIsh::Commit(commit) => Some(commit.id),
+                TreeIsh::Tree(_) => {
+                    return fatal(format!("Cannot switch branch to a non-commit '{s}'"))
+                }
+            }
+        }
         None => current_commit,
     };
     let from_desc = describe_head(repo)?;
@@ -711,13 +724,20 @@ fn switch_detach(
     }
 
     let target_id: ObjectId = match positionals.first().copied() {
-        Some(s) => match repo.rev_parse_single(BStr::new(s)) {
-            Ok(id) => match repo.find_object(id.detach())?.peel_to_commit() {
-                Ok(c) => c.id,
-                Err(_) => return fatal(format!("invalid reference: {s}")),
-            },
-            Err(_) => return fatal(format!("invalid reference: {s}")),
-        },
+        // Same `get_oid_mb()` ordering as the `-c` path above: a full-length hex
+        // name resolves without the odb, so `git switch --detach <absent-sha>` is
+        // git's `unable to read tree`, not `invalid reference`.
+        Some(s) => {
+            let Some(id) = crate::objname::resolve(repo, s) else {
+                return fatal(format!("invalid reference: {s}"));
+            };
+            match super::checkout::classify_tree_ish(repo, id)? {
+                TreeIsh::Commit(commit) => commit.id,
+                TreeIsh::Tree(_) => {
+                    return fatal(format!("Cannot switch branch to a non-commit '{s}'"))
+                }
+            }
+        }
         None => {
             let mut head = repo.head()?;
             match head.try_peel_to_id()? {
@@ -787,11 +807,14 @@ fn switch_orphan(
     // `--orphan` takes no start-point; a resolvable extra arg is a start-point
     // error, an unresolvable one is a bad reference (git's evaluation order).
     if let Some(p) = positionals.first().copied() {
-        return if repo.rev_parse_single(BStr::new(p)).is_ok() {
-            fatal("'--orphan' cannot take <start-point>")
-        } else {
-            fatal(format!("invalid reference: {p}"))
+        let Some(id) = crate::objname::resolve(repo, p) else {
+            return fatal(format!("invalid reference: {p}"));
         };
+        // `parse_branchname_arg()` still has to read the object it resolved, and
+        // fails first when it cannot: `--orphan <absent-full-hex>` is git's
+        // `unable to read tree`, while `--orphan <tree>` reaches the refusal below.
+        super::checkout::classify_tree_ish(repo, id)?;
+        return fatal("'--orphan' cannot take <start-point>");
     }
 
     let full = format!("refs/heads/{branch}");
@@ -1020,13 +1043,20 @@ fn branch_expected(repo: &gix::Repository, branch: &str) -> Result<ExitCode> {
             }
             ExitCode::from(128)
         }
-        None => match repo.rev_parse_single(BStr::new(branch)) {
-            Ok(_) => {
-                eprintln!("fatal: a branch is expected, got commit '{branch}'");
-                ExitCode::from(128)
+        None => {
+            let Some(id) = crate::objname::resolve(repo, branch) else {
+                return fatal(format!("invalid reference: {branch}"));
+            };
+            // `parse_branchname_arg()` reads the object before `switch` gets to
+            // complain that the name is not a branch, so an id this repository does
+            // not have is `unable to read tree` and a tree is the non-commit
+            // refusal. Neither carries the detach hint below.
+            if let TreeIsh::Tree(_) = super::checkout::classify_tree_ish(repo, id)? {
+                return fatal(format!("Cannot switch branch to a non-commit '{branch}'"));
             }
-            Err(_) => return fatal(format!("invalid reference: {branch}")),
-        },
+            eprintln!("fatal: a branch is expected, got commit '{branch}'");
+            ExitCode::from(128)
+        }
     };
     // git checks `advice_enabled()` itself and then calls plain `advise()`, so
     // there is no `Disable this message with …` trailer on this one.

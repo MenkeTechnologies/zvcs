@@ -467,14 +467,25 @@ pub fn archive(args: &[String]) -> Result<ExitCode> {
     }
     let umask = tar_umask(&repo)?;
 
-    let Ok(id) = repo.rev_parse_single(spec.as_str()) else {
+    // `parse_treeish_arg()` (archive.c) resolves with `repo_get_oid()`, which
+    // only has to *name* an object — a full-length hex string is decoded
+    // without the odb being consulted (see [`crate::objname::full_hex`]). An
+    // absent but well-formed id therefore reaches `repo_parse_tree_indirect()`
+    // below and is reported as "not a tree object", not as an invalid name.
+    let Some(id) = crate::objname::resolve(&repo, spec.as_str()) else {
         eprintln!("fatal: not a valid object name: {spec}");
         return Ok(ExitCode::from(128));
     };
+    let object = repo.find_object(id).ok();
 
     // A commit (or a tag peeling to one) contributes the pax global header and
     // the entry mtime; anything else that peels to a tree uses the current time.
-    let commit = id.object()?.peel_to_commit().ok().map(|c| (c.id, c.time()));
+    // `lookup_commit_reference_gently(..., quiet)` never diagnoses a miss, so a
+    // missing object simply leaves both unset.
+    let commit = object
+        .clone()
+        .and_then(|obj| obj.peel_to_commit().ok())
+        .map(|c| (c.id, c.time()));
     let (commit_id, default_mtime) = match commit {
         Some((cid, time)) => (Some(cid), time?.seconds),
         None => (None, now()),
@@ -484,8 +495,9 @@ pub fn archive(args: &[String]) -> Result<ExitCode> {
         Some(text) => approxidate(text),
         None => default_mtime,
     };
-    let Ok(mut tree) = id.object()?.peel_to_tree() else {
-        eprintln!("fatal: not a tree object: {}", id.detach());
+    // git names the *resolved* id here, not the spelling from argv.
+    let Some(mut tree) = object.and_then(|obj| obj.peel_to_tree().ok()) else {
+        eprintln!("fatal: not a tree object: {id}");
         return Ok(ExitCode::from(128));
     };
 

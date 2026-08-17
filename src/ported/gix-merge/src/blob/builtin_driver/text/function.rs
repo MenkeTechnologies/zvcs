@@ -1,8 +1,8 @@
 use crate::blob::{
     Resolution,
     builtin_driver::text::{
-        Conflict, Labels, Merge, Options, Rendering,
-        xdl::{self, Files, Params},
+        Canonicalize, Conflict, Labels, Merge, Options, Rendering,
+        xdl::{self, Classes, Files, Params, Side},
     },
 };
 
@@ -22,16 +22,38 @@ impl<'input, 'data> Merge<'input, 'data> {
         other: &'data [u8],
         diff_algorithm: imara_diff::Algorithm,
     ) -> Merge<'input, 'data> {
+        Merge::new_canonicalized(input, current, ancestor, other, diff_algorithm, None)
+    }
+
+    /// [`Merge::new()`] with `xpp.flags`' whitespace rule in force — see
+    /// [`Canonicalize`].
+    pub fn new_canonicalized(
+        input: &'input mut imara_diff::InternedInput<&'data [u8]>,
+        current: &'data [u8],
+        ancestor: &'data [u8],
+        other: &'data [u8],
+        diff_algorithm: imara_diff::Algorithm,
+        canonicalize: Option<Canonicalize>,
+    ) -> Merge<'input, 'data> {
+        let ancestor_lines: Vec<&'data [u8]> = xdl::tokens(ancestor).collect();
+        let current_lines: Vec<&'data [u8]> = xdl::tokens(current).collect();
+        let other_lines: Vec<&'data [u8]> = xdl::tokens(other).collect();
+
+        // One class table for all three sides: `xdl_recmatch()` is asked about
+        // pairs drawn from any two of them, so they have to agree on which lines
+        // are the same line.
+        let mut classes = Classes::new(canonicalize);
+
         // `xdl_merge()`'s pair of `xdl_do_diff()` calls: both sides against the
         // shared ancestor.
-        input.update_before(xdl::tokens(ancestor));
-        input.update_after(xdl::tokens(current));
+        input.update_before(ancestor_lines.iter().map(|&line| classes.representative(line)));
+        input.update_after(current_lines.iter().map(|&line| classes.representative(line)));
         let ours = xdl::build_script(diff_algorithm, input);
 
         // Interning is shared, so the current-side tokens stay valid once `after`
         // is re-filled with the other side.
         let current_tokens = std::mem::take(&mut input.after);
-        input.update_after(xdl::tokens(other));
+        input.update_after(other_lines.iter().map(|&line| classes.representative(line)));
         let theirs = xdl::build_script(diff_algorithm, input);
 
         Merge {
@@ -39,9 +61,13 @@ impl<'input, 'data> Merge<'input, 'data> {
             current,
             other,
             current_tokens,
+            ancestor_lines,
+            current_lines,
+            other_lines,
             ours,
             theirs,
             diff_algorithm,
+            canonicalize,
         }
     }
 
@@ -91,10 +117,18 @@ impl<'input, 'data> Merge<'input, 'data> {
         };
 
         let files = Files {
-            input: self.input,
-            ancestor: &self.input.before,
-            ours: &self.current_tokens,
-            theirs: &self.input.after,
+            ancestor: Side {
+                tokens: &self.input.before,
+                lines: &self.ancestor_lines,
+            },
+            ours: Side {
+                tokens: &self.current_tokens,
+                lines: &self.current_lines,
+            },
+            theirs: Side {
+                tokens: &self.input.after,
+                lines: &self.other_lines,
+            },
         };
         let conflicts = xdl::merge_scripts(
             &files,
@@ -107,6 +141,7 @@ impl<'input, 'data> Merge<'input, 'data> {
                 marker_size: rendering.marker_size(),
                 level: rendering.level,
                 algorithm: self.diff_algorithm,
+                canonicalize: self.canonicalize,
             },
             out,
         );
@@ -158,10 +193,11 @@ pub fn merge_counted<'a>(
         conflict,
         style,
         level,
+        canonicalize,
     }: Options,
 ) -> (Resolution, usize) {
     out.clear();
-    let merge = Merge::new(input, current, ancestor, other, diff_algorithm);
+    let merge = Merge::new_canonicalized(input, current, ancestor, other, diff_algorithm, canonicalize);
     merge.run_with(
         out,
         labels,

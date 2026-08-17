@@ -17,7 +17,10 @@
 //!   * `--into-name <name>`, and the detached-HEAD spelling (`HEAD`).
 //!   * `-m`/`--message <text>` — replaces the title and suppresses it.
 //!   * `--log[=<n>]` / `--no-log` / `--summary[=<n>]` / `--no-summary`, and the
-//!     `merge.log` / `merge.summary` configuration fallback (`true` = 20).
+//!     `merge.log` / `merge.summary` configuration fallback (`true` = 20). `<n>`
+//!     goes through [`crate::optint`], so it is `OPTION_INTEGER`'s base-0
+//!     grammar — `0x10` is sixteen, `010` is eight, `1k` is 1024 — bounded to a
+//!     C `int` with git's own out-of-range diagnostic.
 //!   * the per-origin shortlog block: `* <name>:` (or `* <name>: (<n> commits)`
 //!     when the count exceeds the limit), two-space-indented subjects in
 //!     commit-date order newest first, merges counted but not listed, the
@@ -226,20 +229,17 @@ pub fn fmt_merge_msg(args: &[String]) -> Result<ExitCode> {
             "--no-log" | "--no-summary" => shortlog_len = 0,
             _ if a.starts_with("--log=") || a.starts_with("--summary=") => {
                 let (flag, value) = a.split_once('=').expect("checked above");
-                let flag = flag.trim_start_matches('-');
-                let Some(n) = parse_integer(value) else {
-                    // `OPTION_INTEGER`'s two diagnostics; neither prints usage.
-                    if value.is_empty() {
-                        eprintln!("error: option `{flag}' expects a numerical value");
-                    } else {
-                        eprintln!(
-                            "error: option `{flag}' expects an integer value \
-                             with an optional k/m/g suffix"
-                        );
+                // `optname()` names the *canonical* option, so `--sum=abc`
+                // reports `option `summary''.
+                let name = crate::optint::long_opt(flag.trim_start_matches('-'));
+                match crate::optint::integer(&name, value) {
+                    Ok(n) => shortlog_len = n,
+                    // `OPTION_INTEGER`'s diagnostics; none of them print usage.
+                    Err(e) => {
+                        eprintln!("error: {}", e.message());
+                        return Ok(ExitCode::from(129));
                     }
-                    return Ok(ExitCode::from(129));
-                };
-                shortlog_len = n;
+                }
             }
             "-m" | "--message" => {
                 i += 1;
@@ -1120,21 +1120,6 @@ fn strip_prefix(value: &BStr, prefix: &[u8]) -> BString {
         Some(rest) => rest.into(),
         None => value.to_owned(),
     }
-}
-
-/// git's `git_parse_signed()` as `OPTION_INTEGER` reaches it: a decimal number
-/// with an optional binary `k`/`m`/`g` scale suffix.
-fn parse_integer(value: &str) -> Option<i64> {
-    // `chars.as_str()` after `next_back()` is the prefix, so a multi-byte final
-    // character can never be sliced through.
-    let mut chars = value.chars();
-    let (digits, scale) = match chars.next_back() {
-        Some('k' | 'K') => (chars.as_str(), 1024i64),
-        Some('m' | 'M') => (chars.as_str(), 1024 * 1024),
-        Some('g' | 'G') => (chars.as_str(), 1024 * 1024 * 1024),
-        _ => (value, 1),
-    };
-    digits.parse::<i64>().ok()?.checked_mul(scale)
 }
 
 /// `strerror(errno)`: the bare message, without Rust's ` (os error <n>)` tail.

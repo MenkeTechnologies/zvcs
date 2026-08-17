@@ -636,6 +636,16 @@ fn parse<'a>(args: &'a [String]) -> Result<Opts<'a>, ExitCode> {
                             o.edit = true;
                             o.edit_given = Some(true);
                         }
+                        // `OPT_NOOP_NOARG('r', NULL)` — builtin/revert.c's
+                        // `base_options[]`, between `--edit` and `--signoff`.
+                        // Hidden, no long form, and it accepts nothing: it is
+                        // swallowed and the rest of the cluster keeps parsing,
+                        // which is why `-rn` and `-rx` behave as `-n` and `-x`.
+                        // An attached value (`-r=1`) is left to fall through the
+                        // cluster as the unknown `=`, and `--no-r` never matches
+                        // an option with no long name — both reach stage 5 and
+                        // come back out as the usage error.
+                        b'r' => {}
                         b's' => o.signoff = true,
                         b'm' => {
                             let v = take_value(attached, args, &mut i, "mainline")?;
@@ -704,6 +714,32 @@ pub fn cherry_pick(args: &[String]) -> Result<ExitCode> {
         return handle_verb(verb, &opts);
     }
 
+    // --- stage 2b: `--ff`'s own incompatibility list -----------------------
+    //
+    // `if (opts->allow_ff) verify_opt_compatible(me, "--ff", …)` — the second
+    // `verify_opt_compatible` in `run_sequencer`, in its declaration order:
+    // `--signoff`, `--no-commit`, `-x`, `--edit`. `--ff` replays the commit by
+    // moving `HEAD`, so none of the four — which all want a *new* commit
+    // object — can be honoured.
+    //
+    // Placed between the verb check above and the no-revision usage below
+    // because git's sits there: `git cherry-pick --ff -n` reports the conflict
+    // (128) rather than usage (129), while `--ff -n --quit` is caught one step
+    // earlier and blames `--quit`. `--edit` is git's `opts->edit > 0`, i.e.
+    // given as `--edit`/`-e` — `--no-edit` leaves it 0 and passes.
+    if opts.allow_ff {
+        for (name, given) in [
+            ("--signoff", opts.signoff),
+            ("--no-commit", opts.no_commit),
+            ("-x", opts.record_origin),
+            ("--edit", opts.edit),
+        ] {
+            if given {
+                return Ok(fatal(&format!("cherry-pick: {name} cannot be used with --ff")));
+            }
+        }
+    }
+
     // --- stage 3: nothing to pick ----------------------------------------
     if opts.specs.is_empty() {
         return Ok(usage());
@@ -724,8 +760,9 @@ pub fn cherry_pick(args: &[String]) -> Result<ExitCode> {
     // go through the one walk [`crate::sequencer::prepare_revs`] runs, which is
     // also where a pick's oldest-first replay order comes from.
     let revs = crate::sequencer::prepare_revs(&repo, &opts.specs, crate::sequencer::Action::Pick)?;
-    if let crate::sequencer::Revs::BadRevision(spec) = &revs {
-        return Ok(fatal(&format!("bad revision '{spec}'")));
+    if let Some(message) = revs.setup_revisions_fatal() {
+        eprint!("{message}");
+        return Ok(ExitCode::from(128));
     }
 
     // --- stage 5: options git kept but never consumed ----------------------
@@ -744,8 +781,11 @@ pub fn cherry_pick(args: &[String]) -> Result<ExitCode> {
         crate::sequencer::Revs::NotACommit { name, kind } => {
             return Ok(sequencer_failed(&format!("{name}: can't cherry-pick a {kind}")));
         }
-        // Both handled above; `prepare_revs` returns each exactly once.
-        crate::sequencer::Revs::BadRevision(_) | crate::sequencer::Revs::UnknownOption => {
+        // All handled above; `prepare_revs` returns each exactly once.
+        crate::sequencer::Revs::BadRevision(_)
+        | crate::sequencer::Revs::BadObject(_)
+        | crate::sequencer::Revs::InvalidRange { .. }
+        | crate::sequencer::Revs::UnknownOption => {
             unreachable!("stage 4 and stage 5 return on these")
         }
     };
@@ -783,12 +823,14 @@ pub fn cherry_pick(args: &[String]) -> Result<ExitCode> {
     // exclusion — creates the directory and runs `pick_commits`, which is the
     // `sequence` flag `prepare_revs` returned.
     //
-    // This runs *before* the dirty-worktree refusal below because git's does:
+    // This runs *before* the index refusal in `pick_one` because git's does:
     // `create_seq_dir()`/`save_head()`/`save_opts()` are all in
     // `sequencer_pick_revisions`, and the refusal comes out of the first
-    // `do_pick_commit` inside `pick_commits`. So a multi-commit pick that is
-    // turned away for a dirty worktree still leaves the sequencer state behind,
-    // and a *second* one is then refused as "already in progress".
+    // `do_pick_commit` inside `pick_commits` — which `pick_commits` reaches only
+    // after `save_todo()` has written the instruction it is about to run. So a
+    // multi-commit pick turned away for a dirty index still leaves the whole
+    // sequencer state — todo list included — behind, and a *second* one is then
+    // refused as "already in progress".
     let todo = build_todo(&repo, &picks)?;
 
     if sequence {
@@ -801,16 +843,6 @@ pub fn cherry_pick(args: &[String]) -> Result<ExitCode> {
         crate::sequencer::save_head(git_dir, head_id)?;
         crate::sequencer::save_opts(git_dir, &saved_opts(&opts, cleanup))?;
         crate::sequencer::update_abort_safety_file(&repo)?;
-    }
-
-    // --- stage 8: git's `require_clean_work_tree` --------------------------
-    if repo.is_dirty()? {
-        eprintln!("error: your local changes would be overwritten by cherry-pick.");
-        // `error_dirty_index` (sequencer.c) gates its one-line direction on
-        // `advice.commitBeforeMerge`; the `error:` line above always prints.
-        crate::advice::Advice::CommitBeforeMerge
-            .advise_plain("commit your changes or stash them to proceed.");
-        return Ok(sequencer_failed_tail());
     }
 
     // Committer identity, shared by every pick in the sequence.
@@ -828,8 +860,9 @@ pub fn cherry_pick(args: &[String]) -> Result<ExitCode> {
         should_interrupt: AtomicBool::new(false),
     };
     let mut state = PickState {
-        // Index mirroring the current (clean) worktree; carried forward across
-        // picks so filesystem stats are reused and a later `status` stays cheap.
+        // The index as it stands — `pick_one` is what refuses an unmerged or
+        // dirty one, as `do_pick_commit` does. Carried forward across picks so
+        // filesystem stats are reused and a later `status` stays cheap.
         index: repo.index_or_load_from_head()?.into_owned(),
         // `-n`/`--no-commit` applies picks to the index and worktree without
         // committing; `pending_tree` accumulates the applied tree so a run of
@@ -982,6 +1015,55 @@ fn pick_one(
     let head_id = state.head_id;
     let pick = repo.find_commit(pick_id)?;
 
+    // --- the index gate, and with it the *ours* side ------------------
+    //
+    // `do_pick_commit` inspects the index before it so much as looks at the
+    // picked commit's parents, so an unmerged or dirty index outranks "is a
+    // merge but no -m option was given". Being here rather than once before the
+    // sequence is what leaves `.git/sequencer/todo` behind on the refusal:
+    // `pick_commits` writes the instruction it is about to run first.
+    let head_tree = if opts.no_commit {
+        // `write_index_as_tree`: under `--no-commit` the *ours* side is the
+        // index written out as a tree, so a staged change is merged through and
+        // repeated picks stack on what the previous one left staged. The only
+        // demand is that the index be merged — `cache_tree_update()` names every
+        // conflicted entry on its way out.
+        if let Some(unmerged) = unmerged_entries(&state.index) {
+            for (path, id) in unmerged {
+                eprintln!("{path}: unmerged ({id})");
+            }
+            eprintln!("error: your index file is unmerged.");
+            return Ok(PickOutcome::Stopped(sequencer_failed_tail()));
+        }
+        match state.pending_tree {
+            Some(t) => t,
+            None => tree_from_index(&repo, &state.index)?,
+        }
+    } else {
+        let head_tree = repo.find_commit(head_id)?.tree_id()?.detach();
+        if unmerged_entries(&state.index).is_some() {
+            // `error_dirty_index`'s first move is `repo_read_index_unmerged()`,
+            // which hands an unmerged index to `error_resolve_conflict`: that
+            // prints the error unconditionally and the two-line direction only
+            // under `advice.resolveConflict`.
+            eprintln!("error: Cherry-picking is not possible because you have unmerged files.");
+            crate::advice::Advice::ResolveConflict.advise_plain(
+                "Fix them up in the work tree, and then use 'git add/rm <file>'\n\
+                 as appropriate to mark resolution and make a commit.",
+            );
+            return Ok(PickOutcome::Stopped(sequencer_failed_tail()));
+        }
+        if index_differs_from(&repo, &state.index, head_tree)? {
+            eprintln!("error: your local changes would be overwritten by cherry-pick.");
+            // `error_dirty_index` (sequencer.c) gates its one-line direction on
+            // `advice.commitBeforeMerge`; the `error:` line above always prints.
+            crate::advice::Advice::CommitBeforeMerge
+                .advise_plain("commit your changes or stash them to proceed.");
+            return Ok(PickOutcome::Stopped(sequencer_failed_tail()));
+        }
+        head_tree
+    };
+
     // --- pick the base (mainline) parent ------------------------------
     let parents: Vec<ObjectId> = pick.parent_ids().map(|id| id.detach()).collect();
     let base_id: Option<ObjectId> = if parents.is_empty() {
@@ -1016,10 +1098,6 @@ fn pick_one(
     let base_tree = match base_id {
         Some(id) => repo.find_commit(id)?.tree_id()?.detach(),
         None => ObjectId::empty_tree(hash),
-    };
-    let head_tree = match state.pending_tree {
-        Some(t) => t,
-        None => repo.find_commit(head_id)?.tree_id()?.detach(),
     };
 
     // `--ff`: HEAD is exactly the picked commit's parent, so replaying the
@@ -1117,6 +1195,33 @@ fn pick_one(
                 strategy.apply(repo.tree_merge_options()?)?,
             )?;
             let tree_id = merge.tree.write()?.detach();
+
+            // `merge_switch_to_result()` opens with `checkout(opt, head,
+            // result->tree)` — an `unpack_trees()` from the tree the worktree
+            // currently holds onto the merged one, which refuses per path rather
+            // than write over work that is only in the worktree. The index gate
+            // above cannot stand in for it: that one is `DIFF_INDEX_CACHED` and
+            // blind to the worktree, so an unstaged edit reaches here and is
+            // stopped only by this.
+            //
+            // It runs before everything below because git's does: a failed
+            // `checkout()` sets `result->clean = -1` and returns, so
+            // `merge_display_update_messages()` never flushes the
+            // `Auto-merging`/`CONFLICT` lines, `write_auto_merge` never writes
+            // `.git/AUTO_MERGE`, and `do_pick_commit`'s
+            // `if (res < 0) goto leave` skips the `MERGE_MSG` write. The merged
+            // tree itself is already in the object database — git writes it
+            // before the checkout too.
+            let clobber =
+                crate::merge_guard::verify_two_way(repo, head_tree, tree_id, &state.index)?;
+            if !clobber.is_empty() {
+                // `setup_unpack_trees_porcelain(&unpack_opts, "merge")`: the
+                // verb in the refusal is merge-ort's, not the sequencer's, so a
+                // cherry-pick reports `overwritten by merge` and only the
+                // `fatal:` tail names the command.
+                clobber.report("merge");
+                return Ok(PickOutcome::Stopped(sequencer_failed_tail()));
+            }
 
             // `merge_switch_to_result()` (merge-ort.c) records the merged tree
             // as `AUTO_MERGE` for every result it checks out. Only this
@@ -1912,6 +2017,44 @@ fn flatten(
         }
     }
     Ok(out)
+}
+
+/// `repo_read_index_unmerged()`'s answer: the conflicted entries, in index
+/// order, or `None` when the index is fully merged.
+///
+/// The pairs are what `cache_tree_update()` names on stderr when a
+/// `--no-commit` pick tries to write such an index out as a tree — one line per
+/// entry, so a path conflicted at two stages is named twice.
+fn unmerged_entries(index: &gix::index::File) -> Option<Vec<(BString, ObjectId)>> {
+    let backing = index.path_backing();
+    let found: Vec<(BString, ObjectId)> = index
+        .entries()
+        .iter()
+        .filter(|e| e.stage_raw() != 0)
+        .map(|e| (e.path_in(backing).to_owned(), e.id))
+        .collect();
+    (!found.is_empty()).then_some(found)
+}
+
+/// `index_differs_from(r, "HEAD", NULL, 0)`: whether the index holds anything
+/// `head_tree` does not, or the other way round.
+///
+/// git runs it as a `DIFF_INDEX_CACHED` diff, so it is blind to the worktree —
+/// an unstaged edit is not what a cherry-pick refuses over, only a staged one.
+fn index_differs_from(
+    repo: &gix::Repository,
+    index: &gix::index::File,
+    head_tree: ObjectId,
+) -> Result<bool> {
+    let backing = index.path_backing();
+    let mut staged: HashMap<BString, (EntryMode, ObjectId)> =
+        HashMap::with_capacity(index.entries().len());
+    for e in index.entries() {
+        if let Some(mode) = e.mode.to_tree_entry_mode() {
+            staged.insert(e.path_in(backing).to_owned(), (mode, e.id));
+        }
+    }
+    Ok(staged != flatten(repo, head_tree)?)
 }
 
 /// Point `HEAD` (writing through to its branch when attached) at `new`, with

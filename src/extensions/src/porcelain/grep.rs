@@ -1014,7 +1014,21 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
         // `allow_revs` is false without a repository (it implies `--no-index`), so
         // this only ever runs with one.
         let repo = repo.as_ref().expect("revisions require a repository");
-        if repo.rev_parse_single(arg.as_str()).is_ok() {
+        // `cmd_grep()` resolves the token with `get_oid_with_context()`, whose
+        // `get_oid_basic()` decodes a full-length hex name without consulting the
+        // odb (see [`crate::objname`]). `rev_parse_single()` resolves through the
+        // odb, so on its own it rejects a well-formed but absent id and the token
+        // falls through to the pathspec side — reporting it as a bad path rather
+        // than as the object it plainly names.
+        if let Some(id) = crate::objname::resolve(repo, arg.as_str()) {
+            // `parse_object_or_die()` (object.c) runs on the resolved id straight
+            // away — before `verify_non_filename`, and whether or not a `--` was
+            // seen — so an object the repository does not have ends the command
+            // here with this message and never reaches the checks below.
+            if repo.find_object(id).is_err() {
+                eprintln!("fatal: unable to parse object: {arg}");
+                return Ok(ExitCode::from(128));
+            }
             // git's `verify_non_filename`: a token that is both a revision and an
             // existing path is ambiguous unless a `--` disambiguates it — but only
             // where a worktree path could have been meant, which is why the check

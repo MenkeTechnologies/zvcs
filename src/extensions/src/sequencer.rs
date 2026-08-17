@@ -103,9 +103,9 @@ impl TodoItem {
 
 /// What a `cherry-pick`/`revert` command line selects, or the refusal it earns.
 ///
-/// The three failure shapes are kept apart because git prints them from three
-/// different places, and the order it reports them in is observable: a bad
-/// revision (`setup_revisions`, 128) outranks an unknown option
+/// The failure shapes are kept apart because git prints them from different
+/// places, and the order it reports them in is observable: anything
+/// `setup_revisions` diagnoses (128) outranks an unknown option
 /// (`run_sequencer`, 129), which outranks a non-commit operand
 /// (`sequencer_pick_revisions`, 128).
 pub enum Revs {
@@ -119,7 +119,26 @@ pub enum Revs {
     },
     /// `setup_revisions()` could not resolve this operand, which it reports as
     /// `fatal: bad revision '<spec>'` with status 128 the moment it reaches it.
+    ///
+    /// `builtin/revert.c` sets `s_r_opt.assume_dashdash`, so this is the message
+    /// even though there was no `--` on the command line: `seen_dashdash` sends
+    /// the operand to `die("bad revision '%s'")` rather than to
+    /// `verify_filename()`'s "ambiguous argument" text.
     BadRevision(String),
+    /// The operand *did* resolve — it was a full-length hex, which
+    /// `get_oid_basic()` decodes without consulting the odb — but the object is
+    /// not in the database, so `get_reference()` dies with
+    /// `fatal: bad object <name>` (128). See [`crate::objname::bad_object_name`]
+    /// for which spellings reach it and under what name.
+    BadObject(String),
+    /// `dotdot_missing()`: a range whose endpoints resolved but whose objects
+    /// are missing (or, for `A...B`, are not commit-ish). `notes` holds the
+    /// `object_as_type()` lines `lookup_commit_reference()` printed first.
+    InvalidRange {
+        spec: String,
+        symmetric: bool,
+        notes: Vec<String>,
+    },
     /// A pending object that is not commit-ish, named as it was written on the
     /// command line. `sequencer_pick_revisions()` reports
     /// `error: <name>: can't cherry-pick a <kind>` — that wording is fixed, so a
@@ -134,6 +153,34 @@ pub enum Revs {
     /// `run_sequencer()` reports it as the usage block with status 129 once the
     /// whole list is scanned, so a bad revision anywhere outranks it.
     UnknownOption,
+}
+
+impl Revs {
+    /// Everything `setup_revisions()` itself would have written to stderr, ready
+    /// to `eprint!`, or `None` when it got through the operand list.
+    ///
+    /// All three of these `die()` at 128 from inside the argument walk, before
+    /// `run_sequencer()` sees anything, so `cherry-pick` and `revert` report them
+    /// identically — the wording that differs between the two commands starts
+    /// later, at `sequencer_pick_revisions()`.
+    pub fn setup_revisions_fatal(&self) -> Option<String> {
+        match self {
+            Revs::BadRevision(spec) => Some(format!("fatal: bad revision '{spec}'\n")),
+            Revs::BadObject(name) => Some(format!("fatal: bad object {name}\n")),
+            Revs::InvalidRange { spec, symmetric, notes } => {
+                let mut out = String::new();
+                for note in notes {
+                    out.push_str(&format!("error: {note}\n"));
+                }
+                out.push_str(&format!(
+                    "fatal: {}\n",
+                    crate::objname::dotdot_missing_message(spec, *symmetric)
+                ));
+                Some(out)
+            }
+            _ => None,
+        }
+    }
 }
 
 /// git's `setup_revisions()` + `prepare_revs()` as `builtin/revert.c` drives
@@ -204,37 +251,55 @@ pub fn prepare_revs<S: AsRef<str>>(
             continue;
         }
 
-        // `<a>...<b>`: both tips, with their merge bases excluded. Checked ahead
-        // of `..` because the two spellings share a prefix.
-        if let Some((lhs, rhs)) = spec.split_once("...") {
-            let (left, right) = match (peel_side(repo, lhs), peel_side(repo, rhs)) {
-                (Side::Commit(l), Side::Commit(r)) => (l, r),
-                (Side::NotACommit(name, kind), _) | (_, Side::NotACommit(name, kind)) => {
-                    return Ok(Revs::NotACommit { name, kind })
+        // `handle_dotdot()`, which `handle_revision_arg_1()` reaches before any
+        // other reading of the operand: a token holding `..` is a range, both of
+        // whose endpoints resolve through `get_oid_with_context()` — and so
+        // through the full-hex rule — before either object is looked up.
+        // [`crate::objname::dotdot`] is that function; what is left here is only
+        // what the sequencer does with each of its three answers.
+        if let Some(range) = crate::objname::split_range(spec) {
+            match crate::objname::dotdot(repo, spec) {
+                // `<a>...<b>`: both tips, with their merge bases excluded. The
+                // merge bases take `flags_exclude`, both tips take `flags`.
+                crate::objname::Dotdot::Ok { a, b } if range.symmetric => {
+                    for base in repo.merge_bases_many(a, &[b])? {
+                        pending.add(base.detach(), !state.uninteresting);
+                    }
+                    pending.add(a, state.uninteresting);
+                    pending.add(b, state.uninteresting);
                 }
-                _ => return Ok(Revs::BadRevision(spec.to_owned())),
-            };
-            // `handle_dotdot_1()`'s symmetric arm: the merge bases take
-            // `flags_exclude`, both tips take `flags`.
-            for base in repo.merge_bases_many(left, &[right])? {
-                pending.add(base.detach(), !state.uninteresting);
-            }
-            pending.add(left, state.uninteresting);
-            pending.add(right, state.uninteresting);
-            continue;
-        }
-
-        // `<a>..<b>`: everything `<b>` reaches that `<a>` does not.
-        if let Some((lhs, rhs)) = spec.split_once("..") {
-            match (peel_side(repo, lhs), peel_side(repo, rhs)) {
-                (Side::Commit(from), Side::Commit(to)) => {
-                    pending.add(from, !state.uninteresting);
-                    pending.add(to, state.uninteresting);
+                // `<a>..<b>`: everything `<b>` reaches that `<a>` does not. This
+                // form only `parse_object()`s its endpoints, so a non-commit one
+                // is queued here and refused later by
+                // `sequencer_pick_revisions()`, naming the endpoint as written.
+                crate::objname::Dotdot::Ok { a, b } => {
+                    match (peel_id(repo, a), peel_id(repo, b)) {
+                        (Side::Commit(from), Side::Commit(to)) => {
+                            pending.add(from, !state.uninteresting);
+                            pending.add(to, state.uninteresting);
+                        }
+                        (Side::NotACommit(kind), _) => {
+                            return Ok(Revs::NotACommit { name: range.a.to_owned(), kind })
+                        }
+                        (_, Side::NotACommit(kind)) => {
+                            return Ok(Revs::NotACommit { name: range.b.to_owned(), kind })
+                        }
+                        _ => return Ok(Revs::BadRevision(spec.to_owned())),
+                    }
                 }
-                (Side::NotACommit(name, kind), _) | (_, Side::NotACommit(name, kind)) => {
-                    return Ok(Revs::NotACommit { name, kind })
+                crate::objname::Dotdot::Missing { notes } => {
+                    return Ok(Revs::InvalidRange {
+                        spec: spec.to_owned(),
+                        symmetric: range.symmetric,
+                        notes,
+                    })
                 }
-                _ => return Ok(Revs::BadRevision(spec.to_owned())),
+                // `handle_dotdot_1()` returned -1. git then retries the whole
+                // token as a single name, which cannot succeed for one holding
+                // `..`, and `assume_dashdash` turns that into `bad revision`.
+                crate::objname::Dotdot::NotARange => {
+                    return Ok(Revs::BadRevision(spec.to_owned()))
+                }
             }
             continue;
         }
@@ -254,13 +319,23 @@ pub fn prepare_revs<S: AsRef<str>>(
             Some(rest) if !rest.is_empty() => (rest, !state.uninteresting),
             _ => (spec, state.uninteresting),
         };
+
+        // A full-length hex the repository does not have resolves anyway, so git
+        // gets as far as `get_reference()` and dies there naming the object
+        // rather than the operand. `gix`'s parser consults the odb, so without
+        // this the same operand would come back as a bad revision — the
+        // divergence this whole module exists to close.
+        if let Some(name) = crate::objname::bad_object_name(repo, spec) {
+            return Ok(Revs::BadObject(name.to_owned()));
+        }
+
         let Ok(parsed) = repo.rev_parse(word) else {
             return Ok(Revs::BadRevision(spec.to_owned()));
         };
         match *parsed {
             gix::revision::plumbing::Spec::Include(id) => match peel_id(repo, id) {
                 Side::Commit(id) => pending.add_rev(id, uninteresting),
-                Side::NotACommit(_, kind) => {
+                Side::NotACommit(kind) => {
                     return Ok(Revs::NotACommit { name: spec.to_owned(), kind })
                 }
                 Side::Unresolved => return Ok(Revs::BadRevision(spec.to_owned())),
@@ -269,7 +344,7 @@ pub fn prepare_revs<S: AsRef<str>>(
             // above — an operand that is nothing but `^`.
             gix::revision::plumbing::Spec::Exclude(id) => match peel_id(repo, id) {
                 Side::Commit(id) => pending.add_rev(id, !uninteresting),
-                Side::NotACommit(_, kind) => {
+                Side::NotACommit(kind) => {
                     return Ok(Revs::NotACommit { name: spec.to_owned(), kind })
                 }
                 Side::Unresolved => return Ok(Revs::BadRevision(spec.to_owned())),
@@ -473,7 +548,7 @@ fn pseudo_opt(
             if let Some(id) = repo.head_id().ok().map(|id| id.detach()) {
                 match peel_id(repo, id) {
                     Side::Commit(id) => pending.add(id, state.uninteresting),
-                    Side::NotACommit(_, kind) => {
+                    Side::NotACommit(kind) => {
                         return Ok(Pseudo::NotACommit { name: "HEAD".into(), kind })
                     }
                     Side::Unresolved => {}
@@ -495,7 +570,7 @@ fn pseudo_opt(
                     };
                     match peel_id(repo, id) {
                         Side::Commit(id) => pending.add(id, state.uninteresting),
-                        Side::NotACommit(_, kind) => {
+                        Side::NotACommit(kind) => {
                             return Ok(Pseudo::NotACommit { name, kind })
                         }
                         Side::Unresolved => {}
@@ -613,7 +688,7 @@ fn handle_refs(
         };
         match peel_id(repo, id) {
             Side::Commit(id) => pending.add(id, state.uninteresting),
-            Side::NotACommit(_, kind) => return Ok(Some((name, kind))),
+            Side::NotACommit(kind) => return Ok(Some((name, kind))),
             Side::Unresolved => continue,
         }
     }
@@ -662,25 +737,14 @@ fn ref_excluded(excludes: &[String], name: &str) -> bool {
     excludes.iter().any(|pattern| wildmatch0(pattern, name))
 }
 
-/// What one revision word resolved to.
+/// What one revision word resolved to. Every caller supplies the *name* to
+/// quote itself, because git's diagnostics quote the operand as written and the
+/// spelling that reached this point has usually been trimmed.
 enum Side {
     Commit(ObjectId),
-    /// The object exists but nothing commit-ish is behind it; the name is kept
-    /// because git's diagnostic quotes the operand as written.
-    NotACommit(String, gix::object::Kind),
+    /// The object is present but nothing commit-ish is behind it.
+    NotACommit(gix::object::Kind),
     Unresolved,
-}
-
-/// One side of a range: git defaults an omitted side to `HEAD`.
-fn peel_side(repo: &gix::Repository, name: &str) -> Side {
-    let name = if name.is_empty() { "HEAD" } else { name };
-    let Ok(id) = repo.rev_parse_single(name) else {
-        return Side::Unresolved;
-    };
-    match peel_id(repo, id.detach()) {
-        Side::NotACommit(_, kind) => Side::NotACommit(name.to_owned(), kind),
-        other => other,
-    }
 }
 
 /// `lookup_commit_reference_gently()`: peel tags through to the commit, and
@@ -692,7 +756,7 @@ fn peel_id(repo: &gix::Repository, id: ObjectId) -> Side {
     let kind = object.kind;
     match object.peel_to_commit() {
         Ok(commit) => Side::Commit(commit.id),
-        Err(_) => Side::NotACommit(id.to_string(), kind),
+        Err(_) => Side::NotACommit(kind),
     }
 }
 

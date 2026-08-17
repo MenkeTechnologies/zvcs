@@ -656,7 +656,14 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
             _ => crate::git_fatal!("too many revisions given before `--`"),
         }
     } else if let Some((first, rest)) = positionals.split_first() {
-        if repo.rev_parse_single(*first).is_ok() {
+        // `parse_args()` asks `repo_get_oid_{committish,treeish}()`, which reach
+        // `get_oid_basic()` — and its first branch decodes a full-length hex name
+        // *without consulting the odb* (see [`crate::objname`]). So a well-formed
+        // but absent id is a <rev> here, not a path: git goes on to die with
+        // `Could not parse object` below rather than treating the token as a
+        // filename. `rev_parse_single()` alone resolves through the odb and would
+        // misfile it as a pathspec, producing `ambiguous argument` instead.
+        if crate::objname::resolve(&repo, first).is_some() {
             commit_spec = Some(*first);
             paths.extend(rest.iter().map(|s| s.to_string()));
         } else {
@@ -780,11 +787,34 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
     }
 
     let reflog_spec = commit_spec.unwrap_or("HEAD");
-    let target = match repo.rev_parse_single(reflog_spec) {
-        Ok(id) => id,
-        Err(_) => return Ok(ambiguous_argument(reflog_spec)),
+    // `cmd_reset()` (builtin/reset.c) resolves <rev> in two steps, and each step
+    // has its own message. The lookup — `repo_get_oid_committish()` for the
+    // whole-tree form, `repo_get_oid_treeish()` once there are pathspecs — dies
+    // with `Failed to resolve '%s' as a valid revision.` / `… as a valid tree.`.
+    // The peel that follows (`lookup_commit_reference()` / `parse_tree_indirect()`)
+    // dies with `Could not parse object '%s'.` when the id names an object the
+    // repository does not have.
+    //
+    // The second case exists only because `get_oid_basic()` decodes a full-length
+    // hex name without consulting the odb (see [`crate::objname`]); resolving with
+    // `rev_parse_single()` alone folds it into the first and loses the message.
+    //
+    // The lookup itself can only fail here for a spec that stood before a `--`,
+    // since without one the split above already resolved it. A defaulted `HEAD`
+    // that will not resolve is an unborn branch, which git decides before either
+    // check, so that case keeps the report it had.
+    let target_id = match crate::objname::resolve(&repo, reflog_spec) {
+        Some(id) => id,
+        None if commit_spec.is_none() => return Ok(ambiguous_argument(reflog_spec)),
+        None => crate::git_fatal!(
+            "Failed to resolve '{reflog_spec}' as a valid {}.",
+            if with_paths { "tree" } else { "revision" }
+        ),
     };
-    let commit = target.object()?.peel_to_commit()?;
+    let Ok(object) = repo.find_object(target_id) else {
+        crate::git_fatal!("Could not parse object '{reflog_spec}'.")
+    };
+    let commit = object.peel_to_commit()?;
     let target_commit = commit.id;
     let target_tree = commit.tree_id()?.detach();
 

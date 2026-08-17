@@ -153,11 +153,15 @@ pub fn merge_base(args: &[String]) -> Result<ExitCode> {
             if revs.len() != 2 {
                 return Ok(fatal("--is-ancestor takes exactly two commits"));
             }
-            let (Some(one), Some(two)) = (
-                commit_reference(&repo, revs[0]),
-                commit_reference(&repo, revs[1]),
-            ) else {
-                return Ok(not_a_commit(&repo, &revs));
+            // `handle_is_ancestor()` resolves argv[0] and then argv[1]
+            // (builtin/merge-base.c:117-118), so the *first* bad rev is named.
+            let one = match get_commit_reference(&repo, revs[0]) {
+                Ok(id) => id,
+                Err(code) => return Ok(code),
+            };
+            let two = match get_commit_reference(&repo, revs[1]) {
+                Ok(id) => id,
+                Err(code) => return Ok(code),
             };
             Ok(if is_ancestor(&repo, one, two)? {
                 ExitCode::SUCCESS
@@ -175,8 +179,11 @@ pub fn merge_base(args: &[String]) -> Result<ExitCode> {
             if show_all {
                 return Ok(fatal("options '--independent' and '--all' cannot be used together"));
             }
-            let Some(commits) = resolve_all(&repo, &revs) else {
-                return Ok(not_a_commit(&repo, &revs));
+            // `handle_independent()` walks its args back to front
+            // (builtin/merge-base.c:65-66).
+            let commits = match resolve_all(&repo, &revs, true) {
+                Ok(commits) => commits,
+                Err(code) => return Ok(code),
             };
             let heads = reduce_heads(&repo, &commits)?;
             if heads.is_empty() {
@@ -186,8 +193,11 @@ pub fn merge_base(args: &[String]) -> Result<ExitCode> {
             Ok(print_bases(&heads, true))
         }
         Mode::Octopus => {
-            let Some(commits) = resolve_all(&repo, &revs) else {
-                return Ok(not_a_commit(&repo, &revs));
+            // `handle_octopus()` walks its args back to front
+            // (builtin/merge-base.c:86-87).
+            let commits = match resolve_all(&repo, &revs, true) {
+                Ok(commits) => commits,
+                Err(code) => return Ok(code),
             };
             let Some(bases) = octopus_bases(&repo, &commits)? else {
                 return Ok(ExitCode::from(1));
@@ -202,8 +212,11 @@ pub fn merge_base(args: &[String]) -> Result<ExitCode> {
             if revs.len() < 2 {
                 return Ok(usage());
             }
-            let Some(commits) = resolve_all(&repo, &revs) else {
-                return Ok(not_a_commit(&repo, &revs));
+            // The default mode consumes argv forward
+            // (builtin/merge-base.c:205-206).
+            let commits = match resolve_all(&repo, &revs, false) {
+                Ok(commits) => commits,
+                Err(code) => return Ok(code),
             };
             let bases: Vec<ObjectId> = repo
                 .merge_bases_many(commits[0], &commits[1..])?
@@ -218,27 +231,90 @@ pub fn merge_base(args: &[String]) -> Result<ExitCode> {
     }
 }
 
-/// git's `get_commit_reference`: resolve `spec` and peel it to the commit it
-/// names (so tags and refs work), or `None` if it names no commit.
-fn commit_reference(repo: &Repository, spec: &str) -> Option<ObjectId> {
-    let object = repo.rev_parse_single(spec).ok()?.object().ok()?;
-    object.peel_to_commit().ok().map(|c| c.id)
+/// git's `get_commit_reference()` (builtin/merge-base.c:46-58), which every
+/// operand of every mode is funnelled through:
+///
+/// ```c
+/// if (repo_get_oid(the_repository, arg, &revkey))
+///         die("Not a valid object name %s", arg);
+/// r = lookup_commit_reference(the_repository, &revkey);
+/// if (!r)
+///         die("Not a valid commit name %s", arg);
+/// ```
+///
+/// It dies *twice over*, and which of the two messages is reached is decided by
+/// `repo_get_oid()` alone. A full-length hex id always gets past the first check
+/// even when the object is absent, because `get_oid_basic()` decodes it without
+/// consulting the object database — [`crate::objname::resolve`] is that rule.
+/// `lookup_commit_reference` then fails to peel it (`peel_object_ext` cannot
+/// read a missing object) and the *second* message is the one printed. Resolving
+/// only through `rev_parse_single` collapsed the two and always printed the first.
+///
+/// There is a third outcome the two `die`s hide: `lookup_commit_reference()` is
+/// `lookup_commit_reference_gently(r, oid, 0)`, so `quiet` is 0 and an object
+/// that is *present* but is not a commit gets a diagnostic of its own first
+/// (commit.c:61-67):
+///
+/// ```c
+/// if (type != OBJ_COMMIT) {
+///         if (!quiet)
+///                 error(_("object %s is a %s, not a %s"),
+///                       oid_to_hex(oid), type_name(type), type_name(OBJ_COMMIT));
+/// ```
+///
+/// That line mixes the two halves of the lookup — `oid` is the **operand's** id
+/// while `type` is what the peel *arrived at* — so an annotated tag pointing at a
+/// tree reports the tag's id and the word `tree`, and the `fatal:` under it still
+/// names the spec as typed. [`crate::objname::CommitRef`] models exactly that
+/// split, which is why the wording is taken from it rather than rebuilt here.
+fn get_commit_reference(repo: &Repository, arg: &str) -> Result<ObjectId, ExitCode> {
+    let Some(oid) = crate::objname::resolve(repo, arg) else {
+        return Err(fatal(&format!("Not a valid object name {arg}")));
+    };
+    let found = crate::objname::lookup_commit_reference(repo, oid);
+    if let crate::objname::CommitRef::Commit(id) = found {
+        return Ok(id);
+    }
+    if let Some(note) = found.type_error() {
+        eprintln!("error: {note}");
+    }
+    Err(fatal(&format!("Not a valid commit name {arg}")))
 }
 
-/// Resolve every rev, or `None` if any of them fails to name a commit.
-fn resolve_all(repo: &Repository, revs: &[&str]) -> Option<Vec<ObjectId>> {
-    revs.iter().map(|r| commit_reference(repo, r)).collect()
-}
-
-/// Report the first rev that doesn't name a commit, exactly as git's
-/// `get_commit_reference` dies (exit 128).
-fn not_a_commit(repo: &Repository, revs: &[&str]) -> ExitCode {
-    let bad = revs
-        .iter()
-        .find(|r| commit_reference(repo, r).is_none())
-        .copied()
-        .unwrap_or("");
-    fatal(&format!("Not a valid object name {bad}"))
+/// Resolve every rev through [`get_commit_reference`], stopping at the first one
+/// that fails — in the order the *mode's own loop* visits them.
+///
+/// `--octopus` and `--independent` build their `commit_list` back to front
+/// (builtin/merge-base.c:65-66 and :86-87):
+///
+/// ```c
+/// for (i = count - 1; i >= 0; i--)
+///         commit_list_insert(get_commit_reference(args[i]), &revs);
+/// ```
+///
+/// `commit_list_insert()` prepends, so the assembled list still comes out in
+/// input order and the *result* is unaffected — but the resolution runs last rev
+/// first, and it is therefore the **last** bad rev that gets named, not the
+/// first. Every other mode walks argv forward, so `last_first` is what tells the
+/// two apart; scanning forward for all of them named the wrong rev whenever more
+/// than one was bad.
+fn resolve_all(
+    repo: &Repository,
+    revs: &[&str],
+    last_first: bool,
+) -> Result<Vec<ObjectId>, ExitCode> {
+    let mut ids = Vec::with_capacity(revs.len());
+    if last_first {
+        for rev in revs.iter().rev() {
+            ids.push(get_commit_reference(repo, rev)?);
+        }
+        ids.reverse();
+    } else {
+        for rev in revs {
+            ids.push(get_commit_reference(repo, rev)?);
+        }
+    }
+    Ok(ids)
 }
 
 /// Print a `fatal:` line and return git's die status.
@@ -349,25 +425,97 @@ fn reduce_heads(repo: &Repository, commits: &[ObjectId]) -> Result<Vec<ObjectId>
 /// id of its first entry), or the ref tip when there is no reflog. There must
 /// be exactly one merge base between `commitname` and that set, and it must be
 /// one of the candidates; otherwise git prints nothing and exits 1.
+///
+/// Two things are easy to get backwards here, and both are visible in
+/// `handle_fork_point()` (builtin/merge-base.c:128-147):
+///
+/// ```c
+/// if (repo_get_oid(the_repository, commitname, &oid))
+///         die("Not a valid object name: '%s'", commitname);
+/// derived = lookup_commit_reference(the_repository, &oid);
+/// fork_point = get_fork_point(argv[0], derived);
+/// if (!fork_point)
+///         return 1;
+/// ```
+///
+/// The rev is checked *before* `get_fork_point()` looks the ref up, so a bad rev
+/// outranks a bad ref. And only `repo_get_oid()` is fatal: `lookup_commit_reference`
+/// failing leaves `derived` NULL, which `get_fork_point()` walks from without
+/// finding anything — exit 1, silently. A full-length hex id of an absent object
+/// resolves (it never reaches the object database), so `--fork-point <ref> <absent>`
+/// is that silent exit 1 and not a fatal.
+///
+/// "Silently" only covers the *absent* object. `lookup_commit_reference()` is not
+/// quiet (see [`get_commit_reference`]), so a rev naming a present non-commit
+/// prints `error: object %s is a %s, not a %s` here — and prints it on line 138,
+/// **ahead of** the `No such ref:` that `get_fork_point()` dies with on line 140.
+/// Looking the ref up first would put the two lines in the wrong order.
 fn fork_point(repo: &Repository, refname: &str, commitname: &str) -> Result<ExitCode> {
+    let Some(oid) = crate::objname::resolve(repo, commitname) else {
+        return Ok(fatal(&format!("Not a valid object name: '{commitname}'")));
+    };
+    let found = crate::objname::lookup_commit_reference(repo, oid);
+    if let Some(note) = found.type_error() {
+        eprintln!("error: {note}");
+    }
+    let derived = match found {
+        crate::objname::CommitRef::Commit(id) => Some(id),
+        _ => None,
+    };
+
     let Ok(reference) = repo.find_reference(refname) else {
         return Ok(fatal(&format!("No such ref: '{refname}'")));
     };
-    let Some(derived) = commit_reference(repo, commitname) else {
-        return Ok(fatal(&format!("Not a valid object name: '{commitname}'")));
+    let Some(derived) = derived else {
+        // `derived == NULL`: nothing to take a merge base against.
+        return Ok(ExitCode::from(1));
     };
 
     let mut candidates: Vec<ObjectId> = Vec::new();
+    // `add_one_commit()` (commit.c:1061-1076):
+    //
+    // ```c
+    // if (is_null_oid(oid)) return;
+    // commit = lookup_commit(the_repository, oid);
+    // if (!commit || (commit->object.flags & TMP_MARK) ||
+    //     repo_parse_commit(the_repository, commit))
+    //         return;
+    // ```
+    //
+    // The null id and an id already taken (`TMP_MARK`, which only a commit ever
+    // gets) are dropped in silence — but `repo_parse_commit()` is
+    // `repo_parse_commit_gently(r, item, 0)`, i.e. **not** quiet, so anything it
+    // turns away is reported before the `return` (commit.c:641-650):
+    //
+    // ```c
+    // if (odb_read_object_info_extended(...) < 0)
+    //         return quiet_on_missing ? -1 : error("Could not read %s", ...);
+    // if (type != OBJ_COMMIT)
+    //         return error("Object %s not a commit", ...);
+    // ```
+    //
+    // Both name `oid_to_hex()`, neither is translated, and neither has ever been
+    // fatal: `get_fork_point()` simply ends up with one candidate fewer.
+    //
+    // Known gap. `lookup_commit()` reaches `object_as_type(obj, OBJ_COMMIT, 0)`
+    // instead — `error("object %s is a %s, not a %s")` — when the id is *already
+    // interned* in git's in-memory object table, and only then; an id git has not
+    // seen yet gets a fresh commit node and falls through to the wording above.
+    // Which of the two a non-commit id gets therefore depends on what has been
+    // parsed so far in the process (parsing `derived` interns its own tree and
+    // parents), not on anything in the repository. Reproducing that would mean
+    // modelling git's object table, so the parse-time wording is used for every
+    // non-commit: right for the reachable case — a ref that names a tag object,
+    // which nothing has interned — and wrong only for an id some earlier parse
+    // happened to touch, e.g. a ref pointed straight at the tip commit's tree.
     let push = |id: ObjectId, candidates: &mut Vec<ObjectId>| {
-        // Skip the null id, non-commits, and repeats — as `add_one_commit` does.
         if id.is_null() || candidates.contains(&id) {
             return;
         }
-        if repo
-            .find_header(id)
-            .is_ok_and(|h| h.kind() == gix::object::Kind::Commit)
-        {
-            candidates.push(id);
+        match repo.find_header(id) {
+            Ok(header) if header.kind() == gix::object::Kind::Commit => candidates.push(id),
+            Ok(_) => eprintln!("error: Object {id} not a commit"),
+            Err(_) => eprintln!("error: Could not read {id}"),
         }
     };
 
@@ -384,8 +532,11 @@ fn fork_point(repo: &Repository, refname: &str, commitname: &str) -> Result<Exit
         }
     }
     if candidates.is_empty() {
-        // No reflog: fall back to what the ref points at right now.
-        if let Some(id) = commit_reference(repo, refname) {
+        // No reflog: `add_one_commit(&oid, &revs)` on the id `repo_dwim_ref()`
+        // returned — the ref's own target, *not* peeled, so an annotated tag ref
+        // contributes nothing (`push` drops it for the same reason
+        // `add_one_commit`'s `repo_parse_commit()` does).
+        if let Some(id) = crate::objname::resolve(repo, refname) {
             push(id, &mut candidates);
         }
     }

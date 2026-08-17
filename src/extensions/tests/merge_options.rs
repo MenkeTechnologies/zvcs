@@ -168,3 +168,127 @@ fn no_commit_records_merge_state_without_committing() {
 
     let _ = std::fs::remove_dir_all(repo.parent().unwrap());
 }
+
+// ---------------------------------------------------------------------------
+// `-Xpatience` / `-Xdiff-algorithm=patience`
+// ---------------------------------------------------------------------------
+
+/// A three-way merge whose result depends on which xdiff algorithm computed the
+/// two sides' edits. The sequences were found by searching small line sequences
+/// for a case where stock git 2.55.0's patience diff differs from *both* myers
+/// and histogram, so a merge that quietly substituted either would produce
+/// visibly different bytes rather than passing by luck.
+///
+/// Returns (repo dir, home dir).
+fn patience_repo(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    let root = std::env::temp_dir().join(format!("zvcs-merge-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let root = root.canonicalize().unwrap();
+    let home = root.join("home");
+    let repo = root.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+
+    git(&repo, &["init", "-q", "-b", "main"]);
+    git(&repo, &["config", "user.email", "t@e.x"]);
+    git(&repo, &["config", "user.name", "t"]);
+    std::fs::write(repo.join("f.txt"), "c\nb\nc\nd\nc\na\nc\n").unwrap();
+    git(&repo, &["add", "f.txt"]);
+    git(&repo, &["commit", "-q", "-m", "base"]);
+
+    git(&repo, &["checkout", "-q", "-b", "side"]);
+    std::fs::write(repo.join("f.txt"), "c\nb\nc\nd\nc\na\nc\nz\n").unwrap();
+    git(&repo, &["add", "f.txt"]);
+    git(&repo, &["commit", "-q", "-m", "side"]);
+
+    git(&repo, &["checkout", "-q", "main"]);
+    std::fs::write(repo.join("f.txt"), "b\nc\na\nc\na\nb\nb\nd\n").unwrap();
+    git(&repo, &["add", "f.txt"]);
+    git(&repo, &["commit", "-q", "-m", "main"]);
+
+    (repo, home)
+}
+
+/// What stock git 2.55.0 leaves in `f.txt` for the [`patience_repo`] merge when
+/// the diff really is patience.
+const PATIENCE_MERGE: &str = "b\nc\na\nc\na\nb\nb\nd\n<<<<<<< HEAD\n=======\nc\na\nc\nz\n>>>>>>> side\n";
+
+/// The same merge under merge-ort's default algorithm (histogram): a different
+/// conflict shape entirely, which is what makes the assertion above meaningful.
+const HISTOGRAM_MERGE: &str = "b\nc\na\nc\n<<<<<<< HEAD\na\nb\nb\nd\n=======\nz\n>>>>>>> side\n";
+
+#[test]
+fn merge_honours_patience_rather_than_refusing_it() {
+    for xopt in ["-Xpatience", "-Xdiff-algorithm=patience"] {
+        let (repo, home) = patience_repo(&format!("patience{}", xopt.len()));
+
+        let out = zvcs_merge(&repo, &home, &[xopt, "side"]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        // A conflicted merge exits 1; anything else here means the option was
+        // rejected instead of honoured.
+        assert_eq!(out.status.code(), Some(1), "{xopt}: unexpected exit\n{stderr}");
+        assert!(!stderr.contains("unsupported"), "{xopt} must not be refused:\n{stderr}");
+
+        let merged = std::fs::read_to_string(repo.join("f.txt")).unwrap();
+        assert_eq!(merged, PATIENCE_MERGE, "{xopt} did not produce git's patience merge");
+        assert_ne!(merged, HISTOGRAM_MERGE, "{xopt} silently fell back to histogram");
+
+        let _ = std::fs::remove_dir_all(repo.parent().unwrap());
+    }
+}
+
+#[test]
+fn merge_without_an_x_option_still_uses_histogram() {
+    // The negative half of the pair: merge-ort's `init_basic_merge_options()`
+    // opens with `DIFF_WITH_ALG(opt, HISTOGRAM_DIFF)`, so an un-asked-for merge
+    // of the same fixture must NOT look like the patience one.
+    let (repo, home) = patience_repo("default");
+
+    let out = zvcs_merge(&repo, &home, &["side"]);
+    assert_eq!(out.status.code(), Some(1), "{}", String::from_utf8_lossy(&out.stderr));
+    let merged = std::fs::read_to_string(repo.join("f.txt")).unwrap();
+    assert_eq!(merged, HISTOGRAM_MERGE, "default merge algorithm changed");
+
+    let _ = std::fs::remove_dir_all(repo.parent().unwrap());
+}
+
+#[test]
+fn merge_file_honours_patience() {
+    // `git merge-file` reaches the same text driver directly, one zealous level
+    // higher, and had its own patience refusal.
+    let (repo, _home) = patience_repo("mergefile");
+    let (base, cur, oth) = (repo.join("base"), repo.join("cur"), repo.join("oth"));
+    std::fs::write(&base, "c\nb\nc\nd\nc\na\nc\n").unwrap();
+    std::fs::write(&cur, "b\nc\na\nc\na\nb\nb\nd\n").unwrap();
+    std::fs::write(&oth, "c\nb\nc\nd\nc\na\nc\nz\n").unwrap();
+
+    let run = |algo: &str| {
+        let out = Command::new(BIN)
+            .args(["merge-file", "-p", &format!("--diff-algorithm={algo}"), "--", ])
+            .args([cur.to_str().unwrap(), base.to_str().unwrap(), oth.to_str().unwrap()])
+            .current_dir(&repo)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .output()
+            .unwrap();
+        (out.status.code(), String::from_utf8_lossy(&out.stdout).into_owned(), String::from_utf8_lossy(&out.stderr).into_owned())
+    };
+
+    // Labels default to the operand spellings, which are absolute paths here, so
+    // the assertion is on the merged *body* between the markers.
+    let (code, patience, err) = run("patience");
+    assert_eq!(code, Some(1), "merge-file --diff-algorithm=patience: {err}");
+    assert!(!err.contains("unsupported"), "patience must not be refused:\n{err}");
+    let (_, myers, _) = run("myers");
+
+    let body = |s: &str| {
+        s.lines()
+            .map(|l| if l.starts_with("<<<<<<< ") { "<<<".to_string() } else if l.starts_with(">>>>>>> ") { ">>>".to_string() } else { l.to_string() })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    assert_eq!(body(&patience), "b\nc\na\nc\na\nb\nb\nd\n<<<\n=======\nc\na\nc\nz\n>>>");
+    assert_ne!(body(&patience), body(&myers), "patience silently fell back to myers");
+
+    let _ = std::fs::remove_dir_all(repo.parent().unwrap());
+}

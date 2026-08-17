@@ -356,6 +356,21 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
         );
     }
 
+    // `if (addremove && take_worktree_changes) die(...)` (builtin/add.c): `-A` stages
+    // untracked files and `-u` refuses to, so asking for both is a fatal. `addremove`
+    // is the *explicit* `-A`/`--no-all` setting — bare `-u` turns git's default off
+    // instead of tripping this — which is exactly what `all` records here, last
+    // occurrence winning (`-A --no-all -u` is accepted, `-u --no-all -A` is not).
+    //
+    // Its position is load-bearing: verified against git 2.55.0, this fatal is the
+    // only output of `--chmod=bogus -A -u`, `-A -u --ignore-missing`,
+    // `--pathspec-from-file=/nope -A -u`, `-A -u --pathspec-file-nul` and `-A -u ''`,
+    // so it outranks every check below — while `-n -p -A -u` and `-U 3 -A -u` still
+    // report the interactive-mode fatals above, which outrank it.
+    if all && update_only {
+        return usage_fatal("options '-A' and '-u' cannot be used together".into());
+    }
+
     // `--pathspec-from-file`: read pathspecs from a file (or stdin for `-`).
     if let Some(src) = from_file {
         if !pathspecs.is_empty() {
@@ -399,7 +414,18 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
     let tracked_only = update_only || refresh || renormalize;
     // A real add writes new content blobs. Dry-run, refresh, and intent-to-add
     // never write per-file content objects (git writes none in those modes).
-    let write_content = !dry_run && !refresh && !intent_to_add;
+    //
+    // `--renormalize` is excluded too, because under it `cmd_add()` calls
+    // `renormalize_tracked_files()` *instead of* `add_files_to_cache()` — the walk
+    // below stages nothing in git, and every object comes from the index scan, in
+    // index order, stopping dead at the entry whose worktree file is gone. Writing
+    // them here (walk order, all of them, before the scan can abort) left objects
+    // in the store that git never wrote: `add --renormalize --all` over a
+    // cone-sparse repo with `in/f.txt` deleted deposited `root.txt`'s normalized
+    // blob even though git dies at `in/f.txt` first. The ids are unaffected — the
+    // hash of the converted bytes is the same whether or not it is stored — so the
+    // walk still computes them for the report and the index write.
+    let write_content = !dry_run && !refresh && !intent_to_add && !renormalize;
 
     // --- index snapshot: read-only, drives staging decisions and deletions.
     // The authoritative mutation index is re-read under the lock further below.
@@ -535,16 +561,7 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
     // `path_in_sparse_checkout()`: without `--sparse`, a path the sparse-checkout
     // definition leaves out of the worktree is skipped and reported instead of
     // staged. Loaded only when there is a definition to consult.
-    let sparsity = if !include_sparse
-        && repo
-            .config_snapshot()
-            .boolean("core.sparseCheckout")
-            .unwrap_or(false)
-    {
-        Some(super::sparse_checkout::load_sparsity(&repo)?)
-    } else {
-        None
-    };
+    let sparsity = sparsity_to_consult(&repo, include_sparse)?;
     let outside_sparse = |path: &BString| -> bool {
         sparsity.as_ref().is_some_and(|s| !s.includes(&path.to_str_lossy()))
     };
@@ -845,13 +862,18 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
-    // `--renormalize` re-stages tracked content but refuses to stat a matched
-    // tracked path whose worktree file is gone — git aborts with a fatal there
-    // rather than staging the removal.
+    // `--renormalize` re-stages tracked content off the *index* rather than off the
+    // walk above, and does all of this command's object writing while it is at it.
+    // Shared verbatim with the `stage` verb — see [`renormalize_tracked_files`].
     if renormalize {
-        if let Some(first) = deletions.first() {
-            eprintln!("fatal: unable to stat '{first}': No such file or directory");
-            return Ok(ExitCode::from(128));
+        if let Some(code) = renormalize_tracked_files(
+            &repo,
+            &index,
+            &RenormalizeOpts { include_sparse, dry_run, verbose, intent_to_add },
+            &mut filters,
+            |p| pathspec.is_included(p, Some(false)),
+        )? {
+            return Ok(code);
         }
     }
 
@@ -1057,6 +1079,156 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
         dry_run,
         &sparse_skipped,
     ))
+}
+
+/// The sparse-checkout definition `path_in_sparse_checkout()` (sparse-index.c)
+/// consults, or `None` when there is nothing to consult.
+///
+/// `None` covers both of git's short circuits: `--sparse` (git's `include_sparse`)
+/// skips every such test outright, and a repository without `core.sparseCheckout`
+/// has no definition, which `path_in_sparse_checkout()` answers by returning true
+/// for every path. Note that it does NOT cover `ce_skip_worktree()`, which is a bit
+/// on the index entry and is consulted whether or not a definition exists.
+pub(super) fn sparsity_to_consult(
+    repo: &gix::Repository,
+    include_sparse: bool,
+) -> Result<Option<super::sparse_checkout::Sparsity>> {
+    if include_sparse || !repo.config_snapshot().boolean("core.sparseCheckout").unwrap_or(false) {
+        return Ok(None);
+    }
+    Ok(Some(super::sparse_checkout::load_sparsity(repo)?))
+}
+
+/// git's `!include_sparse && (ce_skip_worktree(ce) || !path_in_sparse_checkout(...))`
+/// — the guard `renormalize_tracked_files()` and `chmod_pathspec()` (builtin/add.c)
+/// each open their cache loop with, character for character the same in both.
+///
+/// The two halves are not interchangeable. `ce_skip_worktree()` reads a bit off the
+/// index entry, which `update-index --skip-worktree` can set with
+/// `core.sparseCheckout` off, so it is consulted even when `sparsity` is `None`;
+/// `path_in_sparse_checkout()` consults the definition, which is what `sparsity`
+/// carries. Testing only the second is what let `stage --renormalize` die on a
+/// `--skip-worktree` entry that git skips.
+pub(super) fn skipped_as_sparse(
+    flags: Flags,
+    path: &BStr,
+    include_sparse: bool,
+    sparsity: Option<&super::sparse_checkout::Sparsity>,
+) -> bool {
+    !include_sparse
+        && (flags.contains(Flags::SKIP_WORKTREE)
+            || sparsity.is_some_and(|s| !s.includes(&path.to_str_lossy())))
+}
+
+/// What [`renormalize_tracked_files`] reads off the command line.
+///
+/// `git stage` is registered in git's command table as `cmd_add` itself
+/// (`git-stage(1)`: "This is a synonym for git-add(1)"), so nothing here is
+/// per-verb: both verbs fill it from the same option table and get the same scan.
+pub(super) struct RenormalizeOpts {
+    /// `--sparse` (git's `include_sparse`).
+    pub include_sparse: bool,
+    /// `-n` (`ADD_CACHE_PRETEND`).
+    pub dry_run: bool,
+    /// `-v` (`ADD_CACHE_VERBOSE`).
+    pub verbose: bool,
+    /// `-N` (`add_to_index()`'s `intent_only` branch).
+    pub intent_to_add: bool,
+}
+
+/// Port of `renormalize_tracked_files()` (builtin/add.c), shared by `add` and
+/// `stage` because stock git dispatches both verbs to the very same `cmd_add()`.
+///
+/// Under `--renormalize`, this scan *replaces* `add_files_to_cache()` — `cmd_add()`
+/// runs one or the other, never both — so it is also where every content object of
+/// such a run is written. It walks the cache in entry order, applies git's four
+/// filters (sparse, unmerged, non-blob, pathspec) and hands each survivor to
+/// `add_file_to_index()`, which `lstat`s the worktree path and `die_errno`s when it
+/// is gone. A matched tracked path whose file was deleted therefore aborts the
+/// command rather than staging the removal — independently of `--ignore-removal`
+/// (that flag only governs `update_callback()`'s removal arm, which `--renormalize`
+/// never reaches) and of `--ignore-errors` (the `die` is inside
+/// `add_file_to_index()`, not a returned error).
+///
+/// The abort happens *mid-walk*, which is observable three ways and is why the
+/// order of the writes below matters:
+///
+/// * the entries ahead of the missing one have already printed their `add '<path>'`
+///   line, so `--renormalize -n --all` over a tree with `README.md` modified and
+///   `src/lib.rs` deleted prints `add 'README.md'` and *then* the fatal. `-n` and
+///   `-v` are what turn those lines on at all; without either the abort prints
+///   nothing to stdout.
+/// * their blobs are already in the object store, and the ones behind it never get
+///   there. `add_to_index()` reaches `index_path()`, which hashes *and writes*
+///   before recording the entry.
+/// * under `-N` the empty blob is there too:
+///   `set_object_name_for_intent_to_add_entry()` runs before `add_to_index()` ever
+///   consults `ADD_CACHE_PRETEND`, so even `--dry-run` deposits it — but only once
+///   at least one entry got through ahead of the missing path.
+///
+/// `ADD_CACHE_RENORMALIZE` skips `add_to_index()`'s `alias` lookup, so `was_same` is
+/// never true and an unchanged blob is handled (and reported) too. `selected` is the
+/// caller's `ce_path_match()`: the two verbs normalize their pathspecs differently
+/// and so carry different matchers, but ask them the same question.
+///
+/// Returns `Some(exit code)` when the scan aborted, `None` when it ran to the end.
+pub(super) fn renormalize_tracked_files(
+    repo: &gix::Repository,
+    index: &gix::index::File,
+    opts: &RenormalizeOpts,
+    filters: &mut super::convert_to_git::WorktreeFilter,
+    mut selected: impl FnMut(&BStr) -> bool,
+) -> Result<Option<ExitCode>> {
+    let sparsity = sparsity_to_consult(repo, opts.include_sparse)?;
+    // The paths already handed to `add_file_to_index()`, in index order.
+    let mut handled: Vec<BString> = Vec::new();
+    let backing = index.path_backing();
+    for e in index.entries() {
+        let path = e.path_in(backing);
+        // A path the sparse-checkout definition keeps out of the worktree is absent
+        // by design, so the scan skips it instead of dying on the failed `lstat`.
+        if skipped_as_sparse(e.flags, path, opts.include_sparse, sparsity.as_ref()) {
+            continue;
+        }
+        if e.stage() != Stage::Unconflicted {
+            continue; // "do not touch unmerged paths"
+        }
+        if !matches!(e.mode, Mode::FILE | Mode::FILE_EXECUTABLE | Mode::SYMLINK) {
+            continue; // "do not touch non blobs"
+        }
+        if !selected(path) {
+            continue;
+        }
+        let abs = repo.workdir_path(path);
+        let Some(abs) = abs.filter(|p| std::fs::symlink_metadata(p).is_ok()) else {
+            if opts.dry_run || opts.verbose {
+                for done in &handled {
+                    println!("add '{done}'");
+                }
+            }
+            if opts.intent_to_add && !handled.is_empty() {
+                repo.write_blob(b"")?;
+            }
+            eprintln!("fatal: unable to stat '{path}': No such file or directory");
+            return Ok(Some(ExitCode::from(128)));
+        };
+        handled.push(path.to_owned());
+        // `hash_flags` starts as `pretend ? 0 : INDEX_WRITE_OBJECT`, so `--dry-run`
+        // hashes without writing; `-N` never hashes at all, because `add_to_index()`
+        // takes the `intent_only` branch and the empty blob above is the only object
+        // it deposits. An unreadable file is left to the caller, which reports it
+        // through git's `error: open(...)` / `unable to index file` pair.
+        if !opts.dry_run && !opts.intent_to_add {
+            if let Ok(md) = gix::index::fs::Metadata::from_path_no_follow(&abs) {
+                if let Ok((content, _)) =
+                    super::stage::read_converted_bytes(repo, filters, path, &abs, &md)
+                {
+                    repo.write_blob(&content)?;
+                }
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// Every stage-0 gitlink the pathspec selects whose submodule worktree sits at a

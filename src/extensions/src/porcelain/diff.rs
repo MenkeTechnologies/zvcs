@@ -481,6 +481,10 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     let mut fmt: u32 = 0;
     let mut trailing_paths: Vec<String> = Vec::new();
     let mut after_dashdash = false;
+    // `setup_revisions()`'s `seen_dashdash`, established by a scan of the whole
+    // argument vector before anything is resolved — so it is already in force
+    // for the arguments standing in front of the separator.
+    let seen_dashdash = args.iter().any(|a| a == "--");
 
     // Formatting / behavior options resolved below.
     let mut reverse = false;
@@ -1077,28 +1081,72 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                 // resolvable revision nor an existing path, git dies with the
                 // "ambiguous argument" fatal (128) at exactly this point — before
                 // any later option-value or operand-count check can fire.
+                // `handle_revision_arg_1()` refuses a bare `..` ahead of
+                // `handle_dotdot()`, so it is the pathspec for the parent
+                // directory rather than `HEAD..HEAD` — and the pathspec layer
+                // then rejects it for leaving the repository. See
+                // [`crate::objname::is_parent_directory_pathspec`].
+                if in_rev_region && crate::objname::is_parent_directory_pathspec(s, seen_dashdash) {
+                    in_rev_region = false;
+                }
                 if in_rev_region {
-                    if s.contains("...") && looks_like_range(s) {
-                        // `A...B` diffs the merge-base of A and B against B, exactly
-                        // like `git diff $(git merge-base A B) B`. Empty sides default
-                        // to `HEAD`, mirroring `setup_revisions()`.
-                        let (l, r) = s.split_once("...").expect("checked contains");
-                        let left = if l.is_empty() { "HEAD" } else { l };
-                        let right = if r.is_empty() { "HEAD" } else { r };
-                        let lid = repo.rev_parse_single(left)?.object()?.peel_to_commit()?.id;
-                        let rid = repo.rev_parse_single(right)?.object()?.peel_to_commit()?.id;
-                        let base = repo.merge_base(lid, rid)?.detach();
-                        revs.push(base.to_hex().to_string());
-                        revs.push(right.to_string());
+                    // `handle_dotdot_1()` in full, shared with every other command
+                    // that takes a range: see [`crate::objname::dotdot`]. Both of
+                    // the endings it dies on — an endpoint whose object is absent,
+                    // and an `A...B` endpoint that is not a commit — are
+                    // `dotdot_missing()`, and `dotdot_fatal` renders either with
+                    // whatever `lookup_commit_reference()` printed ahead of it.
+                    // `handle_dotdot_1()` resolves *both* endpoints through
+                    // `repo_get_oid_with_context()` before either is looked up, so
+                    // a range reaches `get_oid_basic()` once per endpoint and warns
+                    // twice. A non-range token warns once, at the `resolve` below.
+                    if let Some(range) = crate::objname::split_range(s) {
+                        crate::objname::warn_ambiguous_refname(&repo, range.a);
+                        crate::objname::warn_ambiguous_refname(&repo, range.b);
+                    }
+                    if let Some(fatal) = crate::objname::dotdot_fatal(&repo, s) {
+                        eprint!("{fatal}");
+                        return Ok(ExitCode::from(128));
+                    }
+                    if let crate::objname::Dotdot::Ok { a, b } =
+                        crate::objname::dotdot(&repo, s)
+                    {
+                        let range = crate::objname::split_range(s)
+                            .expect("dotdot() answers Ok only for a token that split");
+                        if range.symmetric {
+                            // `A...B` diffs the merge-base of A and B against B,
+                            // exactly like `git diff $(git merge-base A B) B`.
+                            // `a` and `b` are already what
+                            // `lookup_commit_reference()` peeled the endpoints to.
+                            let base = repo.merge_base(a, b)?.detach();
+                            revs.push(base.to_hex().to_string());
+                        } else {
+                            revs.push(range.a.to_owned());
+                        }
+                        revs.push(range.b.to_owned());
                         continue;
                     }
-                    if s.contains("..") && looks_like_range(s) {
-                        let (l, r) = s.split_once("..").expect("checked contains");
-                        revs.push(if l.is_empty() { "HEAD".into() } else { l.into() });
-                        revs.push(if r.is_empty() { "HEAD".into() } else { r.into() });
-                        continue;
-                    }
-                    if repo.rev_parse_single(s).is_ok() {
+                    // `handle_revision_arg_1()` resolves the whole token with
+                    // `get_oid_with_context()` — see [`crate::objname`], which is why
+                    // a full-length hex gets this far even when the object is absent.
+                    if let Some(id) = crate::objname::resolve(&repo, s) {
+                        // `verify_non_filename()`: a name that is simultaneously a
+                        // revision and a working-tree path is refused outright rather
+                        // than guessed at.
+                        if std::fs::symlink_metadata(s).is_ok() {
+                            eprintln!(
+                                "fatal: ambiguous argument '{s}': both revision and filename"
+                            );
+                            eprintln!("Use '--' to separate paths from revisions, like this:");
+                            eprintln!("'git <command> [<revision>...] -- [<file>...]'");
+                            return Ok(ExitCode::from(128));
+                        }
+                        // `get_reference()`'s `die("bad object %s", name)`: the name
+                        // resolved, the object is simply not there.
+                        if repo.find_object(id).is_err() {
+                            eprintln!("fatal: bad object {s}");
+                            return Ok(ExitCode::from(128));
+                        }
                         revs.push(s.to_string());
                         continue;
                     }
@@ -1131,6 +1179,14 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
         return Ok(invalid_option(arg, !revs.is_empty() || cached));
     }
     paths.extend(trailing_paths);
+    // `parse_pathspec()` runs inside `setup_revisions()`, so a rejected element
+    // is fatal here — before the tree/index/worktree dispatch below, which for a
+    // plain `git diff` builds no `PathspecMatcher` at all and would otherwise
+    // meet the failure inside gitoxide's status iterator.
+    if let Some(msg) = crate::pathspec::parse_pathspec_fatal(&repo, &paths) {
+        eprintln!("fatal: {msg}");
+        return Ok(ExitCode::from(128));
+    }
 
     // Apply the `diff.algorithm` default only when no `--minimal`/`--histogram`/
     // `--patience`/`--diff-algorithm=` flag set the algorithm on the command line
@@ -1156,7 +1212,10 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     if fmt & (F_NAME | F_NAME_STATUS) != 0 {
         fmt &= !F_SUMMARY;
     }
-    if fmt == 0 {
+    // `cmd_diff()` (builtin/diff.c): the patch default only fills an output format
+    // that is still *empty*, and `--check` has already put `DIFF_FORMAT_CHECKDIFF`
+    // there — which is why `git diff --check` prints checkdiff lines and no patch.
+    if fmt == 0 && !check {
         fmt = F_PATCH;
     }
 
@@ -1168,9 +1227,36 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     }
 
     // Three or more revisions request a dense combined ("--cc") diff of the first
-    // revision against the rest, exactly like `builtin_diff_combined()`.
-    if !cached && revs.len() >= 3 {
-        return combined_multi(&repo, &revs, &paths, fmt, ctx, &line_prefix);
+    // revision against the rest, exactly like `builtin_diff_combined()`
+    // (builtin/diff.c:211) handing them to `diff_tree_combined()`
+    // (combine-diff.c:1491).
+    //
+    // `diff_tree_combined()` serves the requested formats from two different
+    // sources. The stat family is "computed solely against the first parent"
+    // (combine-diff.c:1370-1377, 1571-1584): an ordinary two-tree diff of parent 0
+    // against the result, flushed through a *copy* of the diff options before
+    // anything combined is printed. Raw/name/name-status and the patch come from
+    // the combined path set instead. So the revisions are rewritten here to that
+    // first-parent pair and the format mask is narrowed to the stat family, letting
+    // the ordinary machinery below render the stat half; the combined half is
+    // appended once it has.
+    let combined = !cached && revs.len() >= 3;
+    // `show_combined_header()` reads `opt->a_prefix`/`opt->b_prefix` as they were
+    // configured, so the pair is captured before `-R` swaps them for the ordinary
+    // pair machinery below.
+    let mut combined_req = CombinedRequest {
+        result: String::new(),
+        parents: Vec::new(),
+        fmt,
+        reverse,
+        a_prefix: src_prefix.clone(),
+        b_prefix: dst_prefix.clone(),
+    };
+    if combined {
+        combined_req.result = revs[0].clone();
+        combined_req.parents = revs[1..].to_vec();
+        revs = vec![combined_req.parents[0].clone(), combined_req.result.clone()];
+        fmt &= F_NUMSTAT | F_DIFFSTAT | F_SHORTSTAT | F_SUMMARY | F_DIRSTAT;
     }
 
     // ---- collect the normalized change list -------------------------------
@@ -1510,6 +1596,14 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     // through `diff_flush_checkdiff()`, which prints one line per added line
     // that breaks a whitespace rule and nothing else. Its exit status is 2, the
     // one `git diff --check` gives a caller that greps for problems.
+    //
+    // `diff_setup_done()` lets `DIFF_FORMAT_CHECKDIFF` clear every other output
+    // format (diff.c), and `diff_tree_combined()` in turn never looks at
+    // `DIFF_FORMAT_CHECKDIFF` — so a combined diff asked for `--check` prints
+    // nothing at all, whatever else was asked for alongside it, and exits 0.
+    if check && combined {
+        return Ok(ExitCode::SUCCESS);
+    }
     if check {
         let mut found = false;
         for (delta, analysis) in deltas.iter().zip(analyses.iter()) {
@@ -1728,18 +1822,39 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
 
     // `diff.suppressBlankEmpty`: `fn_out_consume()` rewrites any emitted line that
     // is exactly `" \n"` (an empty context line) to `"\n"` before it is prefixed.
+    // Only the ordinary patch path is fed through that chain — `dump_sline()`
+    // prints the combined patch straight out — so the rewrite runs before the
+    // combined half is appended, not after.
     let out = apply_suppress_blank_empty(out, suppress_blank_empty);
 
     // `--line-prefix`: `diff_line_prefix()` prepends the string to every emitted
-    // line, so a whole-buffer pass over the newline-terminated output reproduces it.
-    let out = apply_line_prefix(out, &line_prefix);
+    // line, so a whole-buffer pass over the newline-terminated output reproduces it
+    // for the ordinary half. The combined half prefixes itself instead, because
+    // `show_combined_header()` leaves the prefix off two of the lines it prints.
+    let mut out = apply_line_prefix(out, &line_prefix);
+
+    // The combined half of `diff_tree_combined()` (combine-diff.c:1611-1631): the
+    // raw/name formats and the patch are served from the path set the result shares
+    // with every parent, after the first-parent stat formats above.
+    //
+    // `--quiet` is `diff_setup_done()`'s `flags.quick`, which replaces the whole
+    // output format with `DIFF_FORMAT_NO_OUTPUT` (diff.c) — the combined half has
+    // nothing to print either.
+    if combined && !quiet {
+        emit_combined(&mut out, &repo, &combined_req, &paths, ctx, &r, &mut separator, &line_prefix)?;
+    }
 
     let mut stdout = std::io::stdout().lock();
     stdout.write_all(&out)?;
     stdout.flush()?;
     // `diff_result_code()` calls `diff_warn_rename_limit()` after stdout is flushed,
     // so the `-l` / `diff.renameLimit` warnings land after the diff itself.
-    rename_warnings.emit("diff.renameLimit");
+    // A combined diff runs every diffcore pass on `diff_tree_combined()`'s *copy* of
+    // the options (combine-diff.c:1524), so the limit it needed never reaches the
+    // caller's and no warning is printed.
+    if !combined {
+        rename_warnings.emit("diff.renameLimit");
+    }
     // `--exit-code`/`--quiet`: exit 1 when any difference was reported.
     //
     // `diff_change()` sets `has_changes` as each pair is queued, so normally a
@@ -1747,7 +1862,11 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     // `diff_from_contents` (diff.c:4899) and that queue-time shortcut is skipped:
     // `diff_flush()` re-derives `has_changes` from `found_changes` instead
     // (diff.c:6861), which only the formats that emitted something ever set.
-    if want_exit_code {
+    //
+    // Neither happens for a combined diff: every pair it queues is queued on the
+    // copy of the options (combine-diff.c:1524), so the caller's `has_changes` stays
+    // clear and `git diff --exit-code <a> <b> <c>` exits 0 however much it printed.
+    if want_exit_code && !combined {
         let changed = if from_contents { found_changes } else { !deltas.is_empty() };
         if changed {
             return Ok(ExitCode::from(1));
@@ -2537,12 +2656,6 @@ fn tree_id_for(repo: &gix::Repository, spec: Option<&String>) -> Result<ObjectId
         Some(s) => repo.rev_parse_single(s.as_str())?.object()?.peel_to_tree()?.id,
         None => repo.head_tree_id_or_empty()?.detach(),
     })
-}
-
-/// `true` if a token looks like a revision range rather than a filename that merely
-/// contains `..` (e.g. `../foo`). Ranges don't contain `/` and don't start with `.`.
-fn looks_like_range(tok: &str) -> bool {
-    !tok.starts_with('.') && !tok.contains('/')
 }
 
 /// Every option name stock `git diff` resolves — the union of what `setup_revisions()`
@@ -5277,56 +5390,283 @@ fn change_blob_location(change: &gix::object::tree::diff::ChangeDetached) -> Opt
     }
 }
 
-/// The blob at `path` in `tree`: its id, whether it exists, and its bytes (the id
-/// is the null oid and the bytes are empty when the path is absent from the tree).
+/// The blob at `path` in `tree`: its entry mode, its id and its bytes. A path the
+/// tree does not hold as a blob reads as `None` / the null oid / no content, which
+/// is exactly what `diff_tree_paths()` records for an absent side (tree-diff.c:247).
 fn tree_blob(
     repo: &gix::Repository,
     tree: &gix::Tree<'_>,
     path: &BString,
-) -> Result<(ObjectId, bool, Vec<u8>)> {
+) -> Result<(Option<EntryKind>, ObjectId, Vec<u8>)> {
     match tree_entry(tree, path)? {
         Some((_, EntryKind::Commit)) => {
             bail!("submodule/gitlink change at {path:?} is not supported")
         }
         // A directory at this path contributes no blob content of its own.
-        Some((_, EntryKind::Tree)) => Ok((repo.object_hash().null(), false, Vec::new())),
-        Some((id, _)) => Ok((id, true, blob_bytes(repo, id)?)),
-        None => Ok((repo.object_hash().null(), false, Vec::new())),
+        Some((_, EntryKind::Tree)) => Ok((None, repo.object_hash().null(), Vec::new())),
+        Some((id, kind)) => Ok((Some(kind), id, blob_bytes(repo, id)?)),
+        None => Ok((None, repo.object_hash().null(), Vec::new())),
     }
 }
 
-/// `git diff <rev0> <rev1> [<rev2> ...]` with three or more revisions: a dense
-/// combined ("--cc") diff of the first revision (the result) against every other
-/// revision (its parents), mirroring `builtin_diff_combined()`. A path is shown
-/// only when the result differs from every parent, exactly as dense combined-diff
-/// filtering requires — so equal revisions produce no output at all.
-fn combined_multi(
+/// One entry of a combined diff's path set: the result side plus, for each parent,
+/// the side that parent contributes. Mirrors `struct combine_diff_path`
+/// (combine-diff.h) as `diff_tree_paths()` fills it in.
+struct CombinedPath {
+    path: BString,
+    /// `None` when the result tree does not hold the path, which git records as
+    /// mode `000000` and the null object id.
+    kind: Option<EntryKind>,
+    id: ObjectId,
+    bytes: Vec<u8>,
+    parents: Vec<CombinedSide>,
+}
+
+/// One parent's side of a [`CombinedPath`].
+struct CombinedSide {
+    kind: Option<EntryKind>,
+    id: ObjectId,
+    bytes: Vec<u8>,
+    /// `p->parent[i].status` (tree-diff.c:237): `D` when the result dropped the
+    /// path, `M` when this parent held it too, `A` when only the result holds it.
+    status: u8,
+}
+
+/// The paths a combined diff covers: every path whose result-side entry differs
+/// from *every* parent's, which is the intersection
+/// `D(A,P1) ^ ... ^ D(A,Pn)` that `intersect_paths()` (combine-diff.c:31) folds and
+/// `find_paths_multitree()` (combine-diff.c:1430) walks the trees for. A path that
+/// matches even one parent is a one-sided change and never appears.
+fn combined_path_set(
     repo: &gix::Repository,
-    revs: &[String],
+    result_tree: &gix::Tree<'_>,
+    parent_trees: &[gix::Tree<'_>],
     paths: &[String],
+) -> Result<Vec<CombinedPath>> {
+    let mut cand: BTreeSet<BString> = BTreeSet::new();
+    for pt in parent_trees {
+        let changes = repo.diff_tree_to_tree(
+            Some(pt),
+            Some(result_tree),
+            Some(gix::diff::Options::default()),
+        )?;
+        for change in changes {
+            if let Some(loc) = change_blob_location(&change) {
+                cand.insert(loc);
+            }
+        }
+    }
+    if !paths.is_empty() {
+        let specs = super::log::PathspecMatcher::new(repo, paths)?;
+        cand.retain(|p| specs.matches(p));
+    }
+
+    let mut out = Vec::with_capacity(cand.len());
+    for path in cand {
+        let (kind, id, bytes) = tree_blob(repo, result_tree, &path)?;
+        let mut parents = Vec::with_capacity(parent_trees.len());
+        let mut shared_with_a_parent = false;
+        for pt in parent_trees {
+            let (p_kind, p_id, p_bytes) = tree_blob(repo, pt, &path)?;
+            if (p_kind, p_id) == (kind, id) {
+                shared_with_a_parent = true;
+            }
+            parents.push(CombinedSide {
+                status: match (p_kind.is_some(), kind.is_some()) {
+                    (_, false) => b'D',
+                    (true, true) => b'M',
+                    (false, true) => b'A',
+                },
+                kind: p_kind,
+                id: p_id,
+                bytes: p_bytes,
+            });
+        }
+        if shared_with_a_parent {
+            continue;
+        }
+        out.push(CombinedPath { path, kind, id, bytes, parents });
+    }
+    Ok(out)
+}
+
+/// `show_raw_diff()` (combine-diff.c:1228): the `--raw` / `--name-only` /
+/// `--name-status` record for one combined path — one colon and one mode per
+/// parent, then the result's mode, then one object name per parent and the
+/// result's, then one status letter per parent.
+///
+/// `line_prefix` is printed only on the `--raw` branch (combine-diff.c:1244), so
+/// `--line-prefix` with a bare `--name-only`/`--name-status` leaves these records
+/// unprefixed.
+fn render_combined_raw(
+    out: &mut Vec<u8>,
+    cp: &CombinedPath,
     fmt: u32,
-    ctx: u32,
+    r: &Render,
     line_prefix: &[u8],
-) -> Result<ExitCode> {
-    // `-s` / `--no-patch` suppresses all output; the combined patch is the only
-    // combined format zvcs renders, so every other format falls back to it.
-    if fmt & F_NO_OUTPUT != 0 {
-        return Ok(ExitCode::SUCCESS);
+) {
+    if fmt & F_RAW != 0 {
+        out.extend_from_slice(line_prefix);
+        for _ in &cp.parents {
+            out.push(b':');
+        }
+        for p in &cp.parents {
+            push_str(out, &mode_octal(p.kind));
+            out.push(b' ');
+        }
+        push_str(out, &mode_octal(cp.kind));
+        for p in &cp.parents {
+            out.push(b' ');
+            push_str(out, &p.id.to_hex_with_len(r.raw_abbrev).to_string());
+        }
+        out.push(b' ');
+        push_str(out, &cp.id.to_hex_with_len(r.raw_abbrev).to_string());
+        out.push(b' ');
+    }
+    if fmt & (F_RAW | F_NAME_STATUS) != 0 {
+        for p in &cp.parents {
+            out.push(p.status);
+        }
+        // `-z` drops the inter-name terminator along with the record terminator.
+        out.push(if r.z { 0 } else { b'\t' });
+    }
+    out.extend_from_slice(&name_field(&cp.path, r.z));
+    out.push(if r.z { 0 } else { b'\n' });
+}
+
+/// `dump_quoted_path()` (combine-diff.c:905): the line prefix, then the head, then
+/// the name written plain. `emit_diff_symbol()`'s `FILEPAIR_MINUS`/`FILEPAIR_PLUS`
+/// (diff.c) appends a tab when the name holds a space; this path never does.
+fn dump_quoted_path(out: &mut Vec<u8>, line_prefix: &[u8], head: &[u8], name: &[u8]) {
+    out.extend_from_slice(line_prefix);
+    out.extend_from_slice(head);
+    out.extend_from_slice(name);
+    out.push(b'\n');
+}
+
+/// What `builtin_diff_combined()` (builtin/diff.c:211) hands `diff_tree_combined()`
+/// that the ordinary pair machinery does not carry: which revision is the result,
+/// which are its parents, and the two settings `show_combined_header()` reads
+/// straight off the options rather than off a pair.
+struct CombinedRequest {
+    /// `ent[first_non_parent]`: the first revision on the command line.
+    result: String,
+    /// Every other revision, in command-line order.
+    parents: Vec<String>,
+    /// The output formats as they stood before the stat half narrowed them.
+    fmt: u32,
+    /// `-R`: `git diff` always takes `find_paths_generic()` (combine-diff.c:1378),
+    /// because `cmd_diff()` sets `skip_stat_unmatch` (builtin/diff.c:525) — so the
+    /// path set is folded out of the diff *queue*, whose pairs `diff_change()`
+    /// (diff.c) has already swapped.
+    reverse: bool,
+    /// `opt->a_prefix ? : "a/"` (combine-diff.c:931), as configured: the combined
+    /// header reads it directly, so `-R` does not swap it the way it swaps the
+    /// ordinary `diff --git` pair's.
+    a_prefix: Vec<u8>,
+    /// `opt->b_prefix ? : "b/"` (combine-diff.c:932).
+    b_prefix: Vec<u8>,
+}
+
+/// `-R` on a combined diff, as `intersect_paths()` (combine-diff.c:52) records it
+/// off reversed pairs: it takes the result side from `pair->two` and parent `i`'s
+/// from `pair->one`, and `diff_change()` has swapped those. So every parent ends
+/// up holding what the result held, and the result holds what parent 0 held —
+/// which is why `git diff -R <a> <b> <c>` shows one tree against the first
+/// revision repeated, and drops the later parents' content entirely.
+fn reverse_combined(set: &mut [CombinedPath]) {
+    for cp in set {
+        let (kind, id, bytes) = (cp.kind, cp.id, std::mem::take(&mut cp.bytes));
+        cp.kind = cp.parents[0].kind;
+        cp.id = cp.parents[0].id;
+        cp.bytes = cp.parents[0].bytes.clone();
+        for p in &mut cp.parents {
+            // `diff_resolve_rename_copy()` (diffcore-rename.c) names a pair from
+            // its sides in order: the old result is the pre-image now, so its
+            // absence reads as `A` and the parent's as `D`.
+            p.status = if kind.is_none() {
+                b'A'
+            } else if p.kind.is_none() {
+                b'D'
+            } else {
+                b'M'
+            };
+            p.kind = kind;
+            p.id = id;
+            p.bytes = bytes.clone();
+        }
+    }
+}
+
+/// The combined half of `diff_tree_combined()` (combine-diff.c:1606-1626) for
+/// `git diff <result> <parent>...`: the raw/name formats, then — separated by a
+/// blank line from whatever came before it — the combined patch.
+///
+/// `separator` carries `needsep` in and out: the stat formats the caller already
+/// rendered set it, the raw formats set it here, and the patch consumes it.
+#[allow(clippy::too_many_arguments)]
+fn emit_combined(
+    out: &mut Vec<u8>,
+    repo: &gix::Repository,
+    req: &CombinedRequest,
+    paths: &[String],
+    ctx: u32,
+    r: &Render,
+    separator: &mut bool,
+    line_prefix: &[u8],
+) -> Result<()> {
+    // `-s` / `--no-patch` clears every other format, leaving nothing to serve.
+    if req.fmt & F_NO_OUTPUT != 0 {
+        return Ok(());
     }
 
-    let result_tree = repo.rev_parse_single(revs[0].as_str())?.object()?.peel_to_tree()?;
-    let mut parent_trees: Vec<gix::Tree<'_>> = Vec::with_capacity(revs.len() - 1);
-    for r in &revs[1..] {
-        parent_trees.push(repo.rev_parse_single(r.as_str())?.object()?.peel_to_tree()?);
+    let result_tree = repo.rev_parse_single(req.result.as_str())?.object()?.peel_to_tree()?;
+    let mut parent_trees: Vec<gix::Tree<'_>> = Vec::with_capacity(req.parents.len());
+    for p in &req.parents {
+        parent_trees.push(repo.rev_parse_single(p.as_str())?.object()?.peel_to_tree()?);
+    }
+    let mut set = combined_path_set(repo, &result_tree, &parent_trees, paths)?;
+    // `if (num_paths)`: an empty intersection prints neither a separator nor a patch,
+    // however much the first-parent stat formats already wrote.
+    if set.is_empty() {
+        return Ok(());
+    }
+    // Reversing pairs does not change *which* paths differ, only which side of each
+    // one is the pre-image, so the intersection above is built first either way.
+    if req.reverse {
+        reverse_combined(&mut set);
     }
 
-    let out = combined_trees_patch(repo, &result_tree, &parent_trees, paths, ctx)?;
-    let out = apply_line_prefix(out, line_prefix);
+    if req.fmt & (F_RAW | F_NAME | F_NAME_STATUS) != 0 {
+        for cp in &set {
+            render_combined_raw(out, cp, req.fmt, r, line_prefix);
+        }
+        *separator = true;
+    }
 
-    let mut stdout = std::io::stdout().lock();
-    stdout.write_all(&out)?;
-    stdout.flush()?;
-    Ok(ExitCode::SUCCESS)
+    if req.fmt & F_PATCH != 0 {
+        if *separator {
+            // `printf("%s%c", diff_line_prefix(opt), opt->line_termination)`
+            // (combine-diff.c:1621): under `-z` that terminator is a NUL.
+            out.extend_from_slice(line_prefix);
+            out.push(if r.z { 0 } else { b'\n' });
+        }
+        let abbrev = if r.full_index {
+            r.hash_kind.len_in_hex()
+        } else {
+            crate::abbrev::configured_abbrev(repo, r.hash_kind.len_in_hex())
+        };
+        out.extend_from_slice(&combined_patch(
+            &set,
+            ctx,
+            true,
+            abbrev,
+            &req.a_prefix,
+            &req.b_prefix,
+            line_prefix,
+        )?);
+    }
+    Ok(())
 }
 
 /// The paths a merge's *combined* pair list holds, with one status letter per
@@ -5347,44 +5687,13 @@ pub(crate) fn merge_combined_names(
         parent_trees.push(repo.find_commit(*p)?.tree()?);
     }
 
-    let mut cand: BTreeSet<BString> = BTreeSet::new();
-    for pt in &parent_trees {
-        for change in repo.diff_tree_to_tree(
-            Some(pt),
-            Some(&result_tree),
-            Some(gix::diff::Options::default()),
-        )? {
-            cand.insert(change.location().to_owned());
-        }
-    }
-    if !paths.is_empty() {
-        let specs = super::log::PathspecMatcher::new(repo, paths)?;
-        cand.retain(|p| specs.matches(p));
-    }
-
-    let mut out = Vec::new();
-    for path in &cand {
-        let (_, res_present, res_bytes) = tree_blob(repo, &result_tree, path)?;
-        let mut letters = String::with_capacity(parent_trees.len());
-        let mut same_as_a_parent = false;
-        for pt in &parent_trees {
-            let (_, p_present, p_bytes) = tree_blob(repo, pt, path)?;
-            if p_bytes == res_bytes && p_present == res_present {
-                same_as_a_parent = true;
-            }
-            letters.push(match (p_present, res_present) {
-                (false, true) => 'A',
-                (true, false) => 'D',
-                _ => 'M',
-            });
-        }
-        // Dense filtering: a path that matches any parent is one-sided and elided.
-        if same_as_a_parent {
-            continue;
-        }
-        out.push((path.clone(), letters));
-    }
-    Ok(out)
+    Ok(combined_path_set(repo, &result_tree, &parent_trees, paths)?
+        .into_iter()
+        .map(|cp| {
+            let letters = cp.parents.iter().map(|p| char::from(p.status)).collect();
+            (cp.path, letters)
+        })
+        .collect())
 }
 
 /// One merge commit's combined patch, as `git log -c`/`--cc` shows it: the commit's
@@ -5430,69 +5739,119 @@ pub(crate) fn combined_trees_patch_headed(
     ctx: u32,
     dense: bool,
 ) -> Result<Vec<u8>> {
-    // Candidate paths: everything that differs between the result and any parent.
-    let mut cand: BTreeSet<BString> = BTreeSet::new();
-    for pt in parent_trees {
-        let changes = repo.diff_tree_to_tree(
-            Some(pt),
-            Some(result_tree),
-            Some(gix::diff::Options::default()),
-        )?;
-        for change in changes {
-            if let Some(loc) = change_blob_location(&change) {
-                cand.insert(loc);
-            }
-        }
-    }
-    if !paths.is_empty() {
-        let specs = super::log::PathspecMatcher::new(repo, paths)?;
-        cand.retain(|p| specs.matches(p));
-    }
+    let set = combined_path_set(repo, result_tree, parent_trees, paths)?;
+    let abbrev = crate::abbrev::configured_abbrev(repo, repo.object_hash().len_in_hex());
+    combined_patch(&set, ctx, dense, abbrev, b"a/", b"b/", b"")
+}
 
-    let null = repo.object_hash().null();
+/// `show_patch_diff()` (combine-diff.c:1015) over an already-built path set: one
+/// `show_combined_header()` plus `dump_sline()` per path that has hunks to show or
+/// a mode that differs from a parent's.
+///
+/// `abbrev` is `show_combined_header()`'s own
+/// `opt->flags.full_index ? the_hash_algo->hexsz : DEFAULT_ABBREV`
+/// (combine-diff.c:933) — the `index` line here answers to `--full-index` but not
+/// to `--abbrev`, which only reaches the raw format.
+///
+/// `a_prefix`/`b_prefix` are `opt->a_prefix ? : "a/"` and `opt->b_prefix ? : "b/"`
+/// (combine-diff.c:931-932), which `--no-prefix` and `--src-prefix`/`--dst-prefix`
+/// replace.
+///
+/// `line_prefix` goes on every line except the `mode <old>..<new>` one:
+/// `show_combined_header()` prints that continuation with a bare `printf("mode ")`
+/// (combine-diff.c:971), so `--line-prefix` misses it. Callers that prefix their
+/// whole output afterwards pass an empty prefix here.
+#[allow(clippy::too_many_arguments)]
+fn combined_patch(
+    set: &[CombinedPath],
+    ctx: u32,
+    dense: bool,
+    abbrev: usize,
+    a_prefix: &[u8],
+    b_prefix: &[u8],
+    line_prefix: &[u8],
+) -> Result<Vec<u8>> {
     let mut out: Vec<u8> = Vec::new();
-    for path in &cand {
-        let (res_id, res_present, res_bytes) = tree_blob(repo, result_tree, path)?;
-        let mut parent_ids: Vec<ObjectId> = Vec::with_capacity(parent_trees.len());
-        let mut parent_bytes: Vec<Vec<u8>> = Vec::with_capacity(parent_trees.len());
-        for pt in parent_trees {
-            let (pid, _present, pbytes) = tree_blob(repo, pt, path)?;
-            parent_ids.push(pid);
-            parent_bytes.push(pbytes);
-        }
-
-        // Dense combined diff shows a path only when the result differs from all
-        // parents; matching any parent makes the change one-sided and elided.
-        if parent_bytes.contains(&res_bytes) {
-            continue;
-        }
-        if parent_bytes.len() != NUM_PARENT {
+    for cp in set {
+        if cp.parents.len() != NUM_PARENT {
             bail!("combined diff of more than two parents is not supported");
         }
-
-        let (sline, cnt) = build_combined_sline(&res_bytes, &parent_bytes, ctx);
-        if !sline_has_marks(&sline, cnt) {
+        let parent_bytes: Vec<Vec<u8>> = cp.parents.iter().map(|p| p.bytes.clone()).collect();
+        let (sline, cnt) = build_combined_sline(&cp.bytes, &parent_bytes, ctx);
+        let show_hunks = sline_has_marks(&sline, cnt);
+        // `for (i = 0; i < num_parent; i++) if (elem->parent[i].mode != elem->mode)`
+        // (combine-diff.c:1123-1128).
+        let mode_differs = cp.parents.iter().any(|p| p.kind != cp.kind);
+        // `if (show_hunks || mode_differs || working_tree_file)` (combine-diff.c:1206):
+        // a path whose content matches a parent but whose mode does not still gets a
+        // header, with no hunks under it.
+        if !show_hunks && !mode_differs {
             continue;
         }
 
+        // ---- `show_combined_header()` (combine-diff.c:922) ------------------
+        out.extend_from_slice(line_prefix);
         push_str(&mut out, if dense { "diff --cc " } else { "diff --combined " });
-        out.extend_from_slice(&quoted_name(path));
+        out.extend_from_slice(&quoted_name(&cp.path));
         out.push(b'\n');
+        out.extend_from_slice(line_prefix);
         push_str(&mut out, "index ");
-        let abbrev = crate::abbrev::configured_abbrev(repo, repo.object_hash().len_in_hex());
-        for (i, pid) in parent_ids.iter().enumerate() {
+        for (i, p) in cp.parents.iter().enumerate() {
             if i != 0 {
                 out.push(b',');
             }
-            push_str(&mut out, &pid.to_hex_with_len(abbrev).to_string());
+            push_str(&mut out, &p.id.to_hex_with_len(abbrev).to_string());
         }
         push_str(&mut out, "..");
-        let res_short = if res_present { res_id } else { null };
-        push_str(&mut out, &res_short.to_hex_with_len(abbrev).to_string());
+        push_str(&mut out, &cp.id.to_hex_with_len(abbrev).to_string());
         out.push(b'\n');
-        emit_file_line(&mut out, b"--- ", &quote_one(b"a/", path));
-        emit_file_line(&mut out, b"+++ ", &quote_one(b"b/", path));
-        dump_sline(&mut out, &sline, cnt, ctx);
+
+        // `deleted` is "the result has no mode"; `added` is "and nobody had it",
+        // i.e. every parent reported the path as added (combine-diff.c:958-983).
+        let mut added = false;
+        let mut deleted = false;
+        if mode_differs {
+            deleted = cp.kind.is_none();
+            added = !deleted && cp.parents.iter().all(|p| p.status == b'A');
+            if added {
+                out.extend_from_slice(line_prefix);
+                push_str(&mut out, "new file mode ");
+                push_str(&mut out, &mode_octal(cp.kind));
+            } else {
+                if deleted {
+                    out.extend_from_slice(line_prefix);
+                    push_str(&mut out, "deleted file ");
+                }
+                push_str(&mut out, "mode ");
+                for (i, p) in cp.parents.iter().enumerate() {
+                    if i != 0 {
+                        out.push(b',');
+                    }
+                    push_str(&mut out, &mode_octal(p.kind));
+                }
+                if cp.kind.is_some() {
+                    push_str(&mut out, "..");
+                    push_str(&mut out, &mode_octal(cp.kind));
+                }
+            }
+            out.push(b'\n');
+        }
+
+        if added {
+            dump_quoted_path(&mut out, line_prefix, b"--- ", b"/dev/null");
+        } else {
+            dump_quoted_path(&mut out, line_prefix, b"--- ", &quote_one(a_prefix, &cp.path));
+        }
+        if deleted {
+            dump_quoted_path(&mut out, line_prefix, b"+++ ", b"/dev/null");
+        } else {
+            dump_quoted_path(&mut out, line_prefix, b"+++ ", &quote_one(b_prefix, &cp.path));
+        }
+        // `dump_sline()` prefixes every line it prints (combine-diff.c:809, 841,
+        // 853), which a whole-buffer pass over its output reproduces.
+        let mut hunks: Vec<u8> = Vec::new();
+        dump_sline(&mut hunks, &sline, cnt, ctx);
+        out.extend_from_slice(&apply_line_prefix(hunks, line_prefix));
     }
     Ok(out)
 }
@@ -5541,8 +5900,10 @@ fn render_combined(
     // The result lives only in the worktree, so it has no object id.
     push_str(out, &repo.object_hash().null().to_hex_with_len(abbrev).to_string());
     out.push(b'\n');
-    emit_file_line(out, b"--- ", &quote_one(b"a/", &delta.path));
-    emit_file_line(out, b"+++ ", &quote_one(b"b/", &delta.path));
+    // This renders into the ordinary output buffer, which the caller prefixes as a
+    // whole, so no prefix is emitted here.
+    dump_quoted_path(out, b"", b"--- ", &quote_one(b"a/", &delta.path));
+    dump_quoted_path(out, b"", b"+++ ", &quote_one(b"b/", &delta.path));
 
     dump_sline(out, &sline, cnt, ctx);
     Ok(())

@@ -66,7 +66,11 @@ use std::process::{Command, ExitCode, ExitStatus};
 /// `git help --all --no-verbose` open with it, each via
 /// `printf(_("usage: %s%s"), _(git_usage_string), "\n\n")`, so it is held apart
 /// from the command table that follows rather than baked into one blob.
-const GIT_USAGE_STRING: &str = r#"git [-v | --version] [-h | --help] [-C <path>] [-c <name>=<value>]
+///
+/// `handle_options()` reaches for the same string when a global option is given
+/// without its value (`usage(git_usage_string)`), which is why it is visible to
+/// the crate rather than private here.
+pub(crate) const GIT_USAGE_STRING: &str = r#"git [-v | --version] [-h | --help] [-C <path>] [-c <name>=<value>]
            [--exec-path[=<path>]] [--html-path] [--man-path] [--info-path]
            [-p | --paginate | -P | --no-pager] [--no-replace-objects] [--no-lazy-fetch]
            [--no-optional-locks] [--no-advice] [--bare] [--git-dir=<path>]

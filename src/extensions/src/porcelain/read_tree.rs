@@ -583,7 +583,11 @@ fn finish(o: Opts) -> Result<ExitCode> {
     // Resolve every tree-ish before any other check, exactly like git's read loop.
     let mut tree_ids: Vec<ObjectId> = Vec::with_capacity(o.trees.len());
     for spec in &o.trees {
-        let Ok(obj) = repo.rev_parse_single(spec.as_str()) else {
+        // `repo_get_oid()` only has to *name* an object: a full-length hex
+        // string is its own answer and the odb is never asked (see
+        // [`crate::objname::full_hex`]), so an absent-but-well-formed id gets
+        // past this check and fails in `list_tree()` below instead.
+        let Some(id) = crate::objname::resolve(&repo, spec.as_str()) else {
             return fatal(format!("Not a valid object name {spec}"));
         };
         // `list_tree()` counts before it parses, so the ninth tree-ish is refused
@@ -592,13 +596,14 @@ fn finish(o: Opts) -> Result<ExitCode> {
         if tree_ids.len() >= MAX_UNPACK_TREES {
             return fatal(format!("I cannot read more than {MAX_UNPACK_TREES} trees"));
         }
-        // `object()` and `peel_to_tree()` have distinct error types, so the two
-        // fallible steps are joined through anyhow rather than `and_then`.
-        let peeled = obj
-            .object()
-            .map_err(anyhow::Error::from)
-            .and_then(|obj| obj.peel_to_tree().map_err(anyhow::Error::from));
-        let Ok(tree) = peeled else {
+        // `list_tree()`'s `repo_parse_tree_indirect()` returns NULL both for an
+        // object the repository does not have and for one that will not peel to
+        // a tree; either way `cmd_read_tree` reports the same message.
+        let peeled = repo
+            .find_object(id)
+            .ok()
+            .and_then(|obj| obj.peel_to_tree().ok());
+        let Some(tree) = peeled else {
             return fatal(format!("failed to unpack tree object {spec}"));
         };
         tree_ids.push(tree.id);

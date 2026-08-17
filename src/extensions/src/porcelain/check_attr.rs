@@ -55,6 +55,11 @@ usage: git check-attr [--source <tree-ish>] [-a | --all | <attr>...] [--] <pathn
 enum AttrIndex {
     Worktree(gix::worktree::Index),
     FromTree(gix::index::File),
+    /// An attribute source git holds on to but cannot read `.gitattributes`
+    /// out of: `get_tree_entry()` fails for every path, so no in-tree
+    /// attributes exist — and, crucially, the worktree is *not* consulted
+    /// instead.
+    Unreadable(gix::index::State),
 }
 
 impl AttrIndex {
@@ -62,8 +67,22 @@ impl AttrIndex {
         match self {
             AttrIndex::Worktree(i) => i,
             AttrIndex::FromTree(f) => f,
+            AttrIndex::Unreadable(s) => s,
         }
     }
+}
+
+/// What an attribute source resolved to, once it was given at all.
+///
+/// `set_git_attr_source()` (attr.c) stores whatever `repo_get_oid_tree()`
+/// produced without checking that it is a tree, and `read_attr_from_blob()`
+/// then reads `.gitattributes` out of it with `get_tree_entry()`. That call
+/// fails quietly for an object the repository does not have and for a blob
+/// alike, so both are an attribute source that simply never matches — not an
+/// error, and not a fallback to the working tree.
+enum AttrTree {
+    Tree(gix::ObjectId),
+    Unreadable,
 }
 
 pub fn check_attr(args: &[String]) -> Result<ExitCode> {
@@ -263,43 +282,56 @@ pub fn check_attr(args: &[String]) -> Result<ExitCode> {
         _ => BString::default(),
     };
 
-    // git resolves `--source` to a tree-ish whenever it is given and dies if it
-    // does not name one — *before* reading any attribute and regardless of
-    // `--cached`, which merely overrides the read direction. So validate here
-    // unconditionally, then let `--cached` win when both are set.
-    let source_tree = if let Some(spec) = &source {
-        let tree = repo
-            .rev_parse_single(spec.as_str())
+    // git resolves `--source` whenever it is given — *before* reading any
+    // attribute and regardless of `--cached`, which merely overrides the read
+    // direction — so validate here unconditionally, then let `--cached` win when
+    // both are set.
+    //
+    // What it resolves with is `repo_get_oid_tree()`, and the only thing that
+    // dies is a name that does not resolve *at all*: the `GET_OID_TREE` flag
+    // steers short-name disambiguation, it does not require the result to be a
+    // tree, and a full-length hex string is decoded without the odb being
+    // consulted (see [`crate::objname::full_hex`]). So `--source=<absent id>`
+    // and `--source=<blob>` are both accepted, and stock git goes on to exit 0
+    // reporting every attribute as unspecified.
+    let as_attr_tree = |id| {
+        repo.find_object(id)
             .ok()
-            .and_then(|id| id.object().ok())
             .and_then(|obj| obj.peel_to_tree().ok())
-            .map(|tree| tree.id);
-        let Some(tree) = tree else {
+            .map_or(AttrTree::Unreadable, |tree| AttrTree::Tree(tree.id))
+    };
+    let source_tree = if let Some(spec) = &source {
+        let Some(id) = crate::objname::resolve(&repo, spec.as_str()) else {
             eprintln!("fatal: {spec}: not a valid tree-ish source");
             return Ok(ExitCode::from(128));
         };
-        Some(tree)
+        Some(as_attr_tree(id))
     } else {
         // `compute_default_attr_source` (attr.c): with no `--source`, the
         // attribute source falls back to `GIT_ATTR_SOURCE` and then to the
         // `attr.tree` config, either of which names a tree to read
-        // `.gitattributes` from instead of the working tree. A value that does
-        // not resolve to a tree is ignored here rather than fatal — git only
-        // dies for it when the source was requested explicitly.
-        std::env::var("GIT_ATTR_SOURCE")
-            .ok()
-            .or_else(|| {
-                repo.config_snapshot()
-                    .string("attr.tree")
-                    .map(|v| v.to_string())
-            })
-            .and_then(|spec| {
-                repo.rev_parse_single(spec.as_str())
-                    .ok()
-                    .and_then(|id| id.object().ok())
-                    .and_then(|obj| obj.peel_to_tree().ok())
-                    .map(|tree| tree.id)
-            })
+        // `.gitattributes` from instead of the working tree.
+        //
+        // The two differ in how a name that does not resolve is treated:
+        // `attr.tree` sets `ignore_bad_attr_tree`, so it is dropped silently,
+        // while `GIT_ATTR_SOURCE` is fatal. Either way a name that *does*
+        // resolve becomes the source even when nothing readable is behind it,
+        // exactly as for `--source`.
+        let from_env = std::env::var("GIT_ATTR_SOURCE").ok();
+        let spec = from_env.clone().or_else(|| {
+            repo.config_snapshot()
+                .string("attr.tree")
+                .map(|v| v.to_string())
+        });
+        match spec.as_deref().map(|s| crate::objname::resolve(&repo, s)) {
+            None => None,
+            Some(Some(id)) => Some(as_attr_tree(id)),
+            Some(None) if from_env.is_some() => {
+                eprintln!("fatal: bad --attr-source or GIT_ATTR_SOURCE");
+                return Ok(ExitCode::from(128));
+            }
+            Some(None) => None,
+        }
     };
 
     // Where `.gitattributes` blobs come from. git's default direction is
@@ -311,9 +343,14 @@ pub fn check_attr(args: &[String]) -> Result<ExitCode> {
             AttrIndex::Worktree(repo.index_or_empty()?),
             Source::IdMapping,
         )
-    } else if let Some(tree) = source_tree {
+    } else if let Some(AttrTree::Tree(tree)) = &source_tree {
         (
-            AttrIndex::FromTree(repo.index_from_tree(&tree)?),
+            AttrIndex::FromTree(repo.index_from_tree(tree)?),
+            Source::IdMapping,
+        )
+    } else if source_tree.is_some() {
+        (
+            AttrIndex::Unreadable(gix::index::State::new(repo.object_hash())),
             Source::IdMapping,
         )
     } else {

@@ -136,7 +136,8 @@
 //!   `Already up to date.`, a plain fast-forward, `-s ours` and the octopus
 //!   strategy all accept a value the `ort` path would reject. Honoured:
 //!   `ours`, `theirs`, `subtree[=<prefix>]` (a port of `match-trees.c`'s tree
-//!   shifting), `histogram`, `diff-algorithm=<myers|default|minimal|histogram>`,
+//!   shifting), `patience`, `histogram`,
+//!   `diff-algorithm=<myers|default|minimal|patience|histogram>`,
 //!   `renormalize`, `no-renormalize`, `no-renames`, `find-renames[=<n>]` and
 //!   `rename-threshold=<n>`. An unrecognised value reproduces git's
 //!   `fatal: unknown strategy option: -X<value>`.
@@ -145,8 +146,6 @@
 //!
 //! * `-s recursive`/`resolve`/`subtree`: distinct conflict-resolution engines
 //!   that are not vendored, refused rather than aliased onto `ort`.
-//! * `-Xpatience`/`-Xdiff-algorithm=patience`: the vendored `imara-diff` has no
-//!   patience implementation, and the other algorithms give different merges.
 //! * `-Xignore-space-change`/`-Xignore-all-space`/`-Xignore-space-at-eol`/
 //!   `-Xignore-cr-at-eol`: git gets these from `xdl_recmatch()`'s `XDF_IGNORE_*`
 //!   record hashing; `gix-merge`'s text driver interns whole lines and has no

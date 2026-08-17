@@ -22,11 +22,12 @@
 //!     override, exactly as git's `better_branch_name` does)
 //!   * exit 0 for a clean merge, 1 when conflicts remain, 128 for the fatal paths
 //!   * `--no-renames`, `--find-renames`, `--find-renames=<n>`,
-//!     `--rename-threshold=<n>`, `--histogram`, `--diff-algorithm=<myers|minimal|histogram>`
+//!     `--rename-threshold=<n>`, `--patience`, `--histogram`,
+//!     `--diff-algorithm=<myers|minimal|patience|histogram>`
 //!
 //! Not covered, and refused rather than approximated:
 //!   * `--ours` / `--theirs` / `--subtree[=<path>]` / `--renormalize` /
-//!     `--no-renormalize` / `--patience` / `--diff-algorithm=patience` /
+//!     `--no-renormalize` /
 //!     `--ignore-space-change` / `--ignore-all-space` / `--ignore-space-at-eol` /
 //!     `--ignore-cr-at-eol` — no equivalent knob on `gix-merge`'s tree/blob
 //!     options, so honouring them would mean producing a different merge than
@@ -82,13 +83,14 @@ enum Renames {
 
 /// `git merge-recursive [--<option>]... <base>... -- <head> <remote>`.
 pub fn merge_recursive(args: &[String]) -> Result<ExitCode> {
-    // git checks `argc < 4`, counting argv[0]; args[0] is the subcommand name.
+    // git checks `argc < 4` counting argv[0], and `args` here starts *after* the
+    // subcommand name, so the same gate is `args.len() < 3`.
     // `show_usage_if_asked(argc, argv, msg.buf)` (builtin/merge-recursive.c:45)
     // precedes the `argc < 4` refusal and prints to stdout instead of stderr.
     if let Some(code) = super::show_usage_if_asked(args, USAGE) {
         return Ok(code);
     }
-    if args.len() < 4 {
+    if args.len() < 3 {
         eprint!("{USAGE}");
         return Ok(ExitCode::from(129));
     }
@@ -100,8 +102,11 @@ pub fn merge_recursive(args: &[String]) -> Result<ExitCode> {
     let mut base_specs: Vec<&str> = Vec::new();
 
     // Leading `--…` arguments are merge options; everything else is a merge
-    // base, until a bare `--` ends the base list.
-    let mut i = 1;
+    // base, until a bare `--` ends the base list. C's `i` starts at 1 because it
+    // is indexing argv; `args` has no argv[0], so the scan starts at 0 — starting
+    // at 1 silently dropped whatever was written first (a strategy option, a
+    // base, or an option git itself rejects).
+    let mut i = 0;
     while i < args.len() {
         let arg = args[i].as_str();
         if let Some(opt) = arg.strip_prefix("--") {
@@ -296,12 +301,13 @@ fn parse_merge_opt(
     renames: &mut Renames,
     diff_algorithm: &mut Option<gix::diff::blob::Algorithm>,
 ) -> Result<bool> {
-    const PORTED: &str = "ported: --no-renames, --find-renames[=<n>], --rename-threshold=<n>, --histogram, --diff-algorithm=<myers|minimal|histogram>";
+    const PORTED: &str = "ported: --no-renames, --find-renames[=<n>], --rename-threshold=<n>, --patience, --histogram, --diff-algorithm=<myers|minimal|patience|histogram>";
     match opt {
         "no-renames" => *renames = Renames::Off,
         "find-renames" => *renames = Renames::On,
+        "patience" => *diff_algorithm = Some(gix::diff::blob::Algorithm::Patience),
         "histogram" => *diff_algorithm = Some(gix::diff::blob::Algorithm::Histogram),
-        "ours" | "theirs" | "subtree" | "renormalize" | "no-renormalize" | "patience"
+        "ours" | "theirs" | "subtree" | "renormalize" | "no-renormalize"
         | "ignore-space-change" | "ignore-all-space" | "ignore-space-at-eol"
         | "ignore-cr-at-eol" => {
             bail!("unsupported flag \"--{opt}\" (no gix-merge equivalent; {PORTED})")
@@ -315,9 +321,7 @@ fn parse_merge_opt(
                 "myers" | "default" => gix::diff::blob::Algorithm::Myers,
                 "minimal" => gix::diff::blob::Algorithm::MyersMinimal,
                 "histogram" => gix::diff::blob::Algorithm::Histogram,
-                "patience" => {
-                    bail!("unsupported flag \"--{opt}\" (gix-merge has no patience diff; {PORTED})")
-                }
+                "patience" => gix::diff::blob::Algorithm::Patience,
                 _ => return Ok(false),
             });
         }

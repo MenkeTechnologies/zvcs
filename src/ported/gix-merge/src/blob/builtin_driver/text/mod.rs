@@ -97,6 +97,19 @@ pub enum Level {
     ZealousAlnum,
 }
 
+/// git's `xpp.flags & XDF_WHITESPACE_FLAGS`, expressed as a canonical form rather
+/// than as a comparison.
+///
+/// `xdl_recmatch()` decides whether two records match by walking them in step
+/// under the flags; interning can only compare bytes, so the flags arrive here as
+/// the function that maps a line to the class `xdl_recmatch()` would put it in —
+/// two lines match exactly when their images are equal. The caller supplies it so
+/// that the whitespace rules live wherever the rest of the port keeps them, and
+/// this crate stays a port of `xmerge.c` alone.
+///
+/// The line includes its terminator, as `xrecord_t` does.
+pub type Canonicalize = fn(&[u8]) -> Vec<u8>;
+
 /// Options for the builtin [text driver](crate::blob::BuiltinDriver::Text).
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct Options {
@@ -115,6 +128,9 @@ pub struct Options {
     /// How hard to try to shrink conflicts, defaulting to [`Level::Zealous`] like git's
     /// low-level merge driver.
     pub level: Level,
+    /// The whitespace rule records are matched under — `-Xignore-space-change` and
+    /// friends. `None`, the default, is git's flagless byte comparison.
+    pub canonicalize: Option<Canonicalize>,
 }
 
 impl Default for Options {
@@ -124,6 +140,7 @@ impl Default for Options {
             diff_algorithm: imara_diff::Algorithm::Myers,
             style: None,
             level: Level::default(),
+            canonicalize: None,
         }
     }
 }
@@ -223,12 +240,20 @@ pub struct Merge<'input, 'data> {
     current: &'data [u8],
     other: &'data [u8],
     current_tokens: Vec<imara_diff::Token>,
+    /// The raw lines behind each side's tokens, in the same order — `xrecord_t`'s
+    /// `ptr`, which is what the merge *writes* even when a whitespace rule made
+    /// the tokens disagree with it.
+    ancestor_lines: Vec<&'data [u8]>,
+    current_lines: Vec<&'data [u8]>,
+    other_lines: Vec<&'data [u8]>,
     /// The `xdchange_t` script from the ancestor to our side, git's `xscr1`.
     ours: Vec<xdl::Change>,
     /// The same to their side, git's `xscr2`.
     theirs: Vec<xdl::Change>,
     /// Needed again to refine conflicts, which re-diffs the two postimages.
     diff_algorithm: imara_diff::Algorithm,
+    /// See [`Options::canonicalize`]; kept because conflict refinement re-diffs.
+    canonicalize: Option<Canonicalize>,
 }
 
 pub(super) mod function;

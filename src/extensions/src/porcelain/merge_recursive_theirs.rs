@@ -83,14 +83,9 @@ pub fn merge_recursive_theirs(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::from(129));
     }
 
-    // Delegate to the shared driver. `cmd_merge_recursive` (and its port) counts
-    // `argv[0]` and scans from index 1; dispatch stripped the command name, so
-    // prepend one synthetic element to realign the grammar. Its value is never
-    // read (the port's scan starts at index 1), and `args.len() >= 3` here means
-    // the forwarded slice is `>= 4` long, so the driver's own `< 4` usage path —
-    // which would print the wrong command name — is never reached.
-    let mut forwarded = Vec::with_capacity(args.len() + 1);
-    forwarded.push(String::from("merge-recursive-theirs"));
-    forwarded.extend_from_slice(args);
-    super::merge_recursive(&forwarded)
+    // Delegate to the shared driver, which takes the same argv-less slice this
+    // one did. The `args.len() >= 3` gate above is the driver's own gate too, so
+    // its usage path — which would print the wrong command name — is never
+    // reached.
+    super::merge_recursive(args)
 }

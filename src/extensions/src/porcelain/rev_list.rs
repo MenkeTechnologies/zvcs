@@ -69,15 +69,26 @@ fn fatal(message: &str) -> ExitCode {
     ExitCode::from(128)
 }
 
-/// The message `setup_revisions()` raises for a revision argument it could not
+/// Print a diagnostic that already carries its own prefixes and newline, and
+/// return git's fatal exit code.
+///
+/// [`fatal`]'s counterpart for a message that may be more than one line: a
+/// symmetric range whose endpoint is not a commit makes `setup_revisions()` write
+/// `lookup_commit_reference()`'s `error:` note *ahead* of the `fatal:`, so the two
+/// travel as one string and neither line may be re-prefixed.
+fn fatal_text(text: &str) -> ExitCode {
+    eprint!("{text}");
+    ExitCode::from(128)
+}
+
+/// Everything `setup_revisions()` writes for a revision argument it could not
 /// resolve, shared with `git log` — `rev-list` runs the same `setup_revisions()`.
-/// Stripped of the `fatal: ` prefix and trailing newline that [`fatal`] adds back.
+///
+/// Prefixes and trailing newline included, which is why it pairs with
+/// [`fatal_text`] rather than [`fatal`]: this is the only producer of the seed
+/// walk's `Err(String)`, so that whole channel carries finished stderr text.
 fn unresolvable(repo: &gix::Repository, spec: &str) -> String {
-    let hex_len = repo.object_hash().len_in_hex();
-    super::log::bad_revision_message(spec, hex_len)
-        .trim_start_matches("fatal: ")
-        .trim_end_matches('\n')
-        .to_string()
+    super::log::bad_revision_message_in(repo, spec)
 }
 
 /// Reject a malformed integer flag value exactly as git does: `fatal: '<v>': not
@@ -298,6 +309,9 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     let mut max_age: Option<i64> = None;
     let mut min_age: Option<i64> = None;
     let mut pathspecs: Vec<Vec<u8>> = Vec::new();
+    // `setup_revisions()`'s `seen_dashdash`, found in a scan of the whole
+    // argument vector before anything is resolved.
+    let seen_dashdash = args.iter().any(|a| a == "--");
     let mut seeds: Vec<Seed> = Vec::new();
     // `--exclude=<glob>`, held until the next ref-selecting option consumes it.
     let mut ref_excludes: Vec<String> = Vec::new();
@@ -379,7 +393,7 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
             "--simplify-by-decoration" => simplify_by_decoration = true,
             "--bisect" => {
                 if let Err(e) = seed_bisect_refs(&repo, negate, &mut seeds, &mut pending_tags) {
-                    return Ok(fatal(&e));
+                    return Ok(fatal_text(&e));
                 }
                 rev_input_given = true;
                 bisect = true;
@@ -489,7 +503,7 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
                     negate,
                 );
                 if let Err(e) = seed_ref_set(&repo, &sel, negate, &mut seeds, &mut pending_tags) {
-                    return Ok(fatal(&e));
+                    return Ok(fatal_text(&e));
                 }
                 rev_input_given = true;
             }
@@ -506,7 +520,7 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
                     negate,
                 );
                 if let Err(e) = seed_ref_set(&repo, &sel, negate, &mut seeds, &mut pending_tags) {
-                    return Ok(fatal(&e));
+                    return Ok(fatal_text(&e));
                 }
                 rev_input_given = true;
             }
@@ -604,9 +618,18 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
             // Every remaining flag is one git knows and this does not; a
             // revision never starts with `-`, so anything left is a usage error.
             s if s.starts_with('-') => return Ok(usage_error()),
+            // `handle_revision_arg_1()`'s guard ahead of `handle_dotdot()`: a
+            // bare `..` is the pathspec for the parent directory, never
+            // `HEAD..HEAD`. `setup_revisions()` then sends it to
+            // `append_prune_data()`, and the pathspec layer rejects it for
+            // leaving the repository. See
+            // [`crate::objname::is_parent_directory_pathspec`].
+            s if crate::objname::is_parent_directory_pathspec(s, seen_dashdash) => {
+                pathspecs.push(s.as_bytes().to_vec());
+            }
             s => {
                 if let Err(e) = seed_revision(&repo, s, negate, &mut seeds, &mut pending_tags) {
-                    return Ok(fatal(&e));
+                    return Ok(fatal_text(&e));
                 }
                 note_parsed(&repo, s, &seeds[seeds_before..], &mut parsed_commits)?;
                 rev_input_given = true;
@@ -631,6 +654,14 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
         ));
     }
 
+    // `parse_pathspec()` runs inside `setup_revisions()`, so a rejected element
+    // is fatal here — before the walk, and on the paths that never build a
+    // matcher at all.
+    if let Some(msg) = crate::pathspec::parse_pathspec_fatal(&repo, &pathspecs) {
+        eprintln!("fatal: {msg}");
+        return Ok(ExitCode::from(128));
+    }
+
     // `revs->abbrev` is the minimum width every abbreviation in the run is asked
     // for, so it goes in front of the same `core.abbrev` lookup gitoxide already
     // makes. Zero (`--no-abbrev`) is handled at the print site instead — it turns
@@ -642,6 +673,10 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     }
 
     if read_stdin {
+        // `read_revisions_from_stdin()` brackets its whole loop with
+        // `cfg->warn_on_object_refname_ambiguity = 0`, so names arriving on stdin
+        // never produce the ambiguity warning that the same names on argv do.
+        let _quiet_ambiguity = crate::objname::AmbiguityWarnings::off();
         let mut text = String::new();
         std::io::stdin().read_to_string(&mut text)?;
         // `read_revisions_from_stdin` reads revisions until a bare `--`, after
@@ -658,7 +693,7 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
             } else {
                 let seeds_before = seeds.len();
                 if let Err(e) = seed_revision(&repo, line, negate, &mut seeds, &mut pending_tags) {
-                    return Ok(fatal(&e));
+                    return Ok(fatal_text(&e));
                 }
                 note_parsed(&repo, line, &seeds[seeds_before..], &mut parsed_commits)?;
                 // The same `handle_revision_arg()` reads these lines, so an
@@ -1733,7 +1768,10 @@ fn reachable_from(
 
 /// git's `limit_to_ancestry`: keep only the commits that can reach a bottom
 /// commit, marking bottom-up until no more progress is made.
-fn limit_to_ancestry(
+///
+/// Shared with `fast-export`, which reaches `limit_list` through the same
+/// `setup_revisions` and so has to apply the identical filter to its own walk.
+pub(super) fn limit_to_ancestry(
     bottoms: &[ObjectId],
     list: &[ObjectId],
     parents_of: &HashMap<ObjectId, Vec<ObjectId>>,
@@ -1924,6 +1962,9 @@ fn resolve(
     spec: &str,
     tags: &mut Vec<(ObjectId, Vec<u8>)>,
 ) -> Option<ObjectId> {
+    // Every endpoint reaches `repo_get_oid()`, so a full-length hex that is also a
+    // refname warns here — once per endpoint, which is why `a..b` warns twice.
+    crate::objname::warn_ambiguous_refname(repo, spec);
     let id = repo.rev_parse_single(spec).ok()?.detach();
     peel_recording_tags(repo, id, tags)
 }

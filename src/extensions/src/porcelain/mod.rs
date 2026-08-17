@@ -630,7 +630,7 @@ mod rerere;
 mod reset;
 mod restore;
 mod rev_list;
-mod rev_parse;
+pub(crate) mod rev_parse;
 mod revert;
 mod rm;
 mod send_email;

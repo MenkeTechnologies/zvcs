@@ -145,6 +145,92 @@ pub fn first_magic_fatal<S: AsRef<[u8]>>(
     })
 }
 
+/// `init_pathspec_item()`'s *other* `die()` — the one that fires after the magic
+/// parsed cleanly and the path itself turned out to point out of the repository
+/// (`pathspec.c:489-502`):
+///
+/// ```c
+/// match = prefix_path_gently(the_repository, prefix, prefixlen,
+///                            &prefixlen, copyfrom);
+/// if (!match) {
+///         const char *hint_path;
+///
+///         if ((flags & PATHSPEC_NO_REPOSITORY) || !have_git_dir())
+///                 die(_("'%s' is outside the directory tree"), copyfrom);
+///         hint_path = repo_get_work_tree(the_repository);
+///         if (!hint_path)
+///                 hint_path = repo_get_git_dir(the_repository);
+///         die(_("%s: '%s' is outside repository at '%s'"), elt,
+///             copyfrom, absolute_path(hint_path));
+/// }
+/// ```
+///
+/// Two operands, and they are not the same string: `elt` is the element as
+/// written, magic and all, while `copyfrom` is the path left after the magic was
+/// stripped. For a bare `..` they coincide, which is exactly why that shape is a
+/// poor test of the rendering and `:(icase)../x` is the one that separates them.
+///
+/// `hint_path` is the working tree, and git prints it through `absolute_path()`
+/// — but the path it holds came from `setup_work_tree()`'s `xgetcwd()`, so
+/// symlinks are already resolved and `/var/…` appears as `/private/var/…` on
+/// macOS. Resolving it here is what reproduces that.
+///
+/// This is a *separate* gate from [`first_magic_fatal`] because git raises it at
+/// a different point and with a different message; a caller that takes a
+/// pathspec runs both, in this order, before it does any work. Returns the
+/// `fatal:` body for the first element git would die on, in argument order.
+pub fn first_outside_repository_fatal<S: AsRef<[u8]>>(
+    repo: &gix::Repository,
+    specs: &[S],
+    defaults: gix::pathspec::Defaults,
+) -> Option<String> {
+    let workdir = repo.workdir()?;
+    let root = gix::path::realpath(workdir).unwrap_or_else(|_| workdir.to_owned());
+    // `prefix_path_gently()` is handed `revs->prefix`, the CWD as seen from the
+    // working tree. Outside one there is nothing to be outside *of*.
+    let prefix = repo.prefix().ok().flatten().unwrap_or_else(|| std::path::Path::new("")).to_owned();
+    specs.iter().find_map(|spec| {
+        let elt: &BStr = spec.as_ref().as_bstr();
+        let mut pattern = gix::pathspec::parse(spec.as_ref(), defaults).ok()?;
+        // `copyfrom`: the path with the magic already taken off.
+        let copyfrom = pattern.path().to_owned();
+        pattern.normalize(&prefix, &root).err().map(|_| {
+            format!(
+                "{}: '{}' is outside repository at '{}'",
+                elt.to_str_lossy(),
+                copyfrom.to_str_lossy(),
+                root.display()
+            )
+        })
+    })
+}
+
+/// Both of `init_pathspec_item()`'s `die()`s, in git's order, for a command that
+/// has finished collecting its pathspec list.
+///
+/// git runs `parse_pathspec()` once, inside `setup_revisions()`, over the whole
+/// list and before the command does any work — so a bad element is fatal even on
+/// a code path that would never have consulted the set. A port that instead
+/// waits for its matcher to be built inherits gitoxide's wording and exit 1, and
+/// misses the check entirely wherever it builds no matcher at all: `git diff`
+/// hands its patterns straight to the index/worktree status iterator, so
+/// `git diff -- ..` reported gitoxide's `Could not obtain the repository prefix`
+/// where git reports `fatal: ..: '..' is outside repository at '<worktree>'`.
+///
+/// Returns the `fatal:` body for the first element git would die on. Callers
+/// print `fatal: {msg}` and exit 128.
+pub fn parse_pathspec_fatal<S: AsRef<[u8]>>(
+    repo: &gix::Repository,
+    specs: &[S],
+) -> Option<String> {
+    if specs.is_empty() {
+        return None;
+    }
+    let defaults = repo.pathspec_defaults_inherit_ignore_case(false).ok()?;
+    first_magic_fatal(specs, defaults)
+        .or_else(|| first_outside_repository_fatal(repo, specs, defaults))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

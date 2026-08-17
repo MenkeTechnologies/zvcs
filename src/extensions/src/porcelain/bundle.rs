@@ -954,8 +954,7 @@ fn resolve_revisions(
             match one_pending(repo, spec, uninteresting) {
                 Ok(p) => resolved.push(p),
                 Err(_) => {
-                    let hex_len = repo.object_hash().len_in_hex();
-                    eprint!("{}", super::log::bad_revision_message(a, hex_len));
+                    eprint!("{}", super::log::bad_revision_message_in(repo, a));
                     return Ok(Err(ExitCode::from(128)));
                 }
             }

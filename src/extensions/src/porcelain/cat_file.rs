@@ -576,11 +576,10 @@ pub fn cat_file(args: &[String]) -> Result<ExitCode> {
     }
     let spec = positional[0];
 
-    let Ok(id) = repo.rev_parse_single(spec) else {
+    let Some(oid) = crate::objname::resolve(&repo, spec) else {
         eprintln!("fatal: Not a valid object name {spec}");
         return Ok(ExitCode::from(128));
     };
-    let oid = id.detach();
 
     match mode {
         // `-e` is silent on both paths: 0 when present, 1 when absent.
@@ -652,7 +651,7 @@ fn type_mode(
     use_mailmap: bool,
 ) -> Result<ExitCode> {
     // git resolves the object before it validates the type name.
-    let Ok(id) = repo.rev_parse_single(spec) else {
+    let Some(oid) = crate::objname::resolve(repo, spec) else {
         eprintln!("fatal: Not a valid object name {spec}");
         return Ok(ExitCode::from(128));
     };
@@ -662,8 +661,11 @@ fn type_mode(
         return Ok(ExitCode::from(128));
     };
 
-    let Ok(object) = repo.find_object(id.detach()) else {
-        eprintln!("fatal: Not a valid object name {spec}");
+    // `read_object_with_reference()` returning NULL — which covers an id that
+    // resolved but is not in the odb — is git's "bad file", the same message the
+    // failed peel below reports.
+    let Ok(object) = repo.find_object(oid) else {
+        eprintln!("fatal: git cat-file {spec}: bad file");
         return Ok(ExitCode::from(128));
     };
 
@@ -761,8 +763,8 @@ fn resolve_transform_spec(
     repo: &gix::Repository,
     spec: &str,
 ) -> std::result::Result<gix::hash::ObjectId, ExitCode> {
-    if let Ok(id) = repo.rev_parse_single(spec) {
-        return Ok(id.detach());
+    if let Some(id) = crate::objname::resolve(repo, spec) {
+        return Ok(id);
     }
     let Some((rev, file)) = spec.split_once(':') else {
         eprintln!("fatal: Not a valid object name {spec}");
@@ -774,7 +776,7 @@ fn resolve_transform_spec(
         eprintln!("fatal: path '{file}' does not exist (neither on disk nor in the index)");
         return Err(ExitCode::from(128));
     }
-    if repo.rev_parse_single(rev).is_err() {
+    if crate::objname::resolve(repo, rev).is_none() {
         eprintln!("fatal: invalid object name '{rev}'.");
         return Err(ExitCode::from(128));
     }
@@ -1460,7 +1462,12 @@ fn run_batch(
         return Ok(ExitCode::SUCCESS);
     }
 
-    // stdin-driven batch.
+    // stdin-driven batch. `batch_objects()` clears
+    // `warn_on_object_refname_ambiguity` from exactly here — after the
+    // `--batch-all-objects` return above — for the reason its comment gives: the
+    // names are overwhelmingly object ids already, and asking the ref store about
+    // each one "just so we can warn" costs more than the object lookups do.
+    let _quiet_ambiguity = crate::objname::AmbiguityWarnings::off();
     let stdin = std::io::stdin();
     let mut input = stdin.lock();
     let mut line: Vec<u8> = Vec::new();

@@ -157,6 +157,20 @@
 //!   is empty, and every disjoint pair of ranges besides. Otherwise, if a body
 //!   would be produced, the run stops with a terse `unsupported flag` message on
 //!   stderr rather than emitting a diff-of-diffs that ignored the option.
+//! * A pair that matched *byte-identically* — the `=` pair, decided by
+//!   `strcmp(a_util->patch, b_util->patch)` (range-diff.c:429) — is a third
+//!   empty body, and the one that is easy to miss: `patch_diff()` does run, but
+//!   the filepair it queues has nothing to report, so `diff_flush()` writes
+//!   nothing under `-p`, `--stat`, `--numstat`, `--shortstat`,
+//!   `--compact-summary`, `--dirstat`, `--summary` or `--check`, and the
+//!   deferred option that asked for one of them is again unobservable. The
+//!   exceptions are `--raw`, `--name-only` and `--name-status`, whose loop is
+//!   gated on `check_pair_status()` alone and lists the pair whatever its
+//!   content — `diff_unmodified_pair()` compares the two filespec *paths*, which
+//!   `get_filespec()` always names `a` and `b` — and the stat group *together
+//!   with* `-p`, where the empty stat still bumps `separator` and
+//!   `DIFF_FORMAT_PATCH` turns that into one four-space line (diff.c:7197-7258).
+//!   Those still stop.
 //! * If the run instead ends earlier — a usage error, or a range that names an
 //!   unknown revision — the deferred option never becomes observable, because
 //!   upstream's behaviour on those two paths does not depend on it. That was
@@ -274,6 +288,7 @@ use gix::object::tree::diff::ChangeDetached;
 use gix::prelude::ObjectIdExt;
 
 use super::{diff_color, Arg, LongOpt};
+use crate::objname;
 
 /// `RANGE_DIFF_CREATION_FACTOR_DEFAULT`.
 const CREATION_FACTOR_DEFAULT: i64 = 60;
@@ -312,15 +327,131 @@ const PICKAXE_G_REGEX_MASK: u32 = PICKAXE_KIND_G | PICKAXE_REGEX;
 /// `DIFF_PICKAXE_KINDS_ALL_OBJFIND_MASK`: `--pickaxe-all` with `--find-object`.
 const PICKAXE_ALL_OBJFIND_MASK: u32 = PICKAXE_ALL | PICKAXE_KIND_OBJFIND;
 
-/// The four `diff.h` output-format bits `diff_setup_done()` forbids combining:
-/// `--name-only`, `--name-status`, `--check` and `-s`. Two or more set is the
-/// fatal `cannot be used together` (exit 128) upstream raises before it resolves
-/// any revision. `-s`/`--no-patch` *assigns* `DIFF_FORMAT_NO_OUTPUT`, clearing
-/// the earlier bits, so `--name-only -s` is one bit but `-s --name-only` is two.
+/// The `diff.h` `DIFF_FORMAT_*` bits, tracked because `diff_flush()` decides
+/// from them whether the diff-of-diffs body is written at all and, for the
+/// formats this port does not render, whether a deferred option is observable.
+///
+/// The first four are the group `diff_setup_done()` forbids combining
+/// (diff.c:5259): two or more of `--name-only`, `--name-status`, `--check` and
+/// `-s` is the fatal `cannot be used together` (exit 128) raised before any
+/// revision is resolved. `-s`/`--no-patch` *assigns* `DIFF_FORMAT_NO_OUTPUT`,
+/// clearing the earlier bits, so `--name-only -s` is one bit but `-s
+/// --name-only` is two.
 const FMT_NAME: u32 = 1 << 0;
 const FMT_NAME_STATUS: u32 = 1 << 1;
 const FMT_CHECKDIFF: u32 = 1 << 2;
 const FMT_NO_OUTPUT: u32 = 1 << 3;
+const FMT_RAW: u32 = 1 << 4;
+const FMT_NUMSTAT: u32 = 1 << 5;
+const FMT_DIFFSTAT: u32 = 1 << 6;
+const FMT_SHORTSTAT: u32 = 1 << 7;
+const FMT_DIRSTAT: u32 = 1 << 8;
+const FMT_SUMMARY: u32 = 1 << 9;
+const FMT_PATCH: u32 = 1 << 10;
+
+/// `HAS_MULTI_BITS`'s operand in `diff_setup_done()` (diff.c:5259) — and, one
+/// line later, the test that clears [`FMT_CLEARED_BY_EXCLUSIVE`].
+const FMT_EXCLUSIVE: u32 = FMT_NAME | FMT_NAME_STATUS | FMT_CHECKDIFF | FMT_NO_OUTPUT;
+
+/// The bits any of [`FMT_EXCLUSIVE`] wipes out (diff.c:5261-5262), which is why
+/// `--check` prints no patch even next to an explicit `-p`.
+const FMT_CLEARED_BY_EXCLUSIVE: u32 =
+    FMT_RAW | FMT_NUMSTAT | FMT_DIFFSTAT | FMT_SHORTSTAT | FMT_DIRSTAT | FMT_SUMMARY | FMT_PATCH;
+
+/// The three formats `diff_flush()` computes from one `diffstat_t` and closes
+/// with a single `separator++` (diff.c:7197-7223) — the reason `-p --stat` puts
+/// a blank line between the stat and the patch even when the stat is empty.
+const FMT_STAT_GROUP: u32 = FMT_NUMSTAT | FMT_DIFFSTAT | FMT_SHORTSTAT;
+
+/// The `output_format` bits `name` sets, and whether it leaves
+/// `flags.dirstat_by_line` on — `None` for an option that is not an output
+/// format at all.
+///
+/// Every entry that is not one of `--name-only`, `--name-status` or `--check`
+/// also *unsets* `DIFF_FORMAT_NO_OUTPUT`, so meeting it revives the output an
+/// earlier `-s` suppressed: that is the unset mask on `add_diff_options()`'s
+/// `OPT_BITOP` entries (diff.c:6043-6099) and the explicit clear in the four
+/// callbacks that set a bit by hand — `diff_opt_stat()` (diff.c:5445),
+/// `parse_dirstat_opt()` (diff.c:5465), `enable_patch_output()` (diff.c:5502,
+/// 5564, 5961) and `diff_opt_compact_summary()` (diff.c:5667). The three
+/// exceptions are `OPT_BIT_F` entries with no unset mask, which is why `-s
+/// --name-only` is still the `cannot be used together` fatal while `-s --patch
+/// --name-only` is not.
+///
+/// Only positive spellings are listed. A `--no-<format>` reaches its callback's
+/// `unset` branch, which leaves `output_format` alone.
+fn format_bits(name: &str, inline: Option<&str>) -> Option<(u32, bool)> {
+    // `parse_dirstat_opt()` walks the comma-separated parameters in order, so
+    // the last of `lines`/`files` wins. The synonyms only prepend a parameter —
+    // `--dirstat-by-file` a `files` and `--cumulative` a `cumulative` — and
+    // neither can outrank a `lines` that follows it, so both start from off.
+    let dirstat_by_line = || {
+        let mut by_line = false;
+        for param in inline.unwrap_or_default().split(',') {
+            match param {
+                "lines" => by_line = true,
+                "files" => by_line = false,
+                _ => {}
+            }
+        }
+        by_line
+    };
+    if name.starts_with("-U") {
+        return Some((FMT_PATCH, false));
+    }
+    let bits = match name {
+        "-p" | "-u" | "--patch" | "--unified" | "--binary" => FMT_PATCH,
+        "--raw" => FMT_RAW,
+        "--patch-with-raw" => FMT_PATCH | FMT_RAW,
+        "--patch-with-stat" => FMT_PATCH | FMT_DIFFSTAT,
+        "--numstat" => FMT_NUMSTAT,
+        "--shortstat" => FMT_SHORTSTAT,
+        "--stat" | "--stat-width" | "--stat-name-width" | "--stat-graph-width"
+        | "--stat-count" | "--compact-summary" => FMT_DIFFSTAT,
+        "--summary" => FMT_SUMMARY,
+        "-X" | "--dirstat" | "--cumulative" | "--dirstat-by-file" => {
+            return Some((FMT_DIRSTAT, dirstat_by_line()))
+        }
+        "--name-only" => FMT_NAME,
+        "--name-status" => FMT_NAME_STATUS,
+        "--check" => FMT_CHECKDIFF,
+        _ => return None,
+    };
+    Some((bits, false))
+}
+
+/// Whether `diff_flush()` writes a byte for range-diff's one filepair under
+/// `output_format`, leaving out [`FMT_PATCH`], which this port renders itself.
+///
+/// The filepair is always the same shape — `get_filespec()` builds two `is_stdin`
+/// buffers named `a` and `b`, both mode `0100644`, both present (range-diff.c:
+/// 477-489) — which fixes three of the answers regardless of content:
+///
+/// * `--raw`, `--name-only` and `--name-status` always list it. Their loop is
+///   gated on `check_pair_status()` alone, and `diff_unmodified_pair()` compares
+///   the two filespec *paths*, so the pair counts as modified even when the two
+///   texts are identical.
+/// * `--summary` never writes: `is_summary_empty()` is true for a pair with no
+///   creation, deletion, rename, copy or mode change, and this pair can have
+///   none of them. It does not reach the `separator++` either.
+/// * `--dirstat` never writes: both paths sit at the root, and `show_dirstat()`
+///   reports directories. `--dirstat=lines` is the exception to the exception —
+///   it rides inside the stat group's block (diff.c:7197-7223) and so bumps
+///   `separator`, which `FMT_PATCH` turns into one four-space line.
+///
+/// The stat group writes only when the diff is non-empty, but bumps `separator`
+/// either way. `--check` is the one format whose output cannot be predicted from
+/// the pair's shape — it writes when an added line carries a whitespace error —
+/// so it counts as writing.
+fn format_writes(output_format: u32, dirstat_by_line: bool, diff_is_empty: bool) -> bool {
+    if output_format & (FMT_RAW | FMT_NAME | FMT_NAME_STATUS | FMT_CHECKDIFF) != 0 {
+        return true;
+    }
+    let bumps_separator =
+        output_format & FMT_STAT_GROUP != 0 || (output_format & FMT_DIRSTAT != 0 && dirstat_by_line);
+    (output_format & FMT_STAT_GROUP != 0 && !diff_is_empty)
+        || (bumps_separator && output_format & FMT_PATCH != 0)
+}
 
 /// The terse rejection for a flag `git range-diff` accepts and this port has not
 /// implemented.
@@ -799,8 +930,13 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
     let mut pos: Vec<String> = Vec::new();
     let mut after_dash_dash = false;
 
-    // The accumulated `diff_setup_done()` output-format bits (see [`FMT_NAME`]).
-    let mut fmt_mask: u32 = 0;
+    // `diffopt.output_format` (see [`FMT_NAME`]) and `diffopt.flags.
+    // dirstat_by_line`, accumulated by [`format_bits`] as each argument is read.
+    let mut output_format: u32 = 0;
+    let mut dirstat_by_line = false;
+    // `diffopt.flags.quick`, which `--quiet` sets and `diff_setup_done()` turns
+    // into `DIFF_FORMAT_NO_OUTPUT` once every argument has been parsed.
+    let mut quick = false;
     // The accumulated `diffopt.pickaxe_opts` bits (see [`PICKAXE_ALL`]) and
     // `diffopt.flags.follow_renames`, the other two things `diff_setup_done()`
     // refuses before any revision is resolved.
@@ -1016,11 +1152,16 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
             }
             // `--quiet` is `flags.quick`, which `diff_setup_done()` turns into
             // `DIFF_FORMAT_NO_OUTPUT` plus `exit_with_status` (diff.c:5348-5352)
-            // — and the status is never read here, so it is exactly `-s`. It is
-            // set *after* the `check_mask` test at diff.c:5259, so unlike `-s`
-            // it never joins the `cannot be used together` fatal.
-            "--quiet" => opts.no_patch = true,
-            "--no-quiet" => opts.no_patch = false,
+            // — and the status is never read here, so the page it leaves is the
+            // one `-s` leaves. It is *not* the same option, though: it is applied
+            // after every argument has been parsed, so it never joins the
+            // `cannot be used together` fatal (diff.c:5259, earlier), and no
+            // later format option can revive the output it suppressed — where a
+            // later format option does exactly that to `-s` (see
+            // [`clears_no_output`]). Kept apart from `no_patch` for that reason
+            // and folded in below.
+            "--quiet" => quick = true,
+            "--no-quiet" => quick = false,
             // `--output=<file>` is opened by `xfopen()` while parse-options runs
             // (diff.c:5829-5830), so a path that cannot be created is fatal
             // before every other check, and a path that can is truncated even
@@ -1111,11 +1252,12 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
                 if repo.is_none() {
                     repo = Some(gix::discover(".")?);
                 }
-                let found = repo
-                    .as_ref()
-                    .expect("discovered just above")
-                    .rev_parse_single(value.as_str())
-                    .is_ok();
+                // `repo_get_oid()`, which decodes a full-length hex without
+                // consulting the object database (see [`crate::objname`]) — so
+                // `--find-object <absent-full-hex>` is a perfectly good filter
+                // that simply matches nothing, and the run continues.
+                let found =
+                    objname::resolve(repo.as_ref().expect("discovered just above"), &value).is_some();
                 if !found {
                     return Ok(option_error(&format!("unable to resolve '{value}'")));
                 }
@@ -1203,26 +1345,12 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
             // so they stay deferred; but their bits are tracked here so the
             // `cannot be used together` fatal can fire before any revision is
             // resolved. `-s`/`--no-patch` assigns `NO_OUTPUT`, clearing the rest.
-            "--name-only" => {
-                fmt_mask |= FMT_NAME;
-                opts.defer(unsupported_flag(a));
-            }
-            "--name-status" => {
-                fmt_mask |= FMT_NAME_STATUS;
-                opts.defer(unsupported_flag(a));
-            }
-            "--check" => {
-                fmt_mask |= FMT_CHECKDIFF;
-                opts.defer(unsupported_flag(a));
-            }
+            "--name-only" | "--name-status" | "--check" => opts.defer(unsupported_flag(a)),
             // `-s`/`--no-patch` assigns `DIFF_FORMAT_NO_OUTPUT`, clearing the
             // other format bits, and suppresses the diff-of-diffs body entirely
             // — leaving the pair headers, which this port renders. So it is
             // implemented here, not deferred.
-            "-s" | "--no-patch" => {
-                fmt_mask = FMT_NO_OUTPUT;
-                opts.no_patch = true;
-            }
+            "-s" | "--no-patch" => output_format = FMT_NO_OUTPUT,
             // `--ws-error-highlight=<kind>` only tints whitespace errors when
             // color is on. This port always emits with color off, so it is a
             // byte-for-byte no-op; accept it and consume a detached value so the
@@ -1278,7 +1406,11 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
                     }
                 }
             }
-            "--no-creation-factor" => opts.creation_factor = CREATION_FACTOR_DEFAULT,
+            // `--no-<int-option>` takes `OPTION_INTEGER`'s unset branch, which
+            // stores 0 — *not* the value the struct was initialised with. So
+            // `--no-creation-factor` weights creation at zero and nothing ever
+            // pairs, where the default 60 pairs a lightly edited commit.
+            "--no-creation-factor" => opts.creation_factor = 0,
             "--creation-factor" => {
                 let value = match inline {
                     Some(v) => v.to_string(),
@@ -1287,18 +1419,29 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
                         match args.get(i) {
                             Some(v) => v.clone(),
                             None => {
-                                return Ok(usage_error(
+                                return Ok(option_error(
                                     "option `creation-factor' requires a value",
                                 ))
                             }
                         }
                     }
                 };
-                match value.parse::<i64>() {
+                // `OPTION_INTEGER`'s three failures, all `error:` at 129 with no
+                // usage block: an empty value, a malformed one, and one outside
+                // the `int` the option writes into.
+                if value.is_empty() {
+                    return Ok(option_error("option `creation-factor' expects a numerical value"));
+                }
+                match git_parse_signed(&value, i32::MIN as i64, i32::MAX as i64) {
                     Ok(n) => opts.creation_factor = n,
-                    // Upstream's `OPT_INTEGER` failure is a usage error, 129.
-                    Err(_) => {
-                        return Ok(usage_error(
+                    Err(MagnitudeError::Range) => {
+                        return Ok(option_error(&format!(
+                            "value {value} for option `creation-factor' not in range \
+                             [-2147483648,2147483647]"
+                        )))
+                    }
+                    Err(MagnitudeError::Invalid) => {
+                        return Ok(option_error(
                             "option `creation-factor' expects an integer value with an \
                              optional k/m/g suffix",
                         ))
@@ -1316,12 +1459,38 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
             // nothing to defer it behind.
             _ if !is_known_option(name) => return Ok(unknown_option(a)),
             _ => {
-                opts.defer(unsupported_flag(a));
+                // `--summary` and the `--dirstat` family (short of
+                // `--dirstat=lines`) are the two formats that provably write
+                // nothing for range-diff's filepair — see [`format_writes`] — so
+                // there is nothing to defer them behind. They are still recorded
+                // below, because setting *any* format bit suppresses the
+                // `DIFF_FORMAT_PATCH` fallback and so does change the page.
+                let writes_nothing = matches!(
+                    format_bits(name, inline),
+                    Some((FMT_SUMMARY, _)) | Some((FMT_DIRSTAT, false))
+                );
+                if !writes_nothing {
+                    opts.defer(unsupported_flag(a));
+                }
                 if inline.is_none()
                     && (LONG_TAKES_VALUE.contains(&name) || SHORT_TAKES_VALUE.contains(&name))
                 {
                     i += 1;
                 }
+            }
+        }
+        // Accumulated here rather than in each arm because two dozen spellings
+        // share it, most of them reaching the catch-all above. `-s`/`--no-patch`
+        // is the one option that *assigns* `output_format`, so it is not listed
+        // in [`format_bits`] and its arm has already run.
+        if let Some((bits, by_line)) = format_bits(name, inline) {
+            output_format |= bits;
+            if bits & FMT_DIRSTAT != 0 {
+                dirstat_by_line = by_line;
+            }
+            // Every format but the three `OPT_BIT_F` ones unsets `NO_OUTPUT`.
+            if bits & (FMT_NAME | FMT_NAME_STATUS | FMT_CHECKDIFF) == 0 {
+                output_format &= !FMT_NO_OUTPUT;
             }
         }
         i += 1;
@@ -1340,13 +1509,34 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
     // (128/255) checks below. Value errors (`--creation-factor`,
     // `--inter-hunk-context`) already returned 129 inside the loop, matching
     // upstream's parse-options-first ordering.
-    if fmt_mask.count_ones() >= 2 {
+    if (output_format & FMT_EXCLUSIVE).count_ones() >= 2 {
         eprintln!(
             "fatal: options '--name-only', '--name-status', '--check', and '-s' \
              cannot be used together"
         );
         return Ok(ExitCode::from(128));
     }
+    // One of those four wipes out every other format (diff.c:5261-5262), which
+    // is why `--check` prints no patch even next to an explicit `-p`.
+    if output_format & FMT_EXCLUSIVE != 0 {
+        output_format &= !FMT_CLEARED_BY_EXCLUSIVE;
+    }
+    // `flags.quick` becomes `DIFF_FORMAT_NO_OUTPUT` here (diff.c:5348-5352),
+    // *after* the test above and after the whole argv has been read — so
+    // `--quiet` neither joins that fatal nor loses to a format option that
+    // follows it, which is the whole reason it is not folded into `-s`.
+    if quick {
+        output_format = FMT_NO_OUTPUT;
+    }
+    // `show_range_diff()`'s fallback (range-diff.c:551-552): a run that named no
+    // format at all gets `DIFF_FORMAT_PATCH`. Any format bit at all — even one
+    // that writes nothing, like `--summary` — suppresses it, which is why
+    // `range-diff --summary` prints pair headers and no bodies.
+    if output_format == 0 {
+        output_format = FMT_PATCH;
+    }
+    // Everything below asks only whether the diff-of-diffs body is written.
+    opts.no_patch = output_format & FMT_PATCH == 0;
     // The three pickaxe refusals, in `diff_setup_done()`'s own order
     // (diff.c:5263-5273), each a `HAS_MULTI_BITS` test on `pickaxe_opts`.
     for (mask, message) in [
@@ -1421,8 +1611,8 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
     // first; a range naming an unknown revision is fatal before any patch is
     // read, and `git log`'s -1 return becomes exit status 255.
     let mut ends1 = match endpoints(&repo, &range1) {
-        Ok(e) => e,
-        Err(_) => return Ok(could_not_parse_log(&range1)),
+        Ok(e) => walkable(&repo, e),
+        Err(_) => return Ok(could_not_parse_log(&repo, &range1)),
     };
     // The inner `git log` takes the range first and the forwarded `log_arg`
     // after it (`range-diff.c` `read_patches()`), so a range it cannot resolve
@@ -1443,8 +1633,8 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
         Err(code) => return Ok(code),
     };
     let mut ends2 = match endpoints(&repo, &range2) {
-        Ok(e) => e,
-        Err(_) => return Ok(could_not_parse_log(&range2)),
+        Ok(e) => walkable(&repo, e),
+        Err(_) => return Ok(could_not_parse_log(&repo, &range2)),
     };
 
     // The one `log_arg` list is appended to *both* logs, so a revision operand
@@ -1479,14 +1669,35 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
     // table to `diffopt` (builtin/range-diff.c:83) and only `--notes`,
     // `--diff-merges` and `--remerge-diff` are `OPT_PASSTHRU_ARGV` into the
     // inner `git log`. That outer diff is reached from exactly one place,
-    // `patch_diff()`, which `output()` calls only for a *matched* pair and only
-    // when the format is not `DIFF_FORMAT_NO_OUTPUT` (range-diff.c:567-573). So
-    // when no pair matched — or `-s` suppressed the bodies — not one byte of the
-    // page can depend on the option, and it is emitted exactly as upstream emits
-    // it. Otherwise stop rather than print a diff-of-diffs that ignored it.
-    let renders_a_body = !opts.no_patch && b.iter().any(|p| p.matching >= 0);
+    // `patch_diff()`, which `output()` calls only for a *matched* pair
+    // (range-diff.c:567-573). So when no pair matched, not one byte of the page
+    // can depend on the option, and it is emitted exactly as upstream emits it.
+    //
+    // For a pair that did match, the question is whether `diff_flush()` writes
+    // anything the option could show through. Two ways it does not:
+    //
+    // * `output_format` asks for nothing this port leaves unrendered — the
+    //   `DIFF_FORMAT_PATCH` default, or `DIFF_FORMAT_NO_OUTPUT` from `-s` /
+    //   `--quiet`. See [`format_writes`] for the formats that write and the
+    //   three that provably never do.
+    // * The two patch texts are byte-identical — the `=` pair
+    //   `strcmp(a_util->patch, b_util->patch)` reports (range-diff.c:429).
+    //   `patch_diff()` still runs, but the filepair it queues has nothing to
+    //   report, so the patch itself is empty and so is the stat.
+    //
+    // Otherwise stop rather than print a diff-of-diffs that ignored the option.
+    let observable = b.iter().any(|p| {
+        if p.matching < 0 {
+            return false;
+        }
+        let diff_is_empty = a[p.matching as usize].text == p.text;
+        // The patch body is this port's own output, so it shows a deferred
+        // option only when there is a body to show it in.
+        (output_format & FMT_PATCH != 0 && !diff_is_empty)
+            || format_writes(output_format, dirstat_by_line, diff_is_empty)
+    });
     if let Some(reason) = &opts.deferred {
-        if renders_a_body {
+        if observable {
             crate::git_fatal!("{reason}");
         }
     }
@@ -1565,12 +1776,12 @@ pub(super) fn show_range_diff(
         colors: diff_color::DiffColors::disabled(),
     };
     let ends1 = match endpoints(repo, range1) {
-        Ok(e) => e,
-        Err(_) => return Ok(Err(could_not_parse_log(range1))),
+        Ok(e) => walkable(repo, e),
+        Err(_) => return Ok(Err(could_not_parse_log(repo, range1))),
     };
     let ends2 = match endpoints(repo, range2) {
-        Ok(e) => e,
-        Err(_) => return Ok(Err(could_not_parse_log(range2))),
+        Ok(e) => walkable(repo, e),
+        Err(_) => return Ok(Err(could_not_parse_log(repo, range2))),
     };
 
     let mailmap = repo.open_mailmap();
@@ -1586,6 +1797,21 @@ pub(super) fn show_range_diff(
     Ok(Ok(()))
 }
 
+/// `prepare_revision_walk()`'s `handle_commit()` pass over a range's pending
+/// objects: tags are peeled and trees and blobs are dropped without a word,
+/// because the inner `git log` has neither `tree_objects` nor `blob_objects` set.
+///
+/// It is deliberately not folded into [`endpoints`]: `is_range_diff_range()`
+/// counts `revs.pending.nr` *before* this runs, so a `<tree>..<tip>` operand is
+/// still a range with one positive and one negative object even though the walk
+/// will go on to ignore the tree.
+fn walkable(repo: &gix::Repository, ends: (Vec<ObjectId>, Vec<ObjectId>)) -> (Vec<ObjectId>, Vec<ObjectId>) {
+    let keep = |ids: Vec<ObjectId>| -> Vec<ObjectId> {
+        ids.into_iter().filter_map(|id| crate::objname::walk_pending(repo, id)).collect()
+    };
+    (keep(ends.0), keep(ends.1))
+}
+
 /// Upstream's `usage_msg_opt()`: the reason, a blank line, the synopsis, 129.
 fn usage_error(reason: &str) -> ExitCode {
     eprintln!("fatal: {reason}\n");
@@ -1596,12 +1822,15 @@ fn usage_error(reason: &str) -> ExitCode {
 /// What `git log <range>` prints when an endpoint names nothing, followed by
 /// `builtin/range-diff.c`'s own `error()`. `git log`'s failure is upstream's
 /// exit status 255.
-fn could_not_parse_log(range: &str) -> ExitCode {
-    eprintln!(
-        "fatal: ambiguous argument '{range}': unknown revision or path not in the working tree."
-    );
-    eprintln!("Use '--' to separate paths from revisions, like this:");
-    eprintln!("'git <command> [<revision>...] -- [<file>...]'");
+///
+/// The message is `log`'s own, so it comes from the shared
+/// [`super::log::bad_revision_message_in`] rather than being spelled out here:
+/// an endpoint that is a full-length hex the repository does not have resolves
+/// (see [`crate::objname`]) and reaches `dotdot_missing()`, which names the
+/// whole range as `Invalid revision range <a>..<b>` instead of giving the
+/// `ambiguous argument` advice.
+fn could_not_parse_log(repo: &gix::Repository, range: &str) -> ExitCode {
+    eprint!("{}", super::log::bad_revision_message_in(repo, range));
     log_parse_failed(range)
 }
 
@@ -1753,6 +1982,95 @@ fn git_parse_unsigned(value: &str, max: u64) -> Result<u64, MagnitudeError> {
     }
 }
 
+/// Port of `git_parse_signed()` (`parse.c`) as `OPTION_INTEGER` reaches it: a
+/// signed integer with an optional k/m/g suffix, range-checked against
+/// `[min, max]`.
+///
+/// The C is `strtoimax(value, &end, 0)` — leading whitespace skipped, an
+/// optional sign, then base 16 for a `0x` prefix, base 8 for a leading `0` and
+/// base 10 otherwise — followed by `parse_unit_factor(end, &factor)` on whatever
+/// is left, so a trailing space is malformed while a leading one is not, and
+/// `0x10` is 16 while `09` is not a number at all. An overflow of `intmax_t`, an
+/// overflowing multiply by the unit factor, and a product outside the option's
+/// own bounds are all `ERANGE`, which parse-options reports as the same
+/// `value <v> for option … not in range [<min>,<max>]`.
+///
+/// Unlike [`git_parse_unsigned`] a `-` is not rejected up front: it is the sign
+/// `strtoimax` accepts, so `--creation-factor=-1k` is -1024.
+fn git_parse_signed(value: &str, min: i64, max: i64) -> Result<i64, MagnitudeError> {
+    let bytes = value.as_bytes();
+
+    // `strtoimax(value, &end, 0)`: skip leading isspace, take an optional sign,
+    // then pick the base from a `0x`/`0` prefix.
+    let mut i = 0;
+    while i < bytes.len() && matches!(bytes[i], b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r') {
+        i += 1;
+    }
+    let negative = match bytes.get(i) {
+        Some(b'-') => {
+            i += 1;
+            true
+        }
+        Some(b'+') => {
+            i += 1;
+            false
+        }
+        _ => false,
+    };
+    let (base, digits_start): (i128, usize) = if bytes.get(i) == Some(&b'0') {
+        if bytes.get(i + 1).is_some_and(|&b| b == b'x' || b == b'X')
+            && bytes.get(i + 2).is_some_and(u8::is_ascii_hexdigit)
+        {
+            (16, i + 2)
+        } else {
+            // A leading `0` is octal; the `0` itself is a valid octal digit, so
+            // a bare `0` parses as zero.
+            (8, i)
+        }
+    } else {
+        (10, i)
+    };
+
+    let mut end = digits_start;
+    // Accumulated as a magnitude so that `i64::MIN` is representable, and in
+    // `i128` so the `ERANGE` test is a comparison rather than a wrapping add.
+    let mut magnitude: i128 = 0;
+    let mut overflow = false;
+    while end < bytes.len() {
+        let digit = i128::from(match bytes[end] {
+            b'0'..=b'9' => bytes[end] - b'0',
+            b'a'..=b'f' => bytes[end] - b'a' + 10,
+            b'A'..=b'F' => bytes[end] - b'A' + 10,
+            _ => break,
+        });
+        if digit >= base {
+            break;
+        }
+        magnitude = magnitude * base + digit;
+        if magnitude > i128::from(i64::MAX) + 1 {
+            overflow = true;
+            magnitude = i128::from(i64::MAX) + 1;
+        }
+        end += 1;
+    }
+    // `if (end == value)` — no digits at all is malformed.
+    if end == digits_start {
+        return Err(MagnitudeError::Invalid);
+    }
+    // `strtoimax` sets `ERANGE` outside `[INTMAX_MIN, INTMAX_MAX]`.
+    let signed = if negative { -magnitude } else { magnitude };
+    if overflow || signed > i128::from(i64::MAX) || signed < i128::from(i64::MIN) {
+        return Err(MagnitudeError::Range);
+    }
+
+    let factor = i128::from(get_unit_factor(&bytes[end..]).ok_or(MagnitudeError::Invalid)?);
+    let product = signed * factor;
+    if product < i128::from(min) || product > i128::from(max) {
+        return Err(MagnitudeError::Range);
+    }
+    Ok(product as i64)
+}
+
 
 /// `find_unique_abbrev()`: the abbreviated id printed in a pair header. With no
 /// `--abbrev`/`--no-abbrev`, gitoxide's `shorten()` applies `core.abbrev` (the 7
@@ -1849,10 +2167,10 @@ fn classify(
         true
     } else if dash_dash.is_none() && argc > 1 {
         match is_range_diff_range(repo, &pos[0]) {
-            RangeKind::Bad => return Err(bad_revision(&pos[0])),
+            RangeKind::Bad => return Err(bad_revision(repo, &pos[0])),
             RangeKind::NotRange => false,
             RangeKind::Range => match is_range_diff_range(repo, &pos[1]) {
-                RangeKind::Bad => return Err(bad_revision(&pos[1])),
+                RangeKind::Bad => return Err(bad_revision(repo, &pos[1])),
                 RangeKind::NotRange => false,
                 RangeKind::Range => true,
             },
@@ -1864,7 +2182,7 @@ fn classify(
         if dash_dash.is_some() {
             for token in &pos[..2] {
                 match is_range_diff_range(repo, token) {
-                    RangeKind::Bad => return Err(bad_revision(token)),
+                    RangeKind::Bad => return Err(bad_revision(repo, token)),
                     RangeKind::NotRange => {
                         return Err(usage_error(&format!("not a commit range: '{token}'")))
                     }
@@ -1933,10 +2251,26 @@ fn is_range_diff_range(repo: &gix::Repository, spec: &str) -> RangeKind {
     }
 }
 
-/// Upstream's fatal `bad revision '<spec>'`, exit 128: what `setup_revisions()`
-/// prints (via `is_range_diff_range()`, or the inner `git log`) when a token
-/// resolves to neither a revision nor an unambiguous path.
-fn bad_revision(spec: &str) -> ExitCode {
+/// Upstream's fatal, exit 128, for a token `is_range_diff_range()` could not
+/// turn into a range.
+///
+/// `is_range_diff_range()` hands `setup_revisions()` an argument vector that
+/// ends in a literal `--` (range-diff.c), and `setup_revisions()` scans the
+/// whole vector for one before it resolves anything — so `seen_dashdash` is
+/// already set when a token fails, and the ending is
+/// `die(_("bad revision '%s'"), arg)` rather than `verify_filename()`'s
+/// `ambiguous argument` advice.
+///
+/// The exception is a range whose endpoints *resolve* but whose objects are not
+/// in the database: `handle_dotdot_1()` dies inside `setup_revisions()` before
+/// that block is reached, naming the whole token (see [`crate::objname::dotdot`]).
+/// A full-length hex is exactly the name that gets that far, since
+/// `get_oid_basic()` decodes it without consulting the object database.
+fn bad_revision(repo: &gix::Repository, spec: &str) -> ExitCode {
+    if let Some(fatal) = objname::dotdot_fatal(repo, spec) {
+        eprint!("{fatal}");
+        return ExitCode::from(128);
+    }
     eprintln!("fatal: bad revision '{spec}'");
     ExitCode::from(128)
 }
@@ -2045,21 +2379,33 @@ fn resolve_commit(repo: &gix::Repository, spec: &str) -> Result<ObjectId> {
 /// it as a range and the walk can traverse it. An unresolvable spec is an
 /// error, which upstream reports as a `git log` failure.
 fn endpoints(repo: &gix::Repository, spec: &str) -> Result<(Vec<ObjectId>, Vec<ObjectId>)> {
-    let or_head = |s: &str| if s.is_empty() { "HEAD" } else { s }.to_string();
-    if let Some(dots) = spec.find("...") {
-        let left = resolve_commit(repo, &or_head(&spec[..dots]))?;
-        let right = resolve_commit(repo, &or_head(&spec[dots + 3..]))?;
-        let bases: Vec<ObjectId> = repo
-            .merge_bases_many(left, &[right])?
-            .into_iter()
-            .map(|id| id.detach())
-            .collect();
-        return Ok((vec![left, right], bases));
-    }
-    if let Some(dots) = spec.find("..") {
-        let left = resolve_commit(repo, &or_head(&spec[..dots]))?;
-        let right = resolve_commit(repo, &or_head(&spec[dots + 2..]))?;
-        return Ok((vec![right], vec![left]));
+    // The two `..` spellings are `handle_dotdot_1()`'s, so ask
+    // [`crate::objname`] rather than re-deriving them. What comes back is the
+    // *pending* object of each endpoint, of whatever type — only the symmetric
+    // form type-checks — because `is_range_diff_range()` counts
+    // `revs.pending.nr` before `prepare_revision_walk()` has dropped anything,
+    // and [`walkable`] is what applies the drop for the callers that walk.
+    match crate::objname::dotdot(repo, spec) {
+        crate::objname::Dotdot::Ok { a, b } => {
+            let symmetric = crate::objname::split_range(spec)
+                .expect("a resolved range has a separator")
+                .symmetric;
+            if !symmetric {
+                return Ok((vec![b], vec![a]));
+            }
+            let bases: Vec<ObjectId> =
+                repo.merge_bases_many(a, &[b])?.into_iter().map(|id| id.detach()).collect();
+            return Ok((vec![a, b], bases));
+        }
+        // `dotdot_missing()`: the caller reports it through
+        // `could_not_parse_log()`, which renders the same fatal `git log` would.
+        crate::objname::Dotdot::Missing { .. } => {
+            return Err(anyhow!("{spec}: {}", crate::objname::dotdot_missing_message(spec, false)))
+        }
+        // `handle_dotdot()` returned non-zero, so the token is not a range at
+        // all and the spellings below get their turn — exactly as
+        // `handle_revision_arg_1()` falls through.
+        crate::objname::Dotdot::NotARange => {}
     }
 
     // No literal `..`/`...`: defer to rev-parse, which recognises `^!`, `^@`,
@@ -2704,6 +3050,22 @@ impl ConsumeHunk for LineCounter {
     }
 }
 
+/// `a_util->diffsize * creation_factor / 100` (range-diff.c:391, 401), the price
+/// of leaving a patch unmatched.
+///
+/// Upstream's `diffsize`, `creation_factor` and the whole `cost` matrix are
+/// `int`, so the multiply is a 32-bit one and a large `--creation-factor` wraps
+/// — `--creation-factor=2147483647` against a diffsize of 9 does not make
+/// creation prohibitively expensive, it makes it *cheap*, and every patch is
+/// reported as a deletion plus a creation. This port carries the costs as `i64`
+/// (the matrix is a `Vec`, so there is no overflow to fear elsewhere), which is
+/// why the truncation has to be reapplied here to keep the pairing identical.
+/// `--creation-factor` is range-checked to `int` at parse time, and `diffsize`
+/// is capped at `COST_MAX`, so only the product can leave the type.
+fn creation_cost(diffsize: i64, creation_factor: i64) -> i64 {
+    i64::from((diffsize as i32).wrapping_mul(creation_factor as i32) / 100)
+}
+
 /// Build and solve the cost matrix, recording the resulting correspondences.
 ///
 /// `Err` is upstream's `die()` when the matrix would outgrow `max_memory`
@@ -2744,7 +3106,7 @@ fn get_correspondences(
             };
         }
         let c = if a[i].matching < 0 {
-            a[i].diffsize * creation_factor / 100
+            creation_cost(a[i].diffsize, creation_factor)
         } else {
             COST_MAX
         };
@@ -2755,7 +3117,7 @@ fn get_correspondences(
 
     for j in 0..b.len() {
         let c = if b[j].matching < 0 {
-            b[j].diffsize * creation_factor / 100
+            creation_cost(b[j].diffsize, creation_factor)
         } else {
             COST_MAX
         };

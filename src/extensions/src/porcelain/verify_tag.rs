@@ -218,14 +218,17 @@ fn verify_one(
     format: Option<&[Token]>,
     min_trust: u8,
 ) -> Result<bool> {
-    let Ok(id) = repo.rev_parse_single(name) else {
+    // `repo_get_oid` is `get_oid_basic()`: a full-length hex name *is* the id,
+    // decoded without consulting the odb, so an absent-but-well-formed name
+    // reaches `gpg_verify_tag` and fails there, not here.
+    let Some(id) = crate::objname::resolve(repo, name) else {
         eprintln!("error: tag '{name}' not found.");
         return Ok(false);
     };
 
     // git asks `oid_object_info` for the type first; a missing object yields no
     // type name at all, which its `error()` renders as `(null)`.
-    let Ok(object) = repo.find_object(id.detach()) else {
+    let Ok(object) = repo.find_object(id) else {
         eprintln!("error: {name}: cannot verify a non-tag object of type (null).");
         return Ok(false);
     };

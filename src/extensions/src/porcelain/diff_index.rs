@@ -1279,11 +1279,19 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
                 return Ok(ExitCode::from(128));
             }
             paths.push(arg.as_str().into());
-        } else if let Ok(id) = repo.rev_parse_single(arg.as_str()) {
+        } else if let Some(id) = crate::objname::resolve(&repo, arg.as_str()) {
+            // `get_reference()`'s `die("bad object %s", name)`: a full-length hex
+            // resolves without the object database being asked (see
+            // [`crate::objname`]), so the name is good and the object is missing —
+            // which `setup_revisions()` reports before the operand count is looked at.
+            if repo.find_object(id).is_err() {
+                eprintln!("fatal: bad object {arg}");
+                return Ok(ExitCode::from(128));
+            }
             pending += 1;
             if spec.is_none() {
                 spec = Some(arg.clone());
-                resolved = Some(id.detach());
+                resolved = Some(id);
             }
         } else if std::fs::symlink_metadata(arg).is_err() {
             eprintln!(

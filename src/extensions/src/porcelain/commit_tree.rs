@@ -24,6 +24,13 @@
 //! `assert_oid_type`. `commit-tree tag` / `-p tag` can therefore succeed here
 //! where stock git fails; every other spec form resolves identically.
 //!
+//! One ordering deviation, deliberate and not observable in stdout/stderr/exit:
+//! git checks the tree's *type* inside `commit_tree()`, i.e. after it has
+//! drained stdin for the message, whereas [`resolve`] checks it where the tree
+//! is resolved. Only the stdin drain differs; the same `fatal:` line and exit
+//! 128 follow either way. `-p`'s type check sits in `parse_options`' callback in
+//! git too, so that one is already in git's place.
+//!
 //! Exit codes follow git rather than the caller's generic failure path: usage
 //! errors exit 129, fatal errors 128, and a rejected message 1.
 
@@ -62,9 +69,17 @@ usage: git commit-tree <tree> [(-p <parent>)...]
 /// is updated, no reflog entry is made, the index and worktree are untouched.
 ///
 /// Argument handling mirrors `builtin/commit-tree.c`: options and the tree may
-/// appear in any order, `-p`/`-F` are resolved eagerly so failures surface in
-/// command-line order, and the tree is *not* peeled — a commit or tag given
-/// where a tree is expected is an error, just as `assert_oid_type` makes it one.
+/// appear in any order, `-p`/`-F` are resolved eagerly inside `parse_options`'
+/// callbacks so their failures surface in command-line order, and the tree is
+/// *not* peeled — a commit or tag given where a tree is expected is an error,
+/// just as `assert_oid_type` makes it one.
+///
+/// The tree itself is a *non-option* argument, which `parse_options` only
+/// collects: `argc != 1` and `repo_get_oid_tree()` run after the whole command
+/// line has been parsed. A bad option therefore outranks a bad tree however
+/// they are ordered — `commit-tree nosuchtree --bogus` is `error: unknown
+/// option` at 129, not `fatal: not a valid object name`, and two unresolvable
+/// trees are `must give exactly one tree` rather than a resolution failure.
 pub fn commit_tree(args: &[String]) -> Result<ExitCode> {
     // Dispatch passes the subcommand itself at index 0.
     let args = match args.first() {
@@ -91,7 +106,8 @@ pub fn commit_tree(args: &[String]) -> Result<ExitCode> {
     let mut message: Vec<u8> = Vec::new();
     let mut have_message = false;
     let mut parents: Vec<ObjectId> = Vec::new();
-    let mut trees: Vec<ObjectId> = Vec::new();
+    // Non-options, kept unresolved: `parse_options` only gathers them.
+    let mut trees: Vec<&str> = Vec::new();
     let mut sign = false;
     let mut no_more_opts = false;
 
@@ -101,10 +117,7 @@ pub fn commit_tree(args: &[String]) -> Result<ExitCode> {
 
         // A bare `-` is a positional to `parse_options`, not an option.
         if no_more_opts || a == "-" || !a.starts_with('-') {
-            match resolve(&repo, a, Kind::Tree, "tree") {
-                Ok(id) => trees.push(id),
-                Err(m) => return fatal(&m),
-            }
+            trees.push(a);
             i += 1;
             continue;
         }
@@ -229,7 +242,12 @@ pub fn commit_tree(args: &[String]) -> Result<ExitCode> {
     if trees.len() != 1 {
         return fatal("must give exactly one tree");
     }
-    let tree = trees[0];
+    // `repo_get_oid_tree(the_repository, argv[0], &tree_oid)` — after the whole
+    // command line parsed, so an option failure always reports before this one.
+    let tree = match resolve(&repo, trees[0], Kind::Tree, "tree") {
+        Ok(id) => id,
+        Err(m) => return fatal(&m),
+    };
 
     // With no -m and no -F the whole message is stdin, verbatim.
     if !have_message {
@@ -289,22 +307,36 @@ fn fatal(msg: &str) -> Result<ExitCode> {
 /// Resolve `spec` and require that it names an object of `kind`.
 ///
 /// This is `repo_get_oid_tree`/`repo_get_oid_commit` followed by
-/// `assert_oid_type`: the revision syntax does the peeling (`<rev>^{tree}`,
+/// `odb_assert_oid_type`: the revision syntax does the peeling (`<rev>^{tree}`,
 /// `<rev>:`), and an object of the wrong type is rejected rather than peeled.
 /// `Err` carries git's exact message text, without the `fatal: ` prefix.
+///
+/// The two steps report *different* failures, and conflating them was the bug
+/// here. `repo_get_oid_*` only fails when the name resolves to nothing, and a
+/// full-length hex id always resolves — `get_oid_basic()` decodes it and returns
+/// without asking the object database, which is what [`crate::objname::resolve`]
+/// reproduces. Whether that object exists is then `odb_assert_oid_type`'s
+/// question (odb.c:977):
+///
+/// ```c
+/// enum object_type type = odb_read_object_info(odb, oid, NULL);
+/// if (type < 0)
+///         die(_("%s is not a valid object"), oid_to_hex(oid));
+/// if (type != expect)
+///         die(_("%s is not a valid '%s' object"), oid_to_hex(oid), type_name(expect));
+/// ```
+///
+/// So a well-formed but absent id is `<oid> is not a valid object`, naming the
+/// *canonical hex* — not `not a valid object name <spec>`, which names the spec
+/// as typed and belongs to names that do not resolve at all.
 fn resolve(repo: &gix::Repository, spec: &str, kind: Kind, label: &str) -> Result<ObjectId, String> {
-    let id = repo
-        .rev_parse_single(spec)
-        .map_err(|_| format!("not a valid object name {spec}"))?
-        .detach();
-    let found = repo
-        .find_header(id)
-        .map_err(|_| format!("not a valid object name {spec}"))?
-        .kind();
-    if found != kind {
-        return Err(format!("{id} is not a valid '{label}' object"));
+    let id = crate::objname::resolve(repo, spec)
+        .ok_or_else(|| format!("not a valid object name {spec}"))?;
+    match repo.find_header(id) {
+        Err(_) => Err(format!("{id} is not a valid object")),
+        Ok(header) if header.kind() != kind => Err(format!("{id} is not a valid '{label}' object")),
+        Ok(_) => Ok(id),
     }
-    Ok(id)
 }
 
 /// Turn a configured identity into an owned signature, or explain what is missing.

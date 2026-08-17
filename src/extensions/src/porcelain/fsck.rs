@@ -302,6 +302,10 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
     // turns reflogs off, whether or not the argument resolved.
     let mut heads: Vec<ObjectId> = Vec::new();
     let mut default_refs = 0usize;
+    // Objects `snapshot_ref()`'s `parse_object()` has already parsed. A second
+    // parse of one of them is a no-op, which the object scan below has to know:
+    // see `creates_children` there.
+    let mut pre_parsed: HashSet<ObjectId> = HashSet::new();
     for arg in &opt.objects {
         // `repo_get_oid()` turns a full-length hex id into an object id without
         // consulting the odb, so an id that names nothing still reaches
@@ -322,7 +326,24 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
             }
             Some(id) => {
                 default_refs += 1;
+                // `snapshot_ref()` calls `parse_object()`, which creates the
+                // object and then parses it — and the parse creates the links it
+                // stores: `parse_commit_buffer()` its tree and every parent,
+                // `parse_tag_buffer()` the tagged object. A tree's entries are
+                // *not* created here; `parse_tree_buffer()` only keeps the
+                // buffer, and the entries are decoded later by the walk.
                 state.note(id);
+                if matches!(
+                    repo.find_header(id).map(|h| h.kind()),
+                    Ok(Kind::Commit) | Ok(Kind::Tag)
+                ) {
+                    if let Ok(Ok(parsed)) = decode(&repo, id) {
+                        for (child, _) in &parsed.children {
+                            state.note(*child);
+                        }
+                        pre_parsed.insert(id);
+                    }
+                }
                 heads.push(id);
             }
             None => {
@@ -346,12 +367,35 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
     let mut in_odb: HashSet<ObjectId> = HashSet::new();
     for id in repo.objects.iter()? {
         let id = id?;
-        state.note(id);
         // The odb iterator can yield the same id from more than one source.
         if in_odb.insert(id) {
             all.push(id);
         }
     }
+    // The gix iterator's order is its own; git's is `fsck_source()`'s, and that
+    // is what decides where two colliding ids land in `obj_hash`. Take only
+    // membership from the iterator and re-lay `all` in git's order whenever that
+    // order is reconstructible — see [`loose_scan_order`].
+    let scan_ordered = match loose_scan_order(&repo) {
+        Some(order) if order.len() == all.len() && order.iter().all(|id| in_odb.contains(id)) => {
+            all = order;
+            true
+        }
+        _ => false,
+    };
+    // `lookup_<type>()` is called in one long sequence over the whole command,
+    // and [`SlotOrder`] can only replay it when every caller is accounted for.
+    // That holds when the scan itself is in git's order, when the scan runs at
+    // all (`--connectivity-only` replaces it with a listing walk this port does
+    // not order), when an explicit `<object>` argument made `snapshot_refs()`
+    // return before touching the ref store and turned reflogs off — the
+    // ref-and-reflog snapshot is the one phase this port takes at git's
+    // *handling* point rather than git's *snapshotting* point — and when no
+    // linked worktree can put its index ahead of the main one under `--cache`.
+    let creation_modeled = scan_ordered
+        && !opt.connectivity_only
+        && explicit_heads
+        && repo.worktrees().map(|w| w.is_empty()).unwrap_or(true);
 
     // Children of every object, for `used` and `missing`. git checks every
     // object in the odb, not just the reachable ones, and marks each child it
@@ -382,6 +426,11 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
         eprintln!("Checking object directory");
     }
     for &id in &all {
+        // `mark_object_for_connectivity()` creates the object straight from the
+        // odb's file listing, before anything is read.
+        if opt.connectivity_only {
+            state.note(id);
+        }
         // `fsck_loose()` reads the object out of the odb first of all. Every
         // failure of that read is reported and stepped over.
         let (kind, data) = match read_for_fsck(&repo, id) {
@@ -403,6 +452,11 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
                 continue;
             }
         };
+        // The read succeeded, so `fsck_loose()` reaches `parse_object_buffer()`,
+        // whose `lookup_<type>()` creates the object *before* the parse — an
+        // object the parse then rejects still occupies a slot, one the read
+        // never produced does not.
+        state.note(id);
         // `fsck_loose()` parses before it does anything else, and skips
         // `fsck_obj()` — the verbose line included — when the parse fails.
         let decoded = match parse_object_buffer(id, kind, &data, repo.object_hash().len_in_hex()) {
@@ -429,12 +483,24 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
         if opt.verbose && !opt.connectivity_only {
             eprintln!("Checking {kind} {id}");
         }
+        // A commit's tree and parents, and a tag's tagged object, are created by
+        // `parse_commit_buffer()`/`parse_tag_buffer()` — and both return
+        // immediately once `object.parsed` is set, after which
+        // `fsck_walk_commit()`/`fsck_walk_tag()` only follow the pointers that
+        // first parse stored. So an `<object>` argument, which `snapshot_ref()`
+        // parsed before the scan started, has its links looked up here exactly
+        // never. A tree is the other way round: `parse_tree_buffer()` creates
+        // nothing and `fsck_walk_tree()` decodes the entries and looks every one
+        // of them up, on every run.
+        let creates_children = kind == Kind::Tree || !pre_parsed.contains(&id);
         for (child, _) in &decoded.children {
             // Absent children are `note`d all the same: `fsck_walk()` creates
             // them, so they occupy an `obj_hash` slot. They are not *reported*
             // here — `check_unreachable_object()` never prints `missing`, so an
             // object that only an unreachable object names stays quiet.
-            state.note(*child);
+            if creates_children {
+                state.note(*child);
+            }
             state.used.insert(*child);
         }
         // `--root` and `--tags` lines are emitted by `fsck_obj()`, which
@@ -518,7 +584,7 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
     // it, which `fsck_walk()` turns into a `lookup_*()` and so into a slot.
     for id in &corrupt {
         if !state.used.contains(id) {
-            state.known.remove(id);
+            state.forget(id);
         }
     }
 
@@ -604,6 +670,23 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
         errors |= verify_packs(&repo);
     }
 
+    // ---- 3c. `process_refs()`: the snapshot, handled ------------------------
+    //
+    // `cmd_fsck` takes the head snapshot *before* the object scan and only acts
+    // on it here, and `fsck_handle_ref()` opens with another `parse_object()`.
+    // For an id the scan has already created that is a plain `lookup_object()`,
+    // which moves it back to its home slot — so the call has to be replayed even
+    // though it changes nothing about the head set.
+    //
+    // Only the explicit-`<object>` snapshot is replayed: the ref/reflog snapshot
+    // is taken below, at the point git *handles* it rather than the point git
+    // takes it, and `creation_modeled` is off for that case.
+    if explicit_heads {
+        for id in heads.clone() {
+            state.note(id);
+        }
+    }
+
     // ---- 4. the head set ----------------------------------------------------
     if !explicit_heads {
         default_refs += collect_default_heads(&repo, &mut state, &mut heads, &mut errors)?;
@@ -687,6 +770,15 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
             }
         };
         for (child, child_kind) in decoded.children {
+            // `fsck_walk_tree()` resolves every entry through `lookup_tree()` /
+            // `lookup_blob()`, and a lookup moves a displaced object back to its
+            // home slot, so the call has to be replayed here as well as in the
+            // scan. `fsck_walk_commit()` and `fsck_walk_tag()` follow pointers
+            // `parse_object()` already stored and look nothing up, which is why
+            // only a tree's children are recorded.
+            if kind == Kind::Tree {
+                state.note(child);
+            }
             // A corrupt object never got `HAS_OBJ`, so `check_reachable_object()`
             // prints `missing` for it with the type the reference site expected.
             if corrupt.contains(&child) || !repo.has_object(child) {
@@ -758,7 +850,10 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
         }
     }
 
-    let order = SlotOrder::new(&state.known);
+    let order = SlotOrder::new(
+        &state.known,
+        creation_modeled.then_some(state.ops.as_slice()),
+    );
     let reported: Vec<ObjectId> = lines.iter().map(|(id, _)| *id).collect();
     if order.is_ambiguous_for(&reported) {
         anyhow::bail!(
@@ -768,7 +863,7 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
             lines.len()
         );
     }
-    lines.sort_by_key(|(id, _)| order.home_of(id));
+    lines.sort_by_key(|(id, _)| order.slot_of(id));
 
     if opt.verbose {
         // `check_connectivity()` announces `get_max_object_index()`, which is the
@@ -779,7 +874,7 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
             obj_hash_size(state.known.len())
         );
         let mut walked: Vec<ObjectId> = state.known.iter().copied().collect();
-        walked.sort_by_key(|id| (order.home_of(id), *id));
+        walked.sort_by_key(|id| (order.slot_of(id), *id));
         for id in walked {
             eprintln!("Checking {id}");
         }
@@ -1068,6 +1163,14 @@ struct State {
     /// Every object id git's `obj_hash` would hold: present objects plus every
     /// id merely referenced by one. Drives the output ordering.
     known: HashSet<ObjectId>,
+    /// Every `lookup_<type>()` git would call, in call order.
+    ///
+    /// The creation sequence alone does not decide `obj_hash`: `lookup_object()`
+    /// moves a hit back to the slot the probe started at, so a *lookup* of an
+    /// already-created object reorders the table too. Both kinds of call go
+    /// through the same `lookup_<type>()` front door, so one entry per call is
+    /// enough to replay the table exactly — see [`replay_obj_hash`].
+    ops: Vec<ObjectId>,
     /// Objects referenced by some other object — the complement of `dangling`.
     used: HashSet<ObjectId>,
     /// Objects reachable from the head set.
@@ -1079,9 +1182,20 @@ struct State {
 }
 
 impl State {
-    /// Record `id` as an object git would have created. Returns whether it is new.
+    /// Record one `lookup_<type>(id)` — which creates `id` when it is new and
+    /// otherwise finds it. Returns whether it is new.
     fn note(&mut self, id: ObjectId) -> bool {
+        self.ops.push(id);
         self.known.insert(id)
+    }
+
+    /// Undo every [`note`](Self::note) of `id` — for an id git turns out never
+    /// to have looked up at all. Keeps `ops` in step with `known`, which the
+    /// slot replay depends on.
+    fn forget(&mut self, id: &ObjectId) {
+        if self.known.remove(id) {
+            self.ops.retain(|c| c != id);
+        }
     }
 }
 
@@ -1472,7 +1586,11 @@ fn collect_cache_tree(
 }
 
 /// Append every reflog file below `dir` to `out` as a `/`-joined ref name.
-fn collect_log_names(dir: &Path, prefix: &str, out: &mut Vec<String>) -> Result<()> {
+///
+/// Unsorted and pre-order, which is what git's `dir_iterator_begin(path, 0)`
+/// hands `for_each_reflog()`. Shared with [`super::shortlog`], whose `--reflog`
+/// walks the same directory through the same iterator.
+pub(super) fn collect_log_names(dir: &Path, prefix: &str, out: &mut Vec<String>) -> Result<()> {
     let read = match std::fs::read_dir(dir) {
         Ok(read) => read,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -2103,7 +2221,18 @@ fn progress_block(label: &str, total: u64) {
 }
 
 /// git's `obj_hash` table, reconstructed far enough to order the report.
+///
+/// Two reconstructions live here. The exact one replays git's own
+/// `lookup_<type>()` call sequence — creations, growth, rehashing and
+/// `lookup_object()`'s move-to-front alike — and so knows the slot every object
+/// actually landed in. It is only available when that sequence is reproducible
+/// (see `creation_modeled` in [`fsck`]); without it the weaker home-slot
+/// argument applies, which orders every object whose cluster holds no repeated
+/// home slot and refuses the rest.
 struct SlotOrder {
+    /// The slot each object landed in, from the replay above. `None` when the
+    /// call sequence was not reproducible.
+    placed: Option<HashMap<ObjectId, usize>>,
     home: HashMap<ObjectId, usize>,
     /// Cluster id per slot; `usize::MAX` for an empty slot. A cluster is a
     /// maximal run of occupied slots, and its extent does not depend on
@@ -2118,8 +2247,16 @@ struct SlotOrder {
 }
 
 impl SlotOrder {
-    fn new(known: &HashSet<ObjectId>) -> Self {
+    /// `ops` is git's `lookup_<type>()` call sequence when this port can
+    /// reproduce it, and `None` when it cannot.
+    fn new(known: &HashSet<ObjectId>, ops: Option<&[ObjectId]>) -> Self {
         let size = obj_hash_size(known.len());
+        // A log that does not account for every object would place the rest
+        // wrongly rather than not at all, so take the replay only when the table
+        // it produces is exactly `known`.
+        let placed = ops
+            .map(replay_obj_hash)
+            .filter(|table| table.len() == known.len() && known.iter().all(|id| table.contains_key(id)));
         let mut ids: Vec<&ObjectId> = known.iter().collect();
         ids.sort();
 
@@ -2173,6 +2310,7 @@ impl SlotOrder {
         }
 
         Self {
+            placed,
             home,
             cluster,
             ambiguous,
@@ -2180,14 +2318,23 @@ impl SlotOrder {
         }
     }
 
-    fn home_of(&self, id: &ObjectId) -> usize {
-        self.home[id]
+    /// Where `id` sits in `obj_hash`, which is the order `check_connectivity()`
+    /// walks the table in and so the order the report is printed in.
+    fn slot_of(&self, id: &ObjectId) -> usize {
+        match &self.placed {
+            Some(placed) => placed[id],
+            None => self.home[id],
+        }
     }
 
     /// Whether the relative order of `reported` could differ from home-slot
     /// order. Two objects can only swap if they share a cluster, and only if
     /// that cluster has a repeated home slot for insertion order to exploit.
     fn is_ambiguous_for(&self, reported: &[ObjectId]) -> bool {
+        // The replay knows every slot outright, so nothing is left to guess.
+        if self.placed.is_some() {
+            return false;
+        }
         if reported.len() < 2 {
             return false;
         }
@@ -2206,6 +2353,125 @@ impl SlotOrder {
         }
         false
     }
+}
+
+/// `object.c`'s `obj_hash` over `ops`, yielding the slot each object ends up in.
+///
+/// Every `lookup_<type>()` goes through `lookup_object()` first and only calls
+/// `create_object()` when that misses, so one pass over the call log reproduces
+/// both halves:
+///
+/// * `lookup_object()` probes from the home slot to the first empty one and, on
+///   a hit away from home, **swaps the hit back to the home slot**. That is not
+///   a cache detail — it is a visible reordering of the table
+///   `check_connectivity()` later walks, and it is why the creation sequence on
+///   its own is not enough.
+/// * `create_object()` grows first when `obj_hash_size - 1 <= nr_objs * 2` —
+///   `grow_object_hash()` re-inserts the old table in *slot* order, not creation
+///   order — then places the object with `insert_obj_hash()`'s linear probe.
+fn replay_obj_hash(ops: &[ObjectId]) -> HashMap<ObjectId, usize> {
+    let mut table: Vec<Option<ObjectId>> = Vec::new();
+    let mut nr: i64 = 0;
+    for &id in ops {
+        if let Some(found) = probe_find(&table, &id) {
+            let home = slot(&id, table.len());
+            if found != home {
+                table.swap(found, home);
+            }
+            continue;
+        }
+        if table.len() as i64 - 1 <= nr * 2 {
+            let grown = if table.len() < 32 { 32 } else { table.len() * 2 };
+            let old = std::mem::replace(&mut table, vec![None; grown]);
+            for existing in old.into_iter().flatten() {
+                probe_insert(&mut table, existing);
+            }
+        }
+        probe_insert(&mut table, id);
+        nr += 1;
+    }
+    table
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, cell)| cell.map(|id| (id, i)))
+        .collect()
+}
+
+/// `object.c::lookup_object`'s probe, without the move-to-front the caller
+/// applies: the home slot, then on to the first empty one, wrapping at the end.
+/// `None` when the table is empty or the probe reaches a free slot.
+fn probe_find(table: &[Option<ObjectId>], id: &ObjectId) -> Option<usize> {
+    let size = table.len();
+    if size == 0 {
+        return None;
+    }
+    let mut i = slot(id, size);
+    while let Some(here) = table[i] {
+        if here == *id {
+            return Some(i);
+        }
+        i += 1;
+        if i == size {
+            i = 0;
+        }
+    }
+    None
+}
+
+/// `object.c::insert_obj_hash` — the home slot, then the next free one, wrapping
+/// at the end of the table.
+fn probe_insert(table: &mut [Option<ObjectId>], id: ObjectId) {
+    let size = table.len();
+    let mut j = slot(&id, size);
+    while table[j].is_some() {
+        j += 1;
+        if j >= size {
+            j = 0;
+        }
+    }
+    table[j] = Some(id);
+}
+
+/// The order `fsck_source()` visits the odb in: every source (the main object
+/// directory then each alternate), each walked by
+/// `for_each_loose_file_in_source()` — the 256 `.git/objects/??` subdirectories
+/// in numeric order, and the entries within one of them in raw `readdir()`
+/// order, which `std::fs::read_dir` is the same system call for.
+///
+/// `None` when the odb holds a pack: `check_full` re-runs `fsck_obj()` over
+/// packed objects through `verify_pack()` after the loose walk, in an order this
+/// port does not model.
+fn loose_scan_order(repo: &gix::Repository) -> Option<Vec<ObjectId>> {
+    if has_packs(repo) {
+        return None;
+    }
+    let hexsz = repo.object_hash().len_in_hex();
+    let mut seen: HashSet<ObjectId> = HashSet::new();
+    let mut out: Vec<ObjectId> = Vec::new();
+    for objdir in odb_sources(repo) {
+        for sub in 0u16..=0xff {
+            let dir = objdir.join(format!("{sub:02x}"));
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name = name.as_bytes();
+                if name.len() != hexsz - 2 {
+                    continue;
+                }
+                let mut hex = format!("{sub:02x}").into_bytes();
+                hex.extend_from_slice(name);
+                let Ok(id) = ObjectId::from_hex(&hex) else {
+                    continue;
+                };
+                if seen.insert(id) {
+                    out.push(id);
+                }
+            }
+        }
+    }
+    Some(out)
 }
 
 /// The size `obj_hash` ends at after `n` objects have been created, replaying

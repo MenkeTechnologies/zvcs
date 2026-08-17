@@ -603,24 +603,38 @@ pub fn tag(args: &[String]) -> Result<ExitCode> {
         return delete_tags(&repo, &positionals);
     }
 
-    // Resolve the listing filters now that the object database is open.
+    // Resolve the listing filters now that the object database is open. Each
+    // option keeps its own `parse_options()` callback's diagnostic and status:
+    // `--points-at` is `parse_opt_object_name` (no odb lookup at all, so an
+    // absent id is a filter that matches nothing), `--contains`/`--no-contains`
+    // are `parse_opt_commits`, and `--merged`/`--no-merged` are
+    // `parse_opt_merge_filter`, whose unresolvable-name case is a `die()`.
     let mut filters = Filters::default();
     if let Some(spec) = &points_at {
-        match resolve_object(&repo, spec) {
-            Some(id) => filters.points_at = Some(id),
-            None => return malformed(spec),
+        match crate::objname::parse_opt_object_name(&repo, spec) {
+            Ok(id) => filters.points_at = Some(id),
+            Err(e) => return Ok(e.report()),
         }
     }
     for (raw, slot) in [
         (&contains, &mut filters.contains),
         (&no_contains, &mut filters.no_contains),
-        (&merged, &mut filters.merged),
-        (&no_merged, &mut filters.no_merged),
     ] {
         if let Some(spec) = raw {
-            match resolve_commit(&repo, spec) {
-                Some(id) => *slot = Some(id),
-                None => return malformed(spec),
+            match crate::objname::parse_opt_commits(&repo, spec) {
+                Ok(id) => *slot = Some(id),
+                Err(e) => return Ok(e.report()),
+            }
+        }
+    }
+    for (raw, slot, long_name) in [
+        (&merged, &mut filters.merged, "merged"),
+        (&no_merged, &mut filters.no_merged, "no-merged"),
+    ] {
+        if let Some(spec) = raw {
+            match crate::objname::parse_opt_merge_filter(&repo, spec, long_name) {
+                Ok(id) => *slot = Some(id),
+                Err(e) => return Ok(e.report()),
             }
         }
     }
@@ -1256,6 +1270,29 @@ fn passes_filters(repo: &gix::Repository, facts: &Facts, filters: &Filters) -> b
         }
     }
     let commit = tag_commit(facts);
+    // `filter_ref()` (`ref-filter.c`) discards a ref that does not peel to a
+    // commit *before* any reachability test, and does so for the whole family at
+    // once:
+    //
+    // ```c
+    // if (filter->reachable_from || filter->unreachable_from ||
+    //     filter->with_commit || filter->no_commit || filter->verbose) {
+    //         commit = lookup_commit_reference_gently(the_repository, ref->oid, 1);
+    //         if (!commit)
+    //                 return NULL;
+    // ```
+    //
+    // So a tag on a tree or a blob is absent from `--no-contains`/`--no-merged`
+    // output too, even though those read as "keep what does not match".
+    // `--points-at` is deliberately not in that list: it compares ids and keeps
+    // non-commit refs.
+    let reachability_asked =
+        [filters.contains, filters.no_contains, filters.merged, filters.no_merged]
+            .iter()
+            .any(Option::is_some);
+    if reachability_asked && commit.is_none() {
+        return false;
+    }
     if let Some(c) = filters.contains {
         match commit {
             Some(tc) if is_ancestor(repo, c, tc) => {}
@@ -1297,19 +1334,6 @@ fn is_ancestor(repo: &gix::Repository, ancestor: ObjectId, descendant: ObjectId)
     }
 }
 
-/// Resolve a filter operand to an object id, or `None` if it is not a valid name.
-fn resolve_object(repo: &gix::Repository, spec: &str) -> Option<ObjectId> {
-    repo.rev_parse_single(BStr::new(spec))
-        .ok()
-        .map(|o| o.detach())
-}
-
-/// Resolve a filter operand to the commit it names (peeling tags), or `None`.
-fn resolve_commit(repo: &gix::Repository, spec: &str) -> Option<ObjectId> {
-    let id = repo.rev_parse_single(BStr::new(spec)).ok()?.detach();
-    let peeled = repo.find_object(id).ok()?.peel_tags_to_end().ok()?;
-    (peeled.kind == Kind::Commit).then_some(peeled.id)
-}
 
 /// Expand a `--format` string for one tag, supporting `%(if)…%(then)…%(else)…%(end)`.
 ///
@@ -1839,10 +1863,13 @@ fn create_tag(
     let name = positionals[0];
     let spec = positionals.get(1).copied().unwrap_or("HEAD");
 
-    let Ok(target) = repo.rev_parse_single(BStr::new(spec)) else {
+    // `cmd_tag()` only dies with `Failed to resolve` when `repo_get_oid()` itself
+    // fails. A full-length hex name resolves without the odb being consulted, so
+    // an absent object gets all the way to the ref update and is refused there
+    // instead — see the `nonexistent object` check below.
+    let Some(target) = crate::objname::resolve(repo, spec) else {
         return fatal(&format!("Failed to resolve '{spec}' as a valid ref."));
     };
-    let target = target.detach();
 
     let ref_name = format!("refs/tags/{name}");
     if FullName::try_from(ref_name.as_str()).is_err() {
@@ -1876,6 +1903,12 @@ fn create_tag(
             Some("verbatim") => CleanupMode::Verbatim,
             Some(other) => return fatal(&format!("Invalid cleanup mode {other}")),
         };
+        // `create_tag()` opens with `odb_read_object_info()` and refuses anything
+        // it cannot type, which is the first thing an absent full-length hex name
+        // hits on the annotated path.
+        if repo.find_header(target).is_err() {
+            return fatal("bad object type.");
+        }
         let raw = match message_file {
             Some(path) => read_message_file(path)?,
             None if messages.is_empty() => {
@@ -1940,6 +1973,25 @@ fn create_tag(
     } else {
         target
     };
+
+    // `ref_transaction_update()` (`refs.c`) verifies the new value before the
+    // transaction is allowed to proceed:
+    //
+    // ```c
+    // struct object *o = parse_object(transaction->ref_store->repo, new_oid);
+    // if (!o) {
+    //         strbuf_addf(err, _("trying to write ref '%s' with nonexistent object %s"),
+    //                     refname, oid_to_hex(new_oid));
+    // ```
+    //
+    // and `cmd_tag()` turns that message straight into a `die()`. This is where a
+    // lightweight tag on a well-formed but absent object name lands; `gix`'s ref
+    // edit does not look the object up, so the check is made here.
+    if repo.find_header(new_id).is_err() {
+        return fatal(&format!(
+            "trying to write ref '{ref_name}' with nonexistent object {new_id}"
+        ));
+    }
 
     // git always computes a reflog message describing the *target* object (built
     // before the tag object exists), then writes the ref with `REF_FORCE_CREATE_REFLOG`
@@ -2194,12 +2246,6 @@ fn delete_tags(repo: &gix::Repository, positionals: &[&str]) -> Result<ExitCode>
 fn fatal(msg: &str) -> Result<ExitCode> {
     eprintln!("fatal: {msg}");
     Ok(ExitCode::from(128))
-}
-
-/// Report a bad filter object name the way git does, at its exit code 129.
-fn malformed(spec: &str) -> Result<ExitCode> {
-    eprintln!("error: malformed object name {spec}");
-    Ok(ExitCode::from(129))
 }
 
 /// Abbreviated hex for `id`, honoring the repo's shortening rules.

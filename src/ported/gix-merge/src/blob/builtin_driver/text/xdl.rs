@@ -11,7 +11,7 @@
 use bstr::BStr;
 use imara_diff::{Algorithm, Diff, InternedInput, Token};
 
-use crate::blob::builtin_driver::text::{ConflictStyle, Labels, Level};
+use crate::blob::builtin_driver::text::{Canonicalize, ConflictStyle, Labels, Level};
 
 /// `xdchange_t`, reduced to what `xdl_do_merge()` reads: the range of ancestor
 /// lines one side replaced (`i1`/`chg1`), and the range of that side's own
@@ -42,30 +42,80 @@ pub struct Region {
     pub chg2: i64,
 }
 
-/// The three token sequences a merge runs over, all interned into `input`'s
-/// interner so tokens compare equal exactly when their lines do.
+/// One `xdfenv_t`'s record array: the interned tokens that decide which records
+/// *match*, and the raw lines that get *written*.
+///
+/// git keeps both in one `xrecord_t` — `ptr`/`size` are the bytes, and
+/// `xdl_recmatch()` compares them under `xpp->flags`. Interning cannot express
+/// that in one array once a whitespace flag is on, because equal records then
+/// have unequal bytes, so the two live side by side here: `tokens[i]` answers
+/// "does this record match that one", `lines[i]` is what `xdl_recs_copy()`
+/// emits. With no whitespace flag the two agree line for line.
+#[derive(Copy, Clone)]
+pub struct Side<'a> {
+    pub tokens: &'a [Token],
+    pub lines: &'a [&'a [u8]],
+}
+
+impl<'a> Side<'a> {
+    /// The bytes of the `i`th line, terminator included — `recs[i]->ptr`.
+    fn line(&self, i: i64) -> &'a [u8] {
+        self.lines[i as usize]
+    }
+
+    /// `xdf->nrec`.
+    fn len(&self) -> i64 {
+        self.tokens.len() as i64
+    }
+}
+
+/// The three record arrays a merge runs over.
 ///
 /// This is the pair of `xdfenv_t` the C passes around: `ancestor` is the
 /// `xdf1` both sides share, `ours` is `xe1->xdf2` and `theirs` is `xe2->xdf2`.
 #[derive(Copy, Clone)]
 pub struct Files<'a> {
-    pub input: &'a InternedInput<&'a [u8]>,
-    pub ancestor: &'a [Token],
-    pub ours: &'a [Token],
-    pub theirs: &'a [Token],
-}
-
-impl Files<'_> {
-    /// The bytes of the `i`th line of `tokens`, terminator included.
-    fn line(&self, tokens: &[Token], i: i64) -> &[u8] {
-        self.input.interner[tokens[i as usize]]
-    }
+    pub ancestor: Side<'a>,
+    pub ours: Side<'a>,
+    pub theirs: Side<'a>,
 }
 
 /// Split `data` into lines, keeping each line's terminator, the way `xdl_prepare()`
 /// records them.
 pub fn tokens(data: &[u8]) -> imara_diff::sources::ByteLines<'_> {
     imara_diff::sources::byte_lines(data)
+}
+
+/// How `XDF_IGNORE_*` reaches an interner that can only compare byte-for-byte.
+///
+/// Each equivalence class is represented by the first line that fell into it, and
+/// that representative — never the canonical form — is what gets interned. Two
+/// lines therefore share a token exactly when `xdl_recmatch()` calls them equal:
+/// same class means same representative, and two classes cannot share a
+/// representative because a representative is a member of its own class. The raw
+/// lines stay untouched, so `xdl_recs_copy()` still writes what git writes.
+pub struct Classes<'data> {
+    representatives: std::collections::HashMap<Vec<u8>, &'data [u8]>,
+    canonicalize: Option<Canonicalize>,
+}
+
+impl<'data> Classes<'data> {
+    pub fn new(canonicalize: Option<Canonicalize>) -> Self {
+        Classes {
+            representatives: std::collections::HashMap::new(),
+            canonicalize,
+        }
+    }
+
+    /// The line to intern in place of `line`.
+    pub fn representative(&mut self, line: &'data [u8]) -> &'data [u8] {
+        match self.canonicalize {
+            // No whitespace flag: every line is its own class, as in the C's
+            // leading `memcmp()` fast path.
+            None => line,
+            Some(canonicalize) => *self.representatives.entry(canonicalize(line)).or_insert(line),
+        }
+    }
 }
 
 /// Run `xdl_do_diff()` + `xdl_change_compact()` + `xdl_build_script()` over a
@@ -119,18 +169,13 @@ fn append_merge(regions: &mut Vec<Region>, mode: i32, i0: i64, chg0: i64, i1: i6
 /// all `line_count` lines.
 fn merge_cmp_lines(files: &Files<'_>, i1: i64, i2: i64, line_count: i64) -> bool {
     (0..line_count).all(|k| {
-        files.ours.get((i1 + k) as usize) == files.theirs.get((i2 + k) as usize)
+        files.ours.tokens.get((i1 + k) as usize) == files.theirs.tokens.get((i2 + k) as usize)
     })
 }
 
 /// Port of `line_contains_alnum()` / `lines_contain_alnum()`.
 fn lines_contain_alnum(files: &Files<'_>, i: i64, chg: i64) -> bool {
-    (0..chg).any(|k| {
-        files
-            .line(files.ours, i + k)
-            .iter()
-            .any(u8::is_ascii_alphanumeric)
-    })
+    (0..chg).any(|k| files.ours.line(i + k).iter().any(u8::is_ascii_alphanumeric))
 }
 
 /// Port of `xdl_refine_zdiff3_conflicts()`: drop lines common to both sides from
@@ -140,7 +185,10 @@ fn refine_zdiff3_conflicts(regions: &mut [Region], files: &Files<'_>) {
         if m.mode != 0 {
             continue;
         }
-        while m.chg1 != 0 && m.chg2 != 0 && files.ours[m.i1 as usize] == files.theirs[m.i2 as usize] {
+        while m.chg1 != 0
+            && m.chg2 != 0
+            && files.ours.tokens[m.i1 as usize] == files.theirs.tokens[m.i2 as usize]
+        {
             m.chg1 -= 1;
             m.chg2 -= 1;
             m.i1 += 1;
@@ -148,7 +196,8 @@ fn refine_zdiff3_conflicts(regions: &mut [Region], files: &Files<'_>) {
         }
         while m.chg1 != 0
             && m.chg2 != 0
-            && files.ours[(m.i1 + m.chg1 - 1) as usize] == files.theirs[(m.i2 + m.chg2 - 1) as usize]
+            && files.ours.tokens[(m.i1 + m.chg1 - 1) as usize]
+                == files.theirs.tokens[(m.i2 + m.chg2 - 1) as usize]
         {
             m.chg1 -= 1;
             m.chg2 -= 1;
@@ -159,7 +208,12 @@ fn refine_zdiff3_conflicts(regions: &mut [Region], files: &Files<'_>) {
 /// Port of `xdl_refine_conflicts()`: diff the two conflicting postimages against
 /// each other and keep only the lines that really differ, splitting one region
 /// into as many as that diff has hunks.
-fn refine_conflicts(regions: &mut Vec<Region>, files: &Files<'_>, algorithm: Algorithm) {
+fn refine_conflicts(
+    regions: &mut Vec<Region>,
+    files: &Files<'_>,
+    algorithm: Algorithm,
+    canonicalize: Option<Canonicalize>,
+) {
     let mut idx = 0;
     while idx < regions.len() {
         let m = regions[idx];
@@ -171,10 +225,10 @@ fn refine_conflicts(regions: &mut Vec<Region>, files: &Files<'_>, algorithm: Alg
 
         // The C takes a sub-`mmfile_t` spanning the raw bytes of the conflicting
         // records; the same span is what concatenating those lines produces.
-        let concat = |tokens: &[Token], start: i64, count: i64| -> Vec<u8> {
+        let concat = |side: Side<'_>, start: i64, count: i64| -> Vec<u8> {
             let mut buf = Vec::new();
             for k in 0..count {
-                buf.extend_from_slice(files.line(tokens, start + k));
+                buf.extend_from_slice(side.line(start + k));
             }
             buf
         };
@@ -182,9 +236,12 @@ fn refine_conflicts(regions: &mut Vec<Region>, files: &Files<'_>, algorithm: Alg
         let t2 = concat(files.theirs, m.i2, m.chg2);
 
         let script = {
+            // The C hands this sub-diff the same `xpp`, so the whitespace flags
+            // apply here too.
+            let mut classes = Classes::new(canonicalize);
             let mut sub = InternedInput::default();
-            sub.update_before(tokens(&t1));
-            sub.update_after(tokens(&t2));
+            sub.update_before(tokens(&t1).map(|line| classes.representative(line)));
+            sub.update_after(tokens(&t2).map(|line| classes.representative(line)));
             build_script(algorithm, &sub)
         };
 
@@ -250,10 +307,10 @@ fn simplify_non_conflicts(regions: &mut Vec<Region>, files: &Files<'_>, simplify
 
 /// Port of `is_eol_crlf()`: `Some(true)` for a CRLF line ending, `Some(false)`
 /// for LF-only, `None` when it cannot be determined (the C returns `-1`).
-fn is_eol_crlf(files: &Files<'_>, tokens: &[Token], i: i64) -> Option<bool> {
-    let nrec = tokens.len() as i64;
+fn is_eol_crlf(side: Side<'_>, i: i64) -> Option<bool> {
+    let nrec = side.len();
     let ends_in_crlf = |n: i64| {
-        let line = files.line(tokens, n);
+        let line = side.line(n);
         line.len() > 1 && line[line.len() - 2] == b'\r'
     };
     if i < nrec - 1 {
@@ -264,7 +321,7 @@ fn is_eol_crlf(files: &Files<'_>, tokens: &[Token], i: i64) -> Option<bool> {
         // Cannot determine eol style from an empty file.
         return None;
     }
-    let line = files.line(tokens, i);
+    let line = side.line(i);
     if line.last() == Some(&b'\n') {
         // Last line; ends in LF; is it CR/LF?
         return Some(ends_in_crlf(i));
@@ -283,35 +340,27 @@ fn is_eol_crlf(files: &Files<'_>, tokens: &[Token], i: i64) -> Option<bool> {
 /// through to the next check and only a definite LF-only stops the chain.
 fn is_cr_needed(files: &Files<'_>, m: &Region) -> bool {
     // Match post-images' preceding, or first, lines' end-of-line style.
-    let mut needs_cr = is_eol_crlf(files, files.ours, if m.i1 != 0 { m.i1 - 1 } else { 0 });
+    let mut needs_cr = is_eol_crlf(files.ours, if m.i1 != 0 { m.i1 - 1 } else { 0 });
     if needs_cr != Some(false) {
-        needs_cr = is_eol_crlf(files, files.theirs, if m.i2 != 0 { m.i2 - 1 } else { 0 });
+        needs_cr = is_eol_crlf(files.theirs, if m.i2 != 0 { m.i2 - 1 } else { 0 });
     }
     // Look at pre-image's first line, unless we already settled on LF.
     if needs_cr != Some(false) {
-        needs_cr = is_eol_crlf(files, files.ancestor, 0);
+        needs_cr = is_eol_crlf(files.ancestor, 0);
     }
     // If still undecided, use LF-only.
     needs_cr == Some(true)
 }
 
 /// Port of `xdl_recs_copy_0()`.
-fn recs_copy(
-    files: &Files<'_>,
-    tokens: &[Token],
-    i: i64,
-    count: i64,
-    needs_cr: bool,
-    add_nl: bool,
-    out: &mut Vec<u8>,
-) {
+fn recs_copy(side: Side<'_>, i: i64, count: i64, needs_cr: bool, add_nl: bool, out: &mut Vec<u8>) {
     if count < 1 {
         return;
     }
     for k in 0..count {
-        out.extend_from_slice(files.line(tokens, i + k));
+        out.extend_from_slice(side.line(i + k));
     }
-    if add_nl && files.line(tokens, i + count - 1).last() != Some(&b'\n') {
+    if add_nl && side.line(i + count - 1).last() != Some(&b'\n') {
         if needs_cr {
             out.push(b'\r');
         }
@@ -345,20 +394,20 @@ fn fill_conflict_hunk(
     let needs_cr = is_cr_needed(files, m);
 
     // Before conflicting part.
-    recs_copy(files, files.ours, i, m.i1 - i, false, false, out);
+    recs_copy(files.ours, i, m.i1 - i, false, false, out);
     write_marker(out, b'<', labels.current, marker_size, needs_cr);
     // Postimage from side #1.
-    recs_copy(files, files.ours, m.i1, m.chg1, needs_cr, true, out);
+    recs_copy(files.ours, m.i1, m.chg1, needs_cr, true, out);
 
     if matches!(style, ConflictStyle::Diff3 | ConflictStyle::ZealousDiff3) {
         // Shared preimage.
         write_marker(out, b'|', labels.ancestor, marker_size, needs_cr);
-        recs_copy(files, files.ancestor, m.i0, m.chg0, needs_cr, true, out);
+        recs_copy(files.ancestor, m.i0, m.chg0, needs_cr, true, out);
     }
 
     write_marker(out, b'=', None, marker_size, needs_cr);
     // Postimage from side #2.
-    recs_copy(files, files.theirs, m.i2, m.chg2, needs_cr, true, out);
+    recs_copy(files.theirs, m.i2, m.chg2, needs_cr, true, out);
     write_marker(out, b'>', labels.other, marker_size, needs_cr);
 }
 
@@ -388,15 +437,15 @@ fn fill_merge_buffer(
             fill_conflict_hunk(files, labels, i, style, m, marker_size, out);
         } else if m.mode & 3 != 0 {
             // Before conflicting part.
-            recs_copy(files, files.ours, i, m.i1 - i, false, false, out);
+            recs_copy(files.ours, i, m.i1 - i, false, false, out);
             // Postimage from side #1.
             if m.mode & 1 != 0 {
                 let needs_cr = is_cr_needed(files, m);
-                recs_copy(files, files.ours, m.i1, m.chg1, needs_cr, m.mode & 2 != 0, out);
+                recs_copy(files.ours, m.i1, m.chg1, needs_cr, m.mode & 2 != 0, out);
             }
             // Postimage from side #2.
             if m.mode & 2 != 0 {
-                recs_copy(files, files.theirs, m.i2, m.chg2, false, false, out);
+                recs_copy(files.theirs, m.i2, m.chg2, false, false, out);
             }
         } else {
             // Mode 4: both sides made the same change, so our postimage already
@@ -405,7 +454,7 @@ fn fill_merge_buffer(
         }
         i = m.i1 + m.chg1;
     }
-    recs_copy(files, files.ours, i, files.ours.len() as i64 - i, false, false, out);
+    recs_copy(files.ours, i, files.ours.len() - i, false, false, out);
 }
 
 /// Port of `xdl_do_merge()`, minus the output step.
@@ -418,6 +467,7 @@ fn do_merge(
     level: Level,
     style: ConflictStyle,
     algorithm: Algorithm,
+    canonicalize: Option<Canonicalize>,
 ) -> Vec<Region> {
     // "diff3 -m" output does not make sense for anything more aggressive than
     // `Eager`, because the base is shown and does not match, so conflicts
@@ -507,7 +557,7 @@ fn do_merge(
         }
     }
 
-    let ancestor_nrec = files.ancestor.len() as i64;
+    let ancestor_nrec = files.ancestor.len();
     while a < xscr1.len() {
         let s1 = xscr1[a];
         append_merge(
@@ -517,7 +567,7 @@ fn do_merge(
             s1.chg1,
             s1.i2,
             s1.chg2,
-            s1.i1 + files.theirs.len() as i64 - ancestor_nrec,
+            s1.i1 + files.theirs.len() - ancestor_nrec,
             s1.chg1,
         );
         a += 1;
@@ -529,7 +579,7 @@ fn do_merge(
             2,
             s2.i1,
             s2.chg1,
-            s2.i1 + files.ours.len() as i64 - ancestor_nrec,
+            s2.i1 + files.ours.len() - ancestor_nrec,
             s2.chg1,
             s2.i2,
             s2.chg2,
@@ -541,7 +591,7 @@ fn do_merge(
     if style == ConflictStyle::ZealousDiff3 {
         refine_zdiff3_conflicts(&mut regions, files);
     } else if level >= Level::Zealous {
-        refine_conflicts(&mut regions, files, algorithm);
+        refine_conflicts(&mut regions, files, algorithm, canonicalize);
         simplify_non_conflicts(&mut regions, files, level > Level::Zealous);
     }
 
@@ -559,6 +609,9 @@ pub struct Params<'a> {
     pub marker_size: usize,
     pub level: Level,
     pub algorithm: Algorithm,
+    /// `xpp.flags & XDF_WHITESPACE_FLAGS`, as the canonicalization
+    /// [`Classes`] groups records by. `None` is git's flagless `memcmp()`.
+    pub canonicalize: Option<Canonicalize>,
 }
 
 /// How many regions conflicted, before and after an automatic resolution was
@@ -584,7 +637,15 @@ pub fn merge_scripts(
     params: Params<'_>,
     out: &mut Vec<u8>,
 ) -> Conflicts {
-    let mut regions = do_merge(files, xscr1, xscr2, params.level, params.style, params.algorithm);
+    let mut regions = do_merge(
+        files,
+        xscr1,
+        xscr2,
+        params.level,
+        params.style,
+        params.algorithm,
+        params.canonicalize,
+    );
     let before_favor = regions.iter().filter(|m| m.mode == 0).count();
     fill_merge_buffer(
         files,

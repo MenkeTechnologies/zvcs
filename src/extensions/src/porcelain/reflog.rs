@@ -1682,7 +1682,7 @@ fn full_name(repo: &gix::Repository, name: &str) -> String {
 /// git's `shorten_unambiguous_ref` for the reflog selector display (`%gd`): a full
 /// ref name is shown by its canonical short form regardless of how it was typed —
 /// `refs/heads/main` → `main`, `refs/stash` → `stash`, `HEAD` stays `HEAD`.
-fn shorten_ref(full: &str) -> String {
+pub(crate) fn shorten_ref(full: &str) -> String {
     if full == "HEAD" {
         return full.to_owned();
     }
@@ -3650,7 +3650,7 @@ fn parse_raw_line(line: &[u8]) -> Option<RawLine> {
 
 /// The file a ref's reflog lives in. `HEAD` (and the other per-worktree
 /// pseudo-refs) belong to this worktree; everything else is shared.
-fn log_file(repo: &gix::Repository, full_name: &str) -> PathBuf {
+pub(crate) fn log_file(repo: &gix::Repository, full_name: &str) -> PathBuf {
     let root = if full_name.starts_with("refs/") {
         repo.common_dir()
     } else {
@@ -4049,7 +4049,7 @@ fn drop_reflogs(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
 /// `name` that both resolves as a reference and has a reflog. When the reference
 /// resolves somewhere else and only the target carries a log, that target is the
 /// answer instead — which is how a symref's log is found through its own name.
-fn dwim_log(repo: &gix::Repository, name: &str) -> Option<String> {
+pub(crate) fn dwim_log(repo: &gix::Repository, name: &str) -> Option<String> {
     let substituted = substitute_branch_name(repo, name);
     let name = substituted.as_deref().unwrap_or(name);
     // `ref_rev_parse_rules` (refs.c), in order.
@@ -4114,7 +4114,7 @@ fn substitute_branch_name(repo: &gix::Repository, name: &str) -> Option<String> 
 /// `refs/heads/` and `refs/remotes/` on its own. This caller is already walking git's
 /// rule list itself, so a lookup that answered under a different name is discarded —
 /// otherwise every candidate would resolve and the first one would always win.
-fn resolve_ref_reading(repo: &gix::Repository, path: &str) -> Option<String> {
+pub(crate) fn resolve_ref_reading(repo: &gix::Repository, path: &str) -> Option<String> {
     // git's `SYMREF_MAXDEPTH`.
     const MAX_DEPTH: usize = 5;
     let mut name = path.to_owned();

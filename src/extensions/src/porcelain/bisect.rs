@@ -26,6 +26,11 @@
 //!     same block on stdout, because `parse_options` answers it before
 //!     `usage_with_options` is ever reached.
 //!
+//! A leading `--` ends option parsing without being kept, and the subcommand
+//! table is only consulted at `argv[0]`, so `git bisect -- <word>` can only ever
+//! reach `help`, a marking term or `unknown command` — never `start`, `log` and
+//! the rest of the named subcommands.
+//!
 //! A good revision that is not an ancestor of the bad one now goes through git's
 //! merge-base machinery: the merge base is checked out with `Bisecting: a merge
 //! base must be tested`, and the `The merge base <oid> is bad` / `Some '<good>'
@@ -113,8 +118,7 @@ pub fn bisect(args: &[String]) -> Result<ExitCode> {
     };
 
     let Some(sub) = args.first().map(String::as_str) else {
-        eprint!("fatal: need a command\n\n{USAGE}");
-        return Ok(ExitCode::from(129));
+        return word_fallback(args);
     };
     let rest = &args[1..];
 
@@ -139,6 +143,14 @@ pub fn bisect(args: &[String]) -> Result<ExitCode> {
         "skip" => skip_cmd(rest),
         "run" => run_cmd(rest),
         "visualize" | "view" => visualize_cmd(rest),
+        // A lone `--` is not a subcommand, and `cmd_bisect` passes no
+        // `PARSE_OPT_KEEP_DASHDASH` (bisect.c:1465-1466), so `parse_options`
+        // swallows it and stops. The `OPT_SUBCOMMAND` table is only ever
+        // consulted at `argv[0]`, so whatever follows lands in the `!fn`
+        // fallback as a bare word: `git bisect -- log` is `unknown command:
+        // 'log'`, never the `log` subcommand, and `git bisect -- -h` is
+        // `unknown command: '-h'`, not parse-options' own refusal.
+        "--" => word_fallback(rest),
         // A dashed word is never a marking term: `cmd_bisect`'s table is
         // `OPT_SUBCOMMAND`s only, so `parse_options_step()` hands it to
         // `parse_long_opt()`, finds nothing and answers `PARSE_OPT_UNKNOWN` —
@@ -150,18 +162,34 @@ pub fn bisect(args: &[String]) -> Result<ExitCode> {
         }
         // Anything else is a marking word — `bad`/`good`, `new`/`old`, or a
         // custom term a stock-git session recorded — or a genuine typo.
-        other => {
-            let ctx = Ctx::open()?;
-            let is_marking = match read_terms(&ctx)? {
-                Some(t) => other == t.bad || other == t.good,
-                None => terms_for_first_marking(other).is_some(),
-            };
-            if is_marking {
-                mark(other, rest)
-            } else {
-                unknown_command(other)
-            }
-        }
+        _ => word_fallback(args),
+    }
+}
+
+/// `cmd_bisect`'s `!fn` branch (bisect.c:1468-1484): no `OPT_SUBCOMMAND`
+/// matched, so the first remaining word is `help`, a marking term, or an error.
+/// Reached both by a word that simply is not a subcommand and by everything
+/// after a `--`, which is why it must not re-examine leading dashes.
+fn word_fallback(args: &[String]) -> Result<ExitCode> {
+    let Some(word) = args.first().map(String::as_str) else {
+        eprint!("fatal: need a command\n\n{USAGE}");
+        return Ok(ExitCode::from(129));
+    };
+    // `if (!strcmp(argv[0], "help")) usage_with_options(...)` sits ahead of the
+    // term check, so `--` never hides it.
+    if word == "help" {
+        eprint!("{USAGE}");
+        return Ok(ExitCode::from(129));
+    }
+    let ctx = Ctx::open()?;
+    let is_marking = match read_terms(&ctx)? {
+        Some(t) => word == t.bad || word == t.good,
+        None => terms_for_first_marking(word).is_some(),
+    };
+    if is_marking {
+        mark(word, &args[1..])
+    } else {
+        unknown_command(word)
     }
 }
 

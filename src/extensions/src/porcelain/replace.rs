@@ -64,6 +64,12 @@ use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
 use gix::refs::Target;
 
 use super::{Arg, LongOpt};
+// Every object name here reaches `repo_get_oid()`, whose full-length-hex branch
+// resolves without consulting the odb — see [`crate::objname`]. `git replace`
+// depends on that: `<40 hex>` naming an object the repository does not have is
+// how the type check reports `(null)`, how `-d` reaches its "not found" report,
+// and how `-f` writes a replace ref for an object that is not present yet.
+use crate::objname;
 
 /// The namespace every replace ref lives in.
 const REPLACE_BASE: &str = "refs/replace/";
@@ -350,7 +356,7 @@ fn err(msg: &str) -> Result<ExitCode> {
 fn edit_and_replace(object_ref: &str, force: bool, raw: bool) -> Result<ExitCode> {
     let repo = gix::discover(".")?;
 
-    let Some(old) = resolve(&repo, object_ref) else {
+    let Some(old) = objname::resolve(&repo, object_ref) else {
         return err(&format!("not a valid object name: '{object_ref}'"));
     };
     let Some(kind) = object_kind(&repo, old) else {
@@ -498,16 +504,14 @@ fn launch_editor(repo: &gix::Repository, path: &std::path::Path) -> bool {
     }
 }
 
-/// What one `create_graft` call did, mirroring the three ways git's version can
-/// leave the process.
+/// What one `create_graft` call did — git's version returns 0 or -1 and never
+/// `die()`s, so there is no third outcome to model.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum GraftResult {
     /// Returned 0.
     Ok,
     /// Returned -1 via `error(...)`; the message is already on stderr.
     Failed,
-    /// Called `die()`; the message is already on stderr and git exits at once.
-    Died,
 }
 
 impl GraftResult {
@@ -516,7 +520,6 @@ impl GraftResult {
         match self {
             GraftResult::Ok => ExitCode::SUCCESS,
             GraftResult::Failed => ExitCode::from(255),
-            GraftResult::Died => ExitCode::from(128),
         }
     }
 }
@@ -535,11 +538,6 @@ fn object_kind(repo: &gix::Repository, oid: ObjectId) -> Option<Kind> {
     repo.find_header(oid).ok().map(|h| h.kind())
 }
 
-/// `repo_get_oid` — resolve a revision to the object it names, without peeling.
-fn resolve(repo: &gix::Repository, spec: &str) -> Option<ObjectId> {
-    repo.rev_parse_single(spec).ok().map(|id| id.detach())
-}
-
 /// The value a replace ref currently holds, or `None` when it does not exist.
 fn read_replace_ref(repo: &gix::Repository, name: &str) -> Result<Option<ObjectId>> {
     Ok(repo
@@ -551,10 +549,10 @@ fn read_replace_ref(repo: &gix::Repository, name: &str) -> Result<Option<ObjectI
 fn replace_object(object_ref: &str, replace_ref: &str, force: bool) -> Result<ExitCode> {
     let repo = gix::discover(".")?;
 
-    let Some(object) = resolve(&repo, object_ref) else {
+    let Some(object) = objname::resolve(&repo, object_ref) else {
         return err(&format!("failed to resolve '{object_ref}' as a valid ref"));
     };
-    let Some(repl) = resolve(&repo, replace_ref) else {
+    let Some(repl) = objname::resolve(&repo, replace_ref) else {
         return err(&format!("failed to resolve '{replace_ref}' as a valid ref"));
     };
 
@@ -600,6 +598,31 @@ fn replace_object_oid(
         return Ok(false);
     }
 
+    // `ref_transaction_update()` (`refs.c`) verifies the *new* value before the
+    // transaction is allowed to prepare:
+    //
+    // ```c
+    // if ((flags & REF_HAVE_NEW) && !new_target && !is_null_oid(new_oid) &&
+    //     !(flags & REF_SKIP_OID_VERIFICATION) && !(flags & REF_LOG_ONLY)) {
+    //         struct object *o = parse_object(transaction->ref_store->repo, new_oid);
+    //         if (!o) {
+    //                 strbuf_addf(err, _("trying to write ref '%s' with nonexistent object %s"),
+    //                             refname, oid_to_hex(new_oid));
+    // ```
+    //
+    // `replace` sets none of those skip flags, and `replace_object_oid` turns the
+    // failure into `error("%s", err.buf)`. It is reachable precisely because
+    // `repo_get_oid()` hands back a full-length hex id without checking the odb:
+    // `git replace -f <ref> <40-hex-that-is-absent>` gets all the way here. Only
+    // the replacement is checked — the object being *replaced* may be absent,
+    // which is what makes `replace -f <absent> HEAD` succeed.
+    if repo.find_object(repl).is_err() {
+        error_line(&format!(
+            "trying to write ref '{name}' with nonexistent object {repl}"
+        ));
+        return Ok(false);
+    }
+
     let expected = match prev {
         Some(id) => PreviousValue::MustExistAndMatch(Target::Object(id)),
         None => PreviousValue::MustNotExist,
@@ -633,7 +656,7 @@ fn delete_replace_refs(names: &[String]) -> Result<ExitCode> {
     let mut had_error = false;
 
     for spec in names {
-        let Some(oid) = resolve(&repo, spec) else {
+        let Some(oid) = objname::resolve(&repo, spec) else {
             eprintln!("error: failed to resolve '{spec}' as a valid ref");
             had_error = true;
             continue;
@@ -766,7 +789,7 @@ fn create_graft(
 ) -> Result<GraftResult> {
     let old_ref = argv[0].as_str();
 
-    let Some(old_oid) = resolve(repo, old_ref) else {
+    let Some(old_oid) = objname::resolve(repo, old_ref) else {
         error_line(&format!("not a valid object name: '{old_ref}'"));
         return Ok(GraftResult::Failed);
     };
@@ -780,18 +803,36 @@ fn create_graft(
     let mut buf = commit.data.clone();
     drop(commit);
 
-    // `replace_parents` runs before the signature and mergetag handling, and
-    // resolves its parents with `die()` rather than `error()`.
+    // `replace_parents` runs before the signature and mergetag handling. Both of
+    // its rejections are `return error(...)`, which `create_graft` propagates as
+    // its own -1 — not `die()`, so the process leaves with 255 and, under
+    // `--convert-graft-file`, the line is merely recorded as unconverted:
+    //
+    // ```c
+    // if (repo_get_oid(the_repository, argv[i], &oid) < 0) {
+    //         strbuf_release(&new_parents);
+    //         return error(_("not a valid object name: '%s'"), argv[i]);
+    // }
+    // commit = lookup_commit_reference(the_repository, &oid);
+    // if (!commit) {
+    //         strbuf_release(&new_parents);
+    //         return error(_("could not parse %s as a commit"), argv[i]);
+    // }
+    // ```
+    //
+    // The second branch is the one a full-length hex id reaches: `repo_get_oid()`
+    // resolved it without the odb, so an absent parent is "could not parse", not
+    // "not a valid object name".
     let hexsz = repo.object_hash().len_in_hex();
     let mut new_parents: Vec<u8> = Vec::new();
     for spec in &argv[1..] {
-        let Some(oid) = resolve(repo, spec) else {
-            eprintln!("fatal: not a valid object name: '{spec}'");
-            return Ok(GraftResult::Died);
+        let Some(oid) = objname::resolve(repo, spec) else {
+            error_line(&format!("not a valid object name: '{spec}'"));
+            return Ok(GraftResult::Failed);
         };
         let Some(parent) = lookup_commit_reference(repo, oid) else {
-            eprintln!("fatal: could not parse {spec} as a commit");
-            return Ok(GraftResult::Died);
+            error_line(&format!("could not parse {spec} as a commit"));
+            return Ok(GraftResult::Failed);
         };
         new_parents.extend_from_slice(format!("parent {}\n", parent.id).as_bytes());
     }
@@ -881,13 +922,15 @@ fn convert_graft_file(force: bool) -> Result<ExitCode> {
                 failed.push_str("\n\t");
                 failed.push_str(line);
             }
-            // `die()` ends the process immediately, mid-loop.
-            GraftResult::Died => return Ok(ExitCode::from(128)),
         }
     }
 
     if !failed.is_empty() {
-        eprintln!("warning: could not convert the following graft(s):{failed}");
+        // `warning(_("could not convert the following graft(s):\n%s"), err.buf)`
+        // — the format string ends in a newline and every accumulated line
+        // already starts with one, so the first failure is preceded by a blank
+        // line.
+        eprintln!("warning: could not convert the following graft(s):\n{failed}");
         return Ok(ExitCode::from(1));
     }
 

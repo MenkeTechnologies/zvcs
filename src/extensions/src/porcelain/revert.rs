@@ -476,20 +476,28 @@ pub fn revert(args: &[String]) -> Result<ExitCode> {
     // follows it — the diagnosis order is handled inside `resolve_specs`, not by
     // a blanket pre-scan here.
 
-    let (commits, sequencer) =
-        match crate::sequencer::prepare_revs(&repo, &specs, crate::sequencer::Action::Revert)? {
-            crate::sequencer::Revs::Picks { commits, sequencer } => (commits, sequencer),
-            crate::sequencer::Revs::BadRevision(spec) => {
-                eprintln!("fatal: bad revision '{spec}'");
-                return Ok(ExitCode::from(128));
-            }
-            // `sequencer_pick_revisions()`'s pending-object loop, whose message
-            // says "cherry-pick" for a revert too.
-            crate::sequencer::Revs::NotACommit { name, kind } => {
-                return Ok(sequencer_failed(&format!("{name}: can't cherry-pick a {kind}")));
-            }
-            crate::sequencer::Revs::UnknownOption => return Ok(usage_error()),
-        };
+    let revs = crate::sequencer::prepare_revs(&repo, &specs, crate::sequencer::Action::Revert)?;
+    // Everything `setup_revisions()` itself refuses — a bad revision, an absent
+    // full-length object name, an unusable range — dies at 128 in the same
+    // wording `cherry-pick` uses, since neither command has been reached yet.
+    if let Some(message) = revs.setup_revisions_fatal() {
+        eprint!("{message}");
+        return Ok(ExitCode::from(128));
+    }
+    let (commits, sequencer) = match revs {
+        crate::sequencer::Revs::Picks { commits, sequencer } => (commits, sequencer),
+        // `sequencer_pick_revisions()`'s pending-object loop, whose message
+        // says "cherry-pick" for a revert too.
+        crate::sequencer::Revs::NotACommit { name, kind } => {
+            return Ok(sequencer_failed(&format!("{name}: can't cherry-pick a {kind}")));
+        }
+        crate::sequencer::Revs::UnknownOption => return Ok(usage_error()),
+        crate::sequencer::Revs::BadRevision(_)
+        | crate::sequencer::Revs::BadObject(_)
+        | crate::sequencer::Revs::InvalidRange { .. } => {
+            unreachable!("reported by setup_revisions_fatal above")
+        }
+    };
     // `walk_revs_populate_todo`'s tail: a selection that names no commit at all
     // is refused before any sequencer state is written.
     if commits.is_empty() {

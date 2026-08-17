@@ -258,26 +258,30 @@ pub fn describe(args: &[String]) -> Result<ExitCode> {
         }
     } else {
         for rev in &revs {
-            let id = match repo.rev_parse_single(*rev) {
-                Ok(id) => id,
-                Err(_) => return fatal(format!("Not a valid object name {rev}")),
+            // `repo_get_oid` takes a full-length hex name as the id without
+            // consulting the odb, so an absent-but-well-formed id is *not* an
+            // invalid object name here; it fails below, where neither
+            // `lookup_commit_reference_gently` nor `odb_read_object_info` can
+            // produce anything for it.
+            let Some(id) = crate::objname::resolve(&repo, rev) else {
+                return fatal(format!("Not a valid object name {rev}"));
             };
             // git names a commit (tags peel through) directly; a blob is routed to
             // the tree-path search; anything else is fatal (`builtin/describe.c`).
-            match id.object()?.peel_to_commit() {
-                Ok(commit) => {
+            match repo.find_object(id).ok().and_then(|obj| obj.peel_to_commit().ok()) {
+                Some(commit) => {
                     if let Some(code) = describe_one(&repo, &commit, &opts, &filter)? {
                         return Ok(code);
                     }
                 }
-                Err(_) => {
-                    let obj = id.object()?;
-                    if obj.kind == gix::object::Kind::Blob {
-                        if let Some(code) = describe_blob(&repo, obj.id, &opts, &filter)? {
-                            return Ok(code);
-                        }
-                    } else {
+                None => {
+                    let blob =
+                        repo.find_object(id).ok().filter(|o| o.kind == gix::object::Kind::Blob);
+                    let Some(obj) = blob else {
                         return fatal(format!("{rev} is neither a commit nor blob"));
+                    };
+                    if let Some(code) = describe_blob(&repo, obj.id, &opts, &filter)? {
+                        return Ok(code);
                     }
                 }
             }
@@ -910,17 +914,25 @@ fn run_contains(
     let mut cutoff = i64::MAX;
     let mut cache: std::collections::HashMap<ObjectId, CommitInfo> = std::collections::HashMap::new();
     for rev in inputs {
-        let commit = match repo
-            .rev_parse_single(*rev)
-            .ok()
-            .and_then(|id| id.object().ok())
-            .and_then(|obj| obj.peel_to_commit().ok())
-        {
-            Some(c) => c,
-            None => {
-                eprintln!("Could not get sha1 for {rev}. Skipping.");
-                continue;
-            }
+        // name-rev's revision setup fails in three distinct ways, and
+        // `--contains` inherits all of them verbatim. `repo_get_oid` is
+        // `get_oid_basic()`, whose first branch takes a full-length hex name as
+        // the id without consulting the odb, so "resolved" and "present" are not
+        // the same question: a well-formed but absent id gets past the first
+        // check and dies at `parse_object` with a different message.
+        let Some(oid) = crate::objname::resolve(&repo, rev) else {
+            eprintln!("Could not get sha1 for {rev}. Skipping.");
+            continue;
+        };
+        let Ok(object) = repo.find_object(oid) else {
+            eprintln!("Could not get object for {rev}. Skipping.");
+            continue;
+        };
+        // `--contains` passes `--peel-tag`, so anything that does not peel to a
+        // commit is reported separately rather than carried as a target.
+        let Ok(commit) = object.peel_to_commit() else {
+            eprintln!("Could not get commit for {rev}. Skipping.");
+            continue;
         };
         let oid = commit.id;
         let date = commit_info(&mut cache, &repo, oid)?.date;

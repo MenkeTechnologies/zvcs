@@ -84,6 +84,8 @@ impl Repository {
                     style,
                     marker_size: text::Conflict::DEFAULT_MARKER_SIZE.try_into().unwrap(),
                 },
+                // git's `xpp.flags` come from `-X`, never from configuration.
+                canonicalize: None,
             },
         })
     }

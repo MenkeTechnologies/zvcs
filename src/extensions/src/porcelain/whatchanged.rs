@@ -120,6 +120,17 @@ struct Fatal {
 }
 
 impl Fatal {
+    /// A `die()` whose text a shared helper has already rendered in full —
+    /// prefix, newline and any preceding `error:` line included. Exit 128, as
+    /// `die()` always is.
+    fn raw(text: String) -> Self {
+        Fatal {
+            text,
+            code: 128,
+            to_stdout: false,
+        }
+    }
+
     /// `die()`: the `fatal: ` prefix and exit 128.
     fn die(msg: impl Into<String>) -> Self {
         Fatal {
@@ -790,6 +801,18 @@ fn parse_args(
             continue;
         }
 
+        // `handle_revision_arg()` dies on its own for a range whose endpoints are
+        // absent objects, and for a full-length hex name `get_oid()` decoded but
+        // `parse_object()` could not find. Both happen before the `^` branch and
+        // the pathspec fallback below exist as far as git is concerned, so they
+        // are asked about first — a token git dies on never reaches either.
+        // A `--` earlier on the line was consumed at the top of this loop, so an
+        // argument reaching here is always one `setup_revisions()` would still let
+        // be a filename.
+        if let Some(message) = super::log::early_revision_fatal(repo, a, false) {
+            return Err(Fatal::raw(message));
+        }
+
         // `^<rev>` never degrades into a pathspec.
         if let Some(rest) = a.strip_prefix('^') {
             if rest.is_empty() || repo.rev_parse(rest).is_err() {
@@ -800,7 +823,12 @@ fn parse_args(
             continue;
         }
 
-        if !a.is_empty() && repo.rev_parse(a).is_ok() {
+        // `handle_revision_arg_1()` refuses a bare `..` ahead of
+        // `handle_dotdot()`, so gitoxide reading it as `HEAD..HEAD` below must
+        // not get the chance. See
+        // [`crate::objname::is_parent_directory_pathspec`].
+        let parent_dir = crate::objname::is_parent_directory_pathspec(a, args.iter().any(|x| x == "--"));
+        if !parent_dir && !a.is_empty() && repo.rev_parse(a).is_ok() {
             accept_rev(repo, &st, a, &mut p)?;
             i += 1;
             continue;
@@ -893,6 +921,21 @@ fn parse_args(
     }
     if let Some(u) = unrecognized {
         return Err(Fatal::die(format!("unrecognized argument: {u}")));
+    }
+    // `parse_pathspec()` runs inside `setup_revisions()`, and `cmd_whatchanged`
+    // reaches that through `cmd_log_init()` *before* its own refusal:
+    //
+    // ```c
+    // cmd_log_init(argc, argv, prefix, &rev, &opt, &cfg);
+    //
+    // if (!cfg.i_still_use_this)
+    //         you_still_use_that("git whatchanged", …);
+    // ```
+    //
+    // So a rejected pathspec element is fatal ahead of the deprecation notice —
+    // `git whatchanged -- ..` is the outside-repository fatal, not the refusal.
+    if let Some(msg) = crate::pathspec::parse_pathspec_fatal(repo, &p.pathspecs) {
+        return Err(Fatal::die(msg));
     }
     Ok(p)
 }

@@ -90,11 +90,6 @@
 //!     patch. `-I` with raw/stat output is fully supported.
 //!   * `--binary` for content that is actually binary (the `GIT binary patch`
 //!     literal/delta encoding is not produced).
-//!   * `--patience` / `--diff-algorithm=patience` together with a format that consumes
-//!     the line diff (`-p`, `--numstat`/`--stat`/`--shortstat`, `--check`,
-//!     `--dirstat=lines`): imara-diff has no patience variant, so rather than silently
-//!     substituting Myers this bails. `--patience` with a raw/name/summary listing is a
-//!     no-op, since those never diff line content.
 //!   * `-M`/`--find-renames` rename *pairing* (an intent-to-add worktree file matched
 //!     to a staged deletion): accepted as a no-op, so such a pair is still reported as
 //!     a separate `D`+`A` rather than a single `R`.
@@ -620,9 +615,14 @@ enum Fatal {
     /// `error: invalid regex given to -I: '<pat>'`, exit 129. `diff_opt_ignore_regex`
     /// compiles inline, so this fires at the flag's own argv position.
     InvalidRegexIgnore(String),
-    /// `error: unable to resolve '<arg>'`, exit 128. `diff_opt_find_object` fails to
-    /// resolve the `--find-object` argument to an object id.
+    /// `error: unable to resolve '<arg>'`, exit 129. `diff_opt_find_object` fails to
+    /// resolve the `--find-object` argument to an object id and returns `error()`,
+    /// which `diff_opt_parse()` turns into parse-options' own exit code rather than
+    /// a `die()` — no usage block accompanies it. Measured against stock 2.55.0.
     UnableToResolve(String),
+    /// `fatal: bad object <name>`, exit 128 — `get_reference()`'s `die()` for a name
+    /// that resolved (see [`crate::objname`]) to an object the repository lacks.
+    BadObject(String),
 }
 
 /// `diff_files_usage` — the synopsis *and* the `common diff options:` table
@@ -759,6 +759,10 @@ impl Fatal {
             }
             Fatal::UnableToResolve(arg) => {
                 let _ = writeln!(err, "error: unable to resolve '{arg}'");
+                return ExitCode::from(129);
+            }
+            Fatal::BadObject(name) => {
+                let _ = writeln!(err, "fatal: bad object {name}");
             }
         }
         ExitCode::from(128)
@@ -954,7 +958,15 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed, Fatal> {
         }
         // A bare argument is a revision, an existing path, or an error — git
         // tries them in that order and dies on the first one that fits none.
-        if repo.rev_parse_single(s).is_ok() {
+        if let Some(id) = crate::objname::resolve(repo, s) {
+            // `get_reference()`'s `die("bad object %s", name)`. A full-length hex
+            // resolves without the object database being consulted (see
+            // [`crate::objname`]), so `setup_revisions()` gets as far as reading the
+            // object and dies there — ahead of `cmd_diff_files()`'s `argc > 1` usage
+            // check, which is what a *present* revision runs into instead.
+            if repo.find_object(id).is_err() {
+                return Err(Fatal::BadObject(s.to_owned()));
+            }
             return Err(Fatal::Usage);
         }
         // `setup_revisions()` hands the argument that failed revision resolution and
@@ -1070,9 +1082,12 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed, Fatal> {
     if !opts.find_object_args.is_empty() {
         let mut ids = Vec::with_capacity(opts.find_object_args.len());
         for arg in std::mem::take(&mut opts.find_object_args) {
-            match repo.rev_parse_single(arg.as_str()) {
-                Ok(id) => ids.push(id.detach()),
-                Err(_) => return Err(Fatal::UnableToResolve(arg)),
+            // `repo_get_oid()`, so [`crate::objname`]'s full-length-hex rule applies:
+            // an id the repository does not have is still a valid needle, and simply
+            // matches nothing.
+            match crate::objname::resolve(repo, arg.as_str()) {
+                Some(id) => ids.push(id),
+                None => return Err(Fatal::UnableToResolve(arg)),
             }
         }
         opts.pickaxe = Some(Pickaxe {

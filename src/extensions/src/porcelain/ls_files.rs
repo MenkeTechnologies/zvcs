@@ -686,23 +686,23 @@ pub fn ls_files(args: &[String]) -> Result<ExitCode> {
             );
             return Ok(ExitCode::from(128));
         }
-        // git's `get_oid` failure is "tree-ish %s not found."; a resolvable name
-        // that will not peel to a tree is "bad tree-ish %s".
-        let tree = match repo.rev_parse_single(spec.as_str()) {
-            Err(_) => {
-                eprintln!("fatal: tree-ish {spec} not found.");
-                return Ok(ExitCode::from(128));
-            }
-            Ok(id) => {
-                let peeled = id.object().ok().and_then(|o| o.peel_to_tree().ok());
-                match peeled {
-                    Some(t) => t,
-                    None => {
-                        eprintln!("fatal: bad tree-ish {spec}");
-                        return Ok(ExitCode::from(128));
-                    }
-                }
-            }
+        // `overlay_tree_on_index` (read-cache.c) splits the two failures: only a
+        // name that does not resolve at all is "tree-ish %s not found.", while
+        // `repo_parse_tree_indirect()` returning NULL — a missing object as much
+        // as a non-tree — is "bad tree-ish %s". `repo_get_oid()` accepts a
+        // full-length hex string without consulting the odb (see
+        // [`crate::objname::full_hex`]), so an absent id lands in the second.
+        let Some(id) = crate::objname::resolve(&repo, spec.as_str()) else {
+            eprintln!("fatal: tree-ish {spec} not found.");
+            return Ok(ExitCode::from(128));
+        };
+        let peeled = repo
+            .find_object(id)
+            .ok()
+            .and_then(|o| o.peel_to_tree().ok());
+        let Some(tree) = peeled else {
+            eprintln!("fatal: bad tree-ish {spec}");
+            return Ok(ExitCode::from(128));
         };
 
         // Paths already carried at stage 0 keep their index entry (git's

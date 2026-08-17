@@ -21,8 +21,9 @@
 //!     codes
 //!   * the strategy options `ours`, `theirs`, `no-renames`, `find-renames`,
 //!     `find-renames=<n>`, `rename-threshold=<n>`, `histogram`,
-//!     `diff-algorithm=myers|default|minimal|histogram`, and the no-op
-//!     `no-renormalize`
+//!     `diff-algorithm=myers|default|minimal|histogram`, `subtree[=<path>]`,
+//!     `ignore-space-change`, `ignore-all-space`, `ignore-space-at-eol`,
+//!     `ignore-cr-at-eol`, and the no-op `no-renormalize`
 //!
 //! Also covered:
 //!   * `--stdin` — the multi-merge batch protocol: each input line is one merge
@@ -47,14 +48,22 @@
 //! to the `merge_blobs()` result. Its two operand diagnostics — `unknown rev`
 //! and `unable to read tree` — still fire before the walk.
 //!
+//! `-Xsubtree[=<path>]` shifts *their* tree and the merge base onto our shape
+//! through [`crate::merge_apply::shift_tree_object`], the `match-trees.c` port
+//! `git merge` already drives, and does it where merge-ort does — in
+//! `merge_ort_nonrecursive_internal()`, once the merge base is settled, which is
+//! why the base is materialized here rather than left to `merge_commits()`.
+//!
+//! `-Xignore-*` reaches the blob merge as `xpp.flags`' whitespace rule, spelled
+//! as the canonical form `xdl_recmatch()` groups records by
+//! ([`super::diff::normalize_line`], shared with the diff family) and handed to
+//! `gix-merge`'s text driver, which interns one representative per class while
+//! still writing the original bytes.
+//!
 //! Not covered, and refused rather than approximated:
-//!   * the strategy options `subtree[=<path>]`, `renormalize`, `patience`,
-//!     `diff-algorithm=patience`, `ignore-space-change`, `ignore-all-space`,
-//!     `ignore-space-at-eol` and `ignore-cr-at-eol` — `gix-merge`'s text driver
-//!     exposes no whitespace-insensitive tokenizer, no renormalizing pipeline
-//!     and no subtree shift, and `gix-imara-diff` has no patience algorithm.
-//!     They parse and validate exactly as git does; only performing such a
-//!     merge is refused.
+//!   * the strategy option `renormalize` — `gix-merge`'s blob pipeline is not
+//!     driven in renormalizing mode here. It parses and validates exactly as git
+//!     does; only performing such a merge is refused.
 //!   * message rendering for the remaining exotic conflict classes —
 //!     directory/file, submodule and the rename type-mismatch failures.
 //!     `gix-merge` reports these as structured resolutions whose exact git
@@ -129,6 +138,13 @@ usage: git merge-tree [--write-tree] [<options>] <branch1> <branch2>
 /// as a fraction of it (see `MAX_SCORE` in git's `diffcore.h`).
 const MAX_SCORE: u64 = 60000;
 
+/// The `XDF_*` whitespace bits of `xdl_opts` (git's `xdiff/xdiff.h`), in the
+/// values the C uses so the `-X` names map onto them one for one.
+const XDF_IGNORE_WHITESPACE: u32 = 1 << 1;
+const XDF_IGNORE_WHITESPACE_CHANGE: u32 = 1 << 2;
+const XDF_IGNORE_WHITESPACE_AT_EOL: u32 = 1 << 3;
+const XDF_IGNORE_CR_AT_EOL: u32 = 1 << 4;
+
 /// Which of `merge-tree`'s two mutually exclusive modes was requested.
 ///
 /// `Unknown` means neither mode flag was given, in which case git picks the
@@ -164,8 +180,13 @@ pub(super) struct StrategyOptions {
     subtree: Option<String>,
     /// The requested diff algorithm, already normalized to lowercase.
     diff_algorithm: Option<String>,
-    /// The first whitespace-insensitivity option seen, kept for the diagnostic.
-    ignore_whitespace: Option<String>,
+    /// The `XDF_IGNORE_*` bits the `-Xignore-*` options set in `xdl_opts`.
+    ///
+    /// `parse_merge_opt()` reaches them through `DIFF_XDL_SET()`, which only ever
+    /// *sets* a bit, so the options accumulate and the strongest one decides —
+    /// `-Xignore-all-space -Xignore-cr-at-eol` compares the same way
+    /// `-Xignore-all-space` alone does, in either order.
+    whitespace: u32,
     /// `renormalize` / `no-renormalize`; `None` leaves the configured default.
     renormalize: Option<bool>,
     /// `no-renames` clears this, `find-renames`/`rename-threshold` set it.
@@ -529,11 +550,13 @@ fn resolve_outcome<'repo>(
     allow_unrelated: bool,
     strategy: &StrategyOptions,
 ) -> Result<std::result::Result<gix::merge::tree::Outcome<'repo>, ExitCode>> {
-    let labels = Labels {
+    let mut labels = Labels {
         ancestor: None,
         current: Some(BStr::new(spec1)),
         other: Some(BStr::new(spec2)),
     };
+    // Only the `-Xsubtree` path needs it, and it has to outlive `labels`.
+    let ancestor_name: String;
     // Both branches produce the same tree-merge outcome; only how the ancestor
     // is chosen differs.
     let outcome = if let Some(base_spec) = merge_base {
@@ -551,6 +574,7 @@ fn resolve_outcome<'repo>(
             eprintln!("fatal: could not parse as tree '{bad}'");
             return Ok(Err(ExitCode::from(128)));
         };
+        let (base, theirs) = strategy.shift(repo, ours, base, theirs)?;
         repo.merge_trees(base, ours, theirs, labels, strategy.apply(repo.tree_merge_options()?)?)?
     } else {
         let Some(ours) = peel_commit(repo, spec1) else {
@@ -561,15 +585,45 @@ fn resolve_outcome<'repo>(
             eprintln!("merge-tree: {spec2} - not something we can merge");
             return Ok(Err(ExitCode::FAILURE));
         };
-        if !allow_unrelated && repo.merge_bases_many(ours, &[theirs])?.is_empty() {
+        let bases = repo.merge_bases_many(ours, &[theirs])?;
+        if !allow_unrelated && bases.is_empty() {
             eprintln!("fatal: refusing to merge unrelated histories");
             return Ok(Err(ExitCode::from(128)));
         }
-        let commit_options =
-            gix::merge::commit::Options::from(strategy.apply(repo.tree_merge_options()?)?)
-                .with_allow_missing_merge_base(allow_unrelated);
-        repo.merge_commits(ours, theirs, labels, commit_options)?
-            .tree_merge
+        if strategy.subtree.is_some() {
+            // git shifts inside `merge_ort_nonrecursive_internal()`, i.e. once the
+            // merge base is already settled, so the base has to be materialized
+            // here rather than left to `merge_commits()` — which would merge the
+            // unshifted trees. The base is chosen exactly as `gix_merge::commit()`
+            // chooses it, including the ancestor label the diff3 styles print.
+            let options = strategy.apply(repo.tree_merge_options()?)?;
+            let base = match bases.len() {
+                0 => {
+                    ancestor_name = "empty tree".into();
+                    ObjectId::empty_tree(repo.object_hash())
+                }
+                1 => {
+                    ancestor_name = bases[0].shorten_or_id().to_string();
+                    repo.find_commit(bases[0])?.tree_id()?.detach()
+                }
+                _ => {
+                    ancestor_name = "merged common ancestors".into();
+                    let bases: Vec<ObjectId> = bases.iter().map(|id| id.detach()).collect();
+                    repo.virtual_merge_base(bases, options.clone())?.tree_id.detach()
+                }
+            };
+            labels.ancestor = Some(BStr::new(ancestor_name.as_bytes()));
+            let ours_tree = repo.find_commit(ours)?.tree_id()?.detach();
+            let theirs_tree = repo.find_commit(theirs)?.tree_id()?.detach();
+            let (base, theirs_tree) = strategy.shift(repo, ours_tree, base, theirs_tree)?;
+            repo.merge_trees(base, ours_tree, theirs_tree, labels, options)?
+        } else {
+            let commit_options =
+                gix::merge::commit::Options::from(strategy.apply(repo.tree_merge_options()?)?)
+                    .with_allow_missing_merge_base(allow_unrelated);
+            repo.merge_commits(ours, theirs, labels, commit_options)?
+                .tree_merge
+        }
     };
     Ok(Ok(outcome))
 }
@@ -713,10 +767,10 @@ impl StrategyOptions {
             "subtree" => self.subtree = Some(String::new()),
             "patience" => self.diff_algorithm = Some("patience".into()),
             "histogram" => self.diff_algorithm = Some("histogram".into()),
-            "ignore-space-change"
-            | "ignore-all-space"
-            | "ignore-space-at-eol"
-            | "ignore-cr-at-eol" => self.ignore_whitespace = Some(s.to_string()),
+            "ignore-space-change" => self.whitespace |= XDF_IGNORE_WHITESPACE_CHANGE,
+            "ignore-all-space" => self.whitespace |= XDF_IGNORE_WHITESPACE,
+            "ignore-space-at-eol" => self.whitespace |= XDF_IGNORE_WHITESPACE_AT_EOL,
+            "ignore-cr-at-eol" => self.whitespace |= XDF_IGNORE_CR_AT_EOL,
             "renormalize" => self.renormalize = Some(true),
             "no-renormalize" => self.renormalize = Some(false),
             "no-renames" => self.detect_renames = Some(false),
@@ -759,28 +813,24 @@ impl StrategyOptions {
         &self,
         options: gix::merge::tree::Options,
     ) -> Result<gix::merge::tree::Options> {
-        if let Some(flag) = &self.ignore_whitespace {
-            anyhow::bail!("unsupported strategy option \"{flag}\" (gix-merge's text driver has no whitespace-insensitive tokenizer)");
-        }
-        if let Some(path) = &self.subtree {
-            let shown = if path.is_empty() {
-                "subtree".to_string()
-            } else {
-                format!("subtree={path}")
-            };
-            anyhow::bail!("unsupported strategy option \"{shown}\" (gix-merge has no subtree shift)");
-        }
         if self.renormalize == Some(true) {
             anyhow::bail!("unsupported strategy option \"renormalize\" (gix-merge's blob pipeline is not driven in renormalizing mode here)");
         }
 
         let algorithm = match self.diff_algorithm.as_deref() {
-            None => None,
+            // `init_merge_options()` (merge-ort.c) opens with
+            // `opt->xdl_opts = DIFF_WITH_ALG(opt, HISTOGRAM_DIFF)`, so an
+            // un-asked-for merge is a *histogram* merge, not a Myers one.
+            // `merge-tree` takes the `init_basic_merge_options()` door, which is
+            // the same but for skipping the `diff.algorithm` config read — so no
+            // configuration can move this, only `-X`.
+            None => Some(gix::diff::blob::Algorithm::Histogram),
             Some("myers" | "default") => Some(gix::diff::blob::Algorithm::Myers),
             Some("minimal") => Some(gix::diff::blob::Algorithm::MyersMinimal),
             Some("histogram") => Some(gix::diff::blob::Algorithm::Histogram),
+            Some("patience") => Some(gix::diff::blob::Algorithm::Patience),
             Some(other) => anyhow::bail!(
-                "unsupported strategy option \"{other}\" diff algorithm (gix-imara-diff implements myers, minimal and histogram only)"
+                "unsupported strategy option \"{other}\" diff algorithm (gix-imara-diff implements myers, minimal, patience and histogram only)"
             ),
         };
 
@@ -790,6 +840,7 @@ impl StrategyOptions {
         if let Some(algorithm) = algorithm {
             plumbing.blob_merge.text.diff_algorithm = algorithm;
         }
+        plumbing.blob_merge.text.canonicalize = self.canonicalize();
         if self.detect_renames == Some(false) {
             plumbing.rewrites = None;
         } else if let Some(score) = self.rename_score {
@@ -806,6 +857,67 @@ impl StrategyOptions {
             Some(favor) => options.with_file_favor(Some(favor)),
             None => options,
         })
+    }
+
+    /// `xpp.flags`' whitespace rule as the canonical form `xdl_recmatch()` groups
+    /// records by, or `None` when no `-Xignore-*` was given.
+    ///
+    /// The order of the tests is `xdl_recmatch()`'s own `else if` chain, which is
+    /// what makes the flags a hierarchy rather than a set: `-w` matches everything
+    /// `-b` matches, `-b` everything `--ignore-space-at-eol` matches, and that
+    /// everything `--ignore-cr-at-eol` matches.
+    ///
+    /// The rules themselves are [`super::diff::normalize_line`], the port the diff
+    /// family already compares lines with — `xdl_recmatch()` is one function in
+    /// git, and this keeps it one function here.
+    fn canonicalize(&self) -> Option<gix::merge::blob::builtin_driver::text::Canonicalize> {
+        use super::diff::{normalize_line, Whitespace};
+
+        let ws = if self.whitespace & XDF_IGNORE_WHITESPACE != 0 {
+            Whitespace::IgnoreAll
+        } else if self.whitespace & XDF_IGNORE_WHITESPACE_CHANGE != 0 {
+            Whitespace::IgnoreChange
+        } else if self.whitespace & XDF_IGNORE_WHITESPACE_AT_EOL != 0 {
+            Whitespace::IgnoreAtEol
+        } else if self.whitespace & XDF_IGNORE_CR_AT_EOL != 0 {
+            Whitespace::IgnoreCrAtEol
+        } else {
+            return None;
+        };
+        Some(match ws {
+            Whitespace::IgnoreAll => |line: &[u8]| normalize_line(line, Whitespace::IgnoreAll),
+            Whitespace::IgnoreChange => |line: &[u8]| normalize_line(line, Whitespace::IgnoreChange),
+            Whitespace::IgnoreAtEol => |line: &[u8]| normalize_line(line, Whitespace::IgnoreAtEol),
+            Whitespace::IgnoreCrAtEol => {
+                |line: &[u8]| normalize_line(line, Whitespace::IgnoreCrAtEol)
+            }
+            Whitespace::Keep => unreachable!("the `else` returned"),
+        })
+    }
+
+    /// `merge_ort_nonrecursive_internal()`'s opening move: with `-Xsubtree` set,
+    /// *their* tree and the merge base are shifted to match the shape of *our*
+    /// tree before any merge information is collected, so the merged tree comes
+    /// out in our shape.
+    ///
+    /// The shifting itself is `match-trees.c`, already ported for `git merge` in
+    /// [`crate::merge_apply::shift_tree_object`]; merge-tree drives its own merge
+    /// but shifts from the same one place git does.
+    fn shift(
+        &self,
+        repo: &gix::Repository,
+        ours: ObjectId,
+        base: ObjectId,
+        theirs: ObjectId,
+    ) -> Result<(ObjectId, ObjectId)> {
+        let Some(prefix) = self.subtree.as_deref() else {
+            return Ok((base, theirs));
+        };
+        let prefix = BStr::new(prefix.as_bytes());
+        Ok((
+            crate::merge_apply::shift_tree_object(repo, ours, base, prefix)?,
+            crate::merge_apply::shift_tree_object(repo, ours, theirs, prefix)?,
+        ))
     }
 }
 
@@ -874,9 +986,25 @@ fn peel_tree(repo: &gix::Repository, spec: &str) -> Option<ObjectId> {
 
 /// Resolve `spec` to a commit id, or `None` when it is not something git would
 /// accept as a side of the merge.
+///
+/// `get_merge_parent()` (builtin/merge-tree.c) peels through `peel_to_type()`
+/// (object.c), which distinguishes the two ways this fails: a spec that names no
+/// object at all is silent — the caller's `not something we can merge` is the
+/// whole diagnostic — while a spec that *does* resolve, but to an object that
+/// only dereferences to a tree or a blob, is reported first, by name and by the
+/// type it landed on. Tags are followed on the way, so the type named is the one
+/// at the end of the tag chain rather than `tag`.
 fn peel_commit(repo: &gix::Repository, spec: &str) -> Option<ObjectId> {
     let object = repo.rev_parse_single(spec).ok()?.object().ok()?;
-    Some(object.peel_to_commit().ok()?.id)
+    let object = object.peel_tags_to_end().ok()?;
+    if object.kind == gix::object::Kind::Commit {
+        return Some(object.id);
+    }
+    eprintln!(
+        "error: {spec}: expected commit type, but the object dereferences to {} type",
+        object.kind
+    );
+    None
 }
 
 /// Outcome of resolving a trivial-merge operand, mirroring the two distinct

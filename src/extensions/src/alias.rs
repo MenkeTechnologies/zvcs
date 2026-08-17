@@ -24,6 +24,11 @@ pub enum Outcome {
     /// A malformed alias (bad quoting, empty, recursive, or looping); carries
     /// git's diagnostic, to print as `zvcs: <msg>`.
     Fatal(String),
+    /// A `handle_options()` failure the expansion provoked — a `-C` that cannot
+    /// chdir, a `-C` with no value. git reports these itself and exits before the
+    /// command runs, so the diagnostic is already on stderr and only the code is
+    /// left to carry.
+    Exit(ExitCode),
 }
 
 /// Expand `sub` (with trailing `rest`) through `alias.<cmd>`, updating
@@ -55,9 +60,14 @@ pub fn resolve(sub: &str, rest: &[String], pager_forced: &mut Option<bool>) -> O
                     i += 1;
                 }
                 "-C" => {
-                    let Some(dir) = args.get(i + 1) else { break };
-                    if std::env::set_current_dir(dir).is_err() {
-                        return Outcome::Fatal(format!("-C: cannot chdir to {dir}"));
+                    let Some(dir) = args.get(i + 1) else {
+                        eprintln!("no directory given for '-C' option");
+                        eprintln!("usage: {}", crate::porcelain::help::GIT_USAGE_STRING);
+                        return Outcome::Exit(ExitCode::from(129));
+                    };
+                    if let Err(msg) = crate::chdir_global(dir) {
+                        eprintln!("fatal: {msg}");
+                        return Outcome::Exit(ExitCode::from(crate::fatal::EXIT_FATAL));
                     }
                     i += 2;
                 }

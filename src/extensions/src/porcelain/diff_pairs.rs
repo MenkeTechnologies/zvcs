@@ -141,11 +141,11 @@
 //!   payload line the way `emit_diff_symbol()` prefixes `DIFF_SYMBOL_BINARY_DIFF_BODY`,
 //!   and a pair rewritten by `--textconv` or forced textual by `-a` must keep
 //!   rendering as text. Until both are covered this bails rather than guessing.
-//! * `--anchored=<text>`: git's own documentation states it "uses the "patience diff"
-//!   algorithm internally", and the vendored `gix-imara-diff` ships only `myers.rs` and
-//!   `histogram.rs`. Same floor as `--patience` below.
-//! * `--patience` / `--diff-algorithm=patience`: imara-diff has no patience variant, so
-//!   these bail rather than silently substituting Myers (the same floor `git diff` hits).
+//! * `--anchored=<text>`: git runs it as a patience diff carrying anchor prefixes
+//!   (`xpp->anchors`). The vendored `gix-imara-diff` has the patience algorithm itself
+//!   (`patience.rs`, a port of `xdiff/xpatience.c`, reached by `--patience` below), but
+//!   no way to pass anchors in — `is_anchor()` is constantly false there — so this bails
+//!   rather than silently dropping the anchors.
 //! * `--submodule=diff`: `show_submodule_inline_diff()` starts a whole second
 //!   `git diff --submodule=diff --color=<when> --src-prefix=… --dst-prefix=… <a> <b>`
 //!   inside the submodule and pipes its stdout through, which this port does not do.
@@ -328,7 +328,7 @@ const FUNCNAME_MAX: usize = 80;
 
 /// How lines are compared, mirroring xdiff's `XDF_*` whitespace flags.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Whitespace {
+pub(crate) enum Whitespace {
     Keep,
     /// `-w` / `--ignore-all-space`: every whitespace byte is ignored.
     IgnoreAll,
@@ -4736,7 +4736,7 @@ pub(crate) fn emit_unified(
 
 /// Split `data` into lines the way `imara_diff::sources::byte_lines` does: the
 /// terminator stays attached, and a final line without one is still a line.
-fn byte_lines(data: &[u8]) -> Vec<&[u8]> {
+pub(crate) fn byte_lines(data: &[u8]) -> Vec<&[u8]> {
     let mut out = Vec::new();
     let mut rest = data;
     while !rest.is_empty() {
@@ -4749,7 +4749,7 @@ fn byte_lines(data: &[u8]) -> Vec<&[u8]> {
 }
 
 /// The form of a line used for *comparison* only; the original bytes are always printed.
-fn normalize(line: &[u8], ws: Whitespace) -> Vec<u8> {
+pub(crate) fn normalize(line: &[u8], ws: Whitespace) -> Vec<u8> {
     let is_space = |b: u8| matches!(b, b' ' | b'\t' | b'\x0b' | b'\x0c' | b'\r' | b'\n');
     match ws {
         Whitespace::Keep => line.to_vec(),

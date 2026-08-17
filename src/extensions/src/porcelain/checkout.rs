@@ -445,14 +445,25 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
                 1 => (Some(pre[0]), post.as_slice()),
                 _ => crate::git_fatal!("only one <tree-ish> may precede `--`"),
             }
-        } else if !pre.is_empty() && repo.rev_parse_single(pre[0]).is_ok() {
+        } else if !pre.is_empty() && crate::objname::resolve(&repo, pre[0]).is_some() {
             (Some(pre[0]), &pre[1..])
         } else {
             (None, pre.as_slice())
         };
         let revision = match rev {
             None | Some("HEAD") => rev.map(str::to_string),
-            Some(r) => Some(repo.rev_parse_single(r)?.detach().to_string()),
+            Some(r) => {
+                // `parse_branchname_arg()` runs before `--patch` hands off to
+                // `add-interactive`, so a name that does not resolve, or resolves
+                // to an id this repository has no tree for, is reported here —
+                // not by the revision parser, whose error named a vendored
+                // `src/ported/…` path and exited 1.
+                let Some(id) = crate::objname::resolve(&repo, r) else {
+                    crate::git_fatal!("invalid reference: {r}");
+                };
+                classify_tree_ish(&repo, id)?;
+                Some(id.to_string())
+            }
         };
         let specs: Vec<String> = specs.iter().map(|s| s.to_string()).collect();
         return super::add_patch::run(
@@ -645,8 +656,22 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
             maybe_recurse_submodules(&repo, recurse_submodules, quiet)?;
             return Ok(code);
         }
-        if let Ok(id) = repo.rev_parse_single(spec) {
-            let commit = id.object()?.peel_to_commit()?;
+        // `get_oid_mb()`, not a bare `rev_parse_single()`: a full-length hex name
+        // *is* the object id, decoded without consulting the odb, so an id this
+        // repository does not have still resolves here and reaches the classifier
+        // below — which reports the missing object the way git does. Resolving it
+        // through the odb instead made `git checkout <sha-from-an-email>` fall
+        // through to the pathspec branch and report "did not match any file(s)".
+        if let Some(id) = crate::objname::resolve(&repo, spec) {
+            let commit = match classify_tree_ish(&repo, id)? {
+                TreeIsh::Commit(commit) => commit,
+                // A tree is a legitimate `source_tree`, so `parse_branchname_arg()`
+                // accepts it; with no paths to restore from it, `checkout_branch()`
+                // is what refuses, by name.
+                TreeIsh::Tree(_) => {
+                    crate::git_fatal!("Cannot switch branch to a non-commit '{spec}'")
+                }
+            };
             let code = detached_checkout(&repo, spec, commit, quiet, detach, force)?;
             maybe_recurse_submodules(&repo, recurse_submodules, quiet)?;
             return Ok(code);
@@ -684,10 +709,66 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
 
     // Multiple positionals, no `--`: if the first resolves to a tree-ish it is the
     // source and the rest are paths; otherwise all are paths from the index.
-    if repo.rev_parse_single(pre[0]).is_ok() {
+    if crate::objname::resolve(&repo, pre[0]).is_some() {
         return restore_from_tree(&repo, pre[0], &pre[1..], overlay, quiet);
     }
     restore_from_index(&repo, &pre, true, quiet)
+}
+
+/// What an object name means to the checkout family once it has been resolved
+/// to an id — the two outcomes `parse_branchname_arg()` distinguishes.
+pub(super) enum TreeIsh<'repo> {
+    /// `lookup_commit_reference_gently()` found a commit; an annotated tag peels
+    /// through to the commit it points at.
+    Commit(gix::Commit<'repo>),
+    /// Not a commit, but `parse_tree_indirect()` reached a tree. git keeps this
+    /// as `source_tree`: it can be restored *from*, but not switched *to*.
+    Tree(ObjectId),
+}
+
+impl TreeIsh<'_> {
+    /// `*source_tree` as `parse_branchname_arg()` sets it: a commit contributes
+    /// `repo_get_commit_tree()`, a tree is already one.
+    pub(super) fn source_tree(self) -> Result<ObjectId> {
+        Ok(match self {
+            TreeIsh::Commit(commit) => commit.tree_id()?.detach(),
+            TreeIsh::Tree(id) => id,
+        })
+    }
+}
+
+/// `parse_branchname_arg()`'s tail: classify an id the way `git checkout`,
+/// `git switch` and `git restore` all classify one.
+///
+/// ```c
+/// new_branch_info->commit = lookup_commit_reference_gently(the_repository, rev, 1);
+/// if (!new_branch_info->commit) {
+///         *source_tree = parse_tree_indirect(rev);
+///         if (!*source_tree)
+///                 die(_("unable to read tree (%s)"), oid_to_hex(rev));
+/// }
+/// ```
+///
+/// This is where a *missing* object is finally noticed. `get_oid_basic()` hands
+/// back a full-length hex name without ever asking the odb whether the object
+/// exists, so every command in this family resolves an absent id successfully
+/// and then dies here — which is why `unable to read tree` is what stock prints
+/// for `git checkout <sha-that-is-not-in-this-repo>`, and why an id naming a
+/// blob prints exactly the same thing.
+///
+/// The message renders `oid_to_hex(rev)`, the *decoded* id rather than the
+/// spelling, so an uppercase name is echoed back lowercase.
+pub(super) fn classify_tree_ish(repo: &gix::Repository, id: ObjectId) -> Result<TreeIsh<'_>> {
+    let Ok(object) = repo.find_object(id) else {
+        crate::git_fatal!("unable to read tree ({id})");
+    };
+    if let Ok(commit) = object.clone().peel_to_commit() {
+        return Ok(TreeIsh::Commit(commit));
+    }
+    match object.peel_to_tree() {
+        Ok(tree) => Ok(TreeIsh::Tree(tree.id)),
+        Err(_) => crate::git_fatal!("unable to read tree ({id})"),
+    }
 }
 
 /// After a switch that changed `HEAD`, move each active, initialized submodule's
@@ -1006,7 +1087,20 @@ fn create_and_switch(
         None => auto_tracking(repo, name, start)?,
     };
 
-    let commit = repo.rev_parse_single(start)?.object()?.peel_to_commit()?;
+    // `parse_branchname_arg()` classifies the start-point before `create_branch()`
+    // gets it: an id this repository does not have — which a full-length hex name
+    // resolves to without the odb ever being asked — is `unable to read tree`, and
+    // a tree is the family's non-commit refusal. Only a name that resolves to
+    // nothing at all reaches `create_branch()`'s own wording.
+    let Some(start_oid) = crate::objname::resolve(repo, start) else {
+        crate::git_fatal!(
+            "'{start}' is not a commit and a branch '{name}' cannot be created from it"
+        );
+    };
+    let commit = match classify_tree_ish(repo, start_oid)? {
+        TreeIsh::Commit(commit) => commit,
+        TreeIsh::Tree(_) => crate::git_fatal!("Cannot switch branch to a non-commit '{start}'"),
+    };
     let start_id = commit.id;
     let target_tree = commit.tree_id()?.detach();
 
@@ -1120,13 +1214,16 @@ fn orphan_checkout(
     quiet: bool,
 ) -> Result<ExitCode> {
     // git resolves the start-point before anything else: a bad one aborts here.
-    let commit = match repo
-        .rev_parse_single(start)
-        .ok()
-        .and_then(|id| id.object().ok())
-        .and_then(|o| o.peel_to_commit().ok())
-    {
-        Some(c) => c,
+    // Resolution is `get_oid_mb()`'s, so a full-length hex name is the id itself
+    // and a missing object is `parse_branchname_arg()`'s `unable to read tree`
+    // rather than this function's wording.
+    let commit = match crate::objname::resolve(repo, start) {
+        Some(id) => match classify_tree_ish(repo, id)? {
+            TreeIsh::Commit(commit) => commit,
+            TreeIsh::Tree(_) => {
+                crate::git_fatal!("Cannot switch branch to a non-commit '{start}'")
+            }
+        },
         None => {
             eprintln!(
                 "fatal: '{start}' is not a commit and a branch '{name}' cannot be created from it"
@@ -1440,7 +1537,14 @@ fn restore_from_tree(
     overlay: bool,
     _quiet: bool,
 ) -> Result<ExitCode> {
-    let tree_id = repo.rev_parse_single(tree_ish)?.object()?.peel_to_tree()?.id;
+    // `parse_branchname_arg()` resolves this through `get_oid_mb()` and dies with
+    // `invalid reference` when nothing resolves. Propagating the revision parser's
+    // own error instead put a Rust type name and a vendored `src/ported/…` path in
+    // front of the user, and exited 1 where git exits 128.
+    let Some(id) = crate::objname::resolve(repo, tree_ish) else {
+        crate::git_fatal!("invalid reference: {tree_ish}");
+    };
+    let tree_id = classify_tree_ish(repo, id)?.source_tree()?;
 
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
 
@@ -1795,6 +1899,12 @@ pub(super) fn show_local_changes(rev: &str, quiet: bool) -> Result<()> {
         return Ok(());
     }
     let args = ["--name-status".to_string(), rev.to_string()];
+    // git hands `show_local_changes()` the object it already resolved
+    // (`add_pending_object(&rev, head, NULL)`), so no name is looked up a second
+    // time. Reaching it through `diff-index`'s argument parsing would re-run
+    // `get_oid()` on the same operand and repeat its ambiguity warning, which
+    // stock prints exactly once per operand.
+    let _quiet_ambiguity = crate::objname::AmbiguityWarnings::off();
     super::diff_index::diff_index(&args)?;
     Ok(())
 }

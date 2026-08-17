@@ -377,7 +377,8 @@ use crate::date::approxidate;
 /// (roots) are prefixed with `^` as git does.
 ///
 /// Also implemented: `-b`, `--root`, `-t`, `-c` (annotate-compat), `-l`,
-/// `--contents <file>` (and `--contents -` from stdin), `--diff-algorithm`,
+/// `--contents <file>` (and `--contents -` from stdin), `--diff-algorithm`
+/// (every name git accepts, `patience` included) and its `--patience` spelling,
 /// `-w`, `--date=relative`, `--color-lines`, `--color-by-age` and
 /// `--progress`/`--no-progress`.
 ///
@@ -2428,13 +2429,67 @@ fn build_ignorelist(
     Ok(set)
 }
 
-/// git's `is_a_rev`: the name resolves to some object in the repository.
+/// git's `is_a_rev` (`builtin/blame.c`), which decides whether the trailing
+/// positional of `git blame <a> <b>` is a revision or a path:
+///
+/// ```c
+/// static int is_a_rev(const char *name)
+/// {
+///         struct object_id oid;
+///
+///         if (repo_get_oid(the_repository, name, &oid))
+///                 return 0;
+///         return OBJ_NONE < odb_read_object_info(the_repository->objects, &oid, NULL);
+/// }
+/// ```
+///
+/// Both halves matter and they pull opposite ways: `repo_get_oid()` is the
+/// full-length-hex rule, so an absent hex gets past it, and then the explicit
+/// object-info lookup rejects it. So — unlike every other operand blame
+/// resolves — a well-formed absent hex is *not* a rev here, and
+/// `git blame <absent-hex>` is a request to blame a **path** by that name.
 fn is_a_rev(repo: &gix::Repository, name: &str) -> bool {
-    repo.rev_parse_single(name).is_ok()
+    match crate::objname::resolve(repo, name) {
+        Some(id) => repo.find_object(id).is_ok(),
+        None => false,
+    }
+}
+
+/// The fatal `setup_revisions()` raises for one revision operand, complete with
+/// any line an inner lookup printed first, or `None` when the operand is not one
+/// of the shapes that rule covers and blame's own diagnosis stands.
+///
+/// `cmd_blame()` hands its operands to `setup_revisions()` untouched, so blame
+/// inherits both halves of `get_oid_basic()`'s full-length-hex rule: a bare
+/// absent hex resolves and then dies in `get_reference()` as `bad object`, and a
+/// range whose endpoints resolve to objects the repository does not have dies in
+/// `dotdot_missing()` naming the whole token. `gix`'s parser consults the object
+/// database, so without this both come back as `bad revision '<operand>'`.
+fn setup_revisions_fatal(repo: &gix::Repository, token: &str) -> Option<String> {
+    if crate::objname::split_range(token).is_some() {
+        return crate::objname::dotdot_fatal(repo, token);
+    }
+    crate::objname::bad_object_name(repo, token).map(|name| format!("fatal: bad object {name}\n"))
+}
+
+/// Report [`setup_revisions_fatal`] and stop, when it has something to say.
+fn setup_revisions_refusal(repo: &gix::Repository, token: &str) -> Result<Option<Targets>> {
+    let Some(message) = setup_revisions_fatal(repo, token) else {
+        return Ok(None);
+    };
+    let mut err = std::io::stderr().lock();
+    write!(err, "{message}")?;
+    err.flush()?;
+    Ok(Some(Targets::Fatal(ExitCode::from(128))))
 }
 
 /// Resolve a revision to the commit it names (peeling tags), or `None` if it is
 /// not a valid revision — git's `get_oid` followed by a peel to commit.
+///
+/// Callers must run [`setup_revisions_refusal`] on the operand first: this
+/// answers `None` both for a name that does not resolve and for one that
+/// resolves to an object the repository lacks, and git reports those two
+/// differently.
 fn resolve_commit(repo: &gix::Repository, rev: &str) -> Option<ObjectId> {
     repo.rev_parse_single(rev)
         .ok()?
@@ -2443,6 +2498,124 @@ fn resolve_commit(repo: &gix::Repository, rev: &str) -> Option<ObjectId> {
         .peel_to_commit()
         .ok()
         .map(|c| c.id().detach())
+}
+
+/// The long options reachable from `setup_revisions()` that take a *separate*
+/// value argument and are reported by `parse-options` when it is missing:
+/// ``error: option `<name>' requires a value``, exit 129. These are the entries of
+/// the `parseopts[]` table `diff.c:prep_parse_options()` builds.
+static REV_OPT_PARSE_OPTIONS_VALUE: &[&str] = &[
+    "anchored", "color-moved-ws", "diff-algorithm", "diff-filter", "dst-prefix", "find-object",
+    "ignore-matching-lines", "inter-hunk-context", "line-prefix", "max-depth", "output",
+    "output-indicator-context", "output-indicator-new", "output-indicator-old", "rotate-to",
+    "skip-to", "src-prefix", "stat-count", "stat-graph-width", "stat-name-width", "stat-width",
+    "word-diff-regex", "ws-error-highlight",
+];
+
+/// The same, for the options `revision.c`'s own hand-rolled matcher owns: it
+/// `die()`s with `fatal: Option '--<name>' requires a value` at exit 128.
+static REV_OPT_REVISION_VALUE: &[&str] = &[
+    "after", "author", "before", "committer", "date", "encoding", "exclude", "exclude-hidden",
+    "glob", "grep", "grep-reflog", "max-age", "max-count", "max-count-oldest", "min-age", "since",
+    "since-as-filter", "skip", "until",
+];
+
+/// git's answer to a `-`-leading token in the revision slot of
+/// `git blame -- <path> <token>`, which `setup_revisions()` parses as an option.
+///
+/// `Ok(None)` means the option parsed — for this port's purposes, that it was
+/// consumed and had no effect on which commit is blamed. `Ok(Some(code))` means
+/// its value was missing: the diagnostic is already on stderr and `code` is the
+/// status to exit with. Which of the three diagnostics fires depends on which
+/// parser owns the name; all three were read off git v2.55.0 by feeding every
+/// option `git blame` accepts through this position.
+///
+/// The rest of value *validation* is out of scope here: `--max-count=` reaches its
+/// parser with an empty string and fails there (`fatal: '': not an integer`), which
+/// needs the parsers themselves, not this table. Options that change which commits
+/// the walk starts from (`--all`, `--branches`, `--reflog`, `--merge`, `--follow`,
+/// `--ancestry-path`) are likewise still dropped rather than honoured.
+fn trailing_option_missing_value(arg: &str) -> Result<Option<ExitCode>> {
+    let mut err = std::io::stderr().lock();
+    if let Some(body) = arg.strip_prefix("--") {
+        // `--name=<value>` carries its value with it, so it is never missing one.
+        if body.contains('=') {
+            return Ok(None);
+        }
+        if REV_OPT_PARSE_OPTIONS_VALUE.contains(&body) {
+            writeln!(err, "error: option `{body}' requires a value")?;
+            err.flush()?;
+            return Ok(Some(ExitCode::from(129)));
+        }
+        if REV_OPT_REVISION_VALUE.contains(&body) {
+            writeln!(err, "fatal: Option '--{body}' requires a value")?;
+            err.flush()?;
+            return Ok(Some(ExitCode::from(128)));
+        }
+        // `--default <rev>` names the revision to fall back on; without one,
+        // `revision.c` rejects the empty name it was left holding.
+        if body == "default" {
+            writeln!(err, "error: bad --default argument")?;
+            err.flush()?;
+            return Ok(Some(ExitCode::from(128)));
+        }
+        return Ok(None);
+    }
+    // `-C[<score>]` / `-M[<score>]` (`diff_opt_find_copies()` /
+    // `diff_opt_find_renames()`): the attached score goes through
+    // `parse_rename_score()`, which stops at the first character it cannot use, and
+    // whatever is left over is what the callback rejects. `git blame`'s *own*
+    // `-C`/`-M` take the same spelling but `blame_copy_callback()`'s `parse_score()`
+    // silently yields 0 for a score it cannot read, so only here does `-CC` fail.
+    for (flag, name) in [("-C", "find-copies"), ("-M", "find-renames")] {
+        if let Some(score) = arg.strip_prefix(flag) {
+            if !rename_score_consumed(score) {
+                writeln!(err, "error: invalid argument to {name}")?;
+                err.flush()?;
+                return Ok(Some(ExitCode::from(129)));
+            }
+            return Ok(None);
+        }
+    }
+    // A short option only lacks its value when nothing is attached to it: `-l5`
+    // and `-Sfoo` are complete, `-l` and `-S` are not. A bare `-` is not an option
+    // name at all and is dropped like any other unrecognised one.
+    match &arg[1..] {
+        // `handle_revision_opt()` checks `-n`'s argument itself, before
+        // `parse-options` ever sees it.
+        "n" => {
+            writeln!(err, "error: -n requires an argument")?;
+            err.flush()?;
+            Ok(Some(ExitCode::from(128)))
+        }
+        c @ ("l" | "G" | "I" | "O" | "S") => {
+            writeln!(err, "error: switch `{c}' requires a value")?;
+            err.flush()?;
+            Ok(Some(ExitCode::from(129)))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Whether git's `parse_rename_score()` (`diff.c`) consumes `score` whole, which is
+/// the test `-C<score>` / `-M<score>` apply to their argument.
+///
+/// The scanner takes digits and at most one `.`; a `%` is "always at the end", so it
+/// stops the scan and anything after it is left over. Everything else stops the scan
+/// too, which is how `C`, `+3`, `1e3` and a second `.` end up rejected while `.`,
+/// `%`, `0` and `50%` are accepted.
+fn rename_score_consumed(score: &str) -> bool {
+    let mut dot = false;
+    let mut chars = score.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '.' if !dot => dot = true,
+            '%' => return chars.next().is_none(),
+            '0'..='9' => {}
+            _ => return false,
+        }
+    }
+    true
 }
 
 /// Split the collected positionals into `[<rev>...] <file>` following git
@@ -2463,7 +2636,20 @@ fn resolve_targets(repo: &gix::Repository, opts: &mut Options) -> Result<Targets
                     let mut it = post.into_iter();
                     let file = it.next().unwrap();
                     let rev = it.next().unwrap();
-                    (vec![rev], file)
+                    // `cmd_blame` reorders this shape to `<rev> -- <path>` and hands
+                    // the whole array to `setup_revisions()`, which routes anything
+                    // starting with `-` to `handle_revision_opt()` / `diff_opt_parse()`
+                    // instead of `get_oid()`. So a `-`-leading token here is an
+                    // *option*, never a revision: it is silently dropped unless it is
+                    // one that needs a value it was not given.
+                    if rev.starts_with('-') {
+                        if let Some(code) = trailing_option_missing_value(&rev)? {
+                            return Ok(Targets::Fatal(code));
+                        }
+                        (vec![], file)
+                    } else {
+                        (vec![rev], file)
+                    }
                 }
                 _ => return Ok(Targets::Usage),
             }
@@ -2504,6 +2690,11 @@ fn resolve_targets(repo: &gix::Repository, opts: &mut Options) -> Result<Targets
     // commit to dig from`.
     let mut suspect: Option<(String, ObjectId)> = None;
     for r in &revs {
+        // `setup_revisions()` runs over the whole operand list before
+        // `cmd_blame()` looks at any of it, so its own refusals come first.
+        if let Some(fatal) = setup_revisions_refusal(repo, r)? {
+            return Ok(fatal);
+        }
         match resolve_commit(repo, r) {
             Some(id) => {
                 if let Some((first, _)) = &suspect {
@@ -2547,6 +2738,11 @@ fn resolve_reverse_targets(
     // (symmetric difference) is not a range the reverse walk can be expressed over, since it has
     // no single initial commit.
     for r in revs {
+        // Same ordering as the forward path: `setup_revisions()` has already
+        // refused the operand before blame gets to read it as a range.
+        if let Some(fatal) = setup_revisions_refusal(repo, r)? {
+            return Ok(fatal);
+        }
         if r.contains("...") {
             let mut err = std::io::stderr().lock();
             writeln!(err, "fatal: unsupported revision range for --reverse: {r}")?;
@@ -3297,6 +3493,11 @@ impl Options {
                 // placements. It is the same knob `--diff-algorithm=minimal`
                 // sets, so the last of the two on the command line wins.
                 "--minimal" => diff_algorithm = Some(gix::diff::blob::Algorithm::MyersMinimal),
+                // `--patience` is `XDF_PATIENCE_DIFF` in the same `xdl_opts` word,
+                // i.e. the knob `--diff-algorithm=patience` sets, so the last of the
+                // two on the command line wins — the exact shape of `--minimal`
+                // above.
+                "--patience" => diff_algorithm = Some(gix::diff::blob::Algorithm::Patience),
                 // `--indent-heuristic` sets `XDF_INDENT_HEURISTIC`, which
                 // `diff.indentHeuristic` already sets by default
                 // (`diff.c:57 static int diff_indent_heuristic = 1;`), so the
@@ -3339,7 +3540,7 @@ impl Options {
                     let v = args
                         .get(i)
                         .ok_or_else(|| anyhow!("option `--diff-algorithm` requires a value"))?;
-                    match parse_diff_algorithm(v)? {
+                    match parse_diff_algorithm(v) {
                         Some(alg) => diff_algorithm = Some(alg),
                         None => {
                             return Ok(ParseOutcome::OptError(DIFF_ALGORITHM_ERROR.to_string()))
@@ -3347,7 +3548,7 @@ impl Options {
                     }
                 }
                 _ if a.starts_with("--diff-algorithm=") => {
-                    match parse_diff_algorithm(&a["--diff-algorithm=".len()..])? {
+                    match parse_diff_algorithm(&a["--diff-algorithm=".len()..]) {
                         Some(alg) => diff_algorithm = Some(alg),
                         None => {
                             return Ok(ParseOutcome::OptError(DIFF_ALGORITHM_ERROR.to_string()))
@@ -3533,23 +3734,26 @@ const DIFF_ALGORITHM_ERROR: &str =
 
 /// git's `diff-algorithm` value parser: the names `parse_algorithm_value()` accepts.
 ///
-/// `Ok(None)` is git's `parse_algorithm_value() < 0`, which
+/// `None` is git's `parse_algorithm_value() < 0`, which
 /// `blame_diff_algorithm_callback` turns into [`DIFF_ALGORITHM_ERROR`] and
 /// `parse-options` into exit 129 — *not* a `die()`, so it must not be reported as
-/// `fatal:`. `Err` is reserved for `patience`, a valid git algorithm the vendored
-/// `gix-diff` does not implement, which is refused rather than silently substituted.
-fn parse_diff_algorithm(name: &str) -> Result<Option<gix::diff::blob::Algorithm>> {
+/// `fatal:`. Every name git accepts maps to an algorithm the vendored
+/// `gix-imara-diff` implements, `patience` included (its `patience.rs` is git's
+/// `xdiff/xpatience.c`), so no valid value is refused here — refusing one during
+/// option parsing would also fire *before* `cmd_blame` has validated the
+/// positional shape, turning git's usage error (129) into an unrelated failure.
+fn parse_diff_algorithm(name: &str) -> Option<gix::diff::blob::Algorithm> {
     use gix::diff::blob::Algorithm;
     if name.eq_ignore_ascii_case("myers") || name.eq_ignore_ascii_case("default") {
-        Ok(Some(Algorithm::Myers))
+        Some(Algorithm::Myers)
     } else if name.eq_ignore_ascii_case("minimal") {
-        Ok(Some(Algorithm::MyersMinimal))
+        Some(Algorithm::MyersMinimal)
     } else if name.eq_ignore_ascii_case("histogram") {
-        Ok(Some(Algorithm::Histogram))
+        Some(Algorithm::Histogram)
     } else if name.eq_ignore_ascii_case("patience") {
-        bail!("diff algorithm 'patience' is not implemented")
+        Some(Algorithm::Patience)
     } else {
-        Ok(None)
+        None
     }
 }
 
@@ -4018,6 +4222,47 @@ mod tests {
         // `0x10` stops at `x`, and a lone tab never reaches a digit.
         for bad in ["", "abc", "true", "false", "v1", "=", "%H%n", "\t", "0x10", "8x"] {
             assert!(parse_abbrev_cb(bad).is_err(), "{bad:?} should be rejected");
+        }
+    }
+
+    /// The `-C<score>` / `-M<score>` argument test `setup_revisions()` applies to a
+    /// trailing `git blame -- <path> <token>`, whose accept/reject split is
+    /// `parse_rename_score()`'s scanner rather than a numeric parse.
+    ///
+    /// Every expectation was read off stock git 2.55.0 as
+    /// `git blame -- <path> -C<score>`: exit 0 for the accepted ones, and
+    /// `error: invalid argument to find-copies` at exit 129 for the rejected ones.
+    #[test]
+    fn rename_score_argument_matches_git() {
+        // Digits, one `.`, and a `%` that ends the number. A bare `-C` arrives here
+        // as the empty string, which the scanner consumes trivially.
+        for good in ["", "0", "40", "50%", ".5", ".", "%", "1.5", "1.5%"] {
+            assert!(rename_score_consumed(good), "-C{good} should be accepted");
+        }
+        // Anything the scanner stops on and cannot consume: a letter (`-CC` is the
+        // one that reaches this from a real command line), a sign, an exponent, a
+        // second `.`, and anything trailing the `%` that ends the scan.
+        for bad in ["C", "foo", "4x", "+3", "-1", "1e3", "1.2.3", "50%x", "10%%", " "] {
+            assert!(!rename_score_consumed(bad), "-C{bad} should be rejected");
+        }
+    }
+
+    /// `--diff-algorithm=<name>`: every name git accepts maps to an algorithm, and
+    /// only a name git itself rejects yields `None` (git's
+    /// `parse_algorithm_value() < 0`, reported as [`DIFF_ALGORITHM_ERROR`]).
+    #[test]
+    fn diff_algorithm_names_match_git() {
+        use gix::diff::blob::Algorithm;
+        assert_eq!(parse_diff_algorithm("myers"), Some(Algorithm::Myers));
+        assert_eq!(parse_diff_algorithm("default"), Some(Algorithm::Myers));
+        assert_eq!(parse_diff_algorithm("minimal"), Some(Algorithm::MyersMinimal));
+        assert_eq!(parse_diff_algorithm("histogram"), Some(Algorithm::Histogram));
+        // The one that used to be refused: `gix-imara-diff`'s `patience.rs` is git's
+        // `xdiff/xpatience.c`, so the name maps like the other three.
+        assert_eq!(parse_diff_algorithm("patience"), Some(Algorithm::Patience));
+        assert_eq!(parse_diff_algorithm("PATIENCE"), Some(Algorithm::Patience));
+        for bad in ["", "pat", "patience2", "none", "0"] {
+            assert_eq!(parse_diff_algorithm(bad), None, "{bad:?} is not a git name");
         }
     }
 

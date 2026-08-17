@@ -178,10 +178,13 @@ pub fn request_pull(args: &[String]) -> Result<ExitCode> {
             }
             match matches.into_iter().next() {
                 Some(name) => Some(name),
-                None => repo
-                    .rev_parse_single(local)
-                    .ok()
-                    .map(|id| id.detach().to_hex().to_string()),
+                // `git rev-parse --quiet --verify "$local"`, which prints an id
+                // for a full-length hex whether or not the repository has that
+                // object (see [`crate::objname`]). So `$head` is non-empty and
+                // the script gets past its `Not a valid revision` to the
+                // `"$head"^0` line below, which is the one that fails — that is
+                // why an absent full hex is reported as an *ambiguous* revision.
+                None => crate::objname::resolve(&repo, local).map(|id| id.to_hex().to_string()),
             }
         }
     };

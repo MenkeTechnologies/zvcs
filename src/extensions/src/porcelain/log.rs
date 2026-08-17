@@ -782,6 +782,12 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // `--expand-tabs[=<n>]` / `--no-expand-tabs`; `None` leaves each pretty format
     // on its own default.
     let mut expand_tabs: Option<usize> = None;
+    // `-g`/`--walk-reflogs` (`revs->reflog_info`): walk each named ref's reflog,
+    // newest entry first, instead of the history reachable from its tip.
+    let mut walk_reflogs = false;
+    // `revs->date_mode_explicit`: whether `--date=` was given on the command line,
+    // which is what the `-g` selector consults (`log.date` alone does not).
+    let mut date_explicit = false;
     let mut reverse = false;
     let mut only_merges = false;
     let mut no_merges = false;
@@ -857,12 +863,18 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // default after one — even though every individual format flag is off again.
     let mut saw_no_patch = false;
 
+    // `setup_revisions()`'s `seen_dashdash`, which it sets in a scan of its own
+    // *before* it resolves anything — so it is in force for the arguments
+    // standing in front of the separator too, as `REVARG_CANNOT_BE_FILENAME`.
+    let mut seen_dashdash = false;
+
     let mut i = 0;
     while i < args.len() {
         let a = &args[i];
         if a == "--" {
             // Everything after `--` is a pathspec, even tokens that look like
             // flags — git stops option parsing at the separator.
+            seen_dashdash = true;
             pathspecs.extend(args[i + 1..].iter().cloned());
             break;
         }
@@ -1028,6 +1040,10 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                     return Ok(ExitCode::from(128));
                 }
             }
+            // `revs->date_mode_explicit` (revision.c): only the *option* sets it,
+            // never `log.date`. It is what switches a `--walk-reflogs` selector
+            // from `HEAD@{0}` to `HEAD@{<date>}`.
+            date_explicit = true;
         } else if let Some(v) = a.strip_prefix("--min-parents=") {
             match parse_nonneg(v) {
                 Some(n) => min_parents = Some(n),
@@ -1247,6 +1263,10 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             }
         } else if a == "--do-walk" {
             no_walk = None;
+        } else if a == "-g" || a == "--walk-reflogs" {
+            // `init_reflog_walk(&revs->reflog_info)`: the walk stops being a
+            // traversal of ancestry and becomes one of each named ref's reflog.
+            walk_reflogs = true;
         } else if a == "--reverse" {
             // `revs->reverse ^= 1` (revision.c): a toggle, so an even number of
             // `--reverse`s leaves the walk in its original order.
@@ -1596,6 +1616,12 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // `read_revisions_from_stdin()`: every line is another revision argument, until
     // a bare `--` turns the rest into pathspecs. They are appended after the ones
     // the command line named, which is where git puts them.
+    // `read_revisions_from_stdin()` brackets its loop with
+    // `cfg->warn_on_object_refname_ambiguity = 0`, so a name that arrives on stdin
+    // never gets the ambiguity warning the same name on argv gets. The lines are
+    // appended to `revs` and resolved further down rather than here, so the
+    // boundary is remembered instead of the switch being held.
+    let argv_revs = revs.len();
     if read_stdin {
         use std::io::Read as _;
         let mut text = String::new();
@@ -1630,21 +1656,43 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // not a revision. Ranges and `^`-prefixed arguments both land here. `token` is
     // the argument as written, which is what `setup_revisions()` names in the
     // message even when only one endpoint of a range failed.
+    // git's `revs->rev_input_given`, for the arguments that resolve and then
+    // leave nothing behind: a pending tree or blob is dropped by
+    // `handle_commit()` but the flag was already set, so `revs->def` stays out.
+    let mut rev_input_given = false;
     let mut resolve_neg = |spec: &str, token: &str, neg_ids: &mut Vec<ObjectId>| -> Option<ExitCode> {
         match resolve_rev(&repo, spec) {
             Ok(id) => {
-                neg_ids.push(id);
+                // `handle_commit()` drops an UNINTERESTING tree or blob rather
+                // than excluding anything by it, so `<tree>..HEAD` walks the
+                // whole history instead of failing.
+                neg_ids.extend(crate::objname::walk_pending(&repo, id));
                 None
             }
             Err(_) => {
-                let hex_len = repo.object_hash().len_in_hex();
-                eprint!("{}", bad_revision_message(token, hex_len));
+                eprint!("{}", bad_revision_message_in(&repo, token));
                 Some(ExitCode::from(128))
             }
         }
     };
     for (at, (spec, negated)) in revs.iter().zip(rev_negated.iter().copied()).enumerate() {
-        if let Some((a, b)) = spec.split_once("...") {
+        // `handle_revision_arg_1()` puts every endpoint of the token through
+        // `get_oid_with_context()`, so `get_oid_basic()`'s ambiguity warning fires
+        // once per endpoint — twice for a range. The lines `--stdin` supplied are
+        // exempt, which is what `read_revisions_from_stdin()` clears the switch for.
+        if at < argv_revs {
+            for endpoint in revision_endpoints(spec) {
+                crate::objname::warn_ambiguous_refname(&repo, endpoint);
+            }
+        }
+        // `handle_revision_arg_1()`'s guard ahead of `handle_dotdot()`: a bare
+        // `..` is the pathspec for the parent directory, not `HEAD..HEAD`. It
+        // falls through to the plain branch, fails to resolve, and is taken as a
+        // path — which the pathspec layer then rejects for leaving the
+        // repository. See [`crate::objname::is_parent_directory_pathspec`].
+        if crate::objname::is_parent_directory_pathspec(spec, seen_dashdash) {
+            pos_specs.push((at, spec.to_string(), spec.to_string()));
+        } else if let Some((a, b)) = spec.split_once("...") {
             let a = if a.is_empty() { "HEAD" } else { a };
             let b = if b.is_empty() { "HEAD" } else { b };
             parsed.extend(navigation_path(&repo, a));
@@ -1728,6 +1776,16 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             } else {
                 pos_specs.push((at, bare.to_string(), bare.to_string()));
             }
+        }
+    }
+    // `add_reflog_for_walk()`: `if (commit->object.flags & UNINTERESTING) die("cannot
+    // walk reflogs for %s", name)`. A reflog walk starts from a ref's log, and an
+    // excluded tip has none to start from — git raises it the moment the argument is
+    // pended, so it beats every post-loop conflict check below.
+    if walk_reflogs {
+        if let Some(name) = reflog_excluded_tip(&repo, &revs, &rev_negated) {
+            eprintln!("fatal: cannot walk reflogs for {name}");
+            return Ok(ExitCode::from(128));
         }
     }
     // git resolves each positional token as a revision; the first that is *not* a
@@ -1817,14 +1875,51 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     let mut specs = pos_specs.iter().peekable();
     for at in 0..=revs.len() {
         push_ref_tips(at, &mut tips, &mut tip_names, &mut tip_sources, &mut neg_ids);
+        // `handle_dotdot()` is the first thing `handle_revision_arg_1()` tries, so a
+        // range whose endpoints resolve as names but not as usable objects dies here
+        // — before this token is read as a tip and long before the walk finds out.
+        // Checked per argument, in argument order, which is the order git dies in.
+        if !in_paths {
+            if let Some(msg) = revs.get(at).and_then(|t| crate::objname::dotdot_fatal(&repo, t)) {
+                eprint!("{msg}");
+                return Ok(ExitCode::from(128));
+            }
+        }
+        // `append_prune_data(&prune_data, argv + i)` prunes with the *arguments*,
+        // not with the endpoints a range split produced — so a token that failed
+        // as a revision becomes the pathspec it was written as. `../..` splits
+        // into `HEAD` and `/..`, and it is `../..` that git names when the
+        // pathspec layer rejects it.
+        let mut prune = |pathspecs: &mut Vec<String>, fallback: &String| {
+            let token = revs.get(at).unwrap_or(fallback);
+            if pathspecs.last() != Some(token) {
+                pathspecs.push(token.clone());
+            }
+        };
         while let Some((_, spec, name)) = specs.next_if(|(i, _, _)| *i == at) {
             if in_paths {
-                pathspecs.push(spec.clone());
+                prune(&mut pathspecs, spec);
                 continue;
             }
             match repo.rev_parse_single(spec.as_str()) {
                 Ok(id) => {
-                    tips.push(peel_to_commit(&repo, id.detach()));
+                    // `prepare_revision_walk()`'s `handle_commit()` peels a tag
+                    // and drops a tree or a blob without a word — the pending
+                    // entry disappears, name and all, and the command still
+                    // exits 0. `git log <tree>`, `git log <blob>` and
+                    // `git log HEAD..<tag-of-a-tree>` all print nothing in stock
+                    // 2.55.0 rather than failing.
+                    //
+                    // The argument still counts as revision input: git sets
+                    // `revs->rev_input_given` in `handle_revision_arg()` as soon
+                    // as `handle_revision_arg_1()` returns 0, which is long
+                    // before the walk drops the entry. So `git log <tree>` walks
+                    // nothing at all rather than falling back to `revs->def`.
+                    rev_input_given = true;
+                    let Some(commit) = crate::objname::walk_pending(&repo, id.detach()) else {
+                        continue;
+                    };
+                    tips.push(commit);
                     tip_names.push(name.clone());
                     if source_mode {
                         tip_sources.push(name.clone());
@@ -1832,14 +1927,13 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                 }
                 Err(_) if spec_is_path(&repo, spec) => {
                     in_paths = true;
-                    pathspecs.push(spec.clone());
+                    prune(&mut pathspecs, spec);
                 }
                 Err(_) => {
-                    let hex_len = repo.object_hash().len_in_hex();
                     // `setup_revisions()` names the argument as written, so a range
                     // whose endpoint failed is reported whole.
                     let token = revs.get(at).map(String::as_str).unwrap_or(spec.as_str());
-                    eprint!("{}", bad_revision_message(token, hex_len));
+                    eprint!("{}", bad_revision_message_in(&repo, token));
                     return Ok(ExitCode::from(128));
                 }
             }
@@ -1852,7 +1946,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // nothing: `--remotes` in a repository with no remotes is still an input.
     // A token that turned out to be a pathspec is not — `git log .` walks `HEAD`.
     let positive_from_args =
-        !tips.is_empty() || !neg_ids.is_empty() || !ref_selections.is_empty();
+        rev_input_given || !tips.is_empty() || !neg_ids.is_empty() || !ref_selections.is_empty();
     if !positive_from_args {
         let head = repo.head()?;
         if head.is_unborn() && !all {
@@ -1885,6 +1979,23 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // for `--graph`, so each of those conflicts with `--children` exactly as
     // `--parents` does. The two decorations share one slot in the header and git
     // refuses to print both rather than pick an order.
+    // `if (revs->reflog_info && revs->limited) die(...)` — a reflog walk hands its
+    // entries out in reflog order, so anything that makes git build a *limited*
+    // (topologically ordered) revision list first has nothing to hand it. The
+    // limiting options this module models are the three sort orders, `--graph`,
+    // `--children` and `--simplify-merges`; `--reverse` has its own message and
+    // comes next. Both are refused ahead of the `--parents`/`--children` check
+    // below, which is where `setup_revisions()` puts them.
+    if walk_reflogs {
+        if order != Order::Default || graph || show_children || simplify_merges_opt {
+            eprintln!("fatal: cannot combine --walk-reflogs with history-limiting options");
+            return Ok(ExitCode::from(128));
+        }
+        if reverse {
+            eprintln!("fatal: options '--reverse' and '--walk-reflogs' cannot be used together");
+            return Ok(ExitCode::from(128));
+        }
+    }
     let rewrite_parents = show_parents || graph || simplify_merges_opt || simplify_by_decoration;
     if rewrite_parents && show_children {
         eprintln!("fatal: options '--parents' and '--children' cannot be used together");
@@ -1942,7 +2053,15 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // walk cannot stop at `skip + max_count` commits there.
     let budget = (unfiltered && max_count.is_some() && flavor == Flavor::Log)
         .then(|| skip.saturating_add(max_count.unwrap_or(0)));
-    let mut nodes = walk(&repo, &tips, &tip_sources, first_parent, &hidden, budget, no_walk)?;
+    // `-g`: `get_revision_1()` calls `next_reflog_entry()` in place of popping the
+    // frontier, so the list is the reflog entries themselves rather than anything
+    // reachable from a tip. Each entry keeps the commit's *real* parents, which is
+    // what the pruning and the diffs below then use.
+    let mut nodes = if walk_reflogs {
+        reflog_walk(&repo, &tip_names)?
+    } else {
+        walk(&repo, &tips, &tip_sources, first_parent, &hidden, budget, no_walk)?
+    };
     // `-L` sets `revs->topo_order = 1` without touching `sort_order`, so it walks
     // topologically unless `--date-order` asked for the date-ordered variant.
     let effective_order = match (order, graph || line_level) {
@@ -2348,8 +2467,14 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         for node in nodes.into_iter() {
             let commit = repo.find_commit(node.id)?;
             // `--since`/`--until` gate on committer time (git's default), then
-            // the header/message predicates.
-            let seconds = commit.time()?.seconds;
+            // the header/message predicates. `comparison_date()` (revision.c):
+            // under `--walk-reflogs` the clock the range is measured against is
+            // the *reflog entry's*, not the commit's — the same commit can sit
+            // under entries from either side of the cutoff.
+            let seconds = match &node.reflog {
+                Some(rl) => rl.time.seconds,
+                None => commit.time()?.seconds,
+            };
             if since.is_some_and(|s| seconds < s) || until.is_some_and(|u| seconds > u) {
                 continue;
             }
@@ -2695,6 +2820,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         pretty: &pretty,
         notes: &notes_trees,
         expand_tabs,
+        date_explicit,
     });
     // The pathspec set the name/stat formats are limited to, parsed once rather
     // than per commit. `--follow` replaces it per commit (see below).
@@ -3299,6 +3425,91 @@ pub(super) fn bad_revision_message(spec: &str, hex_len: usize) -> String {
     )
 }
 
+/// [`bad_revision_message`] with the repository in hand, which is the only way to
+/// tell a range apart from a name that merely looks like one.
+///
+/// `setup_revisions()` reaches `handle_dotdot()` *before* the single-name path, so
+/// a token holding `..` gets the range diagnosis when it earns one and falls back
+/// to the plain message otherwise. Every caller that has a repository should use
+/// this; [`bad_revision_message`] stays as the shape-only half.
+pub(super) fn bad_revision_message_in(repo: &gix::Repository, spec: &str) -> String {
+    crate::objname::dotdot_fatal(repo, spec)
+        .unwrap_or_else(|| bad_revision_message(spec, repo.object_hash().len_in_hex()))
+}
+
+/// The fatal `handle_revision_arg()` raises *itself*, or `None` when the token is
+/// still free to become a pathspec.
+///
+/// [`bad_revision_message_in`] answers "what does git say once this argument has
+/// failed"; this answers the question a caller has to ask first, because
+/// `setup_revisions()` has two quite different endings:
+///
+/// ```c
+/// if (handle_revision_arg(arg, revs, flags, revarg_opt)) {
+///         if (seen_dashdash || *arg == '^')
+///                 die(_("bad revision '%s'"), arg);
+///         for (j = i; j < argc; j++)
+///                 verify_filename(revs->prefix, argv[j], j == i);
+///         …
+/// }
+/// ```
+///
+/// — a *returned* failure may still end up a pathspec, while the two shapes here
+/// die inside `handle_revision_arg()` and never reach that block at all:
+///
+/// * `dotdot_missing()`, for a range whose endpoints resolved but whose objects
+///   are not in the database (see [`crate::objname::dotdot_fatal`]);
+/// * `get_reference()`'s `die("bad object %s", name)`, for a name that
+///   [`crate::objname::full_hex`] decoded and `parse_object()` could not find —
+///   with the leading `^` already stripped, since `handle_revision_arg_1()`
+///   advances past it before resolving.
+///
+/// So a caller with a filename fallback must consult this before taking it: `git
+/// log <absent-full-hex>` is `fatal: bad object`, not a pathspec, even when a file
+/// of that name is sitting in the working tree.
+///
+/// One thing does come between the name resolving and `get_reference()` dying,
+/// and it is the reason `cant_be_filename` is a parameter:
+///
+/// ```c
+/// if (get_oid_with_context(revs->repo, arg, get_sha1_flags, &oid, &oc))
+///         return revs->ignore_missing ? 0 : -1;
+/// if (!cant_be_filename)
+///         verify_non_filename(revs->prefix, arg);
+/// object = get_reference(revs, arg, &oid, flags ^ local_flags);
+/// ```
+///
+/// A name that resolved *and* names an existing file is "both revision and
+/// filename" whether or not the object is there, so that message wins over
+/// `bad object`. `cant_be_filename` is `REVARG_CANNOT_BE_FILENAME`, which
+/// `setup_revisions()` sets only for arguments in front of a `--` it found itself.
+///
+/// `handle_dotdot_1()` runs the same check on `full_name`, between resolving the
+/// two endpoints and `parse_object()`ing them, so a range that is *also* a
+/// working-tree path is "both revision and filename" ahead of
+/// `dotdot_missing()`. This port takes the range branch first and so misses that
+/// ordering; the shape needs a file literally named `<rev>..<rev>`, and no case
+/// in the differential or the parity corpus reaches it.
+pub(super) fn early_revision_fatal(
+    repo: &gix::Repository,
+    spec: &str,
+    cant_be_filename: bool,
+) -> Option<String> {
+    if let Some(message) = crate::objname::dotdot_fatal(repo, spec) {
+        return Some(message);
+    }
+    let bare = spec.strip_prefix('^').unwrap_or(spec);
+    if !crate::objname::resolves_but_absent(repo, bare) {
+        return None;
+    }
+    if !cant_be_filename {
+        if let Some(message) = crate::setup::verify_non_filename(repo, bare) {
+            return Some(format!("fatal: {message}\n"));
+        }
+    }
+    Some(bad_revision_message(bare, repo.object_hash().len_in_hex()))
+}
+
 // ---------------------------------------------------------------------------
 // Revision walk
 // ---------------------------------------------------------------------------
@@ -3361,6 +3572,8 @@ struct EntryParams<'a> {
     notes: &'a [super::notes::Tree],
     /// `--expand-tabs[=<n>]` / `--no-expand-tabs`; see [`RenderCtx::expand_tabs`].
     expand_tabs: Option<usize>,
+    /// `revs->date_mode_explicit`: see [`RenderCtx::date_explicit`].
+    date_explicit: bool,
 }
 
 /// A look-ahead buffer of rendered commit records.
@@ -3533,7 +3746,14 @@ fn entry_block_from(
         now: p.now,
         decorations: p.decorations,
         decorate: p.decorate,
-        source: if p.source_mode { Some(node.source.as_bytes()) } else { None },
+        // A `-g` record has no source to print: git never pends the commit itself
+        // under `--walk-reflogs`, so `revs->sources` records no name for it and
+        // `--source` adds nothing — not even the separating tab.
+        source: if p.source_mode && node.reflog.is_none() {
+            Some(node.source.as_bytes())
+        } else {
+            None
+        },
         mailmap: p.mailmap,
         identity_mailmap: p.identity_mailmap,
         notes: p.notes,
@@ -3542,6 +3762,8 @@ fn entry_block_from(
         parents: &node.parents,
         graph_width: node.graph_width,
         expand_tabs: p.expand_tabs,
+        reflog: node.reflog.as_ref(),
+        date_explicit: p.date_explicit,
     };
     let mut block: Vec<u8> = Vec::new();
     render_entry(&mut block, &commit, p.pretty, &ctx)?;
@@ -3730,6 +3952,326 @@ pub(crate) struct Node {
     /// column target has to leave room for. Zero unless `--graph` is on; filled in
     /// by [`measure_graph_widths`] once the walk's node list is final.
     pub(crate) graph_width: i32,
+    /// `-g`/`--walk-reflogs`: the reflog entry this record stands for. `None` for
+    /// an ordinary ancestry walk, which is what leaves every `%g…` placeholder and
+    /// the `Reflog:` header lines empty.
+    pub(crate) reflog: Option<ReflogEntry>,
+}
+
+/// One walked reflog entry: git's `struct reflog_info` together with the
+/// `<ref>@{…}` selector [`ReflogEntry::selector`] prints for it.
+///
+/// A reflog walk yields one of these per entry, newest first, and the same commit
+/// may appear under several of them — a reflog records where a ref *was*, so a
+/// reset and the commit it went back to are two entries naming one object.
+#[derive(Clone)]
+pub(crate) struct ReflogEntry {
+    /// `commit_reflog->reflogs->ref`: the ref as `-g` was asked for it — `HEAD`,
+    /// `main`, or the full name `--all` supplies. The `Reflog:` line and `%gD`
+    /// print it as-is; `%gd` shortens it.
+    refname: String,
+    /// `reflogs->nr - 2 - recno` once the entry has been consumed: its `@{<n>}`.
+    index: usize,
+    /// The entry's own clock — what `@{<date>}` prints under an explicit `--date=`,
+    /// and what orders a walk spanning several reflogs.
+    time: gix::date::Time,
+    /// `info->email`, which git prints whole inside the `Reflog:` parentheses.
+    who_name: Vec<u8>,
+    who_email: Vec<u8>,
+    /// The entry's message, without its trailing newline (`%gs`).
+    message: Vec<u8>,
+    /// `info->noid`: what the ref pointed at *after* this update, which is the
+    /// commit the record shows.
+    new_oid: ObjectId,
+    /// `commit_reflog->selector`: how the walk was asked for, which decides
+    /// whether the selector prints an index or a date.
+    kind: ReflogSelector,
+}
+
+/// git's `enum selector_type`: how the `@{…}` on a `-g` argument was spelled.
+///
+/// It outranks `--date=`: `HEAD@{1}` keeps index selectors under `--date=short`,
+/// and `HEAD@{yesterday}` prints dates without one.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReflogSelector {
+    /// No `@{…}`: index form unless `--date=` was given (git's `force_date`).
+    None,
+    /// `@{<n>}`: always the index form.
+    Index,
+    /// `@{<date>}`: always the date form.
+    Date,
+}
+
+/// Where in a ref's log a `-g <name>` argument starts, per `add_reflog_for_walk()`.
+enum ReflogStart {
+    /// No `@{…}` suffix: the newest entry.
+    Newest,
+    /// `@{<n>}`: `n` entries back from the newest.
+    Index(usize),
+    /// `@{<date>}`: the newest entry that was already current then.
+    Date(i64),
+}
+
+/// Split a `-g` argument into the ref to read and the entry to start at.
+///
+/// `add_reflog_for_walk()` looks at the *first* `@`, requires a `{` after it, and
+/// reads the rest with `strtoul`: digits followed by `}` is an index, anything
+/// else goes to `approxidate()`. A name without `@{` starts at the newest entry.
+fn split_reflog_name(name: &str) -> (&str, ReflogStart) {
+    let Some(at) = name.find('@') else {
+        return (name, ReflogStart::Newest);
+    };
+    let Some(inner) = name[at + 1..].strip_prefix('{') else {
+        return (name, ReflogStart::Newest);
+    };
+    let base = &name[..at];
+    let digits = inner.len() - inner.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+    if inner[digits..].starts_with('}') {
+        // `strtoul` answers 0 for an empty run, which is what `@{}` gets.
+        (base, ReflogStart::Index(inner[..digits].parse().unwrap_or(0)))
+    } else {
+        // git hands `approxidate` the tail as-is, closing brace included; it
+        // tokenizes on non-alphanumerics and ignores what it cannot read.
+        (base, ReflogStart::Date(crate::date::approxidate(inner)))
+    }
+}
+
+impl ReflogEntry {
+    /// `get_reflog_selector()`: `<ref>@{<n>}`, or `<ref>@{<date>}` when `--date=`
+    /// was given on the command line (git's `force_date`, i.e.
+    /// `revs->date_mode_explicit`). `shorten` is `%gd`'s short ref; the `Reflog:`
+    /// line and `%gD` pass `false`.
+    fn selector(&self, shorten: bool, date_mode: DateMode, force_date: bool, now: i64) -> String {
+        let name = if shorten {
+            super::reflog::shorten_ref(&self.refname)
+        } else {
+            self.refname.clone()
+        };
+        // `selector == SELECTOR_DATE || (selector == SELECTOR_NONE && force_date)`.
+        let force_date = match self.kind {
+            ReflogSelector::Date => true,
+            ReflogSelector::Index => false,
+            ReflogSelector::None => force_date,
+        };
+        if force_date {
+            let when = fmt_time(self.time.seconds, self.time.offset, date_mode, now);
+            format!("{name}@{{{when}}}")
+        } else {
+            format!("{name}@{{{}}}", self.index)
+        }
+    }
+}
+
+/// The name `commit_reflog->reflogs->ref` ends up holding, which is what the
+/// `Reflog:` header and `%gD` print (and what `%gd` shortens).
+///
+/// `read_complete_reflog()` looks for the log file under four spellings of the
+/// argument — as typed, under the reference it resolves to, `refs/<name>` and
+/// `refs/heads/<name>` — and records the name **as typed** whenever one of them
+/// answers. Only when all four come up empty does `add_reflog_for_walk()` fall
+/// back to `repo_dwim_log()` and *replace* the name with the full ref it found.
+/// That is why `-g main` keeps `main@{0}` while `-g origin/main` prints
+/// `refs/remotes/origin/main@{0}`: no `refs/origin/main` or
+/// `refs/heads/origin/main` exists, so only the `refs/remotes/` rule reaches it.
+fn reflog_display_name(repo: &gix::Repository, name: &str) -> String {
+    let direct = [
+        Some(name.to_string()),
+        super::reflog::resolve_ref_reading(repo, name),
+        Some(format!("refs/{name}")),
+        Some(format!("refs/heads/{name}")),
+    ];
+    if direct
+        .into_iter()
+        .flatten()
+        .any(|cand| super::reflog::log_file(repo, &cand).is_file())
+    {
+        return name.to_string();
+    }
+    super::reflog::dwim_log(repo, name).unwrap_or_else(|| name.to_string())
+}
+
+/// `read_complete_reflog()`: a ref's whole reflog in git's stored order (oldest
+/// entry first), each entry carrying the `@{<n>}` index its selector prints.
+///
+/// `None` means the ref has no log. That is not an error: `add_reflog_for_walk()`
+/// answers -1 and `add_pending_object_with_path()` returns without pending the
+/// commit either way, so `git log -g <tag>` prints nothing and exits 0.
+fn read_reflog(
+    repo: &gix::Repository,
+    name: &str,
+    kind: ReflogSelector,
+) -> Result<Option<Vec<ReflogEntry>>> {
+    let Some(reference) = repo.try_find_reference(name).ok().flatten() else {
+        return Ok(None);
+    };
+    let refname = reflog_display_name(repo, name);
+    let mut platform = reference.log_iter();
+    let Some(iter) = platform.all()? else {
+        return Ok(None);
+    };
+    let mut items: Vec<ReflogEntry> = Vec::new();
+    for line in iter {
+        let Ok(line) = line else { break };
+        items.push(ReflogEntry {
+            refname: refname.clone(),
+            // Filled in below: the index counts down from the newest entry, so it
+            // is only known once the whole log has been read.
+            index: 0,
+            time: line.signature.time().ok().unwrap_or_default(),
+            who_name: line.signature.name.to_vec(),
+            who_email: line.signature.email.to_vec(),
+            message: line.message.to_vec(),
+            new_oid: line.new_oid(),
+            kind,
+        });
+    }
+    if items.is_empty() {
+        return Ok(None);
+    }
+    let nr = items.len();
+    for (k, item) in items.iter_mut().enumerate() {
+        item.index = nr - 1 - k;
+    }
+    Ok(Some(items))
+}
+
+/// One `struct commit_reflog`: a ref's complete log plus `recno`, the cursor that
+/// walks it from the newest entry down.
+struct ReflogCursor {
+    items: Vec<ReflogEntry>,
+    recno: i64,
+}
+
+impl ReflogCursor {
+    /// `next_reflog_commit()`: step `recno` past any entry whose new object is not
+    /// a commit — a reflog records ref updates, and a ref may have pointed at a
+    /// tag, a tree, or an object this repository no longer holds.
+    fn advance(&mut self, repo: &gix::Repository) {
+        while self.recno >= 0 {
+            let id = self.items[self.recno as usize].new_oid;
+            if matches!(repo.find_header(id).map(|h| h.kind()), Ok(gix::objs::Kind::Commit)) {
+                return;
+            }
+            self.recno -= 1;
+        }
+    }
+
+    /// `log_timestamp()`: the clock of the entry the cursor is sitting on.
+    fn time(&self) -> i64 {
+        self.items[self.recno as usize].time.seconds
+    }
+}
+
+/// `-g`/`--walk-reflogs`: the node list `next_reflog_entry()` produces.
+///
+/// Every named ref's log is read whole, then drained newest-entry-first across all
+/// of them at once — git picks the log whose current entry is newest, and compares
+/// with `>` so a tie leaves the earlier-named log ahead. Each node keeps the
+/// commit's **real** parents: git saves them before the walk and `log_tree_diff()`
+/// reads them back, so both the diff a record shows and the pathspec pruning that
+/// decides whether it is shown at all are the ordinary ones. Only the *selection*
+/// of commits comes from the reflog, which is why one commit can appear several
+/// times over.
+fn reflog_walk(repo: &gix::Repository, names: &[String]) -> Result<Vec<Node>> {
+    let reader = NodeReader::new(repo);
+    let mut logs: Vec<ReflogCursor> = Vec::new();
+    for name in names {
+        let (base, start) = split_reflog_name(name);
+        let kind = match start {
+            ReflogStart::Newest => ReflogSelector::None,
+            ReflogStart::Index(_) => ReflogSelector::Index,
+            ReflogStart::Date(_) => ReflogSelector::Date,
+        };
+        // `if (*branch == '\0') branch = resolve_refdup("HEAD")`: a bare `@{…}`
+        // names the branch `HEAD` points at, so the selector shows that ref.
+        let resolved;
+        let base = if base.is_empty() {
+            resolved = repo
+                .head()
+                .ok()
+                .and_then(|h| h.referent_name().map(|n| n.as_bstr().to_str_lossy().into_owned()))
+                .unwrap_or_else(|| "HEAD".to_string());
+            resolved.as_str()
+        } else {
+            base
+        };
+        let Some(items) = read_reflog(repo, base, kind)? else { continue };
+        let nr = items.len() as i64;
+        let recno = match start {
+            ReflogStart::Newest => nr - 1,
+            // `commit_reflog->recno = reflogs->nr - recno - 1`, unchecked: a count
+            // past the end simply leaves the cursor below zero and walks nothing.
+            ReflogStart::Index(n) => nr - n as i64 - 1,
+            // `get_reflog_recno_by_time()`: the newest entry already current then,
+            // or nothing at all when the log does not go back that far.
+            ReflogStart::Date(when) => {
+                match (0..items.len()).rev().find(|&i| when >= items[i].time.seconds) {
+                    Some(i) => i as i64,
+                    None => continue,
+                }
+            }
+        };
+        let mut cursor = ReflogCursor { items, recno };
+        cursor.advance(repo);
+        logs.push(cursor);
+    }
+
+    let mut nodes: Vec<Node> = Vec::new();
+    loop {
+        let mut best: Option<usize> = None;
+        for (li, log) in logs.iter().enumerate() {
+            if log.recno < 0 {
+                continue;
+            }
+            if best.is_none_or(|b| log.time() > logs[b].time()) {
+                best = Some(li);
+            }
+        }
+        let Some(bi) = best else { break };
+        let entry = logs[bi].items[logs[bi].recno as usize].clone();
+        logs[bi].recno -= 1;
+        logs[bi].advance(repo);
+        let mut node = reader.read(repo, entry.new_oid)?;
+        node.seq = nodes.len() as u64;
+        node.reflog = Some(entry);
+        nodes.push(node);
+    }
+    Ok(nodes)
+}
+
+/// The excluded revision a `--walk-reflogs` run would have to start from, spelled
+/// the way `add_reflog_for_walk()` names it.
+///
+/// git expands `a..b` into `b ^a` and `a...b` into `a b ^<merge-base>`, so either
+/// range pends an UNINTERESTING tip; `--not` swaps which side that is. `None` when
+/// every argument is a plain positive revision.
+fn reflog_excluded_tip(
+    repo: &gix::Repository,
+    revs: &[String],
+    negated: &[bool],
+) -> Option<String> {
+    for (spec, flip) in revs.iter().zip(negated.iter().copied()) {
+        if let Some(rest) = spec.strip_prefix('^') {
+            if !flip {
+                return Some(rest.to_string());
+            }
+            continue;
+        }
+        if let Some((lhs, rhs)) = spec.split_once("...") {
+            let l = if lhs.is_empty() { "HEAD" } else { lhs };
+            let r = if rhs.is_empty() { "HEAD" } else { rhs };
+            let (l, r) = (repo.rev_parse_single(l).ok()?, repo.rev_parse_single(r).ok()?);
+            return repo.merge_base(l, r).ok().map(|b| b.detach().to_string());
+        }
+        if let Some((lhs, rhs)) = spec.split_once("..") {
+            let excluded = if flip { rhs } else { lhs };
+            return Some(if excluded.is_empty() { "HEAD".to_string() } else { excluded.to_string() });
+        }
+        if flip {
+            return Some(spec.clone());
+        }
+    }
+    None
 }
 
 /// Heap order for the walk's frontier: newest commit-date first, ties broken by
@@ -3926,6 +4468,24 @@ fn expand_walk_only(
 
 /// Resolve a single revision to its object id (a range endpoint), `Err(())` if it
 /// doesn't name anything — the caller turns that into git's bad-revision error.
+/// The names `handle_revision_arg_1()` hands to `get_oid_with_context()` for one
+/// revision argument: both endpoints of a range, the base of a `^@`/`^!` mark,
+/// or the argument itself with any leading `^` stripped.
+///
+/// Only used to decide what to warn about — the resolutions themselves are spread
+/// across the branches below, and several of them ask twice.
+pub(super) fn revision_endpoints(spec: &str) -> Vec<&str> {
+    if let Some(range) = crate::objname::split_range(spec) {
+        return vec![range.a, range.b];
+    }
+    let base = spec
+        .strip_suffix("^@")
+        .or_else(|| spec.strip_suffix("^!"))
+        .filter(|b| !b.is_empty())
+        .unwrap_or(spec);
+    vec![base.strip_prefix('^').filter(|rest| !rest.is_empty()).unwrap_or(base)]
+}
+
 fn resolve_rev(repo: &gix::Repository, spec: &str) -> Result<ObjectId, ()> {
     repo.rev_parse_single(spec).map(|id| peel_to_commit(repo, id.detach())).map_err(|_| ())
 }
@@ -4279,6 +4839,7 @@ fn read_node(repo: &gix::Repository, id: ObjectId) -> Result<Node> {
         follow_path: None,
         source: String::new(),
         graph_width: 0,
+        reflog: None,
     })
 }
 
@@ -4318,6 +4879,7 @@ impl NodeReader {
                     boundary: false,
                     follow_path: None,
                     graph_width: 0,
+                    reflog: None,
                 });
             }
         }
@@ -4624,6 +5186,14 @@ fn check_format(fmt: &str) -> Result<()> {
                 Some(x) => anyhow::bail!("unsupported format placeholder %c{x}"),
                 None => anyhow::bail!("unsupported trailing % in format"),
             },
+            // Reflog placeholders, all empty outside a `--walk-reflogs` walk:
+            // `%gd`/`%gD` are the short and full selector, `%gn`/`%gN`/`%ge`/`%gE`
+            // the entry's identity, and `%gs` its message.
+            Some('g') => match it.next() {
+                Some('d' | 'D' | 'n' | 'N' | 'e' | 'E' | 's') => {}
+                Some(x) => anyhow::bail!("unsupported format placeholder %g{x}"),
+                None => anyhow::bail!("unsupported trailing % in format"),
+            },
             // Signature placeholders: %G? (status char) and %GK (signing key).
             Some('G') => match it.next() {
                 Some('?' | 'K') => {}
@@ -4687,6 +5257,9 @@ pub(crate) fn format_commit(
         // No `--graph` behind either of these callers.
         graph_width: 0,
         expand_tabs: None,
+        // Neither caller is a reflog walk, so every `%g…` expands to nothing.
+        reflog: None,
+        date_explicit: false,
     };
     let mut out = Vec::new();
     expand_format(&mut out, commit, &unabbreviated(fmt), &ctx)?;
@@ -4982,6 +5555,35 @@ fn expand_one(
                 Some('r') => expand_date(out, &committer, DateMode::Relative, ctx.now)?,
                 Some('t') => write!(out, "{}", committer.time()?.seconds)?,
                 _ => unreachable!("check_format rejected this already"),
+            }
+            *i += 1;
+        }
+        // The reflog placeholders. `format_reflog_person()` and the selector both
+        // read `pretty_ctx->reflog_info`, which is only set under `--walk-reflogs`;
+        // without one every `%g…` expands to nothing at all.
+        'g' => {
+            let which = chars.get(*i).copied();
+            if let Some(rl) = ctx.reflog {
+                match which {
+                    Some('d') => write_reflog_selector(out, rl, ctx, true),
+                    Some('D') => write_reflog_selector(out, rl, ctx, false),
+                    Some('n') => out.extend_from_slice(&rl.who_name),
+                    Some('e') => out.extend_from_slice(&rl.who_email),
+                    Some('N') => out.extend_from_slice(
+                        ctx.identity_mailmap
+                            .and_then(|m| m.lookup(&rl.who_name, &rl.who_email))
+                            .and_then(|info| info.name.as_deref())
+                            .unwrap_or(&rl.who_name),
+                    ),
+                    Some('E') => out.extend_from_slice(
+                        ctx.identity_mailmap
+                            .and_then(|m| m.lookup(&rl.who_name, &rl.who_email))
+                            .and_then(|info| info.email.as_deref())
+                            .unwrap_or(&rl.who_email),
+                    ),
+                    Some('s') => out.extend_from_slice(&rl.message),
+                    _ => unreachable!("check_format rejected this already"),
+                }
             }
             *i += 1;
         }
@@ -6050,6 +6652,9 @@ pub(crate) fn rev_list_pretty_body(
         graph_width: 0,
         // `rev-list --pretty` has no `--expand-tabs` of its own.
         expand_tabs: None,
+        // `rev-list` has no reflog walk, so every `%g…` expands to nothing.
+        reflog: None,
+        date_explicit: false,
     };
     let mut out = Vec::new();
     match pretty {
@@ -6207,6 +6812,14 @@ struct RenderCtx<'a> {
     /// `expand_tabs_in_log_default` (8) for the indented headers, and none for
     /// `raw`, which prints the message unindented by git's own reckoning.
     expand_tabs: Option<usize>,
+    /// `-g`: the reflog entry this record stands for. `Some` puts the `Reflog:` /
+    /// `Reflog message:` pair in the built-in headers, replaces `oneline`'s subject
+    /// with `<selector>: <message>`, and fills the `%g…` placeholders.
+    reflog: Option<&'a ReflogEntry>,
+    /// `revs->date_mode_explicit` — set only by a `--date=` on the command line,
+    /// never by `log.date`. It is `get_reflog_selector()`'s `force_date`: the
+    /// selector prints `HEAD@{<date>}` instead of `HEAD@{<n>}`.
+    date_explicit: bool,
 }
 
 /// The `Notes[ (<ref>)]:` blocks for `commit`, or empty.
@@ -6254,6 +6867,15 @@ fn render_entry(
                 );
             }
             out.push(b' ');
+            // `show_log()`: under `-g` the oneline record is the reflog selector and
+            // the entry's own message, and it `return`s there — the commit's subject
+            // and its notes are never reached.
+            if let Some(rl) = ctx.reflog {
+                write_reflog_selector(out, rl, ctx, false);
+                out.extend_from_slice(b": ");
+                out.extend_from_slice(&rl.message);
+                return Ok(());
+            }
             out.extend_from_slice(&subject(commit.message_raw()?));
             out.extend_from_slice(&notes_block(commit, ctx)?);
         }
@@ -6281,6 +6903,7 @@ fn render_entry(
             out.extend_from_slice(&ctx.extra);
             write_source(out, ctx);
             out.push(b'\n');
+            write_reflog_header(out, ctx);
             writeln!(out, "tree {}", commit.tree_id()?)?;
             for pid in commit.parent_ids() {
                 writeln!(out, "parent {pid}")?;
@@ -6309,6 +6932,7 @@ fn render_entry(
                 );
             }
             out.push(b'\n');
+            write_reflog_header(out, ctx);
 
             // A merge commit lists its abbreviated parents right after `commit`.
             // The list is the *effective* one: history simplification rewrites
@@ -6383,6 +7007,36 @@ fn write_source(out: &mut Vec<u8>, ctx: &RenderCtx<'_>) {
         out.push(b'\t');
         out.extend_from_slice(src);
     }
+}
+
+/// `get_reflog_selector()`: `<ref>@{<n>}` — or `<ref>@{<date>}` when `--date=` was
+/// given explicitly. `shorten` picks `%gd`'s canonical short ref; the `Reflog:`
+/// header line and `%gD` print the ref as the walk was asked for it.
+fn write_reflog_selector(
+    out: &mut Vec<u8>,
+    entry: &ReflogEntry,
+    ctx: &RenderCtx<'_>,
+    shorten: bool,
+) {
+    let sel = entry.selector(shorten, ctx.date_mode, ctx.date_explicit, ctx.now);
+    out.extend_from_slice(sel.as_bytes());
+}
+
+/// `show_reflog_message()` for a header format: the `Reflog:` / `Reflog message:`
+/// pair `show_log()` prints between the `commit <id>` line and whatever
+/// `pretty_print_commit()` writes next (`Merge:` for the built-in headers, `tree`
+/// for `raw`). A no-op outside a `-g` walk.
+fn write_reflog_header(out: &mut Vec<u8>, ctx: &RenderCtx<'_>) {
+    let Some(rl) = ctx.reflog else { return };
+    out.extend_from_slice(b"Reflog: ");
+    write_reflog_selector(out, rl, ctx, false);
+    out.extend_from_slice(b" (");
+    out.extend_from_slice(&rl.who_name);
+    out.extend_from_slice(b" <");
+    out.extend_from_slice(&rl.who_email);
+    out.extend_from_slice(b">)\nReflog message: ");
+    out.extend_from_slice(&rl.message);
+    out.push(b'\n');
 }
 
 /// Write git's `<label> <name> <<email>>` header line, mapped through the
@@ -7081,6 +7735,14 @@ impl PathspecMatcher {
         // matcher (`inherit_ignore_case: false` below), so acceptance cannot diverge.
         let defaults = repo.pathspec_defaults_inherit_ignore_case(false)?;
         if let Some(msg) = crate::pathspec::first_magic_fatal(specs, defaults) {
+            return Err(crate::fatal::die(msg));
+        }
+        // `init_pathspec_item()`'s second `die()`, once the magic is off and the
+        // path itself is normalized against the prefix. gitoxide raises it from
+        // inside the constructor below, where `?` would render it in this port's
+        // voice at exit 1 — `git log -- ..` is `fatal: ..: '..' is outside
+        // repository at '<worktree>'` and exit 128.
+        if let Some(msg) = crate::pathspec::first_outside_repository_fatal(repo, specs, defaults) {
             return Err(crate::fatal::die(msg));
         }
         // `IdMapping` reads `.gitattributes` from the index, and is only consulted

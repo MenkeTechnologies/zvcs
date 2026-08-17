@@ -168,7 +168,10 @@ pub fn verify_commit(args: &[String]) -> Result<ExitCode> {
 /// Returns `Err` only for the one case this port cannot decide: a commit that
 /// actually carries a signature.
 fn verify_one(repo: &gix::Repository, name: &str, verbose: bool, raw: bool) -> Result<bool> {
-    let Ok(id) = repo.rev_parse_single(name) else {
+    // `repo_get_oid` is `get_oid_basic()`, whose first branch accepts a
+    // full-length hex name as the id without asking the odb — so a well-formed
+    // but absent id gets past this check and fails at `parse_object` below.
+    let Some(id) = crate::objname::resolve(repo, name) else {
         eprintln!("error: commit '{name}' not found.");
         return Ok(false);
     };

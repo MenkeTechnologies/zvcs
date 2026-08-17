@@ -395,3 +395,126 @@ fn an_unborn_head_is_reported_only_when_it_was_the_default() {
     // `--all` still finds the ref that HEAD does not.
     assert_eq!(g.series(&["--all"]), ["A"]);
 }
+
+/// `handle_revision_arg_1()` type-checks nothing, so a tree, a blob or a tag of
+/// either goes on the pending list exactly like a commit — and is dropped, in
+/// silence, by `handle_commit()` (`revision.c`) once `prepare_revision_walk()`
+/// runs, because `rev.tree_objects` and `rev.blob_objects` are off:
+///
+/// ```c
+/// if (object->type == OBJ_TREE) {
+///         struct tree *tree = (struct tree *)object;
+///         if (!revs->tree_objects)
+///                 return NULL;
+/// ```
+///
+/// The two facts have to hold together, and the order between them is what makes
+/// this worth pinning: `cmd_format_patch` counts `rev.pending.nr` *before* the
+/// drop, so a lone `<tree>` is one pending object, is promoted to `<tree>..HEAD`,
+/// and only then loses the tree — leaving HEAD as an unbounded tip and the whole
+/// history formatted. A port that peels each operand to a commit while resolving
+/// it instead calls the same command line `fatal: ambiguous argument`.
+///
+/// The annotated-tag spellings are here because they separate the operand's id
+/// from the peeled one: a bare `HEAD^{tree}` makes the two coincide, so a port
+/// that confuses them still passes.
+#[test]
+fn a_non_commit_tip_is_dropped_after_the_pending_count() {
+    let f = Fixture::new("nontip");
+
+    // Every non-merge commit, oldest first — what an unbounded walk from HEAD
+    // formats once the endpoint has disappeared.
+    let full = f.series(&["--root"]);
+    assert_eq!(full, ["A", "B", "D", "E", "C"]);
+
+    f.git(&["tag", "-a", "treetag", "-m", "t", "HEAD^{tree}"]);
+    f.git(&["tag", "-a", "blobtag", "-m", "b", "HEAD:A.txt"]);
+
+    // One pending object of a type the walk has no use for: promoted, then
+    // dropped, so HEAD is walked with nothing excluded.
+    for tip in ["HEAD^{tree}", "HEAD:A.txt", "treetag", "blobtag"] {
+        assert_eq!(f.series(&[tip]), full, "{tip}");
+    }
+    // `^<tree>` is one pending object too, so it is promoted the same way; the
+    // exclusion it carries dies with the tree.
+    assert_eq!(f.series(&["^HEAD^{tree}"]), full);
+
+    // Two pending objects: no promotion. HEAD is a tip in its own right and the
+    // tree simply vanishes, whichever side of it the tree stands on.
+    assert_eq!(f.series(&["HEAD^{tree}", "main"]), full);
+    assert_eq!(f.series(&["main", "HEAD^{tree}"]), full);
+
+    // Without the promotion there is no HEAD to fall back on, so a walk whose
+    // only positive endpoint was the tree formats nothing — and still exits 0.
+    assert!(f.series(&["main~2..HEAD^{tree}"]).is_empty());
+    assert!(f.series(&["-1", "HEAD^{tree}"]).is_empty());
+    assert!(f.series(&["--root", "HEAD^{tree}"]).is_empty());
+}
+
+/// `verify_non_filename()` (`setup.c`), which `handle_revision_arg_1()` runs
+/// between resolving a name and pending it:
+///
+/// ```c
+/// if (get_oid_with_context(revs->repo, arg, get_sha1_flags, &oid, &oc))
+///         return revs->ignore_missing ? 0 : -1;
+/// if (!cant_be_filename)
+///         verify_non_filename(revs->prefix, arg);
+/// object = get_reference(revs, arg, &oid, flags ^ local_flags);
+/// ```
+///
+/// A word that is simultaneously a revision and a working-tree path is refused
+/// rather than guessed at, and the two things this test pins are *where* in that
+/// sequence the refusal sits:
+///
+/// * before `get_reference()`, so a full-length hex naming an object the
+///   repository does not have is `both revision and filename` and not
+///   `bad object` — the file wins the race against the missing object;
+/// * after the `^` strip, so `^<name>` is refused under the bare name, and
+///   `cant_be_filename` (any `--` on the line) turns the check off entirely,
+///   which is what makes `git format-patch <name> --` the way to say "the
+///   revision, please".
+#[test]
+fn a_word_that_is_both_a_revision_and_a_path_is_refused() {
+    let f = Fixture::new("bothrevfile");
+    // An object id the repository does not have, so the ordering above is
+    // observable: without the check this word is `fatal: bad object`.
+    let absent = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+    std::fs::write(f.work.join("b2"), "x\n").unwrap();
+    std::fs::write(f.work.join(absent), "x\n").unwrap();
+
+    let refusal = |args: &[&str], named: &str| {
+        let out = f.run(args);
+        assert_eq!(out.status.code(), Some(128), "{args:?}: {out:?}");
+        assert!(out.stdout.is_empty(), "{args:?}: {out:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stderr),
+            format!(
+                "fatal: ambiguous argument '{named}': both revision and filename\n\
+                 Use '--' to separate paths from revisions, like this:\n\
+                 'git <command> [<revision>...] -- [<file>...]'\n"
+            ),
+            "{args:?}"
+        );
+    };
+
+    refusal(&["format-patch", "--stdout", "b2"], "b2");
+    // The `^` is a flag, not part of the name, so the message names what is left.
+    refusal(&["format-patch", "--stdout", "^b2", "main"], "b2");
+    // Whichever position it takes, since every operand goes through the check.
+    refusal(&["format-patch", "--stdout", "b2", "v1"], "b2");
+    refusal(&["format-patch", "--stdout", "v1", "b2"], "b2");
+    // `--root` opts out of the single-endpoint promotion, not out of this.
+    refusal(&["format-patch", "--stdout", "--root", "b2"], "b2");
+    // Ahead of `get_reference()`'s `die("bad object %s")`.
+    refusal(&["format-patch", "--stdout", absent], absent);
+
+    // `REVARG_CANNOT_BE_FILENAME`: a `--` anywhere on the line skips the check,
+    // so the word is read as the revision it also is — here promoted to
+    // `b2..HEAD`, exactly as the explicit spelling walks it.
+    assert_eq!(f.series(&["b2", "--"]), ["B", "C"]);
+    // …and after the `--` it is only ever a path, which limits the default walk.
+    assert!(f.series(&["--", "b2"]).is_empty());
+
+    // A revision no file shadows is untouched by any of this.
+    assert_eq!(f.series(&["v1"]), ["D", "E"]);
+}

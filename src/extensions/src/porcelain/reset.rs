@@ -23,6 +23,26 @@
 //!   uptodate. Cannot merge.` + `fatal: Could not reset index file …`, HEAD
 //!   unmoved) if a file that must change has un-committed local modifications.
 //!
+//! ## Resolving the target
+//!
+//! `cmd_reset()` (builtin/reset.c:405-425) has three exclusive arms and they do
+//! not agree on what the operand may be:
+//!
+//! * **unborn** — `rev` is the word `HEAD` (typed or defaulted) and `HEAD` does
+//!   not resolve. The target is the empty tree, and `reset_refs()` is skipped, so
+//!   the index (and, for `--hard`, the worktree) is emptied while HEAD and
+//!   `ORIG_HEAD` are left alone and no `HEAD is now at` line is printed. `--keep`
+//!   is the one mode that cannot run: its two-tree merge wants HEAD's tree and
+//!   reports `You do not have a valid HEAD.` instead.
+//! * **whole tree** — `lookup_commit_reference()`, so the operand must peel to a
+//!   *commit*; one that does not gets `error: object <operand> is a <kind>, not a
+//!   commit` ahead of `fatal: Could not parse object '<rev>'.`
+//! * **pathspec** — `repo_parse_tree_indirect()`, so the operand only has to peel
+//!   to a *tree*: `git reset <tree> -- <path>` is the documented way to load
+//!   paths out of a tree, and `HEAD^{tree}` works here where it is an error
+//!   above. Its peel is handed a NULL name and so fails *silently*, leaving
+//!   `Could not parse object` as the only line.
+//!
 //! ## The `Unstaged changes after reset:` report
 //!
 //! `cmd_reset()` (builtin/reset.c) ends a `MIXED` reset — which includes the path
@@ -77,6 +97,17 @@
 //! ## Deferred
 //!
 //! `--patch`/`-p` (interactive hunk selection) is unsupported.
+//!
+//! The index's **cache-tree extension** is not written. git primes it from the
+//! target tree after a `--mixed`/`--hard` (`prime_cache_tree()`, reset.c:108-111)
+//! and lets `unpack_trees()` update it for `--merge`/`--keep`; every index writer
+//! in this port instead drops it (`gix::index::File::remove_tree`), so the
+//! extension is absent rather than stale. It is a cache, so no command reads a
+//! wrong answer out of it — but `git fsck` notices when the tree git would have
+//! primed is itself absent from the odb, which is what an unborn `reset --hard`
+//! or `--merge` does: stock leaves a cache tree naming the empty tree and reports
+//! `missing tree 4b825dc…`, this port reports nothing. Writing it properly is a
+//! whole-index feature, not a reset one.
 
 use anyhow::{anyhow, bail, Result};
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -787,36 +818,96 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
     }
 
     let reflog_spec = commit_spec.unwrap_or("HEAD");
-    // `cmd_reset()` (builtin/reset.c) resolves <rev> in two steps, and each step
-    // has its own message. The lookup — `repo_get_oid_committish()` for the
-    // whole-tree form, `repo_get_oid_treeish()` once there are pathspecs — dies
-    // with `Failed to resolve '%s' as a valid revision.` / `… as a valid tree.`.
-    // The peel that follows (`lookup_commit_reference()` / `parse_tree_indirect()`)
-    // dies with `Could not parse object '%s'.` when the id names an object the
-    // repository does not have.
+    // `cmd_reset()` (builtin/reset.c:405-425) picks the target in three exclusive
+    // arms, and the arm decides both what `<rev>` is allowed to *be* and what is
+    // printed when it is not:
     //
-    // The second case exists only because `get_oid_basic()` decodes a full-length
-    // hex name without consulting the odb (see [`crate::objname`]); resolving with
-    // `rev_parse_single()` alone folds it into the first and loses the message.
+    // ```c
+    // unborn = !strcmp(rev, "HEAD") && repo_get_oid(the_repository, "HEAD", &unused);
+    // if (unborn) {
+    //         /* reset on unborn branch: treat as reset to empty tree */
+    //         oidcpy(&oid, the_repository->hash_algo->empty_tree);
+    // } else if (!pathspec.nr && !patch_mode) {
+    //         struct commit *commit;
+    //         if (repo_get_oid_committish(the_repository, rev, &oid))
+    //                 die(_("Failed to resolve '%s' as a valid revision."), rev);
+    //         commit = lookup_commit_reference(the_repository, &oid);
+    //         if (!commit)
+    //                 die(_("Could not parse object '%s'."), rev);
+    //         oidcpy(&oid, &commit->object.oid);
+    // } else {
+    //         struct tree *tree;
+    //         if (repo_get_oid_treeish(the_repository, rev, &oid))
+    //                 die(_("Failed to resolve '%s' as a valid tree."), rev);
+    //         tree = repo_parse_tree_indirect(the_repository, &oid);
+    //         if (!tree)
+    //                 die(_("Could not parse object '%s'."), rev);
+    //         oidcpy(&oid, &tree->object.oid);
+    // }
+    // ```
     //
-    // The lookup itself can only fail here for a spec that stood before a `--`,
-    // since without one the split above already resolved it. A defaulted `HEAD`
-    // that will not resolve is an unborn branch, which git decides before either
-    // check, so that case keeps the report it had.
-    let target_id = match crate::objname::resolve(&repo, reflog_spec) {
-        Some(id) => id,
-        None if commit_spec.is_none() => return Ok(ambiguous_argument(reflog_spec)),
-        None => crate::git_fatal!(
-            "Failed to resolve '{reflog_spec}' as a valid {}.",
-            if with_paths { "tree" } else { "revision" }
-        ),
+    // The pathspec arm wants a *tree*, not a commit: `git reset <tree> -- <path>`
+    // is the documented way to load paths out of a tree, so `HEAD^{tree}` there
+    // succeeds where the same operand in the whole-tree arm is an error. Peeling
+    // to a commit in both arms turns the working form into a failure.
+    //
+    // Each `die()` above is preceded by whatever the helper already printed, and
+    // the two helpers differ: `lookup_commit_reference()` reports a present
+    // object of the wrong type with `error: object %s is a %s, not a %s`, while
+    // `repo_parse_tree_indirect()` passes a NULL name into `repo_peel_to_type()`
+    // and so fails *silently* — which is why a blob operand prints two lines in
+    // the whole-tree form and one in the pathspec form.
+    let unborn = reflog_spec == "HEAD" && crate::objname::resolve(&repo, "HEAD").is_none();
+
+    // The commit `HEAD` is moved to, present only in the whole-tree arm: the
+    // pathspec form never moves a ref, and an unborn branch has no commit to
+    // move to (`!pathspec.nr && !unborn` gates `reset_refs()` below).
+    let mut head_commit: Option<gix::Commit<'_>> = None;
+    let target_tree = if unborn {
+        gix::ObjectId::empty_tree(repo.object_hash())
+    } else {
+        // The lookup can only fail for a spec that stood before a `--`, since
+        // without one the split above already resolved it. `get_oid_basic()`
+        // decodes a full-length hex name without consulting the odb (see
+        // [`crate::objname`]), so a well-formed but absent id gets past here and
+        // falls into the peel's `Could not parse object` instead.
+        let target_id = match crate::objname::resolve(&repo, reflog_spec) {
+            Some(id) => id,
+            None => crate::git_fatal!(
+                "Failed to resolve '{reflog_spec}' as a valid {}.",
+                if with_paths { "tree" } else { "revision" }
+            ),
+        };
+        if with_paths {
+            // `repo_parse_tree_indirect()` is `repo_peel_to_type(r, NULL, 0, obj,
+            // OBJ_TREE)`: tags dereference to their target, commits to their
+            // tree, a tree is the answer, and a blob is a silent NULL.
+            let peeled = repo.find_object(target_id).ok().and_then(|o| o.peel_to_tree().ok());
+            match peeled {
+                Some(tree) => tree.id,
+                None => crate::git_fatal!("Could not parse object '{reflog_spec}'."),
+            }
+        } else {
+            match crate::objname::lookup_commit_reference(&repo, target_id) {
+                crate::objname::CommitRef::Commit(id) => {
+                    let commit = repo.find_object(id)?.into_commit();
+                    let tree = commit.tree_id()?.detach();
+                    head_commit = Some(commit);
+                    tree
+                }
+                // `error: object %s is a %s, not a %s` names the *operand* id and
+                // the *peeled* type, so a tag of a tree reports the tag's id and
+                // the word `tree`; [`crate::objname::CommitRef`] already carries
+                // that pairing.
+                other => {
+                    if let Some(note) = other.type_error() {
+                        eprintln!("error: {note}");
+                    }
+                    crate::git_fatal!("Could not parse object '{reflog_spec}'.")
+                }
+            }
+        }
     };
-    let Ok(object) = repo.find_object(target_id) else {
-        crate::git_fatal!("Could not parse object '{reflog_spec}'.")
-    };
-    let commit = object.peel_to_commit()?;
-    let target_commit = commit.id;
-    let target_tree = commit.tree_id()?.detach();
 
     // Serialize the whole read-modify-write; held for the rest of the function.
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
@@ -836,8 +927,26 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
     // abort on local changes. git does not move HEAD when it aborts, so the merge
     // is computed and applied *before* any ref is touched.
     if matches!(mode, ResetMode::Merge | ResetMode::Keep) {
+        // `reset_index()`'s KEEP arm needs HEAD's tree as the merge's first side
+        // and reports before the caller's `die()` when there is none
+        // (builtin/reset.c:97-100):
+        //
+        // ```c
+        // if (reset_type == KEEP) {
+        //         struct object_id head_oid;
+        //         if (repo_get_oid(the_repository, "HEAD", &head_oid))
+        //                 return error(_("You do not have a valid HEAD."));
+        // ```
+        //
+        // MERGE takes no such side, so an unborn branch reaches `unpack_trees()`
+        // and fails (or not) on the worktree state alone.
         let head_tree = match repo.head_id() {
             Ok(h) => h.object()?.peel_to_commit()?.tree_id()?.detach(),
+            Err(_) if mode == ResetMode::Keep => {
+                eprintln!("error: You do not have a valid HEAD.");
+                eprintln!("fatal: Could not reset index file to revision '{reflog_spec}'.");
+                return Ok(ExitCode::from(128));
+            }
             Err(_) => gix::ObjectId::empty_tree(repo.object_hash()),
         };
         let should_interrupt = AtomicBool::new(false);
@@ -851,13 +960,19 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
         )?;
         if !applied {
             // git's `reset_index` failure: `fatal:` line, exit 128, HEAD untouched.
-            eprintln!("fatal: Could not reset index file to revision '{target_commit}'.");
+            // The message names `rev` — the spec as typed — not the id it resolved
+            // to (`die(_("Could not reset index file to revision '%s'."), rev)`).
+            eprintln!("fatal: Could not reset index file to revision '{reflog_spec}'.");
             return Ok(ExitCode::from(128));
         }
-        if let Ok(prev) = repo.head_id() {
-            set_orig_head(&repo, prev.detach())?;
+        // `if (!pathspec.nr && !unborn)`: an unborn branch has no ref to move and
+        // no previous HEAD to save, so `reset_refs()` is skipped outright.
+        if let Some(commit) = &head_commit {
+            if let Ok(prev) = repo.head_id() {
+                set_orig_head(&repo, prev.detach())?;
+            }
+            move_head(&repo, commit.id, reflog_spec)?;
         }
-        move_head(&repo, target_commit, reflog_spec)?;
         remove_branch_state(&repo);
         super::checkout::maybe_recurse_submodules(&repo, recurse_submodules, true)?;
         // No `HEAD is now at` here: `cmd_reset()` gates `print_new_head_line()`
@@ -868,11 +983,15 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
 
     // soft/mixed/hard: `reset_refs()` records the pre-reset HEAD in ORIG_HEAD
     // before moving HEAD, and `remove_branch_state()` drops any in-progress
-    // merge/cherry-pick/revert state.
-    if let Ok(prev) = repo.head_id() {
-        set_orig_head(&repo, prev.detach())?;
+    // merge/cherry-pick/revert state. `reset_refs()` is gated on `!unborn`, so an
+    // unborn branch keeps both HEAD and ORIG_HEAD as they were; `remove_branch_state()`
+    // is not gated and runs for every whole-tree reset.
+    if let Some(commit) = &head_commit {
+        if let Ok(prev) = repo.head_id() {
+            set_orig_head(&repo, prev.detach())?;
+        }
+        move_head(&repo, commit.id, reflog_spec)?;
     }
-    move_head(&repo, target_commit, reflog_spec)?;
     remove_branch_state(&repo);
 
     match mode {
@@ -888,9 +1007,13 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
             // routes it through `unpack_trees()`, which `--soft`/`--mixed` never run.
             // The move itself is silent in git, hence the unconditional quiet flag.
             super::checkout::maybe_recurse_submodules(&repo, recurse_submodules, true)?;
+            // `print_new_head_line()` sits inside the same `!unborn` guard as
+            // `reset_refs()`, so an unborn `--hard` empties the worktree silently.
             if !quiet {
-                let summary = commit.message()?.summary().into_owned();
-                println!("HEAD is now at {} {}", commit.short_id()?, summary);
+                if let Some(commit) = &head_commit {
+                    let summary = commit.message()?.summary().into_owned();
+                    println!("HEAD is now at {} {}", commit.short_id()?, summary);
+                }
             }
         }
         // Handled above, before the ref move.
@@ -1069,6 +1192,26 @@ fn refresh_index_report(repo: &gix::Repository, index: &mut gix::index::File) ->
     Ok(())
 }
 
+/// git's `set_object_name_for_intent_to_add_entry()` (read-cache.c:704), which
+/// `update_index_from_diff()` runs for every `-N` stub it makes:
+///
+/// ```c
+/// struct object_id oid;
+/// if (odb_write_object(the_repository->objects, "", 0, OBJ_BLOB, &oid))
+///         die(_("cannot create an empty blob in the object database"));
+/// oidcpy(&ce->oid, &oid);
+/// ```
+///
+/// The id is always the well-known empty-blob hash, but the call *writes* it:
+/// a repository whose reset produced an intent-to-add entry has the empty blob
+/// loose in its odb afterwards. Naming the id without writing it leaves the
+/// index referring to an object `git fsck` reports as `missing blob e69de29…`,
+/// which is what stock and zvcs disagreed on for every `-N` reset that dropped
+/// a path. Called lazily, so a `-N` reset that creates no stub writes nothing.
+fn empty_blob_for_intent_to_add(repo: &gix::Repository) -> Result<ObjectId> {
+    Ok(repo.write_blob(b"")?.detach())
+}
+
 /// Build the `--mixed` index: `tree` verbatim, but preserving worktree stats for
 /// entries whose id and mode are unchanged so the following refresh does not have to
 /// re-hash every file and the index isn't spuriously reported as fully modified.
@@ -1115,18 +1258,22 @@ fn reset_index_to_tree(
     }
 
     if intent_to_add {
-        let ita = ObjectId::empty_blob(repo.object_hash());
+        let mut ita: Option<ObjectId> = None;
         let mut added: HashSet<BString> = HashSet::new();
         let backing = old.path_backing();
         for e in old.entries() {
             let path = e.path_in(backing).to_owned();
             if !tree_paths.contains(&path) && added.insert(path.clone()) {
+                let id = match ita {
+                    Some(id) => id,
+                    None => *ita.insert(empty_blob_for_intent_to_add(repo)?),
+                };
                 // EXTENDED must accompany INTENT_TO_ADD: the writer upgrades to index
                 // V3 and emits the extended-flags word only when EXTENDED is set —
                 // without it the i-t-a bit (>0xffff) is truncated away on write.
                 new_index.dangerously_push_entry(
                     Stat::default(),
-                    ita,
+                    id,
                     Flags::INTENT_TO_ADD | Flags::EXTENDED,
                     Mode::FILE,
                     BStr::new(&path),
@@ -1596,15 +1743,19 @@ fn pathspec_index(
     // Drop every stage of each selected path, then re-add the tree version if any;
     // a `-N` path missing from the tree comes back as an intent-to-add stub instead.
     index.remove_entries(|_, path, _| ops.contains(&path.to_owned()));
-    let ita = ObjectId::empty_blob(repo.object_hash());
+    let mut ita: Option<ObjectId> = None;
     for path in &ops {
         if let Some((stat, id, flags, mode)) = target_map.get(path) {
             index.dangerously_push_entry(*stat, *id, *flags, *mode, BStr::new(path));
         } else if intent_to_add {
+            let id = match ita {
+                Some(id) => id,
+                None => *ita.insert(empty_blob_for_intent_to_add(repo)?),
+            };
             // EXTENDED must accompany INTENT_TO_ADD so the writer keeps the bit (V3).
             index.dangerously_push_entry(
                 Stat::default(),
-                ita,
+                id,
                 Flags::INTENT_TO_ADD | Flags::EXTENDED,
                 Mode::FILE,
                 BStr::new(path),

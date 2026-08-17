@@ -562,18 +562,21 @@ fn resolve_outcome<'repo>(
     let outcome = if let Some(base_spec) = merge_base {
         // With an explicit base, git accepts plain trees for all three sides,
         // and reports any side that will not peel to one as a fatal error.
-        let (Some(base), Some(ours), Some(theirs)) = (
-            peel_tree(repo, base_spec),
-            peel_tree(repo, spec1),
-            peel_tree(repo, spec2),
-        ) else {
-            let bad = [base_spec, spec1, spec2]
-                .into_iter()
-                .find(|s| peel_tree(repo, s).is_none())
-                .unwrap_or_default();
-            eprintln!("fatal: could not parse as tree '{bad}'");
-            return Ok(Err(ExitCode::from(128)));
-        };
+        // Sequentially, and stopping at the first that will not peel — git runs
+        // the three `repo_get_oid_treeish()` calls one after another and `die()`s
+        // inside the first failing `if`, so a later operand is never resolved at
+        // all. Resolving all three and *then* re-scanning for the bad one would
+        // both reach past the die and put a second `get_oid_basic()` on every
+        // operand, which is one ambiguity warning too many for each.
+        let mut peeled = Vec::with_capacity(3);
+        for spec in [base_spec, spec1, spec2] {
+            let Some(id) = peel_tree(repo, spec) else {
+                eprintln!("fatal: could not parse as tree '{spec}'");
+                return Ok(Err(ExitCode::from(128)));
+            };
+            peeled.push(id);
+        }
+        let (base, ours, theirs) = (peeled[0], peeled[1], peeled[2]);
         let (base, theirs) = strategy.shift(repo, ours, base, theirs)?;
         repo.merge_trees(base, ours, theirs, labels, strategy.apply(repo.tree_merge_options()?)?)?
     } else {
@@ -973,6 +976,9 @@ fn exit_code(conflicted: bool) -> ExitCode {
 /// Resolve `spec` to the tree it names (commits and tags peel through), or
 /// `None` when git would say it could not parse it as a tree.
 fn peel_tree(repo: &gix::Repository, spec: &str) -> Option<ObjectId> {
+    // One `repo_get_oid_treeish()` per operand, so one trip through
+    // `get_oid_basic()` and one chance to warn about a 40-hex refname.
+    crate::objname::warn_ambiguous_refname(repo, spec);
     Some(
         repo.rev_parse_single(spec)
             .ok()?
@@ -995,6 +1001,9 @@ fn peel_tree(repo: &gix::Repository, spec: &str) -> Option<ObjectId> {
 /// type it landed on. Tags are followed on the way, so the type named is the one
 /// at the end of the tag chain rather than `tag`.
 fn peel_commit(repo: &gix::Repository, spec: &str) -> Option<ObjectId> {
+    // `get_merge_parent()` is one `repo_get_oid()` (`commit.c:1881`) ahead of the
+    // peel, which is where the ambiguity warning comes from.
+    crate::objname::warn_ambiguous_refname(repo, spec);
     let object = repo.rev_parse_single(spec).ok()?.object().ok()?;
     let object = object.peel_tags_to_end().ok()?;
     if object.kind == gix::object::Kind::Commit {
@@ -1022,6 +1031,9 @@ enum TreeResolution {
 /// Resolve `spec` the way git's trivial merge does: to a tree, or one of the two
 /// fatal conditions it distinguishes before it begins the three-tree walk.
 fn resolve_tree(repo: &gix::Repository, spec: &str) -> TreeResolution {
+    // `get_tree_descriptor()`'s `repo_get_oid(r, rev, &oid)`
+    // (`builtin/merge-tree.c:379`), one per operand.
+    crate::objname::warn_ambiguous_refname(repo, spec);
     let id = match repo.rev_parse_single(spec) {
         Ok(id) => id,
         Err(_) => return TreeResolution::UnknownRev,
@@ -1570,6 +1582,11 @@ fn render_messages(
         )
     });
     let side_trees = if needs_labels {
+        // Re-reading the two operands this port already resolved, to attribute a
+        // path to a side. git holds the trees from the original resolution and
+        // never asks again, so this second `get_oid_basic()` is this port's alone
+        // and must not add a second `refname … is ambiguous.` to either operand.
+        let _quiet_ambiguity = crate::objname::AmbiguityWarnings::off();
         Some((
             repo.rev_parse_single(label1)?.object()?.peel_to_tree()?,
             repo.rev_parse_single(label2)?.object()?.peel_to_tree()?,

@@ -271,15 +271,36 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
             match crate::objname::split_range(arg) {
                 Some(range) => {
                     warn_ambiguous_refname(&repo, range.a, o.quiet);
+                    warn_reflog_reach(&mut out, &repo, range.a, o.quiet)?;
                     let a_resolved = {
                         let _quiet_ambiguity = crate::objname::AmbiguityWarnings::off();
                         crate::objname::resolve(&repo, range.a).is_some()
                     };
                     if a_resolved {
                         warn_ambiguous_refname(&repo, range.b, o.quiet);
+                        warn_reflog_reach(&mut out, &repo, range.b, o.quiet)?;
                     }
                 }
-                None => warn_ambiguous_refname(&repo, arg, o.quiet),
+                None => {
+                    // `cmd_rev_parse()` advances past the exclusion mark before
+                    // it resolves (`builtin/rev-parse.c:1165-1169`):
+                    //
+                    // ```c
+                    // name = arg;
+                    // type = NORMAL;
+                    // if (*arg == '^') { name++; type = REVERSED; }
+                    // if (!repo_get_oid_with_flags(the_repository, name, &oid, flags)) {
+                    // ```
+                    //
+                    // so `get_oid_basic()` measures the name without the caret
+                    // and both of its warnings are due for `^<40-hex-ref>` and
+                    // `^<ref>@{<date>}`. The range endpoints above keep theirs:
+                    // `try_difference()` cuts at the `..` and hands
+                    // `repo_get_oid_committish()` the endpoint as written.
+                    let name = crate::objname::uninteresting_mark(arg).0;
+                    warn_ambiguous_refname(&repo, name, o.quiet);
+                    warn_reflog_reach(&mut out, &repo, name, o.quiet)?;
+                }
             }
             // A full-length hex name *is* the object id and short-circuits ahead
             // of every database lookup, so it answers even for an object that is
@@ -451,6 +472,31 @@ pub(crate) fn dwim_ref_matches(repo: &gix::Repository, name: &str) -> Vec<String
         });
     }
     found
+}
+
+/// `get_oid_basic`'s *other* warning, a little further down the same function
+/// (`object-name.c:1006-1011`): a `<ref>@{<date>}` operand whose date is older
+/// than every entry in that ref's log resolves to the oldest entry and says so.
+///
+/// It shares `--quiet`'s `GET_OID_QUIETLY` gate with the ambiguity warning, and
+/// nothing else — in particular `core.warnAmbiguousRefs` does not silence it. The
+/// message itself is [`crate::objname::reflog_reach_warning`]'s, so this is only
+/// the placement: stdout is flushed first, because the operands before this one
+/// have already printed and git's warning lands after them.
+fn warn_reflog_reach(
+    out: &mut impl Write,
+    repo: &gix::Repository,
+    arg: &str,
+    quiet: bool,
+) -> std::io::Result<()> {
+    if quiet {
+        return Ok(());
+    }
+    if let Some(warning) = crate::objname::reflog_reach_warning(repo, arg) {
+        out.flush()?;
+        eprint!("{warning}");
+    }
+    Ok(())
 }
 
 /// `get_oid_basic`'s ambiguity warning (`object-name.c`): once a plain name has

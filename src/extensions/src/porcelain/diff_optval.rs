@@ -17,10 +17,59 @@
 //! options a specific command rejects for its own reasons. This module answers
 //! only "would `diff.c`'s callback have called `error()` on this argument's
 //! value", so a caller can print the same line and exit 129 at the same point.
+//!
+//! Two callbacks need more than a yes/no answer — the caller has to act on the
+//! value it accepted — so their `diff.c` function is ported here in full and
+//! [`reject`] delegates to it: [`parse_algorithm_value`] and, in `objname`,
+//! `diff_opt_find_object()`.
 
-/// The exact bytes `diff_opt_diff_algorithm()` writes for an unrecognized value.
-const DIFF_ALGORITHM_ERR: &str =
+use gix::diff::blob::Algorithm;
+
+/// The exact bytes `diff_opt_diff_algorithm()` writes for an unrecognized value,
+/// without its trailing newline. `error()` from an option callback is
+/// parse-options' `PARSE_OPT_ERROR`: exit 129 with no usage block after it.
+pub(super) const DIFF_ALGORITHM_ERR: &str =
     "error: option diff-algorithm accepts \"myers\", \"minimal\", \"patience\" and \"histogram\"";
+
+/// `parse_algorithm_value()` (`diff.c`), the one table `--diff-algorithm=<v>`, the
+/// separated `--diff-algorithm <v>` form, the `--minimal`/`--patience`/`--histogram`
+/// aliases and `diff.algorithm` all read:
+///
+/// ```c
+/// static int parse_algorithm_value(const char *value)
+/// {
+///         if (!value)
+///                 return -1;
+///         else if (!strcasecmp(value, "myers") || !strcasecmp(value, "default"))
+///                 return 0;
+///         else if (!strcasecmp(value, "minimal"))
+///                 return XDF_NEED_MINIMAL;
+///         else if (!strcasecmp(value, "patience"))
+///                 return XDF_PATIENCE_DIFF;
+///         else if (!strcasecmp(value, "histogram"))
+///                 return XDF_HISTOGRAM_DIFF;
+///         return -1;
+/// }
+/// ```
+///
+/// `strcasecmp`, so the value is matched case-insensitively, and `default` is git's
+/// spelling for Myers (`xdl_opts` stay at 0). All four names have a port behind
+/// them: `src/ported/gix-imara-diff/src/patience.rs` is `xdiff/xpatience.c` and
+/// `lib.rs` wires it as [`Algorithm::Patience`], alongside `MyersMinimal` and
+/// `Histogram`.
+///
+/// `None` is git's `-1`, which every caller answers with [`DIFF_ALGORITHM_ERR`].
+/// [`reject`] is the parse-time half of this same call, so it delegates here rather
+/// than repeating the name list.
+pub(super) fn parse_algorithm_value(value: &str) -> Option<Algorithm> {
+    match value.to_ascii_lowercase().as_str() {
+        "myers" | "default" => Some(Algorithm::Myers),
+        "minimal" => Some(Algorithm::MyersMinimal),
+        "patience" => Some(Algorithm::Patience),
+        "histogram" => Some(Algorithm::Histogram),
+        _ => None,
+    }
+}
 
 /// The callbacks in this module that roll their own `strtol(arg, &end, 10)`
 /// instead of using `OPT_INTEGER`, as [`crate::optint::strtol_all`] describes
@@ -95,13 +144,9 @@ pub(super) fn reject(arg: &str) -> Option<String> {
             .then(|| format!("error: bad --word-diff argument: {v}"));
     }
 
-    // `--diff-algorithm=<value>` (`parse_algorithm_value`), case insensitive.
+    // `--diff-algorithm=<value>`, decided by the one [`parse_algorithm_value`] port.
     if let Some(v) = arg.strip_prefix("--diff-algorithm=") {
-        return (!matches!(
-            v.to_ascii_lowercase().as_str(),
-            "myers" | "default" | "minimal" | "patience" | "histogram"
-        ))
-        .then(|| DIFF_ALGORITHM_ERR.to_string());
+        return parse_algorithm_value(v).is_none().then(|| DIFF_ALGORITHM_ERR.to_string());
     }
 
     // `--submodule=<format>` (`parse_submodule_params`), matched exactly. Bare
@@ -211,6 +256,21 @@ pub(super) fn dirstat_reject(arg: &str) -> Option<String> {
 /// fails; git runs it once, after the option scan and before any diff is walked.
 pub(super) const PICKAXE_CONFLICT: &str =
     "fatal: options '-G', '-S', and '--find-object' cannot be used together";
+
+/// The next `diff_setup_done()` `die()` in the same family
+/// (`HAS_MULTI_BITS(pickaxe_opts & DIFF_PICKAXE_KINDS_ALL_OBJFIND_MASK)`, diff.c:5271):
+///
+/// ```c
+/// die(_("options '%s' and '%s' cannot be used together, use '%s' with '%s' and '%s'"),
+///     "--pickaxe-all", "--find-object", "--pickaxe-all", "-G", "-S");
+/// ```
+///
+/// `--pickaxe-all` keeps every pair once *one* matched, which `pickaxe_match()`'s
+/// objfind branch has no notion of — so git refuses the combination rather than
+/// picking a meaning for it. Exit 128, after the whole option scan.
+pub(super) const PICKAXE_ALL_OBJFIND_CONFLICT: &str =
+    "fatal: options '--pickaxe-all' and '--find-object' cannot be used together, \
+     use '--pickaxe-all' with '-G' and '-S'";
 
 /// Whether `args` names more than one pickaxe kind, i.e. whether git would die
 /// with [`PICKAXE_CONFLICT`]. Stops at `--`, which ends option parsing.

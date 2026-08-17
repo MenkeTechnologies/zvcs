@@ -447,6 +447,13 @@ pub(crate) fn parse_decoration_style(value: &str) -> Option<DecorateStyle> {
 ///   * `-n N` / `--max-count=N` / `-N` / `-nN`   → limit the number of commits shown
 ///   * `--skip=N`                                → drop the first N selected commits
 ///   * `--all`                                   → start from every ref plus `HEAD`
+///   * `--reflog`                                → `add_reflogs_to_pending()`: the old
+///     and the new id of every entry of every reflog become pending tips, so a commit
+///     no ref points at any more is still walked. It reads no `--exclude` pattern and
+///     clears none, unlike the ref selectors it stands beside
+///   * `--max-age=<epoch>` / `--min-age=<epoch>`  → the same `revs->max_age`/`min_age`
+///     as `--since`/`--until`, read as a raw epoch by `parse_age()` rather than by
+///     `approxidate()`
 ///   * `--merges` / `--no-merges`                → keep only (or drop) multi-parent commits
 ///   * `--min-parents=N` / `--max-parents=N` and
 ///     their `--no-` forms                       → parent-count limiting
@@ -456,9 +463,19 @@ pub(crate) fn parse_decoration_style(value: &str) -> Option<DecorateStyle> {
 ///   * `--reverse`                               → emit the selected commits oldest-first
 ///   * `--date-order` / `--topo-order`           → git's two topological sort orders
 ///   * `--oneline`, `--pretty=`/`--format=` with
-///     `oneline`, `short`, `medium`, `full`, `fuller`, `raw`, `reference`, and
+///     `oneline`, `short`, `medium`, `full`, `fuller`, `raw`, `reference`, `email`,
+///     `mboxrd`, and
 ///     `format:`/`tformat:` strings (last flag wins; an invalid value is rejected
-///     exactly as git's `get_commit_format` does). User-format placeholders include
+///     exactly as git's `get_commit_format` does). The two mail formats are
+///     `pretty.c`'s `CMIT_FMT_EMAIL`/`CMIT_FMT_MBOXRD`: the magic
+///     `From <oid> Mon Sep 17 00:00:00 2001` line, RFC2047-encoded `From:`, an
+///     RFC2822 `Date:`, `Subject: [<prefix>] …` from `format.subjectPrefix`, and the
+///     `MIME-Version:`/`Content-Transfer-Encoding: 8bit` block a non-ASCII body
+///     forces. `--encode-email-headers`/`--no-encode-email-headers`
+///     (`revs->encode_email_headers`, seeded from `format.encodeEmailHeaders`) turn
+///     the Q-encoding off; `rev-list` renders the same format from a zeroed
+///     `pretty_print_context`, so there it has no `[<prefix>]` and no encoding.
+///     User-format placeholders include
 ///     `%C`/`%C(...)` colors (with `%C(auto)`), `%d`/`%D` ref decorations, and
 ///     `%cr`/`%ar` relative dates, alongside the hash/tree/parent/author/committer/
 ///     subject/body set
@@ -587,7 +604,13 @@ pub(crate) fn parse_decoration_style(value: &str) -> Option<DecorateStyle> {
 ///     history behind that parent alone is followed, so a merge that took one
 ///     side's change drops out along with the side it did not take. The diff
 ///     formats (`-p`, `--stat`, `--name-*`) are limited to the same paths.
-///     `--full-history`/`--simplify-merges` are not implemented.
+///     `--full-history` (`revs->simplify_history = 0`) follows every parent
+///     instead, `--simplify-merges` rewrites each commit to its simplification
+///     on top of that, and `--sparse`/`--dense` (`revs->dense`) decide whether a
+///     TREESAME commit is *dropped* at all. `simplify_history` is also cleared
+///     without being asked for, by `cmd_whatchanged()` and by every
+///     `--diff-merges` value that routes through `set_separate()` (`-m`,
+///     `separate`, `m`, `on`, `1`, `first-parent`, `remerge`).
 ///   * Revision ranges are supported: `A..B` (`^A B`), `A...B` (symmetric
 ///     difference, excluding the merge-base), and a leading `^A` exclusion.
 ///   * `-M`/`-C`/`-B` and their long spellings drive `diffcore_rename`'s rename, copy and
@@ -686,6 +709,26 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         };
         (abbrev, date, show_root, decorate, mailmap, follow)
     };
+    // `git_log_config()` also reads the two keys behind `--pretty=email`'s
+    // headers (builtin/log.c:560-561 and 566-569), so `git log --pretty=email`
+    // honours both even though the options that set them belong to
+    // `format-patch`:
+    //
+    // ```c
+    // if (!strcmp(var, "format.subjectprefix"))
+    //         return git_config_string(&fmt_patch_subject_prefix, var, value);
+    // …
+    // if (!strcmp(var, "format.encodeemailheaders")) {
+    //         default_encode_email_headers = git_config_bool(var, value);
+    //         return 0;
+    // }
+    // ```
+    //
+    // `fmt_patch_subject_prefix` starts at `"PATCH"`, which is the bracketed word
+    // an unconfigured repository prints; an empty value drops the brackets
+    // entirely, as `fmt_output_email_subject()`'s `*opt->subject_prefix` test does.
+    let (cfg_subject_prefix, cfg_encode_email_headers) = email_config(&repo);
+    let mut encode_email_headers = cfg_encode_email_headers;
 
     // `--stat` width geometry, seeded from `diff.statNameWidth`/`diff.statGraphWidth`
     // (`git_diff_ui_config()`); a later `--stat*` flag overrides the corresponding slot.
@@ -766,10 +809,17 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // `--exclude=<glob>`, accumulated until the next ref-selecting option consumes
     // and clears it (`clear_ref_exclusions`, revision.c).
     let mut ref_excludes: Vec<String> = Vec::new();
-    /// `--stdin`: read further revisions (then, after a bare `--`, pathspecs) from
-    /// standard input. It is how a caller asks about a set of commits too large or
-    /// too dynamic for a command line — the JetBrains client loads every commit's
-    /// details with `log --no-walk --stdin`, feeding the hashes it wants.
+    // `--reflog`: where each occurrence stood, and whether `--not` was in force
+    // when it did. `add_reflogs_to_pending()` appends to the same pending list the
+    // ref selectors above do, so its position among them is what orders the tips.
+    // Parallel to [`ref_selections`] rather than part of it because the two share
+    // no state at all: `--reflog` reads no glob and — unlike every selector beside
+    // it — neither consumes nor clears the `--exclude` patterns (revision.c:2766).
+    let mut reflog_selections: Vec<(usize, bool)> = Vec::new();
+    // `--stdin`: read further revisions (then, after a bare `--`, pathspecs) from
+    // standard input. It is how a caller asks about a set of commits too large or
+    // too dynamic for a command line — the JetBrains client loads every commit's
+    // details with `log --no-walk --stdin`, feeding the hashes it wants.
     let mut read_stdin = false;
     // `--not`: reverses the sense of every revision that follows, and toggles
     // again at the next `--not` (`handle_revision_pseudo_opt()`). It applies to
@@ -798,15 +848,39 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // `--simplify-by-decoration`, plus somewhere to keep the decoration map when
     // the format itself did not ask for one.
     let mut simplify_by_decoration = false;
-    /// `--full-history` (git's `revs->simplify_history = 0`): follow every parent
-    /// of a merge even when the merge is TREESAME to one of them, so a change that
-    /// arrived on a side branch keeps both the merge and that side in the history.
-    let mut full_history = false;
-    /// `--simplify-merges`: build the `--full-history` graph, then replace each
-    /// commit with its simplification (see [`simplify_merges`]). revision.c:2424
-    /// sets, in order: simplify_merges, topo_order, rewrite_parents,
-    /// simplify_history = 0, limited.
+    // `--full-history` (git's `revs->simplify_history = 0`): follow every parent
+    // of a merge even when the merge is TREESAME to one of them, so a change that
+    // arrived on a side branch keeps both the merge and that side in the history.
+    //
+    // The flag has three other sources, and each is a plain `= 0` that nothing
+    // ever puts back:
+    //
+    //   * `cmd_whatchanged()`: `rev.simplify_history = 0;` (builtin/log.c:620),
+    //     which is why `git whatchanged --parents -- <path>` keeps a merge that
+    //     `git log --parents -- <path>` collapses;
+    //   * `set_separate()` — so `-m`, `--diff-merges=separate|m|on|1|first-parent`
+    //     and `--diff-merges=remerge` all carry it (diff-merges.c:38, 65). A later
+    //     `--diff-merges=off` selects a different mode but runs only `suppress()`,
+    //     which does not touch `simplify_history`, so the history stays unsimplified;
+    //   * `--simplify-merges` (revision.c:2424), handled with the option below.
+    let mut full_history = flavor == Flavor::WhatChanged;
+    // `--simplify-merges`: build the `--full-history` graph, then replace each
+    // commit with its simplification (see [`simplify_merges`]). revision.c:2424
+    // sets, in order: simplify_merges, topo_order, rewrite_parents,
+    // simplify_history = 0, limited.
     let mut simplify_merges_opt = false;
+    // `revs->dense` (`--dense`/`--sparse`, revision.c:2462-2465), which
+    // `repo_init_revisions()` starts at 1. It only matters where `revs->prune`
+    // is on — a pathspec — and it turns off two things at once: the
+    // `!revs->dense && !commit->parents->next` early return in
+    // `try_to_simplify_commit()` (revision.c:996), which keeps every non-merge
+    // out of TREESAME, and the `if (revs->prune && revs->dense)` gates in
+    // `get_commit_action()` (revision.c:4221) and `simplify_commit()`
+    // (revision.c:4318), which are what actually *drop* a TREESAME commit and
+    // rewrite its ancestry. What survives `--sparse` is the parent pruning
+    // `try_to_simplify_commit()` does in place, so a merge that is TREESAME to
+    // one parent is still shown but the sides it did not take are not walked.
+    let mut dense = true;
     let decorations_for_simplify: Option<Decorations>;
     let mut min_parents: Option<usize> = None;
     let mut max_parents: Option<usize> = None;
@@ -815,8 +889,8 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     let mut color = ColorWhen::Auto;
     let mut order = Order::Default;
     let mut revs: Vec<String> = Vec::new();
-    /// Parallel to `revs`: whether a `--not` was in force when it was read, which
-    /// reverses the sense the `^` prefix would otherwise give it.
+    // Parallel to `revs`: whether a `--not` was in force when it was read, which
+    // reverses the sense the `^` prefix would otherwise give it.
     let mut rev_negated: Vec<bool> = Vec::new();
     let mut pathspecs: Vec<String> = Vec::new();
     // History filtering (`--grep`/`--author`/`--committer` + dialect flags),
@@ -850,6 +924,35 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // `--diff-merges=<mode>`: what a *merge* commit's patch shows. git's default is
     // `off`, which is why `git log -p` prints no diff for a merge at all.
     let mut diff_merges = DiffMerges::Off;
+    // `revs->explicit_diff_merges` (`diff_merges_parse_opts()` sets it after every
+    // branch it took, diff-merges.c:149). It is what
+    // `diff_merges_default_to_first_parent()` consults, so `--no-diff-merges
+    // --first-parent` keeps a merge diffless while `--first-parent` alone does not.
+    let mut explicit_diff_merges = false;
+    // `revs->merges_need_diff` / `revs->merges_imply_patch`. `common_setup()`
+    // raises `merges_need_diff` for every mode but `off`, and `-m` clears it again
+    // (diff-merges.c:125-127) — which is why `git log -m` alone still prints no
+    // diff while `--diff-merges=separate` prints one. `diff_merges_setup_revs()`
+    // then promotes either flag to the patch format, but only when no other format
+    // claimed it (diff-merges.c:186-191):
+    //
+    // ```c
+    // if (revs->merges_imply_patch || revs->merges_need_diff) {
+    //         if (!revs->diffopt.output_format)
+    //                 revs->diffopt.output_format = DIFF_FORMAT_PATCH;
+    // }
+    // ```
+    //
+    // That `if` is also what `cmd_whatchanged()`'s raw default tests, so an
+    // explicit `--diff-merges=<mode>` takes `whatchanged` off raw and onto patches.
+    let mut merges_need_diff = false;
+    // `revs->merges_imply_patch`, which only the short spellings raise
+    // (diff-merges.c:130-140). It differs from `merges_need_diff` in one way that
+    // shows: `diff_merges_setup_revs()` also does `revs->diff = 1` for it
+    // (diff-merges.c:186-187), so `git log -c` diffs *every* commit while
+    // `git log --diff-merges=combined` diffs only the merges. Of the spellings it
+    // covers, `--dd` and `--remerge-diff` are not ported, so `-c`/`--cc` set it here.
+    let mut merges_imply_patch = false;
     // `--follow`: keep following the one pathspec across renames.
     let mut follow = false;
     // `log.follow`'s separate flag, mirroring git's `default_follow_renames`:
@@ -1222,6 +1325,28 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                 std::mem::take(&mut ref_excludes),
                 negate_revs,
             ));
+        // ```c
+        // } else if (!strcmp(arg, "--reflog")) {
+        //         add_reflogs_to_pending(revs, *flags);
+        // ```
+        //
+        // (revision.c:2766-2767.) It is a pseudo-option like the ref selectors
+        // above, and it lands in the same pending list at the same argv position —
+        // but it reads no pattern, and the `--exclude` patterns standing beside it
+        // are neither applied nor cleared. `*flags` is what `--not` is holding, so
+        // `--not --reflog` pends every reflog id UNINTERESTING, and that (through
+        // `add_pending_object_with_path()`) is what clears `revs->no_walk`.
+        } else if a == "--reflog" {
+            if negate_revs {
+                no_walk = None;
+            }
+            reflog_selections.push((revs.len(), negate_revs));
+        // `revs->encode_email_headers` (revision.c:2526-2529). Only the mail
+        // pretty formats read it, and the last spelling on the line wins.
+        } else if a == "--encode-email-headers" {
+            encode_email_headers = true;
+        } else if a == "--no-encode-email-headers" {
+            encode_email_headers = false;
         // `--exclude=<glob>` only accumulates; the next ref-selecting option
         // applies and clears it, and anything else leaves it alone.
         } else if a == "--exclude" || a.starts_with("--exclude=") {
@@ -1310,6 +1435,12 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                     return Ok(ExitCode::from(128));
                 }
             }
+        // `revision.c:2462-2465`. `--dense` restores the `repo_init_revisions()`
+        // default, so it is only ever an undo of an earlier `--sparse`.
+        } else if a == "--dense" {
+            dense = true;
+        } else if a == "--sparse" {
+            dense = false;
         } else if a == "--date-order" {
             order = Order::Date;
         } else if a == "--topo-order" {
@@ -1343,6 +1474,40 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             grep_all_match = true;
         } else if a == "--invert-grep" {
             grep_invert = true;
+        // `--max-age`/`--min-age` set the very same `revs->max_age`/`revs->min_age`
+        // as `--since`/`--until` (revision.c:2379-2393); only the value parser
+        // differs — [`parse_age`]'s raw epoch instead of `approxidate()`. Both
+        // spellings take their value attached or as the next argv element, which is
+        // `parse_long_opt()` (diff.c:5380-5399), and a missing one is its
+        // `die("Option '--%s' requires a value")`.
+        } else if a == "--max-age"
+            || a == "--min-age"
+            || a.starts_with("--max-age=")
+            || a.starts_with("--min-age=")
+        {
+            let name = if a.starts_with("--max-age") { "max-age" } else { "min-age" };
+            let value = match a.split_once('=') {
+                Some((_, v)) => v.to_string(),
+                None => {
+                    i += 1;
+                    match args.get(i) {
+                        Some(v) => v.clone(),
+                        None => {
+                            eprintln!("fatal: Option '--{name}' requires a value");
+                            return Ok(ExitCode::from(128));
+                        }
+                    }
+                }
+            };
+            let Ok(age) = parse_age(&value) else {
+                eprintln!("fatal: '{value}': not a number of seconds since epoch");
+                return Ok(ExitCode::from(128));
+            };
+            if name == "max-age" {
+                since = age;
+            } else {
+                until = age;
+            }
         } else if let Some(v) = a.strip_prefix("--since=").or_else(|| a.strip_prefix("--after=")) {
             since = Some(approxidate(v));
         } else if a == "--since" || a == "--after" {
@@ -1379,18 +1544,48 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             follow = false;
             default_follow = false;
         } else if a == "-m" {
-            // `diff_merges_set_dense_combined_if_unset()` and friends
-            // (diff-merges.c): each spelling selects a mode, and the last one wins.
+            // `diff_merges_parse_opts()` (diff-merges.c:119-151): each spelling
+            // selects a mode, and the last one wins. `-m` is the odd one out — it
+            // runs `set_to_default()` and then clears `merges_need_diff` again, so
+            // it selects the mode without asking for a patch format.
             diff_merges = DiffMerges::Separate;
+            merges_need_diff = false;
+            explicit_diff_merges = true;
+            // `set_separate()`'s second statement, which is not about the diff at
+            // all: `revs->simplify_history = 0` (diff-merges.c:38). It is why
+            // `git log -m -- <path>` shows a merge that `git log -- <path>`
+            // collapses onto the side it took.
+            full_history = true;
         } else if a == "-c" {
             diff_merges = DiffMerges::Combined;
+            merges_need_diff = true;
+            merges_imply_patch = true;
+            explicit_diff_merges = true;
         } else if a == "--cc" {
             diff_merges = DiffMerges::DenseCombined;
+            merges_need_diff = true;
+            merges_imply_patch = true;
+            explicit_diff_merges = true;
         } else if a == "--no-diff-merges" {
             diff_merges = DiffMerges::Off;
+            merges_need_diff = false;
+            explicit_diff_merges = true;
         } else if let Some(v) = a.strip_prefix("--diff-merges=") {
             match DiffMerges::parse(v) {
-                Some(m) => diff_merges = m,
+                Some(m) => {
+                    diff_merges = m;
+                    // `set_none()` is the only `func_by_opt` arm that does not run
+                    // `common_setup()`, so it is the only one that leaves
+                    // `merges_need_diff` at zero.
+                    merges_need_diff = m != DiffMerges::Off;
+                    explicit_diff_merges = true;
+                    // `set_separate()` and `set_first_parent()` (which calls it)
+                    // also clear `revs->simplify_history`; `set_combined()`,
+                    // `set_dense_combined()` and `set_none()` do not.
+                    if matches!(m, DiffMerges::Separate | DiffMerges::FirstParent) {
+                        full_history = true;
+                    }
+                }
                 None => {
                     eprintln!("fatal: invalid value for '--diff-merges': '{v}'");
                     return Ok(ExitCode::from(128));
@@ -1562,6 +1757,47 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         i += 1;
     }
 
+    // `setup_revisions()` runs `opt->tweak(revs)` (revision.c:3121-3122) once the
+    // whole command line has been read, and `cmd_log` is the only caller here that
+    // installs one:
+    //
+    // ```c
+    // static void log_setup_revisions_tweak(struct rev_info *rev)
+    // {
+    //         ...
+    //         if (rev->first_parent_only)
+    //                 diff_merges_default_to_first_parent(rev);
+    // }
+    // ```
+    //
+    // (builtin/log.c:815-823, installed at builtin/log.c:846.) `cmd_whatchanged`
+    // reaches `cmd_log_init` with a zeroed `setup_revision_opt` (builtin/log.c:545)
+    // and therefore has no tweak at all — which is the whole reason
+    // `git whatchanged --first-parent` prints no record for a merge while
+    // `git log --raw --first-parent` prints one.
+    //
+    // ```c
+    // void diff_merges_default_to_first_parent(struct rev_info *revs)
+    // {
+    //         if (!revs->explicit_diff_merges)
+    //                 revs->separate_merges = 1;
+    //         if (revs->separate_merges)
+    //                 revs->first_parent_merges = 1;
+    // }
+    // ```
+    //
+    // It never touches `merges_need_diff`, so `--first-parent` alone still asks for
+    // no output format: it decides only what a merge's diff *is*, once something
+    // else has asked for one.
+    if flavor == Flavor::Log && first_parent {
+        if !explicit_diff_merges {
+            diff_merges = DiffMerges::Separate;
+        }
+        if diff_merges == DiffMerges::Separate {
+            diff_merges = DiffMerges::FirstParent;
+        }
+    }
+
     // `-L` (`rev->line_level_traverse`). git rejects the combinations it cannot
     // render in `setup_revisions`, before the pathspec check in `cmd_log_init_finish`.
     let line_level = !line_ranges.is_empty();
@@ -1676,15 +1912,9 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         }
     };
     for (at, (spec, negated)) in revs.iter().zip(rev_negated.iter().copied()).enumerate() {
-        // `handle_revision_arg_1()` puts every endpoint of the token through
-        // `get_oid_with_context()`, so `get_oid_basic()`'s ambiguity warning fires
-        // once per endpoint — twice for a range. The lines `--stdin` supplied are
-        // exempt, which is what `read_revisions_from_stdin()` clears the switch for.
-        if at < argv_revs {
-            for endpoint in revision_endpoints(spec) {
-                crate::objname::warn_ambiguous_refname(&repo, endpoint);
-            }
-        }
+        // The lines `--stdin` supplied are exempt from the ambiguity half, which
+        // is what `read_revisions_from_stdin()` clears the switch for.
+        warn_operand(&repo, spec, at < argv_revs);
         // `handle_revision_arg_1()`'s guard ahead of `handle_dotdot()`: a bare
         // `..` is the pathspec for the parent directory, not `HEAD..HEAD`. It
         // falls through to the plain branch, fails to resolve, and is taken as a
@@ -1808,6 +2038,15 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     } else {
         Vec::new()
     };
+    // `add_reflogs_to_pending()`'s ids, read once and replayed at each `--reflog`.
+    // git re-walks `$GIT_DIR/logs` per occurrence, which only shows in the
+    // pruned-commit warning a second `--reflog` would repeat; the ids themselves
+    // are the same list either way.
+    let reflog_tips: Vec<ObjectId> = if reflog_selections.is_empty() {
+        Vec::new()
+    } else {
+        super::shortlog::reflog_pending(&repo)?
+    };
     // Append the tips of the ref-selecting pseudo-options that stood at argument
     // index `at`. Each yields its refs in refname order — the ref iterator's own
     // order, which is what breaks a commit-date tie between two of them.
@@ -1861,6 +2100,23 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                 if let Some(id) = repo.head().ok().and_then(|mut h| h.try_peel_to_id().ok().flatten())
                 {
                     pend(id.detach(), "HEAD", tips, tip_names, tip_sources, neg_ids);
+                }
+            }
+        }
+        // `handle_one_reflog_commit()` pends each id under the empty name
+        // (`add_pending_object(cb->all_revs, o, "")`), so `--source` reports
+        // nothing for a commit reached this way — unlike `--all`, which names the
+        // ref.
+        for negated in reflog_selections.iter().filter(|(i, _)| *i == at).map(|(_, n)| *n) {
+            for oid in &reflog_tips {
+                if negated {
+                    neg_ids.push(*oid);
+                    continue;
+                }
+                tips.push(*oid);
+                tip_names.push(String::new());
+                if source_mode {
+                    tip_sources.push(String::new());
                 }
             }
         }
@@ -1945,8 +2201,11 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // rather than quietly walking `HEAD`. So does a namespace option that selected
     // nothing: `--remotes` in a repository with no remotes is still an input.
     // A token that turned out to be a pathspec is not — `git log .` walks `HEAD`.
-    let positive_from_args =
-        rev_input_given || !tips.is_empty() || !neg_ids.is_empty() || !ref_selections.is_empty();
+    let positive_from_args = rev_input_given
+        || !tips.is_empty()
+        || !neg_ids.is_empty()
+        || !ref_selections.is_empty()
+        || !reflog_selections.is_empty();
     if !positive_from_args {
         let head = repo.head()?;
         if head.is_unborn() && !all {
@@ -2184,8 +2443,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             // a merge that the same pathspec keeps without it. `--first-parent` (or
             // an explicit `-m`/`-c`/`--cc`) gives the merge a diff, and then it is
             // shown like any other commit.
-            let merge_without_diff =
-                node.parents.len() > 1 && !first_parent && diff_merges == DiffMerges::Off;
+            let merge_without_diff = node.parents.len() > 1 && diff_merges == DiffMerges::Off;
             let changed =
                 !merge_without_diff && changes_match(&repo, &commit, parent, &mut matcher)?;
             if changed {
@@ -2209,7 +2467,15 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         let mut simplified: HashMap<ObjectId, (Vec<ObjectId>, bool)> =
             HashMap::with_capacity(nodes.len());
         // Only `--simplify-merges` needs the per-parent detail.
-        let mut merge_simp: HashMap<ObjectId, MergeSimp> = HashMap::new();
+        let mut merge_simp: HashMap<ObjectId, super::simplify::Classified> = HashMap::new();
+        // `commit->parents` as `try_to_simplify_commit()` rewrote it in place
+        // (revision.c:1050-1054): the single parent a commit turned out to be
+        // TREESAME to, with every other parent freed. That mutation is part of the
+        // walk, not of the display, so `--parents`, `--graph` and `%p`/`%P` all see
+        // it whatever `revs->dense` is — only `rewrite_parents()` further down is
+        // gated on dense. Absent means the commit kept the parents it was walked
+        // with.
+        let mut pruned: HashMap<ObjectId, Vec<ObjectId>> = HashMap::new();
         for node in &nodes {
             let commit = repo.find_object(node.id)?.try_into_commit()?;
             // `--first-parent` limits the comparison the same way it limits the
@@ -2221,15 +2487,40 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             };
             if parents.is_empty() {
                 // A root commit is compared against the empty tree, so it shows
-                // exactly when it introduced a matching path.
-                let shown = changes_match(&repo, &commit, None, &mut matcher)?;
+                // exactly when it introduced a matching path. That comparison runs
+                // ahead of the `--sparse` early return (revision.c:979-997), so a
+                // root is still marked TREESAME under `--sparse`; what `--sparse`
+                // removes is the `revs->prune && revs->dense` gate that would have
+                // dropped it (revision.c:4221).
+                let changed = changes_match(&repo, &commit, None, &mut matcher)?;
                 if simplify_merges_opt {
                     merge_simp.insert(
                         node.id,
-                        MergeSimp { parents: Vec::new(), treesame_with: Vec::new(), treesame: !shown },
+                        super::simplify::Classified {
+                            parents: Vec::new(),
+                            treesame_with: Vec::new(),
+                            treesame: !changed,
+                        },
                     );
                 }
-                simplified.insert(node.id, (Vec::new(), shown));
+                simplified.insert(node.id, (Vec::new(), changed || !dense));
+                continue;
+            }
+            // `if (!revs->dense && !commit->parents->next) return;`
+            // (revision.c:996): under `--sparse` a non-merge is never compared at
+            // all, so it is never TREESAME, is always shown, and keeps its parent.
+            if !dense && parents.len() == 1 {
+                if simplify_merges_opt {
+                    merge_simp.insert(
+                        node.id,
+                        super::simplify::Classified {
+                            parents: node.parents.clone(),
+                            treesame_with: vec![false],
+                            treesame: false,
+                        },
+                    );
+                }
+                simplified.insert(node.id, (parents.to_vec(), true));
                 continue;
             }
             if full_history {
@@ -2251,12 +2542,20 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                     any_change |= changed;
                 }
                 if simplify_merges_opt {
+                    // The parent list `simplify_one()` rewrites is the *whole*
+                    // one: `--first-parent` stops the comparison at parent 1 but
+                    // leaves the later parents in place, and `%p`/`--parents`
+                    // still print them.
                     merge_simp.insert(
                         node.id,
-                        MergeSimp { parents: parents.to_vec(), treesame_with, treesame: !any_change },
+                        super::simplify::Classified {
+                            parents: node.parents.clone(),
+                            treesame_with,
+                            treesame: !any_change,
+                        },
                     );
                 }
-                simplified.insert(node.id, (parents.to_vec(), any_change));
+                simplified.insert(node.id, (parents.to_vec(), any_change || !dense));
                 continue;
             }
             let mut treesame: Option<ObjectId> = None;
@@ -2267,7 +2566,15 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                 }
             }
             match treesame {
-                Some(p) => simplified.insert(node.id, (vec![p], false)),
+                // The parent pruning `try_to_simplify_commit()` performs in place
+                // (revision.c:1050-1054) happens whatever `revs->dense` is; only
+                // the `revs->prune && revs->dense` display gate below it does not,
+                // so under `--sparse` the merge itself is still printed while the
+                // side it did not take stays unwalked.
+                Some(p) => {
+                    pruned.insert(node.id, vec![p]);
+                    simplified.insert(node.id, (vec![p], !dense))
+                }
                 None => simplified.insert(node.id, (parents.to_vec(), true)),
             };
         }
@@ -2285,20 +2592,40 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         }
         if simplify_merges_opt {
             // `simplify_merges()` prunes `revs->commits` to the commits that
-            // simplify to themselves; the display filter is unchanged, so a
-            // TREESAME commit is still skipped. Both apply.
+            // simplify to themselves; `get_commit_action()` then applies its own
+            // TREESAME filter to what is left. Both apply.
             let order: Vec<ObjectId> =
                 nodes.iter().map(|n| n.id).filter(|id| reachable.contains(id)).collect();
-            let kept = simplify_merges(&repo, &order, &merge_simp, first_parent)?;
+            let walked: HashSet<ObjectId> = order.iter().copied().collect();
+            let sm = super::simplify::merge_simplify(&repo, &order, &merge_simp, first_parent)?;
+            // `--simplify-merges` sets `revs->rewrite_parents`, so `want_ancestry`
+            // holds and a TREESAME merge between two relevant commits stays in the
+            // output to tie the topology together.
             nodes.retain(|n| {
-                kept.contains_key(&n.id) && simplified.get(&n.id).is_some_and(|(_, shown)| *shown)
+                sm.kept(&n.id)
+                    && super::simplify::shows(
+                        sm.treesame.get(&n.id).copied().unwrap_or(false),
+                        sm.parents.get(&n.id).map(Vec::as_slice).unwrap_or(&[]),
+                        &walked,
+                        true,
+                        true,
+                        true,
+                    )
             });
             // The rewritten ancestry is what `%p`/`%P` report as well, not only
             // `--parents`/`--graph`: git rewrites `commit->parents` in place, so
-            // every consumer sees the simplified list.
+            // every consumer sees the simplified list. `simplify_commit()` then
+            // runs the ordinary `rewrite_parents()` on top of it, which is what
+            // drops a TREESAME root parent from the list.
+            let ancestry = super::simplify::Ancestry {
+                walked: &walked,
+                treesame: &sm.treesame,
+                parents: &sm.parents,
+                first_parent,
+            };
             for node in &mut nodes {
-                if let Some(parents) = kept.get(&node.id) {
-                    node.parents = parents.clone();
+                if let Some(parents) = sm.parents.get(&node.id) {
+                    node.parents = ancestry.rewrite(parents);
                 }
             }
         } else {
@@ -2307,12 +2634,29 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             });
         }
 
+        // The in-place prune belongs to the walk, so it lands on every commit that
+        // survived it — `--sparse --parents` shows `385d3ba c6e564c`, not the two
+        // parents the merge object records. Under `--dense` no *shown* commit can
+        // carry one (a TREESAME commit is dropped by `get_commit_action()` unless
+        // `--simplify-merges` handled it separately, and both cases are covered
+        // above), so it is applied only where it can still matter.
+        if !dense && !simplify_merges_opt {
+            for node in &mut nodes {
+                if let Some(parents) = pruned.get(&node.id) {
+                    node.parents = parents.clone();
+                }
+            }
+        }
+
         // `rewrite_parents()`: the ancestry the output shows is the simplified
         // one, and a parent reachable from another parent drops out of it. Only
         // the ancestry-printing formats take it: the per-commit diff stays
         // against the real first parent, which is what `log --name-status --
         // <path>` reports. `--simplify-merges` has already written its own.
-        if (graph || show_parents) && !simplify_merges_opt {
+        // `simplify_commit()` reaches `rewrite_parents()` only under
+        // `revs->prune && revs->dense && want_ancestry(revs)` (revision.c:4317-4318),
+        // so `--sparse --parents` prints the ancestry the commits really have.
+        if (graph || show_parents) && !simplify_merges_opt && dense {
             for node in &mut nodes {
                 let mut rewritten: Vec<ObjectId> = Vec::with_capacity(node.parents.len());
                 for p in &node.parents {
@@ -2558,16 +2902,39 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         nodes.reverse();
     }
 
+    // `revs->diffopt.output_format` as the command line itself left it — every bit
+    // but the `DIFF_FORMAT_PATCH` that `diff_merges_setup_revs()` may add below, and
+    // every bit but `whatchanged`'s raw fallback, which is later still.
+    // `DIFF_FORMAT_NO_OUTPUT` (`-s`, `-q`) counts: it is a format, and it is what
+    // makes `git log --diff-merges=separate -s` print two headerless merge records
+    // instead of two patches.
+    let rendering_format = patch
+        || stat
+        || numstat
+        || shortstat
+        || summary
+        || name_only
+        || name_status
+        || raw;
+    let asked_format = rendering_format || saw_no_patch || quiet;
+    // `revs->diff` — "Did the user ask for any diff output?" (revision.c:3145-3146),
+    // answered *before* `diff_merges_setup_revs()` runs, so the patch format that
+    // call installs never reaches it. It is `log_tree_diff()`'s `all_need_diff`
+    // (log-tree.c:1103), the flag that decides whether a *non-merge* is diffed at
+    // all — which is why `git log --diff-merges=separate` prints a diff for a merge
+    // and nothing but the header for every other commit. `cmd_whatchanged` sets it
+    // unconditionally (`rev.diff = 1`, builtin/log.c:543), and `merges_imply_patch`
+    // sets it too (diff-merges.c:186-187).
+    let all_need_diff = flavor == Flavor::WhatChanged || merges_imply_patch || rendering_format;
     // `--name-only`/`--name-status` are git's reported format; they suppress both
     // the count formats and the `-p` patch. The patch is emitted after the count
     // formats otherwise.
-    // `diff_merges_setup_revs()`: `-c`/`--cc` set `merges_imply_patch`, and the
-    // patch becomes the format only when nothing else claimed it
-    // (`if (!revs->diffopt.output_format)`), so `-c --stat` stays a stat. `-m` sets
-    // no such flag, which is why `git log -m` on its own still prints no diff.
-    let patch = patch
-        || (matches!(diff_merges, DiffMerges::Combined | DiffMerges::DenseCombined)
-            && !(stat || numstat || shortstat || summary || name_only || name_status || raw));
+    // `diff_merges_setup_revs()` (diff-merges.c:186-191) promotes either merge flag
+    // to the patch format, but only when nothing else claimed one — so `-c --stat`
+    // stays a stat and `--diff-merges=separate -s` stays silent. `-m` is the one
+    // spelling that raises neither flag, which is why `git log -m` on its own still
+    // prints no diff.
+    let patch = patch || ((merges_imply_patch || merges_need_diff) && !asked_format);
     let emit_patch = patch && !name_only && !name_status;
     // `diff_setup_done()`: `--name-only`/`--name-status` clear every other output
     // format, `--raw` among them; `--raw` itself clears nothing, so it stacks with
@@ -2795,7 +3162,8 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // above it do. The window computes a batch of them across the thread pool
     // while the loop below stays a plain in-order stream — git computes them one
     // at a time on one core.
-    let mut patches = PatchWindow::new(emit_patch, show_root, diff_merges, first_parent, patch_opts.clone());
+    let mut patches =
+        PatchWindow::new(emit_patch, show_root, diff_merges, all_need_diff, patch_opts.clone());
     // Each record's text comes out of its own commit object, and reading 6000 of
     // them is the whole cost of a format like `--oneline` or `%s`. The window
     // renders a batch of records at a time across the thread pool; the loop below
@@ -2821,6 +3189,13 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         notes: &notes_trees,
         expand_tabs,
         date_explicit,
+        // `show_log()`'s `ctx.rev = opt; ctx.print_email_subject = 1;`
+        // (log-tree.c:700-701), which is what puts `[<prefix>] ` on the
+        // `Subject:` line and turns the RFC2047 encoding on.
+        email: EmailStyle {
+            subject_prefix: &cfg_subject_prefix,
+            encode_headers: encode_email_headers,
+        },
     });
     // The pathspec set the name/stat formats are limited to, parsed once rather
     // than per commit. `--follow` replaces it per commit (see below).
@@ -2839,7 +3214,11 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // `log_tree_commit()` under `-m`: a merge is rendered once per parent, each record
     // carrying its own ` (from <oid>)` header insert and diffing against that parent.
     // Every other commit is one record against its first parent.
-    let separate_merges = diff_merges == DiffMerges::Separate && (want_names || emit_patch);
+    // The repetition is the `for (;;)` loop in `log_tree_diff()`, so it happens
+    // whenever that function gets past its early returns — `--diff-merges=separate -s`
+    // repeats the header twice with no diff under either copy.
+    let separate_merges =
+        diff_merges == DiffMerges::Separate && (all_need_diff || merges_need_diff);
     if separate_merges && graph && nodes.iter().any(|n| n.parents.len() > 1) {
         bail!("`-m` with `--graph` is not ported: git lays out one graph row per
                per-parent record");
@@ -2856,7 +3235,12 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         })
         .collect();
 
-    for (ni, diff_parent, from) in records.iter().copied() {
+    // `log_tree_commit()`'s `shown`, carried across the per-parent records of one
+    // merge: `log_tree_diff()` returns whatever the `for (;;)` loop's flushes
+    // reported, and only when *none* of them showed anything does the
+    // `always_show_header` fallback print a single parentless header.
+    let mut merge_shown_any = false;
+    for (ri, (ni, diff_parent, from)) in records.iter().copied().enumerate() {
         let node = &nodes[ni];
         if print_limit.is_some_and(|n| printed >= n) {
             break;
@@ -2873,6 +3257,11 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         // Whether this record produced a diff queue; `whatchanged` prints nothing for
         // a commit that did not.
         let mut record_has_diff = false;
+        // `log_tree_diff_flush()` reached its `diff_queue_is_empty()` test and it
+        // came back true, which is its `return 0` — no header, no diff. Distinct
+        // from `!record_has_diff`, which is also what an `-s` record looks like:
+        // there the queue was never asked about, so the flush still ran.
+        let mut record_queue_empty = false;
         if walk_only {
             let Pretty::User(fmt) = &pretty else { unreachable!() };
             let mut block: Vec<u8> = Vec::new();
@@ -2910,7 +3299,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         // `--graph` that hand-over is where the graph's remaining rows are drained
         // (`graph_show_commit_msg`), so the split has to survive into
         // [`render_graph`]; everything appended below is diff output.
-        let msg_len = block.len();
+        let mut msg_len = block.len();
 
         // `log_tree_diff` short-circuits under `-L`: it flushes the pairs
         // `line_log_queue_pairs()` produced and returns, so neither the merge rule
@@ -2947,22 +3336,36 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                 block.extend_from_slice(&diff);
             }
         }
-        // A root commit's diff (against the empty tree) is only shown when
-        // `show_root` is set — git's `log.showRoot` (default true), forced on by
-        // `--root`. Non-root commits are unaffected.
-        // A merge reaches the count/name formats too once a `--diff-merges` mode is
-        // in force; git diffs it against its first parent for those
-        // (`log -c --stat` on a merge prints the first-parent stat).
-        // `--first-parent` is the other way a merge gets a diff: git's
-        // `diff_merges_setup_revs()` reads it as "diff against the first parent",
-        // so `log --first-parent -p` renders a merge like any single-parent commit.
+        // `log_tree_diff()`'s early returns, in order (log-tree.c:1103-1152):
+        //
+        // ```c
+        // int all_need_diff = opt->diff || opt->diffopt.flags.exit_with_status;
+        // if (!all_need_diff && !opt->merges_need_diff)
+        //         return 0;
+        // ...
+        // is_merge = parents && parents->next;
+        // if (!is_merge && !all_need_diff)
+        //         return 0;
+        // if (!parents) { if (opt->show_root_diff) { … } return !opt->loginfo; }
+        // if (is_merge) { … if (opt->separate_merges) { … } else return 0; }
+        // ```
+        //
+        // So a merge needs a `--diff-merges` mode (`separate_merges` or
+        // `combine_merges`) *and* one of the two diff flags; every other commit,
+        // root included, needs only `all_need_diff`, and a root additionally obeys
+        // `log.showRoot`. That is why `git whatchanged --first-parent` emits no
+        // record at all for a merge: `cmd_whatchanged` installs no tweak, so the
+        // mode stays `off`.
         // `DIFF_FORMAT_NO_OUTPUT` renders nothing, but `log_tree_diff_flush()` still
         // builds and tests the pair queue — and its answer is what decides whether
         // `whatchanged` prints the commit at all. So the queue is still walked
         // under `-s`/`-q`; only the rendering is skipped.
         else if (want_names || emit_patch || probe_queue)
-            && (node.parents.len() < 2 || diff_merges != DiffMerges::Off || first_parent)
-            && (show_root || !node.parents.is_empty())
+            && if node.parents.len() > 1 {
+                (all_need_diff || merges_need_diff) && diff_merges != DiffMerges::Off
+            } else {
+                all_need_diff && (show_root || !node.parents.is_empty())
+            }
         {
             let mut diff: Vec<u8> = Vec::new();
             // `log_tree_diff_flush()` separates the message from the diff whenever the
@@ -3136,20 +3539,46 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                     diff.extend_from_slice(p);
                 }
             }
+            // A merge's combined diff is separated from the header even under
+            // `oneline`, which is the one format that otherwise runs the patch
+            // straight on — and it is separated even when the combined diff came
+            // out *empty*, because that separator is not `log_tree_diff_flush()`'s
+            // at all. `diff_tree_combined()` prints the header and the blank line
+            // itself, before it has scanned a single path:
+            //
+            // ```c
+            // show_log_first = !!rev->loginfo && !rev->no_commit_id;
+            // needsep = 0;
+            // if (show_log_first) {
+            //         show_log(rev);
+            //
+            //         if (rev->verbose_header && opt->output_format &&
+            //             opt->output_format != DIFF_FORMAT_NO_OUTPUT &&
+            //             !commit_format_is_empty(rev->commit_format))
+            //                 printf("%s%c", diff_line_prefix(opt),
+            //                        opt->line_termination);
+            // }
+            // ```
+            //
+            // (combine-diff.c:1512-1522.) So `git log -c` on a merge that is
+            // TREESAME to every parent still prints its header followed by a blank
+            // line, and `git whatchanged -c` — whose `always_show_header` is off —
+            // prints that merge too, even though `do_diff_combined()` reports it as
+            // not shown.
+            let combined_here = node.parents.len() > 1
+                && matches!(diff_merges, DiffMerges::Combined | DiffMerges::DenseCombined);
             // `if (opt->diffopt.output_format & ~DIFF_FORMAT_NO_OUTPUT)`
             // (log-tree.c): with nothing but `NO_OUTPUT` set there is no diff to
-            // separate the message from, so `-s` prints no blank line either.
-            if (!diff.is_empty() || queue_nonempty) && !probe_queue {
+            // separate the message from, so `-s` prints no blank line either —
+            // and combine-diff's own separator carries the same
+            // `output_format != DIFF_FORMAT_NO_OUTPUT` test, which `probe_queue`
+            // is exactly the state of.
+            if (!diff.is_empty() || queue_nonempty || combined_here) && !probe_queue {
                 // git puts a separator between the log message and the diff for
                 // every format but `oneline` — and only when the message block
                 // rendered something to separate from. A `--stat` block shown
                 // together with `-p` is fenced off with a `---` line; every other
                 // diff format uses a plain blank line.
-                // A merge's combined diff is separated from the header even under
-                // `oneline`, which is the one format that otherwise runs the patch
-                // straight on: `show_combined_diff()` writes the blank line itself.
-                let combined_here = node.parents.len() > 1
-                    && matches!(diff_merges, DiffMerges::Combined | DiffMerges::DenseCombined);
                 if (!matches!(pretty, Pretty::Oneline) || combined_here) && !block.is_empty() {
                     if stat && emit_patch {
                         block.extend_from_slice(b"---\n");
@@ -3159,7 +3588,39 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                 }
                 block.extend_from_slice(&diff);
             }
-            record_has_diff = !diff.is_empty() || queue_nonempty;
+            record_has_diff = !diff.is_empty() || queue_nonempty || combined_here;
+            record_queue_empty = !record_has_diff;
+        }
+        // ```c
+        // if (diff_queue_is_empty(&opt->diffopt)) {
+        //         …
+        //         return 0;
+        // }
+        //
+        // if (opt->loginfo && !opt->no_commit_id) {
+        //         show_log(opt);
+        // ```
+        //
+        // (log-tree.c:864-873.) The ` (from <oid>)` header belongs to the flush, so
+        // a per-parent record whose queue came out empty prints nothing at all —
+        // which is why `git log --diff-merges=separate -- <path>` shows only the
+        // parents that path really differs against. If every parent came out empty,
+        // `log_tree_diff()` reported `shown == 0` and `log_tree_commit()`'s
+        // `always_show_header` prints one header with `log.parent = NULL`, i.e.
+        // without the insert.
+        if from.is_some() {
+            let last_of_merge = records.get(ri + 1).is_none_or(|next| next.0 != ni);
+            let shown_before = merge_shown_any;
+            // The flag belongs to one merge, so it is cleared the moment that
+            // merge's last per-parent record is reached.
+            merge_shown_any = !last_of_merge && (shown_before || !record_queue_empty);
+            if record_queue_empty {
+                if !last_of_merge || shown_before {
+                    continue;
+                }
+                block = entry_block_from(&repo, node, &entries.params, &abbrev_cache, None)?;
+                msg_len = block.len();
+            }
         }
         // `cmd_whatchanged()` leaves `always_show_header` off, so `log_tree_commit()`
         // prints nothing at all for a commit whose diff queue came out empty — and
@@ -3336,6 +3797,73 @@ pub(crate) fn parse_max_count(value: &str) -> Result<Option<usize>, ()> {
     }
 }
 
+/// git's `parse_age()` (revision.c:2286-2296), the value parser behind
+/// `--max-age=`/`--min-age=`:
+///
+/// ```c
+/// static timestamp_t parse_age(const char *arg)
+/// {
+///         timestamp_t num;
+///         char *p;
+///
+///         errno = 0;
+///         num = parse_timestamp(arg, &p, 10);
+///         if (errno || *p || p == arg)
+///                 die("'%s': not a number of seconds since epoch", arg);
+///         return num;
+/// }
+/// ```
+///
+/// `parse_timestamp` is `strtoumax`, so the token is read **unsigned**: leading
+/// whitespace is skipped, an optional sign is accepted, and `-` negates by
+/// wrapping. Anything left over, an empty digit run, or an overflow (`ERANGE`) is
+/// the fatal.
+///
+/// `Ok(None)` is the one value that parses and still does nothing:
+/// `repo_init_revisions()` leaves `revs->max_age`/`revs->min_age` at `-1` and
+/// every reader tests against that sentinel, so `--max-age=-1` — which wraps to
+/// exactly `UINTMAX_MAX` — is indistinguishable from the option never having been
+/// given.
+pub(super) fn parse_age(arg: &str) -> Result<Option<i64>, ()> {
+    let b = arg.as_bytes();
+    let mut i = 0;
+    while i < b.len() && b[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    let negative = match b.get(i) {
+        Some(b'-') => {
+            i += 1;
+            true
+        }
+        Some(b'+') => {
+            i += 1;
+            false
+        }
+        _ => false,
+    };
+    let digits_at = i;
+    let mut num: u64 = 0;
+    while i < b.len() && b[i].is_ascii_digit() {
+        // `strtoumax` sets `ERANGE` rather than wrapping, and `parse_age` dies on it.
+        num = num
+            .checked_mul(10)
+            .and_then(|n| n.checked_add(u64::from(b[i] - b'0')))
+            .ok_or(())?;
+        i += 1;
+    }
+    // `p == arg` (nothing converted) and `*p` (trailing garbage), in that order.
+    if i == digits_at || i != b.len() {
+        return Err(());
+    }
+    let num = if negative { num.wrapping_neg() } else { num };
+    if num == u64::MAX {
+        return Ok(None);
+    }
+    // A bound past `i64::MAX` can only exclude every commit there is, which is what
+    // the saturating conversion leaves it doing.
+    Ok(Some(i64::try_from(num).unwrap_or(i64::MAX)))
+}
+
 /// A non-negative base-10 integer (`--min-parents`, `--max-parents`).
 /// `None` for anything git would reject with `fatal: '<value>': not an integer`.
 fn parse_nonneg(value: &str) -> Option<usize> {
@@ -3411,11 +3939,44 @@ fn spec_is_path(repo: &gix::Repository, spec: &str) -> bool {
 ///   too names the whole token, so `nosuch..main` is reported as written rather
 ///   than as the endpoint that failed.
 pub(super) fn bad_revision_message(spec: &str, hex_len: usize) -> String {
+    bad_revision_message_gated(spec, hex_len, false)
+}
+
+/// [`bad_revision_message`] with the *other* half of its own condition supplied.
+///
+/// git gates the second shape above on two things, not one
+/// (`setup_revisions()`, `revision.c`):
+///
+/// ```c
+/// if (handle_revision_arg(arg, revs, flags, revarg_opt)) {
+///         int j;
+///         if (seen_dashdash || *arg == '^')
+///                 die(_("bad revision '%s'"), arg);
+///         for (j = i; j < argc; j++)
+///                 verify_filename(revs->prefix, argv[j], j == i);
+///         …
+/// }
+/// ```
+///
+/// `seen_dashdash` is decided by a scan of the whole argument vector before any
+/// operand is resolved, so it is not "after a `--`" in argv order — a separator
+/// anywhere makes *every* operand revision-only, including the ones written in
+/// front of it. `git diff nosuch..HEAD --` is therefore `bad revision`, while the
+/// same operand with no separator is still a pathspec candidate and gets the
+/// three-line `ambiguous argument` text.
+///
+/// A caller that has not scanned for a separator passes `false` and gets exactly
+/// the behaviour [`bad_revision_message`] always had.
+pub(super) fn bad_revision_message_gated(
+    spec: &str,
+    hex_len: usize,
+    seen_dashdash: bool,
+) -> String {
     let bare = spec.strip_prefix('^').unwrap_or(spec);
     if bare.len() == hex_len && bare.bytes().all(|b| b.is_ascii_hexdigit()) {
         return format!("fatal: bad object {bare}\n");
     }
-    if spec.starts_with('^') {
+    if seen_dashdash || spec.starts_with('^') {
         return format!("fatal: bad revision '{spec}'\n");
     }
     format!(
@@ -3433,8 +3994,70 @@ pub(super) fn bad_revision_message(spec: &str, hex_len: usize) -> String {
 /// to the plain message otherwise. Every caller that has a repository should use
 /// this; [`bad_revision_message`] stays as the shape-only half.
 pub(super) fn bad_revision_message_in(repo: &gix::Repository, spec: &str) -> String {
-    crate::objname::dotdot_fatal(repo, spec)
-        .unwrap_or_else(|| bad_revision_message(spec, repo.object_hash().len_in_hex()))
+    bad_revision_message_in_gated(repo, spec, false)
+}
+
+/// [`bad_revision_message_in`] with `setup_revisions()`'s `seen_dashdash` in hand,
+/// for a command that scanned its argument vector for the separator — see
+/// [`bad_revision_message_gated`] for the C and for why the flag is not positional.
+///
+/// The two checks in front of the shape test are unaffected by it: a range whose
+/// endpoints resolved but whose objects are missing dies in `handle_dotdot_1()`,
+/// and a reflog selector past the end of the log dies inside `get_oid()` — both
+/// *before* `setup_revisions()` gets its failure back and consults the gate.
+pub(super) fn bad_revision_message_in_gated(
+    repo: &gix::Repository,
+    spec: &str,
+    seen_dashdash: bool,
+) -> String {
+    // `interpret_branch_mark()` dies while `handle_dotdot_1()` is still resolving
+    // its first endpoint, so an `@{u}` that names no upstream is reported *before*
+    // the range diagnostic — and, since the two `repo_get_oid_with_context()` calls
+    // are joined by `||`, only up to the endpoint that failed. What the range
+    // resolution then hands back is `-1`, and `handle_revision_arg_1()` re-reads
+    // the whole token as one name: `nosuchrev..lonely@{u}` is stock's
+    // `fatal: no such branch: 'nosuchrev..lonely'`.
+    for endpoint in revision_endpoints(spec) {
+        if let Some(message) = crate::objname::upstream_mark_fatal(repo, endpoint) {
+            return format!("fatal: {message}\n");
+        }
+        let _quiet = crate::objname::AmbiguityWarnings::off();
+        if crate::objname::resolve(repo, endpoint).is_none() {
+            break;
+        }
+    }
+    if let Some(message) = crate::objname::upstream_mark_fatal(repo, spec) {
+        return format!("fatal: {message}\n");
+    }
+    if let Some(message) = crate::objname::dotdot_fatal(repo, spec) {
+        return message;
+    }
+    // `read_ref_at()` dies inside `get_oid()` for a selector past the end of the
+    // log, so this never becomes the "ambiguous argument" fallback.
+    if let Some(crate::objname::ReflogReach::Fatal(message)) =
+        crate::objname::reflog_reach(repo, spec.strip_prefix('^').unwrap_or(spec))
+    {
+        return format!("fatal: {message}\n");
+    }
+    // `die_verify_filename()` resolves the operand a *second* time before it dies
+    // (`maybe_die_on_misspelt_object_name()` → `get_oid_with_context_1()`), so a
+    // reflog operand that reached back past its log and then failed for some other
+    // reason — `HEAD@{<old date>}^` on a root commit — carries the warning twice:
+    // once from the resolution that failed, once from the diagnosis. Verified
+    // against stock 2.55.0, which prints two for every `~`/`^<n>` suffix and one
+    // for `^{…}`, `:<path>` and the bare name.
+    let mut message = String::new();
+    if let Some(warning) =
+        crate::objname::reflog_reach_warning(repo, spec.strip_prefix('^').unwrap_or(spec))
+    {
+        message.push_str(&warning);
+    }
+    message.push_str(&bad_revision_message_gated(
+        spec,
+        repo.object_hash().len_in_hex(),
+        seen_dashdash,
+    ));
+    message
 }
 
 /// The fatal `handle_revision_arg()` raises *itself*, or `None` when the token is
@@ -3499,6 +4122,13 @@ pub(super) fn early_revision_fatal(
         return Some(message);
     }
     let bare = spec.strip_prefix('^').unwrap_or(spec);
+    // `read_ref_at()` dies inside `get_oid()`, so an out-of-range reflog selector
+    // never reaches the pathspec fallback the way an unresolvable name does.
+    if let Some(crate::objname::ReflogReach::Fatal(message)) =
+        crate::objname::reflog_reach(repo, bare)
+    {
+        return Some(format!("fatal: {message}\n"));
+    }
     if !crate::objname::resolves_but_absent(repo, bare) {
         return None;
     }
@@ -3574,6 +4204,8 @@ struct EntryParams<'a> {
     expand_tabs: Option<usize>,
     /// `revs->date_mode_explicit`: see [`RenderCtx::date_explicit`].
     date_explicit: bool,
+    /// See [`RenderCtx::email`].
+    email: EmailStyle<'a>,
 }
 
 /// A look-ahead buffer of rendered commit records.
@@ -3764,6 +4396,7 @@ fn entry_block_from(
         expand_tabs: p.expand_tabs,
         reflog: node.reflog.as_ref(),
         date_explicit: p.date_explicit,
+        email: p.email,
     };
     let mut block: Vec<u8> = Vec::new();
     render_entry(&mut block, &commit, p.pretty, &ctx)?;
@@ -3793,9 +4426,11 @@ struct PatchWindow {
     show_root: bool,
     /// `--diff-merges=<mode>`: what a merge commit's patch shows.
     merges: DiffMerges,
-    /// `--first-parent`: git reads it as "diff a merge against its first parent",
-    /// so a merge has an ordinary patch even with no `--diff-merges` mode.
-    first_parent: bool,
+    /// `revs->diff`, `log_tree_diff()`'s `all_need_diff` (log-tree.c:1103): whether
+    /// the command line asked for diff output at all. A *non*-merge is diffed only
+    /// when it is set, which is what leaves `git log --diff-merges=separate` diffing
+    /// merges and nothing else.
+    all_need_diff: bool,
     /// The diff options the patch bodies are rendered with (`-U<n>`, `-w`, …).
     patch_opts: super::diff::PatchOpts,
     /// Index of `slots[0]` within the caller's node list.
@@ -3813,20 +4448,22 @@ impl PatchWindow {
         active: bool,
         show_root: bool,
         merges: DiffMerges,
-        first_parent: bool,
+        all_need_diff: bool,
         patch_opts: super::diff::PatchOpts,
     ) -> Self {
-        PatchWindow { active, show_root, merges, first_parent, patch_opts, start: 0, slots: Vec::new() }
+        PatchWindow { active, show_root, merges, all_need_diff, patch_opts, start: 0, slots: Vec::new() }
     }
 
-    /// `true` when git renders a diff for this commit at all: a merge only under a
-    /// `--diff-merges` mode other than `off` (which `-m`/`-c`/`--cc` select), and a
-    /// root commit's diff obeys `log.showRoot`.
+    /// `log_tree_diff()`'s three early returns (log-tree.c:1119-1152): a merge is
+    /// diffed only under a `--diff-merges` mode other than `off` — which is what
+    /// `-m`/`-c`/`--cc` and `cmd_log`'s `--first-parent` tweak select — every other
+    /// commit only when the command line asked for diff output, and a root commit's
+    /// empty-tree diff additionally obeys `log.showRoot`.
     fn diffable(&self, node: &Node) -> bool {
         if node.parents.len() > 1 {
-            return self.merges != DiffMerges::Off || self.first_parent;
+            return self.merges != DiffMerges::Off;
         }
-        self.show_root || !node.parents.is_empty()
+        self.all_need_diff && (self.show_root || !node.parents.is_empty())
     }
 
     /// The patch body for `nodes[i]`, refilling the window when `i` runs past it.
@@ -3859,7 +4496,7 @@ impl PatchWindow {
                 if !self.diffable(n) {
                     continue;
                 }
-                if n.parents.len() > 1 && !self.first_parent {
+                if n.parents.len() > 1 {
                     match self.merges {
                         DiffMerges::Combined | DiffMerges::DenseCombined => {
                             merged.push((
@@ -3925,6 +4562,11 @@ impl DiffMerges {
             "c" | "combined" => DiffMerges::Combined,
             "cc" | "dense-combined" => DiffMerges::DenseCombined,
             "1" | "first-parent" => DiffMerges::FirstParent,
+            // `func_by_opt()`'s `"m"`/`"on"` arm returns `set_to_default`, whose
+            // initial value is `set_separate` (diff-merges.c:10). Only the
+            // `diff.mergesDefault`/`log.diffMerges` config can move it, and that is
+            // not read here, so `on` is `separate`.
+            "on" => DiffMerges::Separate,
             _ => return None,
         })
     }
@@ -4474,6 +5116,60 @@ fn expand_walk_only(
 ///
 /// Only used to decide what to warn about — the resolutions themselves are spread
 /// across the branches below, and several of them ask twice.
+/// Everything `get_oid_basic()` writes to stderr for one revision operand, in
+/// git's order: the `refname … is ambiguous.` block (object-name.c:902-912 and
+/// 964-967) first, then the reflog reach warning (object-name.c:1006-1011).
+///
+/// `handle_revision_arg_1()` puts every endpoint of the token through
+/// `get_oid_with_context()`, so both fire once per endpoint — twice for a range.
+/// A range is not two independent operands, though: `handle_dotdot_1()` joins its
+/// two resolutions with `||`
+///
+/// ```c
+/// if (repo_get_oid_with_context(r, a, oc_flags, &a_oid, &a_oc) ||
+///     repo_get_oid_with_context(r, b, oc_flags, &b_oid, &b_oc))
+///         return -1;
+/// ```
+///
+/// so a left endpoint that does not resolve means the right one is never looked
+/// at and warns about nothing — `nosuch..<40-hex-ref>` is silent in stock 2.55.0
+/// while `<40-hex-ref>..nosuch` warns once.
+/// [`crate::objname::warn_dotdot_endpoints`] owns that rule for the ambiguity
+/// half; the reflog half stops at the same place.
+///
+/// `ambiguity` is `warn_on_object_refname_ambiguity`, which
+/// `read_revisions_from_stdin()` clears around a `--stdin` read. The reflog
+/// warning carries no such gate, so it fires for a stdin line too.
+pub(super) fn warn_operand(repo: &gix::Repository, spec: &str, ambiguity: bool) {
+    let endpoints = revision_endpoints(spec);
+    let range = crate::objname::split_range(spec).is_some();
+    if ambiguity {
+        if range {
+            crate::objname::warn_dotdot_endpoints(repo, spec);
+        } else {
+            for endpoint in &endpoints {
+                crate::objname::warn_ambiguous_refname(repo, endpoint);
+            }
+        }
+    }
+    for endpoint in &endpoints {
+        // `handle_dotdot()` runs before `handle_revision_arg_1()` strips the
+        // exclusion mark, so an endpoint still carrying it fails the pair.
+        if range && endpoint.starts_with('^') {
+            break;
+        }
+        if let Some(warning) = crate::objname::reflog_reach_warning(repo, endpoint) {
+            eprint!("{warning}");
+        }
+        if range {
+            let _quiet = crate::objname::AmbiguityWarnings::off();
+            if crate::objname::resolve(repo, endpoint).is_none() {
+                break;
+            }
+        }
+    }
+}
+
 pub(super) fn revision_endpoints(spec: &str) -> Vec<&str> {
     if let Some(range) = crate::objname::split_range(spec) {
         return vec![range.a, range.b];
@@ -4503,174 +5199,6 @@ fn peel_to_commit(repo: &gix::Repository, id: ObjectId) -> ObjectId {
         .and_then(|obj| obj.peel_tags_to_end().ok())
         .filter(|obj| obj.kind == gix::object::Kind::Commit)
         .map_or(id, |obj| obj.id)
-}
-
-/// Every commit reachable from `roots` (inclusive) — the "uninteresting" set for a
-/// What `--simplify-merges` needs about one commit, from the `--full-history` pass.
-struct MergeSimp {
-    /// Parents as walked, unpruned.
-    parents: Vec<ObjectId>,
-    /// Parallel to `parents`: whether the commit is TREESAME to that one over the
-    /// pathspec — git's `revs->treesame` decoration.
-    treesame_with: Vec<bool>,
-    /// git's `TREESAME` object flag: no parent showed a change.
-    treesame: bool,
-}
-
-/// Port of `simplify_merges()` / `simplify_one()` (revision.c).
-///
-/// Each commit is replaced by its simplification: parents are rewritten to *their*
-/// simplifications, then duplicates and parents that are ancestors of other parents
-/// are dropped (as are root parents TREESAME to the empty tree), never dropping
-/// every parent the commit is TREESAME to. A commit that still has a parent, is
-/// TREESAME, and has exactly one relevant parent becomes that parent's
-/// simplification. What survives is the set of commits that simplify to themselves.
-///
-/// Dropping parents can only make a commit *more* TREESAME, so the flag is
-/// recomputed over the survivors — `relevant_parents ? !relevant_change :
-/// !irrelevant_change`, which with everything relevant is "every surviving parent
-/// is treesame". That recompute is what collapses a merge whose only remaining
-/// parent it matches: in `I -> {side, A} -> M1`, `M1`'s `side` rewrites to `I`,
-/// `I` is redundant beside `A`, and `M1` is TREESAME to the `A` that is left, so
-/// `M1` becomes `A` — which is exactly what `git log --parents` shows, rewriting
-/// the child merge's parent list from `M1` to `A`.
-fn simplify_merges(
-    repo: &gix::Repository,
-    order: &[ObjectId],
-    info: &HashMap<ObjectId, MergeSimp>,
-    first_parent: bool,
-) -> Result<HashMap<ObjectId, Vec<ObjectId>>> {
-    // Relevance is `!(flags & UNINTERESTING)`; excluded commits never enter this
-    // walk, so the walked set is exactly the relevant one.
-    let walked: HashSet<ObjectId> = order.iter().copied().collect();
-    let mut simplified: HashMap<ObjectId, ObjectId> = HashMap::with_capacity(order.len());
-    let mut rewritten: HashMap<ObjectId, Vec<ObjectId>> = HashMap::with_capacity(order.len());
-
-    // git feeds the list reversed and re-queues whatever is not ready yet.
-    let mut queue: Vec<ObjectId> = order.iter().rev().copied().collect();
-    let mut guard = 0usize;
-    while !queue.is_empty() {
-        guard += 1;
-        anyhow::ensure!(guard <= order.len() + 2, "simplify-merges did not converge");
-        let mut next: Vec<ObjectId> = Vec::new();
-        for id in std::mem::take(&mut queue) {
-            if simplified.contains_key(&id) {
-                continue;
-            }
-            let Some(me) = info.get(&id) else {
-                simplified.insert(id, id);
-                continue;
-            };
-            // A root simplifies to itself and its parents are not rewritten.
-            if me.parents.is_empty() {
-                simplified.insert(id, id);
-                continue;
-            }
-            let considered: &[ObjectId] = if first_parent { &me.parents[..1] } else { &me.parents };
-            let pending: Vec<ObjectId> = considered
-                .iter()
-                .copied()
-                .filter(|p| walked.contains(p) && !simplified.contains_key(p))
-                .collect();
-            if !pending.is_empty() {
-                next.extend(pending);
-                next.push(id);
-                continue;
-            }
-
-            // Rewrite each parent to its simplification, carrying its treesame bit.
-            let mut parents: Vec<(ObjectId, bool)> = considered
-                .iter()
-                .enumerate()
-                .map(|(i, p)| {
-                    (
-                        simplified.get(p).copied().unwrap_or(*p),
-                        me.treesame_with.get(i).copied().unwrap_or(false),
-                    )
-                })
-                .collect();
-            // `remove_duplicate_parents`.
-            let mut seen: HashSet<ObjectId> = HashSet::new();
-            parents.retain(|(p, _)| seen.insert(*p));
-
-            let mut treesame = me.treesame;
-            if parents.len() > 1 {
-                let ids: Vec<ObjectId> = parents.iter().map(|(p, _)| *p).collect();
-                // `mark_redundant_parents`: `reduce_heads()` over the parent list —
-                // a parent reachable from another adds nothing.
-                let mut marked: Vec<bool> = vec![false; parents.len()];
-                for (i, p) in ids.iter().enumerate() {
-                    let others: Vec<ObjectId> =
-                        ids.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, q)| *q).collect();
-                    if ancestor_closure(repo, &others)?.contains(p) {
-                        marked[i] = true;
-                    }
-                }
-                // `mark_treesame_root_parents`: a root parent that is TREESAME to
-                // the empty tree contributed nothing either.
-                for (i, (p, _)) in parents.iter().enumerate() {
-                    if info.get(p).is_some_and(|s| s.parents.is_empty() && s.treesame) {
-                        marked[i] = true;
-                    }
-                }
-                // `leave_one_treesame_to_parent`: never drop every parent we are
-                // TREESAME to — that is the path the default scan would follow.
-                if marked.iter().any(|m| *m) {
-                    let has_unmarked_treesame =
-                        parents.iter().zip(&marked).any(|((_, ts), m)| *ts && !*m);
-                    if !has_unmarked_treesame {
-                        if let Some(i) =
-                            parents.iter().zip(&marked).position(|((_, ts), m)| *ts && *m)
-                        {
-                            marked[i] = false;
-                        }
-                    }
-                }
-                if marked.iter().any(|m| *m) {
-                    let mut it = marked.iter();
-                    parents.retain(|_| !it.next().copied().unwrap_or(false));
-                    // `remove_marked_parents`: "Removing parents can only increase
-                    // TREESAMEness", so the flag is recomputed over the survivors.
-                    treesame = parents.iter().all(|(_, ts)| *ts);
-                }
-            }
-
-            // `one_relevant_parent`: for a single parent it is that parent, else the
-            // sole relevant one, else none.
-            let relevant = if first_parent || parents.len() == 1 {
-                parents.first().map(|(p, _)| *p)
-            } else {
-                let mut found = None;
-                let mut several = false;
-                for (p, _) in &parents {
-                    if walked.contains(p) {
-                        if found.is_some() {
-                            several = true;
-                        }
-                        found = Some(*p);
-                    }
-                }
-                if several { None } else { found }
-            };
-
-            let becomes = match relevant {
-                Some(parent) if treesame => simplified.get(&parent).copied().unwrap_or(parent),
-                _ => id,
-            };
-            rewritten.insert(id, parents.into_iter().map(|(p, _)| p).collect());
-            simplified.insert(id, becomes);
-        }
-        queue = next;
-    }
-
-    // "clean up the result, removing the simplified ones".
-    let mut out: HashMap<ObjectId, Vec<ObjectId>> = HashMap::new();
-    for id in order {
-        if simplified.get(id) == Some(id) {
-            out.insert(*id, rewritten.get(id).cloned().unwrap_or_default());
-        }
-    }
-    Ok(out)
 }
 
 /// Whether a revision argument puts anything on the UNINTERESTING side, judged from
@@ -5108,8 +5636,220 @@ pub(crate) enum Pretty {
     Reference,
     /// `<hash> <subject>` on one line.
     Oneline,
+    /// `CMIT_FMT_EMAIL`: the mail message `format-patch` sends, without any of
+    /// the options that decorate it.
+    Email,
+    /// `CMIT_FMT_MBOXRD`: [`Pretty::Email`] whose body escapes `/^>*From /` with
+    /// one more `>`, so a reader splitting an mbox on `From ` cannot mistake a
+    /// body line for a message separator. `pretty.c` models it as its own format
+    /// because the escaping lives in `pp_remainder()`.
+    MboxRd,
     /// A `--format=`/`format:` string with `%` placeholders.
     User(String),
+}
+
+/// The two halves of `pp_title_line()` that differ between the commands sharing
+/// [`Pretty::Email`], both of which come from `pretty_print_context` fields that
+/// `log-tree.c`'s `show_log()` fills in and `builtin/rev-list.c`'s zeroed context
+/// leaves at their `0` defaults.
+///
+/// ```c
+/// if (pp->print_email_subject) {
+///         if (pp->rev)
+///                 fmt_output_email_subject(sb, pp->rev);
+///         if (pp->encode_email_headers &&
+///             needs_rfc2047_encoding(title.buf, title.len))
+///                 add_rfc2047(sb, title.buf, title.len, encoding, RFC2047_SUBJECT);
+///         else
+///                 strbuf_add_wrapped_bytes(sb, title.buf, title.len,
+///                                  -last_line_length(sb), 1, max_length);
+/// }
+/// ```
+///
+/// (pretty.c:1968-1977.) So `git log --pretty=email` gets `pp->rev`, whose
+/// `subject_prefix` `repo_init_revisions()` seeded with `PATCH`, and gets the
+/// RFC2047 encoding; `git rev-list --pretty=email` gets neither, which is why it
+/// prints a bare `Subject:` and a raw UTF-8 `From:`.
+#[derive(Clone, Copy)]
+pub(crate) struct EmailStyle<'a> {
+    /// `opt->subject_prefix` through `fmt_output_email_subject()`. Empty is
+    /// `rev-list`, which never reaches that function at all — the two spell the
+    /// same `Subject: ` and are kept as one case for that reason.
+    ///
+    /// `format.subjectPrefix` is read by `git_log_config()` itself
+    /// (builtin/log.c:560-561) into the `fmt_patch_subject_prefix` that
+    /// `init_log_defaults()` copies into `rev->subject_prefix`, so `git log
+    /// --pretty=email` honours it; `--subject-prefix` is `format-patch`'s alone.
+    pub(crate) subject_prefix: &'a str,
+    /// `pp->encode_email_headers`. `init_log_defaults()` seeds it from
+    /// `default_encode_email_headers`, which starts at 1 and which
+    /// `git_log_config()` moves for `format.encodeEmailHeaders` (builtin/log.c:
+    /// 50, 172, 566-569); `--[no-]encode-email-headers` is `setup_revisions()`'s
+    /// own option (revision.c:2526-2529), so the last spelling wins.
+    pub(crate) encode_headers: bool,
+}
+
+impl EmailStyle<'_> {
+    /// `builtin/rev-list.c`'s `struct pretty_print_context ctx = {0}`: no `rev`,
+    /// so `fmt_output_email_subject()` is never reached and neither the config
+    /// nor the command-line switch behind these two fields is visible to it.
+    pub(crate) const REV_LIST: EmailStyle<'static> =
+        EmailStyle { subject_prefix: "", encode_headers: false };
+}
+
+/// The two keys `git_log_config()` reads for [`EmailStyle`], as
+/// `(format.subjectPrefix, format.encodeEmailHeaders)`:
+///
+/// ```c
+/// if (!strcmp(var, "format.subjectprefix"))
+///         return git_config_string(&fmt_patch_subject_prefix, var, value);
+/// …
+/// if (!strcmp(var, "format.encodeemailheaders")) {
+///         default_encode_email_headers = git_config_bool(var, value);
+///         return 0;
+/// }
+/// ```
+///
+/// (builtin/log.c:560-561 and 566-569.) `git_log_config()` is `cmd_log`'s *and*
+/// `cmd_show`'s, so both honour these even though the options that set them
+/// belong to `format-patch`. `fmt_patch_subject_prefix` starts at `"PATCH"`,
+/// which is the bracketed word an unconfigured repository prints; an empty value
+/// drops the brackets entirely, as `fmt_output_email_subject()`'s
+/// `*opt->subject_prefix` test does.
+pub(super) fn email_config(repo: &gix::Repository) -> (String, bool) {
+    let snap = repo.config_snapshot();
+    (
+        snap.string("format.subjectPrefix")
+            .map_or_else(|| "PATCH".to_string(), |v| v.to_str_lossy().into_owned()),
+        snap.boolean("format.encodeEmailHeaders").unwrap_or(true),
+    )
+}
+
+/// `pretty_print_commit()` for `CMIT_FMT_EMAIL`/`CMIT_FMT_MBOXRD`, minus the
+/// magic `From <oid> Mon Sep 17 00:00:00 2001` line — that one is
+/// `log_write_email_headers()`'s (log-tree.c:440) and therefore belongs to the
+/// caller that has a `struct rev_info`.
+///
+/// The trailing shape is `pretty_print_commit()`'s last four statements
+/// (pretty.c:2206-2221):
+///
+/// ```c
+/// beginning_of_body = sb->len;
+/// if (pp->fmt != CMIT_FMT_ONELINE)
+///         pp_remainder(pp, &msg, sb, indent);
+/// strbuf_rtrim(sb);
+/// if (pp->fmt != CMIT_FMT_ONELINE)
+///         strbuf_addch(sb, '\n');
+/// if (cmit_fmt_is_mail(pp->fmt) && sb->len <= beginning_of_body)
+///         strbuf_addch(sb, '\n');
+/// ```
+///
+/// The `strbuf_rtrim()` reaches back into the headers, so a commit with no body
+/// loses the blank line the header block ended with and the last `if` puts one
+/// back — which is why an empty-bodied record ends in exactly two newlines and a
+/// full one in a single newline.
+/// `pp_user_info()`'s mail branch for one identity (pretty.c:516-595): the
+/// `From:` line, RFC2047-encoded when `encode` is on and the name needs it, and
+/// the RFC2822 `Date:` line under it — a date `--date=` never reaches, because
+/// the switch hard-codes `DATE_MODE(RFC2822)` for the mail formats.
+///
+/// Shared by `--pretty=email`'s author block and `git show`'s annotated-tag
+/// header, which `show_tag_object()` puts through the same `pp_user_info()`.
+pub(super) fn write_identity_headers_for(
+    sb: &mut String,
+    who: &gix::actor::SignatureRef<'_>,
+    encode: bool,
+) -> Result<()> {
+    let date = who.time()?.format(gix::date::time::format::GIT_RFC2822)?;
+    let name = who.name.to_str().map_err(|_| {
+        anyhow!("identity name is not valid UTF-8; RFC2047 encoding needs a known charset")
+    })?;
+    let mail = who.email.to_str().map_err(|_| {
+        anyhow!("identity email is not valid UTF-8; RFC2047 encoding needs a known charset")
+    })?;
+    super::format_patch::write_identity_headers(sb, name, mail, &date, encode);
+    Ok(())
+}
+
+pub(super) fn email_body(
+    out: &mut Vec<u8>,
+    commit: &gix::Commit<'_>,
+    pretty: &Pretty,
+    style: EmailStyle,
+) -> Result<()> {
+    let raw = commit.message_raw()?;
+    let author = commit.author()?;
+
+    let mut sb = String::new();
+    // `pp_header()` → `pp_user_info(pp, "Author", …)`, whose mail branch writes
+    // `From:` and then the RFC2822 `Date:` (pretty.c:516-595). `add_merge_info()`
+    // returns early for a mail format, so a merge has no `Merge:` line here.
+    write_identity_headers_for(&mut sb, &author, style.encode_headers)?;
+
+    let msg = super::format_patch::skip_blank_lines(raw);
+    let (title, rest) = super::format_patch::format_subject(msg);
+    let title = title
+        .to_str()
+        .map_err(|_| anyhow!("commit subject is not valid UTF-8"))?
+        .to_owned();
+    if style.subject_prefix.is_empty() {
+        sb.push_str("Subject: ");
+    } else {
+        sb.push_str(&format!("Subject: [{}] ", style.subject_prefix));
+    }
+    if style.encode_headers && super::format_patch::needs_rfc2047_encoding(&title) {
+        super::format_patch::add_rfc2047(&mut sb, &title, false);
+    } else {
+        let consumed = -super::format_patch::last_line_length(&sb);
+        super::format_patch::wrap_text(
+            &mut sb,
+            &title,
+            consumed,
+            1,
+            super::format_patch::HEADER_MAX_LENGTH,
+        );
+    }
+    sb.push('\n');
+
+    // `pretty_print_commit()`'s `need_8bit_cte` scan (pretty.c:2175-2192) looks
+    // only at the *body*: the author line may be non-ASCII while the log is not.
+    // It runs on the reencoded message, which — with no `encoding` header and
+    // `i18n.commitEncoding` unset — is the raw one.
+    let body_is_8bit = {
+        let after_headers = raw;
+        after_headers.iter().any(|&b| b >= 0x80)
+    };
+    if body_is_8bit {
+        sb.push_str("MIME-Version: 1.0\n");
+        sb.push_str("Content-Type: text/plain; charset=UTF-8\n");
+        sb.push_str("Content-Transfer-Encoding: 8bit\n");
+    }
+    // `if (cmit_fmt_is_mail(pp->fmt)) strbuf_addch(sb, '\n');` (pretty.c:2003-2005).
+    sb.push('\n');
+
+    out.extend_from_slice(sb.as_bytes());
+    let beginning_of_body = out.len();
+    let mut body: Vec<u8> = Vec::new();
+    super::format_patch::pp_remainder(rest, &mut body);
+    if matches!(pretty, Pretty::MboxRd) {
+        let mut escaped = Vec::with_capacity(body.len());
+        for line in body.split_inclusive(|&b| b == b'\n') {
+            if super::format_patch::is_mboxrd_from(line) {
+                escaped.push(b'>');
+            }
+            escaped.extend_from_slice(line);
+        }
+        body = escaped;
+    }
+    out.extend_from_slice(&body);
+    while out.last().is_some_and(|b| matches!(b, b' ' | b'\t' | b'\n' | b'\r')) {
+        out.pop();
+    }
+    out.push(b'\n');
+    if out.len() <= beginning_of_body {
+        out.push(b'\n');
+    }
+    Ok(())
 }
 
 /// git's `get_commit_format`, the shared parser behind `--pretty=` and
@@ -5148,11 +5888,11 @@ pub(crate) fn get_commit_format(spec: &str) -> Result<Option<(Pretty, bool)>> {
         "fuller" => Ok(Some((Pretty::Fuller, false))),
         "raw" => Ok(Some((Pretty::Raw, false))),
         "reference" => Ok(Some((Pretty::Reference, true))),
-        // `email`/`mboxrd` need the full mailbox/`From ` framing git's format-patch
-        // machinery produces; surfaced terse rather than faked.
-        "email" | "mboxrd" => {
-            bail!("pretty format {spec:?} is not ported")
-        }
+        // `cmit_fmt_is_mail()`: the two mail formats terminate rather than
+        // separate their records, since `pp_title_line()` already ended the
+        // header block with the blank line a reader splits on.
+        "email" => Ok(Some((Pretty::Email, false))),
+        "mboxrd" => Ok(Some((Pretty::MboxRd, false))),
         _ => Ok(None),
     }
 }
@@ -5260,6 +6000,8 @@ pub(crate) fn format_commit(
         // Neither caller is a reflog walk, so every `%g…` expands to nothing.
         reflog: None,
         date_explicit: false,
+        // Only a user format reaches this caller, and no `%` placeholder reads it.
+        email: EmailStyle::REV_LIST,
     };
     let mut out = Vec::new();
     expand_format(&mut out, commit, &unabbreviated(fmt), &ctx)?;
@@ -6655,12 +7397,22 @@ pub(crate) fn rev_list_pretty_body(
         // `rev-list` has no reflog walk, so every `%g…` expands to nothing.
         reflog: None,
         date_explicit: false,
+        email: EmailStyle::REV_LIST,
     };
     let mut out = Vec::new();
     match pretty {
         // `pp_title_line()` only: `pretty_print_commit()` skips `pp_remainder()`
         // for oneline, so the body is the subject with no trailing newline.
         Pretty::Oneline => out.extend_from_slice(&subject(commit.message_raw()?)),
+        // `builtin/rev-list.c` builds its `pretty_print_context` from scratch and
+        // leaves `rev`/`print_email_subject`/`encode_email_headers` at zero, so
+        // the mail formats come out with a bare `Subject:` and unencoded headers.
+        // The magic `From <oid> …` line is `log_write_email_headers()`'s, which
+        // only `show_log()` calls — `rev-list` prints its own `commit <oid>`
+        // header instead, above this body.
+        Pretty::Email | Pretty::MboxRd => {
+            email_body(&mut out, commit, pretty, EmailStyle::REV_LIST)?;
+        }
         Pretty::User(fmt) => expand_format(&mut out, commit, fmt, &ctx)?,
         Pretty::Reference => {
             let author = commit.author()?;
@@ -6820,6 +7572,8 @@ struct RenderCtx<'a> {
     /// never by `log.date`. It is `get_reflog_selector()`'s `force_date`: the
     /// selector prints `HEAD@{<date>}` instead of `HEAD@{<n>}`.
     date_explicit: bool,
+    /// The two `pretty_print_context` fields [`Pretty::Email`] reads.
+    email: EmailStyle<'a>,
 }
 
 /// The `Notes[ (<ref>)]:` blocks for `commit`, or empty.
@@ -6893,6 +7647,25 @@ fn render_entry(
             out.extend_from_slice(b", ");
             out.extend_from_slice(fmt_time(t.seconds, t.offset, date_mode, ctx.now).as_bytes());
             out.push(b')');
+        }
+        // ```c
+        // if (cmit_fmt_is_mail(opt->commit_format)) {
+        //         log_write_email_headers(opt, commit, &extra_headers,
+        //                                 &ctx.need_8bit_cte, 1);
+        //         ctx.rev = opt;
+        //         ctx.print_email_subject = 1;
+        // } else if (opt->commit_format != CMIT_FMT_USERFORMAT) {
+        //         … fputs("commit ", …) …
+        // ```
+        //
+        // (log-tree.c:697-705.) The mail formats take the `From <oid> Mon Sep 17
+        // 00:00:00 2001` line *instead of* the `commit <oid>` line, so none of
+        // what decorates that one — `--abbrev-commit`, `--decorate`, `--source`,
+        // `--parents`, the `Reflog:` header — is reached. The name is
+        // `oid_to_hex()`, never the abbreviation.
+        Pretty::Email | Pretty::MboxRd => {
+            writeln!(out, "From {} Mon Sep 17 00:00:00 2001", commit.id())?;
+            email_body(out, commit, pretty, ctx.email)?;
         }
         Pretty::User(fmt) => expand_format(out, commit, fmt, ctx)?,
         Pretty::Raw => {
@@ -9791,6 +10564,17 @@ const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 const MONTHS: [&str; 12] = [
     "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
 ];
+
+/// `show_date(…, DATE_MODE(RFC2822))`, which is the one date mode git hardcodes
+/// outside the `--date=` machinery: `refs.c`'s
+/// `warning(_("log for '%.*s' only goes back to %s"), …)` renders its timestamp
+/// that way regardless of the caller's date settings.
+///
+/// Exposed so [`crate::objname::reflog_reach`] can build that warning without
+/// reaching for [`DateMode`] itself.
+pub(crate) fn show_date_rfc2822(seconds: i64, offset: i32) -> String {
+    format_date(seconds, offset, DateMode::Rfc)
+}
 
 /// Format a timestamp in the requested [`DateMode`], matching git byte-for-byte.
 fn format_date(seconds: i64, offset: i32, mode: DateMode) -> String {

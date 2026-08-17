@@ -40,7 +40,11 @@
 //! patch and the stat graph are painted from the `color.diff.*` slots, with git's
 //! `ws.c` whitespace-error markup driven by `core.whitespace`),
 //! `--patch-with-raw`, `--patch-with-stat`, `--exit-code`, `--quiet`,
-//! `--minimal`/`--diff-algorithm=<myers|minimal|histogram>`,
+//! `--minimal`/`--patience`/`--histogram`/`--diff-algorithm=<v>` (both the `=<v>`
+//! and separated forms, `<v>` matched case-insensitively against `myers`,
+//! `default`, `minimal`, `patience` and `histogram`), `--find-object=<object-id>`
+//! (repeatable; `diffcore_pickaxe()`'s objfind kind, compared against the recorded
+//! ids so an id the repository lacks simply matches nothing),
 //! `--indent-heuristic`/`--no-indent-heuristic` (with the `diff.indentHeuristic`
 //! default), `-O<file>` (with the `diff.orderFile` default),
 //! `-W`/`--function-context` (which grows each hunk to its enclosing function
@@ -115,11 +119,33 @@
 //!   the value arrives through `-c` (measured: two lines from
 //!   `git -c diff.submodule=bogus diff`, one from the same key in a config file);
 //!   zvcs prints one either way, and matches stock byte for byte for the file case.
-//! * The `patience` diff algorithm has no imara-diff equivalent and bails (the
-//!   `--patience` alias and `diff.algorithm=patience` both surface the same error).
 //! * `--line-prefix=<s>` is reproduced by a whole-buffer pass and so only tracks the
 //!   newline-terminated formats; combining it with `-z` (NUL-separated records) is
 //!   not byte-faithful.
+//! * All four of `parse_algorithm_value()`'s names drive the vendored xdiff port in
+//!   `src/ported/gix-imara-diff` (`patience.rs` is `xdiff/xpatience.c`,
+//!   `histogram.rs` is `xdiff/xhistogram.c`). Measured against stock 2.55.0 over the
+//!   59 most recent consecutive commit pairs of this repository: `myers` 0/59
+//!   divergent, `minimal` 0/59, `patience` 0/59, `histogram` 0/59. Getting the last
+//!   two there took four fixes, all in the shared engine — so `diff-index`,
+//!   `diff-files` and `format-patch` carry them identically: `xdl_trim_ends()` is
+//!   now skipped for patience and histogram the way `xdl_prepare_env()` skips
+//!   `xdl_optimize_ctxs()` for them (`xprepare.c:460-462`); histogram now runs the
+//!   full port of `xdl_change_compact()` (`Diff::compact_with`), which includes the
+//!   histogram-only re-diff of a merged group at `xdiffi.c:940-958` that the
+//!   slide-only `postprocess::postprocess_with` has no step for; histogram's own
+//!   Myers fall-back re-enters `xdl_do_diff()` (`xhistogram.c:229-239`) instead of
+//!   calling `myers::diff` bare, so the region gets trimmed and its records cleaned
+//!   the way the sub-diff's own `xdl_prepare_env()` would; and `try_lcs()`'s
+//!   occurrence skip is bounded by the before-side end of the region, `ae`
+//!   (`xhistogram.c:207-217`), not by the after-side one.
+//! * `--no-index` is a separate, thinner path here and does not take an algorithm
+//!   at all: `git diff --no-index --histogram A B` is refused as an unsupported
+//!   option rather than rendered with the wrong algorithm.
+//! * `-S<string>` and `-G<regex>` are not rendered here (`diff-index` and
+//!   `diff-files` implement both). They are still parsed far enough to reach
+//!   `diff_setup_done()`, so a combination git refuses — `-S` with `-G`, or either
+//!   with `--find-object` — gets git's own `fatal:` at 128 rather than a bail.
 //! * Magic pathspecs (`:(...)`) and glob pathspecs bail; literal path / directory-prefix
 //!   filtering is supported.
 //! * `--color-moved[=<mode>]`, `--color-moved-ws=`, `--word-diff[=]`,
@@ -510,6 +536,16 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     let mut dirstat = super::diff_files::DirStat::default();
     let mut diff_filter: Option<Vec<u8>> = None;
     let mut algorithm: Option<gix::diff::blob::Algorithm> = None;
+    // `options->objfind`, the one oidset every `--find-object=<id>` inserts into.
+    // Empty means the objfind pickaxe was never requested.
+    let mut find_object_ids: Vec<ObjectId> = Vec::new();
+    // `DIFF_OPT_PICKAXE_ALL`. Kept only so `diff_setup_done()`'s objfind conflict
+    // can be raised; with no pickaxe kind set it has no effect on the output.
+    let mut pickaxe_all = false;
+    // A `-S`/`-G` this command does not render, held until `diff_setup_done()`'s
+    // conflict checks have run — git raises those from after the option scan, so a
+    // bail taken at the flag's own position would pre-empt them.
+    let mut unsupported_pickaxe: Option<String> = None;
     // `XDF_INDENT_HEURISTIC`, on unless `diff.indentHeuristic` or
     // `--no-indent-heuristic` turns it off (`git_diff_basic_config()` sets
     // `diff_indent_heuristic`, whose default is 1).
@@ -525,7 +561,7 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     let mut raw_abbrev: Option<usize> = None;
     // `diff.algorithm` default, applied after argument parsing so a `--minimal` /
     // `--histogram` / `--diff-algorithm=` flag always wins (git precedence).
-    let mut config_algorithm: Option<ConfigAlgorithm> = None;
+    let mut config_algorithm: Option<gix::diff::blob::Algorithm> = None;
     // `--stat` width limits (`show_stats()`), `0` == unset. Seeded from
     // `diff.statNameWidth`/`diff.statGraphWidth` below, then overwritten by an
     // explicit `--stat-name-width=`/`--stat-graph-width=` flag (git precedence;
@@ -608,11 +644,11 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                 dst_prefix = p.into();
             }
         }
-        // `diff.algorithm` names the default algorithm. git validates it while
-        // loading config — an unknown name is a hard error (exit 128) even when a
-        // CLI flag would override it — so classify it eagerly here. `patience` is a
-        // valid name git renders, but imara-diff has no patience variant, so it is
-        // remembered as unrenderable and only rejected if actually used below.
+        // `diff.algorithm` names the default algorithm (`git_diff_ui_config()`, which
+        // only the porcelain runs — the two plumbing verbs never read it). git
+        // validates it while loading config, so an unknown name is a hard error
+        // (exit 128) even when a CLI flag would have overridden it, which is why this
+        // is classified eagerly rather than lazily.
         if let Some(name) = snap.string("diff.algorithm") {
             config_algorithm = Some(parse_config_algorithm(name.as_ref())?);
         }
@@ -676,6 +712,10 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     }
 
     let mut revs: Vec<String> = Vec::new();
+    // `obj->flags & UNINTERESTING` for each entry of `revs`, which `cmd_diff()` carries
+    // from `revs->pending` into its `ent` array (builtin/diff.c:576,589) and
+    // `builtin_diff_tree()` then reads to decide which of two trees is the pre-image.
+    let mut revs_uninteresting: Vec<bool> = Vec::new();
     let mut paths: Vec<String> = Vec::new();
     let mut in_rev_region = true;
     // The first argument git would not resolve to an option, held until the whole command
@@ -702,6 +742,22 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                 }
             } else if flag == "-O" {
                 order_file = Some(a.clone());
+            } else if flag == "--diff-algorithm" {
+                // The separated form of an `OPT_CALLBACK_F` with a required argument:
+                // parse-options has already taken this entry as the value, so it reaches
+                // the same `parse_algorithm_value()` the `=` form does.
+                match super::diff_optval::parse_algorithm_value(a) {
+                    Some(alg) => algorithm = Some(alg),
+                    None => {
+                        eprintln!("{}", super::diff_optval::DIFF_ALGORITHM_ERR);
+                        return Ok(ExitCode::from(129));
+                    }
+                }
+            } else if flag == "--find-object" {
+                match crate::objname::find_object(&repo, a) {
+                    Ok(id) => find_object_ids.push(id),
+                    Err(e) => return Ok(e.report()),
+                }
             } else if let Some(Err(msg)) =
                 move_word.parse_flag(&format!("{flag}={a}"), &mut color_when)
             {
@@ -710,7 +766,14 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
             }
             continue;
         }
-        if diff_color::needs_separate_value(a) {
+        // `--diff-algorithm` and `--find-object` are `OPT_CALLBACK_F` without
+        // `PARSE_OPT_OPTARG`, so parse-options takes the next argv entry as the value
+        // — even one that looks like a revision — and a bare flag at the end of the
+        // line is `error: option `<name>' requires a value` (129), which the
+        // `pending_value` check after this loop already produces.
+        if diff_color::needs_separate_value(a)
+            || matches!(a.as_str(), "--diff-algorithm" | "--find-object")
+        {
             pending_value = Some(a.clone());
             continue;
         }
@@ -936,13 +999,21 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
             s if s.starts_with("--line-prefix=") => {
                 line_prefix = s.as_bytes()["--line-prefix=".len()..].to_vec();
             }
+            // `diff_opt_diff_algorithm()`. The unknown-value `error()` is already
+            // raised by `diff_optval::reject` at the top of this loop (git's own
+            // callback order), so only a value it accepted reaches this arm — matched
+            // case-insensitively by the one [`super::diff_optval::parse_algorithm_value`]
+            // port, which is why `--diff-algorithm=MYERS` is Myers and not a fatal.
             s if s.starts_with("--diff-algorithm=") => {
-                match &s["--diff-algorithm=".len()..] {
-                    "myers" | "default" => algorithm = Some(gix::diff::blob::Algorithm::Myers),
-                    "minimal" => algorithm = Some(gix::diff::blob::Algorithm::MyersMinimal),
-                    "histogram" => algorithm = Some(gix::diff::blob::Algorithm::Histogram),
-                    "patience" => algorithm = Some(gix::diff::blob::Algorithm::Patience),
-                    other => crate::git_fatal!("diff algorithm {other:?} is not available"),
+                algorithm = super::diff_optval::parse_algorithm_value(&s["--diff-algorithm=".len()..]);
+            }
+            // `diff_opt_find_object()`: each occurrence inserts into one `objfind`
+            // oidset, resolved through [`crate::objname::find_object`] at the flag's own
+            // argv position so its `error()` competes with every other argument in order.
+            s if s.starts_with("--find-object=") => {
+                match crate::objname::find_object(&repo, &s["--find-object=".len()..]) {
+                    Ok(id) => find_object_ids.push(id),
+                    Err(e) => return Ok(e.report()),
                 }
             }
             // `--stat-name-width=<n>` / `--stat-graph-width=<n>` override the
@@ -1074,6 +1145,20 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
             // block on **stderr** at 129 with no `error:` line — diff never
             // routes it to stdout, unlike the parse_options porcelain.
             "-h" => return Ok(usage_error()),
+            // `--pickaxe-all` is `DIFF_OPT_PICKAXE_ALL`, and on its own it changes
+            // nothing: `diffcore_pickaxe()` reads it only once a pickaxe kind is
+            // set, so `git diff --pickaxe-all` is a plain diff (measured against
+            // stock 2.55.0). Accepting it as the no-op it is also lets
+            // `diff_setup_done()`'s objfind conflict below see it.
+            "--pickaxe-all" => pickaxe_all = true,
+            // `-S`/`-G` are not rendered here, but they still have to reach
+            // `diff_setup_done()`: the two `HAS_MULTI_BITS` `die()`s run after the
+            // whole option scan, so bailing at the flag's own argv position would
+            // answer with "unsupported option" where git answers with the conflict.
+            // Recorded and re-raised past those checks instead.
+            s if s.starts_with("-S") || s.starts_with("-G") => {
+                unsupported_pickaxe.get_or_insert_with(|| s.to_owned());
+            }
             s if s.starts_with('-') => bail!("unsupported option {s:?}"),
             s => {
                 // A positional is a revision while we are still in the revision
@@ -1123,32 +1208,69 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                         } else {
                             revs.push(range.a.to_owned());
                         }
+                        // `handle_dotdot_1()`: `a_flags = flags_exclude` for `A..B`, and
+                        // the merge bases a symmetric range pends go in with the same
+                        // `flags_exclude` — so the left entry is UNINTERESTING and the
+                        // right one (`b_flags = flags`) is not. That is already the
+                        // order these two are pushed in, so the swap below never fires
+                        // for a range.
+                        revs_uninteresting.push(true);
                         revs.push(range.b.to_owned());
+                        revs_uninteresting.push(false);
                         continue;
                     }
+                    // `if (*arg == '^') { local_flags = UNINTERESTING | BOTTOM; arg++; }`
+                    // — the mark is a flag, and everything downstream
+                    // (`get_oid_with_context()`, `verify_non_filename()`,
+                    // `get_reference()`) sees the shortened name. The flag itself is
+                    // kept because `builtin_diff_tree()` reads it back off the second
+                    // of two trees (see the swap below); with one tree it changes
+                    // nothing, so `^HEAD` diffs exactly what `HEAD` does.
+                    let (bare, uninteresting) = crate::objname::uninteresting_mark(s);
                     // `handle_revision_arg_1()` resolves the whole token with
                     // `get_oid_with_context()` — see [`crate::objname`], which is why
                     // a full-length hex gets this far even when the object is absent.
-                    if let Some(id) = crate::objname::resolve(&repo, s) {
+                    if let Some(id) = crate::objname::resolve(&repo, bare) {
                         // `verify_non_filename()`: a name that is simultaneously a
                         // revision and a working-tree path is refused outright rather
                         // than guessed at.
-                        if std::fs::symlink_metadata(s).is_ok() {
+                        if std::fs::symlink_metadata(bare).is_ok() {
                             eprintln!(
-                                "fatal: ambiguous argument '{s}': both revision and filename"
+                                "fatal: ambiguous argument '{bare}': both revision and filename"
                             );
                             eprintln!("Use '--' to separate paths from revisions, like this:");
                             eprintln!("'git <command> [<revision>...] -- [<file>...]'");
                             return Ok(ExitCode::from(128));
                         }
                         // `get_reference()`'s `die("bad object %s", name)`: the name
-                        // resolved, the object is simply not there.
+                        // resolved, the object is simply not there. The name printed is
+                        // the one past the mark, which is where the pointer stands.
                         if repo.find_object(id).is_err() {
-                            eprintln!("fatal: bad object {s}");
+                            eprintln!("fatal: bad object {bare}");
                             return Ok(ExitCode::from(128));
                         }
-                        revs.push(s.to_string());
+                        revs.push(bare.to_string());
+                        revs_uninteresting.push(uninteresting);
                         continue;
+                    }
+                    // `if (seen_dashdash || *arg == '^') die(_("bad revision '%s'"), arg);`
+                    // — a marked operand never reaches the pathspec fallback, and keeps
+                    // its mark in the message because `setup_revisions()` still holds
+                    // the original `argv[i]`.
+                    //
+                    // `seen_dashdash` is the same gate and it is *not* positional:
+                    // `setup_revisions()` scans the whole vector for the separator up
+                    // front (see the scan this function opens with), so a `--` anywhere
+                    // makes every earlier operand revision-only. That is why
+                    // `git diff nosuchthing..HEAD --` is `bad revision`, while the same
+                    // operand without the separator is still free to become a pathspec
+                    // and gets the `ambiguous argument` wording below instead.
+                    if uninteresting || seen_dashdash {
+                        eprint!(
+                            "{}",
+                            super::log::bad_revision_message_in_gated(&repo, s, seen_dashdash)
+                        );
+                        return Ok(ExitCode::from(128));
                     }
                     if std::fs::symlink_metadata(s).is_err() {
                         eprintln!(
@@ -1171,12 +1293,33 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
         eprintln!("error: {}", diff_color::missing_value(&flag));
         return Ok(ExitCode::from(129));
     }
+    // `diff_setup_done()`'s two pickaxe `die()`s, in git's order. They close
+    // `setup_revisions()`, so they run once the whole option scan and every
+    // positional is behind them — measured against stock 2.55.0, they beat an
+    // unknown option in either argv position and lose to a bad positional, to a
+    // rejected option *value* and to `diff_opt_find_object()`'s own `error()`,
+    // all of which fire while the scan is still running. Both texts and the
+    // whole-argv kind scan are [`super::diff_optval`]'s, shared with the two
+    // plumbing verbs.
+    if super::diff_optval::pickaxe_conflict(args) {
+        eprintln!("{}", super::diff_optval::PICKAXE_CONFLICT);
+        return Ok(ExitCode::from(128));
+    }
+    if pickaxe_all && !find_object_ids.is_empty() {
+        eprintln!("{}", super::diff_optval::PICKAXE_ALL_OBJFIND_CONFLICT);
+        return Ok(ExitCode::from(128));
+    }
     // `cmd_diff`'s dispatch (builtin/diff.c:611): with no tree-ish pending the leftover
     // reaches `builtin_diff_files()`, which names it; with one it reaches
     // `builtin_diff_index()`, which prints the usage block alone. `--cached` counts as a
     // pending tree-ish because `cmd_diff` supplies HEAD for it.
     if let Some(arg) = &invalid_arg {
         return Ok(invalid_option(arg, !revs.is_empty() || cached));
+    }
+    // A `-S`/`-G` that survived both conflict checks is a real git option this
+    // command does not render, and is refused rather than silently ignored.
+    if let Some(flag) = &unsupported_pickaxe {
+        bail!("unsupported option {flag:?}");
     }
     paths.extend(trailing_paths);
     // `parse_pathspec()` runs inside `setup_revisions()`, so a rejected element
@@ -1188,11 +1331,100 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::from(128));
     }
 
+    // `cmd_diff()` sorts the pending objects into two arrays before it dispatches
+    // (builtin/diff.c:576-604):
+    //
+    // ```c
+    // obj = deref_tag(the_repository, obj, NULL, 0);
+    // if (!obj)
+    //         die(_("invalid object '%s' given."), name);
+    // if (obj->type == OBJ_COMMIT)
+    //         obj = &repo_get_commit_tree(the_repository,
+    //                                     ((struct commit *)obj))->object;
+    //
+    // if (obj->type == OBJ_TREE) {
+    //         …
+    //         add_object_array(obj, name, &ent);
+    //         …
+    // } else if (obj->type == OBJ_BLOB) {
+    //         if (2 <= blobs)
+    //                 die(_("more than two blobs given: '%s'"), name);
+    //         blob[blobs] = entry;
+    //         blobs++;
+    //
+    // } else {
+    //         die(_("unhandled object '%s' given."), name);
+    // }
+    // ```
+    //
+    // and then (builtin/diff.c:611-631):
+    //
+    // ```c
+    // if (!ent.nr) {
+    //         switch (blobs) {
+    //         case 0:  builtin_diff_files(&rev, argc, argv); break;
+    //         case 1:  if (paths != 1) usage(builtin_diff_usage);
+    //                  builtin_diff_b_f(&rev, argc, argv, blob); break;
+    //         case 2:  if (paths) usage(builtin_diff_usage);
+    //                  builtin_diff_blobs(&rev, argc, argv, blob); break;
+    //         default: usage(builtin_diff_usage);
+    //         }
+    // }
+    // else if (blobs)
+    //         usage(builtin_diff_usage);
+    // ```
+    //
+    // So a blob operand is not a tree-ish that failed to peel — it is its own
+    // arm, and every shape but "one blob and exactly one path" or "two blobs and
+    // no path" is the plain usage block at 129. Without this the blob fell through
+    // to the tree dispatch below and surfaced gitoxide's "was blob while trying to
+    // peel to tree" at exit 1. Only a blob (or a type git refuses outright) is
+    // intercepted here; a tree-ish operand takes exactly the path it always did.
+    let mut blobs = 0usize;
+    let mut trees = 0usize;
+    for name in &revs {
+        let Some(id) = crate::objname::resolve(&repo, name) else {
+            continue;
+        };
+        let Ok(object) = repo.find_object(id) else {
+            continue;
+        };
+        // `deref_tag()` walks the whole tag chain; a chain that cannot be walked is
+        // git's NULL and the `die()` above it.
+        let Ok(peeled) = object.peel_tags_to_end() else {
+            crate::git_fatal!("invalid object '{name}' given.");
+        };
+        match peeled.kind {
+            // `repo_get_commit_tree()`: a commit *is* its tree from here on.
+            gix::object::Kind::Commit | gix::object::Kind::Tree => trees += 1,
+            gix::object::Kind::Blob => {
+                if blobs >= 2 {
+                    crate::git_fatal!("more than two blobs given: '{name}'");
+                }
+                blobs += 1;
+            }
+            gix::object::Kind::Tag => crate::git_fatal!("unhandled object '{name}' given."),
+        }
+    }
+    if blobs > 0 {
+        // `paths` is `rev.prune_data.nr`, the pathspec elements — the `--`-separated
+        // tail included, which is why this is read after `trailing_paths` merged in.
+        let two_blobs_no_path = trees == 0 && blobs == 2 && paths.is_empty();
+        let blob_vs_file = trees == 0 && blobs == 1 && paths.len() == 1;
+        if !two_blobs_no_path && !blob_vs_file {
+            return Ok(usage_error());
+        }
+        // The two arms that *would* have rendered: `builtin_diff_blobs()` and
+        // `builtin_diff_b_f()`. Neither is ported, so they are refused rather than
+        // approximated with the tree machinery below, which cannot express them.
+        bail!("unsupported: diff of a blob operand");
+    }
+
     // Apply the `diff.algorithm` default only when no `--minimal`/`--histogram`/
     // `--patience`/`--diff-algorithm=` flag set the algorithm on the command line
     // (git's precedence).
     if algorithm.is_none() {
-        if let Some(ConfigAlgorithm::Use(a)) = config_algorithm {
+        if let Some(a) = config_algorithm {
             algorithm = Some(a);
         }
     }
@@ -1217,6 +1449,26 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     // there — which is why `git diff --check` prints checkdiff lines and no patch.
     if fmt == 0 && !check {
         fmt = F_PATCH;
+    }
+
+    // `builtin_diff_tree()` (builtin/diff.c:196):
+    //
+    // ```c
+    // /*
+    //  * We saw two trees, ent0 and ent1.  If ent1 is uninteresting,
+    //  * swap them.
+    //  */
+    // if (ent1->item->flags & UNINTERESTING)
+    //         swap = 1;
+    // oid[swap] = &ent0->item->oid;
+    // oid[1 - swap] = &ent1->item->oid;
+    // ```
+    //
+    // The one place a `^` mark is visible in this command's *output* rather than only
+    // in its diagnostics: `git diff HEAD ^HEAD~1` diffs `HEAD~1` against `HEAD`, not
+    // the other way round. It reads `ent1` alone, so `^A ^B` swaps and `^A B` does not.
+    if revs.len() == 2 && revs_uninteresting.get(1) == Some(&true) {
+        revs.swap(0, 1);
     }
 
     // `cmd_diff()` rejects `--cached`/`--staged` with two or more revisions as a
@@ -1369,6 +1621,29 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     let mut rename_warnings = diffcore_rename::Warnings::default();
     if ro.detect_rename != 0 || ro.break_opt != -1 {
         rename_warnings = run_diffcore_rename(&repo, &mut cache, &mut deltas, &ro, worktree_mode)?;
+    }
+
+    // `diffcore_pickaxe()` (diff.c:7517), which `diffcore_std()` runs immediately after
+    // the rename passes and before `diffcore_order()`. Only the objfind kind exists
+    // here — `-S`/`-G` are not ported in this command — and `pickaxe_match()` answers
+    // it from the *recorded* ids without reading either side, so a worktree post-image
+    // git has not hashed carries the null id and cannot match.
+    if !find_object_ids.is_empty() {
+        let null = repo.object_hash().null();
+        deltas.retain(|d| {
+            super::diff_files::objfind_hit(
+                &find_object_ids,
+                // `DIFF_FILE_VALID(p->one)` and `p->one->oid`: a worktree pre-image
+                // (only `-R` produces one) carries `old_raw_id`, which is that field.
+                d.old.map(|(id, _)| if d.old_worktree { d.old_raw_id.unwrap_or(null) } else { id }),
+                // `DIFF_FILE_VALID(p->two)` and `p->two->oid`.
+                match &d.new {
+                    NewSide::Absent => None,
+                    NewSide::Blob(id, _) => Some(*id),
+                    NewSide::Worktree(_) => Some(d.new_id.unwrap_or(null)),
+                },
+            )
+        });
     }
 
     // `--diff-filter`: keep only deltas whose status letter is selected.
@@ -2837,25 +3112,26 @@ fn invalid_option(arg: &str, have_revision: bool) -> ExitCode {
     usage_error()
 }
 
-/// A validated `diff.algorithm` config value.
-enum ConfigAlgorithm {
-    Use(gix::diff::blob::Algorithm),
-}
-
-/// Parse a `diff.algorithm` config value the way git's config loader does:
-/// case-insensitively, accepting `myers`/`default`, `minimal`, `histogram` and
-/// `patience`. Any other name is a hard config error (git exits 128) — rendered
-/// here as the same "not available" bail the `--diff-algorithm=` flag uses.
-fn parse_config_algorithm(name: &gix::bstr::BStr) -> Result<ConfigAlgorithm> {
-    use gix::diff::blob::Algorithm::{Histogram, Myers, MyersMinimal, Patience};
-    let lower = name.to_ascii_lowercase();
-    Ok(match lower.as_slice() {
-        b"myers" | b"default" => ConfigAlgorithm::Use(Myers),
-        b"minimal" => ConfigAlgorithm::Use(MyersMinimal),
-        b"histogram" => ConfigAlgorithm::Use(Histogram),
-        b"patience" => ConfigAlgorithm::Use(Patience),
-        _ => crate::git_fatal!("diff algorithm {:?} is not available", name.to_str_lossy()),
-    })
+/// `git_xmerge_config()`'s `diff.algorithm` arm:
+///
+/// ```c
+/// if (!strcmp(var, "diff.algorithm")) {
+///         int value_i = parse_algorithm_value(value);
+///         if (value_i < 0)
+///                 return error(_("unknown value for config '%s': %s"), var, value);
+///         ...
+/// }
+/// ```
+///
+/// The same [`super::diff_optval::parse_algorithm_value`] table the flag reads, so
+/// the config accepts exactly the four names, case-insensitively. An unrecognized
+/// one is a hard config error (git exits 128) even when a CLI flag would have
+/// overridden it.
+fn parse_config_algorithm(name: &gix::bstr::BStr) -> Result<gix::diff::blob::Algorithm> {
+    match super::diff_optval::parse_algorithm_value(&name.to_str_lossy()) {
+        Some(alg) => Ok(alg),
+        None => crate::git_fatal!("diff algorithm {:?} is not available", name.to_str_lossy()),
+    }
 }
 
 /// The three outcomes of parsing a `-U`/`--unified` value, mirroring the two

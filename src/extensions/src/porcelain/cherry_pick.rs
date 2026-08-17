@@ -1295,7 +1295,7 @@ fn pick_one(
                                 format!("{pick_id}\n"),
                             )?;
                         }
-                        merge_conflict_advice(&repo, opts.no_commit);
+                        crate::sequencer::print_advice(&repo, crate::sequencer::Action::Pick, opts.no_commit);
                     }
                     return Ok(PickOutcome::Stopped(ExitCode::from(res)));
                 }
@@ -1333,7 +1333,27 @@ fn pick_one(
         let git_dir = repo.git_dir();
         // `AUTO_MERGE` — the merge result with its conflict markers — was
         // already recorded by `merge_switch_to_result()` above.
-        std::fs::write(git_dir.join("CHERRY_PICK_HEAD"), format!("{pick_id}\n"))?;
+        //
+        // `CHERRY_PICK_HEAD` is not written under `--no-commit`
+        // (`sequencer.c:2474-2479`):
+        //
+        // ```c
+        // if ((command == TODO_PICK || command == TODO_REWORD ||
+        //      command == TODO_EDIT) && !opts->no_commit &&
+        //     (res == 0 || res == 1) &&
+        //     refs_update_ref(…, "CHERRY_PICK_HEAD", &commit->object.oid, …))
+        //         res = -1;
+        // ```
+        //
+        // The comment above it says why: the ref exists "for the subsequent
+        // invocation of commit to use", and `--no-commit` is the spelling that
+        // says no commit follows. The strategy arm above already gates on it;
+        // this one did not, which left a `git cherry-pick -n` that conflicted
+        // claiming a pick was in progress — `git status` reports it, and
+        // `git cherry-pick --abort` then has state stock never wrote.
+        if !opts.no_commit {
+            std::fs::write(git_dir.join("CHERRY_PICK_HEAD"), format!("{pick_id}\n"))?;
+        }
 
         // git's `append_conflicts_hint`: a blank line, then one commented
         // line per conflicted path, appended to the message it would have
@@ -1349,12 +1369,10 @@ fn pick_one(
         std::fs::write(git_dir.join("MERGE_MSG"), &merge_msg[..])?;
 
         eprintln!("error: could not apply {pick_short}... {pick_subject}");
-        eprintln!("hint: After resolving the conflicts, mark them with");
-        eprintln!("hint: \"git add/rm <pathspec>\", then run");
-        eprintln!("hint: \"git cherry-pick --continue\".");
-        eprintln!("hint: You can instead skip this commit with \"git cherry-pick --skip\".");
-        eprintln!("hint: To abort and get back to the state before \"git cherry-pick\",");
-        eprintln!("hint: run \"git cherry-pick --abort\".");
+        // `print_advice(r, res == 1, opts)`: the in-tree merge reporting
+        // conflicts *is* `res == 1`, so the hint always shows here. Which of the
+        // two variants it is comes from `opts->no_commit`, not from the action.
+        crate::sequencer::print_advice(&repo, crate::sequencer::Action::Pick, opts.no_commit);
         return Ok(PickOutcome::Stopped(ExitCode::from(1)));
     }
 
@@ -1489,24 +1507,6 @@ fn run_merge_strategy(
         Some(code) => code.clamp(0, 255) as u8,
         None => 128,
     })
-}
-
-/// `print_advice(r, show_hint = 1, opts)` for a stopped cherry-pick: the
-/// `advice.mergeConflict` slot, so the `Disable this message with …` trailer is
-/// appended when the user has never configured it.
-fn merge_conflict_advice(repo: &gix::Repository, no_commit: bool) {
-    let body = if no_commit {
-        "after resolving the conflicts, mark the corrected paths\n\
-         with 'git add <paths>' or 'git rm <paths>'"
-    } else {
-        "After resolving the conflicts, mark them with\n\
-         \"git add/rm <pathspec>\", then run\n\
-         \"git cherry-pick --continue\".\n\
-         You can instead skip this commit with \"git cherry-pick --skip\".\n\
-         To abort and get back to the state before \"git cherry-pick\",\n\
-         run \"git cherry-pick --abort\"."
-    };
-    crate::advice::Advice::MergeConflict.advise_in(repo, body);
 }
 
 /// The bare `fatal: cherry-pick failed` tail, for call sites that already

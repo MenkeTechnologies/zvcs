@@ -343,3 +343,60 @@ fn only_full_length_hex_takes_the_branch() {
         assert!(!err.contains("is ambiguous"), "`{name}x` must not take the branch:\n{err}");
     }
 }
+
+/// The three commands whose own copy of the decode used to return before
+/// anything could warn: `merge-subtree`, `notes` and `reflog show`.
+///
+/// Each takes its operand straight off argv and reaches `get_oid_basic()` once
+/// for it — `cmd_merge_recursive()` calls `repo_get_oid()` once per base and once
+/// per head (`builtin/merge-recursive.c:62,82,84`), every `notes` subcommand
+/// calls it once for `<object>`, and `cmd_log_reflog()` hands each operand to
+/// `setup_revisions()`. So the count is the assertion: exactly one warning per
+/// operand, never two.
+#[test]
+fn the_three_late_arrivals_warn_once_per_operand() {
+    let (repo, home, head) = fixture("late", true);
+    let quiet_advice = ["-c", "advice.objectNameWarning=false"];
+    let h = head.as_str();
+
+    for args in [
+        vec!["notes", "list", h],
+        vec!["notes", "show", h],
+        vec!["notes", "add", "-f", "-m", "n", h],
+        vec!["reflog", "show", h],
+        vec!["merge-subtree", h, "--", "HEAD", "HEAD"],
+    ] {
+        let mut argv: Vec<&str> = quiet_advice.to_vec();
+        argv.extend(args.iter().copied());
+        let err = stderr_of(&run(&repo, &home, &argv, None));
+        assert_eq!(
+            warnings_in(&err, &head),
+            1,
+            "`git {}` must warn exactly once; stderr:\n{err}",
+            args.join(" ")
+        );
+    }
+
+    // `merge-subtree` resolves three operands, so three warnings — and that is
+    // the shape a shared resolver most easily turns into six.
+    let mut argv: Vec<&str> = quiet_advice.to_vec();
+    argv.extend(["merge-subtree", h, "--", h, h]);
+    let err = stderr_of(&run(&repo, &home, &argv, None));
+    assert_eq!(warnings_in(&err, &head), 3, "one per operand, base included:\n{err}");
+
+    // Gate 3 still governs all of them.
+    for args in [
+        vec!["notes", "list", h],
+        vec!["reflog", "show", h],
+        vec!["merge-subtree", h, "--", "HEAD", "HEAD"],
+    ] {
+        let mut argv: Vec<&str> = vec!["-c", "core.warnAmbiguousRefs=false"];
+        argv.extend(args.iter().copied());
+        let err = stderr_of(&run(&repo, &home, &argv, None));
+        assert!(
+            !err.contains("is ambiguous"),
+            "`git {}` must be silent under core.warnAmbiguousRefs=false:\n{err}",
+            args.join(" ")
+        );
+    }
+}

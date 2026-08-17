@@ -45,6 +45,16 @@
 //! `reset` additionally asserts the repository is untouched: `--hard` dies before
 //! `unpack_trees()` runs, so a failed one must not have reset anything.
 //!
+//! The same `die(_("Could not parse object '%s'."), rev)` is reached from two
+//! arms of `cmd_reset()` that do not agree on what the operand may be, so the
+//! rest of the reset tests here pin the arms apart: the pathspec arm takes a
+//! *tree* (`repo_parse_tree_indirect()`) and accepts `HEAD^{tree}` where the
+//! whole-tree arm (`lookup_commit_reference()`) refuses it, the refusal names
+//! the **operand** id and the **peeled** type — checked with an annotated tag on
+//! a tree, where those two ids differ — and the pathspec arm fails *silently*
+//! because its peel is handed a NULL name, so one blob operand produces two
+//! stderr lines in one arm and one in the other.
+//!
 //! Expectations are stock git 2.55.0's, captured with the parity harness's
 //! environment (fixed identity and date, no global or system config, `LC_ALL=C`,
 //! `TZ=UTC`).
@@ -244,6 +254,114 @@ fn reset_applies_the_rule_by_length_and_ignores_case() {
 
     let (out, err, code) = f.run(&["reset", "--hard", ABSENT_UPPER]);
     assert_eq!(err, format!("fatal: Could not parse object '{ABSENT_UPPER}'.\n"));
+    assert_eq!(out, "");
+    assert_eq!(code, 128);
+}
+
+/// The two arms of `cmd_reset()`'s resolution do **not** want the same kind of
+/// object, and a present-but-wrong-kind operand is where that shows:
+///
+/// ```c
+/// } else if (!pathspec.nr && !patch_mode) {
+///         commit = lookup_commit_reference(the_repository, &oid);
+///         if (!commit)
+///                 die(_("Could not parse object '%s'."), rev);
+/// } else {
+///         tree = repo_parse_tree_indirect(the_repository, &oid);
+///         if (!tree)
+///                 die(_("Could not parse object '%s'."), rev);
+/// }
+/// ```
+///
+/// `git reset <tree> -- <path>` is the documented way to load paths out of a
+/// tree, so the pathspec arm has to accept one; peeling to a commit in both arms
+/// turns the working form into a failure. Every mode of the whole-tree form is
+/// checked because they diverge earlier in `cmd_reset()` and only rejoin here.
+#[test]
+fn a_tree_operand_is_an_error_only_in_the_whole_tree_arm() {
+    let f = Fixture::new("reset-tree-arm");
+    let tree = f.run(&["rev-parse", "HEAD^{tree}"]).0.trim().to_string();
+    let head_f = f.run(&["rev-parse", "HEAD:f.txt"]).0.trim().to_string();
+
+    for mode in ["--hard", "--soft", "--mixed"] {
+        let (out, err, code) = f.run(&["reset", mode, "HEAD^{tree}"]);
+        assert_eq!(
+            err,
+            format!("error: object {tree} is a tree, not a commit\nfatal: Could not parse object 'HEAD^{{tree}}'.\n"),
+            "reset {mode} <tree>"
+        );
+        assert_eq!(out, "", "reset {mode} <tree>");
+        assert_eq!(code, 128, "reset {mode} <tree>");
+    }
+
+    // Same operand, one pathspec later: accepted, and the index entry really is
+    // the tree's version — a message-only fix would pass the first half.
+    let (out, err, code) = f.run(&["reset", "HEAD^{tree}", "--", "f.txt"]);
+    assert_eq!(err, "");
+    assert_eq!(out, "Unstaged changes after reset:\nM\tf.txt\n");
+    assert_eq!(code, 0);
+    assert_eq!(f.run(&["rev-parse", ":f.txt"]).0.trim(), head_f);
+}
+
+/// `lookup_commit_reference()` names the id it was *handed* and the type it
+/// *arrived at*:
+///
+/// ```c
+/// error(_("object %s is a %s, not a %s"),
+///       oid_to_hex(oid), type_name(type), type_name(OBJ_COMMIT));
+/// ```
+///
+/// A bare tree makes those two ids coincide and hides a mix-up, so the operand
+/// here is an annotated tag pointing at a tree: git prints the *tag's* id next
+/// to the word `tree`. The test asserts the two ids differ first, so it cannot
+/// pass by accident on a build where they happen to be equal.
+#[test]
+fn the_type_error_names_the_operand_id_and_the_peeled_type() {
+    let f = Fixture::new("reset-tagged-tree");
+    let tree = f.run(&["rev-parse", "HEAD^{tree}"]).0.trim().to_string();
+    f.ok(&["tag", "-a", "-m", "t", "treetag", &tree]);
+    let tag = f.run(&["rev-parse", "treetag"]).0.trim().to_string();
+    assert_ne!(tag, tree, "the fixture must make operand and peeled ids distinguishable");
+
+    let (out, err, code) = f.run(&["reset", "treetag"]);
+    assert_eq!(
+        err,
+        format!("error: object {tag} is a tree, not a commit\nfatal: Could not parse object 'treetag'.\n")
+    );
+    assert_eq!(out, "");
+    assert_eq!(code, 128);
+
+    // The pathspec arm peels the same tag all the way to the tree and succeeds.
+    let (out, err, code) = f.run(&["reset", "treetag", "--", "f.txt"]);
+    assert_eq!(err, "");
+    assert_eq!(out, "Unstaged changes after reset:\nM\tf.txt\n");
+    assert_eq!(code, 0);
+}
+
+/// The two arms also differ in how *loudly* they fail. `repo_parse_tree_indirect()`
+/// is `repo_peel_to_type(r, NULL, 0, obj, OBJ_TREE)` — a NULL name, so
+/// `repo_peel_to_type()` skips its `error()` and returns NULL silently, leaving
+/// `cmd_reset()`'s `die()` as the only line. The whole-tree arm's
+/// `lookup_commit_reference()` has no such guard and reports first.
+///
+/// So the same blob operand is two lines in one arm and one line in the other,
+/// and an implementation that routes both through one helper gets one of them
+/// wrong whichever helper it picks.
+#[test]
+fn a_blob_operand_is_reported_once_with_paths_and_twice_without() {
+    let f = Fixture::new("reset-blob-arm");
+    let blob = f.run(&["rev-parse", "HEAD:g.txt"]).0.trim().to_string();
+
+    let (out, err, code) = f.run(&["reset", &blob]);
+    assert_eq!(
+        err,
+        format!("error: object {blob} is a blob, not a commit\nfatal: Could not parse object '{blob}'.\n")
+    );
+    assert_eq!(out, "");
+    assert_eq!(code, 128);
+
+    let (out, err, code) = f.run(&["reset", &blob, "--", "f.txt"]);
+    assert_eq!(err, format!("fatal: Could not parse object '{blob}'.\n"));
     assert_eq!(out, "");
     assert_eq!(code, 128);
 }

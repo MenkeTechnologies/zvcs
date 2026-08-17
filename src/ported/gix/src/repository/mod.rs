@@ -100,6 +100,9 @@ pub mod blame_file {
         pub ranges: gix_blame::BlameRanges,
         /// Don't consider commits before the given date.
         pub since: Option<gix_date::Time>,
+        /// The commits the walk must not dig past, closed under ancestry — git's `UNINTERESTING`
+        /// flag, i.e. the bottom end of `git blame <rev>..<rev>` and `git blame ^<rev>`.
+        pub bottom: std::collections::HashSet<gix_hash::ObjectId>,
         /// Determine if rename tracking should be performed, and how.
         pub rewrites: Option<gix_diff::Rewrites>,
         /// Ignore whitespace differences when diffing revisions (`git blame -w`).

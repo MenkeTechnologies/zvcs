@@ -47,6 +47,26 @@
 //! git atoms, so an unknown field name is reported the way git reports it.
 //! `%(rest)` is refused the way git refuses it for this command.
 //!
+//! `%(ahead-behind:<committish>)` is computed in git's two stages, not one: the
+//! atom's operand is peeled when the format is parsed, and then
+//! `filter_ahead_behind()` (ref-filter.c:3187) peels **every ref in the array**
+//! before the sort. Both peels are `lookup_commit_reference…()` with `quiet = 0`,
+//! so a ref that does not peel to a commit produces
+//! `error: object <id> is a <kind>, not a commit` on stderr even though its own
+//! atom simply renders empty and the command still exits 0. The pass runs ahead
+//! of `--count` (applied in `print_formatted_ref_array()`) and is triggered by a
+//! `--sort=ahead-behind:<x>` key as much as by a format atom.
+//!
+//! A second divergence, in stock's favour: with `--include-root-refs`, stock
+//! git *drops* `HEAD` and the other root refs from the listing as soon as an
+//! option or atom resolves a ref name before the iteration — `%(ahead-behind:…)`,
+//! `%(is-base:…)`, `--merged`, `--contains`, `--points-at`. The root refs are
+//! only added while the loose-ref cache is first built
+//! (`add_root_refs()` under `get_loose_ref_cache()`, refs/files-backend.c:421-451),
+//! so a lookup that warms that cache earlier leaves them out for the rest of the
+//! process. This port lists them regardless, i.e. it lists what
+//! `--include-root-refs` asked for.
+//!
 //! One known divergence: the `:short` renderings (`%(objectname:short)`,
 //! `%(tree:short)`, `%(parent:short)`) take their length from gitoxide's
 //! abbreviation logic, which honours `core.abbrev` but, when it is unset,
@@ -1080,6 +1100,53 @@ pub fn for_each_ref(args: &[String]) -> Result<ExitCode> {
             peeled,
             packed,
         });
+    }
+
+    // `filter_ahead_behind()` (ref-filter.c:3187), which `cmd_for_each_ref()` runs
+    // between `filter_refs()` and the sort:
+    //
+    // ```c
+    // if (!array->nr)
+    //         return;
+    // for (size_t i = bases_nr = 0; i < used_atom_cnt; i++)
+    //         if (used_atom[i].atom_type == ATOM_AHEADBEHIND)
+    //                 bases_nr++;
+    // if (!bases_nr)
+    //         return;
+    // …
+    // for (size_t i = 0; i < array->nr; i++) {
+    //         const char *name = array->items[i]->refname;
+    //         commits[commits_nr] = lookup_commit_reference_by_name(name);
+    //         if (!commits[commits_nr])
+    //                 continue;
+    //         …
+    // }
+    // ```
+    //
+    // `lookup_commit_reference_by_name()` ends in `lookup_commit_reference_gently(r,
+    // &oid, 0)` — quiet is *0* — so a ref that does not peel to a commit prints
+    // `error: object %s is a %s, not a %s` right here. Three consequences the lazy
+    // per-ref peel in the formatter does not have:
+    //
+    // * the line appears for a ref whose own `%(ahead-behind:…)` operand is
+    //   perfectly good, purely because that ref is in the array;
+    // * every line is emitted before the first output line, in array (pre-sort)
+    //   order, not interleaved with the formatted output;
+    // * `--count` is applied later, in `print_formatted_ref_array()`, so refs
+    //   past the limit are still walked and still report.
+    //
+    // A `--sort=ahead-behind:<x>` key is a `used_atom` as much as a format atom is,
+    // which is why the pass can fire for a format that names no such atom at all.
+    if !refs.is_empty() && atoms().any(|a| matches!(a.field, Field::AheadBehind(_))) {
+        for info in &refs {
+            // The array item's id is what `repo_get_oid_committish()` answers for
+            // the item's refname: `get_oid_basic()` resolves a full refname
+            // through the ref store and does no peeling of its own.
+            let found = crate::objname::lookup_commit_reference(&repo, info.obj.id);
+            if let Some(note) = found.type_error() {
+                eprintln!("error: {note}");
+            }
+        }
     }
 
     let ctx = RenderCtx {

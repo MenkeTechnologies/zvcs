@@ -401,3 +401,486 @@ fn present_names_are_unaffected() {
     assert_eq!(code, 0, "{err}");
     assert_eq!(out, "f.txt\n");
 }
+
+/// `setup_revisions()`'s `seen_dashdash`, the *other* half of the gate that
+/// decides between `bad revision` and `ambiguous argument`:
+///
+/// ```c
+/// if (handle_revision_arg(arg, revs, flags, revarg_opt)) {
+///         int j;
+///         if (seen_dashdash || *arg == '^')
+///                 die(_("bad revision '%s'"), arg);
+///         for (j = i; j < argc; j++)
+///                 verify_filename(revs->prefix, argv[j], j == i);
+///         …
+/// }
+/// ```
+///
+/// It is established by a scan of the whole argument vector before any operand
+/// is resolved, so it is *not* positional: a separator anywhere makes every
+/// operand revision-only, including the ones written in front of it. Each case
+/// is paired with the same argv minus the separator, because the bug being
+/// pinned is that both spellings produced the pathspec wording.
+#[test]
+fn a_separator_anywhere_makes_a_failed_operand_a_bad_revision() {
+    let f = Fixture::new("seen-dashdash");
+
+    for verb in ["diff", "diff-index", "diff-files"] {
+        for tok in [
+            UNRESOLVABLE,
+            "nosuchthing..HEAD",
+            "HEAD..nosuchthing",
+            "nosuchthing...HEAD",
+        ] {
+            // With the separator: `die(_("bad revision '%s'"), arg)`, naming the
+            // token as written — `setup_revisions()` still holds `argv[i]`.
+            let (out, err, code) = f.run(&[verb, tok, "--"]);
+            assert_eq!(code, 128, "{verb} {tok} --: {out}{err}");
+            assert_eq!(err, format!("fatal: bad revision '{tok}'\n"), "{verb} {tok} --");
+
+            // Without it the same token is still a pathspec candidate, so it
+            // reaches `verify_filename()` and gets the three-line wording.
+            let (out, err, code) = f.run(&[verb, tok]);
+            assert_eq!(code, 128, "{verb} {tok}: {out}{err}");
+            assert_eq!(err, ambiguous(tok), "{verb} {tok}");
+        }
+    }
+}
+
+/// `handle_revision_arg_1()`'s exclusion mark:
+///
+/// ```c
+/// if (*arg == '^') {
+///         flags ^= UNINTERESTING | BOTTOM;
+///         arg++;
+/// }
+/// ```
+///
+/// The mark is stripped before anything resolves, so the two diagnostics below
+/// it name *different* strings and that is the point of the pairing: the
+/// `bad object` die comes from `get_reference()`, past the mark, while the
+/// `bad revision` die comes from `setup_revisions()`, which still holds the
+/// original `argv[i]` and prints the mark.
+#[test]
+fn an_exclusion_mark_is_stripped_before_resolution_but_kept_in_the_die() {
+    let f = Fixture::new("uninteresting");
+
+    for verb in ["diff", "diff-index", "diff-files"] {
+        // Resolved by the full-hex rule, absent from the odb: named past the mark.
+        let (out, err, code) = f.run(&[verb, &format!("^{ABSENT}")]);
+        assert_eq!(code, 128, "{verb} ^<absent>: {out}{err}");
+        assert_eq!(err, bad_object(ABSENT), "{verb} ^<absent>");
+
+        // Resolves to nothing: never offered to `verify_filename()`, and named
+        // *with* the mark.
+        let (out, err, code) = f.run(&[verb, &format!("^{UNRESOLVABLE}")]);
+        assert_eq!(code, 128, "{verb} ^<unresolvable>: {out}{err}");
+        assert_eq!(err, format!("fatal: bad revision '^{UNRESOLVABLE}'\n"), "{verb} ^…");
+    }
+
+    // With a single tree the flag changes nothing: `cmd_diff_index()` reads the
+    // tree out of `revs->pending` regardless of the flag bits, so `^HEAD` and
+    // `HEAD` are the same diff.
+    let (marked, err, code) = f.run(&["diff-index", "^HEAD"]);
+    assert_eq!(code, 0, "{err}");
+    let (plain, err, code) = f.run(&["diff-index", "HEAD"]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(marked, plain);
+    assert!(!plain.is_empty(), "the fixture must have an unstaged edit to show");
+}
+
+/// `diff_opt_find_object()`:
+///
+/// ```c
+/// if (repo_get_oid(the_repository, arg, &oid))
+///         return error(_("unable to resolve '%s'"), arg);
+/// ```
+///
+/// `repo_get_oid()`, so the full-hex rule applies and an id the repository does
+/// not have is a perfectly good needle that simply matches nothing — exit 0 with
+/// empty output, not an error. Only a name that resolves to *nothing* is the
+/// callback's `error()`, and `error()` from an option callback is
+/// parse-options' `PARSE_OPT_ERROR`: a bare exit 129 with no usage block.
+#[test]
+fn find_object_takes_any_resolvable_id_and_only_errors_on_an_unresolvable_name() {
+    // The tag is the fixture directory name and tests run in parallel in one
+    // process, so it has to be unique across this file.
+    let f = Fixture::new("find-object-resolve");
+
+    for verb in ["diff", "diff-index", "diff-files"] {
+        // The two spellings are one `OPT_CALLBACK_F` without `PARSE_OPT_OPTARG`,
+        // so the separated form takes the next argv entry as its value.
+        for mut args in [
+            vec![verb.to_string(), format!("--find-object={ABSENT}")],
+            vec![verb.to_string(), "--find-object".to_string(), ABSENT.to_string()],
+            vec![verb.to_string(), format!("--find-object={ABSENT_UPPER}")],
+        ] {
+            // `diff-index` needs its tree-ish; the other two take none.
+            if verb == "diff-index" {
+                args.push("HEAD".to_string());
+            }
+            let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+            let (out, err, code) = f.run(&argv);
+            assert_eq!(code, 0, "{argv:?}: {out}{err}");
+            assert_eq!(out, "", "{argv:?}");
+            assert_eq!(err, "", "{argv:?}");
+        }
+
+        // A name that resolves to nothing at all.
+        for args in [
+            vec![verb.to_string(), format!("--find-object={UNRESOLVABLE}")],
+            vec![verb.to_string(), "--find-object".to_string(), UNRESOLVABLE.to_string()],
+        ] {
+            let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+            let (out, err, code) = f.run(&argv);
+            assert_eq!(code, 129, "{argv:?}: {out}{err}");
+            assert_eq!(err, format!("error: unable to resolve '{UNRESOLVABLE}'\n"), "{argv:?}");
+        }
+    }
+
+    // A real id does select: the one blob `f.txt` had at HEAD is the pre-image of
+    // the only pair `diff-files` has, so the pair survives the objfind filter.
+    let (blob, err, code) = f.run(&["rev-parse", "HEAD:f.txt"]);
+    assert_eq!(code, 0, "{err}");
+    let blob = blob.trim();
+    let (out, err, code) = f.run(&["diff-files", "--name-only", &format!("--find-object={blob}")]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(out, "f.txt\n");
+}
+
+/// `diff_setup_done()`'s two pickaxe `die()`s
+/// (`HAS_MULTI_BITS(pickaxe_opts & DIFF_PICKAXE_KINDS_MASK)` and the
+/// `…_ALL_OBJFIND_MASK` one right after it). Both fire on the *combination*, so
+/// each verb has to reach them even when it does not render the options
+/// involved: `diff` does not implement `-S`/`-G`, and still owes git's `fatal:`
+/// at 128 rather than a bail. Measured against stock 2.55.0, they beat an
+/// unknown option in either argv position.
+#[test]
+fn conflicting_pickaxe_kinds_are_gits_fatal_on_every_verb() {
+    let f = Fixture::new("pickaxe-conflict");
+    let kinds = "fatal: options '-G', '-S', and '--find-object' cannot be used together\n";
+    let all_objfind = "fatal: options '--pickaxe-all' and '--find-object' cannot be used \
+                       together, use '--pickaxe-all' with '-G' and '-S'\n";
+
+    let find = format!("--find-object={ABSENT}");
+    for verb in ["diff", "diff-index", "diff-files"] {
+        for (argv, want) in [
+            (vec![verb, &find, "-Sfoo"], kinds),
+            (vec![verb, "-Gfoo", "-Sfoo"], kinds),
+            (vec![verb, &find, "--pickaxe-all"], all_objfind),
+            (vec![verb, "--pickaxe-all", &find], all_objfind),
+            // `diff_setup_done()` closes `setup_revisions()`, so it beats the
+            // leftover-argv complaint about an unknown option in either position.
+            (vec![verb, "--bogus-flag", &find, "--pickaxe-all"], all_objfind),
+            (vec![verb, &find, "--pickaxe-all", "--bogus-flag"], all_objfind),
+        ] {
+            let (out, err, code) = f.run(&argv);
+            assert_eq!(code, 128, "{argv:?}: {out}{err}");
+            assert_eq!(err, want, "{argv:?}");
+        }
+    }
+}
+
+/// `diff_cache()` (`diff-lib.c`), reached from `run_diff_index()`:
+///
+/// ```c
+/// tree = repo_parse_tree_indirect(the_repository, tree_oid);
+/// if (!tree)
+///         return error("bad tree object %s",
+///                      tree_name ? tree_name : oid_to_hex(tree_oid));
+/// ```
+///
+/// ```c
+/// if (diff_cache(revs, &oid, name, cached))
+///         exit(128);
+/// ```
+///
+/// `error()`, so the line reads `error:` and not `fatal:`, and the status comes
+/// from the caller's `exit(128)`. The operand is *not* re-diagnosed as a bad
+/// revision: it resolved perfectly well, it simply does not peel to a tree.
+#[test]
+fn a_diff_index_operand_that_is_not_a_treeish_is_a_bad_tree_object() {
+    let f = Fixture::new("bad-tree-object");
+    let (blob, err, code) = f.run(&["rev-parse", "HEAD:f.txt"]);
+    assert_eq!(code, 0, "{err}");
+    let blob = blob.trim().to_string();
+
+    // Marked or not: `handle_revision_arg_1()` advances past the `^` before the
+    // object is pended, so `ent->name` — and the message — has no mark either way.
+    for arg in [blob.clone(), format!("^{blob}")] {
+        let (out, err, code) = f.run(&["diff-index", &arg]);
+        assert_eq!(code, 128, "diff-index {arg}: {out}{err}");
+        assert_eq!(err, format!("error: bad tree object {blob}\n"), "diff-index {arg}");
+    }
+}
+
+/// `handle_revision_arg_1()`'s guard in front of `handle_dotdot()`:
+///
+/// ```c
+/// if (!cant_be_filename && !strcmp(arg, "..")) {
+///         /*
+///          * Just ".."?  That is not a range but the
+///          * pathspec for the parent directory.
+///          */
+///         ret = -1;
+///         goto out;
+/// }
+/// ```
+///
+/// So the token becomes prune data, and the diagnostic the user finally gets is
+/// the *pathspec* layer's, from `init_pathspec_item()` — not a revision error.
+/// `parse_pathspec()` runs inside `setup_revisions()`, which is why it precedes
+/// `diff_setup_done()`'s pickaxe checks and the operand-count usage error
+/// (measured: `git diff-index -Gx -Sx -- ..` reports the pathspec).
+#[test]
+fn a_bare_parent_directory_pathspec_dies_in_the_pathspec_layer() {
+    let f = Fixture::new("parent-dir-pathspec");
+    let want = format!(
+        "fatal: ..: '..' is outside repository at '{}'\n",
+        f.repo.display()
+    );
+
+    for argv in [
+        vec!["diff", ".."],
+        vec!["diff-files", ".."],
+        vec!["diff-index", "HEAD", "--", ".."],
+        vec!["diff-index", "-Gx", "-Sx", "--", ".."],
+        vec!["diff-files", "-Gx", "-Sx", "--", ".."],
+    ] {
+        let (out, err, code) = f.run(&argv);
+        assert_eq!(code, 128, "{argv:?}: {out}{err}");
+        assert_eq!(err, want, "{argv:?}");
+    }
+}
+
+/// `parse_algorithm_value()` (`diff.c`) names four algorithms, and all four now
+/// select a real one in every diff verb:
+///
+/// ```c
+/// static int parse_algorithm_value(const char *value)
+/// {
+///         if (!value)
+///                 return -1;
+///         else if (!strcasecmp(value, "myers") || !strcasecmp(value, "default"))
+///                 return 0;
+///         else if (!strcasecmp(value, "minimal"))
+///                 return XDF_NEED_MINIMAL;
+///         else if (!strcasecmp(value, "patience"))
+///                 return XDF_PATIENCE_DIFF;
+///         else if (!strcasecmp(value, "histogram"))
+///                 return XDF_HISTOGRAM_DIFF;
+///         return -1;
+/// }
+/// ```
+///
+/// The fixture is chosen so stock 2.55.0 gives three *different* patches for the
+/// four names (myers == minimal, patience and histogram each its own), because a
+/// fixture where they coincide cannot tell "the algorithm ran" from "the flag was
+/// ignored" — which is exactly the failure this pins. The expected bytes below
+/// are stock's, captured under the parity environment.
+#[test]
+fn every_algorithm_name_selects_a_distinct_ported_xdiff() {
+    let f = Fixture::new("algorithms");
+    std::fs::write(
+        f.repo.join("alg.txt"),
+        "a\nb\nc\nd\ne\nf\ng\nh\na\nb\nc\nd\ne\nf\ng\nh\nx\ny\nz\na\nb\nc\n",
+    )
+    .unwrap();
+    f.ok(&["add", "alg.txt"]);
+    f.ok(&["commit", "-q", "-m", "alg"]);
+    std::fs::write(
+        f.repo.join("alg.txt"),
+        "x\na\nb\nc\nd\ne\nf\ng\nh\ny\na\nb\nc\nd\ne\nf\ng\nh\na\nb\nc\nz\n",
+    )
+    .unwrap();
+
+    const HEADER: &str = "diff --git a/alg.txt b/alg.txt\n\
+                          index 3043f60..7918bdd 100644\n\
+                          --- a/alg.txt\n\
+                          +++ b/alg.txt\n";
+    let myers = format!(
+        "{HEADER}@@ -1,3 +1,4 @@\n+x\n a\n b\n c\n@@ -6,6 +7,7 @@ e\n f\n g\n h\n+y\n a\n b\n c\n\
+         @@ -14,9 +16,7 @@ e\n f\n g\n h\n-x\n-y\n-z\n a\n b\n c\n+z\n"
+    );
+    let patience = format!(
+        "{HEADER}@@ -1,22 +1,22 @@\n-a\n-b\n-c\n-d\n-e\n-f\n-g\n-h\n-a\n-b\n-c\n-d\n-e\n-f\n\
+         -g\n-h\n x\n+a\n+b\n+c\n+d\n+e\n+f\n+g\n+h\n y\n+a\n+b\n+c\n+d\n+e\n+f\n+g\n+h\n+a\n\
+         +b\n+c\n z\n-a\n-b\n-c\n"
+    );
+    let histogram = format!(
+        "{HEADER}@@ -1,22 +1,22 @@\n-a\n-b\n-c\n-d\n-e\n-f\n-g\n-h\n-a\n-b\n-c\n-d\n-e\n-f\n\
+         -g\n-h\n x\n-y\n-z\n a\n b\n c\n+d\n+e\n+f\n+g\n+h\n+y\n+a\n+b\n+c\n+d\n+e\n+f\n+g\n\
+         +h\n+a\n+b\n+c\n+z\n"
+    );
+
+    // `myers`/`default` are one value, matched case-insensitively (`strcasecmp`),
+    // and `minimal` coincides with them on this input — under stock too, which is
+    // why it is asserted equal rather than distinct.
+    for value in ["myers", "MYERS", "default", "Default", "minimal"] {
+        let (out, err, code) =
+            f.run(&["diff-files", "-p", &format!("--diff-algorithm={value}"), "--", "alg.txt"]);
+        assert_eq!(code, 0, "{value}: {err}");
+        assert_eq!(out, myers, "--diff-algorithm={value}");
+    }
+
+    // The three spellings of one setting: `=<v>`, the separated form (an
+    // `OPT_CALLBACK_F` with a required argument), and the `OPT_BIT` alias.
+    for (value, want) in [("patience", &patience), ("histogram", &histogram)] {
+        let glued = format!("--diff-algorithm={value}");
+        let alias = format!("--{value}");
+        for argv in [
+            vec!["diff-files", "-p", glued.as_str(), "--", "alg.txt"],
+            vec!["diff-files", "-p", "--diff-algorithm", value, "--", "alg.txt"],
+            vec!["diff-files", "-p", alias.as_str(), "--", "alg.txt"],
+        ] {
+            let (out, err, code) = f.run(&argv);
+            assert_eq!(code, 0, "{argv:?}: {err}");
+            assert_eq!(out, *want, "{argv:?}");
+        }
+    }
+
+    // The same three patches through `diff` and `diff-index`, so the selection is
+    // not wired in one verb only. `diff` reads the worktree like `diff-files`;
+    // `diff-index --cached` would see no change, so it is given the staged pair.
+    for (value, want) in [("myers", &myers), ("patience", &patience), ("histogram", &histogram)] {
+        let glued = format!("--diff-algorithm={value}");
+        let (out, err, code) = f.run(&["diff", glued.as_str(), "--", "alg.txt"]);
+        assert_eq!(code, 0, "diff {value}: {err}");
+        assert_eq!(out, *want, "diff --diff-algorithm={value}");
+    }
+    f.ok(&["add", "alg.txt"]);
+    for (value, want) in [("myers", &myers), ("patience", &patience), ("histogram", &histogram)] {
+        let glued = format!("--diff-algorithm={value}");
+        let (out, err, code) = f.run(&[
+            "diff-index",
+            "-p",
+            "--cached",
+            glued.as_str(),
+            "HEAD",
+            "--",
+            "alg.txt",
+        ]);
+        assert_eq!(code, 0, "diff-index {value}: {err}");
+        assert_eq!(out, *want, "diff-index --diff-algorithm={value}");
+    }
+}
+
+/// The `return -1` arm of `parse_algorithm_value()`, which
+/// `diff_opt_diff_algorithm()` turns into `error()` — parse-options'
+/// `PARSE_OPT_ERROR`, i.e. a bare exit 129 with no usage block after it.
+#[test]
+fn an_unknown_algorithm_value_is_error_129_on_every_verb() {
+    let f = Fixture::new("algorithm-bad");
+    let want = "error: option diff-algorithm accepts \"myers\", \"minimal\", \"patience\" \
+                and \"histogram\"\n";
+
+    for verb in ["diff", "diff-index", "diff-files"] {
+        for value in ["bogus", "", "patienc"] {
+            let (out, err, code) = f.run(&[verb, &format!("--diff-algorithm={value}")]);
+            assert_eq!(code, 129, "{verb} --diff-algorithm={value}: {out}{err}");
+            assert_eq!(err, want, "{verb} --diff-algorithm={value}");
+        }
+        // The separated form reaches the same callback.
+        let (out, err, code) = f.run(&[verb, "--diff-algorithm", "bogus"]);
+        assert_eq!(code, 129, "{verb} --diff-algorithm bogus: {out}{err}");
+        assert_eq!(err, want, "{verb} --diff-algorithm bogus");
+    }
+}
+
+/// `cmd_diff()`'s two operand arrays (`builtin/diff.c:576-604`): a pending object
+/// is deref-tagged, a commit is replaced by its tree, and what is left is sorted
+/// into `ent` (trees) or `blob` (blobs) — a blob is its own arm, not a tree-ish
+/// that failed to peel.
+///
+/// ```c
+/// if (!ent.nr) {
+///         switch (blobs) {
+///         case 0:  builtin_diff_files(&rev, argc, argv); break;
+///         case 1:  if (paths != 1) usage(builtin_diff_usage);
+///                  builtin_diff_b_f(&rev, argc, argv, blob); break;
+///         case 2:  if (paths) usage(builtin_diff_usage);
+///                  builtin_diff_blobs(&rev, argc, argv, blob); break;
+///         default: usage(builtin_diff_usage);
+///         }
+/// }
+/// else if (blobs)
+///         usage(builtin_diff_usage);
+/// ```
+///
+/// Only the shapes that reach a `usage()` are pinned here: `builtin_diff_b_f()`
+/// and `builtin_diff_blobs()` are not ported and are refused rather than
+/// approximated, so asserting their output would be asserting a gap.
+#[test]
+fn a_blob_operand_takes_cmd_diffs_blob_arm_not_the_tree_dispatch() {
+    let f = Fixture::new("blob-operand");
+    let (blob, err, code) = f.run(&["rev-parse", "HEAD:f.txt"]);
+    assert_eq!(code, 0, "{err}");
+    let blob = blob.trim().to_string();
+
+    for argv in [
+        // `ent.nr == 0`, one blob, no path: `paths != 1` → usage.
+        vec!["diff", blob.as_str()],
+        // The mark is a flag; the operand under it is still a blob.
+        vec!["diff", &format!("^{blob}")],
+        // A range pends the blob *and* HEAD's tree: `ent.nr` is 1 and `blobs` is
+        // 1, which is the `else if (blobs) usage(...)` arm.
+        vec!["diff", &format!("{blob}..HEAD")],
+        // Same arm, reached with the two operands written out.
+        vec!["diff", blob.as_str(), "HEAD"],
+    ] {
+        let (out, err, code) = f.run(&argv);
+        assert_eq!(code, 129, "{argv:?}: {out}{err}");
+        assert!(
+            err.starts_with("usage: git diff [<options>] [<commit>] [--] [<path>...]\n"),
+            "{argv:?}: {err}"
+        );
+        // The gitoxide peel error this used to surface must not be back.
+        assert!(!err.contains("peel"), "{argv:?}: {err}");
+    }
+}
+
+/// The one place the exclusion mark changes `diff`'s *output* rather than only
+/// its diagnostics — `builtin_diff_tree()` (`builtin/diff.c:196-204`):
+///
+/// ```c
+/// /*
+///  * We saw two trees, ent0 and ent1.  If ent1 is uninteresting,
+///  * swap them.
+///  */
+/// if (ent1->item->flags & UNINTERESTING)
+///         swap = 1;
+/// oid[swap] = &ent0->item->oid;
+/// oid[1 - swap] = &ent1->item->oid;
+/// ```
+///
+/// It reads `ent1` alone, so the mark counts on the *second* operand and not the
+/// first. The unmarked spelling is asserted to differ, because a test where the
+/// two coincide cannot tell a working swap from no swap at all.
+#[test]
+fn an_uninteresting_second_tree_swaps_the_pre_image() {
+    let f = Fixture::new("tree-swap");
+    std::fs::write(f.repo.join("f.txt"), "a\nb\nc\nd\n").unwrap();
+    f.ok(&["add", "f.txt"]);
+    f.ok(&["commit", "-q", "-m", "c2"]);
+
+    let forward = f.run(&["diff", "HEAD~1", "HEAD", "--", "f.txt"]);
+    let reverse = f.run(&["diff", "HEAD", "HEAD~1", "--", "f.txt"]);
+    assert_eq!(forward.2, 0, "{}", forward.1);
+    assert_ne!(forward.0, reverse.0, "the fixture must make direction observable");
+
+    // `^` on the second operand: `ent1` is UNINTERESTING, so the pair swaps and
+    // the result is the *forward* diff.
+    let (out, err, code) = f.run(&["diff", "HEAD", "^HEAD~1", "--", "f.txt"]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(out, forward.0, "`HEAD ^HEAD~1` must diff HEAD~1 against HEAD");
+
+    // `^` on the first operand only: `ent1` is clean, no swap.
+    let (out, err, code) = f.run(&["diff", "^HEAD~1", "HEAD", "--", "f.txt"]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(out, forward.0, "`^HEAD~1 HEAD` is the plain forward diff");
+
+    // Both marked: `ent1` is still UNINTERESTING, so it still swaps.
+    let (out, err, code) = f.run(&["diff", "^HEAD", "^HEAD~1", "--", "f.txt"]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(out, forward.0, "`^HEAD ^HEAD~1` swaps on ent1 alone");
+}

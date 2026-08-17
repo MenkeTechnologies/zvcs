@@ -168,7 +168,7 @@
 
 use anyhow::{anyhow, bail, Result};
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{BinaryHeap, HashMap};
 use std::io::Write;
 use std::process::ExitCode;
 
@@ -903,7 +903,43 @@ pub fn fast_export(args: &[String]) -> Result<ExitCode> {
 
     // ---- Emission order: `rev-list [--topo-order|--date-order] --reverse`. ----
     let mut order_list: Vec<gix::traverse::commit::Info> = Vec::new();
-    if !tips.is_empty() {
+    if !tips.is_empty() && first_parent {
+        // `--first-parent` is the one mode where the two halves of git's walk
+        // disagree, so it gets git's own two-step rather than one traversal.
+        //
+        // `limit_list()` (revision.c:1438-1515) is the half `first_parent_only`
+        // reaches: it drains a `prio_queue` ordered by
+        // `compare_commits_by_commit_date` — newest first, insertion order
+        // breaking ties — and the `process_parents()` it calls for each commit
+        // `break`s after the first parent under that flag (revision.c:1211).
+        // What comes out is *which* commits are in `revs->commits`, in commit
+        // date order.
+        //
+        // That list is then handed to [`sort_in_topological_order`], which
+        // follows **every** parent link there is. A traversal that limits and
+        // orders in one pass cannot express the pair, and ordering a
+        // first-parent selection as if the second parents were absent is what
+        // puts a merge ahead of the side branch it merges.
+        let mut platform = repo
+            .rev_walk(tips.clone())
+            .sorting(gix::revision::walk::Sorting::ByCommitTime(
+                gix::traverse::commit::simple::CommitTimeOrder::NewestFirst,
+            ))
+            .first_parent_only();
+        if !hidden.is_empty() {
+            platform = platform.with_hidden(hidden.clone());
+        }
+        let mut limited: Vec<gix::traverse::commit::Info> = Vec::new();
+        for info in platform.all()? {
+            let info = info?;
+            limited.push(gix::traverse::commit::Info {
+                id: info.id,
+                parent_ids: info.parent_ids.clone(),
+                commit_time: info.commit_time,
+            });
+        }
+        order_list = sort_in_topological_order(limited, order);
+    } else if !tips.is_empty() {
         // git seeds `sort_in_topological_order` from the pending list and then
         // calls `prio_queue_reverse` on it, so that tips sharing a commit date
         // come back out in pending order. gix's topo queue keeps the seed order
@@ -925,11 +961,7 @@ pub fn fast_export(args: &[String]) -> Result<ExitCode> {
             Order::Topo => gix::traverse::commit::topo::Sorting::TopoOrder,
             Order::Date => gix::traverse::commit::topo::Sorting::DateOrder,
         })
-        .parents(if first_parent {
-            gix::traverse::commit::Parents::First
-        } else {
-            gix::traverse::commit::Parents::All
-        })
+        .parents(gix::traverse::commit::Parents::All)
         .build()?;
         for info in topo {
             order_list.push(info?);
@@ -1242,6 +1274,12 @@ fn add_rev_token(
     }
     if let Some((l, r)) = tok.split_once("...") {
         let (l, r) = (default_head(l), default_head(r));
+        // `handle_dotdot_1()` resolves both endpoints *before* either is looked
+        // up, and joins the two `repo_get_oid_with_context()` calls with `||` —
+        // so the warning set belongs to the token, not to the endpoint
+        // resolutions below, which stop at the first absent object and would
+        // leave the right endpoint unwarned.
+        let _quiet = warn_range_once(repo, tok);
         let (lc, rc) = (commit_of(repo, l).ok_or(())?, commit_of(repo, r).ok_or(())?);
         // `handle_dotdot_1` (revision.c:2087-2107): the merge bases go in under
         // `flags_exclude` (`flags ^ (UNINTERESTING | BOTTOM)`) and both endpoints
@@ -1264,6 +1302,7 @@ fn add_rev_token(
     if let Some((l, r)) = tok.split_once("..") {
         // `b_flags = flags; a_flags = flags_exclude` (revision.c:2083-2086).
         let (l, r) = (default_head(l), default_head(r));
+        let _quiet = warn_range_once(repo, tok);
         let lc = commit_of(repo, l).ok_or(())?;
         let rc = commit_of(repo, r).ok_or(())?;
         sel.args
@@ -1276,6 +1315,38 @@ fn add_rev_token(
     sel.args
         .push(CmdArg::Rev(pending(repo, tok, tok, id, negated)));
     Ok(())
+}
+
+/// `handle_dotdot_1()`'s share of `get_oid_basic()`'s ambiguity warning for a
+/// range operand, plus the guard that keeps the resolution which follows from
+/// adding a second one.
+///
+/// The two things have to happen together. git resolves a range's endpoints in
+/// one `||`-joined pair:
+///
+/// ```c
+/// if (repo_get_oid_with_context(revs->repo, a_name, oc_flags, &a_oid, a_oc) ||
+///     repo_get_oid_with_context(revs->repo, b_name, oc_flags, &b_oid, b_oc))
+///         return -1;
+/// a_obj = parse_object(revs->repo, &a_oid);
+/// b_obj = parse_object(revs->repo, &b_oid);
+/// ```
+///
+/// — so *both* endpoints are resolved, and both warn, before either object is
+/// looked up. [`commit_of`] cannot reproduce that on its own: it fails on the
+/// left endpoint the moment that endpoint's object is missing, which for a
+/// full-length hex is exactly the case that warns, and the right endpoint then
+/// never resolves and never warns.
+/// [`crate::objname::warn_dotdot_endpoints`] carries the `||`'s own
+/// short-circuit — a left endpoint that does not resolve *at all* still stops
+/// the right one.
+///
+/// The returned guard must be held for as long as the endpoint resolutions run;
+/// dropping it early puts the warning back on and doubles the count.
+#[must_use = "the guard silences the endpoint resolutions and must outlive them"]
+fn warn_range_once(repo: &gix::Repository, tok: &str) -> crate::objname::AmbiguityWarnings {
+    crate::objname::warn_dotdot_endpoints(repo, tok);
+    crate::objname::AmbiguityWarnings::off()
 }
 
 /// Build one [`Pending`], dwimming the name git's `add_rev_cmdline` records.
@@ -1303,6 +1374,188 @@ fn dedup_first_wins(ids: &mut Vec<ObjectId>) {
     let mut seen = std::collections::HashSet::new();
     ids.retain(|id| seen.insert(*id));
 }
+
+/// git's `sort_in_topological_order()` (commit.c:945-1054), the sort every
+/// `fast-export` stream comes out of.
+///
+/// `cmd_fast_export()` sets `revs.topo_order = 1` (builtin/fast-export.c:1377),
+/// and with no commit-graph to supply generation numbers `setup_revisions()`
+/// turns that into `revs->limited = 1`:
+///
+/// ```c
+/// if (revs->topo_order && !generation_numbers_enabled(the_repository))
+///         revs->limited = 1;
+/// ```
+///
+/// (revision.c:3157-3158) — so `prepare_revision_walk()` takes the
+/// `limit_list()` + `sort_in_topological_order()` branch and never
+/// `init_topo_walk()` (revision.c:4011-4017).
+///
+/// The function is reproduced here because of what it does **not** contain:
+/// there is no `first_parent_only` test anywhere in it. `limit_list()` already
+/// chose the members of the list; this only orders them, and it counts
+/// in-degrees and enqueues parents over the *whole* parent list:
+///
+/// ```c
+/// for (next = orig; next; next = next->next) {
+///         struct commit_list *parents = next->item->parents;
+///         while (parents) {
+///                 struct commit *parent = parents->item;
+///                 int *pi = indegree_slab_at(&indegree, parent);
+///                 if (*pi)
+///                         (*pi)++;
+///                 parents = parents->next;
+///         }
+/// }
+/// ```
+///
+/// `if (*pi)` is what keeps it to the list: the slab is 0 for every commit
+/// `limit_list()` left out, and the emission loop skips those the same way.
+///
+/// The queue is git's `prio_queue`, which is a **LIFO stack** while
+/// `compare == NULL` (prio-queue.c:49 and 86) — that is `REV_SORT_IN_GRAPH_ORDER`,
+/// i.e. plain `--topo-order`. The seed is therefore reversed
+/// (`prio_queue_reverse`) so the tips come back out in list order, exactly the
+/// comment git leaves there. `--date-order` installs
+/// `compare_commits_by_commit_date` instead (commit.c:930-940), making it a
+/// newest-first heap with insertion order breaking ties (prio-queue.c:4-11), and
+/// is left un-reversed.
+fn sort_in_topological_order(
+    list: Vec<gix::traverse::commit::Info>,
+    order: Order,
+) -> Vec<gix::traverse::commit::Info> {
+    if list.is_empty() {
+        return list;
+    }
+    let info_of: HashMap<ObjectId, &gix::traverse::commit::Info> =
+        list.iter().map(|i| (i.id, i)).collect();
+
+    // "Mark them and clear the indegree", then "update the indegree". A commit
+    // outside the list has no slab entry at all, which is git's implicit 0.
+    let mut indegree: HashMap<ObjectId, usize> = list.iter().map(|i| (i.id, 1)).collect();
+    for info in &list {
+        for parent in info.parent_ids.iter() {
+            if let Some(pi) = indegree.get_mut(parent) {
+                if *pi != 0 {
+                    *pi += 1;
+                }
+            }
+        }
+    }
+
+    // "find the tips": the list members nothing else in the list reaches.
+    let mut queue = TopoQueue::new(order);
+    for info in &list {
+        if indegree.get(&info.id) == Some(&1) {
+            queue.put(info);
+        }
+    }
+    queue.reverse_if_lifo();
+
+    let mut out: Vec<gix::traverse::commit::Info> = Vec::with_capacity(list.len());
+    while let Some(commit) = queue.get() {
+        for parent in commit.parent_ids.iter() {
+            let Some(pi) = indegree.get_mut(parent) else {
+                continue;
+            };
+            if *pi == 0 {
+                continue;
+            }
+            *pi -= 1;
+            // "parents are only enqueued for emission when all their children
+            // have been emitted thereby guaranteeing topological order."
+            if *pi == 1 {
+                queue.put(info_of[parent]);
+            }
+        }
+        indegree.insert(commit.id, 0);
+        out.push(commit.clone());
+    }
+    out
+}
+
+/// git's `prio_queue` (prio-queue.c) in the two shapes
+/// [`sort_in_topological_order`] uses it: a LIFO stack for
+/// `REV_SORT_IN_GRAPH_ORDER` and a newest-commit-date-first heap for
+/// `REV_SORT_BY_COMMIT_DATE`.
+enum TopoQueue<'a> {
+    /// `queue.compare = NULL`, which `prio_queue_put`/`prio_queue_get` then
+    /// treat as a plain stack — append at the end, take from the end.
+    Lifo(Vec<&'a gix::traverse::commit::Info>),
+    /// `queue.compare = compare_commits_by_commit_date`, with `inserted`
+    /// standing in for the entry `ctr` git's `compare()` falls back to.
+    ByDate { heap: BinaryHeap<Newest<'a>>, inserted: u64 },
+}
+
+impl<'a> TopoQueue<'a> {
+    fn new(order: Order) -> Self {
+        match order {
+            Order::Topo => TopoQueue::Lifo(Vec::new()),
+            Order::Date => TopoQueue::ByDate { heap: BinaryHeap::new(), inserted: 0 },
+        }
+    }
+
+    fn put(&mut self, info: &'a gix::traverse::commit::Info) {
+        match self {
+            TopoQueue::Lifo(entries) => entries.push(info),
+            TopoQueue::ByDate { heap, inserted } => {
+                heap.push(Newest { info, ctr: *inserted });
+                *inserted += 1;
+            }
+        }
+    }
+
+    /// `prio_queue_reverse()`, which git calls only for
+    /// `REV_SORT_IN_GRAPH_ORDER` — and `BUG()`s on any queue with a `compare`,
+    /// which is why the other shape has nothing to do here.
+    fn reverse_if_lifo(&mut self) {
+        if let TopoQueue::Lifo(entries) = self {
+            entries.reverse();
+        }
+    }
+
+    fn get(&mut self) -> Option<&'a gix::traverse::commit::Info> {
+        match self {
+            // `return queue->array[--queue->nr].data; /* LIFO */`
+            TopoQueue::Lifo(entries) => entries.pop(),
+            TopoQueue::ByDate { heap, .. } => heap.pop().map(|e| e.info),
+        }
+    }
+}
+
+/// One heap entry, ordered so that `BinaryHeap`'s *maximum* is the element
+/// `prio_queue_get` would return.
+///
+/// `compare_commits_by_commit_date` (commit.c:930-940) returns -1 for the newer
+/// commit and git's `prio_queue` pops its minimum, so the newest date wins; when
+/// the comparison is 0 the entry with the smaller insertion counter wins
+/// (prio-queue.c:4-11). Both are inverted here because the heap pops the
+/// greatest.
+struct Newest<'a> {
+    info: &'a gix::traverse::commit::Info,
+    ctr: u64,
+}
+
+impl Ord for Newest<'_> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        let (a, b) = (self.info.commit_time.unwrap_or(0), other.info.commit_time.unwrap_or(0));
+        a.cmp(&b).then_with(|| other.ctr.cmp(&self.ctr))
+    }
+}
+
+impl PartialOrd for Newest<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for Newest<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for Newest<'_> {}
 
 /// An omitted range endpoint means `HEAD`, as in `..main` or `main..`.
 fn default_head(s: &str) -> &str {
@@ -1570,16 +1823,18 @@ fn rewrite_one(mut id: ObjectId, simpl: &HashMap<ObjectId, Simpl>) -> Option<Obj
 }
 
 /// Resolve a revision to the id of the commit it names, peeling tags.
+///
+/// `handle_revision_arg_1()` reaches `repo_get_oid_with_context()` once for each
+/// name it takes off the command line — the single operand, or each endpoint of
+/// a range — so this is where [`crate::objname::resolve`] belongs and where
+/// `get_oid_basic()`'s `warning: refname … is ambiguous.` is emitted. Resolving
+/// through it rather than `rev_parse_single()` also keeps git's ordering: a
+/// full-length hex is decoded without asking the object database, so an id whose
+/// object is missing gets past this and fails at the `parse_object()` below,
+/// which is what `get_reference()`'s `bad object` diagnostic reports on.
 fn commit_of(repo: &gix::Repository, spec: &str) -> Option<ObjectId> {
-    Some(
-        repo.rev_parse_single(spec)
-            .ok()?
-            .object()
-            .ok()?
-            .peel_to_commit()
-            .ok()?
-            .id,
-    )
+    let id = crate::objname::resolve(repo, spec)?;
+    Some(repo.find_object(id).ok()?.peel_to_commit().ok()?.id)
 }
 
 /// git's `repo_dwim_ref`: the fully-resolved ref name a spec names, if any.

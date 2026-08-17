@@ -770,6 +770,21 @@ fn parse_args(
     }
     let mut unrecognized: Option<String> = None;
     let mut seen_dashdash = false;
+    // The revision operands this pass has accepted, for [`warn_up_to`].
+    let mut accepted: Vec<&str> = Vec::new();
+
+    // `setup_revisions()` resolves each operand as it reads it, so
+    // `get_oid_basic()`'s warnings for every token up to and including the one
+    // that failed are already on stderr by the time it dies. This pass resolves
+    // nothing and prints nothing on the path that succeeds — the walk in
+    // [`super::log::whatchanged`] emits them there — so the paths that die
+    // replay them here, in argv order, immediately before the fatal.
+    let warn_up_to = |accepted: &[&str], failing: &str| {
+        for spec in accepted {
+            super::log::warn_operand(repo, spec, true);
+        }
+        super::log::warn_operand(repo, failing, true);
+    };
 
     let mut i = 0;
     while i < args.len() {
@@ -810,6 +825,7 @@ fn parse_args(
         // argument reaching here is always one `setup_revisions()` would still let
         // be a filename.
         if let Some(message) = super::log::early_revision_fatal(repo, a, false) {
+            warn_up_to(&accepted, a);
             return Err(Fatal::raw(message));
         }
 
@@ -819,6 +835,7 @@ fn parse_args(
                 return Err(Fatal::die(format!("bad revision '{a}'")));
             }
             accept_rev(repo, &st, a, &mut p)?;
+            accepted.push(a);
             i += 1;
             continue;
         }
@@ -830,13 +847,21 @@ fn parse_args(
         let parent_dir = crate::objname::is_parent_directory_pathspec(a, args.iter().any(|x| x == "--"));
         if !parent_dir && !a.is_empty() && repo.rev_parse(a).is_ok() {
             accept_rev(repo, &st, a, &mut p)?;
+            accepted.push(a);
             i += 1;
             continue;
         }
 
         // Not a revision: this argument and every one after it must be a filename.
+        // `handle_revision_arg()` had already resolved what it could of this token
+        // before returning non-zero, so its warnings precede the fatal
+        // `verify_filename()` raises — `git whatchanged <40-hex-ref>..nosuch` warns
+        // about the left endpoint and only then dies.
         for (n, arg) in args[i..].iter().enumerate() {
-            verify_filename(arg, n == 0)?;
+            if let Err(fatal) = verify_filename(arg, n == 0) {
+                warn_up_to(&accepted, a);
+                return Err(fatal);
+            }
         }
         p.pathspecs.extend(args[i..].iter().cloned());
         break;

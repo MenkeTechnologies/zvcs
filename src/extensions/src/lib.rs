@@ -86,12 +86,8 @@ pub fn chdir_global(dir: &str) -> Result<(), String> {
     if dir.is_empty() {
         return Ok(());
     }
-    std::env::set_current_dir(dir).map_err(|e| {
-        // `strerror(errno)` has no Rust ` (os error <n>)` tail.
-        let text = e.to_string();
-        let text = text.split(" (os error ").next().unwrap_or(&text);
-        format!("cannot change to '{dir}': {text}")
-    })
+    std::env::set_current_dir(dir)
+        .map_err(|e| format!("cannot change to '{dir}': {}", errno_text(&e)))
 }
 
 /// `usage(git_usage_string)` after one of `handle_options`' "no value given"
@@ -103,6 +99,382 @@ fn usage_missing_value(reason: &str) -> ExitCode {
     eprintln!("{reason}");
     eprintln!("usage: {}", porcelain::help::GIT_USAGE_STRING);
     ExitCode::from(129)
+}
+
+/// One `git_config_push_split_parameter()` pair — a command-line configuration
+/// override from `-c <name>[=<value>]` or `--config-env <name>=<envvar>`.
+///
+/// `value` is `None` for the bool-only `-c <name>` form, which git records with
+/// no `=` in `GIT_CONFIG_PARAMETERS` and reads back as true.
+pub struct ConfigOverride {
+    key: String,
+    value: Option<String>,
+}
+
+/// What one pass of [`handle_options`] left behind.
+pub enum Handled {
+    /// The number of leading tokens consumed; the command begins after them.
+    Consumed(usize),
+    /// The pass finished the process' work — a query global that printed and
+    /// exits, or a failure it already reported. Leave with this code.
+    Exit(ExitCode),
+}
+
+/// Faithful port of git.c's `handle_options()`, the loop that consumes the
+/// git-global options ahead of the subcommand.
+///
+/// git runs this same function twice: once over the command line in `cmd_main`,
+/// and again over every alias expansion inside `run_argv`'s loop — which is why
+/// it lives here rather than being written once per caller. The alias caller is
+/// the one that passes a non-null `envchanged` in the C, and it is set by every
+/// option that reaches a child process through the environment; `handle_alias`
+/// then refuses the alias outright ([`alias::resolve`]).
+///
+/// Four details of the C shape the control flow:
+///
+/// * The loop stops at the first token that does not start with `-`, and also at
+///   `-h`/`--help`/`-v`/`--version`, which `cmd_main` rewrites into the `help`
+///   and `version` verbs afterwards. Anything else beginning with `-` is either
+///   a known global or `unknown option: <x>` + usage, exit 129 — there is no
+///   "leave it for the dispatcher" path. `--super-prefix` was one of the known
+///   globals until 2.45 removed it, so on 2.55 it is an unknown option like any
+///   other.
+/// * `-c` is *pushed*, not parsed: git validates a command-line override only
+///   when the configuration is first read, which is why `git -c foo --version`
+///   succeeds. See [`validate_config_overrides`].
+/// * `--exec-path` is a `skip_prefix` test, so it also matches spellings that
+///   merely *begin* with it; only `=` after the prefix means "set". The bare
+///   option, `--html-path`, `--man-path` and `--info-path` print one directory
+///   and exit 0, ignoring everything after them.
+/// * The loop can consume the entire command line. `--shallow-file` takes the
+///   next token unconditionally (`git --shallow-file log` uses `log` as the
+///   file name), and `--bare` needs no argument at all, so reaching the end
+///   with no verb left is a normal outcome — `cmd_main` prints the usage block
+///   and exits 1 for it.
+///
+/// One branch of the C is deliberately absent: `--list-cmds=<what>`, which git
+/// answers from its `commands[]` table plus `command-list.txt` categories. This
+/// port's verb set is not git's, so the answer could not match either way; the
+/// option currently falls through to `unknown option`.
+pub fn handle_options(
+    argv: &[String],
+    pager_forced: &mut Option<bool>,
+    overrides: &mut Vec<ConfigOverride>,
+    envchanged: &mut bool,
+) -> Handled {
+    let mut idx = 0;
+    while idx < argv.len() {
+        let cmd = argv[idx].as_str();
+        if !cmd.starts_with('-') {
+            break;
+        }
+        // "For legacy reasons, the version and help commands can be written
+        // with -- prepended to make them look like flags."
+        if matches!(cmd, "--help" | "-h" | "--version" | "-v") {
+            break;
+        }
+
+        match cmd {
+            // `skip_prefix(cmd, "--exec-path", &cmd)` is a *prefix* test, and the
+            // only thing looked at afterwards is whether the remainder starts with
+            // `=`. So `--exec-path=<dir>` sets the directory, and every other
+            // spelling that merely begins with `--exec-path` — the bare option and
+            // `--exec-pathZZZ` alike — prints the directory and exits 0 with the
+            // remainder ignored. It is the first branch of the chain, so no later
+            // option can be shadowed by the prefix.
+            s if s.starts_with("--exec-path") => {
+                match s["--exec-path".len()..].strip_prefix('=') {
+                    Some(dir) => {
+                        std::env::set_var("GIT_EXEC_PATH", dir);
+                        idx += 1;
+                    }
+                    None => {
+                        println!("{}", exec_path());
+                        return Handled::Exit(ExitCode::SUCCESS);
+                    }
+                }
+            }
+            // The three `print_system_path()` queries beside it in
+            // `handle_options`: each prints one directory of the installation and
+            // exits, ignoring whatever follows. git's prefix is its build's; this
+            // port's is `$ZVCS_HOME`, which is where its man pages, HTML pages and
+            // info tree are installed — the same paths `git help -m/-w/-i` resolve
+            // against, so a scripted `git --html-path` and `git help -w` agree.
+            //
+            // `--html-path` is the one that can name a directory outside that
+            // prefix: `git help -w <cmd>` opens the git installation's own HTML
+            // manual where the host has one, so that is the directory reported,
+            // and the generated set only when it does not.
+            "--html-path" => {
+                println!("{}", superset::htmldoc::reported_dir().display());
+                return Handled::Exit(ExitCode::SUCCESS);
+            }
+            "--man-path" => {
+                println!("{}", superset::manpage::man_dir().display());
+                return Handled::Exit(ExitCode::SUCCESS);
+            }
+            "--info-path" => {
+                println!("{}", porcelain::help::info_dir().display());
+                return Handled::Exit(ExitCode::SUCCESS);
+            }
+            "-p" | "--paginate" => {
+                *pager_forced = Some(true);
+                idx += 1;
+            }
+            "-P" | "--no-pager" => {
+                *pager_forced = Some(false);
+                *envchanged = true;
+                idx += 1;
+            }
+            "--no-replace-objects" => {
+                std::env::set_var("GIT_NO_REPLACE_OBJECTS", "1");
+                *envchanged = true;
+                idx += 1;
+            }
+            // `--git-dir`/`--work-tree`/`--namespace`/`--attr-source` set the
+            // well-known environment variables, in both the `--flag <val>` and
+            // `--flag=<val>` forms. Each is its own arm in the C with its own
+            // "no value given" wording, which is what the table reproduces.
+            "--git-dir" | "--work-tree" | "--namespace" | "--attr-source" => {
+                let (key, missing) = match cmd {
+                    "--git-dir" => ("GIT_DIR", "no directory given for '--git-dir' option"),
+                    "--work-tree" => ("GIT_WORK_TREE", "no directory given for '--work-tree' option"),
+                    "--namespace" => ("GIT_NAMESPACE", "no namespace given for --namespace"),
+                    _ => ("GIT_ATTR_SOURCE", "no attribute source given for --attr-source"),
+                };
+                let Some(val) = argv.get(idx + 1) else {
+                    return Handled::Exit(usage_missing_value(missing));
+                };
+                std::env::set_var(key, val);
+                *envchanged = true;
+                idx += 2;
+            }
+            s if s.starts_with("--git-dir=") => {
+                std::env::set_var("GIT_DIR", &s["--git-dir=".len()..]);
+                *envchanged = true;
+                idx += 1;
+            }
+            s if s.starts_with("--work-tree=") => {
+                std::env::set_var("GIT_WORK_TREE", &s["--work-tree=".len()..]);
+                *envchanged = true;
+                idx += 1;
+            }
+            s if s.starts_with("--namespace=") => {
+                std::env::set_var("GIT_NAMESPACE", &s["--namespace=".len()..]);
+                *envchanged = true;
+                idx += 1;
+            }
+            s if s.starts_with("--attr-source=") => {
+                std::env::set_var("GIT_ATTR_SOURCE", &s["--attr-source=".len()..]);
+                *envchanged = true;
+                idx += 1;
+            }
+            // `--bare` names the *current directory* as the repository, with
+            // `setenv(…, 0)` so an inherited `$GIT_DIR` still wins, and turns off
+            // the implicit work tree. git dies from `xgetcwd()` when the cwd
+            // cannot be read, which is `die_errno` and so 128.
+            "--bare" => {
+                let cwd = match std::env::current_dir() {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("fatal: unable to get current working directory: {}", errno_text(&e));
+                        return Handled::Exit(ExitCode::from(fatal::EXIT_FATAL));
+                    }
+                };
+                if std::env::var_os("GIT_DIR").is_none() {
+                    std::env::set_var("GIT_DIR", cwd);
+                }
+                std::env::set_var("GIT_IMPLICIT_WORK_TREE", "0");
+                *envchanged = true;
+                idx += 1;
+            }
+            "-c" => {
+                let Some(text) = argv.get(idx + 1) else {
+                    return Handled::Exit(usage_missing_value("-c expects a configuration string"));
+                };
+                // `git_config_push_parameter()`: split at the *first* `=`, so a
+                // value keeps every later one; a missing `=` is the bool-only form.
+                let (key, value) = match text.split_once('=') {
+                    Some((k, v)) => (k.to_string(), Some(v.to_string())),
+                    None => (text.clone(), None),
+                };
+                push_config_override(overrides, ConfigOverride { key, value });
+                idx += 2;
+            }
+            // `--config-env <name>=<envvar>` reads the value out of the
+            // environment instead of the command line. Unlike `-c` its three
+            // failures are `die()` at push time, so they are reported here and
+            // exit 128 — and the *key* is still left for the deferred check.
+            "--config-env" => {
+                let Some(spec) = argv.get(idx + 1) else {
+                    return Handled::Exit(usage_missing_value("no config key given for --config-env"));
+                };
+                if let Some(code) = push_config_env(overrides, &spec) {
+                    return Handled::Exit(code);
+                }
+                idx += 2;
+            }
+            s if s.starts_with("--config-env=") => {
+                if let Some(code) = push_config_env(overrides, &s["--config-env=".len()..]) {
+                    return Handled::Exit(code);
+                }
+                idx += 1;
+            }
+            "--literal-pathspecs" => {
+                std::env::set_var("GIT_LITERAL_PATHSPECS", "1");
+                *envchanged = true;
+                idx += 1;
+            }
+            "--no-literal-pathspecs" => {
+                std::env::set_var("GIT_LITERAL_PATHSPECS", "0");
+                *envchanged = true;
+                idx += 1;
+            }
+            "--glob-pathspecs" => {
+                std::env::set_var("GIT_GLOB_PATHSPECS", "1");
+                *envchanged = true;
+                idx += 1;
+            }
+            "--noglob-pathspecs" => {
+                std::env::set_var("GIT_NOGLOB_PATHSPECS", "1");
+                *envchanged = true;
+                idx += 1;
+            }
+            "--icase-pathspecs" => {
+                std::env::set_var("GIT_ICASE_PATHSPECS", "1");
+                *envchanged = true;
+                idx += 1;
+            }
+            "--no-optional-locks" => {
+                std::env::set_var("GIT_OPTIONAL_LOCKS", "0");
+                *envchanged = true;
+                idx += 1;
+            }
+            "--no-lazy-fetch" => {
+                std::env::set_var("GIT_NO_LAZY_FETCH", "1");
+                *envchanged = true;
+                idx += 1;
+            }
+            "--no-advice" => {
+                std::env::set_var("GIT_ADVICE", "0");
+                *envchanged = true;
+                idx += 1;
+            }
+            // `--shallow-file <path>` overrides the repository's shallow list for
+            // this process only — git sets it on `the_repository` rather than in
+            // the environment, so there is nothing to hand a child. The argument
+            // is consumed the way the C consumes it so the verb after it is still
+            // found; the override itself is not honored yet.
+            //
+            // The C takes the next token without checking that there is one:
+            // `git --shallow-file` alone reads past the end of `argv` and stock
+            // 2.55.0 dies of the signal (observed exit 139). The bounds test here
+            // is the one deliberate departure — a NULL dereference is not a
+            // behaviour to reproduce — and leaves the command line empty, which
+            // `cmd_main` answers with the usage block and exit 1.
+            "--shallow-file" => {
+                *envchanged = true;
+                idx += if idx + 1 < argv.len() { 2 } else { 1 };
+            }
+            // `-C <path>` chdirs, guarded by `if ((*argv)[1][0])` — an empty path
+            // is a deliberate no-op that succeeds and stays put, and does *not*
+            // count as an environment change for an alias. The failure is
+            // `die_errno`, so it carries the bare `strerror` text and exits 128.
+            "-C" => {
+                let Some(dir) = argv.get(idx + 1) else {
+                    return Handled::Exit(usage_missing_value("no directory given for '-C' option"));
+                };
+                if !dir.is_empty() {
+                    if let Err(msg) = chdir_global(dir) {
+                        eprintln!("fatal: {msg}");
+                        return Handled::Exit(ExitCode::from(fatal::EXIT_FATAL));
+                    }
+                    *envchanged = true;
+                }
+                idx += 2;
+            }
+            _ => {
+                eprintln!("unknown option: {cmd}");
+                eprintln!("usage: {}", porcelain::help::GIT_USAGE_STRING);
+                return Handled::Exit(ExitCode::from(129));
+            }
+        }
+    }
+    Handled::Consumed(idx)
+}
+
+/// `strerror(errno)` without the ` (os error <n>)` tail Rust appends, so a
+/// `die_errno` message reads exactly as git's does.
+fn errno_text(e: &std::io::Error) -> String {
+    let text = e.to_string();
+    text.split(" (os error ").next().unwrap_or(&text).to_string()
+}
+
+/// Port of config.c's `git_config_push_env()`: `--config-env <name>=<envvar>`
+/// takes the value from the environment, splitting at the **last** `=` so the
+/// key may contain one.
+///
+/// All three failures are `die()`, so they are reported here and exit 128. The
+/// key itself is not checked — git validates it when the configuration is read,
+/// which [`validate_config_overrides`] does.
+fn push_config_env(overrides: &mut Vec<ConfigOverride>, spec: &str) -> Option<ExitCode> {
+    let Some(split) = spec.rfind('=') else {
+        eprintln!("fatal: invalid config format: {spec}");
+        return Some(ExitCode::from(fatal::EXIT_FATAL));
+    };
+    let (key, env_name) = (&spec[..split], &spec[split + 1..]);
+    if env_name.is_empty() {
+        eprintln!("fatal: missing environment variable name for configuration '{key}'");
+        return Some(ExitCode::from(fatal::EXIT_FATAL));
+    }
+    let Some(value) = std::env::var_os(env_name) else {
+        eprintln!("fatal: missing environment variable '{env_name}' for configuration '{key}'");
+        return Some(ExitCode::from(fatal::EXIT_FATAL));
+    };
+    push_config_override(
+        overrides,
+        ConfigOverride {
+            key: key.to_string(),
+            value: Some(value.to_string_lossy().into_owned()),
+        },
+    );
+    None
+}
+
+/// git's deferred validation of the command-line configuration, run at the point
+/// the configuration would first be read: `error: <reason>` for the first key
+/// that fails, then `fatal: unable to parse command-line config`, exit 128.
+///
+/// git has no such point — `git_config_from_parameters()` is called by whatever
+/// reads config first, so a command that never reads any (`git -c foo version`,
+/// `git -c foo --exec-path`) never notices a bad key. This port has no single
+/// place where config is read either, so the check runs once, here, after the
+/// `version`/`help` rewrite that `cmd_main` does; `version` and a bare `help`
+/// are the two verbs it exempts, both confirmed silent under stock 2.55.0.
+pub(crate) fn validate_config_overrides(
+    overrides: &[ConfigOverride],
+    sub: &str,
+    rest: &[String],
+) -> Option<ExitCode> {
+    if sub == "version" || (sub == "help" && rest.is_empty()) {
+        return None;
+    }
+    report_bad_config_overrides(overrides)
+}
+
+/// The diagnostic half of [`validate_config_overrides`], for the places that
+/// read configuration unconditionally rather than only when the command does.
+///
+/// [`alias::resolve`] is the caller: `alias_lookup()` reads the configuration
+/// on every turn of `run_argv`'s loop whatever the command turns out to be, so
+/// there is no verb to exempt there.
+pub(crate) fn report_bad_config_overrides(overrides: &[ConfigOverride]) -> Option<ExitCode> {
+    let reason = overrides
+        .iter()
+        .find_map(|o| config::check_config_key(&o.key).err())?;
+    eprintln!("error: {reason}");
+    eprintln!("fatal: unable to parse command-line config");
+    Some(ExitCode::from(fatal::EXIT_FATAL))
 }
 
 /// Parse `argv`, dispatch the subcommand, and return the process exit code.
@@ -121,120 +493,35 @@ fn run_command() -> ExitCode {
     }
     let from_dashed = from_dashed.is_some();
 
-    // Consume the leading git-global options we support, so `git -C <dir> <verb>`
-    // (extremely common in scripts and tooling) reaches the verb instead of
-    // treating `-C` as the subcommand. `-C <dir>` chdirs (before autostart /
-    // failure-surfacing, which key off the cwd); the pager flags force paging on
-    // (`-p`/`--paginate`) or off (`-P`/`--no-pager`). A global given without its
-    // value ends the same way `handle_options()` does: the complaint, git's usage
-    // block, exit 129. A global this loop has never heard of is left in place and
-    // surfaces as an unknown verb rather than being silently mishandled — which is
-    // a divergence from git's `unknown option: --<x>` + usage (129).
-    let mut idx = 0;
+    // git.c's `handle_options()` — the git-global option layer that runs before
+    // any subcommand is dispatched. `-C <dir>` chdirs here (before autostart /
+    // failure-surfacing, which key off the cwd), the pager flags force paging on
+    // or off, and the environment-carried globals are exported for the verb and
+    // for any child it runs. Anything else that begins with `-`, other than the
+    // `-h`/`--help`/`-v`/`--version` legacy spellings the loop stops at, is
+    // `unknown option: <x>` + usage, exit 129.
     let mut pager_forced: Option<bool> = None;
-    // `-c <name>=<value>` overrides, collected and injected into gix's config
-    // resolution via git's `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_N`/…_VALUE_N env
-    // mechanism (which gix-config reads), so `git -c foo.bar=x <verb>` behaves
-    // exactly as git does — tooling and the submodule re-exec path rely on it.
-    let mut config_overrides: Vec<String> = Vec::new();
-    while idx < raw.len() {
-        match raw[idx].as_str() {
-            "-C" => {
-                let Some(dir) = raw.get(idx + 1) else {
-                    return usage_missing_value("no directory given for '-C' option");
-                };
-                if let Err(msg) = chdir_global(dir) {
-                    eprintln!("fatal: {msg}");
-                    return ExitCode::from(fatal::EXIT_FATAL);
-                }
-                idx += 2;
-            }
-            "-c" => {
-                let Some(pair) = raw.get(idx + 1) else {
-                    return usage_missing_value("-c expects a configuration string");
-                };
-                config_overrides.push(pair.clone());
-                idx += 2;
-            }
-            "-p" | "--paginate" => {
-                pager_forced = Some(true);
-                idx += 1;
-            }
-            "-P" | "--no-pager" => {
-                pager_forced = Some(false);
-                idx += 1;
-            }
-            // `--git-dir`/`--work-tree`/`--namespace` set the well-known env vars
-            // gix honors, in both the `--flag <val>` and `--flag=<val>` forms.
-            "--git-dir" | "--work-tree" | "--namespace" => {
-                let (key, missing) = match raw[idx].as_str() {
-                    "--git-dir" => ("GIT_DIR", "no directory given for '--git-dir' option"),
-                    "--work-tree" => ("GIT_WORK_TREE", "no directory given for '--work-tree' option"),
-                    _ => ("GIT_NAMESPACE", "no namespace given for --namespace"),
-                };
-                let Some(val) = raw.get(idx + 1) else {
-                    return usage_missing_value(missing);
-                };
-                std::env::set_var(key, val);
-                idx += 2;
-            }
-            s if s.starts_with("--git-dir=") => {
-                std::env::set_var("GIT_DIR", &s["--git-dir=".len()..]);
-                idx += 1;
-            }
-            s if s.starts_with("--work-tree=") => {
-                std::env::set_var("GIT_WORK_TREE", &s["--work-tree=".len()..]);
-                idx += 1;
-            }
-            s if s.starts_with("--namespace=") => {
-                std::env::set_var("GIT_NAMESPACE", &s["--namespace=".len()..]);
-                idx += 1;
-            }
-            // `git --exec-path` (no value) prints the core-programs directory and
-            // exits, ignoring any following command — git's `handle_options`. For the
-            // shadow that is where its `git-*` helpers live (`~/.zvcs/bin`), or
-            // `$GIT_EXEC_PATH` when set. The `=<path>` form sets the prefix instead.
-            "--exec-path" => {
-                println!("{}", exec_path());
-                return ExitCode::SUCCESS;
-            }
-            s if s.starts_with("--exec-path=") => {
-                std::env::set_var("GIT_EXEC_PATH", &s["--exec-path=".len()..]);
-                idx += 1;
-            }
-            // The three `print_system_path()` queries beside it in
-            // `handle_options`: each prints one directory of the installation and
-            // exits, ignoring whatever follows. git's prefix is its build's; this
-            // port's is `$ZVCS_HOME`, which is where its man pages, HTML pages and
-            // info tree are installed — the same paths `git help -m/-w/-i` resolve
-            // against, so a scripted `git --html-path` and `git help -w` agree.
-            //
-            // `--html-path` is the one that can name a directory outside that
-            // prefix: `git help -w <cmd>` opens the git installation's own HTML
-            // manual where the host has one, so that is the directory reported,
-            // and the generated set only when it does not.
-            "--html-path" => {
-                println!("{}", superset::htmldoc::reported_dir().display());
-                return ExitCode::SUCCESS;
-            }
-            "--man-path" => {
-                println!("{}", superset::manpage::man_dir().display());
-                return ExitCode::SUCCESS;
-            }
-            "--info-path" => {
-                println!("{}", porcelain::help::info_dir().display());
-                return ExitCode::SUCCESS;
-            }
-            _ => break,
-        }
-    }
-    if !config_overrides.is_empty() {
-        apply_config_overrides(&config_overrides);
-    }
+    let mut config_overrides: Vec<ConfigOverride> = Vec::new();
+    // Only the alias caller looks at this; on the command line an option that
+    // changes the environment is exactly what the user asked for.
+    let mut envchanged = false;
+    let idx = match handle_options(&raw, &mut pager_forced, &mut config_overrides, &mut envchanged) {
+        Handled::Consumed(n) => n,
+        Handled::Exit(code) => return code,
+    };
     let args = &raw[idx..];
 
+    // `cmd_main`'s `if (!argc)` — nothing left after the option layer, so the
+    // user gets the same three `printf`s `git help` ends with (the synopsis, the
+    // common command groups, the trailer) on **stdout**, and the process leaves
+    // with 1. `handle_options` can consume the whole command line without ever
+    // reaching a verb — `git --bare`, `git -c x.y=1`, `git --shallow-file log`
+    // (the shallow path swallows the token after it) — so this is not only the
+    // bare `git` case.
     let Some(sub) = args.first() else {
-        eprintln!("zvcs: no subcommand given");
+        if let Err(e) = porcelain::help(&[]) {
+            eprintln!("zvcs: help: {e:#}");
+        }
         return ExitCode::FAILURE;
     };
 
@@ -249,6 +536,13 @@ fn run_command() -> ExitCode {
         other => other,
     };
     let rest = &args[1..];
+
+    // The verb is known, so the deferred check on any `-c`/`--config-env` key can
+    // run — this is git's `git_config_from_parameters()` reporting a malformed
+    // command-line override the first time configuration is read.
+    if let Some(code) = validate_config_overrides(&config_overrides, sub, rest) {
+        return code;
+    }
 
     // Surface any headless autonomous-op failures recorded since last time, on
     // this next `git` invocation. Async/daemon failures carry no exit code back,
@@ -268,14 +562,30 @@ fn run_command() -> ExitCode {
     // run_argv: a real verb wins over a same-named alias, otherwise the alias is
     // expanded (recursively) and a `!shell` alias is run directly. Done before
     // the pager so paging keys off the resolved command, not the alias name.
-    let (sub, rest): (String, Vec<String>) = match alias::resolve(sub, rest, &mut pager_forced) {
-        alias::Outcome::Shell(code) | alias::Outcome::Exit(code) => return code,
-        alias::Outcome::Fatal(msg) => {
-            eprintln!("zvcs: {msg}");
-            return ExitCode::FAILURE;
-        }
-        alias::Outcome::Command(head, args) => (head, args),
-    };
+    //
+    // `typed` is `cmd_main`'s `cmd`, the verb as it stood before any expansion.
+    // It is the name the alias-failure diagnostic below names, whatever depth the
+    // chain reached.
+    let typed = sub.to_string();
+    let mut was_alias = false;
+    let (sub, rest): (String, Vec<String>) =
+        match alias::resolve(sub, rest, &mut pager_forced, &mut was_alias, &mut config_overrides) {
+            alias::Outcome::Shell(code) | alias::Outcome::Exit(code) => return code,
+            alias::Outcome::Fatal(msg) => {
+                eprintln!("fatal: {msg}");
+                return ExitCode::from(fatal::EXIT_FATAL);
+            }
+            alias::Outcome::Command(head, args) => (head, args),
+        };
+
+    // The chain is resolved, so any `-c` an expansion pushed is now checked
+    // against the command that will actually read it — git's re-exec of the
+    // expanded command inherits `GIT_CONFIG_PARAMETERS` and reports the bad key
+    // from inside it, so `alias.x = "-c foo status"` complains and
+    // `alias.x = "-c foo version"` does not.
+    if let Some(code) = validate_config_overrides(&config_overrides, &sub, &rest) {
+        return code;
+    }
 
     // An unknown verb (not a builtin, not an alias) follows git's exact
     // precedence: `execv_dashed_external` first — exec `git-<verb>` from PATH so
@@ -306,14 +616,29 @@ fn run_command() -> ExitCode {
                 return code;
             }
         }
+        // `cmd_main`'s `if (was_alias)`: a verb that came out of an alias and
+        // still resolves to nothing is reported against the name the user typed,
+        // and `help_unknown_cmd` — suggestions and `help.autocorrect` alike — is
+        // never reached for it. Exit 1.
+        if was_alias {
+            eprintln!("expansion of alias '{typed}' failed; '{sub}' is not a git command");
+            return ExitCode::FAILURE;
+        }
         match autocorrect::correct(&sub) {
             autocorrect::Correction::None => return ExitCode::FAILURE,
             autocorrect::Correction::Use(corrected) => {
-                match alias::resolve(&corrected, &rest, &mut pager_forced) {
+                let mut corrected_alias = false;
+                match alias::resolve(
+                    &corrected,
+                    &rest,
+                    &mut pager_forced,
+                    &mut corrected_alias,
+                    &mut config_overrides,
+                ) {
                     alias::Outcome::Shell(code) | alias::Outcome::Exit(code) => return code,
                     alias::Outcome::Fatal(msg) => {
-                        eprintln!("zvcs: {msg}");
-                        return ExitCode::FAILURE;
+                        eprintln!("fatal: {msg}");
+                        return ExitCode::from(fatal::EXIT_FATAL);
                     }
                     alias::Outcome::Command(head, args) => (head, args),
                 }
@@ -754,26 +1079,28 @@ pub(crate) fn exec_path() -> String {
     }
 }
 
-/// Translate `git -c <name>=<value>` overrides into the `GIT_CONFIG_COUNT` /
-/// `GIT_CONFIG_KEY_N` / `GIT_CONFIG_VALUE_N` environment sequence that
-/// `gix-config` reads, appending to any count a parent process already set. A
-/// bare `-c <name>` (no `=`) is git's boolean-true form, encoded as an empty
-/// value (which gix reads as true for boolean keys), matching git.
-fn apply_config_overrides(overrides: &[String]) {
-    let mut count: usize = std::env::var("GIT_CONFIG_COUNT")
+/// Record one command-line configuration override and publish it, the way
+/// `git_config_push_split_parameter()` appends to `GIT_CONFIG_PARAMETERS`.
+///
+/// The transport differs — this port uses git's other command-line-config
+/// channel, the `GIT_CONFIG_COUNT` / `GIT_CONFIG_KEY_N` / `GIT_CONFIG_VALUE_N`
+/// sequence, because that is the one `gix-config` reads — but the timing is the
+/// C's: each override is visible to every child process the moment it is parsed,
+/// and it appends to any count a parent process already set. A bare `-c <name>`
+/// (no `=`) is git's boolean-true form, encoded as an empty value, which gix
+/// reads as true for boolean keys.
+///
+/// The `overrides` list is kept for [`validate_config_overrides`], which is
+/// where git's own diagnostics for a malformed key are produced.
+fn push_config_override(overrides: &mut Vec<ConfigOverride>, over: ConfigOverride) {
+    let count: usize = std::env::var("GIT_CONFIG_COUNT")
         .ok()
         .and_then(|v| v.trim().parse().ok())
         .unwrap_or(0);
-    for pair in overrides {
-        let (key, value) = match pair.split_once('=') {
-            Some((k, v)) => (k, v),
-            None => (pair.as_str(), ""),
-        };
-        std::env::set_var(format!("GIT_CONFIG_KEY_{count}"), key);
-        std::env::set_var(format!("GIT_CONFIG_VALUE_{count}"), value);
-        count += 1;
-    }
-    std::env::set_var("GIT_CONFIG_COUNT", count.to_string());
+    std::env::set_var(format!("GIT_CONFIG_KEY_{count}"), &over.key);
+    std::env::set_var(format!("GIT_CONFIG_VALUE_{count}"), over.value.as_deref().unwrap_or(""));
+    std::env::set_var("GIT_CONFIG_COUNT", (count + 1).to_string());
+    overrides.push(over);
 }
 
 /// The current session key for attributing operations to an agent: `ZVCS_SESSION`

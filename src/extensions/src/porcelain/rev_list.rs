@@ -197,6 +197,9 @@ struct ObjectWalk<'a> {
 ///   * `--all` / `--branches` / `--tags` / `--remotes`, each with an optional
 ///     `=<pattern>`, and `--glob=<pattern>` — seed from a ref set, at the position
 ///     the flag appears
+///   * `--reflog`                     — `add_reflogs_to_pending()`: every id in
+///                                       every log, which reaches commits no ref
+///                                       points at any more
 ///   * `--exclude=<pattern>`          — drop refs from the next ref-set flag, and
 ///                                       only that one (`clear_ref_exclusions`)
 ///   * `--stdin`                      — read further revisions, and pathspecs
@@ -212,11 +215,17 @@ struct ObjectWalk<'a> {
 ///   * `--ancestry-path`              — keep only descendants of the excluded tips
 ///   * `--merges` / `--no-merges` / `--{min,max}-parents=<n>` — parent-count filter
 ///   * `--since=` / `--until=` (`--after=` / `--before=`) — committer-date bounds
+///                                       through `approxidate()`, and
+///                                       `--max-age=` / `--min-age=` — the same
+///                                       two bounds as a raw epoch
+///   * `--sparse` / `--dense`         — whether a path-limited walk drops the
+///                                       commits it found TREESAME (the in-place
+///                                       parent prune happens either way)
 ///   * `--grep=` / `--author=` / `--committer=` with `-i`/`-E`/`-F`/`-P`,
 ///     `--all-match` and `--invert-grep` — header and message predicates
 ///   * `-- <path>...`                 — path-limited: keep only commits whose diff
 ///                                       against a parent touched a matching path
-///   * `-n <n>` / `-n<n>` / `--max-count=<n>` — limit the number listed
+///   * `-n <n>` / `-n<n>` / `-<n>` / `--max-count=<n>` — limit the number listed
 ///   * `--reverse`                    — toggle reversed output (git XORs the flag,
 ///                                       so it applies with an odd count only;
 ///                                       limit applied first)
@@ -240,11 +249,19 @@ struct ObjectWalk<'a> {
 ///   * `--disk-usage[=human]`         — print the total on-disk size instead
 /// ```
 ///
+/// `--[no-]encode-email-headers` is accepted and does nothing:
+/// `builtin/rev-list.c` builds its `pretty_print_context` from scratch and never
+/// copies `revs->encode_email_headers` into it, so — unlike `log` — the mail
+/// formats here never see the switch (see [`super::log::EmailStyle::REV_LIST`]).
+///
 /// Genuinely unsupported forms stay rejected rather than silently accepted:
-/// magic pathspecs (`:(glob)`, `:!exclude`, …), `--bisect`,
-/// `--simplify-by-decoration`, `-z`, the `--missing` actions that need promisor
-/// plumbing, and a `--cherry-mark` whose two sides are both non-empty, which is
-/// the only case where git computes patch ids.
+/// magic pathspecs (`:(glob)`, `:!exclude`, …), `-z`, `--full-history`, the diff
+/// options `setup_revisions()` accepts and this command ignores (`-s` /
+/// `--no-patch`, …), the `--missing` actions that need promisor plumbing,
+/// `--bisect` under a pathspec (git weighs a TREESAME commit as reaching nothing
+/// and there is no TREESAME marking during the walk here to weigh with), and a
+/// `--cherry-mark` whose two sides are both non-empty, which is the only case
+/// where git computes patch ids.
 pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     // `show_usage_if_asked(argc, argv, rev_list_usage)` (builtin/rev-list.c:711)
     // fires before the repository is opened, prints to stdout and exits 129 —
@@ -308,6 +325,9 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     // `--since`/`--until` are git's `max_age`/`min_age`, both committer-date.
     let mut max_age: Option<i64> = None;
     let mut min_age: Option<i64> = None;
+    // `revs->dense` (revision.c:2462-2465), which `repo_init_revisions()` starts
+    // at 1. `--sparse` clears it and `--dense` puts it back.
+    let mut dense = true;
     let mut pathspecs: Vec<Vec<u8>> = Vec::new();
     // `setup_revisions()`'s `seen_dashdash`, found in a scan of the whole
     // argument vector before anything is resolved.
@@ -371,6 +391,35 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
                 continue 'args;
             }
         }
+        // `--max-age`/`--min-age` set the very same `revs->max_age`/`revs->min_age`
+        // as `--since`/`--until` (revision.c:2379-2393); only the value parser
+        // differs — [`super::log::parse_age`]'s raw epoch instead of
+        // `approxidate()`, so a value that is not a number is fatal rather than
+        // silently "now".
+        for name in ["max-age", "min-age"] {
+            let Some(v) = long_opt_value(args, i, name) else {
+                continue;
+            };
+            // `parse_long_opt()` (diff.c:5380-5399) dies when the detached form
+            // runs off the end of argv; [`long_opt_value`] answers with an empty
+            // string there, which is a *different* value git accepts as written.
+            if v.consumed == 2 && args.get(i + 1).is_none() {
+                return Ok(fatal(&format!("Option '--{name}' requires a value")));
+            }
+            let Ok(age) = super::log::parse_age(&v.value) else {
+                return Ok(fatal(&format!(
+                    "'{}': not a number of seconds since epoch",
+                    v.value
+                )));
+            };
+            if name == "max-age" {
+                max_age = age;
+            } else {
+                min_age = age;
+            }
+            i += v.consumed;
+            continue 'args;
+        }
         match a {
             "--count" => count_only = true,
             // git toggles this with `revs->reverse ^= 1`, so an even number of
@@ -398,6 +447,40 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
                 rev_input_given = true;
                 bisect = true;
             }
+            // `revs->dense` (revision.c:2462-2465). `--dense` restores the
+            // `repo_init_revisions()` default, so it is only ever an undo of an
+            // earlier `--sparse`. Neither says anything without a pathspec: the
+            // flag is read where `try_to_simplify_commit()` runs.
+            "--sparse" => dense = false,
+            "--dense" => dense = true,
+            // ```c
+            // } else if (!strcmp(arg, "--reflog")) {
+            //         add_reflogs_to_pending(revs, *flags);
+            // ```
+            //
+            // (revision.c:2766-2767.) A pseudo-option like the ref selectors, and
+            // it lands in the same pending list at the same argv position — but it
+            // reads no pattern, so the `--exclude` patterns standing beside it are
+            // neither applied nor cleared. `*flags` is what `--not` holds, which is
+            // also what cancels a `--no-walk` seen earlier (the shared check at the
+            // end of this loop does that).
+            "--reflog" => {
+                for id in super::shortlog::reflog_pending(&repo)? {
+                    seeds.push(Seed {
+                        id,
+                        uninteresting: negate,
+                        symmetric_left: false,
+                        bottom: negate,
+                    });
+                }
+                rev_input_given = true;
+            }
+            // `revs->encode_email_headers` (revision.c:2526-2529).
+            // `builtin/rev-list.c`'s `struct pretty_print_context ctx = {0}` never
+            // copies it, so — unlike `log` — the flag changes nothing this command
+            // prints. It is still `setup_revisions()`'s option and must be
+            // accepted; see [`super::log::EmailStyle::REV_LIST`].
+            "--encode-email-headers" | "--no-encode-email-headers" => {}
             "--topo-order" => order = Order::Topo,
             "--date-order" => order = Order::DateTopo,
             "--merges" => min_parents = 2,
@@ -615,6 +698,20 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
                     None => return Ok(not_an_integer(&s[2..])),
                 }
             }
+            // ```c
+            // } else if (*arg == '-' && isdigit(arg[1])) {
+            //         revs->max_count = atoi(arg + 1);
+            //         revs->no_walk = 0;
+            // ```
+            //
+            // (revision.c:2743-2746.) `atoi()` stops at the first non-digit and
+            // answers 0 rather than failing, so `-1x` is `-0`; only the second
+            // character has to be a digit for the branch to be taken at all.
+            s if s.len() > 1 && s.starts_with('-') && s.as_bytes()[1].is_ascii_digit() => {
+                let digits: String = s[1..].chars().take_while(char::is_ascii_digit).collect();
+                max_count = clamp_count(digits.parse::<i64>().unwrap_or(i64::MAX));
+                no_walk = false;
+            }
             // Every remaining flag is one git knows and this does not; a
             // revision never starts with `-`, so anything left is a usage error.
             s if s.starts_with('-') => return Ok(usage_error()),
@@ -628,6 +725,12 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
                 pathspecs.push(s.as_bytes().to_vec());
             }
             s => {
+                // Everything `get_oid_basic()` writes for an operand read off
+                // argv, in git's order and with `handle_dotdot_1()`'s `||`
+                // short-circuit across a range's endpoints. `rev-list` runs the
+                // same `setup_revisions()` as `log`, so the rule is shared rather
+                // than restated.
+                super::log::warn_operand(&repo, s, true);
                 if let Err(e) = seed_revision(&repo, s, negate, &mut seeds, &mut pending_tags) {
                     return Ok(fatal_text(&e));
                 }
@@ -692,6 +795,10 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
                 in_paths = true;
             } else {
                 let seeds_before = seeds.len();
+                // The ambiguity half is switched off for the whole loop above;
+                // the reflog-reach half carries no such gate and fires for a
+                // stdin line exactly as it does for an argv operand.
+                super::log::warn_operand(&repo, line, false);
                 if let Err(e) = seed_revision(&repo, line, negate, &mut seeds, &mut pending_tags) {
                     return Ok(fatal_text(&e));
                 }
@@ -838,12 +945,27 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
         let mut simplified: Vec<(ObjectId, Vec<ObjectId>)> = Vec::new();
         for id in &commits {
             let parents = parents_of.get(id).map(Vec::as_slice).unwrap_or(&[]);
+            // `if (!revs->dense && !commit->parents->next) return;`
+            // (revision.c:996): under `--sparse` a non-merge is never compared at
+            // all, so it is never TREESAME, is always shown, and keeps its parent.
+            // A root has no `parents->next` either but is compared earlier, at
+            // revision.c:979-997.
+            if !dense && parents.len() == 1 {
+                continue;
+            }
             let same =
                 treesame_parent(&repo, *id, parents, first_parent, &mut specs, &parents_of)?;
             match same {
                 None => {}
                 Some(parent) => {
-                    treesame.insert(*id);
+                    // The `revs->prune && revs->dense` display gate
+                    // (revision.c:4221) is what drops a TREESAME commit. Under
+                    // `--sparse` it does not fire, so the commit stays even though
+                    // git has marked it — what `--sparse` leaves in place is only
+                    // the in-place parent prune below.
+                    if dense {
+                        treesame.insert(*id);
+                    }
                     if let Some(parent) = parent {
                         if parents.len() > 1 {
                             simplified.push((*id, vec![parent]));
@@ -967,8 +1089,11 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
 
     // `simplify_commit` rewrites the parent list of every shown commit when
     // `--parents` asked for ancestry, so a parent the path limit simplified away
-    // is reported as the nearest ancestor that survived.
-    if !pathspecs.is_empty() && show_parents {
+    // is reported as the nearest ancestor that survived. The call sits under
+    // `revs->prune && revs->dense && want_ancestry(revs)` (revision.c:4317-4318),
+    // so `--sparse --parents` prints the ancestry the commits really have — as
+    // the in-place prune left it, not as `rewrite_parents()` would.
+    if !pathspecs.is_empty() && show_parents && dense {
         let survivors: HashSet<ObjectId> = commits.iter().copied().collect();
         let rewritten: Vec<(ObjectId, Vec<ObjectId>)> = commits
             .iter()
@@ -1957,14 +2082,19 @@ fn human_size(bytes: u64) -> String {
 
 /// Resolve `spec` to the commit it names, recording any annotated tag peeled
 /// through on the way. `None` means the spec does not name a commit.
+///
+/// Silent by design. `get_oid_basic()` has two warnings — the ambiguous 40-hex
+/// refname and the reflog that does not reach back far enough — and they come out
+/// of one call, in one order, with one short-circuit rule across a range's two
+/// endpoints. [`super::log::warn_operand`] is that whole rule, and it runs once at
+/// the site that reads an operand off argv or stdin; this is called several times
+/// per operand (both endpoints, then again to diagnose a failure), so warning here
+/// would multiply them.
 fn resolve(
     repo: &gix::Repository,
     spec: &str,
     tags: &mut Vec<(ObjectId, Vec<u8>)>,
 ) -> Option<ObjectId> {
-    // Every endpoint reaches `repo_get_oid()`, so a full-length hex that is also a
-    // refname warns here — once per endpoint, which is why `a..b` warns twice.
-    crate::objname::warn_ambiguous_refname(repo, spec);
     let id = repo.rev_parse_single(spec).ok()?.detach();
     peel_recording_tags(repo, id, tags)
 }

@@ -494,7 +494,9 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
         let refs: Vec<&str> = specs.iter().map(String::as_str).collect();
         return match pre.len() {
             0 => restore_from_index(&repo, &refs, false, quiet),
-            1 => restore_from_tree(&repo, pre[0], &refs, overlay, quiet),
+            // `--pathspec-from-file` rejects a `--` above, so this is the bare
+            // form: stock reports `Updated N paths from <tree>` here.
+            1 => restore_from_tree(&repo, pre[0], &refs, overlay, true, quiet),
             _ => crate::git_fatal!("only one <tree-ish> may precede pathspecs"),
         };
     }
@@ -595,7 +597,9 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
         }
         return match pre.len() {
             0 => restore_from_index(&repo, &post, false, quiet),
-            1 => restore_from_tree(&repo, pre[0], &post, overlay, quiet),
+            // Reached only under `has_dashdash`, and stock stays silent for the
+            // `--` form even though it updates the same paths.
+            1 => restore_from_tree(&repo, pre[0], &post, overlay, false, quiet),
             _ => crate::git_fatal!("only one <tree-ish> may precede `--`"),
         };
     }
@@ -710,7 +714,7 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
     // Multiple positionals, no `--`: if the first resolves to a tree-ish it is the
     // source and the rest are paths; otherwise all are paths from the index.
     if crate::objname::resolve(&repo, pre[0]).is_some() {
-        return restore_from_tree(&repo, pre[0], &pre[1..], overlay, quiet);
+        return restore_from_tree(&repo, pre[0], &pre[1..], overlay, true, quiet);
     }
     restore_from_index(&repo, &pre, true, quiet)
 }
@@ -1476,6 +1480,102 @@ fn unique_remote_branch(repo: &gix::Repository, name: &str) -> Result<Dwim> {
     }
 }
 
+/// `nr_checkouts` as `checkout_entry()` (entry.c) counts it: the number of
+/// entries whose file it actually rewrites.
+///
+/// The counter is not "paths the pathspec matched" — `checkout_entry_ca()` gives
+/// up before writing when the worktree file already matches the entry:
+///
+/// ```c
+/// if (!check_path(path.buf, path.len, &st, state->base_dir_len)) {
+///         unsigned changed = ie_match_stat(state->istate, ce, &st,
+///                                          CE_MATCH_IGNORE_VALID | CE_MATCH_IGNORE_SKIP_WORKTREE);
+///         …
+///         if (!changed)
+///                 return 0;
+/// ```
+///
+/// and only `write_entry()`, past that gate, does `if (nr_checkouts) (*nr_checkouts)++`.
+/// So `git checkout <path>` on an untouched worktree is stock's
+/// `Updated 0 paths from the index`, and the decision is `ie_match_stat()`'s —
+/// **stat** data, not content: a bare `touch` that leaves the bytes alone still
+/// counts, because the mtime moved.
+///
+/// `entries` are the entries `checkout_worktree()` would hand to `checkout_entry()`,
+/// which is why the tree form has to build them first (see [`tree_effective_entries`]).
+fn nr_checkouts<'a>(
+    repo: &gix::Repository,
+    ctx: &super::read_tree::StatCtx,
+    entries: impl Iterator<Item = (&'a BString, &'a gix::index::Entry)>,
+) -> usize {
+    entries
+        .filter(|(path, entry)| {
+            // `check_path()` failing (the file is gone) is not the `!changed`
+            // early return — git falls through and writes, so it counts.
+            ctx.probe(repo, entry, BStr::new(path.as_slice())) != super::read_tree::Probe::Uptodate
+        })
+        .count()
+}
+
+/// The entries `read_tree_some()` leaves in the index for a `<tree-ish>` path
+/// checkout, which is what the counter above has to be asked about.
+///
+/// `update_some()` (builtin/checkout.c) does not blindly replace: an entry the
+/// tree agrees with keeps its **existing stat data**, and only that is what makes
+/// `git checkout HEAD^{tree} <clean-path>` report `Updated 0 paths`:
+///
+/// ```c
+/// pos = index_name_pos(the_repository->index, ce->name, ce->ce_namelen);
+/// if (pos >= 0) {
+///         struct cache_entry *old = the_repository->index->cache[pos];
+///         if (ce->ce_mode == old->ce_mode &&
+///             !ce_intent_to_add(old) &&
+///             oideq(&ce->oid, &old->oid)) {
+///                 old->ce_flags |= CE_UPDATE;
+///                 discard_cache_entry(ce);
+///                 return 0;
+///         }
+/// }
+/// add_index_entry(the_repository->index, ce, ADD_CACHE_OK_TO_ADD | ADD_CACHE_OK_TO_REPLACE);
+/// ```
+///
+/// A replaced (or newly added) entry arrives with `make_empty_cache_entry()`'s
+/// zeroed stat, which `ie_match_stat()` can never call clean — so it always
+/// counts. Only the "leave the old entry in place" arm can report up to date.
+fn tree_effective_entries(
+    from_tree: &gix::index::File,
+    current: &gix::index::File,
+    matched: &[BString],
+) -> Vec<(BString, gix::index::Entry)> {
+    let cur_backing = current.path_backing();
+    let mut cur: HashMap<BString, &gix::index::Entry> = HashMap::new();
+    for e in current.entries().iter().filter(|e| e.stage_raw() == 0) {
+        cur.insert(e.path_in(cur_backing).to_owned(), e);
+    }
+    let backing = from_tree.path_backing();
+    let mut out = Vec::with_capacity(matched.len());
+    for e in from_tree.entries() {
+        let path = e.path_in(backing).to_owned();
+        if !matched.contains(&path) {
+            continue;
+        }
+        let mut eff = e.clone();
+        match cur.get(&path) {
+            Some(old)
+                if old.mode == e.mode
+                    && old.id == e.id
+                    && !old.flags.contains(Flags::INTENT_TO_ADD) =>
+            {
+                eff.stat = old.stat;
+            }
+            // `make_empty_cache_entry()`: no stat data at all.
+            _ => eff.stat = Stat::default(),
+        }
+        out.push((path, eff));
+    }
+    out
+}
+
 /// Restore `paths` in the worktree from the current index (index left unchanged;
 /// only stat info is refreshed). `bare` is true for the no-`--` pathspec form,
 /// which prints git's "Updated N path(s) from the index" confirmation.
@@ -1494,6 +1594,23 @@ fn restore_from_index(
             eprintln!("error: pathspec '{spec}' did not match any file(s) known to git");
             return Ok(ExitCode::from(1));
         }
+    };
+
+    // Counted before anything is written: afterwards every file matches its entry.
+    let count = if bare && !quiet {
+        let ctx = super::read_tree::StatCtx::new(repo, &index)?;
+        let backing = index.path_backing();
+        let mset: HashSet<&BString> = matched.iter().collect();
+        let pairs: Vec<(BString, gix::index::Entry)> = index
+            .entries()
+            .iter()
+            .filter(|e| e.stage_raw() == 0)
+            .map(|e| (e.path_in(backing).to_owned(), e.clone()))
+            .filter(|(p, _)| mset.contains(p))
+            .collect();
+        nr_checkouts(repo, &ctx, pairs.iter().map(|(p, e)| (p, e)))
+    } else {
+        0
     };
 
     let mut subset = repo.open_index()?;
@@ -1518,8 +1635,10 @@ fn restore_from_index(
     index.write(Default::default())?;
 
     if bare && !quiet {
-        let n = matched.len();
-        eprintln!("Updated {n} path{} from the index", if n == 1 { "" } else { "s" });
+        eprintln!(
+            "Updated {count} path{} from the index",
+            if count == 1 { "" } else { "s" }
+        );
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -1530,12 +1649,28 @@ fn restore_from_index(
 /// false` a pathspec-matched path that exists in the current index but not in
 /// `tree_ish` is deleted from both the worktree and the index, so the result
 /// matches `tree_ish` exactly (git's `--no-overlay`).
+/// `bare` is the no-`--` form, which reports through
+/// `Updated N path(s) from <abbrev>` — where the abbreviation is of
+/// `opts->source_tree`, i.e. the **tree** the operand peeled to and never the
+/// operand's own id:
+///
+/// ```c
+/// if (opts->source_tree)
+///         fprintf_ln(stderr, Q_("Updated %d path from %s",
+///                               "Updated %d paths from %s", nr_checkouts),
+///                    nr_checkouts,
+///                    repo_find_unique_abbrev(the_repository, &opts->source_tree->object.oid,
+///                                            DEFAULT_ABBREV));
+/// ```
+///
+/// so an annotated tag pointing at a tree reports the tree's id, not the tag's.
 fn restore_from_tree(
     repo: &gix::Repository,
     tree_ish: &str,
     paths: &[&str],
     overlay: bool,
-    _quiet: bool,
+    bare: bool,
+    quiet: bool,
 ) -> Result<ExitCode> {
     // `parse_branchname_arg()` resolves this through `get_oid_mb()` and dies with
     // `invalid reference` when nothing resolves. Propagating the revision parser's
@@ -1597,6 +1732,16 @@ fn restore_from_tree(
         (tree_matched, rm)
     };
 
+    // Counted before anything is written: afterwards every file matches its entry.
+    let count = if bare && !quiet {
+        let cur = repo.open_index()?;
+        let ctx = super::read_tree::StatCtx::new(repo, &cur)?;
+        let effective = tree_effective_entries(&src, &cur, &matched);
+        nr_checkouts(repo, &ctx, effective.iter().map(|(p, e)| (p, e)))
+    } else {
+        0
+    };
+
     let mut subset = repo.index_from_tree(&tree_id)?;
     keep_only(&mut subset, &matched);
     let should_interrupt = AtomicBool::new(false);
@@ -1647,6 +1792,13 @@ fn restore_from_tree(
     index.remove_tree();
     index.write(Default::default())?;
 
+    if bare && !quiet {
+        eprintln!(
+            "Updated {count} path{} from {}",
+            if count == 1 { "" } else { "s" },
+            tree_id.attach(repo).shorten_or_id()
+        );
+    }
     Ok(ExitCode::SUCCESS)
 }
 

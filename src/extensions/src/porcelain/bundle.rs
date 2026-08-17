@@ -950,6 +950,19 @@ fn resolve_revisions(
                 None => vec![(a, negate)],
             },
         };
+        // `handle_dotdot_1()` resolves a range's two endpoints in one `||`-joined
+        // pair, before either object is looked up, so both warn — while
+        // [`one_pending`] below stops at the first endpoint whose object is
+        // missing, which for a full-length hex is exactly the case that warns.
+        // The warning therefore belongs to the token, and the resolutions that
+        // follow are silenced so the count stays at git's.
+        // `warn_dotdot_endpoints` carries the `||`'s own short-circuit: a left
+        // endpoint that does not resolve at all still stops the right one.
+        let range = crate::objname::split_range(a).is_some();
+        if range {
+            crate::objname::warn_dotdot_endpoints(repo, a);
+        }
+        let _quiet = range.then(crate::objname::AmbiguityWarnings::off);
         for (spec, uninteresting) in parts {
             match one_pending(repo, spec, uninteresting) {
                 Ok(p) => resolved.push(p),
@@ -968,10 +981,18 @@ fn resolve_revisions(
 /// Resolve one revision argument, recording the name `write_bundle_refs` would
 /// print for it.
 fn one_pending(repo: &gix::Repository, spec: &str, uninteresting: bool) -> Result<Pending> {
-    let id = repo
-        .rev_parse_single(spec)
-        .map_err(|_| anyhow::anyhow!("bad revision '{spec}'"))?
-        .detach();
+    // `cmd_bundle_create()` hands the operands to `setup_revisions()`, so each
+    // name reaches `get_oid_basic()` once — including each endpoint of a range,
+    // which the caller has already split. [`crate::objname::resolve`] is that
+    // call, ambiguity warning included.
+    //
+    // The object still has to be present: `get_reference()` `parse_object()`s
+    // whatever `get_oid_basic()` decoded and dies `bad object <name>` when it is
+    // not there, which is the message the caller's `bad_revision_message_in()`
+    // produces for this `Err`.
+    let id = crate::objname::resolve(repo, spec)
+        .filter(|id| repo.find_object(*id).is_ok())
+        .ok_or_else(|| anyhow::anyhow!("bad revision '{spec}'"))?;
     // `repo_dwim_ref()` decides whether this is a ref at all; a symref keeps the
     // name as typed (bundle.c:398-403).
     let display_ref = match repo.find_reference(spec) {

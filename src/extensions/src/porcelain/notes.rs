@@ -746,18 +746,13 @@ fn check_writable(notes_ref: &str, sub: &str) -> Result<Option<ExitCode>> {
 /// `get_oid_basic()` returns a full-length hex object name as-is, *without*
 /// checking that the object exists, so `git notes show <missing-40-hex>` reaches
 /// the note lookup and reports "no note found" instead of failing to parse its
-/// argument. Only git's ambiguity *warning* for a same-named ref is skipped.
+/// argument. [`crate::objname::resolve`] is that branch, and carries the
+/// `warning: refname … is ambiguous.` a same-named ref earns — every notes
+/// subcommand takes its `<object>` straight off argv and calls `get_oid()` once
+/// for it, so once per operand is exactly right here.
 fn resolve(repo: &gix::Repository, spec: &str) -> Result<ObjectId, String> {
-    let hexsz = repo.object_hash().len_in_hex();
-    if spec.len() == hexsz && spec.bytes().all(|b| b.is_ascii_hexdigit()) {
-        // `hexval()` accepts either case; `from_hex` wants lowercase.
-        if let Ok(id) = ObjectId::from_hex(spec.to_ascii_lowercase().as_bytes()) {
-            return Ok(id);
-        }
-    }
-    repo.rev_parse_single(spec)
-        .map(|id| id.detach())
-        .map_err(|_| format!("failed to resolve '{spec}' as a valid ref."))
+    crate::objname::resolve(repo, spec)
+        .ok_or_else(|| format!("failed to resolve '{spec}' as a valid ref."))
 }
 
 /// One `-m`/`-F`/`-C` value, carrying the per-option stripspace default that

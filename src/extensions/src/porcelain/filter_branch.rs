@@ -71,6 +71,16 @@
 //!     the `<tag> -> <new> (<sha> -> <new sha>)` tag lines, the
 //!     `gpg signature stripped from tag object <sha>` warning, and the
 //!     `git read-tree -u -m HEAD` that refreshes the work tree at the end.
+//!   * **`get_oid_basic()`'s `warning: refname '<40-hex>' is ambiguous.`, once
+//!     per `git` process the script would have spent on the name.** Being a
+//!     shell script rather than a builtin is observable here: `"$@"` goes
+//!     through four separate `git rev-parse` invocations (lines 269, 316, 325
+//!     and 329/332), and every commit the loop rewrites costs two or three more
+//!     (`cat-file commit`, `read-tree`/`diff-index`, `rev-parse
+//!     "$commit^{tree}"`, `commit-tree <tree> -p <parent>…`). So
+//!     `filter-branch -f <40-hex-ref>` warns six times, not once, and where the
+//!     run stops decides how many of those points it reaches. See
+//!     [`warn_rev_args`].
 //!
 //! Deliberate floors, refused rather than approximated:
 //!
@@ -652,16 +662,45 @@ fn run(args: &[String]) -> Result<ExitCode> {
     rewrite(&repo, &mut ctx, &opts, &rev_args)
 }
 
-/// `git-sh-setup`'s `require_clean_work_tree 'rewrite branches'`.
+/// `git-sh-setup`'s `require_clean_work_tree 'rewrite branches'`:
+///
+/// ```sh
+/// require_clean_work_tree () {
+///         git rev-parse --verify HEAD >/dev/null || exit 1
+///         git update-index -q --ignore-submodules --refresh
+///         err=0
+///         …
+/// ```
 ///
 /// filter-branch passes no `$2`, so there is no `Please commit or stash them.`
-/// line. The `git update-index --refresh` it runs first is why stat-only
-/// staleness does not count as an unstaged change here.
+/// line.
+///
+/// The `git update-index --refresh` is run for real rather than modelled, and
+/// that matters twice over. Reading it back is why stat-only staleness does not
+/// count as an unstaged change below — but the command also **writes the
+/// refreshed stat cache to `.git/index`**, and the script depends on that at the
+/// very end: `git read-tree -u -m HEAD` (line 662) is a separate process reading
+/// the real index, and a one-way merge refuses to drop a path whose entry is not
+/// up to date. In a repository whose index carries stale `mtime`s — a copied
+/// tree, a checkout by another tool, an editor that rewrote a file in place — the
+/// whole run then ends in `error: Entry '<path>' not uptodate. Cannot merge.` and
+/// exit 128 where stock exits 0, with the refs already rewritten. That is the
+/// state `git filter-branch --force --subdirectory-filter <dir> main` lands in
+/// whenever the rewritten HEAD no longer contains a path the index still does.
+///
+/// Its exit status is deliberately ignored, as the script ignores it: `-q` makes
+/// it silent and it returns non-zero for a genuinely modified path, which is the
+/// `diff-files` pair below's to report and not this line's.
 fn require_clean_work_tree(repo: &gix::Repository) -> Result<()> {
     // `git rev-parse --verify HEAD >/dev/null || exit 1`.
     if repo.head_id().is_err() {
         eprintln!("fatal: Needed a single revision");
         return Err(Exit(1).into());
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        let _ = Command::new(exe)
+            .args(["update-index", "-q", "--ignore-submodules", "--refresh"])
+            .status();
     }
     let (unstaged, staged) = dirty_state(repo)?;
     if unstaged {
@@ -906,6 +945,12 @@ fn rewrite(
     }
 
     // Lines 269-284: the refs to update, and the revisions to walk.
+    //
+    // Line 269 is the first of the script's four `git rev-parse` passes over
+    // `"$@"` and the only one ahead of the `heads` check below, so its share of
+    // `get_oid_basic()`'s ambiguity warning is printed here — before `select`,
+    // which resolves quietly for all four at once. See [`warn_rev_args`].
+    warn_rev_args(repo, rev_args);
     let selection = select(repo, rev_args)?;
     let mut heads: Vec<String> = Vec::new();
     for name in &selection.head_refs {
@@ -966,6 +1011,17 @@ fn rewrite(
     }
 
     // Lines 315-343: the pathspecs, then the walk itself.
+    //
+    // Lines 316, 325 and 329/332 are three more `git rev-parse` processes over
+    // the same `"$@"`, and each reaches `get_oid_basic()` once per revision word
+    // exactly as line 269 did. They sit *behind* the `heads` check and the
+    // `--state-branch` load, so a run that stopped at either never prints them —
+    // which is why `filter-branch -f <40-hex-ref>` warns six times while
+    // `filter-branch -f <base>..<tip>` warns once.
+    for _ in 0..3 {
+        warn_rev_args(repo, rev_args);
+    }
+
     let mut pathspecs = selection.pathspecs.clone();
     let mut remap_to_ancestor = opts.remap_to_ancestor;
     if selection.saw_nonrev {
@@ -1014,6 +1070,15 @@ fn rewrite(
     // encoding that is not UTF-8 (`is_encoding_utf8`); read once, not per commit.
     let commit_encoding = fast_commit.then(|| configured_commit_encoding(repo)).flatten();
 
+    // Lines 376-382: `$need_index`, which decides how many `git` processes each
+    // commit costs the script. Nothing here needs a scratch index — see the
+    // module documentation — but the *count* is still observable, because every
+    // one of those processes resolves the commit id and a commit whose id also
+    // names a ref makes `get_oid_basic()` warn once per process.
+    let need_index = !opts.filter_index.is_empty()
+        || !opts.filter_tree.is_empty()
+        || !opts.filter_subdir.is_empty();
+
     // Line 373: `start_timestamp=$(date '+%s')`. The clock starts *before* the
     // setup filter runs, not after it, so a `--setup` that takes a second is a
     // second the first `Rewrite` line already reports as passed.
@@ -1037,6 +1102,24 @@ fn rewrite(
         // commit's tree, or the subtree `--subdirectory-filter` names, or the
         // empty tree when the commit has no such directory (the script removes
         // the index there, and `git write-tree` then reports the empty tree).
+        //
+        // `git read-tree -i -m $commit` is a process of its own resolving the
+        // commit id, so a rewritten commit whose id also names a ref earns
+        // `get_oid_basic()`'s ambiguity warning here.
+        //
+        // Only on the `$filter_subdir` **empty** arm. The other one is
+        //
+        //     err=$(GIT_ALLOW_NULL_SHA1=1 \
+        //           git read-tree -i -m $commit:"$filter_subdir" 2>&1) || { … }
+        //
+        // and that `2>&1` inside a command substitution puts the whole of
+        // `read-tree`'s stderr — warning included — into `$err`, which the
+        // success path then throws away. So `--subdirectory-filter` prints one
+        // warning *fewer* per commit than `--index-filter` does, which is
+        // exactly what stock 2.55.0 does (five against six on the same commit).
+        if need_index && opts.filter_subdir.is_empty() {
+            crate::objname::warn_ambiguous_refname(repo, &commit_hex);
+        }
         let commit_tree = tree_of(repo, *commit)?;
         let base_tree = if opts.filter_subdir.is_empty() {
             commit_tree
@@ -1056,6 +1139,9 @@ fn rewrite(
 
         // Lines 415-423: `$GIT_COMMIT`, `../commit`, `set_ident`, `--env-filter`.
         sh.run(&format!("GIT_COMMIT={commit_hex}\nexport GIT_COMMIT"))?;
+        // Line 417: `git cat-file commit "$commit"`, which every commit goes
+        // through whatever the filters are.
+        crate::objname::warn_ambiguous_refname(repo, &commit_hex);
         let object = repo
             .find_object(*commit)
             .map_err(|_| anyhow::anyhow!("cannot read commit {commit_hex}"))?;
@@ -1085,6 +1171,10 @@ fn rewrite(
             if sh.run("eval \"$filter_tree\" < /dev/null")? != 0 {
                 return die(&format!("tree filter failed: {}", opts.filter_tree));
             }
+            // Line 434: `git diff-index -r --name-only --ignore-submodules
+            // $commit --`, the script's way of listing what the filter removed.
+            // Another process, another resolution of the commit id.
+            crate::objname::warn_ambiguous_refname(repo, &commit_hex);
             tree = hash_worktree(repo, &ctx.workdir, base_tree)?;
         }
 
@@ -1159,6 +1249,13 @@ fn rewrite(
                 Err(code) => return Err(Exit(code).into()),
             }
         }
+        // The `else` arm of that same `if test -n "$need_index"` is
+        // `tree=$(git rev-parse "$commit^{tree}")` — one more process resolving
+        // the commit id, and the last of the loop's. `peel_onion()` cuts the
+        // `^{tree}` before `get_oid_basic()`, so the warning names the id.
+        if !need_index {
+            crate::objname::warn_ambiguous_refname(repo, &commit_hex);
+        }
 
         // Lines 480-482: the commit filter, in its own shell, with `$workdir`
         // in its environment so `map()` resolves.
@@ -1173,6 +1270,19 @@ fn rewrite(
         // remaining item on the clock the script's progress line reports.
         let map_path = format!("../map/{commit_hex}");
         if fast_commit {
+            // The `git commit-tree` this replaces resolves each `-p <parent>`
+            // through `repo_get_oid_commit()` (`parse_parent_arg_callback`,
+            // builtin/commit-tree.c:40-54) and then `<tree>` through
+            // `repo_get_oid_tree()` — `parse_options()` runs the `-p` callbacks
+            // first, so that is also the order the warnings come out in. A
+            // parent whose id happens to name a ref therefore warns once per
+            // rewritten child, which is how `filter-branch -f ^<40-hex-ref>
+            // main` reaches five warnings where the arguments alone explain
+            // four.
+            for parent in &seen {
+                crate::objname::warn_ambiguous_refname(repo, parent);
+            }
+            crate::objname::warn_ambiguous_refname(repo, &tree.to_string());
             let message = fs::read(ctx.tempdir.join("message"))?;
             match write_commit_object(repo, tree, &seen, &message, commit_encoding.clone(), &raw)? {
                 Some(id) => fs::write(ctx.map_file(&commit_hex), format!("{id}\n"))?,
@@ -1969,9 +2079,63 @@ fn die_ambiguous<T>(token: &str) -> Result<T> {
     )
 }
 
-/// The script's three `git rev-parse` calls over `"$@"` (lines 269, 316, 325),
-/// as one pass. Arguments outside the ported set are refused rather than
-/// silently dropped, since dropping one rewrites a different set of commits.
+/// The `warning: refname '<40-hex>' is ambiguous.` set **one** `git rev-parse`
+/// pass over `<rev-list options>` prints.
+///
+/// The script is a shell script, and it hands `"$@"` to four separate
+/// `git rev-parse` processes — lines 269, 316, 325 and 329/332. Each is its own
+/// `cmd_rev_parse()`, so each reaches `get_oid_basic()` once per revision word
+/// and each prints the warning again: `git filter-branch -f <40-hex>` in a
+/// repository holding `refs/heads/<40-hex>` produces it four times over from the
+/// argument alone (verified against stock 2.55.0 with `GIT_TRACE=2`, which
+/// attributes one warning to each of the four invocations).
+///
+/// [`select`] answers all four passes from a single resolution, and resolves
+/// quietly — [`resolve_arg`] goes through [`crate::objname::full_hex`], which is
+/// `get_oid_basic()`'s decode without its warning. So the count is replayed from
+/// here at the script's own four points instead of falling out of the
+/// resolution, which is also the only way to get the *placement* right: the
+/// `heads` check and the `--state-branch` load sit between line 269 and line
+/// 316 and either can end the run.
+///
+/// Only revision words warn. `cmd_rev_parse()` stops resolving at `--`
+/// (`as_is`, builtin/rev-parse.c:751-756), and `--all`/`--branches`/`--tags`/
+/// `--remotes` name refs through `handle_refs()` rather than object names, so
+/// neither shape reaches `get_oid_basic()` at all.
+fn warn_rev_args(repo: &gix::Repository, args: &[String]) {
+    let mut in_paths = false;
+    for arg in args {
+        if in_paths {
+            continue;
+        }
+        match arg.as_str() {
+            "--" => in_paths = true,
+            "--all" | "--branches" | "--tags" | "--remotes" => {}
+            // `handle_dotdot()` runs before anything else looks at the token,
+            // and its two `repo_get_oid_with_context()` calls are joined by
+            // `||` — so a left endpoint that does not resolve keeps the right
+            // one from ever being resolved, and from ever warning.
+            _ if crate::objname::split_range(arg).is_some() => {
+                crate::objname::warn_dotdot_endpoints(repo, arg);
+            }
+            // `handle_revision_arg_1()` advances past the exclusion mark before
+            // resolving, so `^<40-hex>` warns about the 40 characters and not
+            // about the 41-character token.
+            _ => {
+                let (name, _) = crate::objname::uninteresting_mark(arg);
+                crate::objname::warn_ambiguous_refname(repo, name);
+            }
+        }
+    }
+}
+
+/// The script's four `git rev-parse` calls over `"$@"` (lines 269, 316, 325 and
+/// 329/332), as one pass. Arguments outside the ported set are refused rather
+/// than silently dropped, since dropping one rewrites a different set of commits.
+///
+/// Deliberately silent: the ambiguity warning those four processes print is
+/// [`warn_rev_args`]'s, called four times at the script's own points, because
+/// resolving here once would produce one warning where stock prints four.
 fn select(repo: &gix::Repository, args: &[String]) -> Result<Selection> {
     let mut sel = Selection::default();
     let mut in_paths = false;
@@ -2069,12 +2233,22 @@ fn select(repo: &gix::Repository, args: &[String]) -> Result<Selection> {
                 saw_rev = true;
             }
             // An absent full-length hex is still a revision, so it never becomes
-            // a pathspec and never reaches the `--` advice — it names no ref
-            // either, which is what leaves `heads` empty and stops the run at
-            // `You must specify a ref to rewrite.` before `rev-list` runs.
+            // a pathspec and never reaches the `--` advice.
+            //
+            // Whether the run gets any further is decided by `git rev-parse
+            // --symbolic-full-name`, and that question is about the *ref store*,
+            // not the object database: a repository that happens to hold
+            // `refs/heads/<40-hex>` answers with that ref, `heads` is not empty,
+            // and the run carries on to `rev-list`, which is where the missing
+            // object is finally reported. Without such a ref there is nothing to
+            // print, `heads` stays empty and the run stops at `You must specify
+            // a ref to rewrite.` — the same two outcomes stock 2.55.0 produces.
             Resolved::Absent(id) => {
                 sel.tips.push(id);
                 sel.bad_object.get_or_insert(id);
+                if let Some(name) = symbolic_full_name(repo, arg) {
+                    sel.head_refs.push(name);
+                }
                 saw_rev = true;
             }
             Resolved::Unresolvable if Path::new(arg).exists() => {

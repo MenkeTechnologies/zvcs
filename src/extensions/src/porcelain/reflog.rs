@@ -1567,6 +1567,25 @@ enum Resolved {
 /// Resolve a `<ref>`, `<ref>@{<n>}` or `<ref>@{<date>}` argument the way git's
 /// revision parser does, reporting git's own fatal text at the failure points.
 fn resolve_spec(repo: &gix::Repository, spec: &str) -> Result<Resolved> {
+    // `cmd_log_reflog()` hands every operand to `setup_revisions()`, so
+    // `get_oid_basic()` sees it before the reflog is ever opened — and a
+    // full-length hex takes that function's *first* branch, warning about a
+    // same-named ref and returning the id. The walk still shows that ref's log,
+    // because `add_reflog_for_walk()` dwims `e->name` rather than the id, which
+    // is why the warning is all that distinguishes the two implementations here.
+    //
+    // Once per operand: this function is called once for each argument and once
+    // for the `HEAD` default, exactly as git resolves them.
+    //
+    // The exclusion mark is split off first because `handle_revision_arg_1()`
+    // advances past it (`if (*arg == '^') { … arg++; }`) before
+    // `get_oid_with_context()` is called, so `get_oid_basic()` measures the name
+    // *without* the caret and its full-hex branch is the one taken —
+    // `git reflog show ^<40-hex-ref>` warns in stock 2.55.0. `repo_get_oid()`
+    // does no such strip, which is why [`crate::objname::ambiguity_base`] does
+    // not either and the walkers do it here.
+    crate::objname::warn_ambiguous_refname(repo, crate::objname::uninteresting_mark(spec).0);
+
     let (base, selector) = split_selector(spec);
 
     let entries = read_entries(repo, base)?;
@@ -1574,8 +1593,35 @@ fn resolve_spec(repo: &gix::Repository, spec: &str) -> Result<Resolved> {
     match selector {
         None => {
             let Some(entries) = entries else {
-                // Not a ref with a log. Still fine if it names an object at all.
-                return Ok(if repo.rev_parse_single(base).is_ok() {
+                // Not a ref with a log, so `setup_revisions()` decides the
+                // operand's fate the way it decides every other one:
+                //
+                // ```c
+                // if (get_oid_with_context(revs->repo, arg, get_sha1_flags, &oid, &oc)) {
+                //         ret = revs->ignore_missing ? 0 : -1;
+                //         goto out;
+                // }
+                // if (!cant_be_filename)
+                //         verify_non_filename(the_repository, revs->prefix, arg);
+                // object = get_reference(revs, arg, &oid, flags ^ local_flags);
+                // ```
+                //
+                // `get_oid_with_context()` is the full-hex rule — an id the
+                // repository does not have still resolves, without the object
+                // database being consulted — and `get_reference()` then
+                // `parse_object()`s it and `die(_("bad object %s"), name)`s.
+                // Only a name that resolves to nothing at all reaches
+                // `setup_revisions()`'s `ambiguous argument` block, which is why
+                // `git reflog show <absent-40-hex>` is `bad object` in stock
+                // 2.55.0 and `git reflog show nosuchref` is not.
+                //
+                // Quiet, because this function already reached
+                // `warn_ambiguous_refname` for `spec` above and git resolves the
+                // operand once.
+                return Ok(if crate::objname::resolves_but_absent(repo, base) {
+                    eprintln!("fatal: bad object {base}");
+                    Resolved::Fatal(128)
+                } else if crate::objname::resolve_quiet(repo, base).is_some() {
                     Resolved::Empty
                 } else {
                     Resolved::Fatal(fatal_ambiguous(spec))

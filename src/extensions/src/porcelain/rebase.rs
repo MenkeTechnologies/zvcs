@@ -1330,6 +1330,11 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
     let upstream_oid = if root {
         None
     } else {
+        // `options.upstream = lookup_commit_reference_by_name(options.upstream_name)`
+        // (`builtin/rebase.c:1663`), which opens with `repo_get_oid_committish()`
+        // — one trip through `get_oid_basic()`, so one
+        // `warning: refname … is ambiguous.` for the operand as typed.
+        crate::objname::warn_ambiguous_refname(&repo, &upstream_spec);
         match peel_to_commit(&repo, &upstream_spec) {
             Some(oid) => Some(oid),
             None => die!("invalid upstream '{upstream_spec}'"),
@@ -1352,13 +1357,52 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
     let mut eager_switch: Option<String> = None;
     let branch_name = match branch_arg {
         Some(requested) => {
-            let is_branch = repo
-                .try_find_reference(&format!("refs/heads/{requested}"))
-                .ok()
-                .flatten()
-                .is_some();
-            let resolved = peel_to_commit(&repo, requested);
-            if !is_branch && resolved.is_none() {
+            // ```c
+            // strbuf_addf(&buf, "refs/heads/%s", branch_name);
+            // if (!refs_read_ref(get_main_ref_store(the_repository), buf.buf, &branch_oid)) {
+            //         die_if_checked_out(buf.buf, 1);
+            //         options.head_name = xstrdup(buf.buf);
+            //         options.orig_head = lookup_commit_object(the_repository, &branch_oid);
+            // /* If not is it a valid ref (branch or commit)? */
+            // } else {
+            //         options.orig_head = lookup_commit_reference_by_name(branch_name);
+            //         options.head_name = NULL;
+            // }
+            // ```
+            //
+            // The two arms resolve the operand by *different* means, and which one
+            // runs decides both what is rebased and whether the operand warns:
+            //
+            // * `refs_read_ref()` is a ref-store read. It never reaches
+            //   `get_oid_basic()`, so a `<branch>` whose name happens to be 40 hex
+            //   digits does not warn — and `options.orig_head` is the **branch's
+            //   own tip**, not the object those 40 characters decode to. Resolving
+            //   this arm through a revspec parser instead picks up
+            //   `get_oid_basic()`'s full-hex rule and rebases the wrong commit,
+            //   which then fails the `refs/heads/<hex>` update with an old-value
+            //   mismatch (the ref holds its tip, the update expects the decoded
+            //   id).
+            // * `lookup_commit_reference_by_name()` is the ordinary resolution and
+            //   does warn, once.
+            let branch_ref = repo.try_find_reference(&format!("refs/heads/{requested}")).ok().flatten();
+            let is_branch = branch_ref.is_some();
+            if !is_branch {
+                crate::objname::warn_ambiguous_refname(&repo, requested);
+            }
+            // `lookup_commit_object()` for the ref arm — the tip as recorded, with
+            // no tag peeling and no revspec grammar; `peel_to_commit()` for the
+            // other, which is what `lookup_commit_reference_by_name()` does.
+            let resolved = match branch_ref {
+                Some(mut r) => r
+                    .peel_to_id()
+                    .ok()
+                    .map(gix::Id::detach)
+                    .and_then(|id| repo.find_object(id).ok())
+                    .filter(|o| o.kind == gix::object::Kind::Commit)
+                    .map(|o| o.id),
+                None => peel_to_commit(&repo, requested),
+            };
+            if resolved.is_none() {
                 die!("no such branch/commit '{requested}'");
             }
             let current = branch.as_ref().map(|b| b.shorten().to_string());
@@ -1413,7 +1457,25 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
         } else {
             right_raw
         };
-        let base = match (peel_to_commit(&repo, left), peel_to_commit(&repo, right)) {
+        // `repo_get_oid_mb()` (`object-name.c:1308`) resolves the two sides in
+        // order and gives up between them:
+        //
+        // ```c
+        // st = repo_get_oid_committish(r, sb.buf, &oid_tmp);
+        // if (st) return st;
+        // one = lookup_commit_reference_gently(r, &oid_tmp, 0);
+        // if (!one) return -1;
+        // if (repo_get_oid_committish(r, dots[3] ? (dots + 3) : "HEAD", &oid_tmp)) return -1;
+        // ```
+        //
+        // so a left side that does not resolve — or resolves to something that is
+        // not commit-ish — means the right one is never looked at and never warns.
+        crate::objname::warn_ambiguous_refname(&repo, left);
+        let left_commit = peel_to_commit(&repo, left);
+        if left_commit.is_some() {
+            crate::objname::warn_ambiguous_refname(&repo, right);
+        }
+        let base = match (left_commit, peel_to_commit(&repo, right)) {
             (Some(l), Some(r)) => merge_base_unique(&repo, l, r)?,
             _ => None,
         };
@@ -1425,6 +1487,11 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
             None => die!("'{onto_spec}': need exactly one merge base"),
         }
     } else {
+        // `options.onto = lookup_commit_reference_by_name(options.onto_name)`
+        // (`builtin/rebase.c:1760`). Without `--onto`, `options.onto_name` *is*
+        // `options.upstream_name` (`:1747`), so the same operand is resolved a
+        // second time and `git rebase <40-hex-ref>` warns twice, not once.
+        crate::objname::warn_ambiguous_refname(&repo, &onto_spec);
         match peel_to_commit(&repo, &onto_spec) {
             Some(oid) => oid,
             None => die!("Does not point to a valid commit '{onto_spec}'"),

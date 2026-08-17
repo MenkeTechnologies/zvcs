@@ -172,3 +172,109 @@ fn a_path_nothing_touched_shows_nothing() {
     let f = Fixture::nested_merges(TAG);
     assert!(f.subjects(&["--full-history", "--simplify-merges", "--", "nosuch.txt"]).is_empty());
 }
+
+/// `revs->simplify_history` has three sources beyond `--full-history`, and each is
+/// a plain `= 0` that nothing puts back.
+///
+/// ```c
+/// static void set_separate(struct rev_info *revs)
+/// {
+///         common_setup(revs);
+///         revs->separate_merges = 1;
+///         revs->simplify_history = 0;
+/// }
+/// ```
+///
+/// (diff-merges.c:34-39.) So `-m` and every `--diff-merges` value that routes
+/// through `set_separate()` turn history simplification off as a side effect of
+/// choosing what a merge's diff shows — while `-c`, `--cc` and `--diff-merges=off`,
+/// which run `set_combined()` / `set_dense_combined()` / `set_none()`, leave it on.
+/// `cmd_whatchanged()` sets it directly (`rev.simplify_history = 0`,
+/// builtin/log.c:620), which is the whole difference between `git whatchanged` and
+/// `git log --raw` on a merge a pathspec makes TREESAME.
+///
+/// A single merge is enough to see it: `I -> {side-nopath, A} -> M`, where `M` took
+/// `A`'s `f.txt` and is therefore TREESAME to `A` over that path.
+#[test]
+fn diff_merges_separate_and_whatchanged_clear_simplify_history() {
+    const TAG: &str = "simplify-sources";
+    let f = Fixture::nested_merges(TAG);
+
+    // The default walk collapses `M1` onto the parent it matched.
+    let base = f.subjects(&["--", "f.txt"]);
+    assert!(!base.contains(&"M1".to_owned()), "{base:?}");
+
+    for spelling in [
+        vec!["-m"],
+        vec!["--diff-merges=separate"],
+        vec!["--diff-merges=1"],
+        vec!["--diff-merges=on"],
+        // `set_none()` runs only `suppress()`, which does not touch
+        // `simplify_history`, so an `--diff-merges=off` *after* `-m` does not undo it.
+        vec!["-m", "--diff-merges=off"],
+        vec!["-m", "--no-diff-merges"],
+    ] {
+        let mut args = spelling.clone();
+        args.extend_from_slice(&["--", "f.txt"]);
+        let seen = f.subjects(&args);
+        assert!(seen.contains(&"M1".to_owned()), "{spelling:?} simplified M1 away: {seen:?}");
+    }
+
+    // The modes that do not route through `set_separate()` leave it simplifying.
+    for spelling in [vec!["-c"], vec!["--cc"], vec!["--diff-merges=off"]] {
+        let mut args = spelling.clone();
+        args.extend_from_slice(&["--format=%s", "--", "f.txt"]);
+        let mut a = vec!["log"];
+        a.extend_from_slice(&args);
+        let out = f.cmd(&a).output().unwrap();
+        assert_eq!(out.status.code(), Some(0), "`git {a:?}`: {out:?}");
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(
+            !text.lines().any(|l| l == "M1"),
+            "{spelling:?} kept M1 in a simplifying walk: {text}"
+        );
+    }
+}
+
+/// `git whatchanged` keeps the merge its `simplify_history = 0` saved, but only
+/// where something still prints a record for it: its `always_show_header` is off,
+/// so a merge with an empty diff queue is dropped again on the way out. `-c` is
+/// what makes it visible, because `diff_tree_combined()` prints the header itself
+/// before it scans a path:
+///
+/// ```c
+/// show_log_first = !!rev->loginfo && !rev->no_commit_id;
+/// if (show_log_first) {
+///         show_log(rev);
+///         …
+/// }
+/// ```
+///
+/// (combine-diff.c:1512-1522.)
+#[test]
+fn whatchanged_keeps_a_treesame_merge_that_log_simplifies_away() {
+    const TAG: &str = "wc-simplify";
+    let f = Fixture::nested_merges(TAG);
+    let subjects = |args: &[&str]| -> Vec<String> {
+        let out = f.cmd(args).output().unwrap();
+        assert_eq!(out.status.code(), Some(0), "`git {args:?}`: {out:?}");
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| matches!(*l, "M1" | "M2" | "A" | "B" | "C" | "I"))
+            .map(str::to_owned)
+            .collect()
+    };
+
+    let logged = subjects(&["log", "-c", "--format=%s", "--", "f.txt"]);
+    assert!(!logged.contains(&"M1".to_owned()), "log -c kept M1: {logged:?}");
+
+    let changed = subjects(&[
+        "whatchanged",
+        "--i-still-use-this",
+        "-c",
+        "--format=%s",
+        "--",
+        "f.txt",
+    ]);
+    assert!(changed.contains(&"M1".to_owned()), "whatchanged -c dropped M1: {changed:?}");
+}

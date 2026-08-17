@@ -4359,9 +4359,25 @@ pub(crate) fn compute_compacted(
     after: &[&[u8]],
     indent_heuristic: bool,
 ) -> gix::diff::blob::Diff {
-    use gix::diff::blob::{IndentHeuristic, IndentLevel, SliderHeuristic, Token};
+    use gix::diff::blob::{compact, IndentHeuristic, IndentLevel, SliderHeuristic, Token};
 
     let mut diff = gix::diff::blob::Diff::compute(algorithm, input);
+    if algorithm == gix::diff::blob::Algorithm::Histogram {
+        // Histogram is the one algorithm whose `xdl_change_compact()` does more than slide:
+        // a group that grew by merging during the slide can hold lines that match in both
+        // files, and git re-diffs the merged group with Myers to mark them unchanged
+        // (`xdiff/xdiffi.c:940-958`). `postprocess_with` below has no such step, so
+        // histogram goes through the full port of `xdl_change_compact()` instead.
+        let line_indents = |lines: &[&[u8]]| -> Vec<i32> { lines.iter().map(|l| compact::get_indent(l)).collect() };
+        let (indent_before, indent_after) = (line_indents(before), line_indents(after));
+        diff.compact_with(
+            algorithm,
+            &input.before,
+            &input.after,
+            indent_heuristic.then_some((indent_before.as_slice(), indent_after.as_slice())),
+        );
+        return diff;
+    }
     if !indent_heuristic {
         diff.postprocess_no_heuristic(input);
         return diff;

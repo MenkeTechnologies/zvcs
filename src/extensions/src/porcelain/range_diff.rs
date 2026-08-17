@@ -1628,7 +1628,7 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
     // spliced in at range-diff.c:71-73). It is resolved here, between the two
     // ranges, because range1's log is the one that meets it first: an operand it
     // rejects is reported against range1, and range2's log never runs.
-    let extra = match extra_operands(&repo, &range1, &extra) {
+    let operands = match extra_operands(&repo, &range1, &extra) {
         Ok(e) => e,
         Err(code) => return Ok(code),
     };
@@ -1636,6 +1636,19 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
         Ok(e) => walkable(&repo, e),
         Err(_) => return Ok(could_not_parse_log(&repo, &range2)),
     };
+    // range2's log is a *second* process handed the same `log_arg` list, so it
+    // resolves every one of those operands over again. That is observable: an
+    // operand that is a full-length hex and also a ref name earns
+    // `get_oid_basic()`'s `warning: refname … is ambiguous.` once per log, and
+    // stock 2.55.0 prints it twice for `range-diff <r1> <r2> <40-hex>`. Resolving
+    // once and reusing the ids under-warns by exactly one. The result is
+    // discarded — it can only equal the first pass's — for the same reason
+    // `notes1` and `notes2` are loaded separately below: what is being reproduced
+    // is the second log's side effects, not a second answer.
+    if let Err(code) = extra_operands(&repo, &range2, &extra) {
+        return Ok(code);
+    }
+    let extra = operands;
 
     // The one `log_arg` list is appended to *both* logs, so a revision operand
     // widens each walk alike.
@@ -2224,11 +2237,46 @@ fn classify(
     Err(usage_error("need two commit ranges"))
 }
 
-/// `get_oid_committish()`: does `spec` name something that peels to a commit?
+/// `repo_get_oid_committish()`: does `spec` name an object at all?
+///
 /// Never fatal — a miss is reported as `false`, matching upstream's use of the
 /// return value as a mere predicate in the three-committish test.
+///
+/// The name is resolved, never peeled. `repo_get_oid_committish()` is
+/// `repo_get_oid_with_context(…, GET_OID_COMMITTISH, …)`, and that flag steers
+/// how a *short* or `@{…}` name is disambiguated; it does not reject a name that
+/// resolves to a tree or a blob. So stock 2.55.0 reads `range-diff <tree> <a>
+/// <b>` as the three-committish form and renders it, while peeling here refused
+/// the same command line as `need two commit ranges`. Resolution — and the
+/// `get_oid_basic()` ambiguity warning that comes with it — is
+/// [`crate::objname::resolve`]'s, shared with every other command that takes an
+/// object name from argv.
+///
+/// The operand reaches that call **as typed**, and that is the one place this
+/// differs from every *revision* operand in the file. The `^` exclusion mark
+/// belongs to `revision.c`:
+///
+/// ```c
+/// if (*arg == '^') {
+///         local_flags = UNINTERESTING | BOTTOM;
+///         arg++;
+/// }
+/// ```
+///
+/// `cmd_range_diff()` calls `repo_get_oid_committish()` directly, so no such
+/// strip happens and `object-name.c` sees the leading `^`. Nothing there has a
+/// form for it: `get_oid_basic()` measures one character too many for its
+/// full-hex branch — taking the `warning: refname … is ambiguous.` with it —
+/// `peel_onion()` and the `~<n>`/`^<n>` suffix rule both look at the *tail*, and
+/// `repo_dwim_ref()` cannot match because `check_refname_format()` bans `^` in a
+/// ref name. The answer is a silent `false`, which is why stock says nothing for
+/// `range-diff ^<40-hex> <a> <b>` while handing the same operand to `git log` —
+/// where the mark *is* stripped first — warns once.
 fn committish(repo: &gix::Repository, spec: &str) -> bool {
-    resolve_commit(repo, spec).is_ok()
+    if spec.starts_with('^') {
+        return false;
+    }
+    crate::objname::resolve(repo, spec).is_some()
 }
 
 /// `is_range_diff_range()`: run `spec` through the same resolution `git log`
@@ -2238,10 +2286,45 @@ fn committish(repo: &gix::Repository, spec: &str) -> bool {
 /// and a hidden negative endpoint, and [`RangeKind::NotRange`] otherwise. This
 /// recognises every spelling gitoxide's rev-parse does, so `<rev>^!` and
 /// `<rev>^@` are handled alongside `<a>..<b>` and `<a>...<b>`.
+///
+/// ```c
+/// if (setup_revisions(3, argv, &revs, NULL) == 1) {
+///         for (i = 0; i < revs.pending.nr; i++)
+///                 if (revs.pending.objects[i].item->flags & UNINTERESTING)
+///                         negative++;
+///                 else
+///                         positive++;
+/// }
+/// …
+/// return negative > 0 && positive > 0;
+/// ```
+///
+/// The count walks the *pending list*, but `UNINTERESTING` is a bit on the
+/// `struct object` each entry points at — not on the entry. So when both
+/// endpoints name the same object the two entries are the same object, and
+/// `handle_dotdot_1()`'s
+///
+/// ```c
+/// a_obj->flags |= a_flags;
+/// b_obj->flags |= flags;
+/// ```
+///
+/// leaves that one object `UNINTERESTING` (`b_obj->flags |= 0` cannot clear what
+/// the line above set). `<x>..<x>` is therefore `negative == 2, positive == 0` —
+/// **not** a range — and stock answers `fatal: need two commit ranges` for
+/// `range-diff HEAD..HEAD <a>..<b>`. The symmetric spelling reaches the same
+/// place by a different route: `repo_get_merge_bases(a, a)` is `a` itself, and
+/// `add_pending_commit_list(revs, exclude, flags_exclude)` marks it before
+/// `a_flags`/`flags` are applied.
+///
+/// Modelled here by treating an id that appears on both sides as the single
+/// object it is: the tips that are also hidden count as negative.
 fn is_range_diff_range(repo: &gix::Repository, spec: &str) -> RangeKind {
     match endpoints(repo, spec) {
         Ok((tips, hidden)) => {
-            if !tips.is_empty() && !hidden.is_empty() {
+            let positive = tips.iter().filter(|id| !hidden.contains(id)).count();
+            let negative = tips.len() + hidden.len() - positive;
+            if positive > 0 && negative > 0 {
                 RangeKind::Range
             } else {
                 RangeKind::NotRange
@@ -2261,13 +2344,17 @@ fn is_range_diff_range(repo: &gix::Repository, spec: &str) -> RangeKind {
 /// `die(_("bad revision '%s'"), arg)` rather than `verify_filename()`'s
 /// `ambiguous argument` advice.
 ///
-/// The exception is a range whose endpoints *resolve* but whose objects are not
-/// in the database: `handle_dotdot_1()` dies inside `setup_revisions()` before
-/// that block is reached, naming the whole token (see [`crate::objname::dotdot`]).
-/// A full-length hex is exactly the name that gets that far, since
-/// `get_oid_basic()` decodes it without consulting the object database.
+/// The exception is a token `handle_revision_arg()` dies *inside* — a range
+/// whose endpoints resolve but whose objects are not in the database
+/// (`dotdot_missing()`), or a single name `get_reference()` reports as
+/// `bad object`. Both are reached because `get_oid_basic()` decodes a
+/// full-length hex without consulting the object database, and both are asked of
+/// [`super::log::early_revision_fatal`], which is where that pair of endings
+/// lives for every command with a filename fallback. `cant_be_filename` is true
+/// here: `is_range_diff_range()` hands `setup_revisions()` a `--` of its own, so
+/// the operand can never be re-read as a path.
 fn bad_revision(repo: &gix::Repository, spec: &str) -> ExitCode {
-    if let Some(fatal) = objname::dotdot_fatal(repo, spec) {
+    if let Some(fatal) = super::log::early_revision_fatal(repo, spec, true) {
         eprint!("{fatal}");
         return ExitCode::from(128);
     }
@@ -2329,11 +2416,23 @@ fn extra_operands(
                 out.tips.extend(tips);
                 out.hidden.extend(hidden);
             }
-            Err(_) if arg.starts_with('^') => {
-                eprintln!("fatal: bad revision '{arg}'");
-                return Err(log_parse_failed(range));
-            }
             Err(_) => {
+                // `handle_revision_arg()` has two endings that die *inside* it,
+                // so the token never reaches either fallback below:
+                // `dotdot_missing()` and `get_reference()`'s `bad object`.
+                // `cant_be_filename` is false — these operands trail the ranges on
+                // the inner `git log`, with no `--` in front of them — so a name
+                // that is also a working-tree path is reported as "both revision
+                // and filename" instead. Asked once and kept: the helper resolves
+                // the name to answer, and git resolves an operand once.
+                if let Some(message) = super::log::early_revision_fatal(repo, arg, false) {
+                    eprint!("{message}");
+                    return Err(log_parse_failed(range));
+                }
+                if arg.starts_with('^') {
+                    eprintln!("fatal: bad revision '{arg}'");
+                    return Err(log_parse_failed(range));
+                }
                 for (j, rest) in extra[n..].iter().enumerate() {
                     if let Some(msg) = crate::setup::verify_filename(rest, j == 0) {
                         eprintln!("fatal: {msg}");
@@ -2360,15 +2459,6 @@ fn build_matcher(repo: &gix::Repository, pathspec: &[String]) -> Result<Option<P
     Ok(Some(PathMatcher::new(repo, pathspec)?))
 }
 
-fn resolve_commit(repo: &gix::Repository, spec: &str) -> Result<ObjectId> {
-    let commit = repo
-        .rev_parse_single(spec)?
-        .object()?
-        .peel_to_commit()
-        .map_err(|e| anyhow!("{spec}: not a commit: {e}"))?;
-    Ok(commit.id)
-}
-
 /// Split a range into the tips it includes and the commits it hides.
 ///
 /// `<a>..<b>` hides `a` and includes `b`; `<a>...<b>` includes both and hides
@@ -2385,6 +2475,13 @@ fn endpoints(repo: &gix::Repository, spec: &str) -> Result<(Vec<ObjectId>, Vec<O
     // form type-checks — because `is_range_diff_range()` counts
     // `revs.pending.nr` before `prepare_revision_walk()` has dropped anything,
     // and [`walkable`] is what applies the drop for the callers that walk.
+    // `handle_dotdot_1()` resolves both endpoints through
+    // `get_oid_with_context()` before it looks either of them up, so that pair of
+    // calls is where an endpoint that is a full-length hex *and* a ref name earns
+    // its `warning: refname … is ambiguous.`. [`crate::objname::dotdot`] itself is
+    // quiet: it is a classifier, asked again by every caller that then wants to
+    // diagnose what it classified.
+    crate::objname::warn_dotdot_endpoints(repo, spec);
     match crate::objname::dotdot(repo, spec) {
         crate::objname::Dotdot::Ok { a, b } => {
             let symmetric = crate::objname::split_range(spec)
@@ -2397,10 +2494,19 @@ fn endpoints(repo: &gix::Repository, spec: &str) -> Result<(Vec<ObjectId>, Vec<O
                 repo.merge_bases_many(a, &[b])?.into_iter().map(|id| id.detach()).collect();
             return Ok((vec![a, b], bases));
         }
-        // `dotdot_missing()`: the caller reports it through
-        // `could_not_parse_log()`, which renders the same fatal `git log` would.
+        // `dotdot_missing()`. Deliberately *not* rendered here: every one of this
+        // function's four callers discards the `Err` and re-reports through
+        // `could_not_parse_log()` → [`super::log::bad_revision_message_in`],
+        // which is the only path that also emits the `error: object … is a …`
+        // notes `lookup_commit_reference()` prints ahead of the fatal. A second
+        // copy of the wording built here would be a string nothing prints and no
+        // test can pin — and the copy that used to stand in this spot proved the
+        // point by drifting: it passed `symmetric: false` unconditionally, so it
+        // called an `<a>...<b>` an `Invalid revision range` where git says
+        // `Invalid symmetric difference expression`, for years, invisibly. What
+        // the `Err` carries is only what a `Result` must carry.
         crate::objname::Dotdot::Missing { .. } => {
-            return Err(anyhow!("{spec}: {}", crate::objname::dotdot_missing_message(spec, false)))
+            return Err(anyhow!("{spec}: endpoints resolve but their objects are missing"));
         }
         // `handle_dotdot()` returned non-zero, so the token is not a range at
         // all and the spellings below get their turn — exactly as
@@ -2416,6 +2522,36 @@ fn endpoints(repo: &gix::Repository, spec: &str) -> Result<(Vec<ObjectId>, Vec<O
         let commit = repo.find_object(id)?.try_into_commit()?;
         Ok(commit.parent_ids().map(|p| p.detach()).collect())
     };
+    // The single `get_oid_basic()` call this operand reaches, which is the other
+    // place the ambiguity warning is due. It is asked of
+    // [`crate::objname`] rather than of rev-parse, because rev-parse resolves
+    // through the object database and so never sees the full-hex branch that
+    // warns; the helper peels the `~<n>`/`^<n>`/`^{…}`/`:<path>` suffixes the way
+    // `get_oid_1()` does before deciding.
+    // The mark comes off first: `handle_revision_arg_1()` advances past a leading
+    // `^` before `get_oid_with_context()` sees the name, so `get_oid_basic()`
+    // measures `<40-hex>` rather than `^<40-hex>` and takes its full-hex branch.
+    // `repo_get_oid()` performs no such strip, which is why
+    // [`crate::objname::ambiguity_base`] does not either.
+    crate::objname::warn_ambiguous_refname(repo, crate::objname::uninteresting_mark(spec).0);
+    // …and the *resolution* that branch performs, which `rev_parse` does not
+    // have: a name of exactly `hexsz` hex digits **is** the object id, decoded
+    // without the object database or the ref store being consulted. gitoxide
+    // looks the id up and, when the repository does not have it, falls back to a
+    // ref of the same name — so in a repository holding `refs/heads/<40-hex>`
+    // this walked that ref's history where git reports `bad object`. The mark is
+    // split off first because `handle_revision_arg_1()` advances past it before
+    // resolving; a `^@`/`^!`/`^-<n>` spelling is longer than `hexsz` and so falls
+    // through to `rev_parse` untouched, which is where `add_parents_only()`'s
+    // forms are handled.
+    let (bare, negative) = crate::objname::uninteresting_mark(spec);
+    if let Some(id) = crate::objname::full_hex(repo, bare) {
+        // `get_reference()`: `parse_object()` or `die("bad object %s", name)`.
+        // The caller renders that fatal through
+        // [`super::log::early_revision_fatal`], so only the failure matters here.
+        repo.find_object(id).map_err(|_| anyhow!("bad object {bare}"))?;
+        return Ok(if negative { (vec![], vec![id]) } else { (vec![id], vec![]) });
+    }
     let parsed = repo.rev_parse(spec).map_err(|e| anyhow!("{spec}: {e}"))?;
     match parsed.detach() {
         Spec::Include(id) => Ok((vec![id], vec![])),

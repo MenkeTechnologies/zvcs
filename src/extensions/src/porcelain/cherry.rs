@@ -310,9 +310,13 @@ fn tracked_upstream(repo: &gix::Repository) -> Result<Option<String>> {
 /// `repo_get_oid()` followed by `lookup_commit_reference()`: resolve a revision
 /// and peel it to a commit, or report the failure the caller turns into
 /// `fatal: unknown commit`.
+///
+/// `cmd_cherry()` calls `repo_get_oid()` once per operand — head, then upstream,
+/// then the optional limit — so [`crate::objname::resolve`] carries
+/// `get_oid_basic()`'s ambiguity warning here and each operand earns at most one.
 fn resolve_commit(repo: &gix::Repository, spec: &str) -> Option<ObjectId> {
-    let object = repo.rev_parse_single(spec).ok()?.object().ok()?;
-    Some(object.peel_to_commit().ok()?.id)
+    let id = crate::objname::resolve(repo, spec)?;
+    Some(repo.find_object(id).ok()?.peel_to_commit().ok()?.id)
 }
 
 /// A revision walk over `tips` excluding everything reachable from `hidden`,

@@ -20,6 +20,14 @@
 //!   * `show-branch <absent-id>` drops the rev quietly, because `append_ref()`
 //!     peels with `quiet = 1`; the command still exits 0.
 //!
+//! The `lookup_commit_reference()` peel these operands go through is also run by
+//! `for-each-ref` over **every ref in the array** whenever an
+//! `%(ahead-behind:…)` atom is in play (`filter_ahead_behind()`,
+//! ref-filter.c:3213), and there too `quiet` is 0. So the last group of tests
+//! pins the pass rather than an operand: which refs it reports, that it runs
+//! before `--count` truncates and before the sort, that a `--sort` key alone is
+//! enough to trigger it, and that it reports nothing when no such atom is used.
+//!
 //! Every expectation below was captured from stock git 2.55.0 in an identical
 //! throwaway repository, comparing stdout, stderr and exit status separately.
 #![cfg(unix)]
@@ -275,6 +283,119 @@ fn merged_a_non_commit_reports_the_type_first() {
         )
     );
     assert_eq!(code, 129);
+}
+
+// ---------------------------------------------------------------------------
+// `for-each-ref`'s `%(ahead-behind:…)` per-ref pre-pass
+// ---------------------------------------------------------------------------
+
+/// The same non-quiet peel, reached from the *other* side: not the atom's
+/// operand but every **ref in the array**.
+///
+/// `filter_ahead_behind()` (ref-filter.c:3213-3218) runs between `filter_refs()`
+/// and the sort:
+///
+/// ```c
+/// for (size_t i = 0; i < array->nr; i++) {
+///         const char *name = array->items[i]->refname;
+///         commits[commits_nr] = lookup_commit_reference_by_name(name);
+///         if (!commits[commits_nr])
+///                 continue;
+/// ```
+///
+/// and `lookup_commit_reference_by_name()` is the `quiet = 0` form, so a ref that
+/// does not peel to a commit is reported even though the atom's own operand is
+/// fine and the atom itself renders as the empty string for that ref. Peeling
+/// lazily inside the formatter produces the identical stdout and no stderr at
+/// all, which is why stdout and stderr are asserted separately here.
+#[test]
+fn ahead_behind_reports_every_ref_that_is_not_a_commit() {
+    let f = Fixture::new("ab-prepass");
+    let tag = f.rev_parse("treetag");
+    let tree = f.rev_parse("HEAD^{tree}");
+    assert_ne!(tag, tree, "the annotated tag must be distinguishable from its target");
+
+    let (out, err, code) = f.run(&["for-each-ref", "--format=%(refname) [%(ahead-behind:main)]"]);
+    assert_eq!(err, format!("error: object {tag} is a tree, not a commit\n"));
+    assert_eq!(
+        out,
+        "refs/heads/main [0 0]\n\
+         refs/heads/side [0 0]\n\
+         refs/tags/treetag []\n\
+         refs/tags/v1 [0 0]\n"
+    );
+    assert_eq!(code, 0, "the pass reports and continues; it never fails the command");
+}
+
+/// Three properties that separate the pre-pass from a formatter-side peel, each
+/// of which a lazy implementation gets wrong on its own:
+///
+///   * `--count` is applied later, in `print_formatted_ref_array()`, so a ref
+///     that never reaches the output is still walked and still reports;
+///   * a `--sort` key is a `used_atom` too, so the pass fires for a format that
+///     names no such atom at all;
+///   * a pattern that excludes the offending ref removes it from the array, and
+///     with it the report — the line follows the *array*, not the repository.
+#[test]
+fn the_ahead_behind_pass_follows_the_array_and_not_the_output() {
+    let f = Fixture::new("ab-prepass-scope");
+    let tag = f.rev_parse("treetag");
+    let want = format!("error: object {tag} is a tree, not a commit\n");
+
+    let (out, err, code) = f.run(&[
+        "for-each-ref",
+        "--format=%(refname) [%(ahead-behind:main)]",
+        "--count=1",
+    ]);
+    assert_eq!(err, want, "--count truncates the output, not the pass");
+    assert_eq!(out, "refs/heads/main [0 0]\n");
+    assert_eq!(code, 0);
+
+    let (out, err, code) =
+        f.run(&["for-each-ref", "--format=%(refname)", "--sort=ahead-behind:main"]);
+    assert_eq!(err, want, "a sort key is a used atom");
+    assert_eq!(
+        out,
+        "refs/tags/treetag\nrefs/heads/main\nrefs/heads/side\nrefs/tags/v1\n"
+    );
+    assert_eq!(code, 0);
+
+    let (out, err, code) = f.run(&[
+        "for-each-ref",
+        "--format=%(refname) [%(ahead-behind:main)]",
+        "refs/heads",
+    ]);
+    assert_eq!(err, "", "the tag is not in the array, so nothing reports it");
+    assert_eq!(out, "refs/heads/main [0 0]\nrefs/heads/side [0 0]\n");
+    assert_eq!(code, 0);
+
+    // The control: without any such atom there is no pass and no report, so the
+    // line above cannot be coming from ref iteration in general.
+    let (out, err, code) = f.run(&["for-each-ref", "--format=%(refname)"]);
+    assert_eq!(err, "");
+    assert_eq!(
+        out,
+        "refs/heads/main\nrefs/heads/side\nrefs/tags/treetag\nrefs/tags/v1\n"
+    );
+    assert_eq!(code, 0);
+}
+
+/// The atom's own operand keeps its separate diagnostic:
+/// `ahead_behind_atom_parser()` reports the type through the same non-quiet peel
+/// and then `die("failed to find '%s'", arg)` — 128, before any ref is looked at,
+/// so exactly one type line appears rather than one per ref.
+#[test]
+fn a_bad_ahead_behind_operand_still_dies_before_the_pass() {
+    let f = Fixture::new("ab-operand");
+    let tag = f.rev_parse("treetag");
+    let (out, err, code) =
+        f.run(&["for-each-ref", "--format=%(refname) [%(ahead-behind:treetag)]"]);
+    assert_eq!(
+        err,
+        format!("error: object {tag} is a tree, not a commit\nfatal: failed to find 'treetag'\n")
+    );
+    assert_eq!(out, "");
+    assert_eq!(code, 128);
 }
 
 // ---------------------------------------------------------------------------

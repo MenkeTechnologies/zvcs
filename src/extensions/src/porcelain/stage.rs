@@ -30,8 +30,6 @@
 //!     staged blob is byte-identical to the one `git add` writes — `cmd_stage()`
 //!     *is* `cmd_add()`. `--renormalize` additionally drops the `text=auto` guard
 //!     that normally leaves a file alone when the indexed blob already holds CRLF.
-//!   * `--sparse`/`--no-sparse` are accepted only while the repo has no
-//!     sparse-checkout; with one configured they are rejected rather than ignored.
 //!   * submodule gitlinks are skipped here (use `git zbump`).
 //!   * `-e`/`--edit` is rejected with a precise message rather than silently
 //!     ignored (it requires an interactive editor this port does not drive).
@@ -44,25 +42,29 @@
 //!     `fatal: the option '<x>' requires '--interactive/--patch'` (exit 128) is
 //!     reproduced. A bare `--auto-advance` is the default and stages normally; only
 //!     `--no-auto-advance` triggers the fatal.
-//!   * pathspecs are resolved relative to the repository root, not to the current
-//!     working directory's prefix.
 //! ```
 //!
 //! NOTE: the parts of `cmd_add()` whose behaviour is observable *per index entry*
 //! are shared with [`add`](super::add) rather than reimplemented here — the
 //! `--renormalize` cache scan ([`super::add::renormalize_tracked_files`]), the
-//! sparse-checkout definition lookup ([`super::add::sparsity_to_consult`]), the
-//! submodule gitlink pass ([`super::add::moved_gitlinks`]), and the option table
-//! itself ([`super::add::LONG_OPTS`]). Keeping two copies of the cache scan is what
+//! sparse-checkout definition lookup ([`super::add::sparsity_to_consult`]) and its
+//! guard ([`super::add::skipped_as_sparse`]), the `--chmod` cache pass
+//! ([`super::add::apply_chmod_pathspec`]), the pathspec prefix pass
+//! ([`super::add::resolve_pathspecs`]), the exit-code/report tail
+//! ([`super::add::finish_code`]), the submodule gitlink pass
+//! ([`super::add::moved_gitlinks`]), and the option table itself
+//! ([`super::add::LONG_OPTS`]). Keeping two copies of the cache scan is what
 //! previously let this verb miss the `ce_skip_worktree()` guard and the `-N`
 //! empty-blob write that `add` already had.
 //!
 //! What is still this module's own is the worktree walk and the pathspec-accounting
 //! built on it (`mark_seen_per_spec`, `unmatched_pathspec_exit`, the `--refresh`
-//! porcelain report, `chmod_pathspec`). Those diverge from `add`'s in ways that are
-//! not yet reconciled — most visibly, `add` prefixes pathspecs with the current
-//! directory and this walk does not, and `add` reports matched tracked paths in
-//! index order ahead of the new ones while [`report`] interleaves them.
+//! porcelain report). Two behaviours of `add`'s walk are still missing from this
+//! one, both measured against stock git 2.55.0 and both pre-dating this module's
+//! current shape: the `core.autocrlf` round-trip warning a restaged file produces,
+//! and the racily-clean stat window `run_diff_files()` treats as modified (which is
+//! what makes `-N -v` report every matched tracked path in a freshly checked out
+//! worktree). `add` misses the second one too.
 
 use anyhow::{anyhow, bail, Result};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -128,7 +130,14 @@ struct Opts {
     /// The `<file>` argument of `--pathspec-from-file=<file>` (or its separate-arg
     /// form). `-` names stdin. Read in `stage()`, after option validation.
     pathspec_from_file_value: Option<String>,
+    /// The pathspec elements as typed, which is what git quotes back in its
+    /// diagnostics and what the matcher is handed (gitoxide resolves patterns
+    /// against the repository prefix itself).
     pathspecs: Vec<String>,
+    /// The same elements made repo-relative by `parse_pathspec()`'s prefix pass —
+    /// the only form comparable with index and worktree paths. 1:1 with
+    /// [`Opts::pathspecs`], filled in `stage()` once the repository is open.
+    resolved: Vec<String>,
 }
 
 impl Opts {
@@ -667,7 +676,17 @@ pub fn stage(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::from(FATAL));
     }
 
-    reject_unsupportable_config(&repo, &o)?;
+    // `parse_pathspec()` (builtin/add.c:460) normalizes every element and resolves it
+    // against the current prefix — so `git stage f.txt` in `sub/` means `sub/f.txt`,
+    // and an element that climbs out of the worktree is a fatal here rather than a
+    // pathspec nobody can match. Shared with `add`; see
+    // [`super::add::resolve_pathspecs`] for why each element is carried twice. This
+    // runs after the `--pathspec-from-file` read, because the elements that file
+    // supplies go through the very same `parse_pathspec()`.
+    o.resolved = super::add::resolve_pathspecs(&repo, &mut o.pathspecs)?
+        .into_iter()
+        .map(|(_typed, relative)| relative)
+        .collect();
 
     // Only `-A` and `-u` imply a pathspec; every other flag alone is a no-op.
     if o.pathspecs.is_empty() && !(o.addremove == Some(true) || o.update) {
@@ -685,23 +704,6 @@ pub fn stage(args: &[String]) -> Result<ExitCode> {
         return refresh(&repo, &o);
     }
     add(&repo, &o)
-}
-
-/// Reject the configurations under which a flag we otherwise accept would
-/// silently produce the wrong index, rather than pretending to honour it.
-fn reject_unsupportable_config(repo: &gix::Repository, o: &Opts) -> Result<()> {
-    let cfg = repo.config_snapshot();
-
-    if o.sparse.is_some() && cfg.boolean("core.sparseCheckout").unwrap_or(false) {
-        bail!("--sparse/--no-sparse is not supported in a sparse-checkout repository");
-    }
-
-    // `--renormalize` used to be refused here, because this staging path wrote the
-    // verbatim worktree bytes and re-running content filters was the one thing the
-    // flag is for. Both halves are now real: staging goes through
-    // `convert_to_git()` (see [`read_converted_bytes`]) and the flag switches off
-    // the `text=auto` index guard, exactly as `git add --renormalize` does.
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -840,8 +842,12 @@ fn unmatched_pathspec_exit(
         if seen.contains(&i) || is_exclude_spec(spec) || spec.is_empty() {
             continue;
         }
+        // `file_exists(pathspec.items[i].match)` (builtin/add.c:561): git asks about
+        // the element *after* the prefix pass, which is the only form a worktree path
+        // can be built from. The message still quotes `original`, i.e. `spec`.
+        let relative = o.resolved.get(i).map(String::as_str).unwrap_or(spec.as_str());
         let on_disk = repo
-            .workdir_path(BStr::new(spec.as_bytes()))
+            .workdir_path(BStr::new(relative.as_bytes()))
             .is_some_and(|abs| std::fs::symlink_metadata(abs).is_ok());
 
         if !on_disk || !is_literal_spec(spec) {
@@ -853,7 +859,9 @@ fn unmatched_pathspec_exit(
             eprintln!("error: pathspec '{spec}' did not match any file(s) known to git");
             return Some(ExitCode::from(FATAL));
         }
-        ignored.insert(spec.as_str());
+        // `dir_add_ignored()` records `pathspec.items[i].match`, so the block below
+        // lists the repo-relative form, not the element as typed.
+        ignored.insert(relative);
     }
 
     if !ignored.is_empty() {
@@ -1124,6 +1132,41 @@ fn add(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
     // git — rather than flipping the bit on every tracked entry.
     let chmod = if o.pathspecs.is_empty() { None } else { o.chmod };
 
+    // --- sparse-checkout accounting, identical to `add`'s -------------------
+    // `--sparse` is git's `include_sparse`, which switches every test below off.
+    // Without it a path outside the definition is never staged, and how git says so
+    // depends on which half of `cmd_add()` found it: `add_files()` collects the
+    // untracked ones into `matched_sparse_paths` and names them
+    // (builtin/add.c:356-362, exit 1), while `update_callback()` drops the tracked
+    // ones without a word (read-cache.c:3979-3981). This verb used to reject the
+    // flag outright instead of implementing any of it, which also meant a plain
+    // `stage` in a sparse-checkout repository ran with no sparse test at all.
+    let include_sparse = o.sparse == Some(true);
+    let sparsity = super::add::sparsity_to_consult(repo, include_sparse)?;
+    let outside_sparse = |path: &BString| -> bool {
+        sparsity.as_ref().is_some_and(|s| !s.includes(&path.to_str_lossy()))
+    };
+    let mut sparse_skipped: BTreeSet<BString> = BTreeSet::new();
+    // See `add`'s copy for why these two sets are not the same one:
+    // `PS_IGNORE_SKIP_WORKTREE` tests the bit alone and always applies, while
+    // `matches_skip_worktree()` tests the bit or the definition and only matters
+    // without `--sparse`.
+    let (skip_worktree_entries, sparse_hidden): (HashSet<BString>, Vec<BString>) = {
+        let backing = index.path_backing();
+        let mut bit = HashSet::new();
+        let mut hidden = Vec::new();
+        for e in index.entries().iter().filter(|e| e.stage() == Stage::Unconflicted) {
+            let path = e.path_in(backing);
+            if e.flags.contains(Flags::SKIP_WORKTREE) {
+                bit.insert(path.to_owned());
+            }
+            if super::add::skipped_as_sparse(e.flags, path, include_sparse, sparsity.as_ref()) {
+                hidden.push(path.to_owned());
+            }
+        }
+        (bit, hidden)
+    };
+
     // Repo-relative stage-0 entries: the tracked set, with what is staged today.
     let tracked: HashMap<BString, (gix::hash::ObjectId, Mode)> = {
         let backing = index.path_backing();
@@ -1194,8 +1237,10 @@ fn add(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
 
     // --- decide what each candidate becomes ---------------------------------
     let mut staged: Vec<Staged> = Vec::new();
-    let mut printed: BTreeMap<BString, &'static str> = BTreeMap::new();
-    let mut had_error = false;
+    // What each path became, keyed by path. The ORDER git prints them in is not
+    // this map's — see [`report_lines`] — so nothing here may be a sorted map.
+    let mut touched: HashMap<BString, &'static str> = HashMap::new();
+    let mut had_error = ReadErrors::default();
     // Whether any path actually reached `add_to_index()` under `-N`, which is
     // what decides the empty-blob side effect further down.
     let mut intent_visited = false;
@@ -1222,12 +1267,25 @@ fn add(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
         if (o.update || o.renormalize) && !already_tracked {
             continue;
         }
-        universe.push(path.clone());
-
-        if let Some(m) = ps.pattern_matching_relative_path(path.as_bstr(), Some(false)) {
-            if !m.is_excluded() && m.sequence_number < patterns.len() {
-                seen.insert(m.sequence_number);
+        // `PS_IGNORE_SKIP_WORKTREE`: an entry carrying the bit never marks its
+        // pathspec matched, so it must stay out of the seen accounting as well.
+        if !skip_worktree_entries.contains(&path) {
+            universe.push(path.clone());
+            if let Some(m) = ps.pattern_matching_relative_path(path.as_bstr(), Some(false)) {
+                if !m.is_excluded() && m.sequence_number < patterns.len() {
+                    seen.insert(m.sequence_number);
+                }
             }
+        }
+        // The sparse test sits *after* the seen accounting, because git marks a
+        // pathspec matched in `prune_directory()` — before `add_files()` ever looks
+        // at the definition — which is why `git add out/extra.txt` reports the
+        // sparse block rather than "did not match any files".
+        if outside_sparse(&path) {
+            if !already_tracked {
+                sparse_skipped.insert(path);
+            }
+            continue;
         }
 
         let Some(abs) = repo.workdir_path(&path) else {
@@ -1236,7 +1294,14 @@ fn add(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
         let md = match gix::index::fs::Metadata::from_path_no_follow(&abs) {
             Ok(md) => md,
             Err(e) => {
-                report_read_error(path.as_ref(), &e, &mut had_error);
+                if !o.renormalize {
+                    // `--renormalize` runs `renormalize_tracked_files()` INSTEAD of
+                    // `add_files_to_cache()` (builtin/add.c:587-592), so this walk is
+                    // not a git code path under that flag and reports nothing: the
+                    // index scan below owns every `unable to index file` line, and
+                    // the -1 that follows them.
+                    report_read_error(path.as_ref(), &e, already_tracked, &mut had_error);
+                }
                 continue;
             }
         };
@@ -1269,12 +1334,12 @@ fn add(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
                         .get(&path)
                         .is_some_and(|recorded| recorded.matches(&stat_now, STAT_MATCH));
                 if !unchanged {
-                    printed.insert(path.clone(), "add");
+                    touched.insert(path.clone(), "add");
                     intent_visited = true;
                 }
                 continue;
             }
-            printed.insert(path.clone(), "add");
+            touched.insert(path.clone(), "add");
             intent_visited = true;
             let stat = Stat::from_fs(&md).unwrap_or_default();
             staged.push(Staged {
@@ -1290,7 +1355,14 @@ fn add(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
         let (id, mode) = match read_worktree_blob(repo, &mut scan_filters, path.as_ref(), &abs, &md) {
             Ok(v) => v,
             Err(e) => {
-                report_read_error(path.as_ref(), &e, &mut had_error);
+                if !o.renormalize {
+                    // `--renormalize` runs `renormalize_tracked_files()` INSTEAD of
+                    // `add_files_to_cache()` (builtin/add.c:587-592), so this walk is
+                    // not a git code path under that flag and reports nothing: the
+                    // index scan below owns every `unable to index file` line, and
+                    // the -1 that follows them.
+                    report_read_error(path.as_ref(), &e, already_tracked, &mut had_error);
+                }
                 continue;
             }
         };
@@ -1304,7 +1376,7 @@ fn add(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
         if !o.renormalize && current == Some(&(id, mode)) {
             continue;
         }
-        printed.insert(path.clone(), "add");
+        touched.insert(path.clone(), "add");
         let stat = Stat::from_fs(&md).unwrap_or_default();
         staged.push(Staged { path, id, mode, stat, intent: false });
     }
@@ -1327,7 +1399,7 @@ fn add(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
                 _ => false,
             }
         }) {
-            printed.insert(path.clone(), "add");
+            touched.insert(path.clone(), "add");
             staged.push(Staged { path, id, mode: Mode::COMMIT, stat, intent: false });
         }
     }
@@ -1352,7 +1424,7 @@ fn add(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
             }
             let path = e.path_in(backing);
             let owned = path.to_owned();
-            if staged_set.contains(&owned) || printed.contains_key(&owned) {
+            if staged_set.contains(&owned) || touched.contains_key(&owned) {
                 continue;
             }
             match ps.pattern_matching_relative_path(path, Some(false)) {
@@ -1367,9 +1439,17 @@ fn add(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
                     if m.sequence_number < patterns.len() {
                         seen.insert(m.sequence_number);
                     }
+                    // `update_callback()`'s sparse guard (read-cache.c:3979-3981)
+                    // sits ahead of its `DIFF_STATUS_DELETED` arm, so a removal
+                    // outside the definition is dropped silently — no report, and
+                    // no place in `matched_sparse_paths`, which only `add_files()`
+                    // fills.
+                    if outside_sparse(&owned) {
+                        continue;
+                    }
                     if gone && (o.stages_deletions() || o.update) {
                         deletions.push(owned.clone());
-                        printed.insert(owned, "remove");
+                        touched.insert(owned, "remove");
                     }
                 }
                 _ => continue,
@@ -1382,9 +1462,24 @@ fn add(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
     // the repository, and the object database, completely untouched. The tracked
     // set joins the walked candidates so a pathspec that matched only a tracked
     // (possibly exclude-shadowed) path is still recorded as seen.
-    universe.extend(tracked.keys().cloned());
+    universe.extend(
+        tracked.keys().filter(|p| !skip_worktree_entries.contains(*p)).cloned(),
+    );
     mark_seen_per_spec(repo, &index, &patterns, o, &universe, &mut seen)?;
-    if let Some(code) = unmatched_pathspec_exit(repo, o, &seen, o.update) {
+    // `if (!include_sparse && matches_skip_worktree(&pathspec, i, ...))`
+    // (builtin/add.c:549-554): a pathspec that matched nothing so far but *does*
+    // match an index entry the sparse-checkout definition hides is named through
+    // `advise_on_updating_sparse_paths()` with exit 1, not killed with the
+    // "did not match any files" fatal. `find_pathspecs_matching_skip_worktree()`
+    // asks the question with an ordinary `ce_path_match()`, which is exactly what
+    // [`mark_seen_per_spec`] runs — so it is reused over the hidden paths and the
+    // pathspecs it newly marks are the ones to report.
+    let mut hidden_seen = seen.clone();
+    mark_seen_per_spec(repo, &index, &patterns, o, &sparse_hidden, &mut hidden_seen)?;
+    for i in hidden_seen.difference(&seen) {
+        sparse_skipped.insert(BString::from(o.pathspecs[*i].as_bytes()));
+    }
+    if let Some(code) = unmatched_pathspec_exit(repo, o, &hidden_seen, o.update) {
         return Ok(code);
     }
 
@@ -1394,12 +1489,13 @@ fn add(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
     // `stage --renormalize a.txt nosuch` over a deleted `a.txt` reports the
     // unmatched `nosuch`, not the failed stat. One implementation serves both
     // verbs, because stock git dispatches `stage` to that same `cmd_add()`.
+    let mut index_failed = false;
     if o.renormalize {
-        if let Some(code) = super::add::renormalize_tracked_files(
+        let outcome = super::add::renormalize_tracked_files(
             repo,
             &index,
             &super::add::RenormalizeOpts {
-                include_sparse: o.sparse == Some(true),
+                include_sparse,
                 dry_run: o.dry_run,
                 verbose: o.verbose,
                 intent_to_add: o.intent_to_add,
@@ -1409,15 +1505,20 @@ fn add(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
                 ps.pattern_matching_relative_path(p, Some(false))
                     .is_some_and(|m| !m.is_excluded())
             },
-        )? {
+        )?;
+        if let Some(code) = outcome.aborted {
             return Ok(code);
         }
+        // An entry the scan could not index is `exit_status |= -1` — 255 at the
+        // end, with the index still written. See [`super::add::RenormalizeOutcome`].
+        index_failed = outcome.failed;
     }
 
     // An unreadable file is only survivable under `--ignore-errors`; otherwise git
     // reports every failure it hit and then dies once, after the scan.
-    if had_error && !o.ignore_errors {
-        eprintln!("fatal: adding files failed");
+    if had_error.any && !o.ignore_errors {
+        let verb = if had_error.tracked { "updating" } else { "adding" };
+        eprintln!("fatal: {verb} files failed");
         return Ok(ExitCode::from(FATAL));
     }
 
@@ -1434,19 +1535,42 @@ fn add(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
         repo.write_blob(b"")?;
     }
 
+    let lines = report_lines(&index, &tracked, &touched);
+    let finish = |chmod_errors: &'_ [String]| -> ExitCode {
+        super::add::finish_code(super::add::Finish {
+            had_errors: had_error.any,
+            ignore_errors: o.ignore_errors,
+            sparse_skipped: &sparse_skipped,
+            chmod_errors,
+            index_failed,
+        })
+    };
+
     // --- dry run: report only, never touch the index or the odb -------------
+    // `chmod_pathspec(show_only = 1)` still runs its `S_ISREG` test over every
+    // matched entry, so a matched symlink is `cannot chmod` and 255 here too.
     if o.dry_run {
-        report(&printed);
-        return Ok(exit_status(had_error));
+        report(&lines);
+        let chmod_errors = match chmod {
+            None => Vec::new(),
+            Some(flip) => {
+                super::add::chmod_pathspec(&index, flip, include_sparse, sparsity.as_ref(), |p| {
+                    ps.pattern_matching_relative_path(p, Some(false))
+                        .is_some_and(|m| !m.is_excluded())
+                })
+                .1
+            }
+        };
+        return Ok(finish(&chmod_errors));
     }
 
     // Nothing to write: report and leave the index file alone, so its extensions
     // (notably the tree cache dropped below) survive a run that changed nothing.
     if staged.is_empty() && deletions.is_empty() && chmod.is_none() {
         if o.verbose {
-            report(&printed);
+            report(&lines);
         }
-        return Ok(exit_status(had_error));
+        return Ok(finish(&[]));
     }
 
     // --- write path: serialize the read-modify-write through the coordinator.
@@ -1495,20 +1619,17 @@ fn add(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
     }
     index.sort_entries();
 
-    // `--chmod` forces the mode of every matched path, whether or not this run
-    // restaged it, and never contributes to the verbose report.
-    if let Some(executable) = chmod {
-        let want = if executable { Mode::FILE_EXECUTABLE } else { Mode::FILE };
-        // `chmod_pathspec()` opens its cache loop with the very same sparse guard
-        // `renormalize_tracked_files()` does, so it is asked here through the same
-        // predicate. Without it, `stage --chmod=+x .` flipped the mode of every entry
-        // the sparse-checkout definition (or a `--skip-worktree` bit) keeps out of the
-        // worktree, which git leaves alone.
-        let include_sparse = o.sparse == Some(true);
-        let sparsity = super::add::sparsity_to_consult(repo, include_sparse)?;
-        // Collect first, so the matcher and the index's shared borrow are both
-        // released before the entries are mutated below.
-        let wanted: HashSet<BString> = {
+    // `chmod_pathspec()` (builtin/add.c:601-602) runs last, over the cache staging
+    // has already updated, and never contributes to the verbose report. One
+    // implementation serves both verbs — see [`super::add::apply_chmod_pathspec`].
+    // The matcher has to be rebuilt against THIS index (the locked re-read), which
+    // is why it is not the `ps` the scan used.
+    let chmod_errors = if chmod.is_none() {
+        Vec::new()
+    } else {
+        // The matcher borrows the index, so its answers are collected and it is
+        // dropped before the flip asks for the index exclusively.
+        let selected: HashSet<BString> = {
             let mut matcher = repo.pathspec(
                 true,
                 &patterns,
@@ -1520,26 +1641,14 @@ fn add(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
             index
                 .entries()
                 .iter()
-                .filter(|e| {
-                    e.stage() == Stage::Unconflicted
-                        && (e.mode == Mode::FILE || e.mode == Mode::FILE_EXECUTABLE)
-                        && !super::add::skipped_as_sparse(
-                            e.flags,
-                            e.path_in(backing),
-                            include_sparse,
-                            sparsity.as_ref(),
-                        )
-                })
                 .map(|e| e.path_in(backing).to_owned())
                 .filter(|p| matcher.is_included(p.as_bstr(), Some(false)))
                 .collect()
         };
-        for (entry, path) in index.entries_mut_with_paths() {
-            if wanted.contains(&path.to_owned()) {
-                entry.mode = want;
-            }
-        }
-    }
+        super::add::apply_chmod_pathspec(&mut index, chmod, include_sparse, sparsity.as_ref(), |p| {
+            selected.contains(&p.to_owned())
+        })
+    };
 
     // The tree-cache extension is written verbatim by `File::write`; drop it after
     // mutating entries so a later commit can't capture a stale subtree.
@@ -1548,32 +1657,87 @@ fn add(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
     super::add::record_stage_event(repo, staged.len() + deletions.len());
 
     if o.verbose {
-        report(&printed);
+        report(&lines);
     }
-    Ok(exit_status(had_error))
+    Ok(finish(&chmod_errors))
 }
 
 /// git prints both of these lines for each unreadable file and keeps going; only
 /// after the whole run does it decide between dying (128) and, under
-/// `--ignore-errors`, reporting the skips with exit 1.
-fn report_read_error(path: &BStr, err: &dyn std::fmt::Display, had_error: &mut bool) {
-    eprintln!("error: open(\"{path}\"): {err}");
+/// `--ignore-errors`, reporting the skips with exit 1 — which is
+/// [`super::add::finish_code`], shared with `add`.
+///
+/// `index_path()` renders the reason with `strerror(errno)` alone; Rust appends a
+/// ` (os error N)` tail, which is stripped here for the same reason `add` strips it.
+/// `tracked` records which of git's two callers this failure belongs to, because
+/// they die with different words — see [`ReadErrors`].
+fn report_read_error(
+    path: &BStr,
+    err: &dyn std::fmt::Display,
+    tracked: bool,
+    errors: &mut ReadErrors,
+) {
+    eprintln!("error: open(\"{path}\"): {}", super::add::strip_os_error(&err.to_string()));
     eprintln!("error: unable to index file '{path}'");
-    *had_error = true;
+    errors.any = true;
+    errors.tracked |= tracked;
 }
 
-fn exit_status(had_error: bool) -> ExitCode {
-    if had_error {
-        ExitCode::FAILURE
-    } else {
-        ExitCode::SUCCESS
+/// Which of git's two indexing callers reported a failure.
+///
+/// `update_callback()` handles the tracked paths and dies `updating files failed`
+/// (read-cache.c:3993-3995); `add_files()` handles the untracked ones and dies
+/// `adding files failed` (builtin/add.c:363-365). `add_files_to_cache()` runs first
+/// (builtin/add.c:590), so a tracked failure always reaches its die ahead of an
+/// untracked one.
+#[derive(Default)]
+struct ReadErrors {
+    any: bool,
+    tracked: bool,
+}
+
+
+/// The `-n`/`-v` report, in the order `cmd_add()` produces it: two passes, not one
+/// sorted run.
+///
+/// `add_files_to_cache()` goes first and walks the *index* — `run_diff_files()`
+/// iterates the cache, and `update_callback()` prints `add`/`remove` as it goes
+/// (read-cache.c:3993-4006) — so the matched tracked paths come out in cache order
+/// with adds and removes interleaved. `add_files()` runs second over the sorted
+/// `dir->entries` (builtin/add.c:356-370) and prints the brand-new ones after all
+/// of them.
+///
+/// Verified against git 2.55.0: over a modified `m.txt` and `z.txt`, a deleted
+/// `d.txt` and new `a_new.txt`/`n_new.txt`, `git add -n -A` prints
+/// `remove 'd.txt'`, `add 'm.txt'`, `add 'z.txt'`, `add 'a_new.txt'`,
+/// `add 'n_new.txt'` — the new files last. Merging the two groups into one sorted
+/// map, which this verb used to do, floats `a_new.txt` to the top instead.
+fn report_lines(
+    index: &gix::index::File,
+    tracked: &HashMap<BString, (gix::hash::ObjectId, Mode)>,
+    touched: &HashMap<BString, &'static str>,
+) -> Vec<String> {
+    let mut lines = Vec::with_capacity(touched.len());
+    let backing = index.path_backing();
+    for e in index.entries() {
+        if e.stage() != Stage::Unconflicted {
+            continue;
+        }
+        let path = e.path_in(backing).to_owned();
+        if let Some(kind) = touched.get(&path) {
+            lines.push(format!("{kind} '{path}'"));
+        }
     }
+    let mut fresh: Vec<&BString> = touched.keys().filter(|p| !tracked.contains_key(*p)).collect();
+    fresh.sort();
+    for path in fresh {
+        lines.push(format!("add '{path}'"));
+    }
+    lines
 }
 
-/// git reports staged paths in index order — a plain byte-wise sort — with adds
-/// and removes interleaved, not grouped.
-fn report(printed: &BTreeMap<BString, &'static str>) {
-    for (path, kind) in printed {
-        println!("{kind} '{path}'");
+fn report(lines: &[String]) {
+    for line in lines {
+        println!("{line}");
     }
 }

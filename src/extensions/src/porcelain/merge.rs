@@ -1086,6 +1086,11 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
         targets.push(*id);
     }
     for spec in refs.iter().filter(|_| fetch_head.is_empty()) {
+        // `collect_parents()`'s `get_merge_parent(argv[i])`, which opens with a
+        // single `repo_get_oid()` (`commit.c:1881`) — one trip through
+        // `get_oid_basic()`, and so one `refname … is ambiguous.` per operand,
+        // printed before the peel decides whether the operand is usable at all.
+        crate::objname::warn_ambiguous_refname(&repo, spec.as_str());
         // `cmd_merge`'s own refusal, which is neither a `fatal:` nor exit 128:
         // `merge: <arg> - not something we can merge`, on stderr, exit 1. It also
         // covers a name that resolves to something that is not a commit.
@@ -1099,6 +1104,47 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
             return Err(anyhow::Error::new(crate::fatal::Silent(1)));
         };
         targets.push(commit.id);
+    }
+
+    // `collect_parents()`'s *second* pass over the operands, which is where a
+    // generated merge message is built:
+    //
+    // ```c
+    // if (merge_msg && (!have_message || shortlog_len))
+    //         autogen = &merge_names;
+    // …
+    // remoteheads = reduce_parents(head_commit, head_subsumed, remoteheads);
+    // if (autogen) {
+    //         struct commit_list *p;
+    //         for (p = remoteheads; p; p = p->next)
+    //                 merge_name(merge_remote_util(p->item)->name, autogen);
+    // }
+    // ```
+    //
+    // `merge_name()` opens with `get_merge_parent(remote)` too
+    // (`builtin/merge.c:560`), so every operand it is asked about is resolved a
+    // second time and warns a second time. Both gates are observable: `-m`/`-F`
+    // (`have_message`) drops the pass to one warning per operand, `--log` or
+    // `merge.log` puts it back even with `-m`, and `reduce_parents()` running
+    // first is why merging an ancestor of `HEAD` warns once and not twice — the
+    // head is dropped before `merge_name()` ever sees it.
+    //
+    // The message itself is composed much later here (`compose_message`), after
+    // `Already up to date.` has had its chance to return, so the pass cannot ride
+    // along with it and is done here where git does it.
+    if opts.message.is_none() || opts.log_len != 0 {
+        // `reduce_heads()` walks history; the answer only ever gates a warning,
+        // so it is not asked for unless some operand could produce one.
+        let specs: Vec<&String> = refs.iter().filter(|_| fetch_head.is_empty()).collect();
+        if specs.iter().any(|s| crate::objname::full_hex(&repo, s).is_some()) {
+            for (spec, keep) in
+                specs.iter().zip(independent_heads(&repo, local_id, &targets)?)
+            {
+                if keep {
+                    crate::objname::warn_ambiguous_refname(&repo, spec.as_str());
+                }
+            }
+        }
     }
 
     // `--verify-signatures` / `merge.verifySignatures`. git runs this over the
@@ -1465,6 +1511,50 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
 /// `strategy` distinguishes the two failure shapes `cmd_merge` produces: a
 /// strategy that failed adds `Merge with strategy ort failed.` and exits 2,
 /// while a failed `checkout_fast_forward()` just exits 1.
+/// `reduce_parents()` (`builtin/merge.c`) as far as the generated merge message
+/// needs it: which of `targets` survive, in operand order.
+///
+/// ```c
+/// /* Find what parents to record by checking independent ones. */
+/// parents = reduce_heads(remoteheads);
+/// ```
+///
+/// `reduce_heads()` keeps the *independent* commits of `{HEAD} ∪ remoteheads` —
+/// the ones no other member of the set reaches — and `collect_parents()` then
+/// asks `merge_name()` only about those. That is why `git merge <ancestor>`
+/// produces one `refname … is ambiguous.` and not two: the operand is resolved by
+/// `get_merge_parent()`, then dropped here, and `merge_name()` never resolves it
+/// a second time.
+///
+/// Duplicates keep their first occurrence, which is what `reduce_heads()`'s
+/// `commit_list_insert_by_date` + dedup by `object->flags` amounts to for a
+/// repeated operand.
+fn independent_heads(
+    repo: &gix::Repository,
+    head: ObjectId,
+    targets: &[ObjectId],
+) -> Result<Vec<bool>> {
+    // `a` reaches `b` exactly when `b` is one of their merge bases.
+    let reaches = |a: ObjectId, b: ObjectId| -> Result<bool> {
+        Ok(repo.merge_bases_many(a, &[b])?.iter().any(|base| base.detach() == b))
+    };
+    let mut keep = Vec::with_capacity(targets.len());
+    for (i, &target) in targets.iter().enumerate() {
+        let duplicate = targets[..i].contains(&target);
+        let subsumed = !duplicate
+            && (reaches(head, target)?
+                || targets
+                    .iter()
+                    .enumerate()
+                    .filter(|(j, &other)| *j != i && other != target)
+                    .try_fold(false, |acc, (_, &other)| {
+                        Ok::<_, anyhow::Error>(acc || reaches(other, target)?)
+                    })?);
+        keep.push(!duplicate && !subsumed);
+    }
+    Ok(keep)
+}
+
 fn guard_checkout(
     repo: &gix::Repository,
     head_tree: ObjectId,

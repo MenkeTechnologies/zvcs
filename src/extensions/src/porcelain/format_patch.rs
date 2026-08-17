@@ -48,8 +48,9 @@
 //!     `--signature-file`, `--zero-commit`, `-p`/`--no-stat`, `--root`,
 //!     `-q`/`--quiet`, `--filename-max-length`, `--cover-letter`,
 //!     `-k`/`--keep-subject`, `--to`, `--cc`, `--add-header`, `--in-reply-to`,
-//!     `-U`/`--unified`, `-a`/`--text`, `--minimal`,
-//!     `--histogram`, `--diff-algorithm=myers|minimal|histogram`.
+//!     `-U`/`--unified`, `-a`/`--text`, `--minimal`, `--patience`,
+//!     `--histogram`, `--diff-algorithm=<name>` (every name
+//!     `parse_algorithm_value()` takes, `default` and mixed case included).
 //!   * messaging — `-s`/`--signoff` (a port of `append_signoff()` with its
 //!     trailer-block dedup), `--from[=<ident>]` and `--force-in-body-from` (the
 //!     in-body `From:` `pp_user_info()` emits when the header identity is
@@ -131,8 +132,7 @@
 //!     the patch to it is not ported, so a pathspec that reaches a non-empty
 //!     commit list is fatal.
 //!   * `--compact-summary`, `--encode-email-headers` as a *deferred* spelling,
-//!     whitespace-insensitive diffing, patience diff (imara-diff has Myers,
-//!     MyersMinimal and Histogram only), and copy detection (`-C`; renames are
+//!     whitespace-insensitive diffing, and copy detection (`-C`; renames are
 //!     detected, as git's default asks). `--ignore-if-in-upstream` reproduces
 //!     everything `cmd_format_patch` decides before the comparison — the
 //!     single-endpoint promotion that turns a lone rev into `<rev>..HEAD`, the
@@ -283,7 +283,7 @@ const MAIL_DEFAULT_WRAP: i64 = 72;
 const NAME_MAX_DEFAULT: usize = 64;
 
 /// Header wrap column for `From:`/`Subject:` (RFC2822 §2.1.1).
-const HEADER_MAX_LENGTH: i64 = 78;
+pub(super) const HEADER_MAX_LENGTH: i64 = 78;
 
 /// The charset name used for RFC2047 encoding and the 8-bit MIME header.
 const ENCODING: &str = "UTF-8";
@@ -1175,7 +1175,6 @@ const DEFERRED: &[&str] = &[
     "--encode-email-headers",
     "--ignore-if-in-upstream",
     "--compact-summary",
-    "--patience",
     "--no-indent-heuristic",
     "--abbrev",
     "--break-rewrites",
@@ -1318,44 +1317,6 @@ fn revision_argv_from(argv: &[String], at: usize) -> Vec<&str> {
     out
 }
 
-/// Port of `looks_like_pathspec()` (setup.c): a raw wildcard or long-form magic
-/// makes a word a pathspec without the file having to exist.
-fn looks_like_pathspec(arg: &str) -> bool {
-    let mut escaped = false;
-    for c in arg.chars() {
-        if escaped {
-            escaped = false;
-        } else if c == '\\' {
-            escaped = true;
-        } else if matches!(c, '*' | '?' | '[') {
-            return true;
-        }
-    }
-    arg.starts_with(":(")
-}
-
-/// Port of `check_filename()` (setup.c): does the word name something that
-/// exists, once the short-form magic that cannot be part of a filename is
-/// stripped? `lstat`, so a dangling symlink counts as present.
-fn check_filename(arg: &str) -> bool {
-    let rest = if let Some(r) = arg.strip_prefix(":/") {
-        // ":/" alone is the root directory, which always exists.
-        if r.is_empty() {
-            return true;
-        }
-        r
-    } else if let Some(r) = arg.strip_prefix(":!").or_else(|| arg.strip_prefix(":^")) {
-        // Excluding everything is silly, but git allows it.
-        if r.is_empty() {
-            return true;
-        }
-        r
-    } else {
-        arg
-    };
-    std::fs::symlink_metadata(rest).is_ok()
-}
-
 /// Port of the `for (j = i; j < argc; j++) verify_filename(...)` sweep
 /// `setup_revisions()` runs the moment a word stops being a revision: from there
 /// on every remaining word has to be a usable pathspec, and the first one that
@@ -1367,28 +1328,51 @@ fn check_filename(arg: &str) -> bool {
 /// `format-patch README.md HEAD` is `fatal: HEAD: no such path in the working
 /// tree.` and `format-patch README.md --no-thread` — a format-patch option, so
 /// gone from argv before the sweep — is accepted.
+///
+/// The per-word rule is [`crate::setup::verify_filename`]'s, shared with every
+/// other verb that splits revisions from paths; the private
+/// `looks_like_pathspec()`/`check_filename()` pair that used to stand here was a
+/// second transcription of setup.c with no caller of its own. Only the *sweep* —
+/// which word carries `diagnose_misspelt_rev` — belongs to this command.
+///
 /// Returns the `die()` text, which the caller prints only once it has confirmed
 /// nothing earlier on the command line preempts it.
-fn verify_filenames(words: &[&str]) -> Option<String> {
+fn verify_filenames(repo: &gix::Repository, words: &[&str]) -> Option<String> {
     for (n, word) in words.iter().enumerate() {
-        if word.starts_with('-') {
-            return Some(format!(
-                "option '{word}' must come before non-option arguments"
-            ));
-        }
-        if looks_like_pathspec(word) || check_filename(word) {
-            continue;
-        }
         // `die_verify_filename()`: only the word that failed to be a revision
         // gets the "did you mean a revision?" wording.
-        return Some(if n == 0 {
-            ambiguous_msg(word)
-        } else {
-            format!(
-                "{word}: no such path in the working tree.\n\
-                 Use 'git <command> -- <path>...' to specify paths that do not exist locally."
-            )
-        });
+        let Some(message) = crate::setup::verify_filename(word, n == 0) else {
+            continue;
+        };
+        // `die_verify_filename()`'s last stop before that wording:
+        //
+        // ```c
+        // maybe_die_on_misspelt_object_name(r, arg, prefix);
+        // /* ... or fall back the most general message. */
+        // die(_("ambiguous argument '%s': unknown revision or path not in the working tree. ..."
+        // ```
+        //
+        // and that helper is `get_oid_with_context_1(r, name, GET_OID_ONLY_TO_DIE
+        // | GET_OID_QUIETLY, …)` — a *second* resolution of the same word. It is
+        // silent unless the word takes `get_oid_basic()`'s full-hex branch and a
+        // ref answers to those 40 characters, in which case the ambiguity warning
+        // is printed again: `GET_OID_QUIETLY` gates the later, unrelated warning
+        // and not this one. So stock prints it twice for
+        // `format-patch <40-hex-that-is-also-a-ref>^{commit}`, once from
+        // `handle_revision_arg_1()` and once from here.
+        //
+        // Two words never get that far, so neither may warn: one starting with
+        // `-`, which `verify_filename()` dies on before `die_verify_filename()`,
+        // and short-form pathspec magic, which the C skips explicitly —
+        // `if (!(arg[0] == ':' && !isalnum(arg[1])))`, with `arg[1]` the NUL of a
+        // bare `:` counting as non-alnum.
+        let mut bytes = word.bytes();
+        let pathspec_magic = bytes.next() == Some(b':')
+            && !bytes.next().is_some_and(|b| b.is_ascii_alphanumeric());
+        if n == 0 && !word.starts_with('-') && !pathspec_magic {
+            crate::objname::warn_ambiguous_refname(repo, word);
+        }
+        return Some(message);
     }
     None
 }
@@ -1905,7 +1889,12 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
             "--no-merges" => o.max_parents = Some(1),
             // git has no `--no-first-parent`; the flag is one-way.
             "--first-parent" => o.first_parent = true,
+            // The three bare spellings are `diff_opt_diff_algorithm()` with the
+            // option's own name as the value (diff.c:5689-5704), so they set the
+            // same knob `--diff-algorithm=<name>` does and the last one on the
+            // line wins.
             "--minimal" => o.algorithm = Algorithm::MyersMinimal,
+            "--patience" => o.algorithm = Algorithm::Patience,
             "--histogram" => o.algorithm = Algorithm::Histogram,
             "-a" | "--text" => o.text = true,
             // At the top of the worktree `--relative` neither strips a prefix
@@ -1988,24 +1977,36 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
             s if s.len() > 2 && s.starts_with("-U") && s[2..].bytes().all(|c| c.is_ascii_digit()) => {
                 o.context = parse_num(&s[2..])? as u32;
             }
+            // `diff_opt_diff_algorithm()` hands the value to
+            // `parse_algorithm_value()` (diff.c:220-236), which compares with
+            // `strcasecmp` and takes `default` as another spelling of `myers`.
+            // The accept set and the rejection message are
+            // [`crate::diffopt::check`]'s, shared with every other command built
+            // from `add_diff_options()` — the private copy that used to stand
+            // here had drifted into a case-sensitive set without `default`.
             s if s.starts_with("--diff-algorithm=") => {
-                match &s["--diff-algorithm=".len()..] {
-                    "myers" => o.algorithm = Algorithm::Myers,
-                    "minimal" => o.algorithm = Algorithm::MyersMinimal,
-                    "histogram" => o.algorithm = Algorithm::Histogram,
-                    // imara-diff has no patience implementation.
-                    "patience" => o.deferred.push(a.to_owned()),
+                let value = &s["--diff-algorithm=".len()..];
+                match crate::diffopt::check("diff-algorithm", Some(value)) {
+                    // Every name git accepts maps onto an algorithm the vendored
+                    // `gix-imara-diff` implements, `patience` included: its
+                    // `patience.rs` is a port of git's `xdiff/xpatience.c` and
+                    // `Algorithm::Patience` is wired through `diff()`
+                    // (gix-imara-diff/src/lib.rs:214,298).
+                    Ok(()) => {
+                        o.algorithm = match value.to_ascii_lowercase().as_str() {
+                            "minimal" => Algorithm::MyersMinimal,
+                            "patience" => Algorithm::Patience,
+                            "histogram" => Algorithm::Histogram,
+                            // `myers` and `default`, the only names left.
+                            _ => Algorithm::Myers,
+                        }
+                    }
                     // git's `parse_algorithm_value()` rejects this in
                     // setup_revisions (exit 129); recorded positionally so an
                     // earlier bad revision preempts it.
-                    _ => record_opt_error(
-                        &mut o.opt_error,
-                        i,
-                        129,
-                        "error: option diff-algorithm accepts \"myers\", \"minimal\", \
-                         \"patience\" and \"histogram\""
-                            .to_owned(),
-                    ),
+                    Err(message) => {
+                        record_opt_error(&mut o.opt_error, i, 129, format!("error: {message}"))
+                    }
                 }
             }
             s if s.starts_with("--thread=") => match &s["--thread=".len()..] {
@@ -3206,25 +3207,48 @@ fn author_date(repo: &gix::Repository, id: ObjectId) -> i64 {
         .unwrap_or(0)
 }
 
-/// git's `die_verify_filename()` wording for an argument that is neither a
-/// revision nor an existing path.
-///
-/// Only the text is needed: every caller has to decide *whether* to print it
-/// before printing it, and a rejected range reaches this message through
-/// `verify_filename()`'s sweep over the remaining arguments rather than on its
-/// own.
-fn ambiguous_msg(spec: &str) -> String {
-    format!(
-        "ambiguous argument '{spec}': unknown revision or path not in the working tree.\n\
-         Use '--' to separate paths from revisions, like this:\n\
-         'git <command> [<revision>...] -- [<file>...]'"
-    )
-}
-
-/// A full-length object name is reported as a missing object rather than as an
-/// ambiguous argument — git can tell it was meant to be an object id.
-fn is_full_oid(spec: &str, hexsz: usize) -> bool {
-    spec.len() == hexsz && spec.bytes().all(|b| b.is_ascii_hexdigit())
+/// What `handle_revision_arg_1()` made of a single-name operand — the
+/// `get_oid_with_context()` + `get_reference()` pair it runs once the range
+/// spellings have had their turn.
+enum Named {
+    /// The object `get_reference()` appended to `revs->pending`, **as named**.
+    ///
+    /// Of whatever type: `handle_revision_arg_1()` type-checks nothing, so a
+    /// tree, a blob or a tag lands on the pending list exactly like a commit
+    /// and is dropped later, by `handle_commit()` — see
+    /// [`crate::objname::walk_pending`]. Peeling to a commit here instead is
+    /// what used to turn `format-patch <tree>` into an `ambiguous argument`
+    /// failure, because a tree that would not peel looked like a name that had
+    /// not resolved.
+    Pending(ObjectId),
+    /// `verify_non_filename()`'s `die()`, carried rather than raised because an
+    /// earlier diff-option error may still preempt it.
+    ///
+    /// It sits between the two calls above, and before `get_reference()`:
+    ///
+    /// ```c
+    /// if (get_oid_with_context(revs->repo, arg, get_sha1_flags, &oid, &oc))
+    ///         return revs->ignore_missing ? 0 : -1;
+    /// if (!cant_be_filename)
+    ///         verify_non_filename(revs->prefix, arg);
+    /// object = get_reference(revs, arg, &oid, flags ^ local_flags);
+    /// ```
+    ///
+    /// so a name that resolves *and* names a working-tree file is refused ahead
+    /// of `bad object`, and a `--` anywhere on the line
+    /// (`REVARG_CANNOT_BE_FILENAME`) turns the check off entirely — which is what
+    /// `git format-patch -- <name>` is for. The rule itself is
+    /// [`crate::setup::verify_non_filename`]'s, shared with every verb that reads
+    /// a revision out of argv; its first line is the `is_inside_work_tree()`
+    /// guard that keeps a bare repository from calling every operand ambiguous.
+    BothRevisionAndFilename(String),
+    /// `get_reference()`'s `die("bad object %s")`: the name decoded — which for
+    /// a full-length hex happens without the object database being consulted at
+    /// all, see [`crate::objname`] — but `parse_object()` found nothing.
+    BadObject,
+    /// `get_oid_with_context()` failed outright, so `handle_revision_arg()`
+    /// returns non-zero and the word gets its filename reading.
+    Unresolved,
 }
 
 enum Selected {
@@ -3268,13 +3292,27 @@ fn seed_pending(
     repo: &gix::Repository,
     o: &Opts,
 ) -> Result<std::result::Result<Pending, ExitCode>> {
-    let hexsz = repo.object_hash().len_in_hex();
-    let resolve = |spec: &str| -> Option<ObjectId> {
-        repo.rev_parse_single(BStr::new(spec))
-            .ok()
-            .and_then(|id| id.object().ok())
-            .and_then(|obj| obj.peel_to_commit().ok())
-            .map(|c| c.id)
+    // `repo_get_oid()` first, then `parse_object()` — git's order, and the
+    // ambiguity warning a full-length hex that is also a ref name earns. Both
+    // live in [`crate::objname`] because every command that takes an object name
+    // from argv needs them; resolving through `rev_parse_single()` alone reports
+    // "not a valid object name" for a well-formed id the repository simply does
+    // not have, and never warns.
+    let resolve = |spec: &str| -> Named {
+        let Some(id) = crate::objname::resolve(repo, spec) else {
+            return Named::Unresolved;
+        };
+        // `verify_non_filename()` before `get_reference()` — see
+        // [`Named::BothRevisionAndFilename`] for the C.
+        if !o.seen_dashdash {
+            if let Some(message) = crate::setup::verify_non_filename(repo, spec) {
+                return Named::BothRevisionAndFilename(message);
+            }
+        }
+        match repo.find_object(id) {
+            Ok(_) => Named::Pending(id),
+            Err(_) => Named::BadObject,
+        }
     };
 
     let mut p = Pending {
@@ -3328,7 +3366,17 @@ fn seed_pending(
         let range = (!crate::objname::is_parent_directory_pathspec(spec, o.seen_dashdash))
             .then(|| crate::objname::split_range(spec))
             .flatten()
-            .map(|r| (r.symmetric, crate::objname::dotdot(&repo, spec)));
+            .map(|r| {
+                // `handle_dotdot_1()` resolves both endpoints through
+                // `get_oid_with_context()`, so this is where an endpoint that is
+                // a full-length hex *and* a ref name earns its warning.
+                // [`crate::objname::dotdot`] is quiet by design — it is asked
+                // twice per operand here, once to classify and once to
+                // diagnose — so the warning is requested separately, exactly
+                // once, alongside the resolution the walk keeps.
+                crate::objname::warn_dotdot_endpoints(repo, spec);
+                (r.symmetric, crate::objname::dotdot(repo, spec))
+            });
         if let Some((symmetric, crate::objname::Dotdot::Missing { .. })) = &range {
             // `dotdot_missing()`, with whatever `lookup_commit_reference()`
             // already printed ahead of it. Rendered here but reported through
@@ -3375,7 +3423,7 @@ fn seed_pending(
             }
         } else if let Some(rest) = spec.strip_prefix('^') {
             match resolve(rest) {
-                Some(id) => {
+                Named::Pending(id) => {
                     p.rev_input_given = true;
                     // `^` flips the sense `--not` set, as git XORs both.
                     if negate {
@@ -3384,11 +3432,16 @@ fn seed_pending(
                         p.hidden.push(id);
                     }
                 }
-                None if is_full_oid(rest, hexsz) => {
+                Named::BothRevisionAndFilename(message) => {
+                    return Ok(Err(rev_err(&|| fatal(&message))))
+                }
+                // `get_reference()` names the argument it was handed, which is
+                // the operand *after* the `^` was stripped.
+                Named::BadObject => {
                     return Ok(Err(rev_err(&|| fatal(&format!("bad object {rest}")))))
                 }
                 // An exclusion is never retried as a filename.
-                None => {
+                Named::Unresolved => {
                     return Ok(Err(rev_err(&|| {
                         fatal(&format!("bad revision '{spec}'"))
                     })))
@@ -3396,7 +3449,7 @@ fn seed_pending(
             }
         } else {
             match resolve(spec) {
-                Some(id) => {
+                Named::Pending(id) => {
                     p.rev_input_given = true;
                     if negate {
                         p.hidden.push(id);
@@ -3404,13 +3457,16 @@ fn seed_pending(
                         p.tips.push(id);
                     }
                 }
-                None if is_full_oid(spec, hexsz) => {
+                Named::BothRevisionAndFilename(message) => {
+                    return Ok(Err(rev_err(&|| fatal(&message))))
+                }
+                Named::BadObject => {
                     return Ok(Err(rev_err(&|| fatal(&format!("bad object {spec}")))))
                 }
                 // `handle_revision_arg()` returned non-zero. With a `--` anywhere
                 // on the line `REVARG_CANNOT_BE_FILENAME` is in force and the word
                 // has nowhere left to go.
-                None if o.seen_dashdash => {
+                Named::Unresolved if o.seen_dashdash => {
                     return Ok(Err(rev_err(&|| {
                         fatal(&format!("bad revision '{spec}'"))
                     })))
@@ -3419,9 +3475,9 @@ fn seed_pending(
                 // git verifies them all as filenames and then stops resolving
                 // revisions entirely. It leaves `rev_input_given` alone, which is
                 // what lets `s_r_opt.def` still supply HEAD.
-                None => {
+                Named::Unresolved => {
                     let rest = revision_argv_from(&o.argv, rpos);
-                    if let Some(msg) = verify_filenames(&rest) {
+                    if let Some(msg) = verify_filenames(repo, &rest) {
                         return Ok(Err(rev_err(&|| fatal(&msg))));
                     }
                     p.paths.extend(rest.iter().map(|s| (*s).to_owned()));
@@ -4412,7 +4468,7 @@ fn write_from_line(out: &mut Vec<u8>, id: ObjectId, opts: &Opts) -> Result<()> {
 /// UTF-8 through the ordinary quoting/wrapping path; only the Q-encoding is
 /// skipped, so the `MIME-Version:`/`Content-Transfer-Encoding: 8bit` block a
 /// non-ASCII message still emits is unchanged.
-fn write_identity_headers(sb: &mut String, name: &str, mail: &str, date: &str, encode: bool) {
+pub(super) fn write_identity_headers(sb: &mut String, name: &str, mail: &str, date: &str, encode: bool) {
     sb.push_str("From: ");
     let mut max_length = HEADER_MAX_LENGTH;
     if encode && needs_rfc2047_encoding(name) {
@@ -4485,7 +4541,7 @@ fn mboxrd_escape(body: &mut Vec<u8>, opts: &Opts) {
 }
 
 /// git's `is_mboxrd_from()`: a line matching `/^>*From /`.
-fn is_mboxrd_from(line: &[u8]) -> bool {
+pub(super) fn is_mboxrd_from(line: &[u8]) -> bool {
     let rest = &line[line.iter().take_while(|&&b| b == b'>').count()..];
     rest.starts_with(b"From ")
 }
@@ -5197,7 +5253,7 @@ fn trim_end_ws(mut s: &[u8]) -> &[u8] {
 }
 
 /// git's `skip_blank_lines`: advance past leading blank lines.
-fn skip_blank_lines(mut msg: &[u8]) -> &[u8] {
+pub(super) fn skip_blank_lines(mut msg: &[u8]) -> &[u8] {
     loop {
         let len = one_line(msg);
         if len == 0 {
@@ -5212,7 +5268,7 @@ fn skip_blank_lines(mut msg: &[u8]) -> &[u8] {
 
 /// git's `format_subject` with a `" "` separator: join the first paragraph into
 /// one line and return it together with the rest of the message.
-fn format_subject(mut msg: &[u8]) -> (Vec<u8>, &[u8]) {
+pub(super) fn format_subject(mut msg: &[u8]) -> (Vec<u8>, &[u8]) {
     let mut title: Vec<u8> = Vec::new();
     let mut first = true;
     loop {
@@ -5236,7 +5292,7 @@ fn format_subject(mut msg: &[u8]) -> (Vec<u8>, &[u8]) {
 
 /// git's `pp_remainder` with zero indent: skip leading blank lines, then emit
 /// every remaining line right-trimmed.
-fn pp_remainder(mut msg: &[u8], out: &mut Vec<u8>) {
+pub(super) fn pp_remainder(mut msg: &[u8], out: &mut Vec<u8>) {
     let mut first = true;
     loop {
         let len = one_line(msg);
@@ -5259,7 +5315,7 @@ fn pp_remainder(mut msg: &[u8], out: &mut Vec<u8>) {
 // ---------------------------------------------------------------------------
 
 /// Bytes already used on the last line of `sb` (git's `last_line_length`).
-fn last_line_length(sb: &str) -> i64 {
+pub(super) fn last_line_length(sb: &str) -> i64 {
     match sb.rfind('\n') {
         Some(i) => (sb.len() - i - 1) as i64,
         None => sb.len() as i64,
@@ -5268,7 +5324,7 @@ fn last_line_length(sb: &str) -> i64 {
 
 /// git's `needs_rfc2047_encoding`: any non-ASCII byte, a newline, or a literal
 /// `=?` sequence forces the encoded-word form.
-fn needs_rfc2047_encoding(s: &str) -> bool {
+pub(super) fn needs_rfc2047_encoding(s: &str) -> bool {
     let b = s.as_bytes();
     for (i, &ch) in b.iter().enumerate() {
         if ch >= 0x80 || ch == b'\n' {
@@ -5320,7 +5376,7 @@ fn is_rfc2047_special(ch: u8, address: bool) -> bool {
 
 /// Port of `add_rfc2047()` (pretty.c): q-encoded words, never splitting a
 /// multi-byte character, folded at 76 columns.
-fn add_rfc2047(sb: &mut String, line: &str, address: bool) {
+pub(super) fn add_rfc2047(sb: &mut String, line: &str, address: bool) {
     const MAX_ENCODED_LENGTH: i64 = 76;
     let mut line_len = last_line_length(sb);
 
@@ -5356,7 +5412,7 @@ fn add_rfc2047(sb: &mut String, line: &str, address: bool) {
 /// the original's embedded-newline branch is unreachable here.
 ///
 /// A negative `indent1` means that many columns are already consumed.
-fn wrap_text(buf: &mut String, text: &str, indent1: i64, indent2: i64, width: i64) {
+pub(super) fn wrap_text(buf: &mut String, text: &str, indent1: i64, indent2: i64, width: i64) {
     if width <= 0 {
         buf.push_str(text);
         return;

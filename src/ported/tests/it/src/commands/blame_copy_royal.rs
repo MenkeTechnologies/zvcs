@@ -46,6 +46,9 @@ pub(super) mod function {
             diff_algorithm,
             ranges: gix::blame::BlameRanges::default(),
             since: None,
+            // `<rev>..<rev>` / `^<rev>`: this command walks back from `HEAD` with no
+            // bottom, so nothing is UNINTERESTING and no commit stops passing blame.
+            bottom: HashSet::new(),
             rewrites: Some(gix::diff::Rewrites::default()),
             debug_track_path: true,
             // `-w`

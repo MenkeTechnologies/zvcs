@@ -160,3 +160,99 @@ fn option_refusals_match_git() {
         "{ranged:?}"
     );
 }
+
+/// Every name `parse_algorithm_value()` accepts (`diff.c`), on content where
+/// patience genuinely disagrees with the other three.
+///
+/// The fixture is the point. `patience`, `myers`, `minimal` and `histogram` agree
+/// on almost any small edit, so a test built on a one-line change proves nothing
+/// about which algorithm ran — it passes just as happily when the flag is
+/// silently ignored. These two revisions are chosen so stock 2.55.0 emits a
+/// *different set of hunks* for patience than for the other three:
+///
+/// ```text
+/// before: c b c d c a c        after: b c a c a b b d
+/// ```
+///
+/// which is what makes this a regression test for the port having pushed
+/// `--diff-algorithm=patience` onto its deferred list — over a comment claiming
+/// the vendored imara-diff had no patience implementation, while
+/// `gix-imara-diff`'s `patience.rs` is a port of `xdiff/xpatience.c` and
+/// `Algorithm::Patience` is wired straight through `diff()`.
+#[test]
+fn every_diff_algorithm_name_selects_the_algorithm_it_names() {
+    let f = Fixture::new("algo");
+    std::fs::write(f.work.join("f.txt"), "c\nb\nc\nd\nc\na\nc\n").unwrap();
+    f.git(&["commit", "-q", "-am", "base"]);
+    std::fs::write(f.work.join("f.txt"), "b\nc\na\nc\na\nb\nb\nd\n").unwrap();
+    f.git(&["commit", "-q", "-am", "ours"]);
+
+    // `-U0` so the hunk headers are the algorithm's own choice of anchors and not
+    // three lines of shared context around them.
+    let hunks = |extra: &[&str]| -> Vec<String> {
+        let mut args = vec!["format-patch", "-1", "--stdout", "-U0"];
+        args.extend_from_slice(extra);
+        args.push("HEAD");
+        f.text(&args)
+            .lines()
+            .filter(|l| l.starts_with("@@"))
+            .map(str::to_owned)
+            .collect()
+    };
+
+    let myers = ["@@ -1 +0,0 @@", "@@ -4,2 +2,0 @@ c", "@@ -7,0 +5,4 @@ c"];
+    let patience = ["@@ -1 +0,0 @@", "@@ -3,0 +3,5 @@ c", "@@ -5,3 +8,0 @@ d"];
+    assert_ne!(myers, patience, "the fixture has to discriminate");
+
+    // The default, and the four names that reproduce it. `default` is
+    // `parse_algorithm_value()`'s own spelling of "clear every algorithm bit".
+    for extra in [
+        &[][..],
+        &["--diff-algorithm=myers"][..],
+        &["--diff-algorithm=minimal"][..],
+        &["--diff-algorithm=histogram"][..],
+        &["--diff-algorithm=default"][..],
+        &["--minimal"][..],
+        &["--histogram"][..],
+    ] {
+        assert_eq!(hunks(extra), myers, "{extra:?}");
+    }
+
+    // Patience, by both spellings — and `strcasecmp`, so the case of the value is
+    // not part of the name.
+    for extra in [
+        &["--diff-algorithm=patience"][..],
+        &["--patience"][..],
+        &["--diff-algorithm=PATIENCE"][..],
+    ] {
+        assert_eq!(hunks(extra), patience, "{extra:?}");
+    }
+
+    // One knob, so the last spelling on the line wins whichever form it took.
+    assert_eq!(hunks(&["--patience", "--histogram"]), myers);
+    assert_eq!(hunks(&["--histogram", "--patience"]), patience);
+    assert_eq!(
+        hunks(&["--diff-algorithm=patience", "--diff-algorithm=myers"]),
+        myers
+    );
+
+    // A name it does not take is parse-options' bare `exit(129)`: an `error:`
+    // line and no usage block. An empty value is not a name either.
+    for value in ["bogus", "", "Patiencex"] {
+        let out = f.run(&[
+            "format-patch",
+            "-1",
+            "--stdout",
+            &format!("--diff-algorithm={value}"),
+            "HEAD",
+        ]);
+        assert_eq!(out.status.code(), Some(129), "{value:?}: {out:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stderr),
+            "error: option diff-algorithm accepts \"myers\", \"minimal\", \
+             \"patience\" and \"histogram\"\n",
+            "{value:?}"
+        );
+        assert!(out.stdout.is_empty(), "{value:?}: {out:?}");
+    }
+}

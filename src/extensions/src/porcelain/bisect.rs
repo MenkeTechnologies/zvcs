@@ -697,6 +697,18 @@ fn start(args: &[String]) -> Result<ExitCode> {
             eprintln!("error: unrecognized option: '{arg}'");
             return Ok(ExitCode::from(1));
         } else {
+            // `} else if (!get_oidf(&oid, "%s^{commit}", arg)) {`
+            // (`builtin/bisect.c:776`) — one `repo_get_oid()` per revision
+            // operand, and the only place `bisect start` resolves the operand as
+            // *typed*. `get_oid_with_context_1()` cuts the `^{commit}` back off
+            // before `get_oid_basic()` sees it, so the warning names the 40 hex
+            // characters the user wrote.
+            //
+            // It comes first because git's does: the resolution that warns is the
+            // one whose failure ends the option scan, so a full-length hex the
+            // repository does not have warns and *then* becomes the head of the
+            // pathspec list.
+            crate::objname::warn_ambiguous_refname(&ctx.repo, arg);
             match resolve(&ctx.repo, arg) {
                 Ok(id) => resolved.push(id),
                 Err(_) if has_double_dash => {

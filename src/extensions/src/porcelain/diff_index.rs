@@ -90,13 +90,19 @@
 //!   * `--ignore-submodules=<v>` — only `none|untracked|dirty|all`; else exit 128
 //!     `fatal: bad --ignore-submodules argument: <v>`.
 //!   * `--diff-algorithm[=]<v>` (both the `=<v>` and separated `--diff-algorithm <v>`
-//!     forms, matched case-insensitively) — `myers`/`default` is the Myers renderer this
-//!     module already uses, so it composes with the ported content formats; a missing
-//!     value is exit 129 ``error: option `diff-algorithm' requires a value``; an unknown
-//!     value is exit 129 `error: option diff-algorithm accepts "myers", "minimal",
-//!     "patience" and "histogram"`. `minimal`/`patience`/`histogram` are accepted for the
-//!     raw/name listing (identical bytes) but a *content* format under one of them is
-//!     declined — see the honest-limitations note on unreproducible algorithms below.
+//!     forms, matched case-insensitively) and the `--minimal`/`--patience`/`--histogram`
+//!     `OPT_BIT` aliases — all four of `parse_algorithm_value()`'s names select a real
+//!     algorithm here, through the same ported xdiff `diff` and `diff-files` run; a
+//!     missing value is exit 129 ``error: option `diff-algorithm' requires a value``; an
+//!     unknown value is exit 129 `error: option diff-algorithm accepts "myers",
+//!     "minimal", "patience" and "histogram"`. See the note on `patience`/`histogram`
+//!     fidelity below.
+//!
+//!     `diff.algorithm` is deliberately *not* read: it belongs to
+//!     `git_diff_ui_config()`, which `cmd_diff_index()` never calls — it runs
+//!     `git_diff_basic_config()` and leaves `xdl_opts` at its 0 initialiser. Measured
+//!     against stock 2.55.0: `git -c diff.algorithm=histogram diff-index -p HEAD` is
+//!     byte-identical to `git diff-index -p HEAD`, while `--histogram` is not.
 //!   * `--skip-to=<path>` / `--rotate-to=<path>` — git reorders the queued pairs so
 //!     output starts at `<path>` (skip drops the earlier pairs, rotate wraps them to the
 //!     end); a `<path>` naming no queued pair is exit 128
@@ -117,15 +123,52 @@
 //!   payload) are not produced. Both are content-driven in git, so when no pair survives
 //!   the content comparison the correct output is nothing at all and that is what is
 //!   emitted; a run that would have produced real bytes is refused, not approximated.
-//! * The non-default diff algorithms are not reproduced. `--diff-algorithm=minimal`,
-//!   `=histogram`, `=patience` and the `--minimal`/`--histogram`/`--patience` aliases are
-//!   honoured only for the raw and name listings, where git's bytes do not depend on the
-//!   algorithm; a *content* format (patch or a stat) under one of them is declined. git
-//!   drives them through xdiff, but gitoxide's `MyersMinimal` and `Histogram` diverge from
-//!   xdiff on real inputs (verified: both differ from stock git's hunk grouping on
-//!   ordinary files) and it has no patience variant at all, so rendering them would emit
-//!   bytes that do not match git. Only `--diff-algorithm=myers`/`=default` — which is the
-//!   Myers renderer already in use — composes with the content formats.
+//! * `patience` and `histogram` render, and no divergence from stock is currently
+//!   known — the measurement below is a corpus, not a proof of every input.
+//!   All four algorithm names drive the vendored xdiff port in
+//!   `src/ported/gix-imara-diff` — `patience.rs` is `xdiff/xpatience.c` and
+//!   `histogram.rs` is `xdiff/xhistogram.c` — and every content format here
+//!   (`-p`, `--stat`, `--shortstat`, `--numstat`, `--dirstat=lines`) reaches it,
+//!   as git does through `xpp.flags = o->xdl_opts`. Measured against stock 2.55.0
+//!   over the 59 most recent consecutive commit pairs of this repository, one
+//!   `diff-tree -p --diff-algorithm=<a>` per pair:
+//!
+//!   | algorithm | divergent pairs |
+//!   |---|---|
+//!   | `myers` | 0 / 59 |
+//!   | `minimal` | 0 / 59 |
+//!   | `patience` | 0 / 59 |
+//!   | `histogram` | 0 / 59 |
+//!
+//!   `myers` and `minimal` also reproduce stock on a fixture built to separate
+//!   them (a 1200-line pair on which stock's `minimal` output differs from its
+//!   `myers` output), so the older claim in this file that gitoxide "has no
+//!   patience variant at all" and that `minimal` diverges was wrong on both
+//!   counts and has been removed.
+//!
+//!   Reaching 0 on all four took four fixes, all in the shared engine rather than
+//!   in this module's plumbing — so `diff`, `diff-files` and `format-patch` carry
+//!   them identically, and all have rendered all four algorithms since before
+//!   v0.15.0:
+//!
+//!   1. `xdl_trim_ends()` is skipped for patience and histogram. It lives inside
+//!      `xdl_optimize_ctxs()` (`xprepare.c:414-423`), which `xdl_prepare_env()`
+//!      does not call for those two (`xprepare.c:460-462`), so they see the whole
+//!      file. Trimming changes which lines are unique in both files, and therefore
+//!      which anchors patience is allowed to pick and what histogram counts.
+//!   2. `xdiffi.c:940-958`: after group shifting, histogram alone re-diffs a
+//!      merged group through `xdl_fall_back_diff()` to recover matches the LCS
+//!      never saw. Histogram now runs the full port of `xdl_change_compact()` that
+//!      contains it, `Diff::compact_with`, rather than the slide-only
+//!      `postprocess::postprocess_with`, which has no such step.
+//!   3. Histogram's own Myers fall-back (`xhistogram.c:229-239`) re-enters
+//!      `xdl_do_diff()`, so the region is trimmed and its records cleaned by the
+//!      sub-diff's own `xdl_prepare_env()`; calling `myers::diff` bare skipped both.
+//!   4. `try_lcs()` skips the occurrences a measured region already covers with
+//!      `while (np <= ae)` (`xhistogram.c:207-217`) — a bound on the *before* side,
+//!      not the after side.
+//!
+//!   Nothing is faked: the algorithm the user asked for is the one that runs.
 //! * Rename/copy detection is off, which is git's default for `diff-index`. `-M`/`-C`
 //!   and friends are accepted for their *observable* side effect on this listing — git
 //!   hashes rename candidates, so an added path gains its real object id — but no rename
@@ -271,10 +314,14 @@ fn compile_regex(pat: &[u8]) -> std::result::Result<Regex, String> {
         .map_err(|e| e.to_string())
 }
 
-/// The pickaxe: `-S` compares occurrence counts, `-G` greps the changed lines.
+/// The pickaxe: `-S` compares occurrence counts, `-G` greps the changed lines,
+/// `--find-object` keeps a pair that touches one of the named object ids.
 enum Pickaxe {
     Occurrences(Needle),
     Grep(Needle),
+    /// `DIFF_PICKAXE_KIND_OBJFIND` — the one `options->objfind` oidset every
+    /// `--find-object=<id>` on the line inserted into.
+    ObjFind(Vec<ObjectId>),
 }
 
 /// Parsed command-line options for a single `diff-index` invocation.
@@ -315,6 +362,15 @@ struct Opts {
     /// `diff.indentHeuristic` reaches plumbing too, and `--[no-]indent-heuristic`
     /// overrides it.
     indent_heuristic: bool,
+    /// `--diff-algorithm=<v>` and its `--minimal`/`--patience`/`--histogram` aliases:
+    /// the xdiff algorithm the content pass runs.
+    ///
+    /// `None` is Myers, not "whatever the repository configured". `diff.algorithm` is
+    /// read by `git_diff_ui_config()`, which `cmd_diff_index()` never calls — it runs
+    /// `git_diff_basic_config()` and leaves diff.c's `xdl_opts` at its 0 initialiser.
+    /// Measured against stock 2.55.0: `git -c diff.algorithm=histogram diff-index -p`
+    /// is byte-identical to `git diff-index -p`, while `--histogram` is not.
+    algorithm: Option<Algorithm>,
     /// `--numstat`: the `<added>\t<deleted>\t<path>` machine listing.
     numstat: bool,
     /// `--stat[=…]`/`--compact-summary`: the human diffstat.
@@ -461,13 +517,11 @@ fn render_only_option(a: &str) -> bool {
         "--ext-diff",
         "--full-index",
         "--function-context",
-        "--histogram",
         "--ignore-blank-lines",
         "--ignore-submodules",
         "--irreversible-delete",
         "--ita-invisible-in-index",
         "--ita-visible-in-index",
-        "--minimal",
         "--no-diff-merges",
         "--no-ext-diff",
         "--no-function-context",
@@ -478,10 +532,6 @@ fn render_only_option(a: &str) -> bool {
         "--no-rename-empty",
         "--no-renames",
         "--no-textconv",
-        // Like `--histogram` and `--minimal` above: this module's content formats always
-        // run Myers (`analyze_index_delta`), so an algorithm flag is a no-op for the raw
-        // listing and a refusal for anything that renders the line diff.
-        "--patience",
         "--rename-empty",
         "--submodule",
         "--text",
@@ -534,34 +584,10 @@ fn parse_stat_spec(v: &str, stat: &mut StatWidths) {
 }
 
 /// The exact bytes `diff_opt_diff_algorithm()` writes for an unknown `--diff-algorithm`
-/// value (`diff.c`, `error()` → exit 129).
-const DIFF_ALGORITHM_ERR: &[u8] =
-    b"error: option diff-algorithm accepts \"myers\", \"minimal\", \"patience\" and \"histogram\"\n";
-
-/// The outcome of validating a `--diff-algorithm=<value>` (`parse_algorithm_value()`,
-/// `diff.c:200`, matched case-insensitively).
-enum AlgoParse {
-    /// `myers`/`default`: git's `xdl_opts` stay at 0, which is the Myers renderer this
-    /// module already uses, so the value composes with the ported content formats.
-    Myers,
-    /// `minimal`/`patience`/`histogram`: git selects an xdiff algorithm gitoxide cannot
-    /// reproduce byte for byte (its `MyersMinimal`/`Histogram` diverge from git's xdiff on
-    /// real inputs, and it has no patience variant at all), so a content format is refused
-    /// rather than rendered with the wrong bytes. The raw and name listings are unaffected.
-    Unreproducible,
-    /// Anything else: git's `parse_algorithm_value()` returns `-1` and the option callback
-    /// dies with [`DIFF_ALGORITHM_ERR`] (exit 129).
-    Bad,
-}
-
-/// `parse_algorithm_value()`: match a `--diff-algorithm` value the way git does, case
-/// insensitively. `default` is git's alias for `myers`.
-fn parse_diff_algorithm(v: &str) -> AlgoParse {
-    match v.to_ascii_lowercase().as_str() {
-        "myers" | "default" => AlgoParse::Myers,
-        "minimal" | "patience" | "histogram" => AlgoParse::Unreproducible,
-        _ => AlgoParse::Bad,
-    }
+/// value (`diff.c`, `error()` → exit 129), newline included — the shared text plus the
+/// terminator, so the one copy lives in [`super::diff_optval`].
+fn diff_algorithm_err() -> Vec<u8> {
+    format!("{}\n", super::diff_optval::DIFF_ALGORITHM_ERR).into_bytes()
 }
 
 /// The context count of `-U<n>`/`--unified=<n>`: git reads it with `strtol`, so leading
@@ -656,6 +682,7 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
         check: false,
         binary: false,
         indent_heuristic: true,
+        algorithm: None,
         numstat: false,
         diffstat: false,
         shortstat: false,
@@ -698,6 +725,28 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
     let mut positionals: Vec<(usize, String)> = Vec::new();
     let mut paths: Vec<BString> = Vec::new();
     let mut after_dashdash = false;
+    // `setup_revisions()`'s `seen_dashdash`, which it establishes in a scan of the
+    // whole argument vector *before* it resolves anything:
+    //
+    // ```c
+    // seen_dashdash = 0;
+    // for (i = 1; i < argc; i++) {
+    //         const char *arg = argv[i];
+    //         if (strcmp(arg, "--"))
+    //                 continue;
+    //         …
+    //         seen_dashdash = 1;
+    //         break;
+    // }
+    // ```
+    //
+    // So it is not positional: a separator anywhere puts every earlier operand
+    // under `REVARG_CANNOT_BE_FILENAME`, which is why `git diff-index nosuch..HEAD --`
+    // is `fatal: bad revision …` while the same operand alone may still become a
+    // pathspec. It is also the flag [`crate::objname::is_parent_directory_pathspec`]
+    // takes, since a bare `..` is the parent directory only while it could be a
+    // filename at all.
+    let seen_dashdash = args.iter().any(|a| a == "--");
     // The first option git understands but this module does not. Held back rather than
     // raised immediately: git parses the whole command line before it looks at the
     // tree-ish, so a missing or unresolvable revision still has to win, exactly as it
@@ -714,6 +763,12 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
     // refused rather than emitting the wrong bytes. git honours these; this module does
     // not port them, so honesty wins over coverage.
     let mut content_altering: Option<String> = None;
+    // Each `--find-object=<id>` with the argv index it stood at. git resolves the name
+    // inside `diff_opt_find_object()`, i.e. during the option scan — but the repository
+    // is not open yet at this point in this function, so the pair is kept and resolved
+    // as soon as it is, with the index putting the resulting `error()` back at the
+    // flag's own position relative to the positionals.
+    let mut find_object_args: Vec<(usize, String)> = Vec::new();
     // A `-G`/`-S --pickaxe-regex` pattern that failed to compile. git compiles these in
     // `diffcore_pickaxe`, after the tree-ish is resolved, and dies with
     // `fatal: invalid regex: <msg>` (exit 128); the message tail comes from the platform
@@ -909,18 +964,12 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
                     return Ok(ExitCode::from(129));
                 };
                 i += 1;
-                match parse_diff_algorithm(value) {
-                    // `myers`/`default` is the Myers renderer already in use.
-                    AlgoParse::Myers => {}
-                    // gitoxide cannot reproduce the other algorithms byte for byte, so a
-                    // content format is refused while the raw/name listing is unaffected.
-                    AlgoParse::Unreproducible => {
-                        content_altering.get_or_insert_with(|| a.to_owned());
-                    }
+                match super::diff_optval::parse_algorithm_value(value) {
+                    Some(alg) => opts.algorithm = Some(alg),
                     // Deferred with its argv index so a bad revision earlier in argv still
                     // wins with git's 128, as git's single left-to-right parse does.
-                    AlgoParse::Bad => {
-                        deferred.get_or_insert((cur, 129, DIFF_ALGORITHM_ERR.to_vec()));
+                    None => {
+                        deferred.get_or_insert((cur, 129, diff_algorithm_err()));
                     }
                 }
             }
@@ -983,21 +1032,37 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
             s if s.starts_with("--dst-prefix=") => {
                 opts.dst_prefix = s["--dst-prefix=".len()..].to_owned();
             }
+            // `--find-object <id>`, the separated form: `OPT_CALLBACK_F` without
+            // `PARSE_OPT_OPTARG`, so parse-options takes the next argument even when it
+            // looks like a revision, and a truly missing value is
+            // `error: option `find-object' requires a value` (exit 129).
+            "--find-object" => {
+                let Some(value) = args.get(i) else {
+                    std::io::stderr()
+                        .lock()
+                        .write_all(b"error: option `find-object' requires a value\n")?;
+                    return Ok(ExitCode::from(129));
+                };
+                i += 1;
+                find_object_args.push((cur, value.clone()));
+            }
+            s if s.starts_with("--find-object=") => {
+                find_object_args.push((cur, s["--find-object=".len()..].to_owned()));
+            }
+            // The three `OPT_BIT` aliases for the same `xdl_opts` field
+            // `--diff-algorithm=` writes, so the last algorithm flag on the line wins.
+            "--minimal" => opts.algorithm = Some(Algorithm::MyersMinimal),
+            "--histogram" => opts.algorithm = Some(Algorithm::Histogram),
+            "--patience" => opts.algorithm = Some(Algorithm::Patience),
             s if s.starts_with("--diff-algorithm=") => {
-                // `diff_opt_diff_algorithm()`: `myers`/`default` is the Myers renderer this
-                // module already uses, so it composes with the ported content formats;
-                // `minimal`/`patience`/`histogram` name xdiff algorithms gitoxide cannot
-                // reproduce byte for byte, so a content format is refused rather than
-                // rendered wrong (the raw/name listing is identical either way); an unknown
-                // value is `error: option diff-algorithm accepts …` (exit 129), deferred
-                // with its argv index so a bad revision earlier in argv still wins first.
-                match parse_diff_algorithm(&s["--diff-algorithm=".len()..]) {
-                    AlgoParse::Myers => {}
-                    AlgoParse::Unreproducible => {
-                        content_altering.get_or_insert_with(|| s.to_owned());
-                    }
-                    AlgoParse::Bad => {
-                        deferred.get_or_insert((cur, 129, DIFF_ALGORITHM_ERR.to_vec()));
+                // `diff_opt_diff_algorithm()`. All four names render for real here, through
+                // the same ported xdiff the other two diff verbs use; an unknown value is
+                // `error: option diff-algorithm accepts …` (exit 129), deferred with its
+                // argv index so a bad revision earlier in argv still wins first.
+                match super::diff_optval::parse_algorithm_value(&s["--diff-algorithm=".len()..]) {
+                    Some(alg) => opts.algorithm = Some(alg),
+                    None => {
+                        deferred.get_or_insert((cur, 129, diff_algorithm_err()));
                     }
                 }
             }
@@ -1252,6 +1317,28 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
         opts.indent_heuristic = super::diff_pairs::indent_heuristic_default(&repo);
     }
 
+    // `diff_opt_find_object()` — the shared port in [`crate::objname::find_object`],
+    // which is `repo_get_oid()` and so keeps the full-length-hex rule: an id the
+    // repository does not have is a valid needle that simply matches nothing, and
+    // stock exits 0 with empty output rather than erroring. A name that resolves to
+    // nothing at all is the callback's `error()`, filed at the flag's own argv index
+    // so a positional standing earlier still dies first.
+    if !find_object_args.is_empty() {
+        let mut ids = Vec::with_capacity(find_object_args.len());
+        for (idx, arg) in &find_object_args {
+            match crate::objname::find_object(&repo, arg) {
+                Ok(id) => ids.push(id),
+                Err(e) => {
+                    let (code, bytes) = e.rendered();
+                    set_earliest(&mut deferred, (*idx, code, bytes));
+                }
+            }
+        }
+        // `DIFF_PICKAXE_KIND_OBJFIND` outranks `-S`/`-G` in `pickaxe_match()`, which
+        // tests `o->objfind` before it looks at the needle at all.
+        opts.pickaxe = Some(Pickaxe::ObjFind(ids));
+    }
+
     // git's `setup_revisions`: each positional before `--` is tried as a revision.
     // The first that resolves is the tree-ish; a further one that also resolves is
     // an extra revision. Once a positional fails to resolve and is accepted as a
@@ -1279,20 +1366,63 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
                 return Ok(ExitCode::from(128));
             }
             paths.push(arg.as_str().into());
-        } else if let Some(id) = crate::objname::resolve(&repo, arg.as_str()) {
+            continue;
+        }
+        // `handle_revision_arg_1()` tries `handle_dotdot()` before the single-name
+        // path, so a range operand is decided first — by the shared port of
+        // `handle_dotdot_1()` in [`crate::objname`], the same one `diff`, `diff-files`
+        // and `log` call. Both endpoints go through `get_oid_basic()`, so both can
+        // earn its ambiguity warning, and either can raise `dotdot_missing()`'s
+        // `fatal: Invalid revision range …`.
+        if !crate::objname::is_parent_directory_pathspec(arg, seen_dashdash) {
+            crate::objname::warn_dotdot_endpoints(&repo, arg);
+            if let Some(fatal) = crate::objname::dotdot_fatal(&repo, arg) {
+                eprint!("{fatal}");
+                return Ok(ExitCode::from(128));
+            }
+            // `handle_dotdot_1()` ends in two `add_pending_object_with_path()` calls —
+            // one per endpoint — and a symmetric range pends its merge bases on top.
+            // So a range git accepts always leaves `revs->pending.nr > 1`, which is
+            // `cmd_diff_index()`'s usage error however well the endpoints resolved.
+            if matches!(crate::objname::dotdot(&repo, arg), crate::objname::Dotdot::Ok { .. }) {
+                pending += 2;
+                continue;
+            }
+        }
+        // `if (*arg == '^') { local_flags = UNINTERESTING | BOTTOM; arg++; }` — the
+        // mark is a flag, stripped before the name resolves, and invisible to this
+        // command: `cmd_diff_index()` reads `revs->pending` and `run_diff_index()`
+        // takes the tree from it regardless of the flag bits, so `^HEAD` diffs the
+        // same tree `HEAD` does.
+        let (bare, uninteresting) = crate::objname::uninteresting_mark(arg);
+        if let Some(id) = crate::objname::resolve(&repo, bare) {
             // `get_reference()`'s `die("bad object %s", name)`: a full-length hex
             // resolves without the object database being asked (see
             // [`crate::objname`]), so the name is good and the object is missing —
             // which `setup_revisions()` reports before the operand count is looked at.
+            // The name it prints is the one *after* the mark, which is where the
+            // pointer stands by then.
             if repo.find_object(id).is_err() {
-                eprintln!("fatal: bad object {arg}");
+                eprintln!("fatal: bad object {bare}");
                 return Ok(ExitCode::from(128));
             }
             pending += 1;
             if spec.is_none() {
-                spec = Some(arg.clone());
+                spec = Some(bare.to_owned());
                 resolved = Some(id);
             }
+        } else if uninteresting || seen_dashdash {
+            // `if (seen_dashdash || *arg == '^') die(_("bad revision '%s'"), arg);` —
+            // neither shape reaches the pathspec fallback, and both are named with the
+            // operand as written (mark included) because `setup_revisions()` still
+            // holds the original `argv[i]`. `seen_dashdash` was decided by the
+            // whole-vector scan above, so it applies to operands standing *before* the
+            // separator too.
+            eprint!(
+                "{}",
+                super::log::bad_revision_message_in_gated(&repo, arg, seen_dashdash)
+            );
+            return Ok(ExitCode::from(128));
         } else if std::fs::symlink_metadata(arg).is_err() {
             eprintln!(
                 "fatal: ambiguous argument '{arg}': unknown revision or path not in the working tree.\n\
@@ -1311,11 +1441,28 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
         std::io::stderr().lock().write_all(msg)?;
         return Ok(ExitCode::from(*code));
     }
+    // `parse_pathspec()`, which `setup_revisions()` runs on the collected list
+    // before it returns — so it lands ahead of `diff_setup_done()`'s pickaxe
+    // `die()`s and ahead of `cmd_diff_index()`'s operand-count usage error, and
+    // behind the bad-revision die and any rejected option value (all measured
+    // against stock 2.55.0). The rule itself is [`crate::pathspec`]'s, the same
+    // port `diff` calls; without it a `..` element reached gitoxide's status
+    // iterator and produced its `Could not obtain the repository prefix` at
+    // exit 1 instead of git's `fatal: ..: '..' is outside repository at '<wt>'`.
+    if let Some(msg) = crate::pathspec::parse_pathspec_fatal(&repo, &paths) {
+        eprintln!("fatal: {msg}");
+        return Ok(ExitCode::from(128));
+    }
     // `diff_setup_done()`'s pickaxe check: a `die()` after the revisions are
     // resolved, and — measured against 2.55.0 — ahead of the operand-count usage
     // error, so a `diff-index -Gx -Sx` with no tree-ish reports the conflict.
     if super::diff_optval::pickaxe_conflict(args) {
         eprintln!("{}", super::diff_optval::PICKAXE_CONFLICT);
+        return Ok(ExitCode::from(128));
+    }
+    // The next `HAS_MULTI_BITS` in the same `diff_setup_done()` run.
+    if opts.pickaxe_all && !find_object_args.is_empty() {
+        eprintln!("{}", super::diff_optval::PICKAXE_ALL_OBJFIND_CONFLICT);
         return Ok(ExitCode::from(128));
     }
     if pending != 1 {
@@ -1347,6 +1494,30 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
         resolved
     };
 
+    // `run_diff_index()`'s only failure, through `diff_cache()` (`diff-lib.c`):
+    //
+    // ```c
+    // tree = repo_parse_tree_indirect(the_repository, tree_oid);
+    // if (!tree)
+    //         return error("bad tree object %s",
+    //                      tree_name ? tree_name : oid_to_hex(tree_oid));
+    // ```
+    //
+    // ```c
+    // if (diff_cache(revs, &oid, name, cached))
+    //         exit(128);
+    // ```
+    //
+    // `error()`, so the line carries `error:` and not `fatal:`, and the status is
+    // `exit(128)` from the caller rather than `die()`'s. The operand is not
+    // re-diagnosed as a revision: it resolved perfectly well, it just does not
+    // peel to a tree, which is what `git diff-index <blob-id>` runs into.
+    //
+    // `tree_name` is `run_diff_index()`'s `name`, and the two branches above pick
+    // it: with `--merge-base` it is `oid_to_hex_r(merge_base_hex, &oid)`, the
+    // computed base in hex; otherwise `ent->name`, the pending operand — already
+    // past any `^`, since `handle_revision_arg_1()` advances the pointer before
+    // the object is pended.
     let tree_id = match repo
         .find_object(base)
         .map_err(anyhow::Error::from)
@@ -1354,11 +1525,8 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
     {
         Ok(id) => id,
         Err(_) => {
-            eprintln!(
-                "fatal: ambiguous argument '{spec}': unknown revision or path not in the working tree.\n\
-                 Use '--' to separate paths from revisions, like this:\n\
-                 'git <command> [<revision>...] -- [<file>...]'"
-            );
+            let name = if merge_base { base.to_string() } else { spec.clone() };
+            eprintln!("error: bad tree object {name}");
             return Ok(ExitCode::from(128));
         }
     };
@@ -1757,6 +1925,12 @@ fn buffer_is_binary(buf: &[u8]) -> bool {
 }
 
 /// The added and removed line counts a diffstat would report for the two sides.
+///
+/// `--dirstat=lines` reaches this through `show_dirstat_by_line()`, whose
+/// `struct diffstat_t` was filled by `compute_diffstat()` → `diff_flush_stat()` →
+/// `builtin_diffstat()` — and that is one of the two sites that pass
+/// `xpp.flags = o->xdl_opts` (diff.c:4243), so the selected algorithm reaches the
+/// by-line damage counts too.
 fn line_counts(one: &[u8], two: &[u8], opts: &Opts) -> (u64, u64) {
     let before = split_lines(one);
     let after = split_lines(two);
@@ -1764,7 +1938,7 @@ fn line_counts(one: &[u8], two: &[u8], opts: &Opts) -> (u64, u64) {
     let mut input: InternedInput<Vec<u8>> = InternedInput::default();
     input.update_before(before.iter().map(|l| if fold { fold_line(l, opts.ws) } else { l.to_vec() }));
     input.update_after(after.iter().map(|l| if fold { fold_line(l, opts.ws) } else { l.to_vec() }));
-    let diff = Diff::compute(Algorithm::Myers, &input);
+    let diff = Diff::compute(opts.algorithm.unwrap_or(Algorithm::Myers), &input);
     (u64::from(diff.count_additions()), u64::from(diff.count_removals()))
 }
 
@@ -2149,12 +2323,26 @@ fn apply_pickaxe(repo: &gix::Repository, deltas: &mut Vec<Delta>, opts: &Opts) -
     let Some(pickaxe) = &opts.pickaxe else {
         return Ok(());
     };
+    // `pickaxe_match()` answers the objfind kind from the *recorded* ids and returns
+    // before it would fill either filespec, so no content is read for `--find-object`.
+    if let Pickaxe::ObjFind(ids) = pickaxe {
+        deltas.retain(|d| {
+            super::diff_files::objfind_hit(
+                ids,
+                d.old_valid().then_some(d.src_id),
+                d.new_valid().then_some(d.dst_id),
+            )
+        });
+        return Ok(());
+    }
     let workdir = repo.workdir().map(Path::to_path_buf);
     let mut hits = Vec::with_capacity(deltas.len());
     for d in deltas.iter() {
         let one = side_content(repo, workdir.as_deref(), d, true)?;
         let two = side_content(repo, workdir.as_deref(), d, false)?;
         let hit = match pickaxe {
+            // Answered above; `pickaxe_match()` never reaches the content path for it.
+            Pickaxe::ObjFind(_) => false,
             Pickaxe::Occurrences(needle) => {
                 let a = one.as_deref().map(|b| needle.count(b)).unwrap_or(0);
                 let b = two.as_deref().map(|b| needle.count(b)).unwrap_or(0);
@@ -2352,6 +2540,10 @@ fn fold_line(line: &[u8], ws: Ws) -> Vec<u8> {
 }
 
 /// Run a line diff and hand every added or removed line to `visit`.
+///
+/// Myers unconditionally, and not an oversight: this is `-G`'s `diff_grep()`
+/// (diffcore-pickaxe.c:43), which `memset`s its `xpparam_t` and never assigns
+/// `xpp.flags = o->xdl_opts` — so `--diff-algorithm=` does not reach the pickaxe.
 fn for_each_changed_line(before: &[&[u8]], after: &[&[u8]], mut visit: impl FnMut(&[u8])) {
     let one: Vec<u8> = before.concat();
     let two: Vec<u8> = after.concat();
@@ -2614,7 +2806,7 @@ fn analyze_index_delta(
     // `xdl_change_compact()` scores `xdf->recs[i]->ptr`, the *original* record, so the
     // indents come from `before`/`after` rather than the whitespace-folded interner.
     let diff = super::diff_pairs::compute_compacted(
-        Algorithm::Myers,
+        opts.algorithm.unwrap_or(Algorithm::Myers),
         &input,
         &before,
         &after,

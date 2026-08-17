@@ -39,9 +39,12 @@ const STAT_TERM_WIDTH: usize = 80;
 ///     names, directories suffixed with `/`.
 ///   * `git show <tag>`       → the annotated-tag header, then the object it points to.
 ///
-/// Pretty formats: the default `medium`, `--oneline`, and `--format=`/`--pretty=`
-/// with the placeholder subset listed in [`expand_format`]. Any other placeholder
-/// is rejected rather than silently dropped.
+/// Pretty formats: the default `medium`, `--oneline`, the mail formats `email`
+/// and `mboxrd` (rendered by [`super::log::email_body`], so they are byte-for-byte
+/// `git log`'s — `cmd_show` runs the same `cmd_log_init`), and
+/// `--format=`/`--pretty=` with the placeholder subset listed in
+/// [`expand_format`]. Any other placeholder is rejected rather than silently
+/// dropped, and `short`/`full`/`fuller`/`raw`/`reference` are not ported.
 ///
 /// Header decoration and identity flags, shared with `git log` and rendered by
 /// its code so the two commands emit identical bytes:
@@ -133,6 +136,9 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
     let mut pretty = Pretty::Medium;
     // `rev->pretty_given`, which is what decides whether notes show by default.
     let mut pretty_given = false;
+    // `--[no-]encode-email-headers`; `None` leaves `format.encodeEmailHeaders`
+    // (and its `default_encode_email_headers = 1`) in charge.
+    let mut encode_email_headers: Option<bool> = None;
     let mut notes_opt = super::notes::DisplayOpt::default();
     let mut after_dashdash = false;
     // `setup_revisions()`'s `seen_dashdash`, which it establishes in a scan of
@@ -379,6 +385,10 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
             "--no-source" => source_mode = false,
             "--use-mailmap" | "--mailmap" => cli_mailmap = Some(true),
             "--no-use-mailmap" | "--no-mailmap" => cli_mailmap = Some(false),
+            // `revs->encode_email_headers` (revision.c:2526-2529): the last
+            // spelling on the line wins over `format.encodeEmailHeaders`.
+            "--encode-email-headers" => encode_email_headers = Some(true),
+            "--no-encode-email-headers" => encode_email_headers = Some(false),
             // We never colorize; accept the flags that request no/auto color.
             "--no-color" | "--color=never" | "--color=auto" => {}
             _ => {
@@ -865,14 +875,10 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
             &mut plain,
             &mut no_walk,
         )?;
-        // `handle_revision_arg_1()` puts every endpoint of the token through
-        // `get_oid_with_context()`, so `get_oid_basic()`'s ambiguity warning fires
-        // once per endpoint, and not at all for what `--stdin` supplied.
-        if at < argv_specs {
-            for endpoint in super::log::revision_endpoints(spec) {
-                crate::objname::warn_ambiguous_refname(&repo, endpoint);
-            }
-        }
+        // Both of `get_oid_basic()`'s warnings, once per endpoint, with the
+        // short-circuit `handle_dotdot_1()`'s `||` gives a range. The ambiguity
+        // half is skipped for what `--stdin` supplied.
+        super::log::warn_operand(&repo, spec, at < argv_specs);
         // The `~<n>`/`^<n>` chains a token navigates are how far
         // `mark_parents_uninteresting()` can reach while `no_walk` stands.
         for endpoint in spec.trim_start_matches('^').split("..") {
@@ -1131,6 +1137,7 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
         notes_opt.enable_default();
     }
     let notes_trees = super::notes::load_display(&repo, &notes_opt)?;
+    let (cfg_subject_prefix, cfg_encode_email_headers) = super::log::email_config(&repo);
     let disp = DisplayOpts {
         notes: &notes_trees,
         abbrev_commit,
@@ -1144,6 +1151,10 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
         mailmap: mailmap.as_ref(),
         z,
         expand_tabs,
+        email: super::log::EmailStyle {
+            subject_prefix: &cfg_subject_prefix,
+            encode_headers: encode_email_headers.unwrap_or(cfg_encode_email_headers),
+        },
     };
     if line_level {
         // `check_single_commit`: the ranges are resolved against exactly one pending
@@ -1315,8 +1326,33 @@ enum Pretty {
     Medium,
     /// `<abbrev> <subject>` on one line.
     Oneline,
+    /// `CMIT_FMT_EMAIL`: the `From <oid> Mon Sep 17 00:00:00 2001` line and an
+    /// RFC2822 header block. Rendered by [`super::log::email_body`] — the same
+    /// function `git log --pretty=email` uses, since both go through
+    /// `cmd_log_init`/`show_log`.
+    Email,
+    /// `CMIT_FMT_MBOXRD`: [`Pretty::Email`] with `/^>*From /` escaped in the body.
+    MboxRd,
     /// A `--format=` string with `%` placeholders.
     User(String),
+}
+
+impl Pretty {
+    /// `cmit_fmt_is_mail()`.
+    fn is_mail(&self) -> bool {
+        matches!(self, Pretty::Email | Pretty::MboxRd)
+    }
+
+    /// The shared [`super::log::Pretty`] this names, for the renderer both
+    /// commands call. Only the mail formats are shared so far; the rest of
+    /// `show`'s header shapes are still written here.
+    fn as_log_pretty(&self) -> Option<super::log::Pretty> {
+        match self {
+            Pretty::Email => Some(super::log::Pretty::Email),
+            Pretty::MboxRd => Some(super::log::Pretty::MboxRd),
+            _ => None,
+        }
+    }
 }
 
 /// Parse a `--pretty`/`--format` value, or `None` when git would reject it with
@@ -1332,6 +1368,8 @@ fn parse_pretty(spec: &str) -> Option<Pretty> {
         "" => Some(Pretty::User(String::new())),
         "oneline" => Some(Pretty::Oneline),
         "medium" => Some(Pretty::Medium),
+        "email" => Some(Pretty::Email),
+        "mboxrd" => Some(Pretty::MboxRd),
         _ if spec.contains('%') => Some(Pretty::User(spec.to_string())),
         _ => None,
     }
@@ -1650,6 +1688,11 @@ struct DisplayOpts<'a> {
     /// set one. `None` leaves the indented header formats on
     /// `expand_tabs_in_log_default`, which is 8.
     expand_tabs: Option<usize>,
+    /// `show_log()`'s `ctx.rev = opt; ctx.print_email_subject = 1;`
+    /// (log-tree.c:700-701) — the subject prefix and RFC2047 switch the mail
+    /// formats read. `cmd_show` runs the same `cmd_log_init`, so unlike
+    /// `rev-list` it has both.
+    email: super::log::EmailStyle<'a>,
 }
 
 /// A path as a record field: quoted the way `write_name_quoted()` does it, or raw
@@ -1799,7 +1842,7 @@ fn show_one(
                 break;
             }
             Kind::Tag => {
-                let target = show_tag(out, &obj, disp.date_mode)?;
+                let target = show_tag(out, &obj, pretty, disp)?;
                 obj = repo.find_object(target)?;
             }
         }
@@ -1854,22 +1897,68 @@ fn show_tree(out: &mut Vec<u8>, obj: &gix::Object<'_>, name: &str) -> Result<()>
 
 /// Annotated-tag header. Returns the id of the object the tag points to so the
 /// caller can continue rendering the target.
-fn show_tag(out: &mut Vec<u8>, obj: &gix::Object<'_>, date_mode: DateMode) -> Result<ObjectId> {
+///
+/// `show_tag_object()` sends the `tagger` line through `pp_user_info(&pp,
+/// "Tagger", …)`, so the identity block is the selected pretty format's, not one
+/// shape for every format (pretty.c:516-595):
+///
+/// ```c
+/// if (pp->fmt == CMIT_FMT_ONELINE)
+///         return;
+/// …
+/// if (cmit_fmt_is_mail(pp->fmt)) {
+///         … "From: " … "\nDate: %s\n" …
+/// } else {
+///         strbuf_addf(sb, "%s: %.*s%.*s\n", what, …);
+/// }
+/// …
+/// switch (pp->fmt) {
+/// case CMIT_FMT_MEDIUM:
+///         strbuf_addf(sb, "Date:   %s\n", show_ident_date(&ident, &pp->date_mode));
+///         break;
+/// …
+/// ```
+///
+/// So `oneline` prints no identity at all, the mail formats print `From:` with
+/// an RFC2822 `Date:` that `--date=` does not reach, and a user format prints
+/// `Tagger:` with no date line — only `medium` has both halves.
+fn show_tag(
+    out: &mut Vec<u8>,
+    obj: &gix::Object<'_>,
+    pretty: &Pretty,
+    disp: &DisplayOpts<'_>,
+) -> Result<ObjectId> {
     let tag = obj.try_to_tag_ref()?;
 
     out.extend_from_slice(b"tag ");
     out.extend_from_slice(tag.name);
     out.push(b'\n');
 
-    if let Some(tagger) = tag.tagger()? {
-        out.extend_from_slice(b"Tagger: ");
-        out.extend_from_slice(tagger.name);
-        out.extend_from_slice(b" <");
-        out.extend_from_slice(tagger.email);
-        out.extend_from_slice(b">\n");
-        let t = tagger.time()?;
-        let date = format_date(t.seconds, t.offset, date_mode);
-        writeln!(out, "Date:   {date}")?;
+    match (tag.tagger()?, pretty) {
+        (_, Pretty::Oneline) | (None, _) => {}
+        (Some(tagger), Pretty::Email | Pretty::MboxRd) => {
+            let mut sb = String::new();
+            super::log::write_identity_headers_for(
+                &mut sb,
+                &tagger,
+                disp.email.encode_headers,
+            )?;
+            out.extend_from_slice(sb.as_bytes());
+        }
+        (Some(tagger), _) => {
+            out.extend_from_slice(b"Tagger: ");
+            out.extend_from_slice(tagger.name);
+            out.extend_from_slice(b" <");
+            out.extend_from_slice(tagger.email);
+            out.extend_from_slice(b">\n");
+            // Only `CMIT_FMT_MEDIUM` reaches the `Date:` arm of the switch; a
+            // user format falls off its end with nothing written.
+            if matches!(pretty, Pretty::Medium) {
+                let t = tagger.time()?;
+                let date = format_date(t.seconds, t.offset, disp.date_mode);
+                writeln!(out, "Date:   {date}")?;
+            }
+        }
     }
 
     out.push(b'\n');
@@ -1959,7 +2048,7 @@ fn show_commit(
     // `oneline` and `tformat:`) puts a blank line before every record but the
     // first, which is what separates two commits of `git show A..B`. The
     // terminator formats already ended the previous record with a newline.
-    if *shown_one && matches!(pretty, Pretty::Medium) {
+    if *shown_one && (matches!(pretty, Pretty::Medium) || pretty.is_mail()) {
         out.push(b'\n');
     }
     *shown_one = true;
@@ -1979,6 +2068,28 @@ fn show_commit(
             out.extend_from_slice(&subject(commit.message_raw()?));
             out.extend_from_slice(&notes_block(repo, disp, commit.id().detach())?);
             out.push(b'\n');
+        }
+        // ```c
+        // if (cmit_fmt_is_mail(opt->commit_format)) {
+        //         log_write_email_headers(opt, commit, &extra_headers,
+        //                                 &ctx.need_8bit_cte, 1);
+        //         ctx.rev = opt;
+        //         ctx.print_email_subject = 1;
+        // } else if (opt->commit_format != CMIT_FMT_USERFORMAT) {
+        //         … fputs("commit ", …) …
+        // ```
+        //
+        // (log-tree.c:697-705.) The `From <oid> Mon Sep 17 00:00:00 2001` line
+        // replaces the `commit <oid>` line, so nothing that decorates that one —
+        // `--abbrev-commit`, `--decorate`, `--source`, the `Merge:` parents —
+        // is reached, and the name is `oid_to_hex()` rather than the
+        // abbreviation. The header block and body below it are the same
+        // `pretty_print_commit()` `git log --pretty=email` prints; only
+        // [`super::log::EmailStyle`] differs between the callers.
+        Pretty::Email | Pretty::MboxRd => {
+            let log_pretty = pretty.as_log_pretty().expect("mail formats map to a shared Pretty");
+            writeln!(out, "From {} Mon Sep 17 00:00:00 2001", commit.id())?;
+            super::log::email_body(out, commit, &log_pretty, disp.email)?;
         }
         Pretty::User(fmt) => {
             expand_format(out, commit, fmt, disp.notes)?;

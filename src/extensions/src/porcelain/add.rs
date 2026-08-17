@@ -8,7 +8,8 @@
 //!   * `git add -A|--all`       — stage the whole worktree (adds, mods, deletes)
 //!   * `git add -u|--update`    — restage tracked paths only (mods + deletes)
 //!   * `git add -N|--intent-to-add` — record that untracked paths will be added
-//!   * `git add --chmod=(+|-)x` — override the executable bit of staged files
+//!   * `git add --chmod=(+|-)x` — override the executable bit of every matched
+//!     index entry, staged by this run or not ([`chmod_pathspec`])
 //!   * `git add --refresh`      — refresh the stat cache, do not add content
 //!   * `git add --renormalize`  — restage tracked paths (implies -u)
 //!   * `git add --pathspec-from-file=<f>` (`-` = stdin, `--pathspec-file-nul`)
@@ -128,8 +129,10 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
     let mut warn_embedded = true;
     // `--no-all`/`--ignore-removal`: stage adds+mods but not worktree deletions.
     let mut no_removal = false;
-    // Some(true) => `--chmod=+x`, Some(false) => `--chmod=-x`.
-    let mut chmod: Option<bool> = None;
+    // The raw value of the last `--chmod=<v>`. `OPT_STRING` only *records* it
+    // during parsing; `cmd_add()` validates the survivor further down
+    // (builtin/add.c:447-449), which is why this is a string and not a bool.
+    let mut chmod_arg: Option<String> = None;
     let mut from_file: Option<String> = None;
     let mut file_nul = false;
     // `-U`/`--unified`, `--inter-hunk-context` and `--[no-]auto-advance` configure
@@ -236,26 +239,20 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
             "--pathspec-file-nul" => file_nul = true,
             "--no-pathspec-file-nul" => file_nul = false,
             // Value-taking flags: accept both `--flag=value` and `--flag value`.
+            // The value is only recorded here — `OPT_STRING` does no validation —
+            // so a bad one cannot outrank the fatals `cmd_add()` raises first.
             "--chmod" => {
                 i += 1;
-                let v = args.get(i).map(String::as_str).unwrap_or("");
-                match parse_chmod(v) {
-                    Some(b) => chmod = Some(b),
-                    None => return usage_fatal(format!("--chmod param '{v}' must be either -x or +x")),
-                }
+                chmod_arg = Some(args.get(i).cloned().unwrap_or_default());
             }
             // `chmod` is an `OPT_STRING`, whose unset writes NULL over whatever an
             // earlier `--chmod=<v>` recorded (parse-options.c:200-202) — including
             // the validation that value would have failed, since `cmd_add()` only
             // inspects the surviving string.
-            "--no-chmod" => chmod = None,
-            s if s.starts_with("--chmod=") => match parse_chmod(&s["--chmod=".len()..]) {
-                Some(b) => chmod = Some(b),
-                None => {
-                    let v = &s["--chmod=".len()..];
-                    return usage_fatal(format!("--chmod param '{v}' must be either -x or +x"));
-                }
-            },
+            "--no-chmod" => chmod_arg = None,
+            s if s.starts_with("--chmod=") => {
+                chmod_arg = Some(s["--chmod=".len()..].to_string());
+            }
             "--pathspec-from-file" => {
                 i += 1;
                 from_file = Some(args.get(i).cloned().unwrap_or_default());
@@ -371,6 +368,36 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
         return usage_fatal("options '-A' and '-u' cannot be used together".into());
     }
 
+    // `--ignore-missing` is only meaningful with `--dry-run` (builtin/add.c:444).
+    if ignore_missing && !dry_run {
+        return usage_fatal("the option '--ignore-missing' requires '--dry-run'".into());
+    }
+
+    // `if (chmod_arg && (...)) die(...)` (builtin/add.c:447-449): the value is
+    // validated HERE, once, on whatever survived the parse — after the `-A`/`-u`
+    // and `--ignore-missing` fatals, and before `parse_pathspec()` and every check
+    // built on it. Verified against git 2.55.0: `--chmod=bogus -A -u` reports the
+    // `-A`/`-u` fatal and `--chmod=bogus --ignore-missing` the `--dry-run` one,
+    // while `--chmod=bogus --pathspec-from-file=/nope`, `--chmod=bogus ''` and
+    // `--chmod=bogus --pathspec-file-nul` all report the chmod fatal. Validating
+    // during the parse instead (as this did) inverted the first two.
+    let chmod: Option<bool> = match &chmod_arg {
+        None => None,
+        Some(v) => match parse_chmod(v) {
+            Some(b) => Some(b),
+            None => return usage_fatal(format!("--chmod param '{v}' must be either -x or +x")),
+        },
+    };
+
+    // git rejects an empty-string pathspec outright — inside `parse_pathspec()`,
+    // so it fires before `--pathspec-from-file` is even opened.
+    if pathspecs.iter().any(String::is_empty) {
+        return usage_fatal(
+            "empty string is not a valid pathspec. please use . instead if you meant to match all paths"
+                .into(),
+        );
+    }
+
     // `--pathspec-from-file`: read pathspecs from a file (or stdin for `-`).
     if let Some(src) = from_file {
         if !pathspecs.is_empty() {
@@ -379,22 +406,17 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
             );
         }
         pathspecs = super::commit::read_pathspec_file(&src, file_nul)?;
+        // The file's own elements go through the same `parse_pathspec()` the argv
+        // ones did, so an empty line is the same fatal.
+        if pathspecs.iter().any(String::is_empty) {
+            return usage_fatal(
+                "empty string is not a valid pathspec. please use . instead if you meant to match all paths"
+                    .into(),
+            );
+        }
     } else if file_nul {
         return usage_fatal(
             "the option '--pathspec-file-nul' requires '--pathspec-from-file'".into(),
-        );
-    }
-
-    // `--ignore-missing` is only meaningful with `--dry-run`.
-    if ignore_missing && !dry_run {
-        return usage_fatal("the option '--ignore-missing' requires '--dry-run'".into());
-    }
-
-    // git rejects an empty-string pathspec outright.
-    if pathspecs.iter().any(String::is_empty) {
-        return usage_fatal(
-            "empty string is not a valid pathspec. please use . instead if you meant to match all paths"
-                .into(),
         );
     }
 
@@ -459,66 +481,7 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
         .ok()
         .flatten()
         .is_none_or(|p| p.as_os_str().is_empty());
-    // `prefix_path()` runs every command-line path through `normalize_path_copy()`
-    // first, so `./.` is `.`, `src/.` is `src`, and `a/../b` is `b` before anything
-    // asks whether the path exists or is ignored.
-    //
-    for spec in pathspecs.iter_mut() {
-        *spec = normalize_pathspec(spec);
-    }
-
-    // `prefix_pathspec()` also PREPENDS the prefix (pathspec.c:455-467, via
-    // `prefix_path_gently`), and the port needs it in exactly one place. The
-    // dirwalk does not: gitoxide resolves the patterns against the repository
-    // prefix itself, so handing it `sub/f.txt` from `sub/` would look for
-    // `sub/sub/f.txt`. The bookkeeping below does, because it compares each
-    // element against index and worktree paths, which are ALWAYS repo-relative —
-    // that mismatch is why `git add f.txt` in a subdirectory reported `pathspec
-    // 'f.txt' did not match any files` for a file the walk had just staged.
-    //
-    // So each element is carried as a pair: as typed, which is what git quotes
-    // back in its diagnostics, and repo-relative, which is what those comparisons
-    // need. git's `prefix` is directory-terminated ("sub/") while gix reports it
-    // without the separator; concatenating that would produce `subf.txt`.
-    let prefix = repo
-        .prefix()
-        .ok()
-        .flatten()
-        .map(|p| p.to_string_lossy().replace('\\', "/"))
-        .filter(|p| !p.is_empty())
-        .map(|p| if p.ends_with('/') { p } else { format!("{p}/") })
-        .unwrap_or_default();
-    let mut checked: Vec<(String, String)> = Vec::with_capacity(pathspecs.len());
-    for i in 0..pathspecs.len() {
-        let spec = pathspecs[i].clone();
-        match prefixed_pathspec(&spec, &prefix, &repo) {
-            Ok(relative) => {
-                // An absolute pathspec is the one case the matcher cannot take as
-                // typed — gitoxide reads it as a path outside the worktree and
-                // refuses. Its repo-relative form cannot be handed over bare
-                // either, since the walk would resolve THAT against the prefix a
-                // second time; `:(top)` is the spelling that says "already rooted".
-                if spec.starts_with('/') {
-                    pathspecs[i] = format!(":(top){relative}");
-                }
-                checked.push((spec, relative));
-            }
-            // `prefix_path_gently()` returning NULL is a die, not a skip: the path
-            // resolved to somewhere outside the worktree entirely.
-            Err(copyfrom) => {
-                // `absolute_path(hint_path)`: the worktree gix hands back can be
-                // relative to the cwd ("..") and git always names an absolute one.
-                let root = repo
-                    .workdir()
-                    .unwrap_or_else(|| repo.git_dir())
-                    .canonicalize()
-                    .unwrap_or_else(|_| repo.git_dir().to_path_buf())
-                    .display()
-                    .to_string();
-                crate::git_fatal!("{spec}: '{copyfrom}' is outside repository at '{root}'");
-            }
-        }
-    }
+    let checked = resolve_pathspecs(&repo, &mut pathspecs)?;
     if at_root {
         for spec in pathspecs.iter_mut() {
             if spec == "." || spec == "./" {
@@ -567,9 +530,43 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
     };
     // `matched_sparse_paths`: what the message at the end names, sorted and unique.
     let mut sparse_skipped: std::collections::BTreeSet<BString> = Default::default();
+    // The two index-side sets the sparse accounting needs. They are deliberately
+    // not the same set:
+    //
+    // * `skip_worktree_entries` is `PS_IGNORE_SKIP_WORKTREE`
+    //   (pathspec.c:50-55, via `prune_directory()`): `seen` is computed with that
+    //   flag, so an entry carrying the `skip-worktree` bit never marks a pathspec
+    //   matched. It tests the BIT ONLY, and it applies whether or not `--sparse`
+    //   was given.
+    // * `sparse_hidden` is `find_pathspecs_matching_skip_worktree()`
+    //   (pathspec.c:76-89): the bit OR a path the definition excludes. A pathspec
+    //   that matched nothing else but matches one of these is
+    //   `only_match_skip_worktree` (builtin/add.c:549-554) — named through
+    //   `advise_on_updating_sparse_paths()` with exit 1 rather than the "did not
+    //   match" fatal — and that arm is gated on `!include_sparse`, which is exactly
+    //   what [`skipped_as_sparse`] folds in.
+    let (skip_worktree_entries, sparse_hidden): (HashSet<BString>, HashSet<BString>) = {
+        let backing = index.path_backing();
+        let mut bit = HashSet::new();
+        let mut hidden = HashSet::new();
+        for e in index.entries().iter().filter(|e| e.stage() == Stage::Unconflicted) {
+            let path = e.path_in(backing);
+            if e.flags.contains(Flags::SKIP_WORKTREE) {
+                bit.insert(path.to_owned());
+            }
+            if skipped_as_sparse(e.flags, path, include_sparse, sparsity.as_ref()) {
+                hidden.insert(path.to_owned());
+            }
+        }
+        (bit, hidden)
+    };
     // Paths that could not be read, paired with the OS error text git reports
     // (only surfaced for a real add). git prints `open("<p>"): <strerror>`.
-    let mut read_errors: Vec<(BString, String)> = Vec::new();
+    // Paths that could not be read: `(path, strerror, was tracked)`. The third field
+    // picks the fatal: a TRACKED path fails inside `update_callback()`, which dies
+    // `updating files failed` (read-cache.c:3993-3995), while an untracked one fails
+    // inside `add_files()`, which dies `adding files failed` (builtin/add.c:363-365).
+    let mut read_errors: Vec<(BString, String, bool)> = Vec::new();
     // Embedded repositories whose HEAD is unborn: git cannot record a gitlink for
     // them and reports each one before failing the whole add.
     let mut headless_repos: Vec<BString> = Vec::new();
@@ -648,12 +645,21 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
         if tracked_only && !already_tracked {
             continue;
         }
-        // `add_files()`: a path this add would otherwise stage but that lies outside
-        // the sparse-checkout definition is collected for the report instead. The
-        // check sits after the eligibility filters, so a path `-u` was never going to
-        // stage is not reported either.
+        // A path outside the sparse-checkout definition is never staged, and the two
+        // halves of git report it differently. `add_files()` (builtin/add.c:356-362)
+        // walks the *untracked* `dir->entries` and collects each one into
+        // `matched_sparse_paths`, which `advise_on_updating_sparse_paths()` names and
+        // which turns the exit code into 1. `update_callback()` (read-cache.c:3979)
+        // walks the tracked diff and just `continue`s — silently. Verified against git
+        // 2.55.0: in a cone-sparse repo with an untracked `out/extra.txt` and a
+        // restored, still-`skip-worktree` `out/f.txt`, `git add -v -A` names only
+        // `out/extra.txt` and leaves `out/f.txt`'s entry untouched without a word.
+        // The check sits after the eligibility filters, so a path `-u` was never going
+        // to stage is not reported either.
         if outside_sparse(&path) {
-            sparse_skipped.insert(path);
+            if !already_tracked {
+                sparse_skipped.insert(path);
+            }
             continue;
         }
         // `-N/--intent-to-add` never rewrites the content of already-tracked
@@ -669,7 +675,7 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
             let target = match std::fs::read_link(&abs) {
                 Ok(t) => t,
                 Err(e) => {
-                    read_errors.push((path, os_err_message(&e)));
+                    read_errors.push((path, os_err_message(&e), already_tracked));
                     continue;
                 }
             };
@@ -685,7 +691,7 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
             let bytes = match std::fs::read(&abs) {
                 Ok(b) => b,
                 Err(e) => {
-                    read_errors.push((path, os_err_message(&e)));
+                    read_errors.push((path, os_err_message(&e), already_tracked));
                     continue;
                 }
             };
@@ -712,13 +718,11 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
             (bytes, mode)
         };
 
-        // `--chmod=(+|-)x` overrides the executable bit of regular files (not
-        // symlinks), for both the object mode and what lands in the index.
-        let mode = match (chmod, mode) {
-            (Some(true), Mode::FILE) | (Some(true), Mode::FILE_EXECUTABLE) => Mode::FILE_EXECUTABLE,
-            (Some(false), Mode::FILE) | (Some(false), Mode::FILE_EXECUTABLE) => Mode::FILE,
-            (_, m) => m,
-        };
+        // `--chmod` is deliberately NOT applied here: git runs `chmod_pathspec()`
+        // over the whole cache once staging is done (builtin/add.c:601-602), so the
+        // mode flip reaches matched entries this walk never staged. Doing it in the
+        // walk both missed those and reported every matched path as changed under
+        // `-n`/`-v`, because the flipped mode always differs from the recorded one.
 
         // Only a real add hashes content into the odb. Other modes still need the
         // blob id (for change detection in the report) but must not create objects,
@@ -777,8 +781,11 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
             if staged_set.contains(&owned) {
                 continue;
             }
+            // A removal is `update_callback()`'s `DIFF_STATUS_DELETED` arm, which sits
+            // *behind* that function's sparse guard (read-cache.c:3979-3981) — so an
+            // out-of-definition path is skipped without a word here too, unlike the
+            // untracked paths `add_files()` collects and names.
             if outside_sparse(&owned) {
-                sparse_skipped.insert(owned);
                 continue;
             }
             if !pathspec.is_included(path, Some(false)) {
@@ -810,7 +817,10 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
             .workdir_path(BStr::new(p.as_bytes()))
             .is_some_and(|abs| std::fs::symlink_metadata(abs).is_ok());
         let matched_staged = path_is_or_under(staged_set.iter(), p);
-        let matched_tracked = path_is_or_under(existing.iter(), p);
+        // `PS_IGNORE_SKIP_WORKTREE`: an index entry the sparse-checkout definition
+        // hides never marks a pathspec seen, so it cannot count as a tracked match.
+        let matched_tracked =
+            path_is_or_under(existing.iter().filter(|e| !skip_worktree_entries.contains(*e)), p);
         let matched_deleted = path_is_or_under(deletion_set.iter().copied(), p);
         // An embedded repository whose HEAD is unborn matched the pathspec — it
         // just could not be indexed — so it is not a "did not match" case.
@@ -821,6 +831,14 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
 
         if matched_staged || matched_tracked || matched_deleted || matched_headless || matched_sparse
         {
+            continue;
+        }
+        // `if (!include_sparse && matches_skip_worktree(...))` (builtin/add.c:549-554):
+        // an otherwise-unmatched pathspec whose only index matches are hidden by the
+        // sparse-checkout definition is named — as typed, `pathspec.items[i].original`
+        // — and turns the exit code into 1, ahead of every "did not match" arm below.
+        if path_is_or_under(sparse_hidden.iter(), p) {
+            sparse_skipped.insert(BString::from(element.as_bytes()));
             continue;
         }
         if tracked_only {
@@ -865,33 +883,54 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
     // `--renormalize` re-stages tracked content off the *index* rather than off the
     // walk above, and does all of this command's object writing while it is at it.
     // Shared verbatim with the `stage` verb — see [`renormalize_tracked_files`].
+    let mut index_failed = false;
     if renormalize {
-        if let Some(code) = renormalize_tracked_files(
+        let outcome = renormalize_tracked_files(
             &repo,
             &index,
             &RenormalizeOpts { include_sparse, dry_run, verbose, intent_to_add },
             &mut filters,
             |p| pathspec.is_included(p, Some(false)),
-        )? {
+        )?;
+        if let Some(code) = outcome.aborted {
             return Ok(code);
         }
+        index_failed = outcome.failed;
     }
 
     // `--ignore-errors`: a real add reports the paths it could not index and, if
     // any occurred without `--ignore-errors`, aborts before touching the index.
     // An embedded repository with an unborn HEAD is one of those paths; git names
     // it with the trailing slash the directory walk carries.
-    if !(read_errors.is_empty() && headless_repos.is_empty()) && !dry_run {
+    //
+    // `--renormalize` never gets here: `cmd_add()` runs `renormalize_tracked_files()`
+    // *instead of* `add_files_to_cache()` and skips `add_files()` entirely
+    // (`add_new_files` is 0), so under that flag neither of the two callers that
+    // report an unindexable path exists, and the scan above owns the whole story.
+    let had_errors = !renormalize && !(read_errors.is_empty() && headless_repos.is_empty());
+    // `--dry-run` does not suppress any of this: `ADD_CACHE_PRETEND` is consulted
+    // inside `add_to_index()` only after `index_path()` has already failed, so `-n`
+    // reports the same two `error:` lines and dies the same way. Verified against git
+    // 2.55.0: `git add -n --ignore-errors -A` over an unreadable tracked file prints
+    // both lines and exits 1.
+    if had_errors {
         for p in &headless_repos {
             eprintln!("error: '{p}/' does not have a commit checked out");
             eprintln!("error: unable to index file '{p}/'");
         }
-        for (p, msg) in &read_errors {
+        for (p, msg, _) in &read_errors {
             eprintln!("error: open(\"{p}\"): {msg}");
             eprintln!("error: unable to index file '{p}'");
         }
         if !ignore_errors {
-            eprintln!("fatal: adding files failed");
+            // `add_files_to_cache()` runs first and dies on the first tracked path it
+            // could not index, so a tracked failure always outranks an untracked one.
+            let verb = if read_errors.iter().any(|(_, _, tracked)| *tracked) {
+                "updating"
+            } else {
+                "adding"
+            };
+            eprintln!("fatal: {verb} files failed");
             return Ok(ExitCode::from(128));
         }
     }
@@ -969,26 +1008,46 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
         lines
     };
 
-    if staged.is_empty() && deletions.is_empty() {
-        return Ok(finish_code(
-            !read_errors.is_empty() || !headless_repos.is_empty(),
-            ignore_errors,
-            dry_run,
-            &sparse_skipped,
-        ));
-    }
+    // `if (chmod_arg && pathspec.nr)` (builtin/add.c:601): the mode override runs
+    // only when a pathspec was given, so `-A`/`-u` — which synthesize none — leave
+    // every mode alone. Verified against git 2.55.0: `git add -u --chmod=+x` keeps
+    // a tracked file at 100644.
+    let chmod = if pathspecs.is_empty() { None } else { chmod };
 
     // --- dry run: report only, never touch the index ------------------------
+    // `chmod_pathspec(show_only = 1)` still runs, and still answers the `S_ISREG`
+    // question for every matched entry — a `--dry-run` over a matched symlink
+    // reports `cannot chmod +x` and exits 255 exactly as the real run does.
     if dry_run {
         for line in &report {
             println!("{line}");
         }
-        return Ok(finish_code(
-            !read_errors.is_empty() || !headless_repos.is_empty(),
+        let chmod_errors = match chmod {
+            None => Vec::new(),
+            Some(flip) => {
+                chmod_pathspec(&index, flip, include_sparse, sparsity.as_ref(), |p| {
+                    pathspec.is_included(p, Some(false))
+                })
+                .1
+            }
+        };
+        return Ok(finish_code(Finish {
+            had_errors,
             ignore_errors,
-            dry_run,
-            &sparse_skipped,
-        ));
+            sparse_skipped: &sparse_skipped,
+            chmod_errors: &chmod_errors,
+            index_failed,
+        }));
+    }
+
+    if staged.is_empty() && deletions.is_empty() && chmod.is_none() {
+        return Ok(finish_code(Finish {
+            had_errors,
+            ignore_errors,
+            sparse_skipped: &sparse_skipped,
+            chmod_errors: &[],
+            index_failed,
+        }));
     }
 
     // --- write path: serialize the read-modify-write through the coordinator.
@@ -1029,6 +1088,9 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
             );
         }
         index.sort_entries();
+        let chmod_errors = apply_chmod_pathspec(&mut index, chmod, include_sparse, sparsity.as_ref(), |p| {
+            pathspec.is_included(p, Some(false))
+        });
         index.remove_tree();
         index.write(gix::index::write::Options::default())?;
         record_stage_event(&repo, staged.len() + deletions.len());
@@ -1038,12 +1100,13 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
                 println!("{line}");
             }
         }
-        return Ok(finish_code(
-            !read_errors.is_empty() || !headless_repos.is_empty(),
+        return Ok(finish_code(Finish {
+            had_errors,
             ignore_errors,
-            dry_run,
-            &sparse_skipped,
-        ));
+            sparse_skipped: &sparse_skipped,
+            chmod_errors: &chmod_errors,
+            index_failed,
+        }));
     }
 
     // Drop every prior version (any stage) of a staged path and every deletion,
@@ -1061,6 +1124,13 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
     }
     index.sort_entries();
 
+    // `chmod_pathspec()` runs last (builtin/add.c:601-602), over the cache staging
+    // has already updated — which is what makes the flip reach a matched entry this
+    // run never restaged.
+    let chmod_errors = apply_chmod_pathspec(&mut index, chmod, include_sparse, sparsity.as_ref(), |p| {
+        pathspec.is_included(p, Some(false))
+    });
+
     // The tree-cache extension is written verbatim by `File::write`; drop it after
     // mutating entries so a later commit can't capture a stale subtree.
     index.remove_tree();
@@ -1073,12 +1143,13 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
         }
     }
 
-    Ok(finish_code(
-        !read_errors.is_empty() || !headless_repos.is_empty(),
+    Ok(finish_code(Finish {
+        had_errors,
         ignore_errors,
-        dry_run,
-        &sparse_skipped,
-    ))
+        sparse_skipped: &sparse_skipped,
+        chmod_errors: &chmod_errors,
+        index_failed,
+    }))
 }
 
 /// The sparse-checkout definition `path_in_sparse_checkout()` (sparse-index.c)
@@ -1118,6 +1189,82 @@ pub(super) fn skipped_as_sparse(
     !include_sparse
         && (flags.contains(Flags::SKIP_WORKTREE)
             || sparsity.is_some_and(|s| !s.includes(&path.to_str_lossy())))
+}
+
+/// Port of `chmod_pathspec()` (builtin/add.c:42-71): decide which index entries
+/// `--chmod=(+|-)x` flips, and which ones refuse.
+///
+/// The scan is driven by the **cache**, not by whatever the worktree walk staged,
+/// and that is the whole point of the function: `git add --chmod=+x a.txt` over an
+/// unchanged, already-tracked `a.txt` still rewrites its mode to 100755 (verified
+/// against git 2.55.0), and so does `git add -N --chmod=+x a.txt`, which stages no
+/// content at all. An implementation that flips the mode inside the staging walk
+/// misses every matched entry the walk did not restage — and, under `-n`/`-v`,
+/// reports every matched path as changed, because the flipped mode never equals the
+/// recorded one.
+///
+/// `chmod_index_entry()` (read-cache.c:907-911) returns -1 for anything that is not
+/// a regular file, and the `show_only` arm asks the same `S_ISREG` question without
+/// touching the entry — so a matched symlink or gitlink is `error: cannot chmod +x
+/// '<path>'` under `--dry-run` too. `error()` is -1, `ret` is -1, `exit_status |= -1`
+/// is -1, and `cmd_add()` returning -1 is what the shell reads as 255.
+///
+/// Returns `(paths to flip, error lines in cache order)`; the caller applies the
+/// first only when this is a real run.
+pub(super) fn chmod_pathspec(
+    index: &gix::index::File,
+    flip: bool,
+    include_sparse: bool,
+    sparsity: Option<&super::sparse_checkout::Sparsity>,
+    mut selected: impl FnMut(&BStr) -> bool,
+) -> (HashSet<BString>, Vec<String>) {
+    let sign = if flip { '+' } else { '-' };
+    let mut wanted: HashSet<BString> = HashSet::new();
+    let mut errors: Vec<String> = Vec::new();
+    let backing = index.path_backing();
+    for e in index.entries() {
+        let path = e.path_in(backing);
+        // The very same guard `renormalize_tracked_files()` opens with; see
+        // [`skipped_as_sparse`]. Without it, `--chmod=+x .` flipped the mode of every
+        // entry the definition (or a `--skip-worktree` bit) keeps out of the worktree.
+        if skipped_as_sparse(e.flags, path, include_sparse, sparsity) {
+            continue;
+        }
+        // `ce_path_match()`: every stage, not just stage 0 — the C loop walks the
+        // raw cache and has no `ce_stage()` filter.
+        if !selected(path) {
+            continue;
+        }
+        if matches!(e.mode, Mode::FILE | Mode::FILE_EXECUTABLE) {
+            wanted.insert(path.to_owned());
+        } else {
+            errors.push(format!("error: cannot chmod {sign}x '{path}'"));
+        }
+    }
+    (wanted, errors)
+}
+
+/// [`chmod_pathspec`] for a real run: decide, then flip. Split in two because the
+/// decision borrows the index (path backing and matcher) while the flip needs it
+/// exclusively. `None` is git's `chmod_arg == NULL`, which skips the pass entirely.
+pub(super) fn apply_chmod_pathspec(
+    index: &mut gix::index::File,
+    chmod: Option<bool>,
+    include_sparse: bool,
+    sparsity: Option<&super::sparse_checkout::Sparsity>,
+    selected: impl FnMut(&BStr) -> bool,
+) -> Vec<String> {
+    let Some(flip) = chmod else { return Vec::new() };
+    let (wanted, errors) = chmod_pathspec(index, flip, include_sparse, sparsity, selected);
+    if !wanted.is_empty() {
+        let want = if flip { Mode::FILE_EXECUTABLE } else { Mode::FILE };
+        for (entry, path) in index.entries_mut_with_paths() {
+            if wanted.contains(&path.to_owned()) {
+                entry.mode = want;
+            }
+        }
+    }
+    errors
 }
 
 /// What [`renormalize_tracked_files`] reads off the command line.
@@ -1171,17 +1318,41 @@ pub(super) struct RenormalizeOpts {
 /// caller's `ce_path_match()`: the two verbs normalize their pathspecs differently
 /// and so carry different matchers, but ask them the same question.
 ///
-/// Returns `Some(exit code)` when the scan aborted, `None` when it ran to the end.
+/// A file that cannot be *read* is the other failure, and it is nothing like the
+/// missing one: `index_path()` fails, `add_to_index()` reports
+/// `error: unable to index file '<path>'` and returns -1, and the loop's
+/// `retval |= …` carries that to the end while the scan **keeps going** — later
+/// entries are still indexed, still reported, and the index is still written.
+/// `cmd_add()` then returns -1, which the shell reads as 255, and `--ignore-errors`
+/// changes none of it: that flag is consulted by `update_callback()` and
+/// `add_files()`, neither of which runs under `--renormalize`. Verified against git
+/// 2.55.0: `git add -v --renormalize -A` over an unreadable `u.txt` prints the two
+/// `error:` lines, then `add 'a.txt'` and `add 'z.txt'`, updates both of their index
+/// entries, leaves `u.txt`'s alone, and exits 255.
+///
+/// `index_path()` runs under `--dry-run` too — `hash_flags` merely loses
+/// `INDEX_WRITE_OBJECT` (read-cache.c:723) — so `-n` fails the same entry. `-N` takes
+/// the `intent_only` branch instead and never reads the file at all.
+pub(super) struct RenormalizeOutcome {
+    /// `add_file_to_index()`'s `die_errno` on a vanished path: the scan stopped
+    /// there and this is the whole command's exit code.
+    pub aborted: Option<ExitCode>,
+    /// At least one entry could not be indexed — git's `exit_status |= -1`.
+    pub failed: bool,
+}
+
+/// Returns how the scan ended; see [`RenormalizeOutcome`].
 pub(super) fn renormalize_tracked_files(
     repo: &gix::Repository,
     index: &gix::index::File,
     opts: &RenormalizeOpts,
     filters: &mut super::convert_to_git::WorktreeFilter,
     mut selected: impl FnMut(&BStr) -> bool,
-) -> Result<Option<ExitCode>> {
+) -> Result<RenormalizeOutcome> {
     let sparsity = sparsity_to_consult(repo, opts.include_sparse)?;
     // The paths already handed to `add_file_to_index()`, in index order.
     let mut handled: Vec<BString> = Vec::new();
+    let mut failed = false;
     let backing = index.path_backing();
     for e in index.entries() {
         let path = e.path_in(backing);
@@ -1210,25 +1381,41 @@ pub(super) fn renormalize_tracked_files(
                 repo.write_blob(b"")?;
             }
             eprintln!("fatal: unable to stat '{path}': No such file or directory");
-            return Ok(Some(ExitCode::from(128)));
+            return Ok(RenormalizeOutcome { aborted: Some(ExitCode::from(128)), failed });
+        };
+        // `-N` takes `add_to_index()`'s `intent_only` branch, which never calls
+        // `index_path()` — the file is not even opened, so it cannot fail here.
+        if opts.intent_to_add {
+            handled.push(path.to_owned());
+            continue;
+        }
+        // `index_path()` runs for `--dry-run` as well; `hash_flags` only drops
+        // `INDEX_WRITE_OBJECT`. So the read happens either way and only the *write*
+        // is conditional.
+        let read = gix::index::fs::Metadata::from_path_no_follow(&abs)
+            .map_err(|e| e.to_string())
+            .and_then(|md| {
+                super::stage::read_converted_bytes(repo, filters, path, &abs, &md)
+                    .map_err(|e| e.to_string())
+            });
+        let (content, _) = match read {
+            Ok(v) => v,
+            Err(msg) => {
+                // `index_path()`'s `error_errno("open(\"%s\")")` and
+                // `add_to_index()`'s `error(_("unable to index file '%s'"))`
+                // (read-cache.c:784). The scan does not stop.
+                eprintln!("error: open(\"{path}\"): {}", strip_os_error(&msg));
+                eprintln!("error: unable to index file '{path}'");
+                failed = true;
+                continue;
+            }
         };
         handled.push(path.to_owned());
-        // `hash_flags` starts as `pretend ? 0 : INDEX_WRITE_OBJECT`, so `--dry-run`
-        // hashes without writing; `-N` never hashes at all, because `add_to_index()`
-        // takes the `intent_only` branch and the empty blob above is the only object
-        // it deposits. An unreadable file is left to the caller, which reports it
-        // through git's `error: open(...)` / `unable to index file` pair.
-        if !opts.dry_run && !opts.intent_to_add {
-            if let Ok(md) = gix::index::fs::Metadata::from_path_no_follow(&abs) {
-                if let Ok((content, _)) =
-                    super::stage::read_converted_bytes(repo, filters, path, &abs, &md)
-                {
-                    repo.write_blob(&content)?;
-                }
-            }
+        if !opts.dry_run {
+            repo.write_blob(&content)?;
         }
     }
-    Ok(None)
+    Ok(RenormalizeOutcome { aborted: None, failed })
 }
 
 /// Every stage-0 gitlink the pathspec selects whose submodule worktree sits at a
@@ -1346,6 +1533,77 @@ fn split_pathspec_magic(spec: &str) -> (usize, bool) {
     }
 }
 
+/// `parse_pathspec()`'s prefix pass (pathspec.c:455-467, via `prefix_path_gently`)
+/// applied to a whole element list, shared by `add` and `stage` because stock git
+/// dispatches both verbs to the same `cmd_add()`.
+///
+/// Each element comes back as a pair: **as typed**, which is what git quotes back in
+/// its diagnostics, and **repo-relative**, which is the only form that can be
+/// compared with index and worktree paths — those are always repo-relative. Skipping
+/// the second is why `git add f.txt` in a subdirectory once reported `pathspec
+/// 'f.txt' did not match any files` for a file the walk had just staged, and why
+/// `git stage sub/f.txt` from `sub/` matched the repository's `sub/f.txt` instead of
+/// the `sub/sub/f.txt` git looks for.
+///
+/// `pathspecs` itself is left as typed — gitoxide resolves the patterns against the
+/// repository prefix on its own, so handing it a prefixed element would apply the
+/// prefix twice — with one exception, rewritten in place: an absolute element, which
+/// the matcher cannot take at all.
+///
+/// An element that resolves outside the worktree is `prefix_path_gently()` returning
+/// NULL, which is a die, not a skip. It exits the process (128), as git's does.
+pub(super) fn resolve_pathspecs(
+    repo: &gix::Repository,
+    pathspecs: &mut [String],
+) -> Result<Vec<(String, String)>> {
+    // `prefix_path()` runs every command-line path through `normalize_path_copy()`
+    // first, so `./.` is `.`, `src/.` is `src`, and `a/../b` is `b` before anything
+    // asks whether the path exists or is ignored.
+    for spec in pathspecs.iter_mut() {
+        *spec = normalize_pathspec(spec);
+    }
+    // git's `prefix` is directory-terminated ("sub/") while gix reports it without
+    // the separator; concatenating that would produce `subf.txt`.
+    let prefix = repo
+        .prefix()
+        .ok()
+        .flatten()
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .filter(|p| !p.is_empty())
+        .map(|p| if p.ends_with('/') { p } else { format!("{p}/") })
+        .unwrap_or_default();
+    let mut checked: Vec<(String, String)> = Vec::with_capacity(pathspecs.len());
+    for i in 0..pathspecs.len() {
+        let spec = pathspecs[i].clone();
+        match prefixed_pathspec(&spec, &prefix, repo) {
+            Ok(relative) => {
+                // An absolute pathspec is the one case the matcher cannot take as
+                // typed — gitoxide reads it as a path outside the worktree and
+                // refuses. Its repo-relative form cannot be handed over bare
+                // either, since the walk would resolve THAT against the prefix a
+                // second time; `:(top)` is the spelling that says "already rooted".
+                if spec.starts_with('/') {
+                    pathspecs[i] = format!(":(top){relative}");
+                }
+                checked.push((spec, relative));
+            }
+            Err(copyfrom) => {
+                // `absolute_path(hint_path)`: the worktree gix hands back can be
+                // relative to the cwd ("..") and git always names an absolute one.
+                let root = repo
+                    .workdir()
+                    .unwrap_or_else(|| repo.git_dir())
+                    .canonicalize()
+                    .unwrap_or_else(|_| repo.git_dir().to_path_buf())
+                    .display()
+                    .to_string();
+                crate::git_fatal!("{spec}: '{copyfrom}' is outside repository at '{root}'");
+            }
+        }
+    }
+    Ok(checked)
+}
+
 /// `prefix_path_gently()` (setup.c:103-130) applied to one pathspec element,
 /// keeping its magic.
 ///
@@ -1444,20 +1702,42 @@ fn normalize_pathspec(spec: &str) -> String {
     }
 }
 
+/// Everything `cmd_add()`'s `exit_status` has accumulated by the time it falls
+/// through to the `finish:` label, plus the two reports git prints on the way out.
+pub(super) struct Finish<'a> {
+    /// A path this run could not read. Without `--ignore-errors` that already
+    /// aborted; with it, `add_files_to_cache()`/`add_files()` return 1 and git
+    /// carries it to the end. `--dry-run` does not enter into it: `add_to_index()`
+    /// only consults `ADD_CACHE_PRETEND` after `index_path()` has already failed, so
+    /// `git add -n --ignore-errors -A` over an unreadable file exits 1 too (verified
+    /// against git 2.55.0).
+    pub had_errors: bool,
+    pub ignore_errors: bool,
+    /// `matched_sparse_paths` (builtin/add.c:372) and `only_match_skip_worktree`
+    /// (builtin/add.c:574), both handed to `advise_on_updating_sparse_paths()`.
+    pub sparse_skipped: &'a std::collections::BTreeSet<BString>,
+    /// `chmod_pathspec()`'s `cannot chmod` lines — each one an `error()`, i.e. -1.
+    pub chmod_errors: &'a [String],
+    /// `renormalize_tracked_files()` could not index an entry: also -1.
+    pub index_failed: bool,
+}
+
 /// The overall exit code: git returns 1 from a real add when `--ignore-errors`
 /// let it skip at least one unreadable file, and 1 whenever a matched path lay
 /// outside the sparse-checkout definition; else success.
 ///
+/// A -1 outranks both. `exit_status` is an int folded with `|=`, so a single
+/// `error()` (-1, all bits set) survives every later `|= 1`, and `cmd_add()`
+/// returning -1 is what the shell reports as 255.
+///
 /// `advise_on_updating_sparse_paths()` names every skipped path — sorted, one per
 /// line, under a three-line explanation — and follows with the advice block that
-/// `advice.updateSparsePath` turns off.
-fn finish_code(
-    had_errors: bool,
-    ignore_errors: bool,
-    dry_run: bool,
-    sparse_skipped: &std::collections::BTreeSet<BString>,
-) -> ExitCode {
-    if !sparse_skipped.is_empty() {
+/// `advice.updateSparsePath` turns off. It runs inside `add_files()`, ahead of
+/// `chmod_pathspec()`, which is why the two blocks are printed in this order.
+pub(super) fn finish_code(f: Finish<'_>) -> ExitCode {
+    let Finish { had_errors, ignore_errors, sparse_skipped, chmod_errors, index_failed } = f;
+    let sparse_reported = !sparse_skipped.is_empty();
+    if sparse_reported {
         eprintln!("The following paths and/or pathspecs matched paths that exist");
         eprintln!("outside of your sparse-checkout definition, so will not be");
         eprintln!("updated in the index:");
@@ -1472,12 +1752,26 @@ fn finish_code(
                 "hint: Disable this message with \"git config set advice.updateSparsePath false\""
             );
         }
-        return ExitCode::from(1);
     }
-    if ignore_errors && !dry_run && had_errors {
+    for line in chmod_errors {
+        eprintln!("{line}");
+    }
+    if !chmod_errors.is_empty() || index_failed {
+        return ExitCode::from(255);
+    }
+    if sparse_reported || (ignore_errors && had_errors) {
         ExitCode::from(1)
     } else {
         ExitCode::SUCCESS
+    }
+}
+
+/// Rust renders an OS error as `<strerror> (os error N)`; git prints only the
+/// `<strerror>` half. Shared by every message that quotes one.
+pub(super) fn strip_os_error(s: &str) -> &str {
+    match s.find(" (os error ") {
+        Some(idx) => &s[..idx],
+        None => s,
     }
 }
 
@@ -1526,11 +1820,7 @@ fn warn_embedded_repo(
 /// `Permission denied`. Rust renders an OS error as `<strerror> (os error N)`;
 /// git shows only the `<strerror>` prefix, so strip the trailing ` (os error N)`.
 fn os_err_message(e: &std::io::Error) -> String {
-    let s = e.to_string();
-    match s.find(" (os error ") {
-        Some(idx) => s[..idx].to_string(),
-        None => s,
-    }
+    strip_os_error(&e.to_string()).to_string()
 }
 
 /// `--chmod` value parse: `+x` => `Some(true)`, `-x` => `Some(false)`, else `None`.

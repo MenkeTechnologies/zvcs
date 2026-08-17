@@ -21,8 +21,9 @@ pub enum Outcome {
     Command(String, Vec<String>),
     /// A `!`-prefixed shell alias, already run; carries its exit code.
     Shell(ExitCode),
-    /// A malformed alias (bad quoting, empty, recursive, or looping); carries
-    /// git's diagnostic, to print as `zvcs: <msg>`.
+    /// A malformed alias (bad quoting, empty, recursive, or looping). Each is a
+    /// `die()` in `handle_alias`, so the caller prints it as `fatal: <msg>` and
+    /// leaves with 128 — verified one message at a time against stock 2.55.0.
     Fatal(String),
     /// A `handle_options()` failure the expansion provoked — a `-C` that cannot
     /// chdir, a `-C` with no value. git reports these itself and exits before the
@@ -37,47 +38,33 @@ pub enum Outcome {
 /// `pager_forced` mirrors git's `handle_options` running inside the `run_argv`
 /// loop: an alias like `-p log` must still toggle the pager for the resolved
 /// command.
-pub fn resolve(sub: &str, rest: &[String], pager_forced: &mut Option<bool>) -> Outcome {
+///
+/// `expanded` is `run_argv`'s `done_alias` return: set when at least one
+/// expansion happened, because `cmd_main` reports an unresolvable verb that came
+/// out of an alias differently from one the user typed ([`crate::run`]).
+///
+/// `overrides` is the caller's command-line configuration list, which an
+/// expansion's own `-c`/`--config-env` appends to. It is shared rather than
+/// local because git's overrides are process-global from the moment they are
+/// pushed: the command the chain finally resolves to sees the ones its own
+/// aliases added, and the caller checks the whole list against that command.
+pub fn resolve(
+    sub: &str,
+    rest: &[String],
+    pager_forced: &mut Option<bool>,
+    expanded: &mut bool,
+    overrides: &mut Vec<crate::ConfigOverride>,
+) -> Outcome {
     let mut args: Vec<String> = Vec::with_capacity(1 + rest.len());
     args.push(sub.to_string());
     args.extend_from_slice(rest);
 
-    // Alias names already expanded, to detect loops (git's `expanded_aliases`).
-    let mut seen: Vec<String> = Vec::new();
+    // Every command name `run_argv` has looked at this pass, in order — git's
+    // `cmd_list`. It is both the loop guard and the trace the loop diagnostic
+    // prints, so it has to keep the names *and* their order, not just a set.
+    let mut cmd_list: Vec<String> = Vec::new();
 
     loop {
-        // Consume any leading global options an expansion introduced, matching
-        // git handling `handle_options` each turn of `run_argv`.
-        let mut i = 0;
-        while i < args.len() {
-            match args[i].as_str() {
-                "-p" | "--paginate" => {
-                    *pager_forced = Some(true);
-                    i += 1;
-                }
-                "-P" | "--no-pager" => {
-                    *pager_forced = Some(false);
-                    i += 1;
-                }
-                "-C" => {
-                    let Some(dir) = args.get(i + 1) else {
-                        eprintln!("no directory given for '-C' option");
-                        eprintln!("usage: {}", crate::porcelain::help::GIT_USAGE_STRING);
-                        return Outcome::Exit(ExitCode::from(129));
-                    };
-                    if let Err(msg) = crate::chdir_global(dir) {
-                        eprintln!("fatal: {msg}");
-                        return Outcome::Exit(ExitCode::from(crate::fatal::EXIT_FATAL));
-                    }
-                    i += 2;
-                }
-                _ => break,
-            }
-        }
-        if i > 0 {
-            args.drain(0..i);
-        }
-
         let Some(head) = args.first().cloned() else {
             return Outcome::Fatal("empty alias".into());
         };
@@ -88,6 +75,22 @@ pub fn resolve(sub: &str, rest: &[String], pager_forced: &mut Option<bool>) -> O
             return Outcome::Command(head, args[1..].to_vec());
         }
 
+        // `run_argv`'s loop guard, between the builtin lookup and `handle_alias`:
+        // a name seen earlier this pass means the expansion cannot terminate.
+        if let Some(pos) = cmd_list.iter().position(|s| s == &head) {
+            return Outcome::Fatal(loop_detected(&cmd_list, pos));
+        }
+        cmd_list.push(head.clone());
+
+        // `alias_lookup()` reads the configuration, and reading it is what makes
+        // git report a malformed `-c` key. So a bad key an earlier turn of this
+        // loop pushed surfaces *here*, at the next lookup — before the empty /
+        // recursive / loop guards of the turn that would follow, which is why
+        // `alias.x = "-c foo x"` reports the recursion rather than the key.
+        if let Some(code) = crate::report_bad_config_overrides(overrides) {
+            return Outcome::Exit(code);
+        }
+
         let Some(value) = lookup(&head) else {
             // Not a verb and not an alias: let dispatch produce its own error
             // (git's "is not a git command" message).
@@ -95,6 +98,10 @@ pub fn resolve(sub: &str, rest: &[String], pager_forced: &mut Option<bool>) -> O
         };
 
         // `git <alias> -h` reports the aliasing, then still runs the expansion.
+        // The C's guard is `args->nr == 2 && !strcmp(args->v[1], "-h")`: the
+        // notice is for the *bare* `git <alias> -h` only, so `git <alias> -h x`
+        // — where the `-h` is an argument to the expanded command rather than a
+        // request to describe the alias — stays silent.
         if args.len() == 2 && args[1] == "-h" {
             eprintln!("'{head}' is aliased to '{value}'");
         }
@@ -103,23 +110,43 @@ pub fn resolve(sub: &str, rest: &[String], pager_forced: &mut Option<bool>) -> O
             return Outcome::Shell(run_shell_alias(shell, &args[1..]));
         }
 
-        let expansion = match split_cmdline(&value) {
+        let mut expansion = match split_cmdline(&value) {
             Ok(v) => v,
             Err(e) => return Outcome::Fatal(format!("bad alias.{head} string: {e}")),
         };
-        if expansion.is_empty() || expansion[0].is_empty() {
+
+        // `handle_options()` runs over the **expansion alone**, before the user's
+        // trailing arguments are spliced in, and with a non-null `envchanged`.
+        // Every global that reaches a child process through the environment sets
+        // it, and `handle_alias` then refuses the alias outright rather than
+        // letting it leak a setting into the rest of the process — the one thing
+        // an alias may not do. `-p`/`--paginate`, `-c` and `--config-env` do not
+        // set it, so an alias may still choose paging or push configuration.
+        let mut envchanged = false;
+        let consumed =
+            match crate::handle_options(&expansion, pager_forced, overrides, &mut envchanged) {
+                crate::Handled::Consumed(n) => n,
+                crate::Handled::Exit(code) => return Outcome::Exit(code),
+            };
+        if envchanged {
+            eprintln!(
+                "fatal: alias '{head}' changes environment variables.\n\
+                 You can use '!git' in the alias to do this"
+            );
+            return Outcome::Exit(ExitCode::from(crate::fatal::EXIT_FATAL));
+        }
+        expansion.drain(0..consumed);
+
+        // `if (count < 1) die(_("empty alias for %s"), …)`. The test is on the
+        // token *count*, not on the token: `split_cmdline("")` yields one empty
+        // token, so `alias.x = ""` expands to `""` and fails later as a command
+        // that does not exist, which is what stock does.
+        if expansion.is_empty() {
             return Outcome::Fatal(format!("empty alias for {head}"));
         }
         if expansion[0] == head {
             return Outcome::Fatal(format!("recursive alias: {head}"));
         }
-        if seen.iter().any(|s| s == &expansion[0]) {
-            return Outcome::Fatal(format!(
-                "alias loop detected: expansion of '{}' does not terminate",
-                seen[0]
-            ));
-        }
-        seen.push(head);
 
         // Replace the alias token (args[0]) with its expansion, keeping the
         // user's trailing arguments (git's `strvec_splice(args, 0, 1, ...)`).
@@ -127,7 +154,31 @@ pub fn resolve(sub: &str, rest: &[String], pager_forced: &mut Option<bool>) -> O
         args.clear();
         args.extend(expansion);
         args.extend(tail);
+        *expanded = true;
     }
+}
+
+/// `run_argv`'s loop diagnostic, built from the command names seen this pass and
+/// the index of the one that repeated.
+///
+/// The C names the *first* command of the chain in the sentence and then walks
+/// the whole list, marking the repeated entry `<==` and the last entry `==>` —
+/// and only marks the last when it is not itself the repeated one, since the
+/// two markers are an if/else over the same item.
+fn loop_detected(cmd_list: &[String], repeated: usize) -> String {
+    let mut trace = String::new();
+    for (i, name) in cmd_list.iter().enumerate() {
+        trace.push_str(&format!("\n  {name}"));
+        if i == repeated {
+            trace.push_str(" <==");
+        } else if i == cmd_list.len() - 1 {
+            trace.push_str(" ==>");
+        }
+    }
+    format!(
+        "alias loop detected: expansion of '{}' does not terminate:{trace}",
+        cmd_list[0]
+    )
 }
 
 /// Port of `alias_lookup`/`config_alias_cb` (alias.c): find the alias body for

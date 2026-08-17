@@ -665,14 +665,20 @@ fn trailing_byte(name: &[u8], len: usize, is_dir: bool) -> u8 {
 /// `repo_get_oid()` as this command needs it: a full-length hex id is accepted
 /// verbatim, without checking that the object exists, and anything else is a
 /// revision expression. `None` is C's non-zero return.
+///
+/// `cmd_merge_recursive()` (`builtin/merge-recursive.c:62,82,84`) calls
+/// `repo_get_oid()` once for each base and once for each of the two heads, so
+/// every operand reaches `get_oid_basic()` exactly once — and earns its
+/// `warning: refname … is ambiguous.` when the repository also holds a ref by
+/// that name.
+///
+/// The hand-written copy this replaced re-derived only the *decode* half of that
+/// branch and returned before anything could warn, so all three operands were
+/// silent where stock warns once each. It also inherited gitoxide's reading of
+/// `<rev>^!`, which `get_oid_1()` has no case for — see
+/// [`crate::objname::resolve`], which is both halves and the whole grammar.
 fn resolve_object(repo: &gix::Repository, spec: &str) -> Option<ObjectId> {
-    let hexsz = repo.object_hash().len_in_hex();
-    if spec.len() == hexsz && spec.bytes().all(|b| b.is_ascii_hexdigit()) {
-        if let Ok(id) = ObjectId::from_hex(spec.as_bytes()) {
-            return Some(id);
-        }
-    }
-    repo.rev_parse_single(spec).ok().map(|id| id.detach())
+    crate::objname::resolve(repo, spec)
 }
 
 /// Peel a resolved id to the commit it names (git's `lookup_commit_reference`).

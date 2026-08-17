@@ -272,3 +272,50 @@ fn describe_absent_id_is_a_valid_object_name() {
     assert_eq!(out, "v1:f.txt\n");
     assert_eq!(code, 0);
 }
+
+/// `git reflog show <name>` for a name with no reflog, which is `setup_revisions()`
+/// resolving an ordinary operand and therefore the same two outcomes again:
+///
+/// ```c
+/// if (get_oid_with_context(revs->repo, arg, get_sha1_flags, &oid, &oc)) {
+///         ret = revs->ignore_missing ? 0 : -1;
+///         goto out;
+/// }
+/// …
+/// object = get_reference(revs, arg, &oid, flags ^ local_flags);
+/// ```
+///
+/// A well-formed id resolves without the object database being asked, so it gets
+/// past the first test and dies at `get_reference()`'s `bad object <name>`; a
+/// name that resolves to nothing at all never reaches that line and comes back
+/// as `setup_revisions()`'s `ambiguous argument` block instead. Resolving only
+/// through the object database gives the second message for both.
+#[test]
+fn reflog_show_separates_unresolvable_from_absent() {
+    let f = Fixture::new("rlshow");
+
+    let (out, err, code) = f.run(&["reflog", "show", ABSENT]);
+    assert_eq!(err, format!("fatal: bad object {ABSENT}\n"));
+    assert_eq!(out, "");
+    assert_eq!(code, 128);
+
+    let (out, err, code) = f.run(&["reflog", "show", UNRESOLVABLE]);
+    assert_eq!(
+        err,
+        format!(
+            "fatal: ambiguous argument '{UNRESOLVABLE}': unknown revision or path not in the working tree.\n\
+             Use '--' to separate paths from revisions, like this:\n\
+             'git <command> [<revision>...] -- [<file>...]'\n"
+        )
+    );
+    assert_eq!(out, "");
+    assert_eq!(code, 128);
+
+    // A present object with no reflog is neither: the walk finds nothing to show
+    // and exits 0, which is what keeps the `bad object` above about the *object*
+    // rather than about the missing log.
+    let (out, err, code) = f.run(&["reflog", "show", "HEAD^{tree}"]);
+    assert_eq!(err, "");
+    assert_eq!(out, "");
+    assert_eq!(code, 0);
+}

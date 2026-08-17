@@ -1183,12 +1183,10 @@ fn revert_one(
         // git's `do_pick_commit` names the reverted commit and *its* subject here,
         // not the generated `Revert "…"` message, then prints the revert advice.
         eprintln!("error: could not revert {short}... {subject_label}");
-        eprintln!("hint: After resolving the conflicts, mark them with");
-        eprintln!("hint: \"git add/rm <pathspec>\", then run");
-        eprintln!("hint: \"git revert --continue\".");
-        eprintln!("hint: You can instead skip this commit with \"git revert --skip\".");
-        eprintln!("hint: To abort and get back to the state before \"git revert\",");
-        eprintln!("hint: run \"git revert --abort\".");
+        // `print_advice(r, res == 1, opts)`: `--no-commit` picks the two-line
+        // variant regardless of the action, since with no commit pending there
+        // is no `--continue` to point at.
+        crate::sequencer::print_advice(repo, crate::sequencer::Action::Revert, o.no_commit);
         return Ok(Step::Failed(ExitCode::from(1)));
     }
 

@@ -45,6 +45,25 @@
 //!   * `core.graftFile` — git 2.55 does not honour it either (only
 //!     `$GIT_GRAFT_FILE` and the default path), so neither does this.
 //!   * `GIT_REPLACE_REF_BASE` — the namespace is always `refs/replace/`.
+//!   * **Graft *registration*.** `--convert-graft-file` reads the graft file as a
+//!     list of lines; git additionally reads it as a *graft table* the first time
+//!     any commit is parsed (`prepare_commit_graft()` → `read_graft_file()`,
+//!     commit.c:287-316, reached from `parse_commit_buffer()`, commit.c:554), and
+//!     substitutes the listed parents for the commit's real ones everywhere. zvcs
+//!     has no such table: with a graft file in place, `log`, `rev-list` and every
+//!     other walker still follow the true parents. Three diagnostics ride on that
+//!     table and are therefore absent here — the
+//!     `Support for <GIT_DIR>/info/grafts is deprecated` advice (suppressed by
+//!     `--convert-graft-file`'s `no_graft_file_deprecated_advice = 1`),
+//!     `error: bad graft data: <line>` and `error: duplicate graft data: <line>`
+//!     (commit.c:249-311), plus the `error: Could not read <oid>` that
+//!     `repo_parse_commit_internal()` (commit.c:644) emits once a graft has
+//!     pre-created a commit node for an absent parent. Emitting those lines
+//!     without the substitution would report on a table that does not exist, so
+//!     they are left out rather than imitated. Applying grafts for real needs a
+//!     parent-*substitution* hook in commit parsing; gitoxide's traversal takes a
+//!     *skip* predicate (`gix::revision::walk`, used for `.git/shallow`), which
+//!     cannot express replacing a commit's parent list.
 //!
 //! Exit codes follow git: 0 on success, 129 for usage errors, 1 when `-d` or
 //! `--convert-graft-file` had a failure, 128 for `die()`, and 255 for every

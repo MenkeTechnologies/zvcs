@@ -86,6 +86,53 @@ fn reset_n_whole_tree_keeps_staged_addition() {
     assert!(!cached.contains("new.txt"), "i-t-a path must not be staged: {cached:?}");
 }
 
+/// `set_object_name_for_intent_to_add_entry()` (read-cache.c:704) does not merely
+/// *name* the empty blob, it writes it:
+///
+/// ```c
+/// struct object_id oid;
+/// if (odb_write_object(the_repository->objects, "", 0, OBJ_BLOB, &oid))
+///         die(_("cannot create an empty blob in the object database"));
+/// oidcpy(&ce->oid, &oid);
+/// ```
+///
+/// The two tests above are satisfied by an index that only names the id, and
+/// `ls-files --stage` cannot tell the difference. `git fsck` can: an index entry
+/// pointing at an object the odb does not hold is reported as
+/// `missing blob e69de29…`, and that is what stock and a name-only
+/// implementation disagree on after any `-N` reset that dropped a path.
+///
+/// The pathspec form and the whole-tree form build their stubs in different
+/// functions, so both are checked; a repository whose `-N` created no stub at
+/// all must still not gain the object, since git writes it per stub.
+#[test]
+fn reset_n_writes_the_empty_blob_into_the_object_database() {
+    for (tag, reset_args) in [
+        ("ita-odb-path", vec!["reset", "-q", "-N", "--", "new.txt"]),
+        ("ita-odb-whole", vec!["reset", "-q", "-N"]),
+    ] {
+        let r = repo(tag);
+        // The object must not be there before: `add` of a non-empty file cannot
+        // have written it, so its presence afterwards is the reset's doing.
+        let pre = bin(&r, &["cat-file", "-e", EMPTY_BLOB]);
+        assert!(!pre.status.success(), "{tag}: fixture already holds the empty blob");
+
+        std::fs::write(r.join("new.txt"), "hello\n").unwrap();
+        git(&r, &["add", "new.txt"]);
+        let o = bin(&r, &reset_args);
+        assert!(o.status.success(), "{tag}: {}", stderr(&o));
+
+        let post = bin(&r, &["cat-file", "-e", EMPTY_BLOB]);
+        assert!(post.status.success(), "{tag}: the empty blob was named but never written");
+        let fsck = bin(&r, &["fsck", "--no-progress", "--no-dangling"]);
+        let report = format!("{}{}", stdout(git(&r, &["ls-files", "--stage"])), stderr(&fsck));
+        assert!(
+            !stderr(&fsck).contains(EMPTY_BLOB),
+            "{tag}: fsck still reports the i-t-a object: {report}"
+        );
+    }
+}
+
 #[test]
 fn reset_n_requires_mixed() {
     let r = repo("ita-mixed");

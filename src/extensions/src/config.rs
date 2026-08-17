@@ -233,6 +233,74 @@ pub fn parse_config_int(raw: &str) -> Result<i64, &'static str> {
     Ok(if negative { -signed } else { signed })
 }
 
+/// config.c's `iskeychar()`: the bytes a section or variable name may contain.
+/// git's `isalnum` is its own ASCII-only table (`ctype.c`), not the locale's, so
+/// a non-ASCII byte is never a key character no matter what `LC_CTYPE` says.
+fn is_key_char(c: u8) -> bool {
+    c.is_ascii_alphanumeric() || c == b'-'
+}
+
+/// Port of config.c's `git_config_parse_key()`: sanity-check `key` and return it
+/// canonicalized — section and variable name lower-cased, the extended basename
+/// (the `[section "Sub Section"]` part between the first and last dot) left
+/// exactly as typed.
+///
+/// The error strings are git's own `error()` text, printed by the caller as
+/// `error: <text>` before it dies with `unable to parse command-line config`:
+///
+/// * `key does not contain a section: <key>` — no dot, or a leading one
+///   (`last_dot == NULL || last_dot == key`).
+/// * `key does not contain variable name: <key>` — a trailing dot (`!last_dot[1]`).
+/// * `invalid key: <key>` — a byte outside [`is_key_char`] in the section or the
+///   variable name, or a variable name whose first byte is not a letter.
+/// * `invalid key (newline): <key>` — a newline inside the extended basename,
+///   which is the one byte git rejects there.
+pub fn parse_config_key(key: &str) -> Result<String, String> {
+    let bytes = key.as_bytes();
+    // `strrchr(key, '.')`, then git's `last_dot == NULL || last_dot == key`.
+    let Some(baselen) = bytes.iter().rposition(|&c| c == b'.').filter(|&i| i != 0) else {
+        return Err(format!("key does not contain a section: {key}"));
+    };
+    // `!last_dot[1]`: the dot is the last byte, so there is no variable name.
+    if baselen + 1 >= bytes.len() {
+        return Err(format!("key does not contain variable name: {key}"));
+    }
+
+    let mut canonical = Vec::with_capacity(bytes.len());
+    let mut dot = false;
+    for (i, &raw) in bytes.iter().enumerate() {
+        let mut c = raw;
+        if c == b'.' {
+            dot = true;
+        }
+        // Everything before the first dot is the section and everything after
+        // the last is the variable name; both are validated and lower-cased.
+        // What lies between is the extended basename, left untouched.
+        if !dot || i > baselen {
+            if !is_key_char(c) || (i == baselen + 1 && !c.is_ascii_alphabetic()) {
+                return Err(format!("invalid key: {key}"));
+            }
+            c = c.to_ascii_lowercase();
+        } else if c == b'\n' {
+            return Err(format!("invalid key (newline): {key}"));
+        }
+        canonical.push(c);
+    }
+    Ok(String::from_utf8_lossy(&canonical).into_owned())
+}
+
+/// The check config.c's `config_parse_pair()` runs over a `-c`/`--config-env`
+/// key before [`parse_config_key`]: an empty key is its own diagnostic.
+///
+/// Returns `Ok(())` for a key git would accept, or the `error()` text it prints
+/// for one it would not.
+pub fn check_config_key(key: &str) -> Result<(), String> {
+    if key.is_empty() {
+        return Err("empty config key".to_string());
+    }
+    parse_config_key(key).map(|_| ())
+}
+
 /// The reason string git's `die_bad_number` prints for a value it cannot read.
 const INVALID_UNIT: &str = "invalid unit";
 /// The reason string git's `die_bad_number` prints for a value that overflows.

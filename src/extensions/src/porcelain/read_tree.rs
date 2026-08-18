@@ -1406,20 +1406,28 @@ fn threeway_merge(
     }
 
     // #2, #3, #4, #6, #7, #9, #10, #11.
+    //
+    // The stage each kept entry carries is the one `unpack_single_entry()` gave
+    // it when the tree was read, not its slot number: for tree slot `i`
+    // (0-based) it is 1 while `i + 1 < head_idx`, 2 at `i + 1 == head_idx` and 3
+    // beyond (unpack-trees.c:1211-1226). Only a three-tree merge makes those
+    // coincide — there `head_idx` is 2 — so a four-tree `--aggressive` merge
+    // (two merge bases, as `git merge -s resolve` over a criss-cross history
+    // runs) filed the head under stage 3 and left no stage 2 at all.
     let mut kept: Vec<(Ce, u8)> = Vec::new();
     if head_match == 0 || remote_match == 0 {
-        for (i, stage) in stages.iter().enumerate().take(head_idx).skip(1) {
+        for stage in stages.iter().take(head_idx).skip(1) {
             if let Some(ce) = stage {
-                kept.push((*ce, u8::try_from(i).unwrap_or(1)));
+                kept.push((*ce, 1));
                 break;
             }
         }
     }
     if let Some(h) = head {
-        kept.push((h, u8::try_from(head_idx).unwrap_or(2)));
+        kept.push((h, 2));
     }
     if let Some(r) = remote {
-        kept.push((r, u8::try_from(head_idx + 1).unwrap_or(3)));
+        kept.push((r, 3));
     }
     Ok((Verdict::Keep(kept), true))
 }

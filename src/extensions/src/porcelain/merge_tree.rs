@@ -138,12 +138,13 @@ usage: git merge-tree [--write-tree] [<options>] <branch1> <branch2>
 /// as a fraction of it (see `MAX_SCORE` in git's `diffcore.h`).
 const MAX_SCORE: u64 = 60000;
 
-/// The `XDF_*` whitespace bits of `xdl_opts` (git's `xdiff/xdiff.h`), in the
-/// values the C uses so the `-X` names map onto them one for one.
-const XDF_IGNORE_WHITESPACE: u32 = 1 << 1;
-const XDF_IGNORE_WHITESPACE_CHANGE: u32 = 1 << 2;
-const XDF_IGNORE_WHITESPACE_AT_EOL: u32 = 1 << 3;
-const XDF_IGNORE_CR_AT_EOL: u32 = 1 << 4;
+// The `XDF_*` whitespace bits of `xdl_opts` (git's `xdiff/xdiff.h`) and the
+// `xdl_recmatch()` rules they select, shared with `git merge`'s `-X` path so the
+// two commands cannot drift apart.
+use crate::merge_ws::{
+    XDF_IGNORE_CR_AT_EOL, XDF_IGNORE_WHITESPACE, XDF_IGNORE_WHITESPACE_AT_EOL,
+    XDF_IGNORE_WHITESPACE_CHANGE,
+};
 
 /// Which of `merge-tree`'s two mutually exclusive modes was requested.
 ///
@@ -870,32 +871,11 @@ impl StrategyOptions {
     /// `-b` matches, `-b` everything `--ignore-space-at-eol` matches, and that
     /// everything `--ignore-cr-at-eol` matches.
     ///
-    /// The rules themselves are [`super::diff::normalize_line`], the port the diff
-    /// family already compares lines with — `xdl_recmatch()` is one function in
-    /// git, and this keeps it one function here.
+    /// The rules themselves are [`crate::merge_ws::canonicalize_for`], the one
+    /// place the merge family ports `xdl_recmatch()` — `git merge -X` reaches the
+    /// same function with the same `xdl_opts` word.
     fn canonicalize(&self) -> Option<gix::merge::blob::builtin_driver::text::Canonicalize> {
-        use super::diff::{normalize_line, Whitespace};
-
-        let ws = if self.whitespace & XDF_IGNORE_WHITESPACE != 0 {
-            Whitespace::IgnoreAll
-        } else if self.whitespace & XDF_IGNORE_WHITESPACE_CHANGE != 0 {
-            Whitespace::IgnoreChange
-        } else if self.whitespace & XDF_IGNORE_WHITESPACE_AT_EOL != 0 {
-            Whitespace::IgnoreAtEol
-        } else if self.whitespace & XDF_IGNORE_CR_AT_EOL != 0 {
-            Whitespace::IgnoreCrAtEol
-        } else {
-            return None;
-        };
-        Some(match ws {
-            Whitespace::IgnoreAll => |line: &[u8]| normalize_line(line, Whitespace::IgnoreAll),
-            Whitespace::IgnoreChange => |line: &[u8]| normalize_line(line, Whitespace::IgnoreChange),
-            Whitespace::IgnoreAtEol => |line: &[u8]| normalize_line(line, Whitespace::IgnoreAtEol),
-            Whitespace::IgnoreCrAtEol => {
-                |line: &[u8]| normalize_line(line, Whitespace::IgnoreCrAtEol)
-            }
-            Whitespace::Keep => unreachable!("the `else` returned"),
-        })
+        crate::merge_ws::canonicalize_for(self.whitespace)
     }
 
     /// `merge_ort_nonrecursive_internal()`'s opening move: with `-Xsubtree` set,

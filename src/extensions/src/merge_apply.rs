@@ -20,7 +20,10 @@
 //!
 //! [`StrategyOptions`] is the `-X`/`--strategy-option` half: a port of
 //! merge-ort's `parse_merge_opt()` plus the `match-trees.c` tree shifting that
-//! `-Xsubtree[=<prefix>]` drives.
+//! `-Xsubtree[=<prefix>]` drives and the `xdl_recmatch()` whitespace rules
+//! `-Xignore-*` drives (those live in [`crate::merge_ws`], shared with
+//! `merge-tree`). Every branch of `parse_merge_opt()` is honoured, so the only
+//! `-X` that fails is one git itself rejects.
 
 use anyhow::{anyhow, Result};
 use std::collections::{HashMap, HashSet};
@@ -30,6 +33,7 @@ use gix::bstr::{BStr, BString, ByteSlice};
 use gix::diff::blob::Algorithm;
 use gix::hash::ObjectId;
 use gix::index::entry::{Mode, Stat};
+use gix::merge::blob::builtin_driver::text::ConflictStyle;
 
 /// What [`three_way_merge_guarded`] did: the merge was applied, or the checkout
 /// that would have applied it was refused because it would have clobbered local
@@ -180,6 +184,7 @@ pub fn three_way_merge_with_options(
         show_msgs,
         xopts,
         None,
+        None,
     )?;
     let Merged::Applied(applied) = merged else {
         unreachable!("no worktree tree was handed over, so no checkout guard ran")
@@ -219,7 +224,64 @@ pub fn three_way_merge_guarded(
         show_msgs,
         xopts,
         Some(worktree_tree),
+        None,
     )
+}
+
+/// [`three_way_merge_verbose`] with git's `--conflict=<style>` applied to the
+/// markers this merge writes.
+///
+/// git threads the style through `ll_merge()`'s `struct ll_merge_options`, where
+/// `--conflict=diff3`/`zdiff3` is a per-invocation override of
+/// `merge.conflictStyle` — the same knob, one layer up. This is the entry point
+/// for the `git checkout -m`/`git switch -m` stash re-apply, which is a real
+/// three-way merge and therefore has to mark up in the style the switch asked
+/// for; the `<paths>` form of `checkout` merges blob by blob and sets the style
+/// on `builtin_driver::text` directly.
+///
+/// `None` leaves `merge.conflictStyle` alone. `-Xours`/`-Xtheirs` still win over
+/// it, as in git: `recursive_variant` resolves conflicting hunks outright, so
+/// there are no markers left for a style to shape.
+#[allow(clippy::too_many_arguments)]
+pub fn three_way_merge_styled(
+    repo: &gix::Repository,
+    base_tree: ObjectId,
+    ours_tree: ObjectId,
+    theirs_tree: ObjectId,
+    old_index: &gix::index::File,
+    labels: gix::merge::blob::builtin_driver::text::Labels<'_>,
+    should_interrupt: &AtomicBool,
+    show_msgs: bool,
+    style: Option<ConflictStyle>,
+) -> Result<Applied> {
+    let merged = merge_and_apply(
+        repo,
+        base_tree,
+        ours_tree,
+        theirs_tree,
+        old_index,
+        labels,
+        should_interrupt,
+        show_msgs,
+        &StrategyOptions::default(),
+        None,
+        style,
+    )?;
+    let Merged::Applied(applied) = merged else {
+        unreachable!("no worktree tree was handed over, so no checkout guard ran")
+    };
+    Ok(applied)
+}
+
+/// `--conflict=<style>` / `merge.conflictStyle` as git spells it. Returns `None`
+/// for anything else, which is a caller's error to report.
+pub fn conflict_style(name: &str) -> Option<ConflictStyle> {
+    Some(match name {
+        "merge" => ConflictStyle::Merge,
+        "diff3" => ConflictStyle::Diff3,
+        "zdiff3" => ConflictStyle::ZealousDiff3,
+        _ => return None,
+    })
 }
 
 /// The shared body: merge the trees, report, then (unless the guard refuses)
@@ -236,6 +298,9 @@ fn merge_and_apply(
     show_msgs: bool,
     xopts: &StrategyOptions,
     guard: Option<ObjectId>,
+    // `--conflict=<style>`: the per-invocation override of
+    // `merge.conflictStyle`, or `None` to leave the configured style alone.
+    style: Option<ConflictStyle>,
 ) -> Result<Merged> {
     // `merge_ort_nonrecursive_internal()` (merge-ort.c) shifts *their* tree and
     // the merge base to match the shape of *our* tree, before any merge info is
@@ -248,34 +313,15 @@ fn merge_and_apply(
         None => (base_tree, theirs_tree),
     };
 
-    // `-Xrenormalize`/`-Xno-renormalize` override the `merge.renormalize` config
-    // that decides the blob pipeline mode, which `Repository::merge_resource_cache`
-    // reads from the repository — so the override goes into an in-memory config
-    // layer on a private clone of the repo.
-    let renormalized;
-    let repo = match xopts.renormalize {
-        Some(on) => {
-            let mut with_override = repo.clone();
-            {
-                let mut config = with_override.config_snapshot_mut();
-                config.append_config(
-                    Some(format!("merge.renormalize={on}")),
-                    gix::config::Source::Cli,
-                )?;
-                config.commit()?;
-            }
-            renormalized = with_override;
-            &renormalized
-        }
-        None => repo,
-    };
+    let renormalized = renormalized_repo(repo, xopts)?;
+    let repo = renormalized.as_ref().unwrap_or(repo);
 
     let mut merge = repo.merge_trees(
         base_tree,
         ours_tree,
         theirs_tree,
         labels,
-        tree_merge_options(repo, xopts)?,
+        tree_merge_options(repo, xopts, style)?,
     )?;
     let tree_id = merge.tree.write()?.detach();
 
@@ -469,6 +515,11 @@ pub struct StrategyOptions {
     pub renormalize: Option<bool>,
     /// `-Xno-renames` / `-Xfind-renames[=<n>]` / `-Xrename-threshold=<n>`.
     pub detect_renames: Option<bool>,
+    /// `opt->xdl_opts & XDF_WHITESPACE_FLAGS` — the `-Xignore-*-space*` /
+    /// `-Xignore-cr-at-eol` family. `parse_merge_opt()` ORs each into the same
+    /// word (merge-ort.c:5567-5574), so more than one can be in force; which one
+    /// then decides is `crate::merge_ws::canonicalize_for`'s job.
+    pub xdl_opts: u32,
     /// merge-ort's `rename_score`, on git's `0..=MAX_SCORE` scale. `0` means
     /// "unset", which diffcore reads as `DEFAULT_RENAME_SCORE` (50%).
     pub rename_score: u32,
@@ -483,18 +534,13 @@ const MAX_SCORE: f64 = 60000.0;
 const DEFAULT_RENAME_SCORE: f64 = 30000.0;
 
 /// Why a `-X <value>` did not take effect.
+///
+/// Every branch of `parse_merge_opt()` (merge-ort.c:5541-5598) is honoured here,
+/// so git's own refusal is the only way to fail.
 #[derive(Debug)]
 pub enum StrategyOptionError {
     /// git's own `parse_merge_opt()` rejects it.
     Unknown(String),
-    /// git accepts it, but the vendored merge engine has no knob for it, and
-    /// quietly merging without it would change the merge result.
-    Unsupported {
-        /// The `-X` value as spelled on the command line.
-        spec: String,
-        /// What is missing, in the phrasing of the module that lacks it.
-        reason: &'static str,
-    },
 }
 
 impl std::fmt::Display for StrategyOptionError {
@@ -502,23 +548,27 @@ impl std::fmt::Display for StrategyOptionError {
         match self {
             // `die(_("unknown strategy option: -X%s"), …)` in builtin/merge.c.
             StrategyOptionError::Unknown(spec) => write!(f, "unknown strategy option: -X{spec}"),
-            StrategyOptionError::Unsupported { spec, reason } => {
-                write!(f, "strategy option -X{spec} is unsupported ({reason})")
-            }
         }
     }
 }
 
-/// git's whitespace-insensitive merge comes from `xdl_recmatch()` hashing and
-/// comparing records under `XDF_IGNORE_*`; `gix-merge`'s text driver interns
-/// whole lines and has no equivalent.
-const NO_WHITESPACE_FLAGS: &str = "the vendored gix-merge text driver has no \
-                                   xdl_recmatch whitespace flags";
-
 impl StrategyOptions {
     /// Apply every `-X <value>` in order, as `try_merge_strategy()` does.
     pub fn parse(specs: &[String]) -> std::result::Result<Self, StrategyOptionError> {
-        let mut out = StrategyOptions::default();
+        Self::parse_from(Self::default(), specs)
+    }
+
+    /// [`parse`](Self::parse) on top of a seed the strategy already set.
+    ///
+    /// `try_merge_strategy()` assigns `o.subtree_shift = ""` for `-s subtree`
+    /// *before* the `for (x = 0; x < xopts.nr; x++) parse_merge_opt(…)` loop
+    /// (builtin/merge.c:815-822), so `-s subtree -Xsubtree=<prefix>` ends up with
+    /// the explicit prefix rather than the automatic shift.
+    pub fn parse_from(
+        seed: Self,
+        specs: &[String],
+    ) -> std::result::Result<Self, StrategyOptionError> {
+        let mut out = seed;
         for spec in specs {
             out.apply(spec)?;
         }
@@ -528,10 +578,6 @@ impl StrategyOptions {
     /// One `parse_merge_opt()` call (merge-ort.c), kept in the C's branch order.
     fn apply(&mut self, s: &str) -> std::result::Result<(), StrategyOptionError> {
         let unknown = || StrategyOptionError::Unknown(s.to_owned());
-        let unsupported = |reason| StrategyOptionError::Unsupported {
-            spec: s.to_owned(),
-            reason,
-        };
 
         if s.is_empty() {
             return Err(unknown());
@@ -552,11 +598,14 @@ impl StrategyOptions {
                 Some(algo) => self.diff_algorithm = Some(algo),
                 None => return Err(unknown()),
             }
-        } else if matches!(
-            s,
-            "ignore-space-change" | "ignore-all-space" | "ignore-space-at-eol" | "ignore-cr-at-eol"
-        ) {
-            return Err(unsupported(NO_WHITESPACE_FLAGS));
+        } else if s == "ignore-space-change" {
+            self.xdl_opts |= crate::merge_ws::XDF_IGNORE_WHITESPACE_CHANGE;
+        } else if s == "ignore-all-space" {
+            self.xdl_opts |= crate::merge_ws::XDF_IGNORE_WHITESPACE;
+        } else if s == "ignore-space-at-eol" {
+            self.xdl_opts |= crate::merge_ws::XDF_IGNORE_WHITESPACE_AT_EOL;
+        } else if s == "ignore-cr-at-eol" {
+            self.xdl_opts |= crate::merge_ws::XDF_IGNORE_CR_AT_EOL;
         } else if s == "renormalize" {
             self.renormalize = Some(true);
         } else if s == "no-renormalize" {
@@ -635,10 +684,38 @@ fn parse_rename_score(cp: &[u8]) -> (u32, usize) {
     (score as u32, at)
 }
 
-/// `Repository::tree_merge_options()` with the `-X` knobs folded in.
-fn tree_merge_options(
+/// `-Xrenormalize`/`-Xno-renormalize` override the `merge.renormalize` config
+/// that decides the blob pipeline mode, which `Repository::merge_resource_cache`
+/// reads from the repository — so the override goes into an in-memory config
+/// layer on a private clone of the repo. `None` means there was nothing to
+/// override and the caller's own repo stands.
+pub(crate) fn renormalized_repo(
     repo: &gix::Repository,
     xopts: &StrategyOptions,
+) -> Result<Option<gix::Repository>> {
+    let Some(on) = xopts.renormalize else {
+        return Ok(None);
+    };
+    let mut with_override = repo.clone();
+    {
+        let mut config = with_override.config_snapshot_mut();
+        config.append_config(Some(format!("merge.renormalize={on}")), gix::config::Source::Cli)?;
+        config.commit()?;
+    }
+    Ok(Some(with_override))
+}
+
+/// `Repository::tree_merge_options()` with the `-X` knobs folded in.
+///
+/// Shared with the strategy *plumbing* (`git merge-recursive` and its three
+/// alias names), which receives the same options — `try_merge_command()`
+/// re-spells each `-X<value>` as `--<value>` on their command line, and
+/// `cmd_merge_recursive` feeds them to the very same `parse_merge_opt()`
+/// (builtin/merge-recursive.c:55-58).
+pub(crate) fn tree_merge_options(
+    repo: &gix::Repository,
+    xopts: &StrategyOptions,
+    style: Option<ConflictStyle>,
 ) -> Result<gix::merge::tree::Options> {
     use gix::merge::plumbing::blob::builtin_driver::{binary, text};
 
@@ -647,6 +724,32 @@ fn tree_merge_options(
     if let Some(algorithm) = xopts.diff_algorithm {
         opts.blob_merge.text.diff_algorithm = algorithm;
     }
+
+    // `--conflict=<style>` is git's per-invocation override of
+    // `merge.conflictStyle` (`git_xmerge_config()` seeds the default;
+    // `parse_opt_conflict()` replaces it for this run only). Only the style is
+    // replaced — `conflict.marker_size`, which `merge.conflictStyle` never
+    // touches, keeps whatever the configuration gave it.
+    //
+    // Both fields have to move. `blob_merge_options()` fills
+    // `text.style` from the configuration (gix/src/repository/merge.rs:82) and
+    // `Rendering::style()` prefers that field over the one inside
+    // `Conflict::Keep` (gix-merge/src/blob/builtin_driver/text/mod.rs:169-176),
+    // so patching only `Conflict::Keep` left the configured value winning and
+    // the flag inert. Leaving `style` at `None` still lets the configured value
+    // through untouched, which is what keeps `-c merge.conflictStyle=diff3`
+    // working.
+    if let Some(style) = style {
+        if let text::Conflict::Keep { style: current, .. } = &mut opts.blob_merge.text.conflict {
+            *current = style;
+        }
+        opts.blob_merge.text.style = Some(style);
+    }
+
+    // `xpp.flags & XDF_WHITESPACE_FLAGS`: the text driver interns lines by the
+    // class `xdl_recmatch()` would put them in, so the rule arrives as the
+    // canonical image rather than as a comparison. See `crate::merge_ws`.
+    opts.blob_merge.text.canonicalize = crate::merge_ws::canonicalize_for(xopts.xdl_opts);
 
     // `recursive_variant`: merge-ort resolves *every* conflicting hunk, binary
     // blob and symlink towards the chosen side rather than writing markers.

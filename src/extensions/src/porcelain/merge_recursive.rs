@@ -21,17 +21,21 @@
 //!     `<remote>` argument strings (or their `GITHEAD_<oid>` environment
 //!     override, exactly as git's `better_branch_name` does)
 //!   * exit 0 for a clean merge, 1 when conflicts remain, 128 for the fatal paths
-//!   * `--no-renames`, `--find-renames`, `--find-renames=<n>`,
-//!     `--rename-threshold=<n>`, `--patience`, `--histogram`,
-//!     `--diff-algorithm=<myers|minimal|patience|histogram>`
+//!   * every branch of `parse_merge_opt()` except the subtree family:
+//!     `--ours`, `--theirs`, `--renormalize`, `--no-renormalize`,
+//!     `--no-renames`, `--find-renames[=<n>]`, `--rename-threshold=<n>`,
+//!     `--patience`, `--histogram`,
+//!     `--diff-algorithm=<myers|minimal|patience|histogram>`,
+//!     `--ignore-space-change`, `--ignore-all-space`, `--ignore-space-at-eol`
+//!     and `--ignore-cr-at-eol`. `cmd_merge_recursive` calls the very same
+//!     `parse_merge_opt()` the porcelain runs over `-X`
+//!     (builtin/merge-recursive.c:55-58), so this shares
+//!     [`crate::merge_apply::StrategyOptions`] with it rather than keeping a
+//!     second opinion about which options are honourable.
 //!
 //! Not covered, and refused rather than approximated:
-//!   * `--ours` / `--theirs` / `--subtree[=<path>]` / `--renormalize` /
-//!     `--no-renormalize` /
-//!     `--ignore-space-change` / `--ignore-all-space` / `--ignore-space-at-eol` /
-//!     `--ignore-cr-at-eol` — no equivalent knob on `gix-merge`'s tree/blob
-//!     options, so honouring them would mean producing a different merge than
-//!     the flag asks for
+//!   * `--subtree[=<path>]` — tree shifting is [`super::merge_subtree`]'s path,
+//!     which runs the same driver shape with its own `shift_tree_object` pass
 //!   * conflict classes outside the content family (rename/rename, rename/delete,
 //!     modify/delete, directory/file, submodule, binary). `gix-merge` reports
 //!     these as structured resolutions, not as git's message strings; rendering
@@ -69,17 +73,6 @@ struct Message {
     text: String,
 }
 
-/// Rename detection as requested on the command line.
-enum Renames {
-    /// git's default: detection on, threshold from config.
-    Default,
-    /// `--no-renames`.
-    Off,
-    /// `--find-renames` (no value) — detection on at the default threshold.
-    On,
-    /// `--find-renames=<n>` / `--rename-threshold=<n>`, as a similarity fraction.
-    Threshold(f32),
-}
 
 /// `git merge-recursive [--<option>]... <base>... -- <head> <remote>`.
 pub fn merge_recursive(args: &[String]) -> Result<ExitCode> {
@@ -97,8 +90,10 @@ pub fn merge_recursive(args: &[String]) -> Result<ExitCode> {
 
     let repo = gix::discover(".")?;
 
-    let mut renames = Renames::Default;
-    let mut diff_algorithm: Option<gix::diff::blob::Algorithm> = None;
+    // `init_basic_merge_options(&o, …)`. The `-subtree` alias's
+    // `o.subtree_shift = ""` is not seeded here: that name has its own driver
+    // (`super::merge_subtree`), which does the shifting.
+    let mut xopts = crate::merge_apply::StrategyOptions::default();
     let mut base_specs: Vec<&str> = Vec::new();
 
     // Leading `--…` arguments are merge options; everything else is a merge
@@ -113,7 +108,13 @@ pub fn merge_recursive(args: &[String]) -> Result<ExitCode> {
             if opt.is_empty() {
                 break;
             }
-            if !parse_merge_opt(opt, &mut renames, &mut diff_algorithm)? {
+            // `if (parse_merge_opt(&o, arg + 2)) die(_("unknown option %s"), arg);`
+            // — the very same `parse_merge_opt()` the porcelain runs over `-X`,
+            // so the plumbing honours the same set.
+            if crate::merge_apply::StrategyOptions::parse_from(xopts.clone(), &[opt.to_string()])
+                .map(|updated| xopts = updated)
+                .is_err()
+            {
                 eprintln!("fatal: unknown option {arg}");
                 return Ok(ExitCode::from(128));
             }
@@ -183,23 +184,26 @@ pub fn merge_recursive(args: &[String]) -> Result<ExitCode> {
         }
     }
 
-    // Tree-merge options, adjusted by the flags we honour.
-    let mut plumbing_opts: gix::merge::plumbing::tree::Options = repo.tree_merge_options()?.into();
-    if let Some(algorithm) = diff_algorithm {
-        plumbing_opts.blob_merge.text.diff_algorithm = algorithm;
+    // Tree shifting is `super::merge_subtree`'s, which runs the same driver's
+    // shape with its own `shift_tree_object` pass; refuse rather than drop it.
+    if xopts.subtree_shift.is_some() {
+        bail!(
+            "unsupported flag \"--subtree\" here (tree shifting is `git merge-subtree`'s path); \
+             ported: --ours, --theirs, --renormalize, --no-renormalize, --no-renames, \
+             --find-renames[=<n>], --rename-threshold=<n>, --patience, --histogram, \
+             --diff-algorithm=<myers|minimal|patience|histogram>, --ignore-space-change, \
+             --ignore-all-space, --ignore-space-at-eol, --ignore-cr-at-eol"
+        );
     }
-    match renames {
-        Renames::Default => {}
-        Renames::Off => plumbing_opts.rewrites = None,
-        Renames::On => plumbing_opts.rewrites = Some(gix::diff::Rewrites::default()),
-        Renames::Threshold(percentage) => {
-            plumbing_opts.rewrites = Some(gix::diff::Rewrites {
-                percentage: Some(percentage),
-                ..Default::default()
-            });
-        }
-    }
-    let tree_options: gix::merge::tree::Options = plumbing_opts.into();
+
+    // `-Xrenormalize` reaches the blob pipeline through the repository's own
+    // `merge.renormalize`, so it is applied to a private clone before anything
+    // reads a blob.
+    let renormalized = crate::merge_apply::renormalized_repo(&repo, &xopts)?;
+    let repo = renormalized.unwrap_or(repo);
+
+    // The same `-X` knobs the porcelain applies, from the same place.
+    let tree_options = crate::merge_apply::tree_merge_options(&repo, &xopts, None)?;
 
     let head_tree = repo.find_commit(head_id)?.tree_id()?.detach();
     let remote_tree = repo.find_commit(remote_id)?.tree_id()?.detach();
@@ -290,62 +294,6 @@ pub fn merge_recursive(args: &[String]) -> Result<ExitCode> {
     } else {
         ExitCode::SUCCESS
     })
-}
-
-/// git's `parse_merge_opt`: `Ok(true)` when the option is recognised *and*
-/// implemented, `Ok(false)` when git itself would reject it (caller prints
-/// `fatal: unknown option …`). Options git accepts but this port cannot honour
-/// error out instead of being silently dropped.
-fn parse_merge_opt(
-    opt: &str,
-    renames: &mut Renames,
-    diff_algorithm: &mut Option<gix::diff::blob::Algorithm>,
-) -> Result<bool> {
-    const PORTED: &str = "ported: --no-renames, --find-renames[=<n>], --rename-threshold=<n>, --patience, --histogram, --diff-algorithm=<myers|minimal|patience|histogram>";
-    match opt {
-        "no-renames" => *renames = Renames::Off,
-        "find-renames" => *renames = Renames::On,
-        "patience" => *diff_algorithm = Some(gix::diff::blob::Algorithm::Patience),
-        "histogram" => *diff_algorithm = Some(gix::diff::blob::Algorithm::Histogram),
-        "ours" | "theirs" | "subtree" | "renormalize" | "no-renormalize"
-        | "ignore-space-change" | "ignore-all-space" | "ignore-space-at-eol"
-        | "ignore-cr-at-eol" => {
-            bail!("unsupported flag \"--{opt}\" (no gix-merge equivalent; {PORTED})")
-        }
-        _ if opt.starts_with("subtree=") => {
-            bail!("unsupported flag \"--{opt}\" (subtree shifting is not ported; {PORTED})")
-        }
-        _ if opt.starts_with("diff-algorithm=") => {
-            let value = &opt["diff-algorithm=".len()..];
-            *diff_algorithm = Some(match value {
-                "myers" | "default" => gix::diff::blob::Algorithm::Myers,
-                "minimal" => gix::diff::blob::Algorithm::MyersMinimal,
-                "histogram" => gix::diff::blob::Algorithm::Histogram,
-                "patience" => gix::diff::blob::Algorithm::Patience,
-                _ => return Ok(false),
-            });
-        }
-        _ if opt.starts_with("find-renames=") || opt.starts_with("rename-threshold=") => {
-            let value = &opt[opt.find('=').expect("checked above") + 1..];
-            match parse_rename_score(value) {
-                Some(fraction) => *renames = Renames::Threshold(fraction),
-                None => return Ok(false),
-            }
-        }
-        _ => return Ok(false),
-    }
-    Ok(true)
-}
-
-/// git's `parse_rename_score`: an integer or float, optionally suffixed with
-/// `%`, read as a similarity percentage. Returns the fraction in `0.0..=1.0`.
-fn parse_rename_score(value: &str) -> Option<f32> {
-    let digits = value.strip_suffix('%').unwrap_or(value);
-    let number: f32 = digits.parse().ok()?;
-    if !(0.0..=100.0).contains(&number) {
-        return None;
-    }
-    Some(number / 100.0)
 }
 
 /// git's `better_branch_name`: a full hex object id is replaced by

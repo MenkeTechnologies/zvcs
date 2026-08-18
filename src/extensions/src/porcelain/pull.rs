@@ -83,11 +83,16 @@
 //! all four. git pushes none of them onto the rebase command line and does not
 //! reject them there either, so neither does this.
 //!
+//! `-s`/`--strategy`, `-X`/`--strategy-option` and `--signoff` are forwarded on
+//! the *merge* path as well as the rebase one, exactly as `run_merge()` pushes
+//! them (builtin/pull.c:541-558); whatever `merge` itself does not implement is
+//! refused there, so there is one refusal site rather than two.
+//! `--gpg-sign`/`-S` and `--[no-]verify-signatures` are likewise forwarded — the
+//! merge port implements both over `crate::gitsig`.
+//!
 //! What is refused rather than faked, because the underlying substrate is
-//! absent: `-s`/`-X`/`--signoff` on the *merge* path (they are honored on the
-//! *rebase* path), `--rebase=interactive` (interactive todo editing needs a TTY
-//! editor loop), `--set-upstream`, and `--gpg-sign`/`-S`/`--verify-signatures`
-//! (GPG is not vendored).
+//! absent: `--rebase=interactive` (interactive todo editing needs a TTY editor
+//! loop) and `--set-upstream`.
 //!
 //! Option *errors* are `parse-options`': an unknown option prints
 //! `error: unknown option \`<name>'` and the whole usage block on stderr and
@@ -443,6 +448,13 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
     // runs the `pre-merge-commit` and `commit-msg` hooks. git's pull passes it
     // only to the merge, never to the rebase.
     let mut no_verify = false;
+    // git's `opt_verify_signatures` and `opt_gpg_sign` `OPT_PASSTHRU` slots: the
+    // option as `recreate_opt()` re-renders it, or `None` when it never appeared.
+    // Both spellings of `--[no-]verify-signatures` land here, which is why the
+    // negation is a value rather than the absence of one — `pull_into_void()`
+    // tests the slot for non-NULL, not for the positive spelling.
+    let mut verify_signatures: Option<&'static str> = None;
+    let mut gpg_sign: Option<String> = None;
 
     // Knobs forwarded to `fetch`.
     let mut f_all = false;
@@ -678,17 +690,30 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
             // value and sends nothing, rather than being an unknown option.
             "--no-cleanup" => merge_passthru.retain(|o| !o.starts_with("--cleanup=")),
 
-            // Absent substrate. `--no-set-upstream`/`--no-gpg-sign` ask for the
-            // default (do neither), so they are accepted where the positive form
-            // is refused, exactly as git treats them as ordinary negations.
-            "--no-set-upstream" | "--no-gpg-sign" => {}
+            // Absent substrate. `--no-set-upstream` asks for the default (do
+            // nothing), so it is accepted where the positive form is refused,
+            // exactly as git treats it as an ordinary negation.
+            "--no-set-upstream" => {}
             "--set-upstream" => {
                 bail!("--set-upstream is not supported (not exposed by the high-level fetch)")
             }
-            "-S" | "--gpg-sign" => bail!("--gpg-sign is not supported (GPG is not vendored)"),
-            "--verify-signatures" | "--no-verify-signatures" => {
-                bail!("--verify-signatures is not supported (GPG is not vendored)")
+
+            // `OPT_PASSTHRU('S', "gpg-sign", …, PARSE_OPT_OPTARG)` and
+            // `OPT_PASSTHRU(0, "verify-signatures", …, PARSE_OPT_NOARG)`: pull
+            // does not act on either, it re-renders the option and hands it to
+            // the integration step, which is where the merge port implements
+            // both. `recreate_opt()` (parse-options-cb.c:241) always prefers the
+            // long name, so `-S` arrives as `--gpg-sign` and `-S<key>` as
+            // `--gpg-sign=<key>`; the last occurrence wins, negations included.
+            "-S" | "--gpg-sign" => {
+                gpg_sign = Some(match &inline {
+                    Some(key) => format!("--gpg-sign={key}"),
+                    None => "--gpg-sign".to_string(),
+                })
             }
+            "--no-gpg-sign" => gpg_sign = Some("--no-gpg-sign".to_string()),
+            "--verify-signatures" => verify_signatures = Some("--verify-signatures"),
+            "--no-verify-signatures" => verify_signatures = Some("--no-verify-signatures"),
 
             // `parse_options`' built-in `-h`: the option table on stdout,
             // exit 129. It fires wherever it appears, ahead of everything else.
@@ -702,7 +727,12 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
                 break;
             }
             // Attached short-option values git's parse-options accepts, e.g.
-            // `-Xtheirs` / `-sort`.
+            // `-Xtheirs` / `-sort` / `-Skeyid`. `recreate_opt()` re-renders the
+            // last of these under its long name, so `-Skeyid` becomes
+            // `--gpg-sign=keyid`.
+            other if other.starts_with("-S") && other.len() > 2 => {
+                gpg_sign = Some(format!("--gpg-sign={}", &other[2..]))
+            }
             other if other.starts_with("-X") && other.len() > 2 => {
                 strategy_opts.push(other[2..].to_string())
             }
@@ -950,7 +980,7 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
             eprintln!("fatal: Cannot merge multiple branches into empty head.");
             return Ok(ExitCode::from(128));
         }
-        return pull_into_void(&repo, merge_heads[0].0);
+        return pull_into_void(&repo, merge_heads[0].0, verify_signatures.is_some(), f_quiet);
     }
 
     let head_id = repo.head_id()?.detach();
@@ -1022,8 +1052,16 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
             rebase_args.push("--strategy-option".into());
             rebase_args.push(x.clone());
         }
+        if let Some(opt) = &gpg_sign {
+            rebase_args.push(opt.clone());
+        }
         if signoff {
             rebase_args.push("--signoff".into());
+        }
+        // `run_rebase()` warns only for the positive spelling, and forwards
+        // neither: a rebase has no merge head to check a signature on.
+        if verify_signatures == Some("--verify-signatures") {
+            eprintln!("warning: ignoring --verify-signatures for rebase");
         }
         // A clean tree makes autostash a no-op; a dirty tree was already gated by
         // the pre-fetch `require_clean_work_tree()` above unless autostash is on,
@@ -1062,15 +1100,6 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
         return super::rebase(&rebase_args);
     }
 
-    // Merge path. Integration knobs the merge port does not implement cannot be
-    // forwarded; refuse rather than silently drop them.
-    if strategy.is_some() || !strategy_opts.is_empty() || signoff {
-        bail!(
-            "-s/--strategy, -X/--strategy-option and --signoff are not supported on the merge path \
-             (the merge port implements only the 'ort' strategy with no strategy options or sign-off)"
-        );
-    }
-
     // Resolve the fast-forward policy git's `config_get_ff()` computes for pull:
     // a CLI flag wins; else pull.ff (which overrides merge.ff) is forwarded to
     // `merge`; else nothing is forwarded and `merge` reads merge.ff itself.
@@ -1103,6 +1132,32 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
     // sees it (`builtin/pull.c` pushes it in `run_merge`).
     if no_verify {
         merge_args.push("--no-verify".into());
+    }
+    // `run_merge()` pushes both `OPT_PASSTHRU` slots verbatim, and the merge port
+    // implements both — `--[no-]verify-signatures` / `merge.verifySignatures` and
+    // `-S`/`--gpg-sign` over `crate::gitsig`.
+    if let Some(opt) = verify_signatures {
+        merge_args.push(opt.to_string());
+    }
+    // `run_merge()` pushes `opt_signoff`, then `opt_strategies` and
+    // `opt_strategy_opts` verbatim, then `opt_gpg_sign` (builtin/pull.c:541-560).
+    // These were refused here until the merge port grew `-s recursive/subtree`
+    // and the `-X` whitespace rules; `merge` now parses all three, so pull
+    // forwards them and lets `merge` decide what it does not implement — which
+    // is what git does, and keeps a single refusal site instead of two.
+    if signoff {
+        merge_args.push("--signoff".into());
+    }
+    if let Some(s) = &strategy {
+        merge_args.push("--strategy".into());
+        merge_args.push(s.clone());
+    }
+    for x in &strategy_opts {
+        merge_args.push("--strategy-option".into());
+        merge_args.push(x.clone());
+    }
+    if let Some(opt) = &gpg_sign {
+        merge_args.push(opt.clone());
     }
     // `run_merge()` pushes `opt_diffstat` verbatim.
     if let Some(d) = diffstat {
@@ -1296,8 +1351,29 @@ fn no_merge_candidates(repo: &gix::Repository, branch: Option<&str>, rebasing: b
 /// fetched head, so work already added on the unborn branch is not lost and an
 /// untracked file in the way still refuses, then points `HEAD` at it with an
 /// `initial pull` reflog entry.
-fn pull_into_void(repo: &gix::Repository, merge_head: gix::ObjectId) -> Result<ExitCode> {
+fn pull_into_void(
+    repo: &gix::Repository,
+    merge_head: gix::ObjectId,
+    verify_signatures: bool,
+    quiet: bool,
+) -> Result<ExitCode> {
     use gix::bstr::BStr;
+
+    // `if (opt_verify_signatures)` (builtin/pull.c:467). The test is on the
+    // `OPT_PASSTHRU` slot being set at all, and `--no-verify-signatures` sets it
+    // too — so on this one path the negation *enables* the check. That is git's
+    // behaviour, not a transcription slip; the merge path never sees it because
+    // there the whole string is handed to `git merge`, which reads the spelling.
+    if verify_signatures {
+        // `gpg.minTrustLevel` moves the floor into `check_signature()` itself,
+        // so git clears its own `TRUST_MARGINAL` test when the key is set
+        // (builtin/pull.c:247-249).
+        let check_trust = repo.config_snapshot().string("gpg.minTrustLevel").is_none();
+        if let Some(code) = super::merge::verify_merge_signature(repo, merge_head, quiet, check_trust)? {
+            return Ok(code);
+        }
+    }
+
     use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
 
     let empty_tree = gix::ObjectId::empty_tree(repo.object_hash());

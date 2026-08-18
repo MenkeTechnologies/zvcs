@@ -135,21 +135,56 @@
 //!   at the point git's `try_merge_strategy()` would parse them — which is why
 //!   `Already up to date.`, a plain fast-forward, `-s ours` and the octopus
 //!   strategy all accept a value the `ort` path would reject. Honoured:
-//!   `ours`, `theirs`, `subtree[=<prefix>]` (a port of `match-trees.c`'s tree
-//!   shifting), `patience`, `histogram`,
+//!   every branch of `parse_merge_opt()` — `ours`, `theirs`,
+//!   `subtree[=<prefix>]` (a port of `match-trees.c`'s tree shifting),
+//!   `patience`, `histogram`,
 //!   `diff-algorithm=<myers|default|minimal|patience|histogram>`,
-//!   `renormalize`, `no-renormalize`, `no-renames`, `find-renames[=<n>]` and
-//!   `rename-threshold=<n>`. An unrecognised value reproduces git's
+//!   `ignore-space-change`, `ignore-all-space`, `ignore-space-at-eol`,
+//!   `ignore-cr-at-eol` (`xdl_recmatch()`'s `XDF_IGNORE_*` rules, as canonical
+//!   line images — see `crate::merge_ws`), `renormalize`, `no-renormalize`,
+//!   `no-renames`, `find-renames[=<n>]` and `rename-threshold=<n>`. An
+//!   unrecognised value reproduces git's
 //!   `fatal: unknown strategy option: -X<value>`.
+//!
+//! * `-s recursive` and `-s subtree`: git 2.55 has no separate `recursive`
+//!   back-end left — `try_merge_strategy()` routes `recursive`, `subtree` and
+//!   `ort` to the same `merge_ort_recursive()` (builtin/merge.c:800-834) — so
+//!   both run the `ort` engine here, `subtree` adding the automatic subtree
+//!   shift (builtin/merge.c:815-816) and the `NO_FAST_FORWARD` attribute
+//!   (builtin/merge.c:107). The name is echoed back as git echoes `wt_strategy`
+//!   (builtin/merge.c:1794), so `-s recursive` reports
+//!   `Merge made by the 'recursive' strategy.`
+//!
+//! * `-s resolve` and `-s octopus`: the two back-ends git runs out of process
+//!   (`try_merge_command()`, merge.c:22-42), reached through
+//!   [`run_merge_command`]. `resolve` is [`super::merge_resolve`], a port of
+//!   `git-merge-resolve.sh`'s `read-tree`/`write-tree`/`merge-index` chain;
+//!   `octopus` over several heads is [`do_octopus`], and over a *single* head is
+//!   `git-merge-octopus`'s own "Reject if this is not an octopus" exit 2. `-X`
+//!   is not parsed for either: `try_merge_command()` re-spells each value
+//!   `--<value>` onto the back-end's command line, where `git-merge-resolve`
+//!   hands it to `read-tree` and `git-merge-octopus` counts it as a merge base.
+//!
+//! * The `allow_trivial` in-index merge (`Trying really trivial in-index
+//!   merge...` / `Wonderful.` / `In-index merge`): `all_strategy[]` gives
+//!   `octopus` and `resolve` no `NO_TRIVIAL` (builtin/merge.c:102-107), so those
+//!   two — over one head, one merge base and a merge that will be committed —
+//!   run [`read_tree_trivial`] first, which is `git read-tree -u -m --trivial`
+//!   in process.
+//!
+//! * The head count, not the `-s` spelling, picks the engine.
+//!   `add_strategies(pull_octopus, DEFAULT_OCTOPUS)` fires only when no `-s` was
+//!   given (builtin/merge.c:1600-1606), so a named two-head strategy over three
+//!   heads fails with `error: Not handling anything other than two heads
+//!   merge.` rather than quietly octopusing.
 //!
 //! What is refused or deferred rather than faked:
 //!
-//! * `-s recursive`/`resolve`/`subtree`: distinct conflict-resolution engines
-//!   that are not vendored, refused rather than aliased onto `ort`.
-//! * `-Xignore-space-change`/`-Xignore-all-space`/`-Xignore-space-at-eol`/
-//!   `-Xignore-cr-at-eol`: git gets these from `xdl_recmatch()`'s `XDF_IGNORE_*`
-//!   record hashing; `gix-merge`'s text driver interns whole lines and has no
-//!   equivalent knob, so the flags are rejected instead of silently ignored.
+//! * Several `-s` in one command line. git keeps them all in `use_strategies`,
+//!   tries them in order (`Trying merge strategy <name>...`), rewinds with
+//!   `restore_state()` between attempts and keeps the one `evaluate_result()`
+//!   scores best (builtin/merge.c:1781-1856). Only the last `-s` is used here,
+//!   and no `Trying merge strategy` line is printed.
 //! * `--no-overwrite-ignore`: needs gitignore-aware checkout.
 //!
 //! Known fidelity gaps, stated rather than hidden: the diffstat is computed
@@ -295,16 +330,49 @@ enum Ff {
     Only,
 }
 
-/// The merge strategy selected by `-s`/`--strategy`. Only the strategies the
-/// vendored primitives implement byte-for-byte are represented; the remaining
-/// git strategies (`recursive`, `resolve`, `subtree`) are refused rather than
-/// aliased onto `ort`, since their conflict resolution genuinely differs.
+/// The merge engine selected by `-s`/`--strategy`.
+///
+/// git 2.55 has no separate `recursive` back-end left: `try_merge_strategy()`
+/// sends `recursive`, `subtree` and `ort` down the same `merge_ort_recursive()`
+/// branch (builtin/merge.c:800-834), so all three share one variant here. The
+/// only thing `subtree` adds is `o.subtree_shift = ""` before the `-X` loop
+/// (builtin/merge.c:815-816) plus the `NO_FAST_FORWARD` attribute
+/// (builtin/merge.c:107), which is why it needs a variant of its own.
+///
+/// `resolve` and `octopus` are the two strategies git still runs out of process
+/// (`try_merge_command()` spawns `git merge-<name>`), and the two whose entries
+/// in `all_strategy[]` carry no `NO_TRIVIAL` (builtin/merge.c:102-107) — which is
+/// what puts the `allow_trivial` in-index merge in front of them and only them.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Strategy {
-    /// The default three-way merge (git's `ort`).
+    /// git's `ort`, and its `recursive` alias.
     Ort,
+    /// `-s subtree`: `ort` with an automatic subtree shift and no fast-forward.
+    Subtree,
     /// `-s ours`: record every head as a parent but keep our tree verbatim.
     Ours,
+    /// `-s resolve`: `git-merge-resolve`, run out of process by
+    /// `try_merge_command()` and ported as [`super::merge_resolve`].
+    Resolve,
+    /// `-s octopus`: `git-merge-octopus`, likewise out of process.
+    Octopus,
+}
+
+impl Strategy {
+    /// `if (use_strategies[i]->attr & NO_TRIVIAL) allow_trivial = 0;`
+    /// (builtin/merge.c:1611-1612). `all_strategy[]` sets `NO_TRIVIAL` on
+    /// `recursive`, `ort`, `ours` and `subtree` but not on `octopus` or `resolve`
+    /// (builtin/merge.c:102-107), so those two — and the two-head default only
+    /// when neither was named — reach the in-index pre-pass.
+    fn allows_trivial(self) -> bool {
+        matches!(self, Strategy::Resolve | Strategy::Octopus)
+    }
+
+    /// The engines `try_merge_strategy()` hands to `merge_ort_recursive()`
+    /// (builtin/merge.c:800-801), which refuses anything but two heads.
+    fn is_ort(self) -> bool {
+        matches!(self, Strategy::Ort | Strategy::Subtree)
+    }
 }
 
 /// `--cleanup=<mode>` — how the commit message is stripped, a port of git's
@@ -358,6 +426,17 @@ struct Opts {
     quiet: bool,
     cleanup: Cleanup,
     strategy: Strategy,
+    /// The `-s` value as spelled, which is what git echoes back: `finish()`
+    /// prints `wt_strategy`, set to `use_strategies[i]->name`
+    /// (builtin/merge.c:1794), so `-s recursive` reports
+    /// `Merge made by the 'recursive' strategy.` even though the engine it ran
+    /// was `ort`.
+    strategy_name: String,
+    /// Whether any `-s` was given. `if (!use_strategies)` (builtin/merge.c:1600)
+    /// only picks a default when none was: `pull_twohead` (`ort`) for one head,
+    /// `pull_octopus` for several. A named strategy is used for *both* head
+    /// counts, which is why `-s ort a b` fails instead of quietly octopusing.
+    strategy_given: bool,
     /// `-X`/`--strategy-option` values, kept raw. git stores them in a strvec and
     /// only runs `parse_merge_opt()` on them from inside `try_merge_strategy()`,
     /// so a bogus value is diagnosed at merge time, not at parse time.
@@ -406,6 +485,8 @@ impl Default for Opts {
             quiet: false,
             cleanup: Cleanup::Default,
             strategy: Strategy::Ort,
+            strategy_name: "ort".to_string(),
+            strategy_given: false,
             strategy_options: Vec::new(),
             into_name: None,
             log_len: -1,
@@ -415,6 +496,25 @@ impl Default for Opts {
             sign: None,
             rerere_autoupdate: None,
         }
+    }
+}
+
+impl Opts {
+    /// Record one `-s <name>`. git keeps every `-s` in `use_strategies` and tries
+    /// them in order; with a single working engine the last one wins, and its
+    /// spelling is what `finish()` echoes.
+    fn set_strategy(&mut self, strategy: Strategy, name: &str) {
+        self.strategy = strategy;
+        self.strategy_name = name.to_string();
+        self.strategy_given = true;
+    }
+
+    /// `option_commit`: `--no-commit` clears it, and so does `--squash`
+    /// (builtin/merge.c's `if (squash) … option_commit = 0`). It gates the whole
+    /// `allow_trivial` block (builtin/merge.c:1701) and decides whether a clean
+    /// strategy result is committed (builtin/merge.c:1826).
+    fn option_commit(&self) -> bool {
+        self.commit != Some(false) && !self.squash
     }
 }
 
@@ -662,22 +762,28 @@ pub fn merge(args: &[String]) -> Result<ExitCode> {
             "--no-cleanup" => opts.cleanup = Cleanup::Default,
             "-s" | "--strategy" => {
                 i += 1;
-                match args.get(i).map(String::as_str).map(resolve_strategy) {
-                    Some(Ok(s)) => opts.strategy = s,
-                    Some(Err(code)) => return Ok(code),
+                match args.get(i) {
+                    Some(name) => match resolve_strategy(name) {
+                        Ok(s) => opts.set_strategy(s, name),
+                        Err(code) => return Ok(code),
+                    },
                     None => {
                         eprintln!("error: option `{a}' requires a value");
                         return Ok(ExitCode::from(129));
                     }
                 }
             }
-            _ if a.starts_with("--strategy=") => match resolve_strategy(&a["--strategy=".len()..]) {
-                Ok(s) => opts.strategy = s,
-                Err(code) => return Ok(code),
-            },
+            _ if a.starts_with("--strategy=") => {
+                let name = &a["--strategy=".len()..];
+                match resolve_strategy(name) {
+                    Ok(s) => opts.set_strategy(s, name),
+                    Err(code) => return Ok(code),
+                }
+            }
             _ if a.len() > 2 && a.starts_with("-s") && !a.starts_with("--") => {
-                match resolve_strategy(&a[2..]) {
-                    Ok(s) => opts.strategy = s,
+                let name = &a[2..];
+                match resolve_strategy(name) {
+                    Ok(s) => opts.set_strategy(s, name),
                     Err(code) => return Ok(code),
                 }
             }
@@ -779,6 +885,15 @@ pub fn merge(args: &[String]) -> Result<ExitCode> {
             if opts.squash && opts.no_ff_given {
                 eprintln!("fatal: options '--squash' and '--no-ff.' cannot be used together");
                 return Ok(ExitCode::from(128));
+            }
+            // `for (i = 0; i < use_strategies_nr; i++) if (… & NO_FAST_FORWARD)
+            // fast_forward = FF_NO;` (builtin/merge.c:1608-1610). `subtree` and
+            // `ours` carry that attribute (builtin/merge.c:106-107), so they
+            // always record a merge commit. It happens *after* the `--squash`
+            // checks above, which is why `--squash -s subtree` is accepted where
+            // `--squash --no-ff` dies.
+            if opts.strategy == Strategy::Subtree {
+                opts.ff = Ff::Never;
             }
             do_merge(&refs, &opts)
         }
@@ -887,7 +1002,7 @@ fn abort() -> Result<ExitCode> {
 /// git quotes gpg's *signer name* (`sigc->signer`, the text after the key id on
 /// the `GOODSIG`/`BADSIG` status line), not the key id, hence
 /// [`crate::gitsig::evaluate_full`].
-fn verify_merge_signature(
+pub(super) fn verify_merge_signature(
     repo: &gix::Repository,
     id: ObjectId,
     quiet: bool,
@@ -1203,11 +1318,39 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
         return merge_ours(&repo, branch.as_ref(), local_id, &targets, &msg_specs, opts);
     }
 
-    // More than one head, default strategy → octopus. The count is the resolved
-    // heads', not the arguments': a single `FETCH_HEAD` naming several for-merge
-    // lines is exactly how `git pull <remote> <a> <b>` reaches the octopus.
+    // More than one head. `add_strategies(pull_octopus, DEFAULT_OCTOPUS)`
+    // (builtin/merge.c:1605) only picks the octopus when no `-s` was given; a
+    // named strategy is used for this head count too, and the two-head engines
+    // refuse it. That refusal is the whole point of dispatching on the *resolved*
+    // head count rather than on the `-s` spelling: `-s ort a b` must fail, while
+    // a bare `git merge a b` — or a single `FETCH_HEAD` naming several for-merge
+    // lines, which is how `git pull <remote> <a> <b>` arrives — octopuses.
     if targets.len() > 1 {
-        return do_octopus(&repo, &msg_specs, &head_labels, &targets, local_id, branch.as_ref(), opts);
+        if !opts.strategy_given || opts.strategy == Strategy::Octopus {
+            return do_octopus(&repo, &msg_specs, &head_labels, &targets, local_id, branch.as_ref(), opts);
+        }
+        // `error(_("Not handling anything other than two heads merge."))` then
+        // `return 2` (builtin/merge.c:806-808) for the merge-ort engines;
+        // `git-merge-resolve` says nothing at all — its `case "$remotes" in
+        // ?*' '?*) exit 2` gives up silently. Either way `cmd_merge` finds no
+        // `best_strategy` and prints the failure line (builtin/merge.c:1843).
+        //
+        // `refs_update_ref("updating ORIG_HEAD", …)` (builtin/merge.c:1636) has
+        // already run by then, and `save_state()`/`restore_state()` bracket the
+        // attempt, so a dirty worktree still leaves the snapshot's `AUTO_MERGE`.
+        // No reflog entry is written — measured against stock 2.55.0, which logs
+        // `merge …: updating HEAD` only for the *index* guards.
+        set_orig_head(&repo, local_id)?;
+        let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
+        let stash = begin_autostash(&repo, opts)?;
+        let snapshot = super::stash::create_snapshot(&repo)?;
+        if opts.strategy.is_ort() {
+            eprintln!("error: Not handling anything other than two heads merge.");
+        }
+        eprintln!("Merge with strategy {} failed.", opts.strategy_name);
+        restore_state_residue(&repo, snapshot)?;
+        end_autostash(&repo, stash, false)?;
+        return Ok(ExitCode::from(2));
     }
 
     let spec = refs[0].as_str();
@@ -1248,13 +1391,27 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
         return Ok(ExitCode::from(128));
     }
 
-    // `parse_merge_opt()` runs inside `try_merge_strategy()`, which git reaches
-    // only when it really invokes `ort` — so `Already up to date.` and a plain
-    // fast-forward both accept even a bogus `-X` (verified against stock git),
-    // while `--no-ff` over a fast-forwardable history does not.
-    let runs_ort = diverged || opts.ff == Ff::Never;
+    // A strategy runs for a single head exactly when the fast-forward arm above
+    // did not answer the merge (builtin/merge.c:1655-1690): a diverged history,
+    // or `--no-ff` over one that could have fast-forwarded.
+    let runs_strategy = diverged || opts.ff == Ff::Never;
+    // `parse_merge_opt()` runs inside `try_merge_strategy()`, and only on its
+    // merge-ort branch (builtin/merge.c:823-825) — so `Already up to date.` and
+    // a plain fast-forward both accept even a bogus `-X` (verified against stock
+    // git), while `--no-ff` over a fast-forwardable history does not. `resolve`
+    // and `octopus` never parse `-X` at all: `try_merge_command()` re-spells
+    // each one `--<value>` onto the back-end's command line (merge.c:31-32),
+    // where `git-merge-resolve` passes it through to `read-tree` and
+    // `git-merge-octopus` counts it as a merge base.
+    let runs_ort = runs_strategy && opts.strategy.is_ort();
+    // `if (!strcmp(strategy, "subtree")) o.subtree_shift = "";` runs before the
+    // `-X` loop (builtin/merge.c:815-822), so it is a seed, not an override.
+    let seed = crate::merge_apply::StrategyOptions {
+        subtree_shift: (opts.strategy == Strategy::Subtree).then(BString::default),
+        ..Default::default()
+    };
     let xopts = if runs_ort {
-        match crate::merge_apply::StrategyOptions::parse(&opts.strategy_options) {
+        match crate::merge_apply::StrategyOptions::parse_from(seed, &opts.strategy_options) {
             Ok(x) => x,
             Err(e) => {
                 eprintln!("fatal: {e}");
@@ -1293,14 +1450,57 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
     // runs, whatever the change is and wherever it sits. A fast-forward never
     // reaches this — git happily fast-forwards over a staged change — so it is
     // gated on the same `runs_ort` that decides whether `-X` is parsed.
-    let mut snapshot = None;
-    if runs_ort {
-        stash = begin_autostash(&repo, opts)?;
-        snapshot = super::stash::create_snapshot(&repo)?;
+    let should_interrupt = AtomicBool::new(false);
+    let message = compose_message(&repo, &msg_specs, &targets, branch.as_ref(), local_id, opts)?;
+
+    // ```c
+    // else if (!remoteheads->next && !common->next && option_commit) {
+    //         refresh_index(…);
+    //         if (allow_trivial && fast_forward != FF_ONLY) {
+    // ```
+    //
+    // (builtin/merge.c:1699-1703) — the `allow_trivial` in-index merge. It needs
+    // one head, one merge base, a merge that will be committed, and a strategy
+    // whose `all_strategy[]` entry lacks `NO_TRIVIAL`, which leaves `octopus`
+    // and `resolve` (builtin/merge.c:102-107, 1611-1612). The `fast_forward !=
+    // FF_ONLY` half is already answered: `--ff-only` either fast-forwarded or
+    // died above, so it can never reach here with `runs_strategy` set.
+    if runs_strategy && opts.strategy.allows_trivial() && bases.len() == 1 && opts.option_commit() {
+        // "Must first ensure that index matches HEAD before attempting a trivial
+        // merge." — `repo_index_has_changes()` (builtin/merge.c:1712-1719). Its
+        // refusal is `error:` alone: no `Merge with strategy … failed.` line,
+        // and no reflog entry (measured against stock 2.55.0, which logs
+        // `merge …: updating HEAD` only for merge-ort's own index guard).
         let staged = crate::merge_guard::index_changes_from_head(&repo, head_tree, &old_index)?;
         if !staged.is_empty() {
             crate::merge_guard::report_index_changes(&staged);
-            eprintln!("Merge with strategy ort failed.");
+            return Ok(ExitCode::from(2));
+        }
+        // Both lines are bare `printf`s with no verbosity check, so `-q` keeps
+        // them (builtin/merge.c:1723, 1730).
+        println!("Trying really trivial in-index merge...");
+        if read_tree_trivial(bases[0].detach(), local_id, target_id)? {
+            return merge_trivial(&repo, local_id, target_id, head_tree, message, opts, &reflog_spec);
+        }
+        println!("Nope.");
+    }
+
+    let mut snapshot = None;
+    if runs_strategy {
+        // `create_autostash_ref()` and `save_state()` (builtin/merge.c:1759-1778)
+        // bracket every strategy, whichever one it is.
+        stash = begin_autostash(&repo, opts)?;
+        snapshot = super::stash::create_snapshot(&repo)?;
+    }
+    if runs_ort {
+        // merge-ort's `merge_start()`: the index must match HEAD before the
+        // engine runs, whatever the change is and wherever it sits. A
+        // fast-forward never reaches this — git happily fast-forwards over a
+        // staged change.
+        let staged = crate::merge_guard::index_changes_from_head(&repo, head_tree, &old_index)?;
+        if !staged.is_empty() {
+            crate::merge_guard::report_index_changes(&staged);
+            eprintln!("Merge with strategy {} failed.", opts.strategy_name);
             restore_state_residue(&repo, snapshot)?;
             end_autostash(&repo, stash, false)?;
             log_strategy_failure(&repo, local_id, &reflog_spec);
@@ -1308,8 +1508,15 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
         }
     }
 
-    let should_interrupt = AtomicBool::new(false);
-    let message = compose_message(&repo, &msg_specs, &targets, branch.as_ref(), local_id, opts)?;
+    // `try_merge_command()` (merge.c:22-42) for the two back-ends git still runs
+    // out of process, plus the `ret < 2` bookkeeping `cmd_merge` does with the
+    // status they return (builtin/merge.c:1800-1880).
+    if runs_strategy && !runs_ort && opts.strategy != Strategy::Ours {
+        return run_merge_command(
+            &repo, local_id, target_id, head_tree, &bases, message, opts, &reflog_spec, stash,
+            snapshot,
+        );
+    }
 
     // Diverged histories: a genuine three-way merge (`ort` strategy) of HEAD and
     // the target against their merge base (an empty tree for unrelated histories).
@@ -1320,7 +1527,10 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
     // play: git runs the strategy there too, and an option like
     // `-Xsubtree=<prefix>` reshapes the trees, so the target's tree is no longer
     // the answer. Without `-X` the shortcut below is kept.
-    if diverged || (opts.ff == Ff::Never && !opts.strategy_options.is_empty()) {
+    if diverged
+        || (opts.ff == Ff::Never
+            && (!opts.strategy_options.is_empty() || xopts.subtree_shift.is_some()))
+    {
         // `git`'s recursive base for the three-way; the empty tree stands in for an
         // unrelated history (`--allow-unrelated-histories`), which has no base.
         //
@@ -1368,7 +1578,7 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
             // computed and reported, but nothing on disk moved.
             crate::merge_apply::Merged::Refused(clobber) => {
                 clobber.report("merge");
-                eprintln!("Merge with strategy ort failed.");
+                eprintln!("Merge with strategy {} failed.", opts.strategy_name);
                 restore_state_residue(&repo, snapshot)?;
                 end_autostash(&repo, stash, false)?;
                 return Ok(ExitCode::from(2));
@@ -1392,64 +1602,21 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
                 applied.tree_id,
                 head_tree,
                 opts,
-                "ort",
+                &format!("Merge made by the '{}' strategy.", opts.strategy_name),
                 &reflog_spec,
                 stash,
             );
         }
 
-        // Conflicts: record the in-progress merge and stop with git's message.
-        //
-        // `cmd_merge()` forks here rather than after the notice:
-        //
-        // ```c
-        // if (squash) {
-        //         finish(head_commit, remoteheads, NULL, NULL);
-        //         …
-        // } else
-        //         write_merge_state(remoteheads);
-        // ```
-        //
-        // (builtin/merge.c:1770-1775). `finish()` with a NULL new head records
-        // no ref move and no merge state — it only reaches `squash_message()`,
-        // which announces itself and writes `SQUASH_MSG`. So a conflicted squash
-        // leaves neither `MERGE_HEAD` nor `MERGE_MODE`, and that is a state
-        // difference rather than a wording one: `MERGE_HEAD` is what makes the
-        // next `git commit` write a two-parent commit and what gives
-        // `git merge --abort` a merge to abort, and a squash asked for neither.
-        let git_dir = repo.git_dir();
-        let mut merge_msg = Vec::new();
-        if opts.squash {
-            // `squash_message()` prints before it writes, with no verbosity
-            // check of its own (builtin/merge.c:417).
-            println!("Squash commit -- not updating HEAD");
-            write_squash_msg(&repo, &[target_id], local_id)?;
-        } else {
-            std::fs::write(git_dir.join("MERGE_HEAD"), format!("{target_id}\n"))?;
-            std::fs::write(git_dir.join("MERGE_MODE"), merge_mode(opts.ff))?;
-            merge_msg = message.into_bytes();
-        }
-        // `suggest_conflicts()` opens `MERGE_MSG` with `xfopen(filename, "a")`
-        // and appends `append_conflicts_hint()`'s block (builtin/merge.c:967-979),
-        // so the hint's leading blank line is always there and a squash — which
-        // wrote no message for it to follow — leaves the hint alone in the file.
-        merge_msg.extend_from_slice(b"\n# Conflicts:\n");
-        for path in &applied.conflicts {
-            merge_msg.extend_from_slice(b"#\t");
-            merge_msg.extend_from_slice(&path[..]);
-            merge_msg.push(b'\n');
-        }
-        std::fs::write(git_dir.join("MERGE_MSG"), &merge_msg)?;
-        // `suggest_conflicts()` runs rerere between the `# Conflicts:` hint and
-        // the notice: a known resolution is replayed into the worktree (and
-        // staged under `--rerere-autoupdate`/`rerere.autoupdate`), an unknown one
-        // has its preimage recorded for next time.
-        super::rerere::repo_rerere(&repo, opts.rerere_autoupdate)?;
-        if !opts.quiet {
-            println!("Automatic merge failed; fix conflicts and then commit the result.");
-        }
-        end_autostash(&repo, stash, false)?;
-        return Ok(ExitCode::from(1));
+        return stop_for_conflicts(
+            &repo,
+            local_id,
+            target_id,
+            message,
+            &applied.conflicts,
+            opts,
+            stash,
+        );
     }
 
     // `--no-ff` over a fast-forwardable history: the merge-base is our own commit,
@@ -1459,7 +1626,8 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
         // The strategy still ran (git dispatches `--no-ff` through `ort`), so a
         // refusal here is a strategy failure — and, like every other one, leaves
         // `restore_state()`'s `AUTO_MERGE` behind.
-        if let Some(code) = guard_checkout(&repo, head_tree, target_tree, &old_index, true)? {
+        let blame = Some(opts.strategy_name.as_str());
+        if let Some(code) = guard_checkout(&repo, head_tree, target_tree, &old_index, blame)? {
             restore_state_residue(&repo, snapshot)?;
             end_autostash(&repo, stash, false)?;
             return Ok(code);
@@ -1479,7 +1647,7 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
             target_tree,
             head_tree,
             opts,
-            "ort",
+            &format!("Merge made by the '{}' strategy.", opts.strategy_name),
             &reflog_spec,
             stash,
         );
@@ -1497,7 +1665,7 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
             );
         }
         stash = begin_autostash(&repo, opts)?;
-        if let Some(code) = guard_checkout(&repo, head_tree, target_tree, &old_index, false)? {
+        if let Some(code) = guard_checkout(&repo, head_tree, target_tree, &old_index, None)? {
             end_autostash(&repo, stash, false)?;
             return Ok(code);
         }
@@ -1539,7 +1707,7 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
         );
     }
     stash = begin_autostash(&repo, opts)?;
-    if let Some(code) = guard_checkout(&repo, head_tree, target_tree, &old_index, false)? {
+    if let Some(code) = guard_checkout(&repo, head_tree, target_tree, &old_index, None)? {
         end_autostash(&repo, stash, false)?;
         return Ok(code);
     }
@@ -1617,20 +1785,250 @@ fn mask<T>(values: Vec<T>, keep: &[bool]) -> Vec<T> {
     values.into_iter().zip(keep).filter(|(_, k)| **k).map(|(v, _)| v).collect()
 }
 
+
+/// The numeric status an [`ExitCode`] carries. `ExitCode` exposes no accessor on
+/// stable Rust — only `From<u8>` and equality — so recover it by probing the 256
+/// values it can hold, exactly as `crate::run` does at the top of the binary.
+/// Needed because the two back-ends below are ports of *programs*: `cmd_merge`
+/// branches on the status they exit with, not on a Rust value.
+fn exit_status(code: ExitCode) -> u8 {
+    (0u8..=255).find(|&n| code == ExitCode::from(n)).unwrap_or(1)
+}
+
+/// `read_tree_trivial()` (builtin/merge.c:743-777): `unpack_trees()` over
+/// `<common> <head> <one>` with `head_idx = 2`, `merge`, `update`,
+/// `verbose_update`, `trivial_merges_only` and `preserve_ignored = 0`, resolving
+/// through `threeway_merge()`.
+///
+/// `git read-tree -u -m --trivial <common> <head> <one>` sets that exact field
+/// set: three trees pick `opts.fn = threeway_merge` and `head_idx = stage - 2`,
+/// i.e. 2 (builtin/read-tree.c:246-258); `-u` without `--reset` clears
+/// `preserve_ignored` (builtin/read-tree.c:229); and `--trivial` *is*
+/// `trivial_merges_only` (builtin/read-tree.c:133). So the pre-pass is that
+/// command, run in process — including `unpack_failed()`'s
+/// `error: Merge requires file-level merging` (unpack-trees.c:2031), which stock
+/// prints between `Trying really trivial in-index merge...` and `Nope.`, and
+/// including the fact that a failure writes neither the index nor the worktree.
+///
+/// Returns whether the trivial merge took, i.e. git's `!read_tree_trivial(…)`.
+fn read_tree_trivial(common: ObjectId, head: ObjectId, one: ObjectId) -> Result<bool> {
+    let argv: Vec<String> = vec![
+        "-u".to_string(),
+        "-m".to_string(),
+        "--trivial".to_string(),
+        common.to_string(),
+        head.to_string(),
+        one.to_string(),
+    ];
+    Ok(exit_status(super::read_tree::read_tree(&argv)?) == 0)
+}
+
+/// `merge_trivial()` (builtin/merge.c:989-1012). The index
+/// [`read_tree_trivial`] just wrote *is* the merge result, so `write_tree_trivial()`
+/// turns it into a tree and the commit is written over it with `HEAD` and the
+/// merged head as parents. `finish()` is handed the literal `In-index merge`
+/// where an automerge would pass `Merge made by the '<strategy>' strategy.`, and
+/// that string is what the reflog records too.
+fn merge_trivial(
+    repo: &gix::Repository,
+    local_id: ObjectId,
+    target_id: ObjectId,
+    head_tree: ObjectId,
+    message: String,
+    opts: &Opts,
+    reflog_spec: &str,
+) -> Result<ExitCode> {
+    let index = repo.open_index()?;
+    let result_tree = index_tree(repo, &index)?;
+    // A bare `printf` with no verbosity check, so `-q` keeps it too.
+    println!("Wonderful.");
+    finalize_clean(
+        repo,
+        local_id,
+        &[target_id],
+        None,
+        message,
+        result_tree,
+        head_tree,
+        opts,
+        "In-index merge",
+        reflog_spec,
+        None,
+    )
+}
+
+/// `try_merge_command()` (merge.c:22-42) plus the status bookkeeping `cmd_merge`
+/// does around it (builtin/merge.c:1800-1881), for the two strategies git still
+/// runs as separate programs.
+///
+/// The command line is `git merge-<strategy> --<xopt>… <base>… -- HEAD <head>…`:
+/// every `-X` is re-spelled `--<value>` and lands *ahead of* the merge bases, and
+/// the local side is the literal string `HEAD` while every other operand is an
+/// object id (`merge_argument()`).
+///
+/// > The backend exits with 1 when conflicts are left to be resolved, with 2
+/// > when it does not handle the given merge at all.
+///
+/// 0 is `merge_was_ok`: the index the back-end left behind is the result, so it
+/// becomes the tree of the merge commit (`finish_automerge()`'s
+/// `write_tree_trivial`). 1 stops with the conflicts recorded. 2 leaves
+/// `best_strategy` unset, which is the `Merge with strategy %s failed.` arm.
+#[allow(clippy::too_many_arguments)]
+fn run_merge_command(
+    repo: &gix::Repository,
+    local_id: ObjectId,
+    target_id: ObjectId,
+    head_tree: ObjectId,
+    bases: &[gix::Id<'_>],
+    message: String,
+    opts: &Opts,
+    reflog_spec: &str,
+    stash: Option<ObjectId>,
+    snapshot: Option<ObjectId>,
+) -> Result<ExitCode> {
+    let mut argv: Vec<String> =
+        opts.strategy_options.iter().map(|x| format!("--{x}")).collect();
+    argv.extend(bases.iter().map(|b| b.detach().to_string()));
+    argv.push("--".to_string());
+    argv.push("HEAD".to_string());
+    argv.push(target_id.to_string());
+
+    let status = match opts.strategy {
+        Strategy::Resolve => exit_status(super::merge_resolve::merge_resolve(&argv)?),
+        // `git-merge-octopus`'s second guard — "Reject if this is not an octopus
+        // -- resolve should be used instead" — is `case "$remotes" in ?*' '?*)
+        // ;; *) exit 2 ;; esac`, which needs a non-empty run on both sides of a
+        // space in the trailing-space-separated head list. One head fails it, so
+        // the script exits 2 before its `diff-index` pre-flight, before a single
+        // line of its merge loop, and without printing anything.
+        _ => 2,
+    };
+
+    match status {
+        0 => {
+            let index = repo.open_index()?;
+            let result_tree = index_tree(repo, &index)?;
+            finalize_clean(
+                repo,
+                local_id,
+                &[target_id],
+                None,
+                message,
+                result_tree,
+                head_tree,
+                opts,
+                &format!("Merge made by the '{}' strategy.", opts.strategy_name),
+                reflog_spec,
+                stash,
+            )
+        }
+        1 => {
+            let index = repo.open_index()?;
+            let backing = index.path_backing().to_owned();
+            let mut conflicts: Vec<BString> = Vec::new();
+            for entry in index.entries() {
+                if entry.stage() == Stage::Unconflicted {
+                    continue;
+                }
+                let path = entry.path_in(&backing).to_owned();
+                if conflicts.last() != Some(&path) {
+                    conflicts.push(path);
+                }
+            }
+            stop_for_conflicts(repo, local_id, target_id, message, &conflicts, opts, stash)
+        }
+        _ => {
+            eprintln!("Merge with strategy {} failed.", opts.strategy_name);
+            restore_state_residue(repo, snapshot)?;
+            end_autostash(repo, stash, false)?;
+            Ok(ExitCode::from(2))
+        }
+    }
+}
+
+/// The conflicted tail of `cmd_merge` (builtin/merge.c:1868-1881): record the
+/// in-progress merge — or, under `--squash`, only `SQUASH_MSG` — then
+/// `suggest_conflicts()`. Shared by merge-ort and by the out-of-process
+/// back-ends, which reach it with the same state and the same wording.
+fn stop_for_conflicts(
+    repo: &gix::Repository,
+    local_id: ObjectId,
+    target_id: ObjectId,
+    message: String,
+    conflicts: &[BString],
+    opts: &Opts,
+    stash: Option<ObjectId>,
+) -> Result<ExitCode> {
+    // Conflicts: record the in-progress merge and stop with git's message.
+    //
+    // `cmd_merge()` forks here rather than after the notice:
+    //
+    // ```c
+    // if (squash) {
+    //         finish(head_commit, remoteheads, NULL, NULL);
+    //         …
+    // } else
+    //         write_merge_state(remoteheads);
+    // ```
+    //
+    // (builtin/merge.c:1770-1775). `finish()` with a NULL new head records
+    // no ref move and no merge state — it only reaches `squash_message()`,
+    // which announces itself and writes `SQUASH_MSG`. So a conflicted squash
+    // leaves neither `MERGE_HEAD` nor `MERGE_MODE`, and that is a state
+    // difference rather than a wording one: `MERGE_HEAD` is what makes the
+    // next `git commit` write a two-parent commit and what gives
+    // `git merge --abort` a merge to abort, and a squash asked for neither.
+    let git_dir = repo.git_dir();
+    let mut merge_msg = Vec::new();
+    if opts.squash {
+        // `squash_message()` prints before it writes, with no verbosity
+        // check of its own (builtin/merge.c:417).
+        println!("Squash commit -- not updating HEAD");
+        write_squash_msg(repo, &[target_id], local_id)?;
+    } else {
+        std::fs::write(git_dir.join("MERGE_HEAD"), format!("{target_id}\n"))?;
+        std::fs::write(git_dir.join("MERGE_MODE"), merge_mode(opts.ff))?;
+        merge_msg = message.into_bytes();
+    }
+    // `suggest_conflicts()` opens `MERGE_MSG` with `xfopen(filename, "a")`
+    // and appends `append_conflicts_hint()`'s block (builtin/merge.c:967-979),
+    // so the hint's leading blank line is always there and a squash — which
+    // wrote no message for it to follow — leaves the hint alone in the file.
+    merge_msg.extend_from_slice(b"\n# Conflicts:\n");
+    for path in conflicts {
+        merge_msg.extend_from_slice(b"#\t");
+        merge_msg.extend_from_slice(&path[..]);
+        merge_msg.push(b'\n');
+    }
+    std::fs::write(git_dir.join("MERGE_MSG"), &merge_msg)?;
+    // `suggest_conflicts()` runs rerere between the `# Conflicts:` hint and
+    // the notice: a known resolution is replayed into the worktree (and
+    // staged under `--rerere-autoupdate`/`rerere.autoupdate`), an unknown one
+    // has its preimage recorded for next time.
+    super::rerere::repo_rerere(repo, opts.rerere_autoupdate)?;
+    if !opts.quiet {
+        println!("Automatic merge failed; fix conflicts and then commit the result.");
+    }
+    end_autostash(repo, stash, false)?;
+    return Ok(ExitCode::from(1));
+}
+
 fn guard_checkout(
     repo: &gix::Repository,
     head_tree: ObjectId,
     new_tree: ObjectId,
     index: &gix::index::File,
-    strategy: bool,
+    // The strategy name to blame when the refusal is a strategy failure, or
+    // `None` when the caller is a plain fast-forward checkout (exit 1).
+    strategy: Option<&str>,
 ) -> Result<Option<ExitCode>> {
     let clobber = crate::merge_guard::verify_two_way(repo, head_tree, new_tree, index)?;
     if clobber.is_empty() {
         return Ok(None);
     }
     clobber.report("merge");
-    if strategy {
-        eprintln!("Merge with strategy ort failed.");
+    if let Some(name) = strategy {
+        eprintln!("Merge with strategy {name} failed.");
         return Ok(Some(ExitCode::from(2)));
     }
     Ok(Some(ExitCode::from(1)))
@@ -1700,7 +2098,11 @@ fn finalize_clean(
     merged_tree: ObjectId,
     head_tree: ObjectId,
     opts: &Opts,
-    strategy_name: &str,
+    // The string `finish()` is handed (builtin/merge.c:1013, 1053): normally
+    // `Merge made by the '<wt_strategy>' strategy.`, but the literal `In-index
+    // merge` when the `allow_trivial` pre-pass answered the merge. It is both
+    // the line printed and the reflog message's tail.
+    finish_msg: &str,
     spec_label: &str,
     stash: Option<ObjectId>,
 ) -> Result<ExitCode> {
@@ -1819,13 +2221,10 @@ fn finalize_clean(
         repo,
         local_id,
         new_id,
-        format!(
-            "{}: Merge made by the '{strategy_name}' strategy.",
-            reflog_action(&spec_label)
-        ),
+        format!("{}: {finish_msg}", reflog_action(&spec_label)),
     )?;
     if !opts.quiet {
-        println!("Merge made by the '{strategy_name}' strategy.");
+        println!("{finish_msg}");
         print!("{}", diffstat(repo, head_tree, merged_tree, opts.stat)?);
     }
     end_autostash(repo, stash, true)?;
@@ -1918,7 +2317,7 @@ fn merge_ours(
         head_tree,
         head_tree,
         opts,
-        "ours",
+        "Merge made by the 'ours' strategy.",
         &spec_label,
         stash,
     )
@@ -2176,7 +2575,7 @@ fn do_octopus(
         // taken from where `HEAD` was to the merged tree.
         repo.find_object(local_id)?.peel_to_tree()?.id,
         opts,
-        "octopus",
+        "Merge made by the 'octopus' strategy.",
         &refs.join(" "),
         stash,
     )
@@ -2920,41 +3319,32 @@ fn end_autostash(repo: &gix::Repository, stash: Option<ObjectId>, applied: bool)
 // -S / --gpg-sign
 // ---------------------------------------------------------------------------
 
-/// git's `sign_commit_to_strbuf()`: sign the serialized commit and attach the
-/// armored signature as its `gpgsig` header. The key is `-S<keyid>` when given,
-/// else `user.signingKey`, else the committer identity — git's
-/// `get_signing_key()` ladder — and the program is `gpg.program`.
+/// git's `sign_commit_to_strbuf()` (commit.c): sign the serialized commit and
+/// attach the detached signature as its `gpgsig` header.
+///
+/// Everything about *which* backend, key and program that uses lives in
+/// [`crate::gitsig::Signer`] — the same one `git commit -S` goes through.
+/// Re-deriving it here is how this used to read `gpg.program` and nothing else,
+/// which ran `gpg -bsa` against an ssh key whenever `gpg.format = ssh` was set
+/// and reported `No secret key` for a key that signs fine.
 fn sign_commit(
     repo: &gix::Repository,
     commit: &mut gix::objs::Commit,
     key: &str,
 ) -> std::result::Result<(), ExitCode> {
-    let snapshot = repo.config_snapshot();
-    let program = snapshot
-        .string("gpg.program")
-        .map(|v| v.to_string())
-        .unwrap_or_else(|| "gpg".to_string());
-    let signing_key = if !key.is_empty() {
-        key.to_string()
-    } else {
-        match snapshot.string("user.signingKey") {
-            Some(v) => v.to_string(),
-            None => match identity(repo.committer()) {
-                Some(me) => me,
-                None => {
-                    eprintln!("fatal: no committer identity to sign with");
-                    return Err(ExitCode::from(128));
-                }
-            },
-        }
-    };
+    let mut signer = crate::gitsig::Signer::resolve(repo);
+    // `sign_buffer(..., signing_key, SIGN_BUFFER_USE_DEFAULT_KEY)`: a non-empty
+    // `-S<keyid>` wins, an empty one leaves `get_signing_key()` in charge.
+    if !key.is_empty() {
+        signer.key = Some(key.to_string());
+    }
 
     let mut payload = Vec::new();
     if let Err(e) = commit.write_to(&mut payload) {
         eprintln!("fatal: failed to serialize commit object: {e}");
         return Err(ExitCode::from(128));
     }
-    match crate::gitsig::sign(&payload, &program, Some(&signing_key)) {
+    match signer.sign(&payload) {
         Ok(signature) => {
             commit
                 .extra_headers
@@ -2962,8 +3352,17 @@ fn sign_commit(
             Ok(())
         }
         Err(e) => {
-            eprintln!("error: gpg failed to sign the data:\n{e}\n");
-            eprintln!("fatal: failed to write commit object");
+            // `sign_buffer` reported with `error()`; `commit_tree_extended`'s
+            // caller adds the `die()`. A `Fatal` is `get_signing_key()` dying on
+            // its own, and nothing follows it.
+            match e {
+                crate::gitsig::SignFailure::Silent => {}
+                crate::gitsig::SignFailure::Fatal(m) => eprintln!("fatal: {m}"),
+                crate::gitsig::SignFailure::Error(m) => {
+                    eprintln!("{}", crate::gitsig::report("error: ", &m));
+                    eprintln!("fatal: failed to write commit object");
+                }
+            }
             Err(ExitCode::from(128))
         }
     }
@@ -3008,20 +3407,28 @@ fn parse_cleanup(value: &str) -> Option<Cleanup> {
     })
 }
 
-/// Resolve a `-s`/`--strategy` value. Only `ort` and `ours` map to a real merge
-/// here; `octopus` folds onto the default path (which already selects the octopus
-/// engine for multiple heads). `recursive`/`resolve`/`subtree` are genuine git
-/// strategies with distinct conflict resolution that is not vendored, so they are
-/// refused rather than silently aliased onto `ort`. An unknown name reproduces
-/// git's `Could not find merge strategy` diagnostic.
+/// Resolve a `-s`/`--strategy` value onto the engine that runs it.
+///
+/// `recursive` and `subtree` are not separate back-ends in git 2.55:
+/// `try_merge_strategy()` dispatches `recursive`, `subtree` and `ort` alike to
+/// `merge_ort_recursive()` (builtin/merge.c:800-834), differing only in the
+/// `o.subtree_shift = ""` `subtree` sets first (builtin/merge.c:815-816). Both
+/// therefore map onto the same engine here, `subtree` carrying its shift.
+///
+/// `resolve` and `octopus` are the two back-ends git still runs out of process
+/// (`try_merge_command()`), and the two the `allow_trivial` in-index merge
+/// precedes (builtin/merge.c:1611-1612, 1703-1731). Both get a variant of their
+/// own so the head count — which `-s` parsing cannot know — decides between
+/// `git-merge-octopus`'s two-or-more-heads path and its `exit 2` over one head.
+///
+/// An unknown name reproduces git's `Could not find merge strategy` diagnostic.
 fn resolve_strategy(name: &str) -> std::result::Result<Strategy, ExitCode> {
     match name {
-        "ort" | "octopus" => Ok(Strategy::Ort),
+        "ort" | "recursive" => Ok(Strategy::Ort),
+        "subtree" => Ok(Strategy::Subtree),
         "ours" => Ok(Strategy::Ours),
-        "recursive" | "resolve" | "subtree" => {
-            eprintln!("merge: strategy '{name}' is not supported by this build (use 'ort' or 'ours')");
-            Err(ExitCode::from(128))
-        }
+        "resolve" => Ok(Strategy::Resolve),
+        "octopus" => Ok(Strategy::Octopus),
         _ => {
             eprintln!("Could not find merge strategy '{name}'.");
             eprintln!("Available strategies are: octopus ours recursive resolve subtree.");

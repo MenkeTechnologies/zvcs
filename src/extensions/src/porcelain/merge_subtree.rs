@@ -31,17 +31,18 @@
 //!     `argc - i != 3` arity check, the unmerged-index precondition
 //!     (`die_resolve_conflict`, advice-gated), and the `<head>`/`<remote>`
 //!     resolution errors, all with git's exact wording and exit codes;
-//!   * `parse_merge_opt()`'s accept/reject grammar for the options the merge can
-//!     honour (`--no-renames`, `--find-renames[=<n>]`, `--rename-threshold=<n>`,
-//!     `--patience`, `--histogram`,
-//!     `--diff-algorithm=<myers|minimal|patience|histogram>`, and the
-//!     subtree family `--subtree` / `--subtree=<path>`).
+//!   * every branch of `parse_merge_opt()` — the subtree family
+//!     (`--subtree` / `--subtree=<path>`), `--ours`, `--theirs`,
+//!     `--renormalize`, `--no-renormalize`, `--no-renames`,
+//!     `--find-renames[=<n>]`, `--rename-threshold=<n>`, `--patience`,
+//!     `--histogram`, `--diff-algorithm=<myers|minimal|patience|histogram>` and
+//!     the `--ignore-*-space*` / `--ignore-cr-at-eol` family. It is literally
+//!     the porcelain's `-X` parser ([`crate::merge_apply::StrategyOptions`]),
+//!     because `cmd_merge_recursive` calls the same `parse_merge_opt()`
+//!     (builtin/merge-recursive.c:55-58).
 //!
 //! Deliberate floors, refused rather than approximated (identical to the
 //! `merge-recursive` port, which shares gitoxide's merge substrate):
-//!   * `--ours` / `--theirs` / `--renormalize` / `--no-renormalize` /
-//!     `--ignore-*` — no `gix-merge` knob, so honouring them would silently
-//!     produce a different merge than the flag asks for;
 //!   * conflict classes outside the content family (rename/rename,
 //!     rename/delete, modify/delete, directory/file, submodule, binary):
 //!     `gix-merge` reports these under a different taxonomy, so reproducing
@@ -92,17 +93,6 @@ struct Message {
     text: String,
 }
 
-/// Rename detection as requested on the command line.
-enum Renames {
-    /// git's default: detection on, threshold from config.
-    Default,
-    /// `--no-renames`.
-    Off,
-    /// `--find-renames` (no value) — detection on at the default threshold.
-    On,
-    /// `--find-renames=<n>` / `--rename-threshold=<n>`, as a similarity fraction.
-    Threshold(f32),
-}
 
 /// `o.subtree_shift`, whose default for a `-subtree`-suffixed invocation is the
 /// empty string (automatic detection). `--subtree` (and `--subtree=`) select
@@ -134,10 +124,13 @@ pub fn merge_subtree(args: &[String]) -> Result<ExitCode> {
     // it, or at args.len() when no `--` was seen — mirroring C's `i` shifted by
     // one for the missing argv[0].
     let mut bases: Vec<ObjectId> = Vec::new();
-    let mut renames = Renames::Default;
-    let mut diff_algorithm: Option<gix::diff::blob::Algorithm> = None;
-    // A `-subtree` invocation defaults `o.subtree_shift` to "", i.e. Auto.
-    let mut subtree_shift = SubtreeShift::Auto;
+    // `if (ends_with(argv[0], "-subtree")) o.subtree_shift = "";`
+    // (builtin/merge-recursive.c:34) — set before the option scan, so an
+    // explicit `--subtree=<prefix>` still overrides it.
+    let mut xopts = crate::merge_apply::StrategyOptions {
+        subtree_shift: Some(gix::bstr::BString::default()),
+        ..Default::default()
+    };
     let mut end = args.len();
     for (idx, arg) in args.iter().enumerate() {
         if let Some(opt) = arg.strip_prefix("--") {
@@ -145,7 +138,14 @@ pub fn merge_subtree(args: &[String]) -> Result<ExitCode> {
                 end = idx;
                 break;
             }
-            if !parse_merge_opt(opt, &mut renames, &mut diff_algorithm, &mut subtree_shift)? {
+            // The same `parse_merge_opt()` the porcelain runs over `-X`
+            // (builtin/merge-recursive.c:55-58), so the plumbing honours the
+            // same set: `--ours`/`--theirs`, the `--ignore-*-space*` family and
+            // `--renormalize` included.
+            if crate::merge_apply::StrategyOptions::parse_from(xopts.clone(), &[opt.to_string()])
+                .map(|updated| xopts = updated)
+                .is_err()
+            {
                 eprintln!("fatal: unknown option {arg}");
                 return Ok(ExitCode::from(128));
             }
@@ -248,27 +248,23 @@ pub fn merge_subtree(args: &[String]) -> Result<ExitCode> {
         ),
     };
 
-    // The command's reason to exist: shift both non-head trees toward head.
+    // The command's reason to exist: shift both non-head trees toward head. An
+    // empty prefix is git's `""`, i.e. work the shift out from the tree shapes.
+    let subtree_shift = match xopts.subtree_shift.as_deref() {
+        Some(prefix) if prefix.is_empty() => SubtreeShift::Auto,
+        Some(prefix) => SubtreeShift::By(prefix.to_vec()),
+        None => SubtreeShift::Auto,
+    };
     let remote_shifted = shift_tree_object(&repo, head_tree, remote_tree, &subtree_shift)?;
     let base_shifted = shift_tree_object(&repo, head_tree, base_tree, &subtree_shift)?;
 
-    // Tree-merge options, adjusted by the flags we honour.
-    let mut plumbing_opts: gix::merge::plumbing::tree::Options = repo.tree_merge_options()?.into();
-    if let Some(algorithm) = diff_algorithm {
-        plumbing_opts.blob_merge.text.diff_algorithm = algorithm;
-    }
-    match renames {
-        Renames::Default => {}
-        Renames::Off => plumbing_opts.rewrites = None,
-        Renames::On => plumbing_opts.rewrites = Some(gix::diff::Rewrites::default()),
-        Renames::Threshold(percentage) => {
-            plumbing_opts.rewrites = Some(gix::diff::Rewrites {
-                percentage: Some(percentage),
-                ..Default::default()
-            });
-        }
-    }
-    let tree_options: gix::merge::tree::Options = plumbing_opts.into();
+    // `-Xrenormalize` reaches the blob pipeline through the repository's own
+    // `merge.renormalize`, so it is applied to a private clone first.
+    let renormalized = crate::merge_apply::renormalized_repo(&repo, &xopts)?;
+    let repo = renormalized.unwrap_or(repo);
+
+    // The same `-X` knobs the porcelain applies, from the same place.
+    let tree_options = crate::merge_apply::tree_merge_options(&repo, &xopts, None)?;
 
     let labels = Labels {
         ancestor: ancestor_label.as_deref().map(|s| BStr::new(s.as_bytes())),
@@ -702,87 +698,6 @@ fn better_branch_name(branch: &str) -> String {
     std::env::var(format!("GITHEAD_{branch}")).unwrap_or_else(|_| branch.to_owned())
 }
 
-/// `parse_merge_opt()` from `merge-recursive.c`. `Ok(true)` when the option is
-/// recognised *and* implemented, `Ok(false)` when git itself would reject it
-/// (caller prints `fatal: unknown option …`), and an error for options git
-/// accepts but this port cannot honour without silently changing the merge.
-fn parse_merge_opt(
-    opt: &str,
-    renames: &mut Renames,
-    diff_algorithm: &mut Option<gix::diff::blob::Algorithm>,
-    subtree_shift: &mut SubtreeShift,
-) -> Result<bool> {
-    const PORTED: &str = "ported: --subtree[=<path>], --no-renames, --find-renames[=<n>], --rename-threshold=<n>, --patience, --histogram, --diff-algorithm=<myers|minimal|patience|histogram>";
-    match opt {
-        "no-renames" => *renames = Renames::Off,
-        "find-renames" => *renames = Renames::On,
-        "histogram" => *diff_algorithm = Some(gix::diff::blob::Algorithm::Histogram),
-        // `--subtree` sets o.subtree_shift = "" -> automatic detection.
-        "subtree" => *subtree_shift = SubtreeShift::Auto,
-        "patience" => *diff_algorithm = Some(gix::diff::blob::Algorithm::Patience),
-        "ours" | "theirs" | "renormalize" | "no-renormalize"
-        | "ignore-space-change" | "ignore-all-space" | "ignore-space-at-eol"
-        | "ignore-cr-at-eol" => {
-            bail!("unsupported flag \"--{opt}\" (no gix-merge equivalent; {PORTED})")
-        }
-        _ if opt.starts_with("subtree=") => {
-            let value = &opt["subtree=".len()..];
-            // An empty value is git's "" (automatic detection); anything else is
-            // a shift prefix.
-            *subtree_shift = if value.is_empty() {
-                SubtreeShift::Auto
-            } else {
-                SubtreeShift::By(value.as_bytes().to_vec())
-            };
-        }
-        _ if opt.starts_with("diff-algorithm=") => {
-            let value = &opt["diff-algorithm=".len()..];
-            *diff_algorithm = Some(match value {
-                "myers" | "default" => gix::diff::blob::Algorithm::Myers,
-                "minimal" => gix::diff::blob::Algorithm::MyersMinimal,
-                "histogram" => gix::diff::blob::Algorithm::Histogram,
-                "patience" => gix::diff::blob::Algorithm::Patience,
-                _ => return Ok(false),
-            });
-        }
-        _ if opt.starts_with("find-renames=") || opt.starts_with("rename-threshold=") => {
-            let value = &opt[opt.find('=').expect("checked above") + 1..];
-            match parse_rename_score(value) {
-                Some(fraction) => *renames = Renames::Threshold(fraction),
-                None => return Ok(false),
-            }
-        }
-        _ => return Ok(false),
-    }
-    Ok(true)
-}
-
-/// git's `parse_rename_score`: a run of digits with at most one `.`, optionally
-/// closed by a single trailing `%`, read as a similarity percentage. An empty
-/// value — and a lone `.` or `%` — reads as score 0, exactly as git's scanner
-/// does (`strtoul` consumes nothing and returns 0). Returns the fraction.
-fn parse_rename_score(value: &str) -> Option<f32> {
-    let body = value.strip_suffix('%').unwrap_or(value);
-    // Reject anything git's scanner would not consume as a number: only digits
-    // and at most one decimal point.
-    let mut seen_dot = false;
-    for c in body.chars() {
-        match c {
-            '.' if !seen_dot => seen_dot = true,
-            '0'..='9' => {}
-            _ => return None,
-        }
-    }
-    // "", ".", "%" → 0; git reads a missing/empty number as 0.
-    let number: f32 = match body {
-        "" | "." => 0.0,
-        _ => body.parse().ok()?,
-    };
-    if number < 0.0 {
-        return None;
-    }
-    Some(number / 100.0)
-}
 
 /// Refuse to merge unless the index is exactly `head_tree` — the state git's
 /// `unpack_trees` pass is guaranteed to accept.
@@ -946,12 +861,19 @@ fn is_binary(repo: &gix::Repository, id: &ObjectId) -> Result<bool> {
 mod tests {
     use super::*;
 
-    fn parse(opt: &str) -> Result<(bool, Renames, Option<gix::diff::blob::Algorithm>, SubtreeShift)> {
-        let mut renames = Renames::Default;
-        let mut algo = None;
-        let mut shift = SubtreeShift::Auto;
-        let accepted = parse_merge_opt(opt, &mut renames, &mut algo, &mut shift)?;
-        Ok((accepted, renames, algo, shift))
+    /// One `parse_merge_opt()` call over the `-subtree` seed, as the driver runs
+    /// it. `Err` is git's own `unknown option` refusal.
+    fn parse(
+        opt: &str,
+    ) -> std::result::Result<crate::merge_apply::StrategyOptions, crate::merge_apply::StrategyOptionError>
+    {
+        crate::merge_apply::StrategyOptions::parse_from(
+            crate::merge_apply::StrategyOptions {
+                subtree_shift: Some(gix::bstr::BString::default()),
+                ..Default::default()
+            },
+            &[opt.to_string()],
+        )
     }
 
     #[test]
@@ -979,24 +901,26 @@ mod tests {
             "rename-threshold=5",
             "rename-threshold=",
         ] {
-            let (accepted, ..) = parse(ok).expect("git accepts and this port honours it");
-            assert!(accepted, "git accepts --{ok}");
+            parse(ok).unwrap_or_else(|_| panic!("git accepts --{ok}"));
         }
     }
 
+    /// These used to be refused; they now go through the shared
+    /// `parse_merge_opt()` port and reach the merge, as they do in git.
     #[test]
-    fn refuses_options_git_accepts_but_this_port_cannot_honour() {
-        for floored in [
-            "ours",
-            "theirs",
-            "renormalize",
-            "no-renormalize",
+    fn honours_the_rest_of_parse_merge_opt() {
+        use crate::merge_apply::Variant;
+        assert_eq!(parse("ours").expect("accepted").variant, Some(Variant::Ours));
+        assert_eq!(parse("theirs").expect("accepted").variant, Some(Variant::Theirs));
+        assert_eq!(parse("renormalize").expect("accepted").renormalize, Some(true));
+        assert_eq!(parse("no-renormalize").expect("accepted").renormalize, Some(false));
+        for ws in [
             "ignore-space-change",
             "ignore-all-space",
             "ignore-space-at-eol",
             "ignore-cr-at-eol",
         ] {
-            assert!(parse(floored).is_err(), "--{floored} is a floor, not a silent drop");
+            assert_ne!(parse(ws).expect("accepted").xdl_opts, 0, "--{ws} sets an XDF flag");
         }
     }
 
@@ -1013,38 +937,44 @@ mod tests {
             "verbose",
             "bogus",
         ] {
-            let (accepted, ..) = parse(bad).expect("rejection is Ok(false), not an error");
-            assert!(!accepted, "git rejects --{bad}");
+            assert!(parse(bad).is_err(), "git rejects --{bad}");
         }
     }
 
     #[test]
     fn subtree_flag_selects_the_shift_mode() {
-        assert!(matches!(parse("subtree").unwrap().3, SubtreeShift::Auto));
-        assert!(matches!(parse("subtree=").unwrap().3, SubtreeShift::Auto));
-        match parse("subtree=lib/foo").unwrap().3 {
-            SubtreeShift::By(prefix) => assert_eq!(prefix, b"lib/foo"),
-            SubtreeShift::Auto => panic!("--subtree=<path> must select a prefixed shift"),
-        }
+        // `""` is git's automatic shift; anything else is the prefix to shift by.
+        assert_eq!(parse("subtree").unwrap().subtree_shift.map(Vec::from), Some(b"".to_vec()));
+        assert_eq!(parse("subtree=").unwrap().subtree_shift.map(Vec::from), Some(b"".to_vec()));
+        assert_eq!(
+            parse("subtree=lib/foo").unwrap().subtree_shift.map(Vec::from),
+            Some(b"lib/foo".to_vec())
+        );
     }
 
     #[test]
     fn parse_rename_score_matches_git() {
-        assert_eq!(parse_rename_score("50"), Some(0.5));
-        assert_eq!(parse_rename_score("50%"), Some(0.5));
-        assert_eq!(parse_rename_score("100"), Some(1.0));
-        assert_eq!(parse_rename_score("0"), Some(0.0));
+        // `parse_rename_score()` (diff.c) reads `<num>` as `num/scale` of
+        // `MAX_SCORE` (60000), where `scale` is 10 per digit seen — so a bare
+        // `100` is *ten* percent and only `100%` is a hundred. Measured against
+        // stock 2.55.0 on a 95%-similar rename: `-Xfind-renames=100` detects it
+        // and merges cleanly, `-Xfind-renames=100%` does not and conflicts.
+        let score = |v: &str| {
+            parse(&format!("find-renames={v}"))
+                .unwrap_or_else(|_| panic!("git accepts --find-renames={v}"))
+                .rename_score
+        };
+        assert_eq!(score("50"), 30000);
+        assert_eq!(score("50%"), 30000);
+        assert_eq!(score("100"), 6000);
+        assert_eq!(score("100%"), 60000);
+        assert_eq!(score("5.5"), 33000);
+        assert_eq!(score("0"), 0);
         // An empty/./% value reads as score 0 — verified against git 2.55.0:
         // `git merge-subtree --find-renames= …` is accepted, not "unknown option".
-        assert_eq!(parse_rename_score(""), Some(0.0));
-        assert_eq!(parse_rename_score("."), Some(0.0));
-        assert_eq!(parse_rename_score("%"), Some(0.0));
-        // git does NOT cap the score at 100 — `--find-renames=101` is accepted
-        // (verified against git 2.55.0), so the fraction can exceed 1.0.
-        assert_eq!(parse_rename_score("101"), Some(1.01));
-        // Non-numeric values are rejected (git: "error: unknown option").
-        assert_eq!(parse_rename_score("1x"), None);
-        assert_eq!(parse_rename_score("bogus"), None);
+        assert_eq!(score(""), 0);
+        assert_eq!(score("."), 0);
+        assert_eq!(score("%"), 0);
     }
 
     #[test]

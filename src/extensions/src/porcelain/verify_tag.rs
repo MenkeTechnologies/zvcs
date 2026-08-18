@@ -31,6 +31,14 @@
 //! Exit codes match git: 0 when every named tag verified, 1 when any failed,
 //! 129 for usage errors.
 //!
+//! `git tag -v` shares this checker through [`verify_resolved`] rather than
+//! reimplementing it, because the two commands differ only in how a name becomes an
+//! object id and in whether the payload is printed by default: `verify_tag()`
+//! (builtin/tag.c:142-159) resolves `refs/tags/<name>` alone and passes
+//! `GPG_VERIFY_VERBOSE`, while `cmd_verify_tag()` goes through `repo_get_oid()` and
+//! passes it only under `-v`. Everything from the object-type check downwards is
+//! byte-for-byte the same code.
+//!
 //! All three signature formats are covered, because the backend is chosen the
 //! way git chooses it — off the armor header, by `get_format_by_sig()` — and all
 //! three drivers live in [`crate::gitsig`]: `gpg` for `PGP SIGNATURE`/`PGP
@@ -218,7 +226,24 @@ fn verify_one(
         eprintln!("error: tag '{name}' not found.");
         return Ok(false);
     };
+    verify_resolved(repo, name, id, verbose, raw, format)
+}
 
+/// `gpg_verify_tag()` (tag.c:47-74) plus the `--format` rendering its two callers
+/// bolt on: everything from the object-type check downwards, for an object id the
+/// caller already has.
+///
+/// `git verify-tag` reaches this through `repo_get_oid()`, `git tag -v` through a
+/// `refs/tags/<name>` lookup — the two disagree about which names resolve, but not
+/// about a single byte of what follows, which is why the split is here.
+pub(crate) fn verify_resolved(
+    repo: &gix::Repository,
+    name: &str,
+    id: gix::hash::ObjectId,
+    verbose: bool,
+    raw: bool,
+    format: Option<&[Token]>,
+) -> Result<bool> {
     // git asks `oid_object_info` for the type first; a missing object yields no
     // type name at all, which its `error()` renders as `(null)`.
     let Ok(object) = repo.find_object(id) else {
@@ -287,7 +312,7 @@ fn verify_one(
 }
 
 /// One piece of a parsed `--format` string: literal bytes or a `%(...)` atom.
-enum Token {
+pub(crate) enum Token {
     Literal(Vec<u8>),
     Atom(String),
 }
@@ -297,7 +322,7 @@ enum Token {
 /// `%%` is a literal percent and a `%` that does not open an atom stays
 /// literal; an unterminated `%(` is git's "malformed format string", and the
 /// error carries the remainder git echoes back, starting at that `%(`.
-fn parse_format(fmt: &str) -> std::result::Result<Vec<Token>, String> {
+pub(crate) fn parse_format(fmt: &str) -> std::result::Result<Vec<Token>, String> {
     let bytes = fmt.as_bytes();
     let mut tokens = Vec::new();
     let mut literal: Vec<u8> = Vec::new();

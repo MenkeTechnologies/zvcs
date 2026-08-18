@@ -55,22 +55,40 @@
 //!   * `git tag --create-reflog …`     → force-create the tag's reflog, writing git's
 //!                                       `tag: tagging <abbrev> (<subject>, <date>)` line.
 //!   * `git tag -d <name>…`            → delete each tag.
+//!   * `git tag -s|-u <key-id> …`      → create a GPG/SSH-signed tag object through
+//!                                       [`crate::gitsig::Signer`] — the same backend
+//!                                       `git commit -S` goes through, so `openpgp`,
+//!                                       `x509` and `ssh` all work and the argument
+//!                                       vector is git's.
+//!   * `git tag -v <name>…`            → verify each tag, sharing
+//!                                       [`super::verify_tag`]'s checker so the two
+//!                                       commands cannot drift apart.
 //! ```
 //!
 //! Exit codes follow git: fatal errors exit 128, a bad object name for a filter
-//! exits 129, and a failed delete exits 1.
+//! exits 129, a usage error 129, and a failed delete or verify 1.
 //!
 //! Config read here: the multi-valued `tag.sort` (default listing order), and the
-//! two signing switches `tag.gpgSign` / `tag.forceSignAnnotated` — both of which
-//! ask for a GPG-signed tag object, so they are honored by refusing exactly as an
-//! explicit `-s` does rather than by quietly writing an unsigned tag.
+//! two signing switches `tag.gpgSign` / `tag.forceSignAnnotated`, whose precedence
+//! against the command line is exactly git's and is not intuitive — see the
+//! `opt.sign` resolution in [`tag`] and the `force_sign_annotate` application in
+//! [`create_tag`]'s caller. In short, measured against stock: `-u` beats
+//! `--no-sign` from either side, `-s`/`--no-sign` is ordinary last-one-wins,
+//! `tag.gpgSign` loses to `--no-sign`, and `tag.forceSignAnnotated` beats it while
+//! deliberately leaving an explicit `-a` unsigned.
 //!
-//! Genuinely not backed here, and refused rather than faked: cryptographic
-//! signing (`-s`, `-u`, `tag.gpgSign`, `tag.forceSignAnnotated`) and verification
-//! (`-v`), an editor-supplied message (`-a` with neither `-m` nor `-F`, `-e`),
-//! forced ANSI color (`--color`/`--color=always`), the git gecos identity
-//! fallback, and `--format` atoms outside the set handled by [`render_atom`]
-//! (`align`, `describe`, `upstream`, relative/custom dates, …).
+//! A tag's signature is **body text, not a header**: it is appended to the object
+//! after the message with no separating newline (builtin/tag.c:191), which is why
+//! the signed object is assembled by hand rather than through gix's
+//! `Tag::pgp_signature` field — that one writes an extra newline, which would be a
+//! different object id and a payload stock git cannot verify. Signing fails closed:
+//! no ref and no tag object are written unless a signature was produced.
+//!
+//! Genuinely not backed here, and refused rather than faked: an editor-supplied
+//! message (`-a`/`-s`/`tag.gpgSign` with neither `-m` nor `-F`, and `-e`), forced
+//! ANSI color (`--color`/`--color=always`), the git gecos identity fallback, and
+//! `--format` atoms outside the set handled by [`render_atom`] (`align`,
+//! `describe`, `upstream`, relative/custom dates, …).
 
 use anyhow::{anyhow, bail, Result};
 use std::cmp::Ordering;
@@ -81,7 +99,7 @@ use gix::bstr::{BStr, BString, ByteSlice};
 use gix::glob::wildmatch;
 use gix::glob::wildmatch::Mode;
 use gix::hash::ObjectId;
-use gix::objs::{CommitRef, Kind, TagRef};
+use gix::objs::{CommitRef, Kind, TagRef, Write as _};
 use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
 use gix::refs::{FullName, Target};
 
@@ -290,11 +308,32 @@ impl Filters {
     }
 }
 
+/// git's `cmdmode` for `tag`: the `OPT_CMDMODE` value of `-l`/`-d`/`-v`, or 0.
+///
+/// It is a single variable in C for a reason: the three are mutually exclusive
+/// (parse-options refuses a second, different one), it gates the `tag.gpgSign`
+/// default, and `(create_tag_object || force) && cmdmode` is git's usage error.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CmdMode {
+    /// No `-l`/`-d`/`-v` yet — creation mode unless something implies listing.
+    None,
+    List,
+    Delete,
+    Verify,
+}
+
 pub fn tag(args: &[String]) -> Result<ExitCode> {
-    let mut delete = false;
-    let mut list = false;
+    let mut cmdmode = CmdMode::None;
+    // The spelling `-l`/`-d`/`-v` was typed with, for the conflict message.
+    let mut cmdmode_spelling = "";
     let mut force = false;
     let mut annotate = false;
+    // `opt.sign`, an `OPT_BOOL` left at -1 until the command line speaks: unset
+    // (`None`) is what lets `tag.gpgSign` decide, which an eager `false` would not.
+    let mut sign: Option<bool> = None;
+    // `-u <key-id>` / `--local-user`; `set_signing_key()` on a non-NULL value.
+    let mut keyid: Option<String> = None;
+    let mut edit_flag = false;
     let mut ignore_case = false;
     let mut omit_empty = false;
     let mut create_reflog = false;
@@ -360,8 +399,21 @@ pub fn tag(args: &[String]) -> Result<ExitCode> {
             // (parse-options.c:1122): an exact match, never an abbreviation and
             // never with an `=<value>`, rendering `USAGE_FULL`.
             "--help-all" => return Ok(super::show_usage(USAGE_ALL)),
-            "-d" | "--delete" => delete = true,
-            "-l" | "--list" => list = true,
+            "-d" | "--delete" => {
+                if let Some(code) = set_cmdmode(&mut cmdmode, &mut cmdmode_spelling, CmdMode::Delete, typed) {
+                    return Ok(code);
+                }
+            }
+            "-l" | "--list" => {
+                if let Some(code) = set_cmdmode(&mut cmdmode, &mut cmdmode_spelling, CmdMode::List, typed) {
+                    return Ok(code);
+                }
+            }
+            "-v" | "--verify" => {
+                if let Some(code) = set_cmdmode(&mut cmdmode, &mut cmdmode_spelling, CmdMode::Verify, typed) {
+                    return Ok(code);
+                }
+            }
             "-f" | "--force" => force = true,
             "--no-force" => force = false,
             "-a" | "--annotate" => annotate = true,
@@ -374,11 +426,14 @@ pub fn tag(args: &[String]) -> Result<ExitCode> {
             "--no-create-reflog" => create_reflog = false,
             "--color" => want_color = true,
             "--no-color" => want_color = false,
-            // Negations of unsupported creation flags: the feature they toggle is
-            // off already, so git accepts these and does nothing. Turning an option
-            // off is never faking work, so unlike the positive `-s`/`-u`/`-e` these
-            // are honored silently.
-            "--no-sign" | "--no-local-user" | "--no-edit" => {}
+            // `OPT_BOOL`'s unset writes 0 — which is *not* the same as leaving
+            // `opt.sign` at -1, because a written 0 is what stops `tag.gpgSign`
+            // from turning signing back on.
+            "--no-sign" => sign = Some(false),
+            // `OPT_STRING`'s unset sets `keyid` back to NULL, so the
+            // `if (keyid) opt.sign = 1` below never fires and nothing is signed.
+            "--no-local-user" => keyid = None,
+            "--no-edit" => edit_flag = false,
             // `--column[=<opts>]` / `--no-column`: the list is laid out through the
             // same engine `git column` uses (see `list_tags`). `--no-column` is git's
             // "never", which leaves the default one-name-per-line output.
@@ -408,11 +463,9 @@ pub fn tag(args: &[String]) -> Result<ExitCode> {
             // (git's OPT_WITH/OPT_WITHOUT), same `LASTARG_DEFAULT` HEAD semantics.
             "--with" => contains = Some(optarg(args, &mut i)),
             "--without" => no_contains = Some(optarg(args, &mut i)),
-            "-s" | "--sign" | "-u" | "--local-user" => {
-                bail!("signed tags ({a}) are not supported")
-            }
-            "-v" | "--verify" => bail!("tag verification (-v) is not supported"),
-            "-e" | "--edit" => bail!("editing tag messages (-e) is not supported"),
+            "-s" | "--sign" => sign = Some(true),
+            "-u" | "--local-user" => keyid = Some(take_value(args, &mut i, a)?.to_string()),
+            "-e" | "--edit" => edit_flag = true,
             "-n" => lines = Some(1),
             "--points-at" => points_at = Some(optarg(args, &mut i)),
             "--contains" => contains = Some(optarg(args, &mut i)),
@@ -423,15 +476,15 @@ pub fn tag(args: &[String]) -> Result<ExitCode> {
                 if let Some(rest) = a.strip_prefix("--sort=") {
                     sorts.push(rest.to_string());
                 } else if a == "--sort" {
-                    sorts.push(take_value(args, &mut i, "sort")?.to_string());
+                    sorts.push(take_value(args, &mut i, a)?.to_string());
                 } else if let Some(rest) = a.strip_prefix("--format=") {
                     format = Some(rest.to_string());
                 } else if a == "--format" {
-                    format = Some(take_value(args, &mut i, "format")?.to_string());
+                    format = Some(take_value(args, &mut i, a)?.to_string());
                 } else if let Some(rest) = a.strip_prefix("--cleanup=") {
                     cleanup = Some(rest.to_string());
                 } else if a == "--cleanup" {
-                    cleanup = Some(take_value(args, &mut i, "cleanup")?.to_string());
+                    cleanup = Some(take_value(args, &mut i, a)?.to_string());
                 } else if let Some(rest) = a.strip_prefix("--column=") {
                     super::column::parseopt_column(&mut colopts, Some(rest), false)
                         .map_err(|m| anyhow!("{m}"))?;
@@ -457,19 +510,27 @@ pub fn tag(args: &[String]) -> Result<ExitCode> {
                 } else if let Some(rest) = a.strip_prefix("--trailer=") {
                     trailers.push(rest.to_string());
                 } else if a == "--trailer" {
-                    trailers.push(take_value(args, &mut i, "trailer")?.to_string());
+                    trailers.push(take_value(args, &mut i, a)?.to_string());
                 } else if let Some(rest) = a.strip_prefix("--message=") {
                     messages.push(rest.as_bytes().to_vec());
                 } else if a == "--message" || a == "-m" {
-                    messages.push(take_value(args, &mut i, "message")?.as_bytes().to_vec());
+                    messages.push(take_value(args, &mut i, a)?.as_bytes().to_vec());
                 } else if let Some(rest) = a.strip_prefix("-m") {
                     messages.push(rest.as_bytes().to_vec());
                 } else if let Some(rest) = a.strip_prefix("--file=") {
                     message_file = Some(rest.to_string());
                 } else if a == "--file" || a == "-F" {
-                    message_file = Some(take_value(args, &mut i, "file")?.to_string());
+                    message_file = Some(take_value(args, &mut i, a)?.to_string());
                 } else if let Some(rest) = a.strip_prefix("-F") {
                     message_file = Some(rest.to_string());
+                // `-u<key-id>` and `--local-user=<key-id>`: an `OPT_STRING` takes
+                // its value stuck to the short name or after the `=`, and an empty
+                // one is a key git passes to gpg unchanged (which answers
+                // `gpg: skipped "": Invalid user ID`) rather than a missing one.
+                } else if let Some(rest) = a.strip_prefix("--local-user=") {
+                    keyid = Some(rest.to_string());
+                } else if let Some(rest) = a.strip_prefix("-u") {
+                    keyid = Some(rest.to_string());
                 // A long name no table entry claims is `parse_options()`' own refusal
                 // — the `error:` line and the block, both on stderr, exit 129 — not a
                 // gap in this port. It is decided against the table rather than by
@@ -492,34 +553,48 @@ pub fn tag(args: &[String]) -> Result<ExitCode> {
                     lines = Some(n);
                 } else if a.len() > 2
                     && !a.starts_with("--")
-                    && a[1..2].chars().all(|c| "fadli".contains(c))
+                    && a[1..2].chars().all(|c| "fadlisev".contains(c))
                 {
                     // Bundled short flags, e.g. `-fam <msg>` = `-f -a -m <msg>`.
                     // git's parse-options treats each char as its own option; a
-                    // value-taking one (`-m`/`-F`/`-n`) consumes the rest of the
-                    // cluster, or the next argv element when it ends the cluster.
+                    // value-taking one (`-m`/`-F`/`-u`/`-n`) consumes the rest of
+                    // the cluster, or the next argv element when it ends the
+                    // cluster.
                     let cluster: Vec<char> = a[1..].chars().collect();
                     let mut ci = 0;
                     while ci < cluster.len() {
+                        // The one-character spelling parse-options would name in a
+                        // cmdmode conflict, since only the cluster knows it.
+                        let short = format!("-{}", cluster[ci]);
                         match cluster[ci] {
                             'f' => force = true,
                             'a' => annotate = true,
-                            'd' => delete = true,
-                            'l' => list = true,
                             'i' => ignore_case = true,
-                            's' | 'u' => bail!("signed tags (-{}) are not supported", cluster[ci]),
-                            'e' => bail!("editing tag messages (-e) is not supported"),
-                            'v' => bail!("tag verification (-v) is not supported"),
-                            c @ ('m' | 'F' | 'n') => {
+                            's' => sign = Some(true),
+                            'e' => edit_flag = true,
+                            'd' | 'l' | 'v' => {
+                                let mode = match cluster[ci] {
+                                    'd' => CmdMode::Delete,
+                                    'l' => CmdMode::List,
+                                    _ => CmdMode::Verify,
+                                };
+                                if let Some(code) =
+                                    set_cmdmode(&mut cmdmode, &mut cmdmode_spelling, mode, &short)
+                                {
+                                    return Ok(code);
+                                }
+                            }
+                            c @ ('m' | 'F' | 'u' | 'n') => {
                                 let rest: String = cluster[ci + 1..].iter().collect();
                                 let val = if rest.is_empty() {
-                                    take_value(args, &mut i, "message")?.to_string()
+                                    take_value(args, &mut i, &short)?.to_string()
                                 } else {
                                     rest
                                 };
                                 match c {
                                     'm' => messages.push(val.into_bytes()),
                                     'F' => message_file = Some(val),
+                                    'u' => keyid = Some(val),
                                     _ => {
                                         lines = Some(if val.is_empty() {
                                             1
@@ -542,11 +617,16 @@ pub fn tag(args: &[String]) -> Result<ExitCode> {
         }
     }
 
-    // Without any `--sort` on the CLI, git falls back to the multi-valued
-    // `tag.sort` config — each value adds a sort level — validated below exactly
-    // like a CLI `--sort`.
-    if sorts.is_empty() && !sort_negated {
-        if let Ok(repo) = gix::discover(".") {
+    // `git_tag_config()` (builtin/tag.c:210-237) runs before `parse_options()`, so
+    // every key it reads is in hand by the time the command line is weighed against
+    // it. `tag.gpgSign` is `config_sign_tag`, unspecified until it appears.
+    let mut config_sign_tag: Option<bool> = None;
+    let mut force_sign_annotate = false;
+    if let Ok(repo) = gix::discover(".") {
+        // Without any `--sort` on the CLI, git falls back to the multi-valued
+        // `tag.sort` config — each value adds a sort level — validated below
+        // exactly like a CLI `--sort`.
+        if sorts.is_empty() && !sort_negated {
             sorts = repo
                 .config_snapshot()
                 .plumbing()
@@ -556,6 +636,57 @@ pub fn tag(args: &[String]) -> Result<ExitCode> {
                 .map(|v| v.to_string())
                 .collect();
         }
+        config_sign_tag = repo.config_snapshot().boolean("tag.gpgSign");
+        force_sign_annotate =
+            repo.config_snapshot().boolean("tag.forceSignAnnotated") == Some(true);
+    }
+
+    // ```c
+    // if (!cmdmode) {
+    //         if (argc == 0)                                    cmdmode = 'l';
+    //         else if (filter.with_commit || … || filter.lines != -1) cmdmode = 'l';
+    // }
+    // ```
+    // (builtin/tag.c:559-566). The filters are tested as *given*, before any of
+    // them is resolved against the odb, so this reads the raw operands.
+    if cmdmode == CmdMode::None
+        && (positionals.is_empty()
+            || lines.is_some()
+            || contains.is_some()
+            || no_contains.is_some()
+            || merged.is_some()
+            || no_merged.is_some()
+            || points_at.is_some())
+    {
+        cmdmode = CmdMode::List;
+    }
+
+    // ```c
+    // if (opt.sign == -1)   opt.sign = cmdmode ? 0 : config_sign_tag > 0;
+    // if (keyid) { opt.sign = 1; set_signing_key(keyid); }
+    // create_tag_object = (opt.sign || annotate || msg.given || msgfile ||
+    //                      edit_flag || trailer_args.nr);
+    // if ((create_tag_object || force) && (cmdmode != 0))
+    //         usage_with_options(git_tag_usage, options);
+    // ```
+    // (builtin/tag.c:574-585). Two consequences worth stating, both measured
+    // against stock: `-u <key>` turns signing on *unconditionally*, so it beats a
+    // `--no-sign` on either side of it; and `tag.gpgSign` is consulted only when
+    // no mode flag is in play, which is why `git tag -l` in a repository that sets
+    // it still just lists.
+    let mut sign = sign.unwrap_or(cmdmode == CmdMode::None && config_sign_tag == Some(true));
+    if keyid.is_some() {
+        sign = true;
+    }
+    let create_tag_object = sign
+        || annotate
+        || !messages.is_empty()
+        || message_file.is_some()
+        || edit_flag
+        || !trailers.is_empty();
+    if (create_tag_object || force) && cmdmode != CmdMode::None {
+        eprint!("{USAGE}");
+        return Ok(ExitCode::from(129));
     }
 
     // git validates every `--sort` field name while parsing options, dying on the
@@ -601,10 +732,6 @@ pub fn tag(args: &[String]) -> Result<ExitCode> {
         return Ok(code);
     }
 
-    if delete {
-        return delete_tags(&repo, &positionals);
-    }
-
     // Resolve the listing filters now that the object database is open. Each
     // option keeps its own `parse_options()` callback's diagnostic and status:
     // `--points-at` is `parse_opt_object_name` (no odb lookup at all, so an
@@ -641,9 +768,9 @@ pub fn tag(args: &[String]) -> Result<ExitCode> {
         }
     }
 
-    // git switches to listing when there is nothing to create, when a listing-only
-    // option (`-l`, `-n`) was given, or when a listing filter was given.
-    if list || lines.is_some() || filters.any() || positionals.is_empty() {
+    // The mode `cmdmode` settled on above, which already folds in the listing git
+    // infers from an empty argv, a `-n`, or any filter.
+    if cmdmode == CmdMode::List {
         return list_tags(
             &repo,
             &positionals,
@@ -657,38 +784,202 @@ pub fn tag(args: &[String]) -> Result<ExitCode> {
         );
     }
 
-    // git's `create_tag_object`: anything that fills a message body — `-a`, `-m`,
-    // `-F` or `--trailer` — turns the lightweight ref into a real tag object.
-    let annotate_given = annotate;
-    let annotate = annotate || !messages.is_empty() || message_file.is_some() || !trailers.is_empty();
+    // `only_in_list` (builtin/tag.c:610-623): a listing-only option that survived
+    // to here means the mode is `-d` or `-v`, and git names the *first* such option
+    // in its own fixed order rather than the order they were typed in.
+    let only_in_list = if lines.is_some() {
+        Some("-n")
+    } else if contains.is_some() {
+        Some("--contains")
+    } else if no_contains.is_some() {
+        Some("--no-contains")
+    } else if points_at.is_some() {
+        Some("--points-at")
+    } else if merged.is_some() {
+        Some("--merged")
+    } else if no_merged.is_some() {
+        Some("--no-merged")
+    } else {
+        None
+    };
+    if let Some(name) = only_in_list {
+        return fatal(&format!("the '{name}' option is only allowed in list mode"));
+    }
 
-    // Both signing config keys ask for a GPG-signed tag object. `tag.gpgSign`
-    // sets `opt.sign` before options are parsed (so it also implies `annotate`);
-    // `tag.forceSignAnnotated` signs a tag object only when `-a` was *not* spelled
-    // out. Neither can be honored without a signing implementation, so they take
-    // the same refusal an explicit `-s` gets rather than silently producing an
-    // unsigned tag.
-    if repo.config_snapshot().boolean("tag.gpgSign") == Some(true) {
-        bail!("signed tags (tag.gpgSign) are not supported")
+    if cmdmode == CmdMode::Delete {
+        return delete_tags(&repo, &positionals);
     }
-    if annotate
-        && !annotate_given
-        && repo.config_snapshot().boolean("tag.forceSignAnnotated") == Some(true)
-    {
-        bail!("signed tags (tag.forceSignAnnotated) are not supported")
+    if cmdmode == CmdMode::Verify {
+        return verify_tags(&repo, &positionals, format.as_deref());
     }
+
+    // ```c
+    // if (create_tag_object) {
+    //         if (force_sign_annotate && !annotate)  opt.sign = 1;
+    // ```
+    // (builtin/tag.c:683-685). The `!annotate` is the bare `-a` flag, *not*
+    // `create_tag_object`, so `tag.forceSignAnnotated` signs the tag `-m` alone
+    // implied and pointedly leaves the one `-a` asked for unsigned — and, because
+    // this runs after the command line has been folded in, it also overrides an
+    // explicit `--no-sign`. Both are stock behavior, measured, not guesses.
+    if create_tag_object && force_sign_annotate && !annotate {
+        sign = true;
+    }
+
+    // `get_signing_key()`'s `configured_signing_key` is `set_signing_key(keyid)`
+    // when `-u` was given and `user.signingKey` otherwise, which is exactly what
+    // overwriting the resolved signer's key expresses.
+    let signer = sign.then(|| {
+        let mut signer = crate::gitsig::Signer::resolve(&repo);
+        if let Some(key) = keyid {
+            signer.key = Some(key);
+        }
+        signer
+    });
 
     create_tag(
         &repo,
         &positionals,
         force,
-        annotate,
+        create_tag_object,
+        edit_flag,
         &messages,
         message_file.as_deref(),
         cleanup.as_deref(),
         &trailers,
         create_reflog,
+        signer.as_ref(),
     )
+}
+
+/// The three lines and the exit code that follow a signature git could not
+/// produce, in order (builtin/tag.c:269-278 and 378-383):
+///
+/// ```c
+/// if (sign && do_sign(buf, …) < 0)   return error(_("unable to sign the tag"));
+/// …
+/// if (build_tag_object(buf, opt->sign, result) < 0) {
+///         if (path) fprintf(stderr, _("The tag message has been left in %s\n"), path);
+///         exit(128);
+/// }
+/// ```
+///
+/// `path` is non-NULL for every `create_tag_object` call, so the second line is
+/// printed even when nothing was ever written to `TAG_EDITMSG` — a `-m` message
+/// with no `--trailer` and no editor never creates the file. That is stock's own
+/// behavior, verified against `git tag -u NOPE -m m` (the message names the file,
+/// and the file does not exist), and it is reproduced rather than corrected.
+///
+/// The backend's own report has already reached stderr in every case; what is left
+/// is the `error: ` prefix `sign_buffer` did not add, and the two lines above.
+/// A `die()` inside `get_signing_key()` (an ssh signer with neither
+/// `user.signingKey` nor `gpg.ssh.defaultKeyCommand`) ends the command on the spot,
+/// so it gets neither.
+fn sign_failed(repo: &gix::Repository, e: crate::gitsig::SignFailure) -> ExitCode {
+    match e {
+        crate::gitsig::SignFailure::Silent => return ExitCode::from(128),
+        crate::gitsig::SignFailure::Fatal(m) => {
+            eprintln!("{}", crate::gitsig::report("fatal: ", &m));
+            return ExitCode::from(128);
+        }
+        crate::gitsig::SignFailure::Error(m) => {
+            eprintln!("{}", crate::gitsig::report("error: ", &m));
+        }
+    }
+    eprintln!("error: unable to sign the tag");
+    // `repo_git_path(the_repository, "TAG_EDITMSG")`. `setup_git_directory()` has
+    // already moved to the top of the work tree, so an ordinary repository names
+    // its git directory `.git` however deep the command was run — which is why this
+    // cannot simply print `repo.git_dir()`.
+    let git_dir = repo.git_dir();
+    let shown = match repo.workdir() {
+        Some(top) if git_dir == top.join(".git") => std::path::Path::new(".git"),
+        _ => git_dir,
+    };
+    eprintln!(
+        "The tag message has been left in {}",
+        shown.join("TAG_EDITMSG").display()
+    );
+    ExitCode::from(128)
+}
+
+/// `OPT_CMDMODE`'s duplicate handling (parse-options.c:404-423): a second, *different*
+/// mode is `error(_("options '%s' and '%s' cannot be used together"))` naming the
+/// option just seen first and the one already recorded second, then exit 129 with no
+/// usage block. Repeating the same mode is accepted silently.
+fn set_cmdmode(
+    cmdmode: &mut CmdMode,
+    spelling: &mut &'static str,
+    want: CmdMode,
+    typed: &str,
+) -> Option<ExitCode> {
+    if *cmdmode != CmdMode::None && *cmdmode != want {
+        eprintln!("error: options '{typed}' and '{spelling}' cannot be used together");
+        return Some(ExitCode::from(129));
+    }
+    *cmdmode = want;
+    // The spelling is needed only to name this option in a *later* conflict, and
+    // the two forms of each are fixed, so no borrow of `args` has to outlive here.
+    *spelling = match (want, typed.starts_with("--")) {
+        (CmdMode::List, false) => "-l",
+        (CmdMode::List, true) => "--list",
+        (CmdMode::Delete, false) => "-d",
+        (CmdMode::Delete, true) => "--delete",
+        (CmdMode::Verify, false) => "-v",
+        (CmdMode::Verify, true) => "--verify",
+        (CmdMode::None, _) => "",
+    };
+    None
+}
+
+/// `cmdmode == 'v'` (builtin/tag.c:628-633): verify each name, through
+/// `for_each_tag_name()` — which resolves `refs/tags/<name>` and nothing else, so
+/// an object id or `HEAD` is "not found" here even though `git verify-tag` takes
+/// both.
+///
+/// The per-name callback is `verify_tag()` (builtin/tag.c:142-159), whose flags are
+/// `GPG_VERIFY_VERBOSE` — the tag payload goes to stdout, unlike bare
+/// `git verify-tag` — replaced outright by `GPG_VERIFY_OMIT_STATUS` when
+/// `--format` is given, which is why a formatted verify prints neither the payload
+/// nor gpg's report.
+fn verify_tags(
+    repo: &gix::Repository,
+    names: &[&str],
+    format: Option<&str>,
+) -> Result<ExitCode> {
+    let tokens = match format.map(super::verify_tag::parse_format).transpose() {
+        Ok(t) => t,
+        Err(unterminated) => {
+            eprintln!("error: malformed format string {unterminated}");
+            eprint!("{USAGE}");
+            return Ok(ExitCode::from(129));
+        }
+    };
+    let verbose = tokens.is_none();
+
+    let mut had_error = false;
+    for name in names {
+        // `refs_read_ref(…, "refs/tags/<name>")`, so a missing ref is reported and
+        // the remaining names are still tried.
+        let id = repo
+            .try_find_reference(&format!("refs/tags/{name}"))
+            .ok()
+            .flatten()
+            .and_then(|r| r.try_id().map(|id| id.detach()));
+        let Some(id) = id else {
+            eprintln!("error: tag '{name}' not found.");
+            had_error = true;
+            continue;
+        };
+        if !super::verify_tag::verify_resolved(repo, name, id, verbose, false, tokens.as_deref())? {
+            had_error = true;
+        }
+    }
+    Ok(if had_error {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    })
 }
 
 /// git's `--contains`/`--merged`/`--points-at` use `PARSE_OPT_LASTARG_DEFAULT`: a
@@ -704,11 +995,27 @@ fn optarg(args: &[String], i: &mut usize) -> String {
     }
 }
 
-/// Consume the value of a separated long/short option, or explain what is missing.
+/// Consume the value of a separated long/short option, or report the way
+/// `parse_options()` does when the value is missing.
+///
+/// ```c
+/// if (!p->argc)
+///         return error(_("%s requires a value"), optnamearg(opt, NULL, flags));
+/// ```
+/// (parse-options.c:126-127). `optnamearg()` renders a long option as
+/// ``option `name'`` and a short one as ``switch `c'``, and the `error()` return
+/// takes `parse_options()` straight to `exit(129)` — with **no** usage block after
+/// it, unlike an unknown option. `flag` is therefore the spelling as typed, dashes
+/// and all, which is the only thing that distinguishes the two wordings.
 fn take_value<'a>(args: &'a [String], i: &mut usize, flag: &str) -> Result<&'a str> {
-    let v = args
-        .get(*i)
-        .ok_or_else(|| anyhow!("option `{flag}' requires a value"))?;
+    let Some(v) = args.get(*i) else {
+        let (kind, name) = match flag.strip_prefix("--") {
+            Some(long) => ("option", long),
+            None => ("switch", flag.trim_start_matches('-')),
+        };
+        eprintln!("error: {kind} `{name}' requires a value");
+        return Err(anyhow::Error::new(crate::fatal::Silent(129)));
+    };
     *i += 1;
     Ok(v.as_str())
 }
@@ -1665,11 +1972,13 @@ fn create_tag(
     positionals: &[&str],
     force: bool,
     annotate: bool,
+    edit_flag: bool,
     messages: &[Vec<u8>],
     message_file: Option<&str>,
     cleanup: Option<&str>,
     trailers: &[String],
     create_reflog: bool,
+    signer: Option<&crate::gitsig::Signer>,
 ) -> Result<ExitCode> {
     if positionals.len() > 2 {
         return fatal("too many arguments");
@@ -1723,10 +2032,15 @@ fn create_tag(
         if repo.find_header(target).is_err() {
             return fatal("bad object type.");
         }
+        // `should_edit = opt->use_editor || !opt->message_given` (builtin/tag.c:325):
+        // `-e` opens the editor even on a message that was given.
+        if edit_flag {
+            bail!("`-e` opens the tag message in an editor, which is not supported")
+        }
         let raw = match message_file {
             Some(path) => read_message_file(path)?,
             None if messages.is_empty() => {
-                bail!("`-a` without `-m`/`-F` needs an editor, which is not supported")
+                bail!("a tag message needs `-m`/`-F`; the editor git would open is not supported")
             }
             None => match mode {
                 // git's `-m` under `verbatim` uses each chunk literally.
@@ -1781,9 +2095,35 @@ fn create_tag(
             name: BString::from(name.as_bytes().to_vec()),
             tagger: Some(tagger),
             message: BString::from(message),
+            // Never this field: gix writes a newline between the message and the
+            // signature, and git writes none — `do_sign()` ends with a bare
+            // `strbuf_addbuf(buffer, &sig)` onto a buffer the message already
+            // terminated. One extra byte is a different object id and a payload
+            // stock git cannot verify, so the block is appended by hand below.
             pgp_signature: None,
         };
-        repo.write_object(&object)?.detach()
+        match signer {
+            None => repo.write_object(&object)?.detach(),
+            Some(signer) => {
+                // `build_tag_object()` (builtin/tag.c:269-278): the buffer that is
+                // signed is the finished object minus the signature, and the
+                // signature is appended to it — a tag's signature is body text, not
+                // a header, which is what makes the payload here byte-identical to
+                // the one `parse_signature()` recovers on the way back in.
+                let mut buf = Vec::new();
+                gix::objs::WriteTo::write_to(&object, &mut buf)?;
+                match signer.sign(&buf) {
+                    Ok(sig) => buf.extend_from_slice(&sig),
+                    Err(e) => return Ok(sign_failed(repo, e)),
+                }
+                // `odb_write_object_ext()`'s failure is `error(_("unable to write
+                // tag file"))`, which `create_tag` then turns into the same
+                // exit-128 pair a signing failure gets.
+                repo.objects
+                    .write_buf(Kind::Tag, &buf)
+                    .map_err(|_| anyhow!("unable to write tag file"))?
+            }
+        }
     } else {
         target
     };

@@ -16,13 +16,20 @@
 //!     `--index`/`--cached` (stage the result into the index; `--cached` skips the
 //!     worktree write — see below),
 //!     `--exclude=<glob>`/`--include=<glob>` (path filtering via wildmatch),
-//!     `-v`/`--verbose` (the `Checking patch`/`Applied patch` progress on
-//!     stderr), `--reject` (partial apply, `*.rej` files, exit 1),
-//!     `--allow-overlap`/`--unsafe-paths` (no-op as git is for in-tree paths),
+//!     `-v`/`--verbose` (the `Checking patch`/`Applied patch`/`Hunk #<n> succeeded`
+//!     progress on stderr), `--reject` (partial apply, `*.rej` files, exit 1),
+//!     `-N`/`--intent-to-add` (see below), `-C<n>` (see below),
+//!     `--unsafe-paths` (see below), `--inaccurate-eof` (see below),
+//!     `--build-fake-ancestor=<file>` (see below),
+//!     `--allow-overlap` (accepted; hunks are placed sequentially here, so there is
+//!     nothing for it to relax),
 //!     `--binary`/`--allow-binary-replacement` (accepted, no-op as in modern
-//!     git), `-q`/`--quiet`, `--whitespace=warn|nowarn`, `--recount`,
-//!     `--directory=<root>`, `--`, and the `--no-` form of each of git's
-//!     negatable options
+//!     git), `-v`/`-q` (git's `OPT__VERBOSITY` counter, so `-v -q` is silent and
+//!     `-q -v` is verbose), `--whitespace=<action>` (every action but `fix` under a
+//!     non-default `core.whitespace` — see below), `--recount`,
+//!     `--directory=<root>` (normalised as `strbuf_normalize_path()` does, so a root
+//!     that climbs above the worktree is a usage error before any patch is opened),
+//!     `--`, and the `--no-` form of each of git's negatable options
 //!   * `-3`/`--3way` and its `--ours`/`--theirs`/`--union` variants — see below
 //!   * usage errors: unknown option/switch (git's own usage block on stderr,
 //!     exit 129), a missing or non-integer option value, an unrecognised
@@ -32,21 +39,31 @@
 //!   * patch kinds: modification, creation, deletion, rename, mode change, and
 //!     symlink blobs; git-style (`diff --git`) and traditional `---`/`+++` diffs
 //!
-//! Faithful to git on the write side: the whole patch is validated before any
-//! file is touched (atomicity), targets are removed and re-created rather than
-//! rewritten in place (so the resulting mode is the patch's mode under the
-//! process umask, not the old file's), leading directories are created for new
-//! paths, and directories emptied by a deletion or rename are pruned.
+//! Faithful to git on the write side: every patch is checked before any file is
+//! touched (atomicity), `write_out_results()`'s two passes are kept — every removal
+//! happens before any creation, so a swap-rename cannot clobber its own pre-image —
+//! targets are removed and re-created rather than rewritten in place (so the
+//! resulting mode is the patch's mode under the process umask, not the old file's),
+//! leading directories are created for new paths, and directories emptied by a
+//! deletion or rename are pruned.
+//!
+//! The report modes (`--stat`, `--numstat`, `--summary`) print *after* all of that,
+//! where apply.c prints them (apply.c:4993): every earlier failure reaches them
+//! through a `goto end` that skips them, so a patch that does not apply produces no
+//! report at all. They also turn applying off unless `--apply` (git's `force_apply`)
+//! says otherwise — including over `--reject`, which sets `state->apply` four lines
+//! earlier and so loses to them. `--no-apply` is `OPT_BOOL` on that same
+//! `force_apply`, which starts at zero, so on its own it changes nothing.
 //!
 //! Argument parsing covers git's whole `apply` option table, because git's own
 //! ordering makes that observable: it finishes parsing, runs its usage-level
-//! validations, *then* opens the patch files, *then* parses them. A flag this
-//! port cannot honour is therefore recorded during parsing and only reported
-//! once the input is known to contain at least one patch — the first moment
-//! ignoring it could change a result. Until that moment git has not consulted it
-//! either, so `git apply --stat missing-file` and `git apply --3way not-a-patch`
-//! report what git reports (`can't open patch` / `No valid patches in input`,
-//! exit 128) rather than a premature unsupported-flag error.
+//! validations, *then* opens the patch files, *then* parses them. The one flag this
+//! port cannot honour (`--whitespace=fix` under a non-default `core.whitespace`) is
+//! therefore reported only once the input is known to contain at least one patch —
+//! the first moment ignoring it could change a result. Until then git has not
+//! consulted it either, so `git apply --stat missing-file` and `git apply --3way
+//! not-a-patch` report what git reports (`can't open patch` / `No valid patches in
+//! input`, exit 128) rather than a premature unsupported-flag error.
 //!
 //! `--index`/`--cached` update the index (`git apply`'s `update_index` path,
 //! served natively through the vendored `gix-index` writer, so tools on PATH — and
@@ -61,11 +78,26 @@
 //! gate, refuses (`does not match index`) when the worktree file's content differs
 //! from the index blob; git would instead check the file out when it is missing,
 //! which this port floors by refusing rather than silently diverging. `--cached`
-//! skips every worktree read, check, and write. Not implemented under these
-//! (they still `bail!`/floor honestly): binary patches to the index (the binary
-//! path bails before any index touch), `--reject` combined with `--index`/`--cached`,
-//! and the executable-bit of a plain modification whose diff carries no `index`
-//! mode line and whose pre-image is not in the index.
+//! skips every worktree read, check, and write. `--reject` composes with both, as it
+//! does in git: the pre-image still comes from the index, a cleanly applied patch is
+//! still staged, and a run that rejected *anything* rolls the whole index update
+//! back — `apply_patch()` returns -1 and `apply_all_patches()` never reaches
+//! `write_locked_index()` (apply.c:5129, :5173) — while everything already written to
+//! the worktree stays. One floor is left under these: the executable bit of a plain
+//! modification whose diff carries no `index` mode line and whose pre-image is not in
+//! the index.
+//!
+//! `-N`/`--intent-to-add` is git's `state->ita_only`. The worktree is written as
+//! usual, but the index is touched *only* for the paths the patch creates, and only
+//! with a placeholder: the empty blob, a zeroed stat, and `CE_INTENT_TO_ADD`
+//! (`add_index_file`, apply.c:4443-4460, and `set_object_name_for_intent_to_add_entry`,
+//! read-cache.c:704), so the addition still reads as unstaged. A deletion deliberately
+//! leaves its entry standing (apply.c:4431), a modification stages nothing, and
+//! `check_apply_state()` cancels the flag outright — silently, no error — when
+//! `--index`/`--cached` is also given or when there is no repository (apply.c:178).
+//! It works alongside `--reject`, where a file whose hunks were only partly rejected
+//! is still created — but nothing is *staged* by a run that rejected anything, since
+//! that run never reaches `write_locked_index()` at all.
 //!
 //! `-3`/`--3way` is `try_threeway()`: the patch is replayed onto the blob its
 //! `index <old>..` line names, that post-image is merged into the current
@@ -80,13 +112,52 @@
 //! collides with an existing file — a creation therefore takes the direct route
 //! and reports what git reports without `--3way`.
 //!
+//! Path validation is [`check_unsafe_path`] (apply.c:4036), decided per patch during
+//! the check and reported as `error: invalid path '<name>'` with exit 128 for the
+//! whole run. It asks [`verify_path`] (read-cache.c:839), so it refuses more than an
+//! escape from the worktree: an empty name, a leading or doubled or trailing `/`, and
+//! any `.`, `..` or `.git` component — `.git/hooks/pre-commit` never leaves the
+//! working tree and is refused all the same. `--unsafe-paths` waives the gate, and
+//! `check_apply_state()` then cancels the flag again under `--index`/`--cached`
+//! (and so under `--3way`), silently, at apply.c:180. Two things survive the waiver
+//! because git puts them elsewhere: `check_preimage()` runs first, so a missing
+//! out-of-tree file is reported as missing rather than as an invalid path, and
+//! `add_index_entry()` re-checks every name on the way into the index
+//! (read-cache.c:1287), which is where `-N --unsafe-paths` on an out-of-tree creation
+//! ends — with the file written and the index update rolled back, as in git.
+//!
+//! Not reproduced inside `verify_path`: the `protect_hfs`/`protect_ntfs` arms, which
+//! also refuse the Unicode- and 8.3-obfuscated spellings of `.git`
+//! (`is_hfs_dotgit()`, `is_ntfs_dotgit()`). The Windows-only `has_dos_drive_prefix()`
+//! and `is_valid_path()` gates are compiled out on POSIX anyway
+//! (git-compat-util.h:224-229, :265).
+//!
+//! `--build-fake-ancestor=<file>` is `build_fake_ancestor()`: an index written to that
+//! path holding, for every patch that is not a creation, the blob its `index <old>..`
+//! line points at (resolved from however abbreviated a prefix git wrote), or — for a
+//! patch that adds and deletes no line — the path's current index entry. A patch that
+//! offers neither ends the run with `sha1 information is lacking or useless (<name>).`
+//! Naming a fake ancestor turns applying off like the report modes do. The entries
+//! carry a zeroed stat rather than the one `refresh_cache_entry()` fills in; nothing
+//! that reads a fake ancestor consults it.
+//!
+//! `--inaccurate-eof` is the block at apply.c:3099-3106: when a hunk's pre- and
+//! post-image both end in a newline, both lose it. The pre-image's last line then
+//! matches a file that has no final newline — as a prefix, which is what git's
+//! flat-buffer `memcmp` over the shortened length amounts to — and the post-image is
+//! written without one, so the flag is observable even on a patch that would otherwise
+//! apply cleanly.
+//!
 //! Not implemented — these `bail!` rather than produce plausible-looking wrong
-//! results: `-N`/`--intent-to-add` (index mutation with the intent-to-add flag and
-//! empty-blob placeholder, git's `ita_only` path),
-//! `--build-fake-ancestor` (writes a temporary
-//! index),
-//! `--inaccurate-eof` (subtle trailing-newline
-//! semantics), copy patches, and non-UTF-8 paths.
+//! results: copy patches and non-UTF-8 paths.
+//!
+//! Two known divergences that are not about options. Several patch files on one
+//! command line are read into a single buffer here, while `apply_all_patches()` runs
+//! `apply_patch()` once per file, so git's atomicity is per *file*: with
+//! `git apply good.patch bad.patch`, git writes `good.patch`'s result and then fails,
+//! and this port writes nothing. And `git_header_names` accepts a `diff --git` line
+//! whose two names differ only by a doubled slash (`a/sub//x b/sub//x`), where git's
+//! `git_header_name()` refuses it with `bad git-diff - inconsistent new filename`.
 //!
 //! Running below the worktree root behaves as git does. `setup_git_directory()`
 //! leaves the command at the top of the worktree and hands it the invocation
@@ -101,7 +172,12 @@
 //! pre-image (`delta`, `patch_delta()`'s copy/insert opcodes). Both ends are verified
 //! against the ids the `index` line names, so a payload meets the pre-image it was made
 //! against or the patch is refused — which also means a patch without a full index line
-//! is refused, as git refuses it.
+//! is refused, as git refuses it. `apply_binary()`'s two shortcuts are here as well: a
+//! null post-image id is a deletion and produces no content at all, and a post-image the
+//! object store already holds is read straight out of it rather than rebuilt. `-R`
+//! swaps the pair of ids and consumes the second (reverse) payload. `--reject` makes no
+//! difference to any of it — a binary patch has no fragments to reject one at a time, so
+//! it either lands whole or is rejected whole, with no `*.rej` file written for it.
 //!
 //! `--ignore-whitespace`/`--ignore-space-change` (both are the same flag in git,
 //! `ws_ignore_action = ignore_ws_change`) relax the search: a hunk that does not
@@ -113,9 +189,17 @@
 //! the file rather than the patch, so the file's own indentation survives and only
 //! added lines come out of the patch.
 //!
-//! `-C<n>` reduces context the way `apply_one_fragment()` does: a hunk that does not
-//! land as written sheds one context line from whichever end has more of them and is
-//! retried, down to the `<n>` floor.
+//! `-C<n>` reduces context the way `apply_one_fragment()` does, and — since `--reject`
+//! is a mode of that same loop rather than a path of its own — it reduces context
+//! there too. `state->p_context` is `UINT_MAX` by default, so nothing is reduced
+//! unless the flag asks: a hunk that does not land as written first drops its
+//! begin/end anchoring, then sheds one context line from whichever end has more of
+//! them (both ends when they are equal) and is retried, down to the `<n>` floor. Each
+//! leading line dropped also moves git's `pos` a line *back*, which is why the
+//! `Hunk #<n> succeeded at <l> (offset <k> lines).` it prints can overstate the
+//! distance, and why a `pos` that has gone negative restarts the search at the end of
+//! the file (apply.c:2847-2853). `Context reduced to (<a>/<b>) to apply fragment at
+//! <l>` follows it, and is printed without `-v`.
 //!
 //! `--whitespace=fix` is honoured for git's default rule set (`blank-at-eol`,
 //! `blank-at-eof`, `space-before-tab`): the trailing run goes and the spaces in front of
@@ -146,9 +230,10 @@
 //!
 //! Config: `apply.whitespace` is read as the default `--whitespace` action, the
 //! same as git — the command line overrides it. A `warn`/`nowarn` default is the
-//! same no-op; a `fix`/`strip`/`error`/`error-all` default is deferred to the
-//! unsupported-flag path (as those byte-altering actions are unimplemented); an
-//! invalid value there is fatal (128) at startup, before the patch is opened and
+//! same no-op; a `fix` default is honoured for git's default rule set and refused
+//! beyond it, exactly as the flag is; an invalid value there is fatal (128) at startup
+//! (and `--no-whitespace`, which trips `BUG_ON_OPT_NEG` and aborts git with exit 134,
+//! is accepted here as a no-op instead), before the patch is opened and
 //! ahead of any `--whitespace` on the command line, matching git's config parse
 //! order. `apply.ignoreWhitespace` is read straight after it, as git does: `change`
 //! turns the relaxed match on, `no`/`false`/`never`/`none` off, and any other value
@@ -313,35 +398,8 @@ pub(super) const USAGE_ALL: &str = r#"usage: git apply [<options>] [<patch>...]
 
 "#;
 
-// Reasons quoted back in the deferred unsupported-flag error.
-const R_INDEX: &str = "index mutation is not implemented";
-const R_CONTEXT: &str = "context reduction is not implemented";
+// The reason quoted back by the one flag left that this port cannot honour.
 const R_WS: &str = "whitespace fixing is not implemented";
-const R_EOF: &str = "EOF-newline fudging is not implemented";
-const R_ANCESTOR: &str = "building a fake ancestor index is not implemented";
-
-/// A flag git accepts that this port parses but cannot honour: the spelling as
-/// the user wrote it, plus why. `key` exists so a later `--no-<flag>` cancels the
-/// right entry; the vector keeps argv order, so the flag reported is the first
-/// unhonoured one on the command line.
-struct Unhonoured {
-    key: &'static str,
-    spelling: String,
-    why: &'static str,
-}
-
-fn mark(v: &mut Vec<Unhonoured>, key: &'static str, spelling: &str, why: &'static str) {
-    v.retain(|u| u.key != key);
-    v.push(Unhonoured {
-        key,
-        spelling: spelling.to_owned(),
-        why,
-    });
-}
-
-fn unmark(v: &mut Vec<Unhonoured>, key: &'static str) {
-    v.retain(|u| u.key != key);
-}
 
 /// How a `--whitespace`/`apply.whitespace` action classifies against the set
 /// git's `parse_whitespace_option` accepts.
@@ -396,13 +454,40 @@ struct Opts {
     ignore_ws: bool,
     allow_empty: bool,          // --allow-empty: an input with no patches is not an error
     no_add: bool,               // --no-add: apply context/deletions, drop additions
-    verbose: bool,              // -v/--verbose: Checking/Applied progress on stderr
+    /// `state->apply_verbosity`, an `OPT__VERBOSITY` counter: `-v` raises it, `-q`
+    /// lowers it, each flipping the sign when it crosses zero, and `--no-verbose`
+    /// /`--no-quiet` reset it. `> 0` is `verbosity_verbose` (the `Checking patch`
+    /// /`Applied patch`/`Hunk #<n> succeeded` progress); `< 0` is
+    /// `verbosity_silent`, which mutes every `error:` and `warning:`.
+    verbosity: i32,
     reject: bool,               // --reject: apply what fits, write *.rej for the rest
-    quiet: bool,                // -q/--quiet: silence `error:` diagnostics
     recount: bool,              // --recount: derive hunk sizes from the body, not the header
     index: bool,                // --index: apply to the worktree AND the index
     cached: bool,               // --cached: apply to the index only (no worktree touch)
-    directory: Option<String>,  // --directory=<root>: prepend <root> to every path
+    /// `-N`/`--intent-to-add`: `state->ita_only`. A patch that creates a file also
+    /// records an intent-to-add index entry for it (empty-blob placeholder,
+    /// `CE_INTENT_TO_ADD`); nothing else in the index is touched, and in particular
+    /// a deletion leaves its entry standing (apply.c:4431). `check_apply_state()`
+    /// drops the flag entirely when `--index`/`--cached` is also given or when
+    /// there is no repository (apply.c:178).
+    ita_only: bool,
+    /// `--inaccurate-eof`: `patch->inaccurate_eof`, which lets a hunk whose last
+    /// line ends in a newline match a file that does not end in one.
+    inaccurate_eof: bool,
+    /// `--build-fake-ancestor=<file>`: write a temporary index naming, for every
+    /// path the patch does not create, the pre-image blob its `index <old>..` line
+    /// points at. Like the report modes it turns applying off unless `--apply`
+    /// says otherwise (apply.c:169).
+    fake_ancestor: Option<String>,
+    /// `--unsafe-paths`: waive [`check_unsafe_path`], the per-patch gate that
+    /// refuses a path `verify_path()` calls invalid — one that leaves the working
+    /// tree, names `.git`, or is otherwise unfit for the index. `check_apply_state()`
+    /// clears it again under `--index`/`--cached`/`--3way` (apply.c:180).
+    unsafe_paths: bool,
+    /// `--directory=<root>`: prepend `<root>` to every path. Stored as
+    /// `state->root` is — already run through `strbuf_normalize_path()` and
+    /// completed with a trailing `/` — so an empty root means "no root".
+    directory: Option<String>,
     limits: Vec<(bool, String)>, // --include/--exclude rules in argv order (true = include)
     has_include: bool,          // whether any rule is an --include
     apply_override: Option<bool>, // --apply / --no-apply
@@ -411,6 +496,19 @@ struct Opts {
     /// `--ours`/`--theirs`/`--union`: `state->merge_variant`, which resolves a
     /// 3-way conflict to one side instead of writing conflict markers.
     merge_variant: Option<MergeVariant>,
+}
+
+impl Opts {
+    /// `apply_verbosity > verbosity_normal`.
+    fn verbose(&self) -> bool {
+        self.verbosity > 0
+    }
+
+    /// `apply_verbosity <= verbosity_silent`, which is where git swaps in its muting
+    /// `error()`/`warning()` routines.
+    fn quiet(&self) -> bool {
+        self.verbosity < 0
+    }
 }
 
 /// git's `XDL_MERGE_FAVOR_*`, the three ways `--3way` can silence a conflict.
@@ -439,12 +537,15 @@ impl Default for Opts {
             ignore_ws: false,
             allow_empty: false,
             no_add: false,
-            verbose: false,
+            verbosity: 0,
             reject: false,
-            quiet: false,
             recount: false,
             index: false,
             cached: false,
+            ita_only: false,
+            inaccurate_eof: false,
+            fake_ancestor: None,
+            unsafe_paths: false,
             directory: None,
             limits: Vec::new(),
             has_include: false,
@@ -453,6 +554,19 @@ impl Default for Opts {
             three_way: false,
             merge_variant: None,
         }
+    }
+}
+
+/// `parse_opt_verbosity_cb()`: `Some(1)` is `-v`, `Some(-1)` is `-q`, and `None` is
+/// the `--no-` form of either. Each direction flips the counter's sign when it is
+/// currently on the other side of zero, so `-v -q` is silent and `-q -v` is verbose.
+fn bump_verbosity(target: &mut i32, dir: Option<i32>) {
+    match dir {
+        None => *target = 0,
+        Some(1) if *target >= 0 => *target += 1,
+        Some(1) => *target = 1,
+        Some(_) if *target <= 0 => *target -= 1,
+        Some(_) => *target = -1,
     }
 }
 
@@ -493,7 +607,6 @@ fn parse_opts(
     args: &[String],
     o: &mut Opts,
     sources: &mut Vec<String>,
-    unhonoured: &mut Vec<Unhonoured>,
 ) -> Result<(), ExitCode> {
     let mut conflict_given = false;
     let mut no_more_opts = false;
@@ -552,42 +665,57 @@ fn parse_opts(
                 "reverse" => o.reverse = !neg,
                 "unidiff-zero" => o.unidiff_zero = !neg,
                 "allow-empty" => o.allow_empty = !neg,
-                "quiet" => o.quiet = !neg,
-                "verbose" => o.verbose = !neg,
+                // `parse_opt_verbosity_cb()` (parse-options-cb.c): the negated form
+                // of either spelling resets the counter to `verbosity_normal`.
+                "quiet" => bump_verbosity(&mut o.verbosity, if neg { None } else { Some(-1) }),
+                "verbose" => bump_verbosity(&mut o.verbosity, if neg { None } else { Some(1) }),
                 "reject" => o.reject = !neg,
                 "recount" => o.recount = !neg,
                 "apply" => o.apply_override = Some(!neg),
-                // No-ops for in-tree paths: git needs neither an opt-in for
-                // overlap here (we place hunks sequentially) nor a path-safety
-                // waiver (every path the harness exercises stays in-tree).
-                "allow-overlap" | "unsafe-paths" => {}
+                // `--allow-overlap` relaxes git's already-applied/overlap detection,
+                // which this port has no equivalent of — hunks are placed
+                // sequentially — so accepting it changes nothing.
+                "allow-overlap" => {}
+                // `OPT_BOOL_F(..., PARSE_OPT_NOCOMPLETE)` (apply.c:5230): hidden from
+                // completion, but an ordinary boolean, so `--no-unsafe-paths` resolves
+                // and turns it back off.
+                "unsafe-paths" => o.unsafe_paths = !neg,
+                // `apply_option_parse_directory()` (apply.c:5075) normalises the root
+                // as it is parsed and fails the whole invocation when it cannot,
+                // before any patch file is opened.
                 "directory" => {
-                    o.directory = if neg {
-                        None
-                    } else {
-                        Some(long_value(args, &mut i, name, inline)?)
-                    }
-                }
-                "whitespace" => {
                     if neg {
-                        unmark(unhonoured, "whitespace");
+                        o.directory = None;
                     } else {
                         let v = long_value(args, &mut i, name, inline)?;
-                        // A CLI action overrides any deferred `apply.whitespace`
-                        // default read from config: `Noop` clears it, `Defer`
-                        // replaces it with this spelling.
-                        match classify_whitespace(&v) {
-                            action @ (WsAction::Silent
-                            | WsAction::Warn
-                            | WsAction::Error
-                            | WsAction::Fix) => {
-                                unmark(unhonoured, "whitespace");
-                                o.ws = action;
-                            }
-                            WsAction::Invalid => {
-                                eprintln!("error: unrecognized whitespace option '{v}'");
-                                return Err(ExitCode::from(129));
-                            }
+                        let Some(mut root) = normalize_path(&v) else {
+                            eprintln!("error: unable to normalize directory: '{v}'");
+                            return Err(ExitCode::from(129));
+                        };
+                        // `strbuf_complete(&state->root, '/')`: a non-empty root always
+                        // ends in a separator, and an empty one stays empty.
+                        if !root.is_empty() && !root.ends_with('/') {
+                            root.push('/');
+                        }
+                        o.directory = Some(root);
+                    }
+                }
+                // `--no-whitespace` resolves in git's parse-options but then trips
+                // `BUG_ON_OPT_NEG` in `apply_option_parse_whitespace()` (apply.c:5067),
+                // aborting with SIGABRT and exit 134. Accepting it as a no-op is the
+                // one thing here that is deliberately not what git does — reproducing
+                // an abort would be worse than ignoring the flag.
+                "whitespace" if neg => {}
+                "whitespace" => {
+                    let v = long_value(args, &mut i, name, inline)?;
+                    match classify_whitespace(&v) {
+                        action @ (WsAction::Silent
+                        | WsAction::Warn
+                        | WsAction::Error
+                        | WsAction::Fix) => o.ws = action,
+                        WsAction::Invalid => {
+                            eprintln!("error: unrecognized whitespace option '{v}'");
+                            return Err(ExitCode::from(129));
                         }
                     }
                 }
@@ -622,29 +750,17 @@ fn parse_opts(
                 // --index (worktree + index) and --cached (index only) are honoured.
                 "index" => o.index = !neg,
                 "cached" => o.cached = !neg,
-                "intent-to-add" => {
-                    if neg {
-                        unmark(unhonoured, "intent-to-add");
-                    } else {
-                        mark(unhonoured, "intent-to-add", &a, R_INDEX)
-                    }
-                }
-                "inaccurate-eof" => {
-                    if neg {
-                        unmark(unhonoured, "inaccurate-eof");
-                    } else {
-                        mark(unhonoured, "inaccurate-eof", &a, R_EOF)
-                    }
-                }
+                "intent-to-add" => o.ita_only = !neg,
+                "inaccurate-eof" => o.inaccurate_eof = !neg,
                 // Both spellings run `apply_option_parse_space_change()`
                 // (apply.c:5048), which is a plain on/off for `ws_ignore_action`.
                 "ignore-space-change" | "ignore-whitespace" => o.ignore_ws = !neg,
+                // `OPT_FILENAME` (apply.c:5246); the `--no-` form clears it.
                 "build-fake-ancestor" => {
-                    if neg {
-                        unmark(unhonoured, "build-fake-ancestor");
+                    o.fake_ancestor = if neg {
+                        None
                     } else {
-                        long_value(args, &mut i, name, inline)?;
-                        mark(unhonoured, "build-fake-ancestor", &a, R_ANCESTOR);
+                        Some(long_value(args, &mut i, name, inline)?)
                     }
                 }
 
@@ -715,9 +831,9 @@ fn parse_opts(
                 }
                 'z' => o.nul = true,
                 'R' => o.reverse = true,
-                'q' => o.quiet = true,
-                'v' => o.verbose = true,
-                'N' => mark(unhonoured, "intent-to-add", "-N", R_INDEX),
+                'q' => bump_verbosity(&mut o.verbosity, Some(-1)),
+                'v' => bump_verbosity(&mut o.verbosity, Some(1)),
+                'N' => o.ita_only = true,
                 '3' => o.three_way = true,
                 // parse_options_step()'s `internal_help` check sits inside the
                 // short-option loop: `-h` answers on stdout at 129, without the
@@ -738,31 +854,28 @@ fn parse_opts(
         return Err(ExitCode::from(128));
     }
 
-    // --check and any of the report modes (--numstat/--stat/--summary) turn
-    // applying off; --apply turns it back on, and --reject forces it on (git's
-    // `check_apply_state`).
-    o.apply = o
-        .apply_override
-        .unwrap_or(!(o.check || o.numstat || o.stat || o.summary));
-    if o.reject {
-        o.apply = true;
-    }
+    // `check_apply_state()` (apply.c:169): `state->apply` starts at 1 and any
+    // report mode turns it off — unless `--apply` was given, which is git's
+    // `force_apply` and outranks them. `--reject` does *not* survive that: it sets
+    // `state->apply` at apply.c:165, four lines before the report modes clear it
+    // again, so `git apply --stat --reject` neither applies nor rejects anything.
+    // `--no-apply` is `OPT_BOOL` on the same `force_apply`, so it only cancels an
+    // earlier `--apply`; on its own it leaves the default alone.
+    o.apply = o.apply_override.unwrap_or(false)
+        || !(o.check || o.numstat || o.stat || o.summary || o.fake_ancestor.is_some());
     Ok(())
 }
 
 pub fn apply(args: &[String]) -> Result<ExitCode> {
     let mut o = Opts::default();
     let mut sources: Vec<String> = Vec::new();
-    let mut unhonoured: Vec<Unhonoured> = Vec::new();
 
     // git reads `apply.whitespace` from config as the default `--whitespace`
     // action, before it parses arguments. An invalid value there is fatal (128)
     // immediately — before the patch input is even opened, and regardless of a
     // valid `--whitespace` on the command line, which git parses only afterward.
-    // A byte-altering (`fix`/`strip`) or erroring (`error`/`error-all`) action is
-    // not implemented, so it is recorded as a deferred default exactly like the
-    // CLI flag: it bails only once the input holds a patch, and a later
-    // `--whitespace` on the command line overrides (clears) it.
+    // Every action it can name is honoured here on the same terms as the flag, so a
+    // `--whitespace` on the command line simply replaces it.
     if let Ok(repo) = gix::discover(".") {
         if let Some(v) = repo.config_snapshot().string("apply.whitespace") {
             let v = v.to_str_lossy();
@@ -791,7 +904,7 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
         }
     }
 
-    if let Err(code) = parse_opts(args, &mut o, &mut sources, &mut unhonoured) {
+    if let Err(code) = parse_opts(args, &mut o, &mut sources) {
         return Ok(code);
     }
 
@@ -813,6 +926,28 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
         eprintln!("error: '{flag}' outside a repository");
         return Ok(ExitCode::from(128));
     }
+    // apply.c:178 — `-N` is dropped, silently and without an error, when the far
+    // stronger `--index`/`--cached` is also in play or when there is no index to
+    // record the intent in. Everything downstream then behaves as if it was never
+    // given, which is why `git apply -N --index` stages the real blob.
+    // apply.c:164-168 — `--reject` implies applying, and raises a *normal* run to
+    // verbose. A `-q` run is already below normal, so it stays silent.
+    if o.reject {
+        if o.verbosity == 0 {
+            o.verbosity = 1;
+        }
+    }
+    if o.ita_only && (check_index || gix::discover(".").is_err()) {
+        o.ita_only = false;
+    }
+    // apply.c:180-181 — the last line of `check_apply_state()`: reading pre-images
+    // from the index and writing results back into it only makes sense for paths the
+    // index can hold, so `--index`/`--cached` (and `--3way`, which implies
+    // `check_index`) cancel `--unsafe-paths` outright. Silently: git prints nothing,
+    // and the patch then fails on whichever check it reaches first.
+    if check_index {
+        o.unsafe_paths = false;
+    }
 
     // `setup_git_directory()` leaves every `RUN_SETUP` builtin standing at the top
     // of the worktree and hands it the directory it was invoked from as `prefix`
@@ -822,13 +957,9 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
     // a traditional patch's names are prefixed by it ([`prefix_patch`]), and
     // `use_patch()` drops every path that does not live under it.
     let prefix = worktree_prefix()?;
-    // `state->root`: `--directory=<root>` with `strbuf_complete(&root, '/')`.
-    let apply_root = match &o.directory {
-        Some(r) if !r.is_empty() => {
-            if r.ends_with('/') { r.clone() } else { format!("{r}/") }
-        }
-        _ => String::new(),
-    };
+    // `state->root`: already normalised and slash-completed at parse time, exactly
+    // as `apply_option_parse_directory()` leaves it.
+    let apply_root = o.directory.clone().unwrap_or_default();
     if !prefix.is_empty() {
         for src in &mut sources {
             if src != "-" && !std::path::Path::new(src.as_str()).is_absolute() {
@@ -861,7 +992,7 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
                 }
                 Err(e) => {
                     err(
-                        o.quiet,
+                        o.quiet(),
                         &format!("error: can't open patch '{src}': {}", io_msg(&e)),
                     );
                     return Ok(ExitCode::from(128));
@@ -887,13 +1018,13 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
         Err(e) => {
             let e = match e.downcast::<CorruptPatch>() {
                 Ok(corrupt) => {
-                    err(o.quiet, &format!("error: {corrupt}"));
+                    err(o.quiet(), &format!("error: {corrupt}"));
                     return Ok(ExitCode::from(128));
                 }
                 Err(e) => e,
             };
             let header = e.downcast::<HeaderError>()?;
-            err(o.quiet, &format!("error: {header}"));
+            err(o.quiet(), &format!("error: {header}"));
             return Ok(ExitCode::from(128));
         }
     };
@@ -902,21 +1033,15 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
             return Ok(ExitCode::SUCCESS);
         }
         err(
-            o.quiet,
+            o.quiet(),
             "error: No valid patches in input (allow with \"--allow-empty\")",
         );
         return Ok(ExitCode::from(128));
     }
 
-    // Past here a flag we cannot honour would change the result, so report it.
-    if let Some(u) = unhonoured.first() {
-        let (flag, why) = (&u.spelling, u.why);
-        bail!("unsupported flag {flag:?}: {why}");
-    }
-
     if let Some(root) = &o.directory {
         for p in &mut patches {
-            prefix_names(p, root)?;
+            prefix_names(p, root);
         }
     }
     // `prefix_patch()` (apply.c:2191), which `parse_chunk()` runs on every patch as
@@ -958,7 +1083,7 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
                  core.whitespace"
             );
         }
-        let errors = report_whitespace(&patches, &spans, rule, &o.ws, o.quiet);
+        let errors = report_whitespace(&patches, &spans, rule, &o.ws, o.quiet());
         if matches!(o.ws, WsAction::Fix) {
             for p in &mut patches {
                 for h in &mut p.hunks {
@@ -974,7 +1099,7 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
         }
         if errors > 0 && matches!(o.ws, WsAction::Error) {
             err(
-                o.quiet,
+                o.quiet(),
                 &format!(
                     "error: {errors} {} whitespace errors.",
                     if errors == 1 { "line adds" } else { "lines add" }
@@ -984,7 +1109,7 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
         }
         if errors > 0 && matches!(o.ws, WsAction::Fix) && o.apply {
             err(
-                o.quiet,
+                o.quiet(),
                 &format!(
                     "warning: {errors} {} after fixing whitespace errors.",
                     if errors == 1 { "line applied" } else { "lines applied" }
@@ -993,7 +1118,7 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
         }
         if errors > 0 && matches!(o.ws, WsAction::Warn) {
             err(
-                o.quiet,
+                o.quiet(),
                 &format!(
                     "warning: {errors} {} whitespace errors.",
                     if errors == 1 { "line adds" } else { "lines add" }
@@ -1002,40 +1127,76 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
         }
     }
 
-    // git prints its report modes in this fixed order: the scaled --stat graph,
-    // then the machine-readable --numstat records, then the --summary lines.
-    if o.stat {
-        print!("{}", render_stat(&patches));
+    // `apply_one_fragment()`'s `--inaccurate-eof` adjustment (apply.c:3099-3106),
+    // done once per hunk here because `patch->inaccurate_eof` never changes within a
+    // run: when both images end in a newline, take it off both. The pre-image's last
+    // line then matches a file that has no final newline (as a prefix — see
+    // [`matches_at`]), and the post-image is written without one, which is what makes
+    // the flag observable even on a patch that would otherwise apply.
+    //
+    // It runs after `-R`, because git reverses the fragments before placing them.
+    if o.inaccurate_eof {
+        for p in &mut patches {
+            for h in &mut p.hunks {
+                let (Some(pre), Some(post)) = (h.pre.last(), h.post.last()) else {
+                    continue;
+                };
+                if pre.last() != Some(&b'\n') || post.last() != Some(&b'\n') {
+                    continue;
+                }
+                h.pre.last_mut().expect("checked above").pop();
+                h.post.last_mut().expect("checked above").pop();
+                // `--no-add` splices the context lines instead, and the last of them
+                // is the same line when the hunk ends in context.
+                if h.trailing > 0 {
+                    if let Some(ctx) = h.context.last_mut() {
+                        if ctx.last() == Some(&b'\n') {
+                            ctx.pop();
+                        }
+                    }
+                }
+                h.eof_fudge = true;
+            }
+        }
     }
-    if o.numstat {
-        print!("{}", render_numstat(&patches, o.nul));
-    }
-    if o.summary {
-        print!("{}", render_summary(&patches));
-    }
+
+    // git prints its report modes in this fixed order — the scaled --stat graph,
+    // then the machine-readable --numstat records, then the --summary lines — and
+    // it prints them *last* (apply.c:4993-5000), after the check and the write.
+    // Every earlier failure reaches them through a `goto end` that skips them, so
+    // a patch that does not apply produces no report at all.
+    let reports = |patches: &[Patch]| {
+        if o.stat {
+            print!("{}", render_stat(patches));
+        }
+        if o.numstat {
+            print!("{}", render_numstat(patches, o.nul));
+        }
+        if o.summary {
+            print!("{}", render_summary(patches));
+        }
+    };
+    // apply.c:4987 — the fake ancestor is built at the end of `apply_patch()`,
+    // after any write and before the report modes, on every path that got that far.
+    let fake_ancestor = |patches: &[Patch]| -> Result<bool> {
+        match &o.fake_ancestor {
+            Some(path) => build_fake_ancestor(patches, path, o.quiet()),
+            None => Ok(true),
+        }
+    };
     if !o.apply && !o.check {
+        if !fake_ancestor(&patches)? {
+            return Ok(ExitCode::from(128));
+        }
+        reports(&patches);
         return Ok(ExitCode::SUCCESS);
-    }
-
-    // The reject path applies each file independently and writes *.rej; it does not
-    // stage the index. Rather than silently leave the index un-updated, refuse the
-    // combination (git supports it; this port floors it honestly).
-    if o.reject && check_index {
-        bail!("--reject with --index/--cached is not implemented");
-    }
-
-    // --reject takes a wholly separate path: it applies each file's hunks
-    // independently (not all-or-nothing), writes partial results, and drops the
-    // hunks that did not land into a `<name>.rej` file. git forces verbose there.
-    if o.reject {
-        return reject_apply(&patches, &o);
     }
 
     // ---- index substrate (only when --index/--cached) -----------------------
     // Hold the repo lock across the whole check-and-write span so the index we read
     // pre-images from is the same one we mutate and write — no concurrent writer can
     // slip in between, mirroring how git holds `lock_file` for the operation.
-    let (idx_repo, mut idx_index, _idx_lock) = if check_index {
+    let (idx_repo, mut idx_index, _idx_lock) = if check_index || o.ita_only {
         let repo = gix::discover(".")?;
         let lock = crate::lock::RepoLock::acquire(repo.git_dir());
         let index = if repo.index_path().exists() {
@@ -1051,8 +1212,9 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
         (None, None, None)
     };
     // `update_index` gates the mutation itself: with `--check`/`--stat` (apply off)
-    // the pre-image still comes from the index, but nothing is written.
-    let update_index = check_index && o.apply;
+    // the pre-image still comes from the index, but nothing is written
+    // (apply.c:4945, `(check_index || ita_only) && apply`).
+    let update_index = (check_index || o.ita_only) && o.apply;
 
     // ---- check phase: build every result in memory, touching nothing --------
     let mut staged: HashMap<String, Option<Vec<u8>>> = HashMap::new();
@@ -1069,13 +1231,21 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
         // one (`apply_fragments`), else the post-image path.
         let label = p.old_name.clone().or_else(|| p.new_name.clone()).unwrap_or_default();
 
-        if o.verbose {
+        // `check_patch_list()` (apply.c:4172): `apply_verbosity > verbosity_normal`,
+        // which `--reject` reaches without `-v`.
+        if verbosity(&o).verbose {
             eprintln!("Checking patch {name}...");
         }
 
         // A view of the index for this iteration; recomputed each time so no
         // immutable borrow of `idx_index` is held into the mutable write phase.
-        let idx_view = idx_repo.as_ref().zip(idx_index.as_ref());
+        // `-N` alone opens the index to *write* it, but git's `check_index` stays
+        // off there, so nothing on the read side may consult it.
+        let idx_view = if check_index {
+            idx_repo.as_ref().zip(idx_index.as_ref())
+        } else {
+            None
+        };
 
         // A path that must not already exist: a creation target, or a rename
         // destination. git's `check_to_create` reports it against the index when
@@ -1084,13 +1254,13 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
             if p.is_new || p.is_rename {
                 match create_block(&staged, idx_view, o.cached, new) {
                     Some(Block::InIndex) => {
-                        err(o.quiet, &format!("error: {new}: already exists in index"));
+                        err(o.quiet(), &format!("error: {new}: already exists in index"));
                         failed = true;
                         continue;
                     }
                     Some(Block::InWorktree) => {
                         err(
-                            o.quiet,
+                            o.quiet(),
                             &format!("error: {new}: already exists in working directory"),
                         );
                         failed = true;
@@ -1101,6 +1271,9 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
             }
         }
 
+        // `frag->rejected` per fragment; only `--reject` ever leaves a `false` here,
+        // because without it the first failure fails the whole patch.
+        let mut applied: Vec<bool> = Vec::new();
         // The pre-image bytes, kept whole: a text patch works on its lines, a binary
         // one on the bytes themselves.
         let mut pre_bytes: Vec<u8> = Vec::new();
@@ -1108,28 +1281,40 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
             Vec::new()
         } else {
             let old = p.old_name.as_deref().unwrap_or_default();
-            match read_preimage(&staged, idx_view, o.cached, old) {
+            match read_preimage(&staged, idx_view, o.cached, old, p.is_rename) {
                 PreRead::Found(bytes) => {
                     pre_bytes = bytes.clone();
                     split_lines(&bytes).into_iter().map(|l| l.to_vec()).collect()
                 }
                 PreRead::MissingWorktree => {
-                    err(o.quiet, &format!("error: {old}: No such file or directory"));
+                    err(o.quiet(), &format!("error: {old}: No such file or directory"));
                     failed = true;
                     continue;
                 }
                 PreRead::MissingIndex => {
-                    err(o.quiet, &format!("error: {old}: does not exist in index"));
+                    err(o.quiet(), &format!("error: {old}: does not exist in index"));
                     failed = true;
                     continue;
                 }
                 PreRead::Mismatch => {
-                    err(o.quiet, &format!("error: {old}: does not match index"));
+                    err(o.quiet(), &format!("error: {old}: does not match index"));
                     failed = true;
                     continue;
                 }
             }
         };
+
+        // apply.c:4142 — `check_unsafe_path()`, after the pre-image and
+        // already-exists checks have had their say (so a missing out-of-tree file
+        // is still reported as missing) and before anything is applied. A refusal
+        // here is `-128`: it ends the whole run at once rather than marking this
+        // one patch failed, which is why `--reject` writes no `*.rej` for it.
+        if !o.unsafe_paths {
+            if let Some(bad) = check_unsafe_path(p) {
+                err(o.quiet(), &format!("error: invalid path '{bad}'"));
+                return Ok(ExitCode::from(128));
+            }
+        }
 
         // `apply_data()`: under `--3way` the merge is what applies the patch, and
         // only a pre-image the object store cannot supply — or a patch that will
@@ -1140,7 +1325,7 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
             match try_threeway(repo, p, &pre_bytes, &o)? {
                 ThreeWayOutcome::Merged(tw) => {
                     err(
-                        o.quiet,
+                        o.quiet(),
                         &if tw.stages.is_some() {
                             format!("Applied patch to '{}' with conflicts.", tw.path)
                         } else {
@@ -1152,9 +1337,9 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
                 }
                 ThreeWayOutcome::Fallback(reason) => {
                     if let Some(msg) = reason {
-                        err(o.quiet, &format!("error: {msg}"));
+                        err(o.quiet(), &format!("error: {msg}"));
                     }
-                    err(o.quiet, "Falling back to direct application...");
+                    err(o.quiet(), "Falling back to direct application...");
                 }
             }
         }
@@ -1164,34 +1349,48 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
         if merged.is_some() {
             // The merge already produced the whole post-image.
         } else if p.binary {
-            match rebuild_binary(p, &pre_bytes) {
-                Ok(bytes) => image = vec![bytes],
+            match rebuild_binary(p, &pre_bytes, o.reverse) {
+                // An empty post-image is no line at all, so a binary deletion leaves nothing
+                // behind for `apply_data`'s removal check to trip over.
+                Ok(bytes) => image = if bytes.is_empty() { Vec::new() } else { vec![bytes] },
                 Err(msg) => {
-                    err(o.quiet, &format!("error: {msg}"));
+                    // `apply_binary()` fails `apply_data()`, so `check_patch()`
+                    // (apply.c:4158) adds its own line under git's message.
+                    err(o.quiet(), &format!("error: {msg}"));
+                    err(o.quiet(), &format!("error: {label}: patch does not apply"));
                     failed = true;
                     continue;
                 }
             }
-        } else if let Err(idx) =
-            apply_hunks(&mut image, p, o.unidiff_zero, o.no_add, o.p_context, o.ignore_ws)
-        {
-            let h = &p.hunks[idx];
-            if o.verbose {
-                let pre: Vec<u8> = h.pre.concat();
-                err(
-                    o.quiet,
-                    &format!("error: while searching for:\n{}", String::from_utf8_lossy(&pre)),
-                );
+        } else {
+            match apply_hunks(
+                &mut image,
+                p,
+                o.unidiff_zero,
+                o.no_add,
+                o.p_context,
+                o.ignore_ws,
+                verbosity(&o),
+                o.reject,
+                &label,
+            ) {
+                Ok(a) => applied = a,
+                Err(_) => {
+                    // `apply_fragments()` returned -1, so `apply_data()` failed and
+                    // `check_patch()` (apply.c:4158) adds its own line under it.
+                    err(o.quiet(), &format!("error: {label}: patch does not apply"));
+                    failed = true;
+                    continue;
+                }
             }
-            err(o.quiet, &format!("error: patch failed: {label}:{}", h.old_pos));
-            err(o.quiet, &format!("error: {label}: patch does not apply"));
-            failed = true;
-            continue;
         }
 
         if p.is_delete {
             if !image.is_empty() {
-                err(o.quiet, "error: removal patch leaves file contents");
+                // Also an `apply_data()` failure (apply.c:3826), so `check_patch()`
+                // appends its line.
+                err(o.quiet(), "error: removal patch leaves file contents");
+                err(o.quiet(), &format!("error: {label}: patch does not apply"));
                 failed = true;
                 continue;
             }
@@ -1202,6 +1401,9 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
                 remove: Some(old),
                 prune_dirs: true,
                 create: None,
+                is_new: false,
+                applied,
+                rej_body: Vec::new(),
             });
             continue;
         }
@@ -1236,18 +1438,40 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
         if let Some(stages) = merged.and_then(|tw| tw.stages) {
             conflicted.push((new.clone(), mode, stages));
         }
+        // `write_out_one_reject()` writes the fragments that did not land verbatim,
+        // each newline-terminated (apply.c:4794-4796).
+        let mut rej_body: Vec<u8> = Vec::new();
+        for (idx, ok) in applied.iter().enumerate() {
+            if !*ok {
+                let raw = &p.hunks[idx].raw;
+                rej_body.extend_from_slice(raw);
+                if raw.last() != Some(&b'\n') {
+                    rej_body.push(b'\n');
+                }
+            }
+        }
         ops.push(Op {
             name,
             remove: p.old_name.clone(),
             prune_dirs: p.is_rename,
             create: Some((new, mode, data)),
+            is_new: p.is_new,
+            applied,
+            rej_body,
         });
     }
 
-    if failed {
+    // apply.c:4968 — `check_patch_list()`'s failure ends the run only without
+    // `--reject`; with it, the patches that did check out are still written and the
+    // refused ones are simply skipped.
+    if failed && !o.reject {
         return Ok(ExitCode::from(1));
     }
     if !o.apply {
+        if !fake_ancestor(&patches)? {
+            return Ok(ExitCode::from(128));
+        }
+        reports(&patches);
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -1255,46 +1479,136 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
     // Index mutations are accumulated by path and replayed once at the end (git's
     // `remove_file`/`add_index_file`); `--cached` skips every worktree touch.
     let mut idx_remove: Vec<BString> = Vec::new();
-    let mut idx_add: Vec<(BString, ObjectId, IndexMode, Stat)> = Vec::new();
+    let mut idx_add: Vec<(BString, ObjectId, IndexMode, Stat, Flags)> = Vec::new();
 
-    for op in ops {
-        if let Some(old) = &op.remove {
-            if !o.cached {
-                let _ = std::fs::remove_file(old);
-                if op.prune_dirs {
-                    prune_empty_parents(Path::new(old));
-                }
-            }
-            if update_index {
-                idx_remove.push(old.clone().into_bytes().into());
+    // `write_out_results()` walks the whole list twice (apply.c:4817): every removal
+    // happens in phase 0 and every creation in phase 1, so a swap-rename between two
+    // paths cannot have one side's creation clobber the other side's pre-image.
+    for op in &ops {
+        let Some(old) = &op.remove else { continue };
+        if !o.cached {
+            let _ = std::fs::remove_file(old);
+            if op.prune_dirs {
+                prune_empty_parents(Path::new(old));
             }
         }
+        // `remove_file()` (apply.c:4431) drops the index entry only when this is
+        // a real index update; under `-N` alone the entry is deliberately left
+        // standing, so a deletion shows up as an unstaged removal.
+        if update_index && !o.ita_only {
+            idx_remove.push(old.clone().into_bytes().into());
+        }
+    }
+
+    // `write_out_one_reject()` returns non-zero for every patch that left a `*.rej`,
+    // which is what makes the run exit 1.
+    let mut any_reject = false;
+    for op in ops {
         if let Some((path, mode, data)) = op.create {
             if !o.cached {
                 create_leading_dirs(Path::new(&path))?;
                 write_created(Path::new(&path), mode, &data)?;
             }
-            if update_index {
+            // `create_file()` (apply.c:4685): `check_index` stages every result,
+            // `ita_only` stages only the paths the patch creates.
+            if update_index && (check_index || op.is_new) {
+                // `add_index_entry_with_check()` (read-cache.c:1287) checks the name
+                // once more on the way in, and `add_index_file()` (apply.c:4488)
+                // adds its own line under it. `--unsafe-paths` waived the earlier
+                // gate but not this one, so `-N` on a patch that writes outside the
+                // tree ends here — with the file already written, as in git.
+                if !verify_path(&path, mode) {
+                    err(o.quiet(), &format!("error: invalid path '{path}'"));
+                    err(o.quiet(), &format!("error: unable to add cache entry for {path}"));
+                    return Ok(ExitCode::from(128));
+                }
                 let repo = idx_repo.as_ref().expect("repo present when update_index");
-                let id = repo.write_blob(&data)?.detach();
-                // For `--index` the entry's stat comes from the file just written
-                // (git's `fill_stat_cache_info`); `--cached` writes no file, so the
-                // stat is zeroed, exactly as `make_empty_cache_entry` leaves it.
-                let stat = if o.cached {
-                    Stat::default()
+                let (id, stat, flags) = if o.ita_only {
+                    // `set_object_name_for_intent_to_add_entry()` (read-cache.c:704):
+                    // the entry names the empty blob, and `make_empty_cache_entry`
+                    // leaves its stat zeroed so it can never look up to date.
+                    // `EXTENDED` is what makes the index writer emit the v3 entry
+                    // that carries `CE_INTENT_TO_ADD` at rest.
+                    (
+                        repo.write_blob([])?.detach(),
+                        Stat::default(),
+                        Flags::EXTENDED | Flags::INTENT_TO_ADD,
+                    )
                 } else {
-                    let md = gix::index::fs::Metadata::from_path_no_follow(Path::new(&path))?;
-                    Stat::from_fs(&md)?
+                    let id = repo.write_blob(&data)?.detach();
+                    // For `--index` the entry's stat comes from the file just written
+                    // (git's `fill_stat_cache_info`); `--cached` writes no file, so the
+                    // stat is zeroed, exactly as `make_empty_cache_entry` leaves it.
+                    let stat = if o.cached {
+                        Stat::default()
+                    } else {
+                        let md = gix::index::fs::Metadata::from_path_no_follow(Path::new(&path))?;
+                        Stat::from_fs(&md)?
+                    };
+                    (id, stat, Flags::empty())
                 };
-                idx_add.push((path.clone().into_bytes().into(), id, to_index_mode(mode), stat));
+                idx_add.push((
+                    path.clone().into_bytes().into(),
+                    id,
+                    to_index_mode(mode),
+                    stat,
+                    flags,
+                ));
             }
         }
-        if o.verbose {
-            eprintln!("Applied patch {} cleanly.", op.name);
+        // `write_out_one_reject()` (apply.c:4716), which runs for every patch in
+        // phase 1 — that is where `Applied patch <name> cleanly.` comes from, both
+        // with and without `--reject`.
+        let nrej = op.applied.iter().filter(|a| !**a).count();
+        if nrej == 0 {
+            if verbosity(&o).verbose {
+                eprintln!("Applied patch {} cleanly.", op.name);
+            }
+            continue;
         }
+        any_reject = true;
+        // "Say this even without --verbose".
+        err(
+            o.quiet(),
+            &format!(
+                "Applying patch {} with {nrej} {}...",
+                op.name,
+                if nrej == 1 { "reject" } else { "rejects" }
+            ),
+        );
+        for (idx, ok) in op.applied.iter().enumerate() {
+            err(
+                o.quiet(),
+                &if *ok {
+                    format!("Hunk #{} applied cleanly.", idx + 1)
+                } else {
+                    format!("Rejected hunk #{}.", idx + 1)
+                },
+            );
+        }
+        // git names both sides of the banner with `patch->new_name` (apply.c:4782).
+        let rej = format!("{}.rej", op.name);
+        std::fs::write(
+            &rej,
+            [
+                format!("diff a/{0} b/{0}\t(rejected hunks)\n", op.name).as_bytes(),
+                &op.rej_body,
+            ]
+            .concat(),
+        )?;
     }
 
-    if update_index {
+    // An update that would touch nothing is skipped outright: git's
+    // `write_locked_index` rewrites the same bytes in that case, while rebuilding
+    // it here would drop the cached-tree extension for no reason. This is what
+    // `-N` on a patch that creates nothing hits.
+    // `apply_all_patches()` writes the index only when `apply_patch()` came back
+    // non-negative (apply.c:5129, :5173), and `--reject` turns any rejected hunk —
+    // or any patch the check refused — into `-1`. So a `--reject` run that rejected
+    // anything rolls the whole index update back, including the paths that did
+    // apply cleanly. Everything already written to the worktree stays.
+    let roll_back_index = o.reject && (failed || any_reject);
+    if update_index && !roll_back_index && !(idx_add.is_empty() && idx_remove.is_empty()) {
         let index = idx_index.as_mut().expect("index present when update_index");
         // If two patches in one input touched the same path, keep only the last
         // add for it — git's `add_index_entry` replaces in place, so the final
@@ -1302,13 +1616,13 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
         // `sort_entries` re-order.
         idx_add.reverse();
         let mut seen: HashSet<BString> = HashSet::new();
-        idx_add.retain(|(p, _, _, _)| seen.insert(p.clone()));
+        idx_add.retain(|(p, _, _, _, _)| seen.insert(p.clone()));
         // Every touched path is dropped (any prior stage) before its fresh stage-0
         // entry is pushed; a pure deletion contributes only a removal.
         let drop_set: HashSet<BString> = idx_remove
             .iter()
             .cloned()
-            .chain(idx_add.iter().map(|(p, _, _, _)| p.clone()))
+            .chain(idx_add.iter().map(|(p, _, _, _, _)| p.clone()))
             .collect();
         index.remove_entries(|_, path, _| drop_set.contains(&path.to_owned()));
         // `add_conflicted_stages_file()` replaces a conflicted path's stage-0
@@ -1317,11 +1631,11 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
             .iter()
             .map(|(p, _, _)| BString::from(p.clone().into_bytes()))
             .collect();
-        for (path, id, mode, stat) in &idx_add {
+        for (path, id, mode, stat, flags) in &idx_add {
             if conflicted_paths.contains(path) {
                 continue;
             }
-            index.dangerously_push_entry(*stat, *id, Flags::empty(), *mode, path.as_ref());
+            index.dangerously_push_entry(*stat, *id, *flags, *mode, path.as_ref());
         }
         for (path, mode, stages) in &conflicted {
             let path = BString::from(path.clone().into_bytes());
@@ -1352,11 +1666,21 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
         let mut names: Vec<&str> = conflicted.iter().map(|(p, _, _)| p.as_str()).collect();
         names.sort_unstable();
         for name in names {
-            err(o.quiet, &format!("U {name}"));
+            err(o.quiet(), &format!("U {name}"));
         }
         return Ok(ExitCode::from(1));
     }
 
+    // `write_out_results()` returning non-zero is a `goto end` in `apply_patch()`,
+    // so a run that rejected anything prints no report and exits 1.
+    if failed || any_reject {
+        return Ok(ExitCode::from(1));
+    }
+
+    if !fake_ancestor(&patches)? {
+        return Ok(ExitCode::from(128));
+    }
+    reports(&patches);
     Ok(ExitCode::SUCCESS)
 }
 
@@ -1439,7 +1763,21 @@ fn try_threeway(
         .into_iter()
         .map(<[u8]>::to_vec)
         .collect();
-    if apply_hunks(&mut post, p, o.unidiff_zero, o.no_add, o.p_context, o.ignore_ws).is_err() {
+    if apply_hunks(
+        &mut post,
+        p,
+        o.unidiff_zero,
+        o.no_add,
+        o.p_context,
+        o.ignore_ws,
+        verbosity(o),
+        // `try_threeway()` builds the patch's own post-image, which either applies
+        // to the blob it was made against or does not; `--reject` has no say here.
+        false,
+        p.old_name.as_deref().or(p.new_name.as_deref()).unwrap_or_default(),
+    )
+    .is_err()
+    {
         return Ok(ThreeWayOutcome::Fallback(None));
     }
     let post_bytes: Vec<u8> = post.concat();
@@ -1552,6 +1890,10 @@ fn create_block(
     }
 }
 
+/// An empty stand-in for the in-flight results, for the reads that must not see them.
+static EMPTY_STAGED: std::sync::LazyLock<HashMap<String, Option<Vec<u8>>>> =
+    std::sync::LazyLock::new(HashMap::new);
+
 /// The outcome of reading a patch's pre-image.
 enum PreRead {
     Found(Vec<u8>),
@@ -1570,7 +1912,14 @@ fn read_preimage(
     idx: Option<(&gix::Repository, &gix::index::File)>,
     cached: bool,
     old: &str,
+    // `previous_patch()` (apply.c:3505) returns NULL outright for a rename or copy —
+    // "git patches do not depend on the order" — so those read their pre-image from
+    // the worktree or the index as it stands, never from an earlier patch's result.
+    // A three-way swap-rename therefore fails on the middle name in git, and does
+    // here too.
+    is_rename: bool,
 ) -> PreRead {
+    let staged = if is_rename { &EMPTY_STAGED } else { staged };
     if let Some(entry) = staged.get(old) {
         return match entry {
             Some(bytes) => PreRead::Found(bytes.clone()),
@@ -1631,6 +1980,17 @@ struct Op {
     remove: Option<String>,
     prune_dirs: bool,
     create: Option<(String, u32, Vec<u8>)>,
+    /// `0 < patch->is_new`, the condition `create_file()` tests before recording an
+    /// intent-to-add entry for the path (apply.c:4685).
+    is_new: bool,
+    /// `frag->rejected` for each of the patch's fragments, in order — only filled
+    /// under `--reject`, where a hunk that did not land is recorded instead of
+    /// failing the patch. Empty means there is nothing for
+    /// `write_out_one_reject()` to say beyond `Applied patch <name> cleanly.`.
+    applied: Vec<bool>,
+    /// The verbatim text of the fragments that were rejected, already in the order
+    /// and shape `<name>.rej` wants them.
+    rej_body: Vec<u8>,
 }
 
 /// A single file's patch: the extended header facts plus its hunks.
@@ -1723,6 +2083,11 @@ struct Hunk {
     raw: Vec<u8>,          // the fragment's verbatim text (header + body) for *.rej
     trailing: usize,       // trailing context lines; 0 means the hunk must match at EOF
     leading: usize,        // leading context lines, for `-C<n>` context reduction
+    /// `--inaccurate-eof` took the newline off the last line of both images
+    /// (apply.c:3099-3106), so the pre-image's last line has to match the file's as
+    /// a prefix rather than in full — which is how git's flat-buffer `memcmp`
+    /// compares it once the recorded length has shrunk.
+    eof_fudge: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -1743,27 +2108,101 @@ fn apply_hunks(
     p_context: Option<usize>,
     // `state->ws_ignore_action == ignore_ws_change`.
     ignore_ws: bool,
-) -> Result<(), usize> {
+    v: Verbosity,
+    // `state->apply_with_reject`: a fragment that will not land is recorded and the
+    // rest are still tried, instead of failing the whole patch at the first one.
+    reject: bool,
+    // The name a failure is reported against (`apply_fragments()`' `name`).
+    label: &str,
+) -> Result<Vec<bool>, usize> {
+    let mut applied = Vec::with_capacity(p.hunks.len());
     for (idx, h) in p.hunks.iter().enumerate() {
-        if let Some(at) = place_hunk(image.as_slice(), h, unidiff_zero, ignore_ws) {
-            let repl = replacement(image.as_slice(), at, h, no_add, ignore_ws);
-            image.splice(at..at + h.pre.len(), repl);
-            continue;
-        }
-        // `apply_one_fragment()`'s reduction loop: drop a context line from whichever
-        // end has more of them and try again, down to the `-C<n>` floor.
-        if let Some(floor) = p_context {
-            if let Some((at, trimmed)) =
-                place_reduced(image.as_slice(), h, unidiff_zero, floor, ignore_ws)
-            {
-                let repl = replacement(image.as_slice(), at, &trimmed, no_add, ignore_ws);
-                image.splice(at..at + trimmed.pre.len(), repl);
-                continue;
+        let Some(placed) = place_with_context(image.as_slice(), h, unidiff_zero, p_context, ignore_ws)
+        else {
+            // apply.c:3369-3374 — the diagnostics come first either way; only what
+            // happens next differs.
+            if v.verbose {
+                let pre: Vec<u8> = h.pre.concat();
+                err(
+                    v.quiet,
+                    &format!("error: while searching for:\n{}", String::from_utf8_lossy(&pre)),
+                );
             }
-        }
-        return Err(idx);
+            err(v.quiet, &format!("error: patch failed: {label}:{}", h.old_pos));
+            if !reject {
+                return Err(idx);
+            }
+            applied.push(false);
+            continue;
+        };
+        placed.report(idx + 1, v);
+        let hunk = placed.hunk.as_ref().unwrap_or(h);
+        let repl = replacement(image.as_slice(), placed.at, hunk, no_add, ignore_ws);
+        image.splice(placed.at..placed.at + hunk.pre.len(), repl);
+        applied.push(true);
     }
-    Ok(())
+    Ok(applied)
+}
+
+/// `state->apply_verbosity` for this run.
+fn verbosity(o: &Opts) -> Verbosity {
+    Verbosity {
+        verbose: o.verbose(),
+        quiet: o.quiet(),
+        reverse: o.reverse,
+    }
+}
+
+/// `state->apply_verbosity`, for the two progress lines the placement loop prints.
+/// `--reject` raises a normal run to verbose (apply.c:164-168), which is why
+/// `Hunk #N succeeded …` shows up there without `-v`.
+#[derive(Clone, Copy)]
+struct Verbosity {
+    /// `apply_verbosity > verbosity_normal`: `-v`, or `--reject`.
+    verbose: bool,
+    /// `apply_verbosity <= verbosity_silent`: `-q`, which mutes even the
+    /// context-reduction warning.
+    quiet: bool,
+    /// `state->apply_in_reverse`, which flips the sign of a reported offset.
+    reverse: bool,
+}
+
+/// Where a hunk landed, and what it took to get it there.
+struct Placed {
+    /// The image line the pre-image matched at.
+    at: usize,
+    /// The trimmed form that matched, when context had to be dropped for it.
+    /// `None` means the hunk applied as written.
+    hunk: Option<Hunk>,
+    /// git's running `pos`: where the hunk was *expected*, which the reduction
+    /// loop decrements once per leading context line it drops (apply.c:3162).
+    expected: isize,
+    /// The context counts left on the placed form, for the reduction warning.
+    leading: usize,
+    trailing: usize,
+}
+
+impl Placed {
+    /// The two lines apply.c:3194-3213 prints once a fragment has landed.
+    fn report(&self, nth: usize, v: Verbosity) {
+        if v.verbose && self.at as isize != self.expected {
+            let offset = self.at as isize - self.expected;
+            let offset = if v.reverse { -offset } else { offset };
+            eprintln!(
+                "Hunk #{nth} succeeded at {} (offset {offset} {}).",
+                self.at + 1,
+                if offset.abs() == 1 { "line" } else { "lines" }
+            );
+        }
+        if self.hunk.is_some() && !v.quiet {
+            eprintln!(
+                "Context reduced to ({}/{}) to apply fragment at {}",
+                self.leading,
+                self.trailing,
+                self.at + 1
+            );
+        }
+    }
 }
 
 /// The lines that replace the pre-image at `at`.
@@ -1810,19 +2249,68 @@ fn replacement(
     out
 }
 
-/// Trim context off `h` one line at a time — the longer end first, as git does — and
-/// return the placement of the first trimmed form that lands, together with that form.
-fn place_reduced(
+/// `apply_one_fragment()`'s placement loop (apply.c:3138-3170): try the hunk
+/// where it says it goes, then — only when `-C<n>` allows it — first drop the
+/// begin/end anchoring, and after that trim a context line off whichever end has
+/// more of them, retrying each time down to that floor.
+///
+/// git reduces *both* ends in one pass when they are equal (`leading >= trailing`
+/// takes the front, and the separate `trailing > leading` test then takes the back
+/// off the already-shortened form), which is why the counts it reports can drop by
+/// two at a time.
+fn place_with_context(
     image: &[Vec<u8>],
     h: &Hunk,
     unidiff_zero: bool,
-    floor: usize,
+    p_context: Option<usize>,
     ignore_ws: bool,
-) -> Option<(usize, Hunk)> {
+) -> Option<Placed> {
     let mut cur = h.clone();
-    while cur.leading > floor || cur.trailing > floor {
-        let from_front = cur.leading > cur.trailing;
-        if from_front {
+    // apply.c:3134 — `pos = frag->newpos ? (frag->newpos - 1) : 0`, which the
+    // reduction loop then moves back one line for every leading context line it
+    // drops. It can go negative, and `find_pos()` reads that as "start from the end
+    // of the file".
+    let mut expected = if h.new_pos == 0 { 0 } else { h.new_pos as isize - 1 };
+    // "a hunk that is (oldpos <= 1) with or without leading context must match at
+    // the beginning"; "a hunk without trailing lines must match at the end" — both
+    // defeated by `--unidiff-zero`, which makes the absence of context
+    // uninformative. Computed once, from the hunk as written, and dropped as a
+    // whole on the first retry.
+    let mut match_beginning = h.old_pos == 0 || (h.old_pos == 1 && !unidiff_zero);
+    let mut match_end = !unidiff_zero && h.trailing == 0;
+    // `state->p_context` is `UINT_MAX` by default, so the limit test below is
+    // satisfied at once and no reduction happens unless `-C<n>` asked for one.
+    let floor = p_context.unwrap_or(usize::MAX);
+    loop {
+        if let Some(at) = find_pos(
+            image,
+            &cur.pre,
+            expected,
+            match_beginning,
+            match_end,
+            ignore_ws,
+            cur.eof_fudge,
+        ) {
+            let (leading, trailing) = (cur.leading, cur.trailing);
+            let reduced = leading != h.leading || trailing != h.trailing;
+            return Some(Placed {
+                at,
+                hunk: reduced.then_some(cur),
+                expected,
+                leading,
+                trailing,
+            });
+        }
+        // "Am I at my context limits?"
+        if cur.leading <= floor && cur.trailing <= floor {
+            return None;
+        }
+        if match_beginning || match_end {
+            match_beginning = false;
+            match_end = false;
+            continue;
+        }
+        if cur.leading >= cur.trailing {
             cur.leading -= 1;
             cur.pre.remove(0);
             cur.pre_common.remove(0);
@@ -1831,34 +2319,20 @@ fn place_reduced(
             if !cur.context.is_empty() {
                 cur.context.remove(0);
             }
-            // The pre-image now starts one line later.
-            cur.old_pos += 1;
-            cur.new_pos += 1;
-        } else {
+            expected -= 1;
+        }
+        if cur.trailing > cur.leading {
             cur.trailing -= 1;
             cur.pre.pop();
             cur.pre_common.pop();
             cur.post.pop();
             cur.post_common.pop();
             cur.context.pop();
-        }
-        if let Some(at) = place_hunk(image, &cur, unidiff_zero, ignore_ws) {
-            return Some((at, cur));
+            // `image_remove_last_line()` takes the shortened line away with
+            // everything else, so what is left ends in a newline again.
+            cur.eof_fudge = false;
         }
     }
-    None
-}
-
-/// Where hunk `h`'s pre-image lands in `image`, or `None` if it does not apply.
-fn place_hunk(image: &[Vec<u8>], h: &Hunk, unidiff_zero: bool, ignore_ws: bool) -> Option<usize> {
-    // "a hunk that is (oldpos <= 1) with or without leading context must match at
-    // the beginning"; "a hunk without trailing lines must match at the end" —
-    // both defeated by --unidiff-zero, which makes the absence of context
-    // uninformative.
-    let match_beginning = h.old_pos == 0 || (h.old_pos == 1 && !unidiff_zero);
-    let match_end = !unidiff_zero && h.trailing == 0;
-    let start = h.new_pos.saturating_sub(1);
-    find_pos(image, &h.pre, start, match_beginning, match_end, ignore_ws)
 }
 
 /// Locate `pre` in `image`, starting at `line` and walking outward one line at a
@@ -1867,24 +2341,31 @@ fn place_hunk(image: &[Vec<u8>], h: &Hunk, unidiff_zero: bool, ignore_ws: bool) 
 fn find_pos(
     image: &[Vec<u8>],
     pre: &[Vec<u8>],
-    mut line: usize,
+    start: isize,
     match_beginning: bool,
     match_end: bool,
     ignore_ws: bool,
+    eof_fudge: bool,
 ) -> Option<usize> {
-    if match_beginning {
-        line = 0;
+    let mut line = if match_beginning {
+        0
     } else if match_end {
-        line = image.len().saturating_sub(pre.len());
+        image.len() as isize - pre.len() as isize
+    } else {
+        start
+    };
+    // apply.c:2847-2853 compares as `size_t`, so a negative line — which
+    // `match_end` with an over-long pre-image, and the reduction loop's `pos--`,
+    // both produce — wraps past the image and is clamped to its end.
+    if line < 0 || line as usize > image.len() {
+        line = image.len() as isize;
     }
-    if line > image.len() {
-        line = image.len();
-    }
+    let line = line as usize;
 
     let (mut backwards, mut forwards, mut current) = (line, line, line);
     let mut i: usize = 0;
     loop {
-        if matches_at(image, pre, current, match_beginning, match_end, ignore_ws) {
+        if matches_at(image, pre, current, match_beginning, match_end, ignore_ws, eof_fudge) {
             return Some(current);
         }
         // Pick the next candidate: odd steps go backwards, even steps forwards,
@@ -1915,6 +2396,10 @@ fn find_pos(
 }
 
 /// Whether `pre` sits in `image` at line `at`, honouring the anchoring flags.
+///
+/// `eof_fudge` is `--inaccurate-eof`: the pre-image's last line had its newline
+/// taken off, and git compares the shortened buffer, so that line matches the
+/// file's as a prefix.
 fn matches_at(
     image: &[Vec<u8>],
     pre: &[Vec<u8>],
@@ -1922,6 +2407,7 @@ fn matches_at(
     match_beginning: bool,
     match_end: bool,
     ignore_ws: bool,
+    eof_fudge: bool,
 ) -> bool {
     if at + pre.len() > image.len() {
         return false;
@@ -1932,7 +2418,14 @@ fn matches_at(
     if match_beginning && at != 0 {
         return false;
     }
-    if image[at..at + pre.len()] == *pre {
+    if eof_fudge && !pre.is_empty() {
+        let last = pre.len() - 1;
+        if image[at..at + last] == pre[..last]
+            && image[at + last].starts_with(&pre[last])
+        {
+            return true;
+        }
+    } else if image[at..at + pre.len()] == *pre {
         return true;
     }
     // `match_fragment()` tries the byte-exact comparison first and only then, under
@@ -2421,6 +2914,7 @@ fn parse_hunk(
         raw: Vec::new(),
         trailing: 0,
         leading: 0,
+        eof_fudge: false,
     };
     let (mut added, mut deleted) = (0usize, 0usize);
     let mut last = Side::None;
@@ -2661,31 +3155,288 @@ fn strip_path(name: &[u8], n: usize) -> Result<Option<String>> {
     }
     let out = String::from_utf8(s.to_vec())
         .map_err(|_| anyhow::anyhow!("non-UTF-8 paths in patches are not supported"))?;
-    Ok(Some(check_path(out)?))
-}
-
-/// Reject anything that would escape the working tree. `--unsafe-paths`, which
-/// is what lets git through this gate, is not honoured, so this is unconditional.
-fn check_path(out: String) -> Result<String> {
-    if out.is_empty() || out.starts_with('/') || out.split('/').any(|c| c == "..") {
-        crate::git_fatal!("refusing to apply to path {out:?} outside the working tree");
-    }
-    Ok(out)
+    Ok(Some(out))
 }
 
 /// `--directory=<root>`: git's `prefix_one()` — prepend `root` to every patch
 /// path, after `-p<n>` has done its stripping. A `/dev/null` side is `None` here
 /// (a creation's pre-image, a deletion's post-image) and stays that way.
-fn prefix_names(p: &mut Patch, root: &str) -> Result<()> {
+///
+/// Nothing is validated here, exactly as in git: a root that pushes a path out of
+/// the working tree (`--directory=/tmp`) produces the joined name and lets
+/// [`check_unsafe_path`] rule on it later, per patch.
+fn prefix_names(p: &mut Patch, root: &str) {
     let root = root.trim_end_matches('/');
     if root.is_empty() {
-        return Ok(());
+        return;
     }
     for n in [&mut p.old_name, &mut p.new_name].into_iter().flatten() {
-        let joined = format!("{root}/{n}");
-        *n = check_path(joined)?;
+        *n = format!("{root}/{n}");
     }
-    Ok(())
+}
+
+/// `normalize_path_copy_len()` (path.c:1121), the part that runs on POSIX:
+/// resolve `.` and `..` components textually and squeeze runs of `/`. `None` is
+/// git's `-1` — a relative path that climbs above where it started, or an
+/// absolute one that climbs above `/`, which is the only way
+/// `apply_option_parse_directory()` can fail.
+///
+/// The Windows arms of the C (`offset_1st_component()` past a drive letter or a
+/// `//server/share` prefix, backslash separators) are not reproduced; on POSIX
+/// `offset_1st_component()` is just the leading `/`.
+fn normalize_path(src: &str) -> Option<String> {
+    let b = src.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(b.len());
+    let mut i = 0usize;
+    // The absolute path's leading `/` is copied through and becomes the floor
+    // `..` may not climb past (`dst0` in the C).
+    if b.first() == Some(&b'/') {
+        out.push(b'/');
+        i = 1;
+    }
+    let floor = out.len();
+    while b.get(i) == Some(&b'/') {
+        i += 1;
+    }
+
+    loop {
+        // A component beginning with `.` may be one of the four special forms.
+        let mut up = false;
+        if b.get(i) == Some(&b'.') {
+            match (b.get(i + 1), b.get(i + 2)) {
+                // (1) "." and ends: ignore and terminate.
+                (None, _) => i += 1,
+                // (2) "./": ignore, eat the slash and continue.
+                (Some(b'/'), _) => {
+                    i += 2;
+                    while b.get(i) == Some(&b'/') {
+                        i += 1;
+                    }
+                    continue;
+                }
+                // (3) ".." and ends: strip one and terminate.
+                (Some(b'.'), None) => {
+                    i += 2;
+                    up = true;
+                }
+                // (4) "../": strip one, eat the slash and continue.
+                (Some(b'.'), Some(b'/')) => {
+                    i += 3;
+                    while b.get(i) == Some(&b'/') {
+                        i += 1;
+                    }
+                    up = true;
+                }
+                _ => {}
+            }
+        }
+        if up {
+            // The C steps off the trailing '/' first and only then compares
+            // against `dst0`, so a `..` with nothing above it is the failure.
+            if out.len() <= floor {
+                return None;
+            }
+            out.pop();
+            while out.len() > floor && out.last() != Some(&b'/') {
+                out.pop();
+            }
+            continue;
+        }
+        // Copy up to the next '/', then eat every '/' that follows it.
+        while let Some(&c) = b.get(i) {
+            if c == b'/' {
+                break;
+            }
+            out.push(c);
+            i += 1;
+        }
+        if i >= b.len() {
+            break;
+        }
+        out.push(b'/');
+        while b.get(i) == Some(&b'/') {
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+/// `verify_dotfile()` (read-cache.c:944): rule on a path component that begins
+/// with `.`, with the leading dot already consumed. `false` means the whole path
+/// is invalid.
+fn verify_dotfile(rest: &[u8], is_symlink: bool) -> bool {
+    // "." on its own, and "./", are not allowed.
+    match rest.first() {
+        None | Some(b'/') => return false,
+        _ => {}
+    }
+    match rest[0] {
+        // ".git" followed by NUL or a slash, matched case-insensitively even when
+        // `ignore_case` is off — ".GIT" is outlawed everywhere out of caution.
+        b'g' | b'G' => {
+            if !matches!(rest.get(1), Some(b'i' | b'I')) {
+                return true;
+            }
+            if !matches!(rest.get(2), Some(b't' | b'T')) {
+                return true;
+            }
+            if matches!(rest.get(3), None | Some(b'/')) {
+                return false;
+            }
+            // A symlink may not be named ".gitmodules" either.
+            if is_symlink {
+                let tail = &rest[3..];
+                if tail.len() >= 7 && tail[..7].eq_ignore_ascii_case(b"modules") {
+                    return !matches!(tail.get(7), None | Some(b'/'));
+                }
+            }
+            true
+        }
+        // ".." followed by NUL or a slash.
+        b'.' => !matches!(rest.get(1), None | Some(b'/')),
+        _ => true,
+    }
+}
+
+/// `verify_path()` (read-cache.c:839): may this path be an index entry at all?
+/// The rule runs at the start of the path and again after every `/`, so it rules
+/// out an empty name, a leading or doubled or trailing separator, and any `.`,
+/// `..` or `.git` component.
+///
+/// Not reproduced: the `protect_hfs`/`protect_ntfs` arms, which also reject the
+/// Unicode- and 8.3-obfuscated spellings of `.git` (`is_hfs_dotgit()`,
+/// `is_ntfs_dotgit()`), and the Windows-only `has_dos_drive_prefix()` /
+/// `is_valid_path()` gates — on POSIX the latter two are compiled out
+/// (git-compat-util.h:224-229, :265).
+fn verify_path(path: &str, mode: u32) -> bool {
+    let is_symlink = mode & 0o170000 == 0o120000;
+    let b = path.as_bytes();
+    let mut i = 0usize;
+    loop {
+        match b.get(i) {
+            // The end of the string here is an empty path or a trailing '/'.
+            None => return false,
+            // A leading '/', or a doubled one.
+            Some(b'/') => return false,
+            Some(b'.') if !verify_dotfile(&b[i + 1..], is_symlink) => return false,
+            _ => {}
+        }
+        i += 1;
+        // Scan to the next separator; the checks above then run on what follows it.
+        match b[i..].iter().position(|&c| c == b'/') {
+            None => return true,
+            Some(off) => i += off + 1,
+        }
+    }
+}
+
+/// `build_fake_ancestor()` (apply.c:4243): write, to the file `--build-fake-ancestor`
+/// names, an index holding one entry per patch that is not a creation — the path's
+/// pre-image, taken from the blob its `index <old>..` line points at.
+///
+/// The three ways git finds that blob, in its order: the `index` line's id (however
+/// abbreviated) resolved against the object store; failing that, and only for a patch
+/// that adds and deletes no line, the path's current index entry (`get_current_oid`,
+/// a mode-only change); failing that, the run is over. Submodule (gitlink) pre-images
+/// are not read from a `Subproject commit` body here, so a gitlink patch takes the
+/// same route as any other.
+///
+/// git's entries carry the stat `refresh_cache_entry()` fills in; these are zeroed,
+/// which no reader of a fake ancestor consults — `git am -3` uses it as a tree.
+fn build_fake_ancestor(patches: &[Patch], path: &str, quiet: bool) -> Result<bool> {
+    let repo = gix::discover(".")?;
+    let mut result = gix::index::File::from_state(
+        gix::index::State::new(repo.object_hash()),
+        std::path::PathBuf::from(path),
+    );
+    // `get_current_oid()`'s source, read once and only if a mode-only change asks.
+    let current = || repo.open_index().ok();
+    for p in patches {
+        if p.is_new {
+            continue;
+        }
+        let name = p.old_name.as_deref().or(p.new_name.as_deref()).unwrap_or_default();
+        let id = match p.index_old.as_deref().and_then(|hex| blob_by_prefix(&repo, hex)) {
+            Some(id) => id,
+            None if p.added == 0 && p.deleted == 0 => {
+                match current()
+                    .and_then(|idx| idx.entry_by_path(name.as_bytes().as_bstr()).map(|e| e.id))
+                {
+                    Some(id) => id,
+                    None => {
+                        err(
+                            quiet,
+                            &format!("error: mode change for {name}, which is not in current HEAD"),
+                        );
+                        return Ok(false);
+                    }
+                }
+            }
+            None => {
+                err(
+                    quiet,
+                    &format!("error: sha1 information is lacking or useless ({name})."),
+                );
+                return Ok(false);
+            }
+        };
+        // `make_cache_entry()` runs the name past `verify_path()` too.
+        let mode = p.old_mode.or(p.new_mode).unwrap_or(0o100644);
+        if !verify_path(name, mode) {
+            err(quiet, &format!("error: invalid path '{name}'"));
+            err(quiet, &format!("error: make_cache_entry failed for path '{name}'"));
+            return Ok(false);
+        }
+        result.dangerously_push_entry(
+            Stat::default(),
+            id,
+            Flags::empty(),
+            to_index_mode(mode),
+            BString::from(name.as_bytes().to_vec()).as_ref(),
+        );
+    }
+    result.sort_entries();
+    result.write(gix::index::write::Options::default())?;
+    Ok(true)
+}
+
+/// `repo_get_oid_blob()` for the `index` line's id: git writes it abbreviated, so
+/// this resolves a prefix, and only a blob answers.
+fn blob_by_prefix(repo: &gix::Repository, hex: &str) -> Option<ObjectId> {
+    let prefix = gix::hash::Prefix::from_hex(hex).ok()?;
+    let id = match repo.objects.lookup_prefix(prefix, None).ok()?? {
+        Ok(id) => id,
+        // Ambiguous — git's `get_oid` would refuse it too.
+        Err(()) => return None,
+    };
+    let obj = repo.try_find_object(id).ok()??;
+    (obj.kind == gix::object::Kind::Blob).then_some(id)
+}
+
+/// `check_unsafe_path()` (apply.c:4036): the per-patch gate `--unsafe-paths`
+/// waives. Returns the offending name, which the caller reports as git does —
+/// `error: invalid path '<name>'`, and then exit 128 for the whole run.
+///
+/// Which names are examined is git's own selection: a deletion is judged on the
+/// path it removes, a creation on the path it makes, and everything else on both.
+fn check_unsafe_path(p: &Patch) -> Option<&str> {
+    let old_name = if p.is_delete || !p.is_new {
+        p.old_name.as_deref()
+    } else {
+        None
+    };
+    let new_name = if p.is_delete { None } else { p.new_name.as_deref() };
+    if let Some(old) = old_name {
+        if !verify_path(old, p.old_mode.unwrap_or(0)) {
+            return Some(old);
+        }
+    }
+    if let Some(new) = new_name {
+        if !verify_path(new, p.new_mode.unwrap_or(0)) {
+            return Some(new);
+        }
+    }
+    None
 }
 
 /// `prefix_patch()` (apply.c:2191): a patch that is not already root-relative has
@@ -3081,135 +3832,6 @@ fn match_class(pat: &[u8], c: u8) -> Option<(bool, usize)> {
     Some((matched ^ negated, i))
 }
 
-// ---------------------------------------------------------------------------
-// --reject — port of apply.c:apply_fragments (reject arm) + write_out_one_reject
-// ---------------------------------------------------------------------------
-
-/// Apply each file's hunks independently, writing partial results and dropping
-/// the hunks that do not land into `<name>.rej`. git forces verbose output here,
-/// so every diagnostic goes to stderr; the exit code is 1 if any hunk rejected.
-fn reject_apply(patches: &[Patch], o: &Opts) -> Result<ExitCode> {
-    let mut any_reject = false;
-    let empty: HashMap<String, Option<Vec<u8>>> = HashMap::new();
-
-    for p in patches {
-        if p.binary {
-            bail!("binary patch application is not implemented");
-        }
-        let name = p.new_name.as_deref().or(p.old_name.as_deref()).unwrap_or("");
-        let label = p.old_name.as_deref().or(p.new_name.as_deref()).unwrap_or("");
-        eprintln!("Checking patch {name}...");
-
-        if let Some(new) = &p.new_name {
-            if (p.is_new || p.is_rename) && std::fs::symlink_metadata(new).is_ok() {
-                eprintln!("error: {new}: already exists in working directory");
-                any_reject = true;
-                continue;
-            }
-        }
-
-        let mut image: Vec<Vec<u8>> = if p.is_new {
-            Vec::new()
-        } else {
-            let old = p.old_name.as_deref().unwrap_or_default();
-            // Read from disk (an earlier patch's write is already there).
-            match read_current(&empty, old) {
-                Some(bytes) => split_lines(&bytes).into_iter().map(|l| l.to_vec()).collect(),
-                None => {
-                    eprintln!("error: {old}: No such file or directory");
-                    any_reject = true;
-                    continue;
-                }
-            }
-        };
-
-        let mut applied: Vec<bool> = Vec::with_capacity(p.hunks.len());
-        for h in &p.hunks {
-            if let Some(at) = place_hunk(&image, h, o.unidiff_zero, o.ignore_ws) {
-                let repl = replacement(&image, at, h, o.no_add, o.ignore_ws);
-                image.splice(at..at + h.pre.len(), repl);
-                applied.push(true);
-            } else {
-                let pre: Vec<u8> = h.pre.concat();
-                eprint!(
-                    "error: while searching for:\n{}\n",
-                    String::from_utf8_lossy(&pre)
-                );
-                eprintln!("error: patch failed: {label}:{}", h.old_pos);
-                applied.push(false);
-            }
-        }
-
-        let nrej = applied.iter().filter(|a| !**a).count();
-        if nrej == 0 {
-            eprintln!("Applied patch {name} cleanly.");
-            finalize_write(p, &image)?;
-        } else {
-            any_reject = true;
-            eprintln!(
-                "Applying patch {name} with {nrej} {}...",
-                if nrej == 1 { "reject" } else { "rejects" }
-            );
-            for (idx, ok) in applied.iter().enumerate() {
-                if *ok {
-                    eprintln!("Hunk #{} applied cleanly.", idx + 1);
-                } else {
-                    eprintln!("Rejected hunk #{}.", idx + 1);
-                }
-            }
-            finalize_write(p, &image)?;
-            write_reject_file(p, &applied)?;
-        }
-    }
-
-    Ok(if any_reject {
-        ExitCode::from(1)
-    } else {
-        ExitCode::SUCCESS
-    })
-}
-
-/// Commit one reject-mode file result to disk immediately (git applies each file
-/// independently under `--reject`): a fully-applied deletion removes the file,
-/// otherwise the post-image path is rewritten with the surviving content.
-fn finalize_write(p: &Patch, image: &[Vec<u8>]) -> Result<()> {
-    let data: Vec<u8> = image.concat();
-    if p.is_delete && data.is_empty() {
-        if let Some(old) = &p.old_name {
-            let _ = std::fs::remove_file(old);
-            prune_empty_parents(Path::new(old));
-        }
-        return Ok(());
-    }
-    let target = p.new_name.as_deref().or(p.old_name.as_deref()).unwrap_or_default();
-    let mode = p.new_mode.unwrap_or(0o100644);
-    if let Some(old) = &p.old_name {
-        let _ = std::fs::remove_file(old);
-        if p.is_rename && old != target {
-            prune_empty_parents(Path::new(old));
-        }
-    }
-    create_leading_dirs(Path::new(target))?;
-    write_created(Path::new(target), mode, &data)?;
-    Ok(())
-}
-
-/// Write the `<name>.rej` file: a `diff a/<old> b/<new>\t(rejected hunks)` banner
-/// followed by the verbatim text of every rejected fragment, in patch order.
-fn write_reject_file(p: &Patch, applied: &[bool]) -> Result<()> {
-    let old = p.old_name.as_deref().or(p.new_name.as_deref()).unwrap_or("");
-    let new = p.new_name.as_deref().or(p.old_name.as_deref()).unwrap_or("");
-    let mut out: Vec<u8> = format!("diff a/{old} b/{new}\t(rejected hunks)\n").into_bytes();
-    for (idx, ok) in applied.iter().enumerate() {
-        if !*ok {
-            out.extend_from_slice(&p.hunks[idx].raw);
-        }
-    }
-    let rej = format!("{new}.rej");
-    std::fs::write(&rej, out)?;
-    Ok(())
-}
-
 /// The current bytes of `path`, preferring the result an earlier patch in this
 /// same run produced. `None` means the path does not exist.
 fn read_current(staged: &HashMap<String, Option<Vec<u8>>>, path: &str) -> Option<Vec<u8>> {
@@ -3485,17 +4107,31 @@ fn parse_binary_block(lines: &[&[u8]], mut i: usize) -> Option<(BinaryPayload, u
     ))
 }
 
-/// `apply_binary()`: rebuild a binary file's post-image from its payload, refusing
+/// `apply_binary()` (apply.c:3276): rebuild a binary file's post-image, refusing
 /// unless the `index` line named both ids in full and the pre-image is the one the
 /// payload was made against.
-fn rebuild_binary(p: &Patch, pre: &[u8]) -> std::result::Result<Vec<u8>, String> {
+///
+/// `reverse` is `state->apply_in_reverse`. [`Patch::reverse`] has already swapped the
+/// names and modes by the time this runs, but it leaves `index_old`/`index_new` in
+/// file order, so the swap `reverse_patches()` performs on the two oid prefixes
+/// (apply.c:2340) — and the matching switch to the *reverse* payload
+/// (apply.c:3245-3251) — happen here instead.
+fn rebuild_binary(p: &Patch, pre: &[u8], reverse: bool) -> std::result::Result<Vec<u8>, String> {
+    // `apply_binary()`'s own name, which prefers the pre-image side.
     let name = p
-        .new_name
+        .old_name
         .clone()
-        .or_else(|| p.old_name.clone())
+        .or_else(|| p.new_name.clone())
         .unwrap_or_default();
     let hexsz = gix::hash::Kind::Sha1.len_in_hex();
-    let (Some(old_id), Some(new_id)) = (&p.index_old, &p.index_new) else {
+    let (Some(old_id), Some(new_id)) = (
+        p.preimage_id(reverse),
+        if reverse {
+            p.index_old.as_ref()
+        } else {
+            p.index_new.as_ref()
+        },
+    ) else {
         return Err(format!(
             "cannot apply binary patch to '{name}' without full index line"
         ));
@@ -3505,22 +4141,62 @@ fn rebuild_binary(p: &Patch, pre: &[u8]) -> std::result::Result<Vec<u8>, String>
             "cannot apply binary patch to '{name}' without full index line"
         ));
     }
-    let Some(payload) = &p.binary_forward else {
-        return Err(format!("cannot apply binary patch to '{name}' without full index line"));
+
+    // `apply_binary()` (apply.c:3295-3313): a patch with a pre-image side has to meet
+    // contents that hash to the id it names — and the id git reports back is the one
+    // it just computed from those contents, not the one the patch asked for. A patch
+    // with no pre-image side (a creation) instead requires the target to be empty,
+    // and that is decided by `patch->old_name`, never by the bytes.
+    let have = blob_hex(pre);
+    if p.old_name.is_none() {
+        if !pre.is_empty() {
+            return Err(format!(
+                "the patch applies to an empty '{name}' but it is not empty"
+            ));
+        }
+    } else if have != *old_id {
+        return Err(format!(
+            "the patch applies to '{name}' ({have}), which does not match the current contents."
+        ));
+    }
+
+    // A null post-image id is a deletion; the payload describes nothing (apply.c:3316).
+    if new_id.bytes().all(|b| b == b'0') {
+        return Ok(Vec::new());
+    }
+
+    // "We already have the postimage" (apply.c:3321): when the object store can hand
+    // over the result there is no need for the payload at all — which is how a
+    // reverse-apply of a patch that carries no reverse hunk still works, as long as
+    // the blob it rebuilds is one the repository already holds.
+    if let Some(result) = read_blob_by_hex(new_id) {
+        return Ok(result);
+    }
+
+    // `apply_binary_fragment()` (apply.c:3230), whose own name prefers the post-image
+    // side, picks the second payload when reversing.
+    let frag_name = p
+        .new_name
+        .clone()
+        .or_else(|| p.old_name.clone())
+        .unwrap_or_default();
+    let payload = if reverse {
+        let Some(payload) = &p.binary_reverse else {
+            if p.binary_forward.is_none() {
+                return Err(format!("missing binary patch data for '{frag_name}'"));
+            }
+            return Err(format!(
+                "cannot reverse-apply a binary patch without the reverse hunk to '{frag_name}'"
+            ));
+        };
+        payload
+    } else {
+        let Some(payload) = &p.binary_forward else {
+            return Err(format!("missing binary patch data for '{frag_name}'"));
+        };
+        payload
     };
 
-    // `read_blob_object()`'s check: the pre-image has to hash to the id the patch was
-    // made against, or the payload describes something else entirely.
-    let have = blob_hex(pre);
-    if have != *old_id {
-        return Err(if pre.is_empty() {
-            format!("the patch applies to an empty '{name}' but it is not empty")
-        } else {
-            format!(
-                "the patch applies to '{name}' ({old_id}), which does not match the current contents."
-            )
-        });
-    }
     let Some(result) = payload.rebuild(pre) else {
         return Err(format!("binary patch does not apply to '{name}'"));
     };
@@ -3531,6 +4207,15 @@ fn rebuild_binary(p: &Patch, pre: &[u8]) -> std::result::Result<Vec<u8>, String>
         ));
     }
     Ok(result)
+}
+
+/// The blob `hex` names, when the repository this run stands in already holds it.
+/// `None` outside a repository, which is what `odb_has_object()` reports there.
+fn read_blob_by_hex(hex: &str) -> Option<Vec<u8>> {
+    let id = gix::ObjectId::from_hex(hex.as_bytes()).ok()?;
+    let repo = gix::discover(".").ok()?;
+    let obj = repo.try_find_object(id).ok()??;
+    (obj.kind == gix::object::Kind::Blob).then(|| obj.data.clone())
 }
 
 /// The blob id of `data`, which is what both ends of a binary patch are checked against.
@@ -3841,13 +4526,17 @@ mod tests {
             raw: Vec::new(),
             trailing: 1,
             leading: 1,
+            eof_fudge: false,
         };
         assert_eq!(
-            place_hunk(&image, &h, false, false),
+            place_with_context(&image, &h, false, None, false).map(|p| p.at),
             None,
             "byte-exact matching still rejects it"
         );
-        assert_eq!(place_hunk(&image, &h, false, true), Some(0));
+        assert_eq!(
+            place_with_context(&image, &h, false, None, true).map(|p| p.at),
+            Some(0)
+        );
         assert_eq!(
             replacement(&image, 0, &h, false, true),
             vec![b"\tone\n".to_vec(), b"NEW\n".to_vec(), b"\tthree\n".to_vec()]

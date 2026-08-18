@@ -108,23 +108,35 @@
 //! * `--update-refs`, and the `update-ref` instruction it generates: it still
 //!   selects the merge backend and still raises git's apply-backend
 //!   incompatibility errors, but nothing tracks the refs pointing into the
-//!   rebased range, so executing the instruction is refused.
+//!   rebased range. **The flag is accepted and then ignored**: the sheet is
+//!   generated without any `update-ref` line, so a rebase with it exits 0 having
+//!   left every branch pointing into the old range exactly where it was, with no
+//!   diagnostic and no `Updated the following refs with --update-refs:` report.
+//!   The refusal further down this module is reachable only from a hand-written
+//!   `update-ref` line in an edited todo, never from the flag.
 //! * `--rebase-merges=rebase-cousins`, which changes which base
 //!   `make_script_with_merges()` resets a branch to; only the default mode is
 //!   ported.
-//! * **The apply backend's real replay.** `--apply` works for the two shapes that
-//!   write no patches — the fast-forward finish and the exact replay above — and
-//!   is refused for anything that would actually apply one. `run_am()`
-//!   (builtin/rebase.c:656-726) pipes `git format-patch -k --stdout --full-index
-//!   --cherry-pick --right-only --default-prefix --no-renames --no-cover-letter
-//!   --pretty=mboxrd --topo-order --no-base <upstream>...<orig_head>` into
-//!   `git am --rebasing --patch-format=mboxrd`. Both commands exist in this
-//!   binary and a plain `git am` reproduces stock's commit ids byte for byte, but
-//!   neither accepts that invocation: [`super::format_patch`] does not implement
-//!   `--cherry-pick`, and [`super::am`] refuses `--rebasing` because
-//!   `parse_mail_rebase()` (builtin/am.c:1464-1485) and the `rewritten` list it
-//!   feeds are unported. The refusal names both rather than claiming `git am`
-//!   itself is missing.
+//! * **The apply backend's mailbox.** [`run_am`] is ported in full — it pipes
+//!   `git format-patch -k --stdout --full-index --cherry-pick --right-only
+//!   --default-prefix --no-renames --no-cover-letter --pretty=mboxrd
+//!   --topo-order --no-base <upstream>...<orig_head>` into
+//!   `git am --rebasing --patch-format=mboxrd`, then `move_to_original_branch()`,
+//!   exactly as `builtin/rebase.c:620-733` does — and the consuming half is
+//!   complete: [`super::am`] implements `--rebasing` (`parse_mail_rebase`,
+//!   `get_commit_info`, `write_commit_patch`, the `rewritten` list, `REBASE_HEAD`
+//!   and the three-way fallback), and fed a stock mailbox it reproduces stock's
+//!   commit objects, refs, reflogs and state files byte for byte, through a
+//!   conflict stop and `--continue`/`--skip`.
+//!
+//!   What is still missing is one flag on the *producing* half:
+//!   [`super::format_patch`] accepts `--cherry-pick` and `--right-only` but not
+//!   `--pretty=mboxrd` (it implements the `format.mboxrd` *config* only). Until it
+//!   does, a replay that would actually apply a patch stops at the format-patch
+//!   step, `run_am()` puts the branch back where it found it, and the refusal
+//!   quotes format-patch's own rejection rather than claiming `git am` is
+//!   missing. The shapes that write no patches — the fast-forward finish and the
+//!   exact replay above — are unaffected and still complete.
 //!
 //! ### `--root`
 //!
@@ -1102,14 +1114,17 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
         if m == ModeOption::EditTodo && ty != Backend::Merge {
             die!("The --edit-todo action can only be used during interactive rebase.");
         }
-        // The apply backend's `.git/rebase-apply` state is written by `git am`,
-        // which is not ported; only the merge backend's `rebase-merge` resumes.
+        // `run_am()`'s `ACTION_CONTINUE`/`ACTION_SKIP` arms plus `cmd_rebase()`'s
+        // shared `ACTION_ABORT`/`ACTION_QUIT`: a `.git/rebase-apply` session is
+        // resumed through `git am`, not through the sequencer.
         if apply_in_progress {
-            bail!(
-                "unsupported flag {:?} for an apply-backend rebase (only merge-backend \
-                 .git/rebase-merge state is resumable)",
-                m.flag()
-            );
+            if matches!(m, ModeOption::EditTodo | ModeOption::ShowCurrentPatch) {
+                // `--edit-todo` already died above; `--show-current-patch` is
+                // `git am --show-current-patch`, which under `--rebasing` shows
+                // the original commit (builtin/am.c:2229).
+                return super::am::am(&["--show-current-patch".to_string()]);
+            }
+            return rebase_apply_resume(&repo, m);
         }
         return match m {
             ModeOption::Abort => rebase_abort(&repo),
@@ -1855,8 +1870,14 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
     } else {
         None
     };
-    let exact_replay = plan.is_some();
-    let plan = plan.unwrap_or_default();
+    // The exact-replay shortcut is a *merge-backend* shape only. `cmd_rebase()`
+    // sends every apply-backend rebase that is not a plain fast-forward through
+    // `run_am()` (builtin/rebase.c:1892-1911), and that path is now ported, so
+    // short-cutting it here would diverge on everything `git am` does along the
+    // way — the `Applying:` lines, the session directory, and `Patch is empty.`
+    // on a commit that changes no tree.
+    let exact_replay = plan.is_some() && !apply_backend;
+    let plan = if exact_replay { plan.unwrap_or_default() } else { Vec::new() };
 
     if exact_replay {
         // `--signoff`/`--trailer` rewrite the *message* of every picked commit
@@ -1866,41 +1887,15 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
         if gpg_sign_on {
             return Err(refuse_gpg_sign());
         }
-        // `git format-patch` emits nothing for a commit that changes no tree, so
-        // the apply backend stops at one with `Patch is empty.` and leaves a
-        // half-finished `.git/rebase-apply` behind. Reproducing that interrupted
-        // state is out of scope. The merge backend keeps such commits — its picks
-        // are trees, not patches — and needs no guard.
-        if apply_backend && plan.iter().any(|s| s.tree == s.parent_tree) {
-            bail!(
-                "replaying an empty commit with the apply backend is not ported: `git am` stops \
-                 with `Patch is empty.` and leaves a .git/rebase-apply state directory behind"
-            );
-        }
     } else if apply_backend {
         // The apply backend detaches first and only then notices it merely
         // fast-forwarded. Deciding here keeps a refused rebase from mutating
         // anything.
-        // `run_am()` (builtin/rebase.c:656-726) pipes
-        // `git format-patch -k --stdout --full-index --cherry-pick --right-only
-        //  --default-prefix --no-renames --no-cover-letter --pretty=mboxrd
-        //  --topo-order --no-base <upstream>...<orig_head>`
-        // into `git am --rebasing --patch-format=mboxrd`. Both halves are
-        // present in this binary but neither accepts the invocation:
-        // `format-patch` rejects `--cherry-pick` (`fatal: unrecognized argument`)
-        // and `am` refuses `--rebasing` outright, because `parse_mail_rebase()`
-        // (builtin/am.c:1464-1485) and the `rewritten` list it feeds are not
-        // ported. Naming them is the point: the previous wording claimed `git am`
-        // itself was missing, which is false — a plain `git am` here reproduces
-        // stock's commit ids byte for byte.
-        if branch_base != Some(head_oid) {
-            bail!(
-                "replaying {} commit(s) with the apply backend is not ported: it needs \
-                 `git format-patch --cherry-pick` (unrecognized here) piped into \
-                 `git am --rebasing` (refused: `parse_mail_rebase` and the `rewritten` \
-                 list are unported). Use the merge backend (`--merge`, the default)",
-                replay_range.len()
-            );
+        // Signing a replayed commit is unported everywhere in this file, and
+        // `run_am()` would otherwise hand `git am` a `-S` it refuses mid-replay,
+        // after HEAD had already moved.
+        if gpg_sign_on && branch_base != Some(head_oid) {
+            return Err(refuse_gpg_sign());
         }
     }
     // Genuine picks (a real three-way merge per commit) are replayed in the finish
@@ -1972,6 +1967,8 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
                 signoff,
                 trailers: trailers.clone(),
                 rerere_autoupdate,
+                committer_date_is_author_date,
+                ignore_date,
             },
             onto_spec: &onto_spec,
             upstream: upstream_oid,
@@ -2142,8 +2139,70 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
         if apply_backend {
             rewritten::post_rewrite(&repo, &rewritten_pairs);
         }
-    } else if apply_backend {
+    } else if apply_backend && branch_base == Some(head_oid) {
+        // `if (oideq(&branch_base, &options.orig_head->object.oid))`
+        // (builtin/rebase.c:1892): the detach above already moved everything, so
+        // there is nothing to replay. Printed on stdout, ungated by `--quiet`.
         println!("Fast-forwarded {branch_name} to {onto_spec}.");
+    } else if apply_backend {
+        // `run_specific_rebase()` -> `run_am()` (builtin/rebase.c:620).
+        let head_name = branch.as_ref().map(|b| b.as_bstr().to_string());
+        // `options.revisions`: `<restrict|upstream|onto>..<orig_head>`, quoted in
+        // the "cannot rebase them" diagnostic and nowhere else.
+        let revisions_label = format!(
+            "{}..{}",
+            if root {
+                onto_oid
+            } else {
+                fork_point_oid.or(upstream_oid).unwrap_or(onto_oid)
+            },
+            head_oid
+        );
+        // `if (options.signoff) { strvec_push(&options.git_am_opts, "--signoff"); … }`
+        // (builtin/rebase.c:1640-1643). It is pushed *after* the "am options
+        // require --apply" check, so `--signoff` alone never implies the apply
+        // backend; adding it here keeps that ordering. The merge backend applies
+        // its sign-off through `sign_off()` instead and ignores `git_am_opts`.
+        let mut am_opts = git_am_opts.clone();
+        if signoff {
+            am_opts.push("--signoff".to_string());
+        }
+        let am = AmRun {
+            repo: &repo,
+            onto: onto_oid,
+            upstream: upstream_oid,
+            orig_head: head_oid,
+            restrict_revision: fork_point_oid,
+            root,
+            revisions: &revisions_label,
+            am_opts: &am_opts,
+            rerere_autoupdate,
+            quiet: flags & NO_QUIET == 0,
+            head_name: head_name.clone(),
+        };
+        match run_am(&am)? {
+            AmOutcome::Done(new_tip) => tip = new_tip,
+            AmOutcome::Stopped(code) => {
+                // `run_specific_rebase()`'s tail: a stopped `am` leaves its
+                // session directory, and `rebase_write_basic_state()` adds the
+                // `head-name`/`onto`/`orig-head` files `git rebase --continue`
+                // reads back on top of it.
+                rebase_write_basic_state_apply(
+                    &rebase_apply_dir(&repo),
+                    head_name.as_deref(),
+                    onto_oid,
+                    head_oid,
+                    flags & NO_QUIET == 0,
+                    flags & VERBOSE != 0,
+                    rerere_autoupdate,
+                )?;
+                // `cmd_rebase()` ends in `return !!ret` (builtin/rebase.c:1920),
+                // so every failure the backend reports collapses to exit 1 —
+                // `git am`'s own 128 for `Patch is empty.` or a conflict included.
+                let _ = code;
+                return Ok(ExitCode::from(1));
+            }
+        }
     } else if flags & FORCE != 0 && flags & NO_QUIET != 0 {
         // `complete_action()` appends a `noop` item to an empty todo list, and
         // with `allow_ff` off `skip_unnecessary_picks()` cannot drop it, so
@@ -2563,6 +2622,43 @@ mod rewritten {
     }
 }
 
+/// `try_to_commit()`'s date rules (sequencer.c:1636-1682), for one replayed
+/// commit.
+///
+/// ```c
+/// if (opts->committer_date_is_author_date) {
+///         if (!opts->ignore_date) { ...date = author's date... }
+///         else reset_ident_date();
+///         committer = fmt_ident(..., opts->ignore_date ? NULL : date.buf, ...);
+/// } else reset_ident_date();
+///
+/// if (opts->ignore_date) {
+///         ...
+///         author = fmt_ident(name, email, WANT_AUTHOR_IDENT, NULL, IDENT_STRICT);
+/// }
+/// ```
+///
+/// A `NULL` date argument to `fmt_ident` means "now", so `--ignore-date` restamps
+/// the author and `--committer-date-is-author-date` copies whichever author date
+/// then survives onto the committer. The two compose: given both, git calls
+/// `reset_ident_date()` and dates *both* identities by the same fresh value,
+/// which is why `now` is taken from the committer captured once for the run
+/// rather than read per commit.
+fn apply_date_options(
+    author: &mut gix::actor::Signature,
+    committer: &mut gix::actor::Signature,
+    now: gix::date::Time,
+    ignore_date: bool,
+    committer_date_is_author_date: bool,
+) {
+    if ignore_date {
+        author.time = now;
+    }
+    if committer_date_is_author_date {
+        committer.time = author.time;
+    }
+}
+
 /// `(worktree differs from index, index differs from HEAD, unmerged paths)` —
 /// the two predicates behind `has_unstaged_changes()` and
 /// `has_uncommitted_changes()`, plus the paths `refresh_index()` announces.
@@ -2684,6 +2780,17 @@ struct RebaseState {
     /// as the one-liner `$state_dir/allow_rerere_autoupdate`, holding the flag
     /// as spelled, and writes no file at all when it was never given.
     rerere_autoupdate: Option<bool>,
+    /// `--committer-date-is-author-date`: the committer of every replayed commit
+    /// is dated by that commit's author date. git records it as the presence of
+    /// `$state_dir/cdate_is_adate` and, on `--continue`, re-clears `allow_ff`
+    /// from it (sequencer.c:3234-3237) — a fast-forwarded pick would keep the
+    /// old committer date and defeat the option.
+    committer_date_is_author_date: bool,
+    /// `--ignore-date`/`--reset-author-date`: the *author* date of every replayed
+    /// commit is replaced with the current time. Recorded as
+    /// `$state_dir/ignore_date` and likewise re-clears `allow_ff`
+    /// (sequencer.c:3239-3242).
+    ignore_date: bool,
 }
 
 fn rebase_merge_dir(repo: &gix::Repository) -> std::path::PathBuf {
@@ -2713,6 +2820,10 @@ fn write_basic_state(repo: &gix::Repository, st: &RebaseState) -> Result<()> {
     marker(&dir, "quiet", st.quiet)?;
     marker(&dir, "verbose", st.verbose)?;
     marker(&dir, "reschedule-failed-exec", st.reschedule_failed_exec)?;
+    // `write_file(rebase_path_cdate_is_adate(), "%s", "")` /
+    // `write_file(rebase_path_ignore_date(), "%s", "")` (sequencer.c:3348-3351).
+    marker(&dir, "cdate_is_adate", st.committer_date_is_author_date)?;
+    marker(&dir, "ignore_date", st.ignore_date)?;
     marker(&dir, "no-reschedule-failed-exec", !st.reschedule_failed_exec)?;
     // `write_file(state_dir_path("signoff", opts), "--signoff")` — content-bearing,
     // unlike the empty markers above, though only its presence is ever read back.
@@ -2776,7 +2887,14 @@ fn read_basic_state(repo: &gix::Repository) -> Result<RebaseState> {
         squash_onto: read("squash-onto")
             .ok()
             .and_then(|s| ObjectId::from_hex(s.as_bytes()).ok()),
-        allow_ff: !dir.join("no-ff").exists(),
+        // `read_populate_opts()` clears `allow_ff` for each of `signoff`,
+        // `cdate_is_adate` and `ignore_date` as well as for `no-ff`
+        // (sequencer.c:3228-3242), so a resumed rebase keeps re-committing
+        // rather than fast-forwarding a pick whose dates it must rewrite.
+        allow_ff: !dir.join("no-ff").exists()
+            && !dir.join("signoff").exists()
+            && !dir.join("cdate_is_adate").exists()
+            && !dir.join("ignore_date").exists(),
         quiet: dir.join("quiet").exists(),
         verbose: dir.join("verbose").exists(),
         reschedule_failed_exec: dir.join("reschedule-failed-exec").exists(),
@@ -2789,6 +2907,8 @@ fn read_basic_state(repo: &gix::Repository) -> Result<RebaseState> {
             Ok("--no-rerere-autoupdate") => Some(false),
             _ => None,
         },
+        committer_date_is_author_date: dir.join("cdate_is_adate").exists(),
+        ignore_date: dir.join("ignore_date").exists(),
     })
 }
 
@@ -2990,6 +3110,454 @@ fn rebase_quit(repo: &gix::Repository) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+
+
+// ---------------------------------------------------------------------------
+// The apply backend: `run_am()` (builtin/rebase.c:620)
+// ---------------------------------------------------------------------------
+
+/// `rebase_resolvemsg` (sequencer.c:511). `run_am()` hands it to every `git am`
+/// it spawns, and `die_user_resolve()` prints it *instead of* `am`'s own
+/// `--continue`/`--skip`/`--abort` block — which is why a conflicted
+/// `git rebase --apply` talks about `git rebase` and never mentions `git am`.
+const REBASE_RESOLVEMSG: &str = concat!(
+    "Resolve all conflicts manually, mark them as resolved with\n",
+    "\"git add/rm <conflicted_files>\", then run \"git rebase --continue\".\n",
+    "You can instead skip this commit: run \"git rebase --skip\".\n",
+    "To abort and get back to the state before \"git rebase\", run \"git rebase --abort\"."
+);
+
+/// `opts->state_dir` for `REBASE_APPLY` (builtin/rebase.c:1266) — the very
+/// directory `git am` uses for its own session, which is what lets `git rebase
+/// --continue` be `git am --resolved` and nothing more.
+fn rebase_apply_dir(repo: &gix::Repository) -> std::path::PathBuf {
+    repo.git_dir().join("rebase-apply")
+}
+
+/// What `run_am()` reports back.
+enum AmOutcome {
+    /// The whole mailbox was applied; the payload is the new detached `HEAD`.
+    Done(ObjectId),
+    /// `am` stopped — a conflict, an empty patch, or a refusal. Its own
+    /// diagnostics are already on the terminal and the session directory is left
+    /// in place for `--continue`/`--skip`/`--abort`.
+    Stopped(ExitCode),
+}
+
+/// Everything `run_am()` reads out of `struct rebase_options`.
+struct AmRun<'a> {
+    repo: &'a gix::Repository,
+    onto: ObjectId,
+    upstream: Option<ObjectId>,
+    orig_head: ObjectId,
+    /// `opts->restrict_revision` — the `--fork-point` refinement, appended to the
+    /// range as `^<oid>`.
+    restrict_revision: Option<ObjectId>,
+    root: bool,
+    /// `opts->revisions`, used only in the "cannot rebase them" diagnostic.
+    revisions: &'a str,
+    /// `opts->git_am_opts` — the `-C<n>`/`-p<n>`/`--whitespace=`/`--signoff`/`-q`
+    /// set `cmd_rebase()` accumulated for the backend.
+    am_opts: &'a [String],
+    rerere_autoupdate: Option<bool>,
+    quiet: bool,
+    head_name: Option<String>,
+}
+
+/// `run_am()` — the apply backend's whole replay.
+///
+/// git turns the range into a mailbox with `git format-patch` and pipes it into
+/// `git am --rebasing`. The mailbox is *not* how the patches travel: under
+/// `--rebasing`, `parse_mail_rebase()` (builtin/am.c:1464) reads only each
+/// message's `From <oid>` postmark and regenerates the patch from that commit,
+/// so `format-patch`'s real job here is to decide **which** commits are replayed
+/// and **in what order** — `--cherry-pick --right-only` drops the ones already
+/// upstream, `--topo-order` fixes the sequence.
+///
+/// That is also why the mailbox must come from `format-patch` rather than be
+/// synthesised: `.git/rebase-apply/0001`… survive a conflict stop and are
+/// therefore observable, and `--show-current-patch=raw` prints one verbatim.
+fn run_am(a: &AmRun<'_>) -> Result<AmOutcome> {
+    use std::io::IsTerminal;
+    use std::process::{Command, Stdio};
+
+    let exe = std::env::current_exe()
+        .map_err(|e| anyhow!("cannot locate the running executable: {e}"))?;
+    let workdir = a.repo.workdir().map(|w| w.to_path_buf());
+    let rebased_patches = a.repo.git_dir().join("rebased-patches");
+
+    let out = std::fs::File::create(&rebased_patches)
+        .map_err(|e| anyhow!("could not open '{}' for writing: {e}", rebased_patches.display()))?;
+
+    let mut fp = Command::new(&exe);
+    fp.arg("format-patch").args([
+        "-k",
+        "--stdout",
+        "--full-index",
+        "--cherry-pick",
+        "--right-only",
+        "--default-prefix",
+        "--no-renames",
+        "--no-cover-letter",
+        "--pretty=mboxrd",
+        "--topo-order",
+        "--no-base",
+    ]);
+    // `opts->git_format_patch_opt`, whose only contributor is
+    // `if (isatty(2) && options.flags & REBASE_NO_QUIET)` (builtin/rebase.c:1565).
+    if !a.quiet && std::io::stderr().is_terminal() {
+        fp.arg("--progress");
+    }
+    // `<onto|upstream>...<orig_head>`: `opts->root` is "now equivalent to
+    // !opts->upstream", so the symmetric range starts at `<onto>` under `--root`.
+    let base = if a.root {
+        a.onto
+    } else {
+        a.upstream.unwrap_or(a.onto)
+    };
+    fp.arg(format!("{}...{}", base.to_hex(), a.orig_head.to_hex()));
+    if let Some(r) = a.restrict_revision {
+        fp.arg(format!("^{}", r.to_hex()));
+    }
+    if let Some(w) = &workdir {
+        fp.current_dir(w);
+    }
+    fp.stdout(Stdio::from(out)).stderr(Stdio::piped());
+    let fp_out = fp
+        .spawn()
+        .and_then(|c| c.wait_with_output())
+        .map_err(|e| anyhow!("failed to run format-patch: {e}"))?;
+
+    if !fp_out.status.success() {
+        let _ = std::fs::remove_file(&rebased_patches);
+        // `reset_head(oid = orig_head, branch = head_name)` — git puts the branch
+        // back exactly where it was before the detach above.
+        reset_to_orig_head(a.repo, a.orig_head, a.head_name.as_deref())?;
+        let err = String::from_utf8_lossy(&fp_out.stderr).into_owned();
+        // A missing flag in *this* binary is not the failure git's message
+        // describes, so it is named instead of dressed up as one.
+        if err.contains("unrecognized argument") || err.contains("unsupported flag") {
+            bail!(
+                "the apply backend builds its mailbox with `git format-patch`, which rejected \
+                 the invocation `run_am()` makes:\n    {}\nThe consumer half — \
+                 `git am --rebasing --patch-format=mboxrd` — is ported and byte-identical to \
+                 stock. Use the merge backend (`--merge`, the default) until format-patch \
+                 accepts the flag above",
+                err.trim()
+            );
+        }
+        eprint!("{err}");
+        eprintln!(
+            "error: \ngit encountered an error while preparing the patches to replay\n\
+             these revisions:\n\n    {}\n\nAs a result, git cannot rebase them.",
+            a.revisions
+        );
+        return Ok(AmOutcome::Stopped(ExitCode::from(1)));
+    }
+
+    let outcome = spawn_am(a, |am| {
+        am.arg("--rebasing")
+            .arg(format!("--resolvemsg={REBASE_RESOLVEMSG}"))
+            .arg("--patch-format=mboxrd");
+        let inp = std::fs::File::open(&rebased_patches)?;
+        am.stdin(Stdio::from(inp));
+        Ok(())
+    })?;
+    let _ = std::fs::remove_file(&rebased_patches);
+    outcome
+        .map(|()| finish_am(a.repo))
+        .unwrap_or_else(|code| Ok(AmOutcome::Stopped(code)))
+}
+
+/// `run_am()`'s `ACTION_CONTINUE`/`ACTION_SKIP` arms (builtin/rebase.c:631-650):
+/// the resume verbs are `git am --resolved`/`--skip` with the rebase's own
+/// resolve message, and nothing else.
+fn run_am_resume(a: &AmRun<'_>, skip: bool) -> Result<AmOutcome> {
+    let outcome = spawn_am(a, |am| {
+        am.arg(if skip { "--skip" } else { "--resolved" })
+            .arg(format!("--resolvemsg={REBASE_RESOLVEMSG}"));
+        Ok(())
+    })?;
+    outcome
+        .map(|()| finish_am(a.repo))
+        .unwrap_or_else(|code| Ok(AmOutcome::Stopped(code)))
+}
+
+/// The `git am` child every `run_am()` arm spawns: the accumulated
+/// `git_am_opts`, the `<action> (pick)` reflog action, and the rerere switch,
+/// plus whatever the caller adds.
+fn spawn_am(
+    a: &AmRun<'_>,
+    configure: impl FnOnce(&mut std::process::Command) -> std::io::Result<()>,
+) -> Result<std::result::Result<(), ExitCode>> {
+    let exe = std::env::current_exe()
+        .map_err(|e| anyhow!("cannot locate the running executable: {e}"))?;
+    let mut am = std::process::Command::new(&exe);
+    am.arg("am");
+    for o in a.am_opts {
+        am.arg(o);
+    }
+    match a.rerere_autoupdate {
+        Some(true) => {
+            am.arg("--rerere-autoupdate");
+        }
+        Some(false) => {
+            am.arg("--no-rerere-autoupdate");
+        }
+        None => {}
+    }
+    // `strvec_pushf(&am.env, GIT_REFLOG_ACTION "=%s (pick)", opts->reflog_action)`
+    // — every commit `am` writes gets a `rebase (pick): <subject>` reflog line.
+    am.env("GIT_REFLOG_ACTION", format!("{} (pick)", reflog_action()));
+    if let Some(w) = a.repo.workdir() {
+        am.current_dir(w);
+    }
+    configure(&mut am).map_err(|e| anyhow!("failed to prepare git am: {e}"))?;
+    let status = am
+        .status()
+        .map_err(|e| anyhow!("failed to run git am: {e}"))?;
+    if status.success() {
+        return Ok(Ok(()));
+    }
+    let code = u8::try_from(status.code().unwrap_or(1)).unwrap_or(1);
+    Ok(Err(ExitCode::from(code)))
+}
+
+/// The tail of a successful `run_am()`: `am --rebasing` leaves its session
+/// directory behind ("it's up to the caller to take care of housekeeping",
+/// builtin/am.c:1937), and `finish_rebase()` is the caller that removes it.
+fn finish_am(repo: &gix::Repository) -> Result<AmOutcome> {
+    let _ = std::fs::remove_dir_all(rebase_apply_dir(repo));
+    let tip = repo
+        .head_id()
+        .map_err(|e| anyhow!("could not read HEAD after git am: {e}"))?
+        .detach();
+    Ok(AmOutcome::Done(tip))
+}
+
+/// `reset_head(oid = orig_head, branch = head_name, flags = RESET_HEAD_HARD)` —
+/// what both `run_am()`'s format-patch failure path and `rebase --abort` use to
+/// put the branch and worktree back where the rebase found them.
+fn reset_to_orig_head(
+    repo: &gix::Repository,
+    orig_head: ObjectId,
+    head_name: Option<&str>,
+) -> Result<()> {
+    let should_interrupt = AtomicBool::new(false);
+    let old_index = repo.index_or_load_from_head()?.into_owned();
+    let tree = repo.find_commit(orig_head)?.tree_id()?.detach();
+    restore_worktree_to_tree(repo, &old_index, tree, &should_interrupt)?;
+    match head_name.filter(|n| *n != "detached HEAD") {
+        Some(name) => {
+            let full = full_name(name)?;
+            repo.edit_reference(RefEdit {
+                change: Change::Update {
+                    log: LogChange {
+                        mode: RefLog::AndReference,
+                        force_create_reflog: false,
+                        message: format!("{} (abort): returning to {name}", reflog_action()).into(),
+                    },
+                    expected: PreviousValue::Any,
+                    new: Target::Object(orig_head),
+                },
+                name: full.clone(),
+                deref: false,
+            })?;
+            set_head(
+                repo,
+                Target::Symbolic(full),
+                &format!("{} (abort): returning to {name}", reflog_action()),
+            )?;
+        }
+        None => set_head(
+            repo,
+            Target::Object(orig_head),
+            &format!("{} (abort): returning to {orig_head}", reflog_action()),
+        )?,
+    }
+    Ok(())
+}
+
+/// `rebase_write_basic_state()` (builtin/rebase.c:333) for the apply backend.
+///
+/// `run_specific_rebase()` calls it only when `run_am()` came back non-zero and
+/// the state directory still exists, so these files appear next to `git am`'s own
+/// session files exactly when a replay stopped — which is what makes the stopped
+/// session resumable by `git rebase --continue` rather than only `git am`.
+fn rebase_write_basic_state_apply(
+    dir: &std::path::Path,
+    head_name: Option<&str>,
+    onto: ObjectId,
+    orig_head: ObjectId,
+    quiet: bool,
+    verbose: bool,
+    rerere_autoupdate: Option<bool>,
+) -> Result<()> {
+    if !dir.is_dir() {
+        return Ok(());
+    }
+    std::fs::write(
+        dir.join("head-name"),
+        format!("{}\n", head_name.unwrap_or("detached HEAD")),
+    )?;
+    std::fs::write(dir.join("onto"), format!("{onto}\n"))?;
+    std::fs::write(dir.join("orig-head"), format!("{orig_head}\n"))?;
+    if quiet {
+        std::fs::write(dir.join("quiet"), b"")?;
+    }
+    if verbose {
+        std::fs::write(dir.join("verbose"), b"")?;
+    }
+    match rerere_autoupdate {
+        Some(true) => std::fs::write(dir.join("allow_rerere_autoupdate"), b"--rerere-autoupdate")?,
+        Some(false) => {
+            std::fs::write(dir.join("allow_rerere_autoupdate"), b"--no-rerere-autoupdate")?
+        }
+        None => {}
+    }
+    Ok(())
+}
+
+/// `read_basic_state()` for an apply-backend session: the three files
+/// `rebase_write_basic_state()` wrote, plus the rerere switch.
+struct ApplyState {
+    head_name: Option<String>,
+    onto: ObjectId,
+    orig_head: ObjectId,
+    quiet: bool,
+    verbose: bool,
+    rerere_autoupdate: Option<bool>,
+}
+
+fn read_apply_state(repo: &gix::Repository) -> Result<ApplyState> {
+    let dir = rebase_apply_dir(repo);
+    let read = |name: &str| -> Result<String> {
+        Ok(std::fs::read_to_string(dir.join(name))
+            .map_err(|e| anyhow!("could not read '{}': {e}", dir.join(name).display()))?
+            .trim_end_matches('\n')
+            .to_string())
+    };
+    let head_name = read("head-name")?;
+    let rr = std::fs::read_to_string(dir.join("allow_rerere_autoupdate")).ok();
+    Ok(ApplyState {
+        head_name: (head_name != "detached HEAD").then_some(head_name),
+        onto: ObjectId::from_hex(read("onto")?.as_bytes())?,
+        orig_head: ObjectId::from_hex(read("orig-head")?.as_bytes())?,
+        quiet: dir.join("quiet").exists(),
+        verbose: dir.join("verbose").exists(),
+        rerere_autoupdate: rr.map(|s| s.trim() == "--rerere-autoupdate"),
+    })
+}
+
+/// `cmd_rebase()`'s `ACTION_CONTINUE`/`ACTION_SKIP`/`ACTION_ABORT`/`ACTION_QUIT`
+/// for a `.git/rebase-apply` session (builtin/rebase.c:1352-1440).
+fn rebase_apply_resume(repo: &gix::Repository, action: ModeOption) -> Result<ExitCode> {
+    let st = read_apply_state(repo)?;
+    let dir = rebase_apply_dir(repo);
+    match action {
+        ModeOption::Quit => {
+            let _ = std::fs::remove_dir_all(&dir);
+            return Ok(ExitCode::SUCCESS);
+        }
+        ModeOption::Abort => {
+            // `rerere_clear(&merge_rr)`.
+            let _ = std::fs::remove_file(repo.git_dir().join("MERGE_RR"));
+            reset_to_orig_head(repo, st.orig_head, st.head_name.as_deref())?;
+            for f in [
+                "MERGE_HEAD",
+                "MERGE_RR",
+                "MERGE_MSG",
+                "MERGE_MODE",
+                "AUTO_MERGE",
+                "SQUASH_MSG",
+                "REBASE_HEAD",
+            ] {
+                let _ = std::fs::remove_file(repo.git_dir().join(f));
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+            super::maintenance::run_auto_maintenance(repo, false)?;
+            return Ok(ExitCode::SUCCESS);
+        }
+        _ => {}
+    }
+
+    let a = AmRun {
+        repo,
+        onto: st.onto,
+        upstream: None,
+        orig_head: st.orig_head,
+        restrict_revision: None,
+        root: false,
+        revisions: "",
+        am_opts: &[],
+        rerere_autoupdate: st.rerere_autoupdate,
+        quiet: st.quiet,
+        head_name: st.head_name.clone(),
+    };
+    let skip = action == ModeOption::Skip;
+    if skip {
+        // `ACTION_SKIP`'s `reset_head(RESET_HEAD_HARD)` before the `am --skip`:
+        // `am` does its own `clean_index`, but git discards the worktree here
+        // first so a half-applied patch cannot survive into the next one.
+        let _ = std::fs::remove_file(repo.git_dir().join("MERGE_RR"));
+    }
+    match run_am_resume(&a, skip)? {
+        AmOutcome::Done(tip) => {
+            move_to_original_branch(repo, tip, st.head_name.as_deref(), st.onto)?;
+            let _ = std::fs::remove_file(repo.git_dir().join("REBASE_HEAD"));
+            let _ = std::fs::remove_file(repo.git_dir().join("AUTO_MERGE"));
+            super::maintenance::run_auto_maintenance(repo, st.quiet)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        AmOutcome::Stopped(code) => {
+            rebase_write_basic_state_apply(
+                &dir,
+                st.head_name.as_deref(),
+                st.onto,
+                st.orig_head,
+                st.quiet,
+                st.verbose,
+                st.rerere_autoupdate,
+            )?;
+            // `return !!ret` again: a resumed apply-backend rebase that stops
+            // reports 1, not `git am`'s 128.
+            let _ = code;
+            Ok(ExitCode::from(1))
+        }
+    }
+}
+
+/// `move_to_original_branch()` (builtin/rebase.c:592): `RESET_HEAD_REFS_ONLY` —
+/// point the branch at the replayed tip and re-attach `HEAD` to it, touching
+/// neither the index nor the worktree (they already hold that tree).
+fn move_to_original_branch(
+    repo: &gix::Repository,
+    tip: ObjectId,
+    head_name: Option<&str>,
+    onto: ObjectId,
+) -> Result<()> {
+    let Some(name) = head_name else {
+        return Ok(()); /* nothing to move back to */
+    };
+    let full = full_name(name)?;
+    repo.edit_reference(RefEdit {
+        change: Change::Update {
+            log: LogChange {
+                mode: RefLog::AndReference,
+                force_create_reflog: false,
+                message: format!("{} (finish): {name} onto {onto}", reflog_action()).into(),
+            },
+            expected: PreviousValue::Any,
+            new: Target::Object(tip),
+        },
+        name: full.clone(),
+        deref: false,
+    })?;
+    let message = format!("{} (finish): returning to {name}", reflog_action());
+    set_head(repo, Target::Symbolic(full), &message)?;
+    super::checkout::record_head_move(repo, Some(tip), Some(tip), &message);
+    Ok(())
+}
 
 /// Everything `do_interactive_rebase()` carries into `complete_action()`.
 struct SequencerStart<'a> {
@@ -3438,6 +4006,12 @@ struct Sequencer<'r> {
     repo: &'r gix::Repository,
     st: RebaseState,
     committer: gix::actor::Signature,
+    /// `ident_default_date()`, cached once for the run exactly as git caches it
+    /// per process, so every commit `--ignore-date` restamps gets one value.
+    /// It is *not* the committer's time: `fmt_ident(…, NULL, …)` reads the wall
+    /// clock and ignores `GIT_COMMITTER_DATE`, which is why `--ignore-date` moves
+    /// the author date even when the committer date is pinned by the environment.
+    now: gix::date::Time,
     should_interrupt: AtomicBool,
     /// The autostash to re-apply when the rebase concludes, if any. Carried in
     /// `$state_dir/autostash` across interruptions.
@@ -3475,6 +4049,7 @@ impl<'r> Sequencer<'r> {
             repo,
             st,
             committer,
+            now: gix::date::Time::now_local_or_utc(),
             should_interrupt: AtomicBool::new(false),
             autostash: read_autostash(repo),
             index,
@@ -3546,7 +4121,26 @@ impl<'r> Sequencer<'r> {
         while i < list.items.len() {
             let item = list.items[i].clone();
             self.save_todo(&list, i + 1)?;
+            // `pick_commits()` clears the previous instruction's per-step records
+            // before running this one (sequencer.c:5043-5048):
+            //
+            // ```c
+            // unlink(rebase_path_author_script());
+            // unlink(git_path_merge_head(r));
+            // refs_delete_ref(…, "AUTO_MERGE", NULL, REF_NO_DEREF);
+            // refs_delete_ref(…, "REBASE_HEAD", NULL, REF_NO_DEREF);
+            // ```
+            //
+            // They run for every instruction including comments, and *before* the
+            // instruction executes — so a pick's `AUTO_MERGE` survives only until
+            // the next instruction starts. That is why `git rebase --exec` leaves
+            // none behind while a plain rebase does: the trailing `exec` clears
+            // the last pick's record and writes no merge of its own.
             let _ = std::fs::remove_file(dir.join("author-script"));
+            let git_dir = self.repo.git_dir();
+            for name in ["MERGE_HEAD", "AUTO_MERGE", "REBASE_HEAD"] {
+                let _ = std::fs::remove_file(git_dir.join(name));
+            }
 
             if item.cmd != todo::Cmd::Comment {
                 self.done_nr += 1;
@@ -3930,7 +4524,15 @@ impl<'r> Sequencer<'r> {
             return self.commit_fixup(item, &commit, applied.tree_id, final_fixup);
         }
 
-        let author = commit.author()?.to_owned()?;
+        let mut author = commit.author()?.to_owned()?;
+        let mut committer = self.committer.clone();
+        apply_date_options(
+            &mut author,
+            &mut committer,
+            self.now,
+            self.st.ignore_date,
+            self.st.committer_date_is_author_date,
+        );
         let parents = if create_root {
             Default::default()
         } else {
@@ -3944,7 +4546,7 @@ impl<'r> Sequencer<'r> {
                 message: final_message,
                 tree: applied.tree_id,
                 author,
-                committer: self.committer.clone(),
+                committer,
                 encoding: None,
                 parents,
                 extra_headers: Default::default(),
@@ -4201,14 +4803,22 @@ impl<'r> Sequencer<'r> {
         }
 
         write_author_script(repo, &commit)?;
-        let author = commit.author()?.to_owned()?;
+        let mut author = commit.author()?.to_owned()?;
+        let mut committer = self.committer.clone();
+        apply_date_options(
+            &mut author,
+            &mut committer,
+            self.now,
+            self.st.ignore_date,
+            self.st.committer_date_is_author_date,
+        );
         let signed = sign_off(&self.committer, self.st.signoff, &message)?;
         let new = repo
             .write_object(&gix::objs::Commit {
                 message: signed,
                 tree: applied.tree_id,
                 author,
-                committer: self.committer.clone(),
+                committer,
                 encoding: None,
                 parents: [head, merge_head].into_iter().collect(),
                 extra_headers: Default::default(),
@@ -4292,7 +4902,15 @@ impl<'r> Sequencer<'r> {
         let head_commit = repo.find_commit(head)?;
         // `AMEND_MSG`: the new commit takes HEAD's parents and HEAD's author.
         let parents: Vec<ObjectId> = head_commit.parent_ids().map(|p| p.detach()).collect();
-        let author = head_commit.author()?.to_owned()?;
+        let mut author = head_commit.author()?.to_owned()?;
+        let mut committer = self.committer.clone();
+        apply_date_options(
+            &mut author,
+            &mut committer,
+            self.now,
+            self.st.ignore_date,
+            self.st.committer_date_is_author_date,
+        );
 
         if !final_fixup {
             // Mid-chain: no editor, the message is the running combination.
@@ -4303,7 +4921,7 @@ impl<'r> Sequencer<'r> {
                     message: cleaned.into(),
                     tree,
                     author,
-                    committer: self.committer.clone(),
+                    committer: committer.clone(),
                     encoding: None,
                     parents: parents.into_iter().collect(),
                     extra_headers: Default::default(),
@@ -4331,7 +4949,7 @@ impl<'r> Sequencer<'r> {
                     message: cleaned.into(),
                     tree,
                     author,
-                    committer: self.committer.clone(),
+                    committer: committer.clone(),
                     encoding: None,
                     parents: parents.into_iter().collect(),
                     extra_headers: Default::default(),

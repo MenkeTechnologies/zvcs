@@ -23,6 +23,30 @@
 //!
 //! ## What is served
 //!
+//!   * **`--3way`, including the fallback.** `fall_back_threeway` is ported: on a
+//!     failed apply, `git apply --build-fake-ancestor` rebuilds the pre-image tree
+//!     from the patch's own `index` lines in a scratch index
+//!     (`.git/rebase-apply/patch-merge-index`), the patch is re-applied to *that*
+//!     with `--cached`, and the two trees are merged against `HEAD` through
+//!     [`crate::merge_apply`] — printing git's `Using index info to reconstruct a
+//!     base tree...` / `Falling back to patching base and 3-way merge...` pair and
+//!     recording the result as `AUTO_MERGE`.
+//!   * **`--rebasing`, the mode `git rebase --apply` drives.** `parse_mail_rebase`
+//!     reads each message's `From <oid>` postmark and rebuilds everything from
+//!     that commit — `get_commit_info` takes the authorship and message off the
+//!     commit object (so the original author *and* author date survive a rebase
+//!     verbatim), `write_commit_patch` regenerates the diff with `git diff-tree`,
+//!     and the mail body is never consulted. The session records
+//!     `original-commit` and `REBASE_HEAD`, appends `<old> <new>` to `rewritten`
+//!     from both `do_commit` and `--skip`, feeds that list to the `post-rewrite`
+//!     hook, and leaves its directory standing for the caller to clean up.
+//!   * **The `applypatch-msg`, `pre-applypatch` and `post-applypatch` hooks**, with
+//!     `-n`/`--no-verify` suppressing the first two. A hook that rewrites
+//!     `final-commit` changes the committed message, because the file is re-read
+//!     after it runs.
+//!   * **`--resolvemsg=<text>`**, which replaces the whole conflict hint block
+//!     rather than adding to it — this is how a conflicted `git rebase --apply`
+//!     says `git rebase --continue` and never mentions `git am`.
 //!   * **The full apply pipeline for a clean patch.** Each split message is run
 //!     through `git mailinfo` (authorship + subject + body + diff), the diff is
 //!     staged with `git apply --index`, and the commit is written with
@@ -85,32 +109,29 @@
 //! faithfully through the ported subcommands, so each refuses *before* it could
 //! write a wrong object or worktree rather than emit a guess:
 //!
-//!   * **`--3way`.** The fallback merge on apply failure needs
-//!     `build_fake_ancestor` plus the merge machinery; a clean patch under
-//!     `--3way` still applies, but a patch that fails and falls back refuses
-//!     (the session is left intact for `--abort`).
-//!   * **`--signoff`.** Faithful `append_signoff` trailer placement/dedup is not
-//!     vendored, so appending a Signed-off-by line is refused rather than
-//!     committed wrong.
 //!   * **`-i`/`--interactive`.** The per-patch tty prompt loop cannot run
 //!     unattended.
 //!   * **`-S`.** Signing the commit needs a path `git commit-tree` does not expose
 //!     here. `--ignore-date` and `--committer-date-is-author-date` are honoured:
 //!     the first drops the mail's author date, the second dates the committer by it.
-//!   * **`--rebasing` / rebase-driven sessions.** `parse_mail_rebase`, the
-//!     `rewritten` note replay, and `--show-current-patch` on an
-//!     `original-commit` all need the rebase machinery, which is an empty
-//!     placeholder (`gix-rebase`/`gix-sequencer`).
+//!   * **`GIT binary patch` bodies under `--rebasing`.** `write_commit_patch`
+//!     regenerates the diff with `git diff-tree`, which does not accept
+//!     `--binary` in this binary yet, so a replayed commit that changes a binary
+//!     file regenerates as `Binary files … differ` and then fails to apply. That
+//!     stops the replay loudly rather than committing a wrong tree.
+//!
+//! `--signoff` appends the trailer through the same `append_signoff()` port
+//! `commit` uses, after either parse arm and before the message is stored, so a
+//! `--rebasing --signoff` replay carries it and a later `--continue` sees it
+//! already in `final-commit`.
 //!
 //! `split_mbox` is `git mailsplit`: an input is cut at its `From ` postmarks
 //! (`is_from_line()`'s date-shaped test, not the object name), each message keeping the
 //! postmark it starts with, and content before the first postmark forming a message of
-//! its own — which is how a bare patch file reaches `am`. `--signoff` appends the
-//! trailer through the same `append_signoff()` port `commit` uses, before the message
-//! is stored, so a later `--continue` carries it.
+//! its own — which is how a bare patch file reaches `am`.
 
 use anyhow::{bail, Result};
-use gix::bstr::{BString, ByteSlice};
+use gix::bstr::{BStr, BString, ByteSlice};
 use gix::hash::ObjectId;
 use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
 use gix::refs::{FullName, Target};
@@ -333,7 +354,12 @@ struct Opts {
     format: Option<Format>,
     paths: Vec<String>,
     interactive: bool,
+    no_verify: bool,
     rebasing: bool,
+    resolvemsg: Option<String>,
+    /// `-b`/`--binary`/`--no-binary` was given. The option does nothing, but
+    /// `cmd_am` prints a deprecation notice whenever it appears.
+    binary_given: bool,
     threeway: bool,
     quiet: bool,
     signoff: bool,
@@ -361,7 +387,10 @@ impl Default for Opts {
             format: None,
             paths: Vec::new(),
             interactive: false,
+            no_verify: false,
             rebasing: false,
+            resolvemsg: None,
+            binary_given: false,
             threeway: false,
             quiet: false,
             signoff: false,
@@ -478,6 +507,20 @@ pub fn am(args: &[String]) -> Result<ExitCode> {
         }
     };
 
+    // ```c
+    // if (binary >= 0)
+    //         fprintf_ln(stderr, _("The -b/--binary option has been a no-op for long time, and\n"
+    //                              "it will be removed. Please do not use it anymore."));
+    // ```
+    // (builtin/am.c:2461-2464), immediately after `parse_options` and before any
+    // session work — so it is printed even by an invocation that then dies.
+    if opts.binary_given {
+        eprintln!(
+            "The -b/--binary option has been a no-op for long time, and\n\
+             it will be removed. Please do not use it anymore."
+        );
+    }
+
     let state_dir = repo.git_dir().join("rebase-apply");
 
     // `am_in_progress`: the directory alone is not a session — `next` and `last`
@@ -540,7 +583,7 @@ pub fn am(args: &[String]) -> Result<ExitCode> {
         // `RESUME_FALSE`/`RESUME_APPLY` both land in `am_run`; a bare `git am`
         // inside a live session re-drives the current (previously stopped) patch.
         Resume::Apply => run_am_loop(&repo, &state_dir, &cli, true),
-        Resume::ShowPatch(sub) => show_patch(&state_dir, sub),
+        Resume::ShowPatch(sub) => show_patch(&repo, &state_dir, sub),
         Resume::Quit => {
             // `am_rerere_clear()` then `am_destroy()`. Neither touches HEAD, the
             // index or the worktree — the session is simply forgotten.
@@ -763,9 +806,14 @@ fn parse_long(
                 _ => return Err(Usage::Error(format!("error: invalid value for '--empty': '{v}'"))),
             };
         }
-        // Consulted only when a patch fails to apply.
+        // `OPT_STRING(0, "resolvemsg", &state.resolvemsg, …)`: consulted only
+        // when a patch fails to apply, where it *replaces* the whole
+        // `--continue`/`--skip`/`--abort` hint block (builtin/am.c:1161-1184).
+        // `git rebase --apply` passes its own `rebase_resolvemsg`, which is why a
+        // conflicted `rebase --apply` says "git rebase --continue" and never
+        // mentions `git am`.
         "resolvemsg" => {
-            take_value(tok, attached, args, i)?;
+            o.resolvemsg = Some(take_value(tok, attached, args, i)?.to_string());
         }
         "no-resolvemsg" => no_value(tok, attached)?,
         "rerere-autoupdate" => o.rerere_autoupdate = Some(flag(tok, attached, true)?),
@@ -780,8 +828,20 @@ fn parse_long(
         }
         "ignore-date" => o.ignore_date = flag(tok, attached, true)?,
         "no-ignore-date" => o.ignore_date = flag(tok, attached, false)?,
-        // `--verify`/`--binary` govern hooks/apply this port does not special-case.
-        "verify" | "no-verify" | "binary" | "no-binary" => no_value(tok, attached)?,
+        // `OPT_BOOL('n', "no-verify", &state.no_verify, …)` — the sense of
+        // the *name* is the value, so `--no-verify` sets it and `--verify`
+        // clears it. It suppresses `applypatch-msg` and `pre-applypatch`;
+        // `post-applypatch` runs either way.
+        "no-verify" => o.no_verify = flag(tok, attached, true)?,
+        "verify" => o.no_verify = flag(tok, attached, false)?,
+        // `--binary` has been a documented no-op for years, but giving it still
+        // prints a deprecation line (builtin/am.c:2461-2464). `binary` starts at
+        // -1 and the notice fires on `binary >= 0`, i.e. for `--binary` and
+        // `--no-binary` alike.
+        "binary" | "no-binary" => {
+            no_value(tok, attached)?;
+            o.binary_given = true;
+        }
         "gpg-sign" => o.gpg_sign = true, // optional value, attached only
         "no-gpg-sign" => {
             no_value(tok, attached)?;
@@ -858,8 +918,8 @@ fn parse_short(
             'k' => o.keep = Keep::True,
             'm' => o.message_id = true,
             'c' => o.scissors = Some(true),
-            'n' => {} // --no-verify: hooks are never reached
-            'b' => {} // historical no-op
+            'n' => o.no_verify = true,
+            'b' => o.binary_given = true, // historical no-op, but still warns
             'r' => cmdmode(o, "-r", Resume::Resolved, None)?,
             // `-C<n>`/`-p<num>` take the rest of the token, or the next argument.
             'C' | 'p' => {
@@ -1441,6 +1501,8 @@ fn preflight(repo: &gix::Repository, state_dir: &Path) -> Result<Option<ExitCode
 struct Cli {
     empty: Empty,
     interactive: bool,
+    no_verify: bool,
+    resolvemsg: Option<String>,
     ignore_date: bool,
     committer_date_is_author_date: bool,
     gpg_sign: bool,
@@ -1451,6 +1513,8 @@ impl Cli {
         Self {
             empty: o.empty,
             interactive: o.interactive,
+            no_verify: o.no_verify,
+            resolvemsg: o.resolvemsg.clone(),
             ignore_date: o.ignore_date,
             committer_date_is_author_date: o.committer_date_is_author_date,
             gpg_sign: o.gpg_sign,
@@ -1467,6 +1531,10 @@ struct Ctx {
     exe: PathBuf,
     cwd: Option<PathBuf>,
     sdir: PathBuf,
+    /// The same directory as an absolute path, for the `GIT_INDEX_FILE` the
+    /// three-way fallback's scratch index needs: a child that inherits it
+    /// resolves it against its *own* cwd, which is not always the worktree root.
+    sdir_abs: PathBuf,
 }
 
 impl Ctx {
@@ -1480,7 +1548,19 @@ impl Ctx {
             ),
             _ => (None, state_dir.to_path_buf()),
         };
-        Ok(Ctx { exe, cwd, sdir })
+        let sdir_abs = if state_dir.is_absolute() {
+            state_dir.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map(|d| d.join(state_dir))
+                .unwrap_or_else(|_| state_dir.to_path_buf())
+        };
+        Ok(Ctx {
+            exe,
+            cwd,
+            sdir,
+            sdir_abs,
+        })
     }
 
     /// A child running `git <sub>` from the worktree root.
@@ -1590,40 +1670,45 @@ fn run_am_loop(
                 None => return Ok(ExitCode::from(128)),
             }
         } else {
-            if ld.rebasing {
-                bail!(
-                    "`git am --rebasing` / rebase-driven am is not ported: it needs \
-                     `parse_mail_rebase` (commit replay) and the `rewritten` note machinery, \
-                     neither of which exists in the vendored crates"
-                );
-            }
-            match parse_mail(&ctx, state_dir, &ld, &mail)? {
-                ParseOutcome::Skip => {
-                    am_next(repo, state_dir, &mut cur)?;
-                    resume = false;
-                    continue;
+            // `if (state->rebasing) skip = parse_mail_rebase(…); else skip =
+            // parse_mail(…);` (builtin/am.c:1845). `parse_mail_rebase` never
+            // skips, so only the `parse_mail` arm has a `goto next`.
+            let mut ci = if ld.rebasing {
+                match parse_mail_rebase(&ctx, repo, state_dir, &mail)? {
+                    Some(ci) => ci,
+                    None => return Ok(ExitCode::from(128)),
                 }
-                ParseOutcome::Died(code) => return Ok(code),
-                ParseOutcome::Parsed(mut ci) => {
-                    // `am --signoff`: the trailer goes on before the message is stored, so
-                    // `final-commit` (and a later `--continue`) already carries it.
-                    if ld.signoff {
-                        let sig = repo
-                            .committer()
-                            .transpose()?
-                            .ok_or_else(|| anyhow::anyhow!("unable to auto-detect email address"))?;
-                        let ident = format!("{} <{}>", sig.name, sig.email);
-                        let mut msg = String::from_utf8_lossy(&ci.msg).into_owned();
-                        super::commit::append_signoff(&mut msg, &ident, 0, true);
-                        ci.msg = msg.into_bytes();
-                        std::fs::write(state_dir.join("final-commit"), &ci.msg)?;
+            } else {
+                match parse_mail(&ctx, state_dir, &ld, &mail)? {
+                    ParseOutcome::Skip => {
+                        am_next(repo, state_dir, &mut cur)?;
+                        resume = false;
+                        continue;
                     }
-                    write_author_script(state_dir, &ci)?;
-                    // `final-commit` was written by `parse_mail`.
-                    ci
+                    ParseOutcome::Died(code) => return Ok(code),
+                    ParseOutcome::Parsed(ci) => ci,
                 }
+            };
+            // `am --signoff`: the trailer goes on before the message is stored, so
+            // `final-commit` (and a later `--continue`) already carries it. git
+            // appends it after either parse arm, so a `--rebasing --signoff`
+            // replay gets it too.
+            if ld.signoff {
+                let sig = repo
+                    .committer()
+                    .transpose()?
+                    .ok_or_else(|| anyhow::anyhow!("unable to auto-detect email address"))?;
+                let ident = format!("{} <{}>", sig.name, sig.email);
+                let mut msg = String::from_utf8_lossy(&ci.msg).into_owned();
+                super::commit::append_signoff(&mut msg, &ident, 0, true);
+                ci.msg = msg.into_bytes();
             }
+            write_author_script(state_dir, &ci)?;
+            // `write_commit_msg(state)` (builtin/am.c:1858), unconditional.
+            std::fs::write(state_dir.join("final-commit"), &ci.msg)?;
+            ci
         };
+        let mut info = info;
 
         if cli.interactive {
             bail!(
@@ -1654,36 +1739,58 @@ fn run_am_loop(
                 }
                 Empty::Stop => {
                     println!("Patch is empty.");
-                    return die_user_resolve(repo, state_dir, cli.interactive);
+                    return die_user_resolve(repo, state_dir, cli);
                 }
             }
         }
+
+        // `if (run_applypatch_msg_hook(state)) exit(1);` (builtin/am.c:1889) —
+        // after the empty-patch decision and before either the commit shortcut
+        // or the apply, so a `--empty=keep` commit runs it too.
+        if !run_applypatch_msg_hook(repo, state_dir, cli.no_verify, &mut info)? {
+            return Ok(ExitCode::from(1));
+        }
+        let first = first_line(&info.msg);
 
         if !to_keep {
             if !ld.quiet {
                 println!("Applying: {first}");
             }
-            if !run_apply(&ctx, &ld)? {
-                if ld.threeway {
-                    bail!(
-                        "`git am --3way` fallback is not ported: reconstructing a base tree and \
-                         running a 3-way merge needs `build_fake_ancestor` + the merge machinery \
-                         that is not vendored; the state directory is left intact for `--abort`"
-                    );
+            if !run_apply(&ctx, &ld, None)? {
+                // `--3way` (and therefore every `--rebasing` session, which
+                // `am_setup` forces threeway on) reconstructs a base tree from
+                // the patch's own index lines and merges instead of giving up.
+                let recovered = if ld.threeway {
+                    let merged = fall_back_threeway(&ctx, repo, &ld, &info.msg)?;
+                    // "Applying the patch to an earlier tree and merging the
+                    // result may have produced the same tree as ours."
+                    if merged && index_has_no_changes(repo)? {
+                        if !ld.quiet {
+                            println!("No changes -- Patch already applied.");
+                        }
+                        am_next(repo, state_dir, &mut cur)?;
+                        resume = false;
+                        continue;
+                    }
+                    merged
+                } else {
+                    false
+                };
+                if !recovered {
+                    println!("Patch failed at {cur:04} {first}");
+                    if crate::advice::enabled("amWorkDir") {
+                        eprintln!(
+                            "hint: Use 'git am --show-current-patch=diff' to see the failed patch"
+                        );
+                    }
+                    return die_user_resolve(repo, state_dir, cli);
                 }
-                println!("Patch failed at {cur:04} {first}");
-                if crate::advice::enabled("amWorkDir") {
-                    eprintln!(
-                        "hint: Use 'git am --show-current-patch=diff' to see the failed patch"
-                    );
-                }
-                return die_user_resolve(repo, state_dir, cli.interactive);
             }
         }
 
         if cli.gpg_sign {
             bail!(
-                "`git am -S` is not ported: signing the commit it writes needs the signing\
+                "`git am -S` is not ported: signing the commit it writes needs the signing \
                  path `commit-tree` does not expose here"
             );
         }
@@ -1691,8 +1798,10 @@ fn run_am_loop(
         if let Some(code) = do_commit(
             &ctx,
             repo,
+            state_dir,
             &info,
-            ld.quiet,
+            &ld,
+            cli.no_verify,
             cli.ignore_date,
             cli.committer_date_is_author_date,
         )? {
@@ -1703,11 +1812,26 @@ fn run_am_loop(
         resume = false;
     }
 
-    // `am_destroy`: nothing left to apply, so the session is torn down, and the
-    // automatic maintenance run the objects just written may have earned fires.
-    // git skips both under `--rebasing`, where the caller owns the housekeeping.
-    std::fs::remove_dir_all(state_dir)?;
+    finish_am_run(repo, state_dir, &ld)
+}
+
+/// `am_run`'s tail (builtin/am.c:1930-1946): the `rewritten` list is replayed to
+/// notes and the `post-rewrite` hook, and only a non-`--rebasing` session tears
+/// its own directory down — under `--rebasing` "it's up to the caller to take
+/// care of housekeeping", which is why `git rebase --apply` still finds
+/// `.git/rebase-apply` after `am` exits 0.
+fn finish_am_run(repo: &gix::Repository, state_dir: &Path, ld: &Loaded) -> Result<ExitCode> {
+    let rewritten = state_dir.join("rewritten");
+    if !is_empty_or_missing(&rewritten) {
+        // `copy_notes_for_rebase()` copies notes from each old commit to its
+        // replacement. Nothing in this port rewrites notes and no
+        // `notes.rewriteRef` is honoured anywhere, so with none configured stock
+        // copies nothing either and the step is a no-op rather than a divergence.
+        let payload = std::fs::read(&rewritten)?;
+        let _ = crate::hooks::run(repo, "post-rewrite", &["rebase"], Some(&payload));
+    }
     if !ld.rebasing {
+        std::fs::remove_dir_all(state_dir)?;
         super::maintenance::run_auto_maintenance(repo, ld.quiet)?;
     }
     Ok(ExitCode::SUCCESS)
@@ -1844,35 +1968,366 @@ fn stripspace(ctx: &Ctx, input: &[u8]) -> Result<Vec<u8>> {
     Ok(out.stdout)
 }
 
-/// `run_apply(state, NULL)`: `git apply --index <apply-opts> <patch>` — apply to
-/// both the index and the worktree, checking against the index. Returns whether
-/// the patch applied cleanly (the child's own diagnostics reach stderr).
-fn run_apply(ctx: &Ctx, ld: &Loaded) -> Result<bool> {
+/// `run_apply` (builtin/am.c:1489): `git apply <apply-opts> <patch>`.
+///
+/// `index_file` is git's second parameter. `NULL` sets `apply_state.check_index`
+/// — the `--index` spelling, applying to index *and* worktree — while a path
+/// sets `apply_state.index_file` plus `apply_state.cached`, i.e. `--cached`
+/// against that index, touching no file in the worktree. The second form is only
+/// used by [`fall_back_threeway`], which builds two throw-away trees in a
+/// scratch index before any of it reaches the user's files.
+///
+/// Under `--3way` git also silences the first attempt (`apply_verbosity =
+/// verbosity_silent`), because a patch that fails here is expected to succeed
+/// through the fallback and its complaints would be noise.
+///
+/// Returns whether the patch applied cleanly; the child's own diagnostics reach
+/// stderr.
+fn run_apply(ctx: &Ctx, ld: &Loaded, index_file: Option<&Path>) -> Result<bool> {
     let mut c = ctx.cmd("apply");
-    c.arg("--index");
+    match index_file {
+        Some(path) => {
+            c.arg("--cached").env("GIT_INDEX_FILE", path);
+        }
+        None => {
+            c.arg("--index");
+        }
+    }
     for opt in &ld.apply_opts {
         c.arg(opt);
     }
     c.arg(ctx.spath("patch"));
+    if ld.threeway && index_file.is_none() {
+        c.stderr(Stdio::null());
+    }
     Ok(c
         .status()
         .map_err(|e| anyhow::anyhow!("failed to run apply: {e}"))?
         .success())
 }
 
+/// `fall_back_threeway` (builtin/am.c:1560): what `am -3` does when the patch
+/// does not apply to the current tree.
+///
+/// The patch carries the pre-image blob of every hunk it touches in its `index`
+/// lines, so `git apply --build-fake-ancestor` can reconstruct the tree the
+/// patch *was* written against — for the paths the patch touches, and only
+/// those. That reconstructed tree is the merge base; `HEAD` is ours; the patch
+/// applied *to the reconstructed tree* is theirs. Merging the three lands the
+/// patch's intent on the current tree, or leaves conflict markers where it
+/// cannot.
+///
+/// git runs the two intermediate applies against a scratch index
+/// (`.git/rebase-apply/patch-merge-index`) so a failure never touches the
+/// worktree, and only the final merge is checked out.
+///
+/// Returns `Ok(true)` when the merge produced a clean result, `Ok(false)` when
+/// it stopped — either arm having already printed what git prints.
+fn fall_back_threeway(ctx: &Ctx, repo: &gix::Repository, ld: &Loaded, msg: &[u8]) -> Result<bool> {
+    let index_path = ctx.sdir_abs.join("patch-merge-index");
+    let _ = std::fs::remove_file(&index_path);
+
+    // `repo_get_oid("HEAD")` falling back to the empty tree: an `am` onto an
+    // unborn branch merges against nothing. git hands the *commit* to
+    // `merge_ort_generic`, which peels it; this port's tree-merge takes trees
+    // directly, so the peel happens here instead.
+    let our_tree = match repo.head_id().ok().map(|id| id.detach()) {
+        Some(head) => repo.find_commit(head)?.tree_id()?.detach(),
+        None => repo.object_hash().empty_tree(),
+    };
+
+    let mut fake = ctx.cmd("apply");
+    fake.arg(format!("--build-fake-ancestor={}", index_path.display()));
+    for opt in &ld.apply_opts {
+        fake.arg(opt);
+    }
+    fake.arg(ctx.spath("patch"));
+    if !fake
+        .status()
+        .map_err(|e| anyhow::anyhow!("failed to run apply: {e}"))?
+        .success()
+    {
+        eprintln!("error: could not build fake ancestor");
+        return Ok(false);
+    }
+
+    let base_tree = match capture(write_tree_in(ctx, &index_path))? {
+        Some(t) => t,
+        None => {
+            eprintln!("error: Repository lacks necessary blobs to fall back on 3-way merge.");
+            return Ok(false);
+        }
+    };
+
+    if !ld.quiet {
+        println!("Using index info to reconstruct a base tree...");
+        // `run_diff_index(DIFF_INDEX_CACHED)` filtered to A/M against `HEAD`:
+        // the paths that needed reconstructing, so the user knows where to look
+        // for a mismerge.
+        let _ = ctx
+            .cmd("diff-index")
+            .arg("--cached")
+            .arg("--name-status")
+            .arg("--diff-filter=AM")
+            .arg("HEAD")
+            .env("GIT_INDEX_FILE", &index_path)
+            .status();
+    }
+
+    if !run_apply(ctx, ld, Some(&index_path))? {
+        eprintln!(
+            "error: Did you hand edit your patch?\nIt does not apply to blobs recorded in its \
+             index."
+        );
+        return Ok(false);
+    }
+
+    let their_tree = match capture(write_tree_in(ctx, &index_path))? {
+        Some(t) => t,
+        None => {
+            eprintln!("error: could not write tree");
+            return Ok(false);
+        }
+    };
+
+    if !ld.quiet {
+        println!("Falling back to patching base and 3-way merge...");
+    }
+
+    // `o.branch1 = "HEAD"`, `o.branch2 = <first line of the message>`,
+    // `o.ancestor = "constructed fake ancestor"` — the labels that end up in the
+    // conflict markers.
+    let their_label = first_line(msg);
+    let labels = gix::merge::blob::builtin_driver::text::Labels {
+        ancestor: Some(BStr::new(b"constructed fake ancestor")),
+        current: Some(BStr::new(b"HEAD")),
+        other: Some(BStr::new(their_label.as_bytes())),
+    };
+    let old_index = repo.index_or_load_from_head()?.into_owned();
+    let applied = crate::merge_apply::three_way_merge_verbose(
+        repo,
+        oid_of(&base_tree)?,
+        our_tree,
+        oid_of(&their_tree)?,
+        &old_index,
+        labels,
+        &std::sync::atomic::AtomicBool::default(),
+        !ld.quiet,
+    )?;
+    let mut index = applied.index;
+    index.write(Default::default())?;
+    // `merge_switch_to_result()` records the result either way (merge-ort.c:4950).
+    crate::merge_apply::write_auto_merge(repo, applied.tree_id)?;
+
+    if !applied.conflicts.is_empty() {
+        eprintln!("error: Failed to merge in the changes.");
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+/// `write_index_as_tree(..., index_path, ...)`: `git write-tree` reading the
+/// scratch index rather than the repository's.
+fn write_tree_in(ctx: &Ctx, index_path: &Path) -> Command {
+    let mut c = ctx.cmd("write-tree");
+    c.env("GIT_INDEX_FILE", index_path);
+    c
+}
+
+fn oid_of(hex: &str) -> Result<ObjectId> {
+    ObjectId::from_hex(hex.trim().as_bytes())
+        .map_err(|e| anyhow::anyhow!("could not parse object name {hex:?}: {e}"))
+}
+
+/// `get_mail_commit_oid` (builtin/am.c:88): under `--rebasing` the mailbox is
+/// `git format-patch --stdout` output, whose `From <oid> Mon Sep 17 00:00:00
+/// 2001` postmark names the commit each patch came from. Only that first line is
+/// read — the message body is discarded in favour of the commit object itself,
+/// which is the whole point of the mode (builtin/am.c:1457-1462: it "bypasses
+/// git-mailinfo's munging of patches").
+fn get_mail_commit_oid(repo: &gix::Repository, mail: &Path) -> Option<ObjectId> {
+    let body = std::fs::read(mail).ok()?;
+    let line = match body.find_byte(b'\n') {
+        Some(p) => &body[..p],
+        None => &body[..],
+    };
+    let hex = line.strip_prefix(b"From ".as_ref())?;
+    // `get_oid_hex` reads exactly one hash worth of hex and ignores the rest of
+    // the line (the `Mon Sep 17 00:00:00 2001` fake date).
+    let n = repo.object_hash().len_in_hex();
+    ObjectId::from_hex(hex.get(..n)?).ok()
+}
+
+/// `get_commit_info` (builtin/am.c:1353): the authorship and message of the
+/// *commit*, not of the mail.
+///
+/// This is what makes `--rebasing` preserve the original author identity and
+/// author date exactly — a rebase rewrites the committer, never the author — and
+/// why a `--rebasing` session's `author-script` holds the replayed commit's own
+/// author rather than whoever is running the rebase.
+///
+/// The date is `show_ident_date(&id, DATE_MODE(NORMAL))`, e.g.
+/// `Thu Apr 7 15:13:13 2005 -0700`; `commit-tree` parses that spelling back to
+/// the same `<seconds> <tz>` pair, so the replayed commit keeps the timestamp
+/// bit-for-bit.
+fn get_commit_info(repo: &gix::Repository, oid: ObjectId) -> Result<CommitInfo> {
+    let commit = repo
+        .find_commit(oid)
+        .map_err(|e| anyhow::anyhow!("could not parse commit {oid}: {e}"))?;
+    let author = commit.author()?;
+    let time = author.time()?;
+    Ok(CommitInfo {
+        // `msg = strstr(buffer, "\n\n") + 2`: everything past the header block.
+        msg: commit.message_raw()?.to_vec(),
+        author_name: author.name.to_str_lossy().into_owned(),
+        author_email: author.email.to_str_lossy().into_owned(),
+        author_date: time.format_or_unix(gix::date::time::format::DEFAULT),
+    })
+}
+
+/// `write_commit_patch` (builtin/am.c:1398): regenerate the patch from the
+/// commit rather than trusting the mail body.
+///
+/// `rev_info` is set up with `diff = 1`, `no_commit_id = 1`, `show_root_diff = 1`,
+/// `abbrev = 0`, `flags.full_index`, `flags.binary` and `use_color = NEVER`, and
+/// `am`'s config callback is `git_default_config` — not `git_diff_ui_config` —
+/// so no `diff.*` UI knob (rename detection above all) is in play. `git
+/// diff-tree` is the plumbing that carries exactly that setup.
+///
+/// **`--binary` is absent** because `git diff-tree` does not accept it in this
+/// binary yet, so a commit whose patch needs a `GIT binary patch` body
+/// regenerates as `Binary files … differ` and then fails to apply, stopping the
+/// replay. That is loud rather than silent, and it goes away once `diff-tree`
+/// learns the flag.
+fn write_commit_patch(ctx: &Ctx, state_dir: &Path, oid: ObjectId) -> Result<()> {
+    let out = std::fs::File::create(state_dir.join("patch"))?;
+    let ok = ctx
+        .cmd("diff-tree")
+        .args([
+            "-p",
+            "--root",
+            "--no-commit-id",
+            "--full-index",
+            "--no-renames",
+            "--no-color",
+        ])
+        .arg(oid.to_hex().to_string())
+        .stdout(Stdio::from(out))
+        .stderr(Stdio::inherit())
+        .status()
+        .map_err(|e| anyhow::anyhow!("failed to run diff-tree: {e}"))?
+        .success();
+    if !ok {
+        bail!("could not write the patch for {oid}");
+    }
+    Ok(())
+}
+
+/// `parse_mail_rebase` (builtin/am.c:1464). Always applies the patch — there is
+/// no skip arm — so the return is the commit info or a hard failure.
+fn parse_mail_rebase(
+    ctx: &Ctx,
+    repo: &gix::Repository,
+    state_dir: &Path,
+    mail: &Path,
+) -> Result<Option<CommitInfo>> {
+    let Some(oid) = get_mail_commit_oid(repo, mail) else {
+        eprintln!("fatal: could not parse {}", mail.display());
+        return Ok(None);
+    };
+    let info = get_commit_info(repo, oid)?;
+    write_commit_patch(ctx, state_dir, oid)?;
+    write_text(state_dir, "original-commit", &oid.to_hex().to_string())?;
+    // `refs_update_ref(…, "am", "REBASE_HEAD", …, REF_NO_DEREF, DIE_ON_ERR)`:
+    // the commit being replayed, which `git status` and the conflict advice name.
+    repo.edit_reference(RefEdit {
+        change: Change::Update {
+            log: LogChange {
+                mode: RefLog::AndReference,
+                force_create_reflog: false,
+                message: "am".into(),
+            },
+            expected: PreviousValue::Any,
+            new: Target::Object(oid),
+        },
+        name: full_name("REBASE_HEAD")?,
+        deref: false,
+    })?;
+    Ok(Some(info))
+}
+
+/// `am_load`'s `original-commit` read (builtin/am.c:407) — `state->orig_commit`,
+/// null outside a `--rebasing` session.
+fn read_orig_commit(state_dir: &Path) -> Option<ObjectId> {
+    ObjectId::from_hex(read_state(state_dir, "original-commit").as_bytes()).ok()
+}
+
+/// The `rewritten` append `do_commit` (builtin/am.c:1720) and `am_skip`
+/// (builtin/am.c:2134) share: one `<original> <replacement>` line per replayed
+/// commit. `am_run`'s tail feeds the whole file to the `post-rewrite` hook, and
+/// `git rebase` reads it to update refs and notes.
+fn record_rewritten(state_dir: &Path, orig: ObjectId, new: ObjectId) -> Result<()> {
+    let mut fp = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(state_dir.join("rewritten"))?;
+    // git writes the two hexes and the newline in three separate `fprintf`s.
+    write!(fp, "{} {}\n", orig.to_hex(), new.to_hex())?;
+    Ok(())
+}
+
+/// `run_applypatch_msg_hook` (builtin/am.c:1478): the hook is handed the
+/// `final-commit` path and may rewrite it in place, so the message is re-read
+/// afterwards. A non-zero exit stops `am` with status 1.
+fn run_applypatch_msg_hook(
+    repo: &gix::Repository,
+    state_dir: &Path,
+    no_verify: bool,
+    info: &mut CommitInfo,
+) -> Result<bool> {
+    if no_verify {
+        return Ok(true);
+    }
+    let path = state_dir.join("final-commit");
+    if !crate::hooks::run(repo, "applypatch-msg", &[&path.display().to_string()], None)? {
+        return Ok(false);
+    }
+    match std::fs::read(&path) {
+        Ok(msg) => info.msg = msg,
+        Err(_) => {
+            eprintln!(
+                "fatal: '{}' was deleted by the applypatch-msg hook",
+                path.display()
+            );
+            std::process::exit(128);
+        }
+    }
+    Ok(true)
+}
+
 /// `do_commit`: `write-tree`, then `commit-tree` with the mail's author, then
 /// `update-ref HEAD` with the `am:` reflog line. `Some(code)` means git stops
 /// here (`die`); `None` means the commit was recorded.
+#[allow(clippy::too_many_arguments)]
 fn do_commit(
     ctx: &Ctx,
     repo: &gix::Repository,
+    state_dir: &Path,
     info: &CommitInfo,
-    quiet: bool,
+    ld: &Loaded,
+    no_verify: bool,
     // `--ignore-date` drops the mail's author date (the commit is dated now), and
     // `--committer-date-is-author-date` dates the committer by the author's.
     ignore_date: bool,
     committer_date_is_author_date: bool,
 ) -> Result<Option<ExitCode>> {
+    let quiet = ld.quiet;
+    // `if (!state->no_verify && run_hooks("pre-applypatch")) exit(1);`
+    // (builtin/am.c:1673) — the index is already staged, so a rejecting hook
+    // stops before the commit object exists.
+    if !no_verify && !crate::hooks::run(repo, "pre-applypatch", &[], None)? {
+        return Ok(Some(ExitCode::from(1)));
+    }
     // `fmt_ident(..., IDENT_STRICT)` refuses an empty author name; our
     // `commit-tree` would instead accept an empty gix signature, so reproduce
     // git's failure here rather than write a commit git would not.
@@ -1904,10 +2359,30 @@ fn do_commit(
     }
     ct.env("GIT_AUTHOR_NAME", &info.author_name)
         .env("GIT_AUTHOR_EMAIL", &info.author_email);
+    // ```c
+    // author = fmt_ident(state->author_name, state->author_email, WANT_AUTHOR_IDENT,
+    //                    state->ignore_date ? NULL : state->author_date, IDENT_STRICT);
+    // if (state->committer_date_is_author_date)
+    //         committer = fmt_ident(getenv("GIT_COMMITTER_NAME"), …,
+    //                               state->ignore_date ? NULL : state->author_date, …);
+    // ```
+    //
+    // A NULL *or empty* date argument makes `fmt_ident` fall back to
+    // `ident_default_date()` — the wall clock. git reaches `fmt_ident` directly,
+    // so `$GIT_AUTHOR_DATE` never enters into it; this port drives `commit-tree`,
+    // which *does* read the environment, so the variable has to be cleared
+    // explicitly. Both arms below matter: `--ignore-date` deliberately discards
+    // the date, and a mail with no `Date:` header never had one, and in either
+    // case the caller's ambient `GIT_AUTHOR_DATE` must not stand in for it.
     if !info.author_date.is_empty() && !ignore_date {
         ct.env("GIT_AUTHOR_DATE", &info.author_date);
         if committer_date_is_author_date {
             ct.env("GIT_COMMITTER_DATE", &info.author_date);
+        }
+    } else {
+        ct.env_remove("GIT_AUTHOR_DATE");
+        if committer_date_is_author_date {
+            ct.env_remove("GIT_COMMITTER_DATE");
         }
     }
     ct.stdin(Stdio::piped())
@@ -1946,6 +2421,20 @@ fn do_commit(
     if !updated {
         return Ok(Some(ExitCode::from(128)));
     }
+
+    // `if (state->rebasing) { … fprintf(fp, "%s %s\n", orig, commit); }`
+    // (builtin/am.c:1720-1727). The assert is git's: a `--rebasing` session
+    // always went through `parse_mail_rebase`, so `original-commit` exists.
+    if ld.rebasing {
+        if let Some(orig) = read_orig_commit(state_dir) {
+            record_rewritten(state_dir, orig, oid_of(&commit)?)?;
+        }
+    }
+
+    // `run_hooks("post-applypatch")` (builtin/am.c:1729) — advisory, its exit
+    // status is discarded.
+    let _ = crate::hooks::run(repo, "post-applypatch", &[], None);
+
     Ok(None)
 }
 
@@ -1988,7 +2477,8 @@ fn am_resolve(
         None => return Ok(ExitCode::from(128)),
     };
 
-    let quiet = read_state(state_dir, "quiet") == "t";
+    let ld = load_state(state_dir);
+    let quiet = ld.quiet;
     if !quiet {
         println!("Applying: {}", first_line(&info.msg));
     }
@@ -2004,7 +2494,7 @@ fn am_resolve(
                  stage, chances are that something else\nalready introduced the same changes; \
                  you might want to skip this patch."
             );
-            return die_user_resolve(repo, state_dir, cli.interactive);
+            return die_user_resolve(repo, state_dir, cli);
         }
     }
 
@@ -2014,7 +2504,7 @@ fn am_resolve(
              resolved conflicts to mark them as such.\nYou might run `git rm` on a file to \
              accept \"deleted by them\" for it."
         );
-        return die_user_resolve(repo, state_dir, cli.interactive);
+        return die_user_resolve(repo, state_dir, cli);
     }
 
     if cli.interactive {
@@ -2033,8 +2523,10 @@ fn am_resolve(
     if let Some(code) = do_commit(
         &ctx,
         repo,
+        state_dir,
         &info,
-        quiet,
+        &ld,
+        cli.no_verify,
         cli.ignore_date,
         cli.committer_date_is_author_date,
     )? {
@@ -2049,19 +2541,27 @@ fn am_resolve(
 /// `am_skip`: discard the current patch (reset the index/worktree to HEAD), then
 /// continue with the rest.
 fn am_skip(repo: &gix::Repository, state_dir: &Path, cli: &Cli) -> Result<ExitCode> {
-    if load_state(state_dir).rebasing {
-        bail!(
-            "`git am --skip` for a rebase-driven session is not ported: it must append the \
-             skipped commit to `rewritten`, which the unported rebase machinery consumes"
-        );
-    }
+    let ld = load_state(state_dir);
     let ctx = Ctx::new(repo, state_dir)?;
     am_rerere_clear(repo)?;
-    // clean_index(HEAD, HEAD): reset the index and worktree to HEAD, discarding
-    // the failed patch's partial application (untracked files are preserved).
-    if !reset_hard(&ctx, "HEAD")? {
+    // `clean_index(&head, &head)`: reset the index and worktree to HEAD,
+    // discarding the failed patch's partial application (untracked files are
+    // preserved). HEAD does not move, so nothing is written to its reflog.
+    if !clean_index(repo, &ctx, "HEAD")? {
         eprintln!("fatal: failed to clean index");
         return Ok(ExitCode::from(128));
+    }
+    // `if (state->rebasing) { … fprintf(fp, "%s %s\n", orig_commit, head); }`
+    // (builtin/am.c:2134): a skipped commit is rewritten *to the current HEAD*,
+    // which is how `git rebase --skip` tells the `post-rewrite` hook the commit
+    // was dropped rather than replaced.
+    if ld.rebasing {
+        if let (Some(orig), Some(head)) = (
+            read_orig_commit(state_dir),
+            repo.head_id().ok().map(|id| id.detach()),
+        ) {
+            record_rewritten(state_dir, orig, head)?;
+        }
     }
     let mut cur = read_count(state_dir, "next")?;
     am_next(repo, state_dir, &mut cur)?;
@@ -2127,12 +2627,22 @@ fn am_rerere_clear(repo: &gix::Repository) -> Result<()> {
 /// `die_user_resolve`: the `advise_if_enabled(ADVICE_MERGE_CONFLICT, ...)` hint
 /// block (stderr, `hint:`-prefixed), then exit 128. The `--allow-empty` line is
 /// gated on `advice.amWorkDir` plus an empty patch with no staged changes.
-fn die_user_resolve(
-    repo: &gix::Repository,
-    state_dir: &Path,
-    interactive: bool,
-) -> Result<ExitCode> {
+fn die_user_resolve(repo: &gix::Repository, state_dir: &Path, cli: &Cli) -> Result<ExitCode> {
+    // `if (state->resolvemsg) advise_if_enabled(ADVICE_MERGE_CONFLICT, "%s",
+    // state->resolvemsg);` — the caller's text *replaces* the whole block, hints
+    // and all. This is how `git rebase --apply` gets `git rebase --continue`
+    // wording out of a failed `git am`.
+    if let Some(msg) = &cli.resolvemsg {
+        if crate::advice::enabled("mergeConflict") {
+            for line in msg.split('\n') {
+                eprintln!("hint: {line}");
+            }
+            eprintln!("hint: Disable this message with \"git config set advice.mergeConflict false\"");
+        }
+        return Ok(ExitCode::from(128));
+    }
     if crate::advice::enabled("mergeConflict") {
+        let interactive = cli.interactive;
         let cmdline = if interactive { "git am -i" } else { "git am" };
         eprintln!("hint: When you have resolved this problem, run \"{cmdline} --continue\".");
         eprintln!("hint: If you prefer to skip this patch, run \"{cmdline} --skip\" instead.");
@@ -2285,6 +2795,44 @@ fn has_unmerged(repo: &gix::Repository) -> Result<bool> {
 
 /// Run `git reset --hard -q <rev>` (silent, so no `HEAD is now at …` line), the
 /// re-exec form of `am`'s `clean_index`/worktree reset. Returns success.
+/// `clean_index(head, head)` (builtin/am.c:2058): reset the index to a tree and
+/// bring the worktree with it, **moving no ref**.
+///
+/// This is not `reset --hard`: that also repoints `HEAD` and writes `ORIG_HEAD`,
+/// so using it for `am --skip` — where git's `clean_index` leaves `HEAD` exactly
+/// where it is — left a spurious `reset: moving to HEAD` line in `HEAD`'s reflog
+/// and an `ORIG_HEAD` stock never creates. `read-tree -u --reset` is the
+/// plumbing that does the index+worktree half alone.
+fn clean_index(repo: &gix::Repository, ctx: &Ctx, rev: &str) -> Result<bool> {
+    let ok = ctx
+        .cmd("read-tree")
+        .arg("-u")
+        .arg("--reset")
+        .arg(rev)
+        .status()
+        .map_err(|e| anyhow::anyhow!("failed to run read-tree: {e}"))?
+        .success();
+    if !ok {
+        return Ok(false);
+    }
+    // `clean_index()` ends in `remove_branch_state(the_repository, 0)`, which is
+    // `remove_merge_branch_state()` plus `SQUASH_MSG` (branch.c:803-829). Without
+    // it the `AUTO_MERGE` the three-way fallback recorded for the conflict being
+    // discarded survives the skip, and `git diff AUTO_MERGE` then reports against
+    // a merge that no longer exists.
+    for name in [
+        "MERGE_HEAD",
+        "MERGE_RR",
+        "MERGE_MSG",
+        "MERGE_MODE",
+        "AUTO_MERGE",
+        "SQUASH_MSG",
+    ] {
+        let _ = std::fs::remove_file(repo.git_dir().join(name));
+    }
+    Ok(true)
+}
+
 fn reset_hard(ctx: &Ctx, rev: &str) -> Result<bool> {
     Ok(ctx
         .cmd("reset")
@@ -2360,14 +2908,24 @@ fn dirty_paths(repo: &gix::Repository, state: &gix::index::State) -> Result<Vec<
 // show_patch
 // ---------------------------------------------------------------------------
 
-fn show_patch(state_dir: &Path, sub: Sub) -> Result<ExitCode> {
-    if state_dir.join("original-commit").is_file() {
-        // git delegates to `git show <orig-commit> --` for a rebase-driven
-        // session; that session cannot be produced here in the first place.
-        crate::git_fatal!(
-            "--show-current-patch for a rebase-driven am session is not yet ported: it \
-             replays `git show <original-commit>`, and gix-rebase is an empty placeholder"
-        );
+fn show_patch(repo: &gix::Repository, state_dir: &Path, sub: Sub) -> Result<ExitCode> {
+    // `if (!is_null_oid(&state->orig_commit)) { run "show <oid> --"; }`
+    // (builtin/am.c:2229). A `--rebasing` session shows the *original commit*,
+    // not the regenerated patch, and it ignores the raw/diff distinction.
+    if let Some(oid) = read_orig_commit(state_dir) {
+        let ctx = Ctx::new(repo, state_dir)?;
+        let ok = ctx
+            .cmd("show")
+            .arg(oid.to_hex().to_string())
+            .arg("--")
+            .status()
+            .map_err(|e| anyhow::anyhow!("failed to run show: {e}"))?
+            .success();
+        return Ok(if ok {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        });
     }
     let path = match sub {
         // `msgnum()`: the zero-padded number held in `next`.

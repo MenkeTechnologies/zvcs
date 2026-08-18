@@ -335,7 +335,7 @@ fn merge_and_apply(
     let mut conflicts: Vec<BString> = Vec::new();
     let mut messages: Vec<String> = Vec::new();
     for conflict in &merge.conflicts {
-        let path = conflict.changes_in_resolution().0.location().to_owned();
+        let path = conflict_location(conflict);
         if show_msgs && conflict.content_merge().is_some() {
             messages.push(format!("Auto-merging {path}"));
         }
@@ -386,6 +386,52 @@ fn merge_and_apply(
         conflicts,
         index,
     }))
+}
+
+/// The path merge-ort names a conflict by: where the merged content actually
+/// ended up, not where it started.
+///
+/// merge-ort's `path_msg()` calls are keyed on the *destination*. When one side
+/// renames a path and the other modifies it, `handle_content_merge()` runs
+/// against the rename's new name and reports it — stock 2.55.0 on a fixture
+/// where `HEAD` renames `old.txt` to `new.txt` and `side` edits `old.txt` prints
+/// `Auto-merging new.txt` / `CONFLICT (content): Merge conflict in new.txt`, and
+/// leaves the three stages under `new.txt`.
+///
+/// `gix-merge` records the same thing but spread across three places, and
+/// `changes_in_resolution().0` is not it: for that fixture the resolution is
+/// `OursModifiedTheirsRenamedAndChangedThenRename`, whose `ours` is the plain
+/// modification at the *old* name and whose `theirs` is the
+/// [`Change::Rewrite`](gix::diff::tree_with_rewrites::Change::Rewrite) carrying
+/// the new one. Reading `.0.location()` therefore named the pre-rename path on
+/// every rename conflict. The destination is, in order of authority:
+///
+///   1. `final_location`, when the resolution carries one — the directory-rename
+///      case, where the blob lands somewhere neither side spelled;
+///   2. the `Rewrite` side's `location`, which is documented as "the location
+///      after the rename or copy operation";
+///   3. `ours.location()`, when no rename is involved at all.
+fn conflict_location(conflict: &gix::merge::tree::Conflict) -> BString {
+    use gix::diff::tree_with_rewrites::Change;
+    use gix::merge::tree::Resolution;
+
+    if let Ok(
+        Resolution::SourceLocationAffectedByRename { final_location }
+        | Resolution::OursModifiedTheirsRenamedAndChangedThenRename {
+            final_location: Some(final_location),
+            ..
+        },
+    ) = &conflict.resolution
+    {
+        return final_location.clone();
+    }
+    let (ours, theirs) = conflict.changes_in_resolution();
+    for change in [ours, theirs] {
+        if matches!(change, Change::Rewrite { .. }) {
+            return change.location().to_owned();
+        }
+    }
+    ours.location().to_owned()
 }
 
 /// Check out `new_tree_id` over the worktree, touching only entries that differ

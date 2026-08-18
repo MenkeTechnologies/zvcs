@@ -425,7 +425,11 @@ fn unknown_strategies_are_still_rejected() {
 
     let repo = diverged("bogus", base, side, main);
     let out = run(&repo, &["merge", "-s", "nosuchstrategy", "side"]);
-    assert_eq!(code(&out), 128);
+    // Exit 1, not 128: `get_strategy()` prints this block with plain
+    // `fprintf(stderr, ...)` and ends in `exit(1)` (builtin/merge.c:209-222).
+    // It never reaches `die()`, which is where a 128 would come from. Measured
+    // against stock 2.55.0, which exits 1 here.
+    assert_eq!(code(&out), 1, "{}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(
         String::from_utf8_lossy(&out.stderr),
         "Could not find merge strategy 'nosuchstrategy'.\n\

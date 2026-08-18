@@ -32,10 +32,18 @@
 //!     (builtin/merge-recursive.c:55-58), so this shares
 //!     [`crate::merge_apply::StrategyOptions`] with it rather than keeping a
 //!     second opinion about which options are honourable.
+//!   * `--subtree` and `--subtree=<path>`. `merge-recursive` and `merge-subtree`
+//!     are one program — `cmd_merge_recursive()` only checks whether `argv[0]`
+//!     ends in `-subtree` to seed `o.subtree_shift = ""`
+//!     (builtin/merge-recursive.c:38-39) — so the flag reaches
+//!     `merge_ort_internal()`'s shift (merge-ort.c:5243-5248) under either name.
+//!     The shift itself is [`crate::merge_apply::shift_tree_object`], which is
+//!     also what the porcelain's `-Xsubtree` runs.
 //!
 //! Not covered, and refused rather than approximated:
-//!   * `--subtree[=<path>]` — tree shifting is [`super::merge_subtree`]'s path,
-//!     which runs the same driver shape with its own `shift_tree_object` pass
+//!   * `--subtree` over a criss-cross history, or over two or more explicit
+//!     bases: git shifts inside every level of the virtual-merge-base recursion,
+//!     and `Repository::virtual_merge_base` cannot carry the shift into its own
 //!   * conflict classes outside the content family (rename/rename, rename/delete,
 //!     modify/delete, directory/file, submodule, binary). `gix-merge` reports
 //!     these as structured resolutions, not as git's message strings; rendering
@@ -184,18 +192,6 @@ pub fn merge_recursive(args: &[String]) -> Result<ExitCode> {
         }
     }
 
-    // Tree shifting is `super::merge_subtree`'s, which runs the same driver's
-    // shape with its own `shift_tree_object` pass; refuse rather than drop it.
-    if xopts.subtree_shift.is_some() {
-        bail!(
-            "unsupported flag \"--subtree\" here (tree shifting is `git merge-subtree`'s path); \
-             ported: --ours, --theirs, --renormalize, --no-renormalize, --no-renames, \
-             --find-renames[=<n>], --rename-threshold=<n>, --patience, --histogram, \
-             --diff-algorithm=<myers|minimal|patience|histogram>, --ignore-space-change, \
-             --ignore-all-space, --ignore-space-at-eol, --ignore-cr-at-eol"
-        );
-    }
-
     // `-Xrenormalize` reaches the blob pipeline through the repository's own
     // `merge.renormalize`, so it is applied to a private clone before anything
     // reads a blob.
@@ -208,9 +204,35 @@ pub fn merge_recursive(args: &[String]) -> Result<ExitCode> {
     let head_tree = repo.find_commit(head_id)?.tree_id()?.detach();
     let remote_tree = repo.find_commit(remote_id)?.tree_id()?.detach();
 
+    // `if (opt->subtree_shift) { side2 = shift_tree_object(repo, side1, side2,
+    // opt->subtree_shift); merge_base = shift_tree_object(repo, side1,
+    // merge_base, opt->subtree_shift); }` (merge-ort.c:5243-5248) — the shift
+    // aligns the *remote* and the *base* onto the head, and it runs inside
+    // `merge_ort_internal()`, which every caller reaches.
+    //
+    // `merge-recursive` and `merge-subtree` are one program: `cmd_merge_recursive()`
+    // (builtin/merge-recursive.c:24-100) differs only in whether `argv[0]` ends
+    // in `-subtree`, which seeds `o.subtree_shift = ""`
+    // (builtin/merge-recursive.c:38-39). Both names then run the same
+    // `parse_merge_opt()`, whose `subtree` / `subtree=<path>` branches
+    // (merge-ort.c:5551-5554) are therefore reachable under either — so refusing
+    // `--subtree` here was divergence, not a floor. Measured against stock
+    // 2.55.0: `git merge-recursive --subtree=sub <base> -- main side` reports
+    // `Auto-merging f.txt` / `CONFLICT (content): Merge conflict in f.txt` and
+    // leaves three stages of `f.txt`, where the same command without the flag
+    // reports a `sub/f.txt` modify/delete.
+    //
+    // The shift is applied through [`crate::merge_apply::shift_tree_object`],
+    // which is `match-trees.c`'s `shift_tree`/`shift_tree_by`/`splice_tree` —
+    // the same function the porcelain's `-Xsubtree` goes through, so the two
+    // spellings cannot drift apart.
+    let subtree_shift = xopts.subtree_shift.clone();
+
     // With no explicit bases git computes them itself (recursively merging
-    // multiple bases); with bases given it uses exactly those.
-    let mut outcome = if bases.is_empty() {
+    // multiple bases); with bases given it uses exactly those. A shift forces
+    // the explicit-tree path even with no bases, because the base tree has to be
+    // in hand to be shifted.
+    let mut outcome = if bases.is_empty() && subtree_shift.is_none() {
         let labels = Labels {
             ancestor: None,
             current: Some(BStr::new(label1.as_bytes())),
@@ -221,20 +243,57 @@ pub fn merge_recursive(args: &[String]) -> Result<ExitCode> {
         repo.merge_commits(head_id, remote_id, labels, commit_options)?
             .tree_merge
     } else {
-        let ancestor_label = if bases.len() == 1 {
-            "constructed merge base"
+        let (base_tree, ancestor_label) = if bases.is_empty() {
+            // The shift path derives the base the way `merge_ort_recursive()`
+            // does before it calls `merge_ort_internal()`.
+            let computed = repo.merge_bases_many(head_id, &[remote_id])?;
+            match computed.len() {
+                // "if there is no common ancestor, use an empty tree"
+                0 => (ObjectId::empty_tree(repo.object_hash()), None),
+                1 => (repo.find_commit(computed[0].detach())?.tree_id()?.detach(), None),
+                // The virtual merge base is built by recursively merging the
+                // bases, and `merge_ort_internal()` applies the shift at every
+                // level of that recursion. `Repository::virtual_merge_base`
+                // cannot thread a shift through its own recursion, so this is a
+                // floor rather than a wrong answer — the same one
+                // `super::merge_subtree` documents.
+                n => crate::git_fatal!(
+                    "merge-recursive --subtree cannot be performed: the history has {n} merge \
+                     bases (criss-cross), whose virtual merge base git builds by recursively \
+                     merging them with the subtree shift applied at each level; \
+                     Repository::virtual_merge_base cannot thread the shift through its recursion"
+                ),
+            }
+        } else if bases.len() == 1 {
+            (
+                repo.find_commit(bases[0])?.tree_id()?.detach(),
+                Some("constructed merge base"),
+            )
+        } else if subtree_shift.is_some() {
+            crate::git_fatal!(
+                "merge-recursive --subtree cannot be performed: {} explicit merge bases require a \
+                 virtual merge base built by recursively merging them with the subtree shift \
+                 applied at each level; Repository::virtual_merge_base cannot thread the shift \
+                 through its recursion",
+                bases.len()
+            )
         } else {
-            "merged common ancestors"
+            (
+                repo.virtual_merge_base(bases.clone(), tree_options.clone())?
+                    .tree_id
+                    .detach(),
+                Some("merged common ancestors"),
+            )
         };
-        let base_tree = if bases.len() == 1 {
-            repo.find_commit(bases[0])?.tree_id()?.detach()
-        } else {
-            repo.virtual_merge_base(bases.clone(), tree_options.clone())?
-                .tree_id
-                .detach()
+        let (base_tree, remote_tree) = match &subtree_shift {
+            Some(prefix) => (
+                crate::merge_apply::shift_tree_object(&repo, head_tree, base_tree, prefix.as_ref())?,
+                crate::merge_apply::shift_tree_object(&repo, head_tree, remote_tree, prefix.as_ref())?,
+            ),
+            None => (base_tree, remote_tree),
         };
         let labels = Labels {
-            ancestor: Some(BStr::new(ancestor_label.as_bytes())),
+            ancestor: ancestor_label.map(|s| BStr::new(s.as_bytes())),
             current: Some(BStr::new(label1.as_bytes())),
             other: Some(BStr::new(label2.as_bytes())),
         };

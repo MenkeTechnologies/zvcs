@@ -1099,7 +1099,7 @@ fn render_non_patch(out: &mut Vec<u8>, rows: &[Row], opts: &Opts) {
             .iter()
             .filter(|r| !r.binary)
             .fold((0u32, 0u32), |(a, d), r| (a + r.added, d + r.deleted));
-        super::diff::stat_summary(out, rows.len() as u32, adds, dels);
+        super::diffstat::print_stat_summary(out, rows.len() as u64, u64::from(adds), u64::from(dels));
     }
     if opts.fmt.summary {
         // `show_file_mode_name(opt, "create", p->two)` and `(…, "delete", p->one)`
@@ -1259,6 +1259,10 @@ mod tests {
             raw_abbrev,
             full_index: false,
             text: false,
+            // git's default: `static long diff_algorithm` (diff.c) is zero, i.e.
+            // Myers, and `--no-index` reaches it through the same `diff_opts`
+            // table as every other verb.
+            algorithm: gix::diff::blob::Algorithm::Myers,
             colors: diff_color::DiffColors::disabled(),
         }
     }

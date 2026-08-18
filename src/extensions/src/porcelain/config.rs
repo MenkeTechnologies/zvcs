@@ -1,3 +1,4 @@
+use crate::optint;
 use anyhow::{bail, Result};
 use std::io::Write;
 use std::process::ExitCode;
@@ -354,25 +355,34 @@ impl ValueType {
     /// what does not is the same either way, so the error is always described and
     /// the caller decides whether to print it.
     fn canonicalize(self, key: &str, value: &[u8]) -> std::result::Result<Vec<u8>, TypeError> {
-        let text = String::from_utf8_lossy(value).trim().to_string();
+        // Verbatim: git hands the stored bytes to each type's reader untouched,
+        // and the number grammar itself skips *leading* blanks only — so a
+        // trailing one is an unreadable unit rather than something to trim away.
+        //
+        // Gap: a key written with no `=` is git's `NULL` value, which reads as
+        // *true* rather than as the empty string. `gix_config` only exposes that
+        // distinction for a name's last occurrence (`BodyRef::value_implicit`),
+        // so this port cannot tell the two apart here — the same reason
+        // `--list` prints `test.q=` for one where git prints `test.q`.
+        let text = String::from_utf8_lossy(value).to_string();
         match self {
-            ValueType::Bool => canonical_bool(&text)
+            ValueType::Bool => optint::maybe_bool(&text)
                 .map(|b| b.to_string().into_bytes())
                 .ok_or(TypeError::BadBool),
-            ValueType::Int => canonical_int(&text),
+            ValueType::Int => canonical_int(&text, Width::Int64),
             // `git_config_bool_or_int()` (config.c:1280) asks
             // `git_parse_maybe_bool_text()` — the *word* half of the boolean
             // grammar, with no number fallback — and prints `true`/`false` when it
             // answers. A digit string therefore falls through to the integer arm
             // and prints as a number, which is the whole point of the type.
-            ValueType::BoolOrInt => match maybe_bool_text(&text) {
+            ValueType::BoolOrInt => match optint::maybe_bool_text(&text) {
                 Some(b) => Ok(b.to_string().into_bytes()),
-                None => canonical_int(&text),
+                None => canonical_int(&text, Width::Int),
             },
             // `format_config_bool_or_str()` (builtin/config.c:332) is documented as
             // "always gentle": a value that is not a boolean is simply itself, so
             // this arm cannot fail.
-            ValueType::BoolOrStr => Ok(match canonical_bool(&text) {
+            ValueType::BoolOrStr => Ok(match optint::maybe_bool(&text) {
                 Some(b) => b.to_string().into_bytes(),
                 None => value.to_vec(),
             }),
@@ -396,59 +406,31 @@ impl ValueType {
     }
 }
 
-/// `git_parse_maybe_bool_text()` (config.c): the *word* half of git's boolean
-/// grammar — `true`/`yes`/`on` and `false`/`no`/`off`, case-insensitively, and
-/// nothing else. A valueless key (git's NULL value) is true.
-///
-/// This is the half `--type=bool-or-int` uses, so that a digit string is left for
-/// the integer reader rather than collapsing to `true`/`false`.
-fn maybe_bool_text(text: &str) -> Option<bool> {
-    match text.to_ascii_lowercase().as_str() {
-        "" | "true" | "yes" | "on" => Some(true),
-        "false" | "no" | "off" => Some(false),
-        _ => None,
-    }
+/// The width the reader bounds its value by, which is the one thing git's two
+/// integer entry points differ in: `git_config_int64()` for `--type=int`,
+/// `git_config_int()` (a C `int`) everywhere `git_parse_maybe_bool()` and
+/// `git_config_bool_or_int()` reach the number.
+#[derive(Clone, Copy)]
+enum Width {
+    Int,
+    Int64,
 }
 
-/// `git_parse_maybe_bool()` (config.c): [`maybe_bool_text`], then any integer git
-/// can read, as its truthiness — so `2` is true, `0` is false and `1k` is true.
-fn canonical_bool(text: &str) -> Option<bool> {
-    if let Some(b) = maybe_bool_text(text) {
-        return Some(b);
-    }
-    match canonical_int(text) {
-        Ok(bytes) => Some(bytes != b"0"),
-        Err(_) => None,
-    }
-}
-
-/// git's integer grammar: an optional `k`/`m`/`g` suffix scales the number
-/// (`git_parse_int`), so `1k` reads as 1024.
+/// `git_config_int()` / `git_config_int64()` (config.c): the base-0 `strtoimax`
+/// grammar with a `k`/`m`/`g` unit, rendered back as the decimal git prints.
 ///
-/// The two failures are distinct to git: a digit string that does not fit the
-/// target width sets `errno` to `ERANGE` and is reported as `out of range`, while
-/// anything else is `invalid unit` (config.c:1191-1192).
-fn canonical_int(text: &str) -> std::result::Result<Vec<u8>, TypeError> {
-    let (digits, scale) = match text.chars().last() {
-        Some('k') | Some('K') => (&text[..text.len() - 1], 1024i64),
-        Some('m') | Some('M') => (&text[..text.len() - 1], 1024 * 1024),
-        Some('g') | Some('G') => (&text[..text.len() - 1], 1024 * 1024 * 1024),
-        _ => (text, 1),
+/// The two failures are distinct to git: a value that does not fit the target
+/// width sets `errno` to `ERANGE` and is reported as `out of range`, while
+/// anything else is `invalid unit`.
+fn canonical_int(text: &str, width: Width) -> std::result::Result<Vec<u8>, TypeError> {
+    let parsed = match width {
+        Width::Int => optint::config_int(text),
+        Width::Int64 => optint::config_int64(text),
     };
-    let digits = digits.trim();
-    match digits.parse::<i64>() {
-        Ok(n) => match n.checked_mul(scale) {
-            Some(n) => Ok(n.to_string().into_bytes()),
-            None => Err(TypeError::BadNumber { out_of_range: true }),
-        },
-        // `strtoimax()` sets `ERANGE` only when the digits themselves overflow;
-        // a non-numeric string is a plain parse failure, which git blames on the
-        // unit suffix it could not read.
-        Err(err) => Err(TypeError::BadNumber {
-            out_of_range: matches!(
-                err.kind(),
-                std::num::IntErrorKind::PosOverflow | std::num::IntErrorKind::NegOverflow
-            ),
+    match parsed {
+        Ok(n) => Ok(n.to_string().into_bytes()),
+        Err(e) => Err(TypeError::BadNumber {
+            out_of_range: e == optint::NumError::OutOfRange,
         }),
     }
 }
@@ -1683,7 +1665,7 @@ fn get_colorbool(file: &gix::config::File, positional: &[&str]) -> Result<ExitCo
     // a tty; with the argument omitted it answers through the exit code alone.
     let stated = positional.get(1);
     let tty = match stated {
-        Some(v) => canonical_bool(v).unwrap_or(false),
+        Some(v) => optint::maybe_bool(v).unwrap_or(false),
         None => std::io::IsTerminal::is_terminal(&std::io::stdout()),
     };
 
@@ -1698,7 +1680,7 @@ fn get_colorbool(file: &gix::config::File, positional: &[&str]) -> Result<ExitCo
     // git: an explicit boolean wins; `auto` and "unset" both defer to the tty.
     let on = match raw.as_deref() {
         Some("auto") | None => tty,
-        Some(v) => canonical_bool(v).unwrap_or(true), // a color NAME means "on"
+        Some(v) => optint::maybe_bool(v).unwrap_or(true), // a color NAME means "on"
     };
     if stated.is_some() {
         println!("{on}");

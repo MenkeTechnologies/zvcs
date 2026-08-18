@@ -10,6 +10,8 @@ use gix::object::tree::diff::ChangeDetached;
 use gix::objs::tree::EntryKind;
 
 use super::filespec::{content_of, count_changed_lines_ws, is_binary};
+use super::diff_color;
+use super::diffstat::{self, StatWidths};
 use super::line_log;
 use super::pretty_pad::{FlushType, PadState, WrapState};
 
@@ -338,60 +340,12 @@ const MINIMUM_ABBREV: usize = 4;
 /// git's `DEFAULT_ABBREV`, the length a valueless `--abbrev` selects.
 const DEFAULT_ABBREV: usize = 7;
 
-const STAT_TERM_WIDTH: usize = 80;
-
-/// `--stat` width geometry, in git's `stat_width`/`stat_name_width`/`stat_graph_width`
-/// encoding (`show_stats()` / `diff_opt_stat()`): `-1` == "unset" (the terminal width
-/// for `width`, "uncapped" for the name/graph columns), seeded from the
-/// `diff.statNameWidth`/`diff.statGraphWidth` config and then overridden by any explicit
-/// `--stat*` flag (a `--stat-name-width=0` flag legitimately un-caps a positive config).
-/// `count` is `0` == "all files", set by `--stat-count`/`--stat=,,<n>`.
-#[derive(Clone, Copy)]
-struct StatWidths {
-    width: i64,
-    name_width: i64,
-    graph_width: i64,
-    count: i64,
-}
-
-impl Default for StatWidths {
-    fn default() -> Self {
-        StatWidths {
-            width: -1,
-            name_width: -1,
-            graph_width: -1,
-            count: 0,
-        }
-    }
-}
-
 /// Parse an integer with git's lenient `strtoul`-ish behavior for a `--stat*=<n>`
 /// value; a non-numeric value leaves the slot at its "unset" sentinel.
 fn parse_stat_i64(s: &str) -> i64 {
     s.parse::<i64>().unwrap_or(-1)
 }
 
-/// Parse `--stat=<width>[,<name-width>[,<count>]]` (`diff_opt_stat()`): each present,
-/// numeric field overwrites the corresponding slot; an empty or non-numeric field is
-/// left unchanged, which is byte-equivalent to git's `strtoul` (empty == `0` == unset).
-fn parse_stat_geometry(sw: &mut StatWidths, spec: &str) {
-    let mut it = spec.split(',');
-    if let Some(w) = it.next() {
-        if let Ok(v) = w.trim().parse::<i64>() {
-            sw.width = v;
-        }
-    }
-    if let Some(n) = it.next() {
-        if let Ok(v) = n.trim().parse::<i64>() {
-            sw.name_width = v;
-        }
-    }
-    if let Some(c) = it.next() {
-        if let Ok(v) = c.trim().parse::<i64>() {
-            sw.count = v;
-        }
-    }
-}
 
 /// git's ref-decoration style (`--decorate` / `log.decorate`): whether commit
 /// decorations are shown and, when shown, with short (`main`) or full
@@ -594,11 +548,13 @@ pub(crate) fn parse_decoration_style(value: &str) -> Option<DecorateStyle> {
 ///   * `--abbrev[=<n>]`/`--no-abbrev` set the width of every abbreviated id, applied as a
 ///     `core.abbrev` override. `--no-abbrev` is git's zero: the raw columns and `%h` print
 ///     the whole id while the patch `index` line stays at the configured default.
-///   * `--stat` assumes an 80-column terminal (`COLUMNS` is not consulted) and measures
-///     paths in `char`s; the `--stat-width`/`--stat=<w>`, `--stat-name-width`,
-///     `--stat-graph-width`, and `--stat-count` flags and the
-///     `diff.statNameWidth`/`diff.statGraphWidth` config are honored (flag over config
-///     over the 80-column / uncapped default).
+///   * `--stat` is the shared [`super::diffstat`] port of `show_stats()`: the name
+///     column is measured in display columns, the total width comes from
+///     `term_columns()` (`$COLUMNS`, else 80 — there is no `TIOCGWINSZ` probe), and
+///     the `--stat-width`/`--stat=<w>`, `--stat-name-width`, `--stat-graph-width`
+///     and `--stat-count` flags and the `diff.statNameWidth`/`diff.statGraphWidth`
+///     config are honored (flag over config over the terminal / uncapped default).
+///     The graph is never colorized here, because this module's diff output never is.
 ///   * Pathspec limiting is git's default history simplification: a commit
 ///     TREESAME to any parent over the pathspec is simplified away and the
 ///     history behind that parent alone is followed, so a merge that took one
@@ -1268,7 +1224,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             // optionally the name column / line cap) and, like every `--stat*` flag,
             // requests the diffstat.
             stat = true;
-            parse_stat_geometry(&mut stat_widths, v);
+            diffstat::parse_stat_geometry(&mut stat_widths, v);
         } else if let Some(v) = a.strip_prefix("--stat-width=") {
             stat = true;
             stat_widths.width = parse_stat_i64(v);
@@ -7201,7 +7157,7 @@ pub(crate) fn pickaxe_hit(
         }
         if let Some(needle) = needle {
             if !needle.is_empty() {
-                net += sign * count_occurrences(content, needle.as_bytes());
+                net += sign * super::diff_pickaxe::count_occurrences(content, needle.as_bytes()) as i64;
             }
         }
     }
@@ -7209,23 +7165,6 @@ pub(crate) fn pickaxe_hit(
     needle.is_some() && net != 0
 }
 
-/// Non-overlapping occurrences of `needle` in `hay`, matching git's pickaxe count.
-fn count_occurrences(hay: &[u8], needle: &[u8]) -> i64 {
-    if needle.is_empty() || needle.len() > hay.len() {
-        return 0;
-    }
-    // Non-overlapping, like git's kwset walk: a match advances past the whole
-    // needle. The substring search is vectorized (git uses the same idea through
-    // its kwset); a byte-at-a-time loop reads a multi-megabyte blob far slower.
-    memchr::memmem::find_iter(hay, needle).fold((0i64, 0usize), |(n, next), at| {
-        if at >= next {
-            (n + 1, at + needle.len())
-        } else {
-            (n, next)
-        }
-    })
-    .0
-}
 
 /// git's `approxidate()` for `--since`/`--until`, shared with every other verb that takes a date
 /// argument. Re-exported so `rev-list`/`whatchanged`/`show` can keep importing it from here.
@@ -9109,188 +9048,26 @@ pub(crate) fn change_path(change: &ChangeDetached) -> &[u8] {
 // --stat
 // ---------------------------------------------------------------------------
 
-/// git's `--stat` (`show_stats()`): a right-aligned change count and a `+`/`-` bar per
-/// file, then a summary line. The geometry is git's, computed in signed arithmetic so a
-/// tight width can drive an intermediate negative exactly as git's `int`s do. `sw` caps
-/// the total width (`--stat-width`/`--stat=<w>`, `-1` == the 80-column non-tty terminal),
-/// the name and graph columns (`--stat-name-width`/`--stat-graph-width`, `0` == uncapped),
-/// and the number of listed files (`--stat-count`, `0` == all); the summary always tallies
-/// every file.
-fn emit_stat(out: &mut Vec<u8>, files: &[FileChange], sw: &StatWidths) -> Result<()> {
-    if files.is_empty() {
-        return Ok(());
-    }
-
-    // `count = options->stat_count ? options->stat_count : data->nr`: only the first
-    // `count` files get a bar line, and the geometry scan stops there too.
-    let mut count: i64 = if sw.count != 0 {
-        sw.count
-    } else {
-        files.len() as i64
-    };
-
-    let mut max_len: i64 = 0;
-    let mut max_change: i64 = 0;
-    let mut bin_width: i64 = 0;
-    let mut number_width: i64 = 0;
-    let mut i: i64 = 0;
-    while i < count && i < files.len() as i64 {
-        let f = &files[i as usize];
-        i += 1;
-        max_len = max_len.max(display_width(&stat_name(f)) as i64);
-        if f.is_binary {
-            // `"Bin XXX -> YYY bytes"`: 14 fixed chars plus each size's decimal width.
-            let w = 14 + decimal_width(f.new_size) as i64 + decimal_width(f.old_size) as i64;
-            bin_width = bin_width.max(w);
-            // Change counts are aligned with the literal "Bin" for binary files.
-            number_width = 3;
-            continue;
-        }
-        max_change = max_change.max((f.added + f.deleted) as i64);
-    }
-    count = i;
-
-    // `stat_width == -1` means the terminal width (80 for a non-tty); an explicit `0`
-    // also falls back to 80, only a positive value overrides.
-    let mut width: i64 = if sw.width > 0 {
-        sw.width
-    } else {
-        STAT_TERM_WIDTH as i64
-    };
-    number_width = number_width.max(decimal_width(max_change.max(0) as usize) as i64);
-    let stat_name_width = if sw.name_width == -1 { 0 } else { sw.name_width };
-    let stat_graph_width = if sw.graph_width == -1 { 0 } else { sw.graph_width };
-
-    if width < 16 + 6 + number_width {
-        width = 16 + 6 + number_width;
-    }
-
-    let mut graph_width = if max_change + 4 > bin_width {
-        max_change
-    } else {
-        bin_width - 4
-    };
-    if stat_graph_width > 0 && stat_graph_width < graph_width {
-        graph_width = stat_graph_width;
-    }
-    let mut name_width = if stat_name_width > 0 && stat_name_width < max_len {
-        stat_name_width
-    } else {
-        max_len
-    };
-
-    // Fixed overhead per line is 6 columns: " ", " | ", and " " before the bar.
-    if name_width + number_width + 6 + graph_width > width {
-        if graph_width > width * 3 / 8 - number_width - 6 {
-            graph_width = width * 3 / 8 - number_width - 6;
-            if graph_width < 6 {
-                graph_width = 6;
-            }
-        }
-        if stat_graph_width > 0 && graph_width > stat_graph_width {
-            graph_width = stat_graph_width;
-        }
-        if name_width > width - number_width - 6 - graph_width {
-            name_width = width - number_width - 6 - graph_width;
-        } else {
-            graph_width = width - number_width - 6 - name_width;
-        }
-    }
-
-    let name_width = name_width.max(0) as usize;
-    let number_width = number_width.max(0) as usize;
-    let graph_width = graph_width.max(0) as usize;
-    let max_change = max_change.max(0) as usize;
-
-    // The summary line counts every file, even those past the `--stat-count` cut.
-    let mut total_added = 0usize;
-    let mut total_deleted = 0usize;
-    for f in files {
-        if !f.is_binary {
-            total_added += f.added;
-            total_deleted += f.deleted;
-        }
-    }
-
-    for f in files.iter().take(count.max(0) as usize) {
-        let display = stat_name(f);
-        let (prefix, name) = elide_name(&display, name_width);
-        let padding = name_width.saturating_sub(prefix.len() + display_width(name));
-        out.push(b' ');
-        out.extend_from_slice(prefix.as_bytes());
-        out.extend_from_slice(name);
-        out.extend_from_slice(&b" ".repeat(padding));
-        out.extend_from_slice(b" | ");
-
-        if f.is_binary {
-            // For binaries the counts are byte sizes, not lines.
-            write!(out, "{:>width$}", "Bin", width = number_width)?;
-            if f.old_size == 0 && f.new_size == 0 {
-                out.push(b'\n');
-            } else {
-                writeln!(out, " {} -> {} bytes", f.old_size, f.new_size)?;
-            }
-            continue;
-        }
-
-        let change = f.added + f.deleted;
-        write!(out, "{change:>number_width$}")?;
-
-        let (mut add, mut del) = (f.added, f.deleted);
-        if graph_width < max_change {
-            let mut total = scale_linear(add + del, graph_width, max_change);
-            if total < 2 && add > 0 && del > 0 {
-                total = 2;
-            }
-            if add < del {
-                add = scale_linear(add, graph_width, max_change);
-                del = total.saturating_sub(add);
-            } else {
-                del = scale_linear(del, graph_width, max_change);
-                add = total.saturating_sub(del);
-            }
-        }
-        if add > 0 || del > 0 {
-            out.push(b' ');
-            out.extend_from_slice(&b"+".repeat(add));
-            out.extend_from_slice(&b"-".repeat(del));
-        }
-        out.push(b'\n');
-    }
-
-    // `--stat-count` cut off some files: git prints a bare " ..." continuation line.
-    if (count as usize) < files.len() {
-        out.extend_from_slice(b" ...\n");
-    }
-
-    write_stat_summary(out, files.len(), total_added, total_deleted)
+/// The rows [`super::diffstat::show_stats`] renders. A binary file's "counts" are
+/// the two byte sizes, which is what `builtin_diffstat()` puts in `added`/`deleted`
+/// for one.
+fn stat_rows(files: &[FileChange]) -> Vec<diffstat::StatFile> {
+    files
+        .iter()
+        .map(|f| diffstat::StatFile {
+            print_name: stat_name(f),
+            added: if f.is_binary { f.new_size as u64 } else { f.added as u64 },
+            deleted: if f.is_binary { f.old_size as u64 } else { f.deleted as u64 },
+            binary: f.is_binary,
+            // `log` walks committed trees, so no pair is ever unmerged.
+            is_unmerged: false,
+        })
+        .collect()
 }
 
-/// git's `--stat`/`--shortstat` summary line: ` N files changed, A insertions(+),
-/// D deletions(-)`, with the `insertions`/`deletions` clauses appearing on git's
-/// same conditions.
-fn write_stat_summary(
-    out: &mut Vec<u8>,
-    n: usize,
-    total_added: usize,
-    total_deleted: usize,
-) -> Result<()> {
-    write!(out, " {n} file{} changed", if n == 1 { "" } else { "s" })?;
-    if total_added > 0 || total_deleted == 0 {
-        write!(
-            out,
-            ", {total_added} insertion{}(+)",
-            if total_added == 1 { "" } else { "s" }
-        )?;
-    }
-    if total_deleted > 0 || total_added == 0 {
-        write!(
-            out,
-            ", {total_deleted} deletion{}(-)",
-            if total_deleted == 1 { "" } else { "s" }
-        )?;
-    }
-    out.push(b'\n');
+/// git's `--stat` (`show_stats()`), rendered by the shared port.
+fn emit_stat(out: &mut Vec<u8>, files: &[FileChange], sw: &StatWidths) -> Result<()> {
+    diffstat::show_stats(out, &stat_rows(files), sw, &diff_color::DiffColors::disabled());
     Ok(())
 }
 
@@ -9452,61 +9229,10 @@ fn stat_name(f: &FileChange) -> Vec<u8> {
     }
 }
 
-/// git's `--shortstat`: the `--stat` summary line only. Binary files contribute
-/// nothing to the insertion/deletion totals, exactly as the full stat block.
+/// git's `--shortstat` (`show_shortstats()`): the summary line only.
 fn emit_shortstat(out: &mut Vec<u8>, files: &[FileChange]) -> Result<()> {
-    if files.is_empty() {
-        return Ok(());
-    }
-    let mut total_added = 0usize;
-    let mut total_deleted = 0usize;
-    for f in files {
-        if f.is_binary {
-            continue;
-        }
-        total_added += f.added;
-        total_deleted += f.deleted;
-    }
-    write_stat_summary(out, files.len(), total_added, total_deleted)
-}
-
-/// Scale `it` into `width` columns, guaranteeing at least one column for any
-/// non-zero value — git widens by one and adds it back for exactly that reason.
-fn scale_linear(it: usize, width: usize, max_change: usize) -> usize {
-    if it == 0 || max_change == 0 {
-        return 0;
-    }
-    1 + (it * width.saturating_sub(1) / max_change)
-}
-
-/// Shorten an over-long path the way git does: a `...` prefix, cut back to a
-/// directory boundary when one falls inside the retained tail. A name column
-/// narrower than the 3-column `...` prefix keeps only the prefix (git prints "...").
-fn elide_name(path: &[u8], name_width: usize) -> (&'static str, &[u8]) {
-    if display_width(path) <= name_width {
-        return ("", path);
-    }
-    let keep = name_width.saturating_sub(3);
-    let mut tail = &path[path.len().saturating_sub(keep)..];
-    if let Some(slash) = tail.iter().position(|&b| b == b'/') {
-        tail = &tail[slash..];
-    }
-    ("...", tail)
-}
-
-fn decimal_width(mut n: usize) -> usize {
-    let mut w = 1;
-    while n >= 10 {
-        n /= 10;
-        w += 1;
-    }
-    w
-}
-
-/// Approximate display width. Paths are treated as UTF-8 and counted in `char`s,
-/// which matches git for everything but wide and combining characters.
-fn display_width(path: &[u8]) -> usize {
-    String::from_utf8_lossy(path).chars().count()
+    diffstat::show_shortstats(out, &stat_rows(files));
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

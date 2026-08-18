@@ -180,6 +180,7 @@ use gix::hash::ObjectId;
 use gix::objs::tree::EntryKind;
 
 use super::diff_color;
+use super::diffstat::{self, StatWidths};
 use super::diff_files;
 use super::diffcore_rename;
 
@@ -574,12 +575,13 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     // `diff.algorithm` default, applied after argument parsing so a `--minimal` /
     // `--histogram` / `--diff-algorithm=` flag always wins (git precedence).
     let mut config_algorithm: Option<gix::diff::blob::Algorithm> = None;
-    // `--stat` width limits (`show_stats()`), `0` == unset. Seeded from
-    // `diff.statNameWidth`/`diff.statGraphWidth` below, then overwritten by an
-    // explicit `--stat-name-width=`/`--stat-graph-width=` flag (git precedence;
-    // a `--stat-name-width=0` flag legitimately overrides a positive config).
-    let mut stat_name_width: i64 = 0;
-    let mut stat_graph_width: i64 = 0;
+    // The `--stat` geometry (`show_stats()`), in git's sentinel encoding.
+    // `builtin/diff.c:510` calls `init_diffstat_widths()`, so all three widths
+    // start at `-1`: the total is the terminal width and the name/graph columns
+    // take `diff.statNameWidth`/`diff.statGraphWidth`, seeded below and then
+    // overwritten by an explicit `--stat*` flag (git precedence; a
+    // `--stat-name-width=0` flag legitimately overrides a positive config).
+    let mut sw = StatWidths::default();
     // `diff.suppressBlankEmpty`: emit an empty context line as `"\n"` rather than
     // the default `" \n"` (`fn_out_consume()`); no CLI flag exists for it.
     let mut suppress_blank_empty = false;
@@ -724,12 +726,12 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
         // `show_stats()`; a non-positive config leaves the column uncapped.
         if let Some(n) = snap.integer("diff.statNameWidth") {
             if n > 0 {
-                stat_name_width = n;
+                sw.name_width = n;
             }
         }
         if let Some(n) = snap.integer("diff.statGraphWidth") {
             if n > 0 {
-                stat_graph_width = n;
+                sw.graph_width = n;
             }
         }
         if snap.boolean("diff.suppressBlankEmpty") == Some(true) {
@@ -792,6 +794,14 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                             "error: unknown value after ws-error-highlight={}",
                             &a[..accepted]
                         );
+                        return Ok(ExitCode::from(129));
+                    }
+                }
+            } else if let Some(slot) = stat_width_slot_of(&mut sw, &flag) {
+                match a.parse::<i64>() {
+                    Ok(n) => *slot = n,
+                    Err(_) => {
+                        eprintln!("error: {} expects a numerical value", &flag[2..]);
                         return Ok(ExitCode::from(129));
                     }
                 }
@@ -1084,30 +1094,30 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                     Err(e) => return Ok(e.report()),
                 }
             }
-            // `--stat-name-width=<n>` / `--stat-graph-width=<n>` override the
-            // `diff.statNameWidth`/`diff.statGraphWidth` defaults (`diff_opt_stat()`),
-            // and, like every `--stat*` flag, request the diffstat format.
-            s if s.starts_with("--stat-name-width=") => {
+            // `--stat=<width>[,<name-width>[,<count>]]` (`diff_opt_stat()`), which
+            // like every `--stat*` flag also requests the diffstat format.
+            s if s.starts_with("--stat=") => {
                 fmt |= F_DIFFSTAT;
-                match s["--stat-name-width=".len()..].parse::<i64>() {
-                    Ok(n) => stat_name_width = n,
+                diffstat::parse_stat_geometry(&mut sw, &s["--stat=".len()..]);
+            }
+            // The four `--stat-*` widths are one `OPT_CALLBACK_F` each, so both the
+            // glued `--opt=<n>` and the separated `--opt <n>` spelling reach it.
+            s if is_stat_width_flag(s) => {
+                fmt |= F_DIFFSTAT;
+                pending_value = Some(s.to_string());
+            }
+            s if s.split_once('=').is_some_and(|(k, _)| is_stat_width_flag(k)) => {
+                fmt |= F_DIFFSTAT;
+                let (k, v) = s.split_once('=').expect("matched above");
+                match v.parse::<i64>() {
+                    Ok(n) => *stat_width_slot_of(&mut sw, k).expect("matched above") = n,
                     Err(_) => {
-                        eprintln!("error: stat-name-width expects a numerical value");
+                        eprintln!("error: {} expects a numerical value", &k[2..]);
                         return Ok(ExitCode::from(129));
                     }
                 }
             }
-            s if s.starts_with("--stat-graph-width=") => {
-                fmt |= F_DIFFSTAT;
-                match s["--stat-graph-width=".len()..].parse::<i64>() {
-                    Ok(n) => stat_graph_width = n,
-                    Err(_) => {
-                        eprintln!("error: stat-graph-width expects a numerical value");
-                        return Ok(ExitCode::from(129));
-                    }
-                }
-            }
-            s if s.starts_with("--stat=") || s.starts_with("--stat-") => fmt |= F_DIFFSTAT,
+            s if s.starts_with("--stat-") => fmt |= F_DIFFSTAT,
             // ---- rename / copy / break detection (`diffcore_std()`) -----------
             // `diff_opt_find_renames()`: an absent value parses as score 0, which
             // `diffcore_rename()` then replaces with DEFAULT_RENAME_SCORE.
@@ -2064,17 +2074,10 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                 render_numstat(&mut out, &stat_pairs, z);
             }
             if fmt & F_DIFFSTAT != 0 {
-                render_stat(
-                    &mut out,
-                    &stat_pairs,
-                    compact_summary,
-                    stat_name_width,
-                    stat_graph_width,
-                    &colors,
-                );
+                diffstat::show_stats(&mut out, &stat_rows(&stat_pairs, compact_summary), &sw, &colors);
             }
             if fmt & F_SHORTSTAT != 0 {
-                render_shortstat(&mut out, &stat_pairs);
+                diffstat::show_shortstats(&mut out, &stat_rows(&stat_pairs, compact_summary));
             }
             separator = true;
         }
@@ -4477,7 +4480,14 @@ pub(crate) fn render_rows_stat(
     colors: &diff_color::DiffColors,
 ) {
     let (deltas, analyses) = synthetic_rows(rows);
-    render_stat(out, &diffstat_pairs(&deltas, &analyses), false, 0, 0, colors);
+    // `diff --no-index` is still `builtin/diff.c`, so it too has run
+    // `init_diffstat_widths()` and scales to the terminal.
+    diffstat::show_stats(
+        out,
+        &stat_rows(&diffstat_pairs(&deltas, &analyses), false),
+        &StatWidths::default(),
+        colors,
+    );
 }
 
 /// `--numstat` for the same rows.
@@ -4962,80 +4972,43 @@ fn render_numstat(out: &mut Vec<u8>, pairs: &[(&Delta, &Analysis)], z: bool) {
     }
 }
 
-/// `--shortstat` (`show_shortstats()`).
-fn render_shortstat(out: &mut Vec<u8>, pairs: &[(&Delta, &Analysis)]) {
-    // `show_shortstats()` (diff.c:2934) returns before the summary line when the
-    // diffstat holds no entries, so a run whose every pair was dropped prints
-    // nothing rather than ` 0 files changed`.
-    if pairs.is_empty() {
-        return;
-    }
-    let (files, adds, dels) = stat_totals(pairs);
-    stat_summary(out, files, adds, dels);
+/// The rows [`super::diffstat::show_stats`] renders, built from the pairs that
+/// survived `compute_diffstat()`.
+fn stat_rows(pairs: &[(&Delta, &Analysis)], compact: bool) -> Vec<diffstat::StatFile> {
+    pairs
+        .iter()
+        .copied()
+        .map(|(d, an)| diffstat::StatFile {
+            print_name: stat_display_name(d, compact),
+            added: u64::from(an.added),
+            deleted: u64::from(an.deleted),
+            binary: an.binary,
+            is_unmerged: d.unmerged,
+        })
+        .collect()
 }
 
-fn stat_totals(pairs: &[(&Delta, &Analysis)]) -> (u32, u32, u32) {
-    let mut files = pairs.len() as u32;
-    let (mut adds, mut dels) = (0u32, 0u32);
-    for (d, an) in pairs.iter().copied() {
-        if d.unmerged {
-            files -= 1;
-        } else if !an.binary {
-            adds += an.added;
-            dels += an.deleted;
-        }
-    }
-    (files, adds, dels)
+/// Whether `flag` is one of the four `--stat-*` geometry options.
+///
+/// Each is an `OPT_CALLBACK_F` with a required argument (diff.c:6100-6111), so
+/// parse-options accepts both the glued `--opt=<n>` and the separated `--opt <n>`
+/// spelling; only the glued one used to be recognised here.
+fn is_stat_width_flag(flag: &str) -> bool {
+    matches!(flag, "--stat-width" | "--stat-name-width" | "--stat-graph-width" | "--stat-count")
 }
 
-/// `print_stat_summary_inserts_deletes()`.
-pub(crate) fn stat_summary(out: &mut Vec<u8>, files: u32, insertions: u32, deletions: u32) {
-    if files == 0 {
-        push_str(out, " 0 files changed\n");
-        return;
+/// The `StatWidths` slot a `--stat-*` flag writes.
+fn stat_width_slot_of<'a>(sw: &'a mut StatWidths, flag: &str) -> Option<&'a mut i64> {
+    match flag {
+        "--stat-width" => Some(&mut sw.width),
+        "--stat-name-width" => Some(&mut sw.name_width),
+        "--stat-graph-width" => Some(&mut sw.graph_width),
+        "--stat-count" => Some(&mut sw.count),
+        _ => None,
     }
-    push_str(
-        out,
-        &format!(" {files} file{} changed", if files == 1 { "" } else { "s" }),
-    );
-    if insertions != 0 || deletions == 0 {
-        push_str(
-            out,
-            &format!(
-                ", {insertions} insertion{}(+)",
-                if insertions == 1 { "" } else { "s" }
-            ),
-        );
-    }
-    if deletions != 0 || insertions == 0 {
-        push_str(
-            out,
-            &format!(
-                ", {deletions} deletion{}(-)",
-                if deletions == 1 { "" } else { "s" }
-            ),
-        );
-    }
-    out.push(b'\n');
 }
 
-fn decimal_width(n: u32) -> i64 {
-    let mut w = 1i64;
-    let mut n = n / 10;
-    while n > 0 {
-        w += 1;
-        n /= 10;
-    }
-    w
-}
 
-/// `scale_linear()` from `diff.c`.
-fn scale_linear(it: i64, width: i64, max_change: i64) -> i64 {
-    if it == 0 {
-        return 0;
-    }
-    1 + (it * (width - 1) / max_change)
-}
 
 /// `get_compact_summary()`: the parenthesized annotation `--compact-summary`
 /// appends to a diffstat name. Mirrors `diff.c`'s status/mode ladder, in order:
@@ -5098,158 +5071,6 @@ fn stat_display_name(d: &Delta, compact: bool) -> Vec<u8> {
     name
 }
 
-/// `--stat` (`show_stats()`), with git's default 80-column budget. `stat_name_width`
-/// and `stat_graph_width` (`0` == unset) cap the filename and graph columns, coming
-/// from `--stat-name-width`/`--stat-graph-width` or `diff.statNameWidth`/`diff.statGraphWidth`.
-fn render_stat(
-    out: &mut Vec<u8>,
-    pairs: &[(&Delta, &Analysis)],
-    compact: bool,
-    stat_name_width: i64,
-    stat_graph_width: i64,
-    colors: &diff_color::DiffColors,
-) {
-    // `show_stats()` (diff.c:2664) returns immediately on an empty diffstat.
-    if pairs.is_empty() {
-        return;
-    }
-    let names: Vec<Vec<u8>> = pairs.iter().map(|(d, _)| stat_display_name(d, compact)).collect();
-
-    let mut max_change: i64 = 0;
-    let mut max_len: i64 = 0;
-    let mut bin_width: i64 = 0;
-    let mut number_width: i64 = 0;
-    for (i, (d, an)) in pairs.iter().copied().enumerate() {
-        let change = (an.added + an.deleted) as i64;
-        max_len = max_len.max(names[i].len() as i64);
-        if d.unmerged {
-            bin_width = bin_width.max(8); // "Unmerged"
-            continue;
-        }
-        if an.binary {
-            let w = 14 + decimal_width(an.added) + decimal_width(an.deleted);
-            bin_width = bin_width.max(w);
-            number_width = 3;
-            continue;
-        }
-        max_change = max_change.max(change);
-    }
-
-    // `width` is `options->stat_width ? options->stat_width : 80` for a plain `--stat`.
-    let mut width: i64 = 80;
-    number_width = number_width.max(decimal_width(max_change as u32));
-    if width < 16 + 6 + number_width {
-        width = 16 + 6 + number_width;
-    }
-
-    let mut graph_width = if max_change + 4 > bin_width {
-        max_change
-    } else {
-        bin_width - 4
-    };
-    // `diff.statGraphWidth`/`--stat-graph-width` caps the graph column.
-    if stat_graph_width > 0 && stat_graph_width < graph_width {
-        graph_width = stat_graph_width;
-    }
-    // `diff.statNameWidth`/`--stat-name-width` caps the filename column.
-    let mut name_width = if stat_name_width > 0 && stat_name_width < max_len {
-        stat_name_width
-    } else {
-        max_len
-    };
-    if name_width + number_width + 6 + graph_width > width {
-        if graph_width > width * 3 / 8 - number_width - 6 {
-            graph_width = (width * 3 / 8 - number_width - 6).max(6);
-        }
-        if stat_graph_width > 0 && graph_width > stat_graph_width {
-            graph_width = stat_graph_width;
-        }
-        if name_width > width - number_width - 6 - graph_width {
-            name_width = width - number_width - 6 - graph_width;
-        } else {
-            graph_width = width - number_width - 6 - name_width;
-        }
-    }
-
-    for (i, (d, an)) in pairs.iter().copied().enumerate() {
-        let (added, deleted) = (an.added as i64, an.deleted as i64);
-        // "scale" the filename: overlong names are truncated to "...<tail>".
-        let full = &names[i];
-        let (prefix, name): (&str, &[u8]) = if name_width < full.len() as i64 {
-            let len = name_width - 3;
-            let start = full.len() - len.max(0) as usize;
-            let tail = &full[start..];
-            let tail = match tail.iter().position(|b| *b == b'/') {
-                Some(p) => &tail[p..],
-                None => tail,
-            };
-            ("...", tail)
-        } else {
-            ("", full.as_slice())
-        };
-        let padding = (name_width - prefix.len() as i64 - name.len() as i64).max(0) as usize;
-
-        push_str(out, " ");
-        push_str(out, prefix);
-        out.extend_from_slice(name);
-        out.extend_from_slice(&b" ".repeat(padding));
-        push_str(out, " | ");
-
-        if an.binary {
-            push_str(out, &format!("{:>width$}", "Bin", width = number_width as usize));
-            if added == 0 && deleted == 0 {
-                out.push(b'\n');
-                continue;
-            }
-            // `show_stats()` paints the two byte counts with the old/new colors.
-            out.push(b' ');
-            diff_color::paint(out, colors, diff_color::DiffSlot::Old, deleted.to_string().as_bytes());
-            push_str(out, " -> ");
-            diff_color::paint(out, colors, diff_color::DiffSlot::New, added.to_string().as_bytes());
-            push_str(out, " bytes\n");
-            continue;
-        }
-        if d.unmerged {
-            push_str(out, &format!("{:>width$}", "Unmerged", width = number_width as usize));
-            out.push(b'\n');
-            continue;
-        }
-
-        let (mut add, mut del) = (added, deleted);
-        if graph_width <= max_change {
-            let mut total = scale_linear(add + del, graph_width, max_change);
-            if total < 2 && add > 0 && del > 0 {
-                total = 2;
-            }
-            if add < del {
-                add = scale_linear(add, graph_width, max_change);
-                del = total - add;
-            } else {
-                del = scale_linear(del, graph_width, max_change);
-                add = total - del;
-            }
-        }
-        push_str(
-            out,
-            &format!("{:>width$}", added + deleted, width = number_width as usize),
-        );
-        if added + deleted != 0 {
-            push_str(out, " ");
-        }
-        // `show_graph()`: each run is wrapped in its own color and emits nothing
-        // at all when it is empty.
-        if add > 0 {
-            diff_color::paint(out, colors, diff_color::DiffSlot::New, &b"+".repeat(add as usize));
-        }
-        if del > 0 {
-            diff_color::paint(out, colors, diff_color::DiffSlot::Old, &b"-".repeat(del as usize));
-        }
-        out.push(b'\n');
-    }
-
-    let (files, adds, dels) = stat_totals(pairs);
-    stat_summary(out, files, adds, dels);
-}
 
 /// `builtin_diff()`'s two submodule branches (diff.c:3870): under `--submodule=log`
 /// the pair renders as `show_submodule_diff_summary()`, and under `--submodule=diff`

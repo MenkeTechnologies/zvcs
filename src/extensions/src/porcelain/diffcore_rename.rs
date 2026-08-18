@@ -76,7 +76,8 @@ pub fn similarity_index(score: u32) -> u32 {
 
 /// `diff.c`'s `git_config_rename()`: the `diff.renames` value.  A missing value is
 /// `DIFF_DETECT_RENAME`; `copies`/`copy` (case-blind) is `DIFF_DETECT_COPY`; anything
-/// else goes through `git_config_bool()`.
+/// else goes through `git_config_bool()`, which reads git's full boolean grammar
+/// (`0x1` and `1k` are true, `0x0` is false) and `die()`s on anything outside it.
 pub fn config_rename(value: Option<&gix::bstr::BStr>) -> u8 {
     let Some(v) = value else {
         return DETECT_RENAME;
@@ -85,28 +86,16 @@ pub fn config_rename(value: Option<&gix::bstr::BStr>) -> u8 {
     if s.eq_ignore_ascii_case("copies") || s.eq_ignore_ascii_case("copy") {
         return DETECT_COPY;
     }
-    if parse_bool(&s) == Some(true) {
-        DETECT_RENAME
-    } else {
-        0
+    match crate::optint::maybe_bool(&s) {
+        Some(true) => DETECT_RENAME,
+        Some(false) => 0,
+        // `git_config_bool()`'s `die()`: every caller of this is deep inside a
+        // diff setup that has no way to report, which is why git exits here too.
+        None => {
+            eprintln!("fatal: bad boolean config value '{s}' for 'diff.renames'");
+            std::process::exit(128);
+        }
     }
-}
-
-/// `git_config_bool()` for the handful of spellings git's `git_parse_maybe_bool()`
-/// accepts. An unparseable value is a config error in git; here it reads as false,
-/// which is what `git_config_bool()` returns for `"0"`/`""`/`"false"` anyway.
-fn parse_bool(s: &str) -> Option<bool> {
-    if s.eq_ignore_ascii_case("true") || s.eq_ignore_ascii_case("yes") || s.eq_ignore_ascii_case("on") {
-        return Some(true);
-    }
-    if s.eq_ignore_ascii_case("false")
-        || s.eq_ignore_ascii_case("no")
-        || s.eq_ignore_ascii_case("off")
-        || s.is_empty()
-    {
-        return Some(false);
-    }
-    s.parse::<i64>().ok().map(|n| n != 0)
 }
 
 /// `diff.c`'s `parse_rename_score()`: read `<n>`, `<n>%`, or `<n>.<m>` from the front

@@ -12,6 +12,10 @@
 //! display columns (`utf8_strnwidth`), not bytes, so a CJK subject consumes two
 //! columns per glyph.
 
+// git's `term_columns()` (`pager.c:203`), shared with every other consumer — see
+// `crate::pager::term_columns`. Only `%<|(-<N>)` (pad to `N` columns from the
+// right edge) reads it here.
+use crate::pager::term_columns;
 use crate::utf8::{display_mode_esc_sequence_len, strbuf_utf8_replace, utf8_strnwidth};
 
 /// `FORMATTING_LIMIT` (pretty.c:31): the largest width a format may ask for, so a
@@ -103,25 +107,7 @@ impl Default for PadState {
     }
 }
 
-/// git's `term_columns()` without the `TIOCGWINSZ` probe, which the vendored
-/// crates do not expose: `COLUMNS` when it parses to a positive number, else 80.
-/// Only `%<|(-<N>)` (pad to `N` columns from the right edge) reads it.
-fn term_columns() -> i64 {
-    if let Ok(value) = std::env::var("COLUMNS") {
-        // atoi(): leading digits, no error for trailing junk.
-        let digits: String = value
-            .trim_start()
-            .chars()
-            .take_while(|c| c.is_ascii_digit() || *c == '-' || *c == '+')
-            .collect();
-        if let Ok(n) = digits.parse::<i64>() {
-            if n > 0 {
-                return n;
-            }
-        }
-    }
-    80
-}
+
 
 /// `strtol(.., 10)`: optional whitespace, optional sign, then digits. Returns the
 /// value and how many units were consumed (0 when no conversion happened, which

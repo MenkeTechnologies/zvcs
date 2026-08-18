@@ -167,7 +167,36 @@
 use anyhow::{bail, Result};
 use std::cmp::Ordering;
 use std::io::{Read, Write};
-use std::process::ExitCode;
+/// The exit status this module computes: the number git would `exit()` with.
+///
+/// Deliberately *not* `std::process::ExitCode`, which is opaque — nothing can read
+/// the value back out of one. `diff-tree` routes its entire render through
+/// [`render_raw_stream`], so with an opaque status a fatal there (an invalid `-G`
+/// regex, say) arrived as a value the caller's `?` could only discard, and
+/// `diff-tree` exited 0 where git exits 128. Keeping the number lets the routed
+/// caller propagate it; it becomes a `std::process::ExitCode` at the one place
+/// that returns to `main`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct Status(u8);
+
+impl Status {
+    /// The status for `code`, spelled like `std::process::ExitCode::from`.
+    pub(crate) fn from(code: u8) -> Self {
+        Status(code)
+    }
+
+    /// The number, for a caller that has to carry it further.
+    pub(crate) fn code(self) -> u8 {
+        self.0
+    }
+}
+
+impl From<Status> for std::process::ExitCode {
+    fn from(s: Status) -> Self {
+        std::process::ExitCode::from(s.0)
+    }
+}
+
 
 use gix::bstr::{BString, ByteSlice};
 use gix::diff::blob::platform::prepare_diff::Operation;
@@ -180,6 +209,8 @@ use regex::bytes::Regex;
 use super::{diff_color, Arg, LongOpt};
 use super::diff_files;
 use super::diffcore_rename;
+use super::diff_pickaxe;
+use super::diffstat::{self, StatWidths};
 
 /// Stock git's `diff-pairs` usage line. The option block under it is
 /// [`DIFF_OPTIONS`]; the two together are what `-h` prints (stdout, exit 129).
@@ -458,13 +489,13 @@ fn is_known_option(arg: &str) -> bool {
 ///
 /// A long option is quoted in full including any `=<value>`; a short one by its letter
 /// alone, the rest of the argument being that option's value.
-fn unknown_option(arg: &str) -> ExitCode {
+fn unknown_option(arg: &str) -> Status {
     match arg.strip_prefix("--") {
         Some(rest) => eprintln!("error: unknown option `{rest}'"),
         None => eprintln!("error: unknown switch `{}'", &arg[1..2]),
     }
     eprint!("{USAGE_LINE}{DIFF_OPTIONS}");
-    ExitCode::from(129)
+    Status::from(129)
 }
 
 /// The `--relative[=<p>]` / `--no-relative` selection.
@@ -497,7 +528,7 @@ impl Needle {
     /// Whether `hay` contains a match — used by `-G` on each changed line.
     pub(crate) fn is_match(&self, hay: &[u8]) -> bool {
         match self {
-            Needle::Literal(n) => count_occurrences(hay, n) > 0,
+            Needle::Literal(n) => diff_pickaxe::count_occurrences(hay, n) > 0,
             Needle::Regex(re) => re.is_match(hay),
         }
     }
@@ -505,7 +536,7 @@ impl Needle {
     /// Non-overlapping match count — used by `-S` to compare the two sides.
     pub(crate) fn count(&self, hay: &[u8]) -> usize {
         match self {
-            Needle::Literal(n) => count_occurrences(hay, n),
+            Needle::Literal(n) => diff_pickaxe::count_occurrences(hay, n),
             Needle::Regex(re) => re.find_iter(hay).count(),
         }
     }
@@ -533,23 +564,6 @@ fn strip_terminator(line: &[u8]) -> &[u8] {
     } else {
         line
     }
-}
-
-fn count_occurrences(hay: &[u8], needle: &[u8]) -> usize {
-    if needle.is_empty() || hay.len() < needle.len() {
-        return 0;
-    }
-    let mut n = 0;
-    let mut i = 0;
-    while i + needle.len() <= hay.len() {
-        if &hay[i..i + needle.len()] == needle {
-            n += 1;
-            i += needle.len();
-        } else {
-            i += 1;
-        }
-    }
-    n
 }
 
 /// `-S<string>` counts occurrences; `-G<pattern>` looks at the changed lines;
@@ -587,28 +601,6 @@ impl Filter {
             return !self.exclude.contains(&status);
         }
         self.keep.contains(&status)
-    }
-}
-
-/// The `--stat` geometry, in git's own `-1 == unset` encoding.
-struct StatWidths {
-    width: i64,
-    name_width: i64,
-    graph_width: i64,
-    count: i64,
-    /// `--compact-summary`: annotate names with `(gone)`, `(new)`, `(mode +x)`, …
-    with_summary: bool,
-}
-
-impl Default for StatWidths {
-    fn default() -> Self {
-        StatWidths {
-            width: -1,
-            name_width: -1,
-            graph_width: -1,
-            count: 0,
-            with_summary: false,
-        }
     }
 }
 
@@ -737,6 +729,8 @@ struct Opts {
     relative: Relative,
     anchor: Option<Anchor>, // --rotate-to / --skip-to
     stat: StatWidths,
+    /// `--compact-summary`: annotate names with `(gone)`, `(new)`, `(mode +x)`, …
+    compact_summary: bool,
     // --output-indicator-new / -old / -context: the character printed at the start of an
     // added / removed / context body line, replacing '+' / '-' / ' '.
     ind_new: u8,
@@ -886,8 +880,8 @@ struct Analysis {
 }
 
 /// `git diff-pairs` — see the module documentation for the covered surface.
-pub fn diff_pairs(args: &[String]) -> Result<ExitCode> {
-    render_raw_stream(args, None, None)
+pub fn diff_pairs(args: &[String]) -> Result<std::process::ExitCode> {
+    Ok(render_raw_stream(args, None, None)?.into())
 }
 
 /// The body of [`diff_pairs`], with the raw-pair stream supplied instead of read from
@@ -899,7 +893,7 @@ pub(crate) fn render_raw_stream(
     args: &[String],
     pairs: Option<Vec<u8>>,
     sink: Option<&mut Vec<u8>>,
-) -> Result<ExitCode> {
+) -> Result<Status> {
     // Dispatch passes the subcommand itself at index 0.
     let args = match args.first().map(String::as_str) {
         Some("diff-pairs") => &args[1..],
@@ -920,7 +914,8 @@ pub(crate) fn render_raw_stream(
         pickaxe: None,
         relative: Relative::No,
         anchor: None,
-        stat: StatWidths::default(),
+        stat: StatWidths::plumbing(),
+        compact_summary: false,
         ind_new: b'+',
         ind_old: b'-',
         ind_context: b' ',
@@ -996,12 +991,16 @@ pub(crate) fn render_raw_stream(
                 canonical.as_ref()
             }
             super::Long::Ambiguous(first, second) => {
-                return Ok(super::ambiguous_option(
+                // `ambiguous_option()` prints the report and answers 129; the
+                // number has to travel as a [`Status`] so a routed `diff-tree`
+                // can exit with it rather than with 0.
+                let _ = super::ambiguous_option(
                     &args[i],
                     &first,
                     &second,
                     &format!("{USAGE_LINE}{DIFF_OPTIONS}"),
-                ))
+                );
+                return Ok(Status::from(129));
             }
         };
         // Fetch the value of a `--opt=v` / `--opt v` / `-Xv` / `-X v` option, advancing
@@ -1019,7 +1018,7 @@ pub(crate) fn render_raw_stream(
                             // parse-options' `error: option `x' requires a value` for a
                             // long name, `switch `x'` for a short one; exit 129 either way.
                             eprintln!("error: {}", diff_color::missing_value(s));
-                            return Ok(ExitCode::from(129));
+                            return Ok(Status::from(129));
                         }
                     }
                 }
@@ -1032,7 +1031,7 @@ pub(crate) fn render_raw_stream(
             let glued = format!("{s}={}", want_value!(s.len()));
             if let Some(Err(msg)) = move_word.parse_flag(&glued, &mut opts.color_when) {
                 eprintln!("{msg}");
-                return Ok(ExitCode::from(129));
+                return Ok(Status::from(129));
             }
             i += 1;
             continue;
@@ -1042,7 +1041,7 @@ pub(crate) fn render_raw_stream(
         if let Some(res) = move_word.parse_flag(s, &mut opts.color_when) {
             if let Err(msg) = res {
                 eprintln!("{msg}");
-                return Ok(ExitCode::from(129));
+                return Ok(Status::from(129));
             }
             i += 1;
             continue;
@@ -1054,7 +1053,7 @@ pub(crate) fn render_raw_stream(
             // because no entry of the table is `PARSE_OPT_HIDDEN`.
             "-h" | "--help-all" => {
                 print!("{USAGE_LINE}{DIFF_OPTIONS}");
-                return Ok(ExitCode::from(129));
+                return Ok(Status::from(129));
             }
             "-z" => nul = true,
             "-p" | "-u" | "--patch" => opts.formats.or_patch(),
@@ -1108,13 +1107,13 @@ pub(crate) fn render_raw_stream(
             }
             _ if s.starts_with("--stat=") => {
                 opts.formats.or_stat();
-                parse_stat_geometry(&mut opts.stat, &s["--stat=".len()..]);
+                diffstat::parse_stat_geometry(&mut opts.stat, &s["--stat=".len()..]);
             }
             "--compact-summary" => {
                 opts.formats.or_stat();
-                opts.stat.with_summary = true;
+                opts.compact_summary = true;
             }
-            "--no-compact-summary" => opts.stat.with_summary = false,
+            "--no-compact-summary" => opts.compact_summary = false,
             // The four `--stat-*` geometry options are `OPT_INTEGER`s, so git's
             // parse-options accepts both the `--opt=<n>` and the `--opt <n>` spelling.
             "--stat-width" | "--stat-name-width" | "--stat-graph-width" | "--stat-count" => {
@@ -1164,7 +1163,7 @@ pub(crate) fn render_raw_stream(
                         eprintln!(
                             "error: option `color' expects \"always\", \"auto\", or \"never\""
                         );
-                        return Ok(ExitCode::from(129));
+                        return Ok(Status::from(129));
                     }
                 }
             }
@@ -1183,7 +1182,7 @@ pub(crate) fn render_raw_stream(
                             "error: unknown value after ws-error-highlight={}",
                             &v[..accepted]
                         );
-                        return Ok(ExitCode::from(129));
+                        return Ok(Status::from(129));
                     }
                 }
             }
@@ -1234,7 +1233,7 @@ pub(crate) fn render_raw_stream(
                             "error: option diff-algorithm accepts \"myers\", \"minimal\", \
                              \"patience\" and \"histogram\""
                         );
-                        return Ok(ExitCode::from(129));
+                        return Ok(Status::from(129));
                     }
                 }
             }
@@ -1246,25 +1245,35 @@ pub(crate) fn render_raw_stream(
                             "error: option diff-algorithm accepts \"myers\", \"minimal\", \
                              \"patience\" and \"histogram\""
                         );
-                        return Ok(ExitCode::from(129));
+                        return Ok(Status::from(129));
                     }
                 }
             }
+            // `diff_opt_ignore_regex()` (diff.c:5859) compiles inline and answers
+            // parse-options' `error()`: `error: invalid regex given to -I: '<pat>'`
+            // and 129 — the *pattern* is quoted, not the engine's complaint — rather
+            // than a `die()`. This had been an `anyhow` bail, which surfaced as
+            // `zvcs: <cmd>: …` on exit 1.
             "-I" | "--ignore-matching-lines" => {
                 let v = want_value!(s.len());
-                let re = compile_regex(v.as_bytes())
-                    .map_err(|e| anyhow::anyhow!("invalid regex given to -I: {e}"))?;
-                opts.ignore_lines.push(Needle::Regex(re));
+                match compile_regex(v.as_bytes()) {
+                    Ok(re) => opts.ignore_lines.push(Needle::Regex(re)),
+                    Err(_) => return Ok(invalid_ignore_regex(&v)),
+                }
             }
             _ if s.starts_with("-I") => {
-                let re = compile_regex(&s.as_bytes()[2..])
-                    .map_err(|e| anyhow::anyhow!("invalid regex given to -I: {e}"))?;
-                opts.ignore_lines.push(Needle::Regex(re));
+                let v = &s[2..];
+                match compile_regex(v.as_bytes()) {
+                    Ok(re) => opts.ignore_lines.push(Needle::Regex(re)),
+                    Err(_) => return Ok(invalid_ignore_regex(v)),
+                }
             }
             _ if s.starts_with("--ignore-matching-lines=") => {
-                let re = compile_regex(&s.as_bytes()["--ignore-matching-lines=".len()..])
-                    .map_err(|e| anyhow::anyhow!("invalid regex given to -I: {e}"))?;
-                opts.ignore_lines.push(Needle::Regex(re));
+                let v = &s["--ignore-matching-lines=".len()..];
+                match compile_regex(v.as_bytes()) {
+                    Ok(re) => opts.ignore_lines.push(Needle::Regex(re)),
+                    Err(_) => return Ok(invalid_ignore_regex(v)),
+                }
             }
             // --diff-filter
             "--diff-filter" => {
@@ -1409,7 +1418,7 @@ pub(crate) fn render_raw_stream(
                 let (score, rest) = diffcore_rename::parse_rename_score(raw);
                 if !rest.is_empty() {
                     eprintln!("error: invalid argument to find-renames");
-                    return Ok(ExitCode::from(129));
+                    return Ok(Status::from(129));
                 }
                 opts.rename.rename_score = score;
                 opts.rename.detect_rename = diffcore_rename::DETECT_RENAME;
@@ -1427,7 +1436,7 @@ pub(crate) fn render_raw_stream(
                 let (score, rest) = diffcore_rename::parse_rename_score(raw);
                 if !rest.is_empty() {
                     eprintln!("error: invalid argument to find-copies");
-                    return Ok(ExitCode::from(129));
+                    return Ok(Status::from(129));
                 }
                 opts.rename.rename_score = score;
                 if opts.rename.detect_rename == diffcore_rename::DETECT_COPY {
@@ -1445,7 +1454,7 @@ pub(crate) fn render_raw_stream(
                     Ok(v) => opts.rename.break_opt = v,
                     Err(()) => {
                         eprintln!("error: break-rewrites expects <n>/<m> form");
-                        return Ok(ExitCode::from(129));
+                        return Ok(Status::from(129));
                     }
                 }
             }
@@ -1455,7 +1464,7 @@ pub(crate) fn render_raw_stream(
                     Ok(n) => opts.rename.rename_limit = n,
                     Err(_) => {
                         eprintln!("error: option `l' expects a numerical value");
-                        return Ok(ExitCode::from(129));
+                        return Ok(Status::from(129));
                     }
                 }
             }
@@ -1463,7 +1472,7 @@ pub(crate) fn render_raw_stream(
                 Ok(n) => opts.rename.rename_limit = n,
                 Err(_) => {
                     eprintln!("error: option `l' expects a numerical value");
-                    return Ok(ExitCode::from(129));
+                    return Ok(Status::from(129));
                 }
             },
             // `ita_invisible_in_index` is only consulted when a diff is computed against
@@ -1479,14 +1488,14 @@ pub(crate) fn render_raw_stream(
                 let v = want_value!(s.len());
                 if parse_git_int(&v).is_none() {
                     eprintln!("error: invalid value for '--max-depth': '{v}'");
-                    return Ok(ExitCode::from(129));
+                    return Ok(Status::from(129));
                 }
             }
             _ if s.starts_with("--max-depth=") => {
                 let v = &s["--max-depth=".len()..];
                 if parse_git_int(v).is_none() {
                     eprintln!("error: invalid value for '--max-depth': '{v}'");
-                    return Ok(ExitCode::from(129));
+                    return Ok(Status::from(129));
                 }
             }
             // `--ignore-submodules[=<when>]` (`handle_ignore_submodules_arg()`).
@@ -1505,7 +1514,7 @@ pub(crate) fn render_raw_stream(
                     "none" | "untracked" | "dirty" => opts.ignore_submodules = false,
                     v => {
                         eprintln!("fatal: bad --ignore-submodules argument: {v}");
-                        return Ok(ExitCode::from(128));
+                        return Ok(Status::from(128));
                     }
                 }
             }
@@ -1538,7 +1547,7 @@ pub(crate) fn render_raw_stream(
                     }
                     v => {
                         eprintln!("error: failed to parse --submodule option parameter: '{v}'");
-                        return Ok(ExitCode::from(129));
+                        return Ok(Status::from(129));
                     }
                 }
             }
@@ -1587,7 +1596,7 @@ pub(crate) fn render_raw_stream(
     // had to pass only decides how the raw/name records come back out.
     if !nul && pairs.is_none() {
         eprintln!("usage: working without -z is not supported");
-        return Ok(ExitCode::from(129));
+        return Ok(Status::from(129));
     }
     // Only now, once every refusal `cmd_diff_pairs()` itself makes has had its
     // turn, does a gap in this port get to speak.
@@ -1607,7 +1616,7 @@ pub(crate) fn render_raw_stream(
         Ok(r) => r,
         Err(_) => {
             eprintln!("fatal: not a git repository (or any of the parent directories): .git");
-            return Ok(ExitCode::from(128));
+            return Ok(Status::from(128));
         }
     };
     if !wseh_explicit {
@@ -1650,7 +1659,7 @@ pub(crate) fn render_raw_stream(
         Ok(e) => e,
         Err(msg) => {
             eprintln!("{msg}");
-            return Ok(ExitCode::from(128));
+            return Ok(Status::from(128));
         }
     };
     // `external_diff()` (diff.c:558) and `diff_setup_done()`'s two consequences of it:
@@ -1687,7 +1696,7 @@ pub(crate) fn render_raw_stream(
         Ok(p) => p,
         Err(msg) => {
             eprintln!("{msg}");
-            return Ok(ExitCode::from(128));
+            return Ok(Status::from(128));
         }
     };
 
@@ -1729,7 +1738,8 @@ pub(crate) fn render_raw_stream(
             None => Box::new(stdout.lock()),
         },
     };
-    let mut any_pair = false;
+    // `o->flags.has_changes`, assigned by each `diffcore_std()` (see [`flush`]).
+    let mut has_changes = false;
     let mut batch: Vec<Pair> = Vec::new();
     // `diff_result_code()` prints the rename-limit warnings once, after the whole
     // stream has been written.
@@ -1749,7 +1759,7 @@ pub(crate) fn render_raw_stream(
         cursor += end + 1;
 
         if header.is_empty() {
-            match flush(&mut out, &repo, &mut cache, &batch, &opts, base_abbrev, &colors, &extra, ws_rule, &mut warnings, &mut check_failed, textconv, ext.as_ref(), &mut found_changes)? {
+            match flush(&mut out, &repo, &mut cache, &batch, &opts, base_abbrev, &colors, &extra, ws_rule, &mut warnings, &mut check_failed, textconv, ext.as_ref(), &mut found_changes, &mut has_changes)? {
                 Ok(()) => {}
                 Err(code) => return Ok(code),
             }
@@ -1782,7 +1792,6 @@ pub(crate) fn render_raw_stream(
         let (_, mut pair) = pair;
         pair.old_path = old_path;
         pair.new_path = new_path;
-        any_pair = true;
         if let Some(ctx) = ext.as_ref() {
             if queues_read_index(&pair, opts.ignore_submodules_set) {
                 ctx.index_read.set(true);
@@ -1791,7 +1800,7 @@ pub(crate) fn render_raw_stream(
         batch.push(pair);
     }
 
-    match flush(&mut out, &repo, &mut cache, &batch, &opts, base_abbrev, &colors, &extra, ws_rule, &mut warnings, &mut check_failed, textconv, ext.as_ref(), &mut found_changes)? {
+    match flush(&mut out, &repo, &mut cache, &batch, &opts, base_abbrev, &colors, &extra, ws_rule, &mut warnings, &mut check_failed, textconv, ext.as_ref(), &mut found_changes, &mut has_changes)? {
         Ok(()) => {}
         Err(code) => return Ok(code),
     }
@@ -1802,14 +1811,14 @@ pub(crate) fn render_raw_stream(
     // having reported something. They are independent, so `--check --exit-code` on a
     // dirty tree exits 3.
     let mut code = 0u8;
-    // `diff_flush()`'s tail: with `diff_from_contents` on, `has_changes` is replaced
-    // by what the rendering pass found, so an external driver that reports "equal"
-    // can bring the status back to 0. Without `--ext-diff` the queue-time
-    // `has_changes` stands, exactly as `diff_queue_change()` set it.
-    let changed = if opts.allow_external && opts.exit_code {
+    // `diff_flush()`'s tail (diff.c:7284): with `diff_from_contents` on, `has_changes`
+    // is replaced by what the rendering pass found, so an external driver that reports
+    // "equal" can bring the status back to 0. Without it, `diffcore_std()`'s own
+    // assignment stands.
+    let changed = if opts.diff_from_contents() {
         found_changes
     } else {
-        any_pair
+        has_changes
     };
     if opts.exit_code && changed {
         code |= 0o1;
@@ -1817,16 +1826,16 @@ pub(crate) fn render_raw_stream(
     if opts.formats.check && check_failed {
         code |= 0o2;
     }
-    Ok(ExitCode::from(code))
+    Ok(Status::from(code))
 }
 
 /// `parse_dirstat_opt()` (diff.c:5454): fold one parameter list into the accumulated
 /// `--dirstat` state and turn the format on, or report git's `die()` and its exit code.
-fn apply_dirstat(opts: &mut Opts, params: &str) -> Option<ExitCode> {
+fn apply_dirstat(opts: &mut Opts, params: &str) -> Option<Status> {
     let errors = diff_files::parse_dirstat_params(params, &mut opts.dirstat);
     if !errors.is_empty() {
         eprint!("fatal: Failed to parse --dirstat/-X option parameter:\n{errors}\n");
-        return Some(ExitCode::from(128));
+        return Some(Status::from(128));
     }
     opts.formats.or_dirstat();
     None
@@ -1897,10 +1906,17 @@ fn parse_git_int(value: &str) -> Option<i32> {
     i32::try_from(val).ok()
 }
 
+/// `diff_opt_ignore_regex()`'s refusal: parse-options' `error()` naming the
+/// pattern, and its 129. Not a `die()`, so there is no `fatal:` and no usage block.
+fn invalid_ignore_regex(pat: &str) -> Status {
+    eprintln!("error: invalid regex given to -I: '{pat}'");
+    Status::from(129)
+}
+
 /// Report a git-style fatal error and yield its exit code.
-fn fatal(msg: &str) -> ExitCode {
+fn fatal(msg: &str) -> Status {
     eprintln!("fatal: {msg}");
-    ExitCode::from(128)
+    Status::from(128)
 }
 
 /// The bare `strerror` text of an I/O failure: Rust appends ` (os error <n>)` to the
@@ -1941,13 +1957,13 @@ fn parse_i64(s: &str) -> i64 {
 /// git errors with `error: <name> expects a character, got '<val>'` (exit 129) for any
 /// value longer than one byte; an empty value leaves the marker as a NUL byte, matching
 /// git's read past the empty string.
-fn set_indicator(slot: &mut u8, val: &str, name: &str) -> std::result::Result<(), ExitCode> {
+fn set_indicator(slot: &mut u8, val: &str, name: &str) -> std::result::Result<(), Status> {
     if val.len() <= 1 {
         *slot = val.as_bytes().first().copied().unwrap_or(0);
         Ok(())
     } else {
         eprintln!("error: {name} expects a character, got '{val}'");
-        Err(ExitCode::from(129))
+        Err(Status::from(129))
     }
 }
 
@@ -1968,26 +1984,6 @@ fn classify_algo(name: &str) -> AlgoChoice {
         "histogram" => AlgoChoice::Use(Histogram),
         "patience" => AlgoChoice::Use(Patience),
         _ => AlgoChoice::Unknown,
-    }
-}
-
-/// Parse `--stat=<width>[,<name-width>[,<count>]]`.
-fn parse_stat_geometry(sw: &mut StatWidths, spec: &str) {
-    let mut it = spec.split(',');
-    if let Some(w) = it.next() {
-        if let Ok(v) = w.trim().parse::<i64>() {
-            sw.width = v;
-        }
-    }
-    if let Some(n) = it.next() {
-        if let Ok(v) = n.trim().parse::<i64>() {
-            sw.name_width = v;
-        }
-    }
-    if let Some(c) = it.next() {
-        if let Ok(v) = c.trim().parse::<i64>() {
-            sw.count = v;
-        }
     }
 }
 
@@ -2167,7 +2163,7 @@ fn run_rename_detection(
     pairs: &mut Vec<Pair>,
     opts: &diffcore_rename::Options,
     resolve_statuses: bool,
-) -> std::result::Result<diffcore_rename::Warnings, ExitCode> {
+) -> std::result::Result<diffcore_rename::Warnings, Status> {
     let mut q = diffcore_rename::Queue::default();
     for p in pairs.iter() {
         // A mode of zero is git's `!DIFF_FILE_VALID`; the record's own (all-zero)
@@ -2235,6 +2231,29 @@ fn run_rename_detection(
 /// The inner `Result` carries a git fatal exit code (e.g. an unreadable blob) so the
 /// caller can stop after the bytes already written.
 #[allow(clippy::type_complexity)]
+/// `diff_setup_done()`'s `diff_from_contents` (diff.c:5282 and :5359): the queue
+/// alone cannot answer "did anything change", so the *rendering* pass has to.
+///
+/// Two independent reasons:
+///
+///   * `XDF_WHITESPACE_FLAGS` (`-w`/`-b`/`--ignore-space-at-eol`/
+///     `--ignore-cr-at-eol`) or a `-I<regex>`, either of which can make a pair with
+///     two different blob ids render nothing at all;
+///   * an external driver, which "could declare non-identical contents equal".
+///
+/// The first was missing here, and it is what `diff_flush()`'s raw/name loop
+/// consults to drop a pair (diff.c:7210). Without it `git diff-tree -r -w` and
+/// `git diff-tree -r -I<re>` listed a raw record for a file whose every changed line
+/// the option ignores, where git lists nothing — the `--stat` path already dropped
+/// it, so the two formats disagreed with each other.
+impl Opts {
+    fn diff_from_contents(&self) -> bool {
+        self.ws != Whitespace::Keep
+            || !self.ignore_lines.is_empty()
+            || (self.allow_external && self.exit_code)
+    }
+}
+
 fn flush(
     out: &mut impl Write,
     repo: &gix::Repository,
@@ -2255,17 +2274,17 @@ fn flush(
     // `diff_from_contents` is on, which for this command means `--ext-diff
     // --exit-code`.
     found_changes: &mut bool,
-) -> Result<std::result::Result<(), ExitCode>> {
-    // `diff_from_contents` (diff_setup_done, diff.c:5359): with an external diff
-    // allowed, the driver may declare non-identical contents equal, so the exit
-    // status has to come from the rendering pass instead of from the queue.
-    let from_contents = opts.allow_external && opts.exit_code;
+    // `o->flags.has_changes`, which `diffcore_std()` *assigns* at its very end
+    // (diff.c:7528) from the queue it is about to hand to `diff_flush()`. Assigned,
+    // not accumulated: `builtin/diff-pairs.c:111` runs one `diffcore_std()` per
+    // explicit batch flush, so the last batch is the one `diff_result_code()` sees.
+    has_changes: &mut bool,
+) -> Result<std::result::Result<(), Status>> {
+    let from_contents = opts.diff_from_contents();
+    // `diffcore_std()` runs whatever the output format is, so its trailing
+    // `has_changes` assignment happens even for a batch it will not render.
+    *has_changes = false;
     if batch.is_empty() {
-        return Ok(Ok(()));
-    }
-    // `diff_flush()` still walks the queue with no output format when it has to
-    // answer `--exit-code` from the contents.
-    if opts.formats.no_output && !from_contents {
         return Ok(Ok(()));
     }
 
@@ -2357,7 +2376,37 @@ fn flush(
         }
     }
 
+    // `diffcore_std()`'s last act (diff.c:7528): the queue that survived break,
+    // rename, pickaxe, order, rotate and `--diff-filter` is the answer to "did
+    // anything change" — unless the contents have to be consulted, in which case it
+    // is `found_changes` below. Reading the *input* pair count instead made
+    // `git diff-tree -r --quiet -S<string-that-occurs-nowhere>` exit 1, because the
+    // walk had pairs even though the pickaxe kept none.
+    *has_changes = !pairs.is_empty() && !from_contents;
+
     if pairs.is_empty() {
+        return Ok(Ok(()));
+    }
+    // `diff_flush()` with `DIFF_FORMAT_NO_OUTPUT` renders nothing — but its tail
+    // (diff.c:7265) still walks the queue with `diff_flush_patch_quietly()` when the
+    // status has to come from the contents, stopping at the first pair that did
+    // change.
+    if opts.formats.no_output {
+        if from_contents && opts.exit_code {
+            for p in &pairs {
+                match pair_found_changes(
+                    repo, cache, p, opts, base_abbrev, tc, ext, pairs.len(),
+                ) {
+                    Ok(hit) => {
+                        *found_changes |= hit;
+                        if *found_changes {
+                            break;
+                        }
+                    }
+                    Err(code) => return Ok(Err(code)),
+                }
+            }
+        }
         return Ok(Ok(()));
     }
 
@@ -2462,12 +2511,12 @@ fn flush(
     }
     if opts.formats.stat {
         let mut sub = Vec::new();
-        render_stat(&mut sub, &files, &opts.stat, colors);
+        diffstat::show_stats(&mut sub, &stat_rows(&files), &opts.stat, colors);
         append_prefixed(&mut buf, lp, &sub);
     }
     if opts.formats.shortstat {
         let mut sub = Vec::new();
-        render_shortstat(&mut sub, &files);
+        diffstat::show_shortstats(&mut sub, &stat_rows(&files));
         append_prefixed(&mut buf, lp, &sub);
     }
     // `show_dirstat_by_line()` closes the stat block; it counts *lines*, normalising a
@@ -2983,7 +3032,7 @@ impl PatchSink<'_> {
 /// `git_diff_basic_config()` instead, so `diff-pairs` never reads it. Verified
 /// against stock git 2.55.0: `git -c diff.external=<prog> diff-pairs -z --ext-diff`
 /// still prints the internal patch. Only the environment reaches here.
-fn external_diff_env() -> std::result::Result<Option<ExternalDiff>, ExitCode> {
+fn external_diff_env() -> std::result::Result<Option<ExternalDiff>, Status> {
     let Some(cmd) = std::env::var_os("GIT_EXTERNAL_DIFF") else {
         return Ok(None);
     };
@@ -2998,7 +3047,7 @@ fn external_diff_env() -> std::result::Result<Option<ExternalDiff>, ExitCode> {
 /// `git_env_bool()` + `git_parse_maybe_bool()`: an unset variable takes the default,
 /// `true`/`yes`/`on`/a non-zero integer are true, `false`/`no`/`off`/`0`/empty are
 /// false, and anything else is fatal.
-fn git_env_bool(key: &str, def: bool) -> std::result::Result<bool, ExitCode> {
+fn git_env_bool(key: &str, def: bool) -> std::result::Result<bool, Status> {
     let Some(raw) = std::env::var_os(key) else {
         return Ok(def);
     };
@@ -3032,7 +3081,7 @@ fn external_for_path(
     drivers: Drivers<'_, '_>,
     path: &gix::bstr::BStr,
     env: Option<&ExternalDiff>,
-) -> std::result::Result<Option<ExternalDiff>, ExitCode> {
+) -> std::result::Result<Option<ExternalDiff>, Status> {
     let name = match drivers.borrow_mut().driver_name(path) {
         Ok(n) => n,
         Err(e) => return Err(fatal(&e.to_string())),
@@ -3083,7 +3132,7 @@ fn prepare_temp_file(
     id: &ObjectId,
     mode: u32,
     valid: bool,
-) -> std::result::Result<TempSide, ExitCode> {
+) -> std::result::Result<TempSide, Status> {
     use std::os::unix::ffi::OsStrExt;
 
     if !valid {
@@ -3200,7 +3249,7 @@ fn run_external_diff(
     // `o->file`: `false` is git's quiet probe (`diff_flush_patch_quietly()`), which
     // nulls the file pointer so nothing is written.
     want_output: bool,
-) -> std::result::Result<ExtRun, ExitCode> {
+) -> std::result::Result<ExtRun, Status> {
     use std::os::unix::ffi::OsStrExt;
 
     // "If we don't need to show the diff and the external diff program lacks the
@@ -3690,7 +3739,7 @@ fn dirstat_damage(
     pairs: &[Pair],
     opts: &Opts,
     tc: TextconvRef<'_, '_>,
-) -> std::result::Result<Vec<(BString, u64)>, ExitCode> {
+) -> std::result::Result<Vec<(BString, u64)>, Status> {
     let mut out = Vec::with_capacity(pairs.len());
     for p in pairs {
         // Equal object ids mean identical content, so no blob has to be read at all.
@@ -3840,7 +3889,7 @@ fn render_check(
     colors: &diff_color::DiffColors,
     ws_cfg: u32,
     tc: TextconvRef<'_, '_>,
-) -> std::result::Result<bool, ExitCode> {
+) -> std::result::Result<bool, Status> {
     let mut failed = false;
     let mut rules = WsRules::new(repo, ws_cfg);
     let lp = opts.line_prefix.as_slice();
@@ -4003,7 +4052,7 @@ fn gitlink_hunks(p: &Pair) -> Vec<u8> {
 
 /// Verify both non-null sides are present in the object database, as git does before
 /// producing any patch body.
-fn check_readable(repo: &gix::Repository, p: &Pair) -> std::result::Result<(), ExitCode> {
+fn check_readable(repo: &gix::Repository, p: &Pair) -> std::result::Result<(), Status> {
     for id in [p.old_id, p.new_id] {
         if id.is_null() {
             continue;
@@ -4024,7 +4073,7 @@ fn analyze(
     p: &Pair,
     opts: &Opts,
     tc: TextconvRef<'_, '_>,
-) -> std::result::Result<Analysis, ExitCode> {
+) -> std::result::Result<Analysis, Status> {
     if is_gitlink(p) {
         let (add, del) = gitlink_counts(p);
         return Ok(Analysis {
@@ -4220,7 +4269,7 @@ fn convert_side(
     path: &gix::bstr::BStr,
     data: &[u8],
     valid: bool,
-) -> std::result::Result<Option<Vec<u8>>, ExitCode> {
+) -> std::result::Result<Option<Vec<u8>>, Status> {
     if !valid {
         return Ok(None);
     }
@@ -4239,7 +4288,7 @@ fn read_blob(
     repo: &gix::Repository,
     id: ObjectId,
     valid: bool,
-) -> std::result::Result<Vec<u8>, ExitCode> {
+) -> std::result::Result<Vec<u8>, Status> {
     if !valid || id.is_null() {
         return Ok(Vec::new());
     }
@@ -4423,7 +4472,7 @@ fn text_analysis(
     new_data: &[u8],
     opts: &Opts,
     algorithm: gix::diff::blob::Algorithm,
-) -> std::result::Result<(u32, u32, Vec<u8>), ExitCode> {
+) -> std::result::Result<(u32, u32, Vec<u8>), Status> {
     let before: Vec<&[u8]> = byte_lines(old_data);
     let after: Vec<&[u8]> = byte_lines(new_data);
     let mut input: InternedInput<Vec<u8>> = InternedInput::default();
@@ -4814,7 +4863,7 @@ fn pickaxe_hit(
     p: &Pair,
     opts: &Opts,
     tc: TextconvRef<'_, '_>,
-) -> std::result::Result<bool, ExitCode> {
+) -> std::result::Result<bool, Status> {
     if let PickaxeKind::ObjFind(ids) = &px.kind {
         return Ok((p.old_valid() && ids.contains(&p.old_id))
             || (p.new_valid() && ids.contains(&p.new_id)));
@@ -4898,7 +4947,7 @@ fn compute_diffstat(pairs: &[Pair], analyses: &[Analysis], opts: &Opts) -> Vec<S
             status: p.kind(),
             old_path: p.old_path.clone(),
             new_path: p.new_path.clone(),
-            print_name: stat_print_name(p, opts.stat.with_summary),
+            print_name: stat_print_name(p, opts.compact_summary),
             added,
             deleted,
             binary: an.binary,
@@ -4908,11 +4957,15 @@ fn compute_diffstat(pairs: &[Pair], analyses: &[Analysis], opts: &Opts) -> Vec<S
 }
 
 /// `fill_print_name()` plus `get_compact_summary()`.
+///
+/// The plain branch is `quote_c_style(file->name, &pname, NULL, 0)`, not the raw
+/// path: without it `diff-tree --stat` printed every name unquoted and so
+/// ignored `core.quotePath` outright, while `diff --stat` (which quotes) did not.
 fn stat_print_name(p: &Pair, with_summary: bool) -> Vec<u8> {
     let mut name = if matches!(p.kind(), b'R' | b'C') {
         pprint_rename(&p.old_path, &p.new_path)
     } else {
-        p.new_path.to_vec()
+        diff_files::quoted_name(&p.new_path)
     };
     if with_summary {
         if let Some(comment) = compact_summary_comment(p) {
@@ -4972,249 +5025,25 @@ fn render_numstat(out: &mut Vec<u8>, files: &[StatFile], lp: &[u8]) {
     }
 }
 
-/// `show_shortstats()`.
-fn render_shortstat(out: &mut Vec<u8>, files: &[StatFile]) {
-    if files.is_empty() {
-        return;
-    }
-    let (total, adds, dels) = stat_totals(files);
-    stat_summary(out, total, adds, dels);
+/// The diffstat rows [`super::diffstat::show_stats`] renders, in git's own
+/// `struct diffstat_file` order. `--numstat` keeps the richer local rows because
+/// it prints raw paths and the rename's two sides, neither of which survives
+/// `fill_print_name()`.
+fn stat_rows(files: &[StatFile]) -> Vec<diffstat::StatFile> {
+    files
+        .iter()
+        .map(|f| diffstat::StatFile {
+            print_name: f.print_name.clone(),
+            added: u64::from(f.added),
+            deleted: u64::from(f.deleted),
+            binary: f.binary,
+            // Unmerged pairs never reach this module: `diff-tree`/`diff-index`
+            // feed it committed pairs, which always have both sides resolved.
+            is_unmerged: false,
+        })
+        .collect()
 }
 
-fn stat_totals(files: &[StatFile]) -> (u32, u32, u32) {
-    let total = files.len() as u32;
-    let (mut adds, mut dels) = (0u32, 0u32);
-    for f in files {
-        if !f.binary {
-            adds += f.added;
-            dels += f.deleted;
-        }
-    }
-    (total, adds, dels)
-}
-
-/// `print_stat_summary_inserts_deletes()`.
-fn stat_summary(out: &mut Vec<u8>, files: u32, insertions: u32, deletions: u32) {
-    if files == 0 {
-        out.extend_from_slice(b" 0 files changed\n");
-        return;
-    }
-    out.extend_from_slice(
-        format!(" {files} file{} changed", if files == 1 { "" } else { "s" }).as_bytes(),
-    );
-    if insertions != 0 || deletions == 0 {
-        out.extend_from_slice(
-            format!(
-                ", {insertions} insertion{}(+)",
-                if insertions == 1 { "" } else { "s" }
-            )
-            .as_bytes(),
-        );
-    }
-    if deletions != 0 || insertions == 0 {
-        out.extend_from_slice(
-            format!(
-                ", {deletions} deletion{}(-)",
-                if deletions == 1 { "" } else { "s" }
-            )
-            .as_bytes(),
-        );
-    }
-    out.push(b'\n');
-}
-
-fn decimal_width(n: u32) -> i64 {
-    let mut w = 1i64;
-    let mut n = n / 10;
-    while n > 0 {
-        w += 1;
-        n /= 10;
-    }
-    w
-}
-
-/// `scale_linear()` from `diff.c`.
-fn scale_linear(it: i64, width: i64, max_change: i64) -> i64 {
-    if it == 0 {
-        return 0;
-    }
-    1 + (it * (width - 1) / max_change)
-}
-
-/// `show_stats()`. `stat_width == -1` means "terminal width", which is 80 for a
-/// non-tty just like git's `term_columns()` fallback.
-fn render_stat(
-    out: &mut Vec<u8>,
-    files: &[StatFile],
-    sw: &StatWidths,
-    colors: &diff_color::DiffColors,
-) {
-    if files.is_empty() {
-        return;
-    }
-    let mut count: i64 = if sw.count != 0 {
-        sw.count
-    } else {
-        files.len() as i64
-    };
-
-    let mut max_change: i64 = 0;
-    let mut max_len: i64 = 0;
-    let mut bin_width: i64 = 0;
-    let mut number_width: i64 = 0;
-    let mut i: i64 = 0;
-    while i < count && i < files.len() as i64 {
-        let f = &files[i as usize];
-        let change = (f.added + f.deleted) as i64;
-        i += 1;
-        max_len = max_len.max(f.print_name.len() as i64);
-        if f.binary {
-            let w = 14 + decimal_width(f.added) + decimal_width(f.deleted);
-            bin_width = bin_width.max(w);
-            number_width = 3;
-            continue;
-        }
-        max_change = max_change.max(change);
-    }
-    count = i;
-
-    let mut width: i64 = if sw.width == -1 {
-        80
-    } else if sw.width != 0 {
-        sw.width
-    } else {
-        80
-    };
-    number_width = number_width.max(decimal_width(max_change as u32));
-    let stat_name_width = if sw.name_width == -1 {
-        0
-    } else {
-        sw.name_width
-    };
-    let stat_graph_width = if sw.graph_width == -1 {
-        0
-    } else {
-        sw.graph_width
-    };
-
-    if width < 16 + 6 + number_width {
-        width = 16 + 6 + number_width;
-    }
-
-    let mut graph_width = if max_change + 4 > bin_width {
-        max_change
-    } else {
-        bin_width - 4
-    };
-    if stat_graph_width > 0 && stat_graph_width < graph_width {
-        graph_width = stat_graph_width;
-    }
-    let mut name_width = if stat_name_width > 0 && stat_name_width < max_len {
-        stat_name_width
-    } else {
-        max_len
-    };
-
-    if name_width + number_width + 6 + graph_width > width {
-        if graph_width > width * 3 / 8 - number_width - 6 {
-            graph_width = width * 3 / 8 - number_width - 6;
-            if graph_width < 6 {
-                graph_width = 6;
-            }
-        }
-        if stat_graph_width > 0 && graph_width > stat_graph_width {
-            graph_width = stat_graph_width;
-        }
-        if name_width > width - number_width - 6 - graph_width {
-            name_width = width - number_width - 6 - graph_width;
-        } else {
-            graph_width = width - number_width - 6 - name_width;
-        }
-    }
-
-    for f in files.iter().take(count.max(0) as usize) {
-        let (added, deleted) = (f.added as i64, f.deleted as i64);
-
-        let full = &f.print_name;
-        let (prefix, name): (&str, &[u8]) = if name_width < full.len() as i64 {
-            let len = (name_width - 3).max(0);
-            let start = full.len() - len as usize;
-            let tail = &full[start..];
-            let tail = match tail.iter().position(|b| *b == b'/') {
-                Some(pos) => &tail[pos..],
-                None => tail,
-            };
-            ("...", tail)
-        } else {
-            ("", full.as_slice())
-        };
-        let padding = (name_width - prefix.len() as i64 - name.len() as i64).max(0) as usize;
-
-        out.push(b' ');
-        out.extend_from_slice(prefix.as_bytes());
-        out.extend_from_slice(name);
-        out.extend_from_slice(&b" ".repeat(padding));
-        out.extend_from_slice(b" | ");
-
-        if f.binary {
-            out.extend_from_slice(
-                format!("{:>width$}", "Bin", width = number_width.max(0) as usize).as_bytes(),
-            );
-            if added == 0 && deleted == 0 {
-                out.push(b'\n');
-                continue;
-            }
-            // `show_stats()` paints the two byte counts with the old/new colors.
-            out.push(b' ');
-            diff_color::paint(out, colors, diff_color::DiffSlot::Old, deleted.to_string().as_bytes());
-            out.extend_from_slice(b" -> ");
-            diff_color::paint(out, colors, diff_color::DiffSlot::New, added.to_string().as_bytes());
-            out.extend_from_slice(b" bytes\n");
-            continue;
-        }
-
-        let (mut add, mut del) = (added, deleted);
-        if graph_width <= max_change {
-            let mut total = scale_linear(add + del, graph_width, max_change);
-            if total < 2 && add > 0 && del > 0 {
-                total = 2;
-            }
-            if add < del {
-                add = scale_linear(add, graph_width, max_change);
-                del = total - add;
-            } else {
-                del = scale_linear(del, graph_width, max_change);
-                add = total - del;
-            }
-        }
-        out.extend_from_slice(
-            format!(
-                "{:>width$}",
-                added + deleted,
-                width = number_width.max(0) as usize
-            )
-            .as_bytes(),
-        );
-        if added + deleted != 0 {
-            out.push(b' ');
-        }
-        // `show_graph()`: each run carries its own color, and emits nothing when empty.
-        if add > 0 {
-            diff_color::paint(out, colors, diff_color::DiffSlot::New, &b"+".repeat(add as usize));
-        }
-        if del > 0 {
-            diff_color::paint(out, colors, diff_color::DiffSlot::Old, &b"-".repeat(del as usize));
-        }
-        out.push(b'\n');
-    }
-
-    if (count as usize) < files.len() {
-        out.extend_from_slice(b" ...\n");
-    }
-
-    let (total, adds, dels) = stat_totals(files);
-    stat_summary(out, total, adds, dels);
-}
 
 // ---------------------------------------------------------------------------
 // --summary
@@ -5387,7 +5216,7 @@ fn render_patch(
     ext: Option<&ExtCtx<'_, '_>>,
     total: usize,
     found_changes: &mut bool,
-) -> std::result::Result<(), ExitCode> {
+) -> std::result::Result<(), Status> {
     // `diff_flush_patch()` drops a pair whose two sides are identical in every
     // respect before `run_diff()` ever sees it.
     if diff_unmodified_pair(p) {
@@ -5487,7 +5316,7 @@ fn pair_found_changes(
     tc: TextconvRef<'_, '_>,
     ext: Option<&ExtCtx<'_, '_>>,
     total: usize,
-) -> std::result::Result<bool, ExitCode> {
+) -> std::result::Result<bool, Status> {
     if diff_unmodified_pair(p) {
         return Ok(false);
     }

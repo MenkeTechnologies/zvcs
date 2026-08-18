@@ -547,7 +547,7 @@ pub(crate) const COLOR_MOVED_WS_ERROR: u32 = 1 << 0;
 /// `parse_color_moved()`: the boolean spellings first (`git_parse_maybe_bool`), then
 /// the mode names. `None` is git's `error()` return.
 pub(crate) fn parse_color_moved(arg: &str) -> Option<ColorMoved> {
-    match parse_maybe_bool(arg) {
+    match crate::optint::maybe_bool(arg) {
         Some(false) => return Some(ColorMoved::No),
         Some(true) => return Some(COLOR_MOVED_DEFAULT),
         None => {}
@@ -560,24 +560,6 @@ pub(crate) fn parse_color_moved(arg: &str) -> Option<ColorMoved> {
         "default" => Some(COLOR_MOVED_DEFAULT),
         "dimmed-zebra" | "dimmed_zebra" => Some(ColorMoved::ZebraDim),
         _ => None,
-    }
-}
-
-/// `git_parse_maybe_bool()`: the spellings a boolean config value may take.
-fn parse_maybe_bool(arg: &str) -> Option<bool> {
-    if arg.is_empty() {
-        return Some(false);
-    }
-    if arg.eq_ignore_ascii_case("true") || arg.eq_ignore_ascii_case("yes") || arg.eq_ignore_ascii_case("on") {
-        return Some(true);
-    }
-    if arg.eq_ignore_ascii_case("false") || arg.eq_ignore_ascii_case("no") || arg.eq_ignore_ascii_case("off") {
-        return Some(false);
-    }
-    match arg.parse::<i64>() {
-        Ok(0) => Some(false),
-        Ok(_) => Some(true),
-        Err(_) => None,
     }
 }
 

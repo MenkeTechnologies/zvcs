@@ -210,6 +210,7 @@ use gix::prelude::ObjectIdExt;
 
 use super::diff_color;
 use super::diff_pickaxe;
+use super::diffstat::{self, StatWidths};
 use super::diff_files::{
     count_changes_sides, quote_one, quote_two, quoted_name, quoted_name_bytes, render_dirstat,
     DirStat,
@@ -249,29 +250,6 @@ struct Ws {
 impl Ws {
     fn any(self) -> bool {
         self.all || self.change || self.at_eol || self.cr
-    }
-}
-
-/// The `--stat` geometry, in git's own `-1 == unset` encoding (`diff.c`'s
-/// `stat_width`/`stat_name_width`/`stat_graph_width`/`stat_count`).
-struct StatWidths {
-    width: i64,
-    name_width: i64,
-    graph_width: i64,
-    count: i64,
-    /// `--compact-summary`: annotate names with `(gone)`, `(new)`, `(mode +x)`, …
-    with_summary: bool,
-}
-
-impl Default for StatWidths {
-    fn default() -> Self {
-        StatWidths {
-            width: -1,
-            name_width: -1,
-            graph_width: -1,
-            count: 0,
-            with_summary: false,
-        }
     }
 }
 
@@ -332,6 +310,8 @@ struct Opts {
     summary: bool,
     /// `--stat` geometry (`--stat=<w>,<n>,<c>`, `--stat-*-width=`, `--compact-summary`).
     stat: StatWidths,
+    /// `--compact-summary`: annotate names with `(gone)`, `(new)`, `(mode +x)`, …
+    compact_summary: bool,
     /// `--full-index`: emit the full object name on the patch `index` line.
     full_index: bool,
     /// `--src-prefix=`/`--no-prefix`; `-R` swaps the two. git's defaults are `a/`/`b/`.
@@ -638,7 +618,8 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
         diffstat: false,
         shortstat: false,
         summary: false,
-        stat: StatWidths::default(),
+        stat: StatWidths::plumbing(),
+        compact_summary: false,
         full_index: false,
         src_prefix: "a/".to_owned(),
         dst_prefix: "b/".to_owned(),
@@ -868,7 +849,7 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
             "--summary" => opts.summary = true,
             "--compact-summary" => {
                 opts.diffstat = true;
-                opts.stat.with_summary = true;
+                opts.compact_summary = true;
             }
             "-U" | "--unified" => {
                 let Some(value) = args.get(i) else {
@@ -1715,10 +1696,10 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
                     render_numstat(&mut rest, &stats, &opts);
                 }
                 if opts.diffstat {
-                    render_stat(&mut rest, &stats, &opts, &colors);
+                    diffstat::show_stats(&mut rest, &stat_rows(&stats), &opts.stat, &colors);
                 }
                 if opts.shortstat {
-                    render_shortstat(&mut rest, &stats);
+                    diffstat::show_shortstats(&mut rest, &stat_rows(&stats));
                 }
                 separator = true;
             }
@@ -2841,7 +2822,7 @@ fn compute_diffstat(deltas: &[Delta], analyses: &[IdxAnalysis], opts: &Opts) -> 
 fn stat_print_name(d: &Delta, opts: &Opts) -> Vec<u8> {
     let path = display_path(&d.path, opts);
     let mut name = quoted_name(&path);
-    if !opts.stat.with_summary {
+    if !opts.compact_summary {
         return name;
     }
     let status = d.status();
@@ -2890,232 +2871,19 @@ fn render_numstat(out: &mut Vec<u8>, files: &[StatFile], opts: &Opts) {
     }
 }
 
-/// `show_shortstats()`.
-fn render_shortstat(out: &mut Vec<u8>, files: &[StatFile]) {
-    if files.is_empty() {
-        return;
-    }
-    let (total, adds, dels) = stat_totals(files);
-    stat_summary(out, total, adds, dels);
-}
-
-fn stat_totals(files: &[StatFile]) -> (u32, u32, u32) {
-    let mut total = files.len() as u32;
-    let (mut adds, mut dels) = (0u32, 0u32);
-    for f in files {
-        if f.is_unmerged {
-            total -= 1;
-        } else if !f.binary {
-            adds += f.added;
-            dels += f.deleted;
-        }
-    }
-    (total, adds, dels)
-}
-
-/// `print_stat_summary_inserts_deletes()`.
-fn stat_summary(out: &mut Vec<u8>, files: u32, insertions: u32, deletions: u32) {
-    if files == 0 {
-        out.extend_from_slice(b" 0 files changed\n");
-        return;
-    }
-    out.extend_from_slice(format!(" {files} file{} changed", if files == 1 { "" } else { "s" }).as_bytes());
-    if insertions != 0 || deletions == 0 {
-        out.extend_from_slice(
-            format!(", {insertions} insertion{}(+)", if insertions == 1 { "" } else { "s" }).as_bytes(),
-        );
-    }
-    if deletions != 0 || insertions == 0 {
-        out.extend_from_slice(
-            format!(", {deletions} deletion{}(-)", if deletions == 1 { "" } else { "s" }).as_bytes(),
-        );
-    }
-    out.push(b'\n');
-}
-
-fn decimal_width(n: u32) -> i64 {
-    let mut w = 1i64;
-    let mut n = n / 10;
-    while n > 0 {
-        w += 1;
-        n /= 10;
-    }
-    w
-}
-
-/// `scale_linear()` from `diff.c`.
-fn scale_linear(it: i64, width: i64, max_change: i64) -> i64 {
-    if it == 0 {
-        return 0;
-    }
-    1 + (it * (width - 1) / max_change)
-}
-
-/// `show_stats()`. A non-tty terminal width is git's `term_columns()` fallback of 80.
-fn render_stat(
-    out: &mut Vec<u8>,
-    files: &[StatFile],
-    opts: &Opts,
-    colors: &diff_color::DiffColors,
-) {
-    if files.is_empty() {
-        return;
-    }
-    let sw = &opts.stat;
-    let mut count: i64 = if sw.count != 0 { sw.count } else { files.len() as i64 };
-
-    let mut max_change: i64 = 0;
-    let mut max_len: i64 = 0;
-    let mut bin_width: i64 = 0;
-    let mut number_width: i64 = 0;
-    let mut i: i64 = 0;
-    while i < count && i < files.len() as i64 {
-        let f = &files[i as usize];
-        let change = (f.added + f.deleted) as i64;
-        i += 1;
-        max_len = max_len.max(f.print_name.len() as i64);
-        if f.is_unmerged {
-            bin_width = bin_width.max(8); // "Unmerged"
-            continue;
-        }
-        if f.binary {
-            let w = 14 + decimal_width(f.added) + decimal_width(f.deleted);
-            bin_width = bin_width.max(w);
-            number_width = 3;
-            continue;
-        }
-        max_change = max_change.max(change);
-    }
-    count = i;
-
-    let mut width: i64 = if sw.width == -1 {
-        80
-    } else if sw.width != 0 {
-        sw.width
-    } else {
-        80
-    };
-    number_width = number_width.max(decimal_width(max_change as u32));
-    let stat_name_width = if sw.name_width == -1 { 0 } else { sw.name_width };
-    let stat_graph_width = if sw.graph_width == -1 { 0 } else { sw.graph_width };
-
-    if width < 16 + 6 + number_width {
-        width = 16 + 6 + number_width;
-    }
-
-    let mut graph_width = if max_change + 4 > bin_width {
-        max_change
-    } else {
-        bin_width - 4
-    };
-    if stat_graph_width > 0 && stat_graph_width < graph_width {
-        graph_width = stat_graph_width;
-    }
-    let mut name_width = if stat_name_width > 0 && stat_name_width < max_len {
-        stat_name_width
-    } else {
-        max_len
-    };
-
-    if name_width + number_width + 6 + graph_width > width {
-        if graph_width > width * 3 / 8 - number_width - 6 {
-            graph_width = width * 3 / 8 - number_width - 6;
-            if graph_width < 6 {
-                graph_width = 6;
-            }
-        }
-        if stat_graph_width > 0 && graph_width > stat_graph_width {
-            graph_width = stat_graph_width;
-        }
-        if name_width > width - number_width - 6 - graph_width {
-            name_width = width - number_width - 6 - graph_width;
-        } else {
-            graph_width = width - number_width - 6 - name_width;
-        }
-    }
-
-    for f in files.iter().take(count.max(0) as usize) {
-        let (added, deleted) = (f.added as i64, f.deleted as i64);
-
-        let full = &f.print_name;
-        let (prefix, name): (&str, &[u8]) = if name_width < full.len() as i64 {
-            let len = (name_width - 3).max(0);
-            let start = full.len() - len as usize;
-            let tail = &full[start..];
-            let tail = match tail.iter().position(|b| *b == b'/') {
-                Some(p) => &tail[p..],
-                None => tail,
-            };
-            ("...", tail)
-        } else {
-            ("", full.as_slice())
-        };
-        let padding = (name_width - prefix.len() as i64 - name.len() as i64).max(0) as usize;
-
-        out.push(b' ');
-        out.extend_from_slice(prefix.as_bytes());
-        out.extend_from_slice(name);
-        out.extend_from_slice(&b" ".repeat(padding));
-        out.extend_from_slice(b" | ");
-
-        if f.binary {
-            out.extend_from_slice(format!("{:>width$}", "Bin", width = number_width.max(0) as usize).as_bytes());
-            if added == 0 && deleted == 0 {
-                out.push(b'\n');
-                continue;
-            }
-            // `show_stats()` paints the two byte counts with the old/new colors.
-            out.push(b' ');
-            diff_color::paint(out, colors, diff_color::DiffSlot::Old, deleted.to_string().as_bytes());
-            out.extend_from_slice(b" -> ");
-            diff_color::paint(out, colors, diff_color::DiffSlot::New, added.to_string().as_bytes());
-            out.extend_from_slice(b" bytes\n");
-            continue;
-        }
-        if f.is_unmerged {
-            out.extend_from_slice(
-                format!("{:>width$}", "Unmerged", width = number_width.max(0) as usize).as_bytes(),
-            );
-            out.push(b'\n');
-            continue;
-        }
-
-        let (mut add, mut del) = (added, deleted);
-        if graph_width <= max_change {
-            let mut total = scale_linear(add + del, graph_width, max_change);
-            if total < 2 && add > 0 && del > 0 {
-                total = 2;
-            }
-            if add < del {
-                add = scale_linear(add, graph_width, max_change);
-                del = total - add;
-            } else {
-                del = scale_linear(del, graph_width, max_change);
-                add = total - del;
-            }
-        }
-        out.extend_from_slice(
-            format!("{:>width$}", added + deleted, width = number_width.max(0) as usize).as_bytes(),
-        );
-        if added + deleted != 0 {
-            out.push(b' ');
-        }
-        // `show_graph()`: each run carries its own color, and emits nothing when empty.
-        if add > 0 {
-            diff_color::paint(out, colors, diff_color::DiffSlot::New, &b"+".repeat(add as usize));
-        }
-        if del > 0 {
-            diff_color::paint(out, colors, diff_color::DiffSlot::Old, &b"-".repeat(del as usize));
-        }
-        out.push(b'\n');
-    }
-
-    if (count as usize) < files.len() {
-        out.extend_from_slice(b" ...\n");
-    }
-
-    let (total, adds, dels) = stat_totals(files);
-    stat_summary(out, total, adds, dels);
+/// The rows [`super::diffstat::show_stats`] renders. `--numstat` keeps the local
+/// rows because it prints the raw path, which `fill_print_name()` does not carry.
+fn stat_rows(files: &[StatFile]) -> Vec<diffstat::StatFile> {
+    files
+        .iter()
+        .map(|f| diffstat::StatFile {
+            print_name: f.print_name.clone(),
+            added: u64::from(f.added),
+            deleted: u64::from(f.deleted),
+            binary: f.binary,
+            is_unmerged: f.is_unmerged,
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------

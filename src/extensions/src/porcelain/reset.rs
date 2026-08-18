@@ -109,6 +109,7 @@
 //! `missing tree 4b825dc…`, this port reports nothing. Writing it properly is a
 //! whole-index feature, not a reset one.
 
+use crate::optint;
 use anyhow::{anyhow, bail, Result};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::Write;
@@ -248,46 +249,45 @@ impl PatchDiffOpts {
     pub(super) fn finish(&self) -> std::result::Result<(), ExitCode> {
         match self.pending {
             Some((name, short)) => {
-                eprintln!("error: {} requires a value", opt_label(name, short));
+                let label = if short {
+                    optint::short_opt('U')
+                } else {
+                    optint::long_opt(name)
+                };
+                eprintln!("error: {label} requires a value");
                 Err(ExitCode::from(129))
             }
             None => Ok(()),
         }
     }
 
-    /// Validate and record one `-U`/`--inter-hunk-context` value, reproducing
-    /// parse-options' `OPTION_INTEGER` diagnostics in git's own order: an absent
-    /// value, then an empty one, then one `git_parse_int()` rejects, then one
-    /// outside the `int` range.
+    /// Validate and record one `-U`/`--inter-hunk-context` value through
+    /// [`optint::integer`], which is `OPTION_INTEGER` — the diagnostics come out
+    /// in git's own order: an absent value, then an empty one, then one the
+    /// base-0 + `k`/`m`/`g` grammar rejects, then one outside the `int` range.
     fn store(
         &mut self,
         name: &'static str,
         short: bool,
         value: Option<&str>,
     ) -> std::result::Result<(), ExitCode> {
-        let label = opt_label(name, short);
-        let raw = match value {
-            None => {
-                eprintln!("error: {label} requires a value");
-                return Err(ExitCode::from(129));
-            }
-            Some("") => {
-                eprintln!("error: {label} expects a numerical value");
-                return Err(ExitCode::from(129));
-            }
-            Some(v) => v,
+        let label = if short {
+            optint::short_opt('U')
+        } else {
+            optint::long_opt(name)
         };
-        let Some(parsed) = git_parse_int(raw) else {
-            eprintln!("error: {label} expects an integer value with an optional k/m/g suffix");
+        let Some(raw) = value else {
+            eprintln!("error: {label} requires a value");
             return Err(ExitCode::from(129));
         };
-        let Ok(narrowed) = i32::try_from(parsed) else {
-            eprintln!(
-                "error: value {raw} for {label} not in range [{},{}]",
-                i32::MIN,
-                i32::MAX
-            );
-            return Err(ExitCode::from(129));
+        // `OPTION_INTEGER` over an `int`: the empty value, the base-0 + k/m/g
+        // grammar and the range clause all come with git's own wording.
+        let narrowed = match optint::integer(&label, raw) {
+            Ok(v) => v as i32,
+            Err(e) => {
+                eprintln!("error: {}", e.message());
+                return Err(ExitCode::from(129));
+            }
         };
         if name == "unified" {
             self.unified = narrowed;
@@ -365,89 +365,6 @@ impl PatchDiffOpts {
             auto_advance: self.auto_advance,
             disallow_edit,
         }
-    }
-}
-
-/// parse-options names a short option `switch \`c'` and a long one `option \`n'`
-/// in its diagnostics.
-fn opt_label(name: &str, short: bool) -> String {
-    if short {
-        "switch `U'".to_string()
-    } else {
-        format!("option `{name}'")
-    }
-}
-
-/// git's `git_parse_int()` (config.c): `strtoimax(v, &end, 0)` — leading ASCII
-/// whitespace, an optional sign, then a base auto-detected from the prefix (`0x`
-/// hex, a leading `0` octal, else decimal) — followed by `get_unit_factor(end)`,
-/// which scales by 1, 1024, 1024² or 1024³ for an empty tail or a single
-/// `k`/`m`/`g` in either case. `None` for anything else. The accumulator is `i128`
-/// so a value too large for `intmax_t` still lands outside the caller's `int`
-/// range check rather than wrapping.
-fn git_parse_int(v: &str) -> Option<i128> {
-    let b = v.as_bytes();
-    let mut i = 0;
-    while i < b.len() && b[i].is_ascii_whitespace() {
-        i += 1;
-    }
-    let negative = match b.get(i) {
-        Some(b'-') => {
-            i += 1;
-            true
-        }
-        Some(b'+') => {
-            i += 1;
-            false
-        }
-        _ => false,
-    };
-    let (radix, mut i) = if i + 1 < b.len() && b[i] == b'0' && (b[i + 1] | 0x20) == b'x' {
-        (16u32, i + 2)
-    } else if i < b.len() && b[i] == b'0' {
-        // A lone leading `0` is itself an octal digit, so the digit run is never empty.
-        (8u32, i)
-    } else {
-        (10u32, i)
-    };
-    let start = i;
-    let mut magnitude: i128 = 0;
-    while i < b.len() {
-        let Some(d) = (b[i] as char).to_digit(radix) else {
-            break;
-        };
-        magnitude = magnitude.saturating_mul(radix as i128) + d as i128;
-        // Saturate well past `int` range so the caller reports "not in range".
-        magnitude = magnitude.min(i64::MAX as i128);
-        i += 1;
-    }
-    if i == start {
-        return None;
-    }
-    let factor: i128 = match b[i..] {
-        [] => 1,
-        [u] => match u | 0x20 {
-            b'k' => 1024,
-            b'm' => 1024 * 1024,
-            b'g' => 1024 * 1024 * 1024,
-            _ => return None,
-        },
-        _ => return None,
-    };
-    let scaled = magnitude.saturating_mul(factor);
-    Some(if negative { -scaled } else { scaled })
-}
-
-/// git's `git_parse_maybe_bool()`: the canonical spellings first
-/// (`git_parse_maybe_bool_text`, where the empty string is false), then a fall
-/// back to `git_parse_int()` where any non-zero integer is true. Drives
-/// `--recurse-submodules=<v>`, whose value git parses as a plain boolean — which
-/// is why `on-demand` is rejected there.
-fn git_parse_maybe_bool(v: &str) -> Option<bool> {
-    match v.to_ascii_lowercase().as_str() {
-        "yes" | "on" | "true" => Some(true),
-        "no" | "off" | "false" | "" => Some(false),
-        _ => git_parse_int(v).map(|n| n != 0),
     }
 }
 
@@ -631,7 +548,7 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
             "--no-recurse-submodules" => recurse_submodules = Some(false),
             s if s.starts_with("--recurse-submodules=") => {
                 let val = &s["--recurse-submodules=".len()..];
-                match git_parse_maybe_bool(val) {
+                match optint::maybe_bool(val) {
                     Some(b) => recurse_submodules = Some(b),
                     None => {
                         eprintln!("fatal: bad recurse-submodules argument: {val}");

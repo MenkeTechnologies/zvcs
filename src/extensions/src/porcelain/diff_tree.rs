@@ -240,6 +240,16 @@ struct Opts {
     exit_code: bool,     // --exit-code/--quiet: exit 1 when anything differs
     abbrev: usize,       // object-id width in the raw output
     filter: u32,         // --diff-filter mask, see `filter_bit`
+    /// `--diff-filter` was actually given. `filter` is set to [`ALL_STATUSES`] on a
+    /// routed run, so it cannot answer git's `opt->filter` test on its own.
+    filter_given: bool,
+    /// `--quiet` — git's `opt->flags.quick`, which is *not* implied by
+    /// `-s --exit-code`.
+    quick: bool,
+    /// `diff_setup_done()`'s `diff_from_contents`: a whitespace-insensitive
+    /// comparison or a `-I<regex>` was asked for, so a queued pair no longer proves
+    /// the trees differ and `has_changes` is left clear at queue time.
+    from_contents: bool,
     format: Format,
     paths: Vec<BString>, // the raw path filters (empty = whole tree)
     // The parsed pathspec set matching `paths`; `None` when there is no filter.
@@ -314,6 +324,9 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
         exit_code: false,
         abbrev: hash.len_in_hex(),
         filter: ALL_STATUSES,
+        filter_given: false,
+        quick: false,
+        from_contents: false,
         format: Format::Raw,
         paths: Vec::new(),
         specs: None,
@@ -486,6 +499,7 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
                 "--quiet" => {
                     opts.format = Format::NoOutput;
                     opts.exit_code = true;
+                    opts.quick = true;
                 }
                 // The lone-`-h` help is answered before discovery. Reaching
                 // here means `-h` had company, which `cmd_diff_tree` treats as
@@ -516,7 +530,10 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
                 }
                 _ if a.starts_with("--diff-filter=") => {
                     match parse_diff_filter(&a["--diff-filter=".len()..]) {
-                        Some(mask) => opts.filter = mask,
+                        Some(mask) => {
+                            opts.filter = mask;
+                            opts.filter_given = true;
+                        }
                         None => return Ok(ExitCode::from(USAGE_ERROR)),
                     }
                 }
@@ -676,6 +693,23 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
         opts.show_trees = false;
     }
 
+    // `diff_setup_done()` (diff.c:5282): a whitespace-insensitive comparison or a
+    // `-I<regex>` means a queued pair no longer proves the trees differ, so
+    // `diff_queue_change()` leaves `has_changes` clear and the walk cannot quit early.
+    opts.from_contents = diff_args.iter().any(|a| {
+        matches!(
+            a.as_str(),
+            "-w" | "--ignore-all-space"
+                | "-b"
+                | "--ignore-space-change"
+                | "--ignore-space-at-eol"
+                | "--ignore-cr-at-eol"
+                | "-I"
+                | "--ignore-matching-lines"
+        ) || a.starts_with("-I")
+            || a.starts_with("--ignore-matching-lines=")
+    });
+
     // An option only `diff-pairs` can render switches the whole rendering pass over to
     // it. The pair list handed over is then the untouched walk output: `-R` and
     // `--diff-filter` travel with the other diff options and are applied there, so
@@ -741,8 +775,7 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
                 Some(new) => {
                     let changes = collect(&repo, Some(old), Some(new), &opts)?;
                     differed = !changes.is_empty();
-                    render_all(&repo, &mut out, &changes, &opts)?;
-                    0
+                    render_all(&repo, &mut out, &changes, &opts)?
                 }
             },
         }
@@ -772,7 +805,13 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
     stdout.write_all(&out)?;
     stdout.flush()?;
 
-    if code == 0 && opts.exit_code && differed {
+    // `diff_result_code()` answers from `opt->flags.has_changes`, which the *whole*
+    // `diffcore_std()` pipeline gets to clear — the pickaxe most of all. A routed run
+    // hands that pipeline to `diff-pairs`, so its status is the answer and this
+    // command's own "the walk saw a change" bit is not: `git diff-tree -r --quiet
+    // -S<string-that-occurs-nowhere>` exits 0 in git and was exiting 1 here, because
+    // the walk had changes even though the pickaxe kept none of them.
+    if code == 0 && opts.route.is_none() && opts.exit_code && differed {
         return Ok(ExitCode::from(1));
     }
     Ok(ExitCode::from(code))
@@ -838,7 +877,10 @@ fn diff_tree_stdin(
                 };
                 let changes = collect(repo, Some(ta), Some(tb), opts)?;
                 *differed |= !changes.is_empty();
-                render_all(repo, out, &changes, opts)?;
+                let code = render_all(repo, out, &changes, opts)?;
+                if code != 0 {
+                    return Ok(code);
+                }
             }
             kind => {
                 eprintln!("error: Object {id} is a {kind}, not a commit or tree");
@@ -891,7 +933,10 @@ fn emit_commit_diff(
         if opts.always || (!opts.no_commit_id && !changes.is_empty()) {
             emit_commit_header(repo, out, commit_id, opts)?;
         }
-        render_all(repo, out, &changes, opts)?;
+        let code = render_all(repo, out, &changes, opts)?;
+        if code != 0 {
+            return Ok(code);
+        }
     }
     Ok(0)
 }
@@ -1766,8 +1811,7 @@ fn merge_base_diff(
     let new_tree = tree_of(repo, commits[1])?;
     let changes = collect(repo, Some(base_tree), Some(new_tree), opts)?;
     *differed = !changes.is_empty();
-    render_all(repo, out, &changes, opts)?;
-    Ok(0)
+    render_all(repo, out, &changes, opts)
 }
 
 /// The tree a commit points at.
@@ -1838,6 +1882,22 @@ fn entry_cmp(a: &Entry, b: &Entry) -> Ordering {
     }
 }
 
+/// `diff_can_quit_early()` (diff.c:7559): `quick && !filter && has_changes`.
+///
+/// `ll_diff_tree_paths()` (tree-diff.c:462) tests this at the top of its loop at
+/// *every* recursion level, so under `--quiet` the walk stops the moment one pair is
+/// queued and everything after it is never compared. That is load-bearing, not an
+/// optimization: `diffcore_std()` then runs the pickaxe over that one pair alone, so
+/// `git diff-tree -r --quiet -S<s>` answers "does the FIRST changed path contain
+/// `<s>`", not "does any". Walking the whole tree instead made
+/// `--quiet -S<later-match>` exit 1 where git exits 0.
+///
+/// `has_changes` is only set at queue time when `!diff_from_contents`, so `-w` and
+/// `-I<re>` switch the early quit off — with them, git walks everything.
+fn can_quit_early(opts: &Opts, out: &[Change]) -> bool {
+    opts.quick && !opts.filter_given && !opts.from_contents && !out.is_empty()
+}
+
 /// Depth-first merge-walk of two trees rooted at `prefix`, appending changes to `out`.
 fn walk(
     repo: &gix::Repository,
@@ -1852,6 +1912,9 @@ fn walk(
     let (mut i, mut j) = (0usize, 0usize);
 
     while i < lhs.len() || j < rhs.len() {
+        if can_quit_early(opts, out) {
+            break;
+        }
         let order = match (lhs.get(i), rhs.get(j)) {
             (Some(a), Some(b)) => entry_cmp(a, b),
             (Some(_), None) => Ordering::Less,
@@ -1973,17 +2036,26 @@ fn descend(path: &BString, opts: &Opts) -> bool {
     specs.may_contain_match(path)
 }
 
+/// Render `changes` in the requested format, answering the exit code the render
+/// itself produced — `0` for every locally-rendered format, and `diff-pairs`' own
+/// status for a routed one.
+///
+/// The routed status is not decoration: `diff-pairs` reports an unusable `-G`/`-S`
+/// regex with `fatal:` and 128, and it is the only thing that can — `diff-tree`
+/// hands it the pattern unparsed. Discarding it here (`render_raw_stream(...)?;`)
+/// made `git diff-tree -G '[' <a> <b>` print the fatal and then exit 0.
 fn render_all(
     repo: &gix::Repository,
     out: &mut Vec<u8>,
     changes: &[Change],
     opts: &Opts,
-) -> Result<()> {
+) -> Result<u8> {
     // A routed run hands the walk output straight to `diff-pairs`, which owns every
     // patch, diffstat, dirstat, whitespace and rename format.
     if let Some(args) = &opts.route {
-        super::diff_pairs::render_raw_stream(args, Some(raw_pair_stream(changes)), Some(out))?;
-        return Ok(());
+        let status =
+            super::diff_pairs::render_raw_stream(args, Some(raw_pair_stream(changes)), Some(out))?;
+        return Ok(status.code());
     }
     match opts.format {
         Format::NumStat => {
@@ -2003,7 +2075,7 @@ fn render_all(
             }
         }
     }
-    Ok(())
+    Ok(0)
 }
 
 /// Serialize the walk output in `diff-pairs`' input format — the NUL-terminated raw
@@ -2102,30 +2174,10 @@ fn render_shortstat(repo: &gix::Repository, out: &mut Vec<u8>, changes: &[Change
             deletions += del as u64;
         }
     }
-    print_stat_summary(out, changes.len() as u64, insertions, deletions);
+    super::diffstat::print_stat_summary(out, changes.len() as u64, insertions, deletions);
     Ok(())
 }
 
-/// git's `print_stat_summary`: ` N file[s] changed[, X insertion[s](+)][, Y
-/// deletion[s](-)]`. The insertion clause also shows when there are zero deletions and
-/// vice versa, so a binary-only change still prints both zero clauses.
-fn print_stat_summary(out: &mut Vec<u8>, files: u64, insertions: u64, deletions: u64) {
-    let mut line = format!(" {files} file{} changed", if files != 1 { "s" } else { "" });
-    if insertions > 0 || deletions == 0 {
-        line.push_str(&format!(
-            ", {insertions} insertion{}(+)",
-            if insertions != 1 { "s" } else { "" }
-        ));
-    }
-    if deletions > 0 || insertions == 0 {
-        line.push_str(&format!(
-            ", {deletions} deletion{}(-)",
-            if deletions != 1 { "s" } else { "" }
-        ));
-    }
-    line.push('\n');
-    out.extend_from_slice(line.as_bytes());
-}
 
 /// One `--summary` line, or nothing for a plain modification. git emits ` create mode`
 /// / ` delete mode` for additions and deletions and ` mode change <old> => <new>` when

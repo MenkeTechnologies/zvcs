@@ -241,12 +241,36 @@ impl ConfInfo {
 
 /// Everything `trailer_config_init()` establishes, plus the comment string that
 /// `git_default_config()` sets.
-struct TrailerConfig {
+///
+/// `commit -s` reaches the same trailer scan through [`block_get`], so this is
+/// shared rather than re-derived there.
+pub(crate) struct TrailerConfig {
     separators: Vec<u8>,
-    comment: Vec<u8>,
+    pub(crate) comment: Vec<u8>,
     defaults: ConfInfo,
     /// `conf_head`, in the order the keys were seen in the merged configuration.
     items: Vec<ConfInfo>,
+}
+
+impl Default for TrailerConfig {
+    /// `trailer_config_init()`'s starting point: a `:` separator, `#` comments,
+    /// and no configured aliases.
+    fn default() -> Self {
+        TrailerConfig {
+            separators: b":".to_vec(),
+            comment: b"#".to_vec(),
+            defaults: ConfInfo {
+                name: Vec::new(),
+                key: None,
+                command: None,
+                cmd: None,
+                where_: Where::End,
+                if_exists: IfExists::AddIfDifferentNeighbor,
+                if_missing: IfMissing::Add,
+            },
+            items: Vec::new(),
+        }
+    }
 }
 
 impl TrailerConfig {
@@ -279,7 +303,7 @@ fn token_matches_item(tok: &[u8], item: &ConfInfo, tok_len: usize) -> bool {
 /// `separators`, `where`, `ifexists`, `ifmissing` — and must run to completion
 /// first, because pass two (`git_trailer_config`) seeds every `trailer.<alias>`
 /// item from the defaults it leaves behind.
-fn load_config() -> Result<TrailerConfig> {
+pub(crate) fn load_config() -> Result<TrailerConfig> {
     // `setup_git_directory_gently()`: a repository is preferred, but the command
     // is legal outside one, where git reads the global set plus `GIT_CONFIG_*`.
     let config = match gix::discover(".") {
@@ -292,18 +316,8 @@ fn load_config() -> Result<TrailerConfig> {
     };
 
     let mut cfg = TrailerConfig {
-        separators: b":".to_vec(),
         comment: comment_string(&config),
-        defaults: ConfInfo {
-            name: Vec::new(),
-            key: None,
-            command: None,
-            cmd: None,
-            where_: Where::End,
-            if_exists: IfExists::AddIfDifferentNeighbor,
-            if_missing: IfMissing::Add,
-        },
-        items: Vec::new(),
+        ..TrailerConfig::default()
     };
 
     // Pass one: the dotless keys.
@@ -457,7 +471,7 @@ fn ordered_values(section: &gix::config::file::SectionRef<'_>) -> Vec<(String, V
 
 /// `core.commentChar` / `core.commentString`, which are the same knob in git 2.55.
 /// The last one set across both spellings wins; `auto` and absence give `#`.
-fn comment_string(config: &ConfigFile) -> Vec<u8> {
+pub(crate) fn comment_string(config: &ConfigFile) -> Vec<u8> {
     let mut chosen = b"#".to_vec();
     for section in config.sections() {
         let header = section.header();
@@ -821,12 +835,12 @@ struct Item {
 }
 
 /// `struct trailer_block`: where the block sits and what it holds.
-struct Block {
-    start: usize,
-    end: usize,
+pub(crate) struct Block {
+    pub(crate) start: usize,
+    pub(crate) end: usize,
     blank_line_before: bool,
     /// The block's lines after RFC-822 folding, each keeping its trailing `\n`.
-    lines: Vec<Vec<u8>>,
+    pub(crate) lines: Vec<Vec<u8>>,
 }
 
 /// `process_trailers()`: everything between reading the input and writing it out.
@@ -875,7 +889,7 @@ pub(crate) fn trailer_block_of(msg: &[u8]) -> Result<Vec<u8>> {
 }
 
 /// `trailer_block_get()`: locate the block and fold its continuation lines.
-fn block_get(input: &[u8], no_divider: bool, cfg: &TrailerConfig) -> Block {
+pub(crate) fn block_get(input: &[u8], no_divider: bool, cfg: &TrailerConfig) -> Block {
     let cend = c_len(input);
     let end = find_end_of_log_message(input, cend, no_divider, cfg);
     // `end` is always line-aligned, so the start can never overshoot it; the clamp
@@ -1204,8 +1218,13 @@ fn find_end_of_log_message(buf: &[u8], cend: usize, no_divider: bool, cfg: &Trai
 /// `ignored_log_message_bytes()`: the size of the trailing run of comment and
 /// blank lines (and any old-style `Conflicts:` block), or of everything below the
 /// scissors line.
-fn ignored_log_message_bytes(buf: &[u8], len: usize, cend: usize, cfg: &TrailerConfig) -> usize {
-    let cutoff = locate_end(buf, len, cend, cfg);
+pub(crate) fn ignored_log_message_bytes(
+    buf: &[u8],
+    len: usize,
+    cend: usize,
+    cfg: &TrailerConfig,
+) -> usize {
+    let cutoff = locate_end(buf, len, cend, &cfg.comment);
     // git uses 0 as "unset" here, so a run that starts at offset 0 reads as no run
     // at all. That quirk is part of the observable behaviour and is kept.
     let mut boc = 0usize;
@@ -1245,9 +1264,9 @@ fn ignored_log_message_bytes(buf: &[u8], len: usize, cend: usize, cfg: &TrailerC
 
 /// `wt_status_locate_end()`: cut at the `<comment> ------------------------ >8 …`
 /// scissors line, if the message has one.
-fn locate_end(buf: &[u8], len: usize, cend: usize, cfg: &TrailerConfig) -> usize {
+pub(crate) fn locate_end(buf: &[u8], len: usize, cend: usize, comment: &[u8]) -> usize {
     let mut pattern = vec![b'\n'];
-    pattern.extend_from_slice(&cfg.comment);
+    pattern.extend_from_slice(comment);
     pattern.push(b' ');
     pattern.extend_from_slice(CUT_LINE);
 
@@ -1354,7 +1373,7 @@ fn ends_with_blank_line(buf: &[u8], len: usize, cend: usize) -> bool {
 // ---------------------------------------------------------------------------
 
 /// The length git's C code sees: everything up to the first NUL.
-fn c_len(buf: &[u8]) -> usize {
+pub(crate) fn c_len(buf: &[u8]) -> usize {
     buf.iter().position(|&b| b == 0).unwrap_or(buf.len())
 }
 

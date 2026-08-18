@@ -15,7 +15,10 @@
 //! is the primary key, earlier ones break its ties, and a final ascending
 //! `strcmp` on the refname breaks the rest (`compare_refs`). `-` reverses a
 //! single key without reversing that final tiebreak; `version:`/`v:` selects
-//! `versioncmp()`, ported verbatim below. Sort keys are validated only after
+//! `versioncmp()` (`crate::refsort`, shared with `branch`, `tag` and
+//! `for-each-ref` exactly as git shares `versioncmp.c`, so
+//! `versionsort.suffix` / `versionsort.prereleaseSuffix` apply here too). Sort
+//! keys are validated only after
 //! the refs have been fetched, exactly where git validates them, so an
 //! unreachable remote still reports the transport failure rather than the key.
 //!
@@ -32,14 +35,12 @@
 //!   those, but computing them needs object data `ls-remote` never fetches.
 //! * `version:` in front of a *date* key falls back to the plain numeric
 //!   compare instead of git's versioncmp over the formatted date string.
-//! * `versionsort.suffix` / `versionsort.prereleaseSuffix` are not consulted,
-//!   so `version:` sorting is plain `strverscmp` ordering (git's behaviour when
-//!   neither key is configured).
 //!
 //! Running outside a repository also bails: gitoxide resolves transport,
 //! credential and `insteadOf` configuration through a `Repository`, and there
 //! is no repository-less remote in the vendored crates.
 
+use crate::refsort::{self, Prereleases};
 use anyhow::{bail, Result};
 use std::cmp::Ordering;
 use std::process::ExitCode;
@@ -310,7 +311,9 @@ pub fn ls_remote(args: &[String]) -> Result<ExitCode> {
             eprintln!("fatal: {msg}");
             return Ok(ExitCode::from(128));
         }
-        rows.sort_by(|a, b| compare_rows(&keys, a, b));
+        // git seeds `versioncmp`'s prerelease list from config once, lazily.
+        let prereleases = Prereleases::new(&repo);
+        rows.sort_by(|a, b| compare_rows(&keys, a, b, &prereleases));
     }
 
     let mut out = String::new();
@@ -583,13 +586,15 @@ fn resolve_dates(repo: &gix::Repository, keys: &[SortKey], rows: &mut [Row]) -> 
 
 /// git's `compare_refs`: walk the keys, then fall back to an ascending refname
 /// `strcmp` that `-` never reverses.
-fn compare_rows(keys: &[SortKey], a: &Row, b: &Row) -> Ordering {
+fn compare_rows(keys: &[SortKey], a: &Row, b: &Row, pre: &Prereleases<'_>) -> Ordering {
     for key in keys {
         let cmp = match (key.version, key.atom) {
-            (true, Atom::Refname) => versioncmp(&a.name, &b.name),
-            (true, Atom::Objectname) => {
-                versioncmp(&a.id.to_hex().to_string(), &b.id.to_hex().to_string())
-            }
+            (true, Atom::Refname) => refsort::versioncmp(a.name.as_bytes(), b.name.as_bytes(), pre),
+            (true, Atom::Objectname) => refsort::versioncmp(
+                a.id.to_hex().to_string().as_bytes(),
+                b.id.to_hex().to_string().as_bytes(),
+                pre,
+            ),
             // `version:<date atom>` is accepted but treated as the plain
             // numeric compare. git runs versioncmp over the atom's *formatted*
             // date string there, which this port does not reproduce; the
@@ -604,91 +609,6 @@ fn compare_rows(keys: &[SortKey], a: &Row, b: &Row) -> Ordering {
         }
     }
     a.name.as_bytes().cmp(b.name.as_bytes())
-}
-
-// `versioncmp()` states: S_N normal, S_I integral part, S_F fractional part,
-// S_Z fractional part with leading zeroes only.
-const S_N: usize = 0x0;
-const S_I: usize = 0x3;
-const S_F: usize = 0x6;
-const S_Z: usize = 0x9;
-/// Result kind: return the raw difference.
-const CMP: i8 = 2;
-/// Result kind: compare by the length of the digit runs.
-const LEN: i8 = 3;
-
-/// git's `versioncmp()` from `versioncmp.c`, itself glibc's `strverscmp()`.
-///
-/// Compares two strings holding indices/version numbers so that `v1.10` sorts
-/// after `v1.2`. `versionsort.suffix` prerelease handling is not implemented
-/// (see the module docs); with neither `versionsort` key configured git takes
-/// exactly this path.
-fn versioncmp(s1: &str, s2: &str) -> Ordering {
-    // Symbol(s)  0       [1-9]   others
-    // Transition (10) 0  (01) d  (00) x
-    #[rustfmt::skip]
-    const NEXT_STATE: [usize; 12] = [
-        /* state    x    d    0  */
-        /* S_N */   S_N, S_I, S_Z,
-        /* S_I */   S_N, S_I, S_I,
-        /* S_F */   S_N, S_F, S_F,
-        /* S_Z */   S_N, S_F, S_Z,
-    ];
-    #[rustfmt::skip]
-    const RESULT_TYPE: [i8; 36] = [
-        /* state   x/x  x/d  x/0  d/x  d/d  d/0  0/x  0/d  0/0 */
-        /* S_N */  CMP, CMP, CMP, CMP, LEN, CMP, CMP, CMP, CMP,
-        /* S_I */  CMP, -1,  -1,  1,   LEN, LEN, 1,   LEN, LEN,
-        /* S_F */  CMP, CMP, CMP, CMP, CMP, CMP, CMP, CMP, CMP,
-        /* S_Z */  CMP, 1,   1,   -1,  CMP, CMP, -1,  CMP, CMP,
-    ];
-
-    let (a, b) = (s1.as_bytes(), s2.as_bytes());
-    // The C original walks NUL-terminated buffers; past the end reads as NUL.
-    let at = |s: &[u8], i: usize| -> u8 { s.get(i).copied().unwrap_or(0) };
-    let digit = |c: u8| c.is_ascii_digit();
-    // 0 for other, 1 for [1-9], 2 for '0' — the column of both tables.
-    let class = |c: u8| usize::from(c == b'0') + usize::from(digit(c));
-
-    let mut i = 0usize;
-    let mut c1 = at(a, 0);
-    let mut c2 = at(b, 0);
-    let mut state = S_N + class(c1);
-
-    let diff = loop {
-        let diff = i32::from(c1) - i32::from(c2);
-        if diff != 0 {
-            break diff;
-        }
-        if c1 == 0 {
-            return Ordering::Equal;
-        }
-        state = NEXT_STATE[state];
-        i += 1;
-        c1 = at(a, i);
-        c2 = at(b, i);
-        state += class(c1);
-    };
-
-    match RESULT_TYPE[state * 3 + class(c2)] {
-        CMP => diff.cmp(&0),
-        LEN => {
-            // Whichever side's digit run continues longer holds the larger number.
-            let mut k = 0;
-            while digit(at(a, i + 1 + k)) {
-                if !digit(at(b, i + 1 + k)) {
-                    return Ordering::Greater;
-                }
-                k += 1;
-            }
-            if digit(at(b, i + 1 + k)) {
-                Ordering::Less
-            } else {
-                diff.cmp(&0)
-            }
-        }
-        verdict => verdict.cmp(&0),
-    }
 }
 
 /// Turn one advertised ref into its output rows.
@@ -791,29 +711,6 @@ fn tail_match(patterns: &[&str], name: &str) -> bool {
 mod tests {
     use super::*;
 
-    /// Ordering of the names stock git 2.55 produced for
-    /// `git tag --sort=version:refname` over this exact set, which is the
-    /// regression this port has to keep reproducing.
-    #[test]
-    fn versioncmp_matches_git_version_refname_order() {
-        let mut names = vec![
-            "v1.0.1", "v1.10", "10", "v1", "a01b2", "v1.0-rc2", "1", "v1.0.0.0", "v1.1", "01",
-            "v001", "v1a", "release-2", "v10", "v0.9", "v1.0a", "v1_2", "v1.0", "v01", "0",
-            "release-10", "abc", "v2.0", "v1.0.0", "v9", "a1b2", "v1-2", "00", "x", "release-1",
-            "refs", "v10.0", "v1.0-rc1", "v2", "v1.2", "y",
-        ];
-        names.sort_by(|a, b| versioncmp(a, b).then_with(|| a.cmp(b)));
-        assert_eq!(
-            names,
-            vec![
-                "00", "01", "0", "1", "10", "a01b2", "a1b2", "abc", "refs", "release-1",
-                "release-2", "release-10", "v001", "v01", "v0.9", "v1", "v1-2", "v1.0", "v1.0-rc1",
-                "v1.0-rc2", "v1.0.0", "v1.0.0.0", "v1.0.1", "v1.0a", "v1.1", "v1.2", "v1.10",
-                "v1_2", "v1a", "v2", "v2.0", "v9", "v10", "v10.0", "x", "y",
-            ]
-        );
-    }
-
     /// The last `--sort` is the primary key (`ref_sorting_options` prepends),
     /// and `-` reverses that key without touching the refname tiebreak.
     #[test]
@@ -833,11 +730,11 @@ mod tests {
         // Equal dates fall through to an ascending refname compare, never a
         // descending one, even though the date key is reversed.
         assert_eq!(
-            compare_rows(&keys, &row("refs/heads/a", 7), &row("refs/heads/b", 7)),
+            compare_rows(&keys, &row("refs/heads/a", 7), &row("refs/heads/b", 7), &Prereleases::none()),
             Ordering::Less
         );
         assert_eq!(
-            compare_rows(&keys, &row("refs/heads/a", 1), &row("refs/heads/b", 9)),
+            compare_rows(&keys, &row("refs/heads/a", 1), &row("refs/heads/b", 9), &Prereleases::none()),
             Ordering::Greater
         );
     }

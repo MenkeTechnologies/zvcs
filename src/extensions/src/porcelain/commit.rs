@@ -166,6 +166,7 @@ use gix::bstr::{BString, ByteSlice};
 use gix::index::entry::{Flags, Mode, Stage, Stat};
 use gix::objs::tree::EntryMode;
 
+use super::interpret_trailers::TrailerConfig;
 use super::{Arg, LongOpt};
 
 /// `cmd_commit()`'s `struct option builtin_commit_options[]` (builtin/commit.c),
@@ -3438,28 +3439,16 @@ fn parse_author_ident(s: &str) -> Result<(String, String)> {
     }
 }
 
-/// The comment prefix for message templates: `core.commentString` (a multi-byte
-/// prefix, git 2.45+) if set, else `core.commentChar` (a single character),
-/// defaulting to `#`. `auto` is treated as the default here.
+/// The comment prefix: `core.commentChar` / `core.commentString`, which are one
+/// knob in git 2.55, so the *last* of the two set anywhere in the merged
+/// configuration wins. `auto` and an empty value give `#`.
+///
+/// This is the same value the trailer scan runs on, read through the same
+/// function, so a message can never be cleaned with one prefix and scanned for
+/// trailers with another.
 pub(super) fn comment_prefix(snap: &gix::config::Snapshot<'_>) -> String {
-    if let Some(v) = snap.string("core.commentString") {
-        let v = v.to_string();
-        if !v.is_empty() && v != "auto" {
-            return v;
-        }
-    }
-    match snap.string("core.commentChar") {
-        None => "#".to_string(),
-        Some(v) => {
-            let s = v.to_string();
-            if s.is_empty() || s == "auto" {
-                "#".to_string()
-            } else {
-                // core.commentChar is a single character.
-                s.chars().next().unwrap_or('#').to_string()
-            }
-        }
-    }
+    let bytes = super::interpret_trailers::comment_string(snap.plumbing());
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 /// Resolve the editor command git would use: `GIT_EDITOR` → `core.editor` →
@@ -3551,7 +3540,9 @@ pub(super) fn cleanup_message(raw: &str, comment: &str, mode: Cleanup, verbose: 
     // `strbuf_setlen(msg, wt_status_locate_end(...))` — the cut line and
     // everything below it never reach the commit.
     let raw = if verbose || mode == Cleanup::Scissors {
-        &raw[..wt_status_locate_end(raw.as_bytes(), comment)]
+        let bytes = raw.as_bytes();
+        let cend = super::interpret_trailers::c_len(bytes);
+        &raw[..super::interpret_trailers::locate_end(bytes, bytes.len(), cend, comment.as_bytes())]
     } else {
         raw
     };
@@ -3678,6 +3669,9 @@ fn message_body(msg: &str) -> String {
 /// re-appends a trailer that appears earlier in the block, while `format-patch`
 /// passes the flag and leaves the block alone.
 pub(crate) fn append_signoff(msg: &mut String, ident: &str, ignore_footer: usize, dedup: bool) {
+    // `ensure_configured()`: the trailer scan below reads the comment prefix,
+    // `trailer.separators` and every configured `trailer.<token>.key`.
+    let cfg = trailer_config();
     let sob = format!("Signed-off-by: {ident}\n");
     // strbuf_complete_line: only when there is no trailing footer to preserve.
     if ignore_footer == 0 && !msg.is_empty() && !msg.ends_with('\n') {
@@ -3689,7 +3683,7 @@ pub(crate) fn append_signoff(msg: &mut String, ident: &str, ignore_footer: usize
     let has_footer: u8 = if cut == sob_bytes.len() && &msg.as_bytes()[..cut] == sob_bytes {
         3
     } else {
-        has_conforming_footer(&msg.as_bytes()[..cut], sob_bytes)
+        has_conforming_footer(&msg.as_bytes()[..cut], sob_bytes, cfg)
     };
     if has_footer == 0 {
         // Leave a blank line between a message body and the sob.
@@ -3719,33 +3713,28 @@ pub(crate) fn append_signoff(msg: &mut String, ident: &str, ignore_footer: usize
 /// Port of `has_conforming_footer()` (sequencer.c) for the default `flag == 0`
 /// path: returns `0` when the tail has no trailer block, `3` when `sob` is the
 /// last trailer, `2` when `sob` appears earlier, `1` otherwise. `sub` is the
-/// message truncated to `len - ignore_footer`.
-fn has_conforming_footer(sub: &[u8], sob: &[u8]) -> u8 {
-    let start = find_trailer_start(sub);
-    let end = sub.len() - ignore_non_trailer(sub);
-    if start >= end {
+/// message truncated to `len - ignore_footer`, which is how git NUL-terminates
+/// it before handing it to `trailer_info_get()`.
+///
+/// The block itself comes from `interpret-trailers`' [`block_get`], the same
+/// `trailer_info_get()` port git shares between the two commands — so the
+/// comment prefix, the `trailer.separators` and every configured
+/// `trailer.<token>.key` are honoured here exactly as they are there.
+///
+/// [`block_get`]: super::interpret_trailers::block_get
+fn has_conforming_footer(sub: &[u8], sob: &[u8], cfg: &TrailerConfig) -> u8 {
+    // `opts.no_divider = 1`: the caller already cut the buffer where it wants.
+    let block = super::interpret_trailers::block_get(sub, true, cfg);
+    if block.start == block.end {
         return 0;
     }
-    // Trailer starts are the non-comment, non-continuation, non-blank lines.
-    let mut trailer_starts: Vec<usize> = Vec::new();
-    let mut off = start;
-    while off < end {
-        let e = next_line_off(sub, off);
-        let line = &sub[off..e];
-        let is_comment = line.first() == Some(&b'#');
-        let is_cont = matches!(line.first(), Some(&b' ') | Some(&b'\t'));
-        if !is_comment && !is_cont && !sig_is_blank_line(&sub[off..]) {
-            trailer_starts.push(off);
-        }
-        off = e;
-    }
-    let last_idx = trailer_starts.len().wrapping_sub(1);
     let mut found_sob = false;
     let mut found_sob_last = false;
-    for (k, &o) in trailer_starts.iter().enumerate() {
-        if sub[o..].starts_with(sob) {
+    let last_idx = block.lines.len().wrapping_sub(1);
+    for (i, line) in block.lines.iter().enumerate() {
+        if line.starts_with(sob) {
             found_sob = true;
-            if k == last_idx {
+            if i == last_idx {
                 found_sob_last = true;
             }
         }
@@ -3759,216 +3748,34 @@ fn has_conforming_footer(sub: &[u8], sob: &[u8]) -> u8 {
     }
 }
 
-/// Port of `find_trailer_start()` (trailer.c) for the default configuration
-/// (separator `:`, comment char `#`, no configured trailer tokens). Returns the
-/// offset of the first trailer line, or `buf.len()` when there is no trailer
-/// block. `recognized_prefix` is set only by the git-generated prefixes below,
-/// since the user's trailer config is empty in this port's signoff path.
-fn find_trailer_start(buf: &[u8]) -> usize {
-    let len = buf.len();
-    const GEN: [&[u8]; 2] = [b"Signed-off-by: ", b"(cherry picked from commit "];
-
-    // The first paragraph is the title and cannot hold trailers.
-    let mut s = 0usize;
-    while s < len {
-        if buf[s] == b'#' {
-            s = next_line_off(buf, s);
-            continue;
-        }
-        if sig_is_blank_line(&buf[s..]) {
-            break;
-        }
-        s = next_line_off(buf, s);
-    }
-    let end_of_title = s as isize;
-
-    let mut only_spaces = true;
-    let mut recognized_prefix = false;
-    let mut trailer_lines: i64 = 0;
-    let mut non_trailer_lines: i64 = 0;
-    let mut possible_continuation_lines: i64 = 0;
-
-    let mut l = last_line(buf, len);
-    while l >= end_of_title {
-        let bol = l as usize;
-        let line = &buf[bol..];
-        if line.first() == Some(&b'#') {
-            non_trailer_lines += possible_continuation_lines;
-            possible_continuation_lines = 0;
-            l = last_line(buf, bol);
-            continue;
-        }
-        if sig_is_blank_line(line) {
-            if only_spaces {
-                l = last_line(buf, bol);
-                continue;
-            }
-            non_trailer_lines += possible_continuation_lines;
-            // Distinct conditions mirror git C source; merging obscures the port.
-            #[allow(clippy::if_same_then_else)]
-            if recognized_prefix && trailer_lines * 3 >= non_trailer_lines {
-                return next_line_off(buf, bol);
-            } else if trailer_lines > 0 && non_trailer_lines == 0 {
-                return next_line_off(buf, bol);
-            }
-            return len;
-        }
-        only_spaces = false;
-
-        let mut matched_gen = false;
-        for g in GEN.iter() {
-            if line.starts_with(g) {
-                trailer_lines += 1;
-                possible_continuation_lines = 0;
-                recognized_prefix = true;
-                matched_gen = true;
-                break;
-            }
-        }
-        if matched_gen {
-            l = last_line(buf, bol);
-            continue;
-        }
-
-        let sep = find_separator(line);
-        if sep >= 1 && !line[0].is_ascii_whitespace() {
-            // A `token: value` line; the empty trailer config never promotes it
-            // to a recognized prefix, matching git with no `trailer.*` set.
-            trailer_lines += 1;
-            possible_continuation_lines = 0;
-        } else if line[0].is_ascii_whitespace() {
-            possible_continuation_lines += 1;
-        } else {
-            non_trailer_lines += 1;
-            non_trailer_lines += possible_continuation_lines;
-            possible_continuation_lines = 0;
-        }
-        l = last_line(buf, bol);
-    }
-    len
+/// Port of `ignore_non_trailer()` (commit.c): the number of trailing bytes to
+/// ignore — a run of comment/blank lines (and an old `Conflicts:` block) at the
+/// very end, or everything past a `>8` scissors line.
+///
+/// git's copy in `commit.c` and the one `trailer.c` uses are the same routine
+/// over the same `comment_line_str`, so this defers to the shared body rather
+/// than keeping a second one that could only drift from it.
+pub(crate) fn ignore_non_trailer(buf: &[u8]) -> usize {
+    let cfg = trailer_config();
+    super::interpret_trailers::ignored_log_message_bytes(
+        buf,
+        buf.len(),
+        super::interpret_trailers::c_len(buf),
+        cfg,
+    )
 }
 
-/// Port of `find_separator()` (trailer.c) with the default `:` separator: the
-/// index of the separator that ends the token, or `-1` if the line is not a
-/// trailer. The token may contain alphanumerics, `-`, and internal whitespace.
-fn find_separator(line: &[u8]) -> isize {
-    let mut whitespace_found = false;
-    for (idx, &c) in line.iter().enumerate() {
-        if c == b':' {
-            return idx as isize;
-        }
-        if !whitespace_found && (c.is_ascii_alphanumeric() || c == b'-') {
-            continue;
-        }
-        if idx != 0 && (c == b' ' || c == b'\t') {
-            whitespace_found = true;
-            continue;
-        }
-        break;
-    }
-    -1
-}
-
-/// Port of `is_blank_line()` (trailer.c): a line (up to the next `\n` or the end
-/// of the buffer) that is empty or all whitespace.
-fn sig_is_blank_line(s: &[u8]) -> bool {
-    for &c in s {
-        if c == b'\n' {
-            return true;
-        }
-        if !c.is_ascii_whitespace() {
-            return false;
-        }
-    }
-    true
-}
-
-/// Port of `next_line()` (trailer.c): the offset just past the next `\n` at or
-/// after `off`, or `buf.len()` when there is none.
-fn next_line_off(buf: &[u8], off: usize) -> usize {
-    match buf[off..].iter().position(|&c| c == b'\n') {
-        Some(p) => off + p + 1,
-        None => buf.len(),
-    }
-}
-
-/// Port of `last_line()` (trailer.c): the start offset of the last line within
-/// `buf[..len]`, or `-1` when `len == 0`.
-fn last_line(buf: &[u8], len: usize) -> isize {
-    if len == 0 {
-        return -1;
-    }
-    if len == 1 {
-        return 0;
-    }
-    let mut i = len as isize - 2;
-    while i >= 0 {
-        if buf[i as usize] == b'\n' {
-            return i + 1;
-        }
-        i -= 1;
-    }
-    0
-}
-
-/// Port of `ignore_non_trailer()` (builtin/commit.c): the number of trailing
-/// bytes to ignore — a run of comment/blank lines (and an old `Conflicts:`
-/// block) at the very end, or everything past a `>8` scissors line.
-fn ignore_non_trailer(buf: &[u8]) -> usize {
-    let len = buf.len();
-    let mut boc = 0usize; // beginning of the trailing comment run (0 = none)
-    let mut bol = 0usize;
-    let mut in_conflicts = false;
-    let cutoff = wt_status_locate_end(buf, "#");
-    while bol < cutoff {
-        let next = match buf[bol..].iter().position(|&c| c == b'\n') {
-            Some(p) => bol + p + 1,
-            None => len,
-        };
-        if buf[bol] == b'#' || buf[bol] == b'\n' {
-            if boc == 0 {
-                boc = bol;
-            }
-        } else if buf[bol..].starts_with(b"Conflicts:\n") {
-            in_conflicts = true;
-            if boc == 0 {
-                boc = bol;
-            }
-        } else if in_conflicts && buf[bol] == b'\t' {
-            // a pathname in the conflicts block — still part of the run
-        } else if boc != 0 {
-            boc = 0;
-            in_conflicts = false;
-        }
-        bol = next;
-    }
-    if boc != 0 {
-        len - boc
-    } else {
-        len - cutoff
-    }
-}
-
-/// Port of `wt_status_locate_end()` (wt-status.c): the length up to a `>8`
-/// scissors line (`# ------------------------ >8 ------------------------`), or
-/// the full length when there is none. `comment` is git's `comment_line_str`.
-fn wt_status_locate_end(s: &[u8], comment: &str) -> usize {
-    let cut: &[u8] = b"------------------------ >8 ------------------------\n";
-    let mut pattern: Vec<u8> = Vec::with_capacity(2 + comment.len() + cut.len());
-    pattern.push(b'\n');
-    pattern.extend_from_slice(comment.as_bytes());
-    pattern.push(b' ');
-    pattern.extend_from_slice(cut);
-    if s.starts_with(&pattern[1..]) {
-        return 0;
-    }
-    if let Some(p) = s
-        .windows(pattern.len())
-        .position(|w| w == pattern.as_slice())
-    {
-        return p + 1;
-    }
-    s.len()
+/// The trailer configuration, read once per process.
+///
+/// This is `ensure_configured()`'s `static int configured`: the sign-off path
+/// asks for it twice (once to find the tail to keep, once to scan the block),
+/// and git reads the configuration for the first of those only. It cannot fail
+/// either — a configuration git cannot parse has already aborted the command
+/// long before a trailer is looked at.
+fn trailer_config() -> &'static TrailerConfig {
+    static CONFIGURED: std::sync::OnceLock<TrailerConfig> = std::sync::OnceLock::new();
+    CONFIGURED
+        .get_or_init(|| super::interpret_trailers::load_config().unwrap_or_default())
 }
 
 #[cfg(test)]

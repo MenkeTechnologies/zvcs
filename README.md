@@ -599,8 +599,37 @@ the same function git shares between them.
 shell scripts. `subtree add`, `merge`, `pull`, `split`, and `push` all produce
 the same commits and object ids as stock; only `-S`/`--gpg-sign` is refused.
 `filter-branch`
-rewrites history to the same commit ids as stock — a `--subdirectory-filter`
-run over the same input yields a byte-identical object. `instaweb` generates
+reproduces stock's commit ids everywhere the corpus looks: every differential
+case it carries — `--msg-filter`, `--tree-filter`, `--index-filter`,
+`--env-filter`, `--subdirectory-filter`, `--prune-empty`, `--tag-name-filter`,
+`--commit-filter`, `--original` and the error paths, over the linear, branched
+and merged fixtures — matches stock's stdout, exit code and post-command state,
+where state is a set of stock probes read back from both repositories —
+`for-each-ref`, `rev-parse HEAD`, `ls-files --stage`, `status --porcelain`,
+`cat-file --batch-all-objects`, `config --list --local` among them. That is the
+whole of the evidence for the claim: it is a statement about those filters on
+those shapes, not about a repository the port has never
+been pointed at, and the rev-list option surface it accepts is deliberately
+narrow (`--since`, `--author`, `--max-count`, `<a>...<b>` and magic pathspecs
+are refused rather than approximated). Until v0.16.0 the claim was also plainly
+false in a case the corpus did not reach: the script's `update-index --refresh`
+was modelled for its read semantics but not its write, so the on-disk index kept
+stale mtimes, the final `read-tree -u -m HEAD` refused, and the run left a
+half-rewritten history behind.
+
+One property of this port belongs with that claim, because it decides *which*
+git the ids come from: unlike stock, it does not prepend its own directory to
+`PATH`. The filters are shell snippets run under `/bin/sh`, and the script's own
+machinery is written the same way — the default commit filter is literally
+`git commit-tree "$@"`, the empty-tree constant comes from `git hash-object -t
+tree /dev/null`, and the ident probe from `git var GIT_AUTHOR_IDENT` — so every
+one of those children, and every `git` a user's own filter runs, resolves
+through the caller's `PATH`. With a shim named `git` first on `PATH`, stock's
+`filter-branch` calls it zero times and this port's calls it for each of those
+three. Put the build you mean at the front of `PATH` before reading a
+`filter-branch` result as that build's.
+
+`instaweb` generates
 the same daemon configuration as stock for whichever of lighttpd, apache2,
 mongoose, plackup, webrick or python is installed, and serves gitweb through
 it; like stock, it ships no web server of its own.

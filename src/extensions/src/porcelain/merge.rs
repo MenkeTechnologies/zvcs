@@ -155,8 +155,7 @@
 //! Known fidelity gaps, stated rather than hidden: the diffstat is computed
 //! with rename detection off, while `git merge` enables it, so a merge that
 //! renames a file reports it as a delete plus a create instead of a `rename`
-//! summary line; diffstat column widths measure Unicode scalar values rather
-//! than terminal columns; `--verbose`'s extra stderr diagnostics are not
+//! summary line; `--verbose`'s extra stderr diagnostics are not
 //! emitted; a `pre-merge-commit` hook that edits the index is not reflected
 //! in the committed tree (the pre-computed merge tree is committed); the
 //! `prepare-commit-msg` hook is not run before the editor; `default_edit_option`
@@ -185,6 +184,7 @@ use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
 use gix::refs::{FullName, Target};
 use gix::revision::walk::Sorting;
 
+use super::diffstat::{self, StatWidths};
 use super::filespec;
 use gix::traverse::commit::simple::CommitTimeOrder;
 
@@ -3840,29 +3840,8 @@ fn compact_comment(old: Option<EntryKind>, new: Option<EntryKind>) -> Option<&'s
     }
 }
 
-/// git's `decimal_width`.
-fn decimal_width(mut n: u64) -> i64 {
-    let mut w = 1;
-    while n >= 10 {
-        n /= 10;
-        w += 1;
-    }
-    w
-}
 
-/// git's `scale_linear`: at least one column for any non-zero change.
-fn scale_linear(it: i64, width: i64, max_change: i64) -> i64 {
-    if it == 0 {
-        return 0;
-    }
-    1 + (it * (width - 1) / max_change)
-}
 
-/// Display width in Unicode scalar values (git measures terminal columns; wide
-/// characters are counted as 1 here, see the module note).
-fn display_width(s: &str) -> i64 {
-    s.chars().count() as i64
-}
 
 /// `quote_c_style()`: the name verbatim unless some byte needs escaping, in which
 /// case the whole name double-quoted with C escapes. The table and the
@@ -4074,150 +4053,31 @@ fn collect(
     ))
 }
 
-/// Port of `show_stats()` (diff.c) at merge's `stat_width = -1`, which resolves
-/// to `term_columns()` — 80 whenever stdout is not a terminal and `COLUMNS` is
-/// unset, as it is under the parity harness. Followed by
-/// `print_stat_summary_inserts_deletes()`.
+/// The rows [`super::diffstat::show_stats`] renders. A binary row's two "counts"
+/// are the blob sizes, which is what `builtin_diffstat()` stores for one.
+fn stat_rows(files: &[StatRow]) -> Vec<diffstat::StatFile> {
+    files
+        .iter()
+        .map(|f| diffstat::StatFile {
+            print_name: f.name.clone().into_bytes(),
+            added: f.added,
+            deleted: f.deleted,
+            binary: f.binary,
+            // `finish()` renders the merge result against HEAD, a committed pair.
+            is_unmerged: false,
+        })
+        .collect()
+}
+
+/// `show_stats()` (diff.c). `builtin/merge.c:515` calls `init_diffstat_widths()`,
+/// so the post-merge diffstat scales to `term_columns()` like `git diff` does.
 fn emit_stats(out: &mut String, files: &[StatRow]) {
-    if files.is_empty() {
-        return;
-    }
-
-    let mut max_change: i64 = 0;
-    let mut max_len: i64 = 0;
-    let mut bin_width: i64 = 0;
-    let mut number_width: i64 = 0;
-    for f in files {
-        max_len = max_len.max(display_width(&f.name));
-        if f.binary {
-            // "Bin XXX -> YYY bytes"
-            bin_width = bin_width.max(14 + decimal_width(f.added) + decimal_width(f.deleted));
-            // Display change counts aligned with "Bin".
-            number_width = 3;
-            continue;
-        }
-        max_change = max_change.max((f.added + f.deleted) as i64);
-    }
-
-    let mut width: i64 = 80;
-    number_width = number_width.max(decimal_width(max_change as u64));
-
-    // Guarantee 3/8*16==6 for the graph part and 5/8*16==10 for the filename.
-    if width < 16 + 6 + number_width {
-        width = 16 + 6 + number_width;
-    }
-
-    let mut graph_width = if max_change + 4 > bin_width { max_change } else { bin_width - 4 };
-    let mut name_width = max_len;
-    if name_width + number_width + 6 + graph_width > width {
-        if graph_width > width * 3 / 8 - number_width - 6 {
-            graph_width = width * 3 / 8 - number_width - 6;
-            if graph_width < 6 {
-                graph_width = 6;
-            }
-        }
-        if name_width > width - number_width - 6 - graph_width {
-            name_width = width - number_width - 6 - graph_width;
-        } else {
-            graph_width = width - number_width - 6 - name_width;
-        }
-    }
-
-    for f in files {
-        // Scale the filename: elide the head, then resume at a path separator.
-        let mut len = name_width;
-        let mut prefix = "";
-        let mut name: &str = &f.name;
-        if name_width < display_width(name) {
-            prefix = "...";
-            len -= 3;
-            if len < 0 {
-                len = 0;
-            }
-            let mut name_len = display_width(name);
-            let mut off = 0;
-            while name_len > len && off < name.len() {
-                let c = name[off..]
-                    .chars()
-                    .next()
-                    .expect("off stays on a char boundary");
-                off += c.len_utf8();
-                name_len -= 1;
-            }
-            name = &name[off..];
-            if let Some(slash) = name.find('/') {
-                name = &name[slash..];
-            }
-        }
-        let padding = (len - display_width(name)).max(0) as usize;
-        let nw = number_width as usize;
-
-        if f.binary {
-            out.push_str(&format!(" {prefix}{name}{:padding$} | {:>nw$}", "", "Bin"));
-            if f.added == 0 && f.deleted == 0 {
-                out.push('\n');
-            } else {
-                out.push_str(&format!(" {} -> {} bytes\n", f.deleted, f.added));
-            }
-            continue;
-        }
-
-        let total = f.added + f.deleted;
-        let mut add = f.added as i64;
-        let mut del = f.deleted as i64;
-        if graph_width <= max_change && max_change > 0 {
-            let mut sum = scale_linear(add + del, graph_width, max_change);
-            if sum < 2 && add > 0 && del > 0 {
-                sum = 2;
-            }
-            if add < del {
-                add = scale_linear(add, graph_width, max_change);
-                del = sum - add;
-            } else {
-                del = scale_linear(del, graph_width, max_change);
-                add = sum - del;
-            }
-        }
-
-        out.push_str(&format!(
-            " {prefix}{name}{:padding$} | {:>nw$}{}",
-            "",
-            total,
-            if total > 0 { " " } else { "" },
-        ));
-        for _ in 0..add.max(0) {
-            out.push('+');
-        }
-        for _ in 0..del.max(0) {
-            out.push('-');
-        }
-        out.push('\n');
-    }
-
-    // Binary rows count as changed files but contribute no insertions/deletions.
-    let mut adds: u64 = 0;
-    let mut dels: u64 = 0;
-    for f in files {
-        if !f.binary {
-            adds += f.added;
-            dels += f.deleted;
-        }
-    }
-
-    let n = files.len();
-    let mut line = format!(" {n} {} changed", if n == 1 { "file" } else { "files" });
-    if adds > 0 || dels == 0 {
-        line.push_str(&format!(
-            ", {adds} {}",
-            if adds == 1 { "insertion(+)" } else { "insertions(+)" }
-        ));
-    }
-    if dels > 0 || adds == 0 {
-        line.push_str(&format!(
-            ", {dels} {}",
-            if dels == 1 { "deletion(-)" } else { "deletions(-)" }
-        ));
-    }
-    out.push_str(&line);
-    out.push('\n');
+    let mut bytes = Vec::new();
+    diffstat::show_stats(
+        &mut bytes,
+        &stat_rows(files),
+        &StatWidths::default(),
+        &super::diff_color::DiffColors::disabled(),
+    );
+    out.push_str(&String::from_utf8_lossy(&bytes));
 }

@@ -174,8 +174,7 @@
 //!
 //! Known deviations, stated rather than hidden: copy detection (`-C`) is off, as
 //! git's own default has it — renames are detected and render with git's
-//! `rename from`/`rename to` header and `old => new` stat line. Column widths are
-//! computed in Unicode scalar values, so East-Asian wide characters measure 1. The
+//! `rename from`/`rename to` header and `old => new` stat line. The
 //! cover letter's shortlog does not wrap long subjects at 76 columns.
 //! `append_signoff()`'s trailer-block scan does not consult `trailer.<token>.key`
 //! config, so only git's own generated prefixes can carry a mixed block over the
@@ -200,6 +199,8 @@ use gix::hash::ObjectId;
 use gix::object::tree::diff::ChangeDetached;
 use gix::prelude::ObjectIdExt;
 use gix::revision::walk::Sorting;
+
+use super::diffstat::{self, StatWidths};
 use gix::traverse::commit::simple::CommitTimeOrder;
 
 /// `usage_with_options()` over `builtin/log.c`'s `format-patch` option table.
@@ -4192,7 +4193,7 @@ fn emit_stat_blocks(
             emit_numstat(out, stats)?;
         }
         if opts.output_format & FMT_DIFFSTAT != 0 {
-            emit_stats(out, stats, StatWidths::from_opts(opts))?;
+            emit_stats(out, stats, stat_widths(opts))?;
         }
         if opts.output_format & FMT_SHORTSTAT != 0 {
             emit_stat_summary(out, stats)?;
@@ -4350,7 +4351,7 @@ fn render_cover_letter(
         let (kept, stats) = render_changes(repo, &mut discard, &changes, abbrev, opts)?;
         // `show_diffstat()` memcpy's `rev->diffopt`, keeping the width knobs, so
         // the cover letter's combined diffstat honors them too.
-        emit_stats(out, &stats, StatWidths::from_opts(opts))?;
+        emit_stats(out, &stats, stat_widths(opts))?;
         emit_summary(out, &kept)?;
         out.push(b'\n');
     }
@@ -4549,7 +4550,7 @@ fn write_subject(sb: &mut String, title: &str, nr: usize, total: usize, opts: &O
     if opts.keep_subject {
         sb.push_str("Subject: ");
     } else if total > 0 {
-        let width = decimal_width(total as u64);
+        let width = diffstat::decimal_width(total as u64) as usize;
         let sep = if opts.subject_prefix.is_empty() {
             ""
         } else {
@@ -5545,235 +5546,50 @@ struct StatEntry {
     deleted: u64,
 }
 
-/// The four `diff_options` knobs `show_stats()` reads, in git's own units (0 is
-/// each field's "unset" sentinel). Carried apart from `Opts` so `show_stats()`
-/// can be exercised without building the whole option set.
-#[derive(Clone, Copy)]
-struct StatWidths {
-    width: i64,
-    name_width: i64,
-    graph_width: i64,
-    count: i64,
-}
-
-impl StatWidths {
-    fn from_opts(o: &Opts) -> StatWidths {
-        StatWidths {
-            width: o.stat_width,
-            name_width: o.stat_name_width,
-            graph_width: o.stat_graph_width,
-            count: o.stat_count,
-        }
-    }
-}
-
-/// git's `decimal_width`.
-fn decimal_width(mut n: u64) -> usize {
-    let mut w = 1;
-    while n >= 10 {
-        n /= 10;
-        w += 1;
-    }
-    w
-}
-
-/// git's `scale_linear`: at least one column for any non-zero change.
-fn scale_linear(it: i64, width: i64, max_change: i64) -> i64 {
-    if it == 0 {
-        return 0;
-    }
-    1 + (it * (width - 1) / max_change)
-}
-
-/// Display width in Unicode scalar values (git measures terminal columns; wide
-/// characters are counted as 1 here, see the module note).
-fn display_width(s: &str) -> i64 {
-    s.chars().count() as i64
-}
-
-/// Port of `show_stats()` (diff.c). format-patch's default width is
-/// `MAIL_DEFAULT_WRAP` (72), overridable by `--stat`/`--stat-width`; the filename
-/// and graph columns and the list length honor `--stat-name-width`,
-/// `--stat-graph-width` and `--stat-count`. Followed by
-/// `print_stat_summary_inserts_deletes()`.
-fn emit_stats(out: &mut Vec<u8>, files: &[StatEntry], sw: StatWidths) -> Result<()> {
-    if files.is_empty() {
-        return Ok(());
-    }
-
-    // git's `count = stat_count ? stat_count : nr`, then the scan loop
-    // `for (i = 0; i < count && i < nr; i++)` sets `count = i`, so a non-zero
-    // `--stat-count` is clamped into `[0, nr]` (a negative value shows nothing).
-    // Only the shown files are scanned for the longest name / largest change, so
-    // `--stat-count` narrows the columns too. Every file here is "interesting"
-    // (binary is refused, no unmerged entries), so no scan step is skipped.
-    let count = if sw.count != 0 {
-        sw.count.clamp(0, files.len() as i64) as usize
-    } else {
-        files.len()
-    };
-
-    let mut max_change: i64 = 0;
-    let mut max_len: i64 = 0;
-    for f in &files[..count] {
-        max_len = max_len.max(display_width(&f.name));
-        max_change = max_change.max((f.added + f.deleted) as i64);
-    }
-
-    // `width = stat_width ? stat_width : 80` in git, but format-patch first
-    // bumps a 0 to `MAIL_DEFAULT_WRAP` (72), so 72 is the effective default and
-    // the `: 80` branch is never taken here. `stat_width` is never git's `-1`
-    // sentinel for format-patch, so `term_columns()` is never consulted.
-    let mut width = if sw.width != 0 {
-        sw.width
-    } else {
-        MAIL_DEFAULT_WRAP
-    };
-    let number_width = decimal_width(max_change as u64) as i64;
-    if width < 16 + 6 + number_width {
-        width = 16 + 6 + number_width;
-    }
-
-    // bin_width is 0 (binary files are refused), so graph_width starts at
-    // max_change; a non-zero `--stat-graph-width` caps it.
-    let mut graph_width = max_change;
-    if sw.graph_width != 0 && sw.graph_width < graph_width {
-        graph_width = sw.graph_width;
-    }
-    let mut name_width = if sw.name_width > 0 && sw.name_width < max_len {
-        sw.name_width
-    } else {
-        max_len
-    };
-    if name_width + number_width + 6 + graph_width > width {
-        if graph_width > width * 3 / 8 - number_width - 6 {
-            graph_width = width * 3 / 8 - number_width - 6;
-            if graph_width < 6 {
-                graph_width = 6;
-            }
-        }
-        if sw.graph_width != 0 && graph_width > sw.graph_width {
-            graph_width = sw.graph_width;
-        }
-        if name_width > width - number_width - 6 - graph_width {
-            name_width = width - number_width - 6 - graph_width;
-        } else {
-            graph_width = width - number_width - 6 - name_width;
-        }
-    }
-
-    for f in &files[..count] {
-        // Scale the filename: elide the head, then resume at a path separator.
-        let mut len = name_width;
-        let mut prefix = "";
-        let mut name: &str = &f.name;
-        if name_width < display_width(name) {
-            prefix = "...";
-            len -= 3;
-            if len < 0 {
-                len = 0;
-            }
-            let mut name_len = display_width(name);
-            let mut off = 0;
-            while name_len > len && off < name.len() {
-                let c = name[off..]
-                    .chars()
-                    .next()
-                    .expect("off stays on a char boundary");
-                off += c.len_utf8();
-                name_len -= 1;
-            }
-            name = &name[off..];
-            if let Some(slash) = name.find('/') {
-                name = &name[slash..];
-            }
-        }
-        let padding = (len - display_width(name)).max(0) as usize;
-
-        let total = f.added + f.deleted;
-        let mut add = f.added as i64;
-        let mut del = f.deleted as i64;
-        if graph_width <= max_change && max_change > 0 {
-            let mut sum = scale_linear(add + del, graph_width, max_change);
-            if sum < 2 && add > 0 && del > 0 {
-                sum = 2;
-            }
-            if add < del {
-                add = scale_linear(add, graph_width, max_change);
-                del = sum - add;
-            } else {
-                del = scale_linear(del, graph_width, max_change);
-                add = sum - del;
-            }
-        }
-
-        write!(
-            out,
-            " {prefix}{name}{:padding$} | {:>nw$}{}",
-            "",
-            total,
-            if total > 0 { " " } else { "" },
-            nw = number_width as usize,
-        )?;
-        for _ in 0..add.max(0) {
-            out.push(b'+');
-        }
-        for _ in 0..del.max(0) {
-            out.push(b'-');
-        }
-        out.push(b'\n');
-    }
-
-    // git's `DIFF_SYMBOL_STATS_SUMMARY_ABBREV`, emitted once when `--stat-count`
-    // hid at least one file. The insertions/deletions summary still counts every
-    // file, so it is fed the full slice.
-    if count < files.len() {
-        out.extend_from_slice(b" ...\n");
-    }
-
-    emit_stat_summary(out, files)
-}
-
-/// Port of `print_stat_summary_inserts_deletes()` (diff.c) — the trailing
-/// ` N files changed, …` line, which is also the whole of `--shortstat`.
+/// The four `show_stats()` width knobs, as this verb records them.
 ///
-/// Every file this module reaches is "interesting" in git's sense
-/// (`is_interesting = p->status != DIFF_STATUS_UNKNOWN`) and binary content is
-/// refused outright, so `show_stats()` and `show_shortstats()` count the same
-/// way and share this one implementation.
-fn emit_stat_summary(out: &mut Vec<u8>, files: &[StatEntry]) -> Result<()> {
-    if files.is_empty() {
-        return Ok(());
+/// format-patch is the one caller that never reaches git's `-1` sentinels:
+/// `cmd_format_patch()` does its own `repo_init_revisions()` + `setup_revisions()`
+/// rather than going through `cmd_log_init()`, so `init_diffstat_widths()` never
+/// runs and every field starts at 0 (`builtin/log.c:2102`, `:2216`). That is why
+/// `if (!rev.diffopt.stat_width) rev.diffopt.stat_width = MAIL_DEFAULT_WRAP;`
+/// (`builtin/log.c:2233`) actually fires here and `term_columns()` never does.
+fn stat_widths(o: &Opts) -> StatWidths {
+    StatWidths {
+        width: o.stat_width,
+        name_width: o.stat_name_width,
+        graph_width: o.stat_graph_width,
+        count: o.stat_count,
     }
-    let adds: u64 = files.iter().map(|f| f.added).sum();
-    let dels: u64 = files.iter().map(|f| f.deleted).sum();
+}
 
-    let n = files.len();
-    let mut line = format!(" {n} {} changed", if n == 1 { "file" } else { "files" });
-    if adds > 0 || dels == 0 {
-        line.push_str(&format!(
-            ", {adds} {}",
-            if adds == 1 {
-                "insertion(+)"
-            } else {
-                "insertions(+)"
-            }
-        ));
-    }
-    if dels > 0 || adds == 0 {
-        line.push_str(&format!(
-            ", {dels} {}",
-            if dels == 1 {
-                "deletion(-)"
-            } else {
-                "deletions(-)"
-            }
-        ));
-    }
-    writeln!(out, "{line}")?;
+
+
+/// The rows [`super::diffstat::show_stats`] renders. Binary content is refused
+/// upstream of here, so no row is ever `Bin` and none is ever unmerged.
+fn stat_rows(files: &[StatEntry]) -> Vec<diffstat::StatFile> {
+    files
+        .iter()
+        .map(|f| diffstat::StatFile::text(f.name.clone().into_bytes(), f.added, f.deleted))
+        .collect()
+}
+
+/// `show_stats()` (diff.c) at format-patch's width: `MAIL_DEFAULT_WRAP` (72)
+/// unless `--stat`/`--stat-width` named one, never the terminal width.
+fn emit_stats(out: &mut Vec<u8>, files: &[StatEntry], sw: StatWidths) -> Result<()> {
+    let sw = StatWidths {
+        width: if sw.width != 0 { sw.width } else { MAIL_DEFAULT_WRAP },
+        ..sw
+    };
+    diffstat::show_stats(out, &stat_rows(files), &sw, &super::diff_color::DiffColors::disabled());
     Ok(())
 }
-
+/// `show_shortstats()` (diff.c) — the trailing ` N files changed, …` line, which
+/// is also the whole of `--shortstat`.
+fn emit_stat_summary(out: &mut Vec<u8>, files: &[StatEntry]) -> Result<()> {
+    diffstat::show_shortstats(out, &stat_rows(files));
+    Ok(())
+}
 /// Port of `show_numstat()` (diff.c): tab-separated counts and the C-quoted path.
 fn emit_numstat(out: &mut Vec<u8>, files: &[StatEntry]) -> Result<()> {
     for f in files {

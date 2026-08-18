@@ -359,12 +359,25 @@ jobs(
 
 ## 6a. Derived-answer caches (`~/.zvcs/cache/`, `rcache.rs`)
 
-Tree diffs, blames and object abbreviations are pure functions of immutable
-objects: there is no event that can make one wrong. That earns none of what
-SQLite provides — no concurrent mutation, no triggers, no queries — while
-costing a query planner, row decoding and an allocation per column to hand back
-bytes already sitting on disk. They live in **rkyv** images instead, read in
-place out of an mmap.
+Tree diffs, blames and object abbreviations are pure functions of the inputs
+their key names: no *event* can invalidate an entry, because the objects behind
+it never change. What the immutability does not buy is protection from a key
+that names too little — an entry answers for every input the key left out, and
+since these images live in `~/.zvcs/cache` keyed by commit id, a key that is
+short by one option is wrong in every repository on the machine rather than in
+the one that wrote it. The blame memo was keyed `(suspect, path, algo)` with
+`opts.bottom` outside the key, so one `git blame A..B -- f` poisoned every later
+plain blame of that file everywhere, persisted, with nothing to indicate it had
+happened (fixed in v0.16.0 by keeping a bottom-limited blame out of the cache
+entirely, the treatment `--reverse` and `--ignore-rev` already had). The rule
+that follows is the one `blame.rs` now states case by case: an option that
+changes the answer either appears in the key or disqualifies the entry, and the
+cache carries no way to check that for itself.
+
+Purity in that sense earns none of what SQLite provides — no concurrent
+mutation, no triggers, no queries — while costing a query planner, row decoding
+and an allocation per column to hand back bytes already sitting on disk. They
+live in **rkyv** images instead, read in place out of an mmap.
 
 ```
 ~/.zvcs/cache/<name>.rkyv   base image: header + sorted index + byte heap

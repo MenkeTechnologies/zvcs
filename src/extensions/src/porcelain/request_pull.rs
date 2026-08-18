@@ -38,16 +38,16 @@
 //!     index NN%` and the `a => b` stat name cannot be reproduced. Rewrite
 //!     tracking is switched on purely so such a change is detected and refused
 //!     rather than silently rendered as a delete plus an add.
-//!   * unmerged entries and `--stat`-affecting diff configuration
-//!     (`diff.statNameWidth`, `diff.statGraphWidth`, `core.quotePath=false`).
+//!   * unmerged entries and the `diff.statNameWidth`/`diff.statGraphWidth`
+//!     configuration. (`core.quotePath` *is* honoured — the names go through
+//!     `quote_c_style()` — and the column arithmetic is the shared
+//!     [`super::diffstat`] port, so it measures display columns.)
 //!
 //! Known deviations, both stated rather than hidden:
 //!   * `term_columns()` is read from `COLUMNS`, falling back to 80. git also
 //!     asks the terminal via `TIOCGWINSZ` when stdout is a tty; there is no
 //!     ioctl in the vendored crates, so a tty-attached run with `COLUMNS` unset
 //!     uses 80 where git would use the window width.
-//!   * column widths are counted in Unicode scalar values, where git uses
-//!     `utf8_strwidth()`; East-Asian wide characters in a path measure 1.
 //!   * when the remote cannot be reached the `fatal:` line on stderr is
 //!     gitoxide's transport error, not git's. stdout and the exit code match.
 
@@ -56,6 +56,8 @@ use std::io::Write;
 use std::process::ExitCode;
 
 use gix::bstr::{BStr, BString, ByteSlice};
+
+use super::diffstat::{self, StatWidths};
 use gix::diff::blob::unified_diff::{ConsumeHunk, ContextSize, DiffLineKind, HunkHeader};
 use gix::diff::blob::{diff_with_slider_heuristics, Algorithm, InternedInput, UnifiedDiff};
 use gix::hash::ObjectId;
@@ -678,198 +680,33 @@ fn diff_stat_summary(
     Ok(())
 }
 
-/// git's `decimal_width`.
-fn decimal_width(mut n: u64) -> usize {
-    let mut w = 1;
-    while n >= 10 {
-        n /= 10;
-        w += 1;
-    }
-    w
+/// The rows [`super::diffstat::show_stats`] renders.
+fn stat_rows(files: &[StatEntry]) -> Vec<diffstat::StatFile> {
+    files
+        .iter()
+        .map(|f| match f.binary {
+            Some((old, new)) => diffstat::StatFile {
+                print_name: f.name.clone().into_bytes(),
+                added: new,
+                deleted: old,
+                binary: true,
+                is_unmerged: false,
+            },
+            None => diffstat::StatFile::text(f.name.clone().into_bytes(), f.added, f.deleted),
+        })
+        .collect()
 }
 
-/// git's `scale_linear`: at least one column for any non-zero change.
-fn scale_linear(it: i64, width: i64, max_change: i64) -> i64 {
-    if it == 0 {
-        return 0;
-    }
-    1 + (it * (width - 1) / max_change)
-}
-
-/// Display width in Unicode scalar values (see the module header).
-fn display_width(s: &str) -> i64 {
-    s.chars().count() as i64
-}
-
-/// git's `term_columns()`, minus the `TIOCGWINSZ` probe (see the module header).
-fn term_columns() -> i64 {
-    if let Ok(value) = std::env::var("COLUMNS") {
-        // C's atoi: read a leading decimal run and ignore the rest.
-        let digits: String = value
-            .trim_start()
-            .chars()
-            .take_while(char::is_ascii_digit)
-            .collect();
-        if let Ok(n) = digits.parse::<i64>() {
-            if n > 0 {
-                return n;
-            }
-        }
-    }
-    80
-}
-
-/// Port of `show_stats()` (diff.c) followed by
-/// `print_stat_summary_inserts_deletes()`.
+/// The diffstat block, which is the `git diff -M --stat --summary` the script
+/// runs. That child is `builtin/diff.c`, so it has run `init_diffstat_widths()`
+/// and scales to `term_columns()`.
 fn emit_stats(out: &mut Vec<u8>, files: &[StatEntry]) -> Result<()> {
-    if files.is_empty() {
-        return Ok(());
-    }
-
-    let mut max_change: i64 = 0;
-    let mut max_len: i64 = 0;
-    let mut number_width: i64 = 0;
-    for f in files {
-        max_len = max_len.max(display_width(&f.name));
-        if f.binary.is_some() {
-            // git also widens `bin_width` here, but that value only bounds the
-            // graph column, which a binary row never prints. What survives into
-            // the layout is the forced number column: "display change counts
-            // aligned with Bin".
-            number_width = number_width.max(3);
-            continue;
-        }
-        max_change = max_change.max((f.added + f.deleted) as i64);
-    }
-    number_width = number_width.max(decimal_width(max_change as u64) as i64);
-
-    let mut width = term_columns();
-    if width < 16 + 6 + number_width {
-        width = 16 + 6 + number_width;
-    }
-
-    let mut graph_width = max_change;
-    let mut name_width = max_len;
-    if name_width + number_width + 6 + graph_width > width {
-        if graph_width > width * 3 / 8 - number_width - 6 {
-            graph_width = width * 3 / 8 - number_width - 6;
-            if graph_width < 6 {
-                graph_width = 6;
-            }
-        }
-        if name_width > width - number_width - 6 - graph_width {
-            name_width = width - number_width - 6 - graph_width;
-        } else {
-            graph_width = width - number_width - 6 - name_width;
-        }
-    }
-
-    let mut adds: u64 = 0;
-    let mut dels: u64 = 0;
-    for f in files {
-        // Scale the filename: elide the head, then resume at a path separator.
-        let mut len = name_width;
-        let mut prefix = "";
-        let mut name: &str = &f.name;
-        if name_width < display_width(name) {
-            prefix = "...";
-            len -= 3;
-            if len < 0 {
-                len = 0;
-            }
-            let mut name_len = display_width(name);
-            let mut off = 0;
-            while name_len > len && off < name.len() {
-                let c = name[off..]
-                    .chars()
-                    .next()
-                    .expect("off stays on a char boundary");
-                off += c.len_utf8();
-                name_len -= 1;
-            }
-            name = &name[off..];
-            if let Some(slash) = name.find('/') {
-                name = &name[slash..];
-            }
-        }
-        let padding = (len - display_width(name)).max(0) as usize;
-
-        if let Some((old_size, new_size)) = f.binary {
-            write!(
-                out,
-                " {prefix}{name}{:padding$} | {:>nw$}",
-                "",
-                "Bin",
-                nw = number_width as usize
-            )?;
-            if old_size == 0 && new_size == 0 {
-                out.push(b'\n');
-            } else {
-                writeln!(out, " {old_size} -> {new_size} bytes")?;
-            }
-            continue;
-        }
-
-        adds += f.added;
-        dels += f.deleted;
-
-        let total = f.added + f.deleted;
-        let mut add = f.added as i64;
-        let mut del = f.deleted as i64;
-        if graph_width <= max_change && max_change > 0 {
-            let mut sum = scale_linear(add + del, graph_width, max_change);
-            if sum < 2 && add > 0 && del > 0 {
-                sum = 2;
-            }
-            if add < del {
-                add = scale_linear(add, graph_width, max_change);
-                del = sum - add;
-            } else {
-                del = scale_linear(del, graph_width, max_change);
-                add = sum - del;
-            }
-        }
-
-        write!(
-            out,
-            " {prefix}{name}{:padding$} | {:>nw$}{}",
-            "",
-            total,
-            if total > 0 { " " } else { "" },
-            nw = number_width as usize,
-        )?;
-        for _ in 0..add.max(0) {
-            out.push(b'+');
-        }
-        for _ in 0..del.max(0) {
-            out.push(b'-');
-        }
-        out.push(b'\n');
-    }
-
-    let n = files.len();
-    let mut line = format!(" {n} {} changed", if n == 1 { "file" } else { "files" });
-    if adds > 0 || dels == 0 {
-        line.push_str(&format!(
-            ", {adds} {}",
-            if adds == 1 {
-                "insertion(+)"
-            } else {
-                "insertions(+)"
-            }
-        ));
-    }
-    if dels > 0 || adds == 0 {
-        line.push_str(&format!(
-            ", {dels} {}",
-            if dels == 1 {
-                "deletion(-)"
-            } else {
-                "deletions(-)"
-            }
-        ));
-    }
-    writeln!(out, "{line}")?;
+    diffstat::show_stats(
+        out,
+        &stat_rows(files),
+        &StatWidths::default(),
+        &super::diff_color::DiffColors::disabled(),
+    );
     Ok(())
 }
 

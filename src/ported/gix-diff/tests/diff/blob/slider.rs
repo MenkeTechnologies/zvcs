@@ -3,7 +3,7 @@ use pretty_assertions::StrComparison;
 
 #[test]
 fn baseline() -> gix_testtools::Result {
-    use gix_diff::blob::{self, Algorithm, InternedInput, diff_with_slider_heuristics};
+    use gix_diff::blob::{self, InternedInput, diff_with_slider_heuristics};
 
     let worktree_path = crate::scripted_fixture_read_only("make_diff_for_sliders_repo.sh")?;
     let asset_dir = worktree_path.join("assets");
@@ -28,14 +28,12 @@ fn baseline() -> gix_testtools::Result {
             old_data.to_str().expect("BUG: we don't have non-ascii here"),
             new_data.to_str().expect("BUG: we don't have non-ascii here"),
         );
-        let diff = diff_with_slider_heuristics(
-            match algorithm {
-                Algorithm::Myers => Algorithm::Myers,
-                Algorithm::Histogram => Algorithm::Histogram,
-                Algorithm::MyersMinimal => Algorithm::MyersMinimal,
-            },
-            &input,
-        );
+        // The algorithm comes straight from the fixture's file name; which ones
+        // are exercised is decided by `baseline::parse_dir_entry`, the one place
+        // that maps a name to an `Algorithm`. Re-listing the variants here as an
+        // identity `match` only made the whole crate's tests stop compiling when
+        // `Algorithm::Patience` was added.
+        let diff = diff_with_slider_heuristics(algorithm, &input);
 
         let actual = blob::UnifiedDiff::new(
             &diff,

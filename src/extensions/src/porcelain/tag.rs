@@ -85,6 +85,8 @@ use gix::objs::{CommitRef, Kind, TagRef};
 use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
 use gix::refs::{FullName, Target};
 
+use crate::refsort::{self, Prereleases};
+
 /// `usage_with_options()` over `builtin/tag.c`'s option table.
 /// `cmd_tag()`'s `struct option options[]` (builtin/tag.c), in table order, as
 /// [`super::resolve_long`] reads it.
@@ -711,58 +713,6 @@ fn take_value<'a>(args: &'a [String], i: &mut usize, flag: &str) -> Result<&'a s
     Ok(v.as_str())
 }
 
-/// git's `ref-filter.c` `valid_atom[]` field names. Membership is only used to
-/// tell git-rejects-it apart from git-accepts-it while validating `--sort`.
-const VALID_SORT_ATOMS: &[&str] = &[
-    "refname",
-    "objecttype",
-    "objectsize",
-    "objectname",
-    "deltabase",
-    "tree",
-    "parent",
-    "numparent",
-    "object",
-    "type",
-    "tag",
-    "author",
-    "authorname",
-    "authoremail",
-    "authordate",
-    "committer",
-    "committername",
-    "committeremail",
-    "committerdate",
-    "tagger",
-    "taggername",
-    "taggeremail",
-    "taggerdate",
-    "creator",
-    "creatordate",
-    "subject",
-    "body",
-    "trailers",
-    "contents",
-    "signature",
-    "raw",
-    "upstream",
-    "push",
-    "symref",
-    "flag",
-    "HEAD",
-    "color",
-    "worktreepath",
-    "align",
-    "end",
-    "if",
-    "then",
-    "else",
-    "rest",
-    "ahead-behind",
-    "is-base",
-    "describe",
-];
-
 /// One resolved `--sort` key.
 struct SortKey {
     reverse: bool,
@@ -796,11 +746,11 @@ enum SortVal {
 }
 
 impl SortVal {
-    fn cmp(&self, other: &SortVal) -> Ordering {
+    fn cmp(&self, other: &SortVal, pre: &Prereleases<'_>) -> Ordering {
         match (self, other) {
             (SortVal::Num(a), SortVal::Num(b)) => a.cmp(b),
             (SortVal::Bytes(a), SortVal::Bytes(b)) => a.cmp(b),
-            (SortVal::Version(a), SortVal::Version(b)) => versioncmp(a, b),
+            (SortVal::Version(a), SortVal::Version(b)) => refsort::versioncmp(a, b, pre),
             _ => Ordering::Equal,
         }
     }
@@ -814,54 +764,18 @@ enum SortErr {
     Unsupported(String),
 }
 
-/// Split a `--sort` key into its `-` (descending), `version:`/`v:` and `*`
-/// (dereference) markers and the remaining field atom.
-fn parse_sort_key(key: &str) -> (bool, bool, bool, &str) {
-    let mut s = key;
-    let mut reverse = false;
-    if let Some(rest) = s.strip_prefix('-') {
-        reverse = true;
-        s = rest;
-    }
-    let mut version = false;
-    if let Some(rest) = s.strip_prefix("version:").or_else(|| s.strip_prefix("v:")) {
-        version = true;
-        s = rest;
-    }
-    let mut star = false;
-    if let Some(rest) = s.strip_prefix('*') {
-        star = true;
-        s = rest;
-    }
-    (reverse, version, star, s)
-}
-
-/// git's `parse_ref_filter_atom`: an empty atom is a `malformed field name`, and
-/// a field name outside `valid_atom[]` is an `unknown field name`.
-fn git_sort_error(key: &str) -> Option<String> {
-    let (_, _, _, atom) = parse_sort_key(key);
-    if atom.is_empty() {
-        return Some(format!("malformed field name: {atom}"));
-    }
-    let name = atom.split(':').next().unwrap_or(atom);
-    if !VALID_SORT_ATOMS.contains(&name) {
-        return Some(format!("unknown field name: {atom}"));
-    }
-    None
-}
-
 /// Validate and interpret every `--sort` key. git dies on the first syntactically
 /// invalid key in the order given, so that is checked first; only then is this
 /// port's narrower support considered.
 fn resolve_sort(sorts: &[String]) -> Result<Vec<SortKey>, SortErr> {
     for key in sorts {
-        if let Some(msg) = git_sort_error(key) {
+        if let Some(msg) = refsort::sort_error(key) {
             return Err(SortErr::Fatal(msg));
         }
     }
     let mut keys = Vec::with_capacity(sorts.len());
     for key in sorts {
-        let (reverse, version, star, atom) = parse_sort_key(key);
+        let (reverse, version, star, atom) = refsort::parse_sort_key(key);
         let field = atom.split(':').next().unwrap_or(atom);
         let kind = if version {
             if field == "refname" && !star {
@@ -897,83 +811,6 @@ fn resolve_sort(sorts: &[String]) -> Result<Vec<SortKey>, SortErr> {
         keys.push(SortKey { reverse, kind });
     }
     Ok(keys)
-}
-
-/// git's `versioncmp` (a modified glibc `strverscmp`), byte for byte.
-fn versioncmp(s1: &[u8], s2: &[u8]) -> Ordering {
-    const S_N: usize = 0;
-    const S_I: usize = 3;
-    const S_F: usize = 6;
-    const S_Z: usize = 9;
-    const CMP: i8 = 2;
-    const LEN: i8 = 3;
-    #[rustfmt::skip]
-    const NEXT_STATE: [usize; 12] = [
-        S_N, S_I, S_Z,
-        S_N, S_I, S_I,
-        S_N, S_F, S_F,
-        S_N, S_F, S_Z,
-    ];
-    #[rustfmt::skip]
-    const RESULT_TYPE: [i8; 36] = [
-        CMP, CMP, CMP, CMP, LEN, CMP, CMP, CMP, CMP,
-        CMP, -1,  -1,   1,  LEN, LEN,  1,  LEN, LEN,
-        CMP, CMP, CMP, CMP, CMP, CMP, CMP, CMP, CMP,
-        CMP,  1,   1,  -1,  CMP, CMP, -1,  CMP, CMP,
-    ];
-
-    let get = |p: &[u8], i: usize| -> u8 { p.get(i).copied().unwrap_or(0) };
-    let digit = |c: u8| -> usize { usize::from(c.is_ascii_digit()) };
-    let zero = |c: u8| -> usize { usize::from(c == b'0') };
-
-    let mut i1 = 0usize;
-    let mut i2 = 0usize;
-    let mut c1 = get(s1, i1);
-    i1 += 1;
-    let mut c2 = get(s2, i2);
-    i2 += 1;
-    let mut state = S_N + zero(c1) + digit(c1);
-    let mut diff;
-    loop {
-        diff = c1 as i32 - c2 as i32;
-        if diff != 0 {
-            break;
-        }
-        if c1 == 0 {
-            return Ordering::Equal;
-        }
-        state = NEXT_STATE[state];
-        c1 = get(s1, i1);
-        i1 += 1;
-        c2 = get(s2, i2);
-        i2 += 1;
-        state += zero(c1) + digit(c1);
-    }
-
-    let rt = RESULT_TYPE[state * 3 + zero(c2) + digit(c2)];
-    match rt {
-        CMP => diff.cmp(&0),
-        LEN => {
-            loop {
-                let d1 = get(s1, i1);
-                i1 += 1;
-                if !d1.is_ascii_digit() {
-                    break;
-                }
-                let d2 = get(s2, i2);
-                i2 += 1;
-                if !d2.is_ascii_digit() {
-                    return Ordering::Greater;
-                }
-            }
-            if get(s2, i2).is_ascii_digit() {
-                Ordering::Less
-            } else {
-                diff.cmp(&0)
-            }
-        }
-        other => (other as i32).cmp(&0),
-    }
 }
 
 /// Build a [`Sig`] from a parsed header signature, tolerating a broken date.
@@ -1173,9 +1010,11 @@ fn list_tags(
 
     // git's most-significant key is the last `--sort` given; ties always fall
     // through to an implicit ascending refname comparison.
+    // git seeds `versioncmp`'s prerelease list from config once, lazily.
+    let prereleases = Prereleases::new(repo);
     entries.sort_by(|a, b| {
         for (idx, key) in sort_keys.iter().enumerate().rev() {
-            let mut ord = a.keys[idx].cmp(&b.keys[idx]);
+            let mut ord = a.keys[idx].cmp(&b.keys[idx], &prereleases);
             if key.reverse {
                 ord = ord.reverse();
             }
@@ -1524,9 +1363,9 @@ fn render_atom(
             Some("short") => out.extend_from_slice(&e.short),
             Some(a) => {
                 if let Some(n) = a.strip_prefix("lstrip=") {
-                    out.extend_from_slice(&strip_components(&e.full, parse_i64(atom, n)?, true));
+                    out.extend_from_slice(&refsort::strip_components(&e.full, parse_i64(atom, n)?, true));
                 } else if let Some(n) = a.strip_prefix("rstrip=") {
-                    out.extend_from_slice(&strip_components(&e.full, parse_i64(atom, n)?, false));
+                    out.extend_from_slice(&refsort::strip_components(&e.full, parse_i64(atom, n)?, false));
                 } else {
                     bail!("--format atom %({atom}) is not supported")
                 }
@@ -1783,31 +1622,6 @@ fn append_lines(out: &mut Vec<u8>, buf: &[u8], lines: usize) {
             }
         }
     }
-}
-
-/// `%(refname:lstrip=<n>)` / `%(refname:rstrip=<n>)`.
-fn strip_components(name: &[u8], n: i64, from_left: bool) -> Vec<u8> {
-    let parts: Vec<&[u8]> = name.split(|&b| b == b'/').collect();
-    let len = parts.len() as i64;
-    let kept: &[&[u8]] = if n >= 0 {
-        if n >= len {
-            &[]
-        } else if from_left {
-            &parts[n as usize..]
-        } else {
-            &parts[..(len - n) as usize]
-        }
-    } else {
-        let keep = -n;
-        if keep >= len {
-            &parts[..]
-        } else if from_left {
-            &parts[(len - keep) as usize..]
-        } else {
-            &parts[..keep as usize]
-        }
-    };
-    kept.join(&b'/')
 }
 
 /// Port of git's `create_reflog_msg`: the reflog line written under `--create-reflog`,

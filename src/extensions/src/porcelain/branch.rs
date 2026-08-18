@@ -11,6 +11,7 @@ use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
 use gix::refs::{FullName, Target};
 
 use super::{resolve_long, Arg, LongOpt, Resolved};
+use crate::refsort::{self, Prereleases};
 
 /// git's smallest permitted abbreviation length, shared with `git blame`.
 const MINIMUM_ABBREV: usize = 4;
@@ -1085,9 +1086,11 @@ fn collect_entries<'repo>(
                 .map(|k| fold_sort_val(sort_value(e, facts.as_ref(), k), icase))
                 .collect();
         }
+        // git seeds `versioncmp`'s prerelease list from config once, lazily.
+        let prereleases = Prereleases::new(repo);
         refs.sort_by(|a, b| {
             for (idx, key) in sort_keys.iter().enumerate().rev() {
-                let mut ord = a.keys[idx].cmp(&b.keys[idx]);
+                let mut ord = a.keys[idx].cmp(&b.keys[idx], &prereleases);
                 if key.reverse {
                     ord = ord.reverse();
                 }
@@ -2794,58 +2797,6 @@ fn delete_branches(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
 // below is the subset of `ref-filter`'s atoms that a commit populates.
 // ---------------------------------------------------------------------------
 
-/// git's `ref-filter.c` `valid_atom[]` field names. Membership only decides
-/// git-rejects-it (`unknown field name`) vs git-accepts-it while validating a key.
-const VALID_SORT_ATOMS: &[&str] = &[
-    "refname",
-    "objecttype",
-    "objectsize",
-    "objectname",
-    "deltabase",
-    "tree",
-    "parent",
-    "numparent",
-    "object",
-    "type",
-    "tag",
-    "author",
-    "authorname",
-    "authoremail",
-    "authordate",
-    "committer",
-    "committername",
-    "committeremail",
-    "committerdate",
-    "tagger",
-    "taggername",
-    "taggeremail",
-    "taggerdate",
-    "creator",
-    "creatordate",
-    "subject",
-    "body",
-    "trailers",
-    "contents",
-    "signature",
-    "raw",
-    "upstream",
-    "push",
-    "symref",
-    "flag",
-    "HEAD",
-    "color",
-    "worktreepath",
-    "align",
-    "end",
-    "if",
-    "then",
-    "else",
-    "rest",
-    "ahead-behind",
-    "is-base",
-    "describe",
-];
-
 /// One resolved sort key.
 struct SortKey {
     reverse: bool,
@@ -2894,11 +2845,11 @@ enum SortVal {
 }
 
 impl SortVal {
-    fn cmp(&self, other: &SortVal) -> Ordering {
+    fn cmp(&self, other: &SortVal, pre: &Prereleases<'_>) -> Ordering {
         match (self, other) {
             (SortVal::Num(a), SortVal::Num(b)) => a.cmp(b),
             (SortVal::Bytes(a), SortVal::Bytes(b)) => a.cmp(b),
-            (SortVal::Version(a), SortVal::Version(b)) => versioncmp(a, b),
+            (SortVal::Version(a), SortVal::Version(b)) => refsort::versioncmp(a, b, pre),
             _ => Ordering::Equal,
         }
     }
@@ -2935,54 +2886,18 @@ enum SortErr {
     Unsupported(String),
 }
 
-/// Split a sort key into its `-` (descending), `version:`/`v:` and `*`
-/// (dereference) markers and the remaining field atom.
-fn parse_sort_key(key: &str) -> (bool, bool, bool, &str) {
-    let mut s = key;
-    let mut reverse = false;
-    if let Some(rest) = s.strip_prefix('-') {
-        reverse = true;
-        s = rest;
-    }
-    let mut version = false;
-    if let Some(rest) = s.strip_prefix("version:").or_else(|| s.strip_prefix("v:")) {
-        version = true;
-        s = rest;
-    }
-    let mut star = false;
-    if let Some(rest) = s.strip_prefix('*') {
-        star = true;
-        s = rest;
-    }
-    (reverse, version, star, s)
-}
-
-/// git's `parse_ref_filter_atom`: an empty atom is a `malformed field name`, and
-/// a field name outside `valid_atom[]` is an `unknown field name`.
-fn git_sort_error(key: &str) -> Option<String> {
-    let (_, _, _, atom) = parse_sort_key(key);
-    if atom.is_empty() {
-        return Some(format!("malformed field name: {atom}"));
-    }
-    let name = atom.split(':').next().unwrap_or(atom);
-    if !VALID_SORT_ATOMS.contains(&name) {
-        return Some(format!("unknown field name: {atom}"));
-    }
-    None
-}
-
 /// Validate and interpret every sort key. git dies on the first syntactically
 /// invalid key in the order given, so that is checked first; only then is this
 /// port's narrower support considered.
 fn resolve_sort(sorts: &[String]) -> Result<Vec<SortKey>, SortErr> {
     for key in sorts {
-        if let Some(msg) = git_sort_error(key) {
+        if let Some(msg) = refsort::sort_error(key) {
             return Err(SortErr::Fatal(msg));
         }
     }
     let mut keys = Vec::with_capacity(sorts.len());
     for key in sorts {
-        let (reverse, version, star, atom) = parse_sort_key(key);
+        let (reverse, version, star, atom) = refsort::parse_sort_key(key);
         let field = atom.split(':').next().unwrap_or(atom);
         // A `:suffix` (e.g. `refname:short`, `objectname:short`) changes the
         // rendered bytes git sorts on, so a field carrying one this port does not
@@ -3140,83 +3055,6 @@ fn body_of(msg: &[u8]) -> Vec<u8> {
     match msg.windows(2).position(|w| w == b"\n\n") {
         Some(p) => msg[p + 2..].to_vec(),
         None => Vec::new(),
-    }
-}
-
-/// git's `versioncmp` (a modified glibc `strverscmp`), byte for byte.
-fn versioncmp(s1: &[u8], s2: &[u8]) -> Ordering {
-    const S_N: usize = 0;
-    const S_I: usize = 3;
-    const S_F: usize = 6;
-    const S_Z: usize = 9;
-    const CMP: i8 = 2;
-    const LEN: i8 = 3;
-    #[rustfmt::skip]
-    const NEXT_STATE: [usize; 12] = [
-        S_N, S_I, S_Z,
-        S_N, S_I, S_I,
-        S_N, S_F, S_F,
-        S_N, S_F, S_Z,
-    ];
-    #[rustfmt::skip]
-    const RESULT_TYPE: [i8; 36] = [
-        CMP, CMP, CMP, CMP, LEN, CMP, CMP, CMP, CMP,
-        CMP, -1,  -1,   1,  LEN, LEN,  1,  LEN, LEN,
-        CMP, CMP, CMP, CMP, CMP, CMP, CMP, CMP, CMP,
-        CMP,  1,   1,  -1,  CMP, CMP, -1,  CMP, CMP,
-    ];
-
-    let get = |p: &[u8], i: usize| -> u8 { p.get(i).copied().unwrap_or(0) };
-    let digit = |c: u8| -> usize { usize::from(c.is_ascii_digit()) };
-    let zero = |c: u8| -> usize { usize::from(c == b'0') };
-
-    let mut i1 = 0usize;
-    let mut i2 = 0usize;
-    let mut c1 = get(s1, i1);
-    i1 += 1;
-    let mut c2 = get(s2, i2);
-    i2 += 1;
-    let mut state = S_N + zero(c1) + digit(c1);
-    let mut diff;
-    loop {
-        diff = c1 as i32 - c2 as i32;
-        if diff != 0 {
-            break;
-        }
-        if c1 == 0 {
-            return Ordering::Equal;
-        }
-        state = NEXT_STATE[state];
-        c1 = get(s1, i1);
-        i1 += 1;
-        c2 = get(s2, i2);
-        i2 += 1;
-        state += zero(c1) + digit(c1);
-    }
-
-    let rt = RESULT_TYPE[state * 3 + zero(c2) + digit(c2)];
-    match rt {
-        CMP => diff.cmp(&0),
-        LEN => {
-            loop {
-                let d1 = get(s1, i1);
-                i1 += 1;
-                if !d1.is_ascii_digit() {
-                    break;
-                }
-                let d2 = get(s2, i2);
-                i2 += 1;
-                if !d2.is_ascii_digit() {
-                    return Ordering::Greater;
-                }
-            }
-            if get(s2, i2).is_ascii_digit() {
-                Ordering::Less
-            } else {
-                diff.cmp(&0)
-            }
-        }
-        other => (other as i32).cmp(&0),
     }
 }
 

@@ -87,6 +87,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use gix::bstr::ByteSlice;
+
+use super::diffstat::{self, StatWidths};
 use gix::diff::blob::{diff_with_slider_heuristics, Algorithm, InternedInput};
 use gix::hash::ObjectId;
 use gix::object::tree::diff::ChangeDetached;
@@ -1743,108 +1745,39 @@ fn quote_path(path: impl AsRef<[u8]>) -> String {
     crate::quote::quoted_name_string(path.as_ref())
 }
 
-/// Render the `--stat` block plus the `--summary` lines, reproducing git's
-/// `show_stats()` column arithmetic for the default 80-column, non-tty width.
+/// The rows [`super::diffstat::show_stats`] renders.
+fn stat_rows(files: &[StatEntry]) -> Vec<diffstat::StatFile> {
+    files
+        .iter()
+        .map(|f| match f.binary {
+            Some((old, new)) => diffstat::StatFile {
+                print_name: f.name.clone().into_bytes(),
+                added: new,
+                deleted: old,
+                binary: true,
+                is_unmerged: false,
+            },
+            None => diffstat::StatFile::text(
+                f.name.clone().into_bytes(),
+                u64::from(f.added),
+                u64::from(f.deleted),
+            ),
+        })
+        .collect()
+}
+
+/// The `--stat` block plus the `--summary` lines, as `show_diff_tree()` prints
+/// them. This is `diff-tree`'s geometry — `builtin/bisect.c` never calls
+/// `init_diffstat_widths()` — so it is a flat 80 columns and ignores `$COLUMNS`.
 fn render_stat(files: &[StatEntry]) -> String {
-    let mut max_len = 0usize;
-    let mut max_change = 0u32;
-    let mut any_binary = false;
-    for f in files {
-        max_len = max_len.max(f.name.len());
-        if f.binary.is_some() {
-            any_binary = true;
-            continue;
-        }
-        max_change = max_change.max(f.added + f.deleted);
-    }
-
-    let mut number_width = decimal_width(max_change);
-    if any_binary {
-        number_width = number_width.max(3);
-    }
-
-    // Give the graph at least 6 columns, then spend what is left on the name.
-    let width: isize = 80;
-    let mut name_width = max_len as isize;
-    let mut graph_width = max_change as isize;
-    let number_width_i = number_width as isize;
-    if name_width + number_width_i + 6 + graph_width > width {
-        let cap = width * 3 / 8 - number_width_i - 6;
-        if graph_width > cap {
-            graph_width = cap.max(6);
-        }
-        if name_width > width - number_width_i - 6 - graph_width {
-            name_width = width - number_width_i - 6 - graph_width;
-        } else {
-            graph_width = width - number_width_i - 6 - name_width;
-        }
-    }
-    let name_width = name_width.max(0) as usize;
-    let graph_width = graph_width.max(0) as usize;
-
-    let mut out = String::new();
-    let (mut total_added, mut total_deleted) = (0u64, 0u64);
-
-    for f in files {
-        let name = print_name(&f.name, name_width);
-        if let Some((old, new)) = f.binary {
-            out.push_str(&format!(
-                " {name:<name_width$} |{:>w$}",
-                "Bin",
-                w = number_width + 1
-            ));
-            if old != 0 || new != 0 {
-                out.push_str(&format!(" {old} -> {new} bytes"));
-            }
-            out.push('\n');
-            continue;
-        }
-
-        total_added += u64::from(f.added);
-        total_deleted += u64::from(f.deleted);
-        let total = f.added + f.deleted;
-        let (mut add, mut del) = (f.added as usize, f.deleted as usize);
-        if max_change > 0 && graph_width <= max_change as usize {
-            let mut t = scale_linear(add + del, graph_width, max_change as usize);
-            if t < 2 && add > 0 && del > 0 {
-                t = 2;
-            }
-            if add < del {
-                add = scale_linear(add, graph_width, max_change as usize);
-                del = t - add;
-            } else {
-                del = scale_linear(del, graph_width, max_change as usize);
-                add = t - del;
-            }
-        }
-        out.push_str(&format!(
-            " {name:<name_width$} | {total:>number_width$}{}{}{}\n",
-            if total != 0 { " " } else { "" },
-            "+".repeat(add),
-            "-".repeat(del),
-        ));
-    }
-
-    // git's print_stat_summary: the zero side is still named when both are zero.
-    let n = files.len();
-    out.push_str(&format!(
-        " {n} file{} changed",
-        if n == 1 { "" } else { "s" }
-    ));
-    if total_added != 0 || total_deleted == 0 {
-        out.push_str(&format!(
-            ", {total_added} insertion{}(+)",
-            if total_added == 1 { "" } else { "s" }
-        ));
-    }
-    if total_deleted != 0 || total_added == 0 {
-        out.push_str(&format!(
-            ", {total_deleted} deletion{}(-)",
-            if total_deleted == 1 { "" } else { "s" }
-        ));
-    }
-    out.push('\n');
-
+    let mut out = Vec::new();
+    diffstat::show_stats(
+        &mut out,
+        &stat_rows(files),
+        &StatWidths::plumbing(),
+        &super::diff_color::DiffColors::disabled(),
+    );
+    let mut out = String::from_utf8_lossy(&out).into_owned();
     for f in files {
         if let Some(line) = &f.summary {
             out.push_str(&format!(" {line}\n"));
@@ -1853,36 +1786,7 @@ fn render_stat(files: &[StatEntry]) -> String {
     out
 }
 
-/// git's `fill_print_name` truncation: keep the tail, cut back to a `/` boundary,
-/// and mark it with a leading `...`. Names are ASCII here (see `quote_path`).
-fn print_name(name: &str, name_width: usize) -> String {
-    if name.len() <= name_width || name_width < 4 {
-        return name.to_owned();
-    }
-    let tail = &name[name.len() - (name_width - 3)..];
-    let tail = match tail.find('/') {
-        Some(i) => &tail[i..],
-        None => tail,
-    };
-    format!("...{tail}")
-}
 
-/// git's `scale_linear`: any non-zero change keeps at least one column.
-fn scale_linear(it: usize, width: usize, max_change: usize) -> usize {
-    if it == 0 || width == 0 || max_change == 0 {
-        return 0;
-    }
-    1 + (it * (width - 1)) / max_change
-}
-
-fn decimal_width(mut n: u32) -> usize {
-    let mut w = 1;
-    while n >= 10 {
-        n /= 10;
-        w += 1;
-    }
-    w
-}
 
 #[cfg(test)]
 mod tests {

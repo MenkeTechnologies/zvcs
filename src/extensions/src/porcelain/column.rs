@@ -24,16 +24,21 @@
 //!     additionally applies `wcwidth()`, so lines containing combining marks or
 //!     wide (CJK) characters lay out differently. This matches the convention
 //!     already used by `shortlog` and `request-pull` in this crate.
-//!   * `term_columns()` (used only when `--width` is absent or zero) reads
-//!     `COLUMNS` and otherwise falls back to 80; the `TIOCGWINSZ` probe is not
-//!     performed, so an unset `COLUMNS` on a terminal of a different size lays
-//!     out at 80 columns rather than the real width.
+//!   * [`crate::pager::term_columns`] (used only when `--width` is absent or
+//!     zero) reads `COLUMNS` with C's `atoi` and otherwise falls back to 80; the
+//!     `TIOCGWINSZ` probe is not performed, so an unset `COLUMNS` on a terminal
+//!     of a different size lays out at 80 columns rather than the real width.
 //!
 //! Not covered: nothing else — every remaining flag git accepts is implemented,
 //! and unknown flags produce git's own `unknown option` usage error rather than
 //! being ignored.
 
 use anyhow::{bail, Result};
+
+// git's `term_columns()` (`pager.c:203`), shared with every other consumer — see
+// `crate::pager::term_columns` for the `atoi` grammar and for why the
+// `TIOCGWINSZ` probe is absent.
+use crate::pager::term_columns;
 use std::io::{IsTerminal, Read, Write};
 use std::process::ExitCode;
 
@@ -877,20 +882,4 @@ pub(crate) fn layout(list: &[Vec<u8>], colopts: u32, opts: &ColumnOptions) -> Ve
     out
 }
 
-/// git's `term_columns()`, minus the `TIOCGWINSZ` probe (see the module header).
-fn term_columns() -> i64 {
-    if let Ok(value) = std::env::var("COLUMNS") {
-        // C's `atoi`: read a leading decimal run and ignore the rest.
-        let digits: String = value
-            .trim_start()
-            .chars()
-            .take_while(char::is_ascii_digit)
-            .collect();
-        if let Ok(n) = digits.parse::<i64>() {
-            if n > 0 {
-                return n;
-            }
-        }
-    }
-    80
-}
+

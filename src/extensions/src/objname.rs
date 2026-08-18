@@ -1,4 +1,4 @@
-//! `get_oid_basic()`'s full-length-hex rule, in one place.
+//! `get_oid_basic()`'s object-name rules, in one place.
 //!
 //! git resolves an object name through `get_oid_basic()` (`object-name.c`),
 //! whose very first branch is:
@@ -16,7 +16,13 @@
 //! paragraph `advice.objectNameWarning` gates. They are separate functions
 //! because git reaches `get_oid_basic()` once per operand while several helpers
 //! below decode a name a second time to *diagnose* it, and a doubled warning is
-//! as wrong as a missing one.
+//! as wrong as a missing one — [`resolve_quiet`] is the resolution that says
+//! nothing, for exactly that second look.
+//!
+//! The same function warns a *second* time further down, for a plain name that
+//! more than one ref answers to (or that is also an unambiguous abbreviated
+//! object id). It carries different gates, so it is not a special case of the
+//! first: see [`warn_ambiguous_operand`].
 //!
 //! A name whose length is exactly the hash's hex length *is* the object id. git
 //! decodes it and returns **without ever asking the object database whether that
@@ -170,29 +176,138 @@ running \"git config set advice.objectNameWarning false\"";
 ///
 /// Returns whether the full-hex branch was taken at all, i.e. whether
 /// `get_oid_basic()` would have `return 0`ed here without looking at anything
-/// else. A caller that also implements the *later* ambiguity warning uses that
-/// to stop, exactly as the `return 0` does.
+/// else.
+///
+/// The body is [`warn_ambiguous_operand`] with git's default `flags` — no
+/// `GET_OID_QUIETLY`, no `GET_OID_SKIP_AMBIGUITY_CHECK` — so it says everything
+/// `get_oid_basic()` says about one operand, which is *both* of its ambiguity
+/// warnings. This is the spelling every command that resolves an argv operand
+/// calls; the two commands that pass one of those flags reach the flagged form
+/// directly.
 pub fn warn_ambiguous_refname(repo: &gix::Repository, name: &str) -> bool {
+    warn_ambiguous_operand(repo, name, OidFlags::default())
+}
+
+/// The two bits of `get_oid_basic()`'s `flags` that decide whether it warns.
+/// Everything else in `flags` picks an object type or a failure mode and is the
+/// resolver's business, not this one's.
+#[derive(Clone, Copy, Default)]
+pub struct OidFlags {
+    /// `GET_OID_QUIETLY`. Gates the *second* warning only — `git rev-parse
+    /// --quiet --verify dup` is silent where `git rev-parse --verify dup` warns,
+    /// while a 40-hex ref name warns under `--quiet` all the same.
+    pub quiet: bool,
+    /// `GET_OID_SKIP_AMBIGUITY_CHECK`, which at 2.55.0 only `builtin/update-ref.c`
+    /// passes. Gates the *first* warning only, so `git update-ref refs/heads/z
+    /// <40-hex-ref>` is silent while `git update-ref refs/heads/z dup` still warns.
+    pub skip_ambiguity_check: bool,
+}
+
+/// `get_oid_basic()`'s two ambiguity warnings, in the order and under the gates
+/// the C applies them, for a caller holding git's own `flags`.
+///
+/// The first branch is the full-hex one documented on
+/// [`warn_ambiguous_refname`]; it ends in `return 0`, so a name that takes it
+/// never reaches the second. The second is `object-name.c:750-756`, after the
+/// name has resolved as a ref:
+///
+/// ```c
+/// if (!refs_found)
+///         return -1;
+///
+/// if (repo_settings_get_warn_ambiguous_refs(r) && !(flags & GET_OID_QUIETLY) &&
+///     (refs_found > 1 ||
+///      !get_short_oid(r, str, len, &tmp_oid, GET_OID_QUIETLY)))
+///         warning(warn_msg, len, str);
+/// ```
+///
+/// Three differences from the first branch, each separately observable and each
+/// measured against stock 2.55.0 before being written down:
+///
+/// * **`warn_on_object_refname_ambiguity` is not a gate here.** The switch is
+///   read only inside the full-hex branch, so the four bulk readers that clear it
+///   ([`AmbiguityWarnings`]) still warn about an ambiguous *plain name*: stock
+///   `printf dup | git rev-list --stdin`, `… | git cat-file --batch-check`,
+///   `… | git pack-objects --revs --stdout` and `… | git bundle create f --stdin`
+///   each print the line once.
+/// * **`GET_OID_SKIP_AMBIGUITY_CHECK` is not a gate here either**, so
+///   `git update-ref refs/heads/z dup` warns although the same command is silent
+///   for a 40-hex ref name.
+/// * **`GET_OID_QUIETLY` *is* a gate**, which the first branch has no test for —
+///   `git rev-parse --quiet --verify dup` is silent while `git rev-parse
+///   --verify dup` warns.
+///
+/// `refs_found` is `repo_dwim_ref()`'s count, so it is the number of distinct
+/// `ref_rev_parse_rules` spellings that exist, not the number of objects they
+/// point at: `refs/heads/dup` and `refs/tags/dup` is two even when both name the
+/// same commit. The right-hand disjunct catches the other shape entirely — a
+/// *single* ref whose name is also an unambiguous abbreviated object id, which is
+/// why a branch called `ca6882fa` warns on its own.
+///
+/// The name in the message is [`ambiguity_base`]'s, not the operand's, for the
+/// same reason as in the first branch: git warns about the `str`/`len` that
+/// reached `get_oid_basic()`, so `git rev-parse dup^` and `git rev-parse
+/// dup:f.txt` both say `refname 'dup' is ambiguous.` once.
+pub fn warn_ambiguous_operand(repo: &gix::Repository, name: &str, flags: OidFlags) -> bool {
     let base = ambiguity_base(name);
-    if base.len() != repo.object_hash().len_in_hex()
-        || !base.bytes().all(|b| b.is_ascii_hexdigit())
+    if base.len() == repo.object_hash().len_in_hex()
+        && base.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        if flags.skip_ambiguity_check
+            || !WARN_ON_OBJECT_REFNAME_AMBIGUITY.load(Ordering::Relaxed)
+        {
+            return true;
+        }
+        if repo.config_snapshot().boolean("core.warnAmbiguousRefs") == Some(false) {
+            return true;
+        }
+        if crate::porcelain::rev_parse::dwim_ref_matches(repo, base).is_empty() {
+            return true;
+        }
+        eprintln!("warning: refname '{base}' is ambiguous.");
+        if Advice::ObjectNameWarning.enabled_in(repo) {
+            eprintln!("{OBJECT_NAME_MSG}");
+        }
+        return true;
+    }
+    if flags.quiet || repo.config_snapshot().boolean("core.warnAmbiguousRefs") == Some(false) {
+        return false;
+    }
+    // `if (!refs_found) return -1;` — a name no rule matches never gets this far,
+    // and that covers the revision grammar `strip_navigation` cannot reduce
+    // (`<rev>^!`, `<rev>^@`, `<rev>@{…}`) without a test of its own:
+    // `check_refname_format()` bans `^`, `~`, `:` and `?` in a refname, so
+    // `repo_dwim_ref()` answers 0 for anything still carrying one.
+    let refs_found = crate::porcelain::rev_parse::dwim_ref_matches(repo, base).len();
+    if refs_found == 0 {
+        return false;
+    }
+    if refs_found > 1 || short_oid_unambiguous(repo, base) {
+        eprintln!("warning: refname '{base}' is ambiguous.");
+    }
+    false
+}
+
+/// `!get_short_oid(r, str, len, &tmp_oid, GET_OID_QUIETLY)`: whether the name is
+/// also a hex prefix that picks out exactly one object.
+///
+/// git's floor is `minimum_abbrev`, four hex digits (`environment.c`), and an
+/// ambiguous prefix makes `get_short_oid()` fail — which reads here as "not a
+/// short oid", exactly as it does in the C.
+fn short_oid_unambiguous(repo: &gix::Repository, name: &str) -> bool {
+    if name.len() < 4
+        || name.len() > repo.object_hash().len_in_hex()
+        || !name.bytes().all(|b| b.is_ascii_hexdigit())
     {
         return false;
     }
-    if !WARN_ON_OBJECT_REFNAME_AMBIGUITY.load(Ordering::Relaxed) {
-        return true;
-    }
-    if repo.config_snapshot().boolean("core.warnAmbiguousRefs") == Some(false) {
-        return true;
-    }
-    if crate::porcelain::rev_parse::dwim_ref_matches(repo, base).is_empty() {
-        return true;
-    }
-    eprintln!("warning: refname '{base}' is ambiguous.");
-    if Advice::ObjectNameWarning.enabled_in(repo) {
-        eprintln!("{OBJECT_NAME_MSG}");
-    }
-    true
+    let Ok(prefix) = gix::hash::Prefix::from_hex(name) else {
+        return false;
+    };
+    // No candidate set: git only needs "does this name exactly one object", and
+    // the early-abort form answers that — `Ok(Some(Err(())))` is the ambiguous
+    // case, which `get_short_oid` also treats as a failure to resolve.
+    matches!(repo.objects.lookup_prefix(prefix, None), Ok(Some(Ok(_))))
 }
 
 /// The substring `get_oid_basic()` is eventually handed for `spec`.

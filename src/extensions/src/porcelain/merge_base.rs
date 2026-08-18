@@ -463,7 +463,28 @@ fn fork_point(repo: &Repository, refname: &str, commitname: &str) -> Result<Exit
         _ => None,
     };
 
-    let Ok(reference) = repo.find_reference(refname) else {
+    // `get_fork_point()` DWIMs this operand itself (commit.c:1103-1111) instead of
+    // handing it to `get_oid_basic()`, so an ambiguous name here is fatal and
+    // earns no `warning: refname … is ambiguous.` on the way:
+    //
+    // ```c
+    // switch (repo_dwim_ref(the_repository, refname, strlen(refname), &oid,
+    //                       &full_refname, 0)) {
+    // case 0:
+    //         die("No such ref: '%s'", refname);
+    // case 1:
+    //         break; /* good */
+    // default:
+    //         die("Ambiguous refname: '%s'", refname);
+    // }
+    // ```
+    let candidates_for_ref = super::rev_parse::dwim_ref_matches(repo, refname);
+    let full_refname = match candidates_for_ref.len() {
+        0 => return Ok(fatal(&format!("No such ref: '{refname}'"))),
+        1 => candidates_for_ref[0].clone(),
+        _ => return Ok(fatal(&format!("Ambiguous refname: '{refname}'"))),
+    };
+    let Ok(reference) = repo.find_reference(full_refname.as_str()) else {
         return Ok(fatal(&format!("No such ref: '{refname}'")));
     };
     let Some(derived) = derived else {
@@ -536,7 +557,9 @@ fn fork_point(repo: &Repository, refname: &str, commitname: &str) -> Result<Exit
         // returned — the ref's own target, *not* peeled, so an annotated tag ref
         // contributes nothing (`push` drops it for the same reason
         // `add_one_commit`'s `repo_parse_commit()` does).
-        if let Some(id) = crate::objname::resolve(repo, refname) {
+        // The id is `repo_dwim_ref()`'s, not a fresh `get_oid()` — nothing is
+        // resolved here and nothing warns.
+        if let Some(id) = crate::objname::resolve_quiet(repo, refname) {
             push(id, &mut candidates);
         }
     }

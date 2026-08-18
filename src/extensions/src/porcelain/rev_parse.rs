@@ -272,10 +272,9 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
                 Some(range) => {
                     warn_ambiguous_refname(&repo, range.a, o.quiet);
                     warn_reflog_reach(&mut out, &repo, range.a, o.quiet)?;
-                    let a_resolved = {
-                        let _quiet_ambiguity = crate::objname::AmbiguityWarnings::off();
-                        crate::objname::resolve(&repo, range.a).is_some()
-                    };
+                    // The endpoint has already been warned about on the line
+                    // above; this is the same resolution, not a second operand.
+                    let a_resolved = crate::objname::resolve_quiet(&repo, range.a).is_some();
                     if a_resolved {
                         warn_ambiguous_refname(&repo, range.b, o.quiet);
                         warn_reflog_reach(&mut out, &repo, range.b, o.quiet)?;
@@ -442,6 +441,24 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
 /// is what `refs_resolve_ref_unsafe()` returns). The first element is the ref git
 /// treats as *the* match; the length is git's `refs_found`.
 pub(crate) fn dwim_ref_matches(repo: &gix::Repository, name: &str) -> Vec<String> {
+    // `expand_ref()` stops at the first match when `core.warnAmbiguousRefs` is
+    // off, so `refs_found` never exceeds 1 there and nothing downstream can call
+    // the name ambiguous:
+    //
+    // ```c
+    // if (r) {
+    //         if (!refs_found++)
+    //                 *ref = xstrdup(r);
+    //         if (!repo_settings_get_warn_ambiguous_refs(repo))
+    //                 break;
+    // }
+    // ```
+    //
+    // Observable through the callers that turn the count into a `die()` rather
+    // than a warning: stock `git -c core.warnAmbiguousRefs=false branch nb dup`
+    // creates the branch, and `merge-base --fork-point dup main` answers instead
+    // of reporting `Ambiguous refname`.
+    let stop_at_first = repo.config_snapshot().boolean("core.warnAmbiguousRefs") == Some(false);
     let mut found = Vec::new();
     for rule in [
         name.to_owned(),
@@ -470,6 +487,9 @@ pub(crate) fn dwim_ref_matches(repo: &gix::Repository, name: &str) -> Vec<String
             TargetRef::Symbolic(full) => full.as_bstr().to_string(),
             TargetRef::Object(_) => r.name().as_bstr().to_string(),
         });
+        if stop_at_first {
+            break;
+        }
     }
     found
 }
@@ -506,33 +526,17 @@ fn warn_reflog_reach(
 /// !get_short_oid(…)` disjunction. `--quiet` is git's `GET_OID_QUIETLY`, which
 /// suppresses it.
 ///
-/// Only a bare name goes through `repo_dwim_ref`, so anything carrying revision
-/// grammar (`~`, `^`, `:`, `@{`) is left alone here, as in git.
+/// Both halves live in [`crate::objname::warn_ambiguous_operand`], because every
+/// other command that takes an object name needs the same two warnings and a
+/// second copy of the rule here would be a second thing to keep in step. `quiet`
+/// is the only thing rev-parse adds: it is the one builtin with a `--quiet` that
+/// reaches `get_oid()` with `GET_OID_QUIETLY`.
 pub(crate) fn warn_ambiguous_refname(repo: &gix::Repository, arg: &str, quiet: bool) {
-    // `get_oid_basic` splits in two, and the *full-length* hex half is the whole
-    // of its first branch — shared, because every command that takes an object
-    // name reaches it. It returns whether that branch was the one taken, which is
-    // the `return 0` that keeps the second warning below out of reach.
-    if crate::objname::warn_ambiguous_refname(repo, arg) {
-        return;
-    }
-    if arg.contains(['~', '^', ':']) || arg.contains("@{") {
-        return;
-    }
-    if repo.config_snapshot().boolean("core.warnAmbiguousRefs") == Some(false) {
-        return;
-    }
-
-    if quiet {
-        return;
-    }
-    let refs_found = dwim_ref_matches(repo, arg).len();
-    if refs_found == 0 {
-        return;
-    }
-    if refs_found > 1 || resolves_as_short_oid(repo, arg) {
-        eprintln!("warning: refname '{arg}' is ambiguous.");
-    }
+    crate::objname::warn_ambiguous_operand(
+        repo,
+        arg,
+        crate::objname::OidFlags { quiet, ..Default::default() },
+    );
 }
 
 /// The revspecs [`crate::objname::full_hex`] rescues once an endpoint is a full-length hex
@@ -564,21 +568,6 @@ fn full_hex_spec(repo: &gix::Repository, arg: &str) -> Option<Parsed> {
 /// hex is its own answer, everything else goes to the ordinary parser.
 fn endpoint(repo: &gix::Repository, name: &str) -> Option<ObjectId> {
     crate::objname::full_hex(repo, name).or_else(|| repo.rev_parse_single(name).ok().map(|id| id.detach()))
-}
-
-/// `get_short_oid(…, GET_OID_QUIETLY) == 0`: whether `arg` is a hex prefix that
-/// names exactly one object. git's minimum abbreviation is four hex digits.
-fn resolves_as_short_oid(repo: &gix::Repository, arg: &str) -> bool {
-    if arg.len() < 4 || !arg.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return false;
-    }
-    let Ok(prefix) = gix::hash::Prefix::from_hex(arg) else {
-        return false;
-    };
-    // No candidate set: git only needs "does this name exactly one object", and
-    // the early-abort form answers that — `Ok(Some(Err(())))` is the ambiguous
-    // case, which `get_short_oid` also treats as a failure to resolve.
-    matches!(repo.objects.lookup_prefix(prefix, None), Ok(Some(Ok(_))))
 }
 
 /// `die_no_single_rev` in stock git: silent exit 1 under `--quiet`, else fatal.

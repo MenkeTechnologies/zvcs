@@ -987,7 +987,9 @@ fn unknown_option(arg: &str, argv_consumed: bool) -> ExitCode {
 /// git's `bad object <name>` for it instead of this walking off with an id it
 /// cannot read.
 fn resolve(repo: &gix::Repository, spec: &str) -> Option<ObjectId> {
-    let id = crate::objname::resolve(repo, spec)?;
+    // Quiet: the caller has already run `warn_operand()` over the same token, and
+    // `get_oid_basic()` is reached once per operand.
+    let id = crate::objname::resolve_quiet(repo, spec)?;
     let object = repo.find_object(id).ok()?;
     Some(object.peel_to_commit().ok()?.id)
 }

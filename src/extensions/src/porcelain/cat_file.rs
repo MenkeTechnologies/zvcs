@@ -1668,6 +1668,15 @@ fn process_request(
 
     // Resolve. A non-UTF-8 or unresolvable name is reported "missing", echoing
     // the name exactly as given.
+    //
+    // `batch_one_object()` reaches `get_oid_with_context()` per line, so both of
+    // `get_oid_basic()`'s ambiguity warnings are due. `batch_objects()`'s
+    // `warn_on_object_refname_ambiguity` bracket — held around this whole loop —
+    // takes the full-hex one out; the plain-name one has no such gate, and stock
+    // `printf dup | git cat-file --batch-check` prints it.
+    if let Ok(spec) = std::str::from_utf8(name) {
+        crate::objname::warn_ambiguous_refname(repo, spec);
+    }
     let oid = std::str::from_utf8(name)
         .ok()
         .and_then(|s| repo.rev_parse_single(s).ok())

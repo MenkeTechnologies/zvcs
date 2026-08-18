@@ -1195,8 +1195,7 @@ fn append_ref(repo: &gix::Repository, refname: &str, names: &mut Vec<String>) {
     // is looked up here and `get_oid_basic()`'s ambiguity warning is not repeated.
     // The one `repo_get_oid()` per entry that git does make is the pass over
     // `ref_name[]` further up, which is where the warning comes from.
-    let _quiet_ambiguity = crate::objname::AmbiguityWarnings::off();
-    if resolve_commit(repo, refname).is_none() {
+    if resolve_commit_quiet(repo, refname).is_none() {
         return;
     }
     if names.iter().any(|n| n == refname) {
@@ -1360,6 +1359,15 @@ fn resolve_commit(repo: &gix::Repository, spec: &str) -> Option<ObjectId> {
     object.peel_to_commit().ok().map(|c| c.id)
 }
 
+/// [`resolve_commit`] for the two callers that are peeling an id their caller has
+/// already resolved, so `get_oid_basic()` — and both of its ambiguity warnings —
+/// is not reached a second time for one entry.
+fn resolve_commit_quiet(repo: &gix::Repository, spec: &str) -> Option<ObjectId> {
+    let id = crate::objname::resolve_quiet(repo, spec)?;
+    let object = repo.find_object(id).ok()?;
+    object.peel_to_commit().ok().map(|c| c.id)
+}
+
 // ---------------------------------------------------------------------------
 // reflog mode (`-g`/`--reflog`): dwim_ref + read_ref_at + show_date_relative
 // ---------------------------------------------------------------------------
@@ -1493,8 +1501,7 @@ fn collect_reflog(
         let oid = if nth == 0 { dwim_oid } else { entry.new_oid };
         // `append_ref()` drops anything that does not peel to a commit. It is
         // given the id, not a name, so nothing is resolved and nothing warns.
-        let _quiet_ambiguity = crate::objname::AmbiguityWarnings::off();
-        if resolve_commit(repo, &oid.to_string()).is_none() {
+        if resolve_commit_quiet(repo, &oid.to_string()).is_none() {
             continue;
         }
         if names.len() >= MAX_REVS {

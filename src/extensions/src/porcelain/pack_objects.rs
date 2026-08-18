@@ -3141,6 +3141,10 @@ fn rev_list_objects(
             if spec.is_empty() || spec.starts_with('^') || spec.starts_with('-') {
                 continue;
             }
+            // The bracket above only reaches `get_oid_basic()`'s full-hex branch.
+            // The plain-name warning under it carries no such gate, so stock
+            // `printf dup | git pack-objects --revs --stdout` prints it.
+            crate::objname::warn_ambiguous_refname(repo, spec);
             if let Ok(id) = repo.rev_parse_single(spec) {
                 pending.push(id.detach());
             }

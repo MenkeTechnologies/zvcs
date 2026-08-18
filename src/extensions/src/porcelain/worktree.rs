@@ -1768,7 +1768,44 @@ fn add(args: &[String]) -> Result<ExitCode> {
         .map(str::to_owned)
         .unwrap_or_default();
 
+    // `add()` puts the `<commit-ish>` through `lookup_commit_reference_by_name()`
+    // — and so through `get_oid_basic()` — at four points, each of which warns:
+    // builtin/worktree.c:904 (the `ac == 2` arm, which `--detach` skips), :918,
+    // `print_preparing_worktree_line()`:641/:657, and `add_worktree()`:490. Stock
+    // prints `warning: refname 'dup' is ambiguous.` three times for
+    // `git worktree add <path> dup`, whichever of `--detach`/`-b` is in play.
+    let branch_arg = commit_ish.unwrap_or("HEAD");
+    if commit_ish.is_some() && !detach {
+        crate::objname::warn_ambiguous_refname(&repo, branch_arg);
+    }
+    crate::objname::warn_ambiguous_refname(&repo, branch_arg);
+
     let start = resolve_start(&repo, new_branch.as_deref(), force_branch, detach, commit_ish, &dwim_name)?;
+
+    // `print_preparing_worktree_line()` looks a name up only on the two arms that
+    // need an id for the message — `-B` (the branch being reset) and the detached
+    // one. `-b`, and the "checking out '<branch>'" arm `check_branch_ref()` takes
+    // when `refs/heads/<branch>` exists and `--detach` was not asked for, print a
+    // name they already have:
+    //
+    // ```c
+    // if (force_new_branch)  { commit = lookup_commit_reference_by_name(new_branch); … }
+    // else if (new_branch)   { … }
+    // else {
+    //         if (!detach && !check_branch_ref(&s, branch) && refs_ref_exists(…, s.buf))
+    //                 … /* "checking out '%s'" */
+    //         else { commit = lookup_commit_reference_by_name(branch); … }
+    // }
+    // ```
+    let branch_ref_exists =
+        repo.try_find_reference(format!("refs/heads/{branch_arg}").as_str())?.is_some();
+    if force_branch {
+        if let Some(name) = new_branch.as_deref() {
+            crate::objname::warn_ambiguous_refname(&repo, name);
+        }
+    } else if new_branch.is_none() && (detach || !branch_ref_exists) {
+        crate::objname::warn_ambiguous_refname(&repo, branch_arg);
+    }
 
     if !quiet {
         eprintln!("Preparing worktree ({})", start.preparing(&repo));
@@ -1784,6 +1821,16 @@ fn add(args: &[String]) -> Result<ExitCode> {
         let short = name.as_bstr().to_str_lossy().trim_start_matches("refs/heads/").to_string();
         if let Some(code) = super::branch::child_branch_option_rejection(&repo, &short) {
             return Ok(code);
+        }
+        // That child is `git branch <new> <branch>`, so `create_branch()` →
+        // `dwim_branch_start()` (branch.c:552,562-582) resolves the start-point
+        // once more — another `warning: refname … is ambiguous.` — and refuses a
+        // name more than one ref answers to. `run_command()` failing here is
+        // `return -1`, which `git` reports as 255.
+        crate::objname::warn_ambiguous_refname(&repo, branch_arg);
+        if super::rev_parse::dwim_ref_matches(&repo, branch_arg).len() > 1 {
+            eprintln!("fatal: ambiguous object name: '{branch_arg}'");
+            return Ok(ExitCode::from(255));
         }
     }
 
@@ -1822,10 +1869,23 @@ fn add(args: &[String]) -> Result<ExitCode> {
         // A plain file at the path is just as occupied as a full directory.
         Err(_) => path.exists(),
     };
-    if occupied && !force {
+    // `check_candidate_path()`'s first line is not gated by `--force`:
+    //
+    // ```c
+    // if (file_exists(path) && !is_empty_dir(path))
+    //         die(_("'%s' already exists"), path);
+    // ```
+    //
+    // `--force` only overrides the *registered worktree* checks below it, so
+    // `git worktree add -f <non-empty-dir>` dies in stock 2.55.0 too.
+    if occupied {
         eprintln!("fatal: '{path_arg}' already exists");
         return Ok(ExitCode::from(128));
     }
+
+    // `add_worktree()`:490 — the fourth and last lookup, after
+    // `check_candidate_path()` above has had its say.
+    crate::objname::warn_ambiguous_refname(&repo, branch_arg);
 
     // The administrative directory, named after the path's last component with
     // git's `<name>N` de-duplication when that name is taken.
@@ -1907,12 +1967,16 @@ fn resolve_start(
         Some(spec) => {
             let oid = peel(spec)?;
             // A `<commit-ish>` that names a branch attaches `HEAD` to it, unless
-            // `--detach` asked otherwise.
+            // `--detach` asked otherwise. `check_branch_ref()` builds
+            // `refs/heads/<name>` and asks whether *that* ref exists, so an
+            // ambiguous name whose tag wins the rev-parse rules is still a branch
+            // here — `git worktree add <path> dup` checks `refs/heads/dup` out
+            // rather than detaching at `refs/tags/dup`.
             let branch = (!detach)
-                .then(|| repo.find_reference(spec).ok())
+                .then(|| repo.try_find_reference(format!("refs/heads/{spec}").as_str()).ok())
                 .flatten()
-                .map(|r| r.name().to_owned())
-                .filter(|n| n.as_bstr().starts_with(b"refs/heads/"));
+                .flatten()
+                .map(|r| r.name().to_owned());
             Ok(match branch {
                 Some(name) => Start::Branch(name, oid),
                 None => Start::Detached(oid),

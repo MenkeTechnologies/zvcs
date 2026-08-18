@@ -508,6 +508,15 @@ fn parse_slot(
     if let Ok(id) = ObjectId::from_hex(spec.as_bytes()) {
         return Ok(Val::Oid(id));
     }
+    // `GET_OID_SKIP_AMBIGUITY_CHECK` silences `get_oid_basic()`'s *first* warning
+    // and nothing else, so a plain name matching more than one ref still earns the
+    // second one: stock `git update-ref refs/heads/z dup` prints
+    // `warning: refname 'dup' is ambiguous.` once per slot it resolves.
+    crate::objname::warn_ambiguous_operand(
+        repo,
+        spec,
+        crate::objname::OidFlags { skip_ambiguity_check: true, ..Default::default() },
+    );
     let id = repo
         .rev_parse_single(spec)
         .map_err(|_| match slot {

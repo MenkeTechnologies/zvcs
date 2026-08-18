@@ -1943,6 +1943,19 @@ fn create_branch(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
             let Some(id) = crate::objname::resolve(repo, s) else {
                 return fatal(format!("not a valid object name: '{s}'"));
             };
+            // `dwim_branch_start()` then DWIMs the same name, and more than one
+            // match is fatal — checked before `lookup_commit_reference()`:
+            //
+            // ```c
+            // switch (repo_dwim_ref(r, start_name, strlen(start_name), &oid, &real_ref, 0)) {
+            // …
+            // default:
+            //         die(_("ambiguous object name: '%s'"), start_name);
+            // }
+            // ```
+            if super::rev_parse::dwim_ref_matches(repo, s).len() > 1 {
+                return fatal(format!("ambiguous object name: '{s}'"));
+            }
             let found = crate::objname::lookup_commit_reference(repo, id);
             let crate::objname::CommitRef::Commit(commit) = found else {
                 // `object_as_type()` has already complained about a present

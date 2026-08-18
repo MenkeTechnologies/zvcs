@@ -1350,8 +1350,9 @@ fn add_rev_token(
         // so the warning set belongs to the token, not to the endpoint
         // resolutions below, which stop at the first absent object and would
         // leave the right endpoint unwarned.
-        let _quiet = warn_range_once(repo, tok);
-        let (lc, rc) = (commit_of(repo, l).ok_or(None)?, commit_of(repo, r).ok_or(None)?);
+        warn_range_once(repo, tok);
+        let (lc, rc) =
+            (commit_of_quiet(repo, l).ok_or(None)?, commit_of_quiet(repo, r).ok_or(None)?);
         // `handle_dotdot_1` (revision.c:2087-2107): the merge bases go in under
         // `flags_exclude` (`flags ^ (UNINTERESTING | BOTTOM)`) and both endpoints
         // under `flags`, in that order — so plain `A...B` is
@@ -1373,9 +1374,9 @@ fn add_rev_token(
     if let Some((l, r)) = tok.split_once("..") {
         // `b_flags = flags; a_flags = flags_exclude` (revision.c:2083-2086).
         let (l, r) = (default_head(l), default_head(r));
-        let _quiet = warn_range_once(repo, tok);
-        let lc = commit_of(repo, l).ok_or(None)?;
-        let rc = commit_of(repo, r).ok_or(None)?;
+        warn_range_once(repo, tok);
+        let lc = commit_of_quiet(repo, l).ok_or(None)?;
+        let rc = commit_of_quiet(repo, r).ok_or(None)?;
         sel.args
             .push(CmdArg::Rev(pending(repo, l, l, lc, !negated)));
         sel.args
@@ -1412,12 +1413,13 @@ fn add_rev_token(
 /// short-circuit — a left endpoint that does not resolve *at all* still stops
 /// the right one.
 ///
-/// The returned guard must be held for as long as the endpoint resolutions run;
-/// dropping it early puts the warning back on and doubles the count.
-#[must_use = "the guard silences the endpoint resolutions and must outlive them"]
-fn warn_range_once(repo: &gix::Repository, tok: &str) -> crate::objname::AmbiguityWarnings {
+/// The endpoint resolutions that follow must therefore be quiet — see
+/// [`commit_of_quiet`]. `AmbiguityWarnings` cannot do that job: its switch is
+/// `warn_on_object_refname_ambiguity`, which git reads only in
+/// `get_oid_basic()`'s full-hex branch, so it leaves the plain-name warning on
+/// and the count doubles for `fast-export dup..main`.
+fn warn_range_once(repo: &gix::Repository, tok: &str) {
     crate::objname::warn_dotdot_endpoints(repo, tok);
-    crate::objname::AmbiguityWarnings::off()
 }
 
 /// Build one [`Pending`], dwimming the name git's `add_rev_cmdline` records.
@@ -1905,6 +1907,13 @@ fn rewrite_one(mut id: ObjectId, simpl: &HashMap<ObjectId, Simpl>) -> Option<Obj
 /// which is what `get_reference()`'s `bad object` diagnostic reports on.
 fn commit_of(repo: &gix::Repository, spec: &str) -> Option<ObjectId> {
     let id = crate::objname::resolve(repo, spec)?;
+    Some(repo.find_object(id).ok()?.peel_to_commit().ok()?.id)
+}
+
+/// [`commit_of`] for a range endpoint, which [`warn_range_once`] has already
+/// warned about as part of the token — git resolves each endpoint once.
+fn commit_of_quiet(repo: &gix::Repository, spec: &str) -> Option<ObjectId> {
+    let id = crate::objname::resolve_quiet(repo, spec)?;
     Some(repo.find_object(id).ok()?.peel_to_commit().ok()?.id)
 }
 

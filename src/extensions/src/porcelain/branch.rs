@@ -2324,6 +2324,56 @@ fn unset_upstream(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
 /// `branch.autoSetupRebase`, `.rebase`) into the local config, then print git's
 /// `set up to track` notice on stdout unless `--quiet`. Called with the repo lock
 /// held.
+/// The tracking half of the child `git branch <new> <start>` that `worktree add`
+/// spawns (`builtin/worktree.c:930-949`), which is where its `--[no-]track` ends
+/// up: the option is an `OPT_PASSTHRU` pushed onto that child's command line
+/// verbatim, so the mode's meaning, `branch.autoSetupMerge`/`autoSetupRebase`,
+/// the "starting point is not a branch" refusal and the
+/// `branch '<n>' set up to track '<u>'.` line all have to be this module's rather
+/// than a second copy that drifts from it.
+///
+/// `track` is the bare distinction `worktree add` can express: `Some(true)` for
+/// `--track`, `Some(false)` for `--no-track`, and `None` when neither was given —
+/// which is not "do nothing" but [`Track::Unset`], the state in which
+/// `branch.autoSetupMerge` decides. That case is the reason this runs
+/// unconditionally: the child is `git branch <new> <start>` whether or not a
+/// passthru was appended, so `autoSetupMerge = always` sets an upstream for a
+/// plain `worktree add -b`.
+///
+/// `worktree add` cannot say `direct`/`inherit` explicitly: its option carries
+/// `PARSE_OPT_NOARG`, so `--track=<anything>` is a parse-options error before this
+/// is ever reached.
+///
+/// Returns `Some(code)` when git would fail, which it does *before* writing the
+/// ref — hence a decision made here rather than after `create_branch`.
+pub(crate) fn worktree_tracking(
+    repo: &gix::Repository,
+    new_branch: &str,
+    start_ref: Option<&BStr>,
+    start_name: &str,
+    track: Option<bool>,
+    quiet: bool,
+) -> Result<Option<ExitCode>> {
+    let track = match track {
+        Some(true) => Track::Direct,
+        Some(false) => Track::No,
+        None => Track::Unset,
+    };
+    if let Some(code) = ambiguous_tracking(repo, start_ref, track)? {
+        return Ok(Some(code));
+    }
+    let upstream = tracking_upstream(repo, start_ref, track, new_branch);
+    if track == Track::Direct && upstream.is_none() {
+        return Ok(Some(fatal(format!(
+            "cannot set up tracking information; starting point '{start_name}' is not a branch"
+        ))?));
+    }
+    if let Some(up) = upstream {
+        install_tracking(repo, new_branch, &up, quiet)?;
+    }
+    Ok(None)
+}
+
 fn install_tracking(
     repo: &gix::Repository,
     branch: &str,

@@ -60,8 +60,25 @@ use gix::refs::FullName;
 /// last component when no `<commit-ish>` is given. The messages keep git's
 /// streams: `Preparing worktree (…)` on stderr before the branch-in-use check,
 /// `HEAD is now at …` on stdout from the checkout — so `--no-checkout` prints
-/// only the first. `--track`, `--guess-remote`, `--orphan` and `--relative-paths`
-/// are refused rather than approximated.
+/// only the first.
+///
+/// `--track` / `--no-track` are the `OPT_PASSTHRU` git hands to the child
+/// `git branch` (worktree.c:819-821, 946-947), so they are forwarded to
+/// [`super::branch::worktree_tracking`] rather than reimplemented: `--track`
+/// writes `branch.<n>.remote`/`.merge` and prints
+/// `branch '<n>' set up to track '<u>'.` on stdout, `--no-track` suppresses the
+/// auto-tracking `branch.autoSetupMerge` would otherwise do. The option carries
+/// `PARSE_OPT_NOARG`, so `--track=direct` is `error: option \`track' takes no
+/// value` and exit 129, not a mode selector. With nothing to create the passthru
+/// has no child to reach, which is `--[no-]track can only be used if a new branch
+/// is created` (128) — after the `Preparing worktree` line, and not for the DWIM
+/// branch named after the path, which *is* a new branch.
+///
+/// `--guess-remote` and `--relative-paths` are refused rather than approximated.
+/// `--orphan` is too, but its check against `--track` comes first
+/// (worktree.c:839-841), so the combination reports
+/// `options '--orphan' and '--track' cannot be used together` — naming `--track`
+/// whichever spelling was given — before the floor is reached.
 ///
 /// git creates the `-b` branch by running `git branch` in the new worktree, so
 /// an option-shaped name is refused by that child rather than by `worktree`
@@ -1700,6 +1717,9 @@ fn add(args: &[String]) -> Result<ExitCode> {
     let mut quiet = false;
     let mut lock_it = false;
     let mut lock_reason: Option<String> = None;
+    // `--track` / `--no-track`; `None` when neither was given.
+    let mut opt_track: Option<bool> = None;
+    let mut orphan = false;
     let mut positional: Vec<&str> = Vec::new();
 
     let mut i = 0;
@@ -1732,11 +1752,26 @@ fn add(args: &[String]) -> Result<ExitCode> {
                 lock_reason = Some(v.clone());
                 i += 1;
             }
-            // Refused rather than approximated: each needs behaviour this port
-            // does not have — remote-tracking DWIM for the first two, and an
-            // unborn HEAD with an empty index for the third.
-            "--track" | "--no-track" | "--guess-remote" | "--no-guess-remote" | "--orphan"
-            | "--relative-paths" | "--no-relative-paths" => {
+            // `OPT_PASSTHRU(0, "track", …, PARSE_OPT_NOARG | PARSE_OPT_OPTARG)`
+            // (worktree.c:819-821): the spelling is captured and pushed onto the
+            // child `git branch`'s command line verbatim. `NOARG` is what makes
+            // `--track=direct` an error rather than a mode selector, so only the
+            // two bare forms reach the child.
+            "--track" => opt_track = Some(true),
+            "--no-track" => opt_track = Some(false),
+            s if s.starts_with("--track=") => {
+                // parse-options answers this one itself, with no usage block.
+                eprintln!("error: option `track' takes no value");
+                return Ok(ExitCode::from(129));
+            }
+            // Deferred rather than refused here: git checks `--orphan` against
+            // `--track` first (worktree.c:839-841) and reports the *combination*,
+            // so the refusal for `--orphan` alone has to wait until both are known.
+            "--orphan" => orphan = true,
+            // Refused rather than approximated: both need remote-tracking DWIM
+            // this port does not have.
+            "--guess-remote" | "--no-guess-remote" | "--relative-paths"
+            | "--no-relative-paths" => {
                 bail!("`worktree add {a}` is not ported")
             }
             // Named as parse-options names it: a long one keeps whatever
@@ -1748,6 +1783,19 @@ fn add(args: &[String]) -> Result<ExitCode> {
             s => positional.push(s),
         }
         i += 1;
+    }
+
+    // worktree.c:839-841, ahead of every other check and of the `Preparing
+    // worktree` line: the combination is reported even when `--no-track` was the
+    // spelling given, because the message names the option, not the mode.
+    if orphan && opt_track.is_some() {
+        eprintln!("fatal: options '--orphan' and '--track' cannot be used together");
+        return Ok(ExitCode::from(128));
+    }
+    // `--orphan` on its own is still a floor: it needs an unborn HEAD over an
+    // empty index, which this port does not build.
+    if orphan {
+        bail!("`worktree add --orphan` is not ported")
     }
 
     let Some(path_arg) = positional.first().copied() else {
@@ -1809,6 +1857,16 @@ fn add(args: &[String]) -> Result<ExitCode> {
 
     if !quiet {
         eprintln!("Preparing worktree ({})", start.preparing(&repo));
+    }
+
+    // worktree.c:951-952. The `--[no-]track` passthru only means anything to the
+    // child `git branch`, so with no branch to create there is nothing to hand it
+    // to. This sits *after* the `Preparing worktree` line, which is where stock
+    // prints it — the DWIM branch named after the path counts as a new branch, so
+    // this fires only when a `<commit-ish>` named an existing branch or a commit.
+    if opt_track.is_some() && !matches!(start, Start::NewBranch { .. }) {
+        eprintln!("fatal: --[no-]track can only be used if a new branch is created");
+        return Ok(ExitCode::from(128));
     }
 
     // The `-b` branch is created by a child `git branch <name> <commit>`, so an
@@ -1905,6 +1963,41 @@ fn add(args: &[String]) -> Result<ExitCode> {
     // `-b`/`-B` creates the branch before `HEAD` can name it.
     if let Start::NewBranch { name, oid, force, from } = &start {
         create_branch(&repo, name, *oid, *force, from)?;
+        // The child `git branch <new> <start> [<opt_track>]` sets the upstream after
+        // it writes the ref, and its `branch '<n>' set up to track '<u>'.` lands on
+        // stdout between the `Preparing worktree` line and the checkout's
+        // `HEAD is now at …`. `super::branch` owns the decision so this cannot
+        // drift from `git branch`'s own.
+        //
+        // Unconditional, not gated on `opt_track`: with no passthru the child still
+        // runs, and `branch.autoSetupMerge = always` makes it track the start point.
+        // Skipping this when no flag was given left `worktree add -b` under that
+        // config with no upstream where git writes one.
+        {
+            let track = opt_track;
+            let short = name.as_bstr().to_str_lossy().trim_start_matches("refs/heads/").to_string();
+            // The start point as a ref, which is what tracking is derived from:
+            // `HEAD` resolves through the symref, anything else has to name a ref
+            // for there to be an upstream at all.
+            let start_ref: Option<gix::bstr::BString> = if from == "HEAD" {
+                repo.head_name()?.map(|n| n.as_bstr().to_owned())
+            } else {
+                repo.try_find_reference(from.as_str())
+                    .ok()
+                    .flatten()
+                    .map(|r| r.name().as_bstr().to_owned())
+            };
+            if let Some(code) = super::branch::worktree_tracking(
+                &repo,
+                &short,
+                start_ref.as_ref().map(|b| b.as_ref()),
+                from,
+                track,
+                quiet,
+            )? {
+                return Ok(code);
+            }
+        }
     }
     let head_line = match &start {
         Start::Branch(name, _) => format!("ref: {}\n", name.as_bstr().to_str_lossy()),

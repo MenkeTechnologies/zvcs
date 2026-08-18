@@ -891,7 +891,6 @@ pub(super) fn blame_with(args: &[String], cmd: &str) -> Result<ExitCode> {
             err.flush()?;
             return Ok(ExitCode::from(128));
         }
-        Err(LineSpecError::Unimplementable(what)) => crate::git_fatal!("blame: {what} is not yet ported"),
     }
 
     // Blame the full file; `-L` is applied to the result so that the working-tree
@@ -5220,8 +5219,6 @@ enum LineSpecError {
     Usage,
     /// git dies with this message and exit 128.
     Fatal(String),
-    /// The form is real but unported; refuse rather than answer wrongly.
-    Unimplementable(&'static str),
 }
 
 /// `builtin/blame.c:1202-1223` — resolve every `-L` argument against the final
@@ -5620,7 +5617,6 @@ mod tests {
         match ranges(specs) {
             Err(LineSpecError::Fatal(msg)) => msg,
             Err(LineSpecError::Usage) => panic!("expected a fatal, got a usage error"),
-            Err(LineSpecError::Unimplementable(w)) => panic!("expected a fatal, got {w}"),
             Ok(r) => panic!("expected a fatal, got {r:?}"),
         }
     }

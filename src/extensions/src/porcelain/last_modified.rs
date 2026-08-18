@@ -24,10 +24,13 @@
 //!   * `<revision-range>` forms (`A..B`, `^X`, `--not`, `--all`, `-n`): they
 //!     drive git's `not_queue`/boundary logic and the `^`-prefixed output
 //!   * pathspec magic (`:(...)`) and wildcards
-//!   * repositories carrying a commit-graph: git orders its walk by
-//!     commit-graph generation numbers (corrected commit dates with GDAT),
-//!     which the vendored `gix-commitgraph` does not expose, so the emission
-//!     order could not be guaranteed to match
+//!   * a repository carrying a commit-graph, *once the walk reaches a point where
+//!     the commit queue holds more than one candidate*: git then orders by the
+//!     graph's generation numbers — corrected commit dates whenever the file has a
+//!     `GDAT` chunk — and the vendored `gix-commitgraph` does not parse that chunk.
+//!     A linear walk is unaffected, since the comparator never gets a choice to
+//!     make, so an ordinary `git commit-graph write` or `gc` no longer takes the
+//!     verb out of service
 
 use anyhow::Result;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -205,9 +208,14 @@ pub fn last_modified(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::from(129));
     }
 
-    if repo.commit_graph_if_enabled()?.is_some() {
-        anyhow::bail!("unsupported: repository has a commit-graph; walk order would not match git");
-    }
+    // `struct prio_queue queue = { compare_commits_by_gen_then_commit_date }`
+    // (builtin/last-modified.c:347). That comparator (commit.c:909) sorts by
+    // `commit_graph_generation()` first and only falls back to the commit date when the
+    // two generations are equal — and with no commit-graph *every* generation is
+    // `GENERATION_NUMBER_INFINITY` (commit-graph.c:134), so the fallback is the whole
+    // comparator. With one, the numbers are real and the order can differ; the walk
+    // below detects that case rather than refusing outright. See [`QItem`].
+    let has_commit_graph = repo.commit_graph_if_enabled()?.is_some();
 
     let mut pathspecs: Vec<BString> = Vec::new();
     let prefix = cwd_prefix(&repo)?;
@@ -285,6 +293,19 @@ pub fn last_modified(args: &[String]) -> Result<ExitCode> {
     ctr += 1;
 
     while let Some(q) = heap.pop() {
+        // The generation numbers are only *consulted* when the queue holds a choice.
+        // While it holds one commit at a time the comparator cannot change anything, so
+        // a repository with a commit-graph — which `git commit-graph write` and `gc`
+        // produce routinely — is walked exactly like one without. The moment a second
+        // commit is queued alongside, the pop order depends on numbers this port cannot
+        // read, and emitting a plausible-looking order would be worse than refusing.
+        if has_commit_graph && !heap.is_empty() {
+            anyhow::bail!(
+                "unsupported: repository has a commit-graph and the walk reached a merge; \
+                 git orders the queue by corrected commit date, which gix-commitgraph \
+                 does not read (no GDAT chunk support)"
+            );
+        }
         let c = q.id;
         let mut active_c = active.remove(&c).unwrap_or_else(|| vec![false; n]);
         let commit = repo.find_commit(c)?;
@@ -366,9 +387,24 @@ fn cwd_prefix(repo: &gix::Repository) -> Result<Vec<u8>> {
 }
 
 /// One entry of the commit priority queue. `Ord` reproduces
-/// `compare_commits_by_gen_then_commit_date` (newest first) with `prio_queue`'s
-/// FIFO tie-break on the insertion counter. Generation numbers are omitted
-/// because a commit-graph is rejected up front, making them all infinite.
+/// `compare_commits_by_gen_then_commit_date` (commit.c:909, newest first) with
+/// `prio_queue`'s FIFO tie-break on the insertion counter.
+///
+/// The generation column is missing, which is exact for a repository with no
+/// commit-graph: `commit_graph_generation()` (commit-graph.c:126) then returns
+/// `GENERATION_NUMBER_INFINITY` for every commit, the first two comparisons tie, and the
+/// date decides. With a commit-graph the number is the *corrected commit date* whenever
+/// the file carries a `GDAT` chunk, which every graph git has written since 2.30 does —
+/// and `gix-commitgraph` parses `OIDF`, `OIDL`, `CDAT`, `EDGE`, `BASE`, `BIDX` and
+/// `BDAT` but not `GDAT` (`gix-commitgraph/src/file/mod.rs:19-27`), so the value git
+/// would sort by is unavailable. `File::generation()` exposes only the topological level
+/// out of the upper bits of `CDAT`, which is a different number.
+///
+/// Measured against git 2.55.0 on a history whose two merge parents order differently
+/// under the two rules (a parent with a large-dated ancestor, so its corrected date far
+/// exceeds its own), `git last-modified` emits `x, y, a` before `git commit-graph write
+/// --reachable` and `y, a, x` after — so the difference is observable, not theoretical.
+/// The walk therefore refuses the moment the queue actually holds a choice.
 #[derive(PartialEq, Eq)]
 struct QItem {
     date: i64,

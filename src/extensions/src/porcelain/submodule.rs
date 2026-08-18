@@ -82,12 +82,18 @@ const SUBCOMMANDS: &[&str] = &[
 ///     `Submodule '<name>' (<url>) registered for path '<path>'` per newly
 ///     registered url.
 ///
-///   * `git submodule [--quiet] summary [--cached|--files] [--summary-limit <n>]
-///     [<commit>] [--] [<path>...]`
+///   * `git submodule [--quiet] summary [--cached|--files] [--for-status]
+///     [--summary-limit <n>] [<commit>] [--] [<path>...]`
 ///     The gitlink half of `git diff-index`/`git diff-files`, rendered as
 ///     `* <displaypath> <src>...<dst> (<n>):` followed by one `  > <subject>` or
 ///     `  < <subject>` line per commit in the first-parent symmetric difference
-///     and a blank line. Like git, an unpopulated submodule contributes nothing.
+///     and a blank line. A path that is a gitlink on only one side is a
+///     typechange row — `<src>(blob)-><dst>(submodule)` and its mirror — and a
+///     commit the submodule does not have replaces the log with
+///     `  Warn: <path> doesn't contain commit <oid>`. `--for-status` (what
+///     `git status` passes) drops submodules whose `ignore` is `all`. Like git,
+///     an unpopulated submodule contributes nothing unless its row is a removal
+///     or a typechange.
 ///
 ///   * `git submodule [--quiet] foreach [--recursive] <command>`
 ///     Runs `<command>` through `sh` inside each populated submodule with
@@ -169,9 +175,11 @@ const SUBCOMMANDS: &[&str] = &[
 /// built exactly like git's `get_name()` under `--all` (full ref names minus
 /// `refs/`), which the `gix` convenience selector does not produce as it
 /// shortens names instead. Stage 3 is `git name-rev`, a distinct algorithm that
-/// is not part of the vendored crates, so when stages 1 and 2 find nothing
-/// while the submodule does hold tags, this bails rather than skipping ahead to
-/// stage 4 and printing a name git would not have printed.
+/// is not part of the vendored crates; it names a commit relative to a tag that
+/// reaches it, so when no tag does, stage 3 fails for git too and falling
+/// through to stage 4 is what git itself does. Only when a tag *does* reach the
+/// commit while stages 1 and 2 found nothing does this bail, rather than print a
+/// name git would not have printed.
 ///
 /// `-h` as the very first argument is `git-sh-setup`'s, not the script's: the
 /// usage block goes to **stdout** and the exit status is 0, unlike every parse
@@ -622,16 +630,38 @@ fn init_repo(repo: &gix::Repository, patterns: &[BString], quiet: bool) -> Resul
 
 // --------------------------------------------------------------- summary ----
 
-/// One gitlink row of the diff `git submodule summary` renders, with `None`
-/// standing for "this side has no gitlink at that path".
+/// `S_IFGITLINK`: the mode git records for a submodule entry.
+const GITLINK: u32 = 0o160000;
+/// `S_IFMT`: the file-type bits `diff_change()` compares to decide a typechange.
+const S_IFMT: u32 = 0o170000;
+
+/// One row of the diff `git submodule summary` renders — git's `struct
+/// module_cb`, which `submodule_summary_callback` fills from every
+/// `diff_filepair` carrying a gitlink on **either** side, so a submodule that
+/// became a file (or a file that became a submodule) is a row too.
 struct Change {
     path: BString,
-    src: Option<ObjectId>,
-    dst: Option<ObjectId>,
+    mod_src: u32,
+    oid_src: ObjectId,
+    mod_dst: u32,
+    oid_dst: ObjectId,
+    /// The diff status letter `submodule_summary_callback` copies out of the
+    /// filepair: `A`, `D`, `T` or `M`.
+    status: char,
+}
+
+impl Change {
+    fn src_is_gitlink(&self) -> bool {
+        self.mod_src == GITLINK
+    }
+    fn dst_is_gitlink(&self) -> bool {
+        self.mod_dst == GITLINK
+    }
 }
 
 fn summary(args: &[String], mut cached: bool) -> Result<ExitCode> {
     let mut files = false;
+    let mut for_status = false;
     // git's `summary_limit` defaults to -1, meaning "no limit"; 0 means
     // "print nothing at all" and short-circuits before any diff is computed.
     let mut limit: i64 = -1;
@@ -649,22 +679,32 @@ fn summary(args: &[String], mut cached: bool) -> Result<ExitCode> {
             "--" => no_more_opts = true,
             "--cached" => cached = true,
             "--files" => files = true,
-            // `--for-status` only changes the header `git status` prints around
-            // this output, never the rows themselves.
-            "--for-status" => {}
-            "-q" | "--quiet" => {}
-            "-n" | "--summary-limit" => match args.get(i).and_then(|v| v.parse::<i64>().ok()) {
-                Some(v) => {
-                    limit = v;
+            // `--for-status` drops every submodule whose `ignore` setting is
+            // `all` — the option `git status` passes, and the only reason its
+            // submodule sections can be shorter than `git submodule summary`'s.
+            "--for-status" => for_status = true,
+            // No `-q`/`--quiet` arm: `--quiet` is the *wrapper's* flag, so
+            // `git submodule --quiet summary` is fine while
+            // `git submodule summary --quiet` is the usage block and exit 1.
+            // `cmd_summary` only rejects an *empty* `-n` value itself; anything
+            // else is forwarded as `--summary-limit=<value>`, so the value
+            // grammar and its diagnostic are the helper's `OPT_INTEGER`.
+            "-n" | "--summary-limit" => match args.get(i) {
+                Some(v) if !v.is_empty() => {
+                    limit = parse_summary_limit(&crate::optint::long_opt("summary-limit"), v)?;
                     i += 1;
                 }
-                None => return usage_exit(),
+                _ => return usage_exit(),
             },
+            // `OPT_INTEGER`'s short form takes its value glued on: `-n5`.
+            s if s.starts_with("-n") && s.len() > 2 => {
+                limit = parse_summary_limit(&crate::optint::short_opt('n'), &s[2..])?;
+            }
             s if s.starts_with("--summary-limit=") => {
-                match s["--summary-limit=".len()..].parse::<i64>() {
-                    Ok(v) => limit = v,
-                    Err(_) => return usage_exit(),
-                }
+                limit = parse_summary_limit(
+                    &crate::optint::long_opt("summary-limit"),
+                    &s["--summary-limit=".len()..],
+                )?;
             }
             s if s.starts_with('-') && s.len() > 1 => return usage_exit(),
             // `PARSE_OPT_STOP_AT_NON_OPTION`: the first operand (the `[commit]`
@@ -689,19 +729,21 @@ fn summary(args: &[String], mut cached: bool) -> Result<ExitCode> {
     let repo = gix::discover(".")?;
     let index = repo.open_index()?;
 
-    // The first leftover argument is the base revision when it resolves to one,
-    // and a pathspec otherwise — git's `repo_get_oid(argv[0])` fallthrough.
+    // `module_summary()` resolves the `[commit]` slot before it looks at
+    // `--files`, so a leading revision is consumed either way — `--files` then
+    // diffs the index against the work tree and never uses it.
     let mut rev: Option<ObjectId> = None;
-    if !files {
-        if let Some(first) = rest.first() {
-            if let Some(id) = resolve_commit(&repo, first.as_str()) {
-                rev = Some(id);
-                rest.remove(0);
-            }
+    if let Some(first) = rest.first() {
+        if let Some(id) = resolve_commit(&repo, first.as_str()) {
+            rev = Some(id);
+            rest.remove(0);
+        } else if first == "HEAD" {
+            // "before the first commit: compare with an empty tree"
+            rest.remove(0);
         }
-        if rev.is_none() {
-            rev = repo.head_id().ok().map(|id| id.detach());
-        }
+    }
+    if rev.is_none() {
+        rev = repo.head_id().ok().map(|id| id.detach());
     }
 
     let patterns: Vec<BString> = rest.iter().map(|s| BString::from(s.as_str())).collect();
@@ -712,23 +754,101 @@ fn summary(args: &[String], mut cached: bool) -> Result<ExitCode> {
 
     let prefix = repo_prefix(&repo)?;
     let workdir = repo.workdir().map(ToOwned::to_owned);
+    let submodules = submodules(&repo)?;
     let stdout = std::io::stdout();
     let mut out = std::io::BufWriter::new(stdout.lock());
 
+    // `prepare_submodule_summary()`: a removal or a typechange is always
+    // rendered, everything else only when the submodule is checked out.
     for change in &changes {
+        let sm_dir = workdir
+            .as_ref()
+            .map(|wd| wd.join(&*gix::path::from_bstr(change.path.as_bstr())));
+        if change.status != 'D' && change.status != 'T' {
+            if for_status && change.status != 'A' && ignores_all(&repo, &submodules, &change.path) {
+                continue;
+            }
+            match &sm_dir {
+                Some(dir) if is_nonbare_repository_dir(dir) => {}
+                _ => continue,
+            }
+        }
+        let sub_repo = sm_dir.as_ref().and_then(|dir| gix::open(dir).ok());
+        report_chdir_failures(&mut out, sm_dir.as_deref(), change)?;
         let display = display_path(change.path.as_bstr(), prefix.as_ref());
-        let sub_repo = match workdir.as_ref() {
-            Some(wd) => gix::open(wd.join(&*gix::path::from_bstr(change.path.as_bstr()))).ok(),
-            None => None,
-        };
-        // git renders nothing for a submodule it cannot walk: an unpopulated
-        // worktree contributes no rows to the summary at all.
-        let Some(sub_repo) = sub_repo else { continue };
-        print_summary(&mut out, &sub_repo, change, &display, limit)?;
+        print_summary(&mut out, sub_repo.as_ref(), change, &display, limit)?;
     }
 
     out.flush()?;
     Ok(ExitCode::SUCCESS)
+}
+
+/// `git submodule--helper summary`'s `OPT_INTEGER(-n, summary-limit)`: the
+/// base-0 grammar with a `k`/`m`/`g` unit. A value outside it is
+/// `error: <optname> expects an integer value with an optional k/m/g suffix`
+/// on stderr and exit 129 — parse-options prints no usage block for this one.
+fn parse_summary_limit(name: &crate::optint::OptName, value: &str) -> Result<i64> {
+    match crate::optint::integer(name, value) {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            eprintln!("error: {e}");
+            Err(crate::fatal::Silent(129).into())
+        }
+    }
+}
+
+/// `prepare_submodule_summary()`'s `--for-status` filter: the submodule at
+/// `path` has `ignore = all`, from the superproject config if it sets the key
+/// and from `.gitmodules` otherwise.
+fn ignores_all(repo: &gix::Repository, submodules: &[gix::Submodule<'_>], path: &BString) -> bool {
+    let Some(sub) = find_submodule(submodules, path) else {
+        // No `.gitmodules` entry: `submodule_from_path()` returns NULL and the
+        // filter never runs, so the row survives.
+        return false;
+    };
+    let key = format!("submodule.{}.ignore", sub.name());
+    match repo.config_snapshot().string(key.as_str()) {
+        Some(v) => v.as_bstr() == "all",
+        None => matches!(sub.ignore(), Ok(Some(gix::submodule::config::Ignore::All))),
+    }
+}
+
+/// `verify_submodule_committish()` spawns `git rev-parse` with `cp.dir` set to
+/// the submodule path, once per gitlink side. When a typechange has replaced the
+/// submodule with a file, that child cannot `chdir` into it and says so itself
+/// (`child_err_spew()`, run-command.c:387-390) — one line per attempted spawn.
+/// `start_command()` flushes every stream before forking, so the line lands
+/// among the rows already written rather than after all of them.
+fn report_chdir_failures(
+    out: &mut impl Write,
+    sm_dir: Option<&std::path::Path>,
+    change: &Change,
+) -> Result<()> {
+    let Some(dir) = sm_dir else { return Ok(()) };
+    let Err(err) = std::fs::read_dir(dir) else {
+        return Ok(());
+    };
+    // A removal skips the source lookup, so it spawns nothing for that side.
+    let attempts = usize::from(change.src_is_gitlink() && change.status != 'D')
+        + usize::from(change.dst_is_gitlink());
+    if attempts == 0 {
+        return Ok(());
+    }
+    out.flush()?;
+    for _ in 0..attempts {
+        eprintln!(
+            "fatal: exec 'rev-parse': cd to '{}' failed: {}",
+            change.path.to_str_lossy(),
+            strerror(&err)
+        );
+    }
+    Ok(())
+}
+
+/// `is_nonbare_repository_dir()` (setup.c:455-470): `<path>/.git` is a gitfile
+/// or a git directory in its own right.
+fn is_nonbare_repository_dir(path: &std::path::Path) -> bool {
+    path.join(".git").exists() && gix::open(path).is_ok()
 }
 
 /// `git rev-parse --verify <spec>^{commit}`, reduced to "did it name a commit".
@@ -739,7 +859,8 @@ fn resolve_commit(repo: &gix::Repository, spec: &str) -> Option<ObjectId> {
 }
 
 /// The gitlink rows of `git diff-index [--cached] <rev>` (or `git diff-files`
-/// under `--files`), restricted to paths that differ between the two sides.
+/// under `--files`), both run with `--ignore-submodules=dirty` so a submodule
+/// that merely has local edits is not a row.
 fn summary_changes(
     repo: &gix::Repository,
     index: &gix::index::State,
@@ -748,36 +869,17 @@ fn summary_changes(
     cached: bool,
     patterns: &[BString],
 ) -> Result<Vec<Change>> {
-    // Left side: the index under `--files`, the revision's tree otherwise.
-    let mut src: HashMap<BString, ObjectId> = HashMap::new();
-    if files {
-        gitlinks_of_index(index, &mut src);
-    } else if let Some(rev) = rev {
-        gitlinks_of_tree(repo, rev, &mut src)?;
-    }
+    let null = ObjectId::null(repo.object_hash());
+    // Only paths that are a gitlink on one of the two recorded sides can reach
+    // the callback, so they are the whole candidate set — and looking each one
+    // up individually keeps a large tree or index off the heap.
+    let tree_links = match (files, rev) {
+        (false, Some(rev)) => gitlinks_of_tree(repo, rev)?,
+        _ => HashMap::new(),
+    };
+    let index_links = gitlinks_of_index(index);
 
-    // Right side: the index when comparing against it, else the worktree, where
-    // a gitlink's content is the submodule's own HEAD.
-    let mut dst: HashMap<BString, ObjectId> = HashMap::new();
-    gitlinks_of_index(index, &mut dst);
-    if files || !cached {
-        let workdir = repo.workdir().map(ToOwned::to_owned);
-        if let Some(wd) = workdir {
-            for (path, oid) in dst.iter_mut() {
-                let sm = wd.join(&*gix::path::from_bstr(path.as_bstr()));
-                // Detach inside the closure: `head_id` borrows the repository,
-                // which is owned by the closure and dropped on return.
-                if let Some(head) = gix::open(sm)
-                    .ok()
-                    .and_then(|r| r.head_id().ok().map(|id| id.detach()))
-                {
-                    *oid = head;
-                }
-            }
-        }
-    }
-
-    let mut paths: Vec<BString> = src.keys().chain(dst.keys()).cloned().collect();
+    let mut paths: Vec<BString> = tree_links.keys().chain(index_links.keys()).cloned().collect();
     paths.sort();
     paths.dedup();
 
@@ -791,118 +893,304 @@ fn summary_changes(
 
     let mut changes = Vec::new();
     for path in paths {
-        let (s, d) = (src.get(&path).copied(), dst.get(&path).copied());
-        if s == d {
-            continue;
-        }
         if !patterns.is_empty() && !ps.is_included(path.as_bstr(), Some(false)) {
             continue;
         }
+        // `--files` diffs the index against the work tree; otherwise the left
+        // side is the named commit's tree.
+        let src = if files {
+            entry_of_index(index, &path)
+        } else {
+            match rev {
+                Some(rev) => entry_of_tree(repo, rev, &path),
+                None => None,
+            }
+        };
+        let dst = if cached {
+            entry_of_index(index, &path)
+        } else {
+            worktree_entry(repo, index, &path)
+        };
+        let (mod_src, oid_src) = src.unwrap_or((0, null));
+        let (mod_dst, oid_dst) = dst.unwrap_or((0, null));
+        // `diff-index` without `--cached` asks two questions — does the index
+        // differ from the tree, and is the entry stat-dirty against the work
+        // tree — and reports the path if either says yes. So a submodule whose
+        // index entry was moved to a commit its checkout does not have is a row
+        // even though the tree and the checkout agree, which is where its
+        // `<src>...<dst> (0)` shape comes from.
+        let changed = if files || cached {
+            (mod_src, oid_src) != (mod_dst, oid_dst)
+        } else {
+            let idx = entry_of_index(index, &path).unwrap_or((0, null));
+            (mod_src, oid_src) != idx || idx != (mod_dst, oid_dst)
+        };
+        if !changed {
+            continue;
+        }
+        let status = if mod_src == 0 {
+            'A'
+        } else if mod_dst == 0 {
+            'D'
+        } else if mod_src & S_IFMT != mod_dst & S_IFMT {
+            'T'
+        } else {
+            'M'
+        };
         changes.push(Change {
             path,
-            src: s,
-            dst: d,
+            mod_src,
+            oid_src,
+            mod_dst,
+            oid_dst,
+            status,
         });
     }
     Ok(changes)
 }
 
 /// Every stage-0 gitlink of the index, keyed by path.
-fn gitlinks_of_index(index: &gix::index::State, into: &mut HashMap<BString, ObjectId>) {
+fn gitlinks_of_index(index: &gix::index::State) -> HashMap<BString, ObjectId> {
+    let mut out = HashMap::new();
     for entry in index.entries() {
         if entry.mode == gix::index::entry::Mode::COMMIT && entry.stage_raw() == 0 {
-            into.insert(entry.path(index).to_owned(), entry.id);
+            out.insert(entry.path(index).to_owned(), entry.id);
         }
     }
+    out
 }
 
 /// Every gitlink reachable from the commit `rev`, keyed by its full path.
-fn gitlinks_of_tree(
-    repo: &gix::Repository,
-    rev: &ObjectId,
-    into: &mut HashMap<BString, ObjectId>,
-) -> Result<()> {
+fn gitlinks_of_tree(repo: &gix::Repository, rev: &ObjectId) -> Result<HashMap<BString, ObjectId>> {
+    let mut out = HashMap::new();
     let Ok(obj) = repo.find_object(*rev) else {
-        return Ok(());
+        return Ok(out);
     };
     let Ok(commit) = obj.peel_to_commit() else {
-        return Ok(());
+        return Ok(out);
     };
-    let tree = commit.tree()?;
-    for entry in tree.traverse().breadthfirst.files()? {
+    for entry in commit.tree()?.traverse().breadthfirst.files()? {
         if entry.mode.is_commit() {
-            into.insert(entry.filepath, entry.oid);
+            out.insert(entry.filepath, entry.oid);
         }
     }
-    Ok(())
+    Ok(out)
 }
 
-/// git's `print_submodule_summary`: the `* <path> <src>...<dst> (<n>):` header,
-/// the marked one-line log of the first-parent symmetric difference, and the
-/// blank line that separates one submodule from the next.
+/// The stage-0 index entry at `path` as a `(mode, oid)` pair, whatever its type.
+fn entry_of_index(index: &gix::index::State, path: &BString) -> Option<(u32, ObjectId)> {
+    let entry = index.entry_by_path(path.as_bstr())?;
+    Some((entry.mode.bits(), entry.id))
+}
+
+/// The entry at `path` in the tree of commit `rev`, whatever its type.
+fn entry_of_tree(repo: &gix::Repository, rev: &ObjectId, path: &BString) -> Option<(u32, ObjectId)> {
+    let tree = repo.find_object(*rev).ok()?.peel_to_commit().ok()?.tree().ok()?;
+    let entry = tree.lookup_entry_by_path(path.to_str_lossy().as_ref()).ok()??;
+    Some((entry.mode().value() as u32, entry.oid().to_owned()))
+}
+
+/// The work tree's side of the diff at `path`: the mode `lstat()` reports, and
+/// the object id git would record for it — a submodule's own `HEAD`
+/// (`handle_submodule_head_ref`, submodule--helper.c:1027-1031), or the hash of
+/// a file's contents (`index_fd`, submodule--helper.c:1032-1039).
+fn worktree_entry(
+    repo: &gix::Repository,
+    index: &gix::index::State,
+    path: &BString,
+) -> Option<(u32, ObjectId)> {
+    // Both diff commands walk the *index*, so a path it no longer carries is a
+    // deletion however much of it survives on disk — `git rm --cached` on a
+    // submodule leaves the checkout in place and still diffs as removed.
+    entry_of_index(index, path)?;
+    let full = repo.workdir()?.join(&*gix::path::from_bstr(path.as_bstr()));
+    let meta = std::fs::symlink_metadata(&full).ok()?;
+    if meta.is_dir() {
+        // A gitlink's content is the submodule's `HEAD`. When it cannot be read
+        // — an unpopulated or broken checkout — git's `ce_compare_gitlink()`
+        // reports no change, i.e. the index entry stands.
+        let head = gix::open(&full)
+            .ok()
+            .and_then(|r| r.head_id().ok().map(|id| id.detach()));
+        let oid = head.or_else(|| entry_of_index(index, path).map(|(_, id)| id))?;
+        return Some((GITLINK, oid));
+    }
+    let (mode, data) = if meta.is_symlink() {
+        (0o120000, std::fs::read_link(&full).ok()?.into_os_string().into_encoded_bytes())
+    } else {
+        use std::os::unix::fs::PermissionsExt;
+        let exec = meta.permissions().mode() & 0o111 != 0;
+        (
+            if exec { 0o100755 } else { 0o100644 },
+            std::fs::read(&full).ok()?,
+        )
+    };
+    let oid = gix::objs::compute_hash(repo.object_hash(), gix::object::Kind::Blob, &data).ok()?;
+    Some((mode, oid))
+}
+
+/// git's `generate_submodule_summary` + `print_submodule_summary`: the
+/// `* <path> <src>...<dst> (<n>):` header (or the `(blob)->(submodule)` shape a
+/// typechange gets), the `Warn:` line when the submodule does not have one of
+/// the commits, the marked one-line log otherwise, and the blank line that
+/// separates one submodule from the next.
 fn print_summary(
     out: &mut impl Write,
-    sub_repo: &gix::Repository,
+    sub_repo: Option<&gix::Repository>,
     change: &Change,
     display: &str,
     limit: i64,
 ) -> Result<()> {
-    // git renders an absent side as seven zeros regardless of `core.abbrev`, and
-    // drops both the count and the log when the destination is gone entirely.
-    let zeros = "0".repeat(7);
-    let abbrev = |oid: &ObjectId| -> String {
-        match (*oid).attach(sub_repo).shorten() {
-            Ok(prefix) => prefix.to_string(),
-            Err(_) => oid.to_hex_with_len(7).to_string(),
-        }
+    // `xstrndup(oid_to_hex(...), 7)`: the fallback when a side is not a gitlink,
+    // or names a commit the submodule does not have. It is a raw truncation, so
+    // `core.abbrev` never widens it.
+    let short7 = |oid: &ObjectId| oid.to_hex_with_len(7).to_string();
+
+    // `verify_submodule_committish()`: `git rev-parse -q --short <oid>^0` inside
+    // the submodule, which fails when the submodule cannot be opened or does not
+    // have the commit.
+    let verify = |oid: &ObjectId| -> Option<String> {
+        let sub = sub_repo?;
+        sub.find_object(*oid).ok()?.peel_to_commit().ok()?;
+        (*oid).attach(sub).shorten().ok().map(|p| p.to_string())
     };
 
-    match (change.src, change.dst) {
-        // Modified: both sides name a commit.
-        (Some(src), Some(dst)) => {
-            let (left, right) = first_parent_difference(sub_repo, &src, &dst);
-            writeln!(
-                out,
-                "* {display} {}...{} ({}):",
-                abbrev(&src),
-                abbrev(&dst),
-                left.len() + right.len()
-            )?;
-            let mut lines: Vec<(i64, char, String)> = Vec::new();
-            for (ids, mark) in [(&left, '<'), (&right, '>')] {
-                for id in ids {
-                    if let Some((time, subject)) = commit_summary(sub_repo, id) {
-                        lines.push((time, mark, subject));
-                    }
+    let mut missing_src = false;
+    let src_abbrev = if change.src_is_gitlink() {
+        // A removal is not verified: the submodule is gone, so `rev-parse` in it
+        // could only fail.
+        match if change.status == 'D' {
+            None
+        } else {
+            verify(&change.oid_src)
+        } {
+            Some(s) => s,
+            None => {
+                missing_src = true;
+                short7(&change.oid_src)
+            }
+        }
+    } else {
+        short7(&change.oid_src)
+    };
+
+    let mut missing_dst = false;
+    let dst_abbrev = if change.dst_is_gitlink() {
+        match verify(&change.oid_dst) {
+            Some(s) => s,
+            None => {
+                missing_dst = true;
+                short7(&change.oid_dst)
+            }
+        }
+    } else {
+        short7(&change.oid_dst)
+    };
+
+    // `rev-list --first-parent --count`, which is only asked for when both
+    // abbreviations resolved; `-1` is git's "no count to print".
+    let mut total: i64 = -1;
+    let mut errmsg: Option<String> = None;
+    if !missing_src && !missing_dst {
+        if let Some(sub) = sub_repo {
+            total = match (change.src_is_gitlink(), change.dst_is_gitlink()) {
+                (true, true) => {
+                    let (left, right) = first_parent_difference(sub, &change.oid_src, &change.oid_dst);
+                    (left.len() + right.len()) as i64
                 }
-            }
-            // `git log` walks in reverse chronological order across both sides.
-            lines.sort_by_key(|x| std::cmp::Reverse(x.0));
-            let take = if limit > 0 {
-                lines.len().min(limit as usize)
-            } else {
-                lines.len()
+                (true, false) => first_parent_chain(sub, &change.oid_src).len() as i64,
+                (false, true) => first_parent_chain(sub, &change.oid_dst).len() as i64,
+                (false, false) => -1,
             };
-            for (_, mark, subject) in &lines[..take] {
-                writeln!(out, "  {mark} {subject}")?;
-            }
         }
-        // Added: git counts the whole first-parent history but logs only the tip.
-        (None, Some(dst)) => {
-            let total = first_parent_chain(sub_repo, &dst).len();
-            writeln!(out, "* {display} {zeros}...{} ({total}):", abbrev(&dst))?;
-            if let Some((_, subject)) = commit_summary(sub_repo, &dst) {
-                writeln!(out, "  > {subject}")?;
-            }
+    } else if change.dst_is_gitlink() {
+        // "Don't give error msg for modification whose dst is not submodule",
+        // i.e. a deletion or a submodule that became a file.
+        errmsg = Some(if missing_src && missing_dst {
+            format!(
+                "  Warn: {display} doesn't contain commits {} and {}\n",
+                change.oid_src.to_hex(),
+                change.oid_dst.to_hex()
+            )
+        } else if missing_src {
+            format!(
+                "  Warn: {display} doesn't contain commit {}\n",
+                change.oid_src.to_hex()
+            )
+        } else {
+            format!(
+                "  Warn: {display} doesn't contain commit {}\n",
+                change.oid_dst.to_hex()
+            )
+        });
+    }
+
+    if change.status == 'T' {
+        if change.dst_is_gitlink() {
+            write!(out, "* {display} {src_abbrev}(blob)->{dst_abbrev}(submodule)")?;
+        } else {
+            write!(out, "* {display} {src_abbrev}(submodule)->{dst_abbrev}(blob)")?;
         }
-        // Deleted: no count and no log, and the surviving side is not abbreviated
-        // against the submodule's object database.
-        (Some(src), None) => {
-            writeln!(out, "* {display} {}...{zeros}:", src.to_hex_with_len(7))?;
+    } else {
+        write!(out, "* {display} {src_abbrev}...{dst_abbrev}")?;
+    }
+    if total < 0 {
+        writeln!(out, ":")?;
+    } else {
+        writeln!(out, " ({total}):")?;
+    }
+
+    if let Some(msg) = errmsg {
+        write!(out, "{msg}")?;
+    } else if total > 0 {
+        if let Some(sub) = sub_repo {
+            print_summary_log(out, sub, change, limit)?;
         }
-        (None, None) => return Ok(()),
     }
     writeln!(out)?;
+    Ok(())
+}
+
+/// The `git log` `print_submodule_summary` runs inside the submodule: the
+/// `%m`-marked first-parent symmetric difference when both sides are gitlinks,
+/// and the single tip commit of whichever side is one otherwise. Only the
+/// two-gitlink form takes `--summary-limit`.
+fn print_summary_log(
+    out: &mut impl Write,
+    sub: &gix::Repository,
+    change: &Change,
+    limit: i64,
+) -> Result<()> {
+    if change.src_is_gitlink() && change.dst_is_gitlink() {
+        let (left, right) = first_parent_difference(sub, &change.oid_src, &change.oid_dst);
+        let mut lines: Vec<(i64, char, String)> = Vec::new();
+        for (ids, mark) in [(&left, '<'), (&right, '>')] {
+            for id in ids {
+                if let Some((time, subject)) = commit_summary(sub, id) {
+                    lines.push((time, mark, subject));
+                }
+            }
+        }
+        // `git log` walks in reverse chronological order across both sides.
+        lines.sort_by_key(|x| std::cmp::Reverse(x.0));
+        let take = if limit > 0 {
+            lines.len().min(limit as usize)
+        } else {
+            lines.len()
+        };
+        for (_, mark, subject) in &lines[..take] {
+            writeln!(out, "  {mark} {subject}")?;
+        }
+        return Ok(());
+    }
+    let (mark, oid) = if change.dst_is_gitlink() {
+        ('>', &change.oid_dst)
+    } else {
+        ('<', &change.oid_src)
+    };
+    if let Some((_, subject)) = commit_summary(sub, oid) {
+        writeln!(out, "  {mark} {subject}")?;
+    }
     Ok(())
 }
 
@@ -922,23 +1210,32 @@ fn first_parent_difference(
     src: &ObjectId,
     dst: &ObjectId,
 ) -> (Vec<ObjectId>, Vec<ObjectId>) {
-    let a = first_parent_chain(repo, src);
-    let b = first_parent_chain(repo, dst);
-    let a_set: std::collections::HashSet<&ObjectId> = a.iter().collect();
-    let b_set: std::collections::HashSet<&ObjectId> = b.iter().collect();
-    // First-parent chains share a tail once they meet, so the unique part of
-    // each is its prefix up to the first commit the other side also holds.
-    let left: Vec<ObjectId> = a
-        .iter()
-        .take_while(|id| !b_set.contains(id))
-        .copied()
-        .collect();
-    let right: Vec<ObjectId> = b
-        .iter()
-        .take_while(|id| !a_set.contains(id))
-        .copied()
-        .collect();
-    (left, right)
+    (
+        first_parent_unique(repo, src, dst),
+        first_parent_unique(repo, dst, src),
+    )
+}
+
+/// `git rev-list --first-parent <tip> ^<hidden>`: `tip`'s first-parent chain
+/// with everything `hidden` can reach removed.
+///
+/// The exclusion is full reachability, not first-parent reachability: a commit
+/// that the other side merged in is excluded even though it is not on the other
+/// side's first-parent chain. Comparing the two chains as sets instead
+/// overcounts exactly those merged-in commits — `A...B` where `A` is an ancestor
+/// of `B` through a merge reports one extra commit on the `<` side.
+fn first_parent_unique(repo: &gix::Repository, tip: &ObjectId, hidden: &ObjectId) -> Vec<ObjectId> {
+    match repo
+        .rev_walk(Some(*tip))
+        .first_parent_only()
+        .with_hidden(Some(*hidden))
+        .all()
+    {
+        Ok(walk) => walk.filter_map(|info| info.ok().map(|i| i.id)).collect(),
+        // A tip the submodule does not have: nothing to walk, as `rev-list`
+        // would also have failed.
+        Err(_) => Vec::new(),
+    }
 }
 
 /// The first-parent ancestry of `tip`, newest first.
@@ -3643,19 +3940,48 @@ fn rev_name(repo: &gix::Repository, oid: &ObjectId) -> Result<Option<String>> {
     }
 
     // 3. `git describe --contains` is `git name-rev`, a different algorithm that
-    // the vendored crates do not implement. It can only produce a name when the
-    // submodule holds tags, so falling through is safe exactly when it has none.
-    let refs = repo.references()?;
-    if refs.tags()?.next().is_some() {
+    // the vendored crates do not implement. It names a commit *relative to a tag
+    // that reaches it*, so it can only produce a name when some tag has `oid` in
+    // its history — when none does it fails and git falls through to step 4,
+    // which is then exactly what happens here.
+    if tag_reaches(repo, oid)? {
         bail!(
             "naming {oid} needs `git describe --contains` (name-rev), which is not ported; \
-             the submodule has tags that neither `describe` nor `describe --tags` reached"
+             the submodule has a tag that reaches it but neither `describe` nor \
+             `describe --tags` named it"
         );
     }
-    drop(refs);
 
     // 4. `git describe --all --always`.
     describe_all_always(repo, oid)
+}
+
+/// Whether any tag in this repository has `oid` in its history — the precondition
+/// `git describe --contains` (`git name-rev --tags`) needs to name it at all.
+///
+/// One traversal from every tag, stopping as soon as `oid` turns up, which is the
+/// same ground `name-rev` covers before it decides it cannot describe the commit.
+fn tag_reaches(repo: &gix::Repository, oid: &ObjectId) -> Result<bool> {
+    let mut tips: Vec<ObjectId> = Vec::new();
+    {
+        let refs = repo.references()?;
+        for tag in refs.tags()? {
+            let Ok(mut tag) = tag else { continue };
+            if let Ok(peeled) = tag.peel_to_id() {
+                tips.push(peeled.detach());
+            }
+        }
+    }
+    if tips.is_empty() {
+        return Ok(false);
+    }
+    if tips.iter().any(|t| t == oid) {
+        return Ok(true);
+    }
+    let Ok(walk) = repo.rev_walk(tips).all() else {
+        return Ok(false);
+    };
+    Ok(walk.filter_map(Result::ok).any(|info| info.id == *oid))
 }
 
 /// `git describe --all --always <oid>`, with the candidate table built the way

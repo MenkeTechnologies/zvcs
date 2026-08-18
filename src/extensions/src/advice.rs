@@ -325,12 +325,22 @@ pub fn on_updating_sparse_paths(repo: &Repository, paths: &[String]) {
     );
 }
 
-/// `git_env_bool(GIT_ADVICE_ENVIRONMENT, 1)`: `GIT_ADVICE` set to a false value
-/// squelches every hint, for tools that drive git as a subprocess.
+/// `git_env_bool(GIT_ADVICE_ENVIRONMENT, 1)` (parse.c:197-208): `GIT_ADVICE` set
+/// to a false value squelches every hint, for tools that drive git as a
+/// subprocess. Unset leaves hints on; a value that is not a boolean at all is
+/// `die()`, not a default.
 fn globally_enabled() -> bool {
-    match std::env::var("GIT_ADVICE") {
-        Ok(v) => !matches!(v.trim(), "0" | "false" | "no" | "off" | ""),
-        Err(_) => true,
+    let Ok(raw) = std::env::var("GIT_ADVICE") else {
+        return true;
+    };
+    // `git_parse_maybe_bool()` — the words case-insensitively, then any integer
+    // the base-0 grammar reads, as its truthiness.
+    match crate::optint::maybe_bool(&raw) {
+        Some(v) => v,
+        None => {
+            eprintln!("fatal: bad boolean environment value '{raw}' for 'GIT_ADVICE'");
+            std::process::exit(crate::fatal::EXIT_FATAL as i32);
+        }
     }
 }
 

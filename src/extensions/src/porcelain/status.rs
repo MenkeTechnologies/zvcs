@@ -78,7 +78,14 @@ enum Untracked {
 /// Supported invocations (output byte-for-byte matches stock `git status`):
 /// ```text
 ///   * `git status`                      — default long format.
-///   * `git status -s|--short`           — short format.
+///   * `git status -s|--short`           — short format. It deliberately disagrees
+///                                          with `--porcelain` on submodules:
+///                                          `short_submodule_status()`
+///                                          (wt-status.c:449) runs only for
+///                                          `STATUS_FORMAT_SHORT`, so a gitlink whose
+///                                          recorded commit is unchanged prints `m`
+///                                          (modified content) or `?` (untracked
+///                                          content) here and `M` there.
 ///   * `git status --porcelain[=v1]`     — porcelain v1.
 ///   * `git status -b|--branch`          — the `## <branch>...<upstream> [ahead N, behind M]`
 ///                                          short-format header.
@@ -100,7 +107,9 @@ enum Untracked {
 ///     `git column` uses (padding 1); honors `column.ui`/`column.status` and
 ///     resolves `auto` against the terminal.
 ///   * `status.displayCommentPrefix` — prefixes every long-format line with the
-///     comment string (`core.commentString`/`core.commentChar`, default `#`); the
+///     comment string. `core.commentString` and `core.commentChar` are one variable
+///     (environment.c:435), so the last of the two that was set wins and `auto`
+///     resolves to `#`; the value is kept whole, so `//` prefixes with `//`. The
 ///     trailing summary / stash lines stay unprefixed, matching git.
 ///   * `git status -v|--verbose` (`OPT__VERBOSE_MORE`, so `-vv`/`-v -v` count up,
 ///     `--no-verbose` resets) — `wt_status_print_verbose()`. One appends the
@@ -613,7 +622,15 @@ pub(crate) fn status_with(args: &[String], reference: Reference) -> Result<ExitC
         // comment string; the short and porcelain renderers never do). Resolve the
         // comment string now so `render_long` needs no snapshot borrow.
         if snap.boolean("status.displayCommentPrefix") == Some(true) {
-            comment_prefix = Some(resolve_comment_string(&snap));
+            // `core.commentChar` and `core.commentString` are one variable in
+            // `git_default_core_config()` (environment.c:435-456), so the *last* one set
+            // across both spellings wins and `auto` resolves to `#` right there —
+            // `adjust_comment_line_char()` only ever revises it from
+            // `builtin/commit.c`'s `prepare_to_commit()`, never for `status`. The rule
+            // lives in [`super::interpret_trailers::comment_string`], which `commit.rs`
+            // and `rebase_todo.rs` already read it from.
+            let bytes = super::interpret_trailers::comment_string(snap.plumbing());
+            comment_prefix = Some(String::from_utf8_lossy(&bytes).into_owned());
         }
         // `status.relativePaths` (git's `git_status_config`), default on: it is
         // what makes `cmd_status`' closing `if (s.relative_paths) s.prefix =
@@ -733,7 +750,7 @@ pub(crate) fn status_with(args: &[String], reference: Reference) -> Result<ExitC
 
     // Collect the four change classes from the unified status iterator.
     let mut staged: Vec<(StageKind, BString, Option<BString>)> = Vec::new();
-    let mut unstaged: Vec<(WorkKind, BString)> = Vec::new();
+    let mut unstaged: Vec<(WorkKind, BString, SubmoduleState)> = Vec::new();
     let mut unmerged: Vec<(u8, BString)> = Vec::new();
     let mut untracked_paths: Vec<BString> = Vec::new();
     let mut ignored_paths: Vec<BString> = Vec::new();
@@ -870,15 +887,49 @@ pub(crate) fn status_with(args: &[String], reference: Reference) -> Result<ExitC
                         // `git add -N` records a placeholder so the path can be
                         // diffed, but nothing is staged: git lists it under
                         // "Changes not staged for commit" as a new file, ` A`.
-                        EntryStatus::IntentToAdd => unstaged.push((WorkKind::Added, rela_path)),
+                        EntryStatus::IntentToAdd => {
+                            unstaged.push((WorkKind::Added, rela_path, SubmoduleState::default()))
+                        }
                         EntryStatus::NeedsUpdate(_) => {}
-                        EntryStatus::Change(change) => match change {
-                            Change::Removed => unstaged.push((WorkKind::Deleted, rela_path)),
-                            Change::Type { .. } => unstaged.push((WorkKind::TypeChange, rela_path)),
-                            Change::Modification { .. } | Change::SubmoduleModification(_) => {
-                                unstaged.push((WorkKind::Modified, rela_path))
-                            }
-                        },
+                        EntryStatus::Change(change) => {
+                            let short_format = short && !porcelain;
+                            let (kind, sub) = match change {
+                                // gix calls every non-submodule entry whose path is a
+                                // directory removed; `check_removed()` (diff-lib.c:58)
+                                // only agrees when that directory is not a repository.
+                                // When it is one the pair becomes `100644` → `160000`,
+                                // so the worktree side is a gitlink and
+                                // `wt_status_collect_changed_cb()` (wt-status.c:484)
+                                // fills in the submodule fields — with `two->oid` still
+                                // null, `new_submodule_commits` is always set.
+                                Change::Removed => match removed_gitlink(&repo, gix::bstr::BStr::new(&rela_path))
+                                {
+                                    Some(()) => (
+                                        WorkKind::TypeChange,
+                                        SubmoduleState {
+                                            new_commits: true,
+                                            ..SubmoduleState::default()
+                                        },
+                                    ),
+                                    None => (WorkKind::Deleted, SubmoduleState::default()),
+                                },
+                                Change::Type { .. } => {
+                                    (WorkKind::TypeChange, SubmoduleState::default())
+                                }
+                                Change::Modification { .. } => {
+                                    (WorkKind::Modified, SubmoduleState::default())
+                                }
+                                Change::SubmoduleModification(sm) => {
+                                    (WorkKind::Modified, SubmoduleState::from_gix(&sm))
+                                }
+                            };
+                            let kind = if short_format {
+                                short_submodule_kind(kind, sub)
+                            } else {
+                                kind
+                            };
+                            unstaged.push((kind, rela_path, sub));
+                        }
                     },
                     Item::DirectoryContents { entry, .. } => match entry.status {
                         gix::dir::entry::Status::Untracked => {
@@ -898,6 +949,14 @@ pub(crate) fn status_with(args: &[String], reference: Reference) -> Result<ExitC
     }
 
     let untracked_slow = uf_was_slow(untracked_t0);
+
+    // `wt_status_collect_untracked()` (wt-status.c:834, :840) filters both dirwalk
+    // lists through `index_name_is_other()`.
+    {
+        let index = repo.index_or_empty()?;
+        untracked_paths.retain(|p| index_name_is_other(&index, gix::bstr::BStr::new(p)));
+        ignored_paths.retain(|p| index_name_is_other(&index, gix::bstr::BStr::new(p)));
+    }
 
     // git orders each section (and each short-format block) by path.
     staged.sort_by(|a, b| a.1.cmp(&b.1));
@@ -1242,6 +1301,120 @@ enum WorkKind {
     /// that is not staged. git reports it in the worktree column (` A`), never
     /// as a staged addition.
     Added,
+    /// `short_submodule_status()`'s `m` (wt-status.c:453): a submodule whose recorded
+    /// commit is unchanged but whose worktree has modified tracked content. Reachable
+    /// only from `--short`, never from `--porcelain` or the long format.
+    SubmoduleDirty,
+    /// `short_submodule_status()`'s `?` (wt-status.c:455): the same, for untracked
+    /// content only.
+    SubmoduleUntracked,
+}
+
+/// The two `wt_status_change_data` fields a *gitlink* worktree change carries
+/// (wt-status.c:484-489), which the three formats read differently:
+///
+/// * `--short` collapses them into one letter with `short_submodule_status()`;
+/// * the long format appends them as ` (new commits, modified content, untracked
+///   content)` (wt-status.c:399-409) and turns on the extra dirty-submodule hint
+///   (wt-status.c:262);
+/// * `--porcelain` and `--porcelain=v2` ignore them entirely, which is why
+///   `git status --short` and `git status --porcelain` disagree on the very same
+///   worktree.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+struct SubmoduleState {
+    /// `d->new_submodule_commits`: `!oideq(&p->one->oid, &p->two->oid)` — the
+    /// submodule has a different commit checked out than the index records.
+    new_commits: bool,
+    /// `DIRTY_SUBMODULE_MODIFIED`: `is_submodule_modified()` (submodule.c) saw a
+    /// non-`?` line in the submodule's own status.
+    modified: bool,
+    /// `DIRTY_SUBMODULE_UNTRACKED`: it saw a `?` line.
+    untracked: bool,
+}
+
+impl SubmoduleState {
+    /// `d->dirty_submodule` as a whole, which is what the dirty-submodule hint and
+    /// `wt_status_check_worktree_changes()` (wt-status.c:968) test.
+    fn dirty(self) -> bool {
+        self.modified || self.untracked
+    }
+
+    /// `is_submodule_modified()` (submodule.c:1880) classifying the lines of the
+    /// submodule's own `git status --porcelain=2`:
+    ///
+    /// ```c
+    /// if (buf.buf[0] == '?')                       /* regular untracked files */
+    ///         dirty_submodule |= DIRTY_SUBMODULE_UNTRACKED;
+    /// if (buf.buf[0] == 'u' || buf.buf[0] == '1' || buf.buf[0] == '2') {
+    ///         if (buf.buf[5] == 'S' && buf.buf[8] == 'U')   /* nested untracked file */
+    ///                 dirty_submodule |= DIRTY_SUBMODULE_UNTRACKED;
+    ///         if (buf.buf[0] == 'u' || buf.buf[0] == '2' ||
+    ///             memcmp(buf.buf + 5, "S..U", 4))          /* other change */
+    ///                 dirty_submodule |= DIRTY_SUBMODULE_MODIFIED;
+    /// }
+    /// ```
+    ///
+    /// The middle clause is what makes this recursive, and it is not a corner case: a
+    /// submodule whose *own* submodule holds untracked files is `S..U` at the inner
+    /// level, and that `U` propagates outward without making the outer one "modified".
+    /// A `1` line is therefore the only kind that can contribute `UNTRACKED` alone, and
+    /// only when its whole `<sub>` column is exactly `S..U`.
+    ///
+    /// gix hands back the same changes as items rather than as formatted lines, so the
+    /// `<sub>` column is re-derived by recursing into the nested
+    /// [`gix::submodule::Status`]. Entries `status --porcelain=2` would not print —
+    /// ignored paths, and the stat-only refreshes gix reports as `NeedsUpdate` — carry
+    /// no line and therefore no bit.
+    fn from_gix(sm: &gix::submodule::Status) -> SubmoduleState {
+        use gix::status::index_worktree::Item as IwItem;
+        use gix::status::plumbing::index_as_worktree::{Change, EntryStatus};
+        use gix::status::Item;
+
+        let mut state = SubmoduleState {
+            new_commits: sm.checked_out_head_id != sm.index_id,
+            ..SubmoduleState::default()
+        };
+        for item in sm.changes.iter().flatten() {
+            match item {
+                // The dirwalk's `?` lines. An ignored path is only listed under
+                // `--ignored`, which this status never passes on.
+                Item::IndexWorktree(IwItem::DirectoryContents { entry, .. }) => {
+                    if entry.status == gix::dir::entry::Status::Untracked {
+                        state.untracked = true;
+                    }
+                }
+                Item::IndexWorktree(IwItem::Modification { status, .. }) => match status {
+                    EntryStatus::Change(Change::SubmoduleModification(inner)) => {
+                        let inner = SubmoduleState::from_gix(inner);
+                        state.untracked |= inner.untracked;
+                        // `memcmp(buf.buf + 5, "S..U", 4)`: anything but a bare
+                        // nested-untracked marker is an "other change".
+                        state.modified |= inner.new_commits || inner.modified || !inner.untracked;
+                    }
+                    EntryStatus::NeedsUpdate(_) => {}
+                    _ => state.modified = true,
+                },
+                _ => state.modified = true,
+            }
+        }
+        state
+    }
+}
+
+/// `short_submodule_status()` (wt-status.c:449), applied by
+/// `wt_status_collect_changed_cb()` (wt-status.c:488) *only* when the format is
+/// `STATUS_FORMAT_SHORT` — so `git status --short` prints `m`/`?` for a submodule
+/// whose recorded commit is unchanged while `git status --porcelain` prints `M`.
+fn short_submodule_kind(kind: WorkKind, sub: SubmoduleState) -> WorkKind {
+    if sub.new_commits {
+        WorkKind::Modified
+    } else if sub.modified {
+        WorkKind::SubmoduleDirty
+    } else if sub.untracked {
+        WorkKind::SubmoduleUntracked
+    } else {
+        kind
+    }
 }
 
 /// Shorten a `HEAD` referent name (`refs/heads/main` → `main`), or fall back.
@@ -1270,19 +1443,35 @@ struct V2Rec {
     /// `000000` and a null oid for BOTH the HEAD and index columns rather than
     /// the placeholder's own values.
     ita: bool,
+    /// `d->new_submodule_commits` and `d->dirty_submodule`, which fill the `<sub>`
+    /// column (`wt_porcelain_v2_submodule_state()`, wt-status.c:2308).
+    sub: SubmoduleState,
     /// `(R|C, similarity, source-path)` for a rename/copy — renders a `2` line.
     rename: Option<(u8, u32, BString)>,
 }
 
-/// The worktree file's git mode: symlink, executable blob, or plain blob. A
-/// missing file yields the plain-blob default (the caller uses 0 for deletions).
+/// `d->mode_worktree`: `check_removed()` (diff-lib.c:42) followed by
+/// `ce_mode_from_stat()` (read-cache.h:8) for one path.
+///
+/// A vanished path is `0`, which is what `run_diff_files()`'s unmerged branch writes
+/// (`wt_mode = 0`, diff-lib.c:169) and what `git status --porcelain=v2` prints as the
+/// `<mW>` column of a `u` line for a conflict whose file was deleted from the worktree.
+/// A directory is `S_IFGITLINK` when it is a repository (`create_ce_mode()`,
+/// object.h:140) and `0` when it is not, since `check_removed()` then calls the entry
+/// removed.
 fn worktree_mode(repo: &gix::Repository, path: &gix::bstr::BStr) -> u32 {
     let Some(wd) = repo.workdir() else {
-        return 0o100644;
+        return 0;
     };
     let full = wd.join(gix::path::from_bstr(path));
     match std::fs::symlink_metadata(&full) {
         Ok(m) if m.file_type().is_symlink() => 0o120000,
+        Ok(m) if m.file_type().is_dir() => {
+            match super::worktree_filespec::removed_became_gitlink(wd, path) {
+                Some(_) => 0o160000,
+                None => 0,
+            }
+        }
         Ok(_m) => {
             #[cfg(unix)]
             {
@@ -1298,8 +1487,64 @@ fn worktree_mode(repo: &gix::Repository, path: &gix::bstr::BStr) -> u32 {
                 0o100644
             }
         }
-        Err(_) => 0o100644,
+        Err(_) => 0,
     }
+}
+
+/// `check_removed()`'s directory arm (diff-lib.c:58) for a path gix reported as
+/// `Change::Removed`: `Some(())` when the vanished entry's name was taken by a
+/// checked-out repository, which git reports as a type change to `160000` rather than a
+/// deletion, `None` when the removal stands.
+fn removed_gitlink(repo: &gix::Repository, rela_path: &gix::bstr::BStr) -> Option<()> {
+    let wd = repo.workdir()?;
+    super::worktree_filespec::removed_became_gitlink(wd, rela_path).map(|_| ())
+}
+
+/// `wt_porcelain_v2_submodule_state()` (wt-status.c:2308): the `<sub>` column.
+///
+/// ```c
+/// if (S_ISGITLINK(d->mode_head) || S_ISGITLINK(d->mode_index) ||
+///     S_ISGITLINK(d->mode_worktree)) {
+///         sub[0] = 'S';
+///         sub[1] = d->new_submodule_commits ? 'C' : '.';
+///         sub[2] = (d->dirty_submodule & DIRTY_SUBMODULE_MODIFIED) ? 'M' : '.';
+///         sub[3] = (d->dirty_submodule & DIRTY_SUBMODULE_UNTRACKED) ? 'U' : '.';
+/// } else { "N..." }
+/// ```
+///
+/// `modes` are the mode columns of the record being printed. For a `1`/`2` line those
+/// are git's own three; for a `u` line git tests the same three accumulated fields
+/// while the line itself prints the stage modes, so the stage modes plus the worktree
+/// mode stand in — measured equal against git 2.55.0 for an `AA` gitlink conflict both
+/// with the submodule checked out (`u AA S... 000000 160000 160000 160000 …`) and with
+/// its directory removed (`… 160000 160000 000000 …`, still `S...`).
+fn v2_submodule_token(modes: &[u32], sub: SubmoduleState) -> String {
+    if !modes.iter().any(|m| *m == 0o160000) {
+        return "N...".to_owned();
+    }
+    let flag = |on: bool, c: char| if on { c } else { '.' };
+    format!(
+        "S{}{}{}",
+        flag(sub.new_commits, 'C'),
+        flag(sub.modified, 'M'),
+        flag(sub.untracked, 'U'),
+    )
+}
+
+/// `index_name_is_other()` (read-cache.c:3442): whether a dirwalk entry is really
+/// untracked, i.e. the index does not mention its name at any stage.
+///
+/// The trailing `/` a directory entry carries is stripped first, which is the whole
+/// point: with `f` a tracked blob and a directory now standing at `f`, the dirwalk
+/// offers `f/`, and git drops it because the index holds `f`. `git status` then prints
+/// ` D f` and nothing else, while `-uall` lists the files inside under their own names.
+/// `wt_status_collect_untracked()` (wt-status.c:834, :840) applies it to the untracked
+/// and the ignored list alike.
+fn index_name_is_other(index: &gix::index::State, name: &gix::bstr::BStr) -> bool {
+    let stem = name.strip_suffix(b"/").map_or(name, gix::bstr::ByteSlice::as_bstr);
+    // `entry_range()` spans every stage of one path, so it answers the C's two tests at
+    // once: the exact stage-0 hit and the unmerged entry at the insertion point.
+    index.entry_range(stem).is_none()
 }
 
 /// `git status --porcelain=v2` — the stable machine format (git-status(1),
@@ -1390,6 +1635,7 @@ fn porcelain_v2_output(
         staged: false,
         ita: false,
         rename: None,
+        sub: SubmoduleState::default(),
     };
 
     let mut platform = repo
@@ -1540,13 +1786,40 @@ fn porcelain_v2_output(
                         }
                         EntryStatus::NeedsUpdate(_) => {}
                         EntryStatus::Change(change) => {
+                            // gix reports every non-submodule entry whose path is a
+                            // directory as removed; `check_removed()` (diff-lib.c:58)
+                            // only agrees when that directory is not a repository, and
+                            // otherwise `ce_mode_from_stat()` makes the pair a type
+                            // change to `160000`.
+                            let (y, sub) = match change {
+                                Change::Removed => {
+                                    match removed_gitlink(repo, gix::bstr::BStr::new(&rela_path)) {
+                                        // `wt_status_collect_changed_cb()`
+                                        // (wt-status.c:486) computes
+                                        // `new_submodule_commits` from the pair's two
+                                        // ids, and the worktree side of a `diff-files`
+                                        // gitlink is null — so it is always set here.
+                                        Some(()) => (
+                                            b'T',
+                                            SubmoduleState {
+                                                new_commits: true,
+                                                ..SubmoduleState::default()
+                                            },
+                                        ),
+                                        None => (b'D', SubmoduleState::default()),
+                                    }
+                                }
+                                Change::Type { .. } => (b'T', SubmoduleState::default()),
+                                Change::Modification { .. } => {
+                                    (b'M', SubmoduleState::default())
+                                }
+                                Change::SubmoduleModification(sm) => {
+                                    (b'M', SubmoduleState::from_gix(&sm))
+                                }
+                            };
                             let r = recs.entry(rela_path).or_insert_with(new_rec);
-                            match change {
-                                Change::Removed => r.y = b'D',
-                                Change::Type { .. } => r.y = b'T',
-                                Change::Modification { .. }
-                                | Change::SubmoduleModification(_) => r.y = b'M',
-                            }
+                            r.y = y;
+                            r.sub = sub;
                         }
                     },
                     Item::DirectoryContents { entry, .. } => match entry.status {
@@ -1562,6 +1835,10 @@ fn porcelain_v2_output(
 
     // --------------------------------------- fill from index & worktree stat
     let index = repo.index_or_empty()?;
+    // `wt_status_collect_untracked()` (wt-status.c:834, :840): a dirwalk entry whose
+    // name the index already holds is not untracked content.
+    untracked_paths.retain(|p| index_name_is_other(&index, gix::bstr::BStr::new(p)));
+    ignored_paths.retain(|p| index_name_is_other(&index, gix::bstr::BStr::new(p)));
     for (path, r) in recs.iter_mut() {
         if !r.staged && !r.ita {
             // No staged change: HEAD == index for this path, so pull both from
@@ -1636,11 +1913,12 @@ fn porcelain_v2_output(
         let mut lines: Vec<(BString, Vec<u8>)> = Vec::new();
         for (path, r) in &recs {
             let xy = format!("{}{}", r.x as char, r.y as char);
+            let sub = v2_submodule_token(&[r.m_h, r.m_i, r.m_w], r.sub);
             let mut line: Vec<u8> = Vec::new();
             if let Some((kind, score, ref orig)) = r.rename {
                 line.extend_from_slice(
                     format!(
-                        "2 {xy} N... {:06o} {:06o} {:06o} {} {} {}{} ",
+                        "2 {xy} {sub} {:06o} {:06o} {:06o} {} {} {}{} ",
                         r.m_h, r.m_i, r.m_w, r.h_h, r.h_i, kind as char, score,
                     )
                     .as_bytes(),
@@ -1651,7 +1929,7 @@ fn porcelain_v2_output(
             } else {
                 line.extend_from_slice(
                     format!(
-                        "1 {xy} N... {:06o} {:06o} {:06o} {} {} ",
+                        "1 {xy} {sub} {:06o} {:06o} {:06o} {} {} ",
                         r.m_h, r.m_i, r.m_w, r.h_h, r.h_i,
                     )
                     .as_bytes(),
@@ -1692,10 +1970,14 @@ fn porcelain_v2_output(
                 }
             }
             let m_w = worktree_mode(repo, path.as_bstr());
+            // An unmerged path has no `wt_status_change_data` here, so the stage modes
+            // stand in for git's accumulated `mode_head`/`mode_index`, and it never
+            // carries dirty-submodule bits. See [`v2_submodule_token`].
+            let sub = v2_submodule_token(&[sm[0], sm[1], sm[2], m_w], SubmoduleState::default());
             let mut line: Vec<u8> = Vec::new();
             line.extend_from_slice(
                 format!(
-                    "u {xy} N... {:06o} {:06o} {:06o} {:06o} {} {} {} ",
+                    "u {xy} {sub} {:06o} {:06o} {:06o} {:06o} {} {} {} ",
                     sm[0], sm[1], sm[2], m_w, sh[0], sh[1], sh[2],
                 )
                 .as_bytes(),
@@ -1732,9 +2014,10 @@ fn porcelain_v2_output(
     let mut lines: Vec<(BString, String)> = Vec::new();
     for (path, r) in &recs {
         let xy = format!("{}{}", r.x as char, r.y as char);
+            let sub = v2_submodule_token(&[r.m_h, r.m_i, r.m_w], r.sub);
         let line = if let Some((kind, score, ref orig)) = r.rename {
             format!(
-                "2 {xy} N... {:06o} {:06o} {:06o} {} {} {}{} {}\t{}",
+                "2 {xy} {sub} {:06o} {:06o} {:06o} {} {} {}{} {}\t{}",
                 r.m_h,
                 r.m_i,
                 r.m_w,
@@ -1747,7 +2030,7 @@ fn porcelain_v2_output(
             )
         } else {
             format!(
-                "1 {xy} N... {:06o} {:06o} {:06o} {} {} {}",
+                "1 {xy} {sub} {:06o} {:06o} {:06o} {} {} {}",
                 r.m_h,
                 r.m_i,
                 r.m_w,
@@ -1791,8 +2074,12 @@ fn porcelain_v2_output(
             }
         }
         let m_w = worktree_mode(repo, path.as_bstr());
+        // An unmerged path has no `wt_status_change_data` here, so the stage modes stand
+        // in for git's accumulated `mode_head`/`mode_index`, and it never carries
+        // dirty-submodule bits. See [`v2_submodule_token`].
+        let sub = v2_submodule_token(&[sm[0], sm[1], sm[2], m_w], SubmoduleState::default());
         let line = format!(
-            "u {xy} N... {:06o} {:06o} {:06o} {:06o} {} {} {} {}",
+            "u {xy} {sub} {:06o} {:06o} {:06o} {:06o} {} {} {} {}",
             sm[0],
             sm[1],
             sm[2],
@@ -2217,6 +2504,11 @@ fn submodule_summary(workdir: Option<&std::path::Path>, uncommitted: bool, limit
         // `s->amend ? "HEAD^" : "HEAD"`; `git status` never amends.
         cmd.arg("HEAD");
     }
+    // `capture_command(&sm_summary, &cmd_stdout, 1024)` (wt-status.c:1051) takes
+    // only stdout; the child keeps this process's stderr, so a diagnostic it
+    // prints — a submodule replaced by a file makes `rev-parse` fail its
+    // `chdir` — reaches the user rather than being swallowed here.
+    cmd.stderr(std::process::Stdio::inherit());
     let body = match cmd.output() {
         Ok(o) => String::from_utf8_lossy(&o.stdout).into_owned(),
         Err(_) => return String::new(),
@@ -2299,17 +2591,6 @@ impl ProgressState {
             state.bisecting_from = read_state_branch(repo, "BISECT_START");
         }
         state
-    }
-
-    /// Whether any of these has a banner to print.
-    fn any(&self) -> bool {
-        self.merge
-            || self.am
-            || self.rebase
-            || self.rebase_interactive
-            || self.cherry_pick.is_some()
-            || self.revert.is_some()
-            || self.bisect
     }
 
     /// `determine_whence()` (builtin/commit.c:198): `s->whence != FROM_COMMIT` leaves
@@ -2581,7 +2862,7 @@ fn render_long(
     untracked_mode: Untracked,
     show_ignored: bool,
     staged: &[(StageKind, BString, Option<BString>)],
-    unstaged: &[(WorkKind, BString)],
+    unstaged: &[(WorkKind, BString, SubmoduleState)],
     unmerged: &[(u8, BString)],
     untracked: &[BString],
     ignored: &[BString],
@@ -2904,7 +3185,7 @@ fn render_long(
     }
 
     if !unstaged.is_empty() {
-        let any_deleted = unstaged.iter().any(|(k, _)| matches!(k, WorkKind::Deleted));
+        let any_deleted = unstaged.iter().any(|(k, _, _)| matches!(k, WorkKind::Deleted));
         let add_hint = if any_deleted { "git add/rm" } else { "git add" };
         out.push_str(&h("Changes not staged for commit:\n"));
         if hints {
@@ -2914,11 +3195,26 @@ fn render_long(
             out.push_str(&h(
                 "  (use \"git restore <file>...\" to discard changes in working directory)\n",
             ));
+            // `wt_longstatus_print_dirty_header()` (wt-status.c:262), keyed on
+            // `d->dirty_submodule` alone — a submodule that merely moved to a new
+            // commit does not raise it.
+            if unstaged.iter().any(|(_, _, sub)| sub.dirty()) {
+                out.push_str(&h(
+                    "  (commit or discard the untracked or modified content in submodules)\n",
+                ));
+            }
         }
-        for (kind, path) in unstaged {
+        for (kind, path, sub) in unstaged {
             let label = work_label(*kind);
             let body = format!("{label:<12}{}", quote_path(path, prefix));
-            out.push_str(&format!("{}{}\n", tab(), colors.paint(Slot::Changed, &body)));
+            // `wt_longstatus_print_change_data()` (wt-status.c:440) writes the
+            // parenthesised submodule note in the *header* color, not the change color.
+            let extra = submodule_extra(*sub);
+            out.push_str(&format!("{}{}", tab(), colors.paint(Slot::Changed, &body)));
+            if !extra.is_empty() {
+                out.push_str(&h(&extra));
+            }
+            out.push('\n');
         }
         out.push_str(&trailer());
     }
@@ -3210,27 +3506,6 @@ fn comment_prefix_body(body: &str, cs: &str) -> String {
     out
 }
 
-/// Resolve git's comment string for `status.displayCommentPrefix` output, matching
-/// git's `comment_line_str` precedence: `core.commentString` wins if set, else
-/// `core.commentChar` (a literal `auto` resolves to `#` for status display, as git
-/// does), else the built-in default `#`.
-fn resolve_comment_string(snap: &gix::config::Snapshot) -> String {
-    use gix::bstr::ByteSlice;
-    if let Some(v) = snap.string("core.commentString") {
-        let s = v.to_str_lossy();
-        if !s.is_empty() {
-            return s.into_owned();
-        }
-    }
-    if let Some(v) = snap.string("core.commentChar") {
-        let s = v.to_str_lossy();
-        if !s.is_empty() && s != "auto" {
-            return s.into_owned();
-        }
-    }
-    "#".to_string()
-}
-
 /// Count `refs/stash` reflog entries — git's `count_stash_entries`, which drives
 /// the `--show-stash` line. Zero when the stash ref (and thus its reflog) is absent.
 fn count_stash_entries(repo: &gix::Repository) -> usize {
@@ -3254,7 +3529,7 @@ fn count_stash_entries(repo: &gix::Repository) -> usize {
 
 fn render_short(
     staged: Vec<(StageKind, BString, Option<BString>)>,
-    unstaged: Vec<(WorkKind, BString)>,
+    unstaged: Vec<(WorkKind, BString, SubmoduleState)>,
     unmerged: Vec<(u8, BString)>,
     untracked: &[BString],
     ignored: &[BString],
@@ -3287,7 +3562,7 @@ fn render_short(
             e.orig = orig;
         }
     }
-    for (kind, path) in unstaged {
+    for (kind, path, _) in unstaged {
         let e = map.entry(path).or_insert(Short {
             x: b' ',
             y: b' ',
@@ -3345,7 +3620,7 @@ fn render_short(
 fn render_short_z(
     out: &mut Vec<u8>,
     staged: &[(StageKind, BString, Option<BString>)],
-    unstaged: &[(WorkKind, BString)],
+    unstaged: &[(WorkKind, BString, SubmoduleState)],
     unmerged: &[(u8, BString)],
     untracked: &[BString],
     ignored: &[BString],
@@ -3371,7 +3646,7 @@ fn render_short_z(
             e.orig = orig.clone();
         }
     }
-    for (kind, path) in unstaged {
+    for (kind, path, _) in unstaged {
         let e = map.entry(path.clone()).or_insert(Short {
             x: b' ',
             y: b' ',
@@ -3530,11 +3805,31 @@ fn stage_label(kind: StageKind) -> &'static str {
 
 fn work_label(kind: WorkKind) -> &'static str {
     match kind {
-        WorkKind::Modified => "modified:",
+        // `short_submodule_status()` only ever runs for `STATUS_FORMAT_SHORT`, so the
+        // two submodule letters cannot reach the long format; they render as the
+        // modification they are if they ever did.
+        WorkKind::Modified | WorkKind::SubmoduleDirty | WorkKind::SubmoduleUntracked => "modified:",
         WorkKind::Deleted => "deleted:",
         WorkKind::TypeChange => "typechange:",
         WorkKind::Added => "new file:",
     }
+}
+
+/// `wt_longstatus_print_change_data()`'s `extra` for a worktree change
+/// (wt-status.c:399-409): the parenthesised, comma-separated list of what the
+/// submodule side of the pair carries, in git's own fixed order. Empty for anything
+/// that is not a submodule change.
+fn submodule_extra(sub: SubmoduleState) -> String {
+    let parts = [
+        (sub.new_commits, "new commits"),
+        (sub.modified, "modified content"),
+        (sub.untracked, "untracked content"),
+    ];
+    let listed: Vec<&str> = parts.iter().filter(|(on, _)| *on).map(|(_, s)| *s).collect();
+    if listed.is_empty() {
+        return String::new();
+    }
+    format!(" ({})", listed.join(", "))
 }
 
 fn stage_char(kind: StageKind) -> u8 {
@@ -3554,6 +3849,8 @@ fn work_char(kind: WorkKind) -> u8 {
         WorkKind::Deleted => b'D',
         WorkKind::TypeChange => b'T',
         WorkKind::Added => b'A',
+        WorkKind::SubmoduleDirty => b'm',
+        WorkKind::SubmoduleUntracked => b'?',
     }
 }
 

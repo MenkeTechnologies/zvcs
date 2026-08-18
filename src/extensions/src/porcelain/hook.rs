@@ -30,19 +30,15 @@
 //! than one when it would actually engage), because matching git's
 //! `run_processes_parallel` output de-interleaving is not reproduced here.
 //!
-//! One known divergence: the `advice.ignoredHook` hint prints the hook path
-//! relative to the current directory when it lies below it, and absolute
-//! otherwise (with the `./` gitoxide prefixes a discovered git dir with
-//! trimmed, so the common case reads `.git/hooks/<event>` as git's does); git
-//! derives the same string from its own `git_path()` bookkeeping, so the two can
-//! still differ when `git hook` is run from a subdirectory.
+//! The hookdir lookup itself — and with it the `advice.ignoredHook` hint and the
+//! path git names in it — lives in [`crate::hooks`], so `git hook` and the hooks
+//! `git commit`/`git merge`/`git push` fire resolve identically.
 
 use anyhow::{bail, Result};
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, ExitCode, Stdio};
 
 use gix::bstr::{BString, ByteSlice};
@@ -623,50 +619,11 @@ fn effective_jobs(repo: &gix::Repository, event: &str, flag: Option<i64>) -> Res
     Ok(n)
 }
 
-/// Locate the traditional `<hooks-dir>/<event>` script.
-///
-/// Returns the path only when it exists and is executable; a present but
-/// non-executable file produces git's `advice.ignoredHook` hint on stderr.
+/// Locate the traditional `<hooks-dir>/<event>` script — git's `find_hook()`,
+/// shared with every other hook site in zvcs so the lookup rules and the
+/// `advice.ignoredHook` hint cannot drift between them.
 fn hookdir_hook(repo: &gix::Repository, event: &str) -> Result<Option<PathBuf>> {
-    let dir = match repo.config_snapshot().trusted_path("core.hooksPath")? {
-        Some(p) => p,
-        None => repo.common_dir().join("hooks"),
-    };
-    let path = dir.join(event);
-    let Ok(meta) = std::fs::metadata(&path) else {
-        return Ok(None);
-    };
-    if meta.is_dir() {
-        return Ok(None);
-    }
-    if meta.permissions().mode() & 0o111 != 0 {
-        return Ok(Some(path));
-    }
-    // `hook.c` bakes the disable sentence into the message and calls plain
-    // `advise()`, so there is no `Disable this message with …` trailer here —
-    // but it *is* behind `advice_enabled()`, which `GIT_ADVICE=0` also squelches.
-    let shown = display_path(&path);
-    crate::advice::Advice::IgnoredHook.advise_plain_in(
-        repo,
-        &format!(
-            "The '{shown}' hook was ignored because it's not set as executable.\n\
-             You can disable this warning with `git config set advice.ignoredHook false`."
-        ),
-    );
-    Ok(None)
-}
-
-/// Render a path the way git tends to: relative to the current directory when it
-/// lies below it, absolute otherwise.
-fn display_path(path: &Path) -> String {
-    let rel = std::env::current_dir()
-        .ok()
-        .and_then(|cwd| path.strip_prefix(cwd).ok().map(Path::to_path_buf));
-    let shown = rel.unwrap_or_else(|| path.to_path_buf()).display().to_string();
-    // gitoxide reports a repository discovered from the current directory as
-    // `./.git`, so a path joined onto it keeps the `./` that git's `git_path()`
-    // never produces: git prints `.git/hooks/pre-commit`.
-    shown.strip_prefix("./").unwrap_or(&shown).to_owned()
+    crate::hooks::find(repo, event)
 }
 
 /// Build the child process for one `HOOK_CONFIGURED` hook command — git's

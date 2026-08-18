@@ -392,19 +392,24 @@ fn parse_args<'a>(
                     't' => opts.tags = true,
                     'q' => opts.quiet = true,
                     'o' => {
-                        // The rest of the cluster is the value, else the next
-                        // argv — consumed even when it looks like a flag, so
-                        // `ls-remote -o --tags` has no `--tags` and no
-                        // repository. The value itself goes nowhere: gitoxide
-                        // cannot transmit protocol-v2 server options.
+                        // `OPT_STRING_LIST('o', "server-option", &server_options, …)`
+                        // (builtin/ls-remote.c:92) — the same list `--server-option`
+                        // appends to, transmitted as protocol-v2 command arguments. The
+                        // rest of the cluster is the value, else the next argv, consumed
+                        // even when it looks like a flag, so `ls-remote -o --tags` has
+                        // no `--tags` and no repository.
                         let sticky = &arg[1 + at + c.len_utf8()..];
-                        if sticky.is_empty() {
-                            if args.get(i).is_none() {
+                        let value = if sticky.is_empty() {
+                            let Some(next) = args.get(i) else {
                                 eprintln!("error: switch `o' requires a value");
                                 return Err(ExitCode::from(129));
-                            }
+                            };
                             i += 1;
-                        }
+                            next.clone()
+                        } else {
+                            sticky.to_string()
+                        };
+                        opts.server_options.push(value.into());
                         break;
                     }
                     other => {
@@ -505,11 +510,6 @@ fn split_long(arg: &str) -> (&str, Option<&str>, bool) {
         Some(rest) => (rest, value, false),
         None => (body, value, true),
     }
-}
-
-/// Report a flag this port deliberately does not implement.
-fn bail_unsupported(flag: &str) {
-    eprintln!("zvcs: ls-remote: unsupported flag {flag:?} (no gitoxide equivalent)");
 }
 
 /// Parse `--sort` arguments into git's ordering chain.
@@ -784,12 +784,15 @@ mod tests {
 
     /// `-o` swallows the next argv even when it looks like a flag — the reason
     /// `git ls-remote -o --tags` reports "No remote configured to list refs
-    /// from." instead of listing tags.
+    /// from." instead of listing tags — and the value it swallowed is a server
+    /// option, since `OPT_STRING_LIST(.o., "server-option", &server_options, …)`
+    /// (builtin/ls-remote.c:92) gives both spellings the same list.
     #[test]
-    fn o_consumes_the_next_argument() {
+    fn o_consumes_the_next_argument_as_a_server_option() {
         let (opts, positionals) = parse(&["-o", "--tags"]).unwrap();
         assert!(!opts.tags, "--tags was the value of -o, not a flag");
         assert!(positionals.is_empty(), "no repository is left on the line");
+        assert_eq!(opts.server_options, vec!["--tags"], "the value is transmitted");
     }
 
     /// Short options cluster, and a sticky `-ofoo` keeps its value inside the
@@ -799,6 +802,7 @@ mod tests {
         let (opts, positionals) = parse(&["-tb", "-ofoo", "."]).unwrap();
         assert!(opts.tags && opts.branches);
         assert_eq!(positionals, vec!["."]);
+        assert_eq!(opts.server_options, vec!["foo"], "the sticky value is the option");
     }
 
     /// `--no-sort` drops previously collected keys; `--no-server-option` must

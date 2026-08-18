@@ -343,6 +343,26 @@ pub trait Content {
     fn data(&mut self, spec: &FileSpec) -> Option<Vec<u8>>;
 }
 
+/// The object-database side of `diff_populate_filespec()`: every spec of a
+/// tree-to-tree queue names a blob that is already in the odb, so the size comes
+/// from the object header and the bytes from the object itself. A spec whose id
+/// is not a blob (a gitlink, whose "content" git synthesises elsewhere) reports
+/// no size, which is git's `diff_populate_filespec()` failing the same way.
+pub struct OdbContent<'a> {
+    pub repo: &'a gix::Repository,
+}
+
+impl Content for OdbContent<'_> {
+    fn size(&mut self, spec: &FileSpec) -> Option<u64> {
+        let header = self.repo.find_header(spec.oid).ok()?;
+        (header.kind() == gix::object::Kind::Blob).then(|| header.size())
+    }
+
+    fn data(&mut self, spec: &FileSpec) -> Option<Vec<u8>> {
+        self.repo.find_object(spec.oid).ok().map(|o| o.detach().data)
+    }
+}
+
 /// Populate `spec.size`, mirroring `diff_populate_filespec(..., check_size_only=1)`.
 /// Returns `false` on the error path git takes when the object cannot be read.
 fn populate_size(specs: &mut [FileSpec], idx: usize, c: &mut dyn Content) -> bool {

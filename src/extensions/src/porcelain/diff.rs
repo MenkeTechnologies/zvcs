@@ -60,7 +60,20 @@
 //! quietly before the raw/name formats print it so `--raw`, `--name-only` and
 //! `--name-status` skip it too, and `--exit-code`/`--quiet` report no change
 //! because `diff_from_contents` makes the status follow what was actually
-//! emitted), and
+//! emitted),
+//! `-I<regex>`/`--ignore-matching-lines=<regex>` and `--ignore-blank-lines` (both
+//! spellings of the value for `-I`, and both marking a change ignorable through the
+//! same `xdl_emit_diff` port),
+//! `--inter-hunk-context=<n>` (`xecfg.interhunkctxlen`, again through that port),
+//! `-a`/`--text`/`--no-text` (a textual patch for content the pipeline classifies as
+//! binary, while `builtin_diffstat()` — which never reads the flag — keeps reporting
+//! `Bin <a> -> <b> bytes`),
+//! `-D`/`--irreversible-delete` (a deletion stops at its header),
+//! `--skip-to=<path>`/`--rotate-to=<path>` (`diffcore_rotate()`, with
+//! `cmd_diff()`'s `rotate_to_strict` making a target that names no queued pair
+//! `fatal: No such path '<p>' in the diff` at 128, though only for a non-empty queue),
+//! `--output=<file>` (opened and truncated during the option scan, as `xfopen` does,
+//! so an unopenable path is fatal before anything else on the line is judged), and
 //! merge-base ranges `<a>...<b>` (diffed as `merge-base(a,b)` against `b`).
 //!
 //! ### Submodules
@@ -103,16 +116,18 @@
 //!
 //! ### Honest limitations (bailed on with a precise message, never faked)
 //!
-//! * `-R` on a worktree diff bails: the worktree "new" side has no object id to move
-//!   onto the old side within this pipeline.
 //! * A pair whose two sides differ in `S_IFMT` — a regular file that became a
 //!   symlink, a blob that became a gitlink — renders as a deletion section followed
 //!   by a creation section, which is what `run_diff()` (diff.c:5052) does. The stat,
 //!   raw, name and summary formats are handed the unsplit pair, so they still show
 //!   one row, one `T` record and one `mode change` line.
-//! * A path deleted from the index whose name a *directory* has since taken bails:
-//!   the post-image would have to be read through a blob platform with no worktree
-//!   root, and this pipeline shares one platform with the post-image side.
+//! * A tracked path whose name a *directory* has since taken follows
+//!   `check_removed()` (diff-lib.c:22): a plain directory makes it an ordinary
+//!   deletion, and a directory that is a repository makes it a `100644 => 160000`
+//!   type change, `resolve_gitlink_ref()` being `gix::open()` + `head_id()`. The
+//!   mixed blob/gitlink pair a type change produces is split for the patch and left
+//!   whole for the diffstat, which counts the blob's lines against the one-line image
+//!   `diff_populate_filespec()` (diff.c:4110) synthesises for the gitlink.
 //! * `--ignore-submodules[=<when>]` is accepted and inert: gitlink changes are
 //!   reported whatever it says, apart from the untracked files every diff ignores.
 //! * `-c diff.submodule=<bad value>` warns once. Stock git repeats the warning when
@@ -153,8 +168,23 @@
 //!   a pattern that will not compile gets `fatal: invalid regex: <message>` at 128
 //!   as git does, but the message after the colon is the `regex` crate's rather
 //!   than the platform `regcomp`'s.
-//! * `-I<regex>` / `--ignore-matching-lines=<regex>` is not implemented here
-//!   (`diff-index` and `diff-files` have it) and is refused.
+//! * `-I<regex>` / `--ignore-matching-lines=<regex>` and `--ignore-blank-lines` mark a
+//!   change ignorable exactly as `xdl_mark_ignorable_regex` and
+//!   `xdl_mark_ignorable_lines` do, through the `xdl_emit_diff` port in
+//!   [`super::diff_pairs::emit_unified`] — so an isolated one leaves the counts as well
+//!   as the patch. Only `-I` raises `diff_from_contents` (diff.c:4899), which is what
+//!   also drops the pair from `--raw`/`--name-status` and leaves
+//!   `diff_fill_oid_info()`'s real hash on a worktree side's raw record;
+//!   `--ignore-blank-lines` is deliberately not on that list and keeps both.
+//!   The regex engine is the `regex` crate rather than the platform `regcomp`, so
+//!   which *patterns compile* can differ even though the message
+//!   (`error: invalid regex given to -I: '<pat>'`, 129) does not.
+//! * `--textconv` / `--no-textconv` and `--ext-diff` / `--no-ext-diff` are accepted and
+//!   inert. `GIT_EXTERNAL_DIFF`, `diff.external` and a `diff.<driver>.command` or
+//!   `diff.<driver>.textconv` reached through gitattributes are all ignored: the blob
+//!   platform is built with `skip_internal_diff_if_external_is_configured` off, so it
+//!   never even reports an external command. `diff-files`, `diff-index` and
+//!   `diff-pairs` do honour them — see [`super::diff_pairs`] for the port.
 //! * Magic pathspecs (`:(...)`) and glob pathspecs bail; literal path / directory-prefix
 //!   filtering is supported.
 //! * `--color-moved[=<mode>]`, `--color-moved-ws=`, `--word-diff[=]`,
@@ -221,6 +251,15 @@ struct Render {
     /// `--binary`: emit a `GIT binary patch` payload for a binary pair, and widen
     /// that pair's `index` line to full object names.
     binary: bool,
+    /// `-D`/`--irreversible-delete` (`o->flags.irreversible_delete`): `builtin_diff()`
+    /// (diff.c:3596) emits a deletion.s header and jumps to the end, so the pair loses
+    /// its `---`/`+++` pair and its hunks. No other format reads the flag.
+    irreversible_delete: bool,
+    /// `-a`/`--text` (`o->flags.text`): `builtin_diff()`.s binary arm is guarded by
+    /// `!o->flags.text`, so with this on a binary pair gets its patch rather than
+    /// `Binary files ... differ` — even beside `--binary`, whose payload lives inside
+    /// the arm this skips.
+    text: bool,
     /// `-z`: terminate `--raw`/`--name-only`/`--name-status` records with NUL and
     /// suppress path C-quoting.
     z: bool,
@@ -231,10 +270,67 @@ struct Render {
     hash_kind: gix::hash::Kind,
 }
 
+/// The `xdiff` knobs that decide which changes make it into the hunk stream at all,
+/// as opposed to how wide the context around them is.
+///
+/// All four reach the same place: `builtin_diff()` fills `xpp.flags`,
+/// `xpp.ignore_regex` and `xecfg.interhunkctxlen` from `diff_options` and hands them
+/// to `xdl_diff()`. `builtin_diffstat()` fills the same three, which is why they
+/// change `--stat`/`--numstat` as well as the patch. `DIFF_OPT_TEXT` is the one that
+/// does not: the diffstat asks `diff_filespec_is_binary()` directly and never sees
+/// it.
+#[derive(Default)]
+struct IgnoreOpts {
+    /// `--ignore-blank-lines`: `XDF_IGNORE_BLANK_LINES`, which
+    /// `xdl_mark_ignorable_lines()` turns into an `ignore` bit on an all-blank change.
+    blank_lines: bool,
+    /// `-I<re>` / `--ignore-matching-lines=<re>`: `xpp.ignore_regex`, which
+    /// `xdl_mark_ignorable_regex()` turns into the same bit.
+    lines: Vec<super::diff_pickaxe::Needle>,
+    /// `--inter-hunk-context=<n>`: `xecfg.interhunkctxlen`, the gap two changes may
+    /// span and still share one hunk.
+    inter_hunk_ctx: usize,
+    /// `-a`/`--text`: `DIFF_OPT_TEXT`, which diffs content git would otherwise
+    /// report as `Binary files ... differ`.
+    text: bool,
+}
+
+/// `diff_opt_output`'s `xfopen(arg, "w")`: create or truncate the file the whole diff
+/// stream is written to. The failure is git's `xfopen` `die()`, which carries the
+/// C-library reason and exits 128.
+pub(crate) fn open_output_file(path: &str) -> std::result::Result<std::fs::File, ExitCode> {
+    std::fs::File::create(path).map_err(|e| {
+        eprintln!("fatal: could not open '{path}' for writing: {}", super::diff_pairs::io_reason(&e));
+        ExitCode::from(128)
+    })
+}
+
+/// `--inter-hunk-context=<n>`'s value through the shared `parse-options` integer
+/// grammar. git declares it `OPT_UNSIGNED`, so base 0, an optional `+`, one optional
+/// `k`/`m`/`g` suffix and a C `int`'s worth of range — which is what makes the
+/// out-of-range message read `[0,4294967295]`. Measured against 2.55.0:
+/// `--inter-hunk-context=` is ``option `inter-hunk-context' expects a numerical
+/// value``, `=bad` and `=-1` are the `non-negative integer ... k/m/g suffix` wording,
+/// and `= 4` (leading space) is accepted, all at 129.
+pub(crate) fn parse_inter_hunk_context(v: &str) -> std::result::Result<usize, String> {
+    crate::optint::unsigned_prec(&crate::optint::long_opt("inter-hunk-context"), v, 4)
+        .map(|n| n as usize)
+        .map_err(|e| e.message().to_owned())
+}
+
+impl IgnoreOpts {
+    /// Whether any change can come out marked ignorable, which is what forces the
+    /// `xdl_emit_diff` port — the counts then have to come from the emitted records
+    /// rather than from the change script.
+    fn marks_changes(&self) -> bool {
+        self.blank_lines || !self.lines.is_empty()
+    }
+}
+
 /// git's `enum diff_submodule_format` (diff.h), selected by `--submodule[=<format>]`
 /// and `diff.submodule`.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum SubmoduleFormat {
+pub(crate) enum SubmoduleFormat {
     /// `DIFF_SUBMODULE_SHORT`: the default — a gitlink pair diffs as the synthetic
     /// one-line `Subproject commit <oid>` blob each side stands for.
     Short,
@@ -246,9 +342,62 @@ enum SubmoduleFormat {
     InlineDiff,
 }
 
+/// Diff options that `git log`, `git show` and `git whatchanged` accept and that
+/// cannot change a byte of what this port prints, because each one sets a
+/// `diff_options` field to the value these commands already run at.
+///
+/// This is not a "we have not got round to it" list — every entry is a *negative*
+/// or default-valued spelling whose callback, read in git 2.55.0, writes the state
+/// this port is permanently in:
+///
+/// * `--no-compact-summary` — `diff_opt_compact_summary()` with `unset` clears
+///   `flags.stat_with_summary` and touches `output_format` only on the positive
+///   side (diff.c:5663). The positive spelling is not ported here, so the flag it
+///   would clear is already clear.
+/// * `--no-color-moved` / `--color-moved=no` — `COLOR_MOVED_NO`. Moved-block
+///   colouring is not ported, so turning it off is what this port already does —
+///   including when `diff.colorMoved` set it, which is the one case where the flag
+///   moves stock git *towards* these bytes rather than away from them.
+/// * `--no-color-moved-ws` — clears `color_moved_ws_handling`, which is only read
+///   while `color_moved` is on.
+/// * `--word-diff=none` — `DIFF_WORDS_NONE`, `diff_setup()`'s value.
+/// * `--no-textconv` — clears `flags.allow_textconv`. No textconv driver is ever
+///   run here, so the converted side never existed to suppress.
+/// * `--no-ext-diff` — clears `flags.allow_external`, likewise.
+/// * `--no-relative` — clears `flags.relative_name`, which is what makes
+///   `diff_setup_done()` drop `options->prefix`; these commands never carry one.
+/// * `--ita-visible-in-index` / `--ita-invisible-in-index` — `flags.ita_invisible_in_index`
+///   is read only by the index-vs-worktree and index-vs-tree walks (diff-lib.c);
+///   `log`/`show`/`whatchanged` diff two trees and never see an intent-to-add entry.
+/// * `--rename-empty` — `flags.rename_empty = 1`, `diff_setup()`'s default. (Its
+///   negation is *not* here: `--no-rename-empty` splits an empty-file `R100` back
+///   into an addition and a deletion, measured against stock 2.55.0.)
+///
+/// Confirmed by measurement as well as by reading: for each entry, stock 2.55.0's
+/// output is byte-identical with and without it across `-p`, `-p --stat`, `--raw`,
+/// `--numstat`, `--shortstat`, `--summary`, `--name-status` and `-p -M -C` on
+/// `log`, `show` and `whatchanged`, over a fixture carrying a rename, an empty-file
+/// rename, a symlink, an exec-bit flip and a tab in a pathname.
+pub(crate) fn history_noop_diff_option(a: &str) -> bool {
+    matches!(
+        a,
+        "--no-compact-summary"
+            | "--no-color-moved"
+            | "--color-moved=no"
+            | "--no-color-moved-ws"
+            | "--word-diff=none"
+            | "--no-textconv"
+            | "--no-ext-diff"
+            | "--no-relative"
+            | "--ita-visible-in-index"
+            | "--ita-invisible-in-index"
+            | "--rename-empty"
+    )
+}
+
 /// `parse_submodule_params()` (diff.c:194): the three format names, or `None` for
 /// the value git refuses.
-fn parse_submodule_params(value: &str) -> Option<SubmoduleFormat> {
+pub(crate) fn parse_submodule_params(value: &str) -> Option<SubmoduleFormat> {
     match value {
         "log" => Some(SubmoduleFormat::Log),
         "short" => Some(SubmoduleFormat::Short),
@@ -541,6 +690,20 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     // `--compact-summary`: annotate `--stat` names with create/delete/mode info.
     let mut compact_summary = false;
     let mut func_context = false;
+    // The `xdiff` knobs fed to [`super::diff_pairs::emit_unified`]: `xpp.flags`'
+    // `XDF_IGNORE_BLANK_LINES`, `xpp.ignore_regex` (`-I<re>`),
+    // `xecfg.interhunkctxlen` and `DIFF_OPT_TEXT`.
+    let mut ignore = IgnoreOpts::default();
+    // `-D`/`--irreversible-delete` (`diff_opt_irreversible_delete`): a deletion emits
+    // its header and stops.
+    let mut irreversible_delete = false;
+    // `--skip-to=<p>` / `--rotate-to=<p>` (`diffcore_rotate`): where the queue is
+    // re-anchored, and which of the two it is. The last one on the line wins.
+    let mut skip_or_rotate: Option<(bool, BString)> = None;
+    // `--output=<file>` (`diff_opt_output`): git's `xfopen(arg, "w")`, so the file is
+    // created and truncated during the option scan and every rendered byte goes there
+    // instead of to stdout.
+    let mut output_file: Option<std::fs::File> = None;
     // `--dirstat`'s parameter block (`struct dirstat_opts`), shared with the
     // `diff-files`/`diff-index` port that renders it.
     let mut dirstat = super::diff_files::DirStat::default();
@@ -823,6 +986,31 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                     Ok(id) => find_object_ids.push(id),
                     Err(e) => return Ok(e.report()),
                 }
+            } else if flag == "--skip-to" || flag == "--rotate-to" {
+                skip_or_rotate = Some((flag == "--skip-to", a.as_str().into()));
+            } else if flag == "--output" {
+                match open_output_file(a) {
+                    Ok(f) => output_file = Some(f),
+                    Err(code) => return Ok(code),
+                }
+            } else if flag == "-I" || flag == "--ignore-matching-lines" {
+                // The separated spelling of `diff_opt_ignore_regex`, reaching the
+                // same `regcomp` the glued one does.
+                match super::diff_pickaxe::compile_regex(a.as_bytes()) {
+                    Ok(re) => ignore.lines.push(super::diff_pickaxe::Needle::Regex(re)),
+                    Err(_) => {
+                        eprintln!("error: invalid regex given to -I: '{a}'");
+                        return Ok(ExitCode::from(129));
+                    }
+                }
+            } else if flag == "--inter-hunk-context" {
+                match parse_inter_hunk_context(a) {
+                    Ok(n) => ignore.inter_hunk_ctx = n,
+                    Err(msg) => {
+                        eprintln!("error: {msg}");
+                        return Ok(ExitCode::from(129));
+                    }
+                }
             } else if flag == "-S" || flag == "-G" {
                 // The separated spelling of the same callback the glued one reaches.
                 let kind = flag.as_bytes()[1];
@@ -888,7 +1076,18 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
             "--name-only" => fmt |= F_NAME,
             "--name-status" => fmt |= F_NAME_STATUS,
             "-p" | "-u" | "--patch" => fmt |= F_PATCH,
-            "-s" | "--no-patch" => fmt |= F_NO_OUTPUT,
+            // `OPT_SET_INT_F('s', "no-patch", &options->output_format, ...,
+            // DIFF_FORMAT_NO_OUTPUT, PARSE_OPT_NONEG)`: an *assignment*, so `-s`
+            // wipes every format bit already set — `--check` included, since
+            // `DIFF_FORMAT_CHECKDIFF` is one of them. Measured against 2.55.0:
+            // `git diff --name-only -s` prints nothing and exits 0 (the `--name-only`
+            // bit is gone, so the mutual-exclusion check below sees only one), while
+            // `git diff -s --stat` prints the stat block (the `--stat` bit arrives
+            // after the assignment).
+            "-s" | "--no-patch" => {
+                fmt = F_NO_OUTPUT;
+                check = false;
+            }
             "--summary" => fmt |= F_SUMMARY,
             // `--dirstat[=<params>]` / `--dirstat-by-file[=<params>]` / `--cumulative`
             // (`diff_opt_dirstat()`), all of which turn the format on.
@@ -937,7 +1136,17 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                 want_exit_code = true;
             }
             "--full-index" => full_index = true,
-            "--binary" => binary = true,
+            // `diff_opt_binary()` (diff.c:5613) is not a plain flag: it calls
+            // `enable_patch_output()` first, so `--binary` turns the patch on and
+            // clears `DIFF_FORMAT_NO_OUTPUT`. Measured against 2.55.0, `git diff
+            // --binary --stat` prints the stat block *and* the patch, and `git diff
+            // -s --binary` prints the patch — while `--binary -s` prints nothing,
+            // since `-s` assigns the format afterwards.
+            "--binary" => {
+                binary = true;
+                fmt |= F_PATCH;
+                fmt &= !F_NO_OUTPUT;
+            }
             "--abbrev" => {
                 abbrev = 7;
                 abbrev_explicit = true;
@@ -970,20 +1179,83 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
             // `--rename-empty`/`--no-rename-empty` are parsed above and fed to
             // `diffcore_rename`, so they change the output exactly as stock git's do.
             //
-            // KNOWN DIVERGENCE, do not describe these as no-ops: `--ignore-blank-lines`
-            // genuinely changes stock's output and is not honored here. Measured against
-            // git 2.55.0 on a blank-line-only edit, stock prints nothing and this prints
-            // the full hunk. `diff_pairs.rs` has the real implementation (a port of
-            // `xdl_mark_ignorable_lines`); wiring this command through it is the fix.
             // The remaining entries are believed to match zvcs's default behavior, but
             // that has not been measured flag by flag — treat them as unverified.
             // `revision.c`'s `--no-notes` turns off a display that is off by
             // default here, so it cannot change any output this command produces.
             "--no-notes" => {}
             "--ignore-cr-at-eol" => ws = Whitespace::IgnoreCrAtEol,
-            "--ignore-blank-lines" | "--text" | "-a"
-            | "--no-ext-diff" | "--ext-diff" | "--textconv"
+            // KNOWN DIVERGENCE, do not describe these as no-ops: `--textconv` and
+            // `--ext-diff` both change stock's output and are not honored here.
+            // `diff_pairs.rs` has the real implementations (`fill_textconv()` and
+            // `run_external_diff()`); wiring this command through them is the fix.
+            "--no-ext-diff" | "--ext-diff" | "--textconv"
             | "--no-textconv" | "--ita-invisible-in-index" | "--ita-visible-in-index" => {}
+            // `XDF_IGNORE_BLANK_LINES` (`OPT_BIT` on `xdl_opts`).
+            "--ignore-blank-lines" => ignore.blank_lines = true,
+            // `DIFF_OPT_TEXT` (`OPT_BIT` on `flags.text`): diff content git would
+            // otherwise report as `Binary files ... differ`.
+            "-a" | "--text" => ignore.text = true,
+            "--no-text" => ignore.text = false,
+            // `OPT_CALLBACK_F('I', "ignore-matching-lines", ..., diff_opt_ignore_regex)`:
+            // every occurrence appends to `xpp.ignore_regex`, and the value may be
+            // glued on or stand as the next argument. The pattern is compiled here,
+            // as the callback does, so a bad one is reported at this argv position.
+            s if s == "--ignore-matching-lines" || s == "-I" => {
+                pending_value = Some(s.to_string())
+            }
+            s if s.starts_with("--ignore-matching-lines=") || s.starts_with("-I") => {
+                let value = match s.strip_prefix("--ignore-matching-lines=") {
+                    Some(v) => v,
+                    None => &s["-I".len()..],
+                };
+                match super::diff_pickaxe::compile_regex(value.as_bytes()) {
+                    Ok(re) => ignore.lines.push(super::diff_pickaxe::Needle::Regex(re)),
+                    Err(_) => {
+                        eprintln!("error: invalid regex given to -I: '{value}'");
+                        return Ok(ExitCode::from(129));
+                    }
+                }
+            }
+            // `diff_opt_irreversible_delete`: `builtin_diff()` (diff.c:3596) emits the
+            // header of a pair whose post-image label is `/dev/null` and jumps to the
+            // end, so a deletion loses its `---`/`+++` pair and its hunks. The other
+            // formats never see the flag.
+            "-D" | "--irreversible-delete" => irreversible_delete = true,
+            // `diffcore_rotate()` (diff.c:6763): `--skip-to` drops every pair before
+            // the named one, `--rotate-to` wraps them to the end. Both are
+            // `OPT_STRING`, so the value may stand as the next argument, and the last
+            // one on the line is the one `diffcore_std()` reads.
+            "--skip-to" | "--rotate-to" => pending_value = Some(a.to_string()),
+            s if s.starts_with("--skip-to=") => {
+                skip_or_rotate = Some((true, s["--skip-to=".len()..].into()));
+            }
+            s if s.starts_with("--rotate-to=") => {
+                skip_or_rotate = Some((false, s["--rotate-to=".len()..].into()));
+            }
+            // `diff_opt_output`: `xfopen(arg, "w")`, which happens *during* the option
+            // scan — measured against 2.55.0, an unopenable path is fatal even when
+            // the command line also carries an unknown option or an unresolvable
+            // revision, both of which are reported after the scan.
+            "--output" => pending_value = Some(a.to_string()),
+            s if s.starts_with("--output=") => {
+                match open_output_file(&s["--output=".len()..]) {
+                    Ok(f) => output_file = Some(f),
+                    Err(code) => return Ok(code),
+                }
+            }
+            // `OPT_INTEGER_F(0, "inter-hunk-context", ..., PARSE_OPT_NONEG)`:
+            // `xecfg.interhunkctxlen`. Same two spellings as any `OPT_INTEGER`.
+            "--inter-hunk-context" => pending_value = Some(a.to_string()),
+            s if s.starts_with("--inter-hunk-context=") => {
+                match parse_inter_hunk_context(&s["--inter-hunk-context=".len()..]) {
+                    Ok(n) => ignore.inter_hunk_ctx = n,
+                    Err(msg) => {
+                        eprintln!("error: {msg}");
+                        return Ok(ExitCode::from(129));
+                    }
+                }
+            }
             // `XDF_INDENT_HEURISTIC` (`OPT_BIT` on `xdl_opts`): where a hunk that can
             // slide freely finally lands.
             // `-W`/`--function-context` (`XDL_EMIT_FUNCCONTEXT`): grow every hunk
@@ -1552,13 +1824,21 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
 
     // `diff_setup_done()`: --name-only / --name-status / -s are mutually exclusive
     // and, when present, suppress every other output format.
-    if (fmt & (F_NAME | F_NAME_STATUS | F_NO_OUTPUT)).count_ones() > 1 {
+    // `HAS_MULTI_BITS(options->output_format & (DIFF_FORMAT_NAME |
+    // DIFF_FORMAT_NAME_STATUS | DIFF_FORMAT_CHECKDIFF | DIFF_FORMAT_NO_OUTPUT))`.
+    // `--check` is `DIFF_FORMAT_CHECKDIFF`, one of the four, which is why the message
+    // names it.
+    if (fmt & (F_NAME | F_NAME_STATUS | F_NO_OUTPUT)).count_ones() + u32::from(check) > 1 {
         eprintln!(
             "fatal: options '--name-only', '--name-status', '--check', and '-s' cannot be used together"
         );
         return Ok(ExitCode::from(128));
     }
-    if fmt & (F_NAME | F_NAME_STATUS | F_NO_OUTPUT) != 0 {
+    // The clearing that follows the check names only three of the four: `-s` is an
+    // assignment, so by the time it is read there is nothing left to clear, and a
+    // format that arrives *after* it survives — measured, `git diff -s --stat` prints
+    // the stat block and `git diff -s --raw` prints the raw records.
+    if fmt & (F_NAME | F_NAME_STATUS) != 0 || check {
         fmt &= !(F_RAW | F_NUMSTAT | F_DIFFSTAT | F_SHORTSTAT | F_PATCH);
     }
     // `--name-only`/`--name-status` suppress `--summary`, but `-s` does not.
@@ -1642,9 +1922,9 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     let mut old_tree_id: Option<ObjectId> = None;
 
     if cached {
-        if revs.len() == 2 {
-            bail!("--cached with two revisions is not supported");
-        }
+        // No second revision can reach here: `cmd_diff()`'s `--cached` arity check
+        // above returns `usage_error()` (129) for `revs.len() >= 2` before any of this
+        // runs, so the tree-vs-index collection below always has exactly one endpoint.
         old_tree_id = Some(tree_id_for(&repo, revs.first())?);
         collect_tree_index(&repo, revs.first(), &mut deltas)?;
         cache = repo.diff_resource_cache_for_tree_diff()?;
@@ -1714,6 +1994,13 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
         }
     }
 
+    // `diff_setup_done()` (diff.c:5288): `--find-copies-harder` on its own turns copy
+    // detection on. A bare `-C -C` reaches here through the second `-C`, but a lone
+    // `--find-copies-harder` sets only the flag, and without this the whole pass —
+    // including the unmodified-source pairs below — would never run.
+    if ro.find_copies_harder {
+        ro.detect_rename = diffcore_rename::DETECT_COPY;
+    }
     // `diff_setup_done()`: `--quiet` turns rename and copy detection off outright.
     if quiet {
         ro.detect_rename = 0;
@@ -1798,12 +2085,39 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
         deltas.sort_by_cached_key(|d| diff_files::match_order(&order, d.path.as_slice()));
     }
 
+    // `diffcore_rotate()` (diff.c:6763): re-anchor the queue on the named pair —
+    // `--skip-to` drops everything before it, `--rotate-to` wraps it to the end. The
+    // comparison is against `p->two->path`, the repository-root relative name, so it
+    // runs here rather than after `--relative` has shortened anything. The function
+    // opens with `if (!q->nr) return;`, which is why `git diff --skip-to=nowhere` on a
+    // clean tree prints nothing and exits 0 instead of dying.
+    if let Some((is_skip, target)) = &skip_or_rotate {
+        if !deltas.is_empty() {
+            match deltas.iter().position(|d| d.path == *target) {
+                Some(k) if *is_skip => deltas.drain(..k).for_each(drop),
+                Some(k) => deltas.rotate_left(k),
+                None => {
+                    let mut msg = b"fatal: No such path '".to_vec();
+                    msg.extend_from_slice(target.as_slice());
+                    msg.extend_from_slice(b"' in the diff\n");
+                    std::io::stderr().lock().write_all(&msg)?;
+                    return Ok(ExitCode::from(128));
+                }
+            }
+        }
+    }
+
     // ---- analyze every delta once -----------------------------------------
     // `--quiet`/`-s` produce no output, so the patch bodies are never needed.
     let workdir = repo.workdir().map(|p| p.to_owned());
-    // `diff_setup_done()` (diff.c:4899): the whitespace-ignoring options make "is
-    // there a change?" a question only the rendered content can answer.
-    let from_contents = ws != Whitespace::Keep;
+    // `diff_setup_done()` (diff.c:4899): the four whitespace-ignoring options and
+    // `-I<re>` make "is there a change?" a question only the rendered content can
+    // answer, so they raise `flags.diff_from_contents`. `--ignore-blank-lines` is
+    // deliberately *not* on that list, and the difference is visible: measured
+    // against 2.55.0, `git diff -w --raw` and `git diff -I<re> --raw` print a real
+    // post-image object name for a worktree side while `git diff
+    // --ignore-blank-lines --raw` prints all-zero.
+    let from_contents = ws != Whitespace::Keep || !ignore.lines.is_empty();
     // `diff_flush()` (diff.c:6828): `--quiet`/`-s` produce no output, but with
     // `diff_from_contents` and `--exit-code` git still runs the patch machinery with
     // its output redirected to `/dev/null` purely to learn the exit status.
@@ -1849,6 +2163,7 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
             // `--binary` reads nothing extra.
             binary && want_patch,
             func_context,
+            &ignore,
         )?;
     }
 
@@ -1888,6 +2203,7 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                             false,
                             binary,
                             func_context,
+                            &ignore,
                         )?;
                         let add_an = analyze(
                             &mut null_cache,
@@ -1904,6 +2220,7 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                             false,
                             binary,
                             func_context,
+                            &ignore,
                         )?;
                         (del_an, add_an)
                     } else {
@@ -1922,6 +2239,7 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                             false,
                             binary,
                             func_context,
+                            &ignore,
                         )?;
                         let add_an = analyze(
                             &mut cache,
@@ -1938,6 +2256,7 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                             false,
                             binary,
                             func_context,
+                            &ignore,
                         )?;
                         (del_an, add_an)
                     };
@@ -1972,6 +2291,8 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
         abbrev,
         full_index,
         binary,
+        text: ignore.text,
+        irreversible_delete,
         z,
         src_prefix,
         dst_prefix,
@@ -2052,7 +2373,9 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                     }
                 }
                 if fmt & (F_RAW | F_NAME_STATUS) != 0 {
-                    render_raw(&mut out, delta, fmt, &r);
+                    // The quiet render above is `run_diff()`, so it has already left
+                    // `diff_fill_oid_info()`'s hash on a worktree side.
+                    render_raw(&mut out, delta, fmt, &r, names_need_patch.then(|| &analyses[i]));
                 } else {
                     out.extend_from_slice(&name_field(&delta.path, r.z));
                     out.push(if r.z { 0 } else { b'\n' });
@@ -2249,9 +2572,20 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
         emit_combined(&mut out, &repo, &combined_req, &paths, ctx, &r, &mut separator, &line_prefix)?;
     }
 
-    let mut stdout = std::io::stdout().lock();
-    stdout.write_all(&out)?;
-    stdout.flush()?;
+    // `--output=<file>` pointed git's output `FILE*` at a file back at parse time;
+    // every rendered byte goes there instead of to stdout, while the exit status is
+    // still computed below.
+    match output_file {
+        Some(mut f) => {
+            f.write_all(&out)?;
+            f.flush()?;
+        }
+        None => {
+            let mut stdout = std::io::stdout().lock();
+            stdout.write_all(&out)?;
+            stdout.flush()?;
+        }
+    }
     // `diff_result_code()` calls `diff_warn_rename_limit()` after stdout is flushed,
     // so the `-l` / `diff.renameLimit` warnings land after the diff itself.
     // A combined diff runs every diffcore pass on `diff_tree_combined()`'s *copy* of
@@ -2744,7 +3078,7 @@ fn collect_tree_worktree(
                 }
             }
             gix::status::Item::IndexWorktree(item) => {
-                if let Some((path, new, dirty, head)) = worktree_new_side(item)? {
+                if let Some((path, new, dirty, head)) = worktree_new_side(repo.workdir(), item)? {
                     new_sides.insert(path, (new, dirty, head));
                 }
             }
@@ -2831,7 +3165,7 @@ fn collect_index_worktree(
                 continue;
             }
         }
-        if let Some((path, new, dirty, head)) = worktree_new_side(item)? {
+        if let Some((path, new, dirty, head)) = worktree_new_side(Some(workdir), item)? {
             // A worktree entry with no index counterpart cannot happen here (the
             // dirwalk is off), so the old side is always the index entry.
             let entry = index
@@ -2884,16 +3218,16 @@ fn collect_index_worktree(
 /// which `run_diff_files()` derives with `ce_mode_from_stat()` and `run_diff()`
 /// then renders as a deletion followed by a creation.
 ///
-/// gix reports `Mode::COMMIT` for *any* path that became a directory, because
-/// `change_to_match_fs()` cannot tell a checked-out submodule from a plain
-/// directory. git can: `check_removed()` (diff-lib.c) calls `resolve_gitlink_ref()`
-/// on the directory and, when it is not a repository, reports the tracked blob as
-/// simply removed instead. That lookup is the missing piece, so this one case is
-/// refused rather than guessed at.
+/// A directory never reaches here. gix-status intercepts `metadata.is_dir()`
+/// (`gix-status/src/index_as_worktree/function.rs:379-393`) before
+/// `change_to_match_fs()` runs and reports `Change::Removed` for every non-submodule
+/// entry, so `change_to_match_fs()`'s `stat.is_dir() => Mode::COMMIT` arm
+/// (`gix-index/src/entry/mode.rs:60-61`) is unreachable from this path and
+/// `new_kind` is never `Commit` unless `old_kind` already was. The directory case
+/// is handled where gix raises it, in [`removed_or_gitlink`].
 fn worktree_type_change(
     rela_path: BString,
     worktree_mode: gix::index::entry::Mode,
-    old_kind: EntryKind,
 ) -> Result<Option<(BString, NewSide, u8, Option<ObjectId>)>> {
     let Some(new_kind) = index_mode_kind(worktree_mode) else {
         bail!(
@@ -2901,19 +3235,61 @@ fn worktree_type_change(
             worktree_mode.bits()
         )
     };
-    if new_kind == EntryKind::Commit && old_kind != EntryKind::Commit {
-        bail!(
-            "{rela_path:?} was replaced by a directory; telling a checked-out submodule from a \
-             plain directory needs git's resolve_gitlink_ref(), which is not ported"
-        )
-    }
     Ok(Some((rela_path, NewSide::Worktree(new_kind), 0, None)))
+}
+
+/// `check_removed()` (diff-lib.c:22) deciding whether a vanished blob really is a
+/// deletion:
+///
+/// ```c
+/// if (S_ISDIR(st->st_mode)) {
+///         struct object_id sub;
+///         if (!S_ISGITLINK(ce->ce_mode) &&
+///             resolve_gitlink_ref(ce->name, "HEAD", &sub))
+///                 return 1;
+/// }
+/// return 0;
+/// ```
+///
+/// A tracked blob whose name a *directory* has taken is only removed when that
+/// directory is not a repository. When it is one, `check_removed()` returns 0 and
+/// `run_diff_files()` gives the pair `ce_mode_from_stat()`'s `S_IFGITLINK`, so the
+/// change is a type change to `160000` — `T` in `--raw`, `mode change 100644 =>
+/// 160000` in `--summary`, and a deletion section followed by a
+/// `Subproject commit <oid>` creation in the patch.
+///
+/// gix-status cannot make that call: it reports `Change::Removed` for any
+/// non-submodule entry whose path is a directory, so the lookup happens here.
+/// `resolve_gitlink_ref()` is `gix::open(<dir>)` + `head_id()` — the same two calls
+/// [`super::commit`] uses to stage a directory that turned out to be a submodule.
+/// A repository whose `HEAD` is unborn resolves to nothing, and git treats that as
+/// a plain removal too.
+fn removed_or_gitlink(
+    workdir: Option<&std::path::Path>,
+    rela_path: BString,
+) -> Option<(BString, NewSide, u8, Option<ObjectId>)> {
+    let removed = (rela_path.clone(), NewSide::Absent, 0, None);
+    let Some(workdir) = workdir else { return Some(removed) };
+    let abs = workdir.join(gix::path::from_bstr(rela_path.as_bstr()).as_ref());
+    if !abs.is_dir() {
+        return Some(removed);
+    }
+    match gix::open(&abs)
+        .ok()
+        .and_then(|sub| sub.head_id().ok().map(|h| h.detach()))
+    {
+        // `run_diff_files()` leaves the worktree gitlink's filespec invalid, so the
+        // post-image keeps no `--raw` id; the commit rides along for the patch.
+        Some(head) => Some((rela_path, NewSide::Worktree(EntryKind::Commit), 0, Some(head))),
+        None => Some(removed),
+    }
 }
 
 /// The "new" side an index-vs-worktree status item implies, together with the
 /// `DIRTY_SUBMODULE_*` bits and the checked-out submodule commit it carries, or
 /// `None` when the item is not a change.
 fn worktree_new_side(
+    workdir: Option<&std::path::Path>,
     item: gix::status::index_worktree::Item,
 ) -> Result<Option<(BString, NewSide, u8, Option<ObjectId>)>> {
     use gix::status::index_worktree::Item;
@@ -2952,7 +3328,7 @@ fn worktree_new_side(
             // The gitlink's path is no longer a directory. `ce_mode_from_stat()`
             // gives the pair the worktree's own type and `run_diff()` then splits it.
             EntryStatus::Change(Change::Type { worktree_mode }) => {
-                worktree_type_change(rela_path, worktree_mode, old_kind)?
+                worktree_type_change(rela_path, worktree_mode)?
             }
             _ => None,
         });
@@ -2969,9 +3345,12 @@ fn worktree_new_side(
             };
             Some((rela_path, NewSide::Worktree(new_kind), 0, None))
         }
-        EntryStatus::Change(Change::Removed) => Some((rela_path, NewSide::Absent, 0, None)),
+        // gix reports every non-submodule entry whose path became a directory as a
+        // removal; `check_removed()` only agrees when the directory is not a
+        // repository. See [`removed_or_gitlink`].
+        EntryStatus::Change(Change::Removed) => removed_or_gitlink(workdir, rela_path),
         EntryStatus::Change(Change::Type { worktree_mode }) => {
-            worktree_type_change(rela_path, worktree_mode, old_kind)?
+            worktree_type_change(rela_path, worktree_mode)?
         }
         // A conflicted path still has worktree content; only `git diff` with no
         // revision treats it specially, and that caller intercepts it first.
@@ -3454,9 +3833,13 @@ fn patch_render(repo: &gix::Repository, opts: &PatchOpts) -> Render {
         // This renderer only produces patches, so the raw width never applies.
         raw_abbrev: crate::abbrev::configured_abbrev(repo, hash_kind.len_in_hex()),
         full_index: opts.full_index,
-        // The history commands do not parse `--binary` yet, so a binary pair there
-        // still renders as `Binary files … differ`, exactly as before.
-        binary: false,
+        // `--binary`: `setup_revisions()` reaches the same `diff_opt_parse()` arm
+        // (revision.c:2721) a bare `git diff` does, so a binary pair under
+        // `log -p --binary` carries the `GIT binary patch` payload.
+        binary: opts.binary,
+        text: opts.text,
+        // `-D`/`--irreversible-delete`.
+        irreversible_delete: opts.irreversible_delete,
         z: false,
         src_prefix: opts.src_prefix.clone(),
         dst_prefix: opts.dst_prefix.clone(),
@@ -3497,6 +3880,32 @@ pub(crate) struct PatchOpts {
     /// `--no-abbrev` zeroes `revs->abbrev`, which the raw format reads as "print the
     /// whole id" while the `index` line falls back to the configured default.
     pub index_abbrev: Option<usize>,
+    /// `--minimal`/`--patience`/`--histogram`/`--diff-algorithm=<v>`, and the
+    /// `diff.algorithm` config default behind them (`git_diff_ui_config()`,
+    /// diff.c:78). `None` leaves the `xdl_diff()` default (Myers) in charge.
+    pub algorithm: Option<gix::diff::blob::Algorithm>,
+    /// `--indent-heuristic`/`--no-indent-heuristic` (`XDF_INDENT_HEURISTIC`): run the
+    /// slider post-processing pass. On by default since git 2.14, so this starts
+    /// `true` and only `--no-indent-heuristic` clears it.
+    pub indent_heuristic: bool,
+    /// `--binary`: emit a `GIT binary patch` payload for a binary pair and widen that
+    /// pair's `index` line to full object names.
+    pub binary: bool,
+    /// `-D`/`--irreversible-delete`: a deletion loses its `---`/`+++` pair and hunks.
+    pub irreversible_delete: bool,
+    /// `--ignore-blank-lines` (`XDF_IGNORE_BLANK_LINES`).
+    pub blank_lines: bool,
+    /// `-I<re>` / `--ignore-matching-lines=<re>` (`xpp.ignore_regex`): a change whose
+    /// every line matches one of these is marked ignorable by
+    /// `xdl_mark_ignorable_regex()` and drops out of the hunk set.
+    pub ignore_lines: Vec<super::diff_pickaxe::Needle>,
+    /// `--inter-hunk-context=<n>` (`xecfg.interhunkctxlen`): the gap two changes may
+    /// span and still share one hunk.
+    pub inter_hunk_ctx: usize,
+    /// `--submodule[=<format>]` (`o->submodule_format`). `Short` is git's default and
+    /// renders a gitlink pair as the synthetic `Subproject commit <oid>` blob; the
+    /// other two take `builtin_diff()`'s submodule branches (diff.c:3870).
+    pub submodule_format: SubmoduleFormat,
 }
 
 impl Default for PatchOpts {
@@ -3514,6 +3923,15 @@ impl Default for PatchOpts {
             find_copies_harder: false,
             break_opt: -1,
             index_abbrev: None,
+            algorithm: None,
+            // `XDF_INDENT_HEURISTIC` is git's default (diff.c `diff_setup()`).
+            indent_heuristic: true,
+            binary: false,
+            irreversible_delete: false,
+            blank_lines: false,
+            ignore_lines: Vec::new(),
+            inter_hunk_ctx: 0,
+            submodule_format: SubmoduleFormat::Short,
         }
     }
 }
@@ -3647,18 +4065,18 @@ fn commit_patch_with(
     // deltas, so the secondary key is inert here but kept for parity with `diff()`.
     // `-- <pathspec>`: git limits the patch to the paths it was asked about, the
     // same list that decided which commits are shown.
-    let mut follow_specs = None;
-    match specs {
-        Some(s) if follow => follow_specs = Some(s),
-        Some(s) => deltas.retain(|delta| s.matches(&delta.path)),
-        None => {}
+    let mut specs = specs;
+    if let Some(s) = specs.as_mut() {
+        if !follow {
+            deltas.retain(|delta| s.matches(&delta.path));
+        }
     }
     deltas.sort_by(|a, b| a.path.cmp(&b.path).then(b.unmerged.cmp(&a.unmerged)));
 
     // `diffcore_std()`: `git log`/`git show` are porcelains, so rename detection is on
     // unless `diff.renames` turns it off — a `git mv` commit is one `R` section, not a
     // deletion plus an addition.
-    let ro = diffcore_rename::Options {
+    let mut ro = diffcore_rename::Options {
         detect_rename: opts.renames.unwrap_or_else(|| {
             diffcore_rename::config_rename(
                 repo.config_snapshot()
@@ -3677,6 +4095,30 @@ fn commit_patch_with(
         hash_kind: repo.object_hash(),
         ..Default::default()
     };
+    // `diff_setup_done()` (diff.c:5288): `--find-copies-harder` turns copy detection
+    // on by itself, whatever `diff.renames` or `--no-renames` asked for.
+    if ro.find_copies_harder {
+        ro.detect_rename = diffcore_rename::DETECT_COPY;
+        // git supplies the unmodified copy sources by having the tree walk emit
+        // equal entries as pairs (tree-diff.c:519, 557). Reproduce that here; the
+        // pathspec limit is re-applied because those pairs bypassed the retain above,
+        // and `diffcore_rename()`'s write-back drops whichever ones stay unclaimed.
+        if let Some(old) = old_tree.as_ref() {
+            let before = deltas.len();
+            add_unmodified_pairs(repo, Some(old.id().detach()), &[], false, &mut deltas)?;
+            if !follow {
+                if let Some(s) = specs.as_mut() {
+                    let added: Vec<Delta> = deltas
+                        .split_off(before)
+                        .into_iter()
+                        .filter(|d| s.matches(&d.path))
+                        .collect();
+                    deltas.extend(added);
+                }
+            }
+        }
+        deltas.sort_by(|a, b| a.path.cmp(&b.path).then(b.unmerged.cmp(&a.unmerged)));
+    }
     // `-B` runs through the same pass even with no rename detection behind it.
     if ro.detect_rename != 0 || ro.break_opt != -1 {
         run_diffcore_rename(repo, cache, &mut deltas, &ro, false)?;
@@ -3684,8 +4126,10 @@ fn commit_patch_with(
     }
     // The `--follow` limit, applied once the rename it is following exists as a
     // pair: the destination is the name the file has at this commit.
-    if let Some(specs) = follow_specs {
-        deltas.retain(|delta| specs.matches(&delta.path));
+    if follow {
+        if let Some(specs) = specs.as_mut() {
+            deltas.retain(|delta| specs.matches(&delta.path));
+        }
     }
 
     let hash_kind = repo.object_hash();
@@ -3699,6 +4143,30 @@ fn commit_patch_with(
             None => vec![queued],
         };
         for delta in steps {
+            // `builtin_diff()`'s submodule branches (diff.c:3870) sit downstream of
+            // `run_diff()`'s type-change split, so each half is tested on its own —
+            // the same placement `git diff` uses at line 2424 above. Under the default
+            // `short` format a gitlink pair falls through to `render_patch`, which
+            // diffs the synthetic `Subproject commit <oid>` blobs.
+            //
+            // These bytes are emitted already painted, but `git log`/`git show` never
+            // colour a patch body (matching stock: `log -p --color=always` paints only
+            // the commit header), so the disabled palette is the faithful one here.
+            if opts.submodule_format != SubmoduleFormat::Short
+                && !delta.unmerged
+                && delta.is_submodule_pair()
+            {
+                render_submodule(
+                    &mut out,
+                    repo,
+                    delta,
+                    opts.submodule_format,
+                    crate::abbrev::configured_abbrev(repo, hash_kind.len_in_hex()),
+                    &diff_color::DiffColors::disabled(),
+                    r,
+                );
+                continue;
+            }
             // A worktree side never arises for a tree diff, so `workdir` is `None`.
             let an = analyze(
                 cache,
@@ -3706,15 +4174,21 @@ fn commit_patch_with(
                 delta,
                 opts.ctx,
                 opts.ws,
-                true,
+                opts.indent_heuristic,
                 hash_kind,
                 None,
                 true,
-                None,
+                opts.algorithm,
                 None,
                 false,
                 r.binary,
                 opts.func_context,
+                &IgnoreOpts {
+                    text: opts.text,
+                    blank_lines: opts.blank_lines,
+                    lines: opts.ignore_lines.clone(),
+                    inter_hunk_ctx: opts.inter_hunk_ctx,
+                },
             )?;
             render_patch(&mut out, repo, delta, &an, opts.ctx, r)?;
         }
@@ -3764,6 +4238,7 @@ pub(crate) fn line_range_patch(
             false,
             r.binary,
             false,
+            &IgnoreOpts::default(),
         )?;
         render_patch(&mut out, repo, &delta, &an, ctx, &r)?;
     }
@@ -3890,6 +4365,8 @@ fn analyze_all(
     want_binary: bool,
     // `-W`: emit hunks grown to enclosing-function boundaries.
     func_context: bool,
+    // See [`analyze`].
+    ignore: &IgnoreOpts,
 ) -> Result<Vec<Analysis>> {
     // Two files per worker. A handle clone plus a fresh blob platform is real
     // setup, but analyzing one file means reading and diffing both its sides —
@@ -3915,6 +4392,7 @@ fn analyze_all(
                     want_dirstat,
                     want_binary,
                     func_context,
+                    ignore,
                 )
             })
             .collect();
@@ -3963,6 +4441,7 @@ fn analyze_all(
                         want_dirstat,
                         want_binary,
                         func_context,
+                        ignore,
                     )?;
                     mine.push((i, an));
                 }
@@ -3989,6 +4468,45 @@ fn analyze_all(
     Ok(done.into_iter().map(|(_, a)| a).collect())
 }
 
+/// Hand the blob platform git's *invalid filespec*: the side of a pair that does not
+/// exist.
+///
+/// `diff_populate_filespec()` (diff.c:4062) returns immediately for a filespec whose
+/// `oid_valid` and `is_stdin` are both clear and whose mode is zero — an absent side
+/// never reaches the worktree, whichever side of the pair it is on. The blob platform
+/// has no such state: it decides between "read this path off disk" and "resolve this id
+/// in the odb" purely by whether a [`WorktreeRoots`] entry covers the side
+/// (`gix-diff/src/blob/pipeline.rs:271`), and a null id only *looks* absent under a root
+/// because the file is normally gone. When something else has taken the name — a
+/// directory, most commonly, after `rm f && mkdir f` — the read fails and the whole diff
+/// dies, where stock renders an ordinary deletion patch at 0.
+///
+/// So the root is lifted for the one call. With `roots.by_kind(kind)` `None`, the
+/// pipeline's `id.is_null()` arm (`pipeline.rs:399`) reports no data at all, which is
+/// exactly the empty filespec. The lift also moves the platform's cache key from the
+/// path to the (null) id, so an absent side shares one entry instead of shadowing the
+/// worktree entry for that path.
+fn set_absent_resource(
+    cache: &mut gix::diff::blob::Platform,
+    kind: ResourceKind,
+    mode: EntryKind,
+    rela_path: &gix::bstr::BStr,
+    objects: &gix::OdbHandle,
+    null: ObjectId,
+) -> Result<()> {
+    let root = match kind {
+        ResourceKind::OldOrSource => cache.filter.roots.old_root.take(),
+        ResourceKind::NewOrDestination => cache.filter.roots.new_root.take(),
+    };
+    let res = cache.set_resource(null, mode, rela_path, kind, objects);
+    match kind {
+        ResourceKind::OldOrSource => cache.filter.roots.old_root = root,
+        ResourceKind::NewOrDestination => cache.filter.roots.new_root = root,
+    }
+    res?;
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn analyze(
     cache: &mut gix::diff::blob::Platform,
@@ -4013,6 +4531,9 @@ fn analyze(
     want_binary: bool,
     // `-W`: hunks grown to enclosing-function boundaries.
     func_context: bool,
+    // The `xpp`/`xecfg` knobs that decide which changes survive into the hunk stream
+    // at all: `--ignore-blank-lines`, `-I<re>`, `--inter-hunk-context=<n>` and `-a`.
+    ignore: &IgnoreOpts,
 ) -> Result<Analysis> {
     let null = hash_kind.null();
     if delta.unmerged {
@@ -4042,7 +4563,18 @@ fn analyze(
         NewSide::Worktree(EntryKind::Commit) => delta.new_commit,
         _ => None,
     };
-    if old_commit.is_some() || new_commit.is_some() {
+    let old_is_gitlink = matches!(delta.old, Some((_, EntryKind::Commit)));
+    let new_is_gitlink = matches!(delta.new_kind(), Some(EntryKind::Commit));
+    // A pair with a gitlink on *one* side and a blob on the other. `run_diff()`
+    // (diff.c:5052) splits it for the patch formats, but `builtin_diffstat()`
+    // (diff.c:3900) is handed it whole and fills both sides with `fill_mmfile()` —
+    // so the blob contributes its own lines while the gitlink contributes the
+    // one-line image `diff_populate_filespec()` (diff.c:4110) synthesises for it.
+    // Measured against git 2.55.0: a 3-line file replaced by a checked-out submodule
+    // is `1  3  f` in `--numstat` and ` f | 4 +---` in `--stat`.
+    let mixed_gitlink =
+        delta.old.is_some() && delta.new_kind().is_some() && old_is_gitlink != new_is_gitlink;
+    if (old_is_gitlink || new_is_gitlink) && !mixed_gitlink {
         return analyze_gitlink(
             old_commit,
             new_commit,
@@ -4060,9 +4592,31 @@ fn analyze(
     // source path (git passes `p->one->path` for that side).
     let old_side_path = delta.old_path().as_bstr();
     let old_kind = delta.old.map(|(_, k)| k).unwrap_or(EntryKind::Blob);
+    // The gitlink half of a mixed pair has no blob to hand the platform, so both
+    // images are filled the way `fill_mmfile()` does and diffed directly.
+    if mixed_gitlink {
+        let before = filespec_image(objects, workdir, delta, true)?;
+        let after = filespec_image(objects, workdir, delta, false)?;
+        return analyze_images(
+            Some(before),
+            Some(after),
+            delta.old.map_or(null, |(id, _)| id),
+            match &delta.new {
+                NewSide::Blob(id, _) => *id,
+                NewSide::Worktree(EntryKind::Commit) => delta.new_commit.unwrap_or(null),
+                _ => null,
+            },
+            false,
+            ctx,
+            want_patch,
+            algo_override,
+        );
+    }
     match delta.old {
         Some((id, k)) => cache.set_resource(id, k, old_side_path, ResourceKind::OldOrSource, objects)?,
-        None => cache.set_resource(null, old_kind, old_side_path, ResourceKind::OldOrSource, objects)?,
+        // An addition's pre-image is git's invalid filespec — `diff_populate_filespec()`
+        // returns an empty one without touching the worktree. See [`set_absent_resource`].
+        None => set_absent_resource(cache, ResourceKind::OldOrSource, old_kind, old_side_path, objects, null)?,
     };
     match &delta.new {
         NewSide::Blob(id, k) => {
@@ -4072,27 +4626,10 @@ fn analyze(
             // With `new_root` set on the cache, a null id reads from the worktree by path.
             cache.set_resource(null, *k, path, ResourceKind::NewOrDestination, objects)?;
         }
+        // A deletion's post-image is git's invalid filespec: no content, and never a
+        // worktree read. See [`set_absent_resource`].
         NewSide::Absent => {
-            // A deletion's post-image is git's invalid filespec: no content. With
-            // `new_root` set, though, the blob platform resolves this null id by
-            // *reading the path*, and it only comes out empty because the file is
-            // normally gone. When a directory has taken the name the read fails, and
-            // the failure is the platform's rather than the diff's, so it is named
-            // here instead of surfacing raw. (`--raw`, `--name-status` and `--stat`
-            // are unaffected: they never reach the blob platform.)
-            // Under `-R` the worktree root sits on the *old* side instead, so the
-            // post-image is read from nowhere and the collision cannot arise.
-            if let Some(base) = workdir.filter(|_| !delta.old_worktree) {
-                let full = base.join(gix::path::from_bstr(path));
-                if full.symlink_metadata().is_ok_and(|m| m.is_dir()) {
-                    bail!(
-                        "{path:?} is deleted from the index but a directory now has that \
-                         name: rendering its patch needs a blob platform with no worktree \
-                         root, and this pipeline shares one with the post-image side"
-                    )
-                }
-            }
-            cache.set_resource(null, old_kind, path, ResourceKind::NewOrDestination, objects)?;
+            set_absent_resource(cache, ResourceKind::NewOrDestination, old_kind, path, objects, null)?;
         }
     };
 
@@ -4138,9 +4675,10 @@ fn analyze(
     match prep.operation {
         Operation::SourceOrDestinationIsBinary => {
             // The blob pipeline withholds the data for a binary pair, so both images
-            // are read back here — and only if `--dirstat` or `--binary` is going to
-            // use them, since for a binary pair that is the whole file on both sides.
-            let images = if want_dirstat || want_binary {
+            // are read back here — and only if `--dirstat`, `--binary` or `-a` is
+            // going to use them, since for a binary pair that is the whole file on
+            // both sides.
+            let images = if want_dirstat || want_binary || ignore.text {
                 let old_bytes = match (delta.old, delta.old_worktree) {
                     (None, _) => Vec::new(),
                     (Some(_), true) => workdir
@@ -4171,7 +4709,24 @@ fn analyze(
                 added: blob_size_new(objects, delta, workdir, path)?,
                 deleted: blob_size_old(objects, delta, workdir)?,
                 binary: true,
-                hunks: None,
+                // `-a`/`--text` (`o->flags.text`) drops out of `builtin_diff()`'s
+                // binary test, so the pair gets an ordinary textual patch while
+                // `binary` above keeps `builtin_diffstat()` — which never reads the
+                // flag — reporting `Bin <a> -> <b> bytes`.
+                hunks: match (ignore.text && want_patch, &images) {
+                    (true, Some((old_bytes, new_bytes))) => text_hunks(
+                        old_bytes,
+                        new_bytes,
+                        ctx,
+                        ws,
+                        indent_heuristic,
+                        algo_override.unwrap_or(gix::diff::blob::Algorithm::Myers),
+                        func_context,
+                        ignore,
+                    )?
+                    .1,
+                    _ => None,
+                },
                 blank_at_eof: (0, 0),
                 // `show_dirstat()` weighs a binary pair like any other, on the raw
                 // bytes with `hash_chars()` in its 64-byte-chunk mode.
@@ -4184,6 +4739,11 @@ fn analyze(
                 images: want_binary.then_some(images).flatten(),
             })
         }
+        // Unreachable: `prepare_diff()` only chooses this operation when
+        // `Options::skip_internal_diff_if_external_is_configured` is set, and
+        // `gix::diff::resource_cache()` (src/ported/gix/src/diff.rs:236) hardcodes it
+        // to `false` for every platform this command builds. A `diff.<driver>.command`
+        // is therefore ignored here rather than run — see the module header.
         Operation::ExternalCommand { .. } => {
             bail!("external diff drivers are not supported for {path:?}")
         }
@@ -4220,81 +4780,48 @@ fn analyze(
                     images: None,
                 });
             }
-            let before: Vec<&[u8]> = byte_lines(old_data);
-            let after: Vec<&[u8]> = byte_lines(new_data);
-            let mut input: InternedInput<Vec<u8>> = InternedInput::default();
-            input.update_before(before.iter().map(|l| normalize_line(l, ws)));
-            input.update_after(after.iter().map(|l| normalize_line(l, ws)));
-
-            // `xdl_change_compact()` measures `xdf->recs[i]->ptr`, the *original*
-            // record, not the whitespace-normalized token the comparison used.
-            let diff =
-                super::diff_pairs::compute_compacted(algorithm, &input, &before, &after, indent_heuristic);
-            let added = diff.count_additions();
-            let deleted = diff.count_removals();
-            let hunks = if want_patch && (added != 0 || deleted != 0) {
-                match line_ranges {
-                    // `-L`: xdiff runs with the context inflated to the widest
-                    // tracked span so every change inside one range lands in a
-                    // single hunk, and the sink clips back to the range bounds.
-                    Some(rs) => {
+            let ((added, deleted), hunks) = match line_ranges {
+                // `-L`: xdiff runs with the context inflated to the widest tracked
+                // span so every change inside one range lands in a single hunk, and
+                // the sink clips back to the range bounds. `-L` is a history option
+                // and never arrives beside `-I` or `--inter-hunk-context`.
+                Some(rs) => {
+                    let before: Vec<&[u8]> = byte_lines(old_data);
+                    let after: Vec<&[u8]> = byte_lines(new_data);
+                    let mut input: InternedInput<Vec<u8>> = InternedInput::default();
+                    input.update_before(before.iter().map(|l| normalize_line(l, ws)));
+                    input.update_after(after.iter().map(|l| normalize_line(l, ws)));
+                    let diff = super::diff_pairs::compute_compacted(
+                        algorithm,
+                        &input,
+                        &before,
+                        &after,
+                        indent_heuristic,
+                    );
+                    let counts = (diff.count_additions(), diff.count_removals());
+                    let hunks = if want_patch && (counts.0 != 0 || counts.1 != 0) {
                         let ctx = super::line_log::RangeSink::context(rs, ctx);
                         let sink = super::line_log::RangeSink::new(&before, &after, rs);
                         Some(
                             UnifiedDiff::new(&diff, &input, sink, ContextSize::symmetrical(ctx))
                                 .consume()?,
                         )
-                    }
-                    // `-W` changes the hunk *geometry*, not just the text inside
-                    // it: both ends grow to the enclosing function and neighbours
-                    // that end up overlapping merge. gitoxide's unified writer has
-                    // one fixed context on both sides and cannot express that, so
-                    // this takes the `xdl_emit_diff` port instead — the same
-                    // emitter `git diff-pairs` runs, driven off the same change
-                    // script.
-                    None if func_context => {
-                        let changes: Vec<super::diff_pairs::Change> = diff
-                            .hunks()
-                            .map(|h| super::diff_pairs::Change {
-                                i1: h.before.start as usize,
-                                chg1: h.before.len(),
-                                i2: h.after.start as usize,
-                                chg2: h.after.len(),
-                                // `--ignore-blank-lines`/`-I` are not honoured on
-                                // this path, so no change is ever ignorable.
-                                ignore: false,
-                            })
-                            .collect();
-                        let (_, _, buf) = super::diff_pairs::emit_unified(
-                            &before,
-                            &after,
-                            &changes,
-                            &super::diff_pairs::EmitGeometry {
-                                ctx: ctx as usize,
-                                inter_hunk_ctx: 0,
-                                func_context: true,
-                            },
-                        );
-                        Some(buf)
-                    }
-                    None => {
-                        let sink = PatchSink {
-                            buf: Vec::new(),
-                            before: &before,
-                            after: &after,
-                            // No hunk has been emitted yet, so nothing bounds the
-                            // first search.
-                            func_prev: -1,
-                            func_text: Vec::new(),
-                        };
-                        Some(
-                            UnifiedDiff::new(&diff, &input, sink, ContextSize::symmetrical(ctx))
-                                .consume()?,
-                        )
-                    }
+                    } else {
+                        None
+                    };
+                    (counts, hunks)
                 }
-            } else {
-                None
+                None => text_hunks(
+                    old_data,
+                    new_data,
+                    ctx,
+                    ws,
+                    indent_heuristic,
+                    algorithm,
+                    func_context,
+                    ignore,
+                )
+                .map(|(counts, hunks)| (counts, hunks.filter(|_| want_patch)))?,
             };
             Ok(Analysis {
                 old_id,
@@ -4313,6 +4840,108 @@ fn analyze(
             })
         }
     }
+}
+
+/// `xdl_diff()` over two whole images: intern both sides under the active whitespace
+/// rules, run the chosen algorithm, and turn the change script into unified-diff text.
+/// Returns `((additions, removals), hunks)`, with the counts read off the *emitted*
+/// records — which is what `diffstat_consume()` counts, and the only way
+/// `--ignore-blank-lines` and `-I` can reach `--stat`/`--numstat` as they do in git.
+///
+/// Two emitters answer to this, both producing the same bytes for a plain diff:
+///
+/// * gitoxide's unified writer through [`PatchSink`], the default.
+/// * the in-tree `xdl_emit_diff` port in [`super::diff_pairs::emit_unified`], the same
+///   emitter `git diff-pairs` runs, whenever the hunk *geometry* depends on something
+///   the gitoxide writer cannot express: `-W`'s growth to function boundaries,
+///   `--inter-hunk-context`'s merging of neighbours, or an `ignore` bit that
+///   `xdl_get_hunk()` has to weigh against the distance to a real change.
+#[allow(clippy::too_many_arguments)]
+fn text_hunks(
+    old_data: &[u8],
+    new_data: &[u8],
+    ctx: u32,
+    ws: Whitespace,
+    indent_heuristic: bool,
+    algorithm: gix::diff::blob::Algorithm,
+    func_context: bool,
+    ignore: &IgnoreOpts,
+) -> Result<((u32, u32), Option<Vec<u8>>)> {
+    let before: Vec<&[u8]> = byte_lines(old_data);
+    let after: Vec<&[u8]> = byte_lines(new_data);
+    let mut input: InternedInput<Vec<u8>> = InternedInput::default();
+    input.update_before(before.iter().map(|l| normalize_line(l, ws)));
+    input.update_after(after.iter().map(|l| normalize_line(l, ws)));
+
+    // `xdl_change_compact()` measures `xdf->recs[i]->ptr`, the *original* record, not
+    // the whitespace-normalized token the comparison used.
+    let diff =
+        super::diff_pairs::compute_compacted(algorithm, &input, &before, &after, indent_heuristic);
+
+    if !func_context && ignore.inter_hunk_ctx == 0 && !ignore.marks_changes() {
+        let added = diff.count_additions();
+        let deleted = diff.count_removals();
+        if added == 0 && deleted == 0 {
+            return Ok(((0, 0), None));
+        }
+        let sink = PatchSink {
+            buf: Vec::new(),
+            before: &before,
+            after: &after,
+            // No hunk has been emitted yet, so nothing bounds the first search.
+            func_prev: -1,
+            func_text: Vec::new(),
+        };
+        let buf = UnifiedDiff::new(&diff, &input, sink, ContextSize::symmetrical(ctx)).consume()?;
+        return Ok(((added, deleted), Some(buf)));
+    }
+
+    // The change script in `xdchange_t` shape, carrying the `ignore` bit
+    // `xdl_mark_ignorable_lines()` (`--ignore-blank-lines`) and
+    // `xdl_mark_ignorable_regex()` (`-I<re>`) set on a change whose every pre- and
+    // post-image record is ignorable. Both markers *assign* rather than or into
+    // `xch->ignore` and the regex pass runs second, so `-I` has the final say
+    // whenever it is present. The same rule [`super::diff_pairs`] applies.
+    let changes: Vec<super::diff_pairs::Change> = diff
+        .hunks()
+        .map(|h| {
+            let (i1, chg1) = (h.before.start as usize, h.before.len());
+            let (i2, chg2) = (h.after.start as usize, h.after.len());
+            let all = |pred: &dyn Fn(&[u8]) -> bool| {
+                before[i1..i1 + chg1].iter().all(|l| pred(l))
+                    && after[i2..i2 + chg2].iter().all(|l| pred(l))
+            };
+            let ignored = if !ignore.lines.is_empty() {
+                all(&|l| ignore.lines.iter().any(|p| p.is_match(l)))
+            } else if ignore.blank_lines {
+                all(&|l| is_blank_record(l, ws))
+            } else {
+                false
+            };
+            super::diff_pairs::Change { i1, chg1, i2, chg2, ignore: ignored }
+        })
+        .collect();
+    let (added, deleted, buf) = super::diff_pairs::emit_unified(
+        &before,
+        &after,
+        &changes,
+        &super::diff_pairs::EmitGeometry {
+            ctx: ctx as usize,
+            inter_hunk_ctx: ignore.inter_hunk_ctx,
+            func_context,
+        },
+    );
+    Ok(((added, deleted), (!buf.is_empty()).then_some(buf)))
+}
+
+/// `xdl_blankline()`: with no whitespace option in force a record is blank only when
+/// it is empty or a bare terminator; once any `XDF_WHITESPACE_FLAGS` bit is set, any
+/// record made entirely of whitespace counts.
+fn is_blank_record(line: &[u8], ws: Whitespace) -> bool {
+    if ws == Whitespace::Keep {
+        return line.len() <= 1;
+    }
+    line.iter().all(|b| b.is_ascii_whitespace())
 }
 
 /// `diff_populate_filespec(..., CHECK_SIZE_ONLY)` for the pre-image: the blob's
@@ -4610,36 +5239,93 @@ fn analyze_gitlink(
     want_patch: bool,
     algo_override: Option<gix::diff::blob::Algorithm>,
 ) -> Result<Analysis> {
-    let line = |id: ObjectId, dirty: bool| -> Vec<u8> {
-        let mut v = b"Subproject commit ".to_vec();
-        v.extend_from_slice(id.to_hex().to_string().as_bytes());
-        if dirty {
-            v.extend_from_slice(b"-dirty");
-        }
-        v.push(b'\n');
-        v
+    analyze_images(
+        old_commit.map(|id| subproject_image(id, old_dirty != 0)),
+        new_commit.map(|id| subproject_image(id, dirty != 0)),
+        old_commit.unwrap_or(null),
+        new_commit.unwrap_or(null),
+        // The `-dirty` marker moves the patch but not the stat formats: measured
+        // against git 2.55.0 on a submodule whose worktree is damaged at the commit
+        // the index already records, `git diff` prints the `-Subproject commit <oid>`
+        // / `+Subproject commit <oid>-dirty` hunk while `git diff --numstat` prints
+        // `0\t0\tsub` and `--shortstat` prints `1 file changed, 0 insertions(+),
+        // 0 deletions(-)`. So the counts come from the two commit ids alone.
+        (dirty | old_dirty) != 0 && old_commit == new_commit,
+        ctx,
+        want_patch,
+        algo_override,
+    )
+}
+
+/// `diff_populate_gitlink()` (diff.c:4475): the one-line image git gives a gitlink
+/// filespec, with `-dirty` glued on whenever any `dirty_submodule` bit is set.
+fn subproject_image(id: ObjectId, dirty: bool) -> Vec<u8> {
+    let mut v = b"Subproject commit ".to_vec();
+    v.extend_from_slice(id.to_hex().to_string().as_bytes());
+    if dirty {
+        v.extend_from_slice(b"-dirty");
+    }
+    v.push(b'\n');
+    v
+}
+
+/// `diff_populate_filespec()` (diff.c:4062) for one side of a pair whose *other* side
+/// is a gitlink: a gitlink contributes [`subproject_image`], anything else its own
+/// bytes — the blob out of the object database, or the worktree file.
+fn filespec_image(
+    objects: &gix::OdbHandle,
+    workdir: Option<&std::path::Path>,
+    delta: &Delta,
+    source: bool,
+) -> Result<Vec<u8>> {
+    let (commit, dirty) = if source {
+        let id = match delta.old {
+            Some((id, EntryKind::Commit)) => Some(id),
+            _ => None,
+        };
+        (id, delta.old_dirty_submodule)
+    } else {
+        let id = match &delta.new {
+            NewSide::Blob(id, EntryKind::Commit) => Some(*id),
+            NewSide::Worktree(EntryKind::Commit) => delta.new_commit,
+            _ => None,
+        };
+        (id, delta.dirty_submodule)
     };
-    let before: Vec<Vec<u8>> = old_commit
-        .map(|id| vec![line(id, old_dirty != 0)])
-        .unwrap_or_default();
-    let after: Vec<Vec<u8>> = new_commit
-        .map(|id| vec![line(id, dirty != 0)])
-        .unwrap_or_default();
-    let before_r: Vec<&[u8]> = before.iter().map(|l| l.as_slice()).collect();
-    let after_r: Vec<&[u8]> = after.iter().map(|l| l.as_slice()).collect();
+    match commit {
+        Some(id) => Ok(subproject_image(id, dirty != 0)),
+        None => Ok(pickaxe_side(objects, workdir, delta, source)?.unwrap_or_default()),
+    }
+}
+
+/// The whole-pair analysis of two images that never went through the blob platform:
+/// the gitlink pairs above, and the mixed blob/gitlink pair `builtin_diffstat()` is
+/// handed whole. `None` is git's invalid filespec — the side does not exist.
+///
+/// `zero_counts` forces the stat formats to zero for a pair whose two sides carry the
+/// same object id, which is only the `-dirty` case above.
+#[allow(clippy::too_many_arguments)]
+fn analyze_images(
+    before_bytes: Option<Vec<u8>>,
+    after_bytes: Option<Vec<u8>>,
+    old_id: ObjectId,
+    new_id: ObjectId,
+    zero_counts: bool,
+    ctx: u32,
+    want_patch: bool,
+    algo_override: Option<gix::diff::blob::Algorithm>,
+) -> Result<Analysis> {
+    let old_data = before_bytes.as_deref().unwrap_or_default();
+    let new_data = after_bytes.as_deref().unwrap_or_default();
+    let before: Vec<&[u8]> = byte_lines(old_data);
+    let after: Vec<&[u8]> = byte_lines(new_data);
 
     let mut input: InternedInput<Vec<u8>> = InternedInput::default();
-    input.update_before(before_r.iter().map(|l| l.to_vec()));
-    input.update_after(after_r.iter().map(|l| l.to_vec()));
+    input.update_before(before.iter().map(|l| l.to_vec()));
+    input.update_after(after.iter().map(|l| l.to_vec()));
     let algorithm = algo_override.unwrap_or(gix::diff::blob::Algorithm::Myers);
     let diff = diff_with_slider_heuristics(algorithm, &input);
-    // The `-dirty` marker moves the patch but not the stat formats: measured against
-    // git 2.55.0 on a submodule whose worktree is damaged at the commit the index
-    // already records, `git diff` prints the `-Subproject commit <oid>` /
-    // `+Subproject commit <oid>-dirty` hunk while `git diff --numstat` prints
-    // `0\t0\tsub` and `--shortstat` prints `1 file changed, 0 insertions(+),
-    // 0 deletions(-)`. So the counts come from the two commit ids alone.
-    let (added, deleted) = if (dirty | old_dirty) != 0 && old_commit == new_commit {
+    let (added, deleted) = if zero_counts {
         (0, 0)
     } else {
         (diff.count_additions(), diff.count_removals())
@@ -4647,8 +5333,8 @@ fn analyze_gitlink(
     let hunks = if want_patch && (diff.count_additions() != 0 || diff.count_removals() != 0) {
         let sink = PatchSink {
             buf: Vec::new(),
-            before: &before_r,
-            after: &after_r,
+            before: &before,
+            after: &after,
             // No hunk has been emitted yet, so nothing bounds the first search.
             func_prev: -1,
             func_text: Vec::new(),
@@ -4658,8 +5344,8 @@ fn analyze_gitlink(
         None
     };
     Ok(Analysis {
-        old_id: old_commit.unwrap_or(null),
-        new_id: new_commit.unwrap_or(null),
+        old_id,
+        new_id,
         added,
         deleted,
         binary: false,
@@ -4667,13 +5353,13 @@ fn analyze_gitlink(
         // A synthetic `Subproject commit <oid>` blob never ends in a blank line.
         blank_at_eof: (0, 0),
         images: None,
-        // The same synthetic images `builtin_diff()` hands the rest of the diff
-        // machinery, so a submodule bump is damage like any other content change.
+        // The same images `builtin_diff()` hands the rest of the diff machinery, so a
+        // submodule bump is damage like any other content change.
         damage: byte_damage(
-            &before.concat(),
-            &after.concat(),
-            old_commit.is_some(),
-            new_commit.is_some(),
+            old_data,
+            new_data,
+            before_bytes.is_some(),
+            after_bytes.is_some(),
             false,
         ),
     })
@@ -4704,18 +5390,17 @@ pub(crate) fn normalize_line(line: &[u8], ws: Whitespace) -> Vec<u8> {
             let end = line.iter().rposition(|b| !is_space(*b)).map_or(0, |i| i + 1);
             line[..end].to_vec()
         }
-        // `XDF_IGNORE_CR_AT_EOL`: exactly one CR, and only where it sits against the
-        // line terminator.
+        // `XDF_IGNORE_CR_AT_EOL`: exactly one CR, and only where it sits against a
+        // real line terminator. `ends_with_optional_cr()` (xdiff/xutils.c:159-171)
+        // computes `complete = s && l[s-1] == '\n'` and only then accepts a CR in
+        // front of it -- "do not ignore CR at the end of an incomplete line". So a
+        // final line that gained a CR but no newline still differs, and stripping a
+        // bare trailing CR here made `diff --quiet --ignore-cr-at-eol` report 0
+        // where git reports 1.
         Whitespace::IgnoreCrAtEol => {
             let mut out = line.to_vec();
-            match out.last() {
-                Some(b'\n') if out.len() >= 2 && out[out.len() - 2] == b'\r' => {
-                    out.remove(out.len() - 2);
-                }
-                Some(b'\r') => {
-                    out.pop();
-                }
-                _ => {}
+            if out.last() == Some(&b'\n') && out.len() >= 2 && out[out.len() - 2] == b'\r' {
+                out.remove(out.len() - 2);
             }
             out
         }
@@ -4755,10 +5440,22 @@ fn mode_str(k: EntryKind) -> &'static str {
 }
 
 /// `--raw` and `--name-status` (`diff_flush_raw()`).
-fn render_raw(out: &mut Vec<u8>, delta: &Delta, fmt: u32, r: &Render) {
+fn render_raw(out: &mut Vec<u8>, delta: &Delta, fmt: u32, r: &Render, filled: Option<&Analysis>) {
     let status = status_char(delta);
     if fmt & F_NAME_STATUS == 0 {
         let null = r.hash_kind.null().to_hex_with_len(r.raw_abbrev).to_string();
+        // `diff_fill_oid_info()` (diff.c:4014) hashes a filespec that has no id of
+        // its own with `index_path()`, leaving the real object name behind in
+        // `p->one->oid`/`p->two->oid`. Only `run_diff()` calls it, so the raw format
+        // sees a filled id exactly when `diff_from_contents` made it render each pair
+        // through the patch machinery first — which is why `git diff -w --raw` prints
+        // a worktree side's real name and plain `git diff --raw` prints all-zero.
+        let hashed = |side: fn(&Analysis) -> ObjectId| {
+            filled
+                .map(side)
+                .filter(|id| !id.is_null())
+                .map(|id| id.to_hex_with_len(r.raw_abbrev).to_string())
+        };
         let old_hash = match (delta.old, delta.old_worktree) {
             (None, _) => null.clone(),
             (Some((id, _)), false) => id.to_hex_with_len(r.raw_abbrev).to_string(),
@@ -4767,16 +5464,19 @@ fn render_raw(out: &mut Vec<u8>, delta: &Delta, fmt: u32, r: &Render) {
             // a submodule sitting where the index says).
             (Some(_), true) => match delta.old_raw_id {
                 Some(id) => id.to_hex_with_len(r.raw_abbrev).to_string(),
-                None => null.clone(),
+                None => hashed(|an| an.old_id).unwrap_or_else(|| null.clone()),
             },
         };
         // Worktree content has no object id yet, which git reports as all-zero —
         // unless rename detection already hashed it (`hash_filespec()`).
         let new_hash = match (&delta.new, delta.unmerged) {
             (NewSide::Blob(id, _), false) => id.to_hex_with_len(r.raw_abbrev).to_string(),
-            (NewSide::Worktree(_), false) => match delta.new_id {
+            (NewSide::Worktree(k), false) => match delta.new_id {
                 Some(id) => id.to_hex_with_len(r.raw_abbrev).to_string(),
-                None => null,
+                // A gitlink never goes through the blob platform, so the analysis
+                // has no hash of the worktree to offer for one.
+                None if *k == EntryKind::Commit => null,
+                None => hashed(|an| an.new_id).unwrap_or(null),
             },
             _ => null,
         };
@@ -5109,7 +5809,7 @@ fn render_submodule(
         );
         return;
     }
-    let hdr = super::diff_pairs::show_submodule_header(
+    submodule_inline_section(
         out,
         repo,
         path,
@@ -5117,12 +5817,41 @@ fn render_submodule(
         &two,
         delta.dirty_submodule,
         abbrev,
+        colors,
+        &r.src_prefix,
+        &r.dst_prefix,
+        r.hash_kind,
     );
+}
+
+/// `show_submodule_inline_diff()` (submodule.c:640) whole: the shared
+/// `Submodule <path> <a>..<b>` header, then the submodule's own diff beneath it.
+///
+/// Split out from [`render_submodule`] so [`super::diff_pairs`] — and through it
+/// `diff-tree`, `log -p` and `show` — reaches the same implementation instead of
+/// growing a second one.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn submodule_inline_section(
+    out: &mut Vec<u8>,
+    repo: &gix::Repository,
+    path: &BString,
+    one: &ObjectId,
+    two: &ObjectId,
+    dirty: u8,
+    abbrev: usize,
+    colors: &diff_color::DiffColors,
+    src_prefix: &[u8],
+    dst_prefix: &[u8],
+    hash_kind: gix::hash::Kind,
+) {
+    let hdr = super::diff_pairs::show_submodule_header(out, repo, path, one, two, dirty, abbrev);
     // "We need a valid left and right commit to display a difference."
     if !(hdr.left.is_some() || one.is_null()) || !(hdr.right.is_some() || two.is_null()) {
         return;
     }
-    match submodule_inline_diff(repo, path, &hdr, &one, &two, delta.dirty_submodule, colors, r) {
+    match submodule_inline_diff(
+        repo, path, &hdr, one, two, dirty, colors, src_prefix, dst_prefix, hash_kind,
+    ) {
         Some(text) => out.extend_from_slice(&text),
         // `diff_emit_submodule_error()`: the child could not be started, or it
         // failed once it had.
@@ -5143,9 +5872,11 @@ fn submodule_inline_diff(
     two: &ObjectId,
     dirty: u8,
     colors: &diff_color::DiffColors,
-    r: &Render,
+    src_prefix: &[u8],
+    dst_prefix: &[u8],
+    hash_kind: gix::hash::Kind,
 ) -> Option<Vec<u8>> {
-    let empty_tree = gix::ObjectId::empty_tree(r.hash_kind);
+    let empty_tree = gix::ObjectId::empty_tree(hash_kind);
     let old_oid = if hdr.left.is_some() { *one } else { empty_tree };
     let new_oid = if hdr.right.is_some() { *two } else { empty_tree };
 
@@ -5159,7 +5890,7 @@ fn submodule_inline_diff(
         if colors.enabled() { "always" } else { "never" }
     ));
     // `-R` swaps which prefix each side is given; every other option keeps them.
-    let (src, dst) = (&r.src_prefix, &r.dst_prefix);
+    let (src, dst) = (src_prefix, dst_prefix);
     let prefix = |lead: &str, base: &[u8]| -> std::ffi::OsString {
         let mut v = lead.as_bytes().to_vec();
         v.extend_from_slice(base);
@@ -5359,7 +6090,23 @@ fn render_patch(
         quote_one(&r.dst_prefix, &delta.path)
     };
 
-    if an.binary {
+    // `builtin_diff()` (diff.c:3596):
+    //
+    // ```c
+    // if (o->flags.irreversible_delete && lbl[1][0] == '/') {
+    //         emit_diff_symbol(o, DIFF_SYMBOL_HEADER, header.buf, header.len, 0);
+    //         ...
+    //         goto free_ab_and_return;
+    // }
+    // ```
+    //
+    // The test is on the *label*, so it is a deletion — the post-image is
+    // `/dev/null` — and the jump lands past the binary arm as well as past the hunks.
+    if r.irreversible_delete && matches!(delta.new, NewSide::Absent) {
+        return Ok(());
+    }
+
+    if an.binary && !r.text {
         match (r.binary, &an.images) {
             // `emit_binary_diff()`: no `---`/`+++` pair, just the payload.
             (true, Some((one, two))) => super::binary_patch::emit(
@@ -5826,8 +6573,9 @@ fn emit_combined(
     separator: &mut bool,
     line_prefix: &[u8],
 ) -> Result<()> {
-    // `-s` / `--no-patch` clears every other format, leaving nothing to serve.
-    if req.fmt & F_NO_OUTPUT != 0 {
+    // `-s` / `--no-patch` is an assignment, so it leaves nothing to serve unless a
+    // later format flag put a bit back.
+    if req.fmt & !F_NO_OUTPUT == 0 {
         return Ok(());
     }
 

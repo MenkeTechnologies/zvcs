@@ -76,7 +76,22 @@
 //!   *every* parent, and the commit-id line is printed whether or not any does
 //!   (`diff_tree_combined`'s `show_log_first`). `-c` renders the combined raw format
 //!   (`::<modes…> <oids…> <statuses>\t<path>`), which is also what `--name-status` and
-//!   `--name-only` narrow down to
+//!   `--name-only` narrow down to; `-p` (and `--cc`'s own default) renders the combined
+//!   *patch* through [`super::diff::merge_combined_patch`], the engine `git show`,
+//!   `git log -c/--cc` and `git diff <a> <b> <c>` share — `diff --cc` under `--cc`,
+//!   `diff --combined` under a bare `-c`. The stat family is not a combined diff at
+//!   all: `diff_tree_combined()` answers it with a plain two-way diff against the
+//!   **first parent**, emitted before the path set is even consulted, so `-c --stat`
+//!   on a clean merge prints a diffstat where `-c` alone prints only the commit id.
+//!   `--exit-code` reports 0 throughout: the combined pass never queues a pair on the
+//!   caller's `diffopt`
+//! * `-m`, `-c` and `--cc` are three settings of one knob
+//!   (`--diff-merges=separate|combined|dense-combined`), so the last one on the command
+//!   line wins
+//! * `--submodule[=<format>]` — routed to `diff-pairs`, which owns `render_submodule`
+//! * `--ignore-submodules[=all]` — drops every file pair that only names a gitlink
+//!   (`diff_change()`/`diff_addremove()`); `none`, `untracked` and `dirty` describe
+//!   worktree states two trees cannot have and are accepted as no-ops
 //!
 //! ### Formats rendered by `diff-pairs`
 //!
@@ -95,10 +110,14 @@
 //! entry there was checked against stock git in the raw, `-t`, `--name-status` and
 //! commit-id-line forms before being listed.
 //!
-//! `--combined-all-paths` is accepted and changes nothing, which is what stock git 2.55.0
-//! does for `diff-tree`: `diff-tree --combined-all-paths -c -r <merge>` and
-//! `diff-tree -c -r <merge>` emit the same bytes, so the per-parent names
-//! `show_raw_diff()` would print are never reached from this command.
+//! `--combined-all-paths` is implemented for the combined *raw* formats, where
+//! `show_raw_diff()` (combine-diff.c:1268) writes the path as each parent knew it
+//! ahead of the result's own: `diff-tree -c --combined-all-paths <merge>` ends
+//! `MM\t<path>\t<path>\t<path>` against stock 2.55.0. Rename detection never runs on
+//! the combined path set here, so every parent's path is the result path. Under a
+//! combined *patch* the same flag makes `show_combined_header()` print one
+//! `--- a/<path>` line per parent, which the shared engine does not take, so a patch
+//! that would carry a header bails instead.
 //!
 //! ### Honest limitations
 //!
@@ -116,12 +135,13 @@
 //!
 //! * bare `--abbrev` (no `=<n>`), whose width is git's *auto* abbreviation derived from
 //!   the repository's approximate object count; the vendored crates expose no equivalent.
-//! * `--cc`, the *dense* combined patch. The path set is computed exactly as for `-c`,
-//!   so a merge with no combined change prints the same bytes as git; a non-empty one
-//!   bails, because there is no `xdl_diff3`-style combined hunk emitter here.
 //! * `-v`, `--pretty`/`--format` — these need commit-message formatting, which belongs
 //!   to the `log`/`show` machinery, not the tree diff.
-//! * `--relative`, `--submodule`/`--ignore-submodules`.
+//! * `--relative`.
+//! * `--full-index`, `--no-prefix`, `--default-prefix`, `--src-prefix=`/`--dst-prefix=`
+//!   and `--combined-all-paths` *under a combined patch*: `show_combined_header()`
+//!   reads all of them and the shared engine takes none, so a combined patch that
+//!   would carry a header bails rather than print the wrong `index`/`---`/`+++` lines.
 //! * magic (`:(...)`) and glob pathspecs.
 //! * `-z` alongside a routed format: `diff-pairs` terminates its raw records the way the
 //!   flag it was given asks, so the NUL form is carried through, but the stat and patch
@@ -263,9 +283,19 @@ struct Opts {
     dense_combined: bool,
     /// `--combined-all-paths`: name the file in every parent, not only in the result.
     combined_all_paths: bool,
+    /// `--ignore-submodules` / `--ignore-submodules=all`: `opt->flags.ignore_submodules`,
+    /// which drops every file pair that only names a gitlink. The other three values
+    /// (`none`, `untracked`, `dirty`) describe worktree states two trees cannot have.
+    ignore_submodules: bool,
     /// When set, the file pairs are handed to `diff-pairs` with these options instead
     /// of being rendered by this module. See [`needs_pairs`].
     route: Option<Vec<String>>,
+    /// Every `diff_opt_parse` option from the command line, in order — the same list
+    /// [`route`](Opts::route) is built from, kept unconditionally because
+    /// [`combined_commit`] has to reconstruct git's `opt->output_format` bitmask,
+    /// which `Format` (one format at a time) cannot represent. Behind an `Rc` so
+    /// `Opts` stays cheap to clone.
+    diff_args: std::rc::Rc<Vec<String>>,
     /// `--line-prefix=<s>`, which git puts in front of the commit-id line too.
     line_prefix: Vec<u8>,
     /// `-v` / `--pretty[=<fmt>]` / `--format[=<fmt>]`: `revs->verbose_header`, which
@@ -333,7 +363,9 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
         combine: false,
         dense_combined: false,
         combined_all_paths: false,
+        ignore_submodules: false,
         route: None,
+        diff_args: std::rc::Rc::new(Vec::new()),
         line_prefix: Vec::new(),
         pretty: None,
     };
@@ -452,7 +484,15 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
                 }
                 "-z" => opts.nul = true,
                 "--root" => opts.root = true,
-                "-m" => opts.merges = true,
+                // `-m`, `-c` and `--cc` are the three settings of one knob
+                // (`--diff-merges=separate|combined|dense-combined`), so the last one
+                // on the command line wins: `--cc -m` renders per-parent diffs and
+                // `-m --cc` the dense combined patch.
+                "-m" => {
+                    opts.merges = true;
+                    opts.combine = false;
+                    opts.dense_combined = false;
+                }
                 "--no-commit-id" => opts.no_commit_id = true,
                 "--always" => opts.always = true,
                 // `-v` is `revs->verbose_header` on its own, and a bare
@@ -480,10 +520,15 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
                 // `--cc` implies `-c` and additionally selects the combined *patch*
                 // format, which is why it also counts as an explicit output format
                 // for `diff_tree_tweak_rev`.
-                "-c" => opts.combine = true,
+                "-c" => {
+                    opts.combine = true;
+                    opts.dense_combined = false;
+                    opts.merges = false;
+                }
                 "--cc" => {
                     opts.combine = true;
                     opts.dense_combined = true;
+                    opts.merges = false;
                 }
                 "--combined-all-paths" => opts.combined_all_paths = true,
                 "--raw" => opts.format = Format::Raw,
@@ -594,7 +639,7 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
                 // Only `all` changes a tree-to-tree diff. `dirty` and `untracked` name
                 // states a worktree has and two trees do not, and `none` is the
                 // default, so all three leave the output alone; `all` drops gitlink
-                // pairs entirely and stays recorded as unimplemented. Verified against
+                // pairs entirely, which [`collect`] now does. Verified against
                 // git 2.55.0 over a pair of commits whose only submodule change is a
                 // gitlink oid: `diff-tree -r A B` is byte-identical with `none`,
                 // `untracked` and `dirty` (raw and `-p`), and loses the `:160000` row
@@ -605,10 +650,11 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
                         eprintln!("fatal: bad --ignore-submodules argument: {v}");
                         return Ok(ExitCode::from(FATAL));
                     }
-                    if v == "all" {
-                        unsupported.get_or_insert_with(|| a.to_string());
-                    }
+                    opts.ignore_submodules = v == "all";
                 }
+                // `diff_opt_ignore_submodules()` with no value is `all`
+                // (`--ignore-submodules` is `PARSE_OPT_OPTARG`).
+                "--ignore-submodules" => opts.ignore_submodules = true,
                 // Rendered by `diff-pairs` further down; see [`needs_pairs`].
                 _ if needs_pairs(a) => {}
                 _ if is_ignorable(a) => {}
@@ -710,11 +756,21 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
             || a.starts_with("--ignore-matching-lines=")
     });
 
+    // `combined_commit` needs the option list itself, not the routing decision below:
+    // git's `diff_tree_combined` reads `opt->output_format` as a bitmask and can emit
+    // a stat, a raw listing and a patch from one invocation.
+    opts.diff_args = std::rc::Rc::new(diff_args.clone());
+
     // An option only `diff-pairs` can render switches the whole rendering pass over to
     // it. The pair list handed over is then the untouched walk output: `-R` and
     // `--diff-filter` travel with the other diff options and are applied there, so
     // applying them here as well would double them up.
-    if diff_args.iter().any(|a| needs_pairs(a)) {
+    //
+    // `--cc` with no output format on the command line is one of them even when no
+    // option needs `diff-pairs` on its own: `diff_tree_tweak_rev` then defaults to
+    // `DIFF_FORMAT_PATCH`, which is what a *non*-merge commit and the two-tree form
+    // render under `--cc`.
+    if diff_args.iter().any(|a| needs_pairs(a)) || (opts.dense_combined && !format_explicit) {
         let mut route = diff_args.clone();
         // `diff_tree_tweak_rev`: with no output format on the command line, `diff-tree`
         // defaults to the raw format where `diff-pairs` would default to a patch.
@@ -732,6 +788,20 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
         opts.filter = ALL_STATUSES;
     }
 
+    // `diff_setup_done()` (diff.c:5259): `--name-only`, `--name-status`, `--check` and
+    // `-s` are mutually exclusive and it dies rather than picking one. `setup_revisions()`
+    // resolves each operand as it parses and only calls `diff_setup_done()` afterwards,
+    // so a revision that does not resolve still wins — hence the silent probe rather than
+    // a bare check (`resolve_tree` would print its own message here, twice).
+    if (output_format_bits(&diff_args, opts.dense_combined) & OF_CHECK_MASK).count_ones() > 1
+        && revs.iter().all(|r| repo.rev_parse_single(r.as_str()).is_ok())
+    {
+        eprintln!(
+            "fatal: options '--name-only', '--name-status', '--check', and '-s' \
+             cannot be used together"
+        );
+        return Ok(ExitCode::from(FATAL));
+    }
     // git checks the `--merge-base` operand count after resolving revisions but before
     // the missing-<tree-ish> usage error, so zero revs here is the fatal merge-base
     // message, not the usage text.
@@ -1307,8 +1377,15 @@ fn sets_output_format(a: &str) -> bool {
         "-s",
         "--no-patch",
         "--quiet",
+        // `diff_opt_binary()` (diff.c:5730) and `diff_opt_unified()` (diff.c:5961) both
+        // end in `enable_patch_output()`, so either one is an explicit output format —
+        // without which `diff_tree_tweak_rev`'s raw default would still be prepended and
+        // `diff-tree -r -U1 <a> <b>` would print the raw listing instead of a patch.
+        "--binary",
+        "--unified",
     ];
-    const PREFIX: &[&str] = &["--stat=", "--stat-", "--dirstat=", "--dirstat-by-file=", "-X"];
+    const PREFIX: &[&str] =
+        &["--stat=", "--stat-", "--dirstat=", "--dirstat-by-file=", "-X", "-U", "--unified="];
     EXACT.contains(&a) || PREFIX.iter().any(|p| a.starts_with(p))
 }
 
@@ -1393,8 +1470,14 @@ fn needs_pairs(a: &str) -> bool {
         "--no-relative",
         "--skip-to",
         "--rotate-to",
+        // `--submodule[=<format>]`: `show_submodule_summary()`/`_inline_diff()` replace
+        // a gitlink pair's body, which is `diff-pairs`' `render_submodule` here. The
+        // raw and name listings are unchanged by it, but routing them costs nothing —
+        // `diff-pairs` renders the same bytes.
+        "--submodule",
     ];
     const PREFIX: &[&str] = &[
+        "--submodule=",
         "--stat=",
         "--stat-",
         "--dirstat=",
@@ -1515,9 +1598,6 @@ fn is_known_unsupported(a: &str) -> bool {
         "--skip-to",
         "--rotate-to",
         "--output",
-        // submodule handling changes which gitlink pairs are reported
-        "--submodule",
-        "--ignore-submodules",
         // content comparison: these drop pairs from the raw output as well
         "-b",
         "-w",
@@ -1655,6 +1735,162 @@ fn single_commit(
     emit_commit_diff(repo, commit_id, &parents, new_tree, opts, out, differed)
 }
 
+// `diff.h`'s `DIFF_FORMAT_*` bits, verbatim. `Format` holds one format at a time,
+// which is all the two-tree and per-parent forms need; the combined forms need the
+// bitmask itself, because `diff_tree_combined()` can emit a diffstat, a raw listing
+// and a patch from a single invocation.
+const OF_RAW: u32 = 0x0001;
+const OF_DIFFSTAT: u32 = 0x0002;
+const OF_NUMSTAT: u32 = 0x0004;
+const OF_SUMMARY: u32 = 0x0008;
+const OF_PATCH: u32 = 0x0010;
+const OF_SHORTSTAT: u32 = 0x0020;
+const OF_DIRSTAT: u32 = 0x0040;
+const OF_NAME: u32 = 0x0100;
+const OF_NAME_STATUS: u32 = 0x0200;
+const OF_CHECKDIFF: u32 = 0x0400;
+const OF_NO_OUTPUT: u32 = 0x0800;
+
+/// `combine-diff.c:1371`'s `STAT_FORMAT_MASK` — the formats `diff_tree_combined()`
+/// answers with a plain two-way diff against the *first* parent.
+const STAT_FORMAT_MASK: u32 =
+    OF_NUMSTAT | OF_SHORTSTAT | OF_SUMMARY | OF_DIRSTAT | OF_DIFFSTAT;
+
+/// Rebuild `diffopt.output_format` from the diff options as given.
+///
+/// The option table (`diff.c:6042-6115`) is `OPT_BITOP(<set>, DIFF_FORMAT_NO_OUTPUT)`
+/// for most formats — set a bit, clear `NO_OUTPUT` — while `-s`/`--no-patch` is
+/// `OPT_SET_INT`, an assignment that discards every format named before it (which is
+/// why `-s --stat` prints a diffstat and `--stat -s` prints nothing). `--name-only`,
+/// `--name-status` and `--check` are `OPT_BIT_F`: they set their bit without clearing
+/// `NO_OUTPUT`. The stat family reaches `output_format` through callbacks
+/// (`diff_opt_stat` at `diff.c:5444`, `parse_dirstat_opt` at `diff.c:5465`,
+/// `diff_opt_compact_summary` at `diff.c:5666`) that do the same clear-then-set.
+///
+/// `diff_tree_tweak_rev` supplies `diff-tree`'s default when nothing was named, and
+/// `diff_setup_done` (`diff.c:5300-5311`) then lets `--name-only`/`--name-status`/
+/// `--check`/`-s` turn every other format off.
+fn output_format(diff_args: &[String], dense_combined: bool) -> u32 {
+    let fmt = output_format_bits(diff_args, dense_combined);
+    if fmt & OF_CHECK_MASK != 0 {
+        return fmt
+            & !(OF_RAW
+                | OF_NUMSTAT
+                | OF_DIFFSTAT
+                | OF_SHORTSTAT
+                | OF_DIRSTAT
+                | OF_SUMMARY
+                | OF_PATCH);
+    }
+    fmt
+}
+
+/// `diff_setup_done()`'s `check_mask` (diff.c:5245): the four formats that may not be
+/// combined. More than one bit set is `die()`, not a precedence rule.
+const OF_CHECK_MASK: u32 = OF_NAME | OF_NAME_STATUS | OF_CHECKDIFF | OF_NO_OUTPUT;
+
+/// `diffopt.output_format` as the option table leaves it, before `diff_setup_done()`
+/// lets the `check_mask` formats displace the others — which is the value that check
+/// itself is made against.
+fn output_format_bits(diff_args: &[String], dense_combined: bool) -> u32 {
+    let mut fmt = 0u32;
+    for a in diff_args {
+        // `OPT_BITOP(x, DIFF_FORMAT_NO_OUTPUT)` and the callbacks that mimic it.
+        let mut bitop = |set: u32| {
+            fmt |= set;
+            fmt &= !OF_NO_OUTPUT;
+        };
+        match a.as_str() {
+            // `diff_opt_binary()` (diff.c:5730) and `diff_opt_unified()` (diff.c:5961)
+            // reach `enable_patch_output()`, which is the same clear-then-set.
+            "-p" | "-u" | "--patch" | "--binary" | "--unified" => bitop(OF_PATCH),
+            "--patch-with-raw" => bitop(OF_PATCH | OF_RAW),
+            "--patch-with-stat" => bitop(OF_PATCH | OF_DIFFSTAT),
+            "--raw" => bitop(OF_RAW),
+            "--numstat" => bitop(OF_NUMSTAT),
+            "--shortstat" => bitop(OF_SHORTSTAT),
+            "--summary" => bitop(OF_SUMMARY),
+            "--compact-summary" => bitop(OF_DIFFSTAT),
+            "--cumulative" | "--dirstat" | "--dirstat-by-file" => bitop(OF_DIRSTAT),
+            "--stat" => bitop(OF_DIFFSTAT),
+            // `OPT_BIT_F`: no `NO_OUTPUT` clear.
+            "--name-only" => fmt |= OF_NAME,
+            "--name-status" => fmt |= OF_NAME_STATUS,
+            "--check" => fmt |= OF_CHECKDIFF,
+            // `OPT_SET_INT`, and `diff_setup_done`'s `flags.quick` block, which
+            // assigns rather than ors.
+            "-s" | "--no-patch" | "--quiet" => fmt = OF_NO_OUTPUT,
+            _ if a.starts_with("--stat=") || a.starts_with("--stat-") => bitop(OF_DIFFSTAT),
+            _ if a.starts_with("--dirstat=") || a.starts_with("--dirstat-by-file=") => {
+                bitop(OF_DIRSTAT);
+            }
+            _ if a.starts_with("-X") => bitop(OF_DIRSTAT),
+            _ if a.starts_with("-U") || a.starts_with("--unified=") => bitop(OF_PATCH),
+            _ => {}
+        }
+    }
+    if fmt == 0 {
+        // `diff_tree_tweak_rev` (builtin/diff-tree.c): the raw format unless `--cc`
+        // asked for the dense combined patch.
+        fmt = if dense_combined { OF_PATCH } else { OF_RAW };
+    }
+    fmt
+}
+
+/// The options to hand `diff-pairs` for `diff_tree_combined()`'s first-parent stat
+/// pass: every non-format option as given, plus exactly the stat formats that
+/// survived [`output_format`].
+///
+/// git builds this by copying `diffopt` and assigning
+/// `diffopts.output_format = stat_opt` (`combine-diff.c:1570-1572`), so the width,
+/// dirstat and rename options travel with it while the raw, name and patch formats
+/// do not. `--patch-with-stat` becomes a plain `--stat` because only its diffstat
+/// half is a stat format.
+fn stat_route(diff_args: &[String], fmt: u32) -> Vec<String> {
+    let mut route = Vec::with_capacity(diff_args.len());
+    for a in diff_args {
+        match a.as_str() {
+            "-p" | "-u" | "--patch" | "--patch-with-raw" | "--raw" | "--name-only"
+            | "--name-status" | "--check" | "-s" | "--no-patch" | "--quiet" => {}
+            // The pass runs on a copy of `diffopt`, so its `--exit-code` result is
+            // discarded; forwarding it would make `diff-pairs` report 1 for a run
+            // stock git exits 0 on.
+            "--exit-code" => {}
+            "--patch-with-stat" => {
+                if fmt & OF_DIFFSTAT != 0 {
+                    route.push("--stat".to_string());
+                }
+            }
+            "--numstat" => keep(&mut route, a, fmt & OF_NUMSTAT != 0),
+            "--shortstat" => keep(&mut route, a, fmt & OF_SHORTSTAT != 0),
+            "--summary" => keep(&mut route, a, fmt & OF_SUMMARY != 0),
+            "--stat" | "--compact-summary" => keep(&mut route, a, fmt & OF_DIFFSTAT != 0),
+            "--cumulative" | "--dirstat" | "--dirstat-by-file" => {
+                keep(&mut route, a, fmt & OF_DIRSTAT != 0);
+            }
+            _ if a.starts_with("--stat=") || a.starts_with("--stat-") => {
+                keep(&mut route, a, fmt & OF_DIFFSTAT != 0);
+            }
+            _ if a.starts_with("--dirstat=")
+                || a.starts_with("--dirstat-by-file=")
+                || a.starts_with("-X") =>
+            {
+                keep(&mut route, a, fmt & OF_DIRSTAT != 0);
+            }
+            _ => route.push(a.clone()),
+        }
+    }
+    route
+}
+
+/// Push `a` onto `route` when `wanted`; the one-line helper keeps [`stat_route`]'s
+/// arms readable.
+fn keep(route: &mut Vec<String>, a: &str, wanted: bool) {
+    if wanted {
+        route.push(a.to_string());
+    }
+}
+
 /// git's `diff_tree_combined_merge()`: a merge rendered against every parent at once.
 ///
 /// A path is part of a combined diff only when it differs from *all* parents — that is
@@ -1663,9 +1899,21 @@ fn single_commit(
 /// commit-id line is emitted before the paths, whether or not any survive, which is
 /// `diff_tree_combined`'s `show_log_first`.
 ///
-/// `--cc` (`dense_combined_merges`) selects the combined *patch* format instead. This
-/// port has no `xdl_diff3`-style combined hunk emitter, so a non-empty `--cc` path set
-/// bails rather than print the wrong bytes; an empty one has no body either way.
+/// Three output passes run off the one path set, in `diff_tree_combined`'s order
+/// (`combine-diff.c:1564-1625`):
+///
+/// 1. the stat family, which is *not* a combined diff at all — git diffs the commit
+///    against its **first parent** only and renders that ("show stat against the first
+///    parent even when doing combined diff", `combine-diff.c:1567`). It is emitted
+///    before the path-set check, so `-c --stat` on a clean merge still prints a
+///    diffstat where `-c` alone prints nothing but the commit id.
+/// 2. `--raw`/`--name-only`/`--name-status`, the combined raw formats emitted here.
+/// 3. `-p`, the combined *patch*, rendered by [`super::diff::merge_combined_patch`] —
+///    the same `diff --cc`/`diff --combined` engine `git show`, `git log -c/--cc` and
+///    `git diff <commit> <commit> <commit>` use. `--cc` picks the `diff --cc` header,
+///    a bare `-c` the `diff --combined` one.
+///
+/// A `needsep` blank line separates a raw or stat pass from a following patch.
 fn combined_commit(
     repo: &gix::Repository,
     commit_id: ObjectId,
@@ -1673,11 +1921,14 @@ fn combined_commit(
     new_tree: ObjectId,
     opts: &Opts,
     out: &mut Vec<u8>,
-    differed: &mut bool,
+    // Deliberately untouched — see the `differed` note below the path-set check.
+    _differed: &mut bool,
 ) -> Result<u8> {
     let mut walk_opts = opts.clone();
+    // `diff_tree_combined` forces `diffopts.flags.recursive` but leaves
+    // `tree_in_recursive` — `-t` — as the command line set it, so `diff-tree -c -t`
+    // reports the changed tree entries alongside the blobs.
     walk_opts.recurse = true;
-    walk_opts.show_trees = false;
     walk_opts.reverse = false;
     walk_opts.filter = ALL_STATUSES;
     walk_opts.route = None;
@@ -1708,54 +1959,168 @@ fn combined_commit(
     if !opts.no_commit_id {
         emit_commit_header(repo, out, commit_id, opts)?;
     }
+
+    let fmt = output_format(&opts.diff_args, opts.dense_combined);
+
+    // Pass 1 — the stat family, against the first parent only, and emitted whether or
+    // not any path reaches the combined diff (`combine-diff.c:1564-1580` runs before
+    // the `if (num_paths)` block below).
+    if fmt & STAT_FORMAT_MASK != 0 {
+        let mut stat_opts = walk_opts.clone();
+        stat_opts.recurse = true;
+        stat_opts.show_trees = false;
+        stat_opts.route = Some(stat_route(&opts.diff_args, fmt));
+        let before = tree_of(repo, parents[0])?;
+        let changes = collect(repo, Some(before), Some(new_tree), &stat_opts)?;
+        // `diff-pairs` answers `--exit-code` with 1, but git runs this pass on a
+        // *copy* of `diffopt` (`combine-diff.c:1570`) and reads the exit status from
+        // the original, so the stat can only report a fatal here.
+        let code = render_all(repo, out, &changes, &stat_opts)?;
+        if code > 1 {
+            return Ok(code);
+        }
+    }
+
     if rows.is_empty() {
         return Ok(0);
     }
-    *differed = true;
-    if opts.dense_combined {
-        bail!(
-            "combined patch output (--cc) is not ported; {} path(s) of commit {commit_id} differ \
-             from every parent (re-run with -c for the combined raw format)",
-            rows.len()
-        );
-    }
+    // `differed` is deliberately not set: `diff_tree_combined` never queues a file
+    // pair on the caller's `diffopt`, so `DIFF_OPT_HAS_CHANGES` stays clear and
+    // `diff-tree -c --exit-code` on a merge with combined changes exits 0.
 
-    for (path, sides) in &rows {
+    // Pass 2 — the combined raw formats. `needsep` is `diff_tree_combined`'s: a raw
+    // listing, or a stat with no raw listing, is separated from a following patch by
+    // one blank line.
+    let raw_bits = fmt & (OF_RAW | OF_NAME | OF_NAME_STATUS);
+    let needsep = raw_bits != 0 || fmt & STAT_FORMAT_MASK != 0;
+
+    for (path, sides) in if raw_bits == 0 { &rows[..0] } else { &rows[..] } {
         out.extend_from_slice(&opts.line_prefix);
-        match opts.format {
-            Format::NameOnly => {}
-            _ => {
-                if opts.format == Format::Raw {
-                    for _ in sides {
-                        out.push(b':');
-                    }
-                    for s in sides {
-                        let m = s.old.map_or(0, |o| o.mode.value());
-                        out.extend_from_slice(format!("{m:06o} ").as_bytes());
-                    }
-                    let rmode = sides[0].new.map_or(0, |n| n.mode.value());
-                    out.extend_from_slice(format!("{rmode:06o}").as_bytes());
-                    for s in sides {
-                        let id = s.old.map_or_else(|| ObjectId::null(commit_id.kind()), |o| o.id);
-                        out.extend_from_slice(format!(" {}", id.to_hex()).as_bytes());
-                    }
-                    let rid = sides[0]
-                        .new
-                        .map_or_else(|| ObjectId::null(commit_id.kind()), |n| n.id);
-                    out.extend_from_slice(format!(" {} ", rid.to_hex()).as_bytes());
+        // `--name-only` is the path on its own; the other two carry a status column.
+        if raw_bits != OF_NAME {
+            if raw_bits == OF_RAW {
+                for _ in sides {
+                    out.push(b':');
                 }
-                // The status column is one letter per parent, for `--raw` and
-                // `--name-status` alike.
                 for s in sides {
-                    out.push(status(s));
+                    let m = s.old.map_or(0, |o| o.mode.value());
+                    out.extend_from_slice(format!("{m:06o} ").as_bytes());
                 }
+                let rmode = sides[0].new.map_or(0, |n| n.mode.value());
+                out.extend_from_slice(format!("{rmode:06o}").as_bytes());
+                // `diff_aligned_abbrev(&oid, opt->abbrev)` — the same width the
+                // two-tree raw format uses, which `--abbrev=<n>` narrows.
+                let zeros = "0".repeat(opts.abbrev);
+                for s in sides {
+                    let id = s
+                        .old
+                        .map_or_else(|| zeros.clone(), |o| o.id.to_hex_with_len(opts.abbrev).to_string());
+                    out.extend_from_slice(format!(" {id}").as_bytes());
+                }
+                let rid = sides[0]
+                    .new
+                    .map_or_else(|| zeros.clone(), |n| n.id.to_hex_with_len(opts.abbrev).to_string());
+                out.extend_from_slice(format!(" {rid} ").as_bytes());
+            }
+            // The status column is one letter per parent, for `--raw` and
+            // `--name-status` alike.
+            for s in sides {
+                out.push(status(s));
+            }
+            out.push(sep);
+        }
+        // `--combined-all-paths` (`show_raw_diff`, combine-diff.c:1268-1274): the
+        // path as each parent knew it, ahead of the result's own, each closed by the
+        // inter-name terminator. Without rename detection every parent's path is the
+        // result path, which is what this walk produces.
+        if opts.combined_all_paths {
+            for _ in sides {
+                write_path(out, path, opts.nul);
                 out.push(sep);
             }
         }
         write_path(out, path, opts.nul);
         out.push(term);
     }
+
+    // Pass 3 — the combined patch, from the shared `diff --cc` engine.
+    if fmt & OF_PATCH != 0 {
+        let paths: Vec<String> =
+            opts.paths.iter().map(|p| String::from_utf8_lossy(p).into_owned()).collect();
+        let patch = super::diff::merge_combined_patch(
+            repo,
+            commit_id,
+            parents,
+            &paths,
+            unified_context(&opts.diff_args),
+            opts.dense_combined,
+        )?;
+        // `show_combined_header()` also reads `opt->flags.full_index`,
+        // `opt->a_prefix`/`opt->b_prefix` and `rev->combined_all_paths`; the shared
+        // engine takes none of them, so a run that asks for one would print the wrong
+        // `index`/`---`/`+++` lines. Fail loudly instead — but only once there is a
+        // header to get wrong, since a path set the dense filter emptied prints
+        // nothing either way.
+        if !patch.is_empty() {
+            if let Some(flag) = opts.diff_args.iter().find(|a| {
+                matches!(a.as_str(), "--full-index" | "--no-prefix" | "--default-prefix")
+                    || a.starts_with("--src-prefix=")
+                    || a.starts_with("--dst-prefix=")
+            }) {
+                bail!("{flag} is not applied to the combined patch format");
+            }
+            if opts.combined_all_paths {
+                bail!("--combined-all-paths is not applied to the combined patch format");
+            }
+        }
+        if needsep {
+            out.extend_from_slice(&opts.line_prefix);
+            out.push(term);
+        }
+        if opts.line_prefix.is_empty() {
+            out.extend_from_slice(&patch);
+        } else {
+            prefix_lines(out, &patch, &opts.line_prefix);
+        }
+    }
     Ok(0)
+}
+
+/// `-U<n>`/`--unified=<n>`, or git's default of 3 when neither was given.
+fn unified_context(diff_args: &[String]) -> u32 {
+    let mut ctx = 3;
+    for (i, a) in diff_args.iter().enumerate() {
+        let value = if let Some(v) = a.strip_prefix("--unified=") {
+            Some(v)
+        } else if let Some(v) = a.strip_prefix("-U") {
+            // `OPT_CALLBACK_F('U', …, PARSE_OPT_OPTARG)`: a bare `-U` takes no value.
+            if v.is_empty() {
+                None
+            } else {
+                Some(v)
+            }
+        } else if a == "--unified" {
+            diff_args.get(i + 1).map(String::as_str)
+        } else {
+            None
+        };
+        if let Some(v) = value {
+            if let Ok(n) = v.parse::<u32>() {
+                ctx = n;
+            }
+        }
+    }
+    ctx
+}
+
+/// Put `prefix` in front of every line of `body`, which is what `--line-prefix=<s>`
+/// asks for and what the combined patch engine — shared with `show`/`log`, neither of
+/// which prefixes — leaves to its caller.
+fn prefix_lines(out: &mut Vec<u8>, body: &[u8], prefix: &[u8]) {
+    for line in body.split_inclusive(|b| *b == b'\n') {
+        out.extend_from_slice(prefix);
+        out.extend_from_slice(line);
+    }
 }
 
 /// `--merge-base <a> <b>`: resolve the two revisions to commits, compute their single
@@ -1862,6 +2227,16 @@ fn collect(
         for c in &mut out {
             std::mem::swap(&mut c.old, &mut c.new);
         }
+    }
+    // `--ignore-submodules[=all]`: `diff_change()` drops a pair whose *both* sides are
+    // gitlinks (diff.c:7663) and `diff_addremove()` one whose single side is
+    // (diff.c:7610) — i.e. every pair that only ever names a submodule. A gitlink that
+    // turned into a blob keeps its row, because one side is not a gitlink.
+    if opts.ignore_submodules {
+        out.retain(|c| {
+            let gitlink = |s: &Option<Side>| s.is_none_or(|s| s.mode.value() == 0o160000);
+            !(gitlink(&c.old) && gitlink(&c.new))
+        });
     }
     apply_filter(&mut out, opts.filter);
     Ok(out)

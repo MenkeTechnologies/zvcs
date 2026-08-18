@@ -12,7 +12,9 @@
 //! lines are a port of `diff_summary()`. The patch body reuses the same default
 //! diff settings the rest of this crate uses: Myers with the indent (slider)
 //! heuristic, three lines of context, `@@`-header function context, and the
-//! `\ No newline at end of file` marker.
+//! `\ No newline at end of file` marker. The slider pass is a default rather than a
+//! constant — `--no-indent-heuristic` clears it, reaching
+//! [`super::diff_pairs::compute_compacted`]'s `indent_heuristic` argument.
 //!
 //! Covered:
 //!   * revision selection — `<since>` (implicit `<since>..HEAD`), `<a>..<b>`,
@@ -131,9 +133,9 @@
 //!     that it never becomes a bogus revision error, but limiting the walk and
 //!     the patch to it is not ported, so a pathspec that reaches a non-empty
 //!     commit list is fatal.
-//!   * `--compact-summary`, `--encode-email-headers` as a *deferred* spelling,
-//!     whitespace-insensitive diffing, and copy detection (`-C`; renames are
-//!     detected, as git's default asks). `--ignore-if-in-upstream` reproduces
+//!   * `--compact-summary`, whitespace-insensitive diffing, and copy detection
+//!     (`-C`; renames are detected, as git's default asks).
+//!     `--ignore-if-in-upstream` reproduces
 //!     everything `cmd_format_patch` decides before the comparison — the
 //!     single-endpoint promotion that turns a lone rev into `<rev>..HEAD`, the
 //!     silent exit when both endpoints are the same commit, and the two
@@ -631,6 +633,10 @@ struct Opts {
     /// `-W`/`--function-context`: `XDL_EMIT_FUNCCONTEXT`, which grows every hunk
     /// outward to the enclosing function's first and last line.
     function_context: bool,
+    /// `--indent-heuristic`/`--no-indent-heuristic` (`XDF_INDENT_HEURISTIC`): run
+    /// `xdl_change_compact()`.s slider post-processing pass. On by default since
+    /// git 2.14, so only `--no-indent-heuristic` clears it.
+    indent_heuristic: bool,
     /// `-w`/`-b`/`--ignore-space-at-eol`/`--ignore-cr-at-eol`: xdiff's
     /// `XDF_WHITESPACE_FLAGS`, the canonical form a record is compared in.
     ws: super::diff_pairs::Whitespace,
@@ -1157,7 +1163,6 @@ const NO_OP: &[&str] = &[
     // measured against stock 2.55.0 over single commits, ranges, and commits whose
     // diff is empty, the output is identical with and without it.
     "--always",
-    "--indent-heuristic",
     "--no-renames",
     "--rename-empty",
     "--no-rename-empty",
@@ -1173,10 +1178,8 @@ const NO_OP: &[&str] = &[
 /// Flags git accepts that this module has not ported. Matched as `--flag` or
 /// `--flag=<value>`; see the module header for what each of them would change.
 const DEFERRED: &[&str] = &[
-    "--encode-email-headers",
     "--ignore-if-in-upstream",
     "--compact-summary",
-    "--no-indent-heuristic",
     "--abbrev",
     "--break-rewrites",
     "--find-renames",
@@ -1192,8 +1195,17 @@ const DEFERRED: &[&str] = &[
     "--anchored",
 ];
 
-/// Short options that carry an attached value, e.g. `-M50%` or `-S<string>`.
-const DEFERRED_SHORT: &[&str] = &["-l", "-M", "-C", "-B", "-O", "-S", "-G"];
+/// Short diff options whose value is *required*, so `parse_short_opt()` takes it
+/// from the next argv slot when nothing is attached: `-S <string>` is `-S<string>`
+/// and `-l 5` is `-l5`. Measured against stock 2.55.0 — `git format-patch -S 5
+/// --stdout -1` prints the last commit's patch (the `5` was eaten), while the same
+/// line with `-M` dies `ambiguous argument '5'`.
+const DEFERRED_SHORT_VALUE: &[&str] = &["-l", "-O", "-S", "-G"];
+
+/// Short diff options whose value is optional and therefore only ever attached
+/// (`OPT_CALLBACK_F(..., PARSE_OPT_OPTARG)`): a bare `-M` leaves the next word to
+/// `setup_revisions()`, which is why `-M 5` is fatal on the `5`.
+const DEFERRED_SHORT_OPTARG: &[&str] = &["-M", "-C", "-B"];
 
 /// `builtin_format_patch_options` entries that need a value in the next argv
 /// slot (or attached after `=` / directly after the short letter).
@@ -1597,6 +1609,7 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
         no_binary: false,
         ignore_regex: Vec::new(),
         function_context: false,
+        indent_heuristic: true,
         ws: super::diff_pairs::Whitespace::Keep,
         full_index: false,
         irreversible_delete: false,
@@ -2113,6 +2126,8 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
             "--full-index" => o.full_index = true,
             "--no-full-index" => o.full_index = false,
             "-D" | "--irreversible-delete" => o.irreversible_delete = true,
+            "--indent-heuristic" => o.indent_heuristic = true,
+            "--no-indent-heuristic" => o.indent_heuristic = false,
             // `--rotate-to`/`--skip-to` share `diff_options::rotate_to` and differ
             // only in `skip_instead_of_rotate`, so whichever comes last wins.
             "--skip-to" | "--rotate-to" => {
@@ -2307,8 +2322,27 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
                 ref_excludes.push(s["--exclude=".len()..].to_owned());
             }
             s if NO_OP.contains(&s) => {}
+            // A bare value-taking short option eats the next slot before anything
+            // else can read it as a revision; without that, `format-patch -S base`
+            // reported `fatal: ambiguous argument 'base'` instead of naming the
+            // option this module has not ported.
+            s if DEFERRED_SHORT_VALUE.contains(&s) => {
+                i += 1;
+                if args.get(i).is_none() {
+                    // `parse_short_opt()`'s `opterror(..., "requires a value")`,
+                    // which `parse_options()` turns into exit 129 with that one
+                    // line and no usage block. Measured against stock 2.55.0:
+                    // `git format-patch --stdout -S` prints exactly this and
+                    // exits 129.
+                    let c = &s[1..];
+                    eprintln!("error: switch `{c}' requires a value");
+                    return Ok(Parsed::Exit(ExitCode::from(129)));
+                }
+                o.deferred.push(s.to_owned());
+            }
             s if DEFERRED.iter().any(|f| is_flag(s, f))
-                || DEFERRED_SHORT.iter().any(|f| s.starts_with(f)) =>
+                || DEFERRED_SHORT_VALUE.iter().any(|f| s.starts_with(f))
+                || DEFERRED_SHORT_OPTARG.iter().any(|f| s.starts_with(f)) =>
             {
                 o.deferred.push(s.to_owned());
             }
@@ -5198,7 +5232,7 @@ fn detect_renames(repo: &gix::Repository, changes: &mut Vec<ChangeDetached>) -> 
         q.pairs[idx].status = status;
     }
 
-    let mut content = OdbContent { repo };
+    let mut content = super::diffcore_rename::OdbContent { repo };
     super::diffcore_rename::run(&mut q, &opts, &mut content);
     super::diffcore_rename::resolve_rename_copy(&mut q);
 
@@ -5249,23 +5283,6 @@ fn detect_renames(repo: &gix::Repository, changes: &mut Vec<ChangeDetached>) -> 
 fn mode_from_octal(mode: u32) -> gix::objs::tree::EntryMode {
     gix::objs::tree::EntryMode::try_from(format!("{mode:o}").as_bytes())
         .unwrap_or(gix::objs::tree::EntryKind::Blob.into())
-}
-
-/// Reads a filespec's blob for [`super::diffcore_rename`]; both sides name an object
-/// in the database here.
-struct OdbContent<'a> {
-    repo: &'a gix::Repository,
-}
-
-impl super::diffcore_rename::Content for OdbContent<'_> {
-    fn size(&mut self, spec: &super::diffcore_rename::FileSpec) -> Option<u64> {
-        let header = self.repo.find_header(spec.oid).ok()?;
-        (header.kind() == gix::object::Kind::Blob).then(|| header.size())
-    }
-
-    fn data(&mut self, spec: &super::diffcore_rename::FileSpec) -> Option<Vec<u8>> {
-        self.repo.find_object(spec.oid).ok().map(|o| o.detach().data)
-    }
 }
 
 fn is_tree_entry(change: &ChangeDetached) -> bool {
@@ -6293,7 +6310,7 @@ fn emit_text_hunks(
         // `xdl_change_compact()`'s `get_indent()` reads the unmodified record, so
         // the slider heuristic scores the raw lines, not the normalized tokens.
         let diff =
-            super::diff_pairs::compute_compacted(opts.algorithm, &input, &before, &after, true);
+            super::diff_pairs::compute_compacted(opts.algorithm, &input, &before, &after, opts.indent_heuristic);
         return emit_hunks_with_ignorable(out, &diff, &before, &after, opts);
     }
 

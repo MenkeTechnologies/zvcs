@@ -67,15 +67,33 @@
 //! `ws.c` whitespace-error markup.
 //!
 //! Options that only steer patch/stat *shaping* (`--anchored=`, `--color-moved[=]`,
-//! `--word-diff` bare, `--ignore-submodules` bare, `--ignore-blank-lines`, `-B`,
-//! `-l<n>`, `-a`/`--text`, `-W`, …) are accepted and ignored for the raw, `--name-only`
-//! and `--name-status` listings — stock git's bytes there are identical with and without
-//! them. The full list is `render_only_option`. Because this module does not *port* those
-//! shapers, a run that also asks for a content format (a patch or a stat) is declined
-//! rather than rendering bytes that would diverge from git; the prefix family
+//! `--word-diff` bare, `--ignore-submodules` bare, `-B`, `-l<n>`, `-a`/`--text`, `-W`,
+//! …) are accepted and ignored for the raw, `--name-only` and `--name-status`
+//! listings — stock git's bytes there are identical with and without them. The full
+//! list is `render_only_option`. Because this module does not *port* those shapers, a
+//! run that also asks for a content format (a patch or a stat) is declined rather than
+//! rendering bytes that would diverge from git; the prefix family
 //! (`--src-prefix=`/`--dst-prefix=`/`--no-prefix`/`--default-prefix`), `--full-index` and
 //! `-D`/`--irreversible-delete` are the shapers this module does honour, so they compose
 //! with the patch instead.
+//!
+//! `provable_noop_option` splits out the entries that set a flag to the value
+//! `cmd_diff_index()` already starts from — `--default-prefix`,
+//! `--ita-visible-in-index`, `--no-diff-merges`, `--no-ext-diff`,
+//! `--no-function-context`, `--no-notes`, `--no-textconv`, `--rename-empty`. They
+//! cannot change any format, so they are not recorded and a content format runs
+//! normally alongside them. Three of the nine are inert only because plumbing runs
+//! `git_diff_basic_config()` and never `git_diff_ui_config()`, which is what leaves
+//! `allow_external`, `allow_textconv` and the prefix config at their off/default
+//! state.
+//!
+//! `--ignore-blank-lines` (`XDF_IGNORE_BLANK_LINES`) and `--no-renames` are honoured
+//! rather than ignored. The first marks a change group whose every pre- and
+//! post-image record is blank, which drops the file from the patch and the stat
+//! family while leaving the raw listing alone (it is not one of
+//! `XDF_WHITESPACE_FLAGS`, so `diff_from_contents` stays clear); `-I<re>` ORs its own
+//! verdict on top, never overriding it. The second clears the rename detection an
+//! earlier `-M`/`-C` turned on, which is the only way it is ever on here.
 //!
 //! A handful of options carry a value git validates during its single left-to-right
 //! parse, so this module validates it too and reproduces git's exact code and message at
@@ -234,6 +252,20 @@ enum Format {
     Silent,
 }
 
+/// `DIFF_FORMAT_NAME` — `--name-only`.
+const M_NAME: u8 = 1;
+/// `DIFF_FORMAT_NAME_STATUS` — `--name-status`.
+const M_NAME_STATUS: u8 = 2;
+/// `DIFF_FORMAT_CHECKDIFF` — `--check`.
+const M_CHECK: u8 = 4;
+/// `DIFF_FORMAT_NO_OUTPUT` — `-s`/`--no-patch`.
+const M_NO_OUTPUT: u8 = 8;
+
+/// `diff_setup_done()`'s message when more than one of `check_mask`'s bits survives
+/// (diff.c:5259). Verbatim, because the four names are hardcoded there in this order.
+const CHECK_MASK_CONFLICT: &str =
+    "fatal: options '--name-only', '--name-status', '--check', and '-s' cannot be used together";
+
 /// Which whitespace differences the content comparison should fold away.
 #[derive(Clone, Copy, Default)]
 struct Ws {
@@ -268,6 +300,12 @@ struct Opts {
     filter_exclude: Vec<u8>,       // --diff-filter lower-case letters, upper-cased
     ws: Ws,
     ignore_lines: Option<diff_pickaxe::Needle>, // -I<s> / --ignore-matching-lines=<s>
+    /// `--ignore-blank-lines`: `XDF_IGNORE_BLANK_LINES`, which
+    /// `xdl_mark_ignorable_lines()` uses to mark a change group whose every pre-
+    /// and post-image record is blank. Not one of `XDF_WHITESPACE_FLAGS`, so it
+    /// leaves `diff_from_contents` clear and the raw and name listings keep every
+    /// pair; only the content formats lose the all-blank ones.
+    ignore_blank_lines: bool,
     pickaxe: Option<diff_pickaxe::Kind>,
     pickaxe_all: bool,
     detect_rename: bool, // -M/-C: git hashes rename candidates, so additions gain real ids
@@ -437,7 +475,50 @@ common diff options:
 /// Deliberately absent: `-U<n>`, `--unified=<n>`, `--binary`, `--check` and the stat
 /// family, which look like rendering knobs but replace the raw listing. The dirstat
 /// family also replaces it and is handled for real, in `apply_dirstat`.
+/// Options that set a flag to the value `cmd_diff_index()` already starts from, so
+/// they cannot change any output in any format and need not be recorded at all.
+///
+/// Three of them are only inert because `cmd_diff_index()` calls
+/// `git_diff_basic_config()` and never `git_diff_ui_config()`: `allow_external`,
+/// `allow_textconv` and the whole prefix family (`diff.noprefix`,
+/// `diff.srcPrefix`/`dstPrefix`, `diff.mnemonicPrefix`) therefore start off/default,
+/// and turning them off again is a no-op. The rest describe machinery this command
+/// has no path to at all.
+///
+/// Measured against stock git 2.55.0: for each entry, `git diff-index <fmt> <opt>
+/// HEAD` is byte-identical to `git diff-index <fmt> HEAD` on stdout, stderr and exit
+/// code for every `<fmt>` in `-p`, `--numstat`, `--stat`, `--shortstat`,
+/// `--summary`, `--raw`, `--name-status`, with and without `-M`, `-M -C` and
+/// `--cached`, on a fixture that carries a binary change, a complete rewrite, an
+/// exact and an empty-file rename pair, a submodule gitlink bump, an `add -N` entry
+/// and *configured* `diff.<driver>.command` and `diff.<driver>.textconv` drivers —
+/// so `--ext-diff` and `--textconv` really had something to switch on.
+///
+/// Deliberately absent, because the same sweep showed each one *does* change output:
+/// `--ita-invisible-in-index` (drops the `add -N` record under `--cached`) and
+/// `--no-rename-empty` (splits an empty-file `R100` back to `A`+`D` under `-M`).
+/// `--diff-merges=<anything but off>` was on that list too and is no longer reached
+/// here at all: it has its own arm in the parse loop, because every mode but
+/// `off`/`none` turns the patch format on.
+fn provable_noop_option(a: &str) -> bool {
+    matches!(
+        a,
+        "--default-prefix"
+            | "--diff-merges=off"
+            | "--ita-visible-in-index"
+            | "--no-diff-merges"
+            | "--no-ext-diff"
+            | "--no-function-context"
+            | "--no-notes"
+            | "--no-textconv"
+            | "--rename-empty"
+    )
+}
+
 fn render_only_option(a: &str) -> bool {
+    if provable_noop_option(a) {
+        return true;
+    }
     const EXACT: &[&str] = &[
         "-a",
         "-B",
@@ -448,7 +529,6 @@ fn render_only_option(a: &str) -> bool {
         "--ext-diff",
         "--full-index",
         "--function-context",
-        "--ignore-blank-lines",
         "--ignore-submodules",
         "--irreversible-delete",
         "--ita-invisible-in-index",
@@ -461,7 +541,6 @@ fn render_only_option(a: &str) -> bool {
         "--no-notes",
         "--no-prefix",
         "--no-rename-empty",
-        "--no-renames",
         "--no-textconv",
         "--rename-empty",
         "--submodule",
@@ -469,13 +548,12 @@ fn render_only_option(a: &str) -> bool {
         "--textconv",
     ];
     // NB: the value-validated options `--color=`, `--word-diff=`, `--ignore-submodules=`,
-    // `--submodule=`, `--diff-algorithm=`, `--skip-to=` and `--rotate-to=` are handled by
-    // dedicated arms in the parse loop (they can fail), so they deliberately do *not*
-    // appear here.
+    // `--submodule=`, `--diff-algorithm=`, `--diff-merges=`, `--skip-to=` and
+    // `--rotate-to=` are handled by dedicated arms in the parse loop (they can fail), so
+    // they deliberately do *not* appear here.
     const WITH_VALUE: &[&str] = &[
         "--anchored=",
         "--break-rewrites=",
-        "--diff-merges=",
         "--dst-prefix=",
         "--output-indicator-context=",
         "--output-indicator-new=",
@@ -604,6 +682,7 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
         filter_exclude: Vec::new(),
         ws: Ws::default(),
         ignore_lines: None,
+        ignore_blank_lines: false,
         pickaxe: None,
         pickaxe_all: false,
         detect_rename: false,
@@ -642,6 +721,12 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
     // `--raw` given explicitly, which is what makes git print the pair listing
     // alongside `--dirstat` instead of only the directories.
     let mut raw_explicit = false;
+    // `diff_setup_done()`'s `check_mask` (diff.c:5245): the four output-format bits that
+    // may not be combined. They are collected rather than overwritten because git dies
+    // when more than one survives — `--name-only`/`--name-status`/`--check` are
+    // `OPT_BIT_F`, which only ever sets its bit, while `-s` is `OPT_SET_INT`, which
+    // replaces the whole word (hence the reset in that arm).
+    let mut check_mask: u8 = 0;
     // `-S`/`-G` share one slot (the last one wins, as in git); `-I` composes with them.
     let mut pickaxe_arg: Option<(u8, Vec<u8>)> = None;
     // `(argv index, pattern)`: the index lets a `-I` that fails to compile fire at exactly
@@ -801,14 +886,71 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
                 opts.format = Format::Raw;
                 raw_explicit = true;
             }
-            "--name-only" => opts.format = Format::NameOnly,
-            "--name-status" => opts.format = Format::NameStatus,
-            "-s" | "--no-patch" => opts.format = Format::Silent,
+            "--name-only" => check_mask |= M_NAME,
+            "--name-status" => check_mask |= M_NAME_STATUS,
+            // `OPT_SET_INT('s', "no-patch", &options->output_format, DIFF_FORMAT_NO_OUTPUT)`
+            // (diff.c:6046) assigns rather than or-s, so every format asked for earlier —
+            // including the three that share `check_mask` — is discarded here.
+            "-s" | "--no-patch" => {
+                check_mask = M_NO_OUTPUT;
+                opts.check = false;
+                opts.patch = false;
+                opts.numstat = false;
+                opts.diffstat = false;
+                opts.shortstat = false;
+                opts.summary = false;
+                opts.dirstat = None;
+                raw_explicit = false;
+            }
             "-z" => opts.nul = true,
             "--abbrev" => opts.abbrev = Some(None),
             "--no-abbrev" => opts.abbrev = None,
-            "--check" => opts.check = true,
-            "--binary" => opts.binary = true,
+            "--check" => {
+                opts.check = true;
+                check_mask |= M_CHECK;
+            }
+            // `diff_opt_binary()` (diff.c:5730) runs `enable_patch_output()`, so `--binary`
+            // turns the patch format on by itself — `git diff-index --binary <tree>` prints
+            // a patch where a bare `git diff-index` prints the raw listing.
+            "--binary" => {
+                opts.binary = true;
+                opts.patch = true;
+            }
+            // `diff_merges_parse_opts()` (diff-merges.c:119) followed by
+            // `diff_merges_setup_revs()` (diff-merges.c:188): every mode but `off`/`none`
+            // sets `merges_need_diff`, which fills an empty `output_format` with
+            // `DIFF_FORMAT_PATCH`. This command never walks a merge, so that is the whole
+            // of the effect — measured against stock 2.55.0, where
+            // `diff-index --diff-merges=<m|on|1|first-parent|separate|r|remerge> <tree>`,
+            // `--remerge-diff` and `--dd` are each byte-identical to `diff-index -p`.
+            // The two combined modes are not: they render `diff --combined`, which this
+            // port has not got, so they turn the patch format on and are then declined.
+            "--remerge-diff" | "--dd" => opts.patch = true,
+            s if s.starts_with("--diff-merges=") => {
+                match &s["--diff-merges=".len()..] {
+                    "off" | "none" => {}
+                    "1" | "first-parent" | "separate" | "m" | "on" | "r" | "remerge" => {
+                        opts.patch = true;
+                    }
+                    "c" | "combined" | "cc" | "dense-combined" => {
+                        opts.patch = true;
+                        content_altering.get_or_insert_with(|| s.to_owned());
+                    }
+                    // `set_diff_merges()`'s `die()` (diff-merges.c:92), which runs inside
+                    // the single left-to-right parse like every other option-value error.
+                    v => {
+                        set_earliest(
+                            &mut deferred,
+                            (
+                                cur,
+                                128,
+                                format!("fatal: invalid value for '--diff-merges': '{v}'\n")
+                                    .into_bytes(),
+                            ),
+                        );
+                    }
+                }
+            }
             "--no-binary" => opts.binary = false,
             "--exit-code" => opts.exit_code = true,
             "--quiet" => {
@@ -820,6 +962,10 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
             "-b" | "--ignore-space-change" => opts.ws.change = true,
             "--ignore-space-at-eol" => opts.ws.at_eol = true,
             "--ignore-cr-at-eol" => opts.ws.cr = true,
+            "--ignore-blank-lines" => opts.ignore_blank_lines = true,
+            // `diff_opt_no_renames()`: cancels an earlier `-M`/`-C`, which is the
+            // only way rename detection is ever on for this plumbing command.
+            "--no-renames" => opts.detect_rename = false,
             "--pickaxe-all" => opts.pickaxe_all = true,
             "--pickaxe-regex" => pickaxe_regex = true,
             // `diff_opt_dirstat()`: `--cumulative` and `--dirstat-by-file` are spelled
@@ -1149,8 +1295,11 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
                 if render_only_option(s) {
                     // Ignored for the raw/name listings (their bytes are identical with
                     // and without it); recorded so a content format refuses rather than
-                    // rendering the wrong bytes.
-                    content_altering.get_or_insert_with(|| s.to_owned());
+                    // rendering the wrong bytes — unless the option cannot change any
+                    // format, in which case there is nothing to refuse.
+                    if !provable_noop_option(s) {
+                        content_altering.get_or_insert_with(|| s.to_owned());
+                    }
                 } else if s.starts_with('-') && s.len() > 1 {
                     if short_option_takes_value(s) {
                         i += 1;
@@ -1162,14 +1311,39 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
             }
         }
     }
-    if quiet {
-        opts.format = Format::Silent;
+    // Every option that carries `DIFF_FORMAT_NO_OUTPUT` in its `OPT_BITOP` clear mask
+    // (diff.c:6043-6091) — and `enable_patch_output()` behind `-U` and `--binary` —
+    // cancels an earlier `-s`. Because that `-s` arm already reset each of these, one of
+    // them still being set here is exactly "a positive format was asked for afterwards".
+    if opts.patch
+        || opts.numstat
+        || opts.diffstat
+        || opts.shortstat
+        || opts.summary
+        || opts.dirstat.is_some()
+        || raw_explicit
+    {
+        check_mask &= !M_NO_OUTPUT;
     }
-    // `diff_setup_done()`: `DIFF_FORMAT_CHECKDIFF` displaces the raw listing the same
-    // way the name formats do, and `-s` outranks it in turn.
-    if opts.check && opts.format != Format::Silent {
-        opts.format = Format::Check;
+    if quiet {
+        check_mask = M_NO_OUTPUT;
+    }
+    // `diff_setup_done()` (diff.c:5259): these four output formats are mutually
+    // exclusive, and it dies rather than picking one. The `die()` itself runs after
+    // `setup_revisions()` has resolved every operand, so it is only recorded here.
+    let check_mask_conflict = check_mask.count_ones() > 1;
+    opts.format = match check_mask {
+        M_NAME => Format::NameOnly,
+        M_NAME_STATUS => Format::NameStatus,
+        M_CHECK => Format::Check,
+        M_NO_OUTPUT => Format::Silent,
+        _ => Format::Raw,
+    };
+    // `DIFF_FORMAT_CHECKDIFF` displaces the raw listing the same way the name formats do.
+    if opts.format == Format::Check {
         opts.emit_pairs = false;
+    } else {
+        opts.check = false;
     }
     // `diff_setup_done()`: `--name-only`, `--name-status`, `--check` and `-s` clear every
     // other output format, so `--dirstat`/`--stat`/`-p` next to one of them are dropped.
@@ -1393,6 +1567,14 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
     // exit 1 instead of git's `fatal: ..: '..' is outside repository at '<wt>'`.
     if let Some(msg) = crate::pathspec::parse_pathspec_fatal(&repo, &paths) {
         eprintln!("fatal: {msg}");
+        return Ok(ExitCode::from(128));
+    }
+    // `diff_setup_done()`'s first `HAS_MULTI_BITS` (diff.c:5259), which stands ahead of
+    // the pickaxe one below and behind the bad-revision die — measured against 2.55.0,
+    // where `diff-index -s --name-only nosuchrev` reports the bad revision and
+    // `diff-index -s --name-only --bogus HEAD~1` reports this conflict.
+    if check_mask_conflict {
+        eprintln!("{CHECK_MASK_CONFLICT}");
         return Ok(ExitCode::from(128));
     }
     // `diff_setup_done()`'s pickaxe check: a `die()` after the revisions are
@@ -2566,6 +2748,11 @@ struct IdxAnalysis {
     hunks: Option<Vec<u8>>,
     old_data: Vec<u8>,
     new_data: Vec<u8>,
+    /// `false` when the internal line diff ran and every change group turned out
+    /// ignorable, so `xdi_diff_outf()` emitted nothing at all — header included,
+    /// because `builtin_diff()` hands a plain modification's header to
+    /// `ecbdata.header` and only `fn_out_consume()` flushes it.
+    changed: bool,
     /// The ids the patch `index` line shows, i.e. the pair after `diff_fill_oid_info()`
     /// (diff.c:4990) has run over it. They differ from `Delta::src_id`/`dst_id` for a
     /// worktree side, whose `oid_valid` is 0: the raw listing prints that side's null id
@@ -2623,6 +2810,7 @@ fn analyze_index_delta(
             hunks: None,
             old_data: Vec::new(),
             new_data: Vec::new(),
+            changed: true,
             src_id: d.src_id,
             dst_id: d.dst_id,
         });
@@ -2656,6 +2844,7 @@ fn analyze_index_delta(
             hunks: None,
             old_data,
             new_data,
+            changed: true,
             src_id,
             dst_id,
         });
@@ -2677,16 +2866,22 @@ fn analyze_index_delta(
         &after,
         opts.indent_heuristic,
     );
-    // `xdl_mark_ignorable_regex()`: a change group whose every removed and added line
-    // matches the `-I` pattern is marked ignorable, which keeps it out of the counts and
-    // stops `xdl_get_hunk()` from opening a hunk for it.
+    // `xdl_mark_ignorable_lines()` (`--ignore-blank-lines`) and
+    // `xdl_mark_ignorable_regex()` (`-I<re>`): a change group whose every removed and
+    // added line is ignorable is marked so, which keeps it out of the counts and stops
+    // `xdl_get_hunk()` from opening a hunk for it. `xdl_diff()` runs the blank-line
+    // pass first and the regex pass second, and the regex pass opens with
+    // `if (xch->ignore) continue;` under the comment "Do not override
+    // --ignore-blank-lines" — so the two predicates are an OR, not a precedence.
     let changes: Vec<super::diff_pairs::Change> = diff
         .hunks()
         .map(|h| {
-            let ignore = opts.ignore_lines.as_ref().is_some_and(|pat| {
-                h.before.clone().all(|i| pat.is_match(before[i as usize]))
-                    && h.after.clone().all(|i| pat.is_match(after[i as usize]))
-            });
+            let all = |pred: &dyn Fn(&[u8]) -> bool| {
+                h.before.clone().all(|i| pred(before[i as usize]))
+                    && h.after.clone().all(|i| pred(after[i as usize]))
+            };
+            let ignore = (opts.ignore_blank_lines && all(&|l| is_blank_record(l, opts.ws)))
+                || opts.ignore_lines.as_ref().is_some_and(|pat| all(&|l| pat.is_match(l)));
             super::diff_pairs::Change {
                 i1: h.before.start as usize,
                 chg1: h.before.len(),
@@ -2696,29 +2891,25 @@ fn analyze_index_delta(
             }
         })
         .collect();
-    let (added, deleted) = changes
-        .iter()
-        .filter(|c| !c.ignore)
-        .fold((0u32, 0u32), |(a, d), c| (a + c.chg2 as u32, d + c.chg1 as u32));
 
+    // The shared `xdl_emit_diff` port, so `--inter-hunk-context=<n>` merges hunks
+    // here exactly as it does for `git diff` and `diff-pairs`. Its `add`/`del` are the
+    // counts too: git's `diffstat_consume()` counts the lines `xdl_emit_diff()`
+    // printed, and an ignorable group is still printed when a neighbouring live group
+    // opened a hunk over it.
+    let (added, deleted, buf) = super::diff_pairs::emit_unified(
+        &before,
+        &after,
+        &changes,
+        &super::diff_pairs::EmitGeometry {
+            ctx: opts.ctx as usize,
+            inter_hunk_ctx: opts.inter_hunk_ctx,
+            func_context: false,
+        },
+    );
     // `--check` walks the hunk stream too, so it is rendered for that format as well.
-    let hunks = if (opts.patch || opts.format == Format::Check) && (added != 0 || deleted != 0) {
-        // The shared `xdl_emit_diff` port, so `--inter-hunk-context=<n>` merges hunks
-        // here exactly as it does for `git diff` and `diff-pairs`.
-        let (_, _, buf) = super::diff_pairs::emit_unified(
-            &before,
-            &after,
-            &changes,
-            &super::diff_pairs::EmitGeometry {
-                ctx: opts.ctx as usize,
-                inter_hunk_ctx: opts.inter_hunk_ctx,
-                func_context: false,
-            },
-        );
-        Some(buf)
-    } else {
-        None
-    };
+    let hunks = ((opts.patch || opts.format == Format::Check) && (added != 0 || deleted != 0))
+        .then_some(buf);
     // `before`/`after` borrow the two buffers, so release them before the move.
     drop(before);
     drop(after);
@@ -2729,9 +2920,19 @@ fn analyze_index_delta(
         hunks,
         old_data,
         new_data,
+        changed: added != 0 || deleted != 0,
         src_id,
         dst_id,
     })
+}
+
+/// `xdl_blankline()` (`xdiff/xutils.c`): with no whitespace flag in force a record is
+/// blank only when it is the bare terminator; with one, when every byte is space.
+fn is_blank_record(line: &[u8], ws: Ws) -> bool {
+    if !ws.any() {
+        return line.len() <= 1;
+    }
+    line.iter().all(u8::is_ascii_whitespace)
 }
 
 /// `diff_fill_oid_info()` (diff.c:4990) for one side of a pair.
@@ -2999,9 +3200,9 @@ fn render_patch(
     let must_show = !d.old_valid()
         || !d.new_valid()
         || d.src_mode != d.dst_mode
-        || content_differs
         || an.binary
-        || an.hunks.is_some();
+        || an.hunks.is_some()
+        || (an.changed && content_differs);
     if !must_show {
         return;
     }

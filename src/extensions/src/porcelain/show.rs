@@ -1,7 +1,6 @@
 use anyhow::{bail, Result};
 use std::io::{IsTerminal, Write};
 use std::process::ExitCode;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use gix::bstr::{BStr, ByteSlice};
 use gix::diff::blob::unified_diff::{ConsumeHunk, ContextSize, DiffLineKind, HunkHeader};
@@ -17,8 +16,7 @@ use super::filespec::{content_of, count_changed_lines_ws, is_binary};
 use super::diff_color;
 use super::diffstat::{self, StatWidths};
 use super::line_log;
-use super::log::{DecorateStyle, Decorations, Mailmap};
-use super::pretty_pad::{FlushType, PadState, WrapState};
+use super::log::{parse_date_mode, DateMode, DecorateStyle, Decorations, Mailmap, Pretty};
 
 /// git's `MINIMUM_ABBREV`: the shortest id `--abbrev=<n>` may ask for, and the width
 /// the all-zero side of an `index`/raw line is padded to when nothing longer is set.
@@ -38,12 +36,21 @@ const DEFAULT_ABBREV: usize = 7;
 ///     names, directories suffixed with `/`.
 ///   * `git show <tag>`       → the annotated-tag header, then the object it points to.
 ///
-/// Pretty formats: the default `medium`, `--oneline`, the mail formats `email`
-/// and `mboxrd` (rendered by [`super::log::email_body`], so they are byte-for-byte
-/// `git log`'s — `cmd_show` runs the same `cmd_log_init`), and
-/// `--format=`/`--pretty=` with the placeholder subset listed in
-/// [`expand_format`]. Any other placeholder is rejected rather than silently
-/// dropped, and `short`/`full`/`fuller`/`raw`/`reference` are not ported.
+/// Pretty formats: every format `git log` renders, rendered by `git log`'s own
+/// code. `cmd_show` runs the same `cmd_log_init` and prints each record through
+/// the same `show_log()`/`pretty_print_commit()` pair, so the format is parsed by
+/// [`super::log::get_commit_format`] and the header is written by
+/// [`super::log::EntryRenderer`] — `medium`, `short`, `full`, `fuller`, `raw`,
+/// `oneline`, `reference`, the mail formats `email`/`mboxrd`, and
+/// `--format=`/`--pretty=` with the placeholder set listed in `git log`'s
+/// `check_format`. A placeholder neither command implements is rejected rather
+/// than silently dropped, and it is rejected identically by both.
+///
+/// The record separator follows from that parse: `get_commit_format` also answers
+/// `show_log()`'s `use_terminator`, so `oneline`, `reference` and `tformat:`/
+/// `--format=` end each record with the terminator byte while every other format
+/// puts it *between* records (log-tree.c:776-793, 915-919). Under `-z` that byte
+/// is a NUL in both places.
 ///
 /// Header decoration and identity flags, shared with `git log` and rendered by
 /// its code so the two commands emit identical bytes:
@@ -132,6 +139,11 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
     // `-z` (`diffopt.line_termination = 0`): NUL-terminated records with raw paths.
     let mut z = false;
     let mut pretty = Pretty::Medium;
+    // `get_commit_format`'s second half: whether the format terminates each
+    // record (`oneline`, `reference`, `tformat:`/`--format=`) or separates them
+    // (every built-in header format and `format:`). `show_log()` reads it as
+    // `rev->use_terminator` (log-tree.c:776, 915).
+    let mut terminator = false;
     // `rev->pretty_given`, which is what decides whether notes show by default.
     let mut pretty_given = false;
     // `--[no-]encode-email-headers`; `None` leaves `format.encodeEmailHeaders`
@@ -194,6 +206,10 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
     // Set while a `--decorate-refs`/`--decorate-refs-exclude` given in the
     // separate-value form waits for its pattern in the next argv token.
     let mut pending_decorate_refs: Option<bool> = None;
+    // Set while a separated `-I` / `--ignore-matching-lines` waits for its pattern.
+    let mut pending_ignore_regex = false;
+    // `--show-signature` / `--no-show-signature` (`rev_info.show_signature`).
+    let mut show_signature = false;
     // `--source`: annotate each shown commit with the argument it was reached
     // from (`\t<source>` after the hash), as `git log --source` does.
     let mut source_mode = false;
@@ -211,6 +227,10 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
     // `unsorted_input` never reaches `cmd_show`'s own loop, which is why
     // `--no-walk=sorted` and `--no-walk=unsorted` are indistinguishable here.
     let mut no_walk = true;
+    // `revs->max_count`: -1 (unlimited) in git; `None` here.
+    let mut max_count: Option<usize> = None;
+    // `-n <n>`: the count lives in the next argv slot.
+    let mut pending_max_count = false;
     // `--all`, `--branches`/`--tags`/`--remotes`, `--glob` and the `--exclude`
     // patterns they consume, slotted at the argument index they were written at
     // so their tips land where `setup_revisions()` pends them.
@@ -261,8 +281,26 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
             eprintln!("{line}");
             return Ok(ExitCode::from(129));
         }
+        if std::mem::take(&mut pending_max_count) {
+            match s.parse::<usize>() {
+                Ok(n) => max_count = Some(n),
+                Err(_) => crate::git_fatal!("'{s}': not an integer"),
+            }
+            no_walk = false;
+            continue;
+        }
         if std::mem::take(&mut pending_line_range) {
             line_ranges.push(a.clone());
+            continue;
+        }
+        if std::mem::take(&mut pending_ignore_regex) {
+            match super::diff_pickaxe::compile_regex(a.as_bytes()) {
+                Ok(re) => patch_opts.ignore_lines.push(super::diff_pickaxe::Needle::Regex(re)),
+                Err(_) => {
+                    eprintln!("error: invalid regex given to -I: '{a}'");
+                    return Ok(ExitCode::from(129));
+                }
+            }
             continue;
         }
         if let Some(include) = pending_decorate_refs.take() {
@@ -326,6 +364,7 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
             "--stat" => formats.stat = true,
             "--oneline" => {
                 pretty = Pretty::Oneline;
+                terminator = true;
                 pretty_given = true;
                 // git`s `--oneline` is `--pretty=oneline --abbrev-commit`.
                 cli_abbrev = Some(true);
@@ -401,10 +440,14 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
                 {
                     // git validates each `--pretty`/`--format` occurrence eagerly,
                     // before resolving any revision, and rejects an invalid one
-                    // wherever it appears with exit 128.
-                    match parse_pretty(spec) {
-                        Some(p) => {
+                    // wherever it appears with exit 128. `cmd_show` runs the same
+                    // `cmd_log_init` as `cmd_log`, so the parser is `git log`'s
+                    // `get_commit_format` — every format name and placeholder the
+                    // one renders, the other renders identically.
+                    match super::log::get_commit_format(spec)? {
+                        Some((p, t)) => {
                             pretty = p;
+                            terminator = t;
                             pretty_given = true;
                         }
                         None => return Ok(fatal(&format!("invalid --pretty format: {spec}\n"))),
@@ -459,10 +502,73 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
                     patch_opts.ws = super::diff::Whitespace::IgnoreChange;
                 } else if s == "--ignore-space-at-eol" {
                     patch_opts.ws = super::diff::Whitespace::IgnoreAtEol;
+                } else if s == "--ignore-cr-at-eol" {
+                    patch_opts.ws = super::diff::Whitespace::IgnoreCrAtEol;
                 } else if s == "--full-index" {
                     patch_opts.full_index = true;
                 } else if s == "-a" || s == "--text" {
                     patch_opts.text = true;
+                // Diff-algorithm selection. `cmd_show()` runs `setup_revisions()`, which
+                // hands every unrecognised token to `diff_opt_parse()` (revision.c:2721),
+                // so `show` takes the same four spellings `git diff` does.
+                } else if s == "--minimal" {
+                    patch_opts.algorithm = Some(gix::diff::blob::Algorithm::MyersMinimal);
+                } else if s == "--patience" {
+                    patch_opts.algorithm = Some(gix::diff::blob::Algorithm::Patience);
+                } else if s == "--histogram" {
+                    patch_opts.algorithm = Some(gix::diff::blob::Algorithm::Histogram);
+                } else if let Some(v) = s.strip_prefix("--diff-algorithm=") {
+                    match super::diff_optval::parse_algorithm_value(v) {
+                        Some(alg) => patch_opts.algorithm = Some(alg),
+                        None => crate::git_fatal!(
+                            "option diff-algorithm accepts \"myers\", \"minimal\", \"patience\" and \"histogram\""
+                        ),
+                    }
+                } else if s == "--indent-heuristic" {
+                    patch_opts.indent_heuristic = true;
+                } else if s == "--no-indent-heuristic" {
+                    patch_opts.indent_heuristic = false;
+                } else if s == "--ignore-blank-lines" {
+                    patch_opts.blank_lines = true;
+                // `-I<re>` / `--ignore-matching-lines=<re>` (`diff_opt_ignore_regex()`,
+                // diff.c:5859): `regcomp`ed with `REG_EXTENDED | REG_NEWLINE` and pushed
+                // onto `options->ignore_regex`, so repeats accumulate.
+                } else if s == "-I" || s == "--ignore-matching-lines" {
+                    pending_ignore_regex = true;
+                } else if let Some(v) = s
+                    .strip_prefix("--ignore-matching-lines=")
+                    .or_else(|| if s.len() > 2 { s.strip_prefix("-I") } else { None })
+                {
+                    match super::diff_pickaxe::compile_regex(v.as_bytes()) {
+                        Ok(re) => {
+                            patch_opts.ignore_lines.push(super::diff_pickaxe::Needle::Regex(re));
+                        }
+                        Err(_) => {
+                            eprintln!("error: invalid regex given to -I: '{v}'");
+                            return Ok(ExitCode::from(129));
+                        }
+                    }
+                } else if let Some(v) = s.strip_prefix("--inter-hunk-context=") {
+                    match v.parse::<usize>() {
+                        Ok(n) => patch_opts.inter_hunk_ctx = n,
+                        Err(_) => crate::git_fatal!("invalid argument to --inter-hunk-context: {v}"),
+                    }
+                } else if s == "--binary" {
+                    patch_opts.binary = true;
+                // `--submodule[=<format>]`: a bare flag is `DIFF_SUBMODULE_LOG`
+                // (diff.c:6269), an unknown value a usage error (129).
+                } else if s == "--submodule" {
+                    patch_opts.submodule_format = super::diff::SubmoduleFormat::Log;
+                } else if let Some(v) = s.strip_prefix("--submodule=") {
+                    match super::diff::parse_submodule_params(v) {
+                        Some(f) => patch_opts.submodule_format = f,
+                        None => {
+                            eprintln!("fatal: bad --submodule argument: {v}");
+                            return Ok(ExitCode::from(129));
+                        }
+                    }
+                } else if s == "-D" || s == "--irreversible-delete" {
+                    patch_opts.irreversible_delete = true;
                 } else if s == "-W" || s == "--function-context" {
                     patch_opts.func_context = true;
                 } else if s == "--no-function-context" {
@@ -584,6 +690,29 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
                     no_walk = true;
                 } else if s == "--do-walk" {
                     no_walk = false;
+                // `--max-count=<n>` / `-<digit>` / `-n<n>` / `-n <n>`. Each of these
+                // clears `revs->no_walk` alongside setting `revs->max_count`
+                // (revision.c:2345-2346, 2366-2368, 2370-2374, 2376-2378), so
+                // `cmd_show` takes its `if (!rev.no_walk)` branch and runs
+                // `cmd_log_walk` (builtin/log.c:694-699) rather than its pending
+                // loop — `git show -2` is a two-commit walk, not one commit.
+                } else if let Some(v) = s
+                    .strip_prefix("--max-count=")
+                    .or_else(|| s.strip_prefix("-n").filter(|v| !v.is_empty()))
+                    .or_else(|| {
+                        s.strip_prefix('-')
+                            .filter(|v| !v.is_empty() && v.bytes().all(|c| c.is_ascii_digit()))
+                    })
+                {
+                    match v.parse::<usize>() {
+                        Ok(n) => max_count = Some(n),
+                        // `parse_count()` (revision.c) dies on a non-number.
+                        Err(_) => crate::git_fatal!("'{v}': not an integer"),
+                    }
+                    no_walk = false;
+                } else if s == "-n" {
+                    // `-n` takes the next argv slot (revision.c:2370-2374).
+                    pending_max_count = true;
                 // `--reverse` reverses what `cmd_log_walk` emits; `cmd_show`'s own
                 // pending loop never consults it, so it does nothing while
                 // `no_walk` stands.
@@ -612,6 +741,13 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
                         std::mem::take(&mut ref_excludes),
                         negate_revs,
                     ));
+                } else if s == "--show-signature" {
+                    show_signature = true;
+                } else if s == "--no-show-signature" {
+                    show_signature = false;
+                } else if super::diff::history_noop_diff_option(s) {
+                    // Accepted and inert; see the list's own documentation for why each
+                    // entry cannot change a byte this command prints.
                 } else if s.starts_with('-') {
                     bail!("unsupported option {s}");
                 } else {
@@ -669,10 +805,6 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
         };
         eprintln!("error: option `{name}' requires a value");
         return Ok(ExitCode::from(129));
-    }
-    if let Pretty::User(fmt) = &pretty {
-        // Reject unknown placeholders before any output is produced.
-        check_format(fmt)?;
     }
     stdin_text = if read_stdin {
         use std::io::Read as _;
@@ -795,7 +927,10 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
     // The commit→refs map for `--decorate`, filtered exactly as `git log` filters
     // it; skipped entirely when no decorations will be shown so the ref scan costs
     // nothing on a plain `git show`.
-    let decorations = if decorate == DecorateStyle::Off {
+    // `%d`/`%D` need the map too, whatever `--decorate` says.
+    let decorations = if decorate == DecorateStyle::Off
+        && !super::log::pretty_uses_decoration(&pretty)
+    {
         None
     } else {
         let filter = super::log::DecorationFilter::build(
@@ -807,7 +942,14 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
         Some(super::log::build_decorations(&repo, &filter)?)
     };
     // `--use-mailmap` / `log.mailmap`: loaded once and shared by every commit.
-    let mailmap = use_mailmap.then(|| Mailmap::load(&repo));
+    // `%aN`/`%aE`/`%cN`/`%cE` resolve through the mailmap whether or not the header
+    // formats do, so a format that names one loads it even under `--no-use-mailmap`
+    // — `format_person_part()` reads `pp->mailmap` unconditionally.
+    let format_maps_identities = match &pretty {
+        Pretty::User(f) => super::log::format_names_mapped_identity(f),
+        _ => false,
+    };
+    let mailmap = (use_mailmap || format_maps_identities).then(|| Mailmap::load(&repo));
 
     // git resolves every revision before rendering anything, so a bad revision
     // produces no stdout at all even when an earlier one was fine. Ranges (`a..b`),
@@ -924,22 +1066,27 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
             // the `^@` parents are already excluded by the `^!`.
             RevSpec::ExcludeParents(id) => {
                 let parents = parents_of(&repo, id)?;
+                // `add_parents_only()` is handed `arg_minus_excl` — the argument
+                // with its `^!` cut off — and `get_reference()` records *that* as
+                // the pending object's name, so `--source` prints `HEAD`, not
+                // `HEAD^!` (revision.c:2186-2191).
+                let name = parents_only_name(spec, "^!");
                 if negated {
                     for p in parents {
-                        plain.push(((*spec).to_string(), p));
+                        plain.push((name.to_string(), p));
                         walk_tips.push(p);
-                        walk_tip_sources.push((*spec).to_string());
+                        walk_tip_sources.push(name.to_string());
                     }
-                    plain.push(((*spec).to_string(), id));
+                    plain.push((name.to_string(), id));
                     walk_hidden.push(id);
                 } else {
                     for p in &parents {
-                        plain.push(((*spec).to_string(), *p));
+                        plain.push((name.to_string(), *p));
                     }
                     walk_hidden.extend(parents);
-                    plain.push(((*spec).to_string(), id));
+                    plain.push((name.to_string(), id));
                     walk_tips.push(id);
-                    walk_tip_sources.push((*spec).to_string());
+                    walk_tip_sources.push(name.to_string());
                 }
             }
             RevSpec::Exclude(id) if negated => {
@@ -1010,14 +1157,24 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
             // `no_walk` survives and `git show HEAD^@` prints the parents themselves
             // rather than walking their history. `--not` is what makes them exclusions.
             RevSpec::IncludeOnlyParents(id) => {
+                // Same rule as `^!`: the name is `arg_minus_at`, the argument with
+                // its `^@` cut off (revision.c:2178-2184).
+                let name = parents_only_name(spec, "^@");
+                // `handle_revision_arg_1()` strips the leading `^` into `flags_exclude`
+                // *before* it looks at the `^@` suffix, so `^<rev>^@` pends the parents
+                // UNINTERESTING. gitoxide's `rev_parse()` folds that `^` into its
+                // `Exclude…` variants but not into `IncludeOnlyParents`, which comes
+                // back as though the caret were not there — so it is read from the
+                // token here rather than trusted to the variant.
+                let negated = negated ^ spec.starts_with('^');
                 for p in parents_of(&repo, id)? {
                     if negated {
-                        plain.push(((*spec).to_string(), p));
+                        plain.push((name.to_string(), p));
                         walk_hidden.push(p);
                     } else {
-                        plain.push(((*spec).to_string(), p));
+                        plain.push((name.to_string(), p));
                         walk_tips.push(p);
-                        walk_tip_sources.push((*spec).to_string());
+                        walk_tip_sources.push(name.to_string());
                     }
                 }
             }
@@ -1136,7 +1293,10 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
     }
     let notes_trees = super::notes::load_display(&repo, &notes_opt)?;
     let (cfg_subject_prefix, cfg_encode_email_headers) = super::log::email_config(&repo);
+    let renderer = super::log::EntryRenderer::new(&repo);
+    let rename_warn = std::cell::RefCell::new(RenameWarnState::default());
     let disp = DisplayOpts {
+        show_signature,
         notes: &notes_trees,
         abbrev_commit,
         date_mode,
@@ -1146,7 +1306,11 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
         patch: patch_opts.clone(),
         decorate,
         decorations: decorations.as_ref(),
-        mailmap: mailmap.as_ref(),
+        mailmap: use_mailmap.then(|| mailmap.as_ref()).flatten(),
+        identity_mailmap: mailmap.as_ref(),
+        terminator,
+        renderer: &renderer,
+        rename_warn: &rename_warn,
         z,
         expand_tabs,
         email: super::log::EmailStyle {
@@ -1217,7 +1381,13 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
     } else if needs_walk {
         // `--reverse` is applied to what the walk produced, which is where
         // `get_revision()` applies it too.
+        // `--max-count`: `get_revision_internal()` stops handing commits back once the
+        // counter runs out, and `--reverse` reverses what survived that limit rather
+        // than limiting the reversed stream (revision.c:4683-4692).
         let mut nodes = walked;
+        if let Some(n) = max_count {
+            nodes.truncate(n);
+        }
         if reverse {
             nodes.reverse();
         }
@@ -1255,8 +1425,13 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
         }
     }
 
+    // Persist whatever abbreviations the header renderer computed, as `git log`
+    // does at the end of its walk.
+    drop(disp);
+    renderer.finish();
+
     let mut stdout = std::io::stdout().lock();
-    match stdout.write_all(&out).and_then(|()| stdout.flush()) {
+    let rc = match stdout.write_all(&out).and_then(|()| stdout.flush()) {
         Ok(()) => Ok(ExitCode::SUCCESS),
         // A downstream `| head` closing the pipe is not an error; git leaves by
         // way of SIGPIPE rather than returning a status of its own.
@@ -1264,7 +1439,31 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
             crate::sigpipe::exit_broken_pipe()
         }
         Err(e) => Err(e.into()),
+    };
+    // `diff_result_code()` reports the rename limit the run would have needed, and
+    // `diff_warn_rename_limit()` opens with `fflush(stdout)` — so the warnings land
+    // after everything the command printed (diff.c:7038-7040, 7546-7548).
+    let warns = rename_warn.borrow();
+    if needs_walk {
+        // One `cmd_log_walk()` for the whole walk, so one report: whatever the last
+        // commit's rename pass left in `rev.diffopt`.
+        warns.current.emit("diff.renameLimit");
+    } else {
+        for w in &warns.per_commit {
+            w.emit("diff.renameLimit");
+        }
     }
+    rc
+}
+
+/// The name `add_parents_only()` pends a `<rev>^@` / `<rev>^!` argument under:
+/// the argument with its mark cut off (`arg_minus_at` / `arg_minus_excl`,
+/// revision.c:2178-2191) and, since `add_parents_only()` steps past a leading
+/// `^` before calling `get_reference()` (revision.c:1898-1901), without that
+/// either. `--source` prints this name, not the argument as written.
+fn parents_only_name<'a>(spec: &'a str, mark: &str) -> &'a str {
+    let base = spec.strip_suffix(mark).unwrap_or(spec);
+    base.strip_prefix('^').unwrap_or(base)
 }
 
 /// The parents of the commit `id` names, for the `<rev>^@` and `<rev>^!` forms.
@@ -1313,243 +1512,6 @@ fn fatal(msg: &str) -> ExitCode {
 fn bad_revision(repo: &gix::Repository, spec: &str) -> ExitCode {
     eprint!("{}", super::log::bad_revision_message_in(repo, spec));
     ExitCode::from(128)
-}
-
-// ---------------------------------------------------------------------------
-// Pretty formats
-// ---------------------------------------------------------------------------
-
-enum Pretty {
-    /// git's default `medium`: `commit`/`Merge`/`Author`/`Date` and an indented message.
-    Medium,
-    /// `<abbrev> <subject>` on one line.
-    Oneline,
-    /// `CMIT_FMT_EMAIL`: the `From <oid> Mon Sep 17 00:00:00 2001` line and an
-    /// RFC2822 header block. Rendered by [`super::log::email_body`] — the same
-    /// function `git log --pretty=email` uses, since both go through
-    /// `cmd_log_init`/`show_log`.
-    Email,
-    /// `CMIT_FMT_MBOXRD`: [`Pretty::Email`] with `/^>*From /` escaped in the body.
-    MboxRd,
-    /// A `--format=` string with `%` placeholders.
-    User(String),
-}
-
-impl Pretty {
-    /// `cmit_fmt_is_mail()`.
-    fn is_mail(&self) -> bool {
-        matches!(self, Pretty::Email | Pretty::MboxRd)
-    }
-
-    /// The shared [`super::log::Pretty`] this names, for the renderer both
-    /// commands call. Only the mail formats are shared so far; the rest of
-    /// `show`'s header shapes are still written here.
-    fn as_log_pretty(&self) -> Option<super::log::Pretty> {
-        match self {
-            Pretty::Email => Some(super::log::Pretty::Email),
-            Pretty::MboxRd => Some(super::log::Pretty::MboxRd),
-            _ => None,
-        }
-    }
-}
-
-/// Parse a `--pretty`/`--format` value, or `None` when git would reject it with
-/// `fatal: invalid --pretty format: <spec>`. git's rule: a `format:`/`tformat:`
-/// prefix or any `%` placeholder is a user format; the empty string is an empty
-/// user format (prints nothing); a known format name is that format; anything
-/// else is invalid.
-fn parse_pretty(spec: &str) -> Option<Pretty> {
-    if let Some(fmt) = spec.strip_prefix("format:").or_else(|| spec.strip_prefix("tformat:")) {
-        return Some(Pretty::User(fmt.to_string()));
-    }
-    match spec {
-        "" => Some(Pretty::User(String::new())),
-        "oneline" => Some(Pretty::Oneline),
-        "medium" => Some(Pretty::Medium),
-        "email" => Some(Pretty::Email),
-        "mboxrd" => Some(Pretty::MboxRd),
-        _ if spec.contains('%') => Some(Pretty::User(spec.to_string())),
-        _ => None,
-    }
-}
-
-/// Reject any placeholder [`expand_format`] does not implement, so an unsupported
-/// format fails loudly instead of expanding to something plausible but wrong.
-fn check_format(fmt: &str) -> Result<()> {
-    let mut it = fmt.chars();
-    while let Some(c) = it.next() {
-        if c != '%' {
-            continue;
-        }
-        match it.next() {
-            Some('H' | 'h' | 'T' | 't' | 'P' | 'p' | 's' | 'n' | '%' | 'N') => {}
-            Some('a') => match it.next() {
-                Some('n' | 'e') => {}
-                Some(x) => anyhow::bail!("unsupported format placeholder %a{x}"),
-                None => anyhow::bail!("unsupported trailing % in format"),
-            },
-            // The column-control atoms — `%<(<N>)`, `%>(<N>)`, `%><(<N>)`, `%>>(<N>)`
-            // and their `|`/`trunc`/`ltrunc`/`mtrunc` forms — and `%w(…)` are
-            // validated where they are expanded: git prints a malformed one
-            // literally rather than failing (see [`super::pretty_pad`]).
-            Some('<' | '>' | 'w') => {}
-            Some(x) => anyhow::bail!("unsupported format placeholder %{x}"),
-            None => anyhow::bail!("unsupported trailing % in format"),
-        }
-    }
-    Ok(())
-}
-
-/// Expand the placeholders accepted by [`check_format`] for `commit`.
-///
-/// The loop is git's `repo_format_commit_message()` driver: `%%` is expanded here
-/// (so it never spends a pending padding field), every other placeholder goes
-/// through [`expand_one`], and a `%<`/`%>` atom holds a column field open for
-/// whichever placeholder comes next.
-fn expand_format(
-    out: &mut Vec<u8>,
-    commit: &gix::Commit<'_>,
-    fmt: &str,
-    notes: &[super::notes::Tree],
-) -> Result<()> {
-    let chars: Vec<char> = fmt.chars().collect();
-    let mut pad = PadState::default();
-    let mut wrap = WrapState::default();
-    let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
-        i += 1;
-        if c != '%' {
-            let mut buf = [0u8; 4];
-            out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
-            continue;
-        }
-        let Some(&p) = chars.get(i) else { break };
-        if p == '%' {
-            out.push(b'%');
-            i += 1;
-            continue;
-        }
-        i += 1;
-        if pad.flush == FlushType::None {
-            if !expand_one(out, commit, &chars, &mut i, p, notes, &mut pad, &mut wrap)? {
-                out.push(b'%');
-                i -= 1;
-            }
-            continue;
-        }
-        // `format_and_pad_commit()`: measure the placeholder's own output, in
-        // display columns, and lay it out in the pending field.
-        let padding = pad.padding;
-        let mut local: Vec<u8> = Vec::new();
-        let consumed = expand_one(&mut local, commit, &chars, &mut i, p, notes, &mut pad, &mut wrap)?;
-        // `git show` has no `%C…`, so the colour-chaining half of
-        // `format_and_pad_commit()` has nothing to chain here.
-        pad.apply(out, local, padding, 0);
-        if !consumed {
-            out.push(b'%');
-            i -= 1;
-        }
-    }
-    wrap.rewrap_message_tail(out, 0, 0, 0);
-    Ok(())
-}
-
-/// `format_commit_one()`: expand the single placeholder `p`, whose following
-/// character is at `chars[*i]`. `false` is git's "consumed nothing", which makes
-/// the caller print the `%` literally.
-fn expand_one(
-    out: &mut Vec<u8>,
-    commit: &gix::Commit<'_>,
-    chars: &[char],
-    i: &mut usize,
-    p: char,
-    notes: &[super::notes::Tree],
-    pad: &mut PadState,
-    wrap: &mut WrapState,
-) -> Result<bool> {
-    match p {
-        // The column atoms expand to nothing and leave the field pending.
-        '<' | '>' => {
-            return Ok(match pad.parse(chars, *i - 1) {
-                Some(consumed) => {
-                    *i = *i - 1 + consumed;
-                    true
-                }
-                None => false,
-            })
-        }
-        // `%w(<width>,<indent1>,<indent2>)` re-wraps everything emitted after it.
-        'w' => {
-            return Ok(match wrap.parse_and_apply(out, chars, *i - 1) {
-                Some(consumed) => {
-                    *i = *i - 1 + consumed;
-                    true
-                }
-                None => false,
-            })
-        }
-        'H' => out.extend_from_slice(commit.id().to_string().as_bytes()),
-        // `%N`: the raw note text, the only way a user format shows notes.
-        'N' => out.extend_from_slice(&super::notes::format_display(
-            commit.repo,
-            notes,
-            commit.id().detach(),
-            true,
-        )?),
-        'h' => out.extend_from_slice(commit.id().shorten_or_id().to_string().as_bytes()),
-        'T' => out.extend_from_slice(commit.tree_id()?.to_string().as_bytes()),
-        't' => {
-            out.extend_from_slice(commit.tree_id()?.shorten_or_id().to_string().as_bytes());
-        }
-        'P' => write_parents(out, commit, false),
-        'p' => write_parents(out, commit, true),
-        's' => out.extend_from_slice(&subject(commit.message_raw()?)),
-        'n' => out.push(b'\n'),
-        '%' => out.push(b'%'),
-        'a' => {
-            let author = commit.author()?;
-            match chars.get(*i).copied() {
-                Some('n') => out.extend_from_slice(author.name),
-                Some('e') => out.extend_from_slice(author.email),
-                _ => unreachable!("check_format rejected this already"),
-            }
-            *i += 1;
-        }
-        _ => unreachable!("check_format rejected this already"),
-    }
-    Ok(true)
-}
-
-/// Space-separated parent ids, abbreviated for `%p` and full for `%P`.
-fn write_parents(out: &mut Vec<u8>, commit: &gix::Commit<'_>, abbrev: bool) {
-    for (i, p) in commit.parent_ids().enumerate() {
-        if i > 0 {
-            out.push(b' ');
-        }
-        let text = if abbrev {
-            p.shorten_or_id().to_string()
-        } else {
-            p.to_string()
-        };
-        out.extend_from_slice(text.as_bytes());
-    }
-}
-
-/// git's subject: the first paragraph of the message, folded onto one line.
-fn subject(msg: &[u8]) -> Vec<u8> {
-    let mut out: Vec<u8> = Vec::new();
-    for line in msg.split(|&b| b == b'\n') {
-        let line = trim_end_ws(line);
-        if line.is_empty() {
-            break;
-        }
-        if !out.is_empty() {
-            out.push(b' ');
-        }
-        out.extend_from_slice(line);
-    }
-    out
 }
 
 // ---------------------------------------------------------------------------
@@ -1652,7 +1614,24 @@ impl Formats {
 
 /// The display knobs `git show` shares with `git log`, resolved once from config
 /// and the command line.
+/// `rev.diffopt`'s two rename-limit fields across a whole `git show` run.
+///
+/// `cmd_show` keeps one `rev_info` for every object it prints and sets
+/// `rev.diffopt.no_free = 1`, so the fields carry over from one pending commit to
+/// the next: a commit whose own rename pass never reached
+/// `too_many_rename_candidates()` reports whatever the commit before it left there.
+#[derive(Default)]
+struct RenameWarnState {
+    /// The live `rev.diffopt` fields.
+    current: super::diffcore_rename::Warnings,
+    /// Their value at the end of each rendered commit — one `diff_result_code()`
+    /// call apiece under `no_walk`.
+    per_commit: Vec<super::diffcore_rename::Warnings>,
+}
+
 struct DisplayOpts<'a> {
+    /// `--show-signature` / `--no-show-signature` (`rev_info.show_signature`).
+    show_signature: bool,
     /// `log.abbrevCommit` / `--abbrev-commit`: abbreviate the `commit <id>` line.
     abbrev_commit: bool,
     /// `log.date` / `--date=<mode>`: the format of the `Date:` line.
@@ -1672,9 +1651,30 @@ struct DisplayOpts<'a> {
     decorate: DecorateStyle,
     /// The commit→refs map behind `decorate`; `None` when decorations are off.
     decorations: Option<&'a Decorations>,
-    /// `--use-mailmap` / `log.mailmap`: rewrites the `Author:` line through
-    /// `.mailmap`. `None` shows the identity as the commit recorded it.
+    /// `--use-mailmap` / `log.mailmap`: rewrites the `Author:`/`Commit:` lines
+    /// through `.mailmap`. `None` shows the identity as the commit recorded it.
     mailmap: Option<&'a Mailmap>,
+    /// The mailmap `%aN`/`%aE`/`%cN`/`%cE` resolve through. `format_person_part()`
+    /// consults it whether or not `--use-mailmap` is on, so a format that names
+    /// one loads it even under `--no-use-mailmap`.
+    identity_mailmap: Option<&'a Mailmap>,
+    /// `get_commit_format`'s terminator/separator answer for the selected format,
+    /// which is `show_log()`'s `opt->use_terminator`.
+    terminator: bool,
+    /// `git log`'s header formatter, which `cmd_show` shares: it owns the
+    /// abbreviation cache so a multi-commit `git show A..B` shortens each id once.
+    renderer: &'a super::log::EntryRenderer<'a>,
+    /// `opt->diffopt.needed_rename_limit` / `degraded_cc_to_c` as they stood when
+    /// each rendered commit finished.
+    ///
+    /// `cmd_show` reports them through `diff_result_code()`, but where that runs
+    /// depends on the shape of the request (builtin/log.c:696-701, 745-754): a walk
+    /// is one `cmd_log_walk()` for the whole range, so only the final state is
+    /// reported, while a no-walk request runs `cmd_log_walk_no_free()` once per
+    /// pending commit and reports after each. `rev.diffopt` is *not* reset between
+    /// those calls (`rev.diffopt.no_free = 1`), so a commit whose own pass never
+    /// reached the candidate check still reports the previous commit's numbers.
+    rename_warn: &'a std::cell::RefCell<RenameWarnState>,
     /// The notes trees whose `Notes[ (<ref>)]:` block follows the message.
     notes: &'a [super::notes::Tree],
     /// `-z`: NUL instead of newline as the record terminator, and paths written
@@ -1701,22 +1701,6 @@ fn name_bytes(path: &[u8], z: bool) -> Vec<u8> {
     } else {
         super::diff_files::quoted_name_bytes(path)
     }
-}
-
-/// The `Notes[ (<ref>)]:` blocks for `id`, or empty when notes are off.
-///
-/// git appends these to the message buffer, so the leading newline lands as the
-/// blank line above the block after a `medium` message and as nothing extra
-/// after a `oneline` subject — see [`super::notes::format_display`].
-fn notes_block(
-    repo: &gix::Repository,
-    disp: &DisplayOpts<'_>,
-    id: ObjectId,
-) -> Result<Vec<u8>> {
-    if disp.notes.is_empty() {
-        return Ok(Vec::new());
-    }
-    super::notes::format_display(repo, disp.notes, id, false)
 }
 
 /// Parse an integer with git's lenient `strtoul`-ish behavior for a `--stat*=<n>`
@@ -1791,43 +1775,21 @@ fn show_one(
                 shown.push(obj.id);
                 let commit = obj.try_into_commit()?;
                 show_commit(repo, out, &commit, pretty, selection, pathspecs, disp, pickaxe, source, shown_one, line_log_pairs)?;
+                // `cmd_show`'s `case OBJ_COMMIT:` runs one `cmd_log_walk_no_free()`
+                // per pending commit, and that closes with `diff_result_code()`
+                // (builtin/log.c:745-754) — so each printed commit gets its own
+                // rename-limit report, off the shared `rev.diffopt`.
+                let cur = disp.rename_warn.borrow().current;
+                disp.rename_warn.borrow_mut().per_commit.push(cur);
                 break;
             }
             Kind::Tag => {
-                let target = show_tag(out, &obj, pretty, disp)?;
+                let target = show_tag(out, &obj, pretty, disp, shown_one)?;
                 obj = repo.find_object(target)?;
             }
         }
     }
     Ok(())
-}
-
-/// `--source`: git's `show_log` prints `\t<source>` right after the commit hash
-/// on the built-in header formats. A no-op when `--source` is off, and never
-/// called for user formats, which git leaves bare.
-fn write_source(out: &mut Vec<u8>, source: Option<&str>) {
-    if let Some(src) = source {
-        out.push(b'\t');
-        out.extend_from_slice(src.as_bytes());
-    }
-}
-
-/// `--decorate`: append ` (HEAD -> main, tag: v1)` after the commit hash, in the
-/// selected style. Rendered by `git log`'s decoration formatter so the two
-/// commands emit the same bytes. Never colorized: `git show` here is always the
-/// `--no-color` case.
-fn write_decorations(out: &mut Vec<u8>, id: &gix::hash::oid, disp: &DisplayOpts<'_>) {
-    let (Some(decos), true) = (disp.decorations, disp.decorate != DecorateStyle::Off) else {
-        return;
-    };
-    super::log::format_decorations(
-        out,
-        decos,
-        &id.to_owned(),
-        disp.decorate == DecorateStyle::Full,
-        &super::color::DecorateColors::disabled(),
-        true,
-    );
 }
 
 /// `tree <name>` header followed by the top-level entry names. git echoes the name
@@ -1871,16 +1833,22 @@ fn show_tree(out: &mut Vec<u8>, obj: &gix::Object<'_>, name: &str) -> Result<()>
 /// …
 /// ```
 ///
-/// So `oneline` prints no identity at all, the mail formats print `From:` with
-/// an RFC2822 `Date:` that `--date=` does not reach, and a user format prints
-/// `Tagger:` with no date line — only `medium` has both halves.
+/// So `oneline` prints no identity at all; the mail formats print `From:` with an
+/// RFC2822 `Date:` that `--date=` does not reach; `fuller` pads the label to the
+/// `AuthorDate:` column and adds `TaggerDate:` (the `%sDate: ` arm, whose `what`
+/// is `Tagger`); `medium` adds `Date:   `; and `short`, `full`, `raw`,
+/// `reference` and a user format print `Tagger:` with no date line at all.
 fn show_tag(
     out: &mut Vec<u8>,
     obj: &gix::Object<'_>,
     pretty: &Pretty,
     disp: &DisplayOpts<'_>,
+    shown_one: &mut bool,
 ) -> Result<ObjectId> {
     let tag = obj.try_to_tag_ref()?;
+    // `--date=relative` measures against the wall clock, as `show_date_relative()`
+    // does.
+    let now = super::log::now_secs();
 
     out.extend_from_slice(b"tag ");
     out.extend_from_slice(tag.name);
@@ -1899,27 +1867,48 @@ fn show_tag(
         }
         (Some(tagger), _) => {
             out.extend_from_slice(b"Tagger: ");
+            // `pp_user_info()` pads the label out to the `TaggerDate: ` column
+            // under `fuller`, the same four spaces it gives `Author:`.
+            if matches!(pretty, Pretty::Fuller) {
+                out.extend_from_slice(b"    ");
+            }
             out.extend_from_slice(tagger.name);
             out.extend_from_slice(b" <");
             out.extend_from_slice(tagger.email);
             out.extend_from_slice(b">\n");
-            // Only `CMIT_FMT_MEDIUM` reaches the `Date:` arm of the switch; a
-            // user format falls off its end with nothing written.
-            if matches!(pretty, Pretty::Medium) {
-                let t = tagger.time()?;
-                let date = format_date(t.seconds, t.offset, disp.date_mode);
-                writeln!(out, "Date:   {date}")?;
+            // Only `CMIT_FMT_MEDIUM` and `CMIT_FMT_FULLER` reach a `Date:` arm of
+            // the switch; every other non-mail format falls off its end with
+            // nothing written.
+            match pretty {
+                Pretty::Medium => {
+                    let t = tagger.time()?;
+                    let date = super::log::fmt_time(t.seconds, t.offset, disp.date_mode, now);
+                    writeln!(out, "Date:   {date}")?;
+                }
+                Pretty::Fuller => {
+                    let t = tagger.time()?;
+                    let date = super::log::fmt_time(t.seconds, t.offset, disp.date_mode, now);
+                    writeln!(out, "TaggerDate: {date}")?;
+                }
+                _ => {}
             }
         }
     }
 
+    // `show_tag_object()` stops its header scan at the blank line and then
+    // `fwrite`s the rest of the object verbatim — the blank line included — so the
+    // record ends exactly where the object does. `cmd_show` then sets
+    // `rev.shown_one = 1` (builtin/log.c:722), which is what puts the blank line
+    // between the tag and the object it points at under a separator format; a
+    // terminator format (`oneline`, `tformat:`) gets none, and adding one here
+    // unconditionally is what used to leave `git show --pretty=oneline <tag>` with
+    // a stray blank line.
     out.push(b'\n');
-    // The tag message is printed verbatim (not indented), followed by a blank line.
     out.extend_from_slice(tag.message);
     if !tag.message.ends_with(b"\n") {
         out.push(b'\n');
     }
-    out.push(b'\n');
+    *shown_one = true;
 
     Ok(tag.target())
 }
@@ -1961,12 +1950,20 @@ fn show_commit(
         // set, so none of the collection below runs.
         Vec::new()
     } else if diff_shown {
+        let mut warn = super::diffcore_rename::Warnings::default();
         let mut f = collect_changes(
             repo,
             commit,
             parents.first().map(|p| p.detach()),
             &disp.patch,
+            &mut warn,
         )?;
+        // Only a pass that reached `too_many_rename_candidates()` writes the
+        // `diff_options` fields (see `git log`'s `record_rename_warnings`); an
+        // empty report leaves the previous commit's in place.
+        if warn.needed_rename_limit != 0 || warn.degraded_cc_to_c {
+            disp.rename_warn.borrow_mut().current = warn;
+        }
         if !pathspecs.is_empty() {
             let specs = super::log::PathspecMatcher::new(repo, pathspecs)?;
             f.retain(|c| specs.matches(&c.path));
@@ -1996,99 +1993,44 @@ fn show_commit(
         return Ok(());
     }
 
-    // git's `show_log`: a separator format (everything but the terminator formats
-    // `oneline` and `tformat:`) puts a blank line before every record but the
-    // first, which is what separates two commits of `git show A..B`. The
-    // terminator formats already ended the previous record with a newline.
-    if *shown_one && (matches!(pretty, Pretty::Medium) || pretty.is_mail()) {
-        out.push(b'\n');
+    // `show_log()`: a separator format puts the record terminator in front of
+    // every record but the first — what separates two commits of
+    // `git show A..B` — while a terminator format already closed the previous
+    // record with one (log-tree.c:776-793). Under `-z` that byte is a NUL, since
+    // it is `opt->diffopt.line_termination` in both places.
+    let rec_term = if disp.z { b'\0' } else { b'\n' };
+    if *shown_one && !disp.terminator {
+        out.push(rec_term);
     }
     *shown_one = true;
 
-    match pretty {
-        Pretty::Oneline => {
-            // `--pretty=oneline` prints the full object name; only `--oneline`,
-            // which is `--pretty=oneline --abbrev-commit`, shortens it.
-            if disp.abbrev_commit {
-                out.extend_from_slice(commit.id().shorten_or_id().to_string().as_bytes());
-            } else {
-                out.extend_from_slice(commit.id().to_string().as_bytes());
-            }
-            write_source(out, source);
-            write_decorations(out, commit.id().as_ref(), disp);
-            out.push(b' ');
-            out.extend_from_slice(&subject(commit.message_raw()?));
-            out.extend_from_slice(&notes_block(repo, disp, commit.id().detach())?);
-            out.push(b'\n');
-        }
-        // ```c
-        // if (cmit_fmt_is_mail(opt->commit_format)) {
-        //         log_write_email_headers(opt, commit, &extra_headers,
-        //                                 &ctx.need_8bit_cte, 1);
-        //         ctx.rev = opt;
-        //         ctx.print_email_subject = 1;
-        // } else if (opt->commit_format != CMIT_FMT_USERFORMAT) {
-        //         … fputs("commit ", …) …
-        // ```
-        //
-        // (log-tree.c:697-705.) The `From <oid> Mon Sep 17 00:00:00 2001` line
-        // replaces the `commit <oid>` line, so nothing that decorates that one —
-        // `--abbrev-commit`, `--decorate`, `--source`, the `Merge:` parents —
-        // is reached, and the name is `oid_to_hex()` rather than the
-        // abbreviation. The header block and body below it are the same
-        // `pretty_print_commit()` `git log --pretty=email` prints; only
-        // [`super::log::EmailStyle`] differs between the callers.
-        Pretty::Email | Pretty::MboxRd => {
-            let log_pretty = pretty.as_log_pretty().expect("mail formats map to a shared Pretty");
-            writeln!(out, "From {} Mon Sep 17 00:00:00 2001", commit.id())?;
-            super::log::email_body(out, commit, &log_pretty, disp.email)?;
-        }
-        Pretty::User(fmt) => {
-            expand_format(out, commit, fmt, disp.notes)?;
-            // A `tformat` (the default for `--format=`) terminates each non-empty
-            // entry with the record terminator — a newline, or NUL under `-z`, which
-            // is `show_log()` writing `opt->diffopt.line_termination`.
-            if !fmt.is_empty() {
-                out.push(if disp.z { b'\0' } else { b'\n' });
-            }
-        }
-        Pretty::Medium => {
-            // `log.abbrevCommit`/`--abbrev-commit` shortens the `commit` line; the
-            // `Merge:` parents are always abbreviated, as in git.
-            if disp.abbrev_commit {
-                write!(out, "commit {}", commit.id().shorten_or_id())?;
-            } else {
-                write!(out, "commit {}", commit.id())?;
-            }
-            write_source(out, source);
-            write_decorations(out, commit.id().as_ref(), disp);
-            out.push(b'\n');
-            if is_merge {
-                out.extend_from_slice(b"Merge:");
-                for p in &parents {
-                    out.push(b' ');
-                    out.extend_from_slice(p.shorten_or_id().to_string().as_bytes());
-                }
-                out.push(b'\n');
-            }
-
-            let author = commit.author()?;
-            // `--use-mailmap`/`log.mailmap` resolves the identity here, which is
-            // the one place git's built-in formats print it (`pp_user_info`).
-            super::log::write_person(out, b"Author: ", &author, disp.mailmap);
-            let t = author.time()?;
-            let date = format_date(t.seconds, t.offset, disp.date_mode);
-            writeln!(out, "Date:   {date}")?;
-            out.push(b'\n');
-
-            // Message, each line indented four spaces (blank lines become four
-            // spaces), with trailing blank lines stripped — and its tabs expanded
-            // against the message's own left edge, which is what keeps whatever
-            // the author lined up in columns from shifting under the indent.
-            // Shared with `git log`, whose `medium`/`full`/`fuller` do the same.
-            super::log::indent_message(out, commit.message_raw()?, disp.expand_tabs.unwrap_or(8));
-            out.extend_from_slice(&notes_block(repo, disp, commit.id().detach())?);
-        }
+    // `cmd_show` runs the same `cmd_log_init` and prints through the same
+    // `show_log()` as `cmd_log`, so the header is rendered by `git log`'s own
+    // formatter — every format name and `%` placeholder behaves identically
+    // across the two commands because it is literally the same code.
+    disp.renderer.render(
+        out,
+        commit,
+        pretty,
+        &super::log::ShowEntry {
+            abbrev_commit: disp.abbrev_commit,
+            date_mode: disp.date_mode,
+            decorate: disp.decorate,
+            decorations: disp.decorations,
+            mailmap: disp.mailmap,
+            identity_mailmap: disp.identity_mailmap,
+            notes: disp.notes,
+            expand_tabs: disp.expand_tabs,
+            email: disp.email,
+            source: source.map(str::as_bytes),
+            show_signature: disp.show_signature,
+        },
+    )?;
+    // The closing half of `show_log()`: a terminator format ends each record with
+    // `opt->diffopt.line_termination`, except the genuinely empty user format,
+    // which emits nothing at all (log-tree.c:915-919).
+    if disp.terminator && !header_empty {
+        out.push(rec_term);
     }
 
     if selection == Selection::Disabled {
@@ -2220,7 +2162,8 @@ fn show_commit(
 
     // Separator between the message and the diff output. `--oneline` and the empty
     // user format get none; a combined stat-plus-patch gets `---`; otherwise a
-    // blank line.
+    // blank line. A mail format that already fenced its notes block with `---`
+    // has raised `opt->shown_dashes`, which suppresses this second one.
     if !header_empty {
         match (pretty, selection) {
             (Pretty::Oneline, _) => {}
@@ -2231,7 +2174,15 @@ fn show_commit(
                     patch: true,
                     ..
                 },
-            ) => out.extend_from_slice(b"---\n"),
+            ) if !super::log::mail_notes_shown_dashes(
+                repo,
+                disp.notes,
+                pretty,
+                commit.id().detach(),
+            )? =>
+            {
+                out.extend_from_slice(b"---\n")
+            }
             _ => out.push(b'\n'),
         }
     }
@@ -2402,6 +2353,10 @@ fn collect_changes(
     // The diffcore knobs (`-M`/`-C`/`-B`) and the whitespace rule the tallies are
     // computed under, so a whitespace-only change reports nothing.
     opts: &super::diff::PatchOpts,
+    // `opt->diffopt.needed_rename_limit` / `degraded_cc_to_c`: one struct for the
+    // whole command, so each commit's rename pass overwrites the last — and
+    // `diff_result_code()` reports whatever the final one left behind.
+    warn: &mut super::diffcore_rename::Warnings,
 ) -> Result<Vec<FileChange>> {
     let ws = opts.ws;
     let new_tree = commit.tree()?;
@@ -2423,7 +2378,7 @@ fn collect_changes(
             out.push(f);
         }
     }
-    detect_renames(repo, &mut out, opts)?;
+    *warn = detect_renames(repo, &mut out, opts)?;
     Ok(out)
 }
 
@@ -2439,7 +2394,7 @@ fn detect_renames(
     repo: &gix::Repository,
     files: &mut Vec<FileChange>,
     popts: &super::diff::PatchOpts,
-) -> Result<()> {
+) -> Result<super::diffcore_rename::Warnings> {
     let cfg = repo.config_snapshot();
     let detect = popts.renames.unwrap_or_else(|| {
         super::diffcore_rename::config_rename(
@@ -2452,7 +2407,7 @@ fn detect_renames(
     if (detect == 0 && !wants_break)
         || (!wants_break && !files.iter().any(|f| f.status == b'A' || f.status == b'D'))
     {
-        return Ok(());
+        return Ok(super::diffcore_rename::Warnings::default());
     }
     let opts = super::diffcore_rename::Options {
         detect_rename: detect,
@@ -2485,8 +2440,11 @@ fn detect_renames(
         q.pairs[idx].status = f.status;
     }
 
-    let mut content = ShowContent { repo };
-    super::diffcore_rename::run(&mut q, &opts, &mut content);
+    let mut content = super::diffcore_rename::OdbContent { repo };
+    // `too_many_rename_candidates()` records what limit would have sufficed in
+    // `opt->diffopt`, and `diff_result_code()` prints it once when the command
+    // ends — `cmd_show` returns through it just as `cmd_log` does.
+    let warnings = super::diffcore_rename::run(&mut q, &opts, &mut content);
     super::diffcore_rename::resolve_rename_copy(&mut q);
 
     // Rebuild the list from the resolved queue: a rename replaces the deletion and the
@@ -2535,24 +2493,7 @@ fn detect_renames(
     }
     rebuilt.sort_by(|a, b| a.path.cmp(&b.path));
     *files = rebuilt;
-    Ok(())
-}
-
-/// Reads a filespec's blob for [`diffcore_rename`]; every side names an object in the
-/// database here, so this is `diff_populate_filespec()` reduced to an odb lookup.
-struct ShowContent<'a> {
-    repo: &'a gix::Repository,
-}
-
-impl super::diffcore_rename::Content for ShowContent<'_> {
-    fn size(&mut self, spec: &super::diffcore_rename::FileSpec) -> Option<u64> {
-        let header = self.repo.find_header(spec.oid).ok()?;
-        (header.kind() == gix::object::Kind::Blob).then(|| header.size())
-    }
-
-    fn data(&mut self, spec: &super::diffcore_rename::FileSpec) -> Option<Vec<u8>> {
-        self.repo.find_object(spec.oid).ok().map(|o| o.detach().data)
-    }
+    Ok(warnings)
 }
 
 /// Turn one gix change into a [`FileChange`], or `None` for the directory entries
@@ -3100,18 +3041,6 @@ fn change_path(change: &ChangeDetached) -> &[u8] {
     }
 }
 
-/// Strip trailing newlines (`\n`/`\r`) — used to trim a commit message before indenting.
-fn trim_trailing_newlines(mut s: &[u8]) -> &[u8] {
-    while let Some(&last) = s.last() {
-        if last == b'\n' || last == b'\r' {
-            s = &s[..s.len() - 1];
-        } else {
-            break;
-        }
-    }
-    s
-}
-
 /// Strip trailing whitespace (git trims the function-context line this way).
 fn trim_end_ws(mut s: &[u8]) -> &[u8] {
     while let Some(&last) = s.last() {
@@ -3125,199 +3054,10 @@ fn trim_end_ws(mut s: &[u8]) -> &[u8] {
 }
 
 // ---------------------------------------------------------------------------
-// Dates (shared with `git log`; see log.rs for the same machinery)
+// Dates
 // ---------------------------------------------------------------------------
+//
+// `cmd_show` runs `cmd_log_init`, so `--date=`/`log.date` are parsed and rendered
+// by `git log`'s own `parse_date_mode`/`fmt_time` — a second copy here could only
+// drift from them.
 
-/// The `log.date` / `--date=<mode>` output modes rendered byte-for-byte, plus
-/// `relative`, measured against the current wall clock. The remaining zone- or
-/// process-time-dependent modes (`human`, `local`) are rejected rather than faked.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum DateMode {
-    /// git's `DATE_NORMAL`: `Www Mmm D HH:MM:SS YYYY +ZZZZ`.
-    Default,
-    /// `short`: `YYYY-MM-DD`.
-    Short,
-    /// `iso`/`iso8601`: `YYYY-MM-DD HH:MM:SS +ZZZZ`.
-    Iso,
-    /// `iso-strict`/`iso8601-strict`: `YYYY-MM-DDTHH:MM:SS+ZZ:ZZ`.
-    IsoStrict,
-    /// `rfc`/`rfc2822`: `Www, D Mmm YYYY HH:MM:SS +ZZZZ`.
-    Rfc,
-    /// `unix`: the raw epoch seconds, no timezone.
-    Unix,
-    /// `raw`: `<seconds> +ZZZZ`.
-    Raw,
-    /// `relative`: `N <unit> ago`, measured against the current time.
-    Relative,
-}
-
-/// Map a `log.date` / `--date=` value to a [`DateMode`]. `None` for a value git
-/// accepts but renders time/zone-dependently (surfaced terse) or does not know.
-fn parse_date_mode(spec: &str) -> Option<DateMode> {
-    Some(match spec {
-        "default" | "normal" => DateMode::Default,
-        "short" => DateMode::Short,
-        "iso" | "iso8601" => DateMode::Iso,
-        "iso-strict" | "iso8601-strict" => DateMode::IsoStrict,
-        "rfc" | "rfc2822" => DateMode::Rfc,
-        "unix" => DateMode::Unix,
-        "raw" => DateMode::Raw,
-        "relative" => DateMode::Relative,
-        _ => return None,
-    })
-}
-
-const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-const MONTHS: [&str; 12] = [
-    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-];
-
-/// Format a timestamp in the requested [`DateMode`], matching git byte-for-byte.
-fn format_date(seconds: i64, offset: i32, mode: DateMode) -> String {
-    match mode {
-        DateMode::Default => format_git_date(seconds, offset),
-        DateMode::Relative => format_relative(seconds, now_secs()),
-        DateMode::Unix => format!("{seconds}"),
-        DateMode::Raw => {
-            let (sign, off) = if offset < 0 { ('-', -offset) } else { ('+', offset) };
-            format!("{seconds} {sign}{:02}{:02}", off / 3600, (off % 3600) / 60)
-        }
-        DateMode::Short | DateMode::Iso | DateMode::IsoStrict | DateMode::Rfc => {
-            let local = seconds + offset as i64;
-            let days = local.div_euclid(86_400);
-            let secs = local.rem_euclid(86_400);
-            let (hour, min, sec) = (secs / 3600, (secs % 3600) / 60, secs % 60);
-            let weekday = ((days.rem_euclid(7)) + 4).rem_euclid(7) as usize;
-            let (year, month, day) = civil_from_days(days);
-            let (sign, off) = if offset < 0 { ('-', -offset) } else { ('+', offset) };
-            let (oh, om) = (off / 3600, (off % 3600) / 60);
-            match mode {
-                DateMode::Short => format!("{year}-{month:02}-{day:02}"),
-                DateMode::Iso => format!(
-                    "{year}-{month:02}-{day:02} {hour:02}:{min:02}:{sec:02} {sign}{oh:02}{om:02}"
-                ),
-                DateMode::IsoStrict => {
-                    // git's `iso-strict` renders a zero (UTC) offset as `Z`, not
-                    // `+00:00`; a non-zero offset uses the `±HH:MM` form.
-                    let zone = if offset == 0 {
-                        "Z".to_string()
-                    } else {
-                        format!("{sign}{oh:02}:{om:02}")
-                    };
-                    format!("{year}-{month:02}-{day:02}T{hour:02}:{min:02}:{sec:02}{zone}")
-                }
-                DateMode::Rfc => format!(
-                    "{}, {day} {} {year} {hour:02}:{min:02}:{sec:02} {sign}{oh:02}{om:02}",
-                    WEEKDAYS[weekday],
-                    MONTHS[(month - 1) as usize],
-                ),
-                _ => unreachable!(),
-            }
-        }
-    }
-}
-
-/// git's default (`DATE_NORMAL`) commit-time rendering: `Www Mmm D HH:MM:SS YYYY
-/// +ZZZZ` in the commit's own timezone. The day is an unpadded decimal (git's
-/// `%d`), matching a single-digit day to one space — unlike a `%e`-style pad.
-fn format_git_date(seconds: i64, offset: i32) -> String {
-    let local = seconds + offset as i64;
-    let days = local.div_euclid(86_400);
-    let secs = local.rem_euclid(86_400);
-    let (hour, min, sec) = (secs / 3600, (secs % 3600) / 60, secs % 60);
-    // 1970-01-01 (day 0) was a Thursday, index 4 with Sunday = 0.
-    let weekday = ((days.rem_euclid(7)) + 4).rem_euclid(7) as usize;
-    let (year, month, day) = civil_from_days(days);
-    let (sign, off) = if offset < 0 { ('-', -offset) } else { ('+', offset) };
-    let (off_h, off_m) = (off / 3600, (off % 3600) / 60);
-    format!(
-        "{} {} {} {:02}:{:02}:{:02} {} {}{:02}{:02}",
-        WEEKDAYS[weekday],
-        MONTHS[(month - 1) as usize],
-        day,
-        hour,
-        min,
-        sec,
-        year,
-        sign,
-        off_h,
-        off_m,
-    )
-}
-
-/// Convert a day count since the Unix epoch into a civil `(year, month, day)`,
-/// month and day 1-based (Howard Hinnant's `civil_from_days`).
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
-    let z = z + 719_468;
-    let era = (if z >= 0 { z } else { z - 146_096 }) / 146_097;
-    let doe = z - era * 146_097; // [0, 146096]
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
-    let year = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
-    let mp = (5 * doy + 2) / 153; // [0, 11]
-    let day = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
-    let month = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
-    (if month <= 2 { year + 1 } else { year }, month as u32, day)
-}
-
-/// Current time in epoch seconds, for relative dates.
-fn now_secs() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
-
-/// git's `show_date_relative`: render `then` as "N units ago" relative to `now`,
-/// with the same unit thresholds and rounding.
-fn format_relative(then: i64, now: i64) -> String {
-    if now < then {
-        return "in the future".to_string();
-    }
-    let mut diff = (now - then) as u64;
-    if diff < 90 {
-        return unit_ago(diff, "second");
-    }
-    diff = (diff + 30) / 60; // minutes
-    if diff < 90 {
-        return unit_ago(diff, "minute");
-    }
-    diff = (diff + 30) / 60; // hours
-    if diff < 36 {
-        return unit_ago(diff, "hour");
-    }
-    diff = (diff + 12) / 24; // days
-    if diff < 14 {
-        return unit_ago(diff, "day");
-    }
-    if diff < 70 {
-        return unit_ago((diff + 3) / 7, "week");
-    }
-    if diff < 365 {
-        return unit_ago((diff + 15) / 30, "month");
-    }
-    if diff < 1825 {
-        let totalmonths = diff * 12 * 10 / 365;
-        let years = totalmonths / 120;
-        let months = (totalmonths % 120) / 10;
-        if months > 0 {
-            return format!("{}, {} ago", unit(years, "year"), unit(months, "month"));
-        }
-        return unit_ago(years, "year");
-    }
-    unit_ago((diff + 183) / 365, "year")
-}
-
-/// `"N unit ago"` / `"N units ago"` with git's singular/plural rule.
-fn unit_ago(n: u64, name: &str) -> String {
-    format!("{} ago", unit(n, name))
-}
-
-/// `"1 unit"` or `"N units"`.
-fn unit(n: u64, name: &str) -> String {
-    if n == 1 {
-        format!("1 {name}")
-    } else {
-        format!("{n} {name}s")
-    }
-}

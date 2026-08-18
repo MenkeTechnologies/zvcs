@@ -36,6 +36,11 @@ use regex::bytes::Regex;
 /// A search pattern: a literal substring (git's kwset path for a plain `-S`) or a
 /// compiled regular expression (git's `-G`, `-I`, and `-S --pickaxe-regex`, all of
 /// which call `regcomp` with `REG_EXTENDED | REG_NEWLINE`).
+/// `Clone` because the history commands hand their whole option set to each patch
+/// worker by value, and `-I<re>`'s compiled patterns travel with it. Cloning a
+/// `regex::bytes::Regex` shares the compiled program behind an `Arc`, so a per-worker
+/// copy costs a refcount rather than a recompile.
+#[derive(Clone)]
 pub(super) enum Needle {
     Literal(Vec<u8>),
     Regex(Regex),

@@ -838,11 +838,16 @@ impl MoveWordOpts {
         Some(Ok(()))
     }
 
-    /// Whether any of these flags was given, which is what decides whether the
-    /// command has to take the whole-patch emit path at all.
-    pub(crate) fn is_active(&self) -> bool {
-        self.moved.is_some() || self.moved_ws.is_some() || self.word_diff != WordDiff::None
-    }
+    // There is deliberately no `is_active()` "were any of these flags given?"
+    // predicate here, and a caller must not reintroduce one as a cheap gate around
+    // `resolve()`. These three fields only ever hold what `parse_flag` read off the
+    // command line, whereas the paint that actually applies is decided by `resolve()`
+    // *layering those flags over config* — `diff.colorMoved` (line 592),
+    // `diff.colorMovedWS` (line 599) and `diff.wordRegex` (line 667). So "no flag was
+    // given" does not imply "no extra paint applies": `git -c diff.colorMoved=zebra
+    // diff` moves-colors with an empty `MoveWordOpts`. Every caller therefore calls
+    // `resolve()` unconditionally and branches on the resulting [`ExtraPaint`]
+    // (diff.rs:2246, diff_pairs.rs:1656, diff_files.rs:1849, diff_index.rs:1696).
 
     /// Layer the flags over `diff.colorMoved`, `diff.colorMovedWS` and
     /// `diff.wordRegex`. `Err` carries the message git writes before exiting 128.

@@ -626,6 +626,7 @@ mod remote_https;
 mod repack;
 mod replace;
 mod replay;
+mod replay_commit;
 mod repo;
 mod request_pull;
 mod rerere;
@@ -682,6 +683,7 @@ mod version;
 mod web__browse;
 mod whatchanged;
 mod worktree;
+pub(crate) mod worktree_filespec;
 mod write_tree;
 
 pub use add::add;

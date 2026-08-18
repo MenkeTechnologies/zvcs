@@ -70,7 +70,8 @@
 //! piped into this renderer, so [`super::diff_tree`] routes its patch, diffstat, dirstat,
 //! whitespace and rename formats here instead of growing a second implementation. The
 //! `-z` usage error only applies to the stdin path; for an in-process caller the flag
-//! decides nothing but how the raw and name records are terminated.
+//! decides how the raw and name records are terminated and which byte
+//! `DIFF_SYMBOL_SEPARATOR` writes between two output blocks.
 //! * `--color[=<when>]` / `--no-color` and `--ws-error-highlight=<kind>`, with the
 //!   `color.diff.*` slots and `core.whitespace` rules the emit layer paints from.
 //!   `--ws-error-highlight`, `--color-moved-ws` and `--word-diff-regex` all accept
@@ -119,7 +120,12 @@
 //!   `(corrupt repository)` messages all follow `show_submodule_header()`, including
 //!   its quirk that a pair whose two commits are *both* unreadable still prints `..`
 //!   (`merge_bases_many()`'s `one == twos[i]` short-circuit compares two NULL
-//!   pointers). An unchanged gitlink prints nothing at all.
+//!   pointers). An unchanged gitlink prints nothing at all. `diff` — git's
+//!   `DIFF_SUBMODULE_INLINE_DIFF` — prints that same header and then the submodule's
+//!   own diff beneath it, which `show_submodule_inline_diff()` produces by starting a
+//!   whole second `git diff --submodule=diff --color=<when> --src-prefix=…
+//!   --dst-prefix=… <a> <b>` inside the submodule; the port of that child invocation
+//!   is shared with `git diff` ([`super::diff::submodule_inline_section`]).
 //! * `--exit-code`, `--quiet` (implies `-s` and `--exit-code`)
 //! * `--abbrev[=<n>]` — accepted and ignored, which is what stock git does here.
 //!   `core.abbrev` itself *is* honoured.
@@ -146,10 +152,6 @@
 //!   (`patience.rs`, a port of `xdiff/xpatience.c`, reached by `--patience` below), but
 //!   no way to pass anchors in — `is_anchor()` is constantly false there — so this bails
 //!   rather than silently dropping the anchors.
-//! * `--submodule=diff`: `show_submodule_inline_diff()` starts a whole second
-//!   `git diff --submodule=diff --color=<when> --src-prefix=… --dst-prefix=… <a> <b>`
-//!   inside the submodule and pipes its stdout through, which this port does not do.
-//!   `--submodule=short` and `--submodule=log` are both covered above.
 //! * `--find-copies-harder` is parsed and fed to `diffcore_rename`, but a `diff-pairs`
 //!   batch only ever contains the pairs stdin listed: git supplies the unmodified pairs
 //!   the option needs from a tree walk, and there is none here, so it behaves as plain
@@ -805,8 +807,12 @@ enum SubmoduleFormat {
     Short,
     /// `DIFF_SUBMODULE_LOG` — the `Submodule <path> <a>..<b>:` header and the
     /// `--left-right --first-parent` commit list beneath it. This is what the bare
-    /// `--submodule` selects. `DIFF_SUBMODULE_INLINE_DIFF` is refused at parse time.
+    /// `--submodule` selects.
     Log,
+    /// `DIFF_SUBMODULE_INLINE_DIFF` — the same header, then the submodule's own
+    /// `git diff` run inside it with the gitlink path glued onto both prefixes.
+    /// Shares [`super::diff::submodule_inline_section`] with `git diff`.
+    InlineDiff,
 }
 
 /// `--textconv`'s resolved driver machinery, shared by every pair in a batch, or
@@ -1530,21 +1536,13 @@ pub(crate) fn render_raw_stream(
             "--ext-diff" => opts.allow_external = true,
             "--no-ext-diff" => opts.allow_external = false,
             // `--submodule[=<format>]` (`parse_submodule_params()`): the bare form is
-            // `log`, matching `diff_opt_submodule()`'s `arg ? arg : "log"`. `diff`
-            // runs a second `git diff` inside the submodule and is not ported.
+            // `log`, matching `diff_opt_submodule()`'s `arg ? arg : "log"`.
             "--submodule" => opts.submodule_format = SubmoduleFormat::Log,
             _ if s.starts_with("--submodule=") => {
                 match &s["--submodule=".len()..] {
                     "short" => opts.submodule_format = SubmoduleFormat::Short,
                     "log" => opts.submodule_format = SubmoduleFormat::Log,
-                    "diff" => {
-                        unsupported.get_or_insert_with(|| {
-                            "unsupported flag \"--submodule=diff\" (runs a second `git diff` \
-                             inside the submodule; --submodule=short and --submodule=log are \
-                             ported)"
-                                .to_string()
-                        });
-                    }
+                    "diff" => opts.submodule_format = SubmoduleFormat::InlineDiff,
                     v => {
                         eprintln!("error: failed to parse --submodule option parameter: '{v}'");
                         return Ok(Status::from(129));
@@ -1582,6 +1580,13 @@ pub(crate) fn render_raw_stream(
     // over the usage error just as it does in stock git.
     if follow {
         return Ok(fatal("--follow requires exactly one pathspec"));
+    }
+    // `diff_setup_done()` (diff.c:5288): `--find-copies-harder` turns copy detection on
+    // by itself. `-C -C` already arrives here with `detect_rename` set by its second
+    // `-C`; a lone `--find-copies-harder` sets only the flag, and without this the
+    // rename pass — and with it the copy this flag exists to find — never runs.
+    if opts.rename.find_copies_harder {
+        opts.rename.detect_rename = diffcore_rename::DETECT_COPY;
     }
     // `flags.quick`: showing the first hit found makes no sense, so the whole output is
     // dropped and the exit status carries the answer instead.
@@ -1921,7 +1926,7 @@ fn fatal(msg: &str) -> Status {
 
 /// The bare `strerror` text of an I/O failure: Rust appends ` (os error <n>)` to the
 /// system message, which git's `%s` of `strerror(errno)` never prints.
-fn io_reason(e: &std::io::Error) -> String {
+pub(crate) fn io_reason(e: &std::io::Error) -> String {
     let text = e.to_string();
     match text.find(" (os error ") {
         Some(at) => text[..at].to_string(),
@@ -2507,7 +2512,7 @@ fn flush(
     // `--numstat` records are NUL-terminated with an embedded NUL like the raw ones, so
     // they take the per-record prefix; `--stat`/`--shortstat` are newline records.
     if opts.formats.numstat {
-        render_numstat(&mut buf, &files, lp);
+        render_numstat(&mut buf, &files, lp, opts.formats.nul);
     }
     if opts.formats.stat {
         let mut sub = Vec::new();
@@ -2578,9 +2583,19 @@ fn flush(
             || dirstat_by_line
             || summary_shown;
         if separator {
-            // `DIFF_SYMBOL_SEPARATOR` prints the line prefix ahead of the terminator.
+            // `DIFF_SYMBOL_SEPARATOR` (diff.c:1592):
+            //
+            // ```c
+            // fprintf(o->file, "%s%c", diff_line_prefix(o), o->line_termination);
+            // ```
+            //
+            // `line_termination` is `\n` and only `-z` makes it NUL. `git diff-pairs`
+            // refuses to run without `-z`, so on that path it is always the NUL — but
+            // an in-process caller ([`render_raw_stream`] from `diff-tree`) reaches
+            // here with whatever the *user* asked for, and `git diff-tree -p --stat`
+            // separates its two blocks with a newline like every other command.
             buf.extend_from_slice(lp);
-            buf.push(b'\0');
+            buf.push(if opts.formats.nul { b'\0' } else { b'\n' });
         }
         // The whole patch is assembled uncolored first, then re-emitted in one pass
         // through git's `fn_out_consume()` chain — the ordering
@@ -4208,6 +4223,11 @@ fn analyze(
                 hunks,
             })
         }
+        // Unreachable: `prepare_diff()` only chooses this operation when
+        // `Options::skip_internal_diff_if_external_is_configured` is set, and
+        // `gix::diff::resource_cache()` (src/ported/gix/src/diff.rs:236) hardcodes it
+        // to `false`. `--ext-diff` runs its program from `run_external_diff()` above,
+        // well before the platform is asked for an operation at all.
         Operation::ExternalCommand { .. } => Err(fatal("external diff drivers are not supported")),
         Operation::InternalDiff { algorithm } => {
             // `builtin_diff()`: a `-B` rewrite that stayed a modification never runs
@@ -5003,9 +5023,31 @@ fn compact_summary_comment(p: &Pair) -> Option<&'static str> {
     }
 }
 
-/// `show_numstat()` with git's `-z` field layout. `lp` is the `--line-prefix` string,
-/// written once per record because a rename record embeds NULs between its own fields.
-fn render_numstat(out: &mut Vec<u8>, files: &[StatFile], lp: &[u8]) {
+/// `show_numstat()` (diff.c:2596), whose two name layouts are chosen by
+/// `options->line_termination`:
+///
+/// ```c
+/// if (options->line_termination) {
+///         fprintf(options->file, "%s", diff_line_prefix(options));
+///         if (!file->is_renamed) {
+///                 write_name_quoted(file->name, options->file, options->line_termination);
+///         } else {
+///                 ... pprint_rename ...
+///         }
+/// } else {
+///         if (file->is_renamed) { putc('\0', ...); write_name_quoted(file->from_name, ..., '\0'); }
+///         write_name_quoted(file->name, options->file, '\0');
+/// }
+/// ```
+///
+/// `git diff-pairs` refuses to run without `-z` and only ever takes the second, but
+/// an in-process caller ([`render_raw_stream`] from `diff-tree`) reaches here with
+/// whatever the user asked for — and `git diff-tree -M --numstat` prints the
+/// `pprint_rename`d `old => new` name on one newline-terminated record.
+///
+/// `lp` is the `--line-prefix` string, written once per record because a `-z` rename
+/// record embeds NULs between its own fields.
+fn render_numstat(out: &mut Vec<u8>, files: &[StatFile], lp: &[u8], nul: bool) {
     for f in files {
         out.extend_from_slice(lp);
         if f.binary {
@@ -5013,15 +5055,23 @@ fn render_numstat(out: &mut Vec<u8>, files: &[StatFile], lp: &[u8]) {
         } else {
             out.extend_from_slice(format!("{}\t{}\t", f.added, f.deleted).as_bytes());
         }
-        if matches!(f.status, b'R' | b'C') {
-            out.push(b'\0');
-            out.extend_from_slice(&f.old_path);
-            out.push(b'\0');
+        let renamed = matches!(f.status, b'R' | b'C');
+        if nul {
+            if renamed {
+                out.push(b'\0');
+                out.extend_from_slice(&f.old_path);
+                out.push(b'\0');
+            }
             out.extend_from_slice(&f.new_path);
+            out.push(b'\0');
         } else {
-            out.extend_from_slice(&f.new_path);
+            if renamed {
+                out.extend_from_slice(&super::diff::pprint_rename(&f.old_path, &f.new_path));
+            } else {
+                out.extend_from_slice(&diff_files::quoted_name(&f.new_path));
+            }
+            out.push(b'\n');
         }
-        out.push(b'\0');
     }
 }
 
@@ -5249,26 +5299,43 @@ fn render_patch(
                 continue;
             }
         }
-        // `builtin_diff()`'s first branch: with `--submodule=log`, a pair whose two
-        // sides are each either absent or a gitlink is rendered from the submodule's
-        // own history instead of as a blob diff, and always counts as a change.
-        if opts.submodule_format == SubmoduleFormat::Log
+        // `builtin_diff()`'s first two branches: with `--submodule=log` or
+        // `--submodule=diff`, a pair whose two sides are each either absent or a
+        // gitlink is rendered from the submodule itself instead of as a blob diff,
+        // and always counts as a change.
+        if opts.submodule_format != SubmoduleFormat::Short
             && (step.old_mode == 0 || is_gitlink_mode(step.old_mode))
             && (step.new_mode == 0 || is_gitlink_mode(step.new_mode))
         {
             let mut lines = Vec::new();
-            show_submodule_diff_summary(
-                &mut lines,
-                repo,
-                &step.old_path,
-                &step.old_id,
-                &step.new_id,
-                // A `diff-pairs` batch is read from stdin, so no side of it was
-                // ever a worktree: `two->dirty_submodule` is always zero here.
-                0,
-                base_abbrev,
-                sink.colors,
-            );
+            // A `diff-pairs` batch is read from stdin, so no side of it was ever a
+            // worktree: `two->dirty_submodule` is always zero here.
+            if opts.submodule_format == SubmoduleFormat::Log {
+                show_submodule_diff_summary(
+                    &mut lines,
+                    repo,
+                    &step.old_path,
+                    &step.old_id,
+                    &step.new_id,
+                    0,
+                    base_abbrev,
+                    sink.colors,
+                );
+            } else {
+                super::diff::submodule_inline_section(
+                    &mut lines,
+                    repo,
+                    &step.old_path,
+                    &step.old_id,
+                    &step.new_id,
+                    0,
+                    base_abbrev,
+                    sink.colors,
+                    &opts.src_prefix,
+                    &opts.dst_prefix,
+                    repo.object_hash(),
+                );
+            }
             sink.prefixed(&lines);
             *found_changes = true;
             continue;
@@ -5342,7 +5409,7 @@ fn pair_found_changes(
                 continue;
             }
         }
-        if opts.submodule_format == SubmoduleFormat::Log
+        if opts.submodule_format != SubmoduleFormat::Short
             && (step.old_mode == 0 || is_gitlink_mode(step.old_mode))
             && (step.new_mode == 0 || is_gitlink_mode(step.new_mode))
         {

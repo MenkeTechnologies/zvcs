@@ -34,7 +34,20 @@
 //! here is a gap rather than a name git rejects. Algorithm selection is on it:
 //! `--diff-algorithm=<v>`, the separated `--diff-algorithm <v>`, `--minimal`,
 //! `--patience`, `--histogram`, and the `diff.algorithm` default when the
-//! comparison happens to be run from inside a repository.
+//! comparison happens to be run from inside a repository. So are
+//! `--inter-hunk-context=<n>`, `-D`/`--irreversible-delete`, `--binary`,
+//! `--output=<file>` and `--skip-to=<p>`/`--rotate-to=<p>` — the last pair anchored
+//! on the *post-image* name (`R/x`, not `x`) and, because
+//! `builtin_diff_no_index()` never raises `rotate_to_strict`, silent rather than
+//! fatal when the target names no pair.
+//!
+//! `diff_setup_done()`'s two output-format rules apply here as well:
+//! `--name-only`/`--name-status` clear every other format bit (so `--name-only -p`
+//! prints names and no patch), `-s` *assigns* `DIFF_FORMAT_NO_OUTPUT` where it
+//! stands, more than one of the four exclusive formats is
+//! `fatal: options '--name-only', '--name-status', '--check', and '-s' cannot be
+//! used together`, and whatever survives is written before the patch with
+//! `DIFF_SYMBOL_SEPARATOR`'s blank line between the two blocks.
 
 use anyhow::Result;
 use gix::bstr::{BString, ByteSlice};
@@ -316,12 +329,67 @@ struct Format {
     name_status: bool,
     raw: bool,
     summary: bool,
+    /// `--quiet`, git's `flags.quick`: `diff_setup_done()` turns it into
+    /// `DIFF_FORMAT_NO_OUTPUT` at the *end* of the scan, so it beats every format on
+    /// the line and also switches rename detection off.
     quiet: bool,
+    /// `-s`/`--no-patch`, git's `DIFF_FORMAT_NO_OUTPUT` bit: an assignment made where
+    /// it stands, so a format flag after it survives.
+    no_output: bool,
 }
 
 impl Format {
-    /// `diff_setup_done()`: with nothing selected, the patch is the format.
+    /// `diff_setup_done()` (diff.c:4899), in two steps.
+    ///
+    /// First the exclusive formats win outright:
+    ///
+    /// ```c
+    /// if (options->output_format & (DIFF_FORMAT_NAME |
+    ///                               DIFF_FORMAT_NAME_STATUS |
+    ///                               DIFF_FORMAT_CHECKDIFF |
+    ///                               DIFF_FORMAT_NO_OUTPUT))
+    ///         options->output_format &= ~(DIFF_FORMAT_RAW |
+    ///                                     DIFF_FORMAT_NUMSTAT |
+    ///                                     DIFF_FORMAT_DIFFSTAT |
+    ///                                     DIFF_FORMAT_SHORTSTAT |
+    ///                                     DIFF_FORMAT_DIRSTAT |
+    ///                                     DIFF_FORMAT_SUMMARY |
+    ///                                     DIFF_FORMAT_PATCH);
+    /// ```
+    ///
+    /// which is why `git diff --no-index --name-only -p` prints names and no patch,
+    /// measured against 2.55.0. Only then, with nothing selected at all, does the
+    /// patch become the format.
     fn resolved(self) -> Self {
+        let mut me = self;
+        // `flags.quick`'s own arm runs at the very end of `diff_setup_done()` and
+        // *assigns* `DIFF_FORMAT_NO_OUTPUT`, so `--quiet` beats every format on the
+        // line however late it stands.
+        if me.quiet {
+            me = Format { quiet: true, no_output: true, ..Format::default() };
+        }
+        // `-s` is not in this list: it is an assignment made where it stands, so by
+        // the time the clearing runs there is nothing of its own left to clear and a
+        // format that came after it survives.
+        if me.name_only || me.name_status {
+            me.raw = false;
+            me.numstat = false;
+            me.stat = false;
+            me.shortstat = false;
+            me.summary = false;
+            me.patch = false;
+        }
+        me.defaulted()
+    }
+
+    /// `HAS_MULTI_BITS(...)`: the four exclusive formats, one of which must stand
+    /// alone. `--check` is not accepted by this parser, so three of them can arise.
+    fn exclusive_conflict(&self) -> bool {
+        u32::from(self.name_only) + u32::from(self.name_status) + u32::from(self.no_output) > 1
+    }
+
+    /// The second step on its own: `if (!options->output_format) ... DIFF_FORMAT_PATCH`.
+    fn defaulted(self) -> Self {
         if !(self.patch
             || self.stat
             || self.numstat
@@ -330,7 +398,8 @@ impl Format {
             || self.name_status
             || self.raw
             || self.summary
-            || self.quiet)
+            || self.quiet
+            || self.no_output)
         {
             Format { patch: true, ..self }
         } else {
@@ -359,6 +428,23 @@ struct Opts {
     /// `options->xdl_opts`' algorithm bits, which `add_diff_options()` exposes to
     /// this parser as fully as to `git diff`'s own.
     algorithm: gix::diff::blob::Algorithm,
+    /// `--inter-hunk-context=<n>`: `xecfg.interhunkctxlen`, fed straight to the
+    /// `xdl_emit_diff` port this command already renders through.
+    inter_hunk_ctx: usize,
+    /// `-D`/`--irreversible-delete`: a deletion emits its header and stops
+    /// (`builtin_diff()`, diff.c:3596).
+    irreversible_delete: bool,
+    /// `--binary` (`diff_opt_binary()`, diff.c:5613): a binary pair gets a
+    /// `GIT binary patch` payload instead of the `Binary files ... differ` line, its
+    /// `index` line widens to full object names, and the patch format is turned on.
+    binary: bool,
+    /// `--skip-to=<p>` / `--rotate-to=<p>`: `(is_skip, target)`, matched against the
+    /// pair.s post-image name. `None` leaves the queue in `queue_diff()`.s order.
+    skip_or_rotate: Option<(bool, BString)>,
+    /// `zlib_compression_level` for that payload: `core.looseCompression`, else
+    /// `core.compression`, else `Z_BEST_SPEED`. A comparison run outside any
+    /// repository has no config to read and takes the default.
+    compression_level: i32,
 }
 
 /// git's `diff_no_index_usage[]`, over the block every `add_diff_options()`
@@ -427,8 +513,45 @@ fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
     // parse-options consumes the next argv entry as its value before that entry is
     // examined for anything else — a `--`, an operand, or another option.
     let mut want_algorithm_value = false;
+    // `--inter-hunk-context=<n>`, `-D`, `--binary` and `--skip-to`/`--rotate-to`,
+    // all of them from the same `add_diff_options()` table.
+    let mut inter_hunk_ctx = 0usize;
+    let mut irreversible_delete = false;
+    let mut binary = false;
+    // `(is_skip, target)`; the last one on the line wins, as `diff_opt_rotate_to`
+    // simply reassigns `options->rotate_to`.
+    let mut skip_or_rotate: Option<(bool, BString)> = None;
+    // `--output=<file>`: `diff_opt_output`'s `xfopen(arg, "w")`, which runs during
+    // the option scan.
+    let mut output_file: Option<std::fs::File> = None;
+    // The other `OPT_STRING`/`OPT_INTEGER` entries whose value may stand as the next
+    // argument instead of being glued on with `=`.
+    let mut pending: Option<String> = None;
 
     for a in args {
+        if let Some(flag) = pending.take() {
+            match flag.as_str() {
+                "--skip-to" | "--rotate-to" => {
+                    skip_or_rotate = Some((flag == "--skip-to", a.as_str().into()));
+                }
+                "--output" => match super::diff::open_output_file(a) {
+                    Ok(f) => output_file = Some(f),
+                    Err(code) => return Ok(code),
+                },
+                _ => match super::diff::parse_inter_hunk_context(a) {
+                    Ok(n) => inter_hunk_ctx = n,
+                    Err(msg) => {
+                        eprintln!("error: {msg}");
+                        return Ok(ExitCode::from(129));
+                    }
+                },
+            }
+            continue;
+        }
+        if matches!(a.as_str(), "--skip-to" | "--rotate-to" | "--output" | "--inter-hunk-context") {
+            pending = Some(a.clone());
+            continue;
+        }
         if std::mem::take(&mut want_algorithm_value) {
             match super::diff_optval::parse_algorithm_value(a) {
                 Some(alg) => algorithm = Some(alg),
@@ -458,7 +581,11 @@ fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
             "--name-status" => fmt.name_status = true,
             "--raw" => fmt.raw = true,
             "--summary" => fmt.summary = true,
-            "-s" | "--no-patch" => fmt = Format::default(),
+            // `OPT_SET_INT_F('s', "no-patch", ..., DIFF_FORMAT_NO_OUTPUT)`: an
+            // assignment, so it wipes the formats already chosen and a later one still
+            // counts. Measured against 2.55.0: `--stat -s` prints nothing, `-s --stat`
+            // prints the stat block.
+            "-s" | "--no-patch" => fmt = Format { no_output: true, quiet: fmt.quiet, ..Format::default() },
             "--quiet" => fmt.quiet = true,
             "--exit-code" => {}
             "-w" | "--ignore-all-space" => ws = super::diff::Whitespace::IgnoreAll,
@@ -529,6 +656,41 @@ fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
             "--no-function-context" => func_context = false,
             "--full-index" => full_index = true,
             "--text" | "-a" => text = true,
+            // `diff_opt_binary()` calls `enable_patch_output()` first, so the flag
+            // turns the patch on as well as widening the `index` line.
+            "--binary" => {
+                binary = true;
+                fmt.patch = true;
+                fmt.no_output = false;
+            }
+            // `diff_opt_irreversible_delete`.
+            "-D" | "--irreversible-delete" => irreversible_delete = true,
+            s if s.starts_with("--inter-hunk-context=") => {
+                match super::diff::parse_inter_hunk_context(&s["--inter-hunk-context=".len()..]) {
+                    Ok(n) => inter_hunk_ctx = n,
+                    Err(msg) => {
+                        eprintln!("error: {msg}");
+                        return Ok(ExitCode::from(129));
+                    }
+                }
+            }
+            // `diffcore_rotate()`. `builtin_diff_no_index()` never sets
+            // `rotate_to_strict` — only `cmd_diff()`'s tracked path does — so a
+            // target that names no pair is silently ignored here, where `git diff
+            // --skip-to=<missing>` dies. Measured against 2.55.0: `git diff
+            // --no-index --skip-to=zzz L R` prints the whole diff and exits 1.
+            s if s.starts_with("--skip-to=") => {
+                skip_or_rotate = Some((true, s["--skip-to=".len()..].into()));
+            }
+            s if s.starts_with("--rotate-to=") => {
+                skip_or_rotate = Some((false, s["--rotate-to=".len()..].into()));
+            }
+            s if s.starts_with("--output=") => {
+                match super::diff::open_output_file(&s["--output=".len()..]) {
+                    Ok(f) => output_file = Some(f),
+                    Err(code) => return Ok(code),
+                }
+            }
             "--no-prefix" => {
                 src_prefix.clear();
                 dst_prefix.clear();
@@ -615,6 +777,12 @@ fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
         eprintln!("error: option `diff-algorithm' requires a value");
         return Ok(ExitCode::from(129));
     }
+    // The same for the other value-taking options: parse-options reports the missing
+    // value and exits 129 before the operand count is looked at.
+    if let Some(flag) = pending {
+        eprintln!("error: {}", diff_color::missing_value(&flag));
+        return Ok(ExitCode::from(129));
+    }
 
     // `if (argc < 2)`: too few operands is where the implicit form explains
     // itself, since the user asked for `git diff` and is being shown the usage
@@ -695,6 +863,12 @@ fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
         },
         (None, None) => gix::diff::blob::Algorithm::Myers,
     };
+    if fmt.exclusive_conflict() {
+        eprintln!(
+            "fatal: options '--name-only', '--name-status', '--check', and '-s' cannot be used together"
+        );
+        return Ok(ExitCode::from(128));
+    }
     let opts = Opts {
         fmt: fmt.resolved(),
         ctx,
@@ -708,6 +882,14 @@ fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
         text,
         colors,
         algorithm,
+        inter_hunk_ctx,
+        irreversible_delete,
+        binary,
+        skip_or_rotate,
+        compression_level: match &repo {
+            Some(repo) => super::binary_patch::loose_compression_level(repo),
+            None => 1,
+        },
     };
 
     // `diff_setup_done()`: `--find-copies-harder` implies copy detection
@@ -758,9 +940,18 @@ fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
             diff_color::FilePaint::new(0),
         );
         use std::io::Write;
-        let mut stdout = std::io::stdout().lock();
-        stdout.write_all(&painted)?;
-        stdout.flush()?;
+        // `--output=<file>` swapped the diff stream for a file back at parse time.
+        match output_file {
+            Some(mut f) => {
+                f.write_all(&painted)?;
+                f.flush()?;
+            }
+            None => {
+                let mut stdout = std::io::stdout().lock();
+                stdout.write_all(&painted)?;
+                stdout.flush()?;
+            }
+        }
     }
     // git-diff(1): "this option implies --exit-code".
     Ok(if changed { ExitCode::from(1) } else { ExitCode::SUCCESS })
@@ -821,7 +1012,33 @@ fn compare(
     super::diffcore_rename::run(&mut q, rename_opts, &mut content).emit("diff.renameLimit");
     super::diffcore_rename::resolve_rename_copy(&mut q);
 
+    // `diffcore_rotate()` (diff.c:6763): re-anchor the queue on the pair whose
+    // *post-image* name is the target — `p->two->path`, which for a no-index
+    // comparison is the right-hand operand's own name (`R/ccc`, not `ccc`).
+    // `builtin_diff_no_index()` never raises `rotate_to_strict`, so a target that
+    // names no pair returns quietly instead of dying the way `git diff --skip-to`
+    // does. Measured against 2.55.0: `git diff --no-index --skip-to=zzz L R` prints
+    // the whole diff and exits 1.
+    if let Some((is_skip, target)) = &opts.skip_or_rotate {
+        if let Some(k) = q
+            .pairs
+            .iter()
+            .position(|p| q.specs[p.two].path == *target)
+        {
+            if *is_skip {
+                q.pairs.drain(..k);
+            } else {
+                q.pairs.rotate_left(k);
+            }
+        }
+    }
+
+    // `diff_flush()` (diff.c:6828) writes the non-patch formats first, then a blank
+    // separator line, then the patch — so the two streams are built apart and joined
+    // below. `--binary` is what makes the combination reachable without `-p`: it
+    // turns the patch on by itself while a `--stat` on the same line stays selected.
     let mut out: Vec<u8> = Vec::new();
+    let mut patch: Vec<u8> = Vec::new();
     let mut changed = false;
     let mut stats: Vec<Row> = Vec::new();
     for pi in 0..q.pairs.len() {
@@ -857,8 +1074,21 @@ fn compare(
         stats.push(Row {
             a_name: a.display_name().clone(),
             b_name: b.display_name().clone(),
-            added,
-            deleted,
+            // `builtin_diffstat()` (diff.c:3900) never counts a binary pair's lines:
+            //
+            // ```c
+            // if (diff_filespec_is_binary(o->repo, one) || diff_filespec_is_binary(o->repo, two)) {
+            //         data->is_binary = 1;
+            //         data->added = diff_filespec_size(o->repo, two);
+            //         data->deleted = diff_filespec_size(o->repo, one);
+            // }
+            // ```
+            //
+            // so the two fields carry *sizes* instead, which is what `show_stats()`
+            // prints as `Bin <old> -> <new> bytes`. Every consumer that counts lines
+            // — `--numstat`'s `-\t-`, `--shortstat`'s totals — skips a binary row.
+            added: if binary { new_data.len() as u32 } else { added },
+            deleted: if binary { old_data.len() as u32 } else { deleted },
             binary,
             a_exists: a.file.is_some(),
             b_exists: b.file.is_some(),
@@ -870,7 +1100,14 @@ fn compare(
             score: pair.score,
         });
         if opts.fmt.patch {
-            emit_header(&mut out, a, b, &old_data, &new_data, &opts, same_content, binary, &pair);
+            emit_header(&mut patch, a, b, &old_data, &new_data, &opts, same_content, binary, &pair);
+            // `builtin_diff()` (diff.c:3596): with `-D`, a pair whose post-image label
+            // is `/dev/null` stops right after its header — no `---`/`+++` pair, no
+            // hunks, and no `Binary files ... differ` either, since the jump lands
+            // past that arm as well.
+            if opts.irreversible_delete && b.file.is_none() {
+                continue;
+            }
             // `builtin_diff()`'s binary arm stops at the header when the two sides
             // hold the same object (diff.c):
             //
@@ -887,28 +1124,56 @@ fn compare(
             // a `Binary files … differ` line for content that is identical. The text
             // side needs no such test: its body is empty when nothing changed.
             if binary && !same_content {
-                out.extend_from_slice(b"Binary files ");
-                push_name(&mut out, &opts.src_prefix, a.header_name(b), a.file.is_some());
-                out.extend_from_slice(b" and ");
-                push_name(&mut out, &opts.dst_prefix, b.header_name(a), b.file.is_some());
-                out.extend_from_slice(b" differ\n");
+                // `emit_binary_diff()` (diff.c:2909): with `--binary` the two images
+                // go out as a `GIT binary patch` payload — literal or delta,
+                // whichever deflates smaller — instead of the one-line notice, and
+                // no `---`/`+++` pair is printed for either form.
+                if opts.binary {
+                    super::binary_patch::emit(
+                        &mut patch,
+                        &old_data,
+                        &new_data,
+                        opts.compression_level,
+                    );
+                } else {
+                    patch.extend_from_slice(b"Binary files ");
+                    push_name(&mut patch, &opts.src_prefix, a.header_name(b), a.file.is_some());
+                    patch.extend_from_slice(b" and ");
+                    push_name(&mut patch, &opts.dst_prefix, b.header_name(a), b.file.is_some());
+                    patch.extend_from_slice(b" differ\n");
+                }
             } else {
-                out.extend_from_slice(&body);
+                patch.extend_from_slice(&body);
             }
         }
     }
 
-    if !opts.fmt.patch && !stats.is_empty() {
+    if !stats.is_empty() && non_patch_format(opts) {
         render_non_patch(&mut out, &stats, opts);
     }
+    if !patch.is_empty() {
+        // `DIFF_SYMBOL_SEPARATOR`: one empty line, and only when a format already
+        // wrote something.
+        if !out.is_empty() {
+            out.push(b'\n');
+        }
+        out.extend_from_slice(&patch);
+    }
     Ok((out, changed))
+}
+
+/// Whether any format other than the patch was asked for, so [`render_non_patch`] has
+/// something to write.
+fn non_patch_format(opts: &Opts) -> bool {
+    let f = &opts.fmt;
+    f.stat || f.numstat || f.shortstat || f.name_only || f.name_status || f.raw || f.summary
 }
 
 impl Opts {
     fn ctx_geometry(&self) -> super::diff_pairs::EmitGeometry {
         super::diff_pairs::EmitGeometry {
             ctx: self.ctx as usize,
-            inter_hunk_ctx: 0,
+            inter_hunk_ctx: self.inter_hunk_ctx,
             func_context: self.func_context,
         }
     }
@@ -964,7 +1229,14 @@ fn emit_header(
             return "0".repeat(opts.abbrev);
         }
         let hex = blob_id(data).to_hex().to_string();
-        let len = if opts.full_index { hex.len() } else { opts.abbrev.min(hex.len()) };
+        // `fill_metainfo()` (diff.c:4491) widens the `index` line to full object
+        // names under `--full-index`, and also under `--binary` — but only for a pair
+        // that really is binary, so text pairs in the same run keep the abbreviation.
+        let len = if opts.full_index || (opts.binary && binary) {
+            hex.len()
+        } else {
+            opts.abbrev.min(hex.len())
+        };
         hex[..len].to_string()
     };
 
@@ -1018,8 +1290,10 @@ fn emit_header(
     out.push(b'\n');
 
     // `emit_diff_symbol(DIFF_SYMBOL_FILEPAIR_*)` is skipped for a binary pair:
-    // there are no line markers to introduce.
-    if binary {
+    // there are no line markers to introduce. `-D` skips them for the same reason —
+    // its `goto` (diff.c:3596) leaves `builtin_diff()` before the arm that prints
+    // them, and the caller then skips the body as well.
+    if binary || (opts.irreversible_delete && b.file.is_none()) {
         return;
     }
     out.extend_from_slice(b"--- ");
@@ -1043,6 +1317,10 @@ fn render_non_patch(out: &mut Vec<u8>, rows: &[Row], opts: &Opts) {
         }
         return;
     }
+    // `flush_one_pair()` (diff.c:6323) prefers `diff_flush_raw()` over the name
+    // format, and `diff_flush_raw()` itself drops the `:<modes> <oids> ` prefix when
+    // `DIFF_FORMAT_NAME_STATUS` is on. The raw/name block runs *before* the stat
+    // family in `diff_flush()`, so `--raw --stat` prints both, raw first.
     if opts.fmt.name_status || opts.fmt.raw {
         for row in rows {
             if opts.fmt.raw {
@@ -1082,7 +1360,6 @@ fn render_non_patch(out: &mut Vec<u8>, rows: &[Row], opts: &Opts) {
             }
             out.push(b'\n');
         }
-        return;
     }
     let stat_rows: Vec<(BString, BString, u32, u32, bool)> = rows
         .iter()
@@ -1264,6 +1541,16 @@ mod tests {
             // table as every other verb.
             algorithm: gix::diff::blob::Algorithm::Myers,
             colors: diff_color::DiffColors::disabled(),
+            // The rest of `diff_setup()`'s defaults, which these cases do not vary:
+            // no `--inter-hunk-context`, no `-D`, no `--binary`, no
+            // `--skip-to`/`--rotate-to`, and `zlib_compression_level`'s `Z_BEST_SPEED`
+            // — which is also what a `--no-index` run outside a repository uses,
+            // there being no `core.looseCompression` to read.
+            inter_hunk_ctx: 0,
+            irreversible_delete: false,
+            binary: false,
+            skip_or_rotate: None,
+            compression_level: 1,
         }
     }
 

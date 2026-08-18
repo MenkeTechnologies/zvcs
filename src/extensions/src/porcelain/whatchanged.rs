@@ -58,7 +58,13 @@
 //!
 //! `cmd_whatchanged` is `cmd_log` with two settings changed — the raw format becomes
 //! the default when no other diff format is asked for, and `always_show_header` stays
-//! off — so once the deprecation gate is cleared the walk and the rendering are handed
+//! off. "Asked for" includes every option whose parse callback ends in
+//! `enable_patch_output()` — `--binary` (diff.c:5564) and `-U`/`--unified`
+//! (diff.c:5961) among them. Those set `DIFF_FORMAT_PATCH`, so the
+//! `!rev.diffopt.output_format` fallback at builtin/log.c:559-560 never fires and the
+//! raw records are *replaced* by a patch rather than joined by one; `git log` shows no
+//! such change because it has no raw default to displace.
+//! Once the deprecation gate is cleared the walk and the rendering are handed
 //! to [`super::log::whatchanged`], which runs `log`'s renderer under that flavour. What
 //! stays here is everything that happens *before* the gate:
 //!
@@ -292,6 +298,13 @@ const FLAG_OPTS: &[&str] = &[
     "--histogram",
     "--patience",
     "--minimal",
+    "--text",
+    "-a",
+    "-W",
+    "--no-function-context",
+    "--indent-heuristic",
+    "--no-indent-heuristic",
+    "-D",
     "--check",
     "--exit-code",
     "-R",
@@ -333,6 +346,7 @@ const PREFIX_OPTS: &[&str] = &[
     "--expand-tabs=",
     "--unified=",
     "--inter-hunk-context=",
+    "--diff-algorithm=",
     "--color=",
     "--decorate=",
     "--min-parents=",
@@ -517,8 +531,8 @@ const FOLLOW_OK_MAGIC: &[&str] = &["top", "exclude"];
 /// expressions (`-E` selects extended, `-F` fixed strings, `-P` PCRE). Only patterns
 /// that are pure literals under the active flavour are honoured here — for those, git's
 /// regex match degenerates to a substring test, which is reproduced exactly. A pattern
-/// carrying any regex metacharacter is left to the deferred-unimplemented path instead of
-/// being matched with the wrong flavour. Multiple `--grep` are OR-ed (`--all-match`
+/// carrying any regex metacharacter is left to `git log`'s own matcher instead of
+/// being matched with the wrong flavour here. Multiple `--grep` are OR-ed (`--all-match`
 /// AND-s them), `--invert-grep` negates the verdict, and `-i` folds ASCII case.
 #[derive(Default)]
 struct GrepFilter {
@@ -543,13 +557,8 @@ struct Parsed {
     max_count: Option<usize>,
     revs: Vec<String>,
     pathspecs: Vec<String>,
-    /// The first recognised option this module does not implement, if any. Consulted
-    /// only when a commit actually survives filtering and is about to be rendered — git
-    /// applies these options to *shown* commits, so an invocation whose filters leave
-    /// nothing to show produces empty output and exit 0 no matter what they are.
-    unimplemented: Option<String>,
-    /// A collected `--grep` filter. Applied when every pattern is literal-faithful;
-    /// otherwise it feeds `unimplemented` so a shown commit still bails.
+    /// A collected `--grep` filter, kept so a malformed pattern is rejected in git's
+    /// order; matching itself is `git log`'s.
     grep: GrepFilter,
     /// Ref-set selectors that replace the default `HEAD` tip with a union of refs.
     select_all: bool,
@@ -673,8 +682,6 @@ struct Phase1 {
     /// `-q`/`--quiet` is extracted here but still sets `NO_OUTPUT`, so it participates
     /// in the `--name-only`/`--name-status`/`--check`/`-s` conflict below.
     quiet: bool,
-    /// The first extracted option this module does not implement.
-    unimplemented: Option<String>,
     /// The arguments `setup_revisions` actually sees.
     rest: Vec<String>,
 }
@@ -707,7 +714,6 @@ fn extract_log_options(args: &[String]) -> Result<Phase1, Fatal> {
     let mut out = Phase1 {
         opted_in: false,
         quiet: false,
-        unimplemented: None,
         rest: Vec::with_capacity(args.len()),
     };
     let mut seen_dashdash = false;
@@ -739,9 +745,6 @@ fn extract_log_options(args: &[String]) -> Result<Phase1, Fatal> {
                 "-q" | "--quiet" => out.quiet = true,
                 "--no-quiet" => out.quiet = false,
                 _ => {}
-            }
-            if out.unimplemented.is_none() {
-                out.unimplemented = Some(a.clone());
             }
             continue;
         }
@@ -1125,14 +1128,12 @@ fn consume_option(
         }
     }
 
-    // --- options git recognises but this module does not implement -------------------
-    // They still have to be classified exactly, because that is what decides which
-    // exit-128 message the command ends with.
-    fn note_recognized(flag: &str, p: &mut Parsed) {
-        if p.unimplemented.is_none() {
-            p.unimplemented = Some(flag.to_string());
-        }
-    }
+    // --- options git recognises and forwards -----------------------------------------
+    // `cmd_whatchanged` *is* `cmd_log`, and this module ends by handing the whole
+    // argument array to `git log`'s implementation, so these arms exist only to
+    // classify each option exactly — how many argv slots it eats, and which
+    // exit-128/129 message a malformed value produces. What the option *does* is
+    // `git log`'s business.
 
     if let Some(v) = a.strip_prefix("--diff-merges=") {
         validate_diff_merges(v)?;
@@ -1141,13 +1142,11 @@ fn consume_option(
         } else {
             st.note_merge_diff();
         }
-        note_recognized(a, p);
         return Ok(1);
     }
 
     // `--grep` companion flags. On their own (no `--grep`) they are inert in git — verified
-    // against stock git 2.55.0 — so, unlike the rest of FLAG_OPTS, they must not mark the
-    // command unimplemented; they only tune how a collected `--grep` pattern is matched.
+    // against stock git 2.55.0 — they only tune how a collected `--grep` pattern is matched.
     match a {
         "-i" | "--regexp-ignore-case" => {
             p.grep.ignore_case = true;
@@ -1223,32 +1222,30 @@ fn consume_option(
         return Ok(1);
     }
 
-    if FLAG_OPTS.contains(&a) {
-        note_recognized(a, p);
+    // The second arm is the shared list of diff options that set a `diff_options` field
+    // to the value the history commands already run at; consuming one here is what keeps
+    // it off the `unrecognized argument` path, which would claim git has no such option.
+    if FLAG_OPTS.contains(&a) || super::diff::history_noop_diff_option(a) {
         return Ok(1);
     }
 
     // `--name=value` families, plus the validation git performs on the value.
     if let Some(v) = a.strip_prefix("--date=") {
         validate_date_format(v)?;
-        note_recognized(a, p);
         return Ok(1);
     }
     if let Some(v) = a.strip_prefix("--diff-filter=") {
         validate_diff_filter(v, a)?;
-        note_recognized(a, p);
         return Ok(1);
     }
     if let Some(v) = a.strip_prefix("--skip=") {
         let _ = parse_count(v)?;
-        note_recognized(a, p);
         return Ok(1);
     }
     // `--no-walk` takes only these two values; any other spelling is not an option git
     // knows, so it joins the deferred unrecognised-argument path rather than dying here.
     if let Some(v) = a.strip_prefix("--no-walk=") {
         if v == "sorted" || v == "unsorted" {
-            note_recognized(a, p);
             return Ok(1);
         }
         if unrecognized.is_none() {
@@ -1261,12 +1258,10 @@ fn consume_option(
     // deprecation notice and of any deferred unrecognised option.
     if let Some(v) = a.strip_prefix("--pretty=") {
         validate_pretty_format(v)?;
-        note_recognized(a, p);
         return Ok(1);
     }
     if let Some(v) = a.strip_prefix("--format=") {
         validate_pretty_format(v)?;
-        note_recognized(a, p);
         return Ok(1);
     }
     // Numeric and enum options git rejects at parse time. The value is not implemented
@@ -1275,53 +1270,44 @@ fn consume_option(
     // a fuzzed bad value matches rather than reaching the generic recognised path.
     if let Some(v) = a.strip_prefix("--min-parents=") {
         let _ = parse_count(v)?;
-        note_recognized(a, p);
         return Ok(1);
     }
     if let Some(v) = a.strip_prefix("--max-parents=") {
         let _ = parse_count(v)?;
-        note_recognized(a, p);
         return Ok(1);
     }
     if let Some(v) = a.strip_prefix("--unified=") {
         validate_unified(v)?;
-        note_recognized(a, p);
         return Ok(1);
     }
     if let Some(v) = a.strip_prefix("--stat-width=") {
         validate_stat_num(v, "stat-width")?;
-        note_recognized(a, p);
         return Ok(1);
     }
     if let Some(v) = a.strip_prefix("--stat-count=") {
         validate_stat_num(v, "stat-count")?;
-        note_recognized(a, p);
         return Ok(1);
     }
     if let Some(v) = a.strip_prefix("--stat-name-width=") {
         validate_stat_num(v, "stat-name-width")?;
-        note_recognized(a, p);
         return Ok(1);
     }
     if let Some(v) = a.strip_prefix("--color=") {
         validate_color(v)?;
-        note_recognized(a, p);
         return Ok(1);
     }
     if let Some(v) = a.strip_prefix("--word-diff=") {
         validate_word_diff(v)?;
-        note_recognized(a, p);
         return Ok(1);
     }
     if PREFIX_OPTS.iter().any(|pre| a.starts_with(pre)) {
-        note_recognized(a, p);
         return Ok(1);
     }
     for opt in VALUE_OPTS {
         let attached = format!("{opt}=");
         if let Some(v) = a.strip_prefix(attached.as_str()) {
-            // `--grep` is honoured (for literal patterns) rather than deferred, so it does
-            // not mark the command unimplemented on its own.
+            // `--grep`'s patterns are collected so a malformed one is rejected in git's
+            // order; the matching itself happens in the forwarded `git log` run.
             if *opt == "--grep" {
                 p.grep.patterns.push(v.to_string());
                 return Ok(1);
@@ -1334,7 +1320,6 @@ fn consume_option(
                 "--diff-merges" => validate_diff_merges(v)?,
                 _ => {}
             }
-            note_recognized(a, p);
             return Ok(1);
         }
         if a == *opt {
@@ -1358,14 +1343,12 @@ fn consume_option(
                 }
                 _ => {}
             }
-            note_recognized(a, p);
             return Ok(2);
         }
     }
     if a == "--diff-filter" {
         let v = next.ok_or_else(|| Fatal::usage("option `diff-filter' requires a value"))?;
         validate_diff_filter(v, &format!("--diff-filter={v}"))?;
-        note_recognized(a, p);
         return Ok(2);
     }
 
@@ -1376,7 +1359,6 @@ fn consume_option(
         let c = bytes[1] as char;
         if VALUE_SWITCHES.contains(&c) {
             if a.len() > 2 {
-                note_recognized(a, p);
                 return Ok(1);
             }
             let v = next.ok_or_else(|| Fatal::usage(format!("switch `{c}' requires a value")))?;
@@ -1387,11 +1369,9 @@ fn consume_option(
                     ))
                 })?;
             }
-            note_recognized(a, p);
             return Ok(2);
         }
         if OPTIONAL_ARG_SWITCHES.contains(&c) {
-            note_recognized(a, p);
             return Ok(1);
         }
     }

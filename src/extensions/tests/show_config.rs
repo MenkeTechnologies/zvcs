@@ -1,8 +1,9 @@
 //! `git show` shares `git log`'s display config: `log.date` (default for
 //! `--date`), `log.abbrevCommit` (default for `--abbrev-commit`), and
 //! `log.showRoot` (default for a root commit's empty-tree diff, forced on by
-//! `--root`). show has its own rendering path — it does not delegate to log — so
-//! these guard that its config plumbing stays in step with git's. Each test both
+//! `--root`). show renders its header through log's formatter but reads and
+//! resolves this config itself, so these guard that its config plumbing stays in
+//! step with git's. Each test both
 //! asserts the deterministic rendering and diffs the full output against the real
 //! `git` binary byte-for-byte. An invalid `log.date` is fatal at config read,
 //! even when a valid `--date` would otherwise take over.

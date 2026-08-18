@@ -92,6 +92,17 @@ const TABLE: [Cmd; 14] = [
 
 impl Cmd {
     /// `todo_command_info[].str`.
+    ///
+    /// `command_to_string()` (sequencer.c:1841-1848) special-cases the comment
+    /// entry — `todo_command_info[TODO_COMMENT].str` is `NULL`, and the function
+    /// returns `comment_line_str` instead — so the `"#"` below is that value's
+    /// default rather than a literal git would write. Nothing reaches it in
+    /// either implementation: `todo_list_to_strbuf()` writes a comment item's raw
+    /// argument and never asks for its command name (sequencer.c:6324-6328, and
+    /// [`List::to_bytes`]'s matching early return), `is_command()` only probes
+    /// `TABLE`, which stops at `drop`, and every other caller here holds a parsed
+    /// instruction. It is left as a constant rather than threaded through a
+    /// `&Repository` for a string no caller can observe.
     pub(crate) fn name(self) -> &'static str {
         match self {
             Cmd::Pick => "pick",
@@ -526,31 +537,36 @@ pub(crate) fn short_name(repo: &gix::Repository, oid: ObjectId) -> String {
     oid.attach(repo).shorten_or_id().to_string()
 }
 
-/// The comment prefix git writes the todo help with: `core.commentString`, else
-/// `core.commentChar`, else `#`.
+/// `comment_line_str` — the prefix every commented line git writes carries.
 ///
-/// `commit.rs` resolves the same three keys for `COMMIT_EDITMSG`; that copy is
-/// private to the module, so this is a second reader of the same keys rather
-/// than a second rule.
+/// This used to re-derive the value and got two things wrong, both of which
+/// corrupted committed data under a non-default setting:
+///
+/// * **It truncated to one character.** `core.commentChar` and
+///   `core.commentString` are one knob in git 2.55 — `git_default_core_config()`
+///   handles them in a single arm (environment.c:435-456) and stores the value
+///   whole, rejecting only an empty value or one containing a newline. Stock with
+///   `core.commentChar = //` writes `// Conflicts:`; truncating to `/` produced a
+///   prefix the reader would not recognise.
+/// * **It preferred `commentString` over `commentChar` unconditionally.** They
+///   feed the same variable, so the *last* one set across the merged
+///   configuration wins regardless of spelling.
+///
+/// `auto` (and an empty value) resolve to `#` here, which is git's behaviour for
+/// everything outside `git commit`: `auto_comment_line_char` leaves
+/// `comment_line_str = "#"` at config time (environment.c:441-443) and only
+/// `builtin/commit.c`'s `adjust_comment_line_char()` ever revises it, from
+/// `prepare_to_commit()`, after the template has been written. The sequencer
+/// never calls it — measured: a conflicted `git rebase` under
+/// `core.commentChar = auto` writes `# Conflicts:`.
+///
+/// The rule itself lives in [`super::interpret_trailers::comment_string`], which
+/// is where `trailer.c` needs it and where `commit.rs` already reads it from —
+/// one implementation, three callers, rather than a third copy to drift.
 pub(crate) fn comment_prefix(repo: &gix::Repository) -> String {
     let snap = repo.config_snapshot();
-    if let Some(v) = snap.string("core.commentString") {
-        let v = v.to_string();
-        if !v.is_empty() && v != "auto" {
-            return v;
-        }
-    }
-    match snap.string("core.commentChar") {
-        None => "#".to_string(),
-        Some(v) => {
-            let s = v.to_string();
-            if s.is_empty() || s == "auto" {
-                "#".to_string()
-            } else {
-                s.chars().next().unwrap_or('#').to_string()
-            }
-        }
-    }
+    let bytes = super::interpret_trailers::comment_string(snap.plumbing());
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 /// `sequencer_make_script()` — the initial instruction sheet.

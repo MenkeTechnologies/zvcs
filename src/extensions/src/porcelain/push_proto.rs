@@ -33,7 +33,7 @@
 //! pack is complete but undeltified (see [`super::pack_objects`]); a non-thin
 //! pack is valid for receive-pack, `--thin` is only a size optimization.
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
 use std::collections::{HashMap, HashSet};
 use std::io::{IsTerminal, Write};
 
@@ -238,9 +238,7 @@ fn build_push_cert(
     push_options: &[String],
 ) -> Result<Vec<u8>> {
     let signer = crate::gitsig::Signer::resolve(repo);
-    let key_id = signer
-        .signing_key_id()
-        .map_err(|e| anyhow!("cannot sign the push certificate: {e}"))?;
+    let key_id = signer.signing_key_id().map_err(sign_failure)?;
     // `datestamp()` (date.c): the current time and this machine's UTC offset, in
     // the same `<seconds> <+hhmm>` shape an ident carries.
     let cert = push_cert_payload(
@@ -251,13 +249,28 @@ fn build_push_cert(
         push_options,
     );
 
-    let signature = signer
-        .sign(cert.as_bytes())
-        .map_err(|e| anyhow!("failed to sign the push certificate: {e}"))?;
+    let signature = signer.sign(cert.as_bytes()).map_err(sign_failure)?;
 
     let mut out = cert.into_bytes();
     out.extend_from_slice(&signature);
     Ok(out)
+}
+
+/// `send-pack.c:379`: `if (sign_buffer(...)) die(_("failed to sign the push
+/// certificate"))`. `sign_buffer` has already written its own `error: …` line by
+/// then, so the only thing left is the `die` — unless the backend died itself, in
+/// which case its message *is* the last word.
+fn sign_failure(e: crate::gitsig::SignFailure) -> anyhow::Error {
+    match e {
+        crate::gitsig::SignFailure::Silent => {
+            anyhow::Error::new(crate::fatal::Silent(crate::fatal::EXIT_FATAL))
+        }
+        crate::gitsig::SignFailure::Fatal(m) => crate::fatal::die(m),
+        crate::gitsig::SignFailure::Error(m) => {
+            eprintln!("{}", crate::gitsig::report("error: ", &m));
+            crate::fatal::die("failed to sign the push certificate")
+        }
+    }
 }
 
 /// git's `datestamp()` (date.c): `<seconds-since-epoch> <+hhmm>` for right now,

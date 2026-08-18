@@ -30,14 +30,14 @@
 //!     does. A revert never reverses that walk, so a range is backed out newest
 //!     first — the opposite of `cherry-pick`
 //!   * `-n`/`--no-commit`, `-s`/`--signoff`, `-m <n>`/`--mainline <n>`,
-//!     `--no-edit`, `--reference`, `--cleanup=<mode>`
+//!     `-e`/`--edit`, `--no-edit`, `--reference`, `--cleanup=<mode>`
 //!   * `--strategy`/`-X`, which git's sequencer ignores outright for a revert:
 //!     `do_pick_commit` routes `TODO_REVERT` to the recursive merge regardless
 //!     of the selected strategy, so an unknown strategy name is not an error
 //!   * `--rerere-autoupdate`/`--no-rerere-autoupdate` and `--no-gpg-sign`,
 //!     accepted and without effect on a conflict-free revert
 //!   * the generated message (`Revert "…"` / `Reapply "…"`, the reference
-//!     format `# *** SAY WHY … ***` plus `<short> (<subject>, <date>)`, the
+//!     format `<comment> *** SAY WHY … ***` plus `<short> (<subject>, <date>)`, the
 //!     `, reversing / changes made to` merge variant, the `Signed-off-by`
 //!     trailer) and the `--cleanup` mode applied to it
 //!   * the summary block (`[<branch> <short-oid>] <subject>`, the ` Date:` line
@@ -85,14 +85,29 @@
 //!     (`do_pick_commit` routes `TODO_REVERT` there whatever `--strategy` says),
 //!     so there is no strategy-child exception as there is for `cherry-pick`.
 //!
-//! What this port does NOT do, and refuses rather than approximates:
-//!   * `-S`/`--gpg-sign` — bails, since nothing here can produce a signature.
-//!   * **spawning an editor.** `-e`/`--edit` is accepted and only changes which
-//!     `--cleanup=default` mode applies; the generated message is then taken as
-//!     written. Under a non-interactive `GIT_EDITOR` that is what git does too,
-//!     but at a terminal git would prompt and this will not.
+//!   * `-e`/`--edit` and the tri-state default behind it. `should_edit()`
+//!     (sequencer.c:2203-2212) edits when `-e` was given, never when `--no-edit`
+//!     was, and for an unqualified revert only at a terminal — a redirected stdin
+//!     silently means "no editor", which is what makes scripted reverts quiet.
+//!     When it does edit, `do_commit()` stops writing the object itself and
+//!     delegates the whole commit to `git commit -e` (sequencer.c:1728,1750-1754),
+//!     which is what [`super::replay_commit`] reproduces. That is observable well
+//!     past the message: the summary loses the ` Date:` line the sequencer's own
+//!     `SUMMARY_SHOW_AUTHOR_DATE` adds, `AUTO_MERGE` does not survive, a failing
+//!     or emptying editor aborts at 1, and the reflog still reads `revert:`
+//!     because the child inherits `GIT_REFLOG_ACTION`.
+//!
+//!   * `-S`/`--gpg-sign[=<key-id>]`, `--no-gpg-sign` and the `commit.gpgSign`
+//!     default behind them. `opts->gpg_sign` reaches `commit_tree_extended()`
+//!     directly on the in-process path (sequencer.c:1685) and is spelled back out
+//!     as `-S<key>` on the editor path (sequencer.c:1157-1160), so both arms sign
+//!     with the same key; `save_opts()` records it as `options.gpg-sign` so a
+//!     resumed sequence keeps signing. A stopped revert's `--continue` is the one
+//!     exception, and it is git's: `continue_single_pick()` spawns a plain
+//!     `git commit` with no `-S` (sequencer.c:5232-5257), so only `commit.gpgSign`
+//!     applies there.
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::process::ExitCode;
 use std::sync::atomic::AtomicBool;
@@ -168,7 +183,15 @@ const USAGE_ALL: &str = r#"usage: git revert [--[no-]edit] [-n] [-m <parent-numb
 "#;
 
 /// The title git puts on a `--reference` revert, left for the user to replace.
-const REFERENCE_TITLE: &str = "# *** SAY WHY WE ARE REVERTING ON THE TITLE LINE ***";
+///
+/// ```c
+/// strbuf_commented_addf(message, comment_line_str,
+///                       "*** SAY WHY WE ARE REVERTING ON THE TITLE LINE ***");
+/// ```
+///
+/// (sequencer.c:5647.) The prefix is `comment_line_str`, so `core.commentChar`
+/// / `core.commentString` decides it — this is the body, without one.
+const REFERENCE_TITLE: &str = "*** SAY WHY WE ARE REVERTING ON THE TITLE LINE ***";
 
 /// A flattened tree: repository-relative path → (blob/tree-leaf id, entry kind).
 type Flat = BTreeMap<BString, (ObjectId, EntryKind)>;
@@ -234,10 +257,10 @@ impl Cleanup {
 struct Options {
     no_commit: bool,
     signoff: bool,
-    edit: bool,
-    /// `opts->edit` as git's tri-state (`-1` when never given), kept alongside
-    /// [`Options::edit`] because `save_opts` writes the key for either explicit
-    /// spelling and omits it otherwise.
+    /// `opts->edit`, git's tri-state: `None` is the C's `-1` — never given — and
+    /// is what makes an unqualified `git revert` edit only at a terminal
+    /// (`should_edit()`, sequencer.c:2203-2212). `save_opts` writes the key for
+    /// either explicit spelling and omits it otherwise, which is the same state.
     edit_given: Option<bool>,
     reference: bool,
     /// 0 means "not given"; git stores it the same way.
@@ -253,6 +276,11 @@ struct Options {
     xopts: Vec<String>,
     /// `Some(true)` for `--rerere-autoupdate`, `Some(false)` for the negation.
     rerere: Option<bool>,
+    /// `opts->gpg_sign`, whose three states git keeps in one `char *`: `None` is
+    /// NULL (do not sign), `Some("")` is the empty string `-S` and
+    /// `commit.gpgSign` both leave behind (sign with `get_signing_key()`'s
+    /// choice), and `Some(key)` is `-S<key>`.
+    gpg_sign: Option<String>,
     mode: Option<Cmd>,
 }
 
@@ -274,6 +302,7 @@ pub fn revert(args: &[String]) -> Result<ExitCode> {
     // so it is only the default: an explicit `--reference`/`--no-reference` on
     // the command line wins. Track whether either was seen so the config is
     // applied only when neither was.
+    let mut gpg_sign_explicit = false;
     let mut reference_explicit = false;
 
     let mut i = 0;
@@ -297,14 +326,8 @@ pub fn revert(args: &[String]) -> Result<ExitCode> {
             "--commit" => o.no_commit = false,
             "-s" | "--signoff" => o.signoff = true,
             "--no-signoff" => o.signoff = false,
-            "-e" | "--edit" => {
-                o.edit = true;
-                o.edit_given = Some(true);
-            }
-            "--no-edit" => {
-                o.edit = false;
-                o.edit_given = Some(false);
-            }
+            "-e" | "--edit" => o.edit_given = Some(true),
+            "--no-edit" => o.edit_given = Some(false),
             "--reference" => {
                 o.reference = true;
                 reference_explicit = true;
@@ -315,7 +338,11 @@ pub fn revert(args: &[String]) -> Result<ExitCode> {
             }
             "--rerere-autoupdate" => o.rerere = Some(true),
             "--no-rerere-autoupdate" => o.rerere = Some(false),
-            "--no-gpg-sign" => {}
+            // `xstrdup_or_null(NULL)` for the negation (builtin/revert.c:256-259).
+            "--no-gpg-sign" => {
+                o.gpg_sign = None;
+                gpg_sign_explicit = true;
+            }
             "--no-mainline" => o.mainline = 0,
             "--no-cleanup" => o.cleanup = None,
             "--no-strategy" => o.strategy = None,
@@ -395,8 +422,26 @@ pub fn revert(args: &[String]) -> Result<ExitCode> {
             _ if a.starts_with("--strategy=") => {
                 o.strategy = Some(a["--strategy=".len()..].to_string());
             }
-            _ if a.starts_with("-S") || a.starts_with("--gpg-sign") => {
-                bail!("GPG signing is not supported")
+            // ```c
+            // { .type = OPTION_STRING, .short_name = 'S', .long_name = "gpg-sign",
+            //   .value = &gpg_sign, .flags = PARSE_OPT_OPTARG, .defval = (intptr_t) "" }
+            // ```
+            //
+            // (builtin/revert.c:136-145.) `PARSE_OPT_OPTARG` takes a value only
+            // when it is attached, so `-S <rev>` signs with the default key and
+            // leaves `<rev>` an operand; `.defval = ""` is what makes the bare
+            // form sign at all rather than parse as `--no-gpg-sign`.
+            "-S" | "--gpg-sign" => {
+                o.gpg_sign = Some(String::new());
+                gpg_sign_explicit = true;
+            }
+            _ if a.starts_with("--gpg-sign=") => {
+                o.gpg_sign = Some(a["--gpg-sign=".len()..].to_string());
+                gpg_sign_explicit = true;
+            }
+            _ if a.starts_with("-S") && !a.starts_with("--") => {
+                o.gpg_sign = Some(a[2..].to_string());
+                gpg_sign_explicit = true;
             }
             // Unknown: git keeps it for the revision parser, which then fails
             // with the usage text. Mirror that by deferring the diagnosis.
@@ -429,10 +474,21 @@ pub fn revert(args: &[String]) -> Result<ExitCode> {
             o.reference = v;
         }
     }
-    // `--reference` implies editing, which is what makes `--cleanup=default`
-    // behave as `strip` and drop the generated `#` title line.
-    if o.reference {
-        o.edit = true;
+    // ```c
+    // if (!strcmp(k, "commit.gpgsign")) {
+    //         free(opts->gpg_sign);
+    //         opts->gpg_sign = git_config_bool(k, v) ? xstrdup("") : NULL;
+    //         return 0;
+    // }
+    // ```
+    //
+    // (sequencer.c:302-306, `git_sequencer_config`.) `sequencer_init_config()`
+    // runs before `parse_args()`, so this is a *default* that either spelling of
+    // the flag overrides. Ignoring it was not a missing flag but a silent one: a
+    // repository that asks for signed commits got unsigned revert commits at
+    // exit 0, with nothing said.
+    if !gpg_sign_explicit && repo.config_snapshot().boolean("commit.gpgSign") == Some(true) {
+        o.gpg_sign = Some(String::new());
     }
     // Every step below mutates the index, the worktree and a ref: serialize the
     // whole sequence through the repo coordinator, as the other writers do.
@@ -574,6 +630,10 @@ fn saved_opts<'a>(
         xopts,
         allow_rerere_auto: o.rerere,
         default_msg_cleanup: cleanup.map(Cleanup::name),
+        // `save_opts()` (sequencer.c:3711-3713) writes `options.gpg-sign` only
+        // when `opts->gpg_sign` is set, so an unsigned sequence leaves the key
+        // out entirely rather than recording an empty one.
+        gpg_sign: o.gpg_sign.as_deref(),
         ..Default::default()
     }
 }
@@ -766,7 +826,6 @@ fn sequencer_continue(repo: &gix::Repository, git_dir: &std::path::Path) -> Resu
     let o = Options {
         no_commit: loaded.no_commit,
         signoff: loaded.signoff,
-        edit: loaded.edit == Some(true),
         edit_given: loaded.edit,
         reference: false,
         mainline: loaded.mainline as usize,
@@ -774,6 +833,7 @@ fn sequencer_continue(repo: &gix::Repository, git_dir: &std::path::Path) -> Resu
         strategy: loaded.strategy.clone(),
         xopts: loaded.xopts.clone(),
         rerere: loaded.allow_rerere_auto,
+        gpg_sign: loaded.gpg_sign.clone(),
         mode: None,
     };
     let cleanup = o.cleanup.as_deref().and_then(Cleanup::parse);
@@ -809,7 +869,10 @@ fn continue_single_pick(
     // `--cleanup=strip` is what git passes, so the `# Conflicts:` block the stop
     // appended is dropped along with every other comment line.
     let raw = std::fs::read_to_string(git_dir.join("MERGE_MSG")).unwrap_or_default();
-    let message = stripspace(&raw, true);
+    let message = stripspace(
+        &raw,
+        Some(&super::commit::comment_prefix(&repo.config_snapshot())),
+    );
 
     let author = repo
         .author()
@@ -820,16 +883,15 @@ fn continue_single_pick(
         .ok_or_else(|| anyhow::anyhow!("no committer identity configured"))??;
     let author_ident = format!("{} <{}>", author.name, author.email);
     let committer_ident = format!("{} <{}>", committer.name, committer.email);
-    let commit = gix::objs::Commit {
-        message: message.clone().into(),
-        tree: tree_id,
-        author: author.into(),
-        committer: committer.into(),
-        encoding: None,
-        parents: std::iter::once(head_id).collect(),
-        extra_headers: Default::default(),
-    };
-    let new_id = repo.write_object(&commit)?.detach();
+    let new_id = super::commit::write_commit_object(
+        repo,
+        &committer.into(),
+        &author.into(),
+        message.as_bytes().as_bstr(),
+        tree_id,
+        vec![head_id],
+        super::commit::commit_config_signer(repo).as_ref(),
+    )?;
     let subject = message.lines().next().unwrap_or("").to_string();
     repo.edit_reference(RefEdit {
         change: Change::Update {
@@ -1211,6 +1273,26 @@ fn revert_one(
         return Ok(Step::Done);
     }
 
+    // `unsigned int flags = should_edit(opts) ? EDIT_MSG : 0;` (sequencer.c:2269),
+    // and `do_commit()` only writes the object itself when *neither* `EDIT_MSG`
+    // nor `VERIFY_MSG` is set (sequencer.c:1728). With an editor wanted the pick
+    // hands the whole commit to `git commit -e`, which seeds `COMMIT_EDITMSG`
+    // from the `MERGE_MSG` written above, runs the editor, and commits what comes
+    // back — including the nothing-to-commit report an empty result earns, which
+    // is why this sits above the empty-result guard rather than below it.
+    if super::replay_commit::should_edit(o.edit_given, super::replay_commit::Action::Revert) {
+        let code = super::replay_commit::run_git_commit(
+            super::replay_commit::Action::Revert,
+            o.gpg_sign.as_deref(),
+            false,
+        )?;
+        return Ok(if code == ExitCode::SUCCESS {
+            Step::Done
+        } else {
+            Step::Failed(code)
+        });
+    }
+
     // A revert that changes nothing produces no commit; git reports this via the
     // commit machinery and exits 1.
     if merged_tree == ours_tree {
@@ -1254,16 +1336,18 @@ fn revert_one(
     let author_time = author.time()?;
     let author_ident = format!("{} <{}>", author.name, author.email);
     let committer_ident = format!("{} <{}>", committer.name, committer.email);
-    let commit = gix::objs::Commit {
-        message: message.clone().into(),
-        tree: merged_tree,
-        author: author.into(),
-        committer: committer.into(),
-        encoding: None,
-        parents: std::iter::once(head_id).collect(),
-        extra_headers: Default::default(),
-    };
-    let new_id = repo.write_object(&commit)?.detach();
+    let signer = super::commit::sequencer_signer(repo, o.gpg_sign.as_deref());
+    // `commit_tree_extended(msg, ..., opts->gpg_sign, extra)` (sequencer.c:1685):
+    // the in-process commit signs with exactly the key the sequencer carries.
+    let new_id = super::commit::write_commit_object(
+        repo,
+        &committer.into(),
+        &author.into(),
+        message.as_bytes().as_bstr(),
+        merged_tree,
+        vec![head_id],
+        signer.as_ref(),
+    )?;
     repo.edit_reference(RefEdit {
         change: Change::Update {
             log: LogChange {
@@ -1560,8 +1644,9 @@ fn build_message(
         .unwrap_or("")
         .to_string();
 
+    let comment = super::commit::comment_prefix(&repo.config_snapshot());
     let mut msg = if o.reference {
-        format!("{REFERENCE_TITLE}\n")
+        format!("{comment} {REFERENCE_TITLE}\n")
     } else {
         // Reverting a revert reads better as "Reapply"; the original subject
         // already carries the closing quote. git leaves an already-nested
@@ -1590,23 +1675,17 @@ fn build_message(
     let Some(mode) = cleanup else {
         return Ok(msg);
     };
-    let mode = match mode {
-        Cleanup::Default => {
-            if o.edit {
-                Cleanup::Strip
-            } else {
-                Cleanup::Whitespace
-            }
-        }
-        other => other,
-    };
     Ok(match mode {
         Cleanup::Verbatim => msg,
-        Cleanup::Strip => stripspace(&msg, true),
+        // `opts->default_msg_cleanup = get_cleanup_mode(cleanup_arg, 1)`
+        // (builtin/revert.c:189) — the `use_editor` argument is the literal `1`,
+        // so `--cleanup=default` is `COMMIT_MSG_CLEANUP_ALL` for a revert whether
+        // or not an editor runs. Measured: `git revert --cleanup=default
+        // --reference` drops the `*** SAY WHY … ***` title with stdin redirected.
+        Cleanup::Strip | Cleanup::Default => stripspace(&msg, Some(&comment)),
         // `scissors` only cuts at the scissors line, which this message never
         // has, so what remains is the plain whitespace tidy-up.
-        Cleanup::Whitespace | Cleanup::Scissors => stripspace(&msg, false),
-        Cleanup::Default => unreachable!("resolved above"),
+        Cleanup::Whitespace | Cleanup::Scissors => stripspace(&msg, None),
     })
 }
 
@@ -1632,14 +1711,16 @@ fn refer_to(repo: &gix::Repository, id: ObjectId, reference: bool) -> Result<Str
 }
 
 /// git's `strbuf_stripspace`: drop trailing whitespace, collapse runs of blank
-/// lines to one, remove leading and trailing blanks, and — when asked — drop
-/// whole comment lines.
-fn stripspace(s: &str, strip_comments: bool) -> String {
+/// lines to one, remove leading and trailing blanks, and — when a comment prefix
+/// is supplied — drop whole comment lines. The prefix is `comment_line_str`, not
+/// a literal `#`: `strbuf_stripspace(msg, cleanup == ALL ? comment_line_str : NULL)`
+/// (sequencer.c:1629-1630).
+fn stripspace(s: &str, comment: Option<&str>) -> String {
     let mut out = String::new();
     let mut wrote = false;
     let mut pending_blank = false;
     for line in s.lines() {
-        if strip_comments && line.starts_with('#') {
+        if comment.is_some_and(|c| line.starts_with(c)) {
             continue;
         }
         let trimmed = line.trim_end();

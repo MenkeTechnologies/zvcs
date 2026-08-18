@@ -112,6 +112,19 @@
 //! * `--rebase-merges=rebase-cousins`, which changes which base
 //!   `make_script_with_merges()` resets a branch to; only the default mode is
 //!   ported.
+//! * **The apply backend's real replay.** `--apply` works for the two shapes that
+//!   write no patches — the fast-forward finish and the exact replay above — and
+//!   is refused for anything that would actually apply one. `run_am()`
+//!   (builtin/rebase.c:656-726) pipes `git format-patch -k --stdout --full-index
+//!   --cherry-pick --right-only --default-prefix --no-renames --no-cover-letter
+//!   --pretty=mboxrd --topo-order --no-base <upstream>...<orig_head>` into
+//!   `git am --rebasing --patch-format=mboxrd`. Both commands exist in this
+//!   binary and a plain `git am` reproduces stock's commit ids byte for byte, but
+//!   neither accepts that invocation: [`super::format_patch`] does not implement
+//!   `--cherry-pick`, and [`super::am`] refuses `--rebasing` because
+//!   `parse_mail_rebase()` (builtin/am.c:1464-1485) and the `rewritten` list it
+//!   feeds are unported. The refusal names both rather than claiming `git am`
+//!   itself is missing.
 //!
 //! ### `--root`
 //!
@@ -142,17 +155,54 @@
 //!
 //! `rebase.maxLabelLength` sizes the labels `make_script_with_merges()` mints.
 //!
-//! `--signoff` appends the `Signed-off-by` trailer `append_signoff()` builds
-//! from the committer identity to every replayed commit, on both the exact-replay
-//! and sequencer paths, and is recorded in `$state_dir/signoff` so `--continue`
-//! keeps signing. `--trailer` is still refused. Neither is refused up front, and
-//! neither is refused at all
-//! when the todo is empty: like git they only set `REBASE_FORCE`, so an
-//! up-to-date range takes the noop / fast-forward finish (git rewrites nothing
-//! there — `git rebase --signoff HEAD` leaves the tip untouched), and a missing
-//! upstream (stdout, exit 1) or an invalid upstream/onto (`fatal:`, exit 128)
-//! still reports git's own diagnostic in git's order, since resolution runs
-//! before the message-rewrite refusal.
+//! ### Message rewriting
+//!
+//! `--signoff` appends the `Signed-off-by` trailer `append_signoff()` builds from
+//! the committer identity, and `--trailer <t>` folds its arguments in through
+//! `amend_strbuf_with_trailers()` — the whole of `trailer.c`'s
+//! `where`/`ifExists`/`ifMissing` machinery, so a trailer the message already
+//! ends with is not repeated. Both are applied on the exact-replay and sequencer
+//! paths, in git's order (sign-off first), and both are applied *before* the pick
+//! merges, so a conflict stop's `$state_dir/message` and `MERGE_MSG` already
+//! carry them and `--continue` commits what the stop recorded.
+//!
+//! Everything this module comments — the `Conflicts:` block a stopped pick
+//! appends, the todo list's help, the squash-message headers — is prefixed with
+//! `comment_line_str`, resolved once by [`super::rebase_todo::comment_prefix`]
+//! from `core.commentChar`/`core.commentString` (one knob; last one set wins;
+//! the value is used whole, not truncated to a character; `auto` resolves to `#`
+//! outside `git commit`). It has to be the configured string on both sides: the
+//! message cleanup strips lines starting with it, so a block written with a
+//! literal `#` under any other setting survived into the commit object.
+//!
+//! `--signoff` is
+//! recorded in `$state_dir/signoff` and the `--trailer` arguments in
+//! `$state_dir/trailer` (one per line), so a resumed rebase keeps applying both.
+//! A `fixup -C`, whose message *replaces* rather than melds, picks them up in
+//! `append_squash_message()` instead. `--trailer` arguments are validated up
+//! front (`validate_trailer_args()`), which is the only way either option can
+//! fail; both merely set `REBASE_FORCE` otherwise, so an up-to-date range takes
+//! the noop / fast-forward finish (git rewrites nothing there —
+//! `git rebase --signoff HEAD` leaves the tip untouched), and a missing upstream
+//! (stdout, exit 1) or an invalid upstream/onto (`fatal:`, exit 128) still
+//! reports git's own diagnostic in git's order.
+//!
+//! ### Hooks
+//!
+//! A rebase runs three of them. `post-commit` fires for every commit the
+//! sequencer writes, and `post-rewrite amend` for every one that amended an
+//! existing commit (`try_to_commit()`, sequencer.c:1697-1699) — this port builds
+//! those commit objects directly instead of re-entering `git commit`, so it runs
+//! them itself. At the end, `post-rewrite rebase` receives the whole
+//! `<old> <new>` map the run accumulated in `$state_dir/rewritten-list`
+//! (sequencer.c:5190-5207), which is what makes a fixup chain report every melded
+//! commit against the single one that replaced it, and what carries the map
+//! across a conflict stop and `--continue`. None of the three can fail a rebase:
+//! their exit status is dropped, as git drops it.
+//!
+//! Not ported: the `git notes copy --for-rewrite=rebase` that git runs just
+//! before the final hook. Nothing here rewrites notes, and with no
+//! `notes.rewriteRef` configured stock copies nothing either.
 
 use anyhow::{anyhow, bail, Result};
 use std::collections::{HashMap, HashSet};
@@ -407,6 +457,10 @@ impl ModeOption {
 /// still leaves the repository untouched. `parent_tree` is only read to spot the
 /// empty commits `git format-patch` would drop.
 struct Replay {
+    /// The commit being replayed. Only the `post-rewrite` payload reads it: it is
+    /// the "old" half of the `<old> <new>` pair `record_in_rewritten()` writes for
+    /// every pick.
+    oid: ObjectId,
     tree: ObjectId,
     parent_tree: ObjectId,
     message: BString,
@@ -982,7 +1036,23 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
     }
 
     // --- post-parse checks, in builtin/rebase.c order ----------------------
+    //
+    // ```c
+    // if (options.trailer_args.nr) {
+    //         if (validate_trailer_args(&options.trailer_args))
+    //                 die(NULL);
+    //         options.flags |= REBASE_FORCE;
+    // }
+    // ```
+    // (builtin/rebase.c:1299-1303). `die(NULL)` prints nothing of its own — the
+    // message is the `error()` `validate_trailer_args()` already wrote — so this
+    // exits 128 silently. `REBASE_FORCE` is what makes every commit in the range
+    // be re-committed rather than fast-forwarded: without it a pick that already
+    // sits on its parent would keep its old message, trailer and all.
     if !trailers.is_empty() {
+        if !super::interpret_trailers::validate_trailer_args(&trailers)? {
+            return Ok(ExitCode::from(128));
+        }
         flags |= FORCE;
     }
     // git sets REBASE_FORCE for `--signoff` alongside trailers, so an already
@@ -1790,18 +1860,11 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
 
     if exact_replay {
         // `--signoff`/`--trailer` rewrite the *message* of every picked commit
-        // (a Signed-off-by / custom trailer). The exact replay reproduces commit
-        // metadata — committer, and the author date under `--ignore-date` — but
-        // not message trailers, so a range that actually picks commits is refused
-        // rather than replayed without the trailer. An empty todo (handled by the
-        // noop / fast-forward finishes below) signs nothing, so it needs no guard;
-        // that is why `git rebase --signoff HEAD` is accepted and only a non-empty
-        // range is refused here.
+        // (a Signed-off-by / custom trailer). Both are applied by the replay loop
+        // below, in `do_pick_commit()`'s order (sequencer.c:2433-2437): sign-off
+        // first, then the command-line trailers.
         if gpg_sign_on {
             return Err(refuse_gpg_sign());
-        }
-        if !trailers.is_empty() {
-            bail!("unsupported flag \"--trailer\" (rewriting commit messages requires commit replay)");
         }
         // `git format-patch` emits nothing for a commit that changes no tree, so
         // the apply backend stops at one with `Patch is empty.` and leaves a
@@ -1818,10 +1881,24 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
         // The apply backend detaches first and only then notices it merely
         // fast-forwarded. Deciding here keeps a refused rebase from mutating
         // anything.
+        // `run_am()` (builtin/rebase.c:656-726) pipes
+        // `git format-patch -k --stdout --full-index --cherry-pick --right-only
+        //  --default-prefix --no-renames --no-cover-letter --pretty=mboxrd
+        //  --topo-order --no-base <upstream>...<orig_head>`
+        // into `git am --rebasing --patch-format=mboxrd`. Both halves are
+        // present in this binary but neither accepts the invocation:
+        // `format-patch` rejects `--cherry-pick` (`fatal: unrecognized argument`)
+        // and `am` refuses `--rebasing` outright, because `parse_mail_rebase()`
+        // (builtin/am.c:1464-1485) and the `rewritten` list it feeds are not
+        // ported. Naming them is the point: the previous wording claimed `git am`
+        // itself was missing, which is false — a plain `git am` here reproduces
+        // stock's commit ids byte for byte.
         if branch_base != Some(head_oid) {
             bail!(
-                "replaying {} commit(s) with the apply backend needs `git am`-style patch \
-                 application, which is not ported",
+                "replaying {} commit(s) with the apply backend is not ported: it needs \
+                 `git format-patch --cherry-pick` (unrecognized here) piped into \
+                 `git am --rebasing` (refused: `parse_mail_rebase` and the `rewritten` \
+                 list are unported). Use the merge backend (`--merge`, the default)",
                 replay_range.len()
             );
         }
@@ -1893,6 +1970,7 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
                 verbose: flags & VERBOSE != 0,
                 reschedule_failed_exec: reschedule,
                 signoff,
+                trailers: trailers.clone(),
                 rerere_autoupdate,
             },
             onto_spec: &onto_spec,
@@ -1948,6 +2026,11 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
 
     // ... replays each commit onto the growing tip, ...
     let mut tip = onto_oid;
+    // `record_in_rewritten()`'s payload for the exact-replay shape. The sequencer
+    // accumulates the same `<old> <new>` pairs in `$state_dir/rewritten-list`;
+    // this path has no state directory to keep them in (it never stops), so the
+    // list is built in memory and handed to the same hook at the end.
+    let mut rewritten_pairs: Vec<u8> = Vec::new();
     if exact_replay {
         // One `now` for the whole run: git caches `ident_default_date()` per
         // process, so every commit `--ignore-date` restamps gets one value.
@@ -1988,8 +2071,17 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
                 committer.time = author.time;
             }
 
-            // `do_pick_commit()`: `if (opts->signoff) append_signoff(&msgbuf, 0, 0)`.
-            let message = sign_off(&committer, signoff, &step.message)?;
+            // `do_pick_commit()` (sequencer.c:2433-2437):
+            //
+            // ```c
+            // if (opts->signoff && !is_fixup(command))
+            //         append_signoff(&ctx->message, 0, 0);
+            // if (opts->trailer_args.nr && !is_fixup(command))
+            //         amend_strbuf_with_trailers(&ctx->message, &opts->trailer_args);
+            // ```
+            //
+            // An exact replay only ever picks, so neither `is_fixup` guard fires.
+            let message = apply_trailers(sign_off(&committer, signoff, &step.message)?, &trailers)?;
 
             let new = repo
                 .write_object(&gix::objs::Commit {
@@ -2008,6 +2100,14 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
                 &gix::reference::log::message(&format!("{} (pick)", reflog_action()), step.message.as_bstr(), 1)
                     .to_string(),
             )?;
+            // `try_to_commit()`'s `post-commit` (sequencer.c:1697). `git am`,
+            // which is what the apply backend replays through, does not run it
+            // in rebasing mode — measured against stock, whose `rebase --apply`
+            // fires none.
+            if !apply_backend {
+                run_commit_hooks(&repo, None, new);
+            }
+            rewritten_pairs.extend_from_slice(format!("{} {new}\n", step.oid).as_bytes());
             tip = new;
         }
         // `do_pick_commit()` runs every pick through merge-ort, and
@@ -2031,6 +2131,16 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
             if let Some(last) = plan.last() {
                 crate::merge_apply::write_auto_merge(&repo, last.tree)?;
             }
+        }
+        // The apply backend runs the hook from inside `git am`
+        // (builtin/am.c:1930-1934), which is over before `run_am()` calls
+        // `move_to_original_branch()` — so the hook sees a still-detached `HEAD`
+        // and the branch still on its pre-rebase tip. The merge backend runs it
+        // from `pick_commits()`'s tail, after the branch has been re-pointed.
+        // Both were measured; a hook that reads refs can tell them apart, so the
+        // two calls are placed separately rather than merged.
+        if apply_backend {
+            rewritten::post_rewrite(&repo, &rewritten_pairs);
         }
     } else if apply_backend {
         println!("Fast-forwarded {branch_name} to {onto_spec}.");
@@ -2075,6 +2185,13 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
 
     if flags & VERBOSE != 0 {
         verbose_replay_diffstat(head_oid, tip)?;
+    }
+
+    // `pick_commits()`'s tail order (sequencer.c:5190-5210): the `post-rewrite`
+    // hook runs after the branch has been re-pointed and `HEAD` re-attached, and
+    // before the autostash is restored and the summary line printed.
+    if !apply_backend {
+        rewritten::post_rewrite(&repo, &rewritten_pairs);
     }
 
     // The single-shot rebase completed; re-apply the autostash onto the new tip
@@ -2145,6 +2262,7 @@ fn first_parent_plan(
         };
         let parent = parent.detach();
         plan.push(Replay {
+            oid: cur,
             tree: commit.tree_id()?.detach(),
             parent_tree: repo.find_commit(parent)?.tree_id()?.detach(),
             message: commit.message_raw()?.to_owned(),
@@ -2279,18 +2397,169 @@ fn peel_to_commit(repo: &gix::Repository, spec: &str) -> Option<ObjectId> {
     Some(id.object().ok()?.peel_to_commit().ok()?.id)
 }
 
-/// True when `name` names a hook git would actually run.
-#[allow(dead_code)] // port helper retained for the hook-dispatch path
-fn hook_is_runnable(repo: &gix::Repository, name: &str) -> bool {
-    let path = repo.common_dir().join("hooks").join(name);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::metadata(&path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+/// `try_to_commit()`'s tail (sequencer.c:1697-1699) — the hooks every commit the
+/// sequencer writes *in process* still owes:
+///
+/// ```c
+/// run_commit_hook(0, r->index_file, NULL, "post-commit", NULL);
+/// if (flags & AMEND_MSG)
+///         commit_post_rewrite(r, current_head, oid);
+/// ```
+///
+/// This port writes those commit objects itself rather than re-entering
+/// `git commit`, so without this the hooks that `porcelain::commit` would have
+/// run never fire: a merge-backend rebase silently skipped `post-commit` for
+/// every replayed commit, and `post-rewrite amend` for every `fixup`/`squash`.
+/// `amended` is git's `current_head`, i.e. the commit `AMEND_MSG` replaced —
+/// `None` for a fresh commit, which is what suppresses the `amend` half.
+///
+/// Both are notification hooks: their exit status is dropped, exactly as
+/// `run_commit_hook()`'s and `run_rewrite_hook()`'s are at this call site.
+fn run_commit_hooks(repo: &gix::Repository, amended: Option<ObjectId>, new: ObjectId) {
+    let _ = crate::hooks::run(repo, "post-commit", &[], None);
+    if let Some(old) = amended {
+        let payload = format!("{old} {new}\n");
+        let _ = crate::hooks::run(repo, "post-rewrite", &["amend"], Some(payload.as_bytes()));
     }
-    #[cfg(not(unix))]
-    {
-        path.is_file()
+}
+
+/// `peek_command()` (sequencer.c:4647-4656): the first instruction at or after
+/// `at` that actually does something — `noop`, `drop` and comments are skipped —
+/// or `None` when the sheet has nothing left.
+///
+/// Callers only ever ask `is_fixup()` of the answer, and `is_fixup(-1)` is false,
+/// so `None` behaves like "not a fixup".
+fn peek_command(list: &todo::List, at: usize) -> Option<todo::Cmd> {
+    list.items[at.min(list.items.len())..]
+        .iter()
+        .map(|i| i.cmd)
+        .find(|c| !c.is_noop())
+}
+
+/// `do_pick_commit()`'s trailer half (sequencer.c:2436-2437):
+///
+/// ```c
+/// if (opts->trailer_args.nr && !is_fixup(command))
+///         amend_strbuf_with_trailers(&ctx->message, &opts->trailer_args);
+/// ```
+///
+/// Returns `message` untouched when no `--trailer` was given, so every call site
+/// can apply it unconditionally the way the C tests `opts->trailer_args.nr`.
+fn apply_trailers(message: BString, trailers: &[String]) -> Result<BString> {
+    if trailers.is_empty() {
+        return Ok(message);
+    }
+    Ok(BString::from(super::interpret_trailers::amend_with_trailers(
+        &message, trailers,
+    )?))
+}
+
+/// `$state_dir/rewritten-pending` and `$state_dir/rewritten-list` — the
+/// `post-rewrite` payload a merge-backend rebase accumulates as it runs
+/// (sequencer.c:156-163).
+///
+/// The two files exist because a fixup/squash chain rewrites several old commits
+/// into one new one: each member's *old* id is appended to `rewritten-pending`
+/// while the chain is still open, and only once the next instruction is not a
+/// fixup is the whole pending set paired with the single `HEAD` the chain
+/// produced and moved to `rewritten-list`. Keeping them on disk (rather than in
+/// this process) is what makes a conflict stop, `--continue` and `--skip` carry
+/// the mapping across invocations, exactly as git does.
+mod rewritten {
+    use super::*;
+
+    /// `record_in_rewritten()` (sequencer.c:2188-2201): remember `oid` as
+    /// rewritten, and — unless the next instruction is a `fixup`/`squash`, which
+    /// would meld into the same new commit — pair the whole pending set with the
+    /// commit `HEAD` now names.
+    pub(super) fn record(repo: &gix::Repository, dir: &std::path::Path, oid: ObjectId, next_is_fixup: bool) {
+        let Ok(mut out) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("rewritten-pending"))
+        else {
+            // `fopen_or_warn()` returning NULL: git warns and gives up on this
+            // one entry rather than failing the rebase.
+            eprintln!(
+                "warning: unable to access '{}'",
+                dir.join("rewritten-pending").display()
+            );
+            return;
+        };
+        use std::io::Write;
+        let _ = writeln!(out, "{oid}");
+        drop(out);
+        if !next_is_fixup {
+            flush(repo, dir);
+        }
+    }
+
+    /// `flush_rewritten_pending()` (sequencer.c:2163-2186): every pending old id
+    /// becomes a `<old> <new>` line naming the current `HEAD`, appended to
+    /// `rewritten-list`; the pending file is then removed.
+    ///
+    /// Silently does nothing when the pending file is absent or `HEAD` cannot be
+    /// read — the C's three `&&`-joined conditions.
+    pub(super) fn flush(repo: &gix::Repository, dir: &std::path::Path) {
+        let Ok(buf) = std::fs::read_to_string(dir.join("rewritten-pending")) else {
+            return;
+        };
+        if buf.is_empty() {
+            return;
+        }
+        let Ok(new) = repo.head_id() else { return };
+        let Ok(mut out) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("rewritten-list"))
+        else {
+            return;
+        };
+        use std::io::Write;
+        // `while (*bol) { eol = strchrnul(bol, '\n'); … }` — a trailing newline
+        // ends the walk rather than producing an empty final entry.
+        for old in buf.split('\n').filter(|l| !l.is_empty()) {
+            let _ = writeln!(out, "{old} {}", new.detach());
+        }
+        drop(out);
+        let _ = std::fs::remove_file(dir.join("rewritten-pending"));
+    }
+
+    /// `pick_commits()`'s tail (sequencer.c:5190-5207): flush what is still
+    /// pending, then — only if the resulting list has something in it — copy
+    /// notes for the rewrite and run the `post-rewrite` hook with `rebase` as its
+    /// argument and the list on stdin.
+    ///
+    /// The hook's exit status is deliberately dropped: `run_hooks_opt()`'s return
+    /// value is not assigned at the call site, so a `post-rewrite` that fails
+    /// does not fail the rebase (measured against stock: a hook exiting 3 still
+    /// leaves `git rebase` at 0).
+    pub(super) fn run_post_rewrite_hook(repo: &gix::Repository, dir: &std::path::Path) {
+        flush(repo, dir);
+        let path = dir.join("rewritten-list");
+        let Ok(list) = std::fs::read(&path) else { return };
+        if list.is_empty() {
+            return;
+        }
+        post_rewrite(repo, &list);
+    }
+
+    /// The hook call itself, shared with the exact-replay finish, which rewrites
+    /// commits without ever building a `$state_dir` to keep the list in.
+    ///
+    /// `hook_opt.path_to_stdin = rebase_path_rewritten_list()` — the payload is
+    /// the file's bytes on the hook's stdin, one `<old> <new>` pair per line,
+    /// with `rebase` as `$1`.
+    pub(super) fn post_rewrite(repo: &gix::Repository, payload: &[u8]) {
+        if payload.is_empty() {
+            return;
+        }
+        // git shells out to `git notes copy --for-rewrite=rebase` just before
+        // this and explicitly ignores the result ("we don't care if this copying
+        // failed"). Nothing in this port rewrites notes, so the step is a no-op
+        // rather than a divergence: with no `notes.rewriteRef` configured stock
+        // copies nothing either.
+        let _ = crate::hooks::run(repo, "post-rewrite", &["rebase"], Some(payload));
     }
 }
 
@@ -2404,6 +2673,11 @@ struct RebaseState {
     /// `$state_dir/signoff`, whose mere presence also re-implies `REBASE_FORCE`
     /// on `--continue`.
     signoff: bool,
+    /// `--trailer <t>` (repeatable): every replayed commit's message is run
+    /// through `amend_strbuf_with_trailers()` with these arguments. git records
+    /// them in `$state_dir/trailer`, one per line, and `read_trailers()`
+    /// (sequencer.c:3168-3193) reads them back on `--continue`.
+    trailers: Vec<String>,
     /// `opts.allow_rerere_auto` — what [`Sequencer::stop_for_conflict`] passes to
     /// `repo_rerere()`. `Some(true)` stages a replayed resolution, `Some(false)`
     /// leaves it unstaged, `None` defers to `rerere.autoupdate`. git records it
@@ -2446,6 +2720,19 @@ fn write_basic_state(repo: &gix::Repository, st: &RebaseState) -> Result<()> {
         std::fs::write(dir.join("signoff"), b"--signoff")?;
     } else {
         let _ = std::fs::remove_file(dir.join("signoff"));
+    }
+    // `save_opts()` (sequencer.c:3356-3363): one argument per line, each with a
+    // trailing newline, and no file at all when none were given — which is what
+    // makes `read_trailers()`'s `errno == ENOENT` arm the "no `--trailer`" case.
+    if st.trailers.is_empty() {
+        let _ = std::fs::remove_file(dir.join("trailer"));
+    } else {
+        let mut body = String::new();
+        for t in &st.trailers {
+            body.push_str(t);
+            body.push('\n');
+        }
+        std::fs::write(dir.join("trailer"), body)?;
     }
     match st.rerere_autoupdate {
         Some(true) => std::fs::write(
@@ -2494,6 +2781,7 @@ fn read_basic_state(repo: &gix::Repository) -> Result<RebaseState> {
         verbose: dir.join("verbose").exists(),
         reschedule_failed_exec: dir.join("reschedule-failed-exec").exists(),
         signoff: dir.join("signoff").exists(),
+        trailers: read_trailers(&dir)?,
         // `read_oneliner(…, READ_ONELINER_SKIP_IF_EMPTY)` followed by an exact
         // match on the flag as spelled: anything else leaves the option unset.
         rerere_autoupdate: match read("allow_rerere_autoupdate").as_deref() {
@@ -2502,6 +2790,46 @@ fn read_basic_state(repo: &gix::Repository) -> Result<RebaseState> {
             _ => None,
         },
     })
+}
+
+/// `read_trailers()` (sequencer.c:3168-3193) — the `--trailer` arguments a
+/// stopped rebase saved, read back so `--continue` keeps applying them.
+///
+/// ```c
+/// len = strbuf_read_file(buf, rebase_path_trailer(), 0);
+/// if (len > 0) {
+///         while ((nl = strchr(p, '\n'))) {
+///                 *nl = '\0';
+///                 if (!*p) return error(_("trailers file contains empty line"));
+///                 strvec_push(&opts->trailer_args, p);
+///                 p = nl + 1;
+///         }
+/// } else if (!len) return error(_("trailers file is empty"));
+/// else if (errno != ENOENT) return error(_("cannot read trailers files"));
+/// ```
+///
+/// Only complete lines are taken (a trailing fragment with no `\n` is ignored,
+/// as the C's `while (strchr(p, '\n'))` is); a present-but-empty file and an
+/// embedded blank line are both errors, while a missing file simply means no
+/// `--trailer` was given.
+fn read_trailers(dir: &std::path::Path) -> Result<Vec<String>> {
+    let body = match std::fs::read_to_string(dir.join("trailer")) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => bail!("cannot read trailers files: {e}"),
+    };
+    if body.is_empty() {
+        bail!("trailers file is empty");
+    }
+    let mut out = Vec::new();
+    for line in body.split_inclusive('\n') {
+        let Some(line) = line.strip_suffix('\n') else { break };
+        if line.is_empty() {
+            bail!("trailers file contains empty line");
+        }
+        out.push(line.to_string());
+    }
+    Ok(out)
 }
 
 /// The commit a stopped rebase was applying (`$state_dir/stopped-sha`), or
@@ -2973,6 +3301,21 @@ fn rebase_continue(repo: &gix::Repository, skip: bool) -> Result<ExitCode> {
     let mut seq = Sequencer::new(repo, st)?;
     seq.load_fixup_state()?;
 
+    // ```c
+    // } else if (file_exists(rebase_path_stopped_sha())) {
+    //         if (read_oneliner(&buf, rebase_path_stopped_sha(), READ_ONELINER_SKIP_IF_EMPTY) &&
+    //             !get_oid_hex(buf.buf, &oid))
+    //                 record_in_rewritten(&oid, peek_command(&todo_list, 0));
+    // }
+    // ```
+    // (sequencer.c:5505-5514). The instruction that stopped has already been
+    // moved to `done`, so the offset is 0 — the *next* thing to run. C reads the
+    // file after `commit_staged_changes()`, which never removes it; this port's
+    // `commit_staged_changes` does, and `--skip` removes it too, so the id is
+    // captured here and recorded once the commit that replaces it exists.
+    let stopped = read_stopped_sha(repo);
+    let next_is_fixup = peek_command(&list, 0).is_some_and(|c| c.is_fixup());
+
     if skip {
         // Discard the stopped instruction's half-applied work: restore the
         // worktree and index to the tip the rebase had reached.
@@ -2992,6 +3335,10 @@ fn rebase_continue(repo: &gix::Repository, skip: bool) -> Result<ExitCode> {
         let _ = std::fs::remove_file(repo.git_dir().join("AUTO_MERGE"));
     } else if let Some(code) = seq.commit_staged_changes()? {
         return Ok(code);
+    }
+
+    if let Some(oid) = stopped {
+        rewritten::record(repo, &dir, oid, next_is_fixup);
     }
 
     seq.refresh_index()?;
@@ -3227,20 +3574,53 @@ impl<'r> Sequencer<'r> {
                 | todo::Cmd::Reword
                 | todo::Cmd::Fixup
                 | todo::Cmd::Squash => {
-                    // `is_final_fixup()`: the last member of a fixup/squash
-                    // chain is the one that cleans the combined message up.
-                    let next_is_fixup = list
-                        .items
-                        .get(i + 1)
-                        .is_some_and(|n| n.cmd.is_fixup());
+                    // `is_final_fixup()` (sequencer.c:4632-4645): the last member
+                    // of a fixup/squash chain is the one that cleans the combined
+                    // message up. Both it and `peek_command()` look past `noop`,
+                    // `drop` and comment lines, so a comment between a `fixup` and
+                    // the next `pick` does not end the chain.
+                    let next_is_fixup =
+                        peek_command(&list, i + 1).is_some_and(|c| c.is_fixup());
                     let final_fixup = item.cmd.is_fixup() && !next_is_fixup;
-                    self.pick_one_commit(&item, final_fixup)?
+                    let step = self.pick_one_commit(&item, final_fixup)?;
+                    // ```c
+                    // if (is_rebase_i(opts) && !res)
+                    //         record_in_rewritten(&item->commit->object.oid,
+                    //                             peek_command(todo_list, 1));
+                    // ```
+                    // (sequencer.c:4968-4970). `edit` returns at 4965 before this,
+                    // so its commit is recorded by `--continue` from
+                    // `stopped-sha` instead; every other command records only when
+                    // the pick succeeded, which is what `Step::Next` means here.
+                    if item.cmd != todo::Cmd::Edit && matches!(step, Step::Next) {
+                        if let Some(oid) = item.commit {
+                            rewritten::record(self.repo, &dir, oid, next_is_fixup);
+                        }
+                    }
+                    step
                 }
                 todo::Cmd::Exec => self.do_exec(&item)?,
                 todo::Cmd::Noop | todo::Cmd::Drop | todo::Cmd::Comment => Step::Next,
                 todo::Cmd::Label => self.do_label(&item)?,
                 todo::Cmd::Reset => self.do_reset(&item)?,
-                todo::Cmd::Merge => self.do_merge(&item)?,
+                todo::Cmd::Merge => {
+                    let step = self.do_merge(&item)?;
+                    // ```c
+                    // else if (item->commit)
+                    //         record_in_rewritten(&item->commit->object.oid,
+                    //                             peek_command(todo_list, 1));
+                    // ```
+                    // (sequencer.c:5088-5090): a recreated merge maps its original
+                    // onto the new one, exactly as a pick does.
+                    if matches!(step, Step::Next) {
+                        if let Some(oid) = item.commit {
+                            let next_is_fixup =
+                                peek_command(&list, i + 1).is_some_and(|c| c.is_fixup());
+                            rewritten::record(self.repo, &dir, oid, next_is_fixup);
+                        }
+                    }
+                    step
+                }
                 todo::Cmd::UpdateRef => {
                     self.term_clear_line();
                     anyhow::bail!(
@@ -3389,6 +3769,25 @@ impl<'r> Sequencer<'r> {
         let short = todo::short_name(repo, oid);
         let head = repo.head_id()?.detach();
 
+        // `do_pick_commit()` (sequencer.c:2433-2437) rewrites `ctx->message`
+        // *before* `do_recursive_merge()`, which is what makes the buffer written
+        // to `$state_dir/message` and `MERGE_MSG` on a conflict stop already
+        // carry the sign-off and the trailers — so `--continue` commits them.
+        // Applying them only on the success path (as this did) silently dropped
+        // both from every commit whose pick had to be resolved by hand.
+        //
+        // Both guards are `!is_fixup(command)`: a `fixup`/`squash` contributes to
+        // a message that `update_squash_messages()` owns, and gets its trailers
+        // there instead.
+        let final_message = if item.cmd.is_fixup() {
+            message.clone()
+        } else {
+            apply_trailers(
+                sign_off(&self.committer, self.st.signoff, &message)?,
+                &self.st.trailers,
+            )?
+        };
+
         // `CREATE_ROOT_COMMIT`: while the tip is still the stand-in `<onto>` that
         // `--root` without `--onto` minted, a pick becomes a new *root* commit
         // rather than that stand-in's child.
@@ -3451,7 +3850,7 @@ impl<'r> Sequencer<'r> {
                 oid,
                 &short,
                 &subject,
-                &message,
+                &final_message,
                 Some(&applied.conflicts),
             );
         }
@@ -3537,13 +3936,12 @@ impl<'r> Sequencer<'r> {
         } else {
             std::iter::once(head).collect()
         };
-        // `do_pick_commit()`: `if (opts->signoff) append_signoff(&msgbuf, 0, 0)`.
-        // The reflog entry below still names the original subject, which the
-        // trailer never touches.
-        let signed = sign_off(&self.committer, self.st.signoff, &message)?;
+        // The sign-off and the `--trailer` arguments went on above, before the
+        // merge, so that a conflict stop records them too. The reflog entry below
+        // still names the original subject, which neither touches.
         let new = repo
             .write_object(&gix::objs::Commit {
-                message: signed,
+                message: final_message,
                 tree: applied.tree_id,
                 author,
                 committer: self.committer.clone(),
@@ -3562,10 +3960,21 @@ impl<'r> Sequencer<'r> {
             )
             .to_string(),
         )?;
+        // A plain pick carries no `AMEND_MSG`, so only `post-commit` fires here;
+        // a `reword` adds the `amend` half below, from the `git commit --amend`
+        // it re-enters.
+        run_commit_hooks(repo, None, new);
 
         match item.cmd {
             todo::Cmd::Reword => self.reword(),
-            todo::Cmd::Edit => self.stop_for_edit(new, &short, item),
+            // `error_with_patch(r, commit, …)` (sequencer.c:4965) is handed
+            // `item->commit` — the commit being *replayed*, not the one the pick
+            // just wrote. `make_patch()` puts that id in `stopped-sha` and
+            // `REBASE_HEAD`, which is what `--continue` records as the "old" half
+            // of the `post-rewrite` pair and what `git show REBASE_HEAD` resolves.
+            // Passing `new` here made both name the replacement, so the pair came
+            // out as `<new> <new>` and `REBASE_HEAD` pointed at the wrong commit.
+            todo::Cmd::Edit => self.stop_for_edit(oid, &short, item),
             _ => Ok(Step::Next),
         }
     }
@@ -3815,6 +4224,10 @@ impl<'r> Sequencer<'r> {
             )
             .to_string(),
         )?;
+        // `do_merge()` concludes through `run_git_commit()` (sequencer.c:4394),
+        // i.e. a real `git commit`, which runs `post-commit`. It carries no
+        // `--amend`, so there is no `post-rewrite amend` half.
+        run_commit_hooks(repo, None, new);
         Ok(Step::Next)
     }
 
@@ -3897,6 +4310,10 @@ impl<'r> Sequencer<'r> {
                 })?
                 .detach();
             set_head(repo, Target::Object(new), &format!("{} (fixup)", reflog_action()))?;
+            // `flags |= AMEND_MSG` (sequencer.c:2414), so `try_to_commit()` runs
+            // `commit_post_rewrite()` as well as `post-commit`: every member of a
+            // fixup chain reports the commit it replaced.
+            run_commit_hooks(repo, Some(head), new);
             return Ok(Step::Next);
         }
 
@@ -3921,6 +4338,7 @@ impl<'r> Sequencer<'r> {
                 })?
                 .detach();
             set_head(repo, Target::Object(new), &format!("{} (fixup)", reflog_action()))?;
+            run_commit_hooks(repo, Some(head), new);
         } else {
             let squash_msg = repo.git_dir().join("SQUASH_MSG");
             std::fs::copy(dir.join("message-squash"), &squash_msg)?;
@@ -4050,13 +4468,42 @@ impl<'r> Sequencer<'r> {
                 &body[..commented_len],
                 comment.as_bytes(),
             ));
+            // `fixup_off = buf->len;` — the offset `message-fixup` is cut from
+            // below, taken before the body is appended so the trailers appended
+            // to `buf` afterwards land inside that cut.
+            let fixup_off = buf.len();
             let rest = &body[commented_len..];
             buf.extend_from_slice(rest);
             if replaces && !self.seen_squash() {
+                // `append_squash_message()` (sequencer.c:2028-2039):
+                //
+                // ```c
+                // /* fixup -C after squash behaves like squash */
+                // if (is_fixup_flag(command, flag) && !seen_squash(ctx)) {
+                //         /*
+                //          * We're replacing the commit message so we need to
+                //          * append any trailers if the user requested
+                //          * '--signoff' or '--trailer'.
+                //          */
+                //         if (opts->signoff)
+                //                 append_signoff(buf, 0, 0);
+                //         if (opts->trailer_args.nr)
+                //                 amend_strbuf_with_trailers(buf, &opts->trailer_args);
+                // ```
+                //
+                // This is the one place a `fixup`/`squash` gets them: the guards
+                // in `do_pick_commit()` skip every fixup, so a `fixup -C` — which
+                // *replaces* the message rather than melding into one that
+                // already carries them — would otherwise lose both.
+                let signed = sign_off(&self.committer, self.st.signoff, &BString::from(buf))?;
+                buf = apply_trailers(signed, &self.st.trailers)?.into();
                 // `fixup -C` outside a squash chain replaces the message
                 // outright; the chain's end takes this alone, minus the blank
                 // lines the commented-out subject left behind.
-                std::fs::write(dir.join("message-fixup"), todo::skip_blank_lines(rest))?;
+                std::fs::write(
+                    dir.join("message-fixup"),
+                    todo::skip_blank_lines(&buf[fixup_off..]),
+                )?;
             } else {
                 let _ = std::fs::remove_file(dir.join("message-fixup"));
             }
@@ -4115,11 +4562,36 @@ impl<'r> Sequencer<'r> {
         // (sequencer.c:2309-2310). `MERGE_MSG` is what a bare `git commit` made
         // during the stop picks up, so without it the resolved pick loses the
         // message it was replaying.
+        //
+        // `append_conflicts_hint()` (sequencer.c:721-744) builds it with
+        // `comment_line_str`, not a literal `#`:
+        //
+        // ```c
+        // strbuf_addch(msgbuf, '\n');
+        // strbuf_commented_addf(msgbuf, comment_line_str, "Conflicts:\n");
+        // …
+        //         strbuf_commented_addf(msgbuf, comment_line_str, "\t%s\n", ce->name);
+        // ```
+        //
+        // `strbuf_commented_addf` puts a space after the prefix unless the line
+        // starts with `\n` or `\t` (`add_lines()`, strbuf.c:374-391), which is
+        // why the header is `<c> Conflicts:` while each path is `<c>\t<path>`.
+        //
+        // Hardcoding `#` here was committed-data corruption, not cosmetics: the
+        // block is stripped from the final message by the comment cleanup, which
+        // strips `core.commentChar` — so under any other setting the whole
+        // `# Conflicts:` block survived `--continue` into the commit object.
+        // Measured against stock under `core.commentChar = |`, `//`, `;;;` and
+        // `core.commentString = ;`.
+        let comment = todo::comment_prefix(self.repo);
         let hinted = conflicts.map(|paths| {
             let mut out = message.to_vec();
-            out.extend_from_slice(b"\n# Conflicts:\n");
+            out.push(b'\n');
+            out.extend_from_slice(comment.as_bytes());
+            out.extend_from_slice(b" Conflicts:\n");
             for path in paths {
-                out.extend_from_slice(b"#\t");
+                out.extend_from_slice(comment.as_bytes());
+                out.push(b'\t');
                 out.extend_from_slice(&path[..]);
                 out.push(b'\n');
             }
@@ -4269,6 +4741,13 @@ impl<'r> Sequencer<'r> {
             verbose_replay_diffstat(self.st.orig_head, tip)?;
         }
         self.delete_rewritten_refs();
+        // `pick_commits()`'s tail (sequencer.c:5190-5207): flush whatever the last
+        // instruction left pending, then hand the accumulated `<old> <new>` list
+        // to the `post-rewrite` hook. It runs after the branch has been re-pointed
+        // and before the autostash is restored, and its exit status is ignored.
+        // This has to precede the state directory going away — the list lives in
+        // it.
+        rewritten::run_post_rewrite_hook(repo, &rebase_merge_dir(repo));
         let _ = std::fs::remove_dir_all(rebase_merge_dir(repo));
         if let Some(oid) = self.autostash {
             crate::porcelain::stash::apply_autostash(repo, oid, self.st.quiet)?;
@@ -4396,6 +4875,18 @@ fn skip_unnecessary_picks(
             list.to_bytes(repo, Some(i), 0),
         )?;
         list.items.drain(..i);
+        // ```c
+        // if (is_fixup(peek_command(todo_list, 0)))
+        //         record_in_rewritten(base_oid, peek_command(todo_list, 0));
+        // ```
+        // (sequencer.c:6429-6430). A fixup at the head of what is left will meld
+        // into the commit the skipped picks fast-forwarded to, so that commit is
+        // one of the ones being rewritten — even though no instruction picked it.
+        // The record stays pending (the next command is a fixup by construction),
+        // so it is paired with whatever the chain produces.
+        if peek_command(list, 0).is_some_and(|c| c.is_fixup()) {
+            rewritten::record(repo, &rebase_merge_dir(repo), *base, true);
+        }
     }
     Ok(())
 }

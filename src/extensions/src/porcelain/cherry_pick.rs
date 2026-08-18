@@ -150,9 +150,27 @@
 //! `-x`, `-m`/`--mainline`, `--ff`/`--no-ff`, `--allow-empty`,
 //! `--allow-empty-message`, `--empty=stop|drop|keep`,
 //! `--keep-redundant-commits`, `-s`/`--signoff`, `--cleanup=<mode>`,
-//! `--no-edit`, `--commit`, the `--no-` forms of the above, `--quit`, and the
-//! no-ops `-r`, `--no-gpg-sign` (we never sign) and `--rerere-autoupdate`
-//! (rerere only participates in conflicts, which are refused anyway).
+//! `-e`/`--edit`, `--no-edit`, `--commit`, `-S`/`--gpg-sign[=<key-id>]` and
+//! `--no-gpg-sign`, the `--no-` forms of the above, `--quit`, and the no-ops `-r`
+//! and `--rerere-autoupdate` (rerere only participates in conflicts, which are
+//! refused anyway).
+//!
+//! `-S` carries the same three-state `opts->gpg_sign` git does: absent, empty
+//! (`-S` alone, or `commit.gpgSign` — which `sequencer_init_config()` reads before
+//! the command line, so the flag overrides it), or a key id. It reaches
+//! `commit_tree_extended()` on the in-process path (sequencer.c:1685) and is
+//! respelled as `-S<key>` for the editor path (sequencer.c:1157-1160), and
+//! `save_opts()` persists it as `options.gpg-sign`. A `--continue` after a stopped
+//! pick is signed by `commit.gpgSign` alone, because `continue_single_pick()`
+//! spawns `git commit` with no `-S` (sequencer.c:5232-5257).
+//!
+//! `-e` is not a cleanup switch: `should_edit()` (sequencer.c:2203-2212) is
+//! *never* true for a cherry-pick unless it was given — the tty default belongs
+//! to revert alone — and when it is, `do_commit()` stops writing the object here
+//! and hands the commit to `git commit -e` (sequencer.c:1728,1750-1754) through
+//! [`super::replay_commit`]. `CHERRY_PICK_HEAD` is written first so the child
+//! recovers the original author, the `You are currently cherry-picking commit …`
+//! status block, and the cherry-pick warning, exactly as stock's does.
 //!
 //! ## Revision arguments
 //!
@@ -171,7 +189,6 @@
 //! `--filter=<spec>` — and all of `handle_revision_opt()`'s walk options are
 //! not, so those reach stage 5 as unknown options where stock walks them.
 //!
-//! Refused with a precise message: `-e`/`--edit` and `-S`.
 //! The `-X` values `gix-merge` cannot express — the whitespace family,
 //! `subtree` and `renormalize` — are refused by the shared
 //! `merge_tree::StrategyOptions`, at the point the merge would have used them.
@@ -314,8 +331,9 @@ enum Empty {
     Keep,
 }
 
-/// `--cleanup` modes. `Default` resolves to `Whitespace` here because it only
-/// differs from it when an editor runs, and `--edit` is refused.
+/// `--cleanup` modes. `Default` behaves as `Strip`: `builtin/revert.c:189`
+/// resolves the argument with `get_cleanup_mode(cleanup_arg, 1)`, and the `1` is
+/// a literal, so whether an editor runs never enters into it.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Cleanup {
     Verbatim,
@@ -399,7 +417,13 @@ struct Opts<'a> {
     /// `-X`/`--strategy-option` values in order (`OPT_STRVEC`, so they
     /// accumulate and `--no-strategy-option` clears the whole list).
     xopts: Vec<&'a str>,
-    gpg_sign: bool,
+    /// `opts->gpg_sign`, git's one `char *` with three states: `None` is NULL
+    /// (do not sign), `Some("")` is what a bare `-S` and `commit.gpgSign` leave
+    /// (`.defval = ""`, builtin/revert.c:144), and `Some(key)` is `-S<key>`.
+    gpg_sign: Option<&'a str>,
+    /// Whether either spelling of the flag appeared, so `commit.gpgSign` applies
+    /// only as a default — `sequencer_init_config()` runs before `parse_args()`.
+    gpg_sign_given: bool,
     /// `--keep-redundant-commits` / `--no-keep-redundant-commits` on their own
     /// (`OPT_BOOL` on `opts->keep_redundant_commits`), kept apart from
     /// [`Opts::empty`] because `verify_opt_compatible` reads the two separately:
@@ -581,8 +605,17 @@ fn parse<'a>(args: &'a [String]) -> Result<Opts<'a>, ExitCode> {
             // `OPT_STRVEC`'s unset arm is `strvec_clear()`, so the negation drops
             // every `-X` seen so far rather than merely the last one.
             "--no-strategy-option" => o.xopts.clear(),
-            "--gpg-sign" => o.gpg_sign = true,
-            "--no-gpg-sign" => o.gpg_sign = false,
+            // `PARSE_OPT_OPTARG`: a long option takes a value only when it is
+            // attached with `=`, so `--gpg-sign <rev>` signs with the default key
+            // and leaves `<rev>` an operand.
+            "--gpg-sign" => {
+                o.gpg_sign = Some(inline.unwrap_or(""));
+                o.gpg_sign_given = true;
+            }
+            "--no-gpg-sign" => {
+                o.gpg_sign = None;
+                o.gpg_sign_given = true;
+            }
 
             "--commit" => o.no_commit = false,
             "--no-commit" => o.no_commit = true,
@@ -658,9 +691,12 @@ fn parse<'a>(args: &'a [String]) -> Result<Opts<'a>, ExitCode> {
                             break;
                         }
                         // `-S` takes an *optional* key id, so a bare `-S` never
-                        // reaches into the next argument.
+                        // reaches into the next argument; anything attached to it
+                        // — `-Skeyid`, and the rest of a cluster like `-nSkeyid`
+                        // — is the key.
                         b'S' => {
-                            o.gpg_sign = true;
+                            o.gpg_sign = Some(attached.unwrap_or(""));
+                            o.gpg_sign_given = true;
                             break;
                         }
                         // parse_options_step() tests `internal_help` inside the
@@ -691,7 +727,7 @@ fn parse<'a>(args: &'a [String]) -> Result<Opts<'a>, ExitCode> {
 }
 
 pub fn cherry_pick(args: &[String]) -> Result<ExitCode> {
-    let opts = match parse(args) {
+    let mut opts = match parse(args) {
         Ok(o) => o,
         Err(code) => return Ok(code),
     };
@@ -746,6 +782,21 @@ pub fn cherry_pick(args: &[String]) -> Result<ExitCode> {
     }
 
     let repo = gix::discover(".")?;
+    // ```c
+    // if (!strcmp(k, "commit.gpgsign")) {
+    //         free(opts->gpg_sign);
+    //         opts->gpg_sign = git_config_bool(k, v) ? xstrdup("") : NULL;
+    //         return 0;
+    // }
+    // ```
+    //
+    // (sequencer.c:302-306.) `sequencer_init_config()` runs before `parse_args()`,
+    // so this is the default that either spelling of `-S` overrides. Skipping it
+    // was a silent divergence rather than a missing flag: a repository configured
+    // to sign got unsigned cherry-picks at exit 0 with no diagnostic.
+    if !opts.gpg_sign_given && repo.config_snapshot().boolean("commit.gpgSign") == Some(true) {
+        opts.gpg_sign = Some("");
+    }
     // The whole sequence (tree build, commit, HEAD move, worktree update) is one
     // logical write; hold the coordinator lock across all of it, like `merge`.
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
@@ -794,13 +845,6 @@ pub fn cherry_pick(args: &[String]) -> Result<ExitCode> {
     // sequencer state is written.
     if picks.is_empty() {
         return Ok(sequencer_failed("empty commit set passed"));
-    }
-
-    if opts.edit {
-        anyhow::bail!("`-e`/`--edit` (editor mode) is not supported");
-    }
-    if opts.gpg_sign {
-        anyhow::bail!("commit signing is not supported");
     }
 
     let head = repo.head()?;
@@ -926,7 +970,9 @@ fn saved_opts<'a>(opts: &'a Opts<'a>, cleanup: Option<Cleanup>) -> crate::sequen
         allow_ff: opts.allow_ff,
         mainline: opts.mainline.unwrap_or(0),
         strategy: opts.strategy,
-        gpg_sign: None,
+        // `save_opts()` writes `options.gpg-sign` only for a set `opts->gpg_sign`
+        // (sequencer.c:3711-3713), so an unsigned sequence records no key at all.
+        gpg_sign: opts.gpg_sign,
         xopts: &opts.xopts,
         allow_rerere_auto: None,
         default_msg_cleanup: cleanup.map(Cleanup::name),
@@ -1132,7 +1178,8 @@ fn pick_one(
     // Only an explicit `--cleanup` rewrites the picked message; without one
     // git carries it across untouched.
     if let Some(mode) = cleanup {
-        message = cleanup_message(&message, mode);
+        let comment = super::commit::comment_prefix(&repo.config_snapshot());
+        message = cleanup_message(&message, mode, &comment);
     }
     if message.trim().is_empty() && !opts.allow_empty_message {
         crate::git_fatal!(
@@ -1386,10 +1433,16 @@ fn pick_one(
     }
 
     // --- empty-result guards -----------------------------------------
+    //
+    // `allow == 1` is what sets `ALLOW_EMPTY` in the commit flags
+    // (sequencer.c:2500-2501), so the same answer has to reach the delegated
+    // `git commit` below as `--allow-empty`.
+    let mut allow_empty_flag = false;
     if tree_id == head_tree {
         let initially_empty = pick_tree == base_tree;
         let action = opts.empty_action();
         let keep = action == Empty::Keep || (initially_empty && opts.allow_empty);
+        allow_empty_flag = keep;
         if !keep {
             // `--empty` governs commits that *became* empty; an initially
             // empty one is only ever kept via `--allow-empty`/`--empty=keep`.
@@ -1412,21 +1465,60 @@ fn pick_one(
         }
     }
 
+    // --- `-e`/`--edit`: hand the commit to `git commit` ----------------
+    //
+    // `do_commit()` writes the object in-process only while neither `EDIT_MSG`
+    // nor `VERIFY_MSG` is set (sequencer.c:1728); an editor sends it to
+    // `run_git_commit()` instead. `CHERRY_PICK_HEAD` is written first because
+    // that is where the child recovers everything the sequencer would otherwise
+    // have supplied — the original author (so the summary keeps its ` Date:`
+    // line), the `You are currently cherry-picking commit …` status block, and
+    // the "It looks like you may be committing a cherry-pick" warning. git writes
+    // it for every committing pick, not just a conflicted one:
+    //
+    // ```c
+    // if ((command == TODO_PICK || command == TODO_REWORD ||
+    //      command == TODO_EDIT) && !opts->no_commit &&
+    //     (res == 0 || res == 1) &&
+    //     refs_update_ref(…, "CHERRY_PICK_HEAD", &commit->object.oid, …))
+    // ```
+    //
+    // (sequencer.c:2474-2479); a landing pick has it removed again by the commit,
+    // which is why the non-editor path above can skip it.
+    if super::replay_commit::should_edit(opts.edit_given, super::replay_commit::Action::Pick) {
+        state.index = update_clean_worktree(&repo, &state.index, tree_id, &should_interrupt)?;
+        std::fs::write(
+            repo.git_dir().join("CHERRY_PICK_HEAD"),
+            format!("{pick_id}\n"),
+        )?;
+        let code = super::replay_commit::run_git_commit(
+            super::replay_commit::Action::Pick,
+            opts.gpg_sign,
+            allow_empty_flag,
+        )?;
+        if code != ExitCode::SUCCESS {
+            return Ok(PickOutcome::Stopped(code));
+        }
+        state.head_id = repo.head_id()?.detach();
+        state.index = repo.open_index()?;
+        return Ok(PickOutcome::Done);
+    }
+
     // --- write the commit, preserving the original author -------------
     let author = pick.author()?;
     let author_ident = format!("{} <{}>", author.name, author.email);
     let author_time = author.time()?;
 
-    let commit = gix::objs::Commit {
-        message: message.clone(),
-        tree: tree_id,
-        author: author.to_owned()?,
-        committer: committer.to_owned()?,
-        encoding: None,
-        parents: std::iter::once(head_id).collect(),
-        extra_headers: Default::default(),
-    };
-    let new_id = repo.write_object(&commit)?.detach();
+    // `commit_tree_extended(msg, ..., opts->gpg_sign, extra)` (sequencer.c:1685).
+    let new_id = super::commit::write_commit_object(
+        &repo,
+        &committer.to_owned()?,
+        &author.to_owned()?,
+        message.as_bstr(),
+        tree_id,
+        vec![head_id],
+        super::commit::sequencer_signer(&repo, opts.gpg_sign).as_ref(),
+    )?;
 
     let reflog = gix::reference::log::message("cherry-pick", message.as_bstr(), 1);
     advance_head(&repo, head_id, new_id, reflog)?;
@@ -1662,7 +1754,8 @@ fn resume_todo(
         cleanup: loaded.default_msg_cleanup.as_deref(),
         strategy: loaded.strategy.as_deref(),
         xopts,
-        gpg_sign: false,
+        gpg_sign: loaded.gpg_sign.as_deref(),
+        gpg_sign_given: true,
         specs: Vec::new(),
         verb: None,
         // Reconstructed from `sequencer/opts`, which records the *effect* of the
@@ -1838,23 +1931,22 @@ fn continue_single_pick(
     // carrying any `-x`/`-s` trailer, plus whatever the user edited in.
     let merge_msg = std::fs::read_to_string(git_dir.join("MERGE_MSG"))
         .unwrap_or_else(|_| pick.message_raw().map(|m| m.to_string()).unwrap_or_default());
-    let mut message: BString = clean_message(&merge_msg).into();
+    let message: BString = clean_message(&merge_msg).into();
 
     let committer = repo
         .committer()
         .ok_or_else(|| anyhow::anyhow!("committer identity is not configured"))??;
     let author = pick.author()?;
-    let commit = gix::objs::Commit {
-        message: std::mem::take(&mut message),
-        tree: tree_id,
-        author: author.to_owned()?,
-        committer: committer.to_owned()?,
-        encoding: None,
-        parents: std::iter::once(head_id).collect(),
-        extra_headers: Default::default(),
-    };
-    let new_id = repo.write_object(&commit)?.detach();
-    let reflog = gix::reference::log::message("cherry-pick", commit.message.as_bstr(), 1);
+    let new_id = super::commit::write_commit_object(
+        repo,
+        &committer.to_owned()?,
+        &author.to_owned()?,
+        message.as_bstr(),
+        tree_id,
+        vec![head_id],
+        super::commit::commit_config_signer(repo).as_ref(),
+    )?;
+    let reflog = gix::reference::log::message("cherry-pick", message.as_bstr(), 1);
     advance_head(repo, head_id, new_id, reflog)?;
     // `sequencer_post_commit_cleanup()`, which is what the child `git commit`
     // runs on its way out: the pseudo-refs always go, the sequencer directory
@@ -1866,7 +1958,7 @@ fn continue_single_pick(
     // `author_date_is_interesting()` true here, because `prepare_to_commit()`
     // set `author_message = "CHERRY_PICK_HEAD"` to reuse the picked author — so
     // the ` Date:` line appears just as it does for a pick that did not stop.
-    let subject = gix::objs::commit::MessageRef::from_bytes(commit.message.as_bstr())
+    let subject = gix::objs::commit::MessageRef::from_bytes(message.as_bstr())
         .summary()
         .to_str_lossy()
         .into_owned();
@@ -1965,22 +2057,37 @@ fn stop_empty(
 /// runs of blank lines collapse to one, and leading/trailing blank lines are
 /// dropped. `strip` additionally removes comment lines, `scissors` truncates at
 /// the scissors marker, and `verbatim` returns the message untouched.
-fn cleanup_message(message: &BString, mode: Cleanup) -> BString {
+///
+/// `default` strips too. `opts->default_msg_cleanup = get_cleanup_mode(cleanup_arg, 1)`
+/// (builtin/revert.c:189) passes the literal `1` for `use_editor`, and
+/// `get_cleanup_mode()` maps a NULL-or-`"default"` argument under `use_editor` to
+/// `COMMIT_MSG_CLEANUP_ALL` (sequencer.c:687-689). Measured: cherry-picking a
+/// commit whose body has a `#` line with `--cleanup=default` drops that line,
+/// with `--cleanup=whitespace` keeps it.
+///
+/// `comment` is `comment_line_str`, which `core.commentChar`/`core.commentString`
+/// moves off `#`.
+fn cleanup_message(message: &BString, mode: Cleanup, comment: &str) -> BString {
     if mode == Cleanup::Verbatim {
         return message.clone();
     }
-    let strip_comments = mode == Cleanup::Strip;
+    let strip_comments = matches!(mode, Cleanup::Strip | Cleanup::Default);
+    let comment = comment.as_bytes();
 
     let mut out: Vec<u8> = Vec::with_capacity(message.len());
     let mut pending_blank = false;
     let mut seen_content = false;
     for line in message.split(|&b| b == b'\n') {
-        // `# ------------------------ >8 ------------------------` and
+        // `<comment> ------------------------ >8 ------------------------` and
         // everything after it is the scissors cut.
-        if mode == Cleanup::Scissors && line.starts_with(b"# ") && line.contains_str(">8") {
+        if mode == Cleanup::Scissors
+            && line.starts_with(comment)
+            && line.get(comment.len()) == Some(&b' ')
+            && line.contains_str(">8")
+        {
             break;
         }
-        if strip_comments && line.first() == Some(&b'#') {
+        if strip_comments && line.starts_with(comment) {
             continue;
         }
         let trimmed = match line.iter().rposition(|b| !b.is_ascii_whitespace()) {

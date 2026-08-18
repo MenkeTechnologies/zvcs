@@ -247,27 +247,54 @@ enum GpgSign {
     On(Option<String>),
 }
 
-/// A resolved gpg signing setup: the program (`gpg.program`, default `gpg`) and
-/// the key (`-S<keyid>` else `user.signingKey`; `None` lets gpg pick its default).
-struct Signer {
-    /// The signing program git would exec — `gpg.program` or plain `gpg`.
-    program: String,
-    /// The key id passed as `-u`, when one is configured or was given.
-    key: Option<String>,
+/// `sign_buffer()`'s backend for this repository, with `-S<keyid>` folded in.
+///
+/// The whole `gpg.format` table lives in [`crate::gitsig::Signer`] — `openpgp`
+/// signs with `gpg.program` / `gpg.openpgp.program` (default `gpg`), `x509` with
+/// `gpg.x509.program` (default `gpgsm`, which `gpg.program` does *not* override),
+/// and `ssh` with `gpg.ssh.program` (default `ssh-keygen`) through an entirely
+/// different argument vector that leaves an `SSH SIGNATURE` block rather than an
+/// armored PGP one. Resolving only `gpg.program` here, as this used to, meant
+/// `git commit -S` under `gpg.format = ssh` ran `gpg -bsa` against an ssh *public
+/// key* and died with `gpg: skipped …: No secret key`.
+///
+/// `sign_buffer(…, signing_key, SIGN_BUFFER_USE_DEFAULT_KEY)` (gpg-interface.c:977)
+/// uses the caller's key when it is non-empty and falls back to `get_signing_key()`
+/// otherwise, which is exactly what overwriting `key` here expresses: `-S<keyid>`
+/// wins over `user.signingKey`, and neither leaves the format's own default in
+/// charge.
+fn resolve_signer(repo: &gix::Repository, key: Option<String>) -> crate::gitsig::Signer {
+    let mut signer = crate::gitsig::Signer::resolve(repo);
+    if let Some(key) = key.filter(|k| !k.is_empty()) {
+        signer.key = Some(key);
+    }
+    signer
 }
 
-impl Signer {
-    /// Resolve the program and key from config, with `key` (from `-S<keyid>`)
-    /// taking precedence over `user.signingKey`, exactly as git does.
-    fn resolve(snap: &gix::config::Snapshot<'_>, key: Option<String>) -> Self {
-        Signer {
-            program: snap
-                .string("gpg.program")
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "gpg".to_string()),
-            key: key.or_else(|| snap.string("user.signingKey").map(|v| v.to_string())),
-        }
-    }
+/// `opts->gpg_sign` as a signing backend, for the sequencer's in-process commit.
+///
+/// `try_to_commit()` hands the field straight to `commit_tree_extended()`
+/// (sequencer.c:1685), whose `sign_commit` parameter is NULL-or-key with exactly
+/// the same three states: absent means do not sign, empty means sign with
+/// `get_signing_key()`'s choice, and a key names one.
+pub(crate) fn sequencer_signer(
+    repo: &gix::Repository,
+    gpg_sign: Option<&str>,
+) -> Option<crate::gitsig::Signer> {
+    gpg_sign.map(|key| resolve_signer(repo, Some(key.to_string())))
+}
+
+/// The signer a plain `git commit` with no `-S` would use: `commit.gpgSign` and
+/// nothing else.
+///
+/// `continue_single_pick()` (sequencer.c:5232-5257) spawns
+/// `git commit [--no-edit --cleanup=strip]` and deliberately pushes **no** `-S`,
+/// unlike `run_git_commit()` two functions up. So a stopped pick that resumes is
+/// signed exactly when the *config* asks for it — the `-S` that started the
+/// sequence does not reach it.
+pub(crate) fn commit_config_signer(repo: &gix::Repository) -> Option<crate::gitsig::Signer> {
+    (repo.config_snapshot().boolean("commit.gpgSign") == Some(true))
+        .then(|| resolve_signer(repo, None))
 }
 
 /// Everything `dry_run_commit()` needs: the report shape plus which index the
@@ -613,7 +640,19 @@ fn is_ancestor(repo: &gix::Repository, ancestor: ObjectId, tip: ObjectId) -> Res
 /// scissors line. `-n`/`--no-verify` and `--verify` toggle the `pre-commit` and
 /// `commit-msg` hooks; `--no-post-rewrite` suppresses the `post-rewrite` hook an
 /// `--amend` otherwise fires. `-S`/`--gpg-sign[=<keyid>]` (`commit.gpgSign`,
-/// `user.signingKey`, `gpg.program`) writes a `gpgsig` header.
+/// `user.signingKey`) writes a `gpgsig` header through [`crate::gitsig::Signer`],
+/// so the whole `gpg.format` table applies: `openpgp` via `gpg.program` or
+/// `gpg.openpgp.program`, `x509` via `gpg.x509.program` (default `gpgsm`), and
+/// `ssh` via `gpg.ssh.program` (default `ssh-keygen`), which produces an
+/// `SSH SIGNATURE` block rather than an armored PGP one.
+///
+/// `post-commit` runs before the `post-rewrite amend` an `--amend` fires, which
+/// is git's order (builtin/commit.c:1966-1970) and matters because each hook can
+/// see what the other left.
+///
+/// `core.commentChar = auto` is honoured: [`adjust_comment_line_char`] re-picks
+/// the comment character against the message body once it exists, so a body line
+/// starting with `#` is text rather than something the `strip` cleanup deletes.
 ///
 /// `-p`/`--patch` stages through the hunk selector ([`super::add_patch`]) and
 /// plain `--interactive` through the numbered menu ([`super::add_interactive`]),
@@ -1660,7 +1699,9 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     };
     let snap = repo.config_snapshot();
     let cleanup = resolve_cleanup(cleanup_arg.as_deref(), &snap, use_editor)?;
-    let comment = comment_prefix(&snap);
+    // `auto` is resolved to `#` at config time and only becomes something else
+    // once `prepare_to_commit()` can see the message body, below.
+    let (mut comment, comment_char_is_auto) = comment_prefix_full(&snap);
     // `-v`/`--verbose` (`commit.verbose`) appends the staged diff under a cut line.
     let verbose = verbose.unwrap_or_else(|| snap.boolean("commit.verbose") == Some(true));
     // `--status`/`--no-status`, defaulting to `commit.status` (git's `include_status`).
@@ -1750,6 +1791,21 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
         append_signoff(&mut buf, &ident, ignore_footer, false);
     }
 
+    // ```c
+    // if (fwrite(sb.buf, 1, sb.len, s->fp) < sb.len)
+    //         die_errno(_("could not write commit template"));
+    // if (auto_comment_line_char)
+    //         adjust_comment_line_char(&sb);
+    // ```
+    //
+    // (builtin/commit.c:931-937.) Exactly here: after `-s` has appended its
+    // trailer and before anything commented is added, so the character is chosen
+    // against the user's text alone. It runs whether or not an editor will, since
+    // the cleanup that follows uses the same character.
+    if comment_char_is_auto {
+        comment = adjust_comment_line_char(&buf)?;
+    }
+
     // The commented help + status block, and the `-v` diff below the cut line, go
     // into the editor buffer only — git gates both on `use_editor && include_status`.
     let msg_path = repo.git_dir().join("COMMIT_EDITMSG");
@@ -1771,8 +1827,21 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
         apply_trailers(&msg_path, &trailer_args)?;
     }
 
+    // ```c
+    // if (launch_editor(git_path_commit_editmsg(), NULL, env.v)) {
+    //         fprintf(stderr,
+    //         _("Please supply the message using either -m or -F option.\n"));
+    //         exit(1);
+    // }
+    // ```
+    //
+    // (builtin/commit.c:1124-1127.) The editor's own `error:` line is already on
+    // stderr; this is the hint that follows it, and the status is 1 — not 128.
     if use_editor {
-        launch_editor(&snap, &msg_path)?;
+        if launch_editor(&snap, &msg_path).is_err() {
+            eprintln!("Please supply the message using either -m or -F option.");
+            return Ok(ExitCode::from(1));
+        }
     }
     message = cleanup_message(&std::fs::read_to_string(&msg_path)?, &comment, cleanup, verbose);
 
@@ -1888,25 +1957,32 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
 
     // `-S`/`--gpg-sign[=<keyid>]` (or `commit.gpgSign`) makes the object carry a
     // `gpgsig` header; the key is the flag's, else `user.signingKey`, and the
-    // program `gpg.program`. `None` leaves the untouched `Repository::commit`
-    // fast paths in charge, so an unsigned commit is byte-for-byte as before.
-    let signer: Option<Signer> = match gpg_sign {
+    // program and signature format come from the `gpg.format` backend.
+    // `None` leaves the untouched `Repository::commit` fast paths in charge, so
+    // an unsigned commit is byte-for-byte as before.
+    let signer: Option<crate::gitsig::Signer> = match gpg_sign {
         GpgSign::Off => None,
         GpgSign::Unset if snap.boolean("commit.gpgSign") != Some(true) => None,
-        GpgSign::Unset => Some(Signer::resolve(&snap, None)),
-        GpgSign::On(key) => Some(Signer::resolve(&snap, key)),
+        GpgSign::Unset => Some(resolve_signer(&repo, None)),
+        GpgSign::On(key) => Some(resolve_signer(&repo, key)),
     };
 
-    // git's `reflog_msg`: "commit", "commit (initial)", "commit (amend)",
+    // git's `reflog_msg` (builtin/commit.c:1850-1894): `GIT_REFLOG_ACTION` when
+    // the environment names one — it is read *before* every fallback, so it wins
+    // over all of them — else "commit", "commit (initial)", "commit (amend)",
     // "commit (merge)", "commit (cherry-pick)" or "commit (rebase)". gix derives
     // the first four from the parent count on its own, so only the sequencer's two
     // need to be supplied — and supplying one forces the explicit write path below.
-    let reflog_override: Option<String> = if whence.is_cherry_pick() {
-        Some(format!("commit (cherry-pick): {subject}"))
-    } else if whence.is_rebase() {
-        Some(format!("commit (rebase): {subject}"))
-    } else {
-        None
+    //
+    // The sequencer sets `GIT_REFLOG_ACTION=revert`/`cherry-pick` on the `git
+    // commit` it spawns (sequencer.c:1141), which is what makes an edited revert's
+    // reflog read `revert: Revert "…"` rather than `commit: …`.
+    let reflog_action = std::env::var("GIT_REFLOG_ACTION").ok().filter(|a| !a.is_empty());
+    let reflog_override: Option<String> = match &reflog_action {
+        Some(action) => Some(format!("{action}: {subject}")),
+        None if whence.is_cherry_pick() => Some(format!("commit (cherry-pick): {subject}")),
+        None if whence.is_rebase() => Some(format!("commit (rebase): {subject}")),
+        None => None,
     };
 
     // --- write the commit and advance HEAD -------------------------------
@@ -1922,7 +1998,7 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
             &repo,
             &committer,
             author,
-            &message,
+            message.as_bytes().as_bstr(),
             tree_id,
             parents,
             signer.as_ref(),
@@ -1933,7 +2009,13 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
                 log: gix::refs::transaction::LogChange {
                     mode: gix::refs::transaction::RefLog::AndReference,
                     force_create_reflog: false,
-                    message: format!("commit (amend): {subject}").into(),
+                    // `if (!reflog_msg) reflog_msg = "commit (amend)"`
+                    // (builtin/commit.c:1854-1856): an amend takes the whence-derived
+                    // wording from nowhere, so only `GIT_REFLOG_ACTION` displaces it.
+                    message: match &reflog_action {
+                        Some(action) => format!("{action}: {subject}").into(),
+                        None => format!("commit (amend): {subject}").into(),
+                    },
                 },
                 expected: gix::refs::transaction::PreviousValue::MustExistAndMatch(
                     gix::refs::Target::Object(prev),
@@ -1967,7 +2049,7 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
             &repo,
             &committer,
             &author,
-            &message,
+            message.as_bytes().as_bstr(),
             tree_id,
             parents,
             signer.as_ref(),
@@ -2056,6 +2138,23 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
         super::rerere::repo_rerere(&repo, None)?;
     }
 
+    // ```c
+    // run_commit_hook(use_editor, repo_get_index_file(the_repository),
+    //                 NULL, "post-commit", NULL);
+    // if (amend && !no_post_rewrite) {
+    //         commit_post_rewrite(the_repository, current_head, &oid);
+    // }
+    // ```
+    //
+    // (builtin/commit.c:1966-1970.) The order is load-bearing and was inverted
+    // here: a `post-commit` hook that reads `HEAD` and a `post-rewrite` hook that
+    // consumes the old→new mapping can each observe what the other did, so
+    // running them the other way round changes what both see.
+    //
+    // `post-commit` is a notification hook: it runs after the commit regardless of
+    // `--no-verify`, and its exit status is ignored.
+    let _ = crate::hooks::run(&repo, "post-commit", &[], None);
+
     // `--amend` rewrites a commit, so git notifies `post-rewrite` with the
     // `amend` mode and one `<old-sha1> SP <new-sha1>` line on stdin;
     // `--no-post-rewrite` suppresses it. Its exit status is ignored.
@@ -2065,10 +2164,6 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
             let _ = crate::hooks::run(&repo, "post-rewrite", &["amend"], Some(payload.as_bytes()));
         }
     }
-
-    // `post-commit` is a notification hook: it runs after the commit regardless of
-    // `--no-verify`, and its exit status is ignored.
-    let _ = crate::hooks::run(&repo, "post-commit", &[], None);
 
     // `print_commit_summary()`, skipped by `-q`. It is the last thing before
     // `apply_autostash_ref()`, so the block is exited rather than returned from.
@@ -2924,18 +3019,23 @@ fn resolve_cleanup(
 
 /// Write the commit object, optionally carrying a `gpgsig` header.
 ///
-/// git signs the *unsigned* serialization and then inserts the armored signature
+/// git signs the *unsigned* serialization and then inserts the detached signature
 /// as an extra header, which is exactly what happens here: the object is encoded
-/// once without the header, handed to `gpg -bsa`, and re-encoded with `gpgsig`
-/// first among the extra headers — the slot git writes it in.
-fn write_commit_object(
+/// once without the header, handed to `sign_buffer()`, and re-encoded with
+/// `gpgsig` first among the extra headers — the slot git writes it in. What the
+/// signature looks like is the backend's business: armored PGP for
+/// `openpgp`/`x509`, an `SSH SIGNATURE` block for `ssh`.
+pub(crate) fn write_commit_object(
     repo: &gix::Repository,
     committer: &gix::actor::Signature,
     author: &gix::actor::Signature,
-    message: &str,
+    // A commit message is bytes, not text: `--file`, a picked commit's own
+    // message and a `-m` argument can all be non-UTF-8, and re-encoding one on
+    // the way in would change the object.
+    message: &gix::bstr::BStr,
     tree: ObjectId,
     parents: Vec<ObjectId>,
-    signer: Option<&Signer>,
+    signer: Option<&crate::gitsig::Signer>,
 ) -> Result<ObjectId> {
     let mut commit = gix::objs::Commit {
         tree,
@@ -2949,9 +3049,26 @@ fn write_commit_object(
     if let Some(s) = signer {
         let mut payload = Vec::new();
         gix::objs::WriteTo::write_to(&commit, &mut payload)?;
-        let sig = crate::gitsig::sign(&payload, &s.program, s.key.as_deref()).map_err(|e| {
-            eprintln!("error: gpg failed to sign the data:\n{e}");
-            anyhow::anyhow!("failed to write commit object")
+        // Both backends already carry the whole text of git's own diagnostic —
+        // `sign_buffer_gpg`'s `gpg failed to sign the data:` wrapper around gpg's
+        // status stream (gpg-interface.c:1045) and `sign_buffer_ssh`'s verbatim
+        // relay of ssh-keygen's stderr (gpg-interface.c:1125) — so all that is
+        // left here is the `error: ` prefix and the `die()` on top, which is
+        // `commit_tree_extended`'s failure: `fatal:` at 128, not this port's own
+        // voice at 1. A `Fatal` came from `get_signing_key()` instead, which dies
+        // on the spot with nothing after it.
+        let sig = s.sign(&payload).map_err(|e| match e {
+            // Reported in full already (an invalid `gpg.format`); only the exit
+            // code is left, and `commit_tree_extended`'s `die()` never runs
+            // because git stopped inside the config reader instead.
+            crate::gitsig::SignFailure::Silent => {
+                anyhow::Error::new(crate::fatal::Silent(crate::fatal::EXIT_FATAL))
+            }
+            crate::gitsig::SignFailure::Fatal(m) => crate::fatal::die(m),
+            crate::gitsig::SignFailure::Error(m) => {
+                eprintln!("{}", crate::gitsig::report("error: ", &m));
+                crate::fatal::die("failed to write commit object")
+            }
         })?;
         commit.extra_headers.push(("gpgsig".into(), sig.into()));
     }
@@ -3447,39 +3564,147 @@ fn parse_author_ident(s: &str) -> Result<(String, String)> {
 /// function, so a message can never be cleaned with one prefix and scanned for
 /// trailers with another.
 pub(super) fn comment_prefix(snap: &gix::config::Snapshot<'_>) -> String {
-    let bytes = super::interpret_trailers::comment_string(snap.plumbing());
-    String::from_utf8_lossy(&bytes).into_owned()
+    comment_prefix_full(snap).0
 }
 
-/// Resolve the editor command git would use: `GIT_EDITOR` → `core.editor` →
-/// `$VISUAL` → `$EDITOR`, else `vi`. On a dumb/non-interactive terminal with no
-/// editor configured, git refuses rather than launching a broken editor.
-fn resolve_editor(snap: &gix::config::Snapshot<'_>) -> Result<String> {
-    let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
-    if let Some(e) = env("GIT_EDITOR") {
-        return Ok(e);
+/// [`comment_prefix`] plus git's `auto_comment_line_char` flag, for the one
+/// caller that has to know: `prepare_to_commit()` re-picks the character against
+/// the message body when `auto` is configured.
+fn comment_prefix_full(snap: &gix::config::Snapshot<'_>) -> (String, bool) {
+    let (bytes, auto) = super::interpret_trailers::comment_string_full(snap.plumbing());
+    (String::from_utf8_lossy(&bytes).into_owned(), auto)
+}
+
+/// The candidate list `adjust_comment_line_char()` picks from, in git's order.
+const COMMENT_CHAR_CANDIDATES: &[u8] = b"#;@!$%^&|:";
+
+/// ```c
+/// static void adjust_comment_line_char(const struct strbuf *sb)
+/// {
+///         char candidates[] = "#;@!$%^&|:";
+///         ...
+///         cutoff = sb->len - ignored_log_message_bytes(sb->buf, sb->len);
+///         if (!memchr(sb->buf, candidates[0], sb->len)) { comment_line_str = "#"; return; }
+///         p = sb->buf;
+///         candidate = strchr(candidates, *p);
+///         if (candidate) *candidate = ' ';
+///         for (p = sb->buf; p + 1 < sb->buf + cutoff; p++)
+///                 if ((p[0] == '\n' || p[0] == '\r') && p[1]) {
+///                         candidate = strchr(candidates, p[1]);
+///                         if (candidate) *candidate = ' ';
+///                 }
+///         for (p = candidates; *p == ' '; p++) ;
+///         if (!*p) die(_("unable to select a comment character that is not used\n"
+///                        "in the current commit message"));
+///         comment_line_str = xstrfmt("%c", *p);
+/// }
+/// ```
+///
+/// (builtin/commit.c:700-736.) Under `core.commentChar = auto` this runs against
+/// the message body — after `-s` has appended its trailer, before the status
+/// block is built — and moves the comment character off any candidate the body
+/// already starts a line with. Without it a body line beginning with `#` is
+/// treated as a comment and **deleted** by the `strip` cleanup an editor implies:
+/// content lost at exit 0 with no diagnostic.
+///
+/// Three details that are easy to get wrong. The early return tests for `#`
+/// anywhere in the whole buffer, not only at a line start and not bounded by
+/// `cutoff` — a `#` in the middle of a line is enough to trigger the search. The
+/// very first byte of the buffer counts as a line start even though the loop
+/// below only looks after `\n`/`\r`. And `cutoff` excludes the trailing comment
+/// run `ignored_log_message_bytes()` finds, so a `# Conflicts:` block left by a
+/// stopped merge does not rule its own character out.
+fn adjust_comment_line_char(body: &str) -> Result<String> {
+    let buf = body.as_bytes();
+    if !buf.contains(&COMMENT_CHAR_CANDIDATES[0]) {
+        return Ok((COMMENT_CHAR_CANDIDATES[0] as char).to_string());
+    }
+    let cutoff = buf.len() - ignore_non_trailer(buf);
+    let mut candidates = COMMENT_CHAR_CANDIDATES.to_vec();
+    let mut strike = |c: u8| {
+        if let Some(i) = candidates.iter().position(|&x| x == c) {
+            candidates[i] = b' ';
+        }
+    };
+    if let Some(&first) = buf.first() {
+        strike(first);
+    }
+    for i in 0..cutoff.saturating_sub(1) {
+        if (buf[i] == b'\n' || buf[i] == b'\r') && buf[i + 1] != 0 {
+            strike(buf[i + 1]);
+        }
+    }
+    match candidates.iter().find(|&&c| c != b' ') {
+        Some(&c) => Ok((c as char).to_string()),
+        None => Err(crate::fatal::die(
+            "unable to select a comment character that is not used\n\
+             in the current commit message",
+        )),
+    }
+}
+
+/// `git_editor()` (editor.c:27-46), which is finickier than it looks:
+///
+/// ```c
+/// const char *editor = getenv("GIT_EDITOR");
+/// int terminal_is_dumb = is_terminal_dumb();
+///
+/// if (!editor && editor_program)      editor = editor_program;
+/// if (!editor && !terminal_is_dumb)   editor = getenv("VISUAL");
+/// if (!editor)                        editor = getenv("EDITOR");
+/// if (!editor && terminal_is_dumb)    return NULL;
+/// if (!editor)                        editor = DEFAULT_EDITOR;
+/// ```
+///
+/// Three details this used to get wrong. `getenv` returns non-NULL for an *empty*
+/// variable, so `GIT_EDITOR=` selects the empty editor and fails at the exec —
+/// it does not fall through to `core.editor`. `$VISUAL` is skipped on a dumb
+/// terminal but `$EDITOR` is not. And the only thing that makes git give up is a
+/// dumb `TERM`: whether stdin is a terminal never enters into it, so a redirected
+/// stdin still gets `vi`.
+///
+/// `None` is git's NULL, which `launch_specified_editor()` reports as
+/// "Terminal is dumb, but EDITOR unset".
+fn resolve_editor(snap: &gix::config::Snapshot<'_>) -> Option<String> {
+    let dumb = is_terminal_dumb();
+    if let Some(e) = std::env::var("GIT_EDITOR").ok() {
+        return Some(e);
     }
     if let Some(e) = snap.string("core.editor") {
-        return Ok(e.to_string());
+        return Some(e.to_string());
     }
-    if let Some(e) = env("VISUAL") {
-        return Ok(e);
+    if !dumb {
+        if let Ok(e) = std::env::var("VISUAL") {
+            return Some(e);
+        }
     }
-    if let Some(e) = env("EDITOR") {
-        return Ok(e);
+    if let Ok(e) = std::env::var("EDITOR") {
+        return Some(e);
     }
-    let dumb = std::env::var("TERM").map(|t| t == "dumb").unwrap_or(true);
-    if dumb || !std::io::stdin().is_terminal() {
-        crate::git_fatal!("Terminal is dumb, but EDITOR unset. Please supply the message using -m.");
+    if dumb {
+        return None;
     }
-    Ok("vi".to_string())
+    Some("vi".to_string())
+}
+
+/// `is_terminal_dumb()` (editor.c:21-25): an unset `TERM` counts as dumb.
+fn is_terminal_dumb() -> bool {
+    std::env::var("TERM").map(|t| t == "dumb").unwrap_or(true)
 }
 
 /// Open `path` in the configured editor and wait, git-style: the editor string
 /// runs through the shell so `core.editor = "code -w"` and other argument-bearing
 /// commands work, and stdio is inherited so the interactive editor owns the tty.
 pub(super) fn launch_editor(snap: &gix::config::Snapshot<'_>, path: &std::path::Path) -> Result<()> {
-    let editor = resolve_editor(snap)?;
+    // Every failure below is `error()` in `launch_specified_editor()`, not
+    // `die()`: the message goes to stderr with an `error: ` prefix and the
+    // *caller* decides the exit status (`builtin/commit.c:1124-1127` prints
+    // "Please supply the message…" and exits 1). Wearing `fatal:`/128 here would
+    // both misreport the code and claim git's voice for a line git never says.
+    let Some(editor) = resolve_editor(snap) else {
+        eprintln!("error: Terminal is dumb, but EDITOR unset");
+        return Err(anyhow::Error::new(crate::fatal::Silent(1)));
+    };
     // `if (strcmp(editor, ":"))` (editor.c:66): git's documented no-op editor is
     // recognised before any child is built, so nothing is spawned and not even
     // the "Waiting for your editor" hint is printed.
@@ -3493,16 +3718,25 @@ pub(super) fn launch_editor(snap: &gix::config::Snapshot<'_>, path: &std::path::
     // stderr is redirected, which is why scripted runs see none of this.
     let waiting = std::io::IsTerminal::is_terminal(&std::io::stderr())
         && crate::advice::Advice::WaitingForEditor.enabled();
-    let dumb = std::env::var("TERM").map(|t| t == "dumb").unwrap_or(true);
+    let dumb = is_terminal_dumb();
     if waiting {
         use std::io::Write;
         let tail = if dumb { "\n" } else { " " };
         eprint!("hint: Waiting for your editor to close the file...{tail}");
         let _ = std::io::stderr().flush();
     }
-    let status = crate::external::prepare_shell_cmd_str(&editor, [path])
-        .status()
-        .map_err(|e| anyhow::anyhow!("cannot run editor '{editor}': {e}"))?;
+    // `start_command()` reports its own `cannot run <cmd>: <strerror>` before
+    // `launch_specified_editor` adds `unable to start editor '<editor>'`
+    // (editor.c:95-98), so a failed spawn produces two `error:` lines.
+    let spawned = crate::external::prepare_shell_cmd_str(&editor, [path]).status();
+    let status = match spawned {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error: cannot run {editor}: {}", crate::external::strerror(&e));
+            eprintln!("error: unable to start editor '{editor}'");
+            return Err(anyhow::Error::new(crate::fatal::Silent(1)));
+        }
+    };
     // `term_clear_line()`: wipe the "Waiting for your editor" line so the
     // command's real output starts on a clean line.
     if waiting && !dumb {
@@ -3511,7 +3745,8 @@ pub(super) fn launch_editor(snap: &gix::config::Snapshot<'_>, path: &std::path::
         let _ = std::io::stderr().flush();
     }
     if !status.success() {
-        crate::git_fatal!("there was a problem with the editor '{editor}'");
+        eprintln!("error: there was a problem with the editor '{editor}'");
+        return Err(anyhow::Error::new(crate::fatal::Silent(1)));
     }
     Ok(())
 }

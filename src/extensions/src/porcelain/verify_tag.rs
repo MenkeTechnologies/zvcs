@@ -31,19 +31,24 @@
 //! Exit codes match git: 0 when every named tag verified, 1 when any failed,
 //! 129 for usage errors.
 //!
-//! Not covered (each bails rather than producing a plausible-looking result):
+//! All three signature formats are covered, because the backend is chosen the
+//! way git chooses it — off the armor header, by `get_format_by_sig()` — and all
+//! three drivers live in [`crate::gitsig`]: `gpg` for `PGP SIGNATURE`/`PGP
+//! MESSAGE`, `gpgsm` for `SIGNED MESSAGE`, and `ssh-keygen -Y` for `SSH
+//! SIGNATURE`. Each one's own report is what reaches stderr, so the text is
+//! byte-identical by construction for all three rather than only for OpenPGP.
+//!
+//! Not covered (bails rather than producing a plausible-looking result):
 //! ref-filter atoms outside the supported set (git has roughly eighty; only the
 //! tag-object atoms above are ported, and an unsupported one — including the
 //! `:<format>` date variants and `objectsize:disk` — bails at render time
 //! rather than at git's up-front `verify_ref_format` position, so git's
-//! `fatal: unknown field name: <name>` / exit 128 path is NOT reproduced), and
-//! x509/gpgsm and SSH signatures (git drives `gpgsm` / `ssh-keygen` for those).
+//! `fatal: unknown field name: <name>` / exit 128 path is NOT reproduced).
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 use std::io::Write;
-use std::process::{Command, ExitCode, Stdio};
+use std::process::ExitCode;
 
-use gix::bstr::ByteSlice;
 use gix::objs::Kind;
 
 /// The parse-options usage block, byte-for-byte as git 2.55 emits it.
@@ -183,20 +188,9 @@ pub fn verify_tag(args: &[String]) -> Result<ExitCode> {
 
     let repo = gix::discover(".")?;
 
-    // git reads `gpg.mintrustlevel` while loading config, before it verifies
-    // anything; an unparseable value is a fatal config error, not a per-tag
-    // failure.
-    let min_trust = match configured_min_trust_level(&repo) {
-        Ok(level) => level,
-        Err(value) => {
-            eprintln!("error: invalid value for 'gpg.mintrustlevel': '{value}'");
-            return Ok(ExitCode::from(128));
-        }
-    };
-
     let mut had_error = false;
     for name in names {
-        if !verify_one(&repo, name, verbose, raw, format.as_deref(), min_trust)? {
+        if !verify_one(&repo, name, verbose, raw, format.as_deref())? {
             had_error = true;
         }
     }
@@ -216,7 +210,6 @@ fn verify_one(
     verbose: bool,
     raw: bool,
     format: Option<&[Token]>,
-    min_trust: u8,
 ) -> Result<bool> {
     // `repo_get_oid` is `get_oid_basic()`: a full-length hex name *is* the id,
     // decoded without consulting the odb, so an absent-but-well-formed name
@@ -251,13 +244,17 @@ fn verify_one(
     };
     let (payload, signature) = object.data.split_at(split);
 
-    match kind {
-        SigKind::OpenPgp => {}
-        SigKind::X509 => bail!("x509 signatures are not supported (needs the gpgsm backend)"),
-        SigKind::Ssh => bail!("ssh signatures are not supported (needs the ssh-keygen backend)"),
-    }
-
-    let gpg = run_gpg(repo, payload, signature)?;
+    // `check_signature()` picks the backend off the armor header itself, so the
+    // `SigKind` the split reported is only used to name the object's format —
+    // every one of the three has a driver behind it.
+    let _ = kind;
+    // `gpg_interface_lazy_init()` is *lazy*: `gpg.minTrustLevel` is read by the
+    // first `check_signature()`. A tag that is missing, is not a tag, or carries
+    // no signature never reaches one, so an unparseable value stays unreported
+    // and the command keeps the exit 1 those paths already earned — which is what
+    // reading the key up front turned into a spurious 128.
+    let min_trust = super::verify_commit::min_trust_level(repo)?;
+    let sigc = crate::gitsig::verify_full(signature, payload);
 
     // `print_signature_buffer` runs after the check, and `--format` sets
     // GPG_VERIFY_OMIT_STATUS, which skips the whole thing — so under --format
@@ -267,18 +264,14 @@ fn verify_one(
         if verbose {
             std::io::stdout().write_all(payload)?;
         }
-        // gpg's stderr by default, or its `--status-fd` stream under --raw;
-        // either way verbatim, on stderr.
-        let shown = if raw { &gpg.status } else { &gpg.output };
+        // The checker's own report by default, or its `--status-fd` stream under
+        // --raw; either way verbatim, on stderr.
+        let shown = if raw { &sigc.gpg_status } else { &sigc.output };
         std::io::stderr().write_all(shown)?;
     }
 
-    // A verification counts as good only when gpg exited cleanly, its status
-    // stream reported GOODSIG, and the reported trust level clears the
-    // configured minimum (git's `status |= sigc->trust_level < min`).
-    let ok = gpg.exit_ok
-        && status_result(&gpg.status) == Some(b'G')
-        && status_trust_level(&gpg.status) >= min_trust;
+    // `check_signature()`'s verdict, with `gpg.minTrustLevel` as its floor.
+    let ok = sigc.verified(min_trust);
 
     // git renders the format only for tags that verified.
     if let Some(tokens) = format.filter(|_| ok) {
@@ -733,151 +726,6 @@ fn find_at_line_start(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .find(|&i| (i == 0 || haystack[i - 1] == b'\n') && &haystack[i..i + needle.len()] == needle)
 }
 
-/// What `gpg` reported: its two output streams and whether it exited cleanly.
-struct GpgRun {
-    status: Vec<u8>,
-    output: Vec<u8>,
-    exit_ok: bool,
-}
-
-/// Run the configured OpenPGP program the way git does: the detached signature
-/// in a temporary file, the payload on stdin, status lines on fd 1.
-fn run_gpg(repo: &gix::Repository, payload: &[u8], signature: &[u8]) -> Result<GpgRun> {
-    let snapshot = repo.config_snapshot();
-    let program = snapshot
-        .string("gpg.openpgp.program")
-        .or_else(|| snapshot.string("gpg.program"))
-        .map(|v| v.to_str_lossy().into_owned())
-        .unwrap_or_else(|| "gpg".to_string());
-
-    let sig_path = std::env::temp_dir().join(format!(
-        ".git_vtag_tmp{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    ));
-    std::fs::write(&sig_path, signature)?;
-
-    let spawned = Command::new(&program)
-        .arg("--keyid-format=long")
-        .arg("--status-fd=1")
-        .arg("--verify")
-        .arg(&sig_path)
-        .arg("-")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn();
-
-    let mut child = match spawned {
-        Ok(c) => c,
-        Err(e) => {
-            let _ = std::fs::remove_file(&sig_path);
-            crate::git_fatal!("could not run {program:?}: {e}");
-        }
-    };
-
-    // Feed the payload from a helper thread: gpg may emit its status lines
-    // before it has drained stdin, and a single-threaded write would deadlock
-    // on a full pipe for large tag messages.
-    let mut stdin = child.stdin.take().expect("stdin was piped");
-    let payload = payload.to_vec();
-    let writer = std::thread::spawn(move || {
-        let _ = stdin.write_all(&payload);
-    });
-
-    let out = child.wait_with_output();
-    let _ = writer.join();
-    let _ = std::fs::remove_file(&sig_path);
-    let out = out?;
-
-    Ok(GpgRun {
-        status: out.stdout,
-        output: out.stderr,
-        exit_ok: out.status.success(),
-    })
-}
-
-/// The result character git derives from gpg's status stream (`G` = GOODSIG,
-/// `B` = BADSIG, and so on). The last matching line wins, as in git.
-fn status_result(status: &[u8]) -> Option<u8> {
-    const CHECKS: &[(u8, &str)] = &[
-        (b'G', "GOODSIG "),
-        (b'B', "BADSIG "),
-        (b'E', "ERRSIG "),
-        (b'X', "EXPSIG "),
-        (b'Y', "EXPKEYSIG "),
-        (b'R', "REVKEYSIG "),
-    ];
-
-    let mut result = None;
-    for line in status.split(|&b| b == b'\n') {
-        let Some(rest) = line.strip_prefix(b"[GNUPG:] ") else {
-            continue;
-        };
-        for (ch, check) in CHECKS {
-            if rest.starts_with(check.as_bytes()) {
-                result = Some(*ch);
-            }
-        }
-    }
-    result
-}
-
-/// git's default `configured_min_trust_level` — `TRUST_UNDEFINED`, the lowest
-/// level, so an unset `gpg.minTrustLevel` never rejects a signature.
-const TRUST_UNDEFINED: u8 = 0;
-
-/// Map a trust-level name to git's numeric `enum signature_trust_level`.
-///
-/// The keys are as gpg emits them in its status stream, and as git stores them
-/// after upper-casing the config value.
-fn trust_level_from_key(key: &[u8]) -> Option<u8> {
-    match key {
-        b"UNDEFINED" => Some(0),
-        b"NEVER" => Some(1),
-        b"MARGINAL" => Some(2),
-        b"FULLY" => Some(3),
-        b"ULTIMATE" => Some(4),
-        _ => None,
-    }
-}
-
-/// The minimum trust level from `gpg.minTrustLevel`, or `TRUST_UNDEFINED` when
-/// unset. `Err` carries the offending value for git's fatal config error.
-fn configured_min_trust_level(repo: &gix::Repository) -> std::result::Result<u8, String> {
-    let snapshot = repo.config_snapshot();
-    match snapshot.string("gpg.minTrustLevel") {
-        None => Ok(TRUST_UNDEFINED),
-        Some(value) => {
-            let value = value.to_str_lossy().into_owned();
-            trust_level_from_key(value.to_uppercase().as_bytes()).ok_or(value)
-        }
-    }
-}
-
-/// The trust level git reads from gpg's status stream: the level named on the
-/// last `TRUST_<LEVEL>` line, or `TRUST_UNDEFINED` when none is present.
-fn status_trust_level(status: &[u8]) -> u8 {
-    let mut level = TRUST_UNDEFINED;
-    for line in status.split(|&b| b == b'\n') {
-        let Some(rest) = line.strip_prefix(b"[GNUPG:] ") else {
-            continue;
-        };
-        let Some(rest) = rest.strip_prefix(b"TRUST_") else {
-            continue;
-        };
-        // git takes the token up to the first space (`strcspn(line, " \n")`).
-        let token: &[u8] = rest.split(|&b| b == b' ').next().unwrap_or(rest);
-        if let Some(parsed) = trust_level_from_key(token) {
-            level = parsed;
-        }
-    }
-    level
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -940,24 +788,6 @@ mod tests {
         assert!(is_empty(b""));
         assert!(is_empty(b"  \t\n"));
         assert!(!is_empty(b" x "));
-    }
-
-    #[test]
-    fn status_trust_level_reads_last_trust_line() {
-        let status = b"[GNUPG:] GOODSIG ABC\n[GNUPG:] TRUST_FULLY 0 pgp\n";
-        assert_eq!(status_trust_level(status), 3);
-        assert_eq!(status_trust_level(b"[GNUPG:] GOODSIG ABC\n"), TRUST_UNDEFINED);
-        assert_eq!(status_trust_level(b"[GNUPG:] TRUST_ULTIMATE\n"), 4);
-    }
-
-    #[test]
-    fn trust_levels_are_ordered() {
-        assert_eq!(trust_level_from_key(b"UNDEFINED"), Some(0));
-        assert_eq!(trust_level_from_key(b"NEVER"), Some(1));
-        assert_eq!(trust_level_from_key(b"MARGINAL"), Some(2));
-        assert_eq!(trust_level_from_key(b"FULLY"), Some(3));
-        assert_eq!(trust_level_from_key(b"ULTIMATE"), Some(4));
-        assert_eq!(trust_level_from_key(b"bogus"), None);
     }
 
     /// Drive the `%(if)`/`%(then)`/`%(else)`/`%(end)` stack the way

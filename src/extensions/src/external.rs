@@ -126,6 +126,28 @@ where
     c
 }
 
+/// `strerror(errno)`, the text git appends after a failed exec or syscall —
+/// `error: cannot run <cmd>: No such file or directory`, and every `error_errno`
+/// / `die_errno` message.
+///
+/// Rust renders the same `io::Error` as `No such file or directory (os error 2)`.
+/// The suffix is Rust's, not git's, so any port that formats an `io::Error`
+/// straight into a git message drifts by those eleven characters.
+pub fn strerror(err: &std::io::Error) -> String {
+    let Some(code) = err.raw_os_error() else {
+        return err.to_string();
+    };
+    // SAFETY: `strerror` returns a pointer to a static, NUL-terminated string for
+    // any int. It is not reentrant; this is only reached on a failed spawn.
+    let text = unsafe { libc::strerror(code) };
+    if text.is_null() {
+        return err.to_string();
+    }
+    unsafe { std::ffi::CStr::from_ptr(text) }
+        .to_string_lossy()
+        .into_owned()
+}
+
 /// [`prepare_shell_cmd`] for a command word that is already a `&str`.
 pub fn prepare_shell_cmd_str<I, S>(cmd: &str, args: I) -> Command
 where

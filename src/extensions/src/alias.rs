@@ -253,7 +253,7 @@ fn run_shell_alias(body: &str, user_args: &[String]) -> ExitCode {
 /// single/double quotes and backslash escapes. Backslash escapes the next byte
 /// everywhere except inside single quotes; whitespace outside quotes separates
 /// words. Errors on a trailing backslash or an unclosed quote, as git does.
-fn split_cmdline(s: &str) -> Result<Vec<String>, SplitError> {
+pub(crate) fn split_cmdline(s: &str) -> Result<Vec<String>, SplitError> {
     let bytes = s.as_bytes();
     let mut tokens: Vec<Vec<u8>> = Vec::new();
     let mut cur: Vec<u8> = Vec::new();
@@ -300,7 +300,7 @@ fn split_cmdline(s: &str) -> Result<Vec<String>, SplitError> {
 
 /// `split_cmdline` failures, rendered with git's `split_cmdline_strerror` text.
 #[derive(Debug)]
-enum SplitError {
+pub(crate) enum SplitError {
     BadEnding,
     UnclosedQuote,
 }

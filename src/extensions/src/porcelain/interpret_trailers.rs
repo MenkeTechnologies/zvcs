@@ -472,7 +472,30 @@ fn ordered_values(section: &gix::config::file::SectionRef<'_>) -> Vec<(String, V
 /// `core.commentChar` / `core.commentString`, which are the same knob in git 2.55.
 /// The last one set across both spellings wins; `auto` and absence give `#`.
 pub(crate) fn comment_string(config: &ConfigFile) -> Vec<u8> {
+    comment_string_full(config).0
+}
+
+/// [`comment_string`] plus git's `auto_comment_line_char`: whether the winning
+/// value was the literal `auto`.
+///
+/// ```c
+/// } else if (!strcasecmp(value, "auto")) {
+///         auto_comment_line_char = 1;
+///         comment_line_str = "#";
+/// } else if (value[0]) {
+///         comment_line_str = value;
+///         auto_comment_line_char = 0;
+/// }
+/// ```
+///
+/// (environment.c:440-452.) The flag is set and cleared by the same last-wins
+/// pass that picks the string, so `core.commentChar = auto` followed by
+/// `core.commentString = ;` leaves the flag *off* — only the last of the two keys
+/// counts. `auto` resolves to `#` here and only `builtin/commit.c`'s
+/// `adjust_comment_line_char()` moves it, once it can see the message.
+pub(crate) fn comment_string_full(config: &ConfigFile) -> (Vec<u8>, bool) {
     let mut chosen = b"#".to_vec();
+    let mut auto = false;
     for section in config.sections() {
         let header = section.header();
         if header.subsection_name().is_some()
@@ -484,14 +507,15 @@ pub(crate) fn comment_string(config: &ConfigFile) -> Vec<u8> {
             if name != "commentchar" && name != "commentstring" {
                 continue;
             }
-            chosen = if value.eq_ignore_ascii_case(b"auto") || value.is_empty() {
+            auto = value.eq_ignore_ascii_case(b"auto");
+            chosen = if auto || value.is_empty() {
                 b"#".to_vec()
             } else {
                 value
             };
         }
     }
-    chosen
+    (chosen, auto)
 }
 
 // ---------------------------------------------------------------------------
@@ -886,6 +910,68 @@ pub(crate) fn trailer_block_of(msg: &[u8]) -> Result<Vec<u8>> {
     let cfg = load_config()?;
     let block = block_get(msg, true, &cfg);
     Ok(msg[block.start..block.end].to_vec())
+}
+
+/// `validate_trailer_args()` (trailer.c:778-805) — the check `git rebase` and
+/// `git commit` run over their `--trailer` arguments before anything is written,
+/// so a malformed one is refused while the repository is still untouched.
+///
+/// Both arms `error()` and return non-zero, which the callers turn into
+/// `die(NULL)`: the message is already on stderr, so the exit carries no second
+/// line. `false` here is that non-zero.
+///
+/// The separator set is `"=" + trailer.separators`, matching the command line's
+/// standing permission to spell a trailer with `=` whatever the configuration
+/// says — the same `cl_separators` [`parse_command_line_args`] builds.
+pub(crate) fn validate_trailer_args(cli_args: &[String]) -> Result<bool> {
+    let cfg = load_config()?;
+    let mut cl_separators = vec![b'='];
+    cl_separators.extend_from_slice(&cfg.separators);
+
+    for txt in cli_args {
+        if txt.is_empty() {
+            eprintln!("error: empty --trailer argument");
+            return Ok(false);
+        }
+        if find_separator(txt.as_bytes(), &cl_separators) == 0 {
+            eprintln!("error: invalid trailer '{txt}': missing key before separator");
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// `amend_strbuf_with_trailers()` (trailer.c:1286-1318) — run `buf` through
+/// `process_trailers()` with every option left at its default except
+/// `no_divider`, which the function always sets.
+///
+/// This is the whole of what `--trailer` does to a commit message: the trailer
+/// block at the end of `buf` is located, each argument is folded into it under
+/// the configured `where`/`ifExists`/`ifMissing` rules, and the message is
+/// re-rendered. Appending the lines verbatim would be wrong — an argument that
+/// repeats a trailer already at the end of the block is dropped rather than
+/// duplicated, and a message with no blank line before its trailers gains one.
+pub(crate) fn amend_with_trailers(buf: &[u8], trailer_args: &[String]) -> Result<Vec<u8>> {
+    let cfg = load_config()?;
+    let opts = Opts { no_divider: true, ..Default::default() };
+    let mut new_trailers = Vec::with_capacity(trailer_args.len());
+    for text in trailer_args {
+        if text.is_empty() {
+            // `error(_("empty --trailer argument")); goto out;` — `buf` is left
+            // as it was, so the caller keeps the unmodified message.
+            eprintln!("error: empty --trailer argument");
+            return Ok(buf.to_vec());
+        }
+        new_trailers.push(NewTrailer {
+            text: text.as_bytes().to_vec(),
+            // `xcalloc`'d `new_trailer_item`: every field but `text` is zero,
+            // and zero is the `*_DEFAULT` sentinel of each enum.
+            where_: Where::Default,
+            if_exists: IfExists::Default,
+            if_missing: IfMissing::Default,
+        });
+    }
+    Ok(process(buf, &opts, &new_trailers, &cfg))
 }
 
 /// `trailer_block_get()`: locate the block and fold its continuation lines.

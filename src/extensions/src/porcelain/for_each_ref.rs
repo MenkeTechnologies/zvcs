@@ -35,17 +35,22 @@
 //! verbatim-block fast path; the option list (`:only`, `:unfold`, `:key=`, …)
 //! re-renders the parsed items instead and is refused.
 //!
-//! `%(signature)`'s `:signer`, `:key`, `:grade` and `:trustlevel` come from
-//! [`crate::gitsig`], which runs the same `gpg --verify` git runs. On an
-//! unsigned object every option renders what a zeroed `signature_check` would.
-//! The bare `%(signature)` of a *signed* object needs `sigc->output` — gpg's own
-//! report — and `:fingerprint` / `:primarykeyfingerprint` need the `VALIDSIG`
-//! fingerprints; `gitsig` keeps neither, so those three are refused.
+//! Every `%(signature)` option comes from [`crate::gitsig`], this crate's port
+//! of `gpg-interface.c`: it runs the checker git runs and keeps the whole of
+//! `struct signature_check`, so the bare form renders `sigc->output` (the
+//! checker's own report) and `:fingerprint` / `:primarykeyfingerprint` render
+//! the `VALIDSIG` line's fields. On an unsigned object every option renders what
+//! a zeroed `signature_check` would.
 //!
 //! Not covered — rejected rather than silently producing divergent output:
-//! `%(deltabase)` and `%(is-base)`. Those names are still recognised as *valid*
-//! git atoms, so an unknown field name is reported the way git reports it.
-//! `%(rest)` is refused the way git refuses it for this command.
+//! `%(deltabase)`, and `%(is-base:<committish>)` for a committish that resolves.
+//! Those names are still recognised as *valid* git atoms, so an unknown field
+//! name is reported the way git reports it, and the refusal keeps this port's
+//! own voice and exit 1 rather than borrowing git's `fatal:`/128 — see
+//! [`report_atom_error`]. Their *parse-time* rejections are a different thing
+//! and are git's own `die()`s, reproduced exactly: `%(deltabase:<anything>)`,
+//! `%(is-base)` with no operand, and `%(is-base:<committish>)` whose operand
+//! does not peel. `%(rest)` is refused the way git refuses it for this command.
 //!
 //! `%(ahead-behind:<committish>)` is computed in git's two stages, not one: the
 //! atom's operand is peeled when the format is parsed, and then
@@ -418,9 +423,10 @@ struct AtomCtx<'a> {
 
 /// Which exit code a format/sort parse failure maps onto.
 ///
-/// git splits these: `verify_ref_format` failures `die()` (128), a malformed
-/// `%(` reaches the `parse-options` usage path (129), and anything this module
-/// simply has not built is reported as an ordinary error.
+/// git splits the first two: `verify_ref_format` failures `die()` (128) and a
+/// malformed `%(` reaches the `parse-options` usage path (129). The third is not
+/// a git failure at all — it is this port saying it has not built something —
+/// and [`report_atom_error`] keeps it out of git's voice.
 #[cfg_attr(test, derive(Debug))]
 enum ErrKind {
     Fatal,
@@ -473,11 +479,16 @@ fn trailers_bare(name: &str, arg: Option<&str>) -> std::result::Result<(), AtomE
 }
 
 /// Turn a parse failure into the exit code git would produce.
+///
+/// The third arm is deliberately *not* one of git's: `fatal: …` at 128 is a
+/// claim that this is what git does here, and a gap in this port is not that.
+/// It keeps the `zvcs: <verb>: …` prefix and exit 1 that mark the port speaking
+/// for itself — see `crate::fatal`.
 fn report_atom_error(e: AtomError) -> Result<ExitCode> {
     match e.kind {
         ErrKind::Fatal => Ok(fatal(&e.msg)),
         ErrKind::Usage => Ok(usage_error(&e.msg)),
-        ErrKind::Unported => crate::git_fatal!("{}", e.msg),
+        ErrKind::Unported => bail!("{}", e.msg),
     }
 }
 
@@ -1791,6 +1802,48 @@ fn parse_atom(spec: &str, ctx: &AtomCtx<'_>) -> std::result::Result<Atom, AtomEr
                 .ok_or_else(|| fatal_atom(format!("failed to find '{arg}'")))?;
             Field::AheadBehind(base)
         }
+        // `deltabase_atom_parser` (ref-filter.c:504) rejects an argument outright,
+        // which is git's own `die()` and is reproduced; the value itself is the
+        // packed delta base `oid_object_info_extended()` reports through
+        // `OBJECT_INFO_DELTA_BASE`, and the vendored object database exposes no
+        // such lookup — nothing under `gix` or `gix-odb` returns a delta base.
+        "deltabase" => {
+            bare(m).map_err(|_| fatal_atom("%(deltabase) does not take arguments"))?;
+            return Err(unported_atom(
+                "%(deltabase) is not ported: the delta base of a packed object is \
+                 oid_object_info_extended()'s OBJECT_INFO_DELTA_BASE, which the vendored \
+                 object database does not expose",
+            ));
+        }
+        // `is_base_atom_parser` (ref-filter.c:913) runs to completion here: the
+        // operand is mandatory, and it is peeled by
+        // `lookup_commit_reference_by_name()` — whose failure is a `die()`, not
+        // an "unknown atom". Both of those rejections are git's own and are
+        // reproduced exactly; only the answer for a committish that *does*
+        // resolve is missing, because `filter_is_base()` computes it with
+        // `get_branch_base_for_tip()` (commit-reach.c:1317), a first-parent walk
+        // ordered by commit-graph generation numbers that this port has no
+        // substrate for.
+        "is-base" => {
+            let Some(arg) = m else {
+                return Err(fatal_atom("expected format: %(is-base:<committish>)"));
+            };
+            let resolved = ctx.repo.and_then(|r| {
+                let id = crate::objname::resolve(r, arg)?;
+                match crate::objname::lookup_commit_reference(r, id) {
+                    crate::objname::CommitRef::Commit(id) => Some(id),
+                    _ => None,
+                }
+            });
+            if resolved.is_none() {
+                return Err(fatal_atom(format!("failed to find '{arg}'")));
+            }
+            return Err(unported_atom(format!(
+                "%(is-base:{arg}) is not ported: naming the base a ref was branched from \
+                 needs get_branch_base_for_tip()'s generation-numbered first-parent walk, \
+                 which needs the commit-graph substrate"
+            )));
+        }
         // `verify_ref_format`'s `reject_atom`: `for-each-ref` has no "rest of the
         // line" to report, so the atom parses and is then refused.
         "rest" => {
@@ -2983,10 +3036,10 @@ fn render_contents(obj: &ObjInfo, part: &ContentPart) -> Result<Vec<u8>> {
 /// no `gpgsig` header — including a tag or a tree, which `grab_signature` is
 /// never even reached for — so those render empty here too.
 ///
-/// [`crate::gitsig`] runs the same `gpg --verify` git runs, but discards gpg's
-/// human-readable report and never asks for the key's fingerprints, so the three
-/// atoms that quote those (`%(signature)` itself, `:fingerprint` and
-/// `:primarykeyfingerprint`) can only be answered for an unsigned object.
+/// [`crate::gitsig`] is this crate's `check_signature()`, so every field of
+/// git's `struct signature_check` is available here — the checker's own report
+/// behind the bare `%(signature)` included, and the `VALIDSIG` fingerprints
+/// behind `:fingerprint` / `:primarykeyfingerprint`.
 fn render_signature(obj: &ObjInfo, option: SigOption) -> Result<Vec<u8>> {
     let data = obj.data.as_deref().unwrap_or_default();
     let signed = obj.kind == Kind::Commit && crate::gitsig::split_signed(data).is_some();
@@ -3007,15 +3060,9 @@ fn render_signature(obj: &ObjInfo, option: SigOption) -> Result<Vec<u8>> {
         SigOption::Key => check.key.into_bytes(),
         SigOption::Grade => vec![check.pretty_status().code() as u8],
         SigOption::TrustLevel => trust_level_str(check.trust).into(),
-        SigOption::Bare => crate::git_fatal!(
-            "%(signature) on a signed object needs `sigc->output` — gpg's own report, which \
-             check_signature() keeps verbatim; crate::gitsig discards gpg's stderr and cannot \
-             reproduce it"
-        ),
-        SigOption::Fingerprint | SigOption::PrimaryKeyFingerprint => crate::git_fatal!(
-            "%(signature:fingerprint) / %(signature:primarykeyfingerprint) need the \
-             VALIDSIG status line's fingerprint fields, which crate::gitsig does not parse"
-        ),
+        SigOption::Bare => check.output,
+        SigOption::Fingerprint => check.fingerprint.into_bytes(),
+        SigOption::PrimaryKeyFingerprint => check.primary_key_fingerprint.into_bytes(),
     })
 }
 

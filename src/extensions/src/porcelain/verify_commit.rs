@@ -16,21 +16,22 @@
 //! Like git, each `<commit>` is processed in order, errors do not stop the loop,
 //! and the process exits 1 if any of them failed.
 //!
-//! NOT covered: the actual cryptographic verdict for a commit that *is* signed.
-//! That needs git's `gpg-interface` substrate — spawning `gpg`/`gpgsm`/
-//! `ssh-keygen -Y` per `gpg.format`/`gpg.program`, parsing `--status-fd` lines
-//! into a trust result, and relaying the checker's own stderr verbatim — none of
-//! which exists in the vendored crates. gitoxide can only *extract* the
-//! signature and its payload; `gix::Commit::signature()` carries an upstream
-//! `TODO: make it possible to verify the signature` at
-//! `src/ported/gix/src/object/commit.rs:215`. A signed commit therefore fails
-//! with a precise message rather than inventing a verdict, because guessing
-//! "good" here would be indistinguishable from a real verification pass.
+//! A commit that *is* signed goes through [`crate::gitsig`], which is this
+//! crate's port of `gpg-interface.c`: `check_signature()` picks the backend off
+//! the signature's own armor header, runs `gpg`/`gpgsm`/`ssh-keygen -Y` with
+//! git's argument vector, and keeps both of the checker's streams. So `-v`
+//! prints the payload, the plain form relays the checker's report and `--raw`
+//! its `--status-fd` stream — all three verbatim, because they *are* the
+//! checker's bytes and nothing here rewrites them. gitoxide's own
+//! `gix::Commit::signature()` only extracts the signature (upstream `TODO: make
+//! it possible to verify the signature`, `src/ported/gix/src/object/commit.rs:215`),
+//! which is why the payload split and the verification both live in `gitsig`
+//! rather than in the vendored crate.
 //!
 //! Exit codes follow git rather than the caller's generic failure path: usage
 //! errors (including `-h`) exit 129, a failed verification exits 1.
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 use std::process::ExitCode;
 
 /// git's own usage block, printed on stderr next to `error: unknown …` and on
@@ -162,11 +163,31 @@ pub fn verify_commit(args: &[String]) -> Result<ExitCode> {
     })
 }
 
+/// `gpg_interface_lazy_init()`: read the signing configuration and reject the two
+/// values `git_gpg_config()` rejects, returning `configured_min_trust_level` — the
+/// only one a verification then consults.
+///
+/// Both rejections are an `error()` inside the config reader followed by its own
+/// `die()`, so what leaves here is a [`crate::fatal::Silent`] carrying nothing but
+/// the exit code: the message is already on stderr, and this port's own voice
+/// after it would double it. The `die()`'s second line, which names the file and
+/// line the value came from, is not reproduced — gix's config parser does not
+/// carry per-entry line numbers.
+///
+/// Calling this where a signature is about to be checked, rather than up front, is
+/// not an optimization but the observable behaviour: `git status` and `git log` in
+/// a repository with a bad `gpg.format` say nothing at all.
+pub(crate) fn min_trust_level(repo: &gix::Repository) -> Result<crate::gitsig::Trust> {
+    let reported = |key: &str, value: &str| {
+        eprintln!("error: invalid value for '{key}': '{value}'");
+        anyhow::Error::new(crate::fatal::Silent(crate::fatal::EXIT_FATAL))
+    };
+    crate::gitsig::validate_format(repo).map_err(|v| reported("gpg.format", &v))?;
+    crate::gitsig::configured_min_trust_level(repo).map_err(|v| reported("gpg.mintrustlevel", &v))
+}
+
 /// Verify a single `<commit>` spec, returning `false` when git would have
 /// counted it as an error. Diagnostics go to stderr in git's exact wording.
-///
-/// Returns `Err` only for the one case this port cannot decide: a commit that
-/// actually carries a signature.
 fn verify_one(repo: &gix::Repository, name: &str, verbose: bool, raw: bool) -> Result<bool> {
     // `repo_get_oid` is `get_oid_basic()`, whose first branch accepts a
     // full-length hex name as the id without asking the odb — so a well-formed
@@ -190,21 +211,32 @@ fn verify_one(repo: &gix::Repository, name: &str, verbose: bool, raw: bool) -> R
 
     let commit = repo.find_object(id)?.try_into_commit()?;
 
-    // No `gpgsig` header: `check_commit_signature` bails out of
-    // `parse_signed_commit` before setting a payload, so git emits nothing at
-    // all — not even under `-v` — and just fails.
-    if commit.signature()?.is_none() {
+    // `verify_commit_buffer()`: the payload is the commit object with its
+    // `gpgsig` block removed, which is what was signed. No such header at all is
+    // `parse_buffer_signed_by_header() <= 0` — `sigc->payload` is never set, so
+    // `print_signature_buffer` emits nothing (not even under `-v`) and the
+    // verification simply fails.
+    let Some((signature, payload)) = crate::gitsig::split_signed(&commit.data) else {
         return Ok(false);
-    }
+    };
 
-    // `-v` (print the payload to stdout) and `--raw` (print the checker's raw
-    // status instead of its human output) only take effect once a checker has
-    // run, so they are parsed and accepted but never reached.
-    let _ = (verbose, raw);
-    bail!(
-        "{name}: commit is signed, but signature verification is not ported \
-         (the vendored crates have no gpg-interface: no gpg/gpgsm/ssh-keygen \
-         driver, no gpg.format/gpg.program handling, no --status-fd parsing; \
-         gix Commit::signature() only extracts the signature)"
-    )
+    // `gpg_interface_lazy_init()` is *lazy*: `gpg.minTrustLevel` is read by the
+    // first `check_signature()`, not while config is loaded. So an unsigned
+    // commit never reads it at all, and a repository with an unparseable value
+    // still exits quietly at 1 there rather than reporting a config error — which
+    // is what reading it up front got wrong.
+    let min_trust = min_trust_level(repo)?;
+
+    let sigc = crate::gitsig::verify_full(&signature, &payload);
+
+    // `print_signature_buffer()` (gpg-interface.c:690): the payload under
+    // `GPG_VERIFY_VERBOSE`, then the checker's own report — its `--status-fd`
+    // stream under `--raw`, its human-readable output otherwise.
+    if verbose {
+        std::io::Write::write_all(&mut std::io::stdout(), &payload)?;
+    }
+    let shown = if raw { &sigc.gpg_status } else { &sigc.output };
+    std::io::Write::write_all(&mut std::io::stderr(), shown)?;
+
+    Ok(sigc.verified(min_trust))
 }

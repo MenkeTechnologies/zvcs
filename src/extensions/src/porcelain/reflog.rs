@@ -149,6 +149,26 @@ const USAGE: &str = r"usage: git reflog [show] [<log-options>] [<ref>]
 ///
 /// All five paths exit 128. `exists` without exactly one argument exits 129.
 ///
+/// A non-option argument is read by the same `handle_revision_arg_1()` every
+/// other verb gets, so the range and pathspec halves of that grammar reach
+/// `show` too — and mostly reach it in order to be refused, because
+/// `add_reflog_for_walk()` dies on any pending entry marked `UNINTERESTING`:
+///
+///   * `<a>..<b>` excludes its left endpoint, so it is
+///     `fatal: cannot walk reflogs for <a>` (with `HEAD` standing in for an
+///     endpoint written empty).
+///   * `<a>...<b>` excludes the merge bases instead, and pends them ahead of
+///     either endpoint under `oid_to_hex()`, so the name in that message is a
+///     full-length object id. Two histories with no merge base at all exclude
+///     nothing and walk *both* reflogs.
+///   * An endpoint that is not an `OBJ_COMMIT` — an annotated tag — is pended
+///     and dropped rather than walked, so it neither dies nor contributes.
+///   * A bare `..` is not a range but the pathspec for the parent directory
+///     (revision.c:2164): it and every operand behind it become prune data, and
+///     the diagnostic comes from `pathspec.c`.
+///
+/// See [`dotdot_walks`] for the C those four bullets are read off.
+///
 /// # Implemented `show` options
 ///
 /// Counting: `-n <n>`, `-n<n>`, `-<n>`, `--max-count=<n>`, `--skip=<n>` — one budget
@@ -952,6 +972,13 @@ fn show(repo: &gix::Repository, rest: &[String], tweak: Tweak) -> Result<u8> {
     let mut grep_invert = false;
     let mut grep_all_match = false;
 
+    // `setup_revisions()` searches the *whole* argv for a `--` before it reads
+    // any argument (revision.c:2836-2851), and every surviving argument then
+    // carries `REVARG_CANNOT_BE_FILENAME`. That flag is the only thing standing
+    // between a bare `..` and the parent-directory pathspec, so the scan has to
+    // happen up front rather than when the `--` is reached below.
+    let seen_dashdash = rest.iter().any(|s| s == "--");
+
     let mut i = 0;
     while i < rest.len() {
         let a = rest[i].as_str();
@@ -1192,6 +1219,42 @@ fn show(repo: &gix::Repository, rest: &[String], tweak: Tweak) -> Result<u8> {
 
             // ---- revision ---------------------------------------------------
             s => {
+                // `handle_revision_arg_1()`'s very first test:
+                //
+                // ```c
+                // if (!cant_be_filename && !strcmp(arg, "..")) {
+                //         /*
+                //          * Just ".."?  That is not a range but the
+                //          * pathspec for the parent directory.
+                //          */
+                //         return -1;
+                // }
+                // ```
+                //
+                // (revision.c:2164). The `-1` sends `setup_revisions()` down its
+                // filename fallback, which checks this operand and every one
+                // after it and then makes prune data of the lot:
+                //
+                // ```c
+                // for (j = i; j < argc; j++)
+                //         verify_filename(revs->prefix, argv[j], j == i);
+                // strvec_pushv(&prune_data, argv + i);
+                // break;
+                // ```
+                //
+                // (revision.c:2907-2911) — so `git reflog show ..` ends at the
+                // pathspec layer's `'..' is outside repository`, and
+                // `git reflog show .. nosuchfile` at the second operand instead.
+                if crate::objname::is_parent_directory_pathspec(s, seen_dashdash) {
+                    for (n, arg) in rest[i..].iter().enumerate() {
+                        if let Some(msg) = crate::setup::verify_filename(arg, n == 0) {
+                            eprintln!("fatal: {msg}");
+                            return Ok(128);
+                        }
+                    }
+                    opts.pathspecs = rest[i..].iter().map(|s| s.as_bytes().to_vec()).collect();
+                    break;
+                }
                 saw_ref_source = true;
                 // One operand can contribute more than one section: `<rev>^@`
                 // queues every parent under the base's name, so a merge's `^@`
@@ -1588,6 +1651,42 @@ fn resolve_operand(
     spec: &str,
     sections: &mut Vec<Section>,
 ) -> Result<Option<u8>> {
+    // ---- handle_dotdot() ---------------------------------------------------
+    //
+    // It runs ahead of the three-mark block below and is the *whole* of the
+    // range rule: both endpoints through `get_oid_with_context()`,
+    // `parse_object()` on each, and — for `<a>...<b>` only —
+    // `lookup_commit_reference()` on each. Asked of [`crate::objname`] rather
+    // than re-derived here, the same way `format-patch` and `bundle` ask it.
+    //
+    // The bare-`..` guard in front of it belongs to the caller: it needs the
+    // rest of argv, because that operand and every one after it become prune
+    // data.
+    let range = crate::objname::split_range(spec).map(|r| {
+        // The `warning: refname … is ambiguous.` half of those two
+        // `get_oid_with_context()` calls. [`crate::objname::dotdot`] is a quiet
+        // classifier, so the warning is asked for separately and exactly once —
+        // and [`dotdot_walks`] below silences the by-name resolutions it does,
+        // which git does not repeat.
+        crate::objname::warn_dotdot_endpoints(repo, spec);
+        (r, crate::objname::dotdot(repo, spec))
+    });
+    if let Some((r, crate::objname::Dotdot::Missing { .. })) = &range {
+        // `dotdot_missing()`, with whatever `lookup_commit_reference()` printed
+        // ahead of it.
+        eprint!(
+            "{}",
+            crate::objname::dotdot_fatal(repo, spec).unwrap_or_else(|| format!(
+                "fatal: {}\n",
+                crate::objname::dotdot_missing_message(spec, r.symmetric)
+            ))
+        );
+        return Ok(Some(128));
+    }
+    if let Some((r, crate::objname::Dotdot::Ok { a, b })) = range {
+        return dotdot_walks(repo, &r, a, b, sections);
+    }
+
     // ---- handle_revision_arg_1()'s three-mark block -----------------------
     //
     // `git reflog show` reaches `setup_revisions()` through `cmd_log_reflog()`,
@@ -1692,6 +1791,98 @@ fn resolve_operand(
         Resolved::Empty => None,
         Resolved::Fatal(code) => Some(code),
     })
+}
+
+/// What a range operand contributes once `handle_dotdot_1()` has resolved it.
+///
+/// The whole of the difference from every other verb is which pending entries
+/// come out UNINTERESTING, because `add_reflog_for_walk()` refuses exactly those:
+///
+/// ```c
+/// if (!symmetric) {
+///         /* just A..B */
+///         b_flags = flags;
+///         a_flags = flags_exclude;
+/// } else {
+///         /* A...B -- find merge bases between the two */
+///         exclude = get_merge_bases(a, b);
+///         add_rev_cmdline_list(revs, exclude, REV_CMD_MERGE_BASE, flags_exclude);
+///         add_pending_commit_list(revs, exclude, flags_exclude);
+///         b_flags = flags;
+///         a_flags = flags | SYMMETRIC_LEFT;
+/// }
+/// a_obj->flags |= a_flags;
+/// b_obj->flags |= b_flags;
+/// add_pending_object_with_path(revs, a_obj, a_name, …);
+/// add_pending_object_with_path(revs, b_obj, b_name, …);
+/// ```
+///
+/// (revision.c). So `<a>..<b>` excludes its *left* end and dies naming it, while
+/// `<a>...<b>` excludes only the merge bases — which
+/// `add_pending_commit_list()` pends under `oid_to_hex()`, which is why stock
+/// 2.55.0 reports a 40-hex there and not either endpoint. The bases are pended
+/// first, so they win the refusal even when the left end is a commit too.
+///
+/// Both ends of a symmetric difference stay interesting, and that is not a dead
+/// branch: two histories with no merge base at all — `git reflog other...side`
+/// across two roots — walk *both* reflogs and exit 0.
+///
+/// `add_pending_object_with_path()` only takes the reflog branch for an
+/// `OBJ_COMMIT`, so an endpoint that is an annotated tag is pended and dropped
+/// instead: it neither dies nor walks.
+fn dotdot_walks(
+    repo: &gix::Repository,
+    r: &crate::objname::Range<'_>,
+    a: gix::hash::ObjectId,
+    b: gix::hash::ObjectId,
+    sections: &mut Vec<Section>,
+) -> Result<Option<u8>> {
+    // `add_reflog_for_walk()` reads its log by *name* and resolves nothing, so
+    // none of the lookups below warn. The one warning git prints for the operand
+    // came from `handle_dotdot_1()`'s two `get_oid_with_context()` calls, which
+    // the caller has already made.
+    let _quiet = crate::objname::AmbiguityWarnings::off();
+    let mut walks: Vec<&str> = Vec::new();
+    if r.symmetric {
+        // `a` and `b` are `lookup_commit_reference()`'s output here, which is
+        // what `get_merge_bases()` is handed.
+        if let Some(base) = repo.merge_bases_many(a, &[b])?.first() {
+            return Ok(Some(cannot_walk(&base.detach().to_string())));
+        }
+        walks.push(r.a);
+        walks.push(r.b);
+    } else {
+        // The left end carries `flags_exclude`. Only a commit reaches
+        // `add_reflog_for_walk()` at all, and reaching it with UNINTERESTING set
+        // is the refusal.
+        if is_commit(repo, r.a) {
+            return Ok(Some(cannot_walk(r.a)));
+        }
+        walks.push(r.b);
+    }
+    for name in walks {
+        // A non-commit endpoint never registers a walk; it goes to
+        // `revs->pending` and is dropped there.
+        if !is_commit(repo, name) {
+            continue;
+        }
+        match resolve_spec(repo, name)? {
+            Resolved::Section(section) => sections.push(section),
+            Resolved::Empty => {}
+            Resolved::Fatal(code) => return Ok(Some(code)),
+        }
+    }
+    Ok(None)
+}
+
+/// Whether the object `name` resolves to is an `OBJ_COMMIT` — the one test
+/// `add_pending_object_with_path()` makes before it hands an entry to
+/// `add_reflog_for_walk()`. The object is the one `parse_object()` returned, so
+/// an annotated tag answers no even though it peels to a commit.
+fn is_commit(repo: &gix::Repository, name: &str) -> bool {
+    crate::objname::resolve_quiet(repo, name)
+        .and_then(|id| repo.find_object(id).ok())
+        .is_some_and(|object| object.kind == gix::object::Kind::Commit)
 }
 
 /// Resolve a `<ref>`, `<ref>@{<n>}` or `<ref>@{<date>}` argument the way git's

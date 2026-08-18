@@ -50,6 +50,14 @@
 //! and refused at the first signature they would have to verify: verification
 //! needs a gpg driver the vendored crates do not provide.
 //!
+//! Ref names are taken as literally as git takes them: `new_branch()` validates
+//! with `check_refname_format(name, REFNAME_ALLOW_ONELEVEL)`, so `commit main`
+//! is accepted and lands in `$GIT_DIR/main` rather than under `refs/heads/`,
+//! while a *deletion* of that same name is refused by `refname_is_safe()`
+//! without failing the run. `refname_ok_onelevel` and `refname_is_safe` below
+//! are the two ports that decide this; gix's `FullName` cannot, because it
+//! implements the flagless check that rejects every lowercase one-level name.
+//!
 //! Not covered, each rejected with a precise message rather than guessed at:
 //!   * `--date-format=rfc2822` / `now` — accepted on the command line, as git
 //!     accepts them, and refused at the first identity line that would have to
@@ -1389,9 +1397,9 @@ impl Importer {
         if let Some(idx) = self.by_name.get(name) {
             return Ok(*idx);
         }
-        let _: FullName = name
-            .try_into()
-            .map_err(|_| anyhow!("invalid ref name: {name}"))?;
+        if !refname_ok_onelevel(name) {
+            crate::git_fatal!("branch name doesn't conform to Git standards: {name}");
+        }
         let idx = self.branches.len();
         self.branches.push(Branch {
             name: name.to_string(),
@@ -1595,6 +1603,17 @@ impl Importer {
 
         let Some(new) = self.branches[idx].head else {
             if self.branches[idx].delete && old.is_some() {
+                // A deletion is the one update git validates with
+                // `refname_is_safe()` rather than `check_refname_format()`
+                // (`refs.c:1199-1205`), so a ref `commit main` was allowed to
+                // *create* cannot be deleted again. git reports that through
+                // `delete_ref()`, whose return `update_branch()` ignores, so the
+                // run neither fails nor stops.
+                if !refname_is_safe(&name) {
+                    eprintln!("error: refusing to update ref with bad name '{name}'");
+                    self.branches[idx].delete = false;
+                    return Ok(());
+                }
                 self.repo.edit_reference(RefEdit {
                     change: Change::Delete {
                         expected: PreviousValue::Any,
@@ -1622,11 +1641,63 @@ impl Importer {
     }
 
     /// The id `name` currently points at, or `None` when the ref does not exist.
+    ///
+    /// A name outside `refs/` is read straight out of the git directory. git's
+    /// `read_ref()` is a literal lookup, while gix's `try_find_reference` takes a
+    /// *partial* name and searches the usual prefixes — which finds neither the
+    /// `main` that `commit main` writes nor the `foo/bar` that `commit foo/bar`
+    /// does, and would answer for `refs/heads/v1` when the stream said `v1`.
     fn current(&self, name: &str) -> Result<Option<ObjectId>> {
+        if !name.starts_with("refs/") {
+            return self.read_onelevel_ref(name);
+        }
         Ok(match self.repo.try_find_reference(name)? {
             Some(r) => Some(r.into_fully_peeled_id()?.detach()),
             None => None,
         })
+    }
+
+    /// Read `$GIT_DIR/<name>` — a one-level ref such as the `main` that
+    /// `commit main` creates — following `ref: ` indirections the way git's
+    /// `refs_resolve_ref_unsafe()` does, and giving up after as many of them as
+    /// git's `SYMREF_MAXDEPTH` allows rather than chasing a cycle forever. A file
+    /// that is absent or holds something that is not an object id reads as "no
+    /// such ref", which is the answer `read_ref()` gives for both.
+    fn read_onelevel_ref(&self, name: &str) -> Result<Option<ObjectId>> {
+        let mut name = name.to_string();
+        for _ in 0..5 {
+            if name.starts_with("refs/") {
+                return self.current(&name);
+            }
+            let Ok(text) = std::fs::read_to_string(self.repo.path().join(&name)) else {
+                return Ok(None);
+            };
+            let text = text.trim();
+            let Some(target) = text.strip_prefix("ref: ") else {
+                return Ok(ObjectId::from_hex(text.as_bytes()).ok());
+            };
+            name = target.trim().to_string();
+        }
+        Ok(None)
+    }
+
+    /// Write `$GIT_DIR/<name>` for a one-level ref, through a `.lock` sibling and
+    /// a rename so a reader never sees a half-written id.
+    ///
+    /// git writes no reflog here: `should_autocreate_reflog()` (`refs.c:959`)
+    /// auto-creates one only for `HEAD` and for `refs/{heads,remotes,notes}/`,
+    /// and a one-level name is none of those — which is why the loose write is
+    /// all there is to match.
+    fn write_onelevel_ref(&self, name: &str, new: ObjectId) -> Result<()> {
+        let path = self.repo.path().join(name);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut lock = path.clone().into_os_string();
+        lock.push(".lock");
+        let lock = std::path::PathBuf::from(lock);
+        std::fs::write(&lock, format!("{new}\n")).with_context(|| format!("cannot write {}", lock.display()))?;
+        std::fs::rename(&lock, &path).with_context(|| format!("cannot write {}", path.display()))
     }
 
     /// Whether `old` is reachable from `new`, i.e. the update loses no commits.
@@ -1643,6 +1714,9 @@ impl Importer {
         if old == Some(new) {
             return Ok(());
         }
+        if FullName::try_from(name).is_err() {
+            return self.write_onelevel_ref(name, new);
+        }
         self.repo.edit_reference(RefEdit {
             change: Change::Update {
                 log: LogChange {
@@ -1657,10 +1731,101 @@ impl Importer {
                 new: Target::Object(new),
             },
             name: name.try_into()?,
-            deref: false,
+            // `update_branch()` calls `ref_transaction_update()` without
+            // `REF_NO_DEREF`, so a symbolic ref is followed and its target is
+            // what moves: `commit HEAD` advances the branch HEAD points at and
+            // leaves HEAD symbolic.
+            deref: true,
         })?;
         Ok(())
     }
+}
+
+/// git's `refname_disposition` table (`refs.c:49-58`), which classifies a byte
+/// for the two functions below: 0 acceptable, 1 end-of-component, 2 `.`, 3 `{`,
+/// 4 forbidden, 5 `*`.
+fn refname_disposition(byte: u8) -> u8 {
+    match byte {
+        0 | b'/' => 1,
+        b'.' => 2,
+        b'{' => 3,
+        b'*' => 5,
+        0x01..=0x20 | b':' | b'?' | b'[' | b'\\' | b'^' | b'~' | 0x7f => 4,
+        _ => 0,
+    }
+}
+
+/// git's `check_refname_component()` (`refs.c:161`): the length of the component
+/// at the front of `s`, or `None` when the component itself is malformed.
+///
+/// A zero length is a legal answer — `check_or_sanitize_refname` is the one that
+/// rejects an empty component — and mirrors the `cp == refname` early return.
+fn refname_component_len(s: &[u8]) -> Option<usize> {
+    let mut last = 0u8;
+    let mut cp = 0;
+    while cp < s.len() {
+        match refname_disposition(s[cp]) {
+            1 => break,
+            2 if last == b'.' => return None,  // ".."
+            3 if last == b'@' => return None,  // "@{"
+            4 | 5 => return None,              // forbidden byte, or "*" without a pattern flag
+            _ => {}
+        }
+        last = s[cp];
+        cp += 1;
+    }
+    if cp == 0 {
+        return Some(0);
+    }
+    if s[0] == b'.' || s[..cp].ends_with(b".lock") {
+        return None;
+    }
+    Some(cp)
+}
+
+/// git's `check_refname_format(name, REFNAME_ALLOW_ONELEVEL)`
+/// (`refs.c:289` into `check_or_sanitize_refname` at 245), which is exactly how
+/// `fast-import.c:617` validates a branch name in `new_branch()`.
+///
+/// The `ALLOW_ONELEVEL` flag is the whole point: a stream may say `commit main`,
+/// and git accepts it, writing `$GIT_DIR/main`. gix's `FullName` implements the
+/// flagless form instead — `gix-validate`'s `reference::name` requires a slash
+/// unless the name is all-uppercase — so it rejects `main`, `v1.2` and every
+/// other lowercase one-level name that git takes.
+fn refname_ok_onelevel(name: &str) -> bool {
+    if name == "@" {
+        return false;
+    }
+    let mut rest = name.as_bytes();
+    loop {
+        let Some(len) = refname_component_len(rest) else { return false };
+        if len == 0 {
+            return false;
+        }
+        if len == rest.len() {
+            // The last component, and the only one whose trailing '.' is checked.
+            return rest[len - 1] != b'.';
+        }
+        rest = &rest[len + 1..];
+    }
+}
+
+/// git's `refname_is_safe()` (`refs.c:300`), which guards a *deletion* rather
+/// than an update: `ref_transaction_update()` picks it over
+/// `check_refname_format()` when the new id is null (`refs.c:1199-1205`).
+///
+/// Outside `refs/` a name must be all-uppercase or `_`, so the one-level refs
+/// this file can create are deletable only when they are shouted.
+fn refname_is_safe(name: &str) -> bool {
+    if let Some(rest) = name.strip_prefix("refs/") {
+        if rest.is_empty() || rest.starts_with('/') || rest.ends_with('/') {
+            return false;
+        }
+        // `normalize_path_copy()` leaves a path alone unless it has a "." or
+        // ".." component to resolve, so "unchanged" means "does not escape".
+        return !rest.split('/').any(|c| c == "." || c == ".." || c.is_empty());
+    }
+    !name.is_empty() && name.bytes().all(|b| b.is_ascii_uppercase() || b == b'_')
 }
 
 /// Where a cryptographic signature starts inside a tag message, or `None` when

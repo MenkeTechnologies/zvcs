@@ -295,7 +295,7 @@ enum ReencodeMode {
 
 /// The traversal order; git's `--topo-order` (fast-export's default) or `--date-order`.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Order {
+pub(super) enum Order {
     Topo,
     Date,
 }
@@ -1491,7 +1491,7 @@ fn dedup_first_wins(ids: &mut Vec<ObjectId>) {
 /// `compare_commits_by_commit_date` instead (commit.c:930-940), making it a
 /// newest-first heap with insertion order breaking ties (prio-queue.c:4-11), and
 /// is left un-reversed.
-fn sort_in_topological_order(
+pub(super) fn sort_in_topological_order(
     list: Vec<gix::traverse::commit::Info>,
     order: Order,
 ) -> Vec<gix::traverse::commit::Info> {

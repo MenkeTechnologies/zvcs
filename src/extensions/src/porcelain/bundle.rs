@@ -51,10 +51,17 @@
 //!     (`HEAD` stays `HEAD` because it is a symref; a short name is written out
 //!     as the full ref it dwims to). The revision arguments are the ones
 //!     `setup_revisions()` reads — `create_bundle()` calls it directly
-//!     (`bundle.c:501`) — so `<rev>`, `^<rev>`, `<a>..<b>`, `--not` and the whole
-//!     ref-selecting family (`--all`, `--branches`, `--tags`, `--remotes`, each
-//!     optionally `=<glob>`, plus `--glob=<glob>` and the `--exclude=<glob>`
-//!     patterns the next of them consumes) all reach it. `-` writes to stdout,
+//!     (`bundle.c:501`) — so `<rev>`, `^<rev>`, `<a>..<b>`, `<a>...<b>` (merge
+//!     bases excluded and pended first, under `oid_to_hex()`), `<rev>^@`,
+//!     `<rev>^!`, `<rev>^-<n>`, `--not`, `--stdin` and the whole ref-selecting
+//!     family (`--all`, `--branches`, `--tags`, `--remotes`, each optionally
+//!     `=<glob>`, plus `--glob=<glob>` and the `--exclude=<glob>` patterns the
+//!     next of them consumes) all reach it. So does the half of that grammar
+//!     that is *not* revisions: a `--` and everything behind it, and a bare `..`
+//!     — the pathspec for the parent directory rather than a range
+//!     (revision.c:2164) — become `prune_data`, which `setup_revisions()` then
+//!     parses, so `git bundle create <file> ..` ends at `pathspec.c`'s
+//!     `'..' is outside repository`. `-` writes to stdout,
 //!     any other name is
 //!     written through a `.lock` and renamed, as `hold_lock_file_for_update`
 //!     does. `Refusing to create empty bundle.` and `unsupported bundle
@@ -697,10 +704,20 @@ fn create(args: &[String]) -> Result<ExitCode> {
     };
 
     let repo = gix::discover(".")?;
-    let pending = match resolve_revisions(&repo, &rev_args)? {
+    let (pending, pathspecs) = match resolve_revisions(&repo, &rev_args)? {
         Ok(p) => p,
         Err(code) => return Ok(code),
     };
+    // `setup_revisions()`'s tail: `parse_pathspec(&revs->prune_data, …)` over
+    // whatever reached `prune_data`, which is where a `..` that never was a
+    // range finally lands. It runs inside `setup_revisions()`, so it precedes
+    // everything `create_bundle()` does afterwards — including
+    // `Refusing to create empty bundle.` for the pending list it just left
+    // empty.
+    if let Some(msg) = crate::pathspec::parse_pathspec_fatal(&repo, &pathspecs) {
+        eprintln!("fatal: {msg}");
+        return Ok(ExitCode::from(128));
+    }
 
     // `if (version == -1) version = min_version;` — 2 for sha1, and only 2 or 3
     // exist (bundle.c:525-531). The v2 header carries no `@object-format`
@@ -733,19 +750,32 @@ fn create(args: &[String]) -> Result<ExitCode> {
 
     // `revs.boundary = 1` then `traverse_commit_list(..., write_bundle_prerequisites, ...)`
     // (bundle.c:564-575): each BOUNDARY commit is written as `-<oid> <oneline>`.
-    let tips: Vec<ObjectId> = pending.iter().filter(|p| !p.uninteresting).map(|p| p.id).collect();
+    //
+    // The pending list is kept as git pends it — unpeeled — because that is what
+    // `write_bundle_refs()` and `write_pack_data()` read (`revs_copy.pending`,
+    // bundle.c:576-587), and an annotated tag has to reach the pack as a tag.
+    // The *walk* sees `prepare_revision_walk()`'s view instead: every entry goes
+    // through `handle_commit()`, whose tag loop peels down to the commit and
+    // carries the flags with it (`object->flags |= flags`, revision.c). Without
+    // that peel a tag tip walks nothing at all, which is why
+    // `git bundle create <file> v1 ^v1^` reported a complete history where stock
+    // 2.55.0 lists three prerequisites.
+    let want_objects: Vec<ObjectId> =
+        pending.iter().filter(|p| !p.uninteresting).map(|p| p.id).collect();
     let excluded: Vec<ObjectId> =
         pending.iter().filter(|p| p.uninteresting).map(|p| p.id).collect();
+    let tips: Vec<ObjectId> = want_objects.iter().map(|id| peel_to_commit(&repo, *id)).collect();
+    let hidden: Vec<ObjectId> = excluded.iter().map(|id| peel_to_commit(&repo, *id)).collect();
     // `UNINTERESTING` sits on the object, and by the time the header is written git
     // has already run the walk that spreads it to every ancestor of a `^<rev>`. Both
     // the prerequisite scan and the ref list below read it back off the objects they
     // hold, so the closure is computed once here.
-    let excluded_closure = if excluded.is_empty() {
+    let excluded_closure = if hidden.is_empty() {
         std::collections::HashSet::new()
     } else {
-        super::log::ancestor_closure(&repo, &excluded)?
+        super::log::ancestor_closure(&repo, &hidden)?
     };
-    let prereqs = boundary_commits(&repo, &tips, &excluded, &excluded_closure);
+    let prereqs = boundary_commits(&repo, &tips, &hidden, &excluded_closure);
     for id in &prereqs {
         let subject = commit_oneline(&repo, *id);
         out.extend_from_slice(format!("-{id} {subject}\n").as_bytes());
@@ -785,9 +815,14 @@ fn create(args: &[String]) -> Result<ExitCode> {
     // A non-thin pack is a strictly self-contained superset — `unbundle` and
     // `index-pack --fix-thin` accept it unchanged — so the bundle is correct,
     // but its bytes are not git's. See the module header.
+    //
+    // The wants are the pending entries as typed, so a tag tip is packed as a
+    // tag; the haves are the peeled ones, because `pack-objects` peels a `^<tag>`
+    // itself and a receiver that already has the commit is what the exclusion
+    // means.
     let mut haves = prereqs.clone();
-    haves.extend_from_slice(&excluded);
-    let objects = crate::porcelain::push_proto::objects_to_send(&repo, &tips, &haves);
+    haves.extend_from_slice(&hidden);
+    let objects = crate::porcelain::push_proto::objects_to_send(&repo, &want_objects, &haves);
     // `write_pack_data()` spawns `pack-objects --stdout --thin --delta-base-offset`
     // (bundle.c:333-336) — the flag is unconditional there, so a bundle's deltas
     // are always `OBJ_OFS_DELTA`. Passing `false` here wrote `OBJ_REF_DELTA`
@@ -835,24 +870,88 @@ struct Pending {
     uninteresting: bool,
 }
 
+/// One element of the revision argv, after `--stdin` has been spliced in where
+/// it stood.
+struct Item {
+    text: String,
+    /// Read by `read_revisions_from_stdin()` rather than typed on the command
+    /// line, which changes two things: the line is handled with
+    /// `REVARG_CANNOT_BE_FILENAME`, and `warn_on_object_refname_ambiguity` is
+    /// off for the whole block.
+    from_stdin: bool,
+}
+
 /// `setup_revisions()` reduced to the grammar `bundle create` is documented
 /// with: the ref-selecting pseudo-options (`--all`, `--branches`, `--tags`,
 /// `--remotes`, `--glob`, each filtered by the `--exclude` patterns it consumes),
-/// `<rev>`, `^<rev>`, and `<a>..<b>`.
+/// `--stdin`, `<rev>`, `^<rev>`, `<a>..<b>` and `<a>...<b>`.
 ///
 /// `builtin/bundle.c:104` hands its whole post-`parse_options` argv to
 /// `create_bundle()`, which calls `setup_revisions()` (bundle.c:501) — so the
 /// pseudo-option family reaches `git bundle create` unchanged.
+///
+/// Returns the pending list *and* the `prune_data` git collected alongside it:
+/// an operand that is not a revision at all does not disappear, it becomes a
+/// pathspec, and `setup_revisions()` parses that list before it returns.
 fn resolve_revisions(
     repo: &gix::Repository,
     args: &[&str],
-) -> Result<std::result::Result<Vec<Pending>, ExitCode>> {
+) -> Result<std::result::Result<(Vec<Pending>, Vec<Vec<u8>>), ExitCode>> {
     let mut pending = Vec::new();
     let mut excludes: Vec<String> = Vec::new();
     let mut negate = false;
+
+    // `setup_revisions()`'s first act, before it looks at a single argument:
+    //
+    // ```c
+    // for (i = 1; i < argc; i++) {
+    //         const char *arg = argv[i];
+    //         if (strcmp(arg, "--"))
+    //                 continue;
+    //         argv[i] = NULL;
+    //         argc = i;
+    //         if (argv[i + 1])
+    //                 strvec_pushv(&prune_data, argv + i + 1);
+    //         seen_dashdash = 1;
+    //         break;
+    // }
+    // ```
+    //
+    // (revision.c:2836-2851). The argv is *cut* at the `--`, everything after it
+    // is prune data, and every surviving argument then carries
+    // `REVARG_CANNOT_BE_FILENAME` — which is what stops a `..` in front of the
+    // `--` from being the parent-directory pathspec.
+    let mut pathspecs: Vec<Vec<u8>> = Vec::new();
+    let mut args = args;
+    let mut seen_dashdash = false;
+    if let Some(cut) = args.iter().position(|a| *a == "--") {
+        pathspecs.extend(args[cut + 1..].iter().map(|a| a.as_bytes().to_vec()));
+        args = &args[..cut];
+        seen_dashdash = true;
+    }
+
+    let mut items: Vec<Item> =
+        args.iter().map(|a| Item { text: (*a).to_string(), from_stdin: false }).collect();
+    let mut read_from_stdin = false;
+
     let mut i = 0;
-    while i < args.len() {
-        let a = args[i];
+    while i < items.len() {
+        // Cloned rather than borrowed: `--stdin` splices its lines into `items`
+        // from inside this same iteration.
+        let text = items[i].text.clone();
+        let a = text.as_str();
+        let from_stdin = items[i].from_stdin;
+        // `read_revisions_from_stdin()` saves and clears
+        // `warn_on_object_refname_ambiguity` around the whole block, so no line
+        // it reads can warn about an ambiguous refname.
+        let _quiet = from_stdin.then(crate::objname::AmbiguityWarnings::off);
+        // `REVARG_CANNOT_BE_FILENAME` reaches `handle_revision_arg_1()` from two
+        // places: `setup_revisions()` sets it for every argument once it has
+        // found a `--` of its own, and `read_revisions_from_stdin()` passes it
+        // unconditionally for each line it reads. So a `..` typed on the command
+        // line is the parent-directory pathspec while the same `..` fed through
+        // `--stdin` is the range `HEAD..HEAD`.
+        let cant_be_filename = seen_dashdash || from_stdin;
         // `--exclude=<glob>` only accumulates; the next ref-selecting option
         // applies and clears it (`clear_ref_exclusions`).
         if let Some(v) = a.strip_prefix("--exclude=") {
@@ -862,10 +961,10 @@ fn resolve_revisions(
         }
         if a == "--exclude" {
             i += 1;
-            let Some(v) = args.get(i) else {
+            let Some(v) = items.get(i) else {
                 anyhow::bail!("option 'exclude' requires a value");
             };
-            excludes.push((*v).to_string());
+            excludes.push(v.text.clone());
             i += 1;
             continue;
         }
@@ -877,8 +976,8 @@ fn resolve_revisions(
         // `--glob` takes its value attached or as the next argv element.
         let glob_value = if a == "--glob" {
             i += 1;
-            match args.get(i) {
-                Some(v) => Some((*v).to_string()),
+            match items.get(i) {
+                Some(v) => Some(v.text.clone()),
                 None => anyhow::bail!("option 'glob' requires a value"),
             }
         } else {
@@ -923,6 +1022,36 @@ fn resolve_revisions(
             i += 1;
             continue;
         }
+        // `--stdin`, which `setup_revisions()` reads *at the point it stands in
+        // argv* (revision.c:2872-2879) — so the lines join the pending list
+        // between the arguments on either side of it, and an earlier argument
+        // that dies is still the one that gets reported.
+        //
+        // ```c
+        // if (!strcmp(arg, "--stdin")) {
+        //         if (revs->disable_stdin) { argv[left++] = arg; continue; }
+        //         if (revs->read_from_stdin++)
+        //                 die("--stdin given twice?");
+        //         read_revisions_from_stdin(revs, &prune_data);
+        //         continue;
+        // }
+        // ```
+        //
+        // `create_bundle()` leaves `disable_stdin` at 0, so the branch is live.
+        if a == "--stdin" && !items[i].from_stdin {
+            if read_from_stdin {
+                eprintln!("fatal: --stdin given twice?");
+                return Ok(Err(ExitCode::from(128)));
+            }
+            read_from_stdin = true;
+            let mut lines = Vec::new();
+            if let Err(code) = read_revisions_from_stdin(&mut lines, &mut pathspecs) {
+                return Ok(Err(code));
+            }
+            items.splice(i + 1..i + 1, lines);
+            i += 1;
+            continue;
+        }
         // `if (argc > 1) error(_("unrecognized argument: %s"), argv[1])`
         // (bundle.c:503-506): whatever `setup_revisions()` left behind. `bundle
         // create`'s own switches are exactly that once the `<file>` operand has
@@ -938,6 +1067,130 @@ fn resolve_revisions(
         {
             eprintln!("error: unrecognized argument: {a}");
             return Ok(Err(ExitCode::from(255)));
+        }
+        // `handle_revision_arg_1()`'s very first test, ahead of everything
+        // below:
+        //
+        // ```c
+        // if (!cant_be_filename && !strcmp(arg, "..")) {
+        //         /*
+        //          * Just ".."?  That is not a range but the
+        //          * pathspec for the parent directory.
+        //          */
+        //         return -1;
+        // }
+        // ```
+        //
+        // (revision.c:2164). The `-1` sends `setup_revisions()` down its
+        // `verify_filename()` branch, which pushes this operand *and every one
+        // after it* into `prune_data` and stops reading revisions
+        // (revision.c:2896-2912) — so `git bundle create <file> ..` is the
+        // pathspec layer's `'..' is outside repository`, not a revision error.
+        if crate::objname::is_parent_directory_pathspec(a, cant_be_filename) {
+            // ```c
+            // for (j = i; j < argc; j++)
+            //         verify_filename(revs->prefix, argv[j], j == i);
+            // strvec_pushv(&prune_data, argv + i);
+            // break;
+            // ```
+            //
+            // `j == i` is `diagnose_misspelt_rev`, so only the operand that just
+            // failed as a revision gets the ambiguous-argument wording; a later
+            // one is already known to stand in path position and gets the
+            // shorter `no such path in the working tree.` instead.
+            for (n, item) in items[i..].iter().enumerate() {
+                if let Some(msg) = crate::setup::verify_filename(&item.text, n == 0) {
+                    eprintln!("fatal: {msg}");
+                    return Ok(Err(ExitCode::from(128)));
+                }
+            }
+            pathspecs.extend(items[i..].iter().map(|it| it.text.as_bytes().to_vec()));
+            break;
+        }
+        // `handle_dotdot()`, which runs before the three-mark block below and is
+        // the *whole* of the range rule: both endpoints through
+        // `get_oid_with_context()`, `parse_object()` on each, and — for
+        // `<a>...<b>` only — `lookup_commit_reference()` on each. Asked of
+        // [`crate::objname`] rather than re-derived here, which is what brings
+        // the symmetric form along: the `split_once("..")` that used to stand in
+        // this spot read `<a>...<b>` as `<a>` against `.<b>` and could only fail.
+        let range = crate::objname::split_range(a).map(|r| {
+            // The `warning: refname … is ambiguous.` half of those two
+            // `get_oid_with_context()` calls. [`crate::objname::dotdot`] is quiet
+            // by design — it is a classifier every caller asks more than once —
+            // so the warning is requested separately, exactly once per operand,
+            // and the endpoints below are never resolved a second time.
+            crate::objname::warn_dotdot_endpoints(repo, a);
+            (r, crate::objname::dotdot(repo, a))
+        });
+        if let Some((r, crate::objname::Dotdot::Missing { .. })) = &range {
+            // `dotdot_missing()`, with whatever `lookup_commit_reference()`
+            // already printed ahead of it.
+            eprint!(
+                "{}",
+                crate::objname::dotdot_fatal(repo, a).unwrap_or_else(|| format!(
+                    "fatal: {}\n",
+                    crate::objname::dotdot_missing_message(a, r.symmetric)
+                ))
+            );
+            return Ok(Err(ExitCode::from(128)));
+        }
+        if let Some((r, crate::objname::Dotdot::Ok { a: a_oid, b: b_oid })) = range {
+            // `handle_dotdot_1()`'s pending order, which is the order the header's
+            // ref list comes out in. For `<a>...<b>` the merge bases go first
+            // (`add_pending_commit_list(revs, exclude, flags_exclude)`,
+            // revision.c:2052), then the left endpoint, then the right.
+            //
+            // The ids that get pended are `a_obj`/`b_obj` — what `parse_object()`
+            // returned for the names, *unpeeled*. `lookup_commit_reference()`
+            // runs only to feed `get_merge_bases()`, and its result is never
+            // pended, which is why `git bundle create <file> v1...main` writes
+            // the tag's own id under `refs/tags/v1` and not the commit's.
+            // [`crate::objname::Dotdot`] hands back the peeled pair for the
+            // symmetric form, so the raw ones are re-read here from the same
+            // quiet resolution it used.
+            let (a_raw, b_raw) = match (
+                crate::objname::resolve_quiet(repo, r.a),
+                crate::objname::resolve_quiet(repo, r.b),
+            ) {
+                (Some(a_raw), Some(b_raw)) => (a_raw, b_raw),
+                _ => (a_oid, b_oid),
+            };
+            if r.symmetric {
+                // Each base is pended under `oid_to_hex()` rather than a name, so
+                // `repo_dwim_ref()` finds nothing for it and it never reaches the
+                // ref list — only the prerequisite walk.
+                for base in repo.merge_bases_many(a_oid, &[b_oid])? {
+                    pending.push(Pending {
+                        id: base.detach(),
+                        display_ref: None,
+                        uninteresting: !negate,
+                    });
+                }
+                // `b_flags = flags` and `a_flags = flags | SYMMETRIC_LEFT`: both
+                // ends of a symmetric difference are interesting, and only the
+                // bases carry `flags_exclude`.
+                pending.push(Pending {
+                    id: a_raw,
+                    display_ref: display_ref(repo, r.a),
+                    uninteresting: negate,
+                });
+            } else {
+                // `a_flags = flags_exclude`: the left end of `<a>..<b>` is the
+                // excluded one, and a preceding `--not` flips both.
+                pending.push(Pending {
+                    id: a_raw,
+                    display_ref: display_ref(repo, r.a),
+                    uninteresting: !negate,
+                });
+            }
+            pending.push(Pending {
+                id: b_raw,
+                display_ref: display_ref(repo, r.b),
+                uninteresting: negate,
+            });
+            i += 1;
+            continue;
         }
         // `handle_revision_arg_1()`'s three-mark block, which runs before the
         // operand is resolved at all — `get_oid_1()` has no case for `^@`, `^!`
@@ -987,43 +1240,100 @@ fn resolve_revisions(
                 }
             }
         };
+        // `if (*arg == '^') { local_flags = UNINTERESTING | BOTTOM; arg++; }`,
+        // then the single `get_oid_with_context()` for whatever is left.
         // `setup_revisions()` reports an unresolvable revision itself, with the
         // token as written and its own exit code — the same message `git log`
         // raises, since it is the same function.
-        let mut resolved = Vec::new();
-        let parts: Vec<(&str, bool)> = match a.strip_prefix('^') {
-            Some(rest) => vec![(rest, !negate)],
-            None => match a.split_once("..") {
-                Some((left, right)) => vec![(left, !negate), (right, negate)],
-                None => vec![(a, negate)],
-            },
+        let (spec, uninteresting) = match a.strip_prefix('^') {
+            Some(rest) => (rest, !negate),
+            None => (a, negate),
         };
-        // `handle_dotdot_1()` resolves a range's two endpoints in one `||`-joined
-        // pair, before either object is looked up, so both warn — while
-        // [`one_pending`] below stops at the first endpoint whose object is
-        // missing, which for a full-length hex is exactly the case that warns.
-        // The warning therefore belongs to the token, and the resolutions that
-        // follow are silenced so the count stays at git's.
-        // `warn_dotdot_endpoints` carries the `||`'s own short-circuit: a left
-        // endpoint that does not resolve at all still stops the right one.
-        let range = crate::objname::split_range(a).is_some();
-        if range {
-            crate::objname::warn_dotdot_endpoints(repo, a);
-        }
-        let _quiet = range.then(crate::objname::AmbiguityWarnings::off);
-        for (spec, uninteresting) in parts {
-            match one_pending(repo, spec, uninteresting) {
-                Ok(p) => resolved.push(p),
-                Err(_) => {
+        match one_pending(repo, spec, uninteresting) {
+            Ok(p) => pending.push(p),
+            Err(_) => {
+                // `read_revisions_from_stdin()` has its own refusal —
+                // `die("bad revision '%s'", sb.buf)` — so a line it read never
+                // reaches `setup_revisions()`' filename fallback and is named
+                // whole, exclusion mark and all.
+                if from_stdin {
+                    eprintln!("fatal: bad revision '{a}'");
+                } else {
                     eprint!("{}", super::log::bad_revision_message_in(repo, a));
-                    return Ok(Err(ExitCode::from(128)));
                 }
+                return Ok(Err(ExitCode::from(128)));
             }
         }
-        pending.extend(resolved);
         i += 1;
     }
-    Ok(Ok(pending))
+    Ok(Ok((pending, pathspecs)))
+}
+
+/// git's `read_revisions_from_stdin()` (revision.c), the whole of it:
+///
+/// ```c
+/// while (strbuf_getline(&sb, stdin) != EOF) {
+///         int len = sb.len;
+///         if (!len)
+///                 break;
+///         if (sb.buf[0] == '-') {
+///                 if (len == 2 && sb.buf[1] == '-') {
+///                         seen_dashdash = 1;
+///                         break;
+///                 }
+///                 die(_("invalid option '%s' in --stdin mode"), sb.buf);
+///         }
+///         if (handle_revision_arg(sb.buf, revs, 0, REVARG_CANNOT_BE_FILENAME))
+///                 die("bad revision '%s'", sb.buf);
+/// }
+/// if (seen_dashdash)
+///         read_pathspec_from_stdin(&sb, prune);
+/// ```
+///
+/// An *empty* line ends the revision list, a lone `--` ends it and hands every
+/// remaining line to the pathspec list, and any other line starting with `-` is
+/// fatal — `--stdin` takes no options, not even the ones the command line
+/// accepts. The lines themselves are handed back for the caller to process in
+/// place, because git processes them where `--stdin` stood.
+fn read_revisions_from_stdin(
+    lines: &mut Vec<Item>,
+    pathspecs: &mut Vec<Vec<u8>>,
+) -> std::result::Result<(), ExitCode> {
+    use std::io::BufRead;
+    let stdin = io::stdin();
+    let mut input = stdin.lock();
+    let mut seen_dashdash = false;
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match input.read_line(&mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        // `strbuf_getline()` strips the terminator and a CR in front of it.
+        let text = line.trim_end_matches('\n').trim_end_matches('\r').to_string();
+        if text.is_empty() {
+            break;
+        }
+        if text.starts_with('-') {
+            if text == "--" {
+                seen_dashdash = true;
+                break;
+            }
+            // 2.55.0's wording, which names the offending line:
+            // `die(_("invalid option '%s' in --stdin mode"), sb.buf)`.
+            eprintln!("fatal: invalid option '{text}' in --stdin mode");
+            return Err(ExitCode::from(128));
+        }
+        lines.push(Item { text, from_stdin: true });
+    }
+    if seen_dashdash {
+        // `read_pathspec_from_stdin()`: every remaining line, to EOF, verbatim.
+        for line in input.lines().map_while(std::result::Result::ok) {
+            pathspecs.push(line.into_bytes());
+        }
+    }
+    Ok(())
 }
 
 /// Resolve one revision argument, recording the name `write_bundle_refs` would
@@ -1053,6 +1363,19 @@ fn one_pending(repo: &gix::Repository, spec: &str, uninteresting: bool) -> Resul
 /// `add_parents_only()` queues for `HEAD^@` are named `HEAD`, so they come back
 /// out of the bundle header under that name even though `HEAD` points elsewhere.
 fn display_ref(repo: &gix::Repository, name: &str) -> Option<String> {
+    // ```c
+    // if (repo_dwim_ref(revs->repo, e->name, strlen(e->name), &oid, &ref, 0) != 1)
+    //         goto skip_write_ref;
+    // ```
+    //
+    // `!= 1`, not `== 0`: a name that answers to *several* refs is skipped just
+    // like one that answers to none. `git bundle create <file> dup`, with `dup`
+    // both a branch and a tag, therefore writes no ref at all and refuses the
+    // empty bundle — where taking gitoxide's own dwim, which simply picks one,
+    // wrote `refs/tags/dup` and a bundle stock never produces.
+    if crate::porcelain::rev_parse::dwim_ref_matches(repo, name).len() != 1 {
+        return None;
+    }
     match repo.find_reference(name) {
         Ok(r) => {
             let is_symref = matches!(r.target(), gix::refs::TargetRef::Symbolic(_));
@@ -1099,7 +1422,82 @@ fn boundary_commits(
             }
         }
     }
-    boundary
+    // `create_boundary_commit_list()` (revision.c:4171-4207) then drains
+    // `revs->boundary_commits` into `revs->commits` with `commit_list_insert()`,
+    // which *prepends*:
+    //
+    // ```c
+    // for (i = 0; i < array->nr; i++) {
+    //         c = (struct commit *)(objects[i].item);
+    //         ...
+    //         c->object.flags |= BOUNDARY;
+    //         commit_list_insert(c, &revs->commits);
+    // }
+    // sort_in_topological_order(&revs->commits, revs->sort_order);
+    // ```
+    //
+    // So the list reaches the sort in the reverse of the order the walk met each
+    // parent — and then the sort runs unconditionally, with `revs->sort_order`
+    // still at its `REV_SORT_IN_GRAPH_ORDER` default because nothing on this
+    // path sets `--date-order`.
+    boundary.reverse();
+    sort_boundary_in_topological_order(repo, boundary)
+}
+
+/// `sort_in_topological_order(&revs->commits, REV_SORT_IN_GRAPH_ORDER)` applied
+/// to the boundary list, by handing it to the port `fast-export` already
+/// carries rather than writing a second one.
+///
+/// Reversing alone is not the whole of `create_boundary_commit_list()`: the
+/// prerequisites of `bundle create <file> main~4 side^ ^main~5` are `C` and then
+/// `B`, and `B` is `C`'s parent, so the sort is what puts the child in front of
+/// its parent no matter which order the date-ordered walk met them in.
+///
+/// The `Info` values are built here because that port speaks git's commit list;
+/// `commit_time` is `None` because `REV_SORT_IN_GRAPH_ORDER` is the `compare ==
+/// NULL` prio-queue, which never looks at a date.
+fn sort_boundary_in_topological_order(
+    repo: &gix::Repository,
+    ids: Vec<ObjectId>,
+) -> Vec<ObjectId> {
+    let mut list: Vec<gix::traverse::commit::Info> = Vec::with_capacity(ids.len());
+    for id in &ids {
+        // Every boundary id is a commit the walk just read a parent link from,
+        // so this cannot fail; if it somehow does, the un-sorted list is still
+        // the complete prerequisite set and is returned rather than truncated.
+        let Ok(commit) = repo.find_commit(*id) else { return ids };
+        list.push(gix::traverse::commit::Info {
+            id: *id,
+            parent_ids: commit.parent_ids().map(|p| p.detach()).collect(),
+            commit_time: None,
+        });
+    }
+    super::fast_export::sort_in_topological_order(list, super::fast_export::Order::Topo)
+        .into_iter()
+        .map(|info| info.id)
+        .collect()
+}
+
+/// `handle_commit()`'s tag loop (revision.c), which is how every pending entry
+/// reaches the walk:
+///
+/// ```c
+/// while (object->type == OBJ_TAG) {
+///         struct tag *tag = (struct tag *) object;
+///         ...
+///         object = parse_object(revs->repo, get_tagged_oid(tag));
+///         ...
+///         object->flags |= flags;
+/// }
+/// ```
+///
+/// The flags ride down to the commit, so an annotated tag named with `^` excludes
+/// its commit's history and one named as a tip walks it. Only the *walk* sees
+/// this: `revs_copy.pending` keeps the tag object, which is what puts the tag
+/// itself in the pack and its ref in the header.
+fn peel_to_commit(repo: &gix::Repository, id: ObjectId) -> ObjectId {
+    let Ok(object) = repo.find_object(id) else { return id };
+    object.peel_to_kind(gix::object::Kind::Commit).map_or(id, |commit| commit.id)
 }
 
 /// `CMIT_FMT_ONELINE`: the commit's subject, i.e. its message up to the first

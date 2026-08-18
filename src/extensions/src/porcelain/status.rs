@@ -123,6 +123,18 @@ enum Untracked {
 ///     pathspec, and the short / porcelain formats ignore `-v` entirely. The
 ///     patches come from this binary's own `git diff`, so they are byte-identical
 ///     to it (see [`verbose_patch`]).
+///   * a `HEAD` that does not name a commit. Nothing on the staged path requires
+///     one: `run_diff_index` peels `s->reference` to a *tree*
+///     (`repo_parse_tree_indirect`, diff-lib.c:555), so a `HEAD` detached onto a
+///     tree reports normally, one on a blob is `error: bad tree object HEAD`
+///     (diff-lib.c:557 + `exit(128)` at :647-648) and one naming an object the
+///     odb lacks is `fatal: bad object HEAD` (revision.c:368). Both refusals
+///     happen during collection, so stdout stays empty in every format. (`git
+///     commit` is stricter and refuses all three — see [`super::commit`].)
+///   * a detached `HEAD` named after `HEAD`'s reflog rather than after its
+///     object — `HEAD detached at refs/heads/<b>` / `at <tag>` / `from <oid>`,
+///     and `Not currently on any branch.` when no switch was ever logged (see
+///     [`detached_from`]).
 ///   * unmerged (conflicted) paths, in both long and short form.
 ///   * `git status [--] <pathspec>...` — limits the report to matching paths
 ///     (the gix status iterator is given the patterns), across every format.
@@ -140,6 +152,53 @@ pub fn status(args: &[String]) -> Result<ExitCode> {
     status_with(args, Reference::Status)
 }
 
+/// `prepare_to_commit()`'s commented status block in `COMMIT_EDITMSG`
+/// (builtin/commit.c:1025) — the same engine as a report on stdout, pointed at a
+/// string and with the four settings the editor buffer forces.
+///
+/// git reaches it through `run_status(s->fp, index_file, prefix, 1, s)` after
+/// having already set, on the very same `wt_status`:
+///
+///   * `s->display_comment_prefix = 1` (builtin/commit.c:917) — the block *is*
+///     comments, whatever `status.displayCommentPrefix` says. The comment string
+///     is the caller's because an `auto` comment char is chosen against the
+///     message body (`adjust_comment_line_char()`, builtin/commit.c:935), which
+///     this module cannot see;
+///   * `s->hints = 0` (:923) — "most hints are counter-productive when the commit
+///     has already started", so no `(use "git …")` direction survives;
+///   * `s->use_color = GIT_COLOR_NEVER` (:1024) — a commit message is not a
+///     terminal;
+///   * `nowarn = 1` (:1025) — the trailing `no changes added to commit` /
+///     `nothing to commit …` summary is dropped (wt-status.c:1977-1978). `No
+///     changes` under `--amend` is *not*, because git tests `s->amend` first.
+///
+/// `status_format` is `STATUS_FORMAT_NONE` for the whole of `cmd_commit`
+/// (builtin/commit.c:1810, "Ignore status.short"), which is what `--long` pins
+/// here.
+pub(crate) fn commit_template_block(
+    reference: Reference,
+    untracked: Option<&str>,
+    comment: &str,
+) -> Result<String> {
+    let mut args = vec!["--long".to_string()];
+    // `handle_untracked_files_arg()` ran before `prepare_to_commit()`, so the
+    // block honors `-u<mode>` exactly as the report on stdout does.
+    if let Some(u) = untracked {
+        args.push(format!("--untracked-files={u}"));
+    }
+    let mut body = String::new();
+    status_report(&args, reference, Some(Template { comment, out: &mut body }))?;
+    Ok(body)
+}
+
+/// [`commit_template_block`]'s destination and the comment string it commits to.
+struct Template<'a> {
+    /// `comment_line_str` as `prepare_to_commit()` settled it.
+    comment: &'a str,
+    /// `s->fp`, which for the editor block is `COMMIT_EDITMSG` rather than stdout.
+    out: &'a mut String,
+}
+
 /// What the staged half of the report is measured against: git's `s->reference`,
 /// with `s->amend` riding along because the two are only ever set together
 /// (builtin/commit.c:571-574).
@@ -147,7 +206,7 @@ pub fn status(args: &[String]) -> Result<ExitCode> {
 /// `git status` leaves both alone and compares the index against `HEAD`. `git
 /// commit --amend` points the engine at `HEAD^1` instead, because the commit it
 /// is about to write replaces `HEAD` rather than following it — so "what would
-/// this commit record" is the difference from `HEAD`'s *parent*. Five things in
+/// this commit record" is the difference from `HEAD`'s *parent*. Six things in
 /// the long format change with it, all of them because git branched on
 /// `s->reference` or `s->amend` rather than on `HEAD`:
 ///
@@ -159,7 +218,9 @@ pub fn status(args: &[String]) -> Result<ExitCode> {
 ///   * an uncommittable report ends in `No changes` instead of one of the
 ///     `nothing to commit` wordings (wt-status.c:1974-1976);
 ///   * the "use `git commit --amend`" advice on a rebase banner is suppressed —
-///     the user is already doing that (wt-status.c:1542).
+///     the user is already doing that (wt-status.c:1542);
+///   * the staged submodule summary is `git submodule summary … HEAD^` rather
+///     than `… HEAD` (wt-status.c:1046).
 /// The third variant is not about the reference at all but travels with it:
 /// `cmd_commit()` sets `s->commit_template = 1` for every report it produces
 /// (builtin/commit.c:1809), which is what turns the unborn-repository notice from
@@ -202,6 +263,16 @@ impl Reference {
 /// which `git commit` calls both for `--dry-run` and for the report that stands
 /// in for a refusal; the port's callers in [`super::commit`] mirror those two.
 pub(crate) fn status_with(args: &[String], reference: Reference) -> Result<ExitCode> {
+    status_report(args, reference, None)
+}
+
+/// [`status_with`] and [`commit_template_block`] in one body, because git runs
+/// them from one `wt_status`: `template` is `Some` only for the editor block.
+fn status_report(
+    args: &[String],
+    reference: Reference,
+    template: Option<Template<'_>>,
+) -> Result<ExitCode> {
     let mut short = false;
     let mut porcelain_v2 = false;
     // `--porcelain` selects the short *machine* format, which git never colors;
@@ -621,7 +692,12 @@ pub(crate) fn status_with(args: &[String], reference: Reference) -> Result<ExitC
         // routes every long-format line through `status_printf`, which prepends the
         // comment string; the short and porcelain renderers never do). Resolve the
         // comment string now so `render_long` needs no snapshot borrow.
-        if snap.boolean("status.displayCommentPrefix") == Some(true) {
+        if let Some(t) = &template {
+            // `s->display_comment_prefix = 1` (builtin/commit.c:917) with the
+            // comment string `prepare_to_commit()` settled on — the key is not
+            // even consulted.
+            comment_prefix = Some(t.comment.to_string());
+        } else if snap.boolean("status.displayCommentPrefix") == Some(true) {
             // `core.commentChar` and `core.commentString` are one variable in
             // `git_default_core_config()` (environment.c:435-456), so the *last* one set
             // across both spellings wins and `auto` resolves to `#` right there —
@@ -668,8 +744,9 @@ pub(crate) fn status_with(args: &[String], reference: Reference) -> Result<ExitC
     // `wt_status_prepare`: `s->hints = advice_enabled(ADVICE_STATUS_HINTS)`.
     // Every parenthesized "(use …)" direction in the long format hangs off this
     // one flag, and the trailing summary switches to its short wording when it is
-    // off. The short/porcelain formats carry no hints at all.
-    let hints = crate::advice::Advice::StatusHints.enabled_in(&repo);
+    // off. The short/porcelain formats carry no hints at all. The editor block
+    // pins it to zero (builtin/commit.c:923).
+    let hints = template.is_none() && crate::advice::Advice::StatusHints.enabled_in(&repo);
 
     // Resolve the head into an owned description so the borrow ends before we
     // re-open references for the tracking computation.
@@ -681,11 +758,12 @@ pub(crate) fn status_with(args: &[String], reference: Reference) -> Result<ExitC
     let head_state = if head_unborn {
         HeadState::Unborn(referent_short(head.referent_name(), "main"))
     } else if head.is_detached() {
-        let short_id = head
-            .id()
-            .map(|id| id.shorten_or_id().to_string())
-            .unwrap_or_default();
-        HeadState::Detached(short_id)
+        // `wt_status_get_state(..., s->branch && !strcmp(s->branch, "HEAD"))`
+        // (wt-status.c:883): the reflog lookup runs only for a detached `HEAD`.
+        match detached_from(&repo) {
+            Some((from, at)) => HeadState::Detached { from: Some(from), at },
+            None => HeadState::Detached { from: None, at: false },
+        }
     } else {
         HeadState::Branch(referent_short(head.referent_name(), "HEAD"))
     };
@@ -696,20 +774,29 @@ pub(crate) fn status_with(args: &[String], reference: Reference) -> Result<ExitC
     // false as soon as `HEAD` is a root commit. `reference_tree` is the tree side
     // the staged section is diffed against — git's `opt.def`, which falls back to
     // the empty tree when the reference is unresolvable (wt-status.c:673).
-    let reference_tree = match reference {
-        Reference::Status | Reference::Commit => None,
+    let reference_tree: Option<ObjectId> = match reference {
+        Reference::Status | Reference::Commit => match reference_tree_oid(&repo, "HEAD")? {
+            ReferenceTree::Resolved(tree) => tree,
+            ReferenceTree::BadObject => {
+                eprintln!("fatal: bad object {}", reference.spec());
+                return Ok(ExitCode::from(128));
+            }
+            ReferenceTree::BadTree => {
+                eprintln!("error: bad tree object {}", reference.spec());
+                return Ok(ExitCode::from(128));
+            }
+        },
         Reference::AmendParent => {
-            let resolved = match repo.rev_parse_single("HEAD^1").ok() {
+            // `HEAD^1` only resolves when `HEAD` is a commit, so neither failure
+            // mode above can arise: an unresolvable `HEAD^1` is git's
+            // `s->is_initial`, and a resolvable one is a commit with a tree.
+            match repo.rev_parse_single("HEAD^1").ok() {
                 Some(id) => Some(repo.find_commit(id.detach())?.tree_id()?.detach()),
                 None => None,
-            };
-            Some(resolved)
+            }
         }
     };
-    let unborn = match &reference_tree {
-        Some(resolved) => resolved.is_none(),
-        None => head_unborn,
-    };
+    let unborn = reference_tree.is_none();
 
     // `MERGE_HEAD` is what makes git treat the run as "from merge": it both
     // enables the in-progress banner and suppresses the unstage hint.
@@ -725,7 +812,13 @@ pub(crate) fn status_with(args: &[String], reference: Reference) -> Result<ExitC
     // entries that are actually in the worktree, in git's integer arithmetic.
     let sparse_checkout = sparse_checkout_state(&repo);
 
-    let untracked = untracked_flag.unwrap_or_else(|| configured_untracked(&repo));
+    // Resolved unconditionally: git validates the config key while reading the
+    // config, before `handle_untracked_files_arg()` can override it.
+    let configured = match configured_untracked(&repo) {
+        Ok(mode) => mode,
+        Err(code) => return Ok(code),
+    };
+    let untracked = untracked_flag.unwrap_or(configured);
 
     // The porcelain-v2 machine format is a separate renderer with its own,
     // richer per-path fields (HEAD/index/worktree modes + oids); it shares none
@@ -733,6 +826,7 @@ pub(crate) fn status_with(args: &[String], reference: Reference) -> Result<ExitC
     if porcelain_v2 {
         return porcelain_v2_output(
             &repo,
+            reference_tree.unwrap_or_else(|| repo.object_hash().empty_tree()),
             untracked,
             show_ignored,
             ignored_matching,
@@ -765,11 +859,8 @@ pub(crate) fn status_with(args: &[String], reference: Reference) -> Result<ExitC
         });
     // `opt.def = s->is_initial ? empty_tree : s->reference` (wt-status.c:673): the
     // staged section is the index against whatever the reference resolved to.
-    // Leaving the platform alone keeps gitoxide's own `HEAD` default, which is the
-    // same tree a plain `git status` would have used.
-    if let Some(resolved) = reference_tree {
-        platform = platform.head_tree(resolved.unwrap_or_else(|| repo.object_hash().empty_tree()));
-    }
+    platform =
+        platform.head_tree(reference_tree.unwrap_or_else(|| repo.object_hash().empty_tree()));
     if show_ignored {
         // git lists ignored entries at the same granularity as untracked ones.
         // `--ignored=matching` reports whatever the ignore pattern matched, so it never
@@ -978,7 +1069,9 @@ pub(crate) fn status_with(args: &[String], reference: Reference) -> Result<ExitC
     // git colors the human formats (long and short display) when `color.status`
     // (or `color.ui`) is on and stdout is a terminal; the porcelain machine format
     // is never colored.
-    let colors = super::color::StatusColors::resolve(&repo, porcelain);
+    // The editor block joins them: `s->use_color = GIT_COLOR_NEVER` around the
+    // `run_status` that renders it (builtin/commit.c:1023-1026).
+    let colors = super::color::StatusColors::resolve(&repo, porcelain || template.is_some());
 
     if short {
         if null_term {
@@ -1033,9 +1126,12 @@ pub(crate) fn status_with(args: &[String], reference: Reference) -> Result<ExitC
                 ab_elapsed_ms as f64 / 1000.0
             ));
         }
-        print!(
-            "{}",
-            render_long(
+        let nowarn = template.is_some();
+        let sink = if nowarn { LongSink::Retain } else { LongSink::Stdout };
+        // Rendered first and printed second: [`render_long`] hands stdout the
+        // part above the `submodule summary` fork itself, so it must not be
+        // called from inside a `print!` that already holds the lock.
+        let body = render_long(
                 &head_state,
                 &tracking_block,
                 untracked_slow,
@@ -1069,11 +1165,145 @@ pub(crate) fn status_with(args: &[String], reference: Reference) -> Result<ExitC
                 path_prefix,
                 submodule_summary_limit,
                 reference,
-            )
-        );
+                // `nowarn`: `run_status(s->fp, index_file, prefix, 1, s)`
+                // (builtin/commit.c:1025) for the editor block, `0` for a report
+                // (builtin/commit.c:1085, and `cmd_status` leaves it unset).
+                nowarn,
+                sink,
+            );
+        match template {
+            Some(t) => *t.out = body,
+            None => print!("{body}"),
+        }
     }
 
     Ok(ExitCode::SUCCESS)
+}
+
+/// `wt_status_get_detached_from()` (wt-status.c:1709-1743): what the long format
+/// names a detached `HEAD` after, and whether it is still sitting where the
+/// switch put it.
+///
+/// git does not name the object `HEAD` currently holds. It reads `HEAD`'s reflog
+/// backwards for the most recent `checkout: moving from <x> to <y>` entry
+/// (`grab_1st_switch`, wt-status.c:1680-1707) and reports `<y>` — so checking out
+/// a tag says the tag, and checking out a branch says that branch. Only the
+/// object id that switch landed on is compared against, which is what tells
+/// `HEAD detached at ` from `HEAD detached from `: the former means `HEAD` still
+/// holds it, the latter that commits have been made since.
+///
+/// `None` is git's NULL `state->detached_from`, which happens when the reflog has
+/// no switch entry at all (a hand-written `HEAD`, or a reflog that was pruned).
+/// The long format then says `Not currently on any branch.` (wt-status.c:1914-1917).
+fn detached_from(repo: &gix::Repository) -> Option<(String, bool)> {
+    let head_ref = repo.find_reference("HEAD").ok()?;
+    let mut platform = head_ref.log_iter();
+    // `refs_for_each_reflog_ent_reverse` returning <= 0 leaves `detached_from`
+    // NULL, which covers both "no reflog" and "no entry matched".
+    let entries = platform.rev().ok()??;
+    let mut switched: Option<(String, ObjectId)> = None;
+    for entry in entries {
+        let Ok(line) = entry else { break };
+        let Some(rest) = line.message.strip_prefix(b"checkout: moving from ".as_slice()) else {
+            continue;
+        };
+        // `strstr(message, " to ")` — the *first* occurrence, so a branch whose
+        // name contains " to " is split exactly where git splits it.
+        let Some(at) = rest.windows(4).position(|w| w == b" to ") else {
+            continue;
+        };
+        let target = &rest[at + 4..];
+        // `strchrnul(target, '\n')`: the entry's message is one line here, but
+        // git still stops at the first newline.
+        let target = match target.iter().position(|&b| b == b'\n') {
+            Some(n) => &target[..n],
+            None => target,
+        };
+        switched = Some((
+            String::from_utf8_lossy(target).into_owned(),
+            line.new_oid,
+        ));
+        break;
+    }
+    let (target, noid) = switched?;
+    let abbrev = |id: ObjectId| -> String {
+        repo.find_object(id)
+            .ok()
+            .map(|obj| obj.id().shorten_or_id().to_string())
+            .unwrap_or_else(|| id.to_string())
+    };
+    // "HEAD is relative. Resolve it to the right reflog entry." (wt-status.c:1701-1705)
+    let target = match target == "HEAD" {
+        true => abbrev(noid),
+        false => target,
+    };
+    // `repo_dwim_ref(..., 1) == 1`: an unambiguous match, whose object is the one
+    // the switch landed on — directly, or after peeling a tag to its commit.
+    let matches = super::rev_parse::dwim_ref_matches(repo, &target);
+    let resolved = match matches.as_slice() {
+        [only] => repo
+            .try_find_reference(only.as_str())
+            .ok()
+            .flatten()
+            .and_then(|mut r| r.peel_to_id().ok().map(|id| (only.clone(), id.detach()))),
+        _ => None,
+    };
+    let name = match resolved {
+        Some((full, id)) if id == noid => {
+            // `skip_prefix(from, "refs/tags/")` else `skip_prefix(from,
+            // "refs/remotes/")` — and nothing else, which is why a branch prints
+            // as the full `refs/heads/<name>`.
+            match full.strip_prefix("refs/tags/") {
+                Some(tail) => tail.to_string(),
+                None => full.strip_prefix("refs/remotes/").unwrap_or(&full).to_string(),
+            }
+        }
+        _ => abbrev(noid),
+    };
+    // `state->detached_at = !repo_get_oid(r, "HEAD", &oid) && oideq(&oid, &state->detached_oid)`.
+    let at = repo.head_id().map(|id| id.detach() == noid).unwrap_or(false);
+    Some((name, at))
+}
+
+/// What `s->reference` resolved to for the staged half of the report — the tree
+/// `run_diff_index` will diff the index against, or one of the two ways git
+/// refuses to produce one.
+///
+/// Nothing on this path requires a commit. `wt_status_collect_changes_index`
+/// hands `opt.def = s->reference` to `setup_revisions`, which turns the name into
+/// an object with `get_reference` (revision.c:353-369), and `run_diff_index` then
+/// peels *that* object with `repo_parse_tree_indirect` (diff-lib.c:555) — a
+/// commit yields its tree, a tag is followed, and a tree is already one. So a
+/// `HEAD` detached onto a tree is a perfectly ordinary status report.
+enum ReferenceTree {
+    /// The tree to diff against, or `None` for git's `s->is_initial` — the
+    /// reference does not resolve at all, and the staged half is measured against
+    /// the empty tree (wt-status.c:673).
+    Resolved(Option<ObjectId>),
+    /// The reference named an object the odb does not have: `die("bad object %s")`
+    /// (revision.c:368), exit 128.
+    BadObject,
+    /// The object exists but does not peel to a tree — a blob:
+    /// `error("bad tree object %s")` (diff-lib.c:557) and then `exit(128)`
+    /// (diff-lib.c:647-648).
+    BadTree,
+}
+
+/// Resolve `s->reference` the way `run_diff_index` does — see [`ReferenceTree`].
+fn reference_tree_oid(repo: &gix::Repository, spec: &str) -> Result<ReferenceTree> {
+    // `repo_get_oid(s->reference, &oid)` (builtin/commit.c:1639) only turns the
+    // name into an oid; it does not read the object, so an unborn `HEAD` is the
+    // only thing that makes it fail here.
+    let Ok(id) = repo.rev_parse_single(spec) else {
+        return Ok(ReferenceTree::Resolved(None));
+    };
+    let Some(object) = repo.try_find_object(id.detach())? else {
+        return Ok(ReferenceTree::BadObject);
+    };
+    Ok(match object.peel_to_kind(gix::object::Kind::Tree) {
+        Ok(tree) => ReferenceTree::Resolved(Some(tree.id)),
+        Err(_) => ReferenceTree::BadTree,
+    })
 }
 
 /// Resolve `status.renames`, git's `git_config_rename`: an explicit `copies` /
@@ -1117,15 +1347,85 @@ fn configured_renames(
 
 /// Resolve `status.showUntrackedFiles`, which stands in for an absent
 /// `--untracked-files` flag. Anything unrecognised falls back to git's default.
-fn configured_untracked(repo: &gix::Repository) -> Untracked {
-    let Some(value) = repo.config_snapshot().string("status.showUntrackedFiles") else {
-        return Untracked::Normal;
+fn configured_untracked(repo: &gix::Repository) -> Result<Untracked, ExitCode> {
+    Ok(show_untracked_files_config(repo)?.unwrap_or(Untracked::Normal))
+}
+
+/// `git_status_config`'s `status.showUntrackedFiles` arm (builtin/commit.c:1509-1517):
+/// the key resolved through the same [`parse_untracked_mode`] the command line
+/// uses, so the boolean spellings it accepts (`false` → `no`, `true`/`2` →
+/// `normal`) are accepted here too.
+///
+/// An unparseable value is not ignored. git's arm ends in
+/// `return error(_("Invalid untracked files mode '%s'"), v)`, which fails the
+/// config callback, and `git_config()` then dies naming where the value came from
+/// (config.c:2555-2558). Both `git status` and `git commit` read the key through
+/// `status_init_config()` *before* they parse their command line, so the death
+/// happens even under a `-u<mode>` that would have overridden the value, and
+/// before either command has printed anything.
+fn show_untracked_files_config(repo: &gix::Repository) -> Result<Option<Untracked>, ExitCode> {
+    let snapshot = repo.config_snapshot();
+    let Some(value) = snapshot.string("status.showUntrackedFiles") else {
+        return Ok(None);
     };
-    match value.as_slice() {
-        b"no" => Untracked::No,
-        b"all" => Untracked::All,
-        _ => Untracked::Normal,
+    let value = value.to_string();
+    if let Some(mode) = parse_untracked_mode(&value) {
+        return Ok(Some(mode));
     }
+    // git reports the key lowercased, because that is the form the config
+    // machinery canonicalized it to before the callback saw it.
+    const KEY: &str = "status.showuntrackedfiles";
+    eprintln!("error: Invalid untracked files mode '{value}'");
+    let origin = match untracked_config_metadata(&snapshot) {
+        Some(meta) => match meta.source {
+            gix::config::Source::Cli | gix::config::Source::Env => {
+                format!("unable to parse '{KEY}' from command-line config")
+            }
+            _ => match &meta.path {
+                // gix records no per-value line number, so the `at line <n>` tail
+                // git appends for a file-sourced value is omitted — the same
+                // limitation this crate's other config-fatal paths carry (see
+                // [`super::color::invalid_color_fatal`]).
+                Some(path) => {
+                    let shown = path.display().to_string();
+                    let shown = shown.strip_prefix("./").unwrap_or(&shown).to_string();
+                    format!("bad config variable '{KEY}' in file '{shown}'")
+                }
+                None => format!("bad config variable '{KEY}'"),
+            },
+        },
+        None => format!("bad config variable '{KEY}'"),
+    };
+    eprintln!("fatal: {origin}");
+    Err(ExitCode::from(128))
+}
+
+/// Where the *last* assignment of `status.showUntrackedFiles` came from — the one
+/// whose value the snapshot returns, and so the one git would name.
+fn untracked_config_metadata(
+    snapshot: &gix::config::Snapshot<'_>,
+) -> Option<gix::config::file::Metadata> {
+    let mut found = None;
+    for section in snapshot.plumbing().sections() {
+        if !section.header().name().eq_ignore_ascii_case(b"status") {
+            continue;
+        }
+        if section
+            .value_names()
+            .any(|v| v.eq_ignore_ascii_case("showUntrackedFiles"))
+        {
+            found = Some(section.meta().clone());
+        }
+    }
+    found
+}
+
+/// [`show_untracked_files_config`] for its side effect alone: `git commit` reads
+/// the same key through `status_init_config(&s, git_commit_config)`
+/// (builtin/commit.c:1808), so a bad value kills it too — including the
+/// `-m <msg>` path, which never renders a report.
+pub(crate) fn validate_show_untracked_files(repo: &gix::Repository) -> Option<ExitCode> {
+    show_untracked_files_config(repo).err()
 }
 
 /// Resolve a `--untracked-files=<mode>` / `-u<mode>` value the way git does.
@@ -1268,7 +1568,11 @@ fn walk_path(entry: &gix::dir::Entry) -> BString {
 
 enum HeadState {
     Branch(String),
-    Detached(String),
+    /// `s->branch` is `"HEAD"`. The payload is
+    /// `state->detached_from` / `state->detached_at` as
+    /// [`detached_from`] worked them out; `None` is git's NULL, which prints
+    /// `Not currently on any branch.`
+    Detached { from: Option<String>, at: bool },
     Unborn(String),
 }
 
@@ -1556,6 +1860,10 @@ fn index_name_is_other(index: &gix::index::State, name: &gix::bstr::BStr) -> boo
 #[allow(clippy::too_many_arguments)]
 fn porcelain_v2_output(
     repo: &gix::Repository,
+    // git's `opt.def` for the staged half, already resolved by the caller the way
+    // `run_diff_index` resolves it: the reference's tree, or the empty tree when
+    // the reference is unborn (`s->is_initial`).
+    head_tree: ObjectId,
     untracked: Untracked,
     show_ignored: bool,
     ignored_matching: bool,
@@ -1640,7 +1948,8 @@ fn porcelain_v2_output(
 
     let mut platform = repo
         .status(gix::progress::Discard)?
-        .index_worktree_options_mut(preload_index_threads(&repo))
+        .index_worktree_options_mut(preload_index_threads(repo))
+        .head_tree(head_tree)
         .untracked_files(match untracked {
             Untracked::No => gix::status::UntrackedFiles::None,
             Untracked::Normal => gix::status::UntrackedFiles::Collapsed,
@@ -2398,7 +2707,7 @@ fn short_branch_header(
     let h = |s: &str| colors.paint(Slot::Header, s);
     let mut out = h("## ");
     match head_state {
-        HeadState::Detached(_) => {
+        HeadState::Detached { .. } => {
             out.push_str(&colors.paint(Slot::Nobranch, "HEAD (no branch)"));
             out.push('\n');
             return out;
@@ -2489,7 +2798,12 @@ fn verbose_patch(workdir: Option<&std::path::Path>, args: &[&str]) -> String {
 /// blank line. git shells out for this too, so re-executing this binary's own
 /// `submodule summary` keeps the body byte-identical rather than forking a
 /// second renderer.
-fn submodule_summary(workdir: Option<&std::path::Path>, uncommitted: bool, limit: i64) -> String {
+fn submodule_summary(
+    workdir: Option<&std::path::Path>,
+    uncommitted: bool,
+    limit: i64,
+    reference: Reference,
+) -> String {
     let (Some(dir), Ok(exe)) = (workdir, std::env::current_exe()) else {
         return String::new();
     };
@@ -2501,8 +2815,10 @@ fn submodule_summary(workdir: Option<&std::path::Path>, uncommitted: bool, limit
         .arg("--summary-limit")
         .arg(limit.to_string());
     if !uncommitted {
-        // `s->amend ? "HEAD^" : "HEAD"`; `git status` never amends.
-        cmd.arg("HEAD");
+        // `s->amend ? "HEAD^" : "HEAD"` (wt-status.c:1046): only `git commit
+        // --amend` sets `s->amend`, and it measures the staged side against the
+        // commit it is replacing rather than that commit itself.
+        cmd.arg(if reference.amend() { "HEAD^" } else { "HEAD" });
     }
     // `capture_command(&sm_summary, &cmd_stdout, 1024)` (wt-status.c:1051) takes
     // only stdout; the child keeps this process's stderr, so a diagnostic it
@@ -2781,7 +3097,7 @@ fn split_commit_in_progress(
     head_state: &HeadState,
     workdir_dirty: bool,
 ) -> bool {
-    if !workdir_dirty || !matches!(head_state, HeadState::Detached(_)) {
+    if !workdir_dirty || !matches!(head_state, HeadState::Detached { .. }) {
         return false;
     }
     let line = |rela: &str| -> Option<String> {
@@ -2879,6 +3195,13 @@ fn render_long(
     submodule_summary_limit: Option<i64>,
     // `s->reference` / `s->amend`, which change four of the lines below.
     reference: Reference,
+    // `s->nowarn`: drop the trailing `no changes added to commit` / `nothing to
+    // commit …` summary (wt-status.c:1977-1978). `No changes` under `--amend`
+    // survives it, because git tests `s->amend` one branch earlier.
+    nowarn: bool,
+    // Where the body is going, which decides whether the mid-body flush before a
+    // `submodule summary` fork is real — see [`LongSink`].
+    sink: LongSink,
 ) -> String {
     let mut out = String::new();
     // When columns are active, the untracked/ignored path lists are replaced by a
@@ -2920,7 +3243,7 @@ fn render_long(
             out.push_str(&colors.paint(Slot::Branch, name));
             out.push('\n');
         }
-        HeadState::Detached(short) => {
+        HeadState::Detached { from, at } => {
             out.push_str(&colors.paint(Slot::Header, ""));
             // A rebase names what it is rebasing onto instead of the detached id:
             // `wt_longstatus_print` prefers `state.onto` whenever a rebase is in
@@ -2931,9 +3254,18 @@ fn render_long(
                 } else {
                     "rebase in progress; onto "
                 };
-                (prefix, progress.onto.as_deref().unwrap_or(short.as_str()))
+                (prefix, progress.onto.as_deref().unwrap_or(""))
             } else {
-                ("HEAD detached at ", short.as_str())
+                match from.as_deref() {
+                    // `HEAD detached at ` while `HEAD` still holds what the switch
+                    // put there, `HEAD detached from ` once it has moved on
+                    // (wt-status.c:1908-1913).
+                    Some(name) if *at => ("HEAD detached at ", name),
+                    Some(name) => ("HEAD detached from ", name),
+                    // git prints the whole sentence as the prefix and an empty
+                    // branch name after it (wt-status.c:1914-1917).
+                    None => ("Not currently on any branch.", ""),
+                }
             };
             out.push_str(&colors.paint(Slot::Nobranch, prefix));
             out.push_str(&colors.paint(Slot::Branch, name));
@@ -3221,9 +3553,18 @@ fn render_long(
 
     // `status.submoduleSummary`, between `wt_longstatus_print_changed` and the
     // untracked listing: the staged side first, then the unstaged one.
+    //
+    // Each of the two shells out, and `start_command()` runs `fflush(NULL)`
+    // before it forks (run-command.c:743) — so everything git has written is on
+    // the descriptor before the child can write a word, and a diagnostic the
+    // child prints lands *between* the sections rather than ahead of the whole
+    // report. This renderer accumulates, so the flush has to be explicit; see
+    // [`flush_rendered`].
     if let Some(limit) = submodule_summary_limit {
-        out.push_str(&submodule_summary(workdir, false, limit));
-        out.push_str(&submodule_summary(workdir, true, limit));
+        flush_rendered(&mut out, comment_prefix, sink);
+        out.push_str(&submodule_summary(workdir, false, limit, reference));
+        flush_rendered(&mut out, comment_prefix, sink);
+        out.push_str(&submodule_summary(workdir, true, limit, reference));
     }
 
     let committable = !staged.is_empty();
@@ -3374,7 +3715,7 @@ fn render_long(
         // `GIT_COLOR_NORMAL` is the empty string, so the line carries no SGR pair
         // even when `color.status.header` is set — only the comment prefix.
         out.push_str("No changes\n");
-    } else if !committable {
+    } else if !committable && !nowarn {
         let workdir_dirty = !unstaged.is_empty() || !unmerged.is_empty();
         // Each summary has a hints-on and a hints-off wording in
         // `wt_longstatus_print`; only the clean-tree line is the same either way.
@@ -3434,6 +3775,48 @@ fn render_long(
     }
     body.push_str(&trailer);
     body
+}
+
+/// Where [`render_long`]'s body ends up, which is what decides whether its
+/// mid-body flush does anything.
+///
+/// git writes the long format to `s->fp` a call at a time, so by the time
+/// `wt_longstatus_print_submodule_summary` forks, everything above it is already
+/// in that stream — `start_command()`'s `fflush(NULL)` (run-command.c:743) makes
+/// sure of it even when the stream is a pipe. This renderer builds the body in
+/// one string instead, which would put a child's `fatal:` ahead of the entire
+/// report rather than in the middle of it.
+#[derive(Clone, Copy, PartialEq)]
+enum LongSink {
+    /// `git status` / `git commit`'s report, which git writes to stdout: hand the
+    /// rendered prefix over before forking so the child's stderr interleaves
+    /// where git's does.
+    Stdout,
+    /// The `COMMIT_EDITMSG` block, which git writes to that file rather than
+    /// stdout (builtin/commit.c:911): the caller wants the whole body back as a
+    /// string, and nothing it holds belongs on stdout at any point.
+    Retain,
+}
+
+/// git's `fflush(NULL)` before the fork, for a [`LongSink::Stdout`] body: write
+/// what is rendered so far and empty the buffer.
+///
+/// `comment_prefix_body` is line-wise and every flush point sits on a line
+/// boundary, so prefixing the halves separately is the same as prefixing the
+/// whole — which is also how git does it, one `status_printf` at a time.
+fn flush_rendered(out: &mut String, comment_prefix: Option<&str>, sink: LongSink) {
+    if sink == LongSink::Retain || out.is_empty() {
+        return;
+    }
+    let text = std::mem::take(out);
+    let text = match comment_prefix {
+        Some(cs) => comment_prefix_body(&text, cs),
+        None => text,
+    };
+    use std::io::Write as _;
+    let mut stdout = std::io::stdout().lock();
+    let _ = stdout.write_all(text.as_bytes());
+    let _ = stdout.flush();
 }
 
 /// The leading SGR sequence git's `color()` would emit for `slot`, recovered from
@@ -3693,7 +4076,7 @@ fn short_branch_header_z(
 ) {
     out.extend_from_slice(b"## ");
     match head_state {
-        HeadState::Detached(_) => {
+        HeadState::Detached { .. } => {
             out.extend_from_slice(b"HEAD (no branch)");
             out.push(0);
             return;

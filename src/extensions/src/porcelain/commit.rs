@@ -370,6 +370,49 @@ impl Whence {
 }
 
 /// git's `determine_whence()` (builtin/commit.c) plus `sequencer_determine_whence()`.
+/// `lookup_commit_or_die(&oid, "HEAD")` (commit.c:81-91) as `cmd_commit()` calls
+/// it (builtin/commit.c:1816): `HEAD` may be unborn, but if it names an object
+/// that object has to be a commit.
+///
+/// Returns `Some(128)` once the diagnostics are on stderr, `None` when there is
+/// nothing to complain about. The two shapes are `lookup_commit_reference_gently`'s
+/// (commit.c:50-67):
+///
+///   * a `HEAD` the odb cannot find fails inside `peel_object_ext()`, which takes
+///     the `default: return NULL` arm *before* the type test — so only
+///     `die(_("could not parse %s"), ref_name)` is printed;
+///   * a `HEAD` on a blob or a tree peels fine and then fails the `type !=
+///     OBJ_COMMIT` test, which prints `error(_("object %s is a %s, not a %s"))`
+///     first and lets the `die()` follow.
+///
+/// Neither is a `status` diagnostic: `git status` in the same repository peels
+/// `HEAD` to a *tree* and reports normally (see [`super::status`]). It is
+/// `git commit` alone that needs a commit, because it is about to take one as a
+/// parent.
+fn die_unless_head_is_a_commit(repo: &gix::Repository) -> Result<Option<ExitCode>> {
+    // `repo_get_oid()` resolving is the whole of the unborn test; it reads no
+    // object, so a dangling `HEAD` gets past it exactly as git's does.
+    let Ok(id) = repo.rev_parse_single("HEAD") else {
+        return Ok(None);
+    };
+    let kind = match repo.try_find_object(id.detach())? {
+        Some(object) => object.peel_tags_to_end().ok().map(|peeled| peeled.kind),
+        None => None,
+    };
+    match kind {
+        Some(gix::object::Kind::Commit) => Ok(None),
+        Some(other) => {
+            eprintln!("error: object {} is a {other}, not a commit", id.detach());
+            eprintln!("fatal: could not parse HEAD");
+            Ok(Some(ExitCode::from(128)))
+        }
+        None => {
+            eprintln!("fatal: could not parse HEAD");
+            Ok(Some(ExitCode::from(128)))
+        }
+    }
+}
+
 fn determine_whence(repo: &gix::Repository) -> Whence {
     let git_dir = repo.git_dir();
     if git_dir.join("MERGE_HEAD").exists() {
@@ -1254,6 +1297,38 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     // moment the selector returns.
     let mut _lock = (!interactive).then(|| crate::lock::RepoLock::acquire(repo.git_dir()));
 
+    // ```c
+    // if (repo_get_oid(the_repository, "HEAD", &oid))
+    //         current_head = NULL;
+    // else {
+    //         current_head = lookup_commit_or_die(&oid, "HEAD");
+    // ```
+    //
+    // (builtin/commit.c:1813-1816.) `cmd_commit()`'s very first act, before it
+    // has even parsed its options. `repo_get_oid()` only turns the name into an
+    // oid, so an unborn `HEAD` is the ordinary root-commit case; anything else
+    // has to be a commit, and `lookup_commit_reference()` says so in two
+    // separate voices when it is not (commit.c:61-67, :84-85):
+    //
+    //   * the object exists but is a blob/tree — `error("object %s is a %s, not
+    //     a %s")` first, then `die("could not parse HEAD")`;
+    //   * the object is missing entirely — `peel_object_ext()` fails before the
+    //     type test, so only the `die()` is printed.
+    //
+    // Both exit 128, and both happen here rather than at the first use, which is
+    // why a `--dry-run` of a repository in this state never reaches the report.
+    if let Some(code) = die_unless_head_is_a_commit(&repo)? {
+        return Ok(code);
+    }
+
+    // `status_init_config(&s, git_commit_config)` (builtin/commit.c:1808) chains
+    // into `git_status_config`, so `git commit` validates `status.showUntrackedFiles`
+    // exactly as `git status` does — and dies on a bad value even when no report
+    // will be rendered, as a plain `-m <msg>` commit does not.
+    if let Some(code) = super::status::validate_show_untracked_files(&repo) {
+        return Ok(code);
+    }
+
     // --- `determine_whence()` --------------------------------------------
     // A merge, cherry-pick, revert or rebase left in the index is what this
     // commit concludes; everything downstream (parents, default message, which
@@ -1806,14 +1881,122 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
         comment = adjust_comment_line_char(&buf)?;
     }
 
+    // `--author="Name <email>"` overrides the author identity. The author *date*
+    // is unchanged: HEAD's on an amend (git preserves it), the configured author
+    // time (now / GIT_AUTHOR_DATE) on a new commit.
+    //
+    // Resolved here rather than at the write, because `prepare_to_commit()`'s
+    // editor block names the author (builtin/commit.c:998-1004) — git has had it
+    // since `determine_author_info()` ran inside `parse_and_validate_options()`,
+    // long before the template.
+    let author_override: Option<(String, String)> = match &author_arg {
+        Some(a) => Some(parse_author_ident(a)?),
+        None => None,
+    };
+
+    // The effective author identity, computed once as an owned signature so its
+    // parts outlive the write. Precedence for the base: `--reset-author` → config
+    // identity; `-C`/`-c` → the reused commit; `--amend` → HEAD; else config.
+    // `--author` then swaps name/email, `--date` the time. `None` means no
+    // override — the plain `repo.commit()` fast path (config author + canonical
+    // reflog) runs unchanged, so a bare `git commit` is byte-for-byte as before.
+    // Concluding a cherry-pick, revert or rebase pick keeps the *picked* commit's
+    // authorship — git's `author_message = "CHERRY_PICK_HEAD"`, which outranks
+    // `-C`/`-c` and is disarmed only by `--reset-author`.
+    let cherry_author: Option<gix::actor::Signature> =
+        match (whence.is_cherry_pick() || whence.is_rebase()) && !reset_author {
+            true => match read_state_oid(&repo, "CHERRY_PICK_HEAD") {
+                Some(id) => Some(repo.find_commit(id)?.author()?.to_owned()?),
+                None => None,
+            },
+            false => None,
+        };
+    let needs_author = amend
+        || reset_author
+        || author_override.is_some()
+        || date_override.is_some()
+        || reuse_commit.is_some()
+        || cherry_author.is_some();
+    let cfg_author = || -> Result<gix::actor::Signature> {
+        Ok(repo
+            .author()
+            .transpose()?
+            .ok_or_else(|| anyhow::anyhow!("unable to determine author identity"))?
+            .to_owned()?)
+    };
+    let author_owned: Option<gix::actor::Signature> = if needs_author {
+        let mut base = if reset_author {
+            cfg_author()?
+        } else if let Some(a) = &cherry_author {
+            a.clone()
+        } else if let Some(rc) = &reuse_commit {
+            rc.author()?.to_owned()?
+        } else if let Some(hc) = &amend_head {
+            hc.author()?.to_owned()?
+        } else {
+            cfg_author()?
+        };
+        if let Some((name, email)) = &author_override {
+            base.name = name.as_str().into();
+            base.email = email.as_str().into();
+        }
+        if let Some(t) = date_override {
+            base.time = t;
+        }
+        Some(base)
+    } else {
+        None
+    };
+
     // The commented help + status block, and the `-v` diff below the cut line, go
     // into the editor buffer only — git gates both on `use_editor && include_status`.
-    let msg_path = repo.git_dir().join("COMMIT_EDITMSG");
+    // `git_path_commit_editmsg()`, which is absolute: `setup_git_directory()`
+    // makes `$GIT_DIR` absolute during startup, so every consumer of the path —
+    // the editor, `prepare-commit-msg`, `commit-msg` — is handed one that does
+    // not depend on their working directory. gix reports a discovered git
+    // directory relative to the cwd, so rebase it here rather than at each use.
+    let msg_path: std::path::PathBuf = {
+        let dir = repo.git_dir();
+        let absolute = match dir.is_absolute() {
+            true => dir.to_owned(),
+            false => std::env::current_dir()?.join(dir),
+        };
+        // gix reports a discovered git directory as `./.git`; `normalize_path()`
+        // drops the `.` on git's side, and `Components` does the same here.
+        absolute.components().collect::<std::path::PathBuf>().join("COMMIT_EDITMSG")
+    };
     if use_editor && include_status {
         if !buf.is_empty() && !buf.ends_with('\n') {
             buf.push('\n');
         }
-        buf.push_str(&editor_status_block(&repo, is_root, &comment, cleanup, whence)?);
+        // `author_date_is_interesting()` (builtin/commit.c:694) is
+        // `author_message || force_date`, and `author_message` is set exactly
+        // when the authorship is inherited rather than composed: `-C`/`-c`
+        // (builtin/commit.c:1358-1363), the `use_message = "HEAD"` an `--amend`
+        // without one implies (:1353-1354), or a cherry-pick / rebase pick
+        // (:1365-1368) — each of them disarmed by `--reset-author`.
+        let author_message = !reset_author
+            && (reuse_commit.is_some()
+                || (amend && fixup_arg.is_none())
+                || whence.is_cherry_pick()
+                || whence.is_rebase());
+        let author = match &author_owned {
+            Some(a) => a.clone(),
+            None => cfg_author()?,
+        };
+        buf.push_str(&editor_status_block(
+            &repo,
+            &comment,
+            cleanup,
+            whence,
+            &author,
+            author_message || date_override.is_some(),
+            untracked_arg.as_deref(),
+            match amend {
+                true => super::status::Reference::AmendParent,
+                false => super::status::Reference::Commit,
+            },
+        )?);
     }
     std::fs::write(&msg_path, &buf)?;
     if use_editor && include_status && verbose {
@@ -1886,67 +2069,6 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     // first line. A subject written across two lines prints as one.
     let subject = folded_subject(&message);
 
-    // `--author="Name <email>"` overrides the author identity. The author *date*
-    // is unchanged: HEAD's on an amend (git preserves it), the configured author
-    // time (now / GIT_AUTHOR_DATE) on a new commit.
-    let author_override: Option<(String, String)> = match &author_arg {
-        Some(a) => Some(parse_author_ident(a)?),
-        None => None,
-    };
-
-    // The effective author identity, computed once as an owned signature so its
-    // parts outlive the write. Precedence for the base: `--reset-author` → config
-    // identity; `-C`/`-c` → the reused commit; `--amend` → HEAD; else config.
-    // `--author` then swaps name/email, `--date` the time. `None` means no
-    // override — the plain `repo.commit()` fast path (config author + canonical
-    // reflog) runs unchanged, so a bare `git commit` is byte-for-byte as before.
-    // Concluding a cherry-pick, revert or rebase pick keeps the *picked* commit's
-    // authorship — git's `author_message = "CHERRY_PICK_HEAD"`, which outranks
-    // `-C`/`-c` and is disarmed only by `--reset-author`.
-    let cherry_author: Option<gix::actor::Signature> =
-        match (whence.is_cherry_pick() || whence.is_rebase()) && !reset_author {
-            true => match read_state_oid(&repo, "CHERRY_PICK_HEAD") {
-                Some(id) => Some(repo.find_commit(id)?.author()?.to_owned()?),
-                None => None,
-            },
-            false => None,
-        };
-    let needs_author = amend
-        || reset_author
-        || author_override.is_some()
-        || date_override.is_some()
-        || reuse_commit.is_some()
-        || cherry_author.is_some();
-    let author_owned: Option<gix::actor::Signature> = if needs_author {
-        let cfg_author = || -> Result<gix::actor::Signature> {
-            Ok(repo
-                .author()
-                .transpose()?
-                .ok_or_else(|| anyhow::anyhow!("unable to determine author identity"))?
-                .to_owned()?)
-        };
-        let mut base = if reset_author {
-            cfg_author()?
-        } else if let Some(a) = &cherry_author {
-            a.clone()
-        } else if let Some(rc) = &reuse_commit {
-            rc.author()?.to_owned()?
-        } else if let Some(hc) = &amend_head {
-            hc.author()?.to_owned()?
-        } else {
-            cfg_author()?
-        };
-        if let Some((name, email)) = &author_override {
-            base.name = name.as_str().into();
-            base.email = email.as_str().into();
-        }
-        if let Some(t) = date_override {
-            base.time = t;
-        }
-        Some(base)
-    } else {
-        None
-    };
     let committer_owned = || -> Result<gix::actor::Signature> {
         Ok(repo
             .committer()
@@ -2846,14 +2968,23 @@ impl Drop for IndexSwap {
 /// minimal status header.
 ///
 /// The hint wording is git's, chosen by cleanup mode in `prepare_to_commit()`.
-/// The status body is a reduced form of `wt_status_print()` — the branch line and
-/// the initial-commit marker — not the full staged/unstaged/untracked listing.
+/// The status body is the whole of `wt_status_print()` — see
+/// [`super::status::commit_template_block`] for the settings it runs under.
 fn editor_status_block(
     repo: &gix::Repository,
-    is_root: bool,
     comment: &str,
     cleanup: Cleanup,
     whence: Whence,
+    // The identity the commit will record, which the block names whenever it
+    // differs from the committer's.
+    author: &gix::actor::Signature,
+    // `author_date_is_interesting()` (builtin/commit.c:694): the author date is
+    // shown when it was inherited or forced rather than taken from the clock.
+    date_is_interesting: bool,
+    // `-u<mode>`, which reached `wt_status` before `prepare_to_commit()` ran.
+    untracked: Option<&str>,
+    // `s->reference` / `s->amend`, as `run_status()` sets them.
+    reference: super::status::Reference,
 ) -> Result<String> {
     let mut buf = String::new();
     // `prepare_to_commit()` warns above everything else when an operation is being
@@ -2903,16 +3034,72 @@ fn editor_status_block(
             ));
         }
     }
-    buf.push_str(&format!("{comment}\n"));
-    match repo.head_name()? {
-        Some(b) => buf.push_str(&format!("{comment} On branch {}\n", b.shorten())),
-        None => buf.push_str(&format!("{comment} HEAD detached\n")),
+    // The three conditional identity lines (builtin/commit.c:998-1019). Each is a
+    // `status_printf_ln` whose leading `%s` is `"\n"` for the *first* one shown
+    // and `""` afterwards, so the group opens with a bare comment line and the
+    // whole group vanishes when none of the three applies.
+    let committer = repo
+        .committer()
+        .transpose()?
+        .ok_or_else(|| anyhow::anyhow!("unable to determine committer identity"))?
+        .to_owned()?;
+    let mut shown = false;
+    let mut ident_line = |buf: &mut String, body: String| {
+        if !shown {
+            buf.push_str(&format!("{comment}\n"));
+            shown = true;
+        }
+        buf.push_str(&format!("{comment} {body}\n"));
+    };
+    // `ident_cmp()` (ident.c:724-736) compares the address first and the name
+    // second; the date is no part of it.
+    if (&author.email, &author.name) != (&committer.email, &committer.name) {
+        ident_line(
+            &mut buf,
+            format!("Author:    {} <{}>", author.name, author.email),
+        );
     }
-    if is_root {
-        buf.push_str(&format!("{comment}\n{comment} Initial commit\n"));
+    // `show_ident_date(&ai, DATE_MODE(NORMAL))`.
+    if date_is_interesting {
+        ident_line(
+            &mut buf,
+            format!(
+                "Date:      {}",
+                author.time.format_or_unix(gix::date::time::format::DEFAULT)
+            ),
+        );
     }
+    if !committer_ident_sufficiently_given(&repo.config_snapshot()) {
+        ident_line(
+            &mut buf,
+            format!("Committer: {} <{}>", committer.name, committer.email),
+        );
+    }
+    // `status_printf_ln(s, GIT_COLOR_NORMAL, "%s", "")` — "Add new line for
+    // clarity" (builtin/commit.c:1021).
     buf.push_str(&format!("{comment}\n"));
+    // `run_status(s->fp, index_file, prefix, 1, s)` (builtin/commit.c:1025): the
+    // whole `wt_status_print()` body, commented, uncolored and hintless. Its own
+    // closing section trailer is the block's last line.
+    buf.push_str(&super::status::commit_template_block(
+        reference, untracked, comment,
+    )?);
     Ok(buf)
+}
+
+/// git's `committer_ident_sufficiently_given()` (ident.c:600-603): whether the
+/// committer's *address* was given rather than worked out from the machine. The
+/// editor block names the committer only when it was not (builtin/commit.c:1013),
+/// which is how a first-time user is told what is about to be recorded.
+///
+/// `IDENT_MAIL_GIVEN` comes from `GIT_COMMITTER_EMAIL` (ident.c:582-583), from
+/// `committer.email` / `user.email` in the config (ident.c:645-648, :663-666),
+/// and from `EMAIL` when `ident_default_email()` fell back to it (ident.c:176-179).
+/// A hostname, `/etc/mailname` or passwd guess is none of those.
+fn committer_ident_sufficiently_given(snap: &gix::config::Snapshot<'_>) -> bool {
+    let env = |key: &str| std::env::var_os(key).is_some_and(|v| !v.is_empty());
+    let cfg = |key: &str| snap.string(key).is_some_and(|v| !v.is_empty());
+    env("GIT_COMMITTER_EMAIL") || cfg("committer.email") || cfg("user.email") || env("EMAIL")
 }
 
 /// git's `wt_status_add_cut_line()`: the `>8` scissors line plus the two-line

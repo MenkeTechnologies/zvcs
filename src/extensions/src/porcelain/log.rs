@@ -448,6 +448,35 @@ pub(crate) fn parse_decoration_style(value: &str) -> Option<DecorateStyle> {
 ///     lines. `-s`/`--no-patch` clears them all. `--patch-with-stat` and
 ///     `--patch-with-raw` are the `OPT_BITOP` spellings that set their own bit
 ///     *and* the patch, i.e. exactly `-p --stat` and `-p --raw`
+///   * `--dirstat[=<params>]`, `--dirstat-by-file[=<params>]`, `--cumulative`
+///                                               → `show_dirstat()`, rendered by the
+///     port `git diff` uses. It is the one format writer `diff_flush()` does not
+///     count into `separator` (diff.c:7238), so `--dirstat -p` runs the patch
+///     straight on where `--stat -p` inserts a blank line; only `--dirstat=lines`,
+///     emitted from inside the count-format block, earns the separator
+///   * `--compact-summary` / `--no-compact-summary` → `fill_print_name()`'s
+///     ` (new|gone|mode ±x|mode ±l)` annotation on each stat row. The positive
+///     spelling also turns `--stat` on; the negation clears only the annotation
+///   * `--relative[=<path>]` / `--no-relative`   → two separate things:
+///     `diff_queue()`'s prefix test narrows *every* format, while `strip_prefix()`
+///     (diff.c:5009) shortens only the patch, raw, name and stat writers —
+///     `diff_summary()` and `show_dirstat()` never call it, so both keep the
+///     repository-root name. Seeded from `diff.relative`
+///   * `--diff-filter=<letters>`                 → `diffcore_apply_filter()`, applied
+///     after rename detection so a pair is judged by the status it finally carries.
+///     It is a queue filter, so `cmd_log_init_finish()` (builtin/log.c:333) clears
+///     `always_show_header` for it and `revision.c:3149` raises `revs->diff`: a
+///     commit the filter empties prints nothing at all, even under `-s`
+///   * `--output-indicator-{new,old,context}=<c>` → `o->output_indicators[]`,
+///     substituted by `emit_line_ws_markup()` at emit time, so the `---`/`+++` file
+///     headers keep their own characters and an empty value drops the sign entirely
+///   * `--word-diff[=<mode>]`, `--word-diff-regex=<re>`, `--color-words[=<re>]`,
+///     `--color-moved[=<mode>]`, `--color-moved-ws=<modes>`, `--ws-error-highlight=<kind>`
+///                                               → the family that re-emits the
+///     assembled patch rather than changing how it is generated, run through the
+///     same `fn_out_consume()` chain `git diff` uses. The patch body is painted from
+///     the run's own `o->use_color`, so `log -p --color=always` colours it exactly as
+///     `git diff` does
 ///   * `--expand-tabs[=<n>]` / `--no-expand-tabs` → `revs->expand_tabs_in_log`, the
 ///     width a tab in the commit message is expanded to under the four-space
 ///     indent the header formats print it with. The default is git's
@@ -734,6 +763,20 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     let mut shortstat = false;
     // `--summary`: the creation/deletion/rename/mode-change lines.
     let mut summary = false;
+    // `--relative[=<path>]` / `--no-relative` (`diff_opt_relative()`): the prefix
+    // every reported name is narrowed to and then shortened by. Seeded from
+    // `diff.relative` once the repository is open.
+    let mut relative: Option<String> = None;
+    /// Whether `--no-relative` was seen, which beats `diff.relative`.
+    let mut no_relative_given = false;
+    // `--compact-summary` (`diff_opt_compact_summary()`, diff.c): the stat rows gain
+    // a ` (new|gone|mode +x|…)` annotation, and the flag also turns `--stat` on.
+    // `--no-compact-summary` only clears the annotation; it never touches the format.
+    let mut compact_summary = false;
+    // `--dirstat[=<params>]` / `--dirstat-by-file[=<params>]` / `--cumulative`
+    // (`diff_opt_dirstat()`, diff.c), and the `diff.dirstat` config behind them.
+    let mut dirstat_on = false;
+    let mut dirstat = super::diff_files::DirStat::default();
     let mut patch = false;
     // `-q`/`--quiet`: git pre-sets DIFF_FORMAT_NO_OUTPUT before the other diff-format
     // flags parse, so it is position-independent. On `git log` (which shows no diff by
@@ -881,6 +924,16 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // The diff options the per-commit patch is rendered with; `-U3` and no whitespace
     // folding until a flag says otherwise.
     let mut patch_opts = super::diff::PatchOpts::default();
+    // `--color-moved*` / `--word-diff*` / `--color-words`, layered over
+    // `diff.colorMoved` / `diff.colorMovedWS` / `diff.wordRegex` once the repository
+    // is readable.
+    let mut move_word = diff_color::MoveWordOpts::default();
+    // The `options->use_color = GIT_COLOR_ALWAYS` the two color spellings of the
+    // word-diff family set; folded into `color` as soon as it is seen.
+    let mut move_word_color: Option<diff_color::ColorWhen> = None;
+    // `--ws-error-highlight=<kind>`. `None` leaves `diff.wsErrorHighlight` (and then
+    // git's `WSEH_NEW` default) in charge.
+    let mut ws_error_highlight: Option<u32> = None;
     // `--diff-merges=<mode>`: what a *merge* commit's patch shows. git's default is
     // `off`, which is why `git log -p` prints no diff for a merge at all.
     let mut diff_merges = DiffMerges::Off;
@@ -1395,6 +1448,138 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                     return Ok(ExitCode::from(128));
                 }
             }
+        // `--color-moved[=<mode>]`, `--color-moved-ws=<modes>`, `--word-diff[=<mode>]`,
+        // `--word-diff-regex=<re>` and `--color-words[=<re>]`. These do not change how
+        // the patch is generated; they re-emit the assembled one, so they ride along on
+        // [`super::diff::PatchOpts`] and are resolved once the repository is in hand.
+        } else if let Some(res) = {
+            // The two that are `OPT_STRING`/`OPT_CALLBACK` without `PARSE_OPT_OPTARG`
+            // take the next argv entry when nothing is glued on.
+            let glued = match diff_color::needs_separate_value(a) {
+                true => {
+                    i += 1;
+                    match args.get(i) {
+                        Some(v) => format!("{a}={v}"),
+                        None => {
+                            eprintln!("error: {}", diff_color::missing_value(a));
+                            return Ok(ExitCode::from(129));
+                        }
+                    }
+                }
+                false => a.clone(),
+            };
+            move_word.parse_flag(&glued, &mut move_word_color)
+        } {
+            if let Err(msg) = res {
+                eprintln!("{msg}");
+                return Ok(ExitCode::from(129));
+            }
+            // `diff_opt_word_diff()` sets `options->use_color = GIT_COLOR_ALWAYS` for
+            // the two color spellings, so a `--color-words` anywhere on the line turns
+            // the whole of `git log`'s output — header included — colored.
+            if move_word_color == Some(diff_color::ColorWhen::Always) {
+                color = ColorWhen::Always;
+                move_word_color = None;
+            }
+        // `--output-indicator-new`/`-old`/`-context=<char>` (`diff_opt_char()`,
+        // diff.c:5593): one byte replaces the sign this side of a hunk line carries.
+        } else if let Some(name) = indicator_name(a) {
+            let val = match a.split_once('=') {
+                Some((_, v)) => v.to_string(),
+                None => {
+                    i += 1;
+                    match args.get(i) {
+                        Some(v) => v.clone(),
+                        None => {
+                            eprintln!("error: {}", diff_color::missing_value(name));
+                            return Ok(ExitCode::from(129));
+                        }
+                    }
+                }
+            };
+            if val.len() > 1 {
+                eprintln!("error: {} expects a character, got '{val}'", &name[2..]);
+                return Ok(ExitCode::from(129));
+            }
+            let c = val.as_bytes().first().copied().unwrap_or(0);
+            match name {
+                "--output-indicator-new" => patch_opts.indicators.0 = c,
+                "--output-indicator-old" => patch_opts.indicators.1 = c,
+                _ => patch_opts.indicators.2 = c,
+            }
+        // `--ws-error-highlight=<kind>` (`diff_opt_ws_error_highlight()`), which
+        // `emit_line_ws_markup()` reads when it decides whether a line's whitespace
+        // errors are painted.
+        } else if a == "--ws-error-highlight" || a.starts_with("--ws-error-highlight=") {
+            let raw = match a.split_once('=') {
+                Some((_, v)) => v.to_string(),
+                None => {
+                    i += 1;
+                    match args.get(i) {
+                        Some(v) => v.clone(),
+                        None => {
+                            eprintln!("error: {}", diff_color::missing_value(a));
+                            return Ok(ExitCode::from(129));
+                        }
+                    }
+                }
+            };
+            match diff_color::parse_ws_error_highlight(&raw) {
+                Ok(v) => ws_error_highlight = Some(v),
+                Err(accepted) => {
+                    eprintln!("error: unknown value after ws-error-highlight={}", &raw[..accepted]);
+                    return Ok(ExitCode::from(129));
+                }
+            }
+        // `--dirstat[=<params>]` / `--dirstat-by-file[=<params>]` / `--cumulative`
+        // (`diff_opt_dirstat()`, diff.c): each turns the format on, and the parameter
+        // list is folded into the same `struct dirstat_opts` `git diff` fills.
+        } else if let Some(v) = a.strip_prefix("--diff-filter=") {
+            // `diff_opt_diff_filter()`: the letters accumulate across repeats, and
+            // `diffcore_apply_filter()` drops every pair whose final status is not
+            // selected.
+            patch_opts.diff_filter.get_or_insert_with(Vec::new).extend_from_slice(v.as_bytes());
+        } else if a == "--relative" {
+            relative = Some(super::diff::cwd_prefix(&repo));
+            no_relative_given = false;
+        } else if a == "--no-relative" {
+            relative = None;
+            no_relative_given = true;
+        } else if let Some(v) = a.strip_prefix("--relative=") {
+            // git stores the prefix with a trailing slash so a plain prefix match
+            // cannot cross a name boundary.
+            let mut p = v.to_string();
+            if !p.is_empty() && !p.ends_with('/') {
+                p.push('/');
+            }
+            relative = Some(p);
+            no_relative_given = false;
+        } else if a == "--compact-summary" {
+            compact_summary = true;
+            stat = true;
+        } else if a == "--no-compact-summary" {
+            compact_summary = false;
+        } else if a == "--dirstat" {
+            dirstat_on = true;
+        } else if a == "--dirstat-by-file" {
+            dirstat_on = true;
+            dirstat.by_file = true;
+        } else if a == "--cumulative" {
+            dirstat_on = true;
+            dirstat.cumulative = true;
+        } else if a.starts_with("--dirstat=") || a.starts_with("--dirstat-by-file=") {
+            let by_file = a.starts_with("--dirstat-by-file=");
+            let params = a.split_once('=').map(|(_, v)| v).unwrap_or_default();
+            let errors = super::diff_files::parse_dirstat_params(params, &mut dirstat);
+            if !errors.is_empty() {
+                // `parse_dirstat_opt()`'s `die()`, carrying the accumulated text.
+                eprint!("fatal: Failed to parse --dirstat/-X option parameter:\n{errors}\n");
+                return Ok(ExitCode::from(128));
+            }
+            if by_file {
+                dirstat.by_file = true;
+            }
+            dirstat_on = true;
         // `revision.c:2462-2465`. `--dense` restores the `repo_init_revisions()`
         // default, so it is only ever an undo of an earlier `--sparse`.
         } else if a == "--dense" {
@@ -1547,7 +1732,17 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                     }
                 }
                 None => {
-                    eprintln!("fatal: invalid value for '--diff-merges': '{v}'");
+                    // `func_by_opt()` (diff-merges.c:68-86) does map `r`/`remerge`
+                    // onto `set_remerge_diff()`; this port has no remerge engine, so
+                    // saying "invalid value" there would claim git rejects a value it
+                    // accepts. Name the gap instead.
+                    if matches!(v, "r" | "remerge") {
+                        eprintln!(
+                            "fatal: --diff-merges=remerge is not supported by this build"
+                        );
+                    } else {
+                        eprintln!("fatal: invalid value for '--diff-merges': '{v}'");
+                    }
                     return Ok(ExitCode::from(128));
                 }
             }
@@ -2971,7 +3166,13 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         || summary
         || name_only
         || name_status
-        || raw;
+        || raw
+        // `DIFF_FORMAT_DIRSTAT` is an output-format bit like any other, so it
+        // satisfies `cmd_whatchanged()`'s `if (!rev.diffopt.output_format)` raw
+        // fallback (builtin/log.c): measured against stock 2.55.0,
+        // `git whatchanged --i-still-use-this --dirstat` prints the dirstat block
+        // alone, with no `:100644 …` records in front of it.
+        || dirstat_on;
     let asked_format = rendering_format || saw_no_patch || quiet;
     // `revs->diff` — "Did the user ask for any diff output?" (revision.c:3145-3146),
     // answered *before* `diff_merges_setup_revs()` runs, so the patch format that
@@ -2981,7 +3182,16 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // and nothing but the header for every other commit. `cmd_whatchanged` sets it
     // unconditionally (`rev.diff = 1`, builtin/log.c:543), and `merges_imply_patch`
     // sets it too (diff-merges.c:186-187).
-    let all_need_diff = flavor == Flavor::WhatChanged || merges_imply_patch || rendering_format;
+    //
+    // `--diff-filter` sets it too: revision.c:3149-3152 raises `revs->diff` for the
+    // pickaxe, `--diff-filter` and `--follow` alike, under the comment "Pickaxe,
+    // diff-filter and rename following need diffs" — which is why `git log -s
+    // --diff-filter=M` still builds the queue, and still prints the header of every
+    // commit the filter left something in.
+    let all_need_diff = flavor == Flavor::WhatChanged
+        || merges_imply_patch
+        || rendering_format
+        || patch_opts.diff_filter.is_some();
     // `--name-only`/`--name-status` are git's reported format; they suppress both
     // the count formats and the `-p` patch. The patch is emitted after the count
     // formats otherwise.
@@ -3009,14 +3219,23 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                 || name_only
                 || name_status
                 || saw_no_patch
-                || quiet));
+                || quiet
+                // `DIFF_FORMAT_DIRSTAT` counts as an output format too, so
+                // `whatchanged --dirstat` prints the dirstat block alone (measured
+                // against stock 2.55.0) rather than raw records plus a dirstat.
+                || dirstat_on));
     let raw = raw && !name_only && !name_status;
     let summary = summary && !name_only && !name_status;
-    let want_names = name_only || name_status || raw || summary || stat || numstat || shortstat;
+    let want_names =
+        name_only || name_status || raw || summary || stat || numstat || shortstat || dirstat_on;
     // `whatchanged` under `DIFF_FORMAT_NO_OUTPUT`: nothing is rendered, but the
     // pair queue still decides whether the commit is shown at all, so it is built
     // and thrown away.
-    let probe_queue = flavor == Flavor::WhatChanged && !want_names && !patch;
+    // `--diff-filter` clears `always_show_header` the same way (builtin/log.c:333),
+    // so the queue decides whether the commit prints even under `-s`, where nothing
+    // would otherwise build it.
+    let probe_queue =
+        (flavor == Flavor::WhatChanged || patch_opts.diff_filter.is_some()) && !want_names && !patch;
     // Whether `%C`/`%d` emit ANSI: git's auto rule is "stdout is a terminal, or we
     // are paging to one" — `pager::maybe_setup` records the latter via the env flag.
     let want_color = match color {
@@ -3026,6 +3245,32 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         // config switch is `color.diff` falling back to `color.ui`; `auto` then
         // asks whether stdout is a terminal or a `color.pager` pager.
         ColorWhen::Auto => super::color::want_color_stdout(&repo, "diff"),
+    };
+    // `--color-moved` / `--word-diff` layered over their config defaults, and the
+    // palette the re-emit pass paints with. `log_tree_commit()` hands the diff
+    // machinery the same `o->use_color` the header was written under, so a patch body
+    // is colored exactly when the header is.
+    patch_opts.extra = match move_word.resolve(&repo) {
+        Ok(e) => e,
+        Err(msg) => {
+            eprintln!("{msg}");
+            return Ok(ExitCode::from(128));
+        }
+    };
+    patch_opts.colors = diff_color::DiffColors::resolve(&repo, want_color);
+    // `diff.relative` seeds the very flag `--relative` sets
+    // (`options->flags.relative_name = diff_relative`, diff.c:4639), so the config
+    // alone both narrows and shortens; `--no-relative` clears it again, which is why
+    // an explicit flag always wins.
+    patch_opts.relative = match (&relative, repo.config_snapshot().boolean("diff.relative")) {
+        (Some(p), _) => Some(p.clone()),
+        (None, Some(true)) if !no_relative_given => Some(super::diff::cwd_prefix(&repo)),
+        _ => None,
+    };
+    // `diff.wsErrorHighlight`, which `--ws-error-highlight` overrides.
+    patch_opts.ws_error_highlight = match ws_error_highlight {
+        Some(v) => v,
+        None => diff_color::ws_error_highlight_default(&repo).unwrap_or(diff_color::WSEH_NEW),
     };
     // `%d`/`%D` need a commit→refs map; build it only when the format asks for one
     // so plain formats pay nothing for the ref scan.
@@ -3442,6 +3687,13 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             }
         {
             let mut diff: Vec<u8> = Vec::new();
+            // `diff_flush()`'s `separator` counter: raised by the raw/name loop, by
+            // the count-format block and by a non-empty `--summary`, and read once by
+            // the patch format to decide whether a blank line precedes it. It is not
+            // "the buffer is non-empty" — `show_dirstat()` writes without raising it
+            // (diff.c:7238 sits outside the block that does), so `--dirstat -p` runs
+            // the patch straight on.
+            let mut separator = false;
             // `log_tree_diff_flush()` separates the message from the diff whenever the
             // pair queue is non-empty, even for a format that has nothing to say about
             // those pairs (`--summary` over a plain content change).
@@ -3478,6 +3730,18 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                 )?;
                 if let Some(m) = followed.as_mut() {
                     files.retain(|f| m.matches(&f.path));
+                }
+                // `--relative[=<path>]`'s *narrowing* half (`diff_queue()`'s prefix
+                // test, diff.c:7630), which every format sees. The *shortening* half
+                // is `strip_prefix()` (diff.c:5009) and is applied per format below,
+                // because `diff_summary()` and `show_dirstat()` do not call it.
+                if let Some(prefix) = &patch_opts.relative {
+                    files.retain(|f| f.path.starts_with(prefix.as_bytes()));
+                }
+                // `diffcore_apply_filter()`: the name and stat formats report the
+                // same filtered queue the patch renders.
+                if let Some(filter) = &patch_opts.diff_filter {
+                    files.retain(|f| super::diff::diff_filter_selected(filter, f.status));
                 }
                 // `diffcore_pickaxe()` munges the queue itself, so every format below
                 // sees only the pairs that matched — `git log -Sfoo --raw` names the
@@ -3518,12 +3782,18 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                         diff.extend_from_slice(path);
                         diff.push(b'\n');
                     }
+                    separator = true;
                 } else {
                     // `diff_flush()`'s fixed order: the raw/name loop first, then the
                     // count formats. `--raw` does not displace them, so `--raw --stat`
                     // prints both.
+                    // `strip_prefix()`'s reach (diff.c:5009): the raw, name and stat
+                    // writers, and the patch. Not `--summary`, not `--dirstat` —
+                    // neither calls it, so both keep the repository-root name.
+                    let rel = patch_opts.relative.as_deref().unwrap_or("");
                     if raw {
-                        emit_raw(&repo, &mut diff, &files, z)?;
+                        emit_raw(&repo, &mut diff, &files, z, rel)?;
+                        separator = true;
                     }
                     let (fsep, fend) = if z { (0u8, 0u8) } else { (b'\t', b'\n') };
                     if name_status {
@@ -3535,35 +3805,65 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                             if let Some(source) = &f.source {
                                 diff.extend_from_slice(format!("{:03}", f.score).as_bytes());
                                 diff.push(fsep);
-                                diff.extend_from_slice(&name_field(source, z));
+                                diff.extend_from_slice(&name_field(shorten_path(source, rel), z));
                             }
                             diff.push(fsep);
-                            diff.extend_from_slice(&name_field(&f.path, z));
+                            diff.extend_from_slice(&name_field(shorten_path(&f.path, rel), z));
                             diff.push(fend);
                         }
+                        separator = true;
                     } else if name_only {
                         for f in &files {
-                            diff.extend_from_slice(&name_field(&f.path, z));
+                            diff.extend_from_slice(&name_field(shorten_path(&f.path, rel), z));
                             diff.push(fend);
                         }
+                        separator = true;
                     } else {
                         // git stacks the count formats in a fixed order: numstat, then
                         // the full stat block, then a bare shortstat summary if stat did
                         // not already print one.
+                        if numstat || stat || shortstat {
+                            separator = true;
+                        }
                         if numstat {
-                            emit_numstat(&mut diff, &files, z);
+                            emit_numstat(&mut diff, &files, z, rel);
                         }
                         // `diff_flush()` tests the two bits separately, so
                         // `--stat --shortstat` prints the stat block and then a
                         // second summary line.
                         if stat {
-                            emit_stat(&mut diff, &files, &stat_widths)?;
+                            emit_stat(&mut diff, &files, &stat_widths, compact_summary, rel)?;
                         }
                         if shortstat {
                             emit_shortstat(&mut diff, &files)?;
                         }
+                        // `diff_flush()`: dirstat sits between the stat formats
+                        // and the summary. Note that `show_dirstat()` is the one
+                        // format writer that does *not* `separator++` (diff.c:7238 is
+                        // outside the block that does), so a bare `--dirstat -p` runs
+                        // the patch straight on with no blank line between them —
+                        // only `--dirstat=lines`, which is emitted from inside the
+                        // diffstat block at diff.c:7233, gets the separator.
+                        if dirstat_on {
+                            if dirstat.by_line {
+                                separator = true;
+                            }
+                            super::diff::commit_dirstat(
+                                &repo,
+                                node.id,
+                                diff_parent,
+                                &patch_opts,
+                                path_limit.as_mut(),
+                                &dirstat,
+                                &mut diff,
+                            )?;
+                        }
                         if summary {
+                            let before = diff.len();
                             emit_summary(&mut diff, &files);
+                            // `!is_summary_empty(q)` guards the `separator++`, so a
+                            // summary with nothing to say does not earn a blank line.
+                            separator |= diff.len() != before;
                         }
                     }
                 }
@@ -3608,7 +3908,12 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                     (None, None) => patches.get(&repo, &nodes, ni, 3, &pathspecs)?,
                 };
                 if !p.is_empty() {
-                    if !diff.is_empty() {
+                    // `if (separator) emit_diff_symbol(DIFF_SYMBOL_SEPARATOR)`
+                    // (diff.c): the blank line is owed by the *format writers* that
+                    // raised `separator`, not by whatever happens to be in the
+                    // buffer — which is why a non-`lines` `--dirstat` block does not
+                    // earn one.
+                    if separator {
                         diff.push(b'\n');
                     }
                     diff.extend_from_slice(p);
@@ -3708,7 +4013,12 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         // `cmd_whatchanged()` leaves `always_show_header` off, so `log_tree_commit()`
         // prints nothing at all for a commit whose diff queue came out empty — and
         // `cmd_log_walk()` hands the `--max-count` slot back.
-        if flavor == Flavor::WhatChanged {
+        //
+        // `cmd_log_init_finish()` (builtin/log.c:333) clears the same flag for
+        // `git log` itself the moment a pickaxe, `--diff-filter` or `--follow` is in
+        // play, because each of those *is* a queue filter: a commit that survives the
+        // walk but loses every pair must print nothing rather than a bare header.
+        if flavor == Flavor::WhatChanged || patch_opts.diff_filter.is_some() {
             if !record_has_diff {
                 // Under `--graph` the commit was still walked and graphed, so it
                 // keeps its slot and prints no row (see [`render_graph`]).
@@ -3879,6 +4189,18 @@ fn line_log_name_status(pair: &line_log::Pair) -> (u8, &gix::bstr::BString) {
 /// with no trailing garbage. A negative value means "unlimited" (git's `-1`
 /// sentinel), reported as `Ok(None)`; a non-negative value caps the walk.
 /// `Err(())` marks a value git rejects with `fatal: '<value>': not an integer`.
+/// The `--output-indicator-*` option a token names, whether it is glued to its
+/// value or not. `OPT_CALLBACK_F(..., diff_opt_char)` declares all three with a
+/// required argument (diff.c:6146-6160), so the bare spelling takes the next entry.
+pub(crate) fn indicator_name(a: &str) -> Option<&'static str> {
+    match a.split_once('=').map_or(a, |(n, _)| n) {
+        "--output-indicator-new" => Some("--output-indicator-new"),
+        "--output-indicator-old" => Some("--output-indicator-old"),
+        "--output-indicator-context" => Some("--output-indicator-context"),
+        _ => None,
+    }
+}
+
 pub(crate) fn parse_max_count(value: &str) -> Result<Option<usize>, ()> {
     match parse_int(value) {
         Some(n) if n < 0 => Ok(None),
@@ -4777,9 +5099,22 @@ impl ReflogEntry {
     /// was given on the command line (git's `force_date`, i.e.
     /// `revs->date_mode_explicit`). `shorten` is `%gd`'s short ref; the `Reflog:`
     /// line and `%gD` pass `false`.
-    fn selector(&self, shorten: bool, date_mode: DateMode, force_date: bool, now: i64) -> String {
+    fn selector(
+        &self,
+        repo: &gix::Repository,
+        shorten: bool,
+        date_mode: DateMode,
+        force_date: bool,
+        now: i64,
+    ) -> String {
+        // `refs_shorten_unambiguous_ref(store, ref, 0)` (reflog-walk.c:252) — the
+        // *non-strict* form, which walks `ref_rev_parse_rules` and keeps the
+        // shortest suffix that resolves back to this ref and no other. A plain
+        // category strip is not the same function: with both `refs/heads/dup` and
+        // `refs/tags/dup` present, stock shortens `refs/heads/dup` to `heads/dup`
+        // (measured), because `dup` would be ambiguous.
         let name = if shorten {
-            super::reflog::shorten_ref(&self.refname)
+            super::reflog::shorten_ref_unambiguous(repo, &self.refname)
         } else {
             self.refname.clone()
         };
@@ -4810,20 +5145,35 @@ impl ReflogEntry {
 /// `refs/remotes/origin/main@{0}`: no `refs/origin/main` or
 /// `refs/heads/origin/main` exists, so only the `refs/remotes/` rule reaches it.
 fn reflog_display_name(repo: &gix::Repository, name: &str) -> String {
-    let direct = [
-        Some(name.to_string()),
-        super::reflog::resolve_ref_reading(repo, name),
-        Some(format!("refs/{name}")),
-        Some(format!("refs/heads/{name}")),
-    ];
-    if direct
-        .into_iter()
-        .flatten()
-        .any(|cand| super::reflog::log_file(repo, &cand).is_file())
+    if reflog_candidates(repo, name)
+        .iter()
+        .any(|cand| super::reflog::log_file(repo, cand).is_file())
     {
         return name.to_string();
     }
     super::reflog::dwim_log(repo, name).unwrap_or_else(|| name.to_string())
+}
+
+/// `read_complete_reflog()`'s four spellings of the argument (reflog-walk.c:68-103),
+/// in the order it tries them: as typed, then the reference it resolves to under
+/// `RESOLVE_REF_READING`, then `refs/<name>`, then `refs/heads/<name>`.
+///
+/// The last two are what make `git log -g <name>` work for a name whose *resolution*
+/// lands somewhere without a log. With both a branch and a tag called `dup`,
+/// `refs_resolve_refdup()` answers `refs/tags/dup` (tags precede heads in
+/// `ref_rev_parse_rules`) and that ref has no reflog, so only the `refs/heads/`
+/// spelling reaches the branch's log — measured against stock 2.55.0, which prints
+/// `dup@{0}` there while resolution alone finds nothing.
+fn reflog_candidates(repo: &gix::Repository, name: &str) -> Vec<String> {
+    [
+        Some(name.to_string()),
+        super::reflog::resolve_ref_reading(repo, name),
+        Some(format!("refs/{name}")),
+        Some(format!("refs/heads/{name}")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
 }
 
 /// `read_complete_reflog()`: a ref's whole reflog in git's stored order (oldest
@@ -4837,19 +5187,48 @@ fn read_reflog(
     name: &str,
     kind: ReflogSelector,
 ) -> Result<Option<Vec<ReflogEntry>>> {
-    let Some(reference) = repo.try_find_reference(name).ok().flatten() else {
-        return Ok(None);
-    };
+    // `reflogs->ref` is the argument *as typed* (reflog-walk.c:71), whichever
+    // spelling ends up supplying the entries.
     let refname = reflog_display_name(repo, name);
-    let mut platform = reference.log_iter();
-    let Some(iter) = platform.all()? else {
-        return Ok(None);
-    };
     let mut items: Vec<ReflogEntry> = Vec::new();
+    for cand in reflog_candidates(repo, name) {
+        let Some(reference) = repo.try_find_reference(cand.as_str()).ok().flatten() else {
+            continue;
+        };
+        let mut platform = reference.log_iter();
+        let Some(iter) = platform.all()? else {
+            continue;
+        };
+        read_reflog_entries(iter, &refname, kind, &mut items);
+        // `if (reflogs->nr == 0)` guards each fallback, so the first spelling with
+        // any entry at all is the one that answers.
+        if !items.is_empty() {
+            break;
+        }
+    }
+    if items.is_empty() {
+        return Ok(None);
+    }
+    let nr = items.len();
+    for (k, item) in items.iter_mut().enumerate() {
+        item.index = nr - 1 - k;
+    }
+    Ok(Some(items))
+}
+
+/// `read_one_reflog()`: one stored line per entry, in the order the file holds them
+/// (oldest first). The `@{<n>}` index is filled in by the caller, since it counts
+/// down from the newest and is only known once the whole log has been read.
+fn read_reflog_entries<'a>(
+    iter: impl Iterator<Item = std::result::Result<gix::refs::file::log::LineRef<'a>, gix::refs::file::log::iter::decode::Error>>,
+    refname: &str,
+    kind: ReflogSelector,
+    items: &mut Vec<ReflogEntry>,
+) {
     for line in iter {
         let Ok(line) = line else { break };
         items.push(ReflogEntry {
-            refname: refname.clone(),
+            refname: refname.to_string(),
             // Filled in below: the index counts down from the newest entry, so it
             // is only known once the whole log has been read.
             index: 0,
@@ -4861,14 +5240,6 @@ fn read_reflog(
             kind,
         });
     }
-    if items.is_empty() {
-        return Ok(None);
-    }
-    let nr = items.len();
-    for (k, item) in items.iter_mut().enumerate() {
-        item.index = nr - 1 - k;
-    }
-    Ok(Some(items))
 }
 
 /// One `struct commit_reflog`: a ref's complete log plus `recno`, the cursor that
@@ -8166,7 +8537,7 @@ fn write_reflog_selector(
     ctx: &RenderCtx<'_>,
     shorten: bool,
 ) {
-    let sel = entry.selector(shorten, ctx.date_mode, ctx.date_explicit, ctx.now);
+    let sel = entry.selector(ctx.repo, shorten, ctx.date_mode, ctx.date_explicit, ctx.now);
     out.extend_from_slice(sel.as_bytes());
 }
 
@@ -9520,11 +9891,11 @@ pub(crate) fn change_path(change: &ChangeDetached) -> &[u8] {
 /// The rows [`super::diffstat::show_stats`] renders. A binary file's "counts" are
 /// the two byte sizes, which is what `builtin_diffstat()` puts in `added`/`deleted`
 /// for one.
-fn stat_rows(files: &[FileChange]) -> Vec<diffstat::StatFile> {
+fn stat_rows(files: &[FileChange], compact: bool, rel: &str) -> Vec<diffstat::StatFile> {
     files
         .iter()
         .map(|f| diffstat::StatFile {
-            print_name: stat_name(f),
+            print_name: stat_name(f, compact, rel),
             added: if f.is_binary { f.new_size as u64 } else { f.added as u64 },
             deleted: if f.is_binary { f.old_size as u64 } else { f.deleted as u64 },
             binary: f.is_binary,
@@ -9535,15 +9906,32 @@ fn stat_rows(files: &[FileChange]) -> Vec<diffstat::StatFile> {
 }
 
 /// git's `--stat` (`show_stats()`), rendered by the shared port.
-fn emit_stat(out: &mut Vec<u8>, files: &[FileChange], sw: &StatWidths) -> Result<()> {
-    diffstat::show_stats(out, &stat_rows(files), sw, &diff_color::DiffColors::disabled());
+fn emit_stat(
+    out: &mut Vec<u8>,
+    files: &[FileChange],
+    sw: &StatWidths,
+    compact: bool,
+    rel: &str,
+) -> Result<()> {
+    diffstat::show_stats(
+        out,
+        &stat_rows(files, compact, rel),
+        sw,
+        &diff_color::DiffColors::disabled(),
+    );
     Ok(())
 }
 
 /// `diff_flush_raw()`: `:<old mode> <new mode> <old sha> <new sha> <status>\t<path>`,
 /// with a rename's similarity index after the status letter and its source path first.
 /// An absent side is mode `000000` and an all-zero id padded to the same width.
-fn emit_raw(repo: &gix::Repository, out: &mut Vec<u8>, files: &[FileChange], z: bool) -> Result<()> {
+fn emit_raw(
+    repo: &gix::Repository,
+    out: &mut Vec<u8>,
+    files: &[FileChange],
+    z: bool,
+    rel: &str,
+) -> Result<()> {
     // `-z`: the field and record separators are NUL and paths go out unquoted.
     let sep = if z { 0u8 } else { b'\t' };
     let end = if z { 0u8 } else { b'\n' };
@@ -9570,10 +9958,10 @@ fn emit_raw(repo: &gix::Repository, out: &mut Vec<u8>, files: &[FileChange], z: 
         if let Some(source) = &f.source {
             write!(out, "{:03}", f.score)?;
             out.push(sep);
-            out.extend_from_slice(&name_field(source, z));
+            out.extend_from_slice(&name_field(shorten_path(source, rel), z));
         }
         out.push(sep);
-        out.extend_from_slice(&name_field(&f.path, z));
+        out.extend_from_slice(&name_field(shorten_path(&f.path, rel), z));
         out.push(end);
     }
     Ok(())
@@ -9662,7 +10050,7 @@ fn name_field(path: &[u8], z: bool) -> Vec<u8> {
 /// git's `--numstat`: `<added>\t<deleted>\t<path>` per file, with `-\t-` for a
 /// binary file whose line counts are undefined. Under `-z` the record is
 /// `<added>\t<deleted>\t\0<path>\0`, with a rename naming both sides.
-fn emit_numstat(out: &mut Vec<u8>, files: &[FileChange], z: bool) {
+fn emit_numstat(out: &mut Vec<u8>, files: &[FileChange], z: bool, rel: &str) {
     for f in files {
         if f.is_binary {
             out.extend_from_slice(b"-\t-\t");
@@ -9674,14 +10062,14 @@ fn emit_numstat(out: &mut Vec<u8>, files: &[FileChange], z: bool) {
             // prefixes an empty field and names its source first.
             if let Some(source) = &f.source {
                 out.push(0);
-                out.extend_from_slice(source);
+                out.extend_from_slice(shorten_path(source, rel));
                 out.push(0);
             }
-            out.extend_from_slice(&f.path);
+            out.extend_from_slice(shorten_path(&f.path, rel));
             out.push(0);
             continue;
         }
-        out.extend_from_slice(&stat_name(f));
+        out.extend_from_slice(&stat_name(f, false, rel));
         out.push(b'\n');
     }
 }
@@ -9689,18 +10077,44 @@ fn emit_numstat(out: &mut Vec<u8>, files: &[FileChange], z: bool) {
 /// The name the stat formats print for a file: a rename goes through
 /// `pprint_rename()`, which factors out a shared prefix and suffix
 /// (`pkg/{a.txt => b.txt}`) and otherwise prints `old => new`.
-fn stat_name(f: &FileChange) -> Vec<u8> {
-    match &f.source {
+/// `strip_prefix()` (diff.c:5009): advance a reported name past `--relative`'s
+/// prefix. The queue was already narrowed to it, so a name that does not start with
+/// it can only be a `--summary`/`--dirstat` caller passing an empty prefix.
+fn shorten_path<'a>(path: &'a [u8], rel: &str) -> &'a [u8] {
+    match path.starts_with(rel.as_bytes()) {
+        true => &path[rel.len()..],
+        false => path,
+    }
+}
+
+fn stat_name(f: &FileChange, compact: bool, rel: &str) -> Vec<u8> {
+    let mut name = match &f.source {
         // `pprint_rename()` quotes the pair itself; a plain name goes through
         // `quote_c_style()` in `fill_print_name()`.
-        Some(source) => super::diff_pairs::pprint_rename(source, &f.path),
-        None => super::diff_files::quoted_name_bytes(&f.path),
+        Some(source) => {
+            super::diff_pairs::pprint_rename(shorten_path(source, rel), shorten_path(&f.path, rel))
+        }
+        None => super::diff_files::quoted_name_bytes(shorten_path(&f.path, rel)),
+    };
+    // `--compact-summary`'s ` (<comment>)` suffix (`fill_print_name()`), derived
+    // from the two sides' mode words exactly as `git diff` derives it.
+    if compact {
+        if let Some(c) = super::diff::compact_comment_for_modes(
+            f.old_side.map(|(m, _)| m),
+            f.new_side.map(|(m, _)| m),
+        ) {
+            name.push(b' ');
+            name.push(b'(');
+            name.extend_from_slice(c.as_bytes());
+            name.push(b')');
+        }
     }
+    name
 }
 
 /// git's `--shortstat` (`show_shortstats()`): the summary line only.
 fn emit_shortstat(out: &mut Vec<u8>, files: &[FileChange]) -> Result<()> {
-    diffstat::show_shortstats(out, &stat_rows(files));
+    diffstat::show_shortstats(out, &stat_rows(files, false, ""));
     Ok(())
 }
 

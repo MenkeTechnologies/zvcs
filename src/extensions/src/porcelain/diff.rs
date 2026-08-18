@@ -267,6 +267,12 @@ struct Render {
     src_prefix: Vec<u8>,
     /// The `b/` (destination) path prefix.
     dst_prefix: Vec<u8>,
+    /// `o->output_indicators[]` (diff.h:381) — the added, removed and context sign
+    /// bytes `--output-indicator-new`/`-old`/`-context` replace. `diff.c` applies
+    /// them in `emit_line_ws_markup()` (diff.c:1369), i.e. at emit time only: the
+    /// stored hunk text keeps git's canonical `+`/`-`/` ` so `--check`, the pickaxe
+    /// and the diffstat all keep reading a real unified diff.
+    indicators: (u8, u8, u8),
     hash_kind: gix::hash::Kind,
 }
 
@@ -350,22 +356,9 @@ pub(crate) enum SubmoduleFormat {
 /// or default-valued spelling whose callback, read in git 2.55.0, writes the state
 /// this port is permanently in:
 ///
-/// * `--no-compact-summary` — `diff_opt_compact_summary()` with `unset` clears
-///   `flags.stat_with_summary` and touches `output_format` only on the positive
-///   side (diff.c:5663). The positive spelling is not ported here, so the flag it
-///   would clear is already clear.
-/// * `--no-color-moved` / `--color-moved=no` — `COLOR_MOVED_NO`. Moved-block
-///   colouring is not ported, so turning it off is what this port already does —
-///   including when `diff.colorMoved` set it, which is the one case where the flag
-///   moves stock git *towards* these bytes rather than away from them.
-/// * `--no-color-moved-ws` — clears `color_moved_ws_handling`, which is only read
-///   while `color_moved` is on.
-/// * `--word-diff=none` — `DIFF_WORDS_NONE`, `diff_setup()`'s value.
 /// * `--no-textconv` — clears `flags.allow_textconv`. No textconv driver is ever
 ///   run here, so the converted side never existed to suppress.
 /// * `--no-ext-diff` — clears `flags.allow_external`, likewise.
-/// * `--no-relative` — clears `flags.relative_name`, which is what makes
-///   `diff_setup_done()` drop `options->prefix`; these commands never carry one.
 /// * `--ita-visible-in-index` / `--ita-invisible-in-index` — `flags.ita_invisible_in_index`
 ///   is read only by the index-vs-worktree and index-vs-tree walks (diff-lib.c);
 ///   `log`/`show`/`whatchanged` diff two trees and never see an intent-to-add entry.
@@ -378,17 +371,18 @@ pub(crate) enum SubmoduleFormat {
 /// `--numstat`, `--shortstat`, `--summary`, `--name-status` and `-p -M -C` on
 /// `log`, `show` and `whatchanged`, over a fixture carrying a rename, an empty-file
 /// rename, a symlink, an exec-bit flip and a tab in a pathname.
+///
+/// The negations that *used* to live here — `--no-compact-summary`,
+/// `--no-color-moved`, `--color-moved=no`, `--no-color-moved-ws`, `--word-diff=none`
+/// and `--no-relative` — have moved out because their positive spellings are now
+/// ported: each is handled by the option parser that owns the flag it clears, so
+/// `--compact-summary --no-compact-summary` really does undo the first flag instead
+/// of being swallowed twice.
 pub(crate) fn history_noop_diff_option(a: &str) -> bool {
     matches!(
         a,
-        "--no-compact-summary"
-            | "--no-color-moved"
-            | "--color-moved=no"
-            | "--no-color-moved-ws"
-            | "--word-diff=none"
-            | "--no-textconv"
+        "--no-textconv"
             | "--no-ext-diff"
-            | "--no-relative"
             | "--ita-visible-in-index"
             | "--ita-invisible-in-index"
             | "--rename-empty"
@@ -757,6 +751,9 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     // `--color-moved*` / `--word-diff*` / `--color-words`, layered over
     // `diff.colorMoved` / `diff.colorMovedWS` / `diff.wordRegex` below.
     let mut move_word = diff_color::MoveWordOpts::default();
+    // `options->output_indicators[]` (diff.c:5143-5145), replaced by
+    // `--output-indicator-new`/`-old`/`-context`.
+    let mut indicators = (b'+', b'-', b' ');
     // The `diffcore_std()` rename/copy/break knobs. `git diff` is a porcelain, so
     // `init_diff_ui_defaults()` has already turned rename detection on by default;
     // `diff.renames` and the `-M`/`-C`/`--no-renames` flags override it below.
@@ -1019,6 +1016,16 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                     return Ok(ExitCode::from(129));
                 }
                 pickaxe_arg = Some((kind, a.as_bytes().to_vec()));
+            } else if indicator_slot(&flag).is_some() {
+                if let Err(msg) = set_indicator(&mut indicators, &flag, a) {
+                    eprintln!("{msg}");
+                    return Ok(ExitCode::from(129));
+                }
+            } else if flag == "--diff-merges" {
+                if !is_diff_merges_value(a) {
+                    eprintln!("fatal: invalid value for '--diff-merges': '{a}'");
+                    return Ok(ExitCode::from(128));
+                }
             } else if let Some(Err(msg)) =
                 move_word.parse_flag(&format!("{flag}={a}"), &mut color_when)
             {
@@ -1038,6 +1045,8 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
         // instead left the real pattern behind to be read as a revision, which is why
         // `git diff -S dd HEAD~1` died with `fatal: ambiguous argument 'dd'`.
         if diff_color::needs_separate_value(a)
+            || indicator_slot(a).is_some()
+            || a == "--diff-merges"
             || matches!(a.as_str(), "--diff-algorithm" | "--find-object" | "-S" | "-G")
         {
             pending_value = Some(a.clone());
@@ -1280,6 +1289,51 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                         );
                         return Ok(ExitCode::from(129));
                     }
+                }
+            }
+            // `--output-indicator-new`/`-old`/`-context=<char>` (`diff_opt_char()`,
+            // diff.c:5593): a single byte replaces the `+`/`-`/` ` this side of a
+            // hunk line is written with. An empty value stores NUL, which
+            // `emit_line_0()` writes as no sign at all.
+            s if indicator_slot(s.split_once('=').map_or(s, |(n, _)| n)).is_some()
+                && s.contains('=') =>
+            {
+                let (name, val) = s.split_once('=').expect("guarded by contains");
+                match set_indicator(&mut indicators, name, val) {
+                    Ok(()) => {}
+                    Err(msg) => {
+                        eprintln!("{msg}");
+                        return Ok(ExitCode::from(129));
+                    }
+                }
+            }
+            // `--expand-tabs[=<n>]` / `--no-expand-tabs` set `revs->expand_tabs_in_log`
+            // (revision.c:2575-2583), which only `pretty.c`'s `pp_remainder()` reads
+            // when it lays out a commit message. `git diff` never prints one, so the
+            // flag is inert here — but its value is still validated, since
+            // `strtol_i()` failing is a `die()` before any diff runs.
+            "--expand-tabs" | "--no-expand-tabs" => {}
+            s if s.starts_with("--expand-tabs=") => {
+                let val = &s["--expand-tabs=".len()..];
+                // `strtol_i(arg, 10, &val) < 0 || val < 0` (revision.c:2580): a value
+                // that is not a whole decimal integer, or is negative, is fatal.
+                if !matches!(val.parse::<i32>(), Ok(n) if n >= 0) {
+                    eprintln!("fatal: '{val}': not a non-negative integer");
+                    return Ok(ExitCode::from(128));
+                }
+            }
+            // `--diff-merges=<v>` / `--no-diff-merges` (diff-merges.c:139-145) touch
+            // only `rev_info`'s merge-diff fields, and every one of them is read
+            // exclusively by `log_tree_commit()` (log-tree.c:1105-1168).
+            // `builtin/diff.c` never walks commits, so none of them can reach output
+            // here — but the value is still rejected the same way, because
+            // `set_diff_merges()` dies before `cmd_diff()` gets going.
+            "--no-diff-merges" => {}
+            s if s.starts_with("--diff-merges=") => {
+                let val = &s["--diff-merges=".len()..];
+                if !is_diff_merges_value(val) {
+                    eprintln!("fatal: invalid value for '--diff-merges': '{val}'");
+                    return Ok(ExitCode::from(128));
                 }
             }
             // `--ws-error-highlight=<kind>` (`diff_opt_ws_error_highlight()`).
@@ -1648,6 +1702,14 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     // callback: parse-options reports it and exits 129 before any revision or
     // pathspec is looked at.
     if let Some(flag) = pending_value {
+        // `--diff-merges` is not a parse-options entry at all: `parse_long_opt()`
+        // (revision.c) reads it, and its missing-value complaint is
+        // `die("Option '--%s' requires a value", ...)` — a fatal at 128 rather than
+        // the `error:` line parse-options writes at 129.
+        if flag == "--diff-merges" {
+            eprintln!("fatal: Option '--diff-merges' requires a value");
+            return Ok(ExitCode::from(128));
+        }
         eprintln!("error: {}", diff_color::missing_value(&flag));
         return Ok(ExitCode::from(129));
     }
@@ -2296,6 +2358,7 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
         z,
         src_prefix,
         dst_prefix,
+        indicators,
         hash_kind,
     };
 
@@ -2460,6 +2523,7 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
             let paint_opts = diff_color::PaintOptions {
                 ws_error_highlight,
                 suppress_blank_empty,
+                indicators,
                 ..Default::default()
             };
             let mut plain: Vec<u8> = Vec::new();
@@ -2971,7 +3035,7 @@ fn mode_kind(mode: u32) -> Option<EntryKind> {
 /// `--diff-filter`: an uppercase letter selects a status, its lowercase excludes it.
 /// When only exclusions are given every other status is kept; when any inclusion is
 /// present, unlisted statuses are dropped — matching `diff_opt_diff_filter()`.
-fn diff_filter_selected(filter: &[u8], status: u8) -> bool {
+pub(crate) fn diff_filter_selected(filter: &[u8], status: u8) -> bool {
     let up = status.to_ascii_uppercase();
     if filter.iter().any(|&f| f == up.to_ascii_lowercase()) {
         return false;
@@ -3594,6 +3658,61 @@ const KNOWN_SHORT: &[u8] = b"abcghilmnpqrstuvwzBCDEFGIMOPRSUWX0123";
 ///
 /// A long option is looked up without its `=<value>`; a short option carries its value
 /// attached (`-S<string>`, `-U3`), so only the letter is looked up.
+/// Which slot of `options->output_indicators[]` a `--output-indicator-*` name
+/// names, in git's `OUTPUT_INDICATOR_NEW`/`_OLD`/`_CONTEXT` order (diff.h:378-380).
+fn indicator_slot(name: &str) -> Option<usize> {
+    match name {
+        "--output-indicator-new" => Some(0),
+        "--output-indicator-old" => Some(1),
+        "--output-indicator-context" => Some(2),
+        _ => None,
+    }
+}
+
+/// `diff_opt_char()` (diff.c:5593): store `arg[0]`, refusing anything longer than
+/// one byte. The empty string stores the NUL that terminates it, which
+/// `emit_line_0()` then declines to write.
+fn set_indicator(
+    indicators: &mut (u8, u8, u8),
+    name: &str,
+    val: &str,
+) -> std::result::Result<(), String> {
+    let Some(slot) = indicator_slot(name) else {
+        return Ok(());
+    };
+    if val.len() > 1 {
+        return Err(format!("error: {} expects a character, got '{val}'", &name[2..]));
+    }
+    let c = val.as_bytes().first().copied().unwrap_or(0);
+    match slot {
+        0 => indicators.0 = c,
+        1 => indicators.1 = c,
+        _ => indicators.2 = c,
+    }
+    Ok(())
+}
+
+/// `func_by_opt()` (diff-merges.c:68-86): the `--diff-merges=<v>` values git maps to
+/// a setup function. Anything else is `die("invalid value for '%s': '%s'")`.
+fn is_diff_merges_value(v: &str) -> bool {
+    matches!(
+        v,
+        "off"
+            | "none"
+            | "1"
+            | "first-parent"
+            | "separate"
+            | "c"
+            | "combined"
+            | "cc"
+            | "dense-combined"
+            | "r"
+            | "remerge"
+            | "m"
+            | "on"
+    )
+}
+
 pub(crate) fn is_known_option(arg: &str) -> bool {
     match arg.starts_with("--") {
         true => KNOWN_LONG.contains(&arg.split_once('=').map_or(arg, |(n, _)| n)),
@@ -3843,6 +3962,7 @@ fn patch_render(repo: &gix::Repository, opts: &PatchOpts) -> Render {
         z: false,
         src_prefix: opts.src_prefix.clone(),
         dst_prefix: opts.dst_prefix.clone(),
+        indicators: opts.indicators,
         hash_kind,
     }
 }
@@ -3906,6 +4026,27 @@ pub(crate) struct PatchOpts {
     /// renders a gitlink pair as the synthetic `Subproject commit <oid>` blob; the
     /// other two take `builtin_diff()`'s submodule branches (diff.c:3870).
     pub submodule_format: SubmoduleFormat,
+    /// `o->output_indicators[]` — see [`Render::indicators`].
+    pub indicators: (u8, u8, u8),
+    /// `--diff-filter=<letters>` (`o->filter`): the status letters a pair must
+    /// carry to survive `diffcore_apply_filter()`. `None` keeps every pair.
+    pub diff_filter: Option<Vec<u8>>,
+    /// `--relative[=<path>]` (`o->flags.relative_name` plus `o->prefix`): the
+    /// repository-relative prefix, with a trailing slash, that narrows the change
+    /// list and is then stripped from every reported name. `None` is
+    /// `--no-relative`, git's default.
+    pub relative: Option<String>,
+    /// `o->ws_error_highlight` (`--ws-error-highlight=<kind>` and
+    /// `diff.wsErrorHighlight`), read by `emit_line_ws_markup()` (diff.c:1374).
+    pub ws_error_highlight: u32,
+    /// `o->color_moved` / `o->word_diff` / `o->word_regex`: the two families that
+    /// re-emit the assembled patch rather than change how it is generated.
+    pub extra: diff_color::ExtraPaint,
+    /// The palette the re-emit pass paints with. `git log`/`git show` leave the
+    /// patch body uncolored unless `--color-words`/`--word-diff=color` forced
+    /// `use_color = GIT_COLOR_ALWAYS` (`diff_opt_word_diff()`), so this is the
+    /// disabled table for an ordinary run.
+    pub colors: diff_color::DiffColors,
 }
 
 impl Default for PatchOpts {
@@ -3932,6 +4073,13 @@ impl Default for PatchOpts {
             ignore_lines: Vec::new(),
             inter_hunk_ctx: 0,
             submodule_format: SubmoduleFormat::Short,
+            indicators: (b'+', b'-', b' '),
+            diff_filter: None,
+            relative: None,
+            // `diff_setup()` (diff.c:5150): `WSEH_NEW`.
+            ws_error_highlight: diff_color::WSEH_NEW,
+            extra: diff_color::ExtraPaint::default(),
+            colors: diff_color::DiffColors::disabled(),
         }
     }
 }
@@ -4029,11 +4177,13 @@ pub(crate) fn commit_patches(
     Ok(out)
 }
 
-/// One commit's patch, reusing a caller-owned blob platform and render settings.
-fn commit_patch_with(
+/// The file pairs one commit's diff resolves to: the tree-to-tree change list with
+/// the pathspec limit and `diffcore_rename()` already applied. Shared by the patch
+/// renderer and by `--dirstat`, which needs the same queue but different per-pair
+/// work.
+fn commit_deltas(
     repo: &gix::Repository,
     cache: &mut gix::diff::blob::Platform,
-    r: &Render,
     commit_id: ObjectId,
     parent: Option<ObjectId>,
     opts: &PatchOpts,
@@ -4044,7 +4194,10 @@ fn commit_patch_with(
     // matches kept. Limiting the tree diff first would hide the deletion side and
     // leave the rename rendered as an addition.
     follow: bool,
-) -> Result<Vec<u8>> {
+    // Whether `--relative`'s prefix is stripped from the reported names as well as
+    // used to narrow the queue. See the block at the end of this function.
+    strip: bool,
+) -> Result<Vec<Delta>> {
     let commit = repo.find_object(commit_id)?.try_into_commit()?;
     let new_tree = commit.tree()?;
     let old_tree = match parent {
@@ -4132,8 +4285,137 @@ fn commit_patch_with(
         }
     }
 
+    // `diffcore_apply_filter()` (diffcore-*.c), which `diffcore_std()` runs after
+    // rename detection so a pair is judged by the status it finally carries.
+    if let Some(filter) = &opts.diff_filter {
+        deltas.retain(|d| diff_filter_selected(filter, status_char(d)));
+    }
+
+    // `--relative[=<path>]` is two separate things in git. The *narrowing* is done
+    // by `diff_queue()`'s prefix test (diff.c:7630, 7748) and so applies to every
+    // format; the *shortening* is `strip_prefix()` (diff.c:5009), called only from
+    // `run_diff`, `run_diffstat`, `run_checkdiff`, `diff_flush_raw` and
+    // `flush_one_pair`. `diff_summary()` and `show_dirstat()` never call it, which is
+    // why `--relative=src --summary` still prints `src/new/moved.txt` (measured
+    // against stock 2.55.0) — hence `strip`.
+    if let Some(prefix) = &opts.relative {
+        deltas.retain(|d| d.path.starts_with(prefix.as_bytes()));
+        for d in deltas.iter_mut().take(if strip { usize::MAX } else { 0 }) {
+            d.path = d.path[prefix.len()..].into();
+            if let Some(src) = &d.src_path {
+                if src.starts_with(prefix.as_bytes()) {
+                    d.src_path = Some(src[prefix.len()..].into());
+                }
+            }
+        }
+    }
+
+    Ok(deltas)
+}
+
+/// One commit's `--dirstat` block: `show_dirstat()` (diff.c) over the same file
+/// pairs `-p` would render.
+///
+/// The per-pair *damage* the default (content) mode weighs is
+/// `diffcore_count_changes()`' byte count, which nothing else in a history command
+/// computes — the stat formats carry line counts, not bytes — so this walks the
+/// pairs itself with `want_dirstat` set rather than reusing the change list
+/// `--stat` already cached. `--dirstat-by-file` and `--dirstat=lines` never need it
+/// and are answered from the analysis' line tallies, exactly as `git diff` answers
+/// them at diff.rs:2492.
+pub(crate) fn commit_dirstat(
+    repo: &gix::Repository,
+    commit_id: ObjectId,
+    parent: Option<ObjectId>,
+    opts: &PatchOpts,
+    specs: Option<&mut super::log::PathspecMatcher>,
+    ds: &super::diff_files::DirStat,
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    let mut cache = repo.diff_resource_cache_for_tree_diff()?;
+    let deltas = commit_deltas(repo, &mut cache, commit_id, parent, opts, specs, false, false)?;
+    let hash_kind = repo.object_hash();
+    let want_damage = !ds.by_file && !ds.by_line;
+    let mut files: Vec<(BString, u64)> = Vec::with_capacity(deltas.len());
+    for delta in &deltas {
+        let an = analyze(
+            &mut cache,
+            &repo.objects,
+            delta,
+            opts.ctx,
+            opts.ws,
+            opts.indent_heuristic,
+            hash_kind,
+            None,
+            // The hunks themselves are never emitted here, but the line tallies
+            // `--dirstat=lines` weighs come from the same pass.
+            false,
+            opts.algorithm,
+            None,
+            want_damage,
+            false,
+            opts.func_context,
+            &IgnoreOpts {
+                text: opts.text,
+                blank_lines: opts.blank_lines,
+                lines: opts.ignore_lines.clone(),
+                inter_hunk_ctx: opts.inter_hunk_ctx,
+            },
+        )?;
+        let damage = if ds.by_file {
+            1
+        } else if ds.by_line {
+            // For a binary pair `added`/`deleted` are the two sizes, which
+            // `show_dirstat_by_line()` charges in 64-byte units.
+            let lines = u64::from(an.added) + u64::from(an.deleted);
+            if an.binary {
+                lines.div_ceil(64)
+            } else {
+                lines
+            }
+        } else if an.damage == 0 {
+            // `show_dirstat()` charges a pair that changed at all a single unit, so
+            // a mode-only change still shows up.
+            1
+        } else {
+            an.damage
+        };
+        files.push((delta.path.clone(), damage));
+    }
+    super::diff_files::render_dirstat(out, files, ds);
+    Ok(())
+}
+
+/// One commit's patch, reusing a caller-owned blob platform and render settings.
+fn commit_patch_with(
+    repo: &gix::Repository,
+    cache: &mut gix::diff::blob::Platform,
+    r: &Render,
+    commit_id: ObjectId,
+    parent: Option<ObjectId>,
+    opts: &PatchOpts,
+    specs: Option<&mut super::log::PathspecMatcher>,
+    // `--follow`: the limit names the file *at this commit*, and the rename that
+    // brought it there is the very thing to show — so the tree diff is taken whole,
+    // rename detection runs on it, and only then is the pair whose destination
+    // matches kept. Limiting the tree diff first would hide the deletion side and
+    // leave the rename rendered as an addition.
+    follow: bool,
+) -> Result<Vec<u8>> {
+    let deltas = commit_deltas(repo, cache, commit_id, parent, opts, specs, follow, true)?;
     let hash_kind = repo.object_hash();
     let mut out: Vec<u8> = Vec::new();
+    // The patch is assembled uncolored and re-emitted through the same
+    // `fn_out_consume()` chain `git diff` uses, so `--word-diff`, `--color-moved`
+    // and `--ws-error-highlight` behave identically in a history command.
+    let ws_rule = diff_color::whitespace_rule_cfg(repo);
+    let paint_opts = diff_color::PaintOptions {
+        ws_error_highlight: opts.ws_error_highlight,
+        indicators: opts.indicators,
+        ..Default::default()
+    };
+    let mut plain: Vec<u8> = Vec::new();
+    let mut files: Vec<diff_color::FilePaint> = Vec::new();
     for queued in &deltas {
         // `run_diff()` (diff.c:5052) renders a type change as a deletion followed by
         // a creation; every other pair is one section.
@@ -4149,20 +4431,35 @@ fn commit_patch_with(
             // `short` format a gitlink pair falls through to `render_patch`, which
             // diffs the synthetic `Subproject commit <oid>` blobs.
             //
-            // These bytes are emitted already painted, but `git log`/`git show` never
-            // colour a patch body (matching stock: `log -p --color=always` paints only
-            // the commit header), so the disabled palette is the faithful one here.
+            // These bytes are emitted already painted, from the same palette the rest
+            // of the patch is re-emitted with. Measured against stock 2.55.0,
+            // `git log -p --color=always` paints the patch body exactly as `git diff`
+            // does — `log_tree_commit()` hands the diff machinery the run's
+            // `o->use_color` — so `opts.colors` is what applies, not a disabled table.
             if opts.submodule_format != SubmoduleFormat::Short
                 && !delta.unmerged
                 && delta.is_submodule_pair()
             {
+                // A submodule line is written already painted, so the patch built so
+                // far has to be flushed through the colorizer first to keep the
+                // order — the same drain `diff()` performs at diff.rs:2489.
+                out.extend_from_slice(&diff_color::colorize_patch_ex(
+                    &plain,
+                    &opts.colors,
+                    &paint_opts,
+                    &files,
+                    diff_color::FilePaint::new(ws_rule),
+                    &opts.extra,
+                ));
+                plain.clear();
+                files.clear();
                 render_submodule(
                     &mut out,
                     repo,
                     delta,
                     opts.submodule_format,
                     crate::abbrev::configured_abbrev(repo, hash_kind.len_in_hex()),
-                    &diff_color::DiffColors::disabled(),
+                    &opts.colors,
                     r,
                 );
                 continue;
@@ -4190,9 +4487,24 @@ fn commit_patch_with(
                     inter_hunk_ctx: opts.inter_hunk_ctx,
                 },
             )?;
-            render_patch(&mut out, repo, delta, &an, opts.ctx, r)?;
+            let before = plain.len();
+            render_patch(&mut plain, repo, delta, &an, opts.ctx, r)?;
+            if plain.len() != before {
+                files.push(diff_color::FilePaint { ws_rule, blank_at_eof: an.blank_at_eof });
+            }
         }
     }
+    // `diff_flush_patch_all_file_pairs()`: the whole commit's patch is decomposed
+    // and re-emitted in one pass, which is what lets `--color-moved` see a block
+    // that moved between two files of the same commit.
+    out.extend_from_slice(&diff_color::colorize_patch_ex(
+        &plain,
+        &opts.colors,
+        &paint_opts,
+        &files,
+        diff_color::FilePaint::new(ws_rule),
+        &opts.extra,
+    ));
     Ok(out)
 }
 
@@ -4312,7 +4624,7 @@ fn path_inside_repo(repo: &gix::Repository, prefix: &str, path: &str) -> bool {
     true
 }
 
-fn cwd_prefix(repo: &gix::Repository) -> String {
+pub(crate) fn cwd_prefix(repo: &gix::Repository) -> String {
     let (Some(workdir), Ok(cwd)) = (repo.workdir(), std::env::current_dir()) else {
         return String::new();
     };
@@ -5721,8 +6033,30 @@ fn compact_comment(d: &Delta) -> Option<&'static str> {
     if d.unmerged {
         return None;
     }
-    let old = d.old.map(|(_, k)| k);
-    let new = d.new_kind();
+    compact_comment_for_kinds(d.old.map(|(_, k)| k), d.new_kind())
+}
+
+/// The same annotation from the two sides' entry kinds alone, which is all
+/// `fill_print_name()` reads. Shared with the history commands, whose change
+/// records carry raw mode words rather than a [`Delta`].
+pub(crate) fn compact_comment_for_modes(old: Option<u32>, new: Option<u32>) -> Option<&'static str> {
+    compact_comment_for_kinds(old.map(kind_of_mode), new.map(kind_of_mode))
+}
+
+/// `S_ISLNK`/`S_IXUSR` on a raw mode word, in the terms the comment is phrased in.
+fn kind_of_mode(mode: u32) -> EntryKind {
+    match mode & 0o170000 {
+        0o120000 => EntryKind::Link,
+        0o160000 => EntryKind::Commit,
+        _ if mode & 0o111 != 0 => EntryKind::BlobExecutable,
+        _ => EntryKind::Blob,
+    }
+}
+
+fn compact_comment_for_kinds(
+    old: Option<EntryKind>,
+    new: Option<EntryKind>,
+) -> Option<&'static str> {
     // DIFF_STATUS_ADDED.
     if old.is_none() {
         return Some(match new {
@@ -6126,9 +6460,48 @@ fn render_patch(
     } else if let Some(hunks) = &an.hunks {
         emit_file_line(out, b"--- ", &old_label);
         emit_file_line(out, b"+++ ", &new_label);
-        out.extend_from_slice(hunks);
+        write_hunks(out, hunks, r.indicators);
     }
     Ok(())
+}
+
+/// Write a rendered hunk body, substituting each line's leading marker with the
+/// configured `--output-indicator-*` character.
+///
+/// `emit_line_ws_markup()` (diff.c:1369) reads `o->output_indicators[sign_index]`
+/// at the moment a line is written, so the substitution belongs here rather than in
+/// the hunk builder: `--check`, `-S`/`-G` and the stat formats all walk the same
+/// stored hunk text and need git's canonical markers. `@@` headers and
+/// `\ No newline at end of file` start with bytes no indicator slot owns and are
+/// copied through. The default triple is a straight copy.
+fn write_hunks(out: &mut Vec<u8>, hunks: &[u8], indicators: (u8, u8, u8)) {
+    let (ind_new, ind_old, ind_ctx) = indicators;
+    if (ind_new, ind_old, ind_ctx) == (b'+', b'-', b' ') {
+        out.extend_from_slice(hunks);
+        return;
+    }
+    for line in hunks.split_inclusive(|&b| b == b'\n') {
+        match line.first() {
+            Some(b' ') => push_indicator(out, ind_ctx),
+            Some(b'-') => push_indicator(out, ind_old),
+            Some(b'+') => push_indicator(out, ind_new),
+            _ => {
+                out.extend_from_slice(line);
+                continue;
+            }
+        }
+        out.extend_from_slice(&line[1..]);
+    }
+}
+
+/// `emit_line_0()` writes the sign only when it is non-zero, which is how
+/// `--output-indicator-new=` (an empty value) drops the marker entirely —
+/// `diff_opt_char()` (diff.c:5602) stores `arg[0]`, and for an empty argument that
+/// is the NUL terminator.
+fn push_indicator(out: &mut Vec<u8>, sign: u8) {
+    if sign != 0 {
+        out.push(sign);
+    }
 }
 
 /// `DIFF_SYMBOL_FILEPAIR_{MINUS,PLUS}`: a name containing a space gets a trailing

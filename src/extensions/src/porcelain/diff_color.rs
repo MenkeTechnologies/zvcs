@@ -396,6 +396,7 @@ const SLOT_DEFS: [SlotDef; NSLOTS] = [
 /// The resolved SGR sequence for every diff slot, or a disabled table whose
 /// sequences — and whose reset — are all empty, matching `diff_get_color()`'s
 /// `want_color(use_color) ? diff_colors[ix] : ""`.
+#[derive(Clone)]
 pub(crate) struct DiffColors {
     enabled: bool,
     slots: [String; NSLOTS],
@@ -680,7 +681,7 @@ pub(crate) fn compile_word_regex(pat: &str) -> Result<regex::bytes::Regex, Strin
 
 /// The `--color-moved` / `--word-diff` state, kept apart from [`PaintOptions`] so
 /// the plain colorizer keeps its existing shape.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct ExtraPaint {
     /// `o->color_moved`.
     pub(crate) color_moved: Option<ColorMoved>,

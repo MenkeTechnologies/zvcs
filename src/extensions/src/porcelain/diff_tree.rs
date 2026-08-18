@@ -246,6 +246,64 @@ impl Format {
     }
 }
 
+/// `diff-merges.c`'s five reachable setup functions, named as the values
+/// `func_by_opt()` (diff-merges.c:68-86) maps onto them.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DiffMerges {
+    /// `set_none()`: a merge contributes no diff at all — `diff-tree`'s start state.
+    None,
+    /// `set_separate()`: one diff per parent (`-m`, `--diff-merges=on|separate`).
+    Separate,
+    /// `set_first_parent()`: `set_separate()` narrowed to parent one (`--dd`).
+    FirstParent,
+    /// `set_combined()`: one combined diff against every parent (`-c`).
+    Combined,
+    /// `set_dense_combined()`: `-c` plus the combined *patch* format (`--cc`).
+    DenseCombined,
+    /// `set_remerge_diff()`: replay the merge and diff the result against it.
+    Remerge,
+}
+
+/// `func_by_opt()` (diff-merges.c:68-86). `m`/`on` selects the built-in default,
+/// which is `set_separate` (diff-merges.c:10) unless `diff.mergedDiffMode` moved it
+/// — a config this port does not read, so the built-in default stands.
+fn parse_diff_merges(v: &str) -> Option<DiffMerges> {
+    Some(match v {
+        "off" | "none" => DiffMerges::None,
+        "1" | "first-parent" => DiffMerges::FirstParent,
+        "separate" | "m" | "on" => DiffMerges::Separate,
+        "c" | "combined" => DiffMerges::Combined,
+        "cc" | "dense-combined" => DiffMerges::DenseCombined,
+        "r" | "remerge" => DiffMerges::Remerge,
+        _ => return None,
+    })
+}
+
+/// The setup functions themselves. Each starts from `suppress()` (diff-merges.c:16),
+/// which is why every mode clears the other two knobs rather than ORing into them:
+/// `--cc -m` renders per-parent diffs and `-m --cc` the dense combined patch.
+fn set_diff_merges(opts: &mut Opts, mode: DiffMerges) {
+    opts.merges = false;
+    opts.remerge = false;
+    opts.first_parent_merges = false;
+    opts.combine = false;
+    opts.dense_combined = false;
+    match mode {
+        DiffMerges::None => {}
+        DiffMerges::Remerge => opts.remerge = true,
+        DiffMerges::Separate => opts.merges = true,
+        DiffMerges::FirstParent => {
+            opts.merges = true;
+            opts.first_parent_merges = true;
+        }
+        DiffMerges::Combined => opts.combine = true,
+        DiffMerges::DenseCombined => {
+            opts.combine = true;
+            opts.dense_combined = true;
+        }
+    }
+}
+
 /// Parsed command-line options for a single `diff-tree` invocation.
 #[derive(Clone)]
 struct Opts {
@@ -254,6 +312,16 @@ struct Opts {
     nul: bool,           // -z: NUL instead of TAB/LF
     root: bool,          // --root: show a parentless commit as a full creation
     merges: bool,        // -m: diff a merge against every parent
+    /// `--remerge-diff` / `--diff-merges=remerge`: `rev->remerge_diff`. Recorded
+    /// rather than acted on — replaying the merge into a temporary object directory
+    /// is not ported — so that a run which never reaches a merge commit stays
+    /// byte-correct (measured: on a two-tree `diff-tree` the flag changes nothing)
+    /// and only a run that does reach one refuses.
+    remerge: bool,
+    /// `--dd` / `--diff-merges=first-parent`: `rev->first_parent_merges`, which
+    /// narrows the per-parent (`separate`) mode to the first parent only
+    /// (diff-merges.c:43-46).
+    first_parent_merges: bool,
     no_commit_id: bool,  // --no-commit-id
     always: bool,        // --always: print the commit id even with no changes
     reverse: bool,       // -R: swap the two sides of every file pair
@@ -348,6 +416,8 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
         nul: false,
         root: false,
         merges: false,
+        remerge: false,
+        first_parent_merges: false,
         no_commit_id: false,
         always: false,
         reverse: false,
@@ -488,11 +558,10 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
                 // (`--diff-merges=separate|combined|dense-combined`), so the last one
                 // on the command line wins: `--cc -m` renders per-parent diffs and
                 // `-m --cc` the dense combined patch.
-                "-m" => {
-                    opts.merges = true;
-                    opts.combine = false;
-                    opts.dense_combined = false;
-                }
+                "-m" => set_diff_merges(&mut opts, DiffMerges::Separate),
+                // `--dd` (diff-merges.c:194): `set_first_parent()` plus
+                // `merges_imply_patch`, i.e. the separate mode limited to parent one.
+                "--dd" => set_diff_merges(&mut opts, DiffMerges::FirstParent),
                 "--no-commit-id" => opts.no_commit_id = true,
                 "--always" => opts.always = true,
                 // `-v` is `revs->verbose_header` on its own, and a bare
@@ -520,15 +589,46 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
                 // `--cc` implies `-c` and additionally selects the combined *patch*
                 // format, which is why it also counts as an explicit output format
                 // for `diff_tree_tweak_rev`.
-                "-c" => {
-                    opts.combine = true;
-                    opts.dense_combined = false;
-                    opts.merges = false;
-                }
-                "--cc" => {
-                    opts.combine = true;
-                    opts.dense_combined = true;
-                    opts.merges = false;
+                "-c" => set_diff_merges(&mut opts, DiffMerges::Combined),
+                "--cc" => set_diff_merges(&mut opts, DiffMerges::DenseCombined),
+                // `--remerge-diff` (diff-merges.c:196) is `set_remerge_diff()` plus
+                // `merges_imply_patch`. On a history with no merge in it the mode is
+                // unreachable and the output is byte-identical to a plain run
+                // (measured against stock 2.55.0 on a two-tree `diff-tree`), so the
+                // request is recorded and only a merge commit turns it into a refusal.
+                "--remerge-diff" => set_diff_merges(&mut opts, DiffMerges::Remerge),
+                // `--no-diff-merges` is `set_none()` (diff-merges.c:140), the state a
+                // bare `diff-tree` already starts in.
+                "--no-diff-merges" => set_diff_merges(&mut opts, DiffMerges::None),
+                // `--diff-merges=<v>` / `--diff-merges <v>` (`parse_long_opt`), whose
+                // values `func_by_opt()` (diff-merges.c:68) maps onto the very setup
+                // functions `-m`, `--dd`, `-c` and `--cc` call. Measured against stock
+                // 2.55.0 on a merge commit, `=on`/`=separate` reproduce `-m` byte for
+                // byte, `=first-parent` reproduces `--dd`, `=combined` reproduces `-c`
+                // and `=dense-combined` reproduces `--cc`.
+                _ if a == "--diff-merges" || a.starts_with("--diff-merges=") => {
+                    let val = match a.split_once('=') {
+                        Some((_, v)) => v.to_string(),
+                        None => {
+                            i += 1;
+                            match args.get(i) {
+                                Some(v) => v.clone(),
+                                None => {
+                                    eprintln!(
+                                        "fatal: Option '--diff-merges' requires a value"
+                                    );
+                                    return Ok(ExitCode::from(128));
+                                }
+                            }
+                        }
+                    };
+                    match parse_diff_merges(&val) {
+                        Some(mode) => set_diff_merges(&mut opts, mode),
+                        None => {
+                            eprintln!("fatal: invalid value for '--diff-merges': '{val}'");
+                            return Ok(ExitCode::from(128));
+                        }
+                    }
                 }
                 "--combined-all-paths" => opts.combined_all_paths = true,
                 "--raw" => opts.format = Format::Raw,
@@ -975,6 +1075,14 @@ fn emit_commit_diff(
     out: &mut Vec<u8>,
     differed: &mut bool,
 ) -> Result<u8> {
+    // `do_remerge_diff()` (log-tree.c:1027) replays the merge into a temporary
+    // object directory and diffs the result against the merge's own tree. That
+    // engine is not ported, and stock's output for it differs from every other mode
+    // (measured on a merge commit), so a merge under `--remerge-diff` refuses rather
+    // than silently falling back to another mode's bytes.
+    if parents.len() > 1 && opts.remerge {
+        bail!("unsupported flag \"--remerge-diff\"");
+    }
     if parents.len() > 1 && opts.combine {
         return combined_commit(repo, commit_id, parents, new_tree, opts, out, differed);
     }
@@ -988,8 +1096,14 @@ fn emit_commit_diff(
         // A merge is silently skipped unless -m asks for per-parent diffs.
         return Ok(0);
     } else if opts.merges {
-        let mut trees = Vec::with_capacity(parents.len());
-        for p in parents {
+        // `first_parent_merges` (log-tree.c:1168) stops the per-parent loop after
+        // the first parent.
+        let take = match opts.first_parent_merges {
+            true => 1,
+            false => parents.len(),
+        };
+        let mut trees = Vec::with_capacity(take);
+        for p in parents.iter().take(take) {
             trees.push(Some(tree_of(repo, *p)?));
         }
         trees
@@ -1339,6 +1453,14 @@ fn is_diff_tree_option(a: &str) -> bool {
         "-m",
         "-c",
         "--cc",
+        // `--dd`, `--remerge-diff` and the `--diff-merges=<v>` family are the same
+        // knob under other spellings (diff-merges.c:104-146), so like `-c`/`--cc`
+        // they are consumed here and never replayed onto `diff-pairs` — which has
+        // no merge-diff knob of its own and would answer with its usage block.
+        "--dd",
+        "--remerge-diff",
+        "--diff-merges",
+        "--no-diff-merges",
         "--combined-all-paths",
         "--no-commit-id",
         "--always",
@@ -1349,7 +1471,10 @@ fn is_diff_tree_option(a: &str) -> bool {
         "--format",
         "-h",
     ];
-    EXACT.contains(&a) || a.starts_with("--pretty=") || a.starts_with("--format=")
+    EXACT.contains(&a)
+        || a.starts_with("--pretty=")
+        || a.starts_with("--format=")
+        || a.starts_with("--diff-merges=")
 }
 
 /// Options that set `diffopt.output_format`, which is what `diff_tree_tweak_rev` checks
@@ -1615,9 +1740,6 @@ fn is_known_unsupported(a: &str) -> bool {
         "-c",
         "--cc",
         "--combined-all-paths",
-        "--diff-merges",
-        "--no-diff-merges",
-        "--remerge-diff",
         "--first-parent",
         "--full-diff",
         "--max-depth",

@@ -92,7 +92,18 @@ const DEFAULT_ABBREV: usize = 7;
 /// The patch uses git's default settings: Myers diff with the indent (slider)
 /// heuristic, three lines of context, `@@`-hunk function-context, binary-file
 /// detection, and the `\ No newline at end of file` marker. Output is never
-/// colorized (equivalent to `git --no-color show` / a non-tty pipe).
+/// colorized (equivalent to `git --no-color show` / a non-tty pipe), which is why
+/// `--color-words` and `--word-diff=color` — the two spellings that set
+/// `options->use_color = GIT_COLOR_ALWAYS` in `diff_opt_word_diff()` — are refused
+/// rather than rendered without the ANSI stock would emit. `--word-diff=plain` and
+/// `=porcelain`, which need no colour, are rendered.
+///
+/// The diff formats `git diff` renders are shared: `--dirstat[=<params>]`,
+/// `--dirstat-by-file`, `--cumulative`, `--compact-summary`, `--relative[=<path>]`
+/// (narrowing every format, shortening only the writers `strip_prefix()` reaches),
+/// `--diff-filter=<letters>` (which also clears `always_show_header`, so a commit
+/// the filter empties prints nothing), `--output-indicator-{new,old,context}` and
+/// `--ws-error-highlight=<kind>`.
 ///
 /// Deviations, surfaced rather than faked:
 ///   * `--stat` is the shared [`super::diffstat`] port of `show_stats()`: the name
@@ -194,6 +205,27 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
     let mut stat_widths = StatWidths::default();
     // The patch-shaping options, handed to the shared renderer.
     let mut patch_opts = super::diff::PatchOpts::default();
+    // `--dirstat[=<params>]` / `--dirstat-by-file[=<params>]` / `--cumulative`
+    // (`diff_opt_dirstat()`, diff.c), all of which also turn the format on.
+    let mut dirstat = super::diff_files::DirStat::default();
+    // `--compact-summary` (`diff_opt_compact_summary()`, diff.c), which also turns
+    // `--stat` on; `--no-compact-summary` clears only the annotation.
+    let mut compact_summary = false;
+    // `--relative[=<path>]` / `--no-relative` (`diff_opt_relative()`): the prefix the
+    // reported set is narrowed to, and which `strip_prefix()` then removes from the
+    // patch, raw, name and stat writers — but not from `--summary` or `--dirstat`.
+    let mut relative: Option<Option<String>> = None;
+    let mut no_relative_given = false;
+    // `--color-moved*` / `--word-diff*` / `--color-words`, resolved against
+    // `diff.colorMoved` / `diff.colorMovedWS` / `diff.wordRegex` after discovery.
+    let mut move_word = diff_color::MoveWordOpts::default();
+    // The `GIT_COLOR_ALWAYS` the two color spellings of that family force.
+    let mut move_word_color: Option<diff_color::ColorWhen> = None;
+    // Set while a separated `--color-moved-ws` / `--word-diff-regex` waits for its
+    // value, and likewise for `--output-indicator-*` and `--ws-error-highlight`.
+    let mut pending_move_word: Option<String> = None;
+    let mut pending_indicator: Option<&'static str> = None;
+    let mut pending_ws_error_highlight = false;
     // `--decorate[=<style>]` / `--no-decorate`, shared with `git log`. `None` means
     // no flag was given, so `log.decorate` (and then git's `auto` default) decides.
     let mut cli_decorate: Option<DecorateStyle> = None;
@@ -300,6 +332,31 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
                     eprintln!("error: invalid regex given to -I: '{a}'");
                     return Ok(ExitCode::from(129));
                 }
+            }
+            continue;
+        }
+        if let Some(flag) = pending_move_word.take() {
+            if let Some(Err(msg)) = move_word.parse_flag(&format!("{flag}={a}"), &mut move_word_color)
+            {
+                eprintln!("{msg}");
+                return Ok(ExitCode::from(129));
+            }
+            if move_word_color == Some(diff_color::ColorWhen::Always) {
+                bail!("unsupported option {flag}");
+            }
+            continue;
+        }
+        if let Some(name) = pending_indicator.take() {
+            if let Err(msg) = set_indicator(&mut patch_opts, name, a) {
+                eprintln!("{msg}");
+                return Ok(ExitCode::from(129));
+            }
+            continue;
+        }
+        if std::mem::take(&mut pending_ws_error_highlight) {
+            if let Err(accepted) = diff_color::parse_ws_error_highlight(a) {
+                eprintln!("error: unknown value after ws-error-highlight={}", &a[..accepted]);
+                return Ok(ExitCode::from(129));
             }
             continue;
         }
@@ -745,9 +802,99 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
                     show_signature = true;
                 } else if s == "--no-show-signature" {
                     show_signature = false;
+                } else if let Some(v) = s.strip_prefix("--diff-filter=") {
+                    patch_opts
+                        .diff_filter
+                        .get_or_insert_with(Vec::new)
+                        .extend_from_slice(v.as_bytes());
+                } else if s == "--relative" {
+                    // The repository is not open yet, so the cwd prefix is resolved
+                    // after discovery; `Some(None)` records "the valueless form".
+                    relative = Some(None);
+                    no_relative_given = false;
+                } else if s == "--no-relative" {
+                    relative = None;
+                    no_relative_given = true;
+                } else if let Some(v) = s.strip_prefix("--relative=") {
+                    // git stores the prefix with a trailing slash so a plain prefix
+                    // match cannot cross a name boundary.
+                    let mut p = v.to_string();
+                    if !p.is_empty() && !p.ends_with('/') {
+                        p.push('/');
+                    }
+                    relative = Some(Some(p));
+                    no_relative_given = false;
+                } else if s == "--compact-summary" {
+                    compact_summary = true;
+                    formats.stat = true;
+                } else if s == "--no-compact-summary" {
+                    compact_summary = false;
+                } else if s == "--dirstat" {
+                    formats.dirstat = true;
+                } else if s == "--dirstat-by-file" {
+                    formats.dirstat = true;
+                    dirstat.by_file = true;
+                } else if s == "--cumulative" {
+                    formats.dirstat = true;
+                    dirstat.cumulative = true;
+                } else if s.starts_with("--dirstat=") || s.starts_with("--dirstat-by-file=") {
+                    let by_file = s.starts_with("--dirstat-by-file=");
+                    let params = s.split_once('=').map(|(_, v)| v).unwrap_or_default();
+                    let errors = super::diff_files::parse_dirstat_params(params, &mut dirstat);
+                    if !errors.is_empty() {
+                        // `parse_dirstat_opt()`'s `die()`, carrying the accumulated text.
+                        eprint!(
+                            "fatal: Failed to parse --dirstat/-X option parameter:\n{errors}\n"
+                        );
+                        return Ok(ExitCode::from(128));
+                    }
+                    if by_file {
+                        dirstat.by_file = true;
+                    }
+                    formats.dirstat = true;
                 } else if super::diff::history_noop_diff_option(s) {
                     // Accepted and inert; see the list's own documentation for why each
                     // entry cannot change a byte this command prints.
+                // `--color-moved*` / `--word-diff*` / `--color-words`: the family that
+                // re-emits the assembled patch instead of changing how it is built.
+                // The two color spellings set `options->use_color = GIT_COLOR_ALWAYS`
+                // (`diff_opt_word_diff()`), and this module has no colored output path
+                // at all, so they stay refused rather than silently dropping the ANSI
+                // stock would emit.
+                //
+                // `--color-moved-ws` and `--word-diff-regex` are declared without
+                // `PARSE_OPT_OPTARG`, so a bare one takes the next argv entry.
+                } else if diff_color::needs_separate_value(s) {
+                    pending_move_word = Some(s.to_string());
+                } else if let Some(res) = move_word.parse_flag(s, &mut move_word_color) {
+                    if let Err(msg) = res {
+                        eprintln!("{msg}");
+                        return Ok(ExitCode::from(129));
+                    }
+                    if move_word_color == Some(diff_color::ColorWhen::Always) {
+                        bail!("unsupported option {s}");
+                    }
+                // `--output-indicator-new`/`-old`/`-context=<char>` (`diff_opt_char()`,
+                // diff.c:5593): one byte replaces the sign a hunk line carries.
+                } else if let Some(name) = super::log::indicator_name(s) {
+                    match s.split_once('=') {
+                        Some((_, v)) => {
+                            if let Err(msg) = set_indicator(&mut patch_opts, name, v) {
+                                eprintln!("{msg}");
+                                return Ok(ExitCode::from(129));
+                            }
+                        }
+                        None => pending_indicator = Some(name),
+                    }
+                // `--ws-error-highlight=<kind>`. Nothing is painted with color off, but
+                // the value is validated the way `diff_opt_ws_error_highlight()` does.
+                } else if s == "--ws-error-highlight" {
+                    pending_ws_error_highlight = true;
+                } else if let Some(v) = s.strip_prefix("--ws-error-highlight=") {
+                    if let Err(accepted) = diff_color::parse_ws_error_highlight(v) {
+                        eprintln!("error: unknown value after ws-error-highlight={}", &v[..accepted]);
+                        return Ok(ExitCode::from(129));
+                    }
                 } else if s.starts_with('-') {
                     bail!("unsupported option {s}");
                 } else {
@@ -797,6 +944,17 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
     }
     // A trailing `--decorate-refs`/`--decorate-refs-exclude` with nothing after it
     // is git's parse-options "requires a value" usage error (exit 129).
+    for flag in [
+        pending_move_word.as_deref(),
+        pending_indicator,
+        pending_ws_error_highlight.then_some("--ws-error-highlight"),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        eprintln!("error: {}", diff_color::missing_value(flag));
+        return Ok(ExitCode::from(129));
+    }
     if let Some(include) = pending_decorate_refs {
         let name = if include {
             "decorate-refs"
@@ -840,6 +998,29 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
 
     let mut repo = gix::discover(".")?;
     let hex_len = repo.object_hash().len_in_hex();
+
+    // `--word-diff`/`--color-moved` layered over `diff.wordRegex` / `diff.colorMoved`.
+    // The palette stays disabled: this module has no colored output path, and both
+    // spellings that would force color on are refused above, so the move detector
+    // (which git only runs with `o->emitted_symbols` allocated, i.e. with color on)
+    // is inert here exactly as it is in stock.
+    // `--relative[=<path>]`, plus the `diff.relative` config that seeds the same
+    // flag (`options->flags.relative_name = diff_relative`, diff.c:5155). An explicit
+    // `--no-relative` beats the config.
+    patch_opts.relative = match (&relative, repo.config_snapshot().boolean("diff.relative")) {
+        (Some(Some(p)), _) => Some(p.clone()),
+        (Some(None), _) => Some(super::diff::cwd_prefix(&repo)),
+        (None, Some(true)) if !no_relative_given => Some(super::diff::cwd_prefix(&repo)),
+        _ => None,
+    };
+
+    patch_opts.extra = match move_word.resolve(&repo) {
+        Ok(e) => e,
+        Err(msg) => {
+            eprintln!("{msg}");
+            return Ok(ExitCode::from(128));
+        }
+    };
 
     // `revs->abbrev` reaches every abbreviation in the run, so it goes in front of
     // the same `core.abbrev` lookup gitoxide already makes. `--no-abbrev` is the one
@@ -1303,6 +1484,9 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
         show_root,
         first_parent,
         stat: stat_widths,
+        compact_summary,
+        relative: patch_opts.relative.clone().unwrap_or_default(),
+        dirstat,
         patch: patch_opts.clone(),
         decorate,
         decorations: decorations.as_ref(),
@@ -1530,6 +1714,8 @@ struct Formats {
     numstat: bool,
     shortstat: bool,
     summary: bool,
+    /// `--dirstat`/`--dirstat-by-file`/`--cumulative`: `DIFF_FORMAT_DIRSTAT`.
+    dirstat: bool,
     patch: bool,
 }
 
@@ -1550,6 +1736,7 @@ enum Selection {
         numstat: bool,
         stat: bool,
         shortstat: bool,
+        dirstat: bool,
         summary: bool,
         patch: bool,
     },
@@ -1572,12 +1759,19 @@ impl Formats {
             || self.numstat
             || self.shortstat
             || self.summary
+            || self.dirstat
             || self.patch
     }
 
     /// The block formats, i.e. everything `--name-only`/`--name-status` overrides.
     fn any_block(self) -> bool {
-        self.raw || self.stat || self.numstat || self.shortstat || self.summary || self.patch
+        self.raw
+            || self.stat
+            || self.numstat
+            || self.shortstat
+            || self.summary
+            || self.dirstat
+            || self.patch
     }
 
     /// Apply git's precedence: `-s` suppresses output only when it is the sole
@@ -1602,6 +1796,7 @@ impl Formats {
             numstat: self.numstat,
             stat: self.stat,
             shortstat: self.shortstat,
+            dirstat: self.dirstat,
             summary: self.summary,
             patch: self.patch,
         })
@@ -1646,6 +1841,15 @@ struct DisplayOpts<'a> {
     patch: super::diff::PatchOpts,
     /// `--stat` width geometry (see [`StatWidths`]).
     stat: StatWidths,
+    /// `--compact-summary`: annotate each stat row with ` (new|gone|mode ±x|…)`.
+    compact_summary: bool,
+    /// `--relative`'s prefix, already narrowed against; empty when the flag is off.
+    /// `strip_prefix()` (diff.c:5009) removes it from the patch, raw, name and stat
+    /// writers only.
+    relative: String,
+    /// `struct dirstat_opts` — the `--dirstat[=<params>]` / `--dirstat-by-file` /
+    /// `--cumulative` parameter block, read only when the format is selected.
+    dirstat: super::diff_files::DirStat,
     /// `--decorate` / `log.decorate`: the decoration style for the `commit <id>`
     /// and oneline headers. `Off` appends nothing.
     decorate: DecorateStyle,
@@ -1981,6 +2185,18 @@ fn show_commit(
         // `diff_flush()` re-renders it quietly under a whitespace rule and drops the
         // pairs whose patch came out empty. A whitespace-only commit therefore still
         // separates its message from the diff it no longer prints.
+        // `--relative[=<path>]`'s narrowing half (`diff_queue()`'s prefix test,
+        // diff.c:7630), which every format sees; the shortening half is `strip_prefix`
+        // and is applied per writer below, because `diff_summary()` and
+        // `show_dirstat()` never call it.
+        if !disp.relative.is_empty() {
+            f.retain(|c| c.path.starts_with(disp.relative.as_bytes()));
+        }
+        // `diffcore_apply_filter()`: the name and stat formats report the same
+        // filtered queue the patch renders.
+        if let Some(filter) = &disp.patch.diff_filter {
+            f.retain(|c| super::diff::diff_filter_selected(filter, c.status));
+        }
         queue_nonempty = !f.is_empty();
         if disp.patch.ws != super::diff::Whitespace::Keep {
             f.retain(reports_change);
@@ -1990,6 +2206,12 @@ fn show_commit(
         Vec::new()
     };
     if pickaxe_path && diff_shown && files.is_empty() && line_log_pairs.is_none() {
+        return Ok(());
+    }
+    // `cmd_log_init_finish()` (builtin/log.c:333) clears `always_show_header` when
+    // `--diff-filter` is in play, so a commit whose queue the filter emptied prints
+    // nothing at all — not even its header.
+    if disp.patch.diff_filter.is_some() && diff_shown && files.is_empty() {
         return Ok(());
     }
 
@@ -2063,7 +2285,7 @@ fn show_commit(
                 if raw {
                     let files: Vec<FileChange> =
                         pairs.iter().map(|(p, _)| line_log_change(repo, p)).collect();
-                    emit_raw(repo, out, &files, disp.z)?;
+                    emit_raw(repo, out, &files, disp.z, &disp.relative)?;
                     wrote_block = true;
                 }
                 if patch {
@@ -2123,7 +2345,7 @@ fn show_commit(
         if let Selection::Blocks { stat, patch, .. } = selection {
             let mut wrote = false;
             if stat {
-                emit_stat(out, &files, &disp.stat)?;
+                emit_stat(out, &files, &disp.stat, disp.compact_summary, &disp.relative)?;
                 wrote = true;
             }
             if patch {
@@ -2202,11 +2424,11 @@ fn show_commit(
                     if let Some(source) = &f.source {
                         out.extend_from_slice(format!("{:03}", f.score).as_bytes());
                         out.push(sep);
-                        out.extend_from_slice(&name_bytes(source, disp.z));
+                        out.extend_from_slice(&name_bytes(shorten_path(source, &disp.relative), disp.z));
                     }
                     out.push(sep);
                 }
-                out.extend_from_slice(&name_bytes(&f.path, disp.z));
+                out.extend_from_slice(&name_bytes(shorten_path(&f.path, &disp.relative), disp.z));
                 out.push(end);
             }
         }
@@ -2215,33 +2437,56 @@ fn show_commit(
             numstat,
             stat,
             shortstat,
+            dirstat,
             summary,
             patch,
         } => {
+            // `diff_flush()`'s `separator` counter, not "the buffer is non-empty":
+            // `show_dirstat()` (diff.c:7238) writes without raising it, so
+            // `--dirstat -p` runs the patch straight on with no blank line, while
+            // `--dirstat=lines` — emitted from inside the count-format block at
+            // diff.c:7233 — does earn one.
             let mut wrote_block = false;
             // `diff_flush()`'s fixed order: raw, numstat, stat, shortstat, summary,
             // then the patch.
             if raw {
-                emit_raw(repo, out, &files, disp.z)?;
+                emit_raw(repo, out, &files, disp.z, &disp.relative)?;
                 wrote_block = true;
             }
             if numstat {
-                emit_numstat(out, &files);
+                emit_numstat(out, &files, &disp.relative);
                 wrote_block = true;
             }
             // `diff_flush()` tests the two bits separately, so `--stat --shortstat`
             // prints the stat block and then a second summary line.
             if stat {
-                emit_stat(out, &files, &disp.stat)?;
+                emit_stat(out, &files, &disp.stat, disp.compact_summary, &disp.relative)?;
                 wrote_block = true;
             }
             if shortstat {
                 emit_shortstat(out, &files)?;
                 wrote_block = true;
             }
+            // `diff_flush()`: dirstat sits between the stat formats and the summary.
+            if dirstat {
+                if disp.dirstat.by_line {
+                    wrote_block = true;
+                }
+                super::diff::commit_dirstat(
+                    repo,
+                    commit.id,
+                    parents.first().map(|p| p.detach()),
+                    &disp.patch,
+                    None,
+                    &disp.dirstat,
+                    out,
+                )?;
+            }
             if summary {
+                let before = out.len();
                 emit_summary(out, &files)?;
-                wrote_block = true;
+                // `!is_summary_empty(q)` guards the `separator++`.
+                wrote_block |= out.len() != before;
             }
             if patch {
                 if wrote_block {
@@ -2652,7 +2897,13 @@ fn type_class(kind: EntryKind) -> u8 {
 // ---------------------------------------------------------------------------
 
 /// `:<old mode> <new mode> <old sha> <new sha> <status>\t<path>`.
-fn emit_raw(repo: &gix::Repository, out: &mut Vec<u8>, files: &[FileChange], z: bool) -> Result<()> {
+fn emit_raw(
+    repo: &gix::Repository,
+    out: &mut Vec<u8>,
+    files: &[FileChange],
+    z: bool,
+    rel: &str,
+) -> Result<()> {
     // `-z` swaps the field separator and the record terminator for NULs and drops
     // the path quoting, exactly as in the name-status form.
     let sep = if z { b'\0' } else { b'\t' };
@@ -2670,10 +2921,10 @@ fn emit_raw(repo: &gix::Repository, out: &mut Vec<u8>, files: &[FileChange], z: 
         if let Some(source) = &f.source {
             write!(out, "{:03}", f.score)?;
             out.push(sep);
-            out.extend_from_slice(&name_bytes(source, z));
+            out.extend_from_slice(&name_bytes(shorten_path(source, rel), z));
         }
         out.push(sep);
-        out.extend_from_slice(&name_bytes(&f.path, z));
+        out.extend_from_slice(&name_bytes(shorten_path(&f.path, rel), z));
         out.push(end);
     }
     Ok(())
@@ -2685,11 +2936,11 @@ fn emit_raw(repo: &gix::Repository, out: &mut Vec<u8>, files: &[FileChange], z: 
 
 /// The rows [`super::diffstat::show_stats`] renders. For a binary file the two
 /// "counts" are the byte sizes, which is what `builtin_diffstat()` stores.
-fn stat_rows(files: &[FileChange]) -> Vec<diffstat::StatFile> {
+fn stat_rows(files: &[FileChange], compact: bool, rel: &str) -> Vec<diffstat::StatFile> {
     files
         .iter()
         .map(|f| diffstat::StatFile {
-            print_name: stat_name(f),
+            print_name: stat_name(f, compact, rel),
             added: if f.is_binary { f.new_content.len() as u64 } else { f.added as u64 },
             deleted: if f.is_binary { f.old_content.len() as u64 } else { f.deleted as u64 },
             binary: f.is_binary,
@@ -2700,8 +2951,39 @@ fn stat_rows(files: &[FileChange]) -> Vec<diffstat::StatFile> {
 }
 
 /// `--stat` (`show_stats()`), rendered by the shared port.
-fn emit_stat(out: &mut Vec<u8>, files: &[FileChange], sw: &StatWidths) -> Result<()> {
-    diffstat::show_stats(out, &stat_rows(files), sw, &diff_color::DiffColors::disabled());
+fn emit_stat(
+    out: &mut Vec<u8>,
+    files: &[FileChange],
+    sw: &StatWidths,
+    compact: bool,
+    rel: &str,
+) -> Result<()> {
+    diffstat::show_stats(
+        out,
+        &stat_rows(files, compact, rel),
+        sw,
+        &diff_color::DiffColors::disabled(),
+    );
+    Ok(())
+}
+
+/// `diff_opt_char()` (diff.c:5593): store `arg[0]` in the named
+/// `output_indicators[]` slot, refusing anything longer than one byte. An empty
+/// value stores the NUL that terminates it, which `emit_line_0()` declines to write.
+fn set_indicator(
+    opts: &mut super::diff::PatchOpts,
+    name: &str,
+    val: &str,
+) -> std::result::Result<(), String> {
+    if val.len() > 1 {
+        return Err(format!("error: {} expects a character, got '{val}'", &name[2..]));
+    }
+    let c = val.as_bytes().first().copied().unwrap_or(0);
+    match name {
+        "--output-indicator-new" => opts.indicators.0 = c,
+        "--output-indicator-old" => opts.indicators.1 = c,
+        _ => opts.indicators.2 = c,
+    }
     Ok(())
 }
 
@@ -2709,21 +2991,21 @@ fn emit_stat(out: &mut Vec<u8>, files: &[FileChange], sw: &StatWidths) -> Result
 
 /// `--numstat` (`show_numstat()`): added, deleted, name — with `-` counts for a
 /// binary pair, and the rename form for a moved file.
-fn emit_numstat(out: &mut Vec<u8>, files: &[FileChange]) {
+fn emit_numstat(out: &mut Vec<u8>, files: &[FileChange], rel: &str) {
     for f in files {
         if f.is_binary {
             out.extend_from_slice(b"-\t-\t");
         } else {
             out.extend_from_slice(format!("{}\t{}\t", f.added, f.deleted).as_bytes());
         }
-        out.extend_from_slice(&stat_name(f));
+        out.extend_from_slice(&stat_name(f, false, rel));
         out.push(b'\n');
     }
 }
 
 /// `--shortstat` (`show_shortstats()`): the `--stat` summary line on its own.
 fn emit_shortstat(out: &mut Vec<u8>, files: &[FileChange]) -> Result<()> {
-    diffstat::show_shortstats(out, &stat_rows(files));
+    diffstat::show_shortstats(out, &stat_rows(files, false, ""));
     Ok(())
 }
 /// `diff_summary()` (diff.c): the `create`/`delete`/`mode change`/`rename` lines that
@@ -2788,13 +3070,34 @@ fn summary_mode_change(out: &mut Vec<u8>, f: &FileChange, show_name: bool) -> Re
 /// The name the stat formats print for a file: a rename shows both sides through
 /// `pprint_rename()`, which factors out a shared prefix and suffix
 /// (`dir/{old => new}.txt`) and otherwise prints `old => new`.
-fn stat_name(f: &FileChange) -> Vec<u8> {
-    match &f.source {
+/// `strip_prefix()` (diff.c:5009): advance a reported name past `--relative`'s
+/// prefix. Called only from the writers git calls it from.
+fn shorten_path<'a>(path: &'a [u8], rel: &str) -> &'a [u8] {
+    match path.starts_with(rel.as_bytes()) {
+        true => &path[rel.len()..],
+        false => path,
+    }
+}
+
+fn stat_name(f: &FileChange, compact: bool, rel: &str) -> Vec<u8> {
+    let mut name = match &f.source {
         // `pprint_rename()` quotes the pair itself; a plain name goes through
         // `quote_c_style()` in `fill_print_name()`.
-        Some(source) => super::diff_pairs::pprint_rename(source, &f.path),
-        None => super::diff_files::quoted_name_bytes(&f.path),
+        Some(source) => {
+            super::diff_pairs::pprint_rename(shorten_path(source, rel), shorten_path(&f.path, rel))
+        }
+        None => super::diff_files::quoted_name_bytes(shorten_path(&f.path, rel)),
+    };
+    // `--compact-summary`'s ` (<comment>)` suffix (`fill_print_name()`).
+    if compact {
+        if let Some(c) = super::diff::compact_comment_for_modes(f.old_mode, f.new_mode) {
+            name.push(b' ');
+            name.push(b'(');
+            name.extend_from_slice(c.as_bytes());
+            name.push(b')');
+        }
     }
+    name
 }
 
 

@@ -32,6 +32,20 @@
 //!     and `--not`. Each is seeded where it stands on the command line, because
 //!     that is the order the walk's commit-date queue breaks ties in, and each
 //!     counts as revision input even when it matches nothing.
+//!   * the `SYMMETRIC_LEFT` selectors — `--cherry-pick`, `--cherry-mark`,
+//!     `--left-only`, `--right-only` and `--cherry`. `cherry_pick_list()`
+//!     (revision.c:1217) computes patch ids for the smaller side of a symmetric
+//!     range and drops every equal-patch-id commit from *both* sides;
+//!     `limit_left_right()` (revision.c:1421) then keeps the side that was named.
+//!     Both run inside `limit_list()`, i.e. before the ordering flags and before
+//!     `--skip`/`-<n>` cut the list down, and both are inert on a range with only
+//!     one side. `--cherry-pick --right-only` is the selector `git rebase --apply`
+//!     drives (builtin/rebase.c:668).
+//!   * `--pretty=email` / `--format=email` (what this module already renders) and
+//!     `--pretty=mboxrd`, which is that plus `pp_remainder()`'s `>` escape on a
+//!     `/^>*From /` body line (pretty.c:2286). As a *pretty format* it is not gated
+//!     on `--stdout`, unlike the `format.mboxrd` config (builtin/log.c:2253). Every
+//!     other `--pretty` value is a different renderer and stays refused.
 //!   * revision errors — git's own `fatal: ambiguous argument …` / `bad object`
 //!     / `bad revision` / `Invalid revision range` text on stderr with exit 128,
 //!     and a positional that names an existing path is a pathspec, not an error.
@@ -534,9 +548,15 @@ struct Opts {
     /// `Content-*` block a non-ASCII message triggers is unaffected.
     encode_email_headers: bool,
     /// `format.mboxrd`: with `--stdout`, escape `/^>*From /` message-body lines
-    /// with one more `>` so an mbox reader cannot mistake them for a separator.
-    /// git has no command-line spelling of this for format-patch.
+    /// with one more `>` so an mbox reader cannot mistake them for a separator
+    /// (`builtin/log.c:2253`, which is where the `--stdout` condition lives).
     mboxrd: bool,
+    /// `--pretty=mboxrd`/`--format=mboxrd`: the same escaping as a *pretty format*
+    /// rather than as config, so `setup_revisions()` sets `rev.commit_format`
+    /// straight to `CMIT_FMT_MBOXRD` and the `--stdout` condition above never
+    /// applies. Measured against stock 2.55.0: `--pretty=mboxrd -o <dir>` escapes,
+    /// `-c format.mboxrd=true -o <dir>` does not.
+    pretty_mboxrd: bool,
     /// `--no-prefix`/`format.noprefix`: drop the `a/`+`b/` path prefixes from
     /// `diff --git`, `---` and `+++`. `--default-prefix` puts them back.
     noprefix: bool,
@@ -601,6 +621,22 @@ struct Opts {
     /// `revs->unsorted_input`, which only `--no-walk=unsorted` sets: keep the
     /// pending list in command-line order instead of sorting it by commit date.
     unsorted_input: bool,
+    /// `revs->cherry_pick` (revision.c:2511): over a symmetric range, drop from
+    /// *both* sides every commit whose patch id also appears on the other side.
+    /// `cherry_pick_list()` (revision.c:1217) marks them `SHOWN`, which
+    /// `get_commit_action()` (revision.c:4178) then suppresses.
+    cherry_pick: bool,
+    /// `revs->cherry_mark` (revision.c:2509): the same search, but marking
+    /// `PATCHSAME` instead of `SHOWN`. `format-patch` has no place to render that
+    /// mark, so it changes nothing here — measured against stock 2.55.0,
+    /// `--cherry-mark --right-only` and `--right-only` agree byte for byte. It is
+    /// still tracked because it is mutually exclusive with `--cherry-pick`.
+    cherry_mark: bool,
+    /// `revs->left_only` / `revs->right_only` (revision.c:2485-2496), applied by
+    /// `limit_left_right()` (revision.c:1421): keep only the side of a symmetric
+    /// range the flag names.
+    left_only: bool,
+    right_only: bool,
     /// Everything that feeds `rev.pending`: the revision arguments and the
     /// `--all`-family selectors, interleaved in command-line order.
     revs: Vec<RevWord>,
@@ -1525,6 +1561,7 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
         add_header: cfg_list("format.headers"),
         encode_email_headers: snap.boolean("format.encodeEmailHeaders").unwrap_or(true),
         mboxrd: snap.boolean("format.mboxrd") == Some(true),
+        pretty_mboxrd: false,
         noprefix: snap.boolean("format.noprefix") == Some(true),
         src_prefix: "a/".to_owned(),
         dst_prefix: "b/".to_owned(),
@@ -1597,6 +1634,10 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
         first_parent: false,
         order: Order::Default,
         no_walk: false,
+        cherry_pick: false,
+        cherry_mark: false,
+        left_only: false,
+        right_only: false,
         unsorted_input: false,
         revs: Vec::new(),
         paths: Vec::new(),
@@ -2345,6 +2386,71 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
                 || DEFERRED_SHORT_OPTARG.iter().any(|f| s.starts_with(f)) =>
             {
                 o.deferred.push(s.to_owned());
+            }
+            // `--pretty=<fmt>` / `--format=<fmt>`. `cmd_format_patch()` starts from
+            // `rev.commit_format = CMIT_FMT_EMAIL` (builtin/log.c:2107), so `email`
+            // is what this module already renders and `mboxrd` is that plus
+            // `pp_remainder()`'s `>` escape (pretty.c:2286). Every other format is a
+            // different renderer this module does not have, so it stays refused
+            // rather than silently producing email bytes under another name.
+            s if matches!(
+                s.split_once('=').map(|(n, v)| (n, v)),
+                Some(("--pretty" | "--format", "email" | "mboxrd"))
+            ) =>
+            {
+                o.pretty_mboxrd = s.ends_with("=mboxrd");
+            }
+            // The `SYMMETRIC_LEFT` family (revision.c:2483-2515). Each sets
+            // `revs->limited`, so they only ever act on a walk that has both sides of
+            // a symmetric range in it; on any other range every one of them is inert,
+            // which is what `apply_cherry_limits` reproduces.
+            "--cherry-pick" => {
+                if o.cherry_mark {
+                    return Ok(Parsed::Exit(fatal(
+                        "options '--cherry-mark' and '--cherry-pick' cannot be used together",
+                    )));
+                }
+                o.cherry_pick = true;
+            }
+            "--cherry-mark" => {
+                if o.cherry_pick {
+                    return Ok(Parsed::Exit(fatal(
+                        "options '--cherry-mark' and '--cherry-pick' cannot be used together",
+                    )));
+                }
+                o.cherry_mark = true;
+            }
+            "--left-only" => {
+                if o.right_only {
+                    return Ok(Parsed::Exit(fatal(
+                        "options '--left-only' and '--right-only/--cherry' cannot be used together",
+                    )));
+                }
+                o.left_only = true;
+            }
+            "--right-only" => {
+                if o.left_only {
+                    return Ok(Parsed::Exit(fatal(
+                        "options '--right-only' and '--left-only' cannot be used together",
+                    )));
+                }
+                o.right_only = true;
+            }
+            // `--cherry` is `--cherry-mark --right-only --max-parents=1`
+            // (revision.c:2497-2504); format-patch already runs at `max_parents = 1`.
+            "--cherry" => {
+                if o.left_only {
+                    return Ok(Parsed::Exit(fatal(
+                        "options '--cherry' and '--left-only' cannot be used together",
+                    )));
+                }
+                if o.cherry_pick {
+                    return Ok(Parsed::Exit(fatal(
+                        "options '--cherry-mark' and '--cherry-pick' cannot be used together",
+                    )));
+                }
+                o.cherry_mark = true;
+                o.right_only = true;
             }
             // `setup_revisions()` reports anything left over the same way, whether it
             // is a typo or an option git knows but this module does not reach.
@@ -3305,6 +3411,11 @@ struct Pending {
     /// The interesting endpoints, in command-line order — which is the order the
     /// commit-date queue breaks ties in, so it is load-bearing.
     tips: Vec<ObjectId>,
+    /// The left endpoint of every `<a>...<b>` on the command line, i.e. the objects
+    /// `handle_dotdot_1()` pends with `SYMMETRIC_LEFT` (revision.c:2107). Only the
+    /// `--cherry-pick`/`--left-only`/`--right-only` family reads it; the flag itself
+    /// propagates to ancestors, which [`symmetric_left_side`] reproduces.
+    symmetric_left: Vec<ObjectId>,
     /// The UNINTERESTING endpoints, plus the merge bases a `<a>...<b>` excludes.
     hidden: Vec<ObjectId>,
     /// Positionals that named a path rather than a revision.
@@ -3352,6 +3463,7 @@ fn seed_pending(
 
     let mut p = Pending {
         tips: Vec::new(),
+        symmetric_left: Vec::new(),
         hidden: Vec::new(),
         paths: o.paths.clone(),
         rev_input_given: false,
@@ -3498,6 +3610,10 @@ fn seed_pending(
                 };
                 sides.push(a);
                 sides.push(b);
+                // `a_flags = flags | SYMMETRIC_LEFT` (revision.c:2107). Under
+                // `--not` the two ends swap sense but not sides: git ORs
+                // `SYMMETRIC_LEFT` onto whichever object `a` names either way.
+                p.symmetric_left.push(a);
                 // Both ends are commits by now: the symmetric form ran them
                 // through `lookup_commit_reference()` before it got here.
                 for base in repo.merge_bases_many(a, &[b])? {
@@ -3625,6 +3741,102 @@ fn seed_pending(
     Ok(Ok(p))
 }
 
+/// `SYMMETRIC_LEFT`'s reach: the walked commits that descend from a `<a>...<b>`
+/// left endpoint.
+///
+/// git sets the flag on the pending object (revision.c:2107) and
+/// `add_parents_to_list()` passes it down to every parent it queues
+/// (revision.c:1179), so the left side is exactly "reachable from `a`". The walk
+/// already stopped at the merge bases, so a breadth-first pass over the parent map
+/// the walk recorded reproduces that reach without reading a single extra object —
+/// and a `<a>...<b>` whose `a` is an ancestor of `b` correctly yields nothing,
+/// because `a` never entered the list.
+fn symmetric_left_side(
+    left_tips: &[ObjectId],
+    parents_of: &HashMap<ObjectId, Vec<ObjectId>>,
+    walked: &[ObjectId],
+) -> HashSet<ObjectId> {
+    let in_list: HashSet<ObjectId> = walked.iter().copied().collect();
+    let mut left: HashSet<ObjectId> = HashSet::new();
+    let mut queue: Vec<ObjectId> = left_tips
+        .iter()
+        .copied()
+        .filter(|id| in_list.contains(id))
+        .collect();
+    for id in &queue {
+        left.insert(*id);
+    }
+    while let Some(id) = queue.pop() {
+        for parent in parents_of.get(&id).into_iter().flatten() {
+            if in_list.contains(parent) && left.insert(*parent) {
+                queue.push(*parent);
+            }
+        }
+    }
+    left
+}
+
+/// `cherry_pick_list()` (revision.c:1217) followed by `limit_left_right()`
+/// (revision.c:1421), in that order.
+///
+/// `cherry_pick_list()` counts both sides, returns immediately unless both are
+/// non-empty, computes patch ids for the *smaller* side and then marks every
+/// equal-patch-id commit on either side. `format-patch` renders neither
+/// `PATCHSAME` nor a left/right mark, so `--cherry-mark` alone drops nothing —
+/// measured against stock 2.55.0, `--cherry-mark --right-only` and `--right-only`
+/// produce identical bytes.
+fn apply_cherry_limits(
+    repo: &gix::Repository,
+    o: &Opts,
+    symmetric_left: &[ObjectId],
+    parents_of: &HashMap<ObjectId, Vec<ObjectId>>,
+    walked: &mut Vec<ObjectId>,
+) -> Result<()> {
+    let left = symmetric_left_side(symmetric_left, parents_of, walked);
+    // `if (!left_count || !right_count) return;` — with one side empty there is
+    // nothing to compare against and nothing to keep.
+    let left_count = walked.iter().filter(|id| left.contains(*id)).count();
+    let right_count = walked.len() - left_count;
+    if left_count == 0 || right_count == 0 {
+        return Ok(());
+    }
+
+    let mut shown: HashSet<ObjectId> = HashSet::new();
+    if o.cherry_pick {
+        // `left_first = left_count < right_count`: patch ids are computed for
+        // whichever side is smaller, and the other side is what gets searched.
+        let left_first = left_count < right_count;
+        let mut ids: HashMap<ObjectId, Vec<ObjectId>> = HashMap::new();
+        for id in walked.iter() {
+            if left_first != left.contains(id) {
+                continue;
+            }
+            let commit = repo.find_object(*id)?.try_into_commit()?;
+            ids.entry(commit_patch_id(repo, &commit)?).or_default().push(*id);
+        }
+        for id in walked.iter() {
+            if left_first == left.contains(id) {
+                continue;
+            }
+            let commit = repo.find_object(*id)?.try_into_commit()?;
+            let Some(same) = ids.get(&commit_patch_id(repo, &commit)?) else {
+                continue;
+            };
+            // `commit->object.flags |= cherry_flag` for the commit found, and the
+            // same for every commit its patch id was recorded from.
+            shown.insert(*id);
+            shown.extend(same.iter().copied());
+        }
+    }
+    if o.right_only {
+        shown.extend(walked.iter().filter(|id| left.contains(*id)).copied());
+    } else if o.left_only {
+        shown.extend(walked.iter().filter(|id| !left.contains(*id)).copied());
+    }
+    walked.retain(|id| !shown.contains(id));
+    Ok(())
+}
+
 /// Resolve the revision arguments into the commits to format, oldest first and
 /// with merges dropped (git sets `rev.max_parents = 1`).
 ///
@@ -3636,6 +3848,7 @@ fn select_commits(repo: &gix::Repository, o: &Opts) -> Result<Selected> {
         tips,
         hidden,
         paths,
+        symmetric_left,
         ..
     } = match seed_pending(repo, o)? {
         Ok(p) => p,
@@ -3723,6 +3936,15 @@ fn select_commits(repo: &gix::Repository, o: &Opts) -> Result<Selected> {
         if !o.no_walk {
             prune_treesame(repo, &mut walked, &parents_of, &tips, specs, o.first_parent)?;
         }
+    }
+
+    // `cherry_pick_list()` (revision.c:1489) and `limit_left_right()`
+    // (revision.c:1492) are the last two steps of `limit_list()`, so they run over
+    // the walked list *before* it is ordered and before the parent bounds, `--skip`
+    // and `-<n>` cut it down. `--no-walk` returns from `prepare_revision_walk()`
+    // ahead of `limit_list()` entirely, which is why none of them apply there.
+    if !o.no_walk && (o.cherry_pick || o.left_only || o.right_only) {
+        apply_cherry_limits(repo, o, &symmetric_left, &parents_of, &mut walked)?;
     }
 
     // `sort_in_topological_order()` runs inside `prepare_revision_walk()`, over
@@ -4617,7 +4839,7 @@ fn write_subject(sb: &mut String, title: &str, nr: usize, total: usize, opts: &O
 /// with `--stdout`, exactly as git documents and implements it — patches written
 /// to files are never concatenated into an mbox by format-patch itself.
 fn mboxrd_escape(body: &mut Vec<u8>, opts: &Opts) {
-    if !opts.mboxrd || !opts.to_stdout {
+    if !opts.pretty_mboxrd && !(opts.mboxrd && opts.to_stdout) {
         return;
     }
     let mut out = Vec::with_capacity(body.len());

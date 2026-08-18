@@ -2282,11 +2282,14 @@ fn matches_in(index: &gix::index::File, specs: &[&str]) -> (Vec<BString>, Vec<bo
     let mut seen: HashSet<BString> = HashSet::new();
     let mut hit = vec![false; specs.len()];
 
+    // Normalised once, not per entry: `matches_in` is O(entries x specs).
+    let norm: Vec<(String, bool)> = specs.iter().map(|s| normalize_spec(s)).collect();
+
     let backing = index.path_backing();
     for e in index.entries() {
         let path = e.path_in(backing);
         let bytes: &[u8] = path.as_ref();
-        for (si, spec) in specs.iter().enumerate() {
+        for (si, spec) in norm.iter().enumerate() {
             if spec_matches(bytes, spec) {
                 hit[si] = true;
                 let owned = path.to_owned();
@@ -2299,14 +2302,49 @@ fn matches_in(index: &gix::index::File, specs: &[&str]) -> (Vec<BString>, Vec<bo
     (matched, hit)
 }
 
-/// A pathspec matches a file path when it is `.`/empty (all), equals the path,
-/// or is a directory prefix of it.
-fn spec_matches(path: &[u8], spec: &str) -> bool {
+/// A pathspec reduced to what the matcher needs: the components it names, and
+/// whether it ended at a directory boundary.
+///
+/// git normalises a pathspec before matching, so `sub/`, `sub//`, `sub/.` and
+/// `sub/./` all name `sub`, and a `..` pops a component — `top.txt/..` names the
+/// whole tree. What must survive normalisation is whether the spec *ended* on a
+/// slash, a `.` or a `..`, because that makes it a directory spec: `top.txt/`
+/// does not match the file `top.txt`, while a bare `top.txt` does.
+///
+/// A leading `/` is left alone. An absolute pathspec is resolved against the
+/// worktree root rather than lexically, which this matcher does not model, and
+/// reducing it here would silently turn `/abs` into a relative `abs`.
+fn normalize_spec(spec: &str) -> (String, bool) {
+    if spec.starts_with('/') {
+        return (spec.to_string(), false);
+    }
+    let mut comps: Vec<&str> = Vec::new();
+    let mut dir_only = false;
+    for part in spec.split('/') {
+        match part {
+            "" | "." => dir_only = true,
+            ".." => {
+                comps.pop();
+                dir_only = true;
+            }
+            other => {
+                comps.push(other);
+                dir_only = false;
+            }
+        }
+    }
+    (comps.join("/"), dir_only)
+}
+
+/// Whether `path` is matched by an already-normalised pathspec: an empty spec is
+/// the whole tree, a directory spec matches only what lies under it, and anything
+/// else matches itself or what lies under it.
+fn spec_matches(path: &[u8], (spec, dir_only): &(String, bool)) -> bool {
     let s = spec.as_bytes();
-    if s.is_empty() || spec == "." {
+    if s.is_empty() {
         return true;
     }
-    if path == s {
+    if !dir_only && path == s {
         return true;
     }
     path.len() > s.len() && path.starts_with(s) && path[s.len()] == b'/'

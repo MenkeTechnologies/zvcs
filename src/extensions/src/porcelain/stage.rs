@@ -131,10 +131,15 @@ struct Opts {
     /// The `<file>` argument of `--pathspec-from-file=<file>` (or its separate-arg
     /// form). `-` names stdin. Read in `stage()`, after option validation.
     pathspec_from_file_value: Option<String>,
-    /// The pathspec elements as typed, which is what git quotes back in its
-    /// diagnostics and what the matcher is handed (gitoxide resolves patterns
-    /// against the repository prefix itself).
+    /// The pathspec elements as `normalize_path_copy()` leaves them, which is what
+    /// the matcher is handed (gitoxide resolves patterns against the repository
+    /// prefix itself).
     pathspecs: Vec<String>,
+    /// `pathspec.items[i].original`: the same elements exactly as the user typed
+    /// them, before normalization. This — not [`Opts::pathspecs`] — is what every
+    /// diagnostic quotes back, which is how `git stage sub/` names `'sub/'` rather
+    /// than `'sub'`. 1:1 with [`Opts::pathspecs`].
+    original: Vec<String>,
     /// The same elements made repo-relative by `parse_pathspec()`'s prefix pass —
     /// the only form comparable with index and worktree paths. 1:1 with
     /// [`Opts::pathspecs`], filled in `stage()` once the repository is open.
@@ -684,10 +689,8 @@ pub fn stage(args: &[String]) -> Result<ExitCode> {
     // [`super::add::resolve_pathspecs`] for why each element is carried twice. This
     // runs after the `--pathspec-from-file` read, because the elements that file
     // supplies go through the very same `parse_pathspec()`.
-    o.resolved = super::add::resolve_pathspecs(&repo, &mut o.pathspecs)?
-        .into_iter()
-        .map(|(_typed, relative)| relative)
-        .collect();
+    (o.original, o.resolved) =
+        super::add::resolve_pathspecs(&repo, &mut o.pathspecs)?.into_iter().unzip();
 
     // Only `-A` and `-u` imply a pathspec; every other flag alone is a no-op.
     if o.pathspecs.is_empty() && !(o.addremove == Some(true) || o.update) {
@@ -762,7 +765,7 @@ fn pathspec_patterns(repo: &gix::Repository, o: &Opts) -> Result<Vec<BString>> {
 
 /// A pathspec that carries `:(exclude)`/`:!` magic never has to match anything,
 /// so it is exempt from the "did not match any files" check.
-fn is_exclude_spec(spec: &str) -> bool {
+pub(super) fn is_exclude_spec(spec: &str) -> bool {
     spec.starts_with(":!")
         || spec.starts_with(":^")
         || (spec.starts_with(":(") && spec[..spec.find(')').unwrap_or(0)].contains("exclude"))
@@ -788,16 +791,16 @@ fn is_literal_spec(spec: &str) -> bool {
 /// exclude and so matches exactly what git counts. `paths` is the universe of
 /// tracked and to-be-staged paths — never a gitignored-and-skipped one, so a
 /// wildcard whose only match is gitignored still (correctly) stays unseen.
-fn mark_seen_per_spec(
+pub(super) fn mark_seen_per_spec(
     repo: &gix::Repository,
     index: &gix::index::File,
     patterns: &[BString],
-    o: &Opts,
+    specs: &[String],
     paths: &[BString],
     seen: &mut HashSet<usize>,
 ) -> Result<()> {
-    // `patterns` is 1:1 with `o.pathspecs`, so the index doubles as the seen key.
-    for (i, spec) in o.pathspecs.iter().enumerate() {
+    // `patterns` is 1:1 with `specs`, so the index doubles as the seen key.
+    for (i, spec) in specs.iter().enumerate() {
         if seen.contains(&i) || is_exclude_spec(spec) || spec.is_empty() {
             continue;
         }
@@ -815,56 +818,211 @@ fn mark_seen_per_spec(
     Ok(())
 }
 
-/// Report the first pathspec that matched nothing, using the message git uses for
-/// the mode we are in. Returns `None` when every pathspec was accounted for.
+/// Deposit the blob of every staged path into the object database — git's
+/// `index_path()` writes, all of which happen inside the odb transaction.
 ///
-/// `seen` holds the sequence numbers handed out by the pathspec search, which are
-/// indices into `o.pathspecs` in argv order.
-/// `update_mode` is `-u` outside `--refresh`: that is the only mode in which git
-/// swaps the fatal for its "known to git" wording. `refresh()` passes `false`
-/// because its own check always uses the plain message.
-fn unmatched_pathspec_exit(
+/// The scan only computed ids; the bytes are re-read and re-converted here rather
+/// than carried out of it, so a `stage -A` over a large worktree holds one file in
+/// memory at a time. The id recorded in the index is the one the write returned,
+/// so the two can never disagree even if the file changed since the scan.
+fn deposit_staged_blobs(
     repo: &gix::Repository,
-    o: &Opts,
-    seen: &HashSet<usize>,
-    update_mode: bool,
-) -> Option<ExitCode> {
-    // `--ignore-missing` (only legal with `--dry-run`) turns the check off.
-    if o.ignore_missing {
-        return None;
+    staged: &mut [Staged],
+    filters: &mut super::convert_to_git::WorktreeFilter,
+) -> Result<()> {
+    for s in staged {
+        // A gitlink has no blob and no worktree bytes: its id is the submodule's
+        // HEAD commit, which lives in the submodule's own object database. Reading
+        // the path would just be a read of a directory.
+        if s.mode == Mode::COMMIT {
+            continue;
+        }
+        s.id = if s.intent {
+            repo.write_blob(b"")?.detach()
+        } else {
+            let abs = repo.workdir_path(&s.path).expect("path came from this worktree");
+            let md = gix::index::fs::Metadata::from_path_no_follow(&abs)?;
+            let (bytes, mode) = read_converted_bytes(repo, filters, s.path.as_ref(), &abs, &md)?;
+            s.mode = mode;
+            repo.write_blob(&bytes)?.detach()
+        };
     }
-    // Literal pathspecs that exist on disk yet matched nothing. In add mode the
-    // only way that happens is a .gitignore exclusion, which git reports as a
-    // block listing every such path at once — but only after the loop below has
-    // had its chance to die, since the fatal outranks it in either argv order.
-    let mut ignored: BTreeSet<&str> = BTreeSet::new();
+    Ok(())
+}
 
-    for (i, spec) in o.pathspecs.iter().enumerate() {
+/// Which reporter `cmd_add()` reaches for this option set. `--refresh` returns
+/// before the shared loop, and `--renormalize` suppresses `report_path_error()`
+/// even though it implies `-u`, so the two outrank plain `-u`.
+fn spec_mode(o: &Opts) -> SpecMode {
+    match (o.refresh, o.renormalize, o.update) {
+        (true, _, _) => SpecMode::Refresh,
+        (_, true, _) => SpecMode::Renormalize,
+        (_, _, true) => SpecMode::Update,
+        _ => SpecMode::Add,
+    }
+}
+
+/// Which of git's four unmatched-pathspec reporters is in force. `cmd_add()`
+/// reaches a different one per mode, and they disagree on both wording and
+/// severity, so the mode has to be carried explicitly.
+#[derive(Clone, Copy, PartialEq)]
+pub(super) enum SpecMode {
+    /// A plain add. `cmd_add()`'s own loop (builtin/add.c:540-570) dies on an
+    /// element that names nothing; one that exists on disk yet matched nothing was
+    /// excluded by .gitignore, and `add_files()` (builtin/add.c:344-352) names all
+    /// of those together, sets `exit_status = 1` and **keeps staging**.
+    Add,
+    /// `-u`: that loop stays silent for an element which exists on disk, and
+    /// `report_path_error()` (dir.c:637-674) afterwards names *every* such element
+    /// with `error:` before `exit(128)` (builtin/add.c:596-597).
+    Update,
+    /// `--renormalize`: implies `-u`, but the `report_path_error()` call is guarded
+    /// by `!add_renormalize`, so an existing untracked element is accepted in
+    /// silence.
+    Renormalize,
+    /// `--refresh`: `refresh()` (builtin/add.c:135-148) runs before that loop and
+    /// `goto finish`es past it. Its own check knows only the fatal and the sparse
+    /// report — never the gitignore block, never the "known to git" wording.
+    Refresh,
+}
+
+/// What git does about the pathspecs that matched nothing.
+pub(super) enum SpecVerdict {
+    /// Every pathspec was accounted for.
+    Ok,
+    /// `die()` from `cmd_add()`'s own loop (builtin/add.c:566) or from `refresh()`,
+    /// both of which run *before* `odb_transaction_begin()` (builtin/add.c:584):
+    /// nothing was hashed, so nothing is staged and nothing is written.
+    Fatal(ExitCode),
+    /// `report_path_error()`'s `exit(128)` (builtin/add.c:596-597), which runs
+    /// *after* `add_files_to_cache()` has hashed and deposited the blob of every
+    /// path it did match. The index is never written; those objects stay.
+    Unknown(ExitCode),
+    /// The gitignore block was printed and `exit_status` became 1. Staging carries
+    /// on; the 1 surfaces at `finish:` — see [`super::add::finish_code`].
+    Ignored,
+}
+
+/// The pathspec state both verbs feed to [`unmatched_pathspec_check`].
+pub(super) struct SpecCheck<'a> {
+    /// `pathspec.items[i].original`: each element exactly as the user typed it,
+    /// which is the form every one of these diagnostics quotes back.
+    pub original: &'a [String],
+    /// `pathspec.items[i].match`: the same elements made repo-relative, the only
+    /// form `file_exists()` can be asked about.
+    pub resolved: &'a [String],
+    /// `--ignore-missing` (legal only with `--dry-run`): suppresses the fatal and
+    /// asks `is_excluded()` instead, so a path that does not exist can still be
+    /// reported as gitignored. It does **not** silence the gitignore block.
+    pub ignore_missing: bool,
+    /// `--ignore-errors`: `report_path_error()` is not even called under it
+    /// (builtin/add.c:596), so `-u` says nothing about its unmatched elements.
+    pub ignore_errors: bool,
+    pub mode: SpecMode,
+}
+
+/// Report the pathspecs that matched nothing, in the wording and with the severity
+/// git uses for the mode in force.
+///
+/// `seen` holds indices into `c.original`, in argv order.
+///
+/// Not ported: `report_path_error()`'s duplicate suppression, which skips an
+/// unmatched element when an identically-spelled one *did* match. Identical
+/// elements share a pattern here, so [`mark_seen_per_spec`] always marks them
+/// alike and the two can never disagree.
+pub(super) fn unmatched_pathspec_check(
+    repo: &gix::Repository,
+    index: &gix::index::File,
+    c: &SpecCheck<'_>,
+    seen: &HashSet<usize>,
+) -> Result<SpecVerdict> {
+    // Literal pathspecs that exist on disk yet matched nothing: under `Add` a
+    // .gitignore exclusion, reported as one block listing every such path — but
+    // only once the loop below has had its chance to die, since the fatal outranks
+    // it in either argv order.
+    let mut ignored: BTreeSet<&str> = BTreeSet::new();
+    // `report_path_error()` collects rather than dying, so `-u` names every
+    // unmatched element before it exits.
+    let mut unknown: Vec<&str> = Vec::new();
+    // `is_excluded()`, built only if the `--ignore-missing` arm actually asks.
+    let mut excludes = None;
+
+    for (i, spec) in c.original.iter().enumerate() {
         if seen.contains(&i) || is_exclude_spec(spec) || spec.is_empty() {
             continue;
         }
         // `file_exists(pathspec.items[i].match)` (builtin/add.c:561): git asks about
         // the element *after* the prefix pass, which is the only form a worktree path
         // can be built from. The message still quotes `original`, i.e. `spec`.
-        let relative = o.resolved.get(i).map(String::as_str).unwrap_or(spec.as_str());
+        let relative = c.resolved.get(i).map(String::as_str).unwrap_or(spec.as_str());
+        // `if (!path[0]) continue;` — "don't complain at 'git add .' on empty repo".
+        // A `.` at the prefix resolves to the empty match, which selects everything.
+        if relative.is_empty() || relative == "." {
+            continue;
+        }
         let on_disk = repo
             .workdir_path(BStr::new(relative.as_bytes()))
             .is_some_and(|abs| std::fs::symlink_metadata(abs).is_ok());
 
-        if !on_disk || !is_literal_spec(spec) {
-            eprintln!("fatal: pathspec '{spec}' did not match any files");
-            return Some(ExitCode::from(FATAL));
+        // `(magic & (PATHSPEC_GLOB | PATHSPEC_ICASE)) || !file_exists(path)`: a
+        // wildcard or `:(icase)` element is judged purely on whether the matcher
+        // found anything, never on whether its literal text names a file.
+        if !on_disk || !is_literal_spec(spec) || c.mode == SpecMode::Refresh {
+            // `if (ignore_missing) { if (is_excluded(...)) dir_add_ignored(...); }`
+            // (builtin/add.c:562-567): the flag exists to answer "would this path be
+            // ignored if it existed", so the element joins the gitignore block
+            // instead of killing the run. `refresh()` has no such arm.
+            if !c.ignore_missing || c.mode == SpecMode::Refresh {
+                eprintln!("fatal: pathspec '{spec}' did not match any files");
+                return Ok(SpecVerdict::Fatal(ExitCode::from(FATAL)));
+            }
+            let stack = match &mut excludes {
+                Some(stack) => stack,
+                none => none.insert(repo.excludes(
+                    index,
+                    None,
+                    gix::worktree::stack::state::ignore::Source::WorktreeThenIdMappingIfNotSkipped,
+                )?),
+            };
+            // `get_dtype()` leaves an absent path `DT_UNKNOWN`, which
+            // `last_matching_pattern()` treats as a non-directory.
+            let mode = match std::fs::symlink_metadata(
+                repo.workdir_path(BStr::new(relative.as_bytes())).unwrap_or_default(),
+            ) {
+                Ok(md) if md.is_dir() => gix::index::entry::Mode::DIR,
+                _ => gix::index::entry::Mode::FILE,
+            };
+            if stack.at_entry(BStr::new(relative.as_bytes()), Some(mode))?.is_excluded() {
+                ignored.insert(relative);
+            }
+            // `--ignore-missing` only silences this loop. `report_path_error()` reads
+            // `ps_matched`, which `add_files_to_cache()` fills and the flag never
+            // touches, so under `-u` the element is still named and still exits 128.
+            if c.mode == SpecMode::Update {
+                unknown.push(spec);
+            }
+            continue;
         }
-        if update_mode {
-            // Present on disk but not tracked, and `-u` only touches tracked paths.
-            eprintln!("error: pathspec '{spec}' did not match any file(s) known to git");
-            return Some(ExitCode::from(FATAL));
+        match c.mode {
+            SpecMode::Update => unknown.push(spec),
+            // `dir_add_ignored()` records `pathspec.items[i].match`, so the block
+            // below lists the repo-relative form, not the element as typed.
+            SpecMode::Add => {
+                ignored.insert(relative);
+            }
+            SpecMode::Renormalize | SpecMode::Refresh => {}
         }
-        // `dir_add_ignored()` records `pathspec.items[i].match`, so the block below
-        // lists the repo-relative form, not the element as typed.
-        ignored.insert(relative);
     }
 
+    // `take_worktree_changes && !add_renormalize && !ignore_add_errors`
+    // (builtin/add.c:596): with `--ignore-errors` git never calls
+    // `report_path_error()` at all, so `-u --ignore-errors <untracked>` is silent.
+    if !unknown.is_empty() && !c.ignore_errors {
+        for spec in unknown {
+            eprintln!("error: pathspec '{spec}' did not match any file(s) known to git");
+        }
+        return Ok(SpecVerdict::Unknown(ExitCode::from(FATAL)));
+    }
     if !ignored.is_empty() {
         eprintln!("The following paths are ignored by one of your .gitignore files:");
         for p in &ignored {
@@ -876,9 +1034,9 @@ fn unmatched_pathspec_exit(
                 "hint: Disable this message with \"git config set advice.addIgnoredFile false\""
             );
         }
-        return Some(ExitCode::FAILURE);
+        return Ok(SpecVerdict::Ignored);
     }
-    None
+    Ok(SpecVerdict::Ok)
 }
 
 // ---------------------------------------------------------------------------
@@ -961,8 +1119,16 @@ fn refresh(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
         }
     }
 
-    mark_seen_per_spec(repo, &index, &patterns, o, &universe, &mut seen)?;
-    if let Some(code) = unmatched_pathspec_exit(repo, o, &seen, false) {
+    mark_seen_per_spec(repo, &index, &patterns, &o.pathspecs, &universe, &mut seen)?;
+    // `refresh()` has its own unmatched-pathspec loop, which only ever dies.
+    let check = SpecCheck {
+        original: &o.original,
+        resolved: &o.resolved,
+        ignore_missing: o.ignore_missing,
+        ignore_errors: o.ignore_errors,
+        mode: SpecMode::Refresh,
+    };
+    if let SpecVerdict::Fatal(code) = unmatched_pathspec_check(repo, &index, &check, &seen)? {
         return Ok(code);
     }
 
@@ -1555,7 +1721,7 @@ fn add(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
     universe.extend(
         tracked.keys().filter(|p| !skip_worktree_entries.contains(*p)).cloned(),
     );
-    mark_seen_per_spec(repo, &index, &patterns, o, &universe, &mut seen)?;
+    mark_seen_per_spec(repo, &index, &patterns, &o.pathspecs, &universe, &mut seen)?;
     // `if (!include_sparse && matches_skip_worktree(&pathspec, i, ...))`
     // (builtin/add.c:549-554): a pathspec that matched nothing so far but *does*
     // match an index entry the sparse-checkout definition hides is named through
@@ -1565,12 +1731,42 @@ fn add(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
     // [`mark_seen_per_spec`] runs — so it is reused over the hidden paths and the
     // pathspecs it newly marks are the ones to report.
     let mut hidden_seen = seen.clone();
-    mark_seen_per_spec(repo, &index, &patterns, o, &sparse_hidden, &mut hidden_seen)?;
+    mark_seen_per_spec(repo, &index, &patterns, &o.pathspecs, &sparse_hidden, &mut hidden_seen)?;
     for i in hidden_seen.difference(&seen) {
-        sparse_skipped.insert(BString::from(o.pathspecs[*i].as_bytes()));
+        sparse_skipped.insert(BString::from(o.original[*i].as_bytes()));
     }
-    if let Some(code) = unmatched_pathspec_exit(repo, o, &hidden_seen, o.update) {
-        return Ok(code);
+    let check = SpecCheck {
+        original: &o.original,
+        resolved: &o.resolved,
+        ignore_missing: o.ignore_missing,
+        ignore_errors: o.ignore_errors,
+        mode: spec_mode(o),
+    };
+    // `add_files()` reports the gitignored elements and carries on staging; only a
+    // fatal stops the run here.
+    let mut gitignored = false;
+    match unmatched_pathspec_check(repo, &index, &check, &hidden_seen)? {
+        SpecVerdict::Fatal(code) => return Ok(code),
+        // `report_path_error()` exits from inside the odb transaction, so everything
+        // `add_files_to_cache()` already did stays: its `-v`/`-n` lines are on stdout
+        // and the blobs it hashed are in the store. Only the index write, which
+        // `finish:` owns, is skipped.
+        SpecVerdict::Unknown(code) => {
+            if o.verbose || o.dry_run {
+                report(&report_lines(&index, &tracked, &touched));
+            }
+            // `ADD_CACHE_PRETEND` is `pretend ? 0 : INDEX_WRITE_OBJECT`
+            // (read-cache.c:723): a dry run hashes the content but stores none of it.
+            if !o.dry_run && !o.intent_to_add {
+                deposit_staged_blobs(repo, &mut staged, &mut filters)?;
+            }
+            if o.intent_to_add && intent_visited {
+                repo.write_blob(b"")?;
+            }
+            return Ok(code);
+        }
+        SpecVerdict::Ignored => gitignored = true,
+        SpecVerdict::Ok => {}
     }
 
     // `--renormalize` is driven by the *index*, not by the worktree walk above:
@@ -1630,6 +1826,7 @@ fn add(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
         super::add::finish_code(super::add::Finish {
             had_errors: had_error.any,
             ignore_errors: o.ignore_errors,
+            gitignored,
             sparse_skipped: &sparse_skipped,
             chmod_errors,
             index_failed,
@@ -1672,25 +1869,7 @@ fn add(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
 
     // Write the blobs only now — after the pathspec check has passed — so a bad
     // pathspec leaves the object database byte-identical, the way git does.
-    // The id recorded in the index is the one the write returned, so the two can
-    // never disagree even if the file changed since the scan hashed it.
-    for s in &mut staged {
-        // A gitlink has no blob and no worktree bytes: its id is the submodule's
-        // HEAD commit, which lives in the submodule's own object database. Reading
-        // the path would just be a read of a directory.
-        if s.mode == Mode::COMMIT {
-            continue;
-        }
-        s.id = if s.intent {
-            repo.write_blob(b"")?.detach()
-        } else {
-            let abs = repo.workdir_path(&s.path).expect("path came from this worktree");
-            let md = gix::index::fs::Metadata::from_path_no_follow(&abs)?;
-            let (bytes, mode) = read_converted_bytes(repo, &mut filters, s.path.as_ref(), &abs, &md)?;
-            s.mode = mode;
-            repo.write_blob(&bytes)?.detach()
-        };
-    }
+    deposit_staged_blobs(repo, &mut staged, &mut filters)?;
 
     // Drop every prior version (any stage) of a staged path and every deletion,
     // then append the fresh stage-0 entries and restore sort order.

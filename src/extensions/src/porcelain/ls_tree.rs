@@ -1,6 +1,8 @@
 use anyhow::Result;
+use std::io::Write;
 use std::process::ExitCode;
 
+use gix::bstr::{BString, ByteSlice};
 use gix::hash::ObjectId;
 use gix::object::tree::{EntryKind, EntryMode};
 use gix::prelude::ObjectIdExt;
@@ -70,6 +72,18 @@ enum CmdMode {
     Long,
 }
 
+/// `ls_tree_cmdmode_format[]`: the canonical `--format` template of each cmdmode.
+///
+/// `cmd_ls_tree()`'s `m2f` loop compares `--format` against these four strings and,
+/// on an exact match, runs that cmdmode's dedicated printer instead of the generic
+/// `show_tree_fmt()`. The choice is observable: the dedicated printers write the
+/// path through `write_name_quoted()`, which leaves it **raw** under `-z`, while
+/// `show_tree_fmt()` always runs it through `quote_c_style()`.
+const FMT_DEFAULT: &str = "%(objectmode) %(objecttype) %(objectname)%x09%(path)";
+const FMT_LONG: &str = "%(objectmode) %(objecttype) %(objectname) %(objectsize:padded)%x09%(path)";
+const FMT_NAME_ONLY: &str = "%(path)";
+const FMT_OBJECT_ONLY: &str = "%(objectname)";
+
 /// Parsed command-line options for a single `ls-tree` invocation.
 struct Opts {
     recurse: bool,    // -r: descend into sub-trees
@@ -80,12 +94,17 @@ struct Opts {
     name_only: bool,  // --name-only/--name-status: print the path alone
     object_only: bool, // --object-only: print the object id alone
     abbrev: Abbrev,   // --abbrev[=N] / --no-abbrev
-    format: Option<String>, // --format=<fmt>: custom per-entry template
-    paths: Vec<String>, // path filters (empty = whole tree); may carry a trailing '/'
+    // --format=<fmt>, only once the `m2f` fast path has failed to claim it; a
+    // template that names one of the four cmdmodes is turned into that cmdmode
+    // and cleared here, exactly as `cmd_ls_tree()` does.
+    format: Option<String>,
+    // Path filters (empty = whole tree); may carry a trailing '/'. Held as bytes
+    // because they are compared against tree entry names, which are bytes.
+    paths: Vec<Vec<u8>>,
     match_all: bool,  // an empty pathspec (e.g. `:` or `:(top)`) was given: selects everything
-    // When `Some("dir/")`, displayed paths are rendered relative to this prefix
+    // When `Some(b"dir/")`, displayed paths are rendered relative to this prefix
     // (git's `chomp_prefix` + `ls_tree_prefix`); `None` prints root-relative names.
-    strip_prefix: Option<String>,
+    strip_prefix: Option<Vec<u8>>,
 }
 
 /// Fatal usage error: `git` prints the message, a blank line, then the usage
@@ -267,7 +286,18 @@ pub fn ls_tree(args: &[String]) -> Result<ExitCode> {
         ));
     }
 
-    match cmdmode.map(|(m, _)| m) {
+    // `cmd_ls_tree()`'s `m2f` loop, which runs after that check: a `--format`
+    // spelled exactly like a cmdmode's canonical template *becomes* that cmdmode.
+    let mut mode = cmdmode.map(|(m, _)| m);
+    match opts.format.as_deref() {
+        Some(FMT_DEFAULT) => (mode, opts.format) = (None, None),
+        Some(FMT_LONG) => (mode, opts.format) = (Some(CmdMode::Long), None),
+        Some(FMT_NAME_ONLY) => (mode, opts.format) = (Some(CmdMode::NameOnly), None),
+        Some(FMT_OBJECT_ONLY) => (mode, opts.format) = (Some(CmdMode::ObjectOnly), None),
+        _ => {}
+    }
+
+    match mode {
         Some(CmdMode::NameOnly) | Some(CmdMode::NameStatus) => opts.name_only = true,
         Some(CmdMode::ObjectOnly) => opts.object_only = true,
         Some(CmdMode::Long) => opts.long = true,
@@ -280,6 +310,9 @@ pub fn ls_tree(args: &[String]) -> Result<ExitCode> {
     };
 
     let repo = gix::discover(".")?;
+    // `repo_config(git_default_config)`: seeds `quote_path_fully` from
+    // `core.quotePath` before the first path is rendered.
+    crate::quote::init(&repo);
 
     // git's `prefix` from setup_git_directory(): the path from the worktree root
     // down to the current directory, carrying a trailing '/' (empty at the root).
@@ -299,7 +332,7 @@ pub fn ls_tree(args: &[String]) -> Result<ExitCode> {
     // git's `chomp_prefix`: display paths relative to the cwd prefix unless
     // `--full-name`/`--full-tree` asked for full (root-relative) names.
     opts.strip_prefix = if !full_name && !cwd_prefix.is_empty() {
-        Some(cwd_prefix.clone())
+        Some(cwd_prefix.clone().into_bytes())
     } else {
         None
     };
@@ -332,24 +365,26 @@ pub fn ls_tree(args: &[String]) -> Result<ExitCode> {
         } else {
             ((*p).to_string(), false)
         };
-        if from_top || cwd_prefix.is_empty() {
-            // Anchored at the root: an empty path (`:`, `:/`, `:(top)`) matches
-            // everything, otherwise the path is taken as-is (root-relative).
-            if cleaned.is_empty() {
-                opts.match_all = true;
-            } else {
-                opts.paths.push(cleaned);
-            }
-        } else if cleaned.is_empty() {
-            // Empty, cwd-relative (`:` with a prefix): git resolves it to the
-            // prefix itself, scoping the listing to the current directory.
-            opts.paths.push(cwd_prefix.clone());
-        } else {
-            opts.paths.push(format!("{cwd_prefix}{cleaned}"));
+        // `top` magic anchors at the root; everything else is resolved against the
+        // cwd prefix, then run through `normalize_path_copy()` — which is what makes
+        // `git ls-tree HEAD ..` from `sub/deep` list `sub/` and `git ls-tree HEAD .`
+        // list the directory it was run in. Without the collapse the element stayed
+        // the literal `sub/deep/..`, which matches no entry and printed nothing.
+        let joined = match from_top {
+            true => cleaned,
+            false => format!("{cwd_prefix}{cleaned}"),
+        };
+        // An element that names the directory it started from normalizes to the
+        // empty match, which selects the whole tree — `:`, `:/`, `:(top)` and a `.`
+        // at the repository root all land here. `normalize_pathspec` spells that
+        // empty result `.`, and returns `""` only for an empty input.
+        match super::add::normalize_pathspec(&joined) {
+            n if n.is_empty() || n == "." => opts.match_all = true,
+            n => opts.paths.push(n.into_bytes()),
         }
     }
     if positionals.is_empty() && !cwd_prefix.is_empty() {
-        opts.paths.push(cwd_prefix.clone());
+        opts.paths.push(cwd_prefix.clone().into_bytes());
     }
 
     // `cmd_ls_tree` splits the two failures the way `object-name.c` does:
@@ -370,11 +405,37 @@ pub fn ls_tree(args: &[String]) -> Result<ExitCode> {
         return Ok(fatal("not a tree object"));
     };
 
-    let mut out = String::new();
-    walk(&repo, tree, "", &opts, &mut out)?;
-    print!("{out}");
+    // Entry names are arbitrary bytes, so the whole listing is assembled and
+    // written as bytes; routing it through a `String` would turn a name that is
+    // not valid UTF-8 into U+FFFD.
+    let mut out: Vec<u8> = Vec::new();
+    if let Err(bad) = walk(&repo, tree, b"", &opts, &mut out) {
+        // `strbuf_expand_bad_format()` dies while rendering the first entry, so
+        // nothing this run produced reaches stdout.
+        return Ok(match bad.downcast::<BadFormat>() {
+            Ok(BadFormat(msg)) => fatal(&msg),
+            Err(other) => return Err(other),
+        });
+    }
+    let stdout = std::io::stdout();
+    let mut sink = std::io::BufWriter::new(stdout.lock());
+    sink.write_all(&out)?;
+    sink.flush()?;
     Ok(ExitCode::SUCCESS)
 }
+
+/// A `--format` template `strbuf_expand_bad_format()` rejects, carried out of the
+/// walk so the fatal is reported once with git's wording and exit 128.
+#[derive(Debug)]
+struct BadFormat(String);
+
+impl std::fmt::Display for BadFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for BadFormat {}
 
 /// Apply an `OPT_CMDMODE`-style flag, rejecting a switch to a *different* mode.
 ///
@@ -529,25 +590,26 @@ fn parse_pathspec_magic(elt: &str) -> std::result::Result<(String, bool), ExitCo
     Ok((path, magic & M_TOP != 0))
 }
 
-/// Recursively render `tree` (rooted at `prefix`, e.g. `"dir/"`) into `out`.
+/// Recursively render `tree` (rooted at `prefix`, e.g. `b"dir/"`) into `out`.
 fn walk(
     repo: &gix::Repository,
     tree: gix::Tree<'_>,
-    prefix: &str,
+    prefix: &[u8],
     opts: &Opts,
-    out: &mut String,
+    out: &mut Vec<u8>,
 ) -> Result<()> {
     // Materialise the entries so the borrow on the tree's data ends before we
     // recurse (child lookups need mutable access to a fresh buffer).
-    let entries: Vec<(EntryMode, String, ObjectId)> = tree
+    let entries: Vec<(EntryMode, BString, ObjectId)> = tree
         .decode()?
         .entries
         .iter()
-        .map(|e| (e.mode, e.filename.to_string(), e.oid.to_owned()))
+        .map(|e| (e.mode, e.filename.to_owned(), e.oid.to_owned()))
         .collect();
 
     for (mode, filename, oid) in entries {
-        let name = format!("{prefix}{filename}");
+        let mut name = prefix.to_vec();
+        name.extend_from_slice(&filename);
 
         if mode.is_tree() {
             // git's show_tree_common: a matched tree is recursed into when
@@ -563,7 +625,9 @@ fn walk(
             }
             if recurse {
                 let child = repo.find_object(oid)?.peel_to_tree()?;
-                walk(repo, child, &format!("{name}/"), opts, out)?;
+                let mut base = name.clone();
+                base.push(b'/');
+                walk(repo, child, &base, opts, out)?;
             }
         } else if !opts.dirs_only && path_selects(&name, opts) {
             write_entry(repo, out, mode, &oid, &name, opts)?;
@@ -579,13 +643,19 @@ fn walk(
 /// this test (`dir` and `dir/` both select `dir` and everything under it); the
 /// distinction between the two only affects whether the directory line is shown,
 /// which git decides via the recursion rules in `walk`.
-fn path_selects(name: &str, opts: &Opts) -> bool {
+fn path_selects(name: &[u8], opts: &Opts) -> bool {
     opts.match_all
         || opts.paths.is_empty()
         || opts.paths.iter().any(|p| {
-            let base = p.trim_end_matches('/');
-            name == base || name.starts_with(&format!("{base}/"))
+            let base = trim_trailing_slashes(p);
+            name == base || (name.starts_with(base) && name.get(base.len()) == Some(&b'/'))
         })
+}
+
+/// `p` without its trailing '/' separators.
+fn trim_trailing_slashes(p: &[u8]) -> &[u8] {
+    let end = p.iter().rposition(|b| *b != b'/').map_or(0, |i| i + 1);
+    &p[..end]
 }
 
 /// Whether the sub-tree `name` is a strict ancestor of some path filter, i.e. a
@@ -593,8 +663,10 @@ fn path_selects(name: &str, opts: &Opts) -> bool {
 /// trees even when their own line is not shown). A `dir/` filter is an ancestor
 /// of `dir` (its contents live below), which is what makes a bare cwd-scoped
 /// `ls-tree` descend into the current directory.
-fn is_ancestor_of_spec(name: &str, opts: &Opts) -> bool {
-    opts.paths.iter().any(|p| p.starts_with(&format!("{name}/")))
+fn is_ancestor_of_spec(name: &[u8], opts: &Opts) -> bool {
+    opts.paths
+        .iter()
+        .any(|p| p.starts_with(name) && p.get(name.len()) == Some(&b'/'))
 }
 
 /// Whether the sub-tree `name` must be descended into (git's `show_recursive`).
@@ -602,7 +674,7 @@ fn is_ancestor_of_spec(name: &str, opts: &Opts) -> bool {
 /// Always when `-r` is set; otherwise only when a path filter points strictly
 /// below this tree (so an exact `<dir>` filter shows the tree line without
 /// recursing, while `<dir>/<file>` or a `<dir>/` directory filter descends).
-fn should_descend(name: &str, opts: &Opts) -> bool {
+fn should_descend(name: &[u8], opts: &Opts) -> bool {
     opts.recurse || is_ancestor_of_spec(name, opts)
 }
 
@@ -610,13 +682,13 @@ fn should_descend(name: &str, opts: &Opts) -> bool {
 /// `--object-only`, `--long` and `-z`.
 fn write_entry(
     repo: &gix::Repository,
-    out: &mut String,
+    out: &mut Vec<u8>,
     mode: EntryMode,
     oid: &ObjectId,
-    name: &str,
+    name: &[u8],
     opts: &Opts,
 ) -> Result<()> {
-    let term = if opts.nul { '\0' } else { '\n' };
+    let term = if opts.nul { b'\0' } else { b'\n' };
 
     // git prints paths relative to `ls_tree_prefix` when `chomp_prefix` is set.
     let disp = display_name(name, opts);
@@ -628,12 +700,12 @@ fn write_entry(
     }
 
     if opts.name_only {
-        out.push_str(&disp);
+        write_name(out, &disp, opts);
         out.push(term);
         return Ok(());
     }
     if opts.object_only {
-        out.push_str(&object_id_str(repo, oid, opts)?);
+        out.extend_from_slice(object_id_str(repo, oid, opts)?.as_bytes());
         out.push(term);
         return Ok(());
     }
@@ -644,24 +716,40 @@ fn write_entry(
 
     if opts.long {
         let size = entry_size(repo, mode, oid)?;
-        out.push_str(&format!(
-            "{mode_str} {type_str} {oid_str} {size:>7}\t{disp}{term}"
-        ));
+        out.extend_from_slice(format!("{mode_str} {type_str} {oid_str} {size:>7}\t").as_bytes());
     } else {
-        out.push_str(&format!("{mode_str} {type_str} {oid_str}\t{disp}{term}"));
+        out.extend_from_slice(format!("{mode_str} {type_str} {oid_str}\t").as_bytes());
     }
+    write_name(out, &disp, opts);
+    out.push(term);
     Ok(())
+}
+
+/// `write_name_quoted(name, fp, terminator)` as the four dedicated printers reach
+/// it, via `show_tree_common_default_long()` / `show_tree_name_only()`.
+///
+/// Those two spell the `-z` case out themselves as a bare `fputs()`, and
+/// `write_name_quoted()` would take the same branch anyway (a NUL terminator is
+/// the falsy one): under `-z` git writes the path **raw**, and quotes it only when
+/// records are newline-terminated. `show_tree_fmt()`'s `%(path)` does not share
+/// this — see [`expand_format`].
+fn write_name(out: &mut Vec<u8>, disp: &[u8], opts: &Opts) {
+    match opts.nul {
+        true => out.extend_from_slice(disp),
+        false => out.extend_from_slice(&crate::quote::quoted_name_bytes(disp)),
+    }
 }
 
 /// Render `name` (a root-relative path) as git would display it: relative to the
 /// cwd prefix when `--full-name`/`--full-tree` did not clear `chomp_prefix`,
-/// otherwise verbatim. Mirrors git's `write_name_quoted_relative` /
-/// `relative_path` (sans C-style quoting), including the `./` and `../` forms
-/// git emits for the prefix directory itself and for entries above it.
-fn display_name(name: &str, opts: &Opts) -> String {
+/// otherwise verbatim. Mirrors the `relative_path()` half of git's
+/// `write_name_quoted_relative` — quoting is applied afterwards, by
+/// [`write_name`] or by `%(path)` — including the `./` and `../` forms git emits
+/// for the prefix directory itself and for entries above it.
+fn display_name(name: &[u8], opts: &Opts) -> Vec<u8> {
     match &opts.strip_prefix {
-        None => name.to_string(),
-        Some(prefix) => relative_path(name, prefix.trim_end_matches('/')),
+        None => name.to_vec(),
+        Some(prefix) => relative_path(name, trim_trailing_slashes(prefix)),
     }
 }
 
@@ -669,9 +757,9 @@ fn display_name(name: &str, opts: &Opts) -> String {
 /// given root-relative. Ascends with `../` segments and collapses an empty
 /// result to `./`, matching git byte-for-byte (`dir` from `dir/sub` -> `../`,
 /// `dir/sub` from `dir/sub` -> `./`, `dir/a` from `dir` -> `a`).
-fn relative_path(name: &str, base: &str) -> String {
-    let target: Vec<&str> = name.split('/').filter(|s| !s.is_empty()).collect();
-    let base: Vec<&str> = base.split('/').filter(|s| !s.is_empty()).collect();
+fn relative_path(name: &[u8], base: &[u8]) -> Vec<u8> {
+    let target: Vec<&[u8]> = name.split_str("/").filter(|s| !s.is_empty()).collect();
+    let base: Vec<&[u8]> = base.split_str("/").filter(|s| !s.is_empty()).collect();
 
     let common = target
         .iter()
@@ -679,84 +767,132 @@ fn relative_path(name: &str, base: &str) -> String {
         .take_while(|(a, b)| a == b)
         .count();
 
-    let mut out = String::new();
+    let mut out = Vec::new();
     for _ in 0..base.len() - common {
-        out.push_str("../");
+        out.extend_from_slice(b"../");
     }
-    out.push_str(&target[common..].join("/"));
+    for (i, seg) in target[common..].iter().enumerate() {
+        if i > 0 {
+            out.push(b'/');
+        }
+        out.extend_from_slice(seg);
+    }
     if out.is_empty() {
-        out.push_str("./");
+        out.extend_from_slice(b"./");
     }
     out
 }
 
-/// Expand one `--format` template for a single entry.
+/// Expand one `--format` template for a single entry — `show_tree_fmt()`.
 ///
-/// Supports the atoms stock `git ls-tree` documents — `%(objectmode)`,
-/// `%(objecttype)`, `%(objectname)`, `%(objectsize)`, `%(objectsize:padded)`,
-/// `%(path)` — plus `%%` and `%x<hh>` byte escapes. An unrecognised `%(...)`
-/// atom is copied through verbatim.
+/// The loop is git's `while (strbuf_expand_step(...))`: literal text up to the
+/// next `%` is copied through, then exactly one of `%%`, a `strbuf_expand_literal`
+/// escape (`%n`, `%x<hh>`) or a documented `%(atom)` must follow. Anything else is
+/// `strbuf_expand_bad_format()`, which dies — and since the template is the same
+/// for every entry, that happens while rendering the first one, before any output
+/// is produced.
+///
+/// `%(path)` goes through `quote_c_style()` **unconditionally**: unlike the four
+/// dedicated printers, `show_tree_fmt()` has no `-z` special case, so a template
+/// that reaches here quotes the path even when records end in NUL.
 fn expand_format(
     repo: &gix::Repository,
     fmt: &str,
-    out: &mut String,
+    out: &mut Vec<u8>,
     mode: EntryMode,
     oid: &ObjectId,
-    name: &str,
+    name: &[u8],
     opts: &Opts,
 ) -> Result<()> {
-    let bytes: Vec<char> = fmt.chars().collect();
+    let b = fmt.as_bytes();
     let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] != '%' {
-            out.push(bytes[i]);
+    while let Some(percent) = b[i..].iter().position(|c| *c == b'%') {
+        out.extend_from_slice(&b[i..i + percent]);
+        // `strbuf_expand_step` leaves `format` pointing just past the `%`.
+        let rest = &b[i + percent + 1..];
+        i += percent + 1;
+
+        if rest.first() == Some(&b'%') {
+            out.push(b'%');
             i += 1;
-            continue;
+        } else if rest.first() == Some(&b'n') {
+            // `strbuf_expand_literal`, case 'n'.
+            out.push(b'\n');
+            i += 1;
+        } else if let Some(byte) = hex2chr(rest) {
+            // `strbuf_expand_literal`, case 'x': `%x00` == NUL, `%x0a` == LF.
+            out.push(byte);
+            i += 3;
+        } else if let Some(len) = expand_atom(repo, rest, out, mode, oid, name, opts)? {
+            i += len;
+        } else {
+            return Err(bad_format(rest).into());
         }
-        // `%` at end of string is literal.
-        let Some(&next) = bytes.get(i + 1) else {
-            out.push('%');
-            break;
-        };
-        if next == '%' {
-            out.push('%');
-            i += 2;
-            continue;
-        }
-        if next == 'x' && i + 3 < bytes.len() {
-            let hex: String = bytes[i + 2..i + 4].iter().collect();
-            if let Ok(b) = u8::from_str_radix(&hex, 16) {
-                out.push(b as char);
-                i += 4;
-                continue;
-            }
-        }
-        if next == '(' {
-            if let Some(close) = bytes[i + 2..].iter().position(|&c| c == ')') {
-                let atom: String = bytes[i + 2..i + 2 + close].iter().collect();
-                match atom.as_str() {
-                    "objectmode" => out.push_str(git_mode(mode)),
-                    "objecttype" => out.push_str(git_type(mode)),
-                    "objectname" => out.push_str(&object_id_str(repo, oid, opts)?),
-                    "objectsize" => out.push_str(&entry_size(repo, mode, oid)?),
-                    "objectsize:padded" => {
-                        out.push_str(&format!("{:>7}", entry_size(repo, mode, oid)?))
-                    }
-                    "path" => out.push_str(name),
-                    other => {
-                        out.push_str("%(");
-                        out.push_str(other);
-                        out.push(')');
-                    }
-                }
-                i += 2 + close + 1;
-                continue;
-            }
-        }
-        out.push('%');
-        i += 1;
     }
+    out.extend_from_slice(&b[i..]);
     Ok(())
+}
+
+/// `strbuf_expand_literal`'s `case 'x'`: `x` followed by two hex digits.
+fn hex2chr(rest: &[u8]) -> Option<u8> {
+    let [b'x', hi, lo, ..] = rest else { return None };
+    let v = |c: u8| (c as char).to_digit(16);
+    Some((v(*hi)? * 16 + v(*lo)?) as u8)
+}
+
+/// The `%(...)` atoms `show_tree_fmt()` knows, in its `skip_prefix` order.
+/// Returns how many bytes of `rest` the atom consumed, or `None` if none matched.
+fn expand_atom(
+    repo: &gix::Repository,
+    rest: &[u8],
+    out: &mut Vec<u8>,
+    mode: EntryMode,
+    oid: &ObjectId,
+    name: &[u8],
+    opts: &Opts,
+) -> Result<Option<usize>> {
+    let atoms: &[&str] = &[
+        "(objectmode)",
+        "(objecttype)",
+        "(objectsize:padded)",
+        "(objectsize)",
+        "(objectname)",
+        "(path)",
+    ];
+    let Some(atom) = atoms.iter().find(|a| rest.starts_with(a.as_bytes())) else {
+        return Ok(None);
+    };
+    match *atom {
+        "(objectmode)" => out.extend_from_slice(git_mode(mode).as_bytes()),
+        "(objecttype)" => out.extend_from_slice(git_type(mode).as_bytes()),
+        "(objectsize:padded)" => {
+            out.extend_from_slice(format!("{:>7}", entry_size(repo, mode, oid)?).as_bytes())
+        }
+        "(objectsize)" => out.extend_from_slice(entry_size(repo, mode, oid)?.as_bytes()),
+        "(objectname)" => out.extend_from_slice(object_id_str(repo, oid, opts)?.as_bytes()),
+        _ => out.extend_from_slice(&crate::quote::quoted_name_bytes(name)),
+    }
+    Ok(Some(atom.len()))
+}
+
+/// `strbuf_expand_bad_format(format, "ls-tree")`: the three ways a template
+/// element is rejected, in the order git tests them.
+fn bad_format(rest: &[u8]) -> BadFormat {
+    let shown = String::from_utf8_lossy(rest);
+    if rest.first() != Some(&b'(') {
+        return BadFormat(format!(
+            "bad ls-tree format: element '{shown}' does not start with '('"
+        ));
+    }
+    match rest.iter().position(|c| *c == b')') {
+        None => BadFormat(format!(
+            "bad ls-tree format: element '{shown}' does not end in ')'"
+        )),
+        Some(end) => BadFormat(format!(
+            "bad ls-tree format: %{}",
+            String::from_utf8_lossy(&rest[..=end])
+        )),
+    }
 }
 
 /// The size column: blobs (including symlinks) report their byte count, trees

@@ -39,10 +39,18 @@
 //! refuses the switch in `checkout`'s wording, and `--force`/`--discard-changes`
 //! resets instead. See [`move_worktree`].
 //!
-//! Deferred (honest terse bail): `-m`/`--merge` (a real 3-way worktree merge of
-//! local modifications *with* the target's version of the same path — a
-//! different operation from the two-way carry-across above) and `--conflict`
-//! (only meaningful with `--merge`).
+//! The listing runs for every switch that names an operand, whether or not the
+//! two trees differ — `merge_working_tree()` is entered unconditionally and the
+//! call sits at its end, outside the merge. A switch with *no* operand
+//! (`git switch -c <new>`, a bare `git switch --detach`) sets git's
+//! `do_merge = 0` and prints nothing.
+//!
+//! `-m`/`--merge` and the `--conflict=<style>` that implies it are `checkout`'s
+//! too, through the same [`super::checkout::move_worktree`]: git 2.55 answers a
+//! refused two-way merge by autostashing the local changes, switching clean, and
+//! re-applying the stash with a three-way merge. `-f`/`--discard-changes`
+//! collide with it — `'-f' cannot be used with '-m'` and `'--discard-changes'
+//! cannot be used with '--merge'`, two flags with two messages.
 //!
 //! Known divergences from git that are *not* fixable from this file:
 //! ```text
@@ -53,7 +61,7 @@
 //!     (consistent with `checkout.rs`).
 //! ```
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, Result};
 use std::io::Write as _;
 use std::process::ExitCode;
 
@@ -152,7 +160,15 @@ struct Parsed<'a> {
     force_create: Option<&'a str>,
     orphan: Option<&'a str>,
     detach: bool,
+    /// `-f`/`--force` → `opts->force`. Kept apart from `--discard-changes`
+    /// because git refuses each against `--merge` with its own wording
+    /// (builtin/checkout.c:1685-1689) before folding `force` into
+    /// `discard_changes` (checkout.c:1921).
     force: bool,
+    discard_changes: bool,
+    /// `-m`/`--merge` → `opts->merge`, and the `--conflict=<style>` that implies it.
+    merge: bool,
+    conflict_style: Option<String>,
     quiet: bool,
     /// `None` default, `Some(true)` for `--track`, `Some(false)` for `--no-track`.
     track: Option<bool>,
@@ -177,6 +193,9 @@ fn parse<'a>(args: &'a [String]) -> Result<Parse<'a>> {
         orphan: None,
         detach: false,
         force: false,
+        discard_changes: false,
+        merge: false,
+        conflict_style: None,
         quiet: false,
         track: None,
         guess: None,
@@ -269,8 +288,10 @@ fn parse<'a>(args: &'a [String]) -> Result<Parse<'a>> {
                 "no-quiet" => p.quiet = false,
                 "detach" => p.detach = true,
                 "no-detach" => p.detach = false,
-                "force" | "discard-changes" => p.force = true,
-                "no-force" | "no-discard-changes" => p.force = false,
+                "force" => p.force = true,
+                "no-force" => p.force = false,
+                "discard-changes" => p.discard_changes = true,
+                "no-discard-changes" => p.discard_changes = false,
                 "guess" => p.guess = Some(true),
                 "no-guess" => p.guess = Some(false),
                 "track" => {
@@ -285,14 +306,21 @@ fn parse<'a>(args: &'a [String]) -> Result<Parse<'a>> {
                     p.track = Some(true);
                 }
                 "no-track" => p.track = Some(false),
-                // `--no-merge` is the `OPT_BOOL` unset (0) and `--no-conflict` is
+                "merge" => p.merge = true,
+                // `--no-merge` is the `OPT_BOOL` unset (0). `--no-conflict` is
                 // `parse_opt_conflict()`'s unset arm (builtin/checkout.c:1750,
-                // `conflict_style = -1`). Both ask for the state this port already
-                // runs in, so neither reaches the three-way refusal below.
-                "no-merge" | "no-conflict" => {}
-                // A real 3-way worktree merge — not reproducible here.
-                "merge" | "conflict" => {
-                    bail!("three-way merge on switch (--{name}) is not supported")
+                // `conflict_style = -1`), which NULLs the style without clearing
+                // the `merge` an earlier `--conflict` set.
+                "no-merge" => p.merge = false,
+                "no-conflict" => p.conflict_style = None,
+                "conflict" => {
+                    let v = take_value!("conflict");
+                    if !matches!(v, "merge" | "diff3" | "zdiff3") {
+                        return Ok(Parse::Failed(unknown_option(format!(
+                            "unknown style '{v}' given for '--conflict'"
+                        ))));
+                    }
+                    p.conflict_style = Some(v.to_string());
                 }
                 // Silently-accepted no-ops that do not change deterministic output.
                 "progress"
@@ -348,7 +376,7 @@ fn parse<'a>(args: &'a [String]) -> Result<Parse<'a>> {
                         off = shorts.len();
                         continue;
                     }
-                    'm' => bail!("three-way merge on switch (-m) is not supported"),
+                    'm' => p.merge = true,
                     _ => {
                         return Ok(Parse::Failed(unknown_option(format!(
                             "unknown switch `{ch}'"
@@ -394,11 +422,30 @@ pub fn switch(args: &[String]) -> Result<ExitCode> {
         Parse::Failed(code) => return Ok(code),
     };
 
+    // `if (opts->merge == -1) opts->merge = opts->conflict_style >= 0;`
+    // (builtin/checkout.c:1918-1919): `--conflict=<style>` implies `--merge`,
+    // and a later `--no-conflict` takes the implication with it because it
+    // NULLs the style before this runs.
+    let merge = p.merge || p.conflict_style.is_some();
+    // Absent the option the style is `merge.conflictStyle`'s, which implies
+    // nothing on its own.
+    let conflict_style_cli = p.conflict_style.clone();
+
     // git's mutual-exclusion checks, in its order.
     let create_modes =
         p.create.is_some() as u8 + p.force_create.is_some() as u8 + p.orphan.is_some() as u8;
     if create_modes > 1 {
         return fatal("options '-c', '-C', and '--orphan' cannot be used together");
+    }
+    // `if (opts->force && opts->merge) die(_("'%s' cannot be used with '%s'"), "-f", "-m");`
+    // and the `--discard-changes`/`--merge` pairing right after it
+    // (builtin/checkout.c:1684-1689) — two separate flags with two separate
+    // messages, so `switch` cannot fold them into one.
+    if p.force && merge {
+        return fatal("'-f' cannot be used with '-m'");
+    }
+    if p.discard_changes && merge {
+        return fatal("'--discard-changes' cannot be used with '--merge'");
     }
     if p.detach && create_modes >= 1 {
         return fatal("'--detach' cannot be used with '-b/-B/--orphan'");
@@ -418,31 +465,81 @@ pub fn switch(args: &[String]) -> Result<ExitCode> {
         .guess
         .unwrap_or_else(|| repo.config_snapshot().boolean("checkout.guess") != Some(false));
 
+    // `if (opts->force) { opts->discard_changes = 1; … }` (builtin/checkout.c:1921)
+    // — `merge_working_tree()` reads only `discard_changes`, so from here on the
+    // two flags are one.
+    let discard = p.force || p.discard_changes;
+
+    // `--conflict=<style>`'s effective value: the flag, else `merge.conflictStyle`,
+    // else git's built-in `merge`.
+    let conflict_style = conflict_style_cli
+        .or_else(|| {
+            repo.config_snapshot()
+                .string("merge.conflictStyle")
+                .map(|v| v.to_string())
+        })
+        .unwrap_or_else(|| "merge".to_string());
+
+    // `opts->merge` for the call sites below: `Some(<style>)` when `-m` is in
+    // effect, `None` otherwise. Only the style travels — the other half of
+    // [`super::checkout::MergeOpt`], the switch target as the user spelled it, is
+    // what each call site knows and this one does not.
+    let merge_style: Option<&str> = merge.then_some(conflict_style.as_str());
+
+    // The `--track` DWIM (builtin/checkout.c:1964-1975), shared verbatim with
+    // `checkout` except for the branch-creating option it names: `cb_option` is
+    // `'c'` for `switch`, so the hint reads `try -c`. It runs before either
+    // half's own gates, and `--orphan` suppresses it because `opts->new_branch`
+    // has already absorbed the orphan name.
+    let create_from_track = if p.track.is_some() && create_modes == 0 {
+        let Some(argv0) = p.positionals.first().copied() else {
+            return fatal("--track needs a branch name");
+        };
+        let stem = argv0.strip_prefix("refs/").unwrap_or(argv0);
+        let stem = stem.strip_prefix("remotes/").unwrap_or(stem);
+        match stem.split_once('/') {
+            Some((_, rest)) if !rest.is_empty() => Some(rest.to_string()),
+            _ => return fatal("missing branch name; try -c"),
+        }
+    } else {
+        None
+    };
+
     if let Some(name) = p.orphan {
-        return switch_orphan(&repo, name, &p.positionals, p.force, p.quiet);
+        if p.track.is_some() {
+            return fatal("'--orphan' cannot be used with '-t'");
+        }
+        return switch_orphan(&repo, name, &p.positionals, discard, p.quiet);
     }
     if p.detach {
-        return switch_detach(&repo, &p.positionals, p.force, p.quiet);
+        if create_from_track.is_some() {
+            return fatal("'--detach' cannot be used with '-b/-B/--orphan'");
+        }
+        return switch_detach(&repo, &p.positionals, discard, p.quiet, merge_style);
     }
     if let Some(name) = p.force_create {
-        return switch_create(&repo, name, true, &p.positionals, p.quiet, p.force, p.track);
+        return switch_create(&repo, name, true, &p.positionals, p.quiet, discard, p.track,
+            merge_style);
     }
-    if let Some(name) = p.create {
+    if let Some(name) = p.create.map(str::to_string).or(create_from_track) {
         return switch_create(
             &repo,
-            name,
+            &name,
             false,
             &p.positionals,
             p.quiet,
-            p.force,
+            discard,
             p.track,
+            merge_style,
         );
     }
     if p.positionals.is_empty() {
         return fatal("missing branch or commit argument");
     }
-    switch_existing(&repo, &p.positionals, p.quiet, guess, p.force)
+    switch_existing(&repo, &p.positionals, p.quiet, guess, discard,
+        merge_style)
 }
+
 
 /// `git switch <branch>` — attach `HEAD` to an existing local branch, with DWIM
 /// (`--guess`) fallback to a remote-tracking branch.
@@ -452,6 +549,7 @@ fn switch_existing(
     quiet: bool,
     guess: bool,
     force: bool,
+    merge_style: Option<&str>,
 ) -> Result<ExitCode> {
     if positionals.len() > 1 {
         return fatal("only one reference expected");
@@ -485,6 +583,13 @@ fn switch_existing(
     // Already on the requested branch → git reports it and exits 0 untouched.
     // `merge_working_tree()` still runs (the branch *is* named, so `do_merge`
     // stays set), and its listing of local changes comes before the message.
+    //
+    // `update_refs_for_switch()` still runs too: its `refs_update_symref("HEAD",
+    // new_branch_info->path, msg.buf)` is unconditional for a named branch and
+    // only *then* does it choose between `Reset branch` / `Already on` / the two
+    // `Switched to` wordings (builtin/checkout.c:1017-1032). So a no-op
+    // `git switch <current>` appends `checkout: moving from <b> to <b>` to
+    // `logs/HEAD` every time, exactly as `git checkout <current>` does.
     if repo.head_name()?.as_ref().map(|n| n.as_bstr())
         == FullName::try_from(full.as_str())
             .ok()
@@ -493,6 +598,10 @@ fn switch_existing(
     {
         if !force {
             super::checkout::show_local_changes(branch, quiet)?;
+        }
+        if let Ok(name) = FullName::try_from(full.as_str()) {
+            let from_desc = describe_head(repo)?;
+            attach_head(repo, &name, &from_desc, branch)?;
         }
         if !quiet {
             eprintln!("Already on '{branch}'");
@@ -511,7 +620,9 @@ fn switch_existing(
             match unique_remote_branch(repo, branch)? {
                 Dwim::One(remote_short) => {
                     let sp = [remote_short.as_str()];
-                    return switch_create(repo, branch, false, &sp, quiet, force, None);
+                    return switch_create(
+                        repo, branch, false, &sp, quiet, force, None, merge_style,
+                    );
                 }
                 Dwim::Many { count } => {
                     crate::advice::ambiguous_remote_branch_name(repo, "switch");
@@ -531,23 +642,28 @@ fn switch_existing(
         .into_fully_peeled_id()?
         .detach();
 
-    let mut head = repo.head()?;
-    let current_commit = head.try_peel_to_id()?.map(|id| id.detach());
     let from_desc = describe_head(repo)?;
-
-    let needs_worktree = current_commit != Some(target);
 
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
 
-    if needs_worktree {
-        let target_tree = repo.find_object(target)?.peel_to_commit()?.tree_id()?.detach();
-        let cur_tree = head_tree(repo)?.unwrap_or_else(|| repo.empty_tree().id().detach());
-        if let Some(code) =
-            move_worktree(repo, cur_tree, target_tree, force, quiet, &target.to_string())?
-        {
-            return Ok(code);
-        }
-    }
+    // Entered unconditionally: `switch <branch>` always names an operand, so
+    // git's `do_merge` stays 1 and `merge_working_tree()` — listing and all —
+    // runs even when the two branches point at the same tree.
+    let target_tree = repo.find_object(target)?.peel_to_commit()?.tree_id()?.detach();
+    let cur_tree = head_tree(repo)?.unwrap_or_else(|| repo.empty_tree().id().detach());
+    let merge = merge_style.map(|style| super::checkout::MergeOpt { style, name: branch });
+    let autostashed = match move_worktree(
+        repo,
+        cur_tree,
+        target_tree,
+        force,
+        quiet,
+        &target.to_string(),
+        merge,
+    )? {
+        Err(code) => return Ok(code),
+        Ok(stashed) => stashed,
+    };
 
     attach_head(repo, &full_name, &from_desc, branch)?;
     if !quiet {
@@ -555,6 +671,9 @@ fn switch_existing(
         // `report_tracking()`, which `cmd_switch` reaches through the same
         // `update_refs_for_switch()` `checkout` does.
         super::checkout::print_tracking_status(repo);
+    }
+    if autostashed {
+        show_autostash_listing(&target.to_string(), quiet)?;
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -569,6 +688,7 @@ fn switch_create(
     quiet: bool,
     force: bool,
     track: Option<bool>,
+    merge_style: Option<&str>,
 ) -> Result<ExitCode> {
     if positionals.len() > 1 {
         return fatal("only one reference expected");
@@ -602,12 +722,30 @@ fn switch_create(
             let Some(id) = crate::objname::resolve(repo, s) else {
                 return fatal(format!("invalid reference: {s}"));
             };
-            match super::checkout::classify_tree_ish(repo, id)? {
+            let commit = match super::checkout::classify_tree_ish(repo, id)? {
                 TreeIsh::Commit(commit) => Some(commit.id),
                 TreeIsh::Tree(_) => {
                     return fatal(format!("Cannot switch branch to a non-commit '{s}'"))
                 }
+            };
+            // `create_branch()` hands the start-point to `dwim_branch_start()`
+            // (branch.c:539-594), which resolves it a *second* time and then
+            // DWIMs it — so the name warns twice and more than one matching ref
+            // is fatal before the branch exists:
+            //
+            // ```c
+            // if (repo_get_oid_mb(r, start_name, &oid)) { … }
+            // switch (repo_dwim_ref(r, start_name, strlen(start_name), &oid, &real_ref, 0)) {
+            // …
+            // default:
+            //         die(_("ambiguous object name: '%s'"), start_name);
+            // }
+            // ```
+            crate::objname::warn_ambiguous_refname(repo, s);
+            if super::rev_parse::dwim_ref_matches(repo, s).len() > 1 {
+                return fatal(format!("ambiguous object name: '{s}'"));
             }
+            commit
         }
         None => current_commit,
     };
@@ -636,16 +774,31 @@ fn switch_create(
         return Ok(ExitCode::SUCCESS);
     };
 
-    // `only_merge_on_switching_branches` is set for `switch`, so the worktree is
-    // only merged when a start-point actually moves `HEAD` — `switch -c <new>`
-    // alone leaves the worktree (and its listing) alone entirely.
-    let needs_worktree = current_commit != Some(start_commit);
+    // ```c
+    // if (!new_branch_info->name) {
+    //         new_branch_info->name = xstrdup("HEAD");
+    //         new_branch_info->commit = old_branch_info.commit;
+    //         …
+    //         if (opts->only_merge_on_switching_branches)
+    //                 do_merge = 0;
+    // }
+    // ```
+    // (builtin/checkout.c:1195-1203.) `only_merge_on_switching_branches` is set
+    // for `switch`, so `merge_working_tree()` is skipped only when **no operand
+    // was given at all** — not when the operand happens to resolve to the commit
+    // `HEAD` already holds. `switch -c <new> <start>` therefore still runs the
+    // merge, and still prints its closing listing, even where `<start>` is the
+    // current commit.
+    let needs_worktree = start.is_some();
+    let mut autostashed = false;
     let trees = if needs_worktree {
         let target_tree = repo.find_object(start_commit)?.peel_to_commit()?.tree_id()?.detach();
         let cur_tree = head_tree(repo)?.unwrap_or_else(|| repo.empty_tree().id().detach());
         // Refuse before the branch is created, so a blocked switch leaves no ref
         // behind — git's `merge_working_tree()` runs before `update_refs_for_switch()`.
-        if let Some(code) = if force {
+        // `-m` is exempt: it has an answer for the paths the two-way merge
+        // rejects, so the refusal it would raise here is not the final one.
+        if let Some(code) = if force || merge_style.is_some() {
             None
         } else {
             super::checkout::ensure_clean(repo, cur_tree, target_tree)?
@@ -683,10 +836,18 @@ fn switch_create(
     }
 
     if let Some((cur_tree, target_tree)) = trees {
-        if let Some(code) =
-            move_worktree(repo, cur_tree, target_tree, force, quiet, &start_commit.to_string())?
-        {
-            return Ok(code);
+        let merge = merge_style.map(|style| super::checkout::MergeOpt { style, name: branch });
+        match move_worktree(
+            repo,
+            cur_tree,
+            target_tree,
+            force,
+            quiet,
+            &start_commit.to_string(),
+            merge,
+        )? {
+            Err(code) => return Ok(code),
+            Ok(stashed) => autostashed = stashed,
         }
     }
 
@@ -709,6 +870,9 @@ fn switch_create(
             }
         }
     }
+    if autostashed {
+        show_autostash_listing(&start_commit.to_string(), quiet)?;
+    }
     Ok(ExitCode::SUCCESS)
 }
 
@@ -718,6 +882,7 @@ fn switch_detach(
     positionals: &[&str],
     force: bool,
     quiet: bool,
+    merge_style: Option<&str>,
 ) -> Result<ExitCode> {
     if positionals.len() > 1 {
         return fatal("only one reference expected");
@@ -760,12 +925,27 @@ fn switch_detach(
 
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
 
-    if cur_tree != Some(target_tree) {
+    // Same `do_merge` rule as [`switch_create`]: a bare `switch --detach` names no
+    // operand, so `merge_working_tree()` never runs; with one it always does,
+    // whatever the trees turn out to be.
+    let mut autostashed = false;
+    if !positionals.is_empty() {
         let from_tree = cur_tree.unwrap_or_else(|| repo.empty_tree().id().detach());
-        if let Some(code) =
-            move_worktree(repo, from_tree, target_tree, force, quiet, &target_id.to_string())?
-        {
-            return Ok(code);
+        // The `ours` label and the autostash message name the target as typed —
+        // `git switch -m --detach HEAD~1` writes `HEAD~1`, not the id.
+        let name = positionals.first().copied().unwrap_or("HEAD");
+        let merge = merge_style.map(|style| super::checkout::MergeOpt { style, name });
+        match move_worktree(
+            repo,
+            from_tree,
+            target_tree,
+            force,
+            quiet,
+            &target_id.to_string(),
+            merge,
+        )? {
+            Err(code) => return Ok(code),
+            Ok(stashed) => autostashed = stashed,
         }
     }
 
@@ -791,6 +971,9 @@ fn switch_detach(
         }
         let (abbrev, summary) = describe(repo, target_id)?;
         eprintln!("HEAD is now at {abbrev} {summary}");
+    }
+    if autostashed {
+        show_autostash_listing(&target_id.to_string(), quiet)?;
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -1142,24 +1325,56 @@ fn head_tree(repo: &gix::Repository) -> Result<Option<ObjectId>> {
 /// `--discard-changes` resets instead.
 ///
 /// Returns the exit code of a refusal, or `None` when the worktree moved.
+///
+/// `cur_tree`/`target_tree` may be equal: `merge_working_tree()` is entered for
+/// every switch, and its closing `show_local_changes()` runs whether or not the
+/// two-way merge had anything to do. Moving that listing inside a
+/// "the trees differ" guard silently drops it for the common case of switching
+/// between two branches that point at the same tree.
+///
+/// The gate, the write-out and the `-m` autostash/re-apply are
+/// [`super::checkout::move_worktree`]'s, not a second copy: git has one
+/// `merge_working_tree()` and both commands call it, so `git switch -m` carries
+/// local changes across exactly as `git checkout -m` does, `--conflict=<style>`
+/// included.
 fn move_worktree(
     repo: &gix::Repository,
     cur_tree: ObjectId,
     target_tree: ObjectId,
-    force: bool,
+    discard: bool,
     quiet: bool,
     listing_rev: &str,
-) -> Result<Option<ExitCode>> {
-    if force {
+    merge: Option<super::checkout::MergeOpt<'_>>,
+) -> Result<Result<bool, ExitCode>> {
+    if discard {
+        // `opts->discard_changes` → `reset_tree()`, and the listing is skipped:
+        // `if (!opts->discard_changes && !opts->quiet && …)` (checkout.c:930).
         super::checkout::reset_worktree_to_tree(repo, target_tree)?;
-        return Ok(None);
+        return Ok(Ok(false));
     }
-    if let Some(code) = super::checkout::ensure_clean(repo, cur_tree, target_tree)? {
-        return Ok(Some(code));
+    let mut autostashed = false;
+    if cur_tree != target_tree {
+        match super::checkout::move_worktree(repo, cur_tree, target_tree, merge)? {
+            super::checkout::Moved::Refused(code) => return Ok(Err(code)),
+            super::checkout::Moved::Autostashed => autostashed = true,
+            super::checkout::Moved::Clean => {}
+        }
     }
-    super::checkout::update_worktree_to_tree(repo, cur_tree, target_tree)?;
-    super::checkout::show_local_changes(listing_rev, quiet)?;
-    Ok(None)
+    if !autostashed {
+        super::checkout::show_local_changes(listing_rev, quiet)?;
+    }
+    Ok(Ok(autostashed))
+}
+
+/// The second, headed listing an autostashed switch prints once `HEAD` has moved
+/// (builtin/checkout.c:1265-1271). Kept next to [`move_worktree`] so the two
+/// halves of git's one `created_autostash` branch stay together.
+fn show_autostash_listing(listing_rev: &str, quiet: bool) -> Result<()> {
+    if quiet {
+        return Ok(());
+    }
+    println!("The following paths have local changes:");
+    super::checkout::show_local_changes(listing_rev, quiet)
 }
 
 /// Point `HEAD` symbolically at `branch_ref`, logging the `checkout: moving from
@@ -1201,7 +1416,7 @@ fn attach_head(
         .find_reference(branch_ref.as_ref())
         .ok()
         .and_then(|mut r| r.peel_to_id_in_place().ok().map(|id| id.detach()));
-    super::checkout::record_head_move(repo, from, to, &message);
+    super::checkout::append_head_log(repo, from, to, &message);
     Ok(())
 }
 

@@ -2214,7 +2214,10 @@ fn sq_quote_one(s: &str) -> String {
 }
 
 /// `sq_dequote`: inverse of `sq_quote` over one or more space-separated tokens.
-fn sq_dequote(s: &str) -> Vec<String> {
+///
+/// Shared with `bisect replay`, whose `BISECT_LOG` records the `start` operands
+/// sq-quoted and hands them back through `sq_dequote_to_strvec()`.
+pub(super) fn sq_dequote(s: &str) -> Vec<String> {
     let b = s.as_bytes();
     let mut out: Vec<String> = Vec::new();
     let mut i = 0;

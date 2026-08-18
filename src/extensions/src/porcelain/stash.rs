@@ -2072,8 +2072,20 @@ fn restore_stash_commit(
 /// (rebase/pull `--autostash`) owns the commit and re-applies it directly via
 /// [`apply_autostash`]. The caller has already checked the tree is dirty.
 pub fn create_autostash(repo: &gix::Repository) -> Result<ObjectId> {
+    create_autostash_msg(repo, "autostash")
+}
+
+/// [`create_autostash`] with the stash message spelled out.
+///
+/// The sequencer's own autostash is `create_autostash(r, path)`, whose message is
+/// the bare `autostash` — but `git checkout -m` builds the same snapshot with
+/// `autostash while switching to '<name>'` (builtin/checkout.c), and that text is
+/// observable: it is the `W` commit's subject (`On <branch>: <message>`) and the
+/// `refs/stash` reflog line the entry gets when a conflicting re-apply forces the
+/// snapshot to be kept.
+pub fn create_autostash_msg(repo: &gix::Repository, message: &str) -> Result<ObjectId> {
     let StashBuild { w_commit, head_tree_id, affected, .. } =
-        build_stash_commit(repo, repo, Some("autostash"), &PushOpts::with_message(None))?;
+        build_stash_commit(repo, repo, Some(message), &PushOpts::with_message(None))?;
 
     // Reset the tracked worktree + index back to HEAD (untracked files untouched),
     // exactly as `push` does after storing the stash.

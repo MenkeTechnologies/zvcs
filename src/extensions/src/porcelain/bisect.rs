@@ -64,12 +64,27 @@
 //! and `register_ref` reads them back by the same names, so a session started
 //! with `--term-new=broken` is interchangeable with stock git's.
 //!
+//! `skip` is ported in full: the `refs/bisect/skip-<oid>` refs, both `BISECT_LOG`
+//! lines, the `BISECT_EXPECTED_REV`/`BISECT_ANCESTORS_OK` invalidation a marking
+//! away from the expected commit performs, and the replacement search itself —
+//! `FIND_BISECTION_ALL`'s distance-sorted candidate list, `filter_skipped()`,
+//! and `skip_away()`'s `get_prn`/`sqrti` pick, which is a pure function of how
+//! many candidates survived the filter. When only skipped commits are left it
+//! reports `There are only 'skip'ped commits left to test.` and exits 2, and
+//! appends the `# possible first '<term>' commit:` block in the revision walk's
+//! order (not the order the same commits are printed in). `bisect replay`
+//! replays `skip` lines the same way.
+//!
 //! Honest limitations — each bails with a precise message rather than guessing:
-//!   * `skip` and `run`: gated on git's `bisect_autostart` / `bisect_next_check`
-//!     first, so an unstarted or half-marked session answers exactly as stock
-//!     does. Past that gate they bail: git chooses a skip replacement through its
-//!     weighted `find_bisection`/`skip_away` PRNG, whose exact commit sequence is
-//!     not reproduced, and `run` depends on that for exit code 125.
+//!   * `skip <a>..<b>`: upstream expands the range with a revision walk in the
+//!     same process as the step that follows, and the `UNINTERESTING` flags it
+//!     leaves behind shrink that step's candidate set — measurably: against git
+//!     2.55.0, `skip c6..c9` and `skip c7 c8 c9` write identical refs and log
+//!     lines and then pick different commits. Reproducing it needs git's object
+//!     flag lifetime rather than its skip algorithm, so the range form is
+//!     refused and the individual revisions are not.
+//!   * `run`: it drives an external command per step and treats exit code 125 as
+//!     a skip; the child-process driver is not ported.
 //!   * `visualize`/`view`: `bisect_next_check(terms, NULL)` is reproduced (a
 //!     silent exit 1 when either side is unmarked); a live session bails, because
 //!     the command shells out to gitk / `git log`.
@@ -266,6 +281,32 @@ impl Ctx {
         self.file("BISECT_FIRST_PARENT").exists()
     }
 
+    /// git's `skipped_revs`, which `register_ref()` fills from the refs whose
+    /// name starts with `skip-`. That prefix is a literal, not a term: a session
+    /// opened with `--term-old`/`--term-new` still records its skips under
+    /// `refs/bisect/skip-<oid>`.
+    fn skipped(&self) -> Result<Vec<ObjectId>> {
+        let Ok(entries) = std::fs::read_dir(self.refs_dir()) else {
+            return Ok(Vec::new());
+        };
+        let mut out = Vec::new();
+        for entry in entries {
+            let entry = entry?;
+            let file_name = entry.file_name();
+            let Some(name) = file_name.to_str() else {
+                continue;
+            };
+            if !name.starts_with("skip-") {
+                continue;
+            }
+            if let Some(id) = read_ref(&entry.path())? {
+                out.push(id);
+            }
+        }
+        out.sort();
+        Ok(out)
+    }
+
     fn append_log(&self, line: &str) -> Result<()> {
         let mut f = std::fs::OpenOptions::new()
             .create(true)
@@ -445,18 +486,98 @@ fn next_check_silent(ctx: &Ctx, terms: &Terms) -> Result<bool> {
     Ok(ctx.bad(terms)?.is_some() && !ctx.goods(terms)?.is_empty())
 }
 
-/// `git bisect skip` routes through `bisect_state`, whose first act is
-/// `bisect_autostart`; only a live session reaches the replacement search.
-fn skip_cmd(_args: &[String]) -> Result<ExitCode> {
+/// `git bisect skip [(<rev>|<range>)…]` — `bisect_skip()` then `bisect_state()`
+/// (builtin/bisect--helper.c:1064-1096).
+///
+/// Every operand holding `..` is expanded by a revision walk *first*, so
+/// `skip A..B` records one `skip` per commit in the range, in the walk's own
+/// (newest-first) order. With no operand at all the commit under test is
+/// skipped: `BISECT_HEAD` when the session was opened `--no-checkout`, and
+/// `HEAD` otherwise.
+fn skip_cmd(args: &[String]) -> Result<ExitCode> {
     let ctx = Ctx::open()?;
+    // `bisect_state()`'s first act, and the reason an unstarted session fails
+    // here rather than at the revision parsing below.
     if !autostart(&ctx) {
         return Ok(ExitCode::from(1));
     }
-    bail!(
-        "`bisect skip` is not supported: git picks a replacement commit from the remaining \
-         candidates via its weighted `find_bisection`/`skip_away` PRNG, whose byte-identical \
-         sequence this port does not reproduce"
-    )
+    let terms = current_terms(&ctx)?;
+
+    let mut specs: Vec<String> = Vec::new();
+    for arg in args {
+        // The range form is refused rather than approximated. `bisect_skip()`
+        // expands it with a `setup_revisions()`/`get_revision()` walk *in the
+        // same process* as the bisection that follows, and the object flags that
+        // walk leaves behind (`UNINTERESTING` on the excluded endpoint and as
+        // much of its ancestry as `still_interesting()`'s slop reached) are not
+        // cleared before `bisect_next_all()` runs — so the commits it then
+        // considers are fewer than the marked state alone implies.
+        //
+        // Measured against git 2.55.0 on a 15-commit history bisected `c15`/`c1`:
+        // `git bisect skip c6..c9` reports `Bisecting: 4 revisions left … c10`
+        // while `git bisect skip c7 c8 c9` — the same three commits, the same
+        // refs, the same log — reports `Bisecting: 6 revisions left … c4`. The
+        // outcome is therefore not a function of the skip set, and reproducing
+        // it needs git's in-process flag lifetime rather than its skip
+        // algorithm, which is ported in full below.
+        if arg.contains("..") {
+            bail!(
+                "`bisect skip <a>..<b>` is not supported: upstream expands the range with a \
+                 revision walk whose leftover `UNINTERESTING` flags then shrink the candidate \
+                 set of the bisection step, so the same skip set reached through a range and \
+                 through explicit revisions picks different commits; skip the revisions \
+                 individually instead"
+            );
+        }
+        specs.push(arg.clone());
+    }
+    let no_checkout = ctx.file("BISECT_HEAD").exists();
+    if specs.is_empty() {
+        // `get_oid("BISECT_HEAD")`, falling back to `HEAD` when that ref is
+        // missing — which is the only difference `--no-checkout` makes here.
+        specs.push(if no_checkout { "BISECT_HEAD" } else { "HEAD" }.to_string());
+    }
+
+    // "All input revs must be checked before executing bisect_write() to discard
+    // junk revs" — a bad operand leaves no ref and no log line behind.
+    let mut ids = Vec::with_capacity(specs.len());
+    for spec in &specs {
+        match resolve(&ctx.repo, spec) {
+            Ok(id) => ids.push(id),
+            Err(_) => {
+                eprintln!("error: Bad rev input: {spec}");
+                return Ok(ExitCode::from(1));
+            }
+        }
+    }
+
+    let mut verify_expected = read_ref(&ctx.file("BISECT_EXPECTED_REV"))?;
+    for id in &ids {
+        write_skip(&ctx, *id)?;
+        // `bisect_state()`: marking anything other than the commit the last step
+        // asked for invalidates both cached answers, once.
+        if verify_expected.is_some_and(|expected| expected != *id) {
+            let _ = std::fs::remove_file(ctx.file("BISECT_ANCESTORS_OK"));
+            let _ = std::fs::remove_file(ctx.file("BISECT_EXPECTED_REV"));
+            verify_expected = None;
+        }
+    }
+
+    auto_next(&ctx, &terms, no_checkout)
+}
+
+/// `bisect_write("skip", …)`: the `refs/bisect/skip-<oid>` ref plus the two
+/// `BISECT_LOG` lines, without taking a step — which is what `replay` needs and
+/// what [`skip_cmd`] does once per operand.
+fn write_skip(ctx: &Ctx, id: ObjectId) -> Result<()> {
+    write_ref(&ctx.refs_dir().join(format!("skip-{}", id.to_hex())), id)?;
+    ctx.append_log(&format!(
+        "# skip: [{}] {}\n",
+        id.to_hex(),
+        subject(&ctx.repo, id)?
+    ))?;
+    ctx.append_log(&format!("git bisect skip {}\n", id.to_hex()))?;
+    Ok(())
 }
 
 /// `git bisect visualize|view`: `bisect_next_check(terms, NULL)` first, then the
@@ -483,8 +604,9 @@ fn run_cmd(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::from(1));
     }
     bail!(
-        "`bisect run` is not supported: it drives an external command per step and relies on \
-         `bisect skip` for exit code 125, which is not reproduced here"
+        "`bisect run` is not supported: it drives an external command per step, reading its \
+         exit status to mark, skip (125) or abort the session; the child-process driver is \
+         not ported"
     )
 }
 
@@ -1049,14 +1171,31 @@ fn replay_cmd(args: &[String]) -> Result<ExitCode> {
         let cmd_args: Vec<String> = toks.map(str::to_owned).collect();
 
         if cmd == "start" {
-            start(&cmd_args)?;
+            // `process_replay_line()` hands the rest of the line to
+            // `sq_dequote_to_strvec()`, because `bisect_start()` wrote those
+            // operands sq-quoted (`git bisect start 'c15' 'c1'`). Splitting on
+            // whitespace alone kept the quotes and started a session on branch
+            // `'c15'`, which resolves to nothing.
+            //
+            // [`super::am::sq_dequote`] is the shared inverse; it is laxer than
+            // git's, which *fails* on a token that does not open with a quote —
+            // so a hand-written log with bare operands replays here and starts an
+            // argument-less bisection upstream.
+            let text = rest[cmd.len()..].trim_start();
+            start(&super::am::sq_dequote(text))?;
             continue;
         }
+        // `process_replay_line()` routes `skip` through `bisect_skip()` like any
+        // other state word, so a replayed log recreates the `skip-<oid>` refs and
+        // its own copy of the two log lines. Only the final `bisect_auto_next()`
+        // below takes a step, which is why replaying prints far fewer
+        // `Bisecting:` blocks than the original session did.
         if cmd == "skip" {
-            bail!(
-                "`bisect replay` of a log containing `skip` is not supported: the skip \
-                 replacement PRNG is not reproduced"
-            );
+            for spec in &cmd_args {
+                let id = resolve(&ctx.repo, spec)?;
+                write_skip(&ctx, id)?;
+            }
+            continue;
         }
 
         // Every other keyword is a marking word. Establish terms the way `mark`
@@ -1174,9 +1313,35 @@ fn take_step(
     let first_parent = ctx.first_parent_only();
     let candidates = candidate_list(ctx, bad, &goods, first_parent)?;
     let n = candidates.len();
-    let (best, reaches) = find_bisection(ctx, &candidates, first_parent)?;
+    // `if (skipped_revs.nr) bisect_flags |= FIND_BISECTION_ALL` (bisect.c:1038):
+    // with anything skipped the whole list is sorted and then filtered, so a
+    // skipped best candidate can be stepped away from.
+    let skipped = ctx.skipped()?;
+    let (best, reaches, tried) = if skipped.is_empty() {
+        let (best, reaches) = find_bisection(ctx, &candidates, first_parent)?;
+        (Some(best), reaches, Vec::new())
+    } else {
+        let (sorted, reaches) = find_bisection_all(ctx, &candidates, first_parent)?;
+        let (best, tried) = managed_skipped(&sorted, &skipped, bad);
+        (best, reaches, tried)
+    };
+
+    let Some(best) = best else {
+        // `if (!revs.commits)`: nothing survived the filter, so every remaining
+        // candidate was skipped.
+        if let Some(code) = error_if_skipped_commits(ctx, &tried, None, terms, &candidates)? {
+            return Ok(code);
+        }
+        println!("{} was both {} and {}", bad.to_hex(), terms.good, terms.bad);
+        return Ok(ExitCode::from(1));
+    };
 
     if best == bad {
+        // The bad end is all that is left, and skipped commits could still hide
+        // the real culprit — git says so instead of naming one.
+        if let Some(code) = error_if_skipped_commits(ctx, &tried, Some(bad), terms, &candidates)? {
+            return Ok(code);
+        }
         return report_first_bad(ctx, bad, terms);
     }
 
@@ -1339,6 +1504,51 @@ fn candidate_list(
 /// exact for a merge as well as for a chain.
 fn find_bisection(ctx: &Ctx, list: &[ObjectId], first_parent: bool) -> Result<(ObjectId, usize)> {
     let nr = list.len();
+    let (parents, weights) = bisection_weights(ctx, list, first_parent)?;
+    find_bisection_from(list, &parents, &weights, nr)
+}
+
+/// `find_bisection()` with `FIND_BISECTION_ALL`, which `bisect_next_all()` turns
+/// on as soon as anything has been skipped (bisect.c:1039).
+///
+/// It suppresses `do_find_bisection()`'s halfway shortcut and ends in
+/// `best_bisection_sorted()` instead of `best_bisection()`: the whole candidate
+/// list comes back ordered by `min(weight, nr - weight)` descending, ties broken
+/// by ascending object id, so `managed_skipped()` can walk it from the best
+/// candidate outwards. `reaches` stays the *head's* weight — `find_bisection()`
+/// assigns `*reaches = weight(best)` before the skip filter runs, which is why
+/// the `Bisecting: N revisions left` line does not change when a skip moves the
+/// commit that actually gets checked out.
+fn find_bisection_all(
+    ctx: &Ctx,
+    list: &[ObjectId],
+    first_parent: bool,
+) -> Result<(Vec<ObjectId>, usize)> {
+    let nr = list.len();
+    let (_parents, weights) = bisection_weights(ctx, list, first_parent)?;
+    let mut order: Vec<usize> = (0..nr).collect();
+    let distance = |i: usize| {
+        let w = weights[i] as i64;
+        w.min(nr as i64 - w)
+    };
+    // `compare_commit_dist()`: descending distance, then ascending `oidcmp`.
+    order.sort_by(|&a, &b| {
+        distance(b)
+            .cmp(&distance(a))
+            .then_with(|| list[a].as_bytes().cmp(list[b].as_bytes()))
+    });
+    let reaches = order.first().map(|&i| weights[i]).unwrap_or(0);
+    Ok((order.into_iter().map(|i| list[i]).collect(), reaches))
+}
+
+/// The candidate subgraph: each commit's candidate parents (by list position)
+/// and the number of candidates it reaches, itself included — git's `weight()`.
+fn bisection_weights(
+    ctx: &Ctx,
+    list: &[ObjectId],
+    first_parent: bool,
+) -> Result<(Vec<Vec<usize>>, Vec<usize>)> {
+    let nr = list.len();
     let index: std::collections::HashMap<ObjectId, usize> =
         list.iter().enumerate().map(|(i, id)| (*id, i)).collect();
 
@@ -1407,7 +1617,17 @@ fn find_bisection(ctx: &Ctx, list: &[ObjectId], first_parent: bool) -> Result<(O
     let weights: Vec<usize> = (0..nr)
         .map(|i| reach[i * words..(i + 1) * words].iter().map(|w| w.count_ones() as usize).sum())
         .collect();
+    Ok((parents, weights))
+}
 
+/// `do_find_bisection()` plus `best_bisection()`: the single commit git tests
+/// next when nothing has been skipped.
+fn find_bisection_from(
+    list: &[ObjectId],
+    parents: &[Vec<usize>],
+    weights: &[usize],
+    nr: usize,
+) -> Result<(ObjectId, usize)> {
     // `do_find_bisection()` (bisect.c:130-217), simulated in its own order because
     // the order decides which of several equally good candidates is returned.
     //
@@ -1481,6 +1701,146 @@ fn find_bisection(ctx: &Ctx, list: &[ObjectId], first_parent: bool) -> Result<(O
         }
     }
     Ok(best)
+}
+
+/// `filter_skipped()` with `show_all = 0` (bisect.c:521-568), over the
+/// distance-sorted candidate list.
+///
+/// Returns `(kept, tried, count, skipped_first)`. The shortcut matters: while the
+/// head of the list has *not* been skipped, the first unskipped commit ends the
+/// scan and the rest of the list comes back untouched — so `count` is 0 and no
+/// `tried` list is built. Only when the head itself is skipped does git filter
+/// the whole list, because it then has to pick a replacement away from it.
+fn filter_skipped(
+    list: &[ObjectId],
+    skipped: &[ObjectId],
+) -> (Vec<ObjectId>, Vec<ObjectId>, usize, bool) {
+    let is_skipped = |id: &ObjectId| skipped.binary_search(id).is_ok();
+    let mut kept: Vec<ObjectId> = Vec::new();
+    let mut tried: Vec<ObjectId> = Vec::new();
+    let mut skipped_first = false;
+    if skipped.is_empty() {
+        return (list.to_vec(), tried, 0, false);
+    }
+    for (i, id) in list.iter().enumerate() {
+        if is_skipped(id) {
+            if !skipped_first {
+                skipped_first = true;
+            }
+            tried.push(*id);
+        } else {
+            if !skipped_first {
+                // `return list`: everything from here on, unfiltered.
+                return (list[i..].to_vec(), Vec::new(), 0, false);
+            }
+            kept.push(*id);
+        }
+    }
+    let count = kept.len();
+    (kept, tried, count, skipped_first)
+}
+
+/// git's `get_prn()` (bisect.c:579): `rand(3)`'s recurrence, seeded with the
+/// count itself rather than carried between calls — so the pick is a pure
+/// function of how many candidates survived the skip filter.
+fn get_prn(count: u32) -> u32 {
+    let count = count.wrapping_mul(1103515245).wrapping_add(12345);
+    (count / 65536) % PRN_MODULO
+}
+
+/// bisect.c:571.
+const PRN_MODULO: u32 = 32768;
+
+/// git's `sqrti()` (bisect.c:588): Newton's method in `float`, stopping once the
+/// step is below half a unit, then truncated. Ported in `f32` because the
+/// rounding of the intermediate values is what the result depends on.
+fn sqrti(val: i32) -> i32 {
+    if val == 0 {
+        return 0;
+    }
+    let mut x = val as f32;
+    loop {
+        let y = (x + val as f32 / x) / 2.0;
+        let d = if y > x { y - x } else { x - y };
+        x = y;
+        if d < 0.5 {
+            break;
+        }
+    }
+    x as i32
+}
+
+/// git's `skip_away()` (bisect.c:605): step away from the best candidate by a
+/// pseudo-random distance, and never land on the `bad` end itself.
+fn skip_away(list: &[ObjectId], count: usize, bad: ObjectId) -> Option<ObjectId> {
+    let prn = get_prn(count as u32) as i64;
+    let index =
+        (count as i64 * prn / PRN_MODULO as i64) * sqrti(prn as i32) as i64 / sqrti(PRN_MODULO as i32) as i64;
+    for (i, id) in list.iter().enumerate() {
+        if i as i64 == index {
+            if *id != bad {
+                return Some(*id);
+            }
+            // The `bad` end is never handed back as the next commit to test:
+            // git steps one *back* towards the better candidates instead.
+            return Some(if i > 0 { list[i - 1] } else { list[0] });
+        }
+    }
+    list.first().copied()
+}
+
+/// git's `managed_skipped()` (bisect.c:630): the filter plus, when the best
+/// candidate is one of the skipped ones, the step away from it.
+fn managed_skipped(
+    list: &[ObjectId],
+    skipped: &[ObjectId],
+    bad: ObjectId,
+) -> (Option<ObjectId>, Vec<ObjectId>) {
+    if skipped.is_empty() {
+        return (list.first().copied(), Vec::new());
+    }
+    let (kept, tried, count, skipped_first) = filter_skipped(list, skipped);
+    if !skipped_first {
+        return (kept.first().copied(), tried);
+    }
+    (skip_away(&kept, count, bad), tried)
+}
+
+/// git's `error_if_skipped_commits()` (bisect.c:465): the search cannot go on
+/// because every remaining candidate was skipped. Exit 2
+/// (`BISECT_ONLY_SKIPPED_LEFT`), and `bisect_skipped_commits()` then appends the
+/// same candidate list to `BISECT_LOG` in *revision-walk* order rather than the
+/// distance order printed here.
+fn error_if_skipped_commits(
+    ctx: &Ctx,
+    tried: &[ObjectId],
+    bad: Option<ObjectId>,
+    terms: &Terms,
+    candidates: &[ObjectId],
+) -> Result<Option<ExitCode>> {
+    if tried.is_empty() {
+        return Ok(None);
+    }
+    println!("There are only 'skip'ped commits left to test.");
+    println!("The first '{}' commit could be any of:", terms.bad);
+    for id in tried {
+        println!("{}", id.to_hex());
+    }
+    if let Some(bad) = bad {
+        println!("{}", bad.to_hex());
+    }
+    println!("We cannot bisect more!");
+
+    ctx.append_log("# only skipped commits left to test\n")?;
+    for id in candidates {
+        ctx.append_log(&format!(
+            "# possible first '{}' commit: [{}] {}\n",
+            terms.bad,
+            id.to_hex(),
+            subject(&ctx.repo, *id)?
+        ))?;
+    }
+    Ok(Some(ExitCode::from(2)))
 }
 
 /// git's `estimate_bisect_steps`.
@@ -1831,5 +2191,40 @@ mod tests {
         }
         assert!(terms_for_first_marking("skip").is_none());
         assert!(terms_for_first_marking("start").is_none());
+    }
+
+    /// `skip_away()`'s pick is arithmetic, not chance: `get_prn(count)` seeded
+    /// with the surviving-candidate count, `sqrti()`'s `float` Newton iteration,
+    /// and the index they multiply out to.
+    ///
+    /// Every row is the output of bisect.c's own `get_prn`/`sqrti` compiled and
+    /// run over the same counts, which is what the port has to agree with — the
+    /// two `int` truncations and the `float` rounding are all load-bearing
+    /// (`sqrti(21381)` is 146, and one off in either direction moves the pick).
+    #[test]
+    fn skip_away_index_is_gits_arithmetic() {
+        // (count, prn, sqrti(prn), index)
+        let rows = [
+            (0u32, 0u32, 0i32, 0i64),
+            (1, 16838, 129, 0),
+            (2, 908, 30, 0),
+            (3, 17747, 133, 0),
+            (4, 1817, 42, 0),
+            (5, 18655, 136, 1),
+            (7, 19564, 139, 3),
+            (11, 21381, 146, 5),
+            (14, 6360, 79, 0),
+            (100, 12662, 112, 23),
+            (32767, 25968, 161, 23097),
+        ];
+        assert_eq!(super::sqrti(super::PRN_MODULO as i32), 181);
+        for (count, prn, root, index) in rows {
+            assert_eq!(super::get_prn(count), prn, "get_prn({count})");
+            assert_eq!(super::sqrti(prn as i32), root, "sqrti({prn})");
+            let got = (count as i64 * prn as i64 / super::PRN_MODULO as i64)
+                * super::sqrti(prn as i32) as i64
+                / super::sqrti(super::PRN_MODULO as i32) as i64;
+            assert_eq!(got, index, "index for count={count}");
+        }
     }
 }

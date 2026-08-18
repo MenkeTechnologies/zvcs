@@ -14,6 +14,13 @@
 //!   * `git restore --pathspec-from-file=<f> ...`     read pathspecs from a file/stdin
 //!   * `git restore --recurse-submodules <pathspec>`  also restore matched submodule worktrees
 //!
+//! `--staged`/`--worktree` are git's `opts->checkout_index`/`checkout_worktree`,
+//! which start as *tri-state* defaults (`-1` off / `-2` on) and collapse to 0/1
+//! only after the whole command line has been read: naming either flag in either
+//! sense turns the other off, so `git restore --no-worktree <path>` leaves both
+//! targets off and is refused with `neither '--staged' or '--worktree' is
+//! specified` rather than silently doing nothing.
+//!
 //! The default restore source is the index for `--worktree`, and `HEAD` when
 //! `--staged` is given (either alone or combined). Restore is no-overlay by
 //! default: a path present in the target but not the source is removed; with
@@ -310,8 +317,26 @@ fn restore_submodule_worktree(
 
 pub fn restore(args: &[String]) -> Result<ExitCode> {
     // --- Argument parsing ---------------------------------------------------
-    let mut staged = false;
-    let mut worktree = false;
+    // git's `opts->checkout_index` / `opts->checkout_worktree`, which start at
+    // `-1` ("default off") and `-2` ("default on") for `restore` and resolve to
+    // 0/1 only after the whole command line has been read:
+    //
+    // ```c
+    // if (opts->checkout_index >= 0 || opts->checkout_worktree >= 0) {
+    //         if (opts->checkout_index < 0)    opts->checkout_index = 0;
+    //         if (opts->checkout_worktree < 0) opts->checkout_worktree = 0;
+    // } else {
+    //         if (opts->checkout_index < 0)    opts->checkout_index = -opts->checkout_index - 1;
+    //         if (opts->checkout_worktree < 0) opts->checkout_worktree = -opts->checkout_worktree - 1;
+    // }
+    // ```
+    // (builtin/checkout.c:1933-1943.) Naming *either* flag in *either* sense
+    // switches the other one off, which is why `--no-worktree` alone leaves both
+    // targets off and is refused rather than silently doing nothing. A plain
+    // `bool` pair cannot express that: it cannot tell "not mentioned" from
+    // "explicitly off".
+    let mut staged: Option<bool> = None;
+    let mut worktree: Option<bool> = None;
     let mut source: Option<String> = None;
     let mut pathspecs: Vec<String> = Vec::new();
     let mut after_dashdash = false;
@@ -392,15 +417,15 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
             // `--help-all` reaches the same renderer with USAGE_FULL, which this
             // table renders identically: it has no `PARSE_OPT_HIDDEN` entry.
             "-h" | "--help-all" => return Ok(super::show_usage(USAGE)),
-            "--staged" | "-S" => staged = true,
+            "--staged" | "-S" => staged = Some(true),
             // Every `--no-<x>` below is parse-options' unset for that entry:
             // an `OPT_BOOL` writes 0, an `OPT_STRING`/`OPT_FILENAME` writes NULL,
             // and `parse_opt_conflict()` (builtin/checkout.c:1750) sets
             // `conflict_style = -1`. None of them is a gap in this port; they are
             // the other half of options it already implements.
-            "--no-staged" => staged = false,
-            "--worktree" | "-W" => worktree = true,
-            "--no-worktree" => worktree = false,
+            "--no-staged" => staged = Some(false),
+            "--worktree" | "-W" => worktree = Some(true),
+            "--no-worktree" => worktree = Some(false),
             "-s" | "--source" => {
                 i += 1;
                 match args.get(i) {
@@ -534,6 +559,28 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
     }
 
     // --- Incompatible-flag combinations (git's fatal/exit-128 diagnostics) --
+    // `if (opts->ignore_unmerged && opts->merge) die(_("options '%s' and '%s'
+    // cannot be used together"), opts->ignore_unmerged_opt, "-m");`
+    // (builtin/checkout.c:547). `restore` never sets `ignore_unmerged_opt` to
+    // anything but `--ignore-unmerged` — the `--force` spelling belongs to
+    // `checkout`, which has no `--ignore-unmerged`.
+    if ignore_unmerged && merge_active {
+        eprintln!("fatal: options '--ignore-unmerged' and '-m' cannot be used together");
+        return Ok(ExitCode::from(128));
+    }
+    // The tri-state resolution quoted above, then
+    // `if (!opts->checkout_worktree && !opts->checkout_index)
+    //      die(_("neither '%s' or '%s' is specified"), "--staged", "--worktree");`
+    // (builtin/checkout.c:554).
+    let (staged, worktree) = if staged.is_some() || worktree.is_some() {
+        (staged.unwrap_or(false), worktree.unwrap_or(false))
+    } else {
+        (false, true)
+    };
+    if !worktree && !staged {
+        eprintln!("fatal: neither '--staged' or '--worktree' is specified");
+        return Ok(ExitCode::from(128));
+    }
     if pick.is_some() && staged {
         eprintln!("fatal: '--ours' or '--theirs' cannot be used with --staged");
         return Ok(ExitCode::from(128));
@@ -545,11 +592,6 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
     if conflict_mode && source.is_some() {
         eprintln!("fatal: '--merge', '--ours', or '--theirs' cannot be used when checking out of a tree");
         return Ok(ExitCode::from(128));
-    }
-
-    // Default target: worktree when neither is named.
-    if !staged && !worktree {
-        worktree = true;
     }
 
     if let Err(code) = patch_opts.finish() {

@@ -120,6 +120,20 @@
 //!     `--ita-visible-in-index` and `--max-depth=<n>`: there is no tree walk, no
 //!     submodule and no index here — the two filespecs are the `is_stdin`
 //!     buffers `get_filespec()` builds (range-diff.c:477-489).
+//! * Rename and copy detection inside the patches. The inner `git log` runs with
+//!   no `-M` of its own (range-diff.c:44-59), so it detects with whatever
+//!   `diff.renames` says — on, at the default 50% similarity, unless the config
+//!   turns it off or asks for copies — and at `diff.renameLimit`. This port runs
+//!   the same [`super::diffcore_rename`] `git diff` and `git log` use, over the
+//!   already pathspec-limited tree diff, so a rename gets upstream's
+//!   ` ## <old> => <new> ##` section header (a copy keeps the bare destination,
+//!   because `read_patches()` tests `patch.is_rename`, which `gitdiff_copysrc()`
+//!   never sets), the destination path in its `@@ <path>:` hunk headers and in
+//!   both `Binary files … differ` labels, and the queue position of the
+//!   destination with the source's deletion collapsed away
+//!   (diffcore-rename.c:1634-1691). Exceeding the rename limit reproduces
+//!   upstream's two `warning:` lines on stderr, once per commit that hit it, in
+//!   the order the two ranges are read in.
 //! * The failure paths, with upstream's exit status: a bad argument shape exits
 //!   129, a two-range operand that names nothing exits 128 (`bad revision`, the
 //!   fatal `is_range_diff_range()` raises), `--left-only` together with
@@ -222,11 +236,6 @@
 //!   `--ext-diff` and `-O`.
 //! * A magic (`:(glob)`, `:!exclude`, …) or wildcard pathspec, and every other
 //!   `git diff` option upstream forwards to the inner patches.
-//! * Commits containing a rename that git's `diffcore-rename` would detect.
-//!   These are found by re-running the tree diff with gitoxide's rename tracker
-//!   at git's default 50% threshold, and refused: upstream's `old => new`
-//!   section header depends on `diffcore-delta` similarity scoring and on
-//!   rename-aware diff-queue ordering, neither of which is ported.
 //! * `-h`: upstream's usage text concatenates the entire `git diff` option list,
 //!   which is not ported.
 //!
@@ -280,7 +289,7 @@ use std::collections::{BinaryHeap, HashMap};
 use std::io::Write;
 use std::process::ExitCode;
 
-use gix::bstr::BStr;
+use gix::bstr::{BStr, BString};
 use gix::diff::blob::unified_diff::{ConsumeHunk, ContextSize, DiffLineKind, HunkHeader};
 use gix::diff::blob::{diff_with_slider_heuristics, Algorithm, Diff, InternedInput, UnifiedDiff};
 use gix::hash::ObjectId;
@@ -2760,6 +2769,13 @@ fn build_patch(
         Some(&new_tree),
         gix::diff::Options::default(),
     )?;
+    // gix reports each containing directory alongside the files inside it; the
+    // recursive tree walk `git log -p` runs (`DIFF_OPT_RECURSIVE`) reports only
+    // the files, so a commit that adds or drops a whole directory would grow a
+    // ` ## <dir> (new|deleted) ##` section — with the tree object's own bytes
+    // as its content — that upstream never writes. Dropped before the pathspec
+    // is applied, because every pathspec test in git is file-granular.
+    changes.retain(|c| !super::log::change_is_tree(c));
     changes.sort_by(|x, y| change_path(x).cmp(change_path(y)));
 
     // A pathspec keeps only the sections it matches, and a commit left with no
@@ -2771,16 +2787,16 @@ fn build_patch(
         }
     }
 
-    reject_renames(repo, old_tree.as_ref(), &new_tree, &changes, id)?;
+    let sections = detect_renames(repo, &changes)?;
 
     let mut diff_offset = 0usize;
     let mut diffsize = 0i64;
-    for change in &changes {
+    for section in &sections {
         text.push(b'\n');
         if diff_offset == 0 {
             diff_offset = text.len();
         }
-        emit_section(repo, &mut text, change, &mut diffsize)?;
+        emit_section(repo, &mut text, section, &mut diffsize)?;
     }
 
     Ok(Some(Patch {
@@ -2795,38 +2811,157 @@ fn build_patch(
     }))
 }
 
-/// `diff.renames` is on for `git log`, so a detected rename changes both the
-/// section header and the diff body. Find that case with gitoxide's tracker at
-/// git's default 50% threshold and refuse, rather than silently emitting the
-/// delete-plus-add rendering that rename detection would have replaced.
-fn reject_renames(
+/// One ` ## <path> ##` section: a `diff_filepair` as `diffcore_std()` leaves it.
+enum Section<'a> {
+    /// A pair `diffcore_rename()` did not pair up, rendered from the tree change
+    /// it came from.
+    Plain(&'a ChangeDetached),
+    /// A rename (`R`) or a copy (`C`), whose two sides carry different paths.
+    Paired {
+        old_path: BString,
+        old_mode: u32,
+        old_id: ObjectId,
+        new_path: BString,
+        new_mode: u32,
+        new_id: ObjectId,
+        /// `read_patches()` prints `old => new` for `patch.is_rename` only
+        /// (range-diff.c:143-144); `gitdiff_copysrc()` sets `is_copy` instead,
+        /// so a copy keeps the bare destination path.
+        is_rename: bool,
+    },
+}
+
+/// The `diffcore_std()` rename pass over one commit's tree diff.
+///
+/// The inner `git log` carries no `-M` of its own (range-diff.c:44-59), so it
+/// detects exactly what `diff.renames` and `diff.renameLimit` ask for — the same
+/// port `git diff` and `git log` run, at git's default 50% similarity — over the
+/// queue *after* the pathspec has limited it, which is where `diff_tree_oid()`
+/// applies a pathspec too.
+///
+/// The result is the collapsed queue of diffcore-rename.c:1634-1691: the source's
+/// deletion is dropped and the rename takes the destination's position, so the
+/// section order is the destination path's.
+fn detect_renames<'a>(
     repo: &gix::Repository,
-    old_tree: Option<&gix::Tree<'_>>,
-    new_tree: &gix::Tree<'_>,
-    changes: &[ChangeDetached],
-    id: ObjectId,
-) -> Result<()> {
+    changes: &'a [ChangeDetached],
+) -> Result<Vec<Section<'a>>> {
+    let plain = || changes.iter().map(Section::Plain).collect::<Vec<_>>();
+    let cfg = repo.config_snapshot();
+    // `git log` is a porcelain, so an absent `diff.renames` is rename detection
+    // on (`git_diff_ui_config()`), which is what a `None` value means here too.
+    let renames = cfg.string("diff.renames");
+    let detect = super::diffcore_rename::config_rename(renames.as_deref().map(BStr::new));
+    // With no destination there is nothing to pair a source with, which is
+    // `rename_dst_nr == 0` leaving `diffcore_rename()` with no work.
     let has_add = changes
         .iter()
         .any(|c| matches!(c, ChangeDetached::Addition { .. }));
-    let has_del = changes
-        .iter()
-        .any(|c| matches!(c, ChangeDetached::Deletion { .. }));
-    if !(has_add && has_del) {
-        return Ok(());
+    if detect == 0 || !has_add {
+        return Ok(plain());
     }
-    let tracked = repo.diff_tree_to_tree(
-        old_tree,
-        Some(new_tree),
-        gix::diff::Options::default().with_rewrites(Some(gix::diff::Rewrites::default())),
-    )?;
-    if tracked
-        .iter()
-        .any(|c| matches!(c, ChangeDetached::Rewrite { .. }))
-    {
-        bail!("commit {id} contains a rename; git's diffcore-rename scoring is not ported");
+
+    let opts = super::diffcore_rename::Options {
+        detect_rename: detect,
+        rename_limit: cfg
+            .integer("diff.renameLimit")
+            .unwrap_or(super::diffcore_rename::DEFAULT_RENAME_LIMIT),
+        hash_kind: repo.object_hash(),
+        ..Default::default()
+    };
+
+    // The queue is built in the order the sections were going to be emitted in,
+    // because that is the order `diff_tree_oid()` queued them and the order the
+    // write-back loop preserves.
+    let null = ObjectId::null(repo.object_hash());
+    let mut q = super::diffcore_rename::Queue::default();
+    for change in changes {
+        let path: BString = change_path(change).into();
+        let (old_mode, old_id) = old_side(change).unwrap_or((0, null));
+        let (new_mode, new_id) = new_side(change).unwrap_or((0, null));
+        let one = q.add_spec(super::diffcore_rename::FileSpec::new(
+            path.clone(),
+            old_mode,
+            old_id,
+            old_mode != 0,
+        ));
+        let two = q.add_spec(super::diffcore_rename::FileSpec::new(
+            path, new_mode, new_id, new_mode != 0,
+        ));
+        q.add_pair(one, two);
     }
-    Ok(())
+
+    let mut content = super::diffcore_rename::OdbContent { repo };
+    let warnings = super::diffcore_rename::run(&mut q, &opts, &mut content);
+    super::diffcore_rename::resolve_rename_copy(&mut q);
+    // `diff_flush()` warns once per commit whose queue hit the limit, and the
+    // inner `git log` runs to completion before a byte of output is written, so
+    // both ranges' warnings precede the whole page.
+    warnings.emit("diff.renameLimit");
+
+    let by_path: HashMap<&[u8], &ChangeDetached> =
+        changes.iter().map(|c| (change_path(c), c)).collect();
+    let mut out = Vec::with_capacity(q.pairs.len());
+    for pair in &q.pairs {
+        let one = &q.specs[pair.one];
+        let two = &q.specs[pair.two];
+        if matches!(pair.status, b'R' | b'C') {
+            out.push(Section::Paired {
+                old_path: one.path.clone(),
+                old_mode: one.mode,
+                old_id: one.oid,
+                new_path: two.path.clone(),
+                new_mode: two.mode,
+                new_id: two.oid,
+                is_rename: pair.status == b'R',
+            });
+            continue;
+        }
+        // Every surviving pair that is not a rename or a copy still names the
+        // path its tree change did, on both of its sides.
+        let change = by_path
+            .get(two.path.as_slice())
+            .ok_or_else(|| anyhow!("rename detection lost the pair for {}", two.path))?;
+        out.push(Section::Plain(change));
+    }
+    Ok(out)
+}
+
+/// The pre-image `(mode, id)` of a tree change, or `None` when the path is new —
+/// git's `!DIFF_FILE_VALID(p->one)`.
+fn old_side(change: &ChangeDetached) -> Option<(u32, ObjectId)> {
+    match change {
+        ChangeDetached::Addition { .. } => None,
+        ChangeDetached::Deletion {
+            entry_mode, id, ..
+        } => Some((u32::from(entry_mode.value()), *id)),
+        ChangeDetached::Modification {
+            previous_entry_mode,
+            previous_id,
+            ..
+        } => Some((u32::from(previous_entry_mode.value()), *previous_id)),
+        ChangeDetached::Rewrite {
+            source_entry_mode,
+            source_id,
+            ..
+        } => Some((u32::from(source_entry_mode.value()), *source_id)),
+    }
+}
+
+/// The post-image `(mode, id)` of a tree change, or `None` when the path is gone.
+fn new_side(change: &ChangeDetached) -> Option<(u32, ObjectId)> {
+    match change {
+        ChangeDetached::Deletion { .. } => None,
+        ChangeDetached::Addition {
+            entry_mode, id, ..
+        }
+        | ChangeDetached::Modification {
+            entry_mode, id, ..
+        }
+        | ChangeDetached::Rewrite {
+            entry_mode, id, ..
+        } => Some((u32::from(entry_mode.value()), *id)),
+    }
 }
 
 /// Emit one ` ## <path> ##` section plus its rewritten hunks, tallying the
@@ -2834,63 +2969,96 @@ fn reject_renames(
 fn emit_section(
     repo: &gix::Repository,
     out: &mut Vec<u8>,
-    change: &ChangeDetached,
+    section: &Section<'_>,
     diffsize: &mut i64,
 ) -> Result<()> {
     let mut body: Vec<u8> = Vec::new();
 
     out.extend_from_slice(b" ## ");
-    match change {
-        ChangeDetached::Addition {
+    match section {
+        Section::Plain(ChangeDetached::Addition {
             location,
             entry_mode,
             id,
             ..
-        } => {
+        }) => {
             let path: &[u8] = location;
             out.extend_from_slice(path);
             out.extend_from_slice(b" (new)");
             let content = content_of(repo, *id, entry_mode.is_commit())?;
-            emit_hunks(&mut body, path, &[], &content, true, false)?;
+            emit_hunks(&mut body, path, None, Some(path), &[], &content)?;
         }
-        ChangeDetached::Deletion {
+        Section::Plain(ChangeDetached::Deletion {
             location,
             entry_mode,
             id,
             ..
-        } => {
+        }) => {
             let path: &[u8] = location;
             out.extend_from_slice(path);
             out.extend_from_slice(b" (deleted)");
             let content = content_of(repo, *id, entry_mode.is_commit())?;
-            emit_hunks(&mut body, path, &content, &[], false, true)?;
+            emit_hunks(&mut body, path, Some(path), None, &content, &[])?;
         }
-        ChangeDetached::Modification {
+        Section::Plain(ChangeDetached::Modification {
             location,
             previous_entry_mode,
             previous_id,
             entry_mode,
             id,
-        } => {
+        }) => {
             let path: &[u8] = location;
             out.extend_from_slice(path);
-            let old_mode = previous_entry_mode.value();
-            let new_mode = entry_mode.value();
-            if old_mode != new_mode {
-                out.extend_from_slice(
-                    format!(" (mode change {old_mode:06o} => {new_mode:06o})").as_bytes(),
-                );
-            }
+            emit_mode_change(
+                out,
+                u32::from(previous_entry_mode.value()),
+                u32::from(entry_mode.value()),
+            );
             // A pure mode change (identical content) has no hunks, like git.
             if previous_id != id {
                 let old = content_of(repo, *previous_id, previous_entry_mode.is_commit())?;
                 let new = content_of(repo, *id, entry_mode.is_commit())?;
-                emit_hunks(&mut body, path, &old, &new, false, false)?;
+                emit_hunks(&mut body, path, Some(path), Some(path), &old, &new)?;
             }
         }
-        // Never produced: rewrite tracking is off, and `reject_renames()` has
-        // already refused the commits where git would have found a rename.
-        ChangeDetached::Rewrite { .. } => bail!("rename/copy detection is not supported"),
+        // Never produced: the tree diff runs with gitoxide's rewrite tracking
+        // off, and every rename this port emits comes from [`detect_renames`]
+        // as a [`Section::Paired`].
+        Section::Plain(ChangeDetached::Rewrite { .. }) => {
+            bail!("rename/copy detection is not supported")
+        }
+        Section::Paired {
+            old_path,
+            old_mode,
+            old_id,
+            new_path,
+            new_mode,
+            new_id,
+            is_rename,
+        } => {
+            if *is_rename {
+                out.extend_from_slice(old_path);
+                out.extend_from_slice(b" => ");
+            }
+            out.extend_from_slice(new_path);
+            emit_mode_change(out, *old_mode, *new_mode);
+            // A 100%-similar rename or copy has no `---`/`+++` and no hunks, so
+            // the section is its header alone.
+            if old_id != new_id {
+                let old = content_of(repo, *old_id, is_gitlink(*old_mode))?;
+                let new = content_of(repo, *new_id, is_gitlink(*new_mode))?;
+                // `current_filename` is the destination (range-diff.c:146-149),
+                // so the `@@ <path>:` headers name it, not the source.
+                emit_hunks(
+                    &mut body,
+                    new_path,
+                    Some(old_path),
+                    Some(new_path),
+                    &old,
+                    &new,
+                )?;
+            }
+        }
     }
     out.extend_from_slice(b" ##\n");
 
@@ -2904,29 +3072,28 @@ fn emit_section(
 /// and each body line re-signed the way `read_patches()` re-signs the
 /// `--output-indicator-*` markers it asked `git log` for.
 ///
-/// `old_missing`/`new_missing` say which side is `/dev/null`; they matter only
-/// for the `Binary files ... differ` labels.
+/// `path` is `current_filename`, the name the `@@` headers carry. `old_name` /
+/// `new_name` are the two sides' own names, which differ from it and from each
+/// other for a rename; `None` is the side that does not exist, which is what the
+/// `Binary files ... differ` labels spell `/dev/null`.
 fn emit_hunks(
     out: &mut Vec<u8>,
     path: &[u8],
+    old_name: Option<&[u8]>,
+    new_name: Option<&[u8]>,
     old: &[u8],
     new: &[u8],
-    old_missing: bool,
-    new_missing: bool,
 ) -> Result<()> {
     if is_binary(old) || is_binary(new) {
-        let label = |missing: bool| {
-            if missing {
-                "/dev/null".to_string()
-            } else {
-                quote_c_style(path)
-            }
+        let label = |name: Option<&[u8]>| match name {
+            None => "/dev/null".to_string(),
+            Some(n) => quote_c_style(n),
         };
         out.extend_from_slice(
             format!(
                 " Binary files {} and {} differ\n",
-                label(old_missing),
-                label(new_missing)
+                label(old_name),
+                label(new_name)
             )
             .as_bytes(),
         );
@@ -3026,6 +3193,22 @@ fn content_of(repo: &gix::Repository, id: ObjectId, is_submodule: bool) -> Resul
     } else {
         Ok(repo.find_object(id)?.detach().data)
     }
+}
+
+/// `read_patches()`'s ` (mode change <old> => <new>)` suffix, which needs both
+/// sides to exist and to differ (range-diff.c:156-159).
+fn emit_mode_change(out: &mut Vec<u8>, old_mode: u32, new_mode: u32) {
+    if old_mode != 0 && new_mode != 0 && old_mode != new_mode {
+        out.extend_from_slice(
+            format!(" (mode change {old_mode:06o} => {new_mode:06o})").as_bytes(),
+        );
+    }
+}
+
+/// `S_ISGITLINK()`: a submodule entry, whose "content" is the synthetic
+/// `Subproject commit <id>` line rather than a blob.
+fn is_gitlink(mode: u32) -> bool {
+    mode & 0o170000 == 0o160000
 }
 
 /// git's `buffer_is_binary()`: a NUL byte within the first 8000 bytes.

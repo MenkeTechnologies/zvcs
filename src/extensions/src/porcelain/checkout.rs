@@ -67,9 +67,30 @@
 //!   * A bare `--` introduces no pathspec, so `checkout -B main origin/main --` is a
 //!     branch reset rather than a path restore; a path after the separator is still
 //!     `Cannot update paths and switch to branch` (exit 128).
-//!   * `-m`/`--merge` is accepted: with a clean worktree it is byte-identical to
-//!     a plain switch, and the dirty case is governed by the same conservative
-//!     clean-check as every other switch here.
+//!   * `-m`/`--merge` on a *switch* is git 2.55's autostash path: when the
+//!     two-way `unpack_trees()` refuses because local changes stand in the way,
+//!     the changes are stashed (`autostash while switching to '<name>'`), the
+//!     now-clean switch happens, and the stash is re-applied with a three-way
+//!     merge — so they come back **unstaged**, a conflicting re-apply leaves the
+//!     snapshot in `refs/stash` with conflict markers labelled `<name>`/`local`,
+//!     and the run still exits 0. An *untracked* file in the way is not a local
+//!     change `-m` can carry, so that refusal stands. The listing this path
+//!     prints is a *second*, headed one (`The following paths have local
+//!     changes:`) emitted **after** `update_refs_for_switch()` has announced the
+//!     switch, not the one at the tail of `merge_working_tree()`.
+//!     `--conflict=<style>` reaches the re-apply through
+//!     [`crate::merge_apply::three_way_merge_styled`], the way git reaches it by
+//!     pushing `merge.conflictStyle=<style>` as a config parameter around the
+//!     `git stash apply`.
+//!   * `-m`/`--merge` on *paths* is `checkout_merged()`: each pathspec-matched
+//!     conflicted entry is re-merged from its three stages under git's
+//!     `base`/`ours`/`theirs` labels — in any of the three conflict styles — and
+//!     written back to the worktree, leaving the index stages alone. Without it
+//!     a conflicted path is `error: path '<p>' is unmerged` (exit 1, nothing
+//!     written); with `-f` it is a warning and the path is left as it is. Naming
+//!     a tree to read from alongside `-m`, `--ours` or `--theirs` is upstream's
+//!     `fatal: '--merge', '--ours', or '--theirs' cannot be used when checking
+//!     out of a tree`.
 //!   * `-p`/`--patch` runs the interactive hunk selector ([`super::add_patch`]),
 //!     restoring the picked hunks into the index and the worktree.
 //!   * `-U`/`--unified <n>`, `--inter-hunk-context <n>` and `--[no-]auto-advance`
@@ -79,18 +100,20 @@
 //!     `fatal: '--unified' cannot be negative` / `fatal: the option '<x>'
 //!     requires '--patch'`, right after the parse and before any ref or pathspec
 //!     is resolved. Shared with `git reset` — see [`super::reset::PatchDiffOpts`].
-//!   * `--conflict <style>` is validated and implies `-m`; the style only affects
-//!     the deferred dirty-merge rendering, so on the clean-switch path honored
-//!     here it is a no-op (the 3-way carry is refused by the same clean-check as
-//!     every other switch).
+//!   * `--conflict <style>` is validated and implies `-m` (`if (conflict_style)
+//!     opts->merge = 1`), and a later `--no-conflict` takes both back. With the
+//!     option absent the style is `merge.conflictStyle`'s, which implies nothing
+//!     on its own.
 //! ```
 
 use anyhow::{anyhow, bail, Result};
 use std::collections::{HashMap, HashSet};
+use std::num::NonZeroU8;
 use std::process::ExitCode;
 use std::sync::atomic::AtomicBool;
 
 use gix::bstr::{BStr, BString};
+use gix::diff::blob::{Algorithm, InternedInput};
 use gix::hash::ObjectId;
 use gix::index::entry::{Flags, Mode, Stat};
 use gix::bstr::ByteSlice;
@@ -201,7 +224,11 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
 
     // --- Argument classification -------------------------------------------
     // `new_branch` is Some((name, reset_if_exists)) for -b / -B.
-    let mut new_branch: Option<(String, bool)> = None;
+    // `-b <name>` and `-B <name>`, kept in the two slots git keeps them in
+    // (`opts->new_branch` / `opts->new_branch_force`) so both being set is
+    // detectable; folded into `new_branch` once that check has run.
+    let mut new_branch_create: Option<String> = None;
+    let mut new_branch_force: Option<String> = None;
     let mut detach = false;
     let mut quiet = false;
     // `-f`/`--force` → git's `opts->discard_changes`.
@@ -219,8 +246,16 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
     // `None` = fall back to `checkout.guess` (default on); `Some(b)` = `--[no-]guess`.
     let mut guess_flag: Option<bool> = None;
     // Overlay (default) never removes paths; `--no-overlay` deletes paths that
-    // match the pathspec but are absent from the source tree.
-    let mut overlay = true;
+    // match the pathspec but are absent from the source tree. Tri-state, because
+    // git's `opts->overlay_mode` starts at -1 and `checkout_branch()` refuses any
+    // explicit setting: `if (opts->overlay_mode != -1) die("'%s' cannot be used
+    // with switching branches", "--[no]-overlay")` (builtin/checkout.c:1671).
+    let mut overlay_mode: Option<bool> = None;
+    // `-l` (`opts->new_branch_log`), refused by `checkout_paths()`:
+    // `if (opts->new_branch_log) die("'%s' cannot be used with updating paths", "-l")`
+    // (builtin/checkout.c:533). Branch reflogs are always written here, so the
+    // flag has no effect beyond that refusal.
+    let mut new_branch_log = false;
     let mut pathspec_from_file: Option<String> = None;
     let mut pathspec_file_nul = false;
     // `--recurse-submodules[=<pathspec>]` / `--no-recurse-submodules`. `None` =
@@ -235,6 +270,10 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
     // `-p`/`--patch`: hand the paths to the interactive hunk selector instead of
     // restoring them wholesale.
     let mut patch_mode = false;
+    // `-m`/`--merge` → git's `opts->merge`, and `--conflict=<style>`, which
+    // implies it (`if (conflict_style) { opts->merge = 1; … }`).
+    let mut merge = false;
+    let mut conflict_style: Option<String> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -275,8 +314,8 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
             continue;
         }
         // Long options that take a value, in `--opt=value` or `--opt value` form.
-        // `--conflict` implies `-m`; the style only affects the deferred dirty
-        // merge rendering, so here it is validated and otherwise ignored.
+        // `--conflict` implies `-m` (`if (conflict_style) opts->merge = 1;`) and
+        // names the style the three-way markers are written in.
         if a == "--conflict" || a.starts_with("--conflict=") {
             let val = match a.strip_prefix("--conflict=") {
                 Some(v) => v.to_string(),
@@ -292,6 +331,7 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
                 eprintln!("error: unknown style '{val}' given for '--conflict'");
                 return Ok(ExitCode::from(129));
             }
+            conflict_style = Some(val);
             i += 1;
             continue;
         }
@@ -336,11 +376,21 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
             // `--help-all` reaches the same renderer with USAGE_FULL, which this
             // table renders identically: it has no `PARSE_OPT_HIDDEN` entry.
             "-h" | "--help-all" => return Ok(super::show_usage(USAGE)),
+            // Tracked apart, because git counts the three *pointers* it fills:
+            // `if ((!!opts->new_branch + !!opts->new_branch_force +
+            // !!opts->new_orphan_branch) > 1) die("options '-b', '-B', and
+            // '--orphan' cannot be used together")` (builtin/checkout.c:1926).
+            // Collapsing `-b`/`-B` into one slot loses that count, and `-b x -B y`
+            // then silently creates `y`.
             "-b" | "-B" => {
                 let name = args
                     .get(i + 1)
                     .ok_or_else(|| anyhow!("option '{a}' requires a value"))?;
-                new_branch = Some((name.clone(), a == "-B"));
+                if a == "-B" {
+                    new_branch_force = Some(name.clone());
+                } else {
+                    new_branch_create = Some(name.clone());
+                }
                 i += 1;
             }
             "--orphan" => {
@@ -366,23 +416,23 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
             "--no-track" => track = Some(false),
             "--ours" | "-2" => writeout_stage = Some(2),
             "--theirs" | "-3" => writeout_stage = Some(3),
-            // `-m` only changes behavior when local changes must be carried across
-            // the switch; with a clean worktree it is byte-identical to a plain
-            // checkout, so accept it and let the shared clean-check govern the
-            // dirty case exactly as every other switch here does.
-            "-m" | "--merge" => {}
-            // Negation of -m: turns the 3-way carry off, which is already the only
-            // behavior on the clean-switch path honored here, so it is a no-op.
-            "--no-merge" => {}
-            // `--no-conflict` clears the conflict style (git sets it to NULL); the
-            // style is only consulted on the deferred dirty-merge path that is
-            // refused here, so clearing it changes nothing.
-            "--no-conflict" => {}
-            "-l" => {} // create the branch reflog — always on here (RefLog::AndReference)
+            // `opts->merge`: carry local changes across a switch the two-way
+            // `unpack_trees()` would otherwise refuse, by stashing them and
+            // merging them back afterwards. With a clean worktree it changes
+            // nothing.
+            "-m" | "--merge" => merge = true,
+            "--no-merge" => merge = false,
+            // `--no-conflict` NULLs the style string. It does not clear
+            // `opts->merge`, because that was set when `--conflict` was seen and
+            // nothing sets it back.
+            "--no-conflict" => conflict_style = None,
+            // The branch reflog is always written here (`RefLog::AndReference`), so
+            // `-l` only survives to be refused alongside a pathspec.
+            "-l" => new_branch_log = true,
             "--guess" => guess_flag = Some(true),
             "--no-guess" => guess_flag = Some(false),
-            "--overlay" => overlay = true,
-            "--no-overlay" => overlay = false,
+            "--overlay" => overlay_mode = Some(true),
+            "--no-overlay" => overlay_mode = Some(false),
             "--pathspec-file-nul" => pathspec_file_nul = true,
             // The unset sense of the three value-carrying entries: git NULLs the
             // `OPT_STRING`/`OPT_FILENAME` pointer and clears the `OPT_BOOL`, so
@@ -401,9 +451,18 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
             "--no-patch" => patch_mode = false,
             "--recurse-submodules" => recurse_submodules = Some(true),
             "--no-recurse-submodules" => recurse_submodules = Some(false),
-            // `--recurse-submodules=<pathspec>` limits which submodules move; this
+            // `--recurse-submodules=<value>` limits which submodules move; this
             // port recurses into all active ones rather than honoring the pathspec.
-            _ if a.starts_with("--recurse-submodules=") => recurse_submodules = Some(true),
+            // The value is still validated: `option_parse_update_submodules()`
+            // (submodule.c) takes only a boolean, and anything else is
+            // `bad recurse-submodules argument: <value>` at 128.
+            _ if a.starts_with("--recurse-submodules=") => {
+                let val = &a["--recurse-submodules=".len()..];
+                match crate::optint::maybe_bool(val) {
+                    Some(on) => recurse_submodules = Some(on),
+                    None => crate::git_fatal!("bad recurse-submodules argument: {val}"),
+                }
+            }
             // Every name the table carries is dispatched above, so anything left
             // with a dash is unknown to stock git too and gets git's own
             // refusal — the `error:` line and the usage block on stderr, at 129.
@@ -418,6 +477,21 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
     if let Err(code) = patch_opts.finish() {
         return Ok(code);
     }
+    // `if (conflict_style) { opts->merge = 1; git_xmerge_config(…); }`, run after
+    // the whole command line has been parsed — which is why a `--no-conflict`
+    // that NULLs the style again also takes the implied `-m` with it. Without
+    // the option the style is whatever `merge.conflictStyle` already said, and
+    // that alone implies nothing.
+    if conflict_style.is_some() {
+        merge = true;
+    }
+    let conflict_style = conflict_style
+        .or_else(|| {
+            repo.config_snapshot()
+                .string("merge.conflictStyle")
+                .map(|v| v.to_string())
+        })
+        .unwrap_or_else(|| "merge".to_string());
     // git collects the hunk-selector options into `add_p_opt` and refuses them
     // right after parse-options, before any ref or pathspec is resolved — so a
     // `-U 3` alongside an unknown branch reports the option, not the branch
@@ -426,17 +500,199 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
         return Ok(code);
     }
 
+    // `if ((!!opts->new_branch + !!opts->new_branch_force + !!opts->new_orphan_branch) > 1)
+    //     die(_("options '-%c', '-%c', and '%s' cannot be used together"),
+    //         cb_option, toupper(cb_option), "--orphan");`
+    // (builtin/checkout.c:1926). `cb_option` is 'b' for `checkout`, so the three
+    // names are spelled `-b`, `-B` and `--orphan` here.
+    if (new_branch_create.is_some() as u8)
+        + (new_branch_force.is_some() as u8)
+        + (orphan.is_some() as u8)
+        > 1
+    {
+        crate::git_fatal!("options '-b', '-B', and '--orphan' cannot be used together");
+    }
+    // The three slots collapse into one only once the count above has run, in
+    // git's own precedence: `if (new_branch_force) new_branch = new_branch_force;
+    // if (new_orphan_branch) new_branch = new_orphan_branch;` (checkout.c:1957-1962).
+    let new_branch = match (new_branch_create, new_branch_force) {
+        (_, Some(name)) => Some((name, true)),
+        (Some(name), None) => Some((name, false)),
+        (None, None) => None,
+    };
+
+    // `if (opts->overlay_mode == 1 && opts->patch_mode)
+    //     die(_("options '%s' and '%s' cannot be used together"), "-p", "--overlay");`
+    // (builtin/checkout.c:1931). Only the *set* sense collides: `-p --no-overlay`
+    // is a supported combination.
+    if overlay_mode == Some(true) && patch_mode {
+        crate::git_fatal!("options '-p' and '--overlay' cannot be used together");
+    }
+
     // `-p`: `git checkout -p [<tree-ish>] [--] [<pathspec>...]` selects hunks to
     // restore into BOTH the index and the worktree (git's `ADD_P_CHECKOUT`). The
     // exact patch mode depends on the source: the index when no tree-ish is
     // given, `HEAD` verbatim, and any other tree-ish resolved to its hex oid —
     // `checkout_paths()` does the same substitution because `diff-index` cannot
     // take an `<a>...<b>` range.
-    if patch_mode {
-        if pathspec_from_file.is_some() {
-            eprintln!("fatal: options '--pathspec-from-file' and '--patch' cannot be used together");
-            return Ok(ExitCode::from(128));
+    // `if (opts->pathspec_from_file) { … if (opts->patch_mode) die(…) }`
+    // (builtin/checkout.c:2043) runs in `cmd_checkout()` itself, ahead of both
+    // halves' own option gates, so it is checked before them here too.
+    if patch_mode && pathspec_from_file.is_some() {
+        crate::git_fatal!("options '--pathspec-from-file' and '--patch' cannot be used together");
+    }
+
+    // ```c
+    // /* --track without -c/-C/-b/-B/--orphan should DWIM */
+    // if (opts->track != BRANCH_TRACK_UNSPECIFIED && !opts->new_branch) {
+    //         const char *argv0 = argv[0];
+    //         if (!argc || !strcmp(argv0, "--"))
+    //                 die(_("--track needs a branch name"));
+    //         skip_prefix(argv0, "refs/", &argv0);
+    //         skip_prefix(argv0, "remotes/", &argv0);
+    //         argv0 = strchr(argv0, '/');
+    //         if (!argv0 || !argv0[1])
+    //                 die(_("missing branch name; try -%c"), cb_option);
+    //         opts->new_branch = argv0 + 1;
+    // }
+    // ```
+    // (builtin/checkout.c:1964-1975.) It runs in `cmd_checkout()` before either
+    // half's option gates, so `--track` with no usable start-point is refused
+    // ahead of everything, and the branch it derives is visible to the
+    // `--detach`/pathspec checks below. `--no-track` reaches it too: git tests
+    // `!= BRANCH_TRACK_UNSPECIFIED`, and `--no-track` is `BRANCH_TRACK_NEVER`.
+    let new_branch = match new_branch {
+        Some(nb) => Some(nb),
+        // `opts->new_branch` has already absorbed `--orphan` by the time the DWIM
+        // block runs (`if (opts->new_orphan_branch) opts->new_branch =
+        // opts->new_orphan_branch;`, checkout.c:1961-1962, immediately above it),
+        // so `--orphan` suppresses the DWIM and reaches `'--orphan' cannot be
+        // used with '-t'` in `checkout_branch()` instead.
+        None if track.is_some() && orphan.is_none() => {
+            // `argv[0]` after parse-options, which keeps the `--` for `checkout`.
+            let argv0 = if has_dashdash && pre.is_empty() {
+                Some("--")
+            } else {
+                pre.first().copied()
+            };
+            let Some(argv0) = argv0 else {
+                crate::git_fatal!("--track needs a branch name");
+            };
+            if argv0 == "--" {
+                crate::git_fatal!("--track needs a branch name");
+            }
+            let stem = argv0.strip_prefix("refs/").unwrap_or(argv0);
+            let stem = stem.strip_prefix("remotes/").unwrap_or(stem);
+            match stem.split_once('/') {
+                Some((_, rest)) if !rest.is_empty() => Some((rest.to_string(), false)),
+                _ => crate::git_fatal!("missing branch name; try -b"),
+            }
         }
+        None => None,
+    };
+
+    // `opts->pathspec.nr != 0`: whatever `parse_branchname_arg()` left behind
+    // once it took its 0-or-1 leading ref. It is the single switch git's own
+    // `cmd_checkout()` tail hangs on — `checkout_paths()` when there is a
+    // pathspec, `checkout_branch()` when there is not — and the two halves
+    // refuse *different* option combinations, so the gates below need it too.
+    //
+    // With `--` the split is literal. Without one, the leading positional is the
+    // ref whenever it names a branch, resolves as a rev, is the `HEAD`/`@`
+    // spelling, or DWIMs to a unique remote branch; anything else is a pathspec,
+    // as is every positional after a `-b`/`-B`/`--orphan`/`-t` start-point.
+    let path_op = if pathspec_from_file.is_some() {
+        true
+    } else if has_dashdash {
+        !post.is_empty()
+    } else if new_branch.is_some() || orphan.is_some() || track == Some(true) {
+        // The one positional those forms accept is their start-point.
+        pre.len() > 1
+    } else {
+        match pre.len() {
+            0 => false,
+            1 => {
+                let spec = pre[0];
+                let is_ref = matches!(spec, "HEAD" | "@")
+                    || repo
+                        .try_find_reference(format!("refs/heads/{spec}").as_str())
+                        .ok()
+                        .flatten()
+                        .is_some()
+                    || crate::objname::resolve(&repo, spec).is_some()
+                    || matches!(unique_remote_branch(&repo, spec), Ok(Dwim::One(_)));
+                !is_ref
+            }
+            _ => true,
+        }
+    };
+
+    // `opts->overlay_mode` resolved for the path forms: git's default is on
+    // (`-1` behaves as overlay), and only `--no-overlay` turns it off.
+    let overlay = overlay_mode.unwrap_or(true);
+
+    if path_op {
+        // `checkout_paths()`'s own refusals, in its order (builtin/checkout.c:530-551).
+        if track.is_some() {
+            crate::git_fatal!("'--track' cannot be used with updating paths");
+        }
+        if new_branch_log {
+            crate::git_fatal!("'-l' cannot be used with updating paths");
+        }
+        if merge && patch_mode {
+            crate::git_fatal!("options '--merge' and '--patch' cannot be used together");
+        }
+        // `if (opts->force_detach) die("git checkout: --detach does not take a
+        // path argument '%s'")` (builtin/checkout.c:2031). Reported against the
+        // first pathspec, and reached before `checkout_paths()`'s own
+        // `'--detach' cannot be used with updating paths`.
+        if detach {
+            let first = if has_dashdash { post.first() } else { pre.first() };
+            if let Some(first) = first {
+                crate::git_fatal!("git checkout: --detach does not take a path argument '{first}'");
+            }
+        }
+        // `if (1 < !!opts->writeout_stage + !!opts->force + !!opts->merge)`
+        // (builtin/checkout.c:2054) — one message for all three pairings.
+        if (writeout_stage.is_some() as u8) + (force as u8) + (merge as u8) > 1 {
+            crate::git_fatal!(
+                "git checkout: --ours/--theirs, --force and --merge are incompatible when\nchecking out of the index."
+            );
+        }
+    } else {
+        // `checkout_branch()`'s refusals (builtin/checkout.c:1667-1699).
+        if patch_mode {
+            crate::git_fatal!("'--patch' cannot be used with switching branches");
+        }
+        if overlay_mode.is_some() {
+            crate::git_fatal!("'--[no]-overlay' cannot be used with switching branches");
+        }
+        if writeout_stage.is_some() {
+            // `noop_switch`: no ref named, nothing created, no `--detach`.
+            let noop_switch = pre.is_empty() && new_branch.is_none() && !detach;
+            if noop_switch {
+                crate::git_fatal!("'--ours/--theirs' needs the paths to check out");
+            }
+            crate::git_fatal!("'--ours/--theirs' cannot be used with switching branches");
+        }
+        if force && merge {
+            crate::git_fatal!("'-f' cannot be used with '-m'");
+        }
+        // `opts->new_branch` here is the merged slot, so `--orphan` is covered.
+        if detach && (new_branch.is_some() || orphan.is_some()) {
+            crate::git_fatal!("'--detach' cannot be used with '-b/-B/--orphan'");
+        }
+        // `else if (opts->force_detach) { if (track != …UNSPECIFIED) die("'--detach'
+        // cannot be used with '-t'") }` has no counterpart here: `--track` without
+        // a created branch already died in the DWIM block above, and with one
+        // `--detach` collides at `-b/-B/--orphan` first.
+        if orphan.is_some() && track.is_some() {
+            crate::git_fatal!("'--orphan' cannot be used with '-t'");
+        }
+    }
+
+
+    if patch_mode {
         // Without `--`, a leading positional is the tree-ish only when it
         // resolves as a revision; otherwise every positional is a pathspec.
         let (rev, specs): (Option<&str>, &[&str]) = if has_dashdash {
@@ -479,6 +735,26 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
     let recurse_submodules = recurse_submodules
         .unwrap_or_else(|| repo.config_snapshot().boolean("submodule.recurse") == Some(true));
 
+    // `if (opts->source_tree && (opts->merge || opts->writeout_stage))`
+    // (builtin/checkout.c): the three-way and stage-picking forms read the
+    // *index*, so naming a tree to read from instead is refused before anything
+    // is resolved. `opts->source_tree` is set only when a tree-ish operand
+    // precedes pathspecs, which is exactly this shape.
+    let source_tree_with_paths = if has_dashdash {
+        pre.len() == 1 && !post.is_empty()
+    } else {
+        pre.len() > 1 && crate::objname::resolve(&repo, pre[0]).is_some()
+    };
+    if source_tree_with_paths
+        && new_branch.is_none()
+        && orphan.is_none()
+        && (merge || writeout_stage.is_some())
+    {
+        crate::git_fatal!(
+            "'--merge', '--ours', or '--theirs' cannot be used when checking out of a tree"
+        );
+    }
+
     // --- Dispatch -----------------------------------------------------------
     // `--pathspec-from-file`: pathspecs come from the file (or stdin for `-`),
     // never the command line. A single positional may still precede them as the
@@ -493,7 +769,7 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
         let specs = super::commit::read_pathspec_file(&file, pathspec_file_nul)?;
         let refs: Vec<&str> = specs.iter().map(String::as_str).collect();
         return match pre.len() {
-            0 => restore_from_index(&repo, &refs, false, quiet),
+            0 => restore_from_index(&repo, &refs, false, quiet, merge_opt(merge, &conflict_style, ""), force),
             // `--pathspec-from-file` rejects a `--` above, so this is the bare
             // form: stock reports `Updated N paths from <tree>` here.
             1 => restore_from_tree(&repo, pre[0], &refs, overlay, true, quiet),
@@ -504,7 +780,7 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
     // `--orphan <name> [<start>]`: start an unborn branch off `<start>`'s tree.
     if let Some(name) = orphan {
         let start = pre.first().copied().unwrap_or("HEAD");
-        return orphan_checkout(&repo, &name, start, quiet);
+        return orphan_checkout(&repo, &name, start, quiet, force);
     }
 
     // `--ours`/`--theirs <path>…`: write one conflict side into the worktree.
@@ -521,14 +797,42 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
         // A bare `--` introduces no pathspec at all — `git checkout -B main origin/main --`
         // is a plain branch creation, which is how the JetBrains client spells it. Only a
         // path *after* the separator (or before it, without one) is a path restore.
-        if !post.is_empty() {
+        // `parse_branchname_arg()` takes the leading operand as the start-point
+        // only when it resolves; whatever is left is `opts->pathspec`.
+        let start_resolved = pre
+            .first()
+            .map(|p| crate::objname::resolve(&repo, p).is_some())
+            .unwrap_or(false);
+        let remaining: &[&str] = if has_dashdash {
+            &post
+        } else if start_resolved {
+            &pre[1..]
+        } else {
+            &pre
+        };
+        if !remaining.is_empty() {
+            // ```c
+            // /* Try to give more helpful suggestion. new_branch && argc > 1 will be caught later. */
+            // if (opts->new_branch && argc == 1 && !new_branch_info.commit)
+            //         die(_("'%s' is not a commit and a branch '%s' cannot be created from it"),
+            //             argv[0], opts->new_branch);
+            // ```
+            // (builtin/checkout.c:2024-2027, then `checkout_paths()`'s
+            // `die(_("Cannot update paths and switch to branch '%s' at the same
+            // time."), opts->new_branch)` at :551.) The friendlier wording needs
+            // *both* conditions: exactly one operand left, and no start-point
+            // resolved for it to have been. `git checkout -b o master -- f.txt`
+            // has a start-point, so it gets the blunt one.
+            if remaining.len() == 1 && !start_resolved {
+                crate::git_fatal!(
+                    "'{}' is not a commit and a branch '{name}' cannot be created from it",
+                    remaining[0]
+                );
+            }
             eprintln!(
                 "fatal: Cannot update paths and switch to branch '{name}' at the same time."
             );
             return Ok(ExitCode::from(128));
-        }
-        if pre.len() > 1 {
-            crate::git_fatal!("too many start-points given for branch creation");
         }
         let start = pre.first().copied().unwrap_or("HEAD");
         // On an UNBORN HEAD (a fresh `git init`, or a clone of an empty repo)
@@ -565,38 +869,19 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
             quiet,
             track,
             !only_merge_on_switching_branches,
+            merge_opt(merge, &conflict_style, &name),
         );
     }
 
-    // `-t <remote>/<branch>` with no `-b`: DWIM the local branch name from the
-    // remote-tracking start-point, then create-and-track.
-    if track == Some(true) {
-        if pre.len() != 1 {
-            eprintln!("fatal: missing branch name; try -b");
-            return Ok(ExitCode::from(128));
-        }
-        match resolve_tracking(&repo, pre[0])? {
-            Some(info) => {
-                let Some(name) = info.dwim_name.clone() else {
-                    // A local-branch start-point can't DWIM a new name.
-                    eprintln!("fatal: missing branch name; try -b");
-                    return Ok(ExitCode::from(128));
-                };
-                return create_and_switch(&repo, &name, false, pre[0], quiet, Some(true), true);
-            }
-            None => {
-                eprintln!("fatal: missing branch name; try -b");
-                return Ok(ExitCode::from(128));
-            }
-        }
-    }
+    // `-t`/`--no-track` without `-b`/`-B`/`--orphan` no longer reaches here: the
+    // DWIM block above has already turned it into a branch creation, or refused.
 
     if has_dashdash {
         if post.is_empty() {
             crate::git_fatal!("you must specify path(s) to restore");
         }
         return match pre.len() {
-            0 => restore_from_index(&repo, &post, false, quiet),
+            0 => restore_from_index(&repo, &post, false, quiet, merge_opt(merge, &conflict_style, ""), force),
             // Reached only under `has_dashdash`, and stock stays silent for the
             // `--` form even though it updates the same paths.
             1 => restore_from_tree(&repo, pre[0], &post, overlay, false, quiet),
@@ -616,7 +901,7 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
                 .map_err(|_| anyhow::anyhow!("you are on a branch yet to be born"))?
                 .detach();
             let commit = head.attach(&repo).object()?.peel_to_commit()?;
-            let code = detached_checkout(&repo, "HEAD", commit, quiet, true, force)?;
+            let code = detached_checkout(&repo, "HEAD", commit, quiet, true, force, merge_opt(merge, &conflict_style, "HEAD"))?;
             maybe_recurse_submodules(&repo, recurse_submodules, quiet)?;
             return Ok(code);
         }
@@ -647,7 +932,8 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
             .flatten()
             .is_some();
         if is_branch && !detach {
-            let code = switch_to_branch(&repo, spec, quiet, force, None)?;
+            let code =
+                switch_to_branch_opts(&repo, spec, quiet, force, None, merge_opt(merge, &conflict_style, spec))?;
             maybe_recurse_submodules(&repo, recurse_submodules, quiet)?;
             return Ok(code);
         }
@@ -676,7 +962,8 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
                     crate::git_fatal!("Cannot switch branch to a non-commit '{spec}'")
                 }
             };
-            let code = detached_checkout(&repo, spec, commit, quiet, detach, force)?;
+            let code =
+                detached_checkout(&repo, spec, commit, quiet, detach, force, merge_opt(merge, &conflict_style, spec))?;
             maybe_recurse_submodules(&repo, recurse_submodules, quiet)?;
             return Ok(code);
         }
@@ -692,7 +979,10 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
                 match unique_remote_branch(&repo, spec)? {
                     Dwim::One(remote_short) => {
                         let code =
-                            create_and_switch(&repo, spec, false, &remote_short, quiet, Some(true), true)?;
+                            create_and_switch(
+                            &repo, spec, false, &remote_short, quiet, Some(true), true,
+                            merge_opt(merge, &conflict_style, spec),
+                        )?;
                         maybe_recurse_submodules(&repo, recurse_submodules, quiet)?;
                         return Ok(code);
                     }
@@ -708,7 +998,7 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
             }
         }
         // Not a ref/rev — treat as a path restore from the index (bare form).
-        return restore_from_index(&repo, &pre, true, quiet);
+        return restore_from_index(&repo, &pre, true, quiet, merge_opt(merge, &conflict_style, ""), force);
     }
 
     // Multiple positionals, no `--`: if the first resolves to a tree-ish it is the
@@ -716,7 +1006,7 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
     if crate::objname::resolve(&repo, pre[0]).is_some() {
         return restore_from_tree(&repo, pre[0], &pre[1..], overlay, true, quiet);
     }
-    restore_from_index(&repo, &pre, true, quiet)
+    restore_from_index(&repo, &pre, true, quiet, merge_opt(merge, &conflict_style, ""), force)
 }
 
 /// What an object name means to the checkout family once it has been resolved
@@ -883,6 +1173,19 @@ pub(crate) fn switch_to_branch(
     // `options.switch_to` checkout records.
     reflog_message: Option<&str>,
 ) -> Result<ExitCode> {
+    switch_to_branch_opts(repo, spec, quiet, force, reflog_message, None)
+}
+
+/// [`switch_to_branch`] with `opts->merge` made explicit — the spelling
+/// `git checkout -m <branch>` reaches, and the only one that can stash.
+pub(crate) fn switch_to_branch_opts(
+    repo: &gix::Repository,
+    spec: &str,
+    quiet: bool,
+    force: bool,
+    reflog_message: Option<&str>,
+    merge: Option<MergeOpt<'_>>,
+) -> Result<ExitCode> {
     // Already on it → the branch `HEAD` points at does not change, but git still
     // goes through `refs_update_symref("HEAD", ...)`, so the move is reflogged
     // ("checkout: moving from main to main") before "Already on 'x'" is printed.
@@ -891,7 +1194,7 @@ pub(crate) fn switch_to_branch(
             let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
             let head_id = repo.head_id().ok().map(|id| id.detach());
             if force {
-                let tree = repo.head_tree_id_or_empty()?.detach();
+                let tree = head_tree_or_empty(repo)?;
                 reset_worktree_to_tree(repo, tree)?;
             } else {
                 // `switch_branch_doing_nothing_is_ok`: the switch is a no-op, but
@@ -921,22 +1224,29 @@ pub(crate) fn switch_to_branch(
 
     let head = repo.head()?;
     let old_detached = head.is_detached();
+    // `orphaned_commit_warning()` is gated on `old_branch_info.commit`
+    // (checkout.c:1252), so a `HEAD` that peels to no commit reports nothing —
+    // and, in particular, is never handed to `describe()`, which would fail on it.
+    let old_commit = peeled_head_commit(repo, &head);
     let old_id = head.id().map(|i| i.detach());
-    let old_label = head_label(&head);
-    let cur_tree = repo.head_tree_id_or_empty()?.detach();
+    let old_label = head_label(repo, &head);
+    let cur_tree = head_tree_or_empty(repo)?;
 
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
 
+    let mut autostashed = false;
     if force {
         reset_worktree_to_tree(repo, target_tree)?;
     } else if target_tree != cur_tree {
-        if let Some(code) = ensure_clean(repo, cur_tree, target_tree)? {
-            return Ok(code);
+        match move_worktree(repo, cur_tree, target_tree, merge)? {
+            Moved::Refused(code) => return Ok(code),
+            Moved::Autostashed => autostashed = true,
+            Moved::Clean => {}
         }
-        update_worktree_to_tree(repo, cur_tree, target_tree)?;
     }
     // The tail of `merge_working_tree()`: `!opts->discard_changes && !opts->quiet`.
-    if !force {
+    // An autostashed switch skips it — its listing is the headed one below.
+    if !force && !autostashed {
         show_local_changes(&commit.id.to_string(), quiet)?;
     }
 
@@ -951,11 +1261,16 @@ pub(crate) fn switch_to_branch(
         Some(commit.id),
     )?;
 
+    if autostashed && !quiet {
+        println!("The following paths have local changes:");
+        show_local_changes(&commit.id.to_string(), quiet)?;
+    }
+
     if !quiet {
         // git only reports the abandoned detached position when it actually
         // moves (checkout.c: `!old->path && old->commit != new->commit`).
         if old_detached {
-            if let Some(id) = old_id.filter(|id| *id != commit.id) {
+            if let Some(id) = old_commit.filter(|id| *id != commit.id) {
                 let (abbrev, summary) = describe(repo, id)?;
                 eprintln!("Previous HEAD position was {abbrev} {summary}");
             }
@@ -979,28 +1294,37 @@ fn detached_checkout(
     quiet: bool,
     force_detach: bool,
     force: bool,
+    merge: Option<MergeOpt<'_>>,
 ) -> Result<ExitCode> {
     let target_id = commit.id;
     let target_tree = commit.tree_id()?.detach();
 
     let head = repo.head()?;
     let old_detached = head.is_detached();
+    // `orphaned_commit_warning()` is gated on `old_branch_info.commit`
+    // (checkout.c:1252), so a `HEAD` that peels to no commit reports nothing —
+    // and, in particular, is never handed to `describe()`, which would fail on it.
+    let old_commit = peeled_head_commit(repo, &head);
     let old_id = head.id().map(|i| i.detach());
-    let old_label = head_label(&head);
-    let cur_tree = repo.head_tree_id_or_empty()?.detach();
+    let old_label = head_label(repo, &head);
+    let cur_tree = head_tree_or_empty(repo)?;
 
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
 
+    let mut autostashed = false;
     if force {
         reset_worktree_to_tree(repo, target_tree)?;
     } else {
         if target_tree != cur_tree {
-            if let Some(code) = ensure_clean(repo, cur_tree, target_tree)? {
-                return Ok(code);
+            match move_worktree(repo, cur_tree, target_tree, merge)? {
+                Moved::Refused(code) => return Ok(code),
+                Moved::Autostashed => autostashed = true,
+                Moved::Clean => {}
             }
-            update_worktree_to_tree(repo, cur_tree, target_tree)?;
         }
-        show_local_changes(&target_id.to_string(), quiet)?;
+        if !autostashed {
+            show_local_changes(&target_id.to_string(), quiet)?;
+        }
     }
 
     set_head_detached(
@@ -1010,9 +1334,14 @@ fn detached_checkout(
         old_id,
     )?;
 
+    if autostashed && !quiet {
+        println!("The following paths have local changes:");
+        show_local_changes(&target_id.to_string(), quiet)?;
+    }
+
     if !quiet {
         if old_detached {
-            if let (Some(old), true) = (old_id, old_id != Some(target_id)) {
+            if let (Some(old), true) = (old_commit, old_commit != Some(target_id)) {
                 let (abbrev, summary) = describe(repo, old)?;
                 eprintln!("Previous HEAD position was {abbrev} {summary}");
             }
@@ -1060,6 +1389,7 @@ fn create_and_switch(
     quiet: bool,
     track: Option<bool>,
     merge_worktree: bool,
+    merge: Option<MergeOpt<'_>>,
 ) -> Result<ExitCode> {
     let full = format!("refs/heads/{name}");
     if !super::branch::valid_branch_name(name) {
@@ -1105,19 +1435,44 @@ fn create_and_switch(
         TreeIsh::Commit(commit) => commit,
         TreeIsh::Tree(_) => crate::git_fatal!("Cannot switch branch to a non-commit '{start}'"),
     };
+
+    // `create_branch()` hands the start-point to `dwim_branch_start()`
+    // (branch.c:539-594), which resolves it a *second* time and then DWIMs it —
+    // so the name reaches `get_oid_basic()` twice and warns twice, and more than
+    // one matching ref is fatal before anything is created:
+    //
+    // ```c
+    // if (repo_get_oid_mb(r, start_name, &oid)) { … die(_("not a valid object name: '%s'"), start_name); }
+    //
+    // switch (repo_dwim_ref(r, start_name, strlen(start_name), &oid, &real_ref, 0)) {
+    // case 0: … break;
+    // case 1: … break;
+    // default:
+    //         die(_("ambiguous object name: '%s'"), start_name);
+    // }
+    // ```
+    crate::objname::warn_ambiguous_refname(repo, start);
+    if super::rev_parse::dwim_ref_matches(repo, start).len() > 1 {
+        crate::git_fatal!("ambiguous object name: '{start}'");
+    }
+
     let start_id = commit.id;
     let target_tree = commit.tree_id()?.detach();
 
     let head = repo.head()?;
     let old_detached = head.is_detached();
+    // `orphaned_commit_warning()` is gated on `old_branch_info.commit`
+    // (checkout.c:1252), so a `HEAD` that peels to no commit reports nothing —
+    // and, in particular, is never handed to `describe()`, which would fail on it.
+    let old_commit = peeled_head_commit(repo, &head);
     let old_id = head.id().map(|i| i.detach());
-    let old_label = head_label(&head);
+    let old_label = head_label(repo, &head);
     // Whether HEAD is already attached to the branch we're (re)creating.
     let already_on = head
         .referent_name()
         .map(|n| n.shorten() == name)
         .unwrap_or(false);
-    let cur_tree = repo.head_tree_id_or_empty()?.detach();
+    let cur_tree = head_tree_or_empty(repo)?;
 
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
 
@@ -1126,17 +1481,19 @@ fn create_and_switch(
         crate::git_fatal!("a branch named '{name}' already exists");
     }
 
+    let mut autostashed = false;
     if target_tree != cur_tree {
-        if let Some(code) = ensure_clean(repo, cur_tree, target_tree)? {
-            return Ok(code);
+        match move_worktree(repo, cur_tree, target_tree, merge)? {
+            Moved::Refused(code) => return Ok(code),
+            Moved::Autostashed => autostashed = true,
+            Moved::Clean => {}
         }
-        update_worktree_to_tree(repo, cur_tree, target_tree)?;
     }
     // `merge_working_tree()` ends here, and its last act is the listing of the
     // local changes carried onto the new branch — before `update_refs_for_switch()`
     // announces the switch. `only_merge_on_switching_branches` skips the whole
     // function, listing included.
-    if merge_worktree {
+    if merge_worktree && !autostashed {
         show_local_changes(&start_id.to_string(), quiet)?;
     }
 
@@ -1182,7 +1539,7 @@ fn create_and_switch(
             eprintln!("Reset branch '{name}'");
         } else {
             if old_detached {
-                if let Some(id) = old_id.filter(|id| *id != start_id) {
+                if let Some(id) = old_commit.filter(|id| *id != start_id) {
                     let (abbrev, summary) = describe(repo, id)?;
                     eprintln!("Previous HEAD position was {abbrev} {summary}");
                 }
@@ -1204,6 +1561,10 @@ fn create_and_switch(
             print_tracking_status(repo);
         }
     }
+    if autostashed && !quiet {
+        println!("The following paths have local changes:");
+        show_local_changes(&start_id.to_string(), quiet)?;
+    }
     Ok(ExitCode::SUCCESS)
 }
 
@@ -1216,6 +1577,10 @@ fn orphan_checkout(
     name: &str,
     start: &str,
     quiet: bool,
+    // `opts->discard_changes`. `merge_working_tree()` routes a forced checkout
+    // through `reset_tree()` instead of the two-way merge, so local changes are
+    // thrown away rather than carried — and its closing listing is skipped.
+    force: bool,
 ) -> Result<ExitCode> {
     // git resolves the start-point before anything else: a bad one aborts here.
     // Resolution is `get_oid_mb()`'s, so a full-length hex name is the id itself
@@ -1250,13 +1615,28 @@ fn orphan_checkout(
         return Ok(ExitCode::from(128));
     }
 
+    let start_commit = commit.id;
     let target_tree = commit.tree_id()?.detach();
-    let cur_tree = repo.head_tree_id_or_empty()?.detach();
-    if target_tree != cur_tree {
+    let cur_tree = head_tree_or_empty(repo)?;
+    if force {
+        reset_worktree_to_tree(repo, target_tree)?;
+    } else if target_tree != cur_tree {
         if let Some(code) = ensure_clean(repo, cur_tree, target_tree)? {
             return Ok(code);
         }
         update_worktree_to_tree(repo, cur_tree, target_tree)?;
+    }
+
+    // The tail of `merge_working_tree()`, which `--orphan` runs like every other
+    // switch: `if (!opts->discard_changes && !opts->quiet && new_branch_info->commit)
+    // show_local_changes(&new_branch_info->commit->object, &opts->diff_options);`
+    // (builtin/checkout.c:930-931). `git checkout --orphan` keeps its start-point
+    // commit — only `git switch --orphan`, whose `orphan_from_empty_tree` leaves
+    // `new_branch_info->commit` NULL, prints nothing — and the call is outside
+    // the two-way merge, so it runs even when the trees were identical and
+    // nothing moved.
+    if !force {
+        show_local_changes(&start_commit.to_string(), quiet)?;
     }
 
     // Write HEAD as a plain symref to the (not-yet-existing) branch. No ref is
@@ -1576,6 +1956,80 @@ fn tree_effective_entries(
     out
 }
 
+/// The conflicted entries among `matched`, as `[stage] -> (id, mode)` with index
+/// 1/2/3 for base/ours/theirs — git's `ce_stage()` walk over the runs of equal
+/// names. A path with a stage-0 entry is not conflicted and never appears here.
+fn unmerged_stages(
+    index: &gix::index::File,
+    matched: &[BString],
+) -> HashMap<BString, [Option<(ObjectId, Mode)>; 4]> {
+    let want: HashSet<&BString> = matched.iter().collect();
+    let backing = index.path_backing();
+    let mut out: HashMap<BString, [Option<(ObjectId, Mode)>; 4]> = HashMap::new();
+    for e in index.entries() {
+        let stage = e.stage_raw() as usize;
+        if stage == 0 || stage > 3 {
+            continue;
+        }
+        let path = e.path_in(backing).to_owned();
+        if !want.contains(&path) {
+            continue;
+        }
+        out.entry(path).or_default()[stage] = Some((e.id, e.mode));
+    }
+    out
+}
+
+/// `checkout_merged()`'s `ll_merge()`: the three stages merged under git's
+/// `base` / `ours` / `theirs` labels, in the requested conflict style. A missing
+/// ancestor is the empty blob, which is what `read_mmblob()` of a null id gives.
+fn merge_stages(
+    repo: &gix::Repository,
+    base: Option<ObjectId>,
+    ours: ObjectId,
+    theirs: ObjectId,
+    style: &str,
+) -> Result<Vec<u8>> {
+    let load = |id: Option<ObjectId>| -> Result<Vec<u8>> {
+        Ok(match id {
+            Some(id) => repo.find_object(id)?.detach().data,
+            None => Vec::new(),
+        })
+    };
+    let base_b = load(base)?;
+    let our_b = load(Some(ours))?;
+    let their_b = load(Some(theirs))?;
+
+    let mut input = InternedInput::new(our_b.as_slice(), their_b.as_slice());
+    let mut out = Vec::new();
+    let opts = gix::merge::blob::builtin_driver::text::Options {
+        diff_algorithm: Algorithm::Myers,
+        conflict: gix::merge::blob::builtin_driver::text::Conflict::Keep {
+            style: match style {
+                "diff3" => gix::merge::blob::builtin_driver::text::ConflictStyle::Diff3,
+                "zdiff3" => gix::merge::blob::builtin_driver::text::ConflictStyle::ZealousDiff3,
+                _ => gix::merge::blob::builtin_driver::text::ConflictStyle::Merge,
+            },
+            marker_size: NonZeroU8::new(7).expect("7 != 0"),
+        },
+        ..Default::default()
+    };
+    gix::merge::blob::builtin_driver::text(
+        &mut out,
+        &mut input,
+        gix::merge::blob::builtin_driver::text::Labels {
+            ancestor: Some(BStr::new("base")),
+            current: Some(BStr::new("ours")),
+            other: Some(BStr::new("theirs")),
+        },
+        our_b.as_slice(),
+        base_b.as_slice(),
+        their_b.as_slice(),
+        opts,
+    );
+    Ok(out)
+}
+
 /// Restore `paths` in the worktree from the current index (index left unchanged;
 /// only stat info is refreshed). `bare` is true for the no-`--` pathspec form,
 /// which prints git's "Updated N path(s) from the index" confirmation.
@@ -1584,6 +2038,12 @@ fn restore_from_index(
     paths: &[&str],
     bare: bool,
     quiet: bool,
+    // `opts->merge`: an unmerged path is re-created as a conflicted file rather
+    // than refused — `checkout_merged()`.
+    merge: Option<MergeOpt<'_>>,
+    // `opts->force`: the unmerged refusal becomes a warning, and the path is
+    // then left alone (`checkout_paths()` has no branch that writes it).
+    force: bool,
 ) -> Result<ExitCode> {
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
 
@@ -1595,6 +2055,39 @@ fn restore_from_index(
             return Ok(ExitCode::from(1));
         }
     };
+
+    // `checkout_paths()`'s unmerged pass, which runs over the whole matched set
+    // before anything is written — so a refusal leaves the worktree untouched.
+    let unmerged = unmerged_stages(&index, &matched);
+    let mut merged_blobs: HashMap<BString, ObjectId> = HashMap::new();
+    if !unmerged.is_empty() {
+        let mut had_error = false;
+        for (path, stages) in &unmerged {
+            let name = path.to_str_lossy();
+            match (merge, force) {
+                (Some(opt), _) => {
+                    // `checkout_merged()`: `ll_merge()` of the three stages under
+                    // the `base`/`ours`/`theirs` labels, written out as a blob.
+                    let (Some(ours), Some(theirs)) = (stages[2], stages[3]) else {
+                        eprintln!("error: path '{name}' does not have necessary versions");
+                        had_error = true;
+                        continue;
+                    };
+                    let content =
+                        merge_stages(repo, stages[1].map(|(id, _)| id), ours.0, theirs.0, opt.style)?;
+                    merged_blobs.insert(path.clone(), repo.write_blob(&content)?.detach());
+                }
+                (None, true) => eprintln!("warning: path '{name}' is unmerged"),
+                (None, false) => {
+                    eprintln!("error: path '{name}' is unmerged");
+                    had_error = true;
+                }
+            }
+        }
+        if had_error {
+            return Ok(ExitCode::from(1));
+        }
+    }
 
     // Counted before anything is written: afterwards every file matches its entry.
     let count = if bare && !quiet {
@@ -1615,13 +2108,37 @@ fn restore_from_index(
 
     let mut subset = repo.open_index()?;
     keep_only(&mut subset, &matched);
+    // An unmerged path is written from the `checkout_merged()` result (git's
+    // "phony cache entry": stage 2's mode carrying the merged blob), and one
+    // that was only warned about is not written at all. Either way the real
+    // index keeps its stages — `checkout_paths()` never resolves them.
+    subset.remove_entries(|_, path, e| {
+        let unmerged_here = unmerged.contains_key(path.as_bstr());
+        // Stage 2 is the one `checkout_merged()` builds its transient entry from
+        // (`if (stage == 2) mode = create_ce_mode(ce->ce_mode)`), so its *mode*
+        // is what the merged content is written with.
+        unmerged_here && (e.stage_raw() != 2 || !merged_blobs.contains_key(path.as_bstr()))
+    });
+    for e in subset.entries_mut() {
+        e.flags.remove(Flags::STAGE_MASK);
+    }
+    {
+        let backing = subset.path_backing().to_owned();
+        for e in subset.entries_mut() {
+            if let Some(id) = merged_blobs.get(e.path_in(&backing).as_bstr()) {
+                e.id = *id;
+            }
+        }
+    }
     let should_interrupt = AtomicBool::new(false);
     checkout_subset(repo, &mut subset, &should_interrupt)?;
 
     // Refresh stat info in the real index for the restored paths so a later
-    // status stays cheap; content ids are unchanged.
+    // status stays cheap; content ids are unchanged. An unmerged path has no
+    // stage-0 entry to refresh and its worktree file is a conflicted merge, so
+    // it is left out.
     let fresh = stats_by_path(&subset);
-    for path in &matched {
+    for path in matched.iter().filter(|p| !unmerged.contains_key(p.as_bstr())) {
         if let Ok(idx) = index.entry_index_by_path(BStr::new(path)) {
             if let Some((id, mode, stat)) = fresh.get(path) {
                 let e = &mut index.entries_mut()[idx];
@@ -1821,13 +2338,268 @@ pub(super) fn ensure_clean(
     cur_tree: ObjectId,
     target_tree: ObjectId,
 ) -> Result<Option<ExitCode>> {
+    match switch_gate(repo, cur_tree, target_tree, None)? {
+        Gate::Clean => Ok(None),
+        Gate::Refused(code) => Ok(Some(code)),
+        Gate::Autostashed(_) => unreachable!("no -m was passed, so nothing is ever stashed"),
+    }
+}
+
+/// `-m` / `--merge`, and the `--conflict=<style>` that implies it.
+#[derive(Clone, Copy)]
+pub(super) struct MergeOpt<'a> {
+    /// The conflict style the re-applied changes are marked up with — `merge`,
+    /// `diff3` or `zdiff3`, already resolved from `--conflict=<style>` or
+    /// `merge.conflictStyle`. It reaches the stash re-apply through
+    /// [`crate::merge_apply::three_way_merge_styled`], so all three styles write
+    /// the markers stock writes.
+    pub style: &'a str,
+    /// The switch target **as spelled on the command line**: the stash message
+    /// (`autostash while switching to '<name>'`) and the `ours` side of every
+    /// conflict marker are written with it, so `git checkout -m <sha>` marks up
+    /// with the id the user typed and not with a branch name. The pathspec form
+    /// has no target and ignores it: `checkout_merged()` labels its three sides
+    /// `base`/`ours`/`theirs` whatever the operands were.
+    pub name: &'a str,
+}
+
+/// What the two-way `unpack_trees()` gate decided.
+pub(super) enum Gate {
+    /// Nothing in the way: check the target tree out as usual.
+    Clean,
+    /// `-m` took over: the local changes are in this stash-like commit and the
+    /// worktree and index are back at `HEAD`, so the checkout can proceed. The
+    /// commit is re-applied by [`apply_switch_autostash`] once the target tree
+    /// is in place.
+    Autostashed(ObjectId),
+    /// Refused, with the exit code to return.
+    Refused(ExitCode),
+}
+
+/// `merge_working_tree()`'s two-way `unpack_trees()` and, when it refuses and
+/// `-m` was given, the autostash that replaces it.
+///
+/// git 2.55 no longer does the "real merge" in place. When the two-way unpack
+/// fails, `-m` stashes the local changes (`autostash while switching to
+/// '<name>'`), lets the now-clean switch happen, and re-applies the stash with a
+/// three-way merge afterwards — which is why the local changes come back
+/// *unstaged*, why a conflicting re-apply leaves the snapshot in `refs/stash`,
+/// and why the run still exits 0. Only the *tracked* refusals are stashable: an
+/// untracked file standing where the target tree has one is not a local change
+/// git can carry, so `-m` does not apply and the refusal stands.
+pub(super) fn switch_gate(
+    repo: &gix::Repository,
+    cur_tree: ObjectId,
+    target_tree: ObjectId,
+    merge: Option<MergeOpt<'_>>,
+) -> Result<Gate> {
     let index = repo.index_or_load_from_head_or_empty()?;
     let clobber = crate::merge_guard::verify_two_way(repo, cur_tree, target_tree, &index)?;
     if clobber.is_empty() {
-        return Ok(None);
+        return Ok(Gate::Clean);
     }
-    clobber.report("checkout");
-    Ok(Some(ExitCode::from(1)))
+    let refuse = |clobber: &crate::merge_guard::Clobber| {
+        clobber.report("checkout");
+        Ok(Gate::Refused(ExitCode::from(1)))
+    };
+    let Some(opt) = merge else {
+        return refuse(&clobber);
+    };
+    // `verify_absent()`'s two buckets: `-m` has nothing to stash for them, and
+    // git leaves the same refusal in place.
+    if !clobber.untracked_overwritten.is_empty() || !clobber.untracked_removed.is_empty() {
+        return refuse(&clobber);
+    }
+    // `if (!old_branch_info->commit) return 1;` — there is no base to merge the
+    // local changes against, so the two-way refusal is the whole answer.
+    if repo.head_id().is_err() {
+        return refuse(&clobber);
+    }
+    let stash = super::stash::create_autostash_msg(
+        repo,
+        &format!("autostash while switching to '{}'", opt.name),
+    )?;
+    Ok(Gate::Autostashed(stash))
+}
+
+/// `opts->merge` packaged for a switch: `None` when `-m` was not given, and
+/// otherwise the conflict style plus the target **as the user spelled it**,
+/// which is the name both the stash message and the `ours` conflict label carry.
+fn merge_opt<'a>(merge: bool, style: &'a str, name: &'a str) -> Option<MergeOpt<'a>> {
+    merge.then_some(MergeOpt { style, name })
+}
+
+/// `merge_working_tree()` as every switch in this file runs it: gate the move,
+/// write the target tree out, and put back whatever `-m` had to stash to get
+/// there. Returns the exit code of a refusal, or `None` when the worktree moved.
+///
+/// Called only when the two trees actually differ, which is the caller's own
+/// `target_tree != cur_tree` test: an identical-tree switch has no path for
+/// `twoway_merge()` to reject and nothing to carry.
+pub(super) fn move_worktree(
+    repo: &gix::Repository,
+    cur_tree: ObjectId,
+    target_tree: ObjectId,
+    merge: Option<MergeOpt<'_>>,
+) -> Result<Moved> {
+    // The base label is the branch being *left*, so it is read before `HEAD`
+    // moves — which, on every path here, is after this function returns.
+    let base_label = old_head_label(repo)?;
+    match switch_gate(repo, cur_tree, target_tree, merge)? {
+        Gate::Refused(code) => Ok(Moved::Refused(code)),
+        Gate::Clean => {
+            update_worktree_to_tree(repo, cur_tree, target_tree)?;
+            Ok(Moved::Clean)
+        }
+        Gate::Autostashed(stash) => {
+            update_worktree_to_tree(repo, cur_tree, target_tree)?;
+            let opt = merge.expect("only `-m` ever stashes");
+            apply_switch_autostash(repo, stash, target_tree, opt, base_label.as_deref())?;
+            Ok(Moved::Autostashed)
+        }
+    }
+}
+
+/// What [`move_worktree`] did, because the caller has to print differently for
+/// the two outcomes.
+///
+/// ```c
+/// if (do_merge) {
+///         ret = merge_working_tree(…, opts->merge, &writeout_error);
+///         if (ret == MERGE_WORKING_TREE_UNPACK_FAILED && opts->merge) {
+///                 create_autostash_ref(…);  created_autostash = 1;
+///                 ret = merge_working_tree(…, false, &writeout_error);
+///         }
+///         if (created_autostash) { … apply_autostash_ref(…); }
+///         …
+/// }
+/// update_refs_for_switch(opts, &old_branch_info, new_branch_info);
+/// if (created_autostash) {
+///         discard_index(the_repository->index);
+///         if (repo_read_index(the_repository) < 0) die(_("index file corrupt"));
+///         if (!opts->quiet && new_branch_info->commit) {
+///                 printf(_("The following paths have local changes:\n"));
+///                 show_local_changes(&new_branch_info->commit->object, &opts->diff_options);
+///         }
+/// }
+/// ```
+/// (builtin/checkout.c:1215-1272.) The listing an autostashed switch prints is a
+/// *second* one, headed and emitted **after** `update_refs_for_switch()` has
+/// announced the switch — not the one at the tail of `merge_working_tree()`,
+/// which the retry ran with `merge = false` and therefore against an index that
+/// no longer holds the re-applied changes.
+#[must_use]
+pub(super) enum Moved {
+    /// The two-way merge carried everything across; the caller prints the
+    /// ordinary `merge_working_tree()` listing before it moves `HEAD`.
+    Clean,
+    /// `-m` stashed and re-applied; the caller prints the headed listing after
+    /// it moves `HEAD`.
+    Autostashed,
+    /// The gate refused; this is the exit code, and nothing moved.
+    Refused(ExitCode),
+}
+
+/// The second half of [`switch_gate`]'s `-m`: re-apply the stashed local changes
+/// on top of the tree that was just checked out.
+///
+/// The three sides are the stash's own base (the tree `HEAD` held when it was
+/// made), *ours* (the tree just checked out) and *theirs* (the stashed
+/// worktree). A clean re-apply leaves the changes **unstaged** — the index goes
+/// back to the target tree — and says `Applied autostash.`; a conflicting one
+/// keeps the conflicted index, hands the snapshot to `refs/stash` so the wording
+/// about `git stash pop` is true, and still lets the switch stand.
+pub(super) fn apply_switch_autostash(
+    repo: &gix::Repository,
+    stash: ObjectId,
+    ours_tree: ObjectId,
+    opt: MergeOpt<'_>,
+    base_label: Option<&str>,
+) -> Result<()> {
+    let commit = repo.find_commit(stash)?;
+    let Some(parent) = commit.parent_ids().next() else {
+        return Err(crate::fatal::die("autostash commit has no base"));
+    };
+    let base = repo.find_commit(parent.detach())?.tree_id()?.detach();
+    let theirs = commit.tree_id()?.detach();
+    let old_index = repo.index_or_load_from_head()?.into_owned();
+
+    // `--label-ours` / `--label-theirs` / `--label-base`, which is how
+    // `builtin/checkout.c` spells the sides to the `git stash apply` it runs.
+    let labels = gix::merge::blob::builtin_driver::text::Labels {
+        ancestor: base_label.map(|l| BStr::new(l.as_bytes())),
+        current: Some(BStr::new(opt.name.as_bytes())),
+        other: Some(BStr::new(b"local")),
+    };
+    let should_interrupt = AtomicBool::new(false);
+    // The re-apply is `git stash apply --quiet`, so its own `Auto-merging` /
+    // `CONFLICT (…)` block is suppressed and only the wording below is printed.
+    // `--conflict=<style>` shapes the markers it leaves behind; the style was
+    // validated at parse time, so an unknown one cannot reach here.
+    let applied = crate::merge_apply::three_way_merge_styled(
+        repo,
+        base,
+        ours_tree,
+        theirs,
+        &old_index,
+        labels,
+        &should_interrupt,
+        false,
+        crate::merge_apply::conflict_style(opt.style),
+    )?;
+
+    if applied.conflicts.is_empty() {
+        // `stash apply` without `--index`: the restored changes come back
+        // unstaged, so the index stays the target tree — which is exactly what
+        // the checkout just wrote, stat data and all. Rebuilding it from the
+        // tree here instead would drop that stat data and make the next
+        // `diff-index` call it modified: `show_local_changes()` runs right after
+        // this and would list every file in the tree.
+        eprintln!("Applied autostash.");
+    } else {
+        let mut index = applied.index;
+        index.write(Default::default())?;
+        super::stash::store_commit(
+            repo,
+            stash,
+            &format!("autostash while switching to '{}'", opt.name),
+        )?;
+        eprintln!("Your local changes are stashed, however applying them");
+        eprintln!("resulted in conflicts.  You can either resolve the conflicts");
+        eprintln!("and then discard the stash with \"git stash drop\", or, if you");
+        eprintln!("do not want to resolve them now, run \"git reset --hard\" and");
+        eprintln!("apply the local changes later by running \"git stash pop\".");
+    }
+    Ok(())
+}
+
+/// `o.ancestor`: the branch the switch is leaving, or its abbreviated commit id
+/// when `HEAD` was already detached — the `|||||||` label of a diff3-style
+/// conflict, and the base label the re-apply is given either way.
+///
+/// ```c
+/// if (old_branch_info.name) {
+///         stash_label_base = old_branch_info.name;
+/// } else if (old_branch_info.commit) {
+///         strbuf_add_unique_abbrev(&old_commit_shortname,
+///                                  &old_branch_info.commit->object.oid, DEFAULT_ABBREV);
+///         stash_label_base = old_commit_shortname.buf;
+/// }
+/// ```
+/// (builtin/checkout.c:1205-1212.) `stash_label_base` stays NULL when `HEAD` has
+/// neither — the same "gently" peel as [`head_label`] — and reaches
+/// `apply_autostash_ref()` as an absent `--label-base`. Returning an error there
+/// instead stopped every non-forced checkout out of a `HEAD` holding an id this
+/// repository does not have, which is exactly the state a checkout is the way
+/// out of. `name` is the *branch* name, so it is taken only under `refs/heads/`.
+pub(super) fn old_head_label(repo: &gix::Repository) -> Result<Option<String>> {
+    let head = repo.head()?;
+    if let Some(name) = head.referent_name() {
+        if let Some(short) = name.as_bstr().strip_prefix(b"refs/heads/") {
+            return Ok(Some(short.to_str_lossy().into_owned()));
+        }
+    }
+    Ok(peeled_head_commit(repo, &head).map(|id| id.attach(repo).shorten_or_id().to_string()))
 }
 
 /// Move a clean worktree and its index from the current state to `new_tree`,
@@ -2116,7 +2888,7 @@ fn set_head_symbolic(
             .map_err(|e| anyhow!("invalid ref name HEAD: {e}"))?,
         deref: false,
     })?;
-    record_head_move(repo, from, to, message);
+    append_head_log(repo, from, to, message);
     Ok(())
 }
 
@@ -2235,16 +3007,86 @@ fn set_head_detached(
     Ok(())
 }
 
-/// Human label for the current `HEAD` used in reflog "moving from …" messages:
-/// the short branch name, else the abbreviated detached hash, else "(unborn)".
-fn head_label(head: &gix::Head<'_>) -> String {
+/// Human label for the current `HEAD` used in reflog "moving from …" messages.
+///
+/// `update_refs_for_switch()`:
+///
+/// ```c
+/// old_desc = old_branch_info->name;
+/// if (!old_desc && old_branch_info->commit)
+///         old_desc = oid_to_hex(&old_branch_info->commit->object.oid);
+/// ```
+///
+/// so a detached `HEAD` contributes the **full** id, not the abbreviation the
+/// `Previous HEAD position was …` line carries.
+fn head_label(repo: &gix::Repository, head: &gix::Head<'_>) -> String {
+    // ```c
+    // old_branch_info.path = refs_resolve_refdup(…, "HEAD", 0, &rev, &flag);
+    // if (old_branch_info.path)
+    //         old_branch_info.commit = lookup_commit_reference_gently(r, &rev, 1);
+    // if (!(flag & REF_ISSYMREF))
+    //         FREE_AND_NULL(old_branch_info.path);
+    // if (old_branch_info.path) {
+    //         const char *const prefix = "refs/heads/";
+    //         const char *p;
+    //         if (skip_prefix(old_branch_info.path, prefix, &p))
+    //                 old_branch_info.name = xstrdup(p);
+    // }
+    // …
+    // old_desc = old_branch_info->name;
+    // if (!old_desc && old_branch_info->commit)
+    //         old_desc = oid_to_hex(&old_branch_info->commit->object.oid);
+    // strbuf_addf(&msg, "checkout: moving from %s to %s",
+    //             old_desc ? old_desc : "(invalid)", new_branch_info->name);
+    // ```
+    // (builtin/checkout.c:1172-1185, 994-1000.) Three shapes, all measured
+    // against git 2.55.0:
+    //
+    //   * `HEAD` symbolic under `refs/heads/` → the short branch name.
+    //   * anything else that still peels to a commit — a detached `HEAD`, or a
+    //     symref to `refs/tags/…`/`refs/foo/bar` — → the **peeled commit's** full
+    //     hex. Not the name, and not `HEAD`'s raw target: detaching at an
+    //     annotated tag's own id records the commit the tag points at.
+    //   * `HEAD` peeling to no commit at all — a detached `HEAD` holding a blob's
+    //     id, or an id this repository does not have → `(invalid)`.
     if let Some(name) = head.referent_name() {
-        name.shorten().to_string()
-    } else if let Some(id) = head.id() {
-        id.shorten_or_id().to_string()
-    } else {
-        "(unborn)".to_string()
+        if let Some(short) = name.as_bstr().strip_prefix(b"refs/heads/") {
+            return short.to_str_lossy().into_owned();
+        }
     }
+    match peeled_head_commit(repo, head) {
+        Some(id) => id.to_string(),
+        None => "(invalid)".to_string(),
+    }
+}
+
+/// The tree the two-way merge starts from:
+/// `old_commit_oid = old_branch_info->commit ? &…->object.oid : the_hash_algo->empty_tree;`
+/// (builtin/checkout.c:904-906).
+///
+/// A `HEAD` that peels to no commit is the **empty tree**, not an error — the
+/// same "gently" rule as [`peeled_head_commit`]. `head_tree_id_or_empty()` only
+/// forgives an *unborn* `HEAD`, so a detached `HEAD` holding a blob's id or an
+/// id this repository lacks reached the caller as a gix type error and stopped
+/// the checkout that was the way out of it.
+fn head_tree_or_empty(repo: &gix::Repository) -> Result<ObjectId> {
+    let head = repo.head()?;
+    Ok(match peeled_head_commit(repo, &head) {
+        Some(id) => repo.find_object(id)?.peel_to_commit()?.tree_id()?.detach(),
+        None => repo.empty_tree().id().detach(),
+    })
+}
+
+/// `lookup_commit_reference_gently(the_repository, &rev, 1)` on whatever `HEAD`
+/// resolves to: the commit it peels to, or `None` — never an error.
+///
+/// Everything `git checkout` reads out of the old `HEAD` goes through this
+/// "gently" lookup, which is why stock can switch *away* from a `HEAD` holding a
+/// blob's id or an id the object database does not have. Peeling strictly
+/// instead turns that recoverable state into a wall the user cannot get past.
+fn peeled_head_commit(repo: &gix::Repository, head: &gix::Head<'_>) -> Option<ObjectId> {
+    let id = head.id()?;
+    Some(repo.find_object(id).ok()?.peel_to_commit().ok()?.id)
 }
 
 /// Abbreviated hash + commit summary for `HEAD is now at …` / `Previous HEAD …`.

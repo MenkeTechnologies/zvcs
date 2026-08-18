@@ -168,6 +168,66 @@ pub fn strtol_all(arg: &str) -> Option<i64> {
     Some(if negative { -acc } else { acc })
 }
 
+/// Why `git_parse_signed()` (config.c) refused a value: `errno == ERANGE` or
+/// `errno == EINVAL`, which `die_bad_number()` reports as `out of range` and
+/// `invalid unit` respectively.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NumError {
+    /// The digits, or the digits times their unit, did not fit the target type.
+    OutOfRange,
+    /// No digits at all, or a suffix that is not one of `k`/`m`/`g`.
+    InvalidUnit,
+}
+
+/// `git_parse_int()` (config.c): [`parse_signed`] bounded by a C `int`, which is
+/// the width `git_config_int()`, `git_config_bool_or_int()` and
+/// `git_parse_maybe_bool()`'s integer fallback all use.
+pub fn config_int(value: &str) -> Result<i64, NumError> {
+    parse_config_signed(value, upper_bound(4))
+}
+
+/// `git_parse_int64()` (config.c): the same grammar over an `int64_t`, which is
+/// what `git config --type=int` reads its value with.
+pub fn config_int64(value: &str) -> Result<i64, NumError> {
+    parse_config_signed(value, i64::MAX)
+}
+
+fn parse_config_signed(value: &str, max: i64) -> Result<i64, NumError> {
+    match parse_signed(value, max) {
+        Ok(v) => Ok(v),
+        Err(ParseFail::Range) => Err(NumError::OutOfRange),
+        Err(ParseFail::Invalid) => Err(NumError::InvalidUnit),
+    }
+}
+
+/// `git_parse_maybe_bool_text()` (config.c): the *word* half of git's boolean
+/// grammar — `true`/`yes`/`on` and `false`/`no`/`off`, case-insensitively, and
+/// the empty string for **false**. `None` leaves the value to the integer
+/// reader, which is what `--type=bool-or-int` depends on.
+///
+/// git's `NULL` value — a key written with no `=` at all — is the caller's to
+/// recognise; C answers `1` for it before ever looking at the text.
+pub fn maybe_bool_text(value: &str) -> Option<bool> {
+    match value.to_ascii_lowercase().as_str() {
+        "" | "false" | "no" | "off" => Some(false),
+        "true" | "yes" | "on" => Some(true),
+        _ => None,
+    }
+}
+
+/// `git_parse_maybe_bool()` (config.c): the words first, then any integer
+/// `git_parse_int()` reads, as its truthiness. `None` is git's `-1`, which every
+/// caller turns into `bad boolean config value`.
+///
+/// The integer half is the full base-0 grammar, so `0x10` and `1k` are true,
+/// `0x0` is false, and a value past `int` range is not a boolean at all.
+pub fn maybe_bool(value: &str) -> Option<bool> {
+    if let Some(b) = maybe_bool_text(value) {
+        return Some(b);
+    }
+    config_int(value).ok().map(|n| n != 0)
+}
+
 fn range_error(name: &OptName, arg: &str, lower: i64, upper: i64) -> IntError {
     IntError::OutOfRange(format!("value {arg} for {name} not in range [{lower},{upper}]"))
 }
@@ -379,6 +439,41 @@ mod tests {
         assert_eq!(strtol_all("0x10"), None);
         assert_eq!(strtol_all("1k"), None);
         assert_eq!(strtol_all(""), None);
+    }
+
+    /// `git_parse_maybe_bool()` reads its integer half with the *same* base-0
+    /// grammar, bounded by `int`. Measured from stock git 2.55.0 with
+    /// `git config --type=bool` over each stored value.
+    #[test]
+    fn maybe_bool_uses_the_base_zero_integer_fallback() {
+        assert_eq!(maybe_bool("0x10"), Some(true));
+        assert_eq!(maybe_bool("0x0"), Some(false));
+        assert_eq!(maybe_bool("010"), Some(true));
+        assert_eq!(maybe_bool("1k"), Some(true));
+        assert_eq!(maybe_bool("-1k"), Some(true));
+        assert_eq!(maybe_bool(""), Some(false));
+        assert_eq!(maybe_bool("ON"), Some(true));
+        assert_eq!(maybe_bool("False"), Some(false));
+        // `08` is an octal `0` with an unreadable `8` suffix, not eight.
+        assert_eq!(maybe_bool("08"), None);
+        assert_eq!(maybe_bool("12 "), None);
+        // Past `int` range it is not a boolean, though it is still an int64.
+        assert_eq!(maybe_bool("2147483648"), None);
+        assert_eq!(maybe_bool("-2147483648"), Some(true));
+        assert_eq!(config_int64("2147483648"), Ok(2147483648));
+    }
+
+    /// The two failures git distinguishes, because `die_bad_number()` prints
+    /// different words for them.
+    #[test]
+    fn config_int_separates_range_from_unit() {
+        assert_eq!(config_int("0x10"), Ok(16));
+        assert_eq!(config_int("010"), Ok(8));
+        assert_eq!(config_int("  12"), Ok(12));
+        assert_eq!(config_int("2147483648"), Err(NumError::OutOfRange));
+        assert_eq!(config_int("08"), Err(NumError::InvalidUnit));
+        assert_eq!(config_int(""), Err(NumError::InvalidUnit));
+        assert_eq!(config_int64("9223372036854775808"), Err(NumError::OutOfRange));
     }
 
     /// A short option is named `switch \`c'`, which is what `git apply -C` and

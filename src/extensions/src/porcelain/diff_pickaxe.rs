@@ -73,22 +73,31 @@ pub(super) fn compile_regex(pat: &[u8]) -> std::result::Result<Regex, String> {
         .map_err(|e| e.to_string())
 }
 
-/// Occurrences of `needle` in `haystack`, counted without overlap, as git's kwset does.
+/// Occurrences of `needle` in `haystack`, counted without overlap, as git's kwset
+/// does — `diffcore_count_changes()`'s `contains()` walks forward past each whole
+/// match rather than by one byte, so `aa` occurs once in `aaa`, not twice.
+///
+/// The empty needle answers 0 rather than "one per position": git's `-S` callers
+/// test `if (!len)` before ever asking, and `--find-object`'s empty case never
+/// reaches here.
+///
+/// `memmem` is a vectorized substring search (git gets the same effect from its
+/// kwset); the skip-forward fold turns its overlapping matches into git's
+/// non-overlapping count. A byte-at-a-time loop reads a multi-megabyte blob far
+/// more slowly for the same answer — see the equivalence test below.
 pub(super) fn count_occurrences(haystack: &[u8], needle: &[u8]) -> usize {
     if needle.is_empty() || needle.len() > haystack.len() {
         return 0;
     }
-    let mut count = 0;
-    let mut at = 0;
-    while at + needle.len() <= haystack.len() {
-        if &haystack[at..at + needle.len()] == needle {
-            count += 1;
-            at += needle.len();
-        } else {
-            at += 1;
-        }
-    }
-    count
+    memchr::memmem::find_iter(haystack, needle)
+        .fold((0usize, 0usize), |(n, next), at| {
+            if at >= next {
+                (n + 1, at + needle.len())
+            } else {
+                (n, next)
+            }
+        })
+        .0
 }
 
 pub(super) fn contains(haystack: &[u8], needle: &[u8]) -> bool {
@@ -207,6 +216,70 @@ impl Kind {
                 (None, Some(t)) | (Some(t), None) => needle.is_match(t),
                 (Some(a), Some(b)) => changed_lines_hit(a, b, needle),
             },
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::count_occurrences;
+
+    /// The byte-at-a-time walk this used to be, kept as the reference the fast
+    /// path is measured against.
+    fn naive(haystack: &[u8], needle: &[u8]) -> usize {
+        if needle.is_empty() || needle.len() > haystack.len() {
+            return 0;
+        }
+        let mut count = 0;
+        let mut at = 0;
+        while at + needle.len() <= haystack.len() {
+            if &haystack[at..at + needle.len()] == needle {
+                count += 1;
+                at += needle.len();
+            } else {
+                at += 1;
+            }
+        }
+        count
+    }
+
+    /// Overlapping candidates are the whole point: `aa` in `aaaa` is 2, not 3.
+    #[test]
+    fn non_overlapping_like_kwset() {
+        assert_eq!(count_occurrences(b"aaaa", b"aa"), 2);
+        assert_eq!(count_occurrences(b"aaa", b"aa"), 1);
+        assert_eq!(count_occurrences(b"abababa", b"aba"), 2);
+        assert_eq!(count_occurrences(b"", b"a"), 0);
+        assert_eq!(count_occurrences(b"a", b""), 0);
+        assert_eq!(count_occurrences(b"a", b"aa"), 0);
+    }
+
+    /// Exhaustive equivalence with the reference walk over a small alphabet, so
+    /// the swap to `memmem` cannot have changed any answer.
+    #[test]
+    fn agrees_with_the_naive_walk() {
+        let alphabet = b"ab";
+        let mut hays: Vec<Vec<u8>> = vec![Vec::new()];
+        for _ in 0..8 {
+            let mut next = Vec::new();
+            for h in &hays {
+                for &c in alphabet {
+                    let mut v = h.clone();
+                    v.push(c);
+                    next.push(v);
+                }
+            }
+            hays.extend(next);
+        }
+        let needles: Vec<&[u8]> = vec![b"a", b"b", b"aa", b"ab", b"aba", b"abab", b"bbbb"];
+        for h in &hays {
+            for n in &needles {
+                assert_eq!(
+                    count_occurrences(h, n),
+                    naive(h, n),
+                    "haystack {h:?} needle {n:?}"
+                );
+            }
         }
     }
 }

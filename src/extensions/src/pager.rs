@@ -50,6 +50,63 @@ struct Pager {
 
 static PAGER: Mutex<Option<Pager>> = Mutex::new(None);
 
+/// `term_columns()` (`pager.c:203`): the cached `$COLUMNS` when it `atoi`s to a
+/// positive number, else the `TIOCGWINSZ` probe on fd 1, else 80.
+///
+/// The probe is deliberately absent — the vendored crates expose no `ioctl`, and
+/// every consumer here (the `--stat` geometry, `column`'s layout,
+/// `%<|(-<N>)` padding) is compared against a captured pipe, where the C's
+/// `ioctl(1, …)` fails and it falls through to the same 80. A tty-attached run
+/// with `COLUMNS` unset therefore uses 80 where git would use the window width.
+///
+/// The parse is `atoi()`, not `strtol` with error checking and not "the leading
+/// digit run": optional whitespace, an optional sign, then digits, with whatever
+/// follows ignored. `COLUMNS=+100` is 100 — a digits-only reader answers 80 —
+/// `COLUMNS=1-2` is 1, and `COLUMNS=-5` is -5, which is not positive and so
+/// falls through to 80. Three copies of this had disagreed on exactly those
+/// cases.
+pub(crate) fn term_columns() -> i64 {
+    if let Ok(value) = std::env::var("COLUMNS") {
+        if let Some(n) = atoi(value.as_bytes()) {
+            if n > 0 {
+                return n;
+            }
+        }
+    }
+    80
+}
+
+/// C's `atoi()` over bytes: `isspace`* `[+-]?` `[0-9]*`, trailing junk ignored.
+/// `None` is C's "no conversion performed", which it reports as 0 and every
+/// caller here treats the same way.
+fn atoi(s: &[u8]) -> Option<i64> {
+    let mut i = 0;
+    while matches!(s.get(i), Some(b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r')) {
+        i += 1;
+    }
+    let negative = match s.get(i) {
+        Some(b'-') => {
+            i += 1;
+            true
+        }
+        Some(b'+') => {
+            i += 1;
+            false
+        }
+        _ => false,
+    };
+    let start = i;
+    let mut n: i64 = 0;
+    while let Some(d) = s.get(i).filter(|c| c.is_ascii_digit()) {
+        n = n.saturating_mul(10).saturating_add(i64::from(d - b'0'));
+        i += 1;
+    }
+    if i == start {
+        return None;
+    }
+    Some(if negative { -n } else { n })
+}
+
 /// Decide whether to page `cmd` and, if so, install the pager over stdout.
 ///
 /// `forced` carries the command-line choice: `Some(true)` for `-p`/`--paginate`,
@@ -197,4 +254,26 @@ fn env_flag(name: &str) -> bool {
 /// `$GIT_PAGER` / `$PAGER` and moves down the chain).
 fn env_nonempty(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.is_empty())
+}
+
+#[cfg(test)]
+mod term_columns_tests {
+    use super::atoi;
+
+    /// C's `atoi`, which is what `term_columns()` runs on `$COLUMNS`. The `+`
+    /// sign and the embedded-junk cases are the ones the three former copies
+    /// disagreed on.
+    #[test]
+    fn atoi_is_c_atoi() {
+        assert_eq!(atoi(b"100"), Some(100));
+        assert_eq!(atoi(b"+100"), Some(100));
+        assert_eq!(atoi(b"-5"), Some(-5));
+        assert_eq!(atoi(b"  96  "), Some(96));
+        assert_eq!(atoi(b"1-2"), Some(1));
+        assert_eq!(atoi(b"120junk"), Some(120));
+        assert_eq!(atoi(b"0"), Some(0));
+        assert_eq!(atoi(b"abc"), None);
+        assert_eq!(atoi(b""), None);
+        assert_eq!(atoi(b"+"), None);
+    }
 }

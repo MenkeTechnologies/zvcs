@@ -35,6 +35,7 @@ pub mod precompose;
 pub mod progress;
 pub mod quote;
 pub mod rcache;
+pub mod refsort;
 pub mod revfilter;
 pub mod sequencer;
 pub mod setup;

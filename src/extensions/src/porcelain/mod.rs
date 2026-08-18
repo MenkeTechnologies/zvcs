@@ -526,6 +526,7 @@ mod diff_index;
 mod diff_optval;
 mod diff_pairs;
 mod diff_pickaxe;
+pub(crate) mod diffstat;
 mod diff_tree;
 /// The diffcore rename/copy/break passes shared by the diff-producing commands.
 mod diffcore_rename;

@@ -1907,78 +1907,149 @@ fn resolve_spec(repo: &gix::Repository, spec: &str) -> Result<Resolved> {
     // not either and the walkers do it here.
     crate::objname::warn_ambiguous_refname(repo, crate::objname::uninteresting_mark(spec).0);
 
+    // `repo_interpret_branch_name()` rewrites the whole operand before either
+    // `get_oid_basic()` or `add_reflog_for_walk()` sees it, so `git reflog show @`
+    // reads HEAD's log and `git reflog show <branch>@{u}` reads the upstream's.
+    let rewritten;
+    let spec: &str = match crate::objname::interpret_branch_name(repo, spec) {
+        Some(Ok(name)) => {
+            rewritten = name;
+            rewritten.as_str()
+        }
+        Some(Err(message)) => {
+            eprintln!("fatal: {message}");
+            return Ok(Resolved::Fatal(128));
+        }
+        None => spec,
+    };
+
     let (base, selector) = split_selector(spec);
 
-    let entries = read_entries(repo, base)?;
-
+    // `get_oid_basic()` resolves the operand before `add_reflog_for_walk()` ever
+    // opens a log, and which lookup it uses depends on whether a selector was
+    // typed:
+    //
+    // ```c
+    // if (!len && reflog_len)
+    //         /* allow "@{...}" to mean the current branch reflog */
+    //         refs_found = repo_dwim_ref(r, "HEAD", 4, oid, &real_ref, !fatal);
+    // else if (reflog_len)
+    //         refs_found = repo_dwim_log(r, str, len, oid, &real_ref);
+    // else
+    //         refs_found = repo_dwim_ref(r, str, len, oid, &real_ref, !fatal);
+    // if (!refs_found)
+    //         return -1;
+    // ```
+    // (`object-name.c:742-751`)
+    //
+    // Both dwims insist the name resolves *to an object*, which is what makes a
+    // stale `logs/HEAD` under an unborn HEAD a fatal rather than a listing: the
+    // log file is there, but `HEAD` names no commit.
     match selector {
-        None => {
-            let Some(entries) = entries else {
-                // Not a ref with a log, so `setup_revisions()` decides the
-                // operand's fate the way it decides every other one:
-                //
-                // ```c
-                // if (get_oid_with_context(revs->repo, arg, get_sha1_flags, &oid, &oc)) {
-                //         ret = revs->ignore_missing ? 0 : -1;
-                //         goto out;
-                // }
-                // if (!cant_be_filename)
-                //         verify_non_filename(the_repository, revs->prefix, arg);
-                // object = get_reference(revs, arg, &oid, flags ^ local_flags);
-                // ```
-                //
-                // `get_oid_with_context()` is the full-hex rule — an id the
-                // repository does not have still resolves, without the object
-                // database being consulted — and `get_reference()` then
-                // `parse_object()`s it and `die(_("bad object %s"), name)`s.
-                // Only a name that resolves to nothing at all reaches
-                // `setup_revisions()`'s `ambiguous argument` block, which is why
-                // `git reflog show <absent-40-hex>` is `bad object` in stock
-                // 2.55.0 and `git reflog show nosuchref` is not.
-                //
-                // Quiet, because this function already reached
-                // `warn_ambiguous_refname` for `spec` above and git resolves the
-                // operand once.
-                return Ok(if crate::objname::resolves_but_absent(repo, base) {
-                    eprintln!("fatal: bad object {base}");
-                    Resolved::Fatal(128)
-                } else if crate::objname::resolve_quiet(repo, base).is_some() {
-                    Resolved::Empty
-                } else {
-                    Resolved::Fatal(fatal_ambiguous(spec))
-                });
-            };
-            Ok(Resolved::Section(Section {
-                display: base.to_owned(),
-                full: full_name(repo, base),
-                start: 0,
-                selector: SelectorKind::None,
-                entries,
-            }))
-        }
-        Some(Selector::Index(n)) => {
-            let Some(entries) = entries else {
-                return Ok(Resolved::Fatal(fatal_ambiguous(spec)));
-            };
-            if entries.is_empty() {
+        Some(_) if base.is_empty() => {
+            if crate::refname::resolve_ref_reading(repo, "HEAD").is_none() {
                 return Ok(Resolved::Fatal(fatal_ambiguous(spec)));
             }
+        }
+        Some(_) => {
+            if dwim_log(repo, base).is_none() {
+                return Ok(Resolved::Fatal(fatal_ambiguous(spec)));
+            }
+        }
+        None => {
+            // `get_oid_with_context()` is the full-hex rule — an id the repository
+            // does not have still resolves, without the object database being
+            // consulted — and `get_reference()` then `parse_object()`s it and
+            // `die(_("bad object %s"), name)`s. Only a name that resolves to
+            // nothing at all reaches `setup_revisions()`'s `ambiguous argument`
+            // block, which is why `git reflog show <absent-40-hex>` is `bad object`
+            // in stock 2.55.0 and `git reflog show nosuchref` is not.
+            //
+            // Quiet, because this function already reached
+            // `warn_ambiguous_refname` for `spec` above and git resolves the
+            // operand once.
+            if crate::objname::resolves_but_absent(repo, base) {
+                eprintln!("fatal: bad object {base}");
+                return Ok(Resolved::Fatal(128));
+            }
+            if crate::objname::resolve_quiet(repo, base).is_none() {
+                return Ok(Resolved::Fatal(fatal_ambiguous(spec)));
+            }
+        }
+    }
+
+    // `add_reflog_for_walk()`: the operand with its selector cut off, and an empty
+    // one means HEAD's own target.
+    //
+    // ```c
+    // if (*branch == '\0') {
+    //         branch = refs_resolve_refdup(get_main_ref_store(the_repository), "HEAD", 0, NULL, NULL);
+    //         if (!branch)
+    //                 die("no current branch");
+    // }
+    // ```
+    // (`reflog-walk.c:187-194`)
+    let branch = if base.is_empty() {
+        match crate::refname::resolve_ref_reading(repo, "HEAD") {
+            Some(name) => name,
+            None => {
+                eprintln!("fatal: no current branch");
+                return Ok(Resolved::Fatal(128));
+            }
+        }
+    } else {
+        base.to_owned()
+    };
+
+    // ```c
+    // reflogs = read_complete_reflog(branch);
+    // if (!reflogs || reflogs->nr == 0) {
+    //         int ret = repo_dwim_log(the_repository, branch, strlen(branch), NULL, &b);
+    //         if (ret == 1) { branch = b; reflogs = read_complete_reflog(branch); }
+    // }
+    // if (!reflogs || reflogs->nr == 0)
+    //         return -1;
+    // ```
+    // (`reflog-walk.c:195-213`). The `return -1` is ignored by `add_pending_object`,
+    // so the commit is simply never queued and the walk prints nothing.
+    // `add_reflog_for_walk()` prints the operand as typed, except for a bare
+    // `@{…}`, where `branch` was replaced by HEAD's target before the log was read.
+    let display = if base.is_empty() { branch.clone() } else { base.to_owned() };
+
+    let (mut named, mut entries) = read_complete_reflog(repo, &branch)?;
+    if entries.is_empty() {
+        if let Some(dwimmed) = dwim_log(repo, &branch) {
+            let (n, e) = read_complete_reflog(repo, &dwimmed)?;
+            named = n;
+            entries = e;
+        }
+    }
+    if entries.is_empty() {
+        return Ok(Resolved::Empty);
+    }
+
+    match selector {
+        None => Ok(Resolved::Section(Section {
+            display,
+            full: named,
+            start: 0,
+            selector: SelectorKind::None,
+            entries,
+        })),
+        Some(Selector::Index(n)) => {
             if n >= entries.len() {
                 eprintln!("fatal: log for '{base}' only has {} entries", entries.len());
                 return Ok(Resolved::Fatal(128));
             }
             Ok(Resolved::Section(Section {
-                display: base.to_owned(),
-                full: full_name(repo, base),
+                display,
+                full: named,
                 start: n,
                 selector: SelectorKind::Index,
                 entries,
             }))
         }
         Some(Selector::Date(text)) => {
-            let Some(entries) = entries else {
-                return Ok(Resolved::Fatal(fatal_ambiguous(spec)));
-            };
             // `object-name.c:780`: approxidate reads the selector, and only a value with nothing
             // date-like in it is ambiguous. Dots need no rewriting — approxidate tokenizes on
             // every non-alphanumeric byte, so `2.days.ago` is native to it.
@@ -1995,15 +2066,18 @@ fn resolve_spec(repo: &gix::Repository, spec: &str) -> Result<Resolved> {
                 .unwrap_or(entries.len());
             if start == entries.len() {
                 if let Some(oldest) = entries.last() {
+                    // `show_date(co_time, co_tz, DATE_MODE(RFC2822))`
+                    // (`object-name.c:797-799`), which writes the day of the month
+                    // unpadded — `7 Apr`, not `07 Apr`.
                     eprintln!(
                         "warning: log for '{base}' only goes back to {}",
-                        oldest.time.format_or_unix(tfmt::RFC2822)
+                        super::log::show_date_rfc2822(oldest.time.seconds, oldest.time.offset)
                     );
                 }
             }
             Ok(Resolved::Section(Section {
-                display: base.to_owned(),
-                full: full_name(repo, base),
+                display,
+                full: named,
                 start,
                 // A date selector switches only this section's column to date form.
                 selector: SelectorKind::Date,
@@ -2013,14 +2087,69 @@ fn resolve_spec(repo: &gix::Repository, spec: &str) -> Result<Resolved> {
     }
 }
 
-/// Read a ref's whole reflog, flipped into git's newest-first order.
-/// `None` means the ref has no log file (or does not exist).
+/// `read_complete_reflog()` (`reflog-walk.c:68-103`): the entries `git log -g` walks
+/// for one operand, and the name it prints them under.
+///
+/// The name is the operand as handed in — `reflogs->ref = xstrdup(ref)` happens
+/// before any of the fallbacks — so `git reflog show dup` prints `dup@{0}` even
+/// though the entries came out of `logs/refs/heads/dup`. Only the *content* falls
+/// back, and it does so down a fixed chain:
+///
+/// ```c
+/// reflogs->ref = xstrdup(ref);
+/// refs_for_each_reflog_ent(refs, ref, read_one_reflog, reflogs);
+/// if (reflogs->nr == 0) {
+///         name = refs_resolve_refdup(refs, ref, RESOLVE_REF_READING, NULL, NULL);
+///         if (name)
+///                 refs_for_each_reflog_ent(refs, name, read_one_reflog, reflogs);
+/// }
+/// if (reflogs->nr == 0) {
+///         char *refname = xstrfmt("refs/%s", ref);
+///         refs_for_each_reflog_ent(refs, refname, read_one_reflog, reflogs);
+///         if (reflogs->nr == 0) {
+///                 refname = xstrfmt("refs/heads/%s", ref);
+///                 refs_for_each_reflog_ent(refs, refname, read_one_reflog, reflogs);
+///         }
+/// }
+/// ```
+///
+/// Note what the chain does *not* contain: `refs/tags/` and `refs/remotes/`. A tag
+/// and a branch may share a name and only the branch's log is ever found here.
+fn read_complete_reflog(repo: &gix::Repository, r#ref: &str) -> Result<(String, Vec<Entry>)> {
+    let mut entries = read_log_of(repo, r#ref)?;
+    if entries.is_empty() {
+        if let Some(resolved) = crate::refname::resolve_ref_reading(repo, r#ref) {
+            entries = read_log_of(repo, &resolved)?;
+        }
+    }
+    if entries.is_empty() {
+        entries = read_log_of(repo, &format!("refs/{}", r#ref))?;
+    }
+    if entries.is_empty() {
+        entries = read_log_of(repo, &format!("refs/heads/{}", r#ref))?;
+    }
+    Ok((r#ref.to_owned(), entries))
+}
+
+/// `refs_for_each_reflog_ent()` for one exact ref name, flipped into git's
+/// newest-first order. A name with no log file reads as no entries, which is what
+/// drives [`read_complete_reflog`]'s fallback chain.
+fn read_log_of(repo: &gix::Repository, name: &str) -> Result<Vec<Entry>> {
+    Ok(read_entries(repo, name)?.unwrap_or_default())
+}
+
+/// `refs_for_each_reflog_ent()` for one *exact* ref name, flipped into git's
+/// newest-first order. `None` means there is no log file under that name.
+///
+/// The name is taken literally: the files backend maps it straight onto
+/// `logs/<name>` and never dwims. That matters because [`read_complete_reflog`]
+/// walks a fallback chain of its own and a lookup that quietly answered under
+/// some other name would short-circuit it — `git reflog show dup` would then read
+/// `refs/tags/dup`'s (absent) log and stop, where git goes on to
+/// `refs/heads/dup`.
 fn read_entries(repo: &gix::Repository, name: &str) -> Result<Option<Vec<Entry>>> {
-    let Some(reference) = repo.try_find_reference(name).ok().flatten() else {
-        return Ok(None);
-    };
-    let mut platform = reference.log_iter();
-    let Some(iter) = platform.all()? else {
+    let mut buf: Vec<u8> = Vec::new();
+    let Ok(Some(iter)) = repo.refs.reflog_iter(name, &mut buf) else {
         return Ok(None);
     };
     let mut entries: Vec<Entry> = Vec::new();
@@ -2038,17 +2167,31 @@ fn read_entries(repo: &gix::Repository, name: &str) -> Result<Option<Vec<Entry>>
     Ok(Some(entries))
 }
 
-/// The full ref name behind a ref as typed, for `%gD`. Falls back to the input.
-fn full_name(repo: &gix::Repository, name: &str) -> String {
-    match repo.try_find_reference(name).ok().flatten() {
-        Some(r) => r.name().as_bstr().to_str_lossy().into_owned(),
-        None => name.to_owned(),
-    }
+/// `%gd`'s short ref: `refs_shorten_unambiguous_ref(refs, ref, 0)`.
+///
+/// ```c
+/// if (!commit_reflog->reflogs->short_ref)
+///         commit_reflog->reflogs->short_ref
+///                 = refs_shorten_unambiguous_ref(get_main_ref_store(the_repository),
+///                                                commit_reflog->reflogs->ref,
+///                                                0);
+/// ```
+/// (`reflog-walk.c:249-255`)
+///
+/// The reflog walker is the one caller that passes `strict = 0`, so a candidate
+/// here only has to survive the rules *before* the one that produced it. It is
+/// still not a prefix strip: `refs/remotes/origin/HEAD` shortens to `origin`
+/// (rule 5 carries the `/HEAD` suffix), and `refs/heads/dup` alongside
+/// `refs/tags/dup` stays `heads/dup`.
+pub(crate) fn shorten_ref_unambiguous(repo: &gix::Repository, full: &str) -> String {
+    crate::refname::shorten_unambiguous_str(repo, full, false)
 }
 
-/// git's `shorten_unambiguous_ref` for the reflog selector display (`%gd`): a full
-/// ref name is shown by its canonical short form regardless of how it was typed —
-/// `refs/heads/main` → `main`, `refs/stash` → `stash`, `HEAD` stays `HEAD`.
+/// The repository-free approximation [`crate::porcelain::log`] still calls for
+/// `%gd` on a `git log -g` walk — a plain category strip, which is *not* what
+/// `reflog-walk.c:252` does. It cannot consult the ref store for ambiguity, so
+/// `refs/remotes/origin/HEAD` comes out as `origin/HEAD` where stock prints
+/// `origin`. Use [`shorten_ref_unambiguous`] wherever a repository is in hand.
 pub(crate) fn shorten_ref(full: &str) -> String {
     if full == "HEAD" {
         return full.to_owned();
@@ -2644,11 +2787,12 @@ fn expand_one_placeholder(
         let two = b.get(i + 2).copied();
         match (one, two) {
             (Some(b'g'), Some(kind @ (b'd' | b'D'))) => {
-                // `%gd` is the short selector (git's `shorten_unambiguous_ref`:
-                // `refs/stash` → `stash`), `%gD` the full ref. Both are independent
-                // of the oneline path, which prints the ref as it was typed.
+                // `%gd` is the short selector (`refs_shorten_unambiguous_ref`
+                // against the live ref set, non-strict), `%gD` the full ref. Both
+                // are independent of the oneline path, which prints the ref as it
+                // was typed.
                 let name = if kind == b'd' {
-                    shorten_ref(&section.full)
+                    shorten_ref_unambiguous(repo, &section.full)
                 } else {
                     section.full.clone()
                 };
@@ -3753,16 +3897,61 @@ enum Selector<'a> {
 /// Split `<ref>@{<selector>}` into the ref name as typed and its selector.
 /// A spec without a trailing `@{...}` yields `(spec, None)`.
 fn split_selector(spec: &str) -> (&str, Option<Selector<'_>>) {
-    let Some(open) = spec.rfind("@{") else {
-        return (spec, None);
-    };
-    if !spec.ends_with('}') || open == 0 {
+    let b = spec.as_bytes();
+    if b.len() < 4 || b[b.len() - 1] != b'}' {
         return (spec, None);
     }
+    // ```c
+    // for (at = len-4; at >= 0; at--) {
+    //         if (str[at] == '@' && str[at+1] == '{') {
+    //                 if (str[at+2] == '-') { … nth_prior = 1; continue; }
+    //                 if (!upstream_mark(str + at, len - at) && !push_mark(str + at, len - at)) {
+    //                         reflog_len = (len-1) - (at+2);
+    //                         len = at;
+    //                 }
+    //                 break;
+    //         }
+    // }
+    // ```
+    // (`object-name.c:705-724`). `at` may be 0 — a bare `@{…}` is HEAD's own log,
+    // not a ref named `@` — and a `-` selector keeps the scan going leftwards
+    // because `@{-<n>}` is `interpret_nth_prior_checkout()`'s, not a reflog's.
+    let mut open = None;
+    for at in (0..=b.len() - 4).rev() {
+        if b[at] != b'@' || b[at + 1] != b'{' {
+            continue;
+        }
+        if b[at + 2] == b'-' {
+            continue;
+        }
+        let rest = &spec[at..];
+        let is_mark = ["@{upstream}", "@{u}", "@{push}"]
+            .iter()
+            .any(|m| rest.len() >= m.len() && rest[..m.len()].eq_ignore_ascii_case(m));
+        if !is_mark {
+            open = Some(at);
+        }
+        break;
+    }
+    let open = match open {
+        Some(at) => at,
+        None => return (spec, None),
+    };
     let inner = &spec[open + 2..spec.len() - 1];
-    match inner.parse::<usize>() {
-        Ok(n) => (&spec[..open], Some(Selector::Index(n))),
-        Err(_) => (&spec[..open], Some(Selector::Date(inner))),
+    // ```c
+    // for (i = nth = 0; 0 <= nth && i < reflog_len; i++) {
+    //         char ch = str[at+2+i];
+    //         if ('0' <= ch && ch <= '9') nth = nth * 10 + ch - '0';
+    //         else nth = -1;
+    // }
+    // if (100000000 <= nth) { at_time = nth; nth = -1; }
+    // ```
+    // An all-digit run large enough to be a unix timestamp is a *date*, not an
+    // ordinal — `main@{100000000}` asks for the log as it stood in March 1973.
+    let digits = !inner.is_empty() && inner.bytes().all(|c| c.is_ascii_digit());
+    match inner.parse::<u64>() {
+        Ok(n) if digits && n < 100_000_000 => (&spec[..open], Some(Selector::Index(n as usize))),
+        _ => (&spec[..open], Some(Selector::Date(inner))),
     }
 }
 
@@ -3968,6 +4157,7 @@ fn delete_entries(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
     let mut rewrite = false;
     let mut updateref = false;
     let mut dry_run = false;
+    let mut verbose = false;
     let mut selectors: Vec<&str> = Vec::new();
     let mut literal = false;
     for a in args {
@@ -3983,7 +4173,7 @@ fn delete_entries(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
             "--rewrite" => rewrite = true,
             "--updateref" => updateref = true,
             "-n" | "--dry-run" => dry_run = true,
-            "--verbose" => {}
+            "--verbose" => verbose = true,
             s if s.starts_with('-') && s != "-" => {
                 return Ok(super::unknown_option(s, DELETE_USAGE))
             }
@@ -3997,59 +4187,170 @@ fn delete_entries(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::from(255));
     }
 
+    // `for (i = 0; i < argc; i++) status |= reflog_delete(argv[i], flags, verbose);`
+    // (`builtin/reflog.c:328-329`): every operand is attempted, and one failure
+    // only decides the exit status.
+    let mut status = ExitCode::SUCCESS;
     for spec in selectors {
-        let Some((name, rest)) = spec.split_once("@{") else {
-            eprintln!("error: not a reflog: {spec}");
-            return Ok(ExitCode::from(255));
-        };
-        let Some(index) = rest.strip_suffix('}').and_then(|n| n.parse::<usize>().ok()) else {
-            eprintln!("error: not a reflog: {spec}");
-            return Ok(ExitCode::from(255));
-        };
-        let full = resolve_log_ref(repo, name);
-        let path = log_file(repo, &full);
-        let Some(mut lines) = read_raw_log(&path)? else {
-            eprintln!("error: reflog for '{name}' does not exist");
-            return Ok(ExitCode::from(255));
-        };
-        // `@{0}` is the newest entry, which is the last line of the file.
-        let Some(at) = lines.len().checked_sub(index + 1) else {
-            continue;
-        };
-        lines.remove(at);
-        if dry_run {
-            continue;
-        }
-        write_raw_log(&path, &lines, rewrite)?;
-        if updateref {
-            if let Some(newest) = lines.last() {
-                update_ref_to(repo, &full, newest.new)?;
-            }
+        if !delete_one(repo, spec, rewrite, updateref, dry_run, verbose)? {
+            status = ExitCode::from(255);
         }
     }
-    Ok(ExitCode::SUCCESS)
+    Ok(status)
 }
 
-/// Point `full_name` at `oid` without adding a reflog entry of its own, which is what
-/// `--updateref` does after the log was rewritten.
+/// `reflog_delete()` (`reflog.c:520-566`) for one `<ref>@{<selector>}` operand.
+/// `false` is its `error()` return.
+///
+/// ```c
+/// const char *spec = strstr(rev, "@{");
+/// if (!spec)
+///         return error(_("not a reflog: %s"), rev);
+/// if (!repo_dwim_log(the_repository, rev, spec - rev, NULL, &ref)) {
+///         status |= error(_("no reflog for '%s'"), rev);
+///         goto cleanup;
+/// }
+/// recno = strtoul(spec + 2, &ep, 10);
+/// if (*ep == '}') {
+///         opts.recno = -recno;
+///         refs_for_each_reflog_ent(refs, ref, count_reflog_ent, &opts);
+/// } else {
+///         opts.expire_total = approxidate(spec + 2);
+///         refs_for_each_reflog_ent(refs, ref, count_reflog_ent, &opts);
+///         opts.expire_total = 0;
+/// }
+/// status |= refs_reflog_expire(refs, ref, flags, …, should_prune_fn, …, &cb);
+/// ```
+///
+/// Three things a re-derivation gets wrong. The lookup is `repo_dwim_log()`, so
+/// an ambiguous `dup@{0}` finds `refs/heads/dup`'s log rather than failing. The
+/// message names the operand *as typed*, selector included. And the selector may
+/// be a date: `count_reflog_ent()` then counts the entries older than it and
+/// `expire_total` is reset to 0, which turns the date into an ordinal before the
+/// expiry walk ever runs.
+fn delete_one(
+    repo: &gix::Repository,
+    spec: &str,
+    rewrite: bool,
+    updateref: bool,
+    dry_run: bool,
+    verbose: bool,
+) -> Result<bool> {
+    let Some(at) = spec.find("@{") else {
+        eprintln!("error: not a reflog: {spec}");
+        return Ok(false);
+    };
+    let Some(full) = dwim_log(repo, &spec[..at]) else {
+        eprintln!("error: no reflog for '{spec}'");
+        return Ok(false);
+    };
+    let path = log_file(repo, &full);
+    let mut lines = read_raw_log(&path)?.unwrap_or_default();
+
+    // `strtoul(spec + 2, &ep, 10)`: leading digits, and `*ep == '}'` is what says
+    // the whole selector was the number.
+    let tail = &spec[at + 2..];
+    let digits = tail.len() - tail.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+    let mut countdown: i64 = if tail[digits..] == *"}" {
+        // `opts.recno = -recno` then one `++` per entry.
+        lines.len() as i64 - tail[..digits].parse::<i64>().unwrap_or(0)
+    } else {
+        // `if (!cb->expire_total || timestamp < cb->expire_total) cb->recno++;`
+        let target = crate::date::approxidate(tail);
+        lines.iter().filter(|l| l.time < target).count() as i64
+    };
+
+    // `refs_reflog_expire()` walks the log oldest entry first, and
+    // `should_expire_reflog_ent()` reduces — with everything but `recno` unset —
+    // to `if (cb->opts.recno && --(cb->opts.recno) == 0) return 1;`. So exactly one
+    // entry is dropped, and a countdown that never reaches 0 drops none.
+    let mut doomed: Option<usize> = None;
+    for (i, line) in lines.iter().enumerate() {
+        let expire = countdown != 0 && {
+            countdown -= 1;
+            countdown == 0
+        };
+        if expire {
+            doomed = Some(i);
+        }
+        if verbose {
+            // `printf("keep %s", message)` — the reflog message already carries its
+            // own newline, so git adds none.
+            let verb = if !expire {
+                "keep"
+            } else if dry_run {
+                "would prune"
+            } else {
+                "prune"
+            };
+            let message = match line.bytes.iter().position(|b| *b == b'\t') {
+                Some(tab) => &line.bytes[tab + 1..],
+                None => &[][..],
+            };
+            let mut out = format!("{verb} ").into_bytes();
+            out.extend_from_slice(message);
+            out.push(b'\n');
+            std::io::Write::write_all(&mut std::io::stdout(), &out)?;
+        }
+    }
+
+    if dry_run {
+        return Ok(true);
+    }
+    if let Some(i) = doomed {
+        lines.remove(i);
+        write_raw_log(&path, &lines, rewrite)?;
+    }
+    // `EXPIRE_REFLOGS_UPDATE_REF`: the files backend writes the ref straight to its
+    // lockfile, so the update leaves no reflog entry of its own.
+    if updateref {
+        if let Some(newest) = lines.last() {
+            update_ref_to(repo, &full, newest.new)?;
+        }
+    }
+    Ok(true)
+}
+
+/// Point `full_name` at `oid` without adding a reflog entry of its own, which is
+/// what `--updateref` does after the log was rewritten.
+///
+/// The files backend does this inside the lock it already holds for the log:
+///
+/// ```c
+/// if ((flags & EXPIRE_REFLOGS_UPDATE_REF) && !is_null_oid(&cb.last_kept_oid)) {
+///         if (write_ref_to_lockfile(refs, &lock, &cb.last_kept_oid, 0, &err) ||
+///             commit_ref(&lock)) { … }
+/// }
+/// ```
+/// (`refs/files-backend.c`)
+///
+/// `write_ref_to_lockfile()`/`commit_ref()` sit *below* the transaction layer, so
+/// no reflog entry is appended. A `gix` `RefEdit` cannot express that — `RefLog::Only`
+/// writes the log and not the ref (the exact inverse of what is wanted, which is
+/// what this used to do), and `RefLog::AndReference` appends an entry whenever a log
+/// file already exists, which here it always does. So the loose ref is written
+/// directly, lock file and all.
 fn update_ref_to(repo: &gix::Repository, full_name: &str, oid: ObjectId) -> Result<()> {
-    use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
-    repo.edit_reference(RefEdit {
-        change: Change::Update {
-            log: LogChange {
-                mode: RefLog::Only,
-                force_create_reflog: false,
-                message: "".into(),
-            },
-            expected: PreviousValue::Any,
-            new: gix::refs::Target::Object(oid),
-        },
-        name: full_name
-            .try_into()
-            .map_err(|e| anyhow!("invalid ref name {full_name}: {e}"))?,
-        deref: false,
-    })?;
+    let path = ref_file(repo, full_name);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let lock = path.with_extension("lock");
+    let mut body = oid.to_hex().to_string().into_bytes();
+    body.push(b'\n');
+    std::fs::write(&lock, &body)?;
+    std::fs::rename(&lock, &path)?;
     Ok(())
+}
+
+/// The loose file a ref lives in, by the same per-worktree rule as [`log_file`].
+fn ref_file(repo: &gix::Repository, full_name: &str) -> PathBuf {
+    let root = if full_name.starts_with("refs/") {
+        repo.common_dir()
+    } else {
+        repo.git_dir()
+    };
+    root.join(full_name)
 }
 
 /// `git reflog expire [--expire=<time>] [--expire-unreachable=<time>] [--all] …` — port
@@ -4349,30 +4650,10 @@ fn substitute_branch_name(repo: &gix::Repository, name: &str) -> Option<String> 
     String::from_utf8(branch).ok()
 }
 
-/// `refs_resolve_ref_unsafe(…, RESOLVE_REF_READING, …)`: the name `path` finally
-/// resolves to after following symrefs, or `None` when `path` names no reference or
-/// the chain does not end at an object.
-///
-/// gitoxide's `try_find` takes a *partial* name and will fall back to `refs/tags/`,
-/// `refs/heads/` and `refs/remotes/` on its own. This caller is already walking git's
-/// rule list itself, so a lookup that answered under a different name is discarded —
-/// otherwise every candidate would resolve and the first one would always win.
-pub(crate) fn resolve_ref_reading(repo: &gix::Repository, path: &str) -> Option<String> {
-    // git's `SYMREF_MAXDEPTH`.
-    const MAX_DEPTH: usize = 5;
-    let mut name = path.to_owned();
-    for _ in 0..MAX_DEPTH {
-        let found = repo.refs.try_find(name.as_str()).ok().flatten()?;
-        if found.name.as_bstr() != name.as_str() {
-            return None;
-        }
-        match found.target {
-            gix::refs::Target::Object(_) => return Some(name),
-            gix::refs::Target::Symbolic(next) => name = next.as_bstr().to_str_lossy().into_owned(),
-        }
-    }
-    None
-}
+/// `refs_resolve_ref_unsafe(…, RESOLVE_REF_READING, …)` — see
+/// [`crate::refname::resolve_ref_reading`], which the ref-name shortening rules
+/// need for the same reason `repo_dwim_log()` does.
+pub(crate) use crate::refname::resolve_ref_reading;
 
 /// `refs_delete_reflog()` for the files backend: unlink the log and then take the
 /// directories it left empty, up to and including `logs` itself.
@@ -4476,7 +4757,7 @@ fn write_reflog(repo: &mut gix::Repository, args: &[String]) -> Result<ExitCode>
         crate::git_fatal!(
             "cannot commit reflog update: cannot update the ref '{name}': \
              there are still logs under '{}'",
-            git_path_display(repo, &path)
+            crate::setup::git_path_display(repo, &path)
         );
     }
     if let Some(parent) = path.parent() {
@@ -4508,21 +4789,6 @@ fn df_conflicting_ref(repo: &gix::Repository, name: &str) -> Result<Option<Strin
     }
     let under = format!("{name}/");
     Ok(names.into_iter().find(|n| n.starts_with(&under)))
-}
-
-/// `git_path()`'s rendering of a path inside the git directory. `setup.c` has already
-/// moved to the top of the work tree by the time a message is printed, so an ordinary
-/// repository shows its git directory as `.git` however deep the command was run.
-fn git_path_display(repo: &gix::Repository, path: &Path) -> String {
-    let git_dir = repo.git_dir();
-    let shown = match repo.workdir() {
-        Some(top) if git_dir == top.join(".git") => Path::new(".git"),
-        _ => git_dir,
-    };
-    match path.strip_prefix(git_dir) {
-        Ok(rest) => shown.join(rest).display().to_string(),
-        Err(_) => path.display().to_string(),
-    }
 }
 
 /// One of `reflog write`'s two object arguments: a full hex id, which must name an

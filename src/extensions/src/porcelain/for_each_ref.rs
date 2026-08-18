@@ -1083,12 +1083,12 @@ pub fn for_each_ref(args: &[String]) -> Result<ExitCode> {
             _ => None,
         };
         let short = if needs_short {
-            short_name(&refname, &all_names)
+            short_name(&repo, &refname, &all_names)
         } else {
             Vec::new()
         };
         let symref_short = if needs_symref_short && !symref.is_empty() {
-            short_name(&symref, &all_names)
+            short_name(&repo, &symref, &all_names)
         } else {
             Vec::new()
         };
@@ -1517,6 +1517,11 @@ fn parse_format(
                     Some((n, a)) => (n, Some(a)),
                     None => (spec, None),
                 };
+                // `parse_ref_filter_atom()` nulls an empty sub-argument list
+                // before it reaches any parser, so `%(align:)` is `%(align)` —
+                // `expected format: %(align:<width>,<position>)`, not an
+                // unrecognized-argument error (`ref-filter.c:1092-1101`).
+                let arg = arg.filter(|a| !a.is_empty());
                 match name {
                     "end" => items.push(Item::End),
                     "align" => items.push(Item::AlignStart(parse_align(arg)?)),
@@ -1691,16 +1696,52 @@ fn parse_atom(spec: &str, ctx: &AtomCtx<'_>) -> std::result::Result<Atom, AtomEr
         Some(rest) => (rest, true),
         None => (spec, false),
     };
+    // ```c
+    // if (ep <= sp)
+    //         return strbuf_addf_ret(err, -1, _("malformed field name: %.*s"),
+    //                                (int)(ep-atom), atom);
+    // ```
+    // (`ref-filter.c:1041-1043`) — an empty name, with or without the deref `*`,
+    // is *malformed*, which is a different message from a name that simply is not
+    // in the table.
+    if body.is_empty() {
+        return Err(fatal_atom(format!("malformed field name: {spec}")));
+    }
     let (name, m) = match body.split_once(':') {
         Some((n, m)) => (n, Some(m)),
         None => (body, None),
+    };
+    // ```c
+    // if (arg) {
+    //         arg = used_atom[at].name + (arg - atom) + 1;
+    //         if (!*arg) {
+    //                 /*
+    //                  * Treat empty sub-arguments list as NULL (i.e.,
+    //                  * "%(atom:)" is equivalent to "%(atom)").
+    //                  */
+    //                 arg = NULL;
+    //         }
+    // }
+    // ```
+    // (`ref-filter.c:1092-1101`). Every atom parser therefore sees `%(refname:)` as
+    // `%(refname)`, including the ones whose no-argument case is itself a fatal —
+    // `%(align:)` is `expected format: %(align:<width>,<position>)`, not an
+    // unrecognized-argument error.
+    let m = m.filter(|a| !a.is_empty());
+    // `err_bad_arg()` cuts the atom at its first colon but keeps the deref `*`:
+    // `%(*parent:bogus)` is `unrecognized %(*parent) argument: bogus`
+    // (`ref-filter.c:272-278`).
+    let dname = if deref {
+        format!("*{name}")
+    } else {
+        name.to_string()
     };
 
     // Reject a modifier on an atom that takes none, naming the offending atom.
     let bare = |m: Option<&str>| -> std::result::Result<(), AtomError> {
         match m {
             None => Ok(()),
-            Some(m) => Err(fatal_atom(format!("unrecognized %({name}) argument: {m}"))),
+            Some(m) => Err(fatal_atom(format!("unrecognized %({dname}) argument: {m}"))),
         }
     };
 
@@ -1713,20 +1754,8 @@ fn parse_atom(spec: &str, ctx: &AtomCtx<'_>) -> std::result::Result<Atom, AtomEr
                 Field::SymRef(m)
             }
         }
-        "objectname" => Field::ObjectName(match m {
-            None => NameLen::Full,
-            Some("short") => NameLen::Auto,
-            Some(m) => match m.strip_prefix("short=") {
-                Some(n) => NameLen::Fixed(n.parse::<usize>().map_err(|_| {
-                    fatal_atom(format!("unrecognized %(objectname) argument: {m}"))
-                })?),
-                None => {
-                    return Err(fatal_atom(format!(
-                        "unrecognized %(objectname) argument: {m}"
-                    )))
-                }
-            },
-        }),
+        // `%(objectname)`, `%(tree)` and `%(parent)` share `oid_atom_parser`.
+        "objectname" => Field::ObjectName(parse_oid_mod(spec, &dname, m)?),
         "objecttype" => {
             bare(m)?;
             Field::ObjectType
@@ -1875,7 +1904,7 @@ fn parse_atom(spec: &str, ctx: &AtomCtx<'_>) -> std::result::Result<Atom, AtomEr
                 None => PersonPart::Email,
                 Some("trim") => PersonPart::EmailTrim,
                 Some("localpart") => PersonPart::EmailLocal,
-                Some(m) => return Err(fatal_atom(format!("unrecognized %({name}) argument: {m}"))),
+                Some(m) => return Err(fatal_atom(format!("unrecognized %({dname}) argument: {m}"))),
             };
             Field::Person(who(name.trim_end_matches("email")), part)
         }
@@ -1946,8 +1975,8 @@ fn parse_atom(spec: &str, ctx: &AtomCtx<'_>) -> std::result::Result<Atom, AtomEr
         }),
         // `%(tree)` / `%(parent)` share `%(objectname)`'s `oid_atom_parser`, so
         // they take the same `:short` / `:short=<n>` modifiers.
-        "tree" => Field::Tree(parse_oid_mod("tree", m)?),
-        "parent" => Field::Parent(parse_oid_mod("parent", m)?),
+        "tree" => Field::Tree(parse_oid_mod(spec, &dname, m)?),
+        "parent" => Field::Parent(parse_oid_mod(spec, &dname, m)?),
         // These four carry no `parser` in git's atom table, so git silently
         // ignores any `:arg` on them (`%(type:foo)` == `%(type)`).
         "numparent" => Field::NumParent,
@@ -1959,11 +1988,13 @@ fn parse_atom(spec: &str, ctx: &AtomCtx<'_>) -> std::result::Result<Atom, AtomEr
         n if KNOWN_ATOMS.contains(&n) => {
             return Err(unported_atom(format!("%({n}) is not ported")))
         }
-        n => return Err(fatal_atom(format!("unknown field name: {n}"))),
+        // `unknown field name: %.*s` measures `ep - atom`, i.e. from the start of
+        // the atom *including* the deref `*`, so `%(*bogus)` keeps it.
+        _ => return Err(fatal_atom(format!("unknown field name: {spec}"))),
     };
 
     if deref && matches!(field, Field::RefName(_) | Field::SymRef(_) | Field::Head) {
-        return Err(fatal_atom(format!("`*` has no meaning on %({name})")));
+        return Err(fatal_atom(format!("`*` has no meaning on %({dname})")));
     }
     Ok(Atom { deref, field })
 }
@@ -2131,7 +2162,11 @@ const MINIMUM_ABBREV: usize = 4;
 /// git's `oid_atom_parser`, shared by `%(objectname)`, `%(tree)` and
 /// `%(parent)`: `:short` picks the configured abbreviation, `:short=<n>` a fixed
 /// length (a positive integer, floored to `MINIMUM_ABBREV`).
-fn parse_oid_mod(name: &str, m: Option<&str>) -> std::result::Result<NameLen, AtomError> {
+fn parse_oid_mod(
+    spec: &str,
+    name: &str,
+    m: Option<&str>,
+) -> std::result::Result<NameLen, AtomError> {
     Ok(match m {
         None => NameLen::Full,
         Some("short") => NameLen::Auto,
@@ -2142,7 +2177,10 @@ fn parse_oid_mod(name: &str, m: Option<&str>) -> std::result::Result<NameLen, At
                     .ok()
                     .filter(|&v| v != 0)
                     .ok_or_else(|| {
-                        fatal_atom(format!("positive value expected '{n}' in %({name})"))
+                        // `_("positive value expected '%s' in %%(%s)"), arg, atom->name`
+                        // — `atom->name` is the atom exactly as written, argument
+                        // and deref `*` included.
+                        fatal_atom(format!("positive value expected '{n}' in %({spec})"))
                     })?;
                 NameLen::Fixed(len.max(MINIMUM_ABBREV))
             }
@@ -2300,14 +2338,21 @@ fn peel_chain(repo: &gix::Repository, id: ObjectId) -> Result<Vec<ObjectId>> {
 /// `*` does not cross `/`.
 fn pattern_matches(pattern: &str, refname: &[u8], ignore_case: bool) -> bool {
     let p = pattern.as_bytes();
+    // ```c
+    // if ((plen <= namelen) &&
+    //     !strncmp(refname, p, plen) &&
+    //     (refname[plen] == '\0' || refname[plen] == '/' || p[plen-1] == '/'))
+    //         return 1;
+    // if (!wildmatch(p, refname, flags))
+    //         return 1;
+    // ```
+    // (`ref-filter.c:2709-2721`). `WM_CASEFOLD` is set on the *wildmatch* only —
+    // the path-prefix test is a plain `strncmp` and stays case-sensitive even
+    // under `--ignore-case`, so `git for-each-ref --ignore-case refs/HEADS/`
+    // matches nothing.
     if !p.is_empty() && p.len() <= refname.len() {
         let head = &refname[..p.len()];
-        let literal = if ignore_case {
-            head.eq_ignore_ascii_case(p)
-        } else {
-            head == p
-        };
-        if literal
+        if head == p
             && (refname.len() == p.len() || refname[p.len()] == b'/' || p[p.len() - 1] == b'/')
         {
             return true;
@@ -2320,45 +2365,26 @@ fn pattern_matches(pattern: &str, refname: &[u8], ignore_case: bool) -> bool {
     gix::glob::wildmatch(p.as_bstr(), refname.as_bstr(), mode)
 }
 
-/// git's `shorten_unambiguous_ref` in strict mode: try the rev-parse rules from
-/// the most specific down, and accept the first candidate that no *other* rule
-/// could expand into an existing ref.
-fn short_name(refname: &[u8], all: &HashSet<Vec<u8>>) -> Vec<u8> {
-    // `ref_rev_parse_rules`, in order. Rule 0 (the bare name) is only ever used
-    // to test a candidate for ambiguity, never to produce one; rule 5 is what
-    // shortens `refs/remotes/origin/HEAD` to `origin`.
-    const RULES: [(&[u8], &[u8]); 6] = [
-        (b"", b""),
-        (b"refs/", b""),
-        (b"refs/tags/", b""),
-        (b"refs/heads/", b""),
-        (b"refs/remotes/", b""),
-        (b"refs/remotes/", b"/HEAD"),
-    ];
-
-    // `refs_shorten_unambiguous_ref()` walks the rules from the most specific
-    // down, and a candidate is ambiguous only against the rules *before* the one
-    // that produced it — the later ones are more specific and cannot collide.
-    for i in (1..RULES.len()).rev() {
-        let (prefix, suffix) = RULES[i];
-        let Some(candidate) = refname
-            .strip_prefix(prefix)
-            .and_then(|rest| rest.strip_suffix(suffix))
-        else {
-            continue;
-        };
-        if candidate.is_empty() {
-            continue;
-        }
-        let ambiguous = RULES[..i].iter().any(|(p, s)| {
-            let name = [*p, candidate, *s].concat();
-            all.contains(&name)
-        });
-        if !ambiguous {
-            return candidate.to_vec();
-        }
-    }
-    refname.to_vec()
+/// `%(refname:short)`'s shortening: `refs_shorten_unambiguous_ref()` with
+/// `strict` = `core.warnAmbiguousRefs`.
+///
+/// ```c
+/// if (atom->option == R_SHORT)
+///         return refs_shorten_unambiguous_ref(get_main_ref_store(the_repository),
+///                                             refname,
+///                                             repo_settings_get_warn_ambiguous_refs(the_repository));
+/// ```
+/// (`ref-filter.c:2230-2233`)
+///
+/// Strict is what makes both halves of an ambiguous pair keep a component:
+/// `refs/tags/dup` alongside `refs/heads/dup` renders as `tags/dup`, not `dup`.
+fn short_name(repo: &gix::Repository, refname: &[u8], all: &HashSet<Vec<u8>>) -> Vec<u8> {
+    crate::refname::shorten_unambiguous_in_set(
+        repo,
+        refname,
+        crate::refname::warn_ambiguous_refs(repo),
+        all,
+    )
 }
 
 /// Order `refs` by the sort chain, falling back to refname as git does.
@@ -2711,7 +2737,7 @@ fn render_upstream(
                         let r = r.map_err(|e| anyhow!("{e}"))?;
                         all.insert(r.name().as_bstr().to_vec());
                     }
-                    short_name(&name, &all)
+                    short_name(repo, &name, &all)
                 }
                 NameMod::LStrip(n) => refsort::strip_components(&name, *n, true),
                 NameMod::RStrip(n) => refsort::strip_components(&name, *n, false),
@@ -3032,21 +3058,32 @@ fn render_contents(obj: &ObjInfo, part: &ContentPart) -> Result<Vec<u8>> {
 /// git's `grab_signature`: verify a commit's signature once, then render the
 /// field the atom asked for.
 ///
-/// `check_commit_signature` leaves every field empty for an object that carries
-/// no `gpgsig` header — including a tag or a tree, which `grab_signature` is
-/// never even reached for — so those render empty here too.
+/// Two distinct "nothing to say" cases, and they render *differently*:
+///
+///   * the object is not a commit. `grab_values()` calls `grab_signature()` from
+///     the `case OBJ_COMMIT:` arm alone (`ref-filter.c:2146`); `OBJ_TAG`,
+///     `OBJ_TREE` and `OBJ_BLOB` never reach it, so the atom keeps its
+///     `ATOM_VALUE_INIT` empty string. Every `%(signature:…)` on an annotated
+///     tag is empty in stock 2.55.0, signed or not — measured on a tag object
+///     carrying a real `-----BEGIN PGP SIGNATURE-----` block.
+///   * the object is a commit with no signature. `check_commit_signature()` does
+///     run and leaves `sigc` zeroed apart from `result = 'N'` and
+///     `trust_level = TRUST_UNDEFINED`, so the string fields are empty but
+///     `:grade` is `N` and `:trustlevel` is `undefined`.
+///
+/// `%(*signature:…)` is unaffected either way: the deref pass runs `grab_values()`
+/// on the *peeled* object, which is the commit.
 ///
 /// [`crate::gitsig`] is this crate's `check_signature()`, so every field of
 /// git's `struct signature_check` is available here — the checker's own report
 /// behind the bare `%(signature)` included, and the `VALIDSIG` fingerprints
 /// behind `:fingerprint` / `:primarykeyfingerprint`.
 fn render_signature(obj: &ObjInfo, option: SigOption) -> Result<Vec<u8>> {
+    if obj.kind != Kind::Commit {
+        return Ok(Vec::new());
+    }
     let data = obj.data.as_deref().unwrap_or_default();
-    let signed = obj.kind == Kind::Commit && crate::gitsig::split_signed(data).is_some();
-    if !signed {
-        // `sigc` stays zeroed apart from `result = 'N'` and `trust_level =
-        // TRUST_UNDEFINED`, so every string field renders empty and the two
-        // derived atoms report the initial verdict.
+    if crate::gitsig::split_signed(data).is_none() {
         return Ok(match option {
             SigOption::Grade => b"N".to_vec(),
             SigOption::TrustLevel => trust_level_str(crate::gitsig::Trust::Undefined).into(),
@@ -3241,36 +3278,38 @@ mod tests {
     // sub-minimum length to `minimum_abbrev` (4).
     #[test]
     fn oid_mod_parses_like_oid_atom_parser() {
-        assert!(matches!(parse_oid_mod("tree", None), Ok(NameLen::Full)));
+        assert!(matches!(parse_oid_mod("tree", "tree", None), Ok(NameLen::Full)));
         assert!(matches!(
-            parse_oid_mod("tree", Some("short")),
+            parse_oid_mod("tree", "tree", Some("short")),
             Ok(NameLen::Auto)
         ));
         // Above the floor, the length is used verbatim.
         assert!(matches!(
-            parse_oid_mod("parent", Some("short=10")),
+            parse_oid_mod("parent:short=10", "parent", Some("short=10")),
             Ok(NameLen::Fixed(10))
         ));
         // git floors `minimum_abbrev` (4): `short=2` becomes a length of 4.
         assert!(matches!(
-            parse_oid_mod("parent", Some("short=2")),
+            parse_oid_mod("parent:short=2", "parent", Some("short=2")),
             Ok(NameLen::Fixed(4))
         ));
     }
 
-    // `git for-each-ref --format='%(tree:short=0)'` dies with exactly this
-    // message and exit 128.
+    // Measured against stock 2.55.0: `git for-each-ref --format='%(tree:short=0)'`
+    // is `fatal: positive value expected '0' in %(tree:short=0)`. `err_bad_arg`
+    // truncates the atom at its first colon, but the `positive value expected`
+    // die does not — it quotes `atom->name`, the atom exactly as written.
     #[test]
     fn oid_mod_rejects_zero_and_garbage() {
-        let e = parse_oid_mod("tree", Some("short=0")).unwrap_err();
+        let e = parse_oid_mod("tree:short=0", "tree", Some("short=0")).unwrap_err();
         assert!(matches!(e.kind, ErrKind::Fatal));
-        assert_eq!(e.msg, "positive value expected '0' in %(tree)");
+        assert_eq!(e.msg, "positive value expected '0' in %(tree:short=0)");
 
-        let e = parse_oid_mod("tree", Some("short=xy")).unwrap_err();
+        let e = parse_oid_mod("tree:short=xy", "tree", Some("short=xy")).unwrap_err();
         assert!(matches!(e.kind, ErrKind::Fatal));
-        assert_eq!(e.msg, "positive value expected 'xy' in %(tree)");
+        assert_eq!(e.msg, "positive value expected 'xy' in %(tree:short=xy)");
 
-        let e = parse_oid_mod("parent", Some("bogus")).unwrap_err();
+        let e = parse_oid_mod("parent:bogus", "parent", Some("bogus")).unwrap_err();
         assert!(matches!(e.kind, ErrKind::Fatal));
         assert_eq!(e.msg, "unrecognized %(parent) argument: bogus");
     }

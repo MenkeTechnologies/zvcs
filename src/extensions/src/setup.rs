@@ -31,6 +31,28 @@ fn is_inside_dir(dir: &Path) -> bool {
 
 /// git's `is_inside_git_dir()` (setup.c:472-478): whether the cwd is the git
 /// directory or below it.
+/// `git_path()`'s rendering of a path inside the git directory.
+///
+/// `setup.c` has already moved to the top of the work tree by the time a message
+/// is printed, so an ordinary repository shows its git directory as `.git`
+/// however deep the command was run. A separate git dir (`--git-dir`, a linked
+/// worktree, a submodule) has no such shorthand and is printed in full.
+///
+/// Shared rather than per-verb: any command that quotes a path it is about to
+/// write inside `$GIT_DIR` has to render it the same way, or two verbs report
+/// different names for the same file.
+pub fn git_path_display(repo: &gix::Repository, path: &Path) -> String {
+    let git_dir = repo.git_dir();
+    let shown = match repo.workdir() {
+        Some(top) if git_dir == top.join(".git") => Path::new(".git"),
+        _ => git_dir,
+    };
+    match path.strip_prefix(git_dir) {
+        Ok(rest) => shown.join(rest).display().to_string(),
+        Err(_) => path.display().to_string(),
+    }
+}
+
 pub fn is_inside_git_dir(repo: &gix::Repository) -> bool {
     is_inside_dir(&realpath(repo.git_dir()))
 }

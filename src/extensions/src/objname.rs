@@ -273,11 +273,41 @@ pub fn warn_ambiguous_operand(repo: &gix::Repository, name: &str, flags: OidFlag
     if flags.quiet || repo.config_snapshot().boolean("core.warnAmbiguousRefs") == Some(false) {
         return false;
     }
+    // A reflog operand is counted by a different function and measured over a
+    // different name. `get_oid_basic()` cuts the selector off (`len = at`) before
+    // it reaches the warning, and the count it tests is `repo_dwim_log()`'s — how
+    // many rules found a *log*, not how many found a ref:
+    //
+    // ```c
+    // else if (reflog_len)
+    //         refs_found = repo_dwim_log(r, str, len, oid, &real_ref);
+    // …
+    // if (repo_settings_get_warn_ambiguous_refs(r) && !(flags & GET_OID_QUIETLY) &&
+    //     (refs_found > 1 || !get_short_oid(r, str, len, &tmp_oid, GET_OID_QUIETLY)))
+    //         warning(warn_msg, len, str);
+    // ```
+    //
+    // So `git reflog show tri@{0}` warns about `tri` when both `refs/heads/tri` and
+    // `refs/remotes/tri/HEAD` have logs, while `dup@{0}` — one log, one tag without
+    // one — does not.
+    if let Some((reflog_base, _)) = split_reflog_selector(base) {
+        if reflog_base.is_empty() {
+            return false;
+        }
+        let logs_found = dwim_log_matches(repo, reflog_base);
+        if logs_found == 0 {
+            return false;
+        }
+        if logs_found > 1 || short_oid_unambiguous(repo, reflog_base) {
+            eprintln!("warning: refname '{reflog_base}' is ambiguous.");
+        }
+        return false;
+    }
     // `if (!refs_found) return -1;` — a name no rule matches never gets this far,
     // and that covers the revision grammar `strip_navigation` cannot reduce
-    // (`<rev>^!`, `<rev>^@`, `<rev>@{…}`) without a test of its own:
-    // `check_refname_format()` bans `^`, `~`, `:` and `?` in a refname, so
-    // `repo_dwim_ref()` answers 0 for anything still carrying one.
+    // (`<rev>^!`, `<rev>^@`) without a test of its own: `check_refname_format()`
+    // bans `^`, `~`, `:` and `?` in a refname, so `repo_dwim_ref()` answers 0 for
+    // anything still carrying one.
     let refs_found = crate::porcelain::rev_parse::dwim_ref_matches(repo, base).len();
     if refs_found == 0 {
         return false;
@@ -566,7 +596,23 @@ pub fn resolve_quiet(repo: &gix::Repository, spec: &str) -> Option<ObjectId> {
     if full_hex(repo, ambiguity_base(spec)).is_some_and(|id| repo.find_object(id).is_err()) {
         return None;
     }
+    // `get_oid_basic()` dispatches on the operand's *shape*. Once a reflog
+    // selector has been cut off the end, the ref half is looked up with
+    // `repo_dwim_log()` and nothing else — so a reflog operand never reaches
+    // gitoxide's rev-spec parser. That matters in both directions: gitoxide gives
+    // up on an ambiguous `dup@{0}` that git answers, and it answers `HEAD@{0}` off
+    // a stale `logs/HEAD` that git refuses because `HEAD` resolves to nothing.
+    if is_reflog_operand(spec) {
+        return reflog_oid(repo, spec);
+    }
     repo.rev_parse_single(spec).ok().map(|id| id.detach())
+}
+
+/// Whether `spec` is what `get_oid_basic()` treats as a reflog operand: a
+/// `<ref>@{<selector>}` whose selector is neither `@{-<n>}` nor an
+/// `@{u}`/`@{upstream}`/`@{push}` mark.
+pub fn is_reflog_operand(spec: &str) -> bool {
+    split_reflog_selector(spec).is_some()
 }
 
 /// Whether `spec` named an object the repository does not actually have.
@@ -1775,6 +1821,200 @@ pub fn upstream_mark_fatal(repo: &gix::Repository, spec: &str) -> Option<String>
     }
 }
 
+/// `get_oid_basic()`'s reflog branch (`object-name.c:742-822`) as a *resolver*:
+/// the object id `<ref>@{<n>}` / `<ref>@{<date>}` names.
+///
+/// gitoxide's rev-spec parser resolves the ref half through its own ref lookup and
+/// gives up when the name is ambiguous, so `dup@{0}` fails there where git answers.
+/// git never consults an ambiguity rule here at all — it calls `repo_dwim_log()`,
+/// which walks `ref_rev_parse_rules` and takes the first candidate that both
+/// resolves *and* has a log:
+///
+/// ```c
+/// if (!len && reflog_len)
+///         refs_found = repo_dwim_ref(r, "HEAD", 4, oid, &real_ref, !fatal);
+/// else if (reflog_len)
+///         refs_found = repo_dwim_log(r, str, len, oid, &real_ref);
+/// …
+/// if (read_ref_at(get_main_ref_store(r), real_ref, flags, at_time, nth, oid, NULL,
+///                 &co_time, &co_tz, &co_cnt)) { … }
+/// ```
+///
+/// `None` means git has no answer either — the name is not a reflog operand, no
+/// rule found a log, or the selector is out of range (which
+/// [`reflog_reach`] separately turns into git's `die()`).
+pub fn reflog_oid(repo: &gix::Repository, spec: &str) -> Option<ObjectId> {
+    let (base, sel) = split_reflog_selector(spec)?;
+    // `repo_dwim_ref("HEAD")` reports HEAD's *target*; `repo_dwim_log` reports the
+    // ref whose log was found. Either way an unborn HEAD resolves to nothing and
+    // the operand fails, which is what makes a stale `logs/HEAD` a fatal.
+    let full = if base.is_empty() {
+        crate::refname::resolve_ref_reading(repo, "HEAD")?
+    } else {
+        crate::porcelain::reflog::dwim_log(repo, base)?
+    };
+
+    // The selector, read exactly as `get_oid_basic()` reads it: an all-digit run is
+    // the N-th entry unless it is large enough to be a unix timestamp.
+    let digits = !sel.is_empty() && sel.bytes().all(|c| c.is_ascii_digit());
+    let n: i64 = if digits { sel.parse().unwrap_or(i64::MAX) } else { -1 };
+    let (nth, at_time) = if n >= 100_000_000 {
+        (-1i64, n)
+    } else if n >= 0 {
+        (n, 0i64)
+    } else {
+        let (t, errors) = crate::date::approxidate_careful(sel);
+        if errors {
+            return None;
+        }
+        (-1, t)
+    };
+
+    // `refs_for_each_reflog_ent_reverse()`: newest entry first.
+    let entries = reflog_lines(repo, &full)?;
+    if entries.is_empty() {
+        // `if (!cb.reccnt)`: `@{0}` on an empty log falls back to the ref's own
+        // value; anything else is a `die()` the caller reports.
+        return (nth == 0).then(|| resolve_ref_oid(repo, &full)).flatten();
+    }
+
+    // `read_ref_at_ent()`: `if (timestamp <= cb->at_time || cb->cnt == 0)`, with
+    // `cnt` counting down from `nth`. The matching entry answers with its *new* id.
+    let hit = if nth >= 0 {
+        entries.get(nth as usize).map(|e| e.1)
+    } else {
+        entries.iter().find(|e| e.2 <= at_time).map(|e| e.1)
+    };
+    if let Some(id) = hit {
+        return Some(id);
+    }
+
+    // `read_ref_at_ent_oldest()`: nothing was old enough, so the answer is the
+    // oldest entry's *old* id — or its new id when that is the null id and a date
+    // was asked for.
+    let oldest = entries.last()?;
+    if nth >= 0 {
+        // `} else if (nth == co_cnt && !is_null_oid(oid)) {`: one past the end is
+        // still answerable from the oldest entry's old id.
+        return (nth as usize == entries.len() && !oldest.0.is_null()).then_some(oldest.0);
+    }
+    Some(if at_time != 0 && oldest.0.is_null() { oldest.1 } else { oldest.0 })
+}
+
+/// `repo_dwim_log()`'s `logs_found`: how many `ref_rev_parse_rules` spellings of
+/// `name` both resolve and have a reflog. It is the count `get_oid_basic()` tests
+/// for the ambiguity warning, and unlike [`crate::porcelain::reflog::dwim_log`] it
+/// does not stop at the first hit.
+fn dwim_log_matches(repo: &gix::Repository, name: &str) -> usize {
+    crate::refname::REV_PARSE_RULES
+        .iter()
+        .filter(|(prefix, suffix)| {
+            let path = format!(
+                "{}{name}{}",
+                String::from_utf8_lossy(prefix),
+                String::from_utf8_lossy(suffix)
+            );
+            let Some(resolved) = crate::refname::resolve_ref_reading(repo, &path) else {
+                return false;
+            };
+            crate::porcelain::reflog::log_file(repo, &path).is_file()
+                || (resolved != path
+                    && crate::porcelain::reflog::log_file(repo, &resolved).is_file())
+        })
+        .count()
+}
+
+/// One ref's reflog as `(old, new, timestamp)` triples, newest entry first.
+fn reflog_lines(
+    repo: &gix::Repository,
+    full: &str,
+) -> Option<Vec<(ObjectId, ObjectId, i64)>> {
+    // The forward iterator reads the whole file into `buf`; the reverse one wants a
+    // fixed-size chunk buffer and yields nothing when handed an empty slice.
+    let mut buf: Vec<u8> = Vec::new();
+    let iter = repo.refs.reflog_iter(full, &mut buf).ok().flatten()?;
+    let mut out = Vec::new();
+    for line in iter {
+        let Ok(line) = line else { break };
+        out.push((
+            line.previous_oid(),
+            line.new_oid(),
+            line.signature.time().map(|t| t.seconds).unwrap_or_default(),
+        ));
+    }
+    // `refs_for_each_reflog_ent_reverse()`: newest entry first.
+    out.reverse();
+    Some(out)
+}
+
+/// The object a full ref name resolves to, following symrefs.
+fn resolve_ref_oid(repo: &gix::Repository, full: &str) -> Option<ObjectId> {
+    let name = crate::refname::resolve_ref_reading(repo, full)?;
+    match repo.refs.try_find(name.as_str()).ok().flatten()?.target {
+        gix::refs::Target::Object(id) => Some(id),
+        gix::refs::Target::Symbolic(_) => None,
+    }
+}
+
+/// `repo_interpret_branch_name()`'s two whole-operand rewrites, the pair
+/// `substitute_branch_name()` (`refs.c:826-841`) applies before `repo_dwim_ref()`
+/// and `repo_dwim_log()` look anything up, and `setup_revisions()` applies again
+/// before `add_reflog_for_walk()`:
+///
+/// ```c
+/// int len = repo_interpret_branch_name(the_repository, name, namelen, &buf, &options);
+/// if (0 < len && len < namelen && buf.len)
+///         strbuf_addstr(&buf, name + len);
+/// add_reflog_for_walk(revs->reflog_info, (struct commit *)obj,
+///                     buf.buf[0] ? buf.buf : name);
+/// ```
+/// (`revision.c:308-315`)
+///
+///   * `interpret_empty_at()`: a bare `@` is `HEAD`;
+///   * `interpret_branch_mark()` with `branch_get_upstream()`: `<branch>@{u}` and
+///     `<branch>@{upstream}` become the full name of that branch's
+///     remote-tracking ref, with anything after the mark carried over.
+///
+/// `Some(Err(_))` is the `die()` [`upstream_mark_fatal`] words. `None` means git
+/// leaves the operand exactly as typed — including `@{push}`, whose `push.default`
+/// machinery has outcomes git does not die on and is a separate port.
+///
+/// `@{-<n>}` is `interpret_nth_prior_checkout()`'s third rewrite and is not here;
+/// the reflog reader applies it separately because it needs HEAD's own log.
+pub fn interpret_branch_name(
+    repo: &gix::Repository,
+    name: &str,
+) -> Option<Result<String, String>> {
+    if name == "@" {
+        return Some(Ok("HEAD".to_owned()));
+    }
+    let at = upstream_mark_at(name)?;
+    // `if (memchr(name, ':', at)) return -1;`
+    if name[..at].contains(':') {
+        return Some(Err(format!("unhandled upstream mark in '{name}'")));
+    }
+    let branch = &name[..at];
+    let full = if branch.is_empty() || branch == "HEAD" {
+        match repo.head_name() {
+            Ok(Some(full)) => full.as_bstr().to_string(),
+            _ => return Some(Err(upstream_mark_fatal(repo, name)?)),
+        }
+    } else {
+        format!("refs/heads/{branch}")
+    };
+    let Some(upstream) = crate::porcelain::branch::upstream_ref(repo, full.as_str().into()) else {
+        return Some(Err(upstream_mark_fatal(repo, name)?));
+    };
+    // `upstream_mark()` returns the length it matched, and `interpret_branch_name`
+    // hands that back so the caller can append whatever followed it.
+    let rest = &name[at..];
+    let mark_len = ["@{upstream}", "@{u}"]
+        .iter()
+        .find(|m| rest.len() >= m.len() && rest[..m.len()].eq_ignore_ascii_case(m))
+        .map(|m| m.len())?;
+    Some(Ok(format!("{}{}", upstream.as_bstr(), &rest[mark_len..])))
+}
+
 /// The offset of the `@` that opens an `@{u}`/`@{upstream}` mark in `base`, as
 /// `interpret_branch_name()`'s left-to-right scan finds it:
 ///
@@ -1801,7 +2041,7 @@ pub fn upstream_mark_fatal(repo: &gix::Repository, spec: &str) -> Option<String>
 /// ```
 ///
 /// `suffix_len <= len` rather than `==`, so anything may follow the mark.
-fn upstream_mark_at(base: &str) -> Option<usize> {
+pub fn upstream_mark_at(base: &str) -> Option<usize> {
     base.bytes().enumerate().filter(|(_, b)| *b == b'@').map(|(i, _)| i).find(|&i| {
         let rest = &base[i..];
         ["@{upstream}", "@{u}"]

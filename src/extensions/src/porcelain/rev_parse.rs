@@ -21,16 +21,20 @@
 //! `a...b` prints `b`, `a`, then `^<merge-base>` for each merge base — matching
 //! stock git's left-to-right emission.
 //!
-//! Implemented: `--verify`, `-q`/`--quiet`, `--short[=n]`, `--abbrev-ref`,
-//! `--symbolic`, `--symbolic-full-name`, `--git-dir`, `--absolute-git-dir`,
-//! `--git-common-dir`, `--show-toplevel`, `--is-inside-work-tree`,
-//! `--is-inside-git-dir`, `--is-bare-repository`, `--is-shallow-repository`,
-//! `--show-cdup`, `--show-prefix`, `--show-object-format`, `--show-ref-format`,
-//! `--all`, `--branches`, `--tags`, `--remotes[=<pattern>]`, `--glob=<pattern>`,
-//! `--exclude=<pattern>`, `--disambiguate=<prefix>`, `--sq-quote`, plus revision
-//! and path arguments. Every other option stock git recognizes is rejected
-//! rather than ignored; options git does *not* recognize are echoed, which is
-//! what git itself does with them.
+//! Implemented: `--verify`, `-q`/`--quiet`, `--short[=n]`,
+//! `--abbrev-ref[=(strict|loose)]`, `--symbolic`, `--symbolic-full-name`,
+//! `--git-dir`, `--absolute-git-dir`, `--git-common-dir`, `--show-toplevel`,
+//! `--is-inside-work-tree`, `--is-inside-git-dir`, `--is-bare-repository`,
+//! `--show-cdup`, `--show-prefix`, `--show-object-format[=<mode>]`,
+//! `--show-ref-format`, `--all`, `--branches`, `--tags`, plus revision and path
+//! arguments.
+//!
+//! Rejected with an explicit refusal rather than silently ignored — the list is
+//! [`UNIMPLEMENTED_EXACT`] and [`UNIMPLEMENTED_PREFIX`], and it includes
+//! `--is-shallow-repository`, `--remotes[=<pattern>]`, `--glob=<pattern>`,
+//! `--exclude=<pattern>`, `--disambiguate=<prefix>` and `--sq-quote`, all of
+//! which this header previously claimed were implemented. Options git does *not*
+//! recognize are echoed, which is what git itself does with them.
 
 use anyhow::Result;
 use std::io::Write;
@@ -88,6 +92,10 @@ struct Opts {
     abbrev: Option<usize>,
     sym: Sym,
     abbrev_ref: bool,
+    /// `abbrev_ref_strict` (`builtin/rev-parse.c:54`). `None` is git's default,
+    /// `repo_settings_get_warn_ambiguous_refs()`; `--abbrev-ref=strict` and
+    /// `--abbrev-ref=loose` pin it (`builtin/rev-parse.c:917-930`).
+    abbrev_ref_strict: Option<bool>,
     /// git's `DO_FLAGS`: echo unrecognized options. Cleared by `--verify`/`--short`.
     echo_flags: bool,
     /// git's `DO_NONFLAGS`: echo path arguments. Cleared by `--verify`/`--short`.
@@ -102,6 +110,7 @@ impl Default for Opts {
             abbrev: None,
             sym: Sym::No,
             abbrev_ref: false,
+            abbrev_ref_strict: None,
             echo_flags: true,
             echo_paths: true,
         }
@@ -141,7 +150,6 @@ const UNIMPLEMENTED_EXACT: &[&str] = &[
 ];
 
 const UNIMPLEMENTED_PREFIX: &[&str] = &[
-    "--abbrev-ref=",
     "--path-format=",
     "--disambiguate=",
     "--glob=",
@@ -297,6 +305,15 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
                     // `try_difference()` cuts at the `..` and hands
                     // `repo_get_oid_committish()` the endpoint as written.
                     let name = crate::objname::uninteresting_mark(arg).0;
+                    // `interpret_branch_mark()`'s `die()` happens inside
+                    // `get_oid()`, before rev-parse has a failed operand to
+                    // report, so it replaces the "ambiguous argument" block rather
+                    // than preceding it (`refs.c`, via `substitute_branch_name()`).
+                    if let Some(message) = crate::objname::upstream_mark_fatal(&repo, name) {
+                        out.flush()?;
+                        eprintln!("fatal: {message}");
+                        return Ok(ExitCode::from(128));
+                    }
                     warn_ambiguous_refname(&repo, name, o.quiet);
                     warn_reflog_reach(&mut out, &repo, name, o.quiet)?;
                 }
@@ -304,8 +321,16 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
             // A full-length hex name *is* the object id and short-circuits ahead
             // of every database lookup, so it answers even for an object that is
             // not present — see [`crate::objname::full_hex`].
-            crate::objname::full_hex(&repo, arg)
-                .or_else(|| repo.rev_parse_single(arg.as_str()).ok().map(|id| id.detach()))
+            crate::objname::full_hex(&repo, arg).or_else(|| {
+                // `get_oid_basic()` resolves `<ref>@{<n>}` itself, through
+                // `repo_dwim_log()` rather than gitoxide's ref lookup — which
+                // answers for names git rejects and rejects names git answers.
+                if crate::objname::is_reflog_operand(arg) {
+                    crate::objname::reflog_oid(&repo, arg)
+                } else {
+                    repo.rev_parse_single(arg.as_str()).ok().map(|id| id.detach())
+                }
+            })
         };
 
         // A reflog ordinal past the end of an existing ref's log is its own
@@ -334,7 +359,11 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
                 // single revision that only the full grammar accepts (`Include`).
                 // The full parser (`rev_parse`) classifies it; expand at this
                 // position before falling through to path handling.
-                let parsed = if arg.is_empty() {
+                // A reflog operand has already had git's own answer — and its
+                // own refusal — from `get_oid_basic()`'s `repo_dwim_log()` branch
+                // above. Re-asking gitoxide's full grammar would resolve names git
+                // rejects (`HEAD@{0}` off a stale log under an unborn HEAD).
+                let parsed = if arg.is_empty() || crate::objname::is_reflog_operand(arg) {
                     None
                 } else {
                     repo.rev_parse(arg.as_str()).ok().and_then(|s| match s.detach() {
@@ -674,6 +703,29 @@ fn option(o: &mut Opts, arg: &str) -> Result<Opt> {
                 }
                 return Ok(Opt::Query(Query::ObjectFormat));
             }
+            // ```c
+            // if (opt_with_value(arg, "--abbrev-ref", &arg)) {
+            //         abbrev_ref = 1;
+            //         abbrev_ref_strict = repo_settings_get_warn_ambiguous_refs(the_repository);
+            //         if (arg) {
+            //                 if (!strcmp(arg, "strict"))       abbrev_ref_strict = 1;
+            //                 else if (!strcmp(arg, "loose"))   abbrev_ref_strict = 0;
+            //                 else die(_("unknown mode for --abbrev-ref: %s"), arg);
+            //         }
+            // ```
+            // (`builtin/rev-parse.c:917-930`)
+            if let Some(mode) = arg.strip_prefix("--abbrev-ref=") {
+                o.abbrev_ref = true;
+                o.abbrev_ref_strict = match mode {
+                    "strict" => Some(true),
+                    "loose" => Some(false),
+                    _ => {
+                        eprintln!("fatal: unknown mode for --abbrev-ref: {mode}");
+                        return Ok(Opt::Fatal);
+                    }
+                };
+                return Ok(Opt::Consumed);
+            }
             if let Some(n) = arg.strip_prefix("--short=") {
                 let n: usize = n
                     .parse()
@@ -869,13 +921,42 @@ fn show_rev(
             Some(f) => Some(f.to_owned()),
             None => name.and_then(|n| dwim_full_name(repo, n)),
         };
+        // ```c
+        // switch (repo_dwim_ref(the_repository, name, strlen(name), &discard, &full, 0)) {
+        // case 0:  /* Not found -- not a ref. */          break;
+        // case 1:  /* happy */                            … show_with_type(type, full); break;
+        // default: /* ambiguous */
+        //         error("refname '%s' is ambiguous", name);
+        //         break;
+        // }
+        // ```
+        // (`builtin/rev-parse.c:155-180`). More than one `ref_rev_parse_rules`
+        // spelling exists, so there is no single full name to report: git prints
+        // an `error:` and *nothing* on stdout, at exit 0. It is not the ambiguity
+        // *warning* — `-q` silences that one and leaves this.
+        let full = match (&full, name, known_full) {
+            (Some(_), Some(n), None)
+                if n.to_str()
+                    .ok()
+                    .is_some_and(|n| dwim_ref_matches(repo, n).len() > 1) =>
+            {
+                out.flush()?;
+                eprintln!("error: refname '{}' is ambiguous", n);
+                None
+            }
+            _ => full,
+        };
         // A revision that names no ref prints nothing at all in these modes.
         full.map(|full| {
             if o.abbrev_ref {
-                <&gix::refs::FullNameRef>::try_from(full.as_bstr())
-                    .map(|f| f.shorten().to_owned())
-                    .unwrap_or_else(|_| full.clone())
-                    .into()
+                // `refs_shorten_unambiguous_ref(…, full, abbrev_ref_strict)`
+                // (`builtin/rev-parse.c:170-172`). Not a category-prefix strip:
+                // `refs/remotes/origin/HEAD` shortens to `origin`, and an
+                // ambiguous name keeps a component (`refs/tags/dup` → `tags/dup`).
+                let strict = o
+                    .abbrev_ref_strict
+                    .unwrap_or_else(|| crate::refname::warn_ambiguous_refs(repo));
+                crate::refname::shorten_unambiguous(repo, &full, strict).into()
             } else {
                 full.into()
             }

@@ -619,7 +619,7 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
                         .ok()
                         .flatten()
                         .is_some()
-                    || crate::objname::resolve(&repo, spec).is_some()
+                    || crate::objname::resolve_quiet(&repo, spec).is_some()
                     || matches!(unique_remote_branch(&repo, spec), Ok(Dwim::One(_)));
                 !is_ref
             }
@@ -701,7 +701,7 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
                 1 => (Some(pre[0]), post.as_slice()),
                 _ => crate::git_fatal!("only one <tree-ish> may precede `--`"),
             }
-        } else if !pre.is_empty() && crate::objname::resolve(&repo, pre[0]).is_some() {
+        } else if !pre.is_empty() && crate::objname::resolve_quiet(&repo, pre[0]).is_some() {
             (Some(pre[0]), &pre[1..])
         } else {
             (None, pre.as_slice())
@@ -743,7 +743,7 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
     let source_tree_with_paths = if has_dashdash {
         pre.len() == 1 && !post.is_empty()
     } else {
-        pre.len() > 1 && crate::objname::resolve(&repo, pre[0]).is_some()
+        pre.len() > 1 && crate::objname::resolve_quiet(&repo, pre[0]).is_some()
     };
     if source_tree_with_paths
         && new_branch.is_none()
@@ -801,7 +801,7 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
         // only when it resolves; whatever is left is `opts->pathspec`.
         let start_resolved = pre
             .first()
-            .map(|p| crate::objname::resolve(&repo, p).is_some())
+            .map(|p| crate::objname::resolve_quiet(&repo, p).is_some())
             .unwrap_or(false);
         let remaining: &[&str] = if has_dashdash {
             &post
@@ -952,7 +952,12 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
         // below — which reports the missing object the way git does. Resolving it
         // through the odb instead made `git checkout <sha-from-an-email>` fall
         // through to the pathspec branch and report "did not match any file(s)".
-        if let Some(id) = crate::objname::resolve(&repo, spec) {
+        // Quiet: `parse_branchname_arg()` put this same operand through
+        // `get_oid_mb()` above, which is the one resolution git warns for. This is
+        // that resolution's result being used, not a second visit to
+        // `get_oid_basic()` — warning again made `git checkout --detach <ambiguous>`
+        // print two `refname … is ambiguous` lines where git prints one.
+        if let Some(id) = crate::objname::resolve_quiet(&repo, spec) {
             let commit = match classify_tree_ish(&repo, id)? {
                 TreeIsh::Commit(commit) => commit,
                 // A tree is a legitimate `source_tree`, so `parse_branchname_arg()`
@@ -1003,7 +1008,7 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
 
     // Multiple positionals, no `--`: if the first resolves to a tree-ish it is the
     // source and the rest are paths; otherwise all are paths from the index.
-    if crate::objname::resolve(&repo, pre[0]).is_some() {
+    if crate::objname::resolve_quiet(&repo, pre[0]).is_some() {
         return restore_from_tree(&repo, pre[0], &pre[1..], overlay, true, quiet);
     }
     restore_from_index(&repo, &pre, true, quiet, merge_opt(merge, &conflict_style, ""), force)

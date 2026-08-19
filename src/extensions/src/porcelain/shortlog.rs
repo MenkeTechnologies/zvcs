@@ -32,7 +32,8 @@
 //!     a CJK subject costs two per glyph. `%C…` is not among the placeholders
 //!     above, so `format_and_pad_commit()`'s colour chain can never open here.
 //!   * `--date=<fmt>` — validated the way `parse_date_format()` validates it.
-//!   * revision selection: `<rev>`, `^<rev>`, `<a>..<b>`, `<a>...<b>`, `--not`,
+//!   * revision selection: `<rev>`, `^<rev>`, `<a>..<b>`, `<a>...<b>`,
+//!     `<rev>^@` / `<rev>^!` / `<rev>^-[<n>]`, `--not`,
 //!     `--all`, `--branches[=<glob>]`, `--tags[=<glob>]`, `--remotes[=<glob>]`,
 //!     `--glob=<glob>`, `--exclude=<glob>`, `--ignore-missing`, `--reflog`
 //!     (`add_reflogs_to_pending()`: the old and the new id of every entry of
@@ -769,6 +770,55 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
                 // quiet — they are the same names again, and git resolves once.
                 super::log::warn_operand(repo, spec, true);
                 let _quiet = crate::objname::AmbiguityWarnings::off();
+                // `handle_revision_arg_1()`'s parent-mark block, which
+                // `cmd_shortlog()` reaches through the same `setup_revisions()`:
+                // `<rev>^@` pends the parents alone and claims the operand, while
+                // `<rev>^!` and `<rev>^-<n>` pend the selected parents with
+                // `flags ^ (UNINTERESTING | BOTTOM)` and put the truncated name
+                // back into `arg` for the ordinary path below. See
+                // [`crate::objname::parents_only`] for the C.
+                let spec: &str = match crate::objname::parents_only(spec) {
+                    crate::objname::ParentsOnly::Absent => spec,
+                    // `strtol_i()` refused the `<n>` before `add_parents_only()`
+                    // was reached, so nothing is resolved and nothing is pended.
+                    crate::objname::ParentsOnly::BadParent => return Ok(fatal_rev(repo, spec)),
+                    crate::objname::ParentsOnly::Mark { base, nth, replaces } => {
+                        let sense = if replaces { negate } else { !negate };
+                        let mut queued: Vec<(ObjectId, bool)> = Vec::new();
+                        let mut queue =
+                            |_name: &str, id: ObjectId, not: bool| queued.push((id, not));
+                        match crate::objname::add_parents_only(repo, base, sense, nth, &mut queue) {
+                            // `get_reference()`'s `die(_("bad object %s"), name)`,
+                            // naming the base without its leading `^`.
+                            crate::objname::Parents::BadObject => {
+                                let name = crate::objname::uninteresting_mark(base).0;
+                                eprintln!("fatal: bad object {name}");
+                                return Ok(ExitCode::from(128));
+                            }
+                            // `return 0` leaves `arg` alone, so the operand keeps
+                            // its mark and cannot resolve.
+                            crate::objname::Parents::None => {
+                                if ignore_missing {
+                                    continue;
+                                }
+                                return Ok(fatal_rev(repo, spec));
+                            }
+                            crate::objname::Parents::Queued => {}
+                        }
+                        for (id, not) in queued {
+                            if not {
+                                hidden.push(id);
+                            } else {
+                                tips.push(id);
+                            }
+                        }
+                        // `^@` claimed the operand outright.
+                        if replaces {
+                            continue;
+                        }
+                        base
+                    }
+                };
                 if let Some(rest) = spec.strip_prefix('^') {
                     match resolve(repo, rest) {
                         Some(id) => {

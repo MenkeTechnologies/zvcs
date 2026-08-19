@@ -91,6 +91,27 @@ fn unresolvable(repo: &gix::Repository, spec: &str) -> String {
     super::log::bad_revision_message_in(repo, spec)
 }
 
+/// [`unresolvable`] with `handle_revision_arg()`'s `REVARG_CANNOT_BE_FILENAME` in
+/// hand.
+///
+/// ```c
+/// if (seen_dashdash)
+///         revarg_opt |= REVARG_CANNOT_BE_FILENAME;
+/// …
+/// if (handle_revision_arg(arg, revs, flags, revarg_opt)) {
+///         if (seen_dashdash || *arg == '^')
+///                 die(_("bad revision '%s'"), arg);
+/// ```
+///
+/// (`revision.c:3035-3036`, `revision.c:3080-3087`.) An argument vector that
+/// carries a `--` anywhere, and every line `read_revisions_from_stdin()` reads,
+/// take the short `bad revision '<arg>'` instead of `verify_filename()`'s
+/// "ambiguous argument" block — stock 2.55.0 answers
+/// `fatal: bad revision 'nosuchrev'` for `git rev-list nosuchrev -- base.txt`.
+fn unresolvable_in(repo: &gix::Repository, spec: &str, cant_be_filename: bool) -> String {
+    super::log::bad_revision_message_in_gated(repo, spec, cant_be_filename)
+}
+
 /// Reject a malformed integer flag value exactly as git does: `fatal: '<v>': not
 /// an integer`, exit 128 — not the 129 usage path.
 fn not_an_integer(value: &str) -> ExitCode {
@@ -127,6 +148,64 @@ enum Order {
     Topo,
     /// `--date-order`: no parent before all its children, otherwise by date.
     DateTopo,
+}
+
+/// Where one argument in the scanned vector came from.
+///
+/// `read_revisions_from_stdin()` (`revision.c:2937-2983`) reads its lines from
+/// inside `setup_revisions()`'s own loop, so they are spliced into the vector at
+/// the `--stdin` position — but they are not argv, and the reader treats them
+/// differently in four ways: only pseudo-options are accepted, a failed revision
+/// is `bad revision '<line>'` rather than a pathspec, `--end-of-options` switches
+/// the option test off for the rest of the block, and the reader keeps its **own**
+/// `int flags = 0` — so an argv `--not` written before `--stdin` does not reach
+/// the stdin lines, and a `--not` among them does not reach the argv that follows.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Origin {
+    Argv,
+    /// A `--stdin` line read before any `--end-of-options`.
+    Stdin,
+    /// A `--stdin` line read after one, which is a revision whatever it looks like.
+    StdinAfterEndOfOptions,
+    /// The sentinel closing a spliced block: restores the `--not` state the argv
+    /// scan held when `--stdin` was reached.
+    StdinEnd(bool),
+}
+
+/// Whether `handle_revision_pseudo_opt()` (`revision.c:2778-2935`) claims `arg`.
+///
+/// The list is that function's own `strcmp`/`skip_prefix`/`parse_long_opt` chain.
+/// It decides one thing here: a `--stdin` line starting with `-` is either one of
+/// these or `fatal: invalid option '<line>' in --stdin mode`. The detached forms
+/// (`--glob <pat>`) cannot occur, because the reader hands the option a one-element
+/// `argv` with no following element to take a value from.
+fn is_revision_pseudo_opt(arg: &str) -> bool {
+    const EXACT: &[&str] = &[
+        "--all",
+        "--branches",
+        "--bisect",
+        "--tags",
+        "--remotes",
+        "--reflog",
+        "--indexed-objects",
+        "--alternate-refs",
+        "--not",
+        "--no-walk",
+        "--do-walk",
+        "--single-worktree",
+        "--no-filter",
+    ];
+    const PREFIX: &[&str] = &[
+        "--glob=",
+        "--exclude=",
+        "--exclude-hidden=",
+        "--branches=",
+        "--tags=",
+        "--remotes=",
+        "--no-walk=",
+        "--filter=",
+    ];
+    EXACT.contains(&arg) || PREFIX.iter().any(|p| arg.starts_with(p))
 }
 
 /// One command-line revision together with the flags `setup_revisions()` puts on
@@ -194,6 +273,9 @@ struct ObjectWalk<'a> {
 ///                                       follow, until the next `--not`
 ///   * `<rev>^@` / `<rev>^!`          — the parents alone, or the commit with its
 ///                                       parents excluded
+///   * `<rev>^-[<n>]`                 — the commit with its `<n>`th parent
+///                                       excluded (`<n>` defaults to 1), i.e.
+///                                       `<rev> ^<rev>^<n>`
 ///   * `--all` / `--branches` / `--tags` / `--remotes`, each with an optional
 ///     `=<pattern>`, and `--glob=<pattern>` — seed from a ref set, at the position
 ///     the flag appears
@@ -203,7 +285,13 @@ struct ObjectWalk<'a> {
 ///   * `--exclude=<pattern>`          — drop refs from the next ref-set flag, and
 ///                                       only that one (`clear_ref_exclusions`)
 ///   * `--stdin`                      — read further revisions, and pathspecs
-///                                       after a `--` line, from standard input
+///                                       after a `--` line, from standard input,
+///                                       *at the position the flag appears* and
+///                                       with a `--not` state of its own; an
+///                                       empty line ends the read, a line
+///                                       starting with `-` must be a
+///                                       pseudo-option, and a second `--stdin`
+///                                       is `fatal: --stdin given twice?`
 ///   * `--no-walk[=(sorted|unsorted)]` — list the named commits only, in commit-date
 ///                                       order or in the order they were pended
 /// ```
@@ -358,12 +446,61 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     let mut all_match = false;
     let mut invert_grep = false;
 
+    // git's argument vector, with each `--stdin` line spliced in *at the position
+    // the option was written*: `setup_revisions()` calls
+    // `read_revisions_from_stdin()` from inside its own argument loop
+    // (`revision.c:3058`), so `printf dup | git rev-list --stdin --not tri` reads
+    // `dup` while `flags` is still empty and only then meets `--not`. Reading
+    // stdin after the loop instead inverts that — and produces a different commit
+    // set at exit 0, not merely a different warning order.
+    let mut argv: Vec<String> = args.to_vec();
+    let mut origin: Vec<Origin> = vec![Origin::Argv; argv.len()];
+
     let mut i = 0;
-    'args: while i < args.len() {
-        let a = args[i].as_str();
+    'args: while i < argv.len() {
+        // Cloned rather than borrowed: a `--stdin` reached here splices its lines
+        // into `argv` while the scan is still running.
+        let a = argv[i].clone();
+        let a = a.as_str();
+        // A `--stdin` line that is not a revision is a *pseudo*-option or nothing:
+        // `read_revisions_from_stdin()` never reaches `handle_revision_opt()`.
+        //
+        // ```c
+        // if (!seen_end_of_options && sb.buf[0] == '-') {
+        //         const char *argv[] = { sb.buf, NULL };
+        //         if (!strcmp(sb.buf, "--end-of-options")) { seen_end_of_options = 1; continue; }
+        //         if (handle_revision_pseudo_opt(revs, argv, &flags) > 0) continue;
+        //         die(_("invalid option '%s' in --stdin mode"), sb.buf);
+        // }
+        // ```
+        //
+        // (`revision.c:2962-2973`.)
+        if let Origin::StdinEnd(saved) = origin[i] {
+            negate = saved;
+            i += 1;
+            continue 'args;
+        }
+        if origin[i] == Origin::Stdin && a.starts_with('-') && !is_revision_pseudo_opt(a) {
+            return Ok(fatal(&format!("invalid option '{a}' in --stdin mode")));
+        }
         // How many revisions were already pending when this argument was reached,
         // so the `--no-walk` rule at the end of the iteration can see what it added.
         let seeds_before = seeds.len();
+        // `seen_end_of_options` inside the stdin reader: every line after it goes
+        // straight to `handle_revision_arg()`, whatever it starts with.
+        if origin[i] == Origin::StdinAfterEndOfOptions {
+            super::log::warn_operand(&repo, a, false);
+            if let Err(e) = seed_revision(&repo, a, negate, true, &mut seeds, &mut pending_tags) {
+                return Ok(fatal_text(&e));
+            }
+            note_parsed(&repo, a, &seeds[seeds_before..], &mut parsed_commits)?;
+            rev_input_given = true;
+            if seeds[seeds_before..].iter().any(|s| s.uninteresting) {
+                no_walk = false;
+            }
+            i += 1;
+            continue 'args;
+        }
         // git's `parse_long_opt` takes a value attached (`--grep=x`) or detached
         // (`--grep x`); these are the rev-list options that carry one.
         for (name, sink) in [
@@ -371,21 +508,21 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
             ("author", &mut author_pats),
             ("committer", &mut committer_pats),
         ] {
-            if let Some(v) = long_opt_value(args, i, name) {
+            if let Some(v) = long_opt_value(&argv, i, name) {
                 sink.push(v.value);
                 i += v.consumed;
                 continue 'args;
             }
         }
         for name in ["since", "after"] {
-            if let Some(v) = long_opt_value(args, i, name) {
+            if let Some(v) = long_opt_value(&argv, i, name) {
                 max_age = Some(approxidate(&v.value));
                 i += v.consumed;
                 continue 'args;
             }
         }
         for name in ["until", "before"] {
-            if let Some(v) = long_opt_value(args, i, name) {
+            if let Some(v) = long_opt_value(&argv, i, name) {
                 min_age = Some(approxidate(&v.value));
                 i += v.consumed;
                 continue 'args;
@@ -397,13 +534,13 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
         // `approxidate()`, so a value that is not a number is fatal rather than
         // silently "now".
         for name in ["max-age", "min-age"] {
-            let Some(v) = long_opt_value(args, i, name) else {
+            let Some(v) = long_opt_value(&argv, i, name) else {
                 continue;
             };
             // `parse_long_opt()` (diff.c:5380-5399) dies when the detached form
             // runs off the end of argv; [`long_opt_value`] answers with an empty
             // string there, which is a *different* value git accepts as written.
-            if v.consumed == 2 && args.get(i + 1).is_none() {
+            if v.consumed == 2 && argv.get(i + 1).is_none() {
                 return Ok(fatal(&format!("Option '--{name}' requires a value")));
             }
             let Ok(age) = super::log::parse_age(&v.value) else {
@@ -481,6 +618,17 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
             // prints. It is still `setup_revisions()`'s option and must be
             // accepted; see [`super::log::EmailStyle::REV_LIST`].
             "--encode-email-headers" | "--no-encode-email-headers" => {}
+            // ```c
+            // } else if (!strcmp(arg, "--single-worktree")) {
+            //         revs->single_worktree = 1;
+            // ```
+            //
+            // (`revision.c:2903-2904`.) The flag only decides whether `--all` and
+            // `--reflog` reach into *other* worktrees' HEADs; this port reads the
+            // main ref store either way, so setting it changes nothing here. It is
+            // still `setup_revisions()`'s option and rejecting it is a refusal git
+            // never prints.
+            "--single-worktree" => {}
             "--topo-order" => order = Order::Topo,
             "--date-order" => order = Order::DateTopo,
             "--merges" => min_parents = 2,
@@ -505,7 +653,65 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
             }
             "--no-walk" => no_walk = true,
             "--do-walk" => no_walk = false,
-            "--stdin" => read_stdin = true,
+            // ```c
+            // if (!strcmp(arg, "--stdin")) {
+            //         if (revs->disable_stdin) { … continue; }
+            //         if (revs->read_from_stdin++)
+            //                 die("--stdin given twice?");
+            //         read_revisions_from_stdin(revs, &prune_data);
+            //         continue;
+            // }
+            // ```
+            //
+            // (`revision.c:3047-3057`.) The read happens *here*, in the middle of
+            // the argument scan, so the lines are spliced in at this position and
+            // the scan carries on over them with whatever `--not` currently holds.
+            "--stdin" => {
+                if read_stdin {
+                    return Ok(fatal("--stdin given twice?"));
+                }
+                read_stdin = true;
+                let mut text = String::new();
+                std::io::stdin().read_to_string(&mut text)?;
+                let mut lines: Vec<String> = Vec::new();
+                let mut kinds: Vec<Origin> = Vec::new();
+                let mut seen_end_of_options = false;
+                let mut rest = text.lines();
+                for line in rest.by_ref() {
+                    // `strbuf_getline()` strips a trailing CR of its own.
+                    let line = line.strip_suffix('\r').unwrap_or(line);
+                    // `if (!sb.len) break;` — an empty line ends the *whole* read,
+                    // pathspecs included, rather than being skipped.
+                    if line.is_empty() {
+                        break;
+                    }
+                    if line == "--" {
+                        // `seen_dashdash = 1; break;` then
+                        // `read_pathspec_from_stdin()`: every remaining line is a
+                        // pathspec, empty ones included.
+                        pathspecs.extend(rest.map(|p| p.as_bytes().to_vec()));
+                        break;
+                    }
+                    if !seen_end_of_options && line == "--end-of-options" {
+                        seen_end_of_options = true;
+                        continue;
+                    }
+                    lines.push(line.to_string());
+                    kinds.push(if seen_end_of_options {
+                        Origin::StdinAfterEndOfOptions
+                    } else {
+                        Origin::Stdin
+                    });
+                }
+                // `read_revisions_from_stdin()`'s `int flags = 0;` is its own, so
+                // the block starts with `--not` cleared and the argv scan gets its
+                // state back at the sentinel.
+                lines.push(String::new());
+                kinds.push(Origin::StdinEnd(negate));
+                negate = false;
+                argv.splice(i + 1..i + 1, lines);
+                origin.splice(i + 1..i + 1, kinds);
+            }
             "-i" | "--regexp-ignore-case" => ignore_case = true,
             "-E" | "--extended-regexp" => dialect = Dialect::Extended,
             "-F" | "--fixed-strings" => dialect = Dialect::Fixed,
@@ -544,7 +750,7 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
             }
             "-n" => {
                 i += 1;
-                let Some(n) = args.get(i) else {
+                let Some(n) = argv.get(i) else {
                     eprintln!("error: -n requires an argument");
                     return Ok(ExitCode::from(128));
                 };
@@ -555,7 +761,7 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
             }
             "--" => {
                 // Everything after `--` is a pathspec, never a rev or flag.
-                pathspecs.extend(args[i + 1..].iter().map(|s| s.as_bytes().to_vec()));
+                pathspecs.extend(argv[i + 1..].iter().map(|s| s.as_bytes().to_vec()));
                 break;
             }
             // `--exclude=<glob>` accumulates until the next ref-selecting option
@@ -563,7 +769,7 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
             // between leaves the accumulation alone.
             "--exclude" => {
                 i += 1;
-                let Some(v) = args.get(i) else {
+                let Some(v) = argv.get(i) else {
                     eprintln!("error: option 'exclude' requires a value");
                     return Ok(usage_error());
                 };
@@ -574,7 +780,7 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
             }
             "--glob" => {
                 i += 1;
-                let Some(v) = args.get(i) else {
+                let Some(v) = argv.get(i) else {
                     eprintln!("error: option 'glob' requires a value");
                     return Ok(usage_error());
                 };
@@ -721,7 +927,9 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
             // `append_prune_data()`, and the pathspec layer rejects it for
             // leaving the repository. See
             // [`crate::objname::is_parent_directory_pathspec`].
-            s if crate::objname::is_parent_directory_pathspec(s, seen_dashdash) => {
+            s if origin[i] == Origin::Argv
+                && crate::objname::is_parent_directory_pathspec(s, seen_dashdash) =>
+            {
                 pathspecs.push(s.as_bytes().to_vec());
             }
             s => {
@@ -730,8 +938,21 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
                 // short-circuit across a range's endpoints. `rev-list` runs the
                 // same `setup_revisions()` as `log`, so the rule is shared rather
                 // than restated.
-                super::log::warn_operand(&repo, s, true);
-                if let Err(e) = seed_revision(&repo, s, negate, &mut seeds, &mut pending_tags) {
+                //
+                // `read_revisions_from_stdin()` brackets its loop with
+                // `cfg->warn_on_object_refname_ambiguity = 0`, which gates
+                // `get_oid_basic()`'s *full-hex* branch alone — a plain refname on
+                // stdin still warns, and does so at this position.
+                let from_stdin = origin[i] != Origin::Argv;
+                super::log::warn_operand(&repo, s, !from_stdin);
+                if let Err(e) = seed_revision(
+                    &repo,
+                    s,
+                    negate,
+                    seen_dashdash || from_stdin,
+                    &mut seeds,
+                    &mut pending_tags,
+                ) {
                     return Ok(fatal_text(&e));
                 }
                 note_parsed(&repo, s, &seeds[seeds_before..], &mut parsed_commits)?;
@@ -773,45 +994,6 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
         let mut config = repo.config_snapshot_mut();
         config.append_config(Some(format!("core.abbrev={n}")), gix::config::Source::Cli)?;
         config.commit()?;
-    }
-
-    if read_stdin {
-        // `read_revisions_from_stdin()` brackets its whole loop with
-        // `cfg->warn_on_object_refname_ambiguity = 0`, so names arriving on stdin
-        // never produce the ambiguity warning that the same names on argv do.
-        let _quiet_ambiguity = crate::objname::AmbiguityWarnings::off();
-        let mut text = String::new();
-        std::io::stdin().read_to_string(&mut text)?;
-        // `read_revisions_from_stdin` reads revisions until a bare `--`, after
-        // which every remaining line is a pathspec.
-        let mut in_paths = false;
-        for line in text.lines() {
-            if line.is_empty() {
-                continue;
-            }
-            if in_paths {
-                pathspecs.push(line.as_bytes().to_vec());
-            } else if line == "--" {
-                in_paths = true;
-            } else {
-                let seeds_before = seeds.len();
-                // The ambiguity half is switched off for the whole loop above;
-                // the reflog-reach half carries no such gate and fires for a
-                // stdin line exactly as it does for an argv operand.
-                super::log::warn_operand(&repo, line, false);
-                if let Err(e) = seed_revision(&repo, line, negate, &mut seeds, &mut pending_tags) {
-                    return Ok(fatal_text(&e));
-                }
-                note_parsed(&repo, line, &seeds[seeds_before..], &mut parsed_commits)?;
-                // The same `handle_revision_arg()` reads these lines, so an
-                // exclusion arriving on stdin cancels `--no-walk` just as one on
-                // the command line does.
-                if seeds[seeds_before..].iter().any(|s| s.uninteresting) {
-                    no_walk = false;
-                }
-                rev_input_given = true;
-            }
-        }
     }
 
     if filter.is_some() && !objects {
@@ -1485,10 +1667,65 @@ fn seed_revision(
     repo: &gix::Repository,
     spec: &str,
     negate: bool,
+    cant_be_filename: bool,
     seeds: &mut Vec<Seed>,
     tags: &mut Vec<(ObjectId, Vec<u8>)>,
 ) -> Result<(), String> {
-    let unknown = |s: &str| unresolvable(repo, s);
+    let unknown = |s: &str| unresolvable_in(repo, s, cant_be_filename);
+    // `handle_revision_arg_1()`'s parent-mark block, decoded once for every verb
+    // by [`crate::objname::parents_only`]: `<rev>^@` pends the parents alone and
+    // returns, while `<rev>^!` and `<rev>^-<n>` pend the selected parents with
+    // `flags ^ (UNINTERESTING | BOTTOM)` and then put the truncated name back in
+    // `arg` so the commit itself is pended after them.
+    //
+    // The mark is found with `strstr`'s first-match rule rather than by stripping
+    // a suffix, which is why `main^!^!` carries no mark at all.
+    let spec: &str = match crate::objname::parents_only(spec) {
+        crate::objname::ParentsOnly::Absent => spec,
+        // `strtol_i()` refused the `<n>`, so `add_parents_only()` is never
+        // reached and the operand is neither resolved nor queued.
+        crate::objname::ParentsOnly::BadParent => return Err(unknown(spec)),
+        crate::objname::ParentsOnly::Mark { base, nth, replaces } => {
+            // `^@` keeps `flags`; `^!` and `^-<n>` pass
+            // `flags ^ (UNINTERESTING | BOTTOM)`.
+            let sense = if replaces { negate } else { !negate };
+            let mut queued = Vec::new();
+            let mut queue = |_name: &str, id: ObjectId, not: bool| queued.push((id, not));
+            let answer = crate::objname::add_parents_only(repo, base, sense, nth, &mut queue);
+            match answer {
+                // `get_reference()`'s `die(_("bad object %s"), name)`, naming the
+                // base with its leading `^` already stripped.
+                crate::objname::Parents::BadObject => {
+                    let name = crate::objname::uninteresting_mark(base).0;
+                    return Err(format!("bad object {name}"));
+                }
+                // `return 0` leaves `arg` alone, so the operand carries its mark
+                // into the ordinary resolution — where it cannot resolve.
+                crate::objname::Parents::None => return Err(unknown(spec)),
+                crate::objname::Parents::Queued => {}
+            }
+            for (id, not) in queued {
+                seeds.push(Seed {
+                    id,
+                    uninteresting: not,
+                    symmetric_left: false,
+                    bottom: not,
+                });
+            }
+            // `if (add_parents_only(…)) { ret = 0; goto out; }` — `^@` claimed the
+            // operand outright and never pends the named commit.
+            if replaces {
+                return Ok(());
+            }
+            // `arg = arg_minus_excl;` / `arg = arg_minus_dash;` — the base still
+            // carries its own leading `^`, which the exclusion step below strips
+            // for a *second* time, exactly as `handle_revision_arg_1()` does.
+            base
+        }
+    };
+
+    // `if (*arg == '^') { local_flags = UNINTERESTING | BOTTOM; arg++; }`, which
+    // `handle_revision_arg_1()` reaches only after the marks are done with.
     if let Some(rest) = spec.strip_prefix('^') {
         let id = resolve(repo, rest, tags).ok_or_else(|| unknown(spec))?;
         seeds.push(Seed {
@@ -1497,41 +1734,6 @@ fn seed_revision(
             symmetric_left: false,
             bottom: !negate,
         });
-        return Ok(());
-    }
-    // `add_parents_only()`: `<rev>^@` pends the parents alone and returns, while
-    // `<rev>^!` pends them with `flags ^ (UNINTERESTING | BOTTOM)` and then falls
-    // through so the commit itself is pended after them.
-    if let Some(base) = spec.strip_suffix("^@").or_else(|| spec.strip_suffix("^!")) {
-        let excludes_parents = spec.ends_with("^!");
-        let id = resolve(repo, base, tags).ok_or_else(|| unknown(spec))?;
-        let parents: Vec<ObjectId> = match repo.find_object(id).and_then(|o| o.peel_tags_to_end()) {
-            Ok(o) => match o.try_into_commit() {
-                Ok(c) => c.parent_ids().map(|p| p.detach()).collect(),
-                // `if (it->type != OBJ_COMMIT) return 0;` — a non-commit makes
-                // `add_parents_only()` fail, and the spelling falls back to being
-                // read as an ordinary revision.
-                Err(_) => return seed_plain(repo, spec, negate, seeds, tags),
-            },
-            Err(_) => return Err(unknown(spec)),
-        };
-        let parents_negated = if excludes_parents { !negate } else { negate };
-        for p in parents {
-            seeds.push(Seed {
-                id: p,
-                uninteresting: parents_negated,
-                symmetric_left: false,
-                bottom: parents_negated,
-            });
-        }
-        if excludes_parents {
-            seeds.push(Seed {
-                id,
-                uninteresting: negate,
-                symmetric_left: false,
-                bottom: negate,
-            });
-        }
         return Ok(());
     }
     if let Some((l, r)) = spec.split_once("...") {
@@ -1583,7 +1785,7 @@ fn seed_revision(
         });
         return Ok(());
     }
-    seed_plain(repo, spec, negate, seeds, tags)
+    seed_plain(repo, spec, negate, cant_be_filename, seeds, tags)
 }
 
 /// Record the commits reading one revision word caused to be parsed.
@@ -1615,10 +1817,12 @@ fn seed_plain(
     repo: &gix::Repository,
     spec: &str,
     negate: bool,
+    cant_be_filename: bool,
     seeds: &mut Vec<Seed>,
     tags: &mut Vec<(ObjectId, Vec<u8>)>,
 ) -> Result<(), String> {
-    let id = resolve(repo, spec, tags).ok_or_else(|| unresolvable(repo, spec))?;
+    let id = resolve(repo, spec, tags)
+        .ok_or_else(|| unresolvable_in(repo, spec, cant_be_filename))?;
     seeds.push(Seed {
         id,
         uninteresting: negate,
@@ -2095,7 +2299,9 @@ fn resolve(
     spec: &str,
     tags: &mut Vec<(ObjectId, Vec<u8>)>,
 ) -> Option<ObjectId> {
-    let id = repo.rev_parse_single(spec).ok()?.detach();
+    // `at_mark()` compares with `strncasecmp`, so `main@{PUSH}` is the same
+    // operand as `main@{push}`; gitoxide's parser is case-sensitive.
+    let id = repo.rev_parse_single(crate::objname::canonical_at_marks(spec).as_ref()).ok()?.detach();
     peel_recording_tags(repo, id, tags)
 }
 

@@ -21,6 +21,16 @@
 //! `a...b` prints `b`, `a`, then `^<merge-base>` for each merge base — matching
 //! stock git's left-to-right emission.
 //!
+//! The parent shorthands expand at their position too, through
+//! `try_parent_shorthands()` (`builtin/rev-parse.c:328-390`) rather than the
+//! object-name parser: `<rev>^!` prints the rev and `^<parent>` per parent,
+//! `<rev>^@` prints the parents alone, and `<rev>^-[<n>]` prints the rev and the
+//! one selected parent. They run *after* the range split and before the single
+//! name is resolved, they are not gated on `--verify`, and the `<n>` is
+//! `strtoul` here rather than the walk's `strtol_i`. An operand that still
+//! carries one of the three marks when the ordinary resolution is reached cannot
+//! resolve at all — `get_oid_1()` has no case for them.
+//!
 //! Implemented: `--verify`, `-q`/`--quiet`, `--short[=n]`,
 //! `--abbrev-ref[=(strict|loose)]`, `--symbolic`, `--symbolic-full-name`,
 //! `--git-dir`, `--absolute-git-dir`, `--git-common-dir`, `--show-toplevel`,
@@ -267,6 +277,21 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
             continue;
         }
 
+        // ```c
+        // /* Not a flag argument */
+        // if (try_difference(arg))
+        //         continue;
+        // if (try_parent_shorthands(arg))
+        //         continue;
+        // ```
+        //
+        // (`builtin/rev-parse.c:1158-1162`.) The parent shorthands are decided
+        // *before* the operand is resolved as a single name, so a name they claim
+        // never reaches `repo_get_oid_with_flags()` at all.
+        if try_parent_shorthands(&mut out, &repo, &o, arg)? {
+            continue;
+        }
+
         // An empty argument is never a revision and never a path, even though
         // joining it onto the worktree root would name the root itself.
         let resolved = if arg.is_empty() {
@@ -327,8 +352,13 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
                 // answers for names git rejects and rejects names git answers.
                 if crate::objname::is_reflog_operand(arg) {
                     crate::objname::reflog_oid(&repo, arg)
+                } else if carries_walk_mark(arg) {
+                    None
                 } else {
-                    repo.rev_parse_single(arg.as_str()).ok().map(|id| id.detach())
+                    repo
+                        .rev_parse_single(crate::objname::canonical_at_marks(arg).as_ref())
+                        .ok()
+                        .map(|id| id.detach())
                 }
             })
         };
@@ -363,7 +393,10 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
                 // own refusal — from `get_oid_basic()`'s `repo_dwim_log()` branch
                 // above. Re-asking gitoxide's full grammar would resolve names git
                 // rejects (`HEAD@{0}` off a stale log under an unborn HEAD).
-                let parsed = if arg.is_empty() || crate::objname::is_reflog_operand(arg) {
+                let parsed = if arg.is_empty()
+                    || crate::objname::is_reflog_operand(arg)
+                    || carries_walk_mark(arg)
+                {
                     None
                 } else {
                     repo.rev_parse(arg.as_str()).ok().and_then(|s| match s.detach() {
@@ -596,7 +629,11 @@ fn full_hex_spec(repo: &gix::Repository, arg: &str) -> Option<Parsed> {
 /// One side of a range, resolved the way `get_oid()` resolves it: a full-length
 /// hex is its own answer, everything else goes to the ordinary parser.
 fn endpoint(repo: &gix::Repository, name: &str) -> Option<ObjectId> {
-    crate::objname::full_hex(repo, name).or_else(|| repo.rev_parse_single(name).ok().map(|id| id.detach()))
+    // `repo_get_oid_committish()` and nothing wider: an endpoint still carrying a
+    // `^!`/`^@`/`^-<n>` mark has no case in `get_oid_1()`, so `try_difference()`
+    // declines the whole token rather than resolving half of it through
+    // gitoxide's `Spec::ExcludeParents`.
+    crate::objname::resolve_quiet(repo, name)
 }
 
 /// `die_no_single_rev` in stock git: silent exit 1 under `--quiet`, else fatal.
@@ -897,6 +934,187 @@ fn is_worktree_path(repo: &gix::Repository, arg: &str) -> bool {
         .is_some_and(|p| p.symlink_metadata().is_ok())
 }
 
+/// Whether `arg` still carries a revision-walk mark (`^!`, `^@`, `^-<n>`) where
+/// `cmd_rev_parse()` would hand it to the object-name parser.
+///
+/// `get_oid_1()` has no case for any of the three: they are
+/// `handle_revision_arg_1()`'s grammar, and `try_parent_shorthands()` is the only
+/// thing in `rev-parse` that reads them. So an operand that reaches
+/// `repo_get_oid_with_flags()` — or `try_difference()`'s
+/// `repo_get_oid_committish()`, one endpoint at a time — while still carrying one
+/// cannot resolve, however much wider gitoxide's own revspec grammar is.
+///
+/// The leading `^` is stripped first because `cmd_rev_parse()` strips it before
+/// resolving (`builtin/rev-parse.c:1163-1167`), which is why `^main^!` is refused
+/// while `^main` is an ordinary exclude.
+fn carries_walk_mark(arg: &str) -> bool {
+    let name = crate::objname::uninteresting_mark(arg).0;
+    match crate::objname::split_range(name) {
+        Some(range) => {
+            crate::objname::has_walk_mark(range.a) || crate::objname::has_walk_mark(range.b)
+        }
+        None => crate::objname::has_walk_mark(name),
+    }
+}
+
+/// `try_parent_shorthands()` (`builtin/rev-parse.c:328-390`):
+///
+/// ```c
+/// if ((mark = strstr(arg, "^!"))) {
+///         include_rev = 1;
+///         if (mark[2])
+///                 return 0;
+/// } else if ((mark = strstr(arg, "^@"))) {
+///         include_parents = 1;
+///         if (mark[2])
+///                 return 0;
+/// } else if ((mark = strstr(arg, "^-"))) {
+///         include_rev = 1;
+///         exclude_parent = 1;
+///         if (mark[2]) {
+///                 char *end;
+///                 exclude_parent = strtoul(mark + 2, &end, 10);
+///                 if (*end != '\0' || !exclude_parent)
+///                         return 0;
+///         }
+/// } else
+///         return 0;
+///
+/// arg = to_free = xmemdupz(arg, mark - arg);
+/// if (repo_get_oid_committish(the_repository, arg, &oid) ||
+///     !(commit = lookup_commit_reference(the_repository, &oid))) { … return 0; }
+/// if (exclude_parent &&
+///     exclude_parent > commit_list_count(commit->parents)) { … return 0; }
+/// if (include_rev)
+///         show_rev(NORMAL, &oid, arg);
+/// for (parents = commit->parents, parent_number = 1; parents;
+///      parents = parents->next, parent_number++) {
+///         char *name = NULL;
+///         if (exclude_parent && parent_number != exclude_parent)
+///                 continue;
+///         if (symbolic)
+///                 name = xstrfmt("%s^%d", arg, parent_number);
+///         show_rev(include_parents ? NORMAL : REVERSED, &parents->item->object.oid, name);
+///         free(name);
+/// }
+/// return 1;
+/// ```
+///
+/// Four details a re-derivation gets wrong:
+///
+///   * The mark is found with `strstr`, i.e. anywhere in the operand, and the
+///     three tests are an `else if` chain — so `main^!x` is refused outright
+///     rather than falling through to the `^-` case.
+///   * `show_rev(NORMAL, &oid, arg)` prints the id `repo_get_oid_committish()`
+///     produced, *not* the peeled commit: `<annotated-tag>^!` leads with the tag
+///     object's own id and follows it with the tagged commit's parents.
+///   * The `--symbolic` name is `<base>^<n>` and is built only when `symbolic` is
+///     set. `--abbrev-ref` alone leaves it `NULL`, and `show_rev()` then prints
+///     the parent's hex rather than trying to name it.
+///   * `verify` is not consulted at all, so `rev-parse --verify <rev>^!` prints
+///     every line and *then* fails `Needed a single revision` with `revs_count`
+///     still zero.
+fn try_parent_shorthands(
+    out: &mut impl Write,
+    repo: &gix::Repository,
+    o: &Opts,
+    arg: &str,
+) -> Result<bool> {
+    let (at, include_rev, include_parents, exclude_parent) = if let Some(at) = arg.find("^!") {
+        if !arg[at + 2..].is_empty() {
+            return Ok(false);
+        }
+        (at, true, false, 0i32)
+    } else if let Some(at) = arg.find("^@") {
+        if !arg[at + 2..].is_empty() {
+            return Ok(false);
+        }
+        (at, false, true, 0i32)
+    } else if let Some(at) = arg.find("^-") {
+        let tail = &arg[at + 2..];
+        let n = if tail.is_empty() { 1 } else { strtoul_int(tail).unwrap_or(0) };
+        // `if (*end != '\0' || !exclude_parent) return 0;`
+        if n == 0 {
+            return Ok(false);
+        }
+        (at, true, false, n)
+    } else {
+        return Ok(false);
+    };
+
+    let base = &arg[..at];
+    // `repo_get_oid_committish()`, which is where an ambiguous base earns its
+    // `warning: refname '<name>' is ambiguous.` — the operand never reaches the
+    // scan's own warning because a claimed one `continue`s.
+    let Some(oid) = crate::objname::resolve(repo, base) else {
+        return Ok(false);
+    };
+    // `lookup_commit_reference()` peels tags and reports the object's own type
+    // when nothing commit-ish is behind it, on stderr and without failing.
+    let commit = match crate::sequencer::peel_id(repo, oid) {
+        crate::sequencer::Side::Commit(id) => id,
+        crate::sequencer::Side::NotACommit(kind) => {
+            out.flush()?;
+            eprintln!("error: object {oid} is a {kind}, not a commit");
+            return Ok(false);
+        }
+        crate::sequencer::Side::Unresolved => return Ok(false),
+    };
+    let Ok(commit) = repo.find_commit(commit) else {
+        return Ok(false);
+    };
+    let parents: Vec<ObjectId> = commit.parent_ids().map(|id| id.detach()).collect();
+    // `exclude_parent > commit_list_count(commit->parents)`, where the count is
+    // unsigned: a `strtoul` result that wrapped an `int` negative compares as a
+    // huge number and is refused here rather than silently selecting no parent.
+    if exclude_parent != 0 && exclude_parent as u32 > parents.len() as u32 {
+        return Ok(false);
+    }
+
+    if include_rev {
+        show_rev(out, repo, o, &oid, Some(base.as_bytes().as_bstr()), None, false)?;
+    }
+    for (n, parent) in parents.iter().enumerate() {
+        let number = n as i32 + 1;
+        if exclude_parent != 0 && number != exclude_parent {
+            continue;
+        }
+        let name = matches!(o.sym, Sym::AsIs | Sym::Full).then(|| format!("{base}^{number}"));
+        show_rev(
+            out,
+            repo,
+            o,
+            parent,
+            name.as_deref().map(|n| n.as_bytes().as_bstr()),
+            None,
+            !include_parents,
+        )?;
+    }
+    Ok(true)
+}
+
+/// `strtoul(mark + 2, &end, 10)` with the whole tail consumed, reduced to the
+/// `int` `try_parent_shorthands()` stores it in.
+///
+/// `strtoul` skips leading whitespace and takes an optional sign, negating on
+/// `-`, so `^- 1` and `^-+1` are parent 1 while `^--1` becomes `ULONG_MAX` and
+/// then `-1` — non-zero, so it survives the `!exclude_parent` test and is caught
+/// by the unsigned bounds comparison instead. Overflow saturates the same way.
+/// `None` is `*end != '\0'`: a tail with anything left over.
+fn strtoul_int(tail: &str) -> Option<i32> {
+    let body = tail.trim_start_matches([' ', '\t', '\n', '\r', '\x0b', '\x0c']);
+    let (negate, digits) = match body.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, body.strip_prefix('+').unwrap_or(body)),
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let magnitude = digits.parse::<u64>().unwrap_or(u64::MAX);
+    let value = if negate { 0u64.wrapping_sub(magnitude) } else { magnitude };
+    Some(value as u32 as i32)
+}
+
 /// Render one resolved revision.
 ///
 /// `name` is the text the revision came in as — the command-line argument for a
@@ -916,7 +1134,19 @@ fn show_rev(
     // nothing" — and for a `^rev` exclude the `^` is suppressed along with it,
     // which is why `rev-parse --abbrev-ref ^HEAD~1` prints an empty result
     // rather than a bare `^`.
-    let payload: Option<Vec<u8>> = if o.abbrev_ref || o.sym == Sym::Full {
+    // ```c
+    // if ((symbolic || abbrev_ref) && name) { … }
+    // else if (abbrev) …
+    // else show_with_type(type, oid_to_hex(oid));
+    // ```
+    //
+    // (`builtin/rev-parse.c:150-186`.) The naming modes are gated on there being
+    // a name at all: `try_parent_shorthands()` passes `NULL` for a parent unless
+    // `--symbolic` asked for `<base>^<n>`, and `--abbrev-ref <rev>^!` therefore
+    // prints the parents as plain hex rather than dropping them.
+    let payload: Option<Vec<u8>> = if (o.abbrev_ref || o.sym == Sym::Full)
+        && (name.is_some() || known_full.is_some())
+    {
         let full = match known_full {
             Some(f) => Some(f.to_owned()),
             None => name.and_then(|n| dwim_full_name(repo, n)),

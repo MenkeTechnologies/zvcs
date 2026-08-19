@@ -533,6 +533,19 @@ fn get_oid_1_has_no_case(spec: &str) -> bool {
     strip_navigation(object_part(spec)).contains('^')
 }
 
+/// [`get_oid_1_has_no_case`] for callers that resolve a name without going
+/// through [`resolve_quiet`].
+///
+/// `builtin/rev-parse.c` is the one such caller: it reaches
+/// `repo_get_oid_with_flags()` for a plain operand and `repo_get_oid_committish()`
+/// for each endpoint of a range, and both land in the same `get_oid_1()` with no
+/// case for `^!`, `^@` or `^-<n>`. Without this test gitoxide's wider grammar
+/// answers where git refuses — `git rev-parse main..side^!` is
+/// `ambiguous argument` in stock 2.55.0.
+pub fn has_walk_mark(spec: &str) -> bool {
+    get_oid_1_has_no_case(spec)
+}
+
 /// `get_oid()` for a single object name: git's ordering, full hex first and the
 /// ordinary revspec parser second.
 ///
@@ -605,7 +618,56 @@ pub fn resolve_quiet(repo: &gix::Repository, spec: &str) -> Option<ObjectId> {
     if is_reflog_operand(spec) {
         return reflog_oid(repo, spec);
     }
-    repo.rev_parse_single(spec).ok().map(|id| id.detach())
+    repo.rev_parse_single(canonical_at_marks(spec).as_ref()).ok().map(|id| id.detach())
+}
+
+/// `spec` with every `@{u}`/`@{upstream}`/`@{push}` mark folded to the spelling
+/// gitoxide's revspec parser recognises.
+///
+/// ```c
+/// static int at_mark(const char *string, int len, const char **suffix, int nr)
+/// {
+///         for (int i = 0; i < nr; i++) {
+///                 int suffix_len = strlen(suffix[i]);
+///                 if (suffix_len <= len && !strncasecmp(string, suffix[i], suffix_len))
+///                         return suffix_len;
+///         }
+///         return 0;
+/// }
+/// ```
+///
+/// (`object-name.c:640-663`.) `strncasecmp`, so `main@{U}`, `main@{UpStReAm}` and
+/// `main@{PUSH}` are the same operands as their lowercase spellings — all three
+/// resolve in stock 2.55.0 and none of them did here. The marks are the same
+/// length as their canonical form, so the fold never moves any other offset.
+pub fn canonical_at_marks(spec: &str) -> std::borrow::Cow<'_, str> {
+    const MARKS: [&str; 3] = ["@{upstream}", "@{u}", "@{push}"];
+    let mut out: Option<String> = None;
+    let mut i = 0;
+    while i < spec.len() {
+        if spec.as_bytes()[i] != b'@' {
+            i += 1;
+            continue;
+        }
+        let rest = &spec[i..];
+        let hit = MARKS
+            .iter()
+            .find(|m| rest.len() >= m.len() && rest[..m.len()].eq_ignore_ascii_case(m));
+        match hit {
+            Some(mark) => {
+                if rest[..mark.len()] != **mark {
+                    let buf = out.get_or_insert_with(|| spec.to_string());
+                    buf.replace_range(i..i + mark.len(), mark);
+                }
+                i += mark.len();
+            }
+            None => i += 1,
+        }
+    }
+    match out {
+        Some(s) => std::borrow::Cow::Owned(s),
+        None => std::borrow::Cow::Borrowed(spec),
+    }
 }
 
 /// Whether `spec` is what `get_oid_basic()` treats as a reflog operand: a
@@ -1556,7 +1618,12 @@ fn split_reflog_selector(spec: &str) -> Option<(&str, &str)> {
     }
     let at = (0..=b.len() - 4).rev().find(|&i| b[i] == b'@' && b[i + 1] == b'{')?;
     let sel = &spec[at + 2..spec.len() - 1];
-    if sel.starts_with('-') || matches!(sel, "u" | "upstream" | "push") {
+    // `upstream_mark()`/`push_mark()` compare with `strncasecmp`, so the marks
+    // are claimed by `interpret_branch_name()` in any case and never reach the
+    // reflog reader.
+    if sel.starts_with('-')
+        || ["u", "upstream", "push"].iter().any(|m| sel.eq_ignore_ascii_case(m))
+    {
         return None;
     }
     Some((&spec[..at], sel))
@@ -1782,15 +1849,19 @@ pub fn reflog_reach_warning(repo: &gix::Repository, spec: &str) -> Option<String
 ///   * `interpret_branch_name()` walks the `@` positions left to right, so
 ///     `a@b@{u}` names the branch `a@b`.
 ///
-/// `@{push}` reaches the same `interpret_branch_mark()` but a different
-/// `get_data`: `branch_get_push()` runs `branch_get_push_1()`'s `push.default`
-/// machinery, whose outcomes include several git does *not* die on
-/// (`push.default=matching` on a branch with no upstream resolves to the branch's
-/// own refname and the operand then fails ordinarily). That is a separate port
-/// and is deliberately not answered here.
+/// `@{push}` reaches the same `interpret_branch_mark()` with a different
+/// `get_data` — `branch_get_push()` — and is answered by [`push_mark_fatal`],
+/// which this delegates to. `interpret_branch_name()` tries `upstream_mark` and
+/// then `push_mark` at each `@` in turn, so the *earlier* `@` decides which of the
+/// two applies and a tie goes to the upstream mark.
 pub fn upstream_mark_fatal(repo: &gix::Repository, spec: &str) -> Option<String> {
     let base = ambiguity_base(spec);
-    let at = upstream_mark_at(base)?;
+    let at = match (upstream_mark_at(base), push_mark_at(base)) {
+        (Some(u), Some(p)) if p < u => return push_mark_fatal(repo, spec),
+        (None, Some(_)) => return push_mark_fatal(repo, spec),
+        (Some(u), _) => u,
+        (None, None) => return None,
+    };
     let named = &base[..at];
     // `branch_get(NULL)` / `branch_get("HEAD")`: the branch HEAD points at, which
     // is `NULL` when HEAD is detached. `head_name()` keeps answering for an unborn
@@ -1819,6 +1890,244 @@ pub fn upstream_mark_fatal(repo: &gix::Repository, spec: &str) -> Option<String>
             gix::bstr::ByteSlice::to_str_lossy(src.as_slice())
         )),
     }
+}
+
+/// The offset of the `@` that opens a `@{push}` mark, as
+/// `interpret_branch_name()`'s left-to-right scan finds it.
+///
+/// `push_mark()` is `at_mark(string, len, { "@{push}" }, 1)`, i.e. the same
+/// `strncasecmp` prefix test `upstream_mark()` uses (`object-name.c:659-663`), so
+/// the mark need not end the operand and its case does not matter.
+pub fn push_mark_at(base: &str) -> Option<usize> {
+    base.bytes().enumerate().filter(|(_, b)| *b == b'@').map(|(i, _)| i).find(|&i| {
+        let rest = &base[i..];
+        rest.len() >= 7 && rest[..7].eq_ignore_ascii_case("@{push}")
+    })
+}
+
+/// The `die()` inside `interpret_branch_mark()` for an operand carrying a
+/// `@{push}` mark whose push destination cannot be named, or `None` when git has
+/// nothing to die about.
+///
+/// The mark reaches the same `interpret_branch_mark()` as `@{u}`
+/// ([`upstream_mark_fatal`]) but with `branch_get_push()` for `get_data`, which is
+/// `branch_get_push_1()` (`remote.c:1904-1966`):
+///
+/// ```c
+/// remote = remotes_remote_get(repo, remotes_pushremote_for_branch(remote_state, branch, NULL));
+/// if (!remote)
+///         return error_buf(err, _("branch '%s' has no remote for pushing"), branch->name);
+/// if (remote->push.nr) {
+///         dst = apply_refspecs(&remote->push, branch->refname);
+///         if (!dst)
+///                 return error_buf(err, _("push refspecs for '%s' do not include '%s'"),
+///                                  remote->name, branch->name);
+///         return tracking_for_push_dest(remote, dst, err);
+/// }
+/// if (remote->mirror)
+///         return tracking_for_push_dest(remote, branch->refname, err);
+/// switch (push_default) {
+/// case PUSH_DEFAULT_NOTHING:
+///         return error_buf(err, _("push has no destination (push.default is 'nothing')"));
+/// case PUSH_DEFAULT_MATCHING:
+/// case PUSH_DEFAULT_CURRENT:
+///         return tracking_for_push_dest(remote, branch->refname, err);
+/// case PUSH_DEFAULT_UPSTREAM:
+///         return xstrdup_or_null(branch_get_upstream(branch, err));
+/// case PUSH_DEFAULT_UNSPECIFIED:
+/// case PUSH_DEFAULT_SIMPLE: {
+///         up = branch_get_upstream(branch, err);
+///         if (!up) return NULL;
+///         cur = tracking_for_push_dest(remote, branch->refname, err);
+///         if (!cur) return NULL;
+///         if (strcmp(cur, up))
+///                 return error_buf(err, _("cannot resolve 'simple' push to a single destination"));
+///         return cur;
+/// }
+/// }
+/// ```
+///
+/// with `tracking_for_push_dest()` (`remote.c:1889-1901`) mapping a destination
+/// back through the *fetch* refspecs:
+///
+/// ```c
+/// ret = apply_refspecs(&remote->fetch, refname);
+/// if (!ret)
+///         return error_buf(err, _("push destination '%s' on remote '%s' has no local tracking branch"),
+///                          refname, remote->name);
+/// ```
+///
+/// Three outcomes git does **not** die on, which is why this cannot simply
+/// answer "no push destination":
+///
+///   * `push.default=current` on a branch with no upstream still maps through the
+///     fetch refspecs, so the operand resolves to a remote-tracking name that may
+///     simply not exist yet — an ordinary `ambiguous argument`, not a fatal.
+///   * a `remote.<r>.push` refspec that *does* match produces a destination whose
+///     tracking ref likewise need not exist.
+///   * `remotes_remote_get()` invents a remote for a name it does not know
+///     (`add_url_alias()`), so `branch.<n>.pushRemote=nosuchremote` reaches the
+///     "no local tracking branch" arm rather than "has no remote for pushing".
+pub fn push_mark_fatal(repo: &gix::Repository, spec: &str) -> Option<String> {
+    let base = ambiguity_base(spec);
+    let at = push_mark_at(base)?;
+    let named = &base[..at];
+    if named.contains(':') {
+        return None;
+    }
+    // `branch_get(NULL)` / `branch_get("HEAD")`.
+    let name = if named.is_empty() || named == "HEAD" {
+        match repo.head_name() {
+            Ok(Some(full)) => full.shorten().to_string(),
+            _ => return Some("HEAD does not point to a branch".to_string()),
+        }
+    } else {
+        named.to_string()
+    };
+    let refname = format!("refs/heads/{name}");
+    let config = repo.config_snapshot();
+    let string = |key: &str| {
+        config.string(key).map(|v| gix::bstr::ByteSlice::to_str_lossy(v.as_slice()).into_owned())
+    };
+
+    // `remotes_pushremote_for_branch()` then `remotes_remote_for_branch()`.
+    let explicit = string(&format!("branch.{name}.pushRemote"))
+        .or_else(|| string("remote.pushDefault"))
+        .or_else(|| string(&format!("branch.{name}.remote")));
+    // `if (remote_state->remotes_nr == 1) return remote_state->remotes[0]->name;`
+    // then `return "origin";`.
+    //
+    // `branch_get_push_1()`'s `if (!remote)` arm — "branch '%s' has no remote for
+    // pushing" — is unreachable from here and so is not produced: the name is
+    // *always* handed to `remotes_remote_get()` explicitly, which makes
+    // `name_given` non-zero, and `remote_get_1()` then calls `add_url_alias()` for
+    // a name it does not know. That gives the invented remote a url, `valid_remote()`
+    // is `!!remote->url.nr`, and the function returns non-NULL. Measured: in a
+    // repository with no remotes at all, stock 2.55.0 answers
+    // `fatal: no upstream configured for branch 'main'`, i.e. it fell through to
+    // the `push.default` switch rather than reporting a missing remote.
+    let remote = match explicit {
+        Some(r) => r,
+        None => {
+            let names = repo.remote_names();
+            match names.len() {
+                1 => names
+                    .iter()
+                    .next()
+                    .map(|n| gix::bstr::ByteSlice::to_str_lossy(n.as_slice()).into_owned())
+                    .unwrap_or_else(|| "origin".to_string()),
+                _ => "origin".to_string(),
+            }
+        }
+    };
+
+    let specs = |key: &str| -> Vec<String> {
+        config
+            .strings(key)
+            .into_iter()
+            .flatten()
+            .map(|v| gix::bstr::ByteSlice::to_str_lossy(v.as_slice()).into_owned())
+            .collect()
+    };
+    let fetch = specs(&format!("remote.{remote}.fetch"));
+    let push = specs(&format!("remote.{remote}.push"));
+    // `tracking_for_push_dest()`.
+    let tracking = |dest: &str| -> Result<String, String> {
+        apply_refspecs(&fetch, dest).ok_or_else(|| {
+            format!("push destination '{dest}' on remote '{remote}' has no local tracking branch")
+        })
+    };
+
+    let landed = if !push.is_empty() {
+        match apply_refspecs(&push, &refname) {
+            None => {
+                return Some(format!(
+                    "push refspecs for '{remote}' do not include '{name}'"
+                ))
+            }
+            Some(dst) => tracking(&dst),
+        }
+    } else if config.boolean(&format!("remote.{remote}.mirror")).unwrap_or(false) {
+        tracking(&refname)
+    } else {
+        match string("push.default").as_deref().unwrap_or("simple") {
+            "nothing" => {
+                return Some("push has no destination (push.default is 'nothing')".to_string())
+            }
+            "matching" | "current" => tracking(&refname),
+            "upstream" | "tracking" => return upstream_mark_fatal_for(repo, &name),
+            // `PUSH_DEFAULT_UNSPECIFIED` and `PUSH_DEFAULT_SIMPLE`.
+            _ => {
+                if let Some(message) = upstream_mark_fatal_for(repo, &name) {
+                    return Some(message);
+                }
+                let up = crate::porcelain::branch::upstream_ref(repo, refname.as_str().into())?;
+                match tracking(&refname) {
+                    Err(message) => return Some(message),
+                    Ok(cur) if cur.as_bytes() != up.as_bstr() => {
+                        return Some(
+                            "cannot resolve 'simple' push to a single destination".to_string(),
+                        )
+                    }
+                    Ok(cur) => Ok(cur),
+                }
+            }
+        }
+    };
+    landed.err()
+}
+
+/// [`upstream_mark_fatal`] asked about a branch by name rather than about an
+/// operand, for `branch_get_push_1()`'s `branch_get_upstream()` arms.
+fn upstream_mark_fatal_for(repo: &gix::Repository, name: &str) -> Option<String> {
+    upstream_mark_fatal(repo, &format!("{name}@{{u}}"))
+}
+
+/// `apply_refspecs()` (`refspec.c:486-497`) reduced to what
+/// `branch_get_push_1()` asks of it: the destination the first matching
+/// `<src>:<dst>` maps `name` to.
+///
+/// ```c
+/// if (refspec->pattern) {
+///         if (match_refname_with_pattern(key, needle, value, result)) { … return 0; }
+/// } else if (!strcmp(needle, key)) {
+///         *result = xstrdup(value);  … return 0;
+/// }
+/// ```
+///
+/// (`refspec.c:refspec_find_match`.) A leading `+` is the force flag and is not
+/// part of the source pattern; a spec with no `:` has no destination and is
+/// skipped, as is a negative (`^`) one.
+fn apply_refspecs(specs: &[String], name: &str) -> Option<String> {
+    for spec in specs {
+        let spec = spec.strip_prefix('+').unwrap_or(spec);
+        if spec.starts_with('^') {
+            continue;
+        }
+        let Some((src, dst)) = spec.split_once(':') else {
+            continue;
+        };
+        if dst.is_empty() {
+            continue;
+        }
+        match src.split_once('*') {
+            // `match_refname_with_pattern()`: `<prefix>*<suffix>`, with the
+            // matched middle spliced into the replacement's own `*`.
+            Some((prefix, suffix)) => {
+                let (dprefix, dsuffix) = dst.split_once('*')?;
+                if name.len() >= prefix.len() + suffix.len()
+                    && name.starts_with(prefix)
+                    && name.ends_with(suffix)
+                {
+                    let middle = &name[prefix.len()..name.len() - suffix.len()];
+                    return Some(format!("{dprefix}{middle}{dsuffix}"));
+                }
+            }
+            None if src == name => return Some(dst.to_string()),
+            None => {}
+        }
+    }
+    None
 }
 
 /// `get_oid_basic()`'s reflog branch (`object-name.c:742-822`) as a *resolver*:

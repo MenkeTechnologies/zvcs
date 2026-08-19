@@ -1006,6 +1006,8 @@ where
                                 Change::Deletion { .. },
                                 Change::Rewrite {
                                     source_location,
+                                    source_entry_mode,
+                                    source_id,
                                     entry_mode: rewritten_mode,
                                     id: rewritten_id,
                                     location,
@@ -1015,6 +1017,8 @@ where
                             | (
                                 Change::Rewrite {
                                     source_location,
+                                    source_entry_mode,
+                                    source_id,
                                     entry_mode: rewritten_mode,
                                     id: rewritten_id,
                                     location,
@@ -1054,7 +1058,21 @@ where
                                     ResolutionFailure::OursDeletedTheirsRenamed,
                                     (ours, theirs, side, outer_side),
                                     [
-                                        None,
+                                        // A rename carries its merge base along: git's
+                                        // `process_renames()` moves the old path's stages onto the
+                                        // new one (merge-ort.c:3192-3211), so the destination ends
+                                        // up with `filemask == 5` — the ancestor blob at stage 1
+                                        // and the renamed one at stage 3. Leaving stage 1 out made
+                                        // the destination look like a plain addition, which is how
+                                        // a rename/delete came to be reported as `add/add`, and it
+                                        // also hid the base that `process_entry()` compares against
+                                        // to decide on the follow-up `modify/delete` notice
+                                        // (merge-ort.c:4396-4410).
+                                        index_entry_at_path(
+                                            source_entry_mode,
+                                            source_id,
+                                            ConflictIndexEntryPathHint::RenamedOrTheirs,
+                                        ),
                                         None,
                                         index_entry_at_path(
                                             rewritten_mode,

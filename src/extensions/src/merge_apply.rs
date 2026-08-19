@@ -7,8 +7,10 @@
 //! merged tree is checked out over the *changed* subset of the worktree (so
 //! unrelated local files are never touched); and, on conflict, the returned index
 //! carries the unmerged stage 1/2/3 entries. The `Auto-merging` / `CONFLICT (…)`
-//! lines git prints during the merge are emitted here, since they are identical
-//! across every caller.
+//! lines git prints during the merge are rendered by [`crate::merge_msg`] — the
+//! one renderer every merge verb shares — in its permissive mode, so a conflict
+//! class whose git text is not ported degrades to the plain content notice
+//! rather than aborting a merge whose worktree has already moved.
 //!
 //! [`three_way_merge_guarded`] adds the last step of
 //! `merge_switch_to_result()`: the `unpack_trees()` pass that refuses the
@@ -329,42 +331,57 @@ fn merge_and_apply(
     let renormalized = renormalized_repo(repo, xopts)?;
     let repo = renormalized.as_ref().unwrap_or(repo);
 
+    // `opt->branch1`/`opt->branch2`, needed again below to attribute a
+    // conflicting path to the operand git names it after. `Labels` borrows, and
+    // the merge call consumes it, so take owned copies first.
+    let label1 = labels.current.unwrap_or_default().to_string();
+    let label2 = labels.other.unwrap_or_default().to_string();
+
     let mut merge = repo.merge_trees(
         base_tree,
         ours_tree,
         theirs_tree,
         labels,
-        tree_merge_options(repo, xopts, style)?,
+        // `git merge` and every sequencer verb that reaches here go through
+        // `init_ui_merge_options()`, so `diff.algorithm` applies.
+        tree_merge_options(repo, xopts, style, true)?,
     )?;
     let tree_id = merge.tree.write()?.detach();
 
-    // git's merge-ort emits an `Auto-merging <path>` line for every attempted blob
-    // merge, then `CONFLICT (<kind>): Merge conflict in <path>` for the unresolved
-    // ones. Trivially-identical changes resolve silently. The lines are collected
-    // rather than printed here because merge-ort collects them too — `path_msg()`
-    // appends to `opt->priv->output` and only `merge_display_update_messages()`
-    // flushes it, which `merge_switch_to_result()` reaches *after* its checkout.
+    // git's merge-ort emits an `Auto-merging <path>` line for every blob merge it
+    // actually runs, then the conflict notice for each class it could not
+    // resolve. The lines are collected rather than printed here because merge-ort
+    // collects them too — `path_msg()` appends to `opt->priv->output` and only
+    // `merge_display_update_messages()` flushes it, which
+    // `merge_switch_to_result()` reaches *after* its checkout.
+    //
+    // Rendering runs through [`crate::merge_msg`], shared with `merge-tree`,
+    // `merge-recursive` and `merge-subtree`, in its permissive mode: this caller
+    // has a worktree to move, so a class whose git text is not ported degrades to
+    // the plain content notice rather than aborting a merge that already happened.
     let unresolved = gix::merge::tree::TreatAsUnresolved::git();
-    let mut conflicts: Vec<BString> = Vec::new();
-    let mut messages: Vec<String> = Vec::new();
-    for conflict in &merge.conflicts {
-        let path = conflict_location(conflict);
-        if conflict.content_merge().is_some() {
-            messages.push(format!("Auto-merging {path}"));
-        }
-        if !conflict.is_unresolved(unresolved) {
-            continue;
-        }
-        // merge-ort's `filemask == 6`: no ancestor stage means both sides added
-        // the path, reported as `add/add` rather than `content`.
-        let kind = if conflict.entries()[0].is_none() {
-            "add/add"
-        } else {
-            "content"
-        };
-        messages.push(format!("CONFLICT ({kind}): Merge conflict in {path}"));
-        conflicts.push(path);
-    }
+    let conflicts: Vec<BString> = merge
+        .conflicts
+        .iter()
+        .filter(|c| c.is_unresolved(unresolved))
+        .map(crate::merge_msg::conflict_location)
+        .collect();
+    // Operand 1 is *our* tree as merged, not as spelled: `-Xsubtree` shifts the
+    // other two onto its shape, so this is the tree the conflicts are reported
+    // against.
+    let messages: Vec<String> = crate::merge_msg::render(
+        repo,
+        &merge.conflicts,
+        &label1,
+        &label2,
+        crate::merge_msg::Operand1::Tree(ours_tree),
+        unresolved,
+        crate::merge_msg::Strictness::Approximate,
+    )?
+    .into_iter()
+    // These are printed with `println!`, so drop the newline git's `puts()` adds.
+    .map(|m| m.text.trim_end_matches('\n').to_owned())
+    .collect();
 
     // `merge_switch_to_result()` ends in `checkout()`, an `unpack_trees()` from
     // the worktree's current tree to the merged one — which refuses rather than
@@ -402,51 +419,6 @@ fn merge_and_apply(
     }))
 }
 
-/// The path merge-ort names a conflict by: where the merged content actually
-/// ended up, not where it started.
-///
-/// merge-ort's `path_msg()` calls are keyed on the *destination*. When one side
-/// renames a path and the other modifies it, `handle_content_merge()` runs
-/// against the rename's new name and reports it — stock 2.55.0 on a fixture
-/// where `HEAD` renames `old.txt` to `new.txt` and `side` edits `old.txt` prints
-/// `Auto-merging new.txt` / `CONFLICT (content): Merge conflict in new.txt`, and
-/// leaves the three stages under `new.txt`.
-///
-/// `gix-merge` records the same thing but spread across three places, and
-/// `changes_in_resolution().0` is not it: for that fixture the resolution is
-/// `OursModifiedTheirsRenamedAndChangedThenRename`, whose `ours` is the plain
-/// modification at the *old* name and whose `theirs` is the
-/// [`Change::Rewrite`](gix::diff::tree_with_rewrites::Change::Rewrite) carrying
-/// the new one. Reading `.0.location()` therefore named the pre-rename path on
-/// every rename conflict. The destination is, in order of authority:
-///
-///   1. `final_location`, when the resolution carries one — the directory-rename
-///      case, where the blob lands somewhere neither side spelled;
-///   2. the `Rewrite` side's `location`, which is documented as "the location
-///      after the rename or copy operation";
-///   3. `ours.location()`, when no rename is involved at all.
-fn conflict_location(conflict: &gix::merge::tree::Conflict) -> BString {
-    use gix::diff::tree_with_rewrites::Change;
-    use gix::merge::tree::Resolution;
-
-    if let Ok(
-        Resolution::SourceLocationAffectedByRename { final_location }
-        | Resolution::OursModifiedTheirsRenamedAndChangedThenRename {
-            final_location: Some(final_location),
-            ..
-        },
-    ) = &conflict.resolution
-    {
-        return final_location.clone();
-    }
-    let (ours, theirs) = conflict.changes_in_resolution();
-    for change in [ours, theirs] {
-        if matches!(change, Change::Rewrite { .. }) {
-            return change.location().to_owned();
-        }
-    }
-    ours.location().to_owned()
-}
 
 /// Check out `new_tree_id` over the worktree, touching only entries that differ
 /// from `old`, deleting worktree files the new tree drops, and returning the
@@ -765,25 +737,66 @@ pub(crate) fn renormalized_repo(
     Ok(Some(with_override))
 }
 
+/// merge-ort's diff algorithm for a merge with no `-X` of its own.
+///
+/// `init_merge_options()` opens with `opt->xdl_opts = DIFF_WITH_ALG(opt,
+/// HISTOGRAM_DIFF)` (merge-ort.c:5502), so **every** merge is a histogram diff
+/// unless something moves it — not a Myers one, which is what gitoxide's
+/// configuration cache defaults to and what this port inherited on every merge
+/// that did not spell an algorithm out. On a fixture where the two disagree,
+/// stock 2.55.0 with no configuration writes the same conflicted blob as
+/// `-Xhistogram` and this port wrote `-Xdiff-algorithm=myers`'s.
+///
+/// `diff.algorithm` then replaces it **only for the `ui` callers**
+/// (merge-ort.c:5472-5480) — `init_ui_merge_options()`, used by `git merge`
+/// (builtin/merge.c:814), `cherry-pick`/`revert`/`rebase` (sequencer.c:764,
+/// 4348), `am` (builtin/am.c:1640), `stash` (builtin/stash.c:696) and
+/// `log --remerge-diff` (log-tree.c:1052). `merge-tree`
+/// (builtin/merge-tree.c:593) and `merge-recursive`/`merge-subtree`
+/// (builtin/merge-recursive.c:37) take `init_basic_merge_options()` and never
+/// read the key at all: measured, stock's `merge-recursive` writes the same
+/// bytes under `diff.algorithm=patience` as under no configuration, while
+/// `git merge` writes different ones.
+///
+/// An unparseable value is left alone here. git rejects it in the configuration
+/// layer, before any verb runs (`error: unknown value for config
+/// 'diff.algorithm': …` plus a `fatal:` naming the config source, exit 128),
+/// which is not this function's to reproduce.
+pub(crate) fn merge_diff_algorithm(repo: &gix::Repository, ui: bool) -> Algorithm {
+    if !ui {
+        return Algorithm::Histogram;
+    }
+    repo.config_snapshot()
+        .string("diff.algorithm")
+        .and_then(|v| parse_algorithm_value(&v.to_str_lossy()))
+        .unwrap_or(Algorithm::Histogram)
+}
+
 /// `Repository::tree_merge_options()` with the `-X` knobs folded in.
 ///
 /// Shared with the strategy *plumbing* (`git merge-recursive` and its three
 /// alias names), which receives the same options — `try_merge_command()`
 /// re-spells each `-X<value>` as `--<value>` on their command line, and
 /// `cmd_merge_recursive` feeds them to the very same `parse_merge_opt()`
-/// (builtin/merge-recursive.c:55-58).
+/// (builtin/merge-recursive.c:55-58). `ui` is the one thing that does *not*
+/// carry across: see [`merge_diff_algorithm`].
 pub(crate) fn tree_merge_options(
     repo: &gix::Repository,
     xopts: &StrategyOptions,
     style: Option<ConflictStyle>,
+    ui: bool,
 ) -> Result<gix::merge::tree::Options> {
     use gix::merge::plumbing::blob::builtin_driver::{binary, text};
 
     let mut opts: gix::merge::plumbing::tree::Options = repo.tree_merge_options()?.into();
 
-    if let Some(algorithm) = xopts.diff_algorithm {
-        opts.blob_merge.text.diff_algorithm = algorithm;
-    }
+    // Set unconditionally: leaving it to gitoxide's configuration cache is what
+    // made an unconfigured merge a Myers merge, and a `diff.algorithm=patience`
+    // one a histogram merge (the cache reports patience as unimplemented and
+    // silently falls back, even though this tree's `gix-imara-diff` has it).
+    opts.blob_merge.text.diff_algorithm = xopts
+        .diff_algorithm
+        .unwrap_or_else(|| merge_diff_algorithm(repo, ui));
 
     // `--conflict=<style>` is git's per-invocation override of
     // `merge.conflictStyle` (`git_xmerge_config()` seeds the default;
@@ -1239,5 +1252,48 @@ pub(crate) fn shift_tree_object(
         shift_tree(repo, one, two, 0)
     } else {
         shift_tree_by(repo, one, two, subtree_shift)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `base_name_compare()`'s only real rule: a tree entry compares as though
+    /// its name ended in `/`, which is why `score_trees()` can walk two trees in
+    /// lockstep without re-sorting them.
+    #[test]
+    fn base_name_compare_treats_dirs_as_slash_suffixed() {
+        const DIR: u32 = 0o040000;
+        const REG: u32 = 0o100644;
+        assert_eq!(base_name_compare(b"a", REG, b"a", DIR), std::cmp::Ordering::Less);
+        assert_eq!(base_name_compare(b"a", DIR, b"a", REG), std::cmp::Ordering::Greater);
+        assert_eq!(base_name_compare(b"a", DIR, b"a", DIR), std::cmp::Ordering::Equal);
+        assert_eq!(base_name_compare(b"ab", REG, b"a", REG), std::cmp::Ordering::Greater);
+        assert_eq!(base_name_compare(b"a", REG, b"ab", REG), std::cmp::Ordering::Less);
+    }
+
+    /// The three scoring tables from `match-trees.c:13-53`, which decide which
+    /// way `-Xsubtree` shifts and are therefore what a wrong constant would
+    /// silently mis-merge on.
+    #[test]
+    fn tree_similarity_scores_match_git() {
+        const DIR: u32 = 0o040000;
+        const LNK: u32 = 0o120000;
+        const REG: u32 = 0o100644;
+
+        assert_eq!(score_missing(DIR), -1000);
+        assert_eq!(score_missing(LNK), -500);
+        assert_eq!(score_missing(REG), -50);
+
+        assert_eq!(score_differs(DIR, REG), -100);
+        assert_eq!(score_differs(LNK, REG), -50);
+        assert_eq!(score_differs(REG, REG), -5);
+
+        assert_eq!(score_matches(DIR, REG), -100);
+        assert_eq!(score_matches(LNK, REG), -50);
+        assert_eq!(score_matches(DIR, DIR), 1000);
+        assert_eq!(score_matches(LNK, LNK), 500);
+        assert_eq!(score_matches(REG, REG), 250);
     }
 }

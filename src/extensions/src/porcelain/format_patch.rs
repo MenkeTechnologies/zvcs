@@ -92,9 +92,66 @@
 //!   * merges the parent-count bounds admit. `--max-parents=<n>` (n > 1) or
 //!     `--min-parents` can put a merge in the series, and `log_tree_diff()`
 //!     produces nothing for one without `-m`/`-c`/`--cc`, none of which
-//!     format-patch sets. `log_tree_commit()`'s `always_show_header` fallback
-//!     then emits the mail headers and the message alone — no three-dash
-//!     separator, no diffstat and no patch, whatever diff format was asked for.
+//!     format-patch sets by default: `log_tree_commit()`'s `always_show_header`
+//!     fallback then emits the mail headers and the message alone. The
+//!     `--diff-merges=<mode>` family (and `-m`, `-c`, `--dd`) changes that.
+//!     `separate`/`on`/`m` emits one whole message per parent — `log_tree_diff()`
+//!     re-enters `show_log()` for each, so the header block repeats, with
+//!     `show_log()`'s inter-record newline between them. `first-parent`/`1`/`--dd`
+//!     stops after the first parent. `combined`/`c` and `dense-combined`/`cc` go
+//!     through `diff_tree_combined()`: the three-dash separator becomes the bare
+//!     newline `show_combined_diff()` writes, every *stat* format is computed
+//!     against the first parent alone (`STAT_FORMAT_MASK`, combine-diff.c:1368),
+//!     `--raw` becomes `show_raw_diff()`'s `::`-prefixed block, and the patch body
+//!     is [`super::diff::merge_combined_patch_painted`]'s `diff --combined` /
+//!     `diff --cc` sections. `log.diffMerges` redefines what `on`/`m`/`-m` mean and
+//!     nothing else — measured against stock 2.55.0, it does not give a merge a
+//!     diff on its own.
+//!   * `--color[=<when>]` / `--no-color`, and with it the whole paint layer:
+//!     `--word-diff[=<mode>]`, `--word-diff-regex=<re>`, `--color-words[=<re>]`,
+//!     `--color-moved[=<mode>]`, `--color-moved-ws=<modes>` and
+//!     `--ws-error-highlight=<kinds>`, all through [`super::diff_color`]'s
+//!     `colorize_patch_ex` — the same re-emit pass `git diff` and `git log -p` use,
+//!     fed the whole commit's patch at once so a block moved *between* two of its
+//!     files is still recognized. Colour reaches the diffstat graph
+//!     (`show_stats()`) and the patch body, which is everything format-patch
+//!     paints; `--numstat`, `--raw` and `diff_summary()`'s lines stay plain.
+//!     `--color-words` and `--word-diff=color` force colour on outright, so they
+//!     paint to a pipe. The *switch* answers to the flag and the terminal alone:
+//!     measured against stock 2.55.0, neither `color.diff`, `diff.color` nor
+//!     `color.ui` moves it in either direction, though the `color.diff.<slot>`
+//!     palette, `core.whitespace`, `diff.wsErrorHighlight`, `diff.colorMoved`,
+//!     `diff.colorMovedWS` and `diff.wordRegex` are all read.
+//!   * `--inter-hunk-context=<n>` (xdiff's `interhunkctxlen`, which widens
+//!     `xdl_get_hunk()`'s `max_common` to `ctxlen + ctxlen + interhunkctxlen`) and
+//!     `--ignore-blank-lines` (`XDF_IGNORE_BLANK_LINES`, whose
+//!     `xdl_mark_ignorable_lines()` verdict `xdl_mark_ignorable_regex()` never
+//!     overrides — 2.55.0's regex pass opens `if (xch->ignore) continue;`, so the
+//!     two markers are an or).
+//!   * `--diff-filter=<letters>`, through [`super::diff_filter`]: a faithful
+//!     `diff_opt_diff_filter()` + `diffcore_apply_filter()` including the `B`
+//!     (broken, i.e. a `-B`-scored modification) and `*` (all-or-none) letters and
+//!     `diff_setup_done()`'s exclusion-only fold.
+//!   * `--relative[=<path>]` / `--no-relative` over `diff.relative`. Both halves:
+//!     `diff_queue()`'s prefix test narrows the queue *before* `diffcore_rename()`
+//!     runs — so a rename out of the prefix is reported as a plain creation — and
+//!     `strip_prefix()` shortens the names the patch, the diffstat and the raw
+//!     block print, but not the ones `diff_summary()` or `show_dirstat()` print.
+//!   * `--submodule[=<format>]`: `short` diffs the synthetic `Subproject commit
+//!     <oid>` blobs this renderer already emits, while `log` and `diff` divert a
+//!     gitlink pair's whole section — `diff --git` header included — to
+//!     `show_submodule_diff_summary()` / `show_submodule_inline_diff()`. The
+//!     diffstat is built by a pass with no such branch, so its row stays the
+//!     `short` one. `diff.submodule` is *not* consulted, measured against stock.
+//!   * `--line-prefix=<p>`, applied per emitter rather than to the message as a
+//!     whole. Every line of a patch takes it, because `show_log()` opens with
+//!     `graph_show_commit()` and `graph_show_strbuf()` writes it between message
+//!     lines even with a NULL graph (graph.c:74-80, 1533); the `base-commit:`
+//!     trailer and the signature `cmd_format_patch` prints itself do not, nor does
+//!     `DIFF_SYMBOL_STAT_SEP`'s `--attach` MIME part, nor an interdiff/range-diff
+//!     block (`show_diff_of_diff()` installs its own `output_prefix`). A cover
+//!     letter never reaches `show_log()`, so only `log_write_email_headers()`'
+//!     three `graph_show_oneline()` calls and its diffstat carry it.
 //!   * width-tuned diffstat — `--stat=<width>[,<name-width>[,<count>]]`,
 //!     `--stat-width`, `--stat-name-width`, `--stat-graph-width`,
 //!     `--stat-count`, a port of `diff_opt_stat()`'s field parsing and the
@@ -168,12 +225,11 @@
 //!     that it never becomes a bogus revision error, but limiting the walk and
 //!     the patch to it is not ported, so a pathspec that reaches a non-empty
 //!     commit list is fatal.
-//!   * whitespace-insensitive diffing (`--ignore-blank-lines`), `--anchored`,
-//!     `--inter-hunk-context`, `--textconv`/`--ext-diff` and `--line-prefix`.
-//!     The last is refused rather than approximated because git applies it per
-//!     emitter (`diff_line_prefix()`), so a cover letter takes it on its diffstat
-//!     rows and its `From:` header but not on its magic `From` line, `Date:` or
-//!     `Subject:` — a whole-message prefix would be wrong bytes at exit 0.
+//!   * `--anchored=<text>`, blocked on the vendored differ: the anchors would have
+//!     to reach xdiff's patience pass, and `gix-imara-diff`'s `patience.rs` omits
+//!     every anchor branch (its header records that `is_anchor()` is constantly
+//!     false), so accepting the flag would silently drop them.
+//!   * `--textconv`/`--ext-diff`, which need a `gitattributes` diff driver to run.
 //!     `--ignore-if-in-upstream` reproduces
 //!     everything `cmd_format_patch` decides before the comparison — the
 //!     single-endpoint promotion that turns a lone rev into `<rev>..HEAD`, the
@@ -186,12 +242,6 @@
 //!   * a glob in `notes.displayRef`/`GIT_NOTES_DISPLAY_REF`/`--notes=<glob>`:
 //!     expanding a pattern over the ref store is not ported, so a pattern is
 //!     refused rather than read as a literal ref name.
-//!   * the diff renderers this module has no emitter for at all, which still
-//!     report `unrecognized argument`: `--word-diff[=<mode>]` /
-//!     `--word-diff-regex` / `--color-words`, `--color-moved[=<mode>]` /
-//!     `--color-moved-ws`, `--ws-error-highlight`, `--diff-filter=<letters>`,
-//!     `--submodule=log|diff` (only `short`, what this renderer emits, is
-//!     accepted) and every `--diff-merges` value that turns merge diffs *on*.
 //!   * the rest of `handle_revision_pseudo_opt()`: `--reflog`, `--bisect`,
 //!     `--indexed-objects`, `--alternate-refs`, `--exclude-hidden=<section>`,
 //!     `--filter=<spec>`, `--single-worktree` and `--stdin`. Each still reports
@@ -222,7 +272,13 @@
 //! Known deviations, stated rather than hidden: a *type change* (a regular file
 //! that became a symlink, or the reverse) renders as one pair with `old mode`/
 //! `new mode` rather than the delete-plus-create `diff_flush_patch()` splits it
-//! into. The cover letter's shortlog does not wrap long subjects at 76 columns.
+//! into. `--word-diff-regex`/`--color-words` compile their pattern while the
+//! command line parses, whereas `init_diff_words_data()` compiles it at the first
+//! blob diff — so an unparsable pattern exits 128 with git's own message but
+//! without the mail headers and diffstat git has already flushed by then. The
+//! `whitespace_rule()` a colour pass applies comes from `core.whitespace` alone,
+//! with no per-path `whitespace` attribute, which is the same reach `git diff`'s
+//! colour path has here. The cover letter's shortlog does not wrap long subjects at 76 columns.
 //! `append_signoff()`'s trailer-block scan does not consult `trailer.<token>.key`
 //! config, so only git's own generated prefixes can carry a mixed block over the
 //! 25% threshold. The ERE
@@ -247,8 +303,19 @@ use gix::object::tree::diff::ChangeDetached;
 use gix::prelude::ObjectIdExt;
 use gix::revision::walk::Sorting;
 
+use super::diff_color::{self, ColorWhen, DiffColors, ExtraPaint, FilePaint, MoveWordOpts, PaintOptions};
 use super::diffstat::{self, StatWidths};
 use gix::traverse::commit::simple::CommitTimeOrder;
+
+impl Opts {
+    /// The prefix `--relative` is narrowing and shortening by, or `None` when the
+    /// flag is off. An empty prefix — a bare `--relative` at the top of the worktree
+    /// — matches everything and strips nothing, which is what git's zero
+    /// `prefix_length` does.
+    fn active_relative(&self) -> Option<&str> {
+        self.relative_name.then_some(self.relative_prefix.as_str())
+    }
+}
 
 /// `usage_with_options()` over `builtin/log.c`'s `format-patch` option table.
 const USAGE: &str = r"usage: git format-patch [<options>] [<since> | <revision-range>]
@@ -748,6 +815,56 @@ struct Opts {
     /// `--compact-summary`: `diff_options.flags.stat_with_summary`, the
     /// ` (<comment>)` `fill_print_name()` hangs off a `--stat` row.
     compact_summary: bool,
+    /// `--inter-hunk-context=<n>`: `diff_options.interhunkcontext`, the extra
+    /// distance `xdl_get_hunk()` will bridge before it starts a second hunk
+    /// (`max_common = ctxlen + ctxlen + interhunkctxlen`, xdiff/xemit.c:58-60).
+    inter_hunk_ctx: i64,
+    /// `--ignore-blank-lines` (`XDF_IGNORE_BLANK_LINES`): change groups whose every
+    /// pre- and post-image record is blank are marked ignorable, exactly as
+    /// `-I<regex>` marks the ones its patterns cover.
+    ignore_blank_lines: bool,
+    /// `--diff-filter=<letters>` as `(include-bits, exclude-bits)` over
+    /// [`super::diff_filter`]'s status set. `None` is no filtering at all.
+    diff_filter: Option<super::diff_filter::Filter>,
+    /// `--color[=<when>]` / `--no-color`, resolved against `color.diff`/`color.ui`
+    /// once the repository is open. Colour reaches the diffstat graph and the patch
+    /// body, which is everything `format-patch` paints.
+    colors: DiffColors,
+    /// `--color-moved[=<mode>]`, `--color-moved-ws=<modes>`, `--word-diff[=<mode>]`,
+    /// `--word-diff-regex=<re>` and `--color-words[=<re>]`, layered over
+    /// `diff.colorMoved`/`diff.colorMovedWS`/`diff.wordRegex`.
+    extra: ExtraPaint,
+    /// `--ws-error-highlight=<kinds>`, over `diff.wsErrorHighlight`.
+    ws_error_highlight: u32,
+    /// `--diff-merges=<mode>` / `-m` / `-c` / `--cc` / `--dd` /
+    /// `--no-diff-merges`, over `log.diffMerges` (which only redefines what the
+    /// `on`/`m` spelling and `-m` mean). format-patch starts at
+    /// [`DiffMerges::Off`].
+    diff_merges: DiffMerges,
+    /// `--line-prefix=<p>`: `diff_options.line_prefix`, which
+    /// `graph_setup_line_prefix()` installs as `output_prefix` (graph.c:347-354).
+    /// Every emitter that opens a line with `diff_line_prefix()` — and every
+    /// `graph_show_commit()`/`graph_show_oneline()`/`graph_show_strbuf()` call that
+    /// writes it for a NULL graph (graph.c:74-80) — takes it; the rest do not.
+    line_prefix: Option<String>,
+    /// `--relative[=<path>]` / `--no-relative` over `diff.relative`:
+    /// `o->flags.relative_name`. `diff_opt_relative()` (diff.c:5905-5914) sets the
+    /// flag and only *then* overwrites `o->prefix` when a value came with it, so a
+    /// bare `--relative` after a `--relative=<p>` keeps `<p>`.
+    relative_name: bool,
+    /// `o->prefix`: the command's own prefix (the current directory inside the
+    /// repository) until `--relative=<path>` replaces it. Stored verbatim — git
+    /// compares `o->prefix_length` bytes and appends no separator, so
+    /// `--relative=sr` really does strip two characters off `src/…`.
+    relative_prefix: String,
+    /// `--submodule[=<format>]` over `diff.submodule`: `short` diffs the synthetic
+    /// `Subproject commit <oid>` blobs, `log` and `diff` divert a gitlink pair to
+    /// `show_submodule_diff_summary()` / `show_submodule_inline_diff()` instead.
+    submodule_format: super::diff::SubmoduleFormat,
+    /// `whitespace_rule()` for the run: `core.whitespace` as parsed by
+    /// `parse_whitespace_rule()`. Per-path `whitespace` attributes are not consulted,
+    /// which is the same reach `git diff`'s own colour path has here.
+    ws_rule: u32,
     /// `--output-indicator-new/-old/-context=<char>` as `(new, old, context)`:
     /// `diff_options.output_indicators`, the three bytes `emit_line()` puts in
     /// front of a hunk's body lines (diff.c:6154-6160). Nothing else moves — the
@@ -1077,6 +1194,11 @@ pub fn format_patch(args: &[String]) -> Result<ExitCode> {
         // git puts one extra blank line between patches in the mbox stream; the
         // cover letter is not separated that way.
         if opts.to_stdout && idx > 0 {
+            // `show_log()`'s inter-record newline (log-tree.c:770-790), which
+            // `graph_show_padding()` opens with `--line-prefix` for a NULL graph.
+            if let Some(p) = &opts.line_prefix {
+                buffered.extend_from_slice(p.as_bytes());
+            }
             buffered.push(b'\n');
         }
         emit_message(&mut buffered, &msg, patch_filename(&commit, nr, &opts)?, &opts)?;
@@ -1206,6 +1328,7 @@ fn emit_diff_of_diff(
             Some(&old_tree),
             Some(&new_tree),
             opts.pathspec.as_ref(),
+            opts.active_relative(),
             &RenameOpts::from_opts(opts),
             &mut dissimilarity,
         )?;
@@ -1294,21 +1417,18 @@ enum Parsed {
 }
 
 /// Flags whose effect is already this module's behavior, so accepting them
-/// changes nothing: the slider heuristic is what the blob diff runs, colour and
-/// progress are never rendered, `a/`+`b/` are the prefixes emitted, an external
-/// diff or textconv driver is never run, and format-patch never diffs the index,
-/// so an intent-to-add entry cannot reach it.
+/// changes nothing: progress is never rendered, an external diff or textconv
+/// driver is never run, and format-patch never diffs the index, so an
+/// intent-to-add entry cannot reach it.
 const NO_OP: &[&str] = &[
     // `rev.always_show_header`, which `format-patch` sets for every commit anyway:
     // measured against stock 2.55.0 over single commits, ranges, and commits whose
     // diff is empty, the output is identical with and without it.
     "--always",
-    "--no-color",
     "--no-textconv",
     "--no-ext-diff",
     "--progress",
     "--no-progress",
-    "--no-relative",
     // format-patch compares two *trees*; there is no index in the comparison, so
     // neither spelling of the intent-to-add rule can reach anything.
     "--ita-invisible-in-index",
@@ -1324,33 +1444,21 @@ const NO_OP: &[&str] = &[
     // these two at the same time.
     "--pickaxe-all",
     "--pickaxe-regex",
-    // format-patch never emits a merge's diff (`log_tree_diff()` produces nothing
-    // without `-m`/`-c`/`--cc`), so the two spellings that turn merge diffs *off*
-    // ask for what already happens. The spellings that turn them on stay refused.
-    "--no-diff-merges",
-    "--diff-merges=off",
-    // The knobs whose default is "off" and whose only spelling here switches them
-    // off again: word diffing, moved-line colouring and its whitespace mode, and
-    // `--stat`'s compact annotation.
-    "--word-diff=none",
-    "--no-color-moved",
-    "--color-moved=no",
-    "--no-color-moved-ws",
-    // `show_submodule_summary()`'s `short` format is the `-Subproject commit <oid>`
-    // pair this renderer already produces for a gitlink change; `log` and `diff`
-    // are different renderings and stay refused.
-    "--submodule=short",
 ];
 
 /// Flags git accepts that this module has not ported. Matched as `--flag` or
 /// `--flag=<value>`; see the module header for what each of them would change.
 const DEFERRED: &[&str] = &[
     "--ignore-if-in-upstream",
-    "--ignore-blank-lines",
-    "--inter-hunk-context",
+    // `--textconv`/`--ext-diff` need the `gitattributes` diff-driver plumbing that
+    // `git diff` reaches through the vendored filter stack; nothing in this module
+    // can run a driver yet.
     "--textconv",
     "--ext-diff",
-    "--line-prefix",
+    // `--anchored` is xdiff's `xpp->anchors`, carried into the patience pass
+    // (`xdiff/xpatience.c:74-76`). The vendored `gix-imara-diff` has the patience
+    // algorithm but omits every anchor branch — its `patience.rs:21-22` records that
+    // `is_anchor()` is constantly false — so the anchors would be silently dropped.
     "--anchored",
 ];
 
@@ -1583,6 +1691,19 @@ fn push_ref_set(
 }
 
 /// True when `arg` is exactly `name` or the `name=<value>` form.
+/// The spellings [`MoveWordOpts::parse_flag`] claims, recognised ahead of the call
+/// so the match arm can dispatch without running the parser twice (it mutates).
+fn is_move_word_flag(s: &str) -> bool {
+    matches!(
+        s,
+        "--color-moved" | "--no-color-moved" | "--no-color-moved-ws" | "--word-diff" | "--color-words"
+    ) || s.starts_with("--color-moved=")
+        || s.starts_with("--color-moved-ws=")
+        || s.starts_with("--word-diff=")
+        || s.starts_with("--word-diff-regex=")
+        || s.starts_with("--color-words=")
+}
+
 fn is_flag(arg: &str, name: &str) -> bool {
     arg == name || arg.strip_prefix(name).is_some_and(|r| r.starts_with('='))
 }
@@ -1781,6 +1902,22 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
         rename_limit: None,
         expand_tabs: 0,
         compact_summary: false,
+        inter_hunk_ctx: 0,
+        ignore_blank_lines: false,
+        diff_filter: None,
+        colors: DiffColors::disabled(),
+        extra: ExtraPaint::default(),
+        ws_error_highlight: diff_color::WSEH_NEW,
+        ws_rule: diff_color::whitespace_rule_cfg(repo),
+        submodule_format: super::diff::SubmoduleFormat::Short,
+        diff_merges: DiffMerges::Off,
+        line_prefix: None,
+        // `diff.relative` seeds the very flag `--relative` sets
+        // (`options->flags.relative_name = diff_relative`, diff.c:422-425); measured
+        // against stock 2.55.0, `-c diff.relative=true format-patch` run from a
+        // subdirectory narrows and shortens exactly as a bare `--relative` does.
+        relative_name: snap.boolean("diff.relative") == Some(true),
+        relative_prefix: super::diff::cwd_prefix(repo),
         indicators: (b'+', b'-', b' '),
         abbrev: None,
         name_only: false,
@@ -1818,6 +1955,25 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
     // `--commit-list-format` implies a cover letter, but only when the caller
     // did not spell `--cover-letter`/`--no-cover-letter` out.
     let mut commit_list_format_given = false;
+    // `--color[=<when>]` / `--no-color`, plus the two flags that force colour on
+    // outright (`--color-words`, `--word-diff=color`) by assigning
+    // `options->use_color = GIT_COLOR_ALWAYS` (diff.c:5606, 5626). `None` is "no
+    // flag given", which falls through to `color.diff`/`color.ui`.
+    let mut color_when: Option<ColorWhen> = None;
+    // `--color-moved`/`--color-moved-ws`/`--word-diff*`/`--color-words`, collected
+    // as spelled and layered over their config defaults once the loop is done.
+    let mut move_word = MoveWordOpts::default();
+    // `--ws-error-highlight=<kinds>`; `None` falls back to `diff.wsErrorHighlight`.
+    let mut ws_error_highlight: Option<u32> = None;
+    // `log.diffMerges` (`diff_merges_config()`, diff-merges.c:100-109) replaces
+    // `set_to_default`, i.e. what `-m` and `--diff-merges=on|m` mean. It does not
+    // change what a merge gets when neither is given — measured against stock
+    // 2.55.0, `-c log.diffMerges=first-parent format-patch` over a merge still
+    // emits header-only. A value git cannot parse is `-1` from the config callback,
+    // which leaves the default alone.
+    let diff_merges_default = cfg_str("log.diffMerges")
+        .and_then(|v| parse_diff_merges(&v, DiffMerges::Separate))
+        .unwrap_or(DiffMerges::Separate);
     while i < args.len() {
         let a = args[i].as_str();
         if pathspec_mode {
@@ -2117,13 +2273,6 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
             "--patience" => o.algorithm = Algorithm::Patience,
             "--histogram" => o.algorithm = Algorithm::Histogram,
             "-a" | "--text" => o.text = true,
-            // At the top of the worktree `--relative` neither strips a prefix
-            // nor filters by directory, so there it is genuinely a no-op.
-            "--relative" => {
-                if !at_worktree_top(repo) {
-                    o.deferred.push(a.to_owned());
-                }
-            }
             s if s.starts_with("--output-directory=") => {
                 o.outdir = Some(s["--output-directory=".len()..].to_owned());
             }
@@ -2255,6 +2404,91 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
                     ),
                 }
             }
+            // `diff_opt_diff_filter()` (diff.c:5470-5500). Every occurrence ors into
+            // the same two bit sets, and an unknown letter is `error()` from inside
+            // setup_revisions, so an earlier bad revision preempts it.
+            s if s.starts_with("--diff-filter=") => {
+                let value = &s["--diff-filter=".len()..];
+                let mut filter = o.diff_filter.unwrap_or_default();
+                match filter.accumulate(value) {
+                    Ok(()) => o.diff_filter = Some(filter),
+                    Err(ch) => record_opt_error(
+                        &mut o.opt_error,
+                        i,
+                        129,
+                        format!("error: unknown change class '{ch}' in --diff-filter={value}"),
+                    ),
+                }
+            }
+            // `OPT_UNSIGNED(0, "inter-hunk-context", …)` (diff.c:6144-6145): a
+            // non-negative integer with an optional k/m/g suffix, rejected at exit 129
+            // by parse-options' own `OPT_UNSIGNED` diagnostic.
+            s if s.starts_with("--inter-hunk-context=") || s == "--inter-hunk-context" => {
+                let value = if s == "--inter-hunk-context" {
+                    i += 1;
+                    match args.get(i) {
+                        Some(v) => v.clone(),
+                        // parse-options' own `opterror(..., "requires a value")`,
+                        // emitted in place at exit 129.
+                        None => {
+                            eprintln!("error: {}", diff_color::missing_value(s));
+                            return Ok(Parsed::Exit(ExitCode::from(129)));
+                        }
+                    }
+                } else {
+                    s["--inter-hunk-context=".len()..].to_owned()
+                };
+                match crate::optint::unsigned(
+                    &crate::optint::long_opt("inter-hunk-context"),
+                    &value,
+                ) {
+                    Ok(n) => o.inter_hunk_ctx = n as i64,
+                    Err(e) => record_opt_error(&mut o.opt_error, i, 129, format!("error: {e}")),
+                }
+            }
+            // `OPT_BIT_F(0, "ignore-blank-lines", …, XDF_IGNORE_BLANK_LINES,
+            // PARSE_OPT_NONEG)` (diff.c:6208-6210): no `--no-` spelling exists.
+            "--ignore-blank-lines" => o.ignore_blank_lines = true,
+            // `diff_opt_line_prefix()` (diff.c:5788-5795), an `OPT_CALLBACK_F` with a
+            // required argument, so a bare `--line-prefix` takes the next argv slot.
+            "--line-prefix" => {
+                i += 1;
+                let Some(v) = args.get(i) else {
+                    eprintln!("error: {}", diff_color::missing_value(a));
+                    return Ok(Parsed::Exit(ExitCode::from(129)));
+                };
+                o.line_prefix = Some(v.clone());
+            }
+            s if s.starts_with("--line-prefix=") => {
+                o.line_prefix = Some(s["--line-prefix=".len()..].to_owned());
+            }
+            // `diff_opt_relative()` (diff.c:5750): with no value the prefix is the
+            // current directory inside the repository, with one it is that path, and
+            // either way it is stored with a trailing slash.
+            "--relative" => o.relative_name = true,
+            "--no-relative" => o.relative_name = false,
+            s if s.starts_with("--relative=") => {
+                o.relative_name = true;
+                o.relative_prefix = s["--relative=".len()..].to_string();
+            }
+            // `diff_opt_submodule()` (diff.c:5804): `PARSE_OPT_OPTARG`, so a bare
+            // `--submodule` is `log`, and an unparsable value is `error()` at 129.
+            // `diff.submodule` is *not* consulted — measured against stock 2.55.0,
+            // `-c diff.submodule=log format-patch` still renders the `short` form,
+            // while the same value does move `git diff`.
+            "--submodule" => o.submodule_format = super::diff::SubmoduleFormat::Log,
+            s if s.starts_with("--submodule=") => {
+                let value = &s["--submodule=".len()..];
+                match super::diff::parse_submodule_params(value) {
+                    Some(f) => o.submodule_format = f,
+                    None => record_opt_error(
+                        &mut o.opt_error,
+                        i,
+                        129,
+                        format!("error: failed to parse --submodule option parameter: '{value}'"),
+                    ),
+                }
+            }
             // `OPT_SET_INT('W', "function-context", …)`, which sets
             // `XDL_EMIT_FUNCCONTEXT` on the blob diffs.
             "-W" | "--function-context" => o.function_context = true,
@@ -2347,21 +2581,38 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
             s if s.starts_with("--rotate-to=") => {
                 o.skip_or_rotate = Some((false, s["--rotate-to=".len()..].as_bytes().to_vec()));
             }
-            // git's `--color=<when>` runs `git_config_colorbool(NULL, arg)`,
-            // which accepts only never/always/auto (case-insensitively) and
-            // otherwise `error()`s (exit 129) from setup_revisions. Colour is
-            // never emitted here, so never/auto agree; "always" would colourize
-            // and is not ported, so it is deferred.
+            // `diff_opt_color()` (diff.c:5591-5604): `PARSE_OPT_OPTARG`, so a bare
+            // `--color` is `GIT_COLOR_ALWAYS` and a value goes through
+            // `git_config_colorbool(NULL, arg)`, which takes only
+            // never/always/auto — plus their boolean spellings — case-insensitively
+            // and otherwise `error()`s (exit 129) from inside setup_revisions.
+            "--color" => color_when = Some(ColorWhen::Always),
+            "--no-color" => color_when = Some(ColorWhen::Never),
             s if s.starts_with("--color=") => {
-                match s["--color=".len()..].to_ascii_lowercase().as_str() {
-                    "never" | "auto" => {}
-                    "always" => o.deferred.push(a.to_owned()),
-                    _ => record_opt_error(
+                match diff_color::parse_color_when(&s["--color=".len()..]) {
+                    Some(w) => color_when = Some(w),
+                    None => record_opt_error(
                         &mut o.opt_error,
                         i,
                         129,
                         "error: option `color' expects \"always\", \"auto\", or \"never\""
                             .to_owned(),
+                    ),
+                }
+            }
+            // `--ws-error-highlight=<kinds>` (diff.c:6210-6212), whose
+            // `parse_ws_error_highlight()` reports the offending suffix and exits 129
+            // from setup_revisions.
+            s if s.starts_with("--ws-error-highlight=") => {
+                let arg = &s["--ws-error-highlight=".len()..];
+                match diff_color::parse_ws_error_highlight(arg) {
+                    Ok(v) => ws_error_highlight = Some(v),
+                    // `%.*s` over the prefix git had already accepted (diff.c:5516).
+                    Err(off) => record_opt_error(
+                        &mut o.opt_error,
+                        i,
+                        129,
+                        format!("error: unknown value after ws-error-highlight={}", &arg[..off]),
                     ),
                 }
             }
@@ -2615,8 +2866,70 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
                     _ => o.check = true,
                 }
             }
-            "--remerge-diff" | "--diff-merges=remerge" => o.remerge_diff = true,
+            "--remerge-diff" | "--diff-merges=remerge" | "--diff-merges=r" => {
+                o.remerge_diff = true
+            }
             "--no-remerge-diff" => o.remerge_diff = false,
+            // `diff_merges_parse_opts()` (diff-merges.c:117-150) and its five setup
+            // functions. `--cc` is *not* here: format-patch's own option table claims
+            // it for `Cc:` and `parse_options()` runs before `setup_revisions()`.
+            "--no-diff-merges" => o.diff_merges = DiffMerges::Off,
+            "-m" => o.diff_merges = diff_merges_default,
+            "-c" => o.diff_merges = DiffMerges::Combined,
+            "--dd" => o.diff_merges = DiffMerges::FirstParent,
+            // `parse_long_opt()` (revision.c) also takes the separate form, and dies
+            // `Option '<opt>' requires a value` when the next argv slot is missing.
+            "--diff-merges" => {
+                i += 1;
+                let Some(v) = args.get(i).cloned() else {
+                    return Ok(Parsed::Exit(fatal("Option '--diff-merges' requires a value")));
+                };
+                match parse_diff_merges(&v, diff_merges_default) {
+                    Some(m) => o.diff_merges = m,
+                    None if v == "remerge" || v == "r" => o.remerge_diff = true,
+                    None => record_opt_error(
+                        &mut o.opt_error,
+                        i,
+                        128,
+                        format!("fatal: invalid value for '--diff-merges': '{v}'"),
+                    ),
+                }
+            }
+            s if s.starts_with("--diff-merges=") => {
+                let value = &s["--diff-merges=".len()..];
+                match parse_diff_merges(value, diff_merges_default) {
+                    Some(m) => o.diff_merges = m,
+                    // `set_diff_merges()`'s `die()`, so exit 128 and positional
+                    // against the revisions like every other setup_revisions error.
+                    None => record_opt_error(
+                        &mut o.opt_error,
+                        i,
+                        128,
+                        format!("fatal: invalid value for '--diff-merges': '{value}'"),
+                    ),
+                }
+            }
+            // `--color-moved[=<mode>]`, `--color-moved-ws=<modes>`,
+            // `--word-diff[=<mode>]`, `--word-diff-regex=<re>` and
+            // `--color-words[=<re>]`, shared with every other command built from
+            // `add_diff_options()`. Two of them force colour on outright, which is
+            // why `color_when` is threaded through the parser.
+            s if diff_color::needs_separate_value(s) => {
+                i += 1;
+                let Some(v) = args.get(i) else {
+                    eprintln!("error: {}", diff_color::missing_value(s));
+                    return Ok(Parsed::Exit(ExitCode::from(129)));
+                };
+                let joined = format!("{s}={v}");
+                if let Some(Err(msg)) = move_word.parse_flag(&joined, &mut color_when) {
+                    record_opt_error(&mut o.opt_error, i, 129, msg);
+                }
+            }
+            s if is_move_word_flag(s) => {
+                if let Some(Err(msg)) = move_word.parse_flag(s, &mut color_when) {
+                    record_opt_error(&mut o.opt_error, i, 129, msg);
+                }
+            }
             s if NO_OP.contains(&s) => {}
             // A bare value-taking short option eats the next slot before anything
             // else can read it as a revision; without that, `format-patch -S base`
@@ -2769,6 +3082,36 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
         o.cover_letter_given = true;
     }
 
+    // The paint layer, resolved once the whole command line has been read.
+    // `git_diff_ui_config()` supplies the defaults each flag layers over, and
+    // `--color-words`/`--word-diff=color` have already forced `color_when` to
+    // `always`, so an explicit `--no-color` after one of them still wins.
+    o.extra = match move_word.resolve(repo) {
+        Ok(e) => e,
+        Err(msg) => {
+            eprintln!("{msg}");
+            return Ok(Parsed::Exit(ExitCode::from(128)));
+        }
+    };
+    // The on/off decision is the flag and the terminal test alone. Measured against
+    // stock 2.55.0: neither `color.diff`, `diff.color` nor `color.ui` moves it in
+    // either direction — `-c color.diff=always format-patch --stdout` to a pipe stays
+    // plain and `-c color.diff=never` to a pty still colours — while the very same
+    // values do decide `git diff`. The `color.diff.<slot>` palette *is* read, so only
+    // the switch is inert here, which is what `DiffColors::resolve` splits apart.
+    let colors_on = match color_when {
+        Some(ColorWhen::Always) => true,
+        Some(ColorWhen::Never) => false,
+        Some(ColorWhen::Auto) | None => {
+            super::color::want_color_stdout_raw(repo, None)
+        }
+    };
+    o.colors = DiffColors::resolve(repo, colors_on);
+    o.ws_error_highlight = match ws_error_highlight {
+        Some(v) => v,
+        None => diff_color::ws_error_highlight_default(repo).unwrap_or(diff_color::WSEH_NEW),
+    };
+
     o.branch_name = find_branch_name(repo, &o);
 
     // builtin/log.c: the stat+summary block is format-patch's default, but only
@@ -2779,6 +3122,20 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
     }
 
     Ok(Parsed::Ready(Box::new(o)))
+}
+
+/// `func_by_opt()` (diff-merges.c:68-85). `default_mode` is what `log.diffMerges`
+/// left `set_to_default` at, which is the only thing `on`/`m` resolve through.
+fn parse_diff_merges(value: &str, default_mode: DiffMerges) -> Option<DiffMerges> {
+    match value {
+        "off" | "none" => Some(DiffMerges::Off),
+        "1" | "first-parent" => Some(DiffMerges::FirstParent),
+        "separate" => Some(DiffMerges::Separate),
+        "c" | "combined" => Some(DiffMerges::Combined),
+        "cc" | "dense-combined" => Some(DiffMerges::DenseCombined),
+        "m" | "on" => Some(default_mode),
+        _ => None,
+    }
 }
 
 /// Port of `git_parse_maybe_bool()` (config.c): the words git accepts as
@@ -3601,21 +3958,29 @@ fn resolve_signature(o: &Opts) -> std::result::Result<String, ExitCode> {
     }
 }
 
-/// Whether the process runs at the root of the worktree, where a relative
-/// pathspec prefix is empty.
-fn at_worktree_top(repo: &gix::Repository) -> bool {
-    let (Some(workdir), Ok(cwd)) = (repo.workdir(), std::env::current_dir()) else {
-        return false;
-    };
-    match (workdir.canonicalize(), cwd.canonicalize()) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => false,
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Revision selection
 // ---------------------------------------------------------------------------
+
+/// `--diff-merges=<mode>` and the `-m`/`-c`/`--cc`/`--dd` spellings, as
+/// `diff-merges.c`'s five setup functions leave `rev_info`. `remerge` is refused
+/// separately (builtin/log.c:2220-2227), so it has no variant here.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DiffMerges {
+    /// `set_none()`: `--diff-merges=off|none`, `--no-diff-merges`, and
+    /// format-patch's own default — `cmd_format_patch` sets neither
+    /// `separate_merges` nor `combine_merges`.
+    Off,
+    /// `set_separate()`: `--diff-merges=separate|m|on` and `-m`. One diff, and one
+    /// repeat of the mail header block, per parent.
+    Separate,
+    /// `set_first_parent()`: `--diff-merges=first-parent|1` and `--dd`.
+    FirstParent,
+    /// `set_combined()`: `--diff-merges=combined|c` and `-c`.
+    Combined,
+    /// `set_dense_combined()`: `--diff-merges=dense-combined|cc` and `--cc`.
+    DenseCombined,
+}
 
 /// What `--ignore-if-in-upstream` finds on the pending list once
 /// `cmd_format_patch`'s single-endpoint rule has run.
@@ -4510,8 +4875,59 @@ fn render_message(
     notes_trees: &[super::notes::Tree],
     out: &mut Vec<u8>,
 ) -> Result<()> {
+    let msg_start = out.len();
+    let mut raw_spans: Vec<(usize, usize)> = Vec::new();
+    render_message_body(repo, commit, nr, total, opts, th, notes_trees, out, &mut raw_spans)?;
+    // Everything a patch message is made of takes `--line-prefix`: `show_log()`
+    // opens with `graph_show_commit()`, `log_write_email_headers()` follows each
+    // header with `graph_show_oneline()`, `graph_show_strbuf()` writes it between
+    // every pair of message lines, and `log_tree_diff_flush()` (log-tree.c:952) and
+    // every `emit_diff_symbol()` write `diff_line_prefix()` themselves. What is left
+    // outside is written by `cmd_format_patch` directly — the `base-commit:` trailer
+    // and the signature — and `show_diff_of_diff()`, which installs an
+    // `output_prefix` callback of its own (diff-lib.c:717) that replaces this one.
+    if let Some(prefix) = &opts.line_prefix {
+        // Prefix every stretch between the spans that go out raw, back to front so
+        // the offsets ahead of each edit stay valid.
+        let mut cut = out.len();
+        for &(start, end) in raw_spans.iter().rev() {
+            prefix_lines(out, end, cut, prefix.as_bytes());
+            cut = start;
+        }
+        prefix_lines(out, msg_start, cut, prefix.as_bytes());
+    }
+    Ok(())
+}
+
+/// Insert `prefix` at the start of every line of `out[from..to]`.
+fn prefix_lines(out: &mut Vec<u8>, from: usize, to: usize, prefix: &[u8]) {
+    if prefix.is_empty() || from >= to || to > out.len() {
+        return;
+    }
+    let mut rebuilt = Vec::with_capacity(to - from + prefix.len() * 8);
+    for line in out[from..to].split_inclusive(|&b| b == b'\n') {
+        rebuilt.extend_from_slice(prefix);
+        rebuilt.extend_from_slice(line);
+    }
+    out.splice(from..to, rebuilt);
+}
+
+fn render_message_body(
+    repo: &gix::Repository,
+    commit: &gix::Commit<'_>,
+    nr: usize,
+    total: usize,
+    opts: &Opts,
+    th: &ThreadState,
+    notes_trees: &[super::notes::Tree],
+    out: &mut Vec<u8>,
+    raw_spans: &mut Vec<(usize, usize)>,
+) -> Result<()> {
+    let header_start = out.len();
     write_from_line(out, commit.id, opts)?;
-    write_message_ids(out, th)?;
+    // No prefix argument here: `show_log()` prefixes every line of a patch message,
+    // which [`render_message`] applies to the whole region in one pass.
+    write_message_ids(out, th, "")?;
 
     // Headers and body are built in one buffer because git's wrapping and the
     // final `strbuf_rtrim` both depend on what is already in it.
@@ -4647,24 +5063,80 @@ fn render_message(
     }
     out.extend_from_slice(sb.as_bytes());
 
-    // The patch itself — but only when this commit has at most one parent.
-    //
-    // `log_tree_diff()` (log-tree.c) reaches its diff loop for a merge only when
-    // `separate_merges` is set, which is `-m`/`--diff-merges=separate`; with
-    // neither that nor `-c`/`--cc` it `return 0`s before producing anything.
-    // format-patch never sets any of them, so `log_tree_commit()` sees nothing
-    // shown, falls back to its `always_show_header` branch and emits the header
-    // alone. A merge that `--max-parents=<n>` (n > 1) or `--min-parents` let
-    // through therefore carries no three-dash separator, no diffstat and no
-    // patch — only the mail headers, the message, and whatever commentary block
-    // (`Notes:`) the message itself opened.
-    let parents: Vec<_> = commit.parent_ids().collect();
+    // The mail headers and the message are one block; `log_tree_diff()` re-runs
+    // `show_log()` for every parent it diffs against, so the separate-merge form
+    // repeats these exact bytes ahead of each parent's patch.
+    let header_block = out[header_start..].to_vec();
+
+    // `log_tree_diff()` (log-tree.c:1097) decides what a merge gets. With
+    // `--diff-merges=off` — format-patch's default, since it sets neither
+    // `separate_merges` nor `combine_merges` — a merge falls through to
+    // `log_tree_commit()`'s `always_show_header` branch and carries no three-dash
+    // separator, no diffstat and no patch, whatever diff format was asked for.
+    let parents: Vec<ObjectId> = commit.parent_ids().map(|p| p.detach()).collect();
     if parents.len() > 1 {
+        match opts.diff_merges {
+            DiffMerges::Off => return Ok(()),
+            // `first_parent_merges` breaks out of the parent loop after the first.
+            DiffMerges::FirstParent => {
+                emit_commit_diff(repo, out, commit, Some(parents[0]), nr, opts, shown_dashes, raw_spans)?;
+            }
+            // The loop at log-tree.c:1156-1172, which sets `opt->loginfo` again for
+            // each later parent so `show_log()` writes the whole header block anew.
+            //
+            // `log_tree_diff_flush()` returns *before* `show_log()` when the pair
+            // queue came out empty (log-tree.c:929-936), so a parent this commit
+            // does not differ from — or whose pairs `--diff-filter` dropped — gets no
+            // message at all, and the next parent that does becomes the first record.
+            DiffMerges::Separate => {
+                let mut shown = false;
+                for parent in &parents {
+                    let mut body: Vec<u8> = Vec::new();
+                    let mut spans: Vec<(usize, usize)> = Vec::new();
+                    emit_commit_diff(
+                        repo, &mut body, commit, Some(*parent), nr, opts, shown_dashes, &mut spans,
+                    )?;
+                    if body.is_empty() {
+                        continue;
+                    }
+                    if shown {
+                        // `show_log()`'s `opt->shown_one` newline (log-tree.c:770-790),
+                        // which separates every record after the first.
+                        out.push(b'\n');
+                        out.extend_from_slice(&header_block);
+                    }
+                    let base = out.len();
+                    out.extend_from_slice(&body);
+                    raw_spans.extend(spans.iter().map(|(a, b)| (a + base, b + base)));
+                    shown = true;
+                }
+                // Nothing shown at all leaves the header block already written, which
+                // is `log_tree_commit()`'s `always_show_header` fallback.
+            }
+            DiffMerges::Combined | DiffMerges::DenseCombined => {
+                emit_combined_diff(repo, out, commit, &parents, nr, opts, raw_spans)?;
+            }
+        }
         return Ok(());
     }
+    emit_commit_diff(repo, out, commit, parents.first().copied(), nr, opts, shown_dashes, raw_spans)
+}
+
+/// One commit-versus-parent patch: the stat blocks and the patch body, in the order
+/// `log_tree_diff_flush()` writes them.
+fn emit_commit_diff(
+    repo: &gix::Repository,
+    out: &mut Vec<u8>,
+    commit: &gix::Commit<'_>,
+    parent: Option<ObjectId>,
+    nr: usize,
+    opts: &Opts,
+    shown_dashes: bool,
+    raw_spans: &mut Vec<(usize, usize)>,
+) -> Result<()> {
     let new_tree = commit.tree()?;
-    let old_tree = match parents.first() {
-        Some(pid) => Some(pid.object()?.try_into_commit()?.tree()?),
+    let old_tree = match parent {
+        Some(pid) => Some(repo.find_object(pid)?.try_into_commit()?.tree()?),
         None => None,
     };
     let abbrev = index_abbrev(repo, &new_tree, opts)?;
@@ -4674,31 +5146,168 @@ fn render_message(
         old_tree.as_ref(),
         Some(&new_tree),
         opts.pathspec.as_ref(),
+        opts.active_relative(),
         &RenameOpts::from_opts(opts),
         &mut dissimilarity,
     )?;
     rotate_changes(&mut changes, opts);
+    apply_diff_filter(&mut changes, opts, &dissimilarity);
 
     if !changes.is_empty() {
         let mut patch: Vec<u8> = Vec::new();
-        let (kept, stats) =
-            render_changes(repo, &mut patch, &changes, abbrev, opts, &dissimilarity)?;
+        let r = render_changes(repo, &mut patch, &changes, abbrev, opts, &dissimilarity)?;
 
         let stat_sep = mime_stat_sep(commit, nr, opts)?;
         emit_stat_blocks(
             repo,
             out,
-            &kept,
-            &stats,
+            &r.kept,
+            &r.stats,
             opts,
             shown_dashes,
             stat_sep.as_deref(),
             &dissimilarity,
             raw_abbrev(repo, &new_tree, opts)?,
+            opts.output_format,
+            true,
+            raw_spans,
         )?;
         out.extend_from_slice(&patch);
     }
     Ok(())
+}
+
+/// `-c` / `--cc`: `do_diff_combined()` (log-tree.c:975) into
+/// `diff_tree_combined_merge()`.
+///
+/// Two things separate this from the per-parent form. `show_combined_diff()` writes
+/// its own blank line after the header rather than the three-dash separator, and
+/// `find_paths_generic()` computes every *stat* format against the first parent
+/// alone (combine-diff.c:1368-1400) — only the patch body is the combined one.
+fn emit_combined_diff(
+    repo: &gix::Repository,
+    out: &mut Vec<u8>,
+    commit: &gix::Commit<'_>,
+    parents: &[ObjectId],
+    nr: usize,
+    opts: &Opts,
+    raw_spans: &mut Vec<(usize, usize)>,
+) -> Result<()> {
+    // The bare newline `diff_tree_combined()` prints after `show_log()` when any
+    // output format is on (combine-diff.c:1510-1515), in place of the three-dash
+    // separator — which is what passing `shown_dashes = true` reproduces. Only the
+    // `STAT_FORMAT_MASK` formats run in that pass; `--raw` is answered by
+    // `show_raw_diff()` over the combined path set instead.
+    let stat_mask = opts.output_format & (FMT_DIFFSTAT | FMT_NUMSTAT | FMT_SHORTSTAT | FMT_DIRSTAT | FMT_SUMMARY);
+    emit_commit_diff_stats_only(repo, out, commit, parents[0], nr, opts, stat_mask, raw_spans)?;
+
+    let dense = opts.diff_merges == DiffMerges::DenseCombined;
+    let abbrev = crate::abbrev::configured_abbrev(repo, repo.object_hash().len_in_hex());
+    // `if (num_paths)` guards both the raw block and `needsep` (combine-diff.c:1606).
+    // A path only enters the intersection by differing from every parent, so it
+    // always renders either hunks or a mode line: the patch being non-empty is the
+    // same test as `num_paths`.
+    let patch = super::diff::merge_combined_patch_painted(
+        repo,
+        commit.id,
+        parents,
+        &opts.paths,
+        opts.context,
+        dense,
+        &opts.colors,
+    )?;
+    if patch.is_empty() {
+        return Ok(());
+    }
+    // `--raw` under a combined mode is `show_raw_diff()`'s `::`-prefixed block, not
+    // the first parent's raw lines, and it sets `needsep` on its own.
+    if opts.output_format & FMT_RAW != 0 {
+        out.extend_from_slice(&super::diff::merge_combined_raw(
+            repo,
+            commit.id,
+            parents,
+            &opts.paths,
+            abbrev,
+            false,
+            true,
+        )?);
+    }
+    if opts.output_format & (FMT_RAW | stat_mask) != 0 {
+        out.push(b'\n');
+    }
+    out.extend_from_slice(&patch);
+    Ok(())
+}
+
+/// The stat half of [`emit_commit_diff`] with the three-dash separator already
+/// spent, for the combined form whose patch body comes from elsewhere.
+fn emit_commit_diff_stats_only(
+    repo: &gix::Repository,
+    out: &mut Vec<u8>,
+    commit: &gix::Commit<'_>,
+    parent: ObjectId,
+    nr: usize,
+    opts: &Opts,
+    output_format: u32,
+    raw_spans: &mut Vec<(usize, usize)>,
+) -> Result<()> {
+    let new_tree = commit.tree()?;
+    let old_tree = repo.find_object(parent)?.try_into_commit()?.tree()?;
+    let abbrev = index_abbrev(repo, &new_tree, opts)?;
+    let mut dissimilarity = HashMap::new();
+    let mut changes = tree_changes(
+        repo,
+        Some(&old_tree),
+        Some(&new_tree),
+        opts.pathspec.as_ref(),
+        opts.active_relative(),
+        &RenameOpts::from_opts(opts),
+        &mut dissimilarity,
+    )?;
+    rotate_changes(&mut changes, opts);
+    apply_diff_filter(&mut changes, opts, &dissimilarity);
+    if changes.is_empty() {
+        // The blank line stands in for the three-dash separator whether or not the
+        // stat pass has anything to say, so it is written here too.
+        out.push(b'\n');
+        return Ok(());
+    }
+    let mut discard: Vec<u8> = Vec::new();
+    let r = render_changes(repo, &mut discard, &changes, abbrev, opts, &dissimilarity)?;
+    let stat_sep = mime_stat_sep(commit, nr, opts)?;
+    emit_stat_blocks(
+        repo,
+        out,
+        &r.kept,
+        &r.stats,
+        opts,
+        true,
+        stat_sep.as_deref(),
+        &dissimilarity,
+        raw_abbrev(repo, &new_tree, opts)?,
+        output_format,
+        false,
+        raw_spans,
+    )
+}
+
+/// `diff_flush_patch_all_file_pairs()`: the commit's whole patch is decomposed into
+/// `o->emitted_symbols` and re-emitted in one pass, which is what lets
+/// `--color-moved` recognise a block that moved between two files of the same
+/// commit and what `--word-diff` rewrites each hunk through.
+fn paint_patch(patch: &[u8], files: &[FilePaint], opts: &Opts) -> Vec<u8> {
+    diff_color::colorize_patch_ex(
+        patch,
+        &opts.colors,
+        &PaintOptions {
+            ws_error_highlight: opts.ws_error_highlight,
+            indicators: opts.indicators,
+            ..Default::default()
+        },
+        files,
+        FilePaint::new(opts.ws_rule),
+        &opts.extra,
+    )
 }
 
 /// True when any byte is outside 7-bit ASCII — git's `has_non_ascii()`.
@@ -4709,9 +5318,10 @@ fn non_ascii(s: &str) -> bool {
 /// `Message-ID:` and the `In-Reply-To:`/`References:` chain, in the order
 /// `log_write_email_headers()` prints them: straight after the mbox `From` line
 /// and ahead of the pretty-printed identity headers.
-fn write_message_ids(out: &mut Vec<u8>, th: &ThreadState) -> Result<()> {
+fn write_message_ids(out: &mut Vec<u8>, th: &ThreadState, prefix: &str) -> Result<()> {
     if let Some(id) = &th.message_id {
         writeln!(out, "Message-ID: <{id}>")?;
+        out.extend_from_slice(prefix.as_bytes());
     }
     if let Some(last) = th.refs.last() {
         writeln!(out, "In-Reply-To: <{last}>")?;
@@ -4719,6 +5329,7 @@ fn write_message_ids(out: &mut Vec<u8>, th: &ThreadState) -> Result<()> {
             let lead = if i > 0 { "\t" } else { "References: " };
             writeln!(out, "{lead}<{r}>")?;
         }
+        out.extend_from_slice(prefix.as_bytes());
     }
     Ok(())
 }
@@ -4776,30 +5387,39 @@ fn emit_stat_blocks(
     stat_sep: Option<&str>,
     dissimilarity: &HashMap<Vec<u8>, u32>,
     raw_abbrev: Abbrev,
+    // `o->output_format`. Taken as an argument rather than read off [`Opts`] because
+    // the combined form runs this pass under `STAT_FORMAT_MASK` alone
+    // (combine-diff.c:1570), with the raw and patch bits masked off.
+    output_format: u32,
+    // Whether `DIFF_FORMAT_PATCH` is still set, which is the only thing that makes
+    // `diff_flush()` write its separator after the stat block (diff.c:7228-7236).
+    patch_follows: bool,
+    // Byte ranges of `out` that `--line-prefix` must not touch, appended to.
+    raw_spans: &mut Vec<(usize, usize)>,
 ) -> Result<()> {
-    if !shown_dashes && opts.output_format & FMT_DIFFSTAT != 0 {
+    if !shown_dashes && output_format & FMT_DIFFSTAT != 0 {
         out.extend_from_slice(b"---");
     }
     out.push(b'\n');
 
-    let dirstat_by_line = opts.output_format & FMT_DIRSTAT != 0 && opts.dirstat.by_line;
+    let dirstat_by_line = output_format & FMT_DIRSTAT != 0 && opts.dirstat.by_line;
     let mut separator = false;
 
     // `diff_flush()` runs the raw formats first, ahead of every stat block
     // (diff.c:7200-7217).
-    if opts.output_format & FMT_RAW != 0 {
-        emit_raw(repo, out, changes, raw_abbrev, dissimilarity)?;
+    if output_format & FMT_RAW != 0 {
+        emit_raw(repo, out, changes, raw_abbrev, dissimilarity, opts)?;
         separator = true;
     }
 
-    if opts.output_format & (FMT_DIFFSTAT | FMT_NUMSTAT | FMT_SHORTSTAT) != 0 || dirstat_by_line {
-        if opts.output_format & FMT_NUMSTAT != 0 {
+    if output_format & (FMT_DIFFSTAT | FMT_NUMSTAT | FMT_SHORTSTAT) != 0 || dirstat_by_line {
+        if output_format & FMT_NUMSTAT != 0 {
             emit_numstat(out, stats)?;
         }
-        if opts.output_format & FMT_DIFFSTAT != 0 {
-            emit_stats(out, stats, stat_widths(opts))?;
+        if output_format & FMT_DIFFSTAT != 0 {
+            emit_stats(out, stats, stat_widths(opts), &opts.colors)?;
         }
-        if opts.output_format & FMT_SHORTSTAT != 0 {
+        if output_format & FMT_SHORTSTAT != 0 {
             emit_stat_summary(out, stats)?;
         }
         if dirstat_by_line {
@@ -4807,21 +5427,26 @@ fn emit_stat_blocks(
         }
         separator = true;
     }
-    if opts.output_format & FMT_DIRSTAT != 0 && !dirstat_by_line {
+    if output_format & FMT_DIRSTAT != 0 && !dirstat_by_line {
         emit_dirstat(repo, out, changes, &opts.dirstat)?;
     }
-    if opts.output_format & FMT_SUMMARY != 0 && !is_summary_empty(changes, dissimilarity) {
+    if output_format & FMT_SUMMARY != 0 && !is_summary_empty(changes, dissimilarity) {
         emit_summary(out, changes, dissimilarity)?;
         separator = true;
     }
 
-    if separator {
+    if separator && patch_follows {
         out.push(b'\n');
         // `--attach`/`--inline` hang the patch off its own MIME part, announced
         // here; with no stat block at all git never emits it and the patch stays
         // inside the first (text) part.
         if let Some(sep) = stat_sep {
+            // `DIFF_SYMBOL_STAT_SEP` is `fputs(o->stat_sep, o->file)` with no
+            // `diff_line_prefix()` in front of it (diff.c:1673-1675), so the MIME
+            // part header goes out unprefixed even inside a prefixed message.
+            let start = out.len();
             out.extend_from_slice(sep.as_bytes());
+            raw_spans.push((start, out.len()));
         }
     }
     Ok(())
@@ -4848,7 +5473,14 @@ fn render_cover_letter(
     // flips the walk itself and so flips both ends together.
     let head = *commits.last().expect("a non-empty series");
     write_from_line(out, head, opts)?;
-    write_message_ids(out, th)?;
+    // `make_cover_letter()` reaches `log_write_email_headers()` but never
+    // `show_log()`, so only the three `graph_show_oneline()` calls inside it write
+    // `--line-prefix` — one after the magic `From` line and one after each
+    // message-id block. Everything else the cover letter prints (`Date:`,
+    // `Subject:`, the blurb, the shortlog) goes out unprefixed.
+    let prefix = opts.line_prefix.as_deref().unwrap_or_default();
+    out.extend_from_slice(prefix.as_bytes());
+    write_message_ids(out, th, prefix)?;
 
     let mut sb = String::new();
     // `make_cover_letter()` writes `cfg->from ? cfg->from : git_committer_info(0)`
@@ -4955,17 +5587,23 @@ fn render_cover_letter(
             base.as_ref(),
             Some(&head_tree),
             opts.pathspec.as_ref(),
+            opts.active_relative(),
             &RenameOpts::from_opts(opts),
             &mut dissimilarity,
         )?;
         rotate_changes(&mut changes, opts);
+        apply_diff_filter(&mut changes, opts, &dissimilarity);
         let mut discard: Vec<u8> = Vec::new();
-        let (kept, stats) =
-            render_changes(repo, &mut discard, &changes, abbrev, opts, &dissimilarity)?;
+        let r = render_changes(repo, &mut discard, &changes, abbrev, opts, &dissimilarity)?;
         // `show_diffstat()` memcpy's `rev->diffopt`, keeping the width knobs, so
         // the cover letter's combined diffstat honors them too.
-        emit_stats(out, &stats, stat_widths(opts))?;
-        emit_summary(out, &kept, &dissimilarity)?;
+        // `show_diffstat()` goes through `diff_flush()`, so every row it writes
+        // opens with `diff_line_prefix()`; the blank line after it does not.
+        let stat_start = out.len();
+        emit_stats(out, &r.stats, stat_widths(opts), &opts.colors)?;
+        emit_summary(out, &r.kept, &dissimilarity)?;
+        let stat_end = out.len();
+        prefix_lines(out, stat_start, stat_end, prefix.as_bytes());
         out.push(b'\n');
     }
     Ok(Ok(()))
@@ -5427,6 +6065,7 @@ fn commit_patch_id(repo: &gix::Repository, commit: &gix::Commit<'_>) -> Result<O
         old_tree.as_ref(),
         Some(&new_tree),
         None,
+        None,
         &RenameOpts::default(),
         &mut HashMap::new(),
     )?;
@@ -5654,6 +6293,7 @@ fn tree_changes(
     old_tree: Option<&gix::Tree<'_>>,
     new_tree: Option<&gix::Tree<'_>>,
     specs: Option<&super::log::PathspecMatcher>,
+    relative: Option<&str>,
     ro: &RenameOpts,
     dissimilarity: &mut HashMap<Vec<u8>, u32>,
 ) -> Result<Vec<ChangeDetached>> {
@@ -5663,12 +6303,27 @@ fn tree_changes(
     if let Some(specs) = specs {
         changes.retain(|c| specs.matches(change_path(c)));
     }
+    // `--relative`'s *narrowing* half is `diff_queue()`'s prefix test (diff.c:7630),
+    // which runs while the queue is being built — before `diffcore_rename()`. That
+    // ordering is visible: measured against stock 2.55.0, `--relative=src` over a
+    // commit that renamed `old/moved.txt` to `src/moved.txt` reports a plain
+    // creation, because the deletion side never entered the queue to be paired.
+    if let Some(prefix) = relative {
+        changes.retain(|c| change_path(c).starts_with(prefix.as_bytes()));
+    }
     changes.sort_by(|a, b| change_path(a).cmp(change_path(b)));
-    let unchanged = if ro.find_copies_harder {
+    let mut unchanged = if ro.find_copies_harder {
         shared_blobs(repo, old_tree, &changes, specs)?
     } else {
         Vec::new()
     };
+    // The unmodified pairs `--find-copies-harder` feeds in as copy sources are queued
+    // through the very same `diff_queue()` (tree-diff.c:519), so the prefix test
+    // applies to them too — without it a copy could be found from a source the
+    // narrowing had already excluded.
+    if let Some(prefix) = relative {
+        unchanged.retain(|(path, _, _)| path.starts_with(prefix.as_bytes()));
+    }
     detect_renames(repo, &mut changes, ro, &unchanged, dissimilarity)?;
     Ok(changes)
 }
@@ -5759,6 +6414,51 @@ impl RenameOpts {
 /// nothing here dies. Both halves verified against stock git 2.55.0 over a commit
 /// touching `del.txt`, `f.txt` and `new.txt`: `format-patch --skip-to=ig.txt`
 /// prints `new.txt` alone, while `--skip-to=nope` prints all three.
+/// `diffcore_apply_filter()`, which `diffcore_std()` runs last — after break,
+/// rename, pickaxe, order and rotate (diff.c:7504-7526).
+fn apply_diff_filter(
+    changes: &mut Vec<ChangeDetached>,
+    opts: &Opts,
+    dissimilarity: &HashMap<Vec<u8>, u32>,
+) {
+    let Some(filter) = opts.diff_filter else {
+        return;
+    };
+    let pairs: Vec<(u8, Option<u32>)> = changes
+        .iter()
+        .map(|c| pair_status(c, dissimilarity))
+        .collect();
+    let mut keep = super::diff_filter::apply(filter, &pairs).into_iter();
+    changes.retain(|_| keep.next().unwrap_or(true));
+}
+
+/// One pair's `p->status` and `p->score`, the two fields `match_filter()` reads.
+/// The score is `-B`'s dissimilarity, which is the only thing that makes a
+/// modified pair "broken".
+fn pair_status(change: &ChangeDetached, dissimilarity: &HashMap<Vec<u8>, u32>) -> (u8, Option<u32>) {
+    match change {
+        ChangeDetached::Addition { .. } => (b'A', None),
+        ChangeDetached::Deletion { .. } => (b'D', None),
+        ChangeDetached::Modification {
+            location,
+            previous_entry_mode,
+            entry_mode,
+            ..
+        } => {
+            // `DIFF_PAIR_TYPE_CHANGED()`: the file-type bits differ.
+            let changed_type = (u32::from(previous_entry_mode.value())
+                ^ u32::from(entry_mode.value()))
+                & 0o170000
+                != 0;
+            (
+                if changed_type { b'T' } else { b'M' },
+                dissimilarity.get(location.as_slice()).copied(),
+            )
+        }
+        ChangeDetached::Rewrite { copy, .. } => (if *copy { b'C' } else { b'R' }, None),
+    }
+}
+
 fn rotate_changes(changes: &mut Vec<ChangeDetached>, opts: &Opts) {
     let Some((skip, path)) = &opts.skip_or_rotate else {
         return;
@@ -5796,22 +6496,111 @@ fn render_changes(
     abbrev: Abbrev,
     opts: &Opts,
     dissimilarity: &HashMap<Vec<u8>, u32>,
-) -> Result<(Vec<ChangeDetached>, Vec<StatEntry>)> {
-    let from_contents =
-        opts.ws != super::diff_pairs::Whitespace::Keep || !opts.ignore_regex.is_empty();
+) -> Result<Rendered> {
+    let from_contents = opts.ws != super::diff_pairs::Whitespace::Keep
+        || !opts.ignore_regex.is_empty()
+        || opts.ignore_blank_lines;
     let mut kept: Vec<ChangeDetached> = Vec::with_capacity(changes.len());
     let mut stats: Vec<StatEntry> = Vec::with_capacity(changes.len());
+    // The plain patch accumulated since the last flush, and the per-file paint state
+    // that indexes it. A `--submodule=log|diff` section is written already painted,
+    // so the run before it has to be flushed to keep the order — the same drain
+    // `git diff` performs at diff.rs:2568.
+    let mut plain: Vec<u8> = Vec::new();
+    let mut files: Vec<FilePaint> = Vec::with_capacity(changes.len());
     for change in changes {
         let mut one: Vec<u8> = Vec::new();
-        let stat = emit_change(repo, &mut one, change, abbrev, opts, dissimilarity)?;
+        let (stat, paint) = emit_change(repo, &mut one, change, abbrev, opts, dissimilarity)?;
         if from_contents && stat.added == 0 && stat.deleted == 0 && is_plain_edit(change) {
             continue;
         }
-        patch.extend_from_slice(&one);
+        // `builtin_diff()`'s submodule branch (diff.c:3870) replaces the whole
+        // `diff --git` section — header included — with the submodule's own report.
+        // The diffstat is computed by `builtin_diffstat()`, which has no such branch,
+        // so the row this pair contributes is still the `Subproject commit` one.
+        if opts.submodule_format != super::diff::SubmoduleFormat::Short
+            && is_gitlink_pair(change)
+        {
+            patch.extend_from_slice(&paint_patch(&plain, &files, opts));
+            plain.clear();
+            files.clear();
+            render_submodule_section(patch, repo, change, opts);
+        } else {
+            plain.extend_from_slice(&one);
+            files.push(paint);
+        }
         stats.push(stat);
         kept.push(change.clone());
     }
-    Ok((kept, stats))
+    patch.extend_from_slice(&paint_patch(&plain, &files, opts));
+    Ok(Rendered { kept, stats })
+}
+
+/// What one commit's file-pair queue rendered into: the pairs that survived
+/// `diff_from_contents` suppression and their diffstat rows.
+struct Rendered {
+    kept: Vec<ChangeDetached>,
+    stats: Vec<StatEntry>,
+}
+
+/// `S_ISGITLINK()` on both sides of the pair, with an absent side not objecting —
+/// the test `builtin_diff()` makes before it diverts to the submodule renderers.
+fn is_gitlink_pair(change: &ChangeDetached) -> bool {
+    match change {
+        ChangeDetached::Addition { entry_mode, .. }
+        | ChangeDetached::Deletion { entry_mode, .. } => entry_mode.is_commit(),
+        ChangeDetached::Modification {
+            previous_entry_mode,
+            entry_mode,
+            ..
+        } => previous_entry_mode.is_commit() && entry_mode.is_commit(),
+        ChangeDetached::Rewrite {
+            source_entry_mode,
+            entry_mode,
+            ..
+        } => source_entry_mode.is_commit() && entry_mode.is_commit(),
+    }
+}
+
+/// `show_submodule_diff_summary()` / `show_submodule_inline_diff()` for one gitlink
+/// pair, through the same implementations `git diff --submodule=<format>` uses.
+fn render_submodule_section(
+    out: &mut Vec<u8>,
+    repo: &gix::Repository,
+    change: &ChangeDetached,
+    opts: &Opts,
+) {
+    let null = repo.object_hash().null();
+    let (one, two) = match change {
+        ChangeDetached::Addition { id, .. } => (null, *id),
+        ChangeDetached::Deletion { id, .. } => (*id, null),
+        ChangeDetached::Modification { previous_id, id, .. } => (*previous_id, *id),
+        ChangeDetached::Rewrite { source_id, id, .. } => (*source_id, *id),
+    };
+    let path = gix::bstr::BString::from(change_path(change).to_vec());
+    let abbrev = crate::abbrev::configured_abbrev(repo, repo.object_hash().len_in_hex());
+    // A tree-to-tree pair never carries `two->dirty_submodule`, which only a
+    // worktree comparison sets.
+    if opts.submodule_format == super::diff::SubmoduleFormat::Log {
+        super::diff_pairs::show_submodule_diff_summary(
+            out, repo, &path, &one, &two, 0, abbrev, &opts.colors,
+        );
+        return;
+    }
+    let (a, b) = prefixes(opts);
+    super::diff::submodule_inline_section(
+        out,
+        repo,
+        &path,
+        &one,
+        &two,
+        0,
+        abbrev,
+        &opts.colors,
+        a.as_bytes(),
+        b.as_bytes(),
+        repo.object_hash(),
+    );
 }
 
 /// An in-place content edit — both sides present, same path, same mode. It is the
@@ -6394,12 +7183,17 @@ fn stat_rows(files: &[StatEntry]) -> Vec<diffstat::StatFile> {
 
 /// `show_stats()` (diff.c) at format-patch's width: `MAIL_DEFAULT_WRAP` (72)
 /// unless `--stat`/`--stat-width` named one, never the terminal width.
-fn emit_stats(out: &mut Vec<u8>, files: &[StatEntry], sw: StatWidths) -> Result<()> {
+fn emit_stats(
+    out: &mut Vec<u8>,
+    files: &[StatEntry],
+    sw: StatWidths,
+    colors: &DiffColors,
+) -> Result<()> {
     let sw = StatWidths {
         width: if sw.width != 0 { sw.width } else { MAIL_DEFAULT_WRAP },
         ..sw
     };
-    diffstat::show_stats(out, &stat_rows(files), &sw, &super::diff_color::DiffColors::disabled());
+    diffstat::show_stats(out, &stat_rows(files), &sw, colors);
     Ok(())
 }
 /// `show_shortstats()` (diff.c) — the trailing ` N files changed, …` line, which
@@ -6772,6 +7566,7 @@ fn emit_raw(
     changes: &[ChangeDetached],
     abbrev: Abbrev,
     dissimilarity: &HashMap<Vec<u8>, u32>,
+    opts: &Opts,
 ) -> Result<()> {
     for change in changes {
         let (old, new, status, score, names): (_, _, u8, Option<u32>, Vec<&[u8]>) = match change {
@@ -6853,9 +7648,10 @@ fn emit_raw(
         if let Some(score) = score {
             write!(out, "{score:03}")?;
         }
+        // `diff_flush_raw()` reports each name through `strip_prefix()`.
         for path in names {
             out.push(b'\t');
-            out.extend_from_slice(quote_path(path).as_bytes());
+            out.extend_from_slice(quote_path(strip_relative(path, opts)).as_bytes());
         }
         out.push(b'\n');
     }
@@ -6977,8 +7773,12 @@ fn emit_change(
     abbrev: Abbrev,
     opts: &Opts,
     dissimilarity: &HashMap<Vec<u8>, u32>,
-) -> Result<StatEntry> {
+) -> Result<(StatEntry, FilePaint)> {
     let mut counts = (0u64, 0u64);
+    // `ecbdata.blank_at_eof_in_preimage` / `_postimage`, left at zero for the pairs
+    // that never reach a textual diff (a pure mode change, a rename that moved the
+    // content untouched, `-D`'s discarded deletion body).
+    let mut blank_at_eof = (0usize, 0usize);
     match change {
         ChangeDetached::Addition {
             location,
@@ -6994,7 +7794,7 @@ fn emit_change(
             reject_binary(is_sub, &content, path, opts)?;
             let short = short_oid(repo, *id, abbrev, is_sub)?;
             writeln!(out, "index {}..{}", "0".repeat(short.len()), short)?;
-            counts = emit_body(out, None, Some(path), &[], &content, opts)?;
+            counts = emit_body(out, None, Some(path), &[], &content, opts, &mut blank_at_eof)?;
         }
         ChangeDetached::Deletion {
             location,
@@ -7016,7 +7816,7 @@ fn emit_change(
             // so the removed lines are still counted here.
             let mut sink = Vec::new();
             let body = if opts.irreversible_delete { &mut sink } else { &mut *out };
-            counts = emit_body(body, Some(path), None, &content, &[], opts)?;
+            counts = emit_body(body, Some(path), None, &content, &[], opts, &mut blank_at_eof)?;
         }
         ChangeDetached::Modification {
             location,
@@ -7063,6 +7863,7 @@ fn emit_change(
                     &old_content,
                     &new_content,
                     opts,
+                    &mut blank_at_eof,
                 )?;
             }
         }
@@ -7081,8 +7882,12 @@ fn emit_change(
             emit_rename_header(out, from, to, opts);
             writeln!(out, "similarity index {}%", similarity_percent(diff.as_ref()))?;
             let verb = if *copy { "copy" } else { "rename" };
-            writeln!(out, "{verb} from {}", quote_path(from))?;
-            writeln!(out, "{verb} to {}", quote_path(to))?;
+            // `fill_metainfo()` names both sides through `p->one->path` /
+            // `p->two->path` after `run_diff()` has already applied
+            // `strip_prefix()` (diff.c:5009), so `--relative` shortens these two
+            // lines exactly as it shortens the `diff --git` header above them.
+            writeln!(out, "{verb} from {}", quote_path(strip_relative(from, opts)))?;
+            writeln!(out, "{verb} to {}", quote_path(strip_relative(to, opts)))?;
             let old_mode = format!("{:o}", source_entry_mode.value());
             let new_mode = format!("{:o}", entry_mode.value());
             if old_mode != new_mode {
@@ -7104,19 +7909,29 @@ fn emit_change(
                 } else {
                     writeln!(out, "index {old_short}..{new_short} {new_mode}")?;
                 }
-                counts = emit_body(out, Some(from), Some(to), &old_content, &new_content, opts)?;
+                counts = emit_body(out, Some(from), Some(to), &old_content, &new_content, opts, &mut blank_at_eof)?;
             }
         }
     }
     // The stat row for a rename names both sides through `pprint_rename()`.
+    // `run_diffstat()` calls `strip_prefix()` first, so `--relative` shortens the
+    // two names it is built from.
     let display = match change {
         ChangeDetached::Rewrite {
             source_location,
             location,
             ..
-        } => super::diff_pairs::pprint_rename(source_location, location),
-        _ => change_path(change).to_vec(),
+        } => super::diff_pairs::pprint_rename(
+            strip_relative(source_location, opts),
+            strip_relative(location, opts),
+        ),
+        _ => strip_relative(change_path(change), opts).to_vec(),
     };
+    // `diffstat_add()` (diff.c:2856) keeps the two apart: `x->name` is the
+    // destination path and `x->from_name` the source, and only `show_stats()` joins
+    // them through `pprint_rename()`. `show_dirstat_by_line()` groups on `x->name`,
+    // so a rename must not carry the `{a => b}` form into the dirstat.
+    let raw_name = strip_relative(change_dest_path(change), opts).to_vec();
     // `get_compact_summary()` (diff.c:4156-4180), reached only under
     // `--compact-summary`; a rename/copy skips the `new`/`gone` words because both
     // of its sides exist, which is exactly what the two modes already say.
@@ -7124,13 +7939,25 @@ fn emit_change(
         let (old_mode, new_mode) = change_modes(change);
         super::diff::compact_comment_for_modes(old_mode, new_mode)
     });
-    Ok(StatEntry {
-        name: quote_path(&display),
-        raw_name: display,
-        added: counts.0,
-        deleted: counts.1,
-        comment: comment.flatten(),
-    })
+    Ok((
+        StatEntry {
+            name: quote_path(&display),
+            raw_name,
+            added: counts.0,
+            deleted: counts.1,
+            comment: comment.flatten(),
+        },
+        FilePaint { ws_rule: opts.ws_rule, blank_at_eof },
+    ))
+}
+
+/// `p->two->path`: the path the change ends at, which is the destination of a
+/// rename or copy rather than [`change_path`]'s source-side name.
+fn change_dest_path(change: &ChangeDetached) -> &[u8] {
+    match change {
+        ChangeDetached::Rewrite { location, .. } => location,
+        _ => change_path(change),
+    }
 }
 
 /// The two mode words a change's file pair carries, `None` on the side the file
@@ -7160,6 +7987,7 @@ fn change_modes(change: &ChangeDetached) -> (Option<u32>, Option<u32>) {
 
 /// `diff --git a/<old> b/<new>` for a rename, where the two paths differ.
 fn emit_rename_header(out: &mut Vec<u8>, from: &[u8], to: &[u8], opts: &Opts) {
+    let (from, to) = (strip_relative(from, opts), strip_relative(to, opts));
     let (a, b) = prefixes(opts);
     out.extend_from_slice(b"diff --git ");
     out.extend_from_slice(&quote_two(a, from));
@@ -7190,12 +8018,36 @@ fn reject_binary(is_submodule: bool, content: &[u8], path: &[u8], opts: &Opts) -
 /// Under `--no-prefix`/`format.noprefix` both prefixes are empty, so git emits
 /// `diff --git <path> <path>`.
 fn emit_git_header(out: &mut Vec<u8>, path: &[u8], opts: &Opts) {
+    let path = strip_relative(path, opts);
     let (a, b) = prefixes(opts);
     out.extend_from_slice(b"diff --git ");
     out.extend_from_slice(&quote_two(a, path));
     out.push(b' ');
     out.extend_from_slice(&quote_two(b, path));
     out.push(b'\n');
+}
+
+/// `strip_prefix()` (diff.c:5009), `--relative`'s *shortening* half. Only
+/// `run_diff()`, `run_diffstat()`, `run_checkdiff()`, `diff_flush_raw()` and
+/// `flush_one_pair()` call it — `diff_summary()` and `show_dirstat()` do not, which
+/// is why `--relative=src --summary` still prints `src/new/moved.txt` (measured
+/// against stock 2.55.0).
+fn strip_relative<'a>(path: &'a [u8], opts: &Opts) -> &'a [u8] {
+    let Some(prefix) = opts.active_relative() else {
+        return path;
+    };
+    if path.len() < prefix.len() {
+        return path;
+    }
+    // `*namep += prefix_length; if (**namep == '/') ++*namep;` — the byte count comes
+    // off first and only *then* is a leading separator eaten, which is why
+    // `--relative=src` strips four characters off `src/f` while `--relative=sr`
+    // strips two and leaves `c/f`.
+    let rest = &path[prefix.len()..];
+    match rest.first() {
+        Some(b'/') => &rest[1..],
+        _ => rest,
+    }
 }
 
 /// The `a/`+`b/` source/destination prefixes, emptied by `--no-prefix` /
@@ -7216,7 +8068,13 @@ fn emit_body(
     old_content: &[u8],
     new_content: &[u8],
     opts: &Opts,
+    blank_at_eof: &mut (usize, usize),
 ) -> Result<(u64, u64)> {
+    // `builtin_diff()` runs `check_blank_at_eof()` over the two whole images before
+    // the hunks are produced (diff.c:4048-4049); the `WS_BLANK_AT_EOF` gate lives
+    // downstream in `ws_check_emit()`, so the counts are taken unconditionally here
+    // exactly as `git diff`'s own path takes them (diff_pairs.rs:5430).
+    *blank_at_eof = diff_color::check_blank_at_eof(old_content, new_content);
     let mut hunks: Vec<u8> = Vec::new();
     let counts = emit_text_hunks(&mut hunks, old_content, new_content, opts)?;
     if hunks.is_empty() {
@@ -7224,8 +8082,8 @@ fn emit_body(
     }
 
     let (a, b) = prefixes(opts);
-    emit_file_header(out, b"--- ", old, a);
-    emit_file_header(out, b"+++ ", new, b);
+    emit_file_header(out, b"--- ", old.map(|p| strip_relative(p, opts)), a);
+    emit_file_header(out, b"+++ ", new.map(|p| strip_relative(p, opts)), b);
     out.extend_from_slice(&hunks);
     Ok(counts)
 }
@@ -7283,10 +8141,15 @@ fn emit_text_hunks(
     let diff = diff_with_slider_heuristics(opts.algorithm, &input);
     let before_lines: Vec<&[u8]> = input.before.iter().map(|&t| input.interner[t]).collect();
 
-    // gix's `UnifiedDiff` emits xdiff's default hunk shape only; both `-I` and
-    // `-W` change which change groups share a hunk and how far its context
-    // reaches, so they go through the hand-rolled `xdl_emit_diff()` port.
-    if !opts.ignore_regex.is_empty() || opts.function_context {
+    // gix's `UnifiedDiff` emits xdiff's default hunk shape only; `-I`,
+    // `--ignore-blank-lines`, `-W` and `--inter-hunk-context` each change which
+    // change groups share a hunk and how far its context reaches, so they go
+    // through the hand-rolled `xdl_emit_diff()` port.
+    if !opts.ignore_regex.is_empty()
+        || opts.ignore_blank_lines
+        || opts.function_context
+        || opts.inter_hunk_ctx != 0
+    {
         let after_lines: Vec<&[u8]> = input.after.iter().map(|&t| input.interner[t]).collect();
         return emit_hunks_with_ignorable(out, &diff, &before_lines, &after_lines, opts);
     }
@@ -7317,14 +8180,16 @@ struct Change {
     ignore: bool,
 }
 
-/// Port of `xdl_emit_diff()` (xdiff/xemit.c) without `XDL_EMIT_FUNCCONTEXT`,
-/// used only when `-I` is in play.
+/// Port of `xdl_emit_diff()` (xdiff/xemit.c), used whenever the hunk geometry is
+/// not xdiff's default: `-I`, `--ignore-blank-lines`, `-W` or
+/// `--inter-hunk-context`.
 ///
 /// gix's `UnifiedDiff` groups every change into a hunk, which is right until a
-/// change can be *ignorable*: git marks those in `xdl_mark_ignorable_regex()`
-/// and then lets `xdl_get_hunk()` drop the ones that no real change is holding
-/// in place. An ignorable change close to a real one is still printed — the
-/// regex suppresses hunks, not lines — so the two must be decided together.
+/// change can be *ignorable*: git marks those in `xdl_mark_ignorable_lines()` /
+/// `xdl_mark_ignorable_regex()` and then lets `xdl_get_hunk()` drop the ones that
+/// no real change is holding in place. An ignorable change close to a real one is
+/// still printed — they suppress hunks, not lines — so the two must be decided
+/// together.
 fn emit_hunks_with_ignorable(
     out: &mut Vec<u8>,
     diff: &gix::diff::blob::Diff,
@@ -7332,23 +8197,43 @@ fn emit_hunks_with_ignorable(
     after_lines: &[&[u8]],
     opts: &Opts,
 ) -> Result<(u64, u64)> {
-    let matches_all = |lines: &[&[u8]]| -> bool {
-        lines
-            .iter()
-            .all(|line| opts.ignore_regex.iter().any(|re| re.is_match(line)))
+    // `xdl_blankline()` (xdiff/xutils.c:142-153): with no `XDF_WHITESPACE_FLAGS` bit
+    // set a record is blank only when it is empty or a bare terminator; once any of
+    // them is on, a record of nothing but whitespace counts.
+    let ws_on = opts.ws != super::diff_pairs::Whitespace::Keep;
+    let blank = |line: &[u8]| -> bool {
+        if ws_on {
+            line.iter().all(|b| b.is_ascii_whitespace())
+        } else {
+            line.len() <= 1
+        }
     };
+    // Both markers start from `ignore = 1` and walk the pre-image then the
+    // post-image, so an empty side simply does not object.
+    let all = |lines: &[&[u8]], pred: &dyn Fn(&[u8]) -> bool| lines.iter().all(|l| pred(l));
     let changes: Vec<Change> = diff
         .hunks()
-        .map(|h| Change {
-            i1: h.before.start,
-            chg1: h.before.end - h.before.start,
-            i2: h.after.start,
-            chg2: h.after.end - h.after.start,
-            // A group is ignorable when every line it touches, on both sides,
-            // matches; `xdl_mark_ignorable_regex()` starts from `ignore = 1`, so
-            // an empty side simply does not object.
-            ignore: matches_all(&before_lines[h.before.start as usize..h.before.end as usize])
-                && matches_all(&after_lines[h.after.start as usize..h.after.end as usize]),
+        .map(|h| {
+            let (b1, b2) = (h.before.start as usize, h.before.end as usize);
+            let (a1, a2) = (h.after.start as usize, h.after.end as usize);
+            // `xdl_mark_ignorable_lines()` runs first, and 2.55.0's
+            // `xdl_mark_ignorable_regex()` opens with `if (xch->ignore) continue;`
+            // (xdiff/xdiffi.c:1070-1073) — the blank-line verdict is never
+            // overridden, so the two are an or, not a last-writer-wins.
+            let blank_ignorable = opts.ignore_blank_lines
+                && all(&before_lines[b1..b2], &blank)
+                && all(&after_lines[a1..a2], &blank);
+            let regex_ignorable = !opts.ignore_regex.is_empty() && {
+                let m = |line: &[u8]| opts.ignore_regex.iter().any(|re| re.is_match(line));
+                all(&before_lines[b1..b2], &m) && all(&after_lines[a1..a2], &m)
+            };
+            Change {
+                i1: h.before.start,
+                chg1: h.before.end - h.before.start,
+                i2: h.after.start,
+                chg2: h.after.end - h.after.start,
+                ignore: blank_ignorable || regex_ignorable,
+            }
         })
         .collect();
 
@@ -7372,7 +8257,7 @@ fn emit_hunks_with_ignorable(
         // over one of those brings it into the hunk after all.
         let xchp = idx;
         let mut start = idx;
-        let Some(last) = get_hunk(&changes, &mut start, ctx) else {
+        let Some(last) = get_hunk(&changes, &mut start, ctx, opts.inter_hunk_ctx) else {
             break;
         };
         let (mut first, mut last) = (start, last);
@@ -7543,13 +8428,20 @@ fn get_func_line(lines: &[&[u8]], start: i64, limit: i64) -> i64 {
     -1
 }
 
-/// Port of `xdl_get_hunk()` (xdiff/xemit.c) with `interhunkctxlen` zero.
+/// Port of `xdl_get_hunk()` (xdiff/xemit.c). `max_common` is
+/// `ctxlen + ctxlen + interhunkctxlen` (xemit.c:58-60), so `--inter-hunk-context`
+/// widens the gap two change groups may leave and still share one hunk.
 ///
 /// Advances `start` past leading ignorable changes that no following change is
 /// close enough to rescue, then returns the index of the last change that
 /// belongs in the same hunk — or `None` once nothing is left to show.
-fn get_hunk(changes: &[Change], start: &mut usize, ctxlen: i64) -> Option<usize> {
-    let max_common = ctxlen + ctxlen;
+fn get_hunk(
+    changes: &[Change],
+    start: &mut usize,
+    ctxlen: i64,
+    interhunkctxlen: i64,
+) -> Option<usize> {
+    let max_common = ctxlen + ctxlen + interhunkctxlen;
     let max_ignorable = ctxlen;
     let end_of = |i: usize| i64::from(changes[i].i1 + changes[i].chg1);
 
@@ -8334,7 +9226,7 @@ mod tests {
 
     fn stats(files: &[StatEntry], sw: StatWidths) -> String {
         let mut out = Vec::new();
-        emit_stats(&mut out, files, sw).expect("emit_stats writes to a Vec");
+        emit_stats(&mut out, files, sw, &DiffColors::disabled()).expect("emit_stats writes to a Vec");
         String::from_utf8(out).expect("diffstat output is UTF-8")
     }
 

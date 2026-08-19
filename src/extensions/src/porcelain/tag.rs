@@ -11,13 +11,11 @@
 //!                                       without `WM_PATHNAME`, so `*` spans `/`).
 //!   * `git tag -n[<num>]`             → append the first `<num>` lines (default 1)
 //!                                       of each tag's message; implies listing.
-//!   * `git tag --sort=[-][version:]<field>` → multi-level sort. Fields backed:
-//!                                       `refname`, `version:refname`/`v:refname`,
-//!                                       `taggerdate`/`committerdate`/`authordate`/
-//!                                       `creatordate`, `objectname`/`objecttype`/
-//!                                       `objectsize`, `taggername`/`committername`/
-//!                                       `authorname`, the matching `*email`,
-//!                                       `creator`, `subject`/`body`/`contents`.
+//!   * `git tag --sort=[-][version:]<field>` → multi-level sort over any
+//!                                       `ref-filter` atom, parsed by the very
+//!                                       function `--format` parses with, so a
+//!                                       key means the same thing here, in
+//!                                       `git branch` and in `git for-each-ref`.
 //!   * `git tag --format=<fmt>`        → render each tag through `<fmt>`.
 //!   * `git tag --contains/--no-contains/--merged/--no-merged/--points-at`
 //!                                       → ancestry / points-at listing filters
@@ -84,26 +82,38 @@
 //! different object id and a payload stock git cannot verify. Signing fails closed:
 //! no ref and no tag object are written unless a signature was produced.
 //!
+//! Listing goes through [`super::ref_filter`], the shared port of
+//! `ref-filter.c`, rather than a `tag`-local atom table: `list_tags()`
+//! (builtin/tag.c:54-80) is nothing but a default format string —
+//! `%(refname:lstrip=2)`, or `%(align:15)%(refname:lstrip=2)%(end)
+//! %(contents:lines=<n>)` under `-n<num>` — handed to
+//! `filter_and_format_refs()`. So `-n` is not an output mode of its own, and
+//! every atom, `%(if)`/`%(align)` container and sort key `git for-each-ref`
+//! accepts is accepted here, evaluated by the same code, from the same per-ref
+//! model. `git tag -v --format=<fmt>` reaches the same evaluator through
+//! [`super::ref_filter::pretty_print_ref`].
+//!
+//! `--color` comes along with that: `OPT__COLOR(&format.use_color, …)`
+//! (builtin/tag.c:535) is the whole of it, resolved against `color.ui` and
+//! stdout by `want_color()`, and `%(color:<spec>)` is rendered by the shared
+//! evaluator's port of `color_parse_mem`.
+//!
 //! Genuinely not backed here, and refused rather than faked: an editor-supplied
-//! message (`-a`/`-s`/`tag.gpgSign` with neither `-m` nor `-F`, and `-e`), forced
-//! ANSI color (`--color`/`--color=always`), the git gecos identity fallback, and
-//! `--format` atoms outside the set handled by [`render_atom`] (`align`,
-//! `describe`, `upstream`, relative/custom dates, …).
+//! message (`-a`/`-s`/`tag.gpgSign` with neither `-m` nor `-F`, and `-e`), and
+//! the git gecos identity fallback.
 
 use anyhow::{anyhow, bail, Result};
-use std::cmp::Ordering;
 use std::io::{Read, Write};
 use std::process::ExitCode;
 
-use gix::bstr::{BStr, BString, ByteSlice};
+use gix::bstr::{BString, ByteSlice};
 use gix::glob::wildmatch;
 use gix::glob::wildmatch::Mode;
 use gix::hash::ObjectId;
-use gix::objs::{CommitRef, Kind, TagRef, Write as _};
+use gix::objs::{CommitRef, Kind, Write as _};
 use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
 use gix::refs::{FullName, Target};
 
-use crate::refsort::{self, Prereleases};
 
 /// `usage_with_options()` over `builtin/tag.c`'s option table.
 /// `cmd_tag()`'s `struct option options[]` (builtin/tag.c), in table order, as
@@ -250,44 +260,6 @@ Tag listing options
 
 "#;
 
-/// A parsed actor identity captured from a tag/commit header.
-#[derive(Clone)]
-struct Sig {
-    name: BString,
-    email: BString,
-    time: gix::date::Time,
-}
-
-/// Everything about one tag ref needed to sort and render it, gathered once.
-struct Facts {
-    /// Full ref name, e.g. `refs/tags/v1.0`.
-    full: BString,
-    /// Short name, e.g. `v1.0`.
-    short: BString,
-    /// The ref's own target — the tag object for an annotated tag.
-    id: ObjectId,
-    dir_kind: Kind,
-    dir_size: u64,
-    /// The ultimate non-tag object reached by peeling, set only when `id` is a tag.
-    peel_id: Option<ObjectId>,
-    peel_kind: Option<Kind>,
-    peel_size: Option<u64>,
-    /// Tagger — only present when the direct object is an annotated tag.
-    tagger: Option<Sig>,
-    /// Committer/author — only present when the direct object is a commit.
-    committer: Option<Sig>,
-    author: Option<Sig>,
-    /// The direct object's message (tag or commit message), empty otherwise.
-    message: Vec<u8>,
-    /// The peeled commit's committer/author/message, set only when peeling a tag
-    /// reaches a commit — powers the `*`-dereference format/sort atoms.
-    peel_committer: Option<Sig>,
-    peel_author: Option<Sig>,
-    peel_message: Vec<u8>,
-    /// Precomputed sort keys, aligned with the parsed `--sort` list.
-    keys: Vec<SortVal>,
-}
-
 /// The set of resolved listing filters.
 #[derive(Default)]
 struct Filters {
@@ -299,6 +271,18 @@ struct Filters {
 }
 
 impl Filters {
+    /// The four reachability filters in the shape `ref-filter` takes them.
+    /// `--points-at` is not one of them: `apply_ref_filter()` tests it against
+    /// the ref's own id before any commit lookup happens.
+    fn shared(&self) -> super::for_each_ref::Filters {
+        super::for_each_ref::Filters {
+            contains: self.contains.into_iter().collect(),
+            no_contains: self.no_contains.into_iter().collect(),
+            merged: self.merged.into_iter().collect(),
+            no_merged: self.no_merged.into_iter().collect(),
+        }
+    }
+
     fn any(&self) -> bool {
         self.points_at.is_some()
             || self.contains.is_some()
@@ -337,7 +321,10 @@ pub fn tag(args: &[String]) -> Result<ExitCode> {
     let mut ignore_case = false;
     let mut omit_empty = false;
     let mut create_reflog = false;
-    let mut want_color = false;
+    // `OPT__COLOR(&format.use_color, …)` (builtin/tag.c:535). Unset falls through
+    // to `color.ui`, whose default is `auto`, which `want_color()` resolves
+    // against stdout.
+    let mut color_when: Option<String> = None;
     // Column layout state, seeded from `column.ui` / `column.tag` before the
     // command line is parsed so a `--column` flag overrides the config (git's
     // `git_column_config` runs during config, `parseopt_column_callback` after).
@@ -424,8 +411,8 @@ pub fn tag(args: &[String]) -> Result<ExitCode> {
             "--no-omit-empty" => omit_empty = false,
             "--create-reflog" => create_reflog = true,
             "--no-create-reflog" => create_reflog = false,
-            "--color" => want_color = true,
-            "--no-color" => want_color = false,
+            "--color" => color_when = Some("always".to_string()),
+            "--no-color" => color_when = Some("never".to_string()),
             // `OPT_BOOL`'s unset writes 0 — which is *not* the same as leaving
             // `opt.sign` at -1, because a written 0 is what stops `tag.gpgSign`
             // from turning signing back on.
@@ -489,10 +476,7 @@ pub fn tag(args: &[String]) -> Result<ExitCode> {
                     super::column::parseopt_column(&mut colopts, Some(rest), false)
                         .map_err(|m| anyhow!("{m}"))?;
                 } else if let Some(rest) = a.strip_prefix("--color=") {
-                    match rest {
-                        "never" | "auto" => want_color = false,
-                        _ => want_color = true,
-                    }
+                    color_when = Some(rest.to_string());
                 } else if let Some(rest) = a.strip_prefix("--points-at=") {
                     points_at = Some(rest.to_string());
                 } else if let Some(rest) = a.strip_prefix("--contains=") {
@@ -622,24 +606,42 @@ pub fn tag(args: &[String]) -> Result<ExitCode> {
     // it. `tag.gpgSign` is `config_sign_tag`, unspecified until it appears.
     let mut config_sign_tag: Option<bool> = None;
     let mut force_sign_annotate = false;
+    let mut config_sorts: Vec<String> = Vec::new();
     if let Ok(repo) = gix::discover(".") {
-        // Without any `--sort` on the CLI, git falls back to the multi-valued
-        // `tag.sort` config — each value adds a sort level — validated below
-        // exactly like a CLI `--sort`.
-        if sorts.is_empty() && !sort_negated {
-            sorts = repo
-                .config_snapshot()
-                .plumbing()
-                .values::<gix::bstr::BString>("tag.sort")
-                .unwrap_or_default()
-                .into_iter()
-                .map(|v| v.to_string())
-                .collect();
-        }
+        config_sorts = repo
+            .config_snapshot()
+            .plumbing()
+            .values::<gix::bstr::BString>("tag.sort")
+            .unwrap_or_default()
+            .into_iter()
+            .map(|v| v.to_string())
+            .collect();
         config_sign_tag = repo.config_snapshot().boolean("tag.gpgSign");
         force_sign_annotate =
             repo.config_snapshot().boolean("tag.forceSignAnnotated") == Some(true);
     }
+
+    // ```c
+    // repo_config(the_repository, git_tag_config, &sorting_options);
+    // if (!sorting_options.nr)
+    //         string_list_append(&sorting_options, "refname");
+    // ```
+    // (builtin/tag.c:549-551), *before* `parse_options()`. So `tag.sort` comes
+    // first, an implicit `refname` stands in when there is none, and every CLI
+    // `--sort` appends after them — ending up most significant while the config
+    // keys still break ties. `--no-sort` is `OPT_STRING_LIST`'s unset callback,
+    // which clears the whole list, config and implicit key included, leaving
+    // `ref_sorting_options()` to return NULL and `ref_array_sort()` to do nothing.
+    let cli_sorts = std::mem::take(&mut sorts);
+    let mut sorts: Vec<String> = if sort_negated {
+        Vec::new()
+    } else {
+        if config_sorts.is_empty() {
+            config_sorts.push("refname".to_string());
+        }
+        config_sorts
+    };
+    sorts.extend(cli_sorts);
 
     // ```c
     // if (!cmdmode) {
@@ -689,29 +691,6 @@ pub fn tag(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::from(129));
     }
 
-    // git validates every `--sort` field name while parsing options, dying on the
-    // first syntactically invalid key with exit 128. Reproduce that here so a bad
-    // sort key fails the same way regardless of mode.
-    let sort_keys = match resolve_sort(&sorts) {
-        Err(SortErr::Fatal(msg)) => return fatal(&msg),
-        Err(SortErr::Unsupported(spec)) => {
-            bail!("--sort={spec} is not supported by this port")
-        }
-        Ok(keys) => keys,
-    };
-
-    // git renders `%(color:…)` only with color forced on. Emitting a byte-exact
-    // ANSI stream would require porting git's whole color table, so the honest
-    // move is to refuse forced color rather than fake it. The default (color off)
-    // path strips color atoms exactly as git does when writing to a pipe.
-    if want_color {
-        bail!(
-            "forced ANSI color (--color) is not supported: `%(color:<spec>)` needs \
-             color.c's `color_parse_mem` name/attribute table to turn a spec into the \
-             exact escape sequence, which is not ported"
-        )
-    }
-
     // Resolve `auto` against the terminal (git's `finalize_colopts(&colopts, -1)`).
     // A piped stdout leaves columns off, so the default output is unchanged. `-n`
     // and columns are mutually exclusive: an explicit `--column` is fatal, a config
@@ -730,6 +709,23 @@ pub fn tag(args: &[String]) -> Result<ExitCode> {
     let mut repo = gix::discover(".")?;
     if let Some(code) = crate::ensure_object_identity(&mut repo, "Committer") {
         return Ok(code);
+    }
+
+    // `want_color(format.use_color)`: the option when it was given, else
+    // `color.ui`, with `auto` decided by stdout. `git tag` has no `color.tag`
+    // slot of its own.
+    let color_on = match color_when.as_deref() {
+        Some(v) => super::color::want_color_stdout_raw(&repo, Some(v)),
+        None => super::color::want_color_stdout(&repo, "ui"),
+    };
+
+    // `sorting = ref_sorting_options(&sorting_options);` (builtin/tag.c:593) runs
+    // unconditionally, after the `--column`/`-n` check and before the mode
+    // dispatch, so an invalid `--sort` is fatal even for `git tag -d`. The keys go
+    // through `ref-filter`'s own atom parser, which is what makes `--sort` mean
+    // exactly the same thing here, in `git branch` and in `git for-each-ref`.
+    if let Err(e) = super::ref_filter::check_sort(&repo, &sorts) {
+        return super::ref_filter::report(e);
     }
 
     // Resolve the listing filters now that the object database is open. Each
@@ -776,11 +772,12 @@ pub fn tag(args: &[String]) -> Result<ExitCode> {
             &positionals,
             lines,
             format.as_deref(),
-            &sort_keys,
+            &sorts,
             &filters,
             ignore_case,
             omit_empty,
             colopts,
+            color_on,
         );
     }
 
@@ -947,13 +944,14 @@ fn verify_tags(
     names: &[&str],
     format: Option<&str>,
 ) -> Result<ExitCode> {
-    let tokens = match format.map(super::verify_tag::parse_format).transpose() {
+    // `verify_ref_format()` runs before the first tag is read, and a malformed
+    // `%(` shows *`git tag`'s* usage block, not `git verify-tag`'s.
+    let tokens = match format
+        .map(|f| super::ref_filter::parse_one_format(repo, f, USAGE))
+        .transpose()
+    {
         Ok(t) => t,
-        Err(unterminated) => {
-            eprintln!("error: malformed format string {unterminated}");
-            eprint!("{USAGE}");
-            return Ok(ExitCode::from(129));
-        }
+        Err(code) => return Ok(code),
     };
     let verbose = tokens.is_none();
 
@@ -1020,222 +1018,6 @@ fn take_value<'a>(args: &'a [String], i: &mut usize, flag: &str) -> Result<&'a s
     Ok(v.as_str())
 }
 
-/// One resolved `--sort` key.
-struct SortKey {
-    reverse: bool,
-    kind: SortKind,
-}
-
-/// What a `--sort` key extracts and how it compares.
-enum SortKind {
-    /// Compare the full refname with git's `versioncmp`.
-    Version,
-    /// Compare a `long` numerically (dates by seconds, size by bytes).
-    Numeric(NumField),
-    /// Render this atom to bytes and compare bytewise.
-    Rendered(String),
-}
-
-enum NumField {
-    TaggerDate,
-    CommitterDate,
-    AuthorDate,
-    CreatorDate,
-    Size,
-    StarSize,
-}
-
-/// A precomputed, comparable value for one sort key on one ref.
-enum SortVal {
-    Num(i64),
-    Bytes(Vec<u8>),
-    Version(Vec<u8>),
-}
-
-impl SortVal {
-    fn cmp(&self, other: &SortVal, pre: &Prereleases<'_>) -> Ordering {
-        match (self, other) {
-            (SortVal::Num(a), SortVal::Num(b)) => a.cmp(b),
-            (SortVal::Bytes(a), SortVal::Bytes(b)) => a.cmp(b),
-            (SortVal::Version(a), SortVal::Version(b)) => refsort::versioncmp(a, b, pre),
-            _ => Ordering::Equal,
-        }
-    }
-}
-
-/// Why `--sort` resolution failed.
-enum SortErr {
-    /// A field name git itself rejects: emit `fatal: {0}` and exit 128.
-    Fatal(String),
-    /// A field git accepts but this port cannot sort by.
-    Unsupported(String),
-}
-
-/// Validate and interpret every `--sort` key. git dies on the first syntactically
-/// invalid key in the order given, so that is checked first; only then is this
-/// port's narrower support considered.
-fn resolve_sort(sorts: &[String]) -> Result<Vec<SortKey>, SortErr> {
-    for key in sorts {
-        if let Some(msg) = refsort::sort_error(key) {
-            return Err(SortErr::Fatal(msg));
-        }
-    }
-    let mut keys = Vec::with_capacity(sorts.len());
-    for key in sorts {
-        let (reverse, version, star, atom) = refsort::parse_sort_key(key);
-        let field = atom.split(':').next().unwrap_or(atom);
-        let kind = if version {
-            if field == "refname" && !star {
-                SortKind::Version
-            } else {
-                return Err(SortErr::Unsupported(key.clone()));
-            }
-        } else {
-            match field {
-                "refname" if !star => SortKind::Rendered("refname".to_string()),
-                "taggerdate" if !star => SortKind::Numeric(NumField::TaggerDate),
-                "committerdate" if !star => SortKind::Numeric(NumField::CommitterDate),
-                "authordate" if !star => SortKind::Numeric(NumField::AuthorDate),
-                "creatordate" if !star => SortKind::Numeric(NumField::CreatorDate),
-                "objectsize" => SortKind::Numeric(if star {
-                    NumField::StarSize
-                } else {
-                    NumField::Size
-                }),
-                "objectname" | "objecttype" | "type" | "taggername" | "committername"
-                | "authorname" | "taggeremail" | "committeremail" | "authoremail" | "creator"
-                | "subject" | "body" | "contents" => {
-                    let mut a = String::new();
-                    if star {
-                        a.push('*');
-                    }
-                    a.push_str(atom);
-                    SortKind::Rendered(a)
-                }
-                _ => return Err(SortErr::Unsupported(key.clone())),
-            }
-        };
-        keys.push(SortKey { reverse, kind });
-    }
-    Ok(keys)
-}
-
-/// Build a [`Sig`] from a parsed header signature, tolerating a broken date.
-fn sig_from(s: gix::actor::SignatureRef<'_>) -> Sig {
-    let time = s
-        .time()
-        .unwrap_or_else(|_| gix::date::Time::new(s.seconds(), 0));
-    Sig {
-        name: BString::from(s.name.to_vec()),
-        email: BString::from(s.email.to_vec()),
-        time,
-    }
-}
-
-/// Gather every fact about one tag ref, decoding the direct object (and, for an
-/// annotated tag, the peeled object) so both sorting and rendering can be exact.
-fn gather(repo: &gix::Repository, full: BString, short: BString, id: ObjectId) -> Result<Facts> {
-    let obj = repo.find_object(id)?;
-    let dir_kind = obj.kind;
-    let dir_size = obj.data.len() as u64;
-    let mut tagger = None;
-    let mut committer = None;
-    let mut author = None;
-    let mut message = Vec::new();
-    let mut peel_id = None;
-    let mut peel_kind = None;
-    let mut peel_size = None;
-    let mut peel_committer = None;
-    let mut peel_author = None;
-    let mut peel_message = Vec::new();
-
-    match dir_kind {
-        Kind::Tag => {
-            let t = TagRef::from_bytes(&obj.data, id.kind())?;
-            if let Some(s) = t.tagger()? {
-                tagger = Some(sig_from(s));
-            }
-            message = t.message.to_vec();
-            let peeled = repo.find_object(id)?.peel_tags_to_end()?;
-            peel_id = Some(peeled.id);
-            peel_kind = Some(peeled.kind);
-            peel_size = Some(peeled.data.len() as u64);
-            if peeled.kind == Kind::Commit {
-                let c = CommitRef::from_bytes(&peeled.data, peeled.id.kind())?;
-                peel_committer = Some(sig_from(c.committer()?));
-                peel_author = Some(sig_from(c.author()?));
-                peel_message = c.message.to_vec();
-            }
-        }
-        Kind::Commit => {
-            let c = CommitRef::from_bytes(&obj.data, id.kind())?;
-            committer = Some(sig_from(c.committer()?));
-            author = Some(sig_from(c.author()?));
-            message = c.message.to_vec();
-        }
-        _ => {}
-    }
-
-    Ok(Facts {
-        full,
-        short,
-        id,
-        dir_kind,
-        dir_size,
-        peel_id,
-        peel_kind,
-        peel_size,
-        tagger,
-        committer,
-        author,
-        message,
-        peel_committer,
-        peel_author,
-        peel_message,
-        keys: Vec::new(),
-    })
-}
-
-/// Compute the precomputed sort value for one key on one ref.
-fn sort_value(
-    repo: &gix::Repository,
-    facts: &Facts,
-    key: &SortKey,
-    ignore_case: bool,
-) -> Result<SortVal> {
-    Ok(match &key.kind {
-        SortKind::Version => SortVal::Version(facts.full.to_vec()),
-        SortKind::Numeric(field) => {
-            let n = match field {
-                NumField::TaggerDate => facts.tagger.as_ref().map_or(0, |s| s.time.seconds),
-                NumField::CommitterDate => facts.committer.as_ref().map_or(0, |s| s.time.seconds),
-                NumField::AuthorDate => facts.author.as_ref().map_or(0, |s| s.time.seconds),
-                NumField::CreatorDate => creator_sig(facts, false).map_or(0, |s| s.time.seconds),
-                NumField::Size => facts.dir_size as i64,
-                NumField::StarSize => facts.peel_size.unwrap_or(0) as i64,
-            };
-            SortVal::Num(n)
-        }
-        SortKind::Rendered(atom) => {
-            let mut buf = Vec::new();
-            render_atom(repo, facts, atom, None, &mut buf)?;
-            if ignore_case {
-                buf.make_ascii_lowercase();
-            }
-            SortVal::Bytes(buf)
-        }
-    })
-}
-
-/// The creator signature: the tagger of an annotated tag, else the committer of a
-/// commit. `star` reads the peeled commit instead of the direct object.
-fn creator_sig(facts: &Facts, star: bool) -> Option<&Sig> {
-    if star {
-        facts.peel_committer.as_ref()
-    } else {
-        facts.tagger.as_ref().or(facts.committer.as_ref())
-    }
-}
 
 /// List tags, honoring pattern operands, filters, `--sort`, and rendering.
 #[allow(clippy::too_many_arguments)]
@@ -1244,32 +1026,29 @@ fn list_tags(
     patterns: &[&str],
     lines: Option<usize>,
     format: Option<&str>,
-    sort_keys: &[SortKey],
+    sorts: &[String],
     filters: &Filters,
     ignore_case: bool,
     omit_empty: bool,
     colopts: u32,
+    color_on: bool,
 ) -> Result<ExitCode> {
-    let match_mode = if ignore_case {
-        Mode::IGNORE_CASE
-    } else {
-        Mode::empty()
-    };
-
-    let head_name: Option<BString> = repo
-        .head_ref()
-        .ok()
-        .flatten()
-        .map(|r| BString::from(r.name().as_bstr().to_vec()));
-
     // A plain `git tag -l` prints refnames and sorts by refname, so nothing about
-    // the objects those refs point at is ever consulted. Reading them anyway cost
+    // the objects those refs point at is ever consulted. Reading them anyway costs
     // an object decode per tag — and a second one per annotated tag, to peel it —
     // which is the whole cost of the command on a repository with many tags.
-    // Anything that DOES look at the object (a --format, `-n`, a filter, or a
+    // Anything that DOES look at the object (a `--format`, `-n`, a filter, or a
     // sort key other than the default refname order) takes the full path below.
-    let names_only = format.is_none() && lines.is_none() && !filters.any() && sort_keys.is_empty();
+    // Every one of `[]`, `["refname"]` and a repeated `refname` is plain ascending
+    // refname order, which is also the order the ref store hands names back in.
+    let refname_order = sorts.iter().all(|s| s == "refname");
+    let names_only = format.is_none() && lines.is_none() && !filters.any() && refname_order;
     if names_only {
+        let match_mode = if ignore_case {
+            Mode::IGNORE_CASE
+        } else {
+            Mode::empty()
+        };
         let mut names: Vec<(BString, BString)> = Vec::new();
         for r in repo.references()?.tags()? {
             let r = r.map_err(|e| anyhow!("failed to read a tag reference: {e}"))?;
@@ -1288,87 +1067,61 @@ fn list_tags(
         return write_lines(names.into_iter().map(|(_, short)| short.into()).collect(), colopts);
     }
 
-    let mut entries: Vec<Facts> = Vec::new();
-    for r in repo.references()?.tags()? {
-        let r = r.map_err(|e| anyhow!("failed to read a tag reference: {e}"))?;
-        let Some(id) = r.try_id().map(|id| id.detach()) else {
-            continue;
-        };
-        let short = BString::from(r.name().shorten().to_vec());
-        if !patterns.is_empty()
-            && !patterns
-                .iter()
-                .any(|p| wildmatch(p.as_bytes().as_bstr(), short.as_bstr(), match_mode))
-        {
-            continue;
-        }
-        let full = BString::from(r.name().as_bstr().to_vec());
-        let mut facts = gather(repo, full, short, id)?;
-        if !passes_filters(repo, &facts, filters) {
-            continue;
-        }
-        let keys = sort_keys
-            .iter()
-            .map(|k| sort_value(repo, &facts, k, ignore_case))
-            .collect::<Result<Vec<_>>>()?;
-        facts.keys = keys;
-        entries.push(facts);
-    }
+    // ```c
+    // if (!format->format) {
+    //         if (filter->lines) {
+    //                 to_free = xstrfmt("%s %%(contents:lines=%d)",
+    //                                   "%(align:15)%(refname:lstrip=2)%(end)",
+    //                                   filter->lines);
+    //                 format->format = to_free;
+    //         } else
+    //                 format->format = "%(refname:lstrip=2)";
+    // }
+    // ```
+    // (builtin/tag.c:62-70). `-n<num>` is not a separate output mode: it is that
+    // one format string, which is why it pads to 15 columns with `%(align)`'s rule
+    // (never truncating) and why `--format` and `-n` cannot both apply.
+    //
+    // `filter->lines` is an `int`, and `list_tags()` opens with `if (filter->lines
+    // == -1) filter->lines = 0;` — so `-n0` leaves it at 0, `if (filter->lines)`
+    // is false, and `git tag -n0` prints bare names with no `%(align:15)` padding.
+    // It is still enough to force list mode (`filter.lines != -1`).
+    let default_format = match lines.filter(|n| *n > 0) {
+        Some(n) => format!("%(align:15)%(refname:lstrip=2)%(end) %(contents:lines={n})"),
+        None => "%(refname:lstrip=2)".to_string(),
+    };
+    let built = |_: &[super::ref_filter::Candidate]| -> Vec<u8> { default_format.clone().into_bytes() };
 
-    // git's most-significant key is the last `--sort` given; ties always fall
-    // through to an implicit ascending refname comparison.
-    // git seeds `versioncmp`'s prerelease list from config once, lazily.
-    let prereleases = Prereleases::new(repo);
-    entries.sort_by(|a, b| {
-        for (idx, key) in sort_keys.iter().enumerate().rev() {
-            let mut ord = a.keys[idx].cmp(&b.keys[idx], &prereleases);
-            if key.reverse {
-                ord = ord.reverse();
-            }
-            if ord != Ordering::Equal {
-                return ord;
-            }
-        }
-        a.full.cmp(&b.full)
-    });
+    let spec = super::ref_filter::ListSpec {
+        repo,
+        format: match format {
+            Some(f) => super::ref_filter::Format::Fixed(f.as_bytes().to_vec()),
+            None => super::ref_filter::Format::Built(&built),
+        },
+        sort_specs: sorts.to_vec(),
+        kinds: super::ref_filter::kind::TAGS,
+        patterns: patterns.iter().map(|p| p.to_string()).collect(),
+        ignore_case,
+        points_at: filters.points_at.into_iter().collect(),
+        filters: filters.shared(),
+        omit_empty,
+        color_on,
+        // `FILTER_REFS_TAGS` only; the detached-HEAD pseudo entry is `git
+        // branch --list`'s alone.
+        head_desc: None,
+        // `list_tags()` goes through `filter_and_format_refs()`, which does call
+        // `filter_is_base()` (ref-filter.c:3440).
+        run_is_base: true,
+        // `FILTER_REFS_TAGS` never produces one, and `cmd_tag()` does not set the
+        // flag anyway.
+        detached_head_first: false,
+    };
 
-    let stdout = std::io::stdout();
-    let mut out = stdout.lock();
-    // When columns are active every rendered line becomes one table cell (git wraps
-    // list_tags' stdout in a `git column` filter with padding 2); otherwise each
-    // line is written straight out, one per line.
-    let column_on = super::column::active(colopts);
-    let mut cells: Vec<Vec<u8>> = Vec::new();
-    for e in &entries {
-        let mut line: Vec<u8> = Vec::new();
-        if let Some(fmt) = format {
-            render_format(repo, &mut line, e, fmt, head_name.as_ref().map(|b| b.as_bstr()))?;
-            if omit_empty && line.is_empty() {
-                continue;
-            }
-        } else if let Some(n) = lines {
-            // git renders `-n` as `%(align:15)%(refname:lstrip=2)%(end) %(contents:lines=N)`.
-            line.extend_from_slice(&e.short);
-            let width = e.short.to_str_lossy().chars().count();
-            if width < 15 {
-                line.resize(line.len() + (15 - width), b' ');
-            }
-            line.push(b' ');
-            append_lines(&mut line, &e.message, n);
-        } else {
-            line.extend_from_slice(&e.short);
-        }
-        if column_on {
-            cells.push(line);
-        } else {
-            line.push(b'\n');
-            out.write_all(&line)?;
-        }
-    }
-    if column_on {
-        write_cells(&mut out, &cells, colopts)?;
-    }
-    Ok(ExitCode::SUCCESS)
+    let out_lines = match super::ref_filter::filter_and_format(&spec)? {
+        super::ref_filter::Listing::Lines(l) => l,
+        super::ref_filter::Listing::Exit(code) => return Ok(code),
+    };
+    write_lines(out_lines, colopts)
 }
 
 /// Write already-rendered lines, through the column filter when it is active.
@@ -1398,463 +1151,6 @@ fn write_cells(out: &mut impl std::io::Write, cells: &[Vec<u8>], colopts: u32) -
     out.write_all(&super::column::layout(cells, colopts, &opts))
 }
 
-/// The commit a tag ultimately names, if any (its peel for an annotated tag, or
-/// itself for a lightweight tag on a commit). `None` for tags on trees/blobs.
-fn tag_commit(facts: &Facts) -> Option<ObjectId> {
-    match facts.dir_kind {
-        Kind::Commit => Some(facts.id),
-        Kind::Tag if facts.peel_kind == Some(Kind::Commit) => facts.peel_id,
-        _ => None,
-    }
-}
-
-/// Apply the resolved listing filters, AND-combined as git does.
-fn passes_filters(repo: &gix::Repository, facts: &Facts, filters: &Filters) -> bool {
-    if let Some(target) = filters.points_at {
-        if facts.id != target && facts.peel_id != Some(target) {
-            return false;
-        }
-    }
-    let commit = tag_commit(facts);
-    // `filter_ref()` (`ref-filter.c`) discards a ref that does not peel to a
-    // commit *before* any reachability test, and does so for the whole family at
-    // once:
-    //
-    // ```c
-    // if (filter->reachable_from || filter->unreachable_from ||
-    //     filter->with_commit || filter->no_commit || filter->verbose) {
-    //         commit = lookup_commit_reference_gently(the_repository, ref->oid, 1);
-    //         if (!commit)
-    //                 return NULL;
-    // ```
-    //
-    // So a tag on a tree or a blob is absent from `--no-contains`/`--no-merged`
-    // output too, even though those read as "keep what does not match".
-    // `--points-at` is deliberately not in that list: it compares ids and keeps
-    // non-commit refs.
-    let reachability_asked =
-        [filters.contains, filters.no_contains, filters.merged, filters.no_merged]
-            .iter()
-            .any(Option::is_some);
-    if reachability_asked && commit.is_none() {
-        return false;
-    }
-    if let Some(c) = filters.contains {
-        match commit {
-            Some(tc) if is_ancestor(repo, c, tc) => {}
-            _ => return false,
-        }
-    }
-    if let Some(c) = filters.no_contains {
-        if let Some(tc) = commit {
-            if is_ancestor(repo, c, tc) {
-                return false;
-            }
-        }
-    }
-    if let Some(m) = filters.merged {
-        match commit {
-            Some(tc) if is_ancestor(repo, tc, m) => {}
-            _ => return false,
-        }
-    }
-    if let Some(m) = filters.no_merged {
-        if let Some(tc) = commit {
-            if is_ancestor(repo, tc, m) {
-                return false;
-            }
-        }
-    }
-    true
-}
-
-/// Whether `ancestor` is reachable from `descendant` (i.e. is an ancestor of, or
-/// equal to, it). Computed via the best merge base.
-fn is_ancestor(repo: &gix::Repository, ancestor: ObjectId, descendant: ObjectId) -> bool {
-    if ancestor == descendant {
-        return true;
-    }
-    match repo.merge_base(descendant, ancestor) {
-        Ok(base) => base.detach() == ancestor,
-        Err(_) => false,
-    }
-}
-
-
-/// Expand a `--format` string for one tag, supporting `%(if)…%(then)…%(else)…%(end)`.
-///
-/// `%%` is a literal percent and `%xx` a hex byte, as in `ref-filter.c`; `%(…)` is
-/// delegated to [`render_atom`]. Anything else is refused rather than passed
-/// through, so a format this module cannot honor never looks like a success.
-fn render_format(
-    repo: &gix::Repository,
-    out: &mut Vec<u8>,
-    e: &Facts,
-    fmt: &str,
-    head: Option<&BStr>,
-) -> Result<()> {
-    // A stack of open `%(if)` frames; the active output sink is the top frame's
-    // current branch, or `out` when the stack is empty.
-    let mut frames: Vec<IfFrame> = Vec::new();
-    let b = fmt.as_bytes();
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] != b'%' {
-            push_byte(out, &mut frames, b[i]);
-            i += 1;
-            continue;
-        }
-        match b.get(i + 1) {
-            Some(b'%') => {
-                push_byte(out, &mut frames, b'%');
-                i += 2;
-            }
-            Some(b'(') => {
-                let Some(end) = b[i + 2..].iter().position(|&c| c == b')') else {
-                    bail!("format string has an unmatched '%('")
-                };
-                let atom = std::str::from_utf8(&b[i + 2..i + 2 + end])
-                    .map_err(|_| anyhow!("format atom is not valid UTF-8"))?;
-                handle_atom(repo, out, &mut frames, e, atom, head)?;
-                i += 2 + end + 1;
-            }
-            _ => {
-                let hex = b
-                    .get(i + 1..i + 3)
-                    .and_then(|h| std::str::from_utf8(h).ok())
-                    .and_then(|h| u8::from_str_radix(h, 16).ok());
-                match hex {
-                    Some(byte) => {
-                        push_byte(out, &mut frames, byte);
-                        i += 3;
-                    }
-                    None => anyhow::bail!("unsupported '%' escape in --format"),
-                }
-            }
-        }
-    }
-    if !frames.is_empty() {
-        crate::git_fatal!("format string has an unclosed '%(if)'");
-    }
-    Ok(())
-}
-
-/// One open `%(if)` control block.
-struct IfFrame {
-    kind: IfKind,
-    branch: IfBranch,
-    cond: Vec<u8>,
-    then_buf: Vec<u8>,
-    else_buf: Vec<u8>,
-}
-
-enum IfKind {
-    Truthy,
-    Equals(String),
-    NotEquals(String),
-}
-
-#[derive(PartialEq)]
-enum IfBranch {
-    Cond,
-    Then,
-    Else,
-}
-
-/// Append one byte to the currently active output sink.
-fn push_byte(out: &mut Vec<u8>, frames: &mut [IfFrame], byte: u8) {
-    sink(out, frames).push(byte);
-}
-
-/// The buffer that literal/atom output currently flows into.
-fn sink<'a>(out: &'a mut Vec<u8>, frames: &'a mut [IfFrame]) -> &'a mut Vec<u8> {
-    match frames.last_mut() {
-        None => out,
-        Some(f) => match f.branch {
-            IfBranch::Cond => &mut f.cond,
-            IfBranch::Then => &mut f.then_buf,
-            IfBranch::Else => &mut f.else_buf,
-        },
-    }
-}
-
-/// Dispatch a `%(atom)`: control-flow atoms drive the `%(if)` stack, everything
-/// else renders into the active sink.
-fn handle_atom(
-    repo: &gix::Repository,
-    out: &mut Vec<u8>,
-    frames: &mut Vec<IfFrame>,
-    e: &Facts,
-    atom: &str,
-    head: Option<&BStr>,
-) -> Result<()> {
-    let (name, arg) = match atom.split_once(':') {
-        Some((n, r)) => (n, Some(r)),
-        None => (atom, None),
-    };
-    match name {
-        "if" => {
-            let kind = match arg {
-                None => IfKind::Truthy,
-                Some(a) => {
-                    if let Some(v) = a.strip_prefix("equals=") {
-                        IfKind::Equals(v.to_string())
-                    } else if let Some(v) = a.strip_prefix("notequals=") {
-                        IfKind::NotEquals(v.to_string())
-                    } else {
-                        bail!("--format atom %(if:{a}) is not supported")
-                    }
-                }
-            };
-            frames.push(IfFrame {
-                kind,
-                branch: IfBranch::Cond,
-                cond: Vec::new(),
-                then_buf: Vec::new(),
-                else_buf: Vec::new(),
-            });
-        }
-        "then" => {
-            let f = frames
-                .last_mut()
-                .filter(|f| f.branch == IfBranch::Cond)
-                .ok_or_else(|| anyhow!("format: %(then) without %(if)"))?;
-            f.branch = IfBranch::Then;
-        }
-        "else" => {
-            let f = frames
-                .last_mut()
-                .filter(|f| f.branch == IfBranch::Then)
-                .ok_or_else(|| anyhow!("format: %(else) without %(then)"))?;
-            f.branch = IfBranch::Else;
-        }
-        "end" => {
-            let f = frames
-                .pop()
-                .ok_or_else(|| anyhow!("format: %(end) without %(if)"))?;
-            let taken = match &f.kind {
-                IfKind::Truthy => !f.cond.is_empty(),
-                IfKind::Equals(v) => f.cond.as_slice() == v.as_bytes(),
-                IfKind::NotEquals(v) => f.cond.as_slice() != v.as_bytes(),
-            };
-            let chosen = if taken { f.then_buf } else { f.else_buf };
-            sink(out, frames).extend_from_slice(&chosen);
-        }
-        _ => {
-            let mut buf = Vec::new();
-            render_atom(repo, e, atom, head, &mut buf)?;
-            sink(out, frames).extend_from_slice(&buf);
-        }
-    }
-    Ok(())
-}
-
-/// Render one `%(<atom>)` field into `out`.
-fn render_atom(
-    repo: &gix::Repository,
-    e: &Facts,
-    atom: &str,
-    head: Option<&BStr>,
-    out: &mut Vec<u8>,
-) -> Result<()> {
-    let star = atom.starts_with('*');
-    let body = atom.strip_prefix('*').unwrap_or(atom);
-    let (name, arg) = match body.split_once(':') {
-        Some((n, r)) => (n, Some(r)),
-        None => (body, None),
-    };
-
-    match name {
-        "refname" => match arg {
-            None => out.extend_from_slice(&e.full),
-            Some("short") => out.extend_from_slice(&e.short),
-            Some(a) => {
-                if let Some(n) = a.strip_prefix("lstrip=") {
-                    out.extend_from_slice(&refsort::strip_components(&e.full, parse_i64(atom, n)?, true));
-                } else if let Some(n) = a.strip_prefix("rstrip=") {
-                    out.extend_from_slice(&refsort::strip_components(&e.full, parse_i64(atom, n)?, false));
-                } else {
-                    bail!("--format atom %({atom}) is not supported")
-                }
-            }
-        },
-        "objectname" => {
-            let id = if star { e.peel_id } else { Some(e.id) };
-            if let Some(id) = id {
-                render_objectname(repo, id, arg, atom, out)?;
-            }
-        }
-        "objecttype" | "type" => {
-            let kind = if star { e.peel_kind } else { Some(e.dir_kind) };
-            if let Some(k) = kind {
-                out.extend_from_slice(k.as_bytes());
-            }
-        }
-        "objectsize" => {
-            if arg.is_some() {
-                bail!("--format atom %({atom}) is not supported");
-            }
-            let size = if star { e.peel_size } else { Some(e.dir_size) };
-            if let Some(s) = size {
-                out.extend_from_slice(s.to_string().as_bytes());
-            }
-        }
-        "taggername" | "taggeremail" | "taggerdate" => {
-            let sig = if star { None } else { e.tagger.as_ref() };
-            render_person(name, arg, atom, sig, out)?;
-        }
-        "committername" | "committeremail" | "committerdate" => {
-            let sig = if star {
-                e.peel_committer.as_ref()
-            } else {
-                e.committer.as_ref()
-            };
-            render_person(name, arg, atom, sig, out)?;
-        }
-        "authorname" | "authoremail" | "authordate" => {
-            let sig = if star {
-                e.peel_author.as_ref()
-            } else {
-                e.author.as_ref()
-            };
-            render_person(name, arg, atom, sig, out)?;
-        }
-        "creator" => {
-            if let Some(s) = creator_sig(e, star) {
-                out.extend_from_slice(&s.name);
-                out.extend_from_slice(b" <");
-                out.extend_from_slice(&s.email);
-                out.extend_from_slice(b"> ");
-                out.extend_from_slice(fmt_date(s.time, "raw")?.as_slice());
-            }
-        }
-        "creatordate" => {
-            if let Some(s) = creator_sig(e, star) {
-                out.extend_from_slice(&fmt_date(s.time, arg.unwrap_or(""))?);
-            }
-        }
-        "subject" => {
-            if arg.is_some() {
-                bail!("--format atom %({atom}) is not supported");
-            }
-            let msg = message_of(e, star);
-            out.extend_from_slice(&subject_of(msg));
-        }
-        "body" => {
-            if arg.is_some() {
-                bail!("--format atom %({atom}) is not supported");
-            }
-            let msg = message_of(e, star);
-            out.extend_from_slice(&body_of(msg));
-        }
-        "contents" => {
-            let msg = message_of(e, star);
-            match arg {
-                None => out.extend_from_slice(msg),
-                Some("subject") => out.extend_from_slice(&subject_of(msg)),
-                Some("body") => out.extend_from_slice(&body_of(msg)),
-                Some(a) => {
-                    if let Some(n) = a.strip_prefix("lines=") {
-                        let n: usize = n
-                            .parse()
-                            .map_err(|_| anyhow!("--format atom %({atom}) has a bad line count"))?;
-                        append_lines(out, msg, n);
-                    } else {
-                        bail!("--format atom %({atom}) is not supported")
-                    }
-                }
-            }
-        }
-        "HEAD" => {
-            let here = head.map(|h| h == e.full.as_bstr()).unwrap_or(false);
-            out.push(if here { b'*' } else { b' ' });
-        }
-        "color" => {
-            // Color is off on this (piped) path, so a color atom produces nothing,
-            // exactly as git does when not writing to a terminal.
-        }
-        _ => bail!("--format atom %({atom}) is not supported"),
-    }
-    Ok(())
-}
-
-/// The message backing `%(subject)`/`%(body)`/`%(contents)` — the peeled commit's
-/// message for a `*`-dereferenced atom, else the direct object's message.
-fn message_of(e: &Facts, star: bool) -> &[u8] {
-    if star {
-        &e.peel_message
-    } else {
-        &e.message
-    }
-}
-
-/// Render `%(objectname)` / `:short` / `:short=<n>`.
-fn render_objectname(
-    repo: &gix::Repository,
-    id: ObjectId,
-    arg: Option<&str>,
-    atom: &str,
-    out: &mut Vec<u8>,
-) -> Result<()> {
-    match arg {
-        None => out.extend_from_slice(id.to_hex().to_string().as_bytes()),
-        Some("short") => {
-            // git's dynamic abbreviation, widened by the odb to stay unambiguous.
-            out.extend_from_slice(short_hex(repo, id).as_bytes());
-        }
-        Some(a) => {
-            if let Some(n) = a.strip_prefix("short=") {
-                let n: usize = n
-                    .parse()
-                    .map_err(|_| anyhow!("--format atom %({atom}) has a non-numeric argument"))?;
-                out.extend_from_slice(id.to_hex_with_len(n).to_string().as_bytes());
-            } else {
-                bail!("--format atom %({atom}) is not supported")
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Render a `*name` / `*email[:trim|:localpart]` / `*date[:<fmt>]` person atom.
-fn render_person(
-    name: &str,
-    arg: Option<&str>,
-    atom: &str,
-    sig: Option<&Sig>,
-    out: &mut Vec<u8>,
-) -> Result<()> {
-    let Some(sig) = sig else {
-        return Ok(());
-    };
-    if name.ends_with("name") {
-        if arg.is_some() {
-            bail!("--format atom %({atom}) is not supported");
-        }
-        out.extend_from_slice(&sig.name);
-    } else if name.ends_with("email") {
-        match arg {
-            None => {
-                out.push(b'<');
-                out.extend_from_slice(&sig.email);
-                out.push(b'>');
-            }
-            Some("trim") => out.extend_from_slice(&sig.email),
-            Some("localpart") => {
-                let local = match sig.email.iter().position(|&b| b == b'@') {
-                    Some(p) => &sig.email[..p],
-                    None => &sig.email[..],
-                };
-                out.extend_from_slice(local);
-            }
-            Some(_) => bail!("--format atom %({atom}) is not supported"),
-        }
-    } else {
-        // *date
-        out.extend_from_slice(&fmt_date(sig.time, arg.unwrap_or(""))?);
-    }
-    Ok(())
-}
 
 /// Format a time for a date atom's suffix, matching git's named formats. Formats
 /// that are not deterministic (`relative`, `human`, `local`) or need a custom
@@ -1872,63 +1168,6 @@ fn fmt_date(time: gix::date::Time, spec: &str) -> Result<Vec<u8>> {
         other => bail!("--format date option :{other} is not supported"),
     };
     Ok(s.into_bytes())
-}
-
-/// git's subject: the first paragraph, with internal newlines folded to spaces.
-fn subject_of(msg: &[u8]) -> Vec<u8> {
-    let trimmed = {
-        let end = msg
-            .iter()
-            .rposition(|&b| b != b'\n')
-            .map_or(0, |i| i + 1);
-        &msg[..end]
-    };
-    let sub_end = trimmed
-        .windows(2)
-        .position(|w| w == b"\n\n")
-        .unwrap_or(trimmed.len());
-    trimmed[..sub_end]
-        .iter()
-        .map(|&b| if b == b'\n' { b' ' } else { b })
-        .collect()
-}
-
-/// git's body: everything after the blank line that ends the subject.
-fn body_of(msg: &[u8]) -> Vec<u8> {
-    match msg.windows(2).position(|w| w == b"\n\n") {
-        Some(p) => msg[p + 2..].to_vec(),
-        None => Vec::new(),
-    }
-}
-
-/// Parse a signed integer atom argument (`lstrip=<n>`), or explain the failure.
-fn parse_i64(atom: &str, rest: &str) -> Result<i64> {
-    rest.parse::<i64>()
-        .map_err(|_| anyhow!("--format atom %({atom}) has a non-numeric argument"))
-}
-
-/// Port of git's `append_lines`: the first `lines` lines of `buf`, with every line
-/// after the first prefixed by a newline and four spaces.
-fn append_lines(out: &mut Vec<u8>, buf: &[u8], lines: usize) {
-    let mut sp = 0;
-    for i in 0..lines {
-        if sp >= buf.len() {
-            break;
-        }
-        if i > 0 {
-            out.extend_from_slice(b"\n    ");
-        }
-        match buf[sp..].iter().position(|&b| b == b'\n') {
-            Some(nl) => {
-                out.extend_from_slice(&buf[sp..sp + nl]);
-                sp += nl + 1;
-            }
-            None => {
-                out.extend_from_slice(&buf[sp..]);
-                break;
-            }
-        }
-    }
 }
 
 /// Port of git's `create_reflog_msg`: the reflog line written under `--create-reflog`,
@@ -1951,9 +1190,8 @@ fn reflog_message(repo: &gix::Repository, target: ObjectId) -> Result<BString> {
             let message: &[u8] = c.message;
             let subject_end = message.iter().position(|&b| b == b'\n').unwrap_or(message.len());
             sb.extend_from_slice(&message[..subject_end]);
-            let committed = sig_from(c.committer()?);
             // `show_date(c->date, 0, DATE_MODE(SHORT))` — the committer timestamp at UTC.
-            let utc = gix::date::Time::new(committed.time.seconds, 0);
+            let utc = gix::date::Time::new(c.committer()?.seconds(), 0);
             sb.extend_from_slice(b", ");
             sb.extend_from_slice(&fmt_date(utc, "short")?);
         }

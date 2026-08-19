@@ -5,7 +5,10 @@ use std::{
 
 use crate::{
     File, bloom,
-    file::{self, BLOOM_DATA_HEADER_SIZE, COMMIT_DATA_ENTRY_SIZE_SANS_HASH, commit::Commit},
+    file::{
+        self, BLOOM_DATA_HEADER_SIZE, CORRECTED_COMMIT_DATE_OFFSET_OVERFLOW, COMMIT_DATA_ENTRY_SIZE_SANS_HASH,
+        commit::Commit,
+    },
 };
 
 /// Access
@@ -13,6 +16,40 @@ impl File {
     /// The number of base graphs that this file depends on.
     pub fn base_graph_count(&self) -> u8 {
         self.base_graph_count
+    }
+
+    /// Whether this file carries the `GDA2` chunk, i.e. whether a corrected commit date can be
+    /// read for its commits at all.
+    ///
+    /// This is git's `commit_graph::read_generation_data` (commit-graph.c:460-461).
+    pub fn has_generation_data(&self) -> bool {
+        self.generation_data_offset.is_some()
+    }
+
+    /// The corrected commit date of the commit at lexicographical position `pos`, whose own
+    /// committer timestamp is `committer_timestamp`, or `None` if this file has no `GDA2` chunk.
+    ///
+    /// Port of the `read_generation_data` branch of `fill_commit_graph_info()`
+    /// (commit-graph.c:902-915): `GDA2` holds an offset over the commit's own date, and a slot
+    /// with [`CORRECTED_COMMIT_DATE_OFFSET_OVERFLOW`] set instead indexes `GDO2` for a `u64` one.
+    /// git `die()`s on an index that `GDO2` cannot hold; a reader that must not fail answers
+    /// `None` there, which puts the commit back on the same footing as one outside the graph.
+    pub fn generation_data_at(&self, pos: file::Position, committer_timestamp: u64) -> Option<u64> {
+        let start = self.generation_data_offset?;
+        if pos.0 >= self.num_commits() {
+            return None;
+        }
+        let at = start + 4 * pos.0 as usize;
+        let offset = u32::from_be_bytes(self.data[at..at + 4].try_into().expect("4 bytes"));
+        if offset & CORRECTED_COMMIT_DATE_OFFSET_OVERFLOW == 0 {
+            return Some(committer_timestamp + u64::from(offset));
+        }
+        let overflow = self.generation_data_overflow_range.clone()?;
+        let at = overflow.start + 8 * (offset ^ CORRECTED_COMMIT_DATE_OFFSET_OVERFLOW) as usize;
+        if at + 8 > overflow.end {
+            return None;
+        }
+        Some(committer_timestamp + u64::from_be_bytes(self.data[at..at + 8].try_into().expect("8 bytes")))
     }
 
     /// How the changed-path Bloom filters in this file were built, or `None` if

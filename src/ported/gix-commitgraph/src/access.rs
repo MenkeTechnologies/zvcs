@@ -33,6 +33,16 @@ impl Graph {
         self.files.iter().find_map(File::bloom_filter_settings)
     }
 
+    /// Whether every file in this chain carries corrected commit dates, which is the only case
+    /// in which git reads them.
+    ///
+    /// Port of `validate_mixed_generation_chain()` (commit-graph.c:524-543): one file without
+    /// `GDA2` clears `read_generation_data` for the whole chain, because the two kinds of
+    /// generation number cannot be compared against each other.
+    pub fn has_generation_data(&self) -> bool {
+        self.files.iter().all(File::has_generation_data)
+    }
+
     /// The changed-path Bloom filter for the commit at graph position `pos`, or
     /// `None` if the file holding it carries no filters.
     ///

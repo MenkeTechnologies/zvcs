@@ -36,15 +36,22 @@
 //! `--git-dir`, `--absolute-git-dir`, `--git-common-dir`, `--show-toplevel`,
 //! `--is-inside-work-tree`, `--is-inside-git-dir`, `--is-bare-repository`,
 //! `--show-cdup`, `--show-prefix`, `--show-object-format[=<mode>]`,
-//! `--show-ref-format`, `--all`, `--branches`, `--tags`, plus revision and path
-//! arguments.
+//! `--show-ref-format`, `--all`, `--branches[=<glob>]`, `--tags[=<glob>]`,
+//! `--remotes[=<glob>]`, `--glob=<glob>`, `--exclude=<pattern>`, plus revision
+//! and path arguments.
+//!
+//! The ref-set family goes through the same
+//! [`crate::porcelain::log::RefSelection`] the revision walkers use, which is
+//! `refs_for_each_ref_ext()`'s rule: the pattern is matched against the *whole*
+//! refname with `wildmatch(…, 0)`, the namespace is trimmed afterwards, and
+//! `--exclude` is tested against the trimmed name. `handle_ref_opt()` clears the
+//! exclusion list once the walk that consumed it is done.
 //!
 //! Rejected with an explicit refusal rather than silently ignored — the list is
 //! [`UNIMPLEMENTED_EXACT`] and [`UNIMPLEMENTED_PREFIX`], and it includes
-//! `--is-shallow-repository`, `--remotes[=<pattern>]`, `--glob=<pattern>`,
-//! `--exclude=<pattern>`, `--disambiguate=<prefix>` and `--sq-quote`, all of
-//! which this header previously claimed were implemented. Options git does *not*
-//! recognize are echoed, which is what git itself does with them.
+//! `--is-shallow-repository`, `--disambiguate=<prefix>` and `--sq-quote`.
+//! Options git does *not* recognize are echoed, which is what git itself does
+//! with them.
 
 use anyhow::Result;
 use std::io::Write;
@@ -68,13 +75,7 @@ enum Sym {
     Full,
 }
 
-/// Which ref namespace a bulk-listing option walks.
-#[derive(Clone, Copy)]
-enum RefSet {
-    All,
-    Branches,
-    Tags,
-}
+/// The `--exclude=<pattern>` list `handle_ref_opt()` consumes and then clears.
 
 /// What the full revspec grammar (`rev_parse`) made of an argument the
 /// single-object parser could not resolve.
@@ -153,7 +154,6 @@ const UNIMPLEMENTED_EXACT: &[&str] = &[
     "--shared-index-path",
     "--is-shallow-repository",
     "--show-superproject-working-tree",
-    "--remotes",
     "--bisect",
     "--end-of-options",
     "--all-objects",
@@ -162,12 +162,7 @@ const UNIMPLEMENTED_EXACT: &[&str] = &[
 const UNIMPLEMENTED_PREFIX: &[&str] = &[
     "--path-format=",
     "--disambiguate=",
-    "--glob=",
-    "--exclude=",
     "--exclude-hidden=",
-    "--branches=",
-    "--tags=",
-    "--remotes=",
     "--since=",
     "--after=",
     "--until=",
@@ -213,6 +208,26 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
     // Set by an explicit `--`: git's `as_is = 2`. Every later token is a pathspec
     // echoed verbatim with no existence check and no flag interpretation.
     let mut dashdash = false;
+    // `ref_excludes` in `builtin/rev-parse.c`: `--exclude=<pattern>` accumulates
+    // here and the next ref walk both applies and clears it.
+    let mut ref_excludes: Vec<String> = Vec::new();
+    // git's `has_dashdash`, decided by a scan of the whole argument vector before
+    // the loop starts (`builtin/rev-parse.c:717-722`):
+    //
+    // ```c
+    // for (i = 1; i < argc; i++) {
+    //         if (!strcmp(argv[i], "--")) {
+    //                 has_dashdash = 1;
+    //                 break;
+    //         }
+    // }
+    // ```
+    //
+    // It is not positional: a separator anywhere makes an operand *in front of
+    // it* revision-only, so `git rev-parse main^{blob} --` dies with
+    // `bad revision` before echoing anything, where the same operand without a
+    // separator is echoed and then diagnosed as a path.
+    let has_dashdash = args.iter().any(|a| a == "--");
 
     for arg in args {
         // After an explicit `--`, everything is a pathspec: echo it (when paths
@@ -244,8 +259,20 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
                         return Ok(code);
                     }
                 }
-                Opt::Refs(which) => {
-                    for (echo, full, id) in collect_refs(&repo, which)? {
+                Opt::Exclude(pattern) => ref_excludes.push(pattern),
+                Opt::Refs(kind, pattern) => {
+                    // `handle_ref_opt()` ends in `clear_ref_exclusions()`, and so
+                    // does the `--all` branch: the exclusion list lives only until
+                    // the next ref walk. `git rev-parse --exclude=side --branches
+                    // --branches` therefore prints `main main side`.
+                    let selection = crate::porcelain::log::RefSelection::new(
+                        0,
+                        kind,
+                        pattern.as_deref(),
+                        std::mem::take(&mut ref_excludes),
+                        false,
+                    );
+                    for (echo, full, id) in collect_refs(&repo, &selection)? {
                         show_rev(&mut out, &repo, &o, &id, Some(echo.as_bstr()), Some(full.as_bstr()), false)?;
                     }
                 }
@@ -356,7 +383,7 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
                     None
                 } else {
                     repo
-                        .rev_parse_single(crate::objname::canonical_at_marks(arg).as_ref())
+                        .rev_parse_single(crate::objname::canonical_spec(&repo, arg).as_ref())
                         .ok()
                         .map(|id| id.detach())
                 }
@@ -367,6 +394,25 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
         // `die()` inside `get_oid()`, ahead of any path interpretation — nothing
         // has been echoed yet at this point, which is what keeps stdout empty.
         if resolved.is_none() {
+            // `peel_onion()` reports a type it cannot reach through `error()`, not
+            // through the caller's `die()`, so the line comes out once per
+            // resolution attempt — here for the one that just failed, and again
+            // below if `die_verify_filename()` resolves the operand a second time.
+            // The name is measured after the exclusion mark, matching
+            // `cmd_rev_parse()`'s `if (*arg == '^') name++;`.
+            if let Some(message) =
+                crate::objname::peel_type_error(&repo, crate::objname::uninteresting_mark(arg).0)
+            {
+                out.flush()?;
+                eprintln!("error: {message}");
+            }
+            // Same class: `prefix_path()` dies while `get_oid_with_context_1()` is
+            // still rewriting the path arm, so nothing has been echoed yet.
+            if let Some(message) = crate::objpath::relative_path_fatal(&repo, arg) {
+                out.flush()?;
+                eprintln!("fatal: {message}");
+                return Ok(ExitCode::from(128));
+            }
             if let Some((name, count)) = reflog_overflow(&repo, arg) {
                 out.flush()?;
                 eprintln!("fatal: log for '{name}' only has {count} entries");
@@ -399,7 +445,8 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
                 {
                     None
                 } else {
-                    repo.rev_parse(arg.as_str()).ok().and_then(|s| match s.detach() {
+                    let full = crate::objname::canonical_spec(&repo, arg);
+                    repo.rev_parse(full.as_ref()).ok().and_then(|s| match s.detach() {
                         gix::revision::plumbing::Spec::Range { from, to } => {
                             Some(Parsed::Range(RangeSpec::Range { from, to }))
                         }
@@ -465,17 +512,34 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
                     out.flush()?;
                     return Ok(die_single(o.quiet));
                 }
+                // `if (has_dashdash) die(_("bad revision '%s'"), arg);` — ahead of
+                // `show_file()`, so the operand is never echoed.
+                if has_dashdash {
+                    out.flush()?;
+                    eprintln!("fatal: bad revision '{arg}'");
+                    return Ok(ExitCode::from(128));
+                }
                 as_is = true;
                 if o.echo_paths {
                     emit(&mut out, arg.as_bytes())?;
                 }
                 if !is_worktree_path(&repo, arg) {
                     out.flush()?;
-                    eprintln!(
-                        "fatal: ambiguous argument '{arg}': unknown revision or path not in the working tree.\n\
-                         Use '--' to separate paths from revisions, like this:\n\
-                         'git <command> [<revision>...] -- [<file>...]'"
-                    );
+                    // `verify_filename(prefix, arg, 1)` → `die_verify_filename()`:
+                    // the operand gets one more resolution, with
+                    // `GET_OID_ONLY_TO_DIE`, and a `<rev>:<path>` / `:<n>:<path>`
+                    // failure has a message of its own there.
+                    if let Some(message) = crate::objname::peel_type_error(&repo, arg) {
+                        eprintln!("error: {message}");
+                    }
+                    match crate::objpath::verify_filename_diagnosis(&repo, arg) {
+                        Some(diagnosis) => eprintln!("fatal: {diagnosis}"),
+                        None => eprintln!(
+                            "fatal: ambiguous argument '{arg}': unknown revision or path not in the working tree.\n\
+                             Use '--' to separate paths from revisions, like this:\n\
+                             'git <command> [<revision>...] -- [<file>...]'"
+                        ),
+                    }
                     return Ok(ExitCode::from(128));
                 }
             }
@@ -520,6 +584,22 @@ pub(crate) fn dwim_ref_matches(repo: &gix::Repository, name: &str) -> Vec<String
     // than a warning: stock `git -c core.warnAmbiguousRefs=false branch nb dup`
     // creates the branch, and `merge-base --fork-point dup main` answers instead
     // of reporting `Ambiguous refname`.
+    // ```c
+    // int repo_dwim_ref(struct repository *r, const char *str, int len, …)
+    // {
+    //         char *last_branch = substitute_branch_name(r, &str, &len, 0);
+    //         int   refs_found  = expand_ref(r, str, len, oid, ref, …);
+    // ```
+    //
+    // `substitute_branch_name()` is `repo_interpret_branch_name()`, so the rules
+    // below are applied to the *rewritten* name: `git rev-parse --abbrev-ref
+    // main@{u}` shortens the upstream ref, not the operand. Without it the scan
+    // finds nothing and `show_rev()`'s `case 0` prints nothing at all.
+    let rewritten = match crate::objname::interpret_branch_name(repo, name) {
+        Some(Ok(full)) => std::borrow::Cow::Owned(full),
+        _ => std::borrow::Cow::Borrowed(name),
+    };
+    let name: &str = rewritten.as_ref();
     let stop_at_first = repo.config_snapshot().boolean("core.warnAmbiguousRefs") == Some(false);
     let mut found = Vec::new();
     for rule in [
@@ -651,7 +731,12 @@ enum Opt {
     /// Pure state change.
     Consumed,
     Query(Query),
-    Refs(RefSet),
+    /// One of `--all`, `--branches[=<glob>]`, `--tags[=<glob>]`,
+    /// `--remotes[=<glob>]`, `--glob=<glob>` — a ref walk that also consumes the
+    /// pending `--exclude` list.
+    Refs(crate::porcelain::log::RefSelector, Option<String>),
+    /// `--exclude=<pattern>`: accumulated until the next ref walk consumes it.
+    Exclude(String),
     /// Not an option stock git knows; git echoes these.
     Unknown,
     /// git `die()`d on the option's value: the message is already on stderr and the
@@ -727,9 +812,13 @@ fn option(o: &mut Opts, arg: &str) -> Result<Opt> {
         "--is-bare-repository" => return Ok(Opt::Query(Query::IsBareRepository)),
         "--show-object-format" => return Ok(Opt::Query(Query::ObjectFormat)),
         "--show-ref-format" => return Ok(Opt::Query(Query::RefFormat)),
-        "--all" => return Ok(Opt::Refs(RefSet::All)),
-        "--branches" => return Ok(Opt::Refs(RefSet::Branches)),
-        "--tags" => return Ok(Opt::Refs(RefSet::Tags)),
+        _ if crate::porcelain::log::ref_selector(arg).is_some() => {
+            let (kind, pattern) = crate::porcelain::log::ref_selector(arg).expect("checked above");
+            return Ok(Opt::Refs(kind, pattern.map(str::to_string)));
+        }
+        _ if arg.starts_with("--exclude=") => {
+            return Ok(Opt::Exclude(arg["--exclude=".len()..].to_string()))
+        }
         _ => {
             // `--show-object-format=<mode>`: git names three, and rejects anything
             // else before it looks at the repository.
@@ -1364,6 +1453,15 @@ fn dwim_full_name(repo: &gix::Repository, name: &BStr) -> Option<BString> {
             let full = repo.find_reference(base).ok()?.name().to_owned();
             full
         };
+        // `branch_get_upstream()` reads `branch.<name>.merge` directly when
+        // `branch.<name>.remote` is `.`: the upstream is a *local* ref and there
+        // is no remote-tracking name to map to. Stock 2.55.0 answers
+        // `git rev-parse --symbolic-full-name main@{u}` with `refs/heads/side`
+        // there; `branch_remote_tracking_ref_name()` has nothing to return.
+        if direction == gix::remote::Direction::Fetch {
+            return super::branch::upstream_ref(repo, branch.as_bstr())
+                .map(|r| r.as_bstr().to_owned());
+        }
         return repo
             .branch_remote_tracking_ref_name(branch.as_ref(), direction)
             .and_then(std::result::Result::ok)
@@ -1410,28 +1508,32 @@ fn split_tracking_suffix(name: &str) -> Option<(&str, gix::remote::Direction)> {
     Some((&name[..at], direction))
 }
 
-/// Walk a ref namespace the way `--all`/`--branches`/`--tags` do.
+/// Walk a ref namespace the way `--all`, `--branches[=<glob>]`,
+/// `--tags[=<glob>]`, `--remotes[=<glob>]` and `--glob=<glob>` do.
 ///
-/// Entries are ordered by full ref name and are *not* peeled: `--tags` reports
-/// an annotated tag's own object id, matching stock git.
-fn collect_refs(repo: &gix::Repository, which: RefSet) -> Result<Vec<(BString, BString, ObjectId)>> {
-    let platform = repo.references()?;
-    let iter = match which {
-        RefSet::All => platform.all()?,
-        RefSet::Branches => platform.local_branches()?,
-        RefSet::Tags => platform.tags()?,
-    };
-
+/// The selection rule — pattern construction, `wildmatch(…, 0)` against the
+/// *whole* refname, trimming after the match, then `ref_excluded()` against the
+/// *trimmed* name — is `refs_for_each_ref_ext()` and is shared with the revision
+/// walkers through [`crate::porcelain::log::RefSelection`]. The trim is why
+/// `git rev-parse --exclude=side --branches` drops `side` while
+/// `--exclude=refs/heads/side --branches` drops nothing: the callback never sees
+/// the `refs/heads/` half.
+///
+/// Entries are ordered by full ref name and are *not* peeled: `--tags` reports an
+/// annotated tag's own object id, matching stock git. `--all` here is
+/// `refs_for_each_ref()`, which — unlike revision.c's `--all` — does not add
+/// `HEAD`.
+fn collect_refs(
+    repo: &gix::Repository,
+    selection: &crate::porcelain::log::RefSelection,
+) -> Result<Vec<(BString, BString, ObjectId)>> {
     let mut refs = Vec::new();
-    for reference in iter {
+    for reference in repo.references()?.all()? {
         let reference = reference.map_err(|e| anyhow::anyhow!("{e}"))?;
         let full = reference.name().as_bstr().to_owned();
-        // `--all` hands the callback a full name; the narrowed walks hand it the
-        // name with its namespace stripped. `--symbolic` echoes exactly that.
-        let echo = match which {
-            RefSet::All => full.clone(),
-            RefSet::Branches | RefSet::Tags => reference.name().shorten().to_owned(),
-        };
+        let Some(full_str) = full.to_str().ok() else { continue };
+        let Some(echo) = selection.selects(full_str) else { continue };
+        let echo = BString::from(echo.as_bytes());
         let Some(id) = ref_target(repo, &reference) else {
             continue;
         };

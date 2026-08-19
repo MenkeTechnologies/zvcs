@@ -43,6 +43,13 @@ pub struct File {
     /// it were built. `max_changed_paths` is not stored in the file and is
     /// git's default.
     bloom_filter_settings: Option<bloom::Settings>,
+    /// The `GDA2` chunk: one big-endian `u32` per commit in lexicographical
+    /// order, holding the commit's corrected-commit-date *offset* over its own
+    /// committer timestamp — or, with [`file::CORRECTED_COMMIT_DATE_OFFSET_OVERFLOW`]
+    /// set, an index into `GDO2`.
+    generation_data_offset: Option<usize>,
+    /// The `GDO2` chunk: big-endian `u64` offsets that did not fit a `GDA2` slot.
+    generation_data_overflow_range: Option<std::ops::Range<usize>>,
 }
 
 /// A complete commit graph.

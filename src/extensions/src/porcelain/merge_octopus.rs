@@ -62,7 +62,18 @@
 //! * The all-heads-already-up-to-date run completes exactly as git does: those
 //!   lines on stdout, exit 0, and the repository untouched.
 //! * The fast-forward branch (`Fast-forwarding to: <name>`), advancing both the
-//!   index/worktree and the `$MRC`/`$MRT` bookkeeping to the head being merged.
+//!   index/worktree and the `$MRC`/`$MRT` bookkeeping to the head being merged —
+//!   including its `read-tree -u -m $head $SHA1` refusals (`Entry '<p>' would be
+//!   overwritten by merge.`, `Entry '<p>' not uptodate.`, `Untracked working
+//!   tree file '<p>' would be overwritten by merge.`, exit 128), whose old tree
+//!   is the original `$head` argument rather than the running `$MRT`, and the
+//!   textual `test "$common,$NON_FF_MERGE" = "$MRC,0"` that decides the branch:
+//!   `$MRC` holds each fast-forwarded head **as spelled**, so a branch name can
+//!   never equal `merge-base --all`'s object ids and the second consecutive
+//!   fast-forward only happens when the caller passes full ids (as `git merge`
+//!   does).
+//! * The three-way branch's `read-tree -u -m --aggressive $common $MRT $SHA1 ||
+//!   exit 2` refusals, with the same plumbing wording and exit 2.
 //! * The three-way branch: `Trying simple merge with <name>`, the conditional
 //!   `Simple merge did not work, trying automatic merge.`, the merge itself, and
 //!   the `Automated merge did not work.` / `Should not be doing an octopus.`
@@ -168,13 +179,26 @@ pub fn merge_octopus(args: &[String]) -> Result<ExitCode> {
     // *replaced* by a fast-forwarded head or *extended* by each merged head. It
     // is both the merge-base peer set and (as trees) the accumulated result.
     let mut mrc: Vec<ObjectId> = head_commit.map(|c| vec![c]).unwrap_or_default();
+    // `$MRC` is a *shell string*, and the fast-forward test below compares it
+    // textually. It starts as `git rev-parse --verify -q $head`, i.e. a full
+    // object id whatever `$head` was spelled as, but a fast-forward replaces it
+    // with `$SHA1` — the head **as spelled on the command line**. Keeping only
+    // the resolved ids made `merge-octopus -- <head> branch1 branch2` fast-forward
+    // twice where stock's `$common` (always full ids) can never equal a branch
+    // name, so stock three-way merges the second head instead.
+    let mut mrc_text: Vec<String> = head_commit.map(|c| vec![c.to_string()]).unwrap_or_default();
     // `MRT=$(git write-tree)` — the "merge result tree". The `diff-index --cached
-    // HEAD` pre-flight above forced the index to equal `$head`'s tree, so this is
-    // exactly that tree. Unused when `$head` is unresolvable (the first head dies).
-    let mut mrt: ObjectId = match head_commit {
+    // HEAD` pre-flight above forced the index to equal `HEAD`'s tree, which is
+    // `$head`'s whenever `git merge` is the caller. Unused when `$head` is
+    // unresolvable (the first head dies).
+    let head_arg_tree: ObjectId = match head_commit {
         Some(c) => repo.find_object(c)?.peel_to_tree()?.id,
         None => repo.empty_tree().id,
     };
+    // `$MRT` starts there and then tracks each folded-in head, while `$head`
+    // stays put — the fast-forward's `read-tree` reads the latter, so both are
+    // needed.
+    let mut mrt: ObjectId = head_arg_tree;
     // `NON_FF_MERGE` is exactly `mrc.len() > 1` (only a three-way merge extends
     // the set), so it needs no separate flag; `OCTOPUS_FAILURE` does.
     let mut octopus_failure = false;
@@ -221,15 +245,37 @@ pub fn merge_octopus(args: &[String]) -> Result<ExitCode> {
         // `if test "$common,$NON_FF_MERGE" = "$MRC,0"` — while `$MRC` is still a
         // single commit that IS the sole merge base, git fast-forwards to this
         // head instead of three-way merging. `mrc.len() == 1` is `NON_FF_MERGE == 0`.
-        if mrc.len() == 1 && common.len() == 1 && common[0] == mrc[0] {
+        // `$common` is `merge-base --all`'s newline-separated output and `$MRC`
+        // is the space-separated commit list, compared as whole strings.
+        let common_text = common.iter().map(ObjectId::to_string).collect::<Vec<_>>().join("\n");
+        if mrc.len() == 1 && common_text == mrc_text.join(" ") {
             // `eval_gettextln "Fast-forwarding to: $pretty_name"`
             println!("Fast-forwarding to: {pretty}");
-            // `git read-tree -u -m $head $SHA1`: a fast-forward is a degenerate
-            // three-way whose base equals ours (`mrt == tree($MRC)` here), so the
-            // shared engine yields exactly `$SHA1`'s tree, conflict-free, and
-            // updates the worktree — the two-tree merge's observable result.
-            // A two-tree read-tree never conflicts, so this label is never
-            // rendered; it is merge-ort's single-base name for the sole base.
+            // `git read-tree -u -m $head $SHA1 || exit` (git-merge-octopus.sh:90):
+            // a two-tree merge, which **refuses** rather than overwrite when the
+            // index or the worktree has drifted off the old tree, and whose
+            // `die()` takes the script down with it (`|| exit`, i.e. read-tree's
+            // own 128).
+            //
+            // The old tree is `$head` — the original argument — **not** the
+            // running `$MRT`. The two coincide only until the first head is
+            // folded in, so a *second* consecutive fast-forward hands read-tree
+            // an index that no longer matches `$head` and it dies. Passing `mrt`
+            // instead made every such octopus succeed at exit 0 with a tree stock
+            // refuses to write, and let an untracked file in the way of the very
+            // first head be silently overwritten.
+            let clobber =
+                crate::merge_guard::verify_two_way(&repo, head_arg_tree, head_tree, &cur_index)?;
+            if !clobber.is_empty() {
+                clobber.report_plumbing();
+                return Ok(ExitCode::from(128));
+            }
+            // Past the guard the two-tree merge writes `$SHA1`'s tree wholesale.
+            // Expressed as the degenerate three-way whose base equals ours, the
+            // shared engine yields exactly that, conflict-free, and updates the
+            // worktree — the two-tree merge's observable result. A two-tree
+            // read-tree never conflicts, so this label is never rendered; it is
+            // merge-ort's single-base name for the sole base.
             let ancestor = common[0].attach(&repo).shorten_or_id().to_string();
             let labels = gix::merge::blob::builtin_driver::text::Labels {
                 ancestor: Some(BStr::new(ancestor.as_bytes())),
@@ -249,6 +295,7 @@ pub fn merge_octopus(args: &[String]) -> Result<ExitCode> {
             cur_index.write(Default::default())?;
             // `MRC=$SHA1 MRT=$(git write-tree)`
             mrc = vec![sha1_commit];
+            mrc_text = vec![sha1.clone()];
             mrt = applied.tree_id;
             continue;
         }
@@ -263,6 +310,18 @@ pub fn merge_octopus(args: &[String]) -> Result<ExitCode> {
         // both phases into one pass, so that trigger is recovered by intersecting
         // each side's changed-path set against the merge base.
         let base_tree = repo.find_object(common[0])?.peel_to_tree()?;
+        // `git read-tree -u -m --aggressive $common $MRT $SHA1 || exit 2`: the
+        // three-tree merge refuses the same way its two-tree sibling above does,
+        // but the script spells this one's failure `exit 2` rather than letting
+        // read-tree's status through. Refusing here rather than over the merged
+        // tree is also what keeps a failed octopus from leaving that tree in the
+        // object database.
+        let clobber =
+            crate::merge_guard::verify_three_way(&repo, base_tree.id, mrt, head_tree, &cur_index)?;
+        if !clobber.is_empty() {
+            clobber.report_plumbing();
+            return Ok(ExitCode::from(2));
+        }
         let ours_changes = side_changes(&repo, base_tree.id, mrt)?;
         let theirs_changes = side_changes(&repo, base_tree.id, head_tree)?;
         let needs_auto_merge = ours_changes.iter().any(|(path, ours_state)| {
@@ -313,6 +372,7 @@ pub fn merge_octopus(args: &[String]) -> Result<ExitCode> {
 
         // `MRC="$MRC $SHA1"; MRT=$next`
         mrc.push(sha1_commit);
+        mrc_text.push(sha1.clone());
         mrt = applied.tree_id;
     }
 

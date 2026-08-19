@@ -52,6 +52,14 @@ memchr = "2"
 # Display width for git's log tab expansion (its `utf8_width`): a tab stop is
 # a column, and a wide character takes two. Already in the tree via ratatui.
 unicode-width = "0.2"
+# `git mailinfo`'s charset re-coding, which git delegates to iconv(3)
+# (utf8.c:reencode_string_len). Costs nothing new: the vendored `gix-filter`
+# already depends on encoding_rs for `working-tree-encoding`, so it is linked
+# into the binary either way. Legacy-label handling differs from iconv in one
+# place that matters — WHATWG aliases `iso-8859-1`/`latin1` to windows-1252 —
+# so mailinfo decodes those two itself and only falls through to the crate for
+# labels iconv and WHATWG agree on.
+encoding_rs = "0.8"
 # POSIX-ERE value-pattern matching for `git config <name> <value> <value-pattern>`.
 # Foundational, vendorable crate; byte-oriented `regex::bytes` mirrors git's regexec.
 regex = "1"

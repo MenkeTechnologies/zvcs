@@ -113,9 +113,6 @@
 //!   * **`-S`.** Signing the commit needs a path `git commit-tree` does not expose
 //!     here. `--ignore-date` and `--committer-date-is-author-date` are honoured:
 //!     the first drops the mail's author date, the second dates the committer by it.
-//!   * **Charset re-coding (`-u` / `--no-utf8`).** See the note below: the
-//!     substrate is in [`super::mailinfo`], which converts only between UTF-8
-//!     and US-ASCII.
 //!   * **`GIT binary patch` bodies under `--rebasing`.** `write_commit_patch`
 //!     regenerates the diff with `git diff-tree`, which does not accept
 //!     `--binary` in this binary yet, so a replayed commit that changes a binary
@@ -143,11 +140,23 @@
 //! `--patch-format=stgit` matches git's prefixes exactly — `Author:` with no
 //! space, and the bare words `From`/`Date` whose whole line is echoed.
 //!
-//! Charset re-coding is *not* implemented: `-u`/`--no-utf8` are parsed, but
-//! [`super::mailinfo`] converts only between UTF-8 and US-ASCII, so a mail in
-//! (say) ISO-8859-1 keeps its original bytes under both spellings where stock
-//! would transcode under the default `-u`. That is a `mailinfo` floor, not an
-//! `am` one.
+//! `-u` (the default) and `--no-utf8` are `mi.metainfo_charset = get_commit_output_
+//! encoding()` versus `NULL` (builtin/am.c:1220-1223), and [`super::mailinfo`] serves
+//! both: a body in ISO-8859-1, ISO-8859-15, windows-1252, KOI8-R, Shift_JIS and the
+//! rest is re-coded, and an unknown charset stops the run with git's `error: cannot
+//! convert from <a> to <b>`. What the flag does *not* reach is the `Subject:` header
+//! when it carries raw 8-bit bytes rather than an RFC 2047 encoded word: `mailinfo`
+//! writes those through unchanged (measured against stock), so `Applying: ` and the
+//! stored subject keep them.
+//!
+//! One divergence that is downstream of this module. `commit_tree_extended()` runs
+//! `ensure_utf8()` over the whole serialized commit (commit.c:1663-1686, called at
+//! :1770) whenever the commit encoding is UTF-8: every invalid byte is rewritten as
+//! its two-byte Latin-1 form and `Warning: commit message did not conform to UTF-8.`
+//! goes to stderr once. So stock stores `caf\xc3\xa9` for a mail whose raw subject was
+//! `caf\xe9`, and warns. This port's `commit-tree` does neither, so the byte survives
+//! into the object and there is no warning — it is a `commit-tree` gap, shared with
+//! every other verb that writes a commit, not an `am` one.
 
 use anyhow::{bail, Result};
 use gix::bstr::{BStr, BString, ByteSlice};
@@ -1939,7 +1948,7 @@ fn run_am_loop(
             match cli.empty {
                 Empty::Drop => {
                     if !ld.quiet {
-                        println!("Skipping: {first}");
+                        say_subject("Skipping: ", first);
                     }
                     am_next(repo, state_dir, &mut cur)?;
                     resume = false;
@@ -1948,7 +1957,7 @@ fn run_am_loop(
                 Empty::Keep => {
                     to_keep = true;
                     if !ld.quiet {
-                        println!("Creating an empty commit: {first}");
+                        say_subject("Creating an empty commit: ", first);
                     }
                 }
                 Empty::Stop => {
@@ -1968,7 +1977,7 @@ fn run_am_loop(
 
         if !to_keep {
             if !ld.quiet {
-                println!("Applying: {first}");
+                say_subject("Applying: ", first);
             }
             if !run_apply(&ctx, &ld, None)? {
                 // `--3way` (and therefore every `--rebasing` session, which
@@ -1991,7 +2000,7 @@ fn run_am_loop(
                     false
                 };
                 if !recovered {
-                    println!("Patch failed at {cur:04} {first}");
+                    say_subject(&format!("Patch failed at {cur:04} "), first);
                     if crate::advice::enabled("amWorkDir") {
                         eprintln!(
                             "hint: Use 'git am --show-current-patch=diff' to see the failed patch"
@@ -2311,7 +2320,7 @@ fn fall_back_threeway(ctx: &Ctx, repo: &gix::Repository, ld: &Loaded, msg: &[u8]
     // `o.branch1 = "HEAD"`, `o.branch2 = <first line of the message>`,
     // `o.ancestor = "constructed fake ancestor"` — the labels that end up in the
     // conflict markers.
-    let their_label = first_line(msg);
+    let their_label = String::from_utf8_lossy(first_line(msg)).into_owned();
     let labels = gix::merge::blob::builtin_driver::text::Labels {
         ancestor: Some(BStr::new(b"constructed fake ancestor")),
         current: Some(BStr::new(b"HEAD")),
@@ -2635,7 +2644,7 @@ fn do_commit(
     let reflog = std::env::var("GIT_REFLOG_ACTION").unwrap_or_else(|_| "am".to_string());
     let mut ur = ctx.cmd("update-ref");
     ur.arg("-m")
-        .arg(format!("{reflog}: {}", first_line(&info.msg)))
+        .arg(format!("{reflog}: {}", String::from_utf8_lossy(first_line(&info.msg))))
         .arg("HEAD")
         .arg(&commit);
     if let Some(p) = &parent {
@@ -2707,7 +2716,7 @@ fn am_resolve(
     let ld = load_state(state_dir);
     let quiet = ld.quiet;
     if !quiet {
-        println!("Applying: {}", first_line(&info.msg));
+        say_subject("Applying: ", first_line(&info.msg));
     }
 
     let no_changes = index_has_no_changes(repo)?;
@@ -3004,9 +3013,24 @@ pub(super) fn sq_dequote(s: &str) -> Vec<String> {
 }
 
 /// The first line of a commit message, for git's `%.*s`/`linelen` echoes.
-fn first_line(msg: &[u8]) -> String {
+fn first_line(msg: &[u8]) -> &[u8] {
     let end = msg.iter().position(|&b| b == b'\n').unwrap_or(msg.len());
-    String::from_utf8_lossy(&msg[..end]).into_owned()
+    &msg[..end]
+}
+
+/// `printf(_("<prefix>%.*s\n"), linelen(state->msg), state->msg)` — the subject
+/// goes to stdout as the bytes `mailinfo` produced, whatever they are.
+///
+/// A mail whose `Subject:` is raw 8-bit in a non-UTF-8 charset stays raw:
+/// `decode_header()` only re-codes RFC 2047 encoded words, so git prints
+/// `Applying: caf\xe9 change` byte for byte. Rendering it through
+/// `String::from_utf8_lossy` instead would print U+FFFD and lose the byte.
+fn say_subject(prefix: &str, subject: &[u8]) {
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
+    let _ = out.write_all(prefix.as_bytes());
+    let _ = out.write_all(subject);
+    let _ = out.write_all(b"\n");
 }
 
 /// `is_empty_or_missing_file`: true when the file is absent or zero-length.

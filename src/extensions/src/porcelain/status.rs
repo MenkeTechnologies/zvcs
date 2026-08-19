@@ -1195,7 +1195,7 @@ fn status_report(
 /// `None` is git's NULL `state->detached_from`, which happens when the reflog has
 /// no switch entry at all (a hand-written `HEAD`, or a reflog that was pruned).
 /// The long format then says `Not currently on any branch.` (wt-status.c:1914-1917).
-fn detached_from(repo: &gix::Repository) -> Option<(String, bool)> {
+pub(super) fn detached_from(repo: &gix::Repository) -> Option<(String, bool)> {
     let head_ref = repo.find_reference("HEAD").ok()?;
     let mut platform = head_ref.log_iter();
     // `refs_for_each_reflog_ent_reverse` returning <= 0 leaves `detached_from`

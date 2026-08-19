@@ -737,6 +737,10 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
     }
 
     // Build git's pending object set in command-line order.
+    // `revs->pending` entries that never become commits — a tree or a blob named
+    // on the command line. They count towards "was anything given?" without
+    // contributing a tip.
+    let mut pending_objects = 0usize;
     let mut tips: Vec<ObjectId> = Vec::new();
     let mut hidden: Vec<ObjectId> = Vec::new();
     let mut excludes: Vec<String> = Vec::new();
@@ -819,6 +823,15 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
                         base
                     }
                 };
+                // `handle_commit()`'s tree and blob arms pend the object and
+                // return NULL: no commit, no error, but one more entry in
+                // `revs->pending`. Checked ahead of every shape below because it
+                // applies to `^<tree>` too, and because the count is what stops
+                // the empty-revision branch from reading stdin.
+                if crate::objname::names_non_commit(repo, spec) {
+                    pending_objects += 1;
+                    continue;
+                }
                 if let Some(rest) = spec.strip_prefix('^') {
                     match resolve(repo, rest) {
                         Some(id) => {
@@ -888,7 +901,7 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
     }
 
     // git: "assume HEAD if from a tty" — only when nothing else is pending.
-    let mut pending = tips.len() + hidden.len();
+    let mut pending = tips.len() + hidden.len() + pending_objects;
     if pending == 0 && std::io::stdin().is_terminal() {
         if let Some(repo) = repo.as_ref() {
             if let Ok(mut head) = repo.head() {

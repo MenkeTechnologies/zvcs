@@ -224,6 +224,32 @@ struct Seed {
     bottom: bool,
 }
 
+/// One entry in git's `revs->pending` that never becomes a commit.
+///
+/// `prepare_revision_walk()` re-pends what `handle_commit()` declines to turn
+/// into a commit — an annotated tag under its own name field, and a tree or blob
+/// named on the command line or pulled out of the index — and
+/// `traverse_non_commits()` (`list-objects.c:344-375`) walks that list *after*
+/// every commit, in the order the arguments were read.
+///
+/// A tree or blob is pended only when `--objects` asked for object output
+/// (`if (!revs->tree_objects) return NULL;`), which is why
+/// `git rev-list main^{tree}` exits 0 having printed nothing at all.
+#[derive(Clone)]
+struct Pending {
+    id: ObjectId,
+    /// `pending->name` for a tag — the tag object's own name field — and
+    /// `pending->path` for a tree or a blob, which is the path it was reached
+    /// through and the base every entry under it is joined onto.
+    name: Vec<u8>,
+    kind: gix::object::Kind,
+    /// `UNINTERESTING`. `handle_commit()` marks such a tree's contents and pends
+    /// nothing; `traverse_non_commits()` then skips the object itself. Both
+    /// happen before any traversal, so an excluded tree hides its contents
+    /// whichever side of the interesting one it was written on.
+    uninteresting: bool,
+}
+
 /// `--filter=<spec>`: which objects the `--objects` walk leaves out.
 #[derive(Clone, Copy)]
 enum Filter {
@@ -284,6 +310,20 @@ struct ObjectWalk<'a> {
 ///                                       points at any more
 ///   * `--exclude=<pattern>`          — drop refs from the next ref-set flag, and
 ///                                       only that one (`clear_ref_exclusions`)
+///   * `--exclude-hidden=<section>`   — drop refs matching `transfer.hideRefs` and
+///                                       `<section>.hideRefs` (`fetch`, `receive`
+///                                       or `uploadpack`) from the ref-set flags
+///                                       that see a full refname; the three
+///                                       *narrowed* selectors are refused
+///                                       alongside it because they do not
+///   * `--indexed-objects`            — pend every index blob under its path and
+///                                       every valid cache-tree, which contributes
+///                                       objects but no commits
+///   * `<tree-ish>` / `<blob>`        — `handle_commit()` pends these rather than
+///                                       walking them, so they are not an error:
+///                                       without `--objects` they list nothing at
+///                                       exit 0, and with it they list themselves
+///                                       and everything under them
 ///   * `--stdin`                      — read further revisions, and pathspecs
 ///                                       after a `--` line, from standard input,
 ///                                       *at the position the flag appears* and
@@ -423,12 +463,16 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     let mut seeds: Vec<Seed> = Vec::new();
     // `--exclude=<glob>`, held until the next ref-selecting option consumes it.
     let mut ref_excludes: Vec<String> = Vec::new();
+    // `revs->ref_excludes.hidden_refs` and `.hidden_refs_configured`, installed by
+    // `--exclude-hidden=<section>` and read by every later ref walk.
+    let mut hidden_refs: Vec<String> = Vec::new();
+    let mut hidden_configured = false;
     // Commits the command line already caused to be parsed. Only `--no-walk`
     // cares — see [`super::log::no_walk_uninteresting`].
     let mut parsed_commits: HashSet<ObjectId> = HashSet::new();
     // Annotated tag objects encountered while peeling seeds. `--objects` lists
     // them, named by the tag's own name field, ahead of any tree.
-    let mut pending_tags: Vec<(ObjectId, Vec<u8>)> = Vec::new();
+    let mut pending: Vec<Pending> = Vec::new();
     // git's `flags` in `setup_revisions`: `--not` XORs UNINTERESTING|BOTTOM onto
     // every revision named after it, and a leading `^` XORs it again.
     let mut negate = false;
@@ -490,7 +534,7 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
         // straight to `handle_revision_arg()`, whatever it starts with.
         if origin[i] == Origin::StdinAfterEndOfOptions {
             super::log::warn_operand(&repo, a, false);
-            if let Err(e) = seed_revision(&repo, a, negate, true, &mut seeds, &mut pending_tags) {
+            if let Err(e) = seed_revision(&repo, a, negate, true, &mut seeds, &mut pending) {
                 return Ok(fatal_text(&e));
             }
             note_parsed(&repo, a, &seeds[seeds_before..], &mut parsed_commits)?;
@@ -578,7 +622,7 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
             // root or a merge; everything else is walked past.
             "--simplify-by-decoration" => simplify_by_decoration = true,
             "--bisect" => {
-                if let Err(e) = seed_bisect_refs(&repo, negate, &mut seeds, &mut pending_tags) {
+                if let Err(e) = seed_bisect_refs(&repo, negate, &mut seeds, &mut pending) {
                     return Ok(fatal_text(&e));
                 }
                 rev_input_given = true;
@@ -778,6 +822,26 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
             s if s.starts_with("--exclude=") => {
                 ref_excludes.push(s["--exclude=".len()..].to_string());
             }
+            "--indexed-objects" => {
+                if let Err(e) = seed_index_objects(&repo, negate, &mut pending) {
+                    return Ok(fatal(&e));
+                }
+            }
+            s if s.starts_with("--exclude-hidden=") => {
+                // `if (exclusions->hidden_refs_configured) die(…)` — the flag is
+                // set by the *config walk*, so a second `--exclude-hidden=` is
+                // refused only when the first one actually found a pattern.
+                if hidden_configured {
+                    return Ok(fatal("--exclude-hidden= passed more than once"));
+                }
+                match hidden_ref_patterns(&repo, &s["--exclude-hidden=".len()..]) {
+                    Ok(patterns) => {
+                        hidden_configured = true;
+                        hidden_refs = patterns;
+                    }
+                    Err(e) => return Ok(fatal(&e)),
+                }
+            }
             "--glob" => {
                 i += 1;
                 let Some(v) = argv.get(i) else {
@@ -791,7 +855,7 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
                     std::mem::take(&mut ref_excludes),
                     negate,
                 );
-                if let Err(e) = seed_ref_set(&repo, &sel, negate, &mut seeds, &mut pending_tags) {
+                if let Err(e) = seed_ref_set(&repo, &sel, negate, &hidden_refs, &mut seeds, &mut pending) {
                     return Ok(fatal_text(&e));
                 }
                 rev_input_given = true;
@@ -801,6 +865,24 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
                 // appears, and with every commit sharing a timestamp the seed
                 // order is what decides the output order.
                 let (kind, pattern) = super::log::ref_selector(s).expect("checked above");
+                // `handle_revision_pseudo_opt()` refuses the three *narrowed*
+                // selectors once `--exclude-hidden=` has been seen, because their
+                // callback is handed a trimmed name that a `refs/…` hideRefs
+                // pattern could never match. `--all` and `--glob=` are not
+                // refused; they see the full name.
+                if hidden_configured {
+                    if let Some(name) = match kind {
+                        super::log::RefSelector::Branches => Some("--branches"),
+                        super::log::RefSelector::Tags => Some("--tags"),
+                        super::log::RefSelector::Remotes => Some("--remotes"),
+                        _ => None,
+                    } {
+                        eprintln!(
+                            "error: options '--exclude-hidden' and '{name}' cannot be used together"
+                        );
+                        return Ok(usage_error());
+                    }
+                }
                 let sel = super::log::RefSelection::new(
                     0,
                     kind,
@@ -808,7 +890,7 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
                     std::mem::take(&mut ref_excludes),
                     negate,
                 );
-                if let Err(e) = seed_ref_set(&repo, &sel, negate, &mut seeds, &mut pending_tags) {
+                if let Err(e) = seed_ref_set(&repo, &sel, negate, &hidden_refs, &mut seeds, &mut pending) {
                     return Ok(fatal_text(&e));
                 }
                 rev_input_given = true;
@@ -951,7 +1033,7 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
                     negate,
                     seen_dashdash || from_stdin,
                     &mut seeds,
-                    &mut pending_tags,
+                    &mut pending,
                 ) {
                     return Ok(fatal_text(&e));
                 }
@@ -1015,7 +1097,12 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     // except under `--objects`, which asks for an object listing and is content
     // to produce an empty one, under `--stdin`, which was given its input, and
     // when a revision *was* named but selected nothing (`--not main --all`).
-    if tips.is_empty() && !objects && !read_stdin && !rev_input_given {
+    // `(!(revs.tag_objects || revs.tree_objects || revs.blob_objects) &&
+    //   !revs.pending.nr)` — the pending list is consulted before
+    // `prepare_revision_walk()` drops the non-commits, so
+    // `git rev-list --indexed-objects` (which names no revision at all) is not a
+    // usage error.
+    if tips.is_empty() && !objects && !read_stdin && !rev_input_given && pending.is_empty() {
         return Ok(usage_error());
     }
     dedup_in_place(&mut tips);
@@ -1346,7 +1433,14 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     };
     let mut absent: Vec<ObjectId> = Vec::new();
     let mut seen: HashSet<ObjectId> = HashSet::new();
-    if objects && !hidden.is_empty() {
+    // `mark_edges_uninteresting()` (`list-objects.c:283-321`) walks `revs->commits`
+    // — the list `prepare_revision_walk()` left behind — and marks the trees of
+    // the uninteresting commits *in it*. An exclusion that leaves nothing to walk
+    // leaves that list empty, so nothing is marked and a tree named on the
+    // command line survives: stock `git rev-list --objects ^main main` prints
+    // nothing while `git rev-list --objects ^main main^{tree}` prints the whole
+    // tree.
+    if objects && !hidden.is_empty() && !commits.is_empty() {
         mark_hidden_objects(&repo, &hidden, first_parent, &mut seen)?;
     }
     // Each entry is the object and the path it was reached through, which
@@ -1354,9 +1448,49 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     // come ahead of any tree, named by the tag's own name field.
     let mut object_lines: Vec<(ObjectId, Vec<u8>)> = Vec::new();
     if objects {
-        for (id, name) in &pending_tags {
-            if seen.insert(*id) {
-                object_lines.push((*id, name.clone()));
+        // `traverse_non_commits()` (`list-objects.c:344-375`), in pending order:
+        // a tag prints its own line and stops there, a blob prints one line, and
+        // a tree prints its own line and then everything under it — with
+        // `pending->path` as the base, so `git rev-list --objects main:sub`
+        // names the entries `sub/…`.
+        // `mark_tree_contents_uninteresting()` runs while the pending list is
+        // still being built, so it is a pass of its own — an excluded tree hides
+        // its contents from an interesting tree named *before* it, not only after.
+        for entry in pending.iter().filter(|e| e.uninteresting) {
+            match entry.kind {
+                gix::object::Kind::Tree => mark_tree_seen(&repo, entry.id, &mut seen),
+                _ => {
+                    seen.insert(entry.id);
+                }
+            }
+        }
+        for entry in pending.iter().filter(|e| !e.uninteresting) {
+            if !seen.insert(entry.id) {
+                continue;
+            }
+            match entry.kind {
+                gix::object::Kind::Tree => {
+                    object_lines.push((entry.id, entry.name.clone()));
+                    if let Err(code) = walk_tree(
+                        &repo,
+                        entry.id,
+                        &entry.name,
+                        0,
+                        &mut seen,
+                        &mut object_lines,
+                        &mut absent,
+                        &walk,
+                    )? {
+                        return Ok(code);
+                    }
+                }
+                gix::object::Kind::Blob => match blob_filtered(&repo, entry.id, &mut absent, &walk)?
+                {
+                    Ok(true) => {}
+                    Ok(false) => object_lines.push((entry.id, entry.name.clone())),
+                    Err(code) => return Ok(code),
+                },
+                _ => object_lines.push((entry.id, entry.name.clone())),
             }
         }
     }
@@ -1607,19 +1741,150 @@ fn revision_mark(
 /// others are their own namespace only, with no `HEAD`. Which refs a selection
 /// yields is [`super::log::RefSelection`]'s business — it is the same
 /// `refs_for_each_ref_ext()` rule `git log` uses.
+/// `exclude_hidden_refs()` (`revision.c`) → `parse_hide_refs_config()`
+/// (`refs.c:1688-1708`): the `transfer.hideRefs` and `<section>.hideRefs`
+/// patterns `--exclude-hidden=<section>` installs.
+///
+/// ```c
+/// if (strcmp(section, "fetch") && strcmp(section, "receive") &&
+///                 strcmp(section, "uploadpack"))
+///         die(_("unsupported section for hidden refs: %s"), section);
+/// ```
+///
+/// Trailing slashes are stripped from each pattern, because
+/// [`ref_is_hidden`] matches on a `/` boundary of its own.
+///
+/// Known gap: git reads the two keys through one `repo_config()` pass, so their
+/// relative order is the order they appear in the config *files*; this reads each
+/// key separately and puts `transfer.hideRefs` first. The order is observable only
+/// through a `!`-negated pattern that overlaps a positive one from the other key.
+fn hidden_ref_patterns(repo: &gix::Repository, section: &str) -> Result<Vec<String>, String> {
+    if !matches!(section, "fetch" | "receive" | "uploadpack") {
+        return Err(format!("unsupported section for hidden refs: {section}"));
+    }
+    let snapshot = repo.config_snapshot();
+    let mut patterns = Vec::new();
+    for key in ["transfer.hideRefs", &format!("{section}.hideRefs")] {
+        for value in snapshot.strings(key).into_iter().flatten() {
+            let mut pattern = value.to_string();
+            while pattern.ends_with('/') {
+                pattern.pop();
+            }
+            patterns.push(pattern);
+        }
+    }
+    Ok(patterns)
+}
+
+/// `ref_is_hidden()` (`refs.c:1710-1740`): the *last* matching pattern decides,
+/// `!` negates it, and a match is a prefix that ends at the end of the name or at
+/// a `/`. `^` selects the un-stripped name, which is the same string here because
+/// this port has no ref namespaces.
+fn ref_is_hidden(refname: &str, patterns: &[String]) -> bool {
+    for pattern in patterns.iter().rev() {
+        let (negated, pattern) = match pattern.strip_prefix('!') {
+            Some(rest) => (true, rest),
+            None => (false, pattern.as_str()),
+        };
+        let pattern = pattern.strip_prefix('^').unwrap_or(pattern);
+        if let Some(rest) = refname.strip_prefix(pattern) {
+            if rest.is_empty() || rest.starts_with('/') {
+                return !negated;
+            }
+        }
+    }
+    false
+}
+
+/// `add_index_objects_to_pending()` → `do_add_index_objects_to_pending()`
+/// (`revision.c:1797-1827`): every index blob, then every valid cache-tree.
+///
+/// ```c
+/// for (i = 0; i < istate->cache_nr; i++) {
+///         struct cache_entry *ce = istate->cache[i];
+///         if (S_ISGITLINK(ce->ce_mode))
+///                 continue;
+///         …
+///         add_pending_object_with_path(revs, &blob->object, "", ce->ce_mode, ce->name);
+/// }
+/// if (istate->cache_tree) { … add_cache_tree(istate->cache_tree, revs, &path, flags); }
+/// ```
+///
+/// The blob's pending *path* is the index path and its *name* is empty, so
+/// `git rev-list --objects --indexed-objects` labels each blob with its path.
+/// `add_cache_tree()` pends the root under the empty path and each subtree under
+/// its directory path, and only when `entry_count >= 0` — an invalidated
+/// cache-tree entry contributes nothing.
+///
+/// `revs->single_worktree` is not consulted: this port reads the current index
+/// only, so the linked-worktree indexes git also scans are not represented.
+fn seed_index_objects(
+    repo: &gix::Repository,
+    negate: bool,
+    pending: &mut Vec<Pending>,
+) -> Result<(), String> {
+    let index = repo.index_or_empty().map_err(|e| e.to_string())?;
+    for entry in index.entries() {
+        if entry.mode.is_submodule() {
+            continue;
+        }
+        pending.push(Pending {
+            id: entry.id,
+            name: entry.path(&index).to_vec(),
+            kind: gix::object::Kind::Blob,
+            uninteresting: negate,
+        });
+    }
+    if let Some(tree) = index.tree() {
+        add_cache_tree(tree, Vec::new(), negate, pending);
+    }
+    Ok(())
+}
+
+/// `add_cache_tree()` (`revision.c:1742-1762`), depth-first from the root.
+fn add_cache_tree(
+    tree: &gix::index::extension::Tree,
+    path: Vec<u8>,
+    negate: bool,
+    pending: &mut Vec<Pending>,
+) {
+    // `if (it->entry_count >= 0)`: a subtree whose entry count was invalidated by
+    // an index change is skipped, though its children are still visited.
+    if tree.num_entries.is_some() {
+        pending.push(Pending {
+            id: tree.id,
+            name: path.clone(),
+            kind: gix::object::Kind::Tree,
+            uninteresting: negate,
+        });
+    }
+    for child in &tree.children {
+        let mut child_path = path.clone();
+        if !child_path.is_empty() {
+            child_path.push(b'/');
+        }
+        child_path.extend_from_slice(&child.name);
+        add_cache_tree(child, child_path, negate, pending);
+    }
+}
+
 fn seed_ref_set(
     repo: &gix::Repository,
     sel: &super::log::RefSelection,
     negate: bool,
+    hidden: &[String],
     seeds: &mut Vec<Seed>,
-    tags: &mut Vec<(ObjectId, Vec<u8>)>,
+    pending: &mut Vec<Pending>,
 ) -> Result<(), String> {
     let refs = repo.references().map_err(|e| e.to_string())?;
     let iter = refs.all().map_err(|e| e.to_string())?;
     for reference in iter {
         let reference = reference.map_err(|e| e.to_string())?;
         let full = reference.name().as_bstr().to_string();
-        if sel.selects(&full).is_none() {
+        let Some(name) = sel.selects(&full) else { continue };
+        // `ref_excluded()` tests the `--exclude` patterns and then
+        // `ref_is_hidden()`, both against the name `handle_one_ref()` was given.
+        if ref_is_hidden(name, hidden) {
             continue;
         }
         let target = match reference.try_id() {
@@ -1630,7 +1895,7 @@ fn seed_ref_set(
                 Err(_) => continue,
             },
         };
-        if let Some(id) = peel_recording_tags(repo, target, tags) {
+        if let Some(id) = peel_recording_tags(repo, target, pending) {
             seeds.push(Seed {
                 id,
                 uninteresting: negate,
@@ -1642,9 +1907,9 @@ fn seed_ref_set(
     // `handle_refs(refs, revs, flags, refs_head_ref)`: `--all` pends `HEAD` too,
     // after the ref list and under that literal name — which is why a `refs/…`
     // exclusion pattern never removes it.
-    if sel.head && !sel.excluded("HEAD") {
+    if sel.head && !sel.excluded("HEAD") && !ref_is_hidden("HEAD", hidden) {
         if let Ok(head) = repo.head_id() {
-            if let Some(id) = peel_recording_tags(repo, head.detach(), tags) {
+            if let Some(id) = peel_recording_tags(repo, head.detach(), pending) {
                 seeds.push(Seed {
                     id,
                     uninteresting: negate,
@@ -1669,7 +1934,7 @@ fn seed_revision(
     negate: bool,
     cant_be_filename: bool,
     seeds: &mut Vec<Seed>,
-    tags: &mut Vec<(ObjectId, Vec<u8>)>,
+    pending: &mut Vec<Pending>,
 ) -> Result<(), String> {
     let unknown = |s: &str| unresolvable_in(repo, s, cant_be_filename);
     // `handle_revision_arg_1()`'s parent-mark block, decoded once for every verb
@@ -1727,7 +1992,15 @@ fn seed_revision(
     // `if (*arg == '^') { local_flags = UNINTERESTING | BOTTOM; arg++; }`, which
     // `handle_revision_arg_1()` reaches only after the marks are done with.
     if let Some(rest) = spec.strip_prefix('^') {
-        let id = resolve(repo, rest, tags).ok_or_else(|| unknown(spec))?;
+        let Some(id) = resolve(repo, rest, pending) else {
+            // `handle_commit()`'s tree/blob arms again: an excluded non-commit
+            // pends nothing and is not an error. Stock `git rev-list --objects
+            // ^main^{tree}` exits 0 with no output.
+            if pend_non_commit(repo, rest, !negate, pending) {
+                return Ok(());
+            }
+            return Err(unknown(spec));
+        };
         seeds.push(Seed {
             id,
             uninteresting: !negate,
@@ -1739,8 +2012,8 @@ fn seed_revision(
     if let Some((l, r)) = spec.split_once("...") {
         let left_spec = if l.is_empty() { "HEAD" } else { l };
         let right_spec = if r.is_empty() { "HEAD" } else { r };
-        let left = resolve(repo, left_spec, tags).ok_or_else(|| unknown(spec))?;
-        let right = resolve(repo, right_spec, tags).ok_or_else(|| unknown(spec))?;
+        let left = resolve(repo, left_spec, pending).ok_or_else(|| unknown(spec))?;
+        let right = resolve(repo, right_spec, pending).ok_or_else(|| unknown(spec))?;
         let bases = repo
             .merge_bases_many(left, &[right])
             .map_err(|e| e.to_string())?;
@@ -1769,8 +2042,8 @@ fn seed_revision(
     if let Some((l, r)) = spec.split_once("..") {
         let left_spec = if l.is_empty() { "HEAD" } else { l };
         let right_spec = if r.is_empty() { "HEAD" } else { r };
-        let left = resolve(repo, left_spec, tags).ok_or_else(|| unknown(spec))?;
-        let right = resolve(repo, right_spec, tags).ok_or_else(|| unknown(spec))?;
+        let left = resolve(repo, left_spec, pending).ok_or_else(|| unknown(spec))?;
+        let right = resolve(repo, right_spec, pending).ok_or_else(|| unknown(spec))?;
         seeds.push(Seed {
             id: left,
             uninteresting: !negate,
@@ -1785,7 +2058,7 @@ fn seed_revision(
         });
         return Ok(());
     }
-    seed_plain(repo, spec, negate, cant_be_filename, seeds, tags)
+    seed_plain(repo, spec, negate, cant_be_filename, seeds, pending)
 }
 
 /// Record the commits reading one revision word caused to be parsed.
@@ -1819,10 +2092,18 @@ fn seed_plain(
     negate: bool,
     cant_be_filename: bool,
     seeds: &mut Vec<Seed>,
-    tags: &mut Vec<(ObjectId, Vec<u8>)>,
+    pending: &mut Vec<Pending>,
 ) -> Result<(), String> {
-    let id = resolve(repo, spec, tags)
-        .ok_or_else(|| unresolvable_in(repo, spec, cant_be_filename))?;
+    let Some(id) = resolve(repo, spec, pending) else {
+        // `get_reference()` answers for any object type; only `handle_commit()`
+        // insists on a commit, and its tree and blob arms pend rather than fail.
+        // So `git rev-list main^{tree}` and `git rev-list main:base.txt` are not
+        // errors at all — they simply contribute no commits.
+        if pend_non_commit(repo, spec, negate, pending) {
+            return Ok(());
+        }
+        return Err(unresolvable_in(repo, spec, cant_be_filename));
+    };
     seeds.push(Seed {
         id,
         uninteresting: negate,
@@ -1830,6 +2111,61 @@ fn seed_plain(
         bottom: negate,
     });
     Ok(())
+}
+
+/// `handle_commit()`'s tree and blob arms (`revision.c`), for an operand that
+/// resolved to something [`resolve`] could not peel to a commit.
+///
+/// ```c
+/// if (object->type == OBJ_TREE) {
+///         struct tree *tree = (struct tree *)object;
+///         if (!revs->tree_objects)
+///                 return NULL;
+///         if (flags & UNINTERESTING) {
+///                 mark_tree_contents_uninteresting(revs->repo, tree);
+///                 return NULL;
+///         }
+///         add_pending_object_with_path(revs, object, name, mode, path);
+///         return NULL;
+/// }
+/// ```
+///
+/// Returns whether the operand was claimed. It is claimed whatever `--objects`
+/// says — the `!revs->tree_objects` guard drops the object, it does not turn the
+/// argument back into an error — which is why `git rev-list main^{tree}` exits 0
+/// with no output at all rather than reporting an unknown revision.
+///
+/// The recorded name is `oc.path`, the path arm the operand read the object out
+/// of, and it is empty for a peel such as `main^{tree}`. `traverse_non_commits()`
+/// uses it as the base for everything below a tree.
+fn pend_non_commit(
+    repo: &gix::Repository,
+    spec: &str,
+    negate: bool,
+    pending: &mut Vec<Pending>,
+) -> bool {
+    let bare = spec.strip_prefix('^').unwrap_or(spec);
+    let Some(id) = crate::objname::resolve_quiet(repo, bare) else {
+        return false;
+    };
+    let Ok(object) = repo.find_object(id) else {
+        return false;
+    };
+    if !matches!(object.kind, gix::object::Kind::Tree | gix::object::Kind::Blob) {
+        return false;
+    }
+    // `oc.path`, which `get_oid_with_context()` fills in only for the path arm.
+    let name = match crate::objpath::canonical_paths(repo, bare) {
+        Ok(canonical) => match crate::objpath::split(canonical.as_ref()) {
+            crate::objpath::Split::Index { path, .. } | crate::objpath::Split::Tree { path, .. } => {
+                path.as_bytes().to_vec()
+            }
+            _ => Vec::new(),
+        },
+        Err(_) => Vec::new(),
+    };
+    pending.push(Pending { id, name, kind: object.kind, uninteresting: negate });
+    true
 }
 
 /// git's `--bisect` pseudo-option: seed from the bisect refs.
@@ -1842,7 +2178,7 @@ fn seed_bisect_refs(
     repo: &gix::Repository,
     negate: bool,
     seeds: &mut Vec<Seed>,
-    tags: &mut Vec<(ObjectId, Vec<u8>)>,
+    pending: &mut Vec<Pending>,
 ) -> Result<(), String> {
     let terms = std::fs::read_to_string(repo.path().join("BISECT_TERMS")).unwrap_or_default();
     let mut lines = terms.lines();
@@ -1870,7 +2206,7 @@ fn seed_bisect_refs(
                 Err(_) => continue,
             },
         };
-        if let Some(id) = peel_recording_tags(repo, target, tags) {
+        if let Some(id) = peel_recording_tags(repo, target, pending) {
             // The good refs are handed `*flags ^ (UNINTERESTING | BOTTOM)`.
             let uninteresting = excluded != negate;
             seeds.push(Seed {
@@ -2297,12 +2633,12 @@ fn human_size(bytes: u64) -> String {
 fn resolve(
     repo: &gix::Repository,
     spec: &str,
-    tags: &mut Vec<(ObjectId, Vec<u8>)>,
+    pending: &mut Vec<Pending>,
 ) -> Option<ObjectId> {
     // `at_mark()` compares with `strncasecmp`, so `main@{PUSH}` is the same
     // operand as `main@{push}`; gitoxide's parser is case-sensitive.
-    let id = repo.rev_parse_single(crate::objname::canonical_at_marks(spec).as_ref()).ok()?.detach();
-    peel_recording_tags(repo, id, tags)
+    let id = repo.rev_parse_single(crate::objname::canonical_spec(repo, spec).as_ref()).ok()?.detach();
+    peel_recording_tags(repo, id, pending)
 }
 
 /// Peel `id` down to a commit, pushing every tag object passed through onto
@@ -2310,7 +2646,7 @@ fn resolve(
 fn peel_recording_tags(
     repo: &gix::Repository,
     id: ObjectId,
-    tags: &mut Vec<(ObjectId, Vec<u8>)>,
+    pending: &mut Vec<Pending>,
 ) -> Option<ObjectId> {
     let mut id = id;
     loop {
@@ -2325,7 +2661,12 @@ fn peel_recording_tags(
                     let decoded = tag.decode().ok()?;
                     (decoded.name.to_vec(), decoded.target())
                 };
-                tags.push((tag_id, name));
+                pending.push(Pending {
+                    id: tag_id,
+                    name,
+                    kind: gix::object::Kind::Tag,
+                    uninteresting: false,
+                });
                 id = target;
             }
             _ => return None,

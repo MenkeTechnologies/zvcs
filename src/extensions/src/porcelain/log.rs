@@ -2245,7 +2245,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // `handle_commit()` but the flag was already set, so `revs->def` stays out.
     let mut rev_input_given = false;
     let mut resolve_neg = |spec: &str, token: &str, neg_ids: &mut Vec<ObjectId>| -> Option<ExitCode> {
-        match resolve_rev(&repo, spec) {
+        match resolve_rev(&repo, crate::objname::canonical_spec(&repo, spec).as_ref()) {
             Ok(id) => {
                 // `handle_commit()` drops an UNINTERESTING tree or blob rather
                 // than excluding anything by it, so `<tree>..HEAD` walks the
@@ -2384,6 +2384,12 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                 if let Some(code) = resolve_neg(bare, spec, &mut neg_ids) {
                     return Ok(code);
                 }
+                // `revs->rev_input_given` is set by `handle_revision_arg()` as
+                // soon as the operand resolves, whichever side it lands on. An
+                // excluded *tree* leaves nothing behind — `handle_commit()` drops
+                // it — but the flag stands, so `git log ^main^{tree}` walks
+                // nothing rather than falling back to `revs->def`.
+                rev_input_given = true;
             } else {
                 pos_specs.push((at, bare.to_string(), bare.to_string()));
             }
@@ -2538,7 +2544,11 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                 prune(&mut pathspecs, spec);
                 continue;
             }
-            match repo.rev_parse_single(spec.as_str()) {
+            // `get_oid_with_context()` rewrites a `./`/`../` path arm against the
+            // prefix and folds the `@{u}` family before anything is looked up;
+            // gitoxide's parser does neither, so `git log main:./f` and
+            // `git log main@{u}` under `branch.<n>.remote = .` were refused here.
+            match repo.rev_parse_single(crate::objname::canonical_spec(&repo, spec).as_ref()) {
                 Ok(id) => {
                     // `prepare_revision_walk()`'s `handle_commit()` peels a tag
                     // and drops a tree or a blob without a word — the pending
@@ -4773,6 +4783,12 @@ pub(super) fn bad_revision_message_in_gated(
     if let Some(message) = crate::objname::upstream_mark_fatal(repo, spec) {
         return format!("fatal: {message}\n");
     }
+    // `prefix_path()` dies inside `get_oid_with_context_1()`, so a `../` path arm
+    // that climbs out of the work tree never reaches `die_verify_filename()` and
+    // never gets its magic-pathspec guard.
+    if let Some(message) = crate::objpath::relative_path_fatal(repo, spec) {
+        return format!("fatal: {message}\n");
+    }
     if let Some(message) = crate::objname::dotdot_fatal(repo, spec) {
         return message;
     }
@@ -4796,11 +4812,38 @@ pub(super) fn bad_revision_message_in_gated(
     {
         message.push_str(&warning);
     }
-    message.push_str(&bad_revision_message_gated(
-        spec,
-        repo.object_hash().len_in_hex(),
-        seen_dashdash,
-    ));
+    // `die_verify_filename()` gives the operand one more pass, with
+    // `GET_OID_ONLY_TO_DIE`, and `<rev>:<path>` / `:<n>:<path>` have their own
+    // messages there — far more specific than the fallback below. The two shapes
+    // that die inside `handle_revision_arg()` never reach it, which is exactly
+    // the pair `bad_revision_message_gated` answers with `bad revision`/`bad
+    // object`, so the diagnosis is asked for only when the fallback would be the
+    // three-line `ambiguous argument` text.
+    // `peel_onion()` reports an unreachable `^{<type>}` through `error()` while
+    // the resolution is still running, so the line precedes whatever the caller
+    // then dies with. `handle_revision_arg_1()` strips the exclusion mark before
+    // resolving, so `^main^{blob}` is measured as `main^{blob}`.
+    if let Some(peel) =
+        crate::objname::peel_type_error(repo, spec.strip_prefix('^').unwrap_or(spec))
+    {
+        message.push_str(&format!("error: {peel}\n"));
+    }
+    let generic =
+        bad_revision_message_gated(spec, repo.object_hash().len_in_hex(), seen_dashdash);
+    if generic.starts_with("fatal: ambiguous argument") {
+        // `die_verify_filename()` resolves the operand once more, so its
+        // `error()` comes out a second time — but only on this branch: the
+        // `bad revision`/`bad object` shapes die inside `handle_revision_arg()`
+        // and never reach `verify_filename()`.
+        if let Some(peel) = crate::objname::peel_type_error(repo, spec) {
+            message.push_str(&format!("error: {peel}\n"));
+        }
+        if let Some(diagnosis) = crate::objpath::verify_filename_diagnosis(repo, spec) {
+            message.push_str(&format!("fatal: {diagnosis}\n"));
+            return message;
+        }
+    }
+    message.push_str(&generic);
     message
 }
 

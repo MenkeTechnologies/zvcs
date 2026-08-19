@@ -61,20 +61,20 @@ impl Repository {
                         .map(|entry| entry.id)
                 }) {
                     Some(id) => id,
-                    None => match self
-                        .head()?
-                        .try_peel_to_id()?
-                        .map(|id| -> Result<Option<_>, submodule::modules::Error> {
-                            Ok(id
-                                .object()?
-                                .peel_to_commit()?
-                                .tree()?
-                                .find_entry(submodule::MODULES_FILE)
-                                .map(|entry| entry.inner.oid.to_owned()))
-                        })
-                        .transpose()?
-                        .flatten()
-                    {
+                    // git's `config_from_gitmodules()` (submodule-config.c:798-806) reads the last
+                    // resort as `repo_get_oid(repo, "HEAD:.gitmodules", &oid)`, and a negative
+                    // return simply means "no submodule configuration" — it never fails the caller.
+                    // That lookup goes through `get_tree_entry_follow_symlinks()`, which resolves
+                    // its starting point with `read_object_with_reference(…, OBJ_TREE, …)`, so a
+                    // `HEAD` that already *is* a tree is as good as one pointing at a commit.
+                    // Peeling to a commit here instead made every command that asks for the
+                    // submodule configuration — `status` among them — fail outright on a tree
+                    // `HEAD`, which git reports as an ordinary detached state.
+                    None => match self.head()?.try_peel_to_id()?.and_then(|id| {
+                        let tree = id.object().ok()?.peel_to_tree().ok()?;
+                        tree.find_entry(submodule::MODULES_FILE)
+                            .map(|entry| entry.inner.oid.to_owned())
+                    }) {
                         Some(id) => id,
                         None => return Ok(None),
                     },

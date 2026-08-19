@@ -196,7 +196,7 @@ const USAGE: &str = r"usage: git for-each-ref [--count=<count>] [--shell|--perl|
 
 /// The `%(...)` fields this module can evaluate.
 #[derive(Clone)]
-enum Field {
+pub(super) enum Field {
     RefName(NameMod),
     SymRef(NameMod),
     ObjectName(NameLen),
@@ -250,7 +250,7 @@ enum Field {
 
 /// git's `signature` atom options, in `parse_signature_option`'s order.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum SigOption {
+pub(super) enum SigOption {
     /// `%(signature)` — `sigc->output`, gpg's own human-readable report.
     Bare,
     /// `%(signature:signer)` — `sigc->signer`.
@@ -271,7 +271,7 @@ enum SigOption {
 /// git's `remote_ref` atom options, shared by `%(upstream)` and `%(push)`.
 #[derive(Clone)]
 #[cfg_attr(test, derive(Debug))]
-struct RemoteRef {
+pub(super) struct RemoteRef {
     option: RrOption,
     /// `nobracket` — drop the `[...]` around a `:track` rendering.
     nobracket: bool,
@@ -283,7 +283,7 @@ struct RemoteRef {
 /// Which rendering a `%(upstream)` / `%(push)` atom asks for.
 #[derive(Clone)]
 #[cfg_attr(test, derive(Debug))]
-enum RrOption {
+pub(super) enum RrOption {
     /// The default: the tracking refname itself, under `%(refname)`'s modifiers.
     Ref(NameMod),
     /// `:track` — `ahead N`/`behind N`/`ahead N, behind M`/`gone`.
@@ -298,7 +298,7 @@ enum RrOption {
 
 /// `%(if)`'s comparison mode (git's `cmp_status`).
 #[derive(Clone)]
-enum Cmp {
+pub(super) enum Cmp {
     /// Bare `%(if)`: any non-blank content satisfies the condition.
     None,
     /// `%(if:equals=<v>)`.
@@ -310,7 +310,7 @@ enum Cmp {
 /// Modifiers accepted by `%(refname)` and `%(symref)`.
 #[derive(Clone)]
 #[cfg_attr(test, derive(Debug))]
-enum NameMod {
+pub(super) enum NameMod {
     Full,
     Short,
     /// `:lstrip=<n>` (`:strip=` is a synonym).
@@ -321,7 +321,7 @@ enum NameMod {
 
 /// Modifiers accepted by `%(objectname)`.
 #[derive(Clone, Debug)]
-enum NameLen {
+pub(super) enum NameLen {
     Full,
     /// `:short` — length from `core.abbrev`, auto-scaled when unset.
     Auto,
@@ -331,7 +331,7 @@ enum NameLen {
 
 /// Which name-email-date header a person atom reads.
 #[derive(Clone, Copy, PartialEq)]
-enum Who {
+pub(super) enum Who {
     Author,
     Committer,
     Tagger,
@@ -341,7 +341,7 @@ enum Who {
 
 /// Which component of a name-email-date tuple an atom extracts.
 #[derive(Clone)]
-enum PersonPart {
+pub(super) enum PersonPart {
     /// The whole `Name <email> <secs> <tz>` tuple.
     Full,
     /// `%(authorname[:mailmap])`, git's `N_RAW` / `N_MAILMAP`.
@@ -357,7 +357,7 @@ enum PersonPart {
 
 /// `email_atom_option_parser`'s bit set: `EO_RAW` is the empty one.
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
-struct EmailOpt(u8);
+pub(super) struct EmailOpt(u8);
 
 impl EmailOpt {
     const TRIM: u8 = 1 << 0;
@@ -374,7 +374,7 @@ impl EmailOpt {
 /// `%(contents:body)` are different options (`C_BODY_DEP` vs `C_BODY`) and
 /// differ on whether a signature block belongs to the body.
 #[derive(Clone)]
-enum ContentPart {
+pub(super) enum ContentPart {
     /// `%(contents)` — `C_BARE`: the message from the subject on, signature
     /// included.
     Bare,
@@ -401,14 +401,14 @@ enum ContentPart {
 /// One `%(...)` atom: an optional leading `*` (evaluate against the peeled
 /// object) plus the field itself.
 #[derive(Clone)]
-struct Atom {
-    deref: bool,
-    field: Field,
+pub(super) struct Atom {
+    pub(super) deref: bool,
+    pub(super) field: Field,
 }
 
 /// A parsed format string is a sequence of literal runs, atoms, and the
 /// `%(align:…)` / `%(end)` container markers that pad the content between them.
-enum Item {
+pub(super) enum Item {
     Lit(Vec<u8>),
     Atom(Atom),
     AlignStart(AlignSpec),
@@ -422,13 +422,13 @@ enum Item {
 /// `%(align:<width>,<position>)` — pad the enclosed content to `width` display
 /// columns; content already at or over `width` is left untouched (never cut).
 #[derive(Clone)]
-struct AlignSpec {
-    width: usize,
-    position: AlignPos,
+pub(super) struct AlignSpec {
+    pub(super) width: usize,
+    pub(super) position: AlignPos,
 }
 
 #[derive(Clone, Copy)]
-enum AlignPos {
+pub(super) enum AlignPos {
     Left,
     Right,
     Middle,
@@ -436,41 +436,56 @@ enum AlignPos {
 
 /// A sort key: an atom, its direction, and whether to compare with `versioncmp`
 /// (the `version:` / `v:` prefix).
-struct SortKey {
-    atom: Atom,
-    descending: bool,
-    versioned: bool,
+pub(super) struct SortKey {
+    pub(super) atom: Atom,
+    pub(super) descending: bool,
+    pub(super) versioned: bool,
 }
 
 /// Everything known about one object referenced during a run.
-struct ObjInfo {
-    id: ObjectId,
-    kind: Kind,
-    size: u64,
+pub(super) struct ObjInfo {
+    pub(super) id: ObjectId,
+    pub(super) kind: Kind,
+    pub(super) size: u64,
     /// Full object data, loaded only when a person/contents atom needs it.
-    data: Option<Vec<u8>>,
+    pub(super) data: Option<Vec<u8>>,
 }
 
 /// One ref, resolved and ready to render.
-struct RefInfo {
-    refname: Vec<u8>,
+pub(super) struct RefInfo {
+    pub(super) refname: Vec<u8>,
     /// `%(refname:short)`, computed only when the format or a sort key asks.
-    short: Vec<u8>,
+    pub(super) short: Vec<u8>,
     /// The target of a symbolic ref, empty for a direct one.
-    symref: Vec<u8>,
+    pub(super) symref: Vec<u8>,
     /// `%(symref:short)`, computed only when asked for.
-    symref_short: Vec<u8>,
-    obj: ObjInfo,
+    pub(super) symref_short: Vec<u8>,
+    pub(super) obj: ObjInfo,
     /// Present only when `obj` is a tag object, holding its fully peeled target.
-    peeled: Option<ObjInfo>,
-    is_head: bool,
+    pub(super) peeled: Option<ObjInfo>,
+    pub(super) is_head: bool,
     /// git's `REF_ISPACKED`: the ref has no loose file, so it was read out of
     /// `packed-refs`. Feeds `%(flag)`.
-    packed: bool,
+    pub(super) packed: bool,
     /// `ref_array_item.is_base`: the `%(is-base:<committish>)` operands that
     /// chose *this* ref, filled in by [`filter_is_base`] before sorting. Every
     /// other ref keeps an empty list and renders those atoms empty.
-    is_base: Vec<String>,
+    pub(super) is_base: Vec<String>,
+    /// `FILTER_REFS_DETACHED_HEAD`: `git branch --list` adds a pseudo entry for a
+    /// detached HEAD whose `%(refname)` is `get_head_description()` rather than
+    /// the ref name, under *every* `refname` modifier:
+    ///
+    /// ```c
+    /// static const char *get_refname(struct used_atom *atom, struct ref_array_item *ref)
+    /// {
+    ///         if (ref->kind & FILTER_REFS_DETACHED_HEAD)
+    ///                 return get_head_description();
+    ///         return show_ref(&atom->u.refname, ref->refname);
+    /// }
+    /// ```
+    ///
+    /// `for-each-ref` never sets it; it is `None` for every ordinary ref.
+    pub(super) head_desc: Option<Vec<u8>>,
 }
 
 /// Everything `parse_atom` needs beyond the atom text itself.
@@ -478,12 +493,12 @@ struct RefInfo {
 /// `repo` is `None` only in unit tests, which never parse a repository-dependent
 /// atom; an atom that needs one reports the failure git reports when the operand
 /// cannot be resolved rather than quietly accepting it.
-struct AtomCtx<'a> {
-    repo: Option<&'a gix::Repository>,
-    color_on: bool,
+pub(super) struct AtomCtx<'a> {
+    pub(super) repo: Option<&'a gix::Repository>,
+    pub(super) color_on: bool,
     /// git's `format->quote_style`, which `%(raw)` is rejected under. Sort keys
     /// parse through a fresh `REF_FORMAT_INIT`, i.e. `QuoteStyle::None`.
-    quote_style: QuoteStyle,
+    pub(super) quote_style: QuoteStyle,
 }
 
 /// Which exit code a format/sort parse failure maps onto.
@@ -493,7 +508,7 @@ struct AtomCtx<'a> {
 /// a git failure at all — it is this port saying it has not built something —
 /// and [`report_atom_error`] keeps it out of git's voice.
 #[cfg_attr(test, derive(Debug))]
-enum ErrKind {
+pub(super) enum ErrKind {
     Fatal,
     Usage,
     Unported,
@@ -501,9 +516,9 @@ enum ErrKind {
 
 /// A format or sort-key parse failure, carrying the exit code it implies.
 #[cfg_attr(test, derive(Debug))]
-struct AtomError {
-    kind: ErrKind,
-    msg: String,
+pub(super) struct AtomError {
+    pub(super) kind: ErrKind,
+    pub(super) msg: String,
 }
 
 fn fatal_atom(msg: impl Into<String>) -> AtomError {
@@ -775,7 +790,7 @@ fn parse_email_opts(
 /// claim that this is what git does here, and a gap in this port is not that.
 /// It keeps the `zvcs: <verb>: …` prefix and exit 1 that mark the port speaking
 /// for itself — see `crate::fatal`.
-fn report_atom_error(e: AtomError) -> Result<ExitCode> {
+pub(super) fn report_atom_error(e: AtomError) -> Result<ExitCode> {
     match e.kind {
         ErrKind::Fatal => Ok(fatal(&e.msg)),
         ErrKind::Usage => Ok(usage_error(&e.msg)),
@@ -784,7 +799,7 @@ fn report_atom_error(e: AtomError) -> Result<ExitCode> {
 }
 
 /// git's `die()`: message on stderr, exit 128.
-fn fatal(msg: &str) -> ExitCode {
+pub(super) fn fatal(msg: &str) -> ExitCode {
     eprintln!("fatal: {msg}");
     ExitCode::from(128)
 }
@@ -844,7 +859,7 @@ enum ColorWhen {
 /// repeating one style is harmless but requesting two distinct ones is
 /// "more than one quoting style?". `--no-<style>` clears its bit.
 #[derive(Clone, Copy, PartialEq)]
-enum QuoteStyle {
+pub(super) enum QuoteStyle {
     None,
     Shell,
     Perl,
@@ -859,15 +874,15 @@ const Q_TCL: u8 = 8;
 
 /// The reachability filters, each a list of commits combined with "any".
 #[derive(Default)]
-struct Filters {
-    contains: Vec<ObjectId>,
-    no_contains: Vec<ObjectId>,
-    merged: Vec<ObjectId>,
-    no_merged: Vec<ObjectId>,
+pub(super) struct Filters {
+    pub(super) contains: Vec<ObjectId>,
+    pub(super) no_contains: Vec<ObjectId>,
+    pub(super) merged: Vec<ObjectId>,
+    pub(super) no_merged: Vec<ObjectId>,
 }
 
 impl Filters {
-    fn active(&self) -> bool {
+    pub(super) fn active(&self) -> bool {
         !self.contains.is_empty()
             || !self.no_contains.is_empty()
             || !self.merged.is_empty()
@@ -1392,6 +1407,7 @@ pub fn for_each_ref(args: &[String]) -> Result<ExitCode> {
 
         refs.push(RefInfo {
             is_head: head_name.as_deref() == Some(refname.as_slice()),
+            head_desc: None,
             refname,
             short,
             symref,
@@ -1492,11 +1508,11 @@ pub fn for_each_ref(args: &[String]) -> Result<ExitCode> {
 }
 
 /// Repository-wide state the renderers share, built at most once per run.
-struct RenderCtx<'a> {
-    repo: &'a gix::Repository,
+pub(super) struct RenderCtx<'a> {
+    pub(super) repo: &'a gix::Repository,
     /// git's `ref_to_worktree_map`, lazily initialised exactly as
     /// `lazy_init_worktree_map` does.
-    worktrees: std::cell::OnceCell<std::collections::HashMap<gix::bstr::BString, String>>,
+    pub(super) worktrees: std::cell::OnceCell<std::collections::HashMap<gix::bstr::BString, String>>,
 }
 
 impl RenderCtx<'_> {
@@ -1534,7 +1550,7 @@ struct Frame {
 ///
 /// `Ok(Err(msg))` is a stack error — a `%(then)` with no `%(if)`, an unbalanced
 /// `%(end)` — which git turns into `die()`.
-fn format_ref(
+pub(super) fn format_ref(
     ctx: &RenderCtx<'_>,
     items: &[Item],
     info: &RefInfo,
@@ -1718,7 +1734,7 @@ fn parse_count(v: &str) -> Option<i64> {
 ///
 /// A ref that does not peel to a commit is dropped by every one of them, as git
 /// does when `lookup_commit_reference_gently` comes back empty.
-fn passes_filters(repo: &gix::Repository, filters: &Filters, tip: ObjectId) -> Result<bool> {
+pub(super) fn passes_filters(repo: &gix::Repository, filters: &Filters, tip: ObjectId) -> Result<bool> {
     if repo.find_header(tip)?.kind() != Kind::Commit {
         return Ok(false);
     }
@@ -1778,7 +1794,7 @@ fn is_ancestor(repo: &gix::Repository, ancestor: ObjectId, descendant: ObjectId)
 /// Returns the item stream plus git's `need_color_reset_at_eol`: a format whose
 /// last `%(color:…)` names anything but `reset` gets an implicit reset appended
 /// to every line, but only while colour is actually on.
-fn parse_format(
+pub(super) fn parse_format(
     fmt: &[u8],
     ctx: &AtomCtx<'_>,
 ) -> std::result::Result<(Vec<Item>, bool), AtomError> {
@@ -2011,7 +2027,7 @@ const KNOWN_ATOMS: &[&str] = &[
 ///     which this command refuses the way git refuses it.
 ///
 /// A leading `*` evaluates the atom against the object a tag peels to.
-fn parse_atom(spec: &str, ctx: &AtomCtx<'_>) -> std::result::Result<Atom, AtomError> {
+pub(super) fn parse_atom(spec: &str, ctx: &AtomCtx<'_>) -> std::result::Result<Atom, AtomError> {
     let (body, deref) = match spec.strip_prefix('*') {
         Some(rest) => (rest, true),
         None => (spec, false),
@@ -2619,7 +2635,7 @@ fn who(stem: &str) -> Who {
 }
 
 /// Read `id`'s header, and its full data when `with_data` is set.
-fn load(repo: &gix::Repository, id: ObjectId, with_data: bool) -> Result<ObjInfo> {
+pub(super) fn load(repo: &gix::Repository, id: ObjectId, with_data: bool) -> Result<ObjInfo> {
     let header = repo.find_header(id)?;
     let data = if with_data {
         Some(repo.find_object(id)?.data.clone())
@@ -2638,7 +2654,7 @@ fn load(repo: &gix::Repository, id: ObjectId, with_data: bool) -> Result<ObjInfo
 ///
 /// Empty when `id` is not a tag; otherwise each element is one dereference
 /// deeper, so the last entry is the fully peeled object.
-fn peel_chain(repo: &gix::Repository, id: ObjectId) -> Result<Vec<ObjectId>> {
+pub(super) fn peel_chain(repo: &gix::Repository, id: ObjectId) -> Result<Vec<ObjectId>> {
     let mut chain = Vec::new();
     let mut current = id;
     loop {
@@ -2655,7 +2671,7 @@ fn peel_chain(repo: &gix::Repository, id: ObjectId) -> Result<Vec<ObjectId>> {
 /// Whether `refname` is selected by `pattern`, using git's ref-filter rules:
 /// a literal match that ends on a path boundary, or a `wildmatch` in which
 /// `*` does not cross `/`.
-fn pattern_matches(pattern: &str, refname: &[u8], ignore_case: bool) -> bool {
+pub(super) fn pattern_matches(pattern: &str, refname: &[u8], ignore_case: bool) -> bool {
     let p = pattern.as_bytes();
     // ```c
     // if ((plen <= namelen) &&
@@ -2697,7 +2713,7 @@ fn pattern_matches(pattern: &str, refname: &[u8], ignore_case: bool) -> bool {
 ///
 /// Strict is what makes both halves of an ambiguous pair keep a component:
 /// `refs/tags/dup` alongside `refs/heads/dup` renders as `tags/dup`, not `dup`.
-fn short_name(repo: &gix::Repository, refname: &[u8], all: &HashSet<Vec<u8>>) -> Vec<u8> {
+pub(super) fn short_name(repo: &gix::Repository, refname: &[u8], all: &HashSet<Vec<u8>>) -> Vec<u8> {
     crate::refname::shorten_unambiguous_in_set(
         repo,
         refname,
@@ -2707,7 +2723,7 @@ fn short_name(repo: &gix::Repository, refname: &[u8], all: &HashSet<Vec<u8>>) ->
 }
 
 /// Order `refs` by the sort chain, falling back to refname as git does.
-fn sort_refs(
+pub(super) fn sort_refs(
     ctx: &RenderCtx<'_>,
     refs: Vec<RefInfo>,
     sorts: &[SortKey],
@@ -2906,6 +2922,11 @@ fn render(ctx: &RenderCtx<'_>, atom: &Atom, info: &RefInfo) -> Result<Vec<u8>> {
             return Ok(format!("{ahead} {behind}").into_bytes());
         }
         Field::RefName(m) => {
+            // `get_refname()` (ref-filter.c:2337-2342) short-circuits ahead of
+            // `show_ref()`, so the description is not lstripped or shortened.
+            if let Some(desc) = &info.head_desc {
+                return Ok(desc.clone());
+            }
             return Ok(match m {
                 NameMod::Full => info.refname.clone(),
                 NameMod::Short => info.short.clone(),
@@ -3003,7 +3024,15 @@ fn render(ctx: &RenderCtx<'_>, atom: &Atom, info: &RefInfo) -> Result<Vec<u8>> {
         // git shells `describe` out as a subprocess; doing the same keeps every
         // option (`--tags`, `--abbrev=`, `--match=`, `--exclude=`) on the one
         // implementation instead of a second, drifting copy.
-        Field::Describe(args) => run_describe(args, obj.id),
+        // `grab_describe_values()` is reached from `grab_values()`'s `OBJ_TAG` and
+        // `OBJ_COMMIT` arms only (ref-filter.c:2135, 2150); the `OBJ_TREE` and
+        // `OBJ_BLOB` arms call `grab_sub_body_contents()` and nothing else, so a
+        // ref pointing straight at a tree or blob renders `%(describe)` empty
+        // rather than running `git describe` on it.
+        Field::Describe(args) => match obj.kind {
+            Kind::Tag | Kind::Commit => run_describe(args, obj.id),
+            Kind::Tree | Kind::Blob => Ok(Vec::new()),
+        },
         Field::RefName(_)
         | Field::SymRef(_)
         | Field::Head
@@ -3148,7 +3177,7 @@ fn render_upstream(
 
 /// Whether the ref that ultimately holds `name`'s object id came out of
 /// `packed-refs` rather than a loose file, following symrefs to the leaf.
-fn is_packed(repo: &gix::Repository, name: &str) -> bool {
+pub(super) fn is_packed(repo: &gix::Repository, name: &str) -> bool {
     let loose = |n: &str| repo.common_dir().join(n).is_file() || repo.git_dir().join(n).is_file();
     let mut current = name.to_string();
     // A cycle is impossible in a well-formed store; the bound keeps a corrupt
@@ -3276,7 +3305,7 @@ fn commit_of<'a>(
 /// trims anything. Refs whose name does not resolve to a commit are skipped and
 /// keep their positions out of the candidate list, exactly as git's `back_index`
 /// does.
-fn filter_is_base(repo: &gix::Repository, refs: &mut [RefInfo], atoms: &[(String, ObjectId)]) {
+pub(super) fn filter_is_base(repo: &gix::Repository, refs: &mut [RefInfo], atoms: &[(String, ObjectId)]) {
     if refs.is_empty() || atoms.is_empty() {
         return;
     }
@@ -3864,21 +3893,21 @@ fn with_signature<T>(
 /// four different ways: `sub` starts at the subject and runs to the end of the
 /// object, `body` starts after the subject's blank line, `nonsig_len` stops the
 /// body at the signature, and `sig` is the signature alone.
-struct SubPos {
+pub(super) struct SubPos {
     /// The first non-blank byte after the header block.
-    sub: usize,
+    pub(super) sub: usize,
     /// The subject's length, trailing `\n`/`\r` already dropped.
-    sub_len: usize,
+    pub(super) sub_len: usize,
     /// The first byte after the subject's blank line.
-    body: usize,
+    pub(super) body: usize,
     /// From `body` to the end of the object.
-    body_len: usize,
+    pub(super) body_len: usize,
     /// From `body` to the start of the signature.
-    nonsig_len: usize,
+    pub(super) nonsig_len: usize,
     /// Where a trailing signature block begins, or the end of the object.
-    sig: usize,
+    pub(super) sig: usize,
     /// From `sig` to the end of the object.
-    sig_len: usize,
+    pub(super) sig_len: usize,
 }
 
 /// `parse_signed_buffer()` (gpg-interface.c): the offset of the *last* line in
@@ -3903,7 +3932,7 @@ fn parse_signed_buffer(buf: &[u8]) -> usize {
 }
 
 /// `find_subpos()` (ref-filter.c:1899-1938), byte-for-byte.
-fn find_subpos(buf: &[u8]) -> SubPos {
+pub(super) fn find_subpos(buf: &[u8]) -> SubPos {
     let end = buf.len();
 
     // Skip past the header until we hit an empty line.
@@ -3961,7 +3990,7 @@ fn find_bytes(hay: &[u8], needle: &[u8]) -> Option<usize> {
 /// turning each `\n` into a space and dropping the `\r` of a `\r\n`. Note that
 /// this does *not* trim a line's trailing whitespace — `"a  \nb"` becomes
 /// `"a   b"`, three spaces.
-fn copy_subject(sub: &[u8]) -> Vec<u8> {
+pub(super) fn copy_subject(sub: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(sub.len());
     for (i, &c) in sub.iter().enumerate() {
         if c == b'\r' && sub.get(i + 1) == Some(&b'\n') {

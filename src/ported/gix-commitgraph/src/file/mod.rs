@@ -23,8 +23,17 @@ const BLOOM_DATA_CHUNK_ID: ChunkId = *b"BDAT";
 const BLOOM_DATA_HEADER_SIZE: usize = 12;
 const COMMIT_DATA_CHUNK_ID: ChunkId = *b"CDAT";
 const EXTENDED_EDGES_LIST_CHUNK_ID: ChunkId = *b"EDGE";
+/// git's `GRAPH_CHUNKID_GENERATION_DATA`: the corrected commit date of every commit,
+/// stored as a `u32` offset over that commit's own committer timestamp.
+const GENERATION_DATA_CHUNK_ID: ChunkId = *b"GDA2";
+/// git's `GRAPH_CHUNKID_GENERATION_DATA_OVERFLOW`: the `u64` offsets too wide for `GDA2`.
+const GENERATION_DATA_OVERFLOW_CHUNK_ID: ChunkId = *b"GDO2";
 const OID_FAN_CHUNK_ID: ChunkId = *b"OIDF";
 const OID_LOOKUP_CHUNK_ID: ChunkId = *b"OIDL";
+
+/// git's `CORRECTED_COMMIT_DATE_OFFSET_OVERFLOW` (commit-graph.c:67): set in a `GDA2` slot,
+/// the remaining bits index into `GDO2` instead of being the offset themselves.
+pub(crate) const CORRECTED_COMMIT_DATE_OFFSET_OVERFLOW: u32 = 1 << 31;
 
 // Note that git's commit-graph-format.txt as of v2.28.0 gives an incorrect value 0x0700_0000 for
 // NO_PARENT. Fixed in https://github.com/git/git/commit/4d515253afcef985e94400adbfed7044959f9121 .

@@ -16,8 +16,15 @@
 //!   * the usage line (exit 129) when fewer than three arguments follow the
 //!     subcommand name
 //!   * the unmerged-index precondition block (exit 128)
-//!   * `Auto-merging <path>` / `CONFLICT (content|add/add): Merge conflict in
-//!     <path>` on stdout, conflict markers labelled with the `<head>` and
+//!   * merge-ort's informational messages on stdout, rendered by the shared
+//!     [`crate::merge_msg`] in its strict mode (this command renders before it
+//!     writes, so an unrenderable class costs nothing to refuse): the
+//!     `Auto-merging` / `CONFLICT (content|add/add|submodule)` content family
+//!     with its `warning: Cannot merge binary files` and symlink variants, plus
+//!     `modify/delete`, `rename/delete`, `rename/rename`, `file/directory` and
+//!     `distinct types`, sorted by primary path the way
+//!     `merge_display_update_messages()` prints them. Conflict markers are
+//!     labelled with the `<head>` and
 //!     `<remote>` argument strings (or their `GITHEAD_<oid>` environment
 //!     override, exactly as git's `better_branch_name` does)
 //!   * exit 0 for a clean merge, 1 when conflicts remain, 128 for the fatal paths
@@ -44,11 +51,11 @@
 //!   * `--subtree` over a criss-cross history, or over two or more explicit
 //!     bases: git shifts inside every level of the virtual-merge-base recursion,
 //!     and `Repository::virtual_merge_base` cannot carry the shift into its own
-//!   * conflict classes outside the content family (rename/rename, rename/delete,
-//!     modify/delete, directory/file, submodule, binary). `gix-merge` reports
-//!     these as structured resolutions, not as git's message strings; rendering
-//!     them would mean inventing text, so they error out *before* anything is
-//!     written
+//!   * the conflict classes [`crate::merge_msg`] still cannot name: a gitlink
+//!     content merge (git's `merge_submodule()` diagnostics and its
+//!     `advice.submoduleMergeConflict` hint block are not ported) and
+//!     `gix-merge`'s `Unknown` catch-all where neither side is a plain type
+//!     clash. Both error out *before* anything is written
 //!   * `merge.conflictStyle = diff3|zdiff3` — the ancestor label git uses here
 //!     is not reproduced, so a non-default style is refused
 //!   * git's `unpack_trees` reconciliation of a dirty index/worktree. Stock git
@@ -63,12 +70,11 @@ use std::process::ExitCode;
 use std::sync::atomic::AtomicBool;
 
 use gix::bstr::{BStr, BString, ByteSlice};
-use gix::diff::tree_with_rewrites::Change;
 use gix::hash::ObjectId;
 use gix::index::entry::{Mode, Stat};
 use gix::merge::blob::builtin_driver::text::Labels;
 use gix::merge::tree::apply_index_entries::RemovalMode;
-use gix::merge::tree::{Conflict, Resolution, TreatAsUnresolved};
+use gix::merge::tree::TreatAsUnresolved;
 
 /// Verbatim `git merge-recursive` usage line (git exits 129 after printing it).
 const USAGE: &str = "usage: git merge-recursive <base>... -- <head> <remote> ...\n";
@@ -76,10 +82,6 @@ const USAGE: &str = "usage: git merge-recursive <base>... -- <head> <remote> ...
 /// git's `bases[21]` array holds one spare slot, so at most 20 bases are kept.
 const MAX_BASES: usize = 20;
 
-/// One informational message, carrying its own trailing newline.
-struct Message {
-    text: String,
-}
 
 
 /// `git merge-recursive [--<option>]... <base>... -- <head> <remote>`.
@@ -199,7 +201,7 @@ pub fn merge_recursive(args: &[String]) -> Result<ExitCode> {
     let repo = renormalized.unwrap_or(repo);
 
     // The same `-X` knobs the porcelain applies, from the same place.
-    let tree_options = crate::merge_apply::tree_merge_options(&repo, &xopts, None)?;
+    let tree_options = crate::merge_apply::tree_merge_options(&repo, &xopts, None, false)?;
 
     let head_tree = repo.find_commit(head_id)?.tree_id()?.detach();
     let remote_tree = repo.find_commit(remote_id)?.tree_id()?.detach();
@@ -302,18 +304,48 @@ pub fn merge_recursive(args: &[String]) -> Result<ExitCode> {
 
     // Render every message first: an unrenderable conflict class must fail
     // before a single byte of index or worktree is touched.
-    let messages = render_messages(&repo, &outcome.conflicts)?;
+    let messages = crate::merge_msg::render(
+        &repo,
+        &outcome.conflicts,
+        &label1,
+        &label2,
+        crate::merge_msg::Operand1::Tree(head_tree),
+        TreatAsUnresolved::git(),
+        crate::merge_msg::Strictness::Refuse,
+    )?;
 
     // Conservative precondition (documented deviation): the index must equal
     // `<head>`'s tree and the worktree must be clean.
-    ensure_index_matches(&repo, &old_index, head_tree)?;
-    if repo.is_dirty()? {
-        crate::git_fatal!("your local changes would be overwritten by merge; commit or stash them first");
+    // merge-ort's `merge_start()` sanity check: `repo_index_has_changes()`
+    // against `<head>`, which refuses the whole merge — naming the paths, two
+    // spaces in, with no advice line — when the index carries a staged change.
+    let staged = crate::merge_guard::index_changes_from_head(&repo, head_tree, &old_index)?;
+    if !staged.is_empty() {
+        crate::merge_guard::report_index_changes(&staged);
+        return Ok(ExitCode::from(128));
     }
 
     let how = TreatAsUnresolved::git();
     let conflicted = outcome.has_unresolved_conflicts(how);
     let merged_tree = outcome.tree.write()?.detach();
+
+    // `merge_switch_to_result()`'s `checkout()`: an `unpack_trees()` from
+    // `<head>`'s tree to the merged one, which refuses rather than overwrite
+    // local work — but **per path**, so an edit outside the merge's footprint is
+    // not a reason to refuse anything. The blanket `repo.is_dirty()` this
+    // replaced turned any uncommitted edit anywhere in the tree into a refusal,
+    // which made the command unusable in a working repository, and it never
+    // looked at untracked files at all: an untracked file standing where the
+    // merge wanted to write one was silently overwritten at exit 0.
+    //
+    // git checks out *before* it displays the messages (merge-ort.c:4964), so a
+    // refusal here prints only the `unpack_trees` block — the `Auto-merging`
+    // lines belong to a merge that did not happen.
+    let clobber = crate::merge_guard::verify_two_way(&repo, head_tree, merged_tree, &old_index)?;
+    if !clobber.is_empty() {
+        clobber.report("merge");
+        return Ok(ExitCode::from(128));
+    }
 
     let old_stats = stats_by_path(&old_index);
     let written = apply_to_worktree(&repo, &old_stats, merged_tree)?;
@@ -372,26 +404,6 @@ fn resolve(repo: &gix::Repository, spec: &str) -> Option<ObjectId> {
     Some(object.peel_to_commit().ok()?.id)
 }
 
-/// Refuse to merge unless the index is exactly `head_tree` — the state git's
-/// `unpack_trees` pass is guaranteed to accept.
-fn ensure_index_matches(
-    repo: &gix::Repository,
-    index: &gix::index::File,
-    head_tree: ObjectId,
-) -> Result<()> {
-    let expected = repo.index_from_tree(&head_tree)?;
-    let key = |file: &gix::index::File| -> Vec<(BString, ObjectId, Mode)> {
-        let backing = file.path_backing();
-        file.entries()
-            .iter()
-            .map(|e| (e.path_in(backing).to_owned(), e.id, e.mode))
-            .collect()
-    };
-    if key(index) != key(&expected) {
-        bail!("the index does not match <head>; staged changes are not supported by this port");
-    }
-    Ok(())
-}
 
 /// Index entries keyed by path, carrying the id, mode and stat data.
 fn stats_by_path(index: &gix::index::File) -> HashMap<BString, (ObjectId, Mode, Stat)> {
@@ -461,71 +473,3 @@ fn apply_to_worktree(
     Ok(stats_by_path(&subset))
 }
 
-/// Turn the structured conflict records into git's informational messages.
-///
-/// Only the content-merge family is rendered; git's text for those is
-/// reproduced exactly. Any other resolution class — and any content merge over
-/// binary data or symlinks, where git prepends a `warning:` line we cannot
-/// reconstruct — errors out instead of guessing, before anything is written.
-fn render_messages(repo: &gix::Repository, conflicts: &[Conflict]) -> Result<Vec<Message>> {
-    let mut out = Vec::new();
-    for conflict in conflicts {
-        let (ours, theirs) = conflict.changes_in_resolution();
-        let path = ours.location().to_owned();
-        let merged_blob = match &conflict.resolution {
-            Ok(Resolution::OursModifiedTheirsModifiedThenBlobContentMerge { merged_blob }) => {
-                merged_blob
-            }
-            _ => bail!(
-                "conflict at {path} is not a content merge; this conflict class is not ported"
-            ),
-        };
-
-        for change in [ours, theirs] {
-            let (mode, id) = change_state(change);
-            if !mode.is_blob() {
-                bail!("conflict at {path} involves a symlink or submodule; not ported");
-            }
-            if is_binary(repo, &id)? {
-                bail!(
-                    "conflict at {path} is a binary content merge; git's `warning: Cannot merge binary files` line is not ported"
-                );
-            }
-        }
-
-        out.push(Message {
-            text: format!("Auto-merging {path}\n"),
-        });
-        if merged_blob.resolution == gix::merge::blob::Resolution::Conflict {
-            // Both sides adding the same path is reported as `add/add`.
-            let kind = if matches!(ours, Change::Addition { .. })
-                && matches!(theirs, Change::Addition { .. })
-            {
-                "add/add"
-            } else {
-                "content"
-            };
-            out.push(Message {
-                text: format!("CONFLICT ({kind}): Merge conflict in {path}\n"),
-            });
-        }
-    }
-    Ok(out)
-}
-
-/// The post-change mode and id of `change` (the rename destination for rewrites).
-fn change_state(change: &Change) -> (gix::object::tree::EntryMode, ObjectId) {
-    match change {
-        Change::Addition { entry_mode, id, .. }
-        | Change::Deletion { entry_mode, id, .. }
-        | Change::Modification { entry_mode, id, .. }
-        | Change::Rewrite { entry_mode, id, .. } => (*entry_mode, *id),
-    }
-}
-
-/// git's binary heuristic: a NUL byte within the first 8000 bytes of the blob.
-fn is_binary(repo: &gix::Repository, id: &ObjectId) -> Result<bool> {
-    let data = repo.find_object(*id)?.data.clone();
-    let head = &data[..data.len().min(8000)];
-    Ok(head.contains(&0))
-}

@@ -2943,9 +2943,10 @@ struct RebaseState {
     /// new root commit rather than its child. git records the same value in
     /// `$state_dir/squash-onto`.
     squash_onto: Option<ObjectId>,
-    /// `opts.allow_ff` — false under `-f`/`--no-ff`. Recorded as the presence of
-    /// a `no-ff` marker file so a resumed rebase keeps re-committing rather than
-    /// fast-forwarding a pick whose parent is already the tip.
+    /// `opts.allow_ff` — false under `-f`/`--no-ff`. Not persisted: git writes no
+    /// state file for it, so `--continue` after a stop re-derives it from the
+    /// resuming command line (which has no `-f`) and the `signoff`/`cdate_is_adate`/
+    /// `ignore_date` markers alone, and fast-forwards again.
     allow_ff: bool,
     /// `-q`/`--quiet`: no `Rebasing (n/m)` progress and no
     /// `Successfully rebased …` summary. git records the same thing as the
@@ -3171,7 +3172,13 @@ fn write_basic_state(repo: &gix::Repository, st: &RebaseState) -> Result<()> {
             let _ = std::fs::remove_file(dir.join("squash-onto"));
         }
     }
-    marker(&dir, "no-ff", !st.allow_ff)?;
+    // No `no-ff` marker: `write_basic_state()`/`save_opts()` persist `allow_ff` only
+    // for cherry-pick/revert (`options.allow-ff` in `$GIT_DIR/sequencer/opts`,
+    // sequencer.c:3698), never for a rebase. `read_populate_opts()`'s rebase arm
+    // (sequencer.c:3223-3247) reads no such file, so `-f`/`--no-ff` is *forgotten*
+    // across a stop and `--continue` runs with `allow_ff` back on. Measured: after
+    // `git rebase -f -i` stops at a `break`, stock's `--continue` logs
+    // `rebase: fast-forward` twice where writing this marker logs `rebase (pick):`.
     marker(&dir, "quiet", st.quiet)?;
     marker(&dir, "verbose", st.verbose)?;
     marker(&dir, "reschedule-failed-exec", st.reschedule_failed_exec)?;
@@ -3330,12 +3337,12 @@ fn read_basic_state(repo: &gix::Repository) -> Result<RebaseState> {
         squash_onto: read("squash-onto")
             .ok()
             .and_then(|s| ObjectId::from_hex(s.as_bytes()).ok()),
-        // `read_populate_opts()` clears `allow_ff` for each of `signoff`,
-        // `cdate_is_adate` and `ignore_date` as well as for `no-ff`
-        // (sequencer.c:3228-3242), so a resumed rebase keeps re-committing
-        // rather than fast-forwarding a pick whose dates it must rewrite.
-        allow_ff: !dir.join("no-ff").exists()
-            && !dir.join("signoff").exists()
+        // `read_populate_opts()` (sequencer.c:3228-3242) clears `allow_ff` for
+        // exactly three flag files — `signoff`, `cdate_is_adate` and
+        // `ignore_date` — because each of them rewrites a date a fast-forward
+        // would have kept. `-f`/`--no-ff` itself is *not* among them and is
+        // persisted nowhere, so a resumed rebase fast-forwards again.
+        allow_ff: !dir.join("signoff").exists()
             && !dir.join("cdate_is_adate").exists()
             && !dir.join("ignore_date").exists(),
         quiet: dir.join("quiet").exists(),

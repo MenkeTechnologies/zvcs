@@ -9,14 +9,15 @@
 //! standalone history — and then performs the ordinary recursive merge on the
 //! shifted trees.
 //!
-//! Both halves are ported here. The subtree shift ([`shift_tree`],
-//! [`shift_tree_by`], [`match_trees`], [`score_trees`], [`splice_tree`]) is
-//! reimplemented directly from `match-trees.c` on gitoxide's tree
-//! reader/editor. The merge itself reuses the same driver as the sibling
+//! Both halves are ported. The subtree shift is `match-trees.c`'s
+//! `shift_tree`/`shift_tree_by`/`match_trees`/`score_trees`/`splice_tree`,
+//! which live once in [`crate::merge_apply`] and are reached from here through
+//! this module's [`shift_tree_object`] — git has exactly one copy and so does
+//! this port. The merge itself reuses the same driver as the sibling
 //! `merge-recursive` port: `Repository::merge_trees` produces the merged tree
-//! and structured conflicts, which are rendered to git's `Auto-merging` /
-//! `CONFLICT` message strings and written back to the index and worktree with
-//! stage 1/2/3 entries.
+//! and structured conflicts, which [`crate::merge_msg`] renders to git's
+//! `Auto-merging` / `CONFLICT` message strings before they are written back to
+//! the index and worktree with stage 1/2/3 entries.
 //!
 //! `merge_trees_internal()` shifts both `merge` (the remote tree) and
 //! `merge_base` (the ancestor tree) toward `head` before merging, so this
@@ -43,11 +44,11 @@
 //!
 //! Deliberate floors, refused rather than approximated (identical to the
 //! `merge-recursive` port, which shares gitoxide's merge substrate):
-//!   * conflict classes outside the content family (rename/rename,
-//!     rename/delete, modify/delete, directory/file, submodule, binary):
-//!     `gix-merge` reports these under a different taxonomy, so reproducing
-//!     git's message text would mean inventing it — they error before anything
-//!     is written;
+//!   * the conflict classes [`crate::merge_msg`] still cannot name: a gitlink
+//!     content merge (git's `merge_submodule()` diagnostics and its
+//!     `advice.submoduleMergeConflict` hint block are not ported) and
+//!     `gix-merge`'s `Unknown` catch-all where neither side is a plain type
+//!     clash — they error before anything is written;
 //!   * `merge.conflictStyle = diff3|zdiff3`;
 //!   * a dirty index/worktree: git's `unpack_trees` reconciles local changes
 //!     that do not collide; this port requires the index to equal `<head>`'s
@@ -66,20 +67,17 @@
 //! object instead.
 
 use anyhow::{anyhow, bail, Result};
-use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::process::ExitCode;
 use std::sync::atomic::AtomicBool;
 
 use gix::bstr::{BStr, BString, ByteSlice};
-use gix::diff::tree_with_rewrites::Change;
 use gix::hash::ObjectId;
 use gix::index::entry::{Mode, Stat};
 use gix::merge::blob::builtin_driver::text::Labels;
 use gix::merge::tree::apply_index_entries::RemovalMode;
-use gix::merge::tree::{Conflict, Resolution, TreatAsUnresolved};
-use gix::object::tree::{EntryKind, EntryMode};
+use gix::merge::tree::TreatAsUnresolved;
 
 /// Verbatim `builtin_merge_recursive_usage`, already interpolated with the
 /// `merge-subtree` command name that dispatch reaches this module under.
@@ -88,10 +86,6 @@ const USAGE: &str = "usage: git merge-subtree <base>... -- <head> <remote> ...\n
 /// The most merge bases `cmd_merge_recursive` will hold (`ARRAY_SIZE(bases) - 1`).
 const MAX_BASES: usize = 20;
 
-/// One informational message, carrying its own trailing newline.
-struct Message {
-    text: String,
-}
 
 
 /// `o.subtree_shift`, whose default for a `-subtree`-suffixed invocation is the
@@ -264,7 +258,7 @@ pub fn merge_subtree(args: &[String]) -> Result<ExitCode> {
     let repo = renormalized.unwrap_or(repo);
 
     // The same `-X` knobs the porcelain applies, from the same place.
-    let tree_options = crate::merge_apply::tree_merge_options(&repo, &xopts, None)?;
+    let tree_options = crate::merge_apply::tree_merge_options(&repo, &xopts, None, false)?;
 
     let labels = Labels {
         ancestor: ancestor_label.as_deref().map(|s| BStr::new(s.as_bytes())),
@@ -281,18 +275,48 @@ pub fn merge_subtree(args: &[String]) -> Result<ExitCode> {
 
     // Render every message first: an unrenderable conflict class must fail
     // before a single byte of index or worktree is touched.
-    let messages = render_messages(&repo, &outcome.conflicts)?;
+    let messages = crate::merge_msg::render(
+        &repo,
+        &outcome.conflicts,
+        &label1,
+        &label2,
+        crate::merge_msg::Operand1::Tree(head_tree),
+        TreatAsUnresolved::git(),
+        crate::merge_msg::Strictness::Refuse,
+    )?;
 
     // Conservative precondition (documented deviation): the index must equal
     // `<head>`'s tree and the worktree must be clean.
-    ensure_index_matches(&repo, &old_index, head_tree)?;
-    if repo.is_dirty()? {
-        crate::git_fatal!("your local changes would be overwritten by merge; commit or stash them first");
+    // merge-ort's `merge_start()` sanity check: `repo_index_has_changes()`
+    // against `<head>`, which refuses the whole merge — naming the paths, two
+    // spaces in, with no advice line — when the index carries a staged change.
+    let staged = crate::merge_guard::index_changes_from_head(&repo, head_tree, &old_index)?;
+    if !staged.is_empty() {
+        crate::merge_guard::report_index_changes(&staged);
+        return Ok(ExitCode::from(128));
     }
 
     let how = TreatAsUnresolved::git();
     let conflicted = outcome.has_unresolved_conflicts(how);
     let merged_tree = outcome.tree.write()?.detach();
+
+    // `merge_switch_to_result()`'s `checkout()`: an `unpack_trees()` from
+    // `<head>`'s tree to the merged one, which refuses rather than overwrite
+    // local work — but **per path**, so an edit outside the merge's footprint is
+    // not a reason to refuse anything. The blanket `repo.is_dirty()` this
+    // replaced turned any uncommitted edit anywhere in the tree into a refusal,
+    // which made the command unusable in a working repository, and it never
+    // looked at untracked files at all: an untracked file standing where the
+    // merge wanted to write one was silently overwritten at exit 0.
+    //
+    // git checks out *before* it displays the messages (merge-ort.c:4964), so a
+    // refusal here prints only the `unpack_trees` block — the `Auto-merging`
+    // lines belong to a merge that did not happen.
+    let clobber = crate::merge_guard::verify_two_way(&repo, head_tree, merged_tree, &old_index)?;
+    if !clobber.is_empty() {
+        clobber.report("merge");
+        return Ok(ExitCode::from(128));
+    }
 
     let old_stats = stats_by_path(&old_index);
     let written = apply_to_worktree(&repo, &old_stats, merged_tree)?;
@@ -336,326 +360,32 @@ pub fn merge_subtree(args: &[String]) -> Result<ExitCode> {
 
 /// `shift_tree_object()`: shift `two` (the remote or ancestor tree) so it lines
 /// up with `head_tree`, either automatically or by the user-supplied prefix.
+///
+/// The `match-trees.c` port itself lives in [`crate::merge_apply`], shared with
+/// `git merge -Xsubtree`, `merge-recursive` and `merge-tree`, because git has
+/// exactly one — `merge_ort_nonrecursive_internal()` calls
+/// `shift_tree_object()` and every caller reaches it from there. This module
+/// carried a second copy whose `splice_tree()` was written on gitoxide's tree
+/// editor rather than `match-trees.c`'s in-place buffer rewrite: it created any
+/// missing intermediate trees where the C `die()`s, and re-serialized the parent
+/// chain where the C preserves it byte for byte. Neither difference is reachable
+/// from here — both entry points only ever splice at a prefix they have already
+/// confirmed is a tree in `head_tree` — and stock 2.55.0 agrees with both copies
+/// across the `--subtree`, `--subtree=<p>`, trailing-slash, nested, absent and
+/// non-tree prefixes, so the faithful one is the one that survives.
 fn shift_tree_object(
     repo: &gix::Repository,
     head_tree: ObjectId,
     two: ObjectId,
     shift: &SubtreeShift,
 ) -> Result<ObjectId> {
-    match shift {
-        SubtreeShift::Auto => shift_tree(repo, head_tree, two, 0),
-        SubtreeShift::By(prefix) => shift_tree_by(repo, head_tree, two, prefix),
-    }
-}
-
-/// `shift_tree()` from `match-trees.c`: come up with a merge between `hash1` and
-/// `hash2` that keeps a tree shape similar to `hash1`. `hash2` might correspond
-/// to a subtree of `hash1` (prefix it with empty directories) or cover `hash1`
-/// (pick a subtree of it). Returns the shifted `hash2`.
-fn shift_tree(
-    repo: &gix::Repository,
-    hash1: ObjectId,
-    hash2: ObjectId,
-    depth_limit: i32,
-) -> Result<ObjectId> {
-    // NEEDSWORK (git's own comment): the recursion depth is hardcoded to 2.
-    let depth_limit = if depth_limit == 0 { 2 } else { depth_limit };
-
-    let base_score = score_trees(repo, hash1, hash2)?;
-    let mut add_score = base_score;
-    let mut del_score = base_score;
-    let mut add_prefix: Vec<u8> = Vec::new();
-    let mut del_prefix: Vec<u8> = Vec::new();
-
-    // Does one's subtree resemble two? (prefix two with fake trees to match)
-    match_trees(repo, hash1, hash2, &mut add_score, &mut add_prefix, &[], depth_limit)?;
-    // Does two's subtree resemble one? (pick only a subtree of two)
-    match_trees(repo, hash2, hash1, &mut del_score, &mut del_prefix, &[], depth_limit)?;
-
-    if add_score < del_score {
-        // We need to pick a subtree of two.
-        if del_prefix.is_empty() {
-            return Ok(hash2);
-        }
-        return match tree_entry(repo, hash2, &del_prefix)? {
-            Some((oid, _)) => Ok(oid),
-            None => crate::git_fatal!(
-                "cannot find path {} in tree {hash2}",
-                del_prefix.as_bstr()
-            ),
-        };
-    }
-
-    if add_prefix.is_empty() {
-        return Ok(hash2);
-    }
-    splice_tree(repo, hash1, &add_prefix, hash2)
-}
-
-/// `shift_tree_by()` from `match-trees.c`: the user says the trees are shifted
-/// by `shift_prefix`; work out which side to prefix (or unprefix) and do it.
-fn shift_tree_by(
-    repo: &gix::Repository,
-    hash1: ObjectId,
-    hash2: ObjectId,
-    shift_prefix: &[u8],
-) -> Result<ObjectId> {
-    // Can hash2 be a tree at shift_prefix in hash1, and vice versa?
-    let sub1 = tree_entry(repo, hash1, shift_prefix)?
-        .filter(|(_, mode)| mode.is_tree())
-        .map(|(oid, _)| oid);
-    let sub2 = tree_entry(repo, hash2, shift_prefix)?
-        .filter(|(_, mode)| mode.is_tree())
-        .map(|(oid, _)| oid);
-
-    let mut candidate = 0u8;
-    if sub1.is_some() {
-        candidate |= 1;
-    }
-    if sub2.is_some() {
-        candidate |= 2;
-    }
-
-    if candidate == 3 {
-        // Both are plausible -- evaluate the score.
-        let sub1_oid = sub1.expect("candidate bit 1 implies sub1");
-        let sub2_oid = sub2.expect("candidate bit 2 implies sub2");
-        let mut best_score = score_trees(repo, hash1, hash2)?;
-        candidate = 0;
-        let score = score_trees(repo, sub1_oid, hash2)?;
-        if score > best_score {
-            candidate = 1;
-            best_score = score;
-        }
-        let score = score_trees(repo, sub2_oid, hash1)?;
-        if score > best_score {
-            candidate = 2;
-        }
-    }
-
-    if candidate == 0 {
-        // Neither is plausible -- do not shift.
-        return Ok(hash2);
-    }
-    if candidate == 1 {
-        // Shift tree2 down by adding shift_prefix above it to match tree1.
-        return splice_tree(repo, hash1, shift_prefix, hash2);
-    }
-    // candidate == 2: shift tree2 up by removing shift_prefix from it.
-    Ok(sub2.expect("candidate 2 implies sub2 is a tree"))
-}
-
-/// `match_trees()` from `match-trees.c`: match `hash1` itself and each of its
-/// subtrees against `hash2`, keeping the best-scoring prefix. Recurses into
-/// subdirectories up to `recurse_limit` levels.
-fn match_trees(
-    repo: &gix::Repository,
-    hash1: ObjectId,
-    hash2: ObjectId,
-    best_score: &mut i32,
-    best_match: &mut Vec<u8>,
-    base: &[u8],
-    recurse_limit: i32,
-) -> Result<()> {
-    for entry in tree_entries(repo, hash1)? {
-        if !entry.is_dir {
-            continue;
-        }
-        let score = score_trees(repo, entry.oid, hash2)?;
-        if *best_score < score {
-            let mut matched = base.to_vec();
-            matched.extend_from_slice(&entry.name);
-            *best_match = matched;
-            *best_score = score;
-        }
-        if recurse_limit > 0 {
-            let mut newbase = base.to_vec();
-            newbase.extend_from_slice(&entry.name);
-            newbase.push(b'/');
-            match_trees(
-                repo,
-                entry.oid,
-                hash2,
-                best_score,
-                best_match,
-                &newbase,
-                recurse_limit - 1,
-            )?;
-        }
-    }
-    Ok(())
-}
-
-/// `splice_tree()` from `match-trees.c`: tree `oid1` has a subdirectory at
-/// `prefix`; produce a new tree that replaces it with `oid2`. gitoxide's tree
-/// editor performs the same rewrite, creating any intermediate trees.
-fn splice_tree(
-    repo: &gix::Repository,
-    oid1: ObjectId,
-    prefix: &[u8],
-    oid2: ObjectId,
-) -> Result<ObjectId> {
-    let mut editor = repo.edit_tree(oid1)?;
-    // `upsert` splits the path on '/' itself (ToComponents for &BStr), creating
-    // any intermediate trees — same as splice_tree() building the parent chain.
-    editor.upsert(BStr::new(prefix), EntryKind::Tree, oid2)?;
-    Ok(editor.write()?.detach())
-}
-
-/// `score_trees()` from `match-trees.c`: walk two trees in git's canonical order
-/// and accumulate a similarity score. Entries missing on one side, present but
-/// differing, or matching are scored per git's `score_missing`/`score_differs`/
-/// `score_matches`.
-fn score_trees(repo: &gix::Repository, hash1: ObjectId, hash2: ObjectId) -> Result<i32> {
-    let one = tree_entries(repo, hash1)?;
-    let two = tree_entries(repo, hash2)?;
-    let mut i = 0usize;
-    let mut j = 0usize;
-    let mut score = 0i32;
-    loop {
-        let cmp = if i < one.len() && j < two.len() {
-            base_name_compare(&one[i].name, one[i].is_dir, &two[j].name, two[j].is_dir)
-        } else if i < one.len() {
-            // two lacks this entry
-            Ordering::Less
-        } else if j < two.len() {
-            // two has more entries
-            Ordering::Greater
-        } else {
-            break;
-        };
-        match cmp {
-            Ordering::Less => {
-                score += score_missing(one[i].is_dir, one[i].is_link);
-                i += 1;
-            }
-            Ordering::Greater => {
-                score += score_missing(two[j].is_dir, two[j].is_link);
-                j += 1;
-            }
-            Ordering::Equal => {
-                if one[i].oid != two[j].oid {
-                    score += score_differs(
-                        one[i].is_dir,
-                        one[i].is_link,
-                        two[j].is_dir,
-                        two[j].is_link,
-                    );
-                } else {
-                    score += score_matches(
-                        one[i].is_dir,
-                        one[i].is_link,
-                        two[j].is_dir,
-                        two[j].is_link,
-                    );
-                }
-                i += 1;
-                j += 1;
-            }
-        }
-    }
-    Ok(score)
-}
-
-/// `score_missing()`: penalty for a path present on one side only.
-fn score_missing(is_dir: bool, is_link: bool) -> i32 {
-    if is_dir {
-        -1000
-    } else if is_link {
-        -500
-    } else {
-        -50
-    }
-}
-
-/// `score_differs()`: penalty for a path present on both sides but differing.
-fn score_differs(dir1: bool, link1: bool, dir2: bool, link2: bool) -> i32 {
-    if dir1 != dir2 {
-        -100
-    } else if link1 != link2 {
-        -50
-    } else {
-        -5
-    }
-}
-
-/// `score_matches()`: reward for a path identical on both sides.
-fn score_matches(dir1: bool, link1: bool, dir2: bool, link2: bool) -> i32 {
-    if dir1 != dir2 {
-        -100
-    } else if link1 != link2 {
-        -50
-    } else if dir1 {
-        1000
-    } else if link1 {
-        500
-    } else {
-        250
-    }
-}
-
-/// One decoded tree entry, materialised so the borrow on the tree buffer ends.
-struct TreeEntry {
-    name: Vec<u8>,
-    is_dir: bool,
-    is_link: bool,
-    oid: ObjectId,
-}
-
-/// The entries of `tree` in git's canonical (stored) order. The empty tree
-/// yields no entries even when it is not physically present in the object db.
-fn tree_entries(repo: &gix::Repository, tree: ObjectId) -> Result<Vec<TreeEntry>> {
-    if tree == ObjectId::empty_tree(repo.object_hash()) {
-        return Ok(Vec::new());
-    }
-    let tree = repo.find_tree(tree)?;
-    let decoded = tree.decode()?;
-    Ok(decoded
-        .entries
-        .iter()
-        .map(|e| TreeEntry {
-            name: e.filename.to_vec(),
-            is_dir: e.mode.is_tree(),
-            is_link: e.mode.is_link(),
-            oid: e.oid.to_owned(),
-        })
-        .collect())
-}
-
-/// `get_tree_entry()`: look up `path` (slash-separated) in `tree`, returning the
-/// entry's object id and mode, or `None` when the path is absent.
-fn tree_entry(
-    repo: &gix::Repository,
-    tree: ObjectId,
-    path: &[u8],
-) -> Result<Option<(ObjectId, EntryMode)>> {
-    let tree = repo.find_tree(tree)?;
-    let components: Vec<&[u8]> = path.split(|b| *b == b'/').collect();
-    Ok(tree
-        .lookup_entry(components)?
-        .map(|e| (e.object_id(), e.mode())))
-}
-
-/// git's `base_name_compare`: compare two tree entry names, treating a directory
-/// as if its name had a trailing `/`.
-fn base_name_compare(name1: &[u8], dir1: bool, name2: &[u8], dir2: bool) -> Ordering {
-    let len = name1.len().min(name2.len());
-    match name1[..len].cmp(&name2[..len]) {
-        Ordering::Equal => {}
-        other => return other,
-    }
-    trailing_byte(name1, len, dir1).cmp(&trailing_byte(name2, len, dir2))
-}
-
-/// The byte git compares past the shared prefix: the next name byte, or `/` for
-/// a directory whose name ended exactly at `len`.
-fn trailing_byte(name: &[u8], len: usize, is_dir: bool) -> u8 {
-    let c = name.get(len).copied().unwrap_or(0);
-    if c == 0 && is_dir {
-        b'/'
-    } else {
-        c
-    }
+    // `merge_apply`'s entry point takes git's own `o.subtree_shift` string, whose
+    // empty value *is* the automatic mode.
+    let prefix: &[u8] = match shift {
+        SubtreeShift::Auto => b"",
+        SubtreeShift::By(prefix) => prefix,
+    };
+    crate::merge_apply::shift_tree_object(repo, head_tree, two, prefix.as_bstr())
 }
 
 /// `repo_get_oid()` as this command needs it: a full-length hex id is accepted
@@ -699,26 +429,6 @@ fn better_branch_name(branch: &str) -> String {
 }
 
 
-/// Refuse to merge unless the index is exactly `head_tree` — the state git's
-/// `unpack_trees` pass is guaranteed to accept.
-fn ensure_index_matches(
-    repo: &gix::Repository,
-    index: &gix::index::File,
-    head_tree: ObjectId,
-) -> Result<()> {
-    let expected = repo.index_from_tree(&head_tree)?;
-    let key = |file: &gix::index::File| -> Vec<(BString, ObjectId, Mode)> {
-        let backing = file.path_backing();
-        file.entries()
-            .iter()
-            .map(|e| (e.path_in(backing).to_owned(), e.id, e.mode))
-            .collect()
-    };
-    if key(index) != key(&expected) {
-        bail!("the index does not match <head>; staged changes are not supported by this port");
-    }
-    Ok(())
-}
 
 /// Index entries keyed by path, carrying the id, mode and stat data.
 fn stats_by_path(index: &gix::index::File) -> HashMap<BString, (ObjectId, Mode, Stat)> {
@@ -786,75 +496,6 @@ fn apply_to_worktree(
     }
 
     Ok(stats_by_path(&subset))
-}
-
-/// Turn the structured conflict records into git's informational messages.
-///
-/// Only the content-merge family is rendered; git's text for those is
-/// reproduced exactly. Any other resolution class — and any content merge over
-/// binary data or symlinks, where git prepends a `warning:` line we cannot
-/// reconstruct — errors out instead of guessing, before anything is written.
-fn render_messages(repo: &gix::Repository, conflicts: &[Conflict]) -> Result<Vec<Message>> {
-    let mut out = Vec::new();
-    for conflict in conflicts {
-        let (ours, theirs) = conflict.changes_in_resolution();
-        let path = ours.location().to_owned();
-        let merged_blob = match &conflict.resolution {
-            Ok(Resolution::OursModifiedTheirsModifiedThenBlobContentMerge { merged_blob }) => {
-                merged_blob
-            }
-            _ => bail!(
-                "conflict at {path} is not a content merge; this conflict class is not ported"
-            ),
-        };
-
-        for change in [ours, theirs] {
-            let (mode, id) = change_state(change);
-            if !mode.is_blob() {
-                bail!("conflict at {path} involves a symlink or submodule; not ported");
-            }
-            if is_binary(repo, &id)? {
-                bail!(
-                    "conflict at {path} is a binary content merge; git's `warning: Cannot merge binary files` line is not ported"
-                );
-            }
-        }
-
-        out.push(Message {
-            text: format!("Auto-merging {path}\n"),
-        });
-        if merged_blob.resolution == gix::merge::blob::Resolution::Conflict {
-            // Both sides adding the same path is reported as `add/add`.
-            let kind = if matches!(ours, Change::Addition { .. })
-                && matches!(theirs, Change::Addition { .. })
-            {
-                "add/add"
-            } else {
-                "content"
-            };
-            out.push(Message {
-                text: format!("CONFLICT ({kind}): Merge conflict in {path}\n"),
-            });
-        }
-    }
-    Ok(out)
-}
-
-/// The post-change mode and id of `change` (the rename destination for rewrites).
-fn change_state(change: &Change) -> (gix::object::tree::EntryMode, ObjectId) {
-    match change {
-        Change::Addition { entry_mode, id, .. }
-        | Change::Deletion { entry_mode, id, .. }
-        | Change::Modification { entry_mode, id, .. }
-        | Change::Rewrite { entry_mode, id, .. } => (*entry_mode, *id),
-    }
-}
-
-/// git's binary heuristic: a NUL byte within the first 8000 bytes of the blob.
-fn is_binary(repo: &gix::Repository, id: &ObjectId) -> Result<bool> {
-    let data = repo.find_object(*id)?.data.clone();
-    let head = &data[..data.len().min(8000)];
-    Ok(head.contains(&0))
 }
 
 #[cfg(test)]
@@ -977,32 +618,4 @@ mod tests {
         assert_eq!(score("%"), 0);
     }
 
-    #[test]
-    fn base_name_compare_treats_dirs_as_slash_suffixed() {
-        // A directory "a" sorts after a file "a" (git compares it as "a/").
-        assert_eq!(base_name_compare(b"a", false, b"a", true), Ordering::Less);
-        assert_eq!(base_name_compare(b"a", true, b"a", false), Ordering::Greater);
-        assert_eq!(base_name_compare(b"a", true, b"a", true), Ordering::Equal);
-        // "ab" sorts after "a" regardless of kind.
-        assert_eq!(base_name_compare(b"ab", false, b"a", false), Ordering::Greater);
-        assert_eq!(base_name_compare(b"a", false, b"ab", false), Ordering::Less);
-    }
-
-    #[test]
-    fn tree_similarity_scores_match_git() {
-        // score_missing
-        assert_eq!(score_missing(true, false), -1000);
-        assert_eq!(score_missing(false, true), -500);
-        assert_eq!(score_missing(false, false), -50);
-        // score_differs
-        assert_eq!(score_differs(true, false, false, false), -100);
-        assert_eq!(score_differs(false, true, false, false), -50);
-        assert_eq!(score_differs(false, false, false, false), -5);
-        // score_matches
-        assert_eq!(score_matches(true, false, false, false), -100);
-        assert_eq!(score_matches(false, true, false, false), -50);
-        assert_eq!(score_matches(true, false, true, false), 1000);
-        assert_eq!(score_matches(false, true, false, true), 500);
-        assert_eq!(score_matches(false, false, false, false), 250);
-    }
 }

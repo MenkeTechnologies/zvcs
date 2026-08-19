@@ -544,6 +544,14 @@ fn rebase_committer_date_is_author_date_composes_with_reset() {
 /// directory, because `--continue` re-reads it (sequencer.c:3239-3242) and also
 /// re-clears `allow_ff` from it. Without the marker a resumed rebase would leave
 /// the remaining commits with their original dates.
+///
+/// The other half is that `allow_ff` itself is *not* recorded. `read_populate_opts()`'s
+/// rebase arm clears it from exactly three flag files — `signoff`, `cdate_is_adate`,
+/// `ignore_date` — and `-f`/`--no-ff` is persisted nowhere (`save_opts()`'s
+/// `options.allow-ff` at sequencer.c:3698 is cherry-pick/revert state, in
+/// `$GIT_DIR/sequencer/opts`). Measured against stock: `rebase --reset-author-date`,
+/// `rebase -f` and `rebase --signoff` all stop with no `no-ff` file, and a
+/// `--continue` after `rebase -f` logs `rebase: fast-forward` again.
 #[test]
 fn reset_author_date_survives_into_the_state_directory() {
     let fx = fixture("statefile");
@@ -561,8 +569,8 @@ fn reset_author_date_survives_into_the_state_directory() {
         "the option is recorded for --continue"
     );
     assert!(
-        fx.git_path("rebase-merge/no-ff").exists(),
-        "--reset-author-date implies REBASE_FORCE, so allow_ff is off"
+        !fx.git_path("rebase-merge/no-ff").exists(),
+        "git persists allow_ff for cherry-pick/revert only, never for a rebase"
     );
 }
 

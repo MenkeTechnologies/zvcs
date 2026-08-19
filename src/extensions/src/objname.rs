@@ -318,6 +318,100 @@ pub fn warn_ambiguous_operand(repo: &gix::Repository, name: &str, flags: OidFlag
     false
 }
 
+/// `repo_peel_to_type()`'s `error()` (`object-name.c:897-903`) for a `^{<type>}`
+/// operand that cannot be peeled that far, or `None` when the operand peels or is
+/// not a peel at all.
+///
+/// ```c
+/// while (1) {
+///         if (!o || (!o->parsed && !parse_object(r, &o->oid)))
+///                 return NULL;
+///         if (expected_type == OBJ_ANY || o->type == expected_type)
+///                 return o;
+///         if (o->type == OBJ_TAG)
+///                 o = ((struct tag*) o)->tagged;
+///         else if (o->type == OBJ_COMMIT)
+///                 o = &(repo_get_commit_tree(r, ((struct commit *)o))->object);
+///         else {
+///                 if (name)
+///                         error("%.*s: expected %s type, but the object "
+///                               "dereferences to %s type",
+///                               namelen, name, type_name(expected_type),
+///                               type_name(o->type));
+///                 return NULL;
+///         }
+/// }
+/// ```
+///
+/// The dereference chain always ends at a tree — a tag peels to its target, a
+/// commit peels to its tree, and a tree has nowhere left to go — so *every*
+/// unreachable type reports `dereferences to tree type`, whatever the operand
+/// named. Stock 2.55.0: `main^{blob}`, `v1.0^{blob}` and `lightweight^{tag}` all
+/// print exactly that.
+///
+/// The name in the message is `peel_onion()`'s whole `name`/`len`, i.e. the
+/// operand *including* its `^{…}` suffix, not the base.
+///
+/// Callers emit this once per failed resolution. git resolves a failing operand
+/// twice on the commands that end in `die_verify_filename()`, which is why stock
+/// `git rev-parse main^{blob}` prints the line twice while `git cat-file -t
+/// main^{blob}` — no `verify_filename()` — prints it once.
+pub fn peel_type_error(repo: &gix::Repository, name: &str) -> Option<String> {
+    // `if (len < 4 || name[len-1] != '}') return -1;`
+    if name.len() < 4 || !name.ends_with('}') {
+        return None;
+    }
+    // `for (sp = name + len - 1; name <= sp; sp--) if (ch == '{' && name < sp && sp[-1] == '^') break;`
+    let bytes = name.as_bytes();
+    let open = (1..bytes.len()).rev().find(|&i| bytes[i] == b'{' && bytes[i - 1] == b'^')?;
+    let sp = &name[open + 1..];
+    let want = if sp.starts_with("commit}") {
+        "commit"
+    } else if sp.starts_with("tag}") {
+        "tag"
+    } else if sp.starts_with("tree}") {
+        "tree"
+    } else if sp.starts_with("blob}") {
+        "blob"
+    } else {
+        // `^{object}` is OBJ_ANY, `^{}` peels tags only, `^{/<text>}` is a
+        // committish search — none of the three can reach the `error()`.
+        return None;
+    };
+    let base = &name[..open - 1];
+    // `peel_onion()` resolves its base with `get_oid_1()`, which has no case for
+    // the `<rev>:<path>` / `:<n>:<path>` grammar — that lives one level up, in
+    // `get_oid_with_context_1()`. So `main:base.txt^{tree}` never reaches
+    // `repo_peel_to_type()` at all: the base fails to resolve and the whole name
+    // falls through to the path arm, where stock reports
+    // `path 'base.txt^{tree}' does not exist in 'main'` with no `error:` line.
+    if !matches!(crate::objpath::split(base), crate::objpath::Split::Rev) {
+        return None;
+    }
+    let mut id = resolve_quiet(repo, base)?;
+    loop {
+        let object = repo.find_object(id).ok()?;
+        let kind = match object.kind {
+            gix::object::Kind::Commit => "commit",
+            gix::object::Kind::Tag => "tag",
+            gix::object::Kind::Tree => "tree",
+            gix::object::Kind::Blob => "blob",
+        };
+        if kind == want {
+            return None;
+        }
+        match object.kind {
+            gix::object::Kind::Tag => id = object.into_tag().decode().ok()?.target(),
+            gix::object::Kind::Commit => id = object.into_commit().tree_id().ok()?.detach(),
+            _ => {
+                return Some(format!(
+                    "{name}: expected {want} type, but the object dereferences to {kind} type"
+                ))
+            }
+        }
+    }
+}
+
 /// `!get_short_oid(r, str, len, &tmp_oid, GET_OID_QUIETLY)`: whether the name is
 /// also a hex prefix that picks out exactly one object.
 ///
@@ -618,7 +712,64 @@ pub fn resolve_quiet(repo: &gix::Repository, spec: &str) -> Option<ObjectId> {
     if is_reflog_operand(spec) {
         return reflog_oid(repo, spec);
     }
-    repo.rev_parse_single(canonical_at_marks(spec).as_ref()).ok().map(|id| id.detach())
+    repo.rev_parse_single(canonical_spec(repo, spec).as_ref()).ok().map(|id| id.detach())
+}
+
+/// The operand as gitoxide's revspec parser needs to see it: `@{u}`-family marks
+/// case-folded ([`canonical_at_marks`]) and any `./`/`../` path arm rewritten
+/// root-relative ([`crate::objpath::canonical_paths`]).
+///
+/// Both are rewrites git performs *inside* `get_oid()` — `at_mark()` compares
+/// case-insensitively and `resolve_relative_path()` runs before the index or the
+/// tree is consulted — so every site that hands a raw argv operand to
+/// `rev_parse_single` needs this first. A path arm that climbs out of the work
+/// tree is left as written; it then fails to resolve, and
+/// [`crate::objpath::misspelt_object_name`] supplies git's `is outside
+/// repository` message.
+pub fn canonical_spec<'a>(
+    repo: &gix::Repository,
+    spec: &'a str,
+) -> std::borrow::Cow<'a, str> {
+    // `repo_interpret_branch_name()` runs first in `get_oid_basic()`, and its
+    // `@{u}` rewrite reaches an upstream gitoxide's parser cannot: with
+    // `branch.<name>.remote = .` the upstream is `branch.<name>.merge` itself, a
+    // *local* ref, so there is no remote-tracking ref to look up. Stock 2.55.0
+    // answers `git rev-parse main@{u}` with the merge ref's id there;
+    // `rev_parse_single()` refuses the operand outright.
+    //
+    // Applying the rewrite unconditionally is what the C does, and it is a no-op
+    // for the ordinary case: the parser is handed `refs/remotes/origin/main`
+    // instead of `main@{u}` and resolves the same object. The *name* the caller
+    // echoes is untouched, so `--abbrev-ref main@{u}` still shortens the operand
+    // git's way.
+    if let Some(Ok(rewritten)) = interpret_branch_name(repo, spec) {
+        return std::borrow::Cow::Owned(
+            canonical_spec(repo, &rewritten).into_owned(),
+        );
+    }
+    match crate::objpath::canonical_paths(repo, spec) {
+        Ok(std::borrow::Cow::Borrowed(s)) => canonical_at_marks(s),
+        Ok(std::borrow::Cow::Owned(s)) => {
+            std::borrow::Cow::Owned(canonical_at_marks(&s).into_owned())
+        }
+        Err(_) => canonical_at_marks(spec),
+    }
+}
+
+/// Whether `spec` names an object `handle_commit()` (`revision.c`) declines to
+/// turn into a commit — a tree or a blob.
+///
+/// Both arms pend the object and `return NULL`, so the operand is *claimed*: it
+/// contributes no commit, it is not an error, and it still counts towards
+/// `revs->pending.nr`. That last part is what keeps `git shortlog main^{tree}`
+/// from falling through to the "no revisions given, read stdin" branch.
+pub fn names_non_commit(repo: &gix::Repository, spec: &str) -> bool {
+    let bare = spec.strip_prefix('^').unwrap_or(spec);
+    let Some(id) = resolve_quiet(repo, bare) else {
+        return false;
+    };
+    repo.find_object(id)
+        .is_ok_and(|o| matches!(o.kind, gix::object::Kind::Tree | gix::object::Kind::Blob))
 }
 
 /// `spec` with every `@{u}`/`@{upstream}`/`@{push}` mark folded to the spelling

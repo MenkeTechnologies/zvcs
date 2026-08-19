@@ -4253,6 +4253,7 @@ name = "zvcs"
 version = "0.21.0"
 dependencies = [
  "anyhow",
+ "encoding_rs",
  "gix",
  "ignore",
  "libc",

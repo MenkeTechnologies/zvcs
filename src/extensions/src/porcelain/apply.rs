@@ -21,8 +21,9 @@
 //!     `-N`/`--intent-to-add` (see below), `-C<n>` (see below),
 //!     `--unsafe-paths` (see below), `--inaccurate-eof` (see below),
 //!     `--build-fake-ancestor=<file>` (see below),
-//!     `--allow-overlap` (accepted; hunks are placed sequentially here, so there is
-//!     nothing for it to relax),
+//!     `--allow-overlap` (`state->allow_overlap`: the lines a fragment writes are no
+//!     longer marked `LINE_PATCHED`, so a later fragment of the same patch may match
+//!     against text the patch itself produced — apply.c:2650, :2969),
 //!     `--binary`/`--allow-binary-replacement` (accepted, no-op as in modern
 //!     git), `-v`/`-q` (git's `OPT__VERBOSITY` counter, so `-v -q` is silent and
 //!     `-q -v` is verbose), `--whitespace=<action>` (every action but `fix` under a
@@ -76,8 +77,9 @@
 //! whole index is written once, under the repo lock. `--index` additionally writes
 //! the worktree (the engine's usual write) and, matching git's `verify_index_match`
 //! gate, refuses (`does not match index`) when the worktree file's content differs
-//! from the index blob; git would instead check the file out when it is missing,
-//! which this port floors by refusing rather than silently diverging. `--cached`
+//! from the index blob. A file that is *missing* is checked out of the index instead
+//! (`checkout_target`, apply.c:3485) — during the check pass, so `--check --index`
+//! recreates it too — and the patch then applies to it. `--cached`
 //! skips every worktree read, check, and write. `--reject` composes with both, as it
 //! does in git: the pre-image still comes from the index, a cleanly applied patch is
 //! still staged, and a run that rejected *anything* rolls the whole index update
@@ -151,13 +153,22 @@
 //! Not implemented — these `bail!` rather than produce plausible-looking wrong
 //! results: copy patches and non-UTF-8 paths.
 //!
-//! Two known divergences that are not about options. Several patch files on one
-//! command line are read into a single buffer here, while `apply_all_patches()` runs
-//! `apply_patch()` once per file, so git's atomicity is per *file*: with
-//! `git apply good.patch bad.patch`, git writes `good.patch`'s result and then fails,
-//! and this port writes nothing. And `git_header_names` accepts a `diff --git` line
-//! whose two names differ only by a doubled slash (`a/sub//x b/sub//x`), where git's
-//! `git_header_name()` refuses it with `bad git-diff - inconsistent new filename`.
+//! One known divergence that is not about options. Several patch files on one command
+//! line are read into a single buffer here, while `apply_all_patches()` (apply.c:5102)
+//! runs `apply_patch()` once per file, so git's unit of atomicity is the *file*.
+//! Measured consequences, all of them in the multiple-operand case only:
+//!
+//! * `git apply good.patch bad.patch` writes `good.patch`'s result in git and then
+//!   fails; nothing is written here. Same for a second operand that cannot even be
+//!   opened.
+//! * `--stat`/`--numstat`/`--summary` print one report per patch file in git — so two
+//!   operands produce two `N files changed` footers — and one combined report here.
+//! * `--reject` interleaves `Checking patch …` / `Applied patch … cleanly.` per file
+//!   in git, because each file runs its own check-then-write pass; here every check
+//!   runs before every write.
+//!
+//! The index is *not* part of this: `apply_all_patches()` writes it once after the
+//! last file (apply.c:5173), which is what this does too.
 //!
 //! Running below the worktree root behaves as git does. `setup_git_directory()`
 //! leaves the command at the top of the worktree and hands it the invocation
@@ -209,12 +220,31 @@
 //! bytes.
 //!
 //! Whitespace errors are checked before anything is written, as `check_whitespace()`
-//! does: every added line goes through `ws_check()` under `core.whitespace`, the first
-//! five offenders are reported as `<patch>:<line>: <error>.` followed by the line, and
-//! the rest are summarised (`squelched <n> whitespace errors`). `warn` (the default)
-//! then applies anyway, `nowarn` counts silently, and `error`/`error-all` refuse the
-//! whole patch with `error: <n> lines add whitespace errors.` and exit 128. A
-//! `whitespace` *attribute* would refine the rule per path; only the config is read.
+//! does: every added line goes through `ws_check()` under `core.whitespace`, and the
+//! first five offenders are reported as `<patch>:<line>: <error>.` followed by the
+//! line. `warn` (the default) then applies anyway, `nowarn` says nothing at all —
+//! `parse_fragment()` skips the check under it, so even the trailing summary is gone
+//! (apply.c:1867-1869) — and `error`/`error-all` refuse the whole patch with
+//! `error: <n> lines add whitespace errors.` and exit 128. A `whitespace` *attribute*
+//! would refine the rule per path; only the config is read.
+//!
+//! Three details of that carry the observable weight:
+//!
+//! * **`patch->ws_rule` is per patch and evolves as the fragment is read.**
+//!   `check_old_for_crlf()` (apply.c:1716) ORs in `WS_CR_AT_EOL` the moment a context
+//!   or removed line ends `\r\n`, so a CRLF patch's added lines stop being
+//!   trailing-whitespace errors — but only the ones *after* that line. Under `-R` the
+//!   roles invert (apply.c:1855-1869), which [`Patch::reverse`] expresses by flipping
+//!   the body markers.
+//! * **`set_default_whitespace_mode()` (apply.c:193-197)** turns an unchosen action
+//!   into `nowarn` whenever `state->apply` is off, so `--check`, `--stat`,
+//!   `--numstat`, `--summary` and `--build-fake-ancestor` say nothing about
+//!   whitespace at all unless `--whitespace=`/`apply.whitespace` asks them to.
+//! * **The counts print last.** `squelched <n> whitespace errors` and the
+//!   `<n> lines add whitespace errors.` line live in `apply_all_patches()`'s tail
+//!   (apply.c:5141-5171), past both `write_out_results()` and the `end:` label — so
+//!   under `--reject` they follow `Applied patch <name> cleanly.`, and a run whose
+//!   patch did not apply prints neither.
 //!
 //! A fragment that `parse_fragment()` rejects — a header the `@@ -a,b +c,d @@`
 //! grammar does not accept, a body that runs out before the header's counts are
@@ -231,13 +261,21 @@
 //! Config: `apply.whitespace` is read as the default `--whitespace` action, the
 //! same as git — the command line overrides it. A `warn`/`nowarn` default is the
 //! same no-op; a `fix` default is honoured for git's default rule set and refused
-//! beyond it, exactly as the flag is; an invalid value there is fatal (128) at startup
-//! (and `--no-whitespace`, which trips `BUG_ON_OPT_NEG` and aborts git with exit 134,
-//! is accepted here as a no-op instead), before the patch is opened and
-//! ahead of any `--whitespace` on the command line, matching git's config parse
-//! order. `apply.ignoreWhitespace` is read straight after it, as git does: `change`
-//! turns the relaxed match on, `no`/`false`/`never`/`none` off, and any other value
-//! is the same startup fatal (`unrecognized whitespace ignore option '<v>'`, 128).
+//! beyond it, exactly as the flag is; an invalid value there is fatal (128) at startup,
+//! before the patch is opened and ahead of any `--whitespace` on the command line,
+//! matching git's config parse order. `apply.ignoreWhitespace` is read straight after
+//! it, as git does: `change` turns the relaxed match on, `no`/`false`/`never`/`none`
+//! off, and any other value is the same startup fatal (`unrecognized whitespace
+//! ignore option '<v>'`, 128).
+//!
+//! Two spellings are accepted here as no-ops where git kills itself: `--no-whitespace`
+//! and `--no-directory`. Both are `OPT_CALLBACK` entries (apply.c:5253, :5277) whose
+//! table entry is missing `PARSE_OPT_NONEG` while the callback opens with
+//! `BUG_ON_OPT_NEG(unset)` (apply.c:5067, :5080) — so parse-options accepts the
+//! negation, hands it to the callback, and git aborts on `BUG:` with SIGABRT and exit
+//! 134. Measured; these are the *only* two of apply's thirty-odd `--no-` spellings
+//! that do it. Reproducing a self-detected programmer error as a crash is not parity
+//! in any useful sense, so the flags are ignored instead.
 //!
 //! `-q`/`--quiet` silences every `error:` diagnostic, matching git, where they
 //! all go through `error()`; exit codes are unaffected, and `fatal:` messages and
@@ -434,6 +472,10 @@ struct Opts {
     /// `--whitespace=<action>` / `apply.whitespace`, for the actions this port runs
     /// itself. `fix`/`strip` never reach here — they are deferred as unsupported.
     ws: WsAction,
+    /// `state->whitespace_option || apply_default_whitespace` — whether the action
+    /// above was *chosen* rather than defaulted. `set_default_whitespace_mode()`
+    /// (apply.c:193-197) only reaches an unchosen one.
+    ws_given: bool,
     strip: usize,               // -p<n>: leading path components to drop (default 1)
     /// `state->p_value_known`: `-p<n>` appeared, so a traditional patch may not
     /// infer its own value through `guess_p_value()`.
@@ -442,6 +484,10 @@ struct Opts {
     /// apply as written. `None` is git's default of keeping every context line.
     p_context: Option<usize>,
     reverse: bool,              // -R/--reverse: swap pre- and post-image
+    /// `state->allow_overlap` (apply.c:5268): stop marking the lines a fragment wrote
+    /// with `LINE_PATCHED`, so a later fragment of the same patch may match text this
+    /// patch itself produced.
+    allow_overlap: bool,
     check: bool,                // --check: validate only, never write
     numstat: bool,              // --numstat: machine-readable added/deleted counts
     stat: bool,                 // --stat: git's scaled diffstat graph
@@ -524,10 +570,12 @@ impl Default for Opts {
         Opts {
             // git's default is `warn`.
             ws: WsAction::Warn,
+            ws_given: false,
             p_context: None,
             strip: 1,
             strip_explicit: false,
             reverse: false,
+            allow_overlap: false,
             check: false,
             numstat: false,
             stat: false,
@@ -672,10 +720,7 @@ fn parse_opts(
                 "reject" => o.reject = !neg,
                 "recount" => o.recount = !neg,
                 "apply" => o.apply_override = Some(!neg),
-                // `--allow-overlap` relaxes git's already-applied/overlap detection,
-                // which this port has no equivalent of — hunks are placed
-                // sequentially — so accepting it changes nothing.
-                "allow-overlap" => {}
+                "allow-overlap" => o.allow_overlap = !neg,
                 // `OPT_BOOL_F(..., PARSE_OPT_NOCOMPLETE)` (apply.c:5230): hidden from
                 // completion, but an ordinary boolean, so `--no-unsafe-paths` resolves
                 // and turns it back off.
@@ -683,6 +728,12 @@ fn parse_opts(
                 // `apply_option_parse_directory()` (apply.c:5075) normalises the root
                 // as it is parsed and fails the whole invocation when it cannot,
                 // before any patch file is opened.
+                //
+                // `--no-directory` is the second of apply's two `BUG_ON_OPT_NEG`
+                // spellings (apply.c:5080, table entry at :5277 missing
+                // `PARSE_OPT_NONEG`): stock aborts with `BUG: apply.c:5080: option
+                // callback does not expect negation` and exit 134. Clearing the root
+                // is the reading a user typing it would want, and is what this does.
                 "directory" => {
                     if neg {
                         o.directory = None;
@@ -712,7 +763,10 @@ fn parse_opts(
                         action @ (WsAction::Silent
                         | WsAction::Warn
                         | WsAction::Error
-                        | WsAction::Fix) => o.ws = action,
+                        | WsAction::Fix) => {
+                            o.ws = action;
+                            o.ws_given = true;
+                        }
                         WsAction::Invalid => {
                             eprintln!("error: unrecognized whitespace option '{v}'");
                             return Err(ExitCode::from(129));
@@ -863,6 +917,23 @@ fn parse_opts(
     // earlier `--apply`; on its own it leaves the default alone.
     o.apply = o.apply_override.unwrap_or(false)
         || !(o.check || o.numstat || o.stat || o.summary || o.fake_ancestor.is_some());
+
+    // `set_default_whitespace_mode()` (apply.c:193-197), which `apply_all_patches()`
+    // calls once per operand before `apply_patch()` (apply.c:5125):
+    //
+    //     if (!state->whitespace_option && !apply_default_whitespace)
+    //             state->ws_error_action = (state->apply ? warn_on_ws_error
+    //                                                    : nowarn_ws_error);
+    //
+    // So a run that is not going to *write* anything says nothing about whitespace
+    // either: `--check`, `--stat`, `--numstat`, `--summary` and
+    // `--build-fake-ancestor` all clear `state->apply`, and the unchosen action then
+    // becomes `nowarn`. Measured against stock — `git apply --check` on a patch with
+    // eight trailing-whitespace lines prints not one of them. An explicit
+    // `--whitespace=warn` (or `apply.whitespace`) opts back in.
+    if !o.ws_given {
+        o.ws = if o.apply { WsAction::Warn } else { WsAction::Silent };
+    }
     Ok(())
 }
 
@@ -881,7 +952,8 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
             let v = v.to_str_lossy();
             match classify_whitespace(&v) {
                 action @ (WsAction::Silent | WsAction::Warn | WsAction::Error | WsAction::Fix) => {
-                    o.ws = action
+                    o.ws = action;
+                    o.ws_given = true;
                 }
                 WsAction::Invalid => {
                     eprintln!("error: unrecognized whitespace option '{v}'");
@@ -1066,6 +1138,12 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
         patches.retain(|p| use_patch(p, &prefix, &o.limits, o.has_include));
     }
 
+    // `state->whitespace_error`, which `apply_all_patches()` summarises only once
+    // every input file has been through `apply_patch()` (apply.c:5141-5171). Carried
+    // out here so the summary can print where git prints it: *after* the write, and
+    // not at all when the run failed (a `goto end` jumps clean over the block).
+    let mut ws_errors = 0usize;
+
     // `check_whitespace()`: every added line is checked before anything is written,
     // so `--whitespace=error` refuses the patch with the worktree untouched. The rule
     // comes from `core.whitespace`; a `whitespace` attribute would refine it per path,
@@ -1086,44 +1164,25 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
         let errors = report_whitespace(&patches, &spans, rule, &o.ws, o.quiet());
         if matches!(o.ws, WsAction::Fix) {
             for p in &mut patches {
-                for h in &mut p.hunks {
-                    for (_, post_idx) in &h.added_at {
-                        if let Some(line) = h.post.get_mut(*post_idx) {
-                            if super::diff_files::ws_check(line, rule) != 0 {
-                                *line = ws_fix_default(line);
-                            }
+                let targets = ws_targets(p, rule);
+                for (_, hunk_idx, post_idx, rule) in targets {
+                    if let Some(line) = p.hunks[hunk_idx].post.get_mut(post_idx) {
+                        if super::diff_files::ws_check(line, rule) != 0 {
+                            *line = ws_fix_default(line);
                         }
                     }
                 }
             }
         }
+        ws_errors = errors;
+        // `if (state->whitespace_error && ws_error_action == die_on_ws_error)
+        // state->apply = 0;` (apply.c:4942), inside `apply_patch()` and therefore
+        // *before* the check and the write. The summary line itself is printed by
+        // the tail block, which nothing else reaches under this action because
+        // `state->check || state->apply` is then false.
         if errors > 0 && matches!(o.ws, WsAction::Error) {
-            err(
-                o.quiet(),
-                &format!(
-                    "error: {errors} {} whitespace errors.",
-                    if errors == 1 { "line adds" } else { "lines add" }
-                ),
-            );
+            ws_summary(errors, &o.ws, o.apply, o.quiet());
             return Ok(ExitCode::from(128));
-        }
-        if errors > 0 && matches!(o.ws, WsAction::Fix) && o.apply {
-            err(
-                o.quiet(),
-                &format!(
-                    "warning: {errors} {} after fixing whitespace errors.",
-                    if errors == 1 { "line applied" } else { "lines applied" }
-                ),
-            );
-        }
-        if errors > 0 && matches!(o.ws, WsAction::Warn) {
-            err(
-                o.quiet(),
-                &format!(
-                    "warning: {errors} {} whitespace errors.",
-                    if errors == 1 { "line adds" } else { "lines add" }
-                ),
-            );
         }
     }
 
@@ -1301,6 +1360,11 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
                     failed = true;
                     continue;
                 }
+                PreRead::CannotCheckout => {
+                    err(o.quiet(), &format!("error: cannot checkout {old}"));
+                    failed = true;
+                    continue;
+                }
             }
         };
 
@@ -1370,6 +1434,7 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
                 o.no_add,
                 o.p_context,
                 o.ignore_ws,
+                o.allow_overlap,
                 verbosity(&o),
                 o.reject,
                 &label,
@@ -1472,6 +1537,7 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
             return Ok(ExitCode::from(128));
         }
         reports(&patches);
+        ws_summary(ws_errors, &o.ws, o.apply, o.quiet());
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -1506,8 +1572,7 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
     for op in ops {
         if let Some((path, mode, data)) = op.create {
             if !o.cached {
-                create_leading_dirs(Path::new(&path))?;
-                write_created(Path::new(&path), mode, &data)?;
+                create_one_file(Path::new(&path), mode, &data)?;
             }
             // `create_file()` (apply.c:4685): `check_index` stages every result,
             // `ita_only` stages only the paths the patch creates.
@@ -1681,6 +1746,7 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::from(128));
     }
     reports(&patches);
+    ws_summary(ws_errors, &o.ws, o.apply, o.quiet());
     Ok(ExitCode::SUCCESS)
 }
 
@@ -1770,6 +1836,7 @@ fn try_threeway(
         o.no_add,
         o.p_context,
         o.ignore_ws,
+        o.allow_overlap,
         verbosity(o),
         // `try_threeway()` builds the patch's own post-image, which either applies
         // to the blob it was made against or does not; `--reject` has no say here.
@@ -1900,13 +1967,34 @@ enum PreRead {
     MissingWorktree,
     MissingIndex,
     Mismatch,
+    /// `checkout_target()` (apply.c:3485) could not write the file back out:
+    /// `error(_("cannot checkout %s"), ce->name)`.
+    CannotCheckout,
+}
+
+/// `checkout_target()` (apply.c:3485). `check_preimage()` reaches it when
+/// `--index` is on and `lstat()` of the pre-image path failed (apply.c:3878-3881):
+/// the index entry is written back into the working tree so the patch has something
+/// to apply to, and only then does `verify_index_match()` get a say.
+///
+/// It runs under `--check` too — `check_preimage()` is part of the check pass — so
+/// `git apply --check --index` on a path whose file was deleted recreates the file
+/// (and its leading directories) as a side effect, which stock does and this
+/// reproduces.
+fn checkout_target(path: &str, mode: u32, data: &[u8]) -> bool {
+    let p = Path::new(path);
+    if create_leading_dirs(p).is_err() {
+        return false;
+    }
+    write_created(p, mode, data).is_ok()
 }
 
 /// Load a patch's pre-image, from an earlier in-run result if present, else from
 /// the index blob (git's `load_patch_target` when `check_index`) or the worktree.
 /// Under `--index` (not `--cached`) the worktree content is verified against the
-/// index blob — git's `verify_index_match` — refusing on any divergence (git would
-/// instead check out a missing file, which this port floors by refusing).
+/// index blob — git's `verify_index_match` — refusing on any divergence. A file that
+/// is *absent* is not a divergence: git checks it out of the index first
+/// ([`checkout_target`]), and so does this.
 fn read_preimage(
     staged: &HashMap<String, Option<Vec<u8>>>,
     idx: Option<(&gix::Repository, &gix::index::File)>,
@@ -1948,7 +2036,24 @@ fn read_preimage(
                             _ => return PreRead::Mismatch,
                         }
                     }
-                    None => return PreRead::Mismatch,
+                    // `stat_ret < 0` in `check_preimage()`: the file is not there at
+                    // all, so git checks it out of the index rather than refusing.
+                    // `verify_index_match()` then trivially agrees, because the bytes
+                    // just written *are* the index blob.
+                    //
+                    // A gitlink is left out of that: `checkout_entry()` would create
+                    // the submodule *directory* and `verify_index_match()` only asks
+                    // whether the path is one (apply.c:3525-3528), so writing the
+                    // commit id out as a file would satisfy neither. An absent
+                    // submodule keeps the refusal it had.
+                    None if ce.mode.bits() & 0o170000 == 0o160000 => {
+                        return PreRead::Mismatch;
+                    }
+                    None => {
+                        if !checkout_target(old, ce.mode.bits(), &bytes) {
+                            return PreRead::CannotCheckout;
+                        }
+                    }
                 }
             }
             PreRead::Found(bytes)
@@ -2055,6 +2160,19 @@ impl Patch {
             std::mem::swap(&mut h.pre, &mut h.post);
             std::mem::swap(&mut h.pre_common, &mut h.post_common);
             std::mem::swap(&mut h.old_pos, &mut h.new_pos);
+            // The stored index into `pre`/`post` stays right because the two images
+            // just traded places; only which side a body line belongs to inverts.
+            // This is what `parse_fragment()` expresses as the `apply_in_reverse`
+            // tests around `check_old_for_crlf()`/`check_whitespace()`
+            // (apply.c:1855-1869): under `-R` it is the `-` lines that get the
+            // whitespace check and the `+` lines that can relax it.
+            for (_, marker, _) in &mut h.body {
+                *marker = match *marker {
+                    b'-' => b'+',
+                    b'+' => b'-',
+                    m => m,
+                };
+            }
         }
     }
 }
@@ -2076,9 +2194,15 @@ struct Hunk {
     /// `LINE_COMMON` on the post-image: which of `post`'s lines are context rather
     /// than additions.
     post_common: Vec<bool>,
-    /// `(index into the concatenated input, index into `post`)` for every added line,
-    /// which is what the whitespace check reports against (`<patch>:<line>: …`).
-    added_at: Vec<(usize, usize)>,
+    /// The fragment's body lines in the order `parse_fragment()` (apply.c:1802) walks
+    /// them, which is the order both whitespace passes depend on: `(index into the
+    /// concatenated input, the `' '`/`'-'`/`'+'` marker, index into `pre` for the
+    /// first two and into `post` for the last)`.
+    ///
+    /// The input index is what the whitespace check reports against
+    /// (`<patch>:<line>: …`); the *order* is what makes `check_old_for_crlf()`
+    /// (apply.c:1716) observable, since it only relaxes the lines that come after it.
+    body: Vec<(usize, u8, usize)>,
     context: Vec<Vec<u8>>, // the context lines only, spliced in for --no-add
     raw: Vec<u8>,          // the fragment's verbatim text (header + body) for *.rej
     trailing: usize,       // trailing context lines; 0 means the hunk must match at EOF
@@ -2108,6 +2232,9 @@ fn apply_hunks(
     p_context: Option<usize>,
     // `state->ws_ignore_action == ignore_ws_change`.
     ignore_ws: bool,
+    // `state->allow_overlap`: do not mark the lines a fragment wrote as `LINE_PATCHED`,
+    // so a later fragment of the same patch may match against them.
+    allow_overlap: bool,
     v: Verbosity,
     // `state->apply_with_reject`: a fragment that will not land is recorded and the
     // rest are still tried, instead of failing the whole patch at the first one.
@@ -2116,8 +2243,14 @@ fn apply_hunks(
     label: &str,
 ) -> Result<Vec<bool>, usize> {
     let mut applied = Vec::with_capacity(p.hunks.len());
+    // `img->line[].flag`, carrying `LINE_PATCHED` for every line an earlier fragment
+    // of this patch has already written (apply.c:2969-2971). It keeps the second hunk
+    // of a patch from matching against the first hunk's own output; `--allow-overlap`
+    // is precisely "stop setting this".
+    let mut patched: Vec<bool> = vec![false; image.len()];
     for (idx, h) in p.hunks.iter().enumerate() {
-        let Some(placed) = place_with_context(image.as_slice(), h, unidiff_zero, p_context, ignore_ws)
+        let Some(placed) =
+            place_with_context(image.as_slice(), &patched, h, unidiff_zero, p_context, ignore_ws)
         else {
             // apply.c:3369-3374 — the diagnostics come first either way; only what
             // happens next differs.
@@ -2138,7 +2271,12 @@ fn apply_hunks(
         placed.report(idx + 1, v);
         let hunk = placed.hunk.as_ref().unwrap_or(h);
         let repl = replacement(image.as_slice(), placed.at, hunk, no_add, ignore_ws);
+        let written = repl.len();
         image.splice(placed.at..placed.at + hunk.pre.len(), repl);
+        patched.splice(
+            placed.at..placed.at + hunk.pre.len(),
+            std::iter::repeat_n(!allow_overlap, written),
+        );
         applied.push(true);
     }
     Ok(applied)
@@ -2260,6 +2398,7 @@ fn replacement(
 /// two at a time.
 fn place_with_context(
     image: &[Vec<u8>],
+    patched: &[bool],
     h: &Hunk,
     unidiff_zero: bool,
     p_context: Option<usize>,
@@ -2284,6 +2423,7 @@ fn place_with_context(
     loop {
         if let Some(at) = find_pos(
             image,
+            patched,
             &cur.pre,
             expected,
             match_beginning,
@@ -2340,6 +2480,7 @@ fn place_with_context(
 /// that could land in two places lands where git lands it).
 fn find_pos(
     image: &[Vec<u8>],
+    patched: &[bool],
     pre: &[Vec<u8>],
     start: isize,
     match_beginning: bool,
@@ -2365,7 +2506,7 @@ fn find_pos(
     let (mut backwards, mut forwards, mut current) = (line, line, line);
     let mut i: usize = 0;
     loop {
-        if matches_at(image, pre, current, match_beginning, match_end, ignore_ws, eof_fudge) {
+        if matches_at(image, patched, pre, current, match_beginning, match_end, ignore_ws, eof_fudge) {
             return Some(current);
         }
         // Pick the next candidate: odd steps go backwards, even steps forwards,
@@ -2402,6 +2543,8 @@ fn find_pos(
 /// file's as a prefix.
 fn matches_at(
     image: &[Vec<u8>],
+    // `img->line[].flag & LINE_PATCHED` (apply.c:2650), one entry per image line.
+    patched: &[bool],
     pre: &[Vec<u8>],
     at: usize,
     match_beginning: bool,
@@ -2410,6 +2553,13 @@ fn matches_at(
     eof_fudge: bool,
 ) -> bool {
     if at + pre.len() > image.len() {
+        return false;
+    }
+    // "Quick hash check" (apply.c:2648-2655): a line an earlier fragment of this same
+    // patch already wrote is off limits, so a hunk cannot match text the patch itself
+    // produced. `--allow-overlap` is the flag that stops the marking in the first
+    // place (apply.c:2969), which is why nothing here consults it.
+    if patched[at..at + pre.len()].iter().any(|&p| p) {
         return false;
     }
     if match_end && at + pre.len() != image.len() {
@@ -2701,10 +2851,10 @@ fn parse_one(
             p.old_mode = Some(octal(rest)?);
         } else if let Some(rest) = l.strip_prefix("rename from ") {
             p.is_rename = true;
-            p.old_name = strip_path(&unquote(rest)?, strip.saturating_sub(1))?;
+            p.old_name = rename_path(rest, strip)?;
         } else if let Some(rest) = l.strip_prefix("rename to ") {
             p.is_rename = true;
-            p.new_name = strip_path(&unquote(rest)?, strip.saturating_sub(1))?;
+            p.new_name = rename_path(rest, strip)?;
         } else if l.starts_with("copy from ") || l.starts_with("copy to ") {
             anyhow::bail!("copy patches are not implemented");
         } else if let Some(rest) = l.strip_prefix("similarity index ") {
@@ -2809,10 +2959,10 @@ fn resolve_traditional(
     let (Some(first), Some(second)) = (first, second) else {
         return Ok(());
     };
-    if is_dev_null(first.split('\t').next().unwrap_or("")) {
+    if is_dev_null(&first[..name_end(first)]) {
         p.is_new = true;
         p.new_name = header_path(second, strip)?;
-    } else if is_dev_null(second.split('\t').next().unwrap_or("")) {
+    } else if is_dev_null(&second[..name_end(second)]) {
         p.is_delete = true;
         p.old_name = header_path(first, strip)?;
     } else {
@@ -2909,7 +3059,7 @@ fn parse_hunk(
         pre_common: Vec::new(),
         post: Vec::new(),
         post_common: Vec::new(),
-        added_at: Vec::new(),
+        body: Vec::new(),
         context: Vec::new(),
         raw: Vec::new(),
         trailing: 0,
@@ -2952,6 +3102,7 @@ fn parse_hunk(
                 if added == 0 && deleted == 0 {
                     h.leading += 1;
                 }
+                h.body.push((i, b' ', h.pre.len()));
                 h.pre.push(body.to_vec());
                 h.pre_common.push(true);
                 h.post.push(body.to_vec());
@@ -2963,6 +3114,7 @@ fn parse_hunk(
                 new_rem = new_rem.saturating_sub(1);
             }
             b'-' => {
+                h.body.push((i, b'-', h.pre.len()));
                 h.pre.push(body.to_vec());
                 h.pre_common.push(false);
                 h.trailing = 0;
@@ -2971,7 +3123,7 @@ fn parse_hunk(
                 old_rem = old_rem.saturating_sub(1);
             }
             _ => {
-                h.added_at.push((i, h.post.len()));
+                h.body.push((i, b'+', h.post.len()));
                 h.post.push(body.to_vec());
                 h.post_common.push(false);
                 h.trailing = 0;
@@ -3044,21 +3196,89 @@ fn one_range(s: &str) -> Option<(usize, usize)> {
 // path handling
 // ---------------------------------------------------------------------------
 
-/// A `---`/`+++` header path: text up to the first tab (traditional diffs append
-/// a timestamp there), `/dev/null` meaning "this side does not exist".
+/// A `---`/`+++` header path: the name as [`name_end`] delimits it (traditional
+/// diffs append a timestamp after a tab), `/dev/null` meaning "this side does not
+/// exist".
 fn header_path(rest: &str, strip: usize) -> Result<Option<String>> {
-    let name = rest.split('\t').next().unwrap_or("");
+    let name = &rest[..name_end(rest)];
     if is_dev_null(name) {
         return Ok(None);
     }
-    strip_path(&unquote(name)?, strip)
+    Ok(strip_path(&unquote(name)?, strip)?.map(|n| squash_slash(&n)))
 }
 
-/// `is_dev_null()` (apply.c:493): the name is `/dev/null`, optionally followed by
-/// whitespace (a traditional diff's timestamp).
+/// A `rename from`/`rename to` name: `find_name()` with `terminate == 0` and one
+/// fewer leading component than `-p<n>` asks for, because the name here has no
+/// `a/`/`b/` prefix on it (apply.c:1073).
+fn rename_path(rest: &str, strip: usize) -> Result<Option<String>> {
+    let name = &rest[..name_end_no_term(rest)];
+    Ok(strip_path(&unquote(name)?, strip.saturating_sub(1))?.map(|n| squash_slash(&n)))
+}
+
+/// `git_isspace()` — git compiles against `sane-ctype.h`, whose `isspace()` is the
+/// four bytes flagged `GIT_SPACE` in `sane_ctype[]` (ctype.c:21-23): space, `\t`,
+/// `\n`, `\r`. `\v` and `\f` are `GIT_CNTRL` only, so they are *not* whitespace to
+/// any of apply.c's scans, and Rust's Unicode-aware `char::is_whitespace` would
+/// wrongly accept them (plus NBSP and friends).
+fn git_isspace(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\n' | b'\r')
+}
+
+/// Where `find_name_common()`'s scan (apply.c:666-678) stops under `TERM_TAB`, which
+/// is what `gitdiff_verify_name()` (apply.c:936) and `find_name_traditional()`
+/// (apply.c:737) both pass: the first `isspace()` byte that `name_terminate()`
+/// (apply.c:437) does not exempt. Under `TERM_TAB` only a plain space is exempt, so a
+/// tab, a newline **or a carriage return** ends the name.
+///
+/// The `\r` arm is what makes `git am --keep-cr` of a CRLF patch behave: every header
+/// line then ends `…\r\n`, and without this the path would come out as `f.txt\r` and
+/// miss both the index and the working tree.
+fn name_end(s: &str) -> usize {
+    s.bytes()
+        .position(|b| b != b' ' && git_isspace(b))
+        .unwrap_or(s.len())
+}
+
+/// The same scan under `terminate == 0`, which is what `gitdiff_renamesrc()`/
+/// `gitdiff_renamedst()` pass (apply.c:1073, :1083): `name_terminate()` exempts both
+/// a space and a tab, so a `rename from`/`rename to` name may contain either and ends
+/// only at a newline or a carriage return.
+fn name_end_no_term(s: &str) -> usize {
+    s.bytes()
+        .position(|b| b == b'\n' || b == b'\r')
+        .unwrap_or(s.len())
+}
+
+/// `squash_slash()` (apply.c:448): collapse runs of `/` into one. Every name that
+/// comes back from `find_name_common()`/`find_name_gnu()` goes through it, which is
+/// why `--- a/sub//g.txt` patches `sub/g.txt`.
+///
+/// `git_header_name()` deliberately does *not* call it — its result only ever becomes
+/// `patch->def_name`, so a pure mode change on `a/sub//g.txt b/sub//g.txt` keeps the
+/// doubled slash and is refused as `invalid path 'sub//g.txt'` by both git and this
+/// port.
+fn squash_slash(name: &str) -> String {
+    if !name.contains("//") {
+        return name.to_string();
+    }
+    let mut out = String::with_capacity(name.len());
+    let mut prev_slash = false;
+    for c in name.chars() {
+        if c == '/' && prev_slash {
+            continue;
+        }
+        prev_slash = c == '/';
+        out.push(c);
+    }
+    out
+}
+
+/// `is_dev_null()` (apply.c:429): the name is `/dev/null` followed by an `isspace()`
+/// byte. The name has already had its terminator taken off here, so "followed by
+/// nothing" stands in for git's "followed by the `\n` that ends the line".
 fn is_dev_null(name: &str) -> bool {
     match name.strip_prefix("/dev/null") {
-        Some(rest) => rest.is_empty() || rest.starts_with(char::is_whitespace),
+        Some(rest) => rest.is_empty() || rest.bytes().next().is_some_and(git_isspace),
         None => false,
     }
 }
@@ -3891,6 +4111,83 @@ fn write_created(path: &Path, _mode: u32, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// `create_one_file()` (apply.c:4549). The plain `O_CREAT|O_EXCL` create is only the
+/// first attempt; git has two recoveries under it, and without them a perfectly
+/// ordinary input fails:
+///
+/// * `ENOENT` — a leading directory is missing, so create them and retry
+///   (apply.c:4594). [`create_leading_dirs`] runs first here, which folds that in.
+/// * `EEXIST` — something is already at the path. git first tries `rmdir()` in case a
+///   *directory* is in the way (apply.c:4604-4611), then writes the content to
+///   `<path>~<pid>` and `rename()`s it over the top (apply.c:4613-4632).
+///
+/// The `EEXIST` arm is reached by anything that writes the same path twice in one
+/// run — two patches in one input against the same file, which is what `git
+/// format-patch`-style stacked patches look like once concatenated. Without it the
+/// second write returns raw `File exists (os error 17)` and the run dies mid-write.
+fn create_one_file(path: &Path, mode: u32, data: &[u8]) -> Result<()> {
+    create_leading_dirs(path)?;
+    let Err(first) = write_created(path, mode, data) else {
+        return Ok(());
+    };
+    let kind = first.downcast_ref::<std::io::Error>().map(std::io::Error::kind);
+    // `if (errno == EEXIST || errno == EACCES)`: "We may be trying to create a file
+    // where a directory used to be." The C then rewrites `errno` to `EEXIST` whenever
+    // `lstat()` finds anything at the path that is not a directory, or is one it could
+    // remove, and only that rewritten `EEXIST` reaches the temporary-name loop.
+    //
+    // The one shape not reproduced is `EACCES` on a path that already exists as a
+    // non-directory, which the C would route into that loop. `O_CREAT|O_EXCL` reports
+    // `EEXIST` before it checks permissions, so the kernel cannot hand us that pair;
+    // a real `EACCES` here means an unwritable parent, where `lstat()` also fails and
+    // the C falls through to the error exactly as this does.
+    let was_dir = matches!(
+        kind,
+        Some(std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::PermissionDenied)
+    ) && std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir())
+        && std::fs::remove_dir(path).is_ok();
+    if was_dir {
+        if write_created(path, mode, data).is_ok() {
+            return Ok(());
+        }
+    } else if kind != Some(std::io::ErrorKind::AlreadyExists) {
+        return Err(first);
+    }
+    // `mkpathdup("%s~%u", path, nr)`, starting at the pid and counting up until a
+    // name is free, then renamed over the target.
+    let mut nr = std::process::id();
+    for _ in 0..1000 {
+        let tmp = path.with_file_name(format!(
+            "{}~{nr}",
+            path.file_name().unwrap_or_default().to_string_lossy()
+        ));
+        match write_created(&tmp, mode, data) {
+            Ok(()) => {
+                if std::fs::rename(&tmp, path).is_ok() {
+                    return Ok(());
+                }
+                let _ = std::fs::remove_file(&tmp);
+                break;
+            }
+            Err(e) if is_already_exists(&e) => nr = nr.wrapping_add(1),
+            Err(_) => break,
+        }
+    }
+    bail!(
+        "unable to write file '{}' mode {mode:o}",
+        path.to_string_lossy()
+    );
+}
+
+/// `errno == EEXIST` on the temporary-name loop's create, which is the only thing
+/// that makes it try the next number (apply.c:4627). `write_created()` wraps
+/// `std::io::Error` in `anyhow`, so the kind has to be recovered rather than matched
+/// on directly.
+fn is_already_exists(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<std::io::Error>().map(std::io::Error::kind)
+        == Some(std::io::ErrorKind::AlreadyExists)
+}
+
 /// After removing a file, drop the directories it emptied, exactly as git's
 /// `remove_path` does. Stops at the first non-empty (or non-removable) parent.
 fn prune_empty_parents(path: &Path) {
@@ -3920,12 +4217,55 @@ fn io_msg(e: &std::io::Error) -> String {
 // whitespace checking — apply.c's ws_check path
 // ---------------------------------------------------------------------------
 
+/// One line the whitespace check will look at: `(index into the concatenated input,
+/// index of the hunk, index into that hunk's `post`, the `patch->ws_rule` in force
+/// when `parse_fragment()` reached it)`.
+type WsTarget = (usize, usize, usize, u32);
+
+/// `check_old_for_crlf()` (apply.c:1716): a context or removed line that ends `\r\n`
+/// means the *pre-image* is a CRLF file, so the `\r` the patch adds back on every
+/// line is not a whitespace error.
+fn ends_with_crlf(line: &[u8]) -> bool {
+    line.ends_with(b"\r\n")
+}
+
+/// Walk one patch's fragments the way `parse_fragment()` (apply.c:1802-1881) does,
+/// carrying `patch->ws_rule` along, and collect every line the check applies to.
+///
+/// The order is load-bearing: `check_old_for_crlf()` only ORs `WS_CR_AT_EOL` in as it
+/// meets a CRLF pre-image line, so a `+` line *ahead* of the first such line is still
+/// checked under the strict rule and is reported as `trailing whitespace`. `-R` has
+/// already inverted the markers ([`Patch::reverse`]), which is how the C's
+/// `apply_in_reverse` tests are expressed here.
+///
+/// `patch->ws_rule` is per patch, not per fragment, so a CRLF line in one hunk
+/// relaxes the hunks after it too.
+fn ws_targets(p: &Patch, base: u32) -> Vec<WsTarget> {
+    let mut rule = base;
+    let mut out = Vec::new();
+    for (hunk_idx, h) in p.hunks.iter().enumerate() {
+        for &(input_idx, marker, idx) in &h.body {
+            if marker == b'+' {
+                out.push((input_idx, hunk_idx, idx, rule));
+            } else if h.pre.get(idx).is_some_and(|l| ends_with_crlf(l)) {
+                rule |= super::diff_color::WS_CR_AT_EOL;
+            }
+        }
+    }
+    out
+}
+
 /// Report the whitespace errors every added line carries, as `apply.c`'s
 /// `check_whitespace()` does: one `<patch>:<line>: <error>.` line followed by the
 /// offending text, the first five only, then the count.
 ///
-/// Returns the number of offending lines. `nowarn` counts without reporting, which is
-/// what git's `ws_error_action == nowarn_ws_error` does.
+/// Returns the number of offending lines.
+///
+/// `nowarn` produces no output *and* no count in git: `parse_fragment()` skips
+/// `check_whitespace()` entirely under `nowarn_ws_error` (apply.c:1867-1869), so
+/// `state->whitespace_error` stays 0 and `apply_all_patches()`'s whole summary block
+/// is skipped with it. The count is still returned here for symmetry; [`ws_summary`]
+/// is what declines to say anything about it.
 fn report_whitespace(
     patches: &[Patch],
     spans: &InputSpans,
@@ -3939,40 +4279,81 @@ fn report_whitespace(
     let mut printed = 0usize;
     let silent = matches!(action, WsAction::Silent);
     for p in patches {
-        for h in &p.hunks {
-            for (input_idx, post_idx) in &h.added_at {
-                let Some(line) = h.post.get(*post_idx) else {
-                    continue;
-                };
-                if super::diff_files::ws_check(line, rule) == 0 {
-                    continue;
-                }
-                errors += 1;
-                if silent || printed >= SQUELCH {
-                    continue;
-                }
-                printed += 1;
-                let (file, no) = spans.location(*input_idx);
-                let what = super::diff_files::whitespace_error_string(
-                    super::diff_files::ws_check(line, rule),
-                );
-                err(quiet, &format!("{file}:{no}: {what}."));
-                let body = line.strip_suffix(b"\n").unwrap_or(line);
-                err(quiet, &String::from_utf8_lossy(body));
+        for (input_idx, hunk_idx, post_idx, rule) in ws_targets(p, rule) {
+            let Some(line) = p.hunks[hunk_idx].post.get(post_idx) else {
+                continue;
+            };
+            let result = super::diff_files::ws_check(line, rule);
+            if result == 0 {
+                continue;
             }
+            errors += 1;
+            if silent || printed >= SQUELCH {
+                continue;
+            }
+            printed += 1;
+            let (file, no) = spans.location(input_idx);
+            let what = super::diff_files::whitespace_error_string(result);
+            err(quiet, &format!("{file}:{no}: {what}."));
+            let body = line.strip_suffix(b"\n").unwrap_or(line);
+            err(quiet, &String::from_utf8_lossy(body));
         }
     }
-    if !silent && errors > printed {
+    errors
+}
+
+/// `apply_all_patches()`'s tail (apply.c:5141-5171): the counts, once every input
+/// file has been through `apply_patch()`.
+///
+/// Where this sits matters as much as what it says. The block is past the `end:`
+/// label's `goto`s, so a run whose patch did not apply prints **none** of it — and
+/// it is past `write_out_results()`, so under `--reject` it follows
+/// `Applied patch <name> cleanly.` rather than preceding it. Both were measured
+/// against stock through `git am`, where `apply` is invoked with `--index`.
+///
+/// `state->squelch_whitespace_errors` is 5, so the "squelched" line reports the
+/// offenders past the fifth that `check_whitespace()` did not print.
+fn ws_summary(errors: usize, action: &WsAction, apply: bool, quiet: bool) {
+    const SQUELCH: usize = 5;
+    if errors == 0 || matches!(action, WsAction::Silent | WsAction::Invalid) {
+        return;
+    }
+    if errors > SQUELCH {
         err(
             quiet,
             &format!(
                 "warning: squelched {} whitespace {}",
-                errors - printed,
-                plural_errors(errors - printed)
+                errors - SQUELCH,
+                plural_errors(errors - SQUELCH)
             ),
         );
     }
-    errors
+    let n = errors;
+    match action {
+        WsAction::Error => err(
+            quiet,
+            &format!(
+                "error: {n} {} whitespace errors.",
+                if n == 1 { "line adds" } else { "lines add" }
+            ),
+        ),
+        // `state->applied_after_fixing_ws && state->apply` picks the first wording;
+        // anything else falls through to the plain count.
+        WsAction::Fix if apply => err(
+            quiet,
+            &format!(
+                "warning: {n} {} after fixing whitespace errors.",
+                if n == 1 { "line applied" } else { "lines applied" }
+            ),
+        ),
+        _ => err(
+            quiet,
+            &format!(
+                "warning: {n} {} whitespace errors.",
+                if n == 1 { "line adds" } else { "lines add" }
+            ),
+        ),
+    }
 }
 
 /// `Q_("whitespace error", "whitespace errors", n)`.
@@ -4521,7 +4902,7 @@ mod tests {
             pre_common: vec![true, false, true],
             post: vec![b" one\n".to_vec(), b"NEW\n".to_vec(), b" three\n".to_vec()],
             post_common: vec![true, false, true],
-            added_at: vec![(0, 1)],
+            body: vec![(0, b' ', 0), (0, b'-', 1), (0, b'+', 1), (0, b' ', 2)],
             context: vec![b" one\n".to_vec(), b" three\n".to_vec()],
             raw: Vec::new(),
             trailing: 1,
@@ -4529,12 +4910,12 @@ mod tests {
             eof_fudge: false,
         };
         assert_eq!(
-            place_with_context(&image, &h, false, None, false).map(|p| p.at),
+            place_with_context(&image, &[false; 3], &h, false, None, false).map(|p| p.at),
             None,
             "byte-exact matching still rejects it"
         );
         assert_eq!(
-            place_with_context(&image, &h, false, None, true).map(|p| p.at),
+            place_with_context(&image, &[false; 3], &h, false, None, true).map(|p| p.at),
             Some(0)
         );
         assert_eq!(

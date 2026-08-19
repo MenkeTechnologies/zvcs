@@ -6,8 +6,9 @@ use crate::{
     File, bloom,
     file::{
         BASE_GRAPHS_LIST_CHUNK_ID, BLOOM_DATA_CHUNK_ID, BLOOM_DATA_HEADER_SIZE, BLOOM_INDEXES_CHUNK_ID,
-        COMMIT_DATA_CHUNK_ID, COMMIT_DATA_ENTRY_SIZE_SANS_HASH, EXTENDED_EDGES_LIST_CHUNK_ID, FAN_LEN, HEADER_LEN,
-        OID_FAN_CHUNK_ID, OID_LOOKUP_CHUNK_ID, SIGNATURE,
+        COMMIT_DATA_CHUNK_ID, COMMIT_DATA_ENTRY_SIZE_SANS_HASH, EXTENDED_EDGES_LIST_CHUNK_ID, FAN_LEN,
+        GENERATION_DATA_CHUNK_ID, GENERATION_DATA_OVERFLOW_CHUNK_ID, HEADER_LEN, OID_FAN_CHUNK_ID,
+        OID_LOOKUP_CHUNK_ID, SIGNATURE,
     },
 };
 
@@ -131,6 +132,19 @@ impl File {
 
         let extra_edges_list_range = chunks.usize_offset_by_id(EXTENDED_EDGES_LIST_CHUNK_ID).ok();
 
+        // Corrected commit dates, git's `read_chunk(GRAPH_CHUNKID_GENERATION_DATA)` pair at
+        // commit-graph.c:453-462. `graph_read_generation_data()` (commit-graph.c:326-334)
+        // rejects a `GDA2` that is not one `u32` per commit, and `read_generation_data` then
+        // stays unset, which is what makes the file fall back to the topological level in the
+        // upper bits of `CDAT`. `GDO2` is paired without validation, exactly as git does; the
+        // reader bounds-checks each index against it instead.
+        let generation_data_offset = chunks
+            .usize_offset_by_id(GENERATION_DATA_CHUNK_ID)
+            .ok()
+            .filter(|range| range.len() / 4 == commit_data_count as usize)
+            .map(|range| range.start);
+        let generation_data_overflow_range = chunks.usize_offset_by_id(GENERATION_DATA_OVERFLOW_CHUNK_ID).ok();
+
         // Changed-path Bloom filters, git's pair of `read_chunk()` calls for
         // `BIDX` and `BDAT`. The format says `BIDX` is ignored without `BDAT`,
         // and `BDAT` shorter than its own header cannot be trusted, so either
@@ -199,6 +213,8 @@ impl File {
             bloom_indexes_offset,
             bloom_data_range,
             bloom_filter_settings,
+            generation_data_offset,
+            generation_data_overflow_range,
         })
     }
 }

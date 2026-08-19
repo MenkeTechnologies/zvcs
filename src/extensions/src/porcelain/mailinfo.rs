@@ -17,18 +17,41 @@
 //! `mailinfo.quotedcr` and `i18n.commitEncoding`. Usage, `error:` and
 //! `warning:` text and the 0/1/129 exit codes match.
 //!
-//! Not covered: charset re-coding is only implemented between UTF-8, US-ASCII
-//! and ISO-8859-1, because git delegates the general case to `iconv`, which has
-//! no counterpart in the vendored crates. Any other pair bails rather than
-//! emitting bytes git would have transliterated differently; `-n` disables
-//! re-coding entirely and always works. A malformed `mailinfo.quotedcr` also
-//! bails instead of reproducing git's config-callback death path.
+//! Charset re-coding (`reencode_string_len()`, which git routes through
+//! `iconv(3)`) is [`reencode`]: US-ASCII, ISO-8859-1 and UTF-8 are converted
+//! directly, and every other label goes to `encoding_rs` — already linked into the
+//! binary by the vendored `gix-filter`, so it costs nothing to use. The three
+//! Latin-1 spellings are kept out of the crate's hands on purpose: WHATWG aliases
+//! them to windows-1252, which iconv does not. A name neither side knows, or a
+//! byte the conversion cannot map, reproduces git's `error: cannot convert from
+//! <a> to <b>` and exit 1 rather than being guessed at.
+//!
+//! `--encoding=<e>` is accepted and, as in git 2.55.0, changes nothing:
+//! `cmd_mailinfo()`'s `CHARSET_EXPLICIT` arm (builtin/mailinfo.c:101-102) is a bare
+//! `break` that never assigns `mi.metainfo_charset`, leaving the NULL that
+//! `setup_mailinfo()` memset — so the flag is `-n` by another name. Measured, not
+//! assumed.
+//!
+//! One conversion outcome is a property of the C library rather than of git, and is
+//! deliberately not chased: git calls `iconv_open()` without `//TRANSLIT`, so what
+//! happens to a character the target encoding cannot hold is up to libiconv. Apple's
+//! `/usr/lib/libiconv.2.dylib` transliterates it (measured: ISO-8859-1 `0xE9` to
+//! KOI8-R yields `'e`, return 0), while glibc returns `EILSEQ` and git then reports
+//! `cannot convert`. This port takes the failing reading, which is what a
+//! headless-Linux run of stock does. It is only reachable when `i18n.commitEncoding`
+//! names an encoding that is neither UTF-8 nor Latin-1; every decode-direction case
+//! — which is the one `git am` walks — is byte-identical.
+//!
+//! `encoding_rs` implements the WHATWG tables, which are a superset of the strict
+//! iconv ones in a few rows (Shift_JIS's NEC extensions, for one). A byte sequence
+//! only WHATWG accepts decodes here and is refused by stock on macOS.
+//!
+//! Not covered: a malformed `mailinfo.quotedcr` bails instead of reproducing git's
+//! config-callback death path.
 //!
 //! One structural difference with no observable effect on a successful run: the
 //! `<msg>` and `<patch>` files are created and truncated up front, as git does,
-//! but filled once parsing finishes rather than incrementally. A run that bails
-//! on an unsupported charset therefore leaves them empty where git would have
-//! left partial content.
+//! but filled once parsing finishes rather than incrementally.
 
 use anyhow::{bail, Result};
 use std::io::{Read, Write};
@@ -226,10 +249,15 @@ pub fn mailinfo(args: &[String]) -> Result<ExitCode> {
         Err(code) => return Ok(code),
     };
 
+    // `cmd_mailinfo()`'s switch (builtin/mailinfo.c:94-105). `CHARSET_EXPLICIT` is
+    // a bare `break;` — it records the name in the local `meta_charset` and never
+    // assigns `mi.metainfo_charset`, which `setup_mailinfo()`'s `memset` left NULL.
+    // So in git 2.55.0 `--encoding=<e>` re-codes nothing and behaves exactly like
+    // `-n`; measured against stock, a `charset=KOI8-R` body passes through byte for
+    // byte under `--encoding=ISO-8859-1`.
     mi.metainfo_charset = match policy {
         CharsetPolicy::Default => Some(commit_output_encoding()?),
-        CharsetPolicy::NoReencode => None,
-        CharsetPolicy::Explicit(enc) => Some(enc),
+        CharsetPolicy::NoReencode | CharsetPolicy::Explicit(_) => None,
     };
 
     let mut stdin = Vec::new();
@@ -696,12 +724,15 @@ impl Mailinfo {
                 *line = converted;
                 Ok(false)
             }
-            // git hands every other pair to iconv; without it, guessing bytes
-            // would be worse than stopping.
-            None => crate::git_fatal!(
-                "cannot convert from {source} to {target}: charset re-coding beyond \
-                 UTF-8/US-ASCII/ISO-8859-1 needs iconv, which is not vendored (use -n)"
-            ),
+            // `if (!out) { mi->input_error = -1; return error(...); }`
+            // (mailinfo.c:468-472): an unknown charset name, or a byte the
+            // conversion cannot map, ends the run at exit 1 with the info lines
+            // already written and the message file left empty.
+            None => {
+                eprintln!("error: cannot convert from {source} to {target}");
+                self.input_error = -1;
+                Ok(true)
+            }
         }
     }
 
@@ -1397,30 +1428,64 @@ fn is_latin1_name(name: &str) -> bool {
         .any(|c| name.eq_ignore_ascii_case(c))
 }
 
-/// The subset of `reencode_string_len()` that needs no iconv: the pairs among
-/// UTF-8, US-ASCII and ISO-8859-1. `None` means "unsupported or invalid".
+/// `reencode_string_len()` (utf8.c:564): decode `data` from `from`, re-encode it
+/// into `to`. `None` is the C's NULL — `iconv_open()` did not know one of the
+/// names, or the conversion hit a byte it could not map — which
+/// `convert_to_utf8()` turns into `cannot convert from %s to %s`.
+///
+/// Three labels are handled here rather than by `encoding_rs`, because the WHATWG
+/// Encoding Standard the crate implements deliberately disagrees with iconv on
+/// them: `iso-8859-1`, `iso8859-1` and `latin1` all alias to **windows-1252** in
+/// WHATWG, which maps 0x80-0x9F to printable characters, while iconv treats
+/// ISO-8859-1 as true Latin-1 where those are C1 controls. Mail in the wild
+/// declares `iso-8859-1` constantly, so taking the WHATWG reading would corrupt
+/// exactly the common case.
 fn reencode(data: &[u8], from: &str, to: &str) -> Option<Vec<u8>> {
+    let text = decode_from(data, from)?;
+    encode_to(&text, to)
+}
+
+/// The decode half. US-ASCII and Latin-1 are done here (see [`reencode`]); UTF-8
+/// is a validity check, since iconv rejects malformed input rather than
+/// substituting.
+fn decode_from(data: &[u8], from: &str) -> Option<String> {
     if is_ascii_name(from) {
-        // Valid US-ASCII is already valid UTF-8 and valid ISO-8859-1.
-        return data.iter().all(u8::is_ascii).then(|| data.to_vec());
+        return data
+            .iter()
+            .all(u8::is_ascii)
+            .then(|| String::from_utf8_lossy(data).into_owned());
     }
-    if is_latin1_name(from) && is_utf8_name(to) {
-        let mut out = Vec::with_capacity(data.len());
-        for &b in data {
-            let mut enc = [0u8; 4];
-            out.extend_from_slice((b as char).encode_utf8(&mut enc).as_bytes());
-        }
-        return Some(out);
+    if is_latin1_name(from) {
+        return Some(data.iter().map(|&b| b as char).collect());
     }
-    if is_utf8_name(from) && is_latin1_name(to) {
-        let text = std::str::from_utf8(data).ok()?;
-        let mut out = Vec::with_capacity(text.len());
-        for ch in text.chars() {
-            out.push(u8::try_from(ch as u32).ok()?);
-        }
-        return Some(out);
+    if is_utf8_name(from) {
+        return std::str::from_utf8(data).ok().map(str::to_string);
     }
-    None
+    let enc = encoding_rs::Encoding::for_label_no_replacement(from.as_bytes())?;
+    // `..._without_replacement` is the arm that fails on a malformed sequence
+    // instead of planting U+FFFD, which is what iconv's EILSEQ does.
+    enc.decode_without_bom_handling_and_without_replacement(data)
+        .map(std::borrow::Cow::into_owned)
+}
+
+/// The encode half, mirroring [`decode_from`].
+fn encode_to(text: &str, to: &str) -> Option<Vec<u8>> {
+    if is_utf8_name(to) {
+        return Some(text.as_bytes().to_vec());
+    }
+    if is_ascii_name(to) {
+        return text.is_ascii().then(|| text.as_bytes().to_vec());
+    }
+    if is_latin1_name(to) {
+        return text
+            .chars()
+            .map(|c| u8::try_from(c as u32).ok())
+            .collect::<Option<Vec<u8>>>();
+    }
+    let enc = encoding_rs::Encoding::for_label_no_replacement(to.as_bytes())?;
+    let (out, _, had_errors) = enc.encode(text);
+    // An unmappable character is iconv's EILSEQ, not a `?` substitution.
+    (!had_errors).then(|| out.into_owned())
 }
 
 /// `get_sane_name()`: fall back to the address when the name looks wrong.

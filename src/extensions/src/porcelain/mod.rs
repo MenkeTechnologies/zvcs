@@ -522,6 +522,8 @@ mod diff;
 /// every diff-producing command.
 pub(crate) mod diff_color;
 mod diff_files;
+/// `--diff-filter=<letters>`: `diff_opt_diff_filter()` and `diffcore_apply_filter()`.
+mod diff_filter;
 mod diff_index;
 mod diff_optval;
 mod diff_pairs;
@@ -614,6 +616,7 @@ mod read_tree;
 mod rebase;
 mod rebase_todo;
 mod receive_pack;
+mod ref_filter;
 pub(crate) mod reflog;
 mod refs;
 mod remote;

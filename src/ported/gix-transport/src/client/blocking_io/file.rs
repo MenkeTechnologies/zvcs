@@ -170,7 +170,13 @@ impl SpawnProcessOnDemand {
                 // which is what lets `--upload-pack`/`--receive-pack` name a whole command line rather
                 // than just a program. Only do so when there is an override: the plain
                 // `git-upload-pack` invocation is a bare program name and gains nothing from a shell.
-                let mut cmd = gix_command::prepare(&program).stderr(Stdio::null());
+                // git's local branch of `git_connect()` (connect.c:1479-1491) fills `conn` and
+                // calls `start_command(conn)` without ever setting `no_stderr`, so the service
+                // keeps the caller's stderr. That is what lets `git push <path>` show what
+                // `git-receive-pack` reports outside the sideband — `advice.ignoredHook` for a
+                // non-executable hook, a `fatal:` from a broken remote configuration, and
+                // anything a `--receive-pack`/`--upload-pack` wrapper writes there.
+                let mut cmd = gix_command::prepare(&program).stderr(Stdio::inherit());
                 if self.service_program_override(service).is_some() {
                     cmd = cmd.command_may_be_shell_script();
                 }
@@ -199,16 +205,18 @@ impl SpawnProcessOnDemand {
     /// Prefer the same program from git's own `--exec-path`, which is where `git` itself finds it, and
     /// otherwise let the `git` itself run it as subcommand.
     /// This is only used for local repositories - remote shells keep the standard invocation.
+    /// The service keeps the caller's stderr here for the same reason the primary invocation does:
+    /// it is still the local `start_command(conn)` of connect.c:1490, which never sets `no_stderr`.
     fn prepare_fallback_command(&self, service: Service) -> (gix_command::Prepare, OsString) {
         let (mut cmd, cmd_name) = match gix_path::env::core_dir_program(service.as_str()) {
             Some(program) => {
                 let cmd_name = program.clone().into_os_string();
-                (gix_command::prepare(program).stderr(Stdio::null()), cmd_name)
+                (gix_command::prepare(program).stderr(Stdio::inherit()), cmd_name)
             }
             None => {
                 let subcommand = service.as_git_subcommand();
                 let git = gix_path::env::exe_invocation();
-                let cmd = gix_command::prepare(git).stderr(Stdio::null()).arg(subcommand);
+                let cmd = gix_command::prepare(git).stderr(Stdio::inherit()).arg(subcommand);
 
                 let mut cmd_name: OsString = git.into();
                 cmd_name.push(" ");

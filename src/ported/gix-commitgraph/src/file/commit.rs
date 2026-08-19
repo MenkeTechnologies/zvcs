@@ -36,9 +36,8 @@ impl<'a> Commit<'a> {
             root_tree_id: gix_hash::oid::from_bytes_unchecked(&bytes[..file.hash_len]),
             parent1: ParentEdge::from_raw(read_u32(&bytes[file.hash_len..][..4])),
             parent2: ParentEdge::from_raw(read_u32(&bytes[file.hash_len + 4..][..4])),
-            // TODO: Add support for corrected commit date offset overflow.
-            //      See https://github.com/git/git/commit/e8b63005c48696a26f976f5f9b0ccaf1983e439d and
-            //          https://github.com/git/git/commit/f90fca638e99a031dce8e3aca72427b2f9b4bb38 for more details and hints at a test.
+            // The topological level out of the upper bits of `CDAT`; the corrected commit date
+            // lives in `GDA2` and is read by [`Commit::corrected_commit_date()`].
             generation: read_u32(&bytes[file.hash_len + 8..][..4]) >> 2,
             commit_timestamp: u64::from_be_bytes(bytes[file.hash_len + 8..][..8].try_into().unwrap())
                 & 0x0003_ffff_ffff,
@@ -58,6 +57,17 @@ impl<'a> Commit<'a> {
     /// number that is the max of their parents' generation numbers + 1.
     pub fn generation(&self) -> u32 {
         self.generation
+    }
+
+    /// Returns the corrected commit date of this commit — git's generation number v2 — or
+    /// `None` if the owning file carries no `GDA2` chunk.
+    ///
+    /// This is what `commit_graph_generation()` (commit-graph.c:126) answers with whenever the
+    /// graph was written with corrected dates, and therefore what git's
+    /// `compare_commits_by_gen_then_commit_date()` (commit.c:909) sorts by. It is a different
+    /// number from [`generation()`][Self::generation()], which is the topological level.
+    pub fn corrected_commit_date(&self) -> Option<u64> {
+        self.file.generation_data_at(self.pos, self.commit_timestamp)
     }
 
     /// Returns an iterator over the parent positions for lookup in the owning [Graph][crate::Graph].

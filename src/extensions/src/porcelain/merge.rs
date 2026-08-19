@@ -197,13 +197,17 @@
 //!
 //! * `--no-overwrite-ignore`: needs gitignore-aware checkout.
 //!
-//! Known fidelity gaps, stated rather than hidden: a `rename/delete` conflict
-//! reports one `CONFLICT (add/add)` line where git reports `CONFLICT
-//! (rename/delete)` followed by `CONFLICT (modify/delete)`, and its index is
-//! missing the stage-1 entry git records — `gix-merge` hands back no base entry
-//! for that conflict (`conflict.entries()[0]` is `None`), so neither the class
-//! nor the missing stage can be recovered by the message renderer; the diffstat
-//! is computed
+//! Known fidelity gaps, stated rather than hidden: `merge.directoryRenames` is
+//! never read — every merge behaves as `=true`, where git's default is
+//! `=conflict`, so a file added into a directory the other side renamed is moved
+//! silently instead of conflicting (`gix-merge` has no directory-rename input to
+//! drive); `merge.renameLimit`/`diff.renameLimit` are only honoured when
+//! `merge.renames`/`diff.renames` is also set, because gitoxide's
+//! `diff_resource_cache` returns before reading the limit otherwise;
+//! `diff.algorithm=patience` reaches the blob merge as histogram, since
+//! gitoxide's configuration cache reports patience as unimplemented and falls
+//! back leniently (`-Xpatience` is unaffected — it bypasses the cache); the
+//! diffstat is computed
 //! with rename detection off, while `git merge` enables it, so a merge that
 //! renames a file reports it as a delete plus a create instead of a `rename`
 //! summary line; `--verbose`'s extra stderr diagnostics are not
@@ -1485,9 +1489,43 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
     crate::ensure_reflog_identity(&mut repo);
     let repo = repo;
 
+    // `if (repo_read_index_unmerged(...)) die_resolve_conflict("merge")`
+    // (builtin/merge.c:1472-1473) — the first thing `cmd_merge` does once the
+    // `--abort`/`--quit`/`--continue` modes are out of the way, and the reason a
+    // second `git merge` after a conflicted one refuses instead of merging.
+    // `error_resolve_conflict()` (advice.c:200-225) prints the `error:` line
+    // unconditionally and the two-line direction only under
+    // `advice.resolveConflict`; `die_resolve_conflict()` adds the `fatal:`.
+    let precheck_index = repo.open_index()?;
+    if precheck_index.entries().iter().any(|e| e.stage_raw() != 0) {
+        eprintln!("error: Merging is not possible because you have unmerged files.");
+        crate::advice::Advice::ResolveConflict.advise_plain(
+            "Fix them up in the work tree, and then use 'git add/rm <file>'\n\
+             as appropriate to mark resolution and make a commit.",
+        );
+        eprintln!("fatal: Exiting because of an unresolved conflict.");
+        return Ok(ExitCode::from(128));
+    }
+    drop(precheck_index);
+
+    // builtin/merge.c:1475-1485. Reached only with a *resolved* index, which is
+    // why the advice says `commit` rather than `add/rm`. Both lines come out of
+    // one `die()`, so the second carries no `hint:` prefix — but it is still
+    // gated on `advice.resolveConflict`.
     if repo.git_dir().join("MERGE_HEAD").exists() {
         eprintln!("fatal: You have not concluded your merge (MERGE_HEAD exists).");
-        eprintln!("Please, commit your changes before you merge.");
+        if crate::advice::Advice::ResolveConflict.enabled_in(&repo) {
+            eprintln!("Please, commit your changes before you merge.");
+        }
+        return Ok(ExitCode::from(128));
+    }
+
+    // builtin/merge.c:1486-1492, the same shape for an unfinished cherry-pick.
+    if repo.git_dir().join("CHERRY_PICK_HEAD").exists() {
+        eprintln!("fatal: You have not concluded your cherry-pick (CHERRY_PICK_HEAD exists).");
+        if crate::advice::Advice::ResolveConflict.enabled_in(&repo) {
+            eprintln!("Please, commit your changes before you merge.");
+        }
         return Ok(ExitCode::from(128));
     }
 
@@ -2685,6 +2723,17 @@ fn octopus_attempt(repo: &gix::Repository, ctx: &MergeCtx<'_>, opts: &Opts) -> R
     }
 
     // Nothing merged: every head was already reachable.
+    //
+    // Unreachable through `git merge`, and kept for the shape of the script
+    // rather than for a case it answers: `collect_parents()` ends in
+    // `reduce_heads()` (see [`independent_heads`]), so every head that survives
+    // into `ctx.targets` is independent of `HEAD` and of the others. A head
+    // reachable from `HEAD` is dropped there and the up-to-date path in
+    // `do_merge` answers the merge before a strategy is dispatched — measured on
+    // a fixture whose two heads are both ancestors of `HEAD`, where stock and
+    // this port alike print `Already up to date.` without entering the octopus.
+    // `git merge-octopus` invoked directly *can* reach it, and that driver is
+    // [`super::merge_octopus`], not this one.
     if mrc.len() == 1 && mrc[0] == ctx.local_id {
         if !opts.quiet {
             println!("{}", up_to_date_line(opts));
@@ -2693,6 +2742,15 @@ fn octopus_attempt(repo: &gix::Repository, ctx: &MergeCtx<'_>, opts: &Opts) -> R
     }
     // Everything collapsed onto one line via fast-forward — a plain fast-forward,
     // not an octopus commit.
+    //
+    // Also unreachable through `git merge`, for the same `reduce_heads()`
+    // reason: only the *first* head can fast-forward (its merge base with
+    // `HEAD` is `HEAD` itself), and a second head that also fast-forwarded would
+    // have to descend from the first, which makes the first non-independent and
+    // drops it. So the loop leaves `mrc` with either one element that is still
+    // `HEAD` (handled above) or two or more. Measured: on a linear `HEAD -> b ->
+    // a`, `git merge b a` never reaches the octopus at all — one head survives
+    // reduction and stock and this port both take the plain fast-forward path.
     if mrc.len() == 1 {
         advance(
             repo,

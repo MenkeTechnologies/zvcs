@@ -1,20 +1,14 @@
 use anyhow::{anyhow, bail, Result};
-use std::cmp::Ordering;
 use std::io::Write as _;
 use std::process::ExitCode;
 
 use gix::bstr::{BStr, BString, ByteSlice};
 use gix::config::{File as ConfigFile, Source};
 use gix::hash::ObjectId;
-use gix::objs::{CommitRef, Kind};
 use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
 use gix::refs::{FullName, Target};
 
-use super::{resolve_long, Arg, LongOpt, Resolved};
-use crate::refsort::{self, Prereleases};
-
-/// git's smallest permitted abbreviation length, shared with `git blame`.
-const MINIMUM_ABBREV: usize = 4;
+use super::{ref_filter, resolve_long, Arg, LongOpt, Resolved};
 
 /// The SGR reset git emits after a colored branch name (`\e[m`, not `\e[0m`).
 const RESET: &str = "\x1b[m";
@@ -425,6 +419,13 @@ struct Opts {
     /// Raw `--sort=<key>` values in command-line order; an empty vec falls back
     /// to the multi-valued `branch.sort` config at listing time.
     sorts: Vec<String>,
+    /// A `--no-sort` was seen. `OPT_REF_SORT` is an `OPT_STRING_LIST`, whose
+    /// unset callback clears the *whole* list — including the `branch.sort`
+    /// values `repo_config()` seeded into it before `parse_options()` ran, and
+    /// including the implicit `refname` (builtin/branch.c:795-797). With the
+    /// list empty, `ref_sorting_options()` returns NULL and `ref_array_sort()`
+    /// is a no-op, which is the only way `git branch` prints refs unsorted.
+    sort_cleared: bool,
     delete: bool,
     rename: bool,
     copy: bool,
@@ -470,34 +471,6 @@ impl Opts {
     }
 }
 
-/// One line of `git branch` output.
-struct Entry<'repo> {
-    /// Full ref name (`refs/heads/main`); empty for the detached-HEAD pseudo entry.
-    full: BString,
-    /// Name as git prints it: `main`, `origin/main` under `-r`,
-    /// `remotes/origin/main` under `-a`, or `(HEAD detached at abc1234)`.
-    display: String,
-    /// `%(refname:short)` form — `main` / `origin/main`, without the `remotes/` prefix.
-    short: String,
-    /// Commit the ref points at; `None` for a symbolic ref such as `origin/HEAD`.
-    id: Option<gix::Id<'repo>>,
-    /// Shortened target of a symbolic ref, printed as `-> origin/main` under `-v`.
-    symref: Option<String>,
-    /// Whether git marks this line with `*`.
-    current: bool,
-    /// Whether this ref lives under `refs/remotes/` (colored with the remote slot).
-    remote: bool,
-    /// The detached-HEAD pseudo entry, which `--format` prints verbatim.
-    detached: bool,
-    /// git's `%(worktreepath)`: the working tree that has this branch checked
-    /// out, if any (including the current one). Drives the `+` marker, the
-    /// `color.branch.worktree` slot and the `-vv` `(<path>)` field.
-    worktreepath: Option<String>,
-    /// Precomputed `--sort` values, aligned positionally with the parsed sort
-    /// keys. Empty when no sort is in effect (default refname order).
-    keys: Vec<SortVal>,
-}
-
 /// Reachability filters resolved to concrete commit ids, as git's `ref-filter`
 /// does before walking the ref list.
 struct Filters {
@@ -509,12 +482,16 @@ struct Filters {
 }
 
 impl Filters {
-    fn is_empty(&self) -> bool {
-        self.contains.is_empty()
-            && self.no_contains.is_empty()
-            && self.merged.is_empty()
-            && self.no_merged.is_empty()
-            && self.points_at.is_empty()
+    /// The four reachability filters in the shape `ref-filter` takes them.
+    /// `--points-at` is not one of them: `apply_ref_filter()` tests it against
+    /// the ref's own id before any commit lookup happens.
+    fn shared(&self) -> super::for_each_ref::Filters {
+        super::for_each_ref::Filters {
+            contains: self.contains.clone(),
+            no_contains: self.no_contains.clone(),
+            merged: self.merged.clone(),
+            no_merged: self.no_merged.clone(),
+        }
     }
 }
 
@@ -543,19 +520,24 @@ impl Filters {
 /// '<name>'` plus the usage block on stderr at 129, *before* anything is
 /// created — it is not taken as a branch to create.
 ///
-/// `--format` supports seven atoms — `refname`, `refname:short`, `objectname`,
-/// `objectname:short`, `HEAD`, `upstream` and `upstream:short` — and rejects any
-/// other rather than rendering it as empty.
+/// Listing is the same `ref-filter.c` run `for-each-ref` and `tag --list` are,
+/// driven through [`super::ref_filter`]. `git branch` has no listing code of its
+/// own beyond deciding *which* refs to ask for and building a format string when
+/// the user gave none — `print_ref_list()` (builtin/branch.c:445-502) filters,
+/// sizes the name column, calls [`build_format`], and hands the result to the
+/// shared evaluator. So every decoration this command is known for — the `* `
+/// marker, the `+ ` worktree marker, the color slots, the padded name column
+/// under `-v`, the ` -> <symref>` tail, the `-vv` upstream and ahead/behind
+/// fields — is an ordinary atom, and `--format` replaces all of them at once
+/// rather than composing with any of them. `--column` is orthogonal and applies
+/// to whichever format ran, but is refused with `-v`/`-vv`
+/// (builtin/branch.c:842-847).
 ///
-/// That is a much narrower set than git's: `git branch --format` runs the same
-/// `ref-filter.c` machinery `for-each-ref` does, so every atom on
-/// [`super::for_each_ref::parse_atom`] is legal there, as are `%(if)`, `%(align)`
-/// and the quoting styles. Measured against stock git 2.55.0 over the 127-atom
-/// corpus in this port's differential harness, `branch --format` agrees on 7
-/// and `for-each-ref --format` on 127. Closing that gap means driving branch's
-/// listing through the shared atom evaluator rather than widening this table:
-/// an atom accepted here but rendered from a different, thinner entry model
-/// would be a wrong value at exit 0, which is worse than the refusal.
+/// Two things `git branch` does *not* inherit from `filter_and_format_refs()`:
+/// `--shell`/`--perl`/`--python`/`--tcl` (its option table has no `OPT_QUOTING`,
+/// so they are `error: unknown option`), and `filter_is_base()`, which
+/// `print_ref_list()` simply never calls — so `%(is-base:<x>)` is empty for
+/// every branch even where `git for-each-ref` marks one.
 ///
 /// `--edit-description` is refused: it needs an interactive
 /// editor loop that is not wired in this environment. `--recurse-submodules`
@@ -573,6 +555,7 @@ pub fn branch(args: &[String]) -> Result<ExitCode> {
         verbose: 0,
         format: None,
         sorts: Vec::new(),
+        sort_cleared: false,
         delete: false,
         rename: false,
         copy: false,
@@ -960,7 +943,10 @@ fn apply_long(
         ("format", false) => o.format = value,
         ("format", true) => o.format = None,
         ("sort", false) => o.sorts.push(val()),
-        ("sort", true) => o.sorts.clear(),
+        ("sort", true) => {
+            o.sorts.clear();
+            o.sort_cleared = true;
+        }
         ("points-at", false) => o.points_at.push(val()),
         ("points-at", true) => o.points_at.clear(),
         // `OPT_COLUMN`: a bad `<style>` token is the callback's own error.
@@ -990,225 +976,6 @@ fn show_current(repo: &gix::Repository) -> Result<ExitCode> {
         println!("{}", name.shorten());
     }
     Ok(ExitCode::SUCCESS)
-}
-
-/// Collect the lines `git branch` would print, in git's order: the detached-HEAD
-/// pseudo entry first, then refs sorted by full name (which puts `refs/heads/*`
-/// ahead of `refs/remotes/*` for free).
-fn collect_entries<'repo>(
-    repo: &'repo gix::Repository,
-    o: &Opts,
-    sort_keys: &[SortKey],
-    filters: &Filters,
-) -> Result<Vec<Entry<'repo>>> {
-    let head = repo.head()?;
-    let current_ref: Option<BString> = head.referent_name().map(|n| n.as_bstr().to_owned());
-
-    let mut detached: Option<Entry<'repo>> = None;
-    if o.mode != ListMode::Remotes && head.is_detached() {
-        if let Some(id) = head.id() {
-            let display = format!("(HEAD detached at {})", id.shorten_or_id());
-            detached = Some(Entry {
-                full: BString::default(),
-                short: display.clone(),
-                display,
-                id: Some(id),
-                symref: None,
-                current: true,
-                remote: false,
-                detached: true,
-                worktreepath: None,
-                keys: Vec::new(),
-            });
-        }
-    }
-
-    let mut refs: Vec<Entry<'repo>> = Vec::new();
-
-    if o.mode != ListMode::Remotes {
-        // git's `ref_to_worktree_map`, built lazily by `%(worktreepath)`.
-        let wt_map = worktree_map(repo);
-        for r in repo.references()?.local_branches()? {
-            let r = r.map_err(|e| anyhow!("{e}"))?;
-            if !resolves(&r) {
-                continue;
-            }
-            let full = r.name().as_bstr().to_owned();
-            let short = r.name().shorten().to_string();
-            let (id, symref) = target_of(&r);
-            refs.push(Entry {
-                current: current_ref.as_ref() == Some(&full),
-                worktreepath: wt_map.get(&full).cloned(),
-                full,
-                display: short.clone(),
-                short,
-                id,
-                symref,
-                remote: false,
-                detached: false,
-                keys: Vec::new(),
-            });
-        }
-    }
-
-    if o.mode != ListMode::Local {
-        for r in repo.references()?.remote_branches()? {
-            let r = r.map_err(|e| anyhow!("{e}"))?;
-            if !resolves(&r) {
-                continue;
-            }
-            let full = r.name().as_bstr().to_owned();
-            let short = r.name().shorten().to_string();
-            // Under `-a` git disambiguates remote refs with a `remotes/` prefix;
-            // under `-r` the namespace is already implied.
-            let display = if o.mode == ListMode::All {
-                format!("remotes/{short}")
-            } else {
-                short.clone()
-            };
-            let (id, symref) = target_of(&r);
-            refs.push(Entry {
-                full,
-                display,
-                short,
-                id,
-                symref,
-                current: false,
-                remote: true,
-                detached: false,
-                worktreepath: None,
-                keys: Vec::new(),
-            });
-        }
-    }
-
-    // Default order is git's implicit ascending refname; an explicit sort (from
-    // `--sort` or `branch.sort`) precomputes a comparable value per key per ref
-    // and orders by them, with the most-significant key given last and a final
-    // refname tie-break — matching git's `ref-filter` sort. `-i`/`--ignore-case`
-    // folds the string comparisons the way git's icase sort does.
-    let icase = o.ignore_case;
-    if sort_keys.is_empty() {
-        refs.sort_by(|a, b| icmp(&a.full, &b.full, icase));
-    } else {
-        for e in &mut refs {
-            let facts = e.id.and_then(|id| commit_facts(repo, id.detach()));
-            e.keys = sort_keys
-                .iter()
-                .map(|k| fold_sort_val(sort_value(e, facts.as_ref(), k), icase))
-                .collect();
-        }
-        // git seeds `versioncmp`'s prerelease list from config once, lazily.
-        let prereleases = Prereleases::new(repo);
-        refs.sort_by(|a, b| {
-            for (idx, key) in sort_keys.iter().enumerate().rev() {
-                let mut ord = a.keys[idx].cmp(&b.keys[idx], &prereleases);
-                if key.reverse {
-                    ord = ord.reverse();
-                }
-                if ord != Ordering::Equal {
-                    return ord;
-                }
-            }
-            icmp(&a.full, &b.full, icase)
-        });
-    }
-
-    // `--list <pattern>...` keeps refs whose short name matches any glob. The
-    // detached pseudo entry is not a ref and never matches a pattern.
-    if !o.names.is_empty() {
-        let mode = if icase {
-            gix::glob::wildmatch::Mode::IGNORE_CASE
-        } else {
-            gix::glob::wildmatch::Mode::empty()
-        };
-        refs.retain(|e| {
-            o.names.iter().any(|p| {
-                gix::glob::wildmatch(BStr::new(p.as_bytes()), BStr::new(e.short.as_bytes()), mode)
-            })
-        });
-        detached = None;
-    }
-
-    let mut out = Vec::with_capacity(refs.len() + 1);
-    out.extend(detached);
-    out.append(&mut refs);
-
-    // Reachability / points-at filters, applied to every candidate line (git's
-    // ref-filter drops any ref that is not a commit or fails a filter).
-    if !filters.is_empty() {
-        let mut kept = Vec::with_capacity(out.len());
-        for e in out {
-            if passes_filters(repo, filters, e.id.map(|id| id.detach()))? {
-                kept.push(e);
-            }
-        }
-        out = kept;
-    }
-
-    Ok(out)
-}
-
-/// Whether a candidate line survives the reachability/points-at filters. A line
-/// with no commit id (a symbolic ref) is dropped whenever any filter is active,
-/// as git does when the ref does not peel to a commit.
-fn passes_filters(
-    repo: &gix::Repository,
-    filters: &Filters,
-    id: Option<ObjectId>,
-) -> Result<bool> {
-    let Some(tip) = id else {
-        return Ok(false);
-    };
-    if !filters.points_at.is_empty() && !filters.points_at.contains(&tip) {
-        return Ok(false);
-    }
-    // `--contains=<c>`: the ref must be a descendant of `<c>`.
-    if !filters.contains.is_empty() {
-        let mut any = false;
-        for &c in &filters.contains {
-            if is_ancestor(repo, c, tip)? {
-                any = true;
-                break;
-            }
-        }
-        if !any {
-            return Ok(false);
-        }
-    }
-    for &c in &filters.no_contains {
-        if is_ancestor(repo, c, tip)? {
-            return Ok(false);
-        }
-    }
-    // `--merged=<m>`: the ref must be reachable from `<m>`.
-    if !filters.merged.is_empty() {
-        let mut any = false;
-        for &m in &filters.merged {
-            if is_ancestor(repo, tip, m)? {
-                any = true;
-                break;
-            }
-        }
-        if !any {
-            return Ok(false);
-        }
-    }
-    for &m in &filters.no_merged {
-        if is_ancestor(repo, tip, m)? {
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
-
-/// git's `repo_in_merge_bases`: whether `ancestor` is reachable from `descendant`.
-fn is_ancestor(repo: &gix::Repository, ancestor: ObjectId, descendant: ObjectId) -> Result<bool> {
-    if ancestor == descendant {
-        return Ok(true);
-    }
-    let bases = repo.merge_bases_many(descendant, &[ancestor])?;
-    Ok(bases.into_iter().any(|b| b.detach() == ancestor))
 }
 
 
@@ -1268,15 +1035,6 @@ pub(crate) fn worktree_map(repo: &gix::Repository) -> std::collections::HashMap<
     map
 }
 
-/// git's `%(upstream:short)` for a local branch: the shortened name of the
-/// remote-tracking ref it is configured to track, or `None` when it tracks
-/// nothing (so the whole `-vv` tracking field is suppressed).
-fn upstream_short(repo: &gix::Repository, full: &BStr) -> Option<(FullName, String)> {
-    let up = upstream_ref(repo, full)?;
-    let short = up.shorten().to_string();
-    Some((up, short))
-}
-
 /// git's `branch_get_upstream`: the remote-tracking ref `full` is configured to
 /// build on, or `None` when it tracks nothing.
 pub(crate) fn upstream_ref(repo: &gix::Repository, full: &BStr) -> Option<FullName> {
@@ -1334,45 +1092,6 @@ pub(crate) fn stat_tracking_info(
     ))
 }
 
-/// git's `%(upstream:track)` text, sans brackets — `gone` when the configured
-/// upstream ref no longer exists, `ahead N` / `behind N` / `ahead N, behind M`
-/// when the two tips have diverged, and the empty string when they agree
-/// (`fill_remote_ref_details`, `ref-filter.c`).
-pub(crate) fn upstream_track(
-    repo: &gix::Repository,
-    local: Option<gix::Id<'_>>,
-    upstream: &FullName,
-) -> String {
-    match stat_tracking_info(repo, local, upstream) {
-        None => "gone".into(),
-        Some((0, 0)) => String::new(),
-        Some((0, t)) => format!("behind {t}"),
-        Some((o, 0)) => format!("ahead {o}"),
-        Some((o, t)) => format!("ahead {o}, behind {t}"),
-    }
-}
-
-/// Split a reference's target into a commit id or a symbolic-ref short name.
-/// Whether `for_each_ref()` would hand this ref to the listing at all.
-///
-/// git drops refs that do not resolve (`ref_resolves_to_object()`), and a
-/// symbolic ref whose target is gone is exactly that: `refs/remotes/<remote>/HEAD`
-/// still naming a default branch the remote has since renamed. git omits it from
-/// `branch -a`/`-r` rather than printing a line that points nowhere.
-fn resolves(r: &gix::Reference<'_>) -> bool {
-    match r.target() {
-        gix::refs::TargetRef::Object(_) => true,
-        gix::refs::TargetRef::Symbolic(_) => r.clone().peel_to_id().is_ok(),
-    }
-}
-
-fn target_of<'repo>(r: &gix::Reference<'repo>) -> (Option<gix::Id<'repo>>, Option<String>) {
-    match r.target() {
-        gix::refs::TargetRef::Object(_) => (Some(r.id()), None),
-        gix::refs::TargetRef::Symbolic(name) => (None, Some(name.shorten().to_string())),
-    }
-}
-
 /// Per-slot colors for the branch listing, resolved once. `on` is false when
 /// coloring is disabled, in which case no SGR (and no reset) is emitted.
 struct Colors {
@@ -1391,37 +1110,6 @@ struct Colors {
     /// this a slot of its own (`BRANCH_COLOR_RESET`), so a user can replace the
     /// plain `\e[m` with any spec.
     reset: String,
-}
-
-impl Colors {
-    /// The SGR to open a line's color, given its slot, mirroring the branch
-    /// order in git's `build_format`: HEAD wins, then a branch checked out in
-    /// another worktree, then plain local. Remote refs take their own slot.
-    /// Local branches default to `normal`, which renders as an empty SGR — but
-    /// git still emits the reset.
-    fn open(&self, e: &Entry<'_>) -> &str {
-        if e.current || e.detached {
-            &self.current
-        } else if e.remote {
-            &self.remote
-        } else if e.worktreepath.is_some() {
-            &self.worktree
-        } else {
-            &self.local
-        }
-    }
-
-    /// The two-character marker git puts in front of the name: `* ` for HEAD,
-    /// `+ ` for a branch checked out in another worktree, `  ` otherwise.
-    fn marker(&self, e: &Entry<'_>) -> &'static str {
-        if e.current || e.detached {
-            "* "
-        } else if !e.remote && e.worktreepath.is_some() {
-            "+ "
-        } else {
-            "  "
-        }
-    }
 }
 
 /// `color_branch_slots[]` — every name `git_branch_config()` accepts under
@@ -1577,33 +1265,45 @@ fn color_code(word: &str, bg: bool) -> Option<String> {
     Some(((if is_bright { bright } else { base }) + idx).to_string())
 }
 
-/// Print the branch listing. `--format` replaces the whole line and takes
-/// precedence over `-v`; `-v` pads names into a column and appends the
-/// abbreviated commit and its subject.
+/// `print_ref_list()` (builtin/branch.c:445-502): filter the refs this listing
+/// asked for, size the name column from what survived, build the format string
+/// unless the user gave one, and hand the whole thing to the shared
+/// `ref-filter` evaluator. `--format` therefore *replaces* `-v`'s layout rather
+/// than being overridden by it — `if (!format->format)` is the only place
+/// [`build_format`] is reached.
 fn list_branches(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
-    // git seeds the sort list from the multi-valued `branch.sort` config while
-    // reading config, then appends every `--sort` from the command line. The CLI
-    // keys therefore end up most significant (each key added later outranks the
-    // earlier ones), yet the config keys still participate and are still
-    // validated — so an invalid `branch.sort` is fatal even with a valid `--sort`.
-    let mut sorts: Vec<String> = repo
-        .config_snapshot()
-        .plumbing()
-        .values::<BString>("branch.sort")
-        .unwrap_or_default()
-        .into_iter()
-        .map(|v| v.to_string())
-        .collect();
-    sorts.extend(o.sorts.iter().cloned());
-
-    // git validates every field name while reading options/config, dying on the
-    // first bad key with exit 128; a field it accepts but this port cannot back is
-    // refused rather than mis-sorted.
-    let sort_keys = match resolve_sort(&sorts) {
-        Err(SortErr::Fatal(msg)) => return fatal(msg),
-        Err(SortErr::Unsupported(spec)) => bail!("--sort={spec} is not supported by this port"),
-        Ok(keys) => keys,
+    // ```c
+    // repo_config(the_repository, git_branch_config, &sorting_options);
+    // if (!sorting_options.nr)
+    //         string_list_append(&sorting_options, "refname");
+    // ```
+    // (builtin/branch.c:795-797) — *before* `parse_options()`. So the
+    // `branch.sort` values come first, an implicit `refname` stands in when there
+    // are none, and every `--sort` from the command line appends after them,
+    // ending up most significant. A `--no-sort` clears the lot, config and
+    // implicit key included, which is what leaves `sorting` NULL.
+    let mut sorts: Vec<String> = if o.sort_cleared {
+        Vec::new()
+    } else {
+        let mut cfg: Vec<String> = repo
+            .config_snapshot()
+            .plumbing()
+            .values::<BString>("branch.sort")
+            .unwrap_or_default()
+            .into_iter()
+            .map(|v| v.to_string())
+            .collect();
+        if cfg.is_empty() {
+            cfg.push("refname".to_string());
+        }
+        cfg
     };
+    sorts.extend(o.sorts.iter().cloned());
+    // `ref_array_sort()` runs only `if (sorting)`, and
+    // `REF_SORTING_DETACHED_HEAD_FIRST` lives on the sorting nodes — so with an
+    // empty list nothing moves, and the detached pseudo entry stays where
+    // `do_filter_refs()` appended it: last.
+    let detached_head_first = !sorts.is_empty();
 
     // Resolve every reachability filter before walking refs. The operand's own
     // callback decides the diagnostic and the status — 129 for the two that
@@ -1613,91 +1313,199 @@ fn list_branches(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
         Err(e) => return Ok(e.report()),
     };
 
-    let entries = collect_entries(repo, o, &sort_keys, &filters)?;
-
-    let column_on = super::column::active(o.colopts);
-
-    if let Some(fmt) = &o.format {
-        // Render every line before printing any, so a bad atom fails the command
-        // without having emitted a partial listing.
-        let mut lines = Vec::with_capacity(entries.len());
-        for e in &entries {
-            // The detached pseudo entry is a `ref_array_item` like any other, so it
-            // renders through the format too: `--format=0` prints `0` for it, and an
-            // empty format an empty line. Only its name is special — `%(refname)`
-            // resolves to `get_head_description()`, which is what `atom_value()` hands
-            // back for a detached entry.
-            lines.push(render_format(repo, fmt, e)?);
-        }
-        // `--omit-empty` drops a line that rendered to nothing rather than
-        // printing its bare newline (ref-filter's `array_opts.omit_empty`).
-        if o.omit_empty {
-            lines.retain(|l| !l.is_empty());
-        }
-        if column_on {
-            emit_columns(o.colopts, lines.iter().map(|l| l.as_bytes().to_vec()).collect());
-        } else {
-            for line in lines {
-                println!("{line}");
-            }
-        }
-        return Ok(ExitCode::SUCCESS);
-    }
-
     let colors = resolve_colors(repo, o.color);
 
-    if o.verbose > 0 {
-        // git pads every name into one column sized by the widest entry, then
-        // separates it from the commit info by a single space.
-        let width = entries
-            .iter()
-            .map(|e| e.display.chars().count())
-            .max()
-            .unwrap_or(0);
-        for e in &entries {
-            let marker = colors.marker(e);
-            let info = match &e.symref {
-                Some(sym) => format!("-> {sym}"),
-                None => verbose_info(repo, e, o.abbrev, o.verbose, &colors),
-            };
-            let pad = " ".repeat(width - e.display.chars().count());
-            if colors.on {
-                println!("{marker}{}{}{pad}{} {info}", colors.open(e), e.display, colors.reset);
-            } else {
-                println!("{marker}{}{pad} {info}", e.display);
+    // `filter.kind`, and the `remote_prefix` that widens a remote-tracking name
+    // whenever local refs are in the same listing (builtin/branch.c:459-460).
+    let kinds = match o.mode {
+        ListMode::Local => ref_filter::kind::BRANCHES,
+        ListMode::Remotes => ref_filter::kind::REMOTES,
+        ListMode::All => ref_filter::kind::BRANCHES | ref_filter::kind::REMOTES,
+    };
+    let remote_prefix = if o.mode == ListMode::Remotes {
+        ""
+    } else {
+        "remotes/"
+    };
+
+    // `git branch --list` also shows HEAD when it is detached:
+    //
+    //     if ((filter.kind & FILTER_REFS_BRANCHES) && filter.detached)
+    //             filter.kind |= FILTER_REFS_DETACHED_HEAD;
+    let head = repo.head()?;
+    let head_desc = if kinds & ref_filter::kind::BRANCHES != 0 && head.is_detached() {
+        // `get_head_description()` (ref-filter.c:2297-2327) names the *switch* the
+        // reflog recorded, not the object HEAD holds, and says `at` only while
+        // HEAD still sits on it:
+        //
+        // ```c
+        // else if (state.detached_from) {
+        //         if (state.detached_at)
+        //                 strbuf_addf(&desc, _("(HEAD detached at %s)"), state.detached_from);
+        //         else
+        //                 strbuf_addf(&desc, _("(HEAD detached from %s)"), state.detached_from);
+        // } else
+        //         strbuf_addstr(&desc, _("(no branch)"));
+        // ```
+        //
+        // `wt_status_get_detached_from()` is the same one `git status`'s long
+        // format uses, so the two commands cannot disagree about the wording.
+        Some(
+            match super::status::detached_from(repo) {
+                Some((name, true)) => format!("(HEAD detached at {name})"),
+                Some((name, false)) => format!("(HEAD detached from {name})"),
+                // NULL `detached_from`: a hand-written HEAD, or a pruned reflog.
+                None => "(no branch)".to_string(),
             }
-        }
+            .into_bytes(),
+        )
+    } else {
+        None
+    };
+
+    let kinds = kinds | if head_desc.is_some() { ref_filter::kind::DETACHED_HEAD } else { 0 };
+    let built = |cands: &[ref_filter::Candidate]| -> Vec<u8> {
+        let maxwidth = if o.verbose > 0 {
+            calc_maxwidth(cands, remote_prefix.len())
+        } else {
+            0
+        };
+        build_format(o, &colors, maxwidth, remote_prefix)
+    };
+    let spec = ref_filter::ListSpec {
+        repo,
+        format: match &o.format {
+            Some(f) => ref_filter::Format::Fixed(f.as_bytes().to_vec()),
+            None => ref_filter::Format::Built(&built),
+        },
+        sort_specs: sorts,
+        kinds,
+        patterns: o.names.clone(),
+        ignore_case: o.ignore_case,
+        points_at: filters.points_at.clone(),
+        filters: filters.shared(),
+        omit_empty: o.omit_empty,
+        color_on: colors.on,
+        head_desc,
+        // `print_ref_list()` (builtin/branch.c:476-477) has no `filter_is_base()`
+        // call, so `%(is-base:<x>)` is always empty under `git branch`.
+        run_is_base: false,
+        detached_head_first,
+    };
+
+    let lines = match ref_filter::filter_and_format(&spec)? {
+        ref_filter::Listing::Lines(lines) => lines,
+        ref_filter::Listing::Exit(code) => return Ok(code),
+    };
+
+    if super::column::active(o.colopts) {
+        emit_columns(o.colopts, lines);
         return Ok(ExitCode::SUCCESS);
     }
-
-    // git formats every entry (marker + optional color + name) into a string_list
-    // and hands it to `print_columns` when columns are active, else writes each
-    // line directly.
-    let mut cells: Vec<Vec<u8>> = Vec::new();
-    for e in &entries {
-        let marker = colors.marker(e);
-        // Both non-verbose branches of `build_format` close the name with the
-        // reset and then append `%(if)%(symref)%(then) -> %(symref:short)`, so a
-        // symbolic ref such as `origin/HEAD` names its target here too.
-        let symref = match &e.symref {
-            Some(sym) => format!(" -> {sym}"),
-            None => String::new(),
-        };
-        let line = if colors.on {
-            format!("{marker}{}{}{}{symref}", colors.open(e), e.display, colors.reset)
-        } else {
-            format!("{marker}{}{symref}", e.display)
-        };
-        if column_on {
-            cells.push(line.into_bytes());
-        } else {
-            println!("{line}");
-        }
+    let mut out: Vec<u8> = Vec::new();
+    for line in lines {
+        out.extend_from_slice(&line);
+        out.push(b'\n');
     }
-    if column_on {
-        emit_columns(o.colopts, cells);
-    }
+    std::io::stdout().write_all(&out)?;
     Ok(ExitCode::SUCCESS)
+}
+
+/// `calc_maxwidth()` (builtin/branch.c:351-374): the widest name in the filtered
+/// array, measured after its namespace prefix is stripped, with remote-tracking
+/// names charged for the `remotes/` they will be printed with.
+fn calc_maxwidth(cands: &[ref_filter::Candidate], remote_bonus: usize) -> usize {
+    let mut max = 0;
+    for c in cands {
+        let mut w = match &c.head_desc {
+            Some(desc) => String::from_utf8_lossy(desc).chars().count(),
+            None => {
+                let desc = c
+                    .refname
+                    .strip_prefix(b"refs/heads/".as_slice())
+                    .or_else(|| c.refname.strip_prefix(b"refs/remotes/".as_slice()))
+                    .unwrap_or(&c.refname);
+                String::from_utf8_lossy(desc).chars().count()
+            }
+        };
+        if c.kind == ref_filter::kind::REMOTES {
+            w += remote_bonus;
+        }
+        max = max.max(w);
+    }
+    max
+}
+
+/// `build_format()` (builtin/branch.c:386-443) — the format string `git branch`
+/// falls back to when no `--format` was given.
+///
+/// Every decoration `git branch` is known for is in here and nowhere else: the
+/// `* ` current marker, the `+ ` worktree marker, the color slots, the padded
+/// name column under `-v`, the `-> <symref:short>` tail, and the `-vv` upstream
+/// and ahead/behind fields. They are ordinary atoms evaluated by the same
+/// `ref-filter` machinery `--format` runs on, which is why `--format` replaces
+/// all of them at once rather than composing with any of them.
+fn build_format(o: &Opts, colors: &Colors, maxwidth: usize, remote_prefix: &str) -> Vec<u8> {
+    let reset = colors.reset.as_str();
+    let mut local = format!(
+        "%(if)%(HEAD)%(then)* {}%(else)%(if)%(worktreepath)%(then)+ {}%(else)  {}%(end)%(end)",
+        colors.current, colors.worktree, colors.local
+    );
+    let mut remote = format!("  {}", colors.remote);
+
+    if o.verbose > 0 {
+        let obname = match o.abbrev {
+            None => "%(objectname:short)".to_string(),
+            Some(0) => "%(objectname)".to_string(),
+            Some(n) => format!("%(objectname:short={n})"),
+        };
+        local.push_str(&format!(
+            "%(align:{maxwidth},left)%(refname:lstrip=2)%(end)"
+        ));
+        local.push_str(reset);
+        local.push_str(&format!(" {obname} "));
+
+        if o.verbose > 1 {
+            local.push_str(&format!(
+                "%(if:notequals=*)%(HEAD)%(then)%(if)%(worktreepath)%(then)({}%(worktreepath){}) %(end)%(end)",
+                colors.worktree, reset
+            ));
+            local.push_str(&format!(
+                "%(if)%(upstream)%(then)[{}%(upstream:short){}%(if)%(upstream:track)\
+                 %(then): %(upstream:track,nobracket)%(end)] %(end)%(contents:subject)",
+                colors.upstream, reset
+            ));
+        } else {
+            local.push_str(
+                "%(if)%(upstream:track)%(then)%(upstream:track) %(end)%(contents:subject)",
+            );
+        }
+
+        remote.push_str(&format!(
+            "%(align:{maxwidth},left){}%(refname:lstrip=2)%(end){}\
+             %(if)%(symref)%(then) -> %(symref:short)\
+             %(else) {obname} %(contents:subject)%(end)",
+            quote_literal_for_format(remote_prefix),
+            reset
+        ));
+    } else {
+        local.push_str(&format!(
+            "%(refname:lstrip=2){reset}%(if)%(symref)%(then) -> %(symref:short)%(end)"
+        ));
+        remote.push_str(&format!(
+            "{}%(refname:lstrip=2){reset}%(if)%(symref)%(then) -> %(symref:short)%(end)",
+            quote_literal_for_format(remote_prefix)
+        ));
+    }
+
+    format!("%(if:notequals=refs/remotes)%(refname:rstrip=-2)%(then){local}%(else){remote}%(end)")
+        .into_bytes()
+}
+
+/// `quote_literal_for_format()` (builtin/branch.c:376-384): a literal spliced
+/// into a format string has to double its `%`, or it would be read as an atom.
+fn quote_literal_for_format(s: &str) -> String {
+    s.replace('%', "%%")
 }
 
 /// Lay `cells` out through the shared column engine (git's `print_columns` with
@@ -1754,155 +1562,6 @@ fn resolve_filters(
     })
 }
 
-/// The `-v` tail: abbreviated object name, the tracking field, and the commit
-/// subject. A tip whose object cannot be read or is not a commit degrades to the
-/// abbreviation alone rather than failing the whole listing.
-///
-/// The tracking field is git's `build_format` verbose tail. Under `-v` it is
-/// `%(if)%(upstream:track)%(then)%(upstream:track) %(end)` — the bracketed
-/// divergence alone. Under `-vv` it is the `(<worktreepath>) ` of a branch
-/// checked out in *another* working tree followed by
-/// `[<upstream:short>[: <track,nobracket>]] `, with `color.branch.upstream`
-/// painting the upstream name and `color.branch.worktree` the path.
-fn verbose_info(
-    repo: &gix::Repository,
-    e: &Entry<'_>,
-    abbrev: Option<usize>,
-    verbose: u8,
-    colors: &Colors,
-) -> String {
-    let Some(id) = e.id else {
-        return String::new();
-    };
-    let mut out = abbrev_hex(repo, id, abbrev);
-
-    if !e.remote {
-        let upstream = upstream_short(repo, e.full.as_bstr());
-        if verbose > 1 {
-            // git guards this with `%(if:notequals=*)%(HEAD)`, so the tree the
-            // current branch is checked out in is never named.
-            if let Some(path) = e.worktreepath.as_ref().filter(|_| !e.current) {
-                out.push_str(&format!(
-                    " ({}{path}{})",
-                    colors.worktree,
-                    if colors.on { &colors.reset } else { "" }
-                ));
-            }
-            if let Some((full, short)) = upstream {
-                let track = upstream_track(repo, e.id, &full);
-                let track = if track.is_empty() {
-                    String::new()
-                } else {
-                    format!(": {track}")
-                };
-                out.push_str(&format!(
-                    " [{}{short}{}{track}]",
-                    colors.upstream,
-                    if colors.on { &colors.reset } else { "" }
-                ));
-            }
-        } else if let Some((full, _)) = upstream {
-            let track = upstream_track(repo, e.id, &full);
-            if !track.is_empty() {
-                out.push_str(&format!(" [{track}]"));
-            }
-        }
-    }
-
-    let Ok(object) = id.object() else {
-        return out;
-    };
-    let Ok(commit) = object.try_into_commit() else {
-        return out;
-    };
-    match commit.message() {
-        Ok(msg) => format!("{out} {}", msg.summary()),
-        Err(_) => out,
-    }
-}
-
-/// git's `find_unique_abbrev` for the `-v` object column: `--abbrev=0`/
-/// `--no-abbrev` prints the full hash, an explicit `<n>` is clamped to at least
-/// `MINIMUM_ABBREV` and extended to a unique prefix, and the default follows
-/// `core.abbrev`.
-fn abbrev_hex(repo: &gix::Repository, id: gix::Id<'_>, abbrev: Option<usize>) -> String {
-    let hexsz = repo.object_hash().len_in_hex();
-    let want = match abbrev {
-        Some(0) => return id.detach().to_string(),
-        Some(n) => n.clamp(MINIMUM_ABBREV, hexsz),
-        None => return id.shorten_or_id().to_string(),
-    };
-    if want >= hexsz {
-        return id.detach().to_string();
-    }
-    match gix::odb::store::prefix::disambiguate::Candidate::new(id.detach(), want)
-        .ok()
-        .and_then(|c| repo.objects.disambiguate_prefix(c).ok().flatten())
-    {
-        Some(p) => p.to_string(),
-        None => id.detach().to_hex_with_len(want).to_string(),
-    }
-}
-
-/// Expand a `--format` template for one entry. Supports `%%` and the atom set
-/// documented on [`branch`]; an unrecognized atom is reported as a gap rather
-/// than silently expanding to nothing.
-fn render_format(repo: &gix::Repository, fmt: &str, e: &Entry<'_>) -> Result<String> {
-    let chars: Vec<char> = fmt.chars().collect();
-    let mut out = String::new();
-    let mut i = 0;
-    while i < chars.len() {
-        if chars[i] == '%' && i + 1 < chars.len() && chars[i + 1] == '%' {
-            out.push('%');
-            i += 2;
-            continue;
-        }
-        if chars[i] == '%' && i + 1 < chars.len() && chars[i + 1] == '(' {
-            let close = chars[i + 2..]
-                .iter()
-                .position(|c| *c == ')')
-                .ok_or_else(|| anyhow!("format: missing ')'"))?
-                + i
-                + 2;
-            let atom: String = chars[i + 2..close].iter().collect();
-            out.push_str(&atom_value(repo, &atom, e)?);
-            i = close + 1;
-            continue;
-        }
-        out.push(chars[i]);
-        i += 1;
-    }
-    Ok(out)
-}
-
-/// Resolve a single `%(...)` atom.
-fn atom_value(repo: &gix::Repository, atom: &str, e: &Entry<'_>) -> Result<String> {
-    Ok(match atom {
-        // The detached pseudo entry has no ref name; `get_head_description()` stands in
-        // for it, which is why `%(refname)` and `%(refname:short)` both print
-        // `(HEAD detached at <abbrev>)`.
-        "refname" if e.detached => e.display.clone(),
-        "refname" => e.full.to_string(),
-        "refname:short" => e.short.clone(),
-        "objectname" => e.id.map(|id| id.to_string()).unwrap_or_default(),
-        "objectname:short" => e
-            .id
-            .map(|id| id.shorten_or_id().to_string())
-            .unwrap_or_default(),
-        "HEAD" => if e.current { "*" } else { " " }.to_string(),
-        // `%(upstream)` and its `:short` form, from the same `branch_get_upstream`
-        // lookup `-vv` prints — empty for a branch that tracks nothing, and for
-        // every remote-tracking ref (which has no upstream of its own).
-        "upstream" => upstream_ref(repo, e.full.as_ref())
-            .map(|up| up.as_bstr().to_string())
-            .unwrap_or_default(),
-        "upstream:short" => upstream_short(repo, e.full.as_ref())
-            .map(|(_, short)| short)
-            .unwrap_or_default(),
-        other => anyhow::bail!("unsupported --format atom \"%({other})\""),
-    })
-}
-
 /// Create a local branch. With no `<start-point>` it starts at the current HEAD
 /// commit; with one, at that resolved commit. `-t`/`--track`/`branch.autoSetupMerge`
 /// then records the upstream, and `-f` allows overwriting an existing branch.
@@ -1912,6 +1571,23 @@ fn create_branch(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
     }
     let name = o.names[0].as_str();
     let full = format!("refs/heads/{name}");
+
+    // `-a`/`-r` widen `filter.kind`, and the creation arm refuses to run under a
+    // widened one — before `--set-upstream` and before any name validation:
+    //
+    // ```c
+    // if (filter.kind != FILTER_REFS_BRANCHES)
+    //         die(_("the -a, and -r, options to 'git branch' do not take a branch name.\n"
+    //               "Did you mean to use: -a|-r --list <pattern>?"));
+    // ```
+    // (builtin/branch.c:1000-1002). Without this, `git branch -a <name>` quietly
+    // *creates* `<name>` at HEAD and exits 0.
+    if o.mode != ListMode::Local {
+        return fatal(
+            "the -a, and -r, options to 'git branch' do not take a branch name.\n\
+             Did you mean to use: -a|-r --list <pattern>?",
+        );
+    }
 
     // The hidden `--set-upstream` is accepted by the parser and refused here, by
     // name, ahead of any name validation:
@@ -2861,276 +2537,6 @@ fn delete_branches(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
     }
 
     Ok(ExitCode::SUCCESS)
-}
-
-// ---------------------------------------------------------------------------
-// `--sort` / `branch.sort`
-//
-// git parses branch sort keys through the same `ref-filter` machinery as
-// `git tag --sort` / `git for-each-ref --sort`. A branch tip is always a commit,
-// so the annotated-tag layer that `git tag` needs is absent here; the field set
-// below is the subset of `ref-filter`'s atoms that a commit populates.
-// ---------------------------------------------------------------------------
-
-/// One resolved sort key.
-struct SortKey {
-    reverse: bool,
-    kind: SortKind,
-}
-
-/// What a sort key extracts and how it compares.
-enum SortKind {
-    /// Compare the full refname with git's `versioncmp`.
-    Version,
-    /// Compare a `long` numerically (dates by seconds, size by bytes).
-    Numeric(NumField),
-    /// Render this atom to bytes and compare bytewise.
-    Rendered(RenderField),
-}
-
-enum NumField {
-    CommitterDate,
-    AuthorDate,
-    CreatorDate,
-    /// A branch tip is a commit, so it has no tagger; the value is always 0,
-    /// matching git rendering `taggerdate` as empty for a non-tag object.
-    TaggerDate,
-    Size,
-}
-
-/// A bytewise-compared field. `refname` reads the ref; the rest read the commit.
-enum RenderField {
-    Refname,
-    ObjectName,
-    ObjectType,
-    CommitterName,
-    CommitterEmail,
-    AuthorName,
-    AuthorEmail,
-    Subject,
-    Body,
-    Contents,
-}
-
-/// A precomputed, comparable value for one sort key on one ref.
-enum SortVal {
-    Num(i64),
-    Bytes(Vec<u8>),
-    Version(Vec<u8>),
-}
-
-impl SortVal {
-    fn cmp(&self, other: &SortVal, pre: &Prereleases<'_>) -> Ordering {
-        match (self, other) {
-            (SortVal::Num(a), SortVal::Num(b)) => a.cmp(b),
-            (SortVal::Bytes(a), SortVal::Bytes(b)) => a.cmp(b),
-            (SortVal::Version(a), SortVal::Version(b)) => refsort::versioncmp(a, b, pre),
-            _ => Ordering::Equal,
-        }
-    }
-}
-
-/// Fold a string-valued sort key to lowercase for `-i`/`--ignore-case`; numeric
-/// keys are unaffected.
-fn fold_sort_val(v: SortVal, icase: bool) -> SortVal {
-    if !icase {
-        return v;
-    }
-    match v {
-        SortVal::Bytes(b) => SortVal::Bytes(b.to_ascii_lowercase()),
-        SortVal::Version(b) => SortVal::Version(b.to_ascii_lowercase()),
-        num => num,
-    }
-}
-
-/// Compare two byte strings, ASCII-folding when `icase` — the refname order used
-/// for the default sort and the final tie-break.
-fn icmp(a: &BString, b: &BString, icase: bool) -> Ordering {
-    if icase {
-        a.to_ascii_lowercase().cmp(&b.to_ascii_lowercase())
-    } else {
-        a.cmp(b)
-    }
-}
-
-/// Why sort resolution failed.
-enum SortErr {
-    /// A field name git itself rejects: emit `fatal: {0}` and exit 128.
-    Fatal(String),
-    /// A field git accepts but this port cannot sort by.
-    Unsupported(String),
-}
-
-/// Validate and interpret every sort key. git dies on the first syntactically
-/// invalid key in the order given, so that is checked first; only then is this
-/// port's narrower support considered.
-fn resolve_sort(sorts: &[String]) -> Result<Vec<SortKey>, SortErr> {
-    for key in sorts {
-        if let Some(msg) = refsort::sort_error(key) {
-            return Err(SortErr::Fatal(msg));
-        }
-    }
-    let mut keys = Vec::with_capacity(sorts.len());
-    for key in sorts {
-        let (reverse, version, star, atom) = refsort::parse_sort_key(key);
-        let field = atom.split(':').next().unwrap_or(atom);
-        // A `:suffix` (e.g. `refname:short`, `objectname:short`) changes the
-        // rendered bytes git sorts on, so a field carrying one this port does not
-        // interpret must be refused rather than mis-sorted. Date fields are the
-        // exception: their suffix is only a display format, while git — like this
-        // port — always sorts a date atom by its underlying timestamp.
-        let suffixed = atom != field;
-        let is_date = matches!(
-            field,
-            "committerdate" | "authordate" | "creatordate" | "taggerdate"
-        );
-        let kind = if version {
-            if field == "refname" && !star && !suffixed {
-                SortKind::Version
-            } else {
-                return Err(SortErr::Unsupported(key.clone()));
-            }
-        } else if star {
-            // Dereference (`*field`) only differs from the plain field for an
-            // annotated tag; a branch never points at one, so this port has no
-            // faithful value for it.
-            return Err(SortErr::Unsupported(key.clone()));
-        } else if suffixed && !is_date {
-            return Err(SortErr::Unsupported(key.clone()));
-        } else {
-            match field {
-                "refname" => SortKind::Rendered(RenderField::Refname),
-                "committerdate" => SortKind::Numeric(NumField::CommitterDate),
-                "authordate" => SortKind::Numeric(NumField::AuthorDate),
-                "creatordate" => SortKind::Numeric(NumField::CreatorDate),
-                "taggerdate" => SortKind::Numeric(NumField::TaggerDate),
-                "objectsize" => SortKind::Numeric(NumField::Size),
-                "objectname" => SortKind::Rendered(RenderField::ObjectName),
-                "objecttype" | "type" => SortKind::Rendered(RenderField::ObjectType),
-                "committername" => SortKind::Rendered(RenderField::CommitterName),
-                "committeremail" => SortKind::Rendered(RenderField::CommitterEmail),
-                "authorname" => SortKind::Rendered(RenderField::AuthorName),
-                "authoremail" => SortKind::Rendered(RenderField::AuthorEmail),
-                "subject" => SortKind::Rendered(RenderField::Subject),
-                "body" => SortKind::Rendered(RenderField::Body),
-                "contents" => SortKind::Rendered(RenderField::Contents),
-                _ => return Err(SortErr::Unsupported(key.clone())),
-            }
-        };
-        keys.push(SortKey { reverse, kind });
-    }
-    Ok(keys)
-}
-
-/// The commit facts a branch sort key can read, decoded once per ref.
-struct CommitFacts {
-    committer_time: i64,
-    author_time: i64,
-    committer_name: Vec<u8>,
-    committer_email: Vec<u8>,
-    author_name: Vec<u8>,
-    author_email: Vec<u8>,
-    message: Vec<u8>,
-    size: u64,
-    kind: Kind,
-}
-
-/// Decode the commit a branch tip names. `None` for a symbolic ref (e.g.
-/// `origin/HEAD`) or any tip that is not a readable commit — such a ref then
-/// sorts with empty/zero keys and falls through to the refname tie-break.
-fn commit_facts(repo: &gix::Repository, id: ObjectId) -> Option<CommitFacts> {
-    let obj = repo.find_object(id).ok()?;
-    let size = obj.data.len() as u64;
-    let kind = obj.kind;
-    if kind != Kind::Commit {
-        return None;
-    }
-    let c = CommitRef::from_bytes(&obj.data, id.kind()).ok()?;
-    let committer = c.committer().ok()?;
-    let author = c.author().ok()?;
-    Some(CommitFacts {
-        committer_time: committer.seconds(),
-        author_time: author.seconds(),
-        committer_name: committer.name.to_vec(),
-        committer_email: committer.email.to_vec(),
-        author_name: author.name.to_vec(),
-        author_email: author.email.to_vec(),
-        message: c.message.to_vec(),
-        size,
-        kind,
-    })
-}
-
-/// Compute the comparable value for one key on one ref.
-fn sort_value(e: &Entry<'_>, facts: Option<&CommitFacts>, key: &SortKey) -> SortVal {
-    match &key.kind {
-        SortKind::Version => SortVal::Version(e.full.to_vec()),
-        SortKind::Numeric(field) => {
-            let n = match field {
-                NumField::CommitterDate => facts.map_or(0, |f| f.committer_time),
-                // A commit's creator is its committer (git's `creatordate` for a
-                // non-tag object is the committer date).
-                NumField::CreatorDate => facts.map_or(0, |f| f.committer_time),
-                NumField::AuthorDate => facts.map_or(0, |f| f.author_time),
-                NumField::TaggerDate => 0,
-                NumField::Size => facts.map_or(0, |f| f.size as i64),
-            };
-            SortVal::Num(n)
-        }
-        SortKind::Rendered(field) => SortVal::Bytes(match field {
-            RenderField::Refname => e.full.to_vec(),
-            RenderField::ObjectName => e.id.map(|id| id.to_string().into_bytes()).unwrap_or_default(),
-            RenderField::ObjectType => match facts {
-                Some(f) => f.kind.as_bytes().to_vec(),
-                None => Vec::new(),
-            },
-            RenderField::CommitterName => facts.map(|f| f.committer_name.clone()).unwrap_or_default(),
-            RenderField::CommitterEmail => facts
-                .map(|f| bracket_email(&f.committer_email))
-                .unwrap_or_default(),
-            RenderField::AuthorName => facts.map(|f| f.author_name.clone()).unwrap_or_default(),
-            RenderField::AuthorEmail => facts
-                .map(|f| bracket_email(&f.author_email))
-                .unwrap_or_default(),
-            RenderField::Subject => facts.map(|f| subject_of(&f.message)).unwrap_or_default(),
-            RenderField::Body => facts.map(|f| body_of(&f.message)).unwrap_or_default(),
-            RenderField::Contents => facts.map(|f| f.message.clone()).unwrap_or_default(),
-        }),
-    }
-}
-
-/// git's `%(committeremail)`/`%(authoremail)` wrap the address in angle brackets;
-/// the sort value is the rendered atom, so match that framing.
-fn bracket_email(email: &[u8]) -> Vec<u8> {
-    let mut v = Vec::with_capacity(email.len() + 2);
-    v.push(b'<');
-    v.extend_from_slice(email);
-    v.push(b'>');
-    v
-}
-
-/// git's subject: the first paragraph, with internal newlines folded to spaces.
-fn subject_of(msg: &[u8]) -> Vec<u8> {
-    let trimmed = {
-        let end = msg.iter().rposition(|&b| b != b'\n').map_or(0, |i| i + 1);
-        &msg[..end]
-    };
-    let sub_end = trimmed
-        .windows(2)
-        .position(|w| w == b"\n\n")
-        .unwrap_or(trimmed.len());
-    trimmed[..sub_end]
-        .iter()
-        .map(|&b| if b == b'\n' { b' ' } else { b })
-        .collect()
-}
-
-/// git's body: everything after the blank line that ends the subject.
-fn body_of(msg: &[u8]) -> Vec<u8> {
-    match msg.windows(2).position(|w| w == b"\n\n") {
-        Some(p) => msg[p + 2..].to_vec(),
-        None => Vec::new(),
-    }
 }
 
 /// Point the last reflog entry's *old* id at `old`, which is what a rename records: the

@@ -603,6 +603,25 @@ pub(crate) fn parse_decoration_style(value: &str) -> Option<DecorateStyle> {
 ///     `--summary`, the patch).
 ///   * `%aN`/`%aE`/`%cN`/`%cE` resolve through `.mailmap` whether or not `--use-mailmap`
 ///     is in effect, and `--author`/`--committer` grep the mailmapped headers while it is.
+///   * `--check` is `DIFF_FORMAT_CHECKDIFF`: it clears every other output format
+///     (`diff_setup_done()`) and reports through `diff_result_code()`'s `02` bit,
+///     while `--exit-code`/`--no-exit-code` is the `01` bit and makes
+///     `log_tree_diff()`'s `all_need_diff` true on its own. A merge under a
+///     combined mode sets neither, because `diff_tree_combined()` never looks at
+///     `DIFF_FORMAT_CHECKDIFF` and has no `has_changes` assignment.
+///   * `--line-prefix=<s>` is `diff_line_prefix()`, written in front of every
+///     emitted line including the header — refused beside `-z`, where git prefixes
+///     each NUL-terminated *record* rather than each NUL.
+///   * `--rename-empty` / `--no-rename-empty` is `o->flags.rename_empty`: with it
+///     off, an empty file that moved reports as a deletion plus an addition
+///     instead of an `R100`.
+///   * `--remerge-diff` / `--diff-merges=remerge` parses and is refused where
+///     `do_remerge_diff()` (log-tree.c:1029-1090) would run — a walk that reaches
+///     no merge is rendered exactly as git renders it.
+///   * `<rev>^@`, `<rev>^!` and `<rev>^-<n>` are decoded by
+///     [`crate::objname::parents_only`] before the revision parser sees the
+///     operand, because they are `handle_revision_arg_1()`'s own grammar
+///     (revision.c:2178-2207) rather than the parser's.
 ///   * Every flag not listed above is rejected.
 /// Which builtin is being run. `cmd_whatchanged()` is `cmd_log()` with two settings
 /// changed: the raw format is the default when nothing else is asked for
@@ -758,6 +777,22 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     let mut name_status = false;
     // `--raw`: the `:<old mode> <new mode> <old sha> <new sha> <status>\t<path>` listing.
     let mut raw = false;
+    // `--check`: `DIFF_FORMAT_CHECKDIFF`, which `diff_setup_done()` lets clear every
+    // other output format — so a commit under it prints its header and the
+    // whitespace report and nothing else. Declared `PARSE_OPT_NONEG`, so there is
+    // no `--no-check`.
+    // `--remerge-diff` / `--diff-merges=remerge` (`revs->remerge_diff`): the mode
+    // is tracked beside [`DiffMerges`] because this port refuses it only where a
+    // merge would actually need the re-merge.
+    let mut remerge = false;
+    // `--line-prefix=<s>` (`diff_line_prefix()`): the string `emit_line_0()` writes
+    // in front of every emitted line, the header `show_log()` wrote included.
+    let mut line_prefix: Vec<u8> = Vec::new();
+    let mut check = false;
+    // `--exit-code` (`o->flags.exit_with_status`), an `OPT_BOOL` (diff.c:6256).
+    // `log_tree_diff()`'s `all_need_diff` is `opt->diff || exit_with_status`, so it
+    // builds the queue on its own even with no format asking for one.
+    let mut exit_code = false;
     let mut stat = false;
     let mut numstat = false;
     let mut shortstat = false;
@@ -963,8 +998,9 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // (diff-merges.c:130-140). It differs from `merges_need_diff` in one way that
     // shows: `diff_merges_setup_revs()` also does `revs->diff = 1` for it
     // (diff-merges.c:186-187), so `git log -c` diffs *every* commit while
-    // `git log --diff-merges=combined` diffs only the merges. Of the spellings it
-    // covers, `--dd` and `--remerge-diff` are not ported, so `-c`/`--cc` set it here.
+    // `git log --diff-merges=combined` diffs only the merges. `-c`, `--cc`, `--dd`
+    // and `--remerge-diff` all raise it; `-m` is the one that does not
+    // (diff-merges.c:125-127).
     let mut merges_imply_patch = false;
     // `--follow`: keep following the one pathspec across renames.
     let mut follow = false;
@@ -1249,6 +1285,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             // Suppress diff output — git treats `-s` as order-sensitive, so a
             // later `--stat`/`-p` re-enables whichever format follows it.
             saw_no_patch = true;
+            check = false;
             stat = false;
             numstat = false;
             shortstat = false;
@@ -1257,6 +1294,14 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             name_only = false;
             name_status = false;
             patch = false;
+        } else if let Some(v) = a.strip_prefix("--line-prefix=") {
+            line_prefix = v.as_bytes().to_vec();
+        } else if a == "--check" {
+            check = true;
+        } else if a == "--exit-code" {
+            exit_code = true;
+        } else if a == "--no-exit-code" {
+            exit_code = false;
         } else if a == "--name-only" {
             name_only = true;
         } else if a == "--name-status" {
@@ -1695,6 +1740,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             // it selects the mode without asking for a patch format.
             diff_merges = DiffMerges::Separate;
             merges_need_diff = false;
+            remerge = false;
             explicit_diff_merges = true;
             // `set_separate()`'s second statement, which is not about the diff at
             // all: `revs->simplify_history = 0` (diff-merges.c:38). It is why
@@ -1705,20 +1751,44 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             diff_merges = DiffMerges::Combined;
             merges_need_diff = true;
             merges_imply_patch = true;
+            remerge = false;
             explicit_diff_merges = true;
         } else if a == "--cc" {
             diff_merges = DiffMerges::DenseCombined;
             merges_need_diff = true;
             merges_imply_patch = true;
+            remerge = false;
             explicit_diff_merges = true;
+        } else if a == "--dd" {
+            // `set_first_parent()` (diff-merges.c:43-47) is `set_separate()` plus
+            // `first_parent_merges`, so it clears `simplify_history` the way
+            // `--diff-merges=separate` does — and, unlike `--first-parent`, it says
+            // nothing about which parents the *walk* follows.
+            diff_merges = DiffMerges::FirstParent;
+            merges_need_diff = true;
+            merges_imply_patch = true;
+            remerge = false;
+            explicit_diff_merges = true;
+            full_history = true;
+        } else if a == "--remerge-diff" {
+            // `set_remerge_diff()` plus `merges_imply_patch = 1`
+            // (diff-merges.c:137-139); refused where the remerge would run.
+            diff_merges = DiffMerges::Separate;
+            remerge = true;
+            merges_need_diff = true;
+            merges_imply_patch = true;
+            explicit_diff_merges = true;
+            full_history = true;
         } else if a == "--no-diff-merges" {
             diff_merges = DiffMerges::Off;
             merges_need_diff = false;
+            remerge = false;
             explicit_diff_merges = true;
         } else if let Some(v) = a.strip_prefix("--diff-merges=") {
             match DiffMerges::parse(v) {
                 Some(m) => {
                     diff_merges = m;
+                    remerge = false;
                     // `set_none()` is the only `func_by_opt` arm that does not run
                     // `common_setup()`, so it is the only one that leaves
                     // `merges_need_diff` at zero.
@@ -1731,18 +1801,22 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                         full_history = true;
                     }
                 }
+                // `func_by_opt()` (diff-merges.c:82-83) maps `r`/`remerge` onto
+                // `set_remerge_diff()`, which is `common_setup()` plus
+                // `remerge_diff = 1` and `simplify_history = 0`. This port has no
+                // merge engine to re-run, so the request is refused where
+                // `do_remerge_diff()` would run (log-tree.c:1134-1142) rather than
+                // at parse time — a walk that reaches no merge behaves exactly as
+                // git's does, which is what the parse-time refusal got wrong.
+                None if matches!(v, "r" | "remerge") => {
+                    diff_merges = DiffMerges::Separate;
+                    remerge = true;
+                    merges_need_diff = true;
+                    explicit_diff_merges = true;
+                    full_history = true;
+                }
                 None => {
-                    // `func_by_opt()` (diff-merges.c:68-86) does map `r`/`remerge`
-                    // onto `set_remerge_diff()`; this port has no remerge engine, so
-                    // saying "invalid value" there would claim git rejects a value it
-                    // accepts. Name the gap instead.
-                    if matches!(v, "r" | "remerge") {
-                        eprintln!(
-                            "fatal: --diff-merges=remerge is not supported by this build"
-                        );
-                    } else {
-                        eprintln!("fatal: invalid value for '--diff-merges': '{v}'");
-                    }
+                    eprintln!("fatal: invalid value for '--diff-merges': '{v}'");
                     return Ok(ExitCode::from(128));
                 }
             }
@@ -1789,6 +1863,14 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             } else {
                 patch_opts.renames = Some(super::diffcore_rename::DETECT_COPY);
             }
+        // `--rename-empty` / `--no-rename-empty` (`o->flags.rename_empty`,
+        // `diff_setup()`'s default 1): whether `record_if_better()` may pair an
+        // empty blob, i.e. whether an empty file that moved reports as `R100` or as
+        // a deletion plus an addition.
+        } else if a == "--rename-empty" {
+            patch_opts.rename_empty = true;
+        } else if a == "--no-rename-empty" {
+            patch_opts.rename_empty = false;
         } else if a == "--find-copies-harder" {
             patch_opts.find_copies_harder = true;
         } else if a == "--no-find-copies-harder" {
@@ -2074,8 +2156,23 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // NO_OUTPUT, but the stat/patch output formats clear it again, so `--quiet`
     // counts toward this conflict only when none of them are present (matching
     // `git log --name-only --stat --quiet`, which git accepts).
-    let quiet_no_output = quiet && !patch && !stat && !numstat && !shortstat;
-    if name_only as u8 + name_status as u8 + quiet_no_output as u8 > 1 {
+    // `-s`/`--no-patch` and `-q`/`--quiet` both *assign* `DIFF_FORMAT_NO_OUTPUT`,
+    // and only the `OPT_BITOP` formats clear it again — `-p`, `--numstat`,
+    // `--shortstat`, `--summary`, `--patch-with-*` and `--stat`. `--raw`,
+    // `--name-only`, `--name-status` and `--check` are plain `OPT_BIT`s, so they
+    // leave the bit standing and land in this count beside it. That is why
+    // `-s --check` and `-s --name-only` are the fatal while `--check -s` and
+    // `--name-only --stat --quiet` are fine.
+    let no_output_bit =
+        (quiet || saw_no_patch) && !patch && !stat && !numstat && !shortstat && !summary;
+    // The `-z` formats are the one shape the whole-record `--line-prefix` pass
+    // cannot reproduce: git prefixes each NUL-terminated *record*, not each NUL, so
+    // a `--numstat -z` rename (`<counts>\0<from>\0<to>\0`) carries one prefix where
+    // splitting on NUL would write three. Refused rather than approximated.
+    if !line_prefix.is_empty() && z {
+        bail!("unsupported option --line-prefix with -z");
+    }
+    if name_only as u8 + name_status as u8 + no_output_bit as u8 + check as u8 > 1 {
         eprintln!(
             "fatal: options '--name-only', '--name-status', '--check', and '-s' cannot be used together"
         );
@@ -2157,7 +2254,12 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                 None
             }
             Err(_) => {
-                eprint!("{}", bad_revision_message_in(&repo, token));
+                // `setup_revisions()`'s `if (seen_dashdash || *arg == '^') die(_("bad
+                // revision '%s'"), arg);` (revision.c:3035-3036): once a `--` has
+                // been seen anywhere on the line the operand can no longer be a
+                // pathspec, so the three-line `ambiguous argument` advice is not
+                // printed.
+                eprint!("{}", bad_revision_message_in_gated(&repo, token, seen_dashdash));
                 Some(ExitCode::from(128))
             }
         }
@@ -2202,49 +2304,77 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                 return Ok(code);
             }
             pos_specs.push((at, kept.to_string(), kept.to_string()));
-        // `add_parents_only()`: `<rev>^@` pends the parents alone, while `<rev>^!`
-        // pends them with `flags ^ (UNINTERESTING | BOTTOM)` and then falls
-        // through so the commit itself is pended after them. Both name their
-        // pending objects by the base, which is what `--source` prints, because
-        // `handle_revision_arg_1()` truncated the token at the `^`.
-        } else if let Some(base) = spec
-            .strip_suffix("^@")
-            .or_else(|| spec.strip_suffix("^!"))
-            .filter(|b| !b.is_empty())
-            .filter(|b| resolve_rev(&repo, b).is_ok())
-        {
-            let excludes_parents = spec.ends_with("^!");
-            parsed.extend(navigation_path(&repo, base));
-            let id = resolve_rev(&repo, base).expect("checked above");
-            let parents: Vec<ObjectId> = match repo
-                .find_object(id)
-                .ok()
-                .and_then(|o| o.peel_tags_to_end().ok())
-                .and_then(|o| o.try_into_commit().ok())
-            {
-                Some(c) => c.parent_ids().map(|p| p.detach()).collect(),
-                // `if (it->type != OBJ_COMMIT) return 0;` — the spelling falls
-                // back to being read as an ordinary revision.
-                None => {
-                    pos_specs.push((at, spec.to_string(), spec.to_string()));
-                    continue;
-                }
-            };
-            for p in parents {
-                if excludes_parents != negated {
-                    neg_ids.push(p);
-                } else {
-                    pos_specs.push((at, p.to_string(), base.to_string()));
-                }
-            }
-            if excludes_parents {
-                if negated {
-                    neg_ids.push(id);
-                } else {
-                    pos_specs.push((at, base.to_string(), base.to_string()));
-                }
-            }
         } else {
+            // `handle_revision_arg_1()`'s parent-mark block (revision.c:2178-2207),
+            // decoded once for every verb by [`crate::objname::parents_only`]:
+            // `<rev>^@` pends the parents alone and claims the operand, while
+            // `<rev>^!` and `<rev>^-<n>` pend the selected parents with
+            // `flags ^ (UNINTERESTING | BOTTOM)` and then put the truncated name
+            // back in `arg`, so the commit itself is pended after them.
+            //
+            // The mark is found with `strstr`'s first-match rule rather than by
+            // stripping a suffix, which is why `main^!^!` carries no mark at all
+            // and fails as an ordinary revision.
+            let mut spec: &str = spec.as_str();
+            match crate::objname::parents_only(spec) {
+                crate::objname::ParentsOnly::Absent => {}
+                // `strtol_i()` refused the `<n>`, so `add_parents_only()` is never
+                // reached: `ret = -1` and the operand is diagnosed as written.
+                crate::objname::ParentsOnly::BadParent => {
+                    eprint!("{}", bad_revision_message_in_gated(&repo, spec, seen_dashdash));
+                    return Ok(ExitCode::from(128));
+                }
+                crate::objname::ParentsOnly::Mark { base, nth, replaces } => {
+                    // `^@` keeps `flags`; `^!` and `^-<n>` pass
+                    // `flags ^ (UNINTERESTING | BOTTOM)`.
+                    let sense = if replaces { negated } else { !negated };
+                    let mut queued: Vec<(String, ObjectId, bool)> = Vec::new();
+                    let mut queue = |name: &str, id: ObjectId, not: bool| {
+                        queued.push((name.to_string(), id, not));
+                    };
+                    let answer =
+                        crate::objname::add_parents_only(&repo, base, sense, nth, &mut queue);
+                    match answer {
+                        // `get_reference()`'s `die(_("bad object %s"), name)`,
+                        // naming the base with its leading `^` already stripped.
+                        crate::objname::Parents::BadObject => {
+                            let name = crate::objname::uninteresting_mark(base).0;
+                            eprintln!("fatal: bad object {name}");
+                            return Ok(ExitCode::from(128));
+                        }
+                        // `return 0` leaves `arg` alone, and an operand that still
+                        // carries a mark cannot resolve — `get_oid_1()` has no case
+                        // for `^@`, `^!` or `^-<n>` — so this is the bad-revision
+                        // fatal rather than a fall-through.
+                        crate::objname::Parents::None => {
+                            eprint!(
+                                "{}",
+                                bad_revision_message_in_gated(&repo, spec, seen_dashdash)
+                            );
+                            return Ok(ExitCode::from(128));
+                        }
+                        crate::objname::Parents::Queued => {
+                            parsed.extend(navigation_path(&repo, base));
+                            for (name, id, not) in queued {
+                                if not {
+                                    neg_ids.push(id);
+                                } else {
+                                    pos_specs.push((at, id.to_string(), name));
+                                }
+                            }
+                            // `if (add_parents_only(…)) { ret = 0; goto out; }` —
+                            // `^@` claimed the operand and never pends the commit.
+                            if replaces {
+                                continue;
+                            }
+                            // `arg = arg_minus_excl;` / `arg = arg_minus_dash;`.
+                            // The base may still carry its own leading `^`, which
+                            // the exclusion step below strips a *second* time.
+                            spec = base;
+                        }
+                    }
+                }
+            }
             // A plain revision is a tip and `^rev` excludes one; `--not` reverses
             // both readings, which is all `handle_revision_arg()` does with its
             // `UNINTERESTING` flip.
@@ -2440,7 +2570,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                     // `setup_revisions()` names the argument as written, so a range
                     // whose endpoint failed is reported whole.
                     let token = revs.get(at).map(String::as_str).unwrap_or(spec.as_str());
-                    eprint!("{}", bad_revision_message_in(&repo, token));
+                    eprint!("{}", bad_revision_message_in_gated(&repo, token, seen_dashdash));
                     return Ok(ExitCode::from(128));
                 }
             }
@@ -2994,6 +3124,15 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         eprintln!("fatal: options '-G', '-S', and '--find-object' cannot be used together");
         return Ok(ExitCode::from(128));
     }
+    // `diff_setup_done()` (diff.c): `DIFF_PICKAXE_REGEX` is `-S`'s modifier, and git
+    // names the pairing explicitly rather than ignoring it.
+    if pickaxe_regex && pickaxe_g.is_some() {
+        eprintln!(
+            "fatal: options '-G' and '--pickaxe-regex' cannot be used together, \
+             use '--pickaxe-regex' with '-S'"
+        );
+        return Ok(ExitCode::from(128));
+    }
     if pickaxe_all && !find_object.is_empty() {
         eprintln!(
             "fatal: options '--pickaxe-all' and '--find-object' cannot be used together, \
@@ -3160,6 +3299,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // makes `git log --diff-merges=separate -s` print two headerless merge records
     // instead of two patches.
     let rendering_format = patch
+        || check
         || stat
         || numstat
         || shortstat
@@ -3191,6 +3331,10 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     let all_need_diff = flavor == Flavor::WhatChanged
         || merges_imply_patch
         || rendering_format
+        // `int all_need_diff = opt->diff || opt->diffopt.flags.exit_with_status;`
+        // (log-tree.c:1103): `--exit-code` builds the queue by itself, which is why
+        // `git log --exit-code -s` still reports 1.
+        || exit_code
         || patch_opts.diff_filter.is_some();
     // `--name-only`/`--name-status` are git's reported format; they suppress both
     // the count formats and the `-p` patch. The patch is emitted after the count
@@ -3201,7 +3345,9 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // spelling that raises neither flag, which is why `git log -m` on its own still
     // prints no diff.
     let patch = patch || ((merges_imply_patch || merges_need_diff) && !asked_format);
-    let emit_patch = patch && !name_only && !name_status;
+    // `diff_setup_done()`: `DIFF_FORMAT_CHECKDIFF` clears every other format bit, so
+    // `--check --stat -p` prints only the whitespace report.
+    let emit_patch = patch && !name_only && !name_status && !check;
     // `diff_setup_done()`: `--name-only`/`--name-status` clear every other output
     // format, `--raw` among them; `--raw` itself clears nothing, so it stacks with
     // the count formats and the patch.
@@ -3224,8 +3370,11 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                 // `whatchanged --dirstat` prints the dirstat block alone (measured
                 // against stock 2.55.0) rather than raw records plus a dirstat.
                 || dirstat_on));
-    let raw = raw && !name_only && !name_status;
-    let summary = summary && !name_only && !name_status;
+    let raw = raw && !name_only && !name_status && !check;
+    let summary = summary && !name_only && !name_status && !check;
+    let (name_only, name_status) = (name_only && !check, name_status && !check);
+    let (stat, numstat, shortstat) = (stat && !check, numstat && !check, shortstat && !check);
+    let dirstat_on = dirstat_on && !check;
     let want_names =
         name_only || name_status || raw || summary || stat || numstat || shortstat || dirstat_on;
     // `whatchanged` under `DIFF_FORMAT_NO_OUTPUT`: nothing is rendered, but the
@@ -3504,6 +3653,16 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             encode_headers: encode_email_headers,
         },
     });
+    // `do_remerge_diff()` (log-tree.c:1029-1090) re-runs the merge into a temporary
+    // object directory and diffs its tree against the recorded one. This port has
+    // no merge engine to re-run, so `--remerge-diff` is refused exactly when the
+    // walk carries a merge that would reach it — a walk without one is rendered
+    // normally, because `set_remerge_diff()` changes nothing else that this command
+    // reads. Checked before any record is written, since the records stream.
+    if remerge && nodes.iter().any(|n| n.parents.len() > 1) {
+        eprintln!("fatal: --diff-merges=remerge is not supported by this build");
+        return Ok(ExitCode::from(128));
+    }
     // The pathspec set the name/stat formats are limited to, parsed once rather
     // than per commit. `--follow` replaces it per commit (see below).
     let mut path_limit = if pathspecs.is_empty() {
@@ -3517,6 +3676,10 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
 
     // `whatchanged` counts what it actually printed against `--max-count`.
     let mut printed = 0usize;
+    // `o->flags.has_changes` / `o->flags.check_failed`, the two bits
+    // `diff_result_code()` (diff.c) turns into the exit status: `01` and `02`.
+    let mut has_changes = false;
+    let mut check_failed = false;
 
     // `log_tree_commit()` under `-m`: a merge is rendered once per parent, each record
     // carrying its own ` (from <oid>)` header insert and diffing against that parent.
@@ -3586,6 +3749,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             }
             piece.extend_from_slice(&block);
             first = false;
+            let piece = super::diff::apply_line_prefix(piece, &line_prefix);
             if let Err(e) = stdout.write_all(&piece) {
                 if e.kind() == std::io::ErrorKind::BrokenPipe {
                     crate::sigpipe::exit_broken_pipe();
@@ -3679,7 +3843,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         // builds and tests the pair queue — and its answer is what decides whether
         // `whatchanged` prints the commit at all. So the queue is still walked
         // under `-s`/`-q`; only the rendering is skipped.
-        else if (want_names || emit_patch || probe_queue)
+        else if (want_names || emit_patch || probe_queue || check || exit_code)
             && if node.parents.len() > 1 {
                 (all_need_diff || merges_need_diff) && diff_merges != DiffMerges::Off
             } else {
@@ -3698,7 +3862,10 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             // pair queue is non-empty, even for a format that has nothing to say about
             // those pairs (`--summary` over a plain content change).
             let mut queue_nonempty = false;
-            if want_names || probe_queue {
+            // The paths `diffcore_pickaxe()` left in the queue, which the patch is
+            // rendered from. Empty and unused when no pickaxe ran.
+            let mut pickaxe_paths: Vec<String> = Vec::new();
+            if want_names || probe_queue || check || exit_code || has_pickaxe {
                 // `--name-only`/`--name-status` are the reported format when
                 // present; git suppresses the count formats in that case, so the
                 // blob reads they need are skipped too.
@@ -3751,6 +3918,24 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                 if let Some(px) = &pickaxe {
                     pickaxe_filter_files(&repo, px, &mut files)?;
                 }
+                // `-G` is `diff_grep()`, which tests each pair's *own* change text
+                // rather than its blobs — but it sits in the same `diffcore_std()`
+                // slot, so the queue it leaves behind is the one every format below
+                // renders.
+                if let Some(re) = &pickaxe_g_re {
+                    grep_filter_files(&repo, re, pickaxe_all, &mut files)?;
+                }
+                if has_pickaxe {
+                    // Both sides of a rename, since limiting the tree diff to the
+                    // destination alone would hide the deletion the pair needs.
+                    pickaxe_paths = files
+                        .iter()
+                        .flat_map(|f| {
+                            std::iter::once(f.path.clone()).chain(f.source.iter().cloned())
+                        })
+                        .map(|p| String::from_utf8_lossy(&p).into_owned())
+                        .collect();
+                }
                 // `diff_flush()` (diff.c:7210): under a whitespace rule the queue is
                 // re-rendered quietly first and every pair whose patch came out empty
                 // is dropped, so the raw, name and stat formats never mention a file
@@ -3762,27 +3947,122 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                 if patch_opts.ws != super::diff::Whitespace::Keep {
                     files.retain(reports_change);
                 }
-                // A merge under a combined mode reports the *combined* pair list
-                // here, with one status letter per parent — `show_raw_diff()` on a
-                // `combine_diff_path`. The stat formats below stay on the
-                // first-parent diff, which is where git leaves them.
-                let combined_names = (node.parents.len() > 1
-                    && matches!(diff_merges, DiffMerges::Combined | DiffMerges::DenseCombined)
-                    && (name_only || name_status))
-                    .then(|| {
-                        super::diff::merge_combined_names(&repo, node.id, &node.parents, &pathspecs)
-                    })
-                    .transpose()?;
-                if let Some(rows) = combined_names {
-                    for (path, letters) in &rows {
-                        if name_status {
-                            diff.extend_from_slice(letters.as_bytes());
-                            diff.push(b'\t');
-                        }
-                        diff.extend_from_slice(path);
-                        diff.push(b'\n');
+                // `o->flags.has_changes`, the `01` bit of `diff_result_code()`.
+                // `diff_tree_combined()` never sets it, so `--exit-code` on a merge
+                // under `-c`/`--cc` reports 0; `--check` reports through
+                // `check_failed` instead, which is why `--check --exit-code` is 2
+                // rather than 3.
+                if !check
+                    && !(node.parents.len() > 1
+                        && matches!(
+                            diff_merges,
+                            DiffMerges::Combined | DiffMerges::DenseCombined
+                        ))
+                {
+                    let changed = match patch_opts.ws != super::diff::Whitespace::Keep {
+                        true => !files.is_empty(),
+                        false => queue_nonempty,
+                    };
+                    has_changes |= changed;
+                }
+                // A merge under a combined mode runs `diff_tree_combined()`
+                // (combine-diff.c:1600-1610) instead of `diff_flush()`, and the two
+                // do not agree on block order or on what earns the separator:
+                //
+                // ```c
+                // if (opt->output_format & (DIFF_FORMAT_RAW | DIFF_FORMAT_NAME |
+                //                           DIFF_FORMAT_NAME_STATUS)) {
+                //         for (p = paths; p; p = p->next)
+                //                 show_raw_diff(p, num_parent, rev);
+                //         needsep = 1;
+                // }
+                // else if (opt->output_format & STAT_FORMAT_MASK)
+                //         needsep = 1;
+                // ```
+                //
+                // The `STAT_FORMAT_MASK` formats (numstat, diffstat, shortstat,
+                // dirstat, summary — combine-diff.c:1371-1375) were already written
+                // by `find_paths_generic()`'s `i == 0` pass, against the *first
+                // parent*, so they precede the raw block rather than follow it. And
+                // `needsep` answers to the format bits alone, which is why
+                // `--summary -p` on a merge with an empty summary still separates.
+                let combined_merge = node.parents.len() > 1
+                    && matches!(diff_merges, DiffMerges::Combined | DiffMerges::DenseCombined);
+                if check {
+                    // `diff_flush_checkdiff()` in place of every other format.
+                    // `diff_tree_combined()` never looks at `DIFF_FORMAT_CHECKDIFF`
+                    // (combine-diff.c:1600-1610), so a merge under `-c`/`--cc`
+                    // reports nothing at all — only the separator its own header
+                    // block already wrote.
+                    if !combined_merge {
+                        check_failed |= super::diff::commit_check(
+                            &repo,
+                            &mut diff,
+                            node.id,
+                            diff_parent,
+                            &patch_opts,
+                            &pathspecs,
+                        )?;
                     }
-                    separator = true;
+                } else if combined_merge {
+                    let rel = patch_opts.relative.as_deref().unwrap_or("");
+                    let (fsep, fend) = if z { (0u8, 0u8) } else { (b'\t', b'\n') };
+                    if !name_only && !name_status {
+                        if numstat {
+                            emit_numstat(&mut diff, &files, z, rel);
+                        }
+                        if stat {
+                            emit_stat(&mut diff, &files, &stat_widths, compact_summary, rel, &patch_opts.colors)?;
+                        }
+                        if shortstat {
+                            emit_shortstat(&mut diff, &files)?;
+                        }
+                        if dirstat_on {
+                            super::diff::commit_dirstat(
+                                &repo,
+                                node.id,
+                                diff_parent,
+                                &patch_opts,
+                                path_limit.as_mut(),
+                                &dirstat,
+                                &mut diff,
+                            )?;
+                        }
+                        if summary {
+                            emit_summary(&mut diff, &files);
+                        }
+                        if numstat || stat || shortstat || dirstat_on || summary {
+                            separator = true;
+                        }
+                    }
+                    if raw {
+                        diff.extend_from_slice(&super::diff::merge_combined_raw(
+                            &repo,
+                            node.id,
+                            &node.parents,
+                            &pathspecs,
+                            crate::abbrev::configured_abbrev(&repo, repo.object_hash().len_in_hex())
+                                .max(MINIMUM_ABBREV),
+                            z,
+                            true,
+                        )?);
+                        separator = true;
+                    } else if name_only || name_status {
+                        for (path, letters) in super::diff::merge_combined_names(
+                            &repo,
+                            node.id,
+                            &node.parents,
+                            &pathspecs,
+                        )? {
+                            if name_status {
+                                diff.extend_from_slice(letters.as_bytes());
+                                diff.push(fsep);
+                            }
+                            diff.extend_from_slice(&name_field(&path, z));
+                            diff.push(fend);
+                        }
+                        separator = true;
+                    }
                 } else {
                     // `diff_flush()`'s fixed order: the raw/name loop first, then the
                     // count formats. `--raw` does not displace them, so `--raw --stat`
@@ -3832,7 +4112,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                         // `--stat --shortstat` prints the stat block and then a
                         // second summary line.
                         if stat {
-                            emit_stat(&mut diff, &files, &stat_widths, compact_summary, rel)?;
+                            emit_stat(&mut diff, &files, &stat_widths, compact_summary, rel, &patch_opts.colors)?;
                         }
                         if shortstat {
                             emit_shortstat(&mut diff, &files)?;
@@ -3902,9 +4182,29 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                     .unwrap_or_default(),
                     None => Vec::new(),
                 };
+                // `diffcore_pickaxe()` filters the queue, and `diff_flush()` renders
+                // the *filtered* queue — the patch included. The batched window has
+                // one pathspec set for the whole span and cannot serve a limit that
+                // differs per commit, so a pickaxe run renders this commit on its
+                // own, against the paths that survived (both sides of a rename, since
+                // limiting to the destination alone would hide the deletion).
+                let pickaxe_patch: Vec<u8> = match has_pickaxe && from.is_none() {
+                    false => Vec::new(),
+                    true if pickaxe_paths.is_empty() => Vec::new(),
+                    true => super::diff::commit_patches(
+                        &repo,
+                        &[(node.id, diff_parent)],
+                        &patch_opts,
+                        &pickaxe_paths,
+                        false,
+                    )?
+                    .pop()
+                    .unwrap_or_default(),
+                };
                 let p: &[u8] = match (&node.follow_path, from) {
                     (Some(_), _) => &follow_patch,
                     (None, Some(_)) => &separate_patch,
+                    (None, None) if has_pickaxe => &pickaxe_patch,
                     (None, None) => patches.get(&repo, &nodes, ni, 3, &pathspecs)?,
                 };
                 if !p.is_empty() {
@@ -3914,7 +4214,10 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                     // buffer — which is why a non-`lines` `--dirstat` block does not
                     // earn one.
                     if separator {
-                        diff.push(b'\n');
+                        // `DIFF_SYMBOL_SEPARATOR` writes `o->line_termination`
+                        // (diff.c:1436-1440), so under `-z` the blank line between an
+                        // earlier block and the patch is a NUL instead.
+                        diff.push(rec_term);
                     }
                     diff.extend_from_slice(p);
                 }
@@ -3953,7 +4256,17 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             // and combine-diff's own separator carries the same
             // `output_format != DIFF_FORMAT_NO_OUTPUT` test, which `probe_queue`
             // is exactly the state of.
-            if (!diff.is_empty() || queue_nonempty || combined_here) && !probe_queue {
+            // ```c
+            // if ((opt->diffopt.output_format & ~DIFF_FORMAT_NO_OUTPUT) && …)
+            // ```
+            //
+            // (log-tree.c:941.) With no output format at all — `--exit-code` on its
+            // own builds the queue without asking for one — there is nothing to
+            // separate the message from, so no blank line is written either.
+            if (!diff.is_empty() || queue_nonempty || combined_here)
+                && !probe_queue
+                && (want_names || emit_patch || check)
+            {
                 // git puts a separator between the log message and the diff for
                 // every format but `oneline` — and only when the message block
                 // rendered something to separate from. A `--stat` block shown
@@ -3963,9 +4276,16 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                 // the format string, so a `%N` that expanded to nothing still gets
                 // its separator.
                 if (!matches!(pretty, Pretty::Oneline) || combined_here) && !empty_user_format {
+                    if combined_here {
+                        // `diff_tree_combined()` writes this one itself, as
+                        // `printf("%s%c", diff_line_prefix(opt), opt->line_termination)`
+                        // (combine-diff.c:1514-1515) — so it is a NUL under `-z`, and
+                        // it is never the `---` fence, which lives in
+                        // `log_tree_diff_flush()` and is not on this path at all.
+                        block.push(rec_term);
                     // A mail format that already fenced its notes block with `---`
                     // raised `opt->shown_dashes`, which suppresses this second one.
-                    if stat
+                    } else if stat
                         && emit_patch
                         && !mail_notes_shown_dashes(&repo, &notes_trees, &pretty, node.id)?
                     {
@@ -4046,6 +4366,12 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         }
         piece.extend_from_slice(&block);
         first = false;
+        // `--line-prefix`: `emit_line_0()` writes `diff_line_prefix(o)` in front of
+        // every emitted line, and for a history verb that includes the header
+        // `show_log()` wrote. Applied per record because the records stream; a
+        // record ends in its terminator, so the next record's leading prefix lands
+        // exactly where an interior newline would have put it.
+        let piece = super::diff::apply_line_prefix(piece, &line_prefix);
         // Each block ends in a newline, so the line-buffered stdout flushes it here;
         // a closed downstream pipe (`| head`) surfaces as a BrokenPipe on this write,
         // which is a normal stop rather than an error. No per-commit flush is needed.
@@ -4060,6 +4386,10 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // Persist whatever abbreviations this run had to compute, off the critical
     // path — the next `log` in any clone holding these objects reads them back.
     abbrev_cache.into_inner().flush();
+
+    // `diff_result_code()` (diff.c): `01` when `--exit-code` saw changes, `02` when
+    // `--check` found a whitespace error.
+    let result_code = u8::from(exit_code && has_changes) | (u8::from(check_failed) << 1);
 
     if graph {
         // `format:` separates records with a newline; `tformat:` already
@@ -4084,8 +4414,9 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             first_parent,
             &interest,
         )?;
+        let out = super::diff::apply_line_prefix(out, &line_prefix);
         let rc = match stdout.write_all(&out) {
-            Ok(()) => Ok(ExitCode::SUCCESS),
+            Ok(()) => Ok(ExitCode::from(result_code)),
             Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
                 crate::sigpipe::exit_broken_pipe()
             }
@@ -4097,7 +4428,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         // Flush the tail: a block that did not end in a newline (an empty user
         // format) may still be buffered.
         let rc = match stdout.flush() {
-            Ok(()) => Ok(ExitCode::SUCCESS),
+            Ok(()) => Ok(ExitCode::from(result_code)),
             Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
                 crate::sigpipe::exit_broken_pipe()
             }
@@ -4917,13 +5248,14 @@ impl PatchWindow {
                         DiffMerges::Combined | DiffMerges::DenseCombined => {
                             merged.push((
                                 k,
-                                super::diff::merge_combined_patch(
+                                super::diff::merge_combined_patch_painted(
                                     repo,
                                     n.id,
                                     &n.parents,
                                     paths,
                                     ctx,
                                     self.merges == DiffMerges::DenseCombined,
+                                    &self.patch_opts.colors,
                                 )?,
                             ));
                             continue;
@@ -4971,7 +5303,7 @@ pub(crate) enum DiffMerges {
 }
 
 impl DiffMerges {
-    fn parse(v: &str) -> Option<Self> {
+    pub(crate) fn parse(v: &str) -> Option<Self> {
         Some(match v {
             "off" | "none" => DiffMerges::Off,
             "m" | "separate" => DiffMerges::Separate,
@@ -5693,10 +6025,22 @@ fn peel_to_commit(repo: &gix::Repository, id: ObjectId) -> ObjectId {
 /// leaves the ranges and `^!` alone, because each of those excludes one side of
 /// itself whichever way round it is read.
 pub(super) fn argument_excludes(spec: &str, negated: bool) -> bool {
-    spec.contains("..")
-        || spec.ends_with("^!")
-        || (negated && spec.ends_with("^@"))
-        || spec.starts_with('^') != negated
+    if spec.contains("..") {
+        return true;
+    }
+    match crate::objname::parents_only(spec) {
+        // `^!` and `^-<n>` pend the selected parents with
+        // `flags ^ (UNINTERESTING | BOTTOM)` and the commit itself with `flags`
+        // (revision.c:2186-2207), so whichever way `--not` leaves them one of the
+        // two sides is always UNINTERESTING.
+        crate::objname::ParentsOnly::Mark { replaces: false, .. } => true,
+        // `^@` pends only the parents, and with `flags` unchanged — so they are
+        // UNINTERESTING exactly when `--not` or a leading `^` on the base says so.
+        crate::objname::ParentsOnly::Mark { base, replaces: true, .. } => {
+            negated ^ base.starts_with('^')
+        }
+        _ => spec.starts_with('^') != negated,
+    }
 }
 
 /// The commits a revision argument's `~<n>` / `^<n>` chain reads the parents of.
@@ -7645,6 +7989,44 @@ fn pickaxe_filter_files(
     Ok(())
 }
 
+/// `diff_grep()` (diffcore-pickaxe.c) over one commit's change list: a pair is kept
+/// when any line its own diff adds or removes matches the regex. `--pickaxe-all`
+/// widens that to the whole list once anything matched, exactly as it does for `-S`.
+fn grep_filter_files(
+    repo: &gix::Repository,
+    re: &regex::bytes::Regex,
+    all: bool,
+    files: &mut Vec<FileChange>,
+) -> Result<()> {
+    let blob = |side: Option<(u32, ObjectId)>| -> Vec<u8> {
+        let Some((_, id)) = side else { return Vec::new() };
+        repo.find_object(id).map(|o| o.data.clone()).unwrap_or_default()
+    };
+    let mut hit = Vec::with_capacity(files.len());
+    for f in files.iter() {
+        // `diff_grep()` runs its own zero-context diff over the two blobs rather
+        // than reusing whatever patch the command is about to print, so `-U<n>`,
+        // the whitespace flags and `--diff-algorithm` do not reach it.
+        let (old, new) = (blob(f.old_side), blob(f.new_side));
+        let before = super::diff_pickaxe::split_lines(&old);
+        let after = super::diff_pickaxe::split_lines(&new);
+        let mut found = false;
+        super::diff_pickaxe::for_each_changed_line(&before, &after, |line| {
+            found |= re.is_match(line.strip_suffix(b"\n").unwrap_or(line));
+        });
+        hit.push(found);
+    }
+    if all {
+        if !hit.iter().any(|h| *h) {
+            files.clear();
+        }
+        return Ok(());
+    }
+    let mut it = hit.into_iter();
+    files.retain(|_| it.next().unwrap_or(false));
+    Ok(())
+}
+
 /// `pickaxe_match()` for one change: `objfind` compares the recorded ids, `-S` compares
 /// the needle's occurrence count in each side's whole blob.
 fn pickaxe_file_hit(
@@ -7702,6 +8084,18 @@ pub(crate) fn pickaxe_hit(
     needle: Option<&str>,
     re: Option<&regex::bytes::Regex>,
 ) -> bool {
+    let literal = needle.map(|n| super::diff_pickaxe::Needle::Literal(n.as_bytes().to_vec()));
+    pickaxe_hit_needle(patch, literal.as_ref(), re)
+}
+
+/// [`pickaxe_hit`] with `-S`'s needle already compiled, so `--pickaxe-regex` can
+/// hand it the regular-expression form `pickaxe_match()` counts under
+/// `DIFF_PICKAXE_REGEX`.
+pub(crate) fn pickaxe_hit_needle(
+    patch: &[u8],
+    needle: Option<&super::diff_pickaxe::Needle>,
+    re: Option<&regex::bytes::Regex>,
+) -> bool {
     let mut net: i64 = 0;
     for line in patch.split(|&b| b == b'\n') {
         // Only real content changes; skip the `+++`/`---` file headers.
@@ -7716,9 +8110,7 @@ pub(crate) fn pickaxe_hit(
             }
         }
         if let Some(needle) = needle {
-            if !needle.is_empty() {
-                net += sign * super::diff_pickaxe::count_occurrences(content, needle.as_bytes()) as i64;
-            }
+            net += sign * needle.count(content) as i64;
         }
     }
     // `-G` reached here without matching (or was absent); `-S` hits on net != 0.
@@ -8037,6 +8429,11 @@ pub(crate) struct ShowEntry<'a> {
     pub(crate) source: Option<&'a [u8]>,
     /// `--show-signature`: print the signature checker's report above the header.
     pub(crate) show_signature: bool,
+    /// `log->parent` (log-tree.c:1149): the parent this record's diff was taken
+    /// against, which `show_log()` prints as ` (from <oid>)` after the commit id
+    /// and before the decorations (log-tree.c:824-826). Only the per-parent
+    /// records of `--diff-merges=separate`/`-m` carry one.
+    pub(crate) from: Option<ObjectId>,
 }
 
 /// A reusable [`render_entry`] driver for the commands that render one record at
@@ -8049,17 +8446,29 @@ pub(crate) struct EntryRenderer<'r> {
     repo: &'r gix::Repository,
     abbrev: std::cell::RefCell<AbbrevCache>,
     colors: super::color::DecorateColors,
+    /// `o->use_color`: whether `%C…` and the header's own coloring emit ANSI.
+    want_color: bool,
     now: i64,
 }
 
 impl<'r> EntryRenderer<'r> {
     pub(crate) fn new(repo: &'r gix::Repository) -> Self {
+        Self::with_color(repo, false)
+    }
+
+    /// The same renderer with `o->use_color` set, which is what
+    /// `diff_opt_word_diff()`'s `GIT_COLOR_ALWAYS` turns on for the whole record:
+    /// `log_tree_commit()` hands the header the run's own color setting, so the
+    /// `commit <id>` line and the decorations are painted exactly when the patch is.
+    pub(crate) fn with_color(repo: &'r gix::Repository, want_color: bool) -> Self {
         EntryRenderer {
             repo,
             abbrev: std::cell::RefCell::new(AbbrevCache::new(repo)),
-            // `git show` here is always the `--no-color` case, so every color slot
-            // is empty and `want_color` is false — `%C(auto)` paints nothing.
-            colors: super::color::DecorateColors::disabled(),
+            colors: match want_color {
+                true => super::color::DecorateColors::resolve(repo),
+                false => super::color::DecorateColors::disabled(),
+            },
+            want_color,
             now: now_secs(),
         }
     }
@@ -8080,9 +8489,22 @@ impl<'r> EntryRenderer<'r> {
             abbrev: &self.abbrev,
             show_signature: opts.show_signature,
             date_mode: opts.date_mode,
-            // No `--parents`/`--children` in `cmd_show`.
-            extra: Vec::new(),
-            want_color: false,
+            // No `--parents`/`--children` in `cmd_show`; the one thing that can
+            // stand in this slot is `show_log()`'s ` (from <oid>)` insert, printed
+            // at the abbreviation width the header itself uses (log-tree.c:824-826).
+            extra: match opts.from {
+                None => Vec::new(),
+                Some(parent) => {
+                    let attached = parent.attach(self.repo);
+                    let id = if opts.abbrev_commit {
+                        self.abbrev.borrow_mut().get(attached)
+                    } else {
+                        attached.to_string()
+                    };
+                    format!(" (from {id})").into_bytes()
+                }
+            },
+            want_color: self.want_color,
             colors: &self.colors,
             now: self.now,
             decorations: opts.decorations,
@@ -9009,6 +9431,7 @@ fn detect_renames(
         rename_score: opts.rename_score,
         find_copies_harder: opts.find_copies_harder,
         break_opt: opts.break_opt,
+        rename_empty: opts.rename_empty,
         rename_limit: cfg
             .integer("diff.renameLimit")
             .unwrap_or(super::diffcore_rename::DEFAULT_RENAME_LIMIT),
@@ -9912,13 +10335,9 @@ fn emit_stat(
     sw: &StatWidths,
     compact: bool,
     rel: &str,
+    colors: &diff_color::DiffColors,
 ) -> Result<()> {
-    diffstat::show_stats(
-        out,
-        &stat_rows(files, compact, rel),
-        sw,
-        &diff_color::DiffColors::disabled(),
-    );
+    diffstat::show_stats(out, &stat_rows(files, compact, rel), sw, colors);
     Ok(())
 }
 

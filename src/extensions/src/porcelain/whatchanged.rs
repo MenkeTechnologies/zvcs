@@ -264,6 +264,10 @@ const FLAG_OPTS: &[&str] = &[
     "-E",
     "--pickaxe-all",
     "--pickaxe-regex",
+    "--rename-empty",
+    "--no-rename-empty",
+    "--exit-code",
+    "--no-exit-code",
     "--graph",
     "--no-graph",
     "--decorate",
@@ -333,6 +337,7 @@ const FLAG_OPTS: &[&str] = &[
     "-c",
     "--cc",
     "-m",
+    "--dd",
     "--no-diff-merges",
     "--combined-all-paths",
     "--use-mailmap",
@@ -484,7 +489,9 @@ impl OptState {
             // `-c`/`--cc` satisfy `--combined-all-paths` wherever they appear; every
             // other merge-diff selector only satisfies it when it comes after.
             "-c" | "--cc" => self.combine_merges = true,
-            "-m" | "--no-diff-merges" => self.note_merge_diff(),
+            // `--dd` is `set_first_parent()` (diff-merges.c:134-136), which clears
+            // `combine_merges` just as `-m` and `--no-diff-merges` do.
+            "-m" | "--dd" | "--no-diff-merges" => self.note_merge_diff(),
             "--combined-all-paths" => self.combined_all_paths = true,
             "--follow" => self.follow = true,
             "--reverse" => self.reverse = true,

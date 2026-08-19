@@ -187,11 +187,12 @@
 //!   `diff-pairs` do honour them — see [`super::diff_pairs`] for the port.
 //! * Magic pathspecs (`:(...)`) and glob pathspecs bail; literal path / directory-prefix
 //!   filtering is supported.
-//! * `--color-moved[=<mode>]`, `--color-moved-ws=`, `--word-diff[=]`,
-//!   `--word-diff-regex=` and `--color-words[=]` are rejected — moved-block detection
-//!   and the word-diff machinery are not ported, and accepting them while color is on
-//!   would print lines in the wrong slot. `diff.colorMoved`/`diff.colorMovedWS` are
-//!   likewise not read.
+//! * `--anchored=<text>` is rejected. It is the one `xdiff` input with no equivalent
+//!   in the ported blob-diff crate: git threads the anchor prefixes through
+//!   `xpp->anchors` into `xdl_do_patience_diff()`'s `is_anchor()` (xdiff/xpatience.c:74-75),
+//!   and `gix-imara-diff` has no way to pass them in at all — see the note at
+//!   `src/ported/gix-imara-diff/src/patience.rs:20-22`. Accepting it would silently
+//!   produce the unanchored patience diff, so it is refused instead.
 //! * `git diff` on an unmerged path renders the combined (`--cc`) patch, and only that —
 //!   the duplicate stage-2-vs-worktree pair the raw/name/stat formats also report is not
 //!   given a `diff --git` section. `--cached` renders git's `* Unmerged path` line.
@@ -362,9 +363,6 @@ pub(crate) enum SubmoduleFormat {
 /// * `--ita-visible-in-index` / `--ita-invisible-in-index` — `flags.ita_invisible_in_index`
 ///   is read only by the index-vs-worktree and index-vs-tree walks (diff-lib.c);
 ///   `log`/`show`/`whatchanged` diff two trees and never see an intent-to-add entry.
-/// * `--rename-empty` — `flags.rename_empty = 1`, `diff_setup()`'s default. (Its
-///   negation is *not* here: `--no-rename-empty` splits an empty-file `R100` back
-///   into an addition and a deletion, measured against stock 2.55.0.)
 ///
 /// Confirmed by measurement as well as by reading: for each entry, stock 2.55.0's
 /// output is byte-identical with and without it across `-p`, `-p --stat`, `--raw`,
@@ -385,7 +383,6 @@ pub(crate) fn history_noop_diff_option(a: &str) -> bool {
             | "--no-ext-diff"
             | "--ita-visible-in-index"
             | "--ita-invisible-in-index"
-            | "--rename-empty"
     )
 }
 
@@ -1077,8 +1074,9 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
             "--raw" => fmt |= F_RAW,
             // `--check`: report whitespace errors instead of a diff (`diff.c`s
             // `DIFF_FORMAT_CHECKDIFF`), which is why it replaces every other format.
+            // Declared `PARSE_OPT_NONEG` (diff.c), so `--no-check` is not an option
+            // at all and falls through to the usage error below.
             "--check" => check = true,
-            "--no-check" => check = false,
             "--numstat" => fmt |= F_NUMSTAT,
             "--shortstat" => fmt |= F_SHORTSTAT,
             "--stat" => fmt |= F_DIFFSTAT,
@@ -1139,7 +1137,10 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
             "--ignore-space-at-eol" => ws = Whitespace::IgnoreAtEol,
             "-R" => reverse = true,
             "-z" => z = true,
+            // `OPT_BOOL` (diff.c:6256): the negation exists and the last spelling
+            // on the line wins.
             "--exit-code" => want_exit_code = true,
+            "--no-exit-code" => want_exit_code = false,
             "--quiet" => {
                 quiet = true;
                 want_exit_code = true;
@@ -2402,9 +2403,15 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     }
     if check {
         let mut found = false;
+        let mut buf: Vec<u8> = Vec::new();
         for (delta, analysis) in deltas.iter().zip(analyses.iter()) {
-            found |= report_whitespace(delta, analysis, ws_rule);
+            found |= report_whitespace_to(&mut buf, delta, analysis, ws_rule, &colors);
         }
+        // `checkdiff_consume()` writes through `emit_line()` like every other
+        // format, so `--line-prefix` reaches these lines too.
+        let buf = apply_line_prefix(buf, &line_prefix);
+        let mut stdout = std::io::stdout().lock();
+        let _ = stdout.write_all(&buf);
         return Ok(if found {
             ExitCode::from(2)
         } else {
@@ -2499,13 +2506,22 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
         }
 
         if fmt & F_SUMMARY != 0 {
+            // `diff_flush()` (diff.c:7243): `if (output_format & DIFF_FORMAT_SUMMARY
+            // && !is_summary_empty(q))` — an empty summary writes nothing and does
+            // not raise `separator`, so `-p --summary` over a plain content change
+            // runs the patch straight on.
+            let before = out.len();
             render_summary(&mut out, &deltas);
-            separator = true;
+            separator |= out.len() != before;
         }
 
         if fmt & F_PATCH != 0 {
             if separator {
-                out.push(b'\n');
+                // `DIFF_SYMBOL_SEPARATOR` is `o->line_termination` (diff.c:1436-1440),
+                // so `-z` separates the earlier block from the patch with a NUL
+                // instead of a blank line. The `diff_line_prefix(o)` in front of it
+                // arrives with the whole-buffer `apply_line_prefix()` below.
+                out.push(if r.z { 0 } else { b'\n' });
             }
             // `run_diff_files()` queues an unmerged path twice — once as the `U`
             // pair and once as the ordinary stage-2-vs-worktree modification — and
@@ -2633,7 +2649,7 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     // output format with `DIFF_FORMAT_NO_OUTPUT` (diff.c) — the combined half has
     // nothing to print either.
     if combined && !quiet {
-        emit_combined(&mut out, &repo, &combined_req, &paths, ctx, &r, &mut separator, &line_prefix)?;
+        emit_combined(&mut out, &repo, &combined_req, &paths, ctx, &r, &mut separator, &line_prefix, &colors)?;
     }
 
     // `--output=<file>` pointed git's output `FILE*` at a file back at parse time;
@@ -3996,6 +4012,12 @@ pub(crate) struct PatchOpts {
     pub find_copies_harder: bool,
     /// `-B[<n>][/<m>]`: `diffcore_break()`'s packed score, `-1` when off.
     pub break_opt: i64,
+    /// `--rename-empty` / `--no-rename-empty` (`o->flags.rename_empty`,
+    /// `diff_setup()`'s default 1). With it off, `record_if_better()`
+    /// (diffcore-rename.c) refuses a pair whose surviving side is an empty blob, so
+    /// an empty file that moved reports as a deletion plus an addition rather than
+    /// an `R100`.
+    pub rename_empty: bool,
     /// The `index` line's abbreviation, when it must differ from `core.abbrev`:
     /// `--no-abbrev` zeroes `revs->abbrev`, which the raw format reads as "print the
     /// whole id" while the `index` line falls back to the configured default.
@@ -4063,6 +4085,7 @@ impl Default for PatchOpts {
             rename_score: 0,
             find_copies_harder: false,
             break_opt: -1,
+            rename_empty: true,
             index_abbrev: None,
             algorithm: None,
             // `XDF_INDENT_HEURISTIC` is git's default (diff.c `diff_setup()`).
@@ -4241,6 +4264,7 @@ fn commit_deltas(
         rename_score: opts.rename_score,
         find_copies_harder: opts.find_copies_harder,
         break_opt: opts.break_opt,
+        rename_empty: opts.rename_empty,
         rename_limit: repo
             .config_snapshot()
             .integer("diff.renameLimit")
@@ -6553,7 +6577,7 @@ fn apply_suppress_blank_empty(out: Vec<u8>, on: bool) -> Vec<u8> {
 /// stat, summary, raw/name without `-z`). An empty buffer stays empty (git emits
 /// nothing at all on a clean tree), and a trailing newline is not followed by a
 /// dangling prefixed empty line.
-fn apply_line_prefix(out: Vec<u8>, prefix: &[u8]) -> Vec<u8> {
+pub(crate) fn apply_line_prefix(out: Vec<u8>, prefix: &[u8]) -> Vec<u8> {
     if prefix.is_empty() || out.is_empty() {
         return out;
     }
@@ -6836,6 +6860,20 @@ fn render_combined_raw(
     r: &Render,
     line_prefix: &[u8],
 ) {
+    render_combined_raw_at(out, cp, fmt, r.raw_abbrev, r.z, line_prefix);
+}
+
+/// [`render_combined_raw`] with the two `Render` fields it reads passed directly,
+/// so the history verbs — which carry their own abbreviation width and `-z` flag
+/// rather than a `Render` — can emit the same record.
+fn render_combined_raw_at(
+    out: &mut Vec<u8>,
+    cp: &CombinedPath,
+    fmt: u32,
+    raw_abbrev: usize,
+    z: bool,
+    line_prefix: &[u8],
+) {
     if fmt & F_RAW != 0 {
         out.extend_from_slice(line_prefix);
         for _ in &cp.parents {
@@ -6848,10 +6886,10 @@ fn render_combined_raw(
         push_str(out, &mode_octal(cp.kind));
         for p in &cp.parents {
             out.push(b' ');
-            push_str(out, &p.id.to_hex_with_len(r.raw_abbrev).to_string());
+            push_str(out, &p.id.to_hex_with_len(raw_abbrev).to_string());
         }
         out.push(b' ');
-        push_str(out, &cp.id.to_hex_with_len(r.raw_abbrev).to_string());
+        push_str(out, &cp.id.to_hex_with_len(raw_abbrev).to_string());
         out.push(b' ');
     }
     if fmt & (F_RAW | F_NAME_STATUS) != 0 {
@@ -6859,10 +6897,38 @@ fn render_combined_raw(
             out.push(p.status);
         }
         // `-z` drops the inter-name terminator along with the record terminator.
-        out.push(if r.z { 0 } else { b'\t' });
+        out.push(if z { 0 } else { b'\t' });
     }
-    out.extend_from_slice(&name_field(&cp.path, r.z));
-    out.push(if r.z { 0 } else { b'\n' });
+    out.extend_from_slice(&name_field(&cp.path, z));
+    out.push(if z { 0 } else { b'\n' });
+}
+
+/// `diff_tree_combined()`'s raw block (combine-diff.c:1600-1606): one
+/// `show_raw_diff()` record per combined path, for `git show`/`git log` on a merge
+/// under `-c`/`--cc`. `raw` picks the full `::<modes> <ids> <statuses>` form over
+/// the bare `--name-status` one; `abbrev` is the width the caller's `--abbrev`
+/// settled on, since the raw columns answer to it.
+pub(crate) fn merge_combined_raw(
+    repo: &gix::Repository,
+    commit: ObjectId,
+    parents: &[ObjectId],
+    paths: &[String],
+    abbrev: usize,
+    z: bool,
+    raw: bool,
+) -> Result<Vec<u8>> {
+    let result_tree = repo.find_commit(commit)?.tree()?;
+    let mut parent_trees: Vec<gix::Tree<'_>> = Vec::with_capacity(parents.len());
+    for p in parents {
+        parent_trees.push(repo.find_commit(*p)?.tree()?);
+    }
+    let set = combined_path_set(repo, &result_tree, &parent_trees, paths)?;
+    let fmt = if raw { F_RAW } else { F_NAME_STATUS };
+    let mut out = Vec::new();
+    for cp in &set {
+        render_combined_raw_at(&mut out, cp, fmt, abbrev, z, b"");
+    }
+    Ok(out)
 }
 
 /// `dump_quoted_path()` (combine-diff.c:905): the line prefix, then the head, then
@@ -6945,6 +7011,7 @@ fn emit_combined(
     r: &Render,
     separator: &mut bool,
     line_prefix: &[u8],
+    colors: &diff_color::DiffColors,
 ) -> Result<()> {
     // `-s` / `--no-patch` is an assignment, so it leaves nothing to serve unless a
     // later format flag put a bit back.
@@ -6996,6 +7063,7 @@ fn emit_combined(
             &req.a_prefix,
             &req.b_prefix,
             line_prefix,
+            colors,
         )?);
     }
     Ok(())
@@ -7038,29 +7106,38 @@ pub(crate) fn merge_combined_patch(
     ctx: u32,
     dense: bool,
 ) -> Result<Vec<u8>> {
+    merge_combined_patch_painted(
+        repo,
+        commit,
+        parents,
+        paths,
+        ctx,
+        dense,
+        &diff_color::DiffColors::disabled(),
+    )
+}
+
+/// [`merge_combined_patch`] with the palette `dump_sline()` paints with.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn merge_combined_patch_painted(
+    repo: &gix::Repository,
+    commit: ObjectId,
+    parents: &[ObjectId],
+    paths: &[String],
+    ctx: u32,
+    dense: bool,
+    colors: &diff_color::DiffColors,
+) -> Result<Vec<u8>> {
     let result_tree = repo.find_commit(commit)?.tree()?;
     let mut parent_trees: Vec<gix::Tree<'_>> = Vec::with_capacity(parents.len());
     for p in parents {
         parent_trees.push(repo.find_commit(*p)?.tree()?);
     }
-    combined_trees_patch_headed(repo, &result_tree, &parent_trees, paths, ctx, dense)
+    combined_trees_patch_painted(repo, &result_tree, &parent_trees, paths, ctx, dense, colors)
 }
 
-/// The dense combined diff (`diff --cc`) of `result_tree` against every parent
-/// tree, returned as bytes. Shared by `git diff -c`/`--cc` and `git show` on a
-/// merge commit. A path appears only where the result differs from *all*
-/// parents (git's dense-combined elision).
-pub(crate) fn combined_trees_patch(
-    repo: &gix::Repository,
-    result_tree: &gix::Tree<'_>,
-    parent_trees: &[gix::Tree<'_>],
-    paths: &[String],
-    ctx: u32,
-) -> Result<Vec<u8>> {
-    combined_trees_patch_headed(repo, result_tree, parent_trees, paths, ctx, true)
-}
-
-/// The same, with the header flavour chosen: `diff --cc` for the dense form and
+/// The combined diff of `result_tree` against every parent tree, with the header
+/// flavour chosen: `diff --cc` for the dense form and
 /// `diff --combined` for a bare `-c` (`show_combined_header()` prints whichever
 /// `opt->flags.dense_combined_merges` selected).
 pub(crate) fn combined_trees_patch_headed(
@@ -7071,9 +7148,32 @@ pub(crate) fn combined_trees_patch_headed(
     ctx: u32,
     dense: bool,
 ) -> Result<Vec<u8>> {
+    combined_trees_patch_painted(
+        repo,
+        result_tree,
+        parent_trees,
+        paths,
+        ctx,
+        dense,
+        &diff_color::DiffColors::disabled(),
+    )
+}
+
+/// [`combined_trees_patch_headed`] with the palette `dump_sline()` paints with, for
+/// the callers that colorize (`git show --color-words` on a merge).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn combined_trees_patch_painted(
+    repo: &gix::Repository,
+    result_tree: &gix::Tree<'_>,
+    parent_trees: &[gix::Tree<'_>],
+    paths: &[String],
+    ctx: u32,
+    dense: bool,
+    colors: &diff_color::DiffColors,
+) -> Result<Vec<u8>> {
     let set = combined_path_set(repo, result_tree, parent_trees, paths)?;
     let abbrev = crate::abbrev::configured_abbrev(repo, repo.object_hash().len_in_hex());
-    combined_patch(&set, ctx, dense, abbrev, b"a/", b"b/", b"")
+    combined_patch(&set, ctx, dense, abbrev, b"a/", b"b/", b"", colors)
 }
 
 /// `show_patch_diff()` (combine-diff.c:1015) over an already-built path set: one
@@ -7102,6 +7202,7 @@ fn combined_patch(
     a_prefix: &[u8],
     b_prefix: &[u8],
     line_prefix: &[u8],
+    colors: &diff_color::DiffColors,
 ) -> Result<Vec<u8>> {
     let mut out: Vec<u8> = Vec::new();
     for cp in set {
@@ -7185,7 +7286,69 @@ fn combined_patch(
         dump_sline(&mut hunks, &sline, cnt, ctx);
         out.extend_from_slice(&apply_line_prefix(hunks, line_prefix));
     }
-    Ok(out)
+    Ok(colorize_combined(out, colors, line_prefix, NUM_PARENT))
+}
+
+/// The palette `show_patch_diff()` and `dump_sline()` paint a combined section
+/// with (combine-diff.c:1015-1230): `c_meta` on the `diff --cc`/`index`/mode and
+/// `---`/`+++` lines, `c_frag` on the `@@@` header, and, for a body line, `c_old`
+/// when any of its sign columns is `-`, `c_new` when any is `+`, and `c_plain`
+/// otherwise. Every one of them closes with `c_reset` — which is why a context
+/// line comes out as the text followed by a bare reset.
+///
+/// Applied as a pass over the assembled section because git writes the color after
+/// `diff_line_prefix(opt)` and before the text; the prefix is already in place
+/// here, so it is stepped over rather than re-emitted. With a disabled table every
+/// lookup is the empty string and the pass copies the bytes through unchanged.
+fn colorize_combined(
+    out: Vec<u8>,
+    colors: &diff_color::DiffColors,
+    line_prefix: &[u8],
+    num_parent: usize,
+) -> Vec<u8> {
+    let reset = colors.reset();
+    if reset.is_empty() {
+        return out;
+    }
+    let mut res: Vec<u8> = Vec::with_capacity(out.len());
+    for line in out.split_inclusive(|&b| b == b'\n') {
+        let (nl, body) = match line.strip_suffix(b"\n") {
+            Some(b) => (true, b),
+            None => (false, line),
+        };
+        let rest = body.strip_prefix(line_prefix).unwrap_or(body);
+        let slot = if rest.starts_with(b"diff --cc ")
+            || rest.starts_with(b"diff --combined ")
+            || rest.starts_with(b"index ")
+            || rest.starts_with(b"--- ")
+            || rest.starts_with(b"+++ ")
+            || rest.starts_with(b"new file mode ")
+            || rest.starts_with(b"deleted file mode ")
+            || rest.starts_with(b"mode ")
+        {
+            diff_color::DiffSlot::Meta
+        } else if rest.starts_with(b"@") {
+            diff_color::DiffSlot::Frag
+        } else {
+            let signs = &rest[..num_parent.min(rest.len())];
+            if signs.contains(&b'-') {
+                diff_color::DiffSlot::Old
+            } else if signs.contains(&b'+') {
+                diff_color::DiffSlot::New
+            } else {
+                diff_color::DiffSlot::Context
+            }
+        };
+        let split = body.len() - rest.len();
+        res.extend_from_slice(&body[..split]);
+        push_str(&mut res, colors.get(slot));
+        res.extend_from_slice(rest);
+        push_str(&mut res, reset);
+        if nl {
+            res.push(b'\n');
+        }
+    }
+    res
 }
 
 /// A combined diff of the two conflict stages against the working-tree file, as
@@ -7706,14 +7869,23 @@ impl ConsumeHunk for PatchSink<'_> {
 }
 
 /// `checkdiff_consume()` (diff.c): report every added line of `delta` that
-/// breaks a whitespace rule, and say whether any did.
+/// breaks a whitespace rule into `out`, and say whether any did.
 ///
 /// The hunk text the analysis already produced is what git walks: each `@@`
 /// header resets the new-file line counter, and every `+` line is checked and,
 /// when it fails, printed under a `<path>:<line>: <problems>.` header. A blank
 /// line inside the run the change lengthened at end-of-file additionally trips
 /// `blank-at-eof`, which is why the analysis carries that boundary.
-fn report_whitespace(delta: &Delta, analysis: &Analysis, ws_rule: u32) -> bool {
+fn report_whitespace_to(
+    out: &mut Vec<u8>,
+    delta: &Delta,
+    analysis: &Analysis,
+    ws_rule: u32,
+    colors: &diff_color::DiffColors,
+) -> bool {
+    let set = colors.get(diff_color::DiffSlot::New);
+    let ws_color = colors.get(diff_color::DiffSlot::Whitespace);
+    let reset = colors.reset();
     let Some(hunks) = &analysis.hunks else {
         return false;
     };
@@ -7736,17 +7908,23 @@ fn report_whitespace(delta: &Delta, analysis: &Analysis, ws_rule: u32) -> bool {
                     continue;
                 }
                 found = true;
-                let mut stdout = std::io::stdout().lock();
                 let _ = writeln!(
-                    stdout,
+                    out,
                     "{}:{lineno}: {}.",
                     delta.path,
                     super::diff_color::whitespace_error_string(bad)
                 );
-                let _ = stdout.write_all(line);
-                if !line.ends_with(b"\n") {
-                    let _ = stdout.write_all(b"\n");
+                // `emit_line(o, set, reset, line, 1)` prints the `+` marker, then
+                // `ws_check_emit()` repaints the body around its offending runs
+                // (diff.c `checkdiff_consume`).
+                push_str(out, set);
+                out.push(b'+');
+                push_str(out, reset);
+                let mut with_nl: Vec<u8> = body.to_vec();
+                if !with_nl.ends_with(b"\n") {
+                    with_nl.push(b'\n');
                 }
+                diff_color::ws_check_emit(out, &with_nl, ws_rule, set, reset, ws_color);
             }
             _ => {}
         }
@@ -7758,13 +7936,86 @@ fn report_whitespace(delta: &Delta, analysis: &Analysis, ws_rule: u32) -> bool {
     let (blank_at_eof, _) = analysis.blank_at_eof;
     if ws_rule & super::diff_color::WS_BLANK_AT_EOF != 0 && blank_at_eof != 0 {
         found = true;
-        println!(
+        let _ = writeln!(
+            out,
             "{}:{blank_at_eof}: {}.",
             delta.path,
             super::diff_color::whitespace_error_string(super::diff_color::WS_BLANK_AT_EOF)
         );
     }
     found
+}
+
+/// `--check` for one commit of a history verb: `diff_flush_checkdiff()` over the
+/// pairs `log_tree_diff()` queued, in place of every other output format.
+///
+/// `DIFF_FORMAT_CHECKDIFF` clears the other format bits in `diff_setup_done()`, so
+/// a commit under `--check` prints its header and then only this — no patch, no
+/// stat, no raw. Returns `o->flags.check_failed`, which `diff_result_code()` turns
+/// into the `02` bit of the exit status.
+pub(crate) fn commit_check(
+    repo: &gix::Repository,
+    out: &mut Vec<u8>,
+    commit_id: ObjectId,
+    parent: Option<ObjectId>,
+    opts: &PatchOpts,
+    paths: &[String],
+) -> Result<bool> {
+    let colors = &opts.colors;
+    let mut cache = repo.diff_resource_cache_for_tree_diff()?;
+    let mut specs = match paths.is_empty() {
+        true => None,
+        false => Some(super::log::PathspecMatcher::new(repo, paths)?),
+    };
+    let r = patch_render(repo, opts);
+    let deltas = commit_deltas(
+        repo,
+        &mut cache,
+        commit_id,
+        parent,
+        opts,
+        specs.as_mut(),
+        false,
+        true,
+    )?;
+    let hash_kind = repo.object_hash();
+    let ws_rule = diff_color::whitespace_rule_cfg(repo);
+    let mut found = false;
+    for queued in &deltas {
+        // `run_checkdiff()` sits downstream of `run_diff()`'s type-change split, as
+        // the patch path does.
+        let halves = split_type_change(queued);
+        let steps: Vec<&Delta> = match &halves {
+            Some((del, add)) => vec![del, add],
+            None => vec![queued],
+        };
+        for delta in steps {
+            let an = analyze(
+                &mut cache,
+                &repo.objects,
+                delta,
+                opts.ctx,
+                opts.ws,
+                opts.indent_heuristic,
+                hash_kind,
+                None,
+                true,
+                opts.algorithm,
+                None,
+                false,
+                r.binary,
+                opts.func_context,
+                &IgnoreOpts {
+                    text: opts.text,
+                    blank_lines: opts.blank_lines,
+                    lines: opts.ignore_lines.clone(),
+                    inter_hunk_ctx: opts.inter_hunk_ctx,
+                },
+            )?;
+            found |= report_whitespace_to(out, delta, &an, ws_rule, colors);
+        }
+    }
+    Ok(found)
 }
 
 /// The `+<start>` field of an `@@ -a,b +c,d @@` header.

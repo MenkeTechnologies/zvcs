@@ -378,9 +378,90 @@ fn the_provable_noop_diff_options_change_nothing() {
         }
     }
 
-    // `--no-rename-empty` is deliberately *not* in that list: it splits an
-    // empty-file `R100` back into an addition and a deletion, so it must not be
-    // accepted as inert.
+    // `--no-rename-empty` is deliberately *not* in that list. It is accepted, and
+    // on this fixture — which holds no empty-file rename — it prints the same bytes;
+    // but it is not inert, and the case below is what proves the difference.
     let o = cmd(&repo, &home, &["log", "--no-decorate", "-p", "-1", "--no-rename-empty", "HEAD"]);
-    assert!(!o.status.success(), "--no-rename-empty was accepted as a no-op");
+    assert!(o.status.success(), "--no-rename-empty: {}", err(&o));
+    assert_eq!(err(&o), "", "--no-rename-empty wrote to stderr");
+}
+
+/// `--no-rename-empty` (`o->flags.rename_empty = 0`): `record_if_better()`
+/// (diffcore-rename.c) refuses a pair whose surviving side is an empty blob, so an
+/// empty file that moved reports as a deletion plus an addition instead of an
+/// `R100`. Both halves are measured from stock git 2.55.0 — the bytes it prints,
+/// and the default it has to differ from.
+#[test]
+fn no_rename_empty_splits_an_empty_file_rename() {
+    let root =
+        std::env::temp_dir().join(format!("zvcs-rendflags-emptyrename-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let root = root.canonicalize().unwrap();
+    let home = root.join("home");
+    let repo = root.join("repo");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&repo).unwrap();
+    run(&repo, &home, &["init", "-q", "-b", "main"]);
+    std::fs::write(repo.join("empty.txt"), "").unwrap();
+    std::fs::write(repo.join("other.txt"), "x\n").unwrap();
+    run(&repo, &home, &["add", "-A"]);
+    run(&repo, &home, &["commit", "-q", "-m", "c0"]);
+    std::fs::rename(repo.join("empty.txt"), repo.join("moved.txt")).unwrap();
+    run(&repo, &home, &["add", "-A"]);
+    run(&repo, &home, &["commit", "-q", "-m", "c1"]);
+
+    let plain = cmd(&repo, &home, &["log", "--no-decorate", "-p", "-1", "--format=%s", "HEAD"]);
+    assert!(plain.status.success(), "{}", err(&plain));
+    assert_eq!(
+        out(&plain),
+        concat!(
+            "c1\n",
+            "\n",
+            "diff --git a/empty.txt b/moved.txt\n",
+            "similarity index 100%\n",
+            "rename from empty.txt\n",
+            "rename to moved.txt\n",
+        ),
+    );
+
+    let split = cmd(
+        &repo,
+        &home,
+        &["log", "--no-decorate", "-p", "-1", "--format=%s", "--no-rename-empty", "HEAD"],
+    );
+    assert!(split.status.success(), "{}", err(&split));
+    assert_eq!(
+        out(&split),
+        concat!(
+            "c1\n",
+            "\n",
+            "diff --git a/empty.txt b/empty.txt\n",
+            "deleted file mode 100644\n",
+            "index e69de29..0000000\n",
+            "diff --git a/moved.txt b/moved.txt\n",
+            "new file mode 100644\n",
+            "index 0000000..e69de29\n",
+        ),
+    );
+    assert_ne!(out(&split), out(&plain), "--no-rename-empty was swallowed");
+
+    // `--rename-empty` is `diff_setup()`'s default, so it puts the `R100` back.
+    let back = cmd(
+        &repo,
+        &home,
+        &[
+            "log",
+            "--no-decorate",
+            "-p",
+            "-1",
+            "--format=%s",
+            "--no-rename-empty",
+            "--rename-empty",
+            "HEAD",
+        ],
+    );
+    assert_eq!(out(&back), out(&plain), "the last spelling on the line wins");
+
+    let _ = std::fs::remove_dir_all(&root);
 }

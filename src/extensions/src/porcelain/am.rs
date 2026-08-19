@@ -98,10 +98,9 @@
 //!     observable — whenever the run stops (e.g. `Patch is empty.`). A malformed
 //!     boolean dies with git's `fatal: bad boolean config value ...` at
 //!     config-read time (exit 128), before any state directory is created.
-//!     `am.keepcr` is *not* honored: it only tunes `mailsplit`'s CR handling,
-//!     which this port does not implement (`split_mbox` copies the body
-//!     verbatim), so reading it would have no observable effect and it is left
-//!     unmapped rather than faked.
+//!     `am.keepcr` is read at split time, as git reads it — inside
+//!     `split_mail()` (builtin/am.c:966-971) rather than in `git_am_config` —
+//!     because it is what `--keep-cr` / `--no-keep-cr` override.
 //!
 //! ## What is not served, and why
 //!
@@ -114,6 +113,9 @@
 //!   * **`-S`.** Signing the commit needs a path `git commit-tree` does not expose
 //!     here. `--ignore-date` and `--committer-date-is-author-date` are honoured:
 //!     the first drops the mail's author date, the second dates the committer by it.
+//!   * **Charset re-coding (`-u` / `--no-utf8`).** See the note below: the
+//!     substrate is in [`super::mailinfo`], which converts only between UTF-8
+//!     and US-ASCII.
 //!   * **`GIT binary patch` bodies under `--rebasing`.** `write_commit_patch`
 //!     regenerates the diff with `git diff-tree`, which does not accept
 //!     `--binary` in this binary yet, so a replayed commit that changes a binary
@@ -128,7 +130,24 @@
 //! `split_mbox` is `git mailsplit`: an input is cut at its `From ` postmarks
 //! (`is_from_line()`'s date-shaped test, not the object name), each message keeping the
 //! postmark it starts with, and content before the first postmark forming a message of
-//! its own — which is how a bare patch file reaches `am`.
+//! its own — which is how a bare patch file reaches `am`. Two per-line rewrites
+//! happen on the way out, both from `split_one()` (builtin/mailsplit.c:87-95):
+//! a line ending `\r\n` becomes `\n` unless `--keep-cr`/`am.keepcr` says
+//! otherwise — the *default*, which is what lets a CRLF mailbox apply at all —
+//! and, under `--patch-format=mboxrd`, one leading `>` is removed from a
+//! `>+From ` line, undoing the quoting `--pretty=mboxrd` applied.
+//!
+//! `--patch-format=hg` reformats mercurial's `# Date <epoch> <seconds west>`
+//! into RFC2822 (`hg_patch_to_mail()`, builtin/am.c:891-929) so `mailinfo` can
+//! read it; a malformed one aborts the split with git's three diagnostics.
+//! `--patch-format=stgit` matches git's prefixes exactly — `Author:` with no
+//! space, and the bare words `From`/`Date` whose whole line is echoed.
+//!
+//! Charset re-coding is *not* implemented: `-u`/`--no-utf8` are parsed, but
+//! [`super::mailinfo`] converts only between UTF-8 and US-ASCII, so a mail in
+//! (say) ISO-8859-1 keeps its original bytes under both spellings where stock
+//! would transcode under the default `-u`. That is a `mailinfo` floor, not an
+//! `am` one.
 
 use anyhow::{bail, Result};
 use gix::bstr::{BStr, BString, ByteSlice};
@@ -369,6 +388,9 @@ struct Opts {
     message_id: bool,
     scissors: Option<bool>,
     quoted_cr: Option<&'static str>,
+    /// `--keep-cr` / `--no-keep-cr`, as git's tri-state `int keep_cr = -1`:
+    /// `-1` is "not given", so `am.keepcr` decides.
+    keep_cr: i32,
     rerere_autoupdate: Option<bool>,
     apply_opts: Vec<String>,
     // `do_commit` shaping flags. This port applies patches faithfully but cannot
@@ -400,6 +422,7 @@ impl Default for Opts {
             message_id: false,
             scissors: None,
             quoted_cr: None,
+            keep_cr: -1,
             rerere_autoupdate: None,
             apply_opts: Vec::new(),
             ignore_date: false,
@@ -761,8 +784,17 @@ fn parse_long(
         }
         "message-id" => o.message_id = flag(tok, attached, true)?,
         "no-message-id" => o.message_id = flag(tok, attached, false)?,
-        // `keep-cr` is only consulted by mailsplit, which never sees a message here.
-        "keep-cr" | "no-keep-cr" => no_value(tok, attached)?,
+        // `OPT_SET_INT(0, "keep-cr", &keep_cr, …, 1)` with no `PARSE_OPT_NONEG`:
+        // the negated spelling sets it to 0 rather than leaving it unset, which
+        // is what makes `--no-keep-cr` override `am.keepcr = true`.
+        "keep-cr" => {
+            no_value(tok, attached)?;
+            o.keep_cr = 1;
+        }
+        "no-keep-cr" => {
+            no_value(tok, attached)?;
+            o.keep_cr = 0;
+        }
         "scissors" => o.scissors = Some(flag(tok, attached, true)?),
         "no-scissors" => o.scissors = Some(flag(tok, attached, false)?),
         "quoted-cr" => {
@@ -1015,7 +1047,7 @@ fn setup(repo: &gix::Repository, state_dir: &Path, o: &Opts) -> Result<Setup> {
         })?;
     }
 
-    let messages = match split_mail(format, &o.paths)? {
+    let messages = match split_mail(repo, format, &o.paths, o.keep_cr)? {
         Split::Failed(errors) => {
             // git creates the directory before splitting and `am_destroy`s it on
             // failure, so the net effect on the repository is nothing.
@@ -1227,10 +1259,37 @@ fn is_from_line(line: &[u8]) -> bool {
     year > 90
 }
 
-/// `split_one()`: cut an mbox into its messages at the postmark lines, each message
-/// keeping the postmark it starts with. Content before the first postmark is a message
-/// of its own, which is how a bare patch file (git's `mailsplit -b`) reaches `am`.
-fn split_mbox_body(body: &[u8]) -> Vec<Vec<u8>> {
+/// `split_one()` (builtin/mailsplit.c:70-112): cut an mbox into its messages at
+/// the postmark lines, each message keeping the postmark it starts with. Content
+/// before the first postmark is a message of its own, which is how a bare patch
+/// file (git's `mailsplit -b`) reaches `am`.
+///
+/// Two per-line rewrites happen on the way out, and both are part of what the
+/// consumer then sees:
+///
+/// ```c
+/// if (!keep_cr && buf.len > 1 && buf.buf[buf.len-1] == '\n' &&
+///         buf.buf[buf.len-2] == '\r') {
+///         strbuf_setlen(&buf, buf.len-2);
+///         strbuf_addch(&buf, '\n');
+/// }
+/// if (mboxrd && is_gtfrom(&buf))
+///         strbuf_remove(&buf, 0, 1);
+/// ```
+///
+/// * **CRLF → LF unless `--keep-cr`.** This is `mailsplit`'s default, not an
+///   option, so a CRLF mailbox reaches `mailinfo`/`apply` with Unix line endings
+///   and applies. Skipping it made every CRLF mbox fail (`git am` exit 128 on a
+///   patch stock applies), which is the opposite of what `--keep-cr` is for.
+/// * **`>From ` unescaping under `--patch-format=mboxrd`**, the reverse of the
+///   quoting `--pretty=mboxrd` applies when a body line would otherwise look
+///   like a postmark. One leading `>` is removed from any run of `>`s followed
+///   by `From `.
+///
+/// The postmark test runs on the line as read, *before* either rewrite, exactly
+/// as the C's loop order has it — `is_from_line()` scans back from `len - 2` for
+/// the time's colon, so a trailing `\r` does not hide a postmark.
+fn split_mbox_body(body: &[u8], keep_cr: bool, mboxrd: bool) -> Vec<Vec<u8>> {
     let mut msgs: Vec<Vec<u8>> = Vec::new();
     let mut current: Vec<u8> = Vec::new();
     for line in body.split_inclusive(|b| *b == b'\n') {
@@ -1238,7 +1297,17 @@ fn split_mbox_body(body: &[u8]) -> Vec<Vec<u8>> {
         if is_from_line(bare) && !current.is_empty() {
             msgs.push(std::mem::take(&mut current));
         }
-        current.extend_from_slice(line);
+        let mut out: &[u8] = line;
+        let stripped;
+        if !keep_cr && line.len() > 1 && line.ends_with(b"\r\n") {
+            stripped = [&line[..line.len() - 2], b"\n"].concat();
+            out = &stripped;
+        }
+        if mboxrd && is_gtfrom(out) {
+            current.extend_from_slice(&out[1..]);
+        } else {
+            current.extend_from_slice(out);
+        }
     }
     if !current.is_empty() {
         msgs.push(current);
@@ -1246,9 +1315,44 @@ fn split_mbox_body(body: &[u8]) -> Vec<Vec<u8>> {
     msgs
 }
 
-fn split_mail(format: Format, paths: &[String]) -> Result<Split> {
+/// `is_gtfrom()` (builtin/mailsplit.c:53-63): one or more `>` followed by
+/// `From `. Shorter than `">From "` cannot qualify.
+fn is_gtfrom(line: &[u8]) -> bool {
+    if line.len() < b">From ".len() {
+        return false;
+    }
+    let ngt = line.iter().take_while(|&&b| b == b'>').count();
+    ngt > 0 && line[ngt..].starts_with(b"From ")
+}
+
+/// `split_mail()` (builtin/am.c:963-985).
+///
+/// `keep_cr` arrives as git's tri-state: negative means "not given", in which
+/// case `am.keepcr` decides and defaults to off.
+///
+/// ```c
+/// if (keep_cr < 0) {
+///         keep_cr = 0;
+///         repo_config_get_bool(the_repository, "am.keepcr", &keep_cr);
+/// }
+/// ```
+///
+/// Only the mbox formats consult it: `stgit_patch_to_mail()` and
+/// `hg_patch_to_mail()` both take it as `int keep_cr UNUSED`.
+fn split_mail(
+    repo: &gix::Repository,
+    format: Format,
+    paths: &[String],
+    keep_cr: i32,
+) -> Result<Split> {
+    let keep_cr = if keep_cr >= 0 {
+        keep_cr == 1
+    } else {
+        repo.config_snapshot().boolean("am.keepcr") == Some(true)
+    };
     match format {
-        Format::Mbox | Format::Mboxrd => split_mbox(paths),
+        Format::Mbox => split_mbox(paths, keep_cr, false),
+        Format::Mboxrd => split_mbox(paths, keep_cr, true),
         // `split_mail_conv` writes one message per input path, converting it;
         // with no paths it reads stdin as a single patch.
         Format::Stgit => split_conv(paths, convert_stgit),
@@ -1258,18 +1362,18 @@ fn split_mail(format: Format, paths: &[String]) -> Result<Split> {
 }
 
 /// `git mailsplit`: each path is an mbox file or a Maildir, and no path at all
-/// means stdin. The fixtures never carry an mbox `From ` envelope, so each
-/// non-empty source contributes exactly one message (its whole body); a real
-/// multi-message mbox would need envelope splitting this does not do.
-fn split_mbox(paths: &[String]) -> Result<Split> {
+/// means stdin. Each file is cut at its `From ` postmarks by
+/// [`split_mbox_body`]; a Maildir contributes one message per file in `new/`
+/// then `cur/`, verbatim.
+fn split_mbox(paths: &[String], keep_cr: bool, mboxrd: bool) -> Result<Split> {
     let mut msgs: Vec<Vec<u8>> = Vec::new();
     if paths.is_empty() {
-        msgs.extend(split_mbox_body(&read_stdin()?));
+        msgs.extend(split_mbox_body(&read_stdin()?, keep_cr, mboxrd));
         return Ok(Split::Messages(msgs));
     }
     for p in paths {
         if p == "-" {
-            msgs.extend(split_mbox_body(&read_stdin()?));
+            msgs.extend(split_mbox_body(&read_stdin()?, keep_cr, mboxrd));
             continue;
         }
         let path = Path::new(p);
@@ -1291,7 +1395,7 @@ fn split_mbox(paths: &[String]) -> Result<Split> {
             continue;
         }
         match std::fs::read(path) {
-            Ok(body) => msgs.extend(split_mbox_body(&body)),
+            Ok(body) => msgs.extend(split_mbox_body(&body, keep_cr, mboxrd)),
             Err(e) => {
                 return Ok(Split::Failed(vec![format!(
                     "cannot stat {p}: {}",
@@ -1305,20 +1409,39 @@ fn split_mbox(paths: &[String]) -> Result<Split> {
 
 /// `split_mail_conv`: one output message per input path, stdin when none. The
 /// converter (`stgit`/`hg`) turns each source into mail form.
-fn split_conv(paths: &[String], conv: fn(&[u8]) -> Vec<u8>) -> Result<Split> {
+fn split_conv(
+    paths: &[String],
+    conv: fn(&[u8]) -> std::result::Result<Vec<u8>, String>,
+) -> Result<Split> {
+    // `if (ret) return error(_("could not parse patch '%s'"), *paths);`
+    // (builtin/am.c:783-784) — the converter's own diagnostic first, then this
+    // one naming the path as the command line spelled it, then the caller's
+    // `fatal: Failed to split patches.`
+    let failed = |p: &str, why: String| {
+        Ok(Split::Failed(vec![why, format!("could not parse patch '{p}'")]))
+    };
     if paths.is_empty() {
-        return Ok(Split::Messages(vec![conv(&read_stdin()?)]));
+        return match conv(&read_stdin()?) {
+            Ok(m) => Ok(Split::Messages(vec![m])),
+            Err(why) => failed("-", why),
+        };
     }
     let mut msgs: Vec<Vec<u8>> = Vec::new();
     for p in paths {
         if p == "-" {
-            msgs.push(conv(&read_stdin()?));
+            match conv(&read_stdin()?) {
+                Ok(m) => msgs.push(m),
+                Err(why) => return failed(p, why),
+            }
             continue;
         }
         // git has already written the messages for the preceding paths, but the
         // caller destroys the whole session directory on failure.
         match std::fs::read(p) {
-            Ok(body) => msgs.push(conv(&body)),
+            Ok(body) => match conv(&body) {
+                Ok(m) => msgs.push(m),
+                Err(why) => return failed(p, why),
+            },
             Err(e) => {
                 return Ok(Split::Failed(vec![format!(
                     "could not open '{p}' for reading: {}",
@@ -1371,19 +1494,33 @@ fn split_stgit_series(paths: &[String]) -> Result<Split> {
 /// and `Date:` become mail headers, and the remainder is the body. Only the
 /// header/subject/body shape matters downstream, so the copy is byte-faithful
 /// enough for `is_empty`/`Subject` detection.
-fn convert_stgit(input: &[u8]) -> Vec<u8> {
+fn convert_stgit(input: &[u8]) -> std::result::Result<Vec<u8>, String> {
     let lines = getlines(input);
     let mut out: Vec<u8> = Vec::new();
     let mut subject_printed = false;
     let mut it = lines.iter();
     while let Some(line) = it.next() {
-        if let Some(v) = strip(line, b"From: ").or_else(|| strip(line, b"Author: ")) {
-            out.extend_from_slice(b"From: ");
+        // ```c
+        // if (str_isspace(sb.buf))                        continue;
+        // else if (skip_prefix(sb.buf, "Author:", &str))  fprintf(out, "From:%s\n", str);
+        // else if (starts_with(sb.buf, "From") ||
+        //          starts_with(sb.buf, "Date"))           fprintf(out, "%s\n", sb.buf);
+        // else if (!subject_printed)                      fprintf(out, "Subject: %s\n", sb.buf);
+        // else                                          { fprintf(out, "\n%s\n", sb.buf); break; }
+        // ```
+        // The prefixes are `Author:` (no space — the rest of the line, leading
+        // space included, is copied verbatim after `From:`) and the bare words
+        // `From`/`Date`, whose whole line is echoed unchanged. Requiring
+        // `"Author: "`/`"From: "`/`"Date: "` instead silently turned an
+        // `Author:<name>` header into the subject line.
+        if is_blank(line) {
+            continue;
+        } else if let Some(v) = line.strip_prefix(b"Author:".as_slice()) {
+            out.extend_from_slice(b"From:");
             out.extend_from_slice(v);
             out.push(b'\n');
-        } else if let Some(v) = strip(line, b"Date: ") {
-            out.extend_from_slice(b"Date: ");
-            out.extend_from_slice(v);
+        } else if line.starts_with(b"From") || line.starts_with(b"Date") {
+            out.extend_from_slice(line);
             out.push(b'\n');
         } else if !subject_printed {
             out.extend_from_slice(b"Subject: ");
@@ -1401,12 +1538,35 @@ fn convert_stgit(input: &[u8]) -> Vec<u8> {
             break;
         }
     }
-    out
+    Ok(out)
 }
 
-/// `hg_patch_to_mail`: `# User`/`# Date` become headers, other `# ` lines are
-/// dropped, and the first ordinary line starts the body.
-fn convert_hg(input: &[u8]) -> Vec<u8> {
+/// `str_isspace()`: the line is empty or entirely whitespace.
+fn is_blank(line: &[u8]) -> bool {
+    line.iter().all(|b| b.is_ascii_whitespace())
+}
+
+/// `hg_patch_to_mail` (builtin/am.c:881-946): `# User`/`# Date` become headers,
+/// other `# ` lines are dropped, and the first ordinary line starts the body.
+///
+/// `# Date` is **not** copied through. Mercurial writes `<epoch> <seconds west
+/// of UTC>`; git parses both halves, converts the offset to its own
+/// hours-and-minutes-east form and re-emits the whole thing as RFC2822:
+///
+/// ```c
+/// tz2 = labs(tz) / 3600 * 100 + labs(tz) % 3600 / 60;
+/// if (tz > 0)
+///         tz2 = -tz2;
+/// fprintf(out, "Date: %s\n", show_date(timestamp, tz2, DATE_MODE(RFC2822)));
+/// ```
+///
+/// Passing the mercurial spelling through instead left `mailinfo` with a date it
+/// cannot parse, so every hg patch was committed with the *current* time —
+/// `git am --patch-format=hg` exited 0 having thrown the author date away.
+///
+/// The three refusals are git's, and each aborts the whole split
+/// (`could not parse patch '<path>'`, then `fatal: Failed to split patches.`).
+fn convert_hg(input: &[u8]) -> std::result::Result<Vec<u8>, String> {
     let lines = getlines(input);
     let mut out: Vec<u8> = Vec::new();
     let mut it = lines.iter();
@@ -1416,9 +1576,8 @@ fn convert_hg(input: &[u8]) -> Vec<u8> {
             out.extend_from_slice(v);
             out.push(b'\n');
         } else if let Some(v) = strip(line, b"# Date ") {
-            // git reformats the timestamp; only its presence matters here.
             out.extend_from_slice(b"Date: ");
-            out.extend_from_slice(v);
+            out.extend_from_slice(hg_date(v)?.as_bytes());
             out.push(b'\n');
         } else if line.starts_with(b"# ") {
             continue;
@@ -1433,7 +1592,49 @@ fn convert_hg(input: &[u8]) -> Vec<u8> {
             break;
         }
     }
-    out
+    Ok(out)
+}
+
+/// The `# Date <timestamp> <tz>` half of `hg_patch_to_mail()`.
+///
+/// `parse_timestamp()` is `strtoumax` and the offset is `strtol`, both base 10,
+/// and git tests `errno` after each — which on this platform's libc is set when
+/// no digits were consumed, so a non-numeric field is reported as that field
+/// rather than as a malformed line.
+fn hg_date(field: &[u8]) -> std::result::Result<String, String> {
+    let text = String::from_utf8_lossy(field);
+    let digits = |s: &str| s.len() - s.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+    let n = digits(&text);
+    if n == 0 {
+        return Err("invalid timestamp".to_string());
+    }
+    let seconds: i64 = text[..n].parse().map_err(|_| "invalid timestamp".to_string())?;
+    let rest = &text[n..];
+    let Some(rest) = rest.strip_prefix(' ') else {
+        return Err("invalid Date line".to_string());
+    };
+    let sign_len = usize::from(rest.starts_with('-') || rest.starts_with('+'));
+    let n = sign_len + digits(&rest[sign_len..]);
+    if n == sign_len {
+        return Err("invalid timezone offset".to_string());
+    }
+    let tz: i64 = rest[..n].parse().map_err(|_| "invalid timezone offset".to_string())?;
+    if !rest[n..].is_empty() {
+        return Err("invalid Date line".to_string());
+    }
+    // `tz2 = labs(tz) / 3600 * 100 + labs(tz) % 3600 / 60; if (tz > 0) tz2 = -tz2;`
+    // — seconds *west* of UTC become git's `+HHMM` east of it.
+    let abs = tz.abs();
+    let hhmm = abs / 3600 * 100 + abs % 3600 / 60;
+    let hhmm = if tz > 0 { -hhmm } else { hhmm };
+    // git's offset is in seconds east of UTC; `hhmm` is the printed `+HHMM`.
+    let offset = (hhmm / 100 * 3600 + hhmm % 100 * 60) as i32;
+    let time = gix::date::Time { seconds, offset };
+    // A timestamp `jiff` cannot represent is out of git's range too; git's
+    // `show_date()` falls back to the raw seconds there.
+    Ok(time
+        .format(gix::date::time::format::GIT_RFC2822)
+        .unwrap_or_else(|_| format!("{seconds}")))
 }
 
 /// `strbuf_getline_lf` over a buffer: split on LF, and drop the empty trailing
@@ -1593,6 +1794,11 @@ struct Loaded {
     quoted_cr: String,
     apply_opts: Vec<String>,
     rebasing: bool,
+    /// `state->allow_rerere_autoupdate`, read back from
+    /// `$state_dir/rerere-autoupdate` (builtin/am.c:428-433): the file is only
+    /// written when the option was given, so its absence is git's `0` — defer to
+    /// `rerere.autoupdate`.
+    rerere_autoupdate: Option<bool>,
 }
 
 fn read_state(state_dir: &Path, name: &str) -> String {
@@ -1622,6 +1828,14 @@ fn load_state(state_dir: &Path) -> Loaded {
         quoted_cr: read_state(state_dir, "quoted-cr"),
         apply_opts: sq_dequote(&read_state(state_dir, "apply-opt")),
         rebasing: state_dir.join("rebasing").exists(),
+        // `if (file_exists(am_path(state, "rerere-autoupdate"))) … else
+        // state->allow_rerere_autoupdate = 0;` (builtin/am.c:428-433). The file
+        // is only written when the option was given, so its absence means
+        // `rerere.autoupdate` decides.
+        rerere_autoupdate: state_dir
+            .join("rerere-autoupdate")
+            .exists()
+            .then(|| read_state(state_dir, "rerere-autoupdate") == "t"),
     }
 }
 
@@ -2120,6 +2334,19 @@ fn fall_back_threeway(ctx: &Ctx, repo: &gix::Repository, ld: &Loaded, msg: &[u8]
     crate::merge_apply::write_auto_merge(repo, applied.tree_id)?;
 
     if !applied.conflicts.is_empty() {
+        // ```c
+        // if (merge_ort_generic(&o, &our_tree, &their_tree, 1, bases, &result)) {
+        //         repo_rerere(the_repository, state->allow_rerere_autoupdate);
+        //         …
+        //         return error(_("Failed to merge in the changes."));
+        // }
+        // ```
+        // (builtin/am.c:1651-1655). Without it a conflicted `git am -3` recorded
+        // no preimage at all, so `rerere` had nothing to replay on the next
+        // attempt and `--rerere-autoupdate` staged nothing — the `Recorded
+        // preimage for '<path>'` line stock prints just above `error: Failed to
+        // merge in the changes.` was missing along with the `rr-cache` entry.
+        super::rerere::repo_rerere(repo, ld.rerere_autoupdate)?;
         eprintln!("error: Failed to merge in the changes.");
         return Ok(false);
     }
@@ -2519,6 +2746,12 @@ fn am_resolve(
              `commit-tree` does not expose here"
         );
     }
+
+    // `repo_rerere(the_repository, 0)` immediately before `do_commit()`
+    // (builtin/am.c:1982): the resolution the user just staged is recorded, so a
+    // later patch that conflicts the same way replays it. The `0` is git's
+    // "no override", i.e. `rerere.autoupdate` decides.
+    super::rerere::repo_rerere(repo, None)?;
 
     if let Some(code) = do_commit(
         &ctx,

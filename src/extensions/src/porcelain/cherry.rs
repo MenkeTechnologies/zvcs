@@ -342,7 +342,7 @@ fn walk(repo: &gix::Repository, tips: &[ObjectId], hidden: &[ObjectId]) -> Resul
 /// Port of `commit_patch_id()`: hash the diff of a commit against its first
 /// parent (against the empty tree for a root commit). `None` for a merge, which
 /// `patch_id_defined()` refuses.
-fn commit_patch_id(repo: &gix::Repository, id: ObjectId) -> Result<Option<ObjectId>> {
+pub(super) fn commit_patch_id(repo: &gix::Repository, id: ObjectId) -> Result<Option<ObjectId>> {
     let commit = repo.find_commit(id)?;
     let mut parents = commit.parent_ids();
     let first = parents.next();

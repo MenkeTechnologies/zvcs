@@ -59,6 +59,19 @@ pub struct Applied {
     /// unmerged stage 1/2/3 entries applied on conflict. **Not yet written**; the
     /// caller writes it after deciding whether to commit or record merge state.
     pub index: gix::index::File,
+    /// The `Auto-merging <path>` / `CONFLICT (<kind>): Merge conflict in <path>`
+    /// lines this merge produced, in order, whether or not `show_msgs` let them
+    /// be printed.
+    ///
+    /// They are returned as well as printed because git's decision to show them
+    /// is not always taken before the merge: the sequencer computes
+    /// `show_output = !is_rebase_i(opts) || !result.clean` *after*
+    /// `merge_incore_nonrecursive()` (sequencer.c:783), and `do_merge()` does the
+    /// same with `if (ret <= 0) fputs(o.obuf.buf, stdout)` (sequencer.c:4360-4361)
+    /// — that is what makes `git rebase -Xours` silent when the option resolves
+    /// every hunk and noisy when it does not. Such a caller passes
+    /// `show_msgs = false` and prints these itself.
+    pub messages: Vec<String>,
 }
 
 /// `merge_switch_to_result()`'s last act: record the merged tree as `AUTO_MERGE`
@@ -336,7 +349,7 @@ fn merge_and_apply(
     let mut messages: Vec<String> = Vec::new();
     for conflict in &merge.conflicts {
         let path = conflict_location(conflict);
-        if show_msgs && conflict.content_merge().is_some() {
+        if conflict.content_merge().is_some() {
             messages.push(format!("Auto-merging {path}"));
         }
         if !conflict.is_unresolved(unresolved) {
@@ -349,9 +362,7 @@ fn merge_and_apply(
         } else {
             "content"
         };
-        if show_msgs {
-            messages.push(format!("CONFLICT ({kind}): Merge conflict in {path}"));
-        }
+        messages.push(format!("CONFLICT ({kind}): Merge conflict in {path}"));
         conflicts.push(path);
     }
 
@@ -368,8 +379,10 @@ fn merge_and_apply(
         }
     }
 
-    for line in messages {
-        println!("{line}");
+    if show_msgs {
+        for line in &messages {
+            println!("{line}");
+        }
     }
 
     let mut index = update_worktree_to_tree(repo, old_index, tree_id, should_interrupt)?;
@@ -385,6 +398,7 @@ fn merge_and_apply(
         tree_id,
         conflicts,
         index,
+        messages,
     }))
 }
 

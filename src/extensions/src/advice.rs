@@ -105,6 +105,9 @@ pub enum Advice {
     /// An interactive-rebase todo line was rejected — `check_merge_commit_insn`'s
     /// "that instruction does not take a merge commit".
     RebaseTodoError,
+    /// `sequencer_make_script()`'s note that `--cherry-mark` dropped commits
+    /// whose patch is already upstream (sequencer.c:6231-6233).
+    SkippedCherryPicks,
     /// `store_updated_refs()`'s note that the forced-update check is switched off,
     /// so the fetch summary cannot flag rewritten branches. Unlike its neighbours
     /// this one gates a `warning()`, not an `advise()` — no `hint: ` prefix, no
@@ -151,6 +154,7 @@ impl Advice {
             Advice::Diverging => "advice.diverging",
             Advice::AmbiguousFetchRefspec => "advice.ambiguousFetchRefspec",
             Advice::RebaseTodoError => "advice.rebaseTodoError",
+            Advice::SkippedCherryPicks => "advice.skippedCherryPicks",
             Advice::FetchShowForcedUpdates => "advice.fetchShowForcedUpdates",
         }
     }

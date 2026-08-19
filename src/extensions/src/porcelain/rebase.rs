@@ -17,6 +17,14 @@
 //!
 //! ### What is ported
 //!
+//! * `-X<option>` and `--ignore-whitespace` (which becomes
+//!   `-Xignore-space-change` on the merge backend, builtin/rebase.c:1546-1548),
+//!   applied to every pick and every recreated `merge` through
+//!   [`crate::merge_apply::StrategyOptions`], and recorded in
+//!   `$state_dir/strategy` / `$state_dir/strategy_opts` so `--continue` merges
+//!   the same way. merge-ort's `Auto-merging`/`CONFLICT` block is shown only
+//!   when the merge came out unclean, which is git's
+//!   `show_output = !is_rebase_i(opts) || !result.clean` (sequencer.c:783).
 //! * The whole option grammar, including the backend inference (`imply_merge()`,
 //!   `parse_opt_am()`/`parse_opt_merge()`/`parse_opt_interactive()`), and every
 //!   `die()` it can raise — `apply options and merge options cannot be used
@@ -90,30 +98,54 @@
 //! finishes. Refused within `merge`, with a message naming the reason: octopus
 //! merges (git shells out to `git merge -s octopus`), an explicit `-s`, the
 //! `merge -c` editor variant, `merge` without an original `-C` commit, more than
-//! one merge base, and `reset [new root]`. `update-ref` is still refused
-//! outright. A refused instruction leaves the rebase resumable, so `--abort`
-//! still works.
+//! one merge base, and `reset [new root]`. A refused instruction leaves the
+//! rebase resumable, so `--abort` still works.
+//!
+//! `update-ref` executes too: it records where `HEAD` has reached in
+//! `$state_dir/update-refs`, and the refs move when the sheet finishes.
+//!
+//! ### `--empty`, `--cherry-mark` and `--update-refs`
+//!
+//! A commit that contributes nothing to the replay is dropped in one of two
+//! places, and which one decides what the user sees:
+//!
+//! * **Before the sheet**, by `revs.cherry_mark` (sequencer.c:6172), for a
+//!   commit whose *patch* is already in `<upstream>`. The patch ids come from
+//!   [`super::cherry::commit_patch_id`], the port of `commit_patch_id()` that
+//!   `git cherry` already needed, applied over the two sides of
+//!   `<upstream>...<orig_head>` the way `cherry_pick_list()` does. Such a commit
+//!   never reaches a pick: it is announced with
+//!   `warning: skipped previously applied commit <abbrev>` and the
+//!   `advice.skippedCherryPicks` hint. `--reapply-cherry-picks` turns it off.
+//! * **In the pick loop**, by `allow_empty()` (sequencer.c:1787-1818), for a
+//!   commit that *became* empty — the merge resolved to the tree already at
+//!   `HEAD`. `--empty` decides between the three outcomes: `keep` commits it
+//!   anyway, `drop` reports `dropping <oid> <subject> -- patch contents already
+//!   upstream`, and `stop` halts. `stop` is not a message this module prints:
+//!   `do_commit()` re-enters a real `git commit` without `--allow-empty`
+//!   (sequencer.c:1750-1755) and forwards its refusal, which is why the
+//!   `The previous cherry-pick is now empty…` advice and the whole `git status`
+//!   report arrive on **stderr**. The `--empty` value is recorded as the
+//!   `drop_redundant_commits` / `keep_redundant_commits` marker pair.
+//!
+//! `--update-refs` generates an `update-ref <fullname>` instruction after every
+//! pick whose commit carries a `refs/heads/*` decoration other than the branch
+//! being rebased ([`super::rebase_todo::add_update_ref_commands`]), records the
+//! `(ref, before, after)` triples in `$state_dir/update-refs`, fills each
+//! `after` in as the instruction runs, and applies them all at the end with the
+//! `rewritten during rebase` reflog message and the `Updated the following refs
+//! with --update-refs:` report. A ref another worktree has checked out becomes a
+//! `# Ref <name> checked out at '<path>'` comment instead, as git's
+//! `add_decorations_to_list()` does.
 //!
 //! ### What is NOT ported, and why
 //!
-//! * **No patch-id equivalence.** `sequencer_make_script()` sets
-//!   `revs.cherry_mark`, which drops a to-be-rebased commit whose patch is
-//!   already in `<upstream>` *before* the sheet is written, announcing it with
-//!   `warning: skipped previously applied commit <abbrev>`. Deciding that needs
-//!   a patch id per commit and nothing vendored computes one, so such a commit
-//!   stays in the sheet and is dropped in the pick loop instead — by git's own
-//!   `drop_redundant_commits`, with its `dropping <oid> <subject> -- patch
-//!   contents already upstream` line. The visible difference is the step count:
-//!   the sheet still holds the commit, so the progress line counts it.
-//! * `--update-refs`, and the `update-ref` instruction it generates: it still
-//!   selects the merge backend and still raises git's apply-backend
-//!   incompatibility errors, but nothing tracks the refs pointing into the
-//!   rebased range. **The flag is accepted and then ignored**: the sheet is
-//!   generated without any `update-ref` line, so a rebase with it exits 0 having
-//!   left every branch pointing into the old range exactly where it was, with no
-//!   diagnostic and no `Updated the following refs with --update-refs:` report.
-//!   The refusal further down this module is reachable only from a hand-written
-//!   `update-ref` line in an edited todo, never from the flag.
+//! * `-s <strategy>` other than `ort`/`recursive`: the name is honoured as far
+//!   as `$state_dir/strategy` and the `-Xsubtree` seeding go, but the merge is
+//!   always merge-ort. `git rebase -s resolve` therefore reports merge-ort's
+//!   `CONFLICT (content)` and stops resumably where git's `git-merge-resolve`
+//!   shell strategy prints `Trying simple merge.` / `fatal: merge program
+//!   failed` and dies.
 //! * `--rebase-merges=rebase-cousins`, which changes which base
 //!   `make_script_with_merges()` resets a branch to; only the default mode is
 //!   ported.
@@ -158,7 +190,8 @@
 //! `--no-fork-point`), `rebase.stat` (true ⇒ `--stat`), `rebase.autoSquash`
 //! (only under an explicit `-i`, matching `cmd_rebase()`),
 //! `rebase.rescheduleFailedExec`, `rebase.rebaseMerges` and `rebase.updateRefs`
-//! (both of which raise git's apply-backend incompatibility errors).
+//! (the last two raise git's apply-backend incompatibility errors; `updateRefs`
+//! is otherwise the default `--update-refs`/`--no-update-refs` overrides).
 //!
 //! Read by the instruction sheet in [`super::rebase_todo`]:
 //! `rebase.instructionFormat` (the oneline on each line),
@@ -201,7 +234,13 @@
 //!
 //! ### Hooks
 //!
-//! A rebase runs three of them. `post-commit` fires for every commit the
+//! `pre-rebase` runs first, with `<upstream>` as spelled (or the literal
+//! `--root`) and the optional `[<branch>]` operand — one argument when no
+//! operand was given, because `run_hooks_l()` is NULL-terminated. A non-zero
+//! exit stops the rebase with `error: The pre-rebase hook refused to rebase.`
+//! before anything has moved.
+//!
+//! A rebase runs three more of them. `post-commit` fires for every commit the
 //! sequencer writes, and `post-rewrite amend` for every one that amended an
 //! existing commit (`try_to_commit()`, sequencer.c:1697-1699) — this port builds
 //! those commit objects directly instead of re-entering `git commit`, so it runs
@@ -543,6 +582,9 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
     let mut ignore_whitespace = false;
     let mut preserve_merges = false;
     let mut empty_set = false;
+    // `options.empty` — `EMPTY_UNSPECIFIED` until the command line or
+    // `cmd_rebase()`'s defaulting below picks one of `drop`/`keep`/`stop`.
+    let mut empty: Option<Empty> = None;
     // `options.keep_empty`, which `REBASE_OPTIONS_INIT` starts at 1: a commit
     // that changes nothing is listed in the instruction sheet (tagged
     // ` # empty`) unless `--no-keep-empty` drops it.
@@ -865,10 +907,15 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
                 "empty" => {
                     let v = value!();
                     match v.to_ascii_lowercase().as_str() {
-                        "drop" | "keep" | "stop" => {}
-                        "ask" => eprintln!(
-                            "warning: --empty=ask is deprecated; use '--empty=stop' instead."
-                        ),
+                        "drop" => empty = Some(Empty::Drop),
+                        "keep" => empty = Some(Empty::Keep),
+                        "stop" => empty = Some(Empty::Stop),
+                        "ask" => {
+                            empty = Some(Empty::Stop);
+                            eprintln!(
+                                "warning: --empty=ask is deprecated; use '--empty=stop' instead."
+                            );
+                        }
                         _ => die!(
                             "unrecognized empty type '{v}'; valid values are \"drop\", \"keep\", and \"stop\"."
                         ),
@@ -1281,6 +1328,17 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
     if update_refs == 1 {
         try_imply!(ty, "--update-refs");
     }
+    // ```c
+    // options.update_refs = (options.update_refs >= 0) ? options.update_refs :
+    //                      ((options.config_update_refs >= 0) ? options.config_update_refs : 0);
+    // ```
+    // (builtin/rebase.c:1589-1590) — `rebase.updateRefs` is the default the flag
+    // overrides, and the apply-backend contradiction above already fired.
+    if update_refs < 0 {
+        update_refs = i32::from(
+            repo.config_snapshot().boolean("rebase.updateRefs") == Some(true),
+        );
+    }
     if rebase_merges == 1 {
         try_imply!(ty, "--rebase-merges");
     }
@@ -1309,6 +1367,22 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
             Some(other) => die!("Unknown rebase backend: {other}"),
         }
     }
+
+    // ```c
+    // if (options.empty == EMPTY_UNSPECIFIED) {
+    //         if (options.flags & REBASE_INTERACTIVE_EXPLICIT) options.empty = EMPTY_STOP;
+    //         else if (options.exec.nr > 0)                    options.empty = EMPTY_KEEP;
+    //         else                                             options.empty = EMPTY_DROP;
+    // }
+    // ```
+    // (builtin/rebase.c:1626-1633), right after the backend has been settled.
+    let empty = empty.unwrap_or(if flags & INTERACTIVE_EXPLICIT != 0 {
+        Empty::Stop
+    } else if !exec.is_empty() {
+        Empty::Keep
+    } else {
+        Empty::Drop
+    });
 
     if reschedule_failed_exec > 0 && ty != Backend::Merge {
         die!("--reschedule-failed-exec requires --exec or --interactive");
@@ -1379,6 +1453,32 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
             let tracking = branch.as_ref().and_then(|b| {
                 repo.branch_remote_tracking_ref_name(b.as_ref(), gix::remote::Direction::Fetch)
             });
+            // `set_merge()` (remote.c:1780-1790): when the branch's remote is the
+            // repository itself (`branch.<name>.remote = .`, what
+            // `git branch --set-upstream-to=<local-branch>` writes),
+            // `remote_find_tracking()` finds nothing — there are no refspecs to
+            // map through — and git falls back to DWIM-resolving
+            // `branch.<name>.merge` as a ref name. `branch_get_upstream()` then
+            // returns that full ref. gix's tracking-ref lookup only knows the
+            // refspec path, so without this a `git rebase` with no operand on a
+            // branch tracking another *local* branch reported
+            // `There is no tracking information for the current branch.` and
+            // exited 1 where stock rebases.
+            let tracking = tracking.or_else(|| {
+                let name = branch.as_ref()?.shorten().to_string();
+                let snap = repo.config_snapshot();
+                if snap.string(&format!("branch.{name}.remote"))?.to_string() != "." {
+                    return None;
+                }
+                let merge = snap.string(&format!("branch.{name}.merge"))?.to_string();
+                let full = repo
+                    .rev_parse_single(merge.as_str())
+                    .ok()
+                    .and_then(|_| repo.find_reference(merge.as_str()).ok())
+                    .map(|r| r.name().as_bstr().to_string())
+                    .unwrap_or(merge);
+                Some(Ok(full_name(&full).ok()?))
+            });
             match tracking {
                 Some(Ok(name)) => {
                     if fork_point < 0 {
@@ -1412,6 +1512,10 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
         }
         }
     };
+    // `options.upstream_arg` — what the `pre-rebase` hook is handed. It is the
+    // `<upstream>` token as the user spelled it, except under `--root`, where
+    // `builtin/rebase.c:1684` substitutes the literal string `--root`.
+    let upstream_arg = if root { "--root".to_string() } else { upstream_spec.clone() };
     let upstream_oid = if root {
         None
     } else {
@@ -1732,9 +1836,33 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
     }
 
     // `pre-rebase` receives `<upstream> [<branch>]`; a non-zero exit aborts.
-    if !ok_to_skip_pre_rebase
-        && !crate::hooks::run(&repo, "pre-rebase", &[onto_spec.as_str(), branch_name.as_str()], None)?
-    {
+    // ```c
+    // if (!ok_to_skip_pre_rebase &&
+    //     run_hooks_l(the_repository, "pre-rebase", options.upstream_arg,
+    //                 argc ? argv[0] : NULL, NULL)) {
+    //         ret = error(_("The pre-rebase hook refused to rebase."));
+    //         goto cleanup_autostash;
+    // }
+    // ```
+    // (builtin/rebase.c:1832-1838). Two things this got wrong, both visible to
+    // any hook that reads `$#`:
+    //
+    // * The first argument is `options.upstream_arg` — the `<upstream>` **as
+    //   spelled**, or the literal `--root` (builtin/rebase.c:1667, 1684) — not
+    //   `<onto>`. With `--onto` the two differ.
+    // * The second is `argv[0]`, i.e. the optional `[<branch>]` operand, and
+    //   `run_hooks_l()` is NULL-terminated: with no operand the hook is called
+    //   with **one** argument, not with the current branch as a second. A hook
+    //   written against `git rebase <upstream>` saw `$#` of 2 and `$2` naming a
+    //   branch git never passes.
+    //
+    // The refusal also has a diagnostic — `error()` on stderr — and exit 1.
+    let mut hook_args: Vec<&str> = vec![upstream_arg.as_str()];
+    if let Some(b) = branch_arg {
+        hook_args.push(b.as_str());
+    }
+    if !ok_to_skip_pre_rebase && !crate::hooks::run(&repo, "pre-rebase", &hook_args, None)? {
+        eprintln!("error: The pre-rebase hook refused to rebase.");
         return Ok(ExitCode::from(1));
     }
 
@@ -1822,6 +1950,55 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
             })
             .collect()
     };
+
+    // `revs.cherry_mark = !reapply_cherry_picks` (sequencer.c:6172), resolved by
+    // `cherry_pick_list()` (revision.c) over the symmetric range the sheet is
+    // built from: patch ids are taken for the commits on *each* side of
+    // `<upstream>...<orig_head>`, and a right-side commit whose id also appears
+    // on the left is flagged `PATCHSAME`. `sequencer_make_script()` then drops it
+    // with `warning: skipped previously applied commit <abbrev>`.
+    //
+    // Both sides must be non-empty — `cherry_pick_list()` returns early
+    // otherwise — so a branch that is purely ahead of its upstream marks nothing.
+    // Merges have no patch id (`commit_patch_id()` refuses them) and are never
+    // marked. The left side is hidden behind the same `^<fork point>` the replay
+    // range uses, so `--fork-point` narrows what counts as "already upstream" too.
+    //
+    // This is what keeps `git rebase -i <upstream>` (whose `--empty` default is
+    // `stop`) from halting on a commit the upstream already carries: git removes
+    // it from the sheet here, long before `allow_empty()` could see an unchanged
+    // index.
+    let patchsame: HashSet<ObjectId> = if reapply_cherry_picks == 1 || root || todo_range.is_empty()
+    {
+        HashSet::new()
+    } else {
+        let mut left_hidden: Vec<ObjectId> = vec![head_oid];
+        if let Some(fp) = fork_point_oid {
+            left_hidden.push(fp);
+        }
+        let base = upstream_oid.unwrap_or(onto_oid);
+        let mut left_ids: HashSet<ObjectId> = HashSet::new();
+        for info in repo.rev_walk([base]).with_hidden(left_hidden).all()? {
+            let id = info?.id;
+            if let Some(pid) = super::cherry::commit_patch_id(&repo, id)? {
+                left_ids.insert(pid);
+            }
+        }
+        if left_ids.is_empty() {
+            HashSet::new()
+        } else {
+            let mut out = HashSet::new();
+            for &id in &todo_range {
+                if let Some(pid) = super::cherry::commit_patch_id(&repo, id)? {
+                    if left_ids.contains(&pid) {
+                        out.insert(id);
+                    }
+                }
+            }
+            out
+        }
+    };
+
 
     let apply_backend = ty == Backend::Apply;
 
@@ -1969,6 +2146,9 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
                 rerere_autoupdate,
                 committer_date_is_author_date,
                 ignore_date,
+                empty,
+                strategy: strategy.clone(),
+                strategy_opts: strategy_opts.clone(),
             },
             onto_spec: &onto_spec,
             upstream: upstream_oid,
@@ -1979,6 +2159,8 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
             autostash: autostash_oid,
             rebase_merges: rebase_merges == 1,
             old_index: &old_index,
+            cherry: todo::CherryMark::new(patchsame, flags & NO_QUIET != 0),
+            update_refs: update_refs == 1,
         });
     }
 
@@ -2740,6 +2922,17 @@ fn full_name(name: &str) -> Result<FullName> {
 /// The instruction stream itself is *not* part of this struct: it lives in
 /// `git-rebase-todo` (what is left to do) and `done` (what has been done), and
 /// is parsed by [`super::rebase_todo::List::parse`].
+/// `enum rebase_empty_type` (builtin/rebase.c) — what a commit that comes out
+/// empty does. `cmd_rebase()` turns it into the two sequencer knobs it actually
+/// reads: `drop_redundant_commits` (`drop`), `keep_redundant_commits` (`keep`),
+/// or neither (`stop`), each recorded as its own marker file.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Empty {
+    Drop,
+    Keep,
+    Stop,
+}
+
 struct RebaseState {
     /// Full name of the branch being rebased (`refs/heads/…`) or `detached HEAD`.
     head_name: String,
@@ -2791,10 +2984,172 @@ struct RebaseState {
     /// `$state_dir/ignore_date` and likewise re-clears `allow_ff`
     /// (sequencer.c:3239-3242).
     ignore_date: bool,
+    /// `opts->drop_redundant_commits` / `opts->keep_redundant_commits` — what
+    /// `--empty` becomes once `cmd_rebase()` has translated it
+    /// (builtin/rebase.c:192-193). `drop` sets the first, `keep` the second, and
+    /// `stop` neither, which is what makes `allow_empty()` halt. Recorded as the
+    /// presence of `$state_dir/drop_redundant_commits` /
+    /// `$state_dir/keep_redundant_commits` (sequencer.c:3344-3347).
+    empty: Empty,
+    /// `opts->strategy` — `-s <name>`, or `ort` when only `-X` was given. git
+    /// records it as the one-liner `$state_dir/strategy` and reads it back on
+    /// `--continue` (`read_strategy_opts()`, sequencer.c:3156-3166).
+    strategy: Option<String>,
+    /// `opts->xopts` — every `-X <opt>`, plus the `ignore-space-change` that
+    /// `--ignore-whitespace` turns into on the merge backend
+    /// (builtin/rebase.c:1546-1548). Recorded as `$state_dir/strategy_opts`, one
+    /// `quote_cmdline()`-quoted word per option on a single line.
+    strategy_opts: Vec<String>,
 }
 
 fn rebase_merge_dir(repo: &gix::Repository) -> std::path::PathBuf {
     repo.git_dir().join("rebase-merge")
+}
+
+/// `rebase_path_update_refs()` (sequencer.c:186-189) — where `--update-refs`
+/// parks the `(ref, before, after)` triples it will apply when the rebase ends.
+fn update_refs_path(repo: &gix::Repository) -> std::path::PathBuf {
+    rebase_merge_dir(repo).join("update-refs")
+}
+
+/// `write_update_refs_state()` (sequencer.c:4414-4461): three lines per record —
+/// the refname, the id it held when the sheet was built, and the id the rebase
+/// has moved it to so far (null until the matching `update-ref` instruction
+/// runs). An empty list removes the file.
+fn write_update_refs_state(
+    repo: &gix::Repository,
+    refs: &[(String, ObjectId, ObjectId)],
+) -> Result<()> {
+    let path = update_refs_path(repo);
+    if refs.is_empty() {
+        let _ = std::fs::remove_file(&path);
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut body = String::new();
+    for (name, before, after) in refs {
+        body.push_str(name);
+        body.push('\n');
+        body.push_str(&before.to_string());
+        body.push('\n');
+        body.push_str(&after.to_string());
+        body.push('\n');
+    }
+    std::fs::write(&path, body)?;
+    Ok(())
+}
+
+/// `sequencer_get_update_refs_state()` (sequencer.c:6868-6907). A missing file is
+/// an empty list — that is the "no `--update-refs`" case, not an error.
+fn read_update_refs_state(repo: &gix::Repository) -> Result<Vec<(String, ObjectId, ObjectId)>> {
+    let body = match std::fs::read_to_string(update_refs_path(repo)) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => bail!("could not read update-refs state: {e}"),
+    };
+    let mut out = Vec::new();
+    let mut lines = body.lines();
+    while let Some(name) = lines.next() {
+        let (Some(before), Some(after)) = (lines.next(), lines.next()) else {
+            eprintln!(
+                "warning: update-refs file at '{}' is invalid",
+                update_refs_path(repo).display()
+            );
+            return Ok(out);
+        };
+        let (Ok(before), Ok(after)) = (
+            ObjectId::from_hex(before.as_bytes()),
+            ObjectId::from_hex(after.as_bytes()),
+        ) else {
+            eprintln!(
+                "warning: update-refs file at '{}' is invalid",
+                update_refs_path(repo).display()
+            );
+            return Ok(out);
+        };
+        out.push((name.to_string(), before, after));
+    }
+    Ok(out)
+}
+
+/// `do_update_ref()` (sequencer.c:4559-4579) — the `update-ref` instruction
+/// itself. It moves nothing: it only records where `HEAD` is now as the record's
+/// `after`, so the ref lands there once the whole sheet has run.
+fn do_update_ref(repo: &gix::Repository, refname: &str) -> Result<()> {
+    let mut list = read_update_refs_state(repo)?;
+    let head = repo.head_id()?.detach();
+    for rec in &mut list {
+        if rec.0 == refname {
+            rec.2 = head;
+            break;
+        }
+    }
+    write_update_refs_state(repo, &list)
+}
+
+/// `do_update_refs()` (sequencer.c:4581-4630) — the finish. Every record is
+/// applied with its `before` as the expected old value, so a ref someone moved
+/// during the rebase is refused rather than clobbered, and the two reports name
+/// the refs that landed and the refs that did not.
+///
+/// git reads the records here; this takes them as an argument because the
+/// caller has already had to load them (the state directory is removed before
+/// this point in the port's `finish()`).
+fn apply_pending_ref_updates(
+    repo: &gix::Repository,
+    list: &[(String, ObjectId, ObjectId)],
+    quiet: bool,
+) -> bool {
+    let mut updated = String::new();
+    let mut failed = String::new();
+    let mut ok = true;
+    for (name, before, after) in list {
+        let Ok(full) = full_name(name) else {
+            ok = false;
+            failed.push_str(&format!("\t{name}\n"));
+            continue;
+        };
+        let expected = if before.is_null() {
+            PreviousValue::MustNotExist
+        } else {
+            PreviousValue::MustExistAndMatch(Target::Object(*before))
+        };
+        // `refs_update_ref(…, &rec->after, …)`: a null `after` is a deletion, as
+        // it is anywhere else in git's ref API.
+        let change = if after.is_null() {
+            Change::Delete {
+                expected,
+                log: RefLog::AndReference,
+                message: "rewritten during rebase".into(),
+            }
+        } else {
+            Change::Update {
+                log: LogChange {
+                    mode: RefLog::AndReference,
+                    force_create_reflog: false,
+                    message: "rewritten during rebase".into(),
+                },
+                expected,
+                new: Target::Object(*after),
+            }
+        };
+        match repo.edit_reference(RefEdit { change, name: full, deref: false }) {
+            Ok(_) => updated.push_str(&format!("\t{name}\n")),
+            Err(_) => {
+                ok = false;
+                failed.push_str(&format!("\t{name}\n"));
+            }
+        }
+    }
+    if !quiet && !(updated.is_empty() && failed.is_empty()) {
+        eprint!("Updated the following refs with --update-refs:\n{updated}");
+        if !ok {
+            eprint!("Failed to update the following refs with --update-refs:\n{failed}");
+        }
+    }
+    ok
 }
 
 /// `write_basic_state()` — the option state the sequencer needs to resume.
@@ -2825,6 +3180,27 @@ fn write_basic_state(repo: &gix::Repository, st: &RebaseState) -> Result<()> {
     marker(&dir, "cdate_is_adate", st.committer_date_is_author_date)?;
     marker(&dir, "ignore_date", st.ignore_date)?;
     marker(&dir, "no-reschedule-failed-exec", !st.reschedule_failed_exec)?;
+    // `write_file(rebase_path_drop_redundant_commits(), "%s", "")` /
+    // `write_file(rebase_path_keep_redundant_commits(), "%s", "")`
+    // (sequencer.c:3344-3347). `--empty=stop` writes neither, which is exactly
+    // what makes `allow_empty()` return 0 and halt the pick.
+    marker(&dir, "drop_redundant_commits", st.empty == Empty::Drop)?;
+    marker(&dir, "keep_redundant_commits", st.empty == Empty::Keep)?;
+    // `write_file(rebase_path_strategy(), "%s\n", opts->strategy)` and
+    // `write_strategy_opts()` (sequencer.c:3330-3333). The options line is
+    // `quote_cmdline()`'d — every word wrapped in `"` with `"` and `\` escaped —
+    // because `read_strategy_opts()` puts it back through `split_cmdline()`.
+    match &st.strategy {
+        Some(name) => std::fs::write(dir.join("strategy"), format!("{name}\n"))?,
+        None => {
+            let _ = std::fs::remove_file(dir.join("strategy"));
+        }
+    }
+    if st.strategy_opts.is_empty() {
+        let _ = std::fs::remove_file(dir.join("strategy_opts"));
+    } else {
+        std::fs::write(dir.join("strategy_opts"), quote_cmdline(&st.strategy_opts))?;
+    }
     // `write_file(state_dir_path("signoff", opts), "--signoff")` — content-bearing,
     // unlike the empty markers above, though only its presence is ever read back.
     if st.signoff {
@@ -2859,6 +3235,73 @@ fn write_basic_state(repo: &gix::Repository, st: &RebaseState) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// `quote_cmdline()` (alias.c:100-115): every word in double quotes, with `"`
+/// and `\` backslash-escaped, joined by single spaces — the form
+/// `split_cmdline()` reads back. The `\n` git's `write_file(…, "%s\n", …)`
+/// appends is part of the file, not of the quoting.
+fn quote_cmdline(argv: &[String]) -> String {
+    let mut out = String::new();
+    for (i, arg) in argv.iter().enumerate() {
+        if i > 0 {
+            out.push(' ');
+        }
+        out.push('"');
+        for c in arg.chars() {
+            if c == '"' || c == '\\' {
+                out.push('\\');
+            }
+            out.push(c);
+        }
+        out.push('"');
+    }
+    out.push('\n');
+    out
+}
+
+/// `split_cmdline()` (alias.c:126-176) as `parse_strategy_opts()` uses it: split
+/// on unquoted whitespace, honour `'` and `"` as quote characters, and treat a
+/// backslash outside single quotes as an escape. Malformed input (an unclosed
+/// quote, a trailing backslash) is a `BUG()` in git — unreachable, since the
+/// only writer is `quote_cmdline()` — so it is simply parsed as far as it goes
+/// here.
+fn split_cmdline(line: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut started = false;
+    let mut quoted: Option<char> = None;
+    let mut it = line.chars().peekable();
+    while let Some(c) = it.next() {
+        match quoted {
+            None if c.is_whitespace() => {
+                if started {
+                    out.push(std::mem::take(&mut cur));
+                    started = false;
+                }
+            }
+            None if c == '\'' || c == '"' => {
+                quoted = Some(c);
+                started = true;
+            }
+            Some(q) if c == q => quoted = None,
+            _ => {
+                started = true;
+                if c == '\\' && quoted != Some('\'') {
+                    match it.next() {
+                        Some(esc) => cur.push(esc),
+                        None => break,
+                    }
+                } else {
+                    cur.push(c);
+                }
+            }
+        }
+    }
+    if started {
+        out.push(cur);
+    }
+    out
 }
 
 /// git records a boolean option as the presence or absence of an empty file.
@@ -2909,6 +3352,21 @@ fn read_basic_state(repo: &gix::Repository) -> Result<RebaseState> {
         },
         committer_date_is_author_date: dir.join("cdate_is_adate").exists(),
         ignore_date: dir.join("ignore_date").exists(),
+        // `read_populate_opts()` (sequencer.c:3249-3253) reads the two markers
+        // independently; only one of them is ever written, so the pair maps back
+        // onto a single `--empty` value.
+        empty: if dir.join("drop_redundant_commits").exists() {
+            Empty::Drop
+        } else if dir.join("keep_redundant_commits").exists() {
+            Empty::Keep
+        } else {
+            Empty::Stop
+        },
+        strategy: read("strategy").ok().filter(|s| !s.is_empty()),
+        strategy_opts: read("strategy_opts")
+            .ok()
+            .map(|s| split_cmdline(&s))
+            .unwrap_or_default(),
     })
 }
 
@@ -3582,6 +4040,13 @@ struct SequencerStart<'a> {
     rebase_merges: bool,
     autostash: Option<ObjectId>,
     old_index: &'a gix::index::File,
+    /// `revs.cherry_mark = !reapply_cherry_picks` — the commits
+    /// `sequencer_make_script()` drops because their patch is already upstream.
+    cherry: todo::CherryMark,
+    /// `--update-refs` / `rebase.updateRefs`: `complete_action()` passes it to
+    /// `todo_list_add_update_ref_commands()` (sequencer.c:6581), which is the
+    /// only thing that puts `update-ref` lines in the sheet.
+    update_refs: bool,
 }
 
 /// `do_interactive_rebase()` followed by `complete_action()`: build the
@@ -3613,10 +4078,12 @@ fn sequencer_rebase(start: SequencerStart<'_>) -> Result<ExitCode> {
             label_onto,
             start.keep_empty,
             abbreviate,
+            &start.cherry,
         )?
     } else {
-        todo::make_script(repo, &start.range, start.keep_empty, abbreviate)?
+        todo::make_script(repo, &start.range, start.keep_empty, abbreviate, &start.cherry)?
     };
+    start.cherry.advise(repo);
 
     // `init_basic_state()`: the state directory exists before the editor runs,
     // so an interrupted edit is still an in-progress rebase.
@@ -3633,6 +4100,17 @@ fn sequencer_rebase(start: SequencerStart<'_>) -> Result<ExitCode> {
     // `complete_action()`.
     if list.items.is_empty() {
         list.items.push(todo::Item::new(todo::Cmd::Noop));
+    }
+    // `if (update_refs && todo_list_add_update_ref_commands(todo_list))`
+    // (sequencer.c:6581): the `update-ref` lines go in *before* `--autosquash`
+    // reorders and before `--exec` interleaves, so a ref stays attached to the
+    // pick it decorated even after both have run.
+    if start.update_refs {
+        let records = todo::add_update_ref_commands(repo, &mut list)?;
+        let null = ObjectId::null(repo.object_hash());
+        let state: Vec<(String, ObjectId, ObjectId)> =
+            records.into_iter().map(|(n, before)| (n, before, null)).collect();
+        write_update_refs_state(repo, &state)?;
     }
     if start.autosquash {
         todo::rearrange_squash(repo, &mut list)?;
@@ -3658,6 +4136,10 @@ fn sequencer_rebase(start: SequencerStart<'_>) -> Result<ExitCode> {
         EditOutcome::NothingToDo => {
             finish_early(repo, start.autostash)?;
             eprintln!("error: nothing to do");
+            return Ok(ExitCode::from(1));
+        }
+        EditOutcome::EditorFailed => {
+            finish_early(repo, start.autostash)?;
             return Ok(ExitCode::from(1));
         }
         EditOutcome::Rejected => {
@@ -3723,7 +4205,10 @@ fn rebase_edit_todo(repo: &gix::Repository) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         EditOutcome::NothingToDo => Ok(ExitCode::SUCCESS),
-        EditOutcome::Rejected => Ok(ExitCode::from(1)),
+        // `edit_todo_file()` (rebase-interactive.c) just propagates the failure;
+        // `--edit-todo` never removes the state directory, so an interrupted
+        // edit leaves the rebase exactly as it found it.
+        EditOutcome::EditorFailed | EditOutcome::Rejected => Ok(ExitCode::from(1)),
     }
 }
 
@@ -3732,6 +4217,11 @@ enum EditOutcome {
     Ok(todo::List),
     /// The user emptied the sheet on the initial edit: git aborts the rebase.
     NothingToDo,
+    /// `edit_todo_list()`'s `-2`: the sequence editor exited non-zero. It has
+    /// already reported itself, so `complete_action()` only tears the rebase
+    /// down (sequencer.c:6601-6605) — autostash back, state directory gone,
+    /// exit 1 with nothing further printed.
+    EditorFailed,
     /// The sheet does not parse, or dropped commits under
     /// `rebase.missingCommitsCheck=error`.
     Rejected,
@@ -3765,8 +4255,8 @@ fn edit_todo_list(
 
     // Without an explicit `-i`, `run_specific_rebase()` sets the sequence editor
     // to `:` — the sheet comes back exactly as written.
-    if interactive {
-        todo::launch_sequence_editor(repo, &todo_path)?;
+    if interactive && !todo::launch_sequence_editor(repo, &todo_path)? {
+        return Ok(EditOutcome::EditorFailed);
     }
 
     let comment = todo::comment_prefix(repo);
@@ -4028,6 +4518,11 @@ struct Sequencer<'r> {
     /// `ctx->current_fixups` — the chain itself, one `<command> <oid>` per line,
     /// mirrored into `$state_dir/current-fixups`.
     fixups: Vec<String>,
+    /// `opts->xopts` after `parse_merge_opt()` has read every one of them —
+    /// what `do_pick_commit()`'s `do_recursive_merge()` and `do_merge()` hand to
+    /// merge-ort. Parsed once per run, because git parses once per
+    /// `try_merge_strategy()` and every pick in a run shares the options.
+    xopts: crate::merge_apply::StrategyOptions,
 }
 
 /// What one instruction did.
@@ -4045,6 +4540,17 @@ impl<'r> Sequencer<'r> {
             .ok_or_else(|| anyhow!("committer identity is not configured"))??
             .to_owned()?;
         let index = repo.index_or_load_from_head()?.into_owned();
+        // `try_merge_strategy()` (builtin/merge.c:815-822) seeds `-s subtree`
+        // with an empty `subtree_shift` *before* running the `-X` loop, so an
+        // explicit `-Xsubtree=<prefix>` still wins. Anything else `-s` names is
+        // merge-ort under a different label as far as these options go.
+        let seed = crate::merge_apply::StrategyOptions {
+            subtree_shift: (st.strategy.as_deref() == Some("subtree"))
+                .then(gix::bstr::BString::default),
+            ..Default::default()
+        };
+        let xopts = crate::merge_apply::StrategyOptions::parse_from(seed, &st.strategy_opts)
+            .map_err(|e| anyhow!("{e}"))?;
         Ok(Sequencer {
             repo,
             st,
@@ -4057,6 +4563,7 @@ impl<'r> Sequencer<'r> {
             total_nr: 0,
             fixup_count: 0,
             fixups: Vec::new(),
+            xopts,
         })
     }
 
@@ -4215,13 +4722,12 @@ impl<'r> Sequencer<'r> {
                     }
                     step
                 }
+                // `do_update_ref()` (sequencer.c:5096-5101): nothing moves yet,
+                // the record just learns where `HEAD` reached. The refs are
+                // written in one pass at the very end.
                 todo::Cmd::UpdateRef => {
-                    self.term_clear_line();
-                    anyhow::bail!(
-                        "unsupported todo command \"update-ref\" (refs pointing into the rebased \
-                         range are not tracked; the rebase is still resumable with \
-                         `git rebase --abort`)"
-                    )
+                    do_update_ref(self.repo, item.arg.to_str_lossy().trim())?;
+                    Step::Next
                 }
                 todo::Cmd::Invalid => {
                     self.term_clear_line();
@@ -4413,7 +4919,13 @@ impl<'r> Sequencer<'r> {
             current: Some(BStr::new(b"HEAD")),
             other: Some(BStr::new(other_label.as_bytes())),
         };
-        let applied = crate::merge_apply::three_way_merge(
+        // `show_output = !is_rebase_i(opts) || !result.clean` (sequencer.c:783):
+        // a rebase shows merge-ort's `Auto-merging`/`CONFLICT` block **only when
+        // the merge came out unclean**. Printing it unconditionally made
+        // `git rebase -Xours`/`-Xtheirs` — where the option resolves every hunk —
+        // announce a merge stock replays silently. The decision needs the result,
+        // so the lines come back with it and are printed here.
+        let applied = crate::merge_apply::three_way_merge_with_options(
             repo,
             base_tree,
             head_tree,
@@ -4421,7 +4933,14 @@ impl<'r> Sequencer<'r> {
             &self.index,
             labels,
             &self.should_interrupt,
+            false,
+            &self.xopts,
         )?;
+        if !applied.conflicts.is_empty() {
+            for line in &applied.messages {
+                println!("{line}");
+            }
+        }
         self.index = applied.index;
         self.index.write(Default::default())?;
 
@@ -4494,27 +5013,61 @@ impl<'r> Sequencer<'r> {
         // needs a patch id per commit, which nothing vendored computes; the
         // observable difference is only that the sheet here still counts the
         // commit, so the progress line reads one step longer.)
+        //
+        // `allow_empty()` returns 1 for an originally-empty commit (rebase always
+        // sets `opts->allow_empty`, so `--keep-empty` round-trips one), and for a
+        // *became*-empty commit it is `--empty` that decides:
+        //
+        // ```c
+        // else if (opts->keep_redundant_commits) return 1;   /* --empty=keep */
+        // else if (opts->drop_redundant_commits) return 2;   /* --empty=drop */
+        // else                                   return 0;   /* --empty=stop */
+        // ```
+        //
+        // (sequencer.c:1810-1817). Dropping unconditionally — as this did — lost
+        // the commit under `--empty=keep` and never halted under `--empty=stop`,
+        // both at exit 0.
+        //
+        // A `fixup`/`squash` is excluded here: it amends the commit already at
+        // `HEAD` rather than adding one, so an unchanged tree is the chain doing
+        // its job, not a redundant pick. git reaches `allow_empty()` for those
+        // too, but through `try_to_commit()`'s `AMEND_MSG` arm, which compares
+        // against `HEAD`'s *parent* instead.
         if !item.cmd.is_fixup() && applied.tree_id == head_tree {
             let originally_empty = todo::is_original_commit_empty(repo, &commit)?;
             if !originally_empty {
-                self.term_clear_line();
-                let subject = commit
-                    .message()
-                    .map(|m| m.summary().to_string())
-                    .unwrap_or_default();
-                // `allow_empty() == 2` (sequencer.c:2500-2511) tears the pick's
-                // state back down before it reports the drop: `CHERRY_PICK_HEAD`,
-                // `MERGE_MSG` and `AUTO_MERGE` all go, so a dropped pick leaves
-                // no trace of the merge that produced it.
-                let git_dir = repo.git_dir();
-                let _ = std::fs::remove_file(git_dir.join("CHERRY_PICK_HEAD"));
-                let _ = std::fs::remove_file(git_dir.join("MERGE_MSG"));
-                let _ = std::fs::remove_file(git_dir.join("AUTO_MERGE"));
-                eprintln!(
-                    "dropping {} {subject} -- patch contents already upstream",
-                    oid.to_hex()
-                );
-                return Ok(Step::Next);
+                match self.st.empty {
+                    // `allow_empty() == 1`: `flags |= ALLOW_EMPTY`, the commit is
+                    // written even though it changes nothing. Falls through.
+                    Empty::Keep => {}
+                    Empty::Drop => {
+                        self.term_clear_line();
+                        let subject = commit
+                            .message()
+                            .map(|m| m.summary().to_string())
+                            .unwrap_or_default();
+                        // `allow_empty() == 2` (sequencer.c:2500-2511) tears the
+                        // pick's state back down before it reports the drop:
+                        // `CHERRY_PICK_HEAD`, `MERGE_MSG` and `AUTO_MERGE` all go,
+                        // so a dropped pick leaves no trace of the merge that
+                        // produced it.
+                        let git_dir = repo.git_dir();
+                        let _ = std::fs::remove_file(git_dir.join("CHERRY_PICK_HEAD"));
+                        let _ = std::fs::remove_file(git_dir.join("MERGE_MSG"));
+                        let _ = std::fs::remove_file(git_dir.join("AUTO_MERGE"));
+                        eprintln!(
+                            "dropping {} {subject} -- patch contents already upstream",
+                            oid.to_hex()
+                        );
+                        return Ok(Step::Next);
+                    }
+                    // `allow_empty() == 0`: `do_commit()` runs without
+                    // `ALLOW_EMPTY`, `try_to_commit()` returns 1, and the pick is
+                    // handed to a real `git commit` that refuses it.
+                    Empty::Stop => {
+                        return self.stop_for_empty(item, &commit, &short, &final_message);
+                    }
+                }
             }
         }
 
@@ -4773,7 +5326,7 @@ impl<'r> Sequencer<'r> {
         let head_tree = repo.find_commit(head)?.tree_id()?.detach();
         let other_tree = repo.find_commit(merge_head)?.tree_id()?.detach();
         let other_label = format!("refs/rewritten/{}", heads[0]);
-        let applied = crate::merge_apply::three_way_merge(
+        let applied = crate::merge_apply::three_way_merge_with_options(
             repo,
             base_tree,
             head_tree,
@@ -4785,7 +5338,17 @@ impl<'r> Sequencer<'r> {
                 other: Some(BStr::new(other_label.as_bytes())),
             },
             &self.should_interrupt,
+            false,
+            &self.xopts,
         )?;
+        // `if (ret <= 0) fputs(o.obuf.buf, stdout)` (sequencer.c:4360-4361) —
+        // `do_merge()` buffers merge-ort's output (`o.buffer_output = 2`) and
+        // flushes it only when the merge did not come out clean.
+        if !applied.conflicts.is_empty() {
+            for line in &applied.messages {
+                println!("{line}");
+            }
+        }
         self.index = applied.index;
         self.index.write(Default::default())?;
 
@@ -4916,6 +5479,7 @@ impl<'r> Sequencer<'r> {
             // Mid-chain: no editor, the message is the running combination.
             let message = std::fs::read(dir.join("message-squash"))?;
             let cleaned = super::stripspace::strip_space(&message, None);
+            let reflog_msg = fixup_reflog_message(&cleaned);
             let new = repo
                 .write_object(&gix::objs::Commit {
                     message: cleaned.into(),
@@ -4927,7 +5491,7 @@ impl<'r> Sequencer<'r> {
                     extra_headers: Default::default(),
                 })?
                 .detach();
-            set_head(repo, Target::Object(new), &format!("{} (fixup)", reflog_action()))?;
+            set_head(repo, Target::Object(new), &reflog_msg)?;
             // `flags |= AMEND_MSG` (sequencer.c:2414), so `try_to_commit()` runs
             // `commit_post_rewrite()` as well as `post-commit`: every member of a
             // fixup chain reports the commit it replaced.
@@ -4944,6 +5508,7 @@ impl<'r> Sequencer<'r> {
         if fixup_msg.exists() {
             let message = std::fs::read(&fixup_msg)?;
             let cleaned = super::stripspace::strip_space(&message, None);
+            let reflog_msg = fixup_reflog_message(&cleaned);
             let new = repo
                 .write_object(&gix::objs::Commit {
                     message: cleaned.into(),
@@ -4955,7 +5520,7 @@ impl<'r> Sequencer<'r> {
                     extra_headers: Default::default(),
                 })?
                 .detach();
-            set_head(repo, Target::Object(new), &format!("{} (fixup)", reflog_action()))?;
+            set_head(repo, Target::Object(new), &reflog_msg)?;
             run_commit_hooks(repo, Some(head), new);
         } else {
             let squash_msg = repo.git_dir().join("SQUASH_MSG");
@@ -5271,6 +5836,66 @@ impl<'r> Sequencer<'r> {
         Ok(Step::Stop(1))
     }
 
+    /// `--empty=stop` — `allow_empty()` returned 0, so the pick has to halt.
+    ///
+    /// git does not print this itself. `do_commit()` calls `try_to_commit()`
+    /// without `ALLOW_EMPTY`, that returns 1 the moment the tree equals the first
+    /// parent's (sequencer.c:1583-1604), and `do_commit()` then records
+    /// `REBASE_HEAD` and re-enters a *real* `git commit` (sequencer.c:1750-1755)
+    /// whose refusal — the `The previous cherry-pick is now empty…` advice plus a
+    /// full `git status` — is what the user sees. `run_command_silent_on_success()`
+    /// (sequencer.c:1093-1108) merges the child's stdout into its stderr and only
+    /// forwards it when the child failed, which is why every one of those lines
+    /// arrives on **stderr** even though `git status` writes to stdout. Then
+    /// `error_with_patch()` adds `Could not apply <short>... <arg>`.
+    ///
+    /// So this spawns the same child rather than reimplementing `git commit`'s
+    /// refusal, exactly as git does.
+    fn stop_for_empty(
+        &mut self,
+        item: &todo::Item,
+        commit: &gix::Commit<'_>,
+        short: &str,
+        message: &BString,
+    ) -> Result<Step> {
+        let repo = self.repo;
+        let oid = commit.id().detach();
+        let git_dir = repo.git_dir();
+        // Every pick writes both before it commits (sequencer.c:2450-2479); a
+        // pick that goes on to commit has them removed again, a halted one does
+        // not. `MERGE_MSG` is also the `-F` file the child below is given.
+        std::fs::write(git_dir.join("MERGE_MSG"), message)?;
+        std::fs::write(git_dir.join("CHERRY_PICK_HEAD"), format!("{oid}\n"))?;
+        write_author_script(repo, commit)?;
+        // `write_rebase_head()` in `do_commit()`'s `res == 1` arm.
+        std::fs::write(git_dir.join("REBASE_HEAD"), format!("{oid}\n"))?;
+        self.term_clear_line();
+        // `run_git_commit(msg_file, …, flags = 0)`: `-n` (no `VERIFY_MSG`),
+        // `--no-gpg-sign`, `-F <MERGE_MSG>`, `--cleanup=verbatim` (no
+        // `CLEANUP_MSG`, no `--signoff` on the replay opts) and
+        // `--allow-empty-message` (no `EDIT_MSG`). No `--allow-empty`, which is
+        // the whole point.
+        let msg_path = git_dir.join("MERGE_MSG");
+        let args: Vec<String> = vec![
+            "-n".into(),
+            "--no-gpg-sign".into(),
+            "-F".into(),
+            msg_path.display().to_string(),
+            "--cleanup=verbatim".into(),
+            "--allow-empty-message".into(),
+        ];
+        let out = self.run_commit_capture(&args, self.author_env())?;
+        if !out.0 {
+            let mut err = std::io::stderr();
+            use std::io::Write;
+            let _ = err.write_all(&out.1);
+        }
+        // `error_with_patch(r, commit, arg, arg_len, opts, res = 1, to_amend = 0)`.
+        make_patch(repo, &self.dir(), commit)?;
+        eprintln!("Could not apply {short}... {}", item.arg.to_str_lossy());
+        Ok(Step::Stop(1))
+    }
+
     /// The `GIT_AUTHOR_*` environment `read_env_script()` reconstructs from
     /// `$state_dir/author-script`, so a commit made by `git commit` on
     /// `--continue` keeps the replayed commit's author.
@@ -5290,6 +5915,49 @@ impl<'r> Sequencer<'r> {
             env.push((key.to_string(), value));
         }
         env
+    }
+
+    /// [`run_commit`](Self::run_commit) with the child's output captured rather
+    /// than inherited — `run_command_silent_on_success()` (sequencer.c:1093-1108),
+    /// which folds stdout into stderr and forwards the buffer only on failure.
+    ///
+    /// Capturing means a real child process: the in-process entry point writes
+    /// straight to this process's descriptors. git forks here too
+    /// (`cmd.git_cmd = 1`), so the shape matches.
+    ///
+    /// Returns whether the child succeeded, and everything it wrote.
+    fn run_commit_capture(
+        &self,
+        args: &[String],
+        env: Vec<(String, String)>,
+    ) -> Result<(bool, Vec<u8>)> {
+        let exe = std::env::current_exe()
+            .map_err(|e| anyhow!("cannot locate the running executable: {e}"))?;
+        let mut cmd = std::process::Command::new(&exe);
+        cmd.arg("commit").args(args);
+        cmd.env("GIT_REFLOG_ACTION", reflog_action());
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        if let Some(w) = self.repo.workdir() {
+            cmd.current_dir(w);
+        }
+        let out = cmd
+            .output()
+            .map_err(|e| anyhow!("failed to run git commit: {e}"))?;
+        // **stderr before stdout**, which is what `cmd->stdout_to_stderr = 1`
+        // actually produces here. Both descriptors are the one pipe, so the
+        // bytes arrive in flush order, not in write order: the child's stdout is
+        // a pipe and therefore fully buffered by C stdio, while its stderr is
+        // unbuffered. `prepare_to_commit()` writes the status report to stdout
+        // *first* and the `The previous cherry-pick is now empty…` advice to
+        // stderr *second* (builtin/commit.c:1085-1097), yet stock's output has
+        // the advice first — the status sits in the stdio buffer until the child
+        // exits. Measured against stock; concatenating stdout first reversed the
+        // two blocks.
+        let mut buf = out.stderr;
+        buf.extend_from_slice(&out.stdout);
+        Ok((out.status.success(), buf))
     }
 
     /// `run_git_commit()` — git re-enters `git commit` for every path that needs
@@ -5366,6 +6034,11 @@ impl<'r> Sequencer<'r> {
         // This has to precede the state directory going away — the list lives in
         // it.
         rewritten::run_post_rewrite_hook(repo, &rebase_merge_dir(repo));
+        // `do_update_refs()` runs *after* the `Successfully rebased and updated
+        // <ref>.` line and before `sequencer_remove_state()`
+        // (sequencer.c:5210-5229), so the records have to survive the state
+        // directory being taken down here.
+        let pending_ref_updates = read_update_refs_state(repo)?;
         let _ = std::fs::remove_dir_all(rebase_merge_dir(repo));
         if let Some(oid) = self.autostash {
             crate::porcelain::stash::apply_autostash(repo, oid, self.st.quiet)?;
@@ -5375,8 +6048,29 @@ impl<'r> Sequencer<'r> {
             self.term_clear_line();
             eprintln!("Successfully rebased and updated {label}.");
         }
+        if !pending_ref_updates.is_empty()
+            && !apply_pending_ref_updates(repo, &pending_ref_updates, self.st.quiet)
+        {
+            return Ok(ExitCode::from(1));
+        }
         Ok(ExitCode::SUCCESS)
     }
+}
+
+/// The reflog line a `fixup`/`squash` writes: `rebase (fixup): <subject>`.
+///
+/// `try_to_commit()` ends in `update_head_with_reflog(…, reflog_action, …)`
+/// (sequencer.c), the same call every other pick makes, so the melded commit's
+/// own subject is appended exactly as a `pick`'s is. Writing the bare
+/// `rebase (fixup)` left the entry with no subject, which is the one line in a
+/// squashed rebase's reflog that says *what* was squashed.
+fn fixup_reflog_message(message: &[u8]) -> String {
+    gix::reference::log::message(
+        &format!("{} (fixup)", reflog_action()),
+        message.as_bstr(),
+        1,
+    )
+    .to_string()
 }
 
 /// `make_patch()` (sequencer.c:3440-3485) — everything an `error_with_patch()`

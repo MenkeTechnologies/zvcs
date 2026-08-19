@@ -217,13 +217,19 @@ impl List {
         let comment = comment_prefix(repo);
         let mut list = List::default();
         let mut ok = true;
-        for (n, raw) in buf.split(|&b| b == b'\n').enumerate() {
-            // `for (i = 1; *p; ...)` stops at the terminating NUL, so a trailing
-            // newline does not yield an extra empty line.
-            if raw.is_empty() && n > 0 && buf.ends_with(b"\n") {
-                continue;
-            }
-            if raw.is_empty() && buf.is_empty() {
+        let lines: Vec<&[u8]> = buf.split(|&b| b == b'\n').collect();
+        // `for (p = buf; *p; p = eol + 1)` stops at the terminating NUL, so a
+        // trailing newline does not yield an extra empty line — but only the
+        // *last* element of the split is that phantom. Skipping every empty
+        // element instead swallowed blank lines in the middle of the sheet,
+        // which git keeps as comment items: `--update-refs` writes its refname
+        // with a trailing newline inside the instruction's argument
+        // (sequencer.c:6489), so the generated sheet has a blank line after
+        // every `update-ref` and a round trip through the editor has to
+        // preserve it.
+        let last = lines.len().saturating_sub(1);
+        for (n, raw) in lines.into_iter().enumerate() {
+            if raw.is_empty() && n == last {
                 continue;
             }
             // `if (p != eol && eol[-1] == '\r') eol--;`
@@ -585,6 +591,7 @@ pub(crate) fn make_script(
     commits: &[ObjectId],
     keep_empty: bool,
     abbreviate: bool,
+    cherry: &CherryMark,
 ) -> Result<Vec<u8>> {
     let format = instruction_format(repo);
     let insn = if abbreviate { "p" } else { "pick" };
@@ -592,6 +599,20 @@ pub(crate) fn make_script(
     for &oid in commits {
         let commit = repo.find_commit(oid)?;
         let empty = is_original_commit_empty(repo, &commit)?;
+        // ```c
+        // if (!is_empty && (commit->object.flags & PATCHSAME)) {
+        //         if (flags & TODO_LIST_WARN_SKIPPED_CHERRY_PICKS)
+        //                 warning(_("skipped previously applied commit %s"),
+        //                         short_commit_name(r, commit));
+        //         skipped_commit = 1;
+        //         continue;
+        // }
+        // ```
+        // (sequencer.c:6215-6221) — the `--cherry-mark` drop, ahead of the
+        // `--keep-empty` one, and only for a commit that was not already empty.
+        if !empty && cherry.skip(repo, oid) {
+            continue;
+        }
         if empty && !keep_empty {
             continue;
         }
@@ -611,6 +632,52 @@ pub(crate) fn make_script(
         out.push(b'\n');
     }
     Ok(out)
+}
+
+/// `revs.cherry_mark` as `sequencer_make_script()` uses it: the set of commits
+/// in the replay range whose patch is already present in `<upstream>`, plus
+/// whether the `warning:` line is wanted (`TODO_LIST_WARN_SKIPPED_CHERRY_PICKS`,
+/// i.e. not `--quiet`).
+///
+/// `--reapply-cherry-picks` turns the whole thing off, which is spelled here as
+/// an empty set.
+pub(crate) struct CherryMark {
+    pub(crate) patchsame: std::collections::HashSet<ObjectId>,
+    pub(crate) warn: bool,
+    /// `skipped_commit`, the flag that decides whether the closing advice runs.
+    skipped: std::cell::Cell<bool>,
+}
+
+impl CherryMark {
+    pub(crate) fn new(patchsame: std::collections::HashSet<ObjectId>, warn: bool) -> Self {
+        Self { patchsame, warn, skipped: std::cell::Cell::new(false) }
+    }
+
+
+    fn skip(&self, repo: &gix::Repository, oid: ObjectId) -> bool {
+        if !self.patchsame.contains(&oid) {
+            return false;
+        }
+        if self.warn {
+            eprintln!("warning: skipped previously applied commit {}", short_name(repo, oid));
+        }
+        self.skipped.set(true);
+        true
+    }
+
+    /// ```c
+    /// if (skipped_commit)
+    ///         advise_if_enabled(ADVICE_SKIPPED_CHERRY_PICKS,
+    ///                           _("use --reapply-cherry-picks to include skipped commits"));
+    /// ```
+    /// (sequencer.c:6231-6233) — printed once, after the whole sheet, and not
+    /// gated on `--quiet`.
+    pub(crate) fn advise(&self, repo: &gix::Repository) {
+        if self.skipped.get() {
+            crate::advice::Advice::SkippedCherryPicks
+                .advise_in(repo, "use --reapply-cherry-picks to include skipped commits");
+        }
+    }
 }
 
 /// `label_oid()`'s bookkeeping: the label each commit was given, and every label
@@ -722,6 +789,7 @@ pub(crate) fn make_script_with_merges(
     onto: Option<ObjectId>,
     keep_empty: bool,
     abbreviate: bool,
+    cherry: &CherryMark,
 ) -> Result<Vec<u8>> {
     use std::collections::{HashMap, HashSet};
 
@@ -759,6 +827,11 @@ pub(crate) fn make_script_with_merges(
     for &oid in commits {
         let commit = repo.find_commit(oid)?;
         let empty = is_original_commit_empty(repo, &commit)?;
+        // The same `--cherry-mark` drop the flat sheet makes
+        // (sequencer.c:5961-5967).
+        if !empty && cherry.skip(repo, oid) {
+            continue;
+        }
         if empty && !keep_empty {
             continue;
         }
@@ -947,6 +1020,107 @@ pub(crate) fn is_original_commit_empty(
         Some(p) => Ok(repo.find_commit(p.detach())?.tree_id()?.detach() == tree),
         None => Ok(tree == ObjectId::empty_tree(repo.object_hash())),
     }
+}
+
+/// `todo_list_add_update_ref_commands()` (sequencer.c:6511-6555) together with
+/// `add_decorations_to_list()` (sequencer.c:6444-6505) — the sheet half of
+/// `--update-refs`.
+///
+/// After every item that names a commit, one line per `refs/heads/*` ref sitting
+/// on that commit is inserted: `update-ref <fullname>` for a ref this rebase may
+/// move, or a `# Ref <name> checked out at '<path>'` comment for one another
+/// worktree holds. The branch `HEAD` itself is on is excluded — the rebase's own
+/// finish already moves it.
+///
+/// Two details are load-bearing and both are visible in the generated file:
+///
+/// * **Order.** `add_ref_decoration()` prepends (`res->next =
+///   add_decoration(…)`, log-tree.c:86-92) while refs are iterated in sorted
+///   order, so the decoration list at a commit comes out *reverse*-sorted:
+///   two branches on one commit yield `update-ref refs/heads/topic2b` before
+///   `update-ref refs/heads/topic2`.
+/// * **The trailing newline in the argument.** git appends the refname to the
+///   todo buffer as `"%s\n"` and then sets `arg_len = buf->len - base_offset`
+///   (sequencer.c:6489-6498), so the argument *includes* that newline and
+///   `todo_list_to_strbuf()` emits a blank line after every `update-ref`. The
+///   blank line re-parses as a comment, so it is never counted as a command and
+///   the round trip is stable.
+///
+/// Returns the `(refname, before)` pairs `write_update_refs_state()` records, in
+/// the sorted order git's `string_list_insert()` keeps them in.
+pub(crate) fn add_update_ref_commands(
+    repo: &gix::Repository,
+    list: &mut List,
+) -> Result<Vec<(String, ObjectId)>> {
+    // `load_branch_decorations()`: every `refs/heads/` ref, keyed by the commit
+    // it resolves to, each bucket in reverse-sorted order (the prepend above).
+    let mut decorations: std::collections::HashMap<ObjectId, Vec<String>> =
+        std::collections::HashMap::new();
+    let mut names: Vec<(String, ObjectId)> = Vec::new();
+    for reference in repo.references()?.prefixed("refs/heads/")? {
+        let Ok(mut reference) = reference else { continue };
+        let name = reference.name().as_bstr().to_str_lossy().into_owned();
+        let Ok(id) = reference.peel_to_id() else { continue };
+        names.push((name, id.detach()));
+    }
+    names.sort_by(|a, b| a.0.cmp(&b.0));
+    for (name, id) in names {
+        decorations.entry(id).or_default().insert(0, name);
+    }
+
+    // `refs_resolve_ref_unsafe(…, "HEAD", …)`: the branch the rebase itself moves.
+    let head_ref: Option<String> = repo
+        .head()
+        .ok()
+        .and_then(|h| h.referent_name().map(|n| n.as_bstr().to_str_lossy().into_owned()));
+
+    let comment = comment_prefix(repo);
+    let mut refs_to_oids: Vec<(String, ObjectId)> = Vec::new();
+    let mut out: Vec<Item> = Vec::with_capacity(list.items.len());
+    for item in list.items.drain(..) {
+        let commit = item.commit;
+        out.push(item);
+        let Some(oid) = commit else { continue };
+        let Some(decos) = decorations.get(&oid) else { continue };
+        for name in decos {
+            if head_ref.as_deref() == Some(name.as_str()) {
+                continue;
+            }
+            match super::worktree::branch_checked_out(repo, name)? {
+                Some(path) => {
+                    // `strbuf_commented_addf(…, "Ref %s checked out at '%s'\n", …)`.
+                    let mut c = Item::new(Cmd::Comment);
+                    c.arg = BString::from(format!(
+                        "{comment} Ref {name} checked out at '{}'",
+                        path.display()
+                    ));
+                    out.push(c);
+                }
+                None => {
+                    let mut u = Item::new(Cmd::UpdateRef);
+                    // The newline git leaves inside `arg_len`; see above.
+                    u.arg = BString::from(format!("{name}\n"));
+                    out.push(u);
+                    // `init_update_ref_record()`: `before` is where the ref is
+                    // now (null when it cannot be read), `after` starts null.
+                    let before = repo
+                        .find_reference(name.as_str())
+                        .ok()
+                        .and_then(|mut r| r.peel_to_id().ok())
+                        .map(|id| id.detach())
+                        .unwrap_or_else(|| ObjectId::null(repo.object_hash()));
+                    if refs_to_oids.iter().all(|(n, _)| n != name) {
+                        refs_to_oids.push((name.clone(), before));
+                    }
+                }
+            }
+        }
+    }
+    list.items = out;
+    // `string_list_insert()` keeps the list sorted, which is the order
+    // `write_update_refs_state()` writes and `do_update_refs()` reports in.
+    refs_to_oids.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(refs_to_oids)
 }
 
 /// `todo_list_add_exec_commands()` — `--exec <cmd>`.
@@ -1323,7 +1497,10 @@ pub(crate) fn append_help(
 /// `launch_sequence_editor()`: `GIT_SEQUENCE_EDITOR`, then `sequence.editor`,
 /// then the ordinary `git_editor()` chain. Run through the shell so a
 /// configured editor may carry arguments.
-pub(crate) fn launch_sequence_editor(repo: &gix::Repository, path: &std::path::Path) -> Result<()> {
+pub(crate) fn launch_sequence_editor(
+    repo: &gix::Repository,
+    path: &std::path::Path,
+) -> Result<bool> {
     let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
     let snap = repo.config_snapshot();
     let editor = env("GIT_SEQUENCE_EDITOR")
@@ -1336,15 +1513,21 @@ pub(crate) fn launch_sequence_editor(repo: &gix::Repository, path: &std::path::P
     // `if (strcmp(editor, ":"))` (editor.c:66): git's documented no-op editor is
     // recognised before any child is built, leaving the todo list untouched.
     if editor == ":" {
-        return Ok(());
+        return Ok(true);
     }
     let status = crate::external::prepare_shell_cmd_str(&editor, [path])
         .status()
         .map_err(|e| anyhow!("cannot run editor '{editor}': {e}"))?;
     if !status.success() {
-        return Err(anyhow!("there was a problem with the editor '{editor}'"));
+        // `launch_specified_editor()` (editor.c) reports this itself with
+        // `error()`, and `edit_todo_list()` then returns `-2` — the caller's
+        // signal to tear the rebase down silently. Returning it as an `anyhow`
+        // error instead rendered it as `zvcs: rebase: …` and left the state
+        // directory behind, so the *next* `git rebase` refused at 128.
+        eprintln!("error: there was a problem with the editor '{editor}'");
+        return Ok(false);
     }
-    Ok(())
+    Ok(true)
 }
 
 #[cfg(test)]

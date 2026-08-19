@@ -127,8 +127,18 @@
 //!   --dst-prefix=… <a> <b>` inside the submodule; the port of that child invocation
 //!   is shared with `git diff` ([`super::diff::submodule_inline_section`]).
 //! * `--exit-code`, `--quiet` (implies `-s` and `--exit-code`)
-//! * `--abbrev[=<n>]` — accepted and ignored, which is what stock git does here.
-//!   `core.abbrev` itself *is* honoured.
+//! * `--abbrev[=<n>]` — accepted and ignored, which is what stock git does here
+//!   (measured against 2.55.0: `git diff-pairs -p --abbrev=12` prints the same
+//!   `index` line as without it). `core.abbrev` itself *is* honoured. An *in-process*
+//!   caller is the exception: `diff-tree` does widen for `--abbrev=<n>`, so
+//!   [`render_raw_stream`] takes the resolved `o->abbrev` as an argument and applies
+//!   it to the raw records and the `index` line.
+//! * `--binary` — implemented: the `GIT binary patch` payload comes from
+//!   [`super::binary_patch`], whose deflate is a transcription of zlib's
+//!   `deflate.c`/`trees.c`, so the base85 armour matches stock byte for byte. It sits
+//!   inside the same guard as the `Binary files … differ` line, so `-a`/`--text` and a
+//!   `--textconv`-rewritten pair still render as text; `PatchSink` line-prefixes every
+//!   payload line, which is what `emit_diff_symbol(DIFF_SYMBOL_BINARY_DIFF_BODY)` does.
 //! * `-h` (usage on stdout, exit 129); running without `-z` (usage line on stderr, exit 129)
 //! * the fatal paths: `invalid raw diff input`, `unable to parse object id: ...`,
 //!   `tree objects not supported`, `unable to read <oid>` — all exit 128
@@ -138,15 +148,6 @@
 //! * Tree-object pairs (`040000` on either side) are rejected with `tree objects not
 //!   supported`, exit 128 — this matches stock git's `builtin/diff-pairs.c`, which dies
 //!   with the same message rather than recursing.
-//! * `--binary`: the `GIT binary patch` payload itself is no longer the obstacle.
-//!   [`super::binary_patch`] emits it byte-for-byte — [`gix::zlib::deflate`] is a
-//!   transcription of zlib's `deflate.c`/`trees.c`, so the base85-armoured deflate
-//!   stream matches stock git, as `git diff --binary` and `git diff-index --binary`
-//!   already demonstrate. What is missing here is the wiring, and this renderer has
-//!   two interactions the other two do not: `--line-prefix` has to reach every
-//!   payload line the way `emit_diff_symbol()` prefixes `DIFF_SYMBOL_BINARY_DIFF_BODY`,
-//!   and a pair rewritten by `--textconv` or forced textual by `-a` must keep
-//!   rendering as text. Until both are covered this bails rather than guessing.
 //! * `--anchored=<text>`: git runs it as a patience diff carrying anchor prefixes
 //!   (`xpp->anchors`). The vendored `gix-imara-diff` has the patience algorithm itself
 //!   (`patience.rs`, a port of `xdiff/xpatience.c`, reached by `--patience` below), but
@@ -631,6 +632,20 @@ struct Formats {
 }
 
 impl Formats {
+    /// The formats `diff_setup_done()` forces recursion for (diff.c:5318-5325) — the
+    /// ones that have to read a blob. `DIFF_FORMAT_RAW`, `DIFF_FORMAT_NAME` and
+    /// `DIFF_FORMAT_NAME_STATUS` are deliberately absent: they print modes, ids and
+    /// names only.
+    fn reads_content(&self) -> bool {
+        self.patch
+            || self.numstat
+            || self.stat
+            || self.shortstat
+            || self.summary
+            || self.dirstat
+            || self.check
+    }
+
     /// Whether any format was requested explicitly (so the patch default does not apply).
     fn requested(&self) -> bool {
         self.patch
@@ -745,6 +760,14 @@ struct Opts {
     text: bool,
     /// `--line-prefix=<s>`: written at the start of every record git emits.
     line_prefix: Vec<u8>,
+    /// `--binary` (`o->flags.binary`): a binary pair's `Binary files … differ` line is
+    /// replaced by the `GIT binary patch` payload, and its `index` line widens to full
+    /// object names.
+    binary: bool,
+    /// `o->abbrev` handed down by an in-process caller; see [`render_raw_stream`]'s
+    /// `abbrev` argument. Never set by this command's own `--abbrev`, which stock git
+    /// ignores here.
+    abbrev_explicit: Option<usize>,
     /// `-D`/`--irreversible-delete`: a deletion prints its header and stops, omitting the
     /// pre-image body so the patch cannot be reversed.
     irreversible_delete: bool,
@@ -887,7 +910,7 @@ struct Analysis {
 
 /// `git diff-pairs` — see the module documentation for the covered surface.
 pub fn diff_pairs(args: &[String]) -> Result<std::process::ExitCode> {
-    Ok(render_raw_stream(args, None, None)?.into())
+    Ok(render_raw_stream(args, None, None, RouteCtx::default())?.into())
 }
 
 /// The body of [`diff_pairs`], with the raw-pair stream supplied instead of read from
@@ -895,10 +918,30 @@ pub fn diff_pairs(args: &[String]) -> Result<std::process::ExitCode> {
 /// `git diff-tree` is `diff-tree -z -r --raw` piped into this exact renderer, so
 /// [`super::diff_tree`] hands its own walk output here rather than growing a second
 /// patch/stat/rename implementation.
+/// What an *in-process* caller knows that a shell caller cannot express, because
+/// stock `git diff-pairs` has no spelling for either.
+#[derive(Default, Clone, Copy)]
+pub(crate) struct RouteCtx {
+    /// `o->abbrev` as the calling command resolved it (`fill_metainfo()`, diff.c:4915:
+    /// `int abbrev = o->abbrev ? o->abbrev : DEFAULT_ABBREV`). Stock `git diff-pairs
+    /// --abbrev=<n>` leaves its `index` lines at `core.abbrev` (measured against
+    /// 2.55.0) while `git diff-tree -p --abbrev=12` widens them, so a routed run hands
+    /// its own value down instead of losing it at the boundary.
+    pub abbrev: Option<usize>,
+    /// Accept `040000` entries in the pair stream. `builtin/diff-pairs.c` dies on them
+    /// and so does this command, but a *tree* diff legitimately queues them: git only
+    /// forces recursion for the content formats (`diff_setup_done()`, diff.c:5318), so
+    /// `git diff-tree <commit> -M --name-status` reports the two changed top-level
+    /// trees. `diffcore_rename()` never considers them — `S_ISREG` gates every
+    /// candidate — and only the raw and name emitters ever see one.
+    pub allow_trees: bool,
+}
+
 pub(crate) fn render_raw_stream(
     args: &[String],
     pairs: Option<Vec<u8>>,
     sink: Option<&mut Vec<u8>>,
+    route: RouteCtx,
 ) -> Result<Status> {
     // Dispatch passes the subcommand itself at index 0.
     let args = match args.first().map(String::as_str) {
@@ -928,6 +971,8 @@ pub(crate) fn render_raw_stream(
         algo: None,
         text: false,
         line_prefix: Vec::new(),
+        binary: false,
+        abbrev_explicit: route.abbrev,
         irreversible_delete: false,
         indent_heuristic: true,
         ignore_blank_lines: false,
@@ -1063,6 +1108,12 @@ pub(crate) fn render_raw_stream(
             }
             "-z" => nul = true,
             "-p" | "-u" | "--patch" => opts.formats.or_patch(),
+            // `diff_opt_binary()` (diff.c:5730) runs `enable_patch_output()` first, so
+            // `--binary` turns the patch format on by itself.
+            "--binary" => {
+                opts.formats.or_patch();
+                opts.binary = true;
+            }
             "-s" | "--no-patch" => opts.formats.set_no_output(),
             "--raw" => opts.formats.or_raw(),
             "--name-only" => opts.formats.name_only = true,
@@ -1205,6 +1256,9 @@ pub(crate) fn render_raw_stream(
             // `--quiet` only raises `flags.quick`; `diff_setup_done()` is what turns
             // that into `output_format = DIFF_FORMAT_NO_OUTPUT` and `--exit-code`.
             "--quiet" => quick = true,
+            // `OPT_BOOL(0, "quiet", &options->flags.quick)` (diff.c:6258) takes a
+            // `--no-` form, which simply lowers the flag again.
+            "--no-quiet" => quick = false,
             // -R swaps the two prefixes and, per pair, the two sides at render time.
             "-R" => opts.reverse = true,
             // Whitespace comparison flags.
@@ -1774,7 +1828,11 @@ pub(crate) fn render_raw_stream(
             continue;
         }
 
-        let pair = match parse_header(header, hexsz) {
+        // A tree entry is only legal for the raw and name listings; every content
+        // format forces recursion in git, so one reaching here would mean the caller
+        // asked this module to read a tree as a blob.
+        let allow_trees = route.allow_trees && !opts.formats.reads_content();
+        let pair = match parse_header(header, hexsz, allow_trees) {
             Ok(p) => p,
             Err(msg) => return Ok(fatal(&msg)),
         };
@@ -2068,7 +2126,7 @@ fn take_field(input: &[u8], at: usize) -> Option<(BString, usize)> {
 }
 
 /// Parse `:<omode> <nmode> <ooid> <noid> <status>` into a pair with empty path fields.
-fn parse_header(header: &[u8], hexsz: usize) -> Result<(u8, Pair), String> {
+fn parse_header(header: &[u8], hexsz: usize, allow_trees: bool) -> Result<(u8, Pair), String> {
     let invalid = || "invalid raw diff input".to_string();
     if header.first() != Some(&b':') {
         return Err(invalid());
@@ -2101,7 +2159,7 @@ fn parse_header(header: &[u8], hexsz: usize) -> Result<(u8, Pair), String> {
         return Err(invalid());
     }
 
-    if old_mode & IFMT == 0o040000 || new_mode & IFMT == 0o040000 {
+    if !allow_trees && (old_mode & IFMT == 0o040000 || new_mode & IFMT == 0o040000) {
         return Err("tree objects not supported".to_string());
     }
 
@@ -2465,7 +2523,7 @@ fn flush(
         }
         for p in shown {
             buf.extend_from_slice(lp);
-            render_name(&mut buf, p, &opts.formats);
+            render_name(&mut buf, p, &opts.formats, opts.abbrev_explicit);
         }
     }
 
@@ -2815,7 +2873,7 @@ fn as_creation(p: &Pair) -> Pair {
 
 /// `--raw` / `--name-only` / `--name-status` for one pair (`--name-status` wins when
 /// several are set, matching `flush_one_pair`'s precedence).
-fn render_name(out: &mut Vec<u8>, p: &Pair, f: &Formats) {
+fn render_name(out: &mut Vec<u8>, p: &Pair, f: &Formats, abbrev: Option<usize>) {
     let two_paths = matches!(p.kind(), b'R' | b'C');
     // `opt->line_termination`: NUL for both fields under `-z`, otherwise git's
     // `inter_name_termination` TAB between the status and the path and LF at the end.
@@ -2841,8 +2899,8 @@ fn render_name(out: &mut Vec<u8>, p: &Pair, f: &Formats) {
                 ":{:06o} {:06o} {} {} ",
                 p.old_mode,
                 p.new_mode,
-                p.old_id.to_hex(),
-                p.new_id.to_hex()
+                hex_or_full(&p.old_id, abbrev),
+                hex_or_full(&p.new_id, abbrev)
             )
             .as_bytes(),
         );
@@ -2854,6 +2912,17 @@ fn render_name(out: &mut Vec<u8>, p: &Pair, f: &Formats) {
     if two_paths {
         out.extend_from_slice(&name(&p.new_path));
         out.push(term);
+    }
+}
+
+/// `diff_aligned_abbrev()` for the raw listing. `diff-pairs` itself always prints the
+/// full object name — stock 2.55.0 ignores its `--abbrev`, measured — but a routed
+/// `diff-tree` hands its own `o->abbrev` down, and `git diff-tree --raw --abbrev=<n>`
+/// does shorten.
+fn hex_or_full(id: &ObjectId, abbrev: Option<usize>) -> String {
+    match abbrev {
+        Some(n) => id.to_hex_with_len(n).to_string(),
+        None => id.to_hex().to_string(),
     }
 }
 
@@ -3224,9 +3293,9 @@ fn external_xfrm_msg(
     }
     if p.old_id != p.new_id {
         msg.extend_from_slice(b"index ");
-        msg.extend_from_slice(oid_text(repo, &p.old_id, base_abbrev, opts.full_index).as_bytes());
+        msg.extend_from_slice(oid_text(repo, &p.old_id, base_abbrev, opts.full_index, opts.abbrev_explicit).as_bytes());
         msg.extend_from_slice(b"..");
-        msg.extend_from_slice(oid_text(repo, &p.new_id, base_abbrev, opts.full_index).as_bytes());
+        msg.extend_from_slice(oid_text(repo, &p.new_id, base_abbrev, opts.full_index, opts.abbrev_explicit).as_bytes());
         if p.old_valid() && p.new_valid() && p.old_mode == p.new_mode {
             msg.extend_from_slice(format!(" {:06o}", p.new_mode).as_bytes());
         }
@@ -3712,13 +3781,13 @@ fn emit_submodule_header(
     // `strbuf_add_unique_abbrev()` shortens against the *superproject's* object
     // store, where a submodule commit is normally absent — so this is the plain
     // `DEFAULT_ABBREV`-wide prefix.
-    out.extend_from_slice(oid_text(repo, one, base_abbrev, false).as_bytes());
+    out.extend_from_slice(oid_text(repo, one, base_abbrev, false, None).as_bytes());
     out.extend_from_slice(if fast_backward || fast_forward {
         &b".."[..]
     } else {
         &b"..."[..]
     });
-    out.extend_from_slice(oid_text(repo, two, base_abbrev, false).as_bytes());
+    out.extend_from_slice(oid_text(repo, two, base_abbrev, false, None).as_bytes());
     match message {
         Some(m) => out.extend_from_slice(format!(" {m}\n").as_bytes()),
         None if fast_backward => out.extend_from_slice(b" (rewind):\n"),
@@ -5490,10 +5559,15 @@ fn emit_patch(
     }
 
     if p.old_id != p.new_id {
+        // `fill_metainfo()` (diff.c:4920-4927): under `--binary` a pair that really is
+        // binary gets full object names on its `index` line, because the payload below
+        // has to be applied against exactly those objects. A text pair in the same run
+        // keeps the caller's abbreviation.
+        let full_index = opts.full_index || (opts.binary && an.binary);
         out.extend_from_slice(b"index ");
-        out.extend_from_slice(oid_text(repo, &p.old_id, base_abbrev, opts.full_index).as_bytes());
+        out.extend_from_slice(oid_text(repo, &p.old_id, base_abbrev, full_index, opts.abbrev_explicit).as_bytes());
         out.extend_from_slice(b"..");
-        out.extend_from_slice(oid_text(repo, &p.new_id, base_abbrev, opts.full_index).as_bytes());
+        out.extend_from_slice(oid_text(repo, &p.new_id, base_abbrev, full_index, opts.abbrev_explicit).as_bytes());
         if p.old_valid() && p.new_valid() && p.old_mode == p.new_mode {
             out.extend_from_slice(format!(" {:06o}", p.new_mode).as_bytes());
         }
@@ -5525,11 +5599,24 @@ fn emit_patch(
     // when the raw blobs are: `builtin_diff()` only reaches its `Binary files … differ`
     // arm for a side that has no textconv driver.
     if an.binary && !opts.text && an.converted.is_none() {
-        out.extend_from_slice(b"Binary files ");
-        out.extend_from_slice(&old_label);
-        out.extend_from_slice(b" and ");
-        out.extend_from_slice(&new_label);
-        out.extend_from_slice(b" differ\n");
+        if opts.binary {
+            // `emit_binary_diff()` (diff.c): the `GIT binary patch` payload replaces the
+            // whole `Binary files …` line, and there is no `---`/`+++` pair in front of
+            // it. `PatchSink` line-prefixes every byte it takes, which is what
+            // `emit_diff_symbol(DIFF_SYMBOL_BINARY_DIFF_BODY)` does per payload line.
+            super::binary_patch::emit(
+                out,
+                &an.old_data,
+                &an.new_data,
+                super::binary_patch::loose_compression_level(repo),
+            );
+        } else {
+            out.extend_from_slice(b"Binary files ");
+            out.extend_from_slice(&old_label);
+            out.extend_from_slice(b" and ");
+            out.extend_from_slice(&new_label);
+            out.extend_from_slice(b" differ\n");
+        }
     } else if !an.hunks.is_empty() {
         out.extend_from_slice(b"--- ");
         out.extend_from_slice(&old_label);
@@ -5581,9 +5668,21 @@ fn mode_kind(mode: u32) -> EntryKind {
 }
 
 /// The object id as it appears on an `index` line.
-fn oid_text(repo: &gix::Repository, id: &ObjectId, base: usize, full: bool) -> String {
+fn oid_text(
+    repo: &gix::Repository,
+    id: &ObjectId,
+    base: usize,
+    full: bool,
+    explicit: Option<usize>,
+) -> String {
     if full {
         id.to_hex().to_string()
+    } else if let Some(n) = explicit {
+        if id.is_null() {
+            "0".repeat(n)
+        } else {
+            id.to_hex_with_len(n).to_string()
+        }
     } else if id.is_null() {
         "0".repeat(base)
     } else {

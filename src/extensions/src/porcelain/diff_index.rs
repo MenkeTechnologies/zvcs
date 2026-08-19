@@ -23,8 +23,34 @@
 //!   * `-z`                             — NUL field/record terminators, paths unquoted.
 //!   * `--abbrev[=<n>]`, `--no-abbrev`, `--full-index` — abbreviated / full object ids.
 //!   * `--exit-code`, `--quiet`         — exit 1 when differences exist (`--quiet` is silent).
+//!     Both are `OPT_BOOL`s, so `--no-exit-code` and `--no-quiet` lower them again;
+//!     `--quiet`'s share of the exit status comes from `diff_setup_done()` reading
+//!     `flags.quick`, so lowering the quiet flag takes that with it. `--no-no-patch`
+//!     is `OPT_SET_INT`'s unset value — an empty `output_format`, which
+//!     `cmd_diff_index()` defaults back to the raw listing.
 //!   * `-s` / `--no-patch`              — suppress output, exit 0 unless `--exit-code`.
-//!   * `-R`                             — swap the two sides of every pair.
+//!   * `-R`                             — swap the two sides of every pair. Applied at
+//!     queue time, as `diff_queue_change()` does (diff.c:7667), so rename detection
+//!     sees the already-reversed pairs.
+//!   * `-M`/`-C`/`-B`/`-l<n>`, `--find-renames[=<n>]`, `--find-copies[=<n>]`,
+//!     `--find-copies-harder`, `--break-rewrites[=<n>]`, `--no-renames`,
+//!     `--rename-empty`/`--no-rename-empty` — the real `diffcore-rename.c` /
+//!     `diffcore-break.c` passes, run through the shared port in
+//!     [`super::diffcore_rename`] (the one `diff-pairs` and `diff` use). Detected
+//!     renames and copies reach every format: `R<score>`/`C<score>` with both names in
+//!     the raw and `--name-status` listings, `pprint_rename`'s `dir/{old => new}` in
+//!     `--stat`/`--numstat`, ` rename …(97%)` / ` copy …(100%)` in `--summary`, and
+//!     `similarity index`/`rename from`/`rename to` in the patch.
+//!     `--find-copies-harder` also queues the *unchanged* paths as `diff_same()` pairs
+//!     (`oneway_diff()`, diff-lib.c:431) so an untouched file can be a copy source.
+//!   * `--expand-tabs[=<n>]`, `--no-expand-tabs` — accepted and inert: they set only
+//!     `revs->expand_tabs_in_log`, which `pretty.c` reads when indenting a commit
+//!     message. The value is still validated, and a bad one is git's fatal.
+//!   * `--compact-summary` / `--no-compact-summary`.
+//!   * `--diff-merges=<mode>`, `--no-diff-merges`, `--dd`, `--remerge-diff` — the
+//!     merge-diff knob. Every mode but `off`/`none` fills an *empty* output format
+//!     with the patch (`diff_merges_setup_revs()`, diff-merges.c:188); the combined
+//!     modes are listed under the limitations below.
 //!   * `--diff-filter=<letters>`        — include upper-case, exclude lower-case statuses.
 //!   * `--line-prefix=<s>`              — prefix every emitted record.
 //!   * `--relative[=<path>]`, `--no-relative` — limit to a subdirectory and strip it.
@@ -187,15 +213,15 @@
 //!      not the after side.
 //!
 //!   Nothing is faked: the algorithm the user asked for is the one that runs.
-//! * Rename/copy detection is off, which is git's default for `diff-index`. `-M`/`-C`
-//!   and friends are accepted for their *observable* side effect on this listing — git
-//!   hashes rename candidates, so an added path gains its real object id — but no rename
-//!   is ever *paired*: additions and deletions stay separate `A`/`D` records rather than
-//!   collapsing into an `R`/`C` record. git's `diffcore_rename` (its exact-id and
-//!   similarity matching, the basename heuristic and the reported `R<score>` percentage)
-//!   is not vendored; gitoxide's `rewrites::Tracker` deliberately deviates from git's
-//!   algorithm, so it cannot reproduce git's pairing or scores byte for byte, and every
-//!   other command in this tree (`diff`, `whatchanged`, …) likewise leaves rewrites off.
+//! * `--diff-merges=combined` / `=dense-combined` / `-c` / `--cc` *without* `--cached`.
+//!   `oneway_diff()` (diff-lib.c:408) then builds a two-parent `combine_diff_path` —
+//!   parent 0 the index entry, parent 1 the tree entry, result the worktree file — and
+//!   renders `diff --combined`/`diff --cc` for it. That renderer is not reached from
+//!   here, so those invocations are declined rather than answered with a two-way patch.
+//!   Under `--cached` the same guard means the mode only turns the patch format on,
+//!   which *is* reproduced.
+//! * `--anchored=<text>`: nothing in this tree implements the anchored patience
+//!   variant, so the flag is recorded and refused for any content format.
 //! * `-G`/`-I`/`-S --pickaxe-regex` compile with the `regex` crate, not the platform's
 //!   POSIX engine, so a pattern the two engines disagree about (rare metacharacter edge
 //!   cases) can match differently, and an *invalid* pattern's fatal carries a different
@@ -228,6 +254,7 @@ use gix::prelude::ObjectIdExt;
 
 use super::diff_color;
 use super::diff_pickaxe;
+use super::diffcore_rename;
 use super::diffstat::{self, StatWidths};
 use super::diff_files::{
     count_changes_sides, quote_one, quote_two, quoted_name, quoted_name_bytes, render_dirstat,
@@ -308,7 +335,9 @@ struct Opts {
     ignore_blank_lines: bool,
     pickaxe: Option<diff_pickaxe::Kind>,
     pickaxe_all: bool,
-    detect_rename: bool, // -M/-C: git hashes rename candidates, so additions gain real ids
+    /// `-M`/`-C`/`-B`/`-l`/`--rename-empty`, handed verbatim to the shared
+    /// `diffcore-rename.c`/`diffcore-break.c` port.
+    rename: diffcore_rename::Options,
     /// `-p`/`-u`/`--patch`: render the unified patch body.
     patch: bool,
     /// `-U<n>`/`--unified=<n>`: unified-diff context, git's default of 3.
@@ -389,17 +418,41 @@ struct Delta {
     dst_id: ObjectId,
     /// An unmerged (conflicted) index entry, reported as `U` under `--cached`.
     unmerged: bool,
-    /// Repository-root relative path.
+    /// Repository-root relative path. For a rename or copy this is `p->two->path`,
+    /// the destination; the source lives in [`Delta::rename`].
     path: BString,
+    /// Set by `diffcore_rename()` when this destination was matched to a source at a
+    /// different path: git's `p->one->path`.
+    rename: Option<RenameSrc>,
+    /// git's `p->score`, in `MAX_SCORE` units. Non-zero for a rename/copy *and* for a
+    /// pair `diffcore_break()` split, which is why `diff_flush_raw()` (diff.c:6481)
+    /// keys the `%03d` suffix off the score rather than off the status letter.
+    /// [`diffcore_rename::similarity_index`] turns it into the printed percentage.
+    score: u32,
+}
+
+/// The `p->one` side of a pair `diffcore_rename()` matched across paths.
+struct RenameSrc {
+    /// git's `p->one->path`.
+    path: BString,
+    /// `C` rather than `R`: the source survived at its own path as well.
+    copy: bool,
 }
 
 impl Delta {
     /// git's `diff_resolve_rename_copy` letter: absent source is an addition, absent
     /// destination a deletion, differing `S_IFMT` bits a type change, otherwise a
-    /// modification. Unmerged pairs short-circuit to `U`.
+    /// modification. Unmerged pairs short-circuit to `U`, and a pair
+    /// `diffcore_rename()` matched across paths is `R`/`C` before any of that.
     fn status(&self) -> u8 {
         if self.unmerged {
             b'U'
+        } else if let Some(r) = &self.rename {
+            if r.copy {
+                b'C'
+            } else {
+                b'R'
+            }
         } else if self.src_mode == 0 {
             b'A'
         } else if self.dst_mode == 0 {
@@ -408,6 +461,15 @@ impl Delta {
             b'T'
         } else {
             b'M'
+        }
+    }
+
+    /// The path the *source* side of this pair carries — `p->one->path`, which is
+    /// `p->two->path` for everything but a rename or copy.
+    fn src_path(&self) -> &BString {
+        match &self.rename {
+            Some(r) => &r.path,
+            None => &self.path,
         }
     }
 
@@ -495,11 +557,11 @@ common diff options:
 /// so `--ext-diff` and `--textconv` really had something to switch on.
 ///
 /// Deliberately absent, because the same sweep showed each one *does* change output:
-/// `--ita-invisible-in-index` (drops the `add -N` record under `--cached`) and
-/// `--no-rename-empty` (splits an empty-file `R100` back to `A`+`D` under `-M`).
-/// `--diff-merges=<anything but off>` was on that list too and is no longer reached
-/// here at all: it has its own arm in the parse loop, because every mode but
-/// `off`/`none` turns the patch format on.
+/// `--ita-invisible-in-index` (drops the `add -N` record under `--cached`). The
+/// rename family — `-M`, `-C`, `-B`, `-l<n>`, `--rename-empty`/`--no-rename-empty` —
+/// left this list when `diffcore_rename` was wired in; each now has its own arm.
+/// `--diff-merges=<anything but off>` likewise has its own arm, because every mode but
+/// `off`/`none` fills an empty output format with the patch.
 fn provable_noop_option(a: &str) -> bool {
     matches!(
         a,
@@ -511,7 +573,17 @@ fn provable_noop_option(a: &str) -> bool {
             | "--no-function-context"
             | "--no-notes"
             | "--no-textconv"
-            | "--rename-empty"
+            // `--expand-tabs[=<n>]`/`--no-expand-tabs` (revision.c:2575-2583) set only
+            // `revs->expand_tabs_in_log`, which nothing but `pretty.c`'s commit-message
+            // indenter reads (pretty.c:2235, 2281). This command never formats a commit
+            // message, so every spelling is inert — measured against stock 2.55.0 for
+            // `-p`, `--stat`, `--numstat`, `--summary` and `--raw`, cached and not.
+            | "--expand-tabs"
+            | "--no-expand-tabs"
+            // `--no-text` clears `o->flags.text`, which this command starts with
+            // clear; `--no-follow` likewise. Both are inert on their own.
+            | "--no-text"
+            | "--no-follow"
     )
 }
 
@@ -521,10 +593,8 @@ fn render_only_option(a: &str) -> bool {
     }
     const EXACT: &[&str] = &[
         "-a",
-        "-B",
         "-D",
         "-W",
-        "--break-rewrites",
         "--default-prefix",
         "--ext-diff",
         "--full-index",
@@ -540,9 +610,7 @@ fn render_only_option(a: &str) -> bool {
         // here, so it cannot change any output this command produces.
         "--no-notes",
         "--no-prefix",
-        "--no-rename-empty",
         "--no-textconv",
-        "--rename-empty",
         "--submodule",
         "--text",
         "--textconv",
@@ -553,7 +621,6 @@ fn render_only_option(a: &str) -> bool {
     // they deliberately do *not* appear here.
     const WITH_VALUE: &[&str] = &[
         "--anchored=",
-        "--break-rewrites=",
         "--dst-prefix=",
         "--output-indicator-context=",
         "--output-indicator-new=",
@@ -563,10 +630,7 @@ fn render_only_option(a: &str) -> bool {
     if EXACT.contains(&a) || WITH_VALUE.iter().any(|p| a.starts_with(*p)) {
         return true;
     }
-    // `-B<n>` / `-B<n>/<m>` (break rewrites) and `-l<n>` (rename limit) carry a numeric
-    // tail; neither changes this listing.
-    let b = a.as_bytes();
-    b.len() > 2 && b[0] == b'-' && (b[1] == b'B' || b[1] == b'l')
+    false
 }
 
 /// `--stat=<width>[,<name-width>[,<count>]]` (`diff_opt_stat()`), parsed leniently:
@@ -685,7 +749,7 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
         ignore_blank_lines: false,
         pickaxe: None,
         pickaxe_all: false,
-        detect_rename: false,
+        rename: diffcore_rename::Options::default(),
         patch: false,
         ctx: 3,
         inter_hunk_ctx: 0,
@@ -717,6 +781,9 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
     let mut wseh_explicit = false;
     let mut ih_explicit = false;
     let mut quiet = false;
+    /// `o->flags.exit_with_status` as `--exit-code`/`--no-exit-code` left it, before
+    /// `diff_setup_done()`'s `flags.quick` block ors its own in.
+    let mut exit_code_given = false;
     let mut merge_base = false;
     // `--raw` given explicitly, which is what makes git print the pair listing
     // alongside `--dirstat` instead of only the directories.
@@ -801,6 +868,15 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
     // `--ignore-submodules=` (128); `get_or_insert` keeps the earliest since the scan runs
     // left to right.
     let mut deferred: Option<(usize, u8, Vec<u8>)> = None;
+    // `revs->combine_merges`, carrying the spelling that set it so the refusal below
+    // can name it. `revs->combined_all_paths` rides along for its own fatal.
+    let mut combine_merges: Option<String> = None;
+    let mut combined_all_paths = false;
+    let mut combined_all_paths_error = false;
+    /// `revs->merges_need_diff` / `revs->merges_imply_patch`, which
+    /// `diff_merges_setup_revs()` turns into `DIFF_FORMAT_PATCH` only when nothing
+    /// else has set an output format.
+    let mut merges_need_diff = false;
 
     // git `die()`s on a bad dirstat parameter the moment it parses it, before it looks
     // at anything else on the command line, so each call site returns straight away.
@@ -880,6 +956,13 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
         match a {
             "--" => after_dashdash = true,
             "--cached" => opts.cached = true,
+            // `set_none()` (diff-merges.c:31): clears every merge-diff bit, including
+            // an earlier `-c`/`--cc`. On its own it changes nothing, because this
+            // command starts with all of them clear.
+            "--no-diff-merges" => {
+                combine_merges = None;
+                merges_need_diff = false;
+            }
             "--merge-base" => merge_base = true,
             "-m" => opts.match_missing = true,
             "--raw" => {
@@ -891,6 +974,20 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
             // `OPT_SET_INT('s', "no-patch", &options->output_format, DIFF_FORMAT_NO_OUTPUT)`
             // (diff.c:6046) assigns rather than or-s, so every format asked for earlier —
             // including the three that share `check_mask` — is discarded here.
+            // `OPT_SET_INT` has no `PARSE_OPT_NONEG`, so `--no-no-patch` assigns the
+            // option's *unset* value — a zero `output_format`, which
+            // `cmd_diff_index()` then defaults back to the raw listing.
+            "--no-no-patch" => {
+                check_mask = 0;
+                opts.check = false;
+                opts.patch = false;
+                opts.numstat = false;
+                opts.diffstat = false;
+                opts.shortstat = false;
+                opts.summary = false;
+                opts.dirstat = None;
+                raw_explicit = false;
+            }
             "-s" | "--no-patch" => {
                 check_mask = M_NO_OUTPUT;
                 opts.check = false;
@@ -925,16 +1022,32 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
             // `--remerge-diff` and `--dd` are each byte-identical to `diff-index -p`.
             // The two combined modes are not: they render `diff --combined`, which this
             // port has not got, so they turn the patch format on and are then declined.
-            "--remerge-diff" | "--dd" => opts.patch = true,
+            "--remerge-diff" | "--dd" => {
+                combine_merges = None;
+                merges_need_diff = true;
+            }
+            // `-c`/`--cc` are `set_combined()`/`set_dense_combined()` plus
+            // `merges_imply_patch` (diff-merges.c:128-133).
+            "-c" | "--cc" => {
+                combine_merges = Some(a.to_owned());
+                merges_need_diff = true;
+            }
+            "--combined-all-paths" => combined_all_paths = true,
             s if s.starts_with("--diff-merges=") => {
                 match &s["--diff-merges=".len()..] {
-                    "off" | "none" => {}
+                    // `set_none()` clears `merges_need_diff` as well, so a later
+                    // `--diff-merges=off` undoes an earlier mode's patch format.
+                    "off" | "none" => {
+                        combine_merges = None;
+                        merges_need_diff = false;
+                    }
                     "1" | "first-parent" | "separate" | "m" | "on" | "r" | "remerge" => {
-                        opts.patch = true;
+                        combine_merges = None;
+                        merges_need_diff = true;
                     }
                     "c" | "combined" | "cc" | "dense-combined" => {
-                        opts.patch = true;
-                        content_altering.get_or_insert_with(|| s.to_owned());
+                        combine_merges = Some(s.to_owned());
+                        merges_need_diff = true;
                     }
                     // `set_diff_merges()`'s `die()` (diff-merges.c:92), which runs inside
                     // the single left-to-right parse like every other option-value error.
@@ -952,11 +1065,15 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
                 }
             }
             "--no-binary" => opts.binary = false,
-            "--exit-code" => opts.exit_code = true,
-            "--quiet" => {
-                opts.exit_code = true;
-                quiet = true;
-            }
+            "--exit-code" => exit_code_given = true,
+            // `OPT_BOOL(0, "exit-code", &options->flags.exit_with_status)` (diff.c:6256)
+            // and `OPT_BOOL(0, "quiet", &options->flags.quick)` (diff.c:6258): both take
+            // a `--no-` form, and `--quiet`'s contribution to the exit status comes from
+            // `diff_setup_done()` reading `quick`, not from the flag itself.
+            "--no-exit-code" => exit_code_given = false,
+            "--quiet" => quiet = true,
+            "--no-quiet" => quiet = false,
+            "--no-full-index" => opts.full_index = false,
             "-R" => opts.reverse = true,
             "-w" | "--ignore-all-space" => opts.ws.all = true,
             "-b" | "--ignore-space-change" => opts.ws.change = true,
@@ -965,7 +1082,7 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
             "--ignore-blank-lines" => opts.ignore_blank_lines = true,
             // `diff_opt_no_renames()`: cancels an earlier `-M`/`-C`, which is the
             // only way rename detection is ever on for this plumbing command.
-            "--no-renames" => opts.detect_rename = false,
+            "--no-renames" => opts.rename.detect_rename = 0,
             "--pickaxe-all" => opts.pickaxe_all = true,
             "--pickaxe-regex" => pickaxe_regex = true,
             // `diff_opt_dirstat()`: `--cumulative` and `--dirstat-by-file` are spelled
@@ -997,6 +1114,9 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
                 opts.diffstat = true;
                 opts.compact_summary = true;
             }
+            // `diff_opt_compact_summary()`'s `unset` branch (diff.c:5663): it clears
+            // `stat_with_summary` and nothing else, so on its own it is inert.
+            "--no-compact-summary" => opts.compact_summary = false,
             "-U" | "--unified" => {
                 let Some(value) = args.get(i) else {
                     eprint!("{}", USAGE);
@@ -1144,8 +1264,43 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
                     }
                 }
             }
-            "-M" | "-C" | "--find-renames" | "--find-copies" | "--find-copies-harder" => {
-                opts.detect_rename = true;
+            // Rename/copy/break detection, parsed exactly as `diff.c`'s
+            // `diff_opt_find_renames`/`diff_opt_find_copies`/`diff_opt_break_rewrites`
+            // do and handed to the shared `diffcore_rename` port. A second `-C`
+            // (`o->flags.find_copies_harder`) and `--find-copies-harder` are the same
+            // knob.
+            "-M" | "--find-renames" => {
+                opts.rename.rename_score = 0;
+                opts.rename.detect_rename = diffcore_rename::DETECT_RENAME;
+            }
+            "-C" | "--find-copies" => {
+                opts.rename.rename_score = 0;
+                if opts.rename.detect_rename == diffcore_rename::DETECT_COPY {
+                    opts.rename.find_copies_harder = true;
+                } else {
+                    opts.rename.detect_rename = diffcore_rename::DETECT_COPY;
+                }
+            }
+            "--find-copies-harder" => opts.rename.find_copies_harder = true,
+            "--no-find-copies-harder" => opts.rename.find_copies_harder = false,
+            "--rename-empty" => opts.rename.rename_empty = true,
+            "--no-rename-empty" => opts.rename.rename_empty = false,
+            "-B" | "--break-rewrites" => opts.rename.break_opt = 0,
+            "-l" => {
+                let Some(value) = args.get(i) else {
+                    eprintln!("error: {}", diff_color::missing_value(a));
+                    return Ok(ExitCode::from(129));
+                };
+                i += 1;
+                match value.parse::<i64>() {
+                    Ok(n) => opts.rename.rename_limit = n,
+                    Err(_) => {
+                        set_earliest(
+                            &mut deferred,
+                            (cur, 129, b"error: option `l' expects a numerical value\n".to_vec()),
+                        );
+                    }
+                }
             }
             "-S" | "-G" | "-I" => {
                 // parse-options' own message for a short option declared with a
@@ -1177,11 +1332,73 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
             // `-X` takes its parameters attached only; a following argument is a
             // positional, which is why `-X 10 HEAD` makes git complain about `10`.
             s if s.len() > 2 && s.starts_with("-X") => dirstat!(&s[2..]),
-            s if s.starts_with("--find-renames=") || s.starts_with("--find-copies=") => {
-                opts.detect_rename = true;
+            s if s.starts_with("--find-renames=") || (s.starts_with("-M") && s.len() > 2) => {
+                let raw = s.strip_prefix("--find-renames=").unwrap_or(&s[2..]);
+                let (score, rest) = diffcore_rename::parse_rename_score(raw);
+                if !rest.is_empty() {
+                    set_earliest(
+                        &mut deferred,
+                        (cur, 129, b"error: invalid argument to find-renames\n".to_vec()),
+                    );
+                }
+                opts.rename.rename_score = score;
+                opts.rename.detect_rename = diffcore_rename::DETECT_RENAME;
             }
+            s if s.starts_with("--find-copies=") || (s.starts_with("-C") && s.len() > 2) => {
+                let raw = s.strip_prefix("--find-copies=").unwrap_or(&s[2..]);
+                let (score, rest) = diffcore_rename::parse_rename_score(raw);
+                if !rest.is_empty() {
+                    set_earliest(
+                        &mut deferred,
+                        (cur, 129, b"error: invalid argument to find-copies\n".to_vec()),
+                    );
+                }
+                opts.rename.rename_score = score;
+                if opts.rename.detect_rename == diffcore_rename::DETECT_COPY {
+                    opts.rename.find_copies_harder = true;
+                } else {
+                    opts.rename.detect_rename = diffcore_rename::DETECT_COPY;
+                }
+            }
+            s if s.starts_with("--break-rewrites=") || (s.starts_with("-B") && s.len() > 2) => {
+                let raw = s.strip_prefix("--break-rewrites=").unwrap_or(&s[2..]);
+                match diffcore_rename::parse_break_opt(raw) {
+                    Ok(v) => opts.rename.break_opt = v,
+                    Err(()) => {
+                        set_earliest(
+                            &mut deferred,
+                            (cur, 129, b"error: break-rewrites expects <n>/<m> form\n".to_vec()),
+                        );
+                    }
+                }
+            }
+            s if s.len() > 2 && s.starts_with("-l") => match s[2..].parse::<i64>() {
+                Ok(n) => opts.rename.rename_limit = n,
+                Err(_) => {
+                    set_earliest(
+                        &mut deferred,
+                        (cur, 129, b"error: option `l' expects a numerical value\n".to_vec()),
+                    );
+                }
+            },
             s if s.starts_with("--relative=") => {
                 opts.relative = Some(trim_slashes(&s["--relative=".len()..]));
+            }
+            // `--expand-tabs=<n>` is validated by `strtol_i` at option-parse time
+            // (revision.c:2579-2583) and dies before any revision is resolved; the
+            // value itself is inert here, see `provable_noop_option`.
+            s if s.starts_with("--expand-tabs=") => {
+                let v = &s["--expand-tabs=".len()..];
+                if super::diff_tree::parse_nonneg_int(v).is_none() {
+                    set_earliest(
+                        &mut deferred,
+                        (
+                            cur,
+                            128,
+                            format!("fatal: '{v}': not a non-negative integer\n").into_bytes(),
+                        ),
+                    );
+                }
             }
             s if s.starts_with("--line-prefix=") => {
                 opts.line_prefix = s.as_bytes()["--line-prefix=".len()..].to_vec();
@@ -1288,9 +1505,6 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
             s if s.len() > 2 && (s.starts_with("-S") || s.starts_with("-G")) => {
                 pickaxe_arg = Some((s.as_bytes()[1], s.as_bytes()[2..].to_vec()));
             }
-            s if s.len() > 2 && (s.starts_with("-M") || s.starts_with("-C")) => {
-                opts.detect_rename = true;
-            }
             s => {
                 if render_only_option(s) {
                     // Ignored for the raw/name listings (their bytes are identical with
@@ -1325,8 +1539,53 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
     {
         check_mask &= !M_NO_OUTPUT;
     }
+    // `diff_merges_setup_revs()` (diff-merges.c:188): the merge-diff knob fills an
+    // *empty* `output_format` with the patch, which is why `--diff-merges=combined
+    // --raw` prints the raw listing and `--diff-merges=combined --diff-merges=off`
+    // prints it too. `cmd_diff_index()`'s own raw default (builtin/diff-index.c:58)
+    // runs after this, so "empty" here means no format flag at all.
+    if merges_need_diff
+        && !opts.patch
+        && !opts.numstat
+        && !opts.diffstat
+        && !opts.shortstat
+        && !opts.summary
+        && opts.dirstat.is_none()
+        && !raw_explicit
+        && check_mask == 0
+    {
+        opts.patch = true;
+    }
+    // `diff_merges_setup_revs()` (diff-merges.c:184): `--combined-all-paths` without a
+    // combined mode is fatal.
+    if combined_all_paths && combine_merges.is_none() {
+        combined_all_paths_error = true;
+    }
+    // `oneway_diff()` (diff-lib.c:408) takes the combined path only when the worktree
+    // is being read: `revs->combine_merges && !cached`. Under `--cached` a combined
+    // mode therefore does nothing but turn the patch format on, which the arms above
+    // already did. Without it, git renders a two-parent `diff --combined`/`diff --cc`
+    // whose parents are the index entry and the tree entry — a shape this module does
+    // not build, so the run is declined rather than approximated.
+    if let Some(flag) = combine_merges {
+        if !opts.cached {
+            content_altering.get_or_insert(flag);
+        }
+    }
+    // `diff_setup_done()` (diff.c:5288): `--find-copies-harder` turns copy detection on
+    // by itself, so a lone `--find-copies-harder` still runs the rename pass.
+    if opts.rename.find_copies_harder {
+        opts.rename.detect_rename = diffcore_rename::DETECT_COPY;
+    }
+    opts.exit_code = exit_code_given;
     if quiet {
+        opts.exit_code = true;
         check_mask = M_NO_OUTPUT;
+        // `diff_setup_done()` (diff.c:5348-5353): `flags.quick` reports only the exit
+        // status, so git drops rename detection rather than paying for it. This runs
+        // after the `find_copies_harder` promotion above, and undoes it.
+        opts.rename.detect_rename = 0;
+        opts.rename.find_copies_harder = false;
     }
     // `diff_setup_done()` (diff.c:5259): these four output formats are mutually
     // exclusive, and it dies rather than picking one. The `die()` itself runs after
@@ -1662,6 +1921,12 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
         std::io::stderr().lock().write_all(msg)?;
         return Ok(ExitCode::from(128));
     }
+    // `diff_merges_setup_revs()` (diff-merges.c:184) runs at the tail of
+    // `setup_revisions()`, so every operand has already been resolved when it dies.
+    if combined_all_paths_error {
+        eprintln!("fatal: --combined-all-paths makes no sense without -c or --cc");
+        return Ok(ExitCode::from(128));
+    }
 
     // git resolves the tree-ish before it notices there is no worktree, so a bare repo
     // reaches this `fatal` (exit 128) rather than the earlier usage error.
@@ -1734,15 +1999,10 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
         || opts.pickaxe.is_some()
         || content_output
         || bad_format.is_some();
-    if content_driven {
-        apply_content_filter(&repo, &mut deltas, &opts)?;
-        apply_pickaxe(&repo, &mut deltas, &opts)?;
-    } else if opts.detect_rename {
-        // git hashes every rename candidate; the only visible effect on this listing is
-        // that a created path shows its real object id instead of the null id.
-        fill_added_ids(&repo, &mut deltas, &opts)?;
-    }
-
+    // `diff_queue_change()` (diff.c:7667) swaps the two sides as it queues the pair, so
+    // `-R` happens before every `diffcore_std()` pass — rename detection included. That
+    // is why `diff-index -R -C` finds no copy where `diff-index -C` does: reversed, the
+    // copy's destination is a deletion and `diffcore_rename()` only matches destinations.
     if opts.reverse {
         for d in &mut deltas {
             if d.unmerged {
@@ -1754,6 +2014,20 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
             std::mem::swap(&mut d.src_id, &mut d.dst_id);
         }
     }
+
+    // `diffcore_std()` (diff.c:7509-7518): break, rename, merge-broken, then the
+    // pickaxe. `diffcore_skip_stat_unmatch` is not in this command's pipeline at all
+    // (`skip_stat_unmatch` is `diff.autoRefreshIndex`, a `git_diff_ui_config` key that
+    // `cmd_diff_index()` never reads), so the content drop below is not that pass —
+    // it stands in for `diff_flush()`'s quiet patch run (diff.c:7210), which happens
+    // *after* diffcore and therefore after rename detection.
+    if opts.rename.detect_rename != 0 || opts.rename.break_opt != -1 {
+        apply_rename_detection(&repo, &mut deltas, &opts)?;
+    }
+    if content_driven {
+        apply_content_filter(&repo, &mut deltas, &opts)?;
+    }
+    apply_pickaxe(&repo, &mut deltas, &opts)?;
     if !opts.filter_include.is_empty() || !opts.filter_exclude.is_empty() {
         deltas.retain(|d| passes_filter(d.status(), &opts));
     }
@@ -2161,6 +2435,8 @@ fn collect(repo: &gix::Repository, tree_id: &ObjectId, opts: &Opts) -> Result<Ve
                 dst_id: null,
                 unmerged: false,
                 path: path.clone(),
+                rename: None,
+                score: 0,
             });
             continue;
         };
@@ -2176,6 +2452,8 @@ fn collect(repo: &gix::Repository, tree_id: &ObjectId, opts: &Opts) -> Result<Ve
                 dst_id: null,
                 unmerged: true,
                 path: path.clone(),
+                rename: None,
+                score: 0,
             });
             continue;
         }
@@ -2224,7 +2502,13 @@ fn collect(repo: &gix::Repository, tree_id: &ObjectId, opts: &Opts) -> Result<Ve
 
         let (src_mode, src_id) = src.unwrap_or((0, null));
         if src_mode == dst_mode && src_id == dst_id {
-            continue;
+            // `oneway_diff()` (diff-lib.c:431): `--find-copies-harder` queues the
+            // *unchanged* paths too, as `diff_same()` pairs, so `diffcore_rename()`
+            // can use them as copy sources. Its own queue rebuild drops whichever of
+            // them stayed unmodified, so nothing extra is ever printed.
+            if !opts.rename.find_copies_harder || src_mode == 0 {
+                continue;
+            }
         }
         deltas.push(Delta {
             src_mode,
@@ -2233,6 +2517,8 @@ fn collect(repo: &gix::Repository, tree_id: &ObjectId, opts: &Opts) -> Result<Ve
             dst_id,
             unmerged: false,
             path: path.clone(),
+            rename: None,
+            score: 0,
         });
     }
 
@@ -2398,7 +2684,14 @@ fn apply_content_filter(repo: &gix::Repository, deltas: &mut Vec<Delta>, opts: &
             keep.push(d);
             continue;
         }
-        let same = d.src_mode != 0
+        // `diff_unmodified_pair()` (diff.c:6528) is false the moment the two sides
+        // carry different names, so a rename or copy survives this drop however
+        // identical its bytes are — `diff_flush_patch_quietly()` still writes its
+        // `similarity index`/`rename from` header. A `-B`-broken pair (`score != 0`)
+        // is likewise always interesting.
+        let same = d.rename.is_none()
+            && d.score == 0
+            && d.src_mode != 0
             && d.dst_mode != 0
             && d.src_mode == d.dst_mode
             && sides_match(repo, workdir.as_deref(), &d, opts)?;
@@ -2427,19 +2720,113 @@ fn apply_content_filter(repo: &gix::Repository, deltas: &mut Vec<Delta>, opts: &
     Ok(())
 }
 
-/// `-M`/`-C` make git hash the rename candidates; the visible consequence for this
-/// listing is that a created path carries its real object id.
-fn fill_added_ids(repo: &gix::Repository, deltas: &mut [Delta], _opts: &Opts) -> Result<()> {
-    let null = ObjectId::null(repo.object_hash());
+/// The `diffcore_std()` break / rename / merge-broken slice (diff.c:7509-7515), run
+/// over this command's pair list through the shared `diffcore-rename.c` port.
+///
+/// Every source side of a `diff-index` pair names a blob in the object database. A
+/// destination side does too under `--cached`, but against the working tree it is
+/// git's `oid_valid == 0` filespec, which `diff_populate_filespec()` (diff.c:4062)
+/// answers by reading the file — so [`IdxContent`] reads it too, and
+/// `hash_filespec()` inside the port then gives it the object id the raw listing
+/// prints. That id-filling is the whole reason `-M`/`-C` used to change this
+/// listing at all.
+fn apply_rename_detection(
+    repo: &gix::Repository,
+    deltas: &mut Vec<Delta>,
+    opts: &Opts,
+) -> Result<()> {
     let workdir = repo.workdir().map(Path::to_path_buf);
-    for d in deltas.iter_mut() {
-        if d.src_mode == 0 && d.dst_mode != 0 && d.dst_id == null {
-            if let Some(id) = hash_worktree(repo, workdir.as_deref(), &d.path)? {
-                d.dst_id = id;
+    let mut q = diffcore_rename::Queue::default();
+    // The pairs an unmerged index entry produces never reach `diffcore_rename()`:
+    // `diff_unmerge()` queues them with both sides invalid, and every rename table
+    // skips them. Keeping them out of the queue entirely preserves their position,
+    // which is what git's own skip does.
+    let mut unmerged: Vec<(usize, Delta)> = Vec::new();
+    for (i, d) in deltas.drain(..).enumerate() {
+        if d.unmerged {
+            unmerged.push((i, d));
+            continue;
+        }
+        let one = q.add_spec(diffcore_rename::FileSpec::new(
+            d.src_path().clone(),
+            d.src_mode,
+            d.src_id,
+            d.src_id != ObjectId::null(repo.object_hash()),
+        ));
+        let two = q.add_spec(diffcore_rename::FileSpec::new(
+            d.path.clone(),
+            d.dst_mode,
+            d.dst_id,
+            d.dst_id != ObjectId::null(repo.object_hash()),
+        ));
+        q.add_pair(one, two);
+    }
+
+    let mut ropts = opts.rename;
+    ropts.hash_kind = repo.object_hash();
+    let mut content = IdxContent {
+        repo,
+        workdir: workdir.as_deref(),
+    };
+    // `diff_warn_rename_limit()` (diff.c:7028): `-l<n>`/`diff.renameLimit` cutting the
+    // matrix short is reported on stderr, naming the config key the caller could raise.
+    diffcore_rename::run(&mut q, &ropts, &mut content).emit("diff.renameLimit");
+    diffcore_rename::resolve_rename_copy(&mut q);
+
+    let mut rebuilt: Vec<Delta> = Vec::with_capacity(q.pairs.len() + unmerged.len());
+    for p in &q.pairs {
+        let one = &q.specs[p.one];
+        let two = &q.specs[p.two];
+        let renamed = matches!(p.status, b'R' | b'C');
+        rebuilt.push(Delta {
+            src_mode: one.mode,
+            dst_mode: two.mode,
+            src_id: one.oid,
+            dst_id: two.oid,
+            unmerged: false,
+            path: two.path.clone(),
+            rename: renamed.then(|| RenameSrc {
+                path: one.path.clone(),
+                copy: p.status == b'C',
+            }),
+            score: p.score,
+        });
+    }
+    // `diff_unmerge()`'s pairs kept their queue slots throughout, so splice them back
+    // where they were.
+    for (i, d) in unmerged {
+        rebuilt.insert(i.min(rebuilt.len()), d);
+    }
+    *deltas = rebuilt;
+    Ok(())
+}
+
+/// `diff_populate_filespec()` for a `diff-index` pair: an id-carrying side is an odb
+/// lookup, a worktree side is a read off disk (a symlink yields its target, which is
+/// what git hashes for a `120000` entry).
+struct IdxContent<'a> {
+    repo: &'a gix::Repository,
+    workdir: Option<&'a Path>,
+}
+
+impl diffcore_rename::Content for IdxContent<'_> {
+    fn size(&mut self, spec: &diffcore_rename::FileSpec) -> Option<u64> {
+        if spec.oid_valid {
+            // `check_size_only = 1`: the odb header answers without inflating the blob.
+            let header = self.repo.find_header(spec.oid).ok()?;
+            return (header.kind() == gix::object::Kind::Blob).then(|| header.size());
+        }
+        self.data(spec).map(|d| d.len() as u64)
+    }
+
+    fn data(&mut self, spec: &diffcore_rename::FileSpec) -> Option<Vec<u8>> {
+        if spec.oid_valid {
+            if let Ok(obj) = self.repo.find_object(spec.oid) {
+                return Some(obj.detach().data);
             }
         }
+        read_worktree(self.workdir?, &spec.path)
     }
-    Ok(())
 }
 
 /// The pickaxe (`-S` counts occurrences, `-G` greps the changed lines).
@@ -2653,38 +3040,53 @@ fn render(repo: &gix::Repository, deltas: &[Delta], opts: &Opts) -> Result<Vec<u
         .unwrap_or(0);
 
     let mut out = Vec::new();
-    for d in deltas {
-        out.extend_from_slice(&opts.line_prefix);
-        match opts.format {
-            Format::Silent => unreachable!("silent output is short-circuited by the caller"),
-            Format::Check => unreachable!("--check clears `emit_pairs`, so this never runs"),
-            Format::NameOnly => {}
-            Format::NameStatus => {
-                out.push(d.status());
-                out.push(sep);
-            }
-            Format::Raw => {
-                out.extend_from_slice(
-                    format!(
-                        ":{:06o} {:06o} {} {} ",
-                        d.src_mode,
-                        d.dst_mode,
-                        hex(&d.src_id, len),
-                        hex(&d.dst_id, len),
-                    )
-                    .as_bytes(),
-                );
-                out.push(d.status());
-                out.push(sep);
-            }
-        }
-        let path = &d.path.as_slice()[strip.min(d.path.len())..];
+    // `diff_flush_raw()` (diff.c:6469) and the `DIFF_FORMAT_NAME` arm of
+    // `flush_one_pair()` (diff.c:6742), which differ only in the columns before the
+    // status letter and in whether a rename prints both of its names.
+    let mut emit_name = |out: &mut Vec<u8>, path: &BString, term: u8| {
+        let name = &path.as_slice()[strip.min(path.len())..];
         if opts.nul {
-            out.extend_from_slice(path);
+            out.extend_from_slice(name);
         } else {
-            out.extend_from_slice(&quoted_name_bytes(path));
+            out.extend_from_slice(&quoted_name_bytes(name));
         }
         out.push(term);
+    };
+    for d in deltas {
+        out.extend_from_slice(&opts.line_prefix);
+        if opts.format == Format::NameOnly {
+            // `name_a = p->two->path`, with no status column in front of it.
+            emit_name(&mut out, &d.path, term);
+            continue;
+        }
+        if opts.format == Format::Raw {
+            out.extend_from_slice(
+                format!(
+                    ":{:06o} {:06o} {} {} ",
+                    d.src_mode,
+                    d.dst_mode,
+                    hex(&d.src_id, len),
+                    hex(&d.dst_id, len),
+                )
+                .as_bytes(),
+            );
+        }
+        debug_assert!(matches!(opts.format, Format::Raw | Format::NameStatus));
+        out.push(d.status());
+        // `if (p->score)`: the three-digit similarity follows the status letter for a
+        // rename, a copy and a `-B`-broken pair alike.
+        if d.score != 0 {
+            out.extend_from_slice(
+                format!("{:03}", diffcore_rename::similarity_index(d.score)).as_bytes(),
+            );
+        }
+        out.push(sep);
+        // A rename or copy names both sides, source first, with the field separator
+        // between them.
+        if let Some(r) = &d.rename {
+            emit_name(&mut out, &r.path, sep);
+        }
+        emit_name(&mut out, &d.path, term);
     }
     Ok(out)
 }
@@ -2974,6 +3376,9 @@ fn display_path(path: &BString, opts: &Opts) -> BString {
 /// One `struct diffstat_file`.
 struct StatFile {
     path: BString,
+    /// git's `from_name`: `Some` exactly when `run_diffstat()` (diff.c:5100) found the
+    /// two sides under different names, which is also its `is_renamed` flag.
+    from_name: Option<BString>,
     /// The name as printed, quoted and possibly annotated by `--compact-summary`.
     print_name: Vec<u8>,
     added: u32,
@@ -2990,6 +3395,7 @@ fn compute_diffstat(deltas: &[Delta], analyses: &[IdxAnalysis], opts: &Opts) -> 
         if d.unmerged {
             out.push(StatFile {
                 path: display_path(&d.path, opts),
+                from_name: None,
                 print_name: stat_print_name(d, opts),
                 added: 0,
                 deleted: 0,
@@ -3009,6 +3415,7 @@ fn compute_diffstat(deltas: &[Delta], analyses: &[IdxAnalysis], opts: &Opts) -> 
         }
         out.push(StatFile {
             path: display_path(&d.path, opts),
+            from_name: (d.rename.is_some()).then(|| display_path(d.src_path(), opts)),
             print_name: stat_print_name(d, opts),
             added,
             deleted,
@@ -3022,7 +3429,12 @@ fn compute_diffstat(deltas: &[Delta], analyses: &[IdxAnalysis], opts: &Opts) -> 
 /// `fill_print_name()` plus `get_compact_summary()`.
 fn stat_print_name(d: &Delta, opts: &Opts) -> Vec<u8> {
     let path = display_path(&d.path, opts);
-    let mut name = quoted_name(&path);
+    // `fill_print_name()`: a renamed entry prints the `pprint_rename`d pair instead of
+    // the quoted destination.
+    let mut name = match &d.rename {
+        Some(_) => super::diff_pairs::pprint_rename(&display_path(d.src_path(), opts), &path),
+        None => quoted_name(&path),
+    };
     if !opts.compact_summary {
         return name;
     }
@@ -3063,10 +3475,21 @@ fn render_numstat(out: &mut Vec<u8>, files: &[StatFile], opts: &Opts) {
             out.extend_from_slice(format!("{}\t{}\t", f.added, f.deleted).as_bytes());
         }
         if opts.nul {
+            // `show_numstat()` (diff.c:3270): under `-z` a rename is three NUL-terminated
+            // fields — an empty one, the source, then the destination — and the names are
+            // written raw rather than `pprint_rename`d.
+            if let Some(from) = &f.from_name {
+                out.push(0);
+                out.extend_from_slice(from.as_ref());
+                out.push(0);
+            }
             out.extend_from_slice(f.path.as_ref());
             out.push(0);
         } else {
-            out.extend_from_slice(&quoted_name(&f.path));
+            match &f.from_name {
+                Some(_) => out.extend_from_slice(&f.print_name),
+                None => out.extend_from_slice(&quoted_name(&f.path)),
+            }
             out.push(b'\n');
         }
     }
@@ -3095,8 +3518,12 @@ fn stat_rows(files: &[StatFile]) -> Vec<diffstat::StatFile> {
 fn summary_is_empty(deltas: &[Delta]) -> bool {
     for d in deltas {
         match d.status() {
-            b'A' | b'D' => return false,
+            b'A' | b'D' | b'C' | b'R' => return false,
             _ => {
+                // A `-B`-broken pair carries a score and prints a ` rewrite ` line.
+                if d.score != 0 {
+                    return false;
+                }
                 if d.src_mode != 0 && d.dst_mode != 0 && d.src_mode != d.dst_mode {
                     return false;
                 }
@@ -3106,22 +3533,51 @@ fn summary_is_empty(deltas: &[Delta]) -> bool {
     true
 }
 
-/// `diff_summary()`.
+/// `diff_summary()` (diff.c:6803).
 fn render_summary(out: &mut Vec<u8>, d: &Delta, opts: &Opts) {
     let path = display_path(&d.path, opts);
     match d.status() {
         b'D' => summary_mode_name(out, "delete", d.src_mode, &path),
         b'A' => summary_mode_name(out, "create", d.dst_mode, &path),
+        // `show_rename_copy()` (diff.c:6787): the `pprint_rename`d name pair, the
+        // similarity percentage, then a mode change *without* a name of its own.
+        st @ (b'R' | b'C') => {
+            let src = display_path(d.src_path(), opts);
+            out.extend_from_slice(if st == b'C' { b" copy " } else { b" rename " });
+            out.extend_from_slice(&super::diff_pairs::pprint_rename(&src, &path));
+            out.extend_from_slice(
+                format!(" ({}%)\n", diffcore_rename::similarity_index(d.score)).as_bytes(),
+            );
+            show_mode_change(out, d, false, &path);
+        }
         _ => {
-            if d.src_mode != 0 && d.dst_mode != 0 && d.src_mode != d.dst_mode {
-                out.extend_from_slice(
-                    format!(" mode change {} => {} ", mode_str(d.src_mode), mode_str(d.dst_mode)).as_bytes(),
-                );
+            // A pair `diffcore_break()` split announces itself as a rewrite, and then
+            // `show_mode_change(opt, p, !p->score)` suppresses the name.
+            if d.score != 0 {
+                out.extend_from_slice(b" rewrite ");
                 out.extend_from_slice(&quoted_name(&path));
-                out.push(b'\n');
+                out.extend_from_slice(
+                    format!(" ({}%)\n", diffcore_rename::similarity_index(d.score)).as_bytes(),
+                );
             }
+            show_mode_change(out, d, d.score == 0, &path);
         }
     }
+}
+
+/// `show_mode_change()` (diff.c:6769).
+fn show_mode_change(out: &mut Vec<u8>, d: &Delta, show_name: bool, path: &BString) {
+    if d.src_mode == 0 || d.dst_mode == 0 || d.src_mode == d.dst_mode {
+        return;
+    }
+    out.extend_from_slice(
+        format!(" mode change {} => {}", mode_str(d.src_mode), mode_str(d.dst_mode)).as_bytes(),
+    );
+    if show_name {
+        out.push(b' ');
+        out.extend_from_slice(&quoted_name(path));
+    }
+    out.push(b'\n');
 }
 
 /// `show_file_mode_name()`.
@@ -3164,6 +3620,9 @@ fn render_patch(
     }
 
     let path = display_path(&d.path, opts);
+    // `name`/`other` in `run_diff()`: the source's own path, which differs from the
+    // destination's only for a rename or copy.
+    let src_path = display_path(d.src_path(), opts);
     // `-R` swaps the two prefixes, leaving the paths themselves alone.
     let (pa, pb): (&str, &str) = if opts.reverse {
         (&opts.dst_prefix, &opts.src_prefix)
@@ -3202,14 +3661,48 @@ fn render_patch(
         || d.src_mode != d.dst_mode
         || an.binary
         || an.hunks.is_some()
+        // `fill_metainfo()`'s `*must_show_header`: a rename, a copy and a `-B`-broken
+        // pair all carry a header of their own, so the section shows even when the two
+        // sides turn out identical (an exact `R100` has no hunks at all).
+        || d.rename.is_some()
+        || d.score != 0
         || (an.changed && content_differs);
     if !must_show {
         return;
     }
 
     out.extend_from_slice(b"diff --git ");
-    out.extend_from_slice(&quote_two(pa, &path, pb, &path));
+    out.extend_from_slice(&quote_two(pa, &src_path, pb, &path));
     out.push(b'\n');
+
+    // `fill_metainfo()` (diff.c:4875): the rename/copy/rewrite block precedes the
+    // create/delete/mode lines.
+    match d.status() {
+        st @ (b'R' | b'C') => {
+            let verb = if st == b'C' { "copy" } else { "rename" };
+            out.extend_from_slice(
+                format!(
+                    "similarity index {}%\n{verb} from ",
+                    diffcore_rename::similarity_index(d.score)
+                )
+                .as_bytes(),
+            );
+            out.extend_from_slice(&quoted_name(&src_path));
+            out.extend_from_slice(format!("\n{verb} to ").as_bytes());
+            out.extend_from_slice(&quoted_name(&path));
+            out.push(b'\n');
+        }
+        b'M' if d.score != 0 => {
+            out.extend_from_slice(
+                format!(
+                    "dissimilarity index {}%\n",
+                    diffcore_rename::similarity_index(d.score)
+                )
+                .as_bytes(),
+            );
+        }
+        _ => {}
+    }
 
     // File-creation / deletion / mode-change lines.
     match (d.old_valid(), d.new_valid()) {
@@ -3252,7 +3745,7 @@ fn render_patch(
     }
 
     let old_label = if d.old_valid() {
-        quote_one(pa, &path)
+        quote_one(pa, &src_path)
     } else {
         b"/dev/null".to_vec()
     };

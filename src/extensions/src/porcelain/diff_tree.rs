@@ -100,9 +100,20 @@
 //! form — the pipeline `git diff-pairs` documents, run in-process. [`needs_pairs`] lists
 //! what switches a run over; [`raw_pair_stream`] writes the stream, and `-R`,
 //! `--diff-filter` and the format flags travel with it rather than being applied twice.
-//! That covers `-p`/`-u`/`--patch`, `-U<n>`, `--stat`/`--compact-summary`/`--dirstat`,
-//! `-w`/`-b`/`--ignore-*`, `-W`, `--inter-hunk-context=<n>`, `--line-prefix=<s>`,
-//! `-M`/`-C`/`-B`/`--no-renames`, the pickaxe and `--check`.
+//! That covers `-p`/`-u`/`--patch`, `-U<n>`, `--stat`/`--compact-summary`/
+//! `--no-compact-summary`/`--dirstat`, `--binary` (the `GIT binary patch` payload),
+//! `-w`/`-b`/`--ignore-*` including `--ignore-blank-lines`, `-W`,
+//! `--inter-hunk-context=<n>`, `--line-prefix=<s>`, `-M`/`-C`/`-B`/`--no-renames`, the
+//! pickaxe, `--check`, and the whole word-diff / coloured-move family
+//! (`--word-diff[=<mode>]`, `--word-diff-regex=<re>`, `--color-words[=<re>]`,
+//! `--color-moved[=<mode>]`, `--color-moved-ws=<modes>` and their `--no-` twins) —
+//! `diff-pairs` owns those renderers, so routing is what makes them work.
+//!
+//! `--abbrev=<n>` crosses that boundary explicitly. Stock `git diff-pairs` ignores its
+//! own `--abbrev` (measured against 2.55.0) while `git diff-tree -p --abbrev=12` widens
+//! the `index` line, so the resolved `o->abbrev` is handed to
+//! [`super::diff_pairs::render_raw_stream`] as an argument rather than replayed as a
+//! flag.
 //!
 //! ### Options accepted but deliberately without effect
 //!
@@ -137,6 +148,9 @@
 //!   the repository's approximate object count; the vendored crates expose no equivalent.
 //! * `-v`, `--pretty`/`--format` — these need commit-message formatting, which belongs
 //!   to the `log`/`show` machinery, not the tree diff.
+//! * `--anchored=<text>` — git runs an anchored patience diff (`xpp->anchors`); the
+//!   vendored `gix-imara-diff` has the patience algorithm but no way to pass anchors
+//!   in, so the flag is recorded and refused rather than silently dropped.
 //! * `--relative`.
 //! * `--full-index`, `--no-prefix`, `--default-prefix`, `--src-prefix=`/`--dst-prefix=`
 //!   and `--combined-all-paths` *under a combined patch*: `show_combined_header()`
@@ -327,6 +341,11 @@ struct Opts {
     reverse: bool,       // -R: swap the two sides of every file pair
     exit_code: bool,     // --exit-code/--quiet: exit 1 when anything differs
     abbrev: usize,       // object-id width in the raw output
+    /// `o->abbrev`: `Some(n)` only after an explicit `--abbrev=<n>`. The raw listing
+    /// reads `abbrev` above (which starts at the full width, `cmd_diff_tree`'s
+    /// `rev.abbrev = 0`); the routed patch's `index` line reads this, because
+    /// `fill_metainfo()` falls back to `DEFAULT_ABBREV` when `o->abbrev` is zero.
+    abbrev_explicit: Option<usize>,
     filter: u32,         // --diff-filter mask, see `filter_bit`
     /// `--diff-filter` was actually given. `filter` is set to [`ALL_STATUSES`] on a
     /// routed run, so it cannot answer git's `opt->filter` test on its own.
@@ -334,6 +353,13 @@ struct Opts {
     /// `--quiet` — git's `opt->flags.quick`, which is *not* implied by
     /// `-s --exit-code`.
     quick: bool,
+    /// `o->flags.find_copies_harder`, computed from the diff options the way
+    /// `diff_opt_find_copies()` does (a second `-C` sets it, `--find-copies-harder`
+    /// sets it outright, `--no-find-copies-harder` clears it). The walk needs it
+    /// because `ll_diff_tree_paths()` (tree-diff.c:519, :557) emits the *unchanged*
+    /// entries too when it is on, so `diffcore_rename()` can use an untouched blob as
+    /// a copy source.
+    find_copies_harder: bool,
     /// `diff_setup_done()`'s `diff_from_contents`: a whitespace-insensitive
     /// comparison or a `-I<regex>` was asked for, so a queued pair no longer proves
     /// the trees differ and `has_changes` is left clear at queue time.
@@ -423,9 +449,11 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
         reverse: false,
         exit_code: false,
         abbrev: hash.len_in_hex(),
+        abbrev_explicit: None,
         filter: ALL_STATUSES,
         filter_given: false,
         quick: false,
+        find_copies_harder: false,
         from_contents: false,
         format: Format::Raw,
         paths: Vec::new(),
@@ -457,6 +485,9 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
     // git's `diff_tree_tweak_rev`: the raw format is only the default while
     // `setup_revisions` left `diffopt.output_format` at zero.
     let mut format_explicit = false;
+    /// The length of `diff_args` when the last `--no-no-patch` was seen; every format
+    /// option before that point was cancelled and must not be replayed.
+    let mut formats_cleared_at: Option<usize> = None;
 
     // git scans the whole argument list for a literal `--` up front; when one is
     // present every argument before it must be a revision.
@@ -638,7 +669,33 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
                 "--shortstat" => opts.format = Format::ShortStat,
                 "--summary" => opts.format = Format::Summary,
                 "-s" | "--no-patch" => opts.format = Format::NoOutput,
+                // `OPT_SET_INT` without `PARSE_OPT_NONEG` (diff.c:6046): the `--no-`
+                // form assigns the unset value, an empty `output_format`, which
+                // `diff_tree_tweak_rev` then defaults back to the raw listing.
+                "--no-no-patch" => {
+                    opts.format = Format::Raw;
+                    // `output_format` is back to zero, so a format asked for *after*
+                    // this one is still the first, and `diff_tree_tweak_rev`'s raw
+                    // default applies again if none is. The replay list has to forget
+                    // the earlier format flags too, or `diff-pairs` would render one
+                    // this option has already cancelled.
+                    format_explicit = false;
+                    formats_cleared_at = Some(diff_args.len());
+                }
                 "--exit-code" => opts.exit_code = true,
+                // `OPT_BOOL(0, "exit-code", …)` (diff.c:6256) and
+                // `OPT_BOOL(0, "quiet", …)` (diff.c:6258) both take a `--no-` form.
+                // `--quiet`'s exit status comes from `diff_setup_done()` reading
+                // `flags.quick`, so clearing the quiet flag clears that too.
+                "--no-exit-code" => opts.exit_code = false,
+                "--no-quiet" => {
+                    if opts.quick {
+                        opts.exit_code = false;
+                        opts.format = Format::Raw;
+                    }
+                    opts.quick = false;
+                }
+                "--no-full-index" => {}
                 // `--quiet` is `-s` plus `--exit-code`: git still prints the
                 // commit-id line, only the diff body is suppressed.
                 "--quiet" => {
@@ -656,7 +713,10 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
                 }
                 // `cmd_diff_tree` starts from `opt->abbrev = 0` (full object names) and
                 // `--no-abbrev` puts it back there, so it is the standing default here.
-                "--no-abbrev" => opts.abbrev = hash.len_in_hex(),
+                "--no-abbrev" => {
+                    opts.abbrev = hash.len_in_hex();
+                    opts.abbrev_explicit = None;
+                }
                 // `--line-prefix=<s>` prefixes every emitted line, the commit-id line
                 // included; the diff body is prefixed by whoever renders it.
                 _ if a.starts_with("--line-prefix=") => {
@@ -672,6 +732,10 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
                     let n = git_strtoul(&a["--abbrev=".len()..]);
                     opts.abbrev =
                         n.clamp(MINIMUM_ABBREV as u64, hash.len_in_hex() as u64) as usize;
+                    // `o->abbrev` for `fill_metainfo()` (diff.c:4915), which a routed
+                    // patch needs: the raw listing uses `opts.abbrev`, the patch's
+                    // `index` line uses this.
+                    opts.abbrev_explicit = Some(opts.abbrev);
                 }
                 _ if a.starts_with("--diff-filter=") => {
                     match parse_diff_filter(&a["--diff-filter=".len()..]) {
@@ -839,6 +903,31 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
         opts.show_trees = false;
     }
 
+    // `diff_opt_find_copies()` (diff.c:5735) as a left-to-right scan: a `-C`/
+    // `--find-copies[=<n>]` that arrives with copy detection already on raises
+    // `find_copies_harder`, and the explicit spelling sets it on its own.
+    {
+        let mut copies = false;
+        for a in &diff_args {
+            let a = a.as_str();
+            if a == "-C" || a == "--find-copies" || a.starts_with("--find-copies=")
+                || (a.starts_with("-C") && a.len() > 2)
+            {
+                if copies {
+                    opts.find_copies_harder = true;
+                }
+                copies = true;
+            } else if a == "--find-copies-harder" {
+                opts.find_copies_harder = true;
+            } else if a == "--no-find-copies-harder" {
+                opts.find_copies_harder = false;
+            } else if a == "--no-renames" {
+                copies = false;
+                opts.find_copies_harder = false;
+            }
+        }
+    }
+
     // `diff_setup_done()` (diff.c:5282): a whitespace-insensitive comparison or a
     // `-I<regex>` means a queued pair no longer proves the trees differ, so
     // `diff_queue_change()` leaves `has_changes` clear and the walk cannot quit early.
@@ -859,6 +948,16 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
     // `combined_commit` needs the option list itself, not the routing decision below:
     // git's `diff_tree_combined` reads `opt->output_format` as a bitmask and can emit
     // a stat, a raw listing and a patch from one invocation.
+    if let Some(n) = formats_cleared_at {
+        let mut kept = Vec::with_capacity(diff_args.len());
+        for (idx, a) in diff_args.iter().enumerate() {
+            if idx < n && sets_output_format(a) {
+                continue;
+            }
+            kept.push(a.clone());
+        }
+        diff_args = kept;
+    }
     opts.diff_args = std::rc::Rc::new(diff_args.clone());
 
     // An option only `diff-pairs` can render switches the whole rendering pass over to
@@ -1318,7 +1417,7 @@ fn git_strtoul(s: &str) -> u64 {
 /// Confirmed against stock git 2.55: `0`, `5`, `+3`, `-0`, `08`, ` 5`, `\t5` accept;
 /// `v1`, `-1`, ``(empty), `3x`, `5 `(trailing space), `0x5`, and an overflowing run of
 /// digits reject.
-fn parse_nonneg_int(s: &str) -> Option<i64> {
+pub(crate) fn parse_nonneg_int(s: &str) -> Option<i64> {
     let b = s.as_bytes();
     let mut i = 0;
     while i < b.len() && b[i].is_ascii_whitespace() {
@@ -1462,6 +1561,10 @@ fn is_diff_tree_option(a: &str) -> bool {
         "--diff-merges",
         "--no-diff-merges",
         "--combined-all-paths",
+        // `--no-no-patch` empties `output_format`, and this module computes the final
+        // format itself (and inserts `--raw` into the route when none survives). Left
+        // in the replay it would clear the route's own format again on the far side.
+        "--no-no-patch",
         "--no-commit-id",
         "--always",
         "--merge-base",
@@ -1534,9 +1637,16 @@ fn format_forces_recursion(a: &str) -> bool {
         "--cumulative",
         "-X",
         "--check",
-        "--name-only",
-        "--name-status",
+        // `diff_opt_binary()` (diff.c:5730) runs `enable_patch_output()`, so
+        // `DIFF_FORMAT_PATCH` is set and `diff_setup_done()` forces recursion for it
+        // like any other patch. Without this, `diff-tree <commit> --binary` handed
+        // `diff-pairs` the unrecursed `040000` entries and died on them.
+        "--binary",
     ];
+    // `--name-only` and `--name-status` are deliberately absent: `DIFF_FORMAT_NAME`
+    // and `DIFF_FORMAT_NAME_STATUS` are not in `diff_setup_done()`'s recursion set
+    // (diff.c:5318-5325), and stock `git diff-tree <commit> --name-status` really does
+    // report the two changed top-level trees rather than the files under them.
     const PREFIX: &[&str] = &["--stat=", "--stat-", "--dirstat=", "--dirstat-by-file=", "-U", "-X"];
     EXACT.contains(&a) || PREFIX.iter().any(|p| a.starts_with(p))
 }
@@ -1575,6 +1685,7 @@ fn needs_pairs(a: &str) -> bool {
         "--find-copies-harder",
         "--irreversible-delete",
         "--no-renames",
+        "--no-find-copies-harder",
         "--rename-empty",
         "--no-rename-empty",
         // whitespace-insensitive comparison, which also drops pairs
@@ -1587,6 +1698,21 @@ fn needs_pairs(a: &str) -> bool {
         // hunk shaping
         "-W",
         "--function-context",
+        "--no-function-context",
+        // `--ignore-blank-lines` drops change groups from the rendered body *and*
+        // from the raw listing (`xdl_mark_ignorable_lines()`), so it belongs to the
+        // side that reads content.
+        "--ignore-blank-lines",
+        // word diff and coloured moves: `diff-pairs` owns both renderers (its
+        // `MoveWordOpts`/`ExtraPaint` pass), so routing is what makes them work
+        // rather than what hides them.
+        "--word-diff",
+        "--color-moved",
+        "--no-color-moved",
+        "--no-color-moved-ws",
+        // `--no-compact-summary` is `--compact-summary`'s `OPT_BOOL` negation; it
+        // reaches the same stat renderer.
+        "--no-compact-summary",
         // pickaxe and ordering
         "--pickaxe-all",
         "--pickaxe-regex",
@@ -1607,6 +1733,10 @@ fn needs_pairs(a: &str) -> bool {
         "--stat-",
         "--dirstat=",
         "--dirstat-by-file=",
+        "--word-diff-regex=",
+        "--color-words=",
+        "--color-moved=",
+        "--color-moved-ws=",
         "--inter-hunk-context=",
         "--line-prefix=",
         "--find-renames=",
@@ -1651,6 +1781,10 @@ fn is_ignorable(a: &str) -> bool {
         "--no-indent-heuristic",
         "--expand-tabs",
         "--no-expand-tabs",
+        // `--no-text` clears `o->flags.text`, `--no-follow` clears `follow_renames`;
+        // both start clear here, so neither can change any output.
+        "--no-text",
+        "--no-follow",
         "--function-context",
         "-W",
         "--full-index",
@@ -1730,7 +1864,6 @@ fn is_known_unsupported(a: &str) -> bool {
         "--ignore-space-at-eol",
         "--ignore-space-change",
         "--ignore-all-space",
-        "--ignore-blank-lines",
         // commit formatting, combined diffs and revision walking
         "--stdin",
         // `--oneline` is `--pretty=oneline --abbrev-commit`; the abbreviated commit
@@ -1744,14 +1877,8 @@ fn is_known_unsupported(a: &str) -> bool {
         "--full-diff",
         "--max-depth",
         "--max-count",
-        // colour and word diff variants that need a rendered body
-        "--word-diff",
-        "--color-moved",
-        "--no-color-moved",
-        // `--no-color-moved-ws` is `OPT_CALLBACK_F(..., PARSE_OPT_NONEG)`'s twin
-        // in `diff_opt_color_moved_ws()`: git takes it and clears the mode, so it
-        // is a recognised flag here rather than an unknown one.
-        "--no-color-moved-ws",
+        // `--anchored=<text>` needs the anchored variant of the patience algorithm,
+        // which is not ported anywhere in this tree.
         "--anchored",
     ];
     const PREFIX: &[&str] = &[
@@ -1765,8 +1892,6 @@ fn is_known_unsupported(a: &str) -> bool {
         "--submodule=",
         "--ignore-submodules=",
         "--ignore-matching-lines=",
-        "--color-moved=",
-        "--color-moved-ws=",
         "--line-prefix=",
         "--anchored=",
         "--pretty=",
@@ -2424,6 +2549,28 @@ fn walk(
                 i += 1;
                 j += 1;
                 if a.mode == b.mode && a.id == b.id {
+                    // `ll_diff_tree_paths()` (tree-diff.c:519): with
+                    // `find_copies_harder` the `goto skip_emit_t_tp` is bypassed and
+                    // the identical entry is emitted anyway, so `diffcore_rename()`
+                    // gets an untouched blob to copy *from*. Its own queue rebuild
+                    // drops whichever unmodified pairs stayed unmodified, so nothing
+                    // extra is ever printed. An identical *tree* is only worth
+                    // descending into, and only when the walk is recursive.
+                    if !opts.find_copies_harder {
+                        continue;
+                    }
+                    let path = join(prefix, a.name.as_bstr());
+                    if a.mode.is_tree() {
+                        if opts.recurse && descend(&path, opts) {
+                            walk(repo, Some(a.id), Some(b.id), path.as_bstr(), opts, out)?;
+                        }
+                    } else if selects(&path, false, opts) {
+                        out.push(Change {
+                            old: Some(side(a)),
+                            new: Some(side(b)),
+                            path,
+                        });
+                    }
                     continue;
                 }
                 let path = join(prefix, a.name.as_bstr());
@@ -2551,7 +2698,18 @@ fn render_all(
     // patch, diffstat, dirstat, whitespace and rename format.
     if let Some(args) = &opts.route {
         let status =
-            super::diff_pairs::render_raw_stream(args, Some(raw_pair_stream(changes)), Some(out))?;
+            super::diff_pairs::render_raw_stream(
+                args,
+                Some(raw_pair_stream(changes)),
+                Some(out),
+                super::diff_pairs::RouteCtx {
+                    abbrev: opts.abbrev_explicit,
+                    // An unrecursed walk queues `040000` entries, and git keeps them:
+                    // only the content formats force recursion, so `diff-tree <commit>
+                    // -M --name-status` really does list the changed top-level trees.
+                    allow_trees: true,
+                },
+            )?;
         return Ok(status.code());
     }
     match opts.format {

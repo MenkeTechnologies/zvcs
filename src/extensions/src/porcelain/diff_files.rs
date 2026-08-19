@@ -109,9 +109,17 @@
 //!     reproduces `xdl_get_hunk()`'s handling of it.
 //!   * `--binary` for content that is actually binary (the `GIT binary patch`
 //!     literal/delta encoding is not produced).
-//!   * `-M`/`--find-renames` rename *pairing* (an intent-to-add worktree file matched
-//!     to a staged deletion): accepted as a no-op, so such a pair is still reported as
-//!     a separate `D`+`A` rather than a single `R`.
+//!   * `-M`/`-C`/`-B` rename, copy and rewrite *pairing*. Accepted and not applied, so
+//!     a pair git collapses is still reported as a separate `D`+`A`. This is a real
+//!     divergence, not a shape `diff-files` cannot reach: with an intent-to-add
+//!     destination (`git add -N <new>` after `git rm --cached <old>`) stock 2.55.0
+//!     answers `-M` with `R097 <old> <new>`, measured. The shared
+//!     `diffcore-rename.c`/`diffcore-break.c` port in [`super::diffcore_rename`] is
+//!     what `diff-index` now runs over its own walk; this module's `Delta` still
+//!     carries one path per record and its renderers still assume it, so wiring the
+//!     same pass here is the outstanding work rather than a missing algorithm.
+//!     `-C` alone has one observable effect that *is* reproduced: `diffcore_rename()`
+//!     hashes every copy destination, so an added path shows its real object id.
 //!
 //! `--submodule[=<format>]` is honored in full: `short` renders the gitlink pair as the
 //! synthetic `Subproject commit <oid>` blobs, and `log`/`diff` take `builtin_diff()`'s
@@ -614,6 +622,12 @@ enum Fatal {
     VerifyFilename(String),
     /// `fatal: '<rest>': not an integer` from `-n<rest>`, exit 128.
     NotAnInteger(String),
+    /// `fatal: '<v>': not a non-negative integer`, exit 128 — `strtol_i`'s failure
+    /// inside `--expand-tabs=<n>` (revision.c:2581-2582).
+    NotNonNegInteger(String),
+    /// `fatal: invalid value for '--diff-merges': '<v>'`, exit 128 —
+    /// `set_diff_merges()`'s `die()` (diff-merges.c:94).
+    DiffMergesValue(String),
     /// `error: -n requires an argument`, exit 128.
     MissingArgument(&'static str),
     /// `fatal: empty string is not a valid pathspec…`, exit 128.
@@ -732,6 +746,12 @@ impl Fatal {
             }
             Fatal::NotAnInteger(v) => {
                 let _ = writeln!(err, "fatal: '{v}': not an integer");
+            }
+            Fatal::NotNonNegInteger(v) => {
+                let _ = writeln!(err, "fatal: '{v}': not a non-negative integer");
+            }
+            Fatal::DiffMergesValue(v) => {
+                let _ = writeln!(err, "fatal: invalid value for '--diff-merges': '{v}'");
             }
             Fatal::MissingArgument(flag) => {
                 let _ = writeln!(err, "error: {flag} requires an argument");
@@ -1288,8 +1308,10 @@ const ACCEPTED_NOOP: &[&str] = &[
     "--no-notes",
     "--ita-invisible-in-index",
     "--ita-visible-in-index",
-    // Rename/copy/break detection never produces a rename for diff-files: the
-    // destination side is the worktree file at the same path.
+    // `--no-renames` is inert because detection is off to begin with. The three below
+    // it are *not* inert in stock git — an intent-to-add destination lets `diff-files
+    // -M` report an `R` — and are listed here only because this module's renderers
+    // cannot carry a second path yet; see the module header.
     "--no-renames",
     "--rename-empty",
     "--no-rename-empty",
@@ -1299,6 +1321,20 @@ const ACCEPTED_NOOP: &[&str] = &[
     "--find-renames",
     // diff-files' "stay quiet about removed files"; zvcs never warns about them.
     "-q",
+    // `--expand-tabs`/`--no-expand-tabs` (revision.c:2575-2578) set only
+    // `revs->expand_tabs_in_log`, which nothing but `pretty.c`'s commit-message
+    // indenter reads (pretty.c:2235, 2281). `diff-files` never formats a commit
+    // message, so both spellings are inert — measured against stock 2.55.0.
+    "--expand-tabs",
+    "--no-expand-tabs",
+    // `--no-text` clears `o->flags.text` and `--no-follow` clears `follow_renames`;
+    // this command starts with both clear, so neither can change any output.
+    "--no-text",
+    "--no-follow",
+    // `--no-find-copies-harder` lowers a flag that is never raised here, and
+    // `--no-function-context` turns off a hunk shaping this command already omits.
+    "--no-find-copies-harder",
+    "--no-function-context",
 ];
 
 /// `DIFF_PICKAXE_KIND_S`: a `-S<string>` search was requested.
@@ -1312,7 +1348,6 @@ const PICKAXE_KIND_OBJFIND: u8 = 4;
 const ACCEPTED_NOOP_VALUED: &[&str] = &[
     "--anchored=",
     "--submodule=",
-    "--diff-merges=",
     "-l",
     "--break-rewrites=",
     "--find-renames=",
@@ -1382,6 +1417,9 @@ fn classify(
         "--shortstat" => opts.fmt |= F_SHORTSTAT,
         "--summary" => opts.fmt |= F_SUMMARY,
         "--check" => opts.fmt |= F_CHECKDIFF,
+        // `diff_opt_compact_summary()`'s `unset` branch (diff.c:5663) clears
+        // `stat_with_summary` and nothing else, so it never turns a format on.
+        "--no-compact-summary" => opts.compact_summary = false,
         "--compact-summary" => {
             opts.fmt |= F_DIFFSTAT;
             opts.compact_summary = true;
@@ -1401,14 +1439,31 @@ fn classify(
             opts.fmt &= !F_ALL_FORMATS;
             opts.fmt |= F_NO_OUTPUT;
         }
+        // `OPT_SET_INT` carries no `PARSE_OPT_NONEG`, so `--no-no-patch` assigns the
+        // unset value: an empty `output_format`, which `cmd_diff_files()` then defaults
+        // back to the raw listing.
+        "--no-no-patch" => opts.fmt &= !(F_ALL_FORMATS | F_NO_OUTPUT),
         "-z" => opts.nul = true,
         "--abbrev" => opts.abbrev = Some(None),
         "--no-abbrev" => opts.abbrev = None,
         "--exit-code" => opts.exit_code = true,
+        // `OPT_BOOL(0, "exit-code", …)` (diff.c:6256) and `OPT_BOOL(0, "quiet", …)`
+        // (diff.c:6258) both take a `--no-` form. `--quiet`'s own contribution to the
+        // exit status is `diff_setup_done()` reading `flags.quick`, so turning the
+        // quiet flag back off takes the forced `--exit-code` with it while leaving an
+        // explicit one alone.
+        "--no-exit-code" => opts.exit_code = false,
         "--quiet" => {
             opts.exit_code = true;
             *quiet = true;
         }
+        "--no-quiet" => {
+            if *quiet {
+                opts.exit_code = false;
+            }
+            *quiet = false;
+        }
+        "--no-full-index" => opts.full_index = false,
         "-R" => opts.reverse = true,
         "-D" | "--irreversible-delete" => opts.irreversible_delete = true,
         "--no-prefix" => {
@@ -1440,6 +1495,25 @@ fn classify(
         "--cc" => {
             opts.combine_merges = true;
             opts.dense_combined = true;
+            opts.merges_need_diff = true;
+        }
+        // `diff_merges_parse_opts()` (diff-merges.c:119). `-m` is the default setup
+        // with `merges_need_diff` explicitly cleared again, so it leaves the raw
+        // format in place; `--no-diff-merges` is `set_none()`, which clears the lot.
+        // Neither combines, which is what a conflicted path's `U`+`M` raw records
+        // depend on.
+        "-m" | "--no-diff-merges" => {
+            opts.combine_merges = false;
+            opts.dense_combined = false;
+            opts.merges_need_diff = false;
+        }
+        // `--dd` is `set_first_parent()` and `--remerge-diff` is
+        // `set_remerge_diff()`; both go through `common_setup()`, so neither
+        // combines but both set `merges_need_diff` and force the patch format —
+        // which `diff_merges_set_dense_combined_if_unset()` then densifies.
+        "--dd" | "--remerge-diff" => {
+            opts.combine_merges = false;
+            opts.dense_combined = false;
             opts.merges_need_diff = true;
         }
         "--full-index" => opts.full_index = true,
@@ -1555,6 +1629,39 @@ fn classify_valued(repo: &gix::Repository, s: &str, opts: &mut Opts) -> Result<F
         }
         return Ok(Flag::Handled);
     }
+    // `set_diff_merges()` (diff-merges.c:89) resolves the value through
+    // `func_by_opt()` and dies on an unknown one.
+    if let Some(v) = s.strip_prefix("--diff-merges=") {
+        match v {
+            "off" | "none" => {
+                opts.combine_merges = false;
+                opts.dense_combined = false;
+                opts.merges_need_diff = false;
+            }
+            "c" | "combined" => {
+                opts.combine_merges = true;
+                opts.dense_combined = false;
+                opts.merges_need_diff = true;
+            }
+            "cc" | "dense-combined" => {
+                opts.combine_merges = true;
+                opts.dense_combined = true;
+                opts.merges_need_diff = true;
+            }
+            // `separate`, `first-parent`/`1`, `remerge`/`r` and `on`/`m` all run
+            // `common_setup()` without `set_combined()`, so they differ only in
+            // fields a worktree diff has no walk to apply them to.
+            "separate" | "1" | "first-parent" | "r" | "remerge" | "m" | "on" => {
+                opts.combine_merges = false;
+                opts.dense_combined = false;
+                opts.merges_need_diff = true;
+            }
+            _ => {
+                return Err(Fatal::DiffMergesValue(v.to_owned()));
+            }
+        }
+        return Ok(Flag::Handled);
+    }
     if let Some(v) = s.strip_prefix("--find-copies=") {
         crate::diffopt::check_rename_score("find-copies", v)
             .map_err(|msg| Fatal::OptionError(format!("error: {msg}")))?;
@@ -1564,6 +1671,15 @@ fn classify_valued(repo: &gix::Repository, s: &str, opts: &mut Opts) -> Result<F
     if let Some(v) = s.strip_prefix("--find-renames=") {
         crate::diffopt::check_rename_score("find-renames", v)
             .map_err(|msg| Fatal::OptionError(format!("error: {msg}")))?;
+        return Ok(Flag::Handled);
+    }
+    // `--expand-tabs=<n>`: the value is inert here (see `ACCEPTED_NOOP`) but
+    // `strtol_i` still validates it at option-parse time (revision.c:2579-2583) and
+    // dies fatally on anything that is not a non-negative integer.
+    if let Some(v) = s.strip_prefix("--expand-tabs=") {
+        if super::diff_tree::parse_nonneg_int(v).is_none() {
+            return Err(Fatal::NotNonNegInteger(v.to_owned()));
+        }
         return Ok(Flag::Handled);
     }
     if let Some(v) = s.strip_prefix("--break-rewrites=") {

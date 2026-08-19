@@ -1551,6 +1551,13 @@ fn last_non_space_char(s: &[u8]) -> u8 {
     s.iter().rev().copied().find(|&c| !is_space(c)).unwrap_or(0)
 }
 
+/// `strbuf_rtrim()`, in place.
+fn rtrim(s: &mut Vec<u8>) {
+    while s.last().is_some_and(|&c| is_space(c)) {
+        s.pop();
+    }
+}
+
 /// `strbuf_trim()`.
 fn trim(s: &[u8]) -> Vec<u8> {
     let mut start = 0;
@@ -1874,12 +1881,35 @@ pub(crate) fn format_pretty(message: &[u8], pretty: &PrettyOpts) -> Vec<u8> {
     for item in &items {
         let Some(token) = &item.token else {
             // A non-trailer line survives only when `only` is off, and it prints
-            // as it stood.
+            // as it stood. `format_trailers()` (trailer.c) treats the separator
+            // as a *joiner* here exactly as it does for a real trailer — it goes
+            // in **front** of every item but the first, and the accumulated
+            // output is right-trimmed afterwards:
+            //
+            // ```c
+            // } else if (!opts->only_trailers) {
+            //         if (opts->separator && out->len != origlen)
+            //                 strbuf_addbuf(out, opts->separator);
+            //         strbuf_addstr(out, item->value);
+            //         if (opts->separator)
+            //                 strbuf_rtrim(out);
+            //         else
+            //                 strbuf_addch(out, '\n');
+            // }
+            // ```
+            //
+            // Appending the separator after the value instead puts it in the
+            // wrong place *and* emits a trailing one, which is only invisible
+            // while the block has no non-trailer lines in it.
             if !pretty.only {
+                if let Some(sep) = &pretty.separator {
+                    if !out.is_empty() {
+                        out.extend_from_slice(sep);
+                    }
+                }
                 out.extend_from_slice(&item.value);
                 match &pretty.separator {
-                    Some(sep) if !out.is_empty() => out.extend_from_slice(sep),
-                    Some(_) => {}
+                    Some(_) => rtrim(&mut out),
                     None => out.push(b'\n'),
                 }
             }

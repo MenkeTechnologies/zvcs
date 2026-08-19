@@ -31,9 +31,37 @@
 //! subprocess, as git does, so its options stay on one implementation.
 //!
 //! `%(trailers)` / `%(contents:trailers)` reuse `trailer.c`'s parser out of
-//! [`super::interpret_trailers`] and reproduce `format_trailers_from_commit`'s
-//! verbatim-block fast path; the option list (`:only`, `:unfold`, `:key=`, …)
-//! re-renders the parsed items instead and is refused.
+//! [`super::interpret_trailers`], including both halves of
+//! `format_trailers_from_commit`: the verbatim-block fast path when no
+//! rendering option is set, and `format_trailers()` re-rendering the parsed
+//! items when one is. The option list is `format_set_trailers_options()`
+//! (pretty.c:1288-1330) — `only`, `unfold`, `keyonly`, `valueonly`, `key=`,
+//! `separator=`, `key_value_separator=` — parsed by [`parse_trailer_opts`],
+//! which keeps git's two distinct rejections and its habit of blaming the text
+//! *after* the option that consumed it.
+//!
+//! Dates go through [`crate::showdate`], this crate's port of `show_date()` and
+//! `parse_date_format()`, so `%(authordate:<fmt>)` takes the whole `--date=`
+//! vocabulary: the fixed shapes, `relative`, `human`, any `<fmt>-local`, and
+//! `format:<strftime>` / `format-local:<strftime>`, whose format reaches the
+//! platform `strftime(3)` with git's own `%s`/`%z`/`%Z` substitutions applied
+//! first. `grab_date()` re-types a date atom as `FIELD_STR` the moment a format
+//! is spelled out, so `--sort=authordate` compares seconds while
+//! `--sort=authordate:default` compares the rendered string.
+//!
+//! The contents atoms are `grab_sub_body_contents()`'s arms, and they are not
+//! interchangeable: `%(body)` (`C_BODY_DEP`) keeps a trailing signature block
+//! and `%(contents:body)` (`C_BODY`) does not, `%(contents:signature)` is that
+//! block alone, `%(contents:size)` measures from the subject rather than from
+//! the end of the header, and `%(contents:lines=<n>)` indents continued lines by
+//! four spaces. A commit's signature lives in a `gpgsig` header rather than in
+//! the message, so those three signature-aware spans only differ on a signed
+//! *tag*.
+//!
+//! `%(authorname:mailmap)` / `%(authoremail:…mailmap…)` rewrite the header line
+//! through `.mailmap` before slicing it, as `apply_mailmap_to_header()` does.
+//! The email options are a bit set, not alternatives: `mailmap` alone keeps the
+//! angle brackets, and `trim,mailmap` is both.
 //!
 //! Every `%(signature)` option comes from [`crate::gitsig`], this crate's port
 //! of `gpg-interface.c`: it runs the checker git runs and keeps the whole of
@@ -42,15 +70,19 @@
 //! the `VALIDSIG` line's fields. On an unsigned object every option renders what
 //! a zeroed `signature_check` would.
 //!
-//! Not covered — rejected rather than silently producing divergent output:
-//! `%(deltabase)`, and `%(is-base:<committish>)` for a committish that resolves.
-//! Those names are still recognised as *valid* git atoms, so an unknown field
-//! name is reported the way git reports it, and the refusal keeps this port's
-//! own voice and exit 1 rather than borrowing git's `fatal:`/128 — see
-//! [`report_atom_error`]. Their *parse-time* rejections are a different thing
-//! and are git's own `die()`s, reproduced exactly: `%(deltabase:<anything>)`,
-//! `%(is-base)` with no operand, and `%(is-base:<committish>)` whose operand
-//! does not peel. `%(rest)` is refused the way git refuses it for this command.
+//! `%(deltabase)` is `oid_object_info_extended()`'s `OBJECT_INFO_DELTA_BASE`:
+//! the pack entry's base for a deltified object — read from the header for a
+//! `OBJ_REF_DELTA` and resolved through the pack index for an `OBJ_OFS_DELTA` —
+//! and the null oid for anything else, loose objects included.
+//!
+//! `%(is-base:<committish>)` is `filter_is_base()` (ref-filter.c:3236), a
+//! whole-array pass that runs before the sort and marks exactly one ref per
+//! atom. Its `get_branch_base_for_tip()` walk needs commit-graph generation
+//! numbers; with no commit-graph file present they are computed the way
+//! `ensure_generations_valid()` computes them, as corrected commit dates.
+//!
+//! `%(rest)` is refused the way git refuses it for this command — that is git's
+//! own `reject_atom`, not a gap.
 //!
 //! `%(ahead-behind:<committish>)` is computed in git's two stages, not one: the
 //! atom's operand is peeled when the format is parsed, and then
@@ -170,6 +202,12 @@ enum Field {
     ObjectName(NameLen),
     ObjectType,
     ObjectSize,
+    /// `%(is-base:<committish>)` — the operand, kept so the winning ref can
+    /// render `(<committish>)`, alongside the commit it resolved to.
+    IsBase(String, ObjectId),
+    /// `%(deltabase)` — the object this one is stored as a delta against inside
+    /// its pack, or the null oid when it is not deltified (or not packed).
+    DeltaBase,
     /// `%(tree)` — a commit's tree, with `%(objectname)`-style abbreviation.
     Tree(NameLen),
     /// `%(parent)` — a commit's parents, space-joined, each abbreviated per the
@@ -306,35 +344,58 @@ enum Who {
 enum PersonPart {
     /// The whole `Name <email> <secs> <tz>` tuple.
     Full,
-    Name,
-    Email,
-    EmailTrim,
-    EmailLocal,
-    Date(DateFmt),
+    /// `%(authorname[:mailmap])`, git's `N_RAW` / `N_MAILMAP`.
+    Name { mailmap: bool },
+    /// `%(authoremail[:<opts>])`, git's `EO_*` bit set.
+    Email(EmailOpt),
+    /// `%(authordate[:<fmt>])`. `None` is the *no colon at all* case, which is
+    /// the only one git leaves as `FIELD_TIME` for sorting (`grab_date()` sets
+    /// `v->atom->type = FIELD_STR` the moment a format is spelled out, even
+    /// `:default`).
+    Date(Option<crate::showdate::DateMode>),
 }
 
-/// The date renderings `%(*date[:<fmt>])` understands.
-#[derive(Clone, Copy, PartialEq)]
-enum DateFmt {
-    Default,
-    Short,
-    Iso,
-    IsoStrict,
-    Rfc2822,
-    Unix,
-    Raw,
-    Relative,
+/// `email_atom_option_parser`'s bit set: `EO_RAW` is the empty one.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+struct EmailOpt(u8);
+
+impl EmailOpt {
+    const TRIM: u8 = 1 << 0;
+    const LOCALPART: u8 = 1 << 1;
+    const MAILMAP: u8 = 1 << 2;
+
+    fn has(self, bit: u8) -> bool {
+        self.0 & bit != 0
+    }
 }
 
-/// Which slice of a commit/tag message a contents atom extracts.
+/// Which slice of a commit/tag message a contents atom extracts — git's
+/// `enum contents_option`, whose arms are *not* interchangeable: `%(body)` and
+/// `%(contents:body)` are different options (`C_BODY_DEP` vs `C_BODY`) and
+/// differ on whether a signature block belongs to the body.
 #[derive(Clone)]
 enum ContentPart {
-    All,
+    /// `%(contents)` — `C_BARE`: the message from the subject on, signature
+    /// included.
+    Bare,
+    /// `%(subject)` — `C_SUB`.
     Subject,
+    /// `%(subject:sanitize)` — `C_SUB_SANITIZE`.
+    SubjectSanitize,
+    /// `%(body)` — `C_BODY_DEP`: everything after the subject, signature
+    /// included. The `_DEP` in git's name is "deprecated", not "dependent".
+    BodyDep,
+    /// `%(contents:body)` — `C_BODY`: the same span with the signature cut off.
     Body,
+    /// `%(contents:size)` — `C_LENGTH`, the length of the whole message from the
+    /// subject on.
     Size,
-    /// `%(trailers)` / `%(contents:trailers)`, git's `C_TRAILERS`.
-    Trailers,
+    /// `%(contents:signature)` — `C_SIG`.
+    Sig,
+    /// `%(contents:lines=<n>)` — `C_LINES`.
+    Lines(u32),
+    /// `%(trailers[:<opts>])` / `%(contents:trailers[:<opts>])` — `C_TRAILERS`.
+    Trailers(super::interpret_trailers::PrettyOpts),
 }
 
 /// One `%(...)` atom: an optional leading `*` (evaluate against the peeled
@@ -406,6 +467,10 @@ struct RefInfo {
     /// git's `REF_ISPACKED`: the ref has no loose file, so it was read out of
     /// `packed-refs`. Feeds `%(flag)`.
     packed: bool,
+    /// `ref_array_item.is_base`: the `%(is-base:<committish>)` operands that
+    /// chose *this* ref, filled in by [`filter_is_base`] before sorting. Every
+    /// other ref keeps an empty list and renders those atoms empty.
+    is_base: Vec<String>,
 }
 
 /// Everything `parse_atom` needs beyond the atom text itself.
@@ -462,19 +527,245 @@ fn unported_atom(msg: impl Into<String>) -> AtomError {
     }
 }
 
-/// `trailers_atom_parser`'s argument handling, reduced to the form this module
-/// renders: the argument-less one, where `format_trailers_from_commit` takes its
-/// fast path and copies the message's trailer block out verbatim. Every option
-/// (`only`, `unfold`, `key=`, `separator=`, `keyonly`, `valueonly`,
-/// `key_value_separator=`) instead re-renders the parsed items, which is
-/// `format_trailers()`'s job and is not wired up here.
-fn trailers_bare(name: &str, arg: Option<&str>) -> std::result::Result<(), AtomError> {
-    match arg {
-        None => Ok(()),
-        Some(a) => Err(unported_atom(format!(
-            "the %({name}) option list {a:?} is not ported: only the argument-less form, \
-             which copies the message's trailer block verbatim, is"
-        ))),
+/// `strtoul_ui()` (git-compat-util.h:962-976): a `10`-base unsigned int, with
+/// git's own extra rejections — any `-` anywhere is refused outright (rather
+/// than wrapping the way `strtoul` would), the whole string must be consumed,
+/// and the value must fit an `unsigned int`.
+fn strtoul_ui(s: &str) -> Option<u32> {
+    if s.contains('-') {
+        return None;
+    }
+    // `strtoul` skips leading whitespace and allows one leading `+`.
+    let t = s.trim_start_matches(|c: char| c.is_ascii_whitespace());
+    let t = t.strip_prefix('+').unwrap_or(t);
+    if t.is_empty() || !t.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    t.parse::<u32>().ok()
+}
+
+/// `git_parse_maybe_bool()` (parse.c:166-192) restricted to what a placeholder
+/// argument can carry: the three true and three false spellings, then any
+/// integer (non-zero is true). `None` is git's `-1`.
+///
+/// Distinct from [`maybe_bool`], which is `match_atom_bool_arg`'s much narrower
+/// `true`/`false`-only test — `%(describe:tags=yes)` and `%(trailers:only=yes)`
+/// really do disagree.
+fn git_parse_maybe_bool(value: Option<&str>) -> Option<bool> {
+    let Some(v) = value else { return Some(true) };
+    if v.is_empty() {
+        return Some(false);
+    }
+    for (words, answer) in [(["true", "yes", "on"], true), (["false", "no", "off"], false)] {
+        if words.iter().any(|w| w.eq_ignore_ascii_case(v)) {
+            return Some(answer);
+        }
+    }
+    v.parse::<i64>().ok().map(|n| n != 0)
+}
+
+/// `match_placeholder_arg_value()` (pretty.c:1195-1224): peel `<candidate>`,
+/// optionally `=<value>`, off the head of a `,`-separated list that ends at `)`.
+///
+/// `Some((value, rest))` on a match, where `value` is `None` for a bare option
+/// and the value itself runs to the next `,` or `)`. A name that is a *prefix*
+/// of the text but is not followed by `=`, `,` or `)` does not match at all,
+/// which is what keeps `only` from claiming `onlyx`.
+fn match_placeholder<'a>(to_parse: &'a str, candidate: &str) -> Option<(Option<&'a str>, &'a str)> {
+    let p = to_parse.strip_prefix(candidate)?;
+    let (value, p) = match p.strip_prefix('=') {
+        Some(v) => {
+            let len = v.find([',', ')']).unwrap_or(v.len());
+            (Some(&v[..len]), &v[len..])
+        }
+        None => {
+            if !p.starts_with(',') && !p.starts_with(')') {
+                return None;
+            }
+            (None, p)
+        }
+    };
+    if let Some(rest) = p.strip_prefix(',') {
+        return Some((value, rest));
+    }
+    if p.starts_with(')') {
+        return Some((value, p));
+    }
+    None
+}
+
+/// Which boolean `%(trailers:...)` flag a name matched.
+#[derive(Clone, Copy)]
+enum Flag {
+    Only,
+    Unfold,
+    KeyOnly,
+    ValueOnly,
+}
+
+/// `format_set_trailers_options()` (pretty.c:1288-1330), as reached from
+/// `trailers_atom_parser` (ref-filter.c:570-610).
+///
+/// git appends a `)` to the argument and parses until it, so the terminator is
+/// part of the grammar rather than of the caller's string; that is reproduced
+/// here so a value stops at `,` or `)` exactly as it does there.
+///
+/// The two failure messages are distinct and both are git's:
+///
+///   * `key` with no `=<value>` is `expected %(trailers:key=<value>)`;
+///   * anything else is `unknown %(trailers) argument: <text>`, where the text
+///     is `strcspn(*arg, ",)")` of whatever is left *after* the options that did
+///     match — empty when a recognised option was given an unparseable boolean.
+fn parse_trailer_opts(
+    arg: Option<&str>,
+) -> std::result::Result<super::interpret_trailers::PrettyOpts, AtomError> {
+    let mut opts = super::interpret_trailers::PrettyOpts::default();
+    let Some(arg) = arg else { return Ok(opts) };
+
+    let owned = format!("{arg})");
+    let mut to_parse = owned.as_str();
+    loop {
+        if to_parse.starts_with(')') {
+            return Ok(opts);
+        }
+        if let Some((value, rest)) = match_placeholder(to_parse, "key") {
+            let Some(value) = value else {
+                return Err(fatal_atom("expected %(trailers:key=<value>)"));
+            };
+            // A key spelled with its separator attached matches the same
+            // trailer; git shortens the comparison length rather than the text.
+            let key = value.strip_suffix(':').unwrap_or(value);
+            opts.keys.push(key.as_bytes().to_vec());
+            opts.only = true;
+            to_parse = rest;
+            continue;
+        }
+        if let Some((value, rest)) = match_placeholder(to_parse, "separator") {
+            opts.separator = Some(expand_string_arg(value.unwrap_or("")));
+            to_parse = rest;
+            continue;
+        }
+        if let Some((value, rest)) = match_placeholder(to_parse, "key_value_separator") {
+            opts.key_value_separator = Some(expand_string_arg(value.unwrap_or("")));
+            to_parse = rest;
+            continue;
+        }
+
+        // `match_placeholder_bool_arg()` (pretty.c:1226-1251) for the four flags.
+        // A recognised name consumes its text *before* its value is judged — git
+        // advances `*arg` inside `match_placeholder_arg_value` and only then
+        // fails on the boolean — so `%(trailers:only=bogus)` reports an empty
+        // argument name, taken from what is left after `only=bogus`.
+        let bools: [(&str, Flag); 4] = [
+            ("only", Flag::Only),
+            ("unfold", Flag::Unfold),
+            ("keyonly", Flag::KeyOnly),
+            ("valueonly", Flag::ValueOnly),
+        ];
+        let hit = bools
+            .into_iter()
+            .find_map(|(name, flag)| match_placeholder(to_parse, name).map(|m| (flag, m)));
+        let Some((flag, (value, rest))) = hit else {
+            return Err(unknown_trailer_arg(to_parse));
+        };
+        to_parse = rest;
+        let Some(v) = git_parse_maybe_bool(value) else {
+            return Err(unknown_trailer_arg(to_parse));
+        };
+        match flag {
+            Flag::Only => opts.only = v,
+            Flag::Unfold => opts.unfold = v,
+            Flag::KeyOnly => opts.keyonly = v,
+            Flag::ValueOnly => opts.valueonly = v,
+        }
+    }
+}
+
+/// `strbuf_addf(err, _("unknown %%(trailers) argument: %s"), invalid_arg)` with
+/// `invalid_arg = xstrndup(*arg, strcspn(*arg, ",)"))`.
+fn unknown_trailer_arg(rest: &str) -> AtomError {
+    let len = rest.find([',', ')']).unwrap_or(rest.len());
+    fatal_atom(format!("unknown %(trailers) argument: {}", &rest[..len]))
+}
+
+/// `expand_string_arg()` (pretty.c:1267-1285): the `%n`, `%xNN` and `%%` escapes
+/// a separator value may use. Anything else keeps its literal `%`.
+fn expand_string_arg(value: &str) -> Vec<u8> {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'%' {
+            out.push(bytes[i]);
+            i += 1;
+            continue;
+        }
+        match bytes.get(i + 1) {
+            Some(b'%') => {
+                out.push(b'%');
+                i += 2;
+            }
+            Some(b'n') => {
+                out.push(b'\n');
+                i += 2;
+            }
+            Some(b'x') => {
+                let hex = bytes
+                    .get(i + 2..i + 4)
+                    .and_then(|h| std::str::from_utf8(h).ok())
+                    .and_then(|h| u8::from_str_radix(h, 16).ok());
+                match hex {
+                    Some(byte) => {
+                        out.push(byte);
+                        i += 4;
+                    }
+                    None => {
+                        out.push(b'%');
+                        i += 1;
+                    }
+                }
+            }
+            _ => {
+                out.push(b'%');
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// `email_atom_option_parser()` (ref-filter.c:769-779) driven by
+/// `person_email_atom_parser`'s loop: options are matched by *prefix*, OR-ed
+/// into one bit set, and separated by commas.
+fn parse_email_opts(
+    dname: &str,
+    arg: Option<&str>,
+) -> std::result::Result<EmailOpt, AtomError> {
+    let Some(mut arg) = arg else { return Ok(EmailOpt::default()) };
+    let mut opt = EmailOpt::default();
+    loop {
+        // `EO_RAW` is only reachable for a NULL argument, handled above.
+        let hit = [
+            ("trim", EmailOpt::TRIM),
+            ("localpart", EmailOpt::LOCALPART),
+            ("mailmap", EmailOpt::MAILMAP),
+        ]
+        .into_iter()
+        .find_map(|(name, bit)| arg.strip_prefix(name).map(|rest| (bit, rest)));
+        let Some((bit, rest)) = hit else {
+            return Err(fatal_atom(format!("unrecognized %({dname}) argument: {arg}")));
+        };
+        opt.0 |= bit;
+        arg = rest;
+        if arg.is_empty() {
+            return Ok(opt);
+        }
+        match arg.strip_prefix(',') {
+            Some(next) => arg = next,
+            // `bad_arg` is the text as it stood *after* the successful prefix,
+            // so `%(authoremail:trimx)` reports `x`.
+            None => return Err(fatal_atom(format!("unrecognized %({dname}) argument: {arg}"))),
+        }
     }
 }
 
@@ -1108,6 +1399,7 @@ pub fn for_each_ref(args: &[String]) -> Result<ExitCode> {
             obj,
             peeled,
             packed,
+            is_base: Vec::new(),
         });
     }
 
@@ -1157,6 +1449,19 @@ pub fn for_each_ref(args: &[String]) -> Result<ExitCode> {
             }
         }
     }
+
+    // `filter_is_base(the_repository, &array)` (ref-filter.c:3440) runs on the
+    // filtered array *before* `ref_array_sort`, so the choice is made over the
+    // refs the filters kept, in their pre-sort order, and `--count` cannot hide
+    // a candidate from it.
+    let is_base_atoms: Vec<(String, ObjectId)> = atoms()
+        .filter_map(|a| match &a.field {
+            Field::IsBase(name, tip) => Some((name.clone(), *tip)),
+            _ => None,
+        })
+        .collect();
+    let mut refs = refs;
+    filter_is_base(&repo, &mut refs, &is_base_atoms);
 
     let ctx = RenderCtx {
         repo: &repo,
@@ -1683,14 +1988,29 @@ const KNOWN_ATOMS: &[&str] = &[
 
 /// Parse one atom body (the text between `%(` and `)`), also used for sort keys.
 ///
-/// Understood: `refname[:short|:lstrip=<n>|:strip=<n>|:rstrip=<n>]`, `symref`
-/// with the same modifiers, `objectname[:short[=<n>]]`, `tree[:short[=<n>]]`,
-/// `parent[:short[=<n>]]`, `numparent`, `object`, `type`, `tag`, `objecttype`,
-/// `objectsize`, `HEAD`, `color:<spec>`, `author`/`committer`/`tagger`/`creator`
-/// and their `name`, `email` (`:trim`, `:localpart`) and `date` (`:short`,
-/// `:iso8601`, `:iso8601-strict`, `:rfc2822`, `:unix`, `:raw`, `:default`)
-/// forms, `subject`, `body`, and `contents[:subject|:body|:size]`. A leading `*`
-/// evaluates the atom against the object a tag peels to.
+/// Every entry of `valid_atom[]` (ref-filter.c:947-993) is understood, with the
+/// modifiers each atom's parser takes:
+///
+///   * `refname` / `symref`, with `:short`, `:lstrip=<n>`, `:rstrip=<n>`,
+///     `:strip=<n>`;
+///   * `objectname` / `tree` / `parent`, with `:short[=<n>]`; `numparent`,
+///     `object`, `type`, `tag`, `objecttype`, `objectsize[:disk]`, `deltabase`,
+///     `raw[:size]`;
+///   * `author` / `committer` / `tagger` / `creator`, their `name[:mailmap]`,
+///     `email` (a bit set of `trim`, `localpart`, `mailmap`) and `date` forms,
+///     the last taking the whole `--date=` vocabulary through
+///     [`crate::showdate::parse_date_format`];
+///   * `subject[:sanitize]`, `body`, `contents[:subject|:body|:size|:signature|
+///     :lines=<n>|:trailers[:<opts>]]`, `trailers[:<opts>]`;
+///   * `signature[:signer|:grade|:key|:fingerprint|:primarykeyfingerprint|
+///     :trustlevel]`;
+///   * `upstream` / `push` with the remote-ref option list, `flag`, `HEAD`,
+///     `color:<spec>`, `worktreepath`, `describe[:<opts>]`,
+///     `ahead-behind:<committish>`, `is-base:<committish>`;
+///   * the container atoms `align`, `if`, `then`, `else`, `end`, and `rest`,
+///     which this command refuses the way git refuses it.
+///
+/// A leading `*` evaluates the atom against the object a tag peels to.
 fn parse_atom(spec: &str, ctx: &AtomCtx<'_>) -> std::result::Result<Atom, AtomError> {
     let (body, deref) = match spec.strip_prefix('*') {
         Some(rest) => (rest, true),
@@ -1831,28 +2151,18 @@ fn parse_atom(spec: &str, ctx: &AtomCtx<'_>) -> std::result::Result<Atom, AtomEr
                 .ok_or_else(|| fatal_atom(format!("failed to find '{arg}'")))?;
             Field::AheadBehind(base)
         }
-        // `deltabase_atom_parser` (ref-filter.c:504) rejects an argument outright,
-        // which is git's own `die()` and is reproduced; the value itself is the
-        // packed delta base `oid_object_info_extended()` reports through
-        // `OBJECT_INFO_DELTA_BASE`, and the vendored object database exposes no
-        // such lookup — nothing under `gix` or `gix-odb` returns a delta base.
+        // `deltabase_atom_parser` (ref-filter.c:504-515) rejects an argument
+        // outright and otherwise asks `oid_object_info_extended()` for
+        // `OBJECT_INFO_DELTA_BASE`.
         "deltabase" => {
             bare(m).map_err(|_| fatal_atom("%(deltabase) does not take arguments"))?;
-            return Err(unported_atom(
-                "%(deltabase) is not ported: the delta base of a packed object is \
-                 oid_object_info_extended()'s OBJECT_INFO_DELTA_BASE, which the vendored \
-                 object database does not expose",
-            ));
+            Field::DeltaBase
         }
-        // `is_base_atom_parser` (ref-filter.c:913) runs to completion here: the
-        // operand is mandatory, and it is peeled by
-        // `lookup_commit_reference_by_name()` — whose failure is a `die()`, not
-        // an "unknown atom". Both of those rejections are git's own and are
-        // reproduced exactly; only the answer for a committish that *does*
-        // resolve is missing, because `filter_is_base()` computes it with
-        // `get_branch_base_for_tip()` (commit-reach.c:1317), a first-parent walk
-        // ordered by commit-graph generation numbers that this port has no
-        // substrate for.
+        // `is_base_atom_parser` (ref-filter.c:913-926): the operand is mandatory
+        // and is peeled by `lookup_commit_reference_by_name()`, whose failure is
+        // a `die()` rather than an "unknown atom". The answer itself is not a
+        // per-ref rendering at all — `filter_is_base()` picks one ref out of the
+        // whole array before sorting, which [`filter_is_base`] does here.
         "is-base" => {
             let Some(arg) = m else {
                 return Err(fatal_atom("expected format: %(is-base:<committish>)"));
@@ -1864,14 +2174,10 @@ fn parse_atom(spec: &str, ctx: &AtomCtx<'_>) -> std::result::Result<Atom, AtomEr
                     _ => None,
                 }
             });
-            if resolved.is_none() {
+            let Some(tip) = resolved else {
                 return Err(fatal_atom(format!("failed to find '{arg}'")));
-            }
-            return Err(unported_atom(format!(
-                "%(is-base:{arg}) is not ported: naming the base a ref was branched from \
-                 needs get_branch_base_for_tip()'s generation-numbered first-parent walk, \
-                 which needs the commit-graph substrate"
-            )));
+            };
+            Field::IsBase(arg.to_string(), tip)
         }
         // `verify_ref_format`'s `reject_atom`: `for-each-ref` has no "rest of the
         // line" to report, so the atom parses and is then refused.
@@ -1895,62 +2201,73 @@ fn parse_atom(spec: &str, ctx: &AtomCtx<'_>) -> std::result::Result<Atom, AtomEr
             bare(m)?;
             Field::Person(who(name), PersonPart::Full)
         }
+        // `person_name_atom_parser` (ref-filter.c:755-767): `N_RAW` or `N_MAILMAP`.
         "authorname" | "committername" | "taggername" => {
-            bare(m)?;
-            Field::Person(who(name.trim_end_matches("name")), PersonPart::Name)
-        }
-        "authoremail" | "committeremail" | "taggeremail" => {
-            let part = match m {
-                None => PersonPart::Email,
-                Some("trim") => PersonPart::EmailTrim,
-                Some("localpart") => PersonPart::EmailLocal,
+            let mailmap = match m {
+                None => false,
+                Some("mailmap") => true,
                 Some(m) => return Err(fatal_atom(format!("unrecognized %({dname}) argument: {m}"))),
             };
-            Field::Person(who(name.trim_end_matches("email")), part)
+            Field::Person(who(name.trim_end_matches("name")), PersonPart::Name { mailmap })
         }
+        // `person_email_atom_parser` (ref-filter.c:781-802): a comma-separated
+        // list whose options are *bits*, not alternatives, so `trim,mailmap`
+        // means both. `email_atom_option_parser` matches by `skip_prefix`, so the
+        // offending text a typo reports is the tail from the failure onwards, not
+        // the whole argument: `%(authoremail:trim,bogus)` names `bogus`, and
+        // `%(authoremail:trimx)` names `x`.
+        "authoremail" | "committeremail" | "taggeremail" => {
+            let opt = parse_email_opts(&dname, m)?;
+            Field::Person(who(name.trim_end_matches("email")), PersonPart::Email(opt))
+        }
+        // `grab_date` (ref-filter.c:1677-1720) reads the format straight off the
+        // atom name and hands it to `parse_date_format()`, so a date atom takes
+        // the whole `--date=` vocabulary, `format:<strftime>` included, and both
+        // of that function's `die()`s reach the user verbatim.
         "authordate" | "committerdate" | "taggerdate" | "creatordate" => {
-            let fmt = match m {
-                None | Some("default") => DateFmt::Default,
-                Some("short") => DateFmt::Short,
-                Some("iso8601") | Some("iso") => DateFmt::Iso,
-                Some("iso8601-strict") | Some("iso-strict") => DateFmt::IsoStrict,
-                Some("rfc2822") => DateFmt::Rfc2822,
-                Some("unix") => DateFmt::Unix,
-                Some("raw") => DateFmt::Raw,
-                Some("relative") => DateFmt::Relative,
-                Some(m) => {
-                    return Err(unported_atom(format!(
-                        "date format `:{m}` is not ported"
-                    )))
-                }
+            let mode = match m {
+                None => None,
+                Some(spec) => Some(
+                    crate::showdate::parse_date_format(spec)
+                        .map_err(|e| fatal_atom(e.to_string()))?,
+                ),
             };
-            Field::Person(who(name.trim_end_matches("date")), PersonPart::Date(fmt))
+            Field::Person(who(name.trim_end_matches("date")), PersonPart::Date(mode))
         }
-        "subject" => {
-            bare(m)?;
-            Field::Contents(ContentPart::Subject)
-        }
+        // `subject_atom_parser` (ref-filter.c:527-538).
+        "subject" => Field::Contents(match m {
+            None => ContentPart::Subject,
+            Some("sanitize") => ContentPart::SubjectSanitize,
+            Some(m) => return Err(fatal_atom(format!("unrecognized %(subject) argument: {m}"))),
+        }),
+        // `body_atom_parser` (ref-filter.c:517-525) sets `C_BODY_DEP`, which is
+        // *not* `%(contents:body)`: it keeps a trailing signature block.
         "body" => {
             bare(m)?;
-            Field::Contents(ContentPart::Body)
+            Field::Contents(ContentPart::BodyDep)
         }
-        // `trailers_atom_parser`: bare, or an option list this port does not
-        // render. The bare form is the one `format_trailers_from_commit` answers
-        // on its verbatim-block fast path.
-        "trailers" => {
-            trailers_bare(name, m)?;
-            Field::Contents(ContentPart::Trailers)
-        }
+        // `trailers_atom_parser` (ref-filter.c:570-610).
+        "trailers" => Field::Contents(ContentPart::Trailers(parse_trailer_opts(m)?)),
+        // `contents_atom_parser` (ref-filter.c:612-641).
         "contents" => Field::Contents(match m {
-            None => ContentPart::All,
+            None => ContentPart::Bare,
             Some("subject") => ContentPart::Subject,
             Some("body") => ContentPart::Body,
             Some("size") => ContentPart::Size,
-            // `contents_atom_parser` forwards this to `trailers_atom_parser`,
-            // splitting `trailers:<args>` at the first colon.
-            Some(m) if m == "trailers" || m.starts_with("trailers:") => {
-                trailers_bare(name, m.strip_prefix("trailers:"))?;
-                ContentPart::Trailers
+            Some("signature") => ContentPart::Sig,
+            // Forwarded to `trailers_atom_parser`, splitting `trailers:<args>`
+            // at the first colon. `%(contents:trailers:)` reaches that parser
+            // with an *empty* argument rather than none, which parses the same.
+            Some("trailers") => ContentPart::Trailers(parse_trailer_opts(None)?),
+            Some(m) if m.starts_with("trailers:") => {
+                ContentPart::Trailers(parse_trailer_opts(Some(&m["trailers:".len()..]))?)
+            }
+            Some(m) if m.starts_with("lines=") => {
+                let arg = &m["lines=".len()..];
+                let n = strtoul_ui(arg).ok_or_else(|| {
+                    fatal_atom(format!("positive value expected contents:lines={arg}"))
+                })?;
+                ContentPart::Lines(n)
             }
             Some(m) => {
                 return Err(fatal_atom(format!(
@@ -1983,8 +2300,10 @@ fn parse_atom(spec: &str, ctx: &AtomCtx<'_>) -> std::result::Result<Atom, AtomEr
         "object" => Field::TargetName,
         "type" => Field::TargetType,
         "tag" => Field::TagName,
-        // A name git knows but this module does not evaluate is an honest gap,
-        // not the "unknown field name" git reserves for a typo.
+        // Unreachable for git 2.55's `valid_atom[]`, every entry of which is
+        // handled above — kept so that an atom a newer git adds to [`KNOWN_ATOMS`]
+        // is an honest gap in this port's own voice rather than the "unknown
+        // field name" git reserves for a typo.
         n if KNOWN_ATOMS.contains(&n) => {
             return Err(unported_atom(format!("%({n}) is not ported")))
         }
@@ -2443,9 +2762,17 @@ fn key_of(ctx: &RenderCtx<'_>, key: &SortKey, info: &RefInfo) -> Result<Key> {
     }
     match &atom.field {
         Field::ObjectSize => Ok(Key::Num(object_of(atom, info).map_or(0, |o| o.size as i64))),
-        // `numparent` is `FIELD_ULONG`, so git compares it numerically; a
-        // non-commit (empty rendering) sorts as the 0 git leaves in `v->value`.
-        Field::NumParent => {
+        // The rest of git's `FIELD_ULONG` atoms — `objectsize:disk`
+        // (valid_atom's `FIELD_ULONG`), `raw:size` (`raw_atom_parser`,
+        // ref-filter.c:728) and `contents:size` (`contents_atom_parser`,
+        // ref-filter.c:620). All three render as decimal, so the number they
+        // sort by is that rendering read back.
+        Field::ObjectSizeDisk
+        | Field::Raw(true)
+        | Field::Contents(ContentPart::Size)
+        // `numparent` is `FIELD_ULONG` too; a non-commit (empty rendering) sorts
+        // as the 0 git leaves in `v->value`.
+        | Field::NumParent => {
             let s = render(ctx, atom, info)?;
             let n = std::str::from_utf8(&s)
                 .ok()
@@ -2453,7 +2780,10 @@ fn key_of(ctx: &RenderCtx<'_>, key: &SortKey, info: &RefInfo) -> Result<Key> {
                 .unwrap_or(0);
             Ok(Key::Num(n))
         }
-        Field::Person(w, PersonPart::Date(DateFmt::Default)) => {
+        // `grab_date()` (ref-filter.c:1690-1697) flips the atom to `FIELD_STR`
+        // the moment a `:<format>` is spelled out — even `:default`, whose
+        // rendering is the same — so only the bare atom sorts numerically.
+        Field::Person(w, PersonPart::Date(None)) => {
             let Some(obj) = object_of(atom, info) else {
                 return Ok(Key::Num(0));
             };
@@ -2557,6 +2887,16 @@ fn render(ctx: &RenderCtx<'_>, atom: &Atom, info: &RefInfo) -> Result<Vec<u8>> {
                 .map(|p| p.as_bytes().to_vec())
                 .unwrap_or_default());
         }
+        // `populate_value`'s `ATOM_ISBASE` arm (ref-filter.c:2586-2594): the ref
+        // [`filter_is_base`] chose renders `(<committish>)`, every other ref
+        // renders empty.
+        Field::IsBase(name, _) => {
+            return Ok(if info.is_base.iter().any(|n| n == name) {
+                format!("({name})").into_bytes()
+            } else {
+                Vec::new()
+            })
+        }
         Field::AheadBehind(base) => {
             let Some(tip) = commit_tip(repo, info.obj.id)? else {
                 // Not a commit: git leaves the atom empty.
@@ -2642,6 +2982,14 @@ fn render(ctx: &RenderCtx<'_>, atom: &Atom, info: &RefInfo) -> Result<Vec<u8>> {
         Field::Person(w, part) => render_person(repo, obj, *w, part),
         Field::Contents(part) => render_contents(obj, part),
         Field::Signature(option) => render_signature(obj, *option),
+        // `oi.info.delta_base_oid` — `oid_object_info_extended()`'s
+        // `OBJECT_INFO_DELTA_BASE`. A non-delta, a loose object and an object
+        // this repository cannot locate all render the null oid, which is what
+        // git prints from its zeroed `oi.delta_base_oid`.
+        Field::DeltaBase => Ok(delta_base(repo, obj.id)
+            .unwrap_or_else(|| repo.object_hash().null())
+            .to_string()
+            .into_bytes()),
         // One implementation of `oi.disk_sizep` for the whole port: it has to try
         // packs before loose files, which the `cat-file` copy already does.
         Field::ObjectSizeDisk => {
@@ -2664,6 +3012,7 @@ fn render(ctx: &RenderCtx<'_>, atom: &Atom, info: &RefInfo) -> Result<Vec<u8>> {
         | Field::Push(_)
         | Field::Flag
         | Field::WorktreePath
+        | Field::IsBase(..)
         | Field::AheadBehind(_) => unreachable!("handled above"),
     }
 }
@@ -2918,6 +3267,320 @@ fn commit_of<'a>(
     Ok(Some(CommitRef::from_bytes(data, repo.object_hash())?))
 }
 
+/// `filter_is_base()` (ref-filter.c:3236-3287) — the whole-array pass that
+/// decides, for each `%(is-base:<committish>)` atom, which one ref that
+/// committish was branched from.
+///
+/// This cannot be a per-ref rendering: the answer is a *choice among* the refs
+/// in the array, so it has to be made once, before sorting and before `--count`
+/// trims anything. Refs whose name does not resolve to a commit are skipped and
+/// keep their positions out of the candidate list, exactly as git's `back_index`
+/// does.
+fn filter_is_base(repo: &gix::Repository, refs: &mut [RefInfo], atoms: &[(String, ObjectId)]) {
+    if refs.is_empty() || atoms.is_empty() {
+        return;
+    }
+
+    // `lookup_commit_reference_by_name_gently(name, 1)` over each item, keeping
+    // the array positions that answered.
+    let mut back_index: Vec<usize> = Vec::with_capacity(refs.len());
+    let mut bases: Vec<ObjectId> = Vec::with_capacity(refs.len());
+    for (i, info) in refs.iter().enumerate() {
+        let Some(id) = crate::objname::resolve(repo, &String::from_utf8_lossy(&info.refname))
+        else {
+            continue;
+        };
+        if let crate::objname::CommitRef::Commit(id) =
+            crate::objname::lookup_commit_reference(repo, id)
+        {
+            back_index.push(i);
+            bases.push(id);
+        }
+    }
+
+    let mut graph = CommitGraph::new(repo);
+    for (name, tip) in atoms {
+        if let Some(best) = graph.branch_base_for_tip(*tip, &bases) {
+            refs[back_index[best]].is_base.push(name.clone());
+        }
+    }
+}
+
+/// The slice of a commit that `get_branch_base_for_tip()` needs: its first
+/// parent, its committer date, and the generation number the walk orders by.
+struct CommitNode {
+    first_parent: Option<ObjectId>,
+    date: i64,
+    /// `commit_graph_generation()`. `None` is git's `GENERATION_NUMBER_ZERO`,
+    /// i.e. "not computed yet".
+    generation: Option<i64>,
+}
+
+/// A lazily-filled commit cache with the corrected-commit-date generation
+/// numbers `ensure_generations_valid()` computes when no commit-graph file is
+/// available (commit-graph.c:1792-1809 → `compute_reachable_generation_numbers`).
+///
+/// Only version 2 (corrected commit dates) is implemented: it is
+/// `get_configured_generation_version()`'s default, and version 1 exists solely
+/// to write an older on-disk format that this port never writes.
+struct CommitGraph<'a> {
+    repo: &'a gix::Repository,
+    nodes: std::collections::HashMap<ObjectId, CommitNode>,
+}
+
+impl<'a> CommitGraph<'a> {
+    fn new(repo: &'a gix::Repository) -> Self {
+        CommitGraph { repo, nodes: std::collections::HashMap::new() }
+    }
+
+    /// `repo_parse_commit()`: read the first parent and the committer date once.
+    fn parse(&mut self, id: ObjectId) {
+        if self.nodes.contains_key(&id) {
+            return;
+        }
+        let node = (|| {
+            let obj = self.repo.find_object(id).ok()?;
+            let commit = obj.try_into_commit().ok()?;
+            let (first_parent, date) = {
+                let decoded = commit.decode().ok()?;
+                let mut parents = decoded.parents();
+                let first = parents.next();
+                drop(parents);
+                (
+                    first,
+                    // `CommitRef::committer` is the raw header bytes; the
+                    // seconds after the `"> "` are what git's `commit->date`
+                    // holds.
+                    gix::actor::SignatureRef::from_bytes(decoded.committer)
+                        .ok()
+                        .and_then(|sig| sig.time().ok())
+                        .map_or(0, |t| t.seconds),
+                )
+            };
+            Some(CommitNode { first_parent, date, generation: None })
+        })()
+        .unwrap_or(CommitNode { first_parent: None, date: 0, generation: None });
+        self.nodes.insert(id, node);
+    }
+
+    fn first_parent(&mut self, id: ObjectId) -> Option<ObjectId> {
+        self.parse(id);
+        self.nodes[&id].first_parent
+    }
+
+    /// `compute_reachable_generation_numbers()` (commit-graph.c) for one commit:
+    /// walk to the ancestors whose generation is still unknown, then fold each
+    /// back up as `max(parent generations, own date - 1) + 1`.
+    ///
+    /// git walks *all* parents here, not just the first, because a generation
+    /// number has to bound every ancestor for the priority order to be sound.
+    fn generation(&mut self, id: ObjectId) -> i64 {
+        self.parse(id);
+        if let Some(gen) = self.nodes[&id].generation {
+            return gen;
+        }
+
+        let mut stack = vec![id];
+        while let Some(&current) = stack.last() {
+            self.parse(current);
+            let parents = self.parents_of(current);
+
+            let mut all_computed = true;
+            let mut max_gen = 0i64;
+            for parent in parents {
+                self.parse(parent);
+                match self.nodes[&parent].generation {
+                    None => {
+                        all_computed = false;
+                        stack.push(parent);
+                        break;
+                    }
+                    Some(gen) => max_gen = max_gen.max(gen),
+                }
+            }
+
+            if all_computed {
+                stack.pop();
+                // `compute_generation_from_max()`, version 2: corrected commit date.
+                let date = self.nodes[&current].date;
+                if date != 0 && date > max_gen {
+                    max_gen = date - 1;
+                }
+                self.nodes.get_mut(&current).expect("just parsed").generation = Some(max_gen + 1);
+            }
+        }
+        self.nodes[&id].generation.expect("the walk fills the root last")
+    }
+
+    /// Every parent of `id`, which the generation walk needs in full.
+    fn parents_of(&mut self, id: ObjectId) -> Vec<ObjectId> {
+        (|| {
+            let obj = self.repo.find_object(id).ok()?;
+            let commit = obj.try_into_commit().ok()?;
+            Some(commit.parent_ids().map(|p| p.detach()).collect::<Vec<_>>())
+        })()
+        .unwrap_or_default()
+    }
+
+    /// `get_branch_base_for_tip()` (commit-reach.c:1317-1425): the index into
+    /// `bases` of the ref `tip` was branched from, or `None`.
+    ///
+    /// Each commit carries a "best" mark: `-1` for "reachable from the tip",
+    /// `i + 1` for "reached from base `i`", `0` for unmarked. Walking first
+    /// parents in generation-then-date order, the first place a tip-marked chain
+    /// meets a base-marked one names the branch point, and the smallest base
+    /// index that reaches it wins.
+    fn branch_base_for_tip(&mut self, tip: ObjectId, bases: &[ObjectId]) -> Option<usize> {
+        if bases.is_empty() {
+            return None;
+        }
+
+        let mut best: std::collections::HashMap<ObjectId, i64> =
+            std::collections::HashMap::new();
+        let mut queue: Vec<ObjectId> = Vec::new();
+        let mut best_index: i64 = -1;
+        let mut branch_point: Option<ObjectId> = None;
+
+        best.insert(tip, -1);
+        queue.push(tip);
+
+        for (i, &c) in bases.iter().enumerate() {
+            match best.get(&c).copied() {
+                // Already marked by another commit.
+                Some(-1) => return Some(i),
+                Some(_) => continue,
+                None => {}
+            }
+            best.insert(c, i as i64 + 1);
+            queue.push(c);
+        }
+
+        while !queue.is_empty() {
+            // `prio_queue_get` under `compare_commits_by_gen_then_commit_date`:
+            // the newest generation first, commit date breaking a tie.
+            let mut pick = 0;
+            for i in 1..queue.len() {
+                let (a, b) = (queue[i], queue[pick]);
+                let (ga, gb) = (self.generation(a), self.generation(b));
+                let newer = ga > gb || (ga == gb && self.date_of(a) > self.date_of(b));
+                if newer {
+                    pick = i;
+                }
+            }
+            let c = queue.swap_remove(pick);
+
+            // A known branch point is optimal; nothing earlier can beat it.
+            if Some(c) == branch_point {
+                break;
+            }
+
+            let Some(parent) = self.first_parent(c) else { continue };
+            let best_for_c = best.get(&c).copied().unwrap_or(0);
+            let best_for_p = best.get(&parent).copied().unwrap_or(0);
+
+            if best_for_p == 0 {
+                best.insert(parent, best_for_c);
+                queue.push(parent);
+                continue;
+            }
+            if best_for_p > 0 && best_for_c > 0 {
+                // Collision among bases: keep the smaller index.
+                if best_for_c < best_for_p {
+                    best.insert(parent, best_for_c);
+                }
+                continue;
+            }
+
+            // Exactly one is positive, by the initial conditions.
+            let positive = if best_for_c < 0 { best_for_p } else { best_for_c };
+            if best_index < 0 || positive < best_index {
+                best_index = positive;
+            }
+            best.insert(parent, -1);
+            branch_point = Some(parent);
+        }
+
+        (best_index > 0).then(|| best_index as usize - 1)
+    }
+
+    fn date_of(&mut self, id: ObjectId) -> i64 {
+        self.parse(id);
+        self.nodes[&id].date
+    }
+}
+
+/// `oid_object_info_extended()`'s `OBJECT_INFO_DELTA_BASE` (`packfile.c`'s
+/// `packed_object_info()`): the object a packed entry is stored as a delta
+/// against, or `None` when it is not a delta — which covers loose objects, whole
+/// packed objects, and anything this repository cannot locate at all.
+///
+/// A pack stores the base two ways and both have to be answered:
+///
+///   * `OBJ_REF_DELTA` carries the base's object id in the entry header, so it
+///     is read straight out.
+///   * `OBJ_OFS_DELTA` carries a *backwards distance* instead, so the base's
+///     position is known but its name is not. git resolves that through the
+///     pack's reverse index; here the pack index is scanned for the entry that
+///     sits at the computed offset, which is the same mapping built the slow
+///     way and is only ever walked for an object that really is a delta.
+fn delta_base(repo: &gix::Repository, id: gix::hash::ObjectId) -> Option<gix::hash::ObjectId> {
+    use gix::odb::pack::Find as _;
+
+    let mut buf = Vec::new();
+    // `location_by_oid` hands back a location that is only valid while the pack
+    // stays mapped, so the handle has to opt out of unloading first.
+    let mut odb = repo.objects.clone();
+    odb.prevent_pack_unload();
+    let loc = odb.location_by_oid(id.as_ref(), &mut buf)?;
+    let entry = odb.entry_by_location(&loc)?;
+    let header =
+        gix::odb::pack::data::Entry::from_bytes(&entry.data, loc.pack_offset, repo.object_hash())
+            .ok()?
+            .header;
+
+    match header {
+        gix::odb::pack::data::entry::Header::RefDelta { base_id } => Some(base_id),
+        gix::odb::pack::data::entry::Header::OfsDelta { base_distance } => {
+            let base_offset = loc.pack_offset.checked_sub(base_distance)?;
+            oid_at_pack_offset(repo, id, base_offset)
+        }
+        _ => None,
+    }
+}
+
+/// The object id of the entry that begins at `offset` in whichever pack holds
+/// `neighbour`.
+///
+/// The pack is identified by asking each index in the object database whether it
+/// knows `neighbour` — `location_by_oid`'s `pack_id` is an internal slot number
+/// with no path attached, so the index has to be found by content rather than by
+/// name. Only the one index that answers is then scanned.
+fn oid_at_pack_offset(
+    repo: &gix::Repository,
+    neighbour: gix::hash::ObjectId,
+    offset: u64,
+) -> Option<gix::hash::ObjectId> {
+    use gix::odb::store::structure::Record;
+
+    let records = repo.objects.store_ref().structure().ok()?;
+    for record in records {
+        let Record::Index { path, .. } = record else { continue };
+        let Ok(index) = gix::odb::pack::index::File::at(&path, repo.object_hash()) else {
+            continue;
+        };
+        if index.lookup(neighbour).is_none() {
+            continue;
+        }
+        for i in 0..index.num_objects() {
+            if index.pack_offset_at_index(i) == offset {
+                return Some(index.oid_at_index(i).to_owned());
+            }
+        }
+        return None;
+    }
+    None
+}
+
 /// Parse `obj` as a tag, or `None` when it is another kind (or its data was not
 /// loaded). Mirrors git only running `grab_tag_values` on tag objects.
 fn tag_of<'a>(repo: &gix::Repository, obj: &'a ObjInfo) -> Result<Option<TagRef<'a>>> {
@@ -2930,40 +3593,236 @@ fn tag_of<'a>(repo: &gix::Repository, obj: &'a ObjInfo) -> Result<Option<TagRef<
     Ok(Some(TagRef::from_bytes(data, repo.object_hash())?))
 }
 
-/// Render a name-email-date atom, or nothing when the object has no such header.
+/// Render a name-email-date atom, or nothing when the object has no such header
+/// — `grab_person()` (ref-filter.c:1724-1800).
+///
+/// git works on the raw header line ("wholine"), not on a parsed identity, and
+/// the atoms slice it with `strchr`; that is reproduced here because the slices
+/// are not equivalent to a parsed `Name`/`email` pair for a malformed ident, and
+/// because `:mailmap` rewrites the line and then re-slices it.
+///
+/// One deliberate divergence, and it is git's bug rather than this port's gap.
+/// `grab_person()` keeps `wholine` in a variable declared *outside* its atom
+/// loop, and the `:mailmap` branch points it into a `struct strbuf mailmap_buf`
+/// declared *inside* that loop — which `strbuf_release(&mailmap_buf)` frees at
+/// the end of the same iteration (ref-filter.c:1737, 1759, 1775). The
+/// "creator"/"creatordate" tail below the loop then reuses that freed pointer
+/// instead of re-deriving it (`if (!wholine) wholine = find_wholine(...)` sees a
+/// non-NULL dangling pointer and keeps it, ref-filter.c:1783-1785). Measured on
+/// stock git 2.55.0:
+///
+/// ```text
+/// $ git for-each-ref --count=1 --format='%(committername)|%(creator)'
+/// C O Mitter|C O Mitter <committer@example.com> 1700000000 +0000
+/// $ git for-each-ref --count=1 --format='%(committername:mailmap)|%(creator)'
+/// C O Mitter|
+/// ```
+///
+/// `%(creator)` and `%(creatordate)` go empty whenever a `:mailmap` name or
+/// email atom for the *same* header is present in the format — and only then;
+/// `%(authorname:mailmap)` does not do it, because `grab_person("author")` is a
+/// separate call that never reaches the creator tail. That output is a read of
+/// freed memory, so it is not a specification: reproducing it would encode one
+/// allocator's behaviour as this port's contract. `%(creator)` is answered here.
+
 fn render_person(
     repo: &gix::Repository,
     obj: &ObjInfo,
     w: Who,
     part: &PersonPart,
 ) -> Result<Vec<u8>> {
-    let rendered = with_signature(repo, obj, w, |sig| match part {
-        PersonPart::Full => {
-            let mut out = sig.name.to_vec();
-            out.extend_from_slice(b" <");
-            out.extend_from_slice(sig.email);
-            out.extend_from_slice(b"> ");
-            out.extend_from_slice(sig.time.as_bytes());
-            out
+    let Some(data) = obj.data.as_deref() else {
+        return Ok(Vec::new());
+    };
+    if !matches!(obj.kind, Kind::Commit | Kind::Tag) {
+        return Ok(Vec::new());
+    }
+    // `%(creator*)` reads `committer` on a commit and `tagger` on a tag; the
+    // other three name their header outright, and a header the object does not
+    // carry (`author` on a tag) leaves the atom empty.
+    let header: &[u8] = match (w, obj.kind) {
+        (Who::Author, Kind::Commit) => b"author",
+        (Who::Committer, Kind::Commit) | (Who::Creator, Kind::Commit) => b"committer",
+        (Who::Tagger, Kind::Tag) | (Who::Creator, Kind::Tag) => b"tagger",
+        _ => return Ok(Vec::new()),
+    };
+
+    let wants_mailmap = match part {
+        PersonPart::Name { mailmap } => *mailmap,
+        PersonPart::Email(opt) => opt.has(EmailOpt::MAILMAP),
+        _ => false,
+    };
+
+    let mapped;
+    let wholine = match find_wholine(header, data) {
+        None => return Ok(Vec::new()),
+        Some(line) if wants_mailmap => {
+            mapped = apply_mailmap_to_line(repo, line);
+            &mapped[..]
         }
-        PersonPart::Name => sig.name.to_vec(),
-        PersonPart::Email => {
-            let mut out = b"<".to_vec();
-            out.extend_from_slice(sig.email);
-            out.push(b'>');
-            out
+        Some(line) => line,
+    };
+
+    Ok(match part {
+        // `copy_line()`: the header line as it stands.
+        PersonPart::Full => wholine.to_vec(),
+        PersonPart::Name { .. } => copy_name(wholine),
+        PersonPart::Email(opt) => copy_email(wholine, *opt),
+        PersonPart::Date(mode) => grab_date(wholine, mode.as_ref()),
+    })
+}
+
+/// `find_wholine()` (ref-filter.c:1581-1598): the bytes of the `<who> ` header
+/// line after its name and space, up to but not including the newline.
+///
+/// The scan stops at the blank line that ends the header block, so a body line
+/// that happens to start with `committer ` is never mistaken for the header.
+fn find_wholine<'a>(who: &[u8], buf: &'a [u8]) -> Option<&'a [u8]> {
+    let mut at = 0;
+    while at < buf.len() {
+        if buf[at..].starts_with(who) && buf.get(at + who.len()) == Some(&b' ') {
+            let start = at + who.len() + 1;
+            let end = buf[start..]
+                .iter()
+                .position(|&b| b == b'\n')
+                .map_or(buf.len(), |nl| start + nl);
+            return Some(&buf[start..end]);
         }
-        PersonPart::EmailTrim => sig.email.to_vec(),
-        PersonPart::EmailLocal => match sig.email.iter().position(|&b| b == b'@') {
-            Some(at) => sig.email[..at].to_vec(),
-            None => sig.email.to_vec(),
-        },
-        PersonPart::Date(fmt) => match sig.time() {
-            Ok(time) => format_date(time, *fmt).into_bytes(),
-            Err(_) => sig.time.as_bytes().to_vec(),
-        },
-    })?;
-    Ok(rendered.unwrap_or_default())
+        let Some(nl) = buf[at..].iter().position(|&b| b == b'\n') else {
+            return None;
+        };
+        at += nl + 1;
+        // A second newline is the end of the header block.
+        if buf.get(at) == Some(&b'\n') {
+            return None;
+        }
+    }
+    None
+}
+
+/// `copy_name()` (ref-filter.c:1602-1610): everything before the first `" <"`,
+/// and the empty string if the line has none.
+fn copy_name(wholine: &[u8]) -> Vec<u8> {
+    for i in 0..wholine.len() {
+        if wholine[i..].starts_with(b" <") {
+            return wholine[..i].to_vec();
+        }
+    }
+    Vec::new()
+}
+
+/// `copy_email()` (ref-filter.c:1641-1657) with `find_end_of_email()`
+/// (ref-filter.c:1612-1639).
+///
+/// The bits are not alternatives. `EO_TRIM` and `EO_LOCALPART` both move the
+/// start past the `<`; `EO_MAILMAP` alone leaves the angle brackets on, which is
+/// why `%(authoremail:mailmap)` prints `<a@b>` and `%(authoremail:trim,mailmap)`
+/// prints `a@b`.
+fn copy_email(wholine: &[u8], opt: EmailOpt) -> Vec<u8> {
+    let Some(lt) = wholine.iter().position(|&b| b == b'<') else {
+        return Vec::new();
+    };
+    let trimming = opt.has(EmailOpt::LOCALPART) || opt.has(EmailOpt::TRIM);
+    let email = if trimming { lt + 1 } else { lt };
+    let rest = &wholine[email..];
+
+    let end = if opt.has(EmailOpt::LOCALPART) {
+        rest.iter()
+            .position(|&b| b == b'@')
+            .or_else(|| rest.iter().position(|&b| b == b'>'))
+    } else if opt.has(EmailOpt::TRIM) {
+        rest.iter().position(|&b| b == b'>')
+    } else {
+        // The raw and raw-mailmap cases keep the closing bracket.
+        rest.iter().position(|&b| b == b'>').map(|i| i + 1)
+    };
+    match end {
+        Some(end) => rest[..end].to_vec(),
+        None => Vec::new(),
+    }
+}
+
+/// `grab_date()` (ref-filter.c:1677-1720): read the `<secs> <tz>` that follows
+/// the `"> "` on the header line, then render it through
+/// [`crate::showdate::show_date`]. A line that carries no parsable timestamp
+/// renders empty, which is git's `goto bad`.
+fn grab_date(wholine: &[u8], mode: Option<&crate::showdate::DateMode>) -> Vec<u8> {
+    let Some(at) = find_bytes(wholine, b"> ") else {
+        return Vec::new();
+    };
+    let rest = &wholine[at + 2..];
+    let digits = rest.iter().take_while(|b| b.is_ascii_digit()).count();
+    if digits == 0 {
+        return Vec::new();
+    }
+    let Ok(seconds) = std::str::from_utf8(&rest[..digits]).unwrap_or("").parse::<i64>() else {
+        return Vec::new();
+    };
+    // `strtol(zone, NULL, 10)` over whatever follows, whitespace skipped.
+    let zone = std::str::from_utf8(&rest[digits..]).unwrap_or("").trim_start();
+    let tz = parse_leading_i32(zone);
+
+    let owned;
+    let mode = match mode {
+        Some(m) => m,
+        None => {
+            owned = crate::showdate::DateMode::new(crate::showdate::DateType::Normal);
+            &owned
+        }
+    };
+    crate::showdate::show_date(seconds, tz, mode, crate::date::now_seconds()).into_bytes()
+}
+
+/// `strtol(s, NULL, 10)`: an optional sign and the digits that follow, stopping
+/// at the first byte that is not one. Anything unparsable is `0`.
+fn parse_leading_i32(s: &str) -> i32 {
+    let bytes = s.as_bytes();
+    let mut end = usize::from(matches!(bytes.first(), Some(b'+' | b'-')));
+    while bytes.get(end).is_some_and(u8::is_ascii_digit) {
+        end += 1;
+    }
+    s[..end].parse::<i32>().unwrap_or(0)
+}
+
+/// `apply_mailmap_to_header()` / `rewrite_ident_line()` (ident.c:354-392) for one
+/// header line: look the `Name <email>` half up in `.mailmap` and splice the
+/// replacement back in, leaving the `<secs> <tz>` tail alone.
+///
+/// git rewrites the whole header buffer and re-runs `find_wholine()` over it;
+/// rewriting the one line it would have found is the same thing, because
+/// `map_user()` only ever replaces the `Name <email>` span.
+fn apply_mailmap_to_line(repo: &gix::Repository, wholine: &[u8]) -> Vec<u8> {
+    let Some(lt) = wholine.iter().position(|&b| b == b'<') else {
+        return wholine.to_vec();
+    };
+    let Some(gt) = wholine[lt..].iter().position(|&b| b == b'>').map(|i| lt + i) else {
+        return wholine.to_vec();
+    };
+    // `split_ident_line()` trims the run of blanks before the `<`.
+    let name_end = wholine[..lt]
+        .iter()
+        .rposition(|b| !b.is_ascii_whitespace())
+        .map_or(0, |i| i + 1);
+    let name = &wholine[..name_end];
+    let email = &wholine[lt + 1..gt];
+
+    let mailmap = repo.open_mailmap();
+    let sig = gix::actor::SignatureRef {
+        name: name.into(),
+        email: email.into(),
+        time: "0 +0000",
+    };
+    let (mapped_name, mapped_email) = match mailmap.try_resolve_ref(sig) {
+        Some(resolved) => (resolved.name, resolved.email),
+        None => return wholine.to_vec(),
+    };
+
+    let mut out = mapped_name.unwrap_or(name.into()).to_vec();
+    out.extend_from_slice(b" <");
+    out.extend_from_slice(mapped_email.unwrap_or(email.into()));
+    out.push(b'>');
+    out.extend_from_slice(&wholine[gt + 1..]);
+    out
 }
 
 /// Run `f` over the signature `w` names on `obj`, or return `None` when the
@@ -2998,25 +3857,193 @@ fn with_signature<T>(
     }
 }
 
-/// Format a timestamp the way `git log --date=<fmt>` does.
-fn format_date(time: gix::date::Time, fmt: DateFmt) -> String {
-    use gix::date::time::format;
-    match fmt {
-        DateFmt::Default => time.format_or_unix(format::DEFAULT),
-        DateFmt::Short => time.format_or_unix(format::SHORT),
-        DateFmt::Iso => time.format_or_unix(format::ISO8601),
-        DateFmt::IsoStrict => time.format_or_unix(format::ISO8601_STRICT),
-        DateFmt::Rfc2822 => time.format_or_unix(format::GIT_RFC2822),
-        DateFmt::Unix => time.format_or_unix(format::UNIX),
-        DateFmt::Raw => time.format_or_unix(format::RAW),
-        DateFmt::Relative => {
-            crate::date::show_date_relative(time.seconds, crate::date::now_seconds())
+/// The four spans `find_subpos()` (ref-filter.c:1899-1938) carves a commit or
+/// tag object into, as offsets into the object's raw bytes.
+///
+/// They overlap on purpose, because git's contents atoms slice the same message
+/// four different ways: `sub` starts at the subject and runs to the end of the
+/// object, `body` starts after the subject's blank line, `nonsig_len` stops the
+/// body at the signature, and `sig` is the signature alone.
+struct SubPos {
+    /// The first non-blank byte after the header block.
+    sub: usize,
+    /// The subject's length, trailing `\n`/`\r` already dropped.
+    sub_len: usize,
+    /// The first byte after the subject's blank line.
+    body: usize,
+    /// From `body` to the end of the object.
+    body_len: usize,
+    /// From `body` to the start of the signature.
+    nonsig_len: usize,
+    /// Where a trailing signature block begins, or the end of the object.
+    sig: usize,
+    /// From `sig` to the end of the object.
+    sig_len: usize,
+}
+
+/// `parse_signed_buffer()` (gpg-interface.c): the offset of the *last* line in
+/// `buf` that opens a signature block, or `buf.len()` when there is none.
+///
+/// The "last" is not a slip: git rescans every line and keeps overwriting its
+/// match, so a message body that quotes a signature header does not shadow the
+/// real trailing block.
+fn parse_signed_buffer(buf: &[u8]) -> usize {
+    let mut len = 0;
+    let mut matched = buf.len();
+    while len < buf.len() {
+        if crate::gitsig::format_by_sig(&buf[len..]).is_some() {
+            matched = len;
         }
+        len = match buf[len..].iter().position(|&b| b == b'\n') {
+            Some(nl) => len + nl + 1,
+            None => buf.len(),
+        };
+    }
+    matched
+}
+
+/// `find_subpos()` (ref-filter.c:1899-1938), byte-for-byte.
+fn find_subpos(buf: &[u8]) -> SubPos {
+    let end = buf.len();
+
+    // Skip past the header until we hit an empty line.
+    let mut at = 0;
+    while at < end && buf[at] != b'\n' {
+        at = match buf[at..].iter().position(|&b| b == b'\n') {
+            Some(nl) => at + nl + 1,
+            None => end,
+        };
+    }
+    // Skip any empty lines.
+    while at < end && buf[at] == b'\n' {
+        at += 1;
+    }
+
+    // Parse the signature first; we might not even have a subject line.
+    let sig = at + parse_signed_buffer(&buf[at..]);
+    let sig_len = end - sig;
+
+    let sub = at;
+    // The subject goes to the first empty line before the signature begins.
+    let eol = find_bytes(&buf[sub..], b"\n\n")
+        .or_else(|| find_bytes(&buf[sub..], b"\r\n\r\n"))
+        .map_or(sig, |off| (sub + off).min(sig));
+
+    let mut sub_len = eol - sub;
+    while sub_len > 0 && matches!(buf[sub + sub_len - 1], b'\n' | b'\r') {
+        sub_len -= 1;
+    }
+
+    // Skip any empty lines.
+    let mut at = eol;
+    while at < end && matches!(buf[at], b'\n' | b'\r') {
+        at += 1;
+    }
+    let body = at;
+
+    SubPos {
+        sub,
+        sub_len,
+        body,
+        body_len: end - body,
+        nonsig_len: sig.saturating_sub(body),
+        sig,
+        sig_len,
     }
 }
 
+/// The offset of the first occurrence of `needle` in `hay`.
+fn find_bytes(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    hay.windows(needle.len()).position(|w| w == needle)
+}
+
+/// `copy_subject()` (ref-filter.c:1659-1674): fold the subject onto one line by
+/// turning each `\n` into a space and dropping the `\r` of a `\r\n`. Note that
+/// this does *not* trim a line's trailing whitespace — `"a  \nb"` becomes
+/// `"a   b"`, three spaces.
+fn copy_subject(sub: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(sub.len());
+    for (i, &c) in sub.iter().enumerate() {
+        if c == b'\r' && sub.get(i + 1) == Some(&b'\n') {
+            continue; /* ignore CR in CRLF */
+        }
+        out.push(if c == b'\n' { b' ' } else { c });
+    }
+    out
+}
+
+/// `format_sanitized_subject()` (pretty.c:947-973): keep only "title"
+/// characters, collapse every run of anything else into a single `-`, squeeze a
+/// run of `.` after a `.`, then trim trailing `.`/`-`.
+fn format_sanitized_subject(sub: &[u8]) -> Vec<u8> {
+    // `istitlechar()` (pretty.c:941-945).
+    let istitlechar = |c: u8| c.is_ascii_alphanumeric() || c == b'.' || c == b'_';
+
+    let mut out: Vec<u8> = Vec::with_capacity(sub.len());
+    // git starts at 2 so a leading non-title run does *not* emit a `-`: only the
+    // transition from "saw a separator after real content" (1) does.
+    let mut space = 2u8;
+    let mut i = 0;
+    while i < sub.len() {
+        let c = sub[i];
+        if istitlechar(c) {
+            if space == 1 {
+                out.push(b'-');
+            }
+            space = 0;
+            out.push(c);
+            if c == b'.' {
+                while sub.get(i + 1) == Some(&b'.') {
+                    i += 1;
+                }
+            }
+        } else {
+            space |= 1;
+        }
+        i += 1;
+    }
+
+    while out.last().is_some_and(|&c| c == b'.' || c == b'-') {
+        out.pop();
+    }
+    out
+}
+
+/// `append_lines()` (ref-filter.c:1943-1961): the first `lines` lines of `buf`,
+/// joined by a newline *and four spaces* — the indent `git log --format` uses
+/// for a continued body, which `%(contents:lines=<n>)` inherits.
+fn append_lines(buf: &[u8], lines: u32) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut sp = 0;
+    for i in 0..lines as usize {
+        if sp >= buf.len() {
+            break;
+        }
+        if i > 0 {
+            out.extend_from_slice(b"\n    ");
+        }
+        match buf[sp..].iter().position(|&b| b == b'\n') {
+            Some(nl) => {
+                out.extend_from_slice(&buf[sp..sp + nl]);
+                sp += nl + 1;
+            }
+            None => {
+                out.extend_from_slice(&buf[sp..]);
+                break;
+            }
+        }
+    }
+    out
+}
+
 /// Render `%(contents...)`, `%(subject)`, `%(body)` and `%(trailers)` from an
-/// object's message.
+/// object's message — `grab_sub_body_contents()` (ref-filter.c:2013-2110).
+///
+/// Every arm slices the spans [`find_subpos`] found; the reason this is not one
+/// "get the message, then cut it" helper is that git's arms genuinely disagree
+/// about where the message ends. `%(body)` keeps a trailing signature block and
+/// `%(contents:body)` does not; `%(contents)` keeps it and `%(trailers)` cuts it
+/// off before looking for a trailer block.
 fn render_contents(obj: &ObjInfo, part: &ContentPart) -> Result<Vec<u8>> {
     let Some(data) = obj.data.as_deref() else {
         return Ok(Vec::new());
@@ -3024,35 +4051,57 @@ fn render_contents(obj: &ObjInfo, part: &ContentPart) -> Result<Vec<u8>> {
     if !matches!(obj.kind, Kind::Commit | Kind::Tag) {
         return Ok(Vec::new());
     }
-    // git takes everything after the header block; a header continuation line
-    // always starts with a space, so the first blank line ends the headers.
-    let contents = match data.windows(2).position(|w| w == &b"\n\n"[..]) {
-        Some(i) => &data[i + 2..],
-        None => &data[..0],
-    };
+    let p = find_subpos(data);
+    let subject = &data[p.sub..p.sub + p.sub_len];
 
     match part {
-        ContentPart::All => Ok(contents.to_vec()),
-        ContentPart::Size => Ok(contents.len().to_string().into_bytes()),
-        // `grab_sub_body_contents`' `C_TRAILERS` arm: the message with any
-        // signature block cut off, handed to `format_trailers_from_commit`.
-        ContentPart::Trailers => {
-            super::interpret_trailers::trailer_block_of(&contents[..signature_start(contents)])
-        }
-        ContentPart::Subject | ContentPart::Body => {
-            // Signatures belong to neither the subject nor the body.
-            let body = &contents[..signature_start(contents)];
-            let body = trim_leading_newlines(body);
-            let (subject, rest) = match body.windows(2).position(|w| w == &b"\n\n"[..]) {
-                Some(i) => (&body[..i], trim_leading_newlines(&body[i..])),
-                None => (body, &body[body.len()..]),
+        // `C_BARE`: `xstrdup(subpos)` — to the end of the object, signature and all.
+        ContentPart::Bare => Ok(data[p.sub..].to_vec()),
+        // `C_LENGTH`: `strlen(subpos)`, which is that same span's length.
+        ContentPart::Size => Ok((data.len() - p.sub).to_string().into_bytes()),
+        ContentPart::Subject => Ok(copy_subject(subject)),
+        ContentPart::SubjectSanitize => Ok(format_sanitized_subject(subject)),
+        // `C_BODY_DEP`: `xmemdupz(bodypos, bodylen)`.
+        ContentPart::BodyDep => Ok(data[p.body..p.body + p.body_len].to_vec()),
+        // `C_BODY`: `xmemdupz(bodypos, nonsiglen)`.
+        ContentPart::Body => Ok(data[p.body..p.body + p.nonsig_len].to_vec()),
+        // `C_SIG`: `xmemdupz(sigpos, siglen)`.
+        ContentPart::Sig => Ok(data[p.sig..p.sig + p.sig_len].to_vec()),
+        // `C_LINES`: measured from the *subject*, over the message minus its
+        // signature.
+        ContentPart::Lines(n) => Ok(append_lines(&data[p.sub..p.body + p.nonsig_len], *n)),
+        // `C_TRAILERS`: the message with any signature block cut off, handed to
+        // `format_trailers_from_commit()`.
+        ContentPart::Trailers(opts) => {
+            let msg = if p.sig_len > 0 {
+                &data[p.sub..p.sig]
+            } else {
+                &data[p.sub..]
             };
-            Ok(match part {
-                ContentPart::Subject => fold_subject(subject),
-                _ => rest.to_vec(),
-            })
+            // `format_trailers_from_commit()`'s fast path: with every rendering
+            // option off, the answer is the block's bytes verbatim, spacing and
+            // folded continuation lines included, rather than the parsed items
+            // rebuilt.
+            if trailers_verbatim(opts) {
+                super::interpret_trailers::trailer_block_of(msg)
+            } else {
+                Ok(super::interpret_trailers::format_pretty(msg, opts))
+            }
         }
     }
+}
+
+/// `format_trailers_from_commit()`'s fast-path test (trailer.c): no option that
+/// changes the rendering is set, so the block can be copied out untouched.
+/// `trim_empty` is deliberately absent — git does not consult it here.
+fn trailers_verbatim(o: &super::interpret_trailers::PrettyOpts) -> bool {
+    !o.only
+        && !o.unfold
+        && o.keys.is_empty()
+        && o.separator.is_none()
+        && !o.keyonly
+        && !o.valueonly
+        && o.key_value_separator.is_none()
 }
 
 /// git's `grab_signature`: verify a commit's signature once, then render the
@@ -3113,51 +4162,6 @@ fn trust_level_str(trust: crate::gitsig::Trust) -> &'static [u8] {
         Trust::Fully => b"fully",
         Trust::Ultimate => b"ultimate",
     }
-}
-
-/// The offset of a line-anchored signature block, or `msg.len()` if absent.
-fn signature_start(msg: &[u8]) -> usize {
-    const MARKERS: [&[u8]; 2] = [
-        b"-----BEGIN PGP SIGNATURE-----",
-        b"-----BEGIN SSH SIGNATURE-----",
-    ];
-    let mut line_start = 0;
-    while line_start <= msg.len() {
-        if MARKERS.iter().any(|m| msg[line_start..].starts_with(m)) {
-            return line_start;
-        }
-        match msg[line_start..].iter().position(|&b| b == b'\n') {
-            Some(nl) => line_start += nl + 1,
-            None => break,
-        }
-    }
-    msg.len()
-}
-
-/// Drop leading blank lines, as git does before locating the subject.
-fn trim_leading_newlines(msg: &[u8]) -> &[u8] {
-    let start = msg.iter().position(|&b| b != b'\n').unwrap_or(msg.len());
-    &msg[start..]
-}
-
-/// Fold the subject paragraph into a single line: each line is right-trimmed of
-/// whitespace and the lines are joined with a space, stopping at the first blank.
-fn fold_subject(subject: &[u8]) -> Vec<u8> {
-    let mut out: Vec<u8> = Vec::new();
-    for line in subject.split(|&b| b == b'\n') {
-        let end = line
-            .iter()
-            .rposition(|b| !b.is_ascii_whitespace())
-            .map_or(0, |i| i + 1);
-        if end == 0 {
-            break;
-        }
-        if !out.is_empty() {
-            out.push(b' ');
-        }
-        out.extend_from_slice(&line[..end]);
-    }
-    out
 }
 
 /// git's `is_root_ref`: which files directly under `$GIT_DIR` count as root

@@ -543,9 +543,21 @@ impl Filters {
 /// '<name>'` plus the usage block on stderr at 129, *before* anything is
 /// created — it is not taken as a branch to create.
 ///
-/// `--format` supports the `refname`, `refname:short`, `objectname`,
-/// `objectname:short`, and `HEAD` atoms; any other atom is rejected rather than
-/// rendered as empty. `--edit-description` is refused: it needs an interactive
+/// `--format` supports seven atoms — `refname`, `refname:short`, `objectname`,
+/// `objectname:short`, `HEAD`, `upstream` and `upstream:short` — and rejects any
+/// other rather than rendering it as empty.
+///
+/// That is a much narrower set than git's: `git branch --format` runs the same
+/// `ref-filter.c` machinery `for-each-ref` does, so every atom on
+/// [`super::for_each_ref::parse_atom`] is legal there, as are `%(if)`, `%(align)`
+/// and the quoting styles. Measured against stock git 2.55.0 over the 127-atom
+/// corpus in this port's differential harness, `branch --format` agrees on 7
+/// and `for-each-ref --format` on 127. Closing that gap means driving branch's
+/// listing through the shared atom evaluator rather than widening this table:
+/// an atom accepted here but rendered from a different, thinner entry model
+/// would be a wrong value at exit 0, which is worse than the refusal.
+///
+/// `--edit-description` is refused: it needs an interactive
 /// editor loop that is not wired in this environment. `--recurse-submodules`
 /// reproduces both of git's refusals (`submodule.propagateBranches` unset, and
 /// the non-creation actions) and then says it is not ported, rather than

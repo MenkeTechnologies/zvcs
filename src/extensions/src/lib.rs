@@ -42,6 +42,7 @@ pub mod revfilter;
 pub mod sequencer;
 pub mod setup;
 pub mod shallow_serve;
+pub mod showdate;
 pub mod sigpipe;
 pub mod superset;
 pub mod threads;

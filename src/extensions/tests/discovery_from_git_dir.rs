@@ -335,3 +335,36 @@ fn ceiling_directories_bound_the_walk() {
     with_slash.push(std::path::MAIN_SEPARATOR_STR);
     hit_the_ceiling(&with_ceiling(&deep, Path::new(&with_slash)));
 }
+
+/// `--git-common-dir` is the one path query git renders with
+/// `DEFAULT_RELATIVE_IF_SHARED` (`builtin/rev-parse.c`), so it is the only place
+/// the stored common-dir string is visible — and the only query whose answer
+/// changes between `.git` and a directory below it.
+///
+/// The regression this pins: the discriminator was the repository root rather
+/// than the working directory. Inside `.git` those are the same path, so every
+/// directory below `.git` answered `.` where stock git answers the whole path,
+/// and an earlier shape of the bug answered `../../.`. `--git-dir` was correct
+/// throughout, which is why it went unnoticed — the two queries share nothing.
+#[test]
+fn git_common_dir_follows_the_cwd_not_the_repository_root() {
+    let (_root, repo, home) = fixture("common-dir");
+    let git_dir = repo.join(".git");
+    std::fs::create_dir_all(repo.join("sub")).unwrap();
+
+    // Inside the work tree the stored string stays `.git`, and
+    // `DEFAULT_RELATIVE_IF_SHARED` measures it against the prefix.
+    assert_eq!(stdout(&repo, &home, &["rev-parse", "--git-common-dir"]), ".git");
+    assert_eq!(stdout(&repo.join("sub"), &home, &["rev-parse", "--git-common-dir"]), "../.git");
+
+    // Standing in the git directory it is `.`; one directory deeper setup has
+    // absolutized it and there is no prefix left to measure against.
+    assert_eq!(stdout(&git_dir, &home, &["rev-parse", "--git-common-dir"]), ".");
+    for below in ["refs", "refs/heads", "objects"] {
+        assert_eq!(
+            stdout(&git_dir.join(below), &home, &["rev-parse", "--git-common-dir"]),
+            git_dir.to_string_lossy(),
+            "from `.git/{below}`"
+        );
+    }
+}

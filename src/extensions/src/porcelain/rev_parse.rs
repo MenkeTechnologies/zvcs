@@ -2142,8 +2142,18 @@ impl PathCtx {
             Some(wd) if !is_inside_git_dir(repo) => absolute(wd),
             _ => absolute(repo.git_dir()),
         };
-        let prefix = std::env::current_dir()
-            .ok()
+        // git's `prefix` is the path down from the top of the WORK TREE, and
+        // nothing else: `setup_git_directory_gently_1()` sets the work tree to
+        // NULL when the cwd is inside the git directory and returns no prefix at
+        // all, which is why `--show-prefix` is empty from inside `.git`. Measuring
+        // the cwd against `root` here instead would hand `print_path` a prefix
+        // like `refs/heads/` in exactly that case, and `--git-common-dir` — the
+        // one query rendered with `DEFAULT_RELATIVE_IF_SHARED` — would answer
+        // `../../.` where git answers the absolute common directory.
+        let in_work_tree = repo.workdir().is_some() && !is_inside_git_dir(repo);
+        let prefix = in_work_tree
+            .then(|| std::env::current_dir().ok())
+            .flatten()
             .and_then(|c| std::fs::canonicalize(c).ok())
             .and_then(|cwd| cwd.strip_prefix(&root).ok().map(std::path::Path::to_path_buf))
             .filter(|rel| !rel.as_os_str().is_empty())
@@ -2449,11 +2459,23 @@ fn adjust_git_path(repo: &gix::Repository, ctx: &PathCtx, buf: &mut String, git_
 /// for the main checkout of a plain repository, otherwise the absolute path.
 fn gitdir_common_string(repo: &gix::Repository, ctx: &PathCtx) -> std::path::PathBuf {
     let common = absolute(repo.common_dir());
-    if common == ctx.root {
+    // The discriminator is the CWD, not [`PathCtx::root`]. Standing in the git
+    // directory itself, git's stored common-dir string is `.` — but one directory
+    // deeper (`.git/refs`) setup has absolutized it and git prints the whole path,
+    // while `root` is the git directory in both places. Comparing against `root`
+    // answered `.` for every directory below `.git`, where stock answers the
+    // absolute path.
+    let cwd = std::env::current_dir().ok().and_then(|c| std::fs::canonicalize(c).ok());
+    if cwd.is_some_and(|c| c == common) {
         return ".".into();
     }
-    if common == ctx.root.join(".git") {
-        return ".git".into();
+    // `.git` relative to the top of the work tree, which is the string git keeps
+    // while the cwd is anywhere inside that work tree; `print_path`'s
+    // `DEFAULT_RELATIVE_IF_SHARED` turns it into `../.git` one directory down.
+    if ctx.prefix.is_some() || !is_inside_git_dir(repo) {
+        if common == ctx.root.join(".git") {
+            return ".git".into();
+        }
     }
     common
 }

@@ -32,6 +32,25 @@
 //! capability rather than silently downgraded. Not ported: shallow grafts. The
 //! pack is complete but undeltified (see [`super::pack_objects`]); a non-thin
 //! pack is valid for receive-pack, `--thin` is only a size optimization.
+//!
+//! # Configuration
+//!
+//! `send_pack()` reads two keys of its own (`send-pack.c:549-560`), both after
+//! the transport is open. Neither acceleration exists here — there are no
+//! negotiation rounds before a push, and `gix-pack` has no bitmap reader — so
+//! both are read and validated exactly where git reads them, and the values then
+//! steer nothing:
+//!
+//!   * `push.negotiate` runs `git fetch --negotiate-only` first so the pack can
+//!     leave out what the rounds proved common. Its documented `false` behaviour
+//!     — "rely solely on the server's ref advertisement" — is what this port does
+//!     either way.
+//!   * `push.useBitmaps` becomes `--no-use-bitmap-index` on the `pack-objects`
+//!     child, and the count here is already the un-accelerated one.
+//!
+//! The *position* of the read is the observable part and is reproduced: a bad
+//! value is fatal for an already-up-to-date push and for `--dry-run`, and is not
+//! reached at all when the remote could not be contacted.
 
 use anyhow::{bail, Context, Result};
 use std::collections::{HashMap, HashSet};
@@ -359,7 +378,7 @@ pub fn send_pack(
             // `ssh_fatal` has already written git's block; this layer returns a
             // `Result` rather than an exit code, so the status is set directly.
             if crate::transport_err::ssh_fatal(url.as_str(), &err).is_some() {
-                std::process::exit(128);
+                crate::hosted::exit(128);
             }
             return Err(err);
         }
@@ -373,6 +392,32 @@ pub fn send_pack(
             let (name, target, _peeled) = r.unpack();
             if let (Ok(name), Some(oid)) = (std::str::from_utf8(name), target) {
                 advertised.insert(name.to_owned(), oid.to_owned());
+            }
+        }
+    }
+
+    // `send_pack()` reads its own two keys here, right after the `if
+    // (!remote_refs)` early return and before the capability selection below
+    // (send-pack.c:542-560). Both go through `repo_config_get_bool`, so an
+    // unreadable value dies — and it dies *late*, after the transport is open:
+    // git 2.55.0 reports it for an already-up-to-date push and for `--dry-run`,
+    // and does not report it when the remote could not be reached at all.
+    //
+    //   * `push.negotiate` runs `git fetch --negotiate-only` against the same
+    //     URL first, so the pack can leave out what the rounds proved common.
+    //     This port's pack is built from the advertised tips alone, which is
+    //     what git falls back to when the key is false — its documented "rely
+    //     solely on the server's ref advertisement" behaviour.
+    //   * `push.useBitmaps` becomes `args->disable_bitmaps`, i.e.
+    //     `--no-use-bitmap-index` on the `pack-objects` child. `gix-pack` has no
+    //     bitmap reader, so the count is already the un-accelerated one.
+    //
+    // Both are therefore validated and reported exactly as git does while the
+    // acceleration each names stays unimplemented; see the module docs.
+    if !requests.is_empty() {
+        for key in ["push.negotiate", "push.usebitmaps"] {
+            if let Err(message) = crate::repo_settings::config_bool_strict(repo, key) {
+                crate::git_fatal!("{message}");
             }
         }
     }

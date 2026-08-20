@@ -316,7 +316,7 @@ pub(crate) fn verify_resolved(
             }
             // A formatting-stack error is `die("%s", err.buf)`, which ends the
             // whole command rather than this one tag.
-            Err(_) => std::process::exit(128),
+            Err(_) => crate::hosted::exit(128),
         }
     }
 

@@ -113,6 +113,13 @@ pub enum Advice {
     /// this one gates a `warning()`, not an `advise()` — no `hint: ` prefix, no
     /// `Disable this message with …` trailer.
     FetchShowForcedUpdates,
+    /// `add()`'s invalid-reference floor (builtin/worktree.c:919-930): a
+    /// `git worktree add <path>` with no `<commit-ish>` found nothing to start
+    /// from, so the only thing the user can have meant is an unborn branch —
+    /// which is what `--orphan` makes. Only the `ac < 2` forms get the hint,
+    /// because an explicit `<commit-ish>` that does not resolve is a typo, not a
+    /// missing `--orphan`.
+    WorktreeAddOrphan,
 }
 
 impl Advice {
@@ -156,6 +163,7 @@ impl Advice {
             Advice::RebaseTodoError => "advice.rebaseTodoError",
             Advice::SkippedCherryPicks => "advice.skippedCherryPicks",
             Advice::FetchShowForcedUpdates => "advice.fetchShowForcedUpdates",
+            Advice::WorktreeAddOrphan => "advice.worktreeAddOrphan",
         }
     }
 
@@ -343,7 +351,7 @@ fn globally_enabled() -> bool {
         Some(v) => v,
         None => {
             eprintln!("fatal: bad boolean environment value '{raw}' for 'GIT_ADVICE'");
-            std::process::exit(crate::fatal::EXIT_FATAL as i32);
+            crate::hosted::exit(crate::fatal::EXIT_FATAL as i32);
         }
     }
 }

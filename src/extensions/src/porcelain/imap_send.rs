@@ -1280,7 +1280,7 @@ fn imap_open_store(
             .spawn()
             .unwrap_or_else(|e| {
                 eprintln!("fatal: cannot start proxy {tunnel}: {e}");
-                std::process::exit(128);
+                crate::hosted::exit(128);
             });
         let stdin = child.stdin.take()?;
         let stdout = child.stdout.take()?;

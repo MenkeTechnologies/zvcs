@@ -61,7 +61,15 @@ pub fn is_broken_pipe(err: &(dyn Error + 'static)) -> bool {
 pub fn exit_broken_pipe() -> ! {
     if crate::pager::is_active() {
         crate::pager::finish();
-        std::process::exit(0);
+        crate::hosted::exit(0);
+    }
+    // Hosted, the signal death is not ours to stage: restoring SIG_DFL and
+    // raising SIGPIPE would kill the host — an interactive shell, for
+    // `git log | head`. Report 141 instead, the status a shell records for a
+    // child that died on SIGPIPE, which is the number the staged death exists
+    // to produce in the first place.
+    if crate::hosted::is_hosted() {
+        crate::hosted::exit(141);
     }
     // SAFETY: both calls are async-signal-safe and this thread is on its way
     // out. `raise` does not return once the default disposition is restored.
@@ -72,5 +80,5 @@ pub fn exit_broken_pipe() -> ! {
     // Not reached: `raise` above terminates the process. Kept so the function
     // is `!` without an `unreachable!` panic, and so a platform that somehow
     // blocks the signal still reports git's status instead of falling through.
-    std::process::exit(141);
+    crate::hosted::exit(141);
 }

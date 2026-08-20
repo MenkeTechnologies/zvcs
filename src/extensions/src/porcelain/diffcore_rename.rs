@@ -93,7 +93,7 @@ pub fn config_rename(value: Option<&gix::bstr::BStr>) -> u8 {
         // diff setup that has no way to report, which is why git exits here too.
         None => {
             eprintln!("fatal: bad boolean config value '{s}' for 'diff.renames'");
-            std::process::exit(128);
+            crate::hosted::exit(128);
         }
     }
 }

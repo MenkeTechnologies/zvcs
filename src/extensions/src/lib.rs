@@ -11,17 +11,21 @@ pub mod autocorrect;
 pub mod autostart;
 pub mod config;
 pub mod crawler;
+pub mod cstdio;
 pub mod date;
 pub mod db;
+pub mod default_config;
 pub mod diffopt;
 pub mod dispatch;
 pub mod external;
 pub mod fatal;
 pub mod gitsig;
 pub mod hooks;
+pub mod hosted;
 pub mod index_commit;
 pub mod jobpool;
 pub mod jobrun;
+pub mod listcmds;
 pub mod lock;
 pub mod merge_apply;
 pub mod merge_guard;
@@ -40,6 +44,7 @@ pub mod quote;
 pub mod rcache;
 pub mod refname;
 pub mod refsort;
+pub mod repo_settings;
 pub mod revfilter;
 pub mod sequencer;
 pub mod setup;
@@ -64,10 +69,31 @@ use std::process::ExitCode;
 /// every path out — including the ones that return early. Both calls are inert
 /// unless a Trace2 event target is configured.
 pub fn run() -> ExitCode {
-    trace2::start(&std::env::args().collect::<Vec<_>>());
-    let code = run_command();
+    let argv: Vec<String> = std::env::args().collect();
+    trace2::start(&argv);
+    let code = run_command(&argv);
     trace2::exit(exit_status(code));
     code
+}
+
+/// Run one `git` invocation inside a host process and return its exit status.
+///
+/// This is the entry point a host without a fork uses — the `git` shell
+/// builtin in zshrs-native, where zvcs is linked into the shell and `git
+/// status` costs no process at all. `argv` is the whole command line,
+/// `argv[0]` included, exactly as `main` would have received it.
+///
+/// The difference from [`run`] is not the arguments; it is that this promises
+/// to come back. Everything that makes that true — an `exit` from deep inside
+/// a rendering loop, a panic, a `-C` that moved the working directory — is
+/// handled by [`hosted::run`], which this wraps.
+pub fn run_argv(argv: &[String]) -> i32 {
+    hosted::run(|| {
+        trace2::start(argv);
+        let code = exit_status(run_command(argv));
+        trace2::exit(code);
+        code
+    })
 }
 
 /// The numeric status an [`ExitCode`] will hand the shell.
@@ -159,10 +185,9 @@ pub enum Handled {
 ///   with no verb left is a normal outcome — `cmd_main` prints the usage block
 ///   and exits 1 for it.
 ///
-/// One branch of the C is deliberately absent: `--list-cmds=<what>`, which git
-/// answers from its `commands[]` table plus `command-list.txt` categories. This
-/// port's verb set is not git's, so the answer could not match either way; the
-/// option currently falls through to `unknown option`.
+/// `--list-cmds=<what>` is served by [`listcmds`], which answers git's
+/// `commands[]`-table groups from this port's own dispatch tables and the
+/// `command-list.txt` categories from the tables `git help -a` prints.
 pub fn handle_options(
     argv: &[String],
     pager_forced: &mut Option<bool>,
@@ -223,6 +248,22 @@ pub fn handle_options(
             "--info-path" => {
                 println!("{}", porcelain::help::info_dir().display());
                 return Handled::Exit(ExitCode::SUCCESS);
+            }
+            // `skip_prefix(cmd, "--list-cmds=", &cmd)` (git.c:325-337), the
+            // completion query. Like the three path queries it prints and exits,
+            // but unlike them it names itself to Trace2 first — `_query_` is the
+            // command name every `--list-cmds` run records, since no subcommand
+            // will ever be dispatched to supply one.
+            //
+            // `parseopt` is answered by the caller in the C rather than by
+            // `list_cmds()`, because its output format is different (see
+            // [`listcmds::parseopt`]); the split is kept here.
+            s if s.starts_with("--list-cmds=") => {
+                let spec = &s["--list-cmds=".len()..];
+                return Handled::Exit(match spec {
+                    "parseopt" => listcmds::parseopt(),
+                    _ => listcmds::list_cmds(spec),
+                });
             }
             "-p" | "--paginate" => {
                 *pager_forced = Some(true);
@@ -486,15 +527,15 @@ pub(crate) fn report_bad_config_overrides(overrides: &[ConfigOverride]) -> Optio
 
 /// Parse `argv`, dispatch the subcommand, and return the process exit code.
 /// Errors are reported terse on stderr as `zvcs: <command>: <reason>`.
-fn run_command() -> ExitCode {
+fn run_command(argv: &[String]) -> ExitCode {
     // Dashed invocation: run as `git-<verb>` (a symlink in `~/.zvcs/bin`, or any
     // `git-*` on PATH) and git dispatches `<verb>` — git.c strips the `git-` prefix
     // from argv[0]. We fold it in by prepending the verb to the argument list;
     // `from_dashed` then suppresses external re-dispatch of that verb (it would
     // re-exec this same binary and loop). No git-global option layer applies to a
     // dashed form — `git-add -C x` is git-add's own `-C`, not the wrapper's.
-    let from_dashed = dashed_subcommand(&std::env::args().next().unwrap_or_default());
-    let mut raw: Vec<String> = std::env::args().skip(1).collect();
+    let from_dashed = dashed_subcommand(argv.first().map(String::as_str).unwrap_or_default());
+    let mut raw: Vec<String> = argv.iter().skip(1).cloned().collect();
     if let Some(verb) = &from_dashed {
         raw.insert(0, verb.clone());
     }
@@ -717,6 +758,10 @@ fn run_command() -> ExitCode {
             ExitCode::FAILURE
         }
     };
+    // `exit()` flushing the stdio `stdout` buffer, which is what puts a command's
+    // stdout output after the stderr it raced when both are captured together.
+    // Before `pager::finish()`, which closes fd 1 out from under it.
+    cstdio::flush();
     pager::finish();
     // Cache rows queued during the command are written by a background thread
     // (see `rcache::cache_write`); this is the one place that waits for it, after

@@ -2535,7 +2535,7 @@ fn run_applypatch_msg_hook(
                 "fatal: '{}' was deleted by the applypatch-msg hook",
                 path.display()
             );
-            std::process::exit(128);
+            crate::hosted::exit(128);
         }
     }
     Ok(true)

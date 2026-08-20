@@ -69,7 +69,7 @@ notify = "6"
 # Job ledger + repo index. Bundled SQLite for cross-arch reproducibility
 # (macOS aarch64 / Linux x86_64+aarch64); WAL, single daemon writer thread.
 # The derived-answer caches do NOT live here — see `rcache`.
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
 # Zero-copy caches for derived answers (`rcache`): tree diffs, blames and object
 # abbreviations are pure functions of immutable objects, so they are read in place
 # out of an mmap'd archive instead of being decoded row by row out of SQLite.

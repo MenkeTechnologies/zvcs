@@ -7,6 +7,13 @@
 //! range and `--creation-factor` needs a `--range-diff`, both fatal before any output,
 //! and anything `setup_revisions()` cannot place is `unrecognized argument`.
 //!
+//! `--stdout`, `--output` and `-o`/`--output-directory` are the three ways of
+//! naming where the series goes, and they interact in two places git checks
+//! separately: `-o` refuses a second value while it parses
+//! (`output_directory_callback()`, builtin/log.c:1593-1603) and the three are
+//! mutually exclusive once parsing is done (builtin/log.c:2250-2251).
+//! `format.outputDirectory` sits outside both, being merged in afterwards.
+//!
 //! Expectations measured against stock git 2.55.0.
 #![cfg(unix)]
 
@@ -255,4 +262,139 @@ fn every_diff_algorithm_name_selects_the_algorithm_it_names() {
         );
         assert!(out.stdout.is_empty(), "{value:?}: {out:?}");
     }
+}
+
+/// `-o` is a callback, not an `OPT_STRING`, so a second one is fatal.
+///
+/// Port check for `output_directory_callback()` (builtin/log.c:1593-1603):
+///
+/// ```text
+/// if (*dir)
+///         die(_("two output directories?"));
+/// ```
+///
+/// The port stored the value directly at each of the three places `-o` can be
+/// spelled, so the last one quietly won and a command line git rejects with exit
+/// 128 succeeded here. All four spellings reach the one callback, `*dir` is a
+/// pointer test rather than a string test, and `PARSE_OPT_NONEG` means nothing
+/// can clear it back to `NULL`.
+#[test]
+fn a_second_output_directory_is_fatal() {
+    let f = Fixture::new("twodirs");
+    let duplicates: [&[&str]; 6] = [
+        &["format-patch", "-o", "a", "-o", "b", "-1"],
+        &["format-patch", "--output-directory=a", "--output-directory=b", "-1"],
+        &["format-patch", "-oa", "-ob", "-1"],
+        &["format-patch", "-o", "a", "--output-directory=b", "-1"],
+        &["format-patch", "--output-directory=a", "-o", "b", "-1"],
+        // `*dir` is a pointer, so an empty first directory still counts as one.
+        &["format-patch", "-o", "", "-o", "b", "-1"],
+    ];
+    for args in duplicates {
+        let out = f.run(args);
+        assert_eq!(out.status.code(), Some(128), "{args:?}: {out:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stderr),
+            "fatal: two output directories?\n",
+            "{args:?}"
+        );
+        assert!(out.stdout.is_empty(), "{args:?}: {out:?}");
+        assert!(!f.work.join("a").exists(), "{args:?}: no directory is created");
+        assert!(!f.work.join("b").exists(), "{args:?}: no directory is created");
+    }
+
+    // The `die()` is inside `parse_options()`, which runs over the whole argv
+    // before `setup_revisions()` does — so it preempts both an unresolvable
+    // revision and the `--stdout` incompatibility check that follows the parse.
+    for args in [
+        &["format-patch", "-o", "a", "-o", "b", "nosuchrev"][..],
+        &["format-patch", "--stdout", "-o", "a", "-o", "b", "-1"][..],
+    ] {
+        let out = f.run(args);
+        assert_eq!(out.status.code(), Some(128), "{args:?}: {out:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stderr),
+            "fatal: two output directories?\n",
+            "{args:?}"
+        );
+    }
+
+    // One is still one. `format.outputDirectory` is a different variable
+    // (`cfg.config_output_directory`, builtin/log.c:895) folded in only after the
+    // check (builtin/log.c:2261-2262), so config plus `-o` is not two either —
+    // and the `-o` wins.
+    let out = f.run(&["format-patch", "-o", "one", "-1"]);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(f.work.join("one").read_dir().unwrap().count(), 1, "{out:?}");
+
+    let out = f.run(&[
+        "-c",
+        "format.outputDirectory=cfgdir",
+        "format-patch",
+        "-o",
+        "two",
+        "-1",
+    ]);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(f.work.join("two").read_dir().unwrap().count(), 1, "{out:?}");
+    assert!(!f.work.join("cfgdir").exists(), "the option wins over the config: {out:?}");
+}
+
+/// The three destinations are mutually exclusive, and the message says how many
+/// of them were named.
+///
+/// Port check for `die_for_incompatible_opt3(use_stdout, "--stdout",
+/// rev.diffopt.close_file, "--output", !!output_directory, "--output-directory")`
+/// (builtin/log.c:2250-2251), whose wording comes from
+/// `die_for_incompatible_opt4()` (parse-options.c:1528-1558): three named options
+/// get the Oxford-comma form, two get the pair form in table order.
+///
+/// The port checked `--stdout` against each of the other two separately, which
+/// printed the pair message for a command line naming all three and never
+/// noticed `--output` together with `--output-directory` at all.
+#[test]
+fn stdout_output_and_output_directory_are_mutually_exclusive() {
+    let f = Fixture::new("dest3");
+    let cases: [(&[&str], &str); 4] = [
+        (
+            &["format-patch", "--stdout", "--output", "s.patch", "--output-directory", "d", "-1"],
+            "fatal: options '--stdout', '--output', and '--output-directory' \
+             cannot be used together\n",
+        ),
+        (
+            &["format-patch", "--output", "s.patch", "--output-directory", "d", "-1"],
+            "fatal: options '--output' and '--output-directory' cannot be used together\n",
+        ),
+        (
+            &["format-patch", "--stdout", "--output-directory", "d", "-1"],
+            "fatal: options '--stdout' and '--output-directory' cannot be used together\n",
+        ),
+        (
+            &["format-patch", "--stdout", "--output", "s2.patch", "-1"],
+            "fatal: options '--stdout' and '--output' cannot be used together\n",
+        ),
+    ];
+    for (args, want) in cases {
+        let out = f.run(args);
+        assert_eq!(out.status.code(), Some(128), "{args:?}: {out:?}");
+        assert_eq!(String::from_utf8_lossy(&out.stderr), want, "{args:?}");
+        assert!(out.stdout.is_empty(), "{args:?}: {out:?}");
+    }
+
+    // `format.outputDirectory` is not one of the three: it is merged in eleven
+    // lines below the check (builtin/log.c:2261-2262), so configuring an output
+    // directory does not make `--stdout` illegal. Reading it as if `-o` had been
+    // typed refused a command git runs.
+    let out = f.run(&["-c", "format.outputDirectory=cfgdir", "format-patch", "--stdout", "-1"]);
+    assert!(out.status.success(), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("\nSubject: [PATCH]"),
+        "the series still goes to stdout: {out:?}"
+    );
+    assert!(!f.work.join("cfgdir").exists(), "{out:?}");
+
+    // …while without `--stdout` the config still selects the directory.
+    let out = f.run(&["-c", "format.outputDirectory=cfgdir", "format-patch", "-1"]);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(f.work.join("cfgdir").read_dir().unwrap().count(), 1, "{out:?}");
 }

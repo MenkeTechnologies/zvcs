@@ -344,3 +344,124 @@ fn git_advice_env_squelches_all_hints() {
 
     let _ = std::fs::remove_dir_all(repo.parent().unwrap());
 }
+
+/// `git worktree add <path>` over an orphaned HEAD: `advice.worktreeAddOrphan`.
+///
+/// The fixture is git's `can_use_local_refs()` middle case (builtin/worktree.c:
+/// 691-701) — `refs/heads/main` exists but `HEAD` points at an unborn branch — so
+/// `dwim_orphan()` does *not* infer `--orphan`, the `lookup_commit_reference_by_name`
+/// at worktree.c:919 fails, and the hint is offered before the `die()`.
+///
+/// Every byte below was captured from stock git 2.55.0 on the same fixture, so
+/// this pins the hint text, the blank `hint:` lines that come from the message's
+/// own trailing newline, and the `Disable this message with …` trailer
+/// `advise_if_enabled()` adds while the slot is unconfigured.
+fn orphaned_head_fixture(tag: &str) -> (PathBuf, PathBuf) {
+    let (repo, home) = fixture(tag);
+    git(&repo, &["commit", "-q", "--allow-empty", "-m", "one"]);
+    git(&repo, &["checkout", "-q", "--orphan", "unborn"]);
+    (repo, home)
+}
+
+const WORKTREE_ORPHAN_HINT_NO_DASH_B: &str = "\
+warning: HEAD points to an invalid (or orphaned) reference.
+
+hint: If you meant to create a worktree containing a new unborn branch
+hint: (branch with no commits) for this repository, you can do so
+hint: using the --orphan flag:
+hint:
+hint:     git worktree add --orphan ../wt
+hint:
+hint: Disable this message with \"git config set advice.worktreeAddOrphan false\"
+fatal: invalid reference: HEAD
+";
+
+#[test]
+fn worktree_add_orphan_hint_matches_stock_byte_for_byte() {
+    let (repo, home) = orphaned_head_fixture("wtorphan");
+    let out = run(&repo, &home, &["worktree", "add", "../wt"]);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        WORKTREE_ORPHAN_HINT_NO_DASH_B,
+        "stderr must match stock git byte for byte"
+    );
+    assert_eq!(out.status.code(), Some(128), "worktree.c:929 is a die()");
+    let _ = std::fs::remove_dir_all(repo.parent().unwrap());
+}
+
+/// `used_new_branch_options` picks the other hint text, which repeats the `-b`
+/// name so the suggested command is the one the user meant to type.
+#[test]
+fn worktree_add_orphan_hint_keeps_the_dash_b_name() {
+    let (repo, home) = orphaned_head_fixture("wtorphanb");
+    let out = run(&repo, &home, &["worktree", "add", "-b", "nb", "../wt2"]);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "\
+warning: HEAD points to an invalid (or orphaned) reference.
+
+hint: If you meant to create a worktree containing a new unborn branch
+hint: (branch with no commits) for this repository, you can do so
+hint: using the --orphan flag:
+hint:
+hint:     git worktree add --orphan -b nb ../wt2
+hint:
+hint: Disable this message with \"git config set advice.worktreeAddOrphan false\"
+fatal: invalid reference: HEAD
+",
+    );
+    let _ = std::fs::remove_dir_all(repo.parent().unwrap());
+}
+
+/// The slot is a real read: `false` drops the hint block while the `warning:` and
+/// `fatal:` lines around it stay, and an explicit `true` keeps the hint but drops
+/// the `Disable this message with …` trailer (`advise_if_enabled()` adds it only
+/// for an unconfigured slot).
+#[test]
+fn worktree_add_orphan_hint_is_gated_by_its_slot() {
+    let (repo, home) = orphaned_head_fixture("wtorphangate");
+
+    git(&repo, &["config", "advice.worktreeAddOrphan", "false"]);
+    let out = run(&repo, &home, &["worktree", "add", "../wt"]);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "warning: HEAD points to an invalid (or orphaned) reference.\n\n\
+         fatal: invalid reference: HEAD\n",
+        "false must leave only the non-hint lines"
+    );
+
+    git(&repo, &["config", "advice.worktreeAddOrphan", "true"]);
+    let out = run(&repo, &home, &["worktree", "add", "../wt"]);
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(err.contains("hint:     git worktree add --orphan ../wt\n"), "err:\n{err}");
+    assert!(
+        !err.contains("Disable this message"),
+        "a configured slot drops the trailer:\n{err}"
+    );
+
+    let _ = std::fs::remove_dir_all(repo.parent().unwrap());
+}
+
+/// `attempt_hint = !opts.quiet && (ac < 2)`: `-q` silences the whole block, and an
+/// explicit `<commit-ish>` means the user named something that does not exist
+/// rather than reaching for an unborn branch — so no hint there either.
+#[test]
+fn worktree_add_orphan_hint_respects_quiet_and_an_explicit_commit_ish() {
+    let (repo, home) = orphaned_head_fixture("wtorphanquiet");
+
+    let out = run(&repo, &home, &["worktree", "add", "-q", "../wt"]);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "fatal: invalid reference: HEAD\n",
+        "-q drops the warning and the hint"
+    );
+
+    let out = run(&repo, &home, &["worktree", "add", "../wt", "nosuchref"]);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "fatal: invalid reference: nosuchref\n",
+        "ac == 2 never offers the hint"
+    );
+
+    let _ = std::fs::remove_dir_all(repo.parent().unwrap());
+}

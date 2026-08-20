@@ -1,4 +1,6 @@
-//! Config-driven `git help` behavior. Four keys reach this command:
+//! Config-driven `git help` behavior. Five keys reach this command:
+//!   * `help.browser` — which browser the web format opens, and its precedence
+//!     over `web.browser`.
 //!   * `help.autocorrect` — parsed in the unknown-verb path (see the
 //!     `autocorrect` integration test); not re-tested here.
 //!   * `help.format` — picks the viewer. All three of git's formats are
@@ -7,8 +9,8 @@
 //!     git's own message.
 //!   * `help.htmlpath` — overrides the directory the HTML viewer resolves the
 //!     page in, and is never written to (it is the user's own tree).
-//!   * `man.viewer` — a non-`man` viewer is a faithful-unsupported gate that
-//!     must fire before `man` is ever spawned.
+//!   * `man.viewer` — the viewer chain, driven here through a stand-in program
+//!     so nothing real is launched (the whole chain lives in `man_viewer.rs`);
 //!
 //! Every case that reaches the HTML viewer pins `web.browser` to a custom tool
 //! whose `browser.<tool>.cmd` echoes its arguments, so no real browser is ever
@@ -187,18 +189,89 @@ fn help_htmlpath_redirects_the_lookup_and_is_never_written_to() {
     let _ = std::fs::remove_dir_all(repo.parent().unwrap());
 }
 
-/// The symmetric gate: a non-`man` `man.viewer` is rejected the same way, naming
-/// the configured viewer.
+/// `man.viewer=konqueror`, one of the three viewers git drives itself. It used
+/// to be a faithful-unsupported gate here; the viewer chain is implemented now
+/// (see the `man_viewer` integration test for the whole chain), so what is
+/// asserted is git's actual konqueror behaviour, which is two-sided:
+///
+///   * outside a graphical session (`$DISPLAY` empty) `exec_man_konqueror()`
+///     runs nothing at all and the chain falls through to `man`;
+///   * inside one it starts `kfmclient newTab man:<page>(1)`, with
+///     `man.konqueror.path` naming the program — pointed at `/bin/echo` here, so
+///     the argument vector lands on stdout instead of a browser.
 #[test]
-fn unsupported_man_viewer_is_rejected() {
+fn konqueror_man_viewer_is_driven_the_way_stock_drives_it() {
     let (repo, home) = fixture("viewer");
     git(&repo, &["config", "man.viewer", "konqueror"]);
+    git(&repo, &["config", "man.konqueror.path", "/bin/echo"]);
+
+    let out = Command::new(BIN)
+        .args(["help", "-m", "status"])
+        .current_dir(&repo)
+        .env("HOME", &home)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("ZVCS_HOME", &home)
+        .env("DISPLAY", ":0")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "newTab man:git-status(1)\n",
+        "konqueror was not started the way git starts it"
+    );
+
+    // With no graphical session the viewer declines silently — nothing is run,
+    // so the stand-in prints nothing.
+    let out = Command::new(BIN)
+        .args(["help", "-m", "status"])
+        .current_dir(&repo)
+        .env("HOME", &home)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("ZVCS_HOME", &home)
+        .env_remove("DISPLAY")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains("newTab"),
+        "konqueror ran without a DISPLAY"
+    );
+
+    let _ = std::fs::remove_dir_all(repo.parent().unwrap());
+}
+
+/// `help.browser` names the browser for the web format. git does not read the
+/// key in `builtin/help.c` at all: `open_html()` execs
+/// `git web--browse -c help.browser <path>`, and `git-web--browse` then consults
+/// *that* key first and `web.browser` only as a fallback — which is the
+/// precedence asserted here, with both keys pointing at echoing stand-ins so the
+/// one that wins is visible on stdout.
+#[test]
+fn help_browser_wins_over_web_browser() {
+    let (repo, home) = fixture("browser");
+    git(&repo, &["config", "help.format", "html"]);
+    git(&repo, &["config", "help.browser", "zvcshelp"]);
+    git(&repo, &["config", "browser.zvcshelp.cmd", "printf 'help:%s\\n'"]);
+    git(&repo, &["config", "web.browser", "zvcsweb"]);
+    git(&repo, &["config", "browser.zvcsweb.cmd", "printf 'web:%s\\n'"]);
 
     let out = run(&repo, &home, &["help", "status"]);
-    assert!(!out.status.success());
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("man.viewer=konqueror"), "stderr:\n{stderr}");
-    assert!(stderr.contains("only the plain `man` viewer is"), "stderr:\n{stderr}");
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.starts_with("help:"), "help.browser did not win over web.browser: {text}");
+    assert!(text.trim_end().ends_with("git-status.html"), "the page was not handed over: {text}");
+
+    // Unset it and the fallback takes over — proving the first result came from
+    // `help.browser` rather than from the browser list.
+    git(&repo, &["config", "--unset", "help.browser"]);
+    let out = run(&repo, &home, &["help", "status"]);
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        String::from_utf8_lossy(&out.stdout).starts_with("web:"),
+        "web.browser did not take over"
+    );
 
     let _ = std::fs::remove_dir_all(repo.parent().unwrap());
 }
